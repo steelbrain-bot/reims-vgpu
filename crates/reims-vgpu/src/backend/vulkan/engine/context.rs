@@ -386,7 +386,22 @@ impl DeviceContext {
                 ash::khr::xcb_surface::NAME,
                 ash::khr::wayland_surface::NAME,
             ];
-            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            // Win32 is the only WSI platform on Windows — there is no session
+            // type to discover at runtime the way there is on Linux.
+            #[cfg(target_os = "windows")]
+            let platform: &[&CStr] = &[ash::khr::win32_surface::NAME];
+            // No host this crate builds for reaches here: the arms are
+            // partitioned in `crate::lib` and each names its surface above. The
+            // empty slice keeps this expression total rather than asserting a
+            // fourth host cannot exist — and because the guard below requires a
+            // non-empty list, such a host declines at attach time instead of
+            // creating a WSI-less instance that a later `create_surface` would
+            // use as though it had one.
+            #[cfg(not(any(
+                target_os = "macos",
+                target_os = "linux",
+                target_os = "windows"
+            )))]
             let platform: &[&CStr] = &[];
             let available: Vec<&CStr> = platform
                 .iter()

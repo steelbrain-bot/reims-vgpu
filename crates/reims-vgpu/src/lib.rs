@@ -11,7 +11,7 @@
 //! Features: exactly one of `backend-metal` (default) or `backend-vulkan`.
 //! Vulkan product path is self-contained `ash` ([`backend::vulkan::engine`]).
 //!
-//! # The three supported arms
+//! # The four supported arms
 //!
 //! A build is exactly one of these, and the guards below reject anything else:
 //!
@@ -20,10 +20,11 @@
 //! | Metal | `all(feature = "backend-metal", target_os = "macos")` | native Metal |
 //! | Vulkan / MoltenVK | `all(feature = "backend-vulkan", target_os = "macos")` | MoltenVK |
 //! | Vulkan / native | `all(feature = "backend-vulkan", target_os = "linux")` | native ICD |
+//! | Vulkan / native | `all(feature = "backend-vulkan", target_os = "windows")` | native ICD |
 //!
-//! **Gate the host on `target_os` and nothing else.** `macos` and `linux` are
-//! the only two values this crate names, so the three arms differ in one term
-//! each and a reader greps one key to find every host gate.
+//! **Gate the host on `target_os` and nothing else.** `macos`, `linux` and
+//! `windows` are the only three values this crate names, so the arms differ in
+//! one term each and a reader greps one key to find every host gate.
 //!
 //! There is **no** host-stub Metal arm. `backend-metal` off macOS has no Metal
 //! to call, so it is a compile error rather than a binary that links and cannot
@@ -33,10 +34,18 @@
 //! Vulkan arms partition every buildable configuration.** So the engine path is
 //! spelled positively as `feature = "backend-vulkan"` and the Metal path as
 //! `all(feature = "backend-metal", target_os = "macos")`, with no negation
-//! of one standing in for the other. Do not reintroduce
-//! `not(all(feature = "backend-metal", target_os = "macos"))` as a spelling
-//! of "the engine path" — it says what the build is *not*, which stops being
-//! equivalent the moment a fourth arm exists.
+//! of one standing in for the other. That partition survived the Windows arm
+//! precisely because it was spelled this way: `backend-metal` stayed macOS-only,
+//! so `feature = "backend-vulkan"` picked up the new host with no edit. Do not
+//! reintroduce `not(all(feature = "backend-metal", target_os = "macos"))` as a
+//! spelling of "the engine path" — it says what the build is *not*, and with
+//! four arms it is no longer equivalent.
+//!
+//! Windows and Linux are the same arm as far as the engine is concerned: both
+//! reach a native ICD through the Vulkan loader. Where the two genuinely differ
+//! - the WSI surface extension, the scratch directory - the gate names
+//! `windows` positively rather than negating `macos`, so a reader sees which
+//! host is meant.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(rust_2018_idioms)]
@@ -54,16 +63,21 @@ compile_error!(
      any other host."
 );
 
-// Vulkan reaches the GPU through MoltenVK on macOS and a native ICD on Linux.
-// Any other host is untested rather than known-broken — name it here so a new
-// port is a deliberate edit to this list, not an accident.
+// Vulkan reaches the GPU through MoltenVK on macOS and a native ICD on Linux and
+// Windows. Any other host is untested rather than known-broken - name it here so
+// a new port is a deliberate edit to this list, not an accident.
 #[cfg(all(
     feature = "backend-vulkan",
-    not(any(target_os = "macos", target_os = "linux"))
+    not(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "windows"
+    ))
 ))]
 compile_error!(
-    "backend-vulkan is supported on target_os = \"macos\" (MoltenVK) and \
-     target_os = \"linux\" (native ICD) only"
+    "backend-vulkan is supported on target_os = \"macos\" (MoltenVK), \
+     target_os = \"linux\" (native ICD) and target_os = \"windows\" \
+     (native ICD) only"
 );
 
 pub mod contract;
