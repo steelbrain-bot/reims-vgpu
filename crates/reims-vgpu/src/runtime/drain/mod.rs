@@ -5139,6 +5139,26 @@ pub fn publish_stranded_fifos<H: HostMemory + HostOps>(
         state.pending.iosfc = true;
         published = true;
     }
+    // A translation finishing is a producer advance with no doorbell behind it,
+    // which is the case this whole function exists for — only the producer is
+    // ours, not the guest's, so none of the tests above can see it.
+    //
+    // The packet that deferred is still at its channel's FIFO head, waiting to
+    // be retried. The guest has nothing left to send: it is blocked on the very
+    // work that packet represents, so it rings no doorbell. The async
+    // translation worker stores its result and returns, with no way to say the
+    // packet became runnable. If the channel is not republished here, the retry
+    // never happens and neither side moves again.
+    //
+    // Measured on the Windows rail: a 1.18 MB fragment shader took 9.3 s to
+    // translate, the FIFOs were parked meanwhile, and the guest then sat idle
+    // for thirteen minutes with the translation it was waiting for long since
+    // complete. Republishing costs one drain per poll while a deferral is
+    // outstanding, and stops as soon as the retry clears the mask.
+    if state.translation_deferred_mask != 0 {
+        state.pending.child_mask |= state.translation_deferred_mask;
+        published = true;
+    }
     if published {
         host.schedule_bh();
     }

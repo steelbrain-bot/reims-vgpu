@@ -683,6 +683,49 @@ fn present_holds_for_translation_deferred_on_other_channel() {
     assert!(state.present.frame_flush_seen);
 }
 
+/// A finished translation must republish its channel, because nothing else
+/// will.
+///
+/// `publish_stranded_fifos` is the periodic rescue for a producer that advanced
+/// without ringing a doorbell. The async translation worker is exactly such a
+/// producer and the only one that is ours: the deferred packet sits at its FIFO
+/// head, the guest is blocked on it and sends nothing more, and the worker
+/// finishes with no way to say so. Without this the retry never runs and both
+/// sides wait forever — observed as a guest idle for thirteen minutes with the
+/// shader it wanted long since translated.
+///
+/// The guest side is left deliberately quiet here: no root FIFO advance, no
+/// active children, no iosfc work. That is the state the deadlock happens in,
+/// so it is the state the test asserts on.
+#[test]
+fn a_deferred_translation_republishes_its_channel_with_no_guest_activity() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    state.gfx.control_fifo = 0x1000;
+    state
+        .gfx
+        .fifo_read
+        .store(state.gfx.fifo_written, std::sync::atomic::Ordering::Release);
+    state.active_child_mask = 0;
+    state.iosfc.consumer = state.iosfc.producer;
+
+    assert!(
+        !publish_stranded_fifos(&mut state, &mut host),
+        "with nothing deferred and the guest quiet there is nothing to publish"
+    );
+
+    state.translation_deferred_mask = 1 << 1;
+    assert!(
+        publish_stranded_fifos(&mut state, &mut host),
+        "a deferred translation must be published even though the guest is quiet"
+    );
+    assert_eq!(
+        state.pending.child_mask & (1 << 1),
+        1 << 1,
+        "the deferred channel must be re-armed so its packet is retried"
+    );
+}
+
 /// The currently executing display channel cannot be an overtaken sibling
 /// and is excluded from the proxy mask.
 #[test]
