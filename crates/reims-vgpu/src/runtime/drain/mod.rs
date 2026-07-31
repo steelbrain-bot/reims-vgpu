@@ -5159,6 +5159,49 @@ pub fn publish_stranded_fifos<H: HostMemory + HostOps>(
         state.pending.child_mask |= state.translation_deferred_mask;
         published = true;
     }
+    // Parked FIFOs need the same rescue, and for the same reason one step later.
+    // `release_translation_order_holds` runs only at the top of a drain, so a
+    // hold that outlives the deferral that caused it needs a drain scheduled to
+    // take it back down — and if the guest is quiet there is nothing to schedule
+    // one. Measured: 14 hold episodes against 7 releases, with the deferred mask
+    // already clear and every FIFO still parked.
+    //
+    // Bit 0 names the root FIFO rather than a channel, so it is routed to
+    // `main_drain`; putting it in `child_mask` would arm channel 0, which is not
+    // what that bit means.
+    if state.translation_order_hold_mask != 0 {
+        let held = state.translation_order_hold_mask;
+        if held & TRANSLATION_ROOT_FIFO_BIT != 0 {
+            state.pending.main_drain = true;
+        }
+        state.pending.child_mask |= held & !TRANSLATION_ROOT_FIFO_BIT;
+        published = true;
+    }
+    // A DisplaySwap parked on present backpressure is the third way to strand a
+    // FIFO, and on the host-window path it is a closed cycle.
+    //
+    // `enqueue_present_scanout` sets `host_action_yield`, which makes
+    // `drain_pending` return at its first line. On the window path the ack that
+    // clears it -- `note_present_paint_consumed` -- runs only inside
+    // `device_drain`, which is the very thing that will not run. There is no
+    // `ScanoutUpdate` on this path either, so `device_scanout_copy`, the other
+    // caller, never fires. Nothing else can lower the flag, and the guest cannot
+    // help: it is waiting for the present it already queued.
+    //
+    // Measured on the Windows rail: guest-side `GPU hang: Name Display0
+    // written: 504 read: 432` repeated 196 times with both ring pointers frozen
+    // at the same values, while `display_vbl` kept ticking and `drain_duty` had
+    // stopped entirely. The 72-byte gap is the DisplaySwap the entry gate is
+    // holding.
+    //
+    // Republishing the channel gets a drain scheduled; the ack inside it clears
+    // the yield and the hold, and the gate re-opens. Costs one drain per poll
+    // while a present is outstanding, which is bounded by
+    // `MAX_UNPAINTED_PRESENTS`.
+    if state.present.backpressure_hold_active || state.pending.host_action_yield {
+        state.pending.child_mask |= state.active_child_mask;
+        published = true;
+    }
     if published {
         host.schedule_bh();
     }

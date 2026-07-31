@@ -726,6 +726,109 @@ fn a_deferred_translation_republishes_its_channel_with_no_guest_activity() {
     );
 }
 
+/// A hold that outlives its deferral still needs a drain scheduled to release
+/// it.
+///
+/// `release_translation_order_holds` runs only at the top of a drain. Once the
+/// deferral clears, nothing is left to publish on the guest's behalf, so a quiet
+/// guest means no drain, no release, and FIFOs parked for good — measured as 14
+/// hold episodes against 7 releases with the deferred mask already empty.
+///
+/// Bit 0 is the root FIFO, not channel 0, so it must arrive as `main_drain`.
+#[test]
+fn a_hold_outliving_its_deferral_still_schedules_a_drain() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    state.gfx.control_fifo = 0x1000;
+    state
+        .gfx
+        .fifo_read
+        .store(state.gfx.fifo_written, std::sync::atomic::Ordering::Release);
+    state.active_child_mask = 0;
+    state.iosfc.consumer = state.iosfc.producer;
+
+    // The deferral is over; only the parking remains.
+    state.translation_deferred_mask = 0;
+    state.translation_order_hold_mask = TRANSLATION_ROOT_FIFO_BIT | (1 << 2);
+
+    assert!(
+        publish_stranded_fifos(&mut state, &mut host),
+        "a parked FIFO must be published even with nothing deferred"
+    );
+    assert!(
+        state.pending.main_drain,
+        "the root FIFO bit must arrive as main_drain, not as channel 0"
+    );
+    assert_eq!(
+        state.pending.child_mask & (1 << 2),
+        1 << 2,
+        "held child channels must be re-armed"
+    );
+    assert_eq!(
+        state.pending.child_mask & TRANSLATION_ROOT_FIFO_BIT,
+        0,
+        "the root bit must not be armed as a child channel"
+    );
+}
+
+/// A present held on backpressure must get a drain scheduled, or the ack that
+/// would release it can never run.
+///
+/// On the host-window path this is a closed cycle: `host_action_yield` makes
+/// `drain_pending` return immediately, and the only thing that clears it —
+/// `note_present_paint_consumed` — runs inside the drain that will not happen.
+/// The guest cannot break it either; it is waiting on the present it queued.
+/// Observed as a guest `GPU hang: Name Display0` repeating with both ring
+/// pointers frozen.
+#[test]
+fn a_present_held_on_backpressure_schedules_a_drain() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    state.gfx.control_fifo = 0x1000;
+    state
+        .gfx
+        .fifo_read
+        .store(state.gfx.fifo_written, std::sync::atomic::Ordering::Release);
+    state.iosfc.consumer = state.iosfc.producer;
+    state.translation_deferred_mask = 0;
+    state.translation_order_hold_mask = 0;
+    // `control_fifo` is zero here on purpose. That is the state the wedge was
+    // measured in: the guest has stopped touching the control ring entirely, so
+    // the `active_child_mask` branch above is unreachable and cannot mask the
+    // defect. With a live control FIFO this function republishes active children
+    // anyway and the test would pass without the fix, proving nothing.
+    state.gfx.control_fifo = 0;
+    state.active_child_mask = 1 << 3;
+    state.pending.child_mask = 0;
+
+    assert!(
+        !publish_stranded_fifos(&mut state, &mut host),
+        "nothing is outstanding yet, so nothing should be published"
+    );
+
+    // The yield alone is enough to wedge the drain, so it is enough to rescue.
+    state.pending.host_action_yield = true;
+    assert!(
+        publish_stranded_fifos(&mut state, &mut host),
+        "a present-yielded drain must be rescheduled"
+    );
+    assert_eq!(
+        state.pending.child_mask & (1 << 3),
+        1 << 3,
+        "the display channel must be re-armed so the ack can run"
+    );
+
+    // The entry-gate hold is the same wedge one step earlier.
+    state.pending.host_action_yield = false;
+    state.pending.child_mask = 0;
+    state.present.backpressure_hold_active = true;
+    assert!(
+        publish_stranded_fifos(&mut state, &mut host),
+        "a backpressure-held DisplaySwap must be rescheduled"
+    );
+    assert_eq!(state.pending.child_mask & (1 << 3), 1 << 3);
+}
+
 /// The currently executing display channel cannot be an overtaken sibling
 /// and is excluded from the proxy mask.
 #[test]
