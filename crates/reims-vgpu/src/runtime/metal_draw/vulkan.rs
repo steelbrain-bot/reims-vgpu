@@ -4096,7 +4096,39 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         )
     })?;
 
-    let Some((w, h)) = req.colors.first().map(|c0| (c0.width, c0.height)) else {
+    // Decline a relooper state machine before the driver is handed it.
+    //
+    // `vkCreateGraphicsPipelines` runs on the drain worker with the device lock
+    // held, so a driver that does not return does not merely lose this draw --
+    // it stops the device. The guest's rings stop being consumed and it reports
+    // `GPU hang: Name Display0` with the ring cursors frozen. Measured on an
+    // NVIDIA host: the WindowServer compositor's fragment module (2 731 blocks,
+    // 2 725 switch cases) held that call past 22 minutes at a full core with a
+    // flat working set, while every structured module in the same boot compiled
+    // in single-digit milliseconds.
+    //
+    // Checked here rather than in the engine because both stages' modules are in
+    // hand and the decline should name which stage carried the shape.
+    for (stage, shader) in [("vertex", &v_shader), ("fragment", &f_shader)] {
+        if shader.shape.is_relooper_state_machine() {
+            let reason = crate::backend::vulkan::engine::reason::DrawReason::
+                UnstructuredStateMachineShader {
+                    blocks: shader.shape.blocks,
+                    switch_cases: shader.shape.max_switch_cases,
+                };
+            crate::observe::Emit::decline("linux_m2v_draw", &reason)
+                .field("pipe", req.pipeline_ref)
+                .field("stage", stage)
+                .fail_once(u64::from(req.pipeline_ref));
+            return Err(DrawError::Unsupported(reason));
+        }
+    }
+
+    let (w, h) = if req.width > 0 && req.height > 0 {
+        (req.width, req.height)
+    } else if let Some(c0) = req.colors.first() {
+        (c0.width, c0.height)
+    } else {
         return Ok(M2vDrawSpan::None);
     };
     // The bound is the device's own `maxImageDimension2D`, not a fixed number:

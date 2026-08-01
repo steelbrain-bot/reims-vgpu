@@ -41,6 +41,22 @@ pub enum DrawReason {
     /// appended after the secondaries and the two paths have not been proven
     /// together.
     DepthWithSecondaryAttachments,
+    /// The translated module is an unstructured state machine, which this
+    /// host's shader compiler cannot compile in bounded time.
+    ///
+    /// metal2vulkan structures control flow when it can and falls back to a
+    /// relooper state machine when it cannot: one function, one loop, and one
+    /// `OpSwitch` whose case count is the block count, with the next block index
+    /// written to a variable each iteration. Measured on an NVIDIA host, one
+    /// such module — the WindowServer compositor, 2 731 blocks, 2 725 cases —
+    /// held `vkCreateGraphicsPipelines` for over 22 minutes at a full core with
+    /// a flat working set, and never returned. The same driver compiles every
+    /// structured module in that boot in single-digit milliseconds.
+    ///
+    /// Declining costs this shader's draws. Not declining costs the device: the
+    /// call runs on the drain worker under the device lock, so the guest's rings
+    /// stop being consumed and it reports a GPU hang.
+    UnstructuredStateMachineShader { blocks: u32, switch_cases: u32 },
     /// The device does not advertise `samplerAnisotropy` and the guest sampler
     /// asked for it.
     SamplerAnisotropyUnsupported,
@@ -123,6 +139,7 @@ impl crate::observe::Decline for DrawReason {
             Self::GuestRunSampledNot2d { .. } => "guest_run_sampled_not_2d",
             Self::SecondaryAttachmentCap { .. } => "secondary_attachment_cap",
             Self::DepthWithSecondaryAttachments => "depth_with_secondary_attachments",
+            Self::UnstructuredStateMachineShader { .. } => "unstructured_state_machine_shader",
             Self::SamplerAnisotropyUnsupported => "sampler_anisotropy_unsupported",
             Self::SamplerMirrorClampToEdgeUnsupported => "sampler_mirror_clamp_to_edge_unsupported",
             Self::DualSourceBlendUnsupported => "dual_source_blend_unsupported",
@@ -167,6 +184,10 @@ impl std::fmt::Display for DrawReason {
             Self::SecondaryAttachmentCap { requested, cap } => {
                 write!(f, " requested={requested} cap={cap}")
             }
+            Self::UnstructuredStateMachineShader {
+                blocks,
+                switch_cases,
+            } => write!(f, " blocks={blocks} switch_cases={switch_cases}"),
             Self::VertexFormat(reason) => write!(f, " value={}", reason.value()),
             Self::InstanceRateDivisorUnsupported { step_rate } => write!(f, " rate={step_rate}"),
             Self::InstanceRateDivisorOverLimit { step_rate, limit } => {
@@ -239,6 +260,10 @@ mod tests {
             cap: 0,
         },
         DrawReason::DepthWithSecondaryAttachments,
+        DrawReason::UnstructuredStateMachineShader {
+            blocks: 0,
+            switch_cases: 0,
+        },
         DrawReason::SamplerAnisotropyUnsupported,
         DrawReason::SamplerMirrorClampToEdgeUnsupported,
         DrawReason::ConstantVertexAttribute,

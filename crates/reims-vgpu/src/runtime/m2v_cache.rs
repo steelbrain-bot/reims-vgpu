@@ -163,9 +163,74 @@ impl std::error::Error for M2vCacheDecline {}
 /// reflection is the single source of truth for stage-interface facts so the
 /// consumer never re-parses AIR or re-walks the emitted SPIR-V. `spirv` is the
 /// post-`repair_layout` module (byte-identical to what the plain cache returned).
+/// A module's basic-block count and the case count of its largest `OpSwitch`.
+///
+/// The pair identifies a relooper state machine, which is what metal2vulkan
+/// emits when it cannot structure a function's control flow: one loop, one
+/// switch, and one case per basic block, with the next block index written to a
+/// variable each iteration. In that shape the two numbers are equal; in
+/// structured code a switch has a handful of cases and many blocks belong to no
+/// switch at all. Measured on one boot's modules: the vertex shader was
+/// 13 blocks / 4 cases, the compositor fragment 2 731 / 2 725.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ModuleShape {
+    pub blocks: u32,
+    pub max_switch_cases: u32,
+}
+
+impl ModuleShape {
+    /// Does this look like a relooper state machine rather than structured code?
+    ///
+    /// Two conditions, both needed. The switch must dispatch essentially every
+    /// block — that is the state machine's defining shape, and no structured
+    /// shader approaches it. And the module must be past the translator's own
+    /// relooper block cap, which is the size at which metal2vulkan itself
+    /// declines to structure; below it a large switch is a real guest switch and
+    /// compiles fine.
+    ///
+    /// Using the translator's cap rather than a number chosen here keeps the
+    /// threshold tied to the thing that produces the shape.
+    pub fn is_relooper_state_machine(&self) -> bool {
+        const RELOOPER_MAX_BLOCKS: u32 = 1024;
+        self.blocks > RELOOPER_MAX_BLOCKS
+            && self.max_switch_cases.saturating_mul(10) >= self.blocks.saturating_mul(9)
+    }
+}
+
+/// Count basic blocks and the largest `OpSwitch`'s case count.
+///
+/// Bounds-checked word walk over the little-endian SPIR-V stream, header
+/// skipped, in the same shape as [`spirv_uses_builtin`]. `OpLabel` is 248 and
+/// starts a basic block; `OpSwitch` is 251 and carries
+/// `[selector, default, (literal, label)...]`, so its case count is
+/// `(word_count - 3) / 2`.
+fn spirv_module_shape(words: &[u32]) -> ModuleShape {
+    let mut shape = ModuleShape::default();
+    let mut i = 5; // skip header
+    while i < words.len() {
+        let word_count = (words[i] >> 16) as usize;
+        let opcode = words[i] & 0xffff;
+        if word_count == 0 || i + word_count > words.len() {
+            break;
+        }
+        match opcode {
+            248 => shape.blocks = shape.blocks.saturating_add(1),
+            251 if word_count >= 3 => {
+                let cases = ((word_count - 3) / 2) as u32;
+                shape.max_switch_cases = shape.max_switch_cases.max(cases);
+            }
+            _ => {}
+        }
+        i += word_count;
+    }
+    shape
+}
+
 pub struct CachedShader {
     pub spirv: Vec<u8>,
     pub reflection: Arc<ShaderReflection>,
+    /// Block/switch shape, computed once when the module is cached.
+    pub shape: ModuleShape,
     /// The same module as u32 words, materialized once — draw paths clone the
     /// `Arc`, never re-collect per draw (was a full-module copy ×2 per draw).
     pub words: Arc<Vec<u32>>,
@@ -182,9 +247,11 @@ impl CachedShader {
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
+        let shape = spirv_module_shape(&words);
         Self {
             spirv,
             reflection,
+            shape,
             words: Arc::new(words),
             frag_reloc: Mutex::new(HashMap::new()),
         }
@@ -750,6 +817,87 @@ pub fn reset_for_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a SPIR-V word stream carrying `blocks` `OpLabel`s and one
+    /// `OpSwitch` with `cases` cases. Only the two opcodes the shape scanner
+    /// reads are emitted — this is a probe for the scanner, not a valid module.
+    fn shaped_module(blocks: u32, cases: u32) -> Vec<u32> {
+        const OP_LABEL: u32 = 248;
+        const OP_SWITCH: u32 = 251;
+        let mut w = vec![0x0723_0203, 0x0001_0500, 0, 1, 0]; // 5-word header
+        for _ in 0..blocks {
+            w.push((2 << 16) | OP_LABEL);
+            w.push(1);
+        }
+        if cases > 0 {
+            let word_count = 3 + cases * 2;
+            w.push((word_count << 16) | OP_SWITCH);
+            w.push(1); // selector
+            w.push(2); // default label
+            for c in 0..cases {
+                w.push(c);
+                w.push(3);
+            }
+        }
+        w
+    }
+
+    /// The scanner must read the two numbers the discriminator is built on.
+    #[test]
+    fn the_module_shape_scanner_counts_blocks_and_the_widest_switch() {
+        let shape = spirv_module_shape(&shaped_module(2731, 2725));
+        assert_eq!(shape.blocks, 2731);
+        assert_eq!(shape.max_switch_cases, 2725);
+
+        // A module with no switch at all still reports its blocks.
+        let plain = spirv_module_shape(&shaped_module(13, 0));
+        assert_eq!(plain.blocks, 13);
+        assert_eq!(plain.max_switch_cases, 0);
+
+        // Truncated stream: stop, do not read past the end.
+        let mut short = shaped_module(4, 0);
+        short.truncate(6);
+        assert!(spirv_module_shape(&short).blocks <= 4);
+    }
+
+    /// The discriminator separates the two real modules that motivated it, and
+    /// does not fire on a large *structured* switch.
+    ///
+    /// Both shapes are measured, from one boot of the x86 guest: the vertex
+    /// shader of pipe 48 and the compositor fragment shader that held
+    /// `vkCreateGraphicsPipelines` past 22 minutes.
+    #[test]
+    fn only_a_relooper_state_machine_is_declined() {
+        // Measured: pipe 48 vertex, structured, compiled in milliseconds.
+        let vertex = ModuleShape {
+            blocks: 13,
+            max_switch_cases: 4,
+        };
+        assert!(!vertex.is_relooper_state_machine());
+
+        // Measured: pipe 48 fragment, the state machine that never compiled.
+        let compositor = ModuleShape {
+            blocks: 2731,
+            max_switch_cases: 2725,
+        };
+        assert!(compositor.is_relooper_state_machine());
+
+        // A genuinely large guest switch, but structured: most blocks are not
+        // cases. Must not be declined.
+        let big_structured = ModuleShape {
+            blocks: 4000,
+            max_switch_cases: 300,
+        };
+        assert!(!big_structured.is_relooper_state_machine());
+
+        // A small function that happens to be almost all switch: below the
+        // translator's relooper cap, so it was structured and compiles.
+        let small_dispatch = ModuleShape {
+            blocks: 200,
+            max_switch_cases: 199,
+        };
+        assert!(!small_dispatch.is_relooper_state_machine());
+    }
 
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
