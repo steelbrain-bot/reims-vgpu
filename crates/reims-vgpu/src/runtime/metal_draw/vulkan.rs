@@ -1917,9 +1917,17 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
     // RG8→(r,g,0,255), which is exactly what an R8_UNORM / R8G8_UNORM Vulkan
     // image samples to (`.r` / `.rg`, zero-filled tail). Skipping the CPU expand
     // and uploading native cuts 4×/2× the staging bytes with byte-exact texels.
+    // Formats with a native sampled rail upload their bytes verbatim; everything
+    // else expands per texel into RGBA8 below. A format that has neither an entry
+    // here nor an arm in `convert_row_to_rgba8` is refused at every bind, which
+    // is what `R16_UNORM` was — 387 refusals of one 3840x2160 view in a single
+    // logged-in session.
     let byte_format = match view.pixel_format {
         pixel_format::MTL_FORMAT_R8_UNORM => TexelLayout::R8,
         pixel_format::MTL_FORMAT_RG8_UNORM => TexelLayout::Rg8,
+        pixel_format::MTL_FORMAT_R16_UNORM => TexelLayout::R16Unorm,
+        pixel_format::MTL_FORMAT_RG16_UNORM => TexelLayout::Rg16Unorm,
+        pixel_format::MTL_FORMAT_R16_FLOAT => TexelLayout::R16Float,
         _ => TexelLayout::Rgba8,
     };
     let ok_line = |generation_source: &str, rgba: &[u8]| {
@@ -2371,6 +2379,8 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
         Ok((layout, decline))
             if layout.is_four_byte_color()
                 || layout == TexelLayout::R16Float
+                || layout == TexelLayout::R16Unorm
+                || layout == TexelLayout::Rg16Unorm
                 || (layout == TexelLayout::R32Float
                     && engine::supports_sampled_r32f_linear_filter()) =>
         {

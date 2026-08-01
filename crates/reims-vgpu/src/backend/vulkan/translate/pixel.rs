@@ -127,6 +127,7 @@ pub fn translate(mtl: u16) -> Result<PixelFormat, TranslateReason> {
         },
         p::MTL_FORMAT_R8_UNORM => linear(vk::Format::R8_UNORM, 1),
         p::MTL_FORMAT_R16_UNORM => linear(vk::Format::R16_UNORM, 2),
+        p::MTL_FORMAT_RG16_UNORM => linear(vk::Format::R16G16_UNORM, 4),
         p::MTL_FORMAT_R16_FLOAT => linear(vk::Format::R16_SFLOAT, 2),
         p::MTL_FORMAT_RG8_UNORM => linear(vk::Format::R8G8_UNORM, 2),
         p::MTL_FORMAT_R32_UINT => linear(vk::Format::R32_UINT, 4),
@@ -216,6 +217,8 @@ pub fn sampled_pixels(mtl: u16) -> Result<(TexelLayout, Option<TranslateReason>)
         // but the rail that emits it must confirm the host can filter it — see
         // `try_linear_sample_zero_copy`'s `supports_sampled_r32f_linear_filter`
         // gate — or the sample stays fail-visible.
+        vk::Format::R16_UNORM => TexelLayout::R16Unorm,
+        vk::Format::R16G16_UNORM => TexelLayout::Rg16Unorm,
         vk::Format::R16_SFLOAT => TexelLayout::R16Float,
         vk::Format::R32_SFLOAT => TexelLayout::R32Float,
         _ => return Err(TranslateReason::NoSampledLayout(mtl)),
@@ -235,6 +238,8 @@ pub fn vk_texel_layout(layout: TexelLayout) -> vk::Format {
         TexelLayout::Bgra8 => vk::Format::B8G8R8A8_UNORM,
         TexelLayout::R8 => vk::Format::R8_UNORM,
         TexelLayout::Rg8 => vk::Format::R8G8_UNORM,
+        TexelLayout::R16Unorm => vk::Format::R16_UNORM,
+        TexelLayout::Rg16Unorm => vk::Format::R16G16_UNORM,
         TexelLayout::R16Float => vk::Format::R16_SFLOAT,
         TexelLayout::R32Float => vk::Format::R32_SFLOAT,
     }
@@ -889,6 +894,31 @@ mod tests {
     /// `UberCompositeFragment` display-profile pass arrive this way; before this
     /// rail carried the layout the draw resolved to nothing and the whole
     /// color-managed desktop composite failed with `draw_vk_nothing_stored`.
+    /// `R16Unorm` reaches the GPU as one 16-bit channel, not as two 8-bit ones.
+    ///
+    /// It has no arm in the CPU `convert_row_to_rgba8` loader, so without a
+    /// native rail every bind of such a view is refused — measured as 387
+    /// `type5_view_convert` declines of a single 3840x2160 view in one logged-in
+    /// macOS session, the largest decline class in that boot.
+    ///
+    /// The layout it lands on decides how the GPU reads the texel, so the
+    /// distinction from the other two-byte layouts is the whole point.
+    #[test]
+    fn single_channel_unorm_samples_natively_and_not_as_two_bytes() {
+        use crate::contract::pixel_format::TexelLayout;
+
+        let (layout, _decline) =
+            sampled_pixels(p::MTL_FORMAT_R16_UNORM).expect("R16Unorm is sampled");
+        assert_eq!(layout, TexelLayout::R16Unorm);
+        assert_eq!(vk_texel_layout(layout), vk::Format::R16_UNORM);
+        // Two bytes per texel, like `Rg8` and `R16Float` — but a distinct layout,
+        // because `R8G8_UNORM` would read the same bytes as two channels.
+        assert_eq!(layout.bytes_per_texel(), 2);
+        assert_ne!(layout, TexelLayout::Rg8);
+        assert_ne!(vk_texel_layout(layout), vk_texel_layout(TexelLayout::Rg8));
+        assert_ne!(vk_texel_layout(layout), vk_texel_layout(TexelLayout::R16Float));
+    }
+
     #[test]
     fn single_channel_float_samples_natively_through_its_own_layout() {
         use crate::contract::pixel_format::TexelLayout;

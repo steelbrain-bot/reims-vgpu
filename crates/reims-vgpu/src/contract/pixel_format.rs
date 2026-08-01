@@ -33,6 +33,19 @@ pub const MTL_FORMAT_R8_UNORM: u16 = 0x0a;
 pub const MTL_FORMAT_R16_UNORM: u16 = 0x14;
 pub const MTL_FORMAT_R16_FLOAT: u16 = 0x19;
 pub const MTL_FORMAT_RG8_UNORM: u16 = 0x1e;
+/// `MTLPixelFormatRG16Unorm = 60`. Four bytes, two channels of 16-bit unorm.
+///
+/// The chroma half of a 10-bit biplanar 4:2:0 surface, whose luma half is
+/// [`MTL_FORMAT_R16_UNORM`]. Measured together on one live macOS desktop: a
+/// `x420` surface (FourCC `0x78343230`, `planes=2`) publishes plane 0 as
+/// 3840x2160 at exactly two bytes per texel and plane 1 as 1920x1080 — half in
+/// both axes, which is what 4:2:0 subsampling means — and a full-screen quad
+/// samples the two at fragment texture indices 3 and 5, doing the YCbCr-to-RGB
+/// conversion itself.
+///
+/// Value read off `MTLPixelFormat.h` like the rest of this table: `RG16Float` is
+/// already here at `0x41` (65), and `RG16Unorm` is 60.
+pub const MTL_FORMAT_RG16_UNORM: u16 = 0x3c;
 pub const MTL_FORMAT_R32_UINT: u16 = 0x35;
 pub const MTL_FORMAT_R32_SINT: u16 = 0x36;
 pub const MTL_FORMAT_R32_FLOAT: u16 = 0x37;
@@ -143,6 +156,28 @@ pub enum TexelLayout {
     /// has no float arm, so this native rail is the only correct path. Not a
     /// four-byte color layout, so it never rides the RGBA8-shaped loaders.
     R16Float,
+    /// 2 bytes/texel — a single-channel 16-bit unorm texture, sampled natively
+    /// as `R16_UNORM` (the shader reads `.x`, the other lanes expand to
+    /// `0,0,1`).
+    ///
+    /// Same reason as [`Self::R16Float`] for having its own layout rather than
+    /// riding the RGBA8 loaders: the CPU `convert_row_to_rgba8` path has no arm
+    /// for it, so every bind of such a view was refused. A live macOS desktop
+    /// binds one 3840x2160 view of this shape 387 times in a single logged-in
+    /// session.
+    ///
+    /// Not folded into [`Self::Rg8`], which is the same two bytes but a
+    /// different reading of them: `R8G8_UNORM` splits the texel into two 8-bit
+    /// channels, where this is one 16-bit value.
+    R16Unorm,
+    /// 4 bytes/texel — two channels of 16-bit unorm, sampled natively as
+    /// `R16G16_UNORM`.
+    ///
+    /// The chroma plane of a 10-bit biplanar 4:2:0 surface. Native for the same
+    /// reason as [`Self::Rg8`] is for 8-bit chroma: the shader reads `.rg` and
+    /// does its own YCbCr conversion, so expanding to RGBA8 would both cost 2x
+    /// the staging bytes and quantize ten bits down to eight.
+    Rg16Unorm,
     /// 4 bytes/texel — a single-channel `float32` texture, sampled natively as
     /// `R32_SFLOAT`. Same color-LUT role as [`Self::R16Float`], but its
     /// linear-filter feature is optional (absent on Apple/MoltenVK), so the
@@ -159,7 +194,8 @@ impl TexelLayout {
             Self::Rgba8 | Self::Bgra8 => RGBA8_BPP,
             Self::R8 => R8_BPP,
             Self::Rg8 => RG8_BPP,
-            Self::R16Float => R16F_BPP,
+            Self::R16Float | Self::R16Unorm => R16F_BPP,
+            Self::Rg16Unorm => RG16F_BPP,
             Self::R32Float => R32F_BPP,
         }
     }
@@ -227,7 +263,7 @@ pub fn bytes_per_pixel(format: u16) -> Option<u32> {
         | MTL_FORMAT_R16_FLOAT
         | MTL_FORMAT_RG8_UNORM
         | MTL_FORMAT_DEPTH16_UNORM => RG8_BPP,
-        MTL_FORMAT_RG16_FLOAT => RG16F_BPP,
+        MTL_FORMAT_RG16_UNORM | MTL_FORMAT_RG16_FLOAT => RG16F_BPP,
         MTL_FORMAT_RGBA8_UNORM
         | MTL_FORMAT_RGBA8_UNORM_SRGB
         | MTL_FORMAT_RGBA8_UINT
@@ -1152,6 +1188,7 @@ mod tests {
             (MTL_FORMAT_R32_UINT, 4),
             (MTL_FORMAT_R32_SINT, 4),
             (MTL_FORMAT_R32_FLOAT, 4),
+            (MTL_FORMAT_RG16_UNORM, 4),
             (MTL_FORMAT_RG16_FLOAT, 4),
             (MTL_FORMAT_RGBA8_UNORM, 4),
             (MTL_FORMAT_RGBA8_UNORM_SRGB, 4),
