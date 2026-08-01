@@ -128,6 +128,7 @@ pub fn translate(mtl: u16) -> Result<PixelFormat, TranslateReason> {
         p::MTL_FORMAT_R8_UNORM => linear(vk::Format::R8_UNORM, 1),
         p::MTL_FORMAT_R16_UNORM => linear(vk::Format::R16_UNORM, 2),
         p::MTL_FORMAT_RG16_UNORM => linear(vk::Format::R16G16_UNORM, 4),
+        p::MTL_FORMAT_RG16_UINT => linear(vk::Format::R16G16_UINT, 4),
         p::MTL_FORMAT_R16_FLOAT => linear(vk::Format::R16_SFLOAT, 2),
         p::MTL_FORMAT_RG8_UNORM => linear(vk::Format::R8G8_UNORM, 2),
         p::MTL_FORMAT_R32_UINT => linear(vk::Format::R32_UINT, 4),
@@ -219,6 +220,7 @@ pub fn sampled_pixels(mtl: u16) -> Result<(TexelLayout, Option<TranslateReason>)
         // gate — or the sample stays fail-visible.
         vk::Format::R16_UNORM => TexelLayout::R16Unorm,
         vk::Format::R16G16_UNORM => TexelLayout::Rg16Unorm,
+        vk::Format::R16G16_UINT => TexelLayout::Rg16Uint,
         vk::Format::R16_SFLOAT => TexelLayout::R16Float,
         vk::Format::R32_SFLOAT => TexelLayout::R32Float,
         _ => return Err(TranslateReason::NoSampledLayout(mtl)),
@@ -240,6 +242,7 @@ pub fn vk_texel_layout(layout: TexelLayout) -> vk::Format {
         TexelLayout::Rg8 => vk::Format::R8G8_UNORM,
         TexelLayout::R16Unorm => vk::Format::R16_UNORM,
         TexelLayout::Rg16Unorm => vk::Format::R16G16_UNORM,
+        TexelLayout::Rg16Uint => vk::Format::R16G16_UINT,
         TexelLayout::R16Float => vk::Format::R16_SFLOAT,
         TexelLayout::R32Float => vk::Format::R32_SFLOAT,
     }
@@ -894,6 +897,47 @@ mod tests {
     /// `UberCompositeFragment` display-profile pass arrive this way; before this
     /// rail carried the layout the draw resolved to nothing and the whole
     /// color-managed desktop composite failed with `draw_vk_nothing_stored`.
+    /// `RG16Uint` samples as integer texels and never rides the colour rails.
+    ///
+    /// The guest shader settles the type twice over: its decoded argument type
+    /// and translated SPIR-V image type both require integer texels. A `_UNORM`
+    /// or `_SFLOAT` there would be an invalid descriptor.
+    ///
+    /// It is also fetch-only — every access is `OpImageFetch` or
+    /// `OpImageQuerySizeLod`, never `OpSampledImage` — so it needs no linear
+    /// filtering, which Vulkan does not offer for integer formats anyway.
+    #[test]
+    fn two_channel_uint_samples_as_integer_texels_and_never_as_colour() {
+        use crate::contract::pixel_format::{self as p, TexelLayout};
+
+        let (layout, _decline) =
+            sampled_pixels(p::MTL_FORMAT_RG16_UINT).expect("RG16Uint is sampled");
+        assert_eq!(layout, TexelLayout::Rg16Uint);
+        assert_eq!(vk_texel_layout(layout), vk::Format::R16G16_UINT);
+        assert_eq!(layout.bytes_per_texel(), 4);
+
+        // Distinct from the other two four-byte two-channel layouts: reading
+        // integer texels as unorm or float would be a different image.
+        assert_ne!(vk_texel_layout(layout), vk_texel_layout(TexelLayout::Rg16Unorm));
+        assert_ne!(vk_texel_layout(layout), vk_texel_layout(TexelLayout::R16Float));
+
+        // Kept off every rail that carries colour through 8-bit unorm LUTs. A
+        // 16-bit coordinate does not survive that round trip, and a named
+        // refusal is better than wrong pixels.
+        assert_eq!(p::render_target_class(p::MTL_FORMAT_RG16_UINT), None);
+        assert_eq!(p::texel_to_rgba8(p::MTL_FORMAT_RG16_UINT, &[0u8; 4]), None);
+        assert!(!p::rgba8_to_texel(
+            p::MTL_FORMAT_RG16_UINT,
+            [1, 2, 3, 4],
+            &mut [0u8; 4]
+        ));
+
+        // But its size is known, which is what the sampled bind needs: an
+        // unknown width is what made this format read as a bpp mismatch against
+        // itself (`base_fmt=0x3f view_fmt=0x3f`).
+        assert_eq!(p::bytes_per_pixel(p::MTL_FORMAT_RG16_UINT), Some(4));
+    }
+
     /// `R16Unorm` reaches the GPU as one 16-bit channel, not as two 8-bit ones.
     ///
     /// It has no arm in the CPU `convert_row_to_rgba8` loader, so without a

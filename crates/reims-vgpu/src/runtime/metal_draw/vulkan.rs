@@ -1927,6 +1927,7 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
         pixel_format::MTL_FORMAT_RG8_UNORM => TexelLayout::Rg8,
         pixel_format::MTL_FORMAT_R16_UNORM => TexelLayout::R16Unorm,
         pixel_format::MTL_FORMAT_RG16_UNORM => TexelLayout::Rg16Unorm,
+        pixel_format::MTL_FORMAT_RG16_UINT => TexelLayout::Rg16Uint,
         pixel_format::MTL_FORMAT_R16_FLOAT => TexelLayout::R16Float,
         _ => TexelLayout::Rgba8,
     };
@@ -2381,6 +2382,7 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                 || layout == TexelLayout::R16Float
                 || layout == TexelLayout::R16Unorm
                 || layout == TexelLayout::Rg16Unorm
+                || layout == TexelLayout::Rg16Uint
                 || (layout == TexelLayout::R32Float
                     && engine::supports_sampled_r32f_linear_filter()) =>
         {
