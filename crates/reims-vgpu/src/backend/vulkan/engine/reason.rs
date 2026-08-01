@@ -57,6 +57,20 @@ pub enum DrawReason {
     /// call runs on the drain worker under the device lock, so the guest's rings
     /// stop being consumed and it reports a GPU hang.
     UnstructuredStateMachineShader { blocks: u32, switch_cases: u32 },
+    /// The fragment shader declares a descriptor the draw never bound.
+    ///
+    /// Reading an undefined descriptor is undefined behaviour. The engine builds
+    /// its descriptor layout purely from provided resources, so such a draw both
+    /// samples whatever memory the descriptor happens to address and omits the
+    /// binding from the pipeline layout — reported by a validation layer as
+    /// `VUID-vkCmdDraw-None-08114` plus
+    /// `VUID-VkGraphicsPipelineCreateInfo-layout-07988` on the same binding.
+    ///
+    /// Measured on the x86 rail: windows dragged their previous contents behind
+    /// them and the process eventually faulted. The unbound indices themselves
+    /// are named by the `shader_resource_declared_unbound` line emitted with
+    /// this decline.
+    FragmentDescriptorUnbound { pipeline_ref: u32 },
     /// The device does not advertise `samplerAnisotropy` and the guest sampler
     /// asked for it.
     SamplerAnisotropyUnsupported,
@@ -140,6 +154,7 @@ impl crate::observe::Decline for DrawReason {
             Self::SecondaryAttachmentCap { .. } => "secondary_attachment_cap",
             Self::DepthWithSecondaryAttachments => "depth_with_secondary_attachments",
             Self::UnstructuredStateMachineShader { .. } => "unstructured_state_machine_shader",
+            Self::FragmentDescriptorUnbound { .. } => "fragment_descriptor_unbound",
             Self::SamplerAnisotropyUnsupported => "sampler_anisotropy_unsupported",
             Self::SamplerMirrorClampToEdgeUnsupported => "sampler_mirror_clamp_to_edge_unsupported",
             Self::DualSourceBlendUnsupported => "dual_source_blend_unsupported",
@@ -188,6 +203,9 @@ impl std::fmt::Display for DrawReason {
                 blocks,
                 switch_cases,
             } => write!(f, " blocks={blocks} switch_cases={switch_cases}"),
+            Self::FragmentDescriptorUnbound { pipeline_ref } => {
+                write!(f, " pipe={pipeline_ref}")
+            }
             Self::VertexFormat(reason) => write!(f, " value={}", reason.value()),
             Self::InstanceRateDivisorUnsupported { step_rate } => write!(f, " rate={step_rate}"),
             Self::InstanceRateDivisorOverLimit { step_rate, limit } => {
@@ -264,6 +282,7 @@ mod tests {
             blocks: 0,
             switch_cases: 0,
         },
+        DrawReason::FragmentDescriptorUnbound { pipeline_ref: 0 },
         DrawReason::SamplerAnisotropyUnsupported,
         DrawReason::SamplerMirrorClampToEdgeUnsupported,
         DrawReason::ConstantVertexAttribute,

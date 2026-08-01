@@ -494,7 +494,9 @@ impl DeviceContext {
         let storage_image_write_without_format_bgra =
             features.storage_image_write_without_format_bgra();
         let sampled_r32f_linear_filter = features.sampled_r32f_linear_filter;
-        let has16 = features.storage16;
+        // Either half of the 16-bit storage struct being wanted is reason to
+        // chain it: they are separate bits in one structure.
+        let has16 = features.storage16 || features.storage_input_output16;
         let has8 = features.storage8;
         let has_float16 = features.float16;
         let has_int8 = features.int8;

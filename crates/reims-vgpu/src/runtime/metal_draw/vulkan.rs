@@ -4415,6 +4415,28 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     declared.join(","),
                     tex_pairs.join(",")
                 ));
+                // Declining, not just reporting.
+                //
+                // This used to log and then draw anyway. A Vulkan validation
+                // layer settled what that costs: the same pipelines come back as
+                // `VUID-vkCmdDraw-None-08114` ("VkDescriptorSet [Set 0, Binding
+                // 160] is invalid") and `VUID-VkGraphicsPipelineCreateInfo-layout-07988`
+                // ("uses descriptor [Set 0, Binding 160] but the binding was not
+                // declared in the pipeline layout"). Binding 160 is
+                // `TEXTURE_BINDING_BASE + 0` — the very `tex0` named here.
+                //
+                // Reading an undefined descriptor is undefined behaviour, and it
+                // presents exactly as reported from the guest: whatever memory
+                // the descriptor happens to address is sampled, so windows drag
+                // their previous contents behind them, and the driver is free to
+                // fault. Producing a wrong frame is worse than producing none —
+                // `AGENTS.md` asks for the reason to be visible, not for the
+                // undefined draw to proceed.
+                let reason =
+                    crate::backend::vulkan::engine::reason::DrawReason::FragmentDescriptorUnbound {
+                        pipeline_ref: req.pipeline_ref,
+                    };
+                return Err(DrawError::Unsupported(reason));
             }
             if !embedded.is_empty() {
                 crate::observe::fail(format!(

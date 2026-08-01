@@ -139,6 +139,16 @@ pub struct DeviceFeatures {
     /// on it and otherwise leaves the sample fail-visible.
     pub sampled_r32f_linear_filter: bool,
     pub storage16: bool,
+    /// 16-bit types in shader `Input`/`Output` storage classes — i.e. half
+    /// varyings passed between stages.
+    ///
+    /// Part of the same `VkPhysicalDevice16BitStorageFeatures` struct as
+    /// [`Self::storage16`] and separately toggled, so asking for one does not
+    /// grant the other. Metal's `half` interpolants land here, and the guest
+    /// uses them: `vkCreateShaderModule(): SPIR-V contains a 16-bit OpVariable
+    /// with Output Storage Class, but storageInputOutput16 was not enabled`
+    /// (`VUID-RuntimeSpirv-storageInputOutput16-11162`).
+    pub storage_input_output16: bool,
     pub storage8: bool,
     pub float16: bool,
     pub int8: bool,
@@ -258,6 +268,7 @@ impl DeviceFeatures {
     pub fn enabled_16bit_storage(&self) -> vk::PhysicalDevice16BitStorageFeatures<'static> {
         vk::PhysicalDevice16BitStorageFeatures::default()
             .storage_buffer16_bit_access(self.storage16)
+            .storage_input_output16(self.storage_input_output16)
     }
 
     /// 8-bit storage-buffer access.
@@ -410,6 +421,7 @@ pub unsafe fn query(
         bgra8_storage,
         sampled_r32f_linear_filter,
         storage16: supported_16.storage_buffer16_bit_access == vk::TRUE,
+        storage_input_output16: supported_16.storage_input_output16 == vk::TRUE,
         storage8: supported_8.storage_buffer8_bit_access == vk::TRUE,
         float16: supported_f16i8.shader_float16 == vk::TRUE,
         int8: supported_f16i8.shader_int8 == vk::TRUE,
@@ -446,6 +458,7 @@ mod tests {
             bgra8_storage: true,
             sampled_r32f_linear_filter: true,
             storage16: true,
+            storage_input_output16: true,
             storage8: true,
             float16: true,
             int8: true,
