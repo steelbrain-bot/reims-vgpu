@@ -4109,6 +4109,26 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     //
     // Checked here rather than in the engine because both stages' modules are in
     // hand and the decline should name which stage carried the shape.
+    // An invalid module must not reach the driver, whichever stage carries it.
+    // The translator can emit an `OpCompositeInsert` that puts an image or
+    // sampler handle into a struct; the Logical addressing model has no
+    // representation for that, `spirv-val` rejects the module, and a driver
+    // handed an invalid one may do anything. Measured on the compute path, where
+    // it stopped the host process being served three boots running — the render
+    // path shares the translator, so it shares the exposure.
+    for (stage, shader) in [("vertex", &v_shader), ("fragment", &f_shader)] {
+        if shader.shape.opaque_in_composite {
+            crate::observe::fail(format!(
+                "linux_m2v_draw m2v_invalid_module reason=opaque_handle_in_composite                  pipe={} stage={stage}                  (OpCompositeInsert/Extract of an image or sampler handle;                   spirv-val rejects the module)",
+                req.pipeline_ref
+            ));
+            return Err(DrawError::Unsupported(
+                crate::backend::vulkan::engine::reason::DrawReason::InvalidTranslatedModule {
+                    pipeline_ref: req.pipeline_ref,
+                },
+            ));
+        }
+    }
     for (stage, shader) in [("vertex", &v_shader), ("fragment", &f_shader)] {
         if shader.shape.is_relooper_state_machine() {
             let reason = crate::backend::vulkan::engine::reason::DrawReason::

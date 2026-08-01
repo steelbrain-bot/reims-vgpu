@@ -176,6 +176,26 @@ impl std::error::Error for M2vCacheDecline {}
 pub struct ModuleShape {
     pub blocks: u32,
     pub max_switch_cases: u32,
+    /// An `OpCompositeInsert` or `OpCompositeExtract` whose object is an opaque
+    /// handle — an image, a sampler or a sampled image.
+    ///
+    /// This is invalid SPIR-V, not a style question. Under the Logical
+    /// addressing model an opaque handle has no representation inside a
+    /// composite, so the type at the indexed path can never be the handle's own
+    /// type. `spirv-val` puts it plainly:
+    ///
+    /// ```text
+    /// The Object type (OpTypeImage) does not match the type that results from
+    /// indexing into the Composite (OpTypePointer).
+    ///   %193 = OpCompositeInsert %_struct_51 %84 %55 0 0
+    /// ```
+    ///
+    /// Creating a shader module from an invalid one is licence for the driver to
+    /// do anything, and here it did: three consecutive boots of a macOS desktop
+    /// stopped being served at the compute pipeline carrying exactly this
+    /// instruction, with no panic, no Vulkan error, no device loss and no host
+    /// crash record.
+    pub opaque_in_composite: bool,
 }
 
 impl ModuleShape {
@@ -206,6 +226,9 @@ impl ModuleShape {
 /// `(word_count - 3) / 2`.
 fn spirv_module_shape(words: &[u32]) -> ModuleShape {
     let mut shape = ModuleShape::default();
+    // <id>s whose type is an opaque handle. Seeded from the type declarations
+    // and propagated through the few instructions that can carry one.
+    let mut opaque_types: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut i = 5; // skip header
     while i < words.len() {
         let word_count = (words[i] >> 16) as usize;
@@ -214,10 +237,41 @@ fn spirv_module_shape(words: &[u32]) -> ModuleShape {
             break;
         }
         match opcode {
+            // OpTypeImage / OpTypeSampler / OpTypeSampledImage: record the
+            // result <id> so the composite check below can recognise a handle
+            // of that type without a full type walk.
+            OP_TYPE_IMAGE..=OP_TYPE_SAMPLED_IMAGE if word_count >= 2 => {
+                opaque_types.insert(words[i + 1]);
+            }
+            // Every other type-declaring or value-producing instruction whose
+            // result type is opaque makes its result opaque too. Only the ones
+            // that can name an image are worth following: OpLoad (61),
+            // OpSampledImage (86), OpImage (100), OpCopyObject (83) and
+            // OpFunctionParameter (55) all carry `result-type, result-id`.
+            55 | 61 | 83 | 86 | 100
+                if word_count >= 3 && opaque_types.contains(&words[i + 1]) =>
+            {
+                opaque_types.insert(words[i + 2]);
+            }
             248 => shape.blocks = shape.blocks.saturating_add(1),
             251 if word_count >= 3 => {
                 let cases = ((word_count - 3) / 2) as u32;
                 shape.max_switch_cases = shape.max_switch_cases.max(cases);
+            }
+            // OpCompositeInsert: result-type, result-id, object, composite, ...
+            // The object is word 3.
+            OP_COMPOSITE_INSERT
+                if word_count >= 5 && opaque_types.contains(&words[i + 3]) =>
+            {
+                shape.opaque_in_composite = true;
+            }
+            // OpCompositeExtract: result-type, result-id, composite, ... — an
+            // opaque *result type* means a handle is being read back out of a
+            // composite it could never have been put into.
+            OP_COMPOSITE_EXTRACT
+                if word_count >= 4 && opaque_types.contains(&words[i + 1]) =>
+            {
+                shape.opaque_in_composite = true;
             }
             _ => {}
         }
@@ -225,6 +279,15 @@ fn spirv_module_shape(words: &[u32]) -> ModuleShape {
     }
     shape
 }
+
+/// The three opaque-handle type declarations, contiguous in the SPIR-V core
+/// grammar: `OpTypeImage`, `OpTypeSampler`, `OpTypeSampledImage`.
+const OP_TYPE_IMAGE: u32 = 25;
+const OP_TYPE_SAMPLED_IMAGE: u32 = 27;
+/// `OpCompositeInsert`, from the SPIR-V core grammar.
+const OP_COMPOSITE_INSERT: u32 = 82;
+/// `OpCompositeExtract`, likewise.
+const OP_COMPOSITE_EXTRACT: u32 = 81;
 
 pub struct CachedShader {
     pub spirv: Vec<u8>,
@@ -866,12 +929,80 @@ mod tests {
     /// Both shapes are measured, from one boot of the x86 guest: the vertex
     /// shader of pipe 48 and the compositor fragment shader that held
     /// `vkCreateGraphicsPipelines` past 22 minutes.
+    /// An image handle inserted into a composite is spotted; ordinary composite
+    /// work is not.
+    ///
+    /// The positive case is the shape of the real instruction, taken from the
+    /// module a live macOS desktop was translating when the host process stopped
+    /// being served three boots in a row:
+    ///
+    /// ```text
+    /// %193 = OpCompositeInsert %_struct_51 %84 %55 0 0
+    /// ```
+    ///
+    /// where `%84` is an `OpLoad` of an `OpTypeImage` variable. `spirv-val`
+    /// rejects it — under the Logical addressing model an opaque handle has no
+    /// representation inside a composite — and a shader module built from an
+    /// invalid one lets the driver do anything.
+    ///
+    /// The negative case matters just as much: `OpCompositeInsert` is ordinary
+    /// and frequent, so a check that fired on all of it would decline nearly
+    /// every shader.
+    #[test]
+    fn an_opaque_handle_inside_a_composite_is_detected() {
+        // (opcode | word_count << 16), then operands.
+        fn op(opcode: u32, operands: &[u32]) -> Vec<u32> {
+            let mut out = vec![((operands.len() as u32 + 1) << 16) | opcode];
+            out.extend_from_slice(operands);
+            out
+        }
+        fn module(body: &[Vec<u32>]) -> Vec<u32> {
+            let mut words = vec![0x0723_0203, 0x0001_0300, 0, 1, 0];
+            for instruction in body {
+                words.extend_from_slice(instruction);
+            }
+            words
+        }
+
+        // %10 = OpTypeImage, %11 = OpTypePointer to it, %12 = OpVariable,
+        // %13 = OpLoad %10 %12  -> %13 is an image handle,
+        // %14 = OpCompositeInsert %20 %13 %21 0 0  -> the invalid instruction.
+        let with_image = module(&[
+            op(25, &[10, 1, 1, 0, 0, 0, 0, 1, 0]), // OpTypeImage
+            op(61, &[10, 13, 12]),                 // OpLoad, result type %10
+            op(82, &[20, 14, 13, 21, 0, 0]),       // OpCompositeInsert, object %13
+        ]);
+        assert!(spirv_module_shape(&with_image).opaque_in_composite);
+
+        // A sampler handle counts too, and so does reading one back out.
+        let extract_sampler = module(&[
+            op(26, &[10]),                   // OpTypeSampler
+            op(81, &[10, 14, 21, 0]),        // OpCompositeExtract, result type %10
+        ]);
+        assert!(spirv_module_shape(&extract_sampler).opaque_in_composite);
+
+        // Ordinary composite work on non-opaque types: must stay silent. Same
+        // instructions, but the object and result types are a plain float.
+        let ordinary = module(&[
+            op(25, &[10, 1, 1, 0, 0, 0, 0, 1, 0]), // OpTypeImage %10 (declared, unused)
+            op(22, &[30]),                         // OpTypeFloat %30
+            op(61, &[30, 31, 32]),                 // OpLoad %30 %31
+            op(82, &[33, 34, 31, 35, 0]),          // OpCompositeInsert of the float
+            op(81, &[30, 36, 35, 0]),              // OpCompositeExtract of a float
+        ]);
+        assert!(!spirv_module_shape(&ordinary).opaque_in_composite);
+
+        // An empty module declares nothing and inserts nothing.
+        assert!(!spirv_module_shape(&module(&[])).opaque_in_composite);
+    }
+
     #[test]
     fn only_a_relooper_state_machine_is_declined() {
         // Measured: pipe 48 vertex, structured, compiled in milliseconds.
         let vertex = ModuleShape {
             blocks: 13,
             max_switch_cases: 4,
+            ..ModuleShape::default()
         };
         assert!(!vertex.is_relooper_state_machine());
 
@@ -879,6 +1010,7 @@ mod tests {
         let compositor = ModuleShape {
             blocks: 2731,
             max_switch_cases: 2725,
+            ..ModuleShape::default()
         };
         assert!(compositor.is_relooper_state_machine());
 
@@ -887,6 +1019,7 @@ mod tests {
         let big_structured = ModuleShape {
             blocks: 4000,
             max_switch_cases: 300,
+            ..ModuleShape::default()
         };
         assert!(!big_structured.is_relooper_state_machine());
 
@@ -895,6 +1028,7 @@ mod tests {
         let small_dispatch = ModuleShape {
             blocks: 200,
             max_switch_cases: 199,
+            ..ModuleShape::default()
         };
         assert!(!small_dispatch.is_relooper_state_machine());
     }

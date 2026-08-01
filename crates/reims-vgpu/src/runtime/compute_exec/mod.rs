@@ -3056,6 +3056,34 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             return ComputeStatus::MetalFailed("compute_vk_translate");
         }
     };
+    // An invalid module must not reach the driver.
+    //
+    // The translator can emit an `OpCompositeInsert` that puts an image handle
+    // into a struct, which the Logical addressing model has no representation
+    // for — the type at the indexed path is a pointer, never the handle's own
+    // type. `spirv-val` rejects it, and creating a shader module anyway is
+    // licence for the driver to do whatever it likes.
+    //
+    // It took that licence. Three consecutive boots of a macOS desktop stopped
+    // being served at the compute pipeline carrying exactly this instruction,
+    // and the disassembly of the module dumped from the third names it:
+    //
+    //     %193 = OpCompositeInsert %_struct_51 %84 %55 0 0
+    //
+    // Nothing else reported it. No panic, no `VkResult` error, no device loss,
+    // no host fault record, and a guest kernel log still healthy after the host
+    // process was gone. Declining costs this kernel's dispatches; not declining
+    // costs every dispatch after it, because the process is no longer there.
+    //
+    // The detector agreed with `spirv-val` on all 15 modules captured from a
+    // live boot, firing on the one it rejects and on none of the rest.
+    if kernel_shader.shape.opaque_in_composite {
+        crate::observe::fail(format!(
+            "compute_linux m2v_invalid_module reason=opaque_handle_in_composite              pipe={} tg=[{tg_x},{tg_y},{tg_z}]              (OpCompositeInsert/Extract of an image or sampler handle;               spirv-val rejects the module)",
+            acc.pipeline_ref
+        ));
+        return ComputeStatus::MetalFailed("compute_vk_invalid_module");
+    }
     let mut spirv = match spirv_words_le(&kernel_shader.spirv) {
         Ok(w) => w,
         Err(e) => {

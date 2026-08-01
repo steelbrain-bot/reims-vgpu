@@ -57,6 +57,17 @@ pub enum DrawReason {
     /// call runs on the drain worker under the device lock, so the guest's rings
     /// stop being consumed and it reports a GPU hang.
     UnstructuredStateMachineShader { blocks: u32, switch_cases: u32 },
+    /// The translated module is not valid SPIR-V and must not reach the driver.
+    ///
+    /// Specifically: an `OpCompositeInsert` or `OpCompositeExtract` moves an
+    /// image or sampler handle through a composite, which the Logical addressing
+    /// model cannot represent. `spirv-val` rejects it, and a driver given an
+    /// invalid module is free to do anything — on the x86 rail it stopped
+    /// serving the guest entirely, with no other diagnostic anywhere.
+    ///
+    /// This is a translator defect, not a guest one. Declining names it instead
+    /// of letting the process die silently.
+    InvalidTranslatedModule { pipeline_ref: u32 },
     /// The fragment shader declares a descriptor the draw never bound.
     ///
     /// Reading an undefined descriptor is undefined behaviour. The engine builds
@@ -154,6 +165,7 @@ impl crate::observe::Decline for DrawReason {
             Self::SecondaryAttachmentCap { .. } => "secondary_attachment_cap",
             Self::DepthWithSecondaryAttachments => "depth_with_secondary_attachments",
             Self::UnstructuredStateMachineShader { .. } => "unstructured_state_machine_shader",
+            Self::InvalidTranslatedModule { .. } => "invalid_translated_module",
             Self::FragmentDescriptorUnbound { .. } => "fragment_descriptor_unbound",
             Self::SamplerAnisotropyUnsupported => "sampler_anisotropy_unsupported",
             Self::SamplerMirrorClampToEdgeUnsupported => "sampler_mirror_clamp_to_edge_unsupported",
@@ -203,7 +215,8 @@ impl std::fmt::Display for DrawReason {
                 blocks,
                 switch_cases,
             } => write!(f, " blocks={blocks} switch_cases={switch_cases}"),
-            Self::FragmentDescriptorUnbound { pipeline_ref } => {
+            Self::FragmentDescriptorUnbound { pipeline_ref }
+            | Self::InvalidTranslatedModule { pipeline_ref } => {
                 write!(f, " pipe={pipeline_ref}")
             }
             Self::VertexFormat(reason) => write!(f, " value={}", reason.value()),
@@ -282,6 +295,7 @@ mod tests {
             blocks: 0,
             switch_cases: 0,
         },
+        DrawReason::InvalidTranslatedModule { pipeline_ref: 0 },
         DrawReason::FragmentDescriptorUnbound { pipeline_ref: 0 },
         DrawReason::SamplerAnisotropyUnsupported,
         DrawReason::SamplerMirrorClampToEdgeUnsupported,
