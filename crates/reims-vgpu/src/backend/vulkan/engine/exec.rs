@@ -2373,6 +2373,30 @@ pub(crate) unsafe fn execute_draw_inner(
             pools.registry_set_layout(identity, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
         }
     }
+    // An MRT secondary attachment ends the pass in `COLOR_ATTACHMENT_OPTIMAL` —
+    // the barrier above put it there and the render pass declares that as its
+    // `finalLayout` — so the registry has to say so too.
+    //
+    // Nothing recorded it before, which left the registry holding whatever the
+    // target was in *last* time, usually `SHADER_READ_ONLY_OPTIMAL` from an
+    // earlier sample. The next draw to sample it then skipped its transition
+    // barrier (that skip is keyed on the tracked layout already being
+    // shader-readable) while the image was really still a colour attachment.
+    // A validation layer names both halves of it:
+    //
+    //     VUID-vkCmdDrawIndexed-imageLayout-00344
+    //       specific layout SHADER_READ_ONLY_OPTIMAL ... doesn't match the
+    //       previous known layout COLOR_ATTACHMENT_OPTIMAL
+    //     VUID-vkCmdDraw-None-09600
+    //       expects VkImage ... to be in layout SHADER_READ_ONLY_OPTIMAL
+    //       --instead, current layout is COLOR_ATTACHMENT_OPTIMAL
+    //
+    // Sampling an image in the wrong layout reads undefined data, and the
+    // skipped barrier also drops the producer→consumer dependency, so the read
+    // is unordered against the write that filled it.
+    for (identity, _image, _old_layout) in &mrt_secondaries {
+        pools.registry_set_layout(identity, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+    }
     if seed_from_resolved.is_some() {
         if let Some(seed_identity) = &req.seed_from_target {
             pools.registry_set_layout(seed_identity, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);

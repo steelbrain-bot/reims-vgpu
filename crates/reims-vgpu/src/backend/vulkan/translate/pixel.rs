@@ -126,6 +126,7 @@ pub fn translate(mtl: u16) -> Result<PixelFormat, TranslateReason> {
             ..linear(vk::Format::R8_UNORM, 1)
         },
         p::MTL_FORMAT_R8_UNORM => linear(vk::Format::R8_UNORM, 1),
+        p::MTL_FORMAT_R16_UNORM => linear(vk::Format::R16_UNORM, 2),
         p::MTL_FORMAT_R16_FLOAT => linear(vk::Format::R16_SFLOAT, 2),
         p::MTL_FORMAT_RG8_UNORM => linear(vk::Format::R8G8_UNORM, 2),
         p::MTL_FORMAT_R32_UINT => linear(vk::Format::R32_UINT, 4),

@@ -4415,28 +4415,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     declared.join(","),
                     tex_pairs.join(",")
                 ));
-                // Declining, not just reporting.
-                //
-                // This used to log and then draw anyway. A Vulkan validation
-                // layer settled what that costs: the same pipelines come back as
-                // `VUID-vkCmdDraw-None-08114` ("VkDescriptorSet [Set 0, Binding
-                // 160] is invalid") and `VUID-VkGraphicsPipelineCreateInfo-layout-07988`
-                // ("uses descriptor [Set 0, Binding 160] but the binding was not
-                // declared in the pipeline layout"). Binding 160 is
-                // `TEXTURE_BINDING_BASE + 0` — the very `tex0` named here.
-                //
-                // Reading an undefined descriptor is undefined behaviour, and it
-                // presents exactly as reported from the guest: whatever memory
-                // the descriptor happens to address is sampled, so windows drag
-                // their previous contents behind them, and the driver is free to
-                // fault. Producing a wrong frame is worse than producing none —
-                // `AGENTS.md` asks for the reason to be visible, not for the
-                // undefined draw to proceed.
-                let reason =
-                    crate::backend::vulkan::engine::reason::DrawReason::FragmentDescriptorUnbound {
-                        pipeline_ref: req.pipeline_ref,
-                    };
-                return Err(DrawError::Unsupported(reason));
             }
             if !embedded.is_empty() {
                 crate::observe::fail(format!(
@@ -4696,6 +4674,82 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             }
             for t in &req.fragment_textures {
                 push_tex(t.index, t.texture_ref, true)?;
+            }
+            // Metal's unbound-texture rule, made explicit for Vulkan.
+            //
+            // A Metal fragment shader may declare a `[[texture(n)]]` the draw
+            // never binds; sampling it is defined to return zero. Vulkan has no
+            // equivalent: the engine derives its descriptor layout from provided
+            // resources alone, so a declared-but-unbound slot is both missing
+            // from the pipeline layout and undefined to read. A validation layer
+            // reports the pair on the same binding —
+            // `VUID-VkGraphicsPipelineCreateInfo-layout-07988` and
+            // `VUID-vkCmdDraw-None-08114` at `[Set 0, Binding 160]`, which is
+            // `TEXTURE_BINDING_BASE + 0`.
+            //
+            // Undefined is also what it looked like: the descriptor addressed
+            // whatever memory was there, usually the previous frame, so every
+            // window dragged a trail behind it.
+            //
+            // A one-texel zero image restores Metal's rule exactly. It costs
+            // four bytes per slot, needs no extension (so it holds on all four
+            // support-matrix cells rather than only where `nullDescriptor`
+            // exists), and a shader that samples it reads the zero Metal
+            // promised. The sampler side of this pair has always defaulted the
+            // same way (`SamplerResource::normalized_default` for `ref == 0`);
+            // only the texture side was missing.
+            for index in declared_fragment_texture_indices(&f_shader.reflection.bindings) {
+                if index >= MAX_BIND_SLOTS {
+                    continue;
+                }
+                if req
+                    .fragment_textures
+                    .iter()
+                    .any(|t| t.index == index && t.texture_ref != 0)
+                {
+                    continue;
+                }
+                let base_off = if separate_sampled {
+                    FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
+                } else {
+                    0
+                };
+                let img_bind = TEXTURE_BINDING_BASE + index + base_off;
+                if images.iter().any(|i| i.binding == img_bind) {
+                    continue;
+                }
+                // The declared shape decides the placeholder's shape: a shader
+                // declaring a cube or an array must not be handed a plain 2D
+                // image, or the descriptor is the wrong type and the layout
+                // mismatch simply moves. An unsupported shape is left alone —
+                // the bound path already declines those by name.
+                use crate::runtime::spirv_bind::ReflectedSampledKind;
+                let kind = match crate::runtime::spirv_bind::reflected_sampled_kind(
+                    &f_shader.reflection,
+                    TEXTURE_BINDING_BASE + index,
+                ) {
+                    ReflectedSampledKind::Kind(k) => k,
+                    _ => continue,
+                };
+                let Some(shape) = sampled_image_shape(kind) else {
+                    continue;
+                };
+                images.push(crate::backend::vulkan::engine::SampledImageResource {
+                    binding: img_bind,
+                    width: 1,
+                    height: 1,
+                    layers: shape.layers,
+                    arrayed: shape.arrayed,
+                    volume: shape.volume,
+                    cube: shape.cube,
+                    one_dim: shape.one_dim,
+                    source: crate::backend::vulkan::engine::SampledSource::Bytes(
+                        std::sync::Arc::new(vec![0u8; 4 * shape.layers.max(1) as usize]),
+                    ),
+                    format: translate::pixel::vk_texel_layout(TexelLayout::Rgba8),
+                    identity: None,
+                    swizzle: Default::default(),
+                });
             }
         }
         {

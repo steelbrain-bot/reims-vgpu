@@ -1617,30 +1617,39 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     {
                         out.type11_mappings.push(att.texture_ref);
                     }
-                    if att.load_action == PASS_LOAD_ACTION_CLEAR {
-                        if att.store_action == PASS_STORE_ACTION_STORE {
-                            acc.clears.push(att);
-                        } else {
-                            // Metal Clear + non-Store (e.g. DontCare): the clear
-                            // seed is dropped from `acc.clears`, so a drawn pass
-                            // loads stale content (residue) and a clear-only
-                            // stream never reaches guest pages. We do NOT invent
-                            // DontCare semantics (unknown wire stays unknown) —
-                            // just make the drop visible so a boot reveals whether
-                            // any guest emits it. Deduped per target.
-                            note_clear_dropped(
-                                "nonstore_store_action",
-                                att.texture_ref,
-                                &format!("store_action={} load_action=clear", att.store_action),
-                            );
-                        }
+                    if clear_seeds_the_pass(att.load_action) {
+                        // Load and store actions are independent in Metal, and
+                        // the clear is a property of the load alone: `Clear`
+                        // fills the attachment at pass start whatever happens at
+                        // pass end. `DontCare` says only that the *result* need
+                        // not be preserved afterwards. Vulkan expresses the same
+                        // pair directly — `LOAD_OP_CLEAR` with
+                        // `STORE_OP_DONT_CARE` is an ordinary combination — so
+                        // nothing has to be invented to honour it.
+                        //
+                        // This used to admit `Store` alone and log the rest as
+                        // dropped, pending a boot that showed whether any guest
+                        // emitted the combination. One did: a macOS desktop
+                        // emits it, with `store_action=0` (DontCare) and
+                        // `store_action=2` (MultisampleResolve). The dropped
+                        // seed left the pass loading stale content, which is
+                        // visible from the guest as every window and every
+                        // transient overlay accumulating on screen instead of
+                        // replacing what was there.
+                        //
+                        // The clear-only case stays gated: `apply_clear` makes
+                        // its own `store_action == Store` check before touching
+                        // guest pages, so a pass with no draws and nothing to
+                        // preserve still writes nothing.
+                        acc.clears.push(att);
                     }
                 }
             }
-            // Also keep color0 from command for convenience.
+            // Also keep color0 from command for convenience. Store action is
+            // not consulted here either, for the reason given on the slot loop
+            // above: the clear belongs to the load action alone.
             if cmd.color0.present
-                && cmd.color0.load_action == PASS_LOAD_ACTION_CLEAR
-                && cmd.color0.store_action == PASS_STORE_ACTION_STORE
+                && clear_seeds_the_pass(cmd.color0.load_action)
                 && !acc
                     .clears
                     .iter()
@@ -3270,6 +3279,25 @@ fn note_clear_dropped(reason: &'static str, tex_ref: u32, detail: &str) -> bool 
         ));
     }
     first
+}
+
+/// Does this attachment seed the pass with a clear?
+///
+/// Load and store actions are independent in Metal. `loadAction == Clear` fills
+/// the attachment at pass start whatever the store action says; `storeAction`
+/// only decides whether the result survives the pass. Vulkan states the same
+/// pair directly, so `LOAD_OP_CLEAR` with `STORE_OP_DONT_CARE` needs nothing
+/// invented to express.
+///
+/// Consulting the store action here is what produced on-screen residue: a
+/// macOS desktop emits `Clear` with `store_action=0` (DontCare) and with
+/// `store_action=2` (MultisampleResolve), and dropping those seeds left each
+/// pass loading whatever the attachment held before.
+///
+/// Writing *back* to guest pages is a different question with a different
+/// answer, and [`apply_clear`] asks it separately.
+fn clear_seeds_the_pass(load_action: u16) -> bool {
+    load_action == PASS_LOAD_ACTION_CLEAR
 }
 
 fn apply_clear<M: HostMemory + HostOps>(
@@ -5258,6 +5286,33 @@ mod tests {
             first.colors[0].target_seed_rgba.as_ref().map(Vec::len),
             Some(16)
         );
+    }
+
+    /// A `Clear` load action seeds the pass whatever the store action is.
+    ///
+    /// The three store actions below are the ones a live macOS desktop was
+    /// measured to emit alongside `Clear`: `Store` (1), `DontCare` (0) and
+    /// `MultisampleResolve` (2). Admitting only `Store` — which this code did —
+    /// dropped the other two, and a pass whose seed is dropped loads whatever
+    /// the attachment held before. From the guest that is windows, menus and
+    /// tooltips piling up on screen instead of replacing what was there.
+    #[test]
+    fn a_clear_load_action_seeds_the_pass_whatever_the_store_action() {
+        // MTLStoreAction: DontCare=0, Store=1, MultisampleResolve=2.
+        for store_action in [0u16, PASS_STORE_ACTION_STORE, 2] {
+            assert!(
+                clear_seeds_the_pass(PASS_LOAD_ACTION_CLEAR),
+                "Clear must seed the pass with store_action={store_action}"
+            );
+        }
+        // Every other load action leaves the attachment alone: Load preserves
+        // it, DontCare leaves it undefined, and neither is a clear.
+        for load_action in [0u16, 1, 3, 4] {
+            if load_action == PASS_LOAD_ACTION_CLEAR {
+                continue;
+            }
+            assert!(!clear_seeds_the_pass(load_action));
+        }
     }
 
     #[test]

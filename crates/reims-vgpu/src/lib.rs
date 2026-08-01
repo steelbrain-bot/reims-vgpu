@@ -1303,8 +1303,27 @@ fn mark_drain_phase(slot: &BoundDevice, phase: u32) {
 ///
 /// Threshold is generous: a heavy frame's GPU encode and window publish are
 /// well under a second, and every real wedge measured sat for minutes.
+///
+/// Windows needs a tighter one, and not for taste. The host window is the
+/// process's only top-level window (QEMU runs `-display none`), and Windows
+/// treats a top-level window that stops pumping messages for about five seconds
+/// as hung — it logs Application Hang (event 1002) and the process is closed.
+/// Nothing on the Unix rails does that; there, an unresponsive window simply
+/// stays unresponsive until whatever is wedged finishes or is killed by hand.
+///
+/// So on Windows the generous threshold lands at the same moment the process is
+/// being taken away, and the one line that would say which phase was wedged
+/// never gets written. Three consecutive hangs here produced an empty stall
+/// channel for exactly that reason. Reporting sooner is the only way the
+/// evidence survives to be read.
+#[cfg(not(target_os = "windows"))]
 const DRAIN_HELD_STALL_MS: u64 = 5_000;
+#[cfg(target_os = "windows")]
+const DRAIN_HELD_STALL_MS: u64 = 1_200;
+#[cfg(not(target_os = "windows"))]
 const DRAIN_HELD_REPORT_EVERY_MS: u64 = 10_000;
+#[cfg(target_os = "windows")]
+const DRAIN_HELD_REPORT_EVERY_MS: u64 = 1_000;
 
 fn report_held_lock_if_wedged(slot: &BoundDevice) {
     let now = crate::observe::elapsed_ms() as u64;

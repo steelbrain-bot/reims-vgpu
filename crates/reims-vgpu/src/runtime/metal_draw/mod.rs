@@ -201,6 +201,32 @@ fn frag_unbound_scan(
     (unbound, embedded)
 }
 
+/// The fragment texture slots the shader declares, in Metal index space.
+///
+/// A Metal shader may declare a `[[texture(n)]]` the draw never binds, and
+/// Metal defines that: sampling an unbound texture returns zero. Vulkan has no
+/// such rule — a descriptor the pipeline uses must exist in the layout and be
+/// valid, or the read is undefined. The Vulkan render path therefore has to
+/// materialise a zero texture for every declared-but-unbound slot, and this is
+/// the enumeration it fills from.
+///
+/// `EmbeddedArgBufferTexture` is deliberately excluded: it is not a directly
+/// bindable slot and the render path declines it by its own name.
+#[cfg(feature = "backend-vulkan")]
+fn declared_fragment_texture_indices(
+    bindings: &[metal2vulkan::reflect::ResourceBinding],
+) -> Vec<u32> {
+    use metal2vulkan::reflect::ResourceKind;
+    let mut out: Vec<u32> = bindings
+        .iter()
+        .filter(|rb| matches!(rb.kind, ResourceKind::Texture | ResourceKind::TextureArray))
+        .map(|rb| rb.metal_index)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 #[cfg(feature = "backend-vulkan")]
 fn reflected_sampled_binding_collision(
     vertex: &metal2vulkan::reflect::ShaderReflection,

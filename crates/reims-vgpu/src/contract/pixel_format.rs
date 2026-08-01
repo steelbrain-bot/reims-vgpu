@@ -24,6 +24,13 @@ pub const R32_BPP: u32 = 4;
 // MTLPixelFormat values (Metal.framework Headers/MTLPixelFormat.h).
 pub const MTL_FORMAT_A8_UNORM: u16 = 0x01;
 pub const MTL_FORMAT_R8_UNORM: u16 = 0x0a;
+/// `MTLPixelFormatR16Unorm = 20`. Two bytes, one channel.
+///
+/// Sits five below `R16Float` in the same enum, which this table already
+/// carries at `0x19` — so the value is read off the header, not inferred from a
+/// measurement. A live macOS desktop binds it as a 3840x2160 type-5 view, and
+/// without it here that view refused 100 times in one boot.
+pub const MTL_FORMAT_R16_UNORM: u16 = 0x14;
 pub const MTL_FORMAT_R16_FLOAT: u16 = 0x19;
 pub const MTL_FORMAT_RG8_UNORM: u16 = 0x1e;
 pub const MTL_FORMAT_R32_UINT: u16 = 0x35;
@@ -216,7 +223,10 @@ const F32_TO_F16_ROUND_BIT: u32 = 0x1000;
 pub fn bytes_per_pixel(format: u16) -> Option<u32> {
     Some(match format {
         MTL_FORMAT_A8_UNORM | MTL_FORMAT_R8_UNORM | MTL_FORMAT_STENCIL8 => R8_BPP,
-        MTL_FORMAT_R16_FLOAT | MTL_FORMAT_RG8_UNORM | MTL_FORMAT_DEPTH16_UNORM => RG8_BPP,
+        MTL_FORMAT_R16_UNORM
+        | MTL_FORMAT_R16_FLOAT
+        | MTL_FORMAT_RG8_UNORM
+        | MTL_FORMAT_DEPTH16_UNORM => RG8_BPP,
         MTL_FORMAT_RG16_FLOAT => RG16F_BPP,
         MTL_FORMAT_RGBA8_UNORM
         | MTL_FORMAT_RGBA8_UNORM_SRGB
@@ -1136,6 +1146,7 @@ mod tests {
             (MTL_FORMAT_RGBA16_UNORM, 8),
             (MTL_FORMAT_A8_UNORM, 1),
             (MTL_FORMAT_R8_UNORM, 1),
+            (MTL_FORMAT_R16_UNORM, 2),
             (MTL_FORMAT_R16_FLOAT, 2),
             (MTL_FORMAT_RG8_UNORM, 2),
             (MTL_FORMAT_R32_UINT, 4),
