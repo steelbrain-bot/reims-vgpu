@@ -579,6 +579,7 @@ impl DeviceContext {
         let mut en16 = features.enabled_16bit_storage();
         let mut en8 = features.enabled_8bit_storage();
         let mut enfi = features.enabled_float16_int8();
+        let mut endemote = features.enabled_demote_to_helper();
         let mut dci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qci)
             .enabled_features(&enabled)
@@ -595,6 +596,11 @@ impl DeviceContext {
         }
         if has_float16 || has_int8 {
             dci = dci.push_next(&mut enfi);
+        }
+        // Chained only when the device has the extension, whose name
+        // `required_extensions` already added under the same condition.
+        if features.shader_demote_to_helper_invocation {
+            dci = dci.push_next(&mut endemote);
         }
         let device = instance
             .create_device(pd, &dci, None)
