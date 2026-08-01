@@ -5208,6 +5208,129 @@ pub fn publish_stranded_fifos<H: HostMemory + HostOps>(
     published
 }
 
+/// How long a woken-less worker must sit on outstanding work before it is a
+/// stall. Present + GPU encode of one heavy frame stays well under this; every
+/// wedge measured so far sat for minutes.
+const STALL_REPORT_AFTER_MS: u64 = 5_000;
+/// One snapshot per this interval while the stall persists.
+const STALL_REPORT_EVERY_MS: u64 = 10_000;
+
+/// Emit a wait-state snapshot when the drain worker has not woken for
+/// [`STALL_REPORT_AFTER_MS`] while something is visibly outstanding.
+///
+/// Every wedge this device has had on the bring-up rail was silent: the worker
+/// stopped waking, the periodic censuses stopped with it (they are emitted
+/// *from* the worker), and the only signal left was a guest watchdog line on a
+/// serial console — or nothing, when the guest waited without a watchdog. A
+/// stall diagnosis needed a human to correlate three logs after the fact. This
+/// line is the device saying it itself, from the poll path, which keeps running
+/// precisely because it is not the thing that wedged.
+///
+/// A quiet worker with clean host-side state is still reported, because the
+/// disagreement that matters may live in guest memory: the guest advances a
+/// child ring's tail with a plain store, and if no doorbell follows, no host
+/// counter moves. The snapshot therefore reads each channel's guest-visible
+/// head/tail out of the root page's register blocks — two 4-byte reads per
+/// channel, the same reads a drain does, nowhere near executing work under the
+/// caller's lock. A guest watchdog said `written: 1240 read: 1208` while every
+/// host counter said "nothing outstanding"; the ring cursors are where that
+/// conflict is visible from our side.
+pub fn report_stall_if_wedged<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &H,
+    now_ms: u64,
+) {
+    if state.last_drain_wake_ms == 0
+        || now_ms.saturating_sub(state.last_drain_wake_ms) < STALL_REPORT_AFTER_MS
+        || now_ms.saturating_sub(state.last_stall_report_ms) < STALL_REPORT_EVERY_MS
+    {
+        return;
+    }
+    let fifo_read = state
+        .gfx
+        .fifo_read
+        .load(std::sync::atomic::Ordering::Acquire);
+    let stamps_pending: u32 = state
+        .child_stamps
+        .iter()
+        .map(|c| c.queue.len() as u32)
+        .sum();
+    // Guest-visible child ring cursors, for every channel whose register block
+    // shows a live cursor pair. `tail != head` is guest work no host counter
+    // knows about.
+    let mut ring_lag = Vec::new();
+    if state.gfx.root_page != 0 {
+        for ch in 1..MAX_CHANNELS as u32 {
+            let Some(regs_off) = child_reg_block_offset(ch) else {
+                continue;
+            };
+            let regs_gpa = state.pfn_gpa(state.gfx.root_page) + regs_off;
+            let (Ok(tail), Ok(head)) = (
+                crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_TAIL),
+                crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_HEAD),
+            ) else {
+                continue;
+            };
+            if tail != head {
+                ring_lag.push(format!("ch{ch}:head={head} tail={tail}"));
+            }
+        }
+    }
+    let outstanding = fifo_read != state.gfx.fifo_written
+        || stamps_pending != 0
+        || !ring_lag.is_empty()
+        || state.pending.main_drain
+        || state.pending.child_mask != 0
+        || state.pending.iosfc
+        || state.pending.host_action_yield
+        || state.present.backpressure_hold_active
+        || state.present.unpainted_presents != 0
+        || state.translation_deferred_mask != 0
+        || state.translation_order_hold_mask != 0;
+    if !outstanding {
+        return;
+    }
+    state.last_stall_report_ms = now_ms;
+    let stamp_heads: Vec<String> = state
+        .child_stamps
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !c.queue.is_empty())
+        .map(|(ch, c)| {
+            let head = &c.queue[0];
+            format!(
+                "ch{ch}:n={} head_idx={} ready={} job={:?}",
+                c.queue.len(),
+                head.stamp_index,
+                head.ready,
+                head.job_id
+            )
+        })
+        .collect();
+    crate::observe::fail(format!(
+        "STALL drain_wedged idle_ms={} fifo={}..{} control_fifo={:#x} root_page={:#x} \
+         pending_main={} pending_child={:#x} iosfc={} yield={} backpressure={} unpainted={} \
+         deferred={:#x} held={:#x} active_children={:#x} stamps_pending={stamps_pending} \
+         stamps=[{}] rings=[{}]",
+        now_ms.saturating_sub(state.last_drain_wake_ms),
+        fifo_read,
+        state.gfx.fifo_written,
+        state.gfx.control_fifo,
+        state.gfx.root_page,
+        state.pending.main_drain,
+        state.pending.child_mask,
+        state.pending.iosfc,
+        state.pending.host_action_yield,
+        state.present.backpressure_hold_active,
+        state.present.unpainted_presents,
+        state.translation_deferred_mask,
+        state.translation_order_hold_mask,
+        state.active_child_mask,
+        stamp_heads.join(" "),
+        ring_lag.join(" ")
+    ));
+}
+
 /// Run all pending drains (BH body).
 ///
 /// # This runs to completion on purpose, and a wall-clock budget was tried
@@ -5297,6 +5420,10 @@ pub(crate) fn fold_rung_child_doorbells(state: &mut DeviceState) {
 }
 
 pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
+    // Recorded before the yield check on purpose: the stall reporter separates
+    // "the worker never wakes" from "the worker wakes and cannot proceed", and
+    // a yield-parked wake is the second shape.
+    state.last_drain_wake_ms = crate::observe::elapsed_ms() as u64;
     // A queued present action is part of the ordered device timeline. QEMU
     // cannot paint it while this worker owns the device lock, so later worker
     // wakeups must leave guest work queued until scanout consumes the action.

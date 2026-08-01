@@ -18,6 +18,15 @@ use super::types::{
 };
 use super::vk_call::{VkCall, VkOp};
 
+/// A graphics-pipeline creation slower than this is reported.
+///
+/// Chosen against what a warm boot actually costs: every other module in a
+/// measured boot compiled in single-digit milliseconds, and the one that
+/// wedged the device took over 200 seconds. A second is far above the first
+/// group and far below the second, so the line fires on the pathological case
+/// and stays silent through normal shader warm-up.
+const SLOW_PIPELINE_COMPILE_US: u64 = 1_000_000;
+
 /// A device-specific widening of an optional three-component vertex format.
 ///
 /// The draw remains executable, but the pipeline is not byte-for-byte what the
@@ -1105,9 +1114,30 @@ impl ObjectCaches {
         if key.pass.depth.is_some() {
             gpci = gpci.depth_stencil_state(&depth_stencil);
         }
+        // Timed because this call is where the host GPU driver compiles the
+        // SPIR-V, and it runs on the drain worker with the device lock held.
+        // A driver that takes minutes over one module stops the whole device:
+        // the worker cannot be scheduled, every census emitted from it goes
+        // quiet, and the guest's GPU watchdog eventually reports a hang whose
+        // real cause is on this line. Measured on an NVIDIA host: one 1.18 MB
+        // fragment module — 160x every other module in the same boot — held the
+        // lock for over 200 s inside nvgpucomp64, and nothing said so.
+        let compile_started = std::time::Instant::now();
         let created = ctx
             .device
             .create_graphics_pipelines(ctx.pipeline_cache, &[gpci], None);
+        let compile_us = compile_started.elapsed().as_micros() as u64;
+        if compile_us >= SLOW_PIPELINE_COMPILE_US {
+            crate::observe::fail(format!(
+                "THRASH pipeline_compile_slow reason=driver_compile_blocks_drain us={compile_us} \
+                 attrs={} secondary_rt={} depth={} bgra={} \
+                 the device lock is held for this whole call",
+                key.attrs.len(),
+                key.pass.secondary_count,
+                key.pass.depth.is_some(),
+                key.pass.bgra
+            ));
+        }
         let pipe = created.map_err(|(_, e)| {
             let err = DrawError::VkCall(VkCall::new(VkOp::CachesCreateGraphicsPipelines, e));
             self.pipelines.insert_negative(key.clone(), err.clone());

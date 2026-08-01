@@ -4351,14 +4351,37 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     .filter(|s| s.index < MAX_BIND_SLOTS && s.sampler_ref != 0)
                     .map(|s| s.index)
                     .collect();
+                // The declared side and the raw provided pairs, so a fire can be
+                // read without a reproduction: which Metal indices the shader
+                // wants (with kinds) and exactly what the guest bound where,
+                // refs included. A fire on the WindowServer composite showed
+                // `unbound=[tex0] provided_tex={3}` and nothing in the line
+                // could say whether the shader also declared tex3, or which
+                // texture the guest put there — the difference between "decode
+                // read the slot wrong" and "the guest binds this shader's
+                // second texture only".
+                let declared: Vec<String> = f_shader
+                    .reflection
+                    .bindings
+                    .iter()
+                    .map(|rb| format!("{:?}[{}]", rb.kind, rb.metal_index))
+                    .collect();
+                let tex_pairs: Vec<String> = req
+                    .fragment_textures
+                    .iter()
+                    .filter(|t| t.texture_ref != 0)
+                    .map(|t| format!("{}:{:#x}", t.index, t.texture_ref))
+                    .collect();
                 crate::observe::fail(format!(
                     "shader_resource_declared_unbound reason=frag_declared_descriptor_unbound \
                      pipe={} unbound=[{}] provided_buf={bufs:?} provided_tex={texs:?} \
-                     provided_smp={smps:?} {}x{}",
+                     provided_smp={smps:?} {}x{} declared=[{}] tex_pairs=[{}]",
                     req.pipeline_ref,
                     unbound.join(","),
                     w,
-                    h
+                    h,
+                    declared.join(","),
+                    tex_pairs.join(",")
                 ));
             }
             if !embedded.is_empty() {

@@ -264,6 +264,19 @@ struct BoundDevice {
     /// poll path. One shared limiter keeps guest pacing independent of which
     /// path happens to win the device lock.
     vbl_last_us: AtomicU64,
+    /// Coarse phase the drain worker is in, and when it entered that phase.
+    /// Both are written without the device lock so the *contended* poll path can
+    /// read them — which is the only path that runs when the worker is stuck
+    /// holding `inner`, and therefore the only place that wedge can be reported
+    /// from at all. A worker blocked inside its own critical section makes
+    /// `try_lock` fail forever: the locked poll body never runs, `device_drain`
+    /// never runs, and every census emitted from either goes silent together.
+    /// That silence is indistinguishable from an idle guest without these.
+    drain_phase: AtomicU32,
+    drain_phase_ms: AtomicU64,
+    /// Last contended-stall report, so a held lock reports on a cadence rather
+    /// than once per poll.
+    drain_stall_report_ms: AtomicU64,
     /// QEMU HostOps (GPA / clock / schedule worker). None in pure unit tests.
     ops: Option<ReimsVgpuHostOps>,
     /// Host-owned presentation window ([[host-window]]), once
@@ -401,6 +414,9 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
             vbl_display_index: AtomicU32::new(0),
             vbl_online: AtomicBool::new(false),
             vbl_last_us: AtomicU64::new(0),
+            drain_phase: AtomicU32::new(DRAIN_PHASE_IDLE),
+            drain_phase_ms: AtomicU64::new(0),
+            drain_stall_report_ms: AtomicU64::new(0),
             ops,
             #[cfg(feature = "host-window")]
             window: Mutex::new(None),
@@ -1090,19 +1106,27 @@ pub fn device_drain(id: u64) -> bool {
     // Both hold the device lock, and which one owns the worker's wall clock is
     // the question `drain_duty` exists to answer.
     let tranche_started = std::time::Instant::now();
+    mark_drain_phase(&slot, DRAIN_PHASE_GUEST_WORK);
     device.drain(&mut host);
     // Submit any deferred draw batch before the worker sleeps: consumers
     // inside the tranche flush on their own (engine begin_entry), this bounds
     // only the idle-tail latency of the last same-target run.
     #[cfg(feature = "backend-vulkan")]
-    backend::vulkan::engine::flush_batched_draws();
+    {
+        mark_drain_phase(&slot, DRAIN_PHASE_BATCH_FLUSH);
+        backend::vulkan::engine::flush_batched_draws();
+    }
+    mark_drain_phase(&slot, DRAIN_PHASE_PRESENT_BOUNDARY);
     publish_present_boundary(&slot, device.state.present.frame_flush_seen);
     let drain_us = tranche_started.elapsed().as_micros() as u64;
     let publish_started = std::time::Instant::now();
     // Push the finished present frame to the host-owned window (if running).
     // Off the QEMU main loop; a small dedicated mutex, never the render lock.
     #[cfg(feature = "host-window")]
-    publish_window_frame(&slot, &mut device.state);
+    {
+        mark_drain_phase(&slot, DRAIN_PHASE_WINDOW_PUBLISH);
+        publish_window_frame(&slot, &mut device.state);
+    }
     runtime::drain::note_drain_tranche(drain_us, publish_started.elapsed().as_micros() as u64);
     // Same one-second cadence, so the cache trend lines up row-for-row with
     // `store_routes` and `drain_duty`. Measure-only; see `note_cache_levels`.
@@ -1134,6 +1158,10 @@ pub fn device_drain(id: u64) -> bool {
     if device.state.pending.host_action_yield {
         slot.present_action_pending.store(true, Ordering::Release);
     }
+    // Back to idle before the lock is dropped: a worker between tranches is not
+    // wedged, and leaving the last phase set would make every quiet period look
+    // like one.
+    mark_drain_phase(&slot, DRAIN_PHASE_IDLE);
     true
 }
 
@@ -1156,6 +1184,10 @@ pub fn device_poll(id: u64) -> bool {
         // inert; kb present-thrash-proxies). Pulse VBL lock-free from the state
         // the last successful poll published, so pacing survives the contention.
         vbl_contended_pulse(&slot);
+        // The only place a worker stuck inside its own critical section can be
+        // seen from: everything that reports from the locked side is exactly
+        // what such a worker has stopped.
+        report_held_lock_if_wedged(&slot);
         return true;
     };
     let Some(ops) = slot.ops else {
@@ -1168,6 +1200,13 @@ pub fn device_poll(id: u64) -> bool {
     // could not see the very channels the doorbell rail is responsible for.
     runtime::drain::fold_rung_child_doorbells(&mut device.state);
     runtime::drain::publish_stranded_fifos(&mut device.state, &mut host);
+    // From the poll path deliberately: it keeps running when the drain worker
+    // does not, which is the exact condition it reports on.
+    runtime::drain::report_stall_if_wedged(
+        &mut device.state,
+        &host,
+        crate::observe::elapsed_ms() as u64,
+    );
     runtime::drain::try_display_online(&mut device.state, &mut host);
     // After ONLINE, pulse VBL so the guest compositor has a display time base
     //. Missing VBL → clear-only dual-mid present thrash.
@@ -1230,6 +1269,68 @@ pub fn device_poll(id: u64) -> bool {
 /// loser drops one bit for one heartbeat (re-raised ~16 ms later). Both writers
 /// clear the acked ONLINE bit, so a torn write cannot resurrect it — far better
 /// than dropping ~90% of VBLs, which is the pre-fix behaviour under load.
+/// Coarse phases of one drain tranche. Named rather than numeric in the log, so
+/// a stall report says which step is stuck without anyone holding the source.
+const DRAIN_PHASE_IDLE: u32 = 0;
+const DRAIN_PHASE_GUEST_WORK: u32 = 1;
+const DRAIN_PHASE_BATCH_FLUSH: u32 = 2;
+const DRAIN_PHASE_PRESENT_BOUNDARY: u32 = 3;
+const DRAIN_PHASE_WINDOW_PUBLISH: u32 = 4;
+
+fn drain_phase_name(phase: u32) -> &'static str {
+    match phase {
+        DRAIN_PHASE_IDLE => "idle",
+        DRAIN_PHASE_GUEST_WORK => "guest_work",
+        DRAIN_PHASE_BATCH_FLUSH => "batch_flush",
+        DRAIN_PHASE_PRESENT_BOUNDARY => "present_boundary",
+        DRAIN_PHASE_WINDOW_PUBLISH => "window_publish",
+        _ => "unknown",
+    }
+}
+
+/// Mark the phase the drain worker is entering. Relaxed: this is a debugging
+/// breadcrumb read by a different thread on a multi-second cadence, not a
+/// synchronisation point, and ordering it would put a fence on the hot path.
+fn mark_drain_phase(slot: &BoundDevice, phase: u32) {
+    slot.drain_phase.store(phase, Ordering::Relaxed);
+    slot.drain_phase_ms
+        .store(crate::observe::elapsed_ms() as u64, Ordering::Relaxed);
+}
+
+/// A worker that has held the device lock too long is wedged inside its own
+/// critical section. Report it from the contended path, which is the only one
+/// still running when that happens.
+///
+/// Threshold is generous: a heavy frame's GPU encode and window publish are
+/// well under a second, and every real wedge measured sat for minutes.
+const DRAIN_HELD_STALL_MS: u64 = 5_000;
+const DRAIN_HELD_REPORT_EVERY_MS: u64 = 10_000;
+
+fn report_held_lock_if_wedged(slot: &BoundDevice) {
+    let now = crate::observe::elapsed_ms() as u64;
+    let phase = slot.drain_phase.load(Ordering::Relaxed);
+    if phase == DRAIN_PHASE_IDLE {
+        // The lock is held by something that is not a drain tranche (a create,
+        // a reset, an MMIO path). Those are bounded and not what this watches.
+        return;
+    }
+    let since = slot.drain_phase_ms.load(Ordering::Relaxed);
+    if since == 0 || now.saturating_sub(since) < DRAIN_HELD_STALL_MS {
+        return;
+    }
+    let last = slot.drain_stall_report_ms.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < DRAIN_HELD_REPORT_EVERY_MS {
+        return;
+    }
+    slot.drain_stall_report_ms.store(now, Ordering::Relaxed);
+    crate::observe::fail(format!(
+        "STALL drain_lock_held phase={} held_ms={} present_action_pending={}",
+        drain_phase_name(phase),
+        now.saturating_sub(since),
+        slot.present_action_pending.load(Ordering::Acquire)
+    ));
+}
+
 fn vbl_contended_pulse(slot: &BoundDevice) {
     use crate::runtime::host::HostMemory;
     let gpa = slot.vbl_shared_gpa.load(Ordering::Acquire);

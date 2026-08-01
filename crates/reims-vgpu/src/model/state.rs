@@ -1670,6 +1670,14 @@ pub struct DeviceState {
     pub translation_order_hold_mask: u32,
     /// Distinct cross-FIFO hold episodes (retries of one episode do not grow it).
     pub translation_order_holds: u64,
+    /// When the drain worker last woke (`observe::elapsed_ms`). The stall
+    /// reporter compares this against now: a device with outstanding work whose
+    /// worker has not woken for seconds is wedged, and every wedge on this
+    /// device so far was silent until something external printed a snapshot.
+    pub last_drain_wake_ms: u64,
+    /// Last stall snapshot emission, so a wedge reports on a bounded cadence
+    /// instead of once per poll.
+    pub last_stall_report_ms: u64,
     /// Display transactions held while another channel remained blocked on
     /// translation after the transaction's rescue drains. This counts hold
     /// episodes, not poll retries of the same packet.
@@ -1987,6 +1995,8 @@ impl DeviceState {
             translation_deferred_mask: 0,
             translation_order_hold_mask: 0,
             translation_order_holds: 0,
+            last_drain_wake_ms: 0,
+            last_stall_report_ms: 0,
             present_translation_holds: 0,
             present_translation_hold_mask: 0,
             pending: PendingWork::default(),
