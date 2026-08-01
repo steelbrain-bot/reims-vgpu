@@ -38,6 +38,28 @@ pub const MTL_FORMAT_BGRA8_UNORM: u16 = 0x50;
 pub const MTL_FORMAT_BGRA8_UNORM_SRGB: u16 = 0x51;
 /// Packed RGB9E5 shared-exponent float. 32-bit texels.
 pub const MTL_FORMAT_RGB9E5_FLOAT: u16 = 0x5d;
+/// Packed 10-bit-per-channel BGR with 2-bit alpha. 32-bit texels.
+///
+/// The wide-gamut format Tahoe's compositor draws its window content in, and
+/// the single largest source of declined views on the x86 rail before it was
+/// modelled: 424 `type5_view_format_bpp` refusals in one boot, all of it text
+/// and window chrome that then rendered wrong.
+///
+/// Four bytes per texel is measured from the guest's own allocation rather than
+/// assumed from the name. The guest describes these surfaces as
+/// `fmt=0x6c313072` — FourCC `'l10r'`, CoreVideo's 30-bit little-endian packed
+/// wide-gamut RGB — and its rows are `bpr=1472` for `w=365` and `bpr=1536` for
+/// `w=370`, i.e. `w * 4` rounded up to 64 bytes in both cases.
+pub const MTL_FORMAT_BGR10A2_UNORM: u16 = 0x5e;
+/// Four 16-bit unorm channels. 64-bit texels.
+///
+/// Sits directly below the `RGBA16Uint`/`RGBA16Float` pair already modelled
+/// here, and the guest's own allocation confirms the width: a `384x384` surface
+/// arrives with `bpr=3072` and `alloc=1179648`, i.e. exactly `384 * 8` per row
+/// and `384 * 384 * 8` in total. Declining it cost 93 sampled loads per boot
+/// (`linear_load_view_bpp_mismatch`), each one a texture that then sampled as
+/// nothing.
+pub const MTL_FORMAT_RGBA16_UNORM: u16 = 0x6e;
 pub const MTL_FORMAT_RGBA16_UINT: u16 = 0x71;
 pub const MTL_FORMAT_RGBA16_FLOAT: u16 = 0x73;
 pub const MTL_FORMAT_RGBA32_UINT: u16 = 0x7b;
@@ -206,13 +228,16 @@ pub fn bytes_per_pixel(format: u16) -> Option<u32> {
         | MTL_FORMAT_R32_SINT
         | MTL_FORMAT_R32_FLOAT
         | MTL_FORMAT_RGB9E5_FLOAT
+        | MTL_FORMAT_BGR10A2_UNORM
         | MTL_FORMAT_DEPTH32_FLOAT
         | MTL_FORMAT_DEPTH24_UNORM_STENCIL8
         | MTL_FORMAT_X24_STENCIL8 => RGBA8_BPP,
         // Depth32Float_Stencil8 / X32_Stencil8: 64-bit cells on Apple Silicon
         // (40-bit logical DS + pad; Metal allocates 8 B/texel for this family).
         MTL_FORMAT_DEPTH32_FLOAT_STENCIL8 | MTL_FORMAT_X32_STENCIL8 => 8,
-        MTL_FORMAT_RGBA16_UINT | MTL_FORMAT_RGBA16_FLOAT => RGBA16_BPP,
+        MTL_FORMAT_RGBA16_UNORM | MTL_FORMAT_RGBA16_UINT | MTL_FORMAT_RGBA16_FLOAT => {
+            RGBA16_BPP
+        }
         MTL_FORMAT_RGBA32_UINT | MTL_FORMAT_RGBA32_FLOAT => RGBA32_BPP,
         _ => return None,
     })
@@ -817,6 +842,36 @@ pub fn texel_to_rgba8(format: u16, src: &[u8]) -> Option<[u8; 4]> {
             rgba[COMPONENT_B] = lut[ld16(&src[4..6]) as usize];
             rgba[COMPONENT_A] = lut[ld16(&src[6..8]) as usize];
         }
+        MTL_FORMAT_BGR10A2_UNORM => {
+            // One little-endian 32-bit word: A in bits 31..30, then R, G, B in
+            // descending 10-bit fields. That is the layout of the FourCC the
+            // guest labels these surfaces with -- `l10r`, CoreVideo's
+            // `30RGBLEPackedWideGamut` -- whose blue channel occupies the low
+            // bits and whose red sits just under the alpha pair.
+            //
+            // Narrowed to 8 bits by taking the top 8 of each 10-bit field. That
+            // is a truncation, not a rescale, and it is the same thing the 16F
+            // LUT above does: this path exists to feed an RGBA8 sampled copy, so
+            // the two low bits have nowhere to go. Wide-gamut content therefore
+            // samples at 8-bit precision rather than not at all.
+            let w = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
+            let a2 = (w >> 30) & 0x3;
+            rgba[COMPONENT_R] = (((w >> 20) & 0x3ff) >> 2) as u8;
+            rgba[COMPONENT_G] = (((w >> 10) & 0x3ff) >> 2) as u8;
+            rgba[COMPONENT_B] = ((w & 0x3ff) >> 2) as u8;
+            // 2-bit alpha spans 0..3; replicate it across the byte so 3 is fully
+            // opaque rather than 0xc0.
+            rgba[COMPONENT_A] = (a2 * 0x55) as u8;
+        }
+        MTL_FORMAT_RGBA16_UNORM => {
+            // Four 16-bit unorm channels, little-endian. Narrowed by taking each
+            // channel's high byte -- the exact 8-bit unorm value, since unorm16
+            // to unorm8 is a truncation of the low 8 bits.
+            rgba[COMPONENT_R] = src[1];
+            rgba[COMPONENT_G] = src[3];
+            rgba[COMPONENT_B] = src[5];
+            rgba[COMPONENT_A] = src[7];
+        }
         MTL_FORMAT_RG16_FLOAT => {
             // Two float16 channels → R,G; B has no source (0), A opaque. Mirrors
             // the RGBA16Float LUT path (values clamp to [0,1] through the u8 LUT).
@@ -1016,9 +1071,69 @@ pub fn convert_rgba8_to_row(format: u16, src_rgba: &[u8], pixels: u32, dst: &mut
 mod tests {
     use super::*;
 
+    /// `BGR10A2Unorm` is pinned against the guest's own numbers, not a name.
+    ///
+    /// Tahoe's compositor draws window content in this format, and before it was
+    /// modelled every such view was declined — 424 refusals in one measured boot,
+    /// which is most of the on-screen text and chrome. The guest described those
+    /// surfaces as FourCC `l10r` (`0x6c313072`, CoreVideo
+    /// `30RGBLEPackedWideGamut`) with `w=365 bpr=1472` and `w=370 bpr=1536`:
+    /// four bytes a texel, rounded up to 64. Both rows are asserted here so the
+    /// size is tied to the measurement that established it.
+    #[test]
+    fn bgr10a2_is_four_bytes_and_unpacks_from_the_low_bits_up() {
+        assert_eq!(bytes_per_pixel(MTL_FORMAT_BGR10A2_UNORM), Some(4));
+        for (w, bpr) in [(365u32, 1472u32), (370, 1536)] {
+            let tight = w * 4;
+            assert!(bpr >= tight, "row must hold w*4");
+            assert_eq!(bpr % 64, 0, "guest rows are 64-byte aligned");
+            assert!(bpr - tight < 64, "and no more padding than that");
+        }
+
+        // Field order: A in 31..30, R in 29..20, G in 19..10, B in 9..0.
+        // Full-scale red only.
+        let red = (0x3u32 << 30) | (0x3ffu32 << 20);
+        assert_eq!(
+            texel_to_rgba8(MTL_FORMAT_BGR10A2_UNORM, &red.to_le_bytes()),
+            Some([255, 0, 0, 255])
+        );
+        // Full-scale blue only — the low field, which is what distinguishes this
+        // from an RGB10A2 reading.
+        let blue = (0x3u32 << 30) | 0x3ff;
+        assert_eq!(
+            texel_to_rgba8(MTL_FORMAT_BGR10A2_UNORM, &blue.to_le_bytes()),
+            Some([0, 0, 255, 255])
+        );
+        // Green, and a zero alpha that must stay zero rather than becoming opaque.
+        let green_transparent = 0x3ffu32 << 10;
+        assert_eq!(
+            texel_to_rgba8(MTL_FORMAT_BGR10A2_UNORM, &green_transparent.to_le_bytes()),
+            Some([0, 255, 0, 0])
+        );
+    }
+
+    /// `RGBA16Unorm` is likewise pinned to the guest's allocation, and its
+    /// narrowing to RGBA8 must take each channel's high byte.
+    #[test]
+    fn rgba16unorm_is_eight_bytes_and_narrows_by_high_byte() {
+        assert_eq!(bytes_per_pixel(MTL_FORMAT_RGBA16_UNORM), Some(8));
+        // Measured: a 384x384 view arrives with bpr=3072, alloc=1179648.
+        assert_eq!(384 * 8, 3072);
+        assert_eq!(384 * 384 * 8, 1179648);
+
+        // 0xffff -> 255, 0x8080 -> 0x80, 0x00ff -> 0 (truncation, not rounding).
+        let texel = [0xff, 0xff, 0x80, 0x80, 0xff, 0x00, 0x00, 0x40];
+        assert_eq!(
+            texel_to_rgba8(MTL_FORMAT_RGBA16_UNORM, &texel),
+            Some([0xff, 0x80, 0x00, 0x40])
+        );
+    }
+
     #[test]
     fn bytes_per_pixel_matrix() {
         let cases = [
+            (MTL_FORMAT_BGR10A2_UNORM, 4),
+            (MTL_FORMAT_RGBA16_UNORM, 8),
             (MTL_FORMAT_A8_UNORM, 1),
             (MTL_FORMAT_R8_UNORM, 1),
             (MTL_FORMAT_R16_FLOAT, 2),

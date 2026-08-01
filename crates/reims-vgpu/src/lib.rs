@@ -1717,14 +1717,78 @@ pub fn backend_name() -> &'static str {
     }
 }
 
+/// Run `f`, returning `on_panic` if it unwinds — and saying so.
+///
+/// This is the C ABI boundary: a panic must not cross it, so it is caught. What
+/// it must not do is vanish. Every entry point is wrapped in this, so a panic
+/// anywhere in the crate used to end as a bare error code with the always-on
+/// sink simply stopping mid-line — indistinguishable from the process being
+/// killed, which is exactly how one was read.
+///
+/// The payload is recovered because `panic!` payloads are `&str` or `String` in
+/// practice, and the location comes from a hook installed once: `catch_unwind`
+/// does not carry it, and "which line" is most of the value.
 pub fn unwind_safe<T, F>(f: F, on_panic: T) -> T
 where
     F: FnOnce() -> T + std::panic::UnwindSafe,
 {
+    install_panic_reporter();
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(v) => v,
-        Err(_) => on_panic,
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic payload>".to_string());
+            crate::observe::fail(format!(
+                "PANIC crossed_abi_boundary at={} msg={msg}",
+                last_panic_location()
+            ));
+            on_panic
+        }
     }
+}
+
+/// Where the most recent panic came from, captured by the hook below.
+///
+/// A `String` behind a mutex rather than a channel: this is read once, on the
+/// unwind path, immediately after the hook wrote it.
+static PANIC_LOCATION: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+fn last_panic_location() -> String {
+    PANIC_LOCATION
+        .lock()
+        .map(|g| {
+            if g.is_empty() {
+                "<unknown>".to_string()
+            } else {
+                g.clone()
+            }
+        })
+        .unwrap_or_else(|_| "<poisoned>".to_string())
+}
+
+/// Record panic locations, once per process.
+///
+/// Chained rather than replacing: the default hook's stderr output is worth
+/// keeping where anyone can see it, and on Windows the sink is the only place
+/// it lands at all.
+fn install_panic_reporter() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let where_ = info
+                .location()
+                .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+                .unwrap_or_else(|| "<no location>".to_string());
+            if let Ok(mut g) = PANIC_LOCATION.lock() {
+                *g = where_;
+            }
+            previous(info);
+        }));
+    });
 }
 
 #[cfg(test)]
@@ -1752,6 +1816,30 @@ mod tests {
     fn panic_does_not_escape() {
         let v = unwind_safe(|| panic!("boom"), 42i32);
         assert_eq!(v, 42);
+    }
+
+    /// A panic caught at the ABI boundary must leave its message and location
+    /// in the always-on sink.
+    ///
+    /// It used to leave nothing: the guard returned the fallback and dropped the
+    /// payload, so a panic looked exactly like the process being killed — the
+    /// sink stopped mid-line and there was no other trace. That reading cost a
+    /// live diagnosis.
+    #[test]
+    fn a_panic_crossing_the_boundary_is_reported_with_its_location() {
+        let capture = crate::observe::FailCapture::start();
+        let v = unwind_safe(|| panic!("a distinctive panic string"), 7i32);
+        assert_eq!(v, 7, "the fallback still reaches the caller");
+
+        let line = capture.one("PANIC");
+        assert!(
+            line.contains("a distinctive panic string"),
+            "the payload must survive: {line}"
+        );
+        assert!(
+            line.contains("lib.rs:"),
+            "and the location must name this file: {line}"
+        );
     }
 
     #[test]
