@@ -400,11 +400,16 @@ pub fn resident_color(bgra: bool) -> vk::Format {
 pub fn bytes_per_texel(format: vk::Format) -> Option<u32> {
     Some(match format {
         vk::Format::R8_UNORM | vk::Format::S8_UINT => 1,
-        vk::Format::R8G8_UNORM | vk::Format::R16_SFLOAT | vk::Format::D16_UNORM => 2,
+        vk::Format::R8G8_UNORM
+        | vk::Format::R16_SFLOAT
+        | vk::Format::R16_UNORM
+        | vk::Format::D16_UNORM => 2,
         vk::Format::R32_UINT
         | vk::Format::R32_SINT
         | vk::Format::R32_SFLOAT
         | vk::Format::R16G16_SFLOAT
+        | vk::Format::R16G16_UNORM
+        | vk::Format::R16G16_UINT
         | vk::Format::R8G8B8A8_UNORM
         | vk::Format::R8G8B8A8_SRGB
         | vk::Format::R8G8B8A8_UINT
@@ -897,6 +902,72 @@ mod tests {
     /// `UberCompositeFragment` display-profile pass arrive this way; before this
     /// rail carried the layout the draw resolved to nothing and the whole
     /// color-managed desktop composite failed with `draw_vk_nothing_stored`.
+    /// Every layout the sampled rail can bind must have a texel footprint the
+    /// draw validator recognises.
+    ///
+    /// These are two tables in two files. `vk_texel_layout` decides the Vulkan
+    /// format a sampled bind carries; `bytes_per_texel` is what
+    /// `validate_sampled_images` then measures the CPU-origin buffer against,
+    /// and a format missing from it is refused by name — which drops the whole
+    /// draw, not the one texture.
+    ///
+    /// Adding `R16_UNORM` to the first table without the second did exactly
+    /// that: the wallpaper's luma plane decoded, bound, and then died at
+    /// `vk_draw_validate_sampled_no_linear_texel_footprint binding=163
+    /// format=R16_UNORM` on a 1920x1088 full-screen quad. The two tables have to
+    /// be checked against each other rather than maintained in parallel by hand.
+    ///
+    /// `index_in_all` is exhaustive on purpose: a new `TexelLayout` variant
+    /// fails to compile there, which forces it into `ALL` and so into this
+    /// check.
+    #[test]
+    fn every_sampled_layout_has_a_texel_footprint_the_validator_knows() {
+        use crate::contract::pixel_format::TexelLayout;
+
+        const ALL: &[TexelLayout] = &[
+            TexelLayout::Rgba8,
+            TexelLayout::Bgra8,
+            TexelLayout::R8,
+            TexelLayout::Rg8,
+            TexelLayout::R16Float,
+            TexelLayout::R16Unorm,
+            TexelLayout::Rg16Unorm,
+            TexelLayout::Rg16Uint,
+            TexelLayout::R32Float,
+        ];
+
+        fn index_in_all(layout: TexelLayout) -> usize {
+            match layout {
+                TexelLayout::Rgba8 => 0,
+                TexelLayout::Bgra8 => 1,
+                TexelLayout::R8 => 2,
+                TexelLayout::Rg8 => 3,
+                TexelLayout::R16Float => 4,
+                TexelLayout::R16Unorm => 5,
+                TexelLayout::Rg16Unorm => 6,
+                TexelLayout::Rg16Uint => 7,
+                TexelLayout::R32Float => 8,
+            }
+        }
+
+        for (position, layout) in ALL.iter().copied().enumerate() {
+            assert_eq!(
+                index_in_all(layout),
+                position,
+                "ALL and index_in_all disagree about {layout:?}"
+            );
+            let format = vk_texel_layout(layout);
+            let footprint = bytes_per_texel(format).unwrap_or_else(|| {
+                panic!("{layout:?} binds as {format:?}, which the draw validator cannot size")
+            });
+            assert_eq!(
+                footprint,
+                layout.bytes_per_texel(),
+                "{layout:?} disagrees with {format:?} about its texel size"
+            );
+        }
+    }
+
     /// `RG16Uint` samples as integer texels and never rides the colour rails.
     ///
     /// The guest shader settles the type twice over: its decoded argument type
