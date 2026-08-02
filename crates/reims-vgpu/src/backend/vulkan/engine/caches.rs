@@ -131,6 +131,24 @@ pub(crate) struct PassKey {
 }
 
 impl PassKey {
+    /// Where the depth attachment sits in this pass, if it has one.
+    ///
+    /// The order is load-bearing in four places that are written separately and
+    /// must agree: the render pass's attachment array, the clear-value array the
+    /// draw builds, the framebuffer's image-view list, and the zero-copy
+    /// readback's assumption that slot 0 is the primary colour. Depth goes last
+    /// so the colour slots keep their indices whether or not depth is present.
+    pub(crate) fn depth_attachment_index(&self) -> Option<u32> {
+        self.depth
+            .is_some()
+            .then(|| 1 + u32::from(self.secondary_count))
+    }
+
+    /// Total attachments this pass declares, in the same order.
+    pub(crate) fn attachment_count(&self) -> u32 {
+        1 + u32::from(self.secondary_count) + u32::from(self.depth.is_some())
+    }
+
     /// Single-color-attachment pass (the pre-MRT constructor).
     pub(crate) fn single(load_seed: bool, bgra: bool) -> Self {
         Self {
@@ -601,7 +619,13 @@ impl ObjectCaches {
                     vk::AttachmentStoreOp::DONT_CARE,
                 )
             };
-            let index = attachments.len() as u32;
+            // Taken from the key rather than from `attachments.len()`, so the
+            // one place that computes this order is the one the clear-value
+            // array and the framebuffer's view list are also checked against.
+            let index = key
+                .depth_attachment_index()
+                .expect("depth_attachment_index is Some inside key.depth.map");
+            debug_assert_eq!(index as usize, attachments.len());
             attachments.push(
                 vk::AttachmentDescription::default()
                     .format(dformat)
@@ -1325,5 +1349,73 @@ mod cull_mapping_tests {
             vk::FrontFace::COUNTER_CLOCKWISE,
             "Metal CCW front under Y-flip"
         );
+    }
+}
+
+#[cfg(test)]
+mod pass_shape_tests {
+    use super::*;
+
+    /// Depth composes with MRT, and it is always the last attachment.
+    ///
+    /// Four separately-written places index this order — the render pass's
+    /// attachment array, the clear-value array, the framebuffer's view list, and
+    /// the readback's assumption that slot 0 is the primary colour. They agreed
+    /// for colour-only and for colour-plus-depth; the combination was simply
+    /// refused, on the stated grounds that "no known workload does both". One
+    /// does: a macOS desktop loses eight draw lists a session to it, at 9x14,
+    /// 96x128, 288x64, 320x128 and 352x128 — the geometry the vibrancy UI tiles
+    /// are composed at.
+    #[test]
+    fn depth_is_the_last_attachment_however_many_colours_precede_it() {
+        let depth = Some(DepthAttachKey {
+            load: false,
+            stencil: false,
+        });
+
+        // Colour only: no depth index, one attachment.
+        let plain = PassKey::single(false, true);
+        assert_eq!(plain.depth_attachment_index(), None);
+        assert_eq!(plain.attachment_count(), 1);
+
+        // Colour + depth: depth is attachment 1.
+        let with_depth = PassKey {
+            depth,
+            ..PassKey::single(false, true)
+        };
+        assert_eq!(with_depth.depth_attachment_index(), Some(1));
+        assert_eq!(with_depth.attachment_count(), 2);
+
+        // MRT, no depth: the secondaries occupy 1..=n and nothing follows.
+        let mrt = PassKey {
+            secondary_count: 2,
+            ..PassKey::single(false, true)
+        };
+        assert_eq!(mrt.depth_attachment_index(), None);
+        assert_eq!(mrt.attachment_count(), 3);
+
+        // MRT + depth — the combination that used to be refused. Depth sits
+        // after every secondary, so the colour slots keep the indices they have
+        // without it.
+        for secondary_count in 1..=MAX_SECONDARY_ATTACH as u8 {
+            let both = PassKey {
+                secondary_count,
+                depth,
+                ..PassKey::single(false, true)
+            };
+            assert_eq!(
+                both.depth_attachment_index(),
+                Some(1 + u32::from(secondary_count)),
+                "depth must follow all {secondary_count} secondaries"
+            );
+            assert_eq!(both.attachment_count(), 2 + u32::from(secondary_count));
+            // Slot 0 is the primary colour in every shape, which the zero-copy
+            // readback depends on.
+            assert_eq!(
+                both.attachment_count() - both.depth_attachment_index().unwrap(),
+                1,
+                "depth must be the final attachment"
+            );
+        }
     }
 }

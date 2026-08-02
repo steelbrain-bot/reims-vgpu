@@ -37,10 +37,6 @@ pub enum DrawReason {
     GuestRunSampledNot2d { binding: u32 },
     /// More MRT secondary attachments than the render pass can carry.
     SecondaryAttachmentCap { requested: usize, cap: usize },
-    /// A depth test combined with MRT secondaries — the depth attachment is
-    /// appended after the secondaries and the two paths have not been proven
-    /// together.
-    DepthWithSecondaryAttachments,
     /// The translated module is an unstructured state machine, which this
     /// host's shader compiler cannot compile in bounded time.
     ///
@@ -163,7 +159,6 @@ impl crate::observe::Decline for DrawReason {
             Self::ResidentSampledNot2d { .. } => "resident_sampled_not_2d",
             Self::GuestRunSampledNot2d { .. } => "guest_run_sampled_not_2d",
             Self::SecondaryAttachmentCap { .. } => "secondary_attachment_cap",
-            Self::DepthWithSecondaryAttachments => "depth_with_secondary_attachments",
             Self::UnstructuredStateMachineShader { .. } => "unstructured_state_machine_shader",
             Self::InvalidTranslatedModule { .. } => "invalid_translated_module",
             Self::FragmentDescriptorUnbound { .. } => "fragment_descriptor_unbound",
@@ -290,7 +285,6 @@ mod tests {
             requested: 0,
             cap: 0,
         },
-        DrawReason::DepthWithSecondaryAttachments,
         DrawReason::UnstructuredStateMachineShader {
             blocks: 0,
             switch_cases: 0,

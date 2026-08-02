@@ -923,14 +923,15 @@ pub(crate) unsafe fn execute_draw_inner(
     pass_key.secondary_count = req.secondary_targets.len() as u8;
     pass_key.color_input = req.color_input;
     // Depth is opt-in per draw (only a non-trivial MTLDepthStencilState reaches
-    // here). Combining it with MRT is not yet supported — the ad-hoc MRT
-    // framebuffer would need the depth view appended and the pass rebuilt; no
-    // known workload does both, so reject rather than silently drop depth.
-    if req.depth.is_some() && is_mrt {
-        return Err(DrawError::Unsupported(
-            super::reason::DrawReason::DepthWithSecondaryAttachments,
-        ));
-    }
+    // here), and it composes with MRT: the pass appends the depth attachment
+    // after the colour ones, the clear-value array is built in the same order,
+    // and the ad-hoc framebuffer below appends the depth view last to match.
+    //
+    // This combination used to be rejected on the grounds that "no known
+    // workload does both". One does — a macOS desktop draws eight such lists per
+    // session, at 9x14, 96x128, 288x64, 320x128 and 352x128, which is the tile
+    // geometry the vibrancy UI path renders at. Rejecting cost the whole draw
+    // list each time, not just the depth test.
     if let Some(d) = &req.depth {
         pass_key.depth = Some(super::caches::DepthAttachKey {
             load: d.load,
@@ -1193,8 +1194,9 @@ pub(crate) unsafe fn execute_draw_inner(
     // Transient depth attachment (image, memory, view, ad-hoc framebuffer) —
     // owned for exactly this draw, disposed deferred after submit. `None` on the
     // 2D path so nothing changes there.
-    let mut transient_depth: Option<(vk::Image, vk::DeviceMemory, vk::ImageView, vk::Framebuffer)> =
-        None;
+    // Image, memory and view only — the framebuffer it is attached to is always
+    // `target_fb`, and naming it twice is how a handle gets disposed twice.
+    let mut transient_depth: Option<(vk::Image, vk::DeviceMemory, vk::ImageView)> = None;
     let (target_image, target_fb, target_old_layout, target_view) =
         if let Some(identity) = &req.target_identity {
             let gen = identity.generation();
@@ -1243,6 +1245,22 @@ pub(crate) unsafe fn execute_draw_inner(
                     views.push(view);
                     mrt_secondaries.push((sec.identity.clone(), img, old_layout));
                 }
+                // Depth goes last, after the secondaries, because that is where
+                // the render pass puts its attachment and where the clear-value
+                // array puts its clear. Same transient image the depth-only arms
+                // below build, and disposed the same way after submit.
+                let mut depth_parts = None;
+                if req.depth.is_some() {
+                    let (dimg, dmem, dview) = pools.create_transient_depth(
+                        ctx,
+                        req.width,
+                        req.height,
+                        req.depth.and_then(|d| d.stencil).is_some(),
+                        counters,
+                    )?;
+                    views.push(dview);
+                    depth_parts = Some((dimg, dmem, dview));
+                }
                 let fb = pools.create_mrt_framebuffer(
                     ctx,
                     render_pass,
@@ -1251,6 +1269,9 @@ pub(crate) unsafe fn execute_draw_inner(
                     req.height,
                     counters,
                 )?;
+                if let Some(parts) = depth_parts {
+                    transient_depth = Some(parts);
+                }
                 (primary_image, fb, primary_layout, primary_view)
             } else if req.depth.is_some() {
                 let (dimg, dmem, dview) = pools.create_transient_depth(
@@ -1268,7 +1289,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     req.height,
                     counters,
                 )?;
-                transient_depth = Some((dimg, dmem, dview, fb));
+                transient_depth = Some((dimg, dmem, dview));
                 (primary_image, fb, primary_layout, primary_view)
             } else if req.color_input {
                 // Fetch pass carries an input reference → the slot's cached
@@ -1313,7 +1334,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     req.height,
                     counters,
                 )?;
-                transient_depth = Some((dimg, dmem, dview, fb));
+                transient_depth = Some((dimg, dmem, dview));
                 (pool_image, fb, vk::ImageLayout::UNDEFINED, pool_view)
             } else if req.color_input {
                 let fb = pools.create_mrt_framebuffer(
@@ -2109,11 +2130,12 @@ pub(crate) unsafe fn execute_draw_inner(
 
     // One clear value per attachment (slot 0 + secondaries), in FB order. Only
     // CLEAR attachments consult these, but the count must cover all attachments.
-    let mut clear = vec![vk::ClearValue {
+    let mut clear = Vec::with_capacity(pass_key.attachment_count() as usize);
+    clear.push(vk::ClearValue {
         color: vk::ClearColorValue {
             float32: [0.0, 0.0, 0.0, 0.0],
         },
-    }];
+    });
     for sec in &req.secondary_targets {
         clear.push(vk::ClearValue {
             color: vk::ClearColorValue { float32: sec.clear },
@@ -2129,6 +2151,10 @@ pub(crate) unsafe fn execute_draw_inner(
             },
         });
     }
+    // One clear value per attachment, in the pass's own order. The two are
+    // built in different functions from the same key, and a disagreement is a
+    // clear applied to the wrong attachment.
+    debug_assert_eq!(clear.len(), pass_key.attachment_count() as usize);
     let rp_begin = vk::RenderPassBeginInfo::default()
         .render_pass(render_pass)
         .framebuffer(target_fb)
@@ -2445,14 +2471,19 @@ pub(crate) unsafe fn execute_draw_inner(
     // and are freed once those retire. Disposing BEFORE this point would
     // immediate-free them (this slot is not yet pending, so it is not in the
     // open mask) while the just-submitted CB still references them → GPU fault.
-    if is_mrt || (req.color_input && transient_depth.is_none()) {
+    //
+    // Exactly one ad-hoc framebuffer per draw, so exactly one disposal. MRT, a
+    // depth attachment and framebuffer fetch each cause one to be built, and a
+    // draw can be more than one of those at once — they all name `target_fb`.
+    // Anything else here is the slot's own cached framebuffer, which this draw
+    // does not own.
+    if is_mrt || req.color_input || transient_depth.is_some() {
         pools.dispose(
             &ctx.device,
             super::pools::DeferredHandle::Framebuffer(target_fb),
         );
     }
-    if let Some((dimg, dmem, dview, dfb)) = transient_depth {
-        pools.dispose(&ctx.device, super::pools::DeferredHandle::Framebuffer(dfb));
+    if let Some((dimg, dmem, dview)) = transient_depth {
         pools.dispose(
             &ctx.device,
             super::pools::DeferredHandle::Image {
