@@ -3919,8 +3919,10 @@ fn guest_numeric_class(guest: crate::backend::vulkan::engine::StorageImageFormat
         | V::R8Unorm
         | V::Rg8Unorm
         | V::R32Float
+        | V::R16Unorm
+        | V::Rg16Unorm
         | V::Rgb9e5Ufloat => 0,
-        V::Rgba16Uint | V::Rgba8Uint | V::Rgba32Uint | V::R32Uint => 1,
+        V::Rgba16Uint | V::Rgba8Uint | V::Rgba32Uint | V::R32Uint | V::Rg16Uint => 1,
         V::Rgba8Sint | V::R32Sint => 2,
     }
 }
@@ -4029,7 +4031,16 @@ fn specialized_storage_image_format(
         // R32 sint/float and the packed Rgb9e5 stay sampled-only until a live
         // capture justifies enabling their storage path.
         V::R32Uint => (1, S::R32ui),
-        V::R32Sint | V::R32Float | V::Rgb9e5Ufloat => {
+        // The 16-bit single- and two-channel normalized/uint formats reach the
+        // engine only as sampled textures — they have no storage selector — so
+        // a shader declaring one as a storage image is refused here rather than
+        // given a view whose storage support was never established.
+        V::R32Sint
+        | V::R32Float
+        | V::Rgb9e5Ufloat
+        | V::R16Unorm
+        | V::Rg16Unorm
+        | V::Rg16Uint => {
             return Err("spirv_sampled_only_format_as_storage");
         }
         V::Rgba32Float => (0, S::Rgba32Float),

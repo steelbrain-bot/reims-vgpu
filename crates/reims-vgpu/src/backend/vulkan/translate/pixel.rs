@@ -348,6 +348,9 @@ pub fn storage_image(mtl: u16) -> Result<StorageImageFormat, TranslateReason> {
         pf::MTL_FORMAT_R32_SINT => return Ok(StorageImageFormat::R32Sint),
         pf::MTL_FORMAT_R32_FLOAT => return Ok(StorageImageFormat::R32Float),
         pf::MTL_FORMAT_RGB9E5_FLOAT => return Ok(StorageImageFormat::Rgb9e5Ufloat),
+        pf::MTL_FORMAT_R16_UNORM => return Ok(StorageImageFormat::R16Unorm),
+        pf::MTL_FORMAT_RG16_UNORM => return Ok(StorageImageFormat::Rg16Unorm),
+        pf::MTL_FORMAT_RG16_UINT => return Ok(StorageImageFormat::Rg16Uint),
         _ => {}
     }
     let selector = pf::storage_selector(mtl).ok_or(TranslateReason::NoStorageImageFormat(mtl))?;
@@ -446,6 +449,9 @@ pub fn vk_storage_image(format: StorageImageFormat) -> vk::Format {
         StorageImageFormat::R32Sint => vk::Format::R32_SINT,
         StorageImageFormat::R32Float => vk::Format::R32_SFLOAT,
         StorageImageFormat::Rgb9e5Ufloat => vk::Format::E5B9G9R9_UFLOAT_PACK32,
+        StorageImageFormat::R16Unorm => vk::Format::R16_UNORM,
+        StorageImageFormat::Rg16Unorm => vk::Format::R16G16_UNORM,
+        StorageImageFormat::Rg16Uint => vk::Format::R16G16_UINT,
     }
 }
 
@@ -1265,5 +1271,30 @@ mod tests {
             TranslateReason::SrgbDowngraded(0).slug(),
             crate::runtime::census::srgb_census::SRGB_DOWNGRADED_SLUG
         );
+    }
+}
+
+#[cfg(test)]
+mod sampled_only_storage_tests {
+    use super::*;
+    use crate::contract::pixel_format as pf;
+
+    /// The compute rails stage a sampled texture through the storage-image
+    /// enum, so a format with no storage selector still has to resolve here.
+    /// Without an answer the whole dispatch declines
+    /// (`mtl_format_unsupported`) and the guest's work is lost, which is what
+    /// happened to the 16-bit single- and two-channel formats.
+    #[test]
+    fn sixteen_bit_narrow_formats_resolve_for_sampled_staging() {
+        for (mtl, expected, bytes) in [
+            (pf::MTL_FORMAT_R16_UNORM, vk::Format::R16_UNORM, 2usize),
+            (pf::MTL_FORMAT_RG16_UNORM, vk::Format::R16G16_UNORM, 4),
+            (pf::MTL_FORMAT_RG16_UINT, vk::Format::R16G16_UINT, 4),
+        ] {
+            let resolved = storage_image(mtl)
+                .unwrap_or_else(|e| panic!("{mtl:#x} has no storage-image format: {e:?}"));
+            assert_eq!(vk_storage_image(resolved), expected, "{mtl:#x}");
+            assert_eq!(resolved.bytes_per_texel(), bytes, "{mtl:#x}");
+        }
     }
 }

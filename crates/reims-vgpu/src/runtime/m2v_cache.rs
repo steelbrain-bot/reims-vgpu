@@ -440,9 +440,17 @@ fn translate_air(air: &[u8], stage: Stage) -> M2vResult<CachedShader> {
     // Reflected translate: byte-identical SPIR-V PLUS the stage-interface facade.
     // `reflection.datalayout` carries the source `target datalayout` the sanitizer
     // strips, so the post-emit ABI reconciliation below no longer re-reads `k.ll`.
-    let (spirv, reflection) =
-        metal2vulkan::translate_reflected(path.to_str().unwrap_or(name), stage, &tmp)
-            .map_err(|e| translate_decline(stage, e.to_string()))?;
+    // Validated: `Ok` from the plain entry can carry bytes no tier validated, and
+    // those go straight to `vkCreate*Pipelines`. An NVIDIA driver segfaults on
+    // one and takes the process with it, with nothing in the validation log
+    // because the module never reaches a layer that would reject it.
+    let (spirv, reflection) = metal2vulkan::translate_reflected_validated(
+        path.to_str().unwrap_or(name),
+        stage,
+        &tmp,
+        metal2vulkan::passes::TransformOptions::default(),
+    )
+    .map_err(|e| translate_decline(stage, e.to_string()))?;
     finish_translated(spirv, reflection, stage)
 }
 
@@ -457,7 +465,7 @@ fn translate_kernel_air(air: &[u8], local_size: [u32; 3]) -> M2vResult<CachedSha
         kernel_local_size: local_size,
         ..Default::default()
     };
-    let (spirv, reflection) = metal2vulkan::translate_reflected_with_options(
+    let (spirv, reflection) = metal2vulkan::translate_reflected_validated(
         path.to_str().unwrap_or("k.air"),
         Stage::Kernel,
         &tmp,
