@@ -57,6 +57,25 @@ enum Sink {
     Draw,
 }
 
+/// Whether the deferred-flush surface census (`REIMS_VGPU_FLUSH_CENSUS=1`) is
+/// active.
+///
+/// Counts the non-zero bytes of each frame as it leaves the resident, which is
+/// the one question the decline side cannot answer: with nothing declining, a
+/// blank icon and an absent material are indistinguishable until you know
+/// whether the surface had any content to begin with.
+pub fn dump_flush_surfaces() -> bool {
+    static CENSUS_INIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static CENSUS_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !CENSUS_INIT.swap(true, Ordering::Relaxed) {
+        let on = std::env::var_os("REIMS_VGPU_FLUSH_CENSUS")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        CENSUS_ON.store(on, Ordering::Relaxed);
+    }
+    CENSUS_ON.load(Ordering::Relaxed)
+}
+
 pub(crate) fn enabled() -> bool {
     if !INIT.swap(true, Ordering::Relaxed) {
         let on = std::env::var_os("REIMS_VGPU_DRAW_LOG")
