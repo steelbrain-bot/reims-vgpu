@@ -390,6 +390,14 @@ pub struct DrawEncodeRequest {
     pub stencil_ref: Option<(u32, u32)>,
     pub depth_attach: Option<DepthAttachment>,
     pub stencil_attach: Option<StencilAttachment>,
+    /// First draw of the Metal render pass that owns this stencil attachment.
+    ///
+    /// A pass clears its stencil once and then relies on it: one draw writes a
+    /// mask, the next tests against it. Flattening the pass into per-draw
+    /// requests loses that ordering, so the pass load action alone would clear
+    /// before every draw and the mask would never survive to be tested. This
+    /// says which draw the clear belongs to; the rest load.
+    pub stencil_first_in_pass: bool,
     /// Records 2+ of a resident render-pass chain: load the prior record's
     /// content from the engine target instead of a CPU seed. Set by the exec
     /// chain loop (Vulkan rail only); default false.

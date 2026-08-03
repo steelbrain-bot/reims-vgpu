@@ -5522,8 +5522,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 write_enable: ds.depth_write_enabled,
                                 compare,
                                 clear_value,
-                                // Transient buffer: always CLEAR (see above).
-                                load: false,
+                                // The stencil belongs to the pass, not to the
+                                // draw: one draw writes a mask and the next
+                                // tests it, so only the first draw of the pass
+                                // clears and the rest load what it left.
+                                // Clearing every draw is what left Tahoe's icon
+                                // and glass surfaces an outline with no fill.
+                                // Depth alone keeps its per-draw clear — the
+                                // transient depth carries nothing between
+                                // draws and nothing asks it to.
+                                load: stencil.is_some() && !req.stencil_first_in_pass,
                                 stencil,
                             });
                         }

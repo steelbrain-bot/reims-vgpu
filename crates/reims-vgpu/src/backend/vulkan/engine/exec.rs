@@ -1197,6 +1197,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // Image, memory and view only — the framebuffer it is attached to is always
     // `target_fb`, and naming it twice is how a handle gets disposed twice.
     let mut transient_depth: Option<(vk::Image, vk::DeviceMemory, vk::ImageView)> = None;
+    let mut depth_owned_by_draw = false;
     let (target_image, target_fb, target_old_layout, target_view) =
         if let Some(identity) = &req.target_identity {
             let gen = identity.generation();
@@ -1251,13 +1252,13 @@ pub(crate) unsafe fn execute_draw_inner(
                 // below build, and disposed the same way after submit.
                 let mut depth_parts = None;
                 if req.depth.is_some() {
-                    let (dimg, dmem, dview) = pools.create_transient_depth(
-                        ctx,
-                        req.width,
-                        req.height,
-                        req.depth.and_then(|d| d.stencil).is_some(),
-                        counters,
-                    )?;
+                    let with_stencil = req.depth.and_then(|d| d.stencil).is_some();
+                    let (dimg, dmem, dview) = if with_stencil {
+                        pools.acquire_depth_stencil(ctx, req.width, req.height, true, counters)?
+                    } else {
+                        depth_owned_by_draw = true;
+                        pools.create_transient_depth(ctx, req.width, req.height, false, counters)?
+                    };
                     views.push(dview);
                     depth_parts = Some((dimg, dmem, dview));
                 }
@@ -1274,13 +1275,13 @@ pub(crate) unsafe fn execute_draw_inner(
                 }
                 (primary_image, fb, primary_layout, primary_view)
             } else if req.depth.is_some() {
-                let (dimg, dmem, dview) = pools.create_transient_depth(
-                    ctx,
-                    req.width,
-                    req.height,
-                    req.depth.and_then(|d| d.stencil).is_some(),
-                    counters,
-                )?;
+                let with_stencil = req.depth.and_then(|d| d.stencil).is_some();
+                let (dimg, dmem, dview) = if with_stencil {
+                    pools.acquire_depth_stencil(ctx, req.width, req.height, true, counters)?
+                } else {
+                    depth_owned_by_draw = true;
+                    pools.create_transient_depth(ctx, req.width, req.height, false, counters)?
+                };
                 let fb = pools.create_mrt_framebuffer(
                     ctx,
                     render_pass,
@@ -1319,13 +1320,13 @@ pub(crate) unsafe fn execute_draw_inner(
             let t = pools.acquire_target(ctx, target_key, primary_pass, counters)?;
             let (pool_image, pool_view, pool_fb) = (t.image, t.view, t.framebuffer);
             if req.depth.is_some() {
-                let (dimg, dmem, dview) = pools.create_transient_depth(
-                    ctx,
-                    req.width,
-                    req.height,
-                    req.depth.and_then(|d| d.stencil).is_some(),
-                    counters,
-                )?;
+                let with_stencil = req.depth.and_then(|d| d.stencil).is_some();
+                let (dimg, dmem, dview) = if with_stencil {
+                    pools.acquire_depth_stencil(ctx, req.width, req.height, true, counters)?
+                } else {
+                    depth_owned_by_draw = true;
+                    pools.create_transient_depth(ctx, req.width, req.height, false, counters)?
+                };
                 let fb = pools.create_mrt_framebuffer(
                     ctx,
                     render_pass,
@@ -2484,14 +2485,20 @@ pub(crate) unsafe fn execute_draw_inner(
         );
     }
     if let Some((dimg, dmem, dview)) = transient_depth {
-        pools.dispose(
-            &ctx.device,
-            super::pools::DeferredHandle::Image {
-                image: dimg,
-                view: dview,
-                memory: dmem,
-            },
-        );
+        if depth_owned_by_draw {
+            pools.dispose(
+                &ctx.device,
+                super::pools::DeferredHandle::Image {
+                    image: dimg,
+                    view: dview,
+                    memory: dmem,
+                },
+            );
+        }
+        // A kept depth-stencil image is owned by the pool: a Metal pass clears
+        // its stencil once and then has one draw write a mask and the next test
+        // it, which a per-draw image cannot carry. The pool disposes it when
+        // the geometry changes or at teardown.
     }
 
     // A draw with no pixel readback (resident target, skip_readback) hands
