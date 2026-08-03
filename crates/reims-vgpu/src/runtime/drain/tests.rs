@@ -4208,3 +4208,30 @@ fn every_short_control_packet_names_itself() {
         );
     }
 }
+
+/// The display-order hold is correct but must not be unbounded.
+///
+/// While it holds, the guest's ring stops being consumed. The guest watchdogs
+/// that ring and calls the stall a device fault: the rail's `GPU Reset` reports
+/// name `Display0 written: 17360 read: 17320`, one packet short. A reset
+/// discards every frame in flight, so the hold has to give up while a frame out
+/// of order is still the cheaper answer.
+#[test]
+fn a_display_order_hold_gives_up_before_the_guest_calls_it_a_gpu_fault() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    state.translation_deferred_mask = 0b100;
+    state.present_translation_hold_mask = 0b010;
+
+    // A hold that just started is inside the budget and keeps ordering.
+    assert!(!present_order_hold_budget_spent(&mut state));
+    assert!(state.present_translation_hold_since.is_some());
+    assert_eq!(state.present_translation_hold_mask, 0b010);
+
+    // One that has outlived it gives up, and clears the hold so the release
+    // path does not later report a hold that was never honoured.
+    state.present_translation_hold_since = Some(
+        std::time::Instant::now() - PRESENT_ORDER_HOLD_BUDGET - std::time::Duration::from_millis(1),
+    );
+    assert!(present_order_hold_budget_spent(&mut state));
+    assert_eq!(state.present_translation_hold_mask, 0);
+}

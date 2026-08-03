@@ -1557,6 +1557,49 @@ fn log_present_page_identity(state: &DeviceState, mapping: u32, w: u32, h: u32) 
     }
 }
 
+/// How long a display packet may be held for an earlier channel's shader
+/// translation before the hold is worth less than what it costs.
+///
+/// The ordering itself is right: publishing a present's retain ahead of the
+/// render packet it should follow shows the guest a frame that has not been
+/// drawn yet. But the guest watchdogs the ring it wrote, and a stall it blames
+/// on the device is a `GPU Reset` — measured on this rail as
+/// `Name Display0 written: 17360 read: 17320`, one 40-byte packet short, with
+/// `iconservicesagent`, `com.apple.dock.extra` and `Spotlight` aborting around
+/// it as their in-flight work was discarded. A frame out of order costs one
+/// frame; the reset costs every frame in flight and the processes waiting on
+/// them.
+///
+/// The budget is wall-clock rather than a poll count because what has to fit
+/// inside it is a translation: the compositor's uber shader takes seconds to
+/// structure on first sight, and a count of drains says nothing about that.
+/// Set well under a watchdog interval so the ring keeps moving while the
+/// translation finishes in the background.
+const PRESENT_ORDER_HOLD_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Has the current display-order hold outlived [`PRESENT_ORDER_HOLD_BUDGET`]?
+///
+/// Starts the clock on the first call of a hold. Says so once when the budget
+/// goes, because from then on presents pass in an order the guest did not ask
+/// for and that has to be visible rather than inferred from a frame that looks
+/// stale.
+fn present_order_hold_budget_spent(state: &mut DeviceState) -> bool {
+    let now = std::time::Instant::now();
+    let since = *state.present_translation_hold_since.get_or_insert(now);
+    if now.duration_since(since) < PRESENT_ORDER_HOLD_BUDGET {
+        return false;
+    }
+    if state.present_translation_hold_mask != 0 {
+        crate::observe::fail(format!(
+            "present_order_hold_expired reason=translation_still_pending              held_ms={} pending_mask={:#x} hold_mask={:#x}              (the ring keeps moving; this present publishes ahead of the render              packet it should have followed)",
+            now.duration_since(since).as_millis(),
+            state.translation_deferred_mask,
+            state.present_translation_hold_mask
+        ));
+        state.present_translation_hold_mask = 0;
+    }
+    true
+}
 /// Present a named mapping to the host console (DisplaySwap / x86 present op6/7).
 fn present_named_mapping<H: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -1610,7 +1653,7 @@ fn present_named_mapping<H: HostMemory + HostOps>(
     // packet is retried in order without blocking a vCPU or the QEMU main loop.
     let current_bit = 1u32.checked_shl(channel_id).unwrap_or(0);
     let deferred_other = state.translation_deferred_mask & !current_bit;
-    if deferred_other != 0 {
+    if deferred_other != 0 && !present_order_hold_budget_spent(state) {
         if state.present_translation_hold_mask & current_bit == 0 {
             state.present_translation_holds = state.present_translation_holds.saturating_add(1);
             state.present_translation_hold_mask |= current_bit;
@@ -1625,6 +1668,9 @@ fn present_named_mapping<H: HostMemory + HostOps>(
     }
     if state.present_translation_hold_mask & current_bit != 0 {
         state.present_translation_hold_mask &= !current_bit;
+        if state.present_translation_hold_mask == 0 {
+            state.present_translation_hold_since = None;
+        }
         crate::observe::off(format!(
             "present_order_release ch={channel_id} mid={mapping} pending_mask={:#x}",
             state.translation_deferred_mask

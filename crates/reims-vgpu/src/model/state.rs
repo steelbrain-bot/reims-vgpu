@@ -1686,6 +1686,11 @@ pub struct DeviceState {
     /// `translation_deferred_mask`. Suppresses fail-log flooding while the
     /// same head is retried and is cleared with channel lifecycle state.
     pub present_translation_hold_mask: u32,
+    /// When the current display-order hold began. The hold is correct but must
+    /// not be unbounded: the guest watchdogs its own ring, and a stall it
+    /// attributes to the device costs a `GPU Reset` that discards every frame
+    /// in flight, not just the one being ordered.
+    pub present_translation_hold_since: Option<std::time::Instant>,
     pub pending: PendingWork,
     pub child_rings: [ChannelRing; MAX_CHANNELS],
     pub tasks: [TaskEntry; MAX_TASKS],
@@ -1999,6 +2004,7 @@ impl DeviceState {
             last_stall_report_ms: 0,
             present_translation_holds: 0,
             present_translation_hold_mask: 0,
+            present_translation_hold_since: None,
             pending: PendingWork::default(),
             child_rings: std::array::from_fn(|_| ChannelRing::default()),
             tasks: std::array::from_fn(|_| TaskEntry::default()),
