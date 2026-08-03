@@ -1700,6 +1700,9 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         .map(|m| m.mapping_internal != 0)
         .unwrap_or(false);
     if force {
+        // Same reason as the mapper-request path: a resolve that moves pages
+        // strands any deferred window armed against the old ones.
+        let _ = crate::runtime::storage_flush::flush_mapping_for_guest_read(state, host, mapping);
         let _ = crate::runtime::mapper::resolve_mapping_backing(state, host, mapping);
     }
     // Paint only from the presented surface's own geom — never the
@@ -2928,6 +2931,19 @@ pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut 
                     if let Some(c) = cap {
                         if c.request_type == MAPPER_REQUEST_MAP {
                             let _ = crate::runtime::mapper::apply_capture(state, &c, mapping_id);
+                            // A resolve that re-points this surface at new
+                            // pages retires the ones a deferred render window's
+                            // pixels belong in, and the flush then drops the
+                            // frame outright (`deferred_flush_lost
+                            // reason=map_generation_drift`) rather than write a
+                            // framebuffer into whatever owns that memory now.
+                            // Measured losing icon-sized RGBA16Float surfaces
+                            // and the menu-bar strip that way. Land what is
+                            // pending first, while its pages are still ours; a
+                            // mapping with nothing armed pays nothing.
+                            let _ = crate::runtime::storage_flush::flush_mapping_for_guest_read(
+                                state, host, mapping_id,
+                            );
                             // Eager page-table + device-desc geometry when KVA works.
                             let _ = crate::runtime::mapper::resolve_mapping_backing(
                                 state, host, mapping_id,
