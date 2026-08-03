@@ -888,6 +888,16 @@ fn process_root_packet<H: HostMemory + HostOps>(
                 let task_id = ld32(&packet.payload[SET_OBJECT_LIST_TASK_ID..]);
                 let pfn = ld32(&packet.payload[SET_OBJECT_LIST_PFN..]);
                 let count = ld32(&packet.payload[SET_OBJECT_LIST_COUNT..]);
+                // A list with entries but no page is not a list: every resolve
+                // on it computes an address out of the offset alone and the
+                // read is refused. Carry the payload so the field the page
+                // actually arrived in can be read off it.
+                if pfn == 0 && count != 0 {
+                    crate::observe::fail(format!(
+                        "set_object_list_no_page task={task_id} count={count} payload={:02x?}",
+                        &packet.payload[..packet.payload.len().min(32)]
+                    ));
+                }
                 let _ = state.set_object_list(task_id, pfn, count);
             }
         }

@@ -801,14 +801,35 @@ fn load_render_pipeline<M: HostMemory + HostOps>(
     task_id: u32,
     pipeline_ref: u32,
 ) -> Option<RenderPipelineDescriptor> {
-    let entry = objects::lookup_list_entry(state, host, task_id, pipeline_ref)?;
+    // Five different losses used to share one `PipelineMissing` decline, which
+    // named the pipeline but not what about it could not be resolved. The draw
+    // is gone either way, so the reason is the only thing that separates "the
+    // guest has not published this object yet" from "we cannot read the object
+    // it published" — and those want opposite fixes.
+    let say = |why: &str| {
+        crate::observe::fail(format!(
+            "render_pipeline_unresolved reason={why} task={task_id} ref={pipeline_ref}"
+        ));
+        None::<RenderPipelineDescriptor>
+    };
+    let Some(entry) = objects::lookup_list_entry(state, host, task_id, pipeline_ref) else {
+        return say("object_list_entry_absent");
+    };
     // Live object-list: render pipeline is type-7 with subtype 0x0e.
     if entry.object_type != OBJECT_TYPE_TYPE7 {
-        return None;
+        return say("object_type_not_type7");
     }
-    let desc = objects::read_descriptor(state, host, task_id, &entry)?;
-    let p = decode_render_pipeline_descriptor(&desc).ok()?;
+    let Some(desc) = objects::read_descriptor(state, host, task_id, &entry) else {
+        return say("descriptor_read_failed");
+    };
+    let Ok(p) = decode_render_pipeline_descriptor(&desc) else {
+        return say("descriptor_decode_failed");
+    };
     if p.vertex_func_ref == 0 || p.fragment_func_ref == 0 {
+        crate::observe::fail(format!(
+            "render_pipeline_unresolved reason=function_ref_unbound task={task_id}              ref={pipeline_ref} vtx={} frag={} object={} mesh={}",
+            p.vertex_func_ref, p.fragment_func_ref, p.object_func_ref, p.mesh_func_ref
+        ));
         return None;
     }
     Some(p)
