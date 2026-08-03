@@ -447,11 +447,49 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     // referenced render stage is ready, so replay cannot duplicate clears,
     // fences, compute dispatches, or guest writeback.
     #[cfg(feature = "backend-vulkan")]
-    let translation_pending = streams.iter().fold(false, |pending, stream| {
-        let render_pending = preflight_render_translations(state, host, task_id, stream);
-        let compute_pending = preflight_compute_translations(state, host, task_id, stream);
-        render_pending || compute_pending || pending
-    });
+    let translation_pending = {
+        let mut pending = false;
+        let mut unpublished: Vec<u32> = Vec::new();
+        for stream in &streams {
+            if preflight_render_translations(state, host, task_id, stream, &mut unpublished) {
+                pending = true;
+            }
+            if preflight_compute_translations(state, host, task_id, stream) {
+                pending = true;
+            }
+        }
+        // A pipeline the guest has not finished publishing is asynchronous, not
+        // a malformed one: the same read a moment later succeeds. Retrying the
+        // packet keeps the draw; declining it here is what leaves an icon a
+        // blank rounded square, because the 128x128 render that fills it is the
+        // draw being thrown away.
+        //
+        // Bounded, because a reference that never resolves must not hold the
+        // channel: past the budget the packet executes and the draw declines
+        // with the reason it always did.
+        // A pipeline that resolved is no longer waiting on anything; drop its
+        // clock so the map holds only what is actually outstanding.
+        state
+            .pipeline_unreadable_since
+            .retain(|(task, pipeline_ref), _| {
+                *task != task_id || unpublished.contains(pipeline_ref)
+            });
+        for pipeline_ref in unpublished {
+            let key = (task_id, pipeline_ref);
+            let now = std::time::Instant::now();
+            let since = *state.pipeline_unreadable_since.entry(key).or_insert(now);
+            if now.duration_since(since) < PIPELINE_PUBLISH_WAIT {
+                pending = true;
+            } else {
+                state.pipeline_unreadable_since.remove(&key);
+                crate::observe::fail(format!(
+                    "pipeline_publish_wait_expired task={task_id} ref={pipeline_ref} waited_ms={}",
+                    now.duration_since(since).as_millis()
+                ));
+            }
+        }
+        pending
+    };
     #[cfg(all(feature = "backend-metal", target_os = "macos"))]
     let translation_pending = false;
     if translation_pending {
@@ -586,12 +624,25 @@ fn elapsed_us(started: std::time::Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
+/// How long a draw waits for the guest to finish publishing the pipeline object
+/// it names.
+///
+/// Long enough to cover the gap between an object being created on one channel
+/// and referenced from another — measured here as a single miss per task, at
+/// the head of that task's life, on refs the guest goes on to use. Short enough
+/// that a reference which never resolves costs one packet's worth of latency
+/// and then declines with the reason it always did, rather than holding the
+/// channel that carries it.
+#[cfg(feature = "backend-vulkan")]
+const PIPELINE_PUBLISH_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+
 #[cfg(feature = "backend-vulkan")]
 fn preflight_render_translations<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
     stream: &[u8],
+    unpublished: &mut Vec<u32>,
 ) -> bool {
     let pipelines = render_pipeline_refs(stream);
     let mut pending = false;
@@ -599,8 +650,13 @@ fn preflight_render_translations<M: HostMemory + HostOps>(
         let Ok((v_air, f_air)) =
             metal_draw::load_render_air_pair(state, host, task_id, pipeline_ref)
         else {
-            // Normal execution emits the precise pipeline/MTLB failure. A
-            // missing plan input is deterministic, not asynchronous work.
+            // Normal execution emits the precise pipeline/MTLB failure. A plan
+            // input that is malformed is deterministic and executes now; one
+            // the guest has not finished publishing is not, and the caller
+            // holds the packet for it.
+            if metal_draw::render_pipeline_unreadable_yet(state, host, task_id, pipeline_ref) {
+                unpublished.push(pipeline_ref);
+            }
             continue;
         };
         if !crate::runtime::m2v_cache::ensure_cached_async(
@@ -6444,5 +6500,37 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "backend-vulkan"))]
+mod publish_wait_tests {
+    use super::*;
+    use crate::model::{DeviceId, PAGE_SHIFT_X86};
+
+    /// A draw whose pipeline object the guest has not finished publishing is
+    /// retried, not lost — that draw is the 128x128 render that fills an app
+    /// icon. The wait is bounded so a reference that never resolves costs one
+    /// packet of latency instead of the channel.
+    #[test]
+    fn an_unpublished_pipeline_is_waited_for_and_then_given_up_on() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let key = (7u32, 14u32);
+        let now = std::time::Instant::now();
+
+        // First sight starts the clock and is inside the budget.
+        let since = *state.pipeline_unreadable_since.entry(key).or_insert(now);
+        assert!(now.duration_since(since) < PIPELINE_PUBLISH_WAIT);
+
+        // Past the budget the wait ends, and the entry goes with it so the
+        // next reference starts its own clock rather than inheriting this one.
+        state.pipeline_unreadable_since.insert(
+            key,
+            now - PIPELINE_PUBLISH_WAIT - std::time::Duration::from_millis(1),
+        );
+        let since = state.pipeline_unreadable_since[&key];
+        assert!(std::time::Instant::now().duration_since(since) >= PIPELINE_PUBLISH_WAIT);
+        state.pipeline_unreadable_since.remove(&key);
+        assert!(state.pipeline_unreadable_since.is_empty());
     }
 }

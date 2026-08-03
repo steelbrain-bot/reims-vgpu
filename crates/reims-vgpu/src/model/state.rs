@@ -1691,6 +1691,11 @@ pub struct DeviceState {
     /// attributes to the device costs a `GPU Reset` that discards every frame
     /// in flight, not just the one being ordered.
     pub present_translation_hold_since: Option<std::time::Instant>,
+    /// When a render pipeline object was first found unreadable, keyed by
+    /// (task, ref). A draw whose pipeline the guest has not finished
+    /// publishing is retried rather than lost, and this is what stops that
+    /// retry from becoming a wait for something that will never arrive.
+    pub pipeline_unreadable_since: std::collections::HashMap<(u32, u32), std::time::Instant>,
     pub pending: PendingWork,
     pub child_rings: [ChannelRing; MAX_CHANNELS],
     pub tasks: [TaskEntry; MAX_TASKS],
@@ -2005,6 +2010,7 @@ impl DeviceState {
             present_translation_holds: 0,
             present_translation_hold_mask: 0,
             present_translation_hold_since: None,
+            pipeline_unreadable_since: std::collections::HashMap::new(),
             pending: PendingWork::default(),
             child_rings: std::array::from_fn(|_| ChannelRing::default()),
             tasks: std::array::from_fn(|_| TaskEntry::default()),

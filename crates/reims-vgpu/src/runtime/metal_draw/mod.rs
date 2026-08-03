@@ -827,12 +827,40 @@ fn load_render_pipeline<M: HostMemory + HostOps>(
     };
     if p.vertex_func_ref == 0 || p.fragment_func_ref == 0 {
         crate::observe::fail(format!(
-            "render_pipeline_unresolved reason=function_ref_unbound task={task_id}              ref={pipeline_ref} vtx={} frag={} object={} mesh={}",
+            "render_pipeline_unresolved reason=function_ref_unbound task={task_id} ref={pipeline_ref} vtx={} frag={} object={} mesh={}",
             p.vertex_func_ref, p.fragment_func_ref, p.object_func_ref, p.mesh_func_ref
         ));
         return None;
     }
     Some(p)
+}
+
+/// Is this pipeline object merely not readable *yet*?
+///
+/// The five ways `load_render_pipeline` fails split in two. An entry that is
+/// absent from the task's object list, or a descriptor whose guest page is not
+/// mapped at this instant, is asynchronous: the guest is still publishing it,
+/// and the same read a moment later succeeds. An entry of the wrong type, a
+/// descriptor that will not decode, or one that decodes with no function bound
+/// is deterministic — waiting cannot change it.
+///
+/// The distinction decides whether the packet is retried or the draw is lost,
+/// so it is drawn from the same reads `load_render_pipeline` makes rather than
+/// from its collapsed `None`.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn render_pipeline_unreadable_yet<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    pipeline_ref: u32,
+) -> bool {
+    let Some(entry) = objects::lookup_list_entry(state, host, task_id, pipeline_ref) else {
+        return true;
+    };
+    if entry.object_type != OBJECT_TYPE_TYPE7 {
+        return false;
+    }
+    objects::read_descriptor(state, host, task_id, &entry).is_none()
 }
 
 /// Resolve immutable AIR inputs for a render pipeline before executing its

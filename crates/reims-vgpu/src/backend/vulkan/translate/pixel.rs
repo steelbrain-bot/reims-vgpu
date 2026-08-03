@@ -268,7 +268,10 @@ pub fn color_attachment(
     let f = translate(mtl)?;
     if !matches!(
         f.linear_vk,
-        vk::Format::R8G8B8A8_UNORM | vk::Format::B8G8R8A8_UNORM | vk::Format::R16G16_SFLOAT
+        vk::Format::R8G8B8A8_UNORM
+            | vk::Format::B8G8R8A8_UNORM
+            | vk::Format::R16G16_SFLOAT
+            | vk::Format::R16G16B16A16_SFLOAT
     ) {
         return Err(TranslateReason::NoColorAttachmentFormat(mtl));
     }
@@ -1143,6 +1146,12 @@ mod tests {
                 p::MTL_FORMAT_RGBA8_UNORM_SRGB,
                 p::MTL_FORMAT_BGRA8_UNORM,
                 p::MTL_FORMAT_BGRA8_UNORM_SRGB,
+                // Tahoe renders its glass material into RGBA16Float: every app
+                // icon and every Liquid Glass surface is a target of this
+                // format. Refusing it did not degrade those surfaces, it lost
+                // them — a blank rounded square where the icon is, and no
+                // material at all.
+                p::MTL_FORMAT_RGBA16_FLOAT,
             ]
         );
     }
@@ -1296,5 +1305,24 @@ mod sampled_only_storage_tests {
             assert_eq!(vk_storage_image(resolved), expected, "{mtl:#x}");
             assert_eq!(resolved.bytes_per_texel(), bytes, "{mtl:#x}");
         }
+    }
+}
+
+#[cfg(test)]
+mod rgba16f_attachment_tests {
+    use super::*;
+    use crate::contract::pixel_format as pf;
+
+    /// `MTLPixelFormatRGBA16Float` is what Tahoe renders its glass material
+    /// into — every app icon and every Liquid Glass surface is an RGBA16Float
+    /// target. Refusing it as a colour attachment does not degrade those
+    /// surfaces, it loses them: the icon is a blank rounded square and the
+    /// material never appears.
+    #[test]
+    fn rgba16_float_is_a_colour_attachment() {
+        let (format, _) = color_attachment(pf::MTL_FORMAT_RGBA16_FLOAT)
+            .expect("RGBA16Float has no colour attachment format");
+        assert_eq!(format, vk::Format::R16G16B16A16_SFLOAT);
+        assert_eq!(bytes_per_texel(format), Some(8));
     }
 }
