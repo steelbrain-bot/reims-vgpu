@@ -81,7 +81,7 @@ pub(crate) use sink::{draw_log_enabled, elapsed_ms, elapsed_us};
 // resort — resolves through one directory, so a host whose spelling of "a
 // writable scratch directory" differs is a single edit in `sink` rather than a
 // literal repeated across `runtime/`.
-pub(crate) use sink::{log_dir, log_path};
+pub(crate) use sink::log_dir;
 
 // Path accessors and the line matcher exist so tests can assert against the
 // real sink rather than a mock; production never reads them back.

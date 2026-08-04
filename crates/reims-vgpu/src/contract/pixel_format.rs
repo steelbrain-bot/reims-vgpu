@@ -1626,6 +1626,9 @@ mod tests {
             TexelLayout::Bgra8,
             TexelLayout::R8,
             TexelLayout::Rg8,
+            TexelLayout::R16Unorm,
+            TexelLayout::Rg16Unorm,
+            TexelLayout::Rg16Uint,
             TexelLayout::R16Float,
             TexelLayout::R32Float,
         ] {
@@ -1634,6 +1637,9 @@ mod tests {
                 TexelLayout::Bgra8 => MTL_FORMAT_BGRA8_UNORM,
                 TexelLayout::R8 => MTL_FORMAT_R8_UNORM,
                 TexelLayout::Rg8 => MTL_FORMAT_RG8_UNORM,
+                TexelLayout::R16Unorm => MTL_FORMAT_R16_UNORM,
+                TexelLayout::Rg16Unorm => MTL_FORMAT_RG16_UNORM,
+                TexelLayout::Rg16Uint => MTL_FORMAT_RG16_UINT,
                 TexelLayout::R16Float => MTL_FORMAT_R16_FLOAT,
                 TexelLayout::R32Float => MTL_FORMAT_R32_FLOAT,
             };
@@ -1642,14 +1648,16 @@ mod tests {
                 bytes_per_pixel(mtl),
                 "{layout:?} and its guest format {mtl:#x} disagree on texel width"
             );
-            // Exactly the four byte-order layouts have a CPU loader class. The
-            // two float ones deliberately do not — `texel_to_rgba8` has no
-            // float arm, which is why they ride a native sampled rail instead,
-            // and `TexelLayout::R16Float`'s own doc says converting them would
-            // quantize the transfer curve. Pinned here because it is an
+            // Exactly the byte-order layouts have a CPU loader class. The
+            // native sampled/storage layouts deliberately do not: converting
+            // them through the 8-bit colour LUTs would quantize floats and
+            // reinterpret integer payloads. Pinned here because it is an
             // *absence*, and an absence is what a later "just add the missing
             // arm" edit removes without noticing what it was for.
-            let expects_loader = !matches!(layout, TexelLayout::R16Float | TexelLayout::R32Float);
+            let expects_loader = matches!(
+                layout,
+                TexelLayout::Rgba8 | TexelLayout::Bgra8 | TexelLayout::R8 | TexelLayout::Rg8
+            );
             assert_eq!(
                 sampled_class(mtl).is_some(),
                 expects_loader,

@@ -5322,11 +5322,6 @@ pub fn report_stall_if_wedged<H: HostMemory + HostOps>(
         .gfx
         .fifo_read
         .load(std::sync::atomic::Ordering::Acquire);
-    let stamps_pending: u32 = state
-        .child_stamps
-        .iter()
-        .map(|c| c.queue.len() as u32)
-        .sum();
     // Guest-visible child ring cursors, for every channel whose register block
     // shows a live cursor pair. `tail != head` is guest work no host counter
     // knows about.
@@ -5349,7 +5344,6 @@ pub fn report_stall_if_wedged<H: HostMemory + HostOps>(
         }
     }
     let outstanding = fifo_read != state.gfx.fifo_written
-        || stamps_pending != 0
         || !ring_lag.is_empty()
         || state.pending.main_drain
         || state.pending.child_mask != 0
@@ -5363,27 +5357,10 @@ pub fn report_stall_if_wedged<H: HostMemory + HostOps>(
         return;
     }
     state.last_stall_report_ms = now_ms;
-    let stamp_heads: Vec<String> = state
-        .child_stamps
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| !c.queue.is_empty())
-        .map(|(ch, c)| {
-            let head = &c.queue[0];
-            format!(
-                "ch{ch}:n={} head_idx={} ready={} job={:?}",
-                c.queue.len(),
-                head.stamp_index,
-                head.ready,
-                head.job_id
-            )
-        })
-        .collect();
     crate::observe::fail(format!(
         "STALL drain_wedged idle_ms={} fifo={}..{} control_fifo={:#x} root_page={:#x} \
          pending_main={} pending_child={:#x} iosfc={} yield={} backpressure={} unpainted={} \
-         deferred={:#x} held={:#x} active_children={:#x} stamps_pending={stamps_pending} \
-         stamps=[{}] rings=[{}]",
+         deferred={:#x} held={:#x} active_children={:#x} rings=[{}]",
         now_ms.saturating_sub(state.last_drain_wake_ms),
         fifo_read,
         state.gfx.fifo_written,
@@ -5398,7 +5375,6 @@ pub fn report_stall_if_wedged<H: HostMemory + HostOps>(
         state.translation_deferred_mask,
         state.translation_order_hold_mask,
         state.active_child_mask,
-        stamp_heads.join(" "),
         ring_lag.join(" ")
     ));
 }

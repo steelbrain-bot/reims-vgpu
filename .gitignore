@@ -45,6 +45,7 @@ Vulkan-Headers/
 /kb/
 /journal/
 /m2v-handoff/
+/docs-local/
 
 # vendor/qemu is a git submodule (steelbrain/qemu-reims-vgpu, branch host-reims-vgpu-vmapple).
 # Its own build/ output is ignored by QEMU's own .gitignore.

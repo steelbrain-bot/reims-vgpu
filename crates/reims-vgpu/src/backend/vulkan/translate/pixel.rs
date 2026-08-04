@@ -1004,7 +1004,7 @@ mod tests {
         // Kept off every rail that carries colour through 8-bit unorm LUTs. A
         // 16-bit coordinate does not survive that round trip, and a named
         // refusal is better than wrong pixels.
-        assert_eq!(p::render_target_class(p::MTL_FORMAT_RG16_UINT), None);
+        assert_eq!(p::render_target_bpp(p::MTL_FORMAT_RG16_UINT), None);
         assert_eq!(p::texel_to_rgba8(p::MTL_FORMAT_RG16_UINT, &[0u8; 4]), None);
         assert!(!p::rgba8_to_texel(
             p::MTL_FORMAT_RG16_UINT,

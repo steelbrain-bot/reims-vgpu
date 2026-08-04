@@ -4156,9 +4156,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         }
     }
 
-    let (w, h) = if req.width > 0 && req.height > 0 {
-        (req.width, req.height)
-    } else if let Some(c0) = req.colors.first() {
+    let (w, h) = if let Some(c0) = req.colors.first() {
         (c0.width, c0.height)
     } else {
         return Ok(M2vDrawSpan::None);
@@ -4683,7 +4681,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // What a draw samples decides what it can draw. For a small
                 // float target — an icon canvas — an empty source and an empty
                 // result are the same picture, and only this separates them.
-                if crate::observe::dump_flush_surfaces() && req.width <= 160 && req.height <= 160 {
+                if crate::observe::dump_flush_surfaces() && w <= 160 && h <= 160 {
                     let census = match &source {
                         crate::backend::vulkan::engine::SampledSource::Bytes(b) => {
                             format!("bytes={} nonzero={}", b.len(), b.iter().filter(|x| **x != 0).count())
@@ -4709,7 +4707,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     };
                     crate::observe::fail(format!(
                         "draw_sampled_census pipe={} target={}x{} bind={img_bind} ref={texture_ref} {tw}x{th} {census}",
-                        req.pipeline_ref, req.width, req.height
+                        req.pipeline_ref, w, h
                     ));
                 }
                 images.push(crate::backend::vulkan::engine::SampledImageResource {
@@ -5149,12 +5147,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // draw reports success and the surface comes out empty but for whatever
         // sliver fell inside. Record the two things that decide where it lands
         // against the size of what it lands on.
-        if crate::observe::dump_flush_surfaces() && req.width <= 256 && req.height <= 256 {
+        if crate::observe::dump_flush_surfaces() && w <= 256 && h <= 256 {
             crate::observe::fail(format!(
                 "draw_placement pipe={} {}x{} viewport={:?} scissor={:?} vtx={} inst={}",
                 req.pipeline_ref,
-                req.width,
-                req.height,
+                w,
+                h,
                 req.viewport,
                 req.scissor,
                 req.vertex_count,
