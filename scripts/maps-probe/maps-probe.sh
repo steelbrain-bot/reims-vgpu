@@ -71,6 +71,20 @@ sleep 2
 # work out of the scored window; a still-blank map draws nothing.
 sleep 10
 
+# Preserve the windowed state before the probe enters macOS full screen. The
+# full-screen captures below cannot tell a missing system menu bar from the OS
+# intentionally hiding it, while this one can. It is setup evidence only and
+# remains outside the scored window.
+timeout 30 ssh -o BatchMode=yes macos-vm '
+  echo "processes:"
+  ps ax -o pid=,state=,command= | egrep "(/ControlCenter|/SystemUIServer)" | grep -v egrep || true
+  echo "controlcenter defaults:"
+  defaults read com.apple.controlcenter 2>&1 || true
+  echo "host controlcenter defaults:"
+  defaults -currentHost read com.apple.controlcenter 2>&1 || true
+' >"$OUT/status-items.txt" 2>&1 || echo "status item diagnostics failed"
+"$SHOT" -o "$OUT/windowed.png" >/dev/null 2>&1 || echo "windowed screenshot failed"
+
 read -r W H < <("$Q" size) || { echo "no display size"; exit 2; }
 echo "display ${W}x${H}"
 
