@@ -1377,21 +1377,28 @@ fn staged_window_pages<M: HostMemory>(
 /// nothing is lost, and the counters are what say how much of a boot's compute
 /// readback this arm can actually reach.
 ///
-/// Three conditions, and each names a contract term rather than an observation:
+/// Two conditions, and each names a contract term rather than an observation:
 ///
 /// - the writeback must be a **guest-linear plane**. A type-11 destination is a
 ///   tiled surface mapping, which [`crate::runtime::render_writeback::GvaPlaneDestination`]
 ///   cannot describe and the licence therefore cannot walk.
-/// - the image must be **transient**. A registered resident is popped out of the
-///   submission ring's live set when it is acquired, so nothing holds it against
-///   `reclaim_compute_storage_for_allocation_retry` while the copy is still
-///   queued — and that reclaim waits on no fence. `pin_resident_storage` is the
-///   mechanism that would hold it and no caller takes it; until one does, a
-///   resident reads back. A transient slot is sealed into the ring entry and
-///   cannot be recycled before the fence retires, which is the whole window.
 /// - the licence must be granted. That is where the format, the complete page
 ///   walk, the texel alignment and the guest-RAM references are all checked, in
 ///   the one place both GPU-side writers of a guest plane meet them.
+///
+/// # Residency is not a third condition
+///
+/// It was, for one boot, and that restriction reached 81 of the 89 linear
+/// windows a driven macos-13 boot produces — so a rule written to be safe was
+/// most of the traffic this arm exists to remove. What it was protecting against
+/// is real but is not the reclaim: both reclaim paths already skip a resident
+/// whose `gpu_only_content` holds, and every executed dispatch sets that flag.
+/// The actual window is a **re-key**, which destroys the held image when the same
+/// identity arrives at a new shape, and the pin is what refuses it. The engine
+/// now takes that pin itself when it arms the write debt — see
+/// `GuestWriteSource::ResidentStorage` — and releases it from the ring slot's
+/// cleanup, after the fence. So a resident is held for exactly the window a
+/// submitted-not-waited copy needs, and the destination no longer has to care.
 #[cfg(feature = "backend-vulkan")]
 fn direct_destination<M: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -1414,10 +1421,6 @@ fn direct_destination<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route("compute_dst_host_not_linear");
         return ComputeImageDestination::Host;
     };
-    if tex.residency.is_some() {
-        crate::runtime::drain::note_store_route("compute_dst_host_resident");
-        return ComputeImageDestination::Host;
-    }
     let Ok(row_stride) = u32::try_from(*row_stride) else {
         crate::runtime::drain::note_store_route("compute_dst_host_stride_width");
         return ComputeImageDestination::Host;
@@ -1439,6 +1442,15 @@ fn direct_destination<M: HostMemory + HostOps>(
     ) {
         Ok(licence) => {
             crate::runtime::drain::note_store_route("compute_dst_guest_pages");
+            // A split of the line above, so the two add up to it. Worth counting
+            // separately because the resident half is the half that needs the
+            // engine's pin, and it is the half that used to read back: a boot
+            // where it stays at zero is a boot where the pin never had to work.
+            crate::runtime::drain::note_store_route(if tex.residency.is_some() {
+                "compute_dst_guest_pages_resident"
+            } else {
+                "compute_dst_guest_pages_transient"
+            });
             ComputeImageDestination::GuestPages {
                 target: Box::new(licence.target),
                 pages: licence.gpas,

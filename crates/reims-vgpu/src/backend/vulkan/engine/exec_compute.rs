@@ -1055,15 +1055,24 @@ pub(crate) unsafe fn execute_compute_inner(
     // does not un-submit the copy and the pages are being written either way.
     //
     // Read straight off the request rather than off `simg_slots`, so nothing
-    // depends on the two being the same length in the same order. `RingEntry`
-    // is the right source for these images: a transient slot is sealed into
-    // this submission's ring entry and cannot be recycled before the fence
-    // retires, which is the whole window the copy needs.
+    // depends on the two being the same length in the same order — and so the
+    // destination and the residency that decide the source are read off one
+    // record, which is the only way they cannot disagree.
+    //
+    // Which source applies is a fact about where the image lives. A transient
+    // slot is sealed into this submission's ring entry and cannot be recycled
+    // before the fence retires, so the ring is its lifetime. A registered
+    // resident was popped out of that live set at acquire and lives in the
+    // compute-storage registry instead, so it needs the pin.
     for resource in &req.storage_images {
         if let super::types::ComputeImageDestination::GuestPages { pages, .. } =
             &resource.destination
         {
-            super::record_guest_write_debt(pools, super::GuestWriteSource::RingEntry, pages);
+            let source = match &resource.residency {
+                Some(residency) => super::GuestWriteSource::ResidentStorage(&residency.identity),
+                None => super::GuestWriteSource::RingEntry,
+            };
+            super::record_guest_write_debt(pools, source, pages);
         }
     }
 

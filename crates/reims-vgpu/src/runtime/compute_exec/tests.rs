@@ -2276,26 +2276,25 @@ fn a_staged_buffer_carries_the_pages_its_writeback_is_bounded_to() {
     assert!(staged_span_pages(&state, &host, 1, page, 0).is_empty());
 }
 
-/// A resident storage image never takes the direct-to-guest-pages arm.
+/// The direct arm refuses on the shape of the destination, and on nothing else.
 ///
-/// This is a safety gate, not a routing preference. A registered resident is
-/// popped out of the submission ring's live set when it is acquired and lives in
-/// `compute_storage_registry`, where `reclaim_compute_storage_for_allocation_
-/// retry` can destroy it as soon as `gpu_only_content` clears — and that reclaim
-/// waits on no fence. A direct copy is submitted and not waited, so routing a
-/// resident here hands the queue an image another dispatch may have already
-/// freed. `pin_resident_storage` is the mechanism that would hold it and nothing
-/// takes it; until something does, the answer must be `Host`.
+/// Two refusals, and the third case is the one that must *not* refuse. A type-11
+/// destination is a tiled surface mapping the guest-linear licence cannot
+/// describe. A window whose pages did not resolve cannot be licensed. Residency
+/// is neither: a registered resident is a perfectly good source for a copy, and
+/// what holds it across a submitted-not-waited copy is the engine's pin, taken
+/// where the write debt is armed and released from the ring slot's cleanup.
 ///
-/// The other two arms are cheaper to be wrong about — a type-11 destination is a
-/// tiled surface mapping the guest-linear licence cannot describe, and an
-/// unlicensed window is one whose pages did not resolve — but all three land the
-/// same way, because `Host` is the general path and loses nothing.
+/// That third case is the regression this test exists for. Residency *was* a
+/// refusal here, and it reached 81 of the 89 linear windows a driven macos-13
+/// boot produces — a rule written to be safe that turned out to be most of the
+/// traffic the arm exists to remove. Re-adding it would read as caution and cost
+/// 91 % of the saving, so it is asserted against directly.
 ///
-/// All three answers are `Host`, so the return value alone cannot say *which*
-/// gate refused, and a resident window that fell through to the licence check
-/// would read identically to one the residency gate caught. The census route is
-/// what distinguishes them, so each case is asserted on its own counter.
+/// Every refusal answers `Host`, so the return value alone cannot say *which*
+/// gate fired, and a window that fell through to the licence check reads
+/// identically to one an earlier gate caught. The census route is what
+/// distinguishes them, so each case is asserted on its own counter.
 ///
 /// Vulkan-only: the direct arm is a `VK_EXT_external_memory_host` import, and
 /// `StagedTexture` does not carry a residency candidate on the Metal arm at all.
@@ -2386,12 +2385,14 @@ fn only_a_licensed_transient_linear_window_can_take_the_direct_arm() {
         "a type-11 window never reaches the guest-linear licence"
     );
 
-    // And the gate this test exists for: residency forces `Host` whatever the
-    // window looks like. Asserted against the same linear writeback the first
-    // case used, so residency is the only term that differs — and on its own
-    // counter, so a resident that merely failed the later licence check would
-    // fail this assertion rather than pass it by coincidence.
-    let before = store_route_count("compute_dst_host_resident");
+    // And the case this test exists for: a resident window is routed on its
+    // destination like any other, so it reaches the licence. Asserted against
+    // the same linear writeback the first case used, so residency is the only
+    // term that differs — and on the *licence's* counter, which is what says it
+    // got that far. `FakeHost` publishes no guest-RAM import, so the licence
+    // itself refuses here and the answer is still `Host`; what this asserts is
+    // that residency was not what decided it.
+    let before = store_route_count("compute_dst_host_unlicensed");
     assert!(
         is_host(&direct_destination(
             &mut state,
@@ -2414,12 +2415,17 @@ fn only_a_licensed_transient_linear_window_can_take_the_direct_arm() {
             ),
             held,
         )),
-        "a resident image must never be handed to a submitted-not-waited copy"
+        "the licence is what refuses on a host with no guest-RAM import"
+    );
+    assert_eq!(
+        store_route_count("compute_dst_host_unlicensed"),
+        before + 1,
+        "a resident window is routed on its destination, not on its residency"
     );
     assert_eq!(
         store_route_count("compute_dst_host_resident"),
-        before + 1,
-        "residency refuses before the licence is even attempted"
+        0,
+        "and nothing refuses on residency at all any more"
     );
 }
 

@@ -298,6 +298,7 @@ impl ResourcePools {
             guest_reads_in_flight: false,
             guest_writes_in_flight: false,
             guest_write_pins_live: Vec::new(),
+            compute_write_pins_live: Vec::new(),
             initialized: false,
         }
     }
@@ -1522,6 +1523,7 @@ impl ResourcePools {
                 attachment_snapshots: std::mem::take(&mut self.attachment_snapshot_live),
                 storage_images: std::mem::take(&mut self.storage_image_live),
                 unpin_residents: std::mem::take(&mut self.guest_write_pins_live),
+                unpin_compute_residents: std::mem::take(&mut self.compute_write_pins_live),
             },
             admissions,
         }
@@ -2461,6 +2463,14 @@ impl ResourcePools {
                     self.guest_write_pins_live.push(identity.clone());
                 }
             }
+            // Same ledger discipline, the other registry. Recorded separately
+            // because the two are keyed differently and the release has to reach
+            // the registry that holds the image.
+            super::super::GuestWriteSource::ResidentStorage(identity) => {
+                if self.pin_resident_storage(identity, true) {
+                    self.compute_write_pins_live.push(*identity);
+                }
+            }
             // Nothing to pin: the ring entry this submission sealed already owns
             // the image and will not recycle it before the fence retires, so a
             // pin here would be a second owner of one lifetime and the ledger
@@ -2571,6 +2581,9 @@ impl ResourcePools {
     unsafe fn drain_cleanup(&mut self, device: &ash::Device, mut pending: PendingGpuCleanup) {
         for identity in pending.unpin_residents.drain(..) {
             self.pin_resident_target(&identity, false);
+        }
+        for identity in pending.unpin_compute_residents.drain(..) {
+            self.pin_resident_storage(&identity, false);
         }
         self.desc_arena.free(device, &pending.dsets);
         // The fence this entry waited on is exactly what makes a rewrite of
@@ -5791,6 +5804,7 @@ mod recycle_tests {
                 attachment_snapshots: Vec::new(),
                 storage_images: Vec::new(),
                 unpin_residents: Vec::new(),
+                unpin_compute_residents: Vec::new(),
             }),
             span: super::gpu_span::SlotSpan::Idle,
             readback_span_armed: false,
@@ -6085,6 +6099,89 @@ mod recycle_tests {
             cleanup.unpin_residents.is_empty(),
             "so its submission carries no unpin either"
         );
+    }
+
+    /// A compute-storage resident's writeback pins in the *other* registry, and
+    /// the ring slot's cleanup releases it.
+    ///
+    /// The arm that lets a registered resident copy straight into guest pages. It
+    /// is not the ring-owned case above: a resident is popped out of the ring's
+    /// live set when it is acquired, so the submission's own cleanup does not own
+    /// its image and the pin is the only thing holding it.
+    ///
+    /// What the pin closes is narrower than it looks, and it is worth being exact
+    /// about because the wrong reading is what made this arm read back for a whole
+    /// boot. Both reclaim paths skip a resident whose `gpu_only_content` holds,
+    /// and every executed dispatch sets it — so the *reclaim* was never the
+    /// hazard. `acquire_resident_storage_image` is: it destroys the held image
+    /// when the same identity arrives at a different shape, and
+    /// `compute_rekey_refusal` is what stops it, reading `pinned` and nothing
+    /// else. Between this submit and its fence, that refusal is the whole defence.
+    ///
+    /// Fails without the ledger in either direction: no pin and a re-keying
+    /// dispatch frees an image the queue is still reading; no release and the
+    /// identity refuses every later re-shape for the life of the guest.
+    #[test]
+    fn a_compute_resident_writeback_pins_in_its_own_registry_until_the_slot_retires() {
+        let mut pools = ResourcePools::new();
+        let id = admit_compute_resident(&mut pools, 1, 1_000, false);
+
+        pools.note_guest_write_recorded(GuestWriteSource::ResidentStorage(&id));
+
+        assert!(
+            pools.take_guest_write_debt(),
+            "the stamp ordering hangs on this debt being owed, resident or not"
+        );
+        assert!(
+            pools.compute_storage_registry[&id].pinned,
+            "the copy is submitted and not waited, so the image must be held"
+        );
+        assert_eq!(
+            pools.compute_write_pins_live,
+            vec![id],
+            "and the ledger records the pin it actually took"
+        );
+
+        let mut cleanup = pools.seal_entry(Vec::new(), Vec::new()).cleanup;
+        assert!(
+            pools.compute_write_pins_live.is_empty(),
+            "sealing hands the pin to the slot rather than copying it"
+        );
+        assert_eq!(cleanup.unpin_compute_residents, vec![id]);
+
+        // What `drain_cleanup` does with them, once the fence has signalled.
+        for identity in cleanup.unpin_compute_residents.drain(..) {
+            pools.pin_resident_storage(&identity, false);
+        }
+        assert!(
+            !pools.compute_storage_registry[&id].pinned,
+            "and the fence is what ends the hold"
+        );
+    }
+
+    /// An identity with no slot records the debt and no pin.
+    ///
+    /// The pin is taken in the registry that owns the image, so an identity that
+    /// is not registered has no image for anything to remove and nothing to hold.
+    /// The ledger must not record a release for a pin it could not take: a stray
+    /// unpin would land on a future resident admitted under the same key.
+    #[test]
+    fn a_compute_writeback_against_an_unregistered_identity_records_no_pin() {
+        let mut pools = ResourcePools::new();
+        let absent = ComputeStorageResidencyKey::linear(0, 77, 0, 0, 0, 8, 8, 0);
+
+        pools.note_guest_write_recorded(GuestWriteSource::ResidentStorage(&absent));
+
+        assert!(
+            pools.take_guest_write_debt(),
+            "the pages are still being written, so the debt is still owed"
+        );
+        assert!(pools.compute_write_pins_live.is_empty());
+        assert!(pools
+            .seal_entry(Vec::new(), Vec::new())
+            .cleanup
+            .unpin_compute_residents
+            .is_empty());
     }
 
     /// Another holder's pin survives a writeback submission's retirement.

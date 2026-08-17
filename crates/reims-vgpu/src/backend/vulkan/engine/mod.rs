@@ -3398,10 +3398,15 @@ fn shared_backing_settles(
 ///
 /// A copy that is submitted and not waited leaves its source image readable by
 /// the queue for as long as the fence is unsignalled, so something has to stop
-/// the reclaim paths taking it. There are exactly two answers in this device and
-/// they are not interchangeable, which is why this is an enum rather than an
+/// the reclaim paths taking it. There are exactly three answers in this device
+/// and they are not interchangeable, which is why this is an enum rather than an
 /// `Option<&TargetIdentity>`: an `Option` would let a caller mean "no pin
 /// needed" and "I forgot the identity" with the same `None`.
+///
+/// The two pinned arms name two different registries and the pin is taken in the
+/// registry that owns the image, not in whichever one the caller happened to
+/// have a key for. Both release through the same ring cleanup, because both are
+/// answering the same question — what holds this image to the fence.
 #[derive(Clone, Copy)]
 pub(super) enum GuestWriteSource<'a> {
     /// A resident render target, or a resident compute storage image reached
@@ -3410,6 +3415,14 @@ pub(super) enum GuestWriteSource<'a> {
     /// `gpu_only_content` and the settle, that pin is all that keeps a reclaim
     /// off an image the submitted copy still reads.
     ResidentTarget(&'a TargetIdentity),
+    /// A registered compute-storage resident, keyed in `compute_storage_registry`.
+    ///
+    /// The reclaim paths already skip it while `gpu_only_content` holds, so what
+    /// the pin closes here is the *re-key*: `acquire_resident_storage_image`
+    /// destroys the held image when the same identity arrives at a new shape, and
+    /// `compute_rekey_refusal` — the only thing that stops it — reads `pinned`.
+    /// See `ResourcePools::pin_resident_storage`.
+    ResidentStorage(&'a crate::model::ComputeStorageResidencyKey),
     /// A transient image sealed into this submission's own ring entry.
     ///
     /// The ring is the lifetime: a slot with cleanup parked on it cannot be

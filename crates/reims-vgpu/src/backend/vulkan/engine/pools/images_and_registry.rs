@@ -565,16 +565,35 @@ impl ResourcePools {
         self.set_compute_sole_copy(identity, false)
     }
 
-    /// Pin/unpin a resident against LRU eviction (deferred-writeback content
-    /// whose only copy is the GPU image). No-op for an absent identity.
+    /// Pin/unpin a resident against removal while its content exists nowhere but
+    /// the GPU image. Answers whether a slot was there to pin.
+    ///
+    /// The bool exists for the same reason [`Self::pin_resident_target`]'s does:
+    /// the guest-write ledger records the pins it actually took, so a release can
+    /// never be handed out for a pin that was never taken. An absent identity is
+    /// not an error — there is then no image for anything to remove.
+    ///
+    /// # What this holds that `gpu_only_content` does not
+    ///
+    /// Both reclaim paths already skip a sole-copy resident, so a dispatch's own
+    /// output is safe from *allocation-pressure recovery* without any pin. The
+    /// window this closes is the other removal: a re-key.
+    /// [`Self::acquire_resident_storage_image`] destroys the held image when the
+    /// same identity arrives at a different shape, and
+    /// [`Self::compute_rekey_refusal`] is what stops it — and that refusal reads
+    /// `pinned`, nothing else. A compute writeback copying straight into guest
+    /// pages is submitted and not waited, so between the submit and the fence a
+    /// re-shaped dispatch would hand the queue a destroyed image.
     pub(crate) fn pin_resident_storage(
         &mut self,
         identity: &ComputeStorageResidencyKey,
         pinned: bool,
-    ) {
+    ) -> bool {
         if let Some(resident) = self.compute_storage_registry.get_mut(identity) {
             resident.pinned = pinned;
+            return true;
         }
+        false
     }
 
     /// Generation of a resident compute storage image, if one is registered.
