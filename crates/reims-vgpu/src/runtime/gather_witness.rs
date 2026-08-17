@@ -97,6 +97,40 @@
 //! zero on this branch — the GPU-direct GVA Store wrote guest pages without
 //! recording them, and the audit was structurally incapable of noticing.
 //!
+//! # A third reason for a zero: the rail did not run at all
+//!
+//! Both readings above are of a host where the sampled cache was *doing work*
+//! and the question was whether the audit could check it. There is a third
+//! shape, and it reads identically to the other two in the census, so check for
+//! it first.
+//!
+//! A driven macos-13 boot on a discrete NVIDIA host with
+//! `host_pointer_import=supported`, 45 s sustained animation, at
+//! `REIMS_VGPU_GATHER_AUDIT_ALL=on`:
+//!
+//! ```text
+//! sampled_guest_imports     88166
+//! sampled_gather_unvouched  88166
+//! sampled_gathers               0
+//! sampled_gather_bytes          0
+//! gw_vouched                    0
+//! gw_audit_seed / _ok / _unsound   0 / 0 / 0
+//! ```
+//!
+//! Every sampled bind was served by the host-pointer import, so the gather rail
+//! this witness exists to elide never ran, so nothing was ever vouched, so the
+//! audit had nothing to seed from — three zeros in a row with a single cause.
+//! **`gw_vouched` is the field that distinguishes this case**, and it is the one
+//! to read before either `gw_audit_ok` or `gw_audit_unsound` means anything: a
+//! zero there says no bind on the boot depended on this witness, which is a
+//! stronger statement than the audit could ever make and a different one.
+//!
+//! It is also the shape to expect wherever the import serves every bind, so do
+//! not go looking for a defect in this module because a capable host's sweep
+//! came back empty. The rail that needs the witness is the one a host without
+//! `VK_EXT_external_memory_host` takes, which is why a soundness sweep of this
+//! alarm belongs on that arm — see `REIMS_VGPU_GUEST_IMPORT=off`.
+//!
 //! # On the Intel iGPU it *was* comparing, and its zero is a real reading
 //!
 //! The paragraphs above are a measurement of a host with a ~40 % refusal rate.
