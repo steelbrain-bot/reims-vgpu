@@ -2445,16 +2445,27 @@ impl ResourcePools {
     /// on its behalf. A pin that cannot be taken — no slot, or content not ready
     /// — records the debt and nothing else, because there is then no image for
     /// the reclaim to take.
-    pub(crate) fn note_guest_write_recorded(&mut self, identity: &TargetIdentity) {
+    pub(crate) fn note_guest_write_recorded(&mut self, source: super::super::GuestWriteSource<'_>) {
         // A bind recorded after this must not reuse a copy taken before it: the
-        // Store lands in guest pages a later bind may name.
+        // Store lands in guest pages a later bind may name. True of every
+        // source — it is a fact about the destination pages, not about which
+        // image the bytes came from.
         self.forget_cb_bound_buffers(
             "bindmap_clear_guestwrite",
             "bindmap_clear_guestwrite_entries",
         );
         self.guest_writes_in_flight = true;
-        if self.pin_resident_target(identity, true) {
-            self.guest_write_pins_live.push(identity.clone());
+        match source {
+            super::super::GuestWriteSource::ResidentTarget(identity) => {
+                if self.pin_resident_target(identity, true) {
+                    self.guest_write_pins_live.push(identity.clone());
+                }
+            }
+            // Nothing to pin: the ring entry this submission sealed already owns
+            // the image and will not recycle it before the fence retires, so a
+            // pin here would be a second owner of one lifetime and the ledger
+            // would have a release to get right for no gain.
+            super::super::GuestWriteSource::RingEntry => {}
         }
     }
 
@@ -4607,6 +4618,7 @@ mod evict_route_tests {
 #[cfg(test)]
 mod recycle_tests {
     use super::*;
+    use crate::backend::vulkan::engine::GuestWriteSource;
 
     fn null_slot(w: u32, h: u32) -> SampledSlot {
         SampledSlot {
@@ -5868,7 +5880,7 @@ mod recycle_tests {
             }),
             ("a staging recycle", &|p| p.recycle_staging()),
             ("a recorded guest-page write", &|p| {
-                p.note_guest_write_recorded(&identity)
+                p.note_guest_write_recorded(GuestWriteSource::ResidentTarget(&identity))
             }),
         ];
         for (what, end) in ends {
@@ -5953,15 +5965,15 @@ mod recycle_tests {
             "a device that has submitted no writeback owes no wait"
         );
 
-        pools.note_guest_write_recorded(&identity);
+        pools.note_guest_write_recorded(GuestWriteSource::ResidentTarget(&identity));
         assert!(pools.take_guest_write_debt());
         assert!(
             !pools.take_guest_write_debt(),
             "one settle covers the copies recorded before it, not every stamp after"
         );
 
-        pools.note_guest_write_recorded(&identity);
-        pools.note_guest_write_recorded(&identity);
+        pools.note_guest_write_recorded(GuestWriteSource::ResidentTarget(&identity));
+        pools.note_guest_write_recorded(GuestWriteSource::ResidentTarget(&identity));
         assert!(pools.take_guest_write_debt());
         assert!(!pools.take_guest_write_debt());
     }
@@ -5997,14 +6009,14 @@ mod recycle_tests {
         assert_eq!(pools.registry[&identity].pin_count, 0, "nobody has pinned");
 
         // Recording the copy is what pins: the caller holds nothing.
-        pools.note_guest_write_recorded(&identity);
+        pools.note_guest_write_recorded(GuestWriteSource::ResidentTarget(&identity));
         assert_eq!(
             pools.registry[&identity].pin_count, 1,
             "the submitted copy must hold the image against reclaim"
         );
 
         // A second window on the same resident inside one pass takes its own.
-        pools.note_guest_write_recorded(&identity);
+        pools.note_guest_write_recorded(GuestWriteSource::ResidentTarget(&identity));
         assert_eq!(pools.registry[&identity].pin_count, 2);
 
         // Sealing transfers the pins to the exact submission that references
@@ -6021,6 +6033,57 @@ mod recycle_tests {
         assert!(
             cleanup.unpin_residents.is_empty(),
             "a retired pin must not be released a second time"
+        );
+    }
+
+    /// A ring-owned source records the same debt and takes no pin.
+    ///
+    /// This is the compute storage-image arm. Its image is a transient slot
+    /// sealed into the submission's own ring entry, which cannot be recycled
+    /// until the fence retires — so the lifetime is already held and a pin here
+    /// would be a second owner of it, with a release to get right for no gain.
+    ///
+    /// Both halves matter and they fail in opposite directions. Pinning would
+    /// leak: nothing releases a pin the ledger did not record in
+    /// `guest_write_pins_live`, so the image would never be reclaimable again.
+    /// Skipping the *debt* would be the correctness bug — the whole ordering
+    /// argument for a submitted-not-waited copy is that `GUEST_WRITE_DEBT`
+    /// removes `StampOrder::CpuReady` from the stamp's answers, so a guest told
+    /// the dispatch finished would read its pages before the copy landed.
+    #[test]
+    fn a_ring_owned_writeback_records_the_debt_without_pinning_anything() {
+        let mut pools = ResourcePools::new();
+        let identity = TargetIdentity::Surface {
+            id: 9,
+            width: 16,
+            height: 16,
+            generation: 1,
+            format: translate::pixel::SCANOUT_FORMAT,
+        };
+        pools.registry.insert(
+            identity.clone(),
+            crate::backend::vulkan::engine::pools::images_and_registry::pin_count_tests::ready_slot(
+            ),
+        );
+
+        pools.note_guest_write_recorded(GuestWriteSource::RingEntry);
+
+        assert!(
+            pools.take_guest_write_debt(),
+            "the stamp ordering hangs on this debt being owed"
+        );
+        assert_eq!(
+            pools.registry[&identity].pin_count, 0,
+            "a ring-owned source pins no resident"
+        );
+        assert!(
+            pools.guest_write_pins_live.is_empty(),
+            "and leaves the ledger nothing to release"
+        );
+        let cleanup = pools.seal_entry(Vec::new(), Vec::new()).cleanup;
+        assert!(
+            cleanup.unpin_residents.is_empty(),
+            "so its submission carries no unpin either"
         );
     }
 
@@ -6051,7 +6114,7 @@ mod recycle_tests {
             "the window's pin"
         );
 
-        pools.note_guest_write_recorded(&identity);
+        pools.note_guest_write_recorded(GuestWriteSource::ResidentTarget(&identity));
         assert_eq!(pools.registry[&identity].pin_count, 2);
 
         let mut cleanup = pools.seal_entry(Vec::new(), Vec::new()).cleanup;
@@ -6079,7 +6142,7 @@ mod recycle_tests {
             format: translate::pixel::SCANOUT_FORMAT,
         };
         // No slot at all: nothing to pin, and nothing for a reclaim to take.
-        pools.note_guest_write_recorded(&identity);
+        pools.note_guest_write_recorded(GuestWriteSource::ResidentTarget(&identity));
         assert!(
             pools.guest_write_pins_live.is_empty(),
             "no pin was taken, so none may be released"

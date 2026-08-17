@@ -1475,7 +1475,17 @@ pub enum ComputeImageDestination {
     /// only and is not what carries a healthy boot, and `write_completion_stamp`
     /// takes only the *read* debt, deliberately leaving this write debt set so
     /// later stamps stay ordered until a host reader settles it.
-    GuestPages(Box<super::GuestPageTarget>),
+    GuestPages {
+        target: Box<super::GuestPageTarget>,
+        /// The pages the copy is licensed over, in guest-virtual order.
+        ///
+        /// Carried beside the target and not derived from it, for the same
+        /// reason `copy_target_to_guest_pages` takes the two separately: the
+        /// target holds *host* references into those pages and the write debt
+        /// has to be armed on their guest-physical addresses, which a reference
+        /// cannot be turned back into. One walk produced both.
+        pages: Vec<u64>,
+    },
 }
 
 impl std::fmt::Debug for ComputeImageDestination {
@@ -1486,9 +1496,14 @@ impl std::fmt::Debug for ComputeImageDestination {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Host => f.write_str("Host"),
-            Self::GuestPages(dst) => {
-                write!(f, "GuestPages({}x{}, {} runs)", dst.width, dst.height, dst.runs.len())
-            }
+            Self::GuestPages { target, pages } => write!(
+                f,
+                "GuestPages({}x{}, {} runs, {} pages)",
+                target.width,
+                target.height,
+                target.runs.len(),
+                pages.len()
+            ),
         }
     }
 }

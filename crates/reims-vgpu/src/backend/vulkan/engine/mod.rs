@@ -3220,7 +3220,7 @@ pub fn copy_target_to_guest_pages(
     }
     if shared_backing_settles(snap.guest_backing, dst.shared_backing) {
         crate::runtime::drain::note_store_route("target_sync_shared_backing");
-        record_guest_write_debt(pools, identity, pages);
+        record_guest_write_debt(pools, GuestWriteSource::ResidentTarget(identity), pages);
         return Ok(());
     }
     unsafe {
@@ -3246,7 +3246,7 @@ pub fn copy_target_to_guest_pages(
     // than guarding every early return above, because the whole body runs under
     // the engine lock and a reclaim needs the same lock: nothing can take the
     // image while this function is running, only after it returns.
-    record_guest_write_debt(pools, identity, pages);
+    record_guest_write_debt(pools, GuestWriteSource::ResidentTarget(identity), pages);
     Ok(())
 }
 
@@ -3394,12 +3394,40 @@ fn shared_backing_settles(
 /// Both a queued image-to-buffer copy and rendering into shared backing owe the
 /// same completion rule: guest code must not observe its completion stamp until
 /// the queue has finished writing these pages.
+/// What a recorded guest-page write must keep alive until it lands.
+///
+/// A copy that is submitted and not waited leaves its source image readable by
+/// the queue for as long as the fence is unsignalled, so something has to stop
+/// the reclaim paths taking it. There are exactly two answers in this device and
+/// they are not interchangeable, which is why this is an enum rather than an
+/// `Option<&TargetIdentity>`: an `Option` would let a caller mean "no pin
+/// needed" and "I forgot the identity" with the same `None`.
+#[derive(Clone, Copy)]
+pub(super) enum GuestWriteSource<'a> {
+    /// A resident render target, or a resident compute storage image reached
+    /// through the target registry. The ledger takes the pin itself and releases
+    /// it when the submission's slot retires — between `finish` clearing
+    /// `gpu_only_content` and the settle, that pin is all that keeps a reclaim
+    /// off an image the submitted copy still reads.
+    ResidentTarget(&'a TargetIdentity),
+    /// A transient image sealed into this submission's own ring entry.
+    ///
+    /// The ring is the lifetime: a slot with cleanup parked on it cannot be
+    /// reused until its fence has signalled and `drain_cleanup` has run, and
+    /// only then is the image returned to the free pool. That holds for the
+    /// whole window a submitted-not-landed copy needs, so there is nothing left
+    /// for a pin to do. It is *not* the right answer for anything reached
+    /// through a residency registry, which is popped out of the ring's live set
+    /// at acquire time and is therefore reclaimable while the fence still runs.
+    RingEntry,
+}
+
 pub(super) fn record_guest_write_debt(
     pools: &mut pools::ResourcePools,
-    identity: &TargetIdentity,
+    source: GuestWriteSource<'_>,
     pages: &[u64],
 ) {
-    pools.note_guest_write_recorded(identity);
+    pools.note_guest_write_recorded(source);
     // Before the flag and under the same lock: a reader that observes the flag
     // set must observe a footprint that already names this write, or it would be
     // told "disjoint" about pages this write is landing in.
@@ -3416,7 +3444,7 @@ pub(super) fn record_guest_write_footprint_debt(
     identity: &TargetIdentity,
     footprint: &crate::runtime::guest_ram::GuestPageFootprint,
 ) {
-    pools.note_guest_write_recorded(identity);
+    pools.note_guest_write_recorded(GuestWriteSource::ResidentTarget(identity));
     arm_guest_write_footprint(footprint);
     GUEST_WRITE_DEBT.store(true, std::sync::atomic::Ordering::Release);
 }

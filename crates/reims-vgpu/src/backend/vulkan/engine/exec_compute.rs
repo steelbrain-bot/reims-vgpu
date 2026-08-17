@@ -54,13 +54,20 @@ struct PreparedSampledImage {
 enum ComputeImageDst {
     /// Pooled host-visible buffer; the CPU reads it back and the runtime
     /// writes guest pages itself.
-    ///
-    /// This is now the only non-deferred destination. A third variant,
-    /// `Direct`, bound a transfer-dst buffer over an imported view of the
-    /// caller's guest window so the dispatch's own copy landed there and no
-    /// bytes crossed device→host. It is gone with the import: a buffer the GPU
-    /// can write, backed by guest pages, is the exposure this removal is about.
     Readback(BufferSlot),
+    /// The dispatch's own image→buffer copy lands in the guest's pages and no
+    /// pixels cross device→host.
+    ///
+    /// An older variant of this name bound a transfer-dst buffer over an
+    /// imported view of the caller's guest window and was removed, because a
+    /// raw buffer the GPU can write backed by guest pages is an unbounded
+    /// reach into this process's address space. This one is not that: it
+    /// carries a [`super::GuestCopyPlan`], built by the same `plan_guest_copy`
+    /// the render rail uses, whose every destination range is a `GuestSlice`
+    /// bounds-checked against the one RAMBlock import that produced it. The
+    /// bound is the type, which is the whole argument in
+    /// `runtime/guest_ram.rs`.
+    Direct(super::GuestCopyPlan),
 }
 
 pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
@@ -548,13 +555,19 @@ pub(crate) unsafe fn execute_compute_inner(
             counters.note_compute_storage_seed_upload(resource.bytes.len() as u64);
             Some(staging)
         };
-        // The dispatch's output crosses device→host and the runtime writes the
-        // guest pages, so it lands in a readback buffer.
-        let dst = ComputeImageDst::Readback(pools.acquire_readback_extra(
-            ctx,
-            resource.bytes.len() as u64,
-            counters,
-        )?);
+        // Where the output goes is the caller's decision, not this rail's: a
+        // request that named guest pages licensed them first, and one that did
+        // not gets the pooled readback and the device→host crossing with it.
+        let dst = match &resource.destination {
+            super::types::ComputeImageDestination::Host => ComputeImageDst::Readback(
+                pools.acquire_readback_extra(ctx, resource.bytes.len() as u64, counters)?,
+            ),
+            super::types::ComputeImageDestination::GuestPages { target, .. } => {
+                ComputeImageDst::Direct(unsafe {
+                    super::plan_guest_copy(ctx, pools, counters, target)?
+                })
+            }
+        };
         simg_slots.push(PreparedStorageImage {
             binding: resource.binding,
             array_element: resource.array_element,
@@ -948,31 +961,54 @@ pub(crate) unsafe fn execute_compute_inner(
             &[],
             &barrier,
         );
-        let dst_buffer = match &prepared.dst {
-            ComputeImageDst::Readback(slot) => slot.buffer,
-        };
-        // The pooled readback is always tightly packed from texel zero. The
-        // offset and row length were the imported window's, and it had a
-        // `buffer_offset` into the guest surface and a guest row stride.
-        let (buffer_offset, row_length_texels) = (0u64, 0u32);
-        let copy = [vk::BufferImageCopy::default()
-            .buffer_offset(buffer_offset)
-            .buffer_row_length(row_length_texels)
-            .image_subresource(super::color_subresource_layers())
-            .image_extent(vk::Extent3D {
-                width: prepared.width,
-                height: prepared.height,
-                depth: 1,
-            })];
-        ctx.device.cmd_copy_image_to_buffer(
-            cb,
-            img.image,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            dst_buffer,
-            &copy,
-        );
+        match &prepared.dst {
+            ComputeImageDst::Readback(slot) => {
+                // The pooled readback is always tightly packed from texel zero.
+                // A guest window's own offset and row stride belong to the
+                // plan on the direct arm, never to this one.
+                let copy = [vk::BufferImageCopy::default()
+                    .buffer_offset(0)
+                    .buffer_row_length(0)
+                    .image_subresource(super::color_subresource_layers())
+                    .image_extent(vk::Extent3D {
+                        width: prepared.width,
+                        height: prepared.height,
+                        depth: 1,
+                    })];
+                ctx.device.cmd_copy_image_to_buffer(
+                    cb,
+                    img.image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    slot.buffer,
+                    &copy,
+                );
+            }
+            ComputeImageDst::Direct(plan) => {
+                // Recorded into the dispatch's own command buffer, so the whole
+                // thing is still one submission and one fence. Both calls are
+                // the render rail's, unchanged: the plan already describes
+                // every guest run, and the release is what makes the bytes
+                // visible to the guest's vCPU once the fence signals.
+                unsafe {
+                    super::record_guest_copy_plan(
+                        ctx,
+                        pools,
+                        cb,
+                        img.image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        plan,
+                    );
+                    super::release_guest_copy_to_host(ctx, cb, plan);
+                }
+            }
+        }
     }
-    if !simg_slots.is_empty() {
+    // Only a readback owes the host-visibility barrier below; the direct arm
+    // released its own writes to `HOST` per plan, right where it recorded them.
+    if simg_slots
+        .iter()
+        .any(|prepared| matches!(prepared.dst, ComputeImageDst::Readback(_)))
+    {
         let barrier = [vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
             .dst_access_mask(vk::AccessFlags::HOST_READ)];
@@ -1014,6 +1050,23 @@ pub(crate) unsafe fn execute_compute_inner(
         Err(e) => return Err(DrawError::VkCall(VkCall::new(VkOp::ComputeExecSubmit, e))),
     }
 
+    // The copy into guest pages is on the queue now, so the debt is owed from
+    // here — before any fallible step below, because a failure past the submit
+    // does not un-submit the copy and the pages are being written either way.
+    //
+    // Read straight off the request rather than off `simg_slots`, so nothing
+    // depends on the two being the same length in the same order. `RingEntry`
+    // is the right source for these images: a transient slot is sealed into
+    // this submission's ring entry and cannot be recycled before the fence
+    // retires, which is the whole window the copy needs.
+    for resource in &req.storage_images {
+        if let super::types::ComputeImageDestination::GuestPages { pages, .. } =
+            &resource.destination
+        {
+            super::record_guest_write_debt(pools, super::GuestWriteSource::RingEntry, pages);
+        }
+    }
+
     // A dispatch whose every output stays on the GPU (deferred storage-image
     // writebacks, no writable SSBO readbacks, no direct guest-window DMA) has
     // nothing to hand the CPU — skip the post-submit fence wait and return
@@ -1022,8 +1075,15 @@ pub(crate) unsafe fn execute_compute_inner(
     // (read_resident_storage) waits it before copying, and the owed
     // descriptor-set/pool cleanup is stashed until a later wait proves the CB
     // retired (drain_pending_compute_cleanup).
-    let all_writeback_deferred =
-        storage_slots.iter().all(|(_, _, _, writable)| !writable) && simg_slots.is_empty();
+    // The test is whether anything owes the *CPU* bytes, not whether there were
+    // storage images: a direct image lands in the guest's own pages and there is
+    // nothing to read back, so it belongs on the deferred side exactly as a
+    // read-only SSBO does. Its ordering does not come from this wait — see
+    // `ComputeImageDestination::GuestPages` for the stamp chain that carries it.
+    let all_writeback_deferred = storage_slots.iter().all(|(_, _, _, writable)| !writable)
+        && simg_slots
+            .iter()
+            .all(|prepared| !matches!(prepared.dst, ComputeImageDst::Readback(_)));
     // Park the owed cleanup (descriptor set + transient pool slots) on this
     // ring slot in every mode; whichever entry retires the slot drains it. A
     // failed wait below leaves the slot pending, so no path ever reuses an
@@ -1071,16 +1131,29 @@ pub(crate) unsafe fn execute_compute_inner(
     }
     let mut images = Vec::with_capacity(simg_slots.len());
     for prepared in &simg_slots {
-        let ComputeImageDst::Readback(readback) = &prepared.dst;
-        let out = crate::backend::vulkan::engine::pools::read_back_slot(
-            ctx,
-            readback,
-            prepared.len as u64,
-            VkOp::ComputeExecMapImageReadback,
-            VkOp::ComputeExecInvalidateImageReadback,
-        )?;
-        counters.note_readback(prepared.len as u64, super::counters::ReadbackSource::ComputeImage);
-        images.push(super::types::ComputeImageResult::Bytes(out));
+        match &prepared.dst {
+            ComputeImageDst::Readback(readback) => {
+                let out = crate::backend::vulkan::engine::pools::read_back_slot(
+                    ctx,
+                    readback,
+                    prepared.len as u64,
+                    VkOp::ComputeExecMapImageReadback,
+                    VkOp::ComputeExecInvalidateImageReadback,
+                )?;
+                counters
+                    .note_readback(prepared.len as u64, super::counters::ReadbackSource::ComputeImage);
+                images.push(super::types::ComputeImageResult::Bytes(out));
+            }
+            // Nothing was read, so nothing is charged to the readback census —
+            // that is the saving this arm exists for, and a bump here would
+            // report it as still being paid. `bytes` is what the queued copy
+            // lands, for the caller's own census.
+            ComputeImageDst::Direct(_) => {
+                images.push(super::types::ComputeImageResult::Landed {
+                    bytes: prepared.len as u64,
+                });
+            }
+        }
     }
 
     // Cleanup was parked on the ring slot right after submit; nothing left
