@@ -2296,6 +2296,13 @@ fn a_staged_buffer_carries_the_pages_its_writeback_is_bounded_to() {
 /// identically to one an earlier gate caught. The census route is what
 /// distinguishes them, so each case is asserted on its own counter.
 ///
+/// The type-11 case asserts one thing more. That class is the largest this arm
+/// does not reach, and its route counter says only how big it is; the decision
+/// about whether to build a type-11 licence turns on how much of it a raw copy
+/// could ever serve, which is a different number. So the three verdicts are
+/// asserted to *partition* the class — a fourth outcome, or an outcome counted
+/// twice, would make the band say more or less reach than there is.
+///
 /// Vulkan-only: the direct arm is a `VK_EXT_external_memory_host` import, and
 /// `StagedTexture` does not carry a residency candidate on the Metal arm at all.
 #[cfg(feature = "backend-vulkan")]
@@ -2357,32 +2364,74 @@ fn only_a_licensed_transient_linear_window_can_take_the_direct_arm() {
         "the licence refusal is the gate that caught it"
     );
 
-    // A type-11 destination is not a guest-linear plane at all.
-    let before = store_route_count("compute_dst_host_not_linear");
-    assert!(
-        is_host(&direct_destination(
-            &mut state,
-            &mut host,
-            &staged(
-                TextureWriteback::Type11 {
-                    mapping_id: 1,
-                    surface_offset: 0,
-                    surface_bpr: 8,
-                    span_end: 16,
-                    width: 2,
-                    height: 2,
-                    bpp: 4,
-                },
-                None,
-            ),
-            held,
-        )),
-        "a tiled surface mapping reads back"
+    // A type-11 destination is not a guest-linear plane at all. It is also the
+    // largest class this arm does not reach, so the same call must band whether
+    // a raw copy could ever have served it — the route counter says how many
+    // there are and the split says how many are reachable.
+    let type11 = |mapping_id| TextureWriteback::Type11 {
+        mapping_id,
+        surface_offset: 0,
+        surface_bpr: 8,
+        span_end: 16,
+        width: 2,
+        height: 2,
+        bpp: 4,
+    };
+    let split = || {
+        (
+            store_route_count("compute_dst_type11_agrees"),
+            store_route_count("compute_dst_type11_differs"),
+            store_route_count("compute_dst_type11_unresolved"),
+        )
+    };
+    // A mapping declaring the same texel the dispatch holds: reachable.
+    state.mappings.insert(
+        1,
+        crate::model::MappingEntry {
+            mapped: true,
+            has_geom: true,
+            width: 2,
+            height: 2,
+            format: MTL_FORMAT_RGBA8_UNORM,
+            ..Default::default()
+        },
     );
+    // One declaring a different texel: a copy converts nothing, so no licence
+    // could land it however the pages resolve.
+    state.mappings.insert(
+        2,
+        crate::model::MappingEntry {
+            mapped: true,
+            has_geom: true,
+            width: 2,
+            height: 2,
+            format: crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT,
+            ..Default::default()
+        },
+    );
+    // Mapping 3 is never registered, so its declared format is unresolvable.
+    let before = store_route_count("compute_dst_host_not_linear");
+    let (agrees, differs, unresolved) = split();
+    for mapping_id in [1, 2, 3] {
+        assert!(
+            is_host(&direct_destination(
+                &mut state,
+                &mut host,
+                &staged(type11(mapping_id), None),
+                held,
+            )),
+            "a tiled surface mapping reads back"
+        );
+    }
     assert_eq!(
         store_route_count("compute_dst_host_not_linear"),
-        before + 1,
+        before + 3,
         "a type-11 window never reaches the guest-linear licence"
+    );
+    assert_eq!(
+        split(),
+        (agrees + 1, differs + 1, unresolved + 1),
+        "the three verdicts partition the class they band"
     );
 
     // And the case this test exists for: a resident window is routed on its

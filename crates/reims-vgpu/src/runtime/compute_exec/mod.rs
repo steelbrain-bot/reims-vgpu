@@ -1381,7 +1381,10 @@ fn staged_window_pages<M: HostMemory>(
 ///
 /// - the writeback must be a **guest-linear plane**. A type-11 destination is a
 ///   tiled surface mapping, which [`crate::runtime::render_writeback::GvaPlaneDestination`]
-///   cannot describe and the licence therefore cannot walk.
+///   cannot describe and the licence therefore cannot walk. It is the largest
+///   class this arm does not reach, so [`note_type11_shape`] bands how much of
+///   it a raw copy could ever serve — see that function for why the route
+///   counter alone does not say.
 /// - the licence must be granted. That is where the format, the complete page
 ///   walk, the texel alignment and the guest-RAM references are all checked, in
 ///   the one place both GPU-side writers of a guest plane meet them.
@@ -1419,6 +1422,7 @@ fn direct_destination<M: HostMemory + HostOps>(
     } = &tex.writeback
     else {
         crate::runtime::drain::note_store_route("compute_dst_host_not_linear");
+        note_type11_shape(state, tex, held);
         return ComputeImageDestination::Host;
     };
     let Ok(row_stride) = u32::try_from(*row_stride) else {
@@ -1468,6 +1472,67 @@ fn direct_destination<M: HostMemory + HostOps>(
             crate::runtime::drain::note_store_route("compute_dst_host_unlicensed");
             ComputeImageDestination::Host
         }
+    }
+}
+
+/// Record whether a type-11 destination could ever be served by a raw copy.
+///
+/// The type-11 windows are the largest class this arm does not reach, and
+/// [`direct_destination`]'s type-11 answer is `Host` before it has looked at
+/// anything — so the route counter says how many there are and nothing says how
+/// many are *reachable*. That is the number that decides whether a type-11
+/// licence is worth building, and it is not the same number: a copy converts
+/// nothing, so a window is only reachable when the format the guest will read
+/// these bytes back as is exactly the format the dispatch's storage image holds.
+///
+/// A compute storage image takes its format from the specialized SPIR-V texel
+/// format, which has no reason to match a surface mapping's declared one, so
+/// `differs` is an expected outcome rather than a defect. The counters split
+/// three ways and add up to `compute_dst_host_not_linear`:
+///
+/// - `agrees` — a raw copy would land these bytes. The reachable population.
+/// - `differs` — the mapping and the resident name different texels. Readback
+///   and its row converter are the only rail that can land these.
+/// - `unresolved` — no mapping, or a declared format with no linear texel
+///   order to name. Not reachable by any copy either.
+#[cfg(feature = "backend-vulkan")]
+fn note_type11_shape(state: &DeviceState, tex: &StagedTexture, held: ash::vk::Format) {
+    let TextureWriteback::Type11 {
+        mapping_id,
+        width,
+        height,
+        ..
+    } = &tex.writeback
+    else {
+        // A storage image the guest gave nowhere to land. There is no
+        // destination to reach, so it is not part of the population above.
+        crate::runtime::drain::note_store_route("compute_dst_no_writeback");
+        return;
+    };
+    let declared = state
+        .mappings
+        .get(mapping_id)
+        .map(crate::runtime::mapping_write::mapping_store_format);
+    let want = declared
+        .and_then(crate::contract::pixel_format::store_texel_order)
+        .map(crate::backend::vulkan::translate::pixel::vk_texel_layout);
+    match want {
+        Some(want) if want == held => {
+            crate::runtime::drain::note_store_route("compute_dst_type11_agrees")
+        }
+        Some(_) => crate::runtime::drain::note_store_route("compute_dst_type11_differs"),
+        None => crate::runtime::drain::note_store_route("compute_dst_type11_unresolved"),
+    }
+    // One line per distinct format pair rather than per window: the pairs are
+    // what a licence would have to serve, and a driven boot repeats a handful of
+    // them thousands of times.
+    let key = (u64::from(declared.unwrap_or(0)) << 32) | u64::from(held.as_raw() as u32);
+    if crate::observe::first_sight("compute_dst_type11_shape", key) {
+        crate::observe::off(format!(
+            "compute_dst_type11 bind={} mid={mapping_id} dims={width}x{height} declared={:#x} want={want:?} held={held:?}",
+            tex.binding,
+            declared.unwrap_or(0),
+        ));
     }
 }
 
