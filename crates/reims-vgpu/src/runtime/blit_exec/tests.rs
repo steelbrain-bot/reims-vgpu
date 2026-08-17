@@ -1389,6 +1389,99 @@ fn texel_offset_math() {
     assert_eq!(t1.texel_offset(1, 2, 0), Some(0x124 + 128));
 }
 
+/// A rectangle into a linear destination resolves its pages once, and the
+/// bytes it lands are the bytes the row loop would have landed.
+///
+/// The hoist is only worth anything if it actually runs, and a green suite is
+/// equally consistent with `map_fresh_span_within` declining on every call and
+/// the per-row fallback quietly doing all the work. So the counter is asserted
+/// first: `blit_rect_linear_one_view` fires once and
+/// `blit_rect_linear_rows_hoisted` counts the page-table walks the rectangle
+/// did not pay — `row_count - 1` of them.
+///
+/// The other two assertions are what makes the hoist a copy of the row path
+/// rather than a second rule about linear layout. Every row lands at the
+/// offset `texel_offset` gives it, and the stride padding between two rows is
+/// **untouched**: the row loop writes `row_bytes` and never the gap, so a
+/// hoist that wrote `span` contiguous bytes would pass a naive round-trip and
+/// still destroy whatever the guest kept there.
+#[test]
+fn a_linear_rectangle_lands_row_exact_through_one_page_table_walk() {
+    use crate::runtime::drain::census::store_route_count;
+
+    let (mut host, mut state) = blit_device();
+    // GVA 0x4000 is root PTE index 1, which `blit_device` backed with its own
+    // one-page RAM range. The whole rectangle sits inside that page, so the
+    // packed alias is expressible on every host this suite runs on.
+    let base_gva = 0x4000u64;
+    let gpa = 5u64 << PAGE_SHIFT_ARM64E;
+    let (row_stride, row_bytes, row_count) = (64u64, 32u64, 4u64);
+
+    // Padding the copy must not touch, laid down through the GPA store rather
+    // than through any view this test is about to exercise.
+    let pad = vec![0xeeu8; row_stride as usize * row_count as usize];
+    host.write_gpa(gpa, &pad).expect("seed the destination page");
+
+    let t = LinearTextureLevel {
+        base_gva,
+        alloc_size: 0x4000,
+        level_offset: 0,
+        row_stride,
+        slice_stride: 0,
+        slice_index: 0,
+        width: (row_bytes / 4) as u32,
+        height: row_count as u32,
+        depth: 1,
+        bpp: 4,
+        pixel_format: MTL_FORMAT_RGBA8_UNORM,
+    };
+    let tex = TextureBacking::Linear(t);
+    let src: Vec<u8> = (0..(row_bytes * row_count) as u8).collect();
+    let allowed: std::collections::HashSet<u64> = [gpa].into_iter().collect();
+
+    let views_before = store_route_count("blit_rect_linear_one_view");
+    let rows_before = store_route_count("blit_rect_linear_rows_hoisted");
+    write_texture_rect(
+        &mut state,
+        &mut host,
+        1,
+        &tex,
+        Point { x: 0, y: 0, z: 0 },
+        row_bytes,
+        row_count,
+        &src,
+        Some(&allowed),
+    )
+    .expect("a rectangle inside one authorised page must land");
+    assert_eq!(
+        store_route_count("blit_rect_linear_one_view") - views_before,
+        1,
+        "the rectangle must resolve its destination once, not once per row"
+    );
+    assert_eq!(
+        store_route_count("blit_rect_linear_rows_hoisted") - rows_before,
+        row_count - 1,
+        "every row after the first is a page-table walk not paid"
+    );
+
+    let mut got = vec![0u8; (row_stride * row_count) as usize];
+    host.read_gpa(gpa, &mut got).expect("read the landed page");
+    for y in 0..row_count {
+        let at = (y * row_stride) as usize;
+        assert_eq!(
+            &got[at..at + row_bytes as usize],
+            &src[(y * row_bytes) as usize..((y + 1) * row_bytes) as usize],
+            "row {y} must land at its own texel offset"
+        );
+        assert!(
+            got[at + row_bytes as usize..at + row_stride as usize]
+                .iter()
+                .all(|&b| b == 0xee),
+            "row {y}'s stride padding is not the copy's to write"
+        );
+    }
+}
+
 /// Geometry this device cannot measure must refuse the copy, never hand the
 /// row loop the `None` that means "authorised by the command".
 ///
