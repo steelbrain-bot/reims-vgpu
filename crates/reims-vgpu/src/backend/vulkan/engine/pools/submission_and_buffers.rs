@@ -540,6 +540,46 @@ impl ResourcePools {
         released
     }
 
+    /// Move one serialized resource off older generations of the same producer
+    /// identity. `SampledContentIdentity::key` is the producer's stable name and
+    /// `generation` is its content revision; retaining every revision until the
+    /// resource itself is deleted confuses object lifetime with content
+    /// lifetime and keeps an unbounded history of obsolete images.
+    ///
+    /// An entry shared by another serialized resource remains live for that
+    /// owner. An entry with no owner returns to `sampled_live`, whose ordinary
+    /// seal/retire path keeps an already-recorded command buffer safe.
+    fn supersede_sampled_generation(
+        &mut self,
+        owner: &crate::model::TaskResourceLifetimeRef,
+        current: crate::backend::vulkan::engine::SampledContentIdentity,
+    ) {
+        let mut index = 0;
+        while index < self.sampled_cache.len() {
+            let superseded = self.sampled_cache[index].identity.is_some_and(|identity| {
+                identity.key == current.key && identity.generation != current.generation
+            }) && self.sampled_cache[index]
+                .owners
+                .iter()
+                .any(|held| held.id() == owner.id());
+            if !superseded {
+                index += 1;
+                continue;
+            }
+
+            self.sampled_cache[index]
+                .owners
+                .retain(|held| held.is_live() && held.id() != owner.id());
+            crate::runtime::drain::note_store_route("sampled_generation_superseded");
+            if self.sampled_cache[index].owners.is_empty() {
+                let slot = self.remove_sampled_entry(index, None);
+                self.sampled_live.push(slot);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
     /// Update the consecutive-settled-pass counter for maintenance and return
     /// whether the HOST_VISIBLE buffer pools may be trimmed this pass.
     ///
@@ -4086,6 +4126,7 @@ impl ResourcePools {
             crate::runtime::drain::note_store_route("sampled_identity_off");
             return None;
         }
+        self.supersede_sampled_generation(owner, id);
         let name = GatheredName { key, identity: id };
         let index = self.sampled_identity_index.get(&name).copied()?;
         let Some(entry) = self.sampled_cache.get_mut(index) else {
@@ -4256,6 +4297,9 @@ impl ResourcePools {
             self.sampled_live.push(slot);
             return;
         };
+        if let Some(identity) = identity {
+            self.supersede_sampled_generation(owner, identity);
+        }
         let (fingerprint, retained, content_len) = match content {
             // The `Arc` is cloned rather than the bytes copied: the retire path
             // already holds one, so recognising this entry by content later
@@ -5207,6 +5251,67 @@ mod recycle_tests {
         );
         assert!(pools.sampled_cache.is_empty());
         assert_eq!(pools.sampled_cache_bytes, 0);
+    }
+
+    /// A mutable producer's generation is the lifetime of its retained pixels;
+    /// the serialized resource may outlive many such generations.
+    #[test]
+    fn sampled_generation_replaces_only_that_owners_prior_content() {
+        let mut pools = ResourcePools::new();
+        let resource = std::sync::Arc::new(crate::model::TaskResource::new(
+            Default::default(),
+            std::sync::Arc::from([]),
+        ));
+        let sharing_resource = std::sync::Arc::new(crate::model::TaskResource::new(
+            Default::default(),
+            std::sync::Arc::from([]),
+        ));
+        let owner = resource.lifetime_ref();
+        let sharing_owner = sharing_resource.lifetime_ref();
+        let identity = |key, generation| {
+            Some(crate::backend::vulkan::engine::SampledContentIdentity { key, generation })
+        };
+        let entry = |identity, owners, len| ResidentSampledSlot {
+            slot: null_slot(64, 64),
+            fingerprint: SampledFingerprint::Gathered,
+            content: None,
+            content_len: len,
+            identity,
+            owners,
+            last_touch_ms: 0,
+        };
+
+        pools.sampled_cache_bytes = 12_000;
+        pools.push_sampled_entry(entry(identity(7, 1), vec![owner.clone()], 4_000));
+        pools.push_sampled_entry(entry(
+            identity(7, 1),
+            vec![owner.clone(), sharing_owner.clone()],
+            4_000,
+        ));
+        pools.push_sampled_entry(entry(identity(8, 1), vec![owner.clone()], 4_000));
+
+        pools.supersede_sampled_generation(
+            &owner,
+            crate::backend::vulkan::engine::SampledContentIdentity {
+                key: 7,
+                generation: 2,
+            },
+        );
+
+        assert_eq!(pools.sampled_cache.len(), 2);
+        assert_eq!(pools.sampled_cache_bytes, 8_000);
+        assert_eq!(pools.sampled_live.len(), 1);
+        let shared_old = pools
+            .sampled_cache
+            .iter()
+            .find(|entry| entry.identity == identity(7, 1))
+            .expect("another owner keeps the prior generation alive");
+        assert_eq!(shared_old.owners.len(), 1);
+        assert_eq!(shared_old.owners[0].id(), sharing_owner.id());
+        assert!(pools
+            .sampled_cache
+            .iter()
+            .any(|entry| entry.identity == identity(8, 1)));
     }
 
     /// Compute-storage residents are standalone allocations, but elapsed time
