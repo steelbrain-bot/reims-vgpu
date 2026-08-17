@@ -927,13 +927,50 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
     width: u32,
     height: u32,
 ) -> Result<u64, GpuWritebackDecline> {
+    // This rail's own window, and the reason the licence does not resolve one:
+    // a Store's destination *is* the surface, so a frame whose extent is not
+    // the mapping's latched geometry is a frame for a mapping that has moved
+    // under it. That is a scanout rule and not a property of a type-11
+    // destination — a compute dispatch writing a sub-rectangle is ordinary — so
+    // it is asked here, by the caller it belongs to.
+    if !scanout_extent_ok(width, height) {
+        return Err(GpuWritebackDecline::NotWritable);
+    }
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return Err(GpuWritebackDecline::NotWritable);
+    };
+    if !m.mapped || m.page_entries.is_empty() {
+        return Err(GpuWritebackDecline::NotWritable);
+    }
+    let (mw, mh, format) = mapping_write_geometry(m, width, height);
+    if mw != width || mh != height {
+        return Err(GpuWritebackDecline::GeometryMoved {
+            latched_width: mw,
+            latched_height: mh,
+            frame_width: width,
+            frame_height: height,
+        });
+    }
+    let Some((base_off, bpr, span_end)) = type11_sample_window(m, mw, mh, format) else {
+        return Err(GpuWritebackDecline::WindowUnresolved {
+            width: mw,
+            height: mh,
+            format,
+        });
+    };
     let licence = licence_type11_surface(
         state,
         host,
-        mapping_id,
         identity.resident_format(),
-        width,
-        height,
+        &Type11SurfaceDestination {
+            mapping_id,
+            base_off,
+            bpr,
+            span_end,
+            width: mw,
+            height: mh,
+            format,
+        },
     )?;
     crate::backend::vulkan::engine::copy_target_to_guest_pages(
         identity,
@@ -943,6 +980,45 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
     .map_err(|inner| GpuWritebackDecline::Engine { inner })?;
     note_type11_landed(state, mapping_id, licence.base_off, licence.span_end);
     Ok(licence.span_end - licence.base_off)
+}
+
+/// A window of a type-11 surface mapping the GPU is asked to write.
+///
+/// The type-11 counterpart of
+/// [`crate::runtime::render_writeback::GvaPlaneDestination`], and it exists for
+/// the same reason: the licence must not resolve its own destination. Which
+/// window of which plane a copy lands in is the *caller's* knowledge, and the
+/// two callers here come by it differently — a render Store's destination is the
+/// whole surface, while a compute bind resolves a window at stage time, which
+/// may be a sub-rectangle and, for a type-5 view, names its IOSurface plane on
+/// the wire.
+///
+/// Resolving it inside the licence instead served the Store and silently
+/// mis-served everything else. It refused every sub-rectangle — 15 of the 19
+/// remaining compute readbacks on a driven macos-13 boot, all
+/// [`GpuWritebackDecline::GeometryMoved`] — and behind that refusal sat a worse
+/// failure it was hiding: [`type11_sample_window`] takes no plane index and
+/// matches by geometry, so a type-5 bind's frame would have landed in whichever
+/// plane happened to share its dimensions. [`resident_gpu_plane`]'s doc states
+/// the cost of exactly that disagreement, which is that there is no error — the
+/// frame lands in the wrong plane of the right surface and the symptom is the
+/// next plane's pixels.
+///
+/// `format` is what the guest will read these bytes back as, and must be the
+/// format the window was resolved against; the licence derives the bytes per
+/// texel from it rather than taking one, so there is no second answer to carry.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) struct Type11SurfaceDestination {
+    pub mapping_id: u32,
+    /// Byte offset of the window's first texel within the mapping.
+    pub base_off: u64,
+    /// Bytes per row of the surface, which is not `width * bpp`.
+    pub bpr: u32,
+    /// One past the last byte the window may touch.
+    pub span_end: u64,
+    pub width: u32,
+    pub height: u32,
+    pub format: u16,
 }
 
 /// A licensed direct-to-guest-pages destination over a type-11 surface mapping.
@@ -969,8 +1045,14 @@ pub(crate) struct Type11SurfaceLicence {
     pub span_end: u64,
 }
 
-/// Resolve a type-11 surface mapping into a destination the GPU may copy into,
-/// or the typed reason it may not.
+/// Licence a caller's type-11 surface window as a destination the GPU may copy
+/// into, or give the typed reason it may not.
+///
+/// Takes the window rather than resolving one — see
+/// [`Type11SurfaceDestination`] for why that division is where it is. What is
+/// shared between the two rails, and therefore lives here, is the format rule,
+/// the page-list plan, the page walk, the guest-RAM references and the two
+/// guest-write witnesses.
 ///
 /// `held` is the format the source image actually holds. **A copy converts
 /// nothing**, so a source whose format is not the one the guest will read these
@@ -980,17 +1062,17 @@ pub(crate) struct Type11SurfaceLicence {
 ///
 /// On the render rail the question is very nearly a tautology — a target's
 /// identity takes its format from [`mapping_store_format`], the same function
-/// [`mapping_write_geometry`] reads below — and the comparison that can actually
-/// fail is made downstream by `copy_target_to_guest_pages`, against the resident
-/// *image's* own format, which a mapping may have redeclared underneath. Both of
-/// those are still true and that check is still there.
+/// that caller resolved its own window through — and the comparison that can
+/// actually fail is made downstream by `copy_target_to_guest_pages`, against the
+/// resident *image's* own format, which a mapping may have redeclared
+/// underneath. Both of those are still true and that check is still there.
 ///
 /// The compute rail has no such downstream. Its dispatch writes the guest's
 /// pages itself, so there is no second pair to compare and this is the only
 /// place the question can be asked. A storage image takes its format from the
-/// specialized SPIR-V texel format, which has no reason to match a surface
-/// mapping's declaration — measured at 3 of 35 type-11 windows on a driven
-/// macos-13 boot — so on that rail it is not a healthy zero either.
+/// specialized SPIR-V texel format, which has no reason to match the format the
+/// bind staged its window against — banded at 3 of 35 type-11 windows on a
+/// driven macos-13 boot — so on that rail it is not a healthy zero either.
 ///
 /// Asking it for both callers rather than for the one that needs it keeps the
 /// rule in the licence, where a third writer of a guest surface would meet it
@@ -999,28 +1081,25 @@ pub(crate) struct Type11SurfaceLicence {
 pub(crate) fn licence_type11_surface<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
-    mapping_id: u32,
     held: ash::vk::Format,
-    width: u32,
-    height: u32,
+    dst: &Type11SurfaceDestination,
 ) -> Result<Type11SurfaceLicence, GpuWritebackDecline> {
-    if !scanout_extent_ok(width, height) {
-        return Err(GpuWritebackDecline::NotWritable);
-    }
+    let &Type11SurfaceDestination {
+        mapping_id,
+        base_off,
+        bpr,
+        span_end,
+        width: mw,
+        height: mh,
+        format,
+    } = dst;
+    // The mapping still has to be here and still have to be backed — the caller
+    // resolved a window against it, and may have done so before this call.
     let Some(m) = state.mappings.get(&mapping_id) else {
         return Err(GpuWritebackDecline::NotWritable);
     };
     if !m.mapped || m.page_entries.is_empty() {
         return Err(GpuWritebackDecline::NotWritable);
-    }
-    let (mw, mh, format) = mapping_write_geometry(m, width, height);
-    if mw != width || mh != height {
-        return Err(GpuWritebackDecline::GeometryMoved {
-            latched_width: mw,
-            latched_height: mh,
-            frame_width: width,
-            frame_height: height,
-        });
     }
     // An image→buffer copy moves bytes and converts nothing, so this rail can
     // only serve a mapping whose declared format has a linear Vulkan texel to
@@ -1041,13 +1120,6 @@ pub(crate) fn licence_type11_surface<M: HostMemory + HostOps>(
         });
     }
     let texel = layout.bytes_per_texel();
-    let Some((base_off, bpr, span_end)) = type11_sample_window(m, mw, mh, format) else {
-        return Err(GpuWritebackDecline::WindowUnresolved {
-            width: mw,
-            height: mh,
-            format,
-        });
-    };
     let shared_backing = if host.map_pages_stable() {
         mapper::ensure_contig_view(state, host, mapping_id).map(|(ptr, len)| {
             crate::backend::vulkan::engine::GuestTargetBacking {

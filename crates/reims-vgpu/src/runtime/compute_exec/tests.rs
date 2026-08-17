@@ -1267,12 +1267,13 @@ fn stage_texture_type5_record_reshapes_stageable_single_plane_surface() {
             surface_bpr,
             width,
             height,
-            bpp,
+            format,
             ..
         } => {
             assert_eq!(mapping_id, sid);
             assert_eq!(surface_bpr, 128);
-            assert_eq!((width, height, bpp), (1, 4, 16));
+            assert_eq!((width, height), (1, 4));
+            assert_eq!(pixel_format::bytes_per_pixel(format), Some(16));
         }
         _ => panic!("expected Type11 writeback through the texture view"),
     }
@@ -2370,41 +2371,36 @@ fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
     // largest class this arm does not reach, so the same call must band whether
     // a raw copy could ever have served it — the route counter says how many
     // there are and the split says how many are reachable.
-    let type11 = |mapping_id| TextureWriteback::Type11 {
+    let type11 = |mapping_id, format| TextureWriteback::Type11 {
         mapping_id,
         surface_offset: 0,
         surface_bpr: 8,
         span_end: 16,
         width: 2,
         height: 2,
-        bpp: 4,
+        format,
     };
     let unlicensed = || store_route_count("compute_dst_host_type11_unlicensed");
-    // A mapping declaring the same texel the dispatch holds: reachable.
-    state.mappings.insert(
-        1,
-        crate::model::MappingEntry {
-            mapped: true,
-            has_geom: true,
-            width: 2,
-            height: 2,
-            format: MTL_FORMAT_RGBA8_UNORM,
-            ..Default::default()
-        },
-    );
-    // One declaring a different texel: a copy converts nothing, so no licence
-    // could land it however the pages resolve.
-    state.mappings.insert(
-        2,
-        crate::model::MappingEntry {
-            mapped: true,
-            has_geom: true,
-            width: 2,
-            height: 2,
-            format: crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT,
-            ..Default::default()
-        },
-    );
+    for mapping_id in [1, 2] {
+        state.mappings.insert(
+            mapping_id,
+            crate::model::MappingEntry {
+                mapped: true,
+                has_geom: true,
+                width: 2,
+                height: 2,
+                format: MTL_FORMAT_RGBA8_UNORM,
+                ..Default::default()
+            },
+        );
+    }
+    // Mapping 1 is staged at the texel the dispatch holds, so a raw copy could
+    // serve it; mapping 2 is staged at a different one, and a copy converts
+    // nothing, so no licence could land it however the pages resolve. The format
+    // that decides is the bind's own, not the mapping's declaration — the bind
+    // may be a type-5 view reinterpreting the surface, and the staged format is
+    // the one both the seeding read and the landing write are arithmetic over.
+    //
     // Mapping 3 is never registered, so there is nothing to write into.
     //
     // All three answer `Host` here, and for three different reasons, only one of
@@ -2415,12 +2411,16 @@ fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
     // for 35 of the 51 storage destinations of a driven macos-13 boot.
     let before = unlicensed();
     let not_linear = store_route_count("compute_dst_host_not_linear");
-    for mapping_id in [1, 2, 3] {
+    for (mapping_id, format) in [
+        (1, MTL_FORMAT_RGBA8_UNORM),
+        (2, crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT),
+        (3, MTL_FORMAT_RGBA8_UNORM),
+    ] {
         assert!(
             is_host(&direct_destination(
                 &mut state,
                 &mut host,
-                &staged(type11(mapping_id), None),
+                &staged(type11(mapping_id, format), None),
                 held,
             )),
             "no guest-RAM import, so every type-11 licence is refused here"

@@ -1309,12 +1309,30 @@ enum TextureWriteback {
     },
     Type11 {
         mapping_id: u32,
+        /// The window this bind was staged against — a byte offset into the
+        /// mapping, the surface's row pitch, and one past the last byte the
+        /// window may touch.
+        ///
+        /// Resolved once, at stage time, through the plane the bind actually
+        /// names: `type5_sample_window` when the wire carried a type-5 view's
+        /// plane index, `type11_sample_window` otherwise. Both the read that
+        /// seeds the image and the write that lands it use exactly these three
+        /// numbers, so the two cannot name different bytes of one surface.
         surface_offset: u64,
         surface_bpr: u32,
         span_end: u64,
         width: u32,
         height: u32,
-        bpp: u32,
+        /// The guest pixel format the window above was resolved against, and
+        /// the only texel measurement this record carries.
+        ///
+        /// It is the bind's own staged format rather than the mapping's current
+        /// declaration, because every byte offset above is arithmetic over it:
+        /// judging the same window under a declaration that has since changed
+        /// would be judging a different window from the one staged. Bytes per
+        /// texel is derived from it at each consumer rather than carried
+        /// alongside, so the two cannot disagree.
+        format: u16,
     },
 }
 
@@ -1501,8 +1519,12 @@ fn type11_destination<M: HostMemory + HostOps>(
     use crate::backend::vulkan::engine::ComputeImageDestination;
     let TextureWriteback::Type11 {
         mapping_id,
+        surface_offset,
+        surface_bpr,
+        span_end,
         width,
         height,
+        format,
         ..
     } = &tex.writeback
     else {
@@ -1511,8 +1533,23 @@ fn type11_destination<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route("compute_dst_no_writeback");
         return ComputeImageDestination::Host;
     };
+    // The window this bind staged against, not one resolved here. It is already
+    // plane-correct for a type-5 view and already a sub-rectangle where the
+    // dispatch writes one, and it is the same window the readback rail lands
+    // through — so the two rails cannot name different bytes of one surface.
     match crate::runtime::mapping_write::licence_type11_surface(
-        state, host, *mapping_id, held, *width, *height,
+        state,
+        host,
+        held,
+        &crate::runtime::mapping_write::Type11SurfaceDestination {
+            mapping_id: *mapping_id,
+            base_off: *surface_offset,
+            bpr: *surface_bpr,
+            span_end: *span_end,
+            width: *width,
+            height: *height,
+            format: *format,
+        },
     ) {
         Ok(licence) => {
             crate::runtime::drain::note_store_route("compute_dst_guest_pages");
@@ -2561,7 +2598,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                 span_end,
                 width,
                 height,
-                bpp,
+                format: stage_fmt,
             }
         } else {
             TextureWriteback::None
@@ -3049,12 +3086,13 @@ fn writeback_texture<M: HostMemory + HostOps>(
         }
         TextureWriteback::Type11 {
             width,
-            bpp,
+            format,
             surface_bpr,
             ..
         } => {
             crate::runtime::drain::note_store_route("compute_wb_type11");
-            crate::runtime::drain::note_store_route(if width.saturating_mul(*bpp) == *surface_bpr {
+            let tight = pixel_format::bytes_per_pixel(*format).map(|bpp| width.saturating_mul(bpp));
+            crate::runtime::drain::note_store_route(if tight == Some(*surface_bpr) {
                 "compute_wb_type11_dense"
             } else {
                 "compute_wb_type11_padded"
@@ -3177,9 +3215,22 @@ fn writeback_texture<M: HostMemory + HostOps>(
             span_end,
             width,
             height,
-            bpp,
+            format,
         } => {
-            let tight = width.saturating_mul(*bpp);
+            // Derived here rather than carried beside the format, so the record
+            // holds one answer about its texel size. Staging refused this bind
+            // outright if the format had no byte width, so a `None` here is a
+            // format that changed identity between stage and landing rather
+            // than an unsupported one — refuse it by name instead of writing
+            // rows at a width nothing declared.
+            let Some(bpp) = pixel_format::bytes_per_pixel(*format) else {
+                crate::observe::fail(format!(
+                    "compute_writeback_tex fail reason=type11_format_unsized task={task_id} bind={} mid={mapping_id} fmt={format:#x}",
+                    tex.binding
+                ));
+                return Err(ComputeStatus::GuestIo("compute_wb_tex_type11_format"));
+            };
+            let tight = width.saturating_mul(bpp);
             if !mapping_write::write_full_rect_raw_at(
                 state,
                 host,
@@ -3189,7 +3240,7 @@ fn writeback_texture<M: HostMemory + HostOps>(
                 *span_end,
                 *width,
                 *height,
-                *bpp,
+                bpp,
                 &tex.bytes,
                 tight,
             ) {

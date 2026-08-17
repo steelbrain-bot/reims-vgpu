@@ -660,6 +660,68 @@ fn a_writeback_refused_because_the_geometry_moved_says_so_by_name() {
     }
 }
 
+/// The type-11 licence judges the window it is given, not the surface's extent.
+///
+/// A render Store's destination *is* the surface, so that caller refuses a frame
+/// whose rect is not the mapping's latched geometry — the test above drives
+/// exactly that, and it stays where it belongs, in the caller. A compute
+/// dispatch's destination is not a scanout: writing a sub-rectangle of a surface
+/// is ordinary, and the licence resolving its own full-extent window refused
+/// every one of them. On a driven macos-13 boot that was 15 of the 19 remaining
+/// compute readbacks, all `GeometryMoved`, at extents like 44x26 of a 64x64
+/// surface and 128x512 of a 512x512 one.
+///
+/// So the assertion is that extent is no longer a *term*: a sub-rectangle and a
+/// whole-surface destination over the same mapping must reach the same decline,
+/// and it must not be `GeometryMoved`. `FakeHost` publishes no guest-RAM import,
+/// so both stop at the reference gate — which is downstream of every rule the
+/// licence still owns, and therefore says both got through all of them.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_type11_licence_judges_the_callers_window_and_not_the_surfaces_extent() {
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::model::PAGE_SHIFT_X86;
+    const PAGE: u64 = 1 << PAGE_SHIFT_X86;
+
+    let mut state = DeviceState::new(DeviceId(9), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let base_pfn = 0x40u32;
+    host.map_range((base_pfn as u64) << PAGE_SHIFT_X86, 16 * PAGE as usize, 0x55);
+    state.map_surface(7);
+    state.attach_mapping_internal(7, 0);
+    let m = state.mappings.get_mut(&7).unwrap();
+    m.mapping_internal = 1;
+    m.page_entries = (0..16)
+        .map(|i| ((base_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
+        .collect();
+    assert!(state.set_mapping_geom(7, 64, 64, MTL_FORMAT_BGRA8_UNORM));
+
+    let held = crate::backend::vulkan::translate::pixel::vk_texel_layout(
+        pixel_format::store_texel_order(MTL_FORMAT_BGRA8_UNORM).expect("BGRA8 has a linear texel"),
+    );
+    let dest = |width, height| Type11SurfaceDestination {
+        mapping_id: 7,
+        base_off: 0,
+        bpr: 64 * 4,
+        span_end: u64::from(height) * 64 * 4,
+        width,
+        height,
+        format: MTL_FORMAT_BGRA8_UNORM,
+    };
+
+    let whole = licence_type11_surface(&mut state, &mut host, held, &dest(64, 64));
+    let part = licence_type11_surface(&mut state, &mut host, held, &dest(44, 26));
+    for (what, got) in [("the whole surface", whole), ("a sub-rectangle", part)] {
+        match got {
+            Err(GpuWritebackDecline::GuestRefRefused { .. }) => {}
+            other => panic!(
+                "{what} must reach the reference gate, and only that gate; got {:?}",
+                other.err()
+            ),
+        }
+    }
+}
+
 #[test]
 fn writing_guest_pages_moves_the_host_write_record_and_reading_them_does_not() {
     use crate::model::PAGE_SHIFT_X86;
