@@ -2100,11 +2100,6 @@ fn t2t_identity_self_copy_is_noop_ok() {
         gva_mem::read_task_gva(&host, &state.tasks[1], gva, &mut back, PAGE_SHIFT_ARM64E).is_ok()
     );
     assert_eq!(back, pat, "identity self-copy left the bytes unchanged");
-    // No overlap enrichment line was emitted (it's not a genuine overlap).
-    assert!(
-        note_t2t_overlap(1, 2, 2, 0, 0, 16, 16, 2, 1),
-        "identity path must not have consumed the overlap dedup slot"
-    );
 }
 
 /// Regression guard for the strided-column false positive: a self-copy of a
@@ -2149,22 +2144,18 @@ fn t2t_shifted_column_self_copy_moves_bytes() {
         let dst_texel = &back[r * 16 + 8..r * 16 + 12];
         assert_eq!(dst_texel, src_texel, "row {r} column x=2 holds moved src");
     }
-    // No overlap enrichment (this is not a genuine overlap).
-    assert!(
-        note_t2t_overlap(9, 2, 2, 0, 8, 4, 16, 4, 1),
-        "shifted-column path must not have consumed the overlap dedup slot"
-    );
 }
 
-/// Regression guard: a GENUINELY overlapping self-copy (src rect x[0,2),
-/// dst rect x[1,3) — overlap on x) is undefined in Metal and must still be
-/// rejected as Overlap, with the enrichment line emitted for diagnosis.
+/// An overlapping same-texture region is admitted by the serialized copy
+/// contract. Snapshot the whole source before the first destination write so
+/// the traversal direction cannot change the bytes copied.
 #[test]
-fn t2t_overlapping_self_copy_still_rejected() {
+fn t2t_overlapping_self_copy_stages_the_source_region() {
     let (mut host, mut state) = blit_device();
-    // Unique ref (4) so the (task,src,dst) enrichment key is globally
-    // distinct from the identity/shifted tests' probes.
     install_linear_rgba(&mut host, &mut state, 4, 4, 4, 4, 16);
+    let gva = 4u64 << RESOURCE_PAGE_SHIFT;
+    let pat: Vec<u8> = (0..64).map(|i| i as u8).collect();
+    write_task_gva_arm64e(&mut host, &state.tasks[1], gva, &pat);
     let mut cmd = copy_cmd(CopyKind::TextureToTexture, 4, 4);
     cmd.destination_origin.x = 1; // src x[0,2), dst x[1,3) overlap at x=1
     cmd.source_size = Size {
@@ -2172,16 +2163,58 @@ fn t2t_overlapping_self_copy_still_rejected() {
         height: 4,
         depth: 1,
     };
-    assert_eq!(
-        execute_blit(&mut state, &mut host, 1, &cmd),
-        BlitStatus::Overlap,
-        "genuinely overlapping self-copy must be rejected"
-    );
-    // The enrichment slot WAS consumed (a real overlap was logged).
-    assert!(
-        !note_t2t_overlap(1, 4, 4, 0, 4, 8, 16, 4, 1),
-        "the reject path must have logged the overlap enrichment once"
-    );
+    assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
+    let mut back = vec![0u8; 64];
+    gva_mem::read_task_gva(&host, &state.tasks[1], gva, &mut back, PAGE_SHIFT_ARM64E)
+        .expect("copied texture remains readable");
+    for row in 0..4usize {
+        assert_eq!(
+            &back[row * 16 + 4..row * 16 + 12],
+            &pat[row * 16..row * 16 + 8],
+            "row {row} came from the pre-copy source"
+        );
+    }
+}
+
+/// The strided vertical overlap emitted by the UI workload: eighteen one-pixel
+/// rows move down twelve rows in one texture. Rows 12..17 are both source and
+/// destination, so staging a row at a time would feed written pixels back into
+/// the tail of the copy.
+#[test]
+fn t2t_vertical_overlap_reads_every_source_row_before_writing() {
+    const WIDTH: u32 = 256;
+    const HEIGHT: u32 = 30;
+    const STRIDE: u32 = WIDTH * 4;
+    let (mut host, mut state) = blit_device();
+    install_linear_rgba(&mut host, &mut state, 5, 5, WIDTH, HEIGHT, STRIDE);
+    let gva = 5u64 << RESOURCE_PAGE_SHIFT;
+    let mut pat = vec![0u8; STRIDE as usize * HEIGHT as usize];
+    for row in 0..HEIGHT as usize {
+        pat[row * STRIDE as usize..row * STRIDE as usize + 4]
+            .copy_from_slice(&(row as u32).to_le_bytes());
+    }
+    write_task_gva_arm64e(&mut host, &state.tasks[1], gva, &pat);
+
+    let mut cmd = copy_cmd(CopyKind::TextureToTexture, 5, 5);
+    cmd.destination_origin.y = 12;
+    cmd.source_size = Size {
+        width: 1,
+        height: 18,
+        depth: 1,
+    };
+    assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
+
+    let mut back = vec![0u8; pat.len()];
+    gva_mem::read_task_gva(&host, &state.tasks[1], gva, &mut back, PAGE_SHIFT_ARM64E)
+        .expect("copied texture remains readable");
+    for source_row in 0..18usize {
+        let destination_row = source_row + 12;
+        assert_eq!(
+            &back[destination_row * STRIDE as usize..destination_row * STRIDE as usize + 4],
+            &pat[source_row * STRIDE as usize..source_row * STRIDE as usize + 4],
+            "destination row {destination_row} came from the pre-copy source row {source_row}"
+        );
+    }
 }
 
 #[test]
@@ -2542,23 +2575,6 @@ fn tex_wrong_type_enrichment_dedups_per_ref_and_type() {
         0,
         0
     ));
-}
-
-/// Regression guard: the `t2t_overlap` enrichment dedups per
-/// `(task, src_ref, dst_ref)` — a self-overlapping copy re-issued every
-/// frame must not flood — while a distinct src/dst pair reports once so a
-/// genuine drop stays diagnosable.
-#[test]
-fn t2t_overlap_enrichment_dedups_per_pair() {
-    // Unique task namespace (3) so the process-global dedup set never
-    // collides with other tests; the set starts empty so first-insert is
-    // deterministic without a reset.
-    assert!(note_t2t_overlap(3, 0x10, 0x10, 0, 4096, 256, 1024, 8, 1));
-    for _ in 0..20 {
-        assert!(!note_t2t_overlap(3, 0x10, 0x10, 0, 4096, 256, 1024, 8, 1));
-    }
-    // A distinct destination ref is a distinct failure -> reports once.
-    assert!(note_t2t_overlap(3, 0x10, 0x11, 0, 4096, 256, 1024, 8, 1));
 }
 
 /// The precondition the `repack_storage_assumed` enrichment exists for.

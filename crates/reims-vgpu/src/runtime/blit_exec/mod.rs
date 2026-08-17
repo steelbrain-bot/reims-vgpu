@@ -218,49 +218,6 @@ fn note_t5_decode_fail(sid: u32, bytes: &[u8]) {
     ));
 }
 
-/// Dedup set for the `t2t_overlap` enrichment, keyed by `(task, src_ref, dst_ref)`.
-static T2T_OVERLAP_SEEN: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashSet<(u32, u32, u32)>>,
-> = std::sync::OnceLock::new();
-
-/// Emit ONE always-on `blit t2t_overlap` line per distinct
-/// `(task, src_ref, dst_ref)` carrying the load-bearing overlap geometry so a
-/// genuine self-overlap (same allocation, live bytes collide — undefined in
-/// Metal, correctly rejected) can be told apart from a false positive.
-///
-/// The reject uses a COMPRESSED bounding span (`row_bytes*copy_h*copy_d`) that
-/// ignores `row_stride` gaps, so it can misjudge a strided sub-rect copy in
-/// either direction. Logging `row_bytes` vs `row_stride` and both offsets lets
-/// a future boot decide whether the check needs to become stride-precise.
-/// Deduped so a per-draw repeat cannot flood. Diagnostic only.
-#[allow(clippy::too_many_arguments)]
-fn note_t2t_overlap(
-    task_id: u32,
-    src_ref: u32,
-    dst_ref: u32,
-    src_off: u64,
-    dst_off: u64,
-    row_bytes: u64,
-    row_stride: u64,
-    copy_h: u64,
-    copy_d: u64,
-) -> bool {
-    let set = T2T_OVERLAP_SEEN.get_or_init(|| std::sync::Mutex::new(Default::default()));
-    if let Ok(mut g) = set.lock() {
-        if !g.insert((task_id, src_ref, dst_ref)) {
-            return false;
-        }
-    }
-    let span = row_bytes.saturating_mul(copy_h).saturating_mul(copy_d);
-    let strided = if row_bytes < row_stride { 1 } else { 0 };
-    crate::observe::fail(format!(
-        "blit t2t_overlap task={task_id} src_ref={src_ref} dst_ref={dst_ref} \
-         src_off={src_off} dst_off={dst_off} row_bytes={row_bytes} \
-         row_stride={row_stride} copy_h={copy_h} copy_d={copy_d} span={span} strided={strided}"
-    ));
-    true
-}
-
 /// `(task, side, format)` — what `repack_storage_assumed` reports once per.
 type RepackAssumedKey = (u32, &'static str, u16);
 
@@ -3325,23 +3282,17 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
         // onto themselves changes nothing, so succeed without work rather than
         // rejecting it as Overlap (which returned a spurious error to the guest
         // blit encoder and dropped a copy the guest treats as complete). A
-        // genuinely-shifted overlap (src_gva != dst_gva, undefined in Metal)
-        // still falls through to the reject below.
+        // genuinely-shifted overlap falls through to source-before-destination
+        // staging below.
         if src_gva == dst_gva && sl.row_stride == dl.row_stride && src_bpi == dst_bpi {
             return BlitStatus::Ok;
         }
         // Same allocation (self-copy or aliased view) but a different region:
-        // safe unless the source and destination TEXEL rectangles actually
-        // intersect. Two axis-aligned rectangles overlap iff they overlap on
-        // EVERY axis — the correct model when src/dst share the texel layout
-        // (same row stride + per-image stride, guaranteed for a same-texture
-        // self-copy). The prior byte-span test collapsed row_stride into one
-        // contiguous span and produced phantom overlaps for strided sub-rect
-        // column copies: a 1-wide column shifted N texels right (live: src_off=0
-        // dst_off=64, 4-byte rows 1024 apart) never collides row-to-row, yet the
-        // span test flagged it and dropped a legitimate copy. If the layouts
-        // differ (exotic aliased views with mismatched strides), texel grids are
-        // incomparable — keep the conservative byte-span reject there.
+        // direct row-by-row execution is safe only when the source and
+        // destination texel rectangles do not intersect. Two axis-aligned
+        // rectangles overlap iff they overlap on every axis. If the layouts
+        // differ, their texel grids are incomparable, so the byte spans give
+        // the conservative answer.
         if sl.base_gva == dl.base_gva {
             let same_layout = sl.row_stride == dl.row_stride && src_bpi == dst_bpi;
             let overlaps = if same_layout {
@@ -3362,18 +3313,88 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
                 )
             };
             if overlaps {
-                note_t2t_overlap(
+                // The serialized copy record carries the complete source and
+                // destination regions and does not define an overlap refusal.
+                // Snapshot every source plane before writing any destination
+                // plane: a row-at-a-time loop can overwrite bytes a later row
+                // or depth plane still has to read.
+                let plane_bytes = match row_bytes.checked_mul(copy_h) {
+                    Some(v) => v,
+                    None => return br(BlitStatus::Capacity, "t2t_overlap_plane_overflow"),
+                };
+                let total_bytes = match plane_bytes.checked_mul(copy_d) {
+                    Some(v) => v,
+                    None => return br(BlitStatus::Capacity, "t2t_overlap_total_overflow"),
+                };
+                let Some(total_len) = host_alloc_len(total_bytes) else {
+                    return br(BlitStatus::Capacity, "t2t_overlap_alloc");
+                };
+                let allowed = match texture_region_window(
+                    state,
+                    host,
                     task_id,
-                    cmd.source,
-                    cmd.destination,
-                    src_off,
-                    dst_off,
-                    row_bytes,
-                    sl.row_stride,
+                    &dst,
+                    Point {
+                        x: dox,
+                        y: doy,
+                        z: doz,
+                    },
+                    copy_w as u32,
                     copy_h,
                     copy_d,
+                    copy_bpp,
+                ) {
+                    Ok(v) => v,
+                    Err(st) => return st,
+                };
+                let mut staged = vec![0u8; total_len];
+                for z in 0..copy_d {
+                    let start = (z * plane_bytes) as usize;
+                    let end = start + plane_bytes as usize;
+                    if let Err(st) = read_texture_rect(
+                        state,
+                        host,
+                        task_id,
+                        &src,
+                        Point {
+                            x: sox,
+                            y: soy,
+                            z: soz + z,
+                        },
+                        row_bytes,
+                        copy_h,
+                        &mut staged[start..end],
+                    ) {
+                        return st;
+                    }
+                }
+                for z in 0..copy_d {
+                    let start = (z * plane_bytes) as usize;
+                    let end = start + plane_bytes as usize;
+                    if let Err(st) = write_texture_rect(
+                        state,
+                        host,
+                        task_id,
+                        &dst,
+                        Point {
+                            x: dox,
+                            y: doy,
+                            z: doz + z,
+                        },
+                        row_bytes,
+                        copy_h,
+                        &staged[start..end],
+                        allowed.as_ref(),
+                    ) {
+                        return st;
+                    }
+                }
+                crate::runtime::drain::note_store_route("blit_t2t_overlap_staged");
+                crate::runtime::drain::note_store_route_n(
+                    "blit_t2t_overlap_staged_bytes",
+                    total_bytes,
                 );
-                return br(BlitStatus::Overlap, "t2t_overlap");
+                return BlitStatus::Ok;
             }
         }
         return match copy_row_region(
