@@ -2815,6 +2815,45 @@ fn writeback_texture<M: HostMemory + HostOps>(
     task_id: u32,
     tex: &StagedTexture,
 ) -> Result<(), ComputeStatus> {
+    // Which destination namespace a compute storage output lands in, and — on
+    // the linear arm — whether its guest rows are dense. Both are properties of
+    // the guest's own window rather than of this device, and neither is
+    // otherwise reported: `rectwr_*` and `linear*` are shared with several
+    // other rails, so they cannot be read as this rail's split. Observed only;
+    // nothing branches on these.
+    match &tex.writeback {
+        TextureWriteback::None => crate::runtime::drain::note_store_route("compute_wb_none"),
+        TextureWriteback::Linear {
+            width,
+            bpp,
+            row_stride,
+            ..
+        } => {
+            crate::runtime::drain::note_store_route("compute_wb_linear");
+            // A dense window is one `VkBufferCopy` run per guest run; a padded
+            // one needs a rectangle copy per run per row fragment, which is the
+            // difference between a handful of regions and a few hundred.
+            crate::runtime::drain::note_store_route(if u64::from(*width) * u64::from(*bpp) == *row_stride {
+                "compute_wb_linear_dense"
+            } else {
+                "compute_wb_linear_padded"
+            });
+        }
+        TextureWriteback::Type11 {
+            width,
+            bpp,
+            surface_bpr,
+            ..
+        } => {
+            crate::runtime::drain::note_store_route("compute_wb_type11");
+            crate::runtime::drain::note_store_route(if width.saturating_mul(*bpp) == *surface_bpr {
+                "compute_wb_type11_dense"
+            } else {
+                "compute_wb_type11_padded"
+            });
+        }
+    }
+
     match &tex.writeback {
         TextureWriteback::None => Ok(()),
         TextureWriteback::Linear {
