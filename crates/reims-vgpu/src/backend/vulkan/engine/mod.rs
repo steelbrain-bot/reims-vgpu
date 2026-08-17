@@ -54,7 +54,7 @@ pub mod vk_call;
 mod window_present;
 
 pub use context::MAX_DEVICE_RECREATES;
-pub(crate) use counters::{CounterSnapshot, EngineCounters};
+pub(crate) use counters::{CounterSnapshot, EngineCounters, TargetReadDelivery};
 pub(crate) use draw_phase::take_window as draw_phase_window;
 pub(crate) use draw_preparation::DrawPreparationDecline;
 pub(crate) use facade_decline::EngineFacadeDecline;
@@ -2957,7 +2957,7 @@ pub fn read_target_leased(identity: &TargetIdentity) -> Result<Option<LeasedFram
             ReadbackDelivery::Lease,
         )?;
         pools.registry_note_access(identity, read_access);
-        counters.note_target_read(rb_size);
+        counters.note_target_read(rb_size, TargetReadDelivery::Host);
         Ok(match delivered {
             ReadbackResult::Leased { token, ptr, len } => Some(LeasedFrame {
                 token,
@@ -3297,7 +3297,13 @@ pub fn copy_target_to_guest_pages(
             identity,
             pools::ResidentAccess::transfer_read(snap.guest_backing.is_some()),
         );
-        counters.note_target_read(u64::from(dst.width) * u64::from(dst.height) * 4);
+        // The copy above is `vkCmdCopyImageToBuffer` into the guest's own
+        // imported pages, so these bytes are the host readback this rail elides
+        // rather than one it paid.
+        counters.note_target_read(
+            u64::from(dst.width) * u64::from(dst.height) * 4,
+            TargetReadDelivery::GuestPagesOnGpu,
+        );
     }
     // Past the last fallible step, so this runs exactly when the copy is on the
     // queue. The ledger takes the resident's pin itself here — the caller holds
@@ -4632,7 +4638,7 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
             target_readback_ops(),
         )?;
         pools.registry_note_access(identity, read_access);
-        counters.note_target_read(rb_size);
+        counters.note_target_read(rb_size, TargetReadDelivery::Host);
         // A wide resident is quantized here rather than refused; see
         // `narrow_readback_to_rgba8` for why that direction is the safe one.
         let (pixels, bgra) =

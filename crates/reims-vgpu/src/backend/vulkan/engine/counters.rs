@@ -289,8 +289,26 @@ engine_counters! {
         /// These are the copies a deferred rail *keeps*, paid once when a consumer
         /// asks instead of once per Store. `target_reads / readbacks` is what
         /// separates "the readback moved" from "the readback went away".
+        ///
+        /// **Host deliveries only.** A full-frame read that lands in the guest's
+        /// own pages on the GPU queue is charged to `target_gpu_copies` below,
+        /// and [`TargetReadDelivery`] is what keeps the two apart.
         target_reads,
         target_read_bytes,
+        /// Full-frame reads of a pinned resident that never entered host address
+        /// space: `copy_target_to_guest_pages` puts them straight into the
+        /// guest's imported pages on the queue, so the bytes are what the host
+        /// copy *would* have cost.
+        ///
+        /// Split out because pooling them with `target_reads` made the one
+        /// instrument that answers "is this device zero-copy?" read the same
+        /// whether the frame crossed into this process or not — the GPU rail
+        /// inflated the host total by gigabytes a boot and looked like the host
+        /// rail still running. Read the pair: `target_reads` falling while
+        /// `target_gpu_copies` rises is the rail moving, and both falling is the
+        /// work going away.
+        target_gpu_copies,
+        target_gpu_copy_bytes,
         /// Completion stamps whose word was recorded into the GPU queue behind
         /// the writebacks they follow, rather than stored by this thread after
         /// blocking on them.
@@ -842,6 +860,24 @@ engine_counters! {
         compute_storage_sole_copy_peak_bytes,
     }
 }
+/// Where a full-frame read of a pinned resident put the bytes.
+///
+/// The two are the same `vkCmdCopyImage*` shape and the same byte count, and
+/// they are opposite answers to this project's only question: one crosses into
+/// this process's address space and one does not. A single total over both is
+/// unreadable, and `copy_target_to_guest_pages` charged the host counter for
+/// gigabytes a boot that no CPU ever touched.
+///
+/// An argument rather than two methods, for the reason [`CreateSite`] is one:
+/// a new read site cannot be added without saying which of the two it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetReadDelivery {
+    /// Into a mapped staging slot the CPU then reads — a real device→host copy.
+    Host,
+    /// Into the guest's imported pages, on the queue, with no host pass at all.
+    GuestPagesOnGpu,
+}
+
 macro_rules! create_sites {
     ($($variant:ident => $slug:literal),+ $(,)?) => {
         /// The Vulkan object lifetime a successful create call belongs to.
@@ -942,9 +978,15 @@ impl EngineCounters {
         self.readback_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub fn note_target_read(&self, bytes: u64) {
-        self.target_reads.fetch_add(1, Ordering::Relaxed);
-        self.target_read_bytes.fetch_add(bytes, Ordering::Relaxed);
+    pub fn note_target_read(&self, bytes: u64, delivery: TargetReadDelivery) {
+        let (count, total) = match delivery {
+            TargetReadDelivery::Host => (&self.target_reads, &self.target_read_bytes),
+            TargetReadDelivery::GuestPagesOnGpu => {
+                (&self.target_gpu_copies, &self.target_gpu_copy_bytes)
+            }
+        };
+        count.fetch_add(1, Ordering::Relaxed);
+        total.fetch_add(bytes, Ordering::Relaxed);
     }
 
     pub fn note_seed_upload(&self, bytes: u64) {
@@ -1164,6 +1206,34 @@ mod tests {
                 snapshot.sampled_gather_skip_bytes
             ),
             (1, 512)
+        );
+    }
+
+    /// A full-frame read charged to the wrong half is the difference between
+    /// "this device is zero-copy" and "it is not", so the two deliveries are
+    /// asserted by name and with different byte counts.
+    ///
+    /// Asserting only the sum would pass with the arms swapped, and swapped is
+    /// exactly the state this split was written to end: `copy_target_to_guest_pages`
+    /// charged `target_reads` for gigabytes a boot that never entered host
+    /// address space, and the host total read the same whether the GPU rail was
+    /// carrying the frames or not.
+    #[test]
+    fn a_target_read_lands_on_the_half_its_delivery_names() {
+        let counters = EngineCounters::default();
+        counters.note_target_read(4096, TargetReadDelivery::Host);
+        counters.note_target_read(8192, TargetReadDelivery::GuestPagesOnGpu);
+
+        let snapshot = counters.snapshot();
+        assert_eq!(
+            (snapshot.target_reads, snapshot.target_read_bytes),
+            (1, 4096),
+            "host delivery: {snapshot:?}"
+        );
+        assert_eq!(
+            (snapshot.target_gpu_copies, snapshot.target_gpu_copy_bytes),
+            (1, 8192),
+            "guest-pages delivery: {snapshot:?}"
         );
     }
 
