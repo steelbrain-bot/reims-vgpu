@@ -2659,6 +2659,61 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
 /// is unavailable and the remaining GPU path would copy into another image.
 pub(super) const SAMPLED_GATHER_MIN_BYTES: u64 = 64 * 1024;
 
+/// Which sampled rail is asking [`sampled_gather_floor_admits`], so a decline
+/// names the rail that took it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum SampledFloorRail {
+    /// A linear texture addressed through task-local GVA space.
+    Linear,
+    /// A type-11 surface plane addressed through a mapping.
+    Type11,
+    /// A serialized type-5 surface view addressed through a mapping.
+    Type5,
+}
+
+/// The only application of [`SAMPLED_GATHER_MIN_BYTES`], for all three sampled
+/// rails, returning whether the copied gather fallback may proceed.
+///
+/// The rule has two terms and they are not separable. The span term is the
+/// performance crossover [`SAMPLED_GATHER_MIN_BYTES`] documents. The layout term
+/// is [`TexelLayout::a_cost_floor_may_decline`], which exists because a floor is
+/// a performance decision *only* where the CPU arm it declines to produces the
+/// same pixels — where that arm is lossy or absent, the same comparison is a
+/// correctness gate wearing a threshold's clothes, and an extended-range LUT
+/// reaches the shader quantized.
+///
+/// Written once here because it was written three times by hand and the three
+/// did not agree: the type-11 arm carried the span term alone, so every
+/// half-float sampled surface under 64 KiB on that rail was declined onto the
+/// very loader `a_cost_floor_may_decline` was added to keep it away from. The
+/// two mapping rails also declined silently — no record at all — while the
+/// counter whose name reads like that refusal was attached to the *success*
+/// return above it, so the log said the opposite of what the code did.
+///
+/// A decline is recorded here rather than at the call site, banded by span, so
+/// a rail cannot be added that declines without saying so.
+pub(super) fn sampled_gather_floor_admits(
+    rail: SampledFloorRail,
+    native: TexelLayout,
+    span: u64,
+) -> bool {
+    if !native.a_cost_floor_may_decline() || span >= SAMPLED_GATHER_MIN_BYTES {
+        return true;
+    }
+    crate::runtime::drain::note_store_route(match (rail, span) {
+        (SampledFloorRail::Linear, s) if s < 4 * 1024 => "zc_lin_below_floor_lt4k",
+        (SampledFloorRail::Linear, s) if s < 16 * 1024 => "zc_lin_below_floor_lt16k",
+        (SampledFloorRail::Linear, _) => "zc_lin_below_floor_lt64k",
+        (SampledFloorRail::Type11, s) if s < 4 * 1024 => "zc_t11_below_floor_lt4k",
+        (SampledFloorRail::Type11, s) if s < 16 * 1024 => "zc_t11_below_floor_lt16k",
+        (SampledFloorRail::Type11, _) => "zc_t11_below_floor_lt64k",
+        (SampledFloorRail::Type5, s) if s < 4 * 1024 => "zc_t5_below_floor_lt4k",
+        (SampledFloorRail::Type5, s) if s < 16 * 1024 => "zc_t5_below_floor_lt16k",
+        (SampledFloorRail::Type5, _) => "zc_t5_below_floor_lt64k",
+    });
+    false
+}
+
 /// Zero-copy floor for draw-time vertex/storage buffer binds. Performance
 /// threshold only — never a correctness gate; below it the bind takes the CPU
 /// staging read instead.
@@ -4439,8 +4494,12 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                 native_components,
                 owner.clone(),
             ) {
+                // Served zero-copy from the retained allocation, so the floor
+                // was never consulted — recorded because this is the band that
+                // would have been declined had the bind needed the copied
+                // fallback, which is what says how much the floor is worth.
                 if span < SAMPLED_GATHER_MIN_BYTES {
-                    crate::runtime::drain::note_store_route("zc_lin_direct_below_gather_floor");
+                    crate::runtime::drain::note_store_route("zc_lin_direct_under_floor_span");
                 }
                 return Some((w, h, request));
             }
@@ -4462,7 +4521,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     };
 
     if let Some(packed) = packed {
-        if !native.a_cost_floor_may_decline() || span >= SAMPLED_GATHER_MIN_BYTES {
+        if sampled_gather_floor_admits(SampledFloorRail::Linear, native, span) {
             let page = state.page_size();
             let packed_offset = packed.head.checked_add(layout.offset)?;
             let first_page = usize::try_from(packed_offset / page).ok()?;
@@ -4518,14 +4577,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // describes, so its size never selects a different ownership model.
     // Single-channel float LUTs have no equivalent CPU loader arm and therefore
     // cannot be declined on cost grounds even on this fallback.
-    if native.a_cost_floor_may_decline() && span < SAMPLED_GATHER_MIN_BYTES {
-        crate::runtime::drain::note_store_route(if span < 4 * 1024 {
-            "zc_lin_below_floor_lt4k"
-        } else if span < 16 * 1024 {
-            "zc_lin_below_floor_lt16k"
-        } else {
-            "zc_lin_below_floor_lt64k"
-        });
+    if !sampled_gather_floor_admits(SampledFloorRail::Linear, native, span) {
         return None;
     }
 
@@ -4659,8 +4711,10 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
             owner,
         },
     ) {
+        // See the linear arm: served zero-copy, so this records the band the
+        // floor would have judged rather than a decline it took.
         if span < SAMPLED_GATHER_MIN_BYTES {
-            crate::runtime::drain::note_store_route("zc_t11_direct_below_gather_floor");
+            crate::runtime::drain::note_store_route("zc_t11_direct_under_floor_span");
         }
         return Some(SampledSourceRequest::GuestRuns(
             source,
@@ -4672,7 +4726,7 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
             pixel_format::swizzle_identity(),
         ));
     }
-    if span < SAMPLED_GATHER_MIN_BYTES {
+    if !sampled_gather_floor_admits(SampledFloorRail::Type11, native, span) {
         return None;
     }
     let (gpas, runs) = mapping_window_guest_runs(state, host, mid, base_off, span)?;
@@ -4784,8 +4838,10 @@ pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
             owner,
         },
     ) {
+        // See the linear arm: served zero-copy, so this records the band the
+        // floor would have judged rather than a decline it took.
         if span < SAMPLED_GATHER_MIN_BYTES {
-            crate::runtime::drain::note_store_route("zc_t5_direct_below_gather_floor");
+            crate::runtime::drain::note_store_route("zc_t5_direct_under_floor_span");
         }
         return Some(SampledSourceRequest::GuestRuns(
             source,
@@ -4797,7 +4853,7 @@ pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
             pixel_format::swizzle_identity(),
         ));
     }
-    if native.a_cost_floor_may_decline() && span < SAMPLED_GATHER_MIN_BYTES {
+    if !sampled_gather_floor_admits(SampledFloorRail::Type5, native, span) {
         return None;
     }
     let (gpas, runs) = mapping_window_guest_runs(state, host, mid, base_off, span)?;

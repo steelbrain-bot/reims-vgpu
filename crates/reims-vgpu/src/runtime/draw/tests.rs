@@ -125,6 +125,57 @@ fn a_small_reflected_object_stays_on_the_gather_rail_and_moves_only_its_extent()
     );
 }
 
+/// The sampled gather floor is one rule, and all three rails get the same answer.
+///
+/// It was three hand-written copies and they disagreed. The type-11 arm carried
+/// the span term alone, so a half-float sampled surface under 64 KiB — whose CPU
+/// loader arm exists and is lossy — was declined onto that loader on that rail
+/// and admitted on the other two. `a_cost_floor_may_decline` exists precisely to
+/// stop that, and one of three call sites did not ask it.
+///
+/// The rail is an input only to the record a decline leaves, never to the
+/// verdict, which is what the first assertion pins.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn the_sampled_gather_floor_gives_one_verdict_to_all_three_rails() {
+    use super::vulkan::{sampled_gather_floor_admits, SampledFloorRail, SAMPLED_GATHER_MIN_BYTES};
+    use crate::contract::pixel_format::TexelLayout;
+
+    let rails = [
+        SampledFloorRail::Linear,
+        SampledFloorRail::Type11,
+        SampledFloorRail::Type5,
+    ];
+    let under = SAMPLED_GATHER_MIN_BYTES - 1;
+    let over = SAMPLED_GATHER_MIN_BYTES;
+
+    for layout in [TexelLayout::Bgra8, TexelLayout::Rgba16Float, TexelLayout::R32Float] {
+        let verdicts: Vec<bool> = rails
+            .iter()
+            .map(|&rail| sampled_gather_floor_admits(rail, layout, under))
+            .collect();
+        assert!(
+            verdicts.windows(2).all(|w| w[0] == w[1]),
+            "{layout:?} split the rails: {verdicts:?}"
+        );
+    }
+
+    for &rail in &rails {
+        // A lossless byte loader exists, so the floor is a cost decision and may
+        // turn a small window away.
+        assert!(!sampled_gather_floor_admits(rail, TexelLayout::Bgra8, under));
+        assert!(sampled_gather_floor_admits(rail, TexelLayout::Bgra8, over));
+
+        // The arm exists and narrows what the guest can see, so the same
+        // comparison would be a correctness gate. Never declined, at any span.
+        assert!(sampled_gather_floor_admits(rail, TexelLayout::Rgba16Float, under));
+        assert!(sampled_gather_floor_admits(rail, TexelLayout::Rgba16Float, 1));
+
+        // No byte-shaped arm at all, for the same reason.
+        assert!(sampled_gather_floor_admits(rail, TexelLayout::R32Float, under));
+    }
+}
+
 /// The scatter band names the run count the coalescer finds, not the page count.
 ///
 /// The reading this census exists to take is "could this window have been served
