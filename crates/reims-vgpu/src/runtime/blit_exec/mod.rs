@@ -52,6 +52,7 @@ use crate::runtime::fence_exec::{self, FenceStatus};
 use crate::runtime::gva_mem;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::mapper;
+use crate::runtime::mapper::RectStride;
 use crate::runtime::mapping_write;
 use crate::runtime::objects;
 use crate::runtime::plan::event_sync::{Domain as FenceDomain, FenceAction};
@@ -1215,20 +1216,15 @@ fn read_texture_rect<M: HostMemory + HostOps>(
         return Err(br(BlitStatus::Capacity, "rd_rect_buf_cap"));
     }
     match tex {
-        TextureBacking::Linear(_) => {
-            for y in 0..row_count {
-                let at = (y * row_bytes) as usize;
-                read_texture_row(
-                    state,
-                    host,
-                    task_id,
-                    tex,
-                    origin,
-                    y,
-                    row_bytes,
-                    &mut buf[at..at + row_bytes as usize],
-                )?;
-            }
+        TextureBacking::Linear(t) => {
+            let (gva, rect) = linear_rect(t, origin, row_bytes, row_count, "rd_rect_linear_shape")?;
+            crate::runtime::gva_view::read_rect(state, host, task_id, gva, rect, buf)
+                .map_err(|_| br(BlitStatus::GuestIo, "rd_rect_linear_io"))?;
+            crate::runtime::drain::note_store_route("blit_rect_linear_read_walk");
+            crate::runtime::drain::note_store_route_n(
+                "blit_rect_linear_read_rows_hoisted",
+                row_count.saturating_sub(1),
+            );
             Ok(())
         }
         TextureBacking::Type11(t) => {
@@ -1255,110 +1251,53 @@ fn read_texture_rect<M: HostMemory + HostOps>(
     }
 }
 
-/// Write a linear level's rectangle through **one** resolution of the guest
-/// window, returning `false` when the window cannot be taken and the caller must
-/// keep its per-row loop.
+/// A linear level's rectangle as the GVA rail's own shape: where it starts and
+/// how its rows are laid out.
 ///
-/// This is the linear endpoint's missing rect primitive. The type-11 endpoint
-/// has had one since it landed — [`mapping_write::write_rect_raw_at`], whose
-/// fragmented arm imports each maximal packed GPA run once instead of once per
-/// row — while the linear endpoint had only [`write_texture_row`], so
-/// [`write_texture_rect`] served a rectangle by re-entering the GVA rail
-/// `row_count` times. Each of those re-entries walks the task page table for the
-/// span afresh, and every row of one level resolves through the same table to
-/// the same allocation, so all but the first walk re-derive an answer already in
-/// hand. A driven macos-13 boot charged that loop 808.9 ms across 235 968 rows —
-/// about 3.4 µs a row against a row of a few kilobytes, which is the walk and not
-/// the bytes.
+/// This is the linear endpoint's missing rect description. The type-11 endpoint
+/// has had one since it landed — [`mapping_write::write_rect_raw_at`] and
+/// friends — while the linear endpoint had only [`write_texture_row`] and
+/// [`read_texture_row`], so [`write_texture_rect`] and [`read_texture_rect`]
+/// each served a rectangle by re-entering the GVA rail `row_count` times. Every
+/// one of those re-entries walks the task page table afresh for a row of the
+/// same allocation, so all but the first re-derive an answer already in hand. A
+/// driven macos-13 boot charged that loop 906.7 ms of a 916.6 ms
+/// texture-to-texture rail across 118 464 rows — about 7.6 us for a 4 KiB row,
+/// which is the walk and not the bytes.
 ///
-/// **Rows are addressed exactly as the row loop addresses them.** Each row's
-/// guest address still comes from [`LinearTextureLevel::texel_offset`]; nothing
-/// here assumes rows are `row_stride` apart, ascending, or contiguous. The span
-/// is taken from the lowest and highest addresses that arithmetic produces, and
-/// each row is written at its own offset inside it. So this hoists the page-table
-/// walk and changes no address.
+/// **The stride is the contract's, not an observation.**
+/// [`LinearTextureLevel::texel_offset`]'s `y` term is exactly `y * row_stride`,
+/// so consecutive rows of one rectangle are `row_stride` apart by construction.
+/// That makes the whole rectangle one [`RectStride`] over one span, which is
+/// what lets a single walk place every row.
 ///
-/// [`gva_view::map_fresh_span_within`] carries the rest of the contract: it
-/// bounds the span against the same `allowed` window the row loop passes, refuses
-/// a span whose pages are not one contiguous run, and takes the write-footprint
-/// and host-wrote-pages records at the acquisition. A refusal returns `false`
-/// here and the caller's per-row path — which is also fresh, and is the only path
-/// on a host without the import — runs unchanged.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the rect helper names the same geometry its row counterpart does"
-)]
-fn write_linear_rect_through_one_view<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    task_id: u32,
+/// Only the last row's offset is resolved alongside the first. That is not a
+/// two-endpoint sample of a range: `texel_offset` is affine and increasing in
+/// `y`, and its only `y` bound is `y < height`, so the largest `y` is the one
+/// that can fail and checking it checks them all.
+fn linear_rect(
     t: &LinearTextureLevel,
     origin: Point,
     row_bytes: u64,
     row_count: u64,
-    buf: &[u8],
-    allowed: crate::runtime::gva_view::WindowPages<'_>,
-) -> Result<bool, BlitStatus> {
-    if row_count < 2 || row_bytes == 0 {
-        // One row is what the row path already does in one walk, so there is
-        // nothing to hoist and a map/unmap pair would be pure cost.
-        return Ok(false);
-    }
+    site: &'static str,
+) -> Result<(u64, RectStride), BlitStatus> {
     let Point { x: ox, y: oy, z: oz } = origin;
-    let mut offsets = Vec::with_capacity(row_count as usize);
-    for y in 0..row_count {
-        let row_y = oy
-            .checked_add(y)
-            .ok_or_else(|| br(BlitStatus::Bounds, "wr_rect_y_overflow"))?;
-        offsets.push(
-            t.texel_offset(ox, row_y, oz)
-                .ok_or_else(|| br(BlitStatus::Bounds, "wr_rect_texel_oob"))?,
-        );
-    }
-    // `min`/`max` rather than first/last: the addresses are whatever
-    // `texel_offset` produced, and a level this device does not currently emit
-    // could produce them in any order. Taking the extremes is total.
-    let (lo, hi) = offsets.iter().fold((u64::MAX, 0u64), |(lo, hi), &o| {
-        (lo.min(o), hi.max(o))
-    });
-    let span = hi
-        .checked_sub(lo)
-        .and_then(|d| d.checked_add(row_bytes))
-        .ok_or_else(|| br(BlitStatus::Bounds, "wr_rect_span_range"))?;
-    let base_gva = t
+    let last_y = oy
+        .checked_add(row_count.saturating_sub(1))
+        .ok_or_else(|| br(BlitStatus::Bounds, site))?;
+    let first = t
+        .texel_offset(ox, oy, oz)
+        .ok_or_else(|| br(BlitStatus::Bounds, site))?;
+    t.texel_offset(ox, last_y, oz)
+        .ok_or_else(|| br(BlitStatus::Bounds, site))?;
+    let gva = t
         .base_gva
-        .checked_add(lo)
-        .ok_or_else(|| br(BlitStatus::Bounds, "wr_rect_gva_overflow"))?;
-    let Some(view) =
-        crate::runtime::gva_view::map_fresh_span_within(state, host, task_id, base_gva, span, allowed)
-    else {
-        crate::runtime::drain::note_store_route("blit_rect_linear_no_view");
-        return Ok(false);
-    };
-    if view.avail < span as usize {
-        crate::runtime::gva_view::unmap_fresh_span(host, view);
-        crate::runtime::drain::note_store_route("blit_rect_linear_short_view");
-        return Ok(false);
-    }
-    for (y, off) in offsets.iter().enumerate() {
-        let at = (y as u64 * row_bytes) as usize;
-        let dst_off = (off - lo) as usize;
-        // SAFETY: `view.ptr` is writable for `view.avail >= span` bytes, and
-        // `dst_off + row_bytes <= span` because `off <= hi` and
-        // `span == hi - lo + row_bytes`. The source slice is bounds-checked by
-        // the caller's `need <= buf.len()`.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                buf[at..at + row_bytes as usize].as_ptr(),
-                view.ptr.add(dst_off),
-                row_bytes as usize,
-            );
-        }
-    }
-    crate::runtime::gva_view::unmap_fresh_span(host, view);
-    crate::runtime::drain::note_store_route("blit_rect_linear_one_view");
-    crate::runtime::drain::note_store_route_n("blit_rect_linear_rows_hoisted", row_count - 1);
-    Ok(true)
+        .checked_add(first)
+        .ok_or_else(|| br(BlitStatus::Bounds, site))?;
+    let rect = RectStride::new(t.row_stride, row_bytes, row_count)
+        .ok_or_else(|| br(BlitStatus::Bounds, site))?;
+    Ok((gva, rect))
 }
 
 /// Write a whole `row_bytes`-wide, `row_count`-tall rectangle at `origin` from
@@ -1393,25 +1332,14 @@ fn write_texture_rect<M: HostMemory + HostOps>(
     }
     match tex {
         TextureBacking::Linear(t) => {
-            if write_linear_rect_through_one_view(
-                state, host, task_id, t, origin, row_bytes, row_count, buf, allowed,
-            )? {
-                return Ok(());
-            }
-            for y in 0..row_count {
-                let at = (y * row_bytes) as usize;
-                write_texture_row(
-                    state,
-                    host,
-                    task_id,
-                    tex,
-                    origin,
-                    y,
-                    row_bytes,
-                    &buf[at..at + row_bytes as usize],
-                    allowed,
-                )?;
-            }
+            let (gva, rect) = linear_rect(t, origin, row_bytes, row_count, "wr_rect_linear_shape")?;
+            crate::runtime::gva_view::write_rect_within(state, host, task_id, gva, rect, buf, allowed)
+                .map_err(|_| br(BlitStatus::GuestIo, "wr_rect_linear_io"))?;
+            crate::runtime::drain::note_store_route("blit_rect_linear_walk");
+            crate::runtime::drain::note_store_route_n(
+                "blit_rect_linear_rows_hoisted",
+                row_count.saturating_sub(1),
+            );
             Ok(())
         }
         TextureBacking::Type11(t) => {

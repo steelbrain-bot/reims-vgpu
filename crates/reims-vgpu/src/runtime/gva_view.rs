@@ -20,7 +20,7 @@ use reims_vgpu_paging::resolve::{geometry_for_page_shift, Task};
 use reims_vgpu_paging::runs::{contig_page_runs, contig_run_count};
 use reims_vgpu_paging::span::span_page_bases;
 use crate::runtime::host::{HostMemory, HostOps, MemError};
-use crate::runtime::mapper::RunCopy;
+use crate::runtime::mapper::{RectStride, RunCopy};
 
 /// Dedup key for a fragmented-span decline: the span identity plus its shape.
 ///
@@ -478,6 +478,53 @@ pub fn write_span_within<H: HostMemory + HostOps>(
         return Ok(());
     }
     span_multi(state, host, task_id, gva, RunCopy::Write(buf), allowed)
+}
+
+/// Write a packed `src` into the guest rectangle at `gva`, bounded to the pages
+/// a deferred window was armed on.
+///
+/// The rectangle is resolved **once** — one task lookup, one page-table walk,
+/// one run split — and every row is placed into the runs that walk produced.
+/// The alternative this replaces is the caller doing its own `0..row_count`
+/// loop over [`write_span_within`], which re-pays all of that per row for a
+/// destination it has already described.
+///
+/// Fragmentation is not a refusal and must not become one: guest linear
+/// textures are routinely scattered in guest-physical space, and a rectangle
+/// primitive that insisted on a single contiguous run declined **every** blit
+/// on a driven macos-13 boot while reading as though it had been installed.
+/// The run walk is what makes the general case the fast case.
+///
+/// Every other property is [`write_span_within`]'s, unchanged and for the same
+/// reasons: the walk that authorises is the walk that writes, no cached view is
+/// reused, and the pages are recorded as host-written before any byte lands.
+pub(crate) fn write_rect_within<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    task_id: u32,
+    gva: u64,
+    rect: RectStride,
+    src: &[u8],
+    allowed: WindowPages<'_>,
+) -> Result<(), MemError> {
+    let copy = RunCopy::write_rect(src, rect).ok_or(MemError::BadArgs)?;
+    span_multi(state, host, task_id, gva, copy, allowed)
+}
+
+/// Read the guest rectangle at `gva` into a packed `dst`.
+///
+/// The read counterpart of [`write_rect_within`], and the same one-walk
+/// argument. A read authorises nothing, so it carries no window.
+pub(crate) fn read_rect<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    task_id: u32,
+    gva: u64,
+    rect: RectStride,
+    dst: &mut [u8],
+) -> Result<(), MemError> {
+    let copy = RunCopy::read_rect(dst, rect).ok_or(MemError::BadArgs)?;
+    span_multi(state, host, task_id, gva, copy, None)
 }
 
 /// Ephemeral fresh-walk host mapping of `[gva, gva+length)` for guest writes.

@@ -1389,42 +1389,46 @@ fn texel_offset_math() {
     assert_eq!(t1.texel_offset(1, 2, 0), Some(0x124 + 128));
 }
 
-/// A rectangle into a linear destination resolves its pages once, and the
-/// bytes it lands are the bytes the row loop would have landed.
+/// A linear rectangle resolves its pages once and round-trips row-exact —
+/// **including when the rectangle crosses guest pages**, which is the case the
+/// whole rail is made of.
 ///
-/// The hoist is only worth anything if it actually runs, and a green suite is
-/// equally consistent with `map_fresh_span_within` declining on every call and
-/// the per-row fallback quietly doing all the work. So the counter is asserted
-/// first: `blit_rect_linear_one_view` fires once and
-/// `blit_rect_linear_rows_hoisted` counts the page-table walks the rectangle
-/// did not pay — `row_count - 1` of them.
+/// The first version of this hoist required the rectangle's span to be one
+/// contiguous guest-physical run, and on a driven macos-13 boot that declined
+/// all 617 texture-to-texture blits: guest linear textures are scattered, so
+/// the "fast path" was never taken and the counter that recorded the decline
+/// was the only sign. So the rectangle here is deliberately **eight pages
+/// wide**, and the assertion that it walked once rather than once a row is
+/// what would have caught that.
 ///
-/// The other two assertions are what makes the hoist a copy of the row path
-/// rather than a second rule about linear layout. Every row lands at the
-/// offset `texel_offset` gives it, and the stride padding between two rows is
-/// **untouched**: the row loop writes `row_bytes` and never the gap, so a
-/// hoist that wrote `span` contiguous bytes would pass a naive round-trip and
-/// still destroy whatever the guest kept there.
+/// The padding assertion is the other half. The row path writes `row_bytes`
+/// and never the gap between two rows, so a rectangle primitive that filled
+/// its span contiguously would round-trip every pixel correctly and destroy
+/// whatever the guest kept in the stride padding.
 #[test]
 fn a_linear_rectangle_lands_row_exact_through_one_page_table_walk() {
     use crate::runtime::drain::census::store_route_count;
 
     let (mut host, mut state) = blit_device();
-    // GVA 0x4000 is root PTE index 1, which `blit_device` backed with its own
-    // one-page RAM range. The whole rectangle sits inside that page, so the
-    // packed alias is expressible on every host this suite runs on.
-    let base_gva = 0x4000u64;
-    let gpa = 5u64 << PAGE_SHIFT_ARM64E;
-    let (row_stride, row_bytes, row_count) = (64u64, 32u64, 4u64);
+    // `blit_device` backs root PTE indices 0..8 with their own one-page RAM
+    // ranges, so a span from GVA 0 upwards is eight separate guest-physical
+    // pages: fragmented in exactly the way the real rail is.
+    let page = 1u64 << PAGE_SHIFT_ARM64E;
+    let base_gva = 0u64;
+    let pages = 8u64;
+    let (row_stride, row_bytes) = (page / 2, page / 4);
+    let row_count = pages * 2;
 
-    // Padding the copy must not touch, laid down through the GPA store rather
-    // than through any view this test is about to exercise.
-    let pad = vec![0xeeu8; row_stride as usize * row_count as usize];
-    host.write_gpa(gpa, &pad).expect("seed the destination page");
+    let pad = vec![0xeeu8; (row_stride * row_count) as usize];
+    for p in 0..pages {
+        let at = (p * page) as usize;
+        host.write_gpa((4 + p) << PAGE_SHIFT_ARM64E, &pad[at..at + page as usize])
+            .expect("seed the destination pages");
+    }
 
     let t = LinearTextureLevel {
         base_gva,
-        alloc_size: 0x4000,
+        alloc_size: pages * page,
         level_offset: 0,
         row_stride,
         slice_stride: 0,
@@ -1436,10 +1440,11 @@ fn a_linear_rectangle_lands_row_exact_through_one_page_table_walk() {
         pixel_format: MTL_FORMAT_RGBA8_UNORM,
     };
     let tex = TextureBacking::Linear(t);
-    let src: Vec<u8> = (0..(row_bytes * row_count) as u8).collect();
-    let allowed: std::collections::HashSet<u64> = [gpa].into_iter().collect();
+    let src: Vec<u8> = (0..(row_bytes * row_count)).map(|i| (i % 251) as u8).collect();
+    let allowed: std::collections::HashSet<u64> =
+        (0..pages).map(|p| (4 + p) << PAGE_SHIFT_ARM64E).collect();
 
-    let views_before = store_route_count("blit_rect_linear_one_view");
+    let walks_before = store_route_count("blit_rect_linear_walk");
     let rows_before = store_route_count("blit_rect_linear_rows_hoisted");
     write_texture_rect(
         &mut state,
@@ -1452,11 +1457,11 @@ fn a_linear_rectangle_lands_row_exact_through_one_page_table_walk() {
         &src,
         Some(&allowed),
     )
-    .expect("a rectangle inside one authorised page must land");
+    .expect("a fragmented rectangle inside the authorised pages must land");
     assert_eq!(
-        store_route_count("blit_rect_linear_one_view") - views_before,
+        store_route_count("blit_rect_linear_walk") - walks_before,
         1,
-        "the rectangle must resolve its destination once, not once per row"
+        "the rectangle must walk the page table once, not once per row"
     );
     assert_eq!(
         store_route_count("blit_rect_linear_rows_hoisted") - rows_before,
@@ -1465,7 +1470,11 @@ fn a_linear_rectangle_lands_row_exact_through_one_page_table_walk() {
     );
 
     let mut got = vec![0u8; (row_stride * row_count) as usize];
-    host.read_gpa(gpa, &mut got).expect("read the landed page");
+    for p in 0..pages {
+        let at = (p * page) as usize;
+        host.read_gpa((4 + p) << PAGE_SHIFT_ARM64E, &mut got[at..at + page as usize])
+            .expect("read the landed pages");
+    }
     for y in 0..row_count {
         let at = (y * row_stride) as usize;
         assert_eq!(
@@ -1480,6 +1489,27 @@ fn a_linear_rectangle_lands_row_exact_through_one_page_table_walk() {
             "row {y}'s stride padding is not the copy's to write"
         );
     }
+
+    // And back, through the read direction's own single walk.
+    let reads_before = store_route_count("blit_rect_linear_read_walk");
+    let mut back = vec![0u8; (row_bytes * row_count) as usize];
+    read_texture_rect(
+        &mut state,
+        &mut host,
+        1,
+        &tex,
+        Point { x: 0, y: 0, z: 0 },
+        row_bytes,
+        row_count,
+        &mut back,
+    )
+    .expect("the same rectangle must read back");
+    assert_eq!(
+        store_route_count("blit_rect_linear_read_walk") - reads_before,
+        1,
+        "the read direction must walk once too"
+    );
+    assert_eq!(back, src, "the rectangle must round-trip byte for byte");
 }
 
 /// Geometry this device cannot measure must refuse the copy, never hand the
