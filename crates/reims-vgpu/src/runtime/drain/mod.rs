@@ -5350,17 +5350,13 @@ pub fn signal_display_vbl<H: HostMemory + HostOps>(
 /// `creates=74 allocs=0` rules out the allocation churn that phase's own doc
 /// names as its cost. What is left in there and scales with content is
 /// [`crate::backend::vulkan::engine::pools`]'s sampled-cache lookup, which
-/// fingerprints the **whole** incoming blob with two SipHash passes on every
-/// call that does not take the identity fast path.
+/// fingerprints the **whole** incoming blob with two SipHash passes before an
+/// exact retained-byte comparison.
 ///
 /// `sampled_cache_hit_bytes` is exactly the byte count fed to that fingerprint
-/// on the hit path, and `sampled_identity_hits` is the count that skipped it
-/// entirely. Together they turn "the cache is working, hits=122 misses=0" —
-/// which is what the line said, and which reads as nothing to fix — into a
-/// GB/s figure that can be compared against SipHash's throughput. Neither can
-/// be derived from the counts alone: 122 hits over 4 KiB blobs and 122 over
-/// 8 MiB blobs are three orders of magnitude apart and the line printed the
-/// same number for both.
+/// on the hit path. It turns "the cache is working, hits=122 misses=0" into a
+/// byte-rate figure: 122 hits over 4 KiB blobs and 122 over 8 MiB blobs are
+/// three orders of magnitude apart.
 ///
 /// `drain_duty` established that 96-99% of the saturated drain second is
 /// `draw_us`, at 1.5-7 ms per draw — orders of magnitude more than a draw's CPU

@@ -1097,6 +1097,22 @@ impl GuestTexels {
             Self::Gathered(_) | Self::Scratch(_) => 0,
         }
     }
+
+    fn is_imported(&self) -> bool {
+        matches!(self, Self::Imported { .. })
+    }
+}
+
+/// Make host writes through an imported guest pointer available to a GPU read.
+///
+/// Guest CPU writes are host writes from Vulkan's point of view even though
+/// they were not issued through this crate. The imported memory type is
+/// host-coherent, so no mapped-range flush is owed; the execution and memory
+/// dependency is still required before a transfer or shader reads the bytes.
+fn imported_guest_read_barrier(dst_access: vk::AccessFlags) -> vk::MemoryBarrier<'static> {
+    vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::HOST_WRITE)
+        .dst_access_mask(dst_access)
 }
 
 /// The source of a guest-page attachment LOAD after target admission.
@@ -1127,10 +1143,9 @@ enum PreparedSampled {
     /// travel to become a buffer the copy can name.
     ///
     /// No owned CPU byte buffer exists either way, so nothing can fingerprint
-    /// this content. The slot is still retained when the producer vouched for an
-    /// identity — see [`super::types::SampledSource::GuestRuns`] — and the next
-    /// bind of the same window under the same generation binds it back through
-    /// `find_sampled_by_identity` without touching the bytes at all.
+    /// this content. The copied image remains transient; a later bind must read
+    /// the live guest pages again unless the decoded resource contract supplies
+    /// a real coherence boundary.
     GuestGather {
         binding: u32,
         array_element: u32,
@@ -1140,8 +1155,6 @@ enum PreparedSampled {
         row_length_texels: u32,
         volume: bool,
         layers: u32,
-        /// Bytes the copy names, for cache-hit and movement accounting.
-        gathered_len: usize,
     },
     Cached {
         binding: u32,
@@ -3934,36 +3947,12 @@ pub(crate) unsafe fn execute_draw_inner(
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             SampledSource::GuestRuns(src, vouch) => {
-                // A copy-backed producer vouches for its identity only when
-                // both halves of the guest-write witness say the window's bytes cannot have
-                // moved since the gather that filled the retained image: no
-                // guest store into the pages, and no write by this device
-                // either. So the retained image is bound with nothing read and
-                // nothing compared — which is the whole point, since reading
-                // the bytes to compare them is the cost being removed.
-                if let Some(image) = pools.find_gathered_sampled(
-                    SampledKey::of(resource),
-                    resource.identity,
-                    resource.resource_lifetime.as_ref(),
-                    counters,
-                ) {
-                    counters.note_sampled_gather_skipped(src.total_len);
-                    sampled.push(PreparedSampled::Cached {
-                        binding: resource.binding,
-                        array_element: resource.array_element,
-                        image,
-                    });
-                    continue;
-                }
-                // The elision did not fire, and the two reasons it can fail want
-                // opposite fixes: no vouch to spend, or a vouch with nothing
-                // left to spend it on. Taken here because this is the only point
-                // holding both the witness's answer and the cache's.
-                //
-                // The witness's answer is `vouch`; the identity names the
-                // content it judged; `Fresh` correctly names the required
-                // conservative gather when there is no retained copied image.
-                counters.note_sampled_gather_unskipped(*vouch);
+                // Guest pages are live storage, not immutable content. Until
+                // the decoded per-subresource coherence contract can prove a
+                // retained copy current, every bind gathers the bytes again.
+                // A producer-assigned name is not content evidence and must not
+                // select an older copied image.
+                counters.note_sampled_gather_witness(*vouch);
                 let img = pools.acquire_sampled(ctx, SampledKey::of(resource), counters)?;
                 // Everything from here to the end of this arm moves bytes;
                 // everything above it in `AcquireSampled` decides which image
@@ -4024,7 +4013,6 @@ pub(crate) unsafe fn execute_draw_inner(
                     row_length_texels: src.row_length_texels,
                     volume: resource.volume,
                     layers: resource.layers,
-                    gathered_len: src.total_len as usize,
                 });
                 // Back to the deciding half for the next texture in the loop.
                 phase.enter(super::draw_phase::Phase::AcquireSampled);
@@ -4595,12 +4583,10 @@ pub(crate) unsafe fn execute_draw_inner(
     // Scattered guest buffer windows, assembled into their device-local
     // destinations before anything reads them.
     //
-    // No HOST→TRANSFER barrier: the source is the guest's own RAM through the
-    // RAMBlock import and nothing in this process wrote it, and the destination
-    // is device-local memory only the GPU touches. What the copies *do* owe is
-    // a barrier before the draw reads them, which follows the loop — one for
-    // all of them, because a per-buffer barrier would submit N of them to
-    // express the same dependency.
+    // The sources are guest RAM imported from QEMU's host mapping. Guest CPU
+    // stores are HOST writes in Vulkan's memory model even though this crate did
+    // not issue them. Publish those writes before either the transfer copies or
+    // the compute gather reads the sources.
     //
     // Either form lands byte-identical bytes; which one ran decides only this
     // barrier's source scope, and `buffer_gather_dispatches` says which it was.
@@ -4630,6 +4616,29 @@ pub(crate) unsafe fn execute_draw_inner(
             None => false,
         }
     };
+    if !guest_gathers.is_empty() {
+        let (dst_stage, dst_access) = if gather_dispatched {
+            (
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::AccessFlags::SHADER_READ,
+            )
+        } else {
+            (
+                vk::PipelineStageFlags::TRANSFER,
+                vk::AccessFlags::TRANSFER_READ,
+            )
+        };
+        let barrier = [imported_guest_read_barrier(dst_access)];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::HOST,
+            dst_stage,
+            vk::DependencyFlags::empty(),
+            &barrier,
+            &[],
+            &[],
+        );
+    }
     if !gather_dispatched {
         for gather in &guest_gathers {
             for (source, copies) in &gather.sources {
@@ -4878,11 +4887,9 @@ pub(crate) unsafe fn execute_draw_inner(
     // from the CPU-origin loop above only in `row_length_texels` striding over
     // guest row padding (0 = tight rows) and in the copy's `bufferOffset`.
     //
-    // No HOST→TRANSFER barrier on either arm. For a scratch, the reason is the
-    // one the loop above relies on: host writes made before `vkQueueSubmit` are
-    // automatically visible to the device. For an import there is no host write
-    // at all — the bytes are the guest's, already in memory the device reads
-    // through the fd, and nothing in this process touched them.
+    // Scratch writes made before `vkQueueSubmit` are automatically visible to
+    // the device. Direct imports are different: the guest wrote through QEMU's
+    // host pointer, so publish those HOST writes before the transfer reads it.
     for image in &sampled {
         let PreparedSampled::GuestGather {
             image: img,
@@ -4896,6 +4903,18 @@ pub(crate) unsafe fn execute_draw_inner(
             continue;
         };
         unsafe { outside_pass.before_record(PassObstacle::SampledUpload, pools, &ctx.device, cb) };
+        if source.is_imported() {
+            let barrier = [imported_guest_read_barrier(vk::AccessFlags::TRANSFER_READ)];
+            ctx.device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::HOST,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &barrier,
+                &[],
+                &[],
+            );
+        }
         upload_buffer_to_sampled_image(
             ctx,
             cb,
@@ -5608,42 +5627,16 @@ pub(crate) unsafe fn execute_draw_inner(
                 image,
                 ..
             } => {
-                if let Some((SampledSource::Bytes(bytes), identity, resource_lifetime)) =
-                    sampled_resource_at(req, *binding, *array_element).map(|resource| {
-                        (
-                            &resource.source,
-                            resource.identity,
-                            resource.resource_lifetime.clone(),
-                        )
-                    })
+                if let Some((SampledSource::Bytes(bytes), resource_lifetime)) =
+                    sampled_resource_at(req, *binding, *array_element)
+                        .map(|resource| (&resource.source, resource.resource_lifetime.clone()))
                 {
                     sampled_retains.push(super::pools::SampledRetain {
                         image: image.image,
                         content: super::pools::SampledRetainContent::Bytes(bytes.clone()),
-                        identity,
                         resource_lifetime,
                     });
                 }
-            }
-            // A gather with no resource lifetime is dropped by admission. Its
-            // copied image has no contract-owned lifetime under which it could
-            // remain retained.
-            PreparedSampled::GuestGather {
-                binding,
-                array_element,
-                image,
-                gathered_len,
-                ..
-            } => {
-                let retained = sampled_resource_at(req, *binding, *array_element);
-                let identity = retained.and_then(|resource| resource.identity);
-                sampled_retains.push(super::pools::SampledRetain {
-                    image: image.image,
-                    content: super::pools::SampledRetainContent::Gathered { len: *gathered_len },
-                    identity,
-                    resource_lifetime: retained
-                        .and_then(|resource| resource.resource_lifetime.clone()),
-                });
             }
             _ => {}
         }
@@ -6396,6 +6389,15 @@ mod tests {
     // mutation, and deleted. The `debug_assert` it replaced had the same blind
     // spot and a release-build hole besides. What makes the two agree is that
     // there is one list.
+
+    #[test]
+    fn an_imported_guest_read_publishes_host_writes_to_its_consumer() {
+        for access in [vk::AccessFlags::TRANSFER_READ, vk::AccessFlags::SHADER_READ] {
+            let barrier = imported_guest_read_barrier(access);
+            assert_eq!(barrier.src_access_mask, vk::AccessFlags::HOST_WRITE);
+            assert_eq!(barrier.dst_access_mask, access);
+        }
+    }
 
     /// `bufferOffset` has a hard rule in the Vulkan spec, and this rail is the
     /// only thing that ever gives it a nonzero value: every other sampled upload

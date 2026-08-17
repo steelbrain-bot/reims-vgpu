@@ -34,51 +34,6 @@ pub(crate) struct ReadbackLease {
     pub slot_size: u64,
 }
 
-/// Whether the identity-only lookup runs, given what the environment said.
-///
-/// Split from the read below so the one thing left to get wrong is testable
-/// without an environment. [`crate::env::read`] has already folded every
-/// negative spelling into [`crate::env::Switch::Off`]; what remains is which
-/// states count as off, and `Unrecognized` must not — a mistyped value would
-/// otherwise narrow this device silently, which is the opposite of what a
-/// mistyped switch should do.
-const fn identity_lookup_on(switch: crate::env::Switch) -> bool {
-    !matches!(switch, crate::env::Switch::Off)
-}
-
-/// Whether the sampled cache's identity-only lookup is on. **Default on**; see
-/// [`crate::env::SAMPLED_IDENTITY`] for what switching it off narrows and why
-/// that arm is worth having at all.
-fn sampled_identity_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| identity_lookup_on(crate::env::read(crate::env::SAMPLED_IDENTITY).0))
-}
-
-#[cfg(test)]
-mod sampled_identity_switch {
-    use super::identity_lookup_on;
-    use crate::env::Switch;
-
-    /// Only an explicit negative spelling narrows. Enumerated rather than
-    /// sampled: a new `Switch` variant that this does not mention fails to
-    /// compile, which is what stops a third state being silently folded into
-    /// whichever arm the author happened to think of.
-    #[test]
-    fn only_an_explicit_off_switches_the_identity_lookup_off() {
-        for switch in [Switch::Unset, Switch::On, Switch::Off, Switch::Unrecognized] {
-            let expected = match switch {
-                Switch::Off => false,
-                Switch::Unset | Switch::On | Switch::Unrecognized => true,
-            };
-            assert_eq!(
-                identity_lookup_on(switch),
-                expected,
-                "{switch:?} decided the identity lookup the wrong way"
-            );
-        }
-    }
-}
-
 #[cfg(test)]
 mod pass_echo_delta_order {
     use super::super::{PassEcho, ResourcePools};
@@ -245,9 +200,7 @@ impl ResourcePools {
             ),
             attachment_snapshot_live: Vec::new(),
             sampled_cache: Vec::new(),
-            sampled_identity_index: HashMap::new(),
             sampled_cache_bytes: 0,
-            sampled_victims: std::collections::VecDeque::new(),
             storage_image_free: FreePool::new(
                 STORAGE_IMAGE_FREE_CAP_PER_KEY,
                 STORAGE_IMAGE_FREE_CAP_TOTAL,
@@ -452,74 +405,14 @@ impl ResourcePools {
     }
 
     /// Take entry `index` out of the sampled cache and update its byte gauge.
-    /// `route` is present only for a failed-submission discard; ordinary
-    /// resource deletion is not a lost cache entry and leaves no victim record.
-    fn remove_sampled_entry(
-        &mut self,
-        index: usize,
-        route: Option<SampledVictimRoute>,
-    ) -> SampledSlot {
-        let last = self.sampled_cache.len() - 1;
-        let removed_name = Self::sampled_entry_name(&self.sampled_cache[index]);
-        let moved_name = (index != last)
-            .then(|| Self::sampled_entry_name(&self.sampled_cache[last]))
-            .flatten();
+    fn remove_sampled_entry(&mut self, index: usize) -> SampledSlot {
         let evicted = self.sampled_cache.swap_remove(index);
-        if let Some(name) = removed_name {
-            if self.sampled_identity_index.get(&name) == Some(&index) {
-                self.sampled_identity_index.remove(&name);
-            }
-        }
-        if let Some(name) = moved_name {
-            if self.sampled_identity_index.get(&name) == Some(&last) {
-                self.sampled_identity_index.insert(name, index);
-            }
-        }
         self.sampled_cache_bytes = self.sampled_cache_bytes.saturating_sub(evicted.content_len);
-        if let (Some(identity), Some(route)) = (evicted.identity, route) {
-            self.sampled_victims.push_front(SampledVictim {
-                key: evicted.slot.key(),
-                identity,
-                route,
-            });
-            self.sampled_victims.truncate(SAMPLED_VICTIM_LEDGER);
-        }
         evicted.slot
     }
 
-    fn sampled_entry_name(entry: &ResidentSampledSlot) -> Option<GatheredName> {
-        Some(GatheredName {
-            key: entry.slot.key(),
-            identity: entry.identity?,
-        })
-    }
-
     fn push_sampled_entry(&mut self, entry: ResidentSampledSlot) {
-        let index = self.sampled_cache.len();
-        if let Some(name) = Self::sampled_entry_name(&entry) {
-            self.sampled_identity_index.insert(name, index);
-        }
         self.sampled_cache.push(entry);
-    }
-
-    fn set_sampled_entry_identity(
-        &mut self,
-        index: usize,
-        identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
-    ) {
-        if let Some(old) = Self::sampled_entry_name(&self.sampled_cache[index]) {
-            if self.sampled_identity_index.get(&old) == Some(&index) {
-                self.sampled_identity_index.remove(&old);
-            }
-        }
-        self.sampled_cache[index].identity = identity;
-        if let Some(new) = Self::sampled_entry_name(&self.sampled_cache[index]) {
-            self.sampled_identity_index.insert(new, index);
-        }
-    }
-
-    fn evict_sampled_entry(&mut self, index: usize, route: SampledVictimRoute) -> SampledSlot {
-        self.remove_sampled_entry(index, Some(route))
     }
 
     /// Remove entries whose serialized texture owners are all gone. The
@@ -532,49 +425,9 @@ impl ResourcePools {
             .iter()
             .position(|entry| !entry.has_live_owner())
         {
-            released.push(self.remove_sampled_entry(index, None));
+            released.push(self.remove_sampled_entry(index));
         }
         released
-    }
-
-    /// Move one serialized resource off older generations of the same producer
-    /// identity. `SampledContentIdentity::key` is the producer's stable name and
-    /// `generation` is its content revision; retaining every revision until the
-    /// resource itself is deleted confuses object lifetime with content
-    /// lifetime and keeps an unbounded history of obsolete images.
-    ///
-    /// An entry shared by another serialized resource remains live for that
-    /// owner. An entry with no owner returns to `sampled_live`, whose ordinary
-    /// seal/retire path keeps an already-recorded command buffer safe.
-    fn supersede_sampled_generation(
-        &mut self,
-        owner: &crate::model::TaskResourceLifetimeRef,
-        current: crate::backend::vulkan::engine::SampledContentIdentity,
-    ) {
-        let mut index = 0;
-        while index < self.sampled_cache.len() {
-            let superseded = self.sampled_cache[index].identity.is_some_and(|identity| {
-                identity.key == current.key && identity.generation != current.generation
-            }) && self.sampled_cache[index]
-                .owners
-                .iter()
-                .any(|held| held.id() == owner.id());
-            if !superseded {
-                index += 1;
-                continue;
-            }
-
-            self.sampled_cache[index]
-                .owners
-                .retain(|held| held.is_live() && held.id() != owner.id());
-            crate::runtime::drain::note_store_route("sampled_generation_superseded");
-            if self.sampled_cache[index].owners.is_empty() {
-                let slot = self.remove_sampled_entry(index, None);
-                self.sampled_live.push(slot);
-            } else {
-                index += 1;
-            }
-        }
     }
 
     /// Update the consecutive-settled-pass counter for maintenance and return
@@ -1659,16 +1512,8 @@ impl ResourcePools {
             admissions.is_empty() || self.open_slot_mask() & (1 << self.cur) != 0,
             "admitting while the filling command buffer's slot is invisible to dispose()"
         );
-        for _ in 0..sampled_twins_in_entry(&admissions) {
-            crate::runtime::drain::note_store_route("sampled_admit_twin_in_entry");
-        }
         for (slot, retain) in admissions {
-            self.admit_sampled_slot(
-                slot,
-                &retain.content,
-                retain.identity,
-                retain.resource_lifetime.as_ref(),
-            );
+            self.admit_sampled_slot(slot, &retain.content, retain.resource_lifetime.as_ref());
         }
     }
 
@@ -1701,7 +1546,7 @@ impl ResourcePools {
         crate::runtime::drain::note_store_route("sampled_cache_discarded");
         let mut taken = Vec::with_capacity(self.sampled_cache.len());
         while !self.sampled_cache.is_empty() {
-            taken.push(self.evict_sampled_entry(0, SampledVictimRoute::Discarded));
+            taken.push(self.remove_sampled_entry(0));
         }
         taken
     }
@@ -1906,15 +1751,13 @@ impl ResourcePools {
     /// set for the single flush-time seal. The CB stays in recording state;
     /// submit happens at [`Self::batch_flush`].
     ///
-    /// # The sampled images go to the cache here, not at the flush
+    /// # Exact-content sampled images go to the cache here, not at the flush
     ///
     /// A batch is several draws sharing one command buffer, and the next draw's
-    /// `find_gathered_sampled` runs before that buffer is
-    /// submitted. Holding the admissions until the flush therefore made every
-    /// draw of a batch miss on every window an earlier draw of the *same* batch
-    /// had already gathered — measured on macos-26 as `sampled_admit_twin_in_entry`
-    /// 3954 of 3956 duplicate admissions, each one a guest window re-imported in
-    /// full across PCIe and then discarded on arrival.
+    /// `find_cached_sampled` runs before that buffer is submitted. Publishing at
+    /// record completion lets later draws reuse only byte-equal CPU-sourced
+    /// uploads; guest-page gathers are transient because no retained bytes can
+    /// prove that a copied image still matches live storage.
     ///
     /// Publishing now is sound because the fill is *recorded* now, into the same
     /// command buffer and ahead of any consumer, and because setting
@@ -3809,108 +3652,6 @@ impl ResourcePools {
         Ok(handles)
     }
 
-    /// Bind a retained image on producer identity alone — same key, same
-    /// generation means the same bytes under the producer's coherence model, so
-    /// nothing is hashed and nothing compared.
-    ///
-    /// The only way to reach a `Gathered` entry, whose bytes were never on the
-    /// CPU to be digested.
-    ///
-    /// It is also the only bind in the sampled path that rests on evidence this
-    /// device did not read at bind time, which is why
-    /// [`crate::env::SAMPLED_IDENTITY`] can switch it off: with it off a
-    /// `Gathered` entry is unreachable and every guest-gather bind re-gathers,
-    /// which is strictly more copying and cannot reach a different image.
-    fn find_sampled_by_identity(
-        &mut self,
-        key: SampledKey,
-        identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
-        resource_lifetime: Option<&crate::model::TaskResourceLifetimeRef>,
-    ) -> Option<SampledSlot> {
-        let id = identity?;
-        let owner = resource_lifetime.filter(|owner| owner.is_live())?;
-        // Counted after the `identity?`, so the route bands the lookups this arm
-        // actually suppressed rather than every call — a bind with no identity
-        // could not have hit at any setting.
-        if !sampled_identity_enabled() {
-            crate::runtime::drain::note_store_route("sampled_identity_off");
-            return None;
-        }
-        self.supersede_sampled_generation(owner, id);
-        let name = GatheredName { key, identity: id };
-        let index = self.sampled_identity_index.get(&name).copied()?;
-        let Some(entry) = self.sampled_cache.get_mut(index) else {
-            self.sampled_identity_index.remove(&name);
-            return None;
-        };
-        if !entry.has_live_owner() || Self::sampled_entry_name(entry) != Some(name) {
-            if self.sampled_identity_index.get(&name) == Some(&index) {
-                self.sampled_identity_index.remove(&name);
-            }
-            return None;
-        }
-        entry.retain_owner(owner);
-        entry.last_touch_ms = self.idle_clock_ms;
-        let handles = entry.slot.handles();
-        Some(handles)
-    }
-
-    /// The guest-gather rail's lookup: the complete image key, and identity as
-    /// the only content evidence there is.
-    pub(crate) fn find_gathered_sampled(
-        &mut self,
-        key: SampledKey,
-        identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
-        resource_lifetime: Option<&crate::model::TaskResourceLifetimeRef>,
-        counters: &EngineCounters,
-    ) -> Option<SampledSlot> {
-        let Some(handles) = self.find_sampled_by_identity(key, identity, resource_lifetime) else {
-            // The ledger distinguishes an entry invalidated by a failed
-            // submission from content this cache has never held.
-            if let Some(id) = identity {
-                self.note_sampled_reach(key, id);
-            }
-            return None;
-        };
-        counters
-            .sampled_identity_hits
-            .fetch_add(1, Ordering::Relaxed);
-        Some(handles)
-    }
-
-    /// Say whether this miss names an entry invalidated by failed submission.
-    fn note_sampled_reach(
-        &self,
-        key: SampledKey,
-        identity: crate::backend::vulkan::engine::SampledContentIdentity,
-    ) {
-        // The two halves of a cache entry's name fail for different reasons, so
-        // the walk asks about them separately. A window whose content identity
-        // the ledger remembers under a *different* `SampledKey` did not lose a
-        // race with the cache — it changed geometry, format or swizzle between
-        // the gather that filled the image and the bind that wanted it back, and
-        // no cache keyed on the image can hold both. Folding that into
-        // `beyond_ledger` says "never cached", which is true of the pair and
-        // misleading about the window.
-        let mut identity_elsewhere = false;
-        for victim in &self.sampled_victims {
-            if victim.identity != identity {
-                continue;
-            }
-            if victim.key != key {
-                identity_elsewhere = true;
-                continue;
-            }
-            crate::runtime::drain::note_store_route(victim.route.route());
-            return;
-        }
-        crate::runtime::drain::note_store_route(if identity_elsewhere {
-            "sampled_reach_identity_other_key"
-        } else {
-            "sampled_reach_beyond_ledger"
-        });
-    }
-
     pub(crate) fn find_cached_sampled(
         &mut self,
         key: SampledKey,
@@ -3925,12 +3666,6 @@ impl ResourcePools {
         // `SAMPLED_VICTIM_LEDGER` and reads `beyond_ledger` 6 704 times on a
         // driven macos-26 boot.
         super::sampled_working_set::note_wanted(key, identity, content.len());
-        if let Some(handles) = self.find_sampled_by_identity(key, identity, resource_lifetime) {
-            counters
-                .sampled_identity_hits
-                .fetch_add(1, Ordering::Relaxed);
-            return Some(handles);
-        }
         let content_hash = sampled_content_hash(content);
         // The digest narrows the walk to one candidate; the retained bytes are
         // what decide the hit. `ResidentSampledSlot::content` carries why the
@@ -3953,11 +3688,6 @@ impl ResourcePools {
                 .fetch_add(1, Ordering::Relaxed);
             return None;
         };
-        // Same content re-presented under a new identity/generation: adopt it
-        // so the fast path serves the follow-up draws.
-        if identity.is_some() {
-            self.set_sampled_entry_identity(index, identity);
-        }
         let entry = &mut self.sampled_cache[index];
         entry.retain_owner(owner);
         entry.last_touch_ms = self.idle_clock_ms;
@@ -3981,10 +3711,9 @@ impl ResourcePools {
         &mut self,
         slot: SampledSlot,
         content: &SampledRetainContent,
-        identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
         resource_lifetime: Option<&crate::model::TaskResourceLifetimeRef>,
     ) {
-        self.admit_sampled_entry(slot, content, identity, resource_lifetime);
+        self.admit_sampled_entry(slot, content, resource_lifetime);
     }
 
     /// Device-free half of [`Self::admit_sampled_slot`], split out so admission
@@ -3999,7 +3728,6 @@ impl ResourcePools {
         &mut self,
         slot: SampledSlot,
         content: &SampledRetainContent,
-        identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
         resource_lifetime: Option<&crate::model::TaskResourceLifetimeRef>,
     ) {
         let Some(owner) = resource_lifetime.filter(|owner| owner.is_live()) else {
@@ -4007,9 +3735,6 @@ impl ResourcePools {
             self.sampled_live.push(slot);
             return;
         };
-        if let Some(identity) = identity {
-            self.supersede_sampled_generation(owner, identity);
-        }
         let (fingerprint, retained, content_len) = match content {
             // The `Arc` is cloned rather than the bytes copied: the retire path
             // already holds one, so recognising this entry by content later
@@ -4019,24 +3744,6 @@ impl ResourcePools {
                 Some(bytes.clone()),
                 bytes.len(),
             ),
-            // Nothing hashed the bytes, so nothing can recognise this image by
-            // them. An entry with no identity to be found under would be
-            // unreachable dead weight, so it is not admitted.
-            //
-            // The identity-only lookup being switched off makes *every*
-            // `Gathered` entry unreachable in exactly the same sense, so the
-            // same rule applies. Without this the ablation arm would keep
-            // filling the cache with entries nothing can find and evicting the
-            // content-compare entries that still work — measuring an
-            // accidentally poisoned cache rather than the arm asked for.
-            SampledRetainContent::Gathered { len } => {
-                if identity.is_none() || !sampled_identity_enabled() {
-                    crate::runtime::drain::note_store_route("sampled_admit_no_identity");
-                    self.sampled_live.push(slot);
-                    return;
-                }
-                (SampledFingerprint::Gathered, None, *len)
-            }
         };
         // Deduplication asks the same question a lookup does, so it has to
         // answer it the same way: a fingerprint match proposes a duplicate and
@@ -4047,22 +3754,10 @@ impl ResourcePools {
             entry.has_live_owner()
                 && entry.slot.key() == slot.key()
                 && entry.fingerprint == fingerprint
-                && match fingerprint {
-                    // Every `Gathered` fingerprint is equal to every other, so
-                    // identity is the only thing separating two windows that
-                    // gathered different pixels.
-                    SampledFingerprint::Gathered => entry.identity == identity,
-                    // The bytes decide, as on the lookup path.
-                    SampledFingerprint::Content(_) => {
-                        entry.content.as_deref() == retained.as_deref()
-                    }
-                }
+                && entry.content.as_deref() == retained.as_deref()
         });
         if let Some(index) = duplicate {
             crate::runtime::drain::note_store_route("sampled_admit_duplicate");
-            if identity.is_some() {
-                self.set_sampled_entry_identity(index, identity);
-            }
             let existing = &mut self.sampled_cache[index];
             existing.retain_owner(owner);
             self.sampled_live.push(slot);
@@ -4076,7 +3771,6 @@ impl ResourcePools {
             fingerprint,
             content: retained,
             content_len,
-            identity,
             owners: vec![owner.clone()],
             last_touch_ms: touch,
         });
@@ -4116,52 +3810,6 @@ fn take_retained_slots(
         }
     }
     taken
-}
-
-/// Band the duplicate admissions that no publication order could have avoided.
-///
-/// `sampled_admit_duplicate` sums two populations that want opposite fixes, and
-/// nothing else can tell them apart:
-///
-/// - **A twin inside this entry.** Two gathers of one guest window recorded
-///   before either was published — a window bound at two slots of one draw, or
-///   two draws of one batch, since a batch publishes nothing until it flushes.
-///   Both are fixed by publishing earlier, and the batch half needs a rollback
-///   for a submit that fails after its entries are in the cache.
-/// - **A twin from an earlier entry.** The window was already in the cache when
-///   this gather's bind looked, and `find_gathered_sampled` did not find it.
-///   The lookup and the admit ask the same `(key, identity)` question, so that
-///   should be impossible — a reading here is a real defect (a recycled slot
-///   whose key differs from the one requested, or an eviction between the two),
-///   and it is worth more than the whole batch case.
-///
-/// The counter names the first. The second is `sampled_admit_duplicate` minus
-/// it, which is why this is emitted per occurrence rather than per entry.
-///
-/// Returns the count so the selection is testable without a route registry;
-/// emitting is the caller's.
-fn sampled_twins_in_entry(admissions: &[(SampledSlot, SampledRetain)]) -> usize {
-    // Linear over a list that is one entry's worth of textures — a handful,
-    // capped by BATCH_MAX_DRAWS times the bindings of one draw.
-    let mut named: Vec<GatheredName> = Vec::new();
-    let mut twins = 0;
-    for (slot, retain) in admissions {
-        // An admission with no identity is never a duplicate: the admit drops
-        // it before the dedup test, because nothing could find it again.
-        let Some(identity) = retain.identity else {
-            continue;
-        };
-        let name = GatheredName {
-            key: slot.key(),
-            identity,
-        };
-        if named.contains(&name) {
-            twins += 1;
-        } else {
-            named.push(name);
-        }
-    }
-    twins
 }
 
 /// Why a readback allocation is slower than the class asked for.
@@ -4314,67 +3962,6 @@ mod recycle_tests {
         }
     }
 
-    /// [`GatheredName`] decides when two gathers are one window, and this is the
-    /// only test of that equality.
-    ///
-    /// It is worth more than the counter it is written against. The same
-    /// equality is what `exec`'s within-draw reuse binds on, where getting it
-    /// wrong is not a miscount but **one surface's pixels sampled for
-    /// another's** — and a screenshot of a desktop with the wrong window content
-    /// in one layer is exactly the class no assertion in this crate would catch.
-    ///
-    /// Four things it must get right, each a different wrong answer: a repeat
-    /// under one name is one window; the same geometry under a different
-    /// producer identity is two windows and sharing them is the corruption; one
-    /// identity at two geometries cannot share an image either, because the key
-    /// is what picks the image; and an admission with no identity is never a
-    /// duplicate, because the admit drops it before its dedup test ever runs and
-    /// the reuse declines it for the same reason.
-    #[test]
-    fn only_a_repeated_name_inside_one_entry_counts_as_a_twin() {
-        let id = |k: u64| crate::backend::vulkan::engine::SampledContentIdentity {
-            key: k,
-            generation: 1,
-        };
-        let retain = |identity| SampledRetain {
-            image: vk::Image::null(),
-            content: SampledRetainContent::Gathered { len: 4096 },
-            identity,
-            resource_lifetime: None,
-        };
-        let entry = |w, identity| (null_slot(w, 64), retain(identity));
-
-        assert_eq!(
-            sampled_twins_in_entry(&[entry(64, Some(id(1))), entry(64, Some(id(1)))]),
-            1,
-            "one window gathered twice inside one entry is one avoidable gather"
-        );
-        assert_eq!(
-            sampled_twins_in_entry(&[entry(64, Some(id(1))), entry(64, Some(id(2)))]),
-            0,
-            "same geometry, different producer identity: two windows, neither avoidable"
-        );
-        assert_eq!(
-            sampled_twins_in_entry(&[entry(64, Some(id(1))), entry(96, Some(id(1)))]),
-            0,
-            "one identity at two geometries cannot share an image, so neither is a twin"
-        );
-        assert_eq!(
-            sampled_twins_in_entry(&[entry(64, None), entry(64, None)]),
-            0,
-            "an unnamed gather is never admitted, so it can never be a duplicate"
-        );
-        assert_eq!(
-            sampled_twins_in_entry(&[
-                entry(64, Some(id(1))),
-                entry(64, Some(id(1))),
-                entry(64, Some(id(1))),
-            ]),
-            2,
-            "three gathers of one window are two gathers that need not have happened"
-        );
-    }
-
     /// A cache holding entries a failed submission promised to fill is emptied,
     /// and emptied completely — the entries, the bytes, and the answers.
     ///
@@ -4384,47 +3971,27 @@ mod recycle_tests {
     /// undo, so each of the three things it must leave behind is asserted
     /// separately:
     ///
-    /// - **No entry answers a bind.** An image the GPU never wrote is undefined
-    ///   content, and binding it is the visual corruption this exists to stop.
     /// - **The bytes go back to zero.** The gauge follows the retained images.
-    /// - **The ledger says why.** A failed publication remains distinguishable
-    ///   from content the cache never held.
     #[test]
-    fn a_discarded_cache_leaves_no_entry_no_bytes_and_a_reason() {
+    fn a_discarded_cache_leaves_no_entry_and_no_bytes() {
         let mut pools = ResourcePools::new();
-        let counters = EngineCounters::default();
         let resource = std::sync::Arc::new(crate::model::TaskResource::new(
             Default::default(),
             std::sync::Arc::from([]),
         ));
         let owner = resource.lifetime_ref();
-        let named = |k: u64| crate::backend::vulkan::engine::SampledContentIdentity {
-            key: k,
-            generation: 1,
-        };
 
-        let mut keys = Vec::new();
         for i in 0..3u32 {
             let slot = null_slot(16 + i, 16);
-            keys.push((slot.key(), named(i as u64)));
             pools.push_sampled_entry(ResidentSampledSlot {
                 slot,
-                fingerprint: SampledFingerprint::Gathered,
-                content: None,
+                fingerprint: SampledFingerprint::Content(i as u128),
+                content: Some(std::sync::Arc::new(vec![i as u8; 4096])),
                 content_len: 4096,
-                identity: Some(named(i as u64)),
                 owners: vec![owner.clone()],
                 last_touch_ms: 0,
             });
             pools.sampled_cache_bytes += 4096;
-        }
-        for (key, id) in &keys {
-            assert!(
-                pools
-                    .find_gathered_sampled(*key, Some(*id), Some(&owner), &counters)
-                    .is_some(),
-                "the entries have to be bindable first, or the test proves nothing"
-            );
         }
 
         let taken = pools.take_whole_sampled_cache();
@@ -4433,21 +4000,6 @@ mod recycle_tests {
         assert_eq!(
             pools.sampled_cache_bytes, 0,
             "the byte accounting follows the entries out"
-        );
-        for (key, id) in &keys {
-            assert!(
-                pools
-                    .find_gathered_sampled(*key, Some(*id), Some(&owner), &counters)
-                    .is_none(),
-                "an image no command buffer filled must not answer a bind"
-            );
-        }
-        assert!(
-            pools
-                .sampled_victims
-                .iter()
-                .all(|v| v.route == SampledVictimRoute::Discarded),
-            "a discarded window is neither a capacity victim nor an aged one"
         );
         assert_eq!(
             pools.take_whole_sampled_cache().len(),
@@ -4529,80 +4081,6 @@ mod recycle_tests {
         );
     }
 
-    /// A window gathered by a submission still in flight is bindable by the very
-    /// next draw, and is bindable exactly once.
-    ///
-    /// Two halves, and each of them is a different defect.
-    ///
-    /// The cache must hold the image **before any fence signals**. A rail that
-    /// waits a millisecond for a ring slot binds one window several times inside
-    /// one slot's life, and every bind that misses re-gathers the whole window:
-    /// measured on the macos-26 rail as 58.9 GB of guest texels in one driven
-    /// boot, 59 % of them thrown away on arrival as `sampled_admit_duplicate`.
-    /// Nothing in this test waits a fence or retires a slot, which is the point.
-    ///
-    /// And the retire bag must **not** still hold it. An image that is both a
-    /// cache entry and a pending recycle is handed to a later `acquire_sampled`
-    /// while the cache still answers binds with it, and that draw overwrites
-    /// content another draw is sampling.
-    #[test]
-    fn a_gathered_window_is_bindable_before_its_fence_and_is_not_also_recycled() {
-        let mut pools = ResourcePools::new();
-        let counters = EngineCounters::default();
-        let identity = crate::backend::vulkan::engine::SampledContentIdentity {
-            key: 0x51,
-            generation: 3,
-        };
-        let resource = std::sync::Arc::new(crate::model::TaskResource::new(
-            Default::default(),
-            std::sync::Arc::from([]),
-        ));
-        let owner = resource.lifetime_ref();
-
-        let slot = null_slot(64, 64);
-        let key = slot.key();
-        let image = slot.image;
-        // What `acquire_sampled` leaves behind for a cold guest gather.
-        pools.sampled_live.push(slot);
-        assert!(
-            pools
-                .find_gathered_sampled(key, Some(identity), Some(&owner), &counters)
-                .is_none(),
-            "nothing has filled this window yet"
-        );
-
-        let sealed = pools.seal_entry(
-            Vec::new(),
-            vec![SampledRetain {
-                image,
-                content: SampledRetainContent::Gathered { len: 64 * 64 * 4 },
-                identity: Some(identity),
-                resource_lifetime: Some(owner.clone()),
-            }],
-        );
-        assert!(
-            sealed.cleanup.sampled.is_empty(),
-            "an image the cache is about to own must not also be in the recycle bag"
-        );
-        // The device-free half of what `finish_entry_async` does at submit.
-        for (slot, retain) in sealed.admissions {
-            pools.admit_sampled_entry(
-                slot,
-                &retain.content,
-                retain.identity,
-                retain.resource_lifetime.as_ref(),
-            );
-        }
-
-        assert!(
-            pools
-                .find_gathered_sampled(key, Some(identity), Some(&owner), &counters)
-                .is_some(),
-            "the next draw must find the window the in-flight submission gathered, \
-             or it imports every byte of it a second time"
-        );
-    }
-
     /// Two different textures filed under one digest stay two textures.
     ///
     /// A natural 128-bit collision is not something a test can produce, so this
@@ -4633,7 +4111,6 @@ mod recycle_tests {
             fingerprint: SampledFingerprint::Content(sampled_content_hash(&incoming)),
             content: Some(std::sync::Arc::new(retained.clone())),
             content_len: retained.len(),
-            identity: None,
             owners: vec![owner.clone()],
             last_touch_ms: 0,
         });
@@ -4674,7 +4151,6 @@ mod recycle_tests {
             fingerprint: SampledFingerprint::Content(sampled_content_hash(&content)),
             content: Some(std::sync::Arc::new(content.clone())),
             content_len: content.len(),
-            identity: None,
             owners: vec![owner.clone()],
             last_touch_ms: 0,
         });
@@ -4938,7 +4414,6 @@ mod recycle_tests {
                 // no bytes to retain beside it.
                 content: None,
                 content_len: len,
-                identity: None,
                 owners: vec![owner.clone()],
                 last_touch_ms: touch,
             });
@@ -4961,67 +4436,6 @@ mod recycle_tests {
         );
         assert!(pools.sampled_cache.is_empty());
         assert_eq!(pools.sampled_cache_bytes, 0);
-    }
-
-    /// A mutable producer's generation is the lifetime of its retained pixels;
-    /// the serialized resource may outlive many such generations.
-    #[test]
-    fn sampled_generation_replaces_only_that_owners_prior_content() {
-        let mut pools = ResourcePools::new();
-        let resource = std::sync::Arc::new(crate::model::TaskResource::new(
-            Default::default(),
-            std::sync::Arc::from([]),
-        ));
-        let sharing_resource = std::sync::Arc::new(crate::model::TaskResource::new(
-            Default::default(),
-            std::sync::Arc::from([]),
-        ));
-        let owner = resource.lifetime_ref();
-        let sharing_owner = sharing_resource.lifetime_ref();
-        let identity = |key, generation| {
-            Some(crate::backend::vulkan::engine::SampledContentIdentity { key, generation })
-        };
-        let entry = |identity, owners, len| ResidentSampledSlot {
-            slot: null_slot(64, 64),
-            fingerprint: SampledFingerprint::Gathered,
-            content: None,
-            content_len: len,
-            identity,
-            owners,
-            last_touch_ms: 0,
-        };
-
-        pools.sampled_cache_bytes = 12_000;
-        pools.push_sampled_entry(entry(identity(7, 1), vec![owner.clone()], 4_000));
-        pools.push_sampled_entry(entry(
-            identity(7, 1),
-            vec![owner.clone(), sharing_owner.clone()],
-            4_000,
-        ));
-        pools.push_sampled_entry(entry(identity(8, 1), vec![owner.clone()], 4_000));
-
-        pools.supersede_sampled_generation(
-            &owner,
-            crate::backend::vulkan::engine::SampledContentIdentity {
-                key: 7,
-                generation: 2,
-            },
-        );
-
-        assert_eq!(pools.sampled_cache.len(), 2);
-        assert_eq!(pools.sampled_cache_bytes, 8_000);
-        assert_eq!(pools.sampled_live.len(), 1);
-        let shared_old = pools
-            .sampled_cache
-            .iter()
-            .find(|entry| entry.identity == identity(7, 1))
-            .expect("another owner keeps the prior generation alive");
-        assert_eq!(shared_old.owners.len(), 1);
-        assert_eq!(shared_old.owners[0].id(), sharing_owner.id());
-        assert!(pools
-            .sampled_cache
-            .iter()
-            .any(|entry| entry.identity == identity(8, 1)));
     }
 
     /// Compute-storage residents are standalone allocations, but elapsed time

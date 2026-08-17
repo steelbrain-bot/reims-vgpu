@@ -1605,11 +1605,13 @@ fn vertex_buffers_bind_in_one_bulk_call_without_losing_slots() {
     }
 }
 
-/// Identity-keyed sampled rebind: same producer key+generation binds the
-/// retained image without hashing/comparing content; a bumped generation with
-/// changed bytes falls back to the content-addressed path (miss + reupload).
+/// A producer name is not proof that live sampled bytes are unchanged.
+///
+/// This deliberately changes the bytes without changing the supplied identity.
+/// The cache must compare the content, miss, and upload. An identity-first
+/// lookup binds the first draw's stale pixels and fails this test.
 #[test]
-fn sampled_identity_fast_path_skips_content_compare() {
+fn sampled_identity_never_overrides_changed_content() {
     let _g = engine_test_session();
     let sampled_owner = sampled_resource_owner();
     let (v, f) = triangle_spirv();
@@ -1648,40 +1650,33 @@ fn sampled_identity_fast_path_skips_content_compare() {
         Err(e) => panic!("cold identity draw: {e}"),
     }
 
-    // Same identity + generation: identity hit, no content hash/compare
-    // accounting (cache_hit_bytes stays zero), no reupload.
+    // Equal bytes still reuse the exact-content entry.
     let warm_before = engine::counter_snapshot();
-    engine::execute_draw_request(&req).expect("identity rebind");
+    engine::execute_draw_request(&req).expect("content rebind");
     let d = engine::counter_snapshot().delta_since(&warm_before);
-    assert_eq!(d.sampled_identity_hits, 1, "identity hit: {d:?}");
-    assert_eq!(d.sampled_cache_hits, 0, "no content hit: {d:?}");
-    assert_eq!(d.sampled_cache_hit_bytes, 0, "no content bytes: {d:?}");
+    assert_eq!(d.sampled_cache_hits, 1, "exact content hit: {d:?}");
+    assert_eq!(d.sampled_cache_hit_bytes, 16, "compared content: {d:?}");
     assert_eq!(d.sampled_reuploads, 0, "no upload: {d:?}");
 
-    // Bumped generation + changed bytes: identity misses, content path
-    // misses, upload happens, and the NEW generation is adopted.
+    // Keep the identity exactly unchanged while replacing the bytes. This is
+    // the stale-compositor case: identity cannot suppress the upload.
     {
         let img = &mut req.sampled_images[0];
         img.source = SampledSource::Bytes(std::sync::Arc::new(vec![
             1, 0, 0, 255, 0, 1, 0, 255, 0, 0, 1, 255, 1, 1, 0, 255,
         ]));
-        img.identity = Some(SampledContentIdentity {
-            key: 0x1234_5000,
-            generation: 2,
-        });
     }
     let changed_before = engine::counter_snapshot();
-    engine::execute_draw_request(&req).expect("gen bump upload");
+    engine::execute_draw_request(&req).expect("changed content upload");
     let d = engine::counter_snapshot().delta_since(&changed_before);
-    assert_eq!(d.sampled_identity_hits, 0, "gen bump no identity: {d:?}");
-    assert_eq!(d.sampled_cache_misses, 1, "gen bump miss: {d:?}");
-    assert_eq!(d.sampled_reuploads, 1, "gen bump upload: {d:?}");
+    assert_eq!(d.sampled_cache_misses, 1, "changed bytes miss: {d:?}");
+    assert_eq!(d.sampled_reuploads, 1, "changed bytes upload: {d:?}");
 
-    // The new generation now identity-hits.
+    // The uploaded replacement is subsequently reusable by exact bytes.
     let settle_before = engine::counter_snapshot();
-    engine::execute_draw_request(&req).expect("settled identity rebind");
+    engine::execute_draw_request(&req).expect("settled content rebind");
     let d = engine::counter_snapshot().delta_since(&settle_before);
-    assert_eq!(d.sampled_identity_hits, 1, "settled identity: {d:?}");
+    assert_eq!(d.sampled_cache_hits, 1, "replacement content hit: {d:?}");
     assert_eq!(d.sampled_reuploads, 0, "settled no upload: {d:?}");
 }
 

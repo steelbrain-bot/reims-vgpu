@@ -372,141 +372,24 @@ engine_counters! {
         /// it. See `draw_phase`'s "What the sampled loop's own cost is *not*".
         sampled_gathers,
         sampled_gather_bytes,
-        /// Sampled binds that would have gathered and did not, because both
-        /// halves of the guest-write witness vouched that the retained image's
-        /// bytes could not have moved. Bytes = the gather that did not happen,
-        /// so `sampled_gather_bytes + sampled_gather_skip_bytes` is what this
-        /// rail would cost with no cache.
-        sampled_gather_skips,
-        sampled_gather_skip_bytes,
         /// Sampled binds the GPU read straight out of the guest's own pages
         /// through the imported RAMBlock — no CPU gather, no staging scratch.
-        ///
-        /// The third disposition of a `SampledSource::GuestRuns` bind, ranked
-        /// against `sampled_gather_skips` (bound a retained image, moved
-        /// nothing) and `sampled_gathers` (the CPU packed the texels). Bytes are
-        /// what the copy names, which is what the CPU no longer moves.
+        /// Bytes are what the copy names, which is what the CPU no longer moves.
         sampled_guest_imports,
         sampled_guest_import_bytes,
-        /// Why a `SampledSource::GuestRuns` bind moved bytes instead of binding
-        /// a retained image, split at the only two things that can go wrong.
+        /// Guest-run sampled binds whose write witness was not current when the
+        /// required read was prepared.
         ///
-        /// `sampled_gather_skips` says how often the elision worked; on a driven
-        /// boot it says 0 for twenty-three consecutive windows while the rail
-        /// moves 424 MB/s, and neither the engine nor the witness could say
-        /// which half was at fault. The witness's own `gw_vouched` is a
-        /// *runtime*-side per-window tally over every rail, so it cannot be
-        /// subtracted from an engine-side per-bind one — that is the "a counter
-        /// and a fail line count different things" trap with two counters.
+        /// These counters classify the witness state; they do not select whether
+        /// the read occurs. Guest pages are live storage, so both populations are
+        /// imported or gathered on every bind until a decoded subresource
+        /// synchronization boundary can prove a retained copy current.
+        sampled_gather_fresh,
+        /// Guest-run sampled binds whose write witness was current. See
+        /// [`sampled_gather_fresh`].
         ///
-        /// These two are engine-side and per-bind, so they divide the same
-        /// population `sampled_gather_skips` is drawn from and the split adds
-        /// up:
-        ///
-        /// ```text
-        /// unvouched + unretained + skips == gathers + imports + skips
-        /// ```
-        ///
-        /// which is the identity `the_unskipped_reason_is_exactly_one_counter_per_bind`
-        /// holds the emitter to. The fixes are opposite, which is why one bar
-        /// could not serve: `unvouched` is the witness refusing, while
-        /// `unretained` is a vouch this device could not spend because no image
-        /// answered to it.
-        ///
-        /// # The first boot's zero was the instrument, not the witness
-        ///
-        /// Driven x86/PCI Safari drag, quiesced, one `vk_caps`, 73 census
-        /// windows with a gather in them:
-        ///
-        /// ```text
-        /// sampled_gather_unvouched      0
-        /// sampled_gather_unretained  6296   (== gathers 6292 + imports 4)
-        /// ```
-        ///
-        /// That zero was read as "the witness vouches for every guest-run bind
-        /// it is asked about; not one gather happened because it refused", and
-        /// the rail's whole cost was attributed to retention on the strength of
-        /// it. **It proved nothing.** The emitter was fed
-        /// `resource.identity.is_some()`, which is not the witness's verdict but
-        /// the producer's: `note_gather` returned `Option<GatheredIdentity>` and
-        /// built it by reading the generation back out of the witness map, which
-        /// holds an entry for every key `observe` is handed. There was no path
-        /// through it that returned `None`. The counter could not fire, and a
-        /// counter that cannot fire reading zero is exactly the "a drop counter
-        /// reading zero is not a measurement" trap.
-        ///
-        /// It now takes [`crate::runtime::gather_witness::GatherVouch`], decided
-        /// beside the assignment that spends the generation, so `unvouched`
-        /// means the witness spent one and the following miss was compulsory.
-        ///
-        /// # The measured split, and it is mostly not the cache
-        ///
-        /// Driven x86/PCI Safari drag, quiesced, one `vk_caps`, 166 census
-        /// windows, 25 s of real compositing:
-        ///
-        /// ```text
-        /// sampled_gather_unvouched   5389   68.1%
-        /// sampled_gather_unretained  2524   31.9%
-        ///                            ----
-        ///                            7913  == gathers 7909 + imports 4
-        /// sampled_gather_skips       3526   (of 11 439 guest-run binds)
-        /// ```
-        ///
-        /// Both arms fire and the identity holds exactly, so the instrument is
-        /// non-vacuous for the first time. **Roughly two thirds of this rail's
-        /// re-gathers are compulsory**: the witness spent the generation, so no
-        /// retained image could have answered and no size of sampled cache
-        /// reaches them. Only the 2524 are a cache result. That is the reverse
-        /// of what the structural zero was read as, and it is consistent with
-        /// the `SAMPLED_REACH_BAND` A/B, where four times the entries and six
-        /// times the bytes left the miss rate where it started.
-        ///
-        /// The 9876 count-cap evictions on the same boot are not evidence of a
-        /// cache too small either. A compulsory miss admits an entry under its
-        /// fresh identity exactly as a lost one does, and nothing ever looks
-        /// that entry up again, so most of the churn is the rail working.
-        ///
-        /// # What spends the generation is this device, not the guest
-        ///
-        /// Same boot, the witness's own verdict routes:
-        ///
-        /// ```text
-        /// gw_vouched             6050
-        /// gw_refused_host_write  5156
-        /// gw_refused_guest_store   14
-        /// gw_unarmed              212
-        /// gw_rearm                128
-        /// gw_audit_unsound          0
-        /// ```
-        ///
-        /// 368:1. The guest barely writes the windows it samples; **this device
-        /// writes them**, and each write is what forces the next bind to read
-        /// 1.4 MB back out of guest RAM. The deferred writeback rail puts a
-        /// render target into guest pages and this rail gathers those same pages
-        /// back, so the two largest byte movers in the device are feeding each
-        /// other. `gw_audit_unsound` at 0 says the witness is sound while it
-        /// does so — nothing vouched had moved.
-        ///
-        /// Read the ratio, not an attribution. These `gw_*` tallies count
-        /// `note_gather` calls (window resolutions) while the two counters above
-        /// count binds, so the populations differ even though all three
-        /// [`crate::runtime::gather_witness::GatherRail`] variants are sampled
-        /// rails and no other caller exists. Subtracting one from the other is
-        /// still invalid, which is why the split had to be taken engine-side.
-        /// One workload, one boot, one pathway: x86/PCI on a discrete GPU, where
-        /// the render target lives in VRAM and the writeback is real. A unified
-        /// host has no such round trip to make.
-        ///
-        /// The skip rate is a property of the workload and not of the rail, so
-        /// do not carry a number for it: one boot's drag ran 23 windows at 0%
-        /// while the next ran ~41% (168 skips against 244 gathers a window) on
-        /// the same build. What is stable across both is this split.
-        sampled_gather_unvouched,
-        /// Vouched by the witness, but the sampled cache held no image under
-        /// `(key, identity)`. See [`sampled_gather_unvouched`].
-        ///
-        /// [`sampled_gather_unvouched`]: EngineCounters::sampled_gather_unvouched
-        sampled_gather_unretained,
+        /// [`sampled_gather_fresh`]: EngineCounters::sampled_gather_fresh
+        sampled_gather_vouched,
         /// How much of its target each draw could have written, split three
         /// ways. See [`DrawCoverage`] and [`EngineCounters::note_draw_coverage`].
         draw_cover_full,
@@ -624,7 +507,6 @@ engine_counters! {
         /// Updated descriptor sets subsequently bound for execution.
         descriptor_set_binds,
         sampled_cache_hits,
-        sampled_identity_hits,
         sampled_cache_hit_bytes,
         sampled_cache_misses,
         sampled_gpu_binds,
@@ -1177,33 +1059,18 @@ impl EngineCounters {
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub fn note_sampled_gather_skipped(&self, bytes: u64) {
-        self.sampled_gather_skips.fetch_add(1, Ordering::Relaxed);
-        self.sampled_gather_skip_bytes
-            .fetch_add(bytes, Ordering::Relaxed);
-    }
-
-    /// Record why a guest-run sampled bind is about to move bytes, taken at the
-    /// one site that already knows both halves: the elision lookup returned
-    /// nothing, and `vouch` says whether the identity it looked up could ever
-    /// have matched. Call exactly once per bind that falls through the skip,
-    /// before the import/gather disposition is decided — the two questions are
-    /// independent and the identity in
-    /// [`EngineCounters::sampled_gather_unvouched`] holds only if this is not
-    /// also called on the skip path.
+    /// Record the write-witness state attached to one required guest-run read.
+    /// This is diagnostic only: both verdicts still read the live guest pages.
     ///
     /// Takes the witness's own verdict rather than a `bool` the caller derives.
     /// The caller derived it from `identity.is_some()` for one boot, which is
     /// not the witness's answer but the producer's, and the producer names every
     /// window it is handed.
-    pub fn note_sampled_gather_unskipped(
-        &self,
-        vouch: crate::runtime::gather_witness::GatherVouch,
-    ) {
+    pub fn note_sampled_gather_witness(&self, vouch: crate::runtime::gather_witness::GatherVouch) {
         let field = if vouch.is_vouched() {
-            &self.sampled_gather_unretained
+            &self.sampled_gather_vouched
         } else {
-            &self.sampled_gather_unvouched
+            &self.sampled_gather_fresh
         };
         field.fetch_add(1, Ordering::Relaxed);
     }
@@ -1268,7 +1135,6 @@ mod tests {
         counters.note_readback(4096, ReadbackSource::DrawTail);
         counters.note_seed_upload(1024);
         counters.note_sampled_gather(2048);
-        counters.note_sampled_gather_skipped(512);
 
         let snapshot = counters.snapshot();
         assert_eq!(snapshot.creates, 1);
@@ -1285,15 +1151,6 @@ mod tests {
         assert_eq!(
             (snapshot.sampled_gathers, snapshot.sampled_gather_bytes),
             (1, 2048)
-        );
-        // And the gathers that did not happen, whose bytes are the other half of
-        // what this rail would cost with no cache.
-        assert_eq!(
-            (
-                snapshot.sampled_gather_skips,
-                snapshot.sampled_gather_skip_bytes
-            ),
-            (1, 512)
         );
     }
 
@@ -1325,37 +1182,27 @@ mod tests {
         );
     }
 
-    /// The split of "the elision did not fire" has to be exhaustive and
-    /// exclusive, or it stops being a division of the gathers and becomes two
-    /// unrelated tallies that happen to sit next to each other.
-    ///
-    /// The two counts are deliberately different, and asserted by name rather
-    /// than only through their sum: a sum-only assertion passes with the arms
-    /// swapped, and swapping them inverts the verdict this instrument exists to
-    /// give — "the witness refused" and "the cache dropped it" want opposite
-    /// fixes.
+    /// The witness verdict is exhaustive and exclusive over required guest-run
+    /// reads. It is telemetry, not an execution choice.
     #[test]
-    fn the_unskipped_reason_is_exactly_one_counter_per_bind() {
+    fn the_gather_witness_state_is_exactly_one_counter_per_bind() {
         let counters = EngineCounters::default();
         for _ in 0..3 {
-            counters.note_sampled_gather_unskipped(GatherVouch::Vouched);
+            counters.note_sampled_gather_witness(GatherVouch::Vouched);
         }
         for _ in 0..5 {
-            counters.note_sampled_gather_unskipped(GatherVouch::Fresh);
+            counters.note_sampled_gather_witness(GatherVouch::Fresh);
         }
 
         let s = counters.snapshot();
-        assert_eq!(s.sampled_gather_unretained, 3, "vouched, nothing retained");
-        assert_eq!(s.sampled_gather_unvouched, 5, "the witness gave no vouch");
+        assert_eq!(s.sampled_gather_vouched, 3, "the witness vouched");
+        assert_eq!(s.sampled_gather_fresh, 5, "the witness was fresh");
         // Exhaustive and exclusive: eight calls, eight increments in total.
         assert_eq!(
-            s.sampled_gather_unretained + s.sampled_gather_unvouched,
+            s.sampled_gather_vouched + s.sampled_gather_fresh,
             8,
-            "a bind that fell through the skip must land in exactly one arm: {s:?}"
+            "each required read must land in exactly one witness state: {s:?}"
         );
-        // And neither is the skip, which counts the population these two divide
-        // the complement of. Nothing above took the skip path.
-        assert_eq!(s.sampled_gather_skips, 0);
     }
 
     /// Source attribution is a partition of uploads that actually happened,

@@ -357,15 +357,7 @@ pub(crate) struct ResourcePools {
     /// Exact-content sampled images retained across draw calls. Hash narrows
     /// candidates only; a hit always requires full byte equality.
     sampled_cache: Vec<ResidentSampledSlot>,
-    /// Direct lookup for the retained object name carried by a sampled bind.
-    /// The vector remains the owner of slots because content-based lookup can
-    /// still compare several candidates; this index keeps the ordinary
-    /// retained-reference bind independent of that population's size.
-    sampled_identity_index: HashMap<GatheredName, usize>,
     sampled_cache_bytes: usize,
-    /// Entries invalidated when a submission failed after publication, most
-    /// recent first and carrying no images — see [`SampledVictim`].
-    sampled_victims: std::collections::VecDeque<SampledVictim>,
     /// Storage-image pool for compute.
     storage_image_free: FreePool<StorageImageKey, StorageImageSlot>,
     storage_image_live: Vec<StorageImageSlot>,
@@ -1314,26 +1306,6 @@ impl SampledSlot {
     }
 }
 
-/// The name a gathered sampled window is findable under.
-///
-/// Both halves are required and neither is sufficient. The key is a *shape* —
-/// extent, image and view type, format, swizzle — and two different windows
-/// routinely share one. The identity says which content the producer put there
-/// and carries its generation, but names no image, so it cannot pick between
-/// two geometries of one surface across a resize.
-///
-/// It exists so that "is this the same window?" is asked once rather than
-/// spelled out per site. [`ResourcePools::find_gathered_sampled`]'s lookup and
-/// the admit's dedup still carry their own conjunctions because each also tests
-/// a fingerprint; the twin counter is named through this type, and any new site
-/// should be. A site that dropped the identity term would bind one surface's
-/// pixels for another's, and only this type's own test would notice.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct GatheredName {
-    pub(crate) key: SampledKey,
-    pub(crate) identity: crate::backend::vulkan::engine::SampledContentIdentity,
-}
-
 /// How a retained sampled image can be recognised again.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SampledFingerprint {
@@ -1344,13 +1316,6 @@ pub(crate) enum SampledFingerprint {
     /// that compare is what answers — see that field for why the digest is not
     /// allowed to be the identity.
     Content(u128),
-    /// No digest exists, because the content was gathered straight from guest
-    /// RAM into a staging buffer and never materialised as CPU bytes. Such an
-    /// entry is reachable only through its producer identity, which is the whole
-    /// point: hashing it would mean reading the bytes this entry exists to avoid
-    /// reading. It must never match a content search, or a CPU-sourced bind
-    /// could pick up an image whose bytes nobody has compared.
-    Gathered,
 }
 
 /// One sampled image a submission owes the content cache — paid at
@@ -1358,17 +1323,14 @@ pub(crate) enum SampledFingerprint {
 /// queue, and not at the fence.
 pub(crate) struct SampledRetain {
     pub(crate) image: vk::Image,
-    /// The bytes to fingerprint, where the source had any. A guest gather has
-    /// none and carries only its byte length for the cache memory gauge.
+    /// Exact bytes used to fill the retained image.
     pub(crate) content: SampledRetainContent,
-    pub(crate) identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
     pub(crate) resource_lifetime: Option<crate::model::TaskResourceLifetimeRef>,
 }
 
-/// What a retained slot's content was, for the two kinds of source.
+/// Bytes retained beside an uploaded sampled image for exact comparison.
 pub(crate) enum SampledRetainContent {
     Bytes(std::sync::Arc<Vec<u8>>),
-    Gathered { len: usize },
 }
 
 struct ResidentSampledSlot {
@@ -1376,9 +1338,7 @@ struct ResidentSampledSlot {
     fingerprint: SampledFingerprint,
     /// The bytes [`SampledFingerprint::Content`]'s digest was taken over, so a
     /// content match is decided by comparing them rather than by the digest
-    /// alone. `None` exactly when the fingerprint is
-    /// [`SampledFingerprint::Gathered`], which has no CPU bytes to retain and is
-    /// reachable only by identity.
+    /// alone.
     ///
     /// # Why the digest is not the identity
     ///
@@ -1403,12 +1363,8 @@ struct ResidentSampledSlot {
     /// the retire path. The bytes make the content comparison exact.
     content: Option<std::sync::Arc<Vec<u8>>>,
     /// Byte length of the content this slot was admitted with, for the cache
-    /// memory gauge. Carried separately because a `Gathered` entry has a length
-    /// but no CPU byte vector.
+    /// memory gauge.
     content_len: usize,
-    /// Producer identity of the retained content; lets a same-identity,
-    /// same-generation rebind skip the content hash + compare entirely.
-    identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
     /// Serialized resources currently sharing this exact retained content.
     /// Weak references make resource deletion observable without making the
     /// backend allocation extend the guest object's lifetime.
@@ -2137,31 +2093,6 @@ const MAINTENANCE_INTERVAL_MS: u64 = 100;
 /// there when the next draw samples one of them, without becoming a second
 /// registry. Diagnostic memory only: a `TargetIdentity` and a discriminant.
 const RECLAIM_HISTORY: usize = 256;
-/// Failed-submission victims remembered for diagnosis. This is a bounded
-/// instrument only: it holds no image and no residency decision reads it.
-const SAMPLED_VICTIM_LEDGER: usize = 512;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SampledVictim {
-    key: SampledKey,
-    identity: crate::backend::vulkan::engine::SampledContentIdentity,
-    route: SampledVictimRoute,
-}
-
-/// The whole cache is discarded only when a submission that had already
-/// published entries never reaches the queue.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SampledVictimRoute {
-    Discarded,
-}
-
-impl SampledVictimRoute {
-    fn route(self) -> &'static str {
-        match self {
-            Self::Discarded => "sampled_reach_lost_to_discard",
-        }
-    }
-}
 /// Max recycled sampled slots retained per geometry key in `sampled_free`. A
 /// content-changing input only needs a few live at once (the CB ring is 3-deep
 /// plus the one being acquired); beyond that a recycled slot is destroyed so a

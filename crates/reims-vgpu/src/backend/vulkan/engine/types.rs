@@ -1065,8 +1065,8 @@ pub struct SampledImageResource {
     /// leaves room for formats no byte-layout enum can name — an sRGB view
     /// first among them.
     pub format: vk::Format,
-    /// Optional identity fast path for [`SampledSource::Bytes`] (see
-    /// [`SampledContentIdentity`]); `None` keeps the content-addressed path.
+    /// Producer metadata used only by sampled working-set instrumentation.
+    /// Cache selection always requires exact retained-byte equality.
     pub identity: Option<SampledContentIdentity>,
     /// Weak proof of the serialized texture resource whose content this bind
     /// represents. A retained sampled image may live only while at least one
@@ -2176,10 +2176,9 @@ pub enum SampledSource {
         initial: AttachmentInitial,
     },
     /// Guest-memory origin. The command buffer copies from imported guest RAM
-    /// into an owned optimal image, without a CPU read or content hash. A copy
-    /// is elided where a retained image already answers to the bind's identity,
-    /// which is what [`crate::runtime::gather_witness::GatherVouch`] says is
-    /// possible.
+    /// into an owned optimal image, without a CPU read or content hash. The
+    /// witness is carried for diagnostics only; it cannot replace the decoded
+    /// subresource-coherency contract needed to reuse a copied image.
     GuestRuns(GuestRunSource, crate::runtime::gather_witness::GatherVouch),
 }
 
@@ -2449,13 +2448,10 @@ impl GuestTargetMemory {
     }
 }
 
-/// Producer-assigned identity + generation for CPU-sourced sampled content.
+/// Producer-assigned identity + generation for sampled working-set accounting.
 ///
-/// When two draws bind [`SampledSource::Bytes`] with the same identity, the
-/// content is byte-identical by the producer's coherence model (the runtime
-/// bumps `generation` whenever its authoritative cache entry is rewritten),
-/// so the sampled cache may bind the retained GPU image without re-hashing
-/// or comparing the bytes.
+/// This is diagnostic metadata, not content evidence. Cache selection never
+/// reads it; a retained upload is reusable only after exact byte equality.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SampledContentIdentity {
     /// Stable key of the guest resource (runtime-chosen keyspace).

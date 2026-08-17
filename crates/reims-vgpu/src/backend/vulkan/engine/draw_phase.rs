@@ -116,25 +116,22 @@
 //! The eliminations below are worth keeping because they are what makes the
 //! remaining candidate stark, but read them as being about the **driven**
 //! regime — see "and none of it holds when the guest is quiet" at the end. In
-//! those
-//! same windows `sampled_gpu_binds`, `sampled_cache_misses`, `sampled_reuploads`
-//! and `sampled_cache_hits` are **all 0**, and only `sampled_identity_hits`
-//! (420/s) moves. So:
+//! those same historical windows `sampled_gpu_binds`, `sampled_cache_misses`,
+//! `sampled_reuploads` and `sampled_cache_hits` were **all 0**, while the former
+//! identity-only counter moved at 420/s. That lookup has since been removed:
+//! a producer name is not proof that live guest bytes still match a retained
+//! copied image. At the time, the reading meant:
 //!
 //! - The `SampledSource::Target` arm is never taken — it is the only writer of
 //!   `sampled_gpu_binds`.
 //! - No bind uploads or re-uploads bytes; the `Bytes` arm always hits cache.
-//! - The hit it takes is `find_cached_sampled`'s identity fast path, which
-//!   scans a `SAMPLED_REACH_BAND`-bounded list of **64** entries and moves one to
-//!   the back. That cannot be the ~100 us per bind the arithmetic demands.
+//! - The former identity-only lookup was not the ~100 us per bind the arithmetic
+//!   demanded.
 //!
 //! **Do not read the third bullet as "the content path never fires".** A later
-//! driven x86/Vulkan boot under a 30 s Safari *drag*, 42 census windows, reads
-//! `sampled_cache_hits=26697` against `sampled_identity_hits=75994` — the
-//! content fallback carries about a quarter of all hits, moving 277 MB at
-//! ~10 KB a hit. The windows above and these are different workloads, and both
-//! readings stand; what does not stand is concluding from the zeros here that
-//! the content rail is dead and can go. It is load-bearing, and
+//! driven x86/Vulkan boot under a 30 s Safari *drag*, 42 census windows, recorded
+//! 26 697 exact-content hits moving 277 MB at ~10 KB a hit. The content rail is
+//! load-bearing, and
 //! `ResidentSampledSlot::content` is what makes taking it safe.
 //!
 //! What is left is `SampledSource::GuestRuns`, and the reason it was invisible
@@ -170,44 +167,22 @@
 //! all eight windows, so this is the *same* content re-gathered every frame
 //! rather than a changing working set.
 //!
-//! ## That repair was built, and it is the cache half that fails
+//! ## Guest-page gathers are not retained copies
 //!
 //! The paragraph this replaces said the gather path had no content cache at all
 //! and that it was *not* established whether the type-11 seed witness could
 //! cover these run lists, "the first thing to check before building on this".
-//! Both are answered. [`crate::runtime::gather_witness`] covers them —
-//! `GatherWindow` carries the window's `gpas` alongside its `runs`, so the
-//! page-set question the witness needs is asked in the address space it needs —
-//! and a vouch becomes a `GatheredIdentity` the engine binds a retained image
-//! on with nothing read and nothing compared. `sampled_gather_skips` counts it
-//! working.
+//! [`crate::runtime::gather_witness`] observes page-write evidence, but that is
+//! not the decoded per-subresource coherence contract. A guest-page gather has
+//! no retained CPU bytes to compare, so its copied image is transient and every
+//! later bind gathers again. A durable reuse path must represent the guest's
+//! live resource or decode the real subresource synchronization boundary; it
+//! cannot infer content from a producer-assigned key and generation.
 //!
-//! Which half fails is **not yet established**. A driven x86/PCI drag over 73
-//! windows read `sampled_gather_unvouched` at **0** against
-//! `sampled_gather_unretained` at 6296, and that was taken to mean every gather
-//! had a vouch it could not spend — so the lever was retention rather than the
-//! witness. The zero was structural: the emitter was handed
-//! `resource.identity.is_some()`, and the producer names every window the
-//! witness is asked about, so the arm could not fire on any bind of any boot.
-//! The counter now takes the witness's own
-//! [`crate::runtime::gather_witness::GatherVouch`], which makes the question
-//! answerable for the first time; see
-//! [`super::counters::EngineCounters::sampled_gather_unvouched`].
-//!
-//! The boot that answered it put the split at **5389 compulsory against 2524
-//! retention losses** — 68/32, the reverse of the reading above. Two thirds of
-//! this rail cannot be reached by any cache, because the witness had spent the
-//! generation and no retained image could have matched. And what spends it is
-//! this device: `gw_refused_host_write` 5156 against `gw_refused_guest_store`
-//! 14 on the same boot. The deferred writeback puts a render target into guest
-//! pages and this rail gathers those same pages back at 1.4 MB a bind.
-//!
-//! So the lever here is neither the witness nor the cache. It is that a window
-//! this device just wrote is re-read from guest RAM instead of bound from the
-//! image it was written out of — which is what `SampledSource::Target` is for,
-//! and that arm is never taken. See
-//! [`super::counters::EngineCounters::sampled_gather_unvouched`] for the full
-//! reading and its qualifiers.
+//! The witness counters now report `fresh` versus `vouched` only as telemetry;
+//! neither verdict changes this read. The remaining contract work is to carry a
+//! real resident resource into `SampledSource::Target` or decode the guest's
+//! subresource synchronization boundary.
 //!
 //! # And none of it holds when the guest is quiet
 //!

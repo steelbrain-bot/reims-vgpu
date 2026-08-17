@@ -641,8 +641,8 @@ pub struct GatherObservation {
     ///
     /// Returned rather than looked back up so the identity has no absent case to
     /// spell. Reading it back out of the map produced an `Option` that was
-    /// `Some` on every path through [`observe`], which is how
-    /// `sampled_gather_unvouched` came to be a counter that could not fire.
+    /// `Some` on every path through [`observe`], which cannot distinguish a
+    /// fresh witness generation from a vouched one.
     pub generation: u64,
     /// Whether [`Self::generation`] is the one the entry carried in or one spent
     /// this bind. Decided beside the assignment that spends it, never
@@ -1376,15 +1376,15 @@ mod tests {
     /// The reading the switch exists to produce: a writer that escapes **both**
     /// halves of the witness is caught on the very next bind.
     ///
-    /// This is the failure the sampled cache's identity-only lookup cannot report
-    /// any other way — an elision correctly taken and one wrongly taken are the
-    /// same absence — so the audit catching it is the only instrument there is.
+    /// This is the failure a write-channel witness cannot report without reading
+    /// the bytes, so the audit is the instrument that makes missed writers
+    /// visible.
     /// The bytes here move with no guest store and no recorded host write, which
     /// is exactly the shape of an unrecorded writer.
     ///
     /// The vouch is asserted too, and it is the half that matters at a bind: a
-    /// `Disagreed` audit that still handed back a live generation would leave the
-    /// next bind serving the same stale image the audit had just convicted.
+    /// `Disagreed` must also spend the generation so no future contract-backed
+    /// consumer can mistake the old witness for current content.
     #[test]
     fn an_unrecorded_write_is_convicted_on_the_next_bind_and_spends_the_generation() {
         let mut w = witness_auditing(AuditDensity::EveryBind);
