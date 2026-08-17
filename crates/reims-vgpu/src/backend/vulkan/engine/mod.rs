@@ -3224,6 +3224,60 @@ pub fn copy_target_to_guest_pages(
         return Ok(());
     }
     unsafe {
+        let plan = plan_guest_copy(ctx, pools, counters, dst)?;
+        copy_image_level0_to_buffer(ctx, pools, counters, &snap, &plan)?;
+        pools.registry_note_access(
+            identity,
+            pools::ResidentAccess::transfer_read(snap.guest_backing.is_some()),
+        );
+        // The copy above is `vkCmdCopyImageToBuffer` into the guest's own
+        // imported pages, so these bytes are the host readback this rail elides
+        // rather than one it paid.
+        counters.note_target_read(
+            u64::from(dst.width) * u64::from(dst.height) * 4,
+            TargetReadDelivery::GuestPagesOnGpu,
+        );
+    }
+    // Past the last fallible step, so this runs exactly when the copy is on the
+    // queue. The ledger takes the resident's pin itself here — the caller holds
+    // none, and `finish` clears `gpu_only_content` as soon as this returns, so
+    // between that and the settle the pin is all that keeps the reclaim off an
+    // image the submitted copy still reads. Safe to leave until the end rather
+    // than guarding every early return above, because the whole body runs under
+    // the engine lock and a reclaim needs the same lock: nothing can take the
+    // image while this function is running, only after it returns.
+    record_guest_write_debt(pools, identity, pages);
+    Ok(())
+}
+
+/// Build the copy plan that lands one frame in a guest-page destination.
+///
+/// # Why this is the half both rails share
+///
+/// Nothing here names a source. The plan is a description of the *destination* —
+/// where the guest's bytes are, how its rows are pitched, and which of the two
+/// forms can write them — so it is derived from [`GuestPageTarget`] and the
+/// pools alone. What differs between a draw and a compute dispatch is only the
+/// image the plan is later recorded against, and which command buffer records
+/// it.
+///
+/// That split is why the compute rail can reuse this rather than growing a
+/// second spelling of the same routing: `copy_target_to_guest_pages` cannot be
+/// called from a dispatch — it resolves its source through the render-target
+/// registry, which a compute storage image is not in, and it opens a command
+/// buffer the dispatch already holds — but neither of those objections reaches
+/// this function.
+///
+/// The region and dispatch counters are bumped here because they count the
+/// plan, not the recording, and a caller that planned and then failed to record
+/// still consumed the pool slots they describe.
+unsafe fn plan_guest_copy(
+    ctx: &context::DeviceContext,
+    pools: &mut pools::ResourcePools,
+    counters: &counters::EngineCounters,
+    dst: &GuestPageTarget,
+) -> Result<GuestCopyPlan, DrawError> {
+    unsafe {
         // Dense rows are the common case and the cheap one; a padded pitch
         // falls to the rectangle path, which is the only form that can leave
         // the padding unwritten. Both land the same guest bytes.
@@ -3235,18 +3289,23 @@ pub fn copy_target_to_guest_pages(
             // held in `gather_live` and returned by the ring, so both of those
             // are properties of the pool rather than of a caller's promise.
             //
-            // Sized by `have` and not `need`. The detile writes `need` bytes
-            // from offset 0, but the scatter below reads one range per run and
-            // those sum to `have` — and the check above only establishes
-            // `need <= have`, so `need` is the smaller of the two. They are in
-            // fact equal wherever this branch is taken, because dense rows make
-            // `extent_end` the same tight frame `references_for_runs` tiled;
-            // that is a coincidence of two separately-derived numbers, not a
-            // stated relation, and sizing by the one the copies actually read
-            // costs nothing and does not depend on it holding.
+            // Sized by `window_bytes` and not `extent_end`. The detile writes
+            // `extent_end` bytes from offset 0, but the scatter below reads one
+            // range per run and those sum to `window_bytes` — and a caller only
+            // establishes `extent_end <= window_bytes`, so the extent is the
+            // smaller of the two. They are in fact equal wherever this branch is
+            // taken, because dense rows make `extent_end` the same tight frame
+            // `references_for_runs` tiled; that is a coincidence of two
+            // separately-derived numbers, not a stated relation, and sizing by
+            // the one the copies actually read costs nothing and does not depend
+            // on it holding.
+            //
+            // The relation itself is the caller's to check, because it is the
+            // caller that knows what the destination was built from and can name
+            // the refusal — see `GuestWriteDecline::WindowTooSmall`.
             let scratch = pools.acquire_guest_gather(
                 ctx,
-                have,
+                dst.window_bytes(),
                 ash::vk::BufferUsageFlags::empty(),
                 counters,
             )?;
@@ -3293,29 +3352,8 @@ pub fn copy_target_to_guest_pages(
         counters
             .guest_write_dispatches
             .fetch_add(plan.dispatches(), Ordering::Relaxed);
-        copy_image_level0_to_buffer(ctx, pools, counters, &snap, &plan)?;
-        pools.registry_note_access(
-            identity,
-            pools::ResidentAccess::transfer_read(snap.guest_backing.is_some()),
-        );
-        // The copy above is `vkCmdCopyImageToBuffer` into the guest's own
-        // imported pages, so these bytes are the host readback this rail elides
-        // rather than one it paid.
-        counters.note_target_read(
-            u64::from(dst.width) * u64::from(dst.height) * 4,
-            TargetReadDelivery::GuestPagesOnGpu,
-        );
+        Ok(plan)
     }
-    // Past the last fallible step, so this runs exactly when the copy is on the
-    // queue. The ledger takes the resident's pin itself here — the caller holds
-    // none, and `finish` clears `gpu_only_content` as soon as this returns, so
-    // between that and the settle the pin is all that keeps the reclaim off an
-    // image the submitted copy still reads. Safe to leave until the end rather
-    // than guarding every early return above, because the whole body runs under
-    // the engine lock and a reclaim needs the same lock: nothing can take the
-    // image while this function is running, only after it returns.
-    record_guest_write_debt(pools, identity, pages);
-    Ok(())
 }
 
 /// Synchronize a resident that is already backed by its guest allocation.
