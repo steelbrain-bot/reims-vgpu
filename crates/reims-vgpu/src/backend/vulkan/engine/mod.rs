@@ -4026,132 +4026,9 @@ unsafe fn copy_image_level0_to_buffer(
         &barrier,
     );
     unsafe { pools.readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::TRANSFER, 1) };
-    // One call per buffer, all of them into the same command buffer, so the
-    // whole frame is still one submission and one fence however many RAMBlocks
-    // it touched — and, on the linear plan, however many hops it takes.
-    match plan {
-        GuestCopyPlan::Rectangles(groups) => {
-            for (buffer, regions) in groups {
-                ctx.device.cmd_copy_image_to_buffer(
-                    cb,
-                    snap.image,
-                    read_access.layout(),
-                    *buffer,
-                    regions,
-                );
-            }
-        }
-        GuestCopyPlan::Linear {
-            scratch,
-            detile,
-            scatter,
-        } => {
-            let one = [*detile];
-            ctx.device.cmd_copy_image_to_buffer(
-                cb,
-                snap.image,
-                read_access.layout(),
-                *scratch,
-                &one,
-            );
-            // The scatter reads what the detile just wrote, and nothing in one
-            // command buffer orders the two by itself. A global memory barrier
-            // rather than a buffer one because there is exactly one buffer in
-            // flight between them and no other access to exclude.
-            match scatter {
-                ScatterForm::Regions(groups) => {
-                    let detiled = [ash::vk::MemoryBarrier::default()
-                        .src_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
-                        .dst_access_mask(ash::vk::AccessFlags::TRANSFER_READ)];
-                    ctx.device.cmd_pipeline_barrier(
-                        cb,
-                        ash::vk::PipelineStageFlags::TRANSFER,
-                        ash::vk::PipelineStageFlags::TRANSFER,
-                        ash::vk::DependencyFlags::empty(),
-                        &detiled,
-                        &[],
-                        &[],
-                    );
-                    for (buffer, regions) in groups {
-                        ctx.device.cmd_copy_buffer(cb, *scratch, *buffer, regions);
-                    }
-                }
-                ScatterForm::Dispatches(groups) => {
-                    // Two dependencies in one barrier because they have the same
-                    // destination: the detile's write to the scratch, and the
-                    // host's write of the run tables, which happened before this
-                    // submission and so needs `HOST` named on the source side.
-                    let ready = [ash::vk::MemoryBarrier::default()
-                        .src_access_mask(
-                            ash::vk::AccessFlags::TRANSFER_WRITE | ash::vk::AccessFlags::HOST_WRITE,
-                        )
-                        .dst_access_mask(ash::vk::AccessFlags::SHADER_READ)];
-                    ctx.device.cmd_pipeline_barrier(
-                        cb,
-                        ash::vk::PipelineStageFlags::TRANSFER | ash::vk::PipelineStageFlags::HOST,
-                        ash::vk::PipelineStageFlags::COMPUTE_SHADER,
-                        ash::vk::DependencyFlags::empty(),
-                        &ready,
-                        &[],
-                        &[],
-                    );
-                    // Looked up rather than carried in the plan: the plan holds
-                    // only what a dispatch needs that is per-writeback, and the
-                    // pipeline is a fixture of the device. It is already built —
-                    // the plan could not have been made otherwise.
-                    if let Some(pipeline) = pools.scatter_pipeline(ctx) {
-                        // One bind for the whole run; the handle never changes.
-                        pipeline.bind(&ctx.device, cb);
-                        for group in groups {
-                            pipeline.dispatch(&ctx.device, cb, group.set, group.run_count);
-                        }
-                    }
-                }
-            }
-        }
-    }
+    unsafe { record_guest_copy_plan(ctx, pools, cb, snap.image, read_access.layout(), plan) };
     unsafe { pools.readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::BOTTOM_OF_PIPE, 2) };
-    // The reader of these bytes is the guest's vCPU, which is a host reader as
-    // far as this device is concerned: the memory is guest RAM the driver
-    // imported, not device-local memory that owes a readback. So the write is
-    // released to `HOST` with `HOST_READ`, which is what makes it visible to a
-    // CPU access after the fence signals.
-    //
-    // Cache maintenance beyond that is the driver's. A host-pointer import
-    // names ordinary system pages this process already has mapped, and a PCIe
-    // write to system memory is snooped, so there is no invalidate for this
-    // side to issue.
-    //
-    // The source scope is the stage that actually wrote the guest's pages, which
-    // is the dispatch on the compute scatter and the copy on every other form.
-    // Naming `TRANSFER` alone against a dispatch would release the detile and
-    // leave the writes the guest is about to read unordered — the one place in
-    // this rail where the two forms are not interchangeable.
-    let (wrote_stage, wrote_access) = match plan {
-        GuestCopyPlan::Linear {
-            scatter: ScatterForm::Dispatches(_),
-            ..
-        } => (
-            ash::vk::PipelineStageFlags::COMPUTE_SHADER,
-            ash::vk::AccessFlags::SHADER_WRITE,
-        ),
-        _ => (
-            ash::vk::PipelineStageFlags::TRANSFER,
-            ash::vk::AccessFlags::TRANSFER_WRITE,
-        ),
-    };
-    let host_visible = [ash::vk::MemoryBarrier::default()
-        .src_access_mask(wrote_access)
-        .dst_access_mask(ash::vk::AccessFlags::HOST_READ)];
-    ctx.device.cmd_pipeline_barrier(
-        cb,
-        wrote_stage,
-        ash::vk::PipelineStageFlags::HOST,
-        ash::vk::DependencyFlags::empty(),
-        &host_visible,
-        &[],
-        &[],
-    );
+    unsafe { release_guest_copy_to_host(ctx, cb, plan) };
     // The wait this rail no longer takes here.
     //
     // What the stamp needs is that every copy has landed before the guest is
@@ -4183,6 +4060,177 @@ unsafe fn copy_image_level0_to_buffer(
         submit_started.elapsed().as_micros() as u64,
     );
     Ok(())
+}
+
+/// Record one [`GuestCopyPlan`] against a source image into an open command
+/// buffer.
+///
+/// # Why this takes a command buffer instead of opening one
+///
+/// The plan says where the guest's bytes go; this says what writes them. Both
+/// rails that land a frame in guest pages need exactly these commands and
+/// differ only in which submission carries them — the render rail joins an open
+/// batch or begins its own entry, while a compute dispatch already holds a
+/// recording command buffer, the one its storage image was written in. Taking
+/// `cb` is what lets the second reuse this instead of restating the
+/// barrier-and-copy sequence, which is the part that is easy to restate subtly
+/// wrong: the scatter reads what the detile just wrote, and nothing in one
+/// command buffer orders those two by itself.
+///
+/// `src_layout` is the layout the image is already in, transitioned by the
+/// caller. This records no layout transition of its own, because the two rails
+/// arrive from different layouts for different reasons and neither can be
+/// guessed from the plan.
+unsafe fn record_guest_copy_plan(
+    ctx: &context::DeviceContext,
+    pools: &mut pools::ResourcePools,
+    cb: ash::vk::CommandBuffer,
+    src_image: ash::vk::Image,
+    src_layout: ash::vk::ImageLayout,
+    plan: &GuestCopyPlan,
+) {
+    unsafe {
+        // One call per buffer, all of them into the same command buffer, so the
+        // whole frame is still one submission and one fence however many RAMBlocks
+        // it touched — and, on the linear plan, however many hops it takes.
+        match plan {
+            GuestCopyPlan::Rectangles(groups) => {
+                for (buffer, regions) in groups {
+                    ctx.device.cmd_copy_image_to_buffer(
+                        cb,
+                        src_image,
+                        src_layout,
+                        *buffer,
+                        regions,
+                    );
+                }
+            }
+            GuestCopyPlan::Linear {
+                scratch,
+                detile,
+                scatter,
+            } => {
+                let one = [*detile];
+                ctx.device.cmd_copy_image_to_buffer(
+                    cb,
+                    src_image,
+                    src_layout,
+                    *scratch,
+                    &one,
+                );
+                // The scatter reads what the detile just wrote, and nothing in one
+                // command buffer orders the two by itself. A global memory barrier
+                // rather than a buffer one because there is exactly one buffer in
+                // flight between them and no other access to exclude.
+                match scatter {
+                    ScatterForm::Regions(groups) => {
+                        let detiled = [ash::vk::MemoryBarrier::default()
+                            .src_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
+                            .dst_access_mask(ash::vk::AccessFlags::TRANSFER_READ)];
+                        ctx.device.cmd_pipeline_barrier(
+                            cb,
+                            ash::vk::PipelineStageFlags::TRANSFER,
+                            ash::vk::PipelineStageFlags::TRANSFER,
+                            ash::vk::DependencyFlags::empty(),
+                            &detiled,
+                            &[],
+                            &[],
+                        );
+                        for (buffer, regions) in groups {
+                            ctx.device.cmd_copy_buffer(cb, *scratch, *buffer, regions);
+                        }
+                    }
+                    ScatterForm::Dispatches(groups) => {
+                        // Two dependencies in one barrier because they have the same
+                        // destination: the detile's write to the scratch, and the
+                        // host's write of the run tables, which happened before this
+                        // submission and so needs `HOST` named on the source side.
+                        let ready = [ash::vk::MemoryBarrier::default()
+                            .src_access_mask(
+                                ash::vk::AccessFlags::TRANSFER_WRITE | ash::vk::AccessFlags::HOST_WRITE,
+                            )
+                            .dst_access_mask(ash::vk::AccessFlags::SHADER_READ)];
+                        ctx.device.cmd_pipeline_barrier(
+                            cb,
+                            ash::vk::PipelineStageFlags::TRANSFER | ash::vk::PipelineStageFlags::HOST,
+                            ash::vk::PipelineStageFlags::COMPUTE_SHADER,
+                            ash::vk::DependencyFlags::empty(),
+                            &ready,
+                            &[],
+                            &[],
+                        );
+                        // Looked up rather than carried in the plan: the plan holds
+                        // only what a dispatch needs that is per-writeback, and the
+                        // pipeline is a fixture of the device. It is already built —
+                        // the plan could not have been made otherwise.
+                        if let Some(pipeline) = pools.scatter_pipeline(ctx) {
+                            // One bind for the whole run; the handle never changes.
+                            pipeline.bind(&ctx.device, cb);
+                            for group in groups {
+                                pipeline.dispatch(&ctx.device, cb, group.set, group.run_count);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Release a landed guest-page copy to the host so the guest's vCPU sees it.
+///
+/// Split from [`record_guest_copy_plan`] only because the render rail stamps a
+/// timestamp between the two. Every caller of that function owes this one: the
+/// copy is otherwise on the queue but never released to `HOST`, and the guest
+/// reads whatever its pages held before.
+unsafe fn release_guest_copy_to_host(
+    ctx: &context::DeviceContext,
+    cb: ash::vk::CommandBuffer,
+    plan: &GuestCopyPlan,
+) {
+    unsafe {
+        // The reader of these bytes is the guest's vCPU, which is a host reader as
+        // far as this device is concerned: the memory is guest RAM the driver
+        // imported, not device-local memory that owes a readback. So the write is
+        // released to `HOST` with `HOST_READ`, which is what makes it visible to a
+        // CPU access after the fence signals.
+        //
+        // Cache maintenance beyond that is the driver's. A host-pointer import
+        // names ordinary system pages this process already has mapped, and a PCIe
+        // write to system memory is snooped, so there is no invalidate for this
+        // side to issue.
+        //
+        // The source scope is the stage that actually wrote the guest's pages, which
+        // is the dispatch on the compute scatter and the copy on every other form.
+        // Naming `TRANSFER` alone against a dispatch would release the detile and
+        // leave the writes the guest is about to read unordered — the one place in
+        // this rail where the two forms are not interchangeable.
+        let (wrote_stage, wrote_access) = match plan {
+            GuestCopyPlan::Linear {
+                scatter: ScatterForm::Dispatches(_),
+                ..
+            } => (
+                ash::vk::PipelineStageFlags::COMPUTE_SHADER,
+                ash::vk::AccessFlags::SHADER_WRITE,
+            ),
+            _ => (
+                ash::vk::PipelineStageFlags::TRANSFER,
+                ash::vk::AccessFlags::TRANSFER_WRITE,
+            ),
+        };
+        let host_visible = [ash::vk::MemoryBarrier::default()
+            .src_access_mask(wrote_access)
+            .dst_access_mask(ash::vk::AccessFlags::HOST_READ)];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            wrote_stage,
+            ash::vk::PipelineStageFlags::HOST,
+            ash::vk::DependencyFlags::empty(),
+            &host_visible,
+            &[],
+            &[],
+        );
+    }
 }
 
 /// Import every RAMBlock in `imports` now, and report how many that took.
