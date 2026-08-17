@@ -1,33 +1,10 @@
 //! How many distinct sampled windows the workload wants live at once.
 //!
-//! # The number `AGENTS.md` asks for before a bound moves
-//!
-//! The sampled cache has two caps and a victim ledger that bands the *eviction
-//! route* — which cap fired. `sampled_evict_route`'s own doc says what that
-//! cannot answer and refuses to act without it:
-//!
-//! > nothing yet counts how many distinct `(key, identity)` windows the workload
-//! > wants live at once, and that is the number `AGENTS.md` requires before a
-//! > bound moves.
-//!
-//! The victim ledger is the closest thing to it and it is censored: it remembers
-//! `SAMPLED_REACH_BAND * 8` = 512 evictions, and a driven macos-26 boot reports
-//! `sampled_reach_beyond_ledger` **6 704** times. A reading that falls off the
-//! end of its instrument is not a large reading, it is no reading, and "raise
-//! the cap" cannot be argued from it in either direction.
-//!
-//! This counts the requested set directly and is not bounded by the cache: every
+//! This counts the requested set directly: every
 //! sampled bind names a `(SampledKey, SampledContentIdentity)` before any cache
 //! is consulted, and the distinct count of those in one census window is the
-//! working set — what a cache would have had to hold to serve the window with no
-//! miss at all.
-//!
-//! # Read the two series together or not at all
-//!
-//! `distinct` alone re-runs the mistake the eviction route was built to expose:
-//! a count cap raised without the byte cap hands every eviction straight to the
-//! other route. So the bytes those distinct windows would have cost are carried
-//! beside the count, and both are compared against both caps on the same line.
+//! working set. The bytes those distinct windows occupy are carried beside the
+//! count.
 //!
 //! # A bind with no identity is not part of the answer
 //!
@@ -37,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use super::{SampledKey, SAMPLED_CACHE_BYTE_CAP, SAMPLED_REACH_BAND};
+use super::SampledKey;
 use crate::backend::vulkan::engine::SampledContentIdentity;
 
 /// What one census window asked for.
@@ -61,11 +38,8 @@ struct Window {
 impl Window {
     /// The most distinct windows one census second may track.
     ///
-    /// Deliberately far above any plausible answer rather than fitted to one:
-    /// the question is whether the workload wants more than the 64-entry cache,
-    /// so a bound that could itself be the binding constraint would beg it.
-    /// Eight thousand is 125x the cache and ~16x the victim ledger this
-    /// replaces, and `dropped` is what says if that ever stops being enough.
+    /// Diagnostic storage only. `dropped` makes any censored reading explicit;
+    /// no residency decision reads this value.
     const CAPACITY: usize = 8192;
 
     fn want(&mut self, key: SampledKey, identity: Option<SampledContentIdentity>, bytes: usize) {
@@ -95,14 +69,12 @@ impl Window {
         let bytes: usize = self.wanted.values().sum();
         let line = format!(
             "sampled_working_set distinct={distinct} mib={:.1} no_identity={} dropped={} \
-             count_cap={SAMPLED_REACH_BAND} byte_cap_mib={} \
              (distinct (key, identity) windows this census second asked for, and what holding \
               all of them would cost; a per-window set, not a high-water — do not sum across \
               windows)",
             bytes as f64 / (1024.0 * 1024.0),
             self.no_identity,
             self.dropped,
-            SAMPLED_CACHE_BYTE_CAP / (1024 * 1024),
         );
         *self = Self::default();
         Some(line)
@@ -116,11 +88,7 @@ fn window() -> &'static std::sync::Mutex<Window> {
 }
 
 /// Record that a sampled bind wanted this window, before any cache is consulted.
-pub(crate) fn note_wanted(
-    key: SampledKey,
-    identity: Option<SampledContentIdentity>,
-    bytes: usize,
-) {
+pub(crate) fn note_wanted(key: SampledKey, identity: Option<SampledContentIdentity>, bytes: usize) {
     window()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -217,7 +185,10 @@ mod tests {
         }
         w.want(key(), id(u64::MAX, 0), 0);
         let line = w.take().expect("a bind happened");
-        assert!(line.contains(&format!("distinct={}", Window::CAPACITY)), "{line}");
+        assert!(
+            line.contains(&format!("distinct={}", Window::CAPACITY)),
+            "{line}"
+        );
         assert!(line.contains("dropped=1"), "{line}");
     }
 }

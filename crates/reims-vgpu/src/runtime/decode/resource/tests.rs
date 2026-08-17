@@ -1407,7 +1407,7 @@ fn iosurface_type11() {
 
 #[test]
 fn linear_texture_geometry() {
-    use crate::contract::endian::{st16, st64};
+    use crate::contract::endian::{st32, st64};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     let mut b = vec![0u8; TEXTURE_DESC_BASE_LEN];
     st64(&mut b[0..], 0x10000);
@@ -1415,12 +1415,19 @@ fn linear_texture_geometry() {
     st32(&mut b[TEXTURE_DESC_ROW_STRIDE..], 256);
     st32(&mut b[TEXTURE_DESC_WIDTH..], 64);
     st32(&mut b[TEXTURE_DESC_HEIGHT..], 32);
-    st16(&mut b[TEXTURE_DESC_PIXEL_FORMAT..], MTL_FORMAT_BGRA8_UNORM);
+    // The trailer is the shared serialized texture declaration. Route it
+    // through that decoder, including fields the old format-only read lost.
+    st32(
+        &mut b[TEXTURE_DESC_DECLARATION..],
+        2 | (5 << 8) | (u32::from(MTL_FORMAT_BGRA8_UNORM) << 16),
+    );
     let d = decode_texture_descriptor(&b).unwrap();
     assert_eq!(d.width, 64);
     assert_eq!(d.height, 32);
     assert_eq!(d.row_stride, 256);
-    assert_eq!(d.pixel_format, MTL_FORMAT_BGRA8_UNORM);
+    assert_eq!(d.declared_pixel_format(), Some(MTL_FORMAT_BGRA8_UNORM));
+    assert_eq!(d.declared_usage(), Some(5));
+    assert_eq!(d.declaration.unwrap().texture_type, 2);
     assert_eq!(
         d.backing_gva_size(PAGE_SHIFT_ARM64E),
         Some(((0x10u64) << RESOURCE_PAGE_SHIFT, 0x10000))
@@ -1495,13 +1502,17 @@ fn multi_mip_level_layouts() {
     st32(&mut b[rec + TEXTURE_LEVEL_WIDTH..], 32);
     st32(&mut b[rec + TEXTURE_LEVEL_HEIGHT..], 16);
     st32(&mut b[rec + TEXTURE_LEVEL_DEPTH..], 1);
-    // Format at 86 + 36
-    let pf_off = TEXTURE_DESC_PIXEL_FORMAT + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
-    st16(&mut b[pf_off..], MTL_FORMAT_BGRA8_UNORM);
+    // Declaration at 84 + 36; format remains its packed high word.
+    let declaration = TEXTURE_DESC_DECLARATION + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+    st32(
+        &mut b[declaration..],
+        2 | (4 << 8) | (u32::from(MTL_FORMAT_BGRA8_UNORM) << 16),
+    );
     let d = decode_texture_descriptor(&b).unwrap();
     assert_eq!(d.mipmap_level_count, 2);
     assert_eq!(d.levels.len(), 2);
-    assert_eq!(d.pixel_format, MTL_FORMAT_BGRA8_UNORM);
+    assert_eq!(d.declared_pixel_format(), Some(MTL_FORMAT_BGRA8_UNORM));
+    assert_eq!(d.declared_usage(), Some(4));
     let l0 = d.level(0).unwrap();
     assert_eq!((l0.width, l0.height, l0.row_stride), (64, 32, 256));
     let l1 = d.level(1).unwrap();

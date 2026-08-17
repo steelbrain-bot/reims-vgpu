@@ -1458,8 +1458,8 @@ fn list_entry_or_miss<M: HostMemory>(
     if task.object_list_count == 0 {
         return Err(ListMiss::NoObjectList);
     }
-    let off = list_object_entry_offset(ref_, task.object_list_count)
-        .ok_or(ListMiss::RefBeyondList)?;
+    let off =
+        list_object_entry_offset(ref_, task.object_list_count).ok_or(ListMiss::RefBeyondList)?;
     let entry_gva = ((task.object_list_pfn as u64) << state.page_shift)
         .checked_add(off)
         .ok_or(ListMiss::AddressOverflow)?;
@@ -1766,8 +1766,8 @@ pub fn resolve_buffer_span<M: HostMemory>(
     task_id: u32,
     buffer_ref: u32,
 ) -> Result<(u64, u64), BufferSpanRefusal> {
-    let resource = resolve_resource(state, host, task_id, buffer_ref)
-        .map_err(BufferSpanRefusal::Rung)?;
+    let resource =
+        resolve_resource(state, host, task_id, buffer_ref).map_err(BufferSpanRefusal::Rung)?;
     resolve_buffer_span_from_resource(state, &resource)
 }
 
@@ -2254,7 +2254,7 @@ fn apply_type4_backing<M: HostMemory>(
         m.type4_walk = Some(crate::model::Type4Walk {
             task_id,
             backing_pfn: surf.backing_pfn,
-            map_generation: m.map_generation,
+            page_generation: m.page_generation,
         });
         // Contiguous view must be rebuilt.
         let mut retired_import = None;

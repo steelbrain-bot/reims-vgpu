@@ -52,7 +52,9 @@ pub enum DrawReason {
     DriverCallQuarantined,
     /// A resident target bound as a sampled image must be a plain 2D image;
     /// arrayed and volume residents have no bind path.
-    ResidentSampledNot2d { binding: u32 },
+    ResidentSampledNot2d {
+        binding: u32,
+    },
     /// The draw rasterizes into more viewport/scissor slots than the host can
     /// declare in a pipeline.
     ///
@@ -79,25 +81,46 @@ pub enum DrawReason {
     /// Refusing rather than degrading is the point. Recording without
     /// `PRECISE` would answer a counting guest with a number that is neither
     /// the count nor recognisably wrong.
-    VisibilityCountingUnsupported { occlusion_query_precise: bool },
-    MultisampleAttachmentSampleCountMismatch { attachment: u32, raster: u32 },
-    MultisampleResidentTargetMissing { sample_count: u32 },
-    MultisampleLinearTransferUnsupported { sample_count: u32 },
-    MultisampleSampleCountUnsupported { requested: u32, limit: u32 },
-    MultisampleStoreActionUnsupported { store_action: u16 },
+    VisibilityCountingUnsupported {
+        occlusion_query_precise: bool,
+    },
+    MultisampleAttachmentSampleCountMismatch {
+        attachment: u32,
+        raster: u32,
+    },
+    MultisampleResidentTargetMissing {
+        sample_count: u32,
+    },
+    MultisampleLinearTransferUnsupported {
+        sample_count: u32,
+    },
+    MultisampleSampleCountUnsupported {
+        requested: u32,
+        limit: u32,
+    },
+    MultisampleStoreActionUnsupported {
+        store_action: u16,
+    },
     /// A multisample source asks to load prior contents. The current scratch
     /// rail can preserve an already-open encoder, but cannot import a
     /// multisample image from guest linear storage at encoder start.
-    MultisampleLoadActionUnsupported { load_action: u16 },
+    MultisampleLoadActionUnsupported {
+        load_action: u16,
+    },
     MultisampleResolveShapeUnsupported {
         color_targets: u32,
         depth: bool,
         color_input: bool,
     },
     /// Same for a zero-copy guest-run sampled bind.
-    GuestRunSampledNot2d { binding: u32 },
+    GuestRunSampledNot2d {
+        binding: u32,
+    },
     /// More MRT secondary attachments than the render pass can carry.
-    SecondaryAttachmentCap { requested: usize, cap: usize },
+    SecondaryAttachmentCap {
+        requested: usize,
+        cap: usize,
+    },
     /// The device does not advertise `samplerAnisotropy` and the guest sampler
     /// asked for it.
     SamplerAnisotropyUnsupported,
@@ -172,9 +195,14 @@ pub enum DrawReason {
     ConstantVertexAttribute,
     /// A per-instance step rate above 1 on a device without
     /// `vertexAttributeInstanceRateDivisor`.
-    InstanceRateDivisorUnsupported { step_rate: u32 },
+    InstanceRateDivisorUnsupported {
+        step_rate: u32,
+    },
     /// A per-instance step rate above the device's `maxVertexAttribDivisor`.
-    InstanceRateDivisorOverLimit { step_rate: u32, limit: u32 },
+    InstanceRateDivisorOverLimit {
+        step_rate: u32,
+        limit: u32,
+    },
     /// No queue family supports graphics and compute together, which the
     /// engine's single-queue submit model requires.
     NoCombinedGraphicsComputeQueue,
@@ -205,25 +233,43 @@ pub enum DrawReason {
     // absent. Named per purpose because "which allocation had nowhere to live" is
     // the diagnostic; each carries the requirement bits that matched no type.
     /// No host-visible memory type for a staging (upload) buffer.
-    NoHostVisibleMemoryForStaging { memory_type_bits: u32 },
+    NoHostVisibleMemoryForStaging {
+        memory_type_bits: u32,
+    },
     /// No host-visible memory type for a readback buffer.
-    NoHostVisibleMemoryForReadback { memory_type_bits: u32 },
+    NoHostVisibleMemoryForReadback {
+        memory_type_bits: u32,
+    },
     /// No host-visible memory type for the stats-reduction readback buffer.
-    NoHostVisibleMemoryForStats { memory_type_bits: u32 },
+    NoHostVisibleMemoryForStats {
+        memory_type_bits: u32,
+    },
     /// No device-local memory type for a storage image.
-    NoDeviceLocalMemoryForStorageImage { memory_type_bits: u32 },
+    NoDeviceLocalMemoryForStorageImage {
+        memory_type_bits: u32,
+    },
     /// No device-local memory type for a shared optimal-image slab.
-    NoDeviceLocalMemoryForSlab { memory_type_bits: u32 },
+    NoDeviceLocalMemoryForSlab {
+        memory_type_bits: u32,
+    },
     /// No device-local memory type for an MRT secondary attachment image.
-    NoDeviceLocalMemoryForMrtSecondary { memory_type_bits: u32 },
+    NoDeviceLocalMemoryForMrtSecondary {
+        memory_type_bits: u32,
+    },
     /// No device-local memory type for a depth attachment image.
-    NoDeviceLocalMemoryForDepth { memory_type_bits: u32 },
+    NoDeviceLocalMemoryForDepth {
+        memory_type_bits: u32,
+    },
     /// No device-local memory type for a draw-time guest gather destination.
-    NoDeviceLocalMemoryForGuestGather { memory_type_bits: u32 },
+    NoDeviceLocalMemoryForGuestGather {
+        memory_type_bits: u32,
+    },
     /// `VK_KHR_swapchain` is not enabled on the engine device.
     SwapchainUnavailable,
     /// The engine's queue family cannot present to the host window's surface.
-    QueueCannotPresent { queue_family: u32 },
+    QueueCannotPresent {
+        queue_family: u32,
+    },
     /// The surface's swapchain images cannot be a transfer destination, which
     /// the present blit requires.
     SwapchainLacksTransferDst,
@@ -282,9 +328,7 @@ impl crate::observe::Decline for DrawReason {
             Self::MultisampleAttachmentSampleCountMismatch { .. } => {
                 "multisample_attachment_sample_count_mismatch"
             }
-            Self::MultisampleResidentTargetMissing { .. } => {
-                "multisample_resident_target_missing"
-            }
+            Self::MultisampleResidentTargetMissing { .. } => "multisample_resident_target_missing",
             Self::MultisampleLinearTransferUnsupported { .. } => {
                 "multisample_linear_transfer_unsupported"
             }
@@ -294,9 +338,7 @@ impl crate::observe::Decline for DrawReason {
             Self::MultisampleStoreActionUnsupported { .. } => {
                 "multisample_store_action_unsupported"
             }
-            Self::MultisampleLoadActionUnsupported { .. } => {
-                "multisample_load_action_unsupported"
-            }
+            Self::MultisampleLoadActionUnsupported { .. } => "multisample_load_action_unsupported",
             Self::MultisampleResolveShapeUnsupported { .. } => {
                 "multisample_resolve_shape_unsupported"
             }
@@ -485,8 +527,7 @@ pub enum TargetReadDecline {
     /// registry entry matching this identity in everything else, or `None` when
     /// there is none. A `Some` that differs from `asked` is the second finding,
     /// stated rather than inferred — which is what the bare variant made
-    /// impossible when `REIMS_VGPU_SHARED_TARGET=off` lost every Maps frame to
-    /// it.
+    /// impossible when the copied-resident route lost every Maps frame to it.
     ///
     /// `prior` closes the first finding the same way. `how == Absent` says the
     /// registry names this surface under no key at all, which is still two
@@ -550,10 +591,7 @@ impl Decline for TargetReadDecline {
                     "held_gen",
                     held.map_or_else(|| "none".to_string(), |g| g.to_string()),
                 ),
-                (
-                    "prior",
-                    prior.map_or("none", |why| why.slug()).to_string(),
-                ),
+                ("prior", prior.map_or("none", |why| why.slug()).to_string()),
             ],
             Self::NoReadyContent => Vec::new(),
             Self::MultisampleImage { sample_count } => {

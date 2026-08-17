@@ -277,13 +277,14 @@ pub fn capture_present_frame(
     // path — kb tahoe-x86-host-reims_vgpu §8.5); otherwise the resident below.
     // There is no guest-page fallback any more — see the note at the resident
     // capture for why it was deleted rather than kept as a second vein.
-    let from_host_cache =
-        if let Some(cached) = crate::runtime::surface_cache::get(state, mapping_id, width, height) {
-            buf.copy_from_slice(cached);
-            true
-        } else {
-            false
-        };
+    let from_host_cache = if let Some(cached) =
+        crate::runtime::surface_cache::get(state, mapping_id, width, height)
+    {
+        buf.copy_from_slice(cached);
+        true
+    } else {
+        false
+    };
     // Resident-direct capture — the ONLY GPU-content capture source.
     //
     // The proxies need the finished frame's BYTES; they do not need those bytes

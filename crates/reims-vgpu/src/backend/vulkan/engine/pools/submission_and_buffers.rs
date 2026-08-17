@@ -91,13 +91,13 @@ mod pass_echo_delta_order {
     /// cache derives it — `AdHocFramebufferKey` is `(render pass, views,
     /// extent)` — so a shape change brings a new handle with it exactly as it
     /// does on the draw path, which is the whole condition under test.
-    fn echo(image: u64, host_accessible: bool) -> PassEcho {
+    fn echo(image: u64, variation: bool) -> PassEcho {
         let mut key = PassKey::single(true, vk::Format::B8G8R8A8_UNORM);
-        key.host_accessible_color0 = host_accessible;
+        key.color_input = variation;
         PassEcho {
             cb: vk::CommandBuffer::null(),
             compatibility: key.compatibility(),
-            fb: vk::Framebuffer::from_raw(image * 2 + host_accessible as u64),
+            fb: vk::Framebuffer::from_raw(image * 2 + variation as u64),
             target_image: vk::Image::from_raw(image),
             area: (1920, 1080),
         }
@@ -146,25 +146,17 @@ mod pass_echo_delta_order {
 }
 
 impl ResourcePools {
-    /// End one guest parent allocation's backend lifetime. If child images are
-    /// still live, their deferred destruction releases it after the last fence.
+    /// End one guest allocation's backend lifetime after open submissions.
     pub(crate) unsafe fn retire_guest_import(
         &mut self,
         device: &ash::Device,
         import_id: crate::runtime::guest_ram::ImportId,
     ) {
-        match self.host_ram_imports.retire(import_id) {
-            host_ram::ParentRetire::Ready(parent) => {
-                crate::runtime::drain::note_store_route("guest_import_retired_now");
-                self.dispose(device, DeferredHandle::GuestAllocation(parent));
-            }
-            host_ram::ParentRetire::WaitingForChildren => {
-                crate::runtime::drain::note_store_route("guest_import_retired_waiting_child");
-                self.dispose(device, DeferredHandle::GuestAllocationBarrier(import_id));
-            }
-            host_ram::ParentRetire::NotImported => {
-                crate::runtime::drain::note_store_route("guest_import_retired_unimported");
-            }
+        if let Some(parent) = self.host_ram_imports.retire(import_id) {
+            crate::runtime::drain::note_store_route("guest_import_retired_now");
+            self.dispose(device, DeferredHandle::GuestAllocation(parent));
+        } else {
+            crate::runtime::drain::note_store_route("guest_import_retired_unimported");
         }
     }
 
@@ -254,7 +246,6 @@ impl ResourcePools {
             attachment_snapshot_live: Vec::new(),
             sampled_cache: Vec::new(),
             sampled_cache_bytes: 0,
-            guest_sampled: HashMap::new(),
             sampled_victims: std::collections::VecDeque::new(),
             storage_image_free: FreePool::new(
                 STORAGE_IMAGE_FREE_CAP_PER_KEY,
@@ -459,60 +450,44 @@ impl ResourcePools {
         trimmed + buf_trimmed
     }
 
-    /// Reclaim direct images only after their serialized resource dies.
-    /// Unlike copied sampled content, these images are the resource itself;
-    /// time since the last bind says nothing about their lifetime.
-    unsafe fn trim_dead_guest_sampled(&mut self, device: &ash::Device, max: usize) -> usize {
-        let keys = self.dead_guest_sampled_keys(max);
-        for key in &keys {
-            if let Some(slot) = self.guest_sampled.remove(key) {
-                crate::runtime::drain::note_store_route("sampled_direct_resource_retired");
-                self.dispose(
-                    device,
-                    DeferredHandle::GuestImage {
-                        image: slot.image,
-                        view: slot.view,
-                        _import: slot._import,
-                    },
-                );
-            }
-        }
-        keys.len()
-    }
-
-    fn dead_guest_sampled_keys(&self, max: usize) -> Vec<GuestSampledKey> {
-        self.guest_sampled
-            .iter()
-            .filter_map(|(key, slot)| (!slot.owner.is_live()).then_some(key.clone()))
-            .take(max)
-            .collect()
-    }
-
-    /// Take entry `index` out of the sampled cache, charge the byte accounting,
-    /// and remember what was lost.
-    ///
-    /// The only way an entry leaves [`Self::sampled_cache`], which is the point:
-    /// the victim ledger is what separates "the cache never held this" from "the
-    /// cache held it and let it go", and a removal site that forgot to record
-    /// one would move misses into the first class silently. There were two such
-    /// sites and only one recorded; now neither can, because neither removes.
-    ///
-    /// An entry with no identity is not remembered. The gather rail's lookup is
-    /// identity-only, so such a window could never have been found again at any
-    /// cache size and banding its distance would answer a question nobody asked.
-    fn evict_sampled_entry(&mut self, index: usize, route: SampledVictimRoute) -> SampledSlot {
+    /// Take entry `index` out of the sampled cache and update its byte gauge.
+    /// `route` is present only for a failed-submission discard; ordinary
+    /// resource deletion is not a lost cache entry and leaves no victim record.
+    fn remove_sampled_entry(
+        &mut self,
+        index: usize,
+        route: Option<SampledVictimRoute>,
+    ) -> SampledSlot {
         let evicted = self.sampled_cache.remove(index);
         self.sampled_cache_bytes = self.sampled_cache_bytes.saturating_sub(evicted.content_len);
-        if let Some(identity) = evicted.identity {
+        if let (Some(identity), Some(route)) = (evicted.identity, route) {
             self.sampled_victims.push_front(SampledVictim {
                 key: evicted.slot.key(),
                 identity,
-                content_len: evicted.content_len,
                 route,
             });
             self.sampled_victims.truncate(SAMPLED_VICTIM_LEDGER);
         }
         evicted.slot
+    }
+
+    fn evict_sampled_entry(&mut self, index: usize, route: SampledVictimRoute) -> SampledSlot {
+        self.remove_sampled_entry(index, Some(route))
+    }
+
+    /// Remove entries whose serialized texture owners are all gone. The
+    /// returned slots still follow the ordinary deferred recycle path, so a
+    /// submission recorded before deletion may finish sampling them safely.
+    fn take_released_sampled_entries(&mut self) -> Vec<SampledSlot> {
+        let mut released = Vec::new();
+        while let Some(index) = self
+            .sampled_cache
+            .iter()
+            .position(|entry| !entry.has_live_owner())
+        {
+            released.push(self.remove_sampled_entry(index, None));
+        }
+        released
     }
 
     /// Update the consecutive-settled-pass counter for maintenance and return
@@ -563,10 +538,12 @@ impl ResourcePools {
         if !self.plan_idle_maintenance(now_ms) {
             return;
         }
+        for slot in self.take_released_sampled_entries() {
+            self.dispose(&ctx.device, DeferredHandle::RecycleSampled(slot));
+        }
         self.retire_released_residents(ctx, counters, IDLE_RECYCLE_TRIM_PER_PASS);
         let trim_buffers = self.note_maintenance_settled();
         self.trim_recycle_pools(&ctx.device, IDLE_RECYCLE_TRIM_PER_PASS, trim_buffers);
-        self.trim_dead_guest_sampled(&ctx.device, IDLE_RECYCLE_TRIM_PER_PASS);
     }
 
     /// Cumulative transient sampled/snapshot pool recycle diagnostics:
@@ -1551,16 +1528,11 @@ impl ResourcePools {
     /// `sampled_admit_kept` 3876, and 58.9 GB of guest texels imported in one
     /// driven boot against 219 MB on macos-13.
     ///
-    /// The admissions run **after** the slot is marked pending, not before. An
-    /// admission can evict, an eviction disposes, and `dispose` defers against
-    /// the slots open right now — the CB just submitted may sample the image
-    /// being evicted, so this slot has to be in that mask. It is the same
-    /// ordering the ad-hoc framebuffer disposal in `exec` relies on.
-    ///
-    /// # Safety
-    ///
-    /// `device` must be the device every parked handle belongs to.
-    pub(crate) unsafe fn finish_entry_async(&mut self, device: &ash::Device, sealed: SealedEntry) {
+    /// The admissions run **after** the slot is marked pending, not before.
+    /// Entries that cannot be retained return their images to `sampled_live`;
+    /// making this slot visible first ensures the next seal parks them behind
+    /// the command buffer that filled or sampled them.
+    pub(crate) unsafe fn finish_entry_async(&mut self, sealed: SealedEntry, timeline: Option<u64>) {
         let SealedEntry {
             cleanup,
             admissions,
@@ -1575,8 +1547,8 @@ impl ResourcePools {
         // submit paths reach — a batch flush and a lone draw's own submit. The
         // trail's per-slot record is cleared again in `retire_slot`, so a slot
         // holding one is a submission whose fence has not signalled.
-        crate::runtime::gpu_hang_trail::note_submit(self.cur);
-        self.admit_recorded_sampled(device, admissions);
+        crate::runtime::gpu_hang_trail::note_submit(self.cur, timeline);
+        self.admit_recorded_sampled(admissions);
     }
 
     /// Give the content cache the images a recorded command buffer fills.
@@ -1589,20 +1561,13 @@ impl ResourcePools {
     ///
     /// # The precondition, and why it is not the same instant for both callers
     ///
-    /// An admission can evict, an eviction disposes, and [`Self::dispose`] frees
-    /// immediately when [`Self::open_slot_mask`] is empty. The command buffer
-    /// that fills these images may also be sampling the one being evicted, so it
-    /// must already be *in* that mask. Read `open_slot_mask`'s own doc: a batch
-    /// puts its slot in the mask the moment `open_batch` is set, while a
-    /// non-batch slot is in it only once its cleanup is parked. That is the
-    /// whole reason the batch may admit while it is still recording and the
-    /// non-batch path may not — and the `debug_assert` is what keeps a third
-    /// caller from being added at the wrong instant.
-    unsafe fn admit_recorded_sampled(
-        &mut self,
-        device: &ash::Device,
-        admissions: Vec<(SampledSlot, SampledRetain)>,
-    ) {
+    /// An admission that cannot be retained returns its image to
+    /// `sampled_live`. The command buffer that fills or samples that image must
+    /// already be represented by [`Self::open_slot_mask`] so the next seal
+    /// parks the image behind the right fence. A batch enters the mask when
+    /// `open_batch` is set; a non-batch slot enters it when its cleanup is
+    /// parked. The assertion keeps a third caller from admitting too early.
+    unsafe fn admit_recorded_sampled(&mut self, admissions: Vec<(SampledSlot, SampledRetain)>) {
         debug_assert!(
             admissions.is_empty() || self.open_slot_mask() & (1 << self.cur) != 0,
             "admitting while the filling command buffer's slot is invisible to dispose()"
@@ -1611,7 +1576,12 @@ impl ResourcePools {
             crate::runtime::drain::note_store_route("sampled_admit_twin_in_entry");
         }
         for (slot, retain) in admissions {
-            self.admit_sampled_slot(device, slot, &retain.content, retain.identity);
+            self.admit_sampled_slot(
+                slot,
+                &retain.content,
+                retain.identity,
+                retain.resource_lifetime.as_ref(),
+            );
         }
     }
 
@@ -1624,10 +1594,8 @@ impl ResourcePools {
     /// is a pure optimisation, so "some of this is unfilled" has a sound answer
     /// that needs no bookkeeping at all.
     ///
-    /// Every removal goes through [`Self::evict_sampled_entry`], so the victim
-    /// ledger stays the single account of how entries leave, and each slot is
-    /// disposed rather than dropped because an *earlier* in-flight CB may still
-    /// be sampling it.
+    /// Discard records failed-publication victims, and each slot is disposed
+    /// rather than dropped because an earlier in-flight CB may still sample it.
     pub(crate) unsafe fn discard_sampled_cache(&mut self, device: &ash::Device) {
         for slot in self.take_whole_sampled_cache() {
             self.dispose(device, DeferredHandle::RecycleSampled(slot));
@@ -1638,11 +1606,7 @@ impl ResourcePools {
     /// through the one removal site and return the slots for the caller to
     /// dispose.
     ///
-    /// Split out so the accounting is testable without a device. A discard that
-    /// emptied `sampled_cache` without returning `sampled_cache_bytes` to zero
-    /// would leave the byte cap believing it was full for the rest of the boot,
-    /// and every later admission would evict a live entry to make room that was
-    /// already there.
+    /// Split out so the accounting is testable without a device.
     fn take_whole_sampled_cache(&mut self) -> Vec<SampledSlot> {
         if self.sampled_cache.is_empty() {
             return Vec::new();
@@ -1796,7 +1760,10 @@ impl ResourcePools {
         let Some(open) = self.open_pass.take() else {
             return;
         };
-        debug_assert_eq!(open.cb, cb, "open render pass belongs to another command buffer");
+        debug_assert_eq!(
+            open.cb, cb,
+            "open render pass belongs to another command buffer"
+        );
         unsafe { device.cmd_end_render_pass(open.cb) };
     }
 
@@ -1873,12 +1840,8 @@ impl ResourcePools {
     /// has not yet delivered. [`Self::batch_flush`] keeps it or, if the submit
     /// fails, calls [`Self::discard_sampled_cache`].
     ///
-    /// # Safety
-    ///
-    /// `device` must be the device the retained images belong to.
     pub(crate) unsafe fn batch_append(
         &mut self,
-        device: &ash::Device,
         // The pair [`Self::batch_slot`] and [`Self::begin_entry`] both hand
         // back, passed through as one value because it only ever travels as one.
         slot: (vk::CommandBuffer, vk::Fence),
@@ -1912,7 +1875,7 @@ impl ResourcePools {
             }
         }
         let admissions = take_retained_slots(&mut self.sampled_live, sampled_retains);
-        self.admit_recorded_sampled(device, admissions);
+        self.admit_recorded_sampled(admissions);
     }
 
     /// Submit the open batch (if any): end its CB, queue it on the batch
@@ -1956,7 +1919,7 @@ impl ResourcePools {
             close_started.elapsed().as_micros() as u64,
             Ordering::Relaxed,
         );
-        let submit = (|| -> Result<(), DrawError> {
+        let submit = (|| -> Result<Option<u64>, DrawError> {
             let end_started = std::time::Instant::now();
             let end_result = ctx.device.end_command_buffer(batch.cb);
             counters
@@ -1971,7 +1934,7 @@ impl ResourcePools {
                 Ordering::Relaxed,
             );
             match result {
-                Ok(()) => Ok(()),
+                Ok(timeline) => Ok(timeline),
                 Err(e) if e == vk::Result::ERROR_DEVICE_LOST => {
                     Err(DrawError::DeviceLost(DeviceLostDecline::Driver {
                         op: DeviceLostOp::PoolsSubmitBatch,
@@ -1982,10 +1945,10 @@ impl ResourcePools {
             }
         })();
         match submit {
-            Ok(()) => {
+            Ok(timeline) => {
                 let finish_started = std::time::Instant::now();
                 let sealed = self.seal_entry(std::mem::take(&mut batch.dsets), Vec::new());
-                self.finish_entry_async(&ctx.device, sealed);
+                self.finish_entry_async(sealed, timeline);
                 counters.batch_flush_finish_us.fetch_add(
                     finish_started.elapsed().as_micros() as u64,
                     Ordering::Relaxed,
@@ -2306,13 +2269,16 @@ impl ResourcePools {
             .fetch_add(requested.len() as u64, Ordering::Relaxed);
 
         g.vertex_scratch.clear();
-        g.vertex_scratch.extend(requested.iter().map(|(binding, bound)| {
-            super::VertexBufferBinding {
-                binding: *binding,
-                buffer: bound.buffer,
-                offset: bound.offset,
-            }
-        }));
+        g.vertex_scratch
+            .extend(
+                requested
+                    .iter()
+                    .map(|(binding, bound)| super::VertexBufferBinding {
+                        binding: *binding,
+                        buffer: bound.buffer,
+                        offset: bound.offset,
+                    }),
+            );
         super::normalize_vertex_bindings(&mut g.vertex_scratch);
         counters
             .vertex_buffer_bind_emitted
@@ -2344,9 +2310,7 @@ impl ResourcePools {
     }
 
     /// Scratch in which the next draw normalizes its push-descriptor state.
-    pub(crate) fn push_descriptor_scratch(
-        &mut self,
-    ) -> &mut Vec<super::PushDescriptorBinding> {
+    pub(crate) fn push_descriptor_scratch(&mut self) -> &mut Vec<super::PushDescriptorBinding> {
         self.cb_graphics.push_scratch.clear();
         &mut self.cb_graphics.push_scratch
     }
@@ -2359,12 +2323,7 @@ impl ResourcePools {
         counters: &EngineCounters,
     ) -> bool {
         let g = &mut self.cb_graphics;
-        if super::push_descriptors_match(
-            g.push_layout,
-            &g.push_bindings,
-            layout,
-            &g.push_scratch,
-        ) {
+        if super::push_descriptors_match(g.push_layout, &g.push_bindings, layout, &g.push_scratch) {
             counters
                 .descriptor_push_held
                 .fetch_add(1, Ordering::Relaxed);
@@ -2471,6 +2430,10 @@ impl ResourcePools {
                     self.compute_write_pins_live.push(*identity);
                 }
             }
+            // The parent import is device-owned and its retirement is deferred
+            // against this submission's ring slot. There is no separate
+            // resident object to pin.
+            super::super::GuestWriteSource::ImportedBuffer => {}
             // Nothing to pin: the ring entry this submission sealed already owns
             // the image and will not recycle it before the fence retires, so a
             // pin here would be a second owner of one lifetime and the ledger
@@ -3601,119 +3564,6 @@ impl ResourcePools {
         unsafe { self.acquire_sampled_for(ctx, sk, counters, SampledTransientUse::Upload) }
     }
 
-    /// Bind a 2D sampled image directly over one packed guest allocation.
-    /// `Ok(None)` is an optional-rail decline; the caller retains its complete
-    /// buffer-to-image fallback over the same source.
-    pub(crate) unsafe fn acquire_guest_sampled(
-        &mut self,
-        ctx: &DeviceContext,
-        image: SampledKey,
-        backing: crate::backend::vulkan::engine::GuestTargetBacking,
-        import: std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
-        owner: crate::model::TaskResourceLifetimeRef,
-        counters: &EngineCounters,
-    ) -> Result<Option<GuestSampledUse>, DrawError> {
-        let key = GuestSampledKey {
-            image,
-            backing,
-            owner_id: owner.id(),
-        };
-        if let Some(slot) = self.guest_sampled.get_mut(&key) {
-            return Ok(Some(GuestSampledUse {
-                key,
-                image: slot.image,
-                view: slot.view,
-                initialized: slot.initialized,
-            }));
-        }
-        // A component mapping is legal on the view; only the image
-        // dimensionality must be the ordinary single-plane 2D form.
-        if key.image.layers != 1
-            || key.image.volume
-            || key.image.cube
-            || key.image.arrayed
-            || key.image.one_dim
-        {
-            return Ok(None);
-        }
-        let imported = match unsafe {
-            super::super::linear_target_import::create(
-                ctx,
-                &mut self.host_ram_imports,
-                &import,
-                key.backing,
-                key.image.width,
-                key.image.height,
-                key.image.format,
-                vk::ImageUsageFlags::SAMPLED,
-            )
-        } {
-            Ok(imported) => imported,
-            Err(reason) => {
-                crate::runtime::drain::note_store_route("sampled_direct_declined");
-                let hash = crate::backend::hash::hash_u64(
-                    crate::backend::hash::hash_bytes(reason.slug().as_bytes()),
-                    key.image.format.as_raw() as u32 as u64,
-                );
-                crate::observe::Emit::decline("vk_guest_sampled", &reason)
-                    .field("format", format!("{:?}", key.image.format))
-                    .field("width", key.image.width)
-                    .field("height", key.image.height)
-                    .fail_once(hash);
-                return Ok(None);
-            }
-        };
-        counters.note_create(CreateSite::GuestSampledImage);
-        let view = match unsafe {
-            ctx.device.create_image_view(
-                &vk::ImageViewCreateInfo::default()
-                    .image(imported.image)
-                    .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(key.image.format)
-                    .components(translate::pixel::vk_component_mapping(&key.image.swizzle))
-                    .subresource_range(super::super::color_subresource_range()),
-                None,
-            )
-        } {
-            Ok(view) => view,
-            Err(error) => {
-                ctx.device.destroy_image(imported.image, None);
-                if let Some(parent) = self.host_ram_imports.release_child(&import) {
-                    parent.destroy(&ctx.device);
-                }
-                return Err(DrawError::VkCall(VkCall::new(
-                    VkOp::PoolsCreateSampledView,
-                    error,
-                )));
-            }
-        };
-        counters.note_create(CreateSite::GuestSampledImageView);
-        let use_ = GuestSampledUse {
-            key: key.clone(),
-            image: imported.image,
-            view,
-            initialized: false,
-        };
-        self.guest_sampled.insert(
-            key,
-            GuestSampledSlot {
-                image: imported.image,
-                view,
-                _import: import,
-                owner,
-                initialized: false,
-            },
-        );
-        crate::runtime::drain::note_store_route("sampled_direct_created");
-        Ok(Some(use_))
-    }
-
-    pub(crate) fn mark_guest_sampled_read(&mut self, key: &GuestSampledKey) {
-        if let Some(slot) = self.guest_sampled.get_mut(key) {
-            slot.initialized = true;
-        }
-    }
-
     pub(crate) unsafe fn acquire_attachment_snapshot(
         &mut self,
         ctx: &DeviceContext,
@@ -3721,12 +3571,7 @@ impl ResourcePools {
         counters: &EngineCounters,
     ) -> Result<SampledSlot, DrawError> {
         unsafe {
-            self.acquire_sampled_for(
-                ctx,
-                sk,
-                counters,
-                SampledTransientUse::AttachmentSnapshot,
-            )
+            self.acquire_sampled_for(ctx, sk, counters, SampledTransientUse::AttachmentSnapshot)
         }
     }
 
@@ -3760,9 +3605,7 @@ impl ResourcePools {
             let handles = slot.handles();
             match use_ {
                 SampledTransientUse::Upload => self.sampled_live.push(slot),
-                SampledTransientUse::AttachmentSnapshot => {
-                    self.attachment_snapshot_live.push(slot)
-                }
+                SampledTransientUse::AttachmentSnapshot => self.attachment_snapshot_live.push(slot),
             }
             return Ok(handles);
         }
@@ -3874,9 +3717,7 @@ impl ResourcePools {
         let handles = slot.handles();
         match use_ {
             SampledTransientUse::Upload => self.sampled_live.push(slot),
-            SampledTransientUse::AttachmentSnapshot => {
-                self.attachment_snapshot_live.push(slot)
-            }
+            SampledTransientUse::AttachmentSnapshot => self.attachment_snapshot_live.push(slot),
         }
         Ok(handles)
     }
@@ -3897,8 +3738,10 @@ impl ResourcePools {
         &mut self,
         key: SampledKey,
         identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
+        resource_lifetime: Option<&crate::model::TaskResourceLifetimeRef>,
     ) -> Option<SampledSlot> {
         let id = identity?;
+        let owner = resource_lifetime.filter(|owner| owner.is_live())?;
         // Counted after the `identity?`, so the route bands the lookups this arm
         // actually suppressed rather than every call — a bind with no identity
         // could not have hit at any setting.
@@ -3906,11 +3749,11 @@ impl ResourcePools {
             crate::runtime::drain::note_store_route("sampled_identity_off");
             return None;
         }
-        let index = self
-            .sampled_cache
-            .iter()
-            .position(|entry| entry.slot.key() == key && entry.identity == Some(id))?;
+        let index = self.sampled_cache.iter().position(|entry| {
+            entry.has_live_owner() && entry.slot.key() == key && entry.identity == Some(id)
+        })?;
         let mut entry = self.sampled_cache.remove(index);
+        entry.retain_owner(owner);
         entry.last_touch_ms = self.idle_clock_ms;
         let handles = entry.slot.handles();
         self.sampled_cache.push(entry);
@@ -3923,15 +3766,12 @@ impl ResourcePools {
         &mut self,
         key: SampledKey,
         identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
+        resource_lifetime: Option<&crate::model::TaskResourceLifetimeRef>,
         counters: &EngineCounters,
     ) -> Option<SampledSlot> {
-        let Some(handles) = self.find_sampled_by_identity(key, identity) else {
-            // A miss the caps caused is the only kind worth banding, and the
-            // ledger is what tells the two apart: a window it remembers was
-            // here and was evicted, and one it does not is either content this
-            // cache has never held or content evicted longer ago than the
-            // instrument can see. Those are opposite findings and the second
-            // route says which.
+        let Some(handles) = self.find_sampled_by_identity(key, identity, resource_lifetime) else {
+            // The ledger distinguishes an entry invalidated by a failed
+            // submission from content this cache has never held.
             if let Some(id) = identity {
                 self.note_sampled_reach(key, id);
             }
@@ -3943,17 +3783,12 @@ impl ResourcePools {
         Some(handles)
     }
 
-    /// Band how much cache would have turned this miss into a hit.
-    ///
-    /// Split out from the lookup so the walk is named: it is the only reason
-    /// this rail touches the ledger, and it is skipped entirely for a bind with
-    /// no identity, which could not have hit at any cache size.
+    /// Say whether this miss names an entry invalidated by failed submission.
     fn note_sampled_reach(
         &self,
         key: SampledKey,
         identity: crate::backend::vulkan::engine::SampledContentIdentity,
     ) {
-        let mut bytes = self.sampled_cache_bytes;
         // The two halves of a cache entry's name fail for different reasons, so
         // the walk asks about them separately. A window whose content identity
         // the ledger remembers under a *different* `SampledKey` did not lose a
@@ -3963,8 +3798,7 @@ impl ResourcePools {
         // `beyond_ledger` says "never cached", which is true of the pair and
         // misleading about the window.
         let mut identity_elsewhere = false;
-        for (distance, victim) in self.sampled_victims.iter().enumerate() {
-            bytes = bytes.saturating_add(victim.content_len);
+        for victim in &self.sampled_victims {
             if victim.identity != identity {
                 continue;
             }
@@ -3972,9 +3806,6 @@ impl ResourcePools {
                 identity_elsewhere = true;
                 continue;
             }
-            let (count_route, byte_route) = sampled_reach_bands(distance, bytes);
-            crate::runtime::drain::note_store_route(count_route);
-            crate::runtime::drain::note_store_route(byte_route);
             crate::runtime::drain::note_store_route(victim.route.route());
             return;
         }
@@ -3990,6 +3821,7 @@ impl ResourcePools {
         key: SampledKey,
         content: &[u8],
         identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
+        resource_lifetime: Option<&crate::model::TaskResourceLifetimeRef>,
         counters: &EngineCounters,
     ) -> Option<SampledSlot> {
         // Before any cache is consulted, so the set is what the workload *asked
@@ -3998,7 +3830,7 @@ impl ResourcePools {
         // `SAMPLED_VICTIM_LEDGER` and reads `beyond_ledger` 6 704 times on a
         // driven macos-26 boot.
         super::sampled_working_set::note_wanted(key, identity, content.len());
-        if let Some(handles) = self.find_sampled_by_identity(key, identity) {
+        if let Some(handles) = self.find_sampled_by_identity(key, identity, resource_lifetime) {
             counters
                 .sampled_identity_hits
                 .fetch_add(1, Ordering::Relaxed);
@@ -4009,11 +3841,18 @@ impl ResourcePools {
         // what decide the hit. `ResidentSampledSlot::content` carries why the
         // digest is not allowed to answer on its own.
         let found = self.sampled_cache.iter().position(|entry| {
-            entry.slot.key() == key
+            entry.has_live_owner()
+                && entry.slot.key() == key
                 && entry.fingerprint == SampledFingerprint::Content(content_hash)
                 && entry.content.as_deref().is_some_and(|b| b == content)
         });
         let Some(index) = found else {
+            counters
+                .sampled_cache_misses
+                .fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        let Some(owner) = resource_lifetime.filter(|owner| owner.is_live()) else {
             counters
                 .sampled_cache_misses
                 .fetch_add(1, Ordering::Relaxed);
@@ -4025,6 +3864,7 @@ impl ResourcePools {
         if identity.is_some() {
             entry.identity = identity;
         }
+        entry.retain_owner(owner);
         entry.last_touch_ms = self.idle_clock_ms;
         let handles = entry.slot.handles();
         self.sampled_cache.push(entry);
@@ -4036,38 +3876,25 @@ impl ResourcePools {
     }
 
     /// Admit one detached sampled slot into the exact-content cache. A slot
-    /// whose content duplicates an existing entry returns to the live list
-    /// (recycled later); cap evictions go through dispose() so an image a
-    /// concurrent in-flight CB samples is never destroyed under it.
+    /// whose content duplicates an existing entry, or has no serialized owner,
+    /// returns to the live list for fence-safe recycling.
     ///
     /// # Every exit is counted, because a cache that never fills looks the same
     ///
-    /// `sampled_admit_kept`, `_duplicate`, `_no_identity` and `_oversize` sum to
-    /// every call, and their sum against `sampled_guest_imports` is the question
-    /// the reach ledger cannot answer on its own: a miss reported
-    /// `sampled_reach_beyond_ledger` is a window this cache never *evicted*, and
-    /// that has two causes — it was admitted and is still here under a different
-    /// name, or it was never admitted at all. Only these say which.
-    unsafe fn admit_sampled_slot(
+    /// `sampled_admit_kept`, `_duplicate`, `_no_identity` and `_no_lifetime`
+    /// partition the calls.
+    fn admit_sampled_slot(
         &mut self,
-        device: &ash::Device,
         slot: SampledSlot,
         content: &SampledRetainContent,
         identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
+        resource_lifetime: Option<&crate::model::TaskResourceLifetimeRef>,
     ) {
-        for evicted in self.admit_sampled_entry(slot, content, identity) {
-            // Recycle rather than destroy: a content-changing sampled input
-            // (live tile / video frame) re-uploads into this same-geometry image
-            // next frame instead of a fresh vkAllocateMemory. Routed through the
-            // in-flight-safe deferral (an in-flight CB may still sample it).
-            self.dispose(device, DeferredHandle::RecycleSampled(evicted));
-        }
+        self.admit_sampled_entry(slot, content, identity, resource_lifetime);
     }
 
-    /// Device-free half of [`Self::admit_sampled_slot`]: place the entry, charge
-    /// the byte accounting, and return the slots the caps pushed out for the
-    /// caller to dispose. Split out so admission — the rail that decides whether
-    /// a window is gathered twice — is reachable from a test with no GPU.
+    /// Device-free half of [`Self::admit_sampled_slot`], split out so admission
+    /// is reachable from a test with no GPU.
     ///
     /// The three arms that decline hand the slot back to `sampled_live`, which
     /// this entry's own [`Self::seal_entry`] has just emptied — so it is swept
@@ -4079,7 +3906,13 @@ impl ResourcePools {
         slot: SampledSlot,
         content: &SampledRetainContent,
         identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
-    ) -> Vec<SampledSlot> {
+        resource_lifetime: Option<&crate::model::TaskResourceLifetimeRef>,
+    ) {
+        let Some(owner) = resource_lifetime.filter(|owner| owner.is_live()) else {
+            crate::runtime::drain::note_store_route("sampled_admit_no_lifetime");
+            self.sampled_live.push(slot);
+            return;
+        };
         let (fingerprint, retained, content_len) = match content {
             // The `Arc` is cloned rather than the bytes copied: the retire path
             // already holds one, so recognising this entry by content later
@@ -4091,7 +3924,7 @@ impl ResourcePools {
             ),
             // Nothing hashed the bytes, so nothing can recognise this image by
             // them. An entry with no identity to be found under would be
-            // unreachable dead weight in a capped cache, so it is not admitted.
+            // unreachable dead weight, so it is not admitted.
             //
             // The identity-only lookup being switched off makes *every*
             // `Gathered` entry unreachable in exactly the same sense, so the
@@ -4103,23 +3936,19 @@ impl ResourcePools {
                 if identity.is_none() || !sampled_identity_enabled() {
                     crate::runtime::drain::note_store_route("sampled_admit_no_identity");
                     self.sampled_live.push(slot);
-                    return Vec::new();
+                    return;
                 }
                 (SampledFingerprint::Gathered, None, *len)
             }
         };
-        if content_len > SAMPLED_CACHE_BYTE_CAP {
-            crate::runtime::drain::note_store_route("sampled_admit_oversize");
-            self.sampled_live.push(slot);
-            return Vec::new();
-        }
         // Deduplication asks the same question a lookup does, so it has to
         // answer it the same way: a fingerprint match proposes a duplicate and
         // something else confirms it. Collapsing two entries here is exactly as
         // wrong as returning the wrong one from `find_cached_sampled` — the
         // survivor then answers for content it was not built from.
         let duplicate = self.sampled_cache.iter_mut().find(|entry| {
-            entry.slot.key() == slot.key()
+            entry.has_live_owner()
+                && entry.slot.key() == slot.key()
                 && entry.fingerprint == fingerprint
                 && match fingerprint {
                     // Every `Gathered` fingerprint is equal to every other, so
@@ -4137,8 +3966,9 @@ impl ResourcePools {
             if identity.is_some() {
                 existing.identity = identity;
             }
+            existing.retain_owner(owner);
             self.sampled_live.push(slot);
-            return Vec::new();
+            return;
         }
         crate::runtime::drain::note_store_route("sampled_admit_kept");
         self.sampled_cache_bytes = self.sampled_cache_bytes.saturating_add(content_len);
@@ -4149,22 +3979,9 @@ impl ResourcePools {
             content: retained,
             content_len,
             identity,
+            owners: vec![owner.clone()],
             last_touch_ms: touch,
         });
-        // Which of the two caps is doing the evicting decides whether a later
-        // miss is a capacity eviction or content the cache has never held.
-        // `sampled_cache_misses` cannot tell them apart — a miss is only the
-        // absence of a (key, fingerprint) entry, and the two causes look
-        // identical from there. Both routes reading zero says every miss is
-        // content, and then raising either cap buys nothing.
-        // Bytes are the only bound. There used to be an entry count beside them
-        // and it was the one that bound: see [`sampled_evict_route`].
-        let mut evicted = Vec::new();
-        while self.sampled_cache_bytes > SAMPLED_CACHE_BYTE_CAP {
-            crate::runtime::drain::note_store_route(SAMPLED_EVICT_BYTE_CAP);
-            evicted.push(self.evict_sampled_entry(0, SampledVictimRoute::Cap));
-        }
-        evicted
     }
 
     pub(crate) fn recycle_sampled(&mut self) {
@@ -4313,146 +4130,6 @@ fn note_readback_memory(
     }
 }
 
-/// The route name a byte-cap eviction is counted under.
-///
-/// # There used to be an entry count beside the byte cap, and it was the bound
-///
-/// The cache carried two limits — 64 entries and 128 MB — and evicted while
-/// *either* was over. A previous A/B measured them on one workload, a driven
-/// Safari drag whose sampled windows are ~2.29 MB each, and concluded correctly
-/// that raising the count alone buys nothing there: at that window size 64
-/// entries is ~146 MB, so the byte cap binds at ~56 entries and the count cap
-/// is the same number twice.
-///
-/// That reasoning holds for that workload and does not generalise, which is the
-/// failure `AGENTS.md` names — "the bound is sized against the boots you ran".
-/// Three independent reporter logs, on three hosts and three guest lines, all
-/// report the opposite shape. Read the reach bands, which are the instrument
-/// that A/B did not have:
-///
-/// ```text
-///                       evict_count_cap   reach_bytes_1x   reach_bytes_>=2x
-///   Iris Xe, import off            5454             1290                 13
-///   RTX 4060 Ti, macos-26          3266              714                 37
-///   AMD iGPU, macos-12            18356             1911                  0
-/// ```
-///
-/// Every one of them evicts thousands of times on the *count* while the byte
-/// occupancy sits in its lowest band — these workloads' windows are small, so
-/// 64 entries is nowhere near 128 MB and the byte cap never binds at all. The
-/// count is doing all the evicting and bounding nothing, and
-/// `sampled_reach_lost_to_cap` — binds that missed *because of* capacity, with
-/// the guest-write witness having vouched — reads 1287, 541 and 1671 against
-/// `gw_refused_host_write` of 9, 275 and 1376. The misses are capacity, not
-/// compulsory.
-///
-/// Eviction takes index 0, insertion order, so the entry it drops first is the
-/// one created first — for a compositor that is the backdrop bound every frame.
-/// `AGENTS.md` records the identical shape in `engine::caches`, which held 1024
-/// entries evicting in insertion order and paid a driver-side shader compile per
-/// frame forever after.
-///
-/// So the count is gone and the bytes remain. `SAMPLED_CACHE_BYTE_CAP` bounds
-/// the scarce thing — host memory this cache is holding — and the entry count
-/// bounded a number nobody derived. On the Safari-drag workload the A/B
-/// measured, nothing changes: the byte cap already bound at ~56 entries there.
-/// On the three workloads above, the cache stops throwing away entries it has
-/// room for.
-///
-/// The former [`SAMPLED_CACHE_CAP`] survives as `SAMPLED_REACH_BAND`, the unit
-/// the reach instruments band against and the length of the victim ledger.
-/// Neither bounds the cache; a victim-ledger eviction costs a record, which is
-/// the class `AGENTS.md` exempts.
-///
-/// # Measured, one driven boot an arm
-///
-/// Two macos-26 x86/Vulkan boots from one snapshot, both
-/// `REIMS_VGPU_GUEST_IMPORT=off` — the copying rail, which is the local
-/// reproduction of what every reporter's host runs — each driven by the same
-/// 25-second window-drag probe:
-///
-/// ```text
-///            evict_count_cap  evict_byte_cap  reach_lost_to_cap
-///   before              2067               0                 59
-///   after                  0            1003                 16
-/// ```
-///
-/// `reach_lost_to_cap` is the one that is guest work: a sampled bind that missed
-/// **because of** capacity, with the guest-write witness having vouched. It fell
-/// by 73 %. The byte cap now does the evicting, which is the point — it bounds
-/// the host memory this cache holds, and it was idle while the entry count threw
-/// entries away.
-///
-/// One boot an arm, so this is a count and not a rate; `AGENTS.md`'s rule about
-/// banding a verdict over several boots applies to anything read as a rate.
-/// Counts survive contention where timings do not, and no timing is quoted.
-///
-/// [`SAMPLED_CACHE_CAP`]: SAMPLED_REACH_BAND
-const SAMPLED_EVICT_BYTE_CAP: &str = "sampled_evict_byte_cap";
-
-/// How much cache a sampled bind that missed would have needed, as two route
-/// names: one in entries and one in bytes.
-///
-/// This is the reach [`sampled_evict_route`]'s doc says nothing counts. It is
-/// the classic LRU stack distance and it is read the same way: a bind at
-/// `distance` d hits in any cache holding more than [`SAMPLED_REACH_BAND`] + d
-/// entries, so the counters partition the misses by how far each raise would
-/// get. `bytes` is what the cache would have been holding at that moment — its
-/// occupancy now plus every victim at or above `d`.
-///
-/// **Both names, on every miss, deliberately.** A count series alone is the trap
-/// the eviction-route doc names: raising the count cap while the byte cap stays
-/// hands the evictions straight to the other route and buys nothing. The pair
-/// says whether that would happen before the change is made — if the byte band
-/// is already `over_4x` where the count band is `2x`, the count cap is not the
-/// bound.
-///
-/// The bands are multiples of the caps rather than fixed sizes, for the reason
-/// [`target_pool_depth_band`] gives: a change to a cap moves them with it, and a
-/// series taken before the change stays comparable in the only terms that
-/// matter.
-///
-/// # Reading the series
-///
-/// `store_routes` counters are per-window, so sum the samples across the boot.
-/// Two identities hold and are the cheapest way to catch a misreading:
-///
-/// - `bytes_1x + bytes_2x + bytes_4x + bytes_over_4x` equals
-///   `count_2x + count_4x + count_8x`, because a miss found in the ledger emits
-///   exactly one of each ladder.
-/// - Those plus `sampled_reach_identity_other_key` and
-///   `sampled_reach_beyond_ledger` are every gathered miss that carried an
-///   identity, so the total is bounded above by
-///   `sampled_gather_unretained + sampled_gather_unvouched`.
-/// - `sampled_reach_lost_to_cap` classifies a cache-capacity miss. The former
-///   age-loss route no longer exists because elapsed time is not a guest
-///   resource-lifetime event.
-///
-/// A large `beyond_ledger` is not a licence to lengthen the ledger. It says the
-/// workload's reuse distance is past eight times the cache, and a cache that
-/// would have to be eight times larger to hit is not a cache this workload
-/// wants — the answer there is upstream, in whatever keeps re-presenting the
-/// window under a new identity.
-fn sampled_reach_bands(distance: usize, bytes: usize) -> (&'static str, &'static str) {
-    let count = if distance < SAMPLED_REACH_BAND {
-        "sampled_reach_count_2x"
-    } else if distance < SAMPLED_REACH_BAND * 3 {
-        "sampled_reach_count_4x"
-    } else {
-        "sampled_reach_count_8x"
-    };
-    let bytes = if bytes <= SAMPLED_CACHE_BYTE_CAP {
-        "sampled_reach_bytes_1x"
-    } else if bytes <= SAMPLED_CACHE_BYTE_CAP * 2 {
-        "sampled_reach_bytes_2x"
-    } else if bytes <= SAMPLED_CACHE_BYTE_CAP * 4 {
-        "sampled_reach_bytes_4x"
-    } else {
-        "sampled_reach_bytes_over_4x"
-    };
-    (count, bytes)
-}
-
 /// Which quarter of [`TARGET_POOL_MAX_ENTRIES`] the scratch target pool is
 /// occupying, as a census route name.
 ///
@@ -4472,67 +4149,6 @@ fn target_pool_depth_band(len: usize) -> &'static str {
         "target_pool_depth_q3"
     } else {
         "target_pool_depth_q4"
-    }
-}
-
-#[cfg(test)]
-mod sampled_reach_band_tests {
-    use super::*;
-
-    /// Each distance band at both of its ends. An off-by-one here reads as
-    /// working for as long as the workload stays inside one band, which is the
-    /// case a rail with a healthy cache is always in.
-    #[test]
-    fn each_distance_band_covers_its_multiple_of_the_cap() {
-        let cap = SAMPLED_REACH_BAND;
-        let count = |d| sampled_reach_bands(d, 0).0;
-        assert_eq!(count(0), "sampled_reach_count_2x");
-        assert_eq!(count(cap - 1), "sampled_reach_count_2x");
-        assert_eq!(count(cap), "sampled_reach_count_4x");
-        assert_eq!(count(cap * 3 - 1), "sampled_reach_count_4x");
-        assert_eq!(count(cap * 3), "sampled_reach_count_8x");
-    }
-
-    /// The furthest a victim can sit in the ledger must still band as the top
-    /// name. The ledger's length and the ladder's top boundary are written apart
-    /// from each other, so a ledger lengthened without the ladder would report
-    /// distances of sixteen times the cap under a name that says eight.
-    #[test]
-    fn the_ledgers_furthest_entry_bands_as_the_top_name() {
-        assert_eq!(
-            sampled_reach_bands(SAMPLED_VICTIM_LEDGER - 1, 0).0,
-            "sampled_reach_count_8x"
-        );
-    }
-
-    /// The byte ladder at both ends of each rung. `<=` at every boundary, so a
-    /// miss needing exactly the cap reports the cap rather than the rung above:
-    /// the question is what the cache would have had to hold, and holding
-    /// exactly the cap is within it.
-    #[test]
-    fn each_byte_band_covers_its_multiple_of_the_byte_cap() {
-        let cap = SAMPLED_CACHE_BYTE_CAP;
-        let bytes = |b| sampled_reach_bands(0, b).1;
-        assert_eq!(bytes(0), "sampled_reach_bytes_1x");
-        assert_eq!(bytes(cap), "sampled_reach_bytes_1x");
-        assert_eq!(bytes(cap + 1), "sampled_reach_bytes_2x");
-        assert_eq!(bytes(cap * 2), "sampled_reach_bytes_2x");
-        assert_eq!(bytes(cap * 2 + 1), "sampled_reach_bytes_4x");
-        assert_eq!(bytes(cap * 4), "sampled_reach_bytes_4x");
-        assert_eq!(bytes(cap * 4 + 1), "sampled_reach_bytes_over_4x");
-    }
-
-    /// The two ladders are independent: a miss can be one entry deep and still
-    /// need four times the byte budget, and that pair is the whole reason both
-    /// are emitted. A reading where the byte band outruns the count band says
-    /// the count cap is not the bound, which is what `sampled_evict_route`'s doc
-    /// warns a count-only series cannot see.
-    #[test]
-    fn a_shallow_miss_can_still_be_byte_bound() {
-        assert_eq!(
-            sampled_reach_bands(0, SAMPLED_CACHE_BYTE_CAP * 4),
-            ("sampled_reach_count_2x", "sampled_reach_bytes_4x")
-        );
     }
 }
 
@@ -4577,58 +4193,6 @@ mod target_pool_band_tests {
 }
 
 #[cfg(test)]
-mod evict_route_tests {
-    use super::*;
-
-    /// The cache has one bound and it is bytes. An entry count that evicted
-    /// beside them was doing all the evicting on three reporters' workloads
-    /// while their byte occupancy sat in its lowest band — see
-    /// [`SAMPLED_EVICT_BYTE_CAP`].
-    ///
-    /// This is a behavioural assertion and not a spelling one: it admits far
-    /// more entries than the old count allowed, at a byte occupancy the byte cap
-    /// is nowhere near, and asserts none of them was thrown away.
-    #[test]
-    fn a_cache_well_past_the_old_entry_count_keeps_every_entry_it_has_room_for() {
-        let entries = SAMPLED_REACH_BAND * 8;
-        // Small windows, which is the shape that made the entry count bind: the
-        // whole cache is three orders of magnitude under the byte cap.
-        let per_entry = 4 * 1024;
-        assert!(
-            entries * per_entry < SAMPLED_CACHE_BYTE_CAP,
-            "the premise is that bytes are not the bound here"
-        );
-        let mut bytes = 0usize;
-        let mut evicted = 0usize;
-        for _ in 0..entries {
-            bytes += per_entry;
-            while bytes > SAMPLED_CACHE_BYTE_CAP {
-                bytes -= per_entry;
-                evicted += 1;
-            }
-        }
-        assert_eq!(evicted, 0, "nothing may be dropped while bytes have room");
-    }
-
-    /// The byte cap is a real resource bound and still evicts.
-    #[test]
-    fn the_byte_cap_still_bounds_what_the_cache_holds() {
-        let per_entry = SAMPLED_CACHE_BYTE_CAP / 4;
-        let mut bytes = 0usize;
-        let mut evicted = 0usize;
-        for _ in 0..8 {
-            bytes += per_entry;
-            while bytes > SAMPLED_CACHE_BYTE_CAP {
-                bytes -= per_entry;
-                evicted += 1;
-            }
-        }
-        assert!(evicted > 0, "bytes past the cap must still evict");
-        assert!(bytes <= SAMPLED_CACHE_BYTE_CAP);
-    }
-}
-
-#[cfg(test)]
 mod recycle_tests {
     use super::*;
     use crate::backend::vulkan::engine::GuestWriteSource;
@@ -4650,68 +4214,6 @@ mod recycle_tests {
             ),
             swizzle: Default::default(),
         }
-    }
-
-    fn direct_sampled(
-        owner: crate::model::TaskResourceLifetimeRef,
-        host_ptr: usize,
-    ) -> (GuestSampledKey, GuestSampledSlot) {
-        let import = std::sync::Arc::new(
-            crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
-                host_ptr, 0x1000, 0x1000,
-            )
-            .unwrap(),
-        );
-        let backing = crate::backend::vulkan::engine::GuestTargetBacking {
-            allocation_host_ptr: host_ptr,
-            allocation_len: 0x1000,
-            plane_offset: 0,
-            row_pitch: 64,
-        };
-        let key = GuestSampledKey {
-            image: null_slot(16, 16).key(),
-            backing,
-            owner_id: owner.id(),
-        };
-        let slot = GuestSampledSlot {
-            image: vk::Image::null(),
-            view: vk::ImageView::null(),
-            _import: import,
-            owner,
-            initialized: false,
-        };
-        (key, slot)
-    }
-
-    #[test]
-    fn direct_sampled_images_follow_resource_lifetime_not_idle_age() {
-        let mut pools = ResourcePools::new();
-        let live = crate::model::TaskResource::new(Default::default(), std::sync::Arc::from([]));
-        let dead_ref = {
-            let dead =
-                crate::model::TaskResource::new(Default::default(), std::sync::Arc::from([]));
-            dead.lifetime_ref()
-        };
-        let (live_key, live_slot) = direct_sampled(live.lifetime_ref(), 0x1000_0000);
-        let (dead_key, dead_slot) = direct_sampled(dead_ref, 0x1000_0000);
-        assert_ne!(
-            live_key, dead_key,
-            "two API resources remain distinct even when they alias one allocation"
-        );
-        pools.guest_sampled.insert(live_key.clone(), live_slot);
-        pools.guest_sampled.insert(dead_key.clone(), dead_slot);
-
-        pools.idle_clock_ms = IDLE_MAINTENANCE_START_MS * 100;
-        assert_eq!(
-            pools.dead_guest_sampled_keys(8),
-            vec![dead_key],
-            "arbitrary idle age must not destroy a live API resource"
-        );
-
-        drop(live);
-        let dead = pools.dead_guest_sampled_keys(8);
-        assert_eq!(dead.len(), 2);
-        assert!(dead.contains(&live_key));
     }
 
     /// [`GatheredName`] decides when two gathers are one window, and this is the
@@ -4740,6 +4242,7 @@ mod recycle_tests {
             image: vk::Image::null(),
             content: SampledRetainContent::Gathered { len: 4096 },
             identity,
+            resource_lifetime: None,
         };
         let entry = |w, identity| (null_slot(w, 64), retain(identity));
 
@@ -4785,18 +4288,18 @@ mod recycle_tests {
     ///
     /// - **No entry answers a bind.** An image the GPU never wrote is undefined
     ///   content, and binding it is the visual corruption this exists to stop.
-    /// - **The bytes go back to zero.** A discard that forgot the accounting
-    ///   would leave the byte cap believing it was full for the rest of the
-    ///   boot, and every later admission would evict a live entry to make room
-    ///   that was already free — a slow leak of reuse with nothing to see.
-    /// - **The ledger says why.** A discarded window is neither a capacity
-    ///   victim nor an aged one; folding it into either makes the next reading
-    ///   of `sampled_reach_lost_to_cap` argue for a bigger cache when the real
-    ///   answer is that a submit failed.
+    /// - **The bytes go back to zero.** The gauge follows the retained images.
+    /// - **The ledger says why.** A failed publication remains distinguishable
+    ///   from content the cache never held.
     #[test]
     fn a_discarded_cache_leaves_no_entry_no_bytes_and_a_reason() {
         let mut pools = ResourcePools::new();
         let counters = EngineCounters::default();
+        let resource = std::sync::Arc::new(crate::model::TaskResource::new(
+            Default::default(),
+            std::sync::Arc::from([]),
+        ));
+        let owner = resource.lifetime_ref();
         let named = |k: u64| crate::backend::vulkan::engine::SampledContentIdentity {
             key: k,
             generation: 1,
@@ -4812,6 +4315,7 @@ mod recycle_tests {
                 content: None,
                 content_len: 4096,
                 identity: Some(named(i as u64)),
+                owners: vec![owner.clone()],
                 last_touch_ms: 0,
             });
             pools.sampled_cache_bytes += 4096;
@@ -4819,7 +4323,7 @@ mod recycle_tests {
         for (key, id) in &keys {
             assert!(
                 pools
-                    .find_gathered_sampled(*key, Some(*id), &counters)
+                    .find_gathered_sampled(*key, Some(*id), Some(&owner), &counters)
                     .is_some(),
                 "the entries have to be bindable first, or the test proves nothing"
             );
@@ -4835,7 +4339,7 @@ mod recycle_tests {
         for (key, id) in &keys {
             assert!(
                 pools
-                    .find_gathered_sampled(*key, Some(*id), &counters)
+                    .find_gathered_sampled(*key, Some(*id), Some(&owner), &counters)
                     .is_none(),
                 "an image no command buffer filled must not answer a bind"
             );
@@ -4951,6 +4455,11 @@ mod recycle_tests {
             key: 0x51,
             generation: 3,
         };
+        let resource = std::sync::Arc::new(crate::model::TaskResource::new(
+            Default::default(),
+            std::sync::Arc::from([]),
+        ));
+        let owner = resource.lifetime_ref();
 
         let slot = null_slot(64, 64);
         let key = slot.key();
@@ -4959,7 +4468,7 @@ mod recycle_tests {
         pools.sampled_live.push(slot);
         assert!(
             pools
-                .find_gathered_sampled(key, Some(identity), &counters)
+                .find_gathered_sampled(key, Some(identity), Some(&owner), &counters)
                 .is_none(),
             "nothing has filled this window yet"
         );
@@ -4970,6 +4479,7 @@ mod recycle_tests {
                 image,
                 content: SampledRetainContent::Gathered { len: 64 * 64 * 4 },
                 identity: Some(identity),
+                resource_lifetime: Some(owner.clone()),
             }],
         );
         assert!(
@@ -4978,17 +4488,17 @@ mod recycle_tests {
         );
         // The device-free half of what `finish_entry_async` does at submit.
         for (slot, retain) in sealed.admissions {
-            assert!(
-                pools
-                    .admit_sampled_entry(slot, &retain.content, retain.identity)
-                    .is_empty(),
-                "a single entry cannot reach either cap, so nothing is evicted"
+            pools.admit_sampled_entry(
+                slot,
+                &retain.content,
+                retain.identity,
+                retain.resource_lifetime.as_ref(),
             );
         }
 
         assert!(
             pools
-                .find_gathered_sampled(key, Some(identity), &counters)
+                .find_gathered_sampled(key, Some(identity), Some(&owner), &counters)
                 .is_some(),
             "the next draw must find the window the in-flight submission gathered, \
              or it imports every byte of it a second time"
@@ -5013,6 +4523,11 @@ mod recycle_tests {
 
         let slot = null_slot(8, 8);
         let key = slot.key();
+        let resource = std::sync::Arc::new(crate::model::TaskResource::new(
+            Default::default(),
+            std::sync::Arc::from([]),
+        ));
+        let owner = resource.lifetime_ref();
         // File the retained blob under the *incoming* blob's digest. This is the
         // collision, forced rather than found.
         pools.sampled_cache.push(ResidentSampledSlot {
@@ -5021,18 +4536,19 @@ mod recycle_tests {
             content: Some(std::sync::Arc::new(retained.clone())),
             content_len: retained.len(),
             identity: None,
+            owners: vec![owner.clone()],
             last_touch_ms: 0,
         });
 
         assert!(
             pools
-                .find_cached_sampled(key, &incoming, None, &counters)
+                .find_cached_sampled(key, &incoming, None, Some(&owner), &counters)
                 .is_none(),
             "equal digests over different bytes must not bind the retained image"
         );
         assert!(
             pools
-                .find_cached_sampled(key, &retained, None, &counters)
+                .find_cached_sampled(key, &retained, None, Some(&owner), &counters)
                 .is_none(),
             "the retained bytes do not hash to the digest they were filed under, \
              so they are not a hit either — the digest still gates the walk"
@@ -5050,19 +4566,25 @@ mod recycle_tests {
         let content: Vec<u8> = (0..64u8).map(|b| b.wrapping_mul(7)).collect();
         let slot = null_slot(8, 8);
         let key = slot.key();
+        let resource = std::sync::Arc::new(crate::model::TaskResource::new(
+            Default::default(),
+            std::sync::Arc::from([]),
+        ));
+        let owner = resource.lifetime_ref();
         pools.sampled_cache.push(ResidentSampledSlot {
             slot,
             fingerprint: SampledFingerprint::Content(sampled_content_hash(&content)),
             content: Some(std::sync::Arc::new(content.clone())),
             content_len: content.len(),
             identity: None,
+            owners: vec![owner.clone()],
             last_touch_ms: 0,
         });
 
         let copy = content.clone();
         assert!(
             pools
-                .find_cached_sampled(key, &copy, None, &counters)
+                .find_cached_sampled(key, &copy, None, Some(&owner), &counters)
                 .is_some(),
             "identical content must still hit, or the compare has cost a real reuse"
         );
@@ -5298,11 +4820,16 @@ mod recycle_tests {
         assert_eq!(pools.sampled_free.count_for(&small), 1);
     }
 
-    /// Maintenance leaves sampled-cache entries alone regardless of their age;
-    /// the cache's count and byte bounds remain the removal policy.
+    /// Elapsed time leaves live sampled entries alone, while deleting their
+    /// serialized owner makes them reclaimable.
     #[test]
-    fn maintenance_does_not_reclaim_sampled_cache_entries_by_age() {
+    fn sampled_cache_entries_follow_resource_lifetime_not_age() {
         let mut pools = ResourcePools::new();
+        let resource = std::sync::Arc::new(crate::model::TaskResource::new(
+            Default::default(),
+            std::sync::Arc::from([]),
+        ));
+        let owner = resource.lifetime_ref();
         let push = |pools: &mut ResourcePools, w: u32, h: u32, touch: u64, len: usize| {
             pools.sampled_cache_bytes = pools.sampled_cache_bytes.saturating_add(len);
             pools.sampled_cache.push(ResidentSampledSlot {
@@ -5314,6 +4841,7 @@ mod recycle_tests {
                 content: None,
                 content_len: len,
                 identity: None,
+                owners: vec![owner.clone()],
                 last_touch_ms: touch,
             });
         };
@@ -5326,6 +4854,15 @@ mod recycle_tests {
         assert!(pools.plan_idle_maintenance(10_000));
         assert_eq!(pools.sampled_cache.len(), 3);
         assert_eq!(pools.sampled_cache_bytes, 13_000_000);
+
+        drop(resource);
+        assert_eq!(
+            pools.take_released_sampled_entries().len(),
+            3,
+            "resource deletion, not age or a chosen capacity, ends retention"
+        );
+        assert!(pools.sampled_cache.is_empty());
+        assert_eq!(pools.sampled_cache_bytes, 0);
     }
 
     /// Compute-storage residents are standalone allocations, but elapsed time
@@ -6771,9 +6308,7 @@ mod scatter_descriptor_sets_do_not_alias {
         let mut pools = ResourcePools::new();
         pools.configure_batch_capacity(super::DISCRETE_BATCH_MAX_DRAWS);
 
-        let expected = super::attachment_snapshot_batch_cap(
-            super::DISCRETE_BATCH_MAX_DRAWS,
-        );
+        let expected = super::attachment_snapshot_batch_cap(super::DISCRETE_BATCH_MAX_DRAWS);
         assert_eq!(pools.batch_max_draws, super::DISCRETE_BATCH_MAX_DRAWS);
         assert_eq!(pools.attachment_snapshot_free.per_key, expected);
         assert_eq!(pools.attachment_snapshot_free.total, expected);

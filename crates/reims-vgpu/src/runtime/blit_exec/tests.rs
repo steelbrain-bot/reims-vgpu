@@ -1440,7 +1440,9 @@ fn a_linear_rectangle_lands_row_exact_through_one_page_table_walk() {
         pixel_format: MTL_FORMAT_RGBA8_UNORM,
     };
     let tex = TextureBacking::Linear(t);
-    let src: Vec<u8> = (0..(row_bytes * row_count)).map(|i| (i % 251) as u8).collect();
+    let src: Vec<u8> = (0..(row_bytes * row_count))
+        .map(|i| (i % 251) as u8)
+        .collect();
     let allowed: std::collections::HashSet<u64> =
         (0..pages).map(|p| (4 + p) << PAGE_SHIFT_ARM64E).collect();
 
@@ -1472,8 +1474,11 @@ fn a_linear_rectangle_lands_row_exact_through_one_page_table_walk() {
     let mut got = vec![0u8; (row_stride * row_count) as usize];
     for p in 0..pages {
         let at = (p * page) as usize;
-        host.read_gpa((4 + p) << PAGE_SHIFT_ARM64E, &mut got[at..at + page as usize])
-            .expect("read the landed pages");
+        host.read_gpa(
+            (4 + p) << PAGE_SHIFT_ARM64E,
+            &mut got[at..at + page as usize],
+        )
+        .expect("read the landed pages");
     }
     for y in 0..row_count {
         let at = (y * row_stride) as usize;
@@ -1862,8 +1867,12 @@ fn a_blit_endpoint_lands_the_writeback_its_texture_still_owes() {
         state.pending_writebacks.arm_gva(
             key,
             GvaWritebackDebt {
-                gva: 0x4000,
-                row_stride: STRIDE,
+                linear: crate::runtime::draw::LinearColorTarget {
+                    allocation_gva: 0x4000,
+                    allocation_size: u64::from(STRIDE) * 8,
+                    plane_offset: 0,
+                    row_stride: STRIDE,
+                },
                 width: 16,
                 height: 8,
                 format: MTL_FORMAT_RGBA8_UNORM,
@@ -2452,7 +2461,11 @@ fn blit_geometry_helpers_clamp_bpp_and_aspect() {
         None,
         "one past the edge refuses; it used to return 100 and copy less"
     );
-    assert_eq!(copy_extent("t", "w", 150, 100), None, "and so does far past");
+    assert_eq!(
+        copy_extent("t", "w", 150, 100),
+        None,
+        "and so does far past"
+    );
 
     // texture_storage_bpp: full-texel storage size per format; unknown fails.
     assert_eq!(texture_storage_bpp(MTL_FORMAT_BGRA8_UNORM), Ok(4));
@@ -3064,7 +3077,10 @@ fn a_whole_surface_type11_source_reaches_the_destinations_own_guest_plane() {
 
     let (plane, geometry) =
         gpu_t2t_gva_plane(Some((W, H)), &src, &dst, 9).expect("one whole plane into another");
-    assert_eq!(plane.target_gva, 0x4000, "the level's own base is the plane");
+    assert_eq!(
+        plane.target_gva, 0x4000,
+        "the level's own base is the plane"
+    );
     assert_eq!(
         plane.texture_ref, 9,
         "the destination is the resource whose host-side pixel caches this invalidates"

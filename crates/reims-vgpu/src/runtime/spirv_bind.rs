@@ -1732,7 +1732,10 @@ pub fn declared_binding_numbers_memoized(
     let declared: std::sync::Arc<[u32]> = std::sync::Arc::from(declared_binding_numbers(words));
     memo.insert(
         key,
-        (std::sync::Arc::clone(words), std::sync::Arc::clone(&declared)),
+        (
+            std::sync::Arc::clone(words),
+            std::sync::Arc::clone(&declared),
+        ),
     );
     declared
 }
@@ -2747,12 +2750,9 @@ fn reflected_buffer_footprint_extent(
 /// Band a declared object size, because what decides whether narrowing is worth
 /// anything is the order of magnitude and not the byte.
 ///
-/// The floor matters: a cap that does not clear `ZERO_COPY_BUFFER_MIN_BYTES` is
-/// dropped by the gather rail and applied by the staging one, so a population
-/// sitting entirely in the smallest band says the narrowing lands on the CPU
-/// path and never on the rail that moves the bytes. A survey of 60 captured AIR
-/// blobs ran a median declared size of 64 bytes and a maximum of 512, so the
-/// bands are placed around that rather than spread evenly.
+/// A survey of translated modules ran a median declared size of 64 bytes and a
+/// maximum of 512, so the bands are placed around that rather than spread
+/// evenly.
 fn band_declared_object(bytes: u32) -> &'static str {
     match bytes {
         0..=64 => "bext_object_le64",

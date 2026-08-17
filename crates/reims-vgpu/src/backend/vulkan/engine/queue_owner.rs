@@ -511,12 +511,17 @@ mod tests {
             .expect("owner accepted submission");
 
         assert_eq!(probe.latest_queued(), Some(7));
-        let request = receiver.try_recv().expect("submission remains in host FIFO");
+        let request = receiver
+            .try_recv()
+            .expect("submission remains in host FIFO");
         let Request::Submit { submit, reply } = request else {
             panic!("async handoff queued a non-submit request");
         };
         assert!(reply.is_none());
-        assert_eq!(submit.timeline.as_ref().map(|(_, value, _)| *value), Some(7));
+        assert_eq!(
+            submit.timeline.as_ref().map(|(_, value, _)| *value),
+            Some(7)
+        );
     }
 
     #[test]
@@ -571,10 +576,7 @@ mod tests {
             },
         );
 
-        assert_eq!(
-            result,
-            Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
-        );
+        assert_eq!(result, Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY));
         assert!(!presented.get());
         assert_eq!(latch.get(), Some(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY));
         assert!(super::super::device_lost::take_device_lost_seen());
@@ -597,11 +599,8 @@ mod tests {
     fn device_loss_during_present_stops_later_queue_work() {
         let _ = super::super::device_lost::take_device_lost_seen();
         let latch = FailureLatch::default();
-        let result = complete_present_transaction(
-            &latch,
-            || Ok(()),
-            || Err(vk::Result::ERROR_DEVICE_LOST),
-        );
+        let result =
+            complete_present_transaction(&latch, || Ok(()), || Err(vk::Result::ERROR_DEVICE_LOST));
 
         assert_eq!(result, Err(vk::Result::ERROR_DEVICE_LOST));
         assert_eq!(latch.get(), Some(vk::Result::ERROR_DEVICE_LOST));

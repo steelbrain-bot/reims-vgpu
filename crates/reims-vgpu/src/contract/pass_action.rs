@@ -162,7 +162,9 @@ mod tests {
     fn only_the_four_named_store_actions_are_accepted() {
         assert!(is_declared_store_action(MTL_STORE_ACTION_DONT_CARE));
         assert!(is_declared_store_action(MTL_STORE_ACTION_STORE));
-        assert!(is_declared_store_action(MTL_STORE_ACTION_MULTISAMPLE_RESOLVE));
+        assert!(is_declared_store_action(
+            MTL_STORE_ACTION_MULTISAMPLE_RESOLVE
+        ));
         assert!(is_declared_store_action(
             MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE
         ));
@@ -264,7 +266,8 @@ mod tests {
             "a load ordinal outside the store set would make a swap detectable"
         );
         assert_eq!(
-            store.iter()
+            store
+                .iter()
                 .filter(|r| !load.contains(r))
                 .collect::<Vec<_>>(),
             vec![&MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE]

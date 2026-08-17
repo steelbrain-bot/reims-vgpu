@@ -79,15 +79,10 @@ use crate::observe::{Decline, Emit};
 /// Deriving the partition once makes a resource—not each Store consumer—the
 /// authority on how its scattered pages fit together.
 ///
-/// `ascending` is that same set a third time, sorted and deduplicated, and it
-/// exists because [`Self::contains_page`] is asked far more often than a
-/// footprint is built. See that method for why the run partition is the wrong
-/// index for a membership question.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GuestPageFootprint {
     pages: std::sync::Arc<[u64]>,
     runs: std::sync::Arc<[std::ops::Range<usize>]>,
-    ascending: std::sync::Arc<[u64]>,
     page_size: u64,
 }
 
@@ -97,13 +92,9 @@ impl GuestPageFootprint {
             return None;
         }
         let runs = reims_vgpu_paging::runs::contig_page_runs(&pages, page_size).into();
-        let mut ascending = pages.to_vec();
-        ascending.sort_unstable();
-        ascending.dedup();
         Some(Self {
             pages,
             runs,
-            ascending: ascending.into(),
             page_size,
         })
     }
@@ -118,51 +109,6 @@ impl GuestPageFootprint {
 
     pub fn page_size(&self) -> u64 {
         self.page_size
-    }
-
-    /// Whether both values retain the same admitted allocation.
-    ///
-    /// Physical-page equality is not allocation identity: a recycled page list
-    /// can describe a later allocation. Resource-owned clones retain the same
-    /// `Arc`, so pointer identity gives the outstanding-write ledger an O(1)
-    /// deduplication key without inventing a second allocation id.
-    #[cfg(feature = "backend-vulkan")]
-    pub(crate) fn same_allocation(&self, other: &Self) -> bool {
-        self.page_size == other.page_size && std::sync::Arc::ptr_eq(&self.pages, &other.pages)
-    }
-
-    /// Whether this allocation contains one page-aligned physical address.
-    ///
-    /// A run holds exactly the pages `pages[run]`, contiguous by construction,
-    /// so "inside this run's byte range at page alignment" and "equal to one of
-    /// this run's pages" are the same predicate. The question is membership and
-    /// nothing else, so the index for it is the sorted page set, not the run
-    /// partition — the runs describe how the pages *abut*, which no membership
-    /// test needs to know.
-    ///
-    /// That distinction is worth a whole allocation. The scan this replaced was
-    /// O(runs) per page, and the runs are not few: a compositor mapping of 2040
-    /// pages lands in 511 of them. Read against a page list rather than a single
-    /// page — which is what the outstanding-write ledger does — the scan was
-    /// O(pages x runs) and measured 5.2 ms per ask on a driven Maps leg, 42 asks
-    /// a second. It is now a binary search.
-    #[cfg(feature = "backend-vulkan")]
-    pub(crate) fn contains_page(&self, gpa: u64) -> bool {
-        self.ascending.binary_search(&gpa).is_ok()
-    }
-
-    /// The lowest and highest physical page this allocation holds, or `None` for
-    /// an empty footprint — which [`Self::new`] refuses, so this is `Some` for
-    /// every value that exists.
-    ///
-    /// Exposed so a caller comparing a whole page *list* against this footprint
-    /// can reject the common no-overlap case on two comparisons instead of one
-    /// binary search per page. A span test can only ever answer "cannot
-    /// overlap"; an overlap of spans still has to be settled by
-    /// [`Self::contains_page`], so this narrows work and never a verdict.
-    #[cfg(feature = "backend-vulkan")]
-    pub(crate) fn page_span(&self) -> Option<(u64, u64)> {
-        Some((*self.ascending.first()?, *self.ascending.last()?))
     }
 
     pub(crate) fn pages_arc(&self) -> std::sync::Arc<[u64]> {
@@ -855,9 +801,8 @@ pub fn forget_import_limits() {
 ///
 /// Distinct from [`import_budget`], which bounds the *sum* of every live import
 /// against the roomiest heap. This bounds one `vkAllocateMemory`, and a RAMBlock
-/// longer than it is imported in several — see
-/// [`crate::backend::vulkan::caps::host_pointer::IMPORT_SPAN_CEILING`] for the
-/// driver defect that makes a single large import unsafe.
+/// longer than it is imported in several. The value is derived from the
+/// backend's queried allocation and buffer limits.
 pub fn import_span_max() -> Option<u64> {
     match IMPORT_SPAN_MAX.load(std::sync::atomic::Ordering::Relaxed) {
         0 => None,
@@ -891,6 +836,85 @@ pub fn granularity() -> Option<u64> {
         0 => None,
         align => Some(align),
     }
+}
+
+/// Why one stable host allocation cannot be imported as a resource backing.
+///
+/// This is deliberately independent of the whole-RAMBlock map. A packed task
+/// or mapper allocation is already the contract-sized object the guest named;
+/// whether every other byte of guest RAM fits in the same heap says nothing
+/// about whether this allocation does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostAllocationImportRefusal {
+    /// No backend published host-pointer import support.
+    Unavailable,
+    /// This allocation exceeds the largest single allocation the queried API
+    /// limits permit.
+    SpanTooLarge { len: u64, max: u64 },
+    /// No compatible heap can hold this allocation even when empty.
+    HeapTooSmall { len: u64, budget: u64 },
+}
+
+impl Decline for HostAllocationImportRefusal {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::Unavailable => "host_allocation_import_unavailable",
+            Self::SpanTooLarge { .. } => "host_allocation_import_span_too_large",
+            Self::HeapTooSmall { .. } => "host_allocation_import_heap_too_small",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match *self {
+            Self::Unavailable => Vec::new(),
+            Self::SpanTooLarge { len, max } => {
+                vec![("len", len.to_string()), ("max", max.to_string())]
+            }
+            Self::HeapTooSmall { len, budget } => {
+                vec![("len", len.to_string()), ("budget", budget.to_string())]
+            }
+        }
+    }
+}
+
+crate::observe::decline::decline_display!(HostAllocationImportRefusal);
+
+/// Record a resource-import degradation once per consumer and reason.
+///
+/// Resource import is optional, so a refusal belongs on the `OFF` channel
+/// rather than the failure channel. It still has to be visible: otherwise a
+/// host can spend the whole boot copying while the log claims the direct rail
+/// is available. The event address distinguishes the small, static set of
+/// consumers without inventing a guest-visible policy term.
+pub fn report_host_allocation_import_refusal(
+    event: &'static str,
+    refusal: &HostAllocationImportRefusal,
+) {
+    if crate::observe::first_sight(refusal.slug(), event.as_ptr() as u64) {
+        Emit::decline(event, refusal).off();
+    }
+}
+
+/// Admit one stable host allocation against the active backend's explicit
+/// host-pointer limits and return the alignment its owner must preserve.
+///
+/// The allocation is judged on its own length. In particular, this does not
+/// consult [`crate::runtime::guest_ram_map::standing_refusal`]: that answer is
+/// about the optional import of every RAMBlock in the VM, while this allocation
+/// follows one guest resource's decoded lifetime. Coupling the two disables a
+/// legal resource import whenever unrelated RAM makes the whole-VM sum too
+/// large.
+pub fn host_allocation_import_align(len: u64) -> Result<u64, HostAllocationImportRefusal> {
+    let align = granularity().ok_or(HostAllocationImportRefusal::Unavailable)?;
+    let span_max = import_span_max().ok_or(HostAllocationImportRefusal::Unavailable)?;
+    if len > span_max {
+        return Err(HostAllocationImportRefusal::SpanTooLarge { len, max: span_max });
+    }
+    let budget = import_budget().ok_or(HostAllocationImportRefusal::Unavailable)?;
+    if len > budget {
+        return Err(HostAllocationImportRefusal::HeapTooSmall { len, budget });
+    }
+    Ok(align)
 }
 
 /// A bounded guest-memory reference a backend can bind: the import that owns
@@ -1017,8 +1041,7 @@ mod tests {
 
     #[test]
     fn a_page_footprint_derives_physical_runs_once_and_windows_them_exactly() {
-        let pages: std::sync::Arc<[u64]> =
-            [0x1000, 0x2000, 0x9000, 0xa000, 0xb000].into();
+        let pages: std::sync::Arc<[u64]> = [0x1000, 0x2000, 0x9000, 0xa000, 0xb000].into();
         let footprint = GuestPageFootprint::new(pages, 0x1000).expect("valid footprint");
         assert_eq!(footprint.runs(), &[0..2, 2..5]);
 
@@ -1028,56 +1051,6 @@ mod tests {
             visited,
             vec![(0x2800, 0x800), (0x9000, 0x2800)],
             "the allocation window follows physical runs without filling their gap"
-        );
-    }
-
-    /// Allocation order is the guest's, and it is not ascending: a page list
-    /// walks a resource's virtual pages, whose physical addresses arrive in
-    /// whatever order the guest allocator handed them out. The run partition
-    /// coped with that by construction — it never assumed an order — so the
-    /// sorted membership index beside it has to be built from a copy rather
-    /// than by asserting the list is already sorted.
-    #[cfg(feature = "backend-vulkan")]
-    #[test]
-    fn membership_holds_when_allocation_order_descends() {
-        let pages: std::sync::Arc<[u64]> = [0x9000, 0x3000, 0x8000, 0x1000, 0x2000].into();
-        let footprint = GuestPageFootprint::new(pages, 0x1000).expect("valid footprint");
-        for gpa in [0x1000, 0x2000, 0x3000, 0x8000, 0x9000] {
-            assert!(footprint.contains_page(gpa), "{gpa:#x} was allocated");
-        }
-        for gpa in [0x0, 0x4000, 0x7000, 0xa000] {
-            assert!(!footprint.contains_page(gpa), "{gpa:#x} was not");
-        }
-        assert_eq!(
-            footprint.page_span(),
-            Some((0x1000, 0x9000)),
-            "the span is of the addresses, not of the allocation order"
-        );
-        assert_eq!(
-            footprint.pages(),
-            [0x9000, 0x3000, 0x8000, 0x1000, 0x2000],
-            "the allocation order alias and ownership checks need is untouched"
-        );
-    }
-
-    #[cfg(feature = "backend-vulkan")]
-    #[test]
-    fn a_page_footprint_answers_membership_without_filling_scatter_gaps() {
-        let pages: std::sync::Arc<[u64]> = [0x1000, 0x2000, 0x9000, 0xa000].into();
-        let footprint = GuestPageFootprint::new(pages, 0x1000).expect("valid footprint");
-        assert!(footprint.contains_page(0x1000));
-        assert!(footprint.contains_page(0xa000));
-        assert!(!footprint.contains_page(0x5000));
-        assert!(!footprint.contains_page(0x9800), "only whole guest pages belong");
-        assert_eq!(footprint.page_span(), Some((0x1000, 0xa000)));
-
-        let clone = footprint.clone();
-        assert!(footprint.same_allocation(&clone));
-        let recycled = GuestPageFootprint::new(footprint.pages().into(), 0x1000)
-            .expect("same addresses can describe a later allocation");
-        assert!(
-            !footprint.same_allocation(&recycled),
-            "equal addresses are not allocation lifetime identity"
         );
     }
 
@@ -1296,6 +1269,61 @@ mod tests {
             import.slice_for_gpa(0x1800, 0x800),
             Err(GuestRamError::GpaOutsideImport { .. })
         ));
+    }
+
+    /// Resource admission is the exact three-term host-pointer contract: the
+    /// backend published support, the allocation fits one API allocation, and
+    /// a compatible heap can hold it. Each failed term keeps its own type.
+    #[test]
+    fn a_host_allocation_is_admitted_by_its_own_queried_limits() {
+        const ALIGN: u64 = 0x1000;
+        const SPAN_MAX: u64 = 0x20_0000;
+        const BUDGET: u64 = 0x80_0000;
+
+        forget_import_limits();
+        assert_eq!(
+            host_allocation_import_align(ALIGN),
+            Err(HostAllocationImportRefusal::Unavailable)
+        );
+
+        latch_import_limits(ALIGN, BUDGET, SPAN_MAX);
+        assert_eq!(host_allocation_import_align(SPAN_MAX), Ok(ALIGN));
+        assert_eq!(
+            host_allocation_import_align(SPAN_MAX + ALIGN),
+            Err(HostAllocationImportRefusal::SpanTooLarge {
+                len: SPAN_MAX + ALIGN,
+                max: SPAN_MAX,
+            })
+        );
+
+        latch_import_limits(ALIGN, SPAN_MAX, BUDGET);
+        assert_eq!(
+            host_allocation_import_align(SPAN_MAX + ALIGN),
+            Err(HostAllocationImportRefusal::HeapTooSmall {
+                len: SPAN_MAX + ALIGN,
+                budget: SPAN_MAX,
+            })
+        );
+        forget_import_limits();
+    }
+
+    /// A direct-import refusal degrades to copying, but the degradation remains
+    /// visible and does not flood when the same consumer retries it.
+    #[test]
+    fn a_host_allocation_refusal_is_reported_once_per_consumer() {
+        let capture = crate::observe::FailCapture::start();
+        let refusal = HostAllocationImportRefusal::SpanTooLarge {
+            len: 0x30_0000,
+            max: 0x20_0000,
+        };
+        report_host_allocation_import_refusal("test_alias_import", &refusal);
+        report_host_allocation_import_refusal("test_alias_import", &refusal);
+        assert_eq!(
+            capture.lines(),
+            vec![
+                "OFF test_alias_import reason=host_allocation_import_span_too_large len=3145728 max=2097152"
+            ]
+        );
     }
 
     /// A block the granularity cannot fit in is refused by name, rather than

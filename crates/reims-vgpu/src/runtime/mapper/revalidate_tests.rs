@@ -366,7 +366,7 @@ fn a_host_refusal_is_cached_but_fragmentation_is_still_offered_to_it() {
     {
         let m = state.mappings.get_mut(&mid).unwrap();
         m.page_entries = vec![entry(gpa0), entry(gpa1), entry(gpa2)];
-        DeviceState::bump_map_generation(m);
+        DeviceState::bump_page_generation(m);
     }
     assert!(ensure_contig_view(&mut state, &mut host, mid).is_none());
     let after = lines();
@@ -599,30 +599,4 @@ fn a_contiguous_mapping_write_marks_only_the_pages_its_offset_reaches() {
          would claim page 0, which this write never touched"
     );
     assert_eq!(footprint::counts(), (1, 0));
-}
-
-/// A guest-backed resident publishes the page footprint retained at admission,
-/// not a second decode of the mapping that happened to carry the same identity
-/// earlier. The byte window must still select within that retained scatter.
-#[test]
-fn an_admitted_page_footprint_marks_its_window_without_filling_scatter_gaps() {
-    use crate::observe::footprint;
-
-    let _fp = footprint::exclusive_for_tests();
-    let page = 1u64 << PAGE_SHIFT_X86;
-    let pages: std::sync::Arc<[u64]> = [0x1200_0000u64, 0x3200_0000u64].into();
-    let retained = crate::runtime::guest_ram::GuestPageFootprint::new(
-        std::sync::Arc::clone(&pages),
-        page,
-    )
-    .expect("non-empty page footprint");
-    note_physical_page_write_footprint(&retained, page - 8, 16);
-
-    assert!(footprint::wrote_gpa(pages[0] + page - 8));
-    assert!(footprint::wrote_gpa(pages[1]));
-    assert!(
-        !footprint::wrote_gpa((pages[0] + pages[1]) / 2),
-        "the retained allocation is still a scatter, never its physical hull"
-    );
-    assert_eq!(footprint::counts(), (2, 0));
 }

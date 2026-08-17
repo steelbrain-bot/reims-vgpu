@@ -211,7 +211,11 @@ fn task_lifetime_retires_all_of_its_resource_objects() {
 
     assert!(state.delete_task(1));
     assert!(state.task_resources.get(1, 1).is_none());
-    assert_eq!(ld32(&resource.descriptor), 9, "an outstanding host owner remains valid");
+    assert_eq!(
+        ld32(&resource.descriptor),
+        9,
+        "an outstanding host owner remains valid"
+    );
 }
 
 #[test]
@@ -2155,7 +2159,7 @@ fn a_repoint_resolves_the_resource_in_its_task_before_touching_a_mapping() {
         surface.type4_walk = Some(crate::model::Type4Walk {
             task_id: 0,
             backing_pfn: 0x20,
-            map_generation: surface.map_generation,
+            page_generation: surface.page_generation,
         });
     }
     {
@@ -2192,7 +2196,7 @@ fn a_repoint_retires_a_type4_mapping_owned_by_the_packet_task() {
         surface.type4_walk = Some(crate::model::Type4Walk {
             task_id: 3,
             backing_pfn: 0x20,
-            map_generation: surface.map_generation,
+            page_generation: surface.page_generation,
         });
         surface.map_generation
     };
@@ -2205,8 +2209,8 @@ fn a_repoint_retires_a_type4_mapping_owned_by_the_packet_task() {
         state.mappings[&7]
             .type4_walk
             .expect("the old walk remains only as provenance")
-            .map_generation,
-        state.mappings[&7].map_generation,
+            .page_generation,
+        state.mappings[&7].page_generation,
         "the generation bump makes the retired walk unusable as currency"
     );
 }

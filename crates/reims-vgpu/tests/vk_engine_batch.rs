@@ -345,7 +345,10 @@ fn stored_multisample_target_survives_for_a_later_encoder() {
         stencil: None,
     });
     match engine::execute_draw_request(&first) {
-        Ok(out) => assert!(out.pixels.is_empty(), "stored multisample target stays GPU-resident"),
+        Ok(out) => assert!(
+            out.pixels.is_empty(),
+            "stored multisample target stays GPU-resident"
+        ),
         Err(e) => {
             let msg = e.to_string();
             if skip_if_no_gpu(&msg) {
@@ -580,7 +583,6 @@ fn batched_guest_runs_buffer_snapshots_at_record() {
             total_len: backing.len() as u64,
             row_length_texels: 0,
             pages: None,
-            direct_image: None,
         }),
     });
     match engine::execute_draw_request(&opener) {
@@ -740,7 +742,6 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
                 total_len: 16,
                 row_length_texels: 0,
                 pages: None,
-                direct_image: None,
             },
             // A fixture over a host `Vec` went through no witness, so the gather is
             // the only disposition available to it.
@@ -749,6 +750,7 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
         byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
+        resource_lifetime: None,
         swizzle: Default::default(),
     });
     req.samplers.push(SamplerResource::normalized_default(64));
@@ -900,7 +902,6 @@ fn a_scattered_guest_buffer_window_is_gathered_by_the_gpu_in_one_region_per_stre
             total_len: STRETCH * 3,
             row_length_texels: 0,
             pages: Some(std::sync::Arc::new(pages)),
-            direct_image: None,
         }),
     });
     engine::execute_draw_request(&req).expect("the gathered draw");
@@ -926,10 +927,6 @@ fn a_scattered_guest_buffer_window_is_gathered_by_the_gpu_in_one_region_per_stre
     assert_eq!(
         d.buffer_guest_gather_regions, 3,
         "one copy region per stretch: {d:?}"
-    );
-    assert_eq!(
-        d.buffer_guest_imports, 0,
-        "three stretches are not one bind range: {d:?}"
     );
     assert_eq!(
         d.buffer_snapshot_binds, 0,
@@ -1130,7 +1127,6 @@ void main() {{
             total_len: STRETCH * 3,
             row_length_texels: 0,
             pages: Some(std::sync::Arc::new(pages)),
-            direct_image: None,
         }),
     });
     engine::execute_draw_request(&req).expect("the gathered draw");
@@ -1310,7 +1306,6 @@ void main() {{
             total_len: STRETCH * RUNS,
             row_length_texels: 0,
             pages: Some(std::sync::Arc::new(pages)),
-            direct_image: None,
         }),
     });
     engine::execute_draw_request(&req).expect("the fallback draw");
@@ -1341,30 +1336,13 @@ void main() {{
     engine::test_quiesce_ring();
 }
 
-/// **The rail a real workload never reaches: bound in place.**
+/// One contiguous guest window still takes the engine-owned draw-buffer route.
 ///
-/// A `GuestRuns` window has three dispositions on a host that can import guest
-/// RAM, and `stage_buffer_content` documents them in decreasing order of cost:
-/// bound in place, gathered by the GPU, gathered by the CPU. The other two now
-/// have tests that read the assembled bytes back out of a shader. This one is
-/// the first, and it is the one that most needs a test, because it is the one
-/// production never exercises: the guest backs a surface in 16 KiB granules, so
-/// a driven boot put 98.5 % of these windows at 9-32 stretches and **none at
-/// all** at one. `buffer_guest_imports` reads 0 for a whole boot.
-///
-/// That makes it a decoded-but-untaken rail — contract fidelity, kept because a
-/// guest that hands over one contiguous stretch must get the cheapest path
-/// rather than a copy. Kept code with no workload behind it is exactly the kind
-/// that rots silently, and the only assertion this crate previously made about
-/// `buffer_guest_imports` was that it stayed *zero*.
-///
-/// One run at window offset 0 covering the whole window, so `single_run` admits
-/// it and the draw reads the guest's bytes where the guest wrote them, with
-/// nothing copied in either direction. The window is laid out so the expected
-/// colour is the *same* one the gathered and CPU-fallback tests expect: three
-/// rails, one picture.
+/// The single-run case matters because it is where a direct guest binding could
+/// be reintroduced accidentally. The guest bytes must be gathered by the GPU,
+/// never copied by the CPU, and the shader must observe the same contents.
 #[test]
-fn a_single_stretch_window_is_bound_in_place_and_the_shader_reads_the_guest_bytes() {
+fn a_single_stretch_window_is_gathered_into_an_engine_owned_buffer() {
     use reims_vgpu::runtime::guest_ram::{granularity, GuestRamImport, GuestRamRegion, GuestRef};
     use reims_vgpu::runtime::guest_ram_map::GuestWindowRun;
 
@@ -1430,8 +1408,8 @@ void main() {{
     // Laid out in *window* order inside the one stretch, so the shader reading
     // words 0, 64 and 128 sees the same (0x33, 0x22, 0x11) the other two tests
     // expect. There is no reordering to detect here — one contiguous run has no
-    // placement to get wrong — so what this asserts is that binding in place
-    // reads the guest's bytes at all, and reads them from the right offset.
+    // placement to get wrong — so what this asserts is that the gather reads
+    // the guest's bytes at all, and reads them from the right offset.
     const FILL: [u8; 3] = [0x11, 0x22, 0x33];
     for (slot, fill) in [FILL[2], FILL[1], FILL[0]].iter().enumerate() {
         let start = (pad + STRETCH * slot as u64) as usize;
@@ -1473,22 +1451,17 @@ void main() {{
             total_len: WINDOW,
             row_length_texels: 0,
             pages: Some(std::sync::Arc::new(pages)),
-            direct_image: None,
         }),
     });
-    engine::execute_draw_request(&req).expect("the in-place draw");
+    engine::execute_draw_request(&req).expect("the gathered draw");
     let px = engine::read_target(&identity)
         .expect("read_target flushes the batch")
         .into_rgba8();
 
     let d = engine::counter_snapshot().delta_since(&before);
     assert_eq!(
-        d.buffer_guest_imports, 1,
-        "one stretch at window offset 0 is the whole window; it must bind in place: {d:?}"
-    );
-    assert_eq!(
-        d.buffer_guest_gathers, 0,
-        "nothing to gather when the window is already contiguous: {d:?}"
+        d.buffer_guest_gathers, 1,
+        "one contiguous window still gathers into engine-owned memory: {d:?}"
     );
     assert_eq!(
         d.buffer_snapshot_binds, 0,
@@ -1499,7 +1472,7 @@ void main() {{
     let got = &px[i..i + 4];
     assert!(
         near(got[0], FILL[2]) && near(got[1], FILL[1]) && near(got[2], FILL[0]),
-        "in-place bind read back as {got:?}; expected ({}, {}, {}) — the same \
+        "gathered bind read back as {got:?}; expected ({}, {}, {}) — the same \
          picture the gathered and CPU-fallback rails produce.",
         FILL[2],
         FILL[1],
@@ -1508,12 +1481,11 @@ void main() {{
     engine::test_quiesce_ring();
 }
 
-/// An indexed draw retains the guest buffer window through execution. This is
+/// An indexed draw gathers its guest window into engine-owned memory. This is
 /// the fixed-function counterpart of the storage-buffer test above: the index
-/// bytes never become a host `Vec` or a staging upload, and a nonzero resource
-/// offset reaches `vkCmdBindIndexBuffer` unchanged.
+/// bytes never become a host `Vec` or a staging upload.
 #[test]
-fn an_index_window_is_bound_in_place_without_a_cpu_copy() {
+fn an_index_window_is_gathered_without_a_cpu_copy() {
     use reims_vgpu::runtime::guest_ram::{granularity, GuestRamImport, GuestRamRegion, GuestRef};
     use reims_vgpu::runtime::guest_ram_map::GuestWindowRun;
 
@@ -1550,8 +1522,7 @@ fn an_index_window_is_bound_in_place_without_a_cpu_copy() {
     let base = backing.as_ptr() as u64 + pad;
     let start = (pad + SOURCE_OFFSET) as usize;
     for (slot, index) in [0u16, 1, 2].into_iter().enumerate() {
-        backing[start + slot * 2..start + slot * 2 + 2]
-            .copy_from_slice(&index.to_le_bytes());
+        backing[start + slot * 2..start + slot * 2 + 2].copy_from_slice(&index.to_le_bytes());
     }
 
     let import = std::sync::Arc::new(
@@ -1582,7 +1553,6 @@ fn an_index_window_is_bound_in_place_without_a_cpu_copy() {
         total_len: INDEX_BYTES,
         row_length_texels: 0,
         pages: Some(std::sync::Arc::new(pages)),
-        direct_image: None,
     };
 
     let before = engine::counter_snapshot();
@@ -1600,12 +1570,17 @@ fn an_index_window_is_bound_in_place_without_a_cpu_copy() {
         .into_rgba8();
 
     let d = engine::counter_snapshot().delta_since(&before);
-    assert_eq!(d.buffer_guest_index_imports, 1, "index source: {d:?}");
-    assert_eq!(d.buffer_guest_index_import_bytes, INDEX_BYTES, "index source: {d:?}");
-    assert_eq!(d.buffer_index_bind_reuses, 1, "index source: {d:?}");
-    assert_eq!(d.buffer_guest_gathers, 0, "index source: {d:?}");
+    assert!(d.buffer_guest_gathers > 0, "index source: {d:?}");
+    assert!(
+        d.buffer_guest_gather_index_bytes >= INDEX_BYTES,
+        "index source: {d:?}"
+    );
     assert_eq!(d.buffer_snapshot_binds, 0, "index source: {d:?}");
     let i = (((H / 2) * W + W / 4) * 4) as usize;
-    assert!(is_frag_color(&px[i..i + 4]), "indexed pixel = {:?}", &px[i..i + 4]);
+    assert!(
+        is_frag_color(&px[i..i + 4]),
+        "indexed pixel = {:?}",
+        &px[i..i + 4]
+    );
     engine::test_quiesce_ring();
 }

@@ -67,6 +67,9 @@ pub struct DrawNote {
     pub height: u32,
     pub vertex_count: u32,
     pub instance_count: u32,
+    /// Fixed-function index fetch for this draw. `None` is a non-indexed draw;
+    /// an indexed draw whose count is zero remains representable distinctly.
+    pub indexed: Option<IndexedNote>,
     /// Distinct set-0 bindings the fragment module carries a `Binding`
     /// decoration for.
     pub frag_declared: u32,
@@ -90,6 +93,47 @@ pub struct DrawNote {
     pub samplers: [SamplerNote; SAMPLER_KEPT],
     /// How many the draw provided, for [`Self::sampled_count`]'s reason.
     pub sampler_count: u32,
+}
+
+/// The indexed-draw state handed to Vulkan's fixed-function fetch.
+///
+/// This is observation rather than policy: it records the exact count, type,
+/// base terms, and supplying rail already selected by the render path. It does
+/// not inspect index values or change which content is bound.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IndexedNote {
+    pub index_count: u32,
+    pub index_width: u8,
+    pub vertex_offset: i32,
+    pub base_instance: u32,
+    pub byte_len: u64,
+    pub source: IndexSource,
+}
+
+/// Which existing buffer-content rail supplies the index bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IndexSource {
+    CpuBytes,
+    GuestRuns,
+}
+
+impl std::fmt::Display for IndexedNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let source = match self.source {
+            IndexSource::CpuBytes => 'b',
+            IndexSource::GuestRuns => 'g',
+        };
+        write!(
+            f,
+            "n{}:u{}:{}:bytes{}:vo{}:bi{}",
+            self.index_count,
+            self.index_width * 8,
+            source,
+            self.byte_len,
+            self.vertex_offset,
+            self.base_instance
+        )
+    }
 }
 
 /// One fragment sampled binding, as the draw handed it to the engine.
@@ -321,10 +365,12 @@ impl std::fmt::Display for DrawNote {
                 .join(",");
             write!(f, " smpl={}[{}]", self.sampler_count, body)?;
         }
+        if let Some(indexed) = self.indexed {
+            write!(f, " idx=[{indexed}]")?;
+        }
         Ok(())
     }
 }
-
 
 /// The bindings a module declares that a layout will not describe: the count,
 /// and the lowest [`GAP_KEPT`] of them.
@@ -524,6 +570,9 @@ pub struct SubmitNote {
     /// Submit ordinal, so "oldest outstanding" is a comparison and not an
     /// inference from ring positions that wrap.
     pub seq: u64,
+    /// Completion-timeline point signalled by this submission. `None` means
+    /// the submission did not participate in the FIFO guest-work timeline.
+    pub timeline: Option<u64>,
     /// The draw ordinal this submission closed at, for lining it up against
     /// [`trail`]'s `kept=n/total`.
     pub at_draw: u64,
@@ -563,11 +612,24 @@ pub const SUBMIT_DRAWS_KEPT: usize = 4;
 
 impl std::fmt::Display for SubmitNote {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "#{} at_draw={} draws={}", self.seq, self.at_draw, self.draws)?;
+        write!(
+            f,
+            "#{} timeline={} at_draw={} draws={}",
+            self.seq,
+            self.timeline
+                .map_or_else(|| "none".to_string(), |value| value.to_string()),
+            self.at_draw,
+            self.draws
+        )?;
         if let Some(note) = &self.heaviest {
             write!(f, " heaviest=[{note}]")?;
         }
-        for (ordinal, note) in self.kept.iter().enumerate().filter_map(|(i, n)| n.map(|n| (i, n))) {
+        for (ordinal, note) in self
+            .kept
+            .iter()
+            .enumerate()
+            .filter_map(|(i, n)| n.map(|n| (i, n)))
+        {
             write!(f, " d{ordinal}=[{note}]")?;
         }
         Ok(())
@@ -609,7 +671,7 @@ impl Accumulating {
 /// lone draw's own submit both reach `finish_entry_async`, which is also where
 /// the slot starts owing cleanup. Attributing at any earlier point would charge
 /// draws to a submission that had not closed yet.
-pub fn note_submit(slot: usize) {
+pub fn note_submit(slot: usize, timeline: Option<u64>) {
     let mut trail = TRAIL.lock().unwrap_or_else(|e| e.into_inner());
     if slot >= trail.submits.len() {
         // Unreachable while the `const _` beside `RING_DEPTH` holds. Counted
@@ -627,6 +689,7 @@ pub fn note_submit(slot: usize) {
     trail.submit_seq = seq;
     trail.submits[slot] = Some(SubmitNote {
         seq,
+        timeline,
         at_draw,
         draws: acc.draws,
         heaviest: acc.heaviest,
@@ -681,6 +744,19 @@ fn render_outstanding(submits: &[Option<SubmitNote>]) -> Option<String> {
 pub fn submission(slot: usize) -> Option<SubmitNote> {
     let trail = TRAIL.lock().unwrap_or_else(|e| e.into_inner());
     trail.submits.get(slot).copied().flatten()
+}
+
+/// The outstanding submission that signals `timeline`, if it is still live.
+///
+/// Timeline identity is the join between the asynchronous completion wait and
+/// the ring slot that carries the draw. A FIFO index is deliberately not used:
+/// it names the guest channel whose word is woken, not a submission slot.
+pub fn submission_for_timeline(timeline: u64) -> Option<(usize, SubmitNote)> {
+    let trail = TRAIL.lock().unwrap_or_else(|e| e.into_inner());
+    trail.submits.iter().enumerate().find_map(|(slot, note)| {
+        note.filter(|note| note.timeline == Some(timeline))
+            .map(|note| (slot, note))
+    })
 }
 
 /// The trail, oldest first, as one line's worth of text.
@@ -787,7 +863,10 @@ mod tests {
         let line = trail().expect("notes were recorded");
         let first = 1000 + CAPACITY as u32;
         let last = 1000 + CAPACITY as u32 * 2 - 1;
-        let pipes: Vec<&str> = line.match_indices("pipe=").map(|(i, _)| &line[i..]).collect();
+        let pipes: Vec<&str> = line
+            .match_indices("pipe=")
+            .map(|(i, _)| &line[i..])
+            .collect();
         assert_eq!(pipes.len(), CAPACITY, "the ring is full: {line}");
         assert!(
             line.contains(&format!("pipe={first} ")),
@@ -869,6 +948,7 @@ mod tests {
     fn submit(seq: u64, draws: u32) -> Option<SubmitNote> {
         Some(SubmitNote {
             seq,
+            timeline: Some(seq + 100),
             at_draw: seq * 10,
             draws,
             heaviest: None,
@@ -919,6 +999,44 @@ mod tests {
             !line.contains("heaviest"),
             "no draw means no heaviest module to name: {line}"
         );
+    }
+
+    #[test]
+    fn indexed_state_is_rendered_without_conflating_a_zero_count_with_nonindexed() {
+        let indexed = DrawNote {
+            pipeline_ref: 77,
+            indexed: Some(IndexedNote {
+                index_count: 0,
+                index_width: 2,
+                vertex_offset: -3,
+                base_instance: 4,
+                byte_len: 0,
+                source: IndexSource::GuestRuns,
+            }),
+            ..DrawNote::default()
+        };
+        let indexed_line = indexed.to_string();
+        assert!(
+            indexed_line.contains("idx=[n0:u16:g:bytes0:vo-3:bi4]"),
+            "{indexed_line}"
+        );
+        assert!(
+            !DrawNote::default().to_string().contains("idx="),
+            "a non-indexed draw has no indexed state"
+        );
+    }
+
+    #[test]
+    fn timeline_identity_selects_the_submission_and_not_a_fifo_or_ring_ordinal() {
+        // Process-global storage means use values no other test can produce.
+        let timeline = u64::MAX - 7;
+        let slot = SUBMIT_SLOTS - 1;
+        note_submit(slot, Some(timeline));
+        let (found_slot, found) = submission_for_timeline(timeline).expect("the timeline is live");
+        assert_eq!(found_slot, slot);
+        assert_eq!(found.timeline, Some(timeline));
+        assert!(submission_for_timeline(timeline - 1).is_none());
+        note_retired(slot);
     }
 
     /// A wedged submission carrying two draws must name both, or the reader is

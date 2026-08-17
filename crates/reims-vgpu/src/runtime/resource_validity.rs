@@ -169,12 +169,13 @@ pub fn apply(
         // `copyFromTexture:toTexture:`, on the grounds that the command does not
         // carry it; this is the counterpart check that the guest's *explicit*
         // request is not being dropped on the floor at the same time.
-        let owed_gva = state
-            .pending_writebacks
-            .has_gva(crate::runtime::writeback_debt::GvaResourceKey {
-                task_id,
-                texture_ref: object_id,
-            });
+        let owed_gva =
+            state
+                .pending_writebacks
+                .has_gva(crate::runtime::writeback_debt::GvaResourceKey {
+                    task_id,
+                    texture_ref: object_id,
+                });
         let owed_surface = targets
             .iter()
             .any(|id| state.pending_writebacks.get(id).is_some());
@@ -427,8 +428,12 @@ mod tests {
             let _ = state.pending_writebacks.arm_gva(
                 key,
                 crate::runtime::writeback_debt::GvaWritebackDebt {
-                    gva: 0x4000,
-                    row_stride: 256,
+                    linear: crate::runtime::draw::LinearColorTarget {
+                        allocation_gva: 0x4000,
+                        allocation_size: 256 * 64,
+                        plane_offset: 0,
+                        row_stride: 256,
+                    },
                     width: 64,
                     height: 64,
                     format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
@@ -442,7 +447,8 @@ mod tests {
         // Nothing owed: the guest may read, and the alarm must not fire.
         let mut quiet = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         quiet.mappings.entry(texture_ref).or_default().mapped = true;
-        let before_quiet = crate::runtime::drain::store_route_count("validity_guest_read_frame_owed");
+        let before_quiet =
+            crate::runtime::drain::store_route_count("validity_guest_read_frame_owed");
         apply(
             &mut quiet,
             task_id,
@@ -460,7 +466,8 @@ mod tests {
         let mut owed = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         owed.mappings.entry(texture_ref).or_default().mapped = true;
         debt(&mut owed);
-        let before_owed = crate::runtime::drain::store_route_count("validity_guest_read_frame_owed");
+        let before_owed =
+            crate::runtime::drain::store_route_count("validity_guest_read_frame_owed");
         apply(
             &mut owed,
             task_id,
@@ -492,8 +499,12 @@ mod tests {
         let _ = state.pending_writebacks.arm_gva(
             key,
             crate::runtime::writeback_debt::GvaWritebackDebt {
-                gva: 0x4000,
-                row_stride: 256,
+                linear: crate::runtime::draw::LinearColorTarget {
+                    allocation_gva: 0x4000,
+                    allocation_size: 256 * 64,
+                    plane_offset: 0,
+                    row_stride: 256,
+                },
                 width: 64,
                 height: 64,
                 format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,

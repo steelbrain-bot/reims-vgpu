@@ -48,7 +48,6 @@ pub mod device_features;
 pub mod device_select;
 pub mod host_pointer;
 pub mod linear_sampled;
-pub mod linear_target;
 pub mod memory_topology;
 pub mod push_descriptor;
 
@@ -160,7 +159,7 @@ mod tests {
                 rung: HostPointerImport::Supported,
                 min_alignment: 4096,
                 heap_budget: 8 << 30,
-                span_max: host_pointer::IMPORT_SPAN_CEILING,
+                span_max: 4 << 30,
             },
             push_descriptor: PushDescriptorCaps::default(),
             portability_subset: false,

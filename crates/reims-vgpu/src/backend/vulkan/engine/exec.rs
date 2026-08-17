@@ -21,8 +21,8 @@ use super::pools::{
 use super::stage_phase;
 use super::types::{
     BufferContent, ColorWriteMask, DrawError, DrawOutput, DrawRequest, ResidentReclaim,
-    SampledSource, ScissorResource, SeedOrder, TargetIdentity, VertexStepFunction,
-    ViewportResource, VisibilityResultMode,
+    SampledImageResource, SampledSource, ScissorResource, SeedOrder, TargetIdentity,
+    VertexStepFunction, ViewportResource, VisibilityResultMode,
 };
 use super::vk_call::{VkCall, VkOp};
 
@@ -62,9 +62,9 @@ impl From<BufferSlot> for BoundBuffer {
 /// Recorded rather than executed at plan time: the copies belong in the draw's
 /// own command buffer, ahead of the pass that reads them, so they cost one
 /// submission with the draw instead of a submit and a fence of their own.
-struct PendingGuestGather {
+pub(super) struct PendingGuestGather {
     /// Device-local destination, which is what the draw actually binds.
-    dst: vk::Buffer,
+    pub(super) dst: vk::Buffer,
     /// One entry per import the window's stretches resolved against, each with
     /// its copy regions.
     ///
@@ -74,7 +74,7 @@ struct PendingGuestGather {
     /// RAMBlock and this is a single-entry `Vec`, but the grouping is what makes
     /// the two-block case land the whole window instead of the part that
     /// happened to be first.
-    sources: Vec<(vk::Buffer, Vec<vk::BufferCopy>)>,
+    pub(super) sources: Vec<(vk::Buffer, Vec<vk::BufferCopy>)>,
 }
 
 /// Which consumer(s) require one physical guest-buffer gather.
@@ -89,30 +89,30 @@ struct PendingGuestGather {
 pub(super) struct BufferGatherRole {
     vertex: bool,
     storage: bool,
-    index_alignment: Option<u64>,
+    index: bool,
 }
 
 impl BufferGatherRole {
     const VERTEX: Self = Self {
         vertex: true,
         storage: false,
-        index_alignment: None,
+        index: false,
     };
-    const STORAGE: Self = Self {
+    pub(super) const STORAGE: Self = Self {
         vertex: false,
         storage: true,
-        index_alignment: None,
+        index: false,
     };
     pub(super) fn is_shared(self) -> bool {
-        self.vertex as u8 + self.storage as u8 + self.index_alignment.is_some() as u8 > 1
+        self.vertex as u8 + self.storage as u8 + self.index as u8 > 1
     }
 
     pub(super) fn includes_index(self) -> bool {
-        self.index_alignment.is_some()
+        self.index
     }
 
     pub(super) fn is_storage_only(self) -> bool {
-        self.storage && !self.vertex && self.index_alignment.is_none()
+        self.storage && !self.vertex && !self.index
     }
 }
 
@@ -159,12 +159,6 @@ fn pass_begin_area_band(width: u32, height: u32) -> &'static str {
     }
 }
 
-/// The offset alignment imposed by the consumer that will bind this source.
-fn buffer_bind_offset_alignment(role: BufferGatherRole, storage_align: u64) -> u64 {
-    let storage = if role.storage { storage_align } else { 1 };
-    storage.max(role.index_alignment.unwrap_or(1))
-}
-
 /// One draw's buffer binds partitioned by the consumer(s) each physical content
 /// allocation serves.
 ///
@@ -187,15 +181,18 @@ struct BufferGatherRoles {
 impl BufferGatherRoles {
     fn of(req: &DrawRequest) -> Self {
         let mut entries: Vec<((usize, u64, u64), BufferGatherRole)> = Vec::with_capacity(
-            req.vertex_attributes.len() + req.storage_buffers.len() + req.indexed.is_some() as usize,
+            req.vertex_attributes.len()
+                + req.storage_buffers.len()
+                + req.indexed.is_some() as usize,
         );
         // `entry`-shaped, so a content allocation named twice in one draw stays
         // one physical operation carrying both roles.
-        let mut merge = |key, seed: BufferGatherRole, add: fn(&mut BufferGatherRole)| {
-            match entries.iter_mut().find(|(held, _)| *held == key) {
-                Some((_, role)) => add(role),
-                None => entries.push((key, seed)),
-            }
+        let mut merge = |key, seed: BufferGatherRole, add: fn(&mut BufferGatherRole)| match entries
+            .iter_mut()
+            .find(|(held, _)| *held == key)
+        {
+            Some((_, role)) => add(role),
+            None => entries.push((key, seed)),
         };
         for content in req.vertex_attributes.iter().map(|r| &r.content) {
             merge(CbBind::key_of(content), BufferGatherRole::VERTEX, |role| {
@@ -208,15 +205,14 @@ impl BufferGatherRoles {
             });
         }
         if let Some(indexed) = &req.indexed {
-            let alignment = indexed.index_type.byte_size() as u64;
             let key = CbBind::key_of(&indexed.content);
             let seed = BufferGatherRole {
                 vertex: false,
                 storage: false,
-                index_alignment: Some(alignment),
+                index: true,
             };
             match entries.iter_mut().find(|(held, _)| *held == key) {
-                Some((_, role)) => role.index_alignment = Some(alignment),
+                Some((_, role)) => role.index = true,
                 None => entries.push((key, seed)),
             }
         }
@@ -721,20 +717,13 @@ unsafe fn stage_buffer_content(
             BoundBuffer::from(slot)
         }
         BufferContent::GuestRuns(src) => {
-            // The bytes are already in memory the device can address. Bind them.
-            //
-            // What keeps this safe is not the mechanism — a host pointer is one
-            // the GPU can write and can stray within — but the bound the
-            // reference carries. `src.pages` is a
-            // [`crate::runtime::guest_ram::GuestRef`], which no call site can
-            // construct without the range check against the RAMBlock it names,
-            // and freeing the import is what ends the access.
-            if let Some(bound) = unsafe { import_guest_buffer_window(ctx, pools, src, gather_role) }
-            {
-                pools.note_guest_read_recorded();
-                counters.note_buffer_guest_import(src.total_len, gather_role);
-                bound
-            } else if let Some((bound, pending)) =
+            // Guest memory is the transport source, never the draw resource.
+            // The command buffer copies the exact declared span into an
+            // engine-owned buffer and orders every consumer behind that copy.
+            // This preserves execution-time freshness without a CPU read or
+            // memcpy and keeps one ownership model for vertex, index, and
+            // shader-buffer input.
+            if let Some((bound, pending)) =
                 unsafe { gather_guest_buffer_window(ctx, pools, counters, src, usage)? }
             {
                 // The copies read guest RAM when the CB executes, exactly as a
@@ -791,20 +780,19 @@ unsafe fn stage_buffer_content(
     Ok(bound)
 }
 
-/// Bind a buffer source's guest pages directly, or say why they have to be
-/// gathered.
+/// Bind a compute storage buffer directly to its retained guest allocation.
 ///
-/// Every `None` is a routing answer and never a lost draw: the caller's CPU
-/// gather reads the same bytes through the same runs.
+/// This is not a draw-buffer route: writable compute storage needs the guest
+/// allocation itself so the dispatch can publish completion without a CPU
+/// readback. Draw buffers instead go through [`gather_guest_buffer_window`].
 ///
 /// # Safety
 ///
 /// `ctx` must own the device `pools` holds every live import against.
-unsafe fn import_guest_buffer_window(
+pub(super) unsafe fn import_guest_compute_buffer_window(
     ctx: &super::context::DeviceContext,
     pools: &mut ResourcePools,
     src: &super::types::GuestRunSource,
-    role: BufferGatherRole,
 ) -> Option<BoundBuffer> {
     if !ctx.caps.host_pointer.is_available() {
         return None;
@@ -813,24 +801,15 @@ unsafe fn import_guest_buffer_window(
     let bound = match unsafe { pools.bind_guest_ram(ctx, stretch.guest) } {
         Ok(bound) => bound,
         Err(inner) => {
-            crate::observe::Emit::decline("vk_buffer_import", &inner).fail_once(0);
+            crate::observe::Emit::decline("vk_compute_buffer_import", &inner).fail_once(0);
             return None;
         }
     };
-    // The imported buffer spans the whole RAMBlock, so the span's first byte is
-    // the bound range's start, plus whatever widening it to the device's import
-    // granularity added at the front, plus the window's own offset inside the
-    // stretch.
     let offset = bound.offset + bound.head + stretch.skip;
-    // Storage descriptors carry the device's queried offset alignment. Vertex
-    // buffers do not: Vulkan only requires their offsets to lie inside the
-    // buffer. Applying the storage limit to a vertex-only bind needlessly turns
-    // valid offsets into gathers. A source used by both roles keeps the stricter
-    // rule because its one `BoundBuffer` is shared by both consumers.
-    let align = buffer_bind_offset_alignment(role, ctx.storage_buffer_offset_align);
+    let align = ctx.storage_buffer_offset_align;
     if !offset.is_multiple_of(align) {
         crate::observe::Emit::decline(
-            "vk_buffer_import",
+            "vk_compute_buffer_import",
             &BufferImportDecline::BindOffsetAlignment { offset, align },
         )
         .fail_once(offset % align);
@@ -993,9 +972,8 @@ fn gather_region(
 /// A check that sent a guest buffer span back to the CPU gather.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BufferImportDecline {
-    /// The span does not start at an offset this device will bind a vertex or
-    /// storage buffer at. See
-    /// [`super::context::DeviceContext::storage_buffer_offset_align`].
+    /// The compute storage span does not start at the offset alignment queried
+    /// from this device.
     BindOffsetAlignment { offset: u64, align: u64 },
     /// The window's stretches did not add up to the window. A healthy zero:
     /// `references_for_runs` tiles exactly, so a firing means the runs and the
@@ -1029,7 +1007,7 @@ crate::observe::decline::decline_display!(BufferImportDecline);
 ///
 /// The two arms are the same `vkCmdCopyBufferToImage` over a different buffer,
 /// and the whole difference is whether the CPU moved the texels first.
-enum GuestTexels {
+pub(super) enum GuestTexels {
     /// The buffer **is** the guest's pages, reached through the host-pointer
     /// import over their RAMBlock. Nothing copied them into it: the GPU reads
     /// the bytes where the guest wrote them, and `offset` is where the first
@@ -1044,29 +1022,28 @@ enum GuestTexels {
     /// guest stretch into a device-local slot, recorded ahead of the pass, and
     /// the buffer→image copy then names that slot.
     ///
-    /// The arm a real workload takes. The guest backs a surface in 16 KiB
-    /// physically-contiguous granules, so a sampled window is a handful of
-    /// stretches and essentially never one — which made [`Self::Imported`]
-    /// unreachable and sent every bind to the CPU.
+    /// This is also the required snapshot when the destination image aliases
+    /// the guest pages: the first copy completes before the image is
+    /// transitioned and written, so the second copy never reads and writes
+    /// overlapping memory.
     Gathered(BufferSlot),
     /// The CPU packed the texels into a pooled staging span, because this host
     /// could not reach the pages (no `VK_EXT_external_memory_host`, the rail
-    /// switched off, a driver that declined the pointer, or a window too
-    /// scattered to be worth the copy regions) or the copy could not name them
-    /// at the offset they sit at. Always available, which is why the import is
-    /// allowed to decline for any reason at all.
+    /// switched off, a driver that declined the pointer, or no retained page
+    /// references) or a direct copy could not name their offset. Always
+    /// available, which is why the import may decline.
     Scratch(BufferSlot),
 }
 
 impl GuestTexels {
-    fn buffer(&self) -> vk::Buffer {
+    pub(super) fn buffer(&self) -> vk::Buffer {
         match self {
             Self::Imported { buffer, .. } => *buffer,
             Self::Gathered(slot) | Self::Scratch(slot) => slot.buffer,
         }
     }
 
-    fn offset(&self) -> u64 {
+    pub(super) fn offset(&self) -> u64 {
         match self {
             Self::Imported { offset, .. } => *offset,
             // Both start at the beginning of a pooled slot the window was
@@ -1078,24 +1055,15 @@ impl GuestTexels {
 
 /// The source of a guest-page attachment LOAD after target admission.
 ///
-/// Admission is the decision point: the same declared seed is either already
-/// the attachment's memory or is fallback material for an ordinary resident.
-/// Carrying the seed only on these two arms prevents callers from preparing it
-/// before the resource has answered that question.
 enum GuestTargetLoad<'a> {
-    SharedBacking(&'a super::types::GuestTargetSeed),
     PrepareSeed(&'a super::types::GuestTargetSeed),
     None,
 }
 
-fn guest_target_load(
-    target_loads_guest_backing: bool,
-    seed: Option<&super::types::GuestTargetSeed>,
-) -> GuestTargetLoad<'_> {
-    match (target_loads_guest_backing, seed) {
-        (true, Some(seed)) => GuestTargetLoad::SharedBacking(seed),
-        (false, Some(seed)) => GuestTargetLoad::PrepareSeed(seed),
-        (_, None) => GuestTargetLoad::None,
+fn guest_target_load(seed: Option<&super::types::GuestTargetSeed>) -> GuestTargetLoad<'_> {
+    match seed {
+        Some(seed) => GuestTargetLoad::PrepareSeed(seed),
+        None => GuestTargetLoad::None,
     }
 }
 
@@ -1126,19 +1094,8 @@ enum PreparedSampled {
         row_length_texels: u32,
         volume: bool,
         layers: u32,
-        /// Bytes the copy names, for the cache's byte-cap accounting.
+        /// Bytes the copy names, for cache-hit and movement accounting.
         gathered_len: usize,
-    },
-    /// A linear image whose storage is the guest resource's packed allocation.
-    /// It remains in GENERAL after first use so host and shader access can
-    /// alternate without copying its texels into an optimal image.
-    GuestDirect {
-        binding: u32,
-        array_element: u32,
-        image: vk::Image,
-        view: vk::ImageView,
-        key: super::pools::GuestSampledKey,
-        initialized: bool,
     },
     Cached {
         binding: u32,
@@ -1171,7 +1128,16 @@ enum PreparedSampled {
         source_access: super::pools::ResidentAccess,
         next_access: super::pools::ResidentAccess,
         image: SampledSlot,
+        timing: SnapshotTiming,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SnapshotTiming {
+    Prior,
+    Clear([f32; 4]),
+    AfterPrimarySeed,
+    Undefined,
 }
 
 impl PreparedSampled {
@@ -1182,7 +1148,6 @@ impl PreparedSampled {
             | Self::Resident { binding, .. }
             | Self::Feedback { binding, .. }
             | Self::Snapshot { binding, .. }
-            | Self::GuestDirect { binding, .. }
             | Self::GuestGather { binding, .. } => *binding,
         }
     }
@@ -1194,7 +1159,6 @@ impl PreparedSampled {
             | Self::Resident { array_element, .. }
             | Self::Feedback { array_element, .. }
             | Self::Snapshot { array_element, .. }
-            | Self::GuestDirect { array_element, .. }
             | Self::GuestGather { array_element, .. } => *array_element,
         }
     }
@@ -1206,7 +1170,6 @@ impl PreparedSampled {
             Self::Resident { view, .. } => *view,
             Self::Feedback { view, .. } => *view,
             Self::Snapshot { image, .. } => image.view,
-            Self::GuestDirect { view, .. } => *view,
             Self::GuestGather { image, .. } => image.view,
         }
     }
@@ -1217,7 +1180,6 @@ impl PreparedSampled {
             // reference name one image at one moment, so they are one answer.
             Self::Feedback { .. } => super::caches::color_feedback_layout(),
             Self::Resident { next_access, .. } => next_access.layout(),
-            Self::GuestDirect { .. } => vk::ImageLayout::GENERAL,
             _ => vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         }
     }
@@ -1237,8 +1199,9 @@ fn feedback_color_index(
     if !supported || !SampledKey::of(resource).is_plain_2d_identity_view() {
         return None;
     }
-    let SampledSource::Target(identity) = &resource.source else {
-        return None;
+    let identity = match &resource.source {
+        SampledSource::Target(identity) | SampledSource::Attachment { identity, .. } => identity,
+        SampledSource::Bytes(_) | SampledSource::GuestRuns(..) => return None,
     };
     req.color_attachment_index(identity)
 }
@@ -1251,18 +1214,17 @@ fn feedback_color_index(
 /// takes the CPU gather, which has no such rule.
 const GUEST_IMPORT_COPY_OFFSET_ALIGN: u64 = 16;
 
-/// Bind a sampled source's guest pages as a buffer the copy can read directly,
-/// or say why it must be gathered on the CPU instead.
+/// Prepare a guest texel window as a buffer-to-image copy source.
 ///
-/// Every `None` is a routing answer and never a lost frame: the caller's CPU
-/// gather reads the same bytes through the same runs. So the checks here are
-/// free to be conservative — a window this refuses costs one `memcpy` that the
-/// device was making unconditionally until now.
+/// A single-stretch window binds in place. A scattered window is gathered by
+/// the GPU into a device-local slot. `None` means the host cannot import the guest
+/// pages or the window cannot be represented, leaving the exact CPU fallback
+/// to the caller.
 ///
 /// # Safety
 ///
 /// `ctx` must own the device `pools` holds every live import against.
-unsafe fn import_sampled_guest_window(
+pub(super) unsafe fn prepare_guest_texel_window(
     ctx: &super::context::DeviceContext,
     pools: &mut ResourcePools,
     counters: &EngineCounters,
@@ -1647,7 +1609,9 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
             ));
         }
         if req.sampled_images.iter().any(|img| match &img.source {
-            SampledSource::Target(identity) => identity == seed_identity,
+            SampledSource::Target(identity) | SampledSource::Attachment { identity, .. } => {
+                identity == seed_identity
+            }
             SampledSource::Bytes(_) | SampledSource::GuestRuns(..) => false,
         }) {
             return Err(DrawError::DrawValidation(
@@ -1911,7 +1875,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                     },
                 ));
             }
-            SampledSource::Target(identity) => {
+            SampledSource::Target(identity) | SampledSource::Attachment { identity, .. } => {
                 if image.arrayed || image.volume || image.cube || image.layers != 1 {
                     return Err(DrawError::Unsupported(
                         super::reason::DrawReason::ResidentSampledNot2d {
@@ -1973,9 +1937,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 }
                 let sum: u64 = src.runs.iter().map(|r| r.len).sum();
                 let covered = src.source_offset.checked_add(src.total_len);
-                if src.total_len == 0
-                    || src.runs.is_empty()
-                    || covered.is_none_or(|end| end > sum)
+                if src.total_len == 0 || src.runs.is_empty() || covered.is_none_or(|end| end > sum)
                 {
                     return Err(DrawError::DrawValidation(
                         DrawValidationDecline::GuestSampleCoverage {
@@ -2525,15 +2487,28 @@ fn note_depth_load_without_content(width: u32, height: u32, stencil: bool) {
 /// query this mutable registry first: such a result can change before the draw
 /// acquires the engine, while this decision cannot race a reclaim or target
 /// replacement.
-fn validate_sampled_resident(
+struct SampledResidentExpectation<'a> {
     binding: u32,
-    identity: &TargetIdentity,
+    identity: &'a TargetIdentity,
     resource_width: u32,
     resource_height: u32,
     shader_multisampled: bool,
+    initialized_by_this_pass: bool,
+}
+
+fn validate_sampled_resident(
+    expected: SampledResidentExpectation<'_>,
     held: Option<(bool, u32, u32, u32)>,
     prior: Option<ResidentReclaim>,
 ) -> Result<(), DrawExecutionDecline> {
+    let SampledResidentExpectation {
+        binding,
+        identity,
+        resource_width,
+        resource_height,
+        shader_multisampled,
+        initialized_by_this_pass,
+    } = expected;
     let Some((content_ready, resident_width, resident_height, resident_samples)) = held else {
         return Err(DrawExecutionDecline::SampledResidentMissing {
             binding,
@@ -2541,7 +2516,7 @@ fn validate_sampled_resident(
             prior,
         });
     };
-    if !content_ready {
+    if !content_ready && !initialized_by_this_pass {
         return Err(DrawExecutionDecline::SampledResidentNotReady {
             binding,
             identity: identity.clone(),
@@ -2566,23 +2541,6 @@ fn validate_sampled_resident(
         });
     }
     Ok(())
-}
-
-/// Select the physical-page footprint a render Store publishes in this draw's
-/// engine transaction.
-///
-/// The request states the guest Store, while `guest_backed` states what target
-/// the engine actually admitted. Keeping both gates here makes an import
-/// refusal a performance fallback: an ordinary resident never claims that its
-/// render pass wrote guest RAM. The pages come from the admitted resident, not
-/// from the request, so a warm resource reuse publishes the allocation that is
-/// actually bound.
-fn guest_store_footprint_to_record(
-    requested: bool,
-    guest_backed: bool,
-    footprint: Option<crate::runtime::guest_ram::GuestPageFootprint>,
-) -> Option<crate::runtime::guest_ram::GuestPageFootprint> {
-    (requested && guest_backed).then_some(footprint).flatten()
 }
 
 pub(crate) unsafe fn execute_draw_inner(
@@ -2638,6 +2596,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .map(|id| id.resident_format())
             .unwrap_or(crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT)
     });
+    let attachment_feedback_available = ctx.features.attachment_feedback_loop_layout;
     // A guest-sourced sampled bind used to force the immediate-submit path.
     // Its read of guest RAM happens when the CB *executes*, and this device
     // acked the packet as soon as it was consumed, so deferred submit stretched
@@ -2658,10 +2617,12 @@ pub(crate) unsafe fn execute_draw_inner(
     // here while being snapshotted there. It is census-only now (the join rule
     // dropped this term), so the cost of the divergence was a wrong label rather
     // than a wrong batch, which is exactly the kind that survives.
-    let samples_own_target = req
-        .sampled_images
-        .iter()
-        .any(|s| matches!(&s.source, SampledSource::Target(t) if req.writes_attachment(t)));
+    let samples_own_target = req.sampled_images.iter().any(|s| match &s.source {
+        SampledSource::Target(identity) | SampledSource::Attachment { identity, .. } => {
+            req.writes_attachment(identity)
+        }
+        SampledSource::Bytes(_) | SampledSource::GuestRuns(..) => false,
+    });
     // Built once and asked twice: the join test below and the append at the end
     // of this function are the same four words, and a `BatchTarget` is how they
     // stay the same four words.
@@ -2925,7 +2886,7 @@ pub(crate) unsafe fn execute_draw_inner(
         bindings: layout_bindings,
     };
     // Resolve load action: resident > guest/host seed > Clear black.
-    let mut load_uses_gpu_content = req.load_from_target;
+    let load_uses_gpu_content = req.load_from_target;
     // output_bgra (computed with the batch decision above): BGRA output only
     // on the resident path (pooled targets stay RGBA); the whole
     // pass/pipeline/image chain then agrees on B8G8R8A8 so a raw image→buffer
@@ -2950,7 +2911,6 @@ pub(crate) unsafe fn execute_draw_inner(
             || req.seed_from_target.is_some(),
         color0_format,
     );
-    pass_key.host_accessible_color0 = req.guest_target_memory.is_some();
     for (i, sec) in req.secondary_targets.iter().enumerate() {
         if i >= MAX_SECONDARY_ATTACH {
             return Err(DrawError::Unsupported(
@@ -2968,9 +2928,7 @@ pub(crate) unsafe fn execute_draw_inner(
     pass_key.secondary_count = req.secondary_targets.len() as u8;
     pass_key.color_input = req.color_input;
     for resource in &req.sampled_images {
-        if let Some(index) =
-            feedback_color_index(req, resource, ctx.features.attachment_feedback_loop_layout)
-        {
+        if let Some(index) = feedback_color_index(req, resource, attachment_feedback_available) {
             pass_key.feedback_colors |= 1u8 << index;
         }
     }
@@ -3055,11 +3013,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     },
                 ));
             }
-            if !req.skip_readback
-                || req.target_rgba8.is_some()
-                || req.target_guest_seed.is_some()
-                || req.load_guest_target_backing
-            {
+            if !req.skip_readback || req.target_rgba8.is_some() || req.target_guest_seed.is_some() {
                 return Err(DrawError::Unsupported(
                     super::reason::DrawReason::MultisampleLinearTransferUnsupported {
                         sample_count: raster_sample_count,
@@ -3443,8 +3397,7 @@ pub(crate) unsafe fn execute_draw_inner(
     let ordinary_ad_hoc_framebuffer = is_mrt || req.depth.is_some() || req.color_input;
     let ad_hoc_framebuffer = ordinary_ad_hoc_framebuffer || req.multisample_resolve;
     let (primary_pass, primary_pass_compatibility) = if ad_hoc_framebuffer {
-        let mut color_only = PassKey::single(pass_key.load_seed, pass_key.color0_format);
-        color_only.host_accessible_color0 = pass_key.host_accessible_color0;
+        let color_only = PassKey::single(pass_key.load_seed, pass_key.color0_format);
         (
             caches.get_or_create_pass(ctx, color_only, counters, pools)?,
             color_only.framebuffer_compatibility(),
@@ -3472,13 +3425,13 @@ pub(crate) unsafe fn execute_draw_inner(
     // mark preserves the source's recency if resolving the destination needs
     // to choose a capacity victim.
     for s in &req.sampled_images {
-        if let SampledSource::Target(identity) = &s.source {
-            pools.registry_note_sampled_use(identity);
+        match &s.source {
+            SampledSource::Target(identity) | SampledSource::Attachment { identity, .. } => {
+                pools.registry_note_sampled_use(identity)
+            }
+            SampledSource::Bytes(_) | SampledSource::GuestRuns(..) => {}
         }
     }
-    let mut target_guest_backed = false;
-    let mut target_loads_guest_backing = false;
-    let mut target_guest_footprint: Option<crate::runtime::guest_ram::GuestPageFootprint> = None;
     let (target_image, mut target_fb, target_access, target_view) =
         if let Some(identity) = &req.target_identity {
             let gen = identity.generation();
@@ -3501,19 +3454,8 @@ pub(crate) unsafe fn execute_draw_inner(
                 primary_pass_compatibility,
                 gen,
                 color0_format,
-                req.guest_target_memory.clone(),
                 counters,
             )?;
-            target_guest_backed = t.memory.is_guest_imported();
-            target_guest_footprint = t.memory.guest_footprint();
-            target_loads_guest_backing = target_guest_backed && req.load_guest_target_backing;
-            if target_loads_guest_backing {
-                // The imported image *is* the guest seed. The pass key already
-                // uses LOAD whenever a seed was supplied; switching the source
-                // here preserves those bytes without recording an overlapping
-                // buffer-to-image copy through two aliases of the same memory.
-                load_uses_gpu_content = true;
-            }
             if load_uses_gpu_content && !t.content_ready {
                 return Err(DrawError::DrawExecution(
                     DrawExecutionDecline::LoadTargetContentNotReady {
@@ -3620,70 +3562,55 @@ pub(crate) unsafe fn execute_draw_inner(
     } else {
         None
     };
-    // A guest-page LOAD is fallback material for an ordinary resident, not a
-    // second source beside an imported attachment. Target admission has to run
-    // first because only the admitted resource can answer which one this draw
-    // owns. When it owns the guest allocation, the render-pass LOAD reads that
-    // image directly and no buffer import, gather, or copy is part of the
-    // operation.
-    //
-    // On the fallback arm this is the same source abstraction sampled images
+    // A guest-page LOAD initializes a newly created image. External-memory
+    // images are required to start UNDEFINED just like ordinary residents, so
+    // they take this path once too; their later Stores land in guest memory
+    // directly. The source is the same abstraction sampled images
     // use: bounded import references for the native rail and host aliases for
     // its exact CPU fallback. Fragmented imports append a gather owed by this
     // command buffer; the copy into the attachment is deliberately recorded
     // only after the shared gather block below has filled it.
-    let target_guest_texels =
-        match guest_target_load(target_loads_guest_backing, req.target_guest_seed.as_ref()) {
-            GuestTargetLoad::SharedBacking(seed) => {
-                crate::runtime::drain::note_store_route("target_load_shared_backing");
+    let target_guest_texels = match guest_target_load(req.target_guest_seed.as_ref()) {
+        GuestTargetLoad::PrepareSeed(seed) => match unsafe {
+            prepare_guest_texel_window(ctx, pools, counters, &seed.source, &mut guest_gathers)?
+        } {
+            Some(source) => {
+                pools.note_guest_read_recorded();
+                crate::runtime::drain::note_store_route("target_seed_guest_import");
                 crate::runtime::drain::note_store_route_n(
-                    "target_load_shared_backing_bytes",
+                    "target_seed_guest_import_bytes",
                     seed.source.total_len,
                 );
-                None
+                Some(source)
             }
-            GuestTargetLoad::PrepareSeed(seed) => match unsafe {
-                import_sampled_guest_window(ctx, pools, counters, &seed.source, &mut guest_gathers)?
-            } {
-                Some(source) => {
-                    pools.note_guest_read_recorded();
-                    crate::runtime::drain::note_store_route("target_seed_guest_import");
-                    crate::runtime::drain::note_store_route_n(
-                        "target_seed_guest_import_bytes",
+            None => {
+                let slot = {
+                    let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
+                    pools.acquire_staging(
+                        ctx,
                         seed.source.total_len,
-                    );
-                    Some(source)
+                        vk::BufferUsageFlags::TRANSFER_SRC,
+                        counters,
+                    )?
+                };
+                {
+                    let _s =
+                        stage_phase::Span::moving(stage_phase::Part::Runs, seed.source.total_len);
+                    pools.write_staging_from_runs(
+                        ctx,
+                        &slot,
+                        &seed.source.runs,
+                        seed.source.source_offset,
+                        seed.source.total_len,
+                    )?;
                 }
-                None => {
-                    let slot = {
-                        let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
-                        pools.acquire_staging(
-                            ctx,
-                            seed.source.total_len,
-                            vk::BufferUsageFlags::TRANSFER_SRC,
-                            counters,
-                        )?
-                    };
-                    {
-                        let _s = stage_phase::Span::moving(
-                            stage_phase::Part::Runs,
-                            seed.source.total_len,
-                        );
-                        pools.write_staging_from_runs(
-                            ctx,
-                            &slot,
-                            &seed.source.runs,
-                            seed.source.source_offset,
-                            seed.source.total_len,
-                        )?;
-                    }
-                    counters.note_seed_upload(seed.source.total_len);
-                    crate::runtime::drain::note_store_route("target_seed_guest_cpu_fallback");
-                    Some(GuestTexels::Scratch(slot))
-                }
-            },
-            GuestTargetLoad::None => None,
-        };
+                counters.note_seed_upload(seed.source.total_len);
+                crate::runtime::drain::note_store_route("target_seed_guest_cpu_fallback");
+                Some(GuestTexels::Scratch(slot))
+            }
+        },
+        GuestTargetLoad::None => None,
+    };
     // GPU seed source: resolved after registry_ensure (which protects it from
     // the capacity sweep) so the handle cannot be destroyed under this draw.
     // Every rejection is a distinct named error — the runtime pre-checks
@@ -3728,7 +3655,7 @@ pub(crate) unsafe fn execute_draw_inner(
         Some((
             slot.image,
             slot.access,
-            super::pools::ResidentAccess::transfer_read(slot.memory.is_guest_imported()),
+            super::pools::ResidentAccess::transfer_read(),
         ))
     } else {
         None
@@ -3749,6 +3676,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     SampledKey::of(resource),
                     bytes,
                     resource.identity,
+                    resource.resource_lifetime.as_ref(),
                     counters,
                 ) {
                     sampled.push(PreparedSampled::Cached {
@@ -3776,7 +3704,24 @@ pub(crate) unsafe fn execute_draw_inner(
                     layers: resource.layers,
                 });
             }
-            SampledSource::Target(identity) => {
+            SampledSource::Target(identity) | SampledSource::Attachment { identity, .. } => {
+                let attachment_initial = match &resource.source {
+                    SampledSource::Attachment { initial, .. } => Some(*initial),
+                    _ => None,
+                };
+                let primary_seed = req.color_attachment_index(identity) == Some(0)
+                    && (seed_slot.is_some()
+                        || target_guest_texels.is_some()
+                        || seed_from_resolved.is_some());
+                let initialized_by_this_pass = matches!(
+                    attachment_initial,
+                    Some(
+                        super::types::AttachmentInitial::Clear(_)
+                            | super::types::AttachmentInitial::DontCare
+                    )
+                ) || (attachment_initial
+                    == Some(super::types::AttachmentInitial::Seed)
+                    && primary_seed);
                 // Reading a resident is using it. Marked before the lookup so
                 // the refusal paths below cannot skip it: a resident whose
                 // content is not ready yet, or whose geometry disagrees with
@@ -3794,14 +3739,13 @@ pub(crate) unsafe fn execute_draw_inner(
                         slot.width,
                         slot.height,
                         slot.sample_count,
-                        slot.memory.is_guest_imported(),
                     )
                 });
                 let prior = held
                     .is_none()
                     .then(|| pools.prior_reclaim(identity))
                     .flatten();
-                if let Some((_, _, _, _, ready, width, height, samples, _)) = held.as_ref() {
+                if let Some((_, _, _, _, ready, width, height, samples)) = held.as_ref() {
                     if *samples > 1 {
                         crate::runtime::drain::note_store_route("sampled_resident_multisample");
                         let key = (u64::from(resource.binding) << 32) | u64::from(*samples);
@@ -3820,11 +3764,14 @@ pub(crate) unsafe fn execute_draw_inner(
                     }
                 }
                 validate_sampled_resident(
-                    resource.binding,
-                    identity,
-                    resource.width,
-                    resource.height,
-                    resource.multisampled,
+                    SampledResidentExpectation {
+                        binding: resource.binding,
+                        identity,
+                        resource_width: resource.width,
+                        resource_height: resource.height,
+                        shader_multisampled: resource.multisampled,
+                        initialized_by_this_pass,
+                    },
                     held.as_ref().map(|held| (held.4, held.5, held.6, held.7)),
                     prior,
                 )
@@ -3838,7 +3785,6 @@ pub(crate) unsafe fn execute_draw_inner(
                     _resident_width,
                     _resident_height,
                     _resident_samples,
-                    source_host_accessible,
                 ) = held.expect("validated resident is held");
                 let source_view = pools
                     .registry_sample_view(ctx, identity, resource.format, counters)?
@@ -3862,11 +3808,9 @@ pub(crate) unsafe fn execute_draw_inner(
                 // `used_binding_absent_from_layout`, so the whole draw was lost.
                 let self_slot = req.attachment_slot(identity);
                 let swizzled = !resource.swizzle.is_identity();
-                if let Some(_attachment_index) = feedback_color_index(
-                    req,
-                    resource,
-                    ctx.features.attachment_feedback_loop_layout,
-                ) {
+                if let Some(_attachment_index) =
+                    feedback_color_index(req, resource, attachment_feedback_available)
+                {
                     crate::runtime::drain::note_store_route("sampled_self_feedback_loop");
                     sampled.push(PreparedSampled::Feedback {
                         binding: resource.binding,
@@ -3911,10 +3855,20 @@ pub(crate) unsafe fn execute_draw_inner(
                         identity: identity.clone(),
                         source_image,
                         source_access: source_layout,
-                        next_access: super::pools::ResidentAccess::transfer_read(
-                            source_host_accessible,
-                        ),
+                        next_access: super::pools::ResidentAccess::transfer_read(),
                         image,
+                        timing: match attachment_initial {
+                            Some(super::types::AttachmentInitial::Clear(clear)) => {
+                                SnapshotTiming::Clear(clear)
+                            }
+                            Some(super::types::AttachmentInitial::Seed) if primary_seed => {
+                                SnapshotTiming::AfterPrimarySeed
+                            }
+                            Some(super::types::AttachmentInitial::DontCare) => {
+                                SnapshotTiming::Undefined
+                            }
+                            _ => SnapshotTiming::Prior,
+                        },
                     });
                 } else {
                     sampled.push(PreparedSampled::Resident {
@@ -3924,9 +3878,7 @@ pub(crate) unsafe fn execute_draw_inner(
                         image: source_image,
                         view: source_view,
                         access: source_layout,
-                        next_access: super::pools::ResidentAccess::shader_read(
-                            source_host_accessible,
-                        ),
+                        next_access: super::pools::ResidentAccess::shader_read(),
                     });
                 }
                 counters
@@ -3934,51 +3886,17 @@ pub(crate) unsafe fn execute_draw_inner(
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             SampledSource::GuestRuns(src, vouch) => {
-                if let Some(direct) = src.direct_image.as_ref() {
-                    if let Some(bound) = unsafe {
-                        pools.acquire_guest_sampled(
-                            ctx,
-                            SampledKey::of(resource),
-                            direct.backing,
-                            std::sync::Arc::clone(&direct.import),
-                            direct.owner.clone(),
-                            counters,
-                        )?
-                    } {
-                        crate::runtime::drain::note_store_route("sampled_direct_bound");
-                        crate::runtime::drain::note_store_route(match direct.origin {
-                            super::SampledByteOrigin::LinearTexture => "sampled_direct_linear",
-                            super::SampledByteOrigin::SurfaceGuestFallback => {
-                                "sampled_direct_type11"
-                            }
-                            super::SampledByteOrigin::SerializedSurfaceView => {
-                                "sampled_direct_type5"
-                            }
-                            _ => "sampled_direct_other",
-                        });
-                        sampled.push(PreparedSampled::GuestDirect {
-                            binding: resource.binding,
-                            array_element: resource.array_element,
-                            image: bound.image,
-                            view: bound.view,
-                            key: bound.key,
-                            initialized: bound.initialized,
-                        });
-                        continue;
-                    }
-                }
                 // A copy-backed producer vouches for its identity only when
                 // both halves of the guest-write witness say the window's bytes cannot have
                 // moved since the gather that filled the retained image: no
                 // guest store into the pages, and no write by this device
                 // either. So the retained image is bound with nothing read and
                 // nothing compared — which is the whole point, since reading
-                // the bytes to compare them is the cost being removed. A
-                // declined direct image carries no identity, so this lookup
-                // misses without touching the copied-content ledger.
+                // the bytes to compare them is the cost being removed.
                 if let Some(image) = pools.find_gathered_sampled(
                     SampledKey::of(resource),
                     resource.identity,
+                    resource.resource_lifetime.as_ref(),
                     counters,
                 ) {
                     counters.note_sampled_gather_skipped(src.total_len);
@@ -3995,10 +3913,8 @@ pub(crate) unsafe fn execute_draw_inner(
                 // holding both the witness's answer and the cache's.
                 //
                 // The witness's answer is `vouch`; the identity names the
-                // content it judged. A direct source that reached this point
-                // was declined by the backend and carries neither copied
-                // content nor a vouchable identity, so `Fresh` correctly names
-                // the required conservative gather.
+                // content it judged; `Fresh` correctly names the required
+                // conservative gather when there is no retained copied image.
                 counters.note_sampled_gather_unskipped(*vouch);
                 let img = pools.acquire_sampled(ctx, SampledKey::of(resource), counters)?;
                 // Everything from here to the end of this arm moves bytes;
@@ -4021,7 +3937,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 // RAMBlock at construction and there is no other way to name a
                 // byte in one.
                 let source = match unsafe {
-                    import_sampled_guest_window(ctx, pools, counters, src, &mut guest_gathers)?
+                    prepare_guest_texel_window(ctx, pools, counters, src, &mut guest_gathers)?
                 } {
                     Some(imported) => {
                         // The read is now the command buffer's, at execute time.
@@ -4169,7 +4085,9 @@ pub(crate) unsafe fn execute_draw_inner(
     }
     if dset.is_some() {
         ctx.device.update_descriptor_sets(&descriptor_writes, &[]);
-        counters.descriptor_set_updates.fetch_add(1, Ordering::Relaxed);
+        counters
+            .descriptor_set_updates
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     phase.enter(super::draw_phase::Phase::RecordBegin);
@@ -4250,11 +4168,15 @@ pub(crate) unsafe fn execute_draw_inner(
             source_access,
             next_access,
             image,
+            timing,
             ..
         } = sampled_image
         else {
             continue;
         };
+        if *timing != SnapshotTiming::Prior {
+            continue;
+        }
         target_snapshotted = true;
         unsafe { outside_pass.before_record(PassObstacle::Snapshot, pools, &ctx.device, cb) };
         // Duplicate descriptor bindings of one attachment/key share one image.
@@ -4278,6 +4200,25 @@ pub(crate) unsafe fn execute_draw_inner(
                 *source_access,
                 *next_access,
             );
+        }
+        if *timing == SnapshotTiming::Undefined {
+            let barrier = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image(image.image)
+                .subresource_range(super::color_subresource_range())];
+            ctx.device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &barrier,
+            );
+            continue;
         }
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::empty())
@@ -4330,13 +4271,10 @@ pub(crate) unsafe fn execute_draw_inner(
     }
 
     // Seed upload (CPU import).
-    if target_loads_guest_backing {
-        // The attachment already contains the shared allocation's bytes.
-    } else if let Some(seed) = &seed_slot {
+    if let Some(seed) = &seed_slot {
         unsafe { outside_pass.before_record(PassObstacle::Seed, pools, &ctx.device, cb) };
         let (src_stage, src_access) =
-            target_prior_access(target_snapshotted, target_access, target_guest_backed)
-                .source_scope();
+            target_prior_access(target_snapshotted, target_access).source_scope();
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(src_access)
             .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -4401,8 +4339,7 @@ pub(crate) unsafe fn execute_draw_inner(
             seed_next_access,
         );
         let (dst_stage, dst_access) =
-            target_prior_access(target_snapshotted, target_access, target_guest_backed)
-                .source_scope();
+            target_prior_access(target_snapshotted, target_access).source_scope();
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(dst_access)
             .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -4460,18 +4397,14 @@ pub(crate) unsafe fn execute_draw_inner(
         );
     } else if load_uses_gpu_content
         && !(target_feedback && req.continues_render_pass && pools.open_pass_echoes(&echo))
-        && !pass_exit_needs_no_barrier(target_prior_access(
-            target_snapshotted,
-            target_access,
-            target_guest_backed,
-        ))
+        && !pass_exit_needs_no_barrier(target_prior_access(target_snapshotted, target_access))
     {
         unsafe { outside_pass.before_record(PassObstacle::TargetLayout, pools, &ctx.device, cb) };
         // A prior direct sample may have left this target shader-readable, or a
         // readback may have left it a transfer source; transition from the
         // registry's tracked layout back to attachment use.
-        let prior = target_prior_access(target_snapshotted, target_access, target_guest_backed);
-        let (src_stage, src_access) = target_source_scope(prior, target_loads_guest_backing);
+        let prior = target_prior_access(target_snapshotted, target_access);
+        let (src_stage, src_access) = prior.source_scope();
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(src_access)
             .dst_access_mask(target_dst_access)
@@ -4510,8 +4443,7 @@ pub(crate) unsafe fn execute_draw_inner(
         // touched it, so it is excluded rather than barriered, which keeps this
         // off the pooled path entirely.
         let (src_stage, src_access) =
-            target_prior_access(target_snapshotted, target_access, target_guest_backed)
-                .source_scope();
+            target_prior_access(target_snapshotted, target_access).source_scope();
         let barrier = [vk::MemoryBarrier::default()
             .src_access_mask(src_access)
             .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)];
@@ -4583,47 +4515,6 @@ pub(crate) unsafe fn execute_draw_inner(
             &[],
             &barrier,
         );
-    }
-
-    // CPU-origin sampled uploads.
-    // Resource-owned guest images are born PREINITIALIZED and remain GENERAL.
-    // Only their first use needs an image-layout transition. Host writes made
-    // before queue submission are made available to device reads by the
-    // submission's host-memory dependency; restating that dependency as an
-    // image barrier at every bind would force an otherwise-continuable render
-    // pass to end for content whose layout never changed.
-    let mut transitioned_guest_direct = std::collections::HashSet::new();
-    for image in &sampled {
-        let PreparedSampled::GuestDirect {
-            image,
-            key,
-            initialized,
-            ..
-        } = image
-        else {
-            continue;
-        };
-        if *initialized || !transitioned_guest_direct.insert(*image) {
-            continue;
-        }
-        unsafe { outside_pass.before_record(PassObstacle::SampledUpload, pools, &ctx.device, cb) };
-        let barrier = [vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::HOST_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ)
-            .old_layout(vk::ImageLayout::PREINITIALIZED)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .image(*image)
-            .subresource_range(super::color_subresource_range())];
-        ctx.device.cmd_pipeline_barrier(
-            cb,
-            vk::PipelineStageFlags::HOST,
-            vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &barrier,
-        );
-        pools.mark_guest_sampled_read(key);
     }
 
     // CPU-origin sampled uploads.
@@ -4756,61 +4647,182 @@ pub(crate) unsafe fn execute_draw_inner(
     // the device-local result of the gather just recorded, or the exact CPU
     // fallback. All three expose one buffer range and therefore share the same
     // target transition and copy.
-    if !target_loads_guest_backing {
-        if let (Some(source), Some(seed)) = (&target_guest_texels, &req.target_guest_seed) {
-            unsafe { outside_pass.before_record(PassObstacle::Seed, pools, &ctx.device, cb) };
-            let (src_stage, src_access) =
-                target_prior_access(target_snapshotted, target_access, target_guest_backed)
-                    .source_scope();
-            let barrier = [vk::ImageMemoryBarrier::default()
-                .src_access_mask(src_access)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .image(target_image)
-                .subresource_range(super::color_subresource_range())];
-            ctx.device.cmd_pipeline_barrier(
-                cb,
-                src_stage,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &barrier,
-            );
-            let copy = [vk::BufferImageCopy::default()
-                .buffer_offset(source.offset())
-                .buffer_row_length(seed.source.row_length_texels)
-                .image_subresource(super::color_subresource_layers())
-                .image_extent(vk::Extent3D {
-                    width: req.width,
-                    height: req.height,
-                    depth: 1,
-                })];
-            ctx.device.cmd_copy_buffer_to_image(
-                cb,
-                source.buffer(),
-                target_image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &copy,
-            );
-            let barrier = [vk::ImageMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(target_dst_access)
-                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .new_layout(target_pass_layout)
-                .image(target_image)
-                .subresource_range(super::color_subresource_range())];
-            ctx.device.cmd_pipeline_barrier(
-                cb,
-                vk::PipelineStageFlags::TRANSFER,
-                target_dst_stage,
-                target_dependency,
-                &[],
-                &[],
-                &barrier,
-            );
+    if let (Some(source), Some(seed)) = (&target_guest_texels, &req.target_guest_seed) {
+        unsafe { outside_pass.before_record(PassObstacle::Seed, pools, &ctx.device, cb) };
+        let (src_stage, src_access) =
+            target_prior_access(target_snapshotted, target_access).source_scope();
+        let barrier = [vk::ImageMemoryBarrier::default()
+            .src_access_mask(src_access)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .image(target_image)
+            .subresource_range(super::color_subresource_range())];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            src_stage,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &barrier,
+        );
+        let copy = [vk::BufferImageCopy::default()
+            .buffer_offset(source.offset())
+            .buffer_row_length(seed.source.row_length_texels)
+            .image_subresource(super::color_subresource_layers())
+            .image_extent(vk::Extent3D {
+                width: req.width,
+                height: req.height,
+                depth: 1,
+            })];
+        ctx.device.cmd_copy_buffer_to_image(
+            cb,
+            source.buffer(),
+            target_image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &copy,
+        );
+        let barrier = [vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(target_dst_access)
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(target_pass_layout)
+            .image(target_image)
+            .subresource_range(super::color_subresource_range())];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::TRANSFER,
+            target_dst_stage,
+            target_dependency,
+            &[],
+            &[],
+            &barrier,
+        );
+    }
+
+    // An attachment sampled during the draw names the attachment itself, not a
+    // second CPU image. Native feedback binds it directly. The capability
+    // fallback below prepares the descriptor snapshot after the attachment's
+    // declared initial contents have been established: Clear fills the
+    // snapshot with the same clear value, a seeded primary is copied from the
+    // target after its GPU seed operation above, and DontCare transitions an
+    // unwritten image so its sampled value remains explicitly undefined.
+    let after_seed_snapshot = sampled.iter().any(|sampled| {
+        matches!(
+            sampled,
+            PreparedSampled::Snapshot {
+                timing: SnapshotTiming::AfterPrimarySeed,
+                ..
+            }
+        )
+    });
+    if after_seed_snapshot {
+        unsafe { outside_pass.before_record(PassObstacle::Snapshot, pools, &ctx.device, cb) };
+        let barrier = [vk::ImageMemoryBarrier::default()
+            .src_access_mask(target_dst_access)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .old_layout(target_pass_layout)
+            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .image(target_image)
+            .subresource_range(super::color_subresource_range())];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            target_dst_stage,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &barrier,
+        );
+    }
+    for sampled_image in &sampled {
+        let PreparedSampled::Snapshot { image, timing, .. } = sampled_image else {
+            continue;
+        };
+        if *timing == SnapshotTiming::Prior || !snapshotted_images.insert(image.image) {
+            continue;
         }
+        unsafe { outside_pass.before_record(PassObstacle::Snapshot, pools, &ctx.device, cb) };
+        let barrier = [vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .image(image.image)
+            .subresource_range(super::color_subresource_range())];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &barrier,
+        );
+        match timing {
+            SnapshotTiming::Clear(clear) => ctx.device.cmd_clear_color_image(
+                cb,
+                image.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &vk::ClearColorValue { float32: *clear },
+                &[super::color_subresource_range()],
+            ),
+            SnapshotTiming::AfterPrimarySeed => {
+                let copy = [vk::ImageCopy::default()
+                    .src_subresource(super::color_subresource_layers())
+                    .dst_subresource(super::color_subresource_layers())
+                    .extent(vk::Extent3D {
+                        width: image.width,
+                        height: image.height,
+                        depth: 1,
+                    })];
+                ctx.device.cmd_copy_image(
+                    cb,
+                    target_image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    image.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &copy,
+                );
+            }
+            SnapshotTiming::Undefined => unreachable!("filtered above"),
+            SnapshotTiming::Prior => unreachable!("filtered above"),
+        }
+        let barrier = [vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image(image.image)
+            .subresource_range(super::color_subresource_range())];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &barrier,
+        );
+    }
+    if after_seed_snapshot {
+        let barrier = [vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .dst_access_mask(target_dst_access)
+            .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .new_layout(target_pass_layout)
+            .image(target_image)
+            .subresource_range(super::color_subresource_range())];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::TRANSFER,
+            target_dst_stage,
+            target_dependency,
+            &[],
+            &[],
+            &barrier,
+        );
     }
 
     // Guest-sourced sampled uploads: one buffer→image copy over either the
@@ -5016,22 +5028,7 @@ pub(crate) unsafe fn execute_draw_inner(
         } else {
             "passbegin_clear"
         });
-        // Whether this pass's colour0 names guest backing at all, which is the
-        // denominator every reading of `REIMS_VGPU_SHARED_TARGET` needs:
-        // `registry_imported_image` counts images created and
-        // `target_store_shared_recorded` counts Stores, and neither says how
-        // much *rendering* the rail carries.
-        //
-        // The key's own answer, so this is the backing the guest **declared**
-        // and not proof the import took: `linear_target_import::create` may
-        // still have refused, in which case the pass renders into an ordinary
-        // resident under a key that says otherwise. Read it against
-        // `target_shared_declined`, which counts exactly those.
-        crate::runtime::drain::note_store_route(if pass_key.host_accessible_color0 {
-            "passbegin_color0_guest_backed"
-        } else {
-            "passbegin_color0_resident"
-        });
+        crate::runtime::drain::note_store_route("passbegin_color0_resident");
         ctx.device
             .cmd_begin_render_pass(cb, &rp_begin, vk::SubpassContents::INLINE);
         pools.note_pass_opened(echo);
@@ -5066,15 +5063,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // Only if this command buffer is not already carrying it — the three
     // `dynstate_*` skips below hang off this one call, because a pipeline change
     // is what invalidates them. See `super::pools::CbGraphicsState`.
-    unsafe {
-        pools.bind_graphics_pipeline(
-            &ctx.device,
-            cb,
-            counters,
-            pipeline,
-            pipeline_layout,
-        )
-    };
+    unsafe { pools.bind_graphics_pipeline(&ctx.device, cb, counters, pipeline, pipeline_layout) };
     if let Some((pool, flags)) = occlusion {
         ctx.device.cmd_begin_query(cb, pool, 0, flags);
     }
@@ -5161,16 +5150,16 @@ pub(crate) unsafe fn execute_draw_inner(
                 range: info.range,
             },
         ));
-        push_state.extend(sampled.iter().zip(&sampled_infos).map(
-            |(image, info)| super::pools::PushDescriptorBinding::Image {
+        push_state.extend(sampled.iter().zip(&sampled_infos).map(|(image, info)| {
+            super::pools::PushDescriptorBinding::Image {
                 binding: image.binding(),
                 array_element: image.array_element(),
                 ty: vk::DescriptorType::SAMPLED_IMAGE,
                 sampler: info.sampler,
                 view: info.image_view,
                 layout: info.image_layout,
-            },
-        ));
+            }
+        }));
         push_state.extend(sampler_handles.iter().zip(&sampler_infos).map(
             |((binding, _), info)| super::pools::PushDescriptorBinding::Image {
                 binding: *binding,
@@ -5213,7 +5202,9 @@ pub(crate) unsafe fn execute_draw_inner(
             &[dset],
             &[],
         );
-        counters.descriptor_set_binds.fetch_add(1, Ordering::Relaxed);
+        counters
+            .descriptor_set_binds
+            .fetch_add(1, Ordering::Relaxed);
     }
     phase.enter(super::draw_phase::Phase::RecordDraw);
     unsafe { pools.bind_vertex_buffers(&ctx.device, cb, counters, &vertex_bufs) };
@@ -5301,7 +5292,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .cmd_begin_render_pass(cb, &rp_begin, vk::SubpassContents::INLINE);
         ctx.device.cmd_end_render_pass(cb);
     }
-    if layout_churn_probe_enabled() && !target_feedback && !target_guest_backed {
+    if layout_churn_probe_enabled() && !target_feedback {
         // PROBE — `REIMS_VGPU_LAYOUT_CHURN=on`. One round trip of the colour
         // attachment's layout, out of [`super::caches::color0_pass_exit_layout`]
         // into `TRANSFER_SRC_OPTIMAL` and straight back, recorded where the pass
@@ -5358,8 +5349,7 @@ pub(crate) unsafe fn execute_draw_inner(
     }
 
     if let Some(ref rb) = readback {
-        let target_read_layout =
-            super::pools::ResidentAccess::transfer_read(target_guest_backed).layout();
+        let target_read_layout = super::pools::ResidentAccess::transfer_read().layout();
         // This copy needs a layout transition **and** a dependency, and the
         // render pass gives it neither. Vulkan's implicit final subpass
         // dependency carries `dstStageMask = BOTTOM_OF_PIPE` and
@@ -5452,10 +5442,10 @@ pub(crate) unsafe fn execute_draw_inner(
         return Err(DrawError::DeviceLost(DeviceLostDecline::ForcedDraw));
     }
 
-    if !defer_submit {
+    let submitted_timeline = if !defer_submit {
         let cbs = [cb];
         match ctx.submit_guest_work(&cbs, fence) {
-            Ok(()) => {}
+            Ok(timeline) => timeline,
             Err(e) if e == vk::Result::ERROR_DEVICE_LOST => {
                 return Err(DrawError::DeviceLost(DeviceLostDecline::Driver {
                     op: DeviceLostOp::DrawSubmit,
@@ -5464,7 +5454,9 @@ pub(crate) unsafe fn execute_draw_inner(
             }
             Err(e) => return Err(DrawError::VkCall(VkCall::new(VkOp::ExecSubmit, e))),
         }
-    }
+    } else {
+        None
+    };
     // Submission ends here. Everything below is CPU-side publication and
     // retention work, and needs its own bar: charging it to `submit_us` makes
     // a slow registry or Store-footprint update look like driver queue cost.
@@ -5515,22 +5507,6 @@ pub(crate) unsafe fn execute_draw_inner(
         }
     }
     phase.enter(super::draw_phase::Phase::PostStore);
-    let guest_store_footprint = match (
-        req.target_identity.as_ref(),
-        guest_store_footprint_to_record(
-            req.record_guest_store,
-            target_guest_backed,
-            target_guest_footprint,
-        ),
-    ) {
-        (Some(identity), Some(footprint)) => {
-            super::record_guest_write_footprint_debt(pools, identity, &footprint);
-            crate::runtime::drain::note_store_route("target_store_shared_recorded");
-            Some(footprint)
-        }
-        _ => None,
-    };
-    let guest_store_recorded = guest_store_footprint.is_some();
     phase.enter(super::draw_phase::Phase::PostTarget);
     // MRT secondary attachments settle at COLOR_ATTACHMENT_OPTIMAL (the pass
     // final layout) and become sampleable residents; the consumer's
@@ -5555,7 +5531,10 @@ pub(crate) unsafe fn execute_draw_inner(
                 // `color0_pass_exit_layout` exists to remove — a registry record
                 // naming a layout the pass did not leave the image in is a later
                 // barrier's wrong `oldLayout`.
-                pools.registry_mark_ready_at(identity, pass_key.color_final_layout(attachment_index));
+                pools.registry_mark_ready_at(
+                    identity,
+                    pass_key.color_final_layout(attachment_index),
+                );
             }
         }
     }
@@ -5573,38 +5552,47 @@ pub(crate) unsafe fn execute_draw_inner(
     let mut sampled_retains: Vec<super::pools::SampledRetain> = Vec::new();
     for prepared in &sampled {
         match prepared {
-            PreparedSampled::Upload { binding, image, .. } => {
-                if let Some((SampledSource::Bytes(bytes), identity)) = req
-                    .sampled_images
-                    .iter()
-                    .find(|resource| resource.binding == *binding)
-                    .map(|resource| (&resource.source, resource.identity))
+            PreparedSampled::Upload {
+                binding,
+                array_element,
+                image,
+                ..
+            } => {
+                if let Some((SampledSource::Bytes(bytes), identity, resource_lifetime)) =
+                    sampled_resource_at(req, *binding, *array_element).map(|resource| {
+                        (
+                            &resource.source,
+                            resource.identity,
+                            resource.resource_lifetime.clone(),
+                        )
+                    })
                 {
                     sampled_retains.push(super::pools::SampledRetain {
                         image: image.image,
                         content: super::pools::SampledRetainContent::Bytes(bytes.clone()),
                         identity,
+                        resource_lifetime,
                     });
                 }
             }
-            // A gather with no vouched identity is dropped by the admit, which
-            // is where that decision belongs: an entry nothing can name is
-            // unreachable weight in a capped cache.
+            // A gather with no resource lifetime is dropped by admission. Its
+            // copied image has no contract-owned lifetime under which it could
+            // remain retained.
             PreparedSampled::GuestGather {
                 binding,
+                array_element,
                 image,
                 gathered_len,
                 ..
             } => {
-                let identity = req
-                    .sampled_images
-                    .iter()
-                    .find(|resource| resource.binding == *binding)
-                    .and_then(|resource| resource.identity);
+                let retained = sampled_resource_at(req, *binding, *array_element);
+                let identity = retained.and_then(|resource| resource.identity);
                 sampled_retains.push(super::pools::SampledRetain {
                     image: image.image,
                     content: super::pools::SampledRetainContent::Gathered { len: *gathered_len },
                     identity,
+                    resource_lifetime: retained
+                        .and_then(|resource| resource.resource_lifetime.clone()),
                 });
             }
             _ => {}
@@ -5644,7 +5632,6 @@ pub(crate) unsafe fn execute_draw_inner(
     if defer_submit {
         let target = batch_target.expect("batch_eligible requires target identity");
         pools.batch_append(
-            &ctx.device,
             (cb, fence),
             target,
             dset.zip(dset_pool),
@@ -5668,9 +5655,6 @@ pub(crate) unsafe fn execute_draw_inner(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(DrawOutput {
             pixels: Vec::new(),
-            target_guest_backed,
-            guest_store_recorded,
-            guest_store_footprint: guest_store_footprint.clone(),
             pixels_bgra: output_bgra,
             // Unreachable with a query armed: `batch_eligible` excludes one, so
             // `defer_submit` is false for every queried draw. Stated as `None`
@@ -5686,7 +5670,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // the slot drains it. A failed wait below leaves the slot pending, so no
     // path ever reuses an unretired fence.
     let sealed = pools.seal_entry(dset.zip(dset_pool).into_iter().collect(), sampled_retains);
-    pools.finish_entry_async(&ctx.device, sealed);
+    pools.finish_entry_async(sealed, submitted_timeline);
 
     // Dispose the ad-hoc per-draw framebuffers (MRT and/or depth) now that
     // `finish_entry_async` has marked this slot pending: the handles park in
@@ -5740,9 +5724,6 @@ pub(crate) unsafe fn execute_draw_inner(
             pools.wait_entry_fence(ctx, counters, fence)?;
             return Ok(DrawOutput {
                 pixels: Vec::new(),
-                target_guest_backed,
-                guest_store_recorded,
-                guest_store_footprint: guest_store_footprint.clone(),
                 pixels_bgra: output_bgra,
                 occlusion_samples: read_occlusion_samples(ctx, occlusion)?,
             });
@@ -5752,9 +5733,6 @@ pub(crate) unsafe fn execute_draw_inner(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(DrawOutput {
             pixels: Vec::new(),
-            target_guest_backed,
-            guest_store_recorded,
-            guest_store_footprint: guest_store_footprint.clone(),
             pixels_bgra: output_bgra,
             occlusion_samples: None,
         });
@@ -5800,12 +5778,19 @@ pub(crate) unsafe fn execute_draw_inner(
 
     Ok(DrawOutput {
         pixels,
-        target_guest_backed,
-        guest_store_recorded,
-        guest_store_footprint,
         pixels_bgra,
         occlusion_samples: read_occlusion_samples(ctx, occlusion)?,
     })
+}
+
+fn sampled_resource_at(
+    req: &DrawRequest,
+    binding: u32,
+    array_element: u32,
+) -> Option<&SampledImageResource> {
+    req.sampled_images
+        .iter()
+        .find(|resource| resource.binding == binding && resource.array_element == array_element)
 }
 
 /// Read the sample count a queried draw produced, and destroy its pool.
@@ -5996,32 +5981,12 @@ fn clear_values(req: &DrawRequest) -> Vec<vk::ClearValue> {
 fn target_prior_access(
     snapshotted: bool,
     tracked: super::pools::ResidentAccess,
-    host_accessible: bool,
 ) -> super::pools::ResidentAccess {
     if snapshotted {
-        super::pools::ResidentAccess::transfer_read(host_accessible)
+        super::pools::ResidentAccess::transfer_read()
     } else {
         tracked
     }
-}
-
-/// Source scope for entering a draw's primary attachment.
-///
-/// A retained imported image can have two predecessors at once: the last GPU
-/// access recorded by the registry, and a host write through the guest
-/// allocation while the image remained in `GENERAL`. The layout belongs to the
-/// former; the dependency must include both. Ordinary and clear/seeded targets
-/// pass `false` and retain the exact prior scope.
-fn target_source_scope(
-    prior: super::pools::ResidentAccess,
-    guest_backing_was_loaded: bool,
-) -> (vk::PipelineStageFlags, vk::AccessFlags) {
-    let (mut stages, mut access) = prior.source_scope();
-    if guest_backing_was_loaded {
-        stages |= vk::PipelineStageFlags::HOST;
-        access |= vk::AccessFlags::HOST_WRITE;
-    }
-    (stages, access)
 }
 
 /// Whether a `LOAD` pass's own external subpass dependency already covers this
@@ -6145,6 +6110,32 @@ pub(super) unsafe fn barrier_resident_for_transfer_read(
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_non_indexed_zero_vertex_count_has_no_invocations() {
+        let req = DrawRequest {
+            vertex_count: 0,
+            instance_count: Some(1),
+            ..DrawRequest::default()
+        };
+        assert!(draw_has_no_invocations(&req));
+    }
+
+    #[test]
+    fn an_indexed_draw_is_governed_by_its_index_count() {
+        let req = DrawRequest {
+            vertex_count: 0,
+            instance_count: Some(1),
+            indexed: Some(super::super::types::IndexedDrawResource {
+                index_type: super::super::types::IndexType::U16,
+                index_count: 3,
+                vertex_offset: 0,
+                content: BufferContent::Bytes(std::sync::Arc::new(Vec::new())),
+            }),
+            ..DrawRequest::default()
+        };
+        assert!(!draw_has_no_invocations(&req));
+    }
+
     fn sampled_identity() -> TargetIdentity {
         TargetIdentity::Surface {
             id: 7,
@@ -6161,8 +6152,16 @@ mod tests {
     #[test]
     fn sampled_resident_state_is_validated_at_execution() {
         let identity = sampled_identity();
+        let expected = |initialized_by_this_pass| SampledResidentExpectation {
+            binding: 34,
+            identity: &identity,
+            resource_width: 64,
+            resource_height: 32,
+            shader_multisampled: false,
+            initialized_by_this_pass,
+        };
         assert!(matches!(
-            validate_sampled_resident(34, &identity, 64, 32, false, None, None),
+            validate_sampled_resident(expected(false), None, None),
             Err(DrawExecutionDecline::SampledResidentMissing {
                 binding: 34,
                 prior: None,
@@ -6170,11 +6169,11 @@ mod tests {
             })
         ));
         assert!(matches!(
-            validate_sampled_resident(34, &identity, 64, 32, false, Some((false, 64, 32, 1)), None),
+            validate_sampled_resident(expected(false), Some((false, 64, 32, 1)), None,),
             Err(DrawExecutionDecline::SampledResidentNotReady { binding: 34, .. })
         ));
         assert!(matches!(
-            validate_sampled_resident(34, &identity, 64, 32, false, Some((true, 63, 32, 1)), None),
+            validate_sampled_resident(expected(false), Some((true, 63, 32, 1)), None,),
             Err(DrawExecutionDecline::SampledResidentGeometryMismatch {
                 binding: 34,
                 resident_width: 63,
@@ -6183,8 +6182,13 @@ mod tests {
             })
         ));
         assert_eq!(
-            validate_sampled_resident(34, &identity, 64, 32, false, Some((true, 64, 32, 1)), None),
+            validate_sampled_resident(expected(false), Some((true, 64, 32, 1)), None,),
             Ok(())
+        );
+        assert_eq!(
+            validate_sampled_resident(expected(true), Some((false, 64, 32, 1)), None,),
+            Ok(()),
+            "the attachment load establishes content before the fragment reads it"
         );
     }
 
@@ -6438,7 +6442,6 @@ mod tests {
             total_len,
             row_length_texels: 0,
             pages: Some(std::sync::Arc::new(pages)),
-            direct_image: None,
         }
     }
 
@@ -6467,7 +6470,9 @@ mod tests {
                 .is_none(),
             "two stretches are two ranges and a bind names one"
         );
-        assert!(source_over(window_runs(&[]), 0, 0).single_stretch().is_none());
+        assert!(source_over(window_runs(&[]), 0, 0)
+            .single_stretch()
+            .is_none());
     }
 
     /// A window inside a lone stretch binds at the window's first byte, not at
@@ -6485,7 +6490,10 @@ mod tests {
     fn a_window_inside_a_lone_stretch_skips_to_its_own_first_byte() {
         let src = source_over(window_runs(&[(0, 0, 0x8000)]), 0x100, 0x4000);
         let stretch = src.single_stretch().expect("one stretch holds the window");
-        assert_eq!(stretch.skip, 0x100, "the plane offset inside the allocation");
+        assert_eq!(
+            stretch.skip, 0x100,
+            "the plane offset inside the allocation"
+        );
         assert_eq!(stretch.window_offset, 0);
         assert_eq!(stretch.len, 0x4000, "the window, not the whole stretch");
     }
@@ -6494,11 +6502,9 @@ mod tests {
     /// bind is refused rather than reading past the allocation.
     #[test]
     fn a_window_past_the_end_of_its_lone_stretch_does_not_bind() {
-        assert!(
-            source_over(window_runs(&[(0, 0, 0x1000)]), 0xf00, 0x200)
-                .single_stretch()
-                .is_none()
-        );
+        assert!(source_over(window_runs(&[(0, 0, 0x1000)]), 0xf00, 0x200)
+            .single_stretch()
+            .is_none());
     }
 
     /// Two offsets into one retained resource are distinct command-buffer
@@ -6517,7 +6523,6 @@ mod tests {
                 total_len: 0x1000,
                 row_length_texels: 0,
                 pages: None,
-                direct_image: None,
             })
         };
         let a = CbBind::of(&content(0));
@@ -6558,7 +6563,11 @@ mod tests {
     #[test]
     fn window_stretches_tile_the_window_and_skip_what_it_does_not_reach() {
         let src = source_over(
-            window_runs(&[(0, 0, 0x1000), (0x1000, 0x2000, 0x1000), (0x2000, 0x4000, 0x1000)]),
+            window_runs(&[
+                (0, 0, 0x1000),
+                (0x1000, 0x2000, 0x1000),
+                (0x2000, 0x4000, 0x1000),
+            ]),
             0x800,
             0x1000,
         );
@@ -6598,7 +6607,6 @@ mod tests {
                 total_len: 16,
                 row_length_texels: 0,
                 pages: None,
-                direct_image: None,
             })
         };
         let vertex_only = content(0x1000);
@@ -6657,10 +6665,15 @@ mod tests {
         assert_eq!(roles.len(), 4, "shared content must stay one operation");
         assert_eq!(roles.role(keys[0]), Some(BufferGatherRole::VERTEX));
         assert_eq!(roles.role(keys[1]), Some(BufferGatherRole::STORAGE));
-        assert!(roles.role(keys[2]).expect("shared was classified").is_shared());
-        let index = roles.role(keys[3]).expect("the index buffer was classified");
+        assert!(roles
+            .role(keys[2])
+            .expect("shared was classified")
+            .is_shared());
+        let index = roles
+            .role(keys[3])
+            .expect("the index buffer was classified");
         assert!(index.includes_index());
-        assert_eq!(index.index_alignment, Some(2));
+        assert!(index.index);
         // The table answers only about this draw's binds. An unclassified key
         // must be `None` and not the role of whichever entry a scan happened to
         // stop on — the three call sites `expect()` on exactly this.
@@ -6698,32 +6711,23 @@ mod tests {
         }
     }
 
-    /// Direct imports obey the limit of the descriptor actually written. A
-    /// source shared with vertex fetch still has a storage descriptor, while a
-    /// vertex-only source has no Vulkan offset-alignment limit.
     #[test]
-    fn direct_import_alignment_follows_the_actual_consumer() {
-        assert_eq!(buffer_bind_offset_alignment(BufferGatherRole::VERTEX, 4), 1);
-        assert_eq!(
-            buffer_bind_offset_alignment(BufferGatherRole::STORAGE, 4),
-            4
-        );
+    fn every_guest_draw_buffer_uses_one_engine_owned_route() {
+        assert!(!BufferGatherRole::VERTEX.includes_index());
+        assert!(BufferGatherRole::STORAGE.is_storage_only());
         let index = BufferGatherRole {
             vertex: false,
             storage: false,
-            index_alignment: Some(2),
+            index: true,
         };
-        assert_eq!(buffer_bind_offset_alignment(index, 4), 2);
+        assert!(index.includes_index());
         let shared = BufferGatherRole {
             vertex: true,
             storage: true,
-            index_alignment: None,
+            index: true,
         };
-        assert_eq!(buffer_bind_offset_alignment(shared, 4), 4);
-        assert!(96u64.is_multiple_of(buffer_bind_offset_alignment(
-            BufferGatherRole::STORAGE,
-            4,
-        )));
+        assert!(shared.is_shared());
+        assert!(!shared.is_storage_only());
     }
 
     /// The two re-basings a gather region does, at the values that make them
@@ -6921,7 +6925,6 @@ mod tests {
                         // A fixture over a dummy host address names no guest
                         // RAM, so there is no reference an import could bind.
                         pages: None,
-                        direct_image: None,
                     },
                     // No witness ran for a synthetic source, so nothing vouches:
                     // the gather is the only disposition this fixture can take.
@@ -6932,6 +6935,7 @@ mod tests {
                     crate::contract::pixel_format::TexelLayout::Bgra8,
                 ),
                 identity: None,
+                resource_lifetime: None,
                 swizzle: Default::default(),
             }],
             ..DrawRequest::default()
@@ -6960,7 +6964,6 @@ mod tests {
                     total_len: declared,
                     row_length_texels,
                     pages: None,
-                    direct_image: None,
                 },
                 format: crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
             }),
@@ -6969,35 +6972,30 @@ mod tests {
     }
 
     #[test]
-    fn an_admitted_guest_attachment_is_the_load_source_not_a_seed_to_prepare() {
+    fn an_imported_guest_attachment_still_prepares_its_initial_load() {
         let req = guest_target_seed_req(16, 16, 1024, 1024, 16);
         let seed = req.target_guest_seed.as_ref();
         assert!(matches!(
-            guest_target_load(true, seed),
-            GuestTargetLoad::SharedBacking(_)
-        ));
-        assert!(matches!(
-            guest_target_load(false, seed),
+            guest_target_load(seed),
             GuestTargetLoad::PrepareSeed(_)
         ));
-        assert!(matches!(
-            guest_target_load(true, None),
-            GuestTargetLoad::None
-        ));
+        assert!(matches!(guest_target_load(None), GuestTargetLoad::None));
     }
 
     /// Every variant a resident can be in, so the tests below enumerate rather
     /// than sample. A new variant that nothing here mentions fails to compile,
     /// which is the point: each one is a rail that can leave a resident in a
     /// state some barrier has to name.
-    fn every_access() -> [ResidentAccess; 6] { [
-        ResidentAccess::Untouched,
-        ResidentAccess::ColorWrite(vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
-        ResidentAccess::ColorWrite(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
-        ResidentAccess::ColorFeedback(vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT),
-        ResidentAccess::shader_read(false),
-        ResidentAccess::transfer_read(false),
-    ] }
+    fn every_access() -> [ResidentAccess; 6] {
+        [
+            ResidentAccess::Untouched,
+            ResidentAccess::ColorWrite(vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
+            ResidentAccess::ColorWrite(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+            ResidentAccess::ColorFeedback(vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT),
+            ResidentAccess::shader_read(),
+            ResidentAccess::transfer_read(),
+        ]
+    }
 
     fn target_sample(identity: super::super::types::TargetIdentity) -> SampledImageResource {
         SampledImageResource {
@@ -7016,8 +7014,31 @@ mod tests {
             byte_origin: Default::default(),
             format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
             identity: None,
+            resource_lifetime: None,
             swizzle: Default::default(),
         }
+    }
+
+    #[test]
+    fn sampled_retain_uses_the_exact_array_element() {
+        let identity = super::super::types::TargetIdentity::Surface {
+            id: 7,
+            width: 16,
+            height: 16,
+            generation: 1,
+            format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+        };
+        let first = target_sample(identity.clone());
+        let mut second = target_sample(identity);
+        second.array_element = 1;
+        let req = DrawRequest {
+            sampled_images: vec![first, second],
+            ..DrawRequest::default()
+        };
+
+        let selected = sampled_resource_at(&req, 32, 1).expect("array member one");
+        assert!(std::ptr::eq(selected, &req.sampled_images[1]));
+        assert!(sampled_resource_at(&req, 32, 2).is_none());
     }
 
     /// Capability and view shape jointly select the native feedback contract.
@@ -7089,7 +7110,7 @@ mod tests {
     #[test]
     fn one_resident_layout_carries_two_different_dependencies() {
         let drawn = ResidentAccess::ColorWrite(vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
-        let read_back = ResidentAccess::transfer_read(false);
+        let read_back = ResidentAccess::transfer_read();
         assert_eq!(
             drawn.layout(),
             read_back.layout(),
@@ -7114,7 +7135,7 @@ mod tests {
     /// reader. `TOP_OF_PIPE`/no-access orders nothing at all.
     #[test]
     fn writing_a_sampled_target_waits_for_the_sampler() {
-        let (stage, access) = ResidentAccess::shader_read(false).source_scope();
+        let (stage, access) = ResidentAccess::shader_read().source_scope();
         assert!(
             stage.contains(vk::PipelineStageFlags::FRAGMENT_SHADER),
             "the write must be ordered after the sampling fragment shader, got {stage:?}"
@@ -7124,21 +7145,13 @@ mod tests {
     }
 
     #[test]
-    fn imported_resident_reads_remain_in_the_host_accessible_layout() {
-        assert_eq!(
-            ResidentAccess::shader_read(true).layout(),
-            vk::ImageLayout::GENERAL
-        );
-        assert_eq!(
-            ResidentAccess::transfer_read(true).layout(),
-            vk::ImageLayout::GENERAL
-        );
+    fn a_transfer_read_uses_the_dedicated_layout() {
         // A transfer read is a genuine second layout: nothing renders in
         // TRANSFER_SRC_OPTIMAL, so the transition is owed and the pass has to be
         // closed for it. That is the ~1 200-a-second population the exit layout
         // was moved *towards*, and it stays.
         assert_eq!(
-            ResidentAccess::transfer_read(false).layout(),
+            ResidentAccess::transfer_read().layout(),
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL
         );
     }
@@ -7158,7 +7171,7 @@ mod tests {
     fn a_rendered_resident_is_already_where_a_sampled_read_wants_it() {
         let resting = super::super::caches::color0_pass_exit_layout();
         let after_a_pass = ResidentAccess::ColorWrite(resting);
-        let for_a_sample = ResidentAccess::shader_read(false);
+        let for_a_sample = ResidentAccess::shader_read();
 
         if super::super::caches::unified_color_layout() {
             assert_eq!(for_a_sample.layout(), resting);
@@ -7178,10 +7191,7 @@ mod tests {
     #[test]
     fn nothing_untouched_or_host_written_is_covered_by_the_pass_entry() {
         for tracked in every_access() {
-            let covered = !matches!(
-                tracked,
-                ResidentAccess::Untouched | ResidentAccess::GuestBacking
-            );
+            let covered = !matches!(tracked, ResidentAccess::Untouched);
             assert_eq!(tracked.covered_by_pass_entry(), covered, "{tracked:?}");
             // A covered access must still name a real prior scope, or "covered"
             // would be covering nothing.
@@ -7193,44 +7203,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn only_an_admitted_shared_store_publishes_guest_pages() {
-        let pages: std::sync::Arc<[u64]> = std::sync::Arc::from([0x1000, 0x5000]);
-        let footprint = crate::runtime::guest_ram::GuestPageFootprint::new(
-            std::sync::Arc::clone(&pages),
-            0x1000,
-        )
-        .expect("page footprint");
-        assert_eq!(
-            guest_store_footprint_to_record(true, true, Some(footprint.clone())),
-            Some(footprint)
-        );
-        let one = || {
-            crate::runtime::guest_ram::GuestPageFootprint::new(
-                std::sync::Arc::from([0x1000]),
-                0x1000,
-            )
-            .expect("page footprint")
-        };
-        assert!(guest_store_footprint_to_record(false, true, Some(one())).is_none());
-        assert!(guest_store_footprint_to_record(true, false, Some(one())).is_none());
-        assert!(guest_store_footprint_to_record(true, true, None).is_none());
-    }
-
-    #[test]
-    fn loading_shared_backing_orders_both_the_prior_gpu_access_and_host_writes() {
-        let prior = ResidentAccess::ColorWrite(vk::ImageLayout::GENERAL);
-        let (gpu_stages, gpu_access) = target_source_scope(prior, false);
-        assert!(!gpu_stages.contains(vk::PipelineStageFlags::HOST));
-        assert!(!gpu_access.contains(vk::AccessFlags::HOST_WRITE));
-
-        let (shared_stages, shared_access) = target_source_scope(prior, true);
-        assert!(shared_stages.contains(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT));
-        assert!(shared_stages.contains(vk::PipelineStageFlags::HOST));
-        assert!(shared_access.contains(vk::AccessFlags::COLOR_ATTACHMENT_WRITE));
-        assert!(shared_access.contains(vk::AccessFlags::HOST_WRITE));
     }
 
     /// A fresh registry slot and every pooled target are untouched. Nothing has
@@ -7349,11 +7321,11 @@ mod tests {
     fn a_snapshotted_target_waits_for_its_own_snapshot() {
         for tracked in every_access() {
             assert_eq!(
-                target_prior_access(true, tracked, false),
-                ResidentAccess::transfer_read(false),
+                target_prior_access(true, tracked),
+                ResidentAccess::transfer_read(),
                 "a snapshot of a {tracked:?} target is still the newest touch"
             );
-            assert_eq!(target_prior_access(false, tracked, false), tracked);
+            assert_eq!(target_prior_access(false, tracked), tracked);
         }
     }
 
@@ -7377,7 +7349,7 @@ mod tests {
             // A snapshot is this draw's own transfer read and always needs the
             // transition back, whatever the registry was tracking.
             assert!(
-                !pass_exit_needs_no_barrier(target_prior_access(true, tracked, false)),
+                !pass_exit_needs_no_barrier(target_prior_access(true, tracked)),
                 "a snapshotted {tracked:?} target still has to come back from TRANSFER_SRC"
             );
         }
@@ -7594,7 +7566,6 @@ mod tests {
             row_length_texels,
             // A fixture over a dummy host address has no guest pages.
             pages: None,
-            direct_image: None,
         })
     }
 
@@ -7667,7 +7638,10 @@ mod tests {
         assert!(validate_v1(&req).is_ok());
 
         let short = index_buffer_req(buffer_guest_runs(&[5], 5, 0));
-        assert_eq!(validation_slug(&short), "vk_draw_validate_index_bytes_short");
+        assert_eq!(
+            validation_slug(&short),
+            "vk_draw_validate_index_bytes_short"
+        );
 
         let uncovered = index_buffer_req(buffer_guest_runs(&[5], 6, 0));
         assert_eq!(
@@ -7808,7 +7782,6 @@ mod tests {
             row_length_texels: 0,
             // A fixture over a host `Vec` has no guest pages.
             pages: None,
-            direct_image: None,
         });
         assert_eq!(content.len(), 20);
         let bytes = content.cpu_bytes();

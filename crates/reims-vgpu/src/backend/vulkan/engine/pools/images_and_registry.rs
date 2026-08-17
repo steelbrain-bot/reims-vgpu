@@ -493,7 +493,7 @@ impl ResourcePools {
     ) {
         if let Some(resident) = self.compute_storage_registry.get_mut(identity) {
             resident.generation = generation;
-            resident.access = ResidentAccess::transfer_read(false);
+            resident.access = ResidentAccess::transfer_read();
         }
         // The dispatch just wrote this image, so nothing outside it holds the
         // result yet.
@@ -751,7 +751,11 @@ impl ResourcePools {
         if slot.format.allocation() == format {
             return Ok(Some(slot.view));
         }
-        if let Some((_, view)) = slot.alternate_views.iter().find(|(held, _)| *held == format) {
+        if let Some((_, view)) = slot
+            .alternate_views
+            .iter()
+            .find(|(held, _)| *held == format)
+        {
             return Ok(Some(*view));
         }
         let view = unsafe {
@@ -851,10 +855,10 @@ impl ResourcePools {
     ///   not the map is a victim that frees nothing.
     fn register_resident(&mut self, identity: &TargetIdentity, new: NewResident) {
         let last_touch_ms = self.idle_clock_ms;
-        let guest_backed = new.memory.is_guest_imported();
         self.registry.insert(
             identity.clone(),
             ResidentTargetSlot {
+                incarnation: super::ResidentIncarnation::allocate(),
                 image: new.image,
                 memory: new.memory,
                 view: new.view,
@@ -875,13 +879,12 @@ impl ResourcePools {
                 height: new.height,
                 sample_count: new.sample_count,
                 generation: new.generation,
-                content_ready: guest_backed,
+                // External-memory images must be born UNDEFINED. Their guest
+                // payload is initialized by the same seed upload as an
+                // ordinary resident before a LOAD may read it.
+                content_ready: false,
                 content_epoch: None,
-                access: if guest_backed {
-                    ResidentAccess::GuestBacking
-                } else {
-                    ResidentAccess::Untouched
-                },
+                access: ResidentAccess::Untouched,
                 format: new.format,
                 pin_count: 0,
                 resource_released: false,
@@ -933,22 +936,16 @@ impl ResourcePools {
         for (_, view) in &old.alternate_views {
             self.dispose(&ctx.device, DeferredHandle::ImageView(*view));
         }
-        let retired = match &old.memory {
-            ResidentMemory::Recyclable(memory) => DeferredHandle::RecycleTarget(FreeTargetImage {
-                image: old.image,
-                memory: *memory,
-                view: old.view,
-                width: old.width,
-                height: old.height,
-                sample_count: old.sample_count,
-                format: old.format.allocation(),
-            }),
-            ResidentMemory::GuestImported { guest } => DeferredHandle::GuestImage {
-                image: old.image,
-                view: old.view,
-                _import: std::sync::Arc::clone(&guest.import),
-            },
-        };
+        let ResidentMemory::Recyclable(memory) = old.memory;
+        let retired = DeferredHandle::RecycleTarget(FreeTargetImage {
+            image: old.image,
+            memory,
+            view: old.view,
+            width: old.width,
+            height: old.height,
+            sample_count: old.sample_count,
+            format: old.format.allocation(),
+        });
         self.dispose(&ctx.device, retired);
         if why != ResidentReclaim::ResourceReleased {
             counters
@@ -982,7 +979,6 @@ impl ResourcePools {
         framebuffer_compatibility: FramebufferCompatibilityKey,
         generation: u64,
         format: vk::Format,
-        guest_memory: Option<crate::backend::vulkan::engine::GuestTargetMemory>,
         counters: &EngineCounters,
     ) -> Result<(&ResidentTargetSlot, vk::ImageView), DrawError> {
         // The format arrives resolved rather than as a channel-order flag, and
@@ -1007,10 +1003,9 @@ impl ResourcePools {
                 // not is exactly the case the fast path must *not* take: the
                 // framebuffer it would hand back was built over the previous
                 // interpretation's view.
-                let attachment = unsafe {
-                    self.registry_view(ctx, &identity, format.declared(), counters)?
-                }
-                .expect("the slot reused on the line above is still registered");
+                let attachment =
+                    unsafe { self.registry_view(ctx, &identity, format.declared(), counters)? }
+                        .expect("the slot reused on the line above is still registered");
                 let slot = self.registry.get(&identity).unwrap();
                 if slot.framebuffer_compatibility == Some(framebuffer_compatibility)
                     && slot.format == format
@@ -1073,11 +1068,7 @@ impl ResourcePools {
         // reclaims and retries on out-of-memory rather than trimming ahead of
         // one. See `recoverable_residents`.
         self.note_registry_reach();
-        let mut usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
-            | vk::ImageUsageFlags::INPUT_ATTACHMENT
-            | vk::ImageUsageFlags::TRANSFER_SRC
-            | vk::ImageUsageFlags::TRANSFER_DST
-            | vk::ImageUsageFlags::SAMPLED;
+        let mut usage = super::super::registry_target_usage(format.allocation());
         if ctx.features.attachment_feedback_loop_layout {
             usage |= vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT;
         }
@@ -1090,69 +1081,7 @@ impl ResourcePools {
         // The recycled contents are stale — the slot is inserted with
         // layout=UNDEFINED / content_ready=false, and a fresh framebuffer is
         // always built below (it binds this specific render_pass).
-        let imported = match (guest_memory.as_ref(), sample_count) {
-            (Some(memory), 1) => match super::super::linear_target_import::create(
-                ctx,
-                &mut self.host_ram_imports,
-                &memory.import,
-                memory.backing,
-                width,
-                height,
-                format.allocation(),
-                usage,
-            ) {
-                Ok(imported) => Some(imported),
-                Err(reason) => {
-                    crate::runtime::drain::note_store_route("target_shared_declined");
-                    let key = crate::backend::hash::hash_u64(
-                        crate::backend::hash::hash_bytes(reason.slug().as_bytes()),
-                        format.allocation().as_raw() as u32 as u64,
-                    );
-                    crate::observe::Emit::decline("vk_guest_target", &reason)
-                        .field("format", format!("{:?}", format.allocation()))
-                        .field("width", width)
-                        .field("height", height)
-                        .fail_once(key);
-                    None
-                }
-            },
-            _ => None,
-        };
-        let (image, memory, view) = if let Some(imported) = imported {
-            counters.note_create(CreateSite::RegistryImportedImage);
-            let view = match ctx.device.create_image_view(
-                &vk::ImageViewCreateInfo::default()
-                    .image(imported.image)
-                    .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(format.allocation())
-                    .subresource_range(color_subresource_range()),
-                None,
-            ) {
-                Ok(view) => view,
-                Err(error) => {
-                    ctx.device.destroy_image(imported.image, None);
-                    let import = &guest_memory
-                        .as_ref()
-                        .expect("an imported target has guest memory")
-                        .import;
-                    if let Some(parent) = self.host_ram_imports.release_child(import) {
-                        parent.destroy(&ctx.device);
-                    }
-                    return Err(DrawError::VkCall(VkCall::new(
-                        VkOp::PoolsCreateRegistryView,
-                        error,
-                    )));
-                }
-            };
-            counters.note_create(CreateSite::RegistryImageView);
-            (
-                imported.image,
-                ResidentMemory::GuestImported {
-                    guest: guest_memory.expect("an imported target has guest memory"),
-                },
-                view,
-            )
-        } else if let Some(free) =
+        let (image, memory, view) = if let Some(free) =
             self.take_free_target(width, height, sample_count, format.allocation())
         {
             (
@@ -1271,20 +1200,8 @@ impl ResourcePools {
                 }
                 Err(e) => {
                     ctx.device.destroy_image_view(view, None);
-                    match &memory {
-                        ResidentMemory::Recyclable(_) => {
-                            self.free_image_slab(&ctx.device, image);
-                            ctx.device.destroy_image(image, None);
-                        }
-                        ResidentMemory::GuestImported { guest } => {
-                            ctx.device.destroy_image(image, None);
-                            if let Some(parent) =
-                                self.host_ram_imports.release_child(&guest.import)
-                            {
-                                parent.destroy(&ctx.device);
-                            }
-                        }
-                    }
+                    self.free_image_slab(&ctx.device, image);
+                    ctx.device.destroy_image(image, None);
                     return Err(DrawError::VkCall(VkCall::new(
                         VkOp::PoolsCreateRegistryView,
                         e,
@@ -1311,17 +1228,7 @@ impl ResourcePools {
                     ctx.device.destroy_image_view(extra, None);
                 }
                 ctx.device.destroy_image(image, None);
-                match &memory {
-                    ResidentMemory::Recyclable(_) => {
-                        self.free_image_slab(&ctx.device, image);
-                    }
-                    ResidentMemory::GuestImported { .. } => {}
-                }
-                if let ResidentMemory::GuestImported { guest } = &memory {
-                    if let Some(parent) = self.host_ram_imports.release_child(&guest.import) {
-                        parent.destroy(&ctx.device);
-                    }
-                }
+                self.free_image_slab(&ctx.device, image);
                 return Err(DrawError::VkCall(VkCall::new(
                     VkOp::PoolsCreateRegistryFramebuffer,
                     e,
@@ -1402,10 +1309,9 @@ impl ResourcePools {
                     .gpu_load_hits
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let image = slot.image;
-                let view = unsafe {
-                    self.registry_view(ctx, &identity, format.declared(), counters)?
-                }
-                .expect("the slot reused on the line above is still registered");
+                let view =
+                    unsafe { self.registry_view(ctx, &identity, format.declared(), counters)? }
+                        .expect("the slot reused on the line above is still registered");
                 return Ok((image, view));
             }
             // Geometry / gen / allocation mismatch → destroy and recreate.
@@ -1772,8 +1678,9 @@ impl ResourcePools {
             crate::runtime::drain::note_store_route("adhoc_fb_hit");
             return Ok(*fb);
         }
-        let fb =
-            unsafe { self.create_mrt_framebuffer(ctx, render_pass, views, width, height, counters) }?;
+        let fb = unsafe {
+            self.create_mrt_framebuffer(ctx, render_pass, views, width, height, counters)
+        }?;
         crate::runtime::drain::note_store_route("adhoc_fb_miss");
         self.ad_hoc_framebuffers.insert(key, fb);
         Ok(fb)
@@ -1866,16 +1773,12 @@ impl ResourcePools {
         identity: &TargetIdentity,
         access: ResidentAccess,
     ) {
-        let guest_backed = self
-            .registry
-            .get(identity)
-            .is_some_and(|slot| slot.memory.is_guest_imported());
         if let Some(slot) = self.registry.get_mut(identity) {
             slot.content_ready = true;
             slot.content_epoch = None;
             slot.access = access;
         }
-        self.set_sole_copy(identity, !guest_backed);
+        self.set_sole_copy(identity, true);
     }
 
     /// Mark a depth resident as holding rendered contents, after a pass that
@@ -1966,19 +1869,16 @@ impl ResourcePools {
         true
     }
 
-    /// Retain a live resource's resident and report whether that resident is
-    /// the guest allocation itself.
-    ///
-    /// The pin and the allocation-kind read are one registry operation. A
-    /// caller that performed them separately could observe a different slot
-    /// between the two and would also pay two engine transactions for one
-    /// resource acquisition.
-    pub(crate) fn retain_resident_target(&mut self, identity: &TargetIdentity) -> Option<bool> {
-        let guest_imported = self
+    /// Retain a live resource's engine-owned resident.
+    pub(crate) fn retain_resident_target(
+        &mut self,
+        identity: &TargetIdentity,
+    ) -> Option<super::ResidentIncarnation> {
+        let incarnation = self
             .registry
             .get(identity)
             .filter(|slot| slot.content_ready)
-            .map(|slot| slot.memory.is_guest_imported())?;
+            .map(|slot| slot.incarnation)?;
         // A new serialized owner may legitimately arrive while a transient GPU
         // holder is finishing the previous owner's use of the same allocation.
         // Revive the ownership before pinning; maintenance cannot retire the
@@ -1997,7 +1897,7 @@ impl ResourcePools {
             return None;
         };
         slot.resource_owner_count = next;
-        Some(guest_imported)
+        Some(incarnation)
     }
 
     /// End one serialized resource's ownership of its resident. The ownership
@@ -2008,15 +1908,33 @@ impl ResourcePools {
         &mut self,
         ctx: &DeviceContext,
         identity: &TargetIdentity,
+        incarnation: super::ResidentIncarnation,
         counters: &EngineCounters,
     ) -> bool {
-        let Some(unpinned) = self.release_resident_ownership(identity) else {
+        let Some(unpinned) = self.release_resident_ownership_for(identity, incarnation) else {
             return false;
         };
         if unpinned {
             self.retire_resident(ctx, identity, ResidentReclaim::ResourceReleased, counters);
         }
         true
+    }
+
+    /// Release ownership only from the concrete slot the lease retained.
+    ///
+    /// A missing or replaced slot has already left the registry. Its deferred
+    /// handles own its destruction; the old lease has no authority over the
+    /// replacement under the same protocol identity.
+    pub(crate) fn release_resident_ownership_for(
+        &mut self,
+        identity: &TargetIdentity,
+        incarnation: super::ResidentIncarnation,
+    ) -> Option<bool> {
+        if self.registry.get(identity)?.incarnation != incarnation {
+            crate::runtime::drain::note_store_route("resident_resource_release_stale_incarnation");
+            return None;
+        }
+        self.release_resident_ownership(identity)
     }
 
     /// Device-free ownership transition behind resource release. Returns
@@ -2655,6 +2573,7 @@ pub(super) mod pin_count_tests {
 
     fn dummy_slot(content_ready: bool) -> ResidentTargetSlot {
         ResidentTargetSlot {
+            incarnation: super::ResidentIncarnation::allocate(),
             image: vk::Image::null(),
             memory: ResidentMemory::Recyclable(vk::DeviceMemory::null()),
             view: vk::ImageView::null(),
@@ -2681,6 +2600,10 @@ pub(super) mod pin_count_tests {
             gpu_only_content: false,
             last_touch_ms: 0,
         }
+    }
+
+    fn retain(pools: &mut ResourcePools, identity: &TargetIdentity) -> bool {
+        pools.retain_resident_target(identity).is_some()
     }
 
     fn pinned_identity() -> TargetIdentity {
@@ -2836,41 +2759,14 @@ pub(super) mod pin_count_tests {
     }
 
     #[test]
-    fn retaining_a_resource_returns_the_pinned_allocations_kind() {
+    fn retaining_a_resource_pins_its_engine_owned_resident() {
         let mut pools = ResourcePools::new();
         let recyclable_id = pinned_identity();
         pools
             .registry
             .insert(recyclable_id.clone(), dummy_slot(true));
-        assert_eq!(pools.retain_resident_target(&recyclable_id), Some(false));
+        assert!(retain(&mut pools, &recyclable_id));
         assert_eq!(pools.registry[&recyclable_id].pin_count, 1);
-
-        let imported_id = surf(2);
-        let mut imported = dummy_slot(true);
-        imported.memory = ResidentMemory::GuestImported {
-            guest: crate::backend::vulkan::engine::GuestTargetMemory {
-                backing: crate::backend::vulkan::engine::GuestTargetBacking {
-                    allocation_host_ptr: 0x1000,
-                    allocation_len: 0x4000,
-                    plane_offset: 0,
-                    row_pitch: 64,
-                },
-                import: std::sync::Arc::new(
-                    crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
-                        0x1000, 0x4000, 0x1000,
-                    )
-                    .unwrap(),
-                ),
-                footprint: crate::runtime::guest_ram::GuestPageFootprint::new(
-                    std::sync::Arc::from([0x1000_u64]),
-                    0x1000,
-                )
-                .expect("page footprint"),
-            },
-        };
-        pools.registry.insert(imported_id.clone(), imported);
-        assert_eq!(pools.retain_resident_target(&imported_id), Some(true));
-        assert_eq!(pools.registry[&imported_id].pin_count, 1);
     }
 
     #[test]
@@ -2880,9 +2776,33 @@ pub(super) mod pin_count_tests {
         pools.registry.insert(id.clone(), dummy_slot(true));
         pools.registry_order.push_back(id.clone());
 
-        assert_eq!(pools.retain_resident_target(&id), Some(false));
+        assert!(retain(&mut pools, &id));
         assert_eq!(pools.release_resident_ownership(&id), Some(true));
         assert_eq!(pools.released_resident_keys(1), vec![id]);
+    }
+
+    #[test]
+    fn an_old_lease_cannot_release_the_replacement_under_the_same_identity() {
+        let mut pools = ResourcePools::new();
+        let id = pinned_identity();
+        pools.registry.insert(id.clone(), dummy_slot(true));
+        let old_incarnation = pools
+            .retain_resident_target(&id)
+            .expect("the old allocation is retained");
+
+        pools.registry.insert(id.clone(), dummy_slot(true));
+        let replacement = pools.registry[&id].incarnation;
+        assert_ne!(replacement, old_incarnation);
+        assert_eq!(
+            pools.release_resident_ownership_for(&id, old_incarnation),
+            None,
+            "the old lease names an allocation no longer in the registry"
+        );
+        assert_eq!(
+            pools.registry[&id].resource_owner_count, 0,
+            "the replacement acquired no owner and must not lose one"
+        );
+        assert_eq!(pools.registry[&id].pin_count, 0);
     }
 
     #[test]
@@ -2892,17 +2812,16 @@ pub(super) mod pin_count_tests {
         pools.registry.insert(id.clone(), dummy_slot(true));
         pools.registry_order.push_back(id.clone());
 
-        assert_eq!(pools.retain_resident_target(&id), Some(false));
-        assert_eq!(pools.retain_resident_target(&id), Some(false));
+        assert!(retain(&mut pools, &id));
+        assert!(retain(&mut pools, &id));
         assert_eq!(pools.registry[&id].resource_owner_count, 2);
         assert_eq!(pools.release_resident_ownership(&id), Some(false));
         assert_eq!(pools.registry[&id].resource_owner_count, 1);
         assert!(!pools.registry[&id].resource_released);
         assert!(pools.released_resident_keys(1).is_empty());
 
-        assert_eq!(
-            pools.retain_resident_target(&id),
-            Some(false),
+        assert!(
+            retain(&mut pools, &id),
             "the surviving alias keeps the shared allocation retainable"
         );
     }
@@ -2914,7 +2833,7 @@ pub(super) mod pin_count_tests {
         pools.registry.insert(id.clone(), dummy_slot(true));
         pools.registry_order.push_back(id.clone());
 
-        assert_eq!(pools.retain_resident_target(&id), Some(false));
+        assert!(retain(&mut pools, &id));
         assert!(pools.pin_resident_target(&id, true), "in-flight holder");
         assert_eq!(pools.release_resident_ownership(&id), Some(false));
         assert!(pools.released_resident_keys(1).is_empty());
@@ -2944,7 +2863,7 @@ pub(super) mod pin_count_tests {
         pools.registry.insert(id.clone(), dummy_slot(true));
         pools.registry_order.push_back(id.clone());
 
-        assert_eq!(pools.retain_resident_target(&id), Some(false));
+        assert!(retain(&mut pools, &id));
         pools.registry_mark_ready(&id);
         assert!(
             pools.registry[&id].gpu_only_content,
@@ -3121,52 +3040,6 @@ pub(super) mod pin_count_tests {
             "nothing has touched it yet"
         );
         assert_eq!(slot.pin_count, 0, "no deferred window holds it yet");
-    }
-
-    #[test]
-    fn a_guest_import_is_born_with_shared_contents_and_never_becomes_sole_copy() {
-        let mut pools = ResourcePools::new();
-        let mut resident = new_resident(some_framebuffer(), vk::RenderPass::null());
-        resident.memory = ResidentMemory::GuestImported {
-            guest: crate::backend::vulkan::engine::GuestTargetMemory {
-                backing: crate::backend::vulkan::engine::GuestTargetBacking {
-                    allocation_host_ptr: 0x1000,
-                    allocation_len: 0x4000,
-                    plane_offset: 0,
-                    row_pitch: 64,
-                },
-                import: std::sync::Arc::new(
-                    crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
-                        0x1000, 0x4000, 0x1000,
-                    )
-                    .unwrap(),
-                ),
-                footprint: crate::runtime::guest_ram::GuestPageFootprint::new(
-                    std::sync::Arc::from([0x2000, 0x3000]),
-                    0x1000,
-                )
-                .expect("page footprint"),
-            },
-        };
-        let identity = surf(1);
-        pools.register_resident(&identity, resident);
-
-        let slot = pools.registry.get(&identity).expect("registered");
-        assert!(
-            slot.content_ready,
-            "the allocation carries its prior texels"
-        );
-        assert_eq!(slot.access, ResidentAccess::GuestBacking);
-        assert!(
-            !slot.gpu_only_content,
-            "the guest allocation is the other copy"
-        );
-
-        pools.registry_mark_ready(&identity);
-        assert!(
-            !pools.registry.get(&identity).unwrap().gpu_only_content,
-            "rendering writes the shared allocation itself"
-        );
     }
 
     /// Registration writes the map and the order together.
@@ -3806,7 +3679,11 @@ pub(super) mod pin_count_tests {
             "clock still advances when throttled"
         );
         assert!(pools.plan_idle_maintenance(t0 + MAINTENANCE_INTERVAL_MS));
-        assert_eq!(pools.registry.len(), 2, "maintenance owns no live residents");
+        assert_eq!(
+            pools.registry.len(),
+            2,
+            "maintenance owns no live residents"
+        );
     }
 
     /// A maintenance pass cannot shrink a live registry, regardless of its size.
@@ -3856,9 +3733,15 @@ pub(super) mod pin_count_tests {
         }
         // Uploads stop: the gate reopens after the usual consecutive passes.
         for _ in 0..(SETTLED_PASSES_FOR_BUFFER_TRIM - 1) {
-            assert!(!pools.note_maintenance_settled(), "counter restarted from zero");
+            assert!(
+                !pools.note_maintenance_settled(),
+                "counter restarted from zero"
+            );
         }
-        assert!(pools.note_maintenance_settled(), "settled once uploads stopped");
+        assert!(
+            pools.note_maintenance_settled(),
+            "settled once uploads stopped"
+        );
     }
 
     /// The HOST_VISIBLE buffer trim gate: only permitted after
@@ -3880,12 +3763,21 @@ pub(super) mod pin_count_tests {
         assert!(pools.note_maintenance_settled(), "stays settled");
         // Upload activity resets the counter.
         pools.staging_hits += 1;
-        assert!(!pools.note_maintenance_settled(), "uploads reset settled state");
+        assert!(
+            !pools.note_maintenance_settled(),
+            "uploads reset settled state"
+        );
         // …and the gate stays closed until the run rebuilds.
         for _ in 0..(SETTLED_PASSES_FOR_BUFFER_TRIM - 1) {
-            assert!(!pools.note_maintenance_settled(), "counter restarted from zero");
+            assert!(
+                !pools.note_maintenance_settled(),
+                "counter restarted from zero"
+            );
         }
-        assert!(pools.note_maintenance_settled(), "settled again after rebuild");
+        assert!(
+            pools.note_maintenance_settled(),
+            "settled again after rebuild"
+        );
     }
 
     /// The presented target passed as `display` is stamped to the current clock

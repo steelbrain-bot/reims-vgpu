@@ -196,10 +196,10 @@ pub struct HostPointerCaps {
     /// The largest **single** `vkAllocateMemory` this device is trusted to
     /// import correctly, which is not the same question as how much it can hold.
     ///
-    /// [`Self::heap_budget`] bounds the total; this bounds one allocation, and a
-    /// RAMBlock longer than it is imported in several. See
-    /// [`IMPORT_SPAN_CEILING`] for why the bound exists at all and why it is not
-    /// simply a device limit.
+    /// [`Self::heap_budget`] independently bounds the reachable heap. This
+    /// value is the intersection of `maxMemoryAllocationSize` and, where Vulkan
+    /// 1.3 exposes it, `maxBufferSize`. A RAMBlock longer than the resulting API
+    /// limit is imported in several allocations.
     ///
     /// Zero on every rung but [`HostPointerImport::Supported`].
     pub span_max: u64,
@@ -220,6 +220,16 @@ impl HostPointerCaps {
     pub fn is_available(self) -> bool {
         self.rung.is_available()
     }
+}
+
+/// Intersect the API limits that apply to one imported buffer and round the
+/// result down to the device's import granularity.
+fn import_span_max_from_limits(
+    max_allocation: u64,
+    max_buffer: Option<u64>,
+    min_alignment: u64,
+) -> u64 {
+    max_allocation.min(max_buffer.unwrap_or(u64::MAX)) & !(min_alignment - 1)
 }
 
 /// What [`crate::env::GUEST_IMPORT`] says about running this rail at all.
@@ -338,20 +348,12 @@ pub unsafe fn query(
         unsafe { instance.get_physical_device_properties2(pd, &mut limits) };
     }
 
-    let span_max = [
-        IMPORT_SPAN_CEILING,
+    let span_max = import_span_max_from_limits(
         max_allocation,
         // Zero means the device never filled it in, i.e. it is not a 1.3 device.
-        if v13.max_buffer_size == 0 {
-            u64::MAX
-        } else {
-            v13.max_buffer_size
-        },
-    ]
-    .into_iter()
-    .min()
-    .unwrap_or(IMPORT_SPAN_CEILING)
-        & !(min_alignment - 1);
+        (v13.max_buffer_size != 0).then_some(v13.max_buffer_size),
+        min_alignment,
+    );
 
     HostPointerCaps {
         rung: HostPointerImport::Supported,
@@ -360,49 +362,6 @@ pub unsafe fn query(
         span_max,
     }
 }
-
-/// The largest single host-pointer import this device will ask any driver for,
-/// before the device's own limits narrow it further.
-///
-/// # Why there is a ceiling that no Vulkan limit accounts for
-///
-/// `VkMemoryAllocateInfo::allocationSize` is a `VkDeviceSize`, so a 14 GiB
-/// import is a legal request and the API has nowhere to say otherwise. Mesa's
-/// Intel driver truncates it to 32 bits on the host-pointer import path: the
-/// readable window of the import is exactly `allocationSize mod 2^32`, and every
-/// byte past it reads back unrelated data. It is silent — `vkAllocateMemory`
-/// returns `VK_SUCCESS`, `vkCreateBuffer` accepts a buffer far larger than the
-/// window, `vkBindBufferMemory` accepts the pair, and only the reads are wrong.
-///
-/// Measured on Intel Arrow Lake / Mesa ANV 26.1.5 by bisecting the accepted
-/// import size at 4096-byte granularity: sizes whose value mod 2^32 is non-zero
-/// are accepted and readable only up to that remainder; a size that is an exact
-/// multiple of 2^32 is rejected outright with `ERROR_INVALID_EXTERNAL_HANDLE`.
-/// A 14 GiB RAMBlock therefore gave a 2 GiB window, which is why a guest on this
-/// host displayed nothing: roughly three quarters of its RAM gathered as
-/// garbage. Chunked imports of the same pages read correctly at every offset.
-///
-/// # Why 2 GiB and not "under 2^32"
-///
-/// The measured wall is `2^32`, and 4 GiB − 4096 imports correctly. Half of that
-/// is taken instead for three reasons: it is a power of two, so splitting a
-/// RAMBlock is a shift rather than a division; it leaves the arithmetic unable
-/// to land on the one size that fails loudly (an exact multiple of `2^32`); and
-/// it costs nothing to be wrong about, because chunking is invisible to a driver
-/// that handles the full size — such a driver just receives more, smaller
-/// imports, and every one of them is a legal allocation it would have accepted
-/// as part of a larger one.
-///
-/// This is deliberately **not** a driver-name branch, which `AGENTS.md` forbids
-/// and which would leave every other truncating driver broken. It is a bound on
-/// what this device asks for, applied everywhere.
-pub const IMPORT_SPAN_CEILING: u64 = 2 * 1024 * 1024 * 1024;
-
-/// The ceiling has to be a multiple of any plausible import granularity, or the
-/// mask that applies the device's alignment to it would round it to zero on a
-/// host with a large page. A power of two at gigabyte scale satisfies every
-/// `minImportedHostPointerAlignment` a driver can report.
-const _: () = assert!(IMPORT_SPAN_CEILING.is_power_of_two());
 
 /// Why an import could not be given a memory type.
 ///
@@ -560,6 +519,26 @@ mod tests {
         }
     }
 
+    /// The span is the intersection of limits the API reports, not a guessed
+    /// size that happens to avoid one implementation defect. A capable device
+    /// may therefore admit a single allocation larger than 2 GiB.
+    #[test]
+    fn the_single_import_limit_is_derived_only_from_reported_limits() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(
+            import_span_max_from_limits(12 * GIB, Some(6 * GIB), 0x1000),
+            6 * GIB
+        );
+        assert_eq!(
+            import_span_max_from_limits(12 * GIB, None, 0x1000),
+            12 * GIB
+        );
+        assert_eq!(
+            import_span_max_from_limits(16 * GIB + 0x7ff, None, 0x1000),
+            16 * GIB
+        );
+    }
+
     /// The usage set queried is the usage set bound. Asking about a narrower set
     /// than the import site creates its buffer with is a query that can answer
     /// yes to a bind the driver then refuses — the failure would land at
@@ -606,7 +585,10 @@ mod tests {
     #[test]
     fn the_env_switch_takes_a_capable_host_down() {
         assert_eq!(with_env(Some("0")), Some(HostPointerImport::DisabledByEnv));
-        assert_eq!(with_env(Some("off")), Some(HostPointerImport::DisabledByEnv));
+        assert_eq!(
+            with_env(Some("off")),
+            Some(HostPointerImport::DisabledByEnv)
+        );
         assert!(!HostPointerImport::DisabledByEnv.is_available());
         assert!(HostPointerImport::DisabledByEnv
             .required_extensions()

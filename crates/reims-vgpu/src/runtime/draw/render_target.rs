@@ -157,8 +157,7 @@ fn rt_type4_declared_format(
         .filter(|view| view.width == base_w && view.height == base_h)
         .map(|view| view.pixel_format)
         .filter(|&fmt| fmt != 0);
-    effective_view_sample_format(base_fmt, view_fmt_override.or(type5_declared))
-        .unwrap_or(base_fmt)
+    effective_view_sample_format(base_fmt, view_fmt_override.or(type5_declared)).unwrap_or(base_fmt)
 }
 
 /// Report a type-5 colour attachment whose view record disagrees with the base
@@ -337,17 +336,11 @@ fn differed_before(surface_id: u32) -> bool {
 /// destructure it do so in different orders from the one that builds a
 /// [`ColorRtRequest`] out of it, which is where such a swap would have gone
 /// unnoticed: all three orders type-check.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ResolvedRenderTarget {
-    /// Non-zero ⇒ a host mapping; `0` with `target_gva` non-zero ⇒ type-2/3
-    /// linear guest VA. The two are exclusive, the same way
-    /// [`ColorRtRequest::target_gva`] documents.
-    pub(super) mapping_id: u32,
-    pub(super) target_gva: u64,
+    pub(super) storage: super::ColorTargetStorage,
     pub(super) width: u32,
     pub(super) height: u32,
-    /// Bytes per row of the target (archive `bpr`).
-    pub(super) row_stride: u32,
     pub(super) format: u16,
     /// Attachment samples requested for this encode. Linear texture resource
     /// dimensions do not retain the creation descriptor's sample count, so the
@@ -778,13 +771,13 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     // number, which is what keeps the type-11 and type-4 rungs — neither of
     // which has a mip layout — refusing an attachment level as loudly as they
     // already refuse a view level.
-    let level = view_level
-        .checked_add(att.level)
-        .ok_or(C::LevelOverflow {
+    let level = view_level.checked_add(att.level).ok_or(
+        C::LevelOverflow {
             view_level,
             attachment_level: att.level,
         }
-        .at(resolved_ref))?;
+        .at(resolved_ref),
+    )?;
     if resolved_ref == 0 {
         return Err(C::ViewBaseUnbound.at(resolved_ref));
     }
@@ -870,11 +863,9 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             return Err(C::Type11Format { mapping_id, fmt }.at(resolved_ref));
         }
         return Ok(ResolvedRenderTarget {
-            mapping_id,
-            target_gva: 0,
+            storage: super::ColorTargetStorage::Mapping(mapping_id),
             width: m.width,
             height: m.height,
-            row_stride: 0,
             format: fmt,
             sample_count: 1,
         });
@@ -939,22 +930,16 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             }
             .at(resolved_ref),
         )?;
-        let fmt = rt_type4_declared_format(
-            base_fmt,
-            (base_w, base_h),
-            type5_view,
-            view_fmt_override,
-        );
+        let fmt =
+            rt_type4_declared_format(base_fmt, (base_w, base_h), type5_view, view_fmt_override);
         if pixel_format::render_target_bpp(fmt).is_none() {
             return Err(C::Type4Format { surface_id, fmt }.at(resolved_ref));
         }
         // mapping_id = surface_id; no linear GVA.
         return Ok(ResolvedRenderTarget {
-            mapping_id: surface_id,
-            target_gva: 0,
+            storage: super::ColorTargetStorage::Mapping(surface_id),
             width: m.width,
             height: m.height,
-            row_stride: 0,
             format: fmt,
             sample_count: 1,
         });
@@ -981,14 +966,16 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         || tex.declared_row_stride().is_none()
     {
         return Err(C::LinearDescIncomplete {
-            format: tex.pixel_format,
+            format: tex.declared_pixel_format().unwrap_or(0),
             width: tex.width,
             height: tex.height,
             row_stride: tex.row_stride,
         }
         .at(resolved_ref));
     }
-    let base_fmt = tex.pixel_format;
+    let base_fmt = tex
+        .declared_pixel_format()
+        .expect("the incomplete declaration returned above");
     let fmt = effective_view_sample_format(base_fmt, view_fmt_override).unwrap_or(base_fmt);
     // Refuses a format with no known bytes-per-texel; the value is not needed.
     if pixel_format::render_target_bpp(fmt).is_none() {
@@ -1096,12 +1083,34 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     if bpr < tight {
         return Err(C::RowStride { bpr, tight }.at(resolved_ref));
     }
+    let allocation_gva = tex.allocation_base_gva(state.page_shift).ok_or(
+        C::LinearBackingGva {
+            allocation_size: tex.allocation_size,
+            handle: tex.handle,
+        }
+        .at(resolved_ref),
+    )?;
+    let plane_offset = gva.checked_sub(allocation_gva).ok_or(
+        C::LinearBackingGva {
+            allocation_size: tex.allocation_size,
+            handle: tex.handle,
+        }
+        .at(resolved_ref),
+    )?;
+    let storage =
+        super::LinearColorTarget::new(allocation_gva, tex.allocation_size, plane_offset, bpr)
+            .map(super::ColorTargetStorage::Linear)
+            .ok_or(
+                C::LinearBackingGva {
+                    allocation_size: tex.allocation_size,
+                    handle: tex.handle,
+                }
+                .at(resolved_ref),
+            )?;
     Ok(ResolvedRenderTarget {
-        mapping_id: 0,
-        target_gva: gva,
+        storage,
         width: w,
         height: h,
-        row_stride: bpr,
         format: fmt,
         sample_count: 1,
     })
@@ -1447,9 +1456,9 @@ mod tests {
         use crate::model::PAGE_SHIFT_ARM64E;
         use crate::runtime::decode::resource::{
             list_object_entry_offset, LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_LIST_ENTRY_LEN,
-            TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT, TEXTURE_DESC_LEVEL_RECORDS,
-            TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_MIP_LEVEL_RECORD_LEN,
-            TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_WIDTH,
+            TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_DECLARATION, TEXTURE_DESC_HEIGHT,
+            TEXTURE_DESC_LEVEL_RECORDS, TEXTURE_DESC_MIPMAP_LEVEL_COUNT,
+            TEXTURE_DESC_MIP_LEVEL_RECORD_LEN, TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_WIDTH,
             TEXTURE_LEVEL_HEIGHT, TEXTURE_LEVEL_OFFSET, TEXTURE_LEVEL_ROW_STRIDE,
             TEXTURE_LEVEL_SIZE, TEXTURE_LEVEL_WIDTH,
         };
@@ -1468,11 +1477,10 @@ mod tests {
         let alloc = l1_offset + (bpr1 as u64) * (h1 as u64);
         let handle = 8u32;
 
-        // Long enough for the level records AND for the format trailer, which
-        // a multi-mip body shifts one record along.
-        let body = (TEXTURE_DESC_LEVEL_RECORDS + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN)
-            .max(TEXTURE_DESC_BASE_LEN)
-            .max(TEXTURE_DESC_PIXEL_FORMAT + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN + 2);
+        // The complete serialized declaration shifts one record along for a
+        // two-level body; a payload ending after only its format word is not a
+        // texture declaration.
+        let body = TEXTURE_DESC_BASE_LEN + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
         let mut desc = vec![0u8; body];
         st64(&mut desc[LINEAR_DESC_SIZE..], alloc);
         st32(&mut desc[LINEAR_DESC_HANDLE..], handle);
@@ -1489,10 +1497,10 @@ mod tests {
         st64(&mut desc[rec + TEXTURE_LEVEL_ROW_STRIDE..], bpr1 as u64);
         st32(&mut desc[rec + TEXTURE_LEVEL_WIDTH..], w1);
         st32(&mut desc[rec + TEXTURE_LEVEL_HEIGHT..], h1);
-        // The format trailer shifts by one record for a two-level body.
-        st16(
-            &mut desc[TEXTURE_DESC_PIXEL_FORMAT + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN..],
-            MTL_FORMAT_BGRA8_UNORM,
+        let declaration = TEXTURE_DESC_DECLARATION + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+        st32(
+            &mut desc[declaration..],
+            2 | (4 << 8) | (u32::from(MTL_FORMAT_BGRA8_UNORM) << 16),
         );
 
         let desc_gva = 0x280u64;
@@ -1507,14 +1515,20 @@ mod tests {
         write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
         let base = (handle as u64) << PAGE_SHIFT_ARM64E;
-        let level0 = lookup_render_target(&mut state, &host, 1, attach(tex_ref))
-            .expect("level 0 of a two-level texture still resolves");
+        let cap = crate::observe::FailCapture::start();
+        let level0 =
+            lookup_render_target(&mut state, &host, 1, attach(tex_ref)).unwrap_or_else(|| {
+                panic!(
+                    "level 0 of a two-level texture still resolves: {:?}",
+                    cap.lines()
+                )
+            });
         assert_eq!(
             (
-                level0.target_gva,
+                level0.storage.target_gva(),
                 level0.width,
                 level0.height,
-                level0.row_stride
+                level0.storage.row_stride()
             ),
             (base, w0, h0, bpr0),
             "level 0 must be unchanged by the pyramid above it"
@@ -1522,7 +1536,6 @@ mod tests {
 
         let mut at_level_1 = attach(tex_ref);
         at_level_1.level = 1;
-        let cap = crate::observe::FailCapture::start();
         let level1 = lookup_render_target(&mut state, &host, 1, at_level_1)
             .expect("a pass naming mip level 1 must resolve, not be refused");
         assert!(
@@ -1532,10 +1545,10 @@ mod tests {
         );
         assert_eq!(
             (
-                level1.target_gva,
+                level1.storage.target_gva(),
                 level1.width,
                 level1.height,
-                level1.row_stride
+                level1.storage.row_stride()
             ),
             (base + l1_offset, w1, h1, bpr1),
             "level 1 must render into its own plane, at its own geometry"

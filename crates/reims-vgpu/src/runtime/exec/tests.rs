@@ -176,8 +176,6 @@ fn a_resource_record_that_populates_its_unrecovered_tail_says_so() {
     assert!(line.contains(" tail_nz=1"), "{line}");
 }
 
-
-
 /// One segment header whose declared length runs `overshoot` bytes past the
 /// buffer, followed by `tail` bytes of would-be records.
 fn truncated_segment(type_: u8, overshoot: usize, tail: usize) -> Vec<u8> {
@@ -1337,7 +1335,10 @@ fn every_decoded_draw_in_a_stream_reaches_the_draw_list() {
     }
 
     assert_eq!(acc.draws.len(), records, "no draw may be truncated away");
-    assert_eq!(acc.dropped_no_pipeline, 0, "all of these had a pipeline bound");
+    assert_eq!(
+        acc.dropped_no_pipeline, 0,
+        "all of these had a pipeline bound"
+    );
 
     // With no pipeline latched the same record is the other arm: still not
     // a `PendingDraw`, but counted rather than vanishing.
@@ -1498,15 +1499,9 @@ fn draw_preparation_keeps_every_recorded_bind_table_allocation() {
     assert!(Arc::ptr_eq(&req.vertex_buffers, &pd.vertex_buffers));
     assert!(Arc::ptr_eq(&req.fragment_buffers, &pd.fragment_buffers));
     assert!(Arc::ptr_eq(&req.vertex_textures, &pd.vertex_textures));
-    assert!(Arc::ptr_eq(
-        &req.fragment_textures,
-        &pd.fragment_textures
-    ));
+    assert!(Arc::ptr_eq(&req.fragment_textures, &pd.fragment_textures));
     assert!(Arc::ptr_eq(&req.vertex_samplers, &pd.vertex_samplers));
-    assert!(Arc::ptr_eq(
-        &req.fragment_samplers,
-        &pd.fragment_samplers
-    ));
+    assert!(Arc::ptr_eq(&req.fragment_samplers, &pd.fragment_samplers));
 }
 
 /// A bind that changes after a draw must not reach back into that draw.
@@ -1612,18 +1607,46 @@ fn a_recorded_buffer_bind_retains_its_object_across_offset_change_and_ref_reuse(
     st32(&mut bind[OP_HEADER_LEN + render::BIND_COUNT..], 1);
     st32(&mut bind[OP_HEADER_LEN + render::BIND_ENTRIES..], 7);
     let mut out = ExecResult::default();
-    let mut acc = StreamAccum { pipeline_ref: 61, ..Default::default() };
-    handle_render_record(&mut state, &host, 1, wire_render::OPCODE_SET_VERTEX_BUFFER, &bind, &mut out, &mut acc);
-    let first = acc.vertex_buffers[0].resource.clone().expect("setter retain");
+    let mut acc = StreamAccum {
+        pipeline_ref: 61,
+        ..Default::default()
+    };
+    handle_render_record(
+        &mut state,
+        &host,
+        1,
+        wire_render::OPCODE_SET_VERTEX_BUFFER,
+        &bind,
+        &mut out,
+        &mut acc,
+    );
+    let first = acc.vertex_buffers[0]
+        .resource
+        .clone()
+        .expect("setter retain");
 
     let offset_total = OP_HEADER_LEN + render::BUFFER_OFFSET_PAYLOAD_LEN;
     let mut offset = vec![0u8; offset_total];
     st32(&mut offset, wire_render::OPCODE_SET_VERTEX_BUFFER_OFFSET);
     st32(&mut offset[4..], offset_total as u32);
-    st64(&mut offset[OP_HEADER_LEN + render::BUFFER_OFFSET_VALUE..], 0x80);
-    handle_render_record(&mut state, &host, 1, wire_render::OPCODE_SET_VERTEX_BUFFER_OFFSET, &offset, &mut out, &mut acc);
+    st64(
+        &mut offset[OP_HEADER_LEN + render::BUFFER_OFFSET_VALUE..],
+        0x80,
+    );
+    handle_render_record(
+        &mut state,
+        &host,
+        1,
+        wire_render::OPCODE_SET_VERTEX_BUFFER_OFFSET,
+        &offset,
+        &mut out,
+        &mut acc,
+    );
     assert_eq!(acc.vertex_buffers[0].offset, 0x80);
-    assert!(Arc::ptr_eq(&first, acc.vertex_buffers[0].resource.as_ref().unwrap()));
+    assert!(Arc::ptr_eq(
+        &first,
+        acc.vertex_buffers[0].resource.as_ref().unwrap()
+    ));
 
     let mut draw = vec![0u8; 0x20];
     let draw_op = wire_render::OPCODE_DRAW_INDEXED_WIDE;
@@ -1665,8 +1688,19 @@ fn a_texture_slot_replaces_object_identity_only_on_a_later_setter() {
     st32(&mut command[OP_HEADER_LEN + render::BIND_ENTRIES..], 9);
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
-    handle_render_record(&mut state, &host, 1, wire_render::OPCODE_SET_FRAGMENT_TEXTURE, &command, &mut out, &mut acc);
-    assert!(Arc::ptr_eq(acc.fragment_textures[0].resource.as_ref().unwrap(), &first));
+    handle_render_record(
+        &mut state,
+        &host,
+        1,
+        wire_render::OPCODE_SET_FRAGMENT_TEXTURE,
+        &command,
+        &mut out,
+        &mut acc,
+    );
+    assert!(Arc::ptr_eq(
+        acc.fragment_textures[0].resource.as_ref().unwrap(),
+        &first
+    ));
 
     assert!(state.task_resources.delete(1, 9));
     let replacement = state.task_resources.register(
@@ -1674,9 +1708,23 @@ fn a_texture_slot_replaces_object_identity_only_on_a_later_setter() {
         9,
         Arc::new(TaskResource::new(ListObjectEntry::default(), Arc::from([]))),
     );
-    assert!(Arc::ptr_eq(acc.fragment_textures[0].resource.as_ref().unwrap(), &first));
-    handle_render_record(&mut state, &host, 1, wire_render::OPCODE_SET_FRAGMENT_TEXTURE, &command, &mut out, &mut acc);
-    assert!(Arc::ptr_eq(acc.fragment_textures[0].resource.as_ref().unwrap(), &replacement));
+    assert!(Arc::ptr_eq(
+        acc.fragment_textures[0].resource.as_ref().unwrap(),
+        &first
+    ));
+    handle_render_record(
+        &mut state,
+        &host,
+        1,
+        wire_render::OPCODE_SET_FRAGMENT_TEXTURE,
+        &command,
+        &mut out,
+        &mut acc,
+    );
+    assert!(Arc::ptr_eq(
+        acc.fragment_textures[0].resource.as_ref().unwrap(),
+        &replacement
+    ));
 }
 
 #[test]
@@ -2263,9 +2311,7 @@ fn render_pass_template_reuses_attachment_without_load_seed() {
         colors: vec![draw::ColorRtRequest {
             slot: 0,
             texture_ref: 11,
-            mapping_id: 3,
-            target_gva: 0,
-            row_stride: 0,
+            storage: draw::ColorTargetStorage::Mapping(3),
             width: 1920,
             height: 1080,
             format: 0x50,
@@ -2281,7 +2327,7 @@ fn render_pass_template_reuses_attachment_without_load_seed() {
     let template = render_pass_attachment_template(&first);
     assert!(template.colors[0].target_seed_rgba.is_none());
     assert_eq!(template.colors[0].load_action, MTL_LOAD_ACTION_LOAD);
-    assert_eq!(template.colors[0].mapping_id, 3);
+    assert_eq!(template.colors[0].mapping_id(), 3);
     assert_eq!(
         (template.colors[0].width, template.colors[0].height),
         (1920, 1080)
@@ -2310,7 +2356,7 @@ fn render_pass_template_reuses_attachment_without_load_seed() {
         (6, 2, 4, 9)
     );
     assert_eq!(req.colors.len(), 1);
-    assert_eq!(req.colors[0].mapping_id, 3);
+    assert_eq!(req.colors[0].mapping_id(), 3);
     assert_eq!(
         first.colors[0].target_seed_rgba.as_ref().map(Vec::len),
         Some(16)
@@ -4946,7 +4992,10 @@ fn a_clear_seeds_the_pass_for_any_store_action_and_publishes_only_for_store() {
 
     let seeded = |store_action: u16| {
         let mut payload = vec![0u8; 0x400];
-        st32(&mut payload[PASS_COLOR_ATTACH_OFF + PASS_ATTACH_TEXREF..], 7);
+        st32(
+            &mut payload[PASS_COLOR_ATTACH_OFF + PASS_ATTACH_TEXREF..],
+            7,
+        );
         payload[PASS_COLOR_ATTACH_OFF + PASS_ATTACH_LOAD_ACTION
             ..PASS_COLOR_ATTACH_OFF + PASS_ATTACH_LOAD_ACTION + 2]
             .copy_from_slice(&MTL_LOAD_ACTION_CLEAR.to_le_bytes());

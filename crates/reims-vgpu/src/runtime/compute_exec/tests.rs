@@ -772,7 +772,7 @@ fn the_buffer_paths_refuse_under_their_own_names() {
         attribute_stride: 0,
         has_attribute_stride: false,
     };
-    let staged = stage_buffer_with_extent(&state, &host, 1, &bind, None);
+    let staged = stage_buffer_with_extent(&mut state, &mut host, 1, &bind, None);
     assert_eq!(
         staged.err().and_then(|e| e.refusal()),
         Some(crate::observe::ladder_slug!(
@@ -785,6 +785,7 @@ fn the_buffer_paths_refuse_under_their_own_names() {
 #[test]
 fn a_compute_extent_stages_only_the_proven_prefix_from_the_bound_offset() {
     let mut host = FakeHost::new();
+    host.stable_map_pages = true;
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
@@ -810,9 +811,22 @@ fn a_compute_extent_stages_only_the_proven_prefix_from_the_bound_offset() {
         attribute_stride: 0,
         has_attribute_stride: false,
     };
-    let staged = stage_buffer_with_extent(&state, &host, 1, &bind, Some(12)).expect("stages");
+    crate::runtime::guest_ram_map::reset();
+    crate::runtime::guest_ram::latch_import_limits(1 << PAGE_SHIFT_ARM64E, 1 << 30, 1 << 30);
+    let staged =
+        stage_buffer_with_extent(&mut state, &mut host, 1, &bind, Some(12)).expect("stages");
+    crate::runtime::guest_ram::forget_import_limits();
+    crate::runtime::guest_ram_map::reset();
     assert_eq!(staged.gva, buffer_gva + 8);
-    assert_eq!(staged.bytes, contents[8..20]);
+    match staged.input {
+        VulkanBufferInput::HostBytes(_) => panic!("an importable buffer must retain guest pages"),
+        VulkanBufferInput::GuestPages(source) => {
+            assert_eq!(source.total_len, 12);
+            assert_eq!(source.source_offset, 8);
+        }
+    }
+    assert!(staged.bytes.is_empty(), "the input has one typed owner");
+    assert_eq!(staged.pages.len(), 1);
 }
 
 /// Callers must pass page_shift explicitly; 12 and 14 place handle differently.
@@ -1195,10 +1209,17 @@ fn stage_texture_type5_ref_resolves_surface_mapping() {
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
+    crate::runtime::guest_ram::latch_import_limits(1 << PAGE_SHIFT_ARM64E, 1 << 30, 1 << 30);
     let staged = stage_texture_raw(&mut state, &mut host, 1, type5_ref, 32, true)
         .expect("type-5→surface stage must succeed after ensure");
+    crate::runtime::guest_ram::forget_import_limits();
     assert_eq!((staged.width, staged.height), (4, 4));
-    assert_eq!(staged.bytes.len(), 4 * 4 * 4);
+    assert!(match &staged.input {
+        VulkanTextureInput::GuestPages(source) => source.total_len == 4 * 4 * 4,
+        VulkanTextureInput::HostBytes(bytes) => bytes.len() == 4 * 4 * 4,
+        VulkanTextureInput::Resident(_) => false,
+    });
+    assert!(staged.bytes.is_empty(), "the input has one typed owner");
     assert!(matches!(
         staged.writeback,
         TextureWriteback::Type11 { mapping_id: 3, .. }
@@ -1259,8 +1280,15 @@ fn stage_texture_type5_record_reshapes_stageable_single_plane_surface() {
         staged.storage_selector,
         Some(StorageImageSelector::Rgba32Uint)
     );
-    assert_eq!(staged.bytes.len(), 4 * 16);
-    assert!(staged.bytes.iter().all(|&b| b == 0x5a));
+    assert!(match &staged.input {
+        VulkanTextureInput::GuestPages(source) => source.total_len == 4 * 16,
+        VulkanTextureInput::HostBytes(bytes) => bytes.len() == 4 * 16,
+        VulkanTextureInput::Resident(_) => false,
+    });
+    assert!(
+        staged.bytes.is_empty(),
+        "guest pages must not be materialized"
+    );
     match staged.writeback {
         TextureWriteback::Type11 {
             mapping_id,
@@ -1296,7 +1324,12 @@ fn stage_texture_type5_record_reshapes_stageable_single_plane_surface() {
         sampled.storage_selector,
         Some(StorageImageSelector::R32Uint)
     );
-    assert_eq!(sampled.bytes.len(), 4 * 4 * 4);
+    assert!(match &sampled.input {
+        VulkanTextureInput::GuestPages(source) => source.total_len == 4 * 4 * 4,
+        VulkanTextureInput::HostBytes(bytes) => bytes.len() == 4 * 4 * 4,
+        VulkanTextureInput::Resident(_) => false,
+    });
+    assert!(sampled.bytes.is_empty(), "the input has one typed owner");
     assert!(matches!(sampled.writeback, TextureWriteback::None));
 }
 
@@ -1384,8 +1417,15 @@ fn stage_texture_type5_record_stages_biplanar_y_plane() {
         staged.storage_selector,
         Some(crate::contract::pixel_format::StorageImageSelector::R8Unorm)
     );
-    assert_eq!(staged.bytes.len(), 16 * 8);
-    assert!(staged.bytes.iter().all(|&b| b == 0x77));
+    assert!(match &staged.input {
+        VulkanTextureInput::GuestPages(source) => source.total_len == 16 * 8,
+        VulkanTextureInput::HostBytes(bytes) => bytes.len() == 16 * 8,
+        VulkanTextureInput::Resident(_) => false,
+    });
+    assert!(
+        staged.bytes.is_empty(),
+        "guest pages must not be materialized"
+    );
     match staged.writeback {
         TextureWriteback::Type11 {
             mapping_id,
@@ -1570,7 +1610,10 @@ fn stage_heap_texture_uses_host_only_residency_identity() {
         staged.storage_selector,
         Some(StorageImageSelector::Rgba32Float)
     );
-    assert_eq!(staged.bytes.len(), 180 * 135 * 16);
+    assert!(matches!(
+        &staged.input,
+        VulkanTextureInput::HostBytes(bytes) if bytes.len() == 180 * 135 * 16
+    ));
     assert!(matches!(staged.writeback, TextureWriteback::None));
     let residency = staged.residency.expect("heap texture needs GPU residency");
     assert!(residency.key.is_heap());
@@ -1611,7 +1654,7 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
         bytes: rgba.clone(),
         is_storage: true,
         residency: None,
-        serve: None,
+        input: VulkanTextureInput::HostBytes(Vec::new()),
         writeback: TextureWriteback::Linear {
             pages: crate::runtime::draw::StoreTargetPages::empty(),
             texture_ref,
@@ -2343,7 +2386,7 @@ fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
         bytes: vec![0u8; 16],
         is_storage: true,
         residency,
-        serve: None,
+        input: VulkanTextureInput::HostBytes(Vec::new()),
         writeback,
     };
     let is_host = |d: &ComputeImageDestination| matches!(d, ComputeImageDestination::Host);
@@ -2356,7 +2399,10 @@ fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
         is_host(&direct_destination(
             &mut state,
             &mut host,
-            &staged(linear(crate::runtime::draw::StoreTargetPages::empty()), None),
+            &staged(
+                linear(crate::runtime::draw::StoreTargetPages::empty()),
+                None
+            ),
             held,
         )),
         "an unlicensed window reads back"
@@ -2526,7 +2572,11 @@ fn a_staged_window_records_its_pages_in_guest_virtual_order() {
     let gva = page; // virtual page 1
 
     let pages = staged_window_pages(&state, &host, 1, gva, page, 3);
-    let want = [gpa_of(pt_base + 6), gpa_of(pt_base + 5), gpa_of(pt_base + 4)];
+    let want = [
+        gpa_of(pt_base + 6),
+        gpa_of(pt_base + 5),
+        gpa_of(pt_base + 4),
+    ];
     assert_eq!(
         pages.ordered_complete(gva, page),
         Some(&want[..]),
@@ -2777,7 +2827,7 @@ fn a_heap_texture_mirror_outlives_the_per_mapping_cap() {
             key,
             seed_generation: 1,
         }),
-        serve: None,
+        input: VulkanTextureInput::HostBytes(Vec::new()),
         writeback: TextureWriteback::None,
     };
 

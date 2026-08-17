@@ -750,7 +750,7 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
     if width == 0
         || height == 0
         || color_list.iter().any(|c| {
-            c.width != width || c.height != height || (c.mapping_id == 0 && c.target_gva == 0)
+            c.width != width || c.height != height || (c.mapping_id() == 0 && c.target_gva() == 0)
         })
     {
         return EncodeStatus::BadArgs("icb_exec_geom_mismatch");
@@ -812,7 +812,8 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
                 crate::observe::fail(format!(
                     "icb_color_format_reinterpreted reason=icb_color_not_bgra8 \
                      mapping={} format={:#x} rendered_as=bgra8_unorm",
-                    c.mapping_id, c.format
+                    c.mapping_id(),
+                    c.format
                 ));
             }
         }
@@ -851,7 +852,7 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
             },
         };
         tex.replace_region(region, 0, seed.as_ptr() as *const _, u64::from(row_bytes));
-        color_tex.push((c.mapping_id, tex, seed));
+        color_tex.push((c.mapping_id(), tex, seed));
     }
 
     let pass = RenderPassDescriptor::new();
@@ -910,7 +911,8 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
     // Writeback each color RT (type-11 mapping or type-2/3 GVA).
     // Same one derivation as the seed side above, so the two halves of this
     // function cannot disagree about the layout of the buffer they share.
-    let Some((stride, need)) = crate::contract::extent::tight_image_layout(width, height, RGBA8_BPP)
+    let Some((stride, need)) =
+        crate::contract::extent::tight_image_layout(width, height, RGBA8_BPP)
     else {
         return EncodeStatus::BadArgs("icb_color_target_degenerate_geometry");
     };
@@ -933,7 +935,7 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
             },
         };
         tex.get_bytes(pixels.as_mut_ptr() as *mut _, (width as u64) * 4, region, 0);
-        let wrote = if c.target_gva != 0 {
+        let wrote = if c.target_gva() != 0 {
             // Shared texture is BGRA8; convert to RGBA for write_gva_rgba8.
             //
             // Walked over `need` — the length `tight_image_layout` just returned
@@ -952,10 +954,10 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
                 state,
                 host,
                 req.task_id,
-                c.target_gva,
+                c.target_gva(),
                 width,
                 height,
-                c.row_stride,
+                c.row_stride(),
                 c.format,
                 &pixels,
             )

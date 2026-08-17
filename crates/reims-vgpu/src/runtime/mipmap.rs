@@ -208,9 +208,9 @@ fn resolve_multi_mip_texture<M: HostMemory + HostOps>(
             return Err(MipmapStatus::MissingTexture);
         }
     };
-    if tex.declared_pixel_format().is_none() {
+    let Some(fmt) = tex.declared_pixel_format() else {
         return Err(MipmapStatus::UnsupportedFormat);
-    }
+    };
     let levels = if tex.mipmap_level_count > 0 {
         tex.mipmap_level_count as usize
     } else {
@@ -222,7 +222,6 @@ fn resolve_multi_mip_texture<M: HostMemory + HostOps>(
     if levels > TEXTURE_MAX_MIP_LEVELS || tex.levels.len() < levels {
         return Err(MipmapStatus::IncompleteLayout);
     }
-    let fmt = tex.pixel_format;
     if pixel_format::bytes_per_pixel(fmt).is_none() {
         return Err(MipmapStatus::UnsupportedFormat);
     }

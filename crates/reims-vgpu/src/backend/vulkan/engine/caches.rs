@@ -166,14 +166,6 @@ pub(crate) struct DepthAttachKey {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct PassKey {
     pub load_seed: bool, // LOAD vs CLEAR (slot 0)
-    /// Slot 0 aliases memory the host may modify between submissions.
-    ///
-    /// A linear image is host-accessible only in `PREINITIALIZED` or `GENERAL`.
-    /// The former is an image's one-way birth layout, so a retained imported
-    /// attachment must use `GENERAL` for both its pass layout and its exit
-    /// layout. This bit partitions render passes and pipelines from ordinary
-    /// device-local attachments, which retain their dedicated layouts.
-    pub host_accessible_color0: bool,
     /// Slot-0 attachment format, as a format rather than a channel-order flag.
     ///
     /// This used to be `bgra: bool`, meaning `B8G8R8A8_UNORM` or
@@ -219,7 +211,6 @@ impl PassKey {
     pub(crate) fn single(load_seed: bool, color0_format: ash::vk::Format) -> Self {
         Self {
             load_seed,
-            host_accessible_color0: false,
             color0_format,
             secondary: [SecondaryAttachKey::default(); MAX_SECONDARY_ATTACH],
             secondary_count: 0,
@@ -284,7 +275,6 @@ impl PassKey {
     /// the key.
     pub(crate) fn framebuffer_compatibility(self) -> FramebufferCompatibilityKey {
         let mut key = self.compatibility().0;
-        key.host_accessible_color0 = false;
         key.feedback_colors = 0;
         FramebufferCompatibilityKey(key)
     }
@@ -292,7 +282,7 @@ impl PassKey {
     pub(crate) fn color_layout(self, index: usize) -> vk::ImageLayout {
         if self.color_feedback(index) {
             color_feedback_layout()
-        } else if index == 0 && (self.color_input || self.host_accessible_color0) {
+        } else if index == 0 && self.color_input {
             vk::ImageLayout::GENERAL
         } else {
             // The same layout the pass exits at, so an ordinary pass performs no
@@ -304,9 +294,7 @@ impl PassKey {
     }
 
     pub(crate) fn color_final_layout(self, index: usize) -> vk::ImageLayout {
-        if index == 0 && self.host_accessible_color0 {
-            vk::ImageLayout::GENERAL
-        } else if self.color_feedback(index) {
+        if self.color_feedback(index) {
             color_feedback_layout()
         } else {
             color0_pass_exit_layout()
@@ -413,7 +401,6 @@ impl PassCompatibilityKey {
             // Load actions are erased by `PassKey::compatibility`, so they are
             // equal here by construction and cannot be a difference.
             load_seed: _,
-            host_accessible_color0,
             color0_format,
             secondary,
             secondary_count,
@@ -435,9 +422,6 @@ impl PassCompatibilityKey {
         }
         if depth != them.depth {
             return Some(PassCompatField::Depth);
-        }
-        if host_accessible_color0 != them.host_accessible_color0 {
-            return Some(PassCompatField::HostAccessibleColor0);
         }
         if color_input != them.color_input {
             return Some(PassCompatField::ColorInput);
@@ -465,7 +449,6 @@ pub(crate) enum PassCompatField {
     SecondaryCount,
     SecondaryFormat,
     Depth,
-    HostAccessibleColor0,
     ColorInput,
     FeedbackColors,
     SampleCount,
@@ -479,7 +462,6 @@ impl PassCompatField {
             Self::SecondaryCount => "passcompat_secondary_count",
             Self::SecondaryFormat => "passcompat_secondary_format",
             Self::Depth => "passcompat_depth",
-            Self::HostAccessibleColor0 => "passcompat_host_accessible",
             Self::ColorInput => "passcompat_color_input",
             Self::FeedbackColors => "passcompat_feedback",
             Self::SampleCount => "passcompat_sample_count",
@@ -896,14 +878,7 @@ pub(crate) struct ObjectCaches {
 }
 
 struct ObjectVariantIndex<K, V> {
-    map: HashMap<
-        std::num::NonZeroU64,
-        (
-            std::sync::Weak<super::types::PipelineObjectLife>,
-            K,
-            V,
-        ),
-    >,
+    map: HashMap<std::num::NonZeroU64, (std::sync::Weak<super::types::PipelineObjectLife>, K, V)>,
 }
 
 impl<K, V> Default for ObjectVariantIndex<K, V> {
@@ -925,11 +900,7 @@ impl<K: Clone + Eq, V: Copy> ObjectVariantIndex<K, V> {
     /// draw for nothing. A `Weak` reads `strong_count() == 0` exactly when its
     /// value has been dropped, which is the same question `upgrade().is_none()`
     /// asked.
-    fn get(
-        &mut self,
-        identity: &super::types::PipelineObjectIdentity,
-        key: &K,
-    ) -> Option<V> {
+    fn get(&mut self, identity: &super::types::PipelineObjectIdentity, key: &K) -> Option<V> {
         let id = identity.id();
         let (life, held_key, pipeline) = self.map.get(&id)?;
         if life.strong_count() == 0 {
@@ -939,12 +910,7 @@ impl<K: Clone + Eq, V: Copy> ObjectVariantIndex<K, V> {
         (held_key == key).then_some(*pipeline)
     }
 
-    fn remember(
-        &mut self,
-        identity: &super::types::PipelineObjectIdentity,
-        key: &K,
-        value: V,
-    ) {
+    fn remember(&mut self, identity: &super::types::PipelineObjectIdentity, key: &K, value: V) {
         let id = identity.id();
         if !self.map.contains_key(&id) {
             // Object construction is rare. Reap identities whose runtime
@@ -1134,7 +1100,6 @@ pub(crate) fn unified_color_layout() -> bool {
 fn external_dependencies(
     has_depth: bool,
     color_input: bool,
-    host_accessible_color0: bool,
     // Taken as an argument rather than read here, so both arms are reachable
     // from a test. The switch is read once, at the one call site that builds a
     // pass; see [`pass_exit_scope_narrow`].
@@ -1163,18 +1128,16 @@ fn external_dependencies(
     // Weakening this to the attachment stages makes that skip a missing
     // dependency, which is a stale frame and no error.
     let (in_dst_stages, mut in_dst_access) = (
-        attach_stages | vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
+        attach_stages
+            | vk::PipelineStageFlags::VERTEX_SHADER
+            | vk::PipelineStageFlags::FRAGMENT_SHADER,
         attach_writes | attach_reads | vk::AccessFlags::SHADER_READ,
     );
     if color_input {
         in_dst_access |= vk::AccessFlags::INPUT_ATTACHMENT_READ;
     }
-    let mut source_stages = attach_stages | vk::PipelineStageFlags::TRANSFER;
-    let mut source_access = attach_writes | vk::AccessFlags::TRANSFER_WRITE;
-    if host_accessible_color0 {
-        source_stages |= vk::PipelineStageFlags::HOST;
-        source_access |= vk::AccessFlags::HOST_WRITE;
-    }
+    let source_stages = attach_stages | vk::PipelineStageFlags::TRANSFER;
+    let source_access = attach_writes | vk::AccessFlags::TRANSFER_WRITE;
     [
         vk::SubpassDependency::default()
             .src_subpass(vk::SUBPASS_EXTERNAL)
@@ -1678,8 +1641,8 @@ impl ObjectCaches {
                 .bindings(&bindings)
                 .push_next(&mut flags);
             if key.uses_push_descriptors(ctx.caps.push_descriptor) {
-                create_info = create_info
-                    .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR);
+                create_info =
+                    create_info.flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR);
             }
             let d = ctx
                 .device
@@ -1903,7 +1866,6 @@ impl ObjectCaches {
         let mut deps: Vec<vk::SubpassDependency> = external_dependencies(
             key.depth.is_some(),
             key.color_input,
-            key.host_accessible_color0,
             pass_exit_scope_narrow(),
         )
         .to_vec();
@@ -2757,34 +2719,59 @@ mod object_cache_tests {
         /// produce. `None` for a mutation `compatibility` erases.
         type Mutation = (&'static str, fn(&mut PassKey), Option<PassCompatField>);
         let mutations: &[Mutation] = &[
-            ("load actions", |k| {
-                k.load_seed = true;
-                k.secondary[0].load = true;
-                k.depth.as_mut().unwrap().load = true;
-            }, None),
-            ("color0 format", |k| k.color0_format = vk::Format::R8G8B8A8_UNORM,
-             Some(PassCompatField::Color0Format)),
-            ("secondary count", |k| k.secondary_count = 2,
-             Some(PassCompatField::SecondaryCount)),
-            ("secondary format", |k| k.secondary[0].format = vk::Format::R32_SFLOAT,
-             Some(PassCompatField::SecondaryFormat)),
+            (
+                "load actions",
+                |k| {
+                    k.load_seed = true;
+                    k.secondary[0].load = true;
+                    k.depth.as_mut().unwrap().load = true;
+                },
+                None,
+            ),
+            (
+                "color0 format",
+                |k| k.color0_format = vk::Format::R8G8B8A8_UNORM,
+                Some(PassCompatField::Color0Format),
+            ),
+            (
+                "secondary count",
+                |k| k.secondary_count = 2,
+                Some(PassCompatField::SecondaryCount),
+            ),
+            (
+                "secondary format",
+                |k| k.secondary[0].format = vk::Format::R32_SFLOAT,
+                Some(PassCompatField::SecondaryFormat),
+            ),
             ("depth", |k| k.depth = None, Some(PassCompatField::Depth)),
-            ("host accessible", |k| k.host_accessible_color0 = true,
-             Some(PassCompatField::HostAccessibleColor0)),
-            ("color input", |k| k.color_input = true, Some(PassCompatField::ColorInput)),
+            (
+                "color input",
+                |k| k.color_input = true,
+                Some(PassCompatField::ColorInput),
+            ),
             // Feedback is a property of the draw, and it makes two passes
             // incompatible only on the arm where it still moves a layout. On the
             // shipping arm `compatibility` erases it, which is what stops a
             // feedback draw closing the render pass an ordinary one opened.
-            ("feedback", |k| k.feedback_colors = 1,
-             if color_feedback_layout() == color0_pass_exit_layout() {
-                 None
-             } else {
-                 Some(PassCompatField::FeedbackColors)
-             }),
-            ("sample count", |k| k.sample_count = 4, Some(PassCompatField::SampleCount)),
-            ("resolve", |k| k.multisample_resolve = true,
-             Some(PassCompatField::MultisampleResolve)),
+            (
+                "feedback",
+                |k| k.feedback_colors = 1,
+                if color_feedback_layout() == color0_pass_exit_layout() {
+                    None
+                } else {
+                    Some(PassCompatField::FeedbackColors)
+                },
+            ),
+            (
+                "sample count",
+                |k| k.sample_count = 4,
+                Some(PassCompatField::SampleCount),
+            ),
+            (
+                "resolve",
+                |k| k.multisample_resolve = true,
+                Some(PassCompatField::MultisampleResolve),
+            ),
         ];
 
         for (name, mutate, expected) in mutations {
@@ -2802,24 +2789,18 @@ mod object_cache_tests {
         }
     }
 
-    /// Framebuffers bind attachment views, not load actions, layouts, or
-    /// dependencies. A transport change on the same retained attachment must
-    /// therefore keep the framebuffer, while a changed input-attachment shape
-    /// must not.
+    /// Framebuffers bind attachment views, not load actions or dependencies.
     #[test]
-    fn framebuffer_compatibility_ignores_transport_and_dependency_state() {
+    fn framebuffer_compatibility_ignores_load_and_dependency_state() {
         let plain = PassKey::single(false, vk::Format::B8G8R8A8_UNORM);
         let mut transported = plain;
         transported.load_seed = true;
-        transported.host_accessible_color0 = true;
         transported.feedback_colors = 1;
 
         assert_eq!(
             plain.framebuffer_compatibility(),
             transported.framebuffer_compatibility()
         );
-        assert_ne!(plain.compatibility(), transported.compatibility());
-
         let mut input = transported;
         input.color_input = true;
         assert_ne!(
@@ -3316,8 +3297,8 @@ mod object_cache_tests {
     fn the_narrow_pass_exit_keeps_the_consumer_that_issues_no_barrier() {
         for has_depth in [false, true] {
             for color_input in [false, true] {
-                let wide = external_dependencies(has_depth, color_input, false, false)[1];
-                let narrow = external_dependencies(has_depth, color_input, false, true)[1];
+                let wide = external_dependencies(has_depth, color_input, false)[1];
+                let narrow = external_dependencies(has_depth, color_input, true)[1];
                 let shape = format!("depth={has_depth} color_input={color_input}");
 
                 assert_eq!(
@@ -3371,112 +3352,73 @@ mod object_cache_tests {
     fn both_external_dependencies_name_the_colour_scope_in_every_pass_shape() {
         for has_depth in [false, true] {
             for color_input in [false, true] {
-                for host_accessible in [false, true] {
-                    // The shipping scope. The probe arm has its own test.
-                    let [incoming, outgoing] =
-                        external_dependencies(has_depth, color_input, host_accessible, false);
-                    let shape = format!(
-                        "depth={has_depth} color_input={color_input} host={host_accessible}"
-                    );
+                // The shipping scope. The probe arm has its own test.
+                let [incoming, outgoing] = external_dependencies(has_depth, color_input, false);
+                let shape = format!("depth={has_depth} color_input={color_input}");
 
-                    // Incoming: the transition into the attachment layout has to be
-                    // ordered against the loadOp that writes it.
-                    assert!(
-                        incoming
-                            .dst_stage_mask
-                            .contains(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT),
-                        "{shape}: the loadOp clear runs at COLOR_ATTACHMENT_OUTPUT"
-                    );
-                    assert!(
-                        incoming
-                            .dst_access_mask
-                            .contains(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
-                        "{shape}: and it is a colour write"
-                    );
-
-                    // Outgoing: the final transition has to be ordered against the
-                    // subpass's own store, and the store made visible to the copy
-                    // that reads the target after the pass.
-                    assert!(
-                        outgoing
-                            .src_stage_mask
-                            .contains(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT),
-                        "{shape}: the store runs at COLOR_ATTACHMENT_OUTPUT"
-                    );
-                    assert!(
-                        outgoing
-                            .src_access_mask
-                            .contains(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
-                        "{shape}: and it is a colour write"
-                    );
-                    assert!(
-                        outgoing
-                            .dst_stage_mask
-                            .contains(vk::PipelineStageFlags::TRANSFER)
-                            && outgoing
-                                .dst_access_mask
-                                .contains(vk::AccessFlags::TRANSFER_READ),
-                        "{shape}: a reader still barriers slot 0 into TRANSFER_SRC_OPTIMAL \
-                     for itself, and this is the scope its transition orders against"
-                    );
-
-                    // Depth is stated only where the pass has a depth attachment —
-                    // the fix is to add the missing class, not to name every class
-                    // on every pass.
-                    assert_eq!(
-                        incoming
-                            .dst_access_mask
-                            .contains(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE),
-                        has_depth,
-                        "{shape}: depth terms follow the depth attachment"
-                    );
-
-                    // Framebuffer fetch reads attachment 0 in the fragment stage, so
-                    // the entry transition must be visible to that read as well.
-                    assert_eq!(
-                        incoming
-                            .dst_access_mask
-                            .contains(vk::AccessFlags::INPUT_ATTACHMENT_READ),
-                        color_input,
-                        "{shape}: input-attachment terms follow the fetch"
-                    );
-                    assert_eq!(
-                        incoming
-                            .src_stage_mask
-                            .contains(vk::PipelineStageFlags::HOST)
-                            && incoming
-                                .src_access_mask
-                                .contains(vk::AccessFlags::HOST_WRITE),
-                        host_accessible,
-                        "{shape}: host writes source only a host-accessible attachment"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn a_host_accessible_primary_stays_general_between_every_pass_shape() {
-        let mut key = PassKey::single(true, vk::Format::R8G8B8A8_UNORM);
-        key.host_accessible_color0 = true;
-        for color_input in [false, true] {
-            for feedback in [false, true] {
-                key.color_input = color_input;
-                key.feedback_colors = u8::from(feedback);
-                assert_eq!(
-                    key.color_layout(0),
-                    if feedback {
-                        color_feedback_layout()
-                    } else {
-                        vk::ImageLayout::GENERAL
-                    }
+                // Incoming: the transition into the attachment layout has to be
+                // ordered against the loadOp that writes it.
+                assert!(
+                    incoming
+                        .dst_stage_mask
+                        .contains(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT),
+                    "{shape}: the loadOp clear runs at COLOR_ATTACHMENT_OUTPUT"
                 );
-                assert_eq!(key.color_final_layout(0), vk::ImageLayout::GENERAL);
+                assert!(
+                    incoming
+                        .dst_access_mask
+                        .contains(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
+                    "{shape}: and it is a colour write"
+                );
+
+                // Outgoing: the final transition has to be ordered against the
+                // subpass's own store, and the store made visible to the copy
+                // that reads the target after the pass.
+                assert!(
+                    outgoing
+                        .src_stage_mask
+                        .contains(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT),
+                    "{shape}: the store runs at COLOR_ATTACHMENT_OUTPUT"
+                );
+                assert!(
+                    outgoing
+                        .src_access_mask
+                        .contains(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
+                    "{shape}: and it is a colour write"
+                );
+                assert!(
+                    outgoing
+                        .dst_stage_mask
+                        .contains(vk::PipelineStageFlags::TRANSFER)
+                        && outgoing
+                            .dst_access_mask
+                            .contains(vk::AccessFlags::TRANSFER_READ),
+                    "{shape}: a reader still barriers slot 0 into TRANSFER_SRC_OPTIMAL \
+                     for itself, and this is the scope its transition orders against"
+                );
+
+                // Depth is stated only where the pass has a depth attachment —
+                // the fix is to add the missing class, not to name every class
+                // on every pass.
+                assert_eq!(
+                    incoming
+                        .dst_access_mask
+                        .contains(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE),
+                    has_depth,
+                    "{shape}: depth terms follow the depth attachment"
+                );
+
+                // Framebuffer fetch reads attachment 0 in the fragment stage, so
+                // the entry transition must be visible to that read as well.
+                assert_eq!(
+                    incoming
+                        .dst_access_mask
+                        .contains(vk::AccessFlags::INPUT_ATTACHMENT_READ),
+                    color_input,
+                    "{shape}: input-attachment terms follow the fetch"
+                );
             }
         }
-        // Host accessibility is a property of slot 0 only, so a secondary is an
-        // ordinary colour slot and rests where every ordinary colour slot does.
-        assert_eq!(key.color_layout(1), color0_pass_exit_layout());
     }
 
     /// The pass key is the single source of truth for every place that names an
@@ -3549,24 +3491,21 @@ mod object_cache_tests {
     fn the_dependency_count_does_not_move_with_anything_the_framebuffer_key_erases() {
         let base = PassKey::single(true, vk::Format::R8G8B8A8_UNORM);
         for feedback in [0u8, 1, (1 << 0) | (1 << 3)] {
-            for host_accessible in [false, true] {
-                let mut key = base;
-                key.feedback_colors = feedback;
-                key.host_accessible_color0 = host_accessible;
-                assert_eq!(
-                    key.framebuffer_compatibility(),
-                    base.framebuffer_compatibility(),
-                    "the framebuffer key must erase these"
-                );
-                // Same framebuffer key ⇒ the passes must agree on dependency
-                // count, because a framebuffer built against one is used with the
-                // other.
-                assert_eq!(
-                    pass_dependency_count(key),
-                    pass_dependency_count(base),
-                    "feedback={feedback} host_accessible={host_accessible}"
-                );
-            }
+            let mut key = base;
+            key.feedback_colors = feedback;
+            assert_eq!(
+                key.framebuffer_compatibility(),
+                base.framebuffer_compatibility(),
+                "the framebuffer key must erase feedback"
+            );
+            // Same framebuffer key ⇒ the passes must agree on dependency
+            // count, because a framebuffer built against one is used with the
+            // other.
+            assert_eq!(
+                pass_dependency_count(key),
+                pass_dependency_count(base),
+                "feedback={feedback}"
+            );
         }
     }
 
@@ -3576,7 +3515,6 @@ mod object_cache_tests {
         external_dependencies(
             key.depth.is_some(),
             key.color_input,
-            key.host_accessible_color0,
             pass_exit_scope_narrow(),
         )
         .len()
@@ -3620,13 +3558,12 @@ mod object_cache_tests {
     /// and naming it made every render pass this device created invalid.
     #[test]
     fn the_feedback_self_dependency_stays_in_framebuffer_space() {
-        const FRAMEBUFFER_SPACE: vk::PipelineStageFlags =
-            vk::PipelineStageFlags::from_raw(
-                vk::PipelineStageFlags::FRAGMENT_SHADER.as_raw()
-                    | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS.as_raw()
-                    | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS.as_raw()
-                    | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT.as_raw(),
-            );
+        const FRAMEBUFFER_SPACE: vk::PipelineStageFlags = vk::PipelineStageFlags::from_raw(
+            vk::PipelineStageFlags::FRAGMENT_SHADER.as_raw()
+                | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS.as_raw()
+                | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS.as_raw()
+                | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT.as_raw(),
+        );
         assert!(FRAMEBUFFER_SPACE.contains(COLOR_FEEDBACK_SRC.0));
         assert!(FRAMEBUFFER_SPACE.contains(COLOR_FEEDBACK_DST.0));
 
@@ -3635,7 +3572,9 @@ mod object_cache_tests {
         let dep = color_feedback_self_dependency(color_feedback_layout());
         assert_eq!(dep.src_stage_mask, COLOR_FEEDBACK_SRC.0);
         assert_eq!(dep.dst_stage_mask, COLOR_FEEDBACK_DST.0);
-        assert!(dep.dependency_flags.contains(vk::DependencyFlags::BY_REGION));
+        assert!(dep
+            .dependency_flags
+            .contains(vk::DependencyFlags::BY_REGION));
         assert_eq!(dep.src_subpass, dep.dst_subpass);
     }
 
@@ -3655,7 +3594,11 @@ mod object_cache_tests {
     fn an_ordinary_colour_slot_enters_and_leaves_a_pass_at_one_layout() {
         let key = PassKey::single(true, vk::Format::B8G8R8A8_UNORM);
         for index in 0..=MAX_SECONDARY_ATTACH {
-            assert_eq!(key.color_layout(index), color0_pass_exit_layout(), "{index}");
+            assert_eq!(
+                key.color_layout(index),
+                color0_pass_exit_layout(),
+                "{index}"
+            );
             assert_eq!(
                 key.color_final_layout(index),
                 color0_pass_exit_layout(),

@@ -113,6 +113,23 @@ impl ImageRobustness {
     }
 }
 
+/// How `VK_NV_linear_color_attachment` obtains the 64-bit format-feature
+/// vocabulary its dedicated attachment bit lives in. Vulkan 1.3 promotes that
+/// vocabulary to core; a 1.2 device must enable the KHR dependency explicitly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LinearColorAttachment {
+    Core13,
+    KhrFormatFeatureFlags2,
+    #[default]
+    Unsupported,
+}
+
+impl LinearColorAttachment {
+    pub fn is_available(self) -> bool {
+        !matches!(self, Self::Unsupported)
+    }
+}
+
 /// The `maxImageDimension2D` every Vulkan 1.2 implementation must report at
 /// least (spec table "Required Limits"). Used only as the floor a queried
 /// value is clamped to, and as the answer when no device has been resolved.
@@ -302,6 +319,13 @@ pub struct DeviceFeatures {
     /// attachment self-sampling contract; hosts without it keep the snapshot
     /// copy rail.
     pub attachment_feedback_loop_layout: bool,
+    /// `VK_NV_linear_color_attachment`: whether formats carrying
+    /// `LINEAR_COLOR_ATTACHMENT_NV` may be used as linear colour attachments.
+    ///
+    /// This is not a vendor-name gate. It is the Vulkan capability dedicated
+    /// to the exact image shape used by imported guest targets, and it is
+    /// queried and enabled like every other optional feature in this type.
+    pub linear_color_attachment: LinearColorAttachment,
     /// `VK_EXT_image_drm_format_modifier`, used only for the explicit linear
     /// plane layout that gives a shared guest target its declared row pitch.
     /// This is an extension capability rather than a device feature bit: when
@@ -489,6 +513,13 @@ impl DeviceFeatures {
             .attachment_feedback_loop_layout(self.attachment_feedback_loop_layout)
     }
 
+    pub fn enabled_linear_color_attachment(
+        &self,
+    ) -> vk::PhysicalDeviceLinearColorAttachmentFeaturesNV<'static> {
+        vk::PhysicalDeviceLinearColorAttachmentFeaturesNV::default()
+            .linear_color_attachment(self.linear_color_attachment.is_available())
+    }
+
     /// 16-bit storage-buffer access, for shaders that pack half-precision data.
     pub fn enabled_16bit_storage(&self) -> vk::PhysicalDevice16BitStorageFeatures<'static> {
         vk::PhysicalDevice16BitStorageFeatures::default()
@@ -546,6 +577,7 @@ impl DeviceFeatures {
             mirror_clamp_to_edge,
             image_robustness,
             attachment_feedback_loop_layout,
+            linear_color_attachment,
             image_drm_format_modifier,
             dual_src_blend,
             fill_mode_non_solid,
@@ -570,6 +602,7 @@ impl DeviceFeatures {
             "vk_features robust_buffer_access={robust_buffer_access} \
              image_robustness={image_robustness:?} \
              attachment_feedback_loop_layout={attachment_feedback_loop_layout} \
+             linear_color_attachment={linear_color_attachment:?} \
              image_drm_format_modifier={image_drm_format_modifier} \
              sampler_anisotropy={sampler_anisotropy} max_sampler_anisotropy={max_sampler_anisotropy} \
              max_image_dimension_2d={max_image_dimension_2d} \
@@ -614,6 +647,12 @@ impl DeviceFeatures {
         }
         if self.attachment_feedback_loop_layout {
             out.push(vk::EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_NAME.as_ptr());
+        }
+        if self.linear_color_attachment.is_available() {
+            out.push(vk::NV_LINEAR_COLOR_ATTACHMENT_NAME.as_ptr());
+        }
+        if self.linear_color_attachment == LinearColorAttachment::KhrFormatFeatureFlags2 {
+            out.push(vk::KHR_FORMAT_FEATURE_FLAGS2_NAME.as_ptr());
         }
         if self.image_drm_format_modifier {
             out.push(vk::EXT_IMAGE_DRM_FORMAT_MODIFIER_NAME.as_ptr());
@@ -752,12 +791,29 @@ pub unsafe fn query(
         } else {
             false
         };
+    let linear_color_attachment = if has_extension(vk::NV_LINEAR_COLOR_ATTACHMENT_NAME) {
+        let mut linear = vk::PhysicalDeviceLinearColorAttachmentFeaturesNV::default();
+        let mut linear_features = vk::PhysicalDeviceFeatures2::default().push_next(&mut linear);
+        unsafe { instance.get_physical_device_features2(pd, &mut linear_features) };
+        if linear.linear_color_attachment != vk::TRUE {
+            LinearColorAttachment::Unsupported
+        } else if props.api_version >= vk::API_VERSION_1_3 {
+            LinearColorAttachment::Core13
+        } else if has_extension(vk::KHR_FORMAT_FEATURE_FLAGS2_NAME) {
+            LinearColorAttachment::KhrFormatFeatureFlags2
+        } else {
+            LinearColorAttachment::Unsupported
+        }
+    } else {
+        LinearColorAttachment::Unsupported
+    };
     let image_drm_format_modifier = has_extension(vk::EXT_IMAGE_DRM_FORMAT_MODIFIER_NAME);
 
     DeviceFeatures {
         robust_buffer_access: supported.robust_buffer_access == vk::TRUE,
         image_robustness,
         attachment_feedback_loop_layout,
+        linear_color_attachment,
         image_drm_format_modifier,
         sampler_anisotropy: supported.sampler_anisotropy == vk::TRUE,
         dual_src_blend: supported.dual_src_blend == vk::TRUE,
@@ -862,6 +918,7 @@ mod tests {
             mirror_clamp_to_edge: MirrorClampToEdge::Core12,
             image_robustness: ImageRobustness::Core13,
             attachment_feedback_loop_layout: true,
+            linear_color_attachment: LinearColorAttachment::Core13,
             image_drm_format_modifier: true,
             dual_src_blend: true,
             fill_mode_non_solid: true,
@@ -885,6 +942,7 @@ mod tests {
         let without = DeviceFeatures {
             dual_src_blend: false,
             attachment_feedback_loop_layout: false,
+            linear_color_attachment: LinearColorAttachment::Unsupported,
             image_drm_format_modifier: false,
             ..all_supported()
         };
@@ -926,6 +984,7 @@ mod tests {
     fn the_core_rung_needs_no_extension_string() {
         let caps = DeviceFeatures {
             attachment_feedback_loop_layout: false,
+            linear_color_attachment: LinearColorAttachment::Unsupported,
             image_drm_format_modifier: false,
             ..all_supported()
         };
@@ -945,6 +1004,7 @@ mod tests {
         let caps = DeviceFeatures {
             mirror_clamp_to_edge: MirrorClampToEdge::KhrExtension,
             attachment_feedback_loop_layout: false,
+            linear_color_attachment: LinearColorAttachment::Unsupported,
             image_drm_format_modifier: false,
             ..all_supported()
         };
@@ -963,6 +1023,7 @@ mod tests {
         let caps = DeviceFeatures {
             mirror_clamp_to_edge: MirrorClampToEdge::Unsupported,
             attachment_feedback_loop_layout: false,
+            linear_color_attachment: LinearColorAttachment::Unsupported,
             image_drm_format_modifier: false,
             ..all_supported()
         };
@@ -1040,6 +1101,40 @@ mod tests {
         assert_eq!(
             off.enabled_attachment_feedback_loop_layout()
                 .attachment_feedback_loop_layout,
+            vk::FALSE
+        );
+        assert!(!off.required_extensions().contains(&name));
+    }
+
+    /// Linear colour attachment support is an extension feature, not a device
+    /// or driver identity. Query, enable and extension naming therefore move as
+    /// one answer, and the default claims none of them.
+    #[test]
+    fn linear_color_attachment_feature_and_extension_move_together() {
+        let name = vk::NV_LINEAR_COLOR_ATTACHMENT_NAME.as_ptr();
+        let on = DeviceFeatures {
+            linear_color_attachment: LinearColorAttachment::Core13,
+            ..Default::default()
+        };
+        assert_eq!(
+            on.enabled_linear_color_attachment().linear_color_attachment,
+            vk::TRUE
+        );
+        assert!(on.required_extensions().contains(&name));
+
+        let khr_name = vk::KHR_FORMAT_FEATURE_FLAGS2_NAME.as_ptr();
+        let on_12 = DeviceFeatures {
+            linear_color_attachment: LinearColorAttachment::KhrFormatFeatureFlags2,
+            ..Default::default()
+        };
+        assert!(on_12.required_extensions().contains(&name));
+        assert!(on_12.required_extensions().contains(&khr_name));
+        assert!(!on.required_extensions().contains(&khr_name));
+
+        let off = DeviceFeatures::default();
+        assert_eq!(
+            off.enabled_linear_color_attachment()
+                .linear_color_attachment,
             vk::FALSE
         );
         assert!(!off.required_extensions().contains(&name));

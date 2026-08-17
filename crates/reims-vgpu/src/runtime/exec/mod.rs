@@ -859,7 +859,10 @@ fn preflight_render_translations<M: HostMemory + HostOps>(
     use crate::runtime::drain::{note_preflight_part, note_preflight_pipe, PreflightPart};
     let refs_started = std::time::Instant::now();
     let pipelines = render_pipeline_refs(stream);
-    note_preflight_part(PreflightPart::Refs, refs_started.elapsed().as_nanos() as u64);
+    note_preflight_part(
+        PreflightPart::Refs,
+        refs_started.elapsed().as_nanos() as u64,
+    );
     let mut pending = false;
     for pipeline_ref in pipelines {
         note_preflight_pipe();
@@ -868,12 +871,8 @@ fn preflight_render_translations<M: HostMemory + HostOps>(
         // resolves below. `translations_ready` states why that is not a weaker
         // answer — chiefly that the translate cache never evicts, so a shader
         // this memo saw translated is still translated.
-        if crate::runtime::pipeline_resolve::translations_ready(
-            state,
-            host,
-            task_id,
-            pipeline_ref,
-        ) {
+        if crate::runtime::pipeline_resolve::translations_ready(state, host, task_id, pipeline_ref)
+        {
             continue;
         }
         let air_started = std::time::Instant::now();
@@ -911,7 +910,10 @@ fn preflight_render_translations<M: HostMemory + HostOps>(
         ) {
             pending = true;
         }
-        note_preflight_part(PreflightPart::Cache, cache_started.elapsed().as_nanos() as u64);
+        note_preflight_part(
+            PreflightPart::Cache,
+            cache_started.elapsed().as_nanos() as u64,
+        );
     }
     pending
 }
@@ -961,7 +963,10 @@ fn preflight_compute_translations<M: HostMemory + HostOps>(
     use crate::runtime::drain::{note_preflight_part, note_preflight_pipe, PreflightPart};
     let refs_started = std::time::Instant::now();
     let inputs = compute_translation_inputs(stream);
-    note_preflight_part(PreflightPart::Refs, refs_started.elapsed().as_nanos() as u64);
+    note_preflight_part(
+        PreflightPart::Refs,
+        refs_started.elapsed().as_nanos() as u64,
+    );
     let mut pending = false;
     for (pipeline_ref, local_size) in inputs {
         note_preflight_pipe();
@@ -986,7 +991,10 @@ fn preflight_compute_translations<M: HostMemory + HostOps>(
         let cache_started = std::time::Instant::now();
         let cached =
             crate::runtime::m2v_cache::ensure_cached_kernel_async(air, local_size, pipeline_ref);
-        note_preflight_part(PreflightPart::Cache, cache_started.elapsed().as_nanos() as u64);
+        note_preflight_part(
+            PreflightPart::Cache,
+            cache_started.elapsed().as_nanos() as u64,
+        );
         if !cached {
             pending = true;
         }
@@ -1832,8 +1840,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     Some(TextureBind {
                         index,
                         texture_ref,
-                        resource: objects::resolve_resource(state, host, task_id, texture_ref)
-                            .ok(),
+                        resource: objects::resolve_resource(state, host, task_id, texture_ref).ok(),
                     })
                 },
             );
@@ -1982,10 +1989,8 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 // guest that wanted none also produces.
                 let depth = decode_depth_attachment(payload);
                 if depth.texture_ref != 0 {
-                    if attachment_subresource_is_bindable(
-                        depth.into(),
-                        LevelSupport::LevelZeroOnly,
-                    ) {
+                    if attachment_subresource_is_bindable(depth.into(), LevelSupport::LevelZeroOnly)
+                    {
                         acc.depth_attach = Some(depth);
                     } else {
                         let drop = note_depth_stencil_unsupported(task_id, "depth", &depth.into());
@@ -3413,7 +3418,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                 let unified = req
                     .colors
                     .first()
-                    .map(|c| c.mapping_id != 0)
+                    .map(|c| c.mapping_id() != 0)
                     .unwrap_or(false);
                 // Records 2+ of a chain composite over the prior record: force
                 // loadAction=Load on every color. Leaving the pass action alone
@@ -3776,9 +3781,7 @@ fn render_pass_attachment_template(first: &draw::DrawEncodeRequest) -> draw::Dra
         .map(|c| draw::ColorRtRequest {
             slot: c.slot,
             texture_ref: c.texture_ref,
-            mapping_id: c.mapping_id,
-            target_gva: c.target_gva,
-            row_stride: c.row_stride,
+            storage: c.storage,
             width: c.width,
             height: c.height,
             format: c.format,
@@ -4122,9 +4125,7 @@ fn apply_clear<M: HostMemory + HostOps>(
         ));
         return false;
     }
-    if att.store_action == MTL_STORE_ACTION_MULTISAMPLE_RESOLVE
-        && att.resolve_texture_ref == 0
-    {
+    if att.store_action == MTL_STORE_ACTION_MULTISAMPLE_RESOLVE && att.resolve_texture_ref == 0 {
         crate::observe::fail(format!(
             "render_clear reason=clear_multisample_resolve_target_missing source={}",
             att.texture_ref
@@ -4162,21 +4163,21 @@ fn apply_clear<M: HostMemory + HostOps>(
     let w = c0.width;
     let h = c0.height;
     let rgba = solid_rgba8(w, h, &att.clear_color);
-    if c0.target_gva != 0 {
+    if c0.target_gva() != 0 {
         return draw::write_gva_rgba8(
             state,
             host,
             task_id,
-            c0.target_gva,
+            c0.target_gva(),
             w,
             h,
-            c0.row_stride,
+            c0.row_stride(),
             c0.format,
             &rgba,
         )
         .is_ok();
     }
-    if c0.mapping_id == 0 {
+    if c0.mapping_id() == 0 {
         return false;
     }
     let r = f64_to_unorm8(att.clear_color[0]);
@@ -4193,9 +4194,9 @@ fn apply_clear<M: HostMemory + HostOps>(
         }
     }
     let _ = MTL_FORMAT_BGRA8_UNORM;
-    let ok = mapping_write::write_bgra8(state, host, c0.mapping_id, &img, stride, w, h);
+    let ok = mapping_write::write_bgra8(state, host, c0.mapping_id(), &img, stride, w, h);
     // host_cache also updated inside write_bgra8 (surface_cache::store).
-    state.note_surface_clear(c0.mapping_id);
+    state.note_surface_clear(c0.mapping_id());
     ok
 }
 

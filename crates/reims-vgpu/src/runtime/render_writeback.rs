@@ -851,7 +851,7 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
     ) {
         Ok(bytes) => {
             crate::runtime::drain::note_store_route("render_flush_gpu_direct");
-            finish(state, mapping_id, identity, bytes as usize, started, false);
+            finish(state, mapping_id, identity, bytes as usize, started);
             return true;
         }
         Err(decline) => {
@@ -978,40 +978,8 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
         ));
         return false;
     }
-    finish(state, mapping_id, identity, frame_len, started, false);
+    finish(state, mapping_id, identity, frame_len, started);
     true
-}
-
-/// Publish a Store for a resident whose attachment memory is the guest mapping.
-#[cfg(feature = "backend-vulkan")]
-pub fn store_guest_backed_frame(
-    state: &mut DeviceState,
-    mapping_id: u32,
-    identity: &crate::backend::vulkan::engine::TargetIdentity,
-    width: u32,
-    height: u32,
-    guest_store_recorded: bool,
-    guest_store_footprint: Option<crate::runtime::guest_ram::GuestPageFootprint>,
-) -> Result<(), crate::runtime::mapping_write::GpuWritebackDecline> {
-    let started = std::time::Instant::now();
-    crate::runtime::drain::note_store_route("surface_flush");
-    let bytes = crate::runtime::mapping_write::synchronize_guest_backed_resident(
-        state,
-        mapping_id,
-        identity,
-        width,
-        height,
-        guest_store_recorded,
-        guest_store_footprint,
-    )?;
-    crate::runtime::drain::note_store_route("render_flush_gpu_direct");
-    finish(state, mapping_id, identity, bytes as usize, started, true);
-    Ok(())
-}
-
-#[cfg(feature = "backend-vulkan")]
-fn finish_needs_registry_handoff(guest_backed: bool) -> bool {
-    !guest_backed
 }
 
 /// Hand the currency witness back to the image the frame came out of, and score
@@ -1030,7 +998,6 @@ fn finish(
     identity: &crate::backend::vulkan::engine::TargetIdentity,
     frame_len: usize,
     started: std::time::Instant,
-    guest_backed: bool,
 ) {
     // A copied resident needs two pieces of registry state handed back: the
     // mapping epoch says its mirror is current, and clearing sole-copy permits
@@ -1038,18 +1005,14 @@ fn finish(
     // the guest allocation itself. It has no mirror epoch to stamp, and draw
     // completion already leaves it non-sole-copy, so neither registry mutation
     // applies.
-    if finish_needs_registry_handoff(guest_backed) {
-        if let Some(epoch) = state
-            .mappings
-            .get(&mapping_id)
-            .map(|m| m.surface_content_epoch)
-        {
-            crate::backend::vulkan::engine::stamp_resident_content_epoch(identity, epoch);
-        }
-        crate::backend::vulkan::engine::note_resident_content_copied_out(identity);
-    } else {
-        crate::runtime::drain::note_store_route("shared_store_registry_handoff_elided");
+    if let Some(epoch) = state
+        .mappings
+        .get(&mapping_id)
+        .map(|m| m.surface_content_epoch)
+    {
+        crate::backend::vulkan::engine::stamp_resident_content_epoch(identity, epoch);
     }
+    crate::backend::vulkan::engine::note_resident_content_copied_out(identity);
     crate::runtime::drain::note_drain_phase(
         crate::runtime::drain::DrainPhase::Flush(crate::runtime::drain::FlushRail::Render),
         started,
@@ -1058,20 +1021,6 @@ fn finish(
         "render_store mapping={mapping_id} bytes={frame_len} us={}",
         started.elapsed().as_micros()
     ));
-}
-
-#[cfg(all(test, feature = "backend-vulkan"))]
-mod guest_backed_finish_tests {
-    use super::finish_needs_registry_handoff;
-
-    #[test]
-    fn shared_storage_has_no_mirror_or_sole_copy_handoff() {
-        assert!(!finish_needs_registry_handoff(true));
-        assert!(
-            finish_needs_registry_handoff(false),
-            "a copied resident still needs its epoch and reclaimability published"
-        );
-    }
 }
 
 /// Why a GVA render Store could not hand its resident straight to the guest's
@@ -1211,9 +1160,8 @@ crate::observe::decline::decline_display!(GvaWritebackDecline);
 ///
 /// The GPU-direct arm below needs a guest-RAM reference over the destination
 /// pages, which is `VK_EXT_external_memory_host` or nothing. On a host without
-/// that extension — and on every discrete GPU, where `linear_target_import`
-/// refuses `UnsupportedTopology` — it declines every Store of every GVA target
-/// with `gvawb_guest_ref_refused via=guest_ram_map_no_backend_import`.
+/// that extension it declines every Store of every GVA target with
+/// `gvawb_guest_ref_refused via=guest_ram_map_no_backend_import`.
 ///
 /// That decline used to be a **lost frame** for one of the two callers. The
 /// eager site in `draw::vulkan` carries its own copying rail (`gva_store_sync`:
@@ -1265,7 +1213,7 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
     // declines every Store of every target, and a line each would drown the
     // channel.
     crate::observe::Emit::decline("gva_flush_gpu_declined", &decline)
-        .field("gva", format!("{:#x}", c0.target_gva))
+        .field("gva", format!("{:#x}", c0.target_gva()))
         .field("geom", format!("{}x{}", c0.width, c0.height))
         // The destination's declared format and the resident's own. The copying
         // arm below converts by `into_rgba8` and then
@@ -1274,7 +1222,7 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
         // on this rail is a screenshot and no reading.
         .field("fmt", format!("{:#x}", c0.format))
         .field("resident", format!("{:?}", identity.resident_format()))
-        .fail_once(c0.target_gva);
+        .fail_once(c0.target_gva());
     crate::runtime::drain::note_store_route("gva_flush_gpu_declined");
     let Some(pages) = pages else {
         return Err(GvaWritebackDecline::Unlicensed);
@@ -1325,21 +1273,21 @@ fn land_gva_frame_bytes<M: HostMemory + HostOps>(
         return Err(GvaWritebackDecline::FormatNeedsConversion { format: c0.format });
     };
     let extent =
-        u64::from(c0.height.saturating_sub(1)) * u64::from(c0.row_stride) + u64::from(tight);
+        u64::from(c0.height.saturating_sub(1)) * u64::from(c0.row_stride()) + u64::from(tight);
     crate::runtime::draw::write_gva_rgba8_within(
         state,
         host,
         task_id,
-        c0.target_gva,
+        c0.target_gva(),
         c0.width,
         c0.height,
-        c0.row_stride,
+        c0.row_stride(),
         c0.format,
         rgba,
         Some(pages.membership()),
     )
     .map_err(|err| GvaWritebackDecline::CopiedWriteRefused { err })?;
-    forget_gva_host_copies(state, task_id, c0.target_gva, texture_ref);
+    forget_gva_host_copies(state, task_id, c0.target_gva(), texture_ref);
     Ok(extent)
 }
 
@@ -1357,7 +1305,12 @@ fn land_gva_frame_bytes<M: HostMemory + HostOps>(
 /// dispatch's readback may have left an entry, and that entry is now stale by
 /// exactly one frame.
 #[cfg(feature = "backend-vulkan")]
-pub(crate) fn forget_gva_host_copies(state: &mut DeviceState, task_id: u32, target_gva: u64, texture_ref: u32) {
+pub(crate) fn forget_gva_host_copies(
+    state: &mut DeviceState,
+    task_id: u32,
+    target_gva: u64,
+    texture_ref: u32,
+) {
     crate::runtime::surface_cache::evict_gva(state, target_gva);
     if texture_ref != 0 {
         crate::runtime::surface_cache::evict_texture(state, task_id, texture_ref);
@@ -1403,10 +1356,10 @@ fn store_gva_frame_direct<M: HostMemory + HostOps>(
         task_id,
         identity,
         &GvaPlaneDestination {
-            target_gva: c0.target_gva,
+            target_gva: c0.target_gva(),
             width: c0.width,
             height: c0.height,
-            row_stride: c0.row_stride,
+            row_stride: c0.row_stride(),
             format: c0.format,
             texture_ref,
         },
@@ -1599,7 +1552,6 @@ pub(crate) fn licence_gva_plane<M: HostMemory + HostOps>(
         width: c0.width,
         height: c0.height,
         format: want,
-        shared_backing: None,
     };
     // This device is about to write these guest pages, and the hypervisor's
     // dirty bitmap is defined not to see it. Without this record a reader
@@ -1669,7 +1621,7 @@ pub(crate) fn copy_resident_into_gva_plane<M: HostMemory + HostOps>(
     // Store, so the shortcut is worth less there and the rails stay easier to
     // tell apart. The frame is in the guest's pages either way; what a missing
     // stamp costs is a re-read, never a wrong image.
-    if let Some(key) = crate::runtime::gva_store_witness::GvaTargetKey::of(identity) {
+    if let Some(key) = crate::runtime::gva_store_witness::GvaTargetKey::of(task_id, identity) {
         crate::runtime::gva_store_witness::note_store(state, host, key, gpas);
     }
     Ok(extent)
@@ -1705,8 +1657,9 @@ mod gva_copying_arm_tests {
     fn request() -> ColorRtRequest {
         ColorRtRequest {
             texture_ref: 0,
-            target_gva: TARGET_GVA,
-            row_stride: BPR,
+            storage: crate::runtime::draw::ColorTargetStorage::Linear(
+                crate::runtime::draw::LinearColorTarget::whole(TARGET_GVA, BPR, H),
+            ),
             width: W,
             height: H,
             // Byte-identical with the RGBA8 the readback hands over, so the
@@ -1787,7 +1740,11 @@ mod gva_copying_arm_tests {
         let mut got = [0u8; (W * 4) as usize];
         crate::runtime::host::HostMemory::read_gpa(&host, gpa, &mut got)
             .expect("the destination page is guest RAM");
-        assert_eq!(got, [0u8; (W * 4) as usize], "nothing may have been written");
+        assert_eq!(
+            got,
+            [0u8; (W * 4) as usize],
+            "nothing may have been written"
+        );
     }
 }
 

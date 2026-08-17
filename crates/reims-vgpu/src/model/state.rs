@@ -763,10 +763,10 @@ mod task_resource_resident_tests {
             acquisitions.set(acquisitions.get() + 1);
             Some(ResidentResourceLease::test_new(
                 identity.clone(),
-                ResidentContentBacking::GuestAllocation,
+                ResidentContentBacking::DeviceAllocation,
             ))
         });
-        assert_eq!(backing, ResidentContentBacking::GuestAllocation);
+        assert_eq!(backing, ResidentContentBacking::DeviceAllocation);
         assert_eq!(acquisitions.get(), 1);
         assert_eq!(
             crate::runtime::drain::census::store_route_count("resident_resource_acquired"),
@@ -776,7 +776,7 @@ mod task_resource_resident_tests {
         let backing = resource.resident_target_backing_with(&first, |_| {
             panic!("a warm bind must not reacquire its live resource")
         });
-        assert_eq!(backing, ResidentContentBacking::GuestAllocation);
+        assert_eq!(backing, ResidentContentBacking::DeviceAllocation);
         assert_eq!(
             crate::runtime::drain::census::store_route_count("resident_resource_acquired"),
             acquired_before + 1,
@@ -799,10 +799,10 @@ mod task_resource_resident_tests {
             acquisitions.set(acquisitions.get() + 1);
             Some(ResidentResourceLease::test_new(
                 identity.clone(),
-                ResidentContentBacking::GuestAllocation,
+                ResidentContentBacking::DeviceAllocation,
             ))
         });
-        assert_eq!(backing, ResidentContentBacking::GuestAllocation);
+        assert_eq!(backing, ResidentContentBacking::DeviceAllocation);
         assert_eq!(
             acquisitions.get(),
             3,
@@ -1241,7 +1241,7 @@ pub struct MapperCapture {
 /// than re-derived. The walk itself is cheap — one page-table translation per
 /// page — and it is the only thing that can say whether the cached list still
 /// names the guest's memory.
-/// It carries the [`MappingEntry::map_generation`] it was latched at, and a
+/// It carries the [`MappingEntry::page_generation`] it was latched at, and a
 /// reader must check that before trusting it. Six sites clear or replace
 /// `page_entries` and every one of them bumps the generation, so a carried-over
 /// walk is unusable by construction rather than by every future writer
@@ -1254,8 +1254,8 @@ pub struct Type4Walk {
     /// `getGPUVirtualAddress() >> page_shift` of the surface backing — page `i`
     /// of the list is `(backing_pfn + i) << page_shift` in that task.
     pub backing_pfn: u32,
-    /// `map_generation` of the list this walk produced.
-    pub map_generation: u32,
+    /// `page_generation` of the list this walk produced.
+    pub page_generation: u32,
 }
 
 /// Who owns a resource's authoritative bytes, as the guest last stated it and as
@@ -1438,12 +1438,18 @@ pub struct MappingEntry {
     /// Who has read what the last landed render flush of this mapping wrote.
     /// See [`RenderFlushWitness`].
     pub render_flush: RenderFlushWitness,
-    /// Bumped whenever the guest page list / map lifetime changes (MAP, UNMAP,
-    /// ReplacePhysical, MappingInternal reattach, page-table refresh that
-    /// changes PFNs). Used as `TargetIdentity` generation for resident
-    /// import-present so a recycled mid never reuses a stale GPU target, and
-    /// as a fail-closed check before zero-copy DMA into contig views.
+    /// Bumped whenever the logical resource lifetime changes (MAP incarnation,
+    /// UNMAP, ReplacePhysical, MappingInternal reattach). Used as
+    /// `TargetIdentity` generation so a recycled id never reuses stale content.
+    /// A page-table refresh of the same live resource does not change this;
+    /// [`Self::page_generation`] names that physical-backing change.
     pub map_generation: u32,
+    /// Version of [`Self::page_entries`], independent of the logical resource
+    /// lifetime. A resource synchronization resolves the resource's current
+    /// backing, so a complete live re-walk may advance this generation while
+    /// preserving [`Self::map_generation`] and the resource's resident content.
+    /// Page-bound views, imports, write trackers, and vouch tokens use this key.
+    pub page_generation: u32,
     /// Guest page-table entries (valid bit + PFN); empty until resolved.
     pub page_entries: Vec<u32>,
     /// Page entries retired by a trailing `DeleteIOSurfaceBacking2` while the
@@ -1471,21 +1477,19 @@ pub struct MappingEntry {
     pub contig_len: usize,
     /// Guest-physical pages represented by `contig_ptr`, in allocation order.
     ///
-    /// Kept with the view because a resource synchronization names the
-    /// resource, not a freshly reconstructed destination. The backend retains
-    /// this footprint with an imported attachment and uses it to order host
-    /// readers against the GPU write without walking the mapping again at
-    /// Store time.
+    /// Kept with the view so imported-buffer users can retain the exact pages
+    /// belonging to this mapping incarnation without walking mutable mapping
+    /// state again.
     pub contig_footprint: Option<crate::runtime::guest_ram::GuestPageFootprint>,
     /// Checked backend-import bound over `contig_ptr`, created once for this
     /// mapping incarnation. Keeping it on the mapping makes every plane view a
     /// slice of one resource-owned allocation instead of minting a new import
     /// identity for each bind.
     pub contig_import: Option<std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>>,
-    /// `map_generation` whose page list the host refused to expose as one
+    /// `page_generation` whose page list the host refused to expose as one
     /// packed view. `None` = not asked for the current list.
     ///
-    /// The host answer is stable for one page list, and `map_generation` names
+    /// The host answer is stable for one page list, and `page_generation` names
     /// that list — the same key that makes `contig_ptr` above safe to cache.
     /// Without it every caller repeats a host mapping attempt that cannot
     /// become possible until the guest changes the list.
@@ -1499,7 +1503,7 @@ pub struct MappingEntry {
     /// both. A token that outlived its list would report writes to pages this
     /// surface no longer owns and miss writes to the ones it does.
     pub guest_write_token: u64,
-    /// [`Self::map_generation`] the token above was built for.
+    /// [`Self::page_generation`] the token above was built for.
     ///
     /// The lifecycle mutators retire the token eagerly, but they are not the
     /// only writers of [`Self::page_entries`]: the mapper's plan adoption and
@@ -1507,7 +1511,7 @@ pub struct MappingEntry {
     /// the contiguous view while leaving the token behind — a token naming
     /// pages the surface no longer owns, which is the one thing it must never
     /// be. Rather than add a third and a fourth site to remember,
-    /// `map_generation` is the key: every writer of the list already bumps it
+    /// `page_generation` is the key: every writer of the list already bumps it
     /// exactly when the list changes, so a token whose generation does not
     /// match is unusable by construction, and the eager retirement is left as
     /// what it should have been — a way to free host state promptly rather than
@@ -2859,6 +2863,18 @@ impl DeviceState {
         std::mem::replace(&mut e.guest_write_token, 0)
     }
 
+    /// Retire sampled-window witnesses bound to one mapping lifetime.
+    ///
+    /// These tokens live in [`crate::runtime::gather_witness::GatherWitness`]
+    /// rather than in [`MappingEntry`], so every mapping lifecycle transition
+    /// that retires the entry's page-bound view must retire them explicitly as
+    /// part of the same operation.
+    #[cfg(feature = "backend-vulkan")]
+    fn retire_mapping_gather_witness(&mut self, mapping_id: u32) {
+        self.retired_guest_write_tokens
+            .extend(self.gather_witness.retire_mapping(mapping_id));
+    }
+
     /// Detach every HostOps mapping owned by the current guest lifetime.
     ///
     /// Device reset is a lifetime boundary even when QEMU itself remains alive.
@@ -3239,6 +3255,13 @@ impl DeviceState {
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
         // New directory ⇒ old GVA HostOps views alias the wrong PT — retire.
         self.retire_task_gva_views(task_id);
+        #[cfg(feature = "backend-vulkan")]
+        {
+            self.retired_guest_write_tokens
+                .extend(self.gva_store_witness.retire_task(task_id));
+            self.retired_guest_write_tokens
+                .extend(self.gather_witness.retire_task(task_id));
+        }
         self.tasks
             .define(task_id, TaskEntry::define(length, directory_pfn));
     }
@@ -3288,8 +3311,7 @@ impl DeviceState {
         );
         self.retire_task_linear_residents(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
-        self.host_texture_surfaces
-            .retain(|&(t, _), _| t != task_id);
+        self.host_texture_surfaces.retain(|&(t, _), _| t != task_id);
         // Clear texture→mapping latches for this task.
         self.texture_to_mapping.retain(|&(t, _), _| t != task_id);
         // GVA encode cache retained until Unmap of that range.
@@ -3297,6 +3319,13 @@ impl DeviceState {
         // HostOps views we held (does not touch host_gva_surfaces encode).
         // Runtime flushes retired_views via HostOps::unmap_pages.
         self.retire_task_gva_views(task_id);
+        #[cfg(feature = "backend-vulkan")]
+        {
+            self.retired_guest_write_tokens
+                .extend(self.gva_store_witness.retire_task(task_id));
+            self.retired_guest_write_tokens
+                .extend(self.gather_witness.retire_task(task_id));
+        }
         // The two observation ledgers keyed by task id go with it, exactly as
         // they do on a redefine. Both were reachable only through `define_task`
         // before, which cleaned them up whenever an id came back — so a task the
@@ -3440,6 +3469,82 @@ impl DeviceState {
         }
     }
 
+    /// Bump [`MappingEntry::page_generation`] (never 0 after first bump).
+    ///
+    /// This is deliberately separate from [`Self::bump_map_generation`]: the
+    /// current physical backing of a live resource may change without creating
+    /// a new resource incarnation.
+    pub fn bump_page_generation(e: &mut MappingEntry) {
+        e.page_generation = e.page_generation.wrapping_add(1);
+        if e.page_generation == 0 {
+            e.page_generation = 1;
+        }
+    }
+
+    /// Adopt a freshly walked physical backing for the same logical resource.
+    ///
+    /// Resource synchronization addresses the resource and resolves its current
+    /// backing. Accordingly this replaces only the page-list incarnation: GPU
+    /// residents and deferred content remain keyed by `map_generation`, while
+    /// every host object bound to the old physical pages is retired here.
+    pub fn refresh_mapping_pages(&mut self, mapping_id: u32, entries: Vec<u32>) -> bool {
+        let Some(e) = self.mappings.get_mut(&mapping_id) else {
+            return false;
+        };
+        if entries.is_empty() || e.page_entries == entries {
+            return false;
+        }
+        e.page_entries = entries;
+        e.condemned_entries = None;
+        Self::bump_page_generation(e);
+        let (retired, retired_import) = Self::take_mapping_view(e);
+        let retired_token = Self::take_guest_write_token(e);
+        if let Some(view) = retired {
+            self.retired_views.push(view);
+        }
+        if let Some(import) = retired_import {
+            self.retired_guest_imports.push(import);
+        }
+        if retired_token != 0 {
+            self.retired_guest_write_tokens.push(retired_token);
+        }
+        #[cfg(feature = "backend-vulkan")]
+        self.retire_mapping_gather_witness(mapping_id);
+        true
+    }
+
+    /// Forget an unresolved physical backing without ending the resource.
+    ///
+    /// A failed current-backing walk proves that the cached pages are unsafe;
+    /// it does not prove that the resource object was destroyed. Keep logical
+    /// content keyed by `map_generation`, but make every page-bound access
+    /// re-resolve before it can proceed.
+    pub fn forget_mapping_page_backing(&mut self, mapping_id: u32) -> bool {
+        let Some(e) = self.mappings.get_mut(&mapping_id) else {
+            return false;
+        };
+        let had = !e.page_entries.is_empty() || e.contig_ptr != 0;
+        e.page_entries.clear();
+        e.page_table_kva = 0;
+        e.condemned_entries = None;
+        e.type4_walk = None;
+        Self::bump_page_generation(e);
+        let (retired, retired_import) = Self::take_mapping_view(e);
+        let retired_token = Self::take_guest_write_token(e);
+        if let Some(view) = retired {
+            self.retired_views.push(view);
+        }
+        if let Some(import) = retired_import {
+            self.retired_guest_imports.push(import);
+        }
+        if retired_token != 0 {
+            self.retired_guest_write_tokens.push(retired_token);
+        }
+        #[cfg(feature = "backend-vulkan")]
+        self.retire_mapping_gather_witness(mapping_id);
+        had
+    }
+
     /// Drop compute storage-residency mirror entries whose byte window
     /// `[surface_offset, span_end)` intersects a guest write of
     /// `[lo, hi)` on this mapping. The mirror claims "guest pages still hold
@@ -3491,6 +3596,7 @@ impl DeviceState {
         e.page_table_kva = 0;
         e.condemned_entries = None;
         Self::bump_map_generation(e);
+        Self::bump_page_generation(e);
         let (retired, retired_import) = Self::take_mapping_view(e);
         let retired_token = Self::take_guest_write_token(e);
         if let Some(v) = retired {
@@ -3502,6 +3608,8 @@ impl DeviceState {
         if retired_token != 0 {
             self.retired_guest_write_tokens.push(retired_token);
         }
+        #[cfg(feature = "backend-vulkan")]
+        self.retire_mapping_gather_witness(mapping_id);
         had
     }
 
@@ -3524,6 +3632,7 @@ impl DeviceState {
             return false;
         }
         e.condemned_entries = Some(std::mem::take(&mut e.page_entries));
+        Self::bump_page_generation(e);
         e.page_table_kva = 0;
         let (retired, retired_import) = Self::take_mapping_view(e);
         let retired_token = Self::take_guest_write_token(e);
@@ -3536,6 +3645,8 @@ impl DeviceState {
         if retired_token != 0 {
             self.retired_guest_write_tokens.push(retired_token);
         }
+        #[cfg(feature = "backend-vulkan")]
+        self.retire_mapping_gather_witness(mapping_id);
         true
     }
 
@@ -3571,6 +3682,7 @@ impl DeviceState {
         } else {
             e.page_entries.clear();
         }
+        Self::bump_page_generation(e);
         e.page_table_kva = 0;
         e.device_desc.clear();
         e.content_generation = 0;
@@ -3590,6 +3702,8 @@ impl DeviceState {
         if retired_token != 0 {
             self.retired_guest_write_tokens.push(retired_token);
         }
+        #[cfg(feature = "backend-vulkan")]
+        self.retire_mapping_gather_witness(mapping_id);
         // Fresh MAP: prior host-cache for this surface_id is stale, and so is
         // any present evidence — the slot may hold a NEW surface.
         self.host_surfaces.remove(&mapping_id);
@@ -3617,6 +3731,7 @@ impl DeviceState {
             e.mapping_internal = 0;
             e.device_desc.clear();
             Self::bump_map_generation(e);
+            Self::bump_page_generation(e);
             e.has_geom = false;
             e.width = 0;
             e.height = 0;
@@ -3632,6 +3747,8 @@ impl DeviceState {
             if retired_token != 0 {
                 self.retired_guest_write_tokens.push(retired_token);
             }
+            #[cfg(feature = "backend-vulkan")]
+            self.retire_mapping_gather_witness(mapping_id);
             self.host_surfaces.remove(&mapping_id);
             true
         } else {
@@ -3669,6 +3786,7 @@ impl DeviceState {
         e.content_generation = 0;
         e.surface_content_epoch = 0;
         Self::bump_map_generation(e);
+        Self::bump_page_generation(e);
         // New MappingInternal ⇒ new surface; force device-desc re-resolve.
         e.has_geom = false;
         e.width = 0;
@@ -3685,6 +3803,8 @@ impl DeviceState {
         if retired_token != 0 {
             self.retired_guest_write_tokens.push(retired_token);
         }
+        #[cfg(feature = "backend-vulkan")]
+        self.retire_mapping_gather_witness(mapping_id);
         // New MappingInternal ⇒ new surface, and the `bump_map_generation`
         // above is what retires the stale present evidence: it is stamped with
         // the incarnation that recorded it, so the recycled slot cannot inherit

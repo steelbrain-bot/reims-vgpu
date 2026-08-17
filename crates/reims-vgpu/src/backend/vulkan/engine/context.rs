@@ -3,10 +3,8 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use ash::vk;
-use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
 
 use super::counters::EngineCounters;
 use super::device_lost::DeviceLostDecline;
@@ -524,7 +522,6 @@ pub(crate) struct DeviceContext {
     /// Per-format/usage answers for explicit linear external-image layout.
     /// Physical-device support is immutable, while target identities churn, so
     /// the query belongs to the device lifetime rather than each image lifetime.
-    pub explicit_linear_support: Mutex<HashMap<(i32, u32), bool>>,
     /// Combined depth-stencil format supported for DEPTH_STENCIL_ATTACHMENT on
     /// this device (D32_SFLOAT_S8_UINT preferred, D24_UNORM_S8_UINT fallback).
     /// Used only by the stencil-test path; depth-only uses D32_SFLOAT.
@@ -1005,6 +1002,7 @@ impl DeviceContext {
         // asking for a feature a device declined fails `vkCreateDevice`.
         let mut en_image_robustness = features.enabled_image_robustness();
         let mut en_attachment_feedback = features.enabled_attachment_feedback_loop_layout();
+        let mut en_linear_color_attachment = features.enabled_linear_color_attachment();
         let mut dci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qci)
             .enabled_features(&enabled)
@@ -1022,6 +1020,9 @@ impl DeviceContext {
         if features.attachment_feedback_loop_layout {
             dci = dci.push_next(&mut en_attachment_feedback);
         }
+        if features.linear_color_attachment.is_available() {
+            dci = dci.push_next(&mut en_linear_color_attachment);
+        }
         let device = instance
             .create_device(pd, &dci, None)
             .map_err(|result| DrawError::Init(InitDecline::CreateDevice { result }))?;
@@ -1038,23 +1039,22 @@ impl DeviceContext {
         // One region per ring slot, for the reason `TimestampProbe`'s doc gives:
         // the guest-page writeback submits without waiting, so two of its copies
         // can be in flight at once and a shared region is reset under the first.
-        let timestamps = scale
-            .and_then(|scale| {
-                let ci = vk::QueryPoolCreateInfo::default()
-                    .query_type(vk::QueryType::TIMESTAMP)
-                    .query_count(TimestampProbe::PER_SLOT * super::pools::RING_DEPTH as u32);
-                device
-                    .create_query_pool(&ci, None)
-                    .map(|pool| TimestampProbe { pool, scale })
-                    .map_err(|e| {
-                        crate::observe::Emit::decline(
-                            "vk_timestamp_pool",
-                            &VkCall::new(VkOp::ContextCreateQueryPool, e),
-                        )
-                        .fail_once(0);
-                    })
-                    .ok()
-            });
+        let timestamps = scale.and_then(|scale| {
+            let ci = vk::QueryPoolCreateInfo::default()
+                .query_type(vk::QueryType::TIMESTAMP)
+                .query_count(TimestampProbe::PER_SLOT * super::pools::RING_DEPTH as u32);
+            device
+                .create_query_pool(&ci, None)
+                .map(|pool| TimestampProbe { pool, scale })
+                .map_err(|e| {
+                    crate::observe::Emit::decline(
+                        "vk_timestamp_pool",
+                        &VkCall::new(VkOp::ContextCreateQueryPool, e),
+                    )
+                    .fail_once(0);
+                })
+                .ok()
+        });
         let draw_spans = scale
             .filter(|_| crate::env::read(crate::env::GPU_SPANS).0 != crate::env::Switch::Off)
             .and_then(|scale| {
@@ -1148,11 +1148,6 @@ impl DeviceContext {
         // Reported and never branched on — see the module doc for why a positive
         // answer here is necessary and not sufficient.
         crate::backend::vulkan::caps::linear_sampled::report(&instance, pd);
-        // Whether a resident colour image can use imported guest storage as
-        // its backing. Like the sampled report, this is necessary but not
-        // sufficient: alias stability, memory requirements and row pitch are
-        // per-target questions.
-        crate::backend::vulkan::caps::linear_target::report(&instance, pd);
         // Fine-grained capabilities that do change what a draw can express.
         crate::observe::off(format!(
             "vk_device_select name={device_name:?} type={:?} depth_stencil_format={:?} bgra_storage_composite={} compute_capable={} quirks_no_deferred_batching={} quirks_guest_pages_authoritative={}",
@@ -1240,7 +1235,6 @@ impl DeviceContext {
             max_sampler_anisotropy: features.max_sampler_anisotropy,
             sampler_anisotropy: features.sampler_anisotropy,
             features,
-            explicit_linear_support: Mutex::new(HashMap::new()),
             depth_stencil_format,
             timestamps,
             draw_spans,
@@ -1484,13 +1478,16 @@ impl DeviceContext {
         &self,
         command_buffers: &[vk::CommandBuffer],
         fence: vk::Fence,
-    ) -> Result<(), vk::Result> {
+    ) -> Result<Option<u64>, vk::Result> {
         let timeline = self
             .stamp_completion
             .as_ref()
             .map(|completion| completion.reserve_submission());
+        let timeline_value = timeline.as_ref().map(|(_, value, _)| *value);
         if let Some(owner) = self.queue_owner.as_ref() {
-            return owner.submit_sync(command_buffers, fence, timeline);
+            return owner
+                .submit_sync(command_buffers, fence, timeline)
+                .map(|()| timeline_value);
         }
         unsafe { self.submit_guest_work_reserved(command_buffers, fence, timeline) }
     }
@@ -1502,15 +1499,18 @@ impl DeviceContext {
         &self,
         command_buffers: &[vk::CommandBuffer],
         fence: vk::Fence,
-    ) -> Result<(), vk::Result> {
+    ) -> Result<Option<u64>, vk::Result> {
         let timeline = self
             .stamp_completion
             .as_ref()
             .map(|completion| completion.reserve_submission());
+        let timeline_value = timeline.as_ref().map(|(_, value, _)| *value);
         let Some(owner) = self.queue_owner.as_ref() else {
             return unsafe { self.submit_guest_work_reserved(command_buffers, fence, timeline) };
         };
-        owner.submit_async(command_buffers, fence, timeline)
+        owner
+            .submit_async(command_buffers, fence, timeline)
+            .map(|()| timeline_value)
     }
 
     unsafe fn submit_guest_work_reserved(
@@ -1518,10 +1518,11 @@ impl DeviceContext {
         command_buffers: &[vk::CommandBuffer],
         fence: vk::Fence,
         timeline: Option<(vk::Semaphore, u64, super::stamp_completion::SubmissionNote)>,
-    ) -> Result<(), vk::Result> {
+    ) -> Result<Option<u64>, vk::Result> {
         let plain = vk::SubmitInfo::default().command_buffers(command_buffers);
         let Some((semaphore, value, note)) = timeline else {
-            return unsafe { self.device.queue_submit(self.queue(), &[plain], fence) };
+            unsafe { self.device.queue_submit(self.queue(), &[plain], fence) }?;
+            return Ok(None);
         };
         let semaphores = [semaphore];
         let values = [value];
@@ -1533,7 +1534,7 @@ impl DeviceContext {
             .push_next(&mut timeline_info);
         unsafe { self.device.queue_submit(self.queue(), &[info], fence) }?;
         note.submitted(value);
-        Ok(())
+        Ok(Some(value))
     }
 
     pub(crate) fn queue_failure(&self) -> Option<vk::Result> {
@@ -1599,7 +1600,10 @@ impl DeviceContext {
             .wait_dst_stage_mask(transaction.wait_stages)
             .command_buffers(transaction.command_buffers)
             .signal_semaphores(transaction.signal_semaphores);
-        unsafe { self.device.queue_submit(self.queue(), &[info], transaction.fence) }?;
+        unsafe {
+            self.device
+                .queue_submit(self.queue(), &[info], transaction.fence)
+        }?;
         let waits = [transaction.present_wait];
         let swapchains = [transaction.swapchain];
         let indices = [transaction.image_index];

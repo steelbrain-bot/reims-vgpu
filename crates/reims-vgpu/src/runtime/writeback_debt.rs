@@ -42,20 +42,8 @@
 //! invalidation, task retirement, and generation movement release the same
 //! ownership without inventing a guest write.
 //!
-//! [`MAX_DEBTS`] bounds only anonymous type-11 surface debts. GVA resource
-//! lifetime is explicit — resource discard/delete and task teardown — so an
-//! unrelated capacity limit must not invent an early synchronization point.
-
 use crate::model::DeviceState;
 use crate::runtime::host::{HostMemory, HostOps};
-
-/// Debts held at once, before an arm pays the oldest to make room.
-///
-/// This is the existing measured ceiling for the ledger, now shared by both
-/// backing representations rather than duplicated per representation. An
-/// insertion past it pays the oldest frame, so the bound can cost coalescing but
-/// cannot lose pixels. `wbdebt_evicted` reports when a workload reaches it.
-pub const MAX_DEBTS: usize = 32;
 
 /// The engine identity of the resident a debt's frame lives in.
 ///
@@ -141,7 +129,7 @@ pub struct WritebackDebt {
     /// registered its resident under — it stamps that identity's content epoch
     /// one statement earlier — and the two are not the same key when the
     /// mapping's generation moved between the draw and the Store. A driven boot
-    /// under `REIMS_VGPU_SHARED_TARGET=off` read
+    /// of the copied-resident route read
     /// `read_target_unknown_identity diverges=generation asked_gen=N held_gen=N-1`
     /// on three of four mappings, and the frame was refused with the resident
     /// holding it sitting in the registry.
@@ -226,8 +214,7 @@ impl GvaResourceKey {
 /// A frame held only by a GVA target's engine-resident image.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GvaWritebackDebt {
-    pub gva: u64,
-    pub row_stride: u32,
+    pub linear: crate::runtime::draw::LinearColorTarget,
     pub width: u32,
     pub height: u32,
     pub format: u16,
@@ -252,12 +239,6 @@ struct GvaResourceState {
     generation: u64,
     span: u64,
     pages: Option<std::sync::Arc<[u64]>>,
-}
-
-/// One entry in the bounded ledger, irrespective of backing kind.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum WritebackKey {
-    Mapping(u32),
 }
 
 /// Every render resource whose current frame exists only in a host resident.
@@ -304,27 +285,12 @@ impl PendingWritebacks {
         all.into_iter().map(|(_, id)| id).collect()
     }
 
-    /// The surface mapping whose debt has been owed longest.
-    fn oldest(&self) -> Option<WritebackKey> {
-        self.debts
-            .iter()
-            .min_by_key(|(_, d)| d.seq)
-            .map(|(id, _)| WritebackKey::Mapping(*id))
-    }
-
-    /// Record that `mapping_id` is owed a frame, returning the mapping whose
-    /// debt the caller must pay to bring the ledger back under [`MAX_DEBTS`] —
-    /// `None` in the ordinary case.
+    /// Record that `mapping_id` is owed a frame.
     ///
     /// A mapping already owed a frame is *replaced*: the later frame is the
     /// fresher answer and the earlier one has been superseded on the GPU
     /// already. That replacement is the whole saving, so it is counted.
     ///
-    /// The over-full entry is left in the ledger and handed back by name rather
-    /// than removed here, so [`PendingWritebacks::take`] stays the only way a
-    /// debt leaves — a removal that is not a payment is a frame the guest asked
-    /// for and never received.
-    #[must_use = "an evicted mapping still owes a frame and the caller must pay it"]
     pub fn arm(
         &mut self,
         mapping_id: u32,
@@ -332,11 +298,7 @@ impl PendingWritebacks {
         width: u32,
         height: u32,
         map_generation: u32,
-    ) -> Option<WritebackKey> {
-        let evict = match self.debts.len() >= MAX_DEBTS && !self.debts.contains_key(&mapping_id) {
-            true => self.oldest(),
-            false => None,
-        };
+    ) {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
         let previous = self.debts.insert(
@@ -353,7 +315,6 @@ impl PendingWritebacks {
             crate::runtime::drain::note_store_route("wbdebt_superseded");
         }
         crate::runtime::drain::note_store_route("wbdebt_armed");
-        evict
     }
 
     /// Record a host-authoritative frame for one plane of a GVA resource.
@@ -374,7 +335,9 @@ impl PendingWritebacks {
     ) -> Option<GvaWritebackDebt> {
         debt.seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
-        let previous = self.gva_debts.insert(key.plane(debt.gva), debt);
+        let previous = self
+            .gva_debts
+            .insert(key.plane(debt.linear.target_gva()), debt);
         if previous.is_some() {
             crate::runtime::drain::note_store_route("gvadebt_superseded");
         }
@@ -628,7 +591,7 @@ impl PendingWritebacks {
         self.gva_debts
             .iter()
             .find(|(_, debt)| {
-                debt.gva == gva
+                debt.linear.target_gva() == gva
                     && debt.width == width
                     && debt.height == height
                     && debt.generation == generation
@@ -877,11 +840,12 @@ pub fn pay_for_texture<M: HostMemory + HostOps>(
         // The split is emitted beside the total, so
         // `_resolved + _unresolved == wbdebt_texture_owes_nothing` is checkable
         // on the census itself.
-        crate::runtime::drain::note_store_route(match state.names_live_mapping(task_id, texture_ref)
-        {
-            true => "wbdebt_texture_owes_nothing_resolved",
-            false => "wbdebt_texture_owes_nothing_unresolved",
-        });
+        crate::runtime::drain::note_store_route(
+            match state.names_live_mapping(task_id, texture_ref) {
+                true => "wbdebt_texture_owes_nothing_resolved",
+                false => "wbdebt_texture_owes_nothing_unresolved",
+            },
+        );
         crate::runtime::drain::note_store_route("wbdebt_texture_owes_nothing");
     }
 }
@@ -1071,14 +1035,16 @@ pub fn arm_gva<M: HostMemory + HostOps>(
     // linear byte cache can otherwise sit above the guest-page reader and serve
     // the frame that preceded this Store indefinitely.
     state.invalidate_object_host_copies(task_id, c0.texture_ref);
-    crate::runtime::surface_cache::evict_gva(state, c0.target_gva);
+    crate::runtime::surface_cache::evict_gva(state, c0.target_gva());
     let key = GvaResourceKey {
         task_id,
         texture_ref: c0.texture_ref,
     };
+    let Some(linear) = c0.linear_target().copied() else {
+        return false;
+    };
     let debt = GvaWritebackDebt {
-        gva: c0.target_gva,
-        row_stride: c0.row_stride,
+        linear,
         width: c0.width,
         height: c0.height,
         format: c0.format,
@@ -1157,7 +1123,7 @@ pub fn discard_gva_resources(state: &mut DeviceState, task_id: u32, object_ids: 
 
 #[cfg(feature = "backend-vulkan")]
 fn same_gva_identity(a: GvaWritebackDebt, b: GvaWritebackDebt) -> bool {
-    a.gva == b.gva
+    a.linear.target_gva() == b.linear.target_gva()
         && a.width == b.width
         && a.height == b.height
         && a.generation == b.generation
@@ -1176,7 +1142,7 @@ pub(crate) fn gva_identity(
     debt: GvaWritebackDebt,
 ) -> crate::backend::vulkan::engine::TargetIdentity {
     crate::backend::vulkan::engine::TargetIdentity::Gva {
-        gva: debt.gva,
+        gva: debt.linear.target_gva(),
         width: debt.width,
         height: debt.height,
         generation: debt.generation,
@@ -1187,22 +1153,6 @@ pub(crate) fn gva_identity(
 #[cfg(feature = "backend-vulkan")]
 fn release_gva(debt: GvaWritebackDebt) {
     crate::backend::vulkan::engine::note_resident_content_copied_out(&gva_identity(debt));
-}
-
-#[cfg(feature = "backend-vulkan")]
-pub(crate) fn pay_key<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    key: WritebackKey,
-) -> bool {
-    match key {
-        WritebackKey::Mapping(mapping_id) => {
-            if let Some(debt) = state.pending_writebacks.take(mapping_id) {
-                pay(state, host, mapping_id, debt, "wbdebt_paid_evicted");
-            }
-            true
-        }
-    }
 }
 
 /// Pay `mapping_id`'s owed frame and then wait for every submitted guest-page
@@ -1336,8 +1286,9 @@ pub fn settle_for_texture<M: HostMemory + HostOps>(
     let (tasks, page_shift, page_size) = (&state.tasks, state.page_shift, state.page_size());
     crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(site, || {
         let want = reims_vgpu_paging::span::pages_spanned(gva, span, page_size);
-        let gpas =
-            crate::runtime::gva_mem::task_gva_page_gpas(host, tasks, task_id, gva, span, page_shift);
+        let gpas = crate::runtime::gva_mem::task_gva_page_gpas(
+            host, tasks, task_id, gva, span, page_shift,
+        );
         (gpas.len() as u64 == want).then_some(gpas)
     });
 }
@@ -1405,7 +1356,6 @@ pub fn submit_for_resources<M: HostMemory + HostOps>(
         pay_for_texture(state, host, task_id, object_id);
     }
 }
-
 
 /// Run the Store the debt stands for, now.
 ///
@@ -1511,7 +1461,7 @@ fn pay_gva<M: HostMemory + HostOps>(
         release_gva(debt);
         return true;
     }
-    let Some(span) = u64::from(debt.row_stride).checked_mul(u64::from(debt.height)) else {
+    let Some(span) = u64::from(debt.linear.row_stride).checked_mul(u64::from(debt.height)) else {
         crate::observe::fail(format!(
             "gvadebt_pay_lost task={} texture={} reason=span_overflow",
             key.task_id, key.texture_ref
@@ -1555,8 +1505,7 @@ fn pay_gva<M: HostMemory + HostOps>(
     let pages = crate::runtime::draw::StoreTargetPages::from_ordered(&ordered, span);
     let request = crate::runtime::draw::ColorRtRequest {
         texture_ref: key.texture_ref,
-        target_gva: debt.gva,
-        row_stride: debt.row_stride,
+        storage: crate::runtime::draw::ColorTargetStorage::Linear(debt.linear),
         width: debt.width,
         height: debt.height,
         format: debt.format,
@@ -1630,8 +1579,8 @@ mod tests {
     /// The ledger hands back the resident the frame is **in**, verbatim, even
     /// when the mapping's own generation has moved past it.
     ///
-    /// This is the defect that lost every Apple Maps frame under
-    /// `REIMS_VGPU_SHARED_TARGET=off`, and it is the whole of it: `pay` rebuilt
+    /// This is the defect that lost every Apple Maps frame on the
+    /// copied-resident route, and it is the whole of it: `pay` rebuilt
     /// the identity from `present_identity::surface_identity`, which reads the
     /// mapping's generation *now*, while the draw had registered its resident
     /// under the generation current when the stream started. A driven boot read
@@ -1647,7 +1596,7 @@ mod tests {
     fn a_debt_remembers_the_resident_it_was_armed_with_and_not_the_mapping() {
         let mut pending = PendingWritebacks::default();
         let resident = ident(7, 1920, 1080, 8);
-        assert_eq!(pending.arm(7, resident.clone(), 1920, 1080, 9), None);
+        pending.arm(7, resident.clone(), 1920, 1080, 9);
         let debt = pending.take(7).expect("the debt was armed");
         assert_eq!(
             debt.identity, resident,
@@ -1667,8 +1616,8 @@ mod tests {
     #[test]
     fn a_second_arm_into_one_mapping_replaces_the_first() {
         let mut pending = PendingWritebacks::default();
-        assert_eq!(pending.arm(7, ident(7, 1920, 1080, 3), 1920, 1080, 3), None);
-        assert_eq!(pending.arm(7, ident(7, 1920, 1080, 3), 1920, 1080, 3), None);
+        pending.arm(7, ident(7, 1920, 1080, 3), 1920, 1080, 3);
+        pending.arm(7, ident(7, 1920, 1080, 3), 1920, 1080, 3);
         assert_eq!(pending.len(), 1, "one mapping owes one frame");
         let debt = pending.take(7).expect("mapping 7 owes a frame");
         assert_eq!(debt.seq, 1, "the later Store is the one owed");
@@ -1681,7 +1630,7 @@ mod tests {
     #[test]
     fn a_debt_carries_the_geometry_its_store_was_taken_at() {
         let mut pending = PendingWritebacks::default();
-        assert_eq!(pending.arm(4, ident(4, 800, 600, 11), 800, 600, 11), None);
+        pending.arm(4, ident(4, 800, 600, 11), 800, 600, 11);
         let debt = pending.get(4).expect("mapping 4 owes a frame");
         assert_eq!(
             (debt.width, debt.height, debt.map_generation),
@@ -1689,47 +1638,25 @@ mod tests {
         );
     }
 
-    /// The bound is the container's, and it hands the caller the mapping that
-    /// has to be paid rather than dropping a frame to stay under it.
+    /// Debt lifetime follows the resource, not an arbitrary container size.
     #[test]
-    fn arming_past_the_bound_evicts_the_oldest_and_says_so() {
+    fn surface_debts_are_not_evicted_by_capacity() {
         let mut pending = PendingWritebacks::default();
-        for id in 0..MAX_DEBTS as u32 {
-            assert_eq!(pending.arm(id, ident(id, 64, 64, 1), 64, 64, 1), None, "under the bound");
+        const DISTINCT_RESOURCES: u32 = 64;
+        for id in 0..DISTINCT_RESOURCES {
+            pending.arm(id, ident(id, 64, 64, 1), 64, 64, 1);
         }
-        assert_eq!(pending.len(), MAX_DEBTS);
-        let evicted = pending.arm(MAX_DEBTS as u32, ident(MAX_DEBTS as u32, 64, 64, 1), 64, 64, 1);
-        assert_eq!(
-            evicted,
-            Some(WritebackKey::Mapping(0)),
-            "the oldest arm is the one handed back"
+        assert_eq!(pending.len(), DISTINCT_RESOURCES as usize);
+        assert!(
+            (0..DISTINCT_RESOURCES).all(|id| pending.get(id).is_some()),
+            "every live resource keeps its host-authoritative frame"
         );
+        pending.arm(0, ident(0, 64, 64, 1), 64, 64, 1);
         assert_eq!(
             pending.len(),
-            MAX_DEBTS + 1,
-            "the named debt is still owed until the caller pays it"
+            DISTINCT_RESOURCES as usize,
+            "re-arming replaces only that resource's prior frame"
         );
-        assert!(
-            pending.take(0).is_some(),
-            "and paying it is what brings the ledger back under the bound"
-        );
-        assert_eq!(pending.len(), MAX_DEBTS);
-    }
-
-    /// Re-arming a mapping already at the head of a full ledger must not evict:
-    /// it is a replacement and the entry count does not grow.
-    #[test]
-    fn re_arming_a_held_mapping_never_evicts() {
-        let mut pending = PendingWritebacks::default();
-        for id in 0..MAX_DEBTS as u32 {
-            assert_eq!(pending.arm(id, ident(id, 64, 64, 1), 64, 64, 1), None);
-        }
-        assert_eq!(
-            pending.arm(0, ident(0, 64, 64, 1), 64, 64, 1),
-            None,
-            "a replacement makes no room"
-        );
-        assert_eq!(pending.len(), MAX_DEBTS);
     }
 
     /// Age order is arm order and not mapping id, because `pay_all` walks it and
@@ -1737,16 +1664,20 @@ mod tests {
     #[test]
     fn mappings_come_back_in_arm_order() {
         let mut pending = PendingWritebacks::default();
-        assert_eq!(pending.arm(9, ident(9, 1, 1, 1), 1, 1, 1), None);
-        assert_eq!(pending.arm(2, ident(2, 1, 1, 1), 1, 1, 1), None);
-        assert_eq!(pending.arm(5, ident(5, 1, 1, 1), 1, 1, 1), None);
+        pending.arm(9, ident(9, 1, 1, 1), 1, 1, 1);
+        pending.arm(2, ident(2, 1, 1, 1), 1, 1, 1);
+        pending.arm(5, ident(5, 1, 1, 1), 1, 1, 1);
         assert_eq!(pending.mappings_by_age(), vec![9, 2, 5]);
     }
 
     fn gva_debt(generation: u64) -> GvaWritebackDebt {
         GvaWritebackDebt {
-            gva: 0x4000,
-            row_stride: 256,
+            linear: crate::runtime::draw::LinearColorTarget {
+                allocation_gva: 0x4000,
+                allocation_size: 64 * 256,
+                plane_offset: 0,
+                row_stride: 256,
+            },
             width: 64,
             height: 64,
             format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
@@ -1774,12 +1705,11 @@ mod tests {
     }
 
     /// GVA resources have protocol lifetime, not an arbitrary ledger capacity.
-    /// Holding more than the anonymous-surface coalescing bound must not invent
-    /// a transfer or drop an older resource's host-authoritative frame.
     #[test]
-    fn gva_resources_are_not_evicted_by_the_surface_debt_bound() {
+    fn gva_debts_are_not_evicted_by_capacity() {
         let mut pending = PendingWritebacks::default();
-        for texture_ref in 1..=(MAX_DEBTS as u32 + 8) {
+        const DISTINCT_RESOURCES: u32 = 64;
+        for texture_ref in 1..=DISTINCT_RESOURCES {
             let key = GvaResourceKey {
                 task_id: 2,
                 texture_ref,
@@ -1792,8 +1722,8 @@ mod tests {
             );
             assert_eq!(pending.arm_gva(key, gva_debt(texture_ref.into())), None);
         }
-        assert_eq!(pending.len(), MAX_DEBTS + 8);
-        assert_eq!(pending.gvas_by_age().len(), MAX_DEBTS + 8);
+        assert_eq!(pending.len(), DISTINCT_RESOURCES as usize);
+        assert_eq!(pending.gvas_by_age().len(), DISTINCT_RESOURCES as usize);
     }
 
     /// Ordinary virtual-memory bookkeeping does not retarget a live resource.
@@ -1916,14 +1846,18 @@ mod tests {
 
         for (i, &(gva, _)) in levels.iter().enumerate() {
             let mut debt = gva_debt(generations[i]);
-            debt.gva = gva;
+            debt.linear.allocation_gva = gva;
             assert_eq!(
                 pending.arm_gva(key, debt),
                 None,
                 "arming one level must not supersede another"
             );
         }
-        assert_eq!(pending.take_gva(key).len(), 3, "the resource owes all three");
+        assert_eq!(
+            pending.take_gva(key).len(),
+            3,
+            "the resource owes all three"
+        );
     }
 
     /// A guest validity transition after the Store makes guest memory newer
@@ -1980,10 +1914,9 @@ mod tests {
         // The ledger has to be non-empty or `pay_for_texture` returns at its
         // emptiness check and neither counter is reached. Mapping 7 owes; the
         // three references below are about other surfaces.
-        assert_eq!(
-            state.pending_writebacks.arm(7, ident(7, 64, 64, 1), 64, 64, 1),
-            None
-        );
+        state
+            .pending_writebacks
+            .arm(7, ident(7, 64, 64, 1), 64, 64, 1);
         // Reference 21 names mapping 9 through the per-task registration, and
         // this device holds mapping 9. It owes nothing.
         state.mappings.entry(9).or_default().mapped = true;
@@ -2036,8 +1969,12 @@ mod tests {
     fn asynchronous_resource_synchronization_submits_only_named_objects() {
         let mut state = DeviceState::new(crate::model::DeviceId::default(), 12);
         let mut host = crate::runtime::FakeHost::new();
-        assert_eq!(state.pending_writebacks.arm(7, ident(7, 64, 64, 1), 64, 64, 1), None);
-        assert_eq!(state.pending_writebacks.arm(8, ident(8, 64, 64, 1), 64, 64, 1), None);
+        state
+            .pending_writebacks
+            .arm(7, ident(7, 64, 64, 1), 64, 64, 1);
+        state
+            .pending_writebacks
+            .arm(8, ident(8, 64, 64, 1), 64, 64, 1);
         submit_for_resources(&mut state, &mut host, 1, &[7]);
         assert!(state.pending_writebacks.get(7).is_none());
         assert!(state.pending_writebacks.get(8).is_some());

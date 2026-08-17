@@ -1031,13 +1031,22 @@ impl StampLedger {
         if self.owed.get(&slot).is_some_and(|v| wait.satisfied_by(*v)) {
             return UnmetSource::Coalesced;
         }
-        if self.written.get(&slot).is_some_and(|v| wait.satisfied_by(*v)) {
+        if self
+            .written
+            .get(&slot)
+            .is_some_and(|v| wait.satisfied_by(*v))
+        {
             return UnmetSource::Queued;
         }
         UnmetSource::Absent
     }
 
-    fn fold(map: &mut std::collections::BTreeMap<u32, u32>, slot: u32, value: u32, page_bytes: u64) {
+    fn fold(
+        map: &mut std::collections::BTreeMap<u32, u32>,
+        slot: u32,
+        value: u32,
+        page_bytes: u64,
+    ) {
         let slot = stamp_slot_index(slot);
         if stamp_slot_offset(slot, page_bytes).is_none() {
             return;
@@ -2907,8 +2916,20 @@ fn fill_display_descriptor<H: HostMemory + HostOps>(
     let (height_f32, height_mm) = display_dimension_mm(DISPLAY_HEIGHT_MM);
     shared_w16(host, gpa, DISPLAY_DESC_WIDTH_MM, width_mm, psz);
     shared_w16(host, gpa, DISPLAY_DESC_HEIGHT_MM, height_mm, psz);
-    shared_w32(host, gpa, DISPLAY_DESC_WIDTH_MM_F32, width_f32.to_bits(), psz);
-    shared_w32(host, gpa, DISPLAY_DESC_HEIGHT_MM_F32, height_f32.to_bits(), psz);
+    shared_w32(
+        host,
+        gpa,
+        DISPLAY_DESC_WIDTH_MM_F32,
+        width_f32.to_bits(),
+        psz,
+    );
+    shared_w32(
+        host,
+        gpa,
+        DISPLAY_DESC_HEIGHT_MM_F32,
+        height_f32.to_bits(),
+        psz,
+    );
     shared_w32(host, gpa, DISPLAY_DESC_FEATURES, 0, psz);
 
     // HW cursor capability so the guest doorbells glyph/show/move.
@@ -3803,8 +3824,10 @@ fn apply_map_family<H: HostMemory + HostOps>(
     // it: the guest is waiting on the stamp, and a lifecycle event this
     // device chose not to act on is still an event the guest performed.
     //
-    // Live MapMemory2 plen=20 layout lead (not yet contract-final):
-    //   task_id@0 u32, gva@4 u64, length@12 u64  (matches fifo MapMemoryCommand).
+    // MapMemory2 and UnmapMemory share the exact 20-byte payload:
+    // task_id@0 u32, gva@4 u64, length@12 u64. The task selects the address
+    // space; the other two fields are forwarded unchanged as the task-relative
+    // range to map or unmap.
     let plen = packet.payload.len();
     let name = family.name();
     if matches!(family, MapFamily::MapMemory2 | MapFamily::UnmapMemory) && plen >= 20 {
@@ -3909,23 +3932,13 @@ fn apply_map_family<H: HostMemory + HostOps>(
                 ));
             }
         }
-        // RE (AppleParavirtMemoryMap): Unmap/Map only mutate the **task
-        // page table** then notify — wire has no PPNs. Guest order is
-        // deallocate/allocate **then** FIFO, so:
-        // - Unmap notify: PTEs already gone → cannot GVA-write; retain
-        //   host_gva_surfaces for sample (wallpaper wipe class).
-        // - Map notify: PTEs already live → flush host_gva encode into
-        //   **new** PFNs (not invent PTEs; not invent geom). Discrete
-        //   type-2/3 content may live only in host_cache until this.
-        // Samples still prefer host_cache GVA key on Load.
-        //
-        // HostOps **views** (gva_host_views) are the opposite of encode
-        // cache: they alias the pages that were in the GPU PT. On Unmap
-        // those pages are no longer mapped for the GPU — drop any host
-        // view covering the range (Apple unmapMemory analogue). On Map
-        // the PFNs may have changed under the same GVA — drop stale
-        // views so the next ensure_gva_view re-walks. Does not invent
-        // PTEs and does not destroy host_gva_surfaces content.
+        // Map and unmap mutate the task page table before notifying the device;
+        // the wire range carries no physical-page list. Host views therefore
+        // cease to name authoritative pages at either notification: an unmap
+        // removed them, while a map may have installed different pages under
+        // the same GVA. Retire overlapping views so the next use resolves the
+        // task page table again. The content cache is independent of those
+        // aliases and remains available to satisfy later Loads.
         if gva != 0 && length != 0 {
             // Held bind resolutions over this range name pages the guest
             // has just remapped. Retired by range, which is exactly what
@@ -3943,21 +3956,10 @@ fn apply_map_family<H: HostMemory + HostOps>(
             };
             crate::runtime::gva_view::log_retire(op, task_id, gva, length, n);
         }
-        // Deferred GVA render-Store windows overlapping the notified
-        // VA range land **cache-only**: on Unmap the PTEs are already
-        // gone; on Map the PFNs are fresh and the map-notify guest
-        // flush is forbidden (PTE-corruption class). The encode cache
-        // preserves the content for samples (wallpaper-retain).
-        // There is deliberately no host_cache→guest GVA flush on
-        // MapMemory2. One existed and was disabled after
-        // serial-20260714-035023: PTE Corruption (freelist-shaped
-        // 0xff100000ff000000) ~135s into boot while it was writing —
-        // one Map of len=0x1c3e000 alone drove 13 GVA rewrites. Samples
-        // use the `host_gva_surfaces` retain on Unmap instead. Any
-        // re-introduction has to be a *narrower* policy than that one
-        // (exact-base only, no multi-key heap maps) and RE-justified, so
-        // the broad implementation is not kept around to be switched
-        // back on. See kb map-memory2 / xnu-pte-corruption-windowserver.
+        // A map notification is not a Store command and does not authorize a
+        // cached surface write into the new mapping. Deferred render Stores
+        // retain their content in the cache until a command names where that
+        // content must be published.
     } else if family == MapFamily::DeleteIOSurfaceBacking2 && plen >= 8 {
         // The live Ventura payload agrees with the resource contract:
         // `{objectID, taskID}`. This is the lifetime
@@ -5040,11 +5042,9 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                     // the latch above until this drain ends. That window is the
                     // only one a repair could shorten.
                     let page_bytes = state.page_size();
-                    state.stamp_ledger.owe(
-                        stamp_index_slot,
-                        packet.completion_stamp,
-                        page_bytes,
-                    );
+                    state
+                        .stamp_ledger
+                        .owe(stamp_index_slot, packet.completion_stamp, page_bytes);
                 } else {
                     let stamp_started = std::time::Instant::now();
                     write_stamp(state, host, stamp_index, packet.completion_stamp);
@@ -5399,10 +5399,10 @@ pub fn signal_display_vbl<H: HostMemory + HostOps>(
 ///   Nothing acts on it; it is what says whether bounding a flush to a damage
 ///   rect could pay, and the answer is a rate against `surface_flush` rather
 ///   than a ratio between the three. See `EngineCounters::note_draw_coverage`.
-/// - `buffer_guest_imports` / `buffer_guest_import_bytes` — vertex and storage
-///   binds pointed straight at the guest's pages, with no copy in either
-///   direction. `buffer_snapshot_binds` is what still had to be gathered, and
-///   the `stage_phase` `runs_*` bars are what that gathering costs.
+/// - `compute_buffer_guest_imports` / `compute_buffer_guest_import_bytes` —
+///   compute storage binds pointed at their retained guest allocation, with no
+///   copy in either direction. Draw buffers are accounted by
+///   `buffer_guest_gathers` and the `stage_phase` `runs_*` CPU fallback bars.
 /// - `ring_retire_blocks` / `target_evicts` — the engine waiting on itself.
 ///
 /// One line per second, one atomic load per field. Emitted from the same window

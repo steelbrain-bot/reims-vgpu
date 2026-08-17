@@ -1548,7 +1548,8 @@ mod wake_tests {
                 backstop = now + ENGINE_WINDOW_REDRAW_BACKSTOP;
             }
         }
-        let backstop_ticks = (second.as_millis() / ENGINE_WINDOW_REDRAW_BACKSTOP.as_millis()) as u32;
+        let backstop_ticks =
+            (second.as_millis() / ENGINE_WINDOW_REDRAW_BACKSTOP.as_millis()) as u32;
         assert!(
             requested <= publishes + backstop_ticks,
             "asked {requested} times for {publishes} frames — a pacing rule \

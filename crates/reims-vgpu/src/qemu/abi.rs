@@ -1010,7 +1010,6 @@ mod tests {
         assert_eq!(std::mem::offset_of!(GuestRamRegion, len), 16);
     }
 
-
     /// Every code the header defines maps to its own variant. A code that fell
     /// through to `UnknownCode` would still log a number, but the reader would
     /// be told the shim is newer than the staticlib when in fact the mapping

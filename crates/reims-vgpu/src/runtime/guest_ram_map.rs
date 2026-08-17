@@ -14,13 +14,10 @@
 //! This module is that, and it is a sorted `Vec` of a dozen or so entries rather
 //! than a cache with an eviction policy.
 //!
-//! A RAMBlock is imported in **chunks** rather than whole, because a driver has
-//! been measured truncating a multi-gigabyte `allocationSize` to 32 bits on this
-//! path and reading back garbage past the truncation — see
-//! [`crate::backend::vulkan::caps::host_pointer::IMPORT_SPAN_CEILING`]. Chunking
-//! needed nothing else to change: a window has always resolved against whichever
-//! import backs its GPA, and one straddling two of them has always grouped into
-//! two `VkBuffer` sources, because a RAMBlock boundary could already split one.
+//! A RAMBlock is imported in **chunks** when it is longer than the backend's
+//! queried single-allocation limit. A window resolves against whichever import
+//! backs its GPA, and one straddling two of them groups into two `VkBuffer`
+//! sources, because a RAMBlock boundary could already split one.
 //!
 //! # Why the imports are built here and not at device create
 //!
@@ -116,20 +113,11 @@ pub enum MapRefusal {
     ///
     /// # What would give such a host the fast rail back
     ///
-    /// Not this refusal, which only makes the host work. A RAMBlock is now
-    /// imported in chunks — for an unrelated reason, a driver truncating
-    /// `allocationSize` — and two of the three things that stood in the way of
-    /// using those chunks for *residency* have gone with it: the split exists,
-    /// and the lookup is a binary search rather than a linear `find`, so a
-    /// hundred imports cost what two did.
-    ///
-    /// What is left is the part that was always the hard one. Chunks are still
-    /// imported eagerly and all at once, and the sum is still what this compares,
-    /// so the refusal fires exactly where it did. Making a small-heap host work
-    /// means importing a chunk on first reference into it and *releasing* chunks
-    /// again — against this module's standing advice, which is sound only while
-    /// every import fits. That cannot be measured on a host whose roomiest heap
-    /// is four times its guest.
+    /// Not this refusal, which governs the optional whole-VM import. Resource-
+    /// sized stable aliases are admitted independently by
+    /// [`crate::runtime::guest_ram::host_allocation_import_align`], so a guest
+    /// allocation that fits can still take the direct rail without making
+    /// unrelated RAM resident.
     ImportExceedsHeap { needed: u64, budget: u64 },
     /// The address is not inside any imported span. Guest RAM the GPU can reach
     /// exists, and this address is not in it — a device MMIO address, a hole,
@@ -431,58 +419,6 @@ pub fn standing_refusal<H: HostOps + ?Sized>(host: &mut H) -> Option<MapRefusal>
     with_map(host, |resolved| resolved.refusal)
 }
 
-/// The whole admission rule for a packed-alias import, in one place.
-///
-/// The alias rails do something the RAMBlock map does not: they build a *new*
-/// host-pointer import over a host allocation they arrange themselves, so that a
-/// guest resource whose pages are scattered can still be presented to Vulkan as
-/// one contiguous range. They are the only importers outside [`resolve`].
-///
-/// # Why they may not assemble this themselves
-///
-/// They did, and it was the same three latches written by hand twice —
-/// `granularity`, `import_span_max`, `import_budget` — with the term that
-/// matters missing from both copies: [`standing_refusal`]. That is precisely
-/// what that function's doc forbids, in the sentence saying a caller must ask it
-/// "rather than re-reading `guest_ram::granularity`, which is the same answer
-/// for one of the four refusals and silence for the other three".
-///
-/// The silence is the bug. The latches are published once at device create from
-/// what the *host* supports, and they stay `Some` for the whole boot. The map's
-/// refusal is a different judgement made later, about what this *guest* fits
-/// into that host — `ImportExceedsHeap` above all, where the guest's RAMBlocks
-/// sum past the roomiest heap an import can be charged to. On such a host the
-/// map is discarded and every RAMBlock reference declines, and these two rails
-/// went on importing anyway, because every latch they asked still answered
-/// `Some`.
-///
-/// That is the reported failure and not a theoretical one: an 8 GiB-or-larger
-/// guest on a host whose importable heap is smaller boots to a black screen or
-/// dies, while the same guest with `REIMS_VGPU_GUEST_IMPORT=off` works — and
-/// `off` is the one arm that also takes these rails' latches away, which is why
-/// it was the arm that worked.
-///
-/// So the rule is one function and the answer is the alignment to import at.
-/// `None` is a refusal already named on the fail channel by whoever owns it.
-pub fn packed_alias_import_align<H: HostOps + ?Sized>(host: &mut H, len: u64) -> Option<u64> {
-    if let Some(refusal) = standing_refusal(host) {
-        // Latched by the refusal, not per call: on a host standing on one,
-        // every alias attempt of every resource refuses for the same reason and
-        // a line each would drown the channel.
-        crate::observe::Emit::decline("packed_alias_refused", &refusal)
-            .fail_once(crate::observe::Decline::slug(&refusal).as_ptr() as u64);
-        crate::runtime::drain::note_store_route("zc_packed_alias_standing_refusal");
-        return None;
-    }
-    let align = crate::runtime::guest_ram::granularity()?;
-    if len > crate::runtime::guest_ram::import_span_max()?
-        || len > crate::runtime::guest_ram::import_budget()?
-    {
-        return None;
-    }
-    Some(align)
-}
-
 /// Turn a guest physical address and a length into a bindable reference.
 ///
 /// The whole guest-memory rail goes through here. Building the imports on the
@@ -771,14 +707,11 @@ fn resolve<H: HostOps + ?Sized>(host: &mut H) -> Resolved {
     // `GuestRamImport::new` names the check that rejected each skipped one on
     // the fail channel, so a partial import is never silent.
     //
-    // One import per RAMBlock was the shape until a driver was found truncating
-    // `allocationSize` to 32 bits on this path — see
-    // [`crate::backend::vulkan::caps::host_pointer::IMPORT_SPAN_CEILING`]. Each
-    // block is now imported in chunks no larger than the span the backend
-    // published. Nothing else had to change: a window already resolves against
-    // whichever import backs its GPA, and one straddling two of them already
-    // groups into two `VkBuffer` sources, because a RAMBlock boundary has always
-    // been able to split one.
+    // Each block is imported in chunks no larger than the API-derived span the
+    // backend published. Nothing else has to change: a window already resolves
+    // against whichever import backs its GPA, and one straddling two of them
+    // already groups into two `VkBuffer` sources, because a RAMBlock boundary
+    // has always been able to split one.
     let span_max = import_span_max().unwrap_or(u64::MAX);
     let mut imports: Vec<Arc<GuestRamImport>> = spans
         .into_iter()
@@ -988,15 +921,10 @@ mod tests {
         }
     }
 
-    /// The reason chunking exists: no single import may be longer than the span
-    /// the backend published.
-    ///
-    /// A driver has been measured truncating `allocationSize` to 32 bits on the
-    /// host-pointer path and reading back unrelated data past the truncation, so
-    /// an import longer than the published ceiling is not a slow import, it is a
-    /// silently wrong one. This asserts the property that makes that
-    /// unreachable, and asserts it about every import rather than about the
-    /// count, because the count is a consequence and the length is the rule.
+    /// No single import may be longer than the API-derived span the backend
+    /// published. This asserts that property about every import rather than
+    /// about the count, because the count is a consequence and the length is
+    /// the rule.
     #[test]
     fn no_import_is_longer_than_the_span_the_backend_published() {
         const CEILING: u64 = 0x2000_0000;

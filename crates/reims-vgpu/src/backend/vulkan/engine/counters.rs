@@ -357,7 +357,6 @@ engine_counters! {
         sampled_reupload_bytes,
         /// Actual sampled upload bytes, partitioned by decoded API resource.
         /// These fields sum to `sampled_reupload_bytes`.
-        sampled_reupload_attachment_bytes,
         sampled_reupload_buffer_texture_bytes,
         sampled_reupload_surface_view_bytes,
         sampled_reupload_surface_cache_bytes,
@@ -513,25 +512,19 @@ engine_counters! {
         draw_cover_full,
         draw_cover_loaded_full_scissor,
         draw_cover_loaded_partial_scissor,
-        /// Vertex/storage/index buffer binds the draw pointed straight at the
-        /// guest's own pages through the imported RAMBlock, with no copy in
-        /// either direction. Ranked against `buffer_snapshot_binds` and the
-        /// `stage_phase` `runs_*` bars, which are what the CPU still gathers.
-        buffer_guest_imports,
-        buffer_guest_import_bytes,
-        /// Index-buffer subset of the direct-import totals above. Kept apart
-        /// because indexed draws previously copied this resource through a CPU
-        /// `Vec` and therefore appeared in neither zero-copy disposition.
-        buffer_guest_index_imports,
-        buffer_guest_index_import_bytes,
+        /// Compute storage buffers bound to their retained guest allocation,
+        /// with no copy in either direction. Draw buffers never contribute:
+        /// vertex, index, and draw-time storage inputs use the gather counters
+        /// below.
+        compute_buffer_guest_imports,
+        compute_buffer_guest_import_bytes,
         /// Vertex/storage buffer binds the GPU assembled out of the guest's own
         /// pages, one `VkBufferCopy` per GPA-contiguous stretch, into a
         /// device-local destination the draw then binds.
         ///
-        /// The disposition between `buffer_guest_imports` (nothing copied) and
-        /// the `stage_phase` `runs_*` bars (the CPU copied). Bytes are what the
-        /// copies name, which is what the CPU no longer moves; regions divided
-        /// by gathers is the mean stretch count.
+        /// The GPU disposition beside the `stage_phase` `runs_*` bars (the CPU
+        /// fallback). Bytes are what the copies name, which is what the CPU no
+        /// longer moves; regions divided by gathers is the mean stretch count.
         ///
         /// There is no ceiling on the region count and there must not be one.
         /// A run is a whole number of guest pages, so every region this rail
@@ -575,9 +568,9 @@ engine_counters! {
         /// Buffer binds served from a copy the command buffer being recorded
         /// already holds — see `ResourcePools::cb_bound_buffers`.
         ///
-        /// Read against `buffer_guest_gathers + buffer_guest_imports` plus
-        /// itself: the three sum to the binds, so this is the share of them
-        /// that cost nothing. It was a per-*draw* map before, and the reuse it
+        /// Read against `buffer_guest_gathers` plus itself: the two sum to the
+        /// draw-buffer binds the GPU gather route admitted, so this is the share
+        /// of them that cost nothing. It was a per-*draw* map before, and the reuse it
         /// found then was invisible because it never reached a counter at all;
         /// a reading of this is only about reuse *across* draws of one command
         /// buffer if it is taken against a boot's `batch_flush_draws /
@@ -636,8 +629,8 @@ engine_counters! {
         /// A subset of the `stage_phase` `runs_*` bars, distinguished by *when*
         /// the bytes were read: a batched CB reads them at record time and an
         /// immediate one effectively at submit, which is a real difference in
-        /// how stale a snapshot can be. `buffer_guest_imports` is the other
-        /// disposition of the same bind, where nothing was read at all.
+        /// how stale a snapshot can be. `buffer_guest_gathers` is the other
+        /// disposition of the same bind, where the GPU reads the pages.
         buffer_snapshot_binds,
         gpu_load_hits,
         target_evicts,
@@ -969,7 +962,6 @@ create_sites! {
     StorageImage => "storage_image",
     StorageImageView => "storage_image_view",
     RegistryFramebuffer => "registry_framebuffer",
-    RegistryImportedImage => "registry_imported_image",
     RegistryImage => "registry_image",
     RegistryImageView => "registry_image_view",
     MrtImage => "mrt_image",
@@ -986,8 +978,6 @@ create_sites! {
     TargetImage => "target_image",
     TargetImageView => "target_image_view",
     TargetFramebuffer => "target_framebuffer",
-    GuestSampledImage => "guest_sampled_image",
-    GuestSampledImageView => "guest_sampled_image_view",
     SampledImage => "sampled_image",
     SampledImageView => "sampled_image_view",
     QueryPool => "query_pool",
@@ -1032,12 +1022,14 @@ impl EngineCounters {
         self.readback_bytes.fetch_add(bytes, Ordering::Relaxed);
         let (count, total) = match source {
             ReadbackSource::DrawTail => (&self.readback_draw, &self.readback_draw_bytes),
-            ReadbackSource::ComputeBuffer => {
-                (&self.readback_compute_buffer, &self.readback_compute_buffer_bytes)
-            }
-            ReadbackSource::ComputeImage => {
-                (&self.readback_compute_image, &self.readback_compute_image_bytes)
-            }
+            ReadbackSource::ComputeBuffer => (
+                &self.readback_compute_buffer,
+                &self.readback_compute_buffer_bytes,
+            ),
+            ReadbackSource::ComputeImage => (
+                &self.readback_compute_image,
+                &self.readback_compute_image_bytes,
+            ),
         };
         count.fetch_add(1, Ordering::Relaxed);
         total.fetch_add(bytes, Ordering::Relaxed);
@@ -1064,9 +1056,6 @@ impl EngineCounters {
         self.sampled_reupload_bytes
             .fetch_add(bytes, Ordering::Relaxed);
         let split = match origin {
-            super::types::SampledByteOrigin::AttachmentAlias => {
-                &self.sampled_reupload_attachment_bytes
-            }
             super::types::SampledByteOrigin::BufferBackedTexture => {
                 &self.sampled_reupload_buffer_texture_bytes
             }
@@ -1101,20 +1090,11 @@ impl EngineCounters {
         }
     }
 
-    pub(super) fn note_buffer_guest_import(
-        &self,
-        bytes: u64,
-        role: super::exec::BufferGatherRole,
-    ) {
-        self.buffer_guest_imports.fetch_add(1, Ordering::Relaxed);
-        self.buffer_guest_import_bytes
+    pub(super) fn note_compute_buffer_guest_import(&self, bytes: u64) {
+        self.compute_buffer_guest_imports
+            .fetch_add(1, Ordering::Relaxed);
+        self.compute_buffer_guest_import_bytes
             .fetch_add(bytes, Ordering::Relaxed);
-        if role.includes_index() {
-            self.buffer_guest_index_imports
-                .fetch_add(1, Ordering::Relaxed);
-            self.buffer_guest_index_import_bytes
-                .fetch_add(bytes, Ordering::Relaxed);
-        }
     }
 
     pub(super) fn note_buffer_guest_gather(
@@ -1370,7 +1350,6 @@ mod tests {
 
         let counters = EngineCounters::default();
         let origins = [
-            SampledByteOrigin::AttachmentAlias,
             SampledByteOrigin::BufferBackedTexture,
             SampledByteOrigin::SerializedSurfaceView,
             SampledByteOrigin::SurfaceHostCache,
@@ -1383,18 +1362,16 @@ mod tests {
         }
 
         let s = counters.snapshot();
-        assert_eq!(s.sampled_reuploads, 7);
-        assert_eq!(s.sampled_reupload_bytes, 28);
-        assert_eq!(s.sampled_reupload_attachment_bytes, 1);
-        assert_eq!(s.sampled_reupload_buffer_texture_bytes, 2);
-        assert_eq!(s.sampled_reupload_surface_view_bytes, 3);
-        assert_eq!(s.sampled_reupload_surface_cache_bytes, 4);
-        assert_eq!(s.sampled_reupload_surface_guest_bytes, 5);
-        assert_eq!(s.sampled_reupload_linear_texture_bytes, 6);
-        assert_eq!(s.sampled_reupload_synthetic_bytes, 7);
+        assert_eq!(s.sampled_reuploads, 6);
+        assert_eq!(s.sampled_reupload_bytes, 21);
+        assert_eq!(s.sampled_reupload_buffer_texture_bytes, 1);
+        assert_eq!(s.sampled_reupload_surface_view_bytes, 2);
+        assert_eq!(s.sampled_reupload_surface_cache_bytes, 3);
+        assert_eq!(s.sampled_reupload_surface_guest_bytes, 4);
+        assert_eq!(s.sampled_reupload_linear_texture_bytes, 5);
+        assert_eq!(s.sampled_reupload_synthetic_bytes, 6);
         assert_eq!(
-            s.sampled_reupload_attachment_bytes
-                + s.sampled_reupload_buffer_texture_bytes
+            s.sampled_reupload_buffer_texture_bytes
                 + s.sampled_reupload_surface_view_bytes
                 + s.sampled_reupload_surface_cache_bytes
                 + s.sampled_reupload_surface_guest_bytes

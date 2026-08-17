@@ -349,23 +349,17 @@ pub(crate) struct ResourcePools {
     sampled_free: FreePool<SampledKey, SampledSlot>,
     sampled_live: Vec<SampledSlot>,
     /// Attachment-feedback snapshots have a command-buffer working set rather
-    /// than a content-cache working set. Keeping them separate prevents the
-    /// general sampled cap from destroying the snapshots a full batch returns,
-    /// while preventing those large, contentless images from displacing upload
-    /// slots that are reusable for a different reason.
+    /// than a serialized-resource lifetime. Their recyclable images therefore
+    /// remain separate from uploaded sampled images; dropping either free-pool
+    /// entry loses only recomputable storage, never cached guest content.
     attachment_snapshot_free: FreePool<SampledKey, SampledSlot>,
     attachment_snapshot_live: Vec<SampledSlot>,
     /// Exact-content sampled images retained across draw calls. Hash narrows
     /// candidates only; a hit always requires full byte equality.
     sampled_cache: Vec<ResidentSampledSlot>,
     sampled_cache_bytes: usize,
-    /// Linear sampled images bound directly over resource-owned packed guest
-    /// allocations. Unlike upload slots these images never enter a recycle
-    /// pool: their memory aliases one specific guest allocation.
-    guest_sampled: HashMap<GuestSampledKey, GuestSampledSlot>,
-    /// What [`SAMPLED_REACH_BAND`] and [`SAMPLED_CACHE_BYTE_CAP`] have thrown
-    /// away, most recently evicted at the front, carrying no images — see
-    /// [`SampledVictim`].
+    /// Entries invalidated when a submission failed after publication, most
+    /// recent first and carrying no images — see [`SampledVictim`].
     sampled_victims: std::collections::VecDeque<SampledVictim>,
     /// Storage-image pool for compute.
     storage_image_free: FreePool<StorageImageKey, StorageImageSlot>,
@@ -873,7 +867,9 @@ struct VertexBufferBinding {
 /// Duplicate bindings have already been rejected by draw validation.
 fn normalize_vertex_bindings(wanted: &mut [VertexBufferBinding]) {
     wanted.sort_unstable_by_key(|entry| entry.binding);
-    debug_assert!(wanted.windows(2).all(|pair| pair[0].binding != pair[1].binding));
+    debug_assert!(wanted
+        .windows(2)
+        .all(|pair| pair[0].binding != pair[1].binding));
 }
 
 /// End index of the maximal consecutive binding run beginning at `start`.
@@ -1032,25 +1028,11 @@ pub(crate) enum DeferredHandle {
         view: vk::ImageView,
         memory: vk::DeviceMemory,
     },
-    GuestImage {
-        image: vk::Image,
-        view: vk::ImageView,
-        _import: std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
-    },
-    /// The parent allocation and its whole-span buffer. It retires only after
-    /// the guest ended the parent lifetime and every child image was destroyed.
+    /// An imported guest allocation and its whole-span buffer.
     GuestAllocation(host_ram::ImportedHostRam),
-    /// Fence barrier captured when a parent allocation's guest lifetime ended.
-    /// Child retirement and this barrier may complete in either order; the
-    /// second one releases the parent.
-    GuestAllocationBarrier(crate::runtime::guest_ram::ImportId),
-    /// A sampled-cache slot evicted by the LRU/byte cap. Instead of destroying
-    /// it, the drain returns it to `sampled_free` for reuse (bounded per key) so
-    /// a content-changing sampled input (live tile / video frame) re-uploads
-    /// into a recycled image instead of paying a fresh `vkAllocateMemory` every
-    /// frame. Routed through the same in-flight-safe deferral as destroys: an
-    /// in-flight CB may still sample the evicted image, so it only rejoins the
-    /// free list once `in_flight == 0`.
+    /// A sampled-cache slot released at resource deletion or cache discard.
+    /// The drain returns it to `sampled_free` for reuse only after in-flight
+    /// submissions are done with it.
     RecycleSampled(SampledSlot),
     /// A resident render-target image displaced from the registry (generation
     /// bump / geometry change / LRU). Instead of destroying it, the drain
@@ -1081,12 +1063,11 @@ impl DeferredHandle {
     /// one, which is the only thing that makes this total.
     fn destroyed_view(&self) -> Option<vk::ImageView> {
         match self {
-            Self::Image { view, .. } | Self::GuestImage { view, .. } => Some(*view),
+            Self::Image { view, .. } => Some(*view),
             Self::RecycleSampled(slot) => Some(slot.view),
             Self::RecycleTarget(img) => Some(img.view),
             Self::ImageView(view) => Some(*view),
             Self::GuestAllocation(_)
-            | Self::GuestAllocationBarrier(_)
             | Self::Framebuffer(_)
             | Self::Pipeline(_)
             | Self::PipelineLayout(_)
@@ -1127,25 +1108,7 @@ impl ResourcePools {
                     device.free_memory(memory, None);
                 }
             }
-            DeferredHandle::GuestImage {
-                image,
-                view,
-                _import,
-            } => {
-                device.destroy_image_view(view, None);
-                device.destroy_image(image, None);
-                if let Some(parent) = self.host_ram_imports.release_child(&_import) {
-                    crate::runtime::drain::note_store_route("guest_import_parent_released");
-                    parent.destroy(device);
-                }
-            }
             DeferredHandle::GuestAllocation(parent) => parent.destroy(device),
-            DeferredHandle::GuestAllocationBarrier(import_id) => {
-                if let Some(parent) = self.host_ram_imports.retirement_fences_cleared(import_id) {
-                    crate::runtime::drain::note_store_route("guest_import_parent_released");
-                    parent.destroy(device);
-                }
-            }
             DeferredHandle::RecycleSampled(slot) => {
                 device.destroy_image_view(slot.view, None);
                 device.destroy_image(slot.image, None);
@@ -1239,32 +1202,6 @@ pub(crate) struct SampledSlot {
     /// channels. Identity is the overwhelmingly common case and keeps its own
     /// free list, so a rare swizzled bind cannot fragment the hot one.
     pub swizzle: crate::contract::pixel_format::SwizzlePlan,
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct GuestSampledKey {
-    pub(crate) image: SampledKey,
-    pub(crate) backing: crate::backend::vulkan::engine::GuestTargetBacking,
-    pub(crate) owner_id: u64,
-}
-
-struct GuestSampledSlot {
-    image: vk::Image,
-    view: vk::ImageView,
-    /// Keeps the checked packed-allocation bound alive for exactly as long as
-    /// Vulkan can address it.
-    _import: std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
-    /// Weak resource lifetime: the cache must not keep the guest object alive.
-    owner: crate::model::TaskResourceLifetimeRef,
-    initialized: bool,
-}
-
-#[derive(Clone)]
-pub(crate) struct GuestSampledUse {
-    pub(crate) key: GuestSampledKey,
-    pub(crate) image: vk::Image,
-    pub(crate) view: vk::ImageView,
-    pub(crate) initialized: bool,
 }
 
 /// Which lifetime owns a newly acquired sampled image. Upload images may enter
@@ -1417,10 +1354,10 @@ pub(crate) enum SampledFingerprint {
 pub(crate) struct SampledRetain {
     pub(crate) image: vk::Image,
     /// The bytes to fingerprint, where the source had any. A guest gather has
-    /// none, and carries only how many it moved so the cache's byte cap still
-    /// accounts for it.
+    /// none and carries only its byte length for the cache memory gauge.
     pub(crate) content: SampledRetainContent,
     pub(crate) identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
+    pub(crate) resource_lifetime: Option<crate::model::TaskResourceLifetimeRef>,
 }
 
 /// What a retained slot's content was, for the two kinds of source.
@@ -1458,22 +1395,35 @@ struct ResidentSampledSlot {
     /// boot runs at 842 MB/s. The compare is not measurable against it.
     ///
     /// Retaining is a refcount bump and not a copy — the `Arc` already exists on
-    /// the retire path — and it costs no new budget: `sampled_cache_bytes` has
-    /// always summed `content_len` against `SAMPLED_CACHE_BYTE_CAP`, so the
-    /// cache was already charging itself for bytes it did not hold. Holding
-    /// them makes that accounting honest.
+    /// the retire path. The bytes make the content comparison exact.
     content: Option<std::sync::Arc<Vec<u8>>>,
-    /// Byte length of the content this slot was admitted with, for the LRU
-    /// byte-cap accounting. Still carried separately because a `Gathered` entry
-    /// has a length but no bytes.
+    /// Byte length of the content this slot was admitted with, for the cache
+    /// memory gauge. Carried separately because a `Gathered` entry has a length
+    /// but no CPU byte vector.
     content_len: usize,
     /// Producer identity of the retained content; lets a same-identity,
     /// same-generation rebind skip the content hash + compare entirely.
     identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
+    /// Serialized resources currently sharing this exact retained content.
+    /// Weak references make resource deletion observable without making the
+    /// backend allocation extend the guest object's lifetime.
+    owners: Vec<crate::model::TaskResourceLifetimeRef>,
     /// Value of [`ResourcePools::idle_clock_ms`] at this entry's last use, kept
-    /// for cache diagnostics. Removal is governed by the cache's count/byte
-    /// capacity, not by this timestamp.
+    /// for cache diagnostics. Elapsed time does not end resource ownership.
     last_touch_ms: u64,
+}
+
+impl ResidentSampledSlot {
+    fn has_live_owner(&self) -> bool {
+        self.owners.iter().any(|owner| owner.is_live())
+    }
+
+    fn retain_owner(&mut self, owner: &crate::model::TaskResourceLifetimeRef) {
+        self.owners.retain(|held| held.is_live());
+        if !self.owners.iter().any(|held| held.id() == owner.id()) {
+            self.owners.push(owner.clone());
+        }
+    }
 }
 
 /// Geometry+format key for storage-image pool free lists. Compute images are
@@ -1650,11 +1600,6 @@ pub(crate) struct NonPinnedTotals {
 pub(crate) enum ResidentAccess {
     /// Created or recycled; nothing has touched the image.
     Untouched,
-    /// A newly imported linear image whose existing texels were most recently
-    /// written through the shared host allocation. Its initial Vulkan layout
-    /// is `PREINITIALIZED`, the only image birth state that preserves those
-    /// bytes across the first transition.
-    GuestBacking,
     /// A render pass wrote it as a colour attachment and left it in that pass's
     /// `final_layout` — `TRANSFER_SRC_OPTIMAL` for a primary target,
     /// `COLOR_ATTACHMENT_OPTIMAL` for an MRT secondary.
@@ -1675,15 +1620,11 @@ impl ResidentAccess {
     /// It is the layout the colour target already rests in, so a resident this
     /// device rendered into and now samples needs **no transition** — see
     /// [`crate::backend::vulkan::engine::caches::color0_pass_exit_layout`] for why one layout
-    /// serves both uses and what it measured. Imported linear images stay
-    /// host-accessible between device operations, which is the same `GENERAL`,
-    /// so the parameter only matters under the ablation arm.
-    ///
     /// The dedicated read-only layout is what the ablation restores, and it is
     /// what makes the transition — and therefore the pass break — come back.
-    pub(crate) fn shader_read(host_accessible: bool) -> Self {
+    pub(crate) fn shader_read() -> Self {
         Self::ShaderRead(
-            if host_accessible || crate::backend::vulkan::engine::caches::unified_color_layout() {
+            if crate::backend::vulkan::engine::caches::unified_color_layout() {
                 vk::ImageLayout::GENERAL
             } else {
                 vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
@@ -1720,16 +1661,12 @@ impl ResidentAccess {
     /// - `Untouched` is `UNDEFINED`: there is a real transition and the layouts
     ///   cannot match, so this never decides it — it answers `false` anyway,
     ///   because "nothing has touched it" must never read as "covered".
-    /// - `GuestBacking` is a host write to `PREINITIALIZED`. The submission's
-    ///   implicit host-memory dependency does make it visible, but the layout is
-    ///   not the resting one and the transition out of `PREINITIALIZED` is the
-    ///   one thing that preserves those bytes. Never skippable.
     ///
     /// A wrong `true` is a sampled read racing the write that produced its
     /// pixels: a stale frame, with nothing reported anywhere.
     pub(crate) fn covered_by_pass_entry(self) -> bool {
         match self {
-            Self::Untouched | Self::GuestBacking => false,
+            Self::Untouched => false,
             Self::ColorWrite(_)
             | Self::ColorFeedback(_)
             | Self::ShaderRead(_)
@@ -1737,21 +1674,15 @@ impl ResidentAccess {
         }
     }
 
-    /// Layout for a transfer read, preserving host access for imported linear
-    /// images while ordinary images use the dedicated transfer layout.
-    pub(crate) const fn transfer_read(host_accessible: bool) -> Self {
-        Self::TransferRead(if host_accessible {
-            vk::ImageLayout::GENERAL
-        } else {
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL
-        })
+    /// Layout for a transfer read from an engine-owned image.
+    pub(crate) const fn transfer_read() -> Self {
+        Self::TransferRead(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
     }
 
     /// Where the image is — the `old_layout` a barrier over it must name.
     pub(crate) fn layout(self) -> vk::ImageLayout {
         match self {
             Self::Untouched => vk::ImageLayout::UNDEFINED,
-            Self::GuestBacking => vk::ImageLayout::PREINITIALIZED,
             Self::ColorWrite(layout) => layout,
             Self::ColorFeedback(layout) | Self::ShaderRead(layout) | Self::TransferRead(layout) => {
                 layout
@@ -1782,7 +1713,6 @@ impl ResidentAccess {
                 vk::PipelineStageFlags::TOP_OF_PIPE,
                 vk::AccessFlags::empty(),
             ),
-            Self::GuestBacking => (vk::PipelineStageFlags::HOST, vk::AccessFlags::HOST_WRITE),
             Self::ColorWrite(_) => (
                 vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                 vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
@@ -1809,44 +1739,31 @@ impl ResidentAccess {
 
 /// Ownership route for a resident image's memory.
 ///
-/// A recyclable allocation belongs to the image slab and may re-enter the
-/// geometry-keyed target pool. A guest import aliases one particular surface
-/// allocation, so recycling it under another identity would bind that surface's
-/// pages to unrelated guest work. The enum forces every retirement path to
-/// choose between those two operations.
-#[derive(Clone, Debug)]
+/// Render targets are engine-owned optimally tiled images. Guest memory is
+/// transport for seed and Store data, never the attachment allocation itself.
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum ResidentMemory {
     Recyclable(vk::DeviceMemory),
-    GuestImported {
-        guest: crate::backend::vulkan::engine::GuestTargetMemory,
-    },
 }
 
-impl ResidentMemory {
-    pub(crate) fn is_guest_imported(&self) -> bool {
-        matches!(self, Self::GuestImported { .. })
-    }
+/// Process-unique identity of one concrete registry allocation.
+///
+/// A [`TargetIdentity`] names protocol content and may be reused while an old
+/// serialized owner still holds a lease. This token names the image allocation,
+/// so releasing that old lease cannot decrement its replacement's ownership.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ResidentIncarnation(std::num::NonZeroU64);
 
-    pub(crate) fn guest_backing(
-        &self,
-    ) -> Option<crate::backend::vulkan::engine::GuestTargetBacking> {
-        match self {
-            Self::GuestImported { guest, .. } => Some(guest.backing),
-            Self::Recyclable(_) => None,
-        }
-    }
-
-    pub(crate) fn guest_footprint(
-        &self,
-    ) -> Option<crate::runtime::guest_ram::GuestPageFootprint> {
-        match self {
-            Self::GuestImported { guest, .. } => Some(guest.footprint.clone()),
-            Self::Recyclable(_) => None,
-        }
+impl ResidentIncarnation {
+    fn allocate() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let raw = NEXT.fetch_add(1, Ordering::Relaxed);
+        Self(std::num::NonZeroU64::new(raw).expect("resident incarnation space exhausted"))
     }
 }
 
 pub(crate) struct ResidentTargetSlot {
+    pub incarnation: ResidentIncarnation,
     pub image: vk::Image,
     pub memory: ResidentMemory,
     pub view: vk::ImageView,
@@ -2215,156 +2132,27 @@ const MAINTENANCE_INTERVAL_MS: u64 = 100;
 /// there when the next draw samples one of them, without becoming a second
 /// registry. Diagnostic memory only: a `TargetIdentity` and a discriminant.
 const RECLAIM_HISTORY: usize = 256;
-/// Entries in the exact-content sampled cache.
-///
-/// **This is the cap that evicts, and its sibling never does.** Measured on one
-/// driven x86/PCI boot over a full `visual-gate` run:
-/// `sampled_evict_count_cap = 2436`, `sampled_evict_byte_cap` **absent** — the
-/// byte cap below is three orders of magnitude from being reached and has never
-/// fired. Over the same boot: 7264 identity hits, 976 content hits, 1657 misses.
-///
-/// **Raising it buys nothing, and that is measured rather than argued.** The
-/// same boot re-run at 256 — a 4x rise, same guest image, same `visual-gate`
-/// workload:
-///
-/// ```text
-///              misses  identity_hits  content_hits  evict_count  evict_byte
-///   cap  64      1657           7264           976         2436           0
-///   cap 256      1701           7302           963           67         658
-/// ```
-///
-/// Count-cap evictions fell 97 % and **the miss count did not move** — 1657
-/// against 1701, which is inside the run-to-run spread the hit columns show
-/// (7264/7302, 976/963, so the two workloads were comparable). The misses are
-/// therefore *content* the cache has never held, not capacity it was forced to
-/// drop, and no size of this constant reaches them.
-///
-/// Two things follow. The frame-rate plan's D1 lever — worth an estimated
-/// 0.42 ms/frame on the premise that the count cap was evicting live entries —
-/// is **dead**; its premise was half right and the half that mattered is false.
-/// And at 256 the byte cap starts binding instead (658 evictions against 0),
-/// so the headroom the plan read as unused is real only while the entry count
-/// is small.
-///
-/// # The same answer for the gather rail, which the reading above could not see
-///
-/// `sampled_cache_misses` has exactly one writer, in `find_cached_sampled`.
-/// `find_gathered_sampled` misses through a `?` and bumps nothing, so the "miss
-/// count did not move" column above is blind to the guest-run gather rail — a
-/// different population, and the one that moves 424 MB/s. Its own miss is
-/// `sampled_gather_unretained` (see
-/// [`EngineCounters::sampled_gather_unvouched`]). Three driven x86/PCI Safari
-/// drags, quiesced, one `vk_caps` each, ratios rather than totals because the
-/// runs did unequal amounts of work:
-///
-/// ```text
-///                    unretained  skips  miss%   evict_count  evict_byte
-///   64 / 128 MB            6296   4164   60.2          5949           0
-///  256 / 128 MB            5591   3133   64.1          3736        4511
-///  256 / 768 MB            6212   4229   59.5          4791           0
-/// ```
-///
-/// **Not capacity.** Four times the entries and six times the bytes leave the
-/// miss rate where it started, 60.2 % against 59.5 %. The middle row is why both
-/// caps had to move together and is the trap in the four-line reading above:
-/// raising the count cap alone just hands the evictions to the byte cap, which
-/// at the ~2.29 MB a window this workload gathers binds at ~56 entries, so the
-/// effective capacity of rows one and two is the same number and the comparison
-/// measures nothing.
-///
-/// The bottom row is the one that settles it, and it also says where to look
-/// next: with no byte pressure at all, a 256-entry cache is *still* evicting
-/// 4791 times on the count cap. Entries are being written, never hit and
-/// dropped. That is the signature of a key that does not repeat rather than of a
-/// cache that is too small.
-///
-/// `runtime::gather_witness` was read to confirm or kill that, and it did
-/// neither — it found the reason the question was open. A `(key, generation)`
-/// *is* held across binds for as long as both witness halves say the bytes have
-/// not moved, so an unchanged window's key does repeat by construction. But
-/// every other verdict spends a fresh generation, and a bind holding one is
-/// **compelled** to miss: the identity names bytes no image was ever built from.
-/// So a miss is only a cache failure when the witness vouched, and the counter
-/// that was supposed to say which — `sampled_gather_unvouched` — was reading a
-/// structural zero. The rows above cannot distinguish a cache dropping live
-/// entries from a guest rewriting the window every frame, and neither can any
-/// reading taken before that counter was fixed.
-///
-/// Do not raise either constant on the strength of the eviction count. Both
-/// causes evict identically: a compulsory miss admits a new entry under its
-/// fresh identity just as a lost one does, so 4791 evictions is what a
-/// perfectly-behaved cache also looks like when the content really is changing.
-///
-/// # With the counter fixed, the answer is 68 % compulsory
-///
-/// A driven boot on the repaired instrument put the gather rail's misses at
-/// `unvouched` 5389 against `unretained` 2524. Two thirds of them are binds the
-/// witness had already spent the generation for, so this constant could not
-/// have reached them at any value — which is why the table above reads flat and
-/// why the flatness was never evidence about the cache. The remaining third is
-/// genuinely this cache's, and it is a third of a rail rather than a rail.
-///
-/// The cause is upstream of both: `gw_refused_host_write` 5156 against
-/// `gw_refused_guest_store` 14 on that boot. See
-/// [`EngineCounters::sampled_gather_unvouched`] for the reading and its
-/// qualifiers, and prefer removing the write to enlarging the cache.
-const SAMPLED_REACH_BAND: usize = 64;
-const SAMPLED_CACHE_BYTE_CAP: usize = 128 * 1024 * 1024;
-/// How far back the victim ledger remembers what the caps threw away.
-///
-/// Derived from the count cap rather than written down, so the bands in
-/// [`sampled_reach_bands`] keep meaning "twice the cache", "four times" and
-/// "eight times" whatever the cap becomes. Eight times is the whole ledger, so
-/// there is no band past it — a miss the ledger cannot see reports
-/// `sampled_reach_beyond_ledger` and says so.
-const SAMPLED_VICTIM_LEDGER: usize = SAMPLED_REACH_BAND * 8;
+/// Failed-submission victims remembered for diagnosis. This is a bounded
+/// instrument only: it holds no image and no residency decision reads it.
+const SAMPLED_VICTIM_LEDGER: usize = 512;
 
-/// One entry [`SAMPLED_REACH_BAND`] or [`SAMPLED_CACHE_BYTE_CAP`] evicted,
-/// remembered without its image.
-///
-/// The eviction *route* has been banded for a while and it answers a different
-/// question: which cap fired, not how much cache the workload wanted. Nothing
-/// counted the second, and `sampled_evict_route`'s own doc says so in as many
-/// words — "nothing yet counts how many distinct `(key, identity)` windows the
-/// workload wants live at once, and that is the number `AGENTS.md` requires
-/// before a bound moves".
-///
-/// This is that count, taken the only way it can be taken from one run: the LRU
-/// stack distance. A bind that misses and finds its window here would have hit
-/// in a cache `distance + 1` entries larger, and the bytes carried alongside say
-/// what holding it that long would have cost. Reading the two together is the
-/// point — the eviction-route doc warns that a count cap raised without the byte
-/// cap hands every eviction straight to the other route, and a distance series
-/// with no byte series cannot see that coming.
-///
-/// It holds no `SampledSlot` and therefore no Vulkan handle: a ledger of images
-/// would be the cache, at eight times the size, which is the thing being
-/// measured rather than a measurement of it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SampledVictim {
     key: SampledKey,
     identity: crate::backend::vulkan::engine::SampledContentIdentity,
-    content_len: usize,
     route: SampledVictimRoute,
 }
 
-/// Why a sampled cache entry stopped being reusable.
+/// The whole cache is discarded only when a submission that had already
+/// published entries never reaches the queue.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SampledVictimRoute {
-    /// [`SAMPLED_REACH_BAND`] or [`SAMPLED_CACHE_BYTE_CAP`] was over budget.
-    Cap,
-    /// The whole cache was discarded because a submission that had already
-    /// published entries into it never reached the queue, so nothing in it could
-    /// be trusted to hold what its name claimed. Not a capacity signal and not
-    /// an age one — a reading here means look at why a submit failed, not at any
-    /// cache bound.
     Discarded,
 }
 
 impl SampledVictimRoute {
     fn route(self) -> &'static str {
         match self {
-            Self::Cap => "sampled_reach_lost_to_cap",
             Self::Discarded => "sampled_reach_lost_to_discard",
         }
     }
@@ -2910,9 +2698,7 @@ const fn batch_default_draws(
 /// Called only while an uninitialized pool is being attached to its device.
 /// The chosen cap is then a field on that pool, so neither the environment nor
 /// topology is re-read on the draw path.
-fn batch_max_draws(
-    topology: crate::backend::vulkan::caps::memory_topology::MemoryTopology,
-) -> u64 {
+fn batch_max_draws(topology: crate::backend::vulkan::caps::memory_topology::MemoryTopology) -> u64 {
     let default = batch_default_draws(topology);
     let cap = match crate::env::count(crate::env::BATCH_DRAWS, default) {
         crate::env::Count::Narrowed(n) => n,
@@ -3304,6 +3090,7 @@ mod sampled_key_tests {
             byte_origin: Default::default(),
             format: ash::vk::Format::R8G8B8A8_UNORM,
             identity: None,
+            resource_lifetime: None,
             swizzle: SwizzlePlan::default(),
         }
     }
@@ -4050,13 +3837,14 @@ mod staging_mapping_tests {
 
 #[cfg(test)]
 mod resident_reuse_tests {
-    use super::{ResidentAccess, ResidentMemory, ResidentTargetSlot};
+    use super::{ResidentAccess, ResidentIncarnation, ResidentMemory, ResidentTargetSlot};
     use crate::backend::vulkan::translate;
     use ash::vk;
 
     /// A slot with nothing in it but the words reuse turns on.
     fn slot(width: u32, height: u32, generation: u64, format: vk::Format) -> ResidentTargetSlot {
         ResidentTargetSlot {
+            incarnation: ResidentIncarnation::allocate(),
             image: vk::Image::null(),
             memory: ResidentMemory::Recyclable(vk::DeviceMemory::null()),
             view: vk::ImageView::null(),
@@ -4111,7 +3899,13 @@ mod resident_reuse_tests {
         );
         assert!(!secondary.reusable_for(64, 32, 1, 7, translate::pixel::ResidentFormat::of(bgra)));
         assert!(
-            secondary.reusable_for(64, 32, 1, 7, translate::pixel::ResidentFormat::of(vk::Format::R16G16_SFLOAT)),
+            secondary.reusable_for(
+                64,
+                32,
+                1,
+                7,
+                translate::pixel::ResidentFormat::of(vk::Format::R16G16_SFLOAT)
+            ),
             "the secondary path must still get its own slot back"
         );
     }
@@ -4171,12 +3965,30 @@ mod resident_reuse_tests {
         let rgba = translate::pixel::resident_color(false);
         let s = slot(64, 32, 7, rgba);
         assert!(s.reusable_for(64, 32, 1, 7, translate::pixel::ResidentFormat::of(rgba)));
-        assert!(!s.reusable_for(65, 32, 1, 7, translate::pixel::ResidentFormat::of(rgba)), "width");
-        assert!(!s.reusable_for(64, 33, 1, 7, translate::pixel::ResidentFormat::of(rgba)), "height");
-        assert!(!s.reusable_for(64, 32, 1, 8, translate::pixel::ResidentFormat::of(rgba)), "generation");
-        assert!(!s.reusable_for(64, 32, 2, 7, translate::pixel::ResidentFormat::of(rgba)), "sample count");
         assert!(
-            !s.reusable_for(64, 32, 1, 7, translate::pixel::ResidentFormat::of(translate::pixel::resident_color(true))),
+            !s.reusable_for(65, 32, 1, 7, translate::pixel::ResidentFormat::of(rgba)),
+            "width"
+        );
+        assert!(
+            !s.reusable_for(64, 33, 1, 7, translate::pixel::ResidentFormat::of(rgba)),
+            "height"
+        );
+        assert!(
+            !s.reusable_for(64, 32, 1, 8, translate::pixel::ResidentFormat::of(rgba)),
+            "generation"
+        );
+        assert!(
+            !s.reusable_for(64, 32, 2, 7, translate::pixel::ResidentFormat::of(rgba)),
+            "sample count"
+        );
+        assert!(
+            !s.reusable_for(
+                64,
+                32,
+                1,
+                7,
+                translate::pixel::ResidentFormat::of(translate::pixel::resident_color(true))
+            ),
             "format still separates the two bgra orders"
         );
     }
@@ -4234,21 +4046,13 @@ mod vertex_binding_bulk_tests {
 
     #[test]
     fn attributes_are_sorted_by_binding_without_losing_values() {
-        let mut wanted = vec![
-            binding(3, 30, 3),
-            binding(1, 10, 1),
-            binding(2, 20, 200),
-        ];
+        let mut wanted = vec![binding(3, 30, 3), binding(1, 10, 1), binding(2, 20, 200)];
 
         normalize_vertex_bindings(&mut wanted);
 
         assert_eq!(
             wanted,
-            vec![
-                binding(1, 10, 1),
-                binding(2, 20, 200),
-                binding(3, 30, 3),
-            ]
+            vec![binding(1, 10, 1), binding(2, 20, 200), binding(3, 30, 3),]
         );
         assert_eq!(vertex_binding_run_end(&wanted, 0), 3);
     }
@@ -4275,9 +4079,7 @@ mod vertex_binding_bulk_tests {
 
 #[cfg(test)]
 mod dynamic_state_match_tests {
-    use super::{
-        push_descriptors_match, scissors_match, viewports_match, PushDescriptorBinding,
-    };
+    use super::{push_descriptors_match, scissors_match, viewports_match, PushDescriptorBinding};
     use ash::vk;
     use ash::vk::Handle;
 
@@ -4385,7 +4187,12 @@ mod dynamic_state_match_tests {
             offset: 64,
             range: 128,
         };
-        assert!(push_descriptors_match(Some(layout), &[binding], layout, &[binding]));
+        assert!(push_descriptors_match(
+            Some(layout),
+            &[binding],
+            layout,
+            &[binding]
+        ));
         assert!(!push_descriptors_match(
             Some(vk::PipelineLayout::from_raw(8)),
             &[binding],

@@ -1298,11 +1298,8 @@ impl HostOps for FakeHost {
     /// The default trait impl answers `CallbackMissing`, which puts the guest-RAM
     /// map in a standing refusal. That is the right default for a `NullHost`
     /// and it was the wrong one here: `FakeHost` models a host that *does* have
-    /// guest RAM, and every test of a rail that imports had to latch the import
-    /// limits by hand and then run against a map that had refused. The rails
-    /// that ask only the latches ran anyway, so the fixture agreed with a bug
-    /// instead of catching it — see
-    /// [`crate::runtime::guest_ram_map::packed_alias_import_align`].
+    /// guest RAM, and every test of the whole-RAMBlock rail had to latch the
+    /// import limits by hand and then run against a map that had refused.
     ///
     /// Answering from `ranges` keeps the fixture honest in both directions: a
     /// test that maps nothing still gets a refusing map, and one that maps guest

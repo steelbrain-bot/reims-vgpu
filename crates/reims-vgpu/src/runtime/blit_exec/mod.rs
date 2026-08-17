@@ -885,17 +885,17 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
             crate::observe::ladder_slug!("tex", desc_decode),
         ));
     };
-    if tex.declared_pixel_format().is_none() {
+    let Some(declared_format) = tex.declared_pixel_format() else {
         crate::observe::fail(format!(
             "blit tex no_pixel_format ref={texture_ref} w={} h={} fmt={}",
-            tex.width, tex.height, tex.pixel_format
+            tex.width, tex.height, 0
         ));
         return Err(br(BlitStatus::Unsupported, "tex_no_pixel_format"));
-    }
-    let Some(bpp) = pixel_format::bytes_per_pixel(tex.pixel_format) else {
+    };
+    let Some(bpp) = pixel_format::bytes_per_pixel(declared_format) else {
         crate::observe::fail(format!(
             "blit tex bad_bpp ref={texture_ref} fmt={}",
-            tex.pixel_format
+            declared_format
         ));
         return Err(br(BlitStatus::Unsupported, "tex_bad_bpp"));
     };
@@ -908,7 +908,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
             state.page_shift,
             tex.width,
             tex.height,
-            tex.pixel_format
+            declared_format
         ));
         return Err(br(BlitStatus::Bounds, "tex_level_gva"));
     };
@@ -953,7 +953,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         // the trailing padding after the final row is never touched. Charging
         // it refuses allocations sized exactly for the array — see
         // `TextureLevelLayout::slice_read_span`.
-        let tight_row = pixel_format::tight_row_bytes(layout.width, tex.pixel_format)
+        let tight_row = pixel_format::tight_row_bytes(layout.width, declared_format)
             .ok_or_else(|| br(BlitStatus::Unsupported, "tex_slice_tight_row"))?;
         let slice_read = layout
             .slice_read_span(tight_row)
@@ -986,7 +986,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         height: layout.height,
         depth: layout.planes(),
         bpp,
-        pixel_format: tex.pixel_format,
+        pixel_format: declared_format,
     }))
 }
 
@@ -1282,7 +1282,11 @@ fn linear_rect(
     row_count: u64,
     site: &'static str,
 ) -> Result<(u64, RectStride), BlitStatus> {
-    let Point { x: ox, y: oy, z: oz } = origin;
+    let Point {
+        x: ox,
+        y: oy,
+        z: oz,
+    } = origin;
     let last_y = oy
         .checked_add(row_count.saturating_sub(1))
         .ok_or_else(|| br(BlitStatus::Bounds, site))?;
@@ -1333,8 +1337,10 @@ fn write_texture_rect<M: HostMemory + HostOps>(
     match tex {
         TextureBacking::Linear(t) => {
             let (gva, rect) = linear_rect(t, origin, row_bytes, row_count, "wr_rect_linear_shape")?;
-            crate::runtime::gva_view::write_rect_within(state, host, task_id, gva, rect, buf, allowed)
-                .map_err(|_| br(BlitStatus::GuestIo, "wr_rect_linear_io"))?;
+            crate::runtime::gva_view::write_rect_within(
+                state, host, task_id, gva, rect, buf, allowed,
+            )
+            .map_err(|_| br(BlitStatus::GuestIo, "wr_rect_linear_io"))?;
             crate::runtime::drain::note_store_route("blit_rect_linear_walk");
             crate::runtime::drain::note_store_route_n(
                 "blit_rect_linear_rows_hoisted",
@@ -1872,10 +1878,7 @@ fn copy_row_region<M: HostMemory + HostOps>(
         window_started.elapsed().as_micros() as u64,
     );
     let rows_started = std::time::Instant::now();
-    crate::runtime::drain::note_store_route_n(
-        "blit_rows_n",
-        row_count.saturating_mul(image_count),
-    );
+    crate::runtime::drain::note_store_route_n("blit_rows_n", row_count.saturating_mul(image_count));
     let mut row_buf = vec![0u8; row_len];
     for z in 0..image_count {
         let src_plane = src_base
@@ -2981,10 +2984,7 @@ fn exec_copy_texture_to_buffer<M: HostMemory + HostOps>(
         "blit_t2b_stage_us",
         stage_rows_started.elapsed().as_micros() as u64,
     );
-    crate::runtime::drain::note_store_route_n(
-        "blit_t2b_stage_rows",
-        copy_h.saturating_mul(copy_d),
-    );
+    crate::runtime::drain::note_store_route_n("blit_t2b_stage_rows", copy_h.saturating_mul(copy_d));
     BlitStatus::Ok
 }
 
@@ -3068,14 +3068,34 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
     // even come through the extent helper, which made it the quieter of two
     // quiet paths.
     let (Some(copy_w), Some(_)) = (
-        copy_extent("t2t_src", "w", cmd.source_size.width, src.width() as u64 - sox),
-        copy_extent("t2t_dst", "w", cmd.source_size.width, dst.width() as u64 - dox),
+        copy_extent(
+            "t2t_src",
+            "w",
+            cmd.source_size.width,
+            src.width() as u64 - sox,
+        ),
+        copy_extent(
+            "t2t_dst",
+            "w",
+            cmd.source_size.width,
+            dst.width() as u64 - dox,
+        ),
     ) else {
         return br(BlitStatus::Bounds, "t2t_extent_oob");
     };
     let (Some(copy_h), Some(_)) = (
-        copy_extent("t2t_src", "h", cmd.source_size.height, src.height() as u64 - soy),
-        copy_extent("t2t_dst", "h", cmd.source_size.height, dst.height() as u64 - doy),
+        copy_extent(
+            "t2t_src",
+            "h",
+            cmd.source_size.height,
+            src.height() as u64 - soy,
+        ),
+        copy_extent(
+            "t2t_dst",
+            "h",
+            cmd.source_size.height,
+            dst.height() as u64 - doy,
+        ),
     ) else {
         return br(BlitStatus::Bounds, "t2t_extent_oob");
     };
@@ -3083,8 +3103,18 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
         0
     } else {
         let (Some(d), Some(_)) = (
-            copy_extent("t2t_src", "d", cmd.source_size.depth, src.depth() as u64 - soz),
-            copy_extent("t2t_dst", "d", cmd.source_size.depth, dst.depth() as u64 - doz),
+            copy_extent(
+                "t2t_src",
+                "d",
+                cmd.source_size.depth,
+                src.depth() as u64 - soz,
+            ),
+            copy_extent(
+                "t2t_dst",
+                "d",
+                cmd.source_size.depth,
+                dst.depth() as u64 - doz,
+            ),
         ) else {
             return br(BlitStatus::Bounds, "t2t_extent_oob");
         };
@@ -3413,14 +3443,9 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
         #[cfg(feature = "backend-vulkan")]
         if whole_src && whole_dst {
             if let (TextureBacking::Type11(s), TextureBacking::Linear(d)) = (&src, &dst) {
-                if let Some(status) = try_copy_t11_plane_to_linear_on_gpu(
-                    state,
-                    host,
-                    task_id,
-                    cmd.destination,
-                    s,
-                    d,
-                ) {
+                if let Some(status) =
+                    try_copy_t11_plane_to_linear_on_gpu(state, host, task_id, cmd.destination, s, d)
+                {
                     return status;
                 }
             }
@@ -3467,10 +3492,7 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
         "blit_t2t_stage_us",
         t2t_stage_started.elapsed().as_micros() as u64,
     );
-    crate::runtime::drain::note_store_route_n(
-        "blit_t2t_stage_rows",
-        copy_h.saturating_mul(copy_d),
-    );
+    crate::runtime::drain::note_store_route_n("blit_t2t_stage_rows", copy_h.saturating_mul(copy_d));
     BlitStatus::Ok
 }
 

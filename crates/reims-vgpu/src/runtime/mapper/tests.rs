@@ -111,7 +111,7 @@ fn the_page_witness_sees_a_rewire_no_packet_announced() {
         m.type4_walk = Some(Type4Walk {
             task_id: 1,
             backing_pfn: 0,
-            map_generation: m.map_generation,
+            page_generation: m.page_generation,
         });
     }
     assert!(
@@ -130,9 +130,11 @@ fn the_page_witness_sees_a_rewire_no_packet_announced() {
         "no packet arrived, so nothing bumped the incarnation"
     );
     assert!(
-        super::type4_pages_witness(&state, &host, 6) == super::Type4Witness::Drifted,
-        "a fresh walk names a different page, and a writeback through the \
-         cached one lands in whatever the guest gave it to"
+        matches!(
+            super::type4_pages_witness(&state, &host, 6),
+            super::Type4Witness::Repointed(_)
+        ),
+        "a fresh complete walk names the resource's current backing"
     );
 
     // A latch from a superseded incarnation is not evidence about the list
@@ -140,7 +142,7 @@ fn the_page_witness_sees_a_rewire_no_packet_announced() {
     {
         let m = state.mappings.get_mut(&6).unwrap();
         let mut walk = m.type4_walk.unwrap();
-        walk.map_generation = m.map_generation.wrapping_sub(1);
+        walk.page_generation = m.page_generation.wrapping_sub(1);
         m.type4_walk = Some(walk);
     }
     assert!(
@@ -156,7 +158,7 @@ fn the_page_witness_sees_a_rewire_no_packet_announced() {
     {
         let m = state.mappings.get_mut(&6).unwrap();
         let mut walk = m.type4_walk.unwrap();
-        walk.map_generation = m.map_generation;
+        walk.page_generation = m.page_generation;
         m.type4_walk = Some(walk);
     }
     st32(&mut pte, (data0 >> PAGE_SHIFT_X86) as u32);
@@ -275,10 +277,10 @@ fn a_page_the_task_cannot_translate_is_not_reported_as_a_move() {
         m.type4_walk = Some(Type4Walk {
             task_id: 1,
             backing_pfn: 0,
-            map_generation: m.map_generation,
+            page_generation: m.page_generation,
         });
     }
-    assert!(super::type4_pages_witness(&state, &host, 6) != super::Type4Witness::Drifted);
+    assert!(super::type4_pages_witness(&state, &host, 6) != super::Type4Witness::Unavailable);
 
     // The translation goes away rather than moving: the PTE is cleared, so
     // the walk fails outright.
@@ -288,7 +290,7 @@ fn a_page_the_task_cannot_translate_is_not_reported_as_a_move() {
     st32(&mut pte, 0);
     host.write_gpa(root_gpa, &pte).unwrap();
     assert!(
-        super::type4_pages_witness(&state, &host, 6) == super::Type4Witness::Drifted,
+        super::type4_pages_witness(&state, &host, 6) == super::Type4Witness::Unavailable,
         "a page the table cannot translate must not vouch for a write"
     );
     let body = std::fs::read_to_string(crate::observe::fail_log_path()).unwrap_or_default();
@@ -364,7 +366,7 @@ fn a_page_moved_in_the_middle_of_a_run_still_refuses_the_write() {
         m.type4_walk = Some(Type4Walk {
             task_id: 1,
             backing_pfn: 0,
-            map_generation: m.map_generation,
+            page_generation: m.page_generation,
         });
     }
     assert_eq!(
@@ -375,27 +377,15 @@ fn a_page_moved_in_the_middle_of_a_run_still_refuses_the_write() {
 
     // Re-point page 2 of 5 and nothing else. A per-page walk and a cached
     // one must reach the same verdict; only one of them can get this wrong.
-    let at = std::fs::read_to_string(crate::observe::fail_log_path())
-        .unwrap_or_default()
-        .len();
     write_pte(&mut host, 2, elsewhere_pfn);
+    let super::Type4Witness::Repointed(entries) = super::type4_pages_witness(&state, &host, 6)
+    else {
+        panic!("a complete walk with a moved middle page must supply the current backing");
+    };
     assert_eq!(
-        super::type4_pages_witness(&state, &host, 6),
-        super::Type4Witness::Drifted,
-        "a page re-pointed in the middle of the run must refuse the write"
-    );
-    let body = std::fs::read_to_string(crate::observe::fail_log_path()).unwrap_or_default();
-    let fresh: Vec<&str> = body[at.min(body.len())..]
-        .lines()
-        .filter(|l| l.starts_with("mapping_page_drift "))
-        .collect();
-    assert!(
-        fresh.iter().any(|l| l.contains("reason=translation_moved")),
-        "the refusal must name the move, got: {fresh:?}"
-    );
-    assert!(
-        fresh.iter().any(|l| l.contains("page=2/5")),
-        "the refusal must name which page moved, got: {fresh:?}"
+        crate::contract::iosurface_pages::entry_gpa_shift(entries[2], PAGE_SHIFT_X86),
+        Some(u64::from(elsewhere_pfn) << PAGE_SHIFT_X86),
+        "the replacement list must include the moved middle page"
     );
 }
 
@@ -425,12 +415,12 @@ fn a_walk_that_visits_nothing_is_not_agreement() {
         m.type4_walk = Some(Type4Walk {
             task_id: 1,
             backing_pfn: 0,
-            map_generation: m.map_generation,
+            page_generation: m.page_generation,
         });
     }
     assert_eq!(
         super::type4_pages_witness(&state, &host, 6),
-        super::Type4Witness::Drifted,
+        super::Type4Witness::Unavailable,
         "a page list nothing walked must not vouch for a write"
     );
 }

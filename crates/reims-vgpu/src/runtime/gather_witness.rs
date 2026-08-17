@@ -438,8 +438,6 @@ struct Entry {
     /// generation 0 has been addressed and has been written zero times, and
     /// comparing it against a later 0 is a real quiet answer.
     stated_gen: Option<u32>,
-    /// Bind ordinal of the last sight of this window, for LRU eviction.
-    last_seen: u64,
     /// Sampled-content generation currently vouched for these bytes.
     ///
     /// Held across binds for as long as both halves of the witness say the bytes
@@ -454,8 +452,6 @@ struct Entry {
 #[derive(Debug)]
 pub struct GatherWitness {
     entries: BTreeMap<GatherKey, Entry>,
-    /// Monotonic bind ordinal, stamped into [`Entry::last_seen`].
-    binds: u64,
     /// How often this device's content audit is allowed to compare.
     ///
     /// On the witness rather than in a process-wide `OnceLock` so a test can
@@ -469,7 +465,6 @@ impl Default for GatherWitness {
     fn default() -> Self {
         Self {
             entries: BTreeMap::new(),
-            binds: 0,
             audit: AuditDensity::from_env(),
         }
     }
@@ -519,21 +514,6 @@ impl AuditDensity {
         matches!(self, Self::EveryBind)
     }
 }
-
-/// Upper bound on tracked windows.
-///
-/// Not a memory bound — a hypervisor harvest bound. `reims_vgpu_dirty_harvest`
-/// walks every page of every tracked set on the BQL thread at each register write
-/// that hands the device work, so each armed window adds its page count to a cost
-/// the whole VM pays. A driven Safari boot re-presents on the order of sixty
-/// distinct sampled keys, so this sits just above the observed working set rather
-/// than wherever memory would run out.
-///
-/// The first driven boot hit the cap twice during a hard scroll, so the working
-/// set does reach it. Overflow evicts the least recently bound window rather than
-/// dropping the map: a full drop costs a `gw_rearm` for every live window at once,
-/// which is precisely the population whose answers are wanted.
-const MAX_TRACKED_WINDOWS: usize = 256;
 
 /// Binds of one window between content audits.
 ///
@@ -586,6 +566,31 @@ impl GatherWitness {
         tokens
     }
 
+    /// Retire every sampled window owned by a task lifetime.
+    pub fn retire_task(&mut self, task_id: u32) -> Vec<u64> {
+        self.retire_where(
+            |key| matches!(key, GatherKey::TaskGva { task_id: t, .. } if *t == task_id),
+        )
+    }
+
+    /// Retire every sampled window owned by a mapping lifetime.
+    pub fn retire_mapping(&mut self, mapping_id: u32) -> Vec<u64> {
+        self.retire_where(|key| matches!(key, GatherKey::Mapping { mid, .. } if *mid == mapping_id))
+    }
+
+    fn retire_where(&mut self, mut doomed: impl FnMut(&GatherKey) -> bool) -> Vec<u64> {
+        let keys: Vec<_> = self
+            .entries
+            .keys()
+            .filter(|key| doomed(key))
+            .copied()
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| self.entries.remove(&key).map(|entry| entry.token))
+            .filter(|&token| token != 0)
+            .collect()
+    }
+
     /// Arm one window against `token` with nothing else set, so a test can
     /// prove the token is released without driving a gather to create it.
     #[cfg(test)]
@@ -608,7 +613,33 @@ impl GatherWitness {
                 rebaselines: 0,
                 pages_epoch: 0,
                 stated_gen: None,
-                last_seen: 0,
+                generation: 0,
+            },
+        );
+    }
+
+    /// Arm a mapping-owned token so lifecycle tests can prove that the owning
+    /// `DeviceState` transition releases it.
+    #[cfg(test)]
+    pub fn arm_mapping_token_for_test(&mut self, mapping_id: u32, token: u64) {
+        self.entries.insert(
+            GatherKey::Mapping {
+                mid: mapping_id,
+                base_off: 0,
+            },
+            Entry {
+                gpas: vec![0x3000],
+                span: 0x1000,
+                token,
+                gen: 0,
+                fold: 0,
+                fold_valid: false,
+                fold_seeded: false,
+                binds_since_fold: 0,
+                audit_armed: false,
+                rebaselines: 0,
+                pages_epoch: 0,
+                stated_gen: None,
                 generation: 0,
             },
         );
@@ -617,30 +648,6 @@ impl GatherWitness {
     /// The host-write epoch recorded at the previous bind of `key`, if any.
     fn previous_pages_epoch(&self, key: &GatherKey) -> Option<u64> {
         self.entries.get(key).map(|entry| entry.pages_epoch)
-    }
-
-    /// Drop the least recently bound window, releasing its token.
-    ///
-    /// Returns the window it dropped and that window's span, so the caller can
-    /// name the loss. An eviction is not bookkeeping: the next bind of the
-    /// evicted window has no entry, so it re-gathers — the CPU re-packs a window
-    /// it had already vouched for. Reporting only how many were dropped says
-    /// nothing about *which*, and an overflow that cannot be attributed to a
-    /// window cannot be attributed to a workload either.
-    fn evict_oldest<M: crate::runtime::host::HostOps>(
-        &mut self,
-        host: &mut M,
-    ) -> Option<(GatherKey, u64)> {
-        let victim = self
-            .entries
-            .iter()
-            .min_by_key(|(_, entry)| entry.last_seen)
-            .map(|(key, _)| *key)?;
-        let entry = self.entries.remove(&victim)?;
-        if entry.token != 0 {
-            host.untrack_guest_writes(entry.token);
-        }
-        Some((victim, entry.span))
     }
 }
 
@@ -655,7 +662,10 @@ impl GatherWitness {
 /// Every run's `host_ptr` must be a live mapping of at least `len` bytes — the
 /// same precondition the gather itself relies on, read at the same point in the
 /// draw.
-pub(crate) unsafe fn fold_runs(runs: &[crate::backend::vulkan::engine::GuestRun], span: u64) -> u128 {
+pub(crate) unsafe fn fold_runs(
+    runs: &[crate::backend::vulkan::engine::GuestRun],
+    span: u64,
+) -> u128 {
     let mut a: u64 = 0x9e37_79b9_7f4a_7c15;
     let mut b: u64 = 0xc2b2_ae3d_27d4_eb4f;
     let mut remaining = span;
@@ -977,15 +987,7 @@ pub struct GatherObservation {
     pub stated: StatedGuestWrite,
 }
 
-/// What this witness reports on the fail channel: one way it can be wrong, and
-/// one way its table can cost the guest work.
-///
-/// The two are different failures and read differently. [`Self::VouchedBytesMoved`]
-/// means a bind was served stale bytes — a correctness loss, and the audit is
-/// the only instrument that sees it. [`Self::TrackedWindowEvicted`] means nothing
-/// was served wrongly and the CPU re-packs a window it had already vouched for —
-/// a cost, not a corruption. Both are named because both are guest work this
-/// device did not have to spend.
+/// What this witness reports when its soundness audit finds stale bytes.
 #[derive(Clone, Copy, Debug)]
 pub enum GatherWitnessFault {
     /// Both halves vouched for a window and the content audit found its bytes
@@ -996,22 +998,12 @@ pub enum GatherWitnessFault {
         span: u64,
         binds: u32,
     },
-    /// [`MAX_TRACKED_WINDOWS`] was reached and the least recently bound window
-    /// was dropped to make room. Names the window that lost its entry and the
-    /// bound that displaced it, so an overflow can be attributed to a workload
-    /// rather than counted.
-    TrackedWindowEvicted {
-        key: GatherKey,
-        span: u64,
-        tracked: usize,
-    },
 }
 
 impl crate::observe::decline::Decline for GatherWitnessFault {
     fn slug(&self) -> &'static str {
         match self {
             Self::VouchedBytesMoved { .. } => "gather_witness_vouched_bytes_moved",
-            Self::TrackedWindowEvicted { .. } => "gather_witness_tracked_window_evicted",
         }
     }
 
@@ -1021,11 +1013,6 @@ impl crate::observe::decline::Decline for GatherWitnessFault {
                 ("window", key.log_token()),
                 ("span", span.to_string()),
                 ("binds", binds.to_string()),
-            ],
-            Self::TrackedWindowEvicted { key, span, tracked } => vec![
-                ("window", key.log_token()),
-                ("span", span.to_string()),
-                ("tracked", tracked.to_string()),
             ],
         }
     }
@@ -1056,8 +1043,7 @@ pub struct GatherOutcome {
 /// It used to, and the `Option` was `Some` on every path: the identity was read
 /// back with `vouched_identity`, which answered "is this window tracked", and
 /// [`observe`] leaves an entry for every key it is given — the re-point branch
-/// inserts one and returns, the overflow evictor never evicts the key it was
-/// asked about, and the surviving branch holds a `&mut` to one. The engine spent
+/// inserts one and returns, and the surviving branch holds a `&mut` to one. The engine spent
 /// a boot counting `identity.is_some()` as the witness's verdict and read the
 /// resulting zero as "the witness never refused a gather". It cannot refuse
 /// through this return value at all; [`GatherVouch`] is where the verdict lives.
@@ -1300,26 +1286,6 @@ fn observe<M: crate::runtime::host::HostOps>(
         stated_gen: stated_now,
     } = counts;
 
-    witness.binds = witness.binds.wrapping_add(1);
-    while witness.entries.len() >= MAX_TRACKED_WINDOWS && !witness.entries.contains_key(&key) {
-        crate::runtime::drain::note_store_route("gw_window_overflow");
-        // The counter carries the magnitude; the decline carries the identity.
-        // Deduped per evicted window, because a window thrashing in and out of
-        // the table reports the same loss on every pass and the count above
-        // already says how often.
-        if let Some((victim, span)) = witness.evict_oldest(host) {
-            crate::observe::emit::Emit::decline(
-                "gather_witness",
-                &GatherWitnessFault::TrackedWindowEvicted {
-                    key: victim,
-                    span,
-                    tracked: MAX_TRACKED_WINDOWS,
-                },
-            )
-            .fail_once(victim.content_key());
-        }
-    }
-
     let stale = match witness.entries.get(&key) {
         Some(entry) => entry.gpas != gpas || entry.span != span,
         None => true,
@@ -1354,7 +1320,6 @@ fn observe<M: crate::runtime::host::HostOps>(
                 rebaselines: 0,
                 pages_epoch,
                 stated_gen: stated_now,
-                last_seen: witness.binds,
                 generation: fresh_generation,
             },
         );
@@ -1515,7 +1480,6 @@ fn observe<M: crate::runtime::host::HostOps>(
     }
     entry.gen = gen;
     entry.pages_epoch = pages_epoch;
-    entry.last_seen = witness.binds;
     GatherObservation {
         verdict,
         audit,
@@ -1741,29 +1705,70 @@ mod tests {
         };
 
         // First sight of the window: a re-point, so no comparison exists yet.
-        let first = observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), stated(Some(0)), 10);
+        let first = observe(
+            &mut w,
+            &mut host,
+            KEY,
+            one_page(&GPAS, &runs),
+            stated(Some(0)),
+            10,
+        );
         assert_eq!(first.stated, StatedGuestWrite::Unaddressed);
 
         // Generation 0 twice is a real quiet answer, not an absent one — the
         // mapping has been addressed and the guest has written it zero times.
-        let quiet = observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), stated(Some(0)), 11);
+        let quiet = observe(
+            &mut w,
+            &mut host,
+            KEY,
+            one_page(&GPAS, &runs),
+            stated(Some(0)),
+            11,
+        );
         assert_eq!(quiet.stated, StatedGuestWrite::Quiet);
 
         // The guest states a CPU write: `resource_validity::apply` bumps the
         // mapping's generation, and the channel reports it.
-        let wrote = observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), stated(Some(1)), 12);
+        let wrote = observe(
+            &mut w,
+            &mut host,
+            KEY,
+            one_page(&GPAS, &runs),
+            stated(Some(1)),
+            12,
+        );
         assert_eq!(wrote.stated, StatedGuestWrite::Wrote);
 
         // Settled at the new generation, quiet again.
-        let settled = observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), stated(Some(1)), 13);
+        let settled = observe(
+            &mut w,
+            &mut host,
+            KEY,
+            one_page(&GPAS, &runs),
+            stated(Some(1)),
+            13,
+        );
         assert_eq!(settled.stated, StatedGuestWrite::Quiet);
 
         // The mapping goes away. Fail closed: not quiet, whatever the inferred
         // half says, and the bind before it does not become quiet retroactively.
-        let gone = observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), stated(None), 14);
+        let gone = observe(
+            &mut w,
+            &mut host,
+            KEY,
+            one_page(&GPAS, &runs),
+            stated(None),
+            14,
+        );
         assert_eq!(gone.stated, StatedGuestWrite::Unaddressed);
-        let still_gone =
-            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), stated(None), 15);
+        let still_gone = observe(
+            &mut w,
+            &mut host,
+            KEY,
+            one_page(&GPAS, &runs),
+            stated(None),
+            15,
+        );
         assert_eq!(still_gone.stated, StatedGuestWrite::Unaddressed);
     }
 
@@ -1794,7 +1799,16 @@ mod tests {
             let mut host = crate::runtime::host::FakeHost::new();
             let mut w = witness_auditing(density);
             (0..6)
-                .map(|_| observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, next_gen()))
+                .map(|_| {
+                    observe(
+                        &mut w,
+                        &mut host,
+                        KEY,
+                        one_page(&GPAS, &runs),
+                        QUIET,
+                        next_gen(),
+                    )
+                })
                 .filter(|seen| seen.audit == ContentAudit::Agreed)
                 .count()
         };
@@ -2025,7 +2039,7 @@ mod tests {
                 pages_epoch: 2,
                 pages_wrote: Some(crate::runtime::host_writes::HostWriteVerdict::Overlap),
                 ..QUIET
-                },
+            },
             next_gen(),
         );
         assert!(
@@ -2129,7 +2143,7 @@ mod tests {
                     pages_epoch: 2,
                     pages_wrote: Some(crate::runtime::host_writes::HostWriteVerdict::Overlap),
                     ..QUIET
-                    },
+                },
                 next_gen(),
             )
             .audit
@@ -2260,16 +2274,9 @@ mod tests {
         assert_eq!(short, unsafe { fold_runs(&[run_over(&head)], 64) });
     }
 
-    /// An eviction names the window it dropped, and drops the least recently
-    /// bound one.
-    ///
-    /// The identity is the whole point: `gw_window_overflow` counts evictions
-    /// and can say how many, never which, so an overflow it reports alone cannot
-    /// be attributed to a window. The re-touch below is what separates the two
-    /// possible answers — without it, "least recently bound" and "first
-    /// inserted" pick the same victim and the test would pass on either rule.
+    /// Live sampled windows are retained without a capacity eviction.
     #[test]
-    fn an_eviction_names_the_least_recently_bound_window_it_dropped() {
+    fn live_windows_are_not_evicted_by_capacity() {
         let mut host = crate::runtime::host::FakeHost::new();
         let mut w = GatherWitness::default();
         let buf = vec![0x5au8; PAGE];
@@ -2281,8 +2288,8 @@ mod tests {
         };
         let gpas_at = |i: u64| [(64 + i) * PAGE as u64];
 
-        // Fill the table exactly, oldest first.
-        for i in 0..MAX_TRACKED_WINDOWS as u64 {
+        const DISTINCT_WINDOWS: u64 = 512;
+        for i in 0..DISTINCT_WINDOWS {
             let gpas = gpas_at(i);
             observe(
                 &mut w,
@@ -2293,36 +2300,52 @@ mod tests {
                 next_gen(),
             );
         }
-        assert_eq!(w.entries.len(), MAX_TRACKED_WINDOWS);
+        assert_eq!(w.entries.len(), DISTINCT_WINDOWS as usize);
+        assert!((0..DISTINCT_WINDOWS).all(|i| w.entries.contains_key(&key_at(i))));
+    }
 
-        // Re-touch the first, so it is no longer the least recently bound. The
-        // second is now the victim, and it is not the one insertion order names.
-        let gpas0 = gpas_at(0);
-        observe(
-            &mut w,
-            &mut host,
-            key_at(0),
-            one_page(&gpas0, &runs),
-            QUIET,
-            next_gen(),
-        );
+    /// Witness entries and their host tokens end with the task or mapping that
+    /// owns the sampled window; unrelated live resources survive either end.
+    #[test]
+    fn resource_lifetime_retirement_releases_only_the_owned_windows() {
+        let mut host = crate::runtime::host::FakeHost::new();
+        let mut w = GatherWitness::default();
+        let buf = vec![0x5au8; PAGE];
+        let runs = [run_over(&buf)];
+        let keys = [
+            GatherKey::TaskGva {
+                task_id: 7,
+                gva: 0x1000,
+            },
+            GatherKey::TaskGva {
+                task_id: 8,
+                gva: 0x1000,
+            },
+            GatherKey::Mapping {
+                mid: 11,
+                base_off: 0,
+            },
+            GatherKey::Mapping {
+                mid: 12,
+                base_off: 0,
+            },
+        ];
+        for key in keys {
+            observe(
+                &mut w,
+                &mut host,
+                key,
+                one_page(&GPAS, &runs),
+                QUIET,
+                next_gen(),
+            );
+        }
 
-        let dropped = w
-            .evict_oldest(&mut host)
-            .expect("a full table has a window to drop");
-        assert_eq!(
-            dropped,
-            (key_at(1), PAGE as u64),
-            "the eviction named the wrong window, or reported no span"
-        );
-        assert!(!w.entries.contains_key(&key_at(1)));
-        assert!(
-            w.entries.contains_key(&key_at(0)),
-            "the re-touched window was evicted, so the victim is insertion order and not recency"
-        );
-
-        // An empty table has nothing to name, and must not invent one.
-        let mut empty = GatherWitness::default();
-        assert!(empty.evict_oldest(&mut host).is_none());
+        assert_eq!(w.retire_task(7).len(), 1);
+        assert_eq!(w.retire_mapping(11).len(), 1);
+        assert!(!w.entries.contains_key(&keys[0]));
+        assert!(!w.entries.contains_key(&keys[2]));
+        assert!(w.entries.contains_key(&keys[1]));
+        assert!(w.entries.contains_key(&keys[3]));
     }
 }

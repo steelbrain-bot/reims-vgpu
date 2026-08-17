@@ -43,10 +43,6 @@ use crate::runtime::guest_ram::{GuestRamError, GuestRamImport, GuestRef};
 pub(crate) struct ImportedHostRam {
     pub buffer: vk::Buffer,
     pub memory: vk::DeviceMemory,
-    /// Memory type selected when the parent allocation was imported. Child
-    /// images may alias this memory only when their own requirements name the
-    /// same type.
-    pub memory_type_index: u32,
     /// Bytes the import covers. The buffer spans all of it, so every
     /// [`crate::runtime::guest_ram::BoundRange`] inside the import is a valid
     /// offset into this one buffer.
@@ -215,15 +211,6 @@ pub(crate) struct BoundGuestRam {
 #[derive(Clone, Copy)]
 struct LiveImport {
     allocation: ImportedHostRam,
-    child_images: usize,
-    retired: bool,
-    retirement_fences_cleared: bool,
-}
-
-pub(crate) enum ParentRetire {
-    NotImported,
-    WaitingForChildren,
-    Ready(ImportedHostRam),
 }
 
 #[derive(Default)]
@@ -291,76 +278,15 @@ impl HostRamImports {
         unsafe { self.ensure(ctx, import) }.map(|(_, made)| made)
     }
 
-    /// Return the one device-memory import owned by `import`'s allocation.
+    /// End a guest allocation's backend lifetime.
     ///
-    /// Child buffers and images are views into this parent allocation; they do
-    /// not import the host pointer again. The caller still has to validate the
-    /// child's memory requirements and bind offset before using the handle.
-    pub(crate) unsafe fn allocation(
-        &mut self,
-        ctx: &super::context::DeviceContext,
-        import: &GuestRamImport,
-    ) -> Result<ImportedHostRam, HostRamDecline> {
-        unsafe { self.ensure(ctx, import) }.map(|(live, _)| live)
-    }
-
-    /// Record one child image bound into this parent allocation.
-    pub(crate) fn retain_child(&mut self, import: &GuestRamImport) {
-        let entry = self
-            .live
-            .get_mut(&import.id().get())
-            .expect("a child can only retain the parent it just bound");
-        entry.child_images = entry
-            .child_images
-            .checked_add(1)
-            .expect("child image reference count overflow");
-    }
-
-    /// Release one retired child. Returns the parent allocation exactly when
-    /// its guest lifetime has ended and this was its last child.
-    pub(crate) fn release_child(&mut self, import: &GuestRamImport) -> Option<ImportedHostRam> {
-        let key = import.id().get();
-        let entry = self.live.get_mut(&key)?;
-        entry.child_images = entry
-            .child_images
-            .checked_sub(1)
-            .expect("every child release has a matching retain");
-        if entry.retired && entry.child_images == 0 && entry.retirement_fences_cleared {
-            return self.remove_live(key);
-        }
-        None
-    }
-
-    /// The submission slots that were open when the parent retired have all
-    /// completed. Returns the allocation when child retirement completed too.
-    pub(crate) fn retirement_fences_cleared(
-        &mut self,
-        import_id: crate::runtime::guest_ram::ImportId,
-    ) -> Option<ImportedHostRam> {
-        let key = import_id.get();
-        let entry = self.live.get_mut(&key)?;
-        entry.retirement_fences_cleared = true;
-        if entry.retired && entry.child_images == 0 {
-            return self.remove_live(key);
-        }
-        None
-    }
-
-    /// End a guest parent allocation's lifetime. Existing children keep its
-    /// Vulkan import alive until their in-flight-safe retirement completes.
+    /// The caller parks the returned handle against every open submission
+    /// before destruction, so no GPU buffer reference can outlive the import.
     pub(crate) fn retire(
         &mut self,
         import_id: crate::runtime::guest_ram::ImportId,
-    ) -> ParentRetire {
-        let key = import_id.get();
-        let Some(entry) = self.live.get_mut(&key) else {
-            return ParentRetire::NotImported;
-        };
-        entry.retired = true;
-        if entry.child_images == 0 {
-            return ParentRetire::Ready(self.remove_live(key).expect("the entry was found above"));
-        }
-        ParentRetire::WaitingForChildren
+    ) -> Option<ImportedHostRam> {
+        self.remove_live(import_id.get())
     }
 
     /// The one place a RAMBlock becomes an import, so "have we imported this
@@ -391,15 +317,7 @@ impl HostRamImports {
                 return Err(decline);
             }
         };
-        self.live.insert(
-            key,
-            LiveImport {
-                allocation: made,
-                child_images: 0,
-                retired: false,
-                retirement_fences_cleared: false,
-            },
-        );
+        self.live.insert(key, LiveImport { allocation: made });
         self.kinds.insert(key, import.gpa_base().is_some());
         Ok((made, true))
     }
@@ -512,10 +430,8 @@ unsafe fn import_ramblock(
     // guest's bytes instead, and no `vkAllocateMemory` the specification forbids
     // is ever issued — which is the difference between the two drivers this was
     // reported on, one of which returns success and then loses the device.
-    let pick = picked.map_err(|refusal| HostRamDecline::NoImportableMemoryType {
-        host_base,
-        refusal,
-    })?;
+    let pick =
+        picked.map_err(|refusal| HostRamDecline::NoImportableMemoryType { host_base, refusal })?;
     let memory_type_index = pick.index;
     let alloc_started = Instant::now();
 
@@ -563,7 +479,6 @@ unsafe fn import_ramblock(
             Ok(()) => Ok(ImportedHostRam {
                 buffer,
                 memory,
-                memory_type_index,
                 size,
             }),
             Err(result) => {
@@ -605,9 +520,6 @@ unsafe fn import_ramblock(
 /// counted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GuestWriteDecline {
-    /// The named resident is an ordinary device allocation rather than the
-    /// guest allocation synchronization requires.
-    NoSharedBacking,
     /// The device cannot import guest RAM at all. Carries the rung so the log
     /// says which check refused; expected on every host without the extension.
     Unsupported {
@@ -660,7 +572,6 @@ pub enum GuestWriteDecline {
 impl Decline for GuestWriteDecline {
     fn slug(&self) -> &'static str {
         match self {
-            Self::NoSharedBacking => "gpu_writeback_no_shared_backing",
             Self::Unsupported { .. } => "gpu_writeback_unsupported",
             Self::NoCompletionPoint => "gpu_completion_point_missing",
             Self::ResidentFormatMismatch { .. } => "gpu_writeback_resident_format_mismatch",
@@ -675,7 +586,6 @@ impl Decline for GuestWriteDecline {
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
-            Self::NoSharedBacking => Vec::new(),
             Self::Unsupported { rung } => vec![("rung", rung.slug().to_string())],
             Self::NoCompletionPoint => Vec::new(),
             Self::ResidentFormatMismatch { held, want } => vec![
@@ -803,98 +713,6 @@ mod tests {
             .fields()
             .iter()
             .any(|(name, value)| *name == "pointer_types" && value == "0xa"));
-    }
-
-    #[test]
-    fn a_retired_parent_waits_for_its_last_child_and_cannot_resurrect() {
-        let import = GuestRamImport::new_host_allocation(0x1000, 0x4000, 0x1000)
-            .expect("aligned synthetic import");
-        let key = import.id().get();
-        let allocation = ImportedHostRam {
-            buffer: vk::Buffer::null(),
-            memory: vk::DeviceMemory::null(),
-            memory_type_index: 0,
-            size: 0x4000,
-        };
-        let mut imports = HostRamImports::default();
-        imports.live.insert(
-            key,
-            LiveImport {
-                allocation,
-                child_images: 0,
-                retired: false,
-                retirement_fences_cleared: false,
-            },
-        );
-        imports.retain_child(&import);
-        imports.retain_child(&import);
-        import.retire();
-
-        assert!(matches!(
-            imports.retire(import.id()),
-            ParentRetire::WaitingForChildren
-        ));
-        assert!(
-            imports.release_child(&import).is_none(),
-            "one child remains"
-        );
-        assert!(
-            imports.retirement_fences_cleared(import.id()).is_none(),
-            "the retirement barrier passed but one child remains"
-        );
-        assert_eq!(
-            imports.release_child(&import).map(|parent| parent.size),
-            Some(0x4000),
-            "the last child hands the parent back exactly once"
-        );
-        assert!(!imports.live.contains_key(&key));
-        assert!(import.is_retired());
-    }
-
-    #[test]
-    fn parent_release_waits_when_the_last_child_finishes_before_the_fence_barrier() {
-        let import = GuestRamImport::new_host_allocation(0x5000, 0x4000, 0x1000)
-            .expect("aligned synthetic import");
-        let key = import.id().get();
-        let mut imports = HostRamImports::default();
-        imports.live.insert(
-            key,
-            LiveImport {
-                allocation: ImportedHostRam {
-                    buffer: vk::Buffer::null(),
-                    memory: vk::DeviceMemory::null(),
-                    memory_type_index: 0,
-                    size: 0x4000,
-                },
-                child_images: 0,
-                retired: false,
-                retirement_fences_cleared: false,
-            },
-        );
-        imports.retain_child(&import);
-        import.retire();
-        assert!(matches!(
-            imports.retire(import.id()),
-            ParentRetire::WaitingForChildren
-        ));
-        assert!(
-            imports.release_child(&import).is_none(),
-            "the retirement fence has not completed"
-        );
-        assert_eq!(
-            imports
-                .retirement_fences_cleared(import.id())
-                .map(|parent| parent.size),
-            Some(0x4000)
-        );
-    }
-
-    #[test]
-    fn a_missing_shared_backing_has_its_own_sync_refusal() {
-        assert_eq!(
-            GuestWriteDecline::NoSharedBacking.slug(),
-            "gpu_writeback_no_shared_backing"
-        );
     }
 
     #[test]

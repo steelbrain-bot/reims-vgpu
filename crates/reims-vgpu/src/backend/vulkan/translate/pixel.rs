@@ -1175,7 +1175,10 @@ mod tests {
         // contract does not define it — an undefined value would satisfy the
         // sweep above for the wrong reason.
         for &(mtl, why) in EXCEPTIONS {
-            assert!(translate(mtl).is_ok(), "{mtl:#x} is a defined format ({why})");
+            assert!(
+                translate(mtl).is_ok(),
+                "{mtl:#x} is a defined format ({why})"
+            );
         }
 
         // The ten-bit biplanar video planes travel together: a shader samples
@@ -1622,14 +1625,8 @@ mod tests {
     #[test]
     fn the_cpu_sampled_rail_lands_where_the_zero_copy_rail_does() {
         for (mtl, expected) in [
-            (
-                p::MTL_FORMAT_RGBA8_UNORM_SRGB,
-                vk::Format::R8G8B8A8_SRGB,
-            ),
-            (
-                p::MTL_FORMAT_BGRA8_UNORM_SRGB,
-                vk::Format::B8G8R8A8_SRGB,
-            ),
+            (p::MTL_FORMAT_RGBA8_UNORM_SRGB, vk::Format::R8G8B8A8_SRGB),
+            (p::MTL_FORMAT_BGRA8_UNORM_SRGB, vk::Format::B8G8R8A8_SRGB),
         ] {
             let (layout, _, _) = sampled_pixels(mtl).expect("both sRGB orders sample");
             let bytes = SampledByteFormat::from_source(layout, mtl);
@@ -1987,8 +1984,9 @@ mod tests {
     fn expected_names_every_format_the_table_translates() {
         let listed: std::collections::BTreeSet<u16> =
             EXPECTED.iter().map(|(mtl, ..)| *mtl).collect();
-        let translated: std::collections::BTreeSet<u16> =
-            (0..=u16::MAX).filter(|mtl| translate(*mtl).is_ok()).collect();
+        let translated: std::collections::BTreeSet<u16> = (0..=u16::MAX)
+            .filter(|mtl| translate(*mtl).is_ok())
+            .collect();
         assert_eq!(
             translated, listed,
             "translate accepts formats EXPECTED does not name (or the reverse), so they are \

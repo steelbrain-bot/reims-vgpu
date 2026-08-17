@@ -317,6 +317,9 @@ fn vouch_for_write<M: HostMemory + HostOps>(
         mapper::PagesVerdict::Ours => {
             crate::runtime::drain::note_store_route("mapw_pages_vouched");
         }
+        mapper::PagesVerdict::Refreshed => {
+            crate::runtime::drain::note_store_route("mapw_pages_refreshed");
+        }
         // The write proceeds exactly as for `Ours`; only the counter differs.
         // `mapw_pages_vouched` used to carry both, so its companion zero
         // (`mapw_pages_refused`) could not distinguish a guard that passed from
@@ -682,9 +685,9 @@ pub enum GpuWritebackDecline {
     /// This window's pages did not become a reference. Carries the check
     /// [`crate::runtime::guest_ram_map`] refused on — including the one that
     /// says nothing about the window at all, that this host cannot import guest
-    /// RAM. There is deliberately no separate variant for that: the early-out
-    /// above and the walk below now ask one function, so they cannot name the
-    /// same host two ways, and `via=` says which check answered either way.
+    /// RAM. There is deliberately no separate variant for that: the whole-RAM
+    /// fallback asks one resolver, so it cannot name the same host two ways,
+    /// and `via=` says which check answered.
     ///
     /// It carries it rather than pointing at it. That module reports each
     /// distinct refusal **once per boot** — `report_once` latches on
@@ -697,6 +700,12 @@ pub enum GpuWritebackDecline {
     /// inner check is the cheaper error.
     GuestRefRefused {
         refusal: crate::runtime::guest_ram_map::MapRefusal,
+    },
+    /// The mapping-owned import existed, but its own checked slice could not
+    /// describe the destination window. This is an allocation-bound invariant
+    /// failure, distinct from the optional whole-RAMBlock map refusing a GPA.
+    ResourceRefRefused {
+        inner: crate::runtime::guest_ram::GuestRamError,
     },
     /// The engine declined or the copy failed; the inner error names which.
     Engine {
@@ -719,6 +728,7 @@ impl crate::observe::Decline for GpuWritebackDecline {
             Self::PageUnbacked { .. } => "gpuwb_page_unbacked",
             Self::PagesNotOurs => "gpuwb_pages_not_ours",
             Self::GuestRefRefused { .. } => "gpuwb_guest_ref_refused",
+            Self::ResourceRefRefused { inner } => crate::observe::Decline::slug(inner),
             // The engine's own slug, so a driver that refuses the pointer and a
             // resident in the wrong channel order stay as distinguishable here
             // as they are where they were decided.
@@ -737,6 +747,7 @@ impl crate::observe::Decline for GpuWritebackDecline {
                 f.extend(crate::observe::Decline::fields(refusal));
                 f
             }
+            Self::ResourceRefRefused { inner } => crate::observe::Decline::fields(inner),
             Self::GeometryMoved {
                 latched_width,
                 latched_height,
@@ -755,10 +766,9 @@ impl crate::observe::Decline for GpuWritebackDecline {
                 ("fmt", format!("{format:#x}")),
             ],
             Self::FormatNeedsConversion { format } => vec![("fmt", format!("{format:#x}"))],
-            Self::ResidentFormatMismatch { held, want } => vec![
-                ("held", format!("{held:?}")),
-                ("want", format!("{want:?}")),
-            ],
+            Self::ResidentFormatMismatch { held, want } => {
+                vec![("held", format!("{held:?}")), ("want", format!("{want:?}"))]
+            }
             Self::PitchNotTexels { bpr } => vec![("bpr", bpr.to_string())],
             Self::OffsetNotTexelAligned { in_page } => vec![("in_page", in_page.to_string())],
             Self::PageListShort { need, have } => {
@@ -1125,42 +1135,12 @@ pub(crate) fn licence_type11_surface<M: HostMemory + HostOps>(
             want: dst_format,
         });
     }
-    let shared_backing = if host.map_pages_stable() {
-        mapper::ensure_contig_view(state, host, mapping_id).map(|(ptr, len)| {
-            crate::backend::vulkan::engine::GuestTargetBacking {
-                allocation_host_ptr: ptr,
-                allocation_len: len as u64,
-                plane_offset: base_off,
-                row_pitch: u64::from(bpr),
-            }
-        })
+    let shared_import = if host.map_pages_stable() {
+        mapper::ensure_contig_import_with_footprint(state, host, mapping_id)
+            .map(|(import, _footprint)| import)
     } else {
         None
     };
-    // One live window per physical format is enough to answer the remaining
-    // device-level question: whether the driver's actual linear layout and
-    // memory requirements agree with a guest plane on this host. The packed
-    // view is the allocation a direct image retains. The report remains useful
-    // because creation declines are per target and this gives the full binding
-    // equation once per physical format.
-    let probe_key = dst_format.as_raw() as u32 as u64;
-    if crate::observe::first_sight("vk_linear_target_window_probe", probe_key) {
-        if let Some(backing) = shared_backing {
-            crate::backend::vulkan::engine::probe_guest_backed_target(
-                backing.allocation_host_ptr,
-                backing.allocation_len,
-                backing.plane_offset,
-                backing.row_pitch,
-                mw,
-                mh,
-                dst_format,
-            );
-        } else {
-            crate::observe::off(format!(
-                "vk_linear_target_window verdict=no_packed_alias format={dst_format:?} {mw}x{mh} plane_offset={base_off} guest_row_pitch={bpr}"
-            ));
-        }
-    }
     // No settle here, and the twin rail is why. `render_writeback::store_gva_frame`
     // does exactly this for a GVA-addressed destination — vouch, resolve runs,
     // submit a buffer copy — and takes no settle at all, because nothing between
@@ -1180,23 +1160,6 @@ pub(crate) fn licence_type11_surface<M: HostMemory + HostOps>(
     // settles and 7.29 s blocked** on a driven Safari-drag boot — 42 % of every
     // wait in the device — for an ordering the queue already had.
     //
-    // Nothing below can land a frame on a host whose GPU cannot import guest
-    // RAM, so the walks below are skipped rather than run and discarded.
-    //
-    // Not a second gate — it is the *same* gate, asked earlier.
-    // `references_for_runs` below opens with the identical question and would
-    // decline these same pages a few hundred microseconds later; this only
-    // declines sooner, and on a pathway where the answer never changes that
-    // saves a page-table walk per flush for the life of the process.
-    //
-    // Asked through `standing_refusal` rather than by re-reading the
-    // granularity latch, because the latch is only one of the four things that
-    // refuse here — a shim that cannot say where guest RAM lives and a machine
-    // whose every span failed the bound both leave a granularity published, and
-    // used to walk the whole page list before finding that out.
-    if let Some(refusal) = crate::runtime::guest_ram_map::standing_refusal(host) {
-        return Err(GpuWritebackDecline::GuestRefRefused { refusal });
-    }
     // Timed on its own because it is the largest `O(pages)` step left and its
     // fix is not the other one's. `vouch_for_write` re-walks every page of the
     // mapping through the guest's page table — the check that licenses writing
@@ -1245,18 +1208,32 @@ pub(crate) fn licence_type11_surface<M: HostMemory + HostOps>(
     // it would let the two rails land different guest memory for one frame.
     let pitch = u64::from(plan.row_length_texels.max(mw)) * u64::from(texel);
     let extent = u64::from(mh.saturating_sub(1)) * pitch + u64::from(mw) * u64::from(texel);
-    // Every run, not one range. The guest backs a surface in 16 KiB granules
-    // with no relation to each other, so a full-screen window is ~507 stretches
-    // and asking for a single contiguous reference refused every 1080p flush of
-    // a driven boot.
-    let runs = crate::runtime::guest_ram_map::references_for_runs(
-        host,
-        &gpas,
-        page_size,
-        plan.in_page,
-        extent,
-    )
-    .map_err(|refusal| GpuWritebackDecline::GuestRefRefused { refusal })?;
+    // Prefer the allocation-sized import retained by this mapping. It follows
+    // the guest resource's lifetime and makes unrelated RAM irrelevant to this
+    // destination, matching the task-range contract. The all-RAMBlock map is
+    // only the fallback for hosts that cannot retain a stable packed alias;
+    // that fallback keeps every physical run because guest surface pages have
+    // no contract requiring them to be contiguous.
+    let runs = if let Some(import) = shared_import {
+        let slice = import
+            .slice(base_off, extent)
+            .map_err(|inner| GpuWritebackDecline::ResourceRefRefused { inner })?;
+        let guest = crate::runtime::guest_ram::GuestRef::new(std::sync::Arc::clone(&import), slice)
+            .map_err(|inner| GpuWritebackDecline::ResourceRefRefused { inner })?;
+        vec![crate::runtime::guest_ram_map::GuestWindowRun {
+            window_offset: 0,
+            guest,
+        }]
+    } else {
+        crate::runtime::guest_ram_map::references_for_runs(
+            host,
+            &gpas,
+            page_size,
+            plan.in_page,
+            extent,
+        )
+        .map_err(|refusal| GpuWritebackDecline::GuestRefRefused { refusal })?
+    };
     let target = crate::backend::vulkan::engine::GuestPageTarget {
         runs,
         row_length_texels: plan.row_length_texels,
@@ -1267,7 +1244,6 @@ pub(crate) fn licence_type11_surface<M: HostMemory + HostOps>(
         // from its width, and the engine refuses the copy outright if the
         // resident does not hold exactly this.
         format: dst_format,
-        shared_backing,
     };
     // Both witnesses before the copy rather than after it, matching
     // `contig_for_write`: a refused write costs a spurious bump, which makes a
@@ -1317,77 +1293,6 @@ pub(crate) fn note_type11_landed(
     // surface cache's entry, if any, is a previous flush's bytes. Same reason
     // `write_bgra8_uncached` invalidates rather than publishes.
     crate::runtime::surface_cache::forget(state, mapping_id);
-}
-
-/// Publish a Store from an attachment already backed by this mapping.
-///
-/// Import admission retained the mapping's bounded allocation and physical-page
-/// footprint in the resident. Synchronization therefore names that resident;
-/// it does not reconstruct a `GuestPageTarget`, re-walk the page table, or
-/// reacquire one guest reference per page.  Those operations describe a copy
-/// destination, and this path has no copy destination—the attachment is the
-/// guest allocation.
-#[cfg(feature = "backend-vulkan")]
-pub fn synchronize_guest_backed_resident(
-    state: &mut DeviceState,
-    mapping_id: u32,
-    identity: &crate::backend::vulkan::engine::TargetIdentity,
-    width: u32,
-    height: u32,
-    guest_store_recorded: bool,
-    guest_store_footprint: Option<crate::runtime::guest_ram::GuestPageFootprint>,
-) -> Result<u64, GpuWritebackDecline> {
-    if !scanout_extent_ok(width, height) {
-        return Err(GpuWritebackDecline::NotWritable);
-    }
-    let Some(m) = state.mappings.get(&mapping_id) else {
-        return Err(GpuWritebackDecline::NotWritable);
-    };
-    if !m.mapped || m.page_entries.is_empty() {
-        return Err(GpuWritebackDecline::NotWritable);
-    }
-    let (mw, mh, format) = mapping_write_geometry(m, width, height);
-    if mw != width || mh != height {
-        return Err(GpuWritebackDecline::GeometryMoved {
-            latched_width: mw,
-            latched_height: mh,
-            frame_width: width,
-            frame_height: height,
-        });
-    }
-    let Some((base_off, _bpr, span_end)) = type11_sample_window(m, mw, mh, format) else {
-        return Err(GpuWritebackDecline::WindowUnresolved {
-            width: mw,
-            height: mh,
-            format,
-        });
-    };
-    let footprint = if guest_store_needs_separate_sync(guest_store_recorded) {
-        crate::backend::vulkan::engine::synchronize_guest_backed_target(identity)
-            .map_err(|inner| GpuWritebackDecline::Engine { inner })?
-    } else {
-        guest_store_footprint.ok_or(GpuWritebackDecline::Engine {
-            inner: crate::backend::vulkan::engine::DrawError::GuestPageWrite(
-                crate::backend::vulkan::engine::GuestWriteDecline::NoSharedBacking,
-            ),
-        })?
-    };
-
-    mapper::note_physical_page_write_footprint(
-        &footprint,
-        base_off,
-        span_end - base_off,
-    );
-    state.host_writes.note_footprint(&footprint);
-    state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
-    let _ = state.mark_mapping_written(mapping_id);
-    crate::runtime::surface_cache::forget(state, mapping_id);
-    Ok(span_end - base_off)
-}
-
-#[cfg(feature = "backend-vulkan")]
-fn guest_store_needs_separate_sync(recorded_in_draw: bool) -> bool {
-    !recorded_in_draw
 }
 
 /// The geometry and pixel format a writeback to this mapping must land in.

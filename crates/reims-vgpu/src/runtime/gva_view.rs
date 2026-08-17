@@ -16,11 +16,11 @@
 
 use crate::model::{DeviceState, GvaHostView, TaskEntry, TaskTable};
 use crate::runtime::gva_mem::HostPhys;
+use crate::runtime::host::{HostMemory, HostOps, MemError};
+use crate::runtime::mapper::{RectStride, RunCopy};
 use reims_vgpu_paging::resolve::{geometry_for_page_shift, Task};
 use reims_vgpu_paging::runs::{contig_page_runs, contig_run_count};
 use reims_vgpu_paging::span::span_page_bases;
-use crate::runtime::host::{HostMemory, HostOps, MemError};
-use crate::runtime::mapper::{RectStride, RunCopy};
 
 /// Dedup key for a fragmented-span decline: the span identity plus its shape.
 ///
@@ -221,7 +221,6 @@ fn collect_span_gpas<M: HostMemory>(
     }
     Ok(gpas)
 }
-
 
 /// Build or reuse a contiguous host-VA view of guest pages for `[gva, gva+length)`.
 ///
@@ -783,9 +782,9 @@ mod tests {
     use super::*;
     use crate::contract::endian::st32;
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use reims_vgpu_paging::resolve::ResolveStatus;
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
     use crate::runtime::host::FakeHost;
+    use reims_vgpu_paging::resolve::ResolveStatus;
 
     fn state_x86() -> DeviceState {
         DeviceState::new(DeviceId(1), 12)

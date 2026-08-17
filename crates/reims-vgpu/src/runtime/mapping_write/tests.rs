@@ -10,16 +10,6 @@ use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
 use crate::runtime::host::FakeHost;
 
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn a_store_recorded_by_its_draw_needs_no_second_engine_sync() {
-    assert!(!guest_store_needs_separate_sync(true));
-    assert!(
-        guest_store_needs_separate_sync(false),
-        "an older or fallback engine result must retain the synchronization transaction"
-    );
-}
-
 /// `mapping_geom_window` puts each measurement in the field of its own name.
 ///
 /// `SurfaceWindow`'s four fields are two `u64`s and two `u32`s, so
@@ -96,8 +86,8 @@ fn a_tight_window_names_the_pages_its_texels_occupy() {
     // 1920x1080 BGRA8, tight, starting at offset 0 of a 4 KiB-page guest.
     let (page, bpr) = (4096u64, 1920 * 4u32);
     let span = u64::from(bpr) * 1080;
-    let plan =
-        plan_guest_window(usize::MAX, page, 0, span, bpr, 1920, RGBA8_BPP).expect("a tight window plans");
+    let plan = plan_guest_window(usize::MAX, page, 0, span, bpr, 1920, RGBA8_BPP)
+        .expect("a tight window plans");
     assert_eq!(plan.first_page, 0);
     assert_eq!(plan.last_page, ((span - 1) / page) as usize);
     assert_eq!(plan.in_page, 0);
@@ -136,8 +126,10 @@ fn a_window_starting_inside_a_page_carries_the_offset_and_not_the_mapping_one() 
 fn the_same_window_spans_fewer_pages_on_a_sixteen_kilobyte_guest() {
     let bpr = 1024 * 4u32;
     let span = u64::from(bpr) * 64;
-    let x86 = plan_guest_window(usize::MAX, 4096, 0, span, bpr, 1024, RGBA8_BPP).expect("plans on x86");
-    let arm = plan_guest_window(usize::MAX, 16384, 0, span, bpr, 1024, RGBA8_BPP).expect("plans on arm64");
+    let x86 =
+        plan_guest_window(usize::MAX, 4096, 0, span, bpr, 1024, RGBA8_BPP).expect("plans on x86");
+    let arm = plan_guest_window(usize::MAX, 16384, 0, span, bpr, 1024, RGBA8_BPP)
+        .expect("plans on arm64");
     assert_eq!(x86.pages(), arm.pages() * 4);
 }
 
@@ -149,8 +141,16 @@ fn the_same_window_spans_fewer_pages_on_a_sixteen_kilobyte_guest() {
 #[test]
 fn a_padded_pitch_becomes_a_row_length_in_texels() {
     let bpr = 2048 * 4u32;
-    let plan =
-        plan_guest_window(usize::MAX, 4096, 0, u64::from(bpr) * 4, bpr, 1600, RGBA8_BPP).expect("plans");
+    let plan = plan_guest_window(
+        usize::MAX,
+        4096,
+        0,
+        u64::from(bpr) * 4,
+        bpr,
+        1600,
+        RGBA8_BPP,
+    )
+    .expect("plans");
     assert_eq!(plan.row_length_texels, 2048);
 }
 
@@ -338,7 +338,6 @@ fn unskipped_returns_exactly_the_bytes_no_range_covers() {
         vec![(12, 16), (18, 28)]
     );
 }
-
 
 /// A rect taller than the window it names is refused on **both** storage
 /// shapes, and writes nothing past the window.
@@ -683,10 +682,16 @@ fn a_type11_licence_judges_the_callers_window_and_not_the_surfaces_extent() {
     use crate::model::PAGE_SHIFT_X86;
     const PAGE: u64 = 1 << PAGE_SHIFT_X86;
 
+    crate::runtime::guest_ram_map::reset();
+    crate::runtime::guest_ram::forget_import_limits();
     let mut state = DeviceState::new(DeviceId(9), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     let base_pfn = 0x40u32;
-    host.map_range((base_pfn as u64) << PAGE_SHIFT_X86, 16 * PAGE as usize, 0x55);
+    host.map_range(
+        (base_pfn as u64) << PAGE_SHIFT_X86,
+        16 * PAGE as usize,
+        0x55,
+    );
     state.map_surface(7);
     state.attach_mapping_internal(7, 0);
     let m = state.mappings.get_mut(&7).unwrap();
@@ -720,6 +725,75 @@ fn a_type11_licence_judges_the_callers_window_and_not_the_surfaces_extent() {
             ),
         }
     }
+    crate::runtime::guest_ram_map::reset();
+}
+
+/// A type-11 destination follows its mapping allocation, not the amount of
+/// unrelated RAM in the VM. A host may be unable to keep every RAMBlock
+/// imported while still admitting this exact resource-sized allocation.
+#[test]
+fn a_type11_resource_import_survives_a_whole_ram_map_refusal() {
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::model::PAGE_SHIFT_X86;
+    const PAGE: u64 = 1 << PAGE_SHIFT_X86;
+    const MAPPING_PAGES: u64 = 16;
+
+    crate::runtime::guest_ram_map::reset();
+    crate::runtime::guest_ram::latch_import_limits(
+        PAGE,
+        MAPPING_PAGES * PAGE,
+        MAPPING_PAGES * PAGE,
+    );
+
+    let mut host = FakeHost::new();
+    host.stable_map_pages = true;
+    let base_pfn = 0x40u32;
+    host.map_range(
+        (base_pfn as u64) << PAGE_SHIFT_X86,
+        (MAPPING_PAGES * PAGE) as usize,
+        0x55,
+    );
+    // This range is not part of the surface. It exists only to put the optional
+    // all-RAM import past the published heap capacity.
+    host.map_range(0x1000_0000, (2 * MAPPING_PAGES * PAGE) as usize, 0x33);
+    assert!(matches!(
+        crate::runtime::guest_ram_map::standing_refusal(&mut host),
+        Some(crate::runtime::guest_ram_map::MapRefusal::ImportExceedsHeap { .. })
+    ));
+
+    let mut state = DeviceState::new(DeviceId(9), PAGE_SHIFT_X86);
+    state.map_surface(7);
+    state.attach_mapping_internal(7, 0);
+    let mapping = state.mappings.get_mut(&7).unwrap();
+    mapping.mapping_internal = 1;
+    mapping.page_entries = (0..MAPPING_PAGES as u32)
+        .map(|i| ((base_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
+        .collect();
+    assert!(state.set_mapping_geom(7, 64, 64, MTL_FORMAT_BGRA8_UNORM));
+
+    let held = crate::backend::vulkan::translate::pixel::vk_texel_layout(
+        pixel_format::store_texel_order(MTL_FORMAT_BGRA8_UNORM).expect("BGRA8 has a linear texel"),
+    );
+    let licence = licence_type11_surface(
+        &mut state,
+        &mut host,
+        held,
+        &Type11SurfaceDestination {
+            mapping_id: 7,
+            base_off: 0,
+            bpr: 64 * 4,
+            span_end: 64 * 64 * 4,
+            width: 64,
+            height: 64,
+            format: MTL_FORMAT_BGRA8_UNORM,
+        },
+    )
+    .expect("the mapping-sized import remains legal");
+    assert_eq!(licence.target.runs.len(), 1);
+    assert_eq!(licence.target.runs[0].guest.requested(), 64 * 64 * 4);
+
+    crate::runtime::guest_ram_map::reset();
+    crate::runtime::guest_ram::forget_import_limits();
 }
 
 #[test]
@@ -826,23 +900,12 @@ fn a_skipping_write_supersedes_the_debt_instead_of_paying_it_over_the_skip() {
     let superseded0 = count("wbdebt_superseded_by_skipping_write");
 
     // A Store owes this mapping a frame.
-    assert!(
-        state
-            .pending_writebacks
-            .arm(
-                7,
-                crate::runtime::writeback_debt::test_resident_identity(
-                    7,
-                    W,
-                    H,
-                    u64::from(map_generation),
-                ),
-                W,
-                H,
-                map_generation,
-            )
-            .is_none(),
-        "one debt cannot overflow a ledger of 32"
+    state.pending_writebacks.arm(
+        7,
+        crate::runtime::writeback_debt::test_resident_identity(7, W, H, u64::from(map_generation)),
+        W,
+        H,
+        map_generation,
     );
 
     let frame = vec![0xAAu8; (W * H * 4) as usize];
@@ -876,22 +939,12 @@ fn a_skipping_write_supersedes_the_debt_instead_of_paying_it_over_the_skip() {
 
     // The whole-frame writer is unchanged and still pays: it has no ranges to
     // protect, and a debt left standing there would be read straight past.
-    assert!(
-        state
-            .pending_writebacks
-            .arm(
-                7,
-                crate::runtime::writeback_debt::test_resident_identity(
-                    7,
-                    W,
-                    H,
-                    u64::from(map_generation),
-                ),
-                W,
-                H,
-                map_generation,
-            )
-            .is_none()
+    state.pending_writebacks.arm(
+        7,
+        crate::runtime::writeback_debt::test_resident_identity(7, W, H, u64::from(map_generation)),
+        W,
+        H,
+        map_generation,
     );
     assert!(write_bgra8(&mut state, &mut host, 7, &frame, W * 4, W, H));
     assert_eq!(
@@ -1089,14 +1142,13 @@ fn mapping_write_invalidates_intersecting_residency_windows_only() {
 /// `0xff` from offset 0 — opaque white BGRA in memory already handed to
 /// somebody else.
 ///
-/// So the fixture recycles a page the way the guest does: adopt a list walked
-/// through a live task page table, write a frame (which must land), re-point
-/// the PTE with no packet — nothing bumps `map_generation`, which is the
-/// whole defect — and require the second write to refuse. `data1` stands for
-/// whatever the guest gave those pages to next, seeded with a pattern rather
-/// than zeroes so "refused" and "wrote zeroes" cannot be confused.
+/// The fixture adopts a list walked through a live task page table, writes one
+/// frame, and then re-points the PTE with no lifecycle packet. The second write
+/// must refresh the resource's current backing: it lands in `data1`, leaves the
+/// recycled `data0` untouched, preserves the logical resource generation, and
+/// advances only the page-list generation.
 #[test]
-fn a_repointed_surface_refuses_the_write_and_leaves_the_new_owner_alone() {
+fn a_repointed_surface_writes_its_current_backing_and_leaves_the_old_owner_alone() {
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::model::{Type4Walk, PAGE_SHIFT_X86};
 
@@ -1132,7 +1184,7 @@ fn a_repointed_surface_refuses_the_write_and_leaves_the_new_owner_alone() {
         m.type4_walk = Some(Type4Walk {
             task_id: 1,
             backing_pfn: 0,
-            map_generation: m.map_generation,
+            page_generation: m.page_generation,
         });
     }
 
@@ -1170,7 +1222,11 @@ fn a_repointed_surface_refuses_the_write_and_leaves_the_new_owner_alone() {
         "no packet arrived, so nothing bumped the incarnation"
     );
 
-    let refused = !write_bgra8(&mut state, &mut host, mid, &frame, stride, w, h);
+    let page_generation_before = state.mappings.get(&mid).unwrap().page_generation;
+    assert!(
+        write_bgra8(&mut state, &mut host, mid, &frame, stride, w, h),
+        "a complete current-backing walk must refresh and land the frame"
+    );
     // The memory assertion comes first deliberately. A return value is this
     // crate's opinion about what it did; `data0` is what the guest will
     // actually find in its heap, and that is the claim the crash reports
@@ -1183,23 +1239,25 @@ fn a_repointed_surface_refuses_the_write_and_leaves_the_new_owner_alone() {
         "the page the guest took away must still hold its new owner's bytes \
          — this is the guest heap corruption the whole goal is about"
     );
-    assert!(
-        refused,
-        "and the caller is told, so a lost frame is never read as a landed one"
+    let mut current = [0u8; 16];
+    host.read_gpa(data1, &mut current).unwrap();
+    assert_eq!(
+        current, [0xffu8; 16],
+        "the frame reached the current backing"
     );
-
-    // Refusing once is not enough: `page_entries` is what every later reader
-    // and writer resolves through, so a list a fresh walk has contradicted
-    // has to stop being believed rather than be skipped once.
-    assert!(
-        state.mappings.get(&mid).unwrap().page_entries.is_empty(),
-        "the contradicted list is dropped, so the next bind re-resolves"
+    let mapping = state.mappings.get(&mid).unwrap();
+    assert_eq!(
+        mapping.map_generation, generation_before,
+        "physical migration does not create a new logical resource"
     );
     assert_ne!(
-        state.mappings.get(&mid).unwrap().map_generation,
-        generation_before,
-        "and every window still armed against the old incarnation refuses \
-         on the map_generation check it already had"
+        mapping.page_generation, page_generation_before,
+        "page-bound proofs and aliases must move to a new backing generation"
+    );
+    assert_eq!(
+        crate::contract::iosurface_pages::entry_gpa_shift(mapping.page_entries[0], PAGE_SHIFT_X86),
+        Some(data1),
+        "the cached page list now names the current backing"
     );
 }
 
@@ -1623,7 +1681,8 @@ fn a_packed_sub_rectangle_of_a_scattered_plane_reads_through_one_walk() {
     for (i, gpa) in gpas.iter().enumerate() {
         host.map_range(*gpa, page as usize, 0);
         let lo = i * page as usize;
-        host.write_gpa(*gpa, &plane[lo..lo + page as usize]).unwrap();
+        host.write_gpa(*gpa, &plane[lo..lo + page as usize])
+            .unwrap();
     }
     let mid = 21u32;
     state.map_surface(mid);
@@ -1633,7 +1692,9 @@ fn a_packed_sub_rectangle_of_a_scattered_plane_reads_through_one_walk() {
         m.mapping_internal = 1;
         m.page_entries = gpas
             .iter()
-            .map(|gpa| (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
+            .map(|gpa| {
+                (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
+            })
             .collect();
     }
 

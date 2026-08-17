@@ -581,49 +581,87 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
         let info = vk::SemaphoreWaitInfo::default()
             .semaphores(&semaphores)
             .values(&values);
-        // The same deadline every blocking wait in this backend uses. Reaching
-        // it means the queue has not run this submission, which is a device
-        // fault rather than a slow frame — announce anyway and say so, because
-        // the guest's own deadline is one second and a withheld stamp costs it
-        // that whether the GPU is wedged or not.
-        let completed =
-            match unsafe { device.wait_semaphores(&info, super::context::FENCE_TIMEOUT_NS) } {
-                Ok(()) => true,
-                Err(vk::Result::TIMEOUT) => {
+        // The same deadline every blocking wait in this backend uses. It is a
+        // diagnostic deadline, not permission to discard the association: the
+        // guest-visible word means this exact submission completed. Keep the
+        // entry at the head and retry until that becomes true.
+        let wait = unsafe { device.wait_semaphores(&info, super::context::FENCE_TIMEOUT_NS) };
+        match classify_wait(wait, shared.stop.load(Ordering::Acquire)) {
+            CompletionWait::Completed => {}
+            CompletionWait::Retry => {
+                if crate::observe::first_sight("stamp_wait_timeout", timeline) {
                     crate::observe::fail(format!(
                         "stamp_wait_timeout reason=stamp_wait_timeout index={} value={} \
-                     (the submission carrying this stamp's word has not executed within the \
-                     fence deadline; announcing it anyway so the guest is not left asleep)",
+                         (the submission carrying this stamp's word has not executed within the \
+                         fence deadline; its completion remains pending)",
                         waiting.index, timeline
                     ));
-                    false
-                }
-                Err(e) => {
-                    crate::observe::fail(format!(
-                        "stamp_wait_failed reason=stamp_wait_failed index={} value={} err={e:?} \
-                     (announcing regardless, for the reason a timeout does)",
-                        waiting.index, timeline
-                    ));
-                    // Announcing is not recovering. This thread may not take the
-                    // engine lock — it exists to announce guest fences while the
-                    // drain worker holds it — so it latches the loss and the drain's
-                    // end-of-tranche flush runs the recovery. Without this, a boot
-                    // whose device dies *here* never rebuilds it: the guest stops
-                    // drawing because its work stopped completing, and "the next
-                    // draw will surface it" then waits forever.
-                    if e == vk::Result::ERROR_DEVICE_LOST {
-                        super::device_lost::note_device_lost_seen();
+                    // Join on the queue's timeline value, not `waiting.index`:
+                    // the latter names the guest FIFO whose word is waiting,
+                    // while the former is the exact Vulkan submission that
+                    // must signal. Treating a FIFO ordinal as a ring slot would
+                    // produce plausible-looking evidence for unrelated work.
+                    match crate::runtime::gpu_hang_trail::submission_for_timeline(timeline) {
+                        Some((slot, submission)) => crate::observe::fail(format!(
+                            "stamp_wait_timeout_submission reason=stamp_wait_timeout \
+                             index={} value={} slot={} held=[{}]",
+                            waiting.index, timeline, slot, submission
+                        )),
+                        None => crate::observe::fail(format!(
+                            "stamp_wait_timeout_submission reason=stamp_wait_timeout \
+                             index={} value={} held=none \
+                             (no live submission-ring entry carries this timeline point)",
+                            waiting.index, timeline
+                        )),
                     }
-                    false
+                    if let Some(outstanding) = crate::runtime::gpu_hang_trail::outstanding() {
+                        crate::observe::fail(format!(
+                            "stamp_wait_timeout_queue reason=stamp_wait_timeout index={} \
+                             value={} {outstanding}",
+                            waiting.index, timeline
+                        ));
+                    }
+                    if let Some(trail) = crate::runtime::gpu_hang_trail::trail() {
+                        crate::observe::fail(format!(
+                            "stamp_wait_timeout_trail reason=stamp_wait_timeout index={} \
+                             value={} {trail}",
+                            waiting.index, timeline
+                        ));
+                    }
+                    if let Some(firsts) = crate::runtime::gpu_hang_trail::recent_pipeline_firsts() {
+                        crate::observe::fail(format!(
+                            "stamp_wait_timeout_pipes reason=stamp_wait_timeout index={} \
+                             value={} {firsts}",
+                            waiting.index, timeline
+                        ));
+                    }
                 }
-            };
-        let stopping = shared.stop.load(Ordering::Acquire);
-        if should_publish(completed, stopping) && !publish_stamp_word(&waiting) {
+                continue;
+            }
+            CompletionWait::Failed(e) => {
+                crate::observe::fail(format!(
+                    "stamp_wait_failed reason=stamp_wait_failed index={} value={} err={e:?} \
+                     (the completion remains unpublished)",
+                    waiting.index, timeline
+                ));
+                // This thread may not take the engine lock — it exists to
+                // announce guest fences while the drain worker holds it — so it
+                // latches the loss and the drain's end-of-tranche flush runs the
+                // established context recovery. No later stamp may pass this
+                // missing point in the meantime.
+                super::device_lost::note_device_lost_seen();
+                return;
+            }
+            CompletionWait::Stopping => return,
+        }
+        if !publish_stamp_word(&waiting) {
             crate::observe::fail(format!(
                 "stamp_cpu_store_failed reason=stamp_cpu_store_failed index={} value={:#x} \
-                 (the completed queue point could not publish its checked shared word)",
+                 (the completed queue point could not publish its checked shared word; \
+                 its interrupt was withheld)",
                 waiting.index, waiting.stamp
             ));
+            return;
         }
         {
             let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
@@ -635,14 +673,26 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
         }
         shared.wake.notify_all();
         announce(waiting.index);
-        if stopping {
-            return;
-        }
     }
 }
 
-fn should_publish(completed: bool, stopping: bool) -> bool {
-    completed && !stopping
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompletionWait {
+    Completed,
+    Retry,
+    Failed(vk::Result),
+    Stopping,
+}
+
+fn classify_wait(result: Result<(), vk::Result>, stopping: bool) -> CompletionWait {
+    if stopping {
+        return CompletionWait::Stopping;
+    }
+    match result {
+        Ok(()) => CompletionWait::Completed,
+        Err(vk::Result::TIMEOUT) => CompletionWait::Retry,
+        Err(error) => CompletionWait::Failed(error),
+    }
 }
 
 fn publish_stamp_word(waiting: &Waiting) -> bool {
@@ -878,10 +928,22 @@ mod tests {
     }
 
     #[test]
-    fn teardown_wakeup_never_publishes_unfinished_work() {
-        assert!(should_publish(true, false));
-        assert!(!should_publish(false, false));
-        assert!(!should_publish(true, true));
+    fn only_a_completed_wait_may_publish_and_retire_its_entry() {
+        assert_eq!(classify_wait(Ok(()), false), CompletionWait::Completed);
+        assert_eq!(
+            classify_wait(Err(vk::Result::TIMEOUT), false),
+            CompletionWait::Retry,
+            "a diagnostic timeout retains the exact submission association"
+        );
+        assert_eq!(
+            classify_wait(Err(vk::Result::ERROR_DEVICE_LOST), false),
+            CompletionWait::Failed(vk::Result::ERROR_DEVICE_LOST)
+        );
+        assert_eq!(
+            classify_wait(Ok(()), true),
+            CompletionWait::Stopping,
+            "the host signal used for teardown is not guest completion"
+        );
     }
 
     #[test]

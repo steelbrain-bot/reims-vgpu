@@ -609,6 +609,7 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         }
         if pages_changed {
             DeviceState::bump_map_generation(m);
+            DeviceState::bump_page_generation(m);
         }
         // The guest-physical footprint this incarnation authorises us to write.
         //
@@ -1126,7 +1127,7 @@ pub fn revalidate_mapping_reason<H: HostMemory + HostOps>(
 /// here changes policy; it changes what the boot can say about it.
 ///
 /// [`Unwitnessed`]: Type4Witness::Unwitnessed
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Type4Witness {
     /// Every page of the cached list was re-walked and agreed. The only exit
     /// that is evidence the list still names the surface's memory.
@@ -1135,8 +1136,13 @@ pub enum Type4Witness {
     /// they are not one outcome: a surface that never latched a walk is a
     /// different gap from one whose walk was superseded.
     Unwitnessed(&'static str),
-    /// The re-walk disagreed, or the owning task is gone.
-    Drifted,
+    /// Every page translated, and the complete current backing differs from the
+    /// cached one. The resource is still live; the carried list is its current
+    /// physical backing and can be adopted without changing resource identity.
+    Repointed(Vec<u32>),
+    /// The current backing could not be resolved completely. No destination is
+    /// invented, and the write is refused.
+    Unavailable,
 }
 
 /// Whether a mapping's cached page list still names the guest memory it was
@@ -1170,11 +1176,12 @@ pub enum Type4Witness {
 /// Every page, not two. [`crate::model::Type4Walk`] latched the task and GPU-VA
 /// base the entries were walked from, so the walk repeats with no object search:
 /// page `i` is `(backing_pfn + i) << page_shift` translated through that task.
-/// Any page that translates differently — or no longer translates at all — means
-/// the list in hand names memory that is no longer the surface's.
+/// A complete walk that translates differently supplies the live resource's
+/// current backing and is adopted. A page that no longer translates makes the
+/// current backing unavailable and refuses the write.
 ///
 /// Answers [`Type4Witness::Unwitnessed`] when there is nothing to check
-/// (`type4_walk` absent, or latched at a superseded `map_generation`), because
+/// (`type4_walk` absent, or latched at a superseded `page_generation`), because
 /// this is a *specific* witness and not a general one. That exit is the reason
 /// the return type is an enum rather than a bool: it is not evidence, and a
 /// caller must not read it as "these pages were verified".
@@ -1196,7 +1203,7 @@ pub fn type4_pages_witness<H: HostMemory>(
         // never had anything to say about it. The type-11 rail lives here.
         return Type4Witness::Unwitnessed("no_walk");
     };
-    if walk.map_generation != m.map_generation {
+    if walk.page_generation != m.page_generation {
         // The list has been replaced since the walk was latched. The new list
         // may be perfectly good — it simply has no witness of its own yet.
         return Type4Witness::Unwitnessed("walk_superseded");
@@ -1219,7 +1226,7 @@ pub fn type4_pages_witness<H: HostMemory>(
             walk.task_id,
             m.page_entries.len()
         ));
-        return Type4Witness::Drifted;
+        return Type4Witness::Unavailable;
     }
     // One walk over the whole run, not one per page.
     //
@@ -1245,7 +1252,9 @@ pub fn type4_pages_witness<H: HostMemory>(
     let base_gva = (walk.backing_pfn as u64) << page_shift;
     let span = (entries.len() as u64).saturating_mul(page_size);
     let mut i = 0usize;
-    let mut verdict = None;
+    let mut unavailable = false;
+    let mut moved = false;
+    let mut live_entries = Vec::with_capacity(entries.len());
     crate::runtime::gva_mem::visit_task_gva_pages_in_order(
         host,
         &state.tasks,
@@ -1280,33 +1289,33 @@ pub fn type4_pages_witness<H: HostMemory>(
                     walk.task_id,
                     entries.len()
                 ));
-                verdict = Some(Type4Witness::Drifted);
+                unavailable = true;
                 return false;
             };
-            if cached != Some(live) {
-                // Every entry in this list came from a walk that succeeded:
-                // `apply_type4_backing` refuses the whole surface on the first
-                // page it cannot walk, so it cannot leave a fabricated one
-                // behind. A disagreement here is therefore between two real
-                // translations taken at different times, which is the guest
-                // having re-pointed the surface without saying so.
+            let pfn = live >> page_shift;
+            if pfn > u64::from(u32::MAX) {
                 crate::observe::fail(format!(
                     "mapping_page_drift mid={mapping_id} task={} page={i}/{} gva={gva:#x} \
-                     cached={cached:?} live={:?} reason=translation_moved \
-                     (the guest re-pointed this surface and no packet said so)",
+                     live={live:#x} reason=pfn_oob",
                     walk.task_id,
-                    entries.len(),
-                    Some(live)
+                    entries.len()
                 ));
-                verdict = Some(Type4Witness::Drifted);
+                unavailable = true;
                 return false;
             }
+            let live_entry = ((pfn as u32)
+                << crate::contract::iosurface_pages::PAGE_ENTRY_PFN_SHIFT)
+                | crate::contract::iosurface_pages::PAGE_ENTRY_VALID;
+            if cached != Some(live) {
+                moved = true;
+            }
+            live_entries.push(live_entry);
             i += 1;
             true
         },
     );
-    if let Some(verdict) = verdict {
-        return verdict;
+    if unavailable {
+        return Type4Witness::Unavailable;
     }
     if i != entries.len() {
         // The visitor stopped before the list did — an inactive task, a
@@ -1321,9 +1330,13 @@ pub fn type4_pages_witness<H: HostMemory>(
             walk.task_id,
             entries.len()
         ));
-        return Type4Witness::Drifted;
+        return Type4Witness::Unavailable;
     }
-    Type4Witness::Verified
+    if moved {
+        Type4Witness::Repointed(live_entries)
+    } else {
+        Type4Witness::Verified
+    }
 }
 
 /// Proof that a mapping's cached page list named the guest memory it was walked
@@ -1348,9 +1361,10 @@ pub fn type4_pages_witness<H: HostMemory>(
 /// proof to the operation and *presenting* it in the funnel keeps the guarantee
 /// without the quadratic.
 ///
-/// # Why it carries the generation
+/// # Why it carries the page generation
 ///
-/// Six sites clear or replace `page_entries` and all six bump `map_generation`.
+/// Every product site that clears or replaces `page_entries` advances
+/// `page_generation`.
 /// A token minted before one of them names a list that no longer exists, so it
 /// records the generation it was taken at and [`PagesVouched::covers`] re-checks
 /// it at the point of use. A carried-over token is then unusable by
@@ -1359,7 +1373,7 @@ pub fn type4_pages_witness<H: HostMemory>(
 #[derive(Clone, Copy, Debug)]
 pub struct PagesVouched {
     mapping_id: u32,
-    map_generation: u32,
+    page_generation: u32,
 }
 
 impl PagesVouched {
@@ -1373,19 +1387,16 @@ impl PagesVouched {
             && state
                 .mappings
                 .get(&mapping_id)
-                .is_some_and(|m| m.map_generation == self.map_generation)
+                .is_some_and(|m| m.page_generation == self.page_generation)
     }
 }
 
 /// Re-walk a mapping's page list and mint the proof a write needs, or refuse.
 ///
-/// `None` means the list in hand does not name the surface's memory any more.
-/// The response is not to skip this one write: `page_entries` is what every
-/// later reader and writer resolves through, so the list is invalidated, which
-/// clears it, bumps `map_generation` and retires the contiguous view and the
-/// guest-write token with it. Every window still armed against the old
-/// incarnation then refuses on the `map_generation` check it already had, and
-/// the next type-4 bind re-resolves the surface from the object list.
+/// `None` means the current backing could not be resolved completely. The stale
+/// page list is forgotten and all page-bound host state is retired, but the
+/// logical resource remains live. A complete walk that names different pages is
+/// adopted immediately and yields a token for that new page generation.
 ///
 /// Returning a token when there is nothing to check is deliberate and is why
 /// [`type4_pages_witness`] reports "nothing to check" separately rather than
@@ -1408,7 +1419,7 @@ pub fn vouch_mapping_pages_verdict<H: HostMemory + HostOps>(
     }
     let token = state.mappings.get(&mapping_id).map(|m| PagesVouched {
         mapping_id,
-        map_generation: m.map_generation,
+        page_generation: m.page_generation,
     });
     (verdict, token)
 }
@@ -1430,9 +1441,11 @@ pub enum PagesVerdict {
     /// passed or had simply never been armed, and those are opposite claims
     /// about the write-after-free class.
     Unwitnessed(&'static str),
-    /// The re-walk disagreed. The list has been invalidated — refusing this one
-    /// write is not enough, because `page_entries` is what every later reader and
-    /// writer resolves through.
+    /// A complete current-backing walk found new physical pages and adopted
+    /// them for the same logical resource. The write proceeds to those pages.
+    Refreshed,
+    /// The current backing could not be resolved completely. The stale list has
+    /// been forgotten and the write is refused.
     Drifted,
 }
 
@@ -1453,9 +1466,30 @@ pub fn mapping_pages_verdict<H: HostMemory + HostOps>(
         // Same policy as `Verified` — the write goes through — and a different
         // counter, because only one of the two is evidence.
         Type4Witness::Unwitnessed(why) => return PagesVerdict::Unwitnessed(why),
-        Type4Witness::Drifted => {}
+        Type4Witness::Repointed(entries) => {
+            let Some(walk) = state.mappings.get(&mapping_id).and_then(|m| m.type4_walk) else {
+                return PagesVerdict::Unwitnessed("walk_superseded");
+            };
+            if !state.refresh_mapping_pages(mapping_id, entries) {
+                return PagesVerdict::Drifted;
+            }
+            if let Some(m) = state.mappings.get_mut(&mapping_id) {
+                m.type4_walk = Some(crate::model::Type4Walk {
+                    task_id: walk.task_id,
+                    backing_pfn: walk.backing_pfn,
+                    page_generation: m.page_generation,
+                });
+                crate::observe::off(format!(
+                    "mapping_backing_refreshed mid={mapping_id} pages={} page_generation={}",
+                    m.page_entries.len(),
+                    m.page_generation
+                ));
+            }
+            return PagesVerdict::Refreshed;
+        }
+        Type4Witness::Unavailable => {}
     }
-    state.invalidate_mapping_pages(mapping_id);
+    state.forget_mapping_page_backing(mapping_id);
     PagesVerdict::Drifted
 }
 
@@ -1515,7 +1549,7 @@ pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
 /// rendering into it.
 ///
 /// What keys the token to the surface's *current* pages is
-/// [`crate::model::MappingEntry::map_generation`], not the eager retirement in
+/// [`crate::model::MappingEntry::page_generation`], not the eager retirement in
 /// the lifecycle mutators. Two writers replace `page_entries` in place without
 /// going near those mutators — the mapper's own plan adoption and the type-4
 /// page refresh — and both retired the contiguous view while leaving the token
@@ -1530,9 +1564,9 @@ pub fn ensure_guest_write_token<H: HostOps>(
     let page_shift = state.page_shift;
     let page_size = state.page_size() as usize;
     let m = state.mappings.get(&mapping_id)?;
-    let map_generation = m.map_generation;
+    let page_generation = m.page_generation;
     if m.guest_write_token != 0 {
-        if m.guest_write_token_gen == map_generation {
+        if m.guest_write_token_gen == page_generation {
             return Some(m.guest_write_token);
         }
         // The list moved underneath the token. Everything recorded against it
@@ -1571,7 +1605,7 @@ pub fn ensure_guest_write_token<H: HostOps>(
     let token = host.track_guest_writes(&gpas, page_size)?;
     let e = state.mappings.get_mut(&mapping_id)?;
     e.guest_write_token = token;
-    e.guest_write_token_gen = map_generation;
+    e.guest_write_token_gen = page_generation;
     Some(token)
 }
 
@@ -1682,7 +1716,7 @@ pub(crate) fn mapping_guest_write_verdict<M: HostOps>(
     // That window is per *token*, not per boot, and it is entered two ways. A
     // brand new mapping enters it once. `ensure_guest_write_token` also retires
     // a token and builds a new one whenever `guest_write_token_gen` has fallen
-    // behind `map_generation`, so a mapping whose page list churns re-enters it
+    // behind `page_generation`, so a mapping whose page list churns re-enters it
     // each time — counted as `gw_token_retired`, and measured at **0 per second
     // across a driven x86/PCI boot**, so on this pathway churn is not how the
     // window is reached and new surfaces are.
@@ -1709,7 +1743,7 @@ pub(crate) fn mapping_guest_write_verdict<M: HostOps>(
         // pages the resident would be reused for. Checked here and not only in
         // `ensure_guest_write_token` because a LOAD can arrive between the list
         // changing and the next Store rebuilding the token.
-        || m.guest_write_token_gen != m.map_generation
+        || m.guest_write_token_gen != m.page_generation
     {
         return GuestWriteVerdict::NoStamp;
     }
@@ -1950,18 +1984,14 @@ pub fn ensure_contig_view_with_pages<H: HostMemory + HostOps>(
             let Some(footprint) = &m.contig_footprint else {
                 return None;
             };
-            return Some((
-                m.contig_ptr,
-                m.contig_len,
-                footprint.pages_arc(),
-            ));
+            return Some((m.contig_ptr, m.contig_len, footprint.pages_arc()));
         }
         // The negative verdict caches on exactly the key that makes the
         // positive one above safe. Re-deriving it per call collected the page
         // GPAs and rescanned them every time, and said so in the always-on sink
         // every time: 471 757 lines in one 2 900 s boot, the sole prefix ever to
         // trip `log_flood_detected`, at up to 1 826 lines in a one-second window.
-        if m.contig_refused_gen == Some(m.map_generation) {
+        if m.contig_refused_gen == Some(m.page_generation) {
             CONTIG_REFUSED_SERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return None;
         }
@@ -1972,8 +2002,8 @@ pub fn ensure_contig_view_with_pages<H: HostMemory + HostOps>(
     let Some(ptr) = host.map_pages(&gpas, page_sz) else {
         let served = CONTIG_REFUSED_SERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let m = state.mappings.get_mut(&mapping_id)?;
-        m.contig_refused_gen = Some(m.map_generation);
-        let generation = m.map_generation;
+        m.contig_refused_gen = Some(m.page_generation);
+        let generation = m.page_generation;
         // One line per (mapping, page list) rather than per call. Physical run
         // count remains diagnosis: it distinguishes a host that declined even
         // a direct run from one that cannot reconstruct a scattered list.
@@ -2017,10 +2047,19 @@ pub fn ensure_contig_import_with_footprint<H: HostMemory + HostOps>(
     let (ptr, len, _pages) = ensure_contig_view_with_pages(state, host, mapping_id)?;
     let footprint = state.mappings.get(&mapping_id)?.contig_footprint.clone()?;
     let len = u64::try_from(len).ok()?;
-    // The one admission rule, which asks the map's standing refusal before the
-    // latches. This site used to ask the three latches directly and so kept
-    // importing on a host whose whole RAMBlock map had been refused.
-    let align = crate::runtime::guest_ram_map::packed_alias_import_align(host, len)?;
+    // This mapping is the guest allocation. Admit its stable alias against the
+    // host-pointer contract on its own size; the optional whole-RAMBlock map is
+    // a different allocation population and cannot decide this one's fate.
+    let align = match crate::runtime::guest_ram::host_allocation_import_align(len) {
+        Ok(align) => align,
+        Err(refusal) => {
+            crate::runtime::guest_ram::report_host_allocation_import_refusal(
+                "mapping_alias_import",
+                &refusal,
+            );
+            return None;
+        }
+    };
     if let Some(import) = state
         .mappings
         .get(&mapping_id)
@@ -2035,6 +2074,47 @@ pub fn ensure_contig_import_with_footprint<H: HostMemory + HostOps>(
     );
     state.mappings.get_mut(&mapping_id)?.contig_import = Some(std::sync::Arc::clone(&import));
     Some((import, footprint))
+}
+
+/// One texel window inside a retained mapping allocation.
+///
+/// The mapping owns the import and its lifetime; callers supply only the plane
+/// coordinates decoded for their view. This is shared by render and compute so
+/// neither reconstructs a second notion of where a mapped texture lives.
+#[cfg(feature = "backend-vulkan")]
+pub fn guest_texel_source<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+    plane_offset: u64,
+    span: u64,
+    row_length_texels: u32,
+) -> Option<crate::backend::vulkan::engine::GuestRunSource> {
+    use crate::backend::vulkan::engine::{GuestRun, GuestRunSource};
+    use crate::runtime::guest_ram::GuestRef;
+
+    let (import, _footprint) = ensure_contig_import_with_footprint(state, host, mapping_id)?;
+    let end = plane_offset.checked_add(span)?;
+    if end > import.len() {
+        return None;
+    }
+    let whole = import.slice(0, import.len()).ok()?;
+    let guest = GuestRef::new(std::sync::Arc::clone(&import), whole).ok()?;
+    Some(GuestRunSource {
+        runs: std::sync::Arc::new(vec![GuestRun {
+            host_ptr: import.host_base(),
+            len: import.len(),
+        }]),
+        source_offset: plane_offset,
+        total_len: span,
+        row_length_texels,
+        pages: Some(std::sync::Arc::new(vec![
+            crate::runtime::guest_ram_map::GuestWindowRun {
+                window_offset: 0,
+                guest,
+            },
+        ])),
+    })
 }
 
 /// Record the guest frames a mapping-rail write of `[off, off+len)` lands in.
@@ -2063,24 +2143,10 @@ pub(crate) fn note_mapping_write_footprint(
     let page_size = state.page_size();
     let page_shift = state.page_shift;
     note_page_write_footprint(page_size, off, len, |i| {
-        m.page_entries.get(i).map(|&entry| {
-            crate::contract::iosurface_pages::entry_gpa_shift(entry, page_shift)
-        })
+        m.page_entries
+            .get(i)
+            .map(|&entry| crate::contract::iosurface_pages::entry_gpa_shift(entry, page_shift))
     });
-}
-
-/// Record a write through a retained allocation footprint.
-///
-/// These are the pages admitted with a guest-backed GPU resource. Consuming
-/// them directly keeps Store publication tied to the allocation that actually
-/// rendered, even if mutable mapping state changes after admission.
-#[cfg(any(feature = "backend-vulkan", test))]
-pub(crate) fn note_physical_page_write_footprint(
-    footprint: &crate::runtime::guest_ram::GuestPageFootprint,
-    off: u64,
-    len: u64,
-) {
-    footprint.visit_window(off, len, crate::observe::footprint::note_written_range);
 }
 
 fn note_page_write_footprint(
@@ -2168,7 +2234,10 @@ impl RectStride {
         if row_bytes == 0 || row_count == 0 || row_bytes > row_stride {
             return None;
         }
-        let span = row_count.checked_sub(1)?.checked_mul(row_stride)?.checked_add(row_bytes)?;
+        let span = row_count
+            .checked_sub(1)?
+            .checked_mul(row_stride)?
+            .checked_add(row_bytes)?;
         let packed = row_bytes.checked_mul(row_count)?;
         usize::try_from(span).ok()?;
         usize::try_from(packed).ok()?;
@@ -2688,7 +2757,15 @@ pub(crate) fn read_mapping_rect<H: HostMemory + HostOps>(
     let Some(copy) = RunCopy::read_rect(dst, rect) else {
         return false;
     };
-    copy_mapping_runs(state, host, mapping_id, off, copy, None, "mapping_read_rect")
+    copy_mapping_runs(
+        state,
+        host,
+        mapping_id,
+        off,
+        copy,
+        None,
+        "mapping_read_rect",
+    )
 }
 
 /// Report a per-run host-pointer import that took at least a millisecond.

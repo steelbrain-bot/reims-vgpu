@@ -189,7 +189,9 @@ mod tests {
     #[test]
     fn crossing_the_deadline_reports_once_per_period() {
         let mut o = outstanding("create_graphics_pipelines frag_words=261597");
-        let first = o.tick(DRIVER_CALL_DEADLINE_S).expect("the deadline reports");
+        let first = o
+            .tick(DRIVER_CALL_DEADLINE_S)
+            .expect("the deadline reports");
         assert!(first.contains("reason=driver_call_outstanding"));
         assert!(first.contains("what=create_graphics_pipelines frag_words=261597"));
         assert!(first.contains(&format!("elapsed_s={DRIVER_CALL_DEADLINE_S}")));
@@ -230,7 +232,10 @@ mod tests {
         // Serialized against the other global-slot test by running the whole
         // suite with `--test-threads=1`, which this crate requires anyway.
         leave();
-        assert!(enter("outer".into()), "an empty slot admits the first caller");
+        assert!(
+            enter("outer".into()),
+            "an empty slot admits the first caller"
+        );
         assert!(!enter("inner".into()), "a taken slot refuses the second");
         assert_eq!(
             lock().as_ref().map(|o| o.what.clone()),

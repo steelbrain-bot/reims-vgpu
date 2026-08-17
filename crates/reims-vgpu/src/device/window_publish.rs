@@ -118,7 +118,9 @@ pub(crate) struct EarlyFb {
 /// [`publish_window_frame`], called by the drain. Idempotent; `true` on success.
 #[cfg(feature = "host-window")]
 pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
-    use crate::host_window::present::{FrameSlot, InputSink, WindowConfig, WindowMode, WindowWaker};
+    use crate::host_window::present::{
+        FrameSlot, InputSink, WindowConfig, WindowMode, WindowWaker,
+    };
     let Some(slot) = device_slot(id) else {
         return false;
     };
@@ -308,8 +310,7 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
     // as it stands, so the frame never crosses host memory. `display_from_resident`
     // is what tells the NEXT capture not to read it back, and it is only set
     // when a resident actually carried this one.
-    if crate::backend::vulkan::engine::window_present_attached() && resident_present.is_ok()
-    {
+    if crate::backend::vulkan::engine::window_present_attached() && resident_present.is_ok() {
         let resident_source = crate::backend::vulkan::engine::WindowPresentSource {
             width,
             height,

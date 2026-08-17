@@ -1135,7 +1135,11 @@ pub(crate) fn read_buffer_window<M: HostMemory + HostOps>(
 pub(crate) struct StagedBuffer {
     pub bind: ComputeBufferBind,
     pub gva: u64,
+    /// Metal input and Vulkan host-fallback output. Vulkan guest-backed input
+    /// lives in `input` and leaves this empty until a host readback occurs.
     pub bytes: Vec<u8>,
+    #[cfg(feature = "backend-vulkan")]
+    input: VulkanBufferInput,
     /// Guest pages this buffer resolved to when it was staged — before the
     /// dispatch, and before a nested session accumulated however many more
     /// jobs before flushing. `writeback_buffer` runs at the far end of that
@@ -1144,6 +1148,22 @@ pub(crate) struct StagedBuffer {
     /// stage-time walk resolved nothing, which leaves the write unbounded as
     /// it was; the writer's own walk then fails closed on its own terms.
     pub pages: std::collections::HashSet<u64>,
+}
+
+#[cfg(feature = "backend-vulkan")]
+enum VulkanBufferInput {
+    HostBytes(Vec<u8>),
+    GuestPages(crate::backend::vulkan::engine::GuestRunSource),
+}
+
+#[derive(Clone, Copy)]
+struct BufferStagePlan {
+    base_gva: u64,
+    size: u64,
+    full: u64,
+    avail: u64,
+    want: usize,
+    gva: u64,
 }
 
 /// Conservative whole-allocation staging used by the Metal-direct callers,
@@ -1155,19 +1175,20 @@ pub(crate) fn stage_buffer<M: HostMemory + HostOps>(
     task_id: u32,
     bind: &ComputeBufferBind,
 ) -> Result<StagedBuffer, ComputeStatus> {
-    stage_buffer_with_extent(state, host, task_id, bind, None)
+    let plan = resolve_buffer_stage_plan(state, host, task_id, bind, None)?;
+    materialize_buffer_host(state, host, task_id, bind, plan)
 }
 
-pub(crate) fn stage_buffer_with_extent<M: HostMemory + HostOps>(
+fn resolve_buffer_stage_plan<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
     bind: &ComputeBufferBind,
     extent_cap: Option<u64>,
-) -> Result<StagedBuffer, ComputeStatus> {
+) -> Result<BufferStagePlan, ComputeStatus> {
     // Eight distinct checks answer with `MissingBuffer`; the status carries
     // which one, so the caller's line and this one name the same slug.
-    let miss = |st: ComputeStatus, detail: String| -> Result<StagedBuffer, ComputeStatus> {
+    let miss = |st: ComputeStatus, detail: String| -> Result<BufferStagePlan, ComputeStatus> {
         crate::observe::fail(format!(
             "compute_stage_buf fail reason={} ref={} off={:#x} {detail}",
             st.reason(),
@@ -1235,6 +1256,90 @@ pub(crate) fn stage_buffer_with_extent<M: HostMemory + HostOps>(
             format!("base={base_gva:#x} size={size:#x}"),
         );
     };
+    Ok(BufferStagePlan {
+        base_gva,
+        size,
+        full,
+        avail,
+        want,
+        gva,
+    })
+}
+
+pub(crate) fn stage_buffer_with_extent<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    bind: &ComputeBufferBind,
+    extent_cap: Option<u64>,
+) -> Result<StagedBuffer, ComputeStatus> {
+    let plan = resolve_buffer_stage_plan(state, host, task_id, bind, extent_cap)?;
+    #[cfg(feature = "backend-vulkan")]
+    {
+        let BufferStagePlan {
+            base_gva,
+            size,
+            full,
+            avail,
+            want,
+            gva,
+        } = plan;
+        if crate::runtime::bound_buffers::ensure_packed_resource(
+            state,
+            host,
+            task_id,
+            bind.buffer_ref,
+            base_gva,
+            size,
+            crate::runtime::bound_buffers::PackedResourceUse::Buffer,
+        ) {
+            let guest = state
+                .bound_buffers
+                .packed_available(task_id, bind.buffer_ref, base_gva, size)
+                .and_then(|packed| {
+                    Some((
+                        packed.buffer_source(bind.offset, want as u64)?,
+                        packed.window_pages(bind.offset, want as u64)?,
+                    ))
+                });
+            if let Some((source, pages)) = guest {
+                if avail < full {
+                    crate::runtime::drain::note_store_route("compute_buffer_extent_narrowed");
+                    crate::runtime::drain::note_store_route_n(
+                        "compute_buffer_extent_saved_bytes",
+                        full - avail,
+                    );
+                }
+                crate::runtime::drain::note_store_route("compute_buffer_guest_pages");
+                return Ok(StagedBuffer {
+                    bind: bind.clone(),
+                    gva,
+                    bytes: Vec::new(),
+                    input: VulkanBufferInput::GuestPages(source),
+                    pages,
+                });
+            }
+        }
+    }
+
+    materialize_buffer_host(state, host, task_id, bind, plan)
+}
+
+fn materialize_buffer_host<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    bind: &ComputeBufferBind,
+    plan: BufferStagePlan,
+) -> Result<StagedBuffer, ComputeStatus> {
+    let BufferStagePlan {
+        base_gva,
+        size,
+        full,
+        avail,
+        want,
+        gva,
+    } = plan;
     let mut bytes = vec![0u8; want];
     if let Err(e) = gva_mem::read_task_gva_by_id(
         host,
@@ -1275,10 +1380,14 @@ pub(crate) fn stage_buffer_with_extent<M: HostMemory + HostOps>(
         );
     }
     let pages = staged_span_pages(state, host, task_id, gva, bytes.len() as u64);
+    #[cfg(feature = "backend-vulkan")]
+    let input = VulkanBufferInput::HostBytes(std::mem::take(&mut bytes));
     Ok(StagedBuffer {
         bind: bind.clone(),
         gva,
         bytes,
+        #[cfg(feature = "backend-vulkan")]
+        input,
         pages,
     })
 }
@@ -1630,26 +1739,23 @@ pub(crate) struct StagedTexture {
     pub storage_selector: Option<pixel_format::StorageImageSelector>,
     pub width: u32,
     pub height: u32,
+    /// Metal-direct stages through host bytes. On Vulkan this becomes the
+    /// post-dispatch host result only; the pre-dispatch source is the typed
+    /// `input` below and never consults this field.
     pub bytes: Vec<u8>,
     pub is_storage: bool,
     #[cfg(feature = "backend-vulkan")]
     residency: Option<ComputeStorageResidencyCandidate>,
-    /// What the engine could already serve for this binding, so the stage-time
-    /// guest read was skipped and `bytes` is a zero placeholder.
-    ///
-    /// [`ResidentServe::Seed`] — a storage binding whose resident the engine
-    /// holds at a verified generation; it must never be seeded from the
-    /// placeholder. [`ResidentServe::Sample`] — a sampled input whose window is
-    /// a prior dispatch's storage output; the engine seeds the sampled image by
-    /// copy-on-sample from that resident, again never from the bytes.
-    ///
-    /// One field rather than the `bool` and `Option` pair it replaces: those
-    /// were the variant tag and the payload of this enum stored apart, so every
-    /// producer had to rebuild both halves and nothing made a producer that set
-    /// one without the other fail to compile.
     #[cfg(feature = "backend-vulkan")]
-    serve: Option<ResidentServe>,
+    input: VulkanTextureInput,
     writeback: TextureWriteback,
+}
+
+#[cfg(feature = "backend-vulkan")]
+enum VulkanTextureInput {
+    HostBytes(Vec<u8>),
+    GuestPages(crate::backend::vulkan::engine::GuestRunSource),
+    Resident(ResidentServe),
 }
 
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
@@ -2177,7 +2283,11 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             storage_selector,
             width,
             height,
-            bytes: vec![0; need],
+            bytes: if cfg!(feature = "backend-vulkan") {
+                Vec::new()
+            } else {
+                vec![0; need]
+            },
             is_storage,
             #[cfg(feature = "backend-vulkan")]
             residency: is_storage.then_some(ComputeStorageResidencyCandidate {
@@ -2185,7 +2295,9 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                 seed_generation,
             }),
             #[cfg(feature = "backend-vulkan")]
-            serve,
+            input: serve
+                .map(VulkanTextureInput::Resident)
+                .unwrap_or_else(|| VulkanTextureInput::HostBytes(vec![0; need])),
             writeback: TextureWriteback::None,
         });
     }
@@ -2564,6 +2676,53 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             ));
         }
         let mut bytes = vec![0u8; need];
+        #[cfg(feature = "backend-vulkan")]
+        let input = if let Some(resident) = serve {
+            VulkanTextureInput::Resident(resident)
+        } else if let Some(source) = span_end.checked_sub(surface_offset).and_then(|span| {
+            let row_length_texels = if surface_bpr == tight {
+                0
+            } else {
+                surface_bpr.checked_div(bpp)?
+            };
+            crate::runtime::mapper::guest_texel_source(
+                state,
+                host,
+                mapping_id,
+                surface_offset,
+                span,
+                row_length_texels,
+            )
+        }) {
+            VulkanTextureInput::GuestPages(source)
+        } else {
+            if !mapping_write::read_rect_raw_at(
+                state,
+                host,
+                mapping_id,
+                mapping_write::SurfaceWindow {
+                    base_off: surface_offset,
+                    bpr: surface_bpr,
+                    span_end,
+                    bpp,
+                },
+                mapping_write::Rect {
+                    origin_x: 0,
+                    origin_y: 0,
+                    width,
+                    height,
+                },
+                &mut bytes,
+                tight,
+            ) {
+                crate::observe::fail(format!(
+                    "compute_stage_tex type11_fail reason=read mapping={mapping_id} {width}x{height} off={surface_offset} bpr={surface_bpr} span_end={span_end} pages={pages_n}"
+                ));
+                return Err(ComputeStatus::GuestIo("compute_stage_tex_type11_read"));
+            }
+            VulkanTextureInput::HostBytes(std::mem::take(&mut bytes))
+        };
+        #[cfg(not(feature = "backend-vulkan"))]
         if serve.is_none()
             && !mapping_write::read_rect_raw_at(
                 state,
@@ -2631,7 +2790,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                 seed_generation,
             }),
             #[cfg(feature = "backend-vulkan")]
-            serve,
+            input,
             writeback,
         });
     }
@@ -2679,20 +2838,20 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             format!("len={}", desc_bytes.len()),
         );
     };
-    if tex.declared_pixel_format().is_none() {
+    let Some(base_format) = tex.declared_pixel_format() else {
         return linear_fail(
             ComputeStatus::Unsupported("linear_tex_no_fmt"),
             String::new(),
         );
-    }
+    };
     let Some(stage_format) =
-        crate::runtime::draw::effective_view_sample_format(tex.pixel_format, view_pixel_format)
+        crate::runtime::draw::effective_view_sample_format(base_format, view_pixel_format)
     else {
         return linear_fail(
             ComputeStatus::Unsupported("linear_tex_view_format"),
             format!(
                 "base={stage_ref} base_fmt={:#x} view_fmt={view_pixel_format:?}",
-                tex.pixel_format
+                base_format
             ),
         );
     };
@@ -2778,106 +2937,132 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             stage_format,
         )
     });
-    let mut bytes = vec![0u8; need];
-    #[cfg_attr(
-        not(feature = "backend-vulkan"),
-        allow(
-            unused_mut,
-            reason = "the Vulkan resident-window block below assigns it"
-        )
-    )]
-    let have_bytes = false;
-    // Resident-authoritative window (deferred linear writeback): consume the
-    // engine resident without bytes when possible; otherwise flush it into the
-    // entry first — falling through to the raw guest read would silently serve
-    // the pre-chain seed pages.
     #[cfg(feature = "backend-vulkan")]
-    let resident = match (
+    let serve = match (
         linear_key,
         crate::runtime::surface_cache::linear_texture_resident_gen(state, &window),
     ) {
-        (Some(key), Some(resident_gen)) => Some((
-            key,
-            resident_gen,
-            resident_serve(key, resident_gen, is_storage, stage_format),
-        )),
+        (Some(key), Some(generation)) => resident_serve(key, generation, is_storage, stage_format),
         _ => None,
     };
+    let mut bytes = vec![0u8; need];
     #[cfg(feature = "backend-vulkan")]
-    let serve = resident.and_then(|(_, _, serve)| serve);
-    #[cfg(not(feature = "backend-vulkan"))]
-    let serve: Option<ResidentServe> = None;
-    if let Some(generation) = serve.and_then(ResidentServe::seed_generation) {
-        crate::observe::off(format!(
-            "compute_stage_linear_resident_seed task={task_id} ref={texture_ref} gva={gva:#x} fmt={:#x} dims={w}x{h} gen={generation}",
-            tex.pixel_format
-        ));
-    } else if let Some((_, generation)) = serve.and_then(ResidentServe::sample_source) {
-        crate::observe::off(format!(
-            "compute_stage_linear_resident_sample task={task_id} ref={texture_ref} gva={gva:#x} fmt={:#x} dims={w}x{h} gen={generation}",
-            stage_format
-        ));
-    }
-    if serve.is_some() || have_bytes {
-        // Engine resident serves this window; no cache/guest read.
-    } else if let Some(cached) = crate::runtime::surface_cache::get_linear_texture(state, &window) {
-        bytes.copy_from_slice(cached);
-        crate::observe::off(format!(
-            "compute_stage_tex linear_cache task={task_id} ref={texture_ref} gva={gva:#x} fmt={:#x} dims={w}x{h} row_stride={}",
-            stage_format, layout.row_stride
-        ));
+    let input = if let Some(resident) = serve {
+        VulkanTextureInput::Resident(resident)
     } else {
-        // The bulk/row reads below walk raw task GVAs; a Store's
-        // guest-page write is submitted and not waited on.
+        // A pending Store is queue work, not host bytes. Submit it before this
+        // source read so both operations are ordered on the engine queue.
         crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
-        crate::runtime::render_writeback::settle_guest_writes(
-            crate::runtime::render_writeback::SettleSite::ComputeStageTexture,
-        );
-        if read_linear_texture_bulk(
-            state,
-            host,
-            task_id,
-            gva,
-            layout.row_stride,
-            tight,
-            h,
-            &mut bytes,
-        ) {
-            // One cached-view walk for the whole span (render-path bulk analog).
+        let exact_span = (h.saturating_sub(1) as u64)
+            .checked_mul(layout.row_stride)
+            .and_then(|prefix| prefix.checked_add(tight as u64));
+        let guest = exact_span.and_then(|span| {
+            let allocation_gva = tex.allocation_base_gva(state.page_shift)?;
+            let level_offset = gva.checked_sub(allocation_gva)?;
+            let row_length_texels = if layout.row_stride == tight as u64 {
+                0
+            } else {
+                u32::try_from(layout.row_stride.checked_div(u64::from(bpp))?).ok()?
+            };
+            if !crate::runtime::bound_buffers::ensure_packed_resource(
+                state,
+                host,
+                task_id,
+                stage_ref,
+                allocation_gva,
+                tex.allocation_size,
+                crate::runtime::bound_buffers::PackedResourceUse::ComputeTexture,
+            ) {
+                return None;
+            }
+            let crate::runtime::bound_buffers::PackedBufferResolution::Available(packed) =
+                state.bound_buffers.packed(task_id, stage_ref)?
+            else {
+                return None;
+            };
+            packed.texel_source(level_offset, span, row_length_texels)
+        });
+        if let Some(source) = guest {
+            VulkanTextureInput::GuestPages(source)
+        } else if let Some(cached) =
+            crate::runtime::surface_cache::get_linear_texture(state, &window)
+        {
+            VulkanTextureInput::HostBytes(cached.to_vec())
         } else {
-            let mut row = vec![0u8; tight];
-            for y in 0..h {
-                let row_gva = gva
-                    .checked_add((y as u64).checked_mul(layout.row_stride).ok_or(
-                        ComputeStatus::GuestIo("compute_stage_tex_linear_row_offset"),
-                    )?)
-                    .ok_or(ComputeStatus::GuestIo("compute_stage_tex_linear_row_gva"))?;
-                if let Err(e) = gva_mem::read_task_gva_by_id(
-                    host,
-                    &state.tasks,
-                    task_id,
-                    row_gva,
-                    &mut row,
-                    state.page_shift,
-                ) {
-                    // First failing row only — full walk status for one-boot diagnosis.
-                    if y == 0 {
-                        let walk = gva_mem::diagnose_gva_walk(
-                            host,
-                            &state.tasks,
-                            task_id,
-                            row_gva,
-                            state.page_shift,
-                        );
-                        crate::observe::fail(format!(
-                            "compute_stage_tex_gva task={task_id} ref={texture_ref} gva={row_gva:#x} y=0 page_shift={} err={e:?} | {walk}",
-                            state.page_shift
-                        ));
-                    }
-                    return Err(ComputeStatus::GuestIo("compute_stage_tex_linear_row_read"));
+            crate::runtime::render_writeback::settle_guest_writes(
+                crate::runtime::render_writeback::SettleSite::ComputeStageTexture,
+            );
+            if read_linear_texture_bulk(
+                state,
+                host,
+                task_id,
+                gva,
+                layout.row_stride,
+                tight,
+                h,
+                &mut bytes,
+            ) {
+                // One cached-view walk for the whole span.
+            } else {
+                let mut row = vec![0u8; tight];
+                for y in 0..h {
+                    let row_gva = gva
+                        .checked_add((y as u64).checked_mul(layout.row_stride).ok_or(
+                            ComputeStatus::GuestIo("compute_stage_tex_linear_row_offset"),
+                        )?)
+                        .ok_or(ComputeStatus::GuestIo("compute_stage_tex_linear_row_gva"))?;
+                    gva_mem::read_task_gva_by_id(
+                        host,
+                        &state.tasks,
+                        task_id,
+                        row_gva,
+                        &mut row,
+                        state.page_shift,
+                    )
+                    .map_err(|_| ComputeStatus::GuestIo("compute_stage_tex_linear_row_read"))?;
+                    let off = (y as usize) * tight;
+                    bytes[off..off + tight].copy_from_slice(&row);
                 }
-                let off = (y as usize) * tight;
-                bytes[off..off + tight].copy_from_slice(&row);
+            }
+            VulkanTextureInput::HostBytes(std::mem::take(&mut bytes))
+        }
+    };
+    #[cfg(not(feature = "backend-vulkan"))]
+    {
+        if let Some(cached) = crate::runtime::surface_cache::get_linear_texture(state, &window) {
+            bytes.copy_from_slice(cached);
+        } else {
+            crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
+            crate::runtime::render_writeback::settle_guest_writes(
+                crate::runtime::render_writeback::SettleSite::ComputeStageTexture,
+            );
+            if !read_linear_texture_bulk(
+                state,
+                host,
+                task_id,
+                gva,
+                layout.row_stride,
+                tight,
+                h,
+                &mut bytes,
+            ) {
+                for y in 0..h {
+                    let row_gva = gva
+                        .checked_add((y as u64).checked_mul(layout.row_stride).ok_or(
+                            ComputeStatus::GuestIo("compute_stage_tex_linear_row_offset"),
+                        )?)
+                        .ok_or(ComputeStatus::GuestIo("compute_stage_tex_linear_row_gva"))?;
+                    let off = (y as usize) * tight;
+                    gva_mem::read_task_gva_by_id(
+                        host,
+                        &state.tasks,
+                        task_id,
+                        row_gva,
+                        &mut bytes[off..off + tight],
+                        state.page_shift,
+                    )
+                    .map_err(|_| ComputeStatus::GuestIo("compute_stage_tex_linear_row_read"))?;
+                }
             }
         }
     }
@@ -2941,7 +3126,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         #[cfg(feature = "backend-vulkan")]
         residency,
         #[cfg(feature = "backend-vulkan")]
-        serve,
+        input,
         writeback,
     })
 }
@@ -3078,11 +3263,13 @@ fn writeback_texture<M: HostMemory + HostOps>(
             // A dense window is one `VkBufferCopy` run per guest run; a padded
             // one needs a rectangle copy per run per row fragment, which is the
             // difference between a handful of regions and a few hundred.
-            crate::runtime::drain::note_store_route(if u64::from(*width) * u64::from(*bpp) == *row_stride {
-                "compute_wb_linear_dense"
-            } else {
-                "compute_wb_linear_padded"
-            });
+            crate::runtime::drain::note_store_route(
+                if u64::from(*width) * u64::from(*bpp) == *row_stride {
+                    "compute_wb_linear_dense"
+                } else {
+                    "compute_wb_linear_padded"
+                },
+            );
         }
         TextureWriteback::Type11 {
             width,
@@ -3753,8 +3940,8 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     cmd: &ComputeCommand,
 ) -> ComputeStatus {
     use crate::backend::vulkan::engine::{
-        self as vk_engine, ComputeBufferResource, ComputeImageResult,
-        ComputeRequest, ComputeSampledImageResource, ComputeStorageImageResource, DrawError,
+        self as vk_engine, ComputeBufferResource, ComputeImageResult, ComputeRequest,
+        ComputeSampledImageResource, ComputeStorageImageResource, DrawError,
     };
 
     if acc.pipeline_ref == 0 {
@@ -4123,7 +4310,18 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         };
         storage_buffers.push(ComputeBufferResource {
             binding: s.bind.index,
-            bytes: std::mem::take(&mut s.bytes),
+            backing: match std::mem::replace(&mut s.input, VulkanBufferInput::HostBytes(Vec::new()))
+            {
+                VulkanBufferInput::HostBytes(bytes) => {
+                    crate::backend::vulkan::engine::ComputeBufferBacking::Bytes(bytes)
+                }
+                VulkanBufferInput::GuestPages(source) => {
+                    crate::backend::vulkan::engine::ComputeBufferBacking::GuestPages {
+                        source,
+                        write_pages: s.pages.iter().copied().collect(),
+                    }
+                }
+            },
             writable: *writable,
         });
     }
@@ -4283,6 +4481,25 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                         .unwrap_or(0)
                 ));
             }
+            let seed =
+                match std::mem::replace(&mut t.input, VulkanTextureInput::HostBytes(Vec::new())) {
+                    VulkanTextureInput::HostBytes(bytes) => {
+                        crate::backend::vulkan::engine::ComputeStorageImageSeed::Bytes(bytes)
+                    }
+                    VulkanTextureInput::GuestPages(source) => {
+                        crate::backend::vulkan::engine::ComputeStorageImageSeed::GuestPages(source)
+                    }
+                    VulkanTextureInput::Resident(ResidentServe::Seed(_)) => {
+                        crate::backend::vulkan::engine::ComputeStorageImageSeed::Resident
+                    }
+                    VulkanTextureInput::Resident(ResidentServe::Sample(..)) => {
+                        crate::observe::fail(format!(
+                        "compute_linux internal reason=sample_resident_on_storage pipe={} bind={}",
+                        acc.pipeline_ref, t.binding
+                    ));
+                        return ComputeStatus::Unsupported("compute_storage_source_role");
+                    }
+                };
             storage_images.push(ComputeStorageImageResource {
                 binding: t.binding,
                 array_element: t.array_element,
@@ -4290,7 +4507,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 format: shader_fmt,
                 width: t.width,
                 height: t.height,
-                bytes: std::mem::take(&mut t.bytes),
+                seed,
                 // The guest window this output belongs to is on `t.writeback`,
                 // so the destination is decided from the window rather than
                 // from anything about this dispatch. `Host` needs no host
@@ -4307,7 +4524,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                         ),
                     }
                 }),
-                seed_skipped: t.serve.and_then(ResidentServe::seed_generation).is_some(),
             });
         } else {
             let Some(sampled_fmt) = mtl_to_engine_sampled(t.pixel_format) else {
@@ -4317,6 +4533,32 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 ));
                 return ComputeStatus::Unsupported("sampled_format_unsupported");
             };
+            let source =
+                match std::mem::replace(&mut t.input, VulkanTextureInput::HostBytes(Vec::new())) {
+                    VulkanTextureInput::HostBytes(bytes) => {
+                        crate::backend::vulkan::engine::ComputeSampledImageSource::Bytes(bytes)
+                    }
+                    VulkanTextureInput::GuestPages(source) => {
+                        crate::backend::vulkan::engine::ComputeSampledImageSource::GuestPages(
+                            source,
+                        )
+                    }
+                    VulkanTextureInput::Resident(ResidentServe::Sample(identity, generation)) => {
+                        crate::backend::vulkan::engine::ComputeSampledImageSource::Resident(
+                            crate::backend::vulkan::engine::ComputeResidentSampleBind {
+                                identity,
+                                generation,
+                            },
+                        )
+                    }
+                    VulkanTextureInput::Resident(ResidentServe::Seed(_)) => {
+                        crate::observe::fail(format!(
+                            "compute_linux internal reason=seed_resident_on_sample pipe={} bind={}",
+                            acc.pipeline_ref, t.binding
+                        ));
+                        return ComputeStatus::Unsupported("compute_sampled_source_role");
+                    }
+                };
             sampled_images.push(ComputeSampledImageResource {
                 binding: t.binding,
                 array_element: t.array_element,
@@ -4324,15 +4566,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 format: sampled_fmt,
                 width: t.width,
                 height: t.height,
-                bytes: std::mem::take(&mut t.bytes),
-                resident_bind: t.serve.and_then(ResidentServe::sample_source).map(
-                    |(identity, generation)| {
-                        crate::backend::vulkan::engine::ComputeResidentSampleBind {
-                            identity,
-                            generation,
-                        }
-                    },
-                ),
+                source,
             });
         }
     }
@@ -4373,12 +4607,13 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             format: crate::backend::vulkan::engine::StorageImageFormat::Rgba8Unorm,
             width: NEUTRAL_SAMPLED_IMAGE_EXTENT,
             height: NEUTRAL_SAMPLED_IMAGE_EXTENT,
-            bytes: pixel_format::solid_rgba8(
-                NEUTRAL_SAMPLED_IMAGE_EXTENT,
-                NEUTRAL_SAMPLED_IMAGE_EXTENT,
-                &[0.0; 4],
+            source: crate::backend::vulkan::engine::ComputeSampledImageSource::Bytes(
+                pixel_format::solid_rgba8(
+                    NEUTRAL_SAMPLED_IMAGE_EXTENT,
+                    NEUTRAL_SAMPLED_IMAGE_EXTENT,
+                    &[0.0; 4],
+                ),
             ),
-            resident_bind: None,
         });
     }
 
@@ -4502,23 +4737,29 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             .find(|staged| staged.bind.index == buffer.binding)
         else {
             crate::observe::fail(format!(
-                "compute_linux readback binding mismatch pipe={} bind={} bytes={}",
-                acc.pipeline_ref,
-                buffer.binding,
-                buffer.bytes.len()
+                "compute_linux readback binding mismatch pipe={} bind={}",
+                acc.pipeline_ref, buffer.binding
             ));
             return ComputeStatus::MetalFailed("compute_vk_readback_binding");
         };
-        s.bytes = buffer.bytes;
-        if let Err(e) = writeback_buffer(
-            state,
-            host,
-            task_id,
-            Some(acc.pipeline_ref),
-            "vulkan_dispatch",
-            s,
-        ) {
-            return e;
+        match buffer.result {
+            crate::backend::vulkan::engine::ComputeBufferResult::Bytes(bytes) => {
+                s.bytes = bytes;
+                if let Err(e) = writeback_buffer(
+                    state,
+                    host,
+                    task_id,
+                    Some(acc.pipeline_ref),
+                    "vulkan_dispatch",
+                    s,
+                ) {
+                    return e;
+                }
+            }
+            crate::backend::vulkan::engine::ComputeBufferResult::Landed { bytes } => {
+                crate::runtime::drain::note_store_route("compute_buffer_wb_landed");
+                crate::runtime::drain::note_store_route_n("compute_buffer_wb_landed_bytes", bytes);
+            }
         }
     }
     for (t, result) in staged_tex

@@ -1203,7 +1203,6 @@ impl WindowPresenter {
                     slot.access,
                     slot.width,
                     slot.height,
-                    slot.memory.is_guest_imported(),
                 )
             })
         });
@@ -1233,7 +1232,7 @@ impl WindowPresenter {
             staged
         };
         let mut pinned = Vec::with_capacity(1);
-        if let Some((identity, _, _, _, _, _)) = selected.as_ref() {
+        if let Some((identity, _, _, _, _)) = selected.as_ref() {
             if !pools.pin_resident_target(identity, true) {
                 return Err(DrawError::Facade(
                     EngineFacadeDecline::WindowSourceDisappearedBeforePin {
@@ -1251,14 +1250,12 @@ impl WindowPresenter {
         let blit = selected
             .as_ref()
             .map(
-                |(_, image, access, base_width, base_height, host_accessible)| {
-                    BlitSource::Resident {
-                        image: *image,
-                        access: *access,
-                        next_access: super::pools::ResidentAccess::transfer_read(*host_accessible),
-                        width: *base_width,
-                        height: *base_height,
-                    }
+                |(_, image, access, base_width, base_height)| BlitSource::Resident {
+                    image: *image,
+                    access: *access,
+                    next_access: super::pools::ResidentAccess::transfer_read(),
+                    width: *base_width,
+                    height: *base_height,
                 },
             )
             .or(staged);
@@ -1366,10 +1363,10 @@ impl WindowPresenter {
                     (0, 0, base_width, base_height),
                     (vp.x, vp.y, vp.x + vp.width, vp.y + vp.height),
                 );
-                if let Some((identity, _, _, _, _, host_accessible)) = selected.as_ref() {
+                if let Some((identity, _, _, _, _)) = selected.as_ref() {
                     pools.registry_note_access(
                         identity,
-                        super::pools::ResidentAccess::transfer_read(*host_accessible),
+                        super::pools::ResidentAccess::transfer_read(),
                     );
                 }
             } else {
@@ -1440,16 +1437,16 @@ impl WindowPresenter {
 
         let direct = selected.is_some();
         match submission {
-            super::context::PresentSubmission::Complete(result) => self.finish_present(
-                FinishedWindowPresent {
+            super::context::PresentSubmission::Complete(result) => {
+                self.finish_present(FinishedWindowPresent {
                     result,
                     acquire_suboptimal,
                     direct,
                     width: self.extent.width,
                     height: self.extent.height,
                     swapchain_images: self.images.len(),
-                },
-            ),
+                })
+            }
             super::context::PresentSubmission::Pending(wait) => {
                 Ok(WindowPresentDispatch::Pending(PendingWindowPresent {
                     wait,
@@ -1493,13 +1490,15 @@ impl WindowPresenter {
                     self.suboptimal_streak = 0;
                 }
                 self.note_cadence(true, finished.direct);
-                Ok(WindowPresentDispatch::Complete(WindowPresentOutcome::Presented {
-                    direct: finished.direct,
-                    width: finished.width,
-                    height: finished.height,
-                    swapchain_images: finished.swapchain_images,
-                    suboptimal,
-                }))
+                Ok(WindowPresentDispatch::Complete(
+                    WindowPresentOutcome::Presented {
+                        direct: finished.direct,
+                        width: finished.width,
+                        height: finished.height,
+                        swapchain_images: finished.swapchain_images,
+                        suboptimal,
+                    },
+                ))
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 self.recreate_pending = true;

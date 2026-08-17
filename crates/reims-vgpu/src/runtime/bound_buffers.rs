@@ -117,9 +117,236 @@ pub struct PackedBuffer {
     /// Physical page list behind the packed alias, retained so resource views
     /// can build witnesses without walking the task page table again.
     pub gpas: Arc<Vec<u64>>,
+    /// Physical ownership of the complete declared allocation, derived with
+    /// the alias and retained for Store publication.
+    pub footprint: crate::runtime::guest_ram::GuestPageFootprint,
     /// Persistent whole-buffer sources shared by every offset bind.
     pub runs: Arc<Vec<GuestRun>>,
     pub pages: Arc<Vec<GuestWindowRun>>,
+}
+
+impl PackedBuffer {
+    /// One buffer bind inside this retained allocation. Compute and render
+    /// consume the same source type; the zero row length says this is a flat
+    /// byte range rather than a pitched image plane.
+    pub fn buffer_source(
+        &self,
+        offset: u64,
+        span: u64,
+    ) -> Option<crate::backend::vulkan::engine::GuestRunSource> {
+        self.texel_source(offset, span, 0)
+    }
+
+    /// Physical pages touched by one allocation-relative byte window.
+    pub fn window_pages(&self, offset: u64, span: u64) -> Option<std::collections::HashSet<u64>> {
+        if span == 0 {
+            return None;
+        }
+        let page = self.footprint.page_size();
+        let start = self.head.checked_add(offset)?;
+        let end = start.checked_add(span)?;
+        let first = usize::try_from(start / page).ok()?;
+        let last = usize::try_from((end - 1) / page).ok()?;
+        Some(self.gpas.get(first..=last)?.iter().copied().collect())
+    }
+
+    /// One image plane inside this retained allocation, expressed in the form
+    /// the Vulkan engine consumes. The plane borrows the allocation's one set
+    /// of runs and bounded imports; only its decoded offset, extent and row
+    /// stride vary per texture level.
+    pub fn texel_source(
+        &self,
+        offset: u64,
+        span: u64,
+        row_length_texels: u32,
+    ) -> Option<crate::backend::vulkan::engine::GuestRunSource> {
+        offset.checked_add(span).filter(|&end| end <= self.size)?;
+        Some(crate::backend::vulkan::engine::GuestRunSource {
+            runs: Arc::clone(&self.runs),
+            source_offset: offset,
+            total_len: span,
+            row_length_texels,
+            pages: Some(Arc::clone(&self.pages)),
+        })
+    }
+}
+
+/// Consumer that asked the resource registry to resolve one allocation. This
+/// selects observability only; every arm creates the same retained allocation.
+#[derive(Clone, Copy)]
+pub enum PackedResourceUse {
+    Buffer,
+    LinearSample,
+    LinearTarget,
+    ComputeTexture,
+}
+
+fn stable_guest_alias_available<H: crate::runtime::host::HostOps>(host: &H) -> bool {
+    if host.map_pages_stable() {
+        return true;
+    }
+    static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        crate::observe::fail(String::from(
+            "guest_run_rail off reason=host_page_alias_not_stable \
+             (resource binds take the CPU byte loader)",
+        ));
+    }
+    false
+}
+
+pub(crate) fn packed_scatter_band(gpas: &[u64], page: u64) -> &'static str {
+    match reims_vgpu_paging::runs::contig_run_count(gpas, page) {
+        0 | 1 => "zc_packed_scatter_runs_1",
+        2 => "zc_packed_scatter_runs_2",
+        3..=4 => "zc_packed_scatter_runs_3_4",
+        5..=8 => "zc_packed_scatter_runs_5_8",
+        9..=16 => "zc_packed_scatter_runs_9_16",
+        17..=64 => "zc_packed_scatter_runs_17_64",
+        _ => "zc_packed_scatter_runs_65_up",
+    }
+}
+
+/// Resolve and retain the complete allocation named by one task-local resource.
+/// Buffer offsets and texture planes are views over this object; neither walks
+/// the task page table again while the guest keeps the mapping alive.
+pub fn ensure_packed_resource<
+    M: crate::runtime::host::HostMemory + crate::runtime::host::HostOps,
+>(
+    state: &mut crate::model::DeviceState,
+    host: &mut M,
+    task_id: u32,
+    resource_ref: u32,
+    gva: u64,
+    size: u64,
+    usage: PackedResourceUse,
+) -> bool {
+    if let Some(held) = state.bound_buffers.packed(task_id, resource_ref) {
+        let matches = match held {
+            PackedBufferResolution::Available(buffer) => buffer.gva == gva && buffer.size == size,
+            PackedBufferResolution::Unavailable {
+                gva: held_gva,
+                size: held_size,
+            } => *held_gva == gva && *held_size == size,
+        };
+        if matches {
+            return matches!(held, PackedBufferResolution::Available(_));
+        }
+    }
+
+    let unavailable = || PackedBufferResolution::Unavailable { gva, size };
+    let made = (|| {
+        if !stable_guest_alias_available(host) {
+            return None;
+        }
+        let page = state.page_size();
+        let page_base = gva & !(page - 1);
+        let head = gva - page_base;
+        let map_len = crate::contract::checked::align_up_u64(head.checked_add(size)?, page)?;
+        let align = match crate::runtime::guest_ram::host_allocation_import_align(map_len) {
+            Ok(align) => align,
+            Err(refusal) => {
+                crate::runtime::guest_ram::report_host_allocation_import_refusal(
+                    "task_buffer_alias_import",
+                    &refusal,
+                );
+                return None;
+            }
+        };
+        let gpas = crate::runtime::gva_mem::task_gva_page_gpas(
+            host,
+            &state.tasks,
+            task_id,
+            page_base,
+            map_len,
+            state.page_shift,
+        );
+        if gpas.len() as u64 != map_len / page {
+            return None;
+        }
+        let host_base = host.map_pages(&gpas, page as usize)?;
+        let ramblock =
+            crate::runtime::guest_ram_map::reference_for_pages(host, &gpas, page, head, size)
+                .ok()
+                .and_then(|guest| {
+                    let base = guest.import().gpa_base()?;
+                    let head_in_import = gpas.first()?.checked_add(head)?.checked_sub(base)?;
+                    Some((Arc::clone(guest.import()), head_in_import, guest))
+                });
+        let (import, retained_head, guest) = match ramblock {
+            Some(resolved) => {
+                crate::runtime::drain::note_store_route("zc_packed_ramblock");
+                resolved
+            }
+            None => {
+                crate::runtime::drain::note_store_route("zc_packed_alias_import");
+                crate::runtime::drain::note_store_route(packed_scatter_band(&gpas, page));
+                let import = Arc::new(
+                    crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
+                        host_base, map_len, align,
+                    )
+                    .ok()?,
+                );
+                let whole = import.slice(head, size).ok()?;
+                let guest =
+                    crate::runtime::guest_ram::GuestRef::new(Arc::clone(&import), whole).ok()?;
+                (import, head, guest)
+            }
+        };
+        let footprint = crate::runtime::guest_ram::GuestPageFootprint::new(
+            Arc::<[u64]>::from(gpas.clone()),
+            page,
+        )?;
+        Some(PackedBufferResolution::Available(PackedBuffer {
+            gva,
+            size,
+            head: retained_head,
+            import,
+            gpas: Arc::new(gpas),
+            footprint,
+            runs: Arc::new(vec![GuestRun {
+                host_ptr: host_base.checked_add(head as usize)?,
+                len: size,
+            }]),
+            pages: Arc::new(vec![GuestWindowRun {
+                window_offset: 0,
+                guest,
+            }]),
+        }))
+    })()
+    .unwrap_or_else(unavailable);
+
+    crate::runtime::drain::note_store_route(match (usage, &made) {
+        (PackedResourceUse::Buffer, PackedBufferResolution::Available(_)) => {
+            "zc_buffer_packed_alias"
+        }
+        (PackedResourceUse::Buffer, PackedBufferResolution::Unavailable { .. }) => {
+            "zc_buffer_packed_unavailable"
+        }
+        (PackedResourceUse::LinearSample, PackedBufferResolution::Available(_)) => {
+            "zc_lin_packed_alias"
+        }
+        (PackedResourceUse::LinearSample, PackedBufferResolution::Unavailable { .. }) => {
+            "zc_lin_packed_unavailable"
+        }
+        (PackedResourceUse::LinearTarget, PackedBufferResolution::Available(_)) => {
+            "zc_target_packed_alias"
+        }
+        (PackedResourceUse::LinearTarget, PackedBufferResolution::Unavailable { .. }) => {
+            "zc_target_packed_unavailable"
+        }
+        (PackedResourceUse::ComputeTexture, PackedBufferResolution::Available(_)) => {
+            "zc_compute_texture_packed_alias"
+        }
+        (PackedResourceUse::ComputeTexture, PackedBufferResolution::Unavailable { .. }) => {
+            "zc_compute_texture_packed_unavailable"
+        }
+    });
+    let available = matches!(made, PackedBufferResolution::Available(_));
+    state
+        .bound_buffers
+        .insert_packed(task_id, resource_ref, made);
+    available
 }
 
 #[derive(Clone, Debug)]
@@ -330,8 +557,9 @@ impl BoundBuffers {
             {
                 Some(packed)
             }
-            PackedBufferResolution::Available(_)
-            | PackedBufferResolution::Unavailable { .. } => None,
+            PackedBufferResolution::Available(_) | PackedBufferResolution::Unavailable { .. } => {
+                None
+            }
         }
     }
 
@@ -569,6 +797,11 @@ mod tests {
                 head: 0x800,
                 import: Arc::clone(&import),
                 gpas: Arc::new(Vec::new()),
+                footprint: crate::runtime::guest_ram::GuestPageFootprint::new(
+                    Arc::from([0x1000]),
+                    0x1000,
+                )
+                .unwrap(),
                 runs: Arc::new(Vec::new()),
                 pages: Arc::new(Vec::new()),
             }),

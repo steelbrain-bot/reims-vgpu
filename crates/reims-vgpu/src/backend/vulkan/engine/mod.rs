@@ -27,7 +27,6 @@ mod facade_decline;
 mod guest_scatter;
 mod host_ram;
 pub mod init_decline;
-mod linear_target_import;
 mod pools;
 mod queue_owner;
 mod scatter_shader;
@@ -58,22 +57,22 @@ pub(crate) use counters::{CounterSnapshot, EngineCounters, TargetReadDelivery};
 pub(crate) use draw_phase::take_window as draw_phase_window;
 pub(crate) use draw_preparation::DrawPreparationDecline;
 pub(crate) use facade_decline::EngineFacadeDecline;
-pub(crate) use host_ram::GuestWriteDecline;
 pub use types::viewport_slot_count;
 pub use types::{
-    BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorWriteMask, ComputeBufferResource,
-    ComputeImageDestination, ComputeImageResult, ComputeOutput, ComputeRequest,
-    ComputeResidentSampleBind, ComputeSampledImageResource,
-    ComputeStorageImageResource, ComputeStorageResidency, CullMode, DepthClipMode, DepthState,
-    DrawError, DrawOutput, DrawRequest, FillMode, GuestRun, GuestRunSource, GuestSampledBacking,
-    GuestTargetBacking, GuestTargetMemory, GuestTargetSeed, IndexType, IndexedDrawResource,
-    PipelineObjectIdentity, PrimitiveTopology, SampledByteOrigin, SampledContentIdentity,
-    SampledImageResource, SampledSource, SamplerAddressMode, SamplerBorderColor,
-    SamplerCompareFunction, SamplerFilter, SamplerMipFilter, SamplerResource, ScissorResource,
-    SecondaryColorTarget, SeedOrder,
+    AttachmentInitial, BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorWriteMask,
+    ComputeBufferBacking, ComputeBufferResource, ComputeBufferResult, ComputeImageDestination,
+    ComputeImageResult, ComputeOutput, ComputeRequest, ComputeResidentSampleBind,
+    ComputeSampledImageResource, ComputeSampledImageSource, ComputeStorageImageResource,
+    ComputeStorageImageSeed, ComputeStorageResidency, CullMode, DepthClipMode, DepthState,
+    DrawError, DrawOutput, DrawRequest, FillMode, GuestRun, GuestRunSource, GuestTargetBacking,
+    GuestTargetMemory, GuestTargetSeed, IndexType, IndexedDrawResource, PipelineObjectIdentity,
+    PrimitiveTopology, SampledByteOrigin, SampledContentIdentity, SampledImageResource,
+    SampledSource, SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter,
+    SamplerMipFilter, SamplerResource, ScissorResource, SecondaryColorTarget, SeedOrder,
     StencilFaceOps, StencilOp, StencilState, StorageBufferResource, StorageImageFormat,
-    TargetIdentity, TargetKeyDivergence, VertexAttributeFormat, VertexAttributeResource, VertexStepFunction,
-    ViewportResource, VisibilityResultMode, WindowPresentSource, COLOR_INPUT_BINDING,
+    TargetIdentity, TargetKeyDivergence, VertexAttributeFormat, VertexAttributeResource,
+    VertexStepFunction, ViewportResource, VisibilityResultMode, WindowPresentSource,
+    COLOR_INPUT_BINDING,
 };
 pub(crate) use vk_call::{VkCall, VkOp};
 #[cfg(feature = "host-window")]
@@ -1226,10 +1225,7 @@ pub(super) static GUEST_READ_DEBT: std::sync::atomic::AtomicBool =
 /// take only this mutex and never the engine lock — taking that at every guest
 /// read is the cost the flag exists to avoid.
 static GUEST_WRITE_PAGES: std::sync::Mutex<GuestWriteFootprint> =
-    std::sync::Mutex::new(GuestWriteFootprint {
-        armed: Vec::new(),
-        allocations: Vec::new(),
-    });
+    std::sync::Mutex::new(GuestWriteFootprint { armed: Vec::new() });
 
 /// The page lists behind [`GUEST_WRITE_PAGES`].
 struct GuestWriteFootprint {
@@ -1249,12 +1245,6 @@ struct GuestWriteFootprint {
     /// ledger — a poisoned mutex — already answers `Unnamed` at every ask
     /// without one.
     armed: Vec<Vec<u64>>,
-    /// Resource-owned allocation footprints. A repeated Store into the same
-    /// admitted resident retains one immutable identity here rather than
-    /// copying and sorting its full page list again. These need no artificial
-    /// entry cap: each is a small `Arc`-backed handle, and the same global
-    /// settle that clears `armed` clears them all.
-    allocations: Vec<crate::runtime::guest_ram::GuestPageFootprint>,
 }
 
 /// What the ledger can say about a reader's window.
@@ -1300,29 +1290,11 @@ fn arm_guest_write_pages(pages: &[u64]) {
     f.armed.push(sorted);
 }
 
-/// Record one resource-owned allocation that an outstanding GPU Store writes.
-/// Repeated writes through the same admitted resource add no ledger work.
-fn arm_guest_write_footprint(
-    footprint: &crate::runtime::guest_ram::GuestPageFootprint,
-) {
-    let Ok(mut f) = GUEST_WRITE_PAGES.lock() else {
-        return;
-    };
-    if f.allocations
-        .iter()
-        .any(|held| held.same_allocation(footprint))
-    {
-        return;
-    }
-    f.allocations.push(footprint.clone());
-}
-
 /// Forget the outstanding writebacks' pages. Called under the engine lock, after
 /// the wait has landed and [`GUEST_WRITE_DEBT`] is cleared.
 fn clear_guest_write_pages() {
     if let Ok(mut f) = GUEST_WRITE_PAGES.lock() {
         f.armed.clear();
-        f.allocations.clear();
     }
 }
 
@@ -1338,7 +1310,7 @@ pub fn guest_writes_reaching(pages: &[u64]) -> GuestWriteReach {
     let Ok(f) = GUEST_WRITE_PAGES.lock() else {
         return GuestWriteReach::Unnamed;
     };
-    if f.armed.is_empty() && f.allocations.is_empty() {
+    if f.armed.is_empty() {
         // The flag said something was outstanding and the ledger names nothing:
         // the settle that cleared it raced this ask. Nothing to rule out
         // against, so nothing may be ruled out.
@@ -1367,11 +1339,6 @@ pub fn guest_writes_reaching(pages: &[u64]) -> GuestWriteReach {
             (Some(&a_lo), Some(&a_hi)) if !disjoint_span((a_lo, a_hi)) => {
                 pages.iter().any(|p| a.binary_search(p).is_ok())
             }
-            _ => false,
-        }
-    }) || f.allocations.iter().any(|a| {
-        match a.page_span() {
-            Some(span) if !disjoint_span(span) => pages.iter().any(|p| a.contains_page(*p)),
             _ => false,
         }
     });
@@ -1565,8 +1532,8 @@ pub fn write_completion_stamp(
         }));
     };
     let had_batch = pools.batch_open_recording().is_some();
-    let deferred = had_batch
-        && completion.queue_for_next_submission(index, guest_ref.clone(), value);
+    let deferred =
+        had_batch && completion.queue_for_next_submission(index, guest_ref.clone(), value);
     if !deferred {
         // A full pending ring cannot wait while this thread owns the open
         // command buffer: submitting it is what lets completions retire. This
@@ -1746,9 +1713,7 @@ fn resident_present_decision(
     };
     match pools::slot_present_decline(slot, width, height) {
         None => Ok(()),
-        Some(pools::ResidentPresentDecline::ContentNotReady) => {
-            Err("winpub_content_not_ready")
-        }
+        Some(pools::ResidentPresentDecline::ContentNotReady) => Err("winpub_content_not_ready"),
         Some(pools::ResidentPresentDecline::ScanoutOrder) => Err("winpub_scanout_order"),
         Some(pools::ResidentPresentDecline::Geometry) => Err("winpub_geometry"),
     }
@@ -1790,15 +1755,10 @@ pub fn prepare_window_resident_present(
     resident_present_decision(pools, identity, width, height)
 }
 
-/// What storage owns a ready resident's pixels.
-///
-/// A guest-backed resident is the guest allocation itself. A recyclable
-/// resident is a device allocation holding a copy, so callers deciding whether
-/// guest CPU writes can make the resident stale must keep the two distinct.
+/// Whether an engine-owned resident currently holds usable pixels.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResidentContentBacking {
     NotReady,
-    GuestAllocation,
     DeviceAllocation,
 }
 
@@ -1812,6 +1772,7 @@ pub enum ResidentContentBacking {
 pub struct ResidentResourceLease {
     identity: TargetIdentity,
     backing: ResidentContentBacking,
+    incarnation: Option<pools::ResidentIncarnation>,
     epoch: u64,
 }
 
@@ -1829,6 +1790,7 @@ impl ResidentResourceLease {
         Self {
             identity,
             backing,
+            incarnation: None,
             epoch: RESIDENT_RESOURCE_EPOCH.load(Ordering::Acquire),
         }
     }
@@ -1841,6 +1803,9 @@ pub(crate) fn test_advance_resident_resource_epoch() {
 
 impl Drop for ResidentResourceLease {
     fn drop(&mut self) {
+        let Some(incarnation) = self.incarnation else {
+            return;
+        };
         let mut guard = lock_engine();
         if self.epoch == RESIDENT_RESOURCE_EPOCH.load(Ordering::Acquire) {
             let EngineState {
@@ -1851,10 +1816,11 @@ impl Drop for ResidentResourceLease {
             } = *guard;
             if let Some(ctx) = owner.ctx.as_ref() {
                 unsafe {
-                    let _ = pools.release_resident_resource(ctx, &self.identity, counters);
+                    let _ =
+                        pools.release_resident_resource(ctx, &self.identity, incarnation, counters);
                 }
             } else {
-                let _ = pools.pin_resident_target(&self.identity, false);
+                let _ = pools.release_resident_ownership_for(&self.identity, incarnation);
             }
         }
     }
@@ -1866,23 +1832,20 @@ impl Drop for ResidentResourceLease {
 /// readiness is still validated by draw execution on every use.
 pub fn retain_resident_resource(identity: &TargetIdentity) -> Option<ResidentResourceLease> {
     let mut guard = lock_engine();
-    let guest_imported = guard.pools.retain_resident_target(identity)?;
+    let incarnation = guard.pools.retain_resident_target(identity)?;
     Some(ResidentResourceLease {
         identity: identity.clone(),
-        backing: if guest_imported {
-            ResidentContentBacking::GuestAllocation
-        } else {
-            ResidentContentBacking::DeviceAllocation
-        },
+        backing: ResidentContentBacking::DeviceAllocation,
+        incarnation: Some(incarnation),
         epoch: RESIDENT_RESOURCE_EPOCH.load(Ordering::Acquire),
     })
 }
 
-fn classify_resident_content(content_ready: bool, guest_imported: bool) -> ResidentContentBacking {
-    match (content_ready, guest_imported) {
-        (false, _) => ResidentContentBacking::NotReady,
-        (true, true) => ResidentContentBacking::GuestAllocation,
-        (true, false) => ResidentContentBacking::DeviceAllocation,
+fn classify_resident_content(content_ready: bool) -> ResidentContentBacking {
+    if content_ready {
+        ResidentContentBacking::DeviceAllocation
+    } else {
+        ResidentContentBacking::NotReady
     }
 }
 
@@ -1891,7 +1854,7 @@ pub fn resident_content_backing(identity: &TargetIdentity) -> ResidentContentBac
     guard
         .pools
         .registry_get(identity)
-        .map(|slot| classify_resident_content(slot.content_ready, slot.memory.is_guest_imported()))
+        .map(|slot| classify_resident_content(slot.content_ready))
         .unwrap_or(ResidentContentBacking::NotReady)
 }
 
@@ -1904,21 +1867,13 @@ mod resident_content_backing_tests {
     use super::*;
 
     #[test]
-    fn ready_content_preserves_whether_it_is_the_guest_allocation() {
+    fn ready_content_is_engine_owned() {
         assert_eq!(
-            classify_resident_content(true, true),
-            ResidentContentBacking::GuestAllocation
-        );
-        assert_eq!(
-            classify_resident_content(true, false),
+            classify_resident_content(true),
             ResidentContentBacking::DeviceAllocation
         );
         assert_eq!(
-            classify_resident_content(false, true),
-            ResidentContentBacking::NotReady
-        );
-        assert_eq!(
-            classify_resident_content(false, false),
+            classify_resident_content(false),
             ResidentContentBacking::NotReady
         );
     }
@@ -2734,7 +2689,7 @@ unsafe fn copy_image_level0_to_host_delivered(
         ctx.submit_queue_work(&cbs, &[], &[], &[], fence)
             .map_err(|e| DrawError::VkCall(VkCall::new(ops.submit, e)))?;
         let sealed = pools.seal_entry(Vec::new(), Vec::new());
-        pools.finish_entry_async(&ctx.device, sealed);
+        pools.finish_entry_async(sealed, None);
     }
     // Split three ways rather than timed as a whole: the submit and the copy
     // scale with the surface, the fence does not scale with anything we control,
@@ -2941,7 +2896,7 @@ pub fn read_target_leased(identity: &TargetIdentity) -> Result<Option<LeasedFram
     }
     let rb_size =
         (snap.width as u64) * (snap.height as u64) * u64::from(RESIDENT_READ_BYTES_PER_TEXEL);
-    let read_access = pools::ResidentAccess::transfer_read(snap.guest_backing.is_some());
+    let read_access = pools::ResidentAccess::transfer_read();
     unsafe {
         let delivered = copy_image_level0_to_host_delivered(
             ctx,
@@ -3011,10 +2966,6 @@ pub struct GuestPageTarget {
     /// written into each of them; a destination four bytes per texel wider
     /// would have had its rows overlap at half their true pitch.
     pub format: ash::vk::Format,
-    /// Exact shared allocation spelling of this destination, when the host can
-    /// retain one. A resident may settle synchronization without a copy only
-    /// when this equals the allocation it was created over.
-    pub shared_backing: Option<GuestTargetBacking>,
 }
 
 impl GuestPageTarget {
@@ -3218,18 +3169,10 @@ pub fn copy_target_to_guest_pages(
             GuestWriteDecline::WindowTooSmall { need, have },
         ));
     }
-    if shared_backing_settles(snap.guest_backing, dst.shared_backing) {
-        crate::runtime::drain::note_store_route("target_sync_shared_backing");
-        record_guest_write_debt(pools, GuestWriteSource::ResidentTarget(identity), pages);
-        return Ok(());
-    }
     unsafe {
         let plan = plan_guest_copy(ctx, pools, counters, dst)?;
         copy_image_level0_to_buffer(ctx, pools, counters, &snap, &plan)?;
-        pools.registry_note_access(
-            identity,
-            pools::ResidentAccess::transfer_read(snap.guest_backing.is_some()),
-        );
+        pools.registry_note_access(identity, pools::ResidentAccess::transfer_read());
         // The copy above is `vkCmdCopyImageToBuffer` into the guest's own
         // imported pages, so these bytes are the host readback this rail elides
         // rather than one it paid.
@@ -3356,44 +3299,10 @@ unsafe fn plan_guest_copy(
     }
 }
 
-/// Synchronize a resident that is already backed by its guest allocation.
-///
-/// The resource owns both its imported binding and the physical-page footprint
-/// retained when that binding was admitted. Synchronization therefore names
-/// only the resource: it publishes the existing GPU write to the completion
-/// ledger and performs no destination reconstruction or copy.
-pub fn synchronize_guest_backed_target(
-    identity: &TargetIdentity,
-) -> Result<crate::runtime::guest_ram::GuestPageFootprint, DrawError> {
-    use host_ram::GuestWriteDecline;
-    let mut guard = lock_engine();
-    let pools = &mut guard.pools;
-    let snap = resident_read_snapshot(pools, identity)?;
-    if snap.guest_backing.is_none() {
-        return Err(DrawError::GuestPageWrite(
-            GuestWriteDecline::NoSharedBacking,
-        ));
-    }
-    let footprint = snap.guest_footprint.ok_or(DrawError::GuestPageWrite(
-        GuestWriteDecline::NoSharedBacking,
-    ))?;
-    crate::runtime::drain::note_store_route("target_sync_shared_backing");
-    record_guest_write_footprint_debt(pools, identity, &footprint);
-    Ok(footprint)
-}
-
-fn shared_backing_settles(
-    resident: Option<GuestTargetBacking>,
-    destination: Option<GuestTargetBacking>,
-) -> bool {
-    resident.is_some() && resident == destination
-}
-
 /// Publish one resident write to the fence/dependency ledger.
 ///
-/// Both a queued image-to-buffer copy and rendering into shared backing owe the
-/// same completion rule: guest code must not observe its completion stamp until
-/// the queue has finished writing these pages.
+/// Guest code must not observe its completion stamp until the queue has
+/// finished copying into these pages.
 /// What a recorded guest-page write must keep alive until it lands.
 ///
 /// A copy that is submitted and not waited leaves its source image readable by
@@ -3423,6 +3332,11 @@ pub(super) enum GuestWriteSource<'a> {
     /// `compute_rekey_refusal` — the only thing that stops it — reads `pinned`.
     /// See `ResourcePools::pin_resident_storage`.
     ResidentStorage(&'a crate::model::ComputeStorageResidencyKey),
+    /// A storage buffer bound directly over an imported guest allocation.
+    /// The import registry owns the Vulkan buffer, and retiring the allocation
+    /// routes destruction through the ring graveyard, so there is no separate
+    /// resident object to pin.
+    ImportedBuffer,
     /// A transient image sealed into this submission's own ring entry.
     ///
     /// The ring is the lifetime: a slot with cleanup parked on it cannot be
@@ -3448,60 +3362,6 @@ pub(super) fn record_guest_write_debt(
     // Published after the ledger entry and while the engine lock is still held,
     // so no thread can observe the flag clear while a write is outstanding.
     GUEST_WRITE_DEBT.store(true, std::sync::atomic::Ordering::Release);
-}
-
-/// Publish a write through the immutable footprint retained by the admitted
-/// resident. This is the resource-owned form of [`record_guest_write_debt`].
-pub(super) fn record_guest_write_footprint_debt(
-    pools: &mut pools::ResourcePools,
-    identity: &TargetIdentity,
-    footprint: &crate::runtime::guest_ram::GuestPageFootprint,
-) {
-    pools.note_guest_write_recorded(GuestWriteSource::ResidentTarget(identity));
-    arm_guest_write_footprint(footprint);
-    GUEST_WRITE_DEBT.store(true, std::sync::atomic::Ordering::Release);
-}
-
-/// Report the exact binding equation for one live packed guest surface.
-///
-/// This remains an observation entry point; resident creation consumes the
-/// same planner independently so a probe cannot enable behavior that the live
-/// allocation did not itself prove.
-#[allow(clippy::too_many_arguments)]
-pub fn probe_guest_backed_target(
-    host_ptr: usize,
-    allocation_len: u64,
-    plane_offset: u64,
-    guest_row_pitch: u64,
-    width: u32,
-    height: u32,
-    format: ash::vk::Format,
-) {
-    let mut guard = lock_engine();
-    let EngineState {
-        ref mut owner,
-        ref counters,
-        ..
-    } = &mut *guard;
-    let Ok(ctx) = owner.ensure(counters) else {
-        crate::observe::off(format!(
-            "vk_linear_target_window verdict=no_context format={format:?} {width}x{height}"
-        ));
-        return;
-    };
-    unsafe {
-        linear_target_import::probe_window(
-            ctx,
-            host_ptr,
-            allocation_len,
-            plane_offset,
-            guest_row_pitch,
-            width,
-            height,
-            format,
-            registry_target_usage(format),
-        )
-    };
 }
 
 /// How one frame gets from a resident image into the guest's stretches.
@@ -4049,7 +3909,7 @@ unsafe fn copy_image_level0_to_buffer(
     // render pass leaves its attachment in [`caches::color0_pass_exit_layout`],
     // so the common case is a real transition too, and it must still order this
     // copy after the draws that produced the pixels.
-    let read_access = pools::ResidentAccess::transfer_read(snap.guest_backing.is_some());
+    let read_access = pools::ResidentAccess::transfer_read();
     let barrier = [ash::vk::ImageMemoryBarrier::default()
         .src_access_mask(RESIDENT_READ_SRC_ACCESS)
         .dst_access_mask(ash::vk::AccessFlags::TRANSFER_READ)
@@ -4091,10 +3951,11 @@ unsafe fn copy_image_level0_to_buffer(
             .end_command_buffer(cb)
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteEndCb, e)))?;
         let cbs = [cb];
-        ctx.submit_guest_work(&cbs, fence)
+        let timeline = ctx
+            .submit_guest_work(&cbs, fence)
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteSubmit, e)))?;
         let sealed = pools.seal_entry(Vec::new(), Vec::new());
-        pools.finish_entry_async(&ctx.device, sealed);
+        pools.finish_entry_async(sealed, timeline);
     }
     note_readback_phase(
         ReadbackPhase::Submit,
@@ -4137,13 +3998,8 @@ unsafe fn record_guest_copy_plan(
         match plan {
             GuestCopyPlan::Rectangles(groups) => {
                 for (buffer, regions) in groups {
-                    ctx.device.cmd_copy_image_to_buffer(
-                        cb,
-                        src_image,
-                        src_layout,
-                        *buffer,
-                        regions,
-                    );
+                    ctx.device
+                        .cmd_copy_image_to_buffer(cb, src_image, src_layout, *buffer, regions);
                 }
             }
             GuestCopyPlan::Linear {
@@ -4152,13 +4008,8 @@ unsafe fn record_guest_copy_plan(
                 scatter,
             } => {
                 let one = [*detile];
-                ctx.device.cmd_copy_image_to_buffer(
-                    cb,
-                    src_image,
-                    src_layout,
-                    *scratch,
-                    &one,
-                );
+                ctx.device
+                    .cmd_copy_image_to_buffer(cb, src_image, src_layout, *scratch, &one);
                 // The scatter reads what the detile just wrote, and nothing in one
                 // command buffer orders the two by itself. A global memory barrier
                 // rather than a buffer one because there is exactly one buffer in
@@ -4188,12 +4039,14 @@ unsafe fn record_guest_copy_plan(
                         // submission and so needs `HOST` named on the source side.
                         let ready = [ash::vk::MemoryBarrier::default()
                             .src_access_mask(
-                                ash::vk::AccessFlags::TRANSFER_WRITE | ash::vk::AccessFlags::HOST_WRITE,
+                                ash::vk::AccessFlags::TRANSFER_WRITE
+                                    | ash::vk::AccessFlags::HOST_WRITE,
                             )
                             .dst_access_mask(ash::vk::AccessFlags::SHADER_READ)];
                         ctx.device.cmd_pipeline_barrier(
                             cb,
-                            ash::vk::PipelineStageFlags::TRANSFER | ash::vk::PipelineStageFlags::HOST,
+                            ash::vk::PipelineStageFlags::TRANSFER
+                                | ash::vk::PipelineStageFlags::HOST,
                             ash::vk::PipelineStageFlags::COMPUTE_SHADER,
                             ash::vk::DependencyFlags::empty(),
                             &ready,
@@ -4510,8 +4363,6 @@ struct ResidentReadSnapshot {
     /// this against the destination's format to decide whether a byte copy
     /// lands the right texel.
     format: ash::vk::Format,
-    guest_backing: Option<GuestTargetBacking>,
-    guest_footprint: Option<crate::runtime::guest_ram::GuestPageFootprint>,
 }
 
 impl ResidentReadSnapshot {
@@ -4568,8 +4419,6 @@ mod resident_read_order_tests {
             height: 2,
             layout: ash::vk::ImageLayout::UNDEFINED,
             format,
-            guest_backing: None,
-            guest_footprint: None,
         }
     }
 
@@ -4699,8 +4548,6 @@ fn resident_read_snapshot(
         height: slot.height,
         layout: slot.access.layout(),
         format: slot.format.declared(),
-        guest_backing: slot.memory.guest_backing(),
-        guest_footprint: slot.memory.guest_footprint(),
     })
 }
 
@@ -4750,7 +4597,7 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
     // not what the caller can read.
     let pixels = (snap.width as u64) * (snap.height as u64);
     let rb_size = pixels * u64::from(layout.bytes_per_texel());
-    let read_access = pools::ResidentAccess::transfer_read(snap.guest_backing.is_some());
+    let read_access = pools::ResidentAccess::transfer_read();
     unsafe {
         let out = copy_image_level0_to_host(
             ctx,
@@ -5137,14 +4984,6 @@ mod group_by_buffer_tests {
 mod guest_write_footprint_tests {
     use super::*;
 
-    fn footprint() -> crate::runtime::guest_ram::GuestPageFootprint {
-        crate::runtime::guest_ram::GuestPageFootprint::new(
-            std::sync::Arc::from([0x1000, 0x2000, 0x9000]),
-            0x1000,
-        )
-        .expect("valid footprint")
-    }
-
     /// The whole point: a reader whose window shares no page with the
     /// outstanding writeback is let through, and one that shares a single page
     /// is not. The wrong answer here is a stale frame, so the overlapping case
@@ -5163,26 +5002,6 @@ mod guest_write_footprint_tests {
         assert_eq!(reach(&[0x2000]), GuestWriteReach::Overlap);
         // Unsorted input on both sides: the arm sorts, the ask does not have to.
         assert_eq!(reach(&[0xf000, 0x4000, 0x1000]), GuestWriteReach::Overlap);
-        clear_guest_write_pages();
-    }
-
-    #[test]
-    fn a_resource_footprint_is_retained_once_and_keeps_scatter_gaps_disjoint() {
-        clear_guest_write_pages();
-        let allocation = footprint();
-        arm_guest_write_footprint(&allocation);
-        arm_guest_write_footprint(&allocation.clone());
-        {
-            let held = GUEST_WRITE_PAGES.lock().expect("ledger lock");
-            assert_eq!(held.allocations.len(), 1, "one admitted allocation identity");
-            assert!(held.armed.is_empty(), "no copied page-list shadow");
-        }
-        assert_eq!(guest_writes_reaching(&[0x9000]), GuestWriteReach::Overlap);
-        assert_eq!(
-            guest_writes_reaching(&[0x5000]),
-            GuestWriteReach::Disjoint,
-            "the physical gap is not part of the allocation"
-        );
         clear_guest_write_pages();
     }
 
@@ -5325,8 +5144,14 @@ mod guest_write_footprint_tests {
     fn a_reader_clear_of_the_armed_span_is_disjoint_from_either_side() {
         clear_guest_write_pages();
         arm_guest_write_pages(&[0x8000, 0x9000, 0xa000]);
-        assert_eq!(guest_writes_reaching(&[0x6000, 0x7000]), GuestWriteReach::Disjoint);
-        assert_eq!(guest_writes_reaching(&[0xb000, 0xc000]), GuestWriteReach::Disjoint);
+        assert_eq!(
+            guest_writes_reaching(&[0x6000, 0x7000]),
+            GuestWriteReach::Disjoint
+        );
+        assert_eq!(
+            guest_writes_reaching(&[0xb000, 0xc000]),
+            GuestWriteReach::Disjoint
+        );
         assert_eq!(
             guest_writes_reaching(&[0x7000, 0x8000]),
             GuestWriteReach::Overlap,
@@ -5442,25 +5267,6 @@ mod engine_lock_census_tests {
 mod guest_page_target_tests {
     use super::*;
 
-    #[test]
-    fn synchronization_settles_only_the_identical_shared_allocation() {
-        let backing = GuestTargetBacking {
-            allocation_host_ptr: 0x1000,
-            allocation_len: 0x8000,
-            plane_offset: 0x2000,
-            row_pitch: 256,
-        };
-        assert!(shared_backing_settles(Some(backing), Some(backing)));
-        assert!(!shared_backing_settles(Some(backing), None));
-        assert!(!shared_backing_settles(
-            Some(backing),
-            Some(GuestTargetBacking {
-                plane_offset: 0x3000,
-                ..backing
-            })
-        ));
-    }
-
     /// A target over a synthetic import large enough that the bound under test
     /// is the extent arithmetic and not the import's own length.
     fn target(width: u32, height: u32, row_length_texels: u32) -> GuestPageTarget {
@@ -5492,7 +5298,6 @@ mod guest_page_target_tests {
             // reaches a resident, so only its texel width matters — these cases
             // are all four-byte extent arithmetic.
             format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
-            shared_backing: None,
         }
     }
 

@@ -180,11 +180,7 @@ impl ReleasedPages {
     /// them cost one boot **104 million** counter increments, each taking the
     /// census mutex, from an instrument whose entire job is to not perturb a
     /// race. The watch size is reported as a level instead.
-    pub fn sweep(
-        &mut self,
-        writes: &HostWrites,
-        now_us: u64,
-    ) -> Vec<(u64, u32, ReleasedVerdict)> {
+    pub fn sweep(&mut self, writes: &HostWrites, now_us: u64) -> Vec<(u64, u32, ReleasedVerdict)> {
         let mut out = Vec::new();
         self.pages.retain(|&gpa, rel| {
             let verdict = match writes.wrote_any_since(rel.epoch, &[gpa]) {
@@ -347,7 +343,10 @@ mod tests {
         writes.note_pages(vec![9 * P]);
 
         let found = r.sweep(&writes, 700);
-        assert_eq!(found, vec![(9 * P, 7, ReleasedVerdict::Wrote { since_us: 600 })]);
+        assert_eq!(
+            found,
+            vec![(9 * P, 7, ReleasedVerdict::Wrote { since_us: 600 })]
+        );
         assert!(found[0].2.is_finding());
         assert_eq!(r.watched(), 0, "a page that reported is not watched again");
         assert!(r.sweep(&writes, 800).is_empty());

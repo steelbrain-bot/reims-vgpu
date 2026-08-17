@@ -55,17 +55,6 @@
 //! change is a guest that starts populating the tail, and that is now a typed
 //! decline raised at the record, not a counter nobody reads.
 //!
-//! `t11_decline` was the second: an eight-way reason enum over the type-11
-//! sampled rail's zero-copy declines. Across every recorded boot, 1 051 sampled
-//! declines named `below_floor` and nothing else — the other seven variants
-//! never fired once, including the three that sat *after* the floor test and so
-//! were never shadowed by it. That answer set `SAMPLED_GATHER_MIN_BYTES`, whose
-//! scope and basis are recorded on the constant. The threshold now governs only
-//! the copied gather fallback; a directly-backed resource has no size
-//! crossover. The rail returns `Option` like its type-2/3 sibling: falling back
-//! to the CPU byte loader is expected control flow that yields the same pixels,
-//! so it stays quiet.
-//!
 //! `deferred_windows` was the third: peak population and forced-eviction count
 //! for the three deferred-window caps (GVA 16, surface 16, storage 8), built to
 //! answer whether any of them had ever bound. Across every boot in a 72 MB

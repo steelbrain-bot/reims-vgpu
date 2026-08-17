@@ -38,17 +38,17 @@
 //!
 //! A token registered over one page list says nothing about another, and the
 //! guest recycles GVAs. The type-11 twin handles this with an explicit
-//! `guest_write_token_gen != map_generation` check that a future writer has to
+//! `guest_write_token_gen != page_generation` check that a future writer has to
 //! remember. Here the page-set hash *is part of the key*
 //! (`draw::vulkan::gva_span_alloc_generation`, the same value the engine
 //! registry keys the resident on), so a target whose page list has moved cannot
 //! be found under the key its token was armed under. The wrong answer is
-//! unreachable rather than guarded; the stale entry becomes an orphan, which is
-//! a resource cost the eviction below collects.
+//! unreachable rather than guarded. Entries are owned by the task lifetime, so
+//! task teardown releases the stale entry and its host token.
 //!
 //! # Why not [`crate::runtime::gather_witness`]
 //!
-//! It already owns a bounded, token-holding map keyed by `GatherKey::TaskGva`,
+//! It already owns a token-holding map keyed by `GatherKey::TaskGva`,
 //! and reusing it was the obvious move. Two things stop it, and the first is a
 //! live hazard rather than an inelegance. Its entry carries the
 //! sampled-content generation the engine binds retained images on, and it keys
@@ -60,7 +60,7 @@
 //!
 //! What is shared instead is everything with no such coupling: the
 //! [`GuestWriteVerdict`] spelling, the release rail through
-//! `DeviceState::retired_guest_write_tokens`, and the eviction shape.
+//! `DeviceState::retired_guest_write_tokens`, and task-lifetime retirement.
 //!
 //! # The rule every consumer must obey
 //!
@@ -84,6 +84,9 @@ use std::collections::BTreeMap;
 /// the two spellings cannot drift into naming different targets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct GvaTargetKey {
+    /// Task-local resource owner. This makes task teardown the lifetime boundary
+    /// for the witness instead of leaving an orphan for a capacity sweep.
+    pub task_id: u32,
     pub gva: u64,
     /// Hash of the resolved guest page set — `gva_span_alloc_generation`. Part
     /// of the key, which is what makes a moved page list a different target
@@ -109,12 +112,13 @@ impl GvaTargetKey {
     /// The key for a `TargetIdentity::Gva`, or `None` for any other identity
     /// kind or an unusable generation.
     ///
-    /// The task is deliberately not in the key. Two tasks colliding here would
-    /// need identical resolved page sets at the same address and extent, which
-    /// is the same physical memory — the same target by every test this device
-    /// applies to it.
+    /// The task is part of the key because it owns the resource lifetime and is
+    /// the contract event that retires the host tracking token.
     #[cfg(feature = "backend-vulkan")]
-    pub fn of(identity: &crate::backend::vulkan::engine::TargetIdentity) -> Option<Self> {
+    pub fn of(
+        task_id: u32,
+        identity: &crate::backend::vulkan::engine::TargetIdentity,
+    ) -> Option<Self> {
         match *identity {
             crate::backend::vulkan::engine::TargetIdentity::Gva {
                 gva,
@@ -123,6 +127,7 @@ impl GvaTargetKey {
                 generation,
                 format: _,
             } if generation != 0 && gva != 0 => Some(Self {
+                task_id,
                 gva,
                 generation,
                 width,
@@ -155,33 +160,13 @@ struct Entry {
     /// `host_writes.epoch()` as it stood at the Store, read *after* the Store
     /// recorded its own write so the Store does not invalidate itself.
     host_epoch_at_store: u64,
-    /// Store ordinal, for the eviction order.
-    last_seen: u64,
 }
 
 /// Per-device witness state: one entry per GVA render target stamped.
 #[derive(Default, Debug)]
 pub struct GvaStoreWitness {
     entries: BTreeMap<GvaTargetKey, Entry>,
-    stores: u64,
 }
-
-/// Upper bound on tracked GVA targets.
-///
-/// A hypervisor harvest bound and not a memory one, for the same reason
-/// `gather_witness::MAX_TRACKED_WINDOWS` is and out of the same budget: the shim
-/// walks every page of every tracked set on the BQL thread at each register
-/// write that hands the device work, so each armed target adds its page count to
-/// a cost the whole VM pays. The two constants are halves of one budget and the
-/// basis is stated in both.
-///
-/// The population is the compositing layers a desktop keeps live at once, which
-/// is the same order as the sampled working set that sized the other bound.
-/// Overflow evicts the least recently stored target rather than dropping the
-/// map, so a working set past this degrades one target at a time instead of
-/// un-arming every live one at once. `gvaw_evict` counts it, so a boot says
-/// whether the bound binds rather than leaving it assumed.
-const MAX_TRACKED_TARGETS: usize = 128;
 
 impl GvaStoreWitness {
     /// Detach every tracking token, for release through
@@ -203,19 +188,17 @@ impl GvaStoreWitness {
         self.entries.len()
     }
 
-    fn evict_oldest(&mut self, retired: &mut Vec<u64>) {
-        let Some(victim) = self
+    pub fn retire_task(&mut self, task_id: u32) -> Vec<u64> {
+        let doomed: Vec<_> = self
             .entries
-            .iter()
-            .min_by_key(|(_, e)| e.last_seen)
-            .map(|(k, _)| *k)
-        else {
-            return;
-        };
-        if let Some(e) = self.entries.remove(&victim) {
-            crate::runtime::drain::note_store_route("gvaw_evict");
-            retired.push(e.token);
-        }
+            .keys()
+            .filter(|key| key.task_id == task_id)
+            .copied()
+            .collect();
+        doomed
+            .into_iter()
+            .filter_map(|key| self.entries.remove(&key).map(|entry| entry.token))
+            .collect()
     }
 }
 
@@ -253,11 +236,6 @@ pub fn note_store<H: HostOps>(
     let token = match state.gva_store_witness.entries.get(&key) {
         Some(e) => e.token,
         None => {
-            while state.gva_store_witness.entries.len() >= MAX_TRACKED_TARGETS {
-                let mut retired = Vec::new();
-                state.gva_store_witness.evict_oldest(&mut retired);
-                state.retired_guest_write_tokens.extend(retired);
-            }
             match host.track_guest_writes(gpas, page_size) {
                 Some(t) => t,
                 None => {
@@ -283,8 +261,6 @@ pub fn note_store<H: HostOps>(
             0
         }
     };
-    state.gva_store_witness.stores = state.gva_store_witness.stores.wrapping_add(1);
-    let last_seen = state.gva_store_witness.stores;
     let host_epoch_at_store = state.host_writes.epoch();
     state.gva_store_witness.entries.insert(
         key,
@@ -293,17 +269,14 @@ pub fn note_store<H: HostOps>(
             gpas: gpas.to_vec(),
             gen_at_store,
             host_epoch_at_store,
-            last_seen,
         },
     );
 }
 
 /// Forget every target whose pages this task owned, handing back their tokens.
 ///
-/// A task teardown takes its page tables with it, so nothing in it names
-/// anything any more. There is no task in the key — see [`GvaTargetKey::of`] —
-/// so this takes the page list instead: an entry every one of whose pages the
-/// caller names as gone is gone. Called with the task's retired page set.
+/// A physical-page retirement can also end targets independently of task
+/// teardown, so this takes the page list and retires every intersecting entry.
 pub fn retire_pages(state: &mut DeviceState, gone: &[u64]) {
     if gone.is_empty() {
         return;
@@ -405,7 +378,10 @@ pub fn note_host_reach(state: &DeviceState, key: GvaTargetKey) {
     let Some(e) = state.gva_store_witness.entries.get(&key) else {
         return;
     };
-    let reach = state.host_writes.epoch().saturating_sub(e.host_epoch_at_store);
+    let reach = state
+        .host_writes
+        .epoch()
+        .saturating_sub(e.host_epoch_at_store);
     crate::runtime::drain::note_store_route(if reach < 64 {
         "gvaw_reach_lt64"
     } else if reach < 512 {
@@ -431,6 +407,7 @@ mod tests {
 
     fn key(generation: u64) -> GvaTargetKey {
         GvaTargetKey {
+            task_id: 1,
             gva: 0x1_0000,
             generation,
             width: 64,
@@ -595,16 +572,15 @@ mod tests {
         );
     }
 
-    /// Past the bound the least recently stored target is evicted and its token
-    /// handed back, rather than the map growing without limit or being dropped
-    /// whole. A leaked token has the whole VM walking its pages at every
-    /// doorbell for the life of the process.
+    /// Every live target remains tracked until its task lifetime ends.
     #[test]
-    fn the_bound_evicts_the_coldest_target_and_hands_back_its_token() {
+    fn live_targets_are_not_evicted_by_capacity() {
         let mut state = device();
         let mut host = FakeHost::new();
-        for i in 0..(MAX_TRACKED_TARGETS as u64 + 4) {
+        const DISTINCT_TARGETS: u64 = 256;
+        for i in 0..DISTINCT_TARGETS {
             let k = GvaTargetKey {
+                task_id: 1,
                 gva: 0x1000 * (i + 1),
                 generation: 0xabc,
                 width: 8,
@@ -613,27 +589,31 @@ mod tests {
             };
             armed(&mut state, &mut host, k, &[(i + 3) * PAGE]);
         }
-        assert!(state.gva_store_witness.len() <= MAX_TRACKED_TARGETS);
+        assert_eq!(state.gva_store_witness.len(), DISTINCT_TARGETS as usize);
+        assert!(state.retired_guest_write_tokens.is_empty());
+    }
+
+    /// The task is the target's contract lifetime: ending it releases only its
+    /// tracking tokens and leaves another task's same-address target intact.
+    #[test]
+    fn task_retirement_releases_only_that_tasks_targets() {
+        let mut state = device();
+        let mut host = FakeHost::new();
+        let owned = key(0xabc);
+        let other = GvaTargetKey {
+            task_id: 2,
+            ..key(0xabc)
+        };
+        armed(&mut state, &mut host, owned, &[3 * PAGE]);
+        armed(&mut state, &mut host, other, &[4 * PAGE]);
+
+        assert_eq!(state.gva_store_witness.retire_task(1).len(), 1);
+        assert_eq!(state.gva_store_witness.len(), 1);
         assert_eq!(
-            state.retired_guest_write_tokens.len(),
-            4,
-            "one token handed back per eviction"
+            reach(&state, &host, owned),
+            GvaWriteReach::Guest(GuestWriteVerdict::NoMapping)
         );
-        assert_eq!(
-            reach(
-                &state,
-                &host,
-                GvaTargetKey {
-                    gva: 0x1000,
-                    generation: 0xabc,
-                    width: 8,
-                    height: 8,
-                    bgra: true
-                }
-            ),
-            GvaWriteReach::Guest(GuestWriteVerdict::NoMapping),
-            "the coldest target is the one gone"
-        );
+        assert_eq!(reach(&state, &host, other), GvaWriteReach::Quiet);
     }
 
     /// Every armed token is handed back on reset. Anything else leaves the host

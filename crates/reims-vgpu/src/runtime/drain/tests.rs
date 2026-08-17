@@ -526,7 +526,7 @@ fn replace_physical_drops_the_cached_page_list() {
         m.type4_walk = Some(crate::model::Type4Walk {
             task_id: 0,
             backing_pfn: 0x20,
-            map_generation: m.map_generation,
+            page_generation: m.page_generation,
         });
     }
     let generation_before = state.mappings.get(&7).unwrap().map_generation;
@@ -621,8 +621,12 @@ fn replace_physical_retires_only_the_named_resource() {
         texture_ref,
     };
     let debt = |gva, generation| GvaWritebackDebt {
-        gva,
-        row_stride: 256,
+        linear: crate::runtime::draw::LinearColorTarget {
+            allocation_gva: gva,
+            allocation_size: 256 * 64,
+            plane_offset: 0,
+            row_stride: 256,
+        },
         width: 64,
         height: 64,
         format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
@@ -682,7 +686,7 @@ fn replace_physical_does_not_confuse_another_tasks_mapping_for_the_resource() {
         m.type4_walk = Some(crate::model::Type4Walk {
             task_id: 1,
             backing_pfn: 0x20,
-            map_generation: m.map_generation,
+            page_generation: m.page_generation,
         });
     }
     state.map_surface(99);
@@ -5528,11 +5532,9 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
     );
     #[cfg(feature = "backend-vulkan")]
     {
-        state.task_depth_stencil_states.register(
-            2,
-            12,
-            std::sync::Arc::new(Default::default()),
-        );
+        state
+            .task_depth_stencil_states
+            .register(2, 12, std::sync::Arc::new(Default::default()));
         state.task_render_pipeline_states.register(
             2,
             13,
@@ -5628,7 +5630,6 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
         state.objects.contains(&(2, 14)),
         "0x3ec is unclaimed inside the destroy span and names no destroy at all"
     );
-
 }
 
 /// The kind is decoded off the record and counted per kind.

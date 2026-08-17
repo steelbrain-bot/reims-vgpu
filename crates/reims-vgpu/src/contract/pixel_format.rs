@@ -387,24 +387,17 @@ impl TexelLayout {
         matches!(self, Self::Rgba8 | Self::Bgra8)
     }
 
-    /// Whether [`texel_to_rgba8`] carries an arm for this layout, so a rail
-    /// that declines has a CPU path to decline *to*.
+    /// Whether [`texel_to_rgba8`] carries an arm for this layout.
     ///
-    /// This is the question a performance threshold is really asking. A floor
-    /// that turns a small window away from a GPU gather is only a cost
-    /// decision when the CPU loader can serve it instead; for a layout with no
-    /// arm the same floor is a correctness gate wearing a threshold's clothes,
-    /// and the sample goes black or fail-visible rather than slow. The two
-    /// float layouts are colour-management LUTs, whose transfer curve unorm8
-    /// would quantize — which is why `texel_to_rgba8` deliberately has no arm
-    /// for them and why they must bypass any such floor.
+    /// The float layouts are colour-management LUTs whose transfer curve
+    /// unorm8 would quantize, which is why `texel_to_rgba8` deliberately has no
+    /// arm for them.
     ///
-    /// Spelled here rather than at the floors, because it is a property of the
-    /// layout and the loader, and a rail that re-lists the variants drifts the
-    /// first time one is added. It is deliberately **not** `is_four_byte_color`
-    /// even though the two agreed for as long as only four-byte colour reached
-    /// a floor: they answer different questions and diverge on `R8`/`Rg8`,
-    /// which have arms and are not four bytes.
+    /// Spelled here because it is a property of the layout and the loader. It
+    /// is deliberately **not** `is_four_byte_color`
+    /// even though the two agreed for the first formats implemented: they
+    /// answer different questions and diverge on `R8`/`Rg8`, which have arms
+    /// and are not four bytes.
     pub fn has_cpu_loader_arm(self) -> bool {
         match self {
             Self::Rgba8 | Self::Bgra8 | Self::R8 | Self::Rg8 => true,
@@ -436,8 +429,7 @@ impl TexelLayout {
     /// Whether [`texel_to_rgba8`]'s arm for this layout loses information the
     /// guest can see.
     ///
-    /// An arm existing and an arm being *equivalent* are two different facts,
-    /// and conflating them is how a cost threshold becomes a data-loss gate.
+    /// An arm existing and an arm being *equivalent* are two different facts.
     /// The half-float colour arms go through `f16_to_unorm8_lut`: every channel
     /// is clamped to `[0, 1]` and quantized to 256 levels, so a compositor
     /// working in extended range has its highlights removed and a colour ramp
@@ -463,27 +455,6 @@ impl TexelLayout {
             | Self::Bgr10a2Unorm
             | Self::Rg11b10Float => false,
         }
-    }
-
-    /// Whether a **cost** threshold may turn this layout away from a GPU rail
-    /// onto the CPU byte loader.
-    ///
-    /// This is the question the zero-copy floors are really asking, and it is
-    /// derived from the two above rather than re-listed, so a layout added with
-    /// a lossy arm cannot be waved past by a floor that only checked whether an
-    /// arm existed. A floor is a performance decision exactly when the path it
-    /// declines to produces the same pixels; where the only CPU arm is lossy —
-    /// or absent — the same floor is a correctness gate wearing a threshold's
-    /// clothes.
-    ///
-    /// The half-float colour layouts are why this exists. They answered
-    /// `has_cpu_loader_arm()` truthfully and were therefore turned away by the
-    /// 64 KiB sampled floor, which is above a 64x64 `RGBA16Float` texture's
-    /// 32 KiB — so a colour-management LUT the guest stored in extended range
-    /// reached the shader clamped and quantized, every boot, reported by
-    /// `sampled_texture_narrowed` and by nothing else.
-    pub fn a_cost_floor_may_decline(self) -> bool {
-        self.has_cpu_loader_arm() && !self.cpu_loader_arm_is_lossy()
     }
 
     /// Whether an sRGB-encoded image can be *stored* in this layout, so a host
@@ -1593,7 +1564,10 @@ pub fn expand_rgba8_to_texel(
             for i in 0..px {
                 let (s, d) = (i * RGBA8_BPP as usize, i * RGBA16F_BPP as usize);
                 for c in 0..4 {
-                    st16(&mut dst[d + c * 2..d + c * 2 + 2], lut[src_rgba[s + c] as usize]);
+                    st16(
+                        &mut dst[d + c * 2..d + c * 2 + 2],
+                        lut[src_rgba[s + c] as usize],
+                    );
                 }
             }
         }
@@ -1607,9 +1581,15 @@ pub fn expand_rgba8_to_texel(
             let lut = unorm8_to_f16_lut();
             let chans = (layout.bytes_per_texel() / 2) as usize;
             for i in 0..px {
-                let (s, d) = (i * RGBA8_BPP as usize, i * layout.bytes_per_texel() as usize);
+                let (s, d) = (
+                    i * RGBA8_BPP as usize,
+                    i * layout.bytes_per_texel() as usize,
+                );
                 for c in 0..chans {
-                    st16(&mut dst[d + c * 2..d + c * 2 + 2], lut[src_rgba[s + c] as usize]);
+                    st16(
+                        &mut dst[d + c * 2..d + c * 2 + 2],
+                        lut[src_rgba[s + c] as usize],
+                    );
                 }
             }
         }
@@ -1710,7 +1690,10 @@ pub fn narrow_texel_to_rgba8(
             let lut = f16_to_unorm8_lut();
             let chans = (layout.bytes_per_texel() / 2) as usize;
             for i in 0..px {
-                let (s, d) = (i * layout.bytes_per_texel() as usize, i * RGBA8_BPP as usize);
+                let (s, d) = (
+                    i * layout.bytes_per_texel() as usize,
+                    i * RGBA8_BPP as usize,
+                );
                 for c in 0..chans {
                     let h = u16::from_le_bytes([src[s + c * 2], src[s + c * 2 + 1]]);
                     dst_rgba[d + c] = lut[h as usize];
@@ -2028,12 +2011,7 @@ mod tests {
     /// and a `match` over the Metal formats — and nothing in the type system
     /// holds them together, so this asks the loader directly rather than
     /// re-listing the answer. A layout that gains a `texel_to_rgba8` arm, or
-    /// loses one, fails here instead of silently moving a zero-copy floor.
-    ///
-    /// The zero-copy sampled floor is the caller that cares: it may only turn a
-    /// window away when there is a CPU path to turn it away *to*, so a `true`
-    /// here that the loader does not honour is a black sample rather than a
-    /// slow one.
+    /// loses one, fails here instead of leaving the predicate stale.
     #[test]
     fn the_cpu_loader_arm_predicate_agrees_with_the_loader() {
         // One representative Metal format per layout, and a source buffer wide
@@ -2493,7 +2471,12 @@ mod tests {
         // Rail two: the readback narrow. One channel out, the rest filled the
         // way a shader sampling it reads them.
         let mut back = vec![0u8; (w as usize) * RGBA8_BPP as usize];
-        assert!(narrow_texel_to_rgba8(TexelLayout::R8, &native, w, &mut back));
+        assert!(narrow_texel_to_rgba8(
+            TexelLayout::R8,
+            &native,
+            w,
+            &mut back
+        ));
         assert_eq!(back[0], 77);
         assert_eq!(back[1], 0);
         assert_eq!(back[2], 0);
@@ -2858,49 +2841,6 @@ mod tests {
         );
     }
 
-    /// **A cost floor may never be the reason a texture loses precision.**
-    ///
-    /// [`TexelLayout::a_cost_floor_may_decline`] is the zero-copy floors' whole
-    /// admission rule, and it must stay the conjunction it is derived from: a
-    /// layout may be turned away onto the CPU byte loader only where that
-    /// loader has an arm *and* the arm is exact. The half-float colour pair is
-    /// the case that made this necessary — both answer
-    /// `has_cpu_loader_arm() == true` truthfully, so a floor asking only that
-    /// question turned a 32 KiB `RGBA16Float` away from the exact rail and onto
-    /// one that clamps to `[0, 1]` and quantizes to 256 levels.
-    #[test]
-    fn a_cost_floor_may_only_decline_a_layout_whose_cpu_arm_is_exact() {
-        for &layout in TexelLayout::ALL {
-            assert_eq!(
-                layout.a_cost_floor_may_decline(),
-                layout.has_cpu_loader_arm() && !layout.cpu_loader_arm_is_lossy(),
-                "{layout:?} — the floor rule must stay derived, not re-listed"
-            );
-            if layout.cpu_loader_arm_is_lossy() {
-                assert!(
-                    layout.has_cpu_loader_arm(),
-                    "{layout:?} — an arm that does not exist cannot be lossy"
-                );
-                assert!(
-                    !layout.a_cost_floor_may_decline(),
-                    "{layout:?} has only a lossy CPU arm, so a byte threshold \
-                     declining it is data loss and not a cost decision"
-                );
-            }
-        }
-        // Named rather than derived, because the point is that these two are
-        // *not* in the set a floor may turn away, and a test that only checked
-        // the identity above would pass with the set empty.
-        for layout in [TexelLayout::Rgba16Float, TexelLayout::Rg16Float] {
-            assert!(layout.cpu_loader_arm_is_lossy(), "{layout:?}");
-            assert!(!layout.a_cost_floor_may_decline(), "{layout:?}");
-        }
-        for layout in [TexelLayout::Rgba8, TexelLayout::Bgra8, TexelLayout::R8] {
-            assert!(!layout.cpu_loader_arm_is_lossy(), "{layout:?}");
-            assert!(layout.a_cost_floor_may_decline(), "{layout:?}");
-        }
-    }
-
     /// Four bytes wide is not the same as a four-byte colour order.
     ///
     /// [`TexelLayout::is_four_byte_color`] gates the RGBA8-shaped loaders, the
@@ -2962,7 +2902,9 @@ mod tests {
     #[test]
     fn a_wide_seed_expands_to_the_same_bytes_the_row_converter_writes() {
         const PIXELS: u32 = 4;
-        let src: Vec<u8> = (0..PIXELS * RGBA8_BPP).map(|i| (i * 7 % 256) as u8).collect();
+        let src: Vec<u8> = (0..PIXELS * RGBA8_BPP)
+            .map(|i| (i * 7 % 256) as u8)
+            .collect();
 
         let mut viaraw = vec![0u8; (PIXELS * RGBA16F_BPP) as usize];
         assert!(convert_rgba8_to_row(

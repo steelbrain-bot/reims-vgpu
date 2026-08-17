@@ -412,7 +412,15 @@ pub struct TextureDescriptor {
     pub width: u32,
     pub height: u32,
     pub depth: u32,
-    pub pixel_format: u16,
+    /// The complete texture declaration retained after the allocation-layout
+    /// records. This is the same serialized descriptor used by plain, heap and
+    /// buffer-backed texture creation, so it is decoded by the same reader.
+    ///
+    /// A short object-list descriptor can carry the allocation prefix without
+    /// reaching this declaration. Such a descriptor has geometry but no
+    /// declared format or usage; callers fail closed through the accessors
+    /// below rather than manufacturing either property from the layout.
+    pub declaration: Option<heap_query::TextureDescriptor>,
     /// Per-mip layouts (index 0 = L0). Empty if geometry incomplete.
     pub levels: Vec<TextureLevelLayout>,
 }
@@ -458,7 +466,18 @@ impl TextureDescriptor {
     /// question: the two decoders once disagreed about what an absent format
     /// meant, one storing `!= 0` and the other an unconditional `true`.
     pub fn declared_pixel_format(&self) -> Option<u16> {
-        (self.pixel_format != 0).then_some(self.pixel_format)
+        self.declaration
+            .map(|declaration| declaration.pixel_format)
+            .filter(|format| *format != 0)
+    }
+
+    /// The `MTLTextureUsage` mask from the texture's creation declaration.
+    ///
+    /// This is not inferred from how one draw happens to bind the texture. The
+    /// declaration is the resource-lifetime contract and is the only stable
+    /// basis for choosing strict Vulkan image usage.
+    pub fn declared_usage(&self) -> Option<u32> {
+        self.declaration.map(|declaration| declaration.usage)
     }
 
     /// Allocation base GVA (`handle << page_shift`), not including data_offset.
@@ -520,9 +539,15 @@ pub const TEXTURE_LEVEL_ROW_STRIDE: usize = 16;
 pub const TEXTURE_LEVEL_WIDTH: usize = 24;
 pub const TEXTURE_LEVEL_HEIGHT: usize = 28;
 pub const TEXTURE_LEVEL_DEPTH: usize = 32;
-pub const TEXTURE_DESC_PIXEL_FORMAT: usize = 86;
+/// Start of the shared 32-byte serialized texture declaration for a one-level
+/// texture. Every additional mip inserts one layout record before it.
+pub const TEXTURE_DESC_DECLARATION: usize = 84;
+pub const TEXTURE_DESC_PIXEL_FORMAT: usize = TEXTURE_DESC_DECLARATION
+    + offset_of!(reims_vgpu_wire::ops::texture::TextureDescriptorBody, packed)
+    + size_of::<u16>();
 #[cfg(test)]
-pub(crate) const TEXTURE_DESC_BASE_LEN: usize = 116;
+pub(crate) const TEXTURE_DESC_BASE_LEN: usize =
+    TEXTURE_DESC_DECLARATION + heap_query::TEXTURE_BODY_LEN;
 /// Mip level records this device will read from a texture descriptor.
 ///
 /// A **corruption guard, not a capacity choice** — the same kind of bound as
@@ -1877,29 +1902,32 @@ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Deco
         }
     }
 
-    // Format trailer: shift by (levels-1)*36 for multi-mip bodies.
+    // Complete creation declaration: shift by (levels-1)*36 for multi-mip
+    // bodies. The pixel format used to be read alone at +86, dropping usage,
+    // sample count, resource options and every other field in the same body.
+    // This is the same wire form heap and buffer-backed textures carry, so one
+    // decoder owns it.
     let levels = declared_levels;
-    let format_shift = if levels > 1 {
+    let declaration_shift = if levels > 1 {
         (levels as usize - 1).saturating_mul(TEXTURE_DESC_MIP_LEVEL_RECORD_LEN)
     } else {
         0
     };
-    let pf_off = TEXTURE_DESC_PIXEL_FORMAT + format_shift;
-    if bytes.len() >= pf_off + 2 {
-        out.pixel_format = ld16(&bytes[pf_off..]);
-    } else if crate::observe::first_sight("texture_desc_format_unreachable", levels as u64) {
-        // No fallback to the unshifted offset. The fallback's own length test
-        // was `TEXTURE_DESC_PIXEL_FORMAT + 2`, so for a single-mip body it
-        // guarded the same two bytes the branch above already read. It
-        // was reachable only when `format_shift > 0` — and there offset 86 is
-        // not the format at all: the level records start at 72 and run 36 bytes
-        // each, so 86..88 is inside level record 1. The fallback therefore
-        // produced a format only in the case where it was guaranteed to be
-        // reading something else, and then set `has_pixel_format`, which is
-        // what seven downstream gates fail closed on. Better to have no format.
+    let declaration_off = TEXTURE_DESC_DECLARATION.saturating_add(declaration_shift);
+    let declaration_end = declaration_off.saturating_add(heap_query::TEXTURE_BODY_LEN);
+    if let Some(body) = bytes.get(declaration_off..declaration_end) {
+        out.declaration = Some(
+            heap_query::decode_serialized_texture_descriptor(body)
+                .map_err(|_| DecodeStatus::ErrShort("res_texture_declaration"))?,
+        );
+    } else if crate::observe::first_sight("texture_desc_declaration_unreachable", levels as u64) {
+        // No fallback to the unshifted offset. With several mips that offset is
+        // inside a level-layout record, so treating it as a declaration would
+        // manufacture a format and usage out of geometry bytes.
         crate::observe::fail(format!(
-            "texture_desc_format_unreachable levels={levels} pf_off={pf_off} len={} \
-             (multi-mip body too short for its shifted format trailer)",
+            "texture_desc_declaration_unreachable levels={levels} \
+             declaration_off={declaration_off} len={} \
+             (body ends before the shifted texture declaration)",
             bytes.len()
         ));
     }
@@ -3928,7 +3956,8 @@ fn parse_compute_stage_input_section(
     if attr_count == 0 && layout_count == 0 {
         return Ok(None);
     }
-    if attr_count > MAX_COMPUTE_STAGE_INPUT_ATTRS || layout_count > MAX_COMPUTE_STAGE_INPUT_LAYOUTS {
+    if attr_count > MAX_COMPUTE_STAGE_INPUT_ATTRS || layout_count > MAX_COMPUTE_STAGE_INPUT_LAYOUTS
+    {
         return Err(DecodeStatus::ErrUnsupported("stage_input_over_cap"));
     }
 

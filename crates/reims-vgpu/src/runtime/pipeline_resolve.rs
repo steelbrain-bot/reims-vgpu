@@ -204,7 +204,10 @@ pub(crate) fn retained_pipeline_with_desc_for_test(
         pipeline_object: Some(crate::backend::vulkan::engine::PipelineObjectIdentity::new()),
         bind_plan: Arc::new(VertexBindPlan::build(&desc)),
         desc,
-        vertex: Arc::new(CachedShader::new(Vec::new(), reflection(ShaderStage::Vertex))),
+        vertex: Arc::new(CachedShader::new(
+            Vec::new(),
+            reflection(ShaderStage::Vertex),
+        )),
         fragment: Arc::new(CachedShader::new(
             Vec::new(),
             reflection(ShaderStage::Fragment),
@@ -292,10 +295,7 @@ pub fn resolve<M: HostMemory + HostOps>(
         return resolve_uncached(state, host, task_id, pipeline_ref).map(Arc::new);
     }
 
-    if let Some(resolved) = state
-        .task_render_pipeline_states
-        .get(task_id, pipeline_ref)
-    {
+    if let Some(resolved) = state.task_render_pipeline_states.get(task_id, pipeline_ref) {
         note_store_route("pipe_memo_hit");
         return Ok(resolved);
     }
@@ -304,11 +304,9 @@ pub fn resolve<M: HostMemory + HostOps>(
     let mut resolved = resolve_uncached(state, host, task_id, pipeline_ref)?;
     resolved.pipeline_object = Some(crate::backend::vulkan::engine::PipelineObjectIdentity::new());
     let resolved = Arc::new(resolved);
-    Ok(state.task_render_pipeline_states.register(
-        task_id,
-        pipeline_ref,
-        resolved,
-    ))
+    Ok(state
+        .task_render_pipeline_states
+        .register(task_id, pipeline_ref, resolved))
 }
 
 /// The sample count an attachment bound with this pipeline must carry.
@@ -327,10 +325,7 @@ pub fn attachment_sample_count<M: HostMemory + HostOps>(
     pipeline_ref: u32,
 ) -> Option<u32> {
     if memo_enabled() {
-        if let Some(resolved) = state
-            .task_render_pipeline_states
-            .get(task_id, pipeline_ref)
-        {
+        if let Some(resolved) = state.task_render_pipeline_states.get(task_id, pipeline_ref) {
             return Some(resolved.desc.raster_sample_count.max(1));
         }
     }
@@ -480,11 +475,16 @@ mod tests {
         ));
         assert!(state.task_render_pipeline_states.delete(3, 9));
         assert!(!state.task_render_pipeline_states.contains(3, 9));
-        assert_eq!(Arc::strong_count(&first), 1, "the encoder owner remains valid");
+        assert_eq!(
+            Arc::strong_count(&first),
+            1,
+            "the encoder owner remains valid"
+        );
 
-        let replacement = state
-            .task_render_pipeline_states
-            .register(3, 9, retained_pipeline_for_test());
+        let replacement =
+            state
+                .task_render_pipeline_states
+                .register(3, 9, retained_pipeline_for_test());
         assert_ne!(
             replacement
                 .pipeline_object

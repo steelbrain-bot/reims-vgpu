@@ -10,12 +10,13 @@
 
 use metal2vulkan::passes::Stage;
 use reims_vgpu::backend::vulkan::engine::{
-    self, BlendFactor, BlendOp, BlendStateResource, BufferContent, CullMode, DepthState, DrawRequest,
-    IndexType, IndexedDrawResource, PrimitiveTopology, SampledContentIdentity, SampledImageResource,
-    SampledSource, SamplerCompareFunction, SamplerResource, ScissorResource, SecondaryColorTarget,
-    StencilFaceOps, StencilOp, StencilState, StorageBufferResource, TargetIdentity,
-    VertexAttributeFormat, VertexAttributeResource, VertexStepFunction, ViewportResource,
-    VisibilityResultMode, MAX_DEVICE_RECREATES,
+    self, AttachmentInitial, BlendFactor, BlendOp, BlendStateResource, BufferContent, CullMode,
+    DepthState, DrawRequest, IndexType, IndexedDrawResource, PrimitiveTopology,
+    SampledContentIdentity, SampledImageResource, SampledSource, SamplerCompareFunction,
+    SamplerResource, ScissorResource, SecondaryColorTarget, StencilFaceOps, StencilOp,
+    StencilState, StorageBufferResource, TargetIdentity, VertexAttributeFormat,
+    VertexAttributeResource, VertexStepFunction, ViewportResource, VisibilityResultMode,
+    MAX_DEVICE_RECREATES,
 };
 /// The resident format every `TargetIdentity::Surface` in this file is built at.
 ///
@@ -50,6 +51,16 @@ fn engine_test_session() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|e| e.into_inner());
     engine::test_reset_engine();
     guard
+}
+
+/// Synthetic serialized owner for sampled-cache tests. Keeping the strong
+/// resource in the test scope gives the engine the same weak lifetime proof a
+/// real task resource supplies; dropping it is the cache boundary.
+fn sampled_resource_owner() -> std::sync::Arc<reims_vgpu::model::TaskResource> {
+    std::sync::Arc::new(reims_vgpu::model::TaskResource::new(
+        Default::default(),
+        std::sync::Arc::from([]),
+    ))
 }
 
 fn fixtures() -> PathBuf {
@@ -617,6 +628,7 @@ fn depth_test_honored_compare_and_clear_wired() {
             byte_origin: Default::default(),
             format: ash::vk::Format::R8G8B8A8_UNORM,
             identity: None,
+            resource_lifetime: None,
             swizzle: Default::default(),
         });
         req.samplers
@@ -750,6 +762,7 @@ fn depth_test_honored_on_resident_target_path() {
             byte_origin: Default::default(),
             format: ash::vk::Format::R8G8B8A8_UNORM,
             identity: None,
+            resource_lifetime: None,
             swizzle: Default::default(),
         });
         req.samplers
@@ -890,6 +903,7 @@ fn stencil_test_honored_compare_ref_and_clear_wired() {
             byte_origin: Default::default(),
             format: ash::vk::Format::R8G8B8A8_UNORM,
             identity: None,
+            resource_lifetime: None,
             swizzle: Default::default(),
         });
         req.samplers
@@ -1025,6 +1039,7 @@ fn storage_buffer_binding_still_renders() {
 #[test]
 fn sampled_and_sampler_still_renders() {
     let _g = engine_test_session();
+    let sampled_owner = sampled_resource_owner();
     let (v, f) = triangle_spirv();
     let mut req = engine_req(&v, &f, 8, 8);
     req.sampled_images.push(SampledImageResource {
@@ -1045,6 +1060,7 @@ fn sampled_and_sampler_still_renders() {
         byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
+        resource_lifetime: Some(sampled_owner.lifetime_ref()),
         swizzle: Default::default(),
     });
     req.samplers.push(SamplerResource::normalized_default(2));
@@ -1129,6 +1145,7 @@ fn sampled_and_sampler_still_renders() {
 #[test]
 fn sampled_upload_happens_once_across_more_draws_than_the_ring_is_deep() {
     let _g = engine_test_session();
+    let sampled_owner = sampled_resource_owner();
     let (v, f) = triangle_spirv();
     let mut req = engine_req(&v, &f, 8, 8);
     req.sampled_images.push(SampledImageResource {
@@ -1149,6 +1166,7 @@ fn sampled_upload_happens_once_across_more_draws_than_the_ring_is_deep() {
         byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
+        resource_lifetime: Some(sampled_owner.lifetime_ref()),
         swizzle: Default::default(),
     });
     req.samplers.push(SamplerResource::normalized_default(2));
@@ -1227,6 +1245,7 @@ fn resident_sample_bind_avoids_roundtrip_and_remains_loadable() {
         byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
+        resource_lifetime: None,
         swizzle: Default::default(),
     });
     engine::reset_draw_counters();
@@ -1330,6 +1349,7 @@ fn resident_sample_uses_the_bindings_compatible_format_view() {
         byte_origin: Default::default(),
         format: ash::vk::Format::B8G8R8A8_SRGB,
         identity: None,
+        resource_lifetime: None,
         swizzle: Default::default(),
     });
     consume
@@ -1389,6 +1409,7 @@ fn resident_sample_alias_uses_native_feedback_or_snapshot_fallback() {
         byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
+        resource_lifetime: None,
         swizzle: Default::default(),
     });
     alias.sampled_images.push(SampledImageResource {
@@ -1407,6 +1428,7 @@ fn resident_sample_alias_uses_native_feedback_or_snapshot_fallback() {
         byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
+        resource_lifetime: None,
         swizzle: Default::default(),
     });
     engine::reset_draw_counters();
@@ -1435,6 +1457,110 @@ fn resident_sample_alias_uses_native_feedback_or_snapshot_fallback() {
     assert_eq!(
         delta.batch_readback_joins, 1,
         "the read must exercise the open-pass close before its image barrier: {delta:?}"
+    );
+}
+
+/// The attachment descriptor and fragment binding name one texture. Its Clear,
+/// Load or DontCare action is therefore the sampled source at fragment
+/// execution; none may be restated as a CPU-uploaded sampled image.
+#[test]
+fn attachment_initial_contents_are_sampled_without_a_host_upload() {
+    let _g = engine_test_session();
+    let vert = translate_words("textured_quad.air", Stage::Vertex);
+    let frag = translate_words("textured_quad.air", Stage::Fragment);
+    let (w, h) = (16u32, 16u32);
+    let positions: [[f32; 4]; 6] = [
+        [-1.0, -1.0, 0.0, 1.0],
+        [1.0, -1.0, 0.0, 1.0],
+        [-1.0, 1.0, 0.0, 1.0],
+        [-1.0, 1.0, 0.0, 1.0],
+        [1.0, -1.0, 0.0, 1.0],
+        [1.0, 1.0, 0.0, 1.0],
+    ];
+    let uvs: [[f32; 2]; 6] = [
+        [0.0, 1.0],
+        [1.0, 1.0],
+        [0.0, 0.0],
+        [0.0, 0.0],
+        [1.0, 1.0],
+        [1.0, 0.0],
+    ];
+    let encode_f32 = |values: &[f32]| {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>()
+    };
+    let make_req = |id: u32, initial: AttachmentInitial| {
+        let identity = TargetIdentity::Surface {
+            id,
+            width: w,
+            height: h,
+            generation: 1,
+            format: SURFACE_TEST_FORMAT,
+        };
+        let mut req = engine_req(&vert, &frag, w, h);
+        req.vertex_count = 6;
+        req.target_identity = Some(identity.clone());
+        req.storage_buffers.push(StorageBufferResource {
+            binding: 0,
+            content: encode_f32(&positions.into_iter().flatten().collect::<Vec<_>>()).into(),
+        });
+        req.storage_buffers.push(StorageBufferResource {
+            binding: 1,
+            content: encode_f32(&uvs.into_iter().flatten().collect::<Vec<_>>()).into(),
+        });
+        req.sampled_images.push(SampledImageResource {
+            binding: 32,
+            array_element: 0,
+            descriptor_count: 1,
+            width: w,
+            height: h,
+            layers: 1,
+            arrayed: false,
+            volume: false,
+            cube: false,
+            one_dim: false,
+            multisampled: false,
+            source: SampledSource::Attachment { identity, initial },
+            byte_origin: Default::default(),
+            format: SURFACE_TEST_FORMAT,
+            identity: None,
+            resource_lifetime: None,
+            swizzle: Default::default(),
+        });
+        req.samplers
+            .push(SamplerResource::normalized_default(sampler_binding(0)));
+        req
+    };
+
+    engine::reset_draw_counters();
+    let before = engine::counter_snapshot();
+    let mut clear = make_req(0x54, AttachmentInitial::Clear([0.25, 0.5, 0.75, 1.0]));
+    clear.target_clear = [0.25, 0.5, 0.75, 1.0];
+    let Some(clear_pixels) = draw_or_skip("attachment initial clear", &clear) else {
+        return;
+    };
+    assert_fullscreen_fragment_color("attachment initial clear", &clear_pixels, w, h);
+
+    let mut seed = make_req(0x55, AttachmentInitial::Seed);
+    seed.target_rgba8 = Some(std::sync::Arc::new(
+        [64, 128, 191, 255].repeat((w * h) as usize),
+    ));
+    let seed_pixels = draw_or_skip("attachment initial seed", &seed).expect("GPU remains usable");
+    assert_fullscreen_fragment_color("attachment initial seed", &seed_pixels, w, h);
+
+    let dont_care = make_req(0x56, AttachmentInitial::DontCare);
+    let _ = draw_or_skip("attachment initial dont-care", &dont_care)
+        .expect("undefined initial contents remain a valid GPU source");
+    let delta = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(
+        delta.sampled_reuploads, 0,
+        "no host sampled upload: {delta:?}"
+    );
+    assert_eq!(
+        delta.sampled_gpu_binds, 3,
+        "one target bind per draw: {delta:?}"
     );
 }
 
@@ -1485,6 +1611,7 @@ fn vertex_buffers_bind_in_one_bulk_call_without_losing_slots() {
 #[test]
 fn sampled_identity_fast_path_skips_content_compare() {
     let _g = engine_test_session();
+    let sampled_owner = sampled_resource_owner();
     let (v, f) = triangle_spirv();
     let mut req = engine_req(&v, &f, 8, 8);
     req.sampled_images.push(SampledImageResource {
@@ -1508,6 +1635,7 @@ fn sampled_identity_fast_path_skips_content_compare() {
             key: 0x1234_5000,
             generation: 1,
         }),
+        resource_lifetime: Some(sampled_owner.lifetime_ref()),
         swizzle: Default::default(),
     });
     req.samplers.push(SamplerResource::normalized_default(2));
@@ -1989,6 +2117,7 @@ fn a_skipped_draw_readback_and_a_resident_read_are_counted_apart() {
 #[test]
 fn sampled_rgba_upload_to_bgra_target_preserves_semantic_channels() {
     let _g = engine_test_session();
+    let sampled_owner = sampled_resource_owner();
     let vert = translate_words("textured_quad.air", Stage::Vertex);
     let frag = translate_words("textured_quad.air", Stage::Fragment);
     let w = 16u32;
@@ -2052,6 +2181,7 @@ fn sampled_rgba_upload_to_bgra_target_preserves_semantic_channels() {
         byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
+        resource_lifetime: Some(sampled_owner.lifetime_ref()),
         swizzle: Default::default(),
     });
     req.samplers
@@ -2131,6 +2261,7 @@ fn reflected_static_sampler_descriptor_samples_texture() {
     use metal2vulkan::reflect::ResourceKind;
 
     let _g = engine_test_session();
+    let sampled_owner = sampled_resource_owner();
     let vert = translate_words("textured_quad.air", Stage::Vertex);
     let tmp = std::env::temp_dir().join(format!(
         "paravirt_engine_{}_static_sampler",
@@ -2214,6 +2345,7 @@ fn reflected_static_sampler_descriptor_samples_texture() {
         byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
+        resource_lifetime: Some(sampled_owner.lifetime_ref()),
         swizzle: Default::default(),
     });
     req.samplers.push(
@@ -2248,14 +2380,23 @@ fn reflected_static_sampler_descriptor_samples_texture() {
         .into_rgba8();
     let descriptors = engine::counter_snapshot().delta_since(&before);
     if descriptors.descriptor_set_updates == 0 {
-        assert_eq!(descriptors.descriptor_pushes, 1, "first draw pushes: {descriptors:?}");
+        assert_eq!(
+            descriptors.descriptor_pushes, 1,
+            "first draw pushes: {descriptors:?}"
+        );
         assert_eq!(
             descriptors.descriptor_push_held, 1,
             "the exact repeated state is retained by the command buffer: {descriptors:?}"
         );
     } else {
-        assert_eq!(descriptors.descriptor_set_updates, 2, "fallback updates: {descriptors:?}");
-        assert_eq!(descriptors.descriptor_set_binds, 2, "fallback binds: {descriptors:?}");
+        assert_eq!(
+            descriptors.descriptor_set_updates, 2,
+            "fallback updates: {descriptors:?}"
+        );
+        assert_eq!(
+            descriptors.descriptor_set_binds, 2,
+            "fallback binds: {descriptors:?}"
+        );
         assert_eq!(descriptors.descriptor_pushes, 0);
         assert_eq!(descriptors.descriptor_push_held, 0);
     }
@@ -2345,6 +2486,7 @@ fn sampled_bgra8_bytes_upload_matches_rgba8_semantic_color() {
             byte_origin: Default::default(),
             format,
             identity: None,
+            resource_lifetime: None,
             swizzle: Default::default(),
         });
         req.samplers
@@ -2471,6 +2613,7 @@ fn a_view_swizzle_is_performed_by_the_image_view_not_the_cpu() {
             byte_origin: Default::default(),
             format: ash::vk::Format::R8G8B8A8_UNORM,
             identity: None,
+            resource_lifetime: None,
             swizzle: plan,
         });
         req.samplers
@@ -2600,7 +2743,6 @@ fn partial_draw_preserves_a_native_guest_target_seed() {
             total_len: backing.len() as u64,
             row_length_texels: 0,
             pages: None,
-            direct_image: None,
         },
         format: SURFACE_TEST_FORMAT,
     });
@@ -3510,6 +3652,7 @@ fn mrt_secondary_attachment_becomes_sampleable_resident() {
         byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
+        resource_lifetime: None,
         swizzle: Default::default(),
     });
     engine::reset_draw_counters();

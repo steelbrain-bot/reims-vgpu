@@ -15,10 +15,11 @@ pub(crate) use regs::*;
 // `mod`, so this is the only path those links can name — and rustc's
 // unused-import lint cannot see a doc link, so it will call this dead.
 pub use state::{
-    ChannelRing, ComputeStorageResidencyKey, DeviceId, DeviceState, ExecFault,
-    FailEvent, GfxRegs, GuestLinearMemo, GvaBacking, GvaEvictionWitness,
-    GvaHostView, HostLinearTexture, HostSurface, MapperCapture, MappingEntry,
-    PacketFault, PresentBacking, PresentState, RenderFlushWitness, ResourceValidity, SurfaceWriteKind, TaskEntry, TaskResource, TaskResourceLifetimeRef, TaskSamplerState, TaskTable, Type4Walk, UnimplementedCommand, FENCE_DOMAIN_BLIT,
+    ChannelRing, ComputeStorageResidencyKey, DeviceId, DeviceState, ExecFault, FailEvent, GfxRegs,
+    GuestLinearMemo, GvaBacking, GvaEvictionWitness, GvaHostView, HostLinearTexture, HostSurface,
+    MapperCapture, MappingEntry, PacketFault, PresentBacking, PresentState, RenderFlushWitness,
+    ResourceValidity, SurfaceWriteKind, TaskEntry, TaskResource, TaskResourceLifetimeRef,
+    TaskSamplerState, TaskTable, Type4Walk, UnimplementedCommand, FENCE_DOMAIN_BLIT,
     FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER, GVA_ENCODE_CACHE_BYTE_CAP,
     GVA_EVICTION_WITNESS_KEYS,
 };
@@ -215,6 +216,35 @@ mod tests {
             0,
             "reset left a guest-write token armed on the host"
         );
+    }
+
+    /// A mapping page-list transition ends every sampled-window witness over
+    /// that page list; its token must reach the host release rail immediately,
+    /// not wait for a device reset or an arbitrary capacity sweep.
+    #[cfg(feature = "backend-vulkan")]
+    #[test]
+    fn mapping_backing_invalidation_releases_its_gather_witness_token() {
+        let mut d = dev();
+        let mut h = FakeHost::new();
+        let mapping_id = 7;
+        d.state.mappings.insert(
+            mapping_id,
+            MappingEntry {
+                page_entries: vec![3],
+                ..Default::default()
+            },
+        );
+        let token = h
+            .track_guest_writes(&[0x3000], PAGE_SIZE_ARM64E as usize)
+            .unwrap();
+        d.state
+            .gather_witness
+            .arm_mapping_token_for_test(mapping_id, token);
+        assert_eq!(h.tracked_guest_write_sets(), 1);
+
+        assert!(d.state.invalidate_mapping_pages(mapping_id));
+        runtime::mapper::flush_retired_views(&mut d.state, &mut h);
+        assert_eq!(h.tracked_guest_write_sets(), 0);
     }
 
     fn setup_boot_regs(d: &mut Device<NullBackend>, h: &mut FakeHost) {
@@ -502,7 +532,10 @@ mod tests {
                 0xee,
             );
             let mut payload = vec![0u8; 12];
-            st32(&mut payload[DEVICE_INFO_TAHOE_KEY_TABLE_LEN..], key_table_len);
+            st32(
+                &mut payload[DEVICE_INFO_TAHOE_KEY_TABLE_LEN..],
+                key_table_len,
+            );
             st32(
                 &mut payload[DEVICE_INFO_TAHOE_COUNT..],
                 (PAGE_SIZE_ARM64E as usize / DEVICE_INFO_REPLY_PAIR_LEN) as u32,

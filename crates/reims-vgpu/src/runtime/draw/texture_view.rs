@@ -763,10 +763,7 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
         objects::LadderRung::DescRead { .. } => R::DescriptorUnreadable,
     })?;
     let tex = decode_texture_descriptor(&desc_bytes).map_err(|_| R::DescriptorUndecodable)?;
-    if tex.declared_pixel_format().is_none() {
-        return Err(R::NoPixelFormat);
-    }
-    let base_fmt = tex.pixel_format;
+    let base_fmt = tex.declared_pixel_format().ok_or(R::NoPixelFormat)?;
     let sample_fmt = effective_view_sample_format(base_fmt, format_override).ok_or(
         R::ViewFormatBppMismatch {
             base: base_fmt,
@@ -822,7 +819,13 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     // Census, pay, settle — the whole obligation of a CPU read of one named
     // resource's guest bytes. See `writeback_debt::settle_for_texture`.
     crate::runtime::writeback_debt::settle_for_texture(
-        state, host, task_id, texture_ref, gva, span, site,
+        state,
+        host,
+        task_id,
+        texture_ref,
+        gva,
+        span,
+        site,
     );
     // Tight display textures are the common compositor source. Read the whole
     // image with one task-root/cache lifetime: the row loop below otherwise
@@ -856,9 +859,9 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     // `need_rgba` is the RGBA8 figure. The tight-row check is the same
     // agreement one step earlier — a source row that is not exactly one tight
     // row of the upload layout cannot be copied straight through.
-    if let Some(fmt) = linear_native_upload_format(sample_fmt, native).filter(|fmt| {
-        (tight as u64) == (w as u64).saturating_mul(fmt.bytes_per_texel() as u64)
-    }) {
+    if let Some(fmt) = linear_native_upload_format(sample_fmt, native)
+        .filter(|fmt| (tight as u64) == (w as u64).saturating_mul(fmt.bytes_per_texel() as u64))
+    {
         let row_bytes = tight as usize;
         let rows = (h as usize)
             .checked_mul(planes as usize)
@@ -911,7 +914,10 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
             return Err(R::RowConvertUnsupported { format: sample_fmt });
         }
     }
-    Ok((rgba, SampledByteFormat::from_source(TexelLayout::Rgba8, sample_fmt)))
+    Ok((
+        rgba,
+        SampledByteFormat::from_source(TexelLayout::Rgba8, sample_fmt),
+    ))
 }
 
 ///
@@ -963,7 +969,8 @@ where
         return Ok((bytes, SampledByteFormat::from_source(layout, sample_format)));
     }
     if native_len == rgba_len
-        && pixel_format::sampled_class(sample_format) == Some(pixel_format::SampledClass::Bgra8Unorm)
+        && pixel_format::sampled_class(sample_format)
+            == Some(pixel_format::SampledClass::Bgra8Unorm)
     {
         // A channel exchange, which moves no value across the transfer
         // function: the bytes stay encoded exactly as the guest stored them.

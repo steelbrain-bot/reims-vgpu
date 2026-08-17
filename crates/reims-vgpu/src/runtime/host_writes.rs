@@ -343,10 +343,7 @@ impl HostWrites {
     /// Record the exact page runs retained with an admitted guest allocation.
     /// The run partition was derived once with the resource, so a repeated
     /// Store updates slices rather than rebuilding adjacency page by page.
-    pub fn note_footprint(
-        &mut self,
-        footprint: &crate::runtime::guest_ram::GuestPageFootprint,
-    ) {
+    pub fn note_footprint(&mut self, footprint: &crate::runtime::guest_ram::GuestPageFootprint) {
         self.epoch = self.epoch.wrapping_add(1);
         if footprint.page_size() != (1u64 << self.page_shift) {
             self.pages.note_unknown(self.epoch);

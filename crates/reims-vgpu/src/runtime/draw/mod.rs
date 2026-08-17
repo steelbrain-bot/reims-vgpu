@@ -788,20 +788,102 @@ pub struct IndexedDrawInfo {
     pub base_vertex: i64,
 }
 
+/// The allocation namespace and byte geometry of one colour attachment.
+///
+/// A type-2/3 target is a plane inside the allocation declared by its texture
+/// descriptor. Keeping that relationship intact is what lets a backend retain
+/// and import the allocation without reconstructing ownership from the plane's
+/// address. The enum also makes the mapping and GVA forms mutually exclusive;
+/// there is no `(mapping_id, target_gva)` pair whose invalid combinations every
+/// consumer has to remember to reject.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ColorTargetStorage {
+    #[default]
+    None,
+    Mapping(u32),
+    Linear(LinearColorTarget),
+}
+
+impl ColorTargetStorage {
+    pub fn mapping_id(&self) -> u32 {
+        match self {
+            Self::Mapping(mapping_id) => *mapping_id,
+            Self::None | Self::Linear(_) => 0,
+        }
+    }
+
+    pub fn linear(&self) -> Option<&LinearColorTarget> {
+        match self {
+            Self::Linear(linear) => Some(linear),
+            Self::None | Self::Mapping(_) => None,
+        }
+    }
+
+    pub fn target_gva(&self) -> u64 {
+        self.linear().map_or(0, LinearColorTarget::target_gva)
+    }
+
+    pub fn row_stride(&self) -> u32 {
+        self.linear().map_or(0, |linear| linear.row_stride)
+    }
+}
+
+/// One declared texture plane inside its parent type-2/3 allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinearColorTarget {
+    pub allocation_gva: u64,
+    pub allocation_size: u64,
+    pub plane_offset: u64,
+    pub row_stride: u32,
+}
+
+impl LinearColorTarget {
+    fn new(
+        allocation_gva: u64,
+        allocation_size: u64,
+        plane_offset: u64,
+        row_stride: u32,
+    ) -> Option<Self> {
+        if allocation_gva == 0
+            || allocation_size == 0
+            || row_stride == 0
+            || plane_offset >= allocation_size
+        {
+            return None;
+        }
+        allocation_gva.checked_add(plane_offset)?;
+        Some(Self {
+            allocation_gva,
+            allocation_size,
+            plane_offset,
+            row_stride,
+        })
+    }
+
+    pub fn target_gva(&self) -> u64 {
+        self.allocation_gva + self.plane_offset
+    }
+
+    #[cfg(test)]
+    pub(crate) fn whole(target_gva: u64, row_stride: u32, height: u32) -> Self {
+        Self {
+            allocation_gva: target_gva,
+            allocation_size: u64::from(row_stride) * u64::from(height),
+            plane_offset: 0,
+            row_stride,
+        }
+    }
+}
+
 /// One color RT for MRT encode/writeback.
 ///
-/// Archive `ApplePVGPURenderTarget`: either type-11 IOSurface (`mapping_id`) or
-/// type-2/3 guest-VA linear (`target_gva` + `row_stride`). Wallpaper/background
-/// layers are the GVA form.
+/// Archive `ApplePVGPURenderTarget`: either type-11 IOSurface or a type-2/3
+/// guest-allocation plane. Wallpaper/background layers are the latter form.
 #[derive(Clone, Debug, Default)]
 pub struct ColorRtRequest {
     pub slot: u32,
     pub texture_ref: u32,
-    pub mapping_id: u32,
-    /// Non-zero ⇒ type-2/3 linear GVA target (mapping_id must be 0).
-    pub target_gva: u64,
-    /// Bytes-per-row for GVA target (archive `bpr`).
-    pub row_stride: u32,
+    pub storage: ColorTargetStorage,
     pub width: u32,
     pub height: u32,
     pub format: u16,
@@ -815,6 +897,39 @@ pub struct ColorRtRequest {
     /// Multisample attachment discarded into this request's single-sample
     /// target at pass end. Zero for an ordinary colour attachment.
     pub multisample_source_ref: u32,
+}
+
+/// Authoritative source of colour0's prior contents for a GVA attachment LOAD.
+///
+/// Kept typed until backend preparation because the two backends consume the
+/// same contract differently: Metal-direct materializes guest pages for its
+/// copied render target, while Vulkan may retain/import them and issue the
+/// buffer-to-image copy on the GPU. Collapsing `GuestPages` into
+/// `target_seed_rgba` at decode time would force both backends through the CPU.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GvaLoadSource {
+    #[default]
+    None,
+    Resident,
+    GuestPages,
+}
+
+impl ColorRtRequest {
+    pub fn mapping_id(&self) -> u32 {
+        self.storage.mapping_id()
+    }
+
+    pub fn linear_target(&self) -> Option<&LinearColorTarget> {
+        self.storage.linear()
+    }
+
+    pub fn target_gva(&self) -> u64 {
+        self.storage.target_gva()
+    }
+
+    pub fn row_stride(&self) -> u32 {
+        self.storage.row_stride()
+    }
 }
 
 /// One `setVisibilityResultMode:offset:`, as the encoder state it is.
@@ -922,23 +1037,11 @@ pub struct DrawEncodeRequest {
     /// Vulkan may defer `vkCmdEndRenderPass` until that draw, an outside-pass
     /// command, or the command-buffer flush closes it.
     pub render_pass_continues: bool,
-    /// This pass's colour0 is a GVA target whose `MTLLoadActionLoad` was **not**
-    /// seeded, because the engine still holds what the render Store published
-    /// into its guest pages. Set by `mrt_draw_request` from
-    /// `draw::vulkan::gva_resident_if_current`; Vulkan rail only.
-    ///
-    /// Distinct from [`Self::chain_from_resident`], which is about records 2+ of
-    /// one pass and is read by two other rails besides the Load gate. This says
-    /// only "the seed is deliberately absent, chain instead" and nothing else
-    /// keys off it.
-    ///
-    /// **A `true` here obliges the encode side to produce content one way or the
-    /// other.** `colors[0].target_seed_rgba` is `None` and the attachment still
-    /// says LOAD, so an encode that neither chains nor re-seeds hands the pass an
-    /// undefined attachment. The re-seed is not theoretical: the generation this
-    /// was decided on is recomputed after the request is built, and a page set
-    /// that moved in between names a different target.
-    pub gva_load_from_resident: bool,
+    /// Where colour0's GVA `MTLLoadActionLoad` obtains its prior contents.
+    /// `Resident` is discharged by Vulkan against the recomputed allocation
+    /// identity; `GuestPages` lets each backend choose its native transport.
+    /// Either non-`None` value means `target_seed_rgba` is deliberately absent.
+    pub gva_load_source: GvaLoadSource,
     /// Out-flag: this record kept chain content on the engine-resident
     /// target (no CPU pixels, no guest Store). The exec chain loop arms
     /// `chain_from_resident` for the next record when set.
@@ -970,8 +1073,8 @@ fn color_target_diag(colors: &[ColorRtRequest]) -> String {
                 "s{}:r{}:mid{}:gva={:#x}:{}x{}:fmt={:#x}:l{}:s{}",
                 c.slot,
                 c.texture_ref,
-                c.mapping_id,
-                c.target_gva,
+                c.mapping_id(),
+                c.target_gva(),
                 c.width,
                 c.height,
                 c.format,
@@ -1578,14 +1681,9 @@ fn resolve_buffer_backing<M: HostMemory>(
 /// wait they never owed.
 ///
 /// `extent_cap` is the shader's proven reach, exactly as
-/// `try_buffer_zero_copy_resolved` takes it, and it is not optional polish here.
-/// This is where a narrowed bind *lands*: capping the span drops it under the
-/// zero-copy floor, so the rail declines and the bind falls through to this
-/// read. A cap applied only on the rail above therefore converts a whole-window
-/// GPU gather into a whole-window CPU read, which a driven macos-13 boot
-/// measured at 11x the bind cost — `binds_us/chain` 2.79 us -> 31.33 us — for a
-/// rail whose point was to move fewer bytes. Both arms take the cap or neither
-/// does.
+/// `try_buffer_zero_copy_resolved` takes it. This is the capability fallback
+/// for the same decoded bind, so it must read the same bounded span; otherwise
+/// host import support would change which guest bytes the command consumes.
 fn read_buffer_bytes_resolved<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -1969,10 +2067,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         crate::observe::fail(format!(
             "metal_draw reason=draw_mtl_multisample_resolve_unsupported pipe={} \
              source={} resolve={} store_action={}",
-            req.pipeline_ref,
-            color.multisample_source_ref,
-            color.texture_ref,
-            color.store_action
+            req.pipeline_ref, color.multisample_source_ref, color.texture_ref, color.store_action
         ));
         return (
             EncodeStatus::BadArgs("draw_mtl_multisample_resolve_unsupported"),
@@ -2010,11 +2105,37 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     if width == 0 || height == 0 {
         return (EncodeStatus::BadArgs("draw_mtl_zero_geom"), None);
     }
+    // `mrt_draw_request` preserves a GVA LOAD's authoritative source instead
+    // of forcing both backends through an eager RGBA allocation. Metal's copied
+    // render target consumes that source on the CPU; Vulkan discharges the same
+    // enum through its guest-memory import path.
+    if req.gva_load_source != GvaLoadSource::None && color_seeds[0].is_none() {
+        let color0 = &color_list[0];
+        color_seeds[0] = seed_color_load(
+            state,
+            host,
+            req.task_id,
+            color0.texture_ref,
+            color0.target_gva(),
+            color0.width,
+            color0.height,
+        );
+        if color_seeds[0].is_none() {
+            crate::observe::fail(format!(
+                "metal_draw reason=load_seed_unresolved task={} pipe={} ref={} gva={:#x} {}x{}",
+                req.task_id,
+                req.pipeline_ref,
+                color0.texture_ref,
+                color0.target_gva(),
+                color0.width,
+                color0.height
+            ));
+        }
+    }
     // Metal pass requires matching RT dimensions.
-    if color_list
-        .iter()
-        .any(|c| c.width != width || c.height != height || (c.mapping_id == 0 && c.target_gva == 0))
-    {
+    if color_list.iter().any(|c| {
+        c.width != width || c.height != height || (c.mapping_id() == 0 && c.target_gva() == 0)
+    }) {
         return (EncodeStatus::BadArgs("draw_mtl_mrt_geom_mismatch"), None);
     }
     // Pages each attachment's GVA Store may reach, resolved here rather than at
@@ -2576,7 +2697,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     // contract refusal (unaligned offset or row stride, span out of range, no
     // device), so this is a rung the rail has always had.
     for (i, c) in color_list.iter().enumerate() {
-        if c.mapping_id == 0 {
+        if c.mapping_id() == 0 {
             continue;
         }
         if c.load_action == MTL_LOAD_ACTION_LOAD && color_seeds[i].is_none() {
@@ -2588,7 +2709,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                      reason=load_seed_unresolved task={} pipe={} mid={} ref={} fmt={:#x} {}x{}",
                     req.task_id,
                     req.pipeline_ref,
-                    c.mapping_id,
+                    c.mapping_id(),
                     c.texture_ref,
                     c.format,
                     width,
@@ -2771,13 +2892,13 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             _ => None,
         };
         let gva_partial = seed_for_store.is_some() && store_rect.is_some();
-        let wrote = if c.mapping_id != 0 {
+        let wrote = if c.mapping_id() != 0 {
             if gva_partial {
                 let r = store_rect.expect("gva_partial implies exactly one narrowing rect");
                 write_mapping_rgba8_rect(
                     state,
                     host,
-                    c.mapping_id,
+                    c.mapping_id(),
                     width,
                     height,
                     c.format,
@@ -2793,14 +2914,14 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                 mapping_write::write_rgba8_image_changed(
                     state,
                     host,
-                    c.mapping_id,
+                    c.mapping_id(),
                     out_rgba,
                     seed_for_store,
                     width,
                     height,
                 )
             }
-        } else if c.target_gva != 0 {
+        } else if c.target_gva() != 0 {
             let allowed = sync_store_pages
                 .get(i)
                 .and_then(|p| p.as_ref())
@@ -2811,10 +2932,10 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                     state,
                     host,
                     req.task_id,
-                    c.target_gva,
+                    c.target_gva(),
                     width,
                     height,
-                    c.row_stride,
+                    c.row_stride(),
                     c.format,
                     out_rgba,
                     mapping_write::Rect {
@@ -2830,10 +2951,10 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                     state,
                     host,
                     req.task_id,
-                    c.target_gva,
+                    c.target_gva(),
                     width,
                     height,
-                    c.row_stride,
+                    c.row_stride(),
                     c.format,
                     out_rgba,
                     allowed,
@@ -2846,11 +2967,11 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         if wrote {
             any_write = true;
             // Early-boot logo+pill: paint type-11 front before first DisplaySwap.
-            if c.mapping_id != 0 {
+            if c.mapping_id() != 0 {
                 crate::runtime::scanout::note_front_buffer_writeback(
                     state,
                     host,
-                    c.mapping_id,
+                    c.mapping_id(),
                     width,
                     height,
                     c.format,
@@ -2860,7 +2981,13 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             let (nz, maxb) = crate::observe::nonzero_stats(out_rgba);
             crate::observe::fail(format!(
                 "metal_draw writeback fail mid={} gva={:#x} fmt={:#x} {}x{} rgba_nz={} max={}",
-                c.mapping_id, c.target_gva, c.format, width, height, nz, maxb
+                c.mapping_id(),
+                c.target_gva(),
+                c.format,
+                width,
+                height,
+                nz,
+                maxb
             ));
         }
     }
@@ -3680,7 +3807,7 @@ fn sample_miss_detail<M: HostMemory + HostOps>(
                     format!(
                         "type={ot} desc_len={desc_len} has_fmt={} fmt={:#x} mips={} handle={:#x} alloc={} L0={}x{} bpr={} reason=linear_sample",
                         u8::from(tex.declared_pixel_format().is_some()),
-                        tex.pixel_format,
+                        tex.declared_pixel_format().unwrap_or(0),
                         tex.mipmap_level_count,
                         tex.handle,
                         tex.allocation_size,
@@ -3869,8 +3996,7 @@ fn load_linear_texture_rgba_at_level<M: HostMemory + HostOps>(
     let tex = decode_texture_descriptor(&desc_bytes).ok()?;
     // A descriptor that declares no pixel format is not a texture this can
     // sample; the field's own value is read below only once that is settled.
-    tex.declared_pixel_format()?;
-    let base_fmt = tex.pixel_format;
+    let base_fmt = tex.declared_pixel_format()?;
     let sample_fmt = effective_view_sample_format(base_fmt, format_override)?;
     let (gva, layout) = tex.level_gva(level, state.page_shift)?;
     let w = layout.width;
@@ -4325,17 +4451,18 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
         return lost("unbound_texture_ref");
     }
     let Some(ResolvedRenderTarget {
-        mapping_id,
-        target_gva: gva,
+        storage,
         width: w,
         height: h,
-        row_stride: bpr,
         format: fmt,
         sample_count: _,
     }) = lookup_render_target(state, host, task_id, *att)
     else {
         return lost("render_target_unresolved");
     };
+    let mapping_id = storage.mapping_id();
+    let gva = storage.target_gva();
+    let bpr = storage.row_stride();
     let need = (w as usize).saturating_mul(h as usize).saturating_mul(4);
     if rgba.len() < need {
         return lost("readback_short");
@@ -4440,9 +4567,7 @@ pub fn color_target_request<M: HostMemory + HostOps>(
     let c0 = ColorRtRequest {
         slot: 0,
         texture_ref: color_texture_ref,
-        mapping_id: rt.mapping_id,
-        target_gva: rt.target_gva,
-        row_stride: rt.row_stride,
+        storage: rt.storage,
         width: rt.width,
         height: rt.height,
         format: rt.format,
@@ -4500,7 +4625,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
     let mut base_h = 0u32;
     // Colour0's LOAD seed was skipped in favour of the engine resident. Declared
     // out here because it belongs to the request, not to the slot that set it.
-    let mut gva_load_from_resident = false;
+    let mut gva_load_source = GvaLoadSource::None;
     for &(slot, att) in color_slots {
         if att.texture_ref == 0 {
             // An empty colour slot is the guest declining to attach one, not a
@@ -4542,14 +4667,14 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
                      source_fmt={:#x} resolve_ref={} resolve_mid={} resolve_gva={:#x} \
                      resolve={}x{} resolve_fmt={:#x} load={} store={} raster_samples={}",
                     att.texture_ref,
-                    source_target.mapping_id,
-                    source_target.target_gva,
+                    source_target.storage.mapping_id(),
+                    source_target.storage.target_gva(),
                     source_target.width,
                     source_target.height,
                     source_target.format,
                     att.resolve_texture_ref,
-                    resolve_target.mapping_id,
-                    resolve_target.target_gva,
+                    resolve_target.storage.mapping_id(),
+                    resolve_target.storage.target_gva(),
                     resolve_target.width,
                     resolve_target.height,
                     resolve_target.format,
@@ -4581,14 +4706,16 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             (att.texture_ref, 0, source_target)
         };
         let ResolvedRenderTarget {
-            mapping_id,
-            target_gva: gva,
+            storage,
             width: mw,
             height: mh,
-            row_stride: bpr,
             format: mfmt,
             sample_count: target_sample_count,
         } = target;
+        let mapping_id = storage.mapping_id();
+        let gva = storage.target_gva();
+        #[cfg(feature = "backend-vulkan")]
+        let bpr = storage.row_stride();
         #[cfg(feature = "backend-vulkan")]
         let attachment_sample_count = pipeline_sample_count.unwrap_or(target_sample_count);
         #[cfg(not(feature = "backend-vulkan"))]
@@ -4660,31 +4787,37 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
                 // block on that same Store's writeback — the device's largest
                 // remaining wait. See `draw::vulkan::gva_resident_if_current`;
                 // the encode side honours the flag or re-seeds.
-                #[cfg(feature = "backend-vulkan")]
-                let elided = vulkan::gva_load_seed_elidable(
-                    state,
-                    host,
-                    task_id,
-                    vulkan::GvaSpan {
-                        texture_ref: att.texture_ref,
-                        gva,
-                        row_stride: bpr,
-                        width: mw,
-                        height: mh,
-                        format: mfmt,
-                    },
-                );
-                #[cfg(not(feature = "backend-vulkan"))]
-                let elided = false;
                 // Only colour0. `gva_chain_identity` names the first attachment
                 // and the chain rail carries that one, so a second slot whose
                 // seed was skipped would reach the pass with nothing to load.
                 // `colors.is_empty()` is "this push becomes `colors[0]`", taken
                 // from the vector the identity will read rather than from the
                 // slot number, which is the guest's and need not start at zero.
-                let elided = elided && colors.is_empty();
-                gva_load_from_resident = elided;
-                if !elided {
+                let is_color0 = colors.is_empty();
+                #[cfg(feature = "backend-vulkan")]
+                let resident = is_color0
+                    && vulkan::gva_load_seed_elidable(
+                        state,
+                        host,
+                        task_id,
+                        vulkan::GvaSpan {
+                            texture_ref: att.texture_ref,
+                            gva,
+                            row_stride: bpr,
+                            width: mw,
+                            height: mh,
+                            format: mfmt,
+                        },
+                    );
+                #[cfg(not(feature = "backend-vulkan"))]
+                let resident = false;
+                if is_color0 {
+                    gva_load_source = if resident {
+                        GvaLoadSource::Resident
+                    } else {
+                        GvaLoadSource::GuestPages
+                    };
+                } else {
                     seed = seed_color_load(state, host, task_id, att.texture_ref, gva, mw, mh);
                     if seed.is_none() {
                         crate::observe::fail(format!(
@@ -4698,9 +4831,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
         colors.push(ColorRtRequest {
             slot,
             texture_ref: target_ref,
-            mapping_id,
-            target_gva: gva,
-            row_stride: bpr,
+            storage,
             width: mw,
             height: mh,
             format: mfmt,
@@ -4724,7 +4855,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
         first_vertex: draw.first_vertex,
         base_instance: draw.base_instance,
         colors,
-        gva_load_from_resident,
+        gva_load_source,
         ..Default::default()
     })
 }
@@ -4818,19 +4949,19 @@ pub(crate) fn sync_store_target_pages<M: HostMemory>(
     task_id: u32,
     c: &ColorRtRequest,
 ) -> Option<StoreTargetPages> {
-    if c.target_gva == 0
+    if c.target_gva() == 0
         || !crate::contract::pass_action::store_action_publishes_single_sample(c.store_action)
         || c.width == 0
         || c.height == 0
     {
         return None;
     }
-    let span = (c.row_stride as u64).checked_mul(c.height as u64)?;
+    let span = (c.row_stride() as u64).checked_mul(c.height as u64)?;
     let ordered = crate::runtime::gva_mem::task_gva_page_gpas(
         host,
         &state.tasks,
         task_id,
-        c.target_gva,
+        c.target_gva(),
         span,
         state.page_shift,
     );
@@ -5525,13 +5656,7 @@ fn seed_color_load<M: HostMemory + HostOps>(
         let cached = if gva_served {
             crate::runtime::surface_cache::get_gva(state, target_gva, width, height)
         } else if ref_served {
-            crate::runtime::surface_cache::get_texture(
-                state,
-                task_id,
-                texture_ref,
-                width,
-                height,
-            )
+            crate::runtime::surface_cache::get_texture(state, task_id, texture_ref, width, height)
         } else {
             None
         };
@@ -5585,14 +5710,24 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
     // Opcode-9 buffer-backed texture (type-8): sample the source buffer directly.
     if let Some(bt) = buffer_texture_descriptor(state, host, task_id, texture_ref, None) {
         let source = bt.desc.pixel_format;
-        return load_buffer_texture_rgba(state, host, task_id, texture_ref, &bt)
-            .map(|(_, _, r)| (r, SampledByteFormat::from_source(TexelLayout::Rgba8, source)));
+        return load_buffer_texture_rgba(state, host, task_id, texture_ref, &bt).map(
+            |(_, _, r)| {
+                (
+                    r,
+                    SampledByteFormat::from_source(TexelLayout::Rgba8, source),
+                )
+            },
+        );
     }
     // Type-11 path via resolve.
     if let Some(mid) = objects::resolve_type11_ref(state, host, task_id, texture_ref) {
         let source = mapping_declared_format(state, mid, None);
-        return load_type11_mapping_rgba(state, host, mid, None)
-            .map(|(_, _, r)| (r, SampledByteFormat::from_source(TexelLayout::Rgba8, source)));
+        return load_type11_mapping_rgba(state, host, mid, None).map(|(_, _, r)| {
+            (
+                r,
+                SampledByteFormat::from_source(TexelLayout::Rgba8, source),
+            )
+        });
     }
     // Type-8 view → base texture + mip + format. The view's SWIZZLE is
     // deliberately not consulted here: it is a property of the view, not of the
@@ -5611,8 +5746,12 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
             return None;
         }
         let source = mapping_declared_format(state, mid, fmt_override);
-        return load_type11_mapping_rgba(state, host, mid, fmt_override)
-            .map(|(_, _, r)| (r, SampledByteFormat::from_source(TexelLayout::Rgba8, source)));
+        return load_type11_mapping_rgba(state, host, mid, fmt_override).map(|(_, _, r)| {
+            (
+                r,
+                SampledByteFormat::from_source(TexelLayout::Rgba8, source),
+            )
+        });
     }
     // The only rung here that can answer in anything but RGBA8. The three above
     // convert unconditionally — `load_buffer_texture_rgba` and
@@ -5857,8 +5996,8 @@ mod load_action_contract_tests {
 mod store_action_contract_tests {
     use super::store_action_in_contract;
     use crate::contract::pass_action::{
-        MTL_STORE_ACTION_DONT_CARE, MTL_STORE_ACTION_MULTISAMPLE_RESOLVE,
-        MTL_STORE_ACTION_STORE, MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
+        MTL_STORE_ACTION_DONT_CARE, MTL_STORE_ACTION_MULTISAMPLE_RESOLVE, MTL_STORE_ACTION_STORE,
+        MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
     };
 
     /// The sibling of `a_load_action_outside_mtlloadaction_is_named_not_swallowed`,

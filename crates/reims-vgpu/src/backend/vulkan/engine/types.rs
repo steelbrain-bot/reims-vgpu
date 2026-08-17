@@ -467,24 +467,6 @@ pub struct DrawRequest {
     /// the linear and sRGB members of one format-compatibility class; Vulkan
     /// represents that distinction on the image view and render pass.
     pub color_attachment_format: Option<vk::Format>,
-    /// Stable shared allocation that may back the primary resident image
-    /// directly.
-    ///
-    /// This is the retained backing named by the guest surface, not a staging
-    /// source. The runtime only constructs it after revalidating the mapping's
-    /// page ownership and obtaining a host alias whose lifetime covers the
-    /// device. The Vulkan engine still verifies the complete image-binding
-    /// equation (layout offset, row pitch, allocation extent and memory type)
-    /// before using it; any mismatch keeps the ordinary resident image.
-    pub guest_target_memory: Option<GuestTargetMemory>,
-    /// Load the primary attachment's prior contents from
-    /// [`Self::guest_target_memory`] when that backing is admitted.
-    ///
-    /// Separate from carrying the backing because CLEAR and DontCare Stores
-    /// should still render directly into guest memory while discarding its old
-    /// texels. This is true only when the guest's load source is that same
-    /// surface allocation, never for an explicit texture-derived seed.
-    pub load_guest_target_backing: bool,
     /// Load the live GPU image for [`DrawRequest::target_identity`] instead of
     /// seeding the attachment from the CPU. Requires that resident to exist.
     ///
@@ -514,13 +496,8 @@ pub struct DrawRequest {
     /// When true, skip full-frame readback (non-Store / ticket path). Content
     /// remains on the GPU under `target_identity` when provided.
     pub skip_readback: bool,
-    /// Publish a Store into an admitted guest-backed primary attachment to the
-    /// guest-write completion ledger in this draw's engine transaction.
-    ///
-    /// This is meaningful only when the resolved target is actually backed by
-    /// [`Self::guest_target_memory`]. An ordinary resident ignores it and keeps
-    /// the copied-resource writeback path.
-    pub record_guest_store: bool,
+    /// Publish a Store through the guest-write completion ledger when the
+    /// resolved output route records one in this draw's engine transaction.
     /// Present-boundary GPU seed: copy this READY resident target's content
     /// into the draw target before the pass (which then runs with LOAD),
     /// eliding the CPU front-frame read + full-frame seed upload. Requires
@@ -732,22 +709,6 @@ pub struct SecondaryColorTarget {
 #[derive(Debug, Default)]
 pub struct DrawOutput {
     pub pixels: Vec<u8>,
-    /// Whether color attachment zero was rendered through the retained guest
-    /// allocation supplied on this request.
-    ///
-    /// Reported by the engine rather than inferred by the runtime: capability,
-    /// layout, memory-type and creation checks can all send one request to the
-    /// ordinary resident fallback, and only the engine knows which image the
-    /// draw actually encoded against.
-    pub target_guest_backed: bool,
-    /// Whether this draw recorded its guest-backed Store in the completion
-    /// ledger before releasing the engine transaction.
-    pub guest_store_recorded: bool,
-    /// Exact physical pages retained by the guest-backed target whose Store was
-    /// recorded. The runtime publishes this same admitted footprint to its
-    /// coherence ledgers instead of reconstructing it from mutable mapping
-    /// state after the engine transaction.
-    pub guest_store_footprint: Option<crate::runtime::guest_ram::GuestPageFootprint>,
     /// Physical channel order of `pixels`: BGRA8 when true, semantic RGBA8
     /// otherwise. Empty when `skip_readback`, in which case this states the
     /// order the attachment *would* have read back in.
@@ -966,12 +927,12 @@ pub struct StorageBufferResource {
 /// one interleaved stream, or a stage-in buffer doubling as a storage bind,
 /// reference the same allocation instead of cloning it.
 ///
-/// `GuestRuns` is the zero-copy origin: the GPU gathers the span straight
-/// from imported guest RAM inside the draw's own command buffer (per-run
-/// `cmd_copy_buffer` into the pooled staging slot the bind then uses). No
-/// CPU read, no CPU memcpy — guest CPU writes are observed at execute time,
-/// at least as fresh as the CPU path's encode-time read (the same in-flight
-/// window contract the sampled `SampledSource::GuestRuns` rail relies on).
+/// `GuestRuns` is the zero-CPU-copy origin: the GPU gathers the declared span
+/// from imported guest RAM inside the draw's own command buffer into the one
+/// engine-owned buffer that vertex, index, and shader-buffer consumers bind.
+/// This does not read or memcpy the bytes on the CPU, and it observes guest
+/// writes at execute time (the same in-flight window contract the sampled
+/// `SampledSource::GuestRuns` rail relies on).
 /// `row_length_texels` MUST be 0 (buffers have no row stride semantics).
 #[derive(Clone, Debug)]
 pub enum BufferContent {
@@ -1039,10 +1000,8 @@ impl BufferContent {
                     // read races guest CPU writes exactly like the staging
                     // path's `read_task_gva_by_id` copy does.
                     unsafe {
-                        let slice = std::slice::from_raw_parts(
-                            (run.host_ptr as *const u8).add(within),
-                            n,
-                        );
+                        let slice =
+                            std::slice::from_raw_parts((run.host_ptr as *const u8).add(within), n);
                         out.extend_from_slice(slice);
                     }
                 }
@@ -1104,6 +1063,11 @@ pub struct SampledImageResource {
     /// Optional identity fast path for [`SampledSource::Bytes`] (see
     /// [`SampledContentIdentity`]); `None` keeps the content-addressed path.
     pub identity: Option<SampledContentIdentity>,
+    /// Weak proof of the serialized texture resource whose content this bind
+    /// represents. A retained sampled image may live only while at least one
+    /// such resource is live; deletion, rather than a byte budget or elapsed
+    /// time, is its cache lifetime boundary.
+    pub resource_lifetime: Option<crate::model::TaskResourceLifetimeRef>,
     /// Decoded type-8 view swizzle, applied as the image view's component
     /// mapping so the GPU performs it at sample time. Identity (the default)
     /// creates the same view as before. Doing this on the view rather than by
@@ -1123,7 +1087,6 @@ pub struct SampledImageResource {
 pub enum SampledByteOrigin {
     #[default]
     Synthetic,
-    AttachmentAlias,
     BufferBackedTexture,
     SerializedSurfaceView,
     SurfaceHostCache,
@@ -1545,15 +1508,66 @@ impl ComputeImageResult {
 #[derive(Debug)]
 pub struct ComputeBufferResource {
     pub binding: u32,
-    pub bytes: Vec<u8>,
+    /// Complete ownership of the bytes bound as this storage descriptor.
+    pub backing: ComputeBufferBacking,
     /// Structurally proven write access in the SPIR-V pointer-use graph.
     pub writable: bool,
 }
 
 #[derive(Debug)]
+pub enum ComputeBufferBacking {
+    /// Host-owned bytes, used on hosts that cannot import the guest allocation.
+    Bytes(Vec<u8>),
+    /// The retained guest allocation itself. `write_pages` is the exact
+    /// physical footprint published when a writable descriptor is bound
+    /// directly; source and destination therefore name one incarnation.
+    GuestPages {
+        source: GuestRunSource,
+        write_pages: Vec<u64>,
+    },
+}
+
+impl ComputeBufferBacking {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Bytes(bytes) => bytes.len(),
+            Self::GuestPages { source, .. } => source.total_len as usize,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[derive(Debug)]
 pub struct ComputeBufferOutput {
     pub binding: u32,
-    pub bytes: Vec<u8>,
+    pub result: ComputeBufferResult,
+}
+
+impl ComputeBufferOutput {
+    pub fn bytes(&self) -> Option<&[u8]> {
+        self.result.bytes()
+    }
+}
+
+#[derive(Debug)]
+pub enum ComputeBufferResult {
+    /// The engine used a host-visible buffer and returned its contents.
+    Bytes(Vec<u8>),
+    /// The shader wrote the imported guest allocation itself. The write is
+    /// queued and covered by the guest-write completion ledger.
+    Landed { bytes: u64 },
+}
+
+impl ComputeBufferResult {
+    pub fn bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Bytes(bytes) => Some(bytes),
+            Self::Landed { .. } => None,
+        }
+    }
 }
 
 /// Storage image for compute. Formats mirror the live `simg_u32_to_vk_storage` map.
@@ -1570,24 +1584,27 @@ pub struct ComputeStorageImageResource {
     pub format: StorageImageFormat,
     pub width: u32,
     pub height: u32,
-    /// Seed content, read *into* the image before the dispatch.
-    ///
-    /// Deliberately still a host allocation, and not paired with
-    /// [`Self::destination`]. The seed direction is the GPU *reading* guest
-    /// pages, which this device refuses on its own grounds: it acks a command
-    /// before the work runs, so the guest may repaint those pages first. Only
-    /// the output direction is routed.
-    pub bytes: Vec<u8>,
+    /// Prior contents read into the image before the dispatch. The variant is
+    /// the complete source decision: no placeholder byte vector or companion
+    /// flag can disagree with it.
+    pub seed: ComputeStorageImageSeed,
     /// Where the post-dispatch pixels go. See [`ComputeImageDestination`].
     pub destination: ComputeImageDestination,
     /// Exact type-11 resource lifetime/view contract for persistent GPU
     /// storage. `None` keeps the conservative transient upload path.
     pub residency: Option<ComputeStorageResidency>,
-    /// The caller skipped reading guest pages into `bytes` because the
-    /// resident generation matched at stage time. The engine must fail
-    /// visibly (never seed the zero placeholder) if the resident image is
-    /// gone by acquire time.
-    pub seed_skipped: bool,
+}
+
+#[derive(Debug)]
+pub enum ComputeStorageImageSeed {
+    /// Tight host bytes. This is the complete fallback on a host that cannot
+    /// retain/import guest pages.
+    Bytes(Vec<u8>),
+    /// The guest allocation itself, including its physical row pitch.
+    GuestPages(GuestRunSource),
+    /// The matching compute-storage resident already holds the current
+    /// generation; no seed copy is required.
+    Resident,
 }
 
 /// Bind request for a sampled input whose window content the engine already
@@ -1628,11 +1645,19 @@ pub struct ComputeSampledImageResource {
     pub format: StorageImageFormat,
     pub width: u32,
     pub height: u32,
-    pub bytes: Vec<u8>,
-    /// When set, `bytes` is a zero placeholder: the engine seeds the sampled
-    /// image with a device-local copy of the named resident storage image
-    /// instead of uploading from the host (see [`ComputeResidentSampleBind`]).
-    pub resident_bind: Option<ComputeResidentSampleBind>,
+    pub source: ComputeSampledImageSource,
+}
+
+#[derive(Debug)]
+pub enum ComputeSampledImageSource {
+    /// Tight host bytes for synthetic inputs and hosts without a retained guest
+    /// allocation.
+    Bytes(Vec<u8>),
+    /// The exact guest allocation/window the resource object retains.
+    GuestPages(GuestRunSource),
+    /// A prior storage dispatch's resident image, copied device-locally so the
+    /// sampled view cannot alias a simultaneous storage write.
+    Resident(ComputeResidentSampleBind),
 }
 
 /// Pixel formats the product compute path maps. Storage and sampled images
@@ -2134,6 +2159,17 @@ pub enum SampledSource {
     Bytes(std::sync::Arc<Vec<u8>>),
     /// Bind a prior GPU-resident target directly (no CPU round-trip).
     Target(TargetIdentity),
+    /// Read the initial contents of an attachment this same draw writes.
+    ///
+    /// The serialized render-pass descriptor and fragment binding name one
+    /// texture resource. `initial` states which attachment load establishes
+    /// the value before fragment execution; it is not a second texture. A host
+    /// with native attachment feedback binds the target itself. Other hosts
+    /// create the required pre-draw snapshot with GPU clear/copy commands.
+    Attachment {
+        identity: TargetIdentity,
+        initial: AttachmentInitial,
+    },
     /// Guest-memory origin. A resource-owned packed allocation binds as a
     /// linear sampled image directly; hosts or layouts that decline it retain
     /// the copy-backed route from imported buffers into an optimal image. No
@@ -2145,6 +2181,17 @@ pub enum SampledSource {
     /// identity. If the backend declines one, the copy fallback therefore runs
     /// conservatively instead of reusing content that was never witnessed.
     GuestRuns(GuestRunSource, crate::runtime::gather_witness::GatherVouch),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AttachmentInitial {
+    Clear([f32; 4]),
+    Seed,
+    /// The render pass discards the attachment's prior contents. Sampling it
+    /// before a fragment writes it is therefore defined to return no particular
+    /// value; the fallback preserves that undefined state instead of sourcing
+    /// bytes from a different resource.
+    DontCare,
 }
 
 /// One packed-contiguous guest-RAM span (a direct RAMBlock alias from
@@ -2208,10 +2255,6 @@ pub struct GuestRunSource {
     /// `Arc` because a source is cloned per bind and these are shared, immutable
     /// and never rebuilt.
     pub pages: Option<std::sync::Arc<Vec<crate::runtime::guest_ram_map::GuestWindowRun>>>,
-    /// One resource-owned packed allocation that can back a linear sampled
-    /// image directly. When the host declines that image layout, `runs` and
-    /// `pages` remain the complete copy-backed fallback for the same texels.
-    pub direct_image: Option<GuestSampledBacking>,
 }
 
 /// One stretch of a [`GuestRunSource`]'s window, already clipped to it.
@@ -2304,32 +2347,25 @@ pub struct GuestTargetSeed {
 
 /// One guest surface plane within a stable shared host allocation.
 ///
-/// `allocation_host_ptr..allocation_len` is the object imported into Vulkan.
-/// `plane_offset` identifies the attachment's first texel within it, while
-/// `row_pitch` is the plane's declared physical stride. Keeping the whole
-/// allocation and the plane coordinates together is what lets the engine
-/// derive `vkBindImageMemory`'s offset without manufacturing a pointer before
-/// the plane or extending the import past its real bound.
+/// `allocation_host_ptr..allocation_len` is the parent object imported into
+/// Vulkan. `resource_offset..resource_len` is the guest allocation within that
+/// parent, and `plane_offset` identifies the attachment's first texel within
+/// the same parent-relative coordinate space. `row_pitch` is the plane's
+/// declared physical stride. Keeping both bounds and the plane coordinates
+/// together lets the engine derive `vkBindImageMemory`'s offset without
+/// manufacturing a pointer before the plane or extending the image into an
+/// adjacent guest resource.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct GuestTargetBacking {
     pub allocation_host_ptr: usize,
     pub allocation_len: u64,
+    /// Declared guest resource within the imported parent. This is zero/full
+    /// for a mapping import and a checked subwindow when a type-2/3 allocation
+    /// reuses the VM's broader RAMBlock import.
+    pub resource_offset: u64,
+    pub resource_len: u64,
     pub plane_offset: u64,
     pub row_pitch: u64,
-}
-
-/// A sampled plane within the packed allocation retained for its guest
-/// resource. The import owns the checked allocation bound; `backing` carries
-/// only the image-layout coordinates derived inside that bound.
-#[derive(Clone, Debug)]
-pub struct GuestSampledBacking {
-    pub backing: GuestTargetBacking,
-    pub import: std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
-    /// The serialized resource that owns this image. The engine keeps this
-    /// weak so its cache cannot extend the guest-visible resource lifetime.
-    pub owner: crate::model::TaskResourceLifetimeRef,
-    /// Resource family for accounting only; never an execution selector.
-    pub origin: SampledByteOrigin,
 }
 
 /// An importable guest allocation and the physical pages it owns.
@@ -2343,6 +2379,74 @@ pub struct GuestTargetMemory {
     /// The parent allocation whose one backend import all child views share.
     pub import: std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
     pub footprint: crate::runtime::guest_ram::GuestPageFootprint,
+}
+
+impl GuestTargetMemory {
+    /// Describe this attachment's prior contents as a bounded guest-buffer
+    /// source for a LOAD.
+    ///
+    /// The allocation already owns the stable import and exact plane geometry;
+    /// deriving the seed here keeps the target and its LOAD source on one
+    /// contract. The returned window includes row padding between rows but no
+    /// padding after the final row, matching `vkCmdCopyBufferToImage`.
+    pub(crate) fn load_seed(
+        &self,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+    ) -> Option<GuestTargetSeed> {
+        if width == 0 || height == 0 || self.import.is_retired() {
+            return None;
+        }
+        let texel = u64::from(translate::pixel::bytes_per_texel(format)?);
+        let tight_row = u64::from(width).checked_mul(texel)?;
+        let row_pitch = self.backing.row_pitch;
+        if row_pitch < tight_row || !row_pitch.is_multiple_of(texel) {
+            return None;
+        }
+        let span = u64::from(height - 1)
+            .checked_mul(row_pitch)?
+            .checked_add(tight_row)?;
+        let resource_end = self
+            .backing
+            .resource_offset
+            .checked_add(self.backing.resource_len)?;
+        let plane_end = self.backing.plane_offset.checked_add(span)?;
+        if self.backing.plane_offset < self.backing.resource_offset || plane_end > resource_end {
+            return None;
+        }
+        let slice = self.import.slice(self.backing.plane_offset, span).ok()?;
+        let guest =
+            crate::runtime::guest_ram::GuestRef::new(std::sync::Arc::clone(&self.import), slice)
+                .ok()?;
+        let host_ptr = self
+            .import
+            .host_base()
+            .checked_add(usize::try_from(self.backing.plane_offset).ok()?)?;
+        let row_length_texels = if row_pitch == tight_row {
+            0
+        } else {
+            u32::try_from(row_pitch / texel).ok()?
+        };
+        Some(GuestTargetSeed {
+            source: GuestRunSource {
+                runs: std::sync::Arc::new(vec![GuestRun {
+                    host_ptr,
+                    len: span,
+                }]),
+                source_offset: 0,
+                total_len: span,
+                row_length_texels,
+                pages: Some(std::sync::Arc::new(vec![
+                    crate::runtime::guest_ram_map::GuestWindowRun {
+                        window_offset: 0,
+                        guest,
+                    },
+                ])),
+            },
+            format,
+        })
+    }
 }
 
 /// Producer-assigned identity + generation for CPU-sourced sampled content.
@@ -2363,6 +2467,51 @@ pub struct SampledContentIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_guest_target_derives_its_load_window_from_its_own_plane_contract() {
+        let import = std::sync::Arc::new(
+            crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
+                0x1000_0000,
+                0x4000,
+                0x1000,
+            )
+            .expect("aligned import"),
+        );
+        let memory = GuestTargetMemory {
+            backing: GuestTargetBacking {
+                allocation_host_ptr: import.host_base(),
+                allocation_len: import.len(),
+                resource_offset: 0x1000,
+                resource_len: 0x2000,
+                plane_offset: 0x1200,
+                row_pitch: 32,
+            },
+            import,
+            footprint: crate::runtime::guest_ram::GuestPageFootprint::new(
+                std::sync::Arc::from([0x5000, 0x6000]),
+                0x1000,
+            )
+            .expect("footprint"),
+        };
+
+        let seed = memory
+            .load_seed(4, 2, vk::Format::R8G8B8A8_UNORM)
+            .expect("the plane contains two padded rows");
+        assert_eq!(seed.source.total_len, 48, "one stride plus the final row");
+        assert_eq!(seed.source.row_length_texels, 8);
+        assert_eq!(seed.source.runs[0].host_ptr, 0x1000_1200);
+        assert_eq!(seed.source.pages.as_ref().unwrap().len(), 1);
+
+        let mut outside = memory.clone();
+        outside.backing.plane_offset = 0x2ff8;
+        assert!(
+            outside
+                .load_seed(4, 2, vk::Format::R8G8B8A8_UNORM)
+                .is_none(),
+            "a plane extending beyond its declared resource is not widened into its neighbour"
+        );
+    }
 
     /// A draw that samples one of its own attachments must reach the snapshot
     /// arm, and "its own" is every attachment it binds rather than slot 0.

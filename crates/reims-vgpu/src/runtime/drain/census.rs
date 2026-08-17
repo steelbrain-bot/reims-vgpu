@@ -3670,7 +3670,7 @@ fn take_store_routes() -> Option<String> {
 
 #[cfg(test)]
 mod drain_gap_tests {
-    use super::{DRAIN_DUTY_REPORT_MS, DrainDutyCensus, PostSweep};
+    use super::{DrainDutyCensus, PostSweep, DRAIN_DUTY_REPORT_MS};
 
     /// The four gap buckets plus `busy_us` account for the whole window.
     ///
@@ -3794,7 +3794,11 @@ mod irq_wait_tests {
                 .parse()
                 .expect("a microsecond count")
         };
-        assert_eq!(field("irq_waits"), 2, "one per emptying, not one per action");
+        assert_eq!(
+            field("irq_waits"),
+            2,
+            "one per emptying, not one per action"
+        );
         assert_eq!(field("irq_wait_us"), 300 + 50);
         assert_eq!(
             field("irq_wait_max_us"),
