@@ -648,6 +648,21 @@ pub enum GpuWritebackDecline {
     /// it needs a per-row conversion. A buffer→image copy performs none, which
     /// is why this is a routing answer rather than something to work around.
     FormatNeedsConversion { format: u16 },
+    /// The mapping's declared format has a linear texel to name, and the source
+    /// image does not hold it. Same consequence as the variant above and a
+    /// different cause: there the guest declared something no copy can express,
+    /// here the two sides simply disagree.
+    ///
+    /// Expected on the compute rail, where a storage image's format comes from
+    /// the specialized SPIR-V texel format and owes a surface mapping's
+    /// declaration nothing. Whole formats, not channel orders: `RGBA16_FLOAT`
+    /// and `RGBA8_UNORM` are both RGBA-ordered and four bytes per texel apart,
+    /// so an order comparison would admit a half-float source over an eight-bit
+    /// destination and land a frame of the wrong size.
+    ResidentFormatMismatch {
+        held: ash::vk::Format,
+        want: ash::vk::Format,
+    },
     /// The guest's row pitch is not a whole number of texels, so it cannot be
     /// expressed as `bufferRowLength`.
     PitchNotTexels { bpr: u32 },
@@ -697,6 +712,7 @@ impl crate::observe::Decline for GpuWritebackDecline {
             Self::GeometryMoved { .. } => "gpuwb_geometry_moved",
             Self::WindowUnresolved { .. } => "gpuwb_window_unresolved",
             Self::FormatNeedsConversion { .. } => "gpuwb_format_needs_conversion",
+            Self::ResidentFormatMismatch { .. } => "gpuwb_resident_format_mismatch",
             Self::PitchNotTexels { .. } => "gpuwb_pitch_not_texels",
             Self::OffsetNotTexelAligned { .. } => "gpuwb_offset_not_texel_aligned",
             Self::PageListShort { .. } => "gpuwb_page_list_short",
@@ -739,6 +755,10 @@ impl crate::observe::Decline for GpuWritebackDecline {
                 ("fmt", format!("{format:#x}")),
             ],
             Self::FormatNeedsConversion { format } => vec![("fmt", format!("{format:#x}"))],
+            Self::ResidentFormatMismatch { held, want } => vec![
+                ("held", format!("{held:?}")),
+                ("want", format!("{want:?}")),
+            ],
             Self::PitchNotTexels { bpr } => vec![("bpr", bpr.to_string())],
             Self::OffsetNotTexelAligned { in_page } => vec![("in_page", in_page.to_string())],
             Self::PageListShort { need, have } => {
@@ -907,6 +927,83 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
     width: u32,
     height: u32,
 ) -> Result<u64, GpuWritebackDecline> {
+    let licence = licence_type11_surface(
+        state,
+        host,
+        mapping_id,
+        identity.resident_format(),
+        width,
+        height,
+    )?;
+    crate::backend::vulkan::engine::copy_target_to_guest_pages(
+        identity,
+        &licence.target,
+        &licence.gpas,
+    )
+    .map_err(|inner| GpuWritebackDecline::Engine { inner })?;
+    note_type11_landed(state, mapping_id, licence.base_off, licence.span_end);
+    Ok(licence.span_end - licence.base_off)
+}
+
+/// A licensed direct-to-guest-pages destination over a type-11 surface mapping.
+///
+/// The type-11 counterpart of
+/// [`crate::runtime::render_writeback::GvaPlaneLicence`], and it exists for the
+/// same reason: the two rails that write a guest surface from the GPU — a render
+/// Store and a compute storage-image output — differ only in the image they copy
+/// *from* and in which command buffer records the copy. Everything about the
+/// destination is this, so it is derived once and the second rail cannot spell
+/// any of it differently.
+///
+/// `base_off` and `span_end` are carried because the landing note needs them and
+/// deriving them a second time would be a second answer to a question the
+/// licence already asked. See [`note_type11_landed`].
+#[cfg(feature = "backend-vulkan")]
+pub(crate) struct Type11SurfaceLicence {
+    pub target: crate::backend::vulkan::engine::GuestPageTarget,
+    /// The pages walked, in the surface's own order — what the copy is licensed
+    /// over and what every witness on this path is armed against.
+    pub gpas: Vec<u64>,
+    /// The window within the mapping the copy names, and nothing past it.
+    pub base_off: u64,
+    pub span_end: u64,
+}
+
+/// Resolve a type-11 surface mapping into a destination the GPU may copy into,
+/// or the typed reason it may not.
+///
+/// `held` is the format the source image actually holds. **A copy converts
+/// nothing**, so a source whose format is not the one the guest will read these
+/// bytes back as must be refused here rather than landed.
+///
+/// # Why this asks about the format and the render caller used not to
+///
+/// On the render rail the question is very nearly a tautology — a target's
+/// identity takes its format from [`mapping_store_format`], the same function
+/// [`mapping_write_geometry`] reads below — and the comparison that can actually
+/// fail is made downstream by `copy_target_to_guest_pages`, against the resident
+/// *image's* own format, which a mapping may have redeclared underneath. Both of
+/// those are still true and that check is still there.
+///
+/// The compute rail has no such downstream. Its dispatch writes the guest's
+/// pages itself, so there is no second pair to compare and this is the only
+/// place the question can be asked. A storage image takes its format from the
+/// specialized SPIR-V texel format, which has no reason to match a surface
+/// mapping's declaration — measured at 3 of 35 type-11 windows on a driven
+/// macos-13 boot — so on that rail it is not a healthy zero either.
+///
+/// Asking it for both callers rather than for the one that needs it keeps the
+/// rule in the licence, where a third writer of a guest surface would meet it
+/// without knowing to look.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn licence_type11_surface<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    held: ash::vk::Format,
+    width: u32,
+    height: u32,
+) -> Result<Type11SurfaceLicence, GpuWritebackDecline> {
     if !scanout_extent_ok(width, height) {
         return Err(GpuWritebackDecline::NotWritable);
     }
@@ -930,19 +1027,19 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
     // name. A compressed or planar declaration has none, and the copying rail's
     // row converter is the only thing that can land it.
     //
-    // Not a check that the resident *holds* that format. The identity carries
-    // the format its image was created with and takes it from
-    // `mapping_store_format`, the same function `mapping_write_geometry` above
-    // reads — so asking here whether the two agree would be asking one input
-    // whether it equals itself. The question is asked once, on the authoritative
-    // pair, by `copy_target_to_guest_pages`: it compares the destination's
-    // format against the resident image's own and refuses by name. That is the
-    // comparison that can actually fail, because a mapping can redeclare its
-    // format under a resident minted before it did.
     let Some(layout) = pixel_format::store_texel_order(format) else {
         return Err(GpuWritebackDecline::FormatNeedsConversion { format });
     };
     let dst_format = crate::backend::vulkan::translate::pixel::vk_texel_layout(layout);
+    // And that the source holds exactly it. See this function's doc for why the
+    // render caller's own downstream check stays where it is: the two compare
+    // different pairs, and this is the only one the compute rail has.
+    if held != dst_format {
+        return Err(GpuWritebackDecline::ResidentFormatMismatch {
+            held,
+            want: dst_format,
+        });
+    }
     let texel = layout.bytes_per_texel();
     let Some((base_off, bpr, span_end)) = type11_sample_window(m, mw, mh, format) else {
         return Err(GpuWritebackDecline::WindowUnresolved {
@@ -1109,16 +1206,40 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
         ReadbackPhase::Resolve,
         resolve_started.elapsed().as_micros() as u64,
     );
-    crate::backend::vulkan::engine::copy_target_to_guest_pages(identity, &target, &gpas)
-        .map_err(|inner| GpuWritebackDecline::Engine { inner })?;
+    Ok(Type11SurfaceLicence {
+        target,
+        gpas,
+        base_off,
+        span_end,
+    })
+}
+
+/// What a landed type-11 GPU write owes the rest of the device.
+///
+/// Called once the copy is *issued*, not once it has completed, and by both
+/// rails that issue one — the render Store, which submits and waits, and the
+/// compute storage-image output, whose copy rides its dispatch's own command
+/// buffer and lands at the fence. Neither leaves a host copy of the frame, so
+/// nothing on the host may go on naming one, and that is true from the moment
+/// the copy is queued rather than from the moment it retires.
+///
+/// Every one of these errs in the same direction on purpose: a cache forgotten
+/// early costs a re-read of bytes that are about to change anyway, while one
+/// forgotten late hands out a stale frame as fresh. The same argument the
+/// witnesses in [`licence_type11_surface`] are armed on.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn note_type11_landed(
+    state: &mut DeviceState,
+    mapping_id: u32,
+    base_off: u64,
+    span_end: u64,
+) {
     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
     let _ = state.mark_mapping_written(mapping_id);
-    // Nothing here leaves a host copy of the frame, so the surface cache must
-    // not go on naming one: its entry, if any, is a previous flush's bytes and
-    // the guest's pages are now the only place this frame exists. Same reason
+    // The guest's pages are now the only place this frame exists, and the
+    // surface cache's entry, if any, is a previous flush's bytes. Same reason
     // `write_bgra8_uncached` invalidates rather than publishes.
     crate::runtime::surface_cache::forget(state, mapping_id);
-    Ok(span_end - base_off)
 }
 
 /// Publish a Store from an attachment already backed by this mapping.

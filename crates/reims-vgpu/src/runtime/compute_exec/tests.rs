@@ -2276,12 +2276,12 @@ fn a_staged_buffer_carries_the_pages_its_writeback_is_bounded_to() {
     assert!(staged_span_pages(&state, &host, 1, page, 0).is_empty());
 }
 
-/// The direct arm refuses on the shape of the destination, and on nothing else.
+/// Every destination reaches a licence; nothing is turned away for its shape.
 ///
-/// Two refusals, and the third case is the one that must *not* refuse. A type-11
-/// destination is a tiled surface mapping the guest-linear licence cannot
-/// describe. A window whose pages did not resolve cannot be licensed. Residency
-/// is neither: a registered resident is a perfectly good source for a copy, and
+/// Both destination shapes have one, and the shapes differ only in which licence
+/// answers — a guest-linear plane goes to `licence_gva_plane` and a tiled surface
+/// mapping to `licence_type11_surface`. Residency is not a shape at all: a
+/// registered resident is a perfectly good source for a copy, and
 /// what holds it across a submitted-not-waited copy is the engine's pin, taken
 /// where the write debt is armed and released from the ring slot's cleanup.
 ///
@@ -2296,18 +2296,20 @@ fn a_staged_buffer_carries_the_pages_its_writeback_is_bounded_to() {
 /// identically to one an earlier gate caught. The census route is what
 /// distinguishes them, so each case is asserted on its own counter.
 ///
-/// The type-11 case asserts one thing more. That class is the largest this arm
-/// does not reach, and its route counter says only how big it is; the decision
-/// about whether to build a type-11 licence turns on how much of it a raw copy
-/// could ever serve, which is a different number. So the three verdicts are
-/// asserted to *partition* the class — a fourth outcome, or an outcome counted
-/// twice, would make the band say more or less reach than there is.
+/// The type-11 cases assert the thing that is easiest to regress back to. That
+/// class was the largest this arm did not reach — 35 of the 51 storage
+/// destinations of a driven macos-13 boot — and the reason was a `return` on the
+/// destination's *shape*, before anything about the surface had been asked. A
+/// tiled surface mapping is not a guest-linear plane, which is true, and does
+/// not make it unreachable. So `compute_dst_host_not_linear` is asserted at
+/// zero: reintroducing that early answer would read as a correct statement about
+/// the GVA licence and put 91 % of the class back on the readback rail.
 ///
 /// Vulkan-only: the direct arm is a `VK_EXT_external_memory_host` import, and
 /// `StagedTexture` does not carry a residency candidate on the Metal arm at all.
 #[cfg(feature = "backend-vulkan")]
 #[test]
-fn only_a_licensed_transient_linear_window_can_take_the_direct_arm() {
+fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
     use crate::backend::vulkan::engine::ComputeImageDestination;
     use crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM;
     use crate::runtime::drain::census::store_route_count;
@@ -2377,13 +2379,7 @@ fn only_a_licensed_transient_linear_window_can_take_the_direct_arm() {
         height: 2,
         bpp: 4,
     };
-    let split = || {
-        (
-            store_route_count("compute_dst_type11_agrees"),
-            store_route_count("compute_dst_type11_differs"),
-            store_route_count("compute_dst_type11_unresolved"),
-        )
-    };
+    let unlicensed = || store_route_count("compute_dst_host_type11_unlicensed");
     // A mapping declaring the same texel the dispatch holds: reachable.
     state.mappings.insert(
         1,
@@ -2409,9 +2405,16 @@ fn only_a_licensed_transient_linear_window_can_take_the_direct_arm() {
             ..Default::default()
         },
     );
-    // Mapping 3 is never registered, so its declared format is unresolvable.
-    let before = store_route_count("compute_dst_host_not_linear");
-    let (agrees, differs, unresolved) = split();
+    // Mapping 3 is never registered, so there is nothing to write into.
+    //
+    // All three answer `Host` here, and for three different reasons, only one of
+    // which is about the format: `FakeHost` publishes no guest-RAM import, so
+    // even the agreeing mapping's licence is refused at the reference walk. What
+    // this asserts is that all three *reached* the licence — the arm no longer
+    // answers `Host` on the shape of the destination alone, which is what it did
+    // for 35 of the 51 storage destinations of a driven macos-13 boot.
+    let before = unlicensed();
+    let not_linear = store_route_count("compute_dst_host_not_linear");
     for mapping_id in [1, 2, 3] {
         assert!(
             is_host(&direct_destination(
@@ -2420,18 +2423,21 @@ fn only_a_licensed_transient_linear_window_can_take_the_direct_arm() {
                 &staged(type11(mapping_id), None),
                 held,
             )),
-            "a tiled surface mapping reads back"
+            "no guest-RAM import, so every type-11 licence is refused here"
         );
     }
     assert_eq!(
-        store_route_count("compute_dst_host_not_linear"),
+        unlicensed(),
         before + 3,
-        "a type-11 window never reaches the guest-linear licence"
+        "the type-11 licence is what refused, not the destination's shape"
     );
+    // A delta and not an absolute: these counters are process-global and this
+    // suite runs serially in one binary, so a zero read absolutely would be
+    // asserting about every other test too.
     assert_eq!(
-        split(),
-        (agrees + 1, differs + 1, unresolved + 1),
-        "the three verdicts partition the class they band"
+        store_route_count("compute_dst_host_not_linear"),
+        not_linear,
+        "a type-11 destination is no longer turned away for not being linear"
     );
 
     // And the case this test exists for: a resident window is routed on its

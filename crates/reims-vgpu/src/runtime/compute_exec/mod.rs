@@ -1421,9 +1421,7 @@ fn direct_destination<M: HostMemory + HostOps>(
         ..
     } = &tex.writeback
     else {
-        crate::runtime::drain::note_store_route("compute_dst_host_not_linear");
-        note_type11_shape(state, tex, held);
-        return ComputeImageDestination::Host;
+        return type11_destination(state, host, tex, held);
     };
     let Ok(row_stride) = u32::try_from(*row_stride) else {
         crate::runtime::drain::note_store_route("compute_dst_host_stride_width");
@@ -1475,28 +1473,32 @@ fn direct_destination<M: HostMemory + HostOps>(
     }
 }
 
-/// Record whether a type-11 destination could ever be served by a raw copy.
+/// [`direct_destination`] for a type-11 surface mapping.
 ///
-/// The type-11 windows are the largest class this arm does not reach, and
-/// [`direct_destination`]'s type-11 answer is `Host` before it has looked at
-/// anything — so the route counter says how many there are and nothing says how
-/// many are *reachable*. That is the number that decides whether a type-11
-/// licence is worth building, and it is not the same number: a copy converts
-/// nothing, so a window is only reachable when the format the guest will read
-/// these bytes back as is exactly the format the dispatch's storage image holds.
+/// A tiled surface mapping is not a guest-linear plane and the GVA licence
+/// cannot describe one — but it is not therefore unreachable, and treating it as
+/// such is what this arm used to do. It answered `Host` before looking at
+/// anything, and on a driven macos-13 boot that was 35 of the 51 storage
+/// destinations, every one of them a device→host crossing.
 ///
-/// A compute storage image takes its format from the specialized SPIR-V texel
-/// format, which has no reason to match a surface mapping's declared one, so
-/// `differs` is an expected outcome rather than a defect. The counters split
-/// three ways and add up to `compute_dst_host_not_linear`:
+/// The destination that *can* describe it already existed on the render rail,
+/// resolving the sample window, walking the mapping's page entries and building
+/// the same [`crate::backend::vulkan::engine::GuestPageTarget`] this rail wants.
+/// It is now [`crate::runtime::mapping_write::licence_type11_surface`] and both
+/// rails ask it, so the surface geometry, the format rule, the page walk and the
+/// guest-RAM references have one spelling rather than two.
 ///
-/// - `agrees` — a raw copy would land these bytes. The reachable population.
-/// - `differs` — the mapping and the resident name different texels. Readback
-///   and its row converter are the only rail that can land these.
-/// - `unresolved` — no mapping, or a declared format with no linear texel
-///   order to name. Not reachable by any copy either.
+/// Every decline is a routing answer on the `OFF` channel, not a loss: readback
+/// lands identical bytes, and on a host without the guest-RAM import it is the
+/// only rail there is.
 #[cfg(feature = "backend-vulkan")]
-fn note_type11_shape(state: &DeviceState, tex: &StagedTexture, held: ash::vk::Format) {
+fn type11_destination<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    tex: &StagedTexture,
+    held: ash::vk::Format,
+) -> crate::backend::vulkan::engine::ComputeImageDestination {
+    use crate::backend::vulkan::engine::ComputeImageDestination;
     let TextureWriteback::Type11 {
         mapping_id,
         width,
@@ -1504,35 +1506,40 @@ fn note_type11_shape(state: &DeviceState, tex: &StagedTexture, held: ash::vk::Fo
         ..
     } = &tex.writeback
     else {
-        // A storage image the guest gave nowhere to land. There is no
-        // destination to reach, so it is not part of the population above.
+        // A storage image the guest gave nowhere to land. Not a destination this
+        // arm declined — there is no destination.
         crate::runtime::drain::note_store_route("compute_dst_no_writeback");
-        return;
+        return ComputeImageDestination::Host;
     };
-    let declared = state
-        .mappings
-        .get(mapping_id)
-        .map(crate::runtime::mapping_write::mapping_store_format);
-    let want = declared
-        .and_then(crate::contract::pixel_format::store_texel_order)
-        .map(crate::backend::vulkan::translate::pixel::vk_texel_layout);
-    match want {
-        Some(want) if want == held => {
-            crate::runtime::drain::note_store_route("compute_dst_type11_agrees")
+    match crate::runtime::mapping_write::licence_type11_surface(
+        state, host, *mapping_id, held, *width, *height,
+    ) {
+        Ok(licence) => {
+            crate::runtime::drain::note_store_route("compute_dst_guest_pages");
+            crate::runtime::drain::note_store_route(if tex.residency.is_some() {
+                "compute_dst_guest_pages_type11_resident"
+            } else {
+                "compute_dst_guest_pages_type11_transient"
+            });
+            ComputeImageDestination::GuestPages {
+                target: Box::new(licence.target),
+                pages: licence.gpas,
+            }
         }
-        Some(_) => crate::runtime::drain::note_store_route("compute_dst_type11_differs"),
-        None => crate::runtime::drain::note_store_route("compute_dst_type11_unresolved"),
-    }
-    // One line per distinct format pair rather than per window: the pairs are
-    // what a licence would have to serve, and a driven boot repeats a handful of
-    // them thousands of times.
-    let key = (u64::from(declared.unwrap_or(0)) << 32) | u64::from(held.as_raw() as u32);
-    if crate::observe::first_sight("compute_dst_type11_shape", key) {
-        crate::observe::off(format!(
-            "compute_dst_type11 bind={} mid={mapping_id} dims={width}x{height} declared={:#x} want={want:?} held={held:?}",
-            tex.binding,
-            declared.unwrap_or(0),
-        ));
+        Err(decline) => {
+            // Named, because the reasons are not interchangeable and the route
+            // counter cannot tell them apart. The one that dominates is
+            // `ResidentFormatMismatch` — a storage image's format comes from the
+            // specialized SPIR-V texel format and owes the mapping's declaration
+            // nothing — and no copy can serve those, so a boot where it is most
+            // of this counter is this arm working rather than failing.
+            crate::observe::off(format!(
+                "compute_dst_type11 bind={} mid={mapping_id} dims={width}x{height} held={held:?} reason={decline:?}",
+                tex.binding
+            ));
+            crate::runtime::drain::note_store_route("compute_dst_host_type11_unlicensed");
+            ComputeImageDestination::Host
+        }
     }
 }
 
@@ -4486,16 +4493,36 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 // previous dispatch's readback may have left an entry, and it
                 // is stale by exactly one frame. Same call, same reason, as
                 // both arms of the render rail's GVA Store.
-                if let TextureWriteback::Linear {
-                    gva, texture_ref, ..
-                } = &t.writeback
-                {
-                    crate::runtime::render_writeback::forget_gva_host_copies(
+                match &t.writeback {
+                    TextureWriteback::Linear {
+                        gva, texture_ref, ..
+                    } => crate::runtime::render_writeback::forget_gva_host_copies(
                         state,
                         task_id,
                         *gva,
                         *texture_ref,
-                    );
+                    ),
+                    // The surface-keyed rail owes more than a cache forget — a
+                    // resident storage window over these bytes and the mapping's
+                    // own written mark — and the render Store that shares this
+                    // destination owes exactly the same set. Both call it.
+                    //
+                    // The offsets are the staged ones rather than the licence's,
+                    // and they are the same offsets: `licence_type11_surface`
+                    // resolves the window through `type11_sample_window`, which
+                    // is where these came from when the texture was staged.
+                    TextureWriteback::Type11 {
+                        mapping_id,
+                        surface_offset,
+                        span_end,
+                        ..
+                    } => crate::runtime::mapping_write::note_type11_landed(
+                        state,
+                        *mapping_id,
+                        *surface_offset,
+                        *span_end,
+                    ),
+                    TextureWriteback::None => {}
                 }
             }
         }
