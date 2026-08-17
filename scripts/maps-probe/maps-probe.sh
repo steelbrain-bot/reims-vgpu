@@ -51,9 +51,25 @@ echo "tile server probe: $(cat "$OUT/tiles-reachable.txt" 2>/dev/null)"
 timeout 60 ssh -o BatchMode=yes macos-vm "open -a Maps" 2>/dev/null \
   || { echo "could not open Maps on the guest"; exit 3; }
 
-# Maps has to fetch, lay out and composite a first frame before any of this
-# means anything; a still-blank map draws nothing.
+# The reverted macOS snapshot presents Maps' own first-run sheet on every boot,
+# but it does so late: the process and even the map behind the sheet are visible
+# several seconds before the sheet accepts input. Wait for the same cold-start
+# interval the map itself needs, then follow the sheet's keyboard focus order:
+# its privacy link owns focus first, Tab moves to Continue, and Space activates
+# it. Return is not handled by this sheet. Do this before full-screen and before
+# the measurement mark: leaving the sheet up produces compositor heartbeats but
+# no map draws, which looks like a slow device instead of an unstarted workload.
 sleep 20
+"$Q" key tab spc >/dev/null 2>&1
+sleep 2
+# Continue advances to the snapshot's notification opt-in sheet. It has the
+# same focus order: Tab selects Not Now and Space accepts it without raising the
+# host notification permission prompt.
+"$Q" key tab spc >/dev/null 2>&1
+
+# Dismissing the sheets starts Maps' own first layout and tile fetch. Keep that
+# work out of the scored window; a still-blank map draws nothing.
+sleep 10
 
 read -r W H < <("$Q" size) || { echo "no display size"; exit 2; }
 echo "display ${W}x${H}"
@@ -128,6 +144,12 @@ tail -c "+$(( OFFSET + 1 ))" "$FAILLOG" >"$OUT/window.log"
 echo "drove $phase phases over ${SECS}s"
 
 "$SHOT" -o "$OUT/after.png" >/dev/null 2>&1 || echo "post-window screenshot failed"
+# Keep an out-of-window settled image beside the immediate one. The immediate
+# capture says what continuous interaction actually displayed; the settled one
+# separates a tile fetch still in flight from texture content that never became
+# visible at all. Neither delay nor capture contributes to the scored window.
+sleep 10
+"$SHOT" -o "$OUT/settled.png" >/dev/null 2>&1 || echo "settled screenshot failed"
 
 # Reading a captured window is not specific to this probe, so the analysis is
 # not carried here; `MAPS_ANALYZE` names it, and absent one the window is still
