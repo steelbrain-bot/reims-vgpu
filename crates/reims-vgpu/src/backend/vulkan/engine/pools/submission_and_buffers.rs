@@ -152,7 +152,6 @@ impl ResourcePools {
         device: &ash::Device,
         import_id: crate::runtime::guest_ram::ImportId,
     ) {
-        self.retire_direct_sampled_import(device, import_id.get());
         if let Some(parent) = self.host_ram_imports.retire(import_id) {
             crate::runtime::drain::note_store_route("guest_import_retired_now");
             self.dispose(device, DeferredHandle::GuestAllocation(parent));
@@ -165,7 +164,6 @@ impl ResourcePools {
         let sampled = self.sampled_live.len()
             + self.sampled_free.len()
             + self.sampled_cache.len()
-            + self.direct_sampled.len()
             + self.attachment_snapshot_live.len()
             + self.attachment_snapshot_free.len();
         let storage = self.storage_image_live.len()
@@ -249,7 +247,6 @@ impl ResourcePools {
             sampled_cache: Vec::new(),
             sampled_identity_index: HashMap::new(),
             sampled_cache_bytes: 0,
-            direct_sampled: HashMap::new(),
             sampled_victims: std::collections::VecDeque::new(),
             storage_image_free: FreePool::new(
                 STORAGE_IMAGE_FREE_CAP_PER_KEY,
@@ -631,7 +628,6 @@ impl ResourcePools {
         for slot in self.take_released_sampled_entries() {
             self.dispose(&ctx.device, DeferredHandle::RecycleSampled(slot));
         }
-        self.retire_released_direct_sampled(&ctx.device);
         self.retire_released_residents(ctx, counters, IDLE_RECYCLE_TRIM_PER_PASS);
         let trim_buffers = self.note_maintenance_settled();
         self.trim_recycle_pools(&ctx.device, IDLE_RECYCLE_TRIM_PER_PASS, trim_buffers);
@@ -1639,7 +1635,6 @@ impl ResourcePools {
         // trail's per-slot record is cleared again in `retire_slot`, so a slot
         // holding one is a submission whose fence has not signalled.
         crate::runtime::gpu_hang_trail::note_submit(self.cur, timeline);
-        self.publish_direct_sampled_transitions();
         self.admit_recorded_sampled(admissions);
     }
 
@@ -2058,7 +2053,6 @@ impl ResourcePools {
                 // `discard_sampled_cache` for why that is the right shape and
                 // not a shortcut.
                 self.discard_sampled_cache(&ctx.device);
-                self.discard_direct_sampled(&ctx.device);
                 Err(e)
             }
         }
@@ -3655,290 +3649,6 @@ impl ResourcePools {
         counters: &EngineCounters,
     ) -> Result<SampledSlot, DrawError> {
         unsafe { self.acquire_sampled_for(ctx, sk, counters, SampledTransientUse::Upload) }
-    }
-
-    /// Bind one decoded linear guest plane as an image over the allocation's
-    /// existing imported memory.  Every negative answer leaves the caller's
-    /// buffer-to-optimal-image path intact; no byte content is guessed or
-    /// cached here.
-    pub(crate) unsafe fn acquire_direct_sampled(
-        &mut self,
-        ctx: &DeviceContext,
-        source: &types::DirectGuestImageSource,
-        sampled: SampledKey,
-        owner: Option<&crate::model::TaskResourceLifetimeRef>,
-        counters: &EngineCounters,
-    ) -> Option<DirectSampledBinding> {
-        let Some(owner) = owner.filter(|owner| owner.is_live()) else {
-            crate::runtime::drain::note_store_route("direct_sampled_no_owner");
-            return None;
-        };
-        if source.import.is_retired() {
-            crate::runtime::drain::note_store_route("direct_sampled_import_retired");
-            return None;
-        }
-        if sampled.width == 0
-            || sampled.height == 0
-            || sampled.layers != 1
-            || sampled.volume
-            || sampled.cube
-            || sampled.arrayed
-            || sampled.one_dim
-        {
-            crate::runtime::drain::note_store_route("direct_sampled_shape");
-            return None;
-        }
-
-        let key = DirectSampledKey::of(source, sampled);
-        if let Some(entry) = self.direct_sampled.get_mut(&key) {
-            if entry.has_live_owner() && !entry.import_is_retired() {
-                entry.retain_owner(owner);
-                return match entry.state {
-                    DirectSampledState::Bound {
-                        image,
-                        view,
-                        layout,
-                        ..
-                    } => {
-                        crate::runtime::drain::note_store_route("direct_sampled_hit");
-                        Some(DirectSampledBinding {
-                            key,
-                            image,
-                            view,
-                            needs_transition: layout == DirectSampledLayout::NeedsTransition,
-                        })
-                    }
-                    DirectSampledState::Declined(decline) => {
-                        crate::runtime::drain::note_store_route("direct_sampled_declined_hit");
-                        crate::runtime::drain::note_store_route(decline.route());
-                        None
-                    }
-                };
-            }
-        }
-        if let Some(dead) = self.direct_sampled.remove(&key) {
-            if let DirectSampledState::Bound { image, view, .. } = dead.state {
-                self.dispose(&ctx.device, DeferredHandle::AliasedImage { image, view });
-            }
-        }
-
-        let verdict = unsafe {
-            crate::backend::vulkan::caps::linear_sampled::format_verdict(
-                &ctx.instance,
-                ctx.pd,
-                sampled.format,
-            )
-        };
-        if !verdict.device_conditions_hold() {
-            crate::runtime::drain::note_store_route(if verdict.dedicated_only {
-                "direct_sampled_dedicated_only"
-            } else if !verdict.importable {
-                "direct_sampled_format_not_importable"
-            } else if !verdict.sampled {
-                "direct_sampled_format_not_sampled"
-            } else {
-                "direct_sampled_format_not_filterable"
-            });
-            return None;
-        }
-
-        let allocation = match unsafe { self.host_ram_imports.ensure(ctx, &source.import) } {
-            Ok((allocation, _)) => allocation,
-            Err(inner) => {
-                crate::observe::Emit::decline("vk_direct_sampled_import", &inner)
-                    .fail_once(source.import.id().get());
-                return None;
-            }
-        };
-
-        let mut external = vk::ExternalMemoryImageCreateInfo::default()
-            .handle_types(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
-        let create = vk::ImageCreateInfo::default()
-            .flags(vk::ImageCreateFlags::ALIAS)
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(sampled.format)
-            .extent(vk::Extent3D {
-                width: sampled.width,
-                height: sampled.height,
-                depth: 1,
-            })
-            .mip_levels(1)
-            .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::LINEAR)
-            .usage(vk::ImageUsageFlags::SAMPLED)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .initial_layout(vk::ImageLayout::PREINITIALIZED)
-            .push_next(&mut external);
-        let image = match unsafe { ctx.device.create_image(&create, None) } {
-            Ok(image) => image,
-            Err(result) => {
-                let decline =
-                    DrawError::VkCall(VkCall::new(VkOp::PoolsCreateDirectSampledImage, result));
-                crate::observe::Emit::decline("vk_direct_sampled", &decline)
-                    .fail_once(source.import.id().get());
-                return None;
-            }
-        };
-        counters.note_create(CreateSite::SampledImage);
-
-        let requirements = unsafe { ctx.device.get_image_memory_requirements(image) };
-        if requirements.memory_type_bits & (1u32 << allocation.memory_type_index) == 0 {
-            unsafe { ctx.device.destroy_image(image, None) };
-            self.remember_direct_sampled_decline(key, owner, DirectSampledAdmission::MemoryType);
-            return None;
-        }
-        let layout = unsafe {
-            ctx.device.get_image_subresource_layout(
-                image,
-                vk::ImageSubresource {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
-                    array_layer: 0,
-                },
-            )
-        };
-        let memory_offset = match direct_sampled_memory_offset(source, layout, requirements) {
-            Ok(offset) => offset,
-            Err(decline) => {
-                unsafe { ctx.device.destroy_image(image, None) };
-                self.remember_direct_sampled_decline(key, owner, decline);
-                return None;
-            }
-        };
-        if let Err(result) = unsafe {
-            ctx.device
-                .bind_image_memory(image, allocation.memory, memory_offset)
-        } {
-            let decline = DrawError::VkCall(VkCall::new(VkOp::PoolsBindDirectSampled, result));
-            crate::observe::Emit::decline("vk_direct_sampled", &decline)
-                .fail_once(source.import.id().get());
-            unsafe { ctx.device.destroy_image(image, None) };
-            return None;
-        }
-        let view = match unsafe {
-            ctx.device.create_image_view(
-                &vk::ImageViewCreateInfo::default()
-                    .image(image)
-                    .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(sampled.format)
-                    .components(translate::pixel::vk_component_mapping(&sampled.swizzle))
-                    .subresource_range(super::color_subresource_range()),
-                None,
-            )
-        } {
-            Ok(view) => view,
-            Err(result) => {
-                let decline =
-                    DrawError::VkCall(VkCall::new(VkOp::PoolsCreateDirectSampledView, result));
-                crate::observe::Emit::decline("vk_direct_sampled", &decline)
-                    .fail_once(source.import.id().get());
-                unsafe { ctx.device.destroy_image(image, None) };
-                return None;
-            }
-        };
-        counters.note_create(CreateSite::SampledImageView);
-        self.direct_sampled.insert(
-            key,
-            DirectSampledEntry {
-                owners: vec![owner.clone()],
-                state: DirectSampledState::Bound {
-                    image,
-                    view,
-                    import: std::sync::Arc::clone(&source.import),
-                    layout: DirectSampledLayout::NeedsTransition,
-                },
-            },
-        );
-        crate::runtime::drain::note_store_route("direct_sampled_created");
-        Some(DirectSampledBinding {
-            key,
-            image,
-            view,
-            needs_transition: true,
-        })
-    }
-
-    fn remember_direct_sampled_decline(
-        &mut self,
-        key: DirectSampledKey,
-        owner: &crate::model::TaskResourceLifetimeRef,
-        decline: DirectSampledAdmission,
-    ) {
-        crate::runtime::drain::note_store_route(decline.route());
-        self.direct_sampled.insert(
-            key,
-            DirectSampledEntry {
-                owners: vec![owner.clone()],
-                state: DirectSampledState::Declined(decline),
-            },
-        );
-        crate::runtime::drain::note_store_route("direct_sampled_declined_remembered");
-    }
-
-    pub(crate) fn note_direct_sampled_transition_recorded(&mut self, key: DirectSampledKey) {
-        if let Some(entry) = self.direct_sampled.get_mut(&key) {
-            if let DirectSampledState::Bound { layout, .. } = &mut entry.state {
-                if *layout == DirectSampledLayout::NeedsTransition {
-                    *layout = DirectSampledLayout::TransitionRecorded;
-                }
-            }
-        }
-    }
-
-    fn publish_direct_sampled_transitions(&mut self) {
-        for entry in self.direct_sampled.values_mut() {
-            if let DirectSampledState::Bound { layout, .. } = &mut entry.state {
-                if *layout == DirectSampledLayout::TransitionRecorded {
-                    *layout = DirectSampledLayout::General;
-                }
-            }
-        }
-    }
-
-    pub(crate) unsafe fn discard_direct_sampled(&mut self, device: &ash::Device) {
-        let entries: Vec<_> = self
-            .direct_sampled
-            .drain()
-            .map(|(_, entry)| entry)
-            .collect();
-        for entry in entries {
-            if let DirectSampledState::Bound { image, view, .. } = entry.state {
-                self.dispose(device, DeferredHandle::AliasedImage { image, view });
-            }
-        }
-    }
-
-    unsafe fn retire_direct_sampled_import(&mut self, device: &ash::Device, import_id: u64) {
-        let keys: Vec<_> = self
-            .direct_sampled
-            .keys()
-            .filter(|key| key.import_id == import_id)
-            .copied()
-            .collect();
-        for key in keys {
-            if let Some(entry) = self.direct_sampled.remove(&key) {
-                if let DirectSampledState::Bound { image, view, .. } = entry.state {
-                    self.dispose(device, DeferredHandle::AliasedImage { image, view });
-                }
-            }
-        }
-    }
-
-    unsafe fn retire_released_direct_sampled(&mut self, device: &ash::Device) {
-        let keys: Vec<_> = self
-            .direct_sampled
-            .iter()
-            .filter(|(_, entry)| entry.import_is_retired() || !entry.has_live_owner())
-            .map(|(key, _)| *key)
-            .collect();
-        for key in keys {
-            if let Some(entry) = self.direct_sampled.remove(&key) {
-                if let DirectSampledState::Bound { image, view, .. } = entry.state {
-                    self.dispose(device, DeferredHandle::AliasedImage { image, view });
-                }
-            }
-        }
     }
 
     pub(crate) unsafe fn acquire_attachment_snapshot(

@@ -61,11 +61,8 @@ use ash::vk;
 ///
 /// **This query is for the allocation's universal buffer view.** An optimally
 /// tiled image backed by linear guest bytes is not a representation Vulkan
-/// offers.  A decoded linear texture may additionally alias this same imported
-/// memory through a `LINEAR` image, but only after the image-side external
-/// format query and the created image's pitch, offset, memory-type and bounds
-/// all agree; see [`super::linear_sampled`].  Every other image use reaches the
-/// bytes through this buffer and an explicit copy.
+/// offers. Image use reaches the bytes through this buffer and an explicit
+/// copy.
 pub const GUEST_IMPORT_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
     vk::BufferUsageFlags::TRANSFER_SRC.as_raw()
         | vk::BufferUsageFlags::TRANSFER_DST.as_raw()

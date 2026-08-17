@@ -746,7 +746,6 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
             // A fixture over a host `Vec` went through no witness, so the gather is
             // the only disposition available to it.
             reims_vgpu::runtime::gather_witness::GatherVouch::Fresh,
-            None,
         ),
         byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,

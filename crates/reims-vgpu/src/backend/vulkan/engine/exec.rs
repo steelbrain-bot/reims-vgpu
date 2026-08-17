@@ -1114,14 +1114,6 @@ fn guest_target_load(seed: Option<&super::types::GuestTargetSeed>) -> GuestTarge
 }
 
 enum PreparedSampled {
-    Direct {
-        binding: u32,
-        array_element: u32,
-        key: super::pools::DirectSampledKey,
-        image: vk::Image,
-        view: vk::ImageView,
-        needs_transition: bool,
-    },
     Upload {
         binding: u32,
         array_element: u32,
@@ -1197,8 +1189,7 @@ enum SnapshotTiming {
 impl PreparedSampled {
     fn binding(&self) -> u32 {
         match self {
-            Self::Direct { binding, .. }
-            | Self::Upload { binding, .. }
+            Self::Upload { binding, .. }
             | Self::Cached { binding, .. }
             | Self::Resident { binding, .. }
             | Self::Feedback { binding, .. }
@@ -1209,8 +1200,7 @@ impl PreparedSampled {
 
     fn array_element(&self) -> u32 {
         match self {
-            Self::Direct { array_element, .. }
-            | Self::Upload { array_element, .. }
+            Self::Upload { array_element, .. }
             | Self::Cached { array_element, .. }
             | Self::Resident { array_element, .. }
             | Self::Feedback { array_element, .. }
@@ -1221,7 +1211,6 @@ impl PreparedSampled {
 
     fn view(&self) -> vk::ImageView {
         match self {
-            Self::Direct { view, .. } => *view,
             Self::Upload { image, .. } => image.view,
             Self::Cached { image, .. } => image.view,
             Self::Resident { view, .. } => *view,
@@ -1237,7 +1226,6 @@ impl PreparedSampled {
             // reference name one image at one moment, so they are one answer.
             Self::Feedback { .. } => super::caches::color_feedback_layout(),
             Self::Resident { next_access, .. } => next_access.layout(),
-            Self::Direct { .. } => vk::ImageLayout::GENERAL,
             _ => vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         }
     }
@@ -1954,7 +1942,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 }
             }
             SampledSource::Bytes(_) => {}
-            SampledSource::GuestRuns(src, _, _) => {
+            SampledSource::GuestRuns(src, _) => {
                 // A cube's face ordering is not carried by this source. Arrays
                 // and volumes are ordinary consecutive image planes and the
                 // copy below consumes all of them.
@@ -3945,32 +3933,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     .sampled_gpu_binds
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            SampledSource::GuestRuns(src, vouch, direct) => {
-                if let Some(direct) = direct {
-                    if let Some(bound) = unsafe {
-                        pools.acquire_direct_sampled(
-                            ctx,
-                            direct,
-                            SampledKey::of(resource),
-                            resource.resource_lifetime.as_ref(),
-                            counters,
-                        )
-                    } {
-                        pools.note_guest_read_recorded();
-                        counters
-                            .sampled_gpu_binds
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        sampled.push(PreparedSampled::Direct {
-                            binding: resource.binding,
-                            array_element: resource.array_element,
-                            key: bound.key,
-                            image: bound.image,
-                            view: bound.view,
-                            needs_transition: bound.needs_transition,
-                        });
-                        continue;
-                    }
-                }
+            SampledSource::GuestRuns(src, vouch) => {
                 // A copy-backed producer vouches for its identity only when
                 // both halves of the guest-write witness say the window's bytes cannot have
                 // moved since the gather that filled the retained image: no
@@ -4600,41 +4563,6 @@ pub(crate) unsafe fn execute_draw_inner(
             &[],
             &barrier,
         );
-    }
-
-    // A new direct guest image starts PREINITIALIZED because its texels were
-    // written through the imported host allocation. Transition it once to
-    // GENERAL, the persistent layout used by every descriptor over that live
-    // resource. Subsequent binds in this command buffer observe the earlier
-    // barrier in queue order; submission publishes the layout to later CBs.
-    for direct in &sampled {
-        let PreparedSampled::Direct {
-            key,
-            image,
-            needs_transition: true,
-            ..
-        } = direct
-        else {
-            continue;
-        };
-        unsafe { outside_pass.before_record(PassObstacle::ResidentLayout, pools, &ctx.device, cb) };
-        let barrier = [vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::HOST_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ)
-            .old_layout(vk::ImageLayout::PREINITIALIZED)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .image(*image)
-            .subresource_range(super::color_subresource_range())];
-        ctx.device.cmd_pipeline_barrier(
-            cb,
-            vk::PipelineStageFlags::HOST,
-            vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &barrier,
-        );
-        pools.note_direct_sampled_transition_recorded(*key);
     }
 
     // CPU-origin sampled uploads.
@@ -5547,7 +5475,6 @@ pub(crate) unsafe fn execute_draw_inner(
         // `batch_flush` instead, on the same slot.
         unsafe { pools.gpu_span_seal_current(ctx, cb) };
         if let Err(e) = ctx.device.end_command_buffer(cb) {
-            pools.discard_direct_sampled(&ctx.device);
             return Err(DrawError::VkCall(VkCall::new(VkOp::ExecEndCb, e)));
         }
     }
@@ -5560,7 +5487,6 @@ pub(crate) unsafe fn execute_draw_inner(
         pools.recycle_staging();
         pools.recycle_readback();
         pools.recycle_sampled();
-        pools.discard_direct_sampled(&ctx.device);
         return Err(DrawError::DeviceLost(DeviceLostDecline::ForcedDraw));
     }
 
@@ -5569,14 +5495,12 @@ pub(crate) unsafe fn execute_draw_inner(
         match ctx.submit_guest_work(&cbs, fence) {
             Ok(timeline) => timeline,
             Err(e) if e == vk::Result::ERROR_DEVICE_LOST => {
-                pools.discard_direct_sampled(&ctx.device);
                 return Err(DrawError::DeviceLost(DeviceLostDecline::Driver {
                     op: DeviceLostOp::DrawSubmit,
                     result: e,
                 }));
             }
             Err(e) => {
-                pools.discard_direct_sampled(&ctx.device);
                 return Err(DrawError::VkCall(VkCall::new(VkOp::ExecSubmit, e)));
             }
         }
@@ -7060,7 +6984,6 @@ mod tests {
                     // No witness ran for a synthetic source, so nothing vouches:
                     // the gather is the only disposition this fixture can take.
                     crate::runtime::gather_witness::GatherVouch::Fresh,
-                    None,
                 ),
                 byte_origin: Default::default(),
                 format: crate::backend::vulkan::translate::pixel::vk_texel_layout(
@@ -7500,7 +7423,7 @@ mod tests {
         req.sampled_images[0].layers = 3;
         assert!(validate_v1(&req).is_ok());
 
-        let SampledSource::GuestRuns(source, _, _) = &mut req.sampled_images[0].source else {
+        let SampledSource::GuestRuns(source, _) = &mut req.sampled_images[0].source else {
             panic!("the fixture is guest-backed")
         };
         source.total_len -= 1;
@@ -7524,7 +7447,7 @@ mod tests {
     fn sampled_subrange_validates_inside_its_resource_owned_runs() {
         let mut req = guest_run_req(4, 4, 4 * 4 * 4, 0);
         {
-            let SampledSource::GuestRuns(source, _, _) = &mut req.sampled_images[0].source else {
+            let SampledSource::GuestRuns(source, _) = &mut req.sampled_images[0].source else {
                 panic!("the fixture is guest-backed")
             };
             source.source_offset = 32;
@@ -7536,7 +7459,7 @@ mod tests {
         assert!(validate_v1(&req).is_ok());
 
         {
-            let SampledSource::GuestRuns(source, _, _) = &mut req.sampled_images[0].source else {
+            let SampledSource::GuestRuns(source, _) = &mut req.sampled_images[0].source else {
                 panic!("the fixture is guest-backed")
             };
             source.runs = std::sync::Arc::new(vec![GuestRun {

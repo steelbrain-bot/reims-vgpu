@@ -363,12 +363,6 @@ pub(crate) struct ResourcePools {
     /// retained-reference bind independent of that population's size.
     sampled_identity_index: HashMap<GatheredName, usize>,
     sampled_cache_bytes: usize,
-    /// Linear image views over persistent guest allocations.  Entries are
-    /// named by allocation identity plus decoded plane geometry and live until
-    /// every serialized resource owner is gone.  There is no capacity or
-    /// eviction policy: dropping one would discard guest-owned resource state
-    /// and turn a stable binding back into per-draw object creation.
-    direct_sampled: HashMap<DirectSampledKey, DirectSampledEntry>,
     /// Entries invalidated when a submission failed after publication, most
     /// recent first and carrying no images — see [`SampledVictim`].
     sampled_victims: std::collections::VecDeque<SampledVictim>,
@@ -1039,13 +1033,6 @@ pub(crate) enum DeferredHandle {
         view: vk::ImageView,
         memory: vk::DeviceMemory,
     },
-    /// An image and view aliasing memory owned by a [`GuestAllocation`].  The
-    /// parent memory is not freed here; retirement destroys these aliases
-    /// before the allocation handle.
-    AliasedImage {
-        image: vk::Image,
-        view: vk::ImageView,
-    },
     /// An imported guest allocation and its whole-span buffer.
     GuestAllocation(host_ram::ImportedHostRam),
     /// A sampled-cache slot released at resource deletion or cache discard.
@@ -1081,7 +1068,7 @@ impl DeferredHandle {
     /// one, which is the only thing that makes this total.
     fn destroyed_view(&self) -> Option<vk::ImageView> {
         match self {
-            Self::Image { view, .. } | Self::AliasedImage { view, .. } => Some(*view),
+            Self::Image { view, .. } => Some(*view),
             Self::RecycleSampled(slot) => Some(slot.view),
             Self::RecycleTarget(img) => Some(img.view),
             Self::ImageView(view) => Some(*view),
@@ -1125,10 +1112,6 @@ impl ResourcePools {
                 if !self.slab.free_image(device, image) {
                     device.free_memory(memory, None);
                 }
-            }
-            DeferredHandle::AliasedImage { image, view } => {
-                device.destroy_image_view(view, None);
-                device.destroy_image(image, None);
             }
             DeferredHandle::GuestAllocation(parent) => parent.destroy(device),
             DeferredHandle::RecycleSampled(slot) => {
@@ -1254,275 +1237,6 @@ pub(crate) struct SampledKey {
     pub(crate) one_dim: bool,
     pub(crate) format: ash::vk::Format,
     pub(crate) swizzle: crate::contract::pixel_format::SwizzlePlan,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub(crate) struct DirectSampledKey {
-    import_id: u64,
-    resource_offset: u64,
-    resource_len: u64,
-    plane_offset: u64,
-    row_pitch: u64,
-    sampled: SampledKey,
-}
-
-impl DirectSampledKey {
-    fn of(source: &types::DirectGuestImageSource, sampled: SampledKey) -> Self {
-        Self {
-            import_id: source.import.id().get(),
-            resource_offset: source.resource_offset,
-            resource_len: source.resource_len,
-            plane_offset: source.plane_offset,
-            row_pitch: source.row_pitch,
-            sampled,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DirectSampledLayout {
-    NeedsTransition,
-    TransitionRecorded,
-    General,
-}
-
-struct DirectSampledEntry {
-    owners: Vec<crate::model::TaskResourceLifetimeRef>,
-    state: DirectSampledState,
-}
-
-enum DirectSampledState {
-    Bound {
-        image: vk::Image,
-        view: vk::ImageView,
-        import: std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
-        layout: DirectSampledLayout,
-    },
-    /// An exact image shape the host has already proved cannot alias this
-    /// resource. The verdict lives with the serialized resource just like a
-    /// successful image; retrying it cannot change the host requirements and
-    /// only repeats driver object creation on every encoder bind.
-    Declined(DirectSampledAdmission),
-}
-
-impl DirectSampledEntry {
-    fn has_live_owner(&self) -> bool {
-        self.owners.iter().any(|owner| owner.is_live())
-    }
-
-    fn retain_owner(&mut self, owner: &crate::model::TaskResourceLifetimeRef) {
-        self.owners.retain(|held| held.is_live());
-        if !self.owners.iter().any(|held| held.id() == owner.id()) {
-            self.owners.push(owner.clone());
-        }
-    }
-
-    fn import_is_retired(&self) -> bool {
-        match &self.state {
-            DirectSampledState::Bound { import, .. } => import.is_retired(),
-            DirectSampledState::Declined(_) => false,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct DirectSampledBinding {
-    pub(crate) key: DirectSampledKey,
-    pub(crate) image: vk::Image,
-    pub(crate) view: vk::ImageView,
-    pub(crate) needs_transition: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DirectSampledAdmission {
-    ResourceBounds,
-    RowPitch,
-    SubresourceOffset,
-    BindAlignment,
-    MemoryType,
-    MemoryBounds,
-}
-
-impl DirectSampledAdmission {
-    fn route(self) -> &'static str {
-        match self {
-            Self::ResourceBounds => "direct_sampled_resource_bounds",
-            Self::RowPitch => "direct_sampled_row_pitch",
-            Self::SubresourceOffset => "direct_sampled_subresource_offset",
-            Self::BindAlignment => "direct_sampled_bind_alignment",
-            Self::MemoryType => "direct_sampled_memory_type",
-            Self::MemoryBounds => "direct_sampled_memory_bounds",
-        }
-    }
-}
-
-/// Reconcile the guest plane's allocation coordinate with the implementation's
-/// linear-image subresource coordinate.  The returned offset is the exact
-/// `vkBindImageMemory` offset; every byte in the image requirements remains
-/// inside both the decoded resource and its parent import.
-fn direct_sampled_memory_offset(
-    source: &types::DirectGuestImageSource,
-    layout: vk::SubresourceLayout,
-    requirements: vk::MemoryRequirements,
-) -> Result<u64, DirectSampledAdmission> {
-    let resource_end = direct_sampled_resource_end(source)?;
-    if source.row_pitch == 0 || layout.row_pitch != source.row_pitch {
-        return Err(DirectSampledAdmission::RowPitch);
-    }
-    let memory_offset = source
-        .plane_offset
-        .checked_sub(layout.offset)
-        .ok_or(DirectSampledAdmission::SubresourceOffset)?;
-    if memory_offset < source.resource_offset {
-        return Err(DirectSampledAdmission::SubresourceOffset);
-    }
-    if requirements.alignment == 0 || !memory_offset.is_multiple_of(requirements.alignment) {
-        return Err(DirectSampledAdmission::BindAlignment);
-    }
-    let image_end = memory_offset
-        .checked_add(requirements.size)
-        .ok_or(DirectSampledAdmission::MemoryBounds)?;
-    if image_end > resource_end || image_end > source.import.len() {
-        return Err(DirectSampledAdmission::MemoryBounds);
-    }
-    Ok(memory_offset)
-}
-
-fn direct_sampled_resource_end(
-    source: &types::DirectGuestImageSource,
-) -> Result<u64, DirectSampledAdmission> {
-    let resource_end = source
-        .resource_offset
-        .checked_add(source.resource_len)
-        .ok_or(DirectSampledAdmission::ResourceBounds)?;
-    if source.resource_len == 0
-        || source.resource_offset > source.plane_offset
-        || resource_end > source.import.len()
-    {
-        return Err(DirectSampledAdmission::ResourceBounds);
-    }
-    Ok(resource_end)
-}
-
-#[cfg(test)]
-mod direct_sampled_admission_tests {
-    use super::*;
-
-    fn source() -> types::DirectGuestImageSource {
-        types::DirectGuestImageSource {
-            import: std::sync::Arc::new(
-                crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
-                    0x1000_0000,
-                    0x10_000,
-                    0x1000,
-                )
-                .expect("aligned import"),
-            ),
-            resource_offset: 0x1000,
-            resource_len: 0x8000,
-            plane_offset: 0x1200,
-            row_pitch: 256,
-        }
-    }
-
-    fn layout() -> vk::SubresourceLayout {
-        vk::SubresourceLayout {
-            offset: 0x200,
-            row_pitch: 256,
-            ..Default::default()
-        }
-    }
-
-    fn requirements() -> vk::MemoryRequirements {
-        vk::MemoryRequirements {
-            size: 0x4000,
-            alignment: 0x1000,
-            memory_type_bits: u32::MAX,
-        }
-    }
-
-    #[test]
-    fn direct_image_bind_offset_reconciles_the_two_declared_coordinates() {
-        assert_eq!(
-            direct_sampled_memory_offset(&source(), layout(), requirements()),
-            Ok(0x1000)
-        );
-    }
-
-    #[test]
-    fn direct_image_admission_requires_exact_pitch_alignment_and_resource_bounds() {
-        let mut wrong_pitch = layout();
-        wrong_pitch.row_pitch += 32;
-        assert_eq!(
-            direct_sampled_memory_offset(&source(), wrong_pitch, requirements()),
-            Err(DirectSampledAdmission::RowPitch)
-        );
-
-        let mut misaligned = source();
-        misaligned.plane_offset += 1;
-        assert_eq!(
-            direct_sampled_memory_offset(&misaligned, layout(), requirements()),
-            Err(DirectSampledAdmission::BindAlignment)
-        );
-
-        let mut short = source();
-        short.resource_len = 0x3000;
-        assert_eq!(
-            direct_sampled_memory_offset(&short, layout(), requirements()),
-            Err(DirectSampledAdmission::MemoryBounds)
-        );
-
-        let mut before_resource = source();
-        before_resource.plane_offset = 0x1100;
-        assert_eq!(
-            direct_sampled_memory_offset(&before_resource, layout(), requirements()),
-            Err(DirectSampledAdmission::SubresourceOffset)
-        );
-    }
-
-    #[test]
-    fn direct_image_residency_ends_with_its_serialized_resource() {
-        let resource = std::sync::Arc::new(crate::model::TaskResource::new(
-            Default::default(),
-            std::sync::Arc::from([]),
-        ));
-        let owner = resource.lifetime_ref();
-        let entry = DirectSampledEntry {
-            owners: vec![owner],
-            state: DirectSampledState::Bound {
-                image: vk::Image::null(),
-                view: vk::ImageView::null(),
-                import: source().import,
-                layout: DirectSampledLayout::General,
-            },
-        };
-        assert!(entry.has_live_owner());
-        drop(resource);
-        assert!(!entry.has_live_owner());
-    }
-
-    #[test]
-    fn direct_image_decline_ends_with_its_serialized_resource() {
-        let resource = std::sync::Arc::new(crate::model::TaskResource::new(
-            Default::default(),
-            std::sync::Arc::from([]),
-        ));
-        let owner = resource.lifetime_ref();
-        let entry = DirectSampledEntry {
-            owners: vec![owner],
-            state: DirectSampledState::Declined(DirectSampledAdmission::RowPitch),
-        };
-
-        assert!(entry.has_live_owner());
-        assert!(!entry.import_is_retired());
-        assert!(matches!(
-            entry.state,
-            DirectSampledState::Declined(DirectSampledAdmission::RowPitch)
-        ));
-
-        drop(resource);
-        assert!(!entry.has_live_owner());
-    }
 }
 
 impl SampledKey {

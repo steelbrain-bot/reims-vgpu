@@ -839,11 +839,6 @@ pub(super) enum SampledSourceRequest {
     /// an optional copied-content identity, and what the guest-write witness
     /// says that identity is worth (see [`crate::runtime::gather_witness`]).
     ///
-    /// A resource-owned direct image reads the live allocation and does not
-    /// consume the copied-content identity. The same request still carries one:
-    /// exact direct-image admission belongs to the backend, so a declined
-    /// candidate must let the copied fallback retain and reuse the gathered
-    /// image under the ordinary guest-write witness.
     /// The last field is the **format's own** channel plan, not the guest's
     /// view swizzle: this rail binds guest bytes untouched, so a format whose
     /// Metal channels do not sit identically on the Vulkan format carrying them
@@ -859,10 +854,6 @@ pub(super) enum SampledSourceRequest {
         ash::vk::Format,
         /// Consecutive depth planes carried by the source window.
         u32,
-        /// Persistent allocation geometry for a direct linear image.  Present
-        /// only when the decoded texture owns one contiguous retained
-        /// allocation; page-run fallbacks do not manufacture it.
-        Option<crate::backend::vulkan::engine::DirectGuestImageSource>,
         Option<LinearSampleIdentity>,
         crate::runtime::gather_witness::GatherVouch,
         pixel_format::SwizzlePlan,
@@ -2694,12 +2685,11 @@ fn coalesce_pages_to_runs<M: HostOps>(
 // Each argument is an independently decoded piece of the guest's sampled-source
 // contract; grouping them into a struct would only move the same fields.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn direct_linear_sample_from_packed(
+pub(super) fn linear_sample_from_packed(
     packed: &crate::runtime::bound_buffers::PackedBuffer,
     level_offset: u64,
     span: u64,
     row_length_texels: u32,
-    row_pitch: u64,
     native: TexelLayout,
     format: ash::vk::Format,
     identity: LinearSampleIdentity,
@@ -2711,13 +2701,6 @@ pub(super) fn direct_linear_sample_from_packed(
         native,
         format,
         1,
-        Some(crate::backend::vulkan::engine::DirectGuestImageSource {
-            import: std::sync::Arc::clone(&packed.import),
-            resource_offset: packed.head,
-            resource_len: packed.size,
-            plane_offset: packed.head.checked_add(level_offset)?,
-            row_pitch,
-        }),
         Some(identity),
         vouch,
         native_components,
@@ -3774,12 +3757,11 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
             },
         );
         if planes == 1 {
-            let request = direct_linear_sample_from_packed(
+            let request = linear_sample_from_packed(
                 &packed,
                 layout.offset,
                 span,
                 row_length_texels,
-                layout.row_stride,
                 native,
                 sampled_vk_format,
                 LinearSampleIdentity::from(seen.identity),
@@ -3802,7 +3784,6 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                 native,
                 sampled_vk_format,
                 planes,
-                None,
                 Some(LinearSampleIdentity::from(seen.identity)),
                 seen.vouch,
                 native_components,
@@ -3856,7 +3837,6 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
             native,
             sampled_vk_format,
             planes,
-            None,
             Some(LinearSampleIdentity::from(seen.identity)),
             seen.vouch,
             native_components,
@@ -3948,7 +3928,6 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
         native,
         sampled_vk_format,
         1,
-        None,
         Some(identity),
         vouch,
         // Identity: this rail admitted the format only after checking its plan
@@ -4029,7 +4008,6 @@ pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
         native,
         sampled_vk_format,
         1,
-        None,
         Some(identity),
         vouch,
         // Identity: this rail admitted the format only after checking its plan
@@ -6407,7 +6385,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         _native,
                         format,
                         planes,
-                        direct,
                         identity,
                         vouch,
                         components,
@@ -6416,7 +6393,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         sampled_components = components;
                         source_planes = planes;
                         bytes_identity = identity;
-                        crate::backend::vulkan::engine::SampledSource::GuestRuns(src, vouch, direct)
+                        crate::backend::vulkan::engine::SampledSource::GuestRuns(src, vouch)
                     }
                 };
                 let array_element = reflected_descriptor

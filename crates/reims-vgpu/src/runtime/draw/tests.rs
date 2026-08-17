@@ -274,8 +274,7 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
     let type5_witnesses = crate::runtime::drain::store_route_count("gw_rail_t5");
     let type11 = try_type11_sample_zero_copy(&mut state, &mut host, mid, 128, 128)
         .expect("the mapping's color plane is sampleable");
-    let SampledSourceRequest::GuestRuns(type11, _, type11_format, _, _, type11_identity, ..) =
-        type11
+    let SampledSourceRequest::GuestRuns(type11, _, type11_format, _, type11_identity, ..) = type11
     else {
         panic!("the mapping stays guest-backed")
     };
@@ -308,7 +307,7 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
         },
     )
     .expect("the serialized plane view is sampleable");
-    let SampledSourceRequest::GuestRuns(type5, _, type5_format, _, _, type5_identity, ..) = type5
+    let SampledSourceRequest::GuestRuns(type5, _, type5_format, _, type5_identity, ..) = type5
     else {
         panic!("the plane view stays guest-backed")
     };
@@ -5449,7 +5448,7 @@ fn gva_target_backing_retains_the_declared_parent_allocation() {
 
 #[test]
 #[cfg(feature = "backend-vulkan")]
-fn sampled_plane_keeps_the_packed_allocation_and_checks_its_extent() {
+fn sampled_plane_keeps_its_copy_source_and_checks_the_packed_extent() {
     use crate::runtime::bound_buffers::PackedBuffer;
     use crate::runtime::guest_ram::GuestRamImport;
 
@@ -5472,12 +5471,11 @@ fn sampled_plane_keeps_the_packed_allocation_and_checks_its_extent() {
         pages: std::sync::Arc::new(Vec::new()),
     };
     assert!(
-        super::vulkan::direct_linear_sample_from_packed(
+        super::vulkan::linear_sample_from_packed(
             &packed,
             0x7000,
             0x1001,
             128,
-            512,
             crate::contract::pixel_format::TexelLayout::Rgba8,
             ash::vk::Format::R8G8B8A8_UNORM,
             super::vulkan::LinearSampleIdentity {
@@ -5495,12 +5493,11 @@ fn sampled_plane_keeps_the_packed_allocation_and_checks_its_extent() {
     let page_list_owners = std::sync::Arc::strong_count(&packed.gpas);
     let run_owners = std::sync::Arc::strong_count(&packed.runs);
     let guest_ref_owners = std::sync::Arc::strong_count(&packed.pages);
-    let request = super::vulkan::direct_linear_sample_from_packed(
+    let request = super::vulkan::linear_sample_from_packed(
         &packed,
         0x1000,
         0x2000,
         128,
-        512,
         crate::contract::pixel_format::TexelLayout::Rgba8,
         ash::vk::Format::R8G8B8A8_UNORM,
         super::vulkan::LinearSampleIdentity {
@@ -5510,29 +5507,24 @@ fn sampled_plane_keeps_the_packed_allocation_and_checks_its_extent() {
         crate::runtime::gather_witness::GatherVouch::Fresh,
         crate::contract::pixel_format::SwizzlePlan::default(),
     )
-    .expect("the retained allocation directly supplies this plane");
+    .expect("the retained allocation supplies this plane's copy source");
     let super::vulkan::SampledSourceRequest::GuestRuns(
         source,
         _,
         _,
         1,
-        Some(direct),
         Some(identity),
         crate::runtime::gather_witness::GatherVouch::Fresh,
         _,
     ) = request
     else {
-        panic!("a direct candidate must retain the copied fallback identity")
+        panic!("a packed source must retain its copied-content identity")
     };
     assert_eq!((identity.key, identity.generation), (1, 1));
-    assert_eq!(direct.plane_offset, 0x1800);
-    assert_eq!(direct.resource_offset, 0x800);
-    assert_eq!(direct.resource_len, 0x6000);
-    assert_eq!(direct.row_pitch, 512);
     assert_eq!(
         std::sync::Arc::strong_count(&packed.import),
-        import_owners + 1,
-        "the direct image retains the allocation it aliases"
+        import_owners,
+        "the execution source retains bounded references rather than the whole allocation"
     );
     assert_eq!(
         std::sync::Arc::strong_count(&packed.gpas),

@@ -43,9 +43,6 @@ use crate::runtime::guest_ram::{GuestRamError, GuestRamImport, GuestRef};
 pub(crate) struct ImportedHostRam {
     pub buffer: vk::Buffer,
     pub memory: vk::DeviceMemory,
-    /// Memory type selected for this pointer.  A linear image may alias this
-    /// allocation only when its own requirements include the same type.
-    pub memory_type_index: u32,
     /// Bytes the import covers. The buffer spans all of it, so every
     /// [`crate::runtime::guest_ram::BoundRange`] inside the import is a valid
     /// offset into this one buffer.
@@ -482,7 +479,6 @@ unsafe fn import_ramblock(
             Ok(()) => Ok(ImportedHostRam {
                 buffer,
                 memory,
-                memory_type_index,
                 size,
             }),
             Err(result) => {
