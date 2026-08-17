@@ -1453,6 +1453,28 @@ pub enum ComputeImageDestination {
     ///
     /// Carries the same [`super::GuestPageTarget`] the render rail writes through, so
     /// the guest-window geometry has exactly one spelling in this crate.
+    ///
+    /// # Why the guest cannot see these pages before the copy lands
+    ///
+    /// The copy is only *submitted*, so the ordering argument is the whole
+    /// licence for this variant, and it is inherited rather than built. Arming
+    /// `record_guest_write_debt` sets the process-global `GUEST_WRITE_DEBT`,
+    /// which makes `guest_access_outstanding()` true, which removes
+    /// `StampOrder::CpuReady` from the answers
+    /// `runtime::drain::stamp_word_order_on_fifo` may give. The stamp is then
+    /// handed to `write_completion_stamp`, and the completion thread waits the
+    /// queue's monotonic timeline before it release-stores the word the guest
+    /// polls. This dispatch submitted through the same `ResourcePools` ring and
+    /// the same `submit_guest_work` the render rail uses, so its timeline value
+    /// is below the awaited one and the bytes are in RAM before the guest is
+    /// told anything.
+    ///
+    /// Nothing in that chain names a rail — it is the contract the render rail
+    /// happened to be the only caller of. Two things it is easy to misread:
+    /// the `settle_guest_writes` in `write_stamp` is on the *declined* path
+    /// only and is not what carries a healthy boot, and `write_completion_stamp`
+    /// takes only the *read* debt, deliberately leaving this write debt set so
+    /// later stamps stay ordered until a host reader settles it.
     GuestPages(Box<super::GuestPageTarget>),
 }
 
