@@ -37,7 +37,7 @@ use crate::runtime::decode::resource::{
     OBJECT_TYPE_TEXTURE_VIEW, OBJECT_TYPE_TYPE7, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE,
     TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
 };
-use crate::runtime::draw::host_alloc_len;
+use crate::runtime::draw::{host_alloc_len, StoreTargetPages};
 use crate::runtime::gva_mem;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::mapper;
@@ -1302,7 +1302,10 @@ enum TextureWriteback {
         /// whether it is still this texture's memory. Empty when the stage-time
         /// walk resolved nothing, which leaves the write unbounded exactly as
         /// it was — the writer's own walk fails closed on its own terms.
-        pages: std::collections::HashSet<u64>,
+        ///
+        /// Ordered as well as a membership set, because the GPU-direct arm reads
+        /// index `i` as page `i` of the window. See [`staged_window_pages`].
+        pages: StoreTargetPages,
     },
     Type11 {
         mapping_id: u32,
@@ -1317,10 +1320,27 @@ enum TextureWriteback {
 
 /// Guest pages a linear storage window resolves to at stage time.
 ///
-/// Taken before the dispatch so the set names the memory the *command* was
-/// issued against, not whatever the address points at once the GPU is done.
-/// An empty set means the walk resolved nothing and the writeback stays
+/// Taken before the dispatch so the record names the memory the *command* was
+/// issued against, not whatever the address points at once the GPU is done. An
+/// empty record means the walk resolved nothing and the writeback stays
 /// unbounded, which is what it was before this existed.
+///
+/// # Why this keeps the walk's order and not just its membership
+///
+/// The walk visits every page of the span in guest-virtual order and reports an
+/// unresolved one as `None` rather than skipping it. Collecting straight into a
+/// `HashSet` — which this did — throws both of those away, and neither can be
+/// recovered afterwards: sorting the set yields ascending *physical* order,
+/// which is not the window's order once the guest's mapping is scattered, and
+/// nothing in a set says whether a page went missing.
+///
+/// The row-by-row host writer only ever asked "is this page one of mine?", so
+/// the loss did not show. A GPU-direct copy asks the other question — it reads
+/// index `i` as page `i` of the window — and a short or reordered vector lands
+/// the frame at the wrong guest addresses with nothing noticing, because the
+/// copy converts nothing and checks nothing. [`StoreTargetPages`] is the render
+/// rail's existing answer to exactly this and carries both forms from the one
+/// walk, so this rail takes that type rather than growing a third spelling.
 fn staged_window_pages<M: HostMemory>(
     state: &DeviceState,
     host: &M,
@@ -1328,11 +1348,22 @@ fn staged_window_pages<M: HostMemory>(
     gva: u64,
     row_stride: u64,
     height: u32,
-) -> std::collections::HashSet<u64> {
+) -> StoreTargetPages {
     let Some(span) = row_stride.checked_mul(height as u64) else {
-        return std::collections::HashSet::new();
+        return StoreTargetPages::empty();
     };
-    staged_span_pages(state, host, task_id, gva, span)
+    if gva == 0 || span == 0 {
+        return StoreTargetPages::empty();
+    }
+    let ordered = crate::runtime::gva_mem::task_gva_page_gpas(
+        host,
+        &state.tasks,
+        task_id,
+        gva,
+        span,
+        state.page_shift,
+    );
+    StoreTargetPages::from_ordered(&ordered, span)
 }
 
 /// [`staged_window_pages`] for a flat span — the buffer rail's shape.
@@ -2934,7 +2965,7 @@ fn writeback_texture<M: HostMemory + HostOps>(
                 *height,
                 &tex.bytes,
                 &format!("bind={}", tex.binding),
-                (!pages.is_empty()).then_some(pages),
+                (!pages.membership().is_empty()).then_some(pages.membership()),
             ) {
                 LinearWrite::Written => {
                     // The mirror above cached these bytes as unevictable

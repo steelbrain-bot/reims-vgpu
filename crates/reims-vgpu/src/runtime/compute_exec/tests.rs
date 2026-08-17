@@ -1612,7 +1612,7 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
         residency: None,
         serve: None,
         writeback: TextureWriteback::Linear {
-            pages: Default::default(),
+            pages: crate::runtime::draw::StoreTargetPages::empty(),
             texture_ref,
             gva,
             pixel_format: MTL_FORMAT_RGBA8_UNORM,
@@ -2274,6 +2274,83 @@ fn a_staged_buffer_carries_the_pages_its_writeback_is_bounded_to() {
     // so the writeback stays unbounded and the writer fails closed itself.
     assert!(staged_span_pages(&state, &host, 1, 0, 0x100).is_empty());
     assert!(staged_span_pages(&state, &host, 1, page, 0).is_empty());
+}
+
+/// A staged window keeps the walk's *order*, and a scattered mapping proves it.
+///
+/// The compute rail carried its destination pages as a bare `HashSet`, which is
+/// enough to bound a write and not enough to place one: a direct copy into guest
+/// pages hands its runs to `references_for_runs`, which consumes them in
+/// **guest-virtual** order. For a scattered mapping that order is not ascending
+/// GPA, so recovering it by sorting the set would land the window's rows in the
+/// wrong pages — silently, with every page still inside the write bound.
+///
+/// The mapping here descends: virtual page `i` sits at pfn `pt_base + 7 - i`, so
+/// a sorted set would answer with the runs reversed. The second half pins the
+/// other thing a set cannot say — whether the walk resolved every page it was
+/// asked for.
+#[test]
+fn a_staged_window_records_its_pages_in_guest_virtual_order() {
+    use crate::contract::endian::st32;
+    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let (dir_pfn, root_pfn, pt_base) = (2u32, 3u32, 4u32);
+    let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
+    let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x4000, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    let _ = host.write_gpa(dir_gpa, &d);
+    for i in 0..8u32 {
+        let pfn = pt_base + 7 - i;
+        host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
+        let mut pte = [0u8; 4];
+        st32(&mut pte, pfn);
+        let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
+    }
+    state.define_task(1, 0x1000, dir_pfn);
+
+    let page = 1u64 << PAGE_SHIFT_ARM64E;
+    let gpa_of = |pfn: u32| (pfn as u64) << PAGE_SHIFT_ARM64E;
+    let gva = page; // virtual page 1
+
+    let pages = staged_window_pages(&state, &host, 1, gva, page, 3);
+    let want = [gpa_of(pt_base + 6), gpa_of(pt_base + 5), gpa_of(pt_base + 4)];
+    assert_eq!(
+        pages.ordered_complete(gva, page),
+        Some(&want[..]),
+        "the record must read in GVA order, not ascending GPA"
+    );
+    assert_eq!(
+        pages.membership().len(),
+        3,
+        "and it bounds the same three pages a set would have"
+    );
+
+    // A walk that could not resolve every page of its span refuses to place
+    // anything, rather than answering with the pages it did find.
+    let short_gva = page * 7;
+    let short = staged_window_pages(&state, &host, 1, short_gva, page, 2);
+    assert!(
+        !short.membership().is_empty(),
+        "the page that did resolve is still bound"
+    );
+    assert!(
+        short.ordered_complete(short_gva, page).is_none(),
+        "an incomplete walk cannot be placed"
+    );
+
+    // Nothing to walk records nothing, which is distinct from a complete record
+    // of zero pages — no span can produce one of those.
+    assert!(staged_window_pages(&state, &host, 1, 0, page, 3)
+        .membership()
+        .is_empty());
+    assert!(staged_window_pages(&state, &host, 1, gva, 0, 3)
+        .membership()
+        .is_empty());
 }
 
 /// The two halves of a resident answer partition; neither rail can see both.

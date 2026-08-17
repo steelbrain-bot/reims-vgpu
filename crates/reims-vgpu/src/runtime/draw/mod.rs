@@ -4871,12 +4871,31 @@ impl StoreTargetPages {
     /// Reconstitute a transfer destination from a live resource's retained
     /// backing. The entries are physical page identities; bounded guest slices
     /// are created only when the backend submits the transfer.
-    #[cfg(feature = "backend-vulkan")]
+    ///
+    /// Not gated on the Vulkan backend: the compute rail builds one on every
+    /// arm, because a page record present on only one of them would make the two
+    /// arms disagree about what a staged window's authorisation is — the same
+    /// reason the struct itself holds both fields unconditionally.
     pub(crate) fn from_ordered(ordered: &[u64], span: u64) -> Self {
         Self {
             ordered: ordered.to_vec(),
             set: ordered.iter().copied().collect(),
             span,
+        }
+    }
+
+    /// The record a walk that resolved nothing leaves behind.
+    ///
+    /// Not the same as a complete record of zero pages, and no span can produce
+    /// one: [`Self::ordered_complete`] asks for `pages_spanned(gva, span)`
+    /// entries, which is at least one for every non-empty span, so a consumer
+    /// meets a refusal here rather than a window that reads as having nothing
+    /// in it.
+    pub(crate) fn empty() -> Self {
+        Self {
+            ordered: Vec::new(),
+            set: std::collections::HashSet::new(),
+            span: 0,
         }
     }
 
