@@ -1498,37 +1498,66 @@ impl GvaPlaneDestination {
 /// already holds and whose destination is a linear guest allocation is another,
 /// and it is the same copy — the two differ only in where the geometry and the
 /// page licence came from.
+/// A licensed direct-to-guest-pages destination: where the bytes go, which
+/// pages the licence covers, and how many bytes land.
+///
+/// The two rails that write guest pages from the GPU — a render Store and a
+/// compute storage-image output — differ only in the image they copy *from* and
+/// in which command buffer records the copy. Everything about the destination is
+/// this, so it is derived once and the second rail cannot spell any of it
+/// differently.
 #[cfg(feature = "backend-vulkan")]
-pub(crate) fn copy_resident_into_gva_plane<M: HostMemory + HostOps>(
+pub(crate) struct GvaPlaneLicence {
+    pub target: crate::backend::vulkan::engine::GuestPageTarget,
+    /// The pages walked, in guest-virtual order — what the copy is licensed
+    /// over and what every witness on this path is armed against.
+    pub gpas: Vec<u64>,
+    /// The bytes from `target_gva` the copy will land. The caller's return
+    /// value, and what the counters on this path are charged.
+    pub extent: u64,
+}
+
+/// Resolve a guest-linear plane into a destination the GPU may copy into, or
+/// the typed reason it may not.
+///
+/// `held` is the format the source image actually holds. **A copy converts
+/// nothing** — neither `vkCmdCopyImageToBuffer` nor the blit behind the
+/// rectangle plan performs a channel swap or a texel resize — so a source whose
+/// format is not the one the guest will read these bytes back as must be refused
+/// here rather than landed. That is the whole of the format contract on this
+/// rail, and it is stated once so neither caller can state it differently.
+///
+/// The comparison is between whole formats, not channel orders. While every
+/// resident was eight bits per channel an order was a complete description of
+/// one, so `is_bgra() != (order == Bgra8)` decided this. It is not any more:
+/// `RGBA16_FLOAT` and `RGBA8_UNORM` are both RGBA-ordered and are four bytes per
+/// texel apart, so an order comparison would admit a half-float destination over
+/// an eight-bit source and copy a frame of the wrong size and the wrong texel
+/// into the guest's pages.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn licence_gva_plane<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
-    task_id: u32,
-    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    held: ash::vk::Format,
     c0: &GvaPlaneDestination,
     pages: Option<&crate::runtime::draw::StoreTargetPages>,
-) -> Result<u64, GvaWritebackDecline> {
-    let geometry = c0.geometry()?;
-    // Compared as whole formats, not as channel orders.
-    //
-    // While every resident was eight bits per channel an order was a complete
-    // description of one, so `is_bgra() != (order == Bgra8)` decided this. It is
-    // not any more: `RGBA16_FLOAT` and `RGBA8_UNORM` are both RGBA-ordered and
-    // are four bytes per texel apart, so an order comparison would admit a
-    // half-float destination over an eight-bit resident and copy a frame of the
-    // wrong size and the wrong texel into the guest's pages.
+) -> Result<GvaPlaneLicence, GvaWritebackDecline> {
     let GvaPlaneGeometry {
         want,
         bpt,
         row_stride,
         extent,
-    } = geometry;
-    let held = identity.resident_format();
-    // A healthy zero on the rail as it stands: `gva_chain_identity` builds the
-    // key from this same `c0.format`, so the two agree by construction and this
-    // arm is the alarm for an identity that came from somewhere else. It is also
-    // the arm that catches the honest disagreement — a guest format whose
-    // resident fell back to eight bits because the host cannot render to it —
-    // and sends that Store down the CPU conversion rail where it belongs.
+    } = c0.geometry()?;
+    // On the render rail this is a healthy zero as things stand:
+    // `gva_chain_identity` builds the key from this same `c0.format`, so the two
+    // agree by construction and this arm is the alarm for an identity that came
+    // from somewhere else. It is also the arm that catches the honest
+    // disagreement — a guest format whose resident fell back to eight bits
+    // because the host cannot render to it — and sends that Store down the CPU
+    // conversion rail where it belongs. On the compute rail it is not a healthy
+    // zero: a storage image takes its format from the specialized SPIR-V texel
+    // format, which can legitimately differ from the guest surface's, and this
+    // is what stops those bytes being landed raw.
     if held != want {
         return Err(GvaWritebackDecline::ResidentFormatMismatch { held, want });
     }
@@ -1568,10 +1597,36 @@ pub(crate) fn copy_resident_into_gva_plane<M: HostMemory + HostOps>(
     // decline is invisible to every reader. Before the submit and not after it,
     // and over the whole walked span rather than the copy's extent: a spurious
     // bump costs a re-read of bytes that did not change, and the opposite error
-    // hands out a stale copy.
+    // hands out a stale copy. It is armed here, past the last refusal, so a
+    // caller that goes on to fail its submit has over-recorded rather than
+    // under-recorded — the direction that costs a re-read instead of a wrong
+    // frame.
     state.note_host_wrote_pages(gpas.to_vec());
-    crate::backend::vulkan::engine::copy_target_to_guest_pages(identity, &target, gpas)
+    Ok(GvaPlaneLicence {
+        target,
+        gpas: gpas.to_vec(),
+        extent,
+    })
+}
+
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn copy_resident_into_gva_plane<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    c0: &GvaPlaneDestination,
+    pages: Option<&crate::runtime::draw::StoreTargetPages>,
+) -> Result<u64, GvaWritebackDecline> {
+    let licence = licence_gva_plane(state, host, identity.resident_format(), c0, pages)?;
+    let GvaPlaneLicence {
+        target,
+        gpas,
+        extent,
+    } = &licence;
+    crate::backend::vulkan::engine::copy_target_to_guest_pages(identity, target, gpas)
         .map_err(|inner| GvaWritebackDecline::Engine { inner })?;
+    let extent = *extent;
     // Nothing here leaves a host copy of the frame, so neither GVA-keyed cache
     // may go on naming one.
     forget_gva_host_copies(state, task_id, c0.target_gva, c0.texture_ref);
