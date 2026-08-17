@@ -2267,26 +2267,22 @@ impl RunCopy<'_> {
                 );
             },
             Self::WriteRect(buf, rect) => {
-                for (packed_off, host_at, len) in rect.pieces(buf_off, host_off, n) {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            buf.as_ptr().add(packed_off),
-                            (host_ptr as *mut u8).add(host_at),
-                            len,
-                        );
-                    }
-                }
+                rect.for_each_piece(buf_off, host_off, n, |packed_off, host_at, len| unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        buf.as_ptr().add(packed_off),
+                        (host_ptr as *mut u8).add(host_at),
+                        len,
+                    );
+                });
             }
             Self::ReadRect(buf, rect) => {
-                for (packed_off, host_at, len) in rect.pieces(buf_off, host_off, n) {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            (host_ptr as *const u8).add(host_at),
-                            buf.as_mut_ptr().add(packed_off),
-                            len,
-                        );
-                    }
-                }
+                rect.for_each_piece(buf_off, host_off, n, |packed_off, host_at, len| unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (host_ptr as *const u8).add(host_at),
+                        buf.as_mut_ptr().add(packed_off),
+                        len,
+                    );
+                });
             }
         }
     }
@@ -2299,21 +2295,37 @@ impl RectStride {
     /// `buf_off` is a span offset and `host_off` the mapped address of that same
     /// span offset, so the two move together and a run boundary falling mid-row
     /// splits the row rather than the rectangle.
-    fn pieces(
+    /// A rectangle with no padding is one piece however many rows it has: the
+    /// span and the packed buffer are the same bytes in the same order, so
+    /// splitting it per row would issue `row_count` memcpys where one describes
+    /// the identical move. Full-plane reads are the common shape on the blit
+    /// rail, and they are the widest rectangles here.
+    fn for_each_piece(
         &self,
         buf_off: usize,
         host_off: usize,
         n: usize,
-    ) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
+        mut piece: impl FnMut(usize, usize, usize),
+    ) {
+        if self.row_bytes == self.row_stride {
+            piece(buf_off, host_off, n);
+            return;
+        }
         let end = buf_off + n;
         let first = buf_off / self.row_stride;
         let last = end.saturating_sub(1) / self.row_stride;
-        (first..=last).filter_map(move |row| {
+        for row in first..=last {
             let row_lo = row * self.row_stride;
             let lo = buf_off.max(row_lo);
             let hi = end.min(row_lo + self.row_bytes);
-            (lo < hi).then(|| (row * self.row_bytes + (lo - row_lo), host_off + (lo - buf_off), hi - lo))
-        })
+            if lo < hi {
+                piece(
+                    row * self.row_bytes + (lo - row_lo),
+                    host_off + (lo - buf_off),
+                    hi - lo,
+                );
+            }
+        }
     }
 }
 
@@ -2631,6 +2643,52 @@ pub fn read_mapping_bytes<H: HostMemory + HostOps>(
         None,
         "mapping_read",
     )
+}
+
+/// Read a strided rectangle starting at mapping-linear `off` into a packed `dst`.
+///
+/// The rectangle's rows are `rect.row_stride` apart in the mapping and back to
+/// back in `dst`, which is the shape every texture read has. It resolves the
+/// mapping's page list and packed runs **once** for the whole rectangle, where a
+/// caller looping [`read_mapping_bytes`] per row pays that resolution
+/// `row_count` times — `O(pages)` each — and a caller materialising the whole
+/// sample window first pays a plane-sized allocation and a second copy out of it.
+///
+/// `dst` shorter than the rectangle's packed size is a refusal, not a partial
+/// read: the shape is checked at [`RunCopy::read_rect`] before any page is
+/// touched.
+pub(crate) fn read_mapping_rect<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+    off: u64,
+    rect: RectStride,
+    dst: &mut [u8],
+) -> bool {
+    // Same flush-on-access obligation as `read_mapping_bytes`, for the same
+    // reason and narrowed the same way: this read must observe the resident
+    // content and not the stale pre-dispatch guest bytes. It returns at once
+    // when nothing is armed, so a caller that has already settled pays a
+    // map-empty check.
+    crate::runtime::writeback_debt::settle_for_mapping(
+        state,
+        host,
+        mapping_id,
+        crate::runtime::render_writeback::SettleSite::MappingBytesRead,
+    );
+    if dst.len() < rect.packed() {
+        crate::observe::fail(format!(
+            "mapping_read_rect fail reason=rect_dst_short mid={mapping_id} off={off:#x} \
+             packed={} dst={}",
+            rect.packed(),
+            dst.len()
+        ));
+        return false;
+    }
+    let Some(copy) = RunCopy::read_rect(dst, rect) else {
+        return false;
+    };
+    copy_mapping_runs(state, host, mapping_id, off, copy, None, "mapping_read_rect")
 }
 
 /// Report a per-run host-pointer import that took at least a millisecond.

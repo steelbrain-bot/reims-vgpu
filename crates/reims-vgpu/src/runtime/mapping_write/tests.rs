@@ -1530,6 +1530,98 @@ fn read_rect_raw_fragmented_pages_with_padded_rows() {
     assert_eq!(&dst[8..], &row1);
 }
 
+/// A sub-rectangle of a padded plane over scattered guest pages reads through
+/// one page-table walk, not through a plane-sized window.
+///
+/// This is the source half of every type-11 to linear blit. Before the
+/// rectangle shape reached this rail the arm below materialised the *whole*
+/// sample window into a fresh zeroed `Vec` and then copied the wanted rows out
+/// of it, so a rectangle covering a fraction of the plane still paid for all of
+/// it twice. The fixture is deliberately a strict sub-rectangle in both axes
+/// with a row stride wider than its rows, which is the shape the old arm could
+/// not narrow and the old full-plane-tight special case could not claim.
+#[test]
+fn a_packed_sub_rectangle_of_a_scattered_plane_reads_through_one_walk() {
+    use crate::model::PAGE_SHIFT_X86;
+    use crate::runtime::drain::store_route_count;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    host.strict_linux_map = true;
+    let page = 1u64 << PAGE_SHIFT_X86;
+    // Four pages, none adjacent, so the walk has to split into four runs.
+    let gpas = [0x5100_0000u64, 0x6200_0000, 0x4300_0000, 0x7400_0000];
+    let bpr = page as u32 / 2;
+    let rows = 8u32;
+    let bpp = 4u32;
+    // Plane bytes, distinct per byte, laid into the pages the mapping names.
+    let plane: Vec<u8> = (0..(bpr as u64 * rows as u64))
+        .map(|i| (i % 251) as u8)
+        .collect();
+    for (i, gpa) in gpas.iter().enumerate() {
+        host.map_range(*gpa, page as usize, 0);
+        let lo = i * page as usize;
+        host.write_gpa(*gpa, &plane[lo..lo + page as usize]).unwrap();
+    }
+    let mid = 21u32;
+    state.map_surface(mid);
+    {
+        let m = state.mappings.get_mut(&mid).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = gpas
+            .iter()
+            .map(|gpa| (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
+            .collect();
+    }
+
+    let origin_x = 3u32;
+    let origin_y = 2u32;
+    let width = 5u32;
+    let height = 4u32;
+    let rb = (width * bpp) as usize;
+    let mut dst = vec![0u8; rb * height as usize];
+    let walks = store_route_count("rectrd_rect_walk");
+    let windows = store_route_count("rectrd_window_padded_dst");
+    assert!(read_rect_raw_at(
+        &mut state,
+        &mut host,
+        mid,
+        SurfaceWindow {
+            base_off: 0,
+            bpr,
+            span_end: bpr as u64 * rows as u64,
+            bpp,
+        },
+        Rect {
+            origin_x,
+            origin_y,
+            width,
+            height,
+        },
+        &mut dst,
+        rb as u32,
+    ));
+    assert_eq!(
+        store_route_count("rectrd_rect_walk") - walks,
+        1,
+        "a packed destination must resolve the page table once for the rectangle"
+    );
+    assert_eq!(
+        store_route_count("rectrd_window_padded_dst") - windows,
+        0,
+        "the plane-sized window arm is for padded destinations only"
+    );
+    for y in 0..height as usize {
+        let src_off = (origin_y as usize + y) * bpr as usize + (origin_x * bpp) as usize;
+        assert_eq!(
+            &dst[y * rb..(y + 1) * rb],
+            &plane[src_off..src_off + rb],
+            "row {y} did not land at its texel offset"
+        );
+    }
+}
+
 /// A rect ending past the sample window must be refused the same way and
 /// named the same way whichever arm reads it. The bound used to live inside
 /// the contig arm, so the fragmented arm — the one a driven x86 boot takes —
@@ -1616,9 +1708,16 @@ fn a_rect_past_the_sample_window_is_named_on_both_read_arms() {
 /// compute_full_tight_scratch: an exact-pitch fragmented compute plane
 /// reads and writes directly through the caller's tight buffer. The
 /// always-on proxy proves this class is selected on a live dispatch.
+///
+/// The read half is the rectangle walk and the write half still has its own
+/// full-plane-tight arm, so the two proxies differ: a counter for the read, the
+/// `full_tight_direct` line for the write. The read's separate special case was
+/// retired because the rectangle subsumes it — a tight full plane is a
+/// rectangle whose rows happen to touch, and it moves as one piece.
 #[test]
 fn fragmented_full_tight_rect_uses_direct_mapping_window() {
     use crate::model::PAGE_SHIFT_X86;
+    use crate::runtime::drain::store_route_count;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
@@ -1643,6 +1742,7 @@ fn fragmented_full_tight_rect_uses_direct_mapping_window() {
     let bpr = page as u32;
     let span = page * 2;
     let mut tight = vec![0u8; span as usize];
+    let walks = store_route_count("rectrd_rect_walk");
     assert!(read_rect_raw_at(
         &mut state,
         &mut host,
@@ -1664,6 +1764,11 @@ fn fragmented_full_tight_rect_uses_direct_mapping_window() {
     ));
     assert!(tight[..page as usize].iter().all(|&v| v == 0x31));
     assert!(tight[page as usize..].iter().all(|&v| v == 0x42));
+    assert_eq!(
+        store_route_count("rectrd_rect_walk") - walks,
+        1,
+        "a tight full plane is a rectangle and must take the one-walk arm"
+    );
 
     tight.fill(0x5a);
     assert!(write_full_rect_raw_at(
@@ -1686,9 +1791,6 @@ fn fragmented_full_tight_rect_uses_direct_mapping_window() {
     assert_eq!(check, tight);
 
     let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
-    assert!(log.contains(&format!(
-        "OFF mapping_read full_tight_direct mid={mid} bytes={span}"
-    )));
     assert!(log.contains(&format!(
         "OFF mapping_write full_tight_direct mid={mid} bytes={span}"
     )));

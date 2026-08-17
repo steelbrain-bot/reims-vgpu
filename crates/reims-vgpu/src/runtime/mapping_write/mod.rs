@@ -2308,38 +2308,37 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
     } else {
         crate::runtime::drain::note_store_route("rectrd_frag_n");
         let window_started = std::time::Instant::now();
-        // Exact full-plane row layout: the tight texture bytes are already the
-        // mapping byte window. Import fragmented GPA runs directly into the
-        // caller's Vulkan staging vector instead of allocating another
-        // full-plane window and copying it row by row.
-        let direct_len = (height as usize).checked_mul(dst_stride as usize);
-        let window_len = span_end
-            .checked_sub(base_off)
-            .and_then(|len| usize::try_from(len).ok());
-        let direct_len = direct_len.filter(|direct_len| {
-            origin_x == 0
-                && origin_y == 0
-                && row_bytes == surface_bpr
-                && dst_stride == surface_bpr
-                && Some(*direct_len) == window_len
-        });
-        if let Some(direct_len) = direct_len {
-            crate::observe::off(format!(
-                "mapping_read full_tight_direct mid={mapping_id} bytes={direct_len} bpr={surface_bpr} rows={height}"
-            ));
-            let ok = mapper::read_mapping_bytes(
-                state,
-                host,
-                mapping_id,
-                base_off,
-                &mut dst[..direct_len],
+        // A packed destination is the rectangle the run walk speaks natively:
+        // the rows are `bpr` apart in the mapping and back to back in `dst`, so
+        // one walk over the rectangle's own span lands every row where it goes.
+        // That subsumes what used to be a separate full-plane-tight special
+        // case, and it reaches every sub-rectangle that case could not — those
+        // paid a plane-sized zeroing allocation, a whole-window read, and a
+        // second row-by-row copy out of it, for a rectangle that may be a
+        // fraction of the plane.
+        //
+        // A padded destination (`dst_stride > row_bytes`) is a shape
+        // [`RectStride`] cannot hold — it describes one stride, the guest's —
+        // so it keeps the window materialisation below.
+        if dst_stride as usize == rb {
+            let rect_off = base_off
+                .saturating_add((origin_y as u64).saturating_mul(bpr as u64))
+                .saturating_add(x_off);
+            let ok = mapper::RectStride::new(bpr as u64, rb as u64, height as u64).is_some_and(
+                |shape| mapper::read_mapping_rect(state, host, mapping_id, rect_off, shape, dst),
             );
+            crate::runtime::drain::note_store_route(if ok {
+                "rectrd_rect_walk"
+            } else {
+                "rectrd_rect_refused"
+            });
             crate::runtime::drain::note_store_route_us(
                 "rectrd_window_us",
                 window_started.elapsed().as_micros() as u64,
             );
             return ok;
         }
+        crate::runtime::drain::note_store_route("rectrd_window_padded_dst");
         // Materialize the fragmented sample window once. Calling
         // read_mapping_bytes for every row revalidates every page and rebuilds
         // all packed GPA runs each time (O(height × pages)); fullscreen
