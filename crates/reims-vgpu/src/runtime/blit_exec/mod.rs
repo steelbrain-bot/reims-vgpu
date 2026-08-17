@@ -3391,6 +3391,25 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
     // slice/level form carried, and there a driven Maps leg charged the row loop
     // 30.15 s of a 30.28 s rail. See [`read_texture_rect`] for what a per-row
     // call into the mapping rail re-pays.
+    // Whether a GPU-side copy could serve this pair at all, and if not, which
+    // term stops it. `engine::copy_target_to_guest_pages` takes no source
+    // rectangle: it copies level 0 of the resident whole, at origin zero, into
+    // a destination whose geometry is the resident's own. So a type-11 source
+    // going to a linear destination is reachable only when both ends are the
+    // whole plane at the origin, and the split below says how much of this
+    // population that is. Instrument only — nothing here branches on it, and the
+    // staging loop runs the same either way.
+    if src.is_type11() && !dst.is_type11() {
+        let whole_src =
+            sox == 0 && soy == 0 && copy_w == src.width() as u64 && copy_h == src.height() as u64;
+        let whole_dst =
+            dox == 0 && doy == 0 && copy_w == dst.width() as u64 && copy_h == dst.height() as u64;
+        crate::runtime::drain::note_store_route(match (whole_src, whole_dst) {
+            (true, true) => "blit_t2t_t11_whole_plane",
+            (true, false) => "blit_t2t_t11_dst_partial",
+            (false, _) => "blit_t2t_t11_src_partial",
+        });
+    }
     let t2t_stage_started = std::time::Instant::now();
     let mut staged = vec![0u8; row_bytes.saturating_mul(copy_h) as usize];
     for z in 0..copy_d {
