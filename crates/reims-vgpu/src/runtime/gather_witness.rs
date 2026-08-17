@@ -395,6 +395,15 @@ struct Entry {
     /// `HostWrites::epoch` at the previous bind, against which the page-exact
     /// question "did this device write any of *these pages* since" is asked.
     pages_epoch: u64,
+    /// `MappingEntry::content_generation` at the previous bind, against which
+    /// the guest's own account of its CPU writes is asked — see
+    /// [`StatedGuestWrite`].
+    ///
+    /// `None` when the channel could not address this window at that bind, which
+    /// is not the same as a generation of 0: a mapping genuinely sitting at
+    /// generation 0 has been addressed and has been written zero times, and
+    /// comparing it against a later 0 is a real quiet answer.
+    stated_gen: Option<u32>,
     /// Bind ordinal of the last sight of this window, for LRU eviction.
     last_seen: u64,
     /// Sampled-content generation currently vouched for these bytes.
@@ -564,6 +573,7 @@ impl GatherWitness {
                 audit_armed: false,
                 rebaselines: 0,
                 pages_epoch: 0,
+                stated_gen: None,
                 last_seen: 0,
                 generation: 0,
             },
@@ -633,11 +643,18 @@ pub(crate) unsafe fn fold_runs(runs: &[crate::backend::vulkan::engine::GuestRun]
     ((a as u128) << 64) | b as u128
 }
 
-/// This device's own answer for one bind: did *we* write these pages?
+/// Every account of one bind's writers that is read out of device state, taken
+/// together before the witness is touched.
 ///
-/// Gathered before the witness is touched, because the page-exact question needs
-/// the epoch recorded at the previous bind and the ring that answers it is read
-/// through the same device state the witness lives in.
+/// Gathered up front because each needs something the witness cannot reach from
+/// inside itself: the page-exact question needs the epoch recorded at the
+/// previous bind, and both it and the guest's stated generation are read through
+/// the same device state the witness lives in. Passing them in keeps [`observe`]
+/// a function of its inputs, which is what lets a test state the writers it is
+/// testing.
+///
+/// One field per writer, and they are not interchangeable —
+/// [`Self::pages_wrote`] is this device and [`Self::stated_gen`] is the guest.
 ///
 /// Two coarser counts used to be asked here beside it — the device-global host
 /// write sequence and a per-mapping share of it — scoring the two candidate
@@ -647,7 +664,7 @@ pub(crate) unsafe fn fold_runs(runs: &[crate::backend::vulkan::engine::GuestRun]
 /// id. Neither is a rule this device could use, so neither is a count it still
 /// takes.
 #[derive(Clone, Copy, Debug)]
-struct HostWriteCounts {
+struct WitnessReadings {
     /// `HostWrites::epoch()` now, to be recorded for the next bind to ask against.
     pages_epoch: u64,
     /// Whether this device wrote any of this window's pages since the previous
@@ -658,6 +675,13 @@ struct HostWriteCounts {
     /// non-quiet values are this device declining to rule the write out rather
     /// than a write that landed here, and the three want different repairs.
     pages_wrote: Option<crate::runtime::host_writes::HostWriteVerdict>,
+    /// The guest's own account: `MappingEntry::content_generation` for the
+    /// mapping this window's key names, now.
+    ///
+    /// `None` when the guest's statements are not addressed to this window at
+    /// all — see [`StatedGuestWrite::Unaddressed`]. Compared against the reading
+    /// the previous bind left in the entry, and acted on by nothing.
+    stated_gen: Option<u32>,
     /// Whether a guest-page write this device has **submitted but the GPU has
     /// not yet executed** could land in this window.
     ///
@@ -790,6 +814,41 @@ pub enum GatherVerdict {
     },
 }
 
+/// What the guest's **stated** invalidation channel says about one window, read
+/// beside the inferred half and acted on by nothing.
+///
+/// The hypervisor dirty bitmap is not the only account of a guest CPU write, and
+/// it is the weaker one. The guest states every CPU write itself: byte `+4` of
+/// each `EXEC_INDIRECT2` resource-table record is a test-and-clear of the
+/// resource's dirty bit, so the statement is addressed to an **object id**,
+/// delivered in the **same submission as the bind** that would consume a stale
+/// copy, and sent exactly once. [`crate::runtime::resource_validity::apply`]
+/// already lands it on [`crate::model::MappingEntry::content_generation`].
+///
+/// [`GatherKey::Mapping`] names the very mapping that generation belongs to, so
+/// the witness can ask the guest what it did instead of asking the hypervisor
+/// what it noticed. Whether it *may* is the open question this type exists to
+/// measure: the two accounts are counted against each other and against the
+/// content audit, and nothing branches on this until that reading is in.
+///
+/// Fail-closed by construction: a window the channel cannot address reads
+/// [`Self::Unaddressed`] rather than quiet, so an absent statement can never be
+/// mistaken for a statement of silence.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StatedGuestWrite {
+    /// The channel has no answer for this window. Either the key is a
+    /// [`GatherKey::TaskGva`] — a task GVA span, which the guest's statements
+    /// are not addressed to — or the mapping the key names is not one this
+    /// device holds. Not evidence in either direction.
+    Unaddressed,
+    /// The mapping's `content_generation` is where the previous bind left it, so
+    /// the guest has stated no CPU write to this resource in between.
+    Quiet,
+    /// The generation moved: the guest stated at least one CPU write to this
+    /// resource since the previous bind of this window.
+    Wrote,
+}
+
 /// What the content fold said, on the binds where it ran.
 ///
 /// The fold is the audit of [`GatherVerdict::Vouched`], not an input to it —
@@ -871,6 +930,10 @@ pub struct GatherObservation {
     /// re-derived from [`Self::verdict`] — a `Disagreed` audit vouches and still
     /// spends, so the two do not agree.
     pub vouch: GatherVouch,
+    /// What the guest's stated channel said about the same question the
+    /// hypervisor half of [`Self::verdict`] answers. Observed only; no arm of
+    /// this module branches on it.
+    pub stated: StatedGuestWrite,
 }
 
 /// The one way this witness can be wrong.
@@ -950,16 +1013,26 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
     note_store_route(rail_count);
     note_store_route_n(rail_kb, span / 1024);
 
-    // This device's own answer, taken before the witness is touched: the
+    // Both writers' accounts, taken before the witness is touched: the
     // page-exact question needs the epoch recorded at the *previous* bind, which
     // is inside the witness, and the ring that answers it is read through the
     // same device state.
-    let counts = HostWriteCounts {
+    let counts = WitnessReadings {
         pages_epoch: state.host_writes.epoch(),
         pages_wrote: state
             .gather_witness
             .previous_pages_epoch(&key)
             .map(|since| state.host_writes.wrote_any_since(since, window.gpas)),
+        // The guest's own statement about this resource, read at the same moment
+        // as the inferred half so the two describe one bind of one window. A task
+        // GVA span is not what the guest addresses its statements to, so the
+        // channel has nothing to say about that shape of key.
+        stated_gen: match key {
+            GatherKey::Mapping { mid, .. } => {
+                state.mappings.get(&mid).map(|m| m.content_generation)
+            }
+            GatherKey::TaskGva { .. } => None,
+        },
         pending: PendingWrites::over(window.gpas),
     };
     // Every bind, vouched or not, so the route is a denominator rather than a
@@ -981,7 +1054,45 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
     // to vouch for the previous one. An unspent generation is not a leak: the
     // counter's whole contract is that a value is issued once and never again.
     let fresh = state.next_sampled_content_generation();
+    // The guest's own statement about this resource, read before the witness is
+    // touched for the same reason the host-write epoch is: it has to describe the
+    // moment the inferred half is asked about, not a moment after it.
     let seen = observe(&mut state.gather_witness, host, key, window, counts, fresh);
+
+    // Score the guest's stated account against the hypervisor's inferred one,
+    // and both against the content audit. Nothing branches on the stated channel
+    // yet; this cross is what says whether anything may.
+    //
+    // The reading wanted is one cell: `gwst_would_save`, the binds the inferred
+    // half refused and the guest says were quiet. That is the gather work the
+    // stated channel would recover. `gwst_stated_stricter` is the opposite cell
+    // and costs nothing but a gather that would have happened anyway.
+    match (seen.stated, seen.verdict) {
+        (StatedGuestWrite::Unaddressed, _) => note_store_route("gwst_unaddressed"),
+        (StatedGuestWrite::Quiet, GatherVerdict::Vouched) => note_store_route("gwst_agree_quiet"),
+        (StatedGuestWrite::Wrote, GatherVerdict::Refused { .. }) => {
+            note_store_route("gwst_agree_wrote")
+        }
+        (StatedGuestWrite::Quiet, _) => {
+            note_store_route("gwst_would_save");
+            note_store_route_n("gwst_would_save_kb", span / 1024);
+        }
+        (StatedGuestWrite::Wrote, _) => note_store_route("gwst_stated_stricter"),
+    }
+    // The falsifier, and the only cell that can veto the whole direction: the
+    // audit read the bytes and found them moved on a bind the guest stated was
+    // quiet. A non-zero here means the stated channel does not cover some writer
+    // and cannot be the guest half of this witness on its own. Read it against
+    // `gwst_audit_judged`, which is its denominator — a zero means nothing until
+    // that is large.
+    if matches!(seen.stated, StatedGuestWrite::Quiet)
+        && matches!(seen.audit, ContentAudit::Agreed | ContentAudit::Disagreed)
+    {
+        note_store_route("gwst_audit_judged");
+        if matches!(seen.audit, ContentAudit::Disagreed) {
+            note_store_route("gwst_audit_unsound");
+        }
+    }
 
     match seen.verdict {
         GatherVerdict::Rearmed => note_store_route("gw_rearm"),
@@ -1109,7 +1220,7 @@ fn observe<M: crate::runtime::host::HostOps>(
     host: &mut M,
     key: GatherKey,
     window: GatherWindow<'_>,
-    counts: HostWriteCounts,
+    counts: WitnessReadings,
     fresh_generation: u64,
 ) -> GatherObservation {
     let GatherWindow {
@@ -1118,10 +1229,11 @@ fn observe<M: crate::runtime::host::HostOps>(
         span,
         page_size,
     } = window;
-    let HostWriteCounts {
+    let WitnessReadings {
         pages_epoch,
         pages_wrote,
         pending,
+        stated_gen: stated_now,
     } = counts;
 
     witness.binds = witness.binds.wrapping_add(1);
@@ -1163,6 +1275,7 @@ fn observe<M: crate::runtime::host::HostOps>(
                 audit_armed: false,
                 rebaselines: 0,
                 pages_epoch,
+                stated_gen: stated_now,
                 last_seen: witness.binds,
                 generation: fresh_generation,
             },
@@ -1175,6 +1288,11 @@ fn observe<M: crate::runtime::host::HostOps>(
             // assigns unconditionally: a re-pointed window has no previous bind
             // of these pages to have vouched for them.
             vouch: GatherVouch::Fresh,
+            // A re-point has no previous bind to compare a generation against,
+            // which is the same "no answer" the channel gives an unaddressable
+            // window. Reporting it as quiet would credit the stated channel with
+            // vouching for a window that gathers unconditionally.
+            stated: StatedGuestWrite::Unaddressed,
         };
     }
 
@@ -1210,6 +1328,17 @@ fn observe<M: crate::runtime::host::HostOps>(
         }
     };
     let vouched = matches!(verdict, GatherVerdict::Vouched);
+
+    // The guest's own account of the same writes the `gen` comparison above
+    // infers, taken here so both answers describe one bind of one window. Only
+    // a window addressed at *both* binds has a comparison to make; either side
+    // absent is no answer rather than a quiet one.
+    let stated = match (entry.stated_gen, stated_now) {
+        (Some(before), Some(now)) if before == now => StatedGuestWrite::Quiet,
+        (Some(_), Some(_)) => StatedGuestWrite::Wrote,
+        _ => StatedGuestWrite::Unaddressed,
+    };
+    entry.stated_gen = stated_now;
 
     // SAFETY (every `fold_runs` below): `runs` describe the window this draw is
     // about to gather from, so their pointers are live here for the same reason
@@ -1318,6 +1447,7 @@ fn observe<M: crate::runtime::host::HostOps>(
         } else {
             GatherVouch::Fresh
         },
+        stated,
     }
 }
 
@@ -1344,11 +1474,14 @@ mod tests {
         }
     }
 
-    /// This device wrote none of the window's pages since the previous bind.
-    const QUIET: HostWriteCounts = HostWriteCounts {
+    /// This device wrote none of the window's pages since the previous bind, and
+    /// the guest's stated channel does not address the window — so these tests
+    /// read the inferred witness alone, which is what they are about.
+    const QUIET: WitnessReadings = WitnessReadings {
         pages_epoch: 1,
         pages_wrote: Some(crate::runtime::host_writes::HostWriteVerdict::Quiet),
         pending: PendingWrites::Disjoint,
+        stated_gen: None,
     };
 
     /// One bind, discarding the audit — for the tests that are about the verdict.
@@ -1356,7 +1489,7 @@ mod tests {
         w: &mut GatherWitness,
         host: &mut M,
         window: GatherWindow<'_>,
-        counts: HostWriteCounts,
+        counts: WitnessReadings,
         gen: u64,
     ) -> GatherVerdict {
         observe(w, host, KEY, window, counts, gen).verdict
@@ -1485,7 +1618,7 @@ mod tests {
             &mut host,
             KEY,
             one_page(&GPAS, &runs),
-            HostWriteCounts {
+            WitnessReadings {
                 pages_wrote: Some(crate::runtime::host_writes::HostWriteVerdict::Overlap),
                 ..QUIET
             },
@@ -1505,6 +1638,55 @@ mod tests {
             (guest_wrote.generation, guest_wrote.vouch),
             (13, GatherVouch::Fresh)
         );
+    }
+
+    /// The guest's stated channel answers the same question as the inferred half
+    /// and answers it only where the guest addresses it.
+    ///
+    /// Four claims, and the first two are what make the reading usable: a
+    /// generation that has not moved is [`StatedGuestWrite::Quiet`] *including at
+    /// generation 0*, and one that has moved is [`StatedGuestWrite::Wrote`]. The
+    /// third is the fail-closed rule — a window the channel cannot address at
+    /// either bind is `Unaddressed` and never quiet, so an absent statement is
+    /// not read as a statement of silence. The fourth is that a re-point reports
+    /// `Unaddressed` too, because it has no previous bind to compare against and
+    /// gathers unconditionally.
+    #[test]
+    fn the_stated_channel_answers_only_where_the_guest_addresses_it() {
+        let mut host = crate::runtime::host::FakeHost::new();
+        let mut w = GatherWitness::default();
+        let buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+        let stated = |gen: Option<u32>| WitnessReadings {
+            stated_gen: gen,
+            ..QUIET
+        };
+
+        // First sight of the window: a re-point, so no comparison exists yet.
+        let first = observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), stated(Some(0)), 10);
+        assert_eq!(first.stated, StatedGuestWrite::Unaddressed);
+
+        // Generation 0 twice is a real quiet answer, not an absent one — the
+        // mapping has been addressed and the guest has written it zero times.
+        let quiet = observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), stated(Some(0)), 11);
+        assert_eq!(quiet.stated, StatedGuestWrite::Quiet);
+
+        // The guest states a CPU write: `resource_validity::apply` bumps the
+        // mapping's generation, and the channel reports it.
+        let wrote = observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), stated(Some(1)), 12);
+        assert_eq!(wrote.stated, StatedGuestWrite::Wrote);
+
+        // Settled at the new generation, quiet again.
+        let settled = observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), stated(Some(1)), 13);
+        assert_eq!(settled.stated, StatedGuestWrite::Quiet);
+
+        // The mapping goes away. Fail closed: not quiet, whatever the inferred
+        // half says, and the bind before it does not become quiet retroactively.
+        let gone = observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), stated(None), 14);
+        assert_eq!(gone.stated, StatedGuestWrite::Unaddressed);
+        let still_gone =
+            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), stated(None), 15);
+        assert_eq!(still_gone.stated, StatedGuestWrite::Unaddressed);
     }
 
     /// A witness at a stated audit density, for the two tests that are about the
@@ -1615,7 +1797,7 @@ mod tests {
                 host,
                 KEY,
                 one_page(&GPAS, &runs),
-                HostWriteCounts { pending, ..QUIET },
+                WitnessReadings { pending, ..QUIET },
                 next_gen(),
             )
         };
@@ -1761,11 +1943,11 @@ mod tests {
             &mut host,
             KEY,
             one_page(&GPAS, &runs),
-            HostWriteCounts {
-                pending: PendingWrites::Disjoint,
+            WitnessReadings {
                 pages_epoch: 2,
                 pages_wrote: Some(crate::runtime::host_writes::HostWriteVerdict::Overlap),
-            },
+                ..QUIET
+                },
             next_gen(),
         );
         assert!(
@@ -1865,11 +2047,11 @@ mod tests {
                 host,
                 KEY,
                 one_page(&GPAS, &runs),
-                HostWriteCounts {
-                    pending: PendingWrites::Disjoint,
+                WitnessReadings {
                     pages_epoch: 2,
                     pages_wrote: Some(crate::runtime::host_writes::HostWriteVerdict::Overlap),
-                },
+                    ..QUIET
+                    },
                 next_gen(),
             )
             .audit
