@@ -1481,11 +1481,13 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         // The object map retains the typed construction descriptor for the
         // resource lifetime. Both linear loaders consume that same object here;
         // neither needs to revisit guest construction bytes.
-        if let Some(tex) =
+        if let Some((resource, tex)) =
             resolved_resource
                 .as_ref()
                 .and_then(|resource| match resource.decoded() {
-                    Ok(crate::runtime::decode::resource::Descriptor::Texture(tex)) => Some(tex),
+                    Ok(crate::runtime::decode::resource::Descriptor::Texture(tex)) => {
+                        Some((resource.as_ref(), tex))
+                    }
                     _ => None,
                 })
         {
@@ -1495,7 +1497,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
             // wait for. See [`try_gva_resident_sample`].
             if may_bind_resident {
                 if let Some((w, h, src)) =
-                    try_gva_resident_sample(state, host, task_id, texture_ref, tex)
+                    try_gva_resident_sample(state, host, task_id, texture_ref, resource, tex)
                 {
                     return Some((w, h, 0, src));
                 }
@@ -3501,9 +3503,15 @@ pub(super) fn try_gva_resident_sample<M: HostMemory + HostOps>(
     host: &mut M,
     task_id: u32,
     texture_ref: u32,
+    resource: &crate::model::TaskResource,
     tex: &TextureDescriptor,
 ) -> Option<(u32, u32, SampledSourceRequest)> {
     use crate::runtime::drain::note_store_route;
+
+    if !resource.was_render_target() {
+        note_store_route("gvarung_sampled_only");
+        return None;
+    }
 
     let (gva, layout) = tex.level_gva(0, state.page_shift)?;
     let (w, h) = (layout.width, layout.height);
@@ -7852,6 +7860,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // `reason=` rather than flattening it into a `vk_engine: {e}` blob.
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Engine);
         let out = crate::backend::vulkan::engine::execute_draw_request(&resources)?;
+        if resources.target_identity.is_some() {
+            if let Some(resource) = req.colors.first().and_then(|color| color.resource.as_ref()) {
+                resource.note_render_target_use();
+            }
+        }
         // Carried back on the request so `runtime::exec` can sum the chain's
         // draws into the guest's buffer. The engine reports per draw because a
         // Metal pass whose counter spans several draws is several Vulkan

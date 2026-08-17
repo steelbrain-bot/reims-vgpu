@@ -4036,6 +4036,7 @@ fn render_pass_attachment_template(first: &draw::DrawEncodeRequest) -> draw::Dra
         .map(|c| draw::ColorRtRequest {
             slot: c.slot,
             texture_ref: c.texture_ref,
+            resource: c.resource.clone(),
             storage: c.storage,
             width: c.width,
             height: c.height,

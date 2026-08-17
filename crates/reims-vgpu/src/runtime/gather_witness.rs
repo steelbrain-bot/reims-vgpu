@@ -22,7 +22,7 @@
 //! Entries are unbounded while their owners are live. Task entries retire with
 //! the task and mapping entries with the mapping; device reset clears both.
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 use crate::contract::fnv;
 
@@ -60,7 +60,7 @@ impl GatherRail {
 /// (the type-11 and type-5 rails). Those two rails can name the same
 /// `(mid, base_off)` for a single-plane surface, and that is harmless — same
 /// mapping, same offset and same span is the same bytes.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum GatherKey {
     /// A texture window addressed through a task's GVA space.
     TaskGva {
@@ -203,7 +203,7 @@ struct Entry {
 /// Per-device witness state: one entry per sampled window seen.
 #[derive(Debug)]
 pub struct GatherWitness {
-    entries: BTreeMap<GatherKey, Entry>,
+    entries: HashMap<GatherKey, Entry>,
     /// How often this device's content audit is allowed to compare.
     ///
     /// On the witness rather than in a process-wide `OnceLock` so a test can
@@ -216,7 +216,7 @@ pub struct GatherWitness {
 impl Default for GatherWitness {
     fn default() -> Self {
         Self {
-            entries: BTreeMap::new(),
+            entries: HashMap::new(),
             audit: AuditDensity::from_env(),
         }
     }

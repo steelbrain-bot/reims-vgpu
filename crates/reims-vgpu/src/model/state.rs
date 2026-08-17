@@ -7,6 +7,8 @@ use crate::runtime::decode::resource::{
 #[cfg(feature = "backend-vulkan")]
 use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "backend-vulkan")]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -589,6 +591,13 @@ pub struct TaskResource {
     /// Direct backend objects keep only a weak reference, so deletion—not an
     /// arbitrary idle timeout—makes them reclaimable.
     lifetime: Arc<TaskResourceLifetime>,
+    /// Set after a successful draw used this texture as an attachment. A
+    /// sampled-only texture cannot have an engine render-target resident, so
+    /// its bind need not probe the mutable Store/witness registries. This is
+    /// resource state carried by the decoded attachment use, not an inference
+    /// from its address, shape, or contents.
+    #[cfg(feature = "backend-vulkan")]
+    was_render_target: AtomicBool,
     /// Engine objects retained for this serialized resource lifetime.
     ///
     /// The lease owns its resident pin and allocation classification. Its
@@ -613,6 +622,8 @@ impl TaskResource {
             type11_mapping: OnceLock::new(),
             lifetime: Arc::new(TaskResourceLifetime::new()),
             #[cfg(feature = "backend-vulkan")]
+            was_render_target: AtomicBool::new(false),
+            #[cfg(feature = "backend-vulkan")]
             resident_targets: Mutex::new(HashMap::new()),
         }
     }
@@ -632,6 +643,16 @@ impl TaskResource {
             id: self.lifetime.id,
             live: Arc::downgrade(&self.lifetime),
         }
+    }
+
+    #[cfg(feature = "backend-vulkan")]
+    pub(crate) fn note_render_target_use(&self) {
+        self.was_render_target.store(true, Ordering::Release);
+    }
+
+    #[cfg(feature = "backend-vulkan")]
+    pub(crate) fn was_render_target(&self) -> bool {
+        self.was_render_target.load(Ordering::Acquire)
     }
 
     pub(crate) fn registered_type11_mapping(&self) -> Option<u32> {

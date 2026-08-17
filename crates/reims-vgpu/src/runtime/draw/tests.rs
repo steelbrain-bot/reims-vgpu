@@ -5759,6 +5759,7 @@ fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
     let c0 = ColorRtRequest {
         slot: 0,
         texture_ref: 7,
+        resource: None,
         storage: linear_target_storage(page, 64 * 4, 64),
         width: 64,
         height: 64,
@@ -5962,6 +5963,7 @@ fn a_scissored_gva_store_is_bounded_on_both_its_rails() {
     let target = ColorRtRequest {
         slot: 0,
         texture_ref: 7,
+        resource: None,
         storage: linear_target_storage(StoreRig::gva(1), BPR, H),
         width: W,
         height: H,
@@ -6519,9 +6521,22 @@ fn a_gva_span_no_store_has_stamped_refuses_the_resident_sample_rung() {
     let no_entry = store_route_count("gvaw_no_entry");
     let absent = store_route_count("gvarung_resident_absent");
     let served = store_route_count("gvarung_resident");
+    let resource = crate::model::TaskResource::new(Default::default(), std::sync::Arc::from([]));
+    let sampled_only = store_route_count("gvarung_sampled_only");
+    assert!(
+        super::try_gva_resident_sample(&mut state, &mut host, 1, 7, &resource, &tex).is_none(),
+        "a texture never used as an attachment cannot own a render-target resident"
+    );
+    assert_eq!(store_route_count("gvarung_sampled_only"), sampled_only + 1);
+    assert_eq!(
+        store_route_count("gvaw_no_entry"),
+        no_entry,
+        "sampled-only construction state answers before the mutable Store witness"
+    );
+    resource.note_render_target_use();
 
     assert!(
-        super::try_gva_resident_sample(&mut state, &mut host, 1, 7, &tex).is_none(),
+        super::try_gva_resident_sample(&mut state, &mut host, 1, 7, &resource, &tex).is_none(),
         "no Store has stamped this span, so nothing licenses serving a resident for it"
     );
     assert_eq!(
@@ -6552,7 +6567,7 @@ fn a_gva_span_no_store_has_stamped_refuses_the_resident_sample_rung() {
     };
     note_store(&mut state, orphan, &gpas);
     assert!(
-        super::try_gva_resident_sample(&mut state, &mut host, 1, 7, &tex).is_none(),
+        super::try_gva_resident_sample(&mut state, &mut host, 1, 7, &resource, &tex).is_none(),
         "a stale page set stamped at this address must not answer for the one that replaced it"
     );
     assert_eq!(

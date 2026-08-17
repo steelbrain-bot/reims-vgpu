@@ -247,6 +247,7 @@ impl ResourcePools {
             ),
             attachment_snapshot_live: Vec::new(),
             sampled_cache: Vec::new(),
+            sampled_identity_index: HashMap::new(),
             sampled_cache_bytes: 0,
             direct_sampled: HashMap::new(),
             sampled_victims: std::collections::VecDeque::new(),
@@ -461,7 +462,22 @@ impl ResourcePools {
         index: usize,
         route: Option<SampledVictimRoute>,
     ) -> SampledSlot {
-        let evicted = self.sampled_cache.remove(index);
+        let last = self.sampled_cache.len() - 1;
+        let removed_name = Self::sampled_entry_name(&self.sampled_cache[index]);
+        let moved_name = (index != last)
+            .then(|| Self::sampled_entry_name(&self.sampled_cache[last]))
+            .flatten();
+        let evicted = self.sampled_cache.swap_remove(index);
+        if let Some(name) = removed_name {
+            if self.sampled_identity_index.get(&name) == Some(&index) {
+                self.sampled_identity_index.remove(&name);
+            }
+        }
+        if let Some(name) = moved_name {
+            if self.sampled_identity_index.get(&name) == Some(&last) {
+                self.sampled_identity_index.insert(name, index);
+            }
+        }
         self.sampled_cache_bytes = self.sampled_cache_bytes.saturating_sub(evicted.content_len);
         if let (Some(identity), Some(route)) = (evicted.identity, route) {
             self.sampled_victims.push_front(SampledVictim {
@@ -472,6 +488,37 @@ impl ResourcePools {
             self.sampled_victims.truncate(SAMPLED_VICTIM_LEDGER);
         }
         evicted.slot
+    }
+
+    fn sampled_entry_name(entry: &ResidentSampledSlot) -> Option<GatheredName> {
+        Some(GatheredName {
+            key: entry.slot.key(),
+            identity: entry.identity?,
+        })
+    }
+
+    fn push_sampled_entry(&mut self, entry: ResidentSampledSlot) {
+        let index = self.sampled_cache.len();
+        if let Some(name) = Self::sampled_entry_name(&entry) {
+            self.sampled_identity_index.insert(name, index);
+        }
+        self.sampled_cache.push(entry);
+    }
+
+    fn set_sampled_entry_identity(
+        &mut self,
+        index: usize,
+        identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
+    ) {
+        if let Some(old) = Self::sampled_entry_name(&self.sampled_cache[index]) {
+            if self.sampled_identity_index.get(&old) == Some(&index) {
+                self.sampled_identity_index.remove(&old);
+            }
+        }
+        self.sampled_cache[index].identity = identity;
+        if let Some(new) = Self::sampled_entry_name(&self.sampled_cache[index]) {
+            self.sampled_identity_index.insert(new, index);
+        }
     }
 
     fn evict_sampled_entry(&mut self, index: usize, route: SampledVictimRoute) -> SampledSlot {
@@ -3604,25 +3651,35 @@ impl ResourcePools {
 
         let key = DirectSampledKey::of(source, sampled);
         if let Some(entry) = self.direct_sampled.get_mut(&key) {
-            if entry.has_live_owner() && !entry.import.is_retired() {
+            if entry.has_live_owner() && !entry.import_is_retired() {
                 entry.retain_owner(owner);
-                crate::runtime::drain::note_store_route("direct_sampled_hit");
-                return Some(DirectSampledBinding {
-                    key,
-                    image: entry.image,
-                    view: entry.view,
-                    needs_transition: entry.layout == DirectSampledLayout::NeedsTransition,
-                });
+                return match entry.state {
+                    DirectSampledState::Bound {
+                        image,
+                        view,
+                        layout,
+                        ..
+                    } => {
+                        crate::runtime::drain::note_store_route("direct_sampled_hit");
+                        Some(DirectSampledBinding {
+                            key,
+                            image,
+                            view,
+                            needs_transition: layout == DirectSampledLayout::NeedsTransition,
+                        })
+                    }
+                    DirectSampledState::Declined(decline) => {
+                        crate::runtime::drain::note_store_route("direct_sampled_declined_hit");
+                        crate::runtime::drain::note_store_route(decline.route());
+                        None
+                    }
+                };
             }
         }
         if let Some(dead) = self.direct_sampled.remove(&key) {
-            self.dispose(
-                &ctx.device,
-                DeferredHandle::AliasedImage {
-                    image: dead.image,
-                    view: dead.view,
-                },
-            );
+            if let DirectSampledState::Bound { image, view, .. } = dead.state {
+                self.dispose(&ctx.device, DeferredHandle::AliasedImage { image, view });
+            }
         }
 
         let verdict = unsafe {
@@ -3687,8 +3744,8 @@ impl ResourcePools {
 
         let requirements = unsafe { ctx.device.get_image_memory_requirements(image) };
         if requirements.memory_type_bits & (1u32 << allocation.memory_type_index) == 0 {
-            crate::runtime::drain::note_store_route("direct_sampled_memory_type");
             unsafe { ctx.device.destroy_image(image, None) };
+            self.remember_direct_sampled_decline(key, owner, DirectSampledAdmission::MemoryType);
             return None;
         }
         let layout = unsafe {
@@ -3704,8 +3761,8 @@ impl ResourcePools {
         let memory_offset = match direct_sampled_memory_offset(source, layout, requirements) {
             Ok(offset) => offset,
             Err(decline) => {
-                crate::runtime::drain::note_store_route(decline.route());
                 unsafe { ctx.device.destroy_image(image, None) };
+                self.remember_direct_sampled_decline(key, owner, decline);
                 return None;
             }
         };
@@ -3744,11 +3801,13 @@ impl ResourcePools {
         self.direct_sampled.insert(
             key,
             DirectSampledEntry {
-                image,
-                view,
-                import: std::sync::Arc::clone(&source.import),
                 owners: vec![owner.clone()],
-                layout: DirectSampledLayout::NeedsTransition,
+                state: DirectSampledState::Bound {
+                    image,
+                    view,
+                    import: std::sync::Arc::clone(&source.import),
+                    layout: DirectSampledLayout::NeedsTransition,
+                },
             },
         );
         crate::runtime::drain::note_store_route("direct_sampled_created");
@@ -3760,18 +3819,39 @@ impl ResourcePools {
         })
     }
 
+    fn remember_direct_sampled_decline(
+        &mut self,
+        key: DirectSampledKey,
+        owner: &crate::model::TaskResourceLifetimeRef,
+        decline: DirectSampledAdmission,
+    ) {
+        crate::runtime::drain::note_store_route(decline.route());
+        self.direct_sampled.insert(
+            key,
+            DirectSampledEntry {
+                owners: vec![owner.clone()],
+                state: DirectSampledState::Declined(decline),
+            },
+        );
+        crate::runtime::drain::note_store_route("direct_sampled_declined_remembered");
+    }
+
     pub(crate) fn note_direct_sampled_transition_recorded(&mut self, key: DirectSampledKey) {
         if let Some(entry) = self.direct_sampled.get_mut(&key) {
-            if entry.layout == DirectSampledLayout::NeedsTransition {
-                entry.layout = DirectSampledLayout::TransitionRecorded;
+            if let DirectSampledState::Bound { layout, .. } = &mut entry.state {
+                if *layout == DirectSampledLayout::NeedsTransition {
+                    *layout = DirectSampledLayout::TransitionRecorded;
+                }
             }
         }
     }
 
     fn publish_direct_sampled_transitions(&mut self) {
         for entry in self.direct_sampled.values_mut() {
-            if entry.layout == DirectSampledLayout::TransitionRecorded {
-                entry.layout = DirectSampledLayout::General;
+            if let DirectSampledState::Bound { layout, .. } = &mut entry.state {
+                if *layout == DirectSampledLayout::TransitionRecorded {
+                    *layout = DirectSampledLayout::General;
+                }
             }
         }
     }
@@ -3783,13 +3863,9 @@ impl ResourcePools {
             .map(|(_, entry)| entry)
             .collect();
         for entry in entries {
-            self.dispose(
-                device,
-                DeferredHandle::AliasedImage {
-                    image: entry.image,
-                    view: entry.view,
-                },
-            );
+            if let DirectSampledState::Bound { image, view, .. } = entry.state {
+                self.dispose(device, DeferredHandle::AliasedImage { image, view });
+            }
         }
     }
 
@@ -3802,13 +3878,9 @@ impl ResourcePools {
             .collect();
         for key in keys {
             if let Some(entry) = self.direct_sampled.remove(&key) {
-                self.dispose(
-                    device,
-                    DeferredHandle::AliasedImage {
-                        image: entry.image,
-                        view: entry.view,
-                    },
-                );
+                if let DirectSampledState::Bound { image, view, .. } = entry.state {
+                    self.dispose(device, DeferredHandle::AliasedImage { image, view });
+                }
             }
         }
     }
@@ -3817,18 +3889,14 @@ impl ResourcePools {
         let keys: Vec<_> = self
             .direct_sampled
             .iter()
-            .filter(|(_, entry)| entry.import.is_retired() || !entry.has_live_owner())
+            .filter(|(_, entry)| entry.import_is_retired() || !entry.has_live_owner())
             .map(|(key, _)| *key)
             .collect();
         for key in keys {
             if let Some(entry) = self.direct_sampled.remove(&key) {
-                self.dispose(
-                    device,
-                    DeferredHandle::AliasedImage {
-                        image: entry.image,
-                        view: entry.view,
-                    },
-                );
+                if let DirectSampledState::Bound { image, view, .. } = entry.state {
+                    self.dispose(device, DeferredHandle::AliasedImage { image, view });
+                }
             }
         }
     }
@@ -4018,14 +4086,21 @@ impl ResourcePools {
             crate::runtime::drain::note_store_route("sampled_identity_off");
             return None;
         }
-        let index = self.sampled_cache.iter().position(|entry| {
-            entry.has_live_owner() && entry.slot.key() == key && entry.identity == Some(id)
-        })?;
-        let mut entry = self.sampled_cache.remove(index);
+        let name = GatheredName { key, identity: id };
+        let index = self.sampled_identity_index.get(&name).copied()?;
+        let Some(entry) = self.sampled_cache.get_mut(index) else {
+            self.sampled_identity_index.remove(&name);
+            return None;
+        };
+        if !entry.has_live_owner() || Self::sampled_entry_name(entry) != Some(name) {
+            if self.sampled_identity_index.get(&name) == Some(&index) {
+                self.sampled_identity_index.remove(&name);
+            }
+            return None;
+        }
         entry.retain_owner(owner);
         entry.last_touch_ms = self.idle_clock_ms;
         let handles = entry.slot.handles();
-        self.sampled_cache.push(entry);
         Some(handles)
     }
 
@@ -4127,16 +4202,15 @@ impl ResourcePools {
                 .fetch_add(1, Ordering::Relaxed);
             return None;
         };
-        let mut entry = self.sampled_cache.remove(index);
         // Same content re-presented under a new identity/generation: adopt it
         // so the fast path serves the follow-up draws.
         if identity.is_some() {
-            entry.identity = identity;
+            self.set_sampled_entry_identity(index, identity);
         }
+        let entry = &mut self.sampled_cache[index];
         entry.retain_owner(owner);
         entry.last_touch_ms = self.idle_clock_ms;
         let handles = entry.slot.handles();
-        self.sampled_cache.push(entry);
         counters.sampled_cache_hits.fetch_add(1, Ordering::Relaxed);
         counters
             .sampled_cache_hit_bytes
@@ -4215,7 +4289,7 @@ impl ResourcePools {
         // something else confirms it. Collapsing two entries here is exactly as
         // wrong as returning the wrong one from `find_cached_sampled` — the
         // survivor then answers for content it was not built from.
-        let duplicate = self.sampled_cache.iter_mut().find(|entry| {
+        let duplicate = self.sampled_cache.iter().position(|entry| {
             entry.has_live_owner()
                 && entry.slot.key() == slot.key()
                 && entry.fingerprint == fingerprint
@@ -4230,11 +4304,12 @@ impl ResourcePools {
                     }
                 }
         });
-        if let Some(existing) = duplicate {
+        if let Some(index) = duplicate {
             crate::runtime::drain::note_store_route("sampled_admit_duplicate");
             if identity.is_some() {
-                existing.identity = identity;
+                self.set_sampled_entry_identity(index, identity);
             }
+            let existing = &mut self.sampled_cache[index];
             existing.retain_owner(owner);
             self.sampled_live.push(slot);
             return;
@@ -4242,7 +4317,7 @@ impl ResourcePools {
         crate::runtime::drain::note_store_route("sampled_admit_kept");
         self.sampled_cache_bytes = self.sampled_cache_bytes.saturating_add(content_len);
         let touch = self.idle_clock_ms;
-        self.sampled_cache.push(ResidentSampledSlot {
+        self.push_sampled_entry(ResidentSampledSlot {
             slot,
             fingerprint,
             content: retained,
@@ -4578,7 +4653,7 @@ mod recycle_tests {
         for i in 0..3u32 {
             let slot = null_slot(16 + i, 16);
             keys.push((slot.key(), named(i as u64)));
-            pools.sampled_cache.push(ResidentSampledSlot {
+            pools.push_sampled_entry(ResidentSampledSlot {
                 slot,
                 fingerprint: SampledFingerprint::Gathered,
                 content: None,

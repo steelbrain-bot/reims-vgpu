@@ -2390,6 +2390,7 @@ fn render_pass_template_reuses_attachment_without_load_seed() {
         colors: vec![draw::ColorRtRequest {
             slot: 0,
             texture_ref: 11,
+            resource: None,
             storage: draw::ColorTargetStorage::Mapping(3),
             width: 1920,
             height: 1080,

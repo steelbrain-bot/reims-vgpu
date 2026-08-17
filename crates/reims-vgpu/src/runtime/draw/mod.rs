@@ -881,6 +881,10 @@ impl LinearColorTarget {
 pub struct ColorRtRequest {
     pub slot: u32,
     pub texture_ref: u32,
+    /// The attachment object retained when the render encoder recorded it.
+    /// References may be deleted and reused before execution; attachment state
+    /// belongs to this object lifetime, just like [`TextureBind::resource`].
+    pub resource: Option<std::sync::Arc<crate::model::TaskResource>>,
     pub storage: ColorTargetStorage,
     pub width: u32,
     pub height: u32,
@@ -4612,6 +4616,7 @@ pub fn color_target_request<M: HostMemory + HostOps>(
     let c0 = ColorRtRequest {
         slot: 0,
         texture_ref: color_texture_ref,
+        resource: objects::resolve_resource(state, host, task_id, color_texture_ref).ok(),
         storage: rt.storage,
         width: rt.width,
         height: rt.height,
@@ -4876,6 +4881,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
         colors.push(ColorRtRequest {
             slot,
             texture_ref: target_ref,
+            resource: objects::resolve_resource(state, host, task_id, target_ref).ok(),
             storage,
             width: mw,
             height: mh,

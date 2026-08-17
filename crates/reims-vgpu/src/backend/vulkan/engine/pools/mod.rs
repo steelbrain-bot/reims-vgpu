@@ -357,6 +357,11 @@ pub(crate) struct ResourcePools {
     /// Exact-content sampled images retained across draw calls. Hash narrows
     /// candidates only; a hit always requires full byte equality.
     sampled_cache: Vec<ResidentSampledSlot>,
+    /// Direct lookup for the retained object name carried by a sampled bind.
+    /// The vector remains the owner of slots because content-based lookup can
+    /// still compare several candidates; this index keeps the ordinary
+    /// retained-reference bind independent of that population's size.
+    sampled_identity_index: HashMap<GatheredName, usize>,
     sampled_cache_bytes: usize,
     /// Linear image views over persistent guest allocations.  Entries are
     /// named by allocation identity plus decoded plane geometry and live until
@@ -1282,11 +1287,22 @@ enum DirectSampledLayout {
 }
 
 struct DirectSampledEntry {
-    image: vk::Image,
-    view: vk::ImageView,
-    import: std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
     owners: Vec<crate::model::TaskResourceLifetimeRef>,
-    layout: DirectSampledLayout,
+    state: DirectSampledState,
+}
+
+enum DirectSampledState {
+    Bound {
+        image: vk::Image,
+        view: vk::ImageView,
+        import: std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
+        layout: DirectSampledLayout,
+    },
+    /// An exact image shape the host has already proved cannot alias this
+    /// resource. The verdict lives with the serialized resource just like a
+    /// successful image; retrying it cannot change the host requirements and
+    /// only repeats driver object creation on every encoder bind.
+    Declined(DirectSampledAdmission),
 }
 
 impl DirectSampledEntry {
@@ -1298,6 +1314,13 @@ impl DirectSampledEntry {
         self.owners.retain(|held| held.is_live());
         if !self.owners.iter().any(|held| held.id() == owner.id()) {
             self.owners.push(owner.clone());
+        }
+    }
+
+    fn import_is_retired(&self) -> bool {
+        match &self.state {
+            DirectSampledState::Bound { import, .. } => import.is_retired(),
+            DirectSampledState::Declined(_) => false,
         }
     }
 }
@@ -1316,6 +1339,7 @@ enum DirectSampledAdmission {
     RowPitch,
     SubresourceOffset,
     BindAlignment,
+    MemoryType,
     MemoryBounds,
 }
 
@@ -1326,6 +1350,7 @@ impl DirectSampledAdmission {
             Self::RowPitch => "direct_sampled_row_pitch",
             Self::SubresourceOffset => "direct_sampled_subresource_offset",
             Self::BindAlignment => "direct_sampled_bind_alignment",
+            Self::MemoryType => "direct_sampled_memory_type",
             Self::MemoryBounds => "direct_sampled_memory_bounds",
         }
     }
@@ -1463,13 +1488,38 @@ mod direct_sampled_admission_tests {
         ));
         let owner = resource.lifetime_ref();
         let entry = DirectSampledEntry {
-            image: vk::Image::null(),
-            view: vk::ImageView::null(),
-            import: source().import,
             owners: vec![owner],
-            layout: DirectSampledLayout::General,
+            state: DirectSampledState::Bound {
+                image: vk::Image::null(),
+                view: vk::ImageView::null(),
+                import: source().import,
+                layout: DirectSampledLayout::General,
+            },
         };
         assert!(entry.has_live_owner());
+        drop(resource);
+        assert!(!entry.has_live_owner());
+    }
+
+    #[test]
+    fn direct_image_decline_ends_with_its_serialized_resource() {
+        let resource = std::sync::Arc::new(crate::model::TaskResource::new(
+            Default::default(),
+            std::sync::Arc::from([]),
+        ));
+        let owner = resource.lifetime_ref();
+        let entry = DirectSampledEntry {
+            owners: vec![owner],
+            state: DirectSampledState::Declined(DirectSampledAdmission::RowPitch),
+        };
+
+        assert!(entry.has_live_owner());
+        assert!(!entry.import_is_retired());
+        assert!(matches!(
+            entry.state,
+            DirectSampledState::Declined(DirectSampledAdmission::RowPitch)
+        ));
+
         drop(resource);
         assert!(!entry.has_live_owner());
     }
@@ -1564,7 +1614,7 @@ impl SampledSlot {
 /// a fingerprint; the twin counter is named through this type, and any new site
 /// should be. A site that dropped the identity term would bind one surface's
 /// pixels for another's, and only this type's own test would notice.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct GatheredName {
     pub(crate) key: SampledKey,
     pub(crate) identity: crate::backend::vulkan::engine::SampledContentIdentity,
