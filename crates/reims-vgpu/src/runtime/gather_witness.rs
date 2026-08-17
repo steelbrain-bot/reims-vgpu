@@ -586,20 +586,27 @@ impl GatherWitness {
     }
 
     /// Drop the least recently bound window, releasing its token.
-    fn evict_oldest<M: crate::runtime::host::HostOps>(&mut self, host: &mut M) {
-        let Some(victim) = self
+    ///
+    /// Returns the window it dropped and that window's span, so the caller can
+    /// name the loss. An eviction is not bookkeeping: the next bind of the
+    /// evicted window has no entry, so it re-gathers — the CPU re-packs a window
+    /// it had already vouched for. Reporting only how many were dropped says
+    /// nothing about *which*, and an overflow that cannot be attributed to a
+    /// window cannot be attributed to a workload either.
+    fn evict_oldest<M: crate::runtime::host::HostOps>(
+        &mut self,
+        host: &mut M,
+    ) -> Option<(GatherKey, u64)> {
+        let victim = self
             .entries
             .iter()
             .min_by_key(|(_, entry)| entry.last_seen)
-            .map(|(key, _)| *key)
-        else {
-            return;
-        };
-        if let Some(entry) = self.entries.remove(&victim) {
-            if entry.token != 0 {
-                host.untrack_guest_writes(entry.token);
-            }
+            .map(|(key, _)| *key)?;
+        let entry = self.entries.remove(&victim)?;
+        if entry.token != 0 {
+            host.untrack_guest_writes(entry.token);
         }
+        Some((victim, entry.span))
     }
 }
 
@@ -936,7 +943,15 @@ pub struct GatherObservation {
     pub stated: StatedGuestWrite,
 }
 
-/// The one way this witness can be wrong.
+/// What this witness reports on the fail channel: one way it can be wrong, and
+/// one way its table can cost the guest work.
+///
+/// The two are different failures and read differently. [`Self::VouchedBytesMoved`]
+/// means a bind was served stale bytes — a correctness loss, and the audit is
+/// the only instrument that sees it. [`Self::TrackedWindowEvicted`] means nothing
+/// was served wrongly and the CPU re-packs a window it had already vouched for —
+/// a cost, not a corruption. Both are named because both are guest work this
+/// device did not have to spend.
 #[derive(Clone, Copy, Debug)]
 pub enum GatherWitnessFault {
     /// Both halves vouched for a window and the content audit found its bytes
@@ -947,12 +962,22 @@ pub enum GatherWitnessFault {
         span: u64,
         binds: u32,
     },
+    /// [`MAX_TRACKED_WINDOWS`] was reached and the least recently bound window
+    /// was dropped to make room. Names the window that lost its entry and the
+    /// bound that displaced it, so an overflow can be attributed to a workload
+    /// rather than counted.
+    TrackedWindowEvicted {
+        key: GatherKey,
+        span: u64,
+        tracked: usize,
+    },
 }
 
 impl crate::observe::decline::Decline for GatherWitnessFault {
     fn slug(&self) -> &'static str {
         match self {
             Self::VouchedBytesMoved { .. } => "gather_witness_vouched_bytes_moved",
+            Self::TrackedWindowEvicted { .. } => "gather_witness_tracked_window_evicted",
         }
     }
 
@@ -962,6 +987,11 @@ impl crate::observe::decline::Decline for GatherWitnessFault {
                 ("window", key.log_token()),
                 ("span", span.to_string()),
                 ("binds", binds.to_string()),
+            ],
+            Self::TrackedWindowEvicted { key, span, tracked } => vec![
+                ("window", key.log_token()),
+                ("span", span.to_string()),
+                ("tracked", tracked.to_string()),
             ],
         }
     }
@@ -1239,7 +1269,21 @@ fn observe<M: crate::runtime::host::HostOps>(
     witness.binds = witness.binds.wrapping_add(1);
     while witness.entries.len() >= MAX_TRACKED_WINDOWS && !witness.entries.contains_key(&key) {
         crate::runtime::drain::note_store_route("gw_window_overflow");
-        witness.evict_oldest(host);
+        // The counter carries the magnitude; the decline carries the identity.
+        // Deduped per evicted window, because a window thrashing in and out of
+        // the table reports the same loss on every pass and the count above
+        // already says how often.
+        if let Some((victim, span)) = witness.evict_oldest(host) {
+            crate::observe::emit::Emit::decline(
+                "gather_witness",
+                &GatherWitnessFault::TrackedWindowEvicted {
+                    key: victim,
+                    span,
+                    tracked: MAX_TRACKED_WINDOWS,
+                },
+            )
+            .fail_once(victim.content_key());
+        }
     }
 
     let stale = match witness.entries.get(&key) {
@@ -2180,5 +2224,71 @@ mod tests {
         let short = unsafe { fold_runs(&[run_over(&buf)], 64) };
         let head = vec![3u8; 64];
         assert_eq!(short, unsafe { fold_runs(&[run_over(&head)], 64) });
+    }
+
+    /// An eviction names the window it dropped, and drops the least recently
+    /// bound one.
+    ///
+    /// The identity is the whole point: `gw_window_overflow` counts evictions
+    /// and can say how many, never which, so an overflow it reports alone cannot
+    /// be attributed to a window. The re-touch below is what separates the two
+    /// possible answers — without it, "least recently bound" and "first
+    /// inserted" pick the same victim and the test would pass on either rule.
+    #[test]
+    fn an_eviction_names_the_least_recently_bound_window_it_dropped() {
+        let mut host = crate::runtime::host::FakeHost::new();
+        let mut w = GatherWitness::default();
+        let buf = vec![0x5au8; PAGE];
+        let runs = [run_over(&buf)];
+
+        let key_at = |i: u64| GatherKey::Mapping {
+            mid: 11,
+            base_off: i * PAGE as u64,
+        };
+        let gpas_at = |i: u64| [(64 + i) * PAGE as u64];
+
+        // Fill the table exactly, oldest first.
+        for i in 0..MAX_TRACKED_WINDOWS as u64 {
+            let gpas = gpas_at(i);
+            observe(
+                &mut w,
+                &mut host,
+                key_at(i),
+                one_page(&gpas, &runs),
+                QUIET,
+                next_gen(),
+            );
+        }
+        assert_eq!(w.entries.len(), MAX_TRACKED_WINDOWS);
+
+        // Re-touch the first, so it is no longer the least recently bound. The
+        // second is now the victim, and it is not the one insertion order names.
+        let gpas0 = gpas_at(0);
+        observe(
+            &mut w,
+            &mut host,
+            key_at(0),
+            one_page(&gpas0, &runs),
+            QUIET,
+            next_gen(),
+        );
+
+        let dropped = w
+            .evict_oldest(&mut host)
+            .expect("a full table has a window to drop");
+        assert_eq!(
+            dropped,
+            (key_at(1), PAGE as u64),
+            "the eviction named the wrong window, or reported no span"
+        );
+        assert!(!w.entries.contains_key(&key_at(1)));
+        assert!(
+            w.entries.contains_key(&key_at(0)),
+            "the re-touched window was evicted, so the victim is insertion order and not recency"
+        );
+
+        // An empty table has nothing to name, and must not invent one.
+        let mut empty = GatherWitness::default();
+        assert!(empty.evict_oldest(&mut host).is_none());
     }
 }
