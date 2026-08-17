@@ -1063,7 +1063,7 @@ pub(crate) unsafe fn execute_compute_inner(
             VkOp::ComputeExecMapStorageReadback,
             VkOp::ComputeExecInvalidateStorageReadback,
         )?;
-        counters.note_readback(*len as u64);
+        counters.note_readback(*len as u64, super::counters::ReadbackSource::ComputeBuffer);
         buffers.push(ComputeBufferOutput {
             binding: *binding,
             bytes: out,
@@ -1079,7 +1079,7 @@ pub(crate) unsafe fn execute_compute_inner(
             VkOp::ComputeExecMapImageReadback,
             VkOp::ComputeExecInvalidateImageReadback,
         )?;
-        counters.note_readback(prepared.len as u64);
+        counters.note_readback(prepared.len as u64, super::counters::ReadbackSource::ComputeImage);
         images.push(out);
     }
 

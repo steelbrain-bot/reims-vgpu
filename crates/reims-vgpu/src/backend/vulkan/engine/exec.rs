@@ -5779,7 +5779,7 @@ pub(crate) unsafe fn execute_draw_inner(
         VkOp::ExecMapReadback,
         VkOp::ExecInvalidateReadback,
     )?;
-    counters.note_readback(rb_size);
+    counters.note_readback(rb_size, super::counters::ReadbackSource::DrawTail);
 
     // Read at the attachment's width above, narrowed here to the RGBA8 a
     // `DrawOutput` consumer speaks. Shared with `read_target`'s rail so the two
