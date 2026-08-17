@@ -382,6 +382,11 @@ pub struct DrawRequest {
     /// module words; `Arc` avoids a full-module copy per draw.
     pub vert_spirv: std::sync::Arc<Vec<u32>>,
     pub frag_spirv: std::sync::Arc<Vec<u32>>,
+    /// Statically used uniform-constant bindings derived once from the exact
+    /// executable variants above. The engine compares these with each draw's
+    /// layout before it lets the host compile the pipeline.
+    pub vert_used_descriptor_bindings: std::sync::Arc<[u32]>,
+    pub frag_used_descriptor_bindings: std::sync::Arc<[u32]>,
     pub width: u32,
     pub height: u32,
     pub vertex_count: u32,

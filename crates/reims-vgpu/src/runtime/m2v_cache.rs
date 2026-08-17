@@ -332,6 +332,17 @@ pub struct ShaderVariant {
     /// with nothing in the log to say so. Interleaving is not optional for a pin
     /// comparison on this host.
     pub samplers: Arc<[crate::runtime::spirv_bind::ReflectedSamplerDescriptor]>,
+    /// Uniform-constant descriptor bindings the executable module statically
+    /// uses, in this variant's binding numbering.
+    ///
+    /// Vulkan requires each of these to appear in the pipeline layout. The
+    /// engine checks that relation for every draw because a missing binding can
+    /// crash a host driver during pipeline creation, but the left-hand set is
+    /// immutable shader state: deriving it from the full module at every draw
+    /// reconstructed state already retained here. Keeping it beside `words`
+    /// also makes relocation agreement structural rather than a call-site
+    /// convention.
+    pub used_descriptor_bindings: Arc<[u32]>,
 }
 
 impl ShaderVariant {
@@ -339,7 +350,18 @@ impl ShaderVariant {
         words: Arc<Vec<u32>>,
         samplers: Arc<[crate::runtime::spirv_bind::ReflectedSamplerDescriptor]>,
     ) -> Arc<Self> {
-        Arc::new(Self { words, samplers })
+        let used_descriptor_bindings = crate::runtime::spirv_bind::declared_binding_numbers(&words)
+            .into_iter()
+            .filter(|binding| {
+                crate::runtime::spirv_bind::descriptor_static_use(&words, *binding).is_violation()
+            })
+            .collect::<Vec<_>>()
+            .into();
+        Arc::new(Self {
+            words,
+            samplers,
+            used_descriptor_bindings,
+        })
     }
 }
 
@@ -1241,6 +1263,36 @@ mod tests {
                 "variant({separate_sampled}, {buf_collide}) was rebuilt"
             );
         }
+    }
+
+    /// Static use belongs to the executable variant, not to each draw that
+    /// binds it. A declaration alone is legal to omit from a Vulkan layout;
+    /// only an instruction reference enters the retained guard set.
+    #[test]
+    fn a_variant_retains_only_statically_used_descriptor_bindings() {
+        let unused = crate::runtime::spirv_bind::test_support::module_with_descriptor(33, false);
+        let used = crate::runtime::spirv_bind::test_support::module_with_descriptor(34, true);
+
+        let unused_shader = synth_shader(
+            Stage::Fragment,
+            unused.iter().flat_map(|word| word.to_le_bytes()).collect(),
+        );
+        let used_shader = synth_shader(
+            Stage::Fragment,
+            used.iter().flat_map(|word| word.to_le_bytes()).collect(),
+        );
+
+        assert!(unused_shader
+            .variant(false, false)
+            .used_descriptor_bindings
+            .is_empty());
+        assert_eq!(
+            used_shader
+                .variant(false, false)
+                .used_descriptor_bindings
+                .as_ref(),
+            &[34]
+        );
     }
 
     /// A minimal `CachedShader` wrapping raw bytes with an empty reflection —

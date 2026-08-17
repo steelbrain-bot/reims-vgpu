@@ -7765,6 +7765,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
         resources.vert_spirv = v_words;
         resources.frag_spirv = f_words;
+        resources.vert_used_descriptor_bindings = v_variant.used_descriptor_bindings.clone();
+        resources.frag_used_descriptor_bindings = f_variant.used_descriptor_bindings.clone();
         resources.width = w;
         resources.height = h;
         resources.vertex_count = vertex_count;
