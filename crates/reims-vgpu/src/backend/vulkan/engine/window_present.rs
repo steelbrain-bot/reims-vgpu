@@ -438,65 +438,34 @@ impl PendingWindowPresent {
     }
 }
 
-/// MAILBOX where the surface offers it, FIFO where it does not.
+/// The presentation mode and image count passed to one swapchain creation.
 ///
-/// FIFO is the only mode Vulkan guarantees, so it is the fallback — including
-/// when the mode query itself fails, which reaches here as an empty slice.
-pub(crate) fn choose_present_mode(supported: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
-    if supported.contains(&vk::PresentModeKHR::MAILBOX) {
-        vk::PresentModeKHR::MAILBOX
-    } else {
-        vk::PresentModeKHR::FIFO
-    }
-}
-
-/// The two swapchain decisions that have to be made together, returned together.
-///
-/// They were computed separately and only one of them reached
-/// `vkCreateSwapchainKHR`: the mode was chosen, handed to
-/// [`swapchain_image_count`], and then dropped in favour of a literal `FIFO` in
-/// the create info. The census printed the *chosen* mode, so a log read
-/// `present_mode=mailbox` beside a swapchain that was FIFO, and the change that
-/// introduced the choice measured "no effect" because it never reached the
-/// driver. One value carried in one struct is what stops that shape: the count
-/// is derived from the very mode the create info is given.
+/// Keeping them in one value makes the logged plan the plan the driver receives.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SwapchainPlan {
     pub present_mode: vk::PresentModeKHR,
     pub image_count: u32,
 }
 
-/// The mode the surface offers and the image count that mode needs.
-pub(crate) fn swapchain_plan(
-    caps_min: u32,
-    caps_max: u32,
-    supported: &[vk::PresentModeKHR],
-) -> SwapchainPlan {
-    let present_mode = choose_present_mode(supported);
+/// The guaranteed FIFO mode and an image count inside the surface's bounds.
+pub(crate) fn swapchain_plan(caps_min: u32, caps_max: u32) -> SwapchainPlan {
     SwapchainPlan {
-        present_mode,
-        image_count: swapchain_image_count(caps_min, caps_max, present_mode),
+        // FIFO is the only mode every Vulkan surface must provide.  The host
+        // window retains a submitted image until a newer guest frame arrives;
+        // it does not need MAILBOX's replace-pending semantics to implement
+        // that contract.
+        present_mode: vk::PresentModeKHR::FIFO,
+        image_count: swapchain_image_count(caps_min, caps_max),
     }
 }
 
-/// The MAILBOX floor: one image queued, one being drawn, one to replace with.
+/// Swapchain image count inside the surface's own bounds.
 ///
-/// Named rather than written inline because [`PRESENT_IN_FLIGHT`] is bounded by
-/// it, and a bound that restates a literal from another function is the kind
-/// that stops being true silently.
-const MAILBOX_MIN_IMAGES: u32 = 3;
-
-/// Swapchain image count for a mode, inside the surface's own bounds.
-///
-/// `min + 1` is the usual one-spare rule. MAILBOX needs a third image to have
-/// something to replace while one is queued and one is being drawn, so the floor
-/// is raised on that arm only — and `max_image_count` still wins, since a
-/// surface that caps at two cannot be argued with (0 means no maximum).
-pub(crate) fn swapchain_image_count(caps_min: u32, caps_max: u32, mode: vk::PresentModeKHR) -> u32 {
+/// The surface's minimum covers its presentation engine; one spare lets the
+/// producer acquire while that minimum is occupied. `max_image_count` still
+/// wins, and zero still means that the surface declares no maximum.
+pub(crate) fn swapchain_image_count(caps_min: u32, caps_max: u32) -> u32 {
     let mut count = caps_min.saturating_add(1);
-    if mode == vk::PresentModeKHR::MAILBOX {
-        count = count.max(MAILBOX_MIN_IMAGES);
-    }
     if caps_max != 0 {
         count = count.min(caps_max);
     }
@@ -671,13 +640,7 @@ const ACQUIRE_WAIT_STAGE: vk::PipelineStageFlags = vk::PipelineStageFlags::TRANS
 /// panics on roughly a third of driven boots for reasons of its own, three clean
 /// boots is an unremarkable draw from that rate, and this says nothing about
 /// whether the rate moved. It is the presenter that was being measured.
-const PRESENT_IN_FLIGHT: usize = MAILBOX_MIN_IMAGES as usize;
-
-/// At least as deep as the single-flight presenter this replaced, so indexing
-/// `frames` is always valid, and no deeper than the swapchain's own floor.
-/// Both ends are relations against values derived elsewhere rather than
-/// restatements of this line.
-const _: () = assert!(PRESENT_IN_FLIGHT >= 1 && PRESENT_IN_FLIGHT <= MAILBOX_MIN_IMAGES as usize);
+const PRESENT_IN_FLIGHT: usize = 3;
 
 impl WindowPresenter {
     /// How deep to run, after the environment has had its say.
@@ -969,38 +932,7 @@ impl WindowPresenter {
                     .clamp(caps.min_image_extent.height, caps.max_image_extent.height),
             }
         };
-        // MAILBOX where the surface offers it, FIFO where it does not.
-        //
-        // This rail acquires with a **zero timeout** and treats NOT_READY as a
-        // dropped frame, because the caller is the drain worker and blocking it
-        // on a vblank would stall guest command processing. Under FIFO an image
-        // only becomes acquirable when the presentation engine releases one at
-        // a refresh boundary, so a non-blocking acquire fails whenever the
-        // queue is full — and the frame is thrown away rather than deferred.
-        //
-        // Measured on a driven x86 boot: `host_window_cadence` reads
-        // `offered=51 presents=20 busy_acquire=330` per second, pinned at
-        // exactly 20.0 Hz. Three fifths of the frames the guest produced never
-        // reached the screen, and the window showed content up to 50 ms stale.
-        //
-        // MAILBOX is the mode whose contract matches this consumer: the
-        // presentation engine keeps one pending image and *replaces* it, so an
-        // image is essentially always acquirable and the newest frame is the one
-        // displayed. A producer faster than the display stops losing frames and
-        // starts superseding them, which is what the caller already assumes.
-        //
-        // Capability-gated with no vendor or driver test, and FIFO remains the
-        // fallback because it is the only mode Vulkan guarantees. MAILBOX also
-        // wants a third image to have something to replace, so the count floor
-        // is raised only on that arm and only within `max_image_count`.
-        let plan = swapchain_plan(
-            caps.min_image_count,
-            caps.max_image_count,
-            self.surface_loader
-                .get_physical_device_surface_present_modes(ctx.pd, self.surface)
-                .as_deref()
-                .unwrap_or(&[]),
-        );
+        let plan = swapchain_plan(caps.min_image_count, caps.max_image_count);
         let composite_alpha = [
             vk::CompositeAlphaFlagsKHR::OPAQUE,
             vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED,
@@ -2237,119 +2169,17 @@ mod tests {
         );
     }
 
-    /// A producer faster than the display must supersede frames, not lose them.
-    ///
-    /// This rail acquires with a zero timeout because the caller is the drain
-    /// worker and blocking it on a vblank stalls guest command processing. Under
-    /// FIFO an image is only acquirable at a refresh boundary, so a non-blocking
-    /// acquire fails whenever the queue is full and the frame is dropped: a
-    /// driven boot measured `offered=51 presents=20 busy_acquire=330` per
-    /// second, pinned at exactly 20.0 Hz with three fifths of the guest's frames
-    /// never reaching the screen. MAILBOX replaces the pending image instead, so
-    /// an image stays acquirable and the newest frame is the one shown.
+    /// The plan uses Vulkan's guaranteed presentation mode and keeps one image
+    /// spare inside the surface's declared bounds.
     #[test]
-    fn the_swapchain_prefers_mailbox_and_falls_back_to_fifo() {
-        use super::{choose_present_mode, swapchain_image_count};
-        let fifo = vk::PresentModeKHR::FIFO;
-        let mailbox = vk::PresentModeKHR::MAILBOX;
-
-        assert_eq!(choose_present_mode(&[fifo, mailbox]), mailbox);
-        assert_eq!(
-            choose_present_mode(&[fifo, vk::PresentModeKHR::IMMEDIATE]),
-            fifo,
-            "IMMEDIATE tears and is not a substitute"
-        );
-        // A failed mode query arrives as an empty slice, and FIFO is the only
-        // mode Vulkan guarantees, so it is what an unknown surface gets.
-        assert_eq!(choose_present_mode(&[]), fifo);
-
-        // MAILBOX needs a third image; FIFO keeps the one-spare rule.
-        assert_eq!(swapchain_image_count(2, 0, mailbox), 3);
-        assert_eq!(swapchain_image_count(1, 0, mailbox), 3);
-        assert_eq!(swapchain_image_count(1, 0, fifo), 2);
-        assert_eq!(swapchain_image_count(3, 0, mailbox), 4);
-        // The surface's own maximum still wins over the MAILBOX floor: a
-        // surface that caps at two cannot be argued into three.
-        assert_eq!(swapchain_image_count(1, 2, mailbox), 2);
-        assert_eq!(swapchain_image_count(2, 3, mailbox), 3);
-    }
-
-    /// The mode that sizes the image count must be the mode the swapchain gets.
-    ///
-    /// It was not. `choose_present_mode` picked MAILBOX, the count was raised to
-    /// three on that basis, and the create info was then handed a literal
-    /// `FIFO` — while the census printed the *chosen* mode, so a live log read
-    /// `present_mode=mailbox images=3` for a swapchain that was FIFO. The
-    /// session that introduced the choice measured "no effect on presents" and
-    /// recorded that MAILBOX does not help, because the driver never saw it.
-    ///
-    /// The test the old shape could pass is the one above: both halves were
-    /// correct in isolation and only their pairing was not. So this asserts the
-    /// pairing — one plan, whose count is derived from the very mode the create
-    /// info reads.
-    #[test]
-    fn the_swapchain_plan_sizes_its_images_for_the_mode_it_will_actually_ask_for() {
+    fn the_swapchain_plan_is_fifo_with_one_spare_image() {
         use super::swapchain_plan;
         let fifo = vk::PresentModeKHR::FIFO;
-        let mailbox = vk::PresentModeKHR::MAILBOX;
-
-        let offered = swapchain_plan(2, 0, &[fifo, mailbox]);
-        assert_eq!(offered.present_mode, mailbox);
-        assert_eq!(
-            offered.image_count, 3,
-            "a three-image count is only justified by the mode that needs it"
-        );
-
-        let bare = swapchain_plan(2, 0, &[fifo]);
-        assert_eq!(bare.present_mode, fifo);
-        assert_eq!(
-            bare.image_count, 3,
-            "min+1 with caps_min=2 is three under either mode"
-        );
-        assert_eq!(swapchain_plan(1, 0, &[fifo]).image_count, 2);
-
-        // A surface that caps at two forces FIFO's count onto a MAILBOX plan;
-        // the mode is still MAILBOX, because the cap is about images.
-        let capped = swapchain_plan(1, 2, &[fifo, mailbox]);
-        assert_eq!(capped.present_mode, mailbox);
-        assert_eq!(capped.image_count, 2);
-    }
-
-    /// The present depth must be servable by the swapchain the plan asks for.
-    ///
-    /// The two numbers are derived from one constant now, so this cannot drift
-    /// by a rename — but it can drift by someone raising [`PRESENT_IN_FLIGHT`]
-    /// for its own sake. An entry past the image count cannot acquire, so it
-    /// would refuse as `busy_acquire` forever: the presenter would look like it
-    /// had depth while permanently wasting its last slot, and the counter that
-    /// says so is the one nobody reads when `busy_fence` is the suspect.
-    ///
-    /// The capped case is asserted too, and asserted as *tolerated* rather than
-    /// as correct: a surface that will only give two images leaves the third
-    /// entry unusable, and that is safe and self-reporting rather than a bug.
-    #[test]
-    fn the_present_depth_is_servable_by_the_swapchain_it_asks_for() {
-        use super::{swapchain_plan, MAILBOX_MIN_IMAGES, PRESENT_IN_FLIGHT};
-        let fifo = vk::PresentModeKHR::FIFO;
-        let mailbox = vk::PresentModeKHR::MAILBOX;
-
-        assert_eq!(
-            PRESENT_IN_FLIGHT, MAILBOX_MIN_IMAGES as usize,
-            "the depth is the swapchain's own floor, not a number of its own"
-        );
-        let plan = swapchain_plan(1, 0, &[fifo, mailbox]);
-        assert_eq!(plan.present_mode, mailbox);
-        assert!(
-            plan.image_count as usize >= PRESENT_IN_FLIGHT,
-            "a MAILBOX swapchain must be able to serve every in-flight present: \
-             {} images against depth {PRESENT_IN_FLIGHT}",
-            plan.image_count
-        );
-
-        let capped = swapchain_plan(1, 2, &[fifo, mailbox]);
-        assert!(
-            (capped.image_count as usize) < PRESENT_IN_FLIGHT,
-            "a surface capped at two is the case the depth cannot be served in"
-        );
+        assert_eq!(swapchain_plan(2, 0).present_mode, fifo);
+        assert_eq!(swapchain_plan(2, 0).image_count, 3);
+        assert_eq!(swapchain_plan(1, 0).image_count, 2);
+        assert_eq!(swapchain_plan(3, 0).image_count, 4);
+        assert_eq!(swapchain_plan(1, 2).image_count, 2);
+        assert_eq!(swapchain_plan(2, 3).image_count, 3);
     }
 }
