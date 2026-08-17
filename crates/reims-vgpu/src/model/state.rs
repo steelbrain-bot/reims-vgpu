@@ -1245,8 +1245,7 @@ pub struct MapperCapture {
 /// reader must check that before trusting it. Six sites clear or replace
 /// `page_entries` and every one of them bumps the generation, so a carried-over
 /// walk is unusable by construction rather than by every future writer
-/// remembering to retire a second field — the same rule
-/// [`MappingEntry::guest_write_token_gen`] states for the same reason.
+/// remembering to retire a second field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Type4Walk {
     /// Task whose page table translated the backing pages.
@@ -1494,42 +1493,6 @@ pub struct MappingEntry {
     /// Without it every caller repeats a host mapping attempt that cannot
     /// become possible until the guest changes the list.
     pub contig_refused_gen: Option<u32>,
-    /// Live [`crate::runtime::host::HostOps::track_guest_writes`] token for the
-    /// page list in [`Self::page_entries`], or 0 when the host cannot observe
-    /// guest writes (or none has been asked for yet).
-    ///
-    /// Retired next to [`Self::contig_ptr`] and for the same reason: both name
-    /// the page list as it stood, so anything that changes the list invalidates
-    /// both. A token that outlived its list would report writes to pages this
-    /// surface no longer owns and miss writes to the ones it does.
-    pub guest_write_token: u64,
-    /// [`Self::page_generation`] the token above was built for.
-    ///
-    /// The lifecycle mutators retire the token eagerly, but they are not the
-    /// only writers of [`Self::page_entries`]: the mapper's plan adoption and
-    /// the type-4 page refresh both replace the list in place, and both retired
-    /// the contiguous view while leaving the token behind — a token naming
-    /// pages the surface no longer owns, which is the one thing it must never
-    /// be. Rather than add a third and a fourth site to remember,
-    /// `page_generation` is the key: every writer of the list already bumps it
-    /// exactly when the list changes, so a token whose generation does not
-    /// match is unusable by construction, and the eager retirement is left as
-    /// what it should have been — a way to free host state promptly rather than
-    /// the thing correctness rests on.
-    pub guest_write_token_gen: u32,
-    /// [`crate::runtime::host::HostOps::guest_write_gen`] as it stood when this
-    /// mapping's pixels were last published by a device Store.
-    ///
-    /// The other half of the type-11 seed currency test.
-    /// [`Self::surface_content_epoch`] can only witness writers inside this
-    /// crate — every caller of `mark_mapping_written` is one — and a surface's
-    /// pages are plain guest RAM the guest CPU stores into with no device
-    /// operation at all. This is what sees that store.
-    ///
-    /// 0 means no Store has stamped it, or the host could not answer, and
-    /// never compares equal to a live generation (the host's first readable
-    /// generation is 1).
-    pub guest_write_gen_at_store: u64,
     /// Task id that last owned this surface as a type-4 `OBJECT_TYPE_SURFACE`
     /// object (0 = no non-trivial hint; task 0 is always probed first anyway).
     /// `resolve_type4_surface_ex` probes this task right after task 0 so a
@@ -1839,24 +1802,6 @@ pub struct HostSurface {
     ///
     /// `true` for the surface_id and texture_ref caches, which have no cap.
     pub guest_holds_bytes: bool,
-    // No guest-CPU-write witness sits here, and that is a known gap rather
-    // than an omission. `surface_cache::gva_backing_state` answers whether this
-    // GVA still *names* these pages; nothing answers whether the guest CPU
-    // *wrote* them.
-    // A guest store into pages that never moved produces no notify, no verdict
-    // and no device operation, so this entry can keep serving bytes the guest
-    // has already replaced.
-    //
-    // A `track_guest_writes` token used to sit here for exactly that. It could
-    // never answer: its baseline was latched immediately after the token was
-    // registered, inside the dirty tracker's two-harvest startup window where a
-    // generation reads 0, and was re-latched only by a later store to the same
-    // address. The entries this cache exists for are stored once and sampled
-    // forever, so their baseline stayed 0 for the boot. Over five boots the
-    // comparison it existed to make ran zero times. Anything reinstating it has
-    // to fix that first: re-read the baseline until it is non-zero, the way
-    // `mapper::stamp_guest_write_gen` gets it right on the mapping rail by
-    // re-stamping on every write.
 }
 
 /// Raw type-2/3 texture content retained by the discrete backend.
@@ -2489,15 +2434,11 @@ pub struct DeviceState {
     /// ([`GUEST_LINEAR_MEMO_BYTE_CAP`]): a cap crossing evicts the least-recently
     /// -used entries down to a low-water mark, never bulk-clearing the hot set.
     pub guest_linear_memo: LruBytesMemo<(u32, u64, u32, u32, u32, u16), GuestLinearMemo>,
-    /// Whether the hypervisor's guest-write generation would be a sound "these
-    /// texels did not change" key for the zero-copy sampled gathers, measured
-    /// against the bytes themselves. See
-    /// [`crate::runtime::gather_witness`] — it selects no behaviour.
+    /// Contract-owned currency for zero-copy sampled gathers.
     #[cfg(feature = "backend-vulkan")]
     pub gather_witness: crate::runtime::gather_witness::GatherWitness,
-    /// The GVA render targets a Store has stamped, and what the two write
-    /// witnesses said at the time. The GVA half of the type-11 witness that
-    /// licenses the attachment LOAD elision — see
+    /// GVA render targets stamped against decoded resource validity and exact
+    /// device writes. See
     /// [`crate::runtime::gva_store_witness`].
     #[cfg(feature = "backend-vulkan")]
     pub gva_store_witness: crate::runtime::gva_store_witness::GvaStoreWitness,
@@ -2508,12 +2449,11 @@ pub struct DeviceState {
     /// See [`crate::runtime::bound_buffers`].
     #[cfg(feature = "backend-vulkan")]
     pub bound_buffers: crate::runtime::bound_buffers::BoundBuffers,
-    /// When the guest last declared a write to each **buffer** object.
+    /// When the guest last declared a write to each task-local resource object.
     ///
-    /// The half of the validity quad `resource_validity::apply` has nowhere to
-    /// put: a buffer has no mapping, so its `content_generation` does not exist
-    /// and the statement was being decoded and dropped. Ungated, because the
-    /// producer is the decoder rather than a backend. See
+    /// This preserves the validity statement in the resource-ref namespace;
+    /// mapping generations preserve the same statement in mapping-id space.
+    /// Ungated, because the producer is the decoder rather than a backend. See
     /// [`crate::runtime::buffer_write_gen`].
     pub buffer_write_gen: crate::runtime::buffer_write_gen::BufferWriteGens,
     /// Monotonic source for every sampled-content generation this device
@@ -2536,15 +2476,8 @@ pub struct DeviceState {
     pub sampled_content_gen: u64,
     /// Which guest pages this device has written, and when.
     ///
-    /// The hypervisor dirty bitmap witnesses guest CPU stores and nothing else,
-    /// so a host-side write into the same pages is invisible to it — a copy
-    /// vouched for by "the guest did not write" can still be stale because *we*
-    /// wrote. This is the record that separates the two, and it is page-exact
-    /// because nothing coarser is sound: guest pages are reachable under more
-    /// than one mapping id, so a per-mapping count says nothing about the pages
-    /// themselves, and a device-global one invalidates a texture because an
-    /// unrelated scanout was composited. Both coarser counts were built, measured
-    /// and removed; [`crate::runtime::host_writes`] carries the readings.
+    /// Page-exact because guest pages can be reachable through more than one
+    /// resource name; a mapping-local generation cannot see those aliases.
     pub host_writes: crate::runtime::host_writes::HostWrites,
     /// Reusable native-row read buffer for the guest-linear memo path.
     pub guest_linear_scratch: Vec<u8>,
@@ -2660,11 +2593,6 @@ pub struct DeviceState {
     /// Backend parent allocations detached with `retired_views`. The runtime
     /// retires the GPU import before releasing the host view it aliases.
     pub retired_guest_imports: Vec<crate::runtime::guest_ram::ImportId>,
-    /// Guest-write tokens whose page list is gone, awaiting release through
-    /// `HostOps::untrack_guest_writes`. Drained by
-    /// `mapper::flush_retired_views` alongside `retired_views`, for the same
-    /// reason: both are host-side state this crate cannot free itself.
-    pub retired_guest_write_tokens: Vec<u64>,
     /// Task-GVA HostOps views (zero-copy import substrate). Dropped on
     /// overlapping UnmapMemory/MapMemory2; flushed via `retired_views`.
     pub gva_host_views: Vec<GvaHostView>,
@@ -2807,7 +2735,6 @@ impl DeviceState {
             draining_mask: 0,
             retired_views: Vec::new(),
             retired_guest_imports: Vec::new(),
-            retired_guest_write_tokens: Vec::new(),
             retired_linear_residents: Vec::new(),
             pending_writebacks: crate::runtime::writeback_debt::PendingWritebacks::default(),
             completion_stamp_seq: 0,
@@ -2849,30 +2776,10 @@ impl DeviceState {
         (view, import)
     }
 
-    /// Detach the guest-write token, returning it for release through
-    /// [`crate::runtime::host::HostOps::untrack_guest_writes`].
-    ///
-    /// Called wherever [`Self::take_mapping_view`] is: the token and the view
-    /// both name the page list as it stood, so a change to the list retires
-    /// both. Also clears the Store stamp — a generation recorded against a
-    /// released token cannot vouch for anything, and leaving it would let a
-    /// re-tracked set's first readable generation coincide with it.
-    fn take_guest_write_token(e: &mut MappingEntry) -> u64 {
-        e.guest_write_gen_at_store = 0;
-        e.guest_write_token_gen = 0;
-        std::mem::replace(&mut e.guest_write_token, 0)
-    }
-
     /// Retire sampled-window witnesses bound to one mapping lifetime.
-    ///
-    /// These tokens live in [`crate::runtime::gather_witness::GatherWitness`]
-    /// rather than in [`MappingEntry`], so every mapping lifecycle transition
-    /// that retires the entry's page-bound view must retire them explicitly as
-    /// part of the same operation.
     #[cfg(feature = "backend-vulkan")]
     fn retire_mapping_gather_witness(&mut self, mapping_id: u32) {
-        self.retired_guest_write_tokens
-            .extend(self.gather_witness.retire_mapping(mapping_id));
+        self.gather_witness.retire_mapping(mapping_id);
     }
 
     /// Detach every HostOps mapping owned by the current guest lifetime.
@@ -2882,7 +2789,6 @@ impl DeviceState {
     /// then release them through the bound HostOps implementation.
     pub fn take_all_host_views(&mut self) -> Vec<(usize, usize)> {
         let mut views = std::mem::take(&mut self.retired_views);
-        let mut tokens = std::mem::take(&mut self.retired_guest_write_tokens);
         for mapping in self.mappings.values_mut() {
             let (view, import) = Self::take_mapping_view(mapping);
             if let Some(view) = view {
@@ -2891,25 +2797,11 @@ impl DeviceState {
             if let Some(import) = import {
                 self.retired_guest_imports.push(import);
             }
-            let token = Self::take_guest_write_token(mapping);
-            if token != 0 {
-                tokens.push(token);
-            }
         }
-        // The sampled-cache witness arms its own tokens against window page
-        // sets, and they are not reachable from any `MappingEntry` — so the
-        // loop above cannot see them and a reset that only walked mappings left
-        // them armed on the host forever.
         #[cfg(feature = "backend-vulkan")]
-        tokens.extend(self.gather_witness.take_tokens());
+        self.gather_witness.clear();
         #[cfg(feature = "backend-vulkan")]
-        tokens.extend(self.gva_store_witness.take_tokens());
-        // Back onto the retired list rather than out through the return value:
-        // the caller's contract is "invalidate backend aliases, then release
-        // views", and a token release is neither. `flush_retired_views` drains
-        // both, and `Device::reset_with_host` runs it before `reset` discards
-        // the vector.
-        self.retired_guest_write_tokens = tokens;
+        self.gva_store_witness.clear();
         views.extend(self.gva_host_views.drain(..).filter_map(|view| {
             (view.ptr != 0 && view.ptr_len != 0).then_some((view.ptr, view.ptr_len))
         }));
@@ -3257,10 +3149,8 @@ impl DeviceState {
         self.retire_task_gva_views(task_id);
         #[cfg(feature = "backend-vulkan")]
         {
-            self.retired_guest_write_tokens
-                .extend(self.gva_store_witness.retire_task(task_id));
-            self.retired_guest_write_tokens
-                .extend(self.gather_witness.retire_task(task_id));
+            self.gva_store_witness.retire_task(task_id);
+            self.gather_witness.retire_task(task_id);
         }
         self.tasks
             .define(task_id, TaskEntry::define(length, directory_pfn));
@@ -3321,10 +3211,8 @@ impl DeviceState {
         self.retire_task_gva_views(task_id);
         #[cfg(feature = "backend-vulkan")]
         {
-            self.retired_guest_write_tokens
-                .extend(self.gva_store_witness.retire_task(task_id));
-            self.retired_guest_write_tokens
-                .extend(self.gather_witness.retire_task(task_id));
+            self.gva_store_witness.retire_task(task_id);
+            self.gather_witness.retire_task(task_id);
         }
         // The two observation ledgers keyed by task id go with it, exactly as
         // they do on a redefine. Both were reachable only through `define_task`
@@ -3498,15 +3386,11 @@ impl DeviceState {
         e.condemned_entries = None;
         Self::bump_page_generation(e);
         let (retired, retired_import) = Self::take_mapping_view(e);
-        let retired_token = Self::take_guest_write_token(e);
         if let Some(view) = retired {
             self.retired_views.push(view);
         }
         if let Some(import) = retired_import {
             self.retired_guest_imports.push(import);
-        }
-        if retired_token != 0 {
-            self.retired_guest_write_tokens.push(retired_token);
         }
         #[cfg(feature = "backend-vulkan")]
         self.retire_mapping_gather_witness(mapping_id);
@@ -3530,15 +3414,11 @@ impl DeviceState {
         e.type4_walk = None;
         Self::bump_page_generation(e);
         let (retired, retired_import) = Self::take_mapping_view(e);
-        let retired_token = Self::take_guest_write_token(e);
         if let Some(view) = retired {
             self.retired_views.push(view);
         }
         if let Some(import) = retired_import {
             self.retired_guest_imports.push(import);
-        }
-        if retired_token != 0 {
-            self.retired_guest_write_tokens.push(retired_token);
         }
         #[cfg(feature = "backend-vulkan")]
         self.retire_mapping_gather_witness(mapping_id);
@@ -3598,15 +3478,11 @@ impl DeviceState {
         Self::bump_map_generation(e);
         Self::bump_page_generation(e);
         let (retired, retired_import) = Self::take_mapping_view(e);
-        let retired_token = Self::take_guest_write_token(e);
         if let Some(v) = retired {
             self.retired_views.push(v);
         }
         if let Some(import) = retired_import {
             self.retired_guest_imports.push(import);
-        }
-        if retired_token != 0 {
-            self.retired_guest_write_tokens.push(retired_token);
         }
         #[cfg(feature = "backend-vulkan")]
         self.retire_mapping_gather_witness(mapping_id);
@@ -3635,15 +3511,11 @@ impl DeviceState {
         Self::bump_page_generation(e);
         e.page_table_kva = 0;
         let (retired, retired_import) = Self::take_mapping_view(e);
-        let retired_token = Self::take_guest_write_token(e);
         if let Some(v) = retired {
             self.retired_views.push(v);
         }
         if let Some(import) = retired_import {
             self.retired_guest_imports.push(import);
-        }
-        if retired_token != 0 {
-            self.retired_guest_write_tokens.push(retired_token);
         }
         #[cfg(feature = "backend-vulkan")]
         self.retire_mapping_gather_witness(mapping_id);
@@ -3692,15 +3564,11 @@ impl DeviceState {
         e.height = 0;
         e.format = 0;
         let (retired, retired_import) = Self::take_mapping_view(e);
-        let retired_token = Self::take_guest_write_token(e);
         if let Some(v) = retired {
             self.retired_views.push(v);
         }
         if let Some(import) = retired_import {
             self.retired_guest_imports.push(import);
-        }
-        if retired_token != 0 {
-            self.retired_guest_write_tokens.push(retired_token);
         }
         #[cfg(feature = "backend-vulkan")]
         self.retire_mapping_gather_witness(mapping_id);
@@ -3737,15 +3605,11 @@ impl DeviceState {
             e.height = 0;
             e.format = 0;
             let (retired, retired_import) = Self::take_mapping_view(e);
-            let retired_token = Self::take_guest_write_token(e);
             if let Some(v) = retired {
                 self.retired_views.push(v);
             }
             if let Some(import) = retired_import {
                 self.retired_guest_imports.push(import);
-            }
-            if retired_token != 0 {
-                self.retired_guest_write_tokens.push(retired_token);
             }
             #[cfg(feature = "backend-vulkan")]
             self.retire_mapping_gather_witness(mapping_id);
@@ -3793,15 +3657,11 @@ impl DeviceState {
         e.height = 0;
         e.format = 0;
         let (retired, retired_import) = Self::take_mapping_view(e);
-        let retired_token = Self::take_guest_write_token(e);
         if let Some(v) = retired {
             self.retired_views.push(v);
         }
         if let Some(import) = retired_import {
             self.retired_guest_imports.push(import);
-        }
-        if retired_token != 0 {
-            self.retired_guest_write_tokens.push(retired_token);
         }
         #[cfg(feature = "backend-vulkan")]
         self.retire_mapping_gather_witness(mapping_id);
@@ -3894,9 +3754,8 @@ impl DeviceState {
     ///
     /// Called from every host-side writer, including the ones that reach guest
     /// pages through a raw task-GVA walk and never name a mapping. The
-    /// hypervisor's dirty bitmap cannot see any of them — it witnesses guest CPU
-    /// stores only — so without this a reader has no way to tell "nobody wrote
-    /// these pages" from "we wrote them ourselves".
+    /// a retained derived image must distinguish "unchanged" from "another
+    /// device path wrote these pages".
     ///
     /// Deliberately called before the write rather than after it succeeds: a
     /// refused write costs a spurious bump, which makes a reader re-read bytes

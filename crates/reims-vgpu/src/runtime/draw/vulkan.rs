@@ -537,7 +537,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                             );
                         }
                         if let Some(epoch) = sync_epoch {
-                            stamp_type11_resident(state, host, req, writeback_guest, epoch);
+                            stamp_type11_resident(state, req, writeback_guest, epoch);
                         }
                         if crate::observe::draw_log_enabled() {
                             // Order-independent: both fields reduce over the three
@@ -839,11 +839,11 @@ pub(super) enum SampledSourceRequest {
     /// an optional copied-content identity, and what the guest-write witness
     /// says that identity is worth (see [`crate::runtime::gather_witness`]).
     ///
-    /// A resource-owned direct image has no copied content to witness and
-    /// carries no identity. A copy-backed source carries the identity that lets
-    /// the engine bind a retained gathered image without gathering again. If a
-    /// backend declines a supplied direct image, the absent identity makes the
-    /// copy fallback gather conservatively on that bind.
+    /// A resource-owned direct image reads the live allocation and does not
+    /// consume the copied-content identity. The same request still carries one:
+    /// exact direct-image admission belongs to the backend, so a declined
+    /// candidate must let the copied fallback retain and reuse the gathered
+    /// image under the ordinary guest-write witness.
     /// The last field is the **format's own** channel plan, not the guest's
     /// view swizzle: this rail binds guest bytes untouched, so a format whose
     /// Metal channels do not sit identically on the Vulkan format carrying them
@@ -859,6 +859,10 @@ pub(super) enum SampledSourceRequest {
         ash::vk::Format,
         /// Consecutive depth planes carried by the source window.
         u32,
+        /// Persistent allocation geometry for a direct linear image.  Present
+        /// only when the decoded texture owns one contiguous retained
+        /// allocation; page-run fallbacks do not manufacture it.
+        Option<crate::backend::vulkan::engine::DirectGuestImageSource>,
         Option<LinearSampleIdentity>,
         crate::runtime::gather_witness::GatherVouch,
         pixel_format::SwizzlePlan,
@@ -962,30 +966,13 @@ pub(super) fn attachment_alias_source(
     SampledSourceRequest::Attachment(identity, initial, format)
 }
 
-/// The object-list entry and descriptor bytes behind a sampled `texture_ref`,
-/// reporting when the ref names something that is not a texture.
+/// Resolve the texture construction object behind a sampled `texture_ref`.
 ///
-/// Four rails resolve a texture ref through the second rung of the object-list
-/// ladder — `mipmap`, `draw::texture_view` and `compute_exec` name
-/// `[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT]` to
-/// [`objects::resolve_descriptor`], and `draw::render_target` writes the pair
-/// out — and the two sampled-path sites in this file did not. They went
-/// `lookup_list_entry` -> `read_descriptor` -> `decode_texture_descriptor`, so
-/// **any** object whose descriptor is at least `TEXTURE_DESC_GEOMETRY_LEN`
-/// bytes decodes as a texture and yields a plausible extent rather than a
-/// refusal. That is the hazard `contract::iosurface_pages` documents for the
-/// `TEXTURE_DESC_WIDTH` name collision, reached a different way.
-///
-/// # It reports and does not refuse, on purpose
-///
-/// Adding the rung as a *decline* would turn a resolve that currently produces
-/// geometry into `DrawPreparationDecline::TextureResolveMissing`, which loses
-/// the draw — a behaviour change on the pathway this device is verified on,
-/// justified by nothing yet measured. Whether a guest ever binds a non-texture
-/// ref here is exactly what is not known, and the four rails that do check
-/// cannot answer it because they refuse before anything is counted. So the
-/// answer stays what it was and the log now says when it was reached; a driven
-/// boot reading this slug is what decides whether the rung becomes a refusal.
+/// A texture bind names a texture object. Descriptor length or byte shape does
+/// not widen that contract: another object kind with a sufficiently long body
+/// is still not a texture, and interpreting it as one would let unrelated
+/// fields become image geometry. This is the same typed object-list rung used
+/// by mipmap, texture-view, compute, and render-target resolution.
 pub(super) fn sampled_texture_descriptor<M: HostMemory>(
     state: &DeviceState,
     host: &M,
@@ -1000,15 +987,7 @@ pub(super) fn sampled_texture_descriptor<M: HostMemory>(
     use crate::runtime::decode::resource::{OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT};
     if entry.object_type != OBJECT_TYPE_TEXTURE && entry.object_type != OBJECT_TYPE_TEXTURE_VARIANT
     {
-        let slug = crate::observe::ladder_slug!("draw_sampled_texture", wrong_type);
-        if degrade_log_first(texture_ref, slug) {
-            crate::observe::fail(format!(
-                "sampled_source_degraded reason={slug} task={task_id} ref={texture_ref} \
-                 object_type={} (decoded as a texture descriptor anyway; geometry \
-                 comes from a record of another kind)",
-                entry.object_type
-            ));
-        }
+        return None;
     }
     Some((entry, std::sync::Arc::clone(&resource.descriptor)))
 }
@@ -1267,133 +1246,31 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                         }
                     });
                 }
-                // What the hypervisor can say about the guest's own stores into
-                // this surface since the Store that produced our copies of it.
-                // Asked once here and used by every rung below, because every
-                // rung below either serves a host-side copy — whose currency
-                // this is the only witness for — or reads the pages and does
-                // not care. The host-cache rung used to ask it privately; the
-                // resident rung above it asked nothing at all.
-                //
-                // Two stages: the token's generation says whether the guest
-                // wrote the *allocation*, and only when it did is the page list
-                // enumerated to say whether it wrote the *pixels*. The second
-                // stage costs a page-list walk and is paid on the minority of
-                // binds the first stage flags.
-                let guest_write = mapping_guest_write_verdict(state, host, mid);
-                let site = guest_wrote_allocation(guest_write)
-                    .then(|| guest_write_site(state, host, mid, w, h));
-                if let Some(site) = site.as_ref() {
-                    crate::runtime::drain::note_store_route(match site {
-                        GuestWriteSite::Pixels(_) => "t11sample_gw_wrote_pixels",
-                        GuestWriteSite::Elsewhere => "t11sample_gw_wrote_elsewhere",
-                        GuestWriteSite::Unknown => "t11sample_gw_wrote_unknown",
-                    });
-                }
-                let guest_owned = match site.as_ref() {
-                    Some(GuestWriteSite::Pixels(ranges)) => Some(ranges.as_slice()),
-                    _ => None,
-                };
-                let guest_replaced = !matches!(site, None | Some(GuestWriteSite::Elsewhere));
+                // The serialized validity quad advances the mapping epoch when
+                // the guest declares a CPU write. A resident is current only
+                // when its Store stamp still equals that contract-owned epoch.
+                let mapping_epoch = state
+                    .mappings
+                    .get(&mid)
+                    .map(|mapping| mapping.surface_content_epoch);
+                let resident_epoch = resident_ready
+                    .then(|| crate::backend::vulkan::engine::resident_content_epoch(&resident_id))
+                    .flatten();
+                let resident_current =
+                    resident_ready && type11_resident_is_current(mapping_epoch, resident_epoch);
 
-                // A ready resident target is authoritative after a product
-                // Store — but only while nothing has replaced the bytes it is a
-                // copy of. A type-11 surface's pages are plain guest RAM and the
-                // guest CPU stores into them with no device operation, so a
-                // resident produced for one tenant of the surface keeps claiming
-                // to hold its pixels after the guest has painted different ones
-                // there. This is the same question `type11_guest_wrote_since_store`
-                // asks before the attachment LOAD elision reuses a resident, and
-                // the same one the host-cache rung below asks before serving its
-                // copy. This rung asked neither, and it is the largest of the
-                // three: one 14-round Finder boot measured 92 730 binds here
-                // against the cache rung's 14 396.
-                //
-                // It also sits *above* both rungs that read the guest's own
-                // pages, so a stale bind here is never corrected by anything
-                // below it — the wrong image is held for as long as the guest
-                // keeps re-binding the same surface, which is what "renders
-                // correctly for a few frames then stays corrupted" looks like
-                // from inside the guest.
-                //
-                // Refusing is not enough on its own, because neither copy is the
-                // surface once both sides have written it. The refusal merges
-                // them into the guest's pages first — see
-                // [`merge_guest_writes_into_pages`] — and every rung below then
-                // reads a surface that holds both halves.
                 // A bind whose view remaps channels cannot take a resident
                 // directly — the engine hands the swizzle to the image view and
                 // the direct bind has none — so it falls straight to a byte rung
-                // that can apply it. Counted on its own route and *outside* the
-                // refusal below: nothing was replaced and there is nothing to
-                // merge, so borrowing `_refused` would report a repaint that did
-                // not happen and run a merge for it.
-                if resident_ready && !guest_replaced && !may_bind_resident {
-                    note_type11_sample_rung("t11rung_resident_swizzled", guest_write);
+                // that can apply it.
+                if resident_current && !may_bind_resident {
+                    note_type11_sample_rung("t11rung_resident_swizzled");
+                } else if resident_current {
+                    note_type11_sample_rung("t11rung_resident");
+                    let format = resident_id.resident_format();
+                    return Some((w, h, mid, SampledSourceRequest::Target(resident_id, format)));
                 } else if resident_ready {
-                    if !guest_replaced {
-                        note_type11_sample_rung("t11rung_resident", guest_write);
-                        let format = resident_id.resident_format();
-                        return Some((
-                            w,
-                            h,
-                            mid,
-                            SampledSourceRequest::Target(resident_id, format),
-                        ));
-                    }
-                    note_type11_sample_rung("t11rung_resident_refused", guest_write);
-                    match guest_owned {
-                        Some(ranges) => {
-                            // The merge is what makes falling through sound: it
-                            // puts the resident's half into every page the guest
-                            // did not write, so the rungs below read a surface
-                            // holding both. When it does not land, that premise
-                            // is false — the halves are still split, and the
-                            // pages below hold only the guest's, which for a
-                            // composite the Store deliberately left GPU-side is
-                            // nothing at all. Falling through anyway is how a
-                            // sampled backdrop comes back blank.
-                            //
-                            // So refuse the bind instead of choosing a half.
-                            // `merge_guest_writes_into_pages` has already named
-                            // the stage that failed on the fail channel; this
-                            // turns its `false` into a decline the draw reports,
-                            // which is what its doc asks the caller for.
-                            if !merge_guest_writes_into_pages(
-                                state,
-                                host,
-                                mid,
-                                w,
-                                h,
-                                &resident_id,
-                                ranges,
-                            ) {
-                                crate::runtime::drain::note_store_route(
-                                    "t11sample_resident_merge_unlanded",
-                                );
-                                return None;
-                            }
-                        }
-                        // `Unknown`: the host named no pages, so there is no
-                        // list to preserve and no merge to make. The rungs below
-                        // read whatever the guest's pages hold, which is the only
-                        // source not known to be stale.
-                        None => crate::runtime::drain::note_store_route(
-                            "t11sample_resident_unmergeable",
-                        ),
-                    }
-                    // A resident that stops matching its surface is a real
-                    // correction, not routine control flow: without this line a
-                    // boot cannot tell "the guest never rewrites its sampled
-                    // surfaces" from "the witness is never armed". Latched per
-                    // mapping so a surface the guest repaints every frame stays
-                    // at one line.
-                    if crate::observe::first_sight("sampled_resident_stale", u64::from(mid)) {
-                        crate::observe::off(format!(
-                            "sampled_resident_stale mid={mid} {w}x{h} \
-                             (guest wrote pages inside the sampled window; reading them instead)"
-                        ));
-                    }
+                    note_type11_sample_rung("t11rung_resident_refused");
                 }
 
                 // Falling through because the resident is *gone* is not the same
@@ -1486,9 +1363,8 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // which image got bound — `runtime/census/README.md` forbids
                 // exactly that, and an all-black frame is a legal frame, so the
                 // test mistook a correct black surface for an empty one.
-                if let Some((bgra, host_gen)) = (!guest_replaced)
-                    .then(|| crate::runtime::surface_cache::get_shared_with_gen(state, mid, w, h))
-                    .flatten()
+                if let Some((bgra, host_gen)) =
+                    crate::runtime::surface_cache::get_shared_with_gen(state, mid, w, h)
                 {
                     // Uploaded in the order the cache already holds. This rung's
                     // bytes are BGRA8 by construction — it is a type-4 scanout
@@ -1523,7 +1399,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                         key: (1u64 << 62) | mid as u64,
                         generation: host_gen,
                     });
-                    note_type11_sample_rung("t11rung_host_cache", guest_write);
+                    note_type11_sample_rung("t11rung_host_cache");
                     // BGRA8 by construction — it is a type-4 scanout cache — but
                     // the *values* in it are the surface's, and this cache is
                     // filled from a writeback that reorders channels and decodes
@@ -1553,7 +1429,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     .as_ref()
                     .and_then(|_| try_type11_sample_zero_copy(state, host, mid, w, h))
                 {
-                    note_type11_sample_rung("t11rung_zero_copy", guest_write);
+                    note_type11_sample_rung("t11rung_zero_copy");
                     return Some((w, h, mid, src));
                 }
                 // The memo skips the convert/alloc on unchanged content and
@@ -1561,7 +1437,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // its census (T11Memo hit / T11Guest fill) is emitted internally.
                 let memo_source = crate::runtime::draw::mapping_declared_format(state, mid, None);
                 if let Some((rgba, identity)) = load_type11_rgba_memoized(state, host, mid) {
-                    note_type11_sample_rung("t11rung_guest_memo", guest_write);
+                    note_type11_sample_rung("t11rung_guest_memo");
                     return Some((
                         w,
                         h,
@@ -1582,7 +1458,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     // (mid, geometry) so a steady repeat stays at one line.
                     use std::collections::HashSet;
                     use std::sync::Mutex;
-                    note_type11_sample_rung("t11rung_miss", guest_write);
+                    note_type11_sample_rung("t11rung_miss");
                     static SEEN: Mutex<Option<HashSet<(u32, u32, u32)>>> = Mutex::new(None);
                     let mut guard = SEEN.lock().unwrap_or_else(|e| e.into_inner());
                     if guard.get_or_insert_with(HashSet::new).insert((mid, w, h)) {
@@ -2240,32 +2116,10 @@ fn resolve_type11_load_seed<M: HostMemory + HostOps>(
     target_format: ash::vk::Format,
 ) -> Option<Type11LoadSeed> {
     use crate::backend::vulkan::engine::SeedOrder;
-    // The cache is the other host-side copy of these pages, and it sits above
-    // the only rung that reads the pages themselves — so a stale hit here is
-    // never corrected by anything below it. It takes the same witness the
-    // sampled path's read of this same map takes (`resolve_sampled_source`'s
-    // `guest_replaced`), spelled the same way and for the same reason: the
-    // coarse token says whether the guest wrote the *allocation*, and only when
-    // it did is the page list walked to say whether it wrote the *pixels*.
-    //
-    // Without it this rung served exactly the frame the elision gate two frames
-    // up had just refused. The caller computes `type11_guest_wrote_since_store`
-    // to decide whether the resident may carry the chain, declines when it says
-    // written, and then arrived here to be handed the same stale bytes out of
-    // the host cache. The pass composites onto them and its Store publishes
-    // them back over the guest's pages, which is the fixpoint this file's own
-    // note above `type11_load_currency_query` calls "renders correctly for a few
-    // frames then stays corrupted".
-    let guest_write = mapping_guest_write_verdict(state, host, mapping_id);
-    let site = guest_wrote_allocation(guest_write)
-        .then(|| guest_write_site(state, host, mapping_id, w, h));
-    let guest_replaced = !matches!(site, None | Some(GuestWriteSite::Elsewhere));
-    if guest_replaced {
-        crate::runtime::drain::note_store_route("t11seed_cache_refused_guest_wrote");
-    }
-    let cached = (!guest_replaced)
-        .then(|| crate::runtime::surface_cache::get_shared(state, mapping_id, w, h))
-        .flatten();
+    // `clear_host_valid` removes this mapping's cache entry at the contract
+    // boundary. A hit therefore already means no later guest validity
+    // statement superseded the stored bytes.
+    let cached = crate::runtime::surface_cache::get_shared(state, mapping_id, w, h);
     let served = if let Some(bgra) = cached {
         Some((
             Type11LoadSeed::Host(bgra, SeedOrder::Bgra8),
@@ -2843,8 +2697,11 @@ pub(super) fn direct_linear_sample_from_packed(
     level_offset: u64,
     span: u64,
     row_length_texels: u32,
+    row_pitch: u64,
     native: TexelLayout,
     format: ash::vk::Format,
+    identity: LinearSampleIdentity,
+    vouch: crate::runtime::gather_witness::GatherVouch,
     native_components: pixel_format::SwizzlePlan,
 ) -> Option<SampledSourceRequest> {
     Some(SampledSourceRequest::GuestRuns(
@@ -2852,13 +2709,21 @@ pub(super) fn direct_linear_sample_from_packed(
         native,
         format,
         1,
-        None,
-        crate::runtime::gather_witness::GatherVouch::Fresh,
+        Some(crate::backend::vulkan::engine::DirectGuestImageSource {
+            import: std::sync::Arc::clone(&packed.import),
+            resource_offset: packed.head,
+            resource_len: packed.size,
+            plane_offset: packed.head.checked_add(level_offset)?,
+            row_pitch,
+        }),
+        Some(identity),
+        vouch,
         native_components,
     ))
 }
 
 /// Build one GPU-copy source from the mapping's retained allocation.
+#[derive(Clone, Copy)]
 struct MappedSamplePlane {
     mapping_id: u32,
     base_off: u64,
@@ -2885,6 +2750,64 @@ fn mapped_sampled_source<M: HostMemory + HostOps>(
         span,
         row_length_texels,
     )
+}
+
+/// Build either retained-allocation or page-run execution state for a mapped
+/// plane, with one content identity shared by both representations. The source
+/// choice changes how the GPU reaches the bytes; it must not decide whether a
+/// retained copied image can be recognised on the next bind.
+fn witnessed_mapping_sampled_source<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    rail: crate::runtime::gather_witness::GatherRail,
+    plane: MappedSamplePlane,
+) -> Option<(
+    crate::backend::vulkan::engine::GuestRunSource,
+    LinearSampleIdentity,
+    crate::runtime::gather_witness::GatherVouch,
+)> {
+    use crate::backend::vulkan::engine;
+
+    let retained = mapped_sampled_source(state, host, plane);
+    let (gpas, runs) =
+        mapping_window_guest_runs(state, host, plane.mapping_id, plane.base_off, plane.span)?;
+    let page = state.page_size() as usize;
+    let stated = crate::runtime::gather_witness::StatedGeneration::Mapping(
+        state.mappings.get(&plane.mapping_id)?.content_generation,
+    );
+    let seen = crate::runtime::gather_witness::note_gather(
+        state,
+        rail,
+        crate::runtime::gather_witness::GatherKey::Mapping {
+            mid: plane.mapping_id,
+            base_off: plane.base_off,
+        },
+        stated,
+        crate::runtime::gather_witness::GatherWindow {
+            gpas: &gpas,
+            runs: &runs,
+            span: plane.span,
+            page_size: page,
+        },
+    );
+    let source = retained.unwrap_or_else(|| engine::GuestRunSource {
+        runs: std::sync::Arc::new(runs),
+        source_offset: 0,
+        total_len: plane.span,
+        row_length_texels: plane.row_length_texels,
+        pages: guest_page_window(
+            host,
+            gpas,
+            page as u64,
+            plane.base_off % page as u64,
+            plane.span,
+        ),
+    });
+    Some((
+        source,
+        LinearSampleIdentity::from(seen.identity),
+        seen.vouch,
+    ))
 }
 
 /// The byte extent of a `w × h` image at `bpr` bytes per row and `bpp` bytes per
@@ -3082,6 +3005,28 @@ fn bound_buffer_content(
     })
 }
 
+/// Derive one buffer-plus-offset bind from the retained whole-resource
+/// allocation. The registry owns address resolution; the returned source owns
+/// only the execution references needed to keep that allocation live.
+fn packed_buffer_content(
+    state: &DeviceState,
+    task_id: u32,
+    buffer_ref: u32,
+    offset: u64,
+    extent_cap: Option<u64>,
+) -> Option<crate::backend::vulkan::engine::BufferContent> {
+    let packed = match state.bound_buffers.packed(task_id, buffer_ref)? {
+        crate::runtime::bound_buffers::PackedBufferResolution::Available(packed) => packed,
+        crate::runtime::bound_buffers::PackedBufferResolution::Unavailable { .. } => return None,
+    };
+    let full = packed.size.checked_sub(offset).filter(|&span| span != 0)?;
+    let span = extent_cap.map_or(full, |cap| full.min(cap));
+    let source = packed.buffer_source(offset, span)?;
+    Some(crate::backend::vulkan::engine::BufferContent::GuestRuns(
+        source,
+    ))
+}
+
 /// Load one draw-time buffer bind: the zero-copy rail when allowed and
 /// eligible, else the CPU staging read. `allow_zero_copy` is false for
 /// buffers feeding Constant-step attributes (the engine prepends a CPU
@@ -3128,6 +3073,10 @@ fn held_buffer_content(
     offset: u64,
     extent_cap: Option<u64>,
 ) -> Option<crate::backend::vulkan::engine::BufferContent> {
+    if let Some(content) = packed_buffer_content(state, task_id, buffer_ref, offset, extent_cap) {
+        crate::runtime::drain::note_store_route("zc_buffer_held_packed");
+        return Some(content);
+    }
     // The registry is keyed on the same cap the walk uses, or a lookup could
     // answer with a shorter span than this shader needs.
     // A held resolution answers before anything is resolved at all: the walk
@@ -3164,6 +3113,24 @@ pub(super) fn load_buffer_content_resolved<M: HostMemory + HostOps>(
     // Resolve the backing (object-list entry + descriptor) once and share it
     // between the zero-copy attempt and the CPU fallback.
     if allow_zero_copy {
+        if offset < backing.size
+            && crate::runtime::bound_buffers::ensure_packed_resource(
+                state,
+                host,
+                task_id,
+                buffer_ref,
+                backing.gva,
+                backing.size,
+                crate::runtime::bound_buffers::PackedResourceUse::Buffer,
+            )
+        {
+            if let Some(content) =
+                packed_buffer_content(state, task_id, buffer_ref, offset, extent_cap)
+            {
+                crate::runtime::drain::note_store_route("zc_buffer_imported_packed");
+                return Some(content);
+            }
+        }
         if let Some(bound) =
             try_buffer_zero_copy_resolved(state, host, task_id, backing, offset, extent_cap)
         {
@@ -3246,103 +3213,6 @@ fn load_index_content_reason<M: HostMemory + HostOps>(
     .ok_or(IndexLoadReason::ReadFail)
 }
 
-/// Zero-copy linear sampled bind: resolve the texture's tight level-0 GVA
-/// window to packed-contiguous guest-RAM runs and hand the engine a
-/// [`SampledSource::GuestRuns`] — the GPU gathers the texels from imported
-/// guest RAM inside the draw's own CB. Replaces the lin_memo class's
-/// full-window CPU re-read + memcmp per bind (guest CPU writes are still
-/// observed: the GPU copy re-executes every draw and reads at execute time).
-///
-/// Gates (any miss → `None`, caller stays on the CPU byte paths): native texel
-/// layout Vulkan samples identically, tight rows, a window inside the declared
-/// allocation, every page walkable, and stable mappings available. Allocation
-/// size is not an input to the contract.
-///
-/// **Every gate names itself on the `zc_lin_*` route set, including the ones
-/// that decline before the walk.** Only the three walk refusals used to, and
-/// the whole set read zero on a driven Safari-drag boot — which says the walk
-/// was never reached and says nothing at all about why. The rail declined
-/// 91 687 times in that boot's steady state and the caller fell to
-/// `load_linear_guest_memoized`, whose own doc concedes it re-reads the full
-/// `bpr * h` span out of guest memory and memcmps it against the memo on every
-/// bind, hit or miss. That was 62 µs of a 191 µs draw. A rail that costs the
-/// device its largest per-draw item when it declines may not decline silently;
-/// the routes below are what turn "the gather is not running" into which gate.
-/// Serve a sampled GVA span off the engine resident a render Store published
-/// into it — the GVA twin of `t11rung_resident`.
-///
-/// # What it is worth
-///
-/// The rung below this one reads the span out of guest pages, and before it can
-/// read it has to wait for any render writeback landing in those same pages.
-/// That wait was **94 % of `sampled_phase`'s `resolve_us`** on a driven Safari
-/// drag — 275 ms of a 610 ms drain second, the largest single item in the
-/// device — and narrowing cannot touch it, because the pages the reader wants
-/// are exactly the pages the Store is writing:
-/// `settle_linear_memo_read_overlap` was 4 700 of 4 717 waits.
-///
-/// A probe on that rung counted the join before this was built. Of the sampled
-/// binds it saw, **20 688** named a GVA target a Store had stamped and
-/// **16 202 of those read
-/// [`crate::runtime::gva_store_witness::GvaWriteReach::Quiet`]** — the pages
-/// still hold the Store's frame, so the resident does too and nobody has to
-/// read anything.
-/// Genuine refusals (the guest repainted, or the Store never stamped) were 79.
-///
-/// # Why the whole key and not the address
-///
-/// The generation is recomputed here from the span's *current* page set rather
-/// than taken from any entry found at this address. The witness map can hold an
-/// orphan — a target whose pages have since moved, keyed under the hash they
-/// had — and an orphan's token still answers about pages that now belong to
-/// something else. Recomputing means a moved page list simply misses, which is
-/// [`crate::runtime::gva_store_witness`]'s own rule: the wrong answer is
-/// unreachable rather than guarded.
-///
-/// # The two conditions, and what each rules out
-///
-/// * [`crate::runtime::gva_store_witness::GvaWriteReach::Quiet`] — neither the
-///   guest CPU nor another rail of this device has written the span since the
-///   Store. Everything undecidable answers as written, so a host with no dirty
-///   bitmap never reaches this rung.
-/// * `resident_content_ready` — the engine still holds an image under this
-///   identity. A reclaimed or never-filled slot refuses.
-///
-/// What is deliberately *not* a condition is "no draw has landed in the resident
-/// since the Store". A draw landing there is the guest rendering into this very
-/// texture, and Metal's model is that a render pass changes the texture it
-/// targets — so the resident being ahead of the guest's pages is the content the
-/// guest asked to sample, not a stale read.
-///
-/// # What it measured
-///
-/// Driven Safari drag, against the boot that supplied the numbers above:
-///
-/// ```text
-///                                    before    after
-/// gvarung_resident                        -   20 539
-/// gvarung_resident_absent                 -        0
-/// settle_linear_memo_read (waits)     4 717    1 446
-/// settle_linear_memo_read_overlap     4 700        0
-/// settle_linear_memo_read_us          6.70 s   3.74 s
-/// fence (waits)                       9 475    6 071
-/// fence_us                           11.92 s   5.77 s
-/// sampled_phase resolve_us/s          290 ms   195 ms
-/// ```
-///
-/// The row that says the rung did what it was built to do is the third one:
-/// **the overlap class is gone**, not reduced. Every remaining memo wait is
-/// `_unnamed` — a span whose page walk came up short, which this rung declines
-/// before the witness. `gvarung_resident_absent` reading zero says every quiet
-/// witness had a live resident behind it, so nothing is being armed and then
-/// reclaimed out from under the rung.
-///
-/// Correctness was taken separately and not from a screenshot, because a rung
-/// that serves a stale resident renders a *plausible* frame: the multi-round
-/// recomposite run over a live Wikipedia article scored **PATCHED none,
-/// UNSCOREABLE none** across six anchors with its reload and movement gates
-/// both satisfied. A second workload (page loads and scrolling) served 11 103
-/// binds off the rung with no loss on the fail channel.
 /// The guest bytes one GVA render target occupies, as the rails that ask about
 /// it name them.
 ///
@@ -3490,9 +3360,9 @@ pub(super) fn gva_resident_if_current<M: HostMemory + HostOps>(
     }
     let verdict = reach(
         state,
-        host,
         GvaTargetKey {
             task_id,
+            texture_ref,
             gva,
             generation,
             width: w,
@@ -3853,35 +3723,12 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
         )
     });
 
-    // A warm resource bind borrows the retained allocation directly. The
-    // single-plane request retains only the import/run payloads execution
-    // needs; allocation geometry and the physical construction list remain on
-    // the task resource.
-    if available && planes == 1 {
-        let backing = allocation.as_ref()?;
-        if let Some(packed) =
-            state
-                .bound_buffers
-                .packed_available(task_id, texture_ref, backing.gva, backing.size)
-        {
-            if let Some(request) = direct_linear_sample_from_packed(
-                packed,
-                layout.offset,
-                span,
-                row_length_texels,
-                native,
-                sampled_vk_format,
-                native_components,
-            ) {
-                return Some((w, h, request));
-            }
-        }
-    }
-
-    // The witness recorder mutably borrows `state`, so the multi-plane arm
-    // owns its resource state across that call. Single-plane binds return above
-    // and never pay this construction-state clone.
-    let packed = if available && planes != 1 {
+    // The witness recorder mutably borrows `state`, so the request owns its
+    // lightweight retained-allocation handles across that call. This applies to
+    // a direct-image candidate too: exact image admission belongs to the
+    // backend, and if it declines the copied fallback needs the same identity
+    // every other packed source uses or it would upload on every bind.
+    let packed = if available {
         allocation.as_ref().and_then(|backing| {
             state
                 .bound_buffers
@@ -3894,32 +3741,45 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
 
     if let Some(packed) = packed {
         let page = state.page_size();
-        let packed_offset = packed.head.checked_add(layout.offset)?;
-        let first_page = usize::try_from(packed_offset / page).ok()?;
-        let head_off = packed_offset % page;
-        let page_count = usize::try_from(head_off.checked_add(span)?.div_ceil(page)).ok()?;
-        let witness_gpas = packed
-            .gpas
-            .get(first_page..first_page.checked_add(page_count)?)?;
+        let witness = packed.witness_window(layout.offset, span)?;
         let witness_runs = [engine::GuestRun {
-            host_ptr: packed
-                .import
-                .host_base()
-                .checked_add(usize::try_from(packed_offset).ok()?)?,
+            host_ptr: witness.host_ptr,
             len: span,
         }];
+        let stated = crate::runtime::gather_witness::StatedGeneration::TaskResource(
+            state.buffer_write_gen.stamp(task_id, texture_ref),
+        );
         let seen = crate::runtime::gather_witness::note_gather(
             state,
-            host,
             crate::runtime::gather_witness::GatherRail::Linear,
-            crate::runtime::gather_witness::GatherKey::TaskGva { task_id, gva },
+            crate::runtime::gather_witness::GatherKey::TaskGva {
+                task_id,
+                resource_ref: texture_ref,
+                gva,
+            },
+            stated,
             crate::runtime::gather_witness::GatherWindow {
-                gpas: witness_gpas,
+                gpas: witness.gpas,
                 runs: &witness_runs,
                 span,
                 page_size: page as usize,
             },
         );
+        if planes == 1 {
+            let request = direct_linear_sample_from_packed(
+                &packed,
+                layout.offset,
+                span,
+                row_length_texels,
+                layout.row_stride,
+                native,
+                sampled_vk_format,
+                LinearSampleIdentity::from(seen.identity),
+                seen.vouch,
+                native_components,
+            )?;
+            return Some((w, h, request));
+        }
         return Some((
             w,
             h,
@@ -3934,6 +3794,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                 native,
                 sampled_vk_format,
                 planes,
+                None,
                 Some(LinearSampleIdentity::from(seen.identity)),
                 seen.vouch,
                 native_components,
@@ -3954,11 +3815,18 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
         }
     };
     let page = state.page_size() as usize;
+    let stated = crate::runtime::gather_witness::StatedGeneration::TaskResource(
+        state.buffer_write_gen.stamp(task_id, texture_ref),
+    );
     let seen = crate::runtime::gather_witness::note_gather(
         state,
-        host,
         crate::runtime::gather_witness::GatherRail::Linear,
-        crate::runtime::gather_witness::GatherKey::TaskGva { task_id, gva },
+        crate::runtime::gather_witness::GatherKey::TaskGva {
+            task_id,
+            resource_ref: texture_ref,
+            gva,
+        },
+        stated,
         crate::runtime::gather_witness::GatherWindow {
             gpas: &gpas,
             runs: &runs,
@@ -3980,6 +3848,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
             native,
             sampled_vk_format,
             planes,
+            None,
             Some(LinearSampleIdentity::from(seen.identity)),
             seen.vouch,
             native_components,
@@ -4001,7 +3870,6 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
     w: u32,
     h: u32,
 ) -> Option<SampledSourceRequest> {
-    use crate::backend::vulkan::engine;
     use crate::runtime::mapping_write::type11_sample_window;
     if w == 0 || h == 0 {
         return None;
@@ -4056,53 +3924,25 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
     // Free when nothing is owed — `pay_for_mapping` is one emptiness check on
     // the ledger, which is the answer on nearly every call.
     crate::runtime::writeback_debt::pay_for_mapping(state, host, mid);
-    if let Some(source) = mapped_sampled_source(
+    let (source, identity, vouch) = witnessed_mapping_sampled_source(
         state,
         host,
+        crate::runtime::gather_witness::GatherRail::Type11,
         MappedSamplePlane {
             mapping_id: mid,
             base_off,
             span,
             row_length_texels,
         },
-    ) {
-        return Some(SampledSourceRequest::GuestRuns(
-            source,
-            native,
-            sampled_vk_format,
-            1,
-            None,
-            crate::runtime::gather_witness::GatherVouch::Fresh,
-            pixel_format::swizzle_identity(),
-        ));
-    }
-    let (gpas, runs) = mapping_window_guest_runs(state, host, mid, base_off, span)?;
-    let page = state.page_size() as usize;
-    let seen = crate::runtime::gather_witness::note_gather(
-        state,
-        host,
-        crate::runtime::gather_witness::GatherRail::Type11,
-        crate::runtime::gather_witness::GatherKey::Mapping { mid, base_off },
-        crate::runtime::gather_witness::GatherWindow {
-            gpas: &gpas,
-            runs: &runs,
-            span,
-            page_size: page,
-        },
-    );
+    )?;
     Some(SampledSourceRequest::GuestRuns(
-        engine::GuestRunSource {
-            runs: std::sync::Arc::new(runs),
-            source_offset: 0,
-            total_len: span,
-            row_length_texels,
-            pages: guest_page_window(host, gpas, page as u64, base_off % page as u64, span),
-        },
+        source,
         native,
         sampled_vk_format,
         1,
-        Some(LinearSampleIdentity::from(seen.identity)),
-        seen.vouch,
+        None,
+        Some(identity),
+        vouch,
         // Identity: this rail admitted the format only after checking its plan
         // was identity, so there is nothing to fold in.
         pixel_format::swizzle_identity(),
@@ -4124,7 +3964,6 @@ pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
     mid: u32,
     view: objects::Type5TextureView,
 ) -> Option<SampledSourceRequest> {
-    use crate::backend::vulkan::engine;
     use crate::runtime::mapping_write::type5_sample_window;
     let (w, h) = (view.width, view.height);
     if w == 0 || h == 0 || view.depth != 1 {
@@ -4166,53 +4005,25 @@ pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
     // The owed frame, for the reason `try_type11_sample_zero_copy` states: a
     // debt is not a submitted writeback and queue order cannot order it.
     crate::runtime::writeback_debt::pay_for_mapping(state, host, mid);
-    if let Some(source) = mapped_sampled_source(
+    let (source, identity, vouch) = witnessed_mapping_sampled_source(
         state,
         host,
+        crate::runtime::gather_witness::GatherRail::Type5,
         MappedSamplePlane {
             mapping_id: mid,
             base_off,
             span,
             row_length_texels,
         },
-    ) {
-        return Some(SampledSourceRequest::GuestRuns(
-            source,
-            native,
-            sampled_vk_format,
-            1,
-            None,
-            crate::runtime::gather_witness::GatherVouch::Fresh,
-            pixel_format::swizzle_identity(),
-        ));
-    }
-    let (gpas, runs) = mapping_window_guest_runs(state, host, mid, base_off, span)?;
-    let page = state.page_size() as usize;
-    let seen = crate::runtime::gather_witness::note_gather(
-        state,
-        host,
-        crate::runtime::gather_witness::GatherRail::Type5,
-        crate::runtime::gather_witness::GatherKey::Mapping { mid, base_off },
-        crate::runtime::gather_witness::GatherWindow {
-            gpas: &gpas,
-            runs: &runs,
-            span,
-            page_size: page,
-        },
-    );
+    )?;
     Some(SampledSourceRequest::GuestRuns(
-        engine::GuestRunSource {
-            runs: std::sync::Arc::new(runs),
-            source_offset: 0,
-            total_len: span,
-            row_length_texels,
-            pages: guest_page_window(host, gpas, page as u64, base_off % page as u64, span),
-        },
+        source,
         native,
         sampled_vk_format,
         1,
-        Some(LinearSampleIdentity::from(seen.identity)),
-        seen.vouch,
+        None,
+        Some(identity),
+        vouch,
         // Identity: this rail admitted the format only after checking its plan
         // was identity, so there is nothing to fold in.
         pixel_format::swizzle_identity(),
@@ -4706,31 +4517,9 @@ pub(super) fn load_linear_from_host_caches<M: HostMemory + HostOps>(
     if w == 0 || h == 0 {
         return None;
     }
-    // Two cache rungs that used to sit here are deliberately absent; both were
-    // measured dead before removal, so do not restore either.
-    //
-    // The GVA encode cache rung could not serve. Its freshness gate
-    // (`gva_guest_wrote_since_store`) answered `no_entry`/`no_baseline` 286 800
-    // times against `clean`/`wrote` zero — exactly the bypass count — because
-    // `arm_gva_guest_write_witness` stamps its baseline inside the dirty
-    // tracker's two-harvest startup window and re-stamps only on a *later*
-    // store. A surface stored once and sampled forever never gets one, so the
-    // gate can only answer "stale". The sibling mapping rail escapes this by
-    // re-stamping on every write (`mapper::stamp_guest_write_gen`).
-    //
-    // The other was keyed on `texture_ref` + geometry with no GVA validation,
-    // so it could serve one resource's pixels under another's ref after a
-    // rebind at the same size. It reached 2 serves against 725 233 sampled
-    // loads.
-    //
-    // Still open, and a contract gap rather than a tuning one: that same cache
-    // is read by the colour-LOAD seed paths (`try_metal2vulkan_draw`,
-    // `draw::seed_color_load`), neither of which consults the write
-    // witness. One boot held 397 entries over 105 MiB with 393/397 of their
-    // backing pages unmapped — serving pixels for guest pages that are gone.
-    // What the guest's statement of ownership is for a surface whose pages it
-    // has unmapped is not known.
-    //
+    // No address- or content-derived cache decides this resource's bytes. A
+    // named current resident is handled above; this fallback reads the guest's
+    // declared linear resource and memoizes only the derived conversion.
     // Guest-CPU-produced linear textures (wallpaper, glyph atlases) have no
     // host producer generation. Re-read the native rows and byte-compare
     // against the memo: unchanged content reuses the retained swizzled Arc
@@ -4800,63 +4589,10 @@ pub(super) fn sync_store_allowed_pages<M: HostMemory>(
     sync_store_target_pages(state, host, task_id, color0?)
 }
 
-/// How much surface a taken type-11 seed elision covered, in whole texels.
+/// Record the extent of type-11 LOADs served from a current resident.
 ///
-/// Measured to price the repair for an unsound witness: the epoch could not see
-/// a guest CPU write to the surface's own pages, and the obvious fix was the one
-/// the sibling linear rail uses — re-read the guest's bytes and compare before
-/// trusting the resident. Whether that was affordable was entirely a question of
-/// how much memory the elisions actually cover, and the elision *count* cannot
-/// answer it: 8367 elisions a round is either 130 MB of re-reading or 130 KB
-/// depending on a distribution nobody had measured.
-///
-/// So this buckets by extent rather than counting again. A population dominated
-/// by icon-sized attachments can be revalidated for almost nothing; one
-/// dominated by display-sized composites cannot, and would need the repair to
-/// be scoped to the surfaces the guest can actually write.
-///
-/// Buckets are texel counts at the powers that separate the shapes this device
-/// deals in: a 64x64 icon is 4096, a 256x256 thumbnail 65536, a 1920x1080
-/// composite 2073600.
-///
-/// # What it measured, and what it rules out
-///
-/// One driven boot, x86 / Vulkan, six Finder recomposites:
-///
-/// ```text
-/// type11_seed_elided      41389      t11elide_le_64x64          5
-/// type11_seed_provided      242      t11elide_le_256x256        4
-///                                    t11elide_le_512x512      903
-///                                    t11elide_le_1024x1024  15641
-///                                    t11elide_display       24836
-/// t11elide_texels   59 377 325 642   mean 1 434 616 texels/elision
-/// ```
-///
-/// Two things follow, and they point in opposite directions.
-///
-/// **An unconditional revalidation is not affordable.** At RGBA8 the elided
-/// extent is ~237 GB of guest reads per session. The rail is not a micro-
-/// optimisation to be traded away for correctness; it is carrying essentially
-/// all of the composite seed traffic, and `type11_seed_provided` at 242 against
-/// 41 389 says what the un-elided rate would be.
-///
-/// **The latch is not on the icon target.** Nine elisions in the entire session
-/// covered 256x256 or less, and five covered 64x64 or less — so a 64x64 icon
-/// attachment is essentially never the surface being elided. The rail that holds
-/// the broken cell is the *display-sized composite*: its resident carries a bad
-/// region, every later damage draw loads from it and preserves everything it did
-/// not cover, and the region stays. That is consistent with every observation in
-/// this class, including the small guest damage scissors that made the icon look
-/// like a partial draw.
-///
-/// So the repair could not be "revalidate before trusting", and it could not be
-/// "drop the elision". What was missing was a witness for guest CPU writes that
-/// does not cost a read of the surface, and the hypervisor already had one.
-/// [`type11_guest_wrote_since_store`] is that witness, over
-/// `HostOps::guest_write_gen`: O(pages) at the harvest instead of O(bytes) at
-/// every LOAD, with the 237 GB left saved. One driven boot after it landed
-/// measured `type11_seed_elided` 283 against `type11_seed_provided` 23, so the
-/// reuse survived the soundness.
+/// The mapping/resident epoch equality is the decision. These bands only price
+/// the saved guest-memory transfer and never feed behavior.
 fn note_type11_elision_extent(w: u32, h: u32) {
     let texels = (w as u64).saturating_mul(h as u64);
     crate::runtime::drain::note_store_route(match texels {
@@ -6585,7 +6321,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             texture_resource.clone(),
                             view_swizzle.is_none(),
                         ) else {
-                            let detail = sample_miss_detail(state, host, req.task_id, texture_ref);
+                            let detail = texture_resource
+                                .as_deref()
+                                .and_then(retained_linear_sample_miss_detail)
+                                .unwrap_or_else(|| {
+                                    sample_miss_detail(state, host, req.task_id, texture_ref)
+                                });
                             return Err(DrawError::DrawPreparation(
                                 DrawPreparationDecline::TextureResolveMissing {
                                     stage: if frag_stage { "fragment" } else { "vertex" },
@@ -6658,6 +6399,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         _native,
                         format,
                         planes,
+                        direct,
                         identity,
                         vouch,
                         components,
@@ -6666,7 +6408,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         sampled_components = components;
                         source_planes = planes;
                         bytes_identity = identity;
-                        crate::backend::vulkan::engine::SampledSource::GuestRuns(src, vouch)
+                        crate::backend::vulkan::engine::SampledSource::GuestRuns(src, vouch, direct)
                     }
                 };
                 let array_element = reflected_descriptor
@@ -7041,90 +6783,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         );
         let mut gva_load_identity = resolved_gva_load.identity;
         let mut target_guest_seed = resolved_gva_load.guest_seed;
-        // Type-11 composite Load. A retained guest-allocation target is the
-        // guest's texture resource itself, so its LOAD is authoritative without
-        // comparing two copies. A device-allocation target is a mirror: only
-        // when it was stamped with the mapping's current
-        // `surface_content_epoch` does it hold exactly the bytes
-        // `resolve_type11_load_seed` would upload.
-        //
-        // The epoch is the witness. `mark_mapping_written` advances it and every
-        // guest-page writer *in this crate* calls it, so a blit or a compute
-        // writeback invalidates the stamp without knowing this rail exists. The
-        // deferred type-11 publish — the one writer that changes the pixels
-        // without touching guest pages — advances it explicitly. Anything that
-        // leaves the answer unknown (no slot, an evicted or recycled image, a
-        // draw since the stamp, a `map_generation` rewire that renames the
-        // identity) reads back `None` and takes the seed.
-        //
-        // # The epoch cannot see the guest, so it is only half the test
-        //
-        // The epoch's closure does *not* include a guest CPU write, and cannot.
-        // A type-11 surface's pages are plain guest RAM; the guest writes them
-        // with its own CPU and no device operation is involved, so nothing calls
-        // `mark_mapping_written` and the epoch does not move. Every caller of it
-        // is a device-side writer — `compute_exec`, `mapping_write`, `exec`,
-        // `render_writeback` — and there is no entry for the owner of the pages.
-        //
-        // On the epoch alone the elision answers "current" for a resident that
-        // is stale, the pass loads from it, the matching Store publishes it back
-        // over the guest's own bytes, and the epoch still has not moved — which
-        // arms the same wrong answer for the next frame. That fixpoint is
-        // exactly the "renders correctly for a few frames then stays corrupted"
-        // report.
-        //
-        // Measured, three 14-round Finder recomposite boots on the epoch-only
-        // rail:
-        //
-        //   elision on              rounds 3,4,5,6 corrupt — held, none recovered
-        //   all reuse rails off     round 4 corrupt, rounds 5-14 clean
-        //   this rail off alone     round 1 corrupt, round 2 clean (recovered)
-        //
-        // Turning the rail off restored recovery and corruption still occurred
-        // without it, so the elision was never the cause of a bad frame — it was
-        // what made a bad frame permanent. Recovery requires a source of good
-        // pixels that is not the resident, and the seed's only other source is
-        // the surface's own guest pages, so the guest must be writing them.
-        //
-        // `type11_guest_wrote_since_store` is the other half: the hypervisor's
-        // dirty bitmap, the one witness for a write this device did not make.
-        // Both halves must agree, and every unknown on either side reads as
-        // "not current".
-        //
-        // Measured on the same rig with both halves, two 14-round boots:
-        //
-        //   boot A   14/14 clean          t11_gw_ref_moved 2 973
-        //   boot B   1,2 corrupt 3-5 clean; 6 corrupt 7 clean;
-        //            8 corrupt 9-14 clean      t11_gw_ref_moved 8 887
-        //
-        // Boot B is the informative one, and it says exactly what this rail
-        // does and does not fix. Corruption still happens — something writes a
-        // bad composite and that is still unidentified — but **every corrupt
-        // round is followed by a clean one**. On the epoch alone, the same
-        // script at the same HEAD gave rounds 3, 4, 5 and 6 corrupt and *held*,
-        // with none recovering. The latch is gone; its cause is not.
-        //
-        // The 8 887 is the mechanism, not the round count. The guest CPU really
-        // does write these composites — thousands of times a session — and on
-        // the epoch alone every one of those writes was invisible.
-        //
-        // What boot B's per-round counters rule out, for whoever takes the
-        // remaining half: nothing in `store_routes` separates a corrupt round
-        // from a clean one. Rounds 6 and 8 (corrupt) against 7 and 9 (clean)
-        // ran at 931/854 against 921/839 guest-write refusals, 1338/1305
-        // against 1379/1236 elisions, and matching `draw_partial_clear`,
-        // `draw_partial_load_seeded` and `load_seed_ok` — the counters agree to
-        // within the round-to-round drift. The victim is one whole absent icon
-        // (`blobs=6 intact=6`, never shrunk), so whatever produces it is not
-        // visible in the seed, reuse, or partial-draw populations this census
-        // covers.
-        //
-        // Why not the sibling rail's shape — `load_linear_guest_memoized`
-        // re-reads the guest's native rows on every call and byte-compares
-        // before reusing its `Arc`. Priced on one boot: `type11_seed_elided`
-        // 41 389 against `type11_seed_provided` 242, at a mean 1.43 M texels per
-        // elision, so revalidating by re-reading would move ~237 GB of guest
-        // memory a session. The bitmap answers the same question in a word.
+        // A copied type-11 target may carry a LOAD only while the Store's
+        // resident epoch matches the mapping epoch. Both guest CPU writes and
+        // device writes advance that epoch through their decoded validity or
+        // write paths, so the comparison needs no memory-observation channel.
         if !chain_load_from_target {
             if let Some((identity, mapping_epoch)) = type11_load_currency_query(state, req) {
                 // Both arms counted, into the same one-second window as
@@ -7132,15 +6794,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // skipped" from "this record was never a candidate", and the
                 // ratio of the two is a within-boot number — the only kind that
                 // survives the 1.8x `us_per_draw` drift between boots on this rig.
-                let (resident_current, guest_wrote) = type11_load_resident_is_current(|| {
+                let resident_current = type11_load_resident_is_current(|| {
                     let resident_epoch =
                         crate::backend::vulkan::engine::resident_content_epoch(&identity);
-                    let mapping_id = req.colors.first().map(|c| c.mapping_id()).unwrap_or(0);
-                    let guest_wrote = type11_guest_wrote_since_store(state, host, mapping_id);
-                    (
-                        type11_resident_is_current(mapping_epoch, resident_epoch) && !guest_wrote,
-                        guest_wrote,
-                    )
+                    type11_resident_is_current(mapping_epoch, resident_epoch)
                 });
                 if resident_current {
                     chain_load_from_target = true;
@@ -7148,12 +6805,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     note_type11_elision_extent(w, h);
                 } else {
                     crate::runtime::drain::note_store_route("type11_seed_provided");
-                    // Separated from the epoch's refusal so a boot can say which
-                    // half refused. The two answer different questions and a
-                    // single counter would hide a rail that never fires.
-                    if guest_wrote {
-                        crate::runtime::drain::note_store_route("type11_seed_guest_wrote");
-                    }
                 }
             }
         }
@@ -8601,342 +8252,9 @@ pub(super) fn type11_load_currency_query(
     Some((identity, mapping_epoch))
 }
 
-/// Has the guest written this surface's pages since the Store that produced a
-/// copied resident stamped them?
-///
-/// The device-side half of the currency test — the `surface_content_epoch`
-/// comparison one function up — can only witness writers inside this crate.
-/// A type-11 surface's pages are plain guest RAM, and the guest CPU stores
-/// into them with no device operation, so the epoch does not move and the
-/// resident silently stops matching what the seed would upload. This is the
-/// only witness for that copied-allocation question, and it is the hypervisor's.
-///
-/// Answers `true` — "written, do not reuse" — for every case that is not a
-/// live token whose current generation equals the one the Store recorded:
-/// a host that cannot observe guest writes, a mapping with no token, a token
-/// released with its page list, and a Store that never stamped. A false
-/// "unwritten" is the one answer that produces a wrong frame; a false
-/// "written" only costs a seed.
-///
-/// # What the ordering actually promises
-///
-/// The host observes writes at its own harvest points, and the shims harvest at
-/// the register write that hands the device work. So the promise is: every guest
-/// store ordered before a submission is visible to the draws that submission
-/// carries. It is *not* "immediately" — a store racing the draws that read the
-/// same surface is a race the guest already has against the GPU, and the next
-/// submission's harvest sees it either way, so the rail cannot latch.
-///
-/// The generation is read again at the Store, so a write that lands between a
-/// record's LOAD and its Store is stamped as though the resident contained it.
-/// That window is one packet's execution, it requires the guest to write a
-/// surface it has just asked the GPU to render into, and — unlike the epoch-only
-/// rail this replaced — the very next guest write moves the generation again and
-/// clears it.
-pub(super) fn type11_guest_wrote_since_store<M: HostOps>(
-    state: &DeviceState,
-    host: &M,
-    mapping_id: u32,
-) -> bool {
-    match mapping_guest_write_verdict(state, host, mapping_id) {
-        GuestWriteVerdict::Clean => false,
-        GuestWriteVerdict::NoMapping => {
-            crate::runtime::drain::note_store_route("t11_gw_ref_no_mapping");
-            true
-        }
-        GuestWriteVerdict::NoStamp => {
-            crate::runtime::drain::note_store_route("t11_gw_ref_no_stamp");
-            true
-        }
-        GuestWriteVerdict::Wrote => {
-            crate::runtime::drain::note_store_route("t11_gw_ref_moved");
-            true
-        }
-        GuestWriteVerdict::Unreadable => {
-            crate::runtime::drain::note_store_route("t11_gw_ref_unreadable");
-            true
-        }
-    }
-}
-
-/// Whether the hypervisor watched the guest write anywhere in the allocation a
-/// type-4 surface's host-side copies were taken from.
-///
-/// The first of two stages, and the coarse one: the tracking token covers the
-/// mapping's whole page list and its generation moves for a write to any page
-/// in it, so this answers about the *allocation*, not about the pixels a bind
-/// would read. [`guest_write_site`] is what narrows it.
-///
-/// Only `Wrote` is evidence. `no_stamp` says "nobody asked the host to watch
-/// these pages", which is a statement about this device's arming and not about
-/// the guest; on the boot that first measured the ladder it was 14 092 of 14 396
-/// cache binds, so refusing on it would turn the rung off on the strength of a
-/// rail that was never armed.
-fn guest_wrote_allocation(verdict: GuestWriteVerdict) -> bool {
-    matches!(verdict, GuestWriteVerdict::Wrote)
-}
-
-/// Where the guest's writes since the stamping Store landed, relative to the
-/// pixel window a sampled bind reads.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum GuestWriteSite {
-    /// At least one written page overlaps the sampled window, so every
-    /// host-side copy of it is out of date. Carries the mapping-offset ranges
-    /// the guest owns, which is exactly the `skip` list the merge needs.
-    Pixels(Vec<(u64, u64)>),
-    /// The guest wrote the allocation but not the bytes this bind samples.
-    Elsewhere,
-    /// The host could not name the written pages, or the window is unknown.
-    /// Indistinguishable from [`Self::Pixels`] to a caller that must be right,
-    /// but it cannot be merged either — there is no page list to preserve.
-    Unknown,
-}
-
-/// Narrow a `Wrote` verdict to the pixel window, so a write that misses it does
-/// not discard a resident that is still exactly the surface.
-///
-/// The tracking token is per *page list*, and a type-4 allocation is more than
-/// its sampled plane: `type11_sample_window` reports a `base_off` precisely
-/// because the pixels do not start at offset 0, and an allocation can carry a
-/// second plane and end padding past `span_end`. A guest store into any of that
-/// moves the set-wide generation. Refusing on it discarded whole 1920x1080
-/// compositor scanouts whose pixels the GPU had rendered and nothing had
-/// touched — measured live as a black desktop at 17 Hz, against 120 Hz and a
-/// painted one on the same boot script with the rung ungated.
-///
-/// Fails closed. Everything the host cannot answer exactly — no token, no
-/// enumerable page list, no resolvable sample window, or written GPAs this
-/// mapping does not own — is [`GuestWriteSite::Unknown`], which the caller
-/// treats as [`GuestWriteSite::Pixels`]. Serving a stale copy is a wrong frame
-/// that is then held; re-reading the guest's pages costs a copy.
-fn guest_write_site<M: HostOps>(
-    state: &DeviceState,
-    host: &M,
-    mapping_id: u32,
-    width: u32,
-    height: u32,
-) -> GuestWriteSite {
-    let Some(m) = state.mappings.get(&mapping_id) else {
-        return GuestWriteSite::Unknown;
-    };
-    let format = if m.format != 0 {
-        m.format
-    } else {
-        pixel_format::MTL_FORMAT_BGRA8_UNORM
-    };
-    let Some((base_off, _bpr, span_end)) =
-        crate::runtime::mapping_write::type11_sample_window(m, width, height, format)
-    else {
-        return GuestWriteSite::Unknown;
-    };
-    let Some(pages) = host.guest_written_pages(m.guest_write_token, m.guest_write_gen_at_store)
-    else {
-        return GuestWriteSite::Unknown;
-    };
-    let ranges = mapper::mapping_offsets_of_pages(state, mapping_id, &pages);
-    if ranges.is_empty() {
-        // The set-wide generation moved, so some page of this list was written,
-        // yet none of them mapped back to an offset. That is a disagreement
-        // between the token and the page list this call resolved against, not a
-        // finding about the guest.
-        return GuestWriteSite::Unknown;
-    }
-    if ranges_touch_window(&ranges, base_off, span_end) {
-        GuestWriteSite::Pixels(ranges)
-    } else {
-        GuestWriteSite::Elsewhere
-    }
-}
-
-/// Put both halves of a surface the guest wrote under a live resident into the
-/// guest's own pages, and withdraw the resident's claim to be the surface.
-///
-/// This is the answer the ladder was missing. Neither copy is the surface on its
-/// own: the resident holds what the GPU rendered, the pages hold what the guest
-/// CPU painted since, and picking either one loses the other's work. Refusing
-/// the resident and reading the pages — which is what the gate did on its own —
-/// produced a black desktop at 17 Hz, because the skip-readback Store rail
-/// leaves a composite's pixels GPU-side on purpose and the pages it read had
-/// never been written.
-///
-/// So: read the resident out, land it in every page the guest did *not* write
-/// (`write_bgra8_skipping`, the same per-page rule the deferred writeback
-/// follows), and retire the resident. The pages then hold the merge, and they
-/// are what every rung below reads. The next Store into this surface makes a
-/// fresh resident and stamps it, so this is paid once per burst of guest writes
-/// and not once per bind.
-///
-/// Returns whether the merge landed. On `false` the caller has a surface whose
-/// halves are still split and must say so rather than bind either one.
-///
-/// `#[must_use]` because that is the whole contract: dropping the result leaves
-/// the caller falling through to rungs that read pages holding only the guest's
-/// half, and for a composite the Store deliberately left GPU-side those pages
-/// were never written at all.
-#[must_use]
-fn merge_guest_writes_into_pages<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    mapping_id: u32,
-    width: u32,
-    height: u32,
-    identity: &crate::backend::vulkan::engine::TargetIdentity,
-    guest_owned: &[(u64, u64)],
-) -> bool {
-    let readback = match crate::backend::vulkan::engine::read_target(identity) {
-        Ok(rb) => rb,
-        Err(e) => {
-            crate::observe::fail(format!(
-                "sampled_resident_merge_fail mid={mapping_id} {width}x{height} stage=readback err={e:?}"
-            ));
-            return false;
-        }
-    };
-    let bgra = readback.into_bgra8();
-    let stride = width.saturating_mul(RGBA8_BPP);
-    if !mapping_write::write_bgra8_skipping(
-        state,
-        host,
-        mapping_id,
-        &bgra,
-        stride,
-        width,
-        height,
-        guest_owned,
-    ) {
-        crate::observe::fail(format!(
-            "sampled_resident_merge_fail mid={mapping_id} {width}x{height} stage=writeback \
-             runs={} bytes={}",
-            guest_owned.len(),
-            bgra.len()
-        ));
-        return false;
-    }
-    // `write_bgra8_skipping` has already retired both host-side copies and
-    // re-taken the guest-write stamp, because those follow from the skipping
-    // write and not from who asked for it. `identity` is the same value it
-    // recomputes; it is a parameter here because the readback needs it.
-    crate::runtime::drain::note_store_route("t11sample_resident_merged");
-    true
-}
-
-/// Whether any written mapping-offset range overlaps `[base_off, span_end)`.
-///
-/// Half-open on both sides: a range that abuts the window without entering it
-/// is the padding page after the last row, not the last row.
-fn ranges_touch_window(ranges: &[(u64, u64)], base_off: u64, span_end: u64) -> bool {
-    ranges
-        .iter()
-        .any(|&(lo, hi)| lo < span_end && hi > base_off)
-}
-
-/// Census only: which rung of the type-4 sampled ladder served this bind, and,
-/// for the rungs that serve a host-side *copy* of guest memory, what the
-/// hypervisor said about those bytes when the rung was chosen.
-///
-/// The ladder in [`resolve_sampled_source`] had no counters at all, which is
-/// why the GVA cache's identical defect had to be found through a probe-gated
-/// byte compare instead of read off a boot.
-///
-/// `t11rung_resident_refused` counts binds where a ready resident existed and a
-/// guest write to its pages sent the bind to the guest's pages instead — the
-/// `guest_replaced` gate in [`resolve_sampled_source`]. It is the direct measure
-/// of how much wrong content that rung used to serve.
-///
-/// # Baseline, before the resident rung was gated
-///
-/// One 14-round Finder recomposite boot under load, x86 / Vulkan:
-///
-/// ```text
-/// t11rung_resident    92730     (no currency test at all)
-/// t11rung_host_cache  14396     gw_clean 0  gw_no_stamp 14092  gw_wrote 304
-/// t11rung_zero_copy    4977
-/// t11rung_guest_memo     51
-/// t11rung_miss            0
-/// ```
-///
-/// That is the *pre-gating* world and it is kept only as the before-picture: the
-/// resident rung ran with no column at all because it asked no question, and
-/// every one of the 14 396 cache binds served bytes the hypervisor could not
-/// vouch for.
-///
-/// # What it reads now, which is the reading to reason from
-///
-/// Both statements above have since been overtaken, so do not carry the bolded
-/// `gw_clean == 0` forward — it was true of a build that no longer exists. One
-/// driven x86 / Vulkan boot (Safari page loads, scrolls, title-bar drags):
-///
-/// ```text
-/// t11rung_resident    632   gw_clean 242  gw_no_stamp 426
-/// t11rung_host_cache  131   gw_clean   8  gw_no_stamp 123
-/// ```
-///
-/// The gate did what it was for: the resident rung now asks the question, and
-/// `gw_clean` is non-zero on both copy-serving rungs. `no_stamp` still dominates
-/// — most mappings are never armed with a guest-write token — so the currency
-/// test mostly answers "cannot vouch", but it no longer *always* does.
-///
-/// # The whole ladder, and the inversion since
-///
-/// A later driven boot — Chess, Maps, the WebGL aquarium, page-downs, a
-/// title-bar drag, apple.com — summing `store_routes` deltas across the boot:
-///
-/// ```text
-/// t11rung_resident   7166  (76 %)   gw_clean 6552   gw_no_stamp  614
-/// t11rung_host_cache 1791  (19 %)   gw_clean  432   gw_no_stamp 1359
-/// t11rung_zero_copy   415  (4.4 %)
-/// t11rung_guest_memo   47  (0.5 %)
-/// t11rung_resident_refused 1
-/// ```
-///
-/// Two things to carry forward. **`gw_clean` and `gw_no_stamp` read the other
-/// way round on the resident rung** — 242/426 against 6552/614. Whether that is
-/// the build or the workload is not established: the two readings differ in
-/// both, and this boot drove two native apps and a WebGL page the earlier one
-/// did not. What is safe is that the paragraph above no longer describes any
-/// reading we have, so do not reason from it. The host-cache rung still reads
-/// the old way *in the same boot*, which says the two rungs are not arming
-/// guest-write tokens alike whatever the cause.
-///
-/// And **all four rungs carry traffic**. The thin ones are thin, not empty:
-/// `guest_memo` is 0.5 % of samples and `zero_copy` 4.4 %, so neither is a dead
-/// fallback that can be deleted to shorten the ladder. Deleting either loses
-/// content the guest asked for. Shortening this ladder is a question about the
-/// PVG contract — where a sampled surface's content is *supposed* to live — and
-/// not one a traffic census can settle.
-///
-/// The other six cells of the (rung × verdict) table have never fired on this
-/// pathway: `gw_no_mapping` and `gw_unreadable` on either rung, and
-/// `gw_wrote_elsewhere` on either rung. They are denominators, not dead code —
-/// their being empty is what says a served copy is never a copy the hypervisor
-/// actively contradicted.
-fn note_type11_sample_rung(rung: &'static str, guest_write: GuestWriteVerdict) {
+/// Count which contract-owned rung served a type-11 sampled bind.
+fn note_type11_sample_rung(rung: &'static str) {
     crate::runtime::drain::note_store_route(rung);
-    if let Some(gw) = sample_rung_gw_route(rung, guest_write) {
-        crate::runtime::drain::note_store_route(gw);
-    }
-}
-
-/// The census column for a rung's guest-write verdict, or `None` for a rung the
-/// verdict says nothing about.
-fn sample_rung_gw_route(rung: &str, guest_write: GuestWriteVerdict) -> Option<&'static str> {
-    Some(match (rung, guest_write) {
-        ("t11rung_resident", GuestWriteVerdict::Clean) => "t11rung_resident_gw_clean",
-        ("t11rung_resident", GuestWriteVerdict::NoMapping) => "t11rung_resident_gw_no_mapping",
-        ("t11rung_resident", GuestWriteVerdict::NoStamp) => "t11rung_resident_gw_no_stamp",
-        ("t11rung_resident", GuestWriteVerdict::Unreadable) => "t11rung_resident_gw_unreadable",
-        // Served under a `Wrote` verdict, so the write missed the sampled window
-        // — `guest_write_site` said `Elsewhere` or the bind would have refused.
-        ("t11rung_resident", GuestWriteVerdict::Wrote) => "t11rung_resident_gw_wrote_elsewhere",
-        ("t11rung_host_cache", GuestWriteVerdict::Clean) => "t11rung_host_cache_gw_clean",
-        ("t11rung_host_cache", GuestWriteVerdict::NoMapping) => "t11rung_host_cache_gw_no_mapping",
-        ("t11rung_host_cache", GuestWriteVerdict::NoStamp) => "t11rung_host_cache_gw_no_stamp",
-        ("t11rung_host_cache", GuestWriteVerdict::Unreadable) => "t11rung_host_cache_gw_unreadable",
-        ("t11rung_host_cache", GuestWriteVerdict::Wrote) => "t11rung_host_cache_gw_wrote_elsewhere",
-        // The rungs that read the guest's own pages do not care what the guest
-        // wrote, because they read exactly that.
-        _ => return None,
-    })
 }
 
 /// Whether a resident's stamp still vouches for the mapping's current content.
@@ -8950,7 +8268,7 @@ fn type11_resident_is_current(mapping_epoch: Option<u32>, resident_epoch: Option
     mapping_epoch.is_some() && mapping_epoch == resident_epoch
 }
 
-fn type11_load_resident_is_current(copied_currency: impl FnOnce() -> (bool, bool)) -> (bool, bool) {
+fn type11_load_resident_is_current(copied_currency: impl FnOnce() -> bool) -> bool {
     copied_currency()
 }
 
@@ -8964,16 +8282,8 @@ fn type11_load_resident_is_current(copied_currency: impl FnOnce() -> (bool, bool
 /// refuses a slot that was evicted between the draw and here. Both leave the
 /// stamp absent, which costs a seed and never a wrong frame.
 ///
-/// Also records the host's guest-write generation for the surface's pages, and
-/// registers them for tracking the first time. That is the half of the currency
-/// test `epoch` cannot cover: every writer that advances `epoch` is inside this
-/// crate, while the pages are plain guest RAM the guest CPU stores into with no
-/// device operation. Registration happens here rather than at mapping resolve
-/// because this is the first moment the device has a host-side copy whose reuse
-/// would depend on the answer.
-fn stamp_type11_resident<M: HostMemory + HostOps>(
+fn stamp_type11_resident(
     state: &mut DeviceState,
-    host: &mut M,
     req: &DrawEncodeRequest,
     writeback_guest: bool,
     epoch: u32,
@@ -8992,14 +8302,6 @@ fn stamp_type11_resident<M: HostMemory + HostOps>(
         // readback precisely so no copy is made, keeps the frame in the image
         // alone, and holds it with a pin instead.
         crate::backend::vulkan::engine::note_resident_content_copied_out(&identity);
-    }
-    if let Some(mapping_id) = req
-        .colors
-        .first()
-        .map(|c| c.mapping_id())
-        .filter(|m| *m != 0)
-    {
-        crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
     }
 }
 
@@ -9310,7 +8612,6 @@ fn store_surface_resident<M: HostMemory + HostOps>(
     if plan == SurfaceStorePlan::DeferCopy
         && arm_surface_writeback_debt(state, mapping_id, identity, width, height)
     {
-        crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
         return true;
     }
     if !crate::runtime::render_writeback::store_render_frame(
@@ -9318,11 +8619,6 @@ fn store_surface_resident<M: HostMemory + HostOps>(
     ) {
         return false;
     }
-    // The guest half of the write witness, recorded here rather than by the
-    // caller because this rail returns straight out of `encode_draw` — it never
-    // reaches `stamp_type11_resident`, and it is where nearly all type-11 Stores
-    // go.
-    crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
     true
 }
 
@@ -9971,121 +9267,12 @@ mod vulkan_split_tests {
 
     #[test]
     fn an_engine_owned_load_uses_copy_currency() {
-        for copied_answer in [(false, true), (true, false)] {
+        for copied_answer in [false, true] {
             assert_eq!(
                 type11_load_resident_is_current(|| copied_answer),
                 copied_answer
             );
         }
-    }
-
-    /// A sampled bind may only be served from a host-side copy of a type-4
-    /// surface while the hypervisor has not watched the guest replace the pages
-    /// that copy was taken from — and the GPU resident is bound by that rule
-    /// exactly as the byte cache is.
-    ///
-    /// The two rungs were not equal. `t11rung_host_cache` asked
-    /// `mapping_guest_write_verdict` before serving; `t11rung_resident`, which
-    /// sits above it in the ladder and took 92 730 binds to the cache's 14 396
-    /// on the boot that first measured them, asked nothing and returned
-    /// `SampledSourceRequest::Target` unconditionally. A type-11 surface's pages
-    /// are plain guest RAM: the guest CPU repaints them with no device
-    /// operation, so a resident produced for one tenant of a pooled IOSurface
-    /// keeps claiming to hold its pixels after a different tenant has been
-    /// painted there. Nothing below the rung could correct it, because both
-    /// rungs that read the guest's own pages sit underneath — which is why the
-    /// wrong image was *held* rather than replaced on the next redraw.
-    ///
-    /// Both directions are asserted deliberately. Refusing more than `Wrote`
-    /// would be just as wrong: `NoStamp` means this device never armed the
-    /// witness, and turning the rung off on that answer would send binds to the
-    /// guest's pages for surfaces whose content the deferred writeback rail has
-    /// not landed there yet.
-    #[test]
-    fn a_watched_guest_write_refuses_every_host_side_copy_of_a_surface() {
-        assert!(
-            guest_wrote_allocation(GuestWriteVerdict::Wrote),
-            "a resident whose pages the host watched the guest rewrite is not the surface"
-        );
-        for verdict in [
-            GuestWriteVerdict::Clean,
-            GuestWriteVerdict::NoMapping,
-            GuestWriteVerdict::NoStamp,
-            GuestWriteVerdict::Unreadable,
-        ] {
-            assert!(
-                !guest_wrote_allocation(verdict),
-                "{verdict:?} is not evidence of a guest write and must not refuse a copy"
-            );
-        }
-    }
-
-    /// The second stage, which is what keeps the first from being ruinous. A
-    /// type-4 allocation is bigger than the plane a bind samples — pixels start
-    /// at `base_off` and padding follows `span_end` — and the tracking token's
-    /// generation moves for a write to any page of it. Refusing on that alone
-    /// discarded whole 1920x1080 compositor scanouts the GPU had rendered and
-    /// the guest had never touched the pixels of: measured live as a black
-    /// desktop at 17 Hz.
-    ///
-    /// Fails closed in both unknown directions, because the caller cannot
-    /// distinguish "no answer" from "written" without being wrong on frames.
-    #[test]
-    fn a_guest_write_outside_the_sampled_window_keeps_the_resident() {
-        // A 1920x1080 BGRA8 plane one page into its allocation.
-        const BASE: u64 = 4096;
-        const END: u64 = BASE + 1920 * 1080 * 4;
-        // The header page before the plane is not the pixels.
-        assert!(!ranges_touch_window(&[(0, 4096)], BASE, END));
-        // Nor is padding after it.
-        assert!(!ranges_touch_window(&[(END + 4096, END + 8192)], BASE, END));
-        // Abutting the end exactly is still outside — both bounds half-open.
-        assert!(!ranges_touch_window(&[(END, END + 4096)], BASE, END));
-        // One page anywhere inside the plane is the whole finding.
-        assert!(ranges_touch_window(&[(4_198_400, 4_202_496)], BASE, END));
-        // A range straddling the plane's first byte counts.
-        assert!(ranges_touch_window(&[(0, 8192)], BASE, END));
-        // Outside ranges do not mask an inside one.
-        assert!(ranges_touch_window(
-            &[(0, 4096), (4_198_400, 4_202_496), (END, END + 4096)],
-            BASE,
-            END
-        ));
-        assert!(!ranges_touch_window(&[], BASE, END));
-    }
-
-    /// Every rung of the sampled ladder that serves a host-side copy reports the
-    /// verdict it was chosen under, so a boot can tell "the guest never rewrites
-    /// its sampled surfaces" from "the witness was never armed". A rung with no
-    /// column is a rung that asked no question, which is what the resident rung
-    /// was.
-    #[test]
-    fn both_copy_serving_rungs_report_the_verdict_they_were_chosen_under() {
-        for rung in ["t11rung_resident", "t11rung_host_cache"] {
-            for (verdict, suffix) in [
-                (GuestWriteVerdict::Clean, "clean"),
-                (GuestWriteVerdict::NoMapping, "no_mapping"),
-                (GuestWriteVerdict::NoStamp, "no_stamp"),
-                (GuestWriteVerdict::Unreadable, "unreadable"),
-            ] {
-                assert_eq!(
-                    sample_rung_gw_route(rung, verdict),
-                    Some(format!("{rung}_gw_{suffix}").as_str()),
-                    "sampled ladder lost the {rung} {suffix} column"
-                );
-            }
-            assert_eq!(
-                sample_rung_gw_route(rung, GuestWriteVerdict::Wrote),
-                Some(format!("{rung}_gw_wrote_elsewhere").as_str()),
-                "a bind served under Wrote is one whose write missed the sampled window"
-            );
-        }
-        // A rung that reads the guest's own pages is not a copy and takes no
-        // verdict column.
-        assert_eq!(
-            sample_rung_gw_route("t11rung_zero_copy", GuestWriteVerdict::NoStamp),
-            None
-        );
     }
 
     /// Epoch 0 is a legal mapping value — "nothing published since attach" —
@@ -10491,120 +9678,6 @@ mod vulkan_split_tests {
         );
     }
 
-    /// The `LOAD` seed's host-cache rung must refuse a surface the hypervisor
-    /// watched the guest repaint, exactly as the sampled path's read of the same
-    /// map does.
-    ///
-    /// The two are one cache with two readers, and only one of them asked. The
-    /// damage is not a single wrong frame: this rung sits above the only rung
-    /// that reads the guest's pages, so nothing below corrects it, and the pass
-    /// that seeds from it composites onto the stale bytes and Stores them back
-    /// over the pages the guest just wrote. The guest's repaint is then gone
-    /// from both copies and the next frame loads what this one stored.
-    #[test]
-    fn the_type11_load_seed_cache_rung_refuses_a_surface_the_guest_rewrote() {
-        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-        use crate::runtime::host::HostOps;
-        use crate::runtime::mapping_write::write_bgra8;
-
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        let mut host = FakeHost::new();
-        host.stable_map_pages = true;
-        // Not shared with any other test's: `first_sight` latches per
-        // `(reason, discriminant)` for the life of the process.
-        let mid = 913u32;
-        let pfn = 0x27u32;
-        let gpa = (pfn as u64) << PAGE_SHIFT_X86;
-        host.map_range(gpa, 0x4000, 0);
-        state.map_surface(mid);
-        {
-            let m = state.mappings.get_mut(&mid).expect("mapped above");
-            m.mapped = true;
-            m.mapping_internal = 1;
-            m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
-        }
-        let (w, h) = (4u32, 2u32);
-        assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
-
-        // What the guest painted, on the wire in BGRA and distinct per channel so
-        // a swizzle cannot pass for a rung.
-        let mut pages = vec![0u8; (w * h * 4) as usize];
-        for px in pages.chunks_exact_mut(4) {
-            px.copy_from_slice(&[0x10, 0x20, 0x30, 0xFF]);
-        }
-        assert!(write_bgra8(&mut state, &mut host, mid, &pages, w * 4, w, h));
-
-        // What this device last published for the same surface — an older frame,
-        // and the one the rung under test would serve.
-        let mut cached = vec![0u8; (w * h * 4) as usize];
-        for px in cached.chunks_exact_mut(4) {
-            px.copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xFF]);
-        }
-        crate::runtime::surface_cache::store(&mut state, mid, w, h, cached);
-
-        // Armed and stamped: with nothing written since, the cache is the
-        // fresher copy and must still win. Asserting this first is what stops
-        // the fix from being "refuse always", which would pass the real
-        // assertion below while costing every seed a guest read.
-        let token = crate::runtime::mapper::ensure_guest_write_token(&mut state, &mut host, mid)
-            .expect("FakeHost observes guest writes");
-        state
-            .mappings
-            .get_mut(&mid)
-            .expect("mapped above")
-            .guest_write_gen_at_store = host.guest_write_gen(token).expect("a live token has one");
-        let Type11LoadSeed::Host(bytes, order) = resolve_type11_load_seed(
-            &mut state,
-            &mut host,
-            mid,
-            w,
-            h,
-            gva_resident_format(MTL_FORMAT_BGRA8_UNORM),
-        )
-        .expect("an unwritten surface may be seeded from the cache") else {
-            panic!("the fresh cache must stay above the guest-page rung");
-        };
-        assert_eq!(order, crate::backend::vulkan::engine::SeedOrder::Bgra8);
-        assert_eq!(&bytes[..4], &[0xAA, 0xBB, 0xCC, 0xFF]);
-
-        // The guest CPU repaints the surface. No device operation, so the
-        // content epoch does not move and this is the only witness that sees it.
-        host.guest_wrote_page(gpa);
-        assert_eq!(
-            guest_write_site(&state, &host, mid, w, h),
-            // Whole-page, because the hypervisor's witness has page granularity
-            // and the surface's one page is the whole of its mapping offsets.
-            GuestWriteSite::Pixels(vec![(0, 1u64 << PAGE_SHIFT_X86)]),
-            "the write has to land inside the sampled window, or the rung under \
-             test is being asked the wrong question"
-        );
-
-        let Type11LoadSeed::Guest(seed) = resolve_type11_load_seed(
-            &mut state,
-            &mut host,
-            mid,
-            w,
-            h,
-            gva_resident_format(MTL_FORMAT_BGRA8_UNORM),
-        )
-        .expect("the guest's own pages are still a seed") else {
-            panic!("a repainted surface must bypass the stale host cache");
-        };
-        assert_eq!(seed.format, ash::vk::Format::B8G8R8A8_UNORM);
-        let (_, bpr, _) = crate::runtime::mapping_write::type11_sample_window(
-            &state.mappings[&mid],
-            w,
-            h,
-            MTL_FORMAT_BGRA8_UNORM,
-        )
-        .expect("the seed used this mapping window");
-        let (span, row_length_texels) = strided_window_extent(w, h, 4, u64::from(bpr))
-            .expect("the native row pitch describes this image");
-        assert_eq!(seed.source.total_len, span);
-        assert_eq!(seed.source.row_length_texels, row_length_texels);
-    }
-
     #[test]
     fn a_type11_load_seed_falls_back_to_the_surfaces_own_guest_pages() {
         use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
@@ -10720,73 +9793,6 @@ mod vulkan_split_tests {
             )
             .is_none(),
             "a mismatched extent must refuse by name, not seed something else"
-        );
-    }
-
-    /// The type-4 host-cache sample rung must not serve a surface the
-    /// hypervisor has watched the guest rewrite.
-    ///
-    /// That rung sits above both rungs that read the guest's own pages
-    /// (`t11rung_zero_copy`, `t11rung_guest_memo`), so a stale hit is never
-    /// corrected by anything below it — and its first census said `gw_clean` was
-    /// **zero** across 14 396 binds. Only the demonstrated write refuses:
-    /// `no_stamp` is a statement about this device's arming, not the guest's
-    /// behaviour, and refusing on it would re-read a surface per bind.
-    #[test]
-    fn the_host_cache_sample_rung_refuses_a_surface_the_guest_rewrote() {
-        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-        use crate::runtime::host::{FakeHost, HostOps};
-
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        let mut host = FakeHost::new();
-        let page = state.page_size();
-        // Chosen not to collide with any other test's mapping id: `first_sight`
-        // latches per (reason, discriminant) for the life of the process.
-        let mid = 911u32;
-        assert!(state.map_surface(mid), "mid must be inside MAX_MAPPINGS");
-        let gpa = 0x55 * page;
-        {
-            let m = state.mappings.get_mut(&mid).expect("mapped above");
-            m.mapped = true;
-            m.page_entries =
-                vec![(((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
-        }
-
-        // Unarmed: the verdict cannot vouch, but "nobody asked the host to
-        // watch" is not "the guest wrote", so the rung still serves.
-        assert_eq!(
-            mapping_guest_write_verdict(&state, &host, mid),
-            GuestWriteVerdict::NoStamp
-        );
-        assert!(
-            !matches!(
-                mapping_guest_write_verdict(&state, &host, mid),
-                GuestWriteVerdict::Wrote
-            ),
-            "an unarmed rail must not cost every bind a re-read"
-        );
-
-        // Armed and stamped by a Store: the copy and the pages agree.
-        let token = crate::runtime::mapper::ensure_guest_write_token(&mut state, &mut host, mid)
-            .expect("FakeHost observes guest writes");
-        state
-            .mappings
-            .get_mut(&mid)
-            .expect("mapped above")
-            .guest_write_gen_at_store = host.guest_write_gen(token).expect("a live token has one");
-        assert_eq!(
-            mapping_guest_write_verdict(&state, &host, mid),
-            GuestWriteVerdict::Clean,
-            "a surface nobody wrote since the Store may be served from the copy"
-        );
-
-        // The guest CPU rewrites the surface. No device operation, so nothing
-        // else in this crate moves — this is the only witness that can see it.
-        host.guest_wrote_page(gpa);
-        assert_eq!(
-            mapping_guest_write_verdict(&state, &host, mid),
-            GuestWriteVerdict::Wrote,
-            "the host saw the write, so the host-side copy is a stale picture"
         );
     }
 

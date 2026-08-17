@@ -102,35 +102,13 @@ impl crate::observe::Refusal for DecodeStatus {
 /// the encoder ends here. A render segment that does *not* continue a previous
 /// one begins by decoding a render-pass descriptor out of its own records.
 ///
-/// So one Metal render command encoder — one Vulkan render pass — may span an
-/// unbounded number of records across an unbounded number of segments, and this
-/// device instead opens and ends a render pass per draw.
-///
-/// **Whether that costs anything here is a question about this guest**, and
-/// [`SEGMENT_CHAIN_ROUTES`] answered it. Driven x86 Safari-drag boot:
-///
-/// ```text
-/// seg_chain_none    94 860
-/// seg_chain_next         0
-/// seg_chain_prev         0
-/// seg_chain_both         0
-/// ```
-///
-/// **Every segment of the boot.** This guest never asks for an encoder to
-/// outlive a segment, so there is nothing here to honour and no pass to hold
-/// open across one. Keep the routes: this is a property of a workload, not of
-/// the protocol, and a guest that did chain would arrive as a non-zero here
-/// rather than as a rendering defect.
-///
-/// The narrower question — whether a *single* segment carries more draws than
-/// the one render pass this device opens per draw — has the same answer, from
-/// the same boot: **94 860 segments against 96 351 draws**, so a render segment
-/// carries about one. A render pass per draw is what this guest asks for, not a
-/// translation artifact, and the contract permitting an unbounded number of
-/// draws per encoder does not mean this workload presents one.
-///
-/// So the submission and render-pass granularity are both already the guest's.
-/// Neither is where this device's remaining cost is.
+/// So one render command encoder — and therefore its pipeline, bind state and
+/// render pass — may span an unbounded number of records across an unbounded
+/// number of submitted child buffers. The executor carries the owning decoder
+/// state until `unidentified_u8` clears; resetting it at a child-buffer boundary
+/// drops valid continuation draws that do not repeat their pipeline bind.
+/// [`SEGMENT_CHAIN_ROUTES`] remains the workload instrument for how often each
+/// lifetime form is used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Segment {
     pub offset: u32,

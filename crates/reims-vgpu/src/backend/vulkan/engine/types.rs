@@ -2180,7 +2180,28 @@ pub enum SampledSource {
     /// says is possible. Resource-owned direct images carry no copied-content
     /// identity. If the backend declines one, the copy fallback therefore runs
     /// conservatively instead of reusing content that was never witnessed.
-    GuestRuns(GuestRunSource, crate::runtime::gather_witness::GatherVouch),
+    GuestRuns(
+        GuestRunSource,
+        crate::runtime::gather_witness::GatherVouch,
+        Option<DirectGuestImageSource>,
+    ),
+}
+
+/// A decoded linear image plane inside one persistent guest allocation.
+///
+/// The import is the allocation object; `plane_offset` and `row_pitch` are the
+/// two coordinates the serialized texture declaration contributes.  Vulkan
+/// may bind the same imported memory to a linear image only when the created
+/// image reports this exact pitch and its subresource offset can be reconciled
+/// with `plane_offset`.  Keeping that admission input here prevents execution
+/// from reconstructing resource geometry from page runs or host addresses.
+#[derive(Clone, Debug)]
+pub struct DirectGuestImageSource {
+    pub import: std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
+    pub resource_offset: u64,
+    pub resource_len: u64,
+    pub plane_offset: u64,
+    pub row_pitch: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

@@ -232,6 +232,85 @@ fn a_stream_that_will_not_frame_says_so_instead_of_executing_nothing() {
     );
 }
 
+/// Pipeline and bind state belong to the serialized encoder, not to the child
+/// buffer that happens to carry one segment of it. The second segment omits its
+/// pipeline record deliberately: resetting at the child-buffer boundary turns
+/// its valid draw into `stream_draw_dropped_unbound`.
+#[test]
+fn a_render_encoder_continuation_keeps_pipeline_state_across_child_buffers() {
+    use crate::runtime::decode::stream::{SEGMENT_HEADER_LEN, SEGMENT_TYPE_RENDER};
+
+    fn render_segment(records: &[u8], continues_previous: bool, continues_next: bool) -> Vec<u8> {
+        let mut bytes = vec![0u8; SEGMENT_HEADER_LEN];
+        st32(
+            &mut bytes[0..4],
+            (SEGMENT_HEADER_LEN + records.len()) as u32,
+        );
+        bytes[4] = SEGMENT_TYPE_RENDER;
+        bytes[5] = u8::from(continues_previous);
+        bytes[6] = u8::from(continues_next);
+        bytes.extend_from_slice(records);
+        bytes
+    }
+
+    let mut set_pipeline = vec![0u8; wire_render::SET_STATE_TOTAL_LEN as usize];
+    st32(
+        &mut set_pipeline[0..4],
+        wire_render::OPCODE_SET_RENDER_PIPELINE_STATE,
+    );
+    st32(&mut set_pipeline[4..8], wire_render::SET_STATE_TOTAL_LEN);
+    st32(&mut set_pipeline[8..12], 0x41);
+
+    let mut draw = vec![0u8; wire_render::DRAW_TOTAL_LEN as usize];
+    st32(&mut draw[0..4], wire_render::OPCODE_DRAW);
+    st32(&mut draw[4..8], wire_render::DRAW_TOTAL_LEN);
+    st32(&mut draw[8..12], 3);
+    st16(&mut draw[12..14], 0);
+    st16(&mut draw[14..16], 3);
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut open = None;
+
+    walk_submitted_stream(
+        &mut state,
+        &mut host,
+        1,
+        &render_segment(&set_pipeline, false, true),
+        &mut out,
+        &mut open,
+    );
+    walk_submitted_stream(
+        &mut state,
+        &mut host,
+        1,
+        &render_segment(&draw, true, true),
+        &mut out,
+        &mut open,
+    );
+
+    let Some(OpenEncoder::Render(acc)) = open.as_ref() else {
+        panic!("the continued render encoder must remain open")
+    };
+    assert_eq!(acc.pipeline_ref, 0x41);
+    assert_eq!(acc.draws.len(), 1, "the continuation draw must be retained");
+    assert_eq!(acc.dropped_no_pipeline, 0);
+
+    walk_submitted_stream(
+        &mut state,
+        &mut host,
+        1,
+        &render_segment(&[], true, false),
+        &mut out,
+        &mut open,
+    );
+    assert!(
+        open.is_none(),
+        "the closing segment owns encoder retirement"
+    );
+}
+
 #[test]
 fn a_truncated_segment_names_the_check_rather_than_looking_like_end_of_records() {
     use crate::runtime::decode::stream::{

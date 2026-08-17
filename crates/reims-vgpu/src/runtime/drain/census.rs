@@ -694,7 +694,7 @@ pub enum ReadbackPhase {
     /// near zero exactly when every readback in the window was leased and
     /// climbs in proportion to the ones that were not.
     Map,
-    /// Write the frame into the guest's pages (`write_bgra8_skipping`).
+    /// Write the frame into the guest's pages (`write_bgra8`).
     ///
     /// Reads zero on a window the GPU rail landed, because that rail's
     /// destination *is* the guest's pages and there is no second pass to time.
@@ -1304,7 +1304,7 @@ impl WindowPublishCensus {
 /// help", removed a staging hop on that basis and measured no change.
 ///
 /// The gap is a factor of four, which is the shape of doing the work four times,
-/// not of doing it once badly. `write_bgra8_skipping` makes up to three
+/// not of doing it once badly. `write_bgra8` makes up to three
 /// whole-frame passes and the name covers all of them, so none of them can be
 /// ruled in or out:
 ///

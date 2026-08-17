@@ -698,7 +698,7 @@ pub fn read_span<H: HostMemory + HostOps>(
 /// Three steps are write-only and are keyed on the direction, not duplicated:
 /// the [`WindowPages`] containment check, which only a deferred write carries an
 /// authorisation set for; [`DeviceState::note_host_wrote_pages`], which
-/// invalidates what the hypervisor's dirty bitmap cannot witness; and the
+/// invalidates retained derived content reached through another alias; and the
 /// per-run footprint mark. `allowed` is ignored in the read direction because a
 /// read authorises nothing.
 fn span_multi<H: HostMemory + HostOps>(
@@ -720,9 +720,8 @@ fn span_multi<H: HostMemory + HostOps>(
         collect_span_gpas(host, task, gva, length, page_shift)?
     };
     if copy.is_write() {
-        // Puts bytes into guest pages the hypervisor's dirty bitmap cannot
-        // witness. Recorded here, after the walk that names them and before any
-        // of them is written, so a refusal below costs a spurious invalidation
+        // Record the device write after the walk names its exact pages and before any
+        // byte is written, so a refusal below costs a spurious invalidation
         // rather than a missing one.
         state.note_host_wrote_pages(gpas.clone());
         if !span_within_window(&gpas, allowed) {

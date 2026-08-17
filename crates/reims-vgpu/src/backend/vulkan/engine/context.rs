@@ -519,9 +519,6 @@ pub(crate) struct DeviceContext {
     /// this rather than re-querying: a feature asked about in two places is a
     /// feature that will eventually be enabled in one of them.
     pub features: crate::backend::vulkan::caps::device_features::DeviceFeatures,
-    /// Per-format/usage answers for explicit linear external-image layout.
-    /// Physical-device support is immutable, while target identities churn, so
-    /// the query belongs to the device lifetime rather than each image lifetime.
     /// Combined depth-stencil format supported for DEPTH_STENCIL_ATTACHMENT on
     /// this device (D32_SFLOAT_S8_UINT preferred, D24_UNORM_S8_UINT fallback).
     /// Used only by the stencil-test path; depth-only uses D32_SFLOAT.

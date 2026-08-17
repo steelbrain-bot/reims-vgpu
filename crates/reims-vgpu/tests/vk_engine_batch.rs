@@ -746,6 +746,7 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
             // A fixture over a host `Vec` went through no witness, so the gather is
             // the only disposition available to it.
             reims_vgpu::runtime::gather_witness::GatherVouch::Fresh,
+            None,
         ),
         byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
@@ -1336,13 +1337,13 @@ void main() {{
     engine::test_quiesce_ring();
 }
 
-/// One contiguous guest window still takes the engine-owned draw-buffer route.
+/// One contiguous guest window binds its retained import directly.
 ///
-/// The single-run case matters because it is where a direct guest binding could
-/// be reintroduced accidentally. The guest bytes must be gathered by the GPU,
-/// never copied by the CPU, and the shader must observe the same contents.
+/// The single-run case has no placement work for a gather to perform. The
+/// resource-owned import must remain alive through execution, and the shader
+/// must observe the bytes at the decoded window offset without a CPU copy.
 #[test]
-fn a_single_stretch_window_is_gathered_into_an_engine_owned_buffer() {
+fn a_single_stretch_window_binds_its_retained_guest_import() {
     use reims_vgpu::runtime::guest_ram::{granularity, GuestRamImport, GuestRamRegion, GuestRef};
     use reims_vgpu::runtime::guest_ram_map::GuestWindowRun;
 
@@ -1408,8 +1409,8 @@ void main() {{
     // Laid out in *window* order inside the one stretch, so the shader reading
     // words 0, 64 and 128 sees the same (0x33, 0x22, 0x11) the other two tests
     // expect. There is no reordering to detect here — one contiguous run has no
-    // placement to get wrong — so what this asserts is that the gather reads
-    // the guest's bytes at all, and reads them from the right offset.
+    // placement to get wrong — so what this asserts is that the direct bind
+    // reads the guest's bytes at all, and reads them from the right offset.
     const FILL: [u8; 3] = [0x11, 0x22, 0x33];
     for (slot, fill) in [FILL[2], FILL[1], FILL[0]].iter().enumerate() {
         let start = (pad + STRETCH * slot as u64) as usize;
@@ -1453,15 +1454,19 @@ void main() {{
             pages: Some(std::sync::Arc::new(pages)),
         }),
     });
-    engine::execute_draw_request(&req).expect("the gathered draw");
+    engine::execute_draw_request(&req).expect("the directly bound draw");
     let px = engine::read_target(&identity)
         .expect("read_target flushes the batch")
         .into_rgba8();
 
     let d = engine::counter_snapshot().delta_since(&before);
     assert_eq!(
-        d.buffer_guest_gathers, 1,
-        "one contiguous window still gathers into engine-owned memory: {d:?}"
+        d.buffer_guest_imports, 1,
+        "one contiguous window binds through its retained guest import: {d:?}"
+    );
+    assert_eq!(
+        d.buffer_guest_gathers, 0,
+        "a contiguous window has no placement work requiring a gather: {d:?}"
     );
     assert_eq!(
         d.buffer_snapshot_binds, 0,
@@ -1472,7 +1477,7 @@ void main() {{
     let got = &px[i..i + 4];
     assert!(
         near(got[0], FILL[2]) && near(got[1], FILL[1]) && near(got[2], FILL[0]),
-        "gathered bind read back as {got:?}; expected ({}, {}, {}) — the same \
+        "direct bind read back as {got:?}; expected ({}, {}, {}) — the same \
          picture the gathered and CPU-fallback rails produce.",
         FILL[2],
         FILL[1],
@@ -1481,11 +1486,11 @@ void main() {{
     engine::test_quiesce_ring();
 }
 
-/// An indexed draw gathers its guest window into engine-owned memory. This is
-/// the fixed-function counterpart of the storage-buffer test above: the index
-/// bytes never become a host `Vec` or a staging upload.
+/// An indexed draw binds its retained contiguous guest import directly. This
+/// is the fixed-function counterpart of the storage-buffer test above: the
+/// index bytes never become a host `Vec`, staging upload, or gather target.
 #[test]
-fn an_index_window_is_gathered_without_a_cpu_copy() {
+fn an_index_window_binds_its_retained_guest_import() {
     use reims_vgpu::runtime::guest_ram::{granularity, GuestRamImport, GuestRamRegion, GuestRef};
     use reims_vgpu::runtime::guest_ram_map::GuestWindowRun;
 
@@ -1570,11 +1575,12 @@ fn an_index_window_is_gathered_without_a_cpu_copy() {
         .into_rgba8();
 
     let d = engine::counter_snapshot().delta_since(&before);
-    assert!(d.buffer_guest_gathers > 0, "index source: {d:?}");
-    assert!(
-        d.buffer_guest_gather_index_bytes >= INDEX_BYTES,
+    assert_eq!(d.buffer_guest_index_imports, 1, "index source: {d:?}");
+    assert_eq!(
+        d.buffer_guest_import_bytes, INDEX_BYTES,
         "index source: {d:?}"
     );
+    assert_eq!(d.buffer_guest_gathers, 0, "index source: {d:?}");
     assert_eq!(d.buffer_snapshot_binds, 0, "index source: {d:?}");
     let i = (((H / 2) * W + W / 4) * 4) as usize;
     assert!(

@@ -1,81 +1,10 @@
-//! Which guest pages this device has written, and when.
+//! Exact page generations for writes this device makes into guest RAM.
 //!
-//! The hypervisor's dirty bitmap witnesses guest CPU stores and nothing else, so
-//! a host-side copy vouched for by "the guest has not written since I looked" can
-//! still be stale — because *we* wrote. This is the missing half of that witness.
-//!
-//! # Why pages and not mappings
-//!
-//! Three candidate rules were scored against a full content fold before this one
-//! was built, each by its own census counter. Those counters are gone with the
-//! rules they scored — [`crate::runtime::gather_witness`] takes only the page-exact answer
-//! now — so the names below are what the readings were called at the time and are
-//! not greppable in a current log.
-//!
-//! A per-mapping count was measured first and it leaks. One driven boot read
-//! fifteen binds where the sampled window's own mapping had not been written, the
-//! guest had not written, and the bytes moved anyway. Guest pages are reachable
-//! under more than one mapping id, so "mapping 12 was not written" is not "these pages were not
-//! written", and a cache keyed on the former serves stale pixels fifteen times a
-//! minute.
-//!
-//! The same boot read zero counterexamples for a *global* count, which moves for
-//! every write anywhere — because it moves for every write including the ones a
-//! narrower rule fails to attribute. Sound, and it invalidates a texture because
-//! an unrelated scanout was composited.
-//!
-//! # Where it stands
-//!
-//! Once every writer records here — which took a second pass, because
-//! `map_fresh_span_within`'s callers write through a raw alias and were invisible
-//! to a hand-picked list of call sites — a driven boot reads **zero** binds where
-//! the page-exact rule vouched and the bytes had moved, alongside zero for both
-//! wider rules. Of the binds where the guest was quiet and the bytes were
-//! identical, this rule serves 93 %; the rest are windows whose page set had just
-//! moved.
-//!
-//! That measurement is what the fold is still there for. It runs on one bind in
-//! [`crate::runtime::gather_witness::AUDIT_STRIDE`] rather than all of them, and its
-//! counterexample cell is `gw_audit_unsound`: a standing alarm on the rule this
-//! module exists to make sound, rather than the per-bind decision it began as.
-//!
-//! What that licenses is a cache over the zero-copy sampled gathers, valid iff
-//! the hypervisor's guest generation has not moved **and** this says the pages
-//! were not written. Neither half is sufficient alone and the measurements above
-//! are what say so, rather than an argument that they ought to be.
-//!
-//! Built and measured live on a driven x86/PCI boot: **5852 gathers skipped
-//! against 4167 taken, 14.25 GB not read against 4.56 GB read — 75.8 % of the
-//! rail's bytes gone** — with all three unsound cells still zero and a Wikipedia
-//! page rendering correctly under scroll.
-//!
-//! # Shape
-//!
-//! A per-page last-write epoch in lazily allocated chunks. One chunk occupies
-//! one minimum supported host page; a contiguous surface therefore hashes its
-//! chunk once and indexes page cells directly instead of hashing every GPA.
-//! `wrote_any_since` has **no horizon**: however long ago the reader last
-//! looked, the answer is exact.
-//!
-//! It was a ring of the last 64 writes, walked back to the reader's mark, until
-//! 2026-08-09. That shape was chosen because "between two binds of the same
-//! window (~8 ms apart) there is usually no host write to compare against", and
-//! that premise does not survive compositing. A driven macos-26 boot put the
-//! number on it — of 22 710 asks, **16 402** were quiet, **6 294** were refused
-//! because the ring had forgotten, and **14** were a write that had really
-//! landed in the window. Each refusal cost a full re-gather, and they were 17.2
-//! GB of guest memory re-read per boot.
-//!
-//! The map was run as a shadow first, deciding nothing and only reporting
-//! whether it agreed, and swapped in once six rails read zero in the one
-//! direction that loses a frame. Cutting the refusals also let
-//! [`crate::runtime::gather_witness`]'s content audit run on macos-26 for the
-//! first time — it needs 64 consecutive *vouched* binds of one window — and it
-//! agrees ~950 times across three boots. That audit, not a second copy of this
-//! predicate, is the standing alarm here.
-//!
-//! Everything still fails closed. A write that cannot name its pages answers
-//! "assume written". Named page epochs have no horizon and are never cleared.
+//! Guest pages may be reachable through several resource names. A retained
+//! derived image therefore records this ledger's epoch beside its page
+//! footprint and refuses reuse if any aliasing device write landed later. Named
+//! page generations are unbounded and task-independent; an unnamed write
+//! invalidates every older reader in the conservative direction.
 
 /// Why [`HostWrites::wrote_any_since`] could not call a window quiet.
 ///

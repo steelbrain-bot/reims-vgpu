@@ -1293,40 +1293,6 @@ pub fn settle_for_texture<M: HostMemory + HostOps>(
     });
 }
 
-/// [`settle_for_mapping`] for a caller that is **about to land the owed frame
-/// itself**, over the same window, while preserving ranges the payment would
-/// overwrite.
-///
-/// There is exactly one such caller and the distinction is not a nicety. A debt
-/// is armed at a Store and names the resident that Store produced;
-/// [`pay_for_mapping`] discharges it by writing that resident over the **whole**
-/// window with no exclusions. `merge_guest_writes_into_pages` exists to put the
-/// same resident into every page the guest did *not* write and keep the pages it
-/// did — so paying first destroys exactly the bytes the merge was called to
-/// preserve, one statement before the merge writes everything else back around
-/// them. The guest's repaint is then gone and `t11sample_resident_merged`
-/// reports success.
-///
-/// So the debt is **dropped**, not paid: what the caller is about to write is the
-/// same surface's newer content at the same geometry — `write_bgra8_inner`
-/// refuses on `GeometryMoved` if it is not — so the owed frame is superseded
-/// rather than lost. The settle half still runs, because writes this device has
-/// already submitted into these pages must land before the caller reads or
-/// writes them, and that is true whoever is writing.
-///
-/// Counted, because a zero here says the two never co-occur on a workload and a
-/// non-zero says how much guest painting the old order was throwing away.
-pub fn supersede_for_mapping(
-    state: &mut DeviceState,
-    mapping_id: u32,
-    site: crate::runtime::render_writeback::SettleSite,
-) {
-    if state.pending_writebacks.take(mapping_id).is_some() {
-        crate::runtime::drain::note_store_route("wbdebt_superseded_by_skipping_write");
-    }
-    crate::runtime::render_writeback::settle_guest_writes(site);
-}
-
 /// [`settle_for_mapping`] for a caller that cannot name the mapping it is about
 /// to touch, so it owes every debt.
 pub fn settle_unnamed<M: HostMemory + HostOps>(
@@ -1423,7 +1389,6 @@ fn pay<M: HostMemory + HostOps>(
         ));
         crate::backend::vulkan::engine::note_resident_content_copied_out(&identity);
     }
-    crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

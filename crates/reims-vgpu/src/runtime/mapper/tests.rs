@@ -425,51 +425,6 @@ fn a_walk_that_visits_nothing_is_not_agreement() {
     );
 }
 
-/// The dirty bitmap answers in guest physical pages and a writeback lays
-/// bytes out in mapping offsets; this is the only place the two meet, so it
-/// is tested against a page list that is deliberately not in address order.
-///
-/// A GPA the mapping does not hold contributes nothing. A token is per page
-/// list, but an answer can be taken across a rebind, and inventing an offset
-/// for a page this surface does not own would exclude bytes at random.
-#[test]
-fn mapping_offsets_of_pages_maps_guest_pages_to_surface_offsets() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::model::{DeviceId, PAGE_SHIFT_X86};
-    const PAGE: u64 = 1 << PAGE_SHIFT_X86;
-
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    state.map_surface(6);
-    // Surface pages 0..4 live at PFNs 0x50, 0x53, 0x51, 0x52 — out of
-    // address order, which is what makes the index the answer and not the
-    // address.
-    let pfns = [0x50u32, 0x53, 0x51, 0x52];
-    state.mappings.get_mut(&6).unwrap().page_entries = pfns
-        .iter()
-        .map(|p| (p << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
-        .collect();
-    let gpa = |pfn: u32| (pfn as u64) << PAGE_SHIFT_X86;
-
-    assert_eq!(mapping_offsets_of_pages(&state, 6, &[]), vec![]);
-    // Surface page 1 is the highest GPA of the four.
-    assert_eq!(
-        mapping_offsets_of_pages(&state, 6, &[gpa(0x53)]),
-        vec![(PAGE, 2 * PAGE)]
-    );
-    // Adjacent surface pages merge even though their GPAs are not adjacent.
-    assert_eq!(
-        mapping_offsets_of_pages(&state, 6, &[gpa(0x51), gpa(0x52)]),
-        vec![(2 * PAGE, 4 * PAGE)]
-    );
-    // Non-adjacent stay apart, and a page this surface does not own is
-    // ignored rather than placed somewhere.
-    assert_eq!(
-        mapping_offsets_of_pages(&state, 6, &[gpa(0x50), gpa(0x52), gpa(0x99)]),
-        vec![(0, PAGE), (3 * PAGE, 4 * PAGE)]
-    );
-    assert_eq!(mapping_offsets_of_pages(&state, 7, &[gpa(0x50)]), vec![]);
-}
-
 use super::*;
 use crate::contract::endian::st32;
 use crate::contract::iosurface_pages::{

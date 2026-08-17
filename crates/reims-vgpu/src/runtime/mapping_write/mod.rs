@@ -387,11 +387,8 @@ fn contig_for_write<H: HostMemory + HostOps>(
     // over-marking can only turn a miss into a hit. Under-marking would
     // manufacture the clean "we never wrote there" the set must never invent.
     mapper::note_mapping_write_footprint(state, mapping_id, 0, span_end);
-    // The other reader of these writes, and for the same reason: the hypervisor's
-    // dirty bitmap witnesses guest stores only, so a copy vouched for by "the
-    // guest has not written" is stale the moment this rail runs. Recorded beside
-    // the footprint mark rather than in each caller, so the two cannot drift and
-    // a new caller inherits both.
+    // Record device writes for readers whose resource names may alias these
+    // pages. This is device-owned state, not an observation of guest behavior.
     state.note_host_wrote_mapping(mapping_id);
     Some(view)
 }
@@ -426,52 +423,6 @@ fn rect_extent_end(
         .saturating_add(rb as u64)
 }
 
-/// Mapping byte ranges a writeback must leave alone, ascending and disjoint.
-///
-/// Offsets are from the mapping's page 0, the same space `base_off`/`span_end`
-/// are in, so a caller holding guest *page* addresses converts once with
-/// [`crate::runtime::mapper::mapping_offsets_of_pages`] and everything below
-/// stays in one coordinate system.
-pub type SkipRanges<'a> = &'a [(u64, u64)];
-
-/// The sub-ranges of `[start, end)` that are not covered by `skip`.
-///
-/// `skip` is ascending and disjoint, so one forward walk answers it. Kept
-/// separate from the two writers below because they lay their bytes out
-/// differently — one pokes a host view in place, the other stages a frame and
-/// hands runs to the mapper — and the only thing they must agree on is *which
-/// bytes are excluded*. Two open-coded walks would be two chances to disagree.
-fn unskipped(start: u64, end: u64, skip: SkipRanges<'_>) -> Vec<(u64, u64)> {
-    if skip.is_empty() {
-        return if start < end {
-            vec![(start, end)]
-        } else {
-            vec![]
-        };
-    }
-    let mut out = Vec::new();
-    let mut cur = start;
-    for &(s, e) in skip {
-        if e <= cur {
-            continue;
-        }
-        if s >= end {
-            break;
-        }
-        if s > cur {
-            out.push((cur, s.min(end)));
-        }
-        cur = cur.max(e);
-        if cur >= end {
-            return out;
-        }
-    }
-    if cur < end {
-        out.push((cur, end));
-    }
-    out
-}
-
 /// Write a tight BGRA8 image into the mapping's guest pages.
 ///
 /// Packed contig HostOps view when possible; else multi-import maximal packed
@@ -488,35 +439,6 @@ pub fn write_bgra8<M: HostMemory + HostOps>(
     width: u32,
     height: u32,
 ) -> bool {
-    write_bgra8_skipping(state, host, mapping_id, src, src_stride, width, height, &[])
-}
-
-/// [`write_bgra8`], leaving `skip` untouched.
-///
-/// A deferred writeback holds a frame the device rendered and lands it in the
-/// guest's pages later. If the guest CPU wrote some of those pages in between,
-/// writing the whole frame loses the guest's stores and dropping the frame loses
-/// the device's; `skip` is how the caller expresses the third answer, one page
-/// at a time, from the hypervisor's own per-page report.
-///
-/// Everything else is unchanged, deliberately — including the cache refresh and
-/// the epoch bump at the tail. The frame *is* what the device rendered, and the
-/// host-side copies of it stay that; what `skip` decides is only which of those
-/// bytes the guest's own memory is allowed to keep instead.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the geometry the frame is in, plus the ranges its owner may not overwrite"
-)]
-pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    mapping_id: u32,
-    src: &[u8],
-    src_stride: u32,
-    width: u32,
-    height: u32,
-    skip: SkipRanges<'_>,
-) -> bool {
     write_bgra8_inner(
         state,
         host,
@@ -526,13 +448,12 @@ pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
         src_stride,
         width,
         height,
-        skip,
     )
 }
 
-/// [`write_bgra8_skipping`] for a caller that owns its frame behind an `Arc`.
+/// [`write_bgra8`] for a caller that owns its frame behind an `Arc`.
 ///
-/// The tail of every non-skipping writeback publishes the frame to
+/// The tail of every writeback publishes the frame to
 /// [`crate::runtime::surface_cache`], and a caller holding only a borrow has to
 /// build a second whole-frame buffer for it to keep. On the 8.29 MB composite
 /// that copy costs 1.21 ms about 100 times a second — more than landing the same
@@ -547,11 +468,8 @@ pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
 /// pointer has to be the one the rest of this write read from, the pitch has to
 /// be the packed row length, and the allocation has to cover the whole frame.
 /// Anything else takes the copying publish.
-/// Writes the frame whole. Its one caller is the render writeback, which
-/// preserves nothing by design: the witness a narrowing would rest on cannot
-/// say which bytes the guest still wants. A caller that does
-/// need to skip has [`write_bgra8_skipping`]; adding the parameter back here
-/// belongs with the caller that can fill it.
+/// Writes the frame whole. Resource ownership is decided before this byte
+/// writer is entered.
 pub fn write_bgra8_owned<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -570,11 +488,10 @@ pub fn write_bgra8_owned<M: HostMemory + HostOps>(
         src_stride,
         width,
         height,
-        &[],
     )
 }
 
-/// [`write_bgra8_skipping`] for a caller whose frame is about to stop existing.
+/// [`write_bgra8`] for a caller whose frame is about to stop existing.
 ///
 /// The other writers end by publishing the frame to
 /// [`crate::runtime::surface_cache`], which is nearly free when the caller
@@ -611,7 +528,6 @@ pub fn write_bgra8_uncached<M: HostMemory + HostOps>(
         src_stride,
         width,
         height,
-        &[],
     )
 }
 
@@ -1342,11 +1258,6 @@ enum CacheOutcome<'a> {
     Invalidate,
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the geometry the frame is in, its owner when it has one, plus the \
-              ranges that owner may not overwrite"
-)]
 fn write_bgra8_inner<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -1356,7 +1267,6 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     src_stride: u32,
     width: u32,
     height: u32,
-    skip: SkipRanges<'_>,
 ) -> bool {
     if !scanout_extent_ok(width, height) {
         return refuse(mapping_id, SurfaceWriteRefusal::Geometry { width, height });
@@ -1395,32 +1305,13 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
             },
         );
     };
-    // Deferred-writeback flush-on-access: land pending resident content in
-    // these pages before touching them.
-    //
-    // Except when this write has ranges it must not touch. The payment writes the
-    // owed resident over the *whole* window with no exclusions, and the one
-    // caller that passes a skip list — `merge_guest_writes_into_pages` — passes
-    // exactly the pages the guest painted under a live resident. Paying first
-    // overwrites them, and the write below then restores everything *except*
-    // them, so the guest's repaint is destroyed by the mechanism built to keep
-    // it. What this write is about to land is the same surface at the same
-    // geometry (`GeometryMoved` above refuses anything else), so the owed frame
-    // is superseded rather than lost.
-    if skip.is_empty() {
-        crate::runtime::writeback_debt::settle_for_mapping(
-            state,
-            host,
-            mapping_id,
-            crate::runtime::render_writeback::SettleSite::MappingBgra8Write,
-        );
-    } else {
-        crate::runtime::writeback_debt::supersede_for_mapping(
-            state,
-            mapping_id,
-            crate::runtime::render_writeback::SettleSite::MappingBgra8Write,
-        );
-    }
+    // Land any older device frame before this write replaces the mapping.
+    crate::runtime::writeback_debt::settle_for_mapping(
+        state,
+        host,
+        mapping_id,
+        crate::runtime::render_writeback::SettleSite::MappingBgra8Write,
+    );
     // Taken after the flush, because the flush can invalidate this mapping, and
     // once for the whole frame, because the loop below writes a row at a time.
     let Some(vouched) = vouch_for_write(state, host, mapping_id, "bgra8") else {
@@ -1514,18 +1405,11 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
                 }
                 &row
             };
-            // The row's destination in mapping-offset space, so the skip list —
-            // which is in that space — is subtracted before any pointer exists.
-            let row_off = base_off.saturating_add((y as u64).saturating_mul(bpr as u64));
-            for (lo, hi) in unskipped(row_off, row_off.saturating_add(tight as u64), skip) {
-                let within = (lo - row_off) as usize;
-                let len = (hi - lo) as usize;
-                let dst = unsafe { base.add((y as usize).saturating_mul(bpr) + within) };
-                // SAFETY: `within + len <= tight <= row_bytes.len()`, and the
-                // view covers span_end which is at or past this row's last byte.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(row_bytes.as_ptr().add(within), dst, len);
-                }
+            let dst = unsafe { base.add((y as usize).saturating_mul(bpr)) };
+            // SAFETY: `tight <= row_bytes.len()`, and the view covers span_end
+            // which is at or past this row's last byte.
+            unsafe {
+                std::ptr::copy_nonoverlapping(row_bytes.as_ptr(), dst, tight);
             }
         }
         note_surface_write_phase(
@@ -1617,40 +1501,18 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
             };
         let frame: &[u8] = staged.as_ref();
         let land_started = std::time::Instant::now();
-        // One call for the whole frame, carrying the runs it should store,
-        // rather than one call per surviving run: every call re-runs
-        // `flush_intersecting` over the deferred windows and re-resolves the
-        // mapping's page list, both `O(pages)`, so the per-run shape pays that
-        // twice-over walk for each hole the skip list cuts. The selection
-        // travels into the walk instead, so the resolution happens once and
-        // each imported page run moves only the parts of itself the runs name.
-        //
-        // The runs are the `tight` bytes at the head of each of `mh` rows, not
-        // the frame's whole extent. A row pitch wider than the packed row leaves
-        // padding between rows, and that padding is not a texel this call was
-        // given: the contig arm above writes row by row and never touches it,
-        // so storing the staged frame entire would zero it here and leave it
-        // alone there — the same call landing different guest memory depending
-        // only on whether the guest's pages happened to be adjacent.
-        //
-        // Those bytes do belong to this plane (`sample_window_from_device_plane`
-        // requires the plane's own `plane_size` to cover `bpr * (mh - 1) +
-        // tight`), so this is not an overrun into a neighbouring allocation. It
-        // is content the guest put there and the device was never asked to
-        // replace.
-        let mut runs: Vec<(u64, u64)> = Vec::new();
-        for y in 0..mh {
-            let row_lo = base_off.saturating_add((y as u64).saturating_mul(bpr as u64));
-            for (lo, hi) in unskipped(row_lo, row_lo.saturating_add(tight as u64), skip) {
-                match runs.last_mut() {
-                    // A packed pitch makes consecutive rows adjacent; coalescing
-                    // keeps that frame the single run it was before the split,
-                    // which is the shape the hot 8 MB composite surface takes.
-                    Some(last) if last.1 == lo => last.1 = hi,
-                    _ => runs.push((lo, hi)),
-                }
-            }
-        }
+        // Write only texel bytes. Row padding is part of the allocation but is
+        // not content this Store was asked to replace.
+        let runs: Vec<(u64, u64)> = if bpr == tight {
+            vec![(base_off, base_off.saturating_add(frame_len as u64))]
+        } else {
+            (0..mh)
+                .map(|y| {
+                    let lo = base_off.saturating_add((y as u64).saturating_mul(bpr as u64));
+                    (lo, lo.saturating_add(tight as u64))
+                })
+                .collect()
+        };
         if !mapper::write_mapping_bytes_only(
             state,
             host,
@@ -1675,52 +1537,6 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     }
     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
     let _ = state.mark_mapping_written(mapping_id);
-    if !skip.is_empty() {
-        // A skipping write leaves the guest's pages holding `src` everywhere
-        // except the ranges the guest itself owns, so the pages are now the only
-        // complete copy of this surface and no host-side copy of `src` is its
-        // content any more. Both of them have to be told so.
-        //
-        // The byte cache would answer the type-11 LOAD seed, which prefers it
-        // over the surface's own pages, and hand back exactly the bytes the
-        // guest's stores were preserved *from*.
-        crate::runtime::surface_cache::forget(state, mapping_id);
-        // The resident `src` was read out of does not have the guest's stores
-        // either, but it is NOT retired here: it is also the source other
-        // deferred windows on the same identity are still going to flush from,
-        // and withdrawing its content mid-drain loses their frames outright
-        // (`chain_resident_land_fail reason=read_target`, `deferred_flush_lost
-        // reason=resident_epoch_drift live=None`, both on 1920x1080 scanout
-        // surfaces — measured, and a black screen).
-        //
-        // What disqualifies it instead is the `mark_mapping_written` above,
-        // which advances `surface_content_epoch` past the resident's stamp. Both
-        // rails that would bind a resident in place of this surface compare that
-        // pair — the attachment LOAD elision always did, and the sampled ladder's
-        // resident rung now does too. The caller that produced `src` must
-        // therefore not hand the stamp back after a skipping write.
-        //
-        // The guest-write stamp is re-taken, because the device has *adopted*
-        // the guest's stores: they are in the pages it just wrote around.
-        //
-        // Withholding it was the defect this rail shipped with. The stamp is the
-        // `since` every later `guest_written_pages` call is asked against, and
-        // `page_gen` records the harvest that last saw each page written, never
-        // resetting per consumer. So a stamp that does not move makes the skip
-        // set grow monotonically: one full CPU repaint of a window marks every
-        // page of it, and from then on every deferred flush of that surface
-        // skips the entire extent and the device's composite never reaches guest
-        // memory again. Measured live as a desktop that goes black and stays
-        // black, at `render_flush_preserved_guest_write` ~65 a second, on a boot
-        // whose sampled resident rung was gated off — so it was this rail and
-        // not that one.
-        //
-        // It is honest as well as necessary: the stamp says "no host-side copy
-        // is known stale relative to these pages", and after the two retirements
-        // above there is no host-side copy at all.
-        crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
-        return true;
-    }
     let cache_started = std::time::Instant::now();
     let tight_frame = (mw as usize)
         .saturating_mul(mh as usize)
@@ -1748,14 +1564,6 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
         SurfaceWritePhase::Cache,
         cache_started.elapsed().as_micros() as u64,
     );
-    // This write just made the host copy and the guest pages agree, so it is the
-    // moment the copy's currency can be pinned. Nothing else arms this mapping:
-    // the type-4 sampled ladder's first census read `gw_no_stamp` 14 092 against
-    // `gw_clean` 0 because only the Vulkan Store rails ever stamped, and the
-    // copy that rung serves is written here. Unstamped, the reader cannot tell a
-    // surface the guest has rewritten from one it has not, and must assume the
-    // worst on every bind.
-    crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
     true
 }
 
@@ -1989,7 +1797,6 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     // copy that rung serves is written here. Unstamped, the reader cannot tell a
     // surface the guest has rewritten from one it has not, and must assume the
     // worst on every bind.
-    crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
     true
 }
 

@@ -38,8 +38,7 @@ pub mod drain;
 pub mod exec;
 /// Product-path event + encoder fence sync (event/blit/compute/render domains).
 pub mod fence_exec;
-/// Is the hypervisor's guest-write generation a sound cache key for the
-/// zero-copy sampled gathers? Measurement, not policy.
+/// Contract generations and exact device-write footprints for sampled gathers.
 #[cfg(feature = "backend-vulkan")]
 pub mod gather_witness;
 /// Guest-physical control-plane writes via HostOps map_pages.
@@ -57,9 +56,8 @@ pub mod guest_ram_map;
 /// both backends and every test arm reach it.
 /// Task GVA → guest RAM reads.
 pub mod gva_mem;
-/// Gated with the `GuestWriteVerdict` it reuses and the `TargetIdentity` it
-/// keys on, both of which are Vulkan-side; the type-11 twin this mirrors
-/// (`mapper::mapping_guest_write_verdict`) carries the same gate.
+/// GVA Store currency is used by Vulkan residents and retained in the decoded
+/// task-resource namespace.
 #[cfg(feature = "backend-vulkan")]
 pub mod gva_store_witness;
 /// Task-GVA HostOps views (MapMemory2 / UnmapMemory lifecycle).
@@ -67,8 +65,7 @@ pub mod gva_view;
 /// CmdHeapTextureSizeAndAlign wire decode + host requirement query.
 pub mod heap_query;
 pub mod host;
-/// Which guest pages this device has written, and when — the half of the
-/// guest-write witness the hypervisor's dirty bitmap cannot supply.
+/// Which guest pages this device has written, and when.
 pub mod host_writes;
 /// Type-7 ICB (0x36) materialization, host command fills, execute writeback.
 pub mod icb;

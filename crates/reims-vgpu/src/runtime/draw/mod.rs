@@ -69,8 +69,6 @@ use crate::runtime::decode::resource::{
 use crate::runtime::gva_mem;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::mapper;
-#[cfg(feature = "backend-vulkan")]
-use crate::runtime::mapper::{mapping_guest_write_verdict, GuestWriteVerdict};
 use crate::runtime::mapping_write;
 use crate::runtime::mtlb::{load_mtlb, AirLoadRail};
 use crate::runtime::objects;
@@ -3819,6 +3817,53 @@ fn sample_miss_detail<M: HostMemory + HostOps>(
             }
         }
         other => format!("type={other} desc_len={desc_len} reason=unsupported_object_type"),
+    }
+}
+
+/// Describe the retained linear texture object which an encoder slot actually
+/// binds.
+///
+/// The numeric reference may be deleted and reused after the bind while the
+/// encoder still retains the original resource. A diagnostic that walks the
+/// current object list in that case describes a different object and can send
+/// the repair in exactly the wrong direction. Non-linear objects return
+/// `None` so their existing, type-specific diagnostics remain in charge.
+#[cfg(feature = "backend-vulkan")]
+fn retained_linear_sample_miss_detail(resource: &crate::model::TaskResource) -> Option<String> {
+    if resource.entry.object_type != OBJECT_TYPE_TEXTURE
+        && resource.entry.object_type != OBJECT_TYPE_TEXTURE_VARIANT
+    {
+        return None;
+    }
+    let ot = resource.entry.object_type;
+    let desc_len = resource.entry.descriptor_length;
+    match resource.decoded() {
+        Err(why) => Some(format!(
+            "type={ot} desc_len={desc_len} retained=1 reason={}",
+            why.slug()
+        )),
+        Ok(crate::runtime::decode::resource::Descriptor::Texture(tex)) => {
+            let l0 = tex.level(0);
+            Some(format!(
+                "type={ot} desc_len={desc_len} retained=1 has_fmt={} fmt={:#x} \
+                 mips={} handle={:#x} alloc={} data_off={} used={} L0={}x{} \
+                 L0_off={} bpr={} reason=linear_sample",
+                u8::from(tex.declared_pixel_format().is_some()),
+                tex.declared_pixel_format().unwrap_or(0),
+                tex.mipmap_level_count,
+                tex.handle,
+                tex.allocation_size,
+                tex.data_offset,
+                tex.used_size,
+                l0.map(|level| level.width).unwrap_or(0),
+                l0.map(|level| level.height).unwrap_or(0),
+                l0.map(|level| level.offset).unwrap_or(0),
+                l0.map(|level| level.row_stride).unwrap_or(0),
+            ))
+        }
+        Ok(_) => Some(format!(
+            "type={ot} desc_len={desc_len} retained=1 reason=decoded_kind_mismatch"
+        )),
     }
 }
 

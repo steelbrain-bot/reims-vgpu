@@ -74,12 +74,9 @@
 //!   detail to add later. `dropped=0` says the 1 897 is a count and not a floor.
 //!
 //! Recurrence is about **keys**, not bytes: it says the same window comes back,
-//! not that its contents are unchanged. What would make a hit sound is
-//! [`crate::runtime::gather_witness`], which already carries exactly this
-//! argument for the sampled rails — the hypervisor dirty bitmap for guest CPU
-//! stores and [`crate::runtime::host_writes`] for this device's own. Its
-//! `MAX_TRACKED_WINDOWS` is 256 against the 1 897 here, so adopting it is a
-//! resize as well as a wiring.
+//! not that its contents are unchanged. A sound hit needs the decoded resource
+//! generation plus [`crate::runtime::host_writes`] for aliasing device writes;
+//! [`crate::runtime::gather_witness`] owns that rule for sampled resources.
 
 use std::collections::HashMap;
 

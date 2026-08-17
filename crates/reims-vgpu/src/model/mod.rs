@@ -60,11 +60,8 @@ impl<B: Backend> Device<B> {
         for (ptr, len) in views {
             host.unmap_pages(ptr, len);
         }
-        // Before `reset`, not after: `take_all_host_views` parks the detached
-        // guest-write tokens in `retired_guest_write_tokens`, and `reset`
-        // replaces `DeviceState` wholesale — so a token still sitting there is
-        // dropped rather than released, and the host goes on dirty-logging its
-        // page set for the life of the process.
+        // Flush detached host views before reset replaces their retirement
+        // ledger.
         runtime::mapper::flush_retired_views(&mut self.state, host);
         self.state.reset();
         count
@@ -168,83 +165,6 @@ mod tests {
         assert!(d.state.gva_host_views.is_empty());
         assert_eq!(d.state.mappings[&7].contig_ptr, 0);
         assert_eq!(d.state.mappings[&7].contig_len, 0);
-    }
-
-    /// A reset is a guest lifetime boundary, and every guest-write token armed
-    /// inside it names a page set the host is still logging writes to.
-    ///
-    /// `take_all_host_views` detaches the tokens into
-    /// `retired_guest_write_tokens`, but that vector lives on `DeviceState`, and
-    /// `DeviceState::reset` replaces the whole struct — so anything left in it
-    /// at that point is dropped, not released. Dropping a token does not
-    /// untrack it: the host keeps the page set and keeps dirty-logging its
-    /// pages for the life of the process, and every reboot adds another one.
-    #[test]
-    fn reset_releases_every_guest_write_token_it_armed() {
-        let mut d = dev();
-        let mut h = FakeHost::new();
-        let page = PAGE_SIZE_ARM64E as usize;
-
-        let mapping_token = h.track_guest_writes(&[0x1000, 0x2000], page).unwrap();
-        d.state.mappings.insert(
-            7,
-            MappingEntry {
-                guest_write_token: mapping_token,
-                ..Default::default()
-            },
-        );
-        // The sampled-cache witness arms tokens of its own against window page
-        // sets that no `MappingEntry` names, so a sweep that only walked
-        // mappings would miss this one.
-        #[cfg(feature = "backend-vulkan")]
-        let witness_token = {
-            let token = h.track_guest_writes(&[0x3000], page).unwrap();
-            d.state.gather_witness.arm_token_for_test(token);
-            token
-        };
-        #[cfg(feature = "backend-vulkan")]
-        assert_ne!(witness_token, mapping_token);
-
-        #[cfg(feature = "backend-vulkan")]
-        assert_eq!(h.tracked_guest_write_sets(), 2);
-        #[cfg(not(feature = "backend-vulkan"))]
-        assert_eq!(h.tracked_guest_write_sets(), 1);
-
-        assert_eq!(d.reset_with_host(&mut h), 0);
-        assert_eq!(
-            h.tracked_guest_write_sets(),
-            0,
-            "reset left a guest-write token armed on the host"
-        );
-    }
-
-    /// A mapping page-list transition ends every sampled-window witness over
-    /// that page list; its token must reach the host release rail immediately,
-    /// not wait for a device reset or an arbitrary capacity sweep.
-    #[cfg(feature = "backend-vulkan")]
-    #[test]
-    fn mapping_backing_invalidation_releases_its_gather_witness_token() {
-        let mut d = dev();
-        let mut h = FakeHost::new();
-        let mapping_id = 7;
-        d.state.mappings.insert(
-            mapping_id,
-            MappingEntry {
-                page_entries: vec![3],
-                ..Default::default()
-            },
-        );
-        let token = h
-            .track_guest_writes(&[0x3000], PAGE_SIZE_ARM64E as usize)
-            .unwrap();
-        d.state
-            .gather_witness
-            .arm_mapping_token_for_test(mapping_id, token);
-        assert_eq!(h.tracked_guest_write_sets(), 1);
-
-        assert!(d.state.invalidate_mapping_pages(mapping_id));
-        runtime::mapper::flush_retired_views(&mut d.state, &mut h);
-        assert_eq!(h.tracked_guest_write_sets(), 0);
     }
 
     fn setup_boot_regs(d: &mut Device<NullBackend>, h: &mut FakeHost) {

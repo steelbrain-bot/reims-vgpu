@@ -3,63 +3,44 @@
 //! # Why this state is separate
 //!
 //! [`crate::runtime::resource_validity::apply`] takes the guest's validity quad
-//! for one object id and applies it to `DeviceState::mappings`. Buffers have no
-//! mapping, while GVA render resources are owned by a task-local texture
-//! reference. Their guest-write declarations therefore need a generation keyed
-//! by `(task, object)` rather than the mapping table's validity state.
+//! for one object id. GVA render resources are owned by a task-local texture
+//! reference, including resources that also resolve to a mapping. Their
+//! guest-write declarations therefore need a generation keyed by
+//! `(task, object)` rather than inferred from the physical backing chosen later.
 //!
 //! A Store stamps the generation beside a host-authoritative GVA image. If the
 //! guest later declares that object written, the changed stamp abandons that
 //! image instead of copying its older pixels over the guest's newer bytes.
 //! [`crate::runtime::writeback_debt`] owns both the stamp and the decision.
 //!
-//! # The bound
+//! # Lifetime
 //!
 //! One entry per `(task, object)` the guest has declared a write to. A task's
 //! entries go when the task does, which is the same lifetime `bound_buffers`
-//! retires on and the only announcement this device gets. Past [`BufferWriteGens::MAX`] the
-//! map is **cleared** rather than partially evicted: forgetting one object would
-//! make its next comparison read as clean, which is the direction that reports a
-//! cache hit for a window whose bytes moved. A clear makes every comparison read
-//! as *unknown*, which is the safe direction, and `buffer_write_gen_reset` says
-//! it happened.
+//! retires on and the only announcement this device gets. There is no capacity
+//! eviction: a generation is authoritative state about a live guest object, and
+//! forgetting it while that object lives would make a later comparison read as
+//! clean after the bytes moved.
 
 use std::collections::HashMap;
 
-/// Per-object write generations for objects this device holds no mapping for.
+/// Per-object write generations in the guest's task-local resource namespace.
 #[derive(Default, Debug)]
 pub struct BufferWriteGens {
     gens: HashMap<(u32, u32), u64>,
-    /// Bumped on every drop of an entry — the whole-map clear and the per-task
-    /// retire alike — so a comparison spanning one is not mistaken for a
-    /// comparison that found the same generation twice. A debt stores this
-    /// beside the generation and treats a change in it as "unknown".
+    /// Bumped on task retirement, so a comparison spanning task-id reuse is not
+    /// mistaken for a comparison that found the same generation twice. A debt
+    /// stores this beside the generation and treats a change in it as unknown.
     epoch: u64,
 }
 
 impl BufferWriteGens {
-    /// The most `(task, object)` pairs tracked before the map resets.
-    ///
-    /// A driven boot's `bound_buffers` registry holds ~700 resolutions across
-    /// **22** distinct `(task, reference)` pairs, and this is keyed the same way
-    /// — by object, not by window — so 4 096 is two orders of magnitude above
-    /// the only related number anyone has measured. It bounds a guest that
-    /// creates and writes objects without bound, and `buffer_write_gen_reset`
-    /// is what says whether it ever binds.
-    pub const MAX: usize = 4096;
-
     /// Record that the guest declared a write to `object_id` under `task_id`.
     ///
-    /// Called only for the ids [`crate::runtime::resource_validity::apply`]
-    /// found no mapping for: an object with a mapping already has
-    /// `content_generation`, and stamping it twice would be two spellings of one
-    /// fact.
+    /// Called for every decoded resource write statement. Mapping generations
+    /// remain the corresponding authority in the mapping-id namespace; this
+    /// ledger answers task-local resource references.
     pub fn note_write(&mut self, task_id: u32, object_id: u32) {
-        if self.gens.len() >= Self::MAX && !self.gens.contains_key(&(task_id, object_id)) {
-            self.gens.clear();
-            self.epoch = self.epoch.wrapping_add(1);
-            crate::runtime::drain::note_store_route("buffer_write_gen_reset");
-        }
         let slot = self.gens.entry((task_id, object_id)).or_insert(0);
         *slot = slot.wrapping_add(1);
         // Keep the decoded write rate visible beside GVA debt abandonment. A
@@ -71,9 +52,9 @@ impl BufferWriteGens {
     /// What a reader records beside a copy it has just taken, and compares
     /// against later.
     ///
-    /// The epoch travels with the generation so a clear cannot be read as
-    /// "unchanged": an object with no entry reads `(epoch, 0)`, and after a
-    /// clear the epoch differs from every stamp taken before it.
+    /// The epoch travels with the generation so task-id reuse cannot be read as
+    /// unchanged: an object with no entry reads `(epoch, 0)`, and after a task
+    /// retirement the epoch differs from every stamp taken before it.
     pub fn stamp(&self, task_id: u32, object_id: u32) -> BufferWriteStamp {
         BufferWriteStamp {
             epoch: self.epoch,
@@ -88,8 +69,7 @@ impl BufferWriteGens {
     /// an object id back to what resolved through it is machinery bought with
     /// nothing, and task teardown is rare.
     ///
-    /// This bumps the epoch for the same reason the clear does, and the case is
-    /// not hypothetical: a guest reuses task ids. Drop `(5, 7)` at generation 3,
+    /// This bumps the epoch because a guest reuses task ids. Drop `(5, 7)` at generation 3,
     /// let a *different* task 5 create a *different* object 7 and declare three
     /// writes to it, and a stamp taken before the retire compares equal to one
     /// taken after — same epoch, same generation, unrelated bytes. That is the
@@ -128,8 +108,8 @@ impl BufferWriteStamp {
     /// Whether the guest has declared no write to this object between the two
     /// stamps.
     ///
-    /// `false` for a pair that straddles a map clear, which is the unknown case
-    /// answered in the safe direction — see this module's doc on [`BufferWriteGens::MAX`].
+    /// `false` for a pair that straddles task retirement, which is the unknown
+    /// case answered in the safe direction.
     pub fn quiet_since(self, earlier: Self) -> bool {
         self.epoch == earlier.epoch && self.gen == earlier.gen
     }
@@ -163,20 +143,19 @@ mod tests {
         assert!(g.stamp(1, 7).quiet_since(before));
     }
 
-    /// A stamp taken before a clear must not compare equal to one taken after
-    /// it. Forgetting an object silently must abandon, not preserve, authority.
+    /// Live object generations are retained without a capacity eviction.
     #[test]
-    fn a_stamp_that_straddles_a_reset_is_not_quiet() {
+    fn live_object_generations_are_not_evicted_by_capacity() {
         let mut g = BufferWriteGens::default();
-        g.note_write(1, 7);
-        let before = g.stamp(1, 7);
-        for object in 0..(BufferWriteGens::MAX as u32 + 1) {
+        const DISTINCT_OBJECTS: u32 = 8192;
+        for object in 0..DISTINCT_OBJECTS {
             g.note_write(9, object);
         }
-        assert!(
-            !g.stamp(1, 7).quiet_since(before),
-            "the map was cleared under this reader, so it cannot say the object was quiet"
-        );
+        assert_eq!(g.tracked(), DISTINCT_OBJECTS as usize);
+        assert!((0..DISTINCT_OBJECTS).all(|object| {
+            let current = g.stamp(9, object);
+            current.gen == 1
+        }));
     }
 
     /// A task that goes takes its objects with it, so a later task reusing an
@@ -227,16 +206,5 @@ mod tests {
         let before = g.stamp(1, 7);
         g.retire_task(2);
         assert!(g.stamp(1, 7).quiet_since(before));
-    }
-
-    /// The map stops at its bound rather than tracking a guest that creates
-    /// objects without end.
-    #[test]
-    fn the_map_stops_at_its_bound() {
-        let mut g = BufferWriteGens::default();
-        for object in 0..(BufferWriteGens::MAX as u32 + 5) {
-            g.note_write(1, object);
-        }
-        assert!(g.tracked() <= BufferWriteGens::MAX);
     }
 }

@@ -204,13 +204,101 @@ struct StreamAccum {
     /// and not in either backend's encoder.
     ///
     /// **Sticky, and it cannot go stale.** There is no retirement path and none
-    /// is needed: this field describes the accumulator beside it, a
-    /// `StreamAccum` is built fresh per stream and dropped at [`finish_stream`],
-    /// so the refusal and the state it describes have exactly the same life. The
-    /// compute rail's equivalent needs a `clear_refusal_at` because a
-    /// `ComputeAccum` outlives many dispatches; a render pass's state does not
-    /// outlive the pass.
+    /// is needed: this field describes the accumulator beside it. A
+    /// `StreamAccum` is built when a render encoder begins and dropped at its
+    /// closing segment, so the refusal and the state it describes have exactly
+    /// the same life even when that encoder spans child buffers. The compute
+    /// rail's equivalent needs a `clear_refusal_at` because a `ComputeAccum`
+    /// outlives many dispatches; a render pass's state does not outlive the
+    /// pass.
     unrepresentable: Option<StreamRefusal>,
+}
+
+/// Decoder state owned by one encoder whose segment header keeps it open.
+///
+/// The segment flags, rather than the child command-buffer descriptor, delimit
+/// this state. A render or compute encoder may therefore span several child
+/// buffers, and every stateful record in the later buffers observes the state
+/// established by the earlier ones. Stateless encoder families still occupy
+/// the enum: their presence is what lets the continuation check reject a type
+/// change instead of dispatching the next segment through the wrong decoder.
+enum OpenEncoder {
+    Render(StreamAccum),
+    Compute(crate::runtime::compute_session::ComputeSegment),
+    Blit,
+    Event,
+    Info,
+}
+
+impl OpenEncoder {
+    fn new(type_: u8) -> Option<Self> {
+        match type_ {
+            SEGMENT_TYPE_RENDER => Some(Self::Render(StreamAccum::default())),
+            SEGMENT_TYPE_COMPUTE => Some(Self::Compute(
+                crate::runtime::compute_session::ComputeSegment::default(),
+            )),
+            SEGMENT_TYPE_BLIT => Some(Self::Blit),
+            SEGMENT_TYPE_EVENT => Some(Self::Event),
+            SEGMENT_TYPE_INFO => Some(Self::Info),
+            _ => None,
+        }
+    }
+
+    fn type_(&self) -> u8 {
+        match self {
+            Self::Render(_) => SEGMENT_TYPE_RENDER,
+            Self::Compute(_) => SEGMENT_TYPE_COMPUTE,
+            Self::Blit => SEGMENT_TYPE_BLIT,
+            Self::Event => SEGMENT_TYPE_EVENT,
+            Self::Info => SEGMENT_TYPE_INFO,
+        }
+    }
+}
+
+/// A segment-header encoder lifetime that cannot be represented faithfully.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EncoderLifetimeRefusal {
+    MissingPrevious { actual: u8 },
+    TypeMismatch { previous: u8, actual: u8 },
+    RestartBeforeClose { previous: u8, actual: u8 },
+    Unclosed { previous: u8 },
+}
+
+impl crate::observe::Decline for EncoderLifetimeRefusal {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::MissingPrevious { .. } => "stream_encoder_continuation_without_previous",
+            Self::TypeMismatch { .. } => "stream_encoder_continuation_type_mismatch",
+            Self::RestartBeforeClose { .. } => "stream_encoder_restart_before_close",
+            Self::Unclosed { .. } => "stream_encoder_unclosed",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match *self {
+            Self::MissingPrevious { actual } => {
+                vec![(
+                    "actual",
+                    stream::segment_type_name(u32::from(actual)).into(),
+                )]
+            }
+            Self::TypeMismatch { previous, actual }
+            | Self::RestartBeforeClose { previous, actual } => vec![
+                (
+                    "previous",
+                    stream::segment_type_name(u32::from(previous)).into(),
+                ),
+                (
+                    "actual",
+                    stream::segment_type_name(u32::from(actual)).into(),
+                ),
+            ],
+            Self::Unclosed { previous } => vec![(
+                "previous",
+                stream::segment_type_name(u32::from(previous)).into(),
+            )],
+        }
+    }
 }
 
 impl StreamAccum {
@@ -697,18 +785,26 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     // stale.
     consume_resource_table(state, task_id, &resource_descs);
 
+    let mut open_encoder = None;
     for stream in streams {
-        let mut acc = StreamAccum::default();
         let walk_started = std::time::Instant::now();
-        walk_stream(state, host, task_id, &stream, &mut out, &mut acc);
-        let walk_ns = walk_started.elapsed().as_nanos() as u64;
+        let finish_ns =
+            walk_submitted_stream(state, host, task_id, &stream, &mut out, &mut open_encoder);
+        let walk_ns = (walk_started.elapsed().as_nanos() as u64).saturating_sub(finish_ns);
         measured_ns += walk_ns;
         crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Walk, walk_ns);
-        let finish_started = std::time::Instant::now();
-        finish_stream(state, host, task_id, &mut out, &acc);
-        let finish_ns = finish_started.elapsed().as_nanos() as u64;
         measured_ns += finish_ns;
         crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Finish, finish_ns);
+    }
+    if let Some(previous) = open_encoder {
+        crate::observe::Emit::decline(
+            "stream_encoder",
+            &EncoderLifetimeRefusal::Unclosed {
+                previous: previous.type_(),
+            },
+        )
+        .field("task", task_id)
+        .fail();
     }
     note_exec_header(exec_started, measured_ns);
     out.total_us = elapsed_us(exec_started);
@@ -1132,6 +1228,165 @@ fn walk_segment_records(stream: &[u8], seg: &stream::Segment, mut handle: impl F
     }
 }
 
+fn finish_open_encoder<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    out: &mut ExecResult,
+    encoder: &mut OpenEncoder,
+) -> u64 {
+    let started = std::time::Instant::now();
+    match encoder {
+        OpenEncoder::Render(acc) => finish_stream(state, host, task_id, out, acc),
+        OpenEncoder::Compute(compute) => {
+            if let Some(st) = crate::runtime::compute_session::finish_session(
+                &mut compute.session,
+                state,
+                host,
+                task_id,
+            ) {
+                if !matches!(st, ComputeStatus::Ok) {
+                    out.compute_control_fail = out.compute_control_fail.saturating_add(1);
+                    if let Some(e) = crate::observe::Emit::refusal("compute_session_finish", &st) {
+                        e.field("task", task_id).fail_once(u64::from(task_id));
+                    }
+                }
+            }
+        }
+        OpenEncoder::Blit | OpenEncoder::Event | OpenEncoder::Info => {}
+    }
+    started.elapsed().as_nanos() as u64
+}
+
+/// Walk one submitted child buffer under the segment-header encoder lifetime.
+///
+/// `open` is submission state, not stream state: the closing flag of one child
+/// buffer may deliberately leave its encoder for the opening flag of the next.
+/// The returned duration is time spent closing encoders, so the caller can keep
+/// the `Walk` and `Finish` census phases disjoint even when a close occurs in
+/// the middle of a child buffer.
+fn walk_submitted_stream<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    bytes: &[u8],
+    out: &mut ExecResult,
+    open: &mut Option<OpenEncoder>,
+) -> u64 {
+    let segs = match stream::iter_segments(bytes) {
+        Ok(s) => s,
+        Err(status) => {
+            if let Some(e) = crate::observe::Emit::refusal("stream_frame_fail", &status) {
+                e.field("task", task_id)
+                    .field("bytes", bytes.len())
+                    .fail_once(u64::from(task_id));
+            }
+            return 0;
+        }
+    };
+
+    let mut finish_ns = 0u64;
+    for seg in segs {
+        if let Some(e) =
+            crate::observe::Emit::refusal("stream_segment", &stream::segment_disposition(seg.type_))
+        {
+            e.field("seg_type", seg.type_)
+                .field("seg_off", seg.offset)
+                .field("seg_len", seg.length)
+                .fail_once(u64::from(seg.type_));
+            continue;
+        }
+        if stream::segment_disposition(seg.type_) == stream::SegmentDisposition::Envelope {
+            continue;
+        }
+
+        let mut encoder = if seg.begin_flag != 0 {
+            match open.take() {
+                Some(encoder) if encoder.type_() == seg.type_ => encoder,
+                Some(previous) => {
+                    crate::observe::Emit::decline(
+                        "stream_encoder",
+                        &EncoderLifetimeRefusal::TypeMismatch {
+                            previous: previous.type_(),
+                            actual: seg.type_,
+                        },
+                    )
+                    .field("task", task_id)
+                    .fail();
+                    continue;
+                }
+                None => {
+                    crate::observe::Emit::decline(
+                        "stream_encoder",
+                        &EncoderLifetimeRefusal::MissingPrevious { actual: seg.type_ },
+                    )
+                    .field("task", task_id)
+                    .fail();
+                    continue;
+                }
+            }
+        } else {
+            if let Some(previous) = open.take() {
+                crate::observe::Emit::decline(
+                    "stream_encoder",
+                    &EncoderLifetimeRefusal::RestartBeforeClose {
+                        previous: previous.type_(),
+                        actual: seg.type_,
+                    },
+                )
+                .field("task", task_id)
+                .fail();
+            }
+            let Some(encoder) = OpenEncoder::new(seg.type_) else {
+                unreachable!("walk disposition admitted no encoder state")
+            };
+            encoder
+        };
+
+        match &mut encoder {
+            OpenEncoder::Render(acc) => {
+                walk_segment_records(bytes, &seg, |op, cmd| {
+                    handle_render_record(state, host, task_id, op, cmd, out, acc)
+                });
+            }
+            OpenEncoder::Compute(compute) => {
+                walk_segment_records(bytes, &seg, |op, cmd| {
+                    handle_compute_record(state, host, task_id, op, cmd, out, compute)
+                });
+            }
+            OpenEncoder::Blit => {
+                walk_segment_records(bytes, &seg, |op, cmd| {
+                    handle_blit_record(state, host, task_id, op, cmd)
+                });
+            }
+            OpenEncoder::Event => {
+                walk_segment_records(bytes, &seg, |_op, cmd| {
+                    handle_event_record(state, task_id, cmd)
+                });
+            }
+            OpenEncoder::Info => {
+                walk_segment_records(bytes, &seg, |op, cmd| {
+                    handle_info_record(state, host, task_id, op, cmd)
+                });
+            }
+        }
+
+        if seg.unidentified_u8 != 0 {
+            *open = Some(encoder);
+        } else {
+            finish_ns = finish_ns.saturating_add(finish_open_encoder(
+                state,
+                host,
+                task_id,
+                out,
+                &mut encoder,
+            ));
+        }
+    }
+    finish_ns
+}
+
+#[cfg(test)]
 fn walk_stream<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,

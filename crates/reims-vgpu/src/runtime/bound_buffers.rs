@@ -125,7 +125,39 @@ pub struct PackedBuffer {
     pub pages: Arc<Vec<GuestWindowRun>>,
 }
 
+/// One allocation-relative byte window expressed in both host-import and
+/// guest-physical coordinates.
+///
+/// `host_ptr` includes [`PackedBuffer::head`], which is the resource's offset
+/// inside its retained host import. `gpas` is indexed by the resource GVA's
+/// offset inside its first guest page. Those offsets agree only when the host
+/// import begins at that guest page; a RAM-block import may begin much earlier.
+pub struct PackedWitnessWindow<'a> {
+    pub host_ptr: usize,
+    pub gpas: &'a [u64],
+}
+
 impl PackedBuffer {
+    /// Resolve one allocation-relative byte window for content witnessing.
+    pub fn witness_window(&self, offset: u64, span: u64) -> Option<PackedWitnessWindow<'_>> {
+        if span == 0 || offset.checked_add(span)? > self.size {
+            return None;
+        }
+        let page = self.footprint.page_size();
+        let guest_start = (self.gva % page).checked_add(offset)?;
+        let guest_end = guest_start.checked_add(span)?;
+        let first = usize::try_from(guest_start / page).ok()?;
+        let last = usize::try_from((guest_end - 1) / page).ok()?;
+        let import_offset = self.head.checked_add(offset)?;
+        Some(PackedWitnessWindow {
+            host_ptr: self
+                .import
+                .host_base()
+                .checked_add(usize::try_from(import_offset).ok()?)?,
+            gpas: self.gpas.get(first..=last)?,
+        })
+    }
+
     /// One buffer bind inside this retained allocation. Compute and render
     /// consume the same source type; the zero row length says this is a flat
     /// byte range rather than a pitched image plane.
@@ -139,15 +171,13 @@ impl PackedBuffer {
 
     /// Physical pages touched by one allocation-relative byte window.
     pub fn window_pages(&self, offset: u64, span: u64) -> Option<std::collections::HashSet<u64>> {
-        if span == 0 {
-            return None;
-        }
-        let page = self.footprint.page_size();
-        let start = self.head.checked_add(offset)?;
-        let end = start.checked_add(span)?;
-        let first = usize::try_from(start / page).ok()?;
-        let last = usize::try_from((end - 1) / page).ok()?;
-        Some(self.gpas.get(first..=last)?.iter().copied().collect())
+        Some(
+            self.witness_window(offset, span)?
+                .gpas
+                .iter()
+                .copied()
+                .collect(),
+        )
     }
 
     /// One image plane inside this retained allocation, expressed in the form
@@ -834,6 +864,43 @@ mod tests {
         assert!(
             b.packed_available(4, 9, 0x10800, 0x7000).is_none(),
             "the same reference in another task is a different resource"
+        );
+    }
+
+    #[test]
+    fn packed_witness_separates_host_import_head_from_guest_page_index() {
+        let import = Arc::new(
+            crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
+                0x7f00_0000_0000,
+                0x20_000,
+                0x1000,
+            )
+            .expect("aligned host allocation"),
+        );
+        let packed = PackedBuffer {
+            gva: 0x840_000,
+            size: 0x1000,
+            // A RAM-block import may begin many pages before this resource.
+            head: 0x12_000,
+            import: Arc::clone(&import),
+            gpas: Arc::new(vec![0x220_000]),
+            footprint: crate::runtime::guest_ram::GuestPageFootprint::new(
+                Arc::from([0x220_000]),
+                0x1000,
+            )
+            .unwrap(),
+            runs: Arc::new(Vec::new()),
+            pages: Arc::new(Vec::new()),
+        };
+
+        let window = packed
+            .witness_window(0, 4)
+            .expect("the first four resource bytes are in its first guest page");
+        assert_eq!(window.gpas, &[0x220_000]);
+        assert_eq!(window.host_ptr, import.host_base() + 0x12_000);
+        assert_eq!(
+            packed.window_pages(0, 4).unwrap(),
+            std::collections::HashSet::from([0x220_000])
         );
     }
 

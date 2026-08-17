@@ -518,6 +518,12 @@ engine_counters! {
         /// below.
         compute_buffer_guest_imports,
         compute_buffer_guest_import_bytes,
+        /// Vertex, storage and index binds served directly from the retained
+        /// guest buffer allocation, with no copy in either direction.
+        buffer_guest_imports,
+        buffer_guest_import_bytes,
+        /// Index-buffer subset of the direct-import totals.
+        buffer_guest_index_imports,
         /// Vertex/storage buffer binds the GPU assembled out of the guest's own
         /// pages, one `VkBufferCopy` per GPA-contiguous stretch, into a
         /// device-local destination the draw then binds.
@@ -1095,6 +1101,16 @@ impl EngineCounters {
             .fetch_add(1, Ordering::Relaxed);
         self.compute_buffer_guest_import_bytes
             .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(super) fn note_buffer_guest_import(&self, bytes: u64, role: super::exec::BufferGatherRole) {
+        self.buffer_guest_imports.fetch_add(1, Ordering::Relaxed);
+        self.buffer_guest_import_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        if role.includes_index() {
+            self.buffer_guest_index_imports
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub(super) fn note_buffer_guest_gather(

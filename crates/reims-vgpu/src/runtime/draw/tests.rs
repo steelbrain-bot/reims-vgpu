@@ -274,16 +274,17 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
     let type5_witnesses = crate::runtime::drain::store_route_count("gw_rail_t5");
     let type11 = try_type11_sample_zero_copy(&mut state, &mut host, mid, 128, 128)
         .expect("the mapping's color plane is sampleable");
-    let SampledSourceRequest::GuestRuns(type11, _, type11_format, _, type11_identity, ..) = type11
+    let SampledSourceRequest::GuestRuns(type11, _, type11_format, _, _, type11_identity, ..) =
+        type11
     else {
         panic!("the mapping stays guest-backed")
     };
     assert_eq!(type11_format, ash::vk::Format::B8G8R8A8_SRGB);
-    assert_eq!(type11_identity, None);
+    assert!(type11_identity.is_some());
     assert_eq!(
         crate::runtime::drain::store_route_count("gw_rail_t11"),
-        type11_witnesses,
-        "a direct resource has no copied image whose freshness needs witnessing"
+        type11_witnesses + 1,
+        "the imported source and its copied fallback share one witness"
     );
     let type11_import = std::sync::Arc::clone(
         type11
@@ -307,16 +308,16 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
         },
     )
     .expect("the serialized plane view is sampleable");
-    let SampledSourceRequest::GuestRuns(type5, _, type5_format, _, type5_identity, ..) = type5
+    let SampledSourceRequest::GuestRuns(type5, _, type5_format, _, _, type5_identity, ..) = type5
     else {
         panic!("the plane view stays guest-backed")
     };
     assert_eq!(type5_format, ash::vk::Format::B8G8R8A8_UNORM);
-    assert_eq!(type5_identity, None);
+    assert!(type5_identity.is_some());
     assert_eq!(
         crate::runtime::drain::store_route_count("gw_rail_t5"),
-        type5_witnesses,
-        "a direct plane has no copied image whose freshness needs witnessing"
+        type5_witnesses + 1,
+        "the imported plane and its copied fallback share one witness"
     );
     let type5_import = std::sync::Arc::clone(
         type5
@@ -1425,288 +1426,6 @@ fn an_intermediate_record_can_still_ask_about_the_resident_it_renders_into() {
     assert!(
         type11_load_currency_query(&state, &req).is_none(),
         "a GVA target is the other rail's"
-    );
-}
-
-/// The guest half of the type-11 seed currency test.
-///
-/// `surface_content_epoch` witnesses only writers inside this crate — every
-/// caller of `mark_mapping_written` is one — and a surface's pages are plain
-/// guest RAM the guest CPU stores into with no device operation at all. Without
-/// this half the elision answers "current" for a resident the guest has since
-/// overwritten, the Store publishes that resident back over the guest's bytes,
-/// and the epoch still has not moved: the fixpoint that turns one bad frame
-/// into a permanently corrupted surface.
-///
-/// Every answer here is "written" except the one case that is provably not.
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn a_guest_write_since_the_store_refuses_the_resident() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::runtime::host::{FakeHost, HostOps};
-
-    let entry_for =
-        |gpa: u64| (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    let mut host = FakeHost::new();
-    let page = state.page_size();
-    assert!(state.map_surface(7));
-    // Two pages of guest storage, stated as page-table entries the way a
-    // resolved mapping carries them.
-    let gpas = [0x40 * page, 0x91 * page];
-    {
-        let m = state.mappings.get_mut(&7).expect("mapped above");
-        m.page_entries = gpas.iter().map(|g| entry_for(*g)).collect();
-    }
-
-    assert!(
-        type11_guest_wrote_since_store(&state, &host, 7),
-        "no Store has stamped this surface, so nothing vouches for any resident"
-    );
-    assert!(
-        type11_guest_wrote_since_store(&state, &host, 999),
-        "a mapping this device does not know cannot be declared unwritten"
-    );
-
-    // The Store's side: register the pages and record the generation.
-    let token = crate::runtime::mapper::ensure_guest_write_token(&mut state, &mut host, 7)
-        .expect("FakeHost observes guest writes");
-    let stamped = host.guest_write_gen(token).expect("a live token has one");
-    state
-        .mappings
-        .get_mut(&7)
-        .expect("mapped above")
-        .guest_write_gen_at_store = stamped;
-    assert!(
-        !type11_guest_wrote_since_store(&state, &host, 7),
-        "nothing has written the pages since the Store, so the resident still holds them"
-    );
-
-    // A guest CPU store into one of the surface's pages. No device operation is
-    // involved, which is the whole point: `surface_content_epoch` does not move.
-    let epoch_before = state.mappings[&7].surface_content_epoch;
-    host.guest_wrote_page(gpas[1]);
-    assert_eq!(
-        state.mappings[&7].surface_content_epoch, epoch_before,
-        "the device-side epoch cannot see a guest CPU write — if it could, this \
-         whole rail would be unnecessary"
-    );
-    assert!(
-        type11_guest_wrote_since_store(&state, &host, 7),
-        "the hypervisor saw the write, so the resident is stale"
-    );
-
-    // Idempotent: asking again must give the same answer. A consume-on-read
-    // report would tell the first draw of the frame the surface is dirty and
-    // every later draw that it is clean.
-    assert!(
-        type11_guest_wrote_since_store(&state, &host, 7),
-        "the refusal must survive being read"
-    );
-
-    // Re-stamping after re-seeding restores reuse, so the rail recovers rather
-    // than latching the other way.
-    let restamped = host.guest_write_gen(token).expect("still live");
-    state
-        .mappings
-        .get_mut(&7)
-        .expect("mapped above")
-        .guest_write_gen_at_store = restamped;
-    assert!(!type11_guest_wrote_since_store(&state, &host, 7));
-
-    // Retiring the page list retires the token with it: a generation recorded
-    // against pages the surface no longer owns vouches for nothing.
-    assert!(state.unmap_surface(7));
-    assert!(
-        type11_guest_wrote_since_store(&state, &host, 7),
-        "a surface whose page list is gone has no vouched resident"
-    );
-    crate::runtime::mapper::flush_retired_views(&mut state, &mut host);
-    assert_eq!(
-        host.tracked_guest_write_sets(),
-        0,
-        "the token must reach the host, or every mapping incarnation leaks a set"
-    );
-}
-
-/// The verdict must keep its refusals apart, because two rails now report it.
-///
-/// [`type11_guest_wrote_since_store`] collapses everything that is not `Clean`
-/// to `true`, which is the right answer for a gate and the wrong one for a
-/// census: "this rail was never stamped" and "the guest rewrites this surface
-/// every frame" produce the same refusal and mean opposite things. The sampled
-/// ladder's `t11rung_host_cache_gw_*` counters exist to tell them apart, so a
-/// verdict that pooled them would make that reading a lie.
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn the_guest_write_verdict_separates_its_refusals() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::runtime::host::{FakeHost, HostOps};
-
-    let entry_for =
-        |gpa: u64| (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    let mut host = FakeHost::new();
-    let page = state.page_size();
-    assert!(state.map_surface(7));
-    let gpas = [0x40 * page, 0x91 * page];
-    {
-        let m = state.mappings.get_mut(&7).expect("mapped above");
-        m.page_entries = gpas.iter().map(|g| entry_for(*g)).collect();
-    }
-
-    assert_eq!(
-        mapping_guest_write_verdict(&state, &host, 999),
-        GuestWriteVerdict::NoMapping
-    );
-    assert_eq!(
-        mapping_guest_write_verdict(&state, &host, 7),
-        GuestWriteVerdict::NoStamp,
-        "registered pages but no Store stamp is its own finding"
-    );
-
-    let token = crate::runtime::mapper::ensure_guest_write_token(&mut state, &mut host, 7)
-        .expect("FakeHost observes guest writes");
-    state
-        .mappings
-        .get_mut(&7)
-        .expect("mapped above")
-        .guest_write_gen_at_store = host.guest_write_gen(token).expect("a live token has one");
-    assert_eq!(
-        mapping_guest_write_verdict(&state, &host, 7),
-        GuestWriteVerdict::Clean
-    );
-
-    host.guest_wrote_page(gpas[0]);
-    assert_eq!(
-        mapping_guest_write_verdict(&state, &host, 7),
-        GuestWriteVerdict::Wrote,
-        "a real guest write must not be reported as a missing stamp"
-    );
-
-    // A host that cannot answer for the token is neither clean nor a write.
-    let blind = FakeHost::new();
-    assert_eq!(
-        mapping_guest_write_verdict(&state, &blind, 7),
-        GuestWriteVerdict::Unreadable,
-        "an unknown token is an unreadable answer, not an observed write"
-    );
-}
-
-/// A page list replaced in place must not leave the token vouching for it.
-///
-/// The lifecycle mutators retire the token eagerly, but they are not the only
-/// writers of `page_entries`: the mapper's plan adoption and the type-4 page
-/// refresh both replace the list and bump `page_generation` without going near
-/// them, and both used to retire the contiguous view while leaving the token
-/// behind. A token that outlives its list watches pages the surface no longer
-/// owns — it would report nothing while the guest writes the new ones.
-///
-/// `page_generation` is the key rather than a third retirement call site,
-/// because the next writer of the list would forget the call and not the bump.
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn a_replaced_page_list_invalidates_the_token_it_was_built_for() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::runtime::host::{FakeHost, HostOps};
-
-    let entry_for =
-        |gpa: u64, shift: u32| (((gpa >> shift) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    let mut host = FakeHost::new();
-    let page = state.page_size();
-    assert!(state.map_surface(7));
-    {
-        let m = state.mappings.get_mut(&7).expect("mapped above");
-        m.page_entries = vec![entry_for(0x40 * page, PAGE_SHIFT_X86)];
-    }
-    let token = crate::runtime::mapper::ensure_guest_write_token(&mut state, &mut host, 7)
-        .expect("FakeHost observes guest writes");
-    let stamped = host.guest_write_gen(token).expect("a live token has one");
-    state
-        .mappings
-        .get_mut(&7)
-        .expect("mapped above")
-        .guest_write_gen_at_store = stamped;
-    assert!(!type11_guest_wrote_since_store(&state, &host, 7));
-
-    // Exactly what the mapper's adoption and the type-4 refresh do: swap the
-    // list and bump the generation, without touching the token.
-    {
-        let m = state.mappings.get_mut(&7).expect("mapped above");
-        m.page_entries = vec![entry_for(0x88 * page, PAGE_SHIFT_X86)];
-        DeviceState::bump_page_generation(m);
-    }
-    assert_eq!(
-        state.mappings[&7].guest_write_token, token,
-        "the point of the test is that nothing retired it"
-    );
-    assert!(
-        type11_guest_wrote_since_store(&state, &host, 7),
-        "a token built for the old pages cannot vouch for the new ones"
-    );
-
-    // The next Store rebuilds it against the pages the surface now owns, and
-    // hands the old registration back for release.
-    let fresh = crate::runtime::mapper::ensure_guest_write_token(&mut state, &mut host, 7)
-        .expect("the new list is trackable");
-    assert_ne!(fresh, token, "a new list needs a new registration");
-    crate::runtime::mapper::flush_retired_views(&mut state, &mut host);
-    assert_eq!(
-        host.tracked_guest_write_sets(),
-        1,
-        "the stale set must be released, not leaked alongside the new one"
-    );
-
-    // And it watches the new pages: a write to one of them moves the fresh
-    // generation, and a write to the retired page does not.
-    let restamped = host.guest_write_gen(fresh).expect("live");
-    state
-        .mappings
-        .get_mut(&7)
-        .expect("mapped above")
-        .guest_write_gen_at_store = restamped;
-    host.guest_wrote_page(0x40 * page);
-    assert!(
-        !type11_guest_wrote_since_store(&state, &host, 7),
-        "the surface no longer owns that page"
-    );
-    host.guest_wrote_page(0x88 * page);
-    assert!(type11_guest_wrote_since_store(&state, &host, 7));
-}
-
-/// A host with no dirty bitmap must lose the elision, not gain a wrong frame.
-///
-/// The conservative default is the whole reason `guest_write_gen` answers an
-/// `Option`: a host that cannot observe guest writes has to be told apart from
-/// one that observed none, and only the second may license a reuse.
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn a_host_that_cannot_observe_guest_writes_never_vouches() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::runtime::host::FakeHost;
-
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    let mut host = FakeHost::new();
-    host.guest_writes_unobservable = true;
-    let page = state.page_size();
-    assert!(state.map_surface(7));
-    {
-        let m = state.mappings.get_mut(&7).expect("mapped above");
-        m.page_entries = vec![
-            ((((0x40 * page) >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
-        ];
-    }
-    assert_eq!(
-        crate::runtime::mapper::ensure_guest_write_token(&mut state, &mut host, 7),
-        None,
-        "the refusal belongs at registration, not at every read"
-    );
-    assert!(
-        type11_guest_wrote_since_store(&state, &host, 7),
-        "with no witness the pages must read as written"
     );
 }
 
@@ -5535,13 +5254,12 @@ fn a_packed_alias_is_independent_of_the_whole_ram_map() {
     crate::runtime::guest_ram_map::reset();
 }
 
-/// Draw buffers retain exact per-bind guest-page references even if another
-/// consumer retained a packed view for the same resource. That view is not a
-/// draw resource: the engine gathers the declared window from the RAMBlock
-/// imports into its own buffer.
+/// Draw buffers retain one whole-resource allocation and carry each decoded
+/// offset to the engine beside it. Two offsets of one guest buffer must share
+/// the allocation instead of creating two exact-window resources.
 #[test]
 #[cfg(feature = "backend-vulkan")]
-fn draw_buffers_do_not_bind_a_packed_alias() {
+fn draw_buffers_bind_one_packed_resource_at_each_decoded_offset() {
     // The guest-RAM map resolves once per process and every test in this binary
     // shares it, so a fixture that maps its own RAM has to discard whatever an
     // earlier test resolved. Without this the alias rail asks a map built from
@@ -5590,21 +5308,16 @@ fn draw_buffers_do_not_bind_a_packed_alias() {
     let crate::backend::vulkan::engine::BufferContent::GuestRuns(first_source) = first else {
         panic!("a small resource must not be routed through a CPU snapshot")
     };
+    assert_eq!(first_source.source_offset, 0);
     assert_eq!(first_source.total_len, 0x400);
-    drop(first_source);
-    assert!(crate::runtime::bound_buffers::ensure_packed_resource(
-        &mut state,
-        &mut host,
-        1,
-        7,
-        backing.gva,
-        backing.size,
-        crate::runtime::bound_buffers::PackedResourceUse::Buffer,
-    ));
+    let first_pages = first_source
+        .pages
+        .clone()
+        .expect("the retained allocation has one import view");
     state
         .bound_buffers
         .packed_available(1, 7, backing.gva, backing.size)
-        .expect("the other consumer retained its allocation");
+        .expect("the first draw bind retained its allocation");
 
     let content = super::vulkan::load_buffer_content_resolved(
         &mut state,
@@ -5622,16 +5335,14 @@ fn draw_buffers_do_not_bind_a_packed_alias() {
     };
     crate::runtime::guest_ram::forget_import_limits();
 
-    assert_eq!(source.source_offset, 0);
+    assert_eq!(source.source_offset, 0x400);
     assert_eq!(source.total_len, 0x400);
     let pages = source.pages.expect("the exact window is GPU-readable");
-    assert!(pages
-        .iter()
-        .all(|run| run.guest.import().gpa_base().is_some()));
+    assert!(std::sync::Arc::ptr_eq(&first_pages, &pages));
     assert_eq!(
         state.bound_buffers.len(),
-        2,
-        "each distinct draw window is retained by its decoded bind key"
+        0,
+        "packed resource offsets must not populate the exact-window fallback"
     );
 }
 
@@ -5766,8 +5477,14 @@ fn sampled_plane_keeps_the_packed_allocation_and_checks_its_extent() {
             0x7000,
             0x1001,
             128,
+            512,
             crate::contract::pixel_format::TexelLayout::Rgba8,
             ash::vk::Format::R8G8B8A8_UNORM,
+            super::vulkan::LinearSampleIdentity {
+                key: 1,
+                generation: 1,
+            },
+            crate::runtime::gather_witness::GatherVouch::Fresh,
             crate::contract::pixel_format::SwizzlePlan::default(),
         )
         .is_none(),
@@ -5783,19 +5500,39 @@ fn sampled_plane_keeps_the_packed_allocation_and_checks_its_extent() {
         0x1000,
         0x2000,
         128,
+        512,
         crate::contract::pixel_format::TexelLayout::Rgba8,
         ash::vk::Format::R8G8B8A8_UNORM,
+        super::vulkan::LinearSampleIdentity {
+            key: 1,
+            generation: 1,
+        },
+        crate::runtime::gather_witness::GatherVouch::Fresh,
         crate::contract::pixel_format::SwizzlePlan::default(),
     )
     .expect("the retained allocation directly supplies this plane");
-    let super::vulkan::SampledSourceRequest::GuestRuns(source, _, _, 1, None, _, _) = request
+    let super::vulkan::SampledSourceRequest::GuestRuns(
+        source,
+        _,
+        _,
+        1,
+        Some(direct),
+        Some(identity),
+        crate::runtime::gather_witness::GatherVouch::Fresh,
+        _,
+    ) = request
     else {
-        panic!("a direct single plane has no copied-content identity")
+        panic!("a direct candidate must retain the copied fallback identity")
     };
+    assert_eq!((identity.key, identity.generation), (1, 1));
+    assert_eq!(direct.plane_offset, 0x1800);
+    assert_eq!(direct.resource_offset, 0x800);
+    assert_eq!(direct.resource_len, 0x6000);
+    assert_eq!(direct.row_pitch, 512);
     assert_eq!(
         std::sync::Arc::strong_count(&packed.import),
-        import_owners,
-        "the copied source shares the retained guest-reference list"
+        import_owners + 1,
+        "the direct image retains the allocation it aliases"
     );
     assert_eq!(
         std::sync::Arc::strong_count(&packed.gpas),
@@ -6520,20 +6257,12 @@ fn a_degradation_reports_once_per_pipeline_and_slug() {
     );
 }
 
-/// A sampled bind naming an object that is not a texture is reported, and the
-/// answer it gets does not change.
-///
-/// The two sampled-source sites in `draw::vulkan` resolved a `texture_ref`
-/// without the second ladder rung, so a ref naming any object with a long
-/// enough descriptor decoded as a texture and produced a plausible extent —
-/// while `mipmap`, `draw::texture_view`, `compute_exec` and
-/// `draw::render_target` all ask the type for the same field. Turning the rung
-/// into a refusal here would lose a draw on the pathway this device is verified
-/// on, so it reports; this pins both halves of that, because a probe that
-/// quietly started refusing would be the bug it was added to measure.
+/// A sampled bind accepts only the texture object kinds declared by the object
+/// list, regardless of whether another object's descriptor is long enough to
+/// resemble texture geometry.
 #[cfg(feature = "backend-vulkan")]
 #[test]
-fn a_sampled_ref_naming_another_object_kind_is_reported_and_still_resolves() {
+fn a_sampled_ref_naming_another_object_kind_is_refused() {
     use crate::contract::endian::{st32, st64};
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::runtime::decode::resource::{
@@ -6582,38 +6311,13 @@ fn a_sampled_ref_naming_another_object_kind_is_reported_and_still_resolves() {
     put_entry(&mut host, texture_ref, OBJECT_TYPE_TEXTURE);
     put_entry(&mut host, view_ref, OBJECT_TYPE_REF_TEXTURE);
 
-    crate::observe::redirect_logs_for_tests();
-    let before = std::fs::read_to_string(crate::observe::fail_log_path())
-        .unwrap_or_default()
-        .len();
-
-    // A real texture resolves and says nothing.
     assert!(
         super::vulkan::sampled_texture_descriptor(&state, &host, 1, texture_ref).is_some(),
         "a texture ref resolves"
     );
-    // Another kind resolves exactly the same way — the bytes are the bytes —
-    // and the rung is named.
-    let (entry, bytes) = super::vulkan::sampled_texture_descriptor(&state, &host, 1, view_ref)
-        .expect("the answer does not change: the descriptor still resolves");
-    assert_eq!(entry.object_type, OBJECT_TYPE_REF_TEXTURE);
-    assert_eq!(bytes.len(), body);
-
-    let log = std::fs::read_to_string(crate::observe::fail_log_path()).unwrap_or_default();
-    let tail = &log[before.min(log.len())..];
-    let line = tail
-        .lines()
-        .find(|l| l.contains("draw_sampled_texture_wrong_type"))
-        .expect("the second ladder rung must name itself");
     assert!(
-        line.contains(&format!("ref={view_ref}")) && line.contains("object_type=5"),
-        "the line must name the ref and what it found: {line}"
-    );
-    assert!(
-        !tail
-            .lines()
-            .any(|l| l.contains("draw_sampled_texture_wrong_type") && l.contains("ref=6")),
-        "a texture ref must not be reported"
+        super::vulkan::sampled_texture_descriptor(&state, &host, 1, view_ref).is_none(),
+        "a non-texture object must not acquire texture meaning from its byte shape"
     );
 }
 
@@ -6837,6 +6541,7 @@ fn a_gva_span_no_store_has_stamped_refuses_the_resident_sample_rung() {
     // makes it unreachable rather than merely out-voted.
     let orphan = GvaTargetKey {
         task_id: 1,
+        texture_ref: 7,
         gva,
         generation: 0xdead_beef,
         width,
@@ -6845,7 +6550,7 @@ fn a_gva_span_no_store_has_stamped_refuses_the_resident_sample_rung() {
         // in the generation alone.
         bgra: true,
     };
-    note_store(&mut state, &mut host, orphan, &gpas);
+    note_store(&mut state, orphan, &gpas);
     assert!(
         super::try_gva_resident_sample(&mut state, &mut host, 1, 7, &tex).is_none(),
         "a stale page set stamped at this address must not answer for the one that replaced it"

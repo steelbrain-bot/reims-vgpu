@@ -114,11 +114,19 @@ pub fn apply(
             let seq = state.next_validity_seq();
             if let Some(m) = state.mappings.get_mut(&id) {
                 m.content_generation = m.content_generation.saturating_add(1);
+                m.surface_content_epoch = match m.surface_content_epoch.wrapping_add(1) {
+                    0 => 1,
+                    epoch => epoch,
+                };
                 // Stamped rather than latched: the claim is about this moment,
                 // and the device's next publish into this surface supersedes it.
                 m.validity.host_cleared_seq = seq;
                 out.bumped = out.bumped.saturating_add(1);
             }
+            // A cached frame is a host copy of the resource the guest just
+            // declared newer. Removing it here makes every cache consumer obey
+            // the decoded validity statement without its own currency rule.
+            crate::runtime::surface_cache::forget(state, id);
             crate::runtime::drain::note_store_route("validity_gen_bump");
         }
         let Some(m) = state.mappings.get_mut(&id) else {
@@ -128,27 +136,12 @@ pub fn apply(
     }
     out.missed = !hit;
     if ops.clear_host_valid != 0 {
-        // The statement this device used to decode and drop. A buffer has no
-        // mapping, so the loop above skipped it and the guest's account of its
-        // own write went nowhere — which is the one signal the draw-time buffer
-        // gather has no substitute for. Recorded only on the miss, because an
-        // object with a mapping already carries `content_generation` and a
-        // second spelling of one fact is a divergence waiting to happen.
-        // A task-local texture reference can numerically collide with a
-        // mapping id: they are distinct guest namespaces. While a GVA frame is
-        // owed, that texture needs its own generation even when the integer
-        // happened to hit an unrelated mapping above, or the guest's CPU write
-        // would leave the old resident authoritative.
-        let gva_owed =
-            state
-                .pending_writebacks
-                .has_gva(crate::runtime::writeback_debt::GvaResourceKey {
-                    task_id,
-                    texture_ref: object_id,
-                });
-        if !hit || gva_owed {
-            state.buffer_write_gen.note_write(task_id, object_id);
-        }
+        // The dirty bit belongs to the task-local resource object, so retain
+        // that statement under its native `(task, object)` identity whether or
+        // not the object also names a mapping. Mapping generations are views
+        // used by mapping-owned caches; this is the object-owned source from
+        // which GVA buffers and linear textures derive their freshness.
+        state.buffer_write_gen.note_write(task_id, object_id);
         crate::runtime::drain::note_store_route(site.clear_host_route());
     }
     if ops.clear_guest_valid != 0 {
@@ -397,12 +390,22 @@ mod tests {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         state.mappings.entry(77).or_default().mapped = true;
         state.mappings.entry(77).or_default().validity.host_valid = true;
+        state.mappings.entry(77).or_default().surface_content_epoch = 9;
+        crate::runtime::surface_cache::store(&mut state, 77, 2, 2, vec![0x55; 16]);
         state.texture_to_mapping.insert((4, 12), 77);
         let out = apply(&mut state, 4, 12, quad(1, 0, 0, 0), ValiditySite::ExecTable);
         assert_eq!(out.bumped, 1, "the ref must resolve to its mapping");
         assert!(
             !state.mappings[&77].validity.host_valid,
             "clear_host_valid must reach the mapping the ref names"
+        );
+        assert_ne!(
+            state.mappings[&77].surface_content_epoch, 9,
+            "the same decoded write must invalidate a resident Store stamp"
+        );
+        assert!(
+            crate::runtime::surface_cache::get(&state, 77, 2, 2).is_none(),
+            "a host byte copy must not survive the guest's ownership claim"
         );
     }
 

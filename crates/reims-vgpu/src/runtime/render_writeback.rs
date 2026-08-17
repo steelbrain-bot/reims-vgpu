@@ -1553,9 +1553,8 @@ pub(crate) fn licence_gva_plane<M: HostMemory + HostOps>(
         height: c0.height,
         format: want,
     };
-    // This device is about to write these guest pages, and the hypervisor's
-    // dirty bitmap is defined not to see it. Without this record a reader
-    // holding a gathered image over the same pages
+    // This device is about to write these guest pages. Without this record a
+    // reader holding a gathered image over the same pages
     // (`crate::runtime::gather_witness`) cannot tell "nobody wrote them" from
     // "we wrote them ourselves", and vouches a retained image that no longer
     // matches the pages — a wrong frame that then persists.
@@ -1602,27 +1601,13 @@ pub(crate) fn copy_resident_into_gva_plane<M: HostMemory + HostOps>(
     // exist, so the reclaim paths may take it — the same handover
     // `store_render_frame` performs in `finish`.
     crate::backend::vulkan::engine::note_resident_content_copied_out(identity);
-    // Arm the GVA write witness over the pages this Store just published, the
-    // twin of `mapper::stamp_guest_write_gen` on the type-11 rail. It is what
-    // lets a later reader ask whether these pages still hold this frame without
-    // reading them — see `crate::runtime::gva_store_witness`.
-    //
-    // After the submit, not before it: a stamp taken ahead of a copy that then
-    // declines would claim the guest's pages hold a frame that never reached
-    // them. And after `note_host_wrote_pages` above, because the epoch the
-    // witness records is compared against that same ring — capturing it first
-    // would have every target permanently invalidated by its own Store.
-    //
-    // Only this rail stamps. Both copying arms — the eager `gva_store_sync` and
-    // [`land_gva_frame_bytes`] behind this call — leave no witness, so their
-    // targets never read quiet and never take the shortcut this arms. That is
-    // safe and deliberate rather than an oversight: it is the arm a host without
-    // the guest-RAM import takes, and it already pays a blocking readback per
-    // Store, so the shortcut is worth less there and the rails stay easier to
-    // tell apart. The frame is in the guest's pages either way; what a missing
-    // stamp costs is a re-read, never a wrong image.
-    if let Some(key) = crate::runtime::gva_store_witness::GvaTargetKey::of(task_id, identity) {
-        crate::runtime::gva_store_witness::note_store(state, host, key, gpas);
+    // Stamp the decoded resource generation after the copy and after recording
+    // this device's own page write. Those two contract-owned records are the
+    // complete currency test for a named target.
+    if let Some(key) =
+        crate::runtime::gva_store_witness::GvaTargetKey::of(task_id, c0.texture_ref, identity)
+    {
+        crate::runtime::gva_store_witness::note_store(state, key, gpas);
     }
     Ok(extent)
 }

@@ -89,30 +89,30 @@ pub(super) struct PendingGuestGather {
 pub(super) struct BufferGatherRole {
     vertex: bool,
     storage: bool,
-    index: bool,
+    index_alignment: Option<u64>,
 }
 
 impl BufferGatherRole {
     const VERTEX: Self = Self {
         vertex: true,
         storage: false,
-        index: false,
+        index_alignment: None,
     };
     pub(super) const STORAGE: Self = Self {
         vertex: false,
         storage: true,
-        index: false,
+        index_alignment: None,
     };
     pub(super) fn is_shared(self) -> bool {
-        self.vertex as u8 + self.storage as u8 + self.index as u8 > 1
+        self.vertex as u8 + self.storage as u8 + self.index_alignment.is_some() as u8 > 1
     }
 
     pub(super) fn includes_index(self) -> bool {
-        self.index
+        self.index_alignment.is_some()
     }
 
     pub(super) fn is_storage_only(self) -> bool {
-        self.storage && !self.vertex && !self.index
+        self.storage && !self.vertex && self.index_alignment.is_none()
     }
 }
 
@@ -205,14 +205,15 @@ impl BufferGatherRoles {
             });
         }
         if let Some(indexed) = &req.indexed {
+            let alignment = indexed.index_type.byte_size() as u64;
             let key = CbBind::key_of(&indexed.content);
             let seed = BufferGatherRole {
                 vertex: false,
                 storage: false,
-                index: true,
+                index_alignment: Some(alignment),
             };
             match entries.iter_mut().find(|(held, _)| *held == key) {
-                Some((_, role)) => role.index = true,
+                Some((_, role)) => role.index_alignment = Some(alignment),
                 None => entries.push((key, seed)),
             }
         }
@@ -236,6 +237,12 @@ impl BufferGatherRoles {
     fn len(&self) -> usize {
         self.entries.len()
     }
+}
+
+/// Offset alignment imposed by every consumer of one physical buffer bind.
+fn buffer_bind_offset_alignment(role: BufferGatherRole, storage_align: u64) -> u64 {
+    let storage = if role.storage { storage_align } else { 1 };
+    storage.max(role.index_alignment.unwrap_or(1))
 }
 
 impl PendingGuestGather {
@@ -717,13 +724,17 @@ unsafe fn stage_buffer_content(
             BoundBuffer::from(slot)
         }
         BufferContent::GuestRuns(src) => {
-            // Guest memory is the transport source, never the draw resource.
-            // The command buffer copies the exact declared span into an
-            // engine-owned buffer and orders every consumer behind that copy.
-            // This preserves execution-time freshness without a CPU read or
-            // memcpy and keeps one ownership model for vertex, index, and
-            // shader-buffer input.
-            if let Some((bound, pending)) =
+            // A retained packed allocation is already the persistent buffer
+            // object the guest bound. When the device accepts that host
+            // allocation and every consumer accepts its offset, bind it as-is.
+            // Exact-window/scattered sources that cannot form one Vulkan buffer
+            // continue through the ordered gather below.
+            if let Some(bound) = unsafe { import_guest_buffer_window(ctx, pools, src, gather_role) }
+            {
+                pools.note_guest_read_recorded();
+                counters.note_buffer_guest_import(src.total_len, gather_role);
+                bound
+            } else if let Some((bound, pending)) =
                 unsafe { gather_guest_buffer_window(ctx, pools, counters, src, usage)? }
             {
                 // The copies read guest RAM when the CB executes, exactly as a
@@ -778,6 +789,45 @@ unsafe fn stage_buffer_content(
         pools.note_cb_bind_owes_gather(key);
     }
     Ok(bound)
+}
+
+/// Bind a retained guest buffer allocation directly when it is one Vulkan
+/// buffer and its decoded offset satisfies every consumer's alignment.
+///
+/// # Safety
+///
+/// `ctx` must own the device `pools` holds every live import against.
+unsafe fn import_guest_buffer_window(
+    ctx: &super::context::DeviceContext,
+    pools: &mut ResourcePools,
+    src: &super::types::GuestRunSource,
+    role: BufferGatherRole,
+) -> Option<BoundBuffer> {
+    if !ctx.caps.host_pointer.is_available() {
+        return None;
+    }
+    let stretch = src.single_stretch()?;
+    let bound = match unsafe { pools.bind_guest_ram(ctx, stretch.guest) } {
+        Ok(bound) => bound,
+        Err(inner) => {
+            crate::observe::Emit::decline("vk_buffer_import", &inner).fail_once(0);
+            return None;
+        }
+    };
+    let offset = bound.offset + bound.head + stretch.skip;
+    let align = buffer_bind_offset_alignment(role, ctx.storage_buffer_offset_align);
+    if !offset.is_multiple_of(align) {
+        crate::observe::Emit::decline(
+            "vk_buffer_import",
+            &BufferImportDecline::BindOffsetAlignment { offset, align },
+        )
+        .fail_once(offset % align);
+        return None;
+    }
+    Some(BoundBuffer {
+        buffer: bound.buffer,
+        offset,
+    })
 }
 
 /// Bind a compute storage buffer directly to its retained guest allocation.
@@ -1068,6 +1118,14 @@ fn guest_target_load(seed: Option<&super::types::GuestTargetSeed>) -> GuestTarge
 }
 
 enum PreparedSampled {
+    Direct {
+        binding: u32,
+        array_element: u32,
+        key: super::pools::DirectSampledKey,
+        image: vk::Image,
+        view: vk::ImageView,
+        needs_transition: bool,
+    },
     Upload {
         binding: u32,
         array_element: u32,
@@ -1143,7 +1201,8 @@ enum SnapshotTiming {
 impl PreparedSampled {
     fn binding(&self) -> u32 {
         match self {
-            Self::Upload { binding, .. }
+            Self::Direct { binding, .. }
+            | Self::Upload { binding, .. }
             | Self::Cached { binding, .. }
             | Self::Resident { binding, .. }
             | Self::Feedback { binding, .. }
@@ -1154,7 +1213,8 @@ impl PreparedSampled {
 
     fn array_element(&self) -> u32 {
         match self {
-            Self::Upload { array_element, .. }
+            Self::Direct { array_element, .. }
+            | Self::Upload { array_element, .. }
             | Self::Cached { array_element, .. }
             | Self::Resident { array_element, .. }
             | Self::Feedback { array_element, .. }
@@ -1165,6 +1225,7 @@ impl PreparedSampled {
 
     fn view(&self) -> vk::ImageView {
         match self {
+            Self::Direct { view, .. } => *view,
             Self::Upload { image, .. } => image.view,
             Self::Cached { image, .. } => image.view,
             Self::Resident { view, .. } => *view,
@@ -1180,6 +1241,7 @@ impl PreparedSampled {
             // reference name one image at one moment, so they are one answer.
             Self::Feedback { .. } => super::caches::color_feedback_layout(),
             Self::Resident { next_access, .. } => next_access.layout(),
+            Self::Direct { .. } => vk::ImageLayout::GENERAL,
             _ => vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         }
     }
@@ -1896,7 +1958,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 }
             }
             SampledSource::Bytes(_) => {}
-            SampledSource::GuestRuns(src, _) => {
+            SampledSource::GuestRuns(src, _, _) => {
                 // A cube's face ordering is not carried by this source. Arrays
                 // and volumes are ordinary consecutive image planes and the
                 // copy below consumes all of them.
@@ -3885,7 +3947,32 @@ pub(crate) unsafe fn execute_draw_inner(
                     .sampled_gpu_binds
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            SampledSource::GuestRuns(src, vouch) => {
+            SampledSource::GuestRuns(src, vouch, direct) => {
+                if let Some(direct) = direct {
+                    if let Some(bound) = unsafe {
+                        pools.acquire_direct_sampled(
+                            ctx,
+                            direct,
+                            SampledKey::of(resource),
+                            resource.resource_lifetime.as_ref(),
+                            counters,
+                        )
+                    } {
+                        pools.note_guest_read_recorded();
+                        counters
+                            .sampled_gpu_binds
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        sampled.push(PreparedSampled::Direct {
+                            binding: resource.binding,
+                            array_element: resource.array_element,
+                            key: bound.key,
+                            image: bound.image,
+                            view: bound.view,
+                            needs_transition: bound.needs_transition,
+                        });
+                        continue;
+                    }
+                }
                 // A copy-backed producer vouches for its identity only when
                 // both halves of the guest-write witness say the window's bytes cannot have
                 // moved since the gather that filled the retained image: no
@@ -4515,6 +4602,41 @@ pub(crate) unsafe fn execute_draw_inner(
             &[],
             &barrier,
         );
+    }
+
+    // A new direct guest image starts PREINITIALIZED because its texels were
+    // written through the imported host allocation. Transition it once to
+    // GENERAL, the persistent layout used by every descriptor over that live
+    // resource. Subsequent binds in this command buffer observe the earlier
+    // barrier in queue order; submission publishes the layout to later CBs.
+    for direct in &sampled {
+        let PreparedSampled::Direct {
+            key,
+            image,
+            needs_transition: true,
+            ..
+        } = direct
+        else {
+            continue;
+        };
+        unsafe { outside_pass.before_record(PassObstacle::ResidentLayout, pools, &ctx.device, cb) };
+        let barrier = [vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::HOST_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .old_layout(vk::ImageLayout::PREINITIALIZED)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .image(*image)
+            .subresource_range(super::color_subresource_range())];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::HOST,
+            vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &barrier,
+        );
+        pools.note_direct_sampled_transition_recorded(*key);
     }
 
     // CPU-origin sampled uploads.
@@ -5426,9 +5548,10 @@ pub(crate) unsafe fn execute_draw_inner(
         // copy this submission recorded. A deferred draw is sealed by
         // `batch_flush` instead, on the same slot.
         unsafe { pools.gpu_span_seal_current(ctx, cb) };
-        ctx.device
-            .end_command_buffer(cb)
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExecEndCb, e)))?;
+        if let Err(e) = ctx.device.end_command_buffer(cb) {
+            pools.discard_direct_sampled(&ctx.device);
+            return Err(DrawError::VkCall(VkCall::new(VkOp::ExecEndCb, e)));
+        }
     }
 
     if force_loss {
@@ -5439,6 +5562,7 @@ pub(crate) unsafe fn execute_draw_inner(
         pools.recycle_staging();
         pools.recycle_readback();
         pools.recycle_sampled();
+        pools.discard_direct_sampled(&ctx.device);
         return Err(DrawError::DeviceLost(DeviceLostDecline::ForcedDraw));
     }
 
@@ -5447,12 +5571,16 @@ pub(crate) unsafe fn execute_draw_inner(
         match ctx.submit_guest_work(&cbs, fence) {
             Ok(timeline) => timeline,
             Err(e) if e == vk::Result::ERROR_DEVICE_LOST => {
+                pools.discard_direct_sampled(&ctx.device);
                 return Err(DrawError::DeviceLost(DeviceLostDecline::Driver {
                     op: DeviceLostOp::DrawSubmit,
                     result: e,
                 }));
             }
-            Err(e) => return Err(DrawError::VkCall(VkCall::new(VkOp::ExecSubmit, e))),
+            Err(e) => {
+                pools.discard_direct_sampled(&ctx.device);
+                return Err(DrawError::VkCall(VkCall::new(VkOp::ExecSubmit, e)));
+            }
         }
     } else {
         None
@@ -6673,7 +6801,7 @@ mod tests {
             .role(keys[3])
             .expect("the index buffer was classified");
         assert!(index.includes_index());
-        assert!(index.index);
+        assert_eq!(index.index_alignment, Some(2));
         // The table answers only about this draw's binds. An unclassified key
         // must be `None` and not the role of whichever entry a scan happened to
         // stop on — the three call sites `expect()` on exactly this.
@@ -6712,22 +6840,46 @@ mod tests {
     }
 
     #[test]
-    fn every_guest_draw_buffer_uses_one_engine_owned_route() {
+    fn buffer_roles_preserve_every_consumers_alignment() {
         assert!(!BufferGatherRole::VERTEX.includes_index());
         assert!(BufferGatherRole::STORAGE.is_storage_only());
         let index = BufferGatherRole {
             vertex: false,
             storage: false,
-            index: true,
+            index_alignment: Some(2),
         };
         assert!(index.includes_index());
         let shared = BufferGatherRole {
             vertex: true,
             storage: true,
-            index: true,
+            index_alignment: Some(4),
         };
         assert!(shared.is_shared());
         assert!(!shared.is_storage_only());
+    }
+
+    /// A direct bind applies only the alignment required by its actual Vulkan
+    /// consumers. Vertex buffers have no extra offset alignment; storage and
+    /// index consumers keep their independently queried/decoded requirements.
+    #[test]
+    fn direct_import_alignment_follows_the_actual_consumer() {
+        assert_eq!(buffer_bind_offset_alignment(BufferGatherRole::VERTEX, 4), 1);
+        assert_eq!(
+            buffer_bind_offset_alignment(BufferGatherRole::STORAGE, 4),
+            4
+        );
+        let index = BufferGatherRole {
+            vertex: false,
+            storage: false,
+            index_alignment: Some(2),
+        };
+        assert_eq!(buffer_bind_offset_alignment(index, 4), 2);
+        let shared = BufferGatherRole {
+            vertex: true,
+            storage: true,
+            index_alignment: Some(2),
+        };
+        assert_eq!(buffer_bind_offset_alignment(shared, 4), 4);
     }
 
     /// The two re-basings a gather region does, at the values that make them
@@ -6929,6 +7081,7 @@ mod tests {
                     // No witness ran for a synthetic source, so nothing vouches:
                     // the gather is the only disposition this fixture can take.
                     crate::runtime::gather_witness::GatherVouch::Fresh,
+                    None,
                 ),
                 byte_origin: Default::default(),
                 format: crate::backend::vulkan::translate::pixel::vk_texel_layout(
@@ -7368,7 +7521,7 @@ mod tests {
         req.sampled_images[0].layers = 3;
         assert!(validate_v1(&req).is_ok());
 
-        let SampledSource::GuestRuns(source, _) = &mut req.sampled_images[0].source else {
+        let SampledSource::GuestRuns(source, _, _) = &mut req.sampled_images[0].source else {
             panic!("the fixture is guest-backed")
         };
         source.total_len -= 1;
@@ -7392,7 +7545,7 @@ mod tests {
     fn sampled_subrange_validates_inside_its_resource_owned_runs() {
         let mut req = guest_run_req(4, 4, 4 * 4 * 4, 0);
         {
-            let SampledSource::GuestRuns(source, _) = &mut req.sampled_images[0].source else {
+            let SampledSource::GuestRuns(source, _, _) = &mut req.sampled_images[0].source else {
                 panic!("the fixture is guest-backed")
             };
             source.source_offset = 32;
@@ -7404,7 +7557,7 @@ mod tests {
         assert!(validate_v1(&req).is_ok());
 
         {
-            let SampledSource::GuestRuns(source, _) = &mut req.sampled_images[0].source else {
+            let SampledSource::GuestRuns(source, _, _) = &mut req.sampled_images[0].source else {
                 panic!("the fixture is guest-backed")
             };
             source.runs = std::sync::Arc::new(vec![GuestRun {

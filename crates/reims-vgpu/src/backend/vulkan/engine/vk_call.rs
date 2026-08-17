@@ -245,6 +245,12 @@ pub enum VkOp {
     PoolsBindSampled,
     /// `vkCreateImageView` for a sampled image.
     PoolsCreateSampledView,
+    /// `vkCreateImage` for a linear image alias over guest memory.
+    PoolsCreateDirectSampledImage,
+    /// `vkBindImageMemory` aliasing an imported guest allocation.
+    PoolsBindDirectSampled,
+    /// `vkCreateImageView` for a direct guest image.
+    PoolsCreateDirectSampledView,
     /// `vkCreateImage` for a compute storage image.
     PoolsCreateStorageImage,
     /// `vkAllocateMemory` for a storage image.
@@ -461,6 +467,9 @@ impl Decline for VkCall {
             VkOp::PoolsCreateSampledImage => "vk_pools_create_sampled_image",
             VkOp::PoolsBindSampled => "vk_pools_bind_sampled",
             VkOp::PoolsCreateSampledView => "vk_pools_create_sampled_view",
+            VkOp::PoolsCreateDirectSampledImage => "vk_pools_create_direct_sampled_image",
+            VkOp::PoolsBindDirectSampled => "vk_pools_bind_direct_sampled",
+            VkOp::PoolsCreateDirectSampledView => "vk_pools_create_direct_sampled_view",
             VkOp::PoolsCreateStorageImage => "vk_pools_create_storage_image",
             VkOp::PoolsAllocStorageImage => "vk_pools_alloc_storage_image",
             VkOp::PoolsBindStorageImage => "vk_pools_bind_storage_image",
@@ -628,6 +637,9 @@ mod tests {
         VkOp::PoolsCreateSampledImage,
         VkOp::PoolsBindSampled,
         VkOp::PoolsCreateSampledView,
+        VkOp::PoolsCreateDirectSampledImage,
+        VkOp::PoolsBindDirectSampled,
+        VkOp::PoolsCreateDirectSampledView,
         VkOp::PoolsCreateStorageImage,
         VkOp::PoolsAllocStorageImage,
         VkOp::PoolsBindStorageImage,

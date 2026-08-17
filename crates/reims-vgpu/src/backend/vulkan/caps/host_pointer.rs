@@ -29,9 +29,10 @@
 //! The extension is never a requirement. A host that does not advertise it
 //! reaches [`HostPointerImport::NoHostPointerExtension`], asks for nothing at
 //! `vkCreateDevice`, and runs every guest-memory rail through the copying path.
-//! Those rails are not a legacy arm — they are the only arm on such a host, and
-//! they are the arm a discrete GPU takes regardless, because there the copy into
-//! VRAM is the point.
+//! Those rails are not a legacy arm — they are the only arm on such a host.
+//! A capable discrete device may either consume an imported retained buffer
+//! directly or use it as the source of an explicit copy into device-local
+//! memory; that decision belongs to the resource consumer, not to topology.
 //!
 //! [`crate::env::GUEST_IMPORT`] adds one more rung: an operator can take a host
 //! that *is* capable down to [`HostPointerImport::DisabledByEnv`]. That is the
@@ -58,12 +59,13 @@ use ash::vk;
 /// * `VERTEX_BUFFER` / `INDEX_BUFFER` / `STORAGE_BUFFER` / `UNIFORM_BUFFER` —
 ///   guest pages bound directly to a draw, with no copy at all.
 ///
-/// **Buffers only, deliberately.** An image has implementation-defined tiling,
-/// and an optimally-tiled image backed by linear guest bytes is not a thing
-/// this device may assume works on an unknown driver. A buffer's memory layout
-/// is the bytes themselves on every implementation, which is why it is the
-/// universal primitive here and why guest pages reach an image through a
-/// `vkCmdCopyBufferToImage` from an imported buffer rather than by being one.
+/// **This query is for the allocation's universal buffer view.** An optimally
+/// tiled image backed by linear guest bytes is not a representation Vulkan
+/// offers.  A decoded linear texture may additionally alias this same imported
+/// memory through a `LINEAR` image, but only after the image-side external
+/// format query and the created image's pitch, offset, memory-type and bounds
+/// all agree; see [`super::linear_sampled`].  Every other image use reaches the
+/// bytes through this buffer and an explicit copy.
 pub const GUEST_IMPORT_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
     vk::BufferUsageFlags::TRANSFER_SRC.as_raw()
         | vk::BufferUsageFlags::TRANSFER_DST.as_raw()

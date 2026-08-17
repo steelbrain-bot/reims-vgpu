@@ -89,37 +89,6 @@ pub struct ReimsVgpuHostOps {
     /// imports do read it, because retaining such an import requires the
     /// `map_pages` alias itself to outlive submitted GPU work.
     pub map_pages_stable: c_int,
-    /// Register `count` page-aligned GPAs as one guest-write-tracked set and
-    /// return a non-zero opaque token, or 0 when the host has no dirty bitmap.
-    /// Mutates QEMU MemoryRegion logging state, so the shim may only do the
-    /// enabling part with the BQL held — see the C side for how it defers.
-    pub track_guest_writes: Option<
-        unsafe extern "C" fn(
-            ctx: *mut c_void,
-            gpas: *const u64,
-            count: usize,
-            page_size: usize,
-        ) -> u64,
-    >,
-    /// Release a token from `track_guest_writes`.
-    pub untrack_guest_writes: Option<unsafe extern "C" fn(ctx: *mut c_void, token: u64)>,
-    /// Monotonic count of host observations that some page of the token's set
-    /// was written; 0 for an unknown or not-yet-armed token. Safe from any
-    /// thread.
-    pub guest_write_gen: Option<unsafe extern "C" fn(ctx: *mut c_void, token: u64) -> u64>,
-    /// Page-aligned GPAs of the token's set written since `since_gen`, into
-    /// `out`, returning how many — or -1 for every case where the answer is not
-    /// knowable and the caller must assume the whole set was written. Safe from
-    /// any thread.
-    pub guest_written_pages: Option<
-        unsafe extern "C" fn(
-            ctx: *mut c_void,
-            token: u64,
-            since_gen: u64,
-            out: *mut u64,
-            max: usize,
-        ) -> i64,
-    >,
 }
 
 // SAFETY: QEMU keeps the table valid for the device lifetime; callbacks only
@@ -151,10 +120,6 @@ impl ReimsVgpuHostOps {
             map_pages: None,
             unmap_pages: None,
             map_pages_stable: 0,
-            track_guest_writes: None,
-            untrack_guest_writes: None,
-            guest_write_gen: None,
-            guest_written_pages: None,
             is_ram_gpa: None,
             guest_ram_regions: None,
             notify_actions: None,
@@ -617,69 +582,6 @@ impl HostOps for QemuHost<'_> {
             // Older/missing table: do not invent a reject (map_pages still RAM-checks).
             None => true,
         }
-    }
-
-    fn track_guest_writes(&mut self, gpas: &[u64], page_size: usize) -> Option<u64> {
-        if gpas.is_empty() || page_size == 0 {
-            return None;
-        }
-        let f = self.ops.track_guest_writes?;
-        // SAFETY: QEMU owns ctx; the slice outlives the call and the shim
-        // copies the page list before returning.
-        let token = unsafe { f(self.ops.ctx, gpas.as_ptr(), gpas.len(), page_size) };
-        // A shim that cannot track answers 0 rather than failing. Not a
-        // decline: "this host has no dirty bitmap" is a capability, and every
-        // consumer already has to handle it on the fixture hosts.
-        (token != 0).then_some(token)
-    }
-
-    fn untrack_guest_writes(&mut self, token: u64) {
-        if token == 0 {
-            return;
-        }
-        if let Some(f) = self.ops.untrack_guest_writes {
-            // SAFETY: token came from a successful track_guest_writes.
-            unsafe { f(self.ops.ctx, token) }
-        }
-    }
-
-    fn guest_write_gen(&self, token: u64) -> Option<u64> {
-        if token == 0 {
-            return None;
-        }
-        let f = self.ops.guest_write_gen?;
-        // SAFETY: QEMU owns ctx; the shim answers from its own lock.
-        let gen_ = unsafe { f(self.ops.ctx, token) };
-        // 0 is the shim's "unknown token, or not yet armed" answer. Reading it
-        // as a generation would let two pre-arm checks agree and vouch for a
-        // resident nothing has ever validated.
-        (gen_ != 0).then_some(gen_)
-    }
-
-    fn guest_written_pages(&self, token: u64, since_gen: u64) -> Option<Vec<u64>> {
-        if token == 0 || since_gen == 0 {
-            return None;
-        }
-        let f = self.ops.guest_written_pages?;
-        // The shim refuses rather than truncating, so the buffer has to be able
-        // to hold a whole surface's page list. A display-sized BGRA8 surface is
-        // ~2 000 x86 pages; the cap is a few times that so a larger one still
-        // gets an exact answer, and a set beyond it declines into "assume the
-        // whole surface was written" rather than into a short list.
-        const MAX_PAGES: usize = 16 * 1024;
-        let mut out = vec![0u64; MAX_PAGES];
-        // SAFETY: QEMU owns ctx; `out` is writable for MAX_PAGES u64s for the
-        // duration of the call, and the shim writes at most `max` of them.
-        let n = unsafe { f(self.ops.ctx, token, since_gen, out.as_mut_ptr(), MAX_PAGES) };
-        if n < 0 {
-            return None;
-        }
-        let n = usize::try_from(n).ok()?;
-        if n > MAX_PAGES {
-            return None;
-        }
-        out.truncate(n);
-        Some(out)
     }
 }
 
