@@ -561,6 +561,56 @@ pub fn color_attachment(
     Ok((f.vk, None))
 }
 
+/// The host texel a guest format's own bytes already are, and how wide it is —
+/// or `None` for a format whose bytes no host texel reproduces verbatim.
+///
+/// This is the question a **byte copy** asks. A copy converts nothing, so the
+/// only thing that licenses one is that the bytes the guest declared and the
+/// bytes the image holds are the same texel; a rail that can answer this can
+/// hand the guest its pages directly, and one that cannot must read back and
+/// convert.
+///
+/// # Why this is not [`crate::contract::pixel_format::store_texel_order`]
+///
+/// Both guest-page writeback licences used to ask that function, and it is the
+/// **render Store's** table: its own doc states the membership rule as "a guest
+/// *render target* can declare it", and
+/// `a_byte_copy_destination_is_the_texel_every_other_table_agrees_it_is` holds
+/// it to that by requiring every admitted format to have a `render_target_bpp`
+/// and a `sampled_class`. That is correct for a Store and wrong for a compute
+/// storage image, which the guest never renders into and the sampler never
+/// reads — so asking it was a render-target question about a destination that is
+/// not one, and the answer was `FormatNeedsConversion` for every 32-bit-per-
+/// channel plane. On a driven macos-13 boot that was all five remaining compute
+/// readbacks: four linear at `MTLPixelFormatRGBA32Float` and one type-11 at
+/// `MTLPixelFormatRGBA32Uint` whose source image held `R32G32B32A32_UINT`, the
+/// very texel the guest had declared.
+///
+/// Widening the Store's table instead would have obliged this device to declare
+/// those formats renderable and samplable, which the guest never asked for and
+/// the contract does not say.
+///
+/// # Why this is a union and not a third table
+///
+/// Neither half is written here. A render target's answer is
+/// `store_texel_order` composed with [`vk_texel_layout`]; a storage image's is
+/// `storage_selector` composed with [`storage_image_from_selector`] and
+/// `StorageImageFormat::vk_format`. Both already existed, both are already the
+/// authority for their own rail, and a format either admits is a format that
+/// rail creates images at — so nothing new is claimed about any format, and a
+/// new arm in either table reaches this without being added twice.
+///
+/// The order does not matter, and `the_two_verbatim_texel_tables_never_disagree`
+/// is why: where both answer they must name the same format and the same width,
+/// which is the only way this can be a union rather than a precedence rule.
+pub fn verbatim_texel(mtl: u16) -> Option<(vk::Format, u32)> {
+    if let Some(layout) = pixel_format::store_texel_order(mtl) {
+        return Some((vk_texel_layout(layout), layout.bytes_per_texel()));
+    }
+    let storage = storage_image_from_selector(pixel_format::storage_selector(mtl)?);
+    Some((storage.vk_format(), storage.bytes_per_texel() as u32))
+}
+
 /// The engine's storage-image format for a contract [`StorageImageSelector`].
 ///
 /// The selector is the compute rail's own narrowing of `MTLPixelFormat`, so
@@ -899,6 +949,76 @@ mod tests {
             assert_eq!(storage_format(f), f, "{layout:?}");
             assert_eq!(has_bgra_order(f), f == SCANOUT_FORMAT, "{layout:?}");
         }
+    }
+
+    /// [`verbatim_texel`] is a union of two tables, and a union is only well
+    /// defined where the overlap agrees. Every `MTLPixelFormat` both the render
+    /// Store's table and the compute rail's selector answer for must name the
+    /// same `vk::Format` and the same texel width — otherwise the function would
+    /// be a precedence rule dressed as a union, and which answer a guest plane
+    /// got would depend on the order of two `if let`s rather than on the format
+    /// it declared.
+    ///
+    /// The sweep is the whole `u16` space because neither table publishes its
+    /// membership as a list, and both are cheap total functions.
+    #[test]
+    fn the_two_verbatim_texel_tables_never_disagree() {
+        let mut overlap = 0usize;
+        for mtl in 0..=u16::MAX {
+            let (Some(layout), Some(selector)) =
+                (p::store_texel_order(mtl), p::storage_selector(mtl))
+            else {
+                continue;
+            };
+            overlap += 1;
+            let storage = storage_image_from_selector(selector);
+            assert_eq!(
+                vk_texel_layout(layout),
+                storage.vk_format(),
+                "format {mtl:#x} is two different host texels"
+            );
+            assert_eq!(
+                layout.bytes_per_texel(),
+                storage.bytes_per_texel() as u32,
+                "format {mtl:#x} is two different widths"
+            );
+            // And whichever half answered, the union answers the same thing.
+            assert_eq!(
+                verbatim_texel(mtl),
+                Some((storage.vk_format(), storage.bytes_per_texel() as u32)),
+                "format {mtl:#x}"
+            );
+        }
+        // A zero here would make the assertions above vacuous, and the tables do
+        // overlap: an 8-bit-per-channel plane is a legal render target and a
+        // legal storage image both.
+        assert!(overlap > 0, "the two tables share no format at all");
+    }
+
+    /// The two formats that were the entire remaining compute readback traffic
+    /// on a driven macos-13 boot are byte-copy destinations, and they are so for
+    /// the reason the contract gives rather than because they were listed here:
+    /// the compute rail creates storage images at exactly these texels, so an
+    /// image→buffer copy of one lands the bytes the guest declared.
+    ///
+    /// Neither is in the render Store's table, and neither should be — the guest
+    /// does not render into them and does not sample them.
+    #[test]
+    fn a_thirty_two_bit_per_channel_storage_plane_is_a_byte_copy_destination() {
+        assert_eq!(
+            verbatim_texel(p::MTL_FORMAT_RGBA32_UINT),
+            Some((vk::Format::R32G32B32A32_UINT, 16))
+        );
+        assert_eq!(
+            verbatim_texel(p::MTL_FORMAT_RGBA32_FLOAT),
+            Some((vk::Format::R32G32B32A32_SFLOAT, 16))
+        );
+        // And the union did not quietly widen the render rail's own table to get
+        // there: the Store still refuses both, which is what keeps
+        // `a_byte_copy_destination_is_the_texel_every_other_table_agrees_it_is`
+        // an honest statement about render targets.
+        assert!(p::store_texel_order(p::MTL_FORMAT_RGBA32_UINT).is_none());
+        assert!(p::store_texel_order(p::MTL_FORMAT_RGBA32_FLOAT).is_none());
     }
 
     /// A sampled bind can only ever spell a stored-byte format, so every

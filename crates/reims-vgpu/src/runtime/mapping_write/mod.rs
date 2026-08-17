@@ -1102,14 +1102,20 @@ pub(crate) fn licence_type11_surface<M: HostMemory + HostOps>(
         return Err(GpuWritebackDecline::NotWritable);
     }
     // An image→buffer copy moves bytes and converts nothing, so this rail can
-    // only serve a mapping whose declared format has a linear Vulkan texel to
-    // name. A compressed or planar declaration has none, and the copying rail's
-    // row converter is the only thing that can land it.
+    // only serve a window whose declared format is a host texel verbatim. A
+    // compressed or planar declaration is not, and the copying rail's row
+    // converter is the only thing that can land it.
     //
-    let Some(layout) = pixel_format::store_texel_order(format) else {
+    // Asked of every rail that creates images rather than of the render Store's
+    // table alone: this licence serves a compute storage output as well as a
+    // Store, and a storage image is a thing the guest neither renders into nor
+    // samples. See
+    // [`crate::backend::vulkan::translate::pixel::verbatim_texel`].
+    let Some((dst_format, texel)) =
+        crate::backend::vulkan::translate::pixel::verbatim_texel(format)
+    else {
         return Err(GpuWritebackDecline::FormatNeedsConversion { format });
     };
-    let dst_format = crate::backend::vulkan::translate::pixel::vk_texel_layout(layout);
     // And that the source holds exactly it. See this function's doc for why the
     // render caller's own downstream check stays where it is: the two compare
     // different pairs, and this is the only one the compute rail has.
@@ -1119,7 +1125,6 @@ pub(crate) fn licence_type11_surface<M: HostMemory + HostOps>(
             want: dst_format,
         });
     }
-    let texel = layout.bytes_per_texel();
     let shared_backing = if host.map_pages_stable() {
         mapper::ensure_contig_view(state, host, mapping_id).map(|(ptr, len)| {
             crate::backend::vulkan::engine::GuestTargetBacking {

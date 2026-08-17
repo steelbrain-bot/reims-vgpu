@@ -1086,22 +1086,23 @@ mod guest_backed_finish_tests {
 #[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GvaWritebackDecline {
-    /// The guest declared a destination format that [`crate::contract::pixel_format::store_texel_order`] does
-    /// not admit as a byte-copy destination, so no image→buffer copy can produce
-    /// it and `convert_rgba8_to_row` is the only route.
+    /// The guest declared a destination format that no host texel reproduces
+    /// verbatim, so no image→buffer copy can produce it and `convert_rgba8_to_row`
+    /// is the only route.
     ///
     /// This used to say "not four bytes of colour", and to name `RGBA16_FLOAT`
     /// as landing here *always*. Both went stale together: a resident now
     /// carries the format the guest declared rather than always being eight bits
     /// per channel, so a half-float destination can be the same bytes as the
-    /// image, and `RGBA16_FLOAT` is an admitted eight-byte member of that table.
-    /// The rule was never a width — it is whether the destination's texel and
-    /// the resident's are one layout, which is [`crate::contract::pixel_format::store_texel_order`]'s question
+    /// image. The rule was never a width — it is whether the destination's texel
+    /// and the resident's are one layout, which is
+    /// [`crate::backend::vulkan::translate::pixel::verbatim_texel`]'s question
     /// and not this doc's to restate.
     ///
     /// `R16_FLOAT` is what lands here now, twice on a driven macos-26 boot: it
     /// is renderable but deliberately not a byte-copy destination, for the
-    /// reason `store_texel_order`'s own doc gives for `RG16_FLOAT`.
+    /// reason `store_texel_order`'s own doc gives for `RG16_FLOAT`, and no
+    /// compute selector names it either.
     FormatNeedsConversion { format: u16 },
     /// The resident's format is not the format the destination stores, so a
     /// byte copy would land the wrong texel. Distinct from the engine's own
@@ -1468,15 +1469,23 @@ impl GvaPlaneDestination {
     /// [`copy_resident_into_gva_plane`] may ask again for the copy it issues,
     /// without either restating the rule.
     pub(crate) fn geometry(&self) -> Result<GvaPlaneGeometry, GvaWritebackDecline> {
-        // The destination's texel layout, and the whole reason this rail can
-        // exist at all: a copy converts nothing, so the guest must already read
-        // these bytes exactly as the resident holds them.
-        let Some(order) = crate::contract::pixel_format::store_texel_order(self.format) else {
+        // The destination's texel, and the whole reason this rail can exist at
+        // all: a copy converts nothing, so the guest must already read these
+        // bytes exactly as the resident holds them.
+        //
+        // Asked of every rail that creates images, not of the render Store's
+        // table alone — this destination serves a compute storage output as
+        // readily as a Store, and a storage image is a thing the guest neither
+        // renders into nor samples. See
+        // [`crate::backend::vulkan::translate::pixel::verbatim_texel`].
+        let Some((want, bpt)) =
+            crate::backend::vulkan::translate::pixel::verbatim_texel(self.format)
+        else {
             return Err(GvaWritebackDecline::FormatNeedsConversion {
                 format: self.format,
             });
         };
-        let bpt = u64::from(order.bytes_per_texel());
+        let bpt = u64::from(bpt);
         let row_stride = u64::from(self.row_stride);
         if row_stride == 0
             || !row_stride.is_multiple_of(bpt)
@@ -1487,7 +1496,7 @@ impl GvaPlaneDestination {
             });
         }
         Ok(GvaPlaneGeometry {
-            want: crate::backend::vulkan::translate::pixel::vk_texel_layout(order),
+            want,
             bpt,
             row_stride,
             extent: u64::from(self.height.saturating_sub(1)) * row_stride
