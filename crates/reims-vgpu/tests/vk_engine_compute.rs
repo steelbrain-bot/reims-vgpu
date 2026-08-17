@@ -472,6 +472,7 @@ fn compute_storage_image_rgba8unorm_known_result() {
         sampled_images: vec![],
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
+            destination: Default::default(),
             binding: 0,
             array_element: 0,
             descriptor_count: 1,
@@ -492,7 +493,7 @@ fn compute_storage_image_rgba8unorm_known_result() {
     };
     assert_eq!(out.images.len(), 1);
     // Every texel should be (255,0,0,255) approximately for unorm write of 1,0,0,1
-    for p in out.images[0].chunks_exact(4) {
+    for p in out.images[0].bytes().expect("a Host destination reads bytes back").chunks_exact(4) {
         assert!(
             p[0] >= 254 && p[1] == 0 && p[2] == 0 && p[3] >= 254,
             "unexpected texel {p:?}"
@@ -504,7 +505,7 @@ fn compute_storage_image_rgba8unorm_known_result() {
     assert_eq!(snap.compute_sampled_uploads, 0);
 
     engine::reset_draw_counters();
-    let resident_seed = out.images[0].clone();
+    let resident_seed = out.images[0].bytes().expect("a Host destination reads bytes back").to_vec();
     let hit_req = ComputeRequest {
         spirv: words.clone(),
         entry: "main".into(),
@@ -513,6 +514,7 @@ fn compute_storage_image_rgba8unorm_known_result() {
         sampled_images: vec![],
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
+            destination: Default::default(),
             binding: 0,
             array_element: 0,
             descriptor_count: 1,
@@ -529,7 +531,7 @@ fn compute_storage_image_rgba8unorm_known_result() {
         }],
     };
     let hit = engine::execute_compute_request(&hit_req).expect("resident compute hit");
-    assert_eq!(hit.images[0], resident_seed);
+    assert_eq!(hit.images[0].bytes().expect("a Host destination reads bytes back"), &resident_seed[..]);
     let hit_counters = engine::counter_snapshot();
     assert_eq!(hit_counters.compute_storage_seed_uploads, 0);
     assert_eq!(hit_counters.compute_storage_seed_upload_bytes, 0);
@@ -546,6 +548,7 @@ fn compute_storage_image_rgba8unorm_known_result() {
         sampled_images: vec![],
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
+            destination: Default::default(),
             binding: 0,
             array_element: 0,
             descriptor_count: 1,
@@ -562,8 +565,8 @@ fn compute_storage_image_rgba8unorm_known_result() {
         }],
     };
     let mismatch = engine::execute_compute_request(&mismatch_req).expect("generation mismatch");
-    assert!(mismatch.images[0][0] >= 254 && mismatch.images[0][3] >= 254);
-    assert!(mismatch.images[0][4..].iter().all(|byte| *byte == 0));
+    assert!(mismatch.images[0].bytes().expect("a Host destination reads bytes back")[0] >= 254 && mismatch.images[0].bytes().expect("a Host destination reads bytes back")[3] >= 254);
+    assert!(mismatch.images[0].bytes().expect("a Host destination reads bytes back")[4..].iter().all(|byte| *byte == 0));
     let mismatch_counters = engine::counter_snapshot();
     assert_eq!(mismatch_counters.compute_storage_seed_uploads, 1);
     assert_eq!(
@@ -625,6 +628,7 @@ fn every_admitted_compute_storage_resident_survives_past_the_retired_slot_cap() 
         sampled_images: vec![],
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
+            destination: Default::default(),
             binding: 0,
             array_element: 0,
             descriptor_count: 1,
@@ -715,6 +719,7 @@ fn compute_storage_image_bgra8unorm_is_not_channel_swapped() {
         sampled_images: vec![],
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
+            destination: Default::default(),
             binding: 0,
             array_element: 0,
             descriptor_count: 1,
@@ -736,7 +741,7 @@ fn compute_storage_image_bgra8unorm_is_not_channel_swapped() {
     assert_eq!(out.images.len(), 1);
     // Logical red stored into BGRA memory: B=0, G=0, R=255, A=255. A swap
     // (Rgba8Unorm view) would instead give byte0=255 — the bug.
-    for p in out.images[0].chunks_exact(4) {
+    for p in out.images[0].bytes().expect("a Host destination reads bytes back").chunks_exact(4) {
         assert!(
             p[0] == 0 && p[1] == 0 && p[2] >= 254 && p[3] >= 254,
             "BGRA channel order wrong (R/B swap?): texel {p:?}"
@@ -779,6 +784,7 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
             sampled_images: vec![],
             samplers: vec![],
             storage_images: vec![ComputeStorageImageResource {
+            destination: Default::default(),
                 binding: 0,
                 array_element: 0,
                 descriptor_count: 1,
@@ -799,14 +805,14 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
     let Some(fill) = engine_or_skip("seed_skip_fill", &make([w, h, 1], 1, 2, false)) else {
         return;
     };
-    assert!(fill.images[0].chunks_exact(4).all(|p| p[0] >= 254));
+    assert!(fill.images[0].bytes().expect("a Host destination reads bytes back").chunks_exact(4).all(|p| p[0] >= 254));
 
     // Skip dispatch: one texel, zero-placeholder bytes, matching generation.
     // Untouched texels staying red prove the placeholder was never seeded.
     engine::reset_draw_counters();
     let skip = engine::execute_compute_request(&make([1, 1, 1], 2, 3, true))
         .expect("seed-skip resident hit");
-    for p in skip.images[0].chunks_exact(4) {
+    for p in skip.images[0].bytes().expect("a Host destination reads bytes back").chunks_exact(4) {
         assert!(
             p[0] >= 254 && p[1] == 0 && p[2] == 0 && p[3] >= 254,
             "placeholder leaked into resident: {p:?}"
@@ -870,6 +876,7 @@ fn compute_sampled_resident_copy_and_lost_resident() {
         sampled_images: vec![],
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
+            destination: Default::default(),
             binding: 0,
             array_element: 0,
             descriptor_count: 1,
@@ -888,7 +895,7 @@ fn compute_sampled_resident_copy_and_lost_resident() {
     let Some(fill) = engine_or_skip("resident_sample_fill", &fill_req) else {
         return;
     };
-    assert!(fill.images[0].chunks_exact(4).all(|p| p[0] >= 254));
+    assert!(fill.images[0].bytes().expect("a Host destination reads bytes back").chunks_exact(4).all(|p| p[0] >= 254));
 
     let make_fetch = |generation: u32| ComputeRequest {
         spirv: fetch_words.clone(),
@@ -1193,6 +1200,7 @@ fn compute_storage_image_r16float_if_supported() {
         sampled_images: vec![],
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
+            destination: Default::default(),
             binding: 0,
             array_element: 0,
             descriptor_count: 1,
@@ -1207,7 +1215,7 @@ fn compute_storage_image_r16float_if_supported() {
     match engine::execute_compute_request(&req) {
         Ok(out) => {
             assert_eq!(out.images.len(), 1);
-            assert_eq!(out.images[0].len(), 8);
+            assert_eq!(out.images[0].bytes().expect("a Host destination reads bytes back").len(), 8);
         }
         Err(e) => {
             let s = e.to_string();

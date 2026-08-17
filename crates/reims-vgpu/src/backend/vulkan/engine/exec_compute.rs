@@ -1080,7 +1080,7 @@ pub(crate) unsafe fn execute_compute_inner(
             VkOp::ComputeExecInvalidateImageReadback,
         )?;
         counters.note_readback(prepared.len as u64, super::counters::ReadbackSource::ComputeImage);
-        images.push(out);
+        images.push(super::types::ComputeImageResult::Bytes(out));
     }
 
     // Cleanup was parked on the ring slot right after submit; nothing left
@@ -1303,6 +1303,7 @@ mod tests {
             }],
             samplers: vec![SamplerResource::normalized_default(64)],
             storage_images: vec![ComputeStorageImageResource {
+                destination: Default::default(),
                 binding: 34,
                 array_element: 0,
                 descriptor_count: 1,

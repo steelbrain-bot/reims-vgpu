@@ -3494,8 +3494,8 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     cmd: &ComputeCommand,
 ) -> ComputeStatus {
     use crate::backend::vulkan::engine::{
-        self as vk_engine, ComputeBufferResource, ComputeRequest, ComputeSampledImageResource,
-        ComputeStorageImageResource, DrawError,
+        self as vk_engine, ComputeBufferResource, ComputeImageDestination, ComputeImageResult,
+        ComputeRequest, ComputeSampledImageResource, ComputeStorageImageResource, DrawError,
     };
 
     if acc.pipeline_ref == 0 {
@@ -4032,6 +4032,11 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 width: t.width,
                 height: t.height,
                 bytes: std::mem::take(&mut t.bytes),
+                // Every output still comes back through host memory. The guest
+                // window this will be written into is on `t.writeback` and has
+                // been all along; routing it is the next step, and it is gated
+                // on the host-pointer capability that `Host` does not need.
+                destination: ComputeImageDestination::Host,
                 residency: t.residency.map(|candidate| {
                     crate::backend::vulkan::engine::ComputeStorageResidency {
                         identity: candidate.key,
@@ -4255,14 +4260,26 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             return e;
         }
     }
-    for (t, bytes) in staged_tex
+    for (t, result) in staged_tex
         .iter_mut()
         .filter(|texture| texture.is_storage)
         .zip(output_images)
     {
-        t.bytes = bytes;
-        if let Err(e) = writeback_texture(state, host, task_id, t) {
-            return e;
+        match result {
+            ComputeImageResult::Bytes(bytes) => {
+                t.bytes = bytes;
+                if let Err(e) = writeback_texture(state, host, task_id, t) {
+                    return e;
+                }
+            }
+            // The engine copied straight into the guest's pages, so there is no
+            // writeback to do and no bytes to do it from. Reached only where
+            // this dispatch asked for `ComputeImageDestination::GuestPages`,
+            // which nothing builds yet.
+            ComputeImageResult::Landed { bytes } => {
+                crate::runtime::drain::note_store_route("compute_wb_landed");
+                let _ = bytes;
+            }
         }
         // The output is in the guest's pages now, so the engine's image has
         // stopped being the only copy and the reclaim paths may take it. The

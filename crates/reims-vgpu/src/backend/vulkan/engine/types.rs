@@ -1412,13 +1412,97 @@ pub struct ComputeOutput {
     /// Writable-buffer readbacks only. Read-only descriptors never cross the
     /// device→host boundary after dispatch.
     pub buffers: Vec<ComputeBufferOutput>,
-    /// Image readbacks in request order (same length as `storage_images`).
+    /// One result per requested storage image, in request order (same length as
+    /// `storage_images`).
     ///
-    /// A third case used to leave this empty too: the dispatch copied into an
-    /// imported view of the caller's guest window and `images_direct` said so,
-    /// so the caller skipped its own writeback. That window is gone, and with
-    /// it the flag — every non-deferred image now comes back through here.
-    pub images: Vec<Vec<u8>>,
+    /// Which variant comes back is decided entirely by the matching request's
+    /// [`ComputeStorageImageResource::destination`] — the engine does not choose
+    /// a rail here, it honours the one it was given, so the caller can pair
+    /// result `i` with its own destination without asking the engine what it
+    /// did.
+    pub images: Vec<ComputeImageResult>,
+}
+
+/// Where one storage image's post-dispatch pixels land.
+///
+/// The two variants are the two ways of naming the same landing site, which is
+/// why this is one field and not a `Vec<u8>` with a flag beside it: a request
+/// carrying both a host buffer and a guest window could name two destinations,
+/// and nothing downstream could say which one the guest would read.
+///
+/// This replaces a deleted `images_direct` boolean. The flag went when the
+/// deferred-flush rail was retired and the direct arm went with it; the render
+/// side got [`crate::runtime::render_writeback`] as its replacement and this
+/// rail got nothing, so every image came back through a host readback. See
+/// [`ComputeImageResult`].
+#[derive(Default)]
+pub enum ComputeImageDestination {
+    /// The engine reads the pixels back into host memory and the caller writes
+    /// guest memory itself.
+    ///
+    /// The default, and the *only* form available on a host whose
+    /// `VK_EXT_external_memory_host` capability is not
+    /// [`crate::backend::vulkan::caps::host_pointer::HostPointerImport::Supported`].
+    /// It is not a fallback bolted in front of a general path: on such a host it
+    /// is the general path, and it is what a discrete GPU takes whenever staging
+    /// is the correct answer.
+    #[default]
+    Host,
+    /// The dispatch's own image→buffer copy lands directly in these guest pages
+    /// and no pixels cross device→host.
+    ///
+    /// Carries the same [`super::GuestPageTarget`] the render rail writes through, so
+    /// the guest-window geometry has exactly one spelling in this crate.
+    GuestPages(Box<super::GuestPageTarget>),
+}
+
+impl std::fmt::Debug for ComputeImageDestination {
+    /// Names the arm and the window's size, never the window's addresses. A
+    /// [`super::GuestPageTarget`] holds live host pointers into guest RAM, and a
+    /// derived `Debug` would put them in any log line that formats a
+    /// `ComputeRequest`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Host => f.write_str("Host"),
+            Self::GuestPages(dst) => {
+                write!(f, "GuestPages({}x{}, {} runs)", dst.width, dst.height, dst.runs.len())
+            }
+        }
+    }
+}
+
+/// What one storage image's dispatch produced, paired with the destination that
+/// was asked for.
+#[derive(Debug)]
+pub enum ComputeImageResult {
+    /// Readback pixels, for [`ComputeImageDestination::Host`]. Tight rows: the
+    /// caller re-pitches them into the guest's window.
+    Bytes(Vec<u8>),
+    /// The copy into the guest's own pages is on the queue, for
+    /// [`ComputeImageDestination::GuestPages`]. There are no bytes to hand back
+    /// because none were read.
+    ///
+    /// The caller owes a settle before anything reads those pages, not a
+    /// writeback — the same debt the render rail arms through
+    /// `record_guest_write_debt`. `bytes` is what the copy will land, for the
+    /// census, and is not a length of anything the caller holds.
+    Landed { bytes: u64 },
+}
+
+impl ComputeImageResult {
+    /// The readback pixels, or `None` where the engine wrote guest pages
+    /// directly and never read any.
+    ///
+    /// `None` is not an error and not an empty frame — it means the bytes are
+    /// already where they were going. A caller that treats it as "no output"
+    /// would silently drop a landed frame, so match the variant where the two
+    /// cases need different work and use this only where they do not.
+    pub fn bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Bytes(bytes) => Some(bytes),
+            Self::Landed { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1449,7 +1533,16 @@ pub struct ComputeStorageImageResource {
     pub format: StorageImageFormat,
     pub width: u32,
     pub height: u32,
+    /// Seed content, read *into* the image before the dispatch.
+    ///
+    /// Deliberately still a host allocation, and not paired with
+    /// [`Self::destination`]. The seed direction is the GPU *reading* guest
+    /// pages, which this device refuses on its own grounds: it acks a command
+    /// before the work runs, so the guest may repaint those pages first. Only
+    /// the output direction is routed.
     pub bytes: Vec<u8>,
+    /// Where the post-dispatch pixels go. See [`ComputeImageDestination`].
+    pub destination: ComputeImageDestination,
     /// Exact type-11 resource lifetime/view contract for persistent GPU
     /// storage. `None` keeps the conservative transient upload path.
     pub residency: Option<ComputeStorageResidency>,
