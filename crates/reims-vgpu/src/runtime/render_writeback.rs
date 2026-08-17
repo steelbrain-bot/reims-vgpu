@@ -1389,13 +1389,125 @@ fn store_gva_frame_direct<M: HostMemory + HostOps>(
     texture_ref: u32,
     pages: Option<&crate::runtime::draw::StoreTargetPages>,
 ) -> Result<u64, GvaWritebackDecline> {
-    use crate::contract::pixel_format::store_texel_order;
-    // The destination's texel layout, and the whole reason this rail can exist
-    // at all: a copy converts nothing, so the guest must already read these
-    // bytes exactly as the resident holds them.
-    let Some(order) = store_texel_order(c0.format) else {
-        return Err(GvaWritebackDecline::FormatNeedsConversion { format: c0.format });
-    };
+    copy_resident_into_gva_plane(
+        state,
+        host,
+        task_id,
+        identity,
+        &GvaPlaneDestination {
+            target_gva: c0.target_gva,
+            width: c0.width,
+            height: c0.height,
+            row_stride: c0.row_stride,
+            format: c0.format,
+            texture_ref,
+        },
+        pages,
+    )
+}
+
+/// A guest-linear plane a resident's pixels may be copied into.
+///
+/// The five terms [`copy_resident_into_gva_plane`] needs and nothing else. It
+/// exists because that rail used to take a [`crate::runtime::draw::ColorRtRequest`],
+/// which describes a *render attachment* — a slot, load and store actions, a
+/// clear colour, a multisample source — and a second caller with the same
+/// destination and no render pass behind it could not honestly fill one in.
+///
+/// `texture_ref` is the resource whose host-side pixel caches this copy
+/// invalidates, and is `0` where the caller has none to name.
+#[cfg(feature = "backend-vulkan")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GvaPlaneDestination {
+    pub target_gva: u64,
+    pub width: u32,
+    pub height: u32,
+    pub row_stride: u32,
+    /// The guest's own declaration for these bytes, which is what it will read
+    /// them back as. A copy converts nothing, so this is the format the
+    /// resident must already hold.
+    pub format: u16,
+    pub texture_ref: u32,
+}
+
+/// What a [`GvaPlaneDestination`]'s own terms imply about the bytes it names.
+///
+/// `extent` is the reason this is a type rather than three lines inside the copy
+/// below. A caller has to walk the guest's page table before it can hand over a
+/// licence, and the span it walks must be the span the copy writes — a walk one
+/// row short resolves fewer pages than `ordered_complete` demands and the copy
+/// declines, while a walk that is longer authorises pages the frame never
+/// reaches. Deriving it in one pure place is the only way the two cannot drift.
+#[cfg(feature = "backend-vulkan")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GvaPlaneGeometry {
+    /// The Vulkan format the resident must already hold.
+    pub want: ash::vk::Format,
+    pub bpt: u64,
+    pub row_stride: u64,
+    /// The bytes from `target_gva` this plane occupies — the extent the copy
+    /// names and nothing past it. Padding after the final row belongs to the
+    /// allocation but is not texels this destination was given, and the copying
+    /// rail leaves it alone too. The two rails must land identical guest memory
+    /// or a fallback would be visible.
+    pub extent: u64,
+}
+
+#[cfg(feature = "backend-vulkan")]
+impl GvaPlaneDestination {
+    /// The geometry, or the typed reason this destination has none.
+    ///
+    /// Pure, so a caller may ask for the span it must walk and
+    /// [`copy_resident_into_gva_plane`] may ask again for the copy it issues,
+    /// without either restating the rule.
+    pub(crate) fn geometry(&self) -> Result<GvaPlaneGeometry, GvaWritebackDecline> {
+        // The destination's texel layout, and the whole reason this rail can
+        // exist at all: a copy converts nothing, so the guest must already read
+        // these bytes exactly as the resident holds them.
+        let Some(order) = crate::contract::pixel_format::store_texel_order(self.format) else {
+            return Err(GvaWritebackDecline::FormatNeedsConversion {
+                format: self.format,
+            });
+        };
+        let bpt = u64::from(order.bytes_per_texel());
+        let row_stride = u64::from(self.row_stride);
+        if row_stride == 0
+            || !row_stride.is_multiple_of(bpt)
+            || row_stride < u64::from(self.width) * bpt
+        {
+            return Err(GvaWritebackDecline::PitchNotTexels {
+                row_stride: self.row_stride,
+            });
+        }
+        Ok(GvaPlaneGeometry {
+            want: crate::backend::vulkan::translate::pixel::vk_texel_layout(order),
+            bpt,
+            row_stride,
+            extent: u64::from(self.height.saturating_sub(1)) * row_stride
+                + u64::from(self.width) * bpt,
+        })
+    }
+}
+
+/// Copy `identity`'s pixels into the guest pages behind a linear destination,
+/// with no host copy of the frame at any point.
+///
+/// The body of [`store_gva_frame_direct`], reachable by any caller holding a
+/// resident and a licensed guest-linear plane. A render Store is one such
+/// caller; a `copyFromTexture:toTexture:` whose source is an IOSurface the GPU
+/// already holds and whose destination is a linear guest allocation is another,
+/// and it is the same copy — the two differ only in where the geometry and the
+/// page licence came from.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn copy_resident_into_gva_plane<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    c0: &GvaPlaneDestination,
+    pages: Option<&crate::runtime::draw::StoreTargetPages>,
+) -> Result<u64, GvaWritebackDecline> {
+    let geometry = c0.geometry()?;
     // Compared as whole formats, not as channel orders.
     //
     // While every resident was eight bits per channel an order was a complete
@@ -1404,7 +1516,12 @@ fn store_gva_frame_direct<M: HostMemory + HostOps>(
     // are four bytes per texel apart, so an order comparison would admit a
     // half-float destination over an eight-bit resident and copy a frame of the
     // wrong size and the wrong texel into the guest's pages.
-    let want = crate::backend::vulkan::translate::pixel::vk_texel_layout(order);
+    let GvaPlaneGeometry {
+        want,
+        bpt,
+        row_stride,
+        extent,
+    } = geometry;
     let held = identity.resident_format();
     // A healthy zero on the rail as it stands: `gva_chain_identity` builds the
     // key from this same `c0.format`, so the two agree by construction and this
@@ -1414,14 +1531,6 @@ fn store_gva_frame_direct<M: HostMemory + HostOps>(
     // and sends that Store down the CPU conversion rail where it belongs.
     if held != want {
         return Err(GvaWritebackDecline::ResidentFormatMismatch { held, want });
-    }
-    let bpt = u64::from(order.bytes_per_texel());
-    let row_stride = u64::from(c0.row_stride);
-    if row_stride == 0 || !row_stride.is_multiple_of(bpt) || row_stride < u64::from(c0.width) * bpt
-    {
-        return Err(GvaWritebackDecline::PitchNotTexels {
-            row_stride: c0.row_stride,
-        });
     }
     let Some(pages) = pages else {
         return Err(GvaWritebackDecline::Unlicensed);
@@ -1434,11 +1543,6 @@ fn store_gva_frame_direct<M: HostMemory + HostOps>(
     if !in_page.is_multiple_of(bpt) {
         return Err(GvaWritebackDecline::OffsetNotTexelAligned { in_page });
     }
-    // The extent the copy names and nothing past it: padding after the final
-    // row belongs to the allocation but is not texels this Store was given, and
-    // the copying rail leaves it alone too. The two rails must land identical
-    // guest memory or a fallback would be visible.
-    let extent = u64::from(c0.height.saturating_sub(1)) * row_stride + u64::from(c0.width) * bpt;
     let runs =
         crate::runtime::guest_ram_map::references_for_runs(host, gpas, page_size, in_page, extent)
             .map_err(|refusal| GvaWritebackDecline::GuestRefRefused { refusal })?;
@@ -1470,7 +1574,7 @@ fn store_gva_frame_direct<M: HostMemory + HostOps>(
         .map_err(|inner| GvaWritebackDecline::Engine { inner })?;
     // Nothing here leaves a host copy of the frame, so neither GVA-keyed cache
     // may go on naming one.
-    forget_gva_host_copies(state, task_id, c0.target_gva, texture_ref);
+    forget_gva_host_copies(state, task_id, c0.target_gva, c0.texture_ref);
     // The copy means this image has stopped being the only place these pixels
     // exist, so the reclaim paths may take it — the same handover
     // `store_render_frame` performs in `finish`.

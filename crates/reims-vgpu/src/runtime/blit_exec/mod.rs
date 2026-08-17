@@ -3391,14 +3391,15 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
     // slice/level form carried, and there a driven Maps leg charged the row loop
     // 30.15 s of a 30.28 s rail. See [`read_texture_rect`] for what a per-row
     // call into the mapping rail re-pays.
-    // Whether a GPU-side copy could serve this pair at all, and if not, which
-    // term stops it. `engine::copy_target_to_guest_pages` takes no source
-    // rectangle: it copies level 0 of the resident whole, at origin zero, into
-    // a destination whose geometry is the resident's own. So a type-11 source
-    // going to a linear destination is reachable only when both ends are the
-    // whole plane at the origin, and the split below says how much of this
-    // population that is. Instrument only — nothing here branches on it, and the
-    // staging loop runs the same either way.
+    // Whether a GPU-side copy serves this pair, and if not, which term stops it.
+    // `engine::copy_target_to_guest_pages` takes no source rectangle: it copies
+    // level 0 of the resident whole, at origin zero, into a destination whose
+    // geometry is the resident's own. So a type-11 source going to a linear
+    // destination is reachable only when both ends are the whole plane at the
+    // origin, and the three counters partition the population so a reading says
+    // how much of it that is. See [`try_copy_t11_plane_to_linear_on_gpu`] for
+    // what the arm below is instead of, which is the settle the staging loop
+    // pays to make the source's guest bytes readable.
     if src.is_type11() && !dst.is_type11() {
         let whole_src =
             sox == 0 && soy == 0 && copy_w == src.width() as u64 && copy_h == src.height() as u64;
@@ -3409,6 +3410,21 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
             (true, false) => "blit_t2t_t11_dst_partial",
             (false, _) => "blit_t2t_t11_src_partial",
         });
+        #[cfg(feature = "backend-vulkan")]
+        if whole_src && whole_dst {
+            if let (TextureBacking::Type11(s), TextureBacking::Linear(d)) = (&src, &dst) {
+                if let Some(status) = try_copy_t11_plane_to_linear_on_gpu(
+                    state,
+                    host,
+                    task_id,
+                    cmd.destination,
+                    s,
+                    d,
+                ) {
+                    return status;
+                }
+            }
+        }
     }
     let t2t_stage_started = std::time::Instant::now();
     let mut staged = vec![0u8; row_bytes.saturating_mul(copy_h) as usize];
@@ -3818,6 +3834,219 @@ fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
     _cmd: &Command,
 ) -> Option<BlitStatus> {
     None
+}
+
+/// Why one whole-plane type-11 to guest-linear copy is not the GPU arm's, for
+/// the terms that can be decided from the two endpoints alone.
+///
+/// Every variant is a **fall-through and not a loss**: the staging loop runs
+/// unchanged and lands the same pixels. They are counters for that reason, and
+/// with `t2t_gpu_src_not_resident`, `t2t_gpu_dst_unbounded`,
+/// `t2t_gpu_engine_declined` and `t2t_gpu_landed` they partition
+/// `blit_t2t_t11_whole_plane`, so a census that does not add up is the bug.
+#[cfg(feature = "backend-vulkan")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum T2tGvaRefusal {
+    /// The source names no mapping this device holds, or one that has not
+    /// declared its geometry, so there is no surface identity to ask about.
+    NoSurface,
+    /// The source is a plane of a larger surface, or disagrees with the mapping
+    /// about the surface's size. The resident is keyed by the mapping's own
+    /// geometry and this copy lands it whole, so anything but the whole surface
+    /// would land it into a window that is not the whole of it.
+    SrcNotWholeSurface,
+    /// The destination level's own base does not resolve.
+    DstOffsetOverflow,
+    /// The destination's pitch does not fit the guest's own 32-bit declaration
+    /// of one.
+    DstStrideWide,
+    /// The destination has no byte-copy geometry — the plane's own typed
+    /// reason, carried whole so a reading names the same check the copy would
+    /// have named.
+    DstPlane(crate::runtime::render_writeback::GvaWritebackDecline),
+    /// The plane runs past the allocation the level lives in.
+    DstExtentOob,
+}
+
+#[cfg(feature = "backend-vulkan")]
+impl T2tGvaRefusal {
+    fn route(&self) -> &'static str {
+        match self {
+            Self::NoSurface => "t2t_gpu_no_surface",
+            Self::SrcNotWholeSurface => "t2t_gpu_src_not_whole_surface",
+            Self::DstOffsetOverflow => "t2t_gpu_dst_offset_overflow",
+            Self::DstStrideWide => "t2t_gpu_dst_stride_wide",
+            Self::DstPlane(_) => "t2t_gpu_dst_plane",
+            Self::DstExtentOob => "t2t_gpu_dst_extent_oob",
+        }
+    }
+}
+
+/// The destination plane a whole-plane type-11 to guest-linear copy would write,
+/// and its span, or the typed reason there is none.
+///
+/// Everything [`try_copy_t11_plane_to_linear_on_gpu`] can decide before it asks
+/// the engine anything or walks the guest's page table, which is also everything
+/// about it that a test can reach without a GPU. `surface` is the mapping's own
+/// declared geometry and `None` when it has none.
+#[cfg(feature = "backend-vulkan")]
+fn gpu_t2t_gva_plane(
+    surface: Option<(u32, u32)>,
+    src: &Type11Texture,
+    dst: &LinearTextureLevel,
+    destination_ref: u32,
+) -> Result<
+    (
+        crate::runtime::render_writeback::GvaPlaneDestination,
+        crate::runtime::render_writeback::GvaPlaneGeometry,
+    ),
+    T2tGvaRefusal,
+> {
+    let Some((sw, sh)) = surface else {
+        return Err(T2tGvaRefusal::NoSurface);
+    };
+    if sw != src.width || sh != src.height || src.surface_offset != 0 || sw == 0 || sh == 0 {
+        return Err(T2tGvaRefusal::SrcNotWholeSurface);
+    }
+    // The destination plane, from the level the blit resolved. Origin zero on
+    // both ends is the caller's admission, so this is the level's own base.
+    let Some(level_base) = dst.texel_offset(0, 0, 0) else {
+        return Err(T2tGvaRefusal::DstOffsetOverflow);
+    };
+    let Some(target_gva) = dst.base_gva.checked_add(level_base) else {
+        return Err(T2tGvaRefusal::DstOffsetOverflow);
+    };
+    let Ok(row_stride) = u32::try_from(dst.row_stride) else {
+        return Err(T2tGvaRefusal::DstStrideWide);
+    };
+    let plane = crate::runtime::render_writeback::GvaPlaneDestination {
+        target_gva,
+        width: dst.width,
+        height: dst.height,
+        row_stride,
+        format: dst.pixel_format,
+        texture_ref: destination_ref,
+    };
+    // The span to walk, from the destination's own terms, so the licence covers
+    // exactly the bytes the copy writes and not one page more.
+    let geometry = plane.geometry().map_err(T2tGvaRefusal::DstPlane)?;
+    // Against the allocation and not against the span: a copy that runs off the
+    // level's own bytes is the class `texture_region_window` bounds the host
+    // path with, and this arm owes the same check before it walks anything.
+    if !range_fits(level_base, geometry.extent, dst.alloc_size) {
+        return Err(T2tGvaRefusal::DstExtentOob);
+    }
+    Ok((plane, geometry))
+}
+
+/// The whole-plane copy out of an IOSurface the GPU already holds, into a
+/// guest-linear destination, issued by the GPU.
+///
+/// # What this is instead of
+///
+/// The host path below reads the source through the mapping rail and writes the
+/// destination through the GVA rail. Reading the source's *guest bytes* is what
+/// makes it expensive, and the cost is not the copy: a mapping read must first
+/// settle, which pays the surface's writeback debt and then waits for this
+/// device's own submitted writes to land in those pages. On a driven macos-13
+/// x86 boot that settle was 91 % of the staging window and the memcpy behind it
+/// was 4.5 %.
+///
+/// None of it is owed here. The source's authoritative content is the engine's
+/// resident, the destination is a plane of guest pages, and
+/// `engine::copy_target_to_guest_pages` moves exactly that — so this arm never
+/// touches the source's guest bytes and has nothing to wait for. What the guest
+/// asked for is `copyFromTexture:toTexture:`, a blit-encoder command with no
+/// host visibility; making the source CPU-readable is `synchronizeResource:`,
+/// which is a different call the guest did not make.
+///
+/// # Why it is only the whole plane
+///
+/// `copy_target_to_guest_pages` takes no source rectangle: it copies level 0 of
+/// the resident whole, at origin zero. So a partial rect on either end is not
+/// this arm's, and the caller's census — which partitions the population — is
+/// what says how much of it that leaves. On the boot above it left all of it:
+/// 511 of 511.
+///
+/// Returns `None` for every fall-through, having named it on a counter. The
+/// caller then runs the host path unchanged, so nothing here can lose a frame —
+/// only spend one.
+#[cfg(feature = "backend-vulkan")]
+fn try_copy_t11_plane_to_linear_on_gpu<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    destination_ref: u32,
+    src: &Type11Texture,
+    dst: &LinearTextureLevel,
+) -> Option<BlitStatus> {
+    use crate::runtime::drain::note_store_route;
+    let surface = state
+        .mappings
+        .get(&src.mapping_id)
+        .filter(|m| m.has_geom)
+        .map(|m| (m.width, m.height));
+    let (plane, geometry) = match gpu_t2t_gva_plane(surface, src, dst, destination_ref) {
+        Ok(v) => v,
+        Err(refusal) => {
+            note_store_route(refusal.route());
+            return None;
+        }
+    };
+    let identity = crate::runtime::present_identity::surface_identity(
+        state,
+        src.mapping_id,
+        src.width,
+        src.height,
+    );
+    if matches!(
+        crate::backend::vulkan::engine::resident_content_backing(&identity),
+        crate::backend::vulkan::engine::ResidentContentBacking::NotReady
+    ) {
+        // The source's bytes are its guest pages' bytes already, so the host
+        // path is reading what it should and is the cheap arm rather than the
+        // wasteful one.
+        note_store_route("t2t_gpu_src_not_resident");
+        return None;
+    }
+    // The destination's pages, captured once. The host path's `dest_window`
+    // takes the same walk for the same reason — the guest's vCPUs run
+    // throughout, so the licence must be the walk the command itself was
+    // authorised by rather than whatever the address names later.
+    let gpas = gva_mem::task_gva_page_gpas(
+        host,
+        &state.tasks,
+        task_id,
+        plane.target_gva,
+        geometry.extent,
+        state.page_shift,
+    );
+    if gpas.is_empty() {
+        note_store_route("t2t_gpu_dst_unbounded");
+        return None;
+    }
+    let pages = crate::runtime::draw::StoreTargetPages::from_ordered(&gpas, geometry.extent);
+    match crate::runtime::render_writeback::copy_resident_into_gva_plane(
+        state,
+        host,
+        task_id,
+        &identity,
+        &plane,
+        Some(&pages),
+    ) {
+        Ok(_) => {
+            note_store_route("t2t_gpu_landed");
+            Some(BlitStatus::Ok)
+        }
+        Err(decline) => {
+            note_store_route("t2t_gpu_engine_declined");
+            crate::observe::off(format!(
+                "blit_gpu_gva mid={} {}x{} decline={decline:?}",
+                src.mapping_id, dst.width, dst.height
+            ));
+            None
+        }
+    }
 }
 
 /// Zero `slice_count` or `level_count` is a Metal no-op ([`BlitStatus::ZeroExtent`]).

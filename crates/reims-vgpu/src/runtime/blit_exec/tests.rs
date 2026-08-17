@@ -3019,3 +3019,122 @@ fn the_gpu_whole_plane_arm_compares_stored_texels_and_not_transfer_functions() {
         "three agreeing formats with no stored-texel layout are still not a byte copy"
     );
 }
+
+/// The GPU arm for a whole-plane type-11 source going to a guest-linear
+/// destination, decided from the two endpoints alone.
+///
+/// The staging loop this stands in front of reads the source's *guest bytes*,
+/// and a mapping read must first settle: pay the surface's writeback debt and
+/// then wait for this device's own submitted writes to land. That wait, not the
+/// memcpy behind it, is what the rail costs. The GPU arm owes the source no
+/// settle at all, because the resident is the content — so every term below is
+/// about whether the resident and the destination plane are the two ends of one
+/// byte copy, and never about whether the guest's pages are readable.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_whole_surface_type11_source_reaches_the_destinations_own_guest_plane() {
+    use T2tGvaRefusal::*;
+
+    const W: u32 = 64;
+    const H: u32 = 32;
+    const BPR: u64 = 256;
+    let src = Type11Texture {
+        mapping_id: 7,
+        width: W,
+        height: H,
+        surface_offset: 0,
+        row_stride: BPR as u32,
+        span_end: BPR * H as u64,
+        bpp: 4,
+        pixel_format: MTL_FORMAT_BGRA8_UNORM,
+    };
+    let dst = LinearTextureLevel {
+        base_gva: 0x4000,
+        alloc_size: BPR * H as u64,
+        level_offset: 0,
+        row_stride: BPR,
+        slice_stride: 0,
+        slice_index: 0,
+        width: W,
+        height: H,
+        depth: 1,
+        bpp: 4,
+        pixel_format: MTL_FORMAT_BGRA8_UNORM,
+    };
+
+    let (plane, geometry) =
+        gpu_t2t_gva_plane(Some((W, H)), &src, &dst, 9).expect("one whole plane into another");
+    assert_eq!(plane.target_gva, 0x4000, "the level's own base is the plane");
+    assert_eq!(
+        plane.texture_ref, 9,
+        "the destination is the resource whose host-side pixel caches this invalidates"
+    );
+    assert_eq!(
+        geometry.extent,
+        (H as u64 - 1) * BPR + W as u64 * 4,
+        "the span is the copy's own bytes and not the row padding after the last of them"
+    );
+
+    assert_eq!(
+        gpu_t2t_gva_plane(None, &src, &dst, 9).unwrap_err(),
+        NoSurface,
+        "a mapping with no declared geometry has no surface identity to ask about"
+    );
+    // The resident is keyed by the mapping's own geometry and this copy lands it
+    // whole, so a source that is one plane of a larger surface would land the
+    // whole resident into a window that is not the whole of it.
+    assert_eq!(
+        gpu_t2t_gva_plane(
+            Some((W, H)),
+            &Type11Texture {
+                surface_offset: 0x8000,
+                ..src
+            },
+            &dst,
+            9
+        )
+        .unwrap_err(),
+        SrcNotWholeSurface,
+        "a second plane of a biplanar surface is not the resident"
+    );
+    assert_eq!(
+        gpu_t2t_gva_plane(Some((W, H * 2)), &src, &dst, 9).unwrap_err(),
+        SrcNotWholeSurface,
+        "a texture that disagrees with its mapping about the surface's size is not the resident"
+    );
+    // The class `texture_region_window` bounds the staging loop with: a copy that
+    // runs off its resource paints whatever the guest handed those pages to next.
+    assert_eq!(
+        gpu_t2t_gva_plane(
+            Some((W, H)),
+            &src,
+            &LinearTextureLevel {
+                alloc_size: BPR * H as u64 - 1,
+                ..dst
+            },
+            9
+        )
+        .unwrap_err(),
+        DstExtentOob,
+        "a plane running past its allocation is refused before anything is walked"
+    );
+    // Carried whole rather than collapsed, so the reading names the same check
+    // the copy itself would have named.
+    assert!(
+        matches!(
+            gpu_t2t_gva_plane(
+                Some((W, H)),
+                &src,
+                &LinearTextureLevel {
+                    row_stride: 3,
+                    ..dst
+                },
+                9
+            ),
+            Err(DstPlane(
+                crate::runtime::render_writeback::GvaWritebackDecline::PitchNotTexels { .. }
+            ))
+        ),
+        "a pitch that is not a whole number of texels is the plane's own refusal"
+    );
+}
