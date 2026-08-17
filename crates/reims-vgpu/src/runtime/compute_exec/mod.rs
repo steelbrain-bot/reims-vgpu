@@ -1366,6 +1366,99 @@ fn staged_window_pages<M: HostMemory>(
     StoreTargetPages::from_ordered(&ordered, span)
 }
 
+/// Where one compute storage image's output should land.
+///
+/// `GuestPages` when this device can put the dispatch's own copy straight into
+/// the guest's RAM, `Host` when it has to read the pixels back and write them
+/// itself. **Every decline here costs a device→host crossing and no guest
+/// work**: `Host` is the general path, is what a host without the guest-RAM
+/// import runs for everything, and lands identical bytes. So these are routed
+/// on the `OFF` channel as a census rather than refused on the fail channel —
+/// nothing is lost, and the counters are what say how much of a boot's compute
+/// readback this arm can actually reach.
+///
+/// Three conditions, and each names a contract term rather than an observation:
+///
+/// - the writeback must be a **guest-linear plane**. A type-11 destination is a
+///   tiled surface mapping, which [`crate::runtime::render_writeback::GvaPlaneDestination`]
+///   cannot describe and the licence therefore cannot walk.
+/// - the image must be **transient**. A registered resident is popped out of the
+///   submission ring's live set when it is acquired, so nothing holds it against
+///   `reclaim_compute_storage_for_allocation_retry` while the copy is still
+///   queued — and that reclaim waits on no fence. `pin_resident_storage` is the
+///   mechanism that would hold it and no caller takes it; until one does, a
+///   resident reads back. A transient slot is sealed into the ring entry and
+///   cannot be recycled before the fence retires, which is the whole window.
+/// - the licence must be granted. That is where the format, the complete page
+///   walk, the texel alignment and the guest-RAM references are all checked, in
+///   the one place both GPU-side writers of a guest plane meet them.
+#[cfg(feature = "backend-vulkan")]
+fn direct_destination<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    tex: &StagedTexture,
+    held: ash::vk::Format,
+) -> crate::backend::vulkan::engine::ComputeImageDestination {
+    use crate::backend::vulkan::engine::ComputeImageDestination;
+    let TextureWriteback::Linear {
+        texture_ref,
+        gva,
+        pixel_format,
+        row_stride,
+        width,
+        height,
+        pages,
+        ..
+    } = &tex.writeback
+    else {
+        crate::runtime::drain::note_store_route("compute_dst_host_not_linear");
+        return ComputeImageDestination::Host;
+    };
+    if tex.residency.is_some() {
+        crate::runtime::drain::note_store_route("compute_dst_host_resident");
+        return ComputeImageDestination::Host;
+    }
+    let Ok(row_stride) = u32::try_from(*row_stride) else {
+        crate::runtime::drain::note_store_route("compute_dst_host_stride_width");
+        return ComputeImageDestination::Host;
+    };
+    let plane = crate::runtime::render_writeback::GvaPlaneDestination {
+        target_gva: *gva,
+        width: *width,
+        height: *height,
+        row_stride,
+        format: *pixel_format,
+        texture_ref: *texture_ref,
+    };
+    match crate::runtime::render_writeback::licence_gva_plane(
+        state,
+        host,
+        held,
+        &plane,
+        Some(pages),
+    ) {
+        Ok(licence) => {
+            crate::runtime::drain::note_store_route("compute_dst_guest_pages");
+            ComputeImageDestination::GuestPages {
+                target: Box::new(licence.target),
+                pages: licence.gpas,
+            }
+        }
+        Err(decline) => {
+            // Named, because the reasons are not interchangeable and the census
+            // above cannot tell them apart: a format the copy cannot land raw is
+            // a different thing to learn about this rail than a page walk that
+            // came up short.
+            crate::observe::off(format!(
+                "compute_dst host bind={} gva={gva:#x} dims={width}x{height} fmt={pixel_format:#x} reason={decline:?}",
+                tex.binding
+            ));
+            crate::runtime::drain::note_store_route("compute_dst_host_unlicensed");
+            ComputeImageDestination::Host
+        }
+    }
+}
+
 /// [`staged_window_pages`] for a flat span — the buffer rail's shape.
 fn staged_span_pages<M: HostMemory>(
     state: &DeviceState,
@@ -3525,7 +3618,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     cmd: &ComputeCommand,
 ) -> ComputeStatus {
     use crate::backend::vulkan::engine::{
-        self as vk_engine, ComputeBufferResource, ComputeImageDestination, ComputeImageResult,
+        self as vk_engine, ComputeBufferResource, ComputeImageResult,
         ComputeRequest, ComputeSampledImageResource, ComputeStorageImageResource, DrawError,
     };
 
@@ -4063,11 +4156,13 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 width: t.width,
                 height: t.height,
                 bytes: std::mem::take(&mut t.bytes),
-                // Every output still comes back through host memory. The guest
-                // window this will be written into is on `t.writeback` and has
-                // been all along; routing it is the next step, and it is gated
-                // on the host-pointer capability that `Host` does not need.
-                destination: ComputeImageDestination::Host,
+                // The guest window this output belongs to is on `t.writeback`,
+                // so the destination is decided from the window rather than
+                // from anything about this dispatch. `Host` needs no host
+                // capability; the direct arm needs the guest-RAM import, and
+                // where that is absent the licence declines by name and this
+                // reads back exactly as it always did.
+                destination: direct_destination(state, host, t, shader_fmt.vk_format()),
                 residency: t.residency.map(|candidate| {
                     crate::backend::vulkan::engine::ComputeStorageResidency {
                         identity: candidate.key,
@@ -4304,12 +4399,27 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 }
             }
             // The engine copied straight into the guest's pages, so there is no
-            // writeback to do and no bytes to do it from. Reached only where
-            // this dispatch asked for `ComputeImageDestination::GuestPages`,
-            // which nothing builds yet.
+            // writeback to do and no bytes to do it from.
             ComputeImageResult::Landed { bytes } => {
                 crate::runtime::drain::note_store_route("compute_wb_landed");
                 let _ = bytes;
+                // The guest's pages are the only place this frame exists now,
+                // so no host cache may go on naming one. This arm writes
+                // neither cache — both are on the readback path — but a
+                // previous dispatch's readback may have left an entry, and it
+                // is stale by exactly one frame. Same call, same reason, as
+                // both arms of the render rail's GVA Store.
+                if let TextureWriteback::Linear {
+                    gva, texture_ref, ..
+                } = &t.writeback
+                {
+                    crate::runtime::render_writeback::forget_gva_host_copies(
+                        state,
+                        task_id,
+                        *gva,
+                        *texture_ref,
+                    );
+                }
             }
         }
         // The output is in the guest's pages now, so the engine's image has

@@ -1344,12 +1344,19 @@ fn land_gva_frame_bytes<M: HostMemory + HostOps>(
 
 /// Drop every host-side copy of a GVA target's pixels.
 ///
-/// Both arms of [`store_gva_frame`] end here: once the guest's pages hold the
+/// Both arms of [`store_gva_frame`] end here, and so does a compute dispatch
+/// whose storage output landed in guest pages: once the guest's pages hold the
 /// frame they are the only place it exists, and a cache entry left behind would
-/// serve a later sample the previous Store's bytes. One function rather than two
-/// copies of the pair, because a copied rule is the next divergence.
+/// serve a later sample the previous Store's bytes. One function rather than
+/// three copies of the pair, because a copied rule is the next divergence.
+///
+/// The compute caller has the same obligation for a different reason. It never
+/// *writes* these caches on the direct arm — `store_linear_texture` and
+/// `mirror_linear_color_cache` are on the readback path only — but a previous
+/// dispatch's readback may have left an entry, and that entry is now stale by
+/// exactly one frame.
 #[cfg(feature = "backend-vulkan")]
-fn forget_gva_host_copies(state: &mut DeviceState, task_id: u32, target_gva: u64, texture_ref: u32) {
+pub(crate) fn forget_gva_host_copies(state: &mut DeviceState, task_id: u32, target_gva: u64, texture_ref: u32) {
     crate::runtime::surface_cache::evict_gva(state, target_gva);
     if texture_ref != 0 {
         crate::runtime::surface_cache::evict_texture(state, task_id, texture_ref);

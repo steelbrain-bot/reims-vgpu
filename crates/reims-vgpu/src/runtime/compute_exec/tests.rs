@@ -2276,6 +2276,153 @@ fn a_staged_buffer_carries_the_pages_its_writeback_is_bounded_to() {
     assert!(staged_span_pages(&state, &host, 1, page, 0).is_empty());
 }
 
+/// A resident storage image never takes the direct-to-guest-pages arm.
+///
+/// This is a safety gate, not a routing preference. A registered resident is
+/// popped out of the submission ring's live set when it is acquired and lives in
+/// `compute_storage_registry`, where `reclaim_compute_storage_for_allocation_
+/// retry` can destroy it as soon as `gpu_only_content` clears — and that reclaim
+/// waits on no fence. A direct copy is submitted and not waited, so routing a
+/// resident here hands the queue an image another dispatch may have already
+/// freed. `pin_resident_storage` is the mechanism that would hold it and nothing
+/// takes it; until something does, the answer must be `Host`.
+///
+/// The other two arms are cheaper to be wrong about — a type-11 destination is a
+/// tiled surface mapping the guest-linear licence cannot describe, and an
+/// unlicensed window is one whose pages did not resolve — but all three land the
+/// same way, because `Host` is the general path and loses nothing.
+///
+/// All three answers are `Host`, so the return value alone cannot say *which*
+/// gate refused, and a resident window that fell through to the licence check
+/// would read identically to one the residency gate caught. The census route is
+/// what distinguishes them, so each case is asserted on its own counter.
+///
+/// Vulkan-only: the direct arm is a `VK_EXT_external_memory_host` import, and
+/// `StagedTexture` does not carry a residency candidate on the Metal arm at all.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn only_a_licensed_transient_linear_window_can_take_the_direct_arm() {
+    use crate::backend::vulkan::engine::ComputeImageDestination;
+    use crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM;
+    use crate::runtime::drain::census::store_route_count;
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let held = crate::backend::vulkan::engine::StorageImageFormat::Rgba8Unorm.vk_format();
+
+    let linear = |pages: crate::runtime::draw::StoreTargetPages| TextureWriteback::Linear {
+        pages,
+        texture_ref: 44,
+        gva: 0x101000,
+        pixel_format: MTL_FORMAT_RGBA8_UNORM,
+        row_stride: 8,
+        width: 2,
+        height: 2,
+        bpp: 4,
+    };
+    let staged = |writeback, residency| StagedTexture {
+        binding: 32,
+        #[cfg(feature = "backend-vulkan")]
+        array_element: 0,
+        #[cfg(feature = "backend-vulkan")]
+        descriptor_count: 1,
+        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+        texture_ref: 44,
+        pixel_format: MTL_FORMAT_RGBA8_UNORM,
+        storage_selector: Some(pixel_format::StorageImageSelector::Rgba8Unorm),
+        width: 2,
+        height: 2,
+        bytes: vec![0u8; 16],
+        is_storage: true,
+        residency,
+        serve: None,
+        writeback,
+    };
+    let is_host = |d: &ComputeImageDestination| matches!(d, ComputeImageDestination::Host);
+
+    // A window whose pages never resolved cannot be licensed, so even the
+    // transient linear shape reads back. This is also the arm that holds on a
+    // host with no guest-RAM import, where `references_for_runs` refuses.
+    let before = store_route_count("compute_dst_host_unlicensed");
+    assert!(
+        is_host(&direct_destination(
+            &mut state,
+            &mut host,
+            &staged(linear(crate::runtime::draw::StoreTargetPages::empty()), None),
+            held,
+        )),
+        "an unlicensed window reads back"
+    );
+    assert_eq!(
+        store_route_count("compute_dst_host_unlicensed"),
+        before + 1,
+        "the licence refusal is the gate that caught it"
+    );
+
+    // A type-11 destination is not a guest-linear plane at all.
+    let before = store_route_count("compute_dst_host_not_linear");
+    assert!(
+        is_host(&direct_destination(
+            &mut state,
+            &mut host,
+            &staged(
+                TextureWriteback::Type11 {
+                    mapping_id: 1,
+                    surface_offset: 0,
+                    surface_bpr: 8,
+                    span_end: 16,
+                    width: 2,
+                    height: 2,
+                    bpp: 4,
+                },
+                None,
+            ),
+            held,
+        )),
+        "a tiled surface mapping reads back"
+    );
+    assert_eq!(
+        store_route_count("compute_dst_host_not_linear"),
+        before + 1,
+        "a type-11 window never reaches the guest-linear licence"
+    );
+
+    // And the gate this test exists for: residency forces `Host` whatever the
+    // window looks like. Asserted against the same linear writeback the first
+    // case used, so residency is the only term that differs — and on its own
+    // counter, so a resident that merely failed the later licence check would
+    // fail this assertion rather than pass it by coincidence.
+    let before = store_route_count("compute_dst_host_resident");
+    assert!(
+        is_host(&direct_destination(
+            &mut state,
+            &mut host,
+            &staged(
+                linear(crate::runtime::draw::StoreTargetPages::empty()),
+                Some(ComputeStorageResidencyCandidate {
+                    key: crate::model::ComputeStorageResidencyKey::linear(
+                        1,
+                        44,
+                        0x101000,
+                        8,
+                        0x101010,
+                        2,
+                        2,
+                        MTL_FORMAT_RGBA8_UNORM,
+                    ),
+                    seed_generation: 0,
+                }),
+            ),
+            held,
+        )),
+        "a resident image must never be handed to a submitted-not-waited copy"
+    );
+    assert_eq!(
+        store_route_count("compute_dst_host_resident"),
+        before + 1,
+        "residency refuses before the licence is even attempted"
+    );
+}
+
 /// A staged window keeps the walk's *order*, and a scattered mapping proves it.
 ///
 /// The compute rail carried its destination pages as a bare `HashSet`, which is
