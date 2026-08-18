@@ -582,6 +582,7 @@ impl std::error::Error for WindowError {}
 /// Spawn the window on a dedicated thread and return its join handle. The thread
 /// owns the winit event loop for its lifetime; it exits when the window closes.
 pub fn spawn(
+    executor: std::sync::Arc<dyn crate::runtime::executor::Executor>,
     config: WindowConfig,
     on_input: InputSink,
     frames: FrameSlot,
@@ -590,7 +591,7 @@ pub fn spawn(
 ) -> std::thread::JoinHandle<Result<(), WindowError>> {
     std::thread::Builder::new()
         .name("reims-vgpu-window".to_string())
-        .spawn(move || run(config, on_input, frames, stop, wake))
+        .spawn(move || run(executor, config, on_input, frames, stop, wake))
         .expect("spawn reims-vgpu-window thread")
 }
 
@@ -598,12 +599,14 @@ pub fn spawn(
 /// closes). Prefer [`spawn`]; call this directly only if you already own a
 /// suitable thread.
 pub fn run(
+    executor: std::sync::Arc<dyn crate::runtime::executor::Executor>,
     config: WindowConfig,
     on_input: InputSink,
     frames: FrameSlot,
     stop: StopFlag,
     wake: WindowWakeHandle,
 ) -> Result<(), WindowError> {
+    let _scope = executor.enter();
     let event_loop = build_event_loop()?;
     wake.arm(event_loop.create_proxy());
     let mut app = App::new(config, on_input, frames, stop);
@@ -618,6 +621,7 @@ struct MainThreadWindow {
     event_loop: EventLoop<FramePublished>,
     app: App,
     exited: ExitedFlag,
+    _engine_scope: crate::runtime::executor::ExecutionScope,
 }
 
 #[cfg(target_os = "macos")]
@@ -635,6 +639,7 @@ thread_local! {
 #[cfg(target_os = "macos")]
 pub fn start_main_thread(
     id: u64,
+    executor: std::sync::Arc<dyn crate::runtime::executor::Executor>,
     config: WindowConfig,
     on_input: InputSink,
     frames: FrameSlot,
@@ -654,11 +659,13 @@ pub fn start_main_thread(
         let event_loop = build_event_loop()?;
         wake.arm(event_loop.create_proxy());
         let app = App::new(config, on_input, frames, stop);
+        let engine_scope = executor.enter();
         *slot = Some(MainThreadWindow {
             id,
             event_loop,
             app,
             exited,
+            _engine_scope: engine_scope,
         });
         Ok(())
     })

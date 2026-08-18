@@ -109,7 +109,7 @@ macro_rules! engine_counters {
         pool_sourced { $($(#[$pm:meta])* $pool:ident,)* }
         pool_levels { $($(#[$lm:meta])* $lvl:ident,)* }
     ) => {
-        /// Process-wide product-path counters (resettable for tests).
+        /// Per-vGPU product-path counters (resettable for tests).
         #[derive(Debug, Default)]
         pub struct EngineCounters {
             $($(#[$wm])* pub $win: AtomicU64,)*

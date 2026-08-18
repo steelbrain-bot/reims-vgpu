@@ -2711,7 +2711,7 @@ impl DeviceState {
         return Self::new_with_executor(
             id,
             page_shift,
-            Arc::new(crate::runtime::executor::VulkanExecutor),
+            Arc::new(crate::runtime::executor::VulkanExecutor::default()),
         );
 
         #[cfg(not(feature = "backend-vulkan"))]
@@ -2733,7 +2733,7 @@ impl DeviceState {
         Self {
             id,
             #[cfg(feature = "backend-vulkan")]
-            executor: Arc::new(crate::runtime::executor::VulkanExecutor),
+            executor: Arc::new(crate::runtime::executor::VulkanExecutor::default()),
             #[cfg(feature = "backend-vulkan")]
             active_submission: None,
             #[cfg(feature = "backend-vulkan")]
@@ -3110,10 +3110,13 @@ impl DeviceState {
         // Cleared as well as kept: a reset drops every channel, so a bit rung
         // before it names a channel that no longer exists.
         child_rung.store(0, Ordering::Release);
-        *self = Self::new(id, page_shift);
         #[cfg(feature = "backend-vulkan")]
         {
-            self.executor = executor;
+            *self = Self::new_with_executor(id, page_shift, executor);
+        }
+        #[cfg(not(feature = "backend-vulkan"))]
+        {
+            *self = Self::new(id, page_shift);
         }
         self.gfx.interrupt_status_disp = intr_disp;
         self.gfx.interrupt_status_gpu = intr_gpu;

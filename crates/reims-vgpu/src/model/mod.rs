@@ -54,7 +54,11 @@ impl Device {
 
     pub fn reset(&mut self) {
         #[cfg(feature = "backend-vulkan")]
-        self.state.executor.reset();
+        {
+            let executor = std::sync::Arc::clone(&self.state.executor);
+            let _scope = executor.enter();
+            executor.reset();
+        }
         self.state.reset();
     }
 
@@ -63,7 +67,11 @@ impl Device {
         // Backend aliases must die before their contiguous guest-memory views
         // are unmapped.
         #[cfg(feature = "backend-vulkan")]
-        self.state.executor.reset();
+        let executor = std::sync::Arc::clone(&self.state.executor);
+        #[cfg(feature = "backend-vulkan")]
+        let _scope = executor.enter();
+        #[cfg(feature = "backend-vulkan")]
+        executor.reset();
         let views = self.state.take_all_host_views();
         let count = views.len();
         for (ptr, len) in views {
@@ -77,6 +85,8 @@ impl Device {
     }
 
     pub fn gfx_read(&mut self, offset: u64, size: u32) -> u64 {
+        #[cfg(feature = "backend-vulkan")]
+        let _scope = self.state.executor.enter();
         runtime::mmio::gfx_read(&mut self.state, offset, size)
     }
 
@@ -87,10 +97,14 @@ impl Device {
         data: u64,
         size: u32,
     ) {
+        #[cfg(feature = "backend-vulkan")]
+        let _scope = self.state.executor.enter();
         runtime::mmio::gfx_write(&mut self.state, host, offset, data, size);
     }
 
     pub fn iosfc_read(&self, offset: u64, size: u32) -> u64 {
+        #[cfg(feature = "backend-vulkan")]
+        let _scope = self.state.executor.enter();
         runtime::mmio::iosfc_read(&self.state, offset, size)
     }
 
@@ -101,6 +115,8 @@ impl Device {
         data: u64,
         size: u32,
     ) {
+        #[cfg(feature = "backend-vulkan")]
+        let _scope = self.state.executor.enter();
         runtime::mmio::iosfc_write(&mut self.state, host, offset, data, size);
     }
 
@@ -110,6 +126,8 @@ impl Device {
     /// table and is read directly by `runtime/draw`. This used to also
     /// copy it into the backend on every drain, into a map nothing ever read.
     pub fn drain<H: runtime::host::HostMemory + HostOps>(&mut self, host: &mut H) {
+        #[cfg(feature = "backend-vulkan")]
+        let _scope = self.state.executor.enter();
         runtime::drain::drain_pending(&mut self.state, host);
     }
 

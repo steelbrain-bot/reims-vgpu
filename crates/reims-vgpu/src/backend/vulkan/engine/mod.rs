@@ -78,13 +78,101 @@ pub(crate) use vk_call::{VkCall, VkOp};
 #[cfg(feature = "host-window")]
 pub(crate) use window_present::{WindowCpuFrame, WindowPresentOutcome};
 
-use caches::ObjectCaches;
+use caches::{ObjectCaches, SessionCacheIndexes};
 use context::ContextOwner;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use pools::ResourcePools;
+use std::cell::Cell;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use types::ComputeError;
+
+/// One vGPU's guest-derived namespace inside the shared physical context.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct SessionId(u64);
+
+impl SessionId {
+    pub(crate) fn allocate() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .expect("Vulkan session identity space exhausted");
+        let id = Self(id);
+        let _ = session_signals_for(id);
+        id
+    }
+}
+
+thread_local! {
+    static CURRENT_SESSION: Cell<SessionId> = const { Cell::new(SessionId(0)) };
+}
+
+/// Restores the caller's prior session when a nested device operation ends.
+pub(crate) struct SessionScope {
+    previous: SessionId,
+}
+
+impl Drop for SessionScope {
+    fn drop(&mut self) {
+        CURRENT_SESSION.set(self.previous);
+    }
+}
+
+pub(crate) fn enter_session(session: SessionId) -> SessionScope {
+    let previous = CURRENT_SESSION.replace(session);
+    SessionScope { previous }
+}
+
+pub(crate) fn release_session(session: SessionId) {
+    if session == SessionId(0) {
+        return;
+    }
+    {
+        let _scope = enter_session(session);
+        reset_guest_state();
+    }
+    let mut engine = lock_engine();
+    engine.activate_session(SessionId(0));
+    if let Some(mut resources) = engine.inactive_sessions.remove(&session) {
+        if let Some(ctx) = engine.owner.ctx.as_ref() {
+            unsafe {
+                #[cfg(feature = "host-window")]
+                if let Some(mut presenter) = resources.window_presenter.take() {
+                    presenter.destroy(ctx, Some(&mut resources.pools));
+                }
+                resources.pools.destroy_all(&ctx.device);
+            }
+        }
+    }
+    SESSION_SIGNALS.lock().remove(&session);
+}
+
+#[derive(Default)]
+struct SessionSignals {
+    batch_open: std::sync::atomic::AtomicBool,
+    last_tail_batch_flush_us: AtomicU64,
+}
+
+static SESSION_SIGNALS: Lazy<Mutex<HashMap<SessionId, Arc<SessionSignals>>>> = Lazy::new(|| {
+    let mut sessions = HashMap::new();
+    sessions.insert(SessionId(0), Arc::new(SessionSignals::default()));
+    Mutex::new(sessions)
+});
+
+fn session_signals_for(session: SessionId) -> Arc<SessionSignals> {
+    Arc::clone(
+        SESSION_SIGNALS
+            .lock()
+            .entry(session)
+            .or_insert_with(|| Arc::new(SessionSignals::default())),
+    )
+}
+
+fn current_session_signals() -> Arc<SessionSignals> {
+    session_signals_for(CURRENT_SESSION.get())
+}
 
 /// The colour aspect of a single-mip, single-layer image — the shape of every
 /// image this engine creates.
@@ -200,10 +288,23 @@ pub(crate) fn color_subresource_layers() -> ash::vk::ImageSubresourceLayers {
 struct EngineState {
     owner: ContextOwner,
     caches: ObjectCaches,
+    indexes: SessionCacheIndexes,
     pools: ResourcePools,
     counters: EngineCounters,
     #[cfg(feature = "host-window")]
     window_presenter: Option<window_present::WindowPresenter>,
+    resident_epoch: Arc<AtomicU64>,
+    active_session: SessionId,
+    inactive_sessions: HashMap<SessionId, SessionResources>,
+}
+
+struct SessionResources {
+    pools: ResourcePools,
+    indexes: SessionCacheIndexes,
+    counters: EngineCounters,
+    #[cfg(feature = "host-window")]
+    window_presenter: Option<window_present::WindowPresenter>,
+    resident_epoch: Arc<AtomicU64>,
 }
 
 impl EngineState {
@@ -211,11 +312,45 @@ impl EngineState {
         Self {
             owner: ContextOwner::new(),
             caches: ObjectCaches::new(),
+            indexes: SessionCacheIndexes::new(),
             pools: ResourcePools::new(),
             counters: EngineCounters::default(),
             #[cfg(feature = "host-window")]
             window_presenter: None,
+            resident_epoch: Arc::new(AtomicU64::new(1)),
+            active_session: SessionId(0),
+            inactive_sessions: HashMap::new(),
         }
+    }
+
+    fn activate_session(&mut self, session: SessionId) {
+        if self.active_session == session {
+            return;
+        }
+        let incoming =
+            self.inactive_sessions
+                .remove(&session)
+                .unwrap_or_else(|| SessionResources {
+                    pools: ResourcePools::new(),
+                    indexes: SessionCacheIndexes::new(),
+                    counters: EngineCounters::default(),
+                    #[cfg(feature = "host-window")]
+                    window_presenter: None,
+                    resident_epoch: Arc::new(AtomicU64::new(1)),
+                });
+        let outgoing = SessionResources {
+            pools: std::mem::replace(&mut self.pools, incoming.pools),
+            indexes: std::mem::replace(&mut self.indexes, incoming.indexes),
+            counters: std::mem::replace(&mut self.counters, incoming.counters),
+            #[cfg(feature = "host-window")]
+            window_presenter: std::mem::replace(
+                &mut self.window_presenter,
+                incoming.window_presenter,
+            ),
+            resident_epoch: std::mem::replace(&mut self.resident_epoch, incoming.resident_epoch),
+        };
+        self.inactive_sessions.insert(self.active_session, outgoing);
+        self.active_session = session;
     }
 
     /// Everything a `VK_ERROR_DEVICE_LOST` obliges this device to do, in one
@@ -271,7 +406,12 @@ impl EngineState {
     /// `host_window::present::App::reattach_engine` is what builds it again.
     fn flush_device_derived(&mut self) {
         clear_device_capabilities();
-        RESIDENT_RESOURCE_EPOCH.fetch_add(1, Ordering::Release);
+        self.resident_epoch.fetch_add(1, Ordering::Release);
+        for session in self.inactive_sessions.values() {
+            session.resident_epoch.fetch_add(1, Ordering::Release);
+        }
+        let inactive_sessions = std::mem::take(&mut self.inactive_sessions);
+        self.indexes.clear();
         // Taken and published unconditionally, before anything fallible. The
         // presenter's swapchain, surface and semaphores were made against the
         // device that is going away; whether or not there is still a `ctx` to
@@ -285,6 +425,7 @@ impl EngineState {
         let presenter = self.window_presenter.take();
         #[cfg(feature = "host-window")]
         note_window_present_attached(false);
+        let mut restored_sessions = HashMap::new();
         if let Some(ctx) = self.owner.ctx.as_ref() {
             // A device-loss observer can run while an ended batch is waiting in
             // the submission owner's FIFO. The device is already unusable, so
@@ -296,18 +437,181 @@ impl EngineState {
                 if let Some(mut presenter) = presenter {
                     presenter.destroy(ctx, Some(&mut self.pools));
                 }
+                for (id, mut session) in inactive_sessions {
+                    session.indexes.clear();
+                    #[cfg(feature = "host-window")]
+                    if let Some(mut presenter) = session.window_presenter.take() {
+                        presenter.destroy(ctx, Some(&mut session.pools));
+                    }
+                    session.pools.destroy_all(&ctx.device);
+                    restored_sessions.insert(
+                        id,
+                        SessionResources {
+                            pools: ResourcePools::new(),
+                            indexes: SessionCacheIndexes::new(),
+                            counters: session.counters,
+                            #[cfg(feature = "host-window")]
+                            window_presenter: None,
+                            resident_epoch: session.resident_epoch,
+                        },
+                    );
+                }
                 self.caches.destroy_all(&ctx.device);
                 self.pools.destroy_all(&ctx.device);
             }
         } else {
             self.caches.clear_logical();
+            for (id, session) in inactive_sessions {
+                restored_sessions.insert(
+                    id,
+                    SessionResources {
+                        pools: ResourcePools::new(),
+                        indexes: SessionCacheIndexes::new(),
+                        counters: session.counters,
+                        #[cfg(feature = "host-window")]
+                        window_presenter: None,
+                        resident_epoch: session.resident_epoch,
+                    },
+                );
+            }
         }
+        self.inactive_sessions = restored_sessions;
         self.pools = ResourcePools::new();
+        self.indexes = SessionCacheIndexes::new();
         self.caches = ObjectCaches::new();
     }
 }
 
 static ENGINE: Lazy<Mutex<EngineState>> = Lazy::new(|| Mutex::new(EngineState::new()));
+
+#[cfg(test)]
+mod session_slot_tests {
+    use super::*;
+
+    #[test]
+    fn activating_a_session_parks_every_other_devices_resources() {
+        let mut engine = EngineState::new();
+        let first = SessionId(41);
+        let second = SessionId(42);
+
+        engine.activate_session(first);
+        assert_eq!(engine.active_session, first);
+        assert!(engine.inactive_sessions.contains_key(&SessionId(0)));
+
+        engine.activate_session(second);
+        assert_eq!(engine.active_session, second);
+        assert!(engine.inactive_sessions.contains_key(&first));
+
+        engine.activate_session(first);
+        assert_eq!(engine.active_session, first);
+        assert!(engine.inactive_sessions.contains_key(&second));
+        assert!(!engine.inactive_sessions.contains_key(&first));
+    }
+
+    #[test]
+    fn nested_session_scopes_restore_the_callers_device() {
+        let first = enter_session(SessionId(51));
+        assert_eq!(CURRENT_SESSION.get(), SessionId(51));
+        {
+            let _second = enter_session(SessionId(52));
+            assert_eq!(CURRENT_SESSION.get(), SessionId(52));
+        }
+        assert_eq!(CURRENT_SESSION.get(), SessionId(51));
+        drop(first);
+        assert_eq!(CURRENT_SESSION.get(), SessionId(0));
+    }
+
+    #[test]
+    fn resetting_one_session_does_not_invalidate_another_sessions_lease() {
+        let identity = TargetIdentity::default();
+        let second_lease = {
+            let _second = enter_session(SessionId(62));
+            ResidentResourceLease::test_new(
+                identity.clone(),
+                ResidentContentBacking::DeviceAllocation,
+            )
+        };
+
+        {
+            let _first = enter_session(SessionId(61));
+            reset_guest_state();
+        }
+        assert!(second_lease.matches(&identity));
+
+        {
+            let _second = enter_session(SessionId(62));
+            reset_guest_state();
+        }
+        assert!(!second_lease.matches(&identity));
+    }
+
+    #[test]
+    fn open_batch_publication_is_session_scoped() {
+        {
+            let _first = enter_session(SessionId(71));
+            publish_batch_open(true);
+            assert!(current_session_signals().batch_open.load(Ordering::Acquire));
+        }
+        {
+            let _second = enter_session(SessionId(72));
+            assert!(!current_session_signals().batch_open.load(Ordering::Acquire));
+            publish_batch_open(true);
+        }
+        let _first = enter_session(SessionId(71));
+        assert!(current_session_signals().batch_open.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn sessions_share_content_caches_but_not_device_counters() {
+        let mut engine = EngineState::new();
+        let cache_address = std::ptr::addr_of!(engine.caches);
+        engine
+            .counters
+            .device_lost
+            .store(3, std::sync::atomic::Ordering::Relaxed);
+
+        engine.activate_session(SessionId(82));
+
+        assert_eq!(std::ptr::addr_of!(engine.caches), cache_address);
+        assert_eq!(
+            engine
+                .counters
+                .device_lost
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+
+        engine.activate_session(SessionId(0));
+        assert_eq!(
+            engine
+                .counters
+                .device_lost
+                .load(std::sync::atomic::Ordering::Relaxed),
+            3
+        );
+    }
+
+    #[test]
+    fn deleting_one_session_does_not_invalidate_another_sessions_lease() {
+        let identity = TargetIdentity::default();
+        let survivor = {
+            let _second = enter_session(SessionId(92));
+            ResidentResourceLease::test_new(
+                identity.clone(),
+                ResidentContentBacking::DeviceAllocation,
+            )
+        };
+        {
+            let _first = enter_session(SessionId(91));
+            let _ = current_session_signals();
+        }
+
+        release_session(SessionId(91));
+
+        assert!(survivor.matches(&identity));
+        assert!(!SESSION_SIGNALS.lock().contains_key(&SessionId(91)));
+    }
+}
 
 /// Whether the current device owns a recorded batch that has not been
 /// submitted yet.
@@ -316,14 +620,6 @@ static ENGINE: Lazy<Mutex<EngineState>> = Lazy::new(|| Mutex::new(EngineState::n
 /// only whether the drain's idle-tail boundary has work that justifies entering
 /// that transaction. The recording thread publishes after installing the batch
 /// and clears while removing it, so `false` never permits an open batch to idle.
-static BATCH_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Time of the last successful drain-tail batch submission, consumed by the
-/// next batch opener. This measures whether the host tranche boundary found a
-/// real idle gap or split a run that resumed immediately.
-static LAST_TAIL_BATCH_FLUSH_US: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TailReopenBand {
     Le100Us,
@@ -357,11 +653,22 @@ impl TailReopenBand {
 }
 
 pub(super) fn publish_batch_open(open: bool) {
-    BATCH_OPEN.store(open, std::sync::atomic::Ordering::Release);
+    current_session_signals()
+        .batch_open
+        .store(open, std::sync::atomic::Ordering::Release);
+}
+
+#[cfg(test)]
+pub(super) fn batch_open_for_current_session() -> bool {
+    current_session_signals()
+        .batch_open
+        .load(std::sync::atomic::Ordering::Acquire)
 }
 
 fn note_batch_open_after_tail(counters: &EngineCounters) {
-    let flushed_at = LAST_TAIL_BATCH_FLUSH_US.swap(0, std::sync::atomic::Ordering::AcqRel);
+    let flushed_at = current_session_signals()
+        .last_tail_batch_flush_us
+        .swap(0, std::sync::atomic::Ordering::AcqRel);
     if flushed_at == 0 {
         return;
     }
@@ -549,8 +856,6 @@ mod device_capability_snapshot_tests {
 /// treats a mismatch as an absent handle. Release also checks it under the
 /// engine lock, preventing an old lease from unpinning a new resident that
 /// happens to reuse the same identity.
-static RESIDENT_RESOURCE_EPOCH: AtomicU64 = AtomicU64::new(1);
-
 /// Which thread class is asking for the engine lock.
 ///
 /// The single `ENGINE` mutex serializes the drain worker's guest execution
@@ -770,7 +1075,7 @@ impl Drop for EngineGuard {
 /// did not block costs a failed-then-taken atomic and nothing else.
 #[inline]
 fn lock_engine_at(site: EngineLockSite) -> EngineGuard {
-    let guard = match ENGINE.try_lock() {
+    let mut guard = match ENGINE.try_lock() {
         Some(guard) => {
             ENGINE_LOCK.note_uncontended(site);
             guard
@@ -782,6 +1087,8 @@ fn lock_engine_at(site: EngineLockSite) -> EngineGuard {
             guard
         }
     };
+    let session = CURRENT_SESSION.get();
+    guard.activate_session(session);
     EngineGuard {
         guard,
         site,
@@ -815,8 +1122,11 @@ pub struct GuestResetStats {
 /// immutable content-keyed shader/pipeline caches.
 pub fn reset_guest_state() -> GuestResetStats {
     let mut guard = lock_engine();
-    LAST_TAIL_BATCH_FLUSH_US.store(0, std::sync::atomic::Ordering::Release);
-    RESIDENT_RESOURCE_EPOCH.fetch_add(1, Ordering::Release);
+    current_session_signals()
+        .last_tail_batch_flush_us
+        .store(0, std::sync::atomic::Ordering::Release);
+    guard.resident_epoch.fetch_add(1, Ordering::Release);
+    guard.indexes.clear();
     let (resident_targets, pooled_targets, sampled_images, storage_images) =
         guard.pools.guest_reset_counts();
     let stats = GuestResetStats {
@@ -1010,11 +1320,12 @@ pub fn execute_draw_request(req: &DrawRequest) -> Result<DrawOutput, DrawError> 
     let EngineState {
         ref mut owner,
         ref mut caches,
+        ref mut indexes,
         ref mut pools,
         ref counters,
         ..
     } = &mut *guard;
-    let result = unsafe { exec::execute_draw_inner(owner, caches, pools, counters, req) };
+    let result = unsafe { exec::execute_draw_inner(owner, caches, indexes, pools, counters, req) };
     if result.is_err() {
         // A draw can abandon after staging a gathered window and before the copy
         // that fills it is recorded — `SampledResidentNotReady` and its two
@@ -1055,7 +1366,9 @@ pub fn execute_draw_request(req: &DrawRequest) -> Result<DrawOutput, DrawError> 
 /// only bounds the idle-tail latency. No-op without a context or open batch.
 pub fn flush_batched_draws() {
     if !end_of_tranche_requires_engine(
-        BATCH_OPEN.load(std::sync::atomic::Ordering::Acquire),
+        current_session_signals()
+            .batch_open
+            .load(std::sync::atomic::Ordering::Acquire),
         device_lost::device_lost_seen(),
     ) {
         return;
@@ -1099,7 +1412,7 @@ pub fn flush_batched_draws() {
                 counters
                     .batch_tail_flushes
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                LAST_TAIL_BATCH_FLUSH_US.store(
+                current_session_signals().last_tail_batch_flush_us.store(
                     crate::observe::elapsed_us(),
                     std::sync::atomic::Ordering::Release,
                 );
@@ -1774,11 +2087,13 @@ pub struct ResidentResourceLease {
     backing: ResidentContentBacking,
     incarnation: Option<pools::ResidentIncarnation>,
     epoch: u64,
+    epoch_source: Arc<AtomicU64>,
+    session: SessionId,
 }
 
 impl ResidentResourceLease {
     pub fn matches(&self, identity: &TargetIdentity) -> bool {
-        self.identity == *identity && self.epoch == RESIDENT_RESOURCE_EPOCH.load(Ordering::Acquire)
+        self.identity == *identity && self.epoch == self.epoch_source.load(Ordering::Acquire)
     }
 
     pub fn backing(&self) -> ResidentContentBacking {
@@ -1787,18 +2102,21 @@ impl ResidentResourceLease {
 
     #[cfg(test)]
     pub(crate) fn test_new(identity: TargetIdentity, backing: ResidentContentBacking) -> Self {
+        let guard = lock_engine();
         Self {
             identity,
             backing,
             incarnation: None,
-            epoch: RESIDENT_RESOURCE_EPOCH.load(Ordering::Acquire),
+            epoch: guard.resident_epoch.load(Ordering::Acquire),
+            epoch_source: Arc::clone(&guard.resident_epoch),
+            session: guard.active_session,
         }
     }
 }
 
 #[cfg(test)]
 pub(crate) fn test_advance_resident_resource_epoch() {
-    RESIDENT_RESOURCE_EPOCH.fetch_add(1, Ordering::Release);
+    lock_engine().resident_epoch.fetch_add(1, Ordering::Release);
 }
 
 impl Drop for ResidentResourceLease {
@@ -1806,8 +2124,9 @@ impl Drop for ResidentResourceLease {
         let Some(incarnation) = self.incarnation else {
             return;
         };
+        let _scope = enter_session(self.session);
         let mut guard = lock_engine();
-        if self.epoch == RESIDENT_RESOURCE_EPOCH.load(Ordering::Acquire) {
+        if self.epoch == self.epoch_source.load(Ordering::Acquire) {
             let EngineState {
                 ref owner,
                 ref mut pools,
@@ -1833,11 +2152,14 @@ impl Drop for ResidentResourceLease {
 pub fn retain_resident_resource(identity: &TargetIdentity) -> Option<ResidentResourceLease> {
     let mut guard = lock_engine();
     let incarnation = guard.pools.retain_resident_target(identity)?;
+    let epoch_source = Arc::clone(&guard.resident_epoch);
     Some(ResidentResourceLease {
         identity: identity.clone(),
         backing: ResidentContentBacking::DeviceAllocation,
         incarnation: Some(incarnation),
-        epoch: RESIDENT_RESOURCE_EPOCH.load(Ordering::Acquire),
+        epoch: epoch_source.load(Ordering::Acquire),
+        epoch_source,
+        session: guard.active_session,
     })
 }
 
@@ -4736,7 +5058,7 @@ pub fn reset_draw_counters() {
 /// Test-only: destroy device, clear recreate budget, rebuild on next draw.
 pub fn test_reset_engine() {
     let mut g = lock_engine();
-    RESIDENT_RESOURCE_EPOCH.fetch_add(1, Ordering::Release);
+    g.resident_epoch.fetch_add(1, Ordering::Release);
     // A healthy `DeviceContext` is kept across the reset; only the pools, the
     // caches and the owner's flags are rebuilt.
     //
@@ -4779,6 +5101,7 @@ pub fn test_reset_engine() {
         g.owner = ContextOwner::new();
     }
     g.caches = ObjectCaches::new();
+    g.indexes = SessionCacheIndexes::new();
     g.pools = ResourcePools::new();
     g.counters.reset_all();
 }

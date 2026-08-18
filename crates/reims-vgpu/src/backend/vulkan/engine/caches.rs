@@ -860,17 +860,32 @@ pub(crate) struct ObjectCaches {
     layouts: ObjectCache<LayoutKey, (vk::DescriptorSetLayout, vk::PipelineLayout)>,
     passes: ObjectCache<PassKey, vk::RenderPass>,
     pipelines: ObjectCache<PipelineKey, vk::Pipeline>,
-    /// Exact last Vulkan variant for each retained guest pipeline object.
-    /// Values are weakly tied to the runtime object's lifetime; the content
-    /// cache remains the authority and owns every Vulkan handle.
-    pipeline_objects: ObjectVariantIndex<PipelineKey, vk::Pipeline>,
     samplers: ObjectCache<SamplerStateKey, vk::Sampler>,
     /// Lc: compute pipelines (content digest + entry + layout).
     compute_pipelines: ObjectCache<ComputePipelineKey, vk::Pipeline>,
-    /// The allocation a shader's words live in → the digest its module hashes
-    /// to, so a repeat bind of the same module does not walk it three times to
-    /// find that out.
+}
+
+/// Per-vGPU lookup accelerators that borrow handles from shared content caches.
+pub(crate) struct SessionCacheIndexes {
+    /// Exact last Vulkan variant for each retained guest pipeline object.
+    pipeline_objects: ObjectVariantIndex<PipelineKey, vk::Pipeline>,
+    /// One guest-owned shader allocation to its content digest, so a repeat
+    /// bind does not walk the same module three times.
     shader_digests: ShaderDigestIndex,
+}
+
+impl SessionCacheIndexes {
+    pub(crate) fn new() -> Self {
+        Self {
+            pipeline_objects: ObjectVariantIndex::default(),
+            shader_digests: ShaderDigestIndex::default(),
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.pipeline_objects.clear();
+        self.shader_digests.clear();
+    }
 }
 
 struct ObjectVariantIndex<K, V> {
@@ -1319,17 +1334,14 @@ impl ObjectCaches {
             layouts: ObjectCache::new(),
             passes: ObjectCache::new(),
             pipelines: ObjectCache::new(),
-            pipeline_objects: ObjectVariantIndex::default(),
             samplers: ObjectCache::new(),
             compute_pipelines: ObjectCache::new(),
-            shader_digests: ShaderDigestIndex::default(),
         }
     }
 
     pub(crate) unsafe fn destroy_all(&mut self, device: &ash::Device) {
         // This index borrows handles owned by `pipelines`; forget those echoes
         // before destroying the authoritative objects.
-        self.pipeline_objects.clear();
         for p in self.pipelines.take_all() {
             device.destroy_pipeline(p, None);
         }
@@ -1374,13 +1386,9 @@ impl ObjectCaches {
     }
 
     pub(crate) fn clear_logical(&mut self) {
-        // Before the modules it indexes, so no window exists where a front-index
-        // hit names a digest whose module has already gone.
-        self.shader_digests.clear();
         self.shaders.clear();
         self.layouts.clear();
         self.passes.clear();
-        self.pipeline_objects.clear();
         self.pipelines.clear();
         self.samplers.clear();
         self.compute_pipelines.clear();
@@ -1426,12 +1434,13 @@ impl ObjectCaches {
     /// dispatch is three orders rarer than a draw.
     pub(crate) unsafe fn get_or_create_shader_memoized(
         &mut self,
+        indexes: &mut SessionCacheIndexes,
         ctx: &DeviceContext,
         words: &std::sync::Arc<Vec<u32>>,
         counters: &EngineCounters,
         pools: &mut ResourcePools,
     ) -> Result<(Digest128, vk::ShaderModule), DrawError> {
-        if let Some(key) = self.shader_digests.get(words) {
+        if let Some(key) = indexes.shader_digests.get(words) {
             // Negative before positive, in the order the walking form asks them:
             // a module this device refused is refused again without being
             // rebuilt, and without the front index quietly promoting it.
@@ -1449,7 +1458,7 @@ impl ObjectCaches {
             // why the index may hold a digest the cache does not.
         }
         let (key, module) = self.get_or_create_shader(ctx, words, counters, pools)?;
-        self.shader_digests.insert(words, key);
+        indexes.shader_digests.insert(words, key);
         Ok((key, module))
     }
 
@@ -2085,6 +2094,7 @@ impl ObjectCaches {
     )]
     pub(crate) unsafe fn get_or_create_pipeline(
         &mut self,
+        indexes: &mut SessionCacheIndexes,
         ctx: &DeviceContext,
         key: &PipelineKey,
         pipeline_object: Option<&super::types::PipelineObjectIdentity>,
@@ -2104,7 +2114,7 @@ impl ObjectCaches {
         pools: &mut ResourcePools,
     ) -> Result<vk::Pipeline, DrawError> {
         if let Some(identity) = pipeline_object {
-            if let Some(pipeline) = self.pipeline_objects.get(identity, key) {
+            if let Some(pipeline) = indexes.pipeline_objects.get(identity, key) {
                 counters.pipeline_hits.fetch_add(1, Ordering::Relaxed);
                 counters
                     .pipeline_object_hits
@@ -2122,7 +2132,7 @@ impl ObjectCaches {
                 counters.pipeline_front_hits.fetch_add(1, Ordering::Relaxed);
             }
             if let Some(identity) = pipeline_object {
-                self.pipeline_objects.remember(identity, key, p);
+                indexes.pipeline_objects.remember(identity, key, p);
             }
             return Ok(p);
         }
@@ -2495,7 +2505,7 @@ impl ObjectCaches {
             pools.dispose(&ctx.device, DeferredHandle::Pipeline(old));
         }
         if let Some(identity) = pipeline_object {
-            self.pipeline_objects.remember(identity, key, pipe);
+            indexes.pipeline_objects.remember(identity, key, pipe);
         }
         Ok(pipe)
     }

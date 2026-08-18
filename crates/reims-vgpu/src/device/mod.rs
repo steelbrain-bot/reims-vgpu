@@ -340,6 +340,9 @@ pub fn device_reset(id: u64) -> bool {
 }
 
 pub fn device_destroy(id: u64) -> bool {
+    if !device_reset(id) {
+        return false;
+    }
     DEVICES.lock().remove(&id).is_some()
 }
 

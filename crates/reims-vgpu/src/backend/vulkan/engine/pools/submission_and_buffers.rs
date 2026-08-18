@@ -5418,7 +5418,7 @@ mod recycle_tests {
     #[test]
     fn batch_ownership_publishes_and_clears_the_tail_gate() {
         let mut pools = ResourcePools::new();
-        assert!(!crate::backend::vulkan::engine::BATCH_OPEN.load(Ordering::Acquire));
+        assert!(!crate::backend::vulkan::engine::batch_open_for_current_session());
         pools.install_open_batch(OpenBatch {
             cb: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
@@ -5431,9 +5431,9 @@ mod recycle_tests {
             draws: 1,
             dsets: Vec::new(),
         });
-        assert!(crate::backend::vulkan::engine::BATCH_OPEN.load(Ordering::Acquire));
+        assert!(crate::backend::vulkan::engine::batch_open_for_current_session());
         assert!(pools.take_open_batch().is_some());
-        assert!(!crate::backend::vulkan::engine::BATCH_OPEN.load(Ordering::Acquire));
+        assert!(!crate::backend::vulkan::engine::batch_open_for_current_session());
     }
 
     /// The slot mask and the tail publication describe the same owned batch,

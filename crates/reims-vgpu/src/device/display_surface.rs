@@ -180,6 +180,8 @@ pub fn device_efi_console_copy(
     let Some(mut d) = slot.inner.try_lock() else {
         return false;
     };
+    #[cfg(feature = "backend-vulkan")]
+    let _scope = d.device.state.executor.enter();
     if d.device.state.gfx.efi_fb_start == 0 {
         return false;
     }
@@ -221,6 +223,8 @@ pub fn device_scanout_copy(
         };
         d
     };
+    #[cfg(feature = "backend-vulkan")]
+    let _scope = d.device.state.executor.enter();
     if let Some(ops) = slot.ops {
         let DeviceInner { device, actions } = &mut *d;
         let mut host = QemuHost::new(&ops, actions, &slot.prompt_actions);

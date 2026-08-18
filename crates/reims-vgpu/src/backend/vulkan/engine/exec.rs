@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 
 use super::caches::{
     canonicalize_layout_bindings, AttrKey, BindingSig, LayoutKey, ObjectCaches, PassKey,
-    PipelineKey, SecondaryAttachKey, MAX_SECONDARY_ATTACH,
+    PipelineKey, SecondaryAttachKey, SessionCacheIndexes, MAX_SECONDARY_ATTACH,
 };
 use super::context::ContextOwner;
 use super::counters::{CreateSite, EngineCounters};
@@ -2604,6 +2604,7 @@ fn validate_sampled_resident(
 pub(crate) unsafe fn execute_draw_inner(
     owner: &mut ContextOwner,
     caches: &mut ObjectCaches,
+    indexes: &mut SessionCacheIndexes,
     pools: &mut ResourcePools,
     counters: &EngineCounters,
     req: &DrawRequest,
@@ -3099,9 +3100,9 @@ pub(crate) unsafe fn execute_draw_inner(
 
     phase.enter(super::draw_phase::Phase::PipelineShader);
     let (vert_digest, vert_module) =
-        caches.get_or_create_shader_memoized(ctx, &req.vert_spirv, counters, pools)?;
+        caches.get_or_create_shader_memoized(indexes, ctx, &req.vert_spirv, counters, pools)?;
     let (frag_digest, frag_module) =
-        caches.get_or_create_shader_memoized(ctx, &req.frag_spirv, counters, pools)?;
+        caches.get_or_create_shader_memoized(indexes, ctx, &req.frag_spirv, counters, pools)?;
     phase.enter(super::draw_phase::Phase::PipelineLayoutPass);
     let (dsl, pipeline_layout) = caches.get_or_create_layout(ctx, &layout_key, counters, pools)?;
     let render_pass = caches.get_or_create_pass(ctx, pass_key, counters, pools)?;
@@ -3203,6 +3204,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // and already checks the negative entry for a key that failed to compile.
     phase.enter(super::draw_phase::Phase::PipelineCompile);
     let pipeline = caches.get_or_create_pipeline(
+        indexes,
         ctx,
         &pipeline_key,
         req.pipeline_object.as_ref(),

@@ -124,6 +124,10 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
     let Some(slot) = device_slot(id) else {
         return false;
     };
+    let executor = {
+        let inner = slot.inner.lock();
+        Arc::clone(&inner.device.state.executor)
+    };
     let mut link = slot.window.lock();
     if link.is_some() {
         return true; // already running (idempotent)
@@ -178,6 +182,7 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
             Arc::new(std::sync::atomic::AtomicBool::new(false));
         if let Err(error) = crate::host_window::present::start_main_thread(
             id,
+            Arc::clone(&executor),
             cfg,
             on_input,
             Arc::clone(&frames),
@@ -194,6 +199,7 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
     };
     #[cfg(not(target_os = "macos"))]
     let thread = Some(crate::host_window::present::spawn(
+        executor,
         cfg,
         on_input,
         Arc::clone(&frames),

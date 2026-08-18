@@ -18,6 +18,17 @@ pub struct SubmissionContext {
     pub segment: Option<SegmentBoundary>,
 }
 
+/// Dynamic executor-session scope for one device operation.
+pub struct ExecutionScope {
+    _engine: Option<crate::backend::vulkan::engine::SessionScope>,
+}
+
+impl ExecutionScope {
+    fn none() -> Self {
+        Self { _engine: None }
+    }
+}
+
 impl SubmissionContext {
     /// Context for direct test/tool calls that do not originate in an EXEC
     /// packet. Product submissions always replace this with their decoded
@@ -86,17 +97,39 @@ pub trait Executor: std::fmt::Debug + Send + Sync {
 
     /// End one guest lifetime while preserving shareable physical-GPU state.
     fn reset(&self) {}
+
+    /// Select this executor's device-local backend session for a product call.
+    fn enter(&self) -> ExecutionScope {
+        ExecutionScope::none()
+    }
 }
 
 /// Compatibility adapter over the current Vulkan engine facade.
-#[derive(Debug, Default)]
-pub struct VulkanExecutor;
+#[derive(Debug)]
+pub struct VulkanExecutor {
+    session: crate::backend::vulkan::engine::SessionId,
+}
+
+impl Default for VulkanExecutor {
+    fn default() -> Self {
+        Self {
+            session: crate::backend::vulkan::engine::SessionId::allocate(),
+        }
+    }
+}
+
+impl Drop for VulkanExecutor {
+    fn drop(&mut self) {
+        crate::backend::vulkan::engine::release_session(self.session);
+    }
+}
 
 impl Executor for VulkanExecutor {
     fn execute(
         &self,
         submission: ResolvedSubmission<'_>,
     ) -> Result<ExecutionCompletion, DrawError> {
+        let _scope = self.enter();
         match submission {
             ResolvedSubmission::Draw { request, .. } => {
                 crate::backend::vulkan::engine::execute_draw_request(request)
@@ -110,7 +143,14 @@ impl Executor for VulkanExecutor {
     }
 
     fn reset(&self) {
+        let _scope = self.enter();
         crate::backend::vulkan::engine::reset_guest_state();
+    }
+
+    fn enter(&self) -> ExecutionScope {
+        ExecutionScope {
+            _engine: Some(crate::backend::vulkan::engine::enter_session(self.session)),
+        }
     }
 }
 

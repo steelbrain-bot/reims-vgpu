@@ -48,6 +48,7 @@ fn main() {
 
     let stop = Arc::new(AtomicBool::new(false));
     let handle = spawn(
+        Arc::new(reims_vgpu::runtime::executor::VulkanExecutor::default()),
         WindowConfig {
             title: "reims_vgpu host-window smoke".to_string(),
             width: w,
