@@ -26,8 +26,8 @@ pub use residency::{
 };
 pub use resource::{
     ContentAuthority, ContentError, ContentStamp, ContentState, GraphError, LifecycleState,
-    MappingNode, PendingContentWrite, ReplicaVersions, ResourceGraph, ResourceNode, StorageBacking,
-    StorageNode,
+    MappingNode, PendingContentWrite, ReplicaVersions, ResourceGraph, ResourceLifetime,
+    ResourceLifetimeRef, ResourceNode, StorageBacking, StorageNode,
 };
 pub use resource_state::ResolvedResourceState;
 pub use service::{

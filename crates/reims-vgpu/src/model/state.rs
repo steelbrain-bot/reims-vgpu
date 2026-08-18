@@ -609,7 +609,7 @@ pub struct TaskResource {
     /// Identity whose strong lifetime is exactly this serialized resource.
     /// Direct backend objects keep only a weak reference, so deletion—not an
     /// arbitrary idle timeout—makes them reclaimable.
-    lifetime: Arc<TaskResourceLifetime>,
+    lifetime: reims_vgpu_core::ResourceLifetime,
     /// Set after a successful draw used this texture as an attachment. A
     /// sampled-only texture cannot have an engine render-target resident, so
     /// its bind need not probe the mutable Store/witness registries. This is
@@ -637,7 +637,7 @@ impl TaskResource {
             decoded: OnceLock::new(),
             relation_publication: AtomicU8::new(RELATIONS_UNPUBLISHED),
             iosurface_mapping: OnceLock::new(),
-            lifetime: Arc::new(TaskResourceLifetime::new()),
+            lifetime: reims_vgpu_core::ResourceLifetime::new(),
             #[cfg(feature = "backend-vulkan")]
             was_render_target: AtomicBool::new(false),
             #[cfg(feature = "backend-vulkan")]
@@ -679,10 +679,7 @@ impl TaskResource {
     }
 
     pub fn lifetime_ref(&self) -> TaskResourceLifetimeRef {
-        TaskResourceLifetimeRef {
-            id: self.lifetime.id,
-            live: Arc::downgrade(&self.lifetime),
-        }
+        self.lifetime.reference()
     }
 
     #[cfg(feature = "backend-vulkan")]
@@ -761,43 +758,8 @@ const RELATIONS_UNPUBLISHED: u8 = 0;
 const RELATIONS_PUBLISHING: u8 = 1;
 const RELATIONS_PUBLISHED: u8 = 2;
 
-static NEXT_TASK_RESOURCE_LIFETIME: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
-
-#[derive(Debug)]
-struct TaskResourceLifetime {
-    id: u64,
-}
-
-impl TaskResourceLifetime {
-    fn new() -> Self {
-        let id = NEXT_TASK_RESOURCE_LIFETIME
-            .fetch_update(
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-                |id| id.checked_add(1),
-            )
-            .expect("task resource lifetime identity exhausted");
-        Self { id }
-    }
-}
-
-/// Weak backend-facing proof that one serialized resource still exists.
-#[derive(Clone, Debug)]
-pub struct TaskResourceLifetimeRef {
-    id: u64,
-    live: std::sync::Weak<TaskResourceLifetime>,
-}
-
-impl TaskResourceLifetimeRef {
-    pub fn id(&self) -> u64 {
-        self.id
-    }
-
-    pub fn is_live(&self) -> bool {
-        self.live.strong_count() != 0
-    }
-}
+/// Compatibility name while runtime requests migrate to core vocabulary.
+pub type TaskResourceLifetimeRef = reims_vgpu_core::ResourceLifetimeRef;
 
 #[cfg(all(test, feature = "backend-vulkan"))]
 mod task_resource_resident_tests {

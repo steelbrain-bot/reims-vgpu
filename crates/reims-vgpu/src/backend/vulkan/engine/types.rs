@@ -1074,7 +1074,7 @@ pub struct SampledImageResource {
     /// represents. A retained sampled image may live only while at least one
     /// such resource is live; deletion, rather than a byte budget or elapsed
     /// time, is its cache lifetime boundary.
-    pub resource_lifetime: Option<crate::model::TaskResourceLifetimeRef>,
+    pub resource_lifetime: Option<reims_vgpu_core::ResourceLifetimeRef>,
     /// Decoded type-8 view swizzle, applied as the image view's component
     /// mapping so the GPU performs it at sample time. Identity (the default)
     /// creates the same view as before. Doing this on the view rather than by
@@ -1674,7 +1674,7 @@ pub use reims_vgpu_protocol::StorageImageFormat;
 // Draw residency (workstream D)
 // ---------------------------------------------------------------------------
 
-pub use crate::model::{TargetIdentity, TargetKeyDivergence};
+pub use reims_vgpu_core::{TargetIdentity, TargetKeyDivergence};
 
 pub use reims_vgpu_core::ResidentReclaim;
 

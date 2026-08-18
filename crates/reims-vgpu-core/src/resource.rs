@@ -6,9 +6,67 @@ use reims_vgpu_protocol::{
     SurfaceBackingId, TaskId,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{atomic::AtomicU64, Weak};
 use std::sync::{Arc, Mutex};
 
 type AnyResourceId = ResourceId<ResourceObject>;
+
+static NEXT_RESOURCE_LIFETIME: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug)]
+struct ResourceLifetimeToken {
+    id: u64,
+}
+
+/// Strong ownership token for one constructed semantic resource lifetime.
+///
+/// Backend caches receive only [`ResourceLifetimeRef`]. Entries therefore die
+/// with the guest-owned resource rather than an invented capacity or timer.
+#[derive(Debug)]
+pub struct ResourceLifetime(Arc<ResourceLifetimeToken>);
+
+impl Default for ResourceLifetime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ResourceLifetime {
+    pub fn new() -> Self {
+        let id = NEXT_RESOURCE_LIFETIME
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |id| id.checked_add(1),
+            )
+            .expect("resource lifetime identity exhausted");
+        Self(Arc::new(ResourceLifetimeToken { id }))
+    }
+
+    pub fn reference(&self) -> ResourceLifetimeRef {
+        ResourceLifetimeRef {
+            id: self.0.id,
+            live: Arc::downgrade(&self.0),
+        }
+    }
+}
+
+/// Weak executor-facing proof that one semantic resource still exists.
+#[derive(Clone, Debug)]
+pub struct ResourceLifetimeRef {
+    id: u64,
+    live: Weak<ResourceLifetimeToken>,
+}
+
+impl ResourceLifetimeRef {
+    pub const fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn is_live(&self) -> bool {
+        self.live.strong_count() != 0
+    }
+}
 
 /// Exact semantic content represented by one executor operand or effect.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1122,5 +1180,22 @@ mod tests {
         );
         assert!(!graph.resource(first).unwrap().parents.contains(&second));
         assert!(!graph.resource(second).unwrap().children.contains(&first));
+    }
+
+    #[test]
+    fn cache_lifetime_refs_expire_only_with_the_owning_resource() {
+        let lifetime = ResourceLifetime::new();
+        let reference = lifetime.reference();
+        let sibling = ResourceLifetime::new();
+
+        assert!(reference.is_live());
+        assert_ne!(reference.id(), sibling.reference().id());
+        drop(sibling);
+        assert!(
+            reference.is_live(),
+            "an unrelated resource cannot retire it"
+        );
+        drop(lifetime);
+        assert!(!reference.is_live());
     }
 }

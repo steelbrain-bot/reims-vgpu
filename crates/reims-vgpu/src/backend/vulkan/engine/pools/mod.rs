@@ -1324,7 +1324,7 @@ pub(crate) struct SampledRetain {
     pub(crate) image: vk::Image,
     /// Exact bytes used to fill the retained image.
     pub(crate) content: SampledRetainContent,
-    pub(crate) resource_lifetime: Option<crate::model::TaskResourceLifetimeRef>,
+    pub(crate) resource_lifetime: Option<reims_vgpu_core::ResourceLifetimeRef>,
 }
 
 /// Bytes retained beside an uploaded sampled image for exact comparison.
@@ -1365,7 +1365,7 @@ struct ResidentSampledSlot {
     /// Serialized resources currently sharing this exact retained content.
     /// Weak references make resource deletion observable without making the
     /// backend allocation extend the guest object's lifetime.
-    owners: Vec<crate::model::TaskResourceLifetimeRef>,
+    owners: Vec<reims_vgpu_core::ResourceLifetimeRef>,
     /// Value of [`ResourcePools::idle_clock_ms`] at this entry's last use, kept
     /// for cache diagnostics. Elapsed time does not end resource ownership.
     last_touch_ms: u64,
@@ -1376,7 +1376,7 @@ impl ResidentSampledSlot {
         self.owners.iter().any(|owner| owner.is_live())
     }
 
-    fn retain_owner(&mut self, owner: &crate::model::TaskResourceLifetimeRef) {
+    fn retain_owner(&mut self, owner: &reims_vgpu_core::ResourceLifetimeRef) {
         self.owners.retain(|held| held.is_live());
         if !self.owners.iter().any(|held| held.id() == owner.id()) {
             self.owners.push(owner.clone());

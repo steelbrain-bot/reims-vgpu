@@ -3656,7 +3656,7 @@ impl ResourcePools {
         key: SampledKey,
         content: &[u8],
         identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
-        resource_lifetime: Option<&crate::model::TaskResourceLifetimeRef>,
+        resource_lifetime: Option<&reims_vgpu_core::ResourceLifetimeRef>,
         counters: &EngineCounters,
     ) -> Option<SampledSlot> {
         // Before any cache is consulted, so the set is what the workload *asked
@@ -3710,7 +3710,7 @@ impl ResourcePools {
         &mut self,
         slot: SampledSlot,
         content: &SampledRetainContent,
-        resource_lifetime: Option<&crate::model::TaskResourceLifetimeRef>,
+        resource_lifetime: Option<&reims_vgpu_core::ResourceLifetimeRef>,
     ) {
         self.admit_sampled_entry(slot, content, resource_lifetime);
     }
@@ -3727,7 +3727,7 @@ impl ResourcePools {
         &mut self,
         slot: SampledSlot,
         content: &SampledRetainContent,
-        resource_lifetime: Option<&crate::model::TaskResourceLifetimeRef>,
+        resource_lifetime: Option<&reims_vgpu_core::ResourceLifetimeRef>,
     ) {
         let Some(owner) = resource_lifetime.filter(|owner| owner.is_live()) else {
             crate::runtime::drain::note_store_route("sampled_admit_no_lifetime");
