@@ -220,7 +220,7 @@ pub struct Frame {
     pub height: u32,
     pub bgra: Vec<u8>,
     /// Engine-resident source for same-device MoltenVK presentation.
-    pub resident: Option<crate::backend::vulkan::engine::WindowPresentSource>,
+    pub resident: Option<reims_vgpu_core::PresentationSource>,
 }
 
 /// Shared slot the device writes and the window reads (latest-wins). The frame

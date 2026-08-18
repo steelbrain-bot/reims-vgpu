@@ -316,7 +316,7 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
     // is what tells the NEXT capture not to read it back, and it is only set
     // when a resident actually carried this one.
     if state.executor.window_present_attached() && resident_present.is_ok() {
-        let resident_source = crate::backend::vulkan::engine::WindowPresentSource {
+        let resident_source = reims_vgpu_core::PresentationSource {
             width,
             height,
             identity: present_identity,
@@ -396,7 +396,7 @@ fn window_write_frame(
     width: u32,
     height: u32,
     bgra: Vec<u8>,
-    resident: Option<crate::backend::vulkan::engine::WindowPresentSource>,
+    resident: Option<reims_vgpu_core::PresentationSource>,
 ) -> bool {
     link.seq = link.seq.wrapping_add(1);
     let frame = std::sync::Arc::new(crate::host_window::present::Frame {

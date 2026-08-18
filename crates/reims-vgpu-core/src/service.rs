@@ -2,6 +2,19 @@
 
 use crate::{ResidentContentBacking, ResourceLifetimeRef, TargetIdentity};
 
+/// One semantic resident selected for host presentation.
+///
+/// A display transaction names exactly one surface, so this is one identity
+/// rather than a candidate list. It remains a request instead of a resolved
+/// backend slot: only the executor can decide whether the identity is resident
+/// and presentable at this geometry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PresentationSource {
+    pub width: u32,
+    pub height: u32,
+    pub identity: TargetIdentity,
+}
+
 /// What an executor can prove about outstanding writes into a page window.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GuestWriteReach {

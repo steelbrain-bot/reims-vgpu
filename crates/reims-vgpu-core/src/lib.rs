@@ -57,8 +57,9 @@ pub use resource::{
 };
 pub use resource_state::ResolvedResourceState;
 pub use service::{
-    GuestWriteReach, GuestWriteService, PresentDecline, PresentationService, ReadbackLease,
-    ReadbackService, ResidentContent, ResidentReclaim, ResidentService, TargetReadback,
+    GuestWriteReach, GuestWriteService, PresentDecline, PresentationService, PresentationSource,
+    ReadbackLease, ReadbackService, ResidentContent, ResidentReclaim, ResidentService,
+    TargetReadback,
 };
 pub use submission::SubmissionContext;
 pub use target::{TargetIdentity, TargetKeyDivergence};

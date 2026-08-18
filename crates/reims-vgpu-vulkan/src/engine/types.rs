@@ -266,20 +266,7 @@ pub use reims_vgpu_core::ResidentReclaim;
 
 pub type PresentRect = (u32, u32, u32, u32);
 
-/// The resident a host-window present should blit from.
-///
-/// One identity, not a list. The display transaction names exactly one surface,
-/// and `present_identity::surface_identity` turns that name into exactly one
-/// identity — so there was never a second candidate to rank against the first.
-/// It stays a request rather than a resolved slot because only the engine, under
-/// its own lock, can say whether that identity is resident and presentable at
-/// `width`x`height`.
-#[derive(Clone, Debug)]
-pub struct WindowPresentSource {
-    pub width: u32,
-    pub height: u32,
-    pub identity: TargetIdentity,
-}
+pub use reims_vgpu_core::PresentationSource as WindowPresentSource;
 
 #[cfg(test)]
 mod tests {
