@@ -915,6 +915,7 @@ fn apply_record_inner<M: HostMemory + HostOps>(
     }
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct LoadedComputePipeline {
     pub kernel_func_ref: u32,
     /// Product-ready stage-input. `None` means the descriptor declared none —
@@ -960,15 +961,23 @@ pub(crate) fn load_compute_pipeline<M: HostMemory + HostOps>(
     host: &M,
     task_id: u32,
     pipeline_ref: u32,
-) -> Option<LoadedComputePipeline> {
+) -> Option<std::sync::Arc<LoadedComputePipeline>> {
     // ref==0 is "no pipeline bound" (legitimate) — silent. Other None = a bound
     // pipeline that failed to materialize → caller's coarse MissingPipeline; log
     // the reason (audit).
     if pipeline_ref == 0 {
         return None;
     }
+    if let Some(pipeline) = state
+        .task_compute_pipeline_states
+        .get(task_id, pipeline_ref)
+    {
+        crate::runtime::drain::note_store_route("compute_pipeline_state_hit");
+        return Some(pipeline);
+    }
+    crate::runtime::drain::note_store_route("compute_pipeline_state_miss");
     let report = crate::observe::RungReport::new("compute_load_pipeline", "pipe_ref");
-    let miss = |reason: &str, detail: String| -> Option<LoadedComputePipeline> {
+    let miss = |reason: &str, detail: String| -> Option<std::sync::Arc<LoadedComputePipeline>> {
         report.reason(task_id, pipeline_ref, reason, &detail);
         None
     };
@@ -1018,10 +1027,15 @@ pub(crate) fn load_compute_pipeline<M: HostMemory + HostOps>(
                     );
                 }
             };
-            Some(LoadedComputePipeline {
+            let pipeline = std::sync::Arc::new(LoadedComputePipeline {
                 kernel_func_ref: cp.kernel_func_ref,
                 stage_input,
-            })
+            });
+            Some(
+                state
+                    .task_compute_pipeline_states
+                    .register(task_id, pipeline_ref, pipeline),
+            )
         }
         ResourceDescriptor::ComputePipeline(_) => miss("kernel_func_zero", String::new()),
         _ => miss("not_compute_pipeline", String::new()),

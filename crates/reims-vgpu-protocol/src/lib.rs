@@ -16,8 +16,8 @@ pub use identity::{
     StorageId, SubmissionId, SurfaceBackingId, SurfaceId, TaskId,
 };
 pub use resource::{
-    decode_object_list_entry, DepthStencilObject, EventObject, FenceObject, ObjectKind,
-    ObjectListDecodeError, ObjectListEntry, RenderPipelineObject, SamplerObject,
+    decode_object_list_entry, ComputePipelineObject, DepthStencilObject, EventObject, FenceObject,
+    ObjectKind, ObjectListDecodeError, ObjectListEntry, RenderPipelineObject, SamplerObject,
     OBJECT_LIST_ENTRY_LEN,
 };
 pub use submission::{

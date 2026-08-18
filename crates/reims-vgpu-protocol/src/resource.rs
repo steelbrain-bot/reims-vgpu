@@ -8,6 +8,8 @@ pub enum SamplerObject {}
 pub enum DepthStencilObject {}
 /// Marker for the render-pipeline API's independent reference namespace.
 pub enum RenderPipelineObject {}
+/// Marker for the compute-pipeline API's independent reference namespace.
+pub enum ComputePipelineObject {}
 /// Marker for the fence API's independent reference namespace.
 #[derive(Debug)]
 pub enum FenceObject {}

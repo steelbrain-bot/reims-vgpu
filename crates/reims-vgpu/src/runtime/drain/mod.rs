@@ -324,6 +324,17 @@ fn apply_delete_object(state: &mut DeviceState, channel_id: u32, payload: &[u8],
         });
         return;
     }
+    if op.opcode() == reims_vgpu_wire::ops::destroy::OPCODE_DELETE_COMPUTE_PIPELINE_STATE {
+        let retired = state
+            .task_compute_pipeline_states
+            .delete(task_id, object_ref);
+        note_store_route(if retired {
+            "compute_pipeline_state_deleted"
+        } else {
+            "compute_pipeline_state_delete_absent"
+        });
+        return;
+    }
     #[cfg(feature = "backend-vulkan")]
     if op.opcode() == reims_vgpu_wire::ops::destroy::OPCODE_DELETE_DEPTH_STENCIL_STATE {
         // The invalidation for `task_depth_stencil_states`, and the whole reason

@@ -916,6 +916,56 @@ fn dispatch_missing_pipeline_not_backend_unavailable() {
     );
 }
 
+#[test]
+#[cfg(feature = "backend-vulkan")]
+fn compute_pipeline_state_is_immutable_until_delete_and_reuse() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
+
+    let mut descriptor = vec![0u8; 32];
+    st32(&mut descriptor[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
+    st32(&mut descriptor[4..], 32);
+    descriptor[TYPE7_FIRST_TLVS] = 1;
+    descriptor[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
+    descriptor[TYPE7_FIRST_TLVS + 2] = 4;
+    st32(&mut descriptor[TYPE7_FIRST_TLVS + 3..], 5);
+    let descriptor_gva = 0x140u64;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], descriptor_gva, &descriptor);
+    let off = list_object_entry_offset(6, 32).unwrap();
+    let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(&mut entry[0..], (OBJECT_TYPE_TYPE7 as u32) | (32u32 << 8));
+    entry[4..12].copy_from_slice(&descriptor_gva.to_le_bytes());
+    write_task_gva_arm64e(&mut host, &state.tasks[1], off, &entry);
+
+    let first = load_compute_pipeline(&state, &host, 1, 6).expect("first pipeline");
+    let first_identity = state
+        .task_compute_pipeline_states
+        .identity(1, 6)
+        .expect("first identity");
+    assert_eq!(first.kernel_func_ref, 5);
+
+    st32(&mut descriptor[TYPE7_FIRST_TLVS + 3..], 9);
+    write_task_gva_arm64e(&mut host, &state.tasks[1], descriptor_gva, &descriptor);
+    let retained = load_compute_pipeline(&state, &host, 1, 6).expect("retained pipeline");
+    assert!(std::sync::Arc::ptr_eq(&first, &retained));
+    assert_eq!(retained.kernel_func_ref, 5);
+
+    assert!(state.task_compute_pipeline_states.delete(1, 6));
+    let replacement = load_compute_pipeline(&state, &host, 1, 6).expect("replacement pipeline");
+    let replacement_identity = state
+        .task_compute_pipeline_states
+        .identity(1, 6)
+        .expect("replacement identity");
+    assert_eq!(replacement.kernel_func_ref, 9);
+    assert_eq!(first_identity.index(), replacement_identity.index());
+    assert_ne!(
+        first_identity.generation(),
+        replacement_identity.generation()
+    );
+}
+
 /// One condition, one line, one refusal slug — from every rail that asks.
 ///
 /// Three sites used to ask whether a staged texture's format has a storage
