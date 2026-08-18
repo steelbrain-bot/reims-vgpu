@@ -6,6 +6,7 @@ use reims_vgpu_protocol::{
     SurfaceBackingId, TaskId,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 
 type AnyResourceId = ResourceId<ResourceObject>;
 
@@ -159,6 +160,83 @@ impl ContentState {
     }
 }
 
+/// Shared authority for every resource view over one storage object.
+///
+/// A resource constructed before its backing is known starts with a private
+/// authority. Attaching storage replaces that handle with the storage-owned
+/// one; every later alias therefore observes and mutates the same version
+/// state instead of maintaining counters which merely happen to agree.
+#[derive(Clone, Debug)]
+pub struct ContentAuthority(Arc<Mutex<ContentState>>);
+
+impl Default for ContentAuthority {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new(ContentState::default())))
+    }
+}
+
+impl PartialEq for ContentAuthority {
+    fn eq(&self, other: &Self) -> bool {
+        self.snapshot() == other.snapshot()
+    }
+}
+
+impl Eq for ContentAuthority {}
+
+impl ContentAuthority {
+    pub fn snapshot(&self) -> ContentState {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn same_authority(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    pub fn current(&self) -> ContentVersion {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .current
+    }
+
+    pub fn guest_wrote(&self) -> Result<ContentVersion, ContentError> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .guest_wrote()
+    }
+
+    pub fn gpu_store_planned(
+        &self,
+        submission: SubmissionId,
+    ) -> Result<PendingContentWrite, ContentError> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .gpu_store_planned(submission)
+    }
+
+    pub fn gpu_store_completed(
+        &self,
+        submission: SubmissionId,
+    ) -> Result<ContentVersion, ContentError> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .gpu_store_completed(submission)
+    }
+
+    pub fn copy_gpu_to_guest_completed(&self, version: ContentVersion) -> Result<(), ContentError> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .copy_gpu_to_guest_completed(version)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StorageBacking {
     Dedicated,
@@ -197,6 +275,7 @@ pub struct StorageNode {
     pub id: StorageId,
     pub backing: StorageBacking,
     pub owners: BTreeSet<AnyResourceId>,
+    pub content: ContentAuthority,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -218,7 +297,7 @@ pub struct ResourceNode {
     pub lifecycle: LifecycleState,
     pub storage: Option<StorageId>,
     pub backing_generation: BackingGeneration,
-    pub content: ContentState,
+    pub content: ContentAuthority,
     pub parents: BTreeSet<AnyResourceId>,
     pub children: BTreeSet<AnyResourceId>,
     pub in_flight: BTreeSet<SubmissionId>,
@@ -354,7 +433,10 @@ impl ResourceGraph {
                 lifecycle: LifecycleState::Created,
                 storage,
                 backing_generation: BackingGeneration::new(1),
-                content: ContentState::default(),
+                content: storage
+                    .and_then(|storage| self.storage.get(&storage))
+                    .map(|storage| storage.content.clone())
+                    .unwrap_or_default(),
                 parents,
                 children: BTreeSet::new(),
                 in_flight: BTreeSet::new(),
@@ -393,6 +475,7 @@ impl ResourceGraph {
                 id,
                 backing,
                 owners: BTreeSet::new(),
+                content: ContentAuthority::default(),
             },
         );
         Ok(id)
@@ -484,11 +567,12 @@ impl ResourceGraph {
         if child_node.storage.is_none() {
             if let Some(storage) = parent_storage {
                 child_node.storage = Some(storage);
-                self.storage
+                let storage_node = self
+                    .storage
                     .get_mut(&storage)
-                    .ok_or(GraphError::StorageAbsent)?
-                    .owners
-                    .insert(child);
+                    .ok_or(GraphError::StorageAbsent)?;
+                child_node.content = storage_node.content.clone();
+                storage_node.owners.insert(child);
             }
         }
         Ok(())
@@ -562,7 +646,9 @@ impl ResourceGraph {
             };
         }
         node.storage = Some(storage);
-        self.storage.get_mut(&storage).unwrap().owners.insert(id);
+        let storage_node = self.storage.get_mut(&storage).unwrap();
+        node.content = storage_node.content.clone();
+        storage_node.owners.insert(id);
         Ok(())
     }
 
@@ -584,6 +670,7 @@ impl ResourceGraph {
             }
         }
         self.storage.get_mut(&storage).unwrap().owners.insert(id);
+        node.content = self.storage.get(&storage).unwrap().content.clone();
         let next = node
             .backing_generation
             .get()
@@ -902,6 +989,12 @@ mod tests {
 
         assert_eq!(graph.resource(view).unwrap().storage, Some(storage));
         assert_eq!(graph.storage(storage).unwrap().owners.len(), 2);
+        let surface_content = graph.resource(surface).unwrap().content.clone();
+        let view_content = graph.resource(view).unwrap().content.clone();
+        assert!(surface_content.same_authority(&view_content));
+        let before = view_content.current();
+        surface_content.guest_wrote().unwrap();
+        assert_ne!(view_content.current(), before);
         graph.release_reference(task(), object(1)).unwrap();
         assert!(graph.resource(surface).is_some());
     }

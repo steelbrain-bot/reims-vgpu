@@ -1029,14 +1029,14 @@ impl TaskResources {
     /// Record a CPU write against the canonical resource identity, when that
     /// object has already been constructed.
     pub fn note_guest_write(&self, task_id: u32, ref_: u32) -> Option<ContentVersion> {
-        let mut registry = self
+        let registry = self
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let id = registry
             .graph
             .resolve(TaskId::new(task_id), ObjectRef::new(ref_))?;
-        registry.graph.resource_mut(id)?.content.guest_wrote().ok()
+        registry.graph.resource(id)?.content.guest_wrote().ok()
     }
 
     /// Snapshot the canonical identity and content version of a constructed
@@ -1053,7 +1053,7 @@ impl TaskResources {
         let id = registry
             .graph
             .resolve(TaskId::new(task_id), ObjectRef::new(ref_))?;
-        Some((id, registry.graph.resource(id)?.content.current))
+        Some((id, registry.graph.resource(id)?.content.current()))
     }
 
     /// Apply a completed GPU Store to the resource version state.
@@ -1067,14 +1067,14 @@ impl TaskResources {
         ref_: u32,
         submission: SubmissionId,
     ) -> Option<(ResourceId<ResourceObject>, ContentVersion)> {
-        let mut registry = self
+        let registry = self
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let id = registry
             .graph
             .resolve(TaskId::new(task_id), ObjectRef::new(ref_))?;
-        let content = &mut registry.graph.resource_mut(id)?.content;
+        let content = &registry.graph.resource(id)?.content;
         content.gpu_store_planned(submission).ok()?;
         let version = content.gpu_store_completed(submission).ok()?;
         Some((id, version))
@@ -1132,7 +1132,10 @@ impl TaskResources {
                 let Some(id) = registry.graph.resolve(TaskId::new(task_id), object) else {
                     return (object, None, None);
                 };
-                let expected = registry.graph.resource(id).map(|node| node.content.current);
+                let expected = registry
+                    .graph
+                    .resource(id)
+                    .map(|node| node.content.current());
                 registry
                     .graph
                     .prepare(id, submission)
@@ -1491,15 +1494,17 @@ mod task_resource_graph_tests {
             .unwrap();
         assert_eq!(stored_id, id);
         let node = resources.resource_node(id).unwrap();
-        assert_eq!(node.content.current, version);
-        assert!(node.content.current_in_gpu());
-        assert!(!node.content.current_in_guest());
+        let content = node.content.snapshot();
+        assert_eq!(content.current, version);
+        assert!(content.current_in_gpu());
+        assert!(!content.current_in_guest());
 
         assert!(resources.record_gpu_to_guest_copy(id, version));
         assert!(resources
             .resource_node(id)
             .unwrap()
             .content
+            .snapshot()
             .current_in_guest());
     }
 }
