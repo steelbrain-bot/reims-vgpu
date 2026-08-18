@@ -2,6 +2,7 @@
 //!
 //! This crate deliberately has no QEMU, Vulkan, windowing, or host-OS types.
 
+pub mod blit;
 pub mod capabilities;
 pub mod execution;
 pub mod namespace;
@@ -11,6 +12,7 @@ pub mod service;
 pub mod submission;
 pub mod target;
 
+pub use blit::{BufferFillPattern, ResolvedBufferBlit, ResolvedBufferRange};
 pub use capabilities::{CapabilityService, DeviceInfoLimits, ExecutorCapabilities};
 pub use execution::{
     ExecutionCompletion, ExecutionKind, ExecutionOutput, ExecutionPort, ExecutionReceipt,

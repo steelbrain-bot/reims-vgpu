@@ -323,6 +323,20 @@ fn fill_buffer_roundtrip() {
         gva_mem::read_task_gva(&host, &state.tasks[1], gva, &mut out, PAGE_SHIFT_ARM64E).is_ok()
     );
     assert_eq!(out, [0x5a; 8]);
+
+    let (_, first_version) = state
+        .task_resources
+        .content_stamp(1, 7)
+        .expect("a resolved blit buffer has canonical content state");
+    assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
+    let (_, second_version) = state
+        .task_resources
+        .content_stamp(1, 7)
+        .expect("the resolved resource survives completion");
+    assert!(
+        second_version > first_version,
+        "each completed guest-memory write advances canonical content"
+    );
 }
 
 /// The pattern fill lands a repeating 32-bit unit, in the right order and
@@ -399,11 +413,11 @@ fn an_unaligned_pattern_fill_is_refused_rather_than_guessed() {
 
 /// The byte fill and the pattern fill are one write path.
 ///
-/// `write_fill_range` is `write_fill_pattern` with a one-byte pattern, and
-/// this asserts the two agree on the bytes rather than only on the code
-/// being shared — the divergence this rail keeps producing is two arms of
-/// one guest-memory write drifting, and a shared body is only worth
-/// anything if the equivalence is checked.
+/// Both forms become one resolved fill operation, and this asserts the two
+/// agree on the bytes rather than only on the code being shared — the
+/// divergence this rail keeps producing is two arms of one guest-memory write
+/// drifting, and a shared body is only worth anything if the equivalence is
+/// checked.
 #[test]
 fn a_byte_fill_and_a_four_equal_byte_pattern_fill_write_the_same_bytes() {
     let read_back = |cmd: &Command| {

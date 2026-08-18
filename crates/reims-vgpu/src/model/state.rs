@@ -969,6 +969,10 @@ impl TaskResources {
             .cloned()
     }
 
+    pub fn identity(&self, task_id: u32, ref_: u32) -> Option<ResourceId<ResourceObject>> {
+        self.get(task_id, ref_)?.semantic_id()
+    }
+
     /// Publish a newly constructed object unless another lookup won the race.
     pub fn register(
         &self,
@@ -1050,6 +1054,15 @@ impl TaskResources {
         let id = registry
             .graph
             .resolve(TaskId::new(task_id), ObjectRef::new(ref_))?;
+        registry.graph.resource(id)?.content.guest_wrote().ok()
+    }
+
+    /// Record a CPU write after resolution has replaced the serializer ref.
+    pub fn note_guest_write_by_id(&self, id: ResourceId<ResourceObject>) -> Option<ContentVersion> {
+        let registry = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         registry.graph.resource(id)?.content.guest_wrote().ok()
     }
 

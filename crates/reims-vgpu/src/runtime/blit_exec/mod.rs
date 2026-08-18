@@ -55,6 +55,8 @@ use crate::runtime::mapper::RectStride;
 use crate::runtime::mapping_write;
 use crate::runtime::objects;
 use crate::runtime::plan::event_sync::{Domain as FenceDomain, FenceAction};
+use reims_vgpu_core::{BufferFillPattern, ContentStamp, ResolvedBufferBlit, ResolvedBufferRange};
+use reims_vgpu_protocol::{ByteLength, GuestVirtualAddress};
 use reims_vgpu_wire::ops::blit as wire_blit;
 
 /// Chunk size for fill/copy host staging (bounded guest IO).
@@ -292,8 +294,22 @@ fn note_copy_region_io(
 }
 
 struct LinearBuffer {
+    content: ContentStamp,
     gva: u64,
     size: u64,
+}
+
+impl LinearBuffer {
+    fn range(&self, offset: u64, length: u64) -> Option<ResolvedBufferRange> {
+        if !range_fits(offset, length, self.size) {
+            return None;
+        }
+        Some(ResolvedBufferRange {
+            content: self.content,
+            address: GuestVirtualAddress::new(self.gva.checked_add(offset)?),
+            length: ByteLength::new(length),
+        })
+    }
 }
 
 struct LinearTextureLevel {
@@ -436,7 +452,14 @@ fn resolve_buffer<M: HostMemory + HostOps>(
     let Some((gva, size)) = buf.backing_gva_size(state.page_shift) else {
         return Err(br(BlitStatus::MissingResource, "buf_no_backing"));
     };
-    Ok(LinearBuffer { gva, size })
+    let Some((resource, version)) = state.task_resources.content_stamp(task_id, buffer_ref) else {
+        return Err(br(BlitStatus::MissingResource, "buf_no_semantic_identity"));
+    };
+    Ok(LinearBuffer {
+        content: ContentStamp { resource, version },
+        gva,
+        size,
+    })
 }
 
 fn resolve_texture_backing<M: HostMemory + HostOps>(
@@ -1622,17 +1645,6 @@ fn strided_span(
     last_image.checked_add(last_row)?.checked_add(row_bytes)
 }
 
-fn write_fill_range<M: HostMemory + HostOps>(
-    host: &mut M,
-    state: &mut DeviceState,
-    task_id: u32,
-    gva: u64,
-    length: u64,
-    value: u8,
-) -> Result<(), BlitStatus> {
-    write_fill_pattern(host, state, task_id, gva, length, &[value])
-}
-
 /// Write `length` bytes at `gva` by repeating `pattern` from its first byte.
 ///
 /// One body for both fill records rather than a copy per record. The byte fill
@@ -1714,6 +1726,57 @@ fn copy_bytes<M: HostMemory + HostOps>(
         length,
         allowed.as_ref(),
     )
+}
+
+/// Execute an immutable buffer operation after serializer refs and bounds have
+/// been resolved, then advance canonical content for the written resource.
+fn execute_resolved_buffer_blit<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    operation: ResolvedBufferBlit,
+) -> BlitStatus {
+    let result = match operation {
+        ResolvedBufferBlit::Fill {
+            destination,
+            pattern,
+        } => write_fill_pattern(
+            host,
+            state,
+            task_id,
+            destination.address.get(),
+            destination.length.get(),
+            pattern.bytes(),
+        ),
+        ResolvedBufferBlit::Copy {
+            source,
+            destination,
+        } => copy_bytes(
+            host,
+            state,
+            task_id,
+            source.address.get(),
+            destination.address.get(),
+            source.length.get(),
+        ),
+    };
+    match result {
+        Ok(()) => {
+            let destination = operation.destination();
+            if state
+                .task_resources
+                .note_guest_write_by_id(destination.resource())
+                .is_none()
+            {
+                return br(
+                    BlitStatus::MissingResource,
+                    "buffer_completion_resource_gone",
+                );
+            }
+            BlitStatus::Ok
+        }
+        Err(status) => status,
+    }
 }
 
 /// [`copy_bytes`] with the destination window supplied rather than captured.
@@ -1900,17 +1963,18 @@ fn exec_fill_buffer<M: HostMemory + HostOps>(
         Ok(b) => b,
         Err(st) => return st,
     };
-    if !range_fits(cmd.range_location, cmd.range_length, buf.size) {
+    let Some(destination) = buf.range(cmd.range_location, cmd.range_length) else {
         return br(BlitStatus::Bounds, "fill_range_oob");
-    }
-    let gva = match buf.gva.checked_add(cmd.range_location) {
-        Some(v) => v,
-        None => return br(BlitStatus::Bounds, "fill_gva_overflow"),
     };
-    match write_fill_range(host, state, task_id, gva, cmd.range_length, cmd.fill_value) {
-        Ok(()) => BlitStatus::Ok,
-        Err(st) => st,
-    }
+    execute_resolved_buffer_blit(
+        state,
+        host,
+        task_id,
+        ResolvedBufferBlit::Fill {
+            destination,
+            pattern: BufferFillPattern::Byte(cmd.fill_value),
+        },
+    )
 }
 
 /// `fillBuffer:range:pattern4:` — the byte fill with a repeating 32-bit unit.
@@ -1958,17 +2022,18 @@ fn exec_fill_buffer_pattern4<M: HostMemory + HostOps>(
         Ok(b) => b,
         Err(st) => return st,
     };
-    if !range_fits(cmd.range_location, cmd.range_length, buf.size) {
+    let Some(destination) = buf.range(cmd.range_location, cmd.range_length) else {
         return br(BlitStatus::Bounds, "fill_pattern4_range_oob");
-    }
-    let gva = match buf.gva.checked_add(cmd.range_location) {
-        Some(v) => v,
-        None => return br(BlitStatus::Bounds, "fill_pattern4_gva_overflow"),
     };
-    match write_fill_pattern(host, state, task_id, gva, cmd.range_length, &pattern) {
-        Ok(()) => BlitStatus::Ok,
-        Err(st) => st,
-    }
+    execute_resolved_buffer_blit(
+        state,
+        host,
+        task_id,
+        ResolvedBufferBlit::Fill {
+            destination,
+            pattern: BufferFillPattern::Word(pattern),
+        },
+    )
 }
 
 fn exec_copy_buffer_to_buffer<M: HostMemory + HostOps>(
@@ -2005,18 +2070,21 @@ fn exec_copy_buffer_to_buffer<M: HostMemory + HostOps>(
     {
         return br(BlitStatus::Overlap, "b2b_overlap");
     }
-    let s = match src.gva.checked_add(cmd.source_offset) {
-        Some(v) => v,
-        None => return br(BlitStatus::Bounds, "b2b_src_gva_overflow"),
+    let (Some(source), Some(destination)) = (
+        src.range(cmd.source_offset, cmd.size),
+        dst.range(cmd.destination_offset, cmd.size),
+    ) else {
+        return br(BlitStatus::Bounds, "b2b_resolved_range_oob");
     };
-    let d = match dst.gva.checked_add(cmd.destination_offset) {
-        Some(v) => v,
-        None => return br(BlitStatus::Bounds, "b2b_dst_gva_overflow"),
-    };
-    match copy_bytes(host, state, task_id, s, d, cmd.size) {
-        Ok(()) => BlitStatus::Ok,
-        Err(st) => st,
-    }
+    execute_resolved_buffer_blit(
+        state,
+        host,
+        task_id,
+        ResolvedBufferBlit::Copy {
+            source,
+            destination,
+        },
+    )
 }
 
 /// A copy extent the guest asked for, checked against what the texture holds.
