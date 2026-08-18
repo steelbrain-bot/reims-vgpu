@@ -33,9 +33,9 @@ use std::collections::HashMap;
 
 use ash::vk;
 
-use crate::backend::vulkan::caps::host_pointer::ImportTypeRefusal;
 use crate::observe::Decline;
 use crate::runtime::guest_ram::{GuestRamError, GuestRamImport, GuestRef};
+use reims_vgpu_vulkan::host_pointer::ImportTypeRefusal;
 
 /// One host allocation living on the GPU as a bindable buffer, with no copy
 /// between it and the guest's own view of those bytes.
@@ -79,7 +79,7 @@ pub enum HostRamDecline {
     /// log says which check refused; expected on every host without the
     /// extension and on any host where an operator turned the rail off.
     Unsupported {
-        rung: crate::backend::vulkan::caps::HostPointerImport,
+        rung: reims_vgpu_vulkan::host_pointer::HostPointerImport,
     },
     /// The guest ended this parent allocation's lifetime. Old child objects
     /// may finish retiring, but no new view may resurrect its import identity.
@@ -377,7 +377,7 @@ unsafe fn import_ramblock(
     ctx: &super::context::DeviceContext,
     import: &GuestRamImport,
 ) -> Result<ImportedHostRam, HostRamDecline> {
-    use crate::backend::vulkan::caps::host_pointer::GUEST_IMPORT_USAGE;
+    use reims_vgpu_vulkan::host_pointer::GUEST_IMPORT_USAGE;
     use std::time::Instant;
 
     let Some(loader) = ctx.external_memory_host.as_ref() else {
@@ -412,10 +412,10 @@ unsafe fn import_ramblock(
     // guest resident in a pool with no room for it.
     let req = ctx
         .caps
-        .memory_request(crate::backend::vulkan::caps::MemoryClass::Upload);
+        .memory_request(reims_vgpu_vulkan::memory::MemoryClass::Upload);
     let probe_started = Instant::now();
     let picked = unsafe {
-        crate::backend::vulkan::caps::host_pointer::import_memory_type(
+        reims_vgpu_vulkan::host_pointer::import_memory_type(
             loader,
             &ctx.memory_properties,
             host_base as *const std::ffi::c_void,
@@ -523,7 +523,7 @@ pub enum GuestWriteDecline {
     /// The device cannot import guest RAM at all. Carries the rung so the log
     /// says which check refused; expected on every host without the extension.
     Unsupported {
-        rung: crate::backend::vulkan::caps::HostPointerImport,
+        rung: reims_vgpu_vulkan::host_pointer::HostPointerImport,
     },
     /// Guest-memory work is outstanding, but no successful FIFO submission
     /// published a completion point for it. This is an ownership invariant
@@ -614,8 +614,8 @@ crate::observe::decline::decline_display!(GuestWriteDecline);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::vulkan::caps::memory_topology::MemoryTypeRefusal;
-    use crate::backend::vulkan::caps::HostPointerImport;
+    use reims_vgpu_vulkan::host_pointer::HostPointerImport;
+    use reims_vgpu_vulkan::memory::MemoryTypeRefusal;
 
     /// One slug per check. Two sharing one would mean watching a slug fire and
     /// still not knowing whether the driver refused the pointer or the memory

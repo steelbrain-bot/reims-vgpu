@@ -19,9 +19,9 @@ use super::device_lost::{DeviceLostDecline, DeviceLostOp};
 use super::types::{DrawError, ResidentReclaim, StorageImageFormat, TargetIdentity};
 use super::vk_call::{VkCall, VkOp};
 use super::{buffer_slab, color_subresource_range, gpu_span, host_ram, reason, slab, types};
-use crate::backend::vulkan::caps::{MappedMemoryKind, MemoryClass};
 use crate::backend::vulkan::translate;
 use crate::model::ComputeStorageResidencyKey;
+use reims_vgpu_vulkan::memory::{MappedMemoryKind, MemoryClass};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct TargetKey {
@@ -2607,13 +2607,11 @@ const STAGING_MISS_EMIT_EVERY: u64 = 512;
 /// request. The decision uses the existing structural memory-topology
 /// classification, never a vendor or driver name; misclassification can change
 /// performance only.
-pub(crate) const BATCH_MAX_DRAWS: u64 = crate::backend::vulkan::policy::MAX_BATCH_DRAWS;
+pub(crate) const BATCH_MAX_DRAWS: u64 = reims_vgpu_vulkan::policy::MAX_BATCH_DRAWS;
 #[cfg(test)]
-const DISCRETE_BATCH_MAX_DRAWS: u64 = crate::backend::vulkan::policy::DISCRETE_DEFAULT_BATCH_DRAWS;
-fn batch_default_draws(
-    topology: crate::backend::vulkan::caps::memory_topology::MemoryTopology,
-) -> u64 {
-    crate::backend::vulkan::policy::MemoryPlacementPolicy::new(topology).default_batch_draws()
+const DISCRETE_BATCH_MAX_DRAWS: u64 = reims_vgpu_vulkan::policy::DISCRETE_DEFAULT_BATCH_DRAWS;
+fn batch_default_draws(topology: reims_vgpu_vulkan::memory::MemoryTopology) -> u64 {
+    reims_vgpu_vulkan::policy::MemoryPlacementPolicy::new(topology).default_batch_draws()
 }
 
 /// The draws-per-command-buffer cap this device runs with.
@@ -2627,7 +2625,7 @@ fn batch_default_draws(
 /// Called only while an uninitialized pool is being attached to its device.
 /// The chosen cap is then a field on that pool, so neither the environment nor
 /// topology is re-read on the draw path.
-fn batch_max_draws(topology: crate::backend::vulkan::caps::memory_topology::MemoryTopology) -> u64 {
+fn batch_max_draws(topology: reims_vgpu_vulkan::memory::MemoryTopology) -> u64 {
     let default = batch_default_draws(topology);
     let cap = match crate::env::count(crate::env::BATCH_DRAWS, default) {
         crate::env::Count::Narrowed(n) => n,

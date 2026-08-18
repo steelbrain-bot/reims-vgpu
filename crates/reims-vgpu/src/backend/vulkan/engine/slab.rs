@@ -777,7 +777,7 @@ impl SlabPool {
 }
 
 use super::pools::{allocate_memory_timed, AllocSite};
-use crate::backend::vulkan::caps::MemoryClass;
+use reims_vgpu_vulkan::memory::MemoryClass;
 
 /// A slab allocation/free-list invariant that cannot honestly masquerade as a
 /// driver OOM or image-bind failure.

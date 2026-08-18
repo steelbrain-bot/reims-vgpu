@@ -105,15 +105,13 @@ impl Decline for InitDecline {
             Self::BelowApiFloor { minimum, found } => vec![
                 (
                     "minimum",
-                    crate::backend::vulkan::caps::api_floor::version_str(*minimum),
+                    reims_vgpu_vulkan::api_floor::version_str(*minimum),
                 ),
                 (
                     "found",
                     found
                         .iter()
-                        .map(|version| {
-                            crate::backend::vulkan::caps::api_floor::version_str(*version)
-                        })
+                        .map(|version| reims_vgpu_vulkan::api_floor::version_str(*version))
                         .collect::<Vec<_>>()
                         .join(","),
                 ),

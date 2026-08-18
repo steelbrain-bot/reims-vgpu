@@ -2210,7 +2210,7 @@ impl ResourcePools {
     /// A burst quadruples the population and its residents are *smaller* than the
     /// idle set's, so 320 slots was reached at roughly 350 MiB at the burst's mix
     /// and would be 10 GiB at 4K, on a `DEVICE_LOCAL` heap
-    /// ([`crate::backend::vulkan::caps::memory_topology::MemoryProfile::device_local_bytes`])
+    /// ([`reims_vgpu_vulkan::memory::MemoryProfile::device_local_bytes`])
     /// measured in gigabytes. One constant could not be both.
     ///
     /// A count crossing under load means the guest is using more targets than

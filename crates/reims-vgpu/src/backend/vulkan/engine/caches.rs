@@ -93,7 +93,7 @@ impl LayoutKey {
     /// chooses how every consumer writes it.
     pub(crate) fn uses_push_descriptors(
         &self,
-        caps: crate::backend::vulkan::caps::PushDescriptorCaps,
+        caps: reims_vgpu_vulkan::push_descriptor::PushDescriptorCaps,
     ) -> bool {
         !self.bindings.is_empty() && caps.supports_counts(self.bindings.iter().map(|b| b.count))
     }
@@ -2635,7 +2635,7 @@ mod object_cache_tests {
 
     #[test]
     fn push_layout_selection_uses_the_device_limit_and_keeps_the_fallback() {
-        let caps = crate::backend::vulkan::caps::PushDescriptorCaps {
+        let caps = reims_vgpu_vulkan::push_descriptor::PushDescriptorCaps {
             max_descriptors: 32,
         };
         let layout = |counts: &[u32]| LayoutKey {

@@ -11,13 +11,13 @@ use super::device_lost::DeviceLostDecline;
 use super::init_decline::InitDecline;
 use super::types::DrawError;
 use super::vk_call::{VkCall, VkOp};
-use crate::backend::vulkan::caps::api_floor;
-use crate::backend::vulkan::caps::device_select::select_physical_device;
-use crate::backend::vulkan::caps::memory_topology::{
+use crate::contract::pixel_format::TexelLayout;
+use reims_vgpu_vulkan::api_floor;
+use reims_vgpu_vulkan::capabilities::{DriverQuirk, HostGpuCaps};
+use reims_vgpu_vulkan::device_select::select_physical_device;
+use reims_vgpu_vulkan::memory::{
     classify_memory, select_memory_type, MappedMemoryKind, MemoryClass, MemoryRequest,
 };
-use crate::backend::vulkan::caps::{DriverQuirk, HostGpuCaps};
-use crate::contract::pixel_format::TexelLayout;
 
 /// Max device recreates **that produce no guest work between them**.
 ///
@@ -515,10 +515,10 @@ pub(crate) struct DeviceContext {
     pub max_sampler_anisotropy: f32,
     pub sampler_anisotropy: bool,
     /// Every device feature and format capability, as resolved by
-    /// [`crate::backend::vulkan::caps::device_features`]. Behaviour gates read
+    /// [`reims_vgpu_vulkan::device_features`]. Behaviour gates read
     /// this rather than re-querying: a feature asked about in two places is a
     /// feature that will eventually be enabled in one of them.
-    pub features: crate::backend::vulkan::caps::device_features::DeviceFeatures,
+    pub features: reims_vgpu_vulkan::device_features::DeviceFeatures,
     /// Combined depth-stencil format supported for DEPTH_STENCIL_ATTACHMENT on
     /// this device (D32_SFLOAT_S8_UINT preferred, D24_UNORM_S8_UINT fallback).
     /// Used only by the stencil-test path; depth-only uses D32_SFLOAT.
@@ -774,7 +774,7 @@ impl DeviceContext {
                 candidates.len(),
                 api_floor::version_str(*api),
                 api_floor::meets_floor(*api),
-                crate::backend::vulkan::caps::device_select::rank_physical_device(*device_type),
+                reims_vgpu_vulkan::device_select::rank_physical_device(*device_type),
                 driver.driver_id,
                 profile.topology.slug(),
                 profile.device_local_bytes >> 20,
@@ -854,11 +854,8 @@ impl DeviceContext {
         // choose between the 1.2 core feature and the KHR extension there
         // rather than here; see `caps::device_features` for why that decision
         // must not be spread across the two.
-        let features = crate::backend::vulkan::caps::device_features::query(
-            &instance,
-            pd,
-            &has_device_extension,
-        );
+        let features =
+            reims_vgpu_vulkan::device_features::query(&instance, pd, &has_device_extension);
         let storage_image_write_without_format_bgra =
             features.storage_image_write_without_format_bgra();
         let sampled_linear_filter = features.sampled_linear_filter;
@@ -900,7 +897,7 @@ impl DeviceContext {
         // absence of a number is itself the gate and no site can act on a
         // granularity from a device that declined the handle type.
         match host_pointer.rung {
-            crate::backend::vulkan::caps::HostPointerImport::Supported => {
+            reims_vgpu_vulkan::host_pointer::HostPointerImport::Supported => {
                 crate::runtime::guest_ram::latch_import_limits(
                     host_pointer.min_alignment,
                     host_pointer.heap_budget,
@@ -1350,7 +1347,7 @@ impl DeviceContext {
     ///
     /// This is the ONLY memory-type entry point. Call sites name what the
     /// memory is *for*; the topology-dependent flag choice lives in
-    /// [`crate::backend::vulkan::caps::memory_topology`], so a unified host can
+    /// [`reims_vgpu_vulkan::memory`], so a unified host can
     /// skip a staging hop and a discrete host can avoid burning its BAR window
     /// without either decision being duplicated at an allocation site.
     ///
@@ -1413,7 +1410,7 @@ impl DeviceContext {
     fn report_memory_type_refusal(
         &self,
         class: MemoryClass,
-        refusal: crate::backend::vulkan::caps::memory_topology::MemoryTypeRefusal,
+        refusal: reims_vgpu_vulkan::memory::MemoryTypeRefusal,
     ) {
         // The tag is the refusing check and the key is the class, so the two
         // together are the (class, check) pair without a hand-packed word.
@@ -1435,8 +1432,8 @@ impl DeviceContext {
         bytes: u64,
         req: &MemoryRequest,
     ) -> Result<
-        crate::backend::vulkan::caps::memory_topology::MemoryTypePick,
-        crate::backend::vulkan::caps::memory_topology::MemoryTypeRefusal,
+        reims_vgpu_vulkan::memory::MemoryTypePick,
+        reims_vgpu_vulkan::memory::MemoryTypeRefusal,
     > {
         select_memory_type(
             &self.memory_properties,

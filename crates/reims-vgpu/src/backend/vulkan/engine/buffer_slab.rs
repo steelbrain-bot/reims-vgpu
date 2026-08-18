@@ -96,7 +96,7 @@ use super::pools::{allocate_memory_timed, AllocSite};
 use super::slab::{BlockPlan, SlabDecline};
 use super::types::DrawError;
 use super::vk_call::{VkCall, VkOp};
-use crate::backend::vulkan::caps::MemoryClass;
+use reims_vgpu_vulkan::memory::MemoryClass;
 
 /// Which memory a [`BufferSlabPool`] instance suballocates, and the names it
 /// reports under.

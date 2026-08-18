@@ -724,15 +724,15 @@ const _: () = assert!(CAP_PUBLISHED_BIT < u64::BITS);
 
 impl DeviceCapabilitySnapshot {
     const CONSERVATIVE: Self =
-        Self(crate::backend::vulkan::caps::device_features::VULKAN_MIN_IMAGE_DIMENSION_2D as u64);
+        Self(reims_vgpu_vulkan::device_features::VULKAN_MIN_IMAGE_DIMENSION_2D as u64);
 
     fn from_device(ctx: &context::DeviceContext) -> Self {
         Self::from_parts(&ctx.features, ctx.caps.quirks)
     }
 
     fn from_parts(
-        features: &crate::backend::vulkan::caps::device_features::DeviceFeatures,
-        quirks: crate::backend::vulkan::caps::DriverQuirk,
+        features: &reims_vgpu_vulkan::device_features::DeviceFeatures,
+        quirks: reims_vgpu_vulkan::capabilities::DriverQuirk,
     ) -> Self {
         let mut word = u64::from(features.max_image_dimension_2d);
         for (index, supported) in features.color_attachment_blend.iter().enumerate() {
@@ -803,7 +803,7 @@ mod device_capability_snapshot_tests {
         let snapshot = DeviceCapabilitySnapshot::CONSERVATIVE;
         assert_eq!(
             snapshot.max_render_target_dimension(),
-            crate::backend::vulkan::caps::device_features::VULKAN_MIN_IMAGE_DIMENSION_2D
+            reims_vgpu_vulkan::device_features::VULKAN_MIN_IMAGE_DIMENSION_2D
         );
         assert!(!snapshot.render_target_layout_supported(TexelLayout::Rgba16Float));
         assert!(!snapshot.deferred_gpu_only_content_allowed());
@@ -815,7 +815,7 @@ mod device_capability_snapshot_tests {
 
     #[test]
     fn one_word_preserves_every_published_device_answer() {
-        let mut features = crate::backend::vulkan::caps::device_features::DeviceFeatures {
+        let mut features = reims_vgpu_vulkan::device_features::DeviceFeatures {
             max_image_dimension_2d: 16_384,
             ..Default::default()
         };
@@ -824,7 +824,7 @@ mod device_capability_snapshot_tests {
 
         let snapshot = DeviceCapabilitySnapshot::from_parts(
             &features,
-            crate::backend::vulkan::caps::DriverQuirk::default(),
+            reims_vgpu_vulkan::capabilities::DriverQuirk::default(),
         );
         assert_eq!(snapshot.max_render_target_dimension(), 16_384);
         assert!(snapshot.render_target_layout_supported(TexelLayout::Rgba16Float));
@@ -841,7 +841,7 @@ mod device_capability_snapshot_tests {
 
         let narrowed = DeviceCapabilitySnapshot::from_parts(
             &features,
-            crate::backend::vulkan::caps::DriverQuirk {
+            reims_vgpu_vulkan::capabilities::DriverQuirk {
                 guest_pages_stay_authoritative: true,
                 ..Default::default()
             },
@@ -2292,7 +2292,7 @@ pub fn note_resident_content_copied_out(identity: &TargetIdentity) -> bool {
 ///
 /// Held back by the `guest_pages_stay_authoritative` driver quirk, because a
 /// device recreate drops that registry before guest pages are updated. See
-/// [`crate::backend::vulkan::caps::DriverQuirk`] for what the quirk covers and
+/// [`reims_vgpu_vulkan::capabilities::DriverQuirk`] for what the quirk covers and
 /// how to retire it.
 /// Whether a render target's resident may be created at this texel layout's
 /// format, rather than at the engine's neutral eight-bit one.
@@ -2306,7 +2306,7 @@ pub fn note_resident_content_copied_out(identity: &TargetIdentity) -> bool {
 /// the answer for those two has to be constant.
 ///
 /// Anything wider is a real question and is asked of the device:
-/// [`crate::backend::vulkan::caps::device_features::DeviceFeatures::color_attachment_blend`]
+/// [`reims_vgpu_vulkan::device_features::DeviceFeatures::color_attachment_blend`]
 /// holds one probe per [`TexelLayout`] for `COLOR_ATTACHMENT` *and*
 /// `COLOR_ATTACHMENT_BLEND` under optimal tiling. No device yet resolved
 /// answers `false`, which narrows to the format the target would have had
@@ -2339,7 +2339,7 @@ pub fn max_render_target_dimension() -> u32 {
 /// this, so a boot that answers before the device is up must not be the one
 /// that promises the most.
 pub fn device_info_limits() -> crate::model::DeviceInfoLimits {
-    use crate::backend::vulkan::caps::device_features::{
+    use reims_vgpu_vulkan::device_features::{
         VULKAN_MIN_COMPUTE_SHARED_MEMORY_BYTES, VULKAN_MIN_COMPUTE_WORKGROUP_SIZE,
     };
     lock_engine()
@@ -2369,7 +2369,7 @@ pub fn device_info_limits() -> crate::model::DeviceInfoLimits {
 /// the answer is the Vulkan 1.2 required minimum and a single lane — the pair
 /// no dispatch can be oversized against.
 pub fn compute_threadgroup_limits() -> (u32, u32) {
-    use crate::backend::vulkan::caps::device_features::VULKAN_MIN_COMPUTE_WORKGROUP_INVOCATIONS;
+    use reims_vgpu_vulkan::device_features::VULKAN_MIN_COMPUTE_WORKGROUP_INVOCATIONS;
     lock_engine()
         .owner
         .ctx

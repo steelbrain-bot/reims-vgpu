@@ -5872,7 +5872,7 @@ mod scatter_descriptor_sets_do_not_alias {
     /// command-buffer unit before the Vulkan scheduling bound cuts it.
     #[test]
     fn batch_defaults_follow_structural_memory_topology() {
-        use crate::backend::vulkan::caps::memory_topology::MemoryTopology;
+        use reims_vgpu_vulkan::memory::MemoryTopology;
 
         assert_eq!(
             super::batch_default_draws(MemoryTopology::Discrete),

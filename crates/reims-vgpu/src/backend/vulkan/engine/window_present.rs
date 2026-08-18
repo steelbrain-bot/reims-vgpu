@@ -1546,7 +1546,7 @@ impl WindowPresenter {
         let Some(mem_type) = ctx.memory_type_for(
             req.memory_type_bits,
             req.size,
-            crate::backend::vulkan::caps::MemoryClass::Upload,
+            reims_vgpu_vulkan::memory::MemoryClass::Upload,
         ) else {
             ctx.device.destroy_image(image, None);
             return Err(StagingError::NoUploadMemoryType {

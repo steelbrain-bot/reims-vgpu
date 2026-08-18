@@ -11,7 +11,3 @@ pub mod push_descriptor;
 
 pub use reims_vgpu_vulkan::capabilities::{DriverQuirk, HostGpuCaps};
 pub use reims_vgpu_vulkan::{api_floor, device_select};
-
-pub(crate) use host_pointer::HostPointerImport;
-pub(crate) use memory_topology::{MappedMemoryKind, MemoryClass};
-pub(crate) use push_descriptor::PushDescriptorCaps;

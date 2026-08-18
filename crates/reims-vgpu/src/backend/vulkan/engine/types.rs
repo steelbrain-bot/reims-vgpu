@@ -1412,7 +1412,7 @@ pub enum ComputeImageDestination {
     ///
     /// The default, and the *only* form available on a host whose
     /// `VK_EXT_external_memory_host` capability is not
-    /// [`crate::backend::vulkan::caps::host_pointer::HostPointerImport::Supported`].
+    /// [`reims_vgpu_vulkan::host_pointer::HostPointerImport::Supported`].
     /// It is not a fallback bolted in front of a general path: on such a host it
     /// is the general path, and it is what a discrete GPU takes whenever staging
     /// is the correct answer.
