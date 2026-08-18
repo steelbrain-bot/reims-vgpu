@@ -56,7 +56,6 @@ pub use context::MAX_DEVICE_RECREATES;
 pub(crate) use counters::{CounterSnapshot, EngineCounters, TargetReadDelivery};
 pub(crate) use draw_phase::take_window as draw_phase_window;
 pub(crate) use draw_preparation::DrawPreparationDecline;
-#[cfg(feature = "host-window")]
 pub(crate) use facade_decline::EngineFacadeDecline;
 pub use types::viewport_slot_count;
 pub use types::{

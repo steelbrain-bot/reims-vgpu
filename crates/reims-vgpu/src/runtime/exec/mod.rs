@@ -48,6 +48,11 @@ use crate::runtime::mipmap::{self, MipmapStatus};
 use crate::runtime::objects;
 use crate::runtime::plan::event_sync::{Domain as FenceDomain, FenceAction};
 use crate::runtime::task_slot::{resolve_task_word, TaskWordSite};
+#[cfg(feature = "backend-vulkan")]
+use reims_vgpu_protocol::{
+    ObjectRef, ResourceObject, ResourceValidity, SegmentBoundary, SegmentKind, SubmissionId,
+    SubmissionIdentity, SubmissionResourceUse, TaskId,
+};
 use reims_vgpu_wire::ops::blit as wire_blit;
 use reims_vgpu_wire::ops::render as wire_render;
 use reims_vgpu_wire::ops::render_pass as wire_pass;
@@ -786,6 +791,33 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         return out;
     }
 
+    #[cfg(feature = "backend-vulkan")]
+    {
+        let identity = SubmissionIdentity {
+            id: SubmissionId::new(state.next_submission_id),
+            task: TaskId::new(task_id),
+        };
+        state.next_submission_id = state.next_submission_id.wrapping_add(1).max(1);
+        let resources: std::sync::Arc<[SubmissionResourceUse]> = resource_descs
+            .iter()
+            .map(|desc| SubmissionResourceUse {
+                object: ObjectRef::<ResourceObject>::new(desc.object_id),
+                validity: ResourceValidity {
+                    clear_host: desc.ops.clear_host_valid != 0,
+                    set_host: desc.ops.set_host_valid != 0,
+                    clear_guest: desc.ops.clear_guest_valid != 0,
+                    set_guest: desc.ops.set_guest_valid != 0,
+                },
+            })
+            .collect::<Vec<_>>()
+            .into();
+        state.active_submission = Some(crate::runtime::executor::SubmissionContext {
+            identity,
+            resources,
+            segment: None,
+        });
+    }
+
     // Before any of this submission's work runs. Each record states what was
     // true of its resource *before* the submission, so a pending window holding
     // pixels the guest has since overwritten has to go now — landing it later
@@ -813,6 +845,10 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         )
         .field("task", task_id)
         .fail();
+    }
+    #[cfg(feature = "backend-vulkan")]
+    {
+        state.active_submission = None;
     }
     note_exec_header(exec_started, measured_ns);
     out.total_us = elapsed_us(exec_started);
@@ -1306,6 +1342,24 @@ fn walk_submitted_stream<M: HostMemory + HostOps>(
         }
         if stream::segment_disposition(seg.type_) == stream::SegmentDisposition::Envelope {
             continue;
+        }
+
+        #[cfg(feature = "backend-vulkan")]
+        if let Some(context) = state.active_submission.as_mut() {
+            let kind = match seg.type_ {
+                SEGMENT_TYPE_RENDER => SegmentKind::Render,
+                SEGMENT_TYPE_COMPUTE => SegmentKind::Compute,
+                SEGMENT_TYPE_BLIT => SegmentKind::Blit,
+                SEGMENT_TYPE_EVENT => SegmentKind::Event,
+                SEGMENT_TYPE_INFO => SegmentKind::Info,
+                _ => unreachable!("walk disposition admitted no segment kind"),
+            };
+            context.segment = Some(SegmentBoundary {
+                index: seg.index,
+                kind,
+                continues_previous: seg.begin_flag != 0,
+                continues_next: seg.unidentified_u8 != 0,
+            });
         }
 
         let mut encoder = if seg.begin_flag != 0 {

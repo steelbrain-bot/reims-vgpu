@@ -28,6 +28,9 @@ pub mod drain;
 /// (`/tmp/reims-vgpu-fail.log`); `line()` is the `REIMS_VGPU_DRAW_LOG=1`-gated tier.
 /// CmdExecIndirect2 stream walk + type-11 resolve.
 pub mod exec;
+/// Device-owned execution port and the compatibility Vulkan adapter.
+#[cfg(feature = "backend-vulkan")]
+pub mod executor;
 /// Product-path event + encoder fence sync (event/blit/compute/render domains).
 pub mod fence_exec;
 /// Contract generations and exact device-write footprints for sampled gathers.

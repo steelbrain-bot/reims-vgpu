@@ -4424,7 +4424,9 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             req,
             std::time::Duration::from_millis(COMPUTE_ENGINE_STALL_PROXY_MS),
         );
-        let out = vk_engine::execute_compute_request(req);
+        let executor = std::sync::Arc::clone(&state.executor);
+        let submission = crate::runtime::executor::context_for(state, task_id);
+        let out = crate::runtime::executor::execute_compute(executor.as_ref(), &submission, req);
         engine_done.store(true, std::sync::atomic::Ordering::Release);
         out
     };

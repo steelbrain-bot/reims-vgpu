@@ -7773,7 +7773,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // the boundary below names the engine's specific check as the primary
         // `reason=` rather than flattening it into a `vk_engine: {e}` blob.
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Engine);
-        let out = crate::backend::vulkan::engine::execute_draw_request(&resources)?;
+        let executor = std::sync::Arc::clone(&state.executor);
+        let submission = crate::runtime::executor::context_for(state, req.task_id);
+        let out =
+            crate::runtime::executor::execute_draw(executor.as_ref(), &submission, &resources)?;
         if resources.target_identity.is_some() {
             if let Some(resource) = req.colors.first().and_then(|color| color.resource.as_ref()) {
                 resource.note_render_target_use();

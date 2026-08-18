@@ -14,6 +14,10 @@ use crate::observe::Decline;
 /// A specific engine façade or host-window presenter state failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EngineFacadeDecline {
+    ExecutorCompletionKindMismatch {
+        expected: &'static str,
+        actual: &'static str,
+    },
     WindowPresenterNotAttached,
     StorageReadResidentAbsent {
         identity: ComputeStorageResidencyKey,
@@ -31,6 +35,9 @@ pub enum EngineFacadeDecline {
 impl Decline for EngineFacadeDecline {
     fn slug(&self) -> &'static str {
         match self {
+            Self::ExecutorCompletionKindMismatch { .. } => {
+                "vk_engine_executor_completion_kind_mismatch"
+            }
             Self::WindowPresenterNotAttached => "vk_engine_window_presenter_not_attached",
             Self::StorageReadResidentAbsent { .. } => "vk_engine_storage_read_resident_absent",
             Self::StorageReadGenerationMismatch { .. } => {
@@ -44,6 +51,10 @@ impl Decline for EngineFacadeDecline {
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
+            Self::ExecutorCompletionKindMismatch { expected, actual } => vec![
+                ("expected", (*expected).to_string()),
+                ("actual", (*actual).to_string()),
+            ],
             Self::WindowPresenterNotAttached => Vec::new(),
             Self::StorageReadResidentAbsent { identity } => residency_fields(identity),
             Self::StorageReadGenerationMismatch {
@@ -95,6 +106,10 @@ mod tests {
 
     fn all() -> Vec<EngineFacadeDecline> {
         vec![
+            EngineFacadeDecline::ExecutorCompletionKindMismatch {
+                expected: "draw",
+                actual: "compute",
+            },
             EngineFacadeDecline::WindowPresenterNotAttached,
             EngineFacadeDecline::StorageReadResidentAbsent {
                 identity: residency(),
@@ -124,7 +139,7 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 4, "the engine façade reason census moved");
+        assert_eq!(before, 5, "the engine façade reason census moved");
         assert_eq!(before, slugs.len(), "duplicate engine façade slug");
     }
 

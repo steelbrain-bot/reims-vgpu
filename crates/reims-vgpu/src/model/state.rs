@@ -2282,6 +2282,16 @@ impl NamedMappings {
 #[derive(Debug)]
 pub struct DeviceState {
     pub id: DeviceId,
+    /// Device-owned execution port. The Vulkan adapter is the product default;
+    /// tests may inject a scripted executor through [`Self::new_with_executor`].
+    #[cfg(feature = "backend-vulkan")]
+    pub(crate) executor: Arc<dyn crate::runtime::executor::Executor>,
+    /// Submission metadata currently being decoded and executed.
+    #[cfg(feature = "backend-vulkan")]
+    pub(crate) active_submission: Option<crate::runtime::executor::SubmissionContext>,
+    /// Next device-local submission generation.
+    #[cfg(feature = "backend-vulkan")]
+    pub(crate) next_submission_id: u64,
     /// Guest page shift for PFN↔GPA wire math (12 = x86, 14 = arm64e).
     pub page_shift: u32,
     pub gfx: GfxRegs,
@@ -2697,8 +2707,37 @@ impl DeviceState {
     /// `page_shift` must be **12** (x86_64 / Tahoe) or **14** (arm64e). There
     /// is no default — product create and tests must choose explicitly.
     pub fn new(id: DeviceId, page_shift: u32) -> Self {
+        #[cfg(feature = "backend-vulkan")]
+        return Self::new_with_executor(
+            id,
+            page_shift,
+            Arc::new(crate::runtime::executor::VulkanExecutor),
+        );
+
+        #[cfg(not(feature = "backend-vulkan"))]
+        Self::new_inner(id, page_shift)
+    }
+
+    #[cfg(feature = "backend-vulkan")]
+    pub fn new_with_executor(
+        id: DeviceId,
+        page_shift: u32,
+        executor: Arc<dyn crate::runtime::executor::Executor>,
+    ) -> Self {
+        let mut state = Self::new_inner(id, page_shift);
+        state.executor = executor;
+        state
+    }
+
+    fn new_inner(id: DeviceId, page_shift: u32) -> Self {
         Self {
             id,
+            #[cfg(feature = "backend-vulkan")]
+            executor: Arc::new(crate::runtime::executor::VulkanExecutor),
+            #[cfg(feature = "backend-vulkan")]
+            active_submission: None,
+            #[cfg(feature = "backend-vulkan")]
+            next_submission_id: 1,
             page_shift,
             gfx: GfxRegs::default(),
             iosfc: IosfcRegs::default(),

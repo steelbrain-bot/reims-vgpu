@@ -8,12 +8,17 @@
 
 pub mod identity;
 pub mod resource;
+pub mod submission;
 
 pub use identity::{
     ByteLength, ByteOffset, GuestPhysicalAddress, GuestVirtualAddress, MappingId, ObjectRef,
-    ResourceId, ResourceNamespaceId, StorageId, SurfaceBackingId, SurfaceId, TaskId,
+    ResourceId, ResourceNamespaceId, StorageId, SubmissionId, SurfaceBackingId, SurfaceId, TaskId,
 };
 pub use resource::{
     decode_object_list_entry, ObjectKind, ObjectListDecodeError, ObjectListEntry,
     OBJECT_LIST_ENTRY_LEN,
+};
+pub use submission::{
+    ResourceObject, ResourceValidity, SegmentBoundary, SegmentKind, SubmissionIdentity,
+    SubmissionResourceUse,
 };
