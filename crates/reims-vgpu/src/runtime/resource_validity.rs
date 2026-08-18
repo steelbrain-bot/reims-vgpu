@@ -48,6 +48,8 @@
 
 use crate::model::{DeviceState, ResourceValidity};
 use crate::runtime::decode::fifo::InvalidateValidityOps;
+use reims_vgpu_core::ResolvedResourceState;
+use reims_vgpu_protocol::{ObjectRef, ResourceObject};
 
 /// Which producer delivered a quad. Only used to name the counters, so an arm
 /// can tell an exec-table statement from an invalidate-command one.
@@ -90,7 +92,23 @@ pub fn apply(
     ops: InvalidateValidityOps,
     site: ValiditySite,
 ) -> ValidityOutcome {
+    let update = ResolvedResourceState {
+        object: ObjectRef::<ResourceObject>::new(object_id),
+        resource: state.task_resources.identity(task_id, object_id),
+        ops,
+    };
+    apply_resolved(state, task_id, update, site)
+}
+
+fn apply_resolved(
+    state: &mut DeviceState,
+    task_id: u32,
+    update: ResolvedResourceState,
+    site: ValiditySite,
+) -> ValidityOutcome {
     let mut out = ValidityOutcome::default();
+    let object_id = update.object.get();
+    let ops = update.ops;
     if object_id == 0 {
         // `writeInvalidates` skips null resources and id 0; `pageBacking` never
         // emits one. A zero id names nothing to apply to — and is not a *miss*
@@ -105,7 +123,9 @@ pub fn apply(
         // resource, including buffers and textures without a MappingEntry.
         // Mapping generations below remain cache invalidation witnesses during
         // the migration; they no longer stand in for the resource's version.
-        state.task_resources.note_guest_write(task_id, object_id);
+        if let Some(resource) = update.resource {
+            state.task_resources.note_guest_write_by_id(resource);
+        }
     }
     let targets = state.mappings_named_by(task_id, object_id);
     let mut hit = false;
@@ -366,7 +386,7 @@ mod tests {
     /// authoritative.
     #[test]
     fn the_pageon_quad_hands_ownership_to_the_guest() {
-        let after = next_validity(ResourceValidity::default(), InvalidateValidityOps::PAGEON);
+        let after = next_validity(ResourceValidity::default(), InvalidateValidityOps::PAGE_ON);
         assert!(!after.host_valid);
         assert!(after.guest_valid);
         assert!(after.host_stated && after.guest_stated);

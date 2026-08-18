@@ -10,6 +10,7 @@ pub mod blit;
 pub mod identity;
 pub mod pixel;
 pub mod resource;
+pub mod resource_state;
 pub mod submission;
 
 pub use blit::{
@@ -26,6 +27,7 @@ pub use resource::{
     FunctionObject, ObjectKind, ObjectListDecodeError, ObjectListEntry, RenderPipelineObject,
     SamplerObject, OBJECT_LIST_ENTRY_LEN,
 };
+pub use resource_state::ResourceValidityOps;
 pub use submission::{
     HeapObject, IndirectCommandBufferObject, ResourceObject, ResourceValidity, SegmentBoundary,
     SegmentKind, SubmissionIdentity, SubmissionResourceUse,

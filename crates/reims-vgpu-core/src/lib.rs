@@ -8,6 +8,7 @@ pub mod execution;
 pub mod namespace;
 pub mod residency;
 pub mod resource;
+pub mod resource_state;
 pub mod service;
 pub mod submission;
 pub mod target;
@@ -28,6 +29,7 @@ pub use resource::{
     MappingNode, PendingContentWrite, ReplicaVersions, ResourceGraph, ResourceNode, StorageBacking,
     StorageNode,
 };
+pub use resource_state::ResolvedResourceState;
 pub use service::{
     GuestWriteReach, GuestWriteService, PresentDecline, PresentationService, ReadbackLease,
     ReadbackService, ResidentContent, ResidentReclaim, ResidentService, TargetReadback,
