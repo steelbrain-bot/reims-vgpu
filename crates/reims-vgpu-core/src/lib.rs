@@ -4,8 +4,10 @@
 
 pub mod blit;
 pub mod capabilities;
+pub mod endian;
 pub mod execution;
 pub mod namespace;
+pub mod pixel_format;
 pub mod residency;
 pub mod resource;
 pub mod resource_state;

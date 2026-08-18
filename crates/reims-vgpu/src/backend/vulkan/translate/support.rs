@@ -34,7 +34,7 @@
 //! reason that "the shader's input variable is a three-component vector". That
 //! is the condition, not a fact — nothing checked it, and a `vec4` reader is
 //! exactly the shape that makes it false. So `VertexFormatSupport::resolve` now asks
-//! [`crate::runtime::spirv_vertex_input`] what the shader declares at the
+//! [`reims_vgpu_vulkan::spirv_vertex_input`] what the shader declares at the
 //! attribute's location, and widens only where the answer makes the
 //! substitution invisible:
 //!
@@ -69,7 +69,7 @@ use ash::vk;
 use super::reason::TranslateReason;
 use super::vertex::{self, VertexLayout};
 use crate::backend::vulkan::engine::VertexAttributeFormat;
-use crate::runtime::spirv_vertex_input::InputWidth;
+use reims_vgpu_vulkan::spirv_vertex_input::InputWidth;
 
 /// What the pipeline should bind for one vertex attribute on this device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

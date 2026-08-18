@@ -22,7 +22,7 @@
 use ash::vk;
 
 use super::reason::TranslateReason;
-use crate::contract::pixel_format::{
+use reims_vgpu_core::pixel_format::{
     self, SampledByteFormat, StorageImageSelector, SwizzlePlan, SwizzleSource, TexelLayout,
     COMPONENT_A, COMPONENT_B, COMPONENT_G, COMPONENT_R,
 };
@@ -111,7 +111,7 @@ fn srgb(vk: vk::Format, linear_vk: vk::Format, bytes_per_texel: u32) -> PixelFor
 
 /// Translate one decoded `MTLPixelFormat`.
 ///
-/// Total over the values `crate::contract::pixel_format` defines; every other
+/// Total over the values `reims_vgpu_core::pixel_format` defines; every other
 /// value declines by name rather than reaching a default. Depth/stencil arms
 /// are included because the same enum carries them on the wire — whether a
 /// given role (colour attachment, storage image, sampled) admits a format is a
@@ -309,7 +309,7 @@ pub fn vk_sampled_bytes(format: SampledByteFormat) -> vk::Format {
 ///
 /// The inverse of [`vk_texel_layout`], for the engine, which holds a resolved
 /// `vk::Format` for an attachment and needs the layout to ask
-/// [`crate::contract::pixel_format`] how to write a texel of it. Written as a
+/// [`reims_vgpu_core::pixel_format`] how to write a texel of it. Written as a
 /// search of `TexelLayout::ALL` rather than as a second `match`, so it cannot
 /// disagree with the forward map and a new layout is covered the moment it is
 /// added to `ALL`.
@@ -528,7 +528,7 @@ pub fn color_attachment(
 /// hand the guest its pages directly, and one that cannot must read back and
 /// convert.
 ///
-/// # Why this is not [`crate::contract::pixel_format::store_texel_order`]
+/// # Why this is not [`reims_vgpu_core::pixel_format::store_texel_order`]
 ///
 /// Both guest-page writeback licences used to ask that function, and it is the
 /// **render Store's** table: its own doc states the membership rule as "a guest
@@ -588,7 +588,7 @@ pub fn verbatim_texel(mtl: u16) -> Option<(vk::Format, u32)> {
 /// decline unnecessary: every selector the contract can produce has an engine
 /// format, and a new one cannot be added without this answering for it.
 pub fn storage_image_from_selector(selector: StorageImageSelector) -> StorageImageFormat {
-    use crate::contract::pixel_format::StorageImageSelector as S;
+    use reims_vgpu_core::pixel_format::StorageImageSelector as S;
     match selector {
         S::Rgba8Uint => StorageImageFormat::Rgba8Uint,
         S::Rgba8Sint => StorageImageFormat::Rgba8Sint,
@@ -639,7 +639,7 @@ pub fn storage_image_from_selector(selector: StorageImageSelector) -> StorageIma
 /// A test below pins the first point, so if a future selector does admit an
 /// sRGB format this comment stops being true loudly rather than quietly.
 pub fn storage_image(mtl: u16) -> Result<StorageImageFormat, TranslateReason> {
-    use crate::contract::pixel_format as pf;
+    use reims_vgpu_core::pixel_format as pf;
     // Validate the format against the one pixel table first, so an entirely
     // unknown value declines as `unknown_pixel_format` rather than as a missing
     // storage layout — those are different bugs and want different slugs.
@@ -691,7 +691,7 @@ pub fn storage_image(mtl: u16) -> Result<StorageImageFormat, TranslateReason> {
 /// packed formats a compute shader reads and [`sampled_pixels`] has no
 /// [`TexelLayout`] for, because that one answers a CPU-upload byte order.
 pub fn sampled_image(mtl: u16) -> Result<StorageImageFormat, TranslateReason> {
-    use crate::contract::pixel_format as pf;
+    use reims_vgpu_core::pixel_format as pf;
     // Sampled-only members first, then everything a storage image may be. The
     // `translate` call keeps an entirely unknown value declining as
     // `unknown_pixel_format` rather than as a missing layout, exactly as
@@ -803,7 +803,7 @@ fn srgb_decline(f: &PixelFormat, mtl: u16) -> Option<TranslateReason> {
 ///
 /// The plan passed in is **already folded**: the caller composes the decoded
 /// type-8 view swizzle over the format's own channel remap with
-/// [`crate::contract::pixel_format::SwizzlePlan::after`], because a
+/// [`reims_vgpu_core::pixel_format::SwizzlePlan::after`], because a
 /// `VkComponentMapping` can express one plan and a bind may need both. This
 /// function does no composing of its own and must not start — it would then be
 /// a second place the fold happens, and the two would disagree the first time
@@ -1783,7 +1783,7 @@ mod tests {
         );
         assert_eq!(
             TexelLayout::Rgba16Float.bytes_per_texel(),
-            crate::contract::pixel_format::RGBA16F_BPP
+            reims_vgpu_core::pixel_format::RGBA16F_BPP
         );
         assert_eq!(
             sampled_pixels(0xffff).unwrap_err(),
@@ -1830,7 +1830,7 @@ mod tests {
     /// color-managed desktop composite failed with `draw_vk_nothing_stored`.
     #[test]
     fn single_channel_float_samples_natively_through_its_own_layout() {
-        use crate::contract::pixel_format::TexelLayout;
+        use reims_vgpu_core::pixel_format::TexelLayout;
         let (layout, decline, _) =
             sampled_pixels(p::MTL_FORMAT_R16_FLOAT).expect("R16F is sampled");
         assert_eq!(layout, TexelLayout::R16Float);
@@ -1868,7 +1868,7 @@ mod tests {
     /// derived expectation would fail to catch.
     #[test]
     fn every_texel_layout_uploads_as_a_format_of_its_own_width() {
-        use crate::contract::pixel_format::TexelLayout;
+        use reims_vgpu_core::pixel_format::TexelLayout;
         for (layout, format, width) in [
             (TexelLayout::Rgba8, vk::Format::R8G8B8A8_UNORM, 4u32),
             (TexelLayout::Bgra8, vk::Format::B8G8R8A8_UNORM, 4),
