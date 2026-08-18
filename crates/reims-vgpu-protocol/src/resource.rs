@@ -44,6 +44,23 @@ impl ColorWriteMask {
     }
 }
 
+/// One semantic color-attachment entry in a render-pipeline descriptor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PipelineColorAttachment {
+    pub slot: u32,
+    pub has_pixel_format: bool,
+    pub pixel_format: u32,
+    pub blending_enabled: bool,
+    pub src_rgb: u32,
+    pub dst_rgb: u32,
+    pub op_rgb: u32,
+    pub src_alpha: u32,
+    pub dst_alpha: u32,
+    pub op_alpha: u32,
+    /// Channels written independently of whether blending is enabled.
+    pub write_mask: ColorWriteMask,
+}
+
 /// Marker for the sampler API's independent reference namespace.
 pub enum SamplerObject {}
 /// Marker for the depth-stencil API's independent reference namespace.

@@ -623,24 +623,7 @@ impl VertexAttribute {
     }
 }
 
-/// One pipeline color-attachment entry (format + blend) from the type-7 color section.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PipelineColorAttachment {
-    pub slot: u32,
-    pub has_pixel_format: bool,
-    pub pixel_format: u32,
-    pub blending_enabled: bool,
-    pub src_rgb: u32,
-    pub dst_rgb: u32,
-    pub op_rgb: u32,
-    pub src_alpha: u32,
-    pub dst_alpha: u32,
-    pub op_alpha: u32,
-    /// Which channels this attachment writes. Independent of blending: a
-    /// masked attachment with blending off still leaves the unwritten channels
-    /// alone, so this cannot ride inside the blend state.
-    pub write_mask: ColorWriteMask,
-}
+pub use reims_vgpu_protocol::resource::PipelineColorAttachment;
 
 /// Decoded type-7 render pipeline (functions + optional stage-in attrs).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

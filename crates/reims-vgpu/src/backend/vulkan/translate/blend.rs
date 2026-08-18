@@ -9,7 +9,7 @@ use ash::vk;
 
 use super::reason::TranslateReason;
 use crate::backend::vulkan::engine::{BlendFactor, BlendOp, BlendStateResource};
-use crate::runtime::decode::resource::{
+use reims_vgpu_protocol::resource::{
     ColorWriteMask, PipelineColorAttachment, MTL_COLOR_WRITE_MASK_ALPHA, MTL_COLOR_WRITE_MASK_BLUE,
     MTL_COLOR_WRITE_MASK_GREEN, MTL_COLOR_WRITE_MASK_RED,
 };
