@@ -57,7 +57,7 @@ pub enum MemError {
     /// A page of the span resolves to a GPA that is not guest RAM, so no host
     /// mapping can cover it (mapper / wild-PFN class).
     NotRam,
-    /// [`HostOps::map_pages`] refused a **packed** page run the walk had already
+    /// [`HostPageViews::map_pages`] refused a **packed** page run the walk had already
     /// resolved — a RAMBlock or MemoryRegion edge, not a gap in the GPA list.
     /// Fragmentation alone never reaches here: the multi-import path splits a
     /// gapped span into packed runs and maps them one at a time.
@@ -411,13 +411,15 @@ impl crate::observe::Decline for GuestRamRegionsError {
 
 crate::observe::decline::decline_display!(GuestRamRegionsError);
 
-/// Services the device cannot provide itself (time, wake, action enqueue,
-/// guest CPU / KVA access for the IOSurface mapper path).
-pub trait HostOps {
+/// Clock, wake, and typed host-effect delivery.
+pub trait HostControl {
     fn mono_ns(&self) -> u64;
     fn enqueue(&mut self, action: HostAction);
     fn schedule_bh(&mut self);
+}
 
+/// Directed guest CPU and kernel-virtual-address introspection.
+pub trait GuestCpuAccess {
     /// Read guest kernel virtual address (cpu_memory_rw_debug). Default: fail.
     fn read_kva(&self, _kva: u64, _buf: &mut [u8]) -> Result<(), MemError> {
         Err(MemError::Unmapped)
@@ -429,7 +431,19 @@ pub trait HostOps {
     fn read_xreg(&self, _index: u32) -> Result<u64, MemError> {
         Err(MemError::XregUnavailable)
     }
+}
 
+/// Stable RAMBlock discovery for whole-guest-memory import.
+pub trait GuestRamProvider {
+    fn guest_ram_regions(
+        &mut self,
+    ) -> Result<Vec<crate::runtime::guest_ram::GuestRamRegion>, GuestRamRegionsError> {
+        Err(GuestRamRegionsError::CallbackMissing)
+    }
+}
+
+/// Ownership-bearing views over directed sets of guest pages.
+pub trait HostPageViews {
     /// Build one contiguous host-VA view over guest pages (page-aligned GPAs).
     ///
     /// `page_size` is the guest page size (4 KiB x86 / 16 KiB arm64e). Each
@@ -440,17 +454,17 @@ pub trait HostOps {
         None
     }
 
-    /// Release a view obtained from [`HostOps::map_pages`].
+    /// Release a view obtained from [`HostPageViews::map_pages`].
     fn unmap_pages(&mut self, _ptr: usize, _len: usize) {}
 
-    /// True when [`HostOps::map_pages`] returns a **stable** alias of guest
+    /// True when [`HostPageViews::map_pages`] returns a **stable** alias of guest
     /// RAM: the pointer stays valid for the device lifetime,
-    /// [`HostOps::unmap_pages`] is a no-op, and the address is never recycled
+    /// [`HostPageViews::unmap_pages`] is a no-op, and the address is never recycled
     /// for unrelated memory.
     ///
     /// This is a claim about a CPU-side *view* only, and says nothing about the
     /// GPU rail: guest RAM reaches the GPU by importing the spans
-    /// [`HostOps::guest_ram_regions`] names, which are QEMU's own RAMBlock
+    /// [`GuestRamProvider::guest_ram_regions`] names, which are QEMU's own RAMBlock
     /// mappings and never a view this call built.
     ///
     /// Default `false` — the conservative answer, so a host that has not
@@ -468,25 +482,19 @@ pub trait HostOps {
     /// device init and not again — the answer does not change, and re-importing
     /// pays the driver's page pinning for an answer that is already known.
     ///
-    /// Deliberately not [`HostOps::map_pages`] with a different return type.
+    /// Deliberately not [`HostPageViews::map_pages`] with a different return type.
     /// That call answers about specific pages and on the sysbus shim may build a
     /// transient `mach_vm_remap` view the caller has to release; this one never
     /// allocates and never releases.
     ///
     /// Default: unavailable. A host that cannot answer says so by name, and the
     /// caller runs the copying rails rather than reaching for `map_pages`.
-    fn guest_ram_regions(
-        &mut self,
-    ) -> Result<Vec<crate::runtime::guest_ram::GuestRamRegion>, GuestRamRegionsError> {
-        Err(GuestRamRegionsError::CallbackMissing)
-    }
-
     /// True if `gpa` is guest RAM (not MMIO / ROM / unmapped). Product QEMU
     /// implements via `address_space_translate` + `memory_region_is_ram`.
     /// Default: true (fixtures / NullHost without a RAM map).
     ///
     /// **Answers for one address.** A caller holding a span must ask
-    /// [`HostOps::first_non_ram_page`] instead — see the sampling trap recorded
+    /// [`HostPageViews::first_non_ram_page`] instead — see the sampling trap recorded
     /// there.
     fn is_ram_gpa(&self, _gpa: u64) -> bool {
         true
@@ -497,7 +505,7 @@ pub trait HostOps {
     ///
     /// # Two endpoints are not a span
     ///
-    /// [`HostOps::is_ram_gpa`] answers about a single address, and a caller that
+    /// [`HostPageViews::is_ram_gpa`] answers about a single address, and a caller that
     /// wants to know whether a *range* is readable has to ask about every page
     /// of it. Testing the first and last byte reads as thorough and is not: a
     /// guest-physical range is a walk through whatever regions the machine
@@ -539,6 +547,12 @@ pub trait HostOps {
         None
     }
 }
+
+/// Compatibility bound for operations which genuinely consume every host
+/// port. New helpers should name only the narrow traits they use.
+pub trait HostOps: HostControl + GuestCpuAccess + GuestRamProvider + HostPageViews {}
+
+impl<T: HostControl + GuestCpuAccess + GuestRamProvider + HostPageViews + ?Sized> HostOps for T {}
 
 /// Arm64e guest page size, from the contract shift rather than a literal.
 /// FakeHost / `map_pages` test fixture only — product paths use
@@ -593,7 +607,7 @@ struct RealRange {
 /// Combined host for unit tests: GPA store + action log + BH flag.
 ///
 /// GPA ranges are backed by real page-aligned host memory so
-/// [`HostOps::map_pages`] views work exactly like production (mach_vm_remap
+/// [`HostPageViews::map_pages`] views work exactly like production (mach_vm_remap
 /// aliasing): a GPU/CPU write through a view is immediately visible via
 /// `read_gpa` and vice versa. Bytes outside mapped ranges live in a sparse
 /// map (synthetic KVA fixtures); unmapped reads stay permissive zeros.
@@ -616,7 +630,7 @@ pub struct FakeHost {
     /// reconstruct scattered shared pages; this narrower fixture exercises the
     /// refusal and multi-run fallback arms.
     pub strict_linux_map: bool,
-    /// Test-controlled answer for [`HostOps::map_pages_stable`]. Keep separate
+    /// Test-controlled answer for [`HostPageViews::map_pages_stable`]. Keep separate
     /// from `strict_linux_map`: packed shape and pointer lifetime are distinct
     /// host contracts.
     pub stable_map_pages: bool,
@@ -761,7 +775,7 @@ impl FakeHost {
     }
 
     /// Report `[base, base + len)` as device memory rather than guest RAM, so
-    /// [`HostOps::is_ram_gpa`] answers `false` inside it.
+    /// [`HostPageViews::is_ram_gpa`] answers `false` inside it.
     ///
     /// Models a PCI BAR. Reads and writes still work through this fixture —
     /// the point is the *classification*, which is what production QEMU refuses
@@ -1149,7 +1163,7 @@ impl HostMemory for FakeHost {
 }
 
 #[cfg(test)]
-impl HostOps for FakeHost {
+impl GuestRamProvider for FakeHost {
     /// The real ranges this fixture has mapped, as RAMBlocks.
     ///
     /// The default trait impl answers `CallbackMissing`, which puts the guest-RAM
@@ -1174,20 +1188,12 @@ impl HostOps for FakeHost {
             })
             .collect())
     }
+}
 
+#[cfg(test)]
+impl HostControl for FakeHost {
     fn mono_ns(&self) -> u64 {
         self.mono_ns
-    }
-
-    /// Everything is RAM unless a test said otherwise through
-    /// [`FakeHost::mark_non_ram`], which keeps the default identical to the
-    /// flat `true` this fixture answered before.
-    fn is_ram_gpa(&self, gpa: u64) -> bool {
-        !self
-            .non_ram
-            .borrow()
-            .iter()
-            .any(|&(start, end)| gpa >= start && gpa < end)
     }
 
     fn enqueue(&mut self, action: HostAction) {
@@ -1203,7 +1209,10 @@ impl HostOps for FakeHost {
     fn schedule_bh(&mut self) {
         self.bh_scheduled = true;
     }
+}
 
+#[cfg(test)]
+impl GuestCpuAccess for FakeHost {
     fn read_kva(&self, kva: u64, buf: &mut [u8]) -> Result<(), MemError> {
         // Tests map "KVA" into the same sparse store as GPA.
         self.read_gpa(kva, buf)
@@ -1214,6 +1223,19 @@ impl HostOps for FakeHost {
             .get(&index)
             .copied()
             .ok_or(MemError::XregUnavailable)
+    }
+}
+
+#[cfg(test)]
+impl HostPageViews for FakeHost {
+    /// Everything is RAM unless a test said otherwise through
+    /// [`FakeHost::mark_non_ram`].
+    fn is_ram_gpa(&self, gpa: u64) -> bool {
+        !self
+            .non_ram
+            .borrow()
+            .iter()
+            .any(|&(start, end)| gpa >= start && gpa < end)
     }
 
     fn map_pages_stable(&self) -> bool {
@@ -1445,8 +1467,8 @@ mod tests {
 
     /// A span walk finds a hole its two endpoints cannot see.
     ///
-    /// This is the whole reason [`HostOps::first_non_ram_page`] exists rather
-    /// than two [`HostOps::is_ram_gpa`] calls at the caller, and it is the shape
+    /// This is the whole reason [`HostPageViews::first_non_ram_page`] exists rather
+    /// than two [`HostPageViews::is_ram_gpa`] calls at the caller, and it is the shape
     /// a driven boot hit: both ends of the EFI console framebuffer answered RAM
     /// and a page 375 rows in did not.
     #[test]

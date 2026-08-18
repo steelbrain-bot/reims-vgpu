@@ -1411,7 +1411,7 @@ fn the_efi_console_paint_refuses_a_span_whose_hole_is_not_at_either_end() {
     let span = (h as u64) * (stride as u64);
     let page = 1u64 << crate::model::PAGE_SHIFT_X86;
 
-    use crate::runtime::host::HostOps;
+    use crate::runtime::host::HostPageViews;
 
     let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
     state.gfx.efi_fb_start = fb;

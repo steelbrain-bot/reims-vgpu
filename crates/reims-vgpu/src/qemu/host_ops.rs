@@ -6,7 +6,7 @@
 //! the main loop.
 
 use crate::runtime::host::{
-    GuestRamRegionsError, HostAction, HostActionKind, HostMemory, HostOps, MemError,
+    GuestRamRegionsError, HostAction, HostActionKind, HostMemory, MemError,
 };
 use std::collections::VecDeque;
 use std::os::raw::{c_int, c_void};
@@ -324,7 +324,7 @@ impl HostMemory for QemuHost<'_> {
     }
 }
 
-impl HostOps for QemuHost<'_> {
+impl crate::runtime::host::HostControl for QemuHost<'_> {
     fn mono_ns(&self) -> u64 {
         match self.ops.mono_ns {
             // SAFETY: QEMU owns ctx.
@@ -421,7 +421,9 @@ impl HostOps for QemuHost<'_> {
             QemuHostDecline::ScheduleBhCallbackMissing.emit(0);
         }
     }
+}
 
+impl crate::runtime::host::GuestCpuAccess for QemuHost<'_> {
     fn read_kva(&self, kva: u64, buf: &mut [u8]) -> Result<(), MemError> {
         if buf.is_empty() {
             return Ok(());
@@ -471,7 +473,9 @@ impl HostOps for QemuHost<'_> {
             ))
         }
     }
+}
 
+impl crate::runtime::host::HostPageViews for QemuHost<'_> {
     fn map_pages(&mut self, gpas: &[u64], page_size: usize) -> Option<usize> {
         if gpas.is_empty() {
             return None;
@@ -516,51 +520,6 @@ impl HostOps for QemuHost<'_> {
         self.ops.map_pages_stable != 0
     }
 
-    fn guest_ram_regions(
-        &mut self,
-    ) -> Result<Vec<crate::runtime::guest_ram::GuestRamRegion>, GuestRamRegionsError> {
-        /// Spans the first call asks for.
-        ///
-        /// An x86 machine with a PCI hole has two RAMBlocks and a vmapple one
-        /// has one, so this is already several times the answer. It is a first
-        /// guess and not a bound: a host with more spans reports its total and
-        /// gets asked again at that size, which is why nothing here is a cap
-        /// that could silently import part of the guest's memory.
-        const FIRST_TRY: usize = 8;
-
-        let f = self
-            .ops
-            .guest_ram_regions
-            .ok_or(GuestRamRegionsError::CallbackMissing)?;
-        let mut buf = vec![crate::runtime::guest_ram::GuestRamRegion::default(); FIRST_TRY];
-        // SAFETY: QEMU owns ctx and keeps it valid for the device lifetime;
-        // `buf` is valid for `len` writes of the shared `#[repr(C)]` struct for
-        // the duration of the call.
-        let mut rc = unsafe { f(self.ops.ctx, buf.as_mut_ptr(), buf.len()) };
-        if rc < 0 {
-            return Err(GuestRamRegionsError::from_code(rc));
-        }
-        let mut total = rc as usize;
-        if total > buf.len() {
-            buf.resize(total, crate::runtime::guest_ram::GuestRamRegion::default());
-            // SAFETY: as above, with the array the shim's own total sized.
-            rc = unsafe { f(self.ops.ctx, buf.as_mut_ptr(), buf.len()) };
-            if rc < 0 {
-                return Err(GuestRamRegionsError::from_code(rc));
-            }
-            let retried = rc as usize;
-            if retried > buf.len() {
-                return Err(GuestRamRegionsError::StillTruncated {
-                    total: retried,
-                    capacity: buf.len(),
-                });
-            }
-            total = retried;
-        }
-        buf.truncate(total);
-        Ok(buf)
-    }
-
     fn unmap_pages(&mut self, ptr: usize, len: usize) {
         if ptr == 0 || len == 0 {
             return;
@@ -585,6 +544,46 @@ impl HostOps for QemuHost<'_> {
     }
 }
 
+impl crate::runtime::host::GuestRamProvider for QemuHost<'_> {
+    fn guest_ram_regions(
+        &mut self,
+    ) -> Result<Vec<crate::runtime::guest_ram::GuestRamRegion>, GuestRamRegionsError> {
+        /// Spans the first call asks for.
+        const FIRST_TRY: usize = 8;
+
+        let f = self
+            .ops
+            .guest_ram_regions
+            .ok_or(GuestRamRegionsError::CallbackMissing)?;
+        let mut buf = vec![crate::runtime::guest_ram::GuestRamRegion::default(); FIRST_TRY];
+        // SAFETY: QEMU owns ctx and keeps it valid for the device lifetime;
+        // `buf` is valid for `len` shared-ABI writes during the call.
+        let mut rc = unsafe { f(self.ops.ctx, buf.as_mut_ptr(), buf.len()) };
+        if rc < 0 {
+            return Err(GuestRamRegionsError::from_code(rc));
+        }
+        let mut total = rc as usize;
+        if total > buf.len() {
+            buf.resize(total, crate::runtime::guest_ram::GuestRamRegion::default());
+            // SAFETY: as above, with the array sized from the shim's answer.
+            rc = unsafe { f(self.ops.ctx, buf.as_mut_ptr(), buf.len()) };
+            if rc < 0 {
+                return Err(GuestRamRegionsError::from_code(rc));
+            }
+            let retried = rc as usize;
+            if retried > buf.len() {
+                return Err(GuestRamRegionsError::StillTruncated {
+                    total: retried,
+                    capacity: buf.len(),
+                });
+            }
+            total = retried;
+        }
+        buf.truncate(total);
+        Ok(buf)
+    }
+}
+
 /// Host used when no QEMU ops table is bound (unit tests / headless create).
 pub struct NullHost;
 
@@ -597,7 +596,7 @@ impl HostMemory for NullHost {
     }
 }
 
-impl HostOps for NullHost {
+impl crate::runtime::host::HostControl for NullHost {
     fn mono_ns(&self) -> u64 {
         0
     }
@@ -605,10 +604,16 @@ impl HostOps for NullHost {
     fn schedule_bh(&mut self) {}
 }
 
+impl crate::runtime::host::GuestCpuAccess for NullHost {}
+impl crate::runtime::host::GuestRamProvider for NullHost {}
+impl crate::runtime::host::HostPageViews for NullHost {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::host::HostAction as HA;
+    use crate::runtime::host::{
+        GuestCpuAccess, GuestRamProvider, HostAction as HA, HostControl, HostPageViews,
+    };
 
     unsafe extern "C" fn fail_read_gpa(
         _ctx: *mut c_void,

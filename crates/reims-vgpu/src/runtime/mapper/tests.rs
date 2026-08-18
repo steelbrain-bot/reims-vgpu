@@ -820,7 +820,7 @@ impl HostMemory for FailingKvaHost {
     }
 }
 
-impl HostOps for FailingKvaHost {
+impl crate::runtime::host::HostControl for FailingKvaHost {
     fn mono_ns(&self) -> u64 {
         0
     }
@@ -828,11 +828,17 @@ impl HostOps for FailingKvaHost {
     fn enqueue(&mut self, _action: crate::runtime::host::HostAction) {}
 
     fn schedule_bh(&mut self) {}
+}
 
+impl crate::runtime::host::GuestCpuAccess for FailingKvaHost {
     fn read_kva(&self, _kva: u64, _buf: &mut [u8]) -> Result<(), MemError> {
         Err(self.err)
     }
+}
 
+impl crate::runtime::host::GuestRamProvider for FailingKvaHost {}
+
+impl crate::runtime::host::HostPageViews for FailingKvaHost {
     fn map_pages(&mut self, gpas: &[u64], page_size: usize) -> Option<usize> {
         self.inner.map_pages(gpas, page_size)
     }

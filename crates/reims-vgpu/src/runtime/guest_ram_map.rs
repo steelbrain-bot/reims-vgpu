@@ -22,7 +22,8 @@
 //! # Why the imports are built here and not at device create
 //!
 //! The backend measures the granularity; the runtime holds the
-//! [`HostOps`](crate::runtime::HostOps) that can say where guest RAM lives.
+//! [`GuestRamProvider`](crate::runtime::host::GuestRamProvider) that can say where
+//! guest RAM lives.
 //! Neither side has both, and the device context deliberately does not take a
 //! host — see the module doc on [`crate::qemu::host_ops`] for why the runtime
 //! keeps it. So the granularity is published by the backend through
@@ -48,7 +49,7 @@ use crate::runtime::guest_ram::{
     granularity, import_budget, import_span_max, GuestRamError, GuestRamImport, GuestRamRegion,
     GuestRef,
 };
-use crate::runtime::host::{GuestRamRegionsError, HostOps};
+use crate::runtime::host::{GuestRamProvider, GuestRamRegionsError};
 use std::sync::Arc;
 
 /// Why a guest physical address did not become a bindable reference.
@@ -365,7 +366,7 @@ pub fn imports() -> Vec<Arc<GuestRamImport>> {
 ///
 /// The device-side half is Vulkan-only because only Vulkan has a device-side
 /// against unified memory and holds no per-RAMBlock import to warm.
-pub fn warm<H: HostOps + ?Sized>(host: &mut H) {
+pub fn warm<H: GuestRamProvider + ?Sized>(host: &mut H) {
     if granularity().is_none() {
         return;
     }
@@ -392,7 +393,7 @@ pub fn warm<H: HostOps + ?Sized>(host: &mut H) {
 ///
 /// The one place the resolution is built, so no entry point can hold a second
 /// copy of "have we asked the host yet".
-fn with_map<H: HostOps + ?Sized, R>(host: &mut H, body: impl FnOnce(&Resolved) -> R) -> R {
+fn with_map<H: GuestRamProvider + ?Sized, R>(host: &mut H, body: impl FnOnce(&Resolved) -> R) -> R {
     let mut guard = MAP.lock().unwrap_or_else(|p| p.into_inner());
     if guard.is_none() {
         *guard = Some(resolve(host));
@@ -414,7 +415,7 @@ fn with_map<H: HostOps + ?Sized, R>(host: &mut H, body: impl FnOnce(&Resolved) -
 /// away. That caller must ask *this* rather than re-reading
 /// [`crate::runtime::guest_ram::granularity`], which is the same answer for one
 /// of the four refusals and silence for the other three.
-pub fn standing_refusal<H: HostOps + ?Sized>(host: &mut H) -> Option<MapRefusal> {
+pub fn standing_refusal<H: GuestRamProvider + ?Sized>(host: &mut H) -> Option<MapRefusal> {
     with_map(host, |resolved| resolved.refusal)
 }
 
@@ -422,7 +423,7 @@ pub fn standing_refusal<H: HostOps + ?Sized>(host: &mut H) -> Option<MapRefusal>
 ///
 /// The whole guest-memory rail goes through here. Building the imports on the
 /// first call is why `host` is taken: after that it is not touched.
-pub fn reference<H: HostOps + ?Sized>(
+pub fn reference<H: GuestRamProvider + ?Sized>(
     host: &mut H,
     gpa: u64,
     len: u64,
@@ -483,7 +484,7 @@ pub struct GuestWindowRun {
 /// second for an answer that cannot change inside one call, so the walk happens
 /// inside a single [`with_map`] instead. [`reference`] keeps its own lock for
 /// the callers that resolve exactly one span.
-pub fn references_for_runs<H: HostOps + ?Sized>(
+pub fn references_for_runs<H: GuestRamProvider + ?Sized>(
     host: &mut H,
     gpas: &[u64],
     page_size: u64,
@@ -571,7 +572,7 @@ pub fn references_for_runs<H: HostOps + ?Sized>(
 ///
 /// The one implementation of the contiguity rule, so the sampled, buffer and
 /// writeback rails cannot disagree about what a bindable page list is.
-pub fn reference_for_pages<H: HostOps + ?Sized>(
+pub fn reference_for_pages<H: GuestRamProvider + ?Sized>(
     host: &mut H,
     gpas: &[u64],
     page_size: u64,
@@ -684,7 +685,7 @@ fn chunk_span(span: GuestRamRegion, span_max: u64) -> Vec<GuestRamRegion> {
     out
 }
 
-fn resolve<H: HostOps + ?Sized>(host: &mut H) -> Resolved {
+fn resolve<H: GuestRamProvider + ?Sized>(host: &mut H) -> Resolved {
     let Some(align) = granularity() else {
         return Resolved {
             imports: Vec::new(),
@@ -806,12 +807,7 @@ mod tests {
 
     struct Spans(Vec<GuestRamRegion>);
 
-    impl HostOps for Spans {
-        fn mono_ns(&self) -> u64 {
-            0
-        }
-        fn enqueue(&mut self, _action: crate::runtime::host::HostAction) {}
-        fn schedule_bh(&mut self) {}
+    impl GuestRamProvider for Spans {
         fn guest_ram_regions(&mut self) -> Result<Vec<GuestRamRegion>, GuestRamRegionsError> {
             Ok(self.0.clone())
         }
@@ -819,12 +815,7 @@ mod tests {
 
     struct Refusing;
 
-    impl HostOps for Refusing {
-        fn mono_ns(&self) -> u64 {
-            0
-        }
-        fn enqueue(&mut self, _action: crate::runtime::host::HostAction) {}
-        fn schedule_bh(&mut self) {}
+    impl GuestRamProvider for Refusing {
         fn guest_ram_regions(&mut self) -> Result<Vec<GuestRamRegion>, GuestRamRegionsError> {
             Err(GuestRamRegionsError::NoRam)
         }
@@ -1233,12 +1224,7 @@ mod tests {
     fn the_host_is_asked_once_however_many_references_follow() {
         with_granularity(Some(0x1000), || {
             struct Counting(std::cell::Cell<usize>);
-            impl HostOps for Counting {
-                fn mono_ns(&self) -> u64 {
-                    0
-                }
-                fn enqueue(&mut self, _a: crate::runtime::host::HostAction) {}
-                fn schedule_bh(&mut self) {}
+            impl GuestRamProvider for Counting {
                 fn guest_ram_regions(
                     &mut self,
                 ) -> Result<Vec<GuestRamRegion>, GuestRamRegionsError> {

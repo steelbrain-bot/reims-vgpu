@@ -143,7 +143,7 @@ impl GuestPageFootprint {
 /// One RAMBlock as the host shim describes it: where it starts in guest physical
 /// address space, where QEMU mapped it, and how long it is.
 ///
-/// This is the shape [`crate::runtime::HostOps::guest_ram_regions`] hands back,
+/// This is the shape [`crate::runtime::host::GuestRamProvider::guest_ram_regions`] hands back,
 /// and it is deliberately not `map_pages` with a different return type.
 /// `map_pages` answers "give me a view of these specific pages" and may build a
 /// transient one the caller must release; this answers "where does guest RAM

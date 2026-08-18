@@ -781,12 +781,7 @@ mod tests {
         assert!(!base.is_null(), "allocation for the stand-in RAMBlock");
 
         struct OneBlock(u64);
-        impl crate::runtime::host::HostOps for OneBlock {
-            fn mono_ns(&self) -> u64 {
-                0
-            }
-            fn enqueue(&mut self, _action: crate::runtime::host::HostAction) {}
-            fn schedule_bh(&mut self) {}
+        impl crate::runtime::host::GuestRamProvider for OneBlock {
             fn guest_ram_regions(
                 &mut self,
             ) -> Result<

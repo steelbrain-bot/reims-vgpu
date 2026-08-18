@@ -783,6 +783,7 @@ mod tests {
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
     use crate::runtime::host::FakeHost;
+    use crate::runtime::host::HostPageViews;
     use reims_vgpu_paging::resolve::ResolveStatus;
 
     fn state_x86() -> DeviceState {

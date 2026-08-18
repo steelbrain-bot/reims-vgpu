@@ -47,6 +47,7 @@ use crate::qemu::host_ops::{NullHost, QemuHost, ReimsVgpuHostOps};
 // and this module uses itself. They were the crate root's "convenience
 // re-exports used by qemu ABI and tests" and came with the registry.
 use crate::model::{Device, DeviceId};
+use crate::runtime::host::HostControl;
 use crate::runtime::{HostAction, HostOps};
 
 /// Mutable protocol/backend state. The drain worker may hold this lock across
