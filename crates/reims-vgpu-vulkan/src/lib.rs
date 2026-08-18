@@ -5,6 +5,7 @@
 //! content authority remain in `reims-vgpu-core`.
 
 pub mod api_floor;
+pub mod capabilities;
 pub mod device_features;
 pub mod device_select;
 pub mod format;
