@@ -2,11 +2,13 @@
 //!
 //! This crate deliberately has no QEMU, Vulkan, windowing, or host-OS types.
 
+pub mod capabilities;
 pub mod namespace;
 pub mod resource;
 pub mod submission;
 pub mod target;
 
+pub use capabilities::{DeviceInfoLimits, ExecutorCapabilities};
 pub use namespace::{NamespaceError, ReferenceNamespace};
 pub use resource::{
     ContentAuthority, ContentError, ContentState, GraphError, LifecycleState, MappingNode,

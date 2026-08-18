@@ -11,7 +11,7 @@ use crate::backend::vulkan::engine::{
 use crate::model::TargetIdentity;
 use reims_vgpu_protocol::SubmissionIdentity;
 
-pub use reims_vgpu_core::SubmissionContext;
+pub use reims_vgpu_core::{ExecutorCapabilities, SubmissionContext};
 
 /// Backend-independent classification of a retained target's current content.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,37 +37,6 @@ impl ResidentLease for crate::backend::vulkan::engine::ResidentResourceLease {
 
     fn backing(&self) -> ResidentContentBacking {
         self.backing()
-    }
-}
-
-/// Host-GPU facts available to semantic planning.
-///
-/// These values describe what the executor can implement. They do not encode
-/// guest protocol features or select a guest resource lifetime.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ExecutorCapabilities {
-    pub device_info: crate::model::DeviceInfoLimits,
-    pub max_compute_workgroup_invocations: u32,
-    pub thread_execution_width: u32,
-    pub max_render_target_dimension: u32,
-    pub deferred_gpu_only_content: bool,
-}
-
-impl Default for ExecutorCapabilities {
-    fn default() -> Self {
-        Self {
-            device_info: crate::model::DeviceInfoLimits {
-                max_sample_count: 1,
-                d24_stencil8: false,
-                max_threads_per_threadgroup: [128, 128, 64],
-                max_threadgroup_memory_bytes: 16_384,
-                native_fp16: false,
-            },
-            max_compute_workgroup_invocations: 128,
-            thread_execution_width: 1,
-            max_render_target_dimension: 4096,
-            deferred_gpu_only_content: false,
-        }
     }
 }
 

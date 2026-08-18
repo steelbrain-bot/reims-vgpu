@@ -1327,15 +1327,8 @@ pub fn protocol_dual_plane_textures(version: u32) -> bool {
     matches!(version, 31 | 41 | 42 | 43 | 60 | 61 | 62)
 }
 
-/// What the host GPU can actually do, for the keys above.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeviceInfoLimits {
-    pub max_sample_count: u32,
-    pub d24_stencil8: bool,
-    pub max_threads_per_threadgroup: [u32; 3],
-    pub max_threadgroup_memory_bytes: u32,
-    pub native_fp16: bool,
-}
+/// What the host GPU can actually do, for the keys below.
+pub use reims_vgpu_core::DeviceInfoLimits;
 
 /// The device-info reply for this host: GPU-dependent keys reduced to what
 /// `limits` says the host can execute, and version-dependent keys answered from

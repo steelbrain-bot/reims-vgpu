@@ -1,0 +1,56 @@
+//! Host execution capabilities visible to semantic planning.
+
+/// Host limits used to reduce the device-info values advertised to the guest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceInfoLimits {
+    pub max_sample_count: u32,
+    pub d24_stencil8: bool,
+    pub max_threads_per_threadgroup: [u32; 3],
+    pub max_threadgroup_memory_bytes: u32,
+    pub native_fp16: bool,
+}
+
+/// Host-GPU facts available to semantic planning.
+///
+/// These describe how the executor can implement an already-decoded command.
+/// They do not advertise guest protocol features or select resource lifetimes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExecutorCapabilities {
+    pub device_info: DeviceInfoLimits,
+    pub max_compute_workgroup_invocations: u32,
+    pub thread_execution_width: u32,
+    pub max_render_target_dimension: u32,
+    pub deferred_gpu_only_content: bool,
+}
+
+impl Default for ExecutorCapabilities {
+    fn default() -> Self {
+        Self {
+            device_info: DeviceInfoLimits {
+                max_sample_count: 1,
+                d24_stencil8: false,
+                max_threads_per_threadgroup: [128, 128, 64],
+                max_threadgroup_memory_bytes: 16_384,
+                native_fp16: false,
+            },
+            max_compute_workgroup_invocations: 128,
+            thread_execution_width: 1,
+            max_render_target_dimension: 4096,
+            deferred_gpu_only_content: false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ExecutorCapabilities;
+
+    #[test]
+    fn conservative_capabilities_do_not_enable_optional_execution_paths() {
+        let caps = ExecutorCapabilities::default();
+        assert_eq!(caps.device_info.max_sample_count, 1);
+        assert!(!caps.device_info.d24_stencil8);
+        assert!(!caps.device_info.native_fp16);
+        assert!(!caps.deferred_gpu_only_content);
+    }
+}
