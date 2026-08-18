@@ -11,8 +11,9 @@ use crate::model::TargetIdentity;
 use reims_vgpu_protocol::StorageImageFormat;
 
 pub use reims_vgpu_core::{
-    ExecutionPort, ExecutorCapabilities, GuestWriteReach, GuestWriteService, ResidentContent,
-    ResidentContentBacking, ResidentLease, ResidentService, SubmissionContext, TargetReadback,
+    ComputeResidencyService, ExecutionPort, ExecutorCapabilities, GuestWriteReach,
+    GuestWriteService, ResidentContent, ResidentContentBacking, ResidentLease, ResidentService,
+    SubmissionContext, TargetReadback,
 };
 
 impl ResidentLease for crate::backend::vulkan::engine::ResidentResourceLease {
@@ -58,6 +59,7 @@ pub trait Executor:
         Error = DrawError,
     > + ResidentService
     + GuestWriteService
+    + ComputeResidencyService
 {
     fn capabilities(&self) -> ExecutorCapabilities {
         ExecutorCapabilities::default()
@@ -72,34 +74,6 @@ pub trait Executor:
             crate::contract::pixel_format::TexelLayout::Rgba8
                 | crate::contract::pixel_format::TexelLayout::Bgra8
         )
-    }
-
-    fn compute_resident_storage_generation(
-        &self,
-        _identity: &crate::model::ComputeStorageResidencyKey,
-    ) -> Option<u32> {
-        None
-    }
-
-    fn compute_resident_sample_source(
-        &self,
-        _identity: &crate::model::ComputeStorageResidencyKey,
-    ) -> Option<(u32, StorageImageFormat)> {
-        None
-    }
-
-    fn unpin_resident_storage(&self, _identity: &crate::model::ComputeStorageResidencyKey) {}
-
-    fn retire_resident_storage_content(
-        &self,
-        _identity: &crate::model::ComputeStorageResidencyKey,
-    ) {
-    }
-
-    fn note_resident_storage_copied_out(
-        &self,
-        _identity: &crate::model::ComputeStorageResidencyKey,
-    ) {
     }
 
     fn read_target(&self, _identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
@@ -275,35 +249,6 @@ impl Executor for VulkanExecutor {
         layout: crate::contract::pixel_format::TexelLayout,
     ) -> bool {
         crate::backend::vulkan::engine::render_target_layout_supported(layout)
-    }
-
-    fn compute_resident_storage_generation(
-        &self,
-        identity: &crate::model::ComputeStorageResidencyKey,
-    ) -> Option<u32> {
-        crate::backend::vulkan::engine::compute_resident_storage_generation(identity)
-    }
-
-    fn compute_resident_sample_source(
-        &self,
-        identity: &crate::model::ComputeStorageResidencyKey,
-    ) -> Option<(u32, StorageImageFormat)> {
-        crate::backend::vulkan::engine::compute_resident_sample_source(identity)
-    }
-
-    fn unpin_resident_storage(&self, identity: &crate::model::ComputeStorageResidencyKey) {
-        crate::backend::vulkan::engine::unpin_resident_storage(identity);
-    }
-
-    fn retire_resident_storage_content(&self, identity: &crate::model::ComputeStorageResidencyKey) {
-        crate::backend::vulkan::engine::retire_resident_storage_content(identity);
-    }
-
-    fn note_resident_storage_copied_out(
-        &self,
-        identity: &crate::model::ComputeStorageResidencyKey,
-    ) {
-        crate::backend::vulkan::engine::note_resident_storage_copied_out(identity);
     }
 
     fn read_target(&self, identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
@@ -494,6 +439,40 @@ impl GuestWriteService for VulkanExecutor {
 
     fn quiesce_guest_writes(&self) {
         crate::backend::vulkan::engine::quiesce_guest_writes();
+    }
+}
+
+impl ComputeResidencyService for VulkanExecutor {
+    fn compute_resident_storage_generation(
+        &self,
+        identity: &reims_vgpu_core::ComputeStorageResidencyKey,
+    ) -> Option<u32> {
+        crate::backend::vulkan::engine::compute_resident_storage_generation(identity)
+    }
+
+    fn compute_resident_sample_source(
+        &self,
+        identity: &reims_vgpu_core::ComputeStorageResidencyKey,
+    ) -> Option<(u32, StorageImageFormat)> {
+        crate::backend::vulkan::engine::compute_resident_sample_source(identity)
+    }
+
+    fn unpin_resident_storage(&self, identity: &reims_vgpu_core::ComputeStorageResidencyKey) {
+        crate::backend::vulkan::engine::unpin_resident_storage(identity);
+    }
+
+    fn retire_resident_storage_content(
+        &self,
+        identity: &reims_vgpu_core::ComputeStorageResidencyKey,
+    ) {
+        crate::backend::vulkan::engine::retire_resident_storage_content(identity);
+    }
+
+    fn note_resident_storage_copied_out(
+        &self,
+        identity: &reims_vgpu_core::ComputeStorageResidencyKey,
+    ) {
+        crate::backend::vulkan::engine::note_resident_storage_copied_out(identity);
     }
 }
 
@@ -693,19 +672,21 @@ mod tests {
             self.capabilities
         }
 
-        fn compute_resident_storage_generation(
-            &self,
-            _identity: &crate::model::ComputeStorageResidencyKey,
-        ) -> Option<u32> {
-            self.resident_generation
-        }
-
         fn reset(&self) {
             self.resets.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     impl ResidentService for ScriptedExecutor {}
+
+    impl ComputeResidencyService for ScriptedExecutor {
+        fn compute_resident_storage_generation(
+            &self,
+            _identity: &reims_vgpu_core::ComputeStorageResidencyKey,
+        ) -> Option<u32> {
+            self.resident_generation
+        }
+    }
 
     impl GuestWriteService for ScriptedExecutor {
         fn guest_writes_outstanding(&self) -> bool {
@@ -908,6 +889,7 @@ mod tests {
     impl Executor for WrongIdentityExecutor {}
     impl ResidentService for WrongIdentityExecutor {}
     impl GuestWriteService for WrongIdentityExecutor {}
+    impl ComputeResidencyService for WrongIdentityExecutor {}
 
     impl ExecutionPort for WrongIdentityExecutor {
         type Submission = ResolvedSubmission;

@@ -17,7 +17,10 @@ pub use execution::{
     ResolvedSubmission,
 };
 pub use namespace::{NamespaceError, ReferenceNamespace};
-pub use residency::{ResidentContentBacking, ResidentLease};
+pub use residency::{
+    ComputeResidencyService, ComputeStorageOrigin, ComputeStorageResidencyKey,
+    ResidentContentBacking, ResidentLease,
+};
 pub use resource::{
     ContentAuthority, ContentError, ContentStamp, ContentState, GraphError, LifecycleState,
     MappingNode, PendingContentWrite, ReplicaVersions, ResourceGraph, ResourceNode, StorageBacking,
