@@ -1607,7 +1607,7 @@ pub fn resolve_sampler_state<M: HostMemory>(
 
     let entry = lookup_list_entry(state, host, task_id, sampler_ref)
         .ok_or(SamplerResolveError::Rung(LadderRung::NoListEntry))?;
-    if entry.kind != ObjectKind::StateDescriptor {
+    if entry.kind != ObjectKind::SerializerResource {
         return Err(SamplerResolveError::Rung(LadderRung::WrongType {
             got: entry.kind,
         }));

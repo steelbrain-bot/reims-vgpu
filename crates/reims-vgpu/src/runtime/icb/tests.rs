@@ -10,8 +10,9 @@ use crate::runtime::decode::resource::{
     ICB_DESC_MAX_FRAGMENT_BINDS, ICB_DESC_MAX_KERNEL_BINDS, ICB_DESC_MAX_VERTEX_BINDS,
     ICB_DESC_OPTIONS, ICB_FLAG_INHERIT_BUFFERS, ICB_LAYOUT_LEN,
     MTL_INDIRECT_CMD_CONCURRENT_DISPATCH, MTL_INDIRECT_CMD_DRAW, MTL_INDIRECT_CMD_DRAW_INDEXED,
-    OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER, OBJECT_TYPE_TYPE7, PIPELINE_TAG_FRAGMENT_FUNC,
-    PIPELINE_TAG_VERTEX_FUNC, RESOURCE_PAGE_SHIFT, TYPE7_OBJECT_ICB, TYPE7_OBJECT_RENDER_PIPELINE,
+    OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER, OBJECT_TYPE_SERIALIZER_RESOURCE,
+    PIPELINE_TAG_FRAGMENT_FUNC, PIPELINE_TAG_VERTEX_FUNC, RESOURCE_PAGE_SHIFT,
+    SERIALIZER_RESOURCE_OBJECT_ICB, SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE,
 };
 
 use crate::runtime::gva_mem;
@@ -224,7 +225,7 @@ fn make_icb_desc_bytes_tg(
 ) -> Vec<u8> {
     use crate::runtime::decode::resource::{compute_icb_layout, ICB_DESC_MAX_KERNEL_TG_BINDS};
     let mut b = vec![0u8; ICB_DESC_LEN];
-    st32(&mut b[0..], TYPE7_OBJECT_ICB);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_ICB);
     st32(&mut b[4..], ICB_DESC_LEN as u32);
     st32(&mut b[8..], MTL_INDIRECT_CMD_CONCURRENT_DISPATCH);
     b[ICB_DESC_MAX_VERTEX_BINDS] = 0;
@@ -247,7 +248,7 @@ fn make_icb_desc_bytes_tg(
     b
 }
 
-/// Type-7 render pipeline with vertex-input block: Float4 attr0 @ buffer0 stride 16.
+/// Serializer resource render pipeline with vertex-input block: Float4 attr0 @ buffer0 stride 16.
 ///
 /// Layout matches `parse_vertex_block` / color-attachment section (offset from
 /// header end via tag `0x08`).
@@ -272,7 +273,7 @@ fn make_stagein_render_pipeline_desc(vert_ref: u32, frag_ref: u32) -> Vec<u8> {
     let color_off_from_header = (color_abs - 16) as u32; // 86
 
     let mut b = vec![0u8; 117];
-    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE);
     st32(&mut b[4..], 117);
     st32(&mut b[8..], 6); // object id
                           // First TLVs
@@ -380,7 +381,14 @@ fn load_icb_from_object_list() {
     let (mut host, state) = icb_device();
     let desc = make_icb_desc_bytes(8, 4, true);
     let gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, gva, &desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_RESOURCE,
+        gva,
+        &desc,
+    );
     let icb = load_icb_descriptor(&state, &host, 1, 9).unwrap();
     assert_eq!(icb.max_command_count, 8);
     assert_eq!(icb.max_kernel_buffer_bind_count, 4);
@@ -413,7 +421,14 @@ fn a_flag_this_device_does_not_apply_is_counted_when_the_guest_asks_for_it() {
         let (mut host, state) = icb_device();
         let desc = make_icb_desc_bytes(8, 4, true);
         let gva = 1u64 << RESOURCE_PAGE_SHIFT;
-        put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, gva, &desc);
+        put_object(
+            &mut host,
+            &state,
+            9,
+            OBJECT_TYPE_SERIALIZER_RESOURCE,
+            gva,
+            &desc,
+        );
         load_icb_descriptor(&state, &host, 1, 9).unwrap();
     }
     for (route, was) in routes.iter().zip(&before) {
@@ -448,7 +463,14 @@ fn a_flag_this_device_does_not_apply_is_counted_when_the_guest_asks_for_it() {
         let word = crate::contract::endian::ld16(&desc[ICB_DESC_FLAGS..]);
         st16(&mut desc[ICB_DESC_FLAGS..], word & !clear);
         let gva = 1u64 << RESOURCE_PAGE_SHIFT;
-        put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, gva, &desc);
+        put_object(
+            &mut host,
+            &state,
+            9,
+            OBJECT_TYPE_SERIALIZER_RESOURCE,
+            gva,
+            &desc,
+        );
         let before_route = store_route_count(route);
         let before_other = store_route_count(other);
         load_icb_descriptor(&state, &host, 1, 9).unwrap();
@@ -1018,7 +1040,14 @@ fn a_0x1d1_query_is_refused_and_binds_nothing() {
     let layout = compute_only_icb_layout(1);
     let icb_desc = make_icb_desc_bytes(1, 1, false);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_RESOURCE,
+        icb_gva,
+        &icb_desc,
+    );
     // Record the create body, as `execute` would, so the decode below refuses
     // for want of command memory rather than for want of the ICB itself.
     resolve_icb_record(&state, &host, 1, 9).expect("record the ICB create body");
@@ -1072,8 +1101,22 @@ fn icb_lifetimes_are_device_owned_generational_and_task_scoped() {
     let (mut host_b, state_b) = icb_device();
     let desc = make_icb_desc_bytes(1, 1, false);
     let gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host_a, &state_a, 9, OBJECT_TYPE_TYPE7, gva, &desc);
-    put_object(&mut host_b, &state_b, 9, OBJECT_TYPE_TYPE7, gva, &desc);
+    put_object(
+        &mut host_a,
+        &state_a,
+        9,
+        OBJECT_TYPE_SERIALIZER_RESOURCE,
+        gva,
+        &desc,
+    );
+    put_object(
+        &mut host_b,
+        &state_b,
+        9,
+        OBJECT_TYPE_SERIALIZER_RESOURCE,
+        gva,
+        &desc,
+    );
 
     resolve_icb_record(&state_a, &host_a, 1, 9).expect("record first device ICB");
     resolve_icb_record(&state_b, &host_b, 1, 9).expect("record second device ICB");

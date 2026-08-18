@@ -26,9 +26,9 @@ use crate::runtime::decode::compute::{
     BufferBinding, Command as ComputeCommand, Kind, RefBinding, SamplerBinding,
 };
 use crate::runtime::decode::resource::{
-    decode_heap_texture, decode_state_descriptor, decode_texture_descriptor, texture_type8_opcode,
-    ComputeStageInputDescriptor, Descriptor as ResourceDescriptor, ObjectKind, HEAP_TEXTURE_OPCODE,
-    HEAP_TEXTURE_WIDE_OPCODE, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE,
+    decode_heap_texture, decode_serializer_resource, decode_texture_descriptor,
+    texture_type8_opcode, ComputeStageInputDescriptor, Descriptor as ResourceDescriptor,
+    ObjectKind, HEAP_TEXTURE_OPCODE, HEAP_TEXTURE_WIDE_OPCODE, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE,
     TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
 };
 use crate::runtime::draw::{host_alloc_len, StoreTargetPages};
@@ -989,7 +989,7 @@ pub(crate) fn load_compute_pipeline<M: HostMemory + HostOps>(
         host,
         task_id,
         pipeline_ref,
-        &[ObjectKind::StateDescriptor],
+        &[ObjectKind::SerializerResource],
     ) {
         Ok(found) => found,
         Err(rung) => {
@@ -997,7 +997,7 @@ pub(crate) fn load_compute_pipeline<M: HostMemory + HostOps>(
             return None;
         }
     };
-    let Ok(decoded) = decode_state_descriptor(&desc) else {
+    let Ok(decoded) = decode_serializer_resource(&desc) else {
         return miss(
             crate::observe::ladder_slug!("", desc_decode),
             format!("desc_len={}", desc.len()),

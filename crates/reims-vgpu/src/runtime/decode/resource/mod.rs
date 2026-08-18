@@ -25,7 +25,7 @@ pub use reims_vgpu_protocol::{
 /// here means some object the guest created is unusable everywhere. The payload
 /// is the registered slug naming which check refused: **29 of the 40 sites were
 /// `ErrShort`**, one name for twenty-nine different reads, from a 12-byte
-/// object-list entry to a vertex-attribute table offset inside a type-7 body.
+/// object-list entry to a vertex-attribute table offset inside a serializer resource body.
 ///
 /// Slugs carry a `res_` prefix. Six modules under `runtime/decode/` define a
 /// type called `DecodeStatus` and five of them have an `ErrShort` meaning a
@@ -76,28 +76,29 @@ impl crate::observe::Decline for DecodeStatus {
 
 /// Live object-list type tags (`reims_vgpu_resource_decode.h` / arm contract).
 ///
-/// Type 3 carries the same geometry prefix as type 2 (WindowServer composite
-/// and glyph sources); type 7 is the container for sampler, depth-stencil and
-/// render/compute pipeline descriptors.
+/// Wire tag 3 carries the same geometry prefix as wire tag 2 (WindowServer
+/// composite and glyph sources); wire tag 7 is the serializer-resource
+/// container for sampler, depth-stencil, render/compute pipeline, and indirect
+/// command-buffer descriptors.
 pub const OBJECT_TYPE_BUFFER: u8 = 1;
 pub const OBJECT_TYPE_TEXTURE: u8 = 2;
 pub const OBJECT_TYPE_TEXTURE_VARIANT: u8 = 3;
 pub const OBJECT_TYPE_FUNCTION: u8 = 6;
-pub const OBJECT_TYPE_TYPE7: u8 = 7;
+pub const OBJECT_TYPE_SERIALIZER_RESOURCE: u8 = 7;
 pub const OBJECT_TYPE_TEXTURE_VIEW: u8 = 8;
 pub const OBJECT_TYPE_IOSURFACE: u8 = 11;
 
-/// Type-7 first dword subtypes.
-pub const TYPE7_OBJECT_SAMPLER: u32 = w_smp::OPCODE_NEW_SAMPLER;
-pub const TYPE7_OBJECT_DEPTH_STENCIL: u32 = w_ds::OPCODE_NEW_DEPTH_STENCIL;
-pub const TYPE7_OBJECT_COMPUTE_PIPELINE: u32 = 0x0b;
-pub const TYPE7_OBJECT_RENDER_PIPELINE: u32 = 0x0e;
+/// Serializer resource first dword subtypes.
+pub const SERIALIZER_RESOURCE_OBJECT_SAMPLER: u32 = w_smp::OPCODE_NEW_SAMPLER;
+pub const SERIALIZER_RESOURCE_OBJECT_DEPTH_STENCIL: u32 = w_ds::OPCODE_NEW_DEPTH_STENCIL;
+pub const SERIALIZER_RESOURCE_OBJECT_COMPUTE_PIPELINE: u32 = 0x0b;
+pub const SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE: u32 = 0x0e;
 /// Indirect command buffer create body from
 /// `PGSerializer newIndirectCommandBufferWithDescriptor:layout:maxCommandCount:options:allocator:`.
-pub const TYPE7_OBJECT_ICB: u32 = w_icb::OPCODE_NEW_INDIRECT_COMMAND_BUFFER;
-/// End of the 16-byte type-7 header, which is also where its first TLV
+pub const SERIALIZER_RESOURCE_OBJECT_ICB: u32 = w_icb::OPCODE_NEW_INDIRECT_COMMAND_BUFFER;
+/// End of the 16-byte serializer resource header, which is also where its first TLV
 /// starts — one boundary, so one name.
-pub const TYPE7_FIRST_TLVS: usize = 16;
+pub const SERIALIZER_RESOURCE_FIRST_TLVS: usize = 16;
 /// Serialized ICB descriptor length (allocateOperationBytes 0x58).
 pub const ICB_DESC_LEN: usize = w_icb::NEW_INDIRECT_COMMAND_BUFFER_TOTAL_LEN as usize;
 /// Per-stage max bind counts are single bytes (PGSerializer create body).
@@ -272,7 +273,7 @@ pub const MTL_INDIRECT_CMD_CONCURRENT_DISPATCH_THREADS: u32 = 1 << 6;
 pub const MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS: u32 = 1 << 7;
 pub const MTL_INDIRECT_CMD_DRAW_MESH_THREADS: u32 = 1 << 8;
 
-/// Compact type-7 TLV field: `[tag:u8][length:u8][value…]` after a field-count byte.
+/// Compact serializer resource TLV field: `[tag:u8][length:u8][value…]` after a field-count byte.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CompactTlv {
     pub tag: u8,
@@ -578,7 +579,7 @@ pub(crate) const TEXTURE_DESC_BASE_LEN: usize =
 /// explicit `levels > TEXTURE_MAX_MIP_LEVELS` test for exactly that reason.
 pub const TEXTURE_MAX_MIP_LEVELS: usize = 16;
 
-/// Vertex attribute from a type-7 render-pipeline vertex-input block.
+/// Vertex attribute from a serializer resource render-pipeline vertex-input block.
 ///
 /// The two step fields are `Option` rather than a value beside its own presence
 /// bit. The serializer writes a layout's `stepFunction` and `stepRate` as tagged
@@ -625,7 +626,7 @@ impl VertexAttribute {
 
 pub use reims_vgpu_protocol::resource::PipelineColorAttachment;
 
-/// Decoded type-7 render pipeline (functions + optional stage-in attrs).
+/// Decoded serializer resource render pipeline (functions + optional stage-in attrs).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RenderPipelineDescriptor {
     pub object_id: u32,
@@ -636,10 +637,10 @@ pub struct RenderPipelineDescriptor {
     /// decoded, which made it indistinguishable from a field nobody had
     /// identified. It is not: the header is `objType`, declared length, the new
     /// object's ref, and this — and the declared length is exactly
-    /// [`TYPE7_FIRST_TLVS`] plus this rounded up to four.
+    /// [`SERIALIZER_RESOURCE_FIRST_TLVS`] plus this rounded up to four.
     ///
     /// That relation is checkable from the header alone, which is what
-    /// [`note_type7_payload_len`] does. Nothing else reads the field: the walks
+    /// [`note_serializer_resource_payload_len`] does. Nothing else reads the field: the walks
     /// below bound themselves on the *declared* length, which is the larger of
     /// the two and the one that describes the bytes actually present.
     pub serialized_payload_len: u32,
@@ -689,7 +690,7 @@ pub struct RenderPipelineDescriptor {
     pub color_attachments: Vec<PipelineColorAttachment>,
 }
 
-/// Compute stage-input attribute from type-7 compute pipeline compact block.
+/// Compute stage-input attribute from serializer resource compute pipeline compact block.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ComputeStageInputAttribute {
     pub raw_bits: u32,
@@ -699,7 +700,7 @@ pub struct ComputeStageInputAttribute {
     pub buffer_index: u32,
 }
 
-/// Compute stage-input layout from type-7 compute pipeline compact block.
+/// Compute stage-input layout from serializer resource compute pipeline compact block.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ComputeStageInputLayout {
     pub raw_bits: u32,
@@ -709,7 +710,7 @@ pub struct ComputeStageInputLayout {
     pub stride: u64,
 }
 
-/// Decoded compute `stageInputDescriptor` from a type-7 compute pipeline.
+/// Decoded compute `stageInputDescriptor` from a serializer resource compute pipeline.
 ///
 /// Layout is the MetalSerializer compact block after the first TLV record:
 /// `word0`, `header0` (payload len + counts + index metadata), `header1`
@@ -735,7 +736,7 @@ pub struct ComputeStageInputDescriptor {
     pub dropped_layouts: u32,
 }
 
-/// Decoded type-7 compute pipeline (kernel function + optional stage-input).
+/// Decoded serializer resource compute pipeline (kernel function + optional stage-input).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ComputePipelineDescriptor {
     pub kernel_func_ref: u32,
@@ -1127,7 +1128,7 @@ pub const FUNCTION_DESC_BLOB_SIZE: usize = 8;
 pub const FUNCTION_DESC_FUNCTION_ID: usize = 0x14;
 pub const FUNCTION_DESC_MIN_LEN: usize = 12;
 
-/// Compact first-subrecord tags (u8) on type-7 pipelines.
+/// Compact first-subrecord tags (u8) on serializer resource pipelines.
 pub const PIPELINE_TAG_KERNEL_FUNC: u8 = 0x00;
 /// Classic: vertex function. Mesh SPI: object function.
 pub const PIPELINE_TAG_VERTEX_FUNC: u8 = 0x01;
@@ -1137,7 +1138,7 @@ pub const PIPELINE_TAG_FRAGMENT_FUNC: u8 = 0x02;
 pub const PIPELINE_TAG_MESH_FRAGMENT_FUNC: u8 = 0x03;
 /// Classic: where the serialized `vertexDescriptor` starts, in the same units as
 /// [`PIPELINE_TAG_COLOR_ATTACH_OFFSET`] — a byte offset from the end of the
-/// 16-byte type-7 header.
+/// 16-byte serializer resource header.
 ///
 /// The same wire tag as [`PIPELINE_TAG_MESH_FRAGMENT_FUNC`], whose role it takes
 /// on the mesh shape. The pair is the third instance of this file's standing
@@ -1202,7 +1203,7 @@ pub const DEFAULT_RASTER_SAMPLE_COUNT: u32 = 1;
 /// Mesh SPI section offset (analog of classic [`PIPELINE_TAG_COLOR_ATTACH_OFFSET`]).
 ///
 /// Mesh descriptors use the same compact first-subrecord grammar as classic
-/// type-7 (`[fieldCount]×[tag][0x04][u32]`). Presence of this tag selects the
+/// serializer resource (`[fieldCount]×[tag][0x04][u32]`). Presence of this tag selects the
 /// mesh role map for tags 0x01/0x02/0x03.
 pub const PIPELINE_TAG_MESH_SECTION_OFFSET: u8 = 0x14;
 /// Mesh object-stage function — same wire tag as classic vertex (`0x01`).
@@ -1386,7 +1387,7 @@ pub struct SamplerDescriptor {
     pub lod_average: bool,
 }
 
-/// Type-7 depth-stencil face (12 bytes).
+/// Serializer resource depth-stencil face (12 bytes).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DepthStencilFace {
     pub compare_function: u32,
@@ -1397,7 +1398,7 @@ pub struct DepthStencilFace {
     pub write_mask: u32,
 }
 
-/// Type-7 depth-stencil state (40 bytes).
+/// Serializer resource depth-stencil state (40 bytes).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DepthStencilDescriptor {
     pub depth_stencil_id: u32,
@@ -1454,7 +1455,7 @@ pub struct IcbCommandLayout {
     pub command_size: u32,
 }
 
-/// Decoded type-7 ICB create descriptor (88-byte MetalSerializer body).
+/// Decoded serializer resource ICB create descriptor (88-byte MetalSerializer body).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IndirectCommandBufferDescriptor {
     pub command_types: u32,
@@ -1616,7 +1617,7 @@ impl IndirectCommandBufferDescriptor {
 /// One decoded object-list descriptor.
 ///
 /// There is deliberately no `Unknown`: an object type this host has no contract
-/// for is [`DecodeStatus::ErrUnknownType`], and a type-7 subtype it does not
+/// for is [`DecodeStatus::ErrUnknownType`], and a serializer resource subtype it does not
 /// implement is [`DecodeStatus::ErrUnsupported`]. Both name the check that
 /// refused. An `Unknown` variant would let the same condition arrive as a
 /// successful decode carrying nothing, which every consumer would then have to
@@ -1850,7 +1851,7 @@ pub fn decode_function_descriptor(bytes: &[u8]) -> Result<FunctionDescriptor, De
     })
 }
 
-/// Compact type-7 first sub-record: `[fieldCount:u8]` × `[tag:u8][len:u8][value…]`.
+/// Compact serializer resource first sub-record: `[fieldCount:u8]` × `[tag:u8][len:u8][value…]`.
 pub fn decode_compact_tlv_record(
     bytes: &[u8],
     offset: usize,
@@ -2080,7 +2081,9 @@ pub fn decode_depth_stencil_descriptor(
 ) -> Result<DepthStencilDescriptor, DecodeStatus> {
     let op = reims_vgpu_wire::op(bytes, 0)
         .map_err(|_| DecodeStatus::ErrShort("res_depth_stencil_short"))?;
-    if op.opcode() != TYPE7_OBJECT_DEPTH_STENCIL || op.length() as usize != bytes.len() {
+    if op.opcode() != SERIALIZER_RESOURCE_OBJECT_DEPTH_STENCIL
+        || op.length() as usize != bytes.len()
+    {
         return Err(DecodeStatus::ErrUnsupported("res_depth_stencil_tag"));
     }
     let body = w_ds::new_depth_stencil(&op)
@@ -2130,7 +2133,7 @@ fn wire_max_anisotropy(value: u8) -> u32 {
 pub fn decode_sampler_descriptor(bytes: &[u8]) -> Result<SamplerDescriptor, DecodeStatus> {
     let op =
         reims_vgpu_wire::op(bytes, 0).map_err(|_| DecodeStatus::ErrShort("res_sampler_short"))?;
-    if op.opcode() != TYPE7_OBJECT_SAMPLER || op.length() as usize != bytes.len() {
+    if op.opcode() != SERIALIZER_RESOURCE_OBJECT_SAMPLER || op.length() as usize != bytes.len() {
         return Err(DecodeStatus::ErrUnsupported("res_sampler_tag"));
     }
     let body = w_smp::new_sampler(&op).map_err(|_| DecodeStatus::ErrShort("res_sampler_short"))?;
@@ -2216,7 +2219,7 @@ const COMPUTE_PIPELINE_TAG_THREADGROUP_MULTIPLE: u8 = 0x01;
 /// constant's doc gives.
 const COMPUTE_PIPELINE_TAG_LABEL: u8 = 0x02;
 /// `MTLComputePipelineDescriptor.stageInputDescriptor` — a byte offset from the
-/// end of the 16-byte type-7 header to a nested property list, in the same units
+/// end of the 16-byte serializer resource header to a nested property list, in the same units
 /// as [`PIPELINE_TAG_VERTEX_DESCRIPTOR_OFFSET`] and
 /// [`PIPELINE_TAG_COLOR_ATTACH_OFFSET`]. `COMPUTE_PIPELINE_TAG_LABEL` is the same
 /// kind of offset, to a NUL-terminated string.
@@ -2326,7 +2329,7 @@ const COMPUTE_PIPELINE_TAGS_BENIGN: [u8; 2] = [
 /// or how often.
 ///
 /// It is now a refusal on that same sibling's licence, and the licence is what
-/// took the work: the sibling refuses because `type7_color_attach_shape`
+/// took the work: the sibling refuses because `serializer_resource_color_attach_shape`
 /// measured its zero first. This block's `unconsumed` count is *not* zero and
 /// never will be — two labels arrive on every boot — so the zero that had to be
 /// measured was a different one. Splitting the unread tags into
@@ -2474,14 +2477,14 @@ impl crate::observe::Decline for PipelineFieldDropped {
     }
 }
 
-/// Report the shape of a type-7 pipeline's own compact-TLV block and every
+/// Report the shape of a serializer resource pipeline's own compact-TLV block and every
 /// field in it this decoder does not consume.
 ///
 /// Two lines with the two jobs [`note_color_entry_fields`] splits for the same
 /// reason: a silent census cannot tell "the guest sends only the tags we read"
 /// from "this walk never ran on a live guest".
 ///
-/// * `type7_pipeline_shape` is the *branch*, on the off channel, deduped per
+/// * `serializer_resource_pipeline_shape` is the *branch*, on the off channel, deduped per
 ///   distinct `(kind, tag, len)` sequence and starring the unread tags. A boot
 ///   with pipeline shapes and no drop line is a positive reading.
 /// * `pipeline_descriptor_field_dropped` is the *loss*, one typed decline per
@@ -2613,9 +2616,9 @@ fn report_tlv_shape(
             }
         }
     }
-    if crate::observe::first_sight("type7_pipeline_shape", shape_key) {
+    if crate::observe::first_sight("serializer_resource_pipeline_shape", shape_key) {
         crate::observe::off(format!(
-            "type7_pipeline_shape kind={kind} nfields={field_count} tags=[{shape}] \
+            "serializer_resource_pipeline_shape kind={kind} nfields={field_count} tags=[{shape}] \
              unconsumed={} unknown={}",
             dropped.len(),
             unknown.len()
@@ -2627,7 +2630,7 @@ fn report_tlv_shape(
     // it stays visible.
     for &(tag, len, first_value) in &unknown {
         crate::observe::Emit::decline(
-            "type7_pipeline",
+            "serializer_resource_pipeline",
             &PipelineFieldDropped {
                 kind,
                 tag,
@@ -2644,15 +2647,15 @@ fn report_tlv_shape(
 pub fn decode_render_pipeline_descriptor(
     bytes: &[u8],
 ) -> Result<RenderPipelineDescriptor, DecodeStatus> {
-    if bytes.len() < TYPE7_MIN_LEN {
+    if bytes.len() < SERIALIZER_RESOURCE_MIN_LEN {
         return Err(DecodeStatus::ErrShort("res_render_pipeline_short"));
     }
     let obj_type = ld32(&bytes[0..]);
     let declared = ld32(&bytes[4..]) as usize;
-    if obj_type != TYPE7_OBJECT_RENDER_PIPELINE {
+    if obj_type != SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE {
         return Err(DecodeStatus::ErrUnsupported("res_render_pipeline_tag"));
     }
-    if declared != bytes.len() || declared < TYPE7_MIN_LEN {
+    if declared != bytes.len() || declared < SERIALIZER_RESOURCE_MIN_LEN {
         return Err(DecodeStatus::ErrShort("res_render_pipeline_declared_len"));
     }
     let mut out = RenderPipelineDescriptor {
@@ -2660,8 +2663,8 @@ pub fn decode_render_pipeline_descriptor(
         serialized_payload_len: ld32(&bytes[12..]),
         ..Default::default()
     };
-    note_type7_payload_len("render", out.serialized_payload_len, declared);
-    let (fields, consumed) = decode_compact_tlv_record(bytes, TYPE7_FIRST_TLVS)?;
+    note_serializer_resource_payload_len("render", out.serialized_payload_len, declared);
+    let (fields, consumed) = decode_compact_tlv_record(bytes, SERIALIZER_RESOURCE_FIRST_TLVS)?;
     let tag01 = compact_tlv_u32(&fields, PIPELINE_TAG_VERTEX_FUNC).unwrap_or(0);
     let tag02 = compact_tlv_u32(&fields, PIPELINE_TAG_FRAGMENT_FUNC).unwrap_or(0);
     let tag03 = compact_tlv_u32(&fields, PIPELINE_TAG_MESH_FRAGMENT_FUNC).unwrap_or(0);
@@ -2677,7 +2680,7 @@ pub fn decode_render_pipeline_descriptor(
     out.tessellation_output_winding_order =
         compact_tlv_u32(&fields, PIPELINE_TAG_TESSELLATION_OUTPUT_WINDING_ORDER).unwrap_or(0);
     // Mesh SPI shape: tag 0x14 section offset (host serializeMeshRenderPipelineDescriptor).
-    // Classic type-7 uses tag 0x08. Roles for 0x01/0x02/0x03 differ by shape.
+    // Classic serializer resource uses tag 0x08. Roles for 0x01/0x02/0x03 differ by shape.
     if let Some(off) = compact_tlv_u32(&fields, PIPELINE_TAG_MESH_SECTION_OFFSET) {
         note_pipeline_tlv_fields(
             "render_mesh",
@@ -2715,9 +2718,9 @@ pub fn decode_render_pipeline_descriptor(
             out.has_color_attachment_offset = true;
         }
     }
-    let first_tlv_end = TYPE7_FIRST_TLVS + consumed;
+    let first_tlv_end = SERIALIZER_RESOURCE_FIRST_TLVS + consumed;
     if out.has_color_attachment_offset {
-        let color_abs = TYPE7_FIRST_TLVS + out.color_attachment_offset as usize;
+        let color_abs = SERIALIZER_RESOURCE_FIRST_TLVS + out.color_attachment_offset as usize;
         // The vertex block runs from where the descriptor says it starts to
         // where the colour section begins. Only the classic shape states that
         // start; the mesh shape does not, so it keeps the old inference —
@@ -2728,7 +2731,7 @@ pub fn decode_render_pipeline_descriptor(
         let start = if inferred {
             first_tlv_end
         } else {
-            TYPE7_FIRST_TLVS + out.vertex_descriptor_offset as usize
+            SERIALIZER_RESOURCE_FIRST_TLVS + out.vertex_descriptor_offset as usize
         };
         if color_abs <= declared && start < color_abs {
             out.vertex_attributes = parse_vertex_block(bytes, start, color_abs)?;
@@ -2746,12 +2749,12 @@ pub fn decode_render_pipeline_descriptor(
     Ok(out)
 }
 
-/// The two lengths in a type-7 header disagree about the same payload.
+/// The two lengths in a serializer resource header disagree about the same payload.
 ///
 /// The header states the payload's length twice: the declared length at `+4`
 /// covers the header and the payload padded to four bytes, and
 /// [`RenderPipelineDescriptor::serialized_payload_len`] at `+0xc` is the same
-/// payload unpadded. So `declared == TYPE7_FIRST_TLVS + round_up_4(payload)`
+/// payload unpadded. So `declared == SERIALIZER_RESOURCE_FIRST_TLVS + round_up_4(payload)`
 /// always, and a record where it does not hold is one whose two halves were
 /// written by different ideas of how long it is.
 ///
@@ -2775,7 +2778,7 @@ pub fn decode_render_pipeline_descriptor(
 /// state a payload length first. A reader who measures only the boot will
 /// conclude the promotion is free, and it is not.
 ///
-/// Both pipeline subtypes reach this, and **only** those two: the other type-7
+/// Both pipeline subtypes reach this, and **only** those two: the other serializer resource
 /// subtypes — sampler, depth-stencil, ICB — are fixed-layout wire structs rather
 /// than property-list containers, so their fourth header word is a declared
 /// field of the struct and not a payload length. The relation would be false
@@ -2784,26 +2787,26 @@ pub fn decode_render_pipeline_descriptor(
 /// **Both halves have now been booted, which is worth stating because a
 /// `kind=compute` zero could have meant the arm never ran.** The compute arm was
 /// added a commit after the render one and had no boot behind it; a later driven
-/// x86 boot reported `type7_pipeline_shape kind=compute` twice against
+/// x86 boot reported `serializer_resource_pipeline_shape kind=compute` twice against
 /// `kind=render` four times, so the compute arm decoded two real descriptors and
 /// agreed on both. The denominator to quote for this instrument is that shape
 /// line, not this one, because this one is silent on success by construction.
-fn note_type7_payload_len(kind: &'static str, payload: u32, declared: usize) {
+fn note_serializer_resource_payload_len(kind: &'static str, payload: u32, declared: usize) {
     let padded = (payload as usize).next_multiple_of(4);
-    if TYPE7_FIRST_TLVS.checked_add(padded) == Some(declared) {
+    if SERIALIZER_RESOURCE_FIRST_TLVS.checked_add(padded) == Some(declared) {
         return;
     }
     if crate::observe::first_sight(
-        "type7_payload_len_disagrees",
+        "serializer_resource_payload_len_disagrees",
         ((payload as u64) << 32) | declared as u64,
     ) {
         crate::observe::fail(format!(
-            "type7_payload_len kind={kind} reason=type7_payload_len_disagrees \
+            "serializer_resource_payload_len kind={kind} reason=serializer_resource_payload_len_disagrees \
              payload={payload} padded={padded} declared={declared} \
              expected={} (the header states its payload length twice and the \
              two do not agree; nothing is refused, the walks below bound \
              themselves on the declared length)",
-            TYPE7_FIRST_TLVS + padded
+            SERIALIZER_RESOURCE_FIRST_TLVS + padded
         ));
     }
 }
@@ -2825,7 +2828,7 @@ fn note_type7_payload_len(kind: &'static str, payload: u32, declared: usize) {
 /// **Its zero is not yet a measurement, and the denominator says so.** Both
 /// callers sit inside [`parse_compute_stage_input_block`], and on a driven x86
 /// boot — Safari composited over a Ventura desktop, 25 s of window drag —
-/// `type7_pipeline_shape` reported two compute pipelines while
+/// `serializer_resource_pipeline_shape` reported two compute pipelines while
 /// `compute_stage_input_decoded` reported **none**. Neither compute pipeline
 /// carried a stage-input block at all, so no entry word was ever offered to this
 /// function and its silence is an empty walk rather than a clean one. That is
@@ -2883,11 +2886,11 @@ fn note_unread_bits(kind: &'static str, word: u32, read_mask: u32) {
 /// is the whole of what the offset was read for.
 fn note_vertex_block_inferred(start: usize, color_abs: usize) {
     if crate::observe::first_sight(
-        "type7_vertex_block_inferred",
+        "serializer_resource_vertex_block_inferred",
         ((start as u64) << 32) | color_abs as u64,
     ) {
         crate::observe::off(format!(
-            "type7_vertex_block_inferred start={start} color={color_abs} \
+            "serializer_resource_vertex_block_inferred start={start} color={color_abs} \
              (the descriptor stated no vertexDescriptor offset, so the block was \
               located by stepping over the label)"
         ));
@@ -2921,7 +2924,7 @@ fn note_vertex_block_inferred(start: usize, color_abs: usize) {
 ///
 /// # What licenses it
 ///
-/// A bare zero would not. `type7_color_attach_shape` is the sibling that fires:
+/// A bare zero would not. `serializer_resource_color_attach_shape` is the sibling that fires:
 /// it reports every entry's tag sequence and stars the unread ones, and across
 /// every driven boot in the record it appears 4–13 times per boot, each one
 /// `unconsumed=0`, over the tag set `00,01,02,04,07`. So the walk runs on a live
@@ -3040,7 +3043,7 @@ const COLOR_ATTACH_DROP_VALUE_CAP: u32 = 64;
 /// "the guest sends nothing but the eight tags we read" from "this walk never
 /// ran on a live guest":
 ///
-/// * `type7_color_attach_shape` is the *branch*, deduped per distinct `(tag,
+/// * `serializer_resource_color_attach_shape` is the *branch*, deduped per distinct `(tag,
 ///   len)` sequence. A boot with entries but no drop line is then a positive
 ///   reading — the entries were seen and carried only consumed tags — rather
 ///   than an absence.
@@ -3103,9 +3106,9 @@ fn note_color_entry_fields(bytes: &[u8], entry: usize, slot: u32) -> Result<(), 
         }
         p += 2 + field_len;
     }
-    if crate::observe::first_sight("type7_color_attach_shape", shape_key) {
+    if crate::observe::first_sight("serializer_resource_color_attach_shape", shape_key) {
         crate::observe::off(format!(
-            "type7_color_attach_shape slot={slot} nfields={field_count} \
+            "serializer_resource_color_attach_shape slot={slot} nfields={field_count} \
              tags=[{shape}] unconsumed={}",
             dropped.len()
         ));
@@ -3118,7 +3121,7 @@ fn note_color_entry_fields(bytes: &[u8], entry: usize, slot: u32) -> Result<(), 
             ((slot as u64) << 40) | ((read as u64) << 16) | (field_count as u64),
         ) {
             crate::observe::Emit::decline(
-                "type7_color_attach",
+                "serializer_resource_color_attach",
                 &ColorAttachEntryShort {
                     read,
                     declared: field_count,
@@ -3142,11 +3145,14 @@ fn note_color_entry_fields(bytes: &[u8], entry: usize, slot: u32) -> Result<(), 
         if !crate::observe::first_sight("color_attachment_field_dropped", disc) {
             continue;
         }
-        crate::observe::Emit::decline("type7_color_attach", &ColorAttachDropped { tag })
-            .field("slot", slot)
-            .field("len", field_len)
-            .field("value", value)
-            .fail();
+        crate::observe::Emit::decline(
+            "serializer_resource_color_attach",
+            &ColorAttachDropped { tag },
+        )
+        .field("slot", slot)
+        .field("len", field_len)
+        .field("value", value)
+        .fail();
     }
     // Outside the loop, so the refusal does not inherit `first_sight`'s latch:
     // the line names a tag once, the pipeline is refused every time.
@@ -3172,7 +3178,9 @@ fn parse_one_color_entry(
                 // attachments are not a dense in-order prefix, so every consumer
                 // that matches `a.slot == c.slot` was reading another slot's
                 // blend state, write mask and pixel format.
-                crate::runtime::drain::note_store_route("type7_color_slot_off_position");
+                crate::runtime::drain::note_store_route(
+                    "serializer_resource_color_slot_off_position",
+                );
             }
             declared
         }
@@ -3187,7 +3195,7 @@ fn parse_one_color_entry(
                 u64::from(declared),
             ) {
                 crate::observe::Emit::decline(
-                    "type7_color_attach",
+                    "serializer_resource_color_attach",
                     &ColorAttachIndexOutOfRange { declared },
                 )
                 .field("position", position)
@@ -3252,10 +3260,13 @@ fn parse_one_color_entry(
             // has none — every representable mask is a mask the guest might
             // have meant, and picking one is guessing which channels it wanted.
             if crate::observe::first_sight("color_write_mask_out_of_range", u64::from(mask)) {
-                crate::observe::Emit::decline("type7_color_attach", &ColorWriteMaskOutOfRange)
-                    .field("slot", slot)
-                    .field("value", mask)
-                    .fail();
+                crate::observe::Emit::decline(
+                    "serializer_resource_color_attach",
+                    &ColorWriteMaskOutOfRange,
+                )
+                .field("slot", slot)
+                .field("value", mask)
+                .fail();
             }
             return Err(DecodeStatus::ErrUnsupported("res_color_write_mask_over"));
         };
@@ -3321,7 +3332,7 @@ fn note_color_table_truncated(
         return;
     }
     crate::observe::Emit::decline(
-        "type7_color_attach",
+        "serializer_resource_color_attach",
         &ColorAttachTableTruncated { declared, decoded },
     )
     .field("section_off", section_off)
@@ -3703,7 +3714,7 @@ pub fn texture_type8_opcode(bytes: &[u8]) -> Option<u32> {
     texture_type8_header(bytes).map(|(opcode, _)| opcode)
 }
 
-const TYPE7_MIN_LEN: usize = 17;
+const SERIALIZER_RESOURCE_MIN_LEN: usize = 17;
 
 /// **Unused on the x86 PCI pathway.** A probe placed at the top of this function
 /// — before the length check, so a short record would also report — emitted
@@ -3809,7 +3820,7 @@ fn parse_compute_stage_input_section(
     if declared_offset == 0 {
         return Ok(None);
     }
-    let section = TYPE7_FIRST_TLVS.saturating_add(declared_offset as usize);
+    let section = SERIALIZER_RESOURCE_FIRST_TLVS.saturating_add(declared_offset as usize);
     if section >= bytes.len() {
         return Err(DecodeStatus::ErrShort("res_compute_stage_input_off_oob"));
     }
@@ -4070,26 +4081,26 @@ pub fn parse_compute_stage_input_block(
     Ok(Some(out))
 }
 
-/// Decode type-7 compute pipeline (`objType=0x0b`): kernel TLV + optional stage-input.
+/// Decode serializer resource compute pipeline (`objType=0x0b`): kernel TLV + optional stage-input.
 pub fn decode_compute_pipeline_descriptor(
     bytes: &[u8],
 ) -> Result<ComputePipelineDescriptor, DecodeStatus> {
-    if bytes.len() < TYPE7_MIN_LEN {
+    if bytes.len() < SERIALIZER_RESOURCE_MIN_LEN {
         return Err(DecodeStatus::ErrShort("res_compute_pipeline_short"));
     }
-    if ld32(&bytes[0..]) != TYPE7_OBJECT_COMPUTE_PIPELINE {
+    if ld32(&bytes[0..]) != SERIALIZER_RESOURCE_OBJECT_COMPUTE_PIPELINE {
         return Err(DecodeStatus::ErrUnsupported("res_compute_pipeline_tag"));
     }
     let declared = ld32(&bytes[4..]) as usize;
-    if declared != bytes.len() || declared < TYPE7_MIN_LEN {
+    if declared != bytes.len() || declared < SERIALIZER_RESOURCE_MIN_LEN {
         return Err(DecodeStatus::ErrShort("res_compute_pipeline_declared_len"));
     }
     // The same four-word header its render sibling carries, so the same relation
     // between its two lengths holds. Checked rather than stored: this descriptor
     // has no consumer for the value, and the walks below bound themselves on the
     // declared length.
-    note_type7_payload_len("compute", ld32(&bytes[12..]), declared);
-    let (fields, consumed) = decode_compact_tlv_record(bytes, TYPE7_FIRST_TLVS)?;
+    note_serializer_resource_payload_len("compute", ld32(&bytes[12..]), declared);
+    let (fields, consumed) = decode_compact_tlv_record(bytes, SERIALIZER_RESOURCE_FIRST_TLVS)?;
     note_pipeline_tlv_fields(
         "compute",
         &COMPUTE_PIPELINE_TAGS_CONSUMED,
@@ -4103,7 +4114,7 @@ pub fn decode_compute_pipeline_descriptor(
     // therefore does not replace.
     let stage_input = match compact_tlv_u32(&fields, PIPELINE_TAG_COMPUTE_STAGE_INPUT_OFFSET) {
         Some(off) => parse_compute_stage_input_section(bytes, off)?,
-        None => parse_compute_stage_input_block(bytes, TYPE7_FIRST_TLVS + consumed)?,
+        None => parse_compute_stage_input_block(bytes, SERIALIZER_RESOURCE_FIRST_TLVS + consumed)?,
     };
     Ok(ComputePipelineDescriptor {
         kernel_func_ref: compact_tlv_u32(&fields, PIPELINE_TAG_KERNEL_FUNC).unwrap_or(0),
@@ -4427,7 +4438,7 @@ pub fn icb_layout_attribute_stride_slot_count(layout: &IcbCommandLayout) -> u32 
     icb_layout_table_len(start, end, ICB_ATTRIBUTE_STRIDE_ENTRY_SIZE)
 }
 
-/// Decode type-7 ICB create descriptor (tag 0x36, length 0x58).
+/// Decode serializer resource ICB create descriptor (tag 0x36, length 0x58).
 ///
 /// Field map from PGSerializer
 /// `newIndirectCommandBufferWithDescriptor:layout:maxCommandCount:options:allocator:`
@@ -4437,7 +4448,7 @@ pub fn decode_icb_descriptor(
 ) -> Result<IndirectCommandBufferDescriptor, DecodeStatus> {
     let op =
         reims_vgpu_wire::op(bytes, 0).map_err(|_| DecodeStatus::ErrShort("res_icb_desc_short"))?;
-    if op.opcode() != TYPE7_OBJECT_ICB
+    if op.opcode() != SERIALIZER_RESOURCE_OBJECT_ICB
         || op.length() as usize != ICB_DESC_LEN
         || bytes.len() != ICB_DESC_LEN
     {
@@ -4468,39 +4479,36 @@ pub fn decode_icb_descriptor(
     })
 }
 
-/// Decode a state descriptor (sampler, depth-stencil, pipeline, or ICB).
+/// Decode a serializer resource (sampler, depth-stencil, pipeline, or ICB).
 ///
-/// The object-list wire tag is consumed by [`ObjectKind::StateDescriptor`].
+/// The object-list wire tag is consumed by [`ObjectKind::SerializerResource`].
 /// Callers beyond this module deal only in the semantic family and decoded
 /// descriptor variants.
-pub fn decode_state_descriptor(bytes: &[u8]) -> Result<Descriptor, DecodeStatus> {
+pub fn decode_serializer_resource(bytes: &[u8]) -> Result<Descriptor, DecodeStatus> {
     if bytes.len() < 4 {
-        return Err(DecodeStatus::ErrShort("res_type7_short"));
+        return Err(DecodeStatus::ErrShort("res_serializer_resource_short"));
     }
     let first = ld32(&bytes[0..]);
     match first {
-        TYPE7_OBJECT_SAMPLER => Ok(Descriptor::Sampler(decode_sampler_descriptor(bytes)?)),
-        TYPE7_OBJECT_DEPTH_STENCIL => Ok(Descriptor::DepthStencil(
+        SERIALIZER_RESOURCE_OBJECT_SAMPLER => {
+            Ok(Descriptor::Sampler(decode_sampler_descriptor(bytes)?))
+        }
+        SERIALIZER_RESOURCE_OBJECT_DEPTH_STENCIL => Ok(Descriptor::DepthStencil(
             decode_depth_stencil_descriptor(bytes)?,
         )),
-        TYPE7_OBJECT_RENDER_PIPELINE => Ok(Descriptor::RenderPipeline(
+        SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE => Ok(Descriptor::RenderPipeline(
             decode_render_pipeline_descriptor(bytes)?,
         )),
-        TYPE7_OBJECT_COMPUTE_PIPELINE => Ok(Descriptor::ComputePipeline(
+        SERIALIZER_RESOURCE_OBJECT_COMPUTE_PIPELINE => Ok(Descriptor::ComputePipeline(
             decode_compute_pipeline_descriptor(bytes)?,
         )),
-        TYPE7_OBJECT_ICB => Ok(Descriptor::IndirectCommandBuffer(decode_icb_descriptor(
-            bytes,
-        )?)),
-        _ => Err(DecodeStatus::ErrUnsupported("res_type7_subtype_unknown")),
+        SERIALIZER_RESOURCE_OBJECT_ICB => Ok(Descriptor::IndirectCommandBuffer(
+            decode_icb_descriptor(bytes)?,
+        )),
+        _ => Err(DecodeStatus::ErrUnsupported(
+            "res_serializer_resource_subtype_unknown",
+        )),
     }
-}
-
-/// Raw wire-family name retained for decoder fixtures that construct tag-7
-/// records directly.
-#[cfg(test)]
-pub fn decode_type7_descriptor(bytes: &[u8]) -> Result<Descriptor, DecodeStatus> {
-    decode_state_descriptor(bytes)
 }
 
 pub fn decode_descriptor(kind: ObjectKind, bytes: &[u8]) -> Result<Descriptor, DecodeStatus> {
@@ -4508,7 +4516,7 @@ pub fn decode_descriptor(kind: ObjectKind, bytes: &[u8]) -> Result<Descriptor, D
         ObjectKind::Buffer => Ok(Descriptor::Buffer(decode_buffer_descriptor(bytes)?)),
         ObjectKind::Texture => Ok(Descriptor::Texture(decode_texture_descriptor(bytes)?)),
         ObjectKind::Function => Ok(Descriptor::Function(decode_function_descriptor(bytes)?)),
-        ObjectKind::StateDescriptor => decode_state_descriptor(bytes),
+        ObjectKind::SerializerResource => decode_serializer_resource(bytes),
         ObjectKind::TextureView => Ok(Descriptor::TextureView(decode_texture_view_descriptor(
             bytes,
         )?)),

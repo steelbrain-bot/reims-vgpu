@@ -317,9 +317,9 @@ fn serializer_verdict(bytes: &[u8], opcode: u32) -> Reading {
         // The indirect-command-buffer creation. This device does have a reader
         // for it, and the gap map hid that for as long as the map was keyed on
         // how a record *arrives*: `decode_icb_descriptor` is reached by object
-        // type through the type-7 object list rather than by opcode off the
+        // type through the serializer-resource object list rather than by opcode off the
         // command stream, so the 88 bytes never met their decoder here even
-        // though the decoder existed. They are the same bytes — the type-7 tag
+        // though the decoder existed. They are the same bytes — the serializer-resource tag
         // is the opcode and the declared length is the record length, which is
         // what the decoder itself checks first.
         0x36 => shape(resource::decode_icb_descriptor(bytes), "serializer_icb"),

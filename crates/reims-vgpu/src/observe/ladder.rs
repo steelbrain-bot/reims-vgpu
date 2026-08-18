@@ -274,7 +274,7 @@ mod tests {
         let rungs = [
             LadderRung::NoListEntry,
             LadderRung::WrongType {
-                got: ObjectKind::StateDescriptor,
+                got: ObjectKind::SerializerResource,
             },
             LadderRung::DescRead { declared_len: 32 },
         ];

@@ -28,7 +28,7 @@ use crate::contract::endian::{ld32, ld64}; // ld64: 0x1d1 gpu_address + dispatch
 use crate::model::DeviceState;
 
 use crate::runtime::decode::resource::{
-    decode_state_descriptor, icb_layout_attribute_stride_slot_count,
+    decode_serializer_resource, icb_layout_attribute_stride_slot_count,
     icb_layout_kernel_tg_slot_count, icb_layout_table_len, Descriptor as ResourceDescriptor,
     IcbCommandLayout, IndirectCommandBufferDescriptor, ObjectKind, ICB_ATTRIBUTE_STRIDE_ENTRY_SIZE,
     ICB_BUFFER_BIND_STRIDE, ICB_CMD_TYPE_CONCURRENT_DISPATCH_THREADGROUPS,
@@ -1121,7 +1121,7 @@ pub fn load_icb_descriptor<M: HostMemory + HostOps>(
         return Err(IcbStatus::Missing("icb_desc_ref_zero"));
     }
     // The two statuses this rail splits the ladder into, stated once: a tag that
-    // is not a state descriptor means the guest described something wrongly, while a
+    // is not a serializer resource means the guest described something wrongly, while a
     // missing entry or unreadable bytes mean it described nothing this device
     // can see yet.
     let (_entry, desc) = objects::resolve_descriptor(
@@ -1129,7 +1129,7 @@ pub fn load_icb_descriptor<M: HostMemory + HostOps>(
         host,
         task_id,
         icb_ref,
-        &[ObjectKind::StateDescriptor],
+        &[ObjectKind::SerializerResource],
     )
     .map_err(|rung| {
         let slug = crate::observe::ladder_slugs!("icb")(rung);
@@ -1140,7 +1140,7 @@ pub fn load_icb_descriptor<M: HostMemory + HostOps>(
             objects::LadderRung::WrongType { .. } => IcbStatus::BadDescriptor(slug),
         }
     })?;
-    match decode_state_descriptor(&desc) {
+    match decode_serializer_resource(&desc) {
         Ok(ResourceDescriptor::IndirectCommandBuffer(icb)) => {
             note_unapplied_icb_flags(task_id, icb_ref, &icb);
             Ok(icb)

@@ -5,7 +5,7 @@ use crate::contract::endian::{ld32, st16, st32, st64};
 use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 use crate::contract::iosurface_pages::DEVICE_DESC_PLANE_COUNT;
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
-use crate::runtime::decode::resource::TYPE7_OBJECT_SAMPLER;
+use crate::runtime::decode::resource::SERIALIZER_RESOURCE_OBJECT_SAMPLER;
 use crate::runtime::host::FakeHost;
 
 #[test]
@@ -271,7 +271,7 @@ fn the_resource_registry_accepts_exactly_the_resource_constructor_kinds() {
         ObjectKind::SurfaceBacking,
         ObjectKind::IOSurfacePlaneView,
         ObjectKind::Function,
-        ObjectKind::StateDescriptor,
+        ObjectKind::SerializerResource,
         ObjectKind::TextureView,
         ObjectKind::MemorylessTexture,
         ObjectKind::IOSurfaceTexture,
@@ -305,39 +305,42 @@ fn the_resource_registry_accepts_exactly_the_resource_constructor_kinds() {
 /// must not retain its descriptor and hide a later update.
 #[test]
 fn non_resource_descriptors_are_read_again() {
-    use crate::runtime::decode::resource::OBJECT_TYPE_TYPE7;
+    use crate::runtime::decode::resource::OBJECT_TYPE_SERIALIZER_RESOURCE;
 
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     setup_task_with_list(&mut host, &mut state);
     let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
     let mut entry = [0u8; 12];
-    st32(&mut entry, u32::from(OBJECT_TYPE_TYPE7) | (4u32 << 8));
+    st32(
+        &mut entry,
+        u32::from(OBJECT_TYPE_SERIALIZER_RESOURCE) | (4u32 << 8),
+    );
     entry[4..].copy_from_slice(&0x80u64.to_le_bytes());
     let _ = host.write_gpa(data_gpa + 24, &entry);
     let _ = host.write_gpa(data_gpa + 0x80, &1u32.to_le_bytes());
 
-    let (_, first) = resolve_descriptor(&state, &host, 1, 2, &[ObjectKind::StateDescriptor])
+    let (_, first) = resolve_descriptor(&state, &host, 1, 2, &[ObjectKind::SerializerResource])
         .expect("first serializer descriptor");
     assert_eq!(ld32(&first), 1);
     assert!(state.task_resources.get(1, 2).is_none());
 
     let _ = host.write_gpa(data_gpa + 0x80, &2u32.to_le_bytes());
-    let (_, second) = resolve_descriptor(&state, &host, 1, 2, &[ObjectKind::StateDescriptor])
+    let (_, second) = resolve_descriptor(&state, &host, 1, 2, &[ObjectKind::SerializerResource])
         .expect("updated serializer descriptor");
     assert_eq!(ld32(&second), 2);
     assert!(state.task_resources.get(1, 2).is_none());
 }
 
 fn put_sampler_object(host: &mut FakeHost, ref_: u32, descriptor_gva: u64, lod_min: f32) {
-    use crate::runtime::decode::resource::OBJECT_TYPE_TYPE7;
+    use crate::runtime::decode::resource::OBJECT_TYPE_SERIALIZER_RESOURCE;
     use reims_vgpu_wire::ops::sampler::NEW_SAMPLER_TOTAL_LEN;
 
     let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
     let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     st32(
         &mut entry,
-        u32::from(OBJECT_TYPE_TYPE7) | (NEW_SAMPLER_TOTAL_LEN << 8),
+        u32::from(OBJECT_TYPE_SERIALIZER_RESOURCE) | (NEW_SAMPLER_TOTAL_LEN << 8),
     );
     st64(&mut entry[4..], descriptor_gva);
     let _ = host.write_gpa(
@@ -346,7 +349,7 @@ fn put_sampler_object(host: &mut FakeHost, ref_: u32, descriptor_gva: u64, lod_m
     );
 
     let mut descriptor = vec![0u8; NEW_SAMPLER_TOTAL_LEN as usize];
-    st32(&mut descriptor, TYPE7_OBJECT_SAMPLER);
+    st32(&mut descriptor, SERIALIZER_RESOURCE_OBJECT_SAMPLER);
     st32(&mut descriptor[4..], NEW_SAMPLER_TOTAL_LEN);
     st32(&mut descriptor[8..], ref_);
     st32(&mut descriptor[12..], 0x8400_0000);
@@ -382,17 +385,23 @@ fn sampler_construction_is_retained_until_its_own_explicit_delete() {
 
 #[test]
 fn failed_sampler_construction_is_not_retained_and_can_retry() {
-    use crate::runtime::decode::resource::OBJECT_TYPE_TYPE7;
+    use crate::runtime::decode::resource::OBJECT_TYPE_SERIALIZER_RESOURCE;
 
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     setup_task_with_list(&mut host, &mut state);
     let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
     let mut short_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
-    st32(&mut short_entry, u32::from(OBJECT_TYPE_TYPE7) | (4 << 8));
+    st32(
+        &mut short_entry,
+        u32::from(OBJECT_TYPE_SERIALIZER_RESOURCE) | (4 << 8),
+    );
     st64(&mut short_entry[4..], 0x80);
     let _ = host.write_gpa(data_gpa + 24, &short_entry);
-    let _ = host.write_gpa(data_gpa + 0x80, &TYPE7_OBJECT_SAMPLER.to_le_bytes());
+    let _ = host.write_gpa(
+        data_gpa + 0x80,
+        &SERIALIZER_RESOURCE_OBJECT_SAMPLER.to_le_bytes(),
+    );
 
     assert!(matches!(
         resolve_sampler_state(&state, &host, 1, 2),

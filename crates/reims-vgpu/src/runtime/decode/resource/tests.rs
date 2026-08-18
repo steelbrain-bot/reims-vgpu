@@ -8,7 +8,7 @@ use crate::contract::endian::st32;
 fn sampler_record(state: u32) -> Vec<u8> {
     use reims_vgpu_wire::ops::sampler::NEW_SAMPLER_TOTAL_LEN;
     let mut b = vec![0u8; NEW_SAMPLER_TOTAL_LEN as usize];
-    st32(&mut b[0..], TYPE7_OBJECT_SAMPLER);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_SAMPLER);
     st32(&mut b[4..], NEW_SAMPLER_TOTAL_LEN);
     st32(&mut b[8..], 7);
     st32(&mut b[12..], state);
@@ -136,7 +136,7 @@ fn a_vertex_entry_tag_with_no_reader_is_reported() {
     assert!(
         clean
             .iter()
-            .filter(|l| l.contains("type7_pipeline_shape"))
+            .filter(|l| l.contains("serializer_resource_pipeline_shape"))
             .all(|l| l.contains("unconsumed=0")),
         "the entries a guest sends are read whole; that is the reading this \
          instrument exists to make, and it must not be an absence: {clean:?}"
@@ -155,7 +155,9 @@ fn a_vertex_entry_tag_with_no_reader_is_reported() {
     let lines = cap2.lines();
     let shape: Vec<&String> = lines
         .iter()
-        .filter(|l| l.contains("type7_pipeline_shape") && l.contains("kind=vertex_layout"))
+        .filter(|l| {
+            l.contains("serializer_resource_pipeline_shape") && l.contains("kind=vertex_layout")
+        })
         .collect();
     assert_eq!(
         shape.len(),
@@ -572,7 +574,7 @@ fn the_embedded_descriptor_decodes_through_the_shared_reader() {
 ///
 /// This is the collapse the payload closes: **29 of the decoder's 40 sites
 /// were `ErrShort`**, one name for twenty-nine different reads spanning a
-/// 12-byte object-list entry, a type-7 TLV walk and a vertex-attribute
+/// 12-byte object-list entry, a serializer resource TLV walk and a vertex-attribute
 /// table offset. Asserting the class alone would pass on any of them.
 #[test]
 fn every_short_read_names_the_field_it_ran_out_on() {
@@ -601,11 +603,13 @@ fn every_short_read_names_the_field_it_ran_out_on() {
             .slug(),
         "res_object_type_unknown"
     );
-    let mut type7 = [0u8; 64];
-    st32(&mut type7[0..], 0xdead_beef);
+    let mut serializer_resource = [0u8; 64];
+    st32(&mut serializer_resource[0..], 0xdead_beef);
     assert_eq!(
-        decode_type7_descriptor(&type7).unwrap_err().slug(),
-        "res_type7_subtype_unknown"
+        decode_serializer_resource(&serializer_resource)
+            .unwrap_err()
+            .slug(),
+        "res_serializer_resource_subtype_unknown"
     );
 }
 
@@ -613,7 +617,7 @@ fn every_short_read_names_the_field_it_ran_out_on() {
 fn icb_descriptor_from_serializer_fixture() {
     // PGSerializer emission: ConcurrentDispatch, maxKernel=4, maxCmd=8, options=0.
     let mut b = [0u8; ICB_DESC_LEN];
-    st32(&mut b[0..], TYPE7_OBJECT_ICB);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_ICB);
     st32(&mut b[4..], ICB_DESC_LEN as u32);
     st32(&mut b[8..], MTL_INDIRECT_CMD_CONCURRENT_DISPATCH);
     // bind counts as u8: vertex, fragment, kernel, …
@@ -722,7 +726,7 @@ fn the_decoded_flag_word_holds_no_bit_the_serializer_never_wrote() {
     let mut seen = std::collections::BTreeSet::new();
     for ring in [0x00u8, 0x80, 0xff] {
         let mut b = [0u8; ICB_DESC_LEN];
-        st32(&mut b[0..], TYPE7_OBJECT_ICB);
+        st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_ICB);
         st32(&mut b[4..], ICB_DESC_LEN as u32);
         st32(&mut b[8..], MTL_INDIRECT_CMD_DRAW);
         // Every written bit set, plus whatever the ring left in bit 15.
@@ -853,7 +857,7 @@ fn the_options_word_ignores_the_two_bytes_the_serializer_never_writes() {
     let mut decoded = Vec::new();
     for ring in [0x00u8, 0xaa, 0x55, 0xff] {
         let mut b = [0u8; ICB_DESC_LEN];
-        st32(&mut b[0..], TYPE7_OBJECT_ICB);
+        st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_ICB);
         st32(&mut b[4..], ICB_DESC_LEN as u32);
         st32(&mut b[8..], MTL_INDIRECT_CMD_DRAW);
         b[ICB_DESC_MAX_VERTEX_BINDS] = 4;
@@ -887,7 +891,7 @@ fn the_options_word_ignores_the_two_bytes_the_serializer_never_writes() {
 #[test]
 fn a_dispatch_only_command_mask_keeps_the_stated_fragment_bind_count() {
     let mut b = [0u8; ICB_DESC_LEN];
-    st32(&mut b[0..], TYPE7_OBJECT_ICB);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_ICB);
     st32(&mut b[4..], ICB_DESC_LEN as u32);
     // Dispatch bits only — no draw bit anywhere in the mask.
     st32(
@@ -912,7 +916,7 @@ fn a_dispatch_only_command_mask_keeps_the_stated_fragment_bind_count() {
     assert_eq!(icb.max_kernel_buffer_bind_count, 4);
     assert_eq!(icb.layout.command_size, layout.command_size);
     assert_eq!(icb.layout.kernel_buffer_bind_offset, 0x64);
-    match decode_type7_descriptor(&b).unwrap() {
+    match decode_serializer_resource(&b).unwrap() {
         Descriptor::IndirectCommandBuffer(d) => assert_eq!(d.max_command_count, 8),
         _ => panic!("expected ICB"),
     }
@@ -933,7 +937,7 @@ fn icb_create_body_max_count_matrix() {
 
     // --- Decode: single-byte fields at RE offsets ---
     let mut b = [0u8; ICB_DESC_LEN];
-    st32(&mut b[0..], TYPE7_OBJECT_ICB);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_ICB);
     st32(&mut b[4..], ICB_DESC_LEN as u32);
     st32(
         &mut b[8..],
@@ -1120,7 +1124,7 @@ fn macos12_shaped_compute_pipeline(kernel_ref: u32, attrs: u32, layouts: u32) ->
     // Two fields of `[tag][len][u32]` behind a one-byte count, then padding to
     // the section's four-byte alignment.
     const TLV_TWO_FIELDS: usize = 1 + 2 * (1 + 1 + 4);
-    let section = (TYPE7_FIRST_TLVS + TLV_TWO_FIELDS).next_multiple_of(4);
+    let section = (SERIALIZER_RESOURCE_FIRST_TLVS + TLV_TWO_FIELDS).next_multiple_of(4);
     // The section's own two fields, then its two offset arrays and compact-TLV
     // entries. Both entry kinds carry four u32 properties.
     const ENTRY_LEN: usize = 1 + 4 * (1 + 1 + 4);
@@ -1131,17 +1135,20 @@ fn macos12_shaped_compute_pipeline(kernel_ref: u32, attrs: u32, layouts: u32) ->
     let total = section + layout_rel + layout_array_len;
 
     let mut b = vec![0u8; total];
-    st32(&mut b[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_COMPUTE_PIPELINE);
     st32(&mut b[4..], total as u32);
     st32(&mut b[8..], kernel_ref + 1);
-    st32(&mut b[12..], (total - TYPE7_FIRST_TLVS) as u32);
+    st32(
+        &mut b[12..],
+        (total - SERIALIZER_RESOURCE_FIRST_TLVS) as u32,
+    );
 
-    b[TYPE7_FIRST_TLVS] = 2;
-    let mut p = TYPE7_FIRST_TLVS + 1;
+    b[SERIALIZER_RESOURCE_FIRST_TLVS] = 2;
+    let mut p = SERIALIZER_RESOURCE_FIRST_TLVS + 1;
     for (tag, value) in [
         (
             PIPELINE_TAG_COMPUTE_STAGE_INPUT_OFFSET,
-            (section - TYPE7_FIRST_TLVS) as u32,
+            (section - SERIALIZER_RESOURCE_FIRST_TLVS) as u32,
         ),
         (PIPELINE_TAG_KERNEL_FUNC, kernel_ref),
     ] {
@@ -1266,9 +1273,9 @@ fn a_populated_compute_stage_input_section_preserves_every_field() {
 #[test]
 fn a_compute_stage_input_offset_is_bounds_checked_and_zero_means_nil() {
     // The offset field sits at the start of the first TLV entry's value.
-    let off_at = TYPE7_FIRST_TLVS + 1 + 2;
+    let off_at = SERIALIZER_RESOURCE_FIRST_TLVS + 1 + 2;
     assert_eq!(
-        macos12_shaped_compute_pipeline(9, 0, 0)[TYPE7_FIRST_TLVS + 1],
+        macos12_shaped_compute_pipeline(9, 0, 0)[SERIALIZER_RESOURCE_FIRST_TLVS + 1],
         PIPELINE_TAG_COMPUTE_STAGE_INPUT_OFFSET,
         "the builder emits the offset tag first"
     );
@@ -1304,14 +1311,14 @@ fn a_stage_input_at_the_wire_count_field_maximum_loses_nothing() {
     let n = COMPUTE_STAGE_INPUT_HEADER0_COUNT_MASK;
     let ns = n as usize;
 
-    // Same 24-byte type-7 prefix as the fixture above (tag, declared length,
+    // Same 24-byte serializer resource prefix as the fixture above (tag, declared length,
     // then an empty first TLV record), so the stage-input block starts at 24.
     const BLOCK: usize = 24;
     let layout_section = BLOCK + COMPUTE_STAGE_INPUT_MIN_LEN;
     let attr_section = layout_section + ns * COMPUTE_STAGE_INPUT_LAYOUT_ENTRY_SIZE;
     let total = attr_section + ns * COMPUTE_STAGE_INPUT_ATTR_ENTRY_SIZE;
     let mut b = vec![0u8; total];
-    st32(&mut b[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_COMPUTE_PIPELINE);
     st32(&mut b[4..], total as u32);
     // word0, then header0: payload length (everything after word0) plus both
     // count fields at their maximum.
@@ -1340,7 +1347,7 @@ fn a_stage_input_at_the_wire_count_field_maximum_loses_nothing() {
     }
 
     let si = decode_compute_pipeline_descriptor(&b)
-        .expect("type-7 decodes")
+        .expect("serializer resource decodes")
         .stage_input
         .expect("stage-input block");
     assert_eq!(si.dropped_attributes, 0, "no attribute may be dropped");
@@ -1581,7 +1588,7 @@ fn a_level_record_the_body_does_not_reach_is_reported_not_dropped() {
     );
 }
 
-/// The type-7 header states its payload length twice, and a record where the
+/// The serializer resource header states its payload length twice, and a record where the
 /// two disagree says so.
 ///
 /// The declared length at `+4` covers the header plus the payload padded to
@@ -1593,14 +1600,14 @@ fn a_level_record_the_body_does_not_reach_is_reported_not_dropped() {
 /// why it reports rather than refuses, and why a future promotion to a refusal
 /// has to fix the fixtures first rather than only measure a boot.
 #[test]
-fn a_type7_header_states_its_payload_length_twice_and_says_when_they_disagree() {
+fn a_serializer_resource_header_states_its_payload_length_twice_and_says_when_they_disagree() {
     use crate::contract::endian::st32;
 
     // A minimal classic pipeline: header, then a one-field TLV block of seven
     // bytes, padded to eight by the declared length.
     let mut b = vec![0u8; 16 + 8];
     let blen = b.len() as u32;
-    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE);
     st32(&mut b[4..], blen);
     st32(&mut b[8..], 3);
     st32(&mut b[12..], 7);
@@ -1616,7 +1623,7 @@ fn a_type7_header_states_its_payload_length_twice_and_says_when_they_disagree() 
     assert!(
         !cap.lines()
             .iter()
-            .any(|l| l.contains("type7_payload_len_disagrees")),
+            .any(|l| l.contains("serializer_resource_payload_len_disagrees")),
         "7 rounds up to 8 and 16 + 8 is the declared length, so the two agree: \
          {:?}",
         cap.lines()
@@ -1630,7 +1637,7 @@ fn a_type7_header_states_its_payload_length_twice_and_says_when_they_disagree() 
     assert!(
         lines
             .iter()
-            .any(|l| l.contains("type7_payload_len_disagrees")
+            .any(|l| l.contains("serializer_resource_payload_len_disagrees")
                 && l.contains("payload=9")
                 && l.contains("declared=24")
                 && l.contains("expected=28")),
@@ -1642,10 +1649,10 @@ fn a_type7_header_states_its_payload_length_twice_and_says_when_they_disagree() 
 #[test]
 fn compact_render_pipeline_funcs() {
     use crate::contract::endian::st32;
-    // Minimal type-7 render pipeline: header + fieldCount=2 with vert/frag refs.
+    // Minimal serializer resource render pipeline: header + fieldCount=2 with vert/frag refs.
     let mut b = vec![0u8; 16 + 1 + 6 + 6];
     let blen = b.len() as u32;
-    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE);
     st32(&mut b[4..], blen);
     st32(&mut b[8..], 9);
     b[16] = 2;
@@ -1678,7 +1685,7 @@ fn compact_render_pipeline_funcs() {
 fn a_depth_stencil_pipeline_with_a_sample_count_decodes() {
     let mut b = vec![0u8; 16 + 1 + 5 * 6];
     let blen = b.len() as u32;
-    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE);
     st32(&mut b[4..], blen);
     st32(&mut b[8..], 20);
     // Written in the order the guest's serializer emits them: the descriptor's
@@ -1717,14 +1724,14 @@ fn a_classic_tessellation_pipeline_preserves_its_three_properties() {
         (PIPELINE_TAG_TESSELLATION_FACTOR_STEP_FUNCTION, 1),
         (PIPELINE_TAG_TESSELLATION_OUTPUT_WINDING_ORDER, 1),
     ];
-    let mut b = vec![0u8; TYPE7_FIRST_TLVS + 1 + fields.len() * 6];
+    let mut b = vec![0u8; SERIALIZER_RESOURCE_FIRST_TLVS + 1 + fields.len() * 6];
     let len = b.len() as u32;
-    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE);
     st32(&mut b[4..], len);
     st32(&mut b[8..], 22);
-    st32(&mut b[12..], len - TYPE7_FIRST_TLVS as u32);
-    b[TYPE7_FIRST_TLVS] = fields.len() as u8;
-    let mut p = TYPE7_FIRST_TLVS + 1;
+    st32(&mut b[12..], len - SERIALIZER_RESOURCE_FIRST_TLVS as u32);
+    b[SERIALIZER_RESOURCE_FIRST_TLVS] = fields.len() as u8;
+    let mut p = SERIALIZER_RESOURCE_FIRST_TLVS + 1;
     for (tag, value) in fields {
         b[p] = tag;
         b[p + 1] = 4;
@@ -1755,7 +1762,7 @@ fn a_pipeline_sample_count_is_preserved_for_backend_rasterization() {
     let pipeline = |count: u32| {
         let mut b = vec![0u8; 16 + 1 + 6];
         let blen = b.len() as u32;
-        st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+        st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE);
         st32(&mut b[4..], blen);
         st32(&mut b[8..], 21);
         b[16] = 1;
@@ -1812,7 +1819,7 @@ fn an_unidentified_pipeline_descriptor_field_refuses_the_pipeline() {
 
     let mut b = vec![0u8; 16 + 1 + 6 + 6 + 6];
     let blen = b.len() as u32;
-    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE);
     st32(&mut b[4..], blen);
     st32(&mut b[8..], 9);
     b[16] = 3;
@@ -1836,7 +1843,7 @@ fn an_unidentified_pipeline_descriptor_field_refuses_the_pipeline() {
 
     let shape: Vec<&String> = lines
         .iter()
-        .filter(|l| l.contains("type7_pipeline_shape"))
+        .filter(|l| l.contains("serializer_resource_pipeline_shape"))
         .collect();
     assert_eq!(
         shape.len(),
@@ -1917,7 +1924,7 @@ fn an_identified_but_unapplied_pipeline_field_still_builds_the_pipeline() {
 
     let mut b = vec![0u8; 16 + 1 + 6 + 6 + 6];
     let blen = b.len() as u32;
-    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE);
     st32(&mut b[4..], blen);
     st32(&mut b[8..], 9);
     b[16] = 3;
@@ -1953,7 +1960,7 @@ fn an_identified_but_unapplied_pipeline_field_still_builds_the_pipeline() {
     // for alarm — starred as unread, and not counted as unknown.
     let shape: Vec<&String> = lines
         .iter()
-        .filter(|l| l.contains("type7_pipeline_shape"))
+        .filter(|l| l.contains("serializer_resource_pipeline_shape"))
         .collect();
     assert_eq!(shape.len(), 1, "{lines:?}");
     assert!(
@@ -2000,7 +2007,7 @@ fn a_classic_pipeline_takes_its_vertex_block_from_the_stated_offset() {
 
     let mut b = vec![0u8; 16 + color_rel + 8];
     let blen = b.len() as u32;
-    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE);
     st32(&mut b[4..], blen);
     st32(&mut b[8..], 12);
     b[16] = 4;
@@ -2037,7 +2044,7 @@ fn a_classic_pipeline_takes_its_vertex_block_from_the_stated_offset() {
     assert!(
         !cap.lines()
             .iter()
-            .any(|l| l.contains("type7_vertex_block_inferred")),
+            .any(|l| l.contains("serializer_resource_vertex_block_inferred")),
         "and a descriptor that stated its offset must not report the fallback: \
          {:?}",
         cap.lines()
@@ -2056,7 +2063,7 @@ fn a_classic_pipeline_without_the_offset_reports_no_vertex_descriptor() {
 
     let mut b = vec![0u8; 16 + 13 + 8];
     let blen = b.len() as u32;
-    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE);
     st32(&mut b[4..], blen);
     st32(&mut b[8..], 13);
     b[16] = 2;
@@ -2090,7 +2097,7 @@ fn compact_render_pipeline_object_mesh_funcs() {
     // offset must carry the eight header bytes a real descriptor carries.
     let mut b = vec![0u8; 16 + 24 + 8];
     let blen = b.len() as u32;
-    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE);
     st32(&mut b[4..], blen);
     st32(&mut b[8..], 7);
     b[16] = 4;
@@ -2120,7 +2127,7 @@ fn compact_render_pipeline_object_mesh_funcs() {
 fn depth_stencil_object_decode() {
     use crate::contract::endian::st32;
     let mut b = vec![0u8; DEPTH_STENCIL_DESC_LEN];
-    st32(&mut b[0..], TYPE7_OBJECT_DEPTH_STENCIL);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_DEPTH_STENCIL);
     st32(&mut b[4..], DEPTH_STENCIL_DESC_LEN as u32);
     st32(&mut b[DEPTH_STENCIL_DESC_ID..], 5);
     // compare Less=1, write enabled, both stencil enabled
@@ -2488,7 +2495,7 @@ fn an_unconsumed_colour_attachment_field_refuses_the_pipeline() {
 
     let shape: Vec<&String> = lines
         .iter()
-        .filter(|l| l.contains("type7_color_attach_shape"))
+        .filter(|l| l.contains("serializer_resource_color_attach_shape"))
         .collect();
     assert_eq!(
         shape.len(),
@@ -3049,10 +3056,10 @@ fn property_fuzz_types() {
     }
 }
 
-/// A type-7 subtype **is** a `PGSerializer` opcode, and the two this module
+/// A serializer resource subtype **is** a `PGSerializer` opcode, and the two this module
 /// still spells as numbers are exactly the two nothing has driven.
 ///
-/// The type-7 object-list entry is reached by object *type* rather than off
+/// The serializer resource object-list entry is reached by object *type* rather than off
 /// the command stream, which is why its subtypes look like a private
 /// enumeration and were written as one. They are not: `0x03` is
 /// `newSamplerState`, `0x04` is `newDepthStencilState` and `0x36` is
@@ -3073,7 +3080,7 @@ fn property_fuzz_types() {
 /// number from the wrong opcode space — the same trap `0x1b` sets, where
 /// the texture-view creation and `useHeap:` share a value.
 #[test]
-fn the_undrivable_type7_subtypes_are_the_pipeline_pair_and_nothing_claims_them() {
+fn the_undrivable_serializer_resource_subtypes_are_the_pipeline_pair_and_nothing_claims_them() {
     let serializer_opcodes = |op: u32| {
         reims_vgpu_wire::manifest::MANIFEST
             .iter()
@@ -3083,9 +3090,18 @@ fn the_undrivable_type7_subtypes_are_the_pipeline_pair_and_nothing_claims_them()
 
     // The three that are derived must still be, in the serializer's space.
     for (tag, name) in [
-        (TYPE7_OBJECT_SAMPLER, "TYPE7_OBJECT_SAMPLER"),
-        (TYPE7_OBJECT_DEPTH_STENCIL, "TYPE7_OBJECT_DEPTH_STENCIL"),
-        (TYPE7_OBJECT_ICB, "TYPE7_OBJECT_ICB"),
+        (
+            SERIALIZER_RESOURCE_OBJECT_SAMPLER,
+            "SERIALIZER_RESOURCE_OBJECT_SAMPLER",
+        ),
+        (
+            SERIALIZER_RESOURCE_OBJECT_DEPTH_STENCIL,
+            "SERIALIZER_RESOURCE_OBJECT_DEPTH_STENCIL",
+        ),
+        (
+            SERIALIZER_RESOURCE_OBJECT_ICB,
+            "SERIALIZER_RESOURCE_OBJECT_ICB",
+        ),
     ] {
         assert!(
             serializer_opcodes(tag),
@@ -3098,10 +3114,13 @@ fn the_undrivable_type7_subtypes_are_the_pipeline_pair_and_nothing_claims_them()
     // derivation and must come from it rather than stay a literal.
     for (tag, name) in [
         (
-            TYPE7_OBJECT_COMPUTE_PIPELINE,
-            "TYPE7_OBJECT_COMPUTE_PIPELINE",
+            SERIALIZER_RESOURCE_OBJECT_COMPUTE_PIPELINE,
+            "SERIALIZER_RESOURCE_OBJECT_COMPUTE_PIPELINE",
         ),
-        (TYPE7_OBJECT_RENDER_PIPELINE, "TYPE7_OBJECT_RENDER_PIPELINE"),
+        (
+            SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE,
+            "SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE",
+        ),
     ] {
         assert!(
             !serializer_opcodes(tag),

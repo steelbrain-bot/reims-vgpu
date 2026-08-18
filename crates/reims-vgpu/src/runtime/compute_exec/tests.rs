@@ -10,12 +10,13 @@ use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
 use crate::runtime::decode::compute;
 use crate::runtime::decode::resource::{
     list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER, OBJECT_TYPE_IOSURFACE,
-    OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TYPE7, RESOURCE_PAGE_SHIFT,
+    OBJECT_TYPE_SERIALIZER_RESOURCE, OBJECT_TYPE_TEXTURE, RESOURCE_PAGE_SHIFT,
 };
 /// Compute-pipeline descriptor constants used by the backend execute test.
 #[cfg(feature = "backend-vulkan")]
 use crate::runtime::decode::resource::{
-    OBJECT_TYPE_FUNCTION, PIPELINE_TAG_KERNEL_FUNC, TYPE7_FIRST_TLVS, TYPE7_OBJECT_COMPUTE_PIPELINE,
+    OBJECT_TYPE_FUNCTION, PIPELINE_TAG_KERNEL_FUNC, SERIALIZER_RESOURCE_FIRST_TLVS,
+    SERIALIZER_RESOURCE_OBJECT_COMPUTE_PIPELINE,
 };
 use crate::runtime::gva_mem;
 use crate::runtime::gva_mem::write_task_gva_arm64e;
@@ -957,17 +958,23 @@ fn compute_pipeline_state_is_immutable_until_delete_and_reuse() {
     );
 
     let mut descriptor = vec![0u8; 32];
-    st32(&mut descriptor[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
+    st32(
+        &mut descriptor[0..],
+        SERIALIZER_RESOURCE_OBJECT_COMPUTE_PIPELINE,
+    );
     st32(&mut descriptor[4..], 32);
-    descriptor[TYPE7_FIRST_TLVS] = 1;
-    descriptor[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
-    descriptor[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut descriptor[TYPE7_FIRST_TLVS + 3..], 5);
+    descriptor[SERIALIZER_RESOURCE_FIRST_TLVS] = 1;
+    descriptor[SERIALIZER_RESOURCE_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
+    descriptor[SERIALIZER_RESOURCE_FIRST_TLVS + 2] = 4;
+    st32(&mut descriptor[SERIALIZER_RESOURCE_FIRST_TLVS + 3..], 5);
     let descriptor_gva = 0x140u64;
     write_task_gva_arm64e(&mut host, &state.tasks[1], descriptor_gva, &descriptor);
     let off = list_object_entry_offset(6, 32).unwrap();
     let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
-    st32(&mut entry[0..], (OBJECT_TYPE_TYPE7 as u32) | (32u32 << 8));
+    st32(
+        &mut entry[0..],
+        (OBJECT_TYPE_SERIALIZER_RESOURCE as u32) | (32u32 << 8),
+    );
     entry[4..12].copy_from_slice(&descriptor_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &entry);
 
@@ -1007,7 +1014,7 @@ fn compute_pipeline_state_is_immutable_until_delete_and_reuse() {
         replacement_function_identity.generation()
     );
 
-    st32(&mut descriptor[TYPE7_FIRST_TLVS + 3..], 9);
+    st32(&mut descriptor[SERIALIZER_RESOURCE_FIRST_TLVS + 3..], 9);
     write_task_gva_arm64e(&mut host, &state.tasks[1], descriptor_gva, &descriptor);
     let retained = load_compute_pipeline(&state, &host, 1, 6).expect("retained pipeline");
     assert!(std::sync::Arc::ptr_eq(&first, &retained));
@@ -1076,18 +1083,18 @@ fn dispatch_buffer_kernel_mul3add1() {
     }
 
     let mut pdesc = vec![0u8; 32];
-    st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
+    st32(&mut pdesc[0..], SERIALIZER_RESOURCE_OBJECT_COMPUTE_PIPELINE);
     st32(&mut pdesc[4..], 32); // declared descriptor length
-    pdesc[TYPE7_FIRST_TLVS] = 1;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
+    pdesc[SERIALIZER_RESOURCE_FIRST_TLVS] = 1;
+    pdesc[SERIALIZER_RESOURCE_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
+    pdesc[SERIALIZER_RESOURCE_FIRST_TLVS + 2] = 4;
+    st32(&mut pdesc[SERIALIZER_RESOURCE_FIRST_TLVS + 3..], 5);
     let pdesc_gva = 0x140u64;
     write_task_gva_arm64e(&mut host, &state.tasks[1], pdesc_gva, &pdesc);
     {
         let off = list_object_entry_offset(6, 32).unwrap();
         let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
-        let packed = (OBJECT_TYPE_TYPE7 as u32) | (32u32 << 8);
+        let packed = (OBJECT_TYPE_SERIALIZER_RESOURCE as u32) | (32u32 << 8);
         st32(&mut le[0..], packed);
         le[4..12].copy_from_slice(&pdesc_gva.to_le_bytes());
         write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);

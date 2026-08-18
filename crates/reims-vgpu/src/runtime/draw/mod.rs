@@ -589,9 +589,14 @@ fn load_depth_stencil_descriptor<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route("ds_state_held");
         return Ok((*state_).clone());
     }
-    let (_entry, desc) =
-        objects::resolve_descriptor(state, host, task_id, ds_ref, &[ObjectKind::StateDescriptor])
-            .map_err(crate::observe::ladder_slugs!("depth_stencil"))?;
+    let (_entry, desc) = objects::resolve_descriptor(
+        state,
+        host,
+        task_id,
+        ds_ref,
+        &[ObjectKind::SerializerResource],
+    )
+    .map_err(crate::observe::ladder_slugs!("depth_stencil"))?;
     let decoded = decode_depth_stencil_descriptor(&desc)
         .map_err(|_| crate::observe::ladder_slug!("depth_stencil", desc_decode))?;
     // Registered only after a successful decode, on the same terms as
@@ -1290,7 +1295,7 @@ pub(crate) fn load_render_pipeline<M: HostMemory + HostOps>(
         host,
         task_id,
         pipeline_ref,
-        &[ObjectKind::StateDescriptor],
+        &[ObjectKind::SerializerResource],
     ) {
         Ok(found) => found,
         Err(rung) => {
