@@ -2896,6 +2896,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             VulkanTextureInput::HostBytes(cached.to_vec())
         } else {
             crate::runtime::render_writeback::settle_guest_writes(
+                state.executor.as_ref(),
                 crate::runtime::render_writeback::SettleSite::ComputeStageTexture,
             );
             if read_linear_texture_bulk(
@@ -2940,6 +2941,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         } else {
             crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
             crate::runtime::render_writeback::settle_guest_writes(
+                state.executor.as_ref(),
                 crate::runtime::render_writeback::SettleSite::ComputeStageTexture,
             );
             if !read_linear_texture_bulk(

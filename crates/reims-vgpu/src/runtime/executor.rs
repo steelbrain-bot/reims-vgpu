@@ -6,7 +6,8 @@
 
 use crate::backend::vulkan::engine::{
     ComputeOutput, ComputeRequest, DrawError, DrawOutput, DrawRequest, EngineFacadeDecline,
-    ResidentContent, ResidentContentBacking, StorageImageFormat, TargetIdentity, TargetReadback,
+    GuestWriteReach, ResidentContent, ResidentContentBacking, StorageImageFormat, TargetIdentity,
+    TargetReadback,
 };
 use reims_vgpu_protocol::{SegmentBoundary, SubmissionIdentity, SubmissionResourceUse};
 use std::sync::Arc;
@@ -248,6 +249,16 @@ pub trait Executor: std::fmt::Debug + Send + Sync {
         None
     }
 
+    fn guest_writes_outstanding(&self) -> bool {
+        false
+    }
+
+    fn guest_writes_reaching(&self, _pages: &[u64]) -> GuestWriteReach {
+        GuestWriteReach::Disjoint
+    }
+
+    fn quiesce_guest_writes(&self) {}
+
     fn execute(&self, submission: ResolvedSubmission) -> Result<ExecutionCompletion, DrawError>;
 
     /// End one guest lifetime while preserving shareable physical-GPU state.
@@ -381,6 +392,18 @@ impl Executor for VulkanExecutor {
         crate::backend::vulkan::engine::read_resident_bgra(identity, need)
     }
 
+    fn guest_writes_outstanding(&self) -> bool {
+        crate::backend::vulkan::engine::guest_writes_outstanding()
+    }
+
+    fn guest_writes_reaching(&self, pages: &[u64]) -> GuestWriteReach {
+        crate::backend::vulkan::engine::guest_writes_reaching(pages)
+    }
+
+    fn quiesce_guest_writes(&self) {
+        crate::backend::vulkan::engine::quiesce_guest_writes();
+    }
+
     fn execute(&self, submission: ResolvedSubmission) -> Result<ExecutionCompletion, DrawError> {
         let _scope = self.enter();
         match submission {
@@ -508,8 +531,10 @@ mod tests {
         completion: ScriptedCompletion,
         capabilities: ExecutorCapabilities,
         resident_generation: Option<u32>,
+        guest_writes: GuestWriteReach,
         seen: Mutex<Vec<SubmissionContext>>,
         resets: AtomicUsize,
+        write_quiesces: AtomicUsize,
     }
 
     impl ScriptedExecutor {
@@ -518,8 +543,10 @@ mod tests {
                 completion,
                 capabilities: ExecutorCapabilities::default(),
                 resident_generation: None,
+                guest_writes: GuestWriteReach::Disjoint,
                 seen: Mutex::new(Vec::new()),
                 resets: AtomicUsize::new(0),
+                write_quiesces: AtomicUsize::new(0),
             }
         }
 
@@ -530,6 +557,11 @@ mod tests {
 
         fn with_resident_generation(mut self, generation: u32) -> Self {
             self.resident_generation = Some(generation);
+            self
+        }
+
+        fn with_guest_writes(mut self, reach: GuestWriteReach) -> Self {
+            self.guest_writes = reach;
             self
         }
     }
@@ -544,6 +576,18 @@ mod tests {
             _identity: &crate::model::ComputeStorageResidencyKey,
         ) -> Option<u32> {
             self.resident_generation
+        }
+
+        fn guest_writes_outstanding(&self) -> bool {
+            self.guest_writes != GuestWriteReach::Disjoint
+        }
+
+        fn guest_writes_reaching(&self, _pages: &[u64]) -> GuestWriteReach {
+            self.guest_writes
+        }
+
+        fn quiesce_guest_writes(&self) {
+            self.write_quiesces.fetch_add(1, Ordering::Relaxed);
         }
 
         fn execute(
@@ -661,6 +705,21 @@ mod tests {
                 }
             ))
         ));
+    }
+
+    #[test]
+    fn guest_write_settlement_uses_the_injected_executor() {
+        let scripted = Arc::new(
+            ScriptedExecutor::new(ScriptedCompletion::Draw)
+                .with_guest_writes(GuestWriteReach::Overlap),
+        );
+
+        crate::runtime::render_writeback::settle_guest_writes(
+            scripted.as_ref(),
+            crate::runtime::render_writeback::SettleSite::CompletionStamp,
+        );
+
+        assert_eq!(scripted.write_quiesces.load(Ordering::Relaxed), 1);
     }
 
     #[test]

@@ -1939,6 +1939,7 @@ pub fn write_stamp<H: HostMemory + HostOps>(
             // already proved the packet had nothing preceding it, and work
             // another thread arms afterward belongs after this stamp.
             crate::runtime::render_writeback::settle_guest_writes(
+                state.executor.as_ref(),
                 crate::runtime::render_writeback::SettleSite::CompletionStamp,
             );
             crate::backend::vulkan::engine::quiesce_guest_reads();
@@ -1946,6 +1947,7 @@ pub fn write_stamp<H: HostMemory + HostOps>(
     }
     #[cfg(not(feature = "backend-vulkan"))]
     crate::runtime::render_writeback::settle_guest_writes(
+        state.executor.as_ref(),
         crate::runtime::render_writeback::SettleSite::CompletionStamp,
     );
     let Some(off) = stamp_slot_offset(index, state.page_size()) else {
@@ -2694,6 +2696,7 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                                 // the word, and must let an older root word land.
                                 crate::backend::vulkan::engine::quiesce_completion_stamps(0);
                                 crate::runtime::render_writeback::settle_guest_writes(
+                                    state.executor.as_ref(),
                                     crate::runtime::render_writeback::SettleSite::RootStamp,
                                 );
                                 crate::backend::vulkan::engine::quiesce_guest_reads();
@@ -2701,6 +2704,7 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                         }
                         #[cfg(not(feature = "backend-vulkan"))]
                         crate::runtime::render_writeback::settle_guest_writes(
+                            state.executor.as_ref(),
                             crate::runtime::render_writeback::SettleSite::RootStamp,
                         );
                         let gpa = state.pfn_gpa(state.gfx.fifo_base_page) + off;

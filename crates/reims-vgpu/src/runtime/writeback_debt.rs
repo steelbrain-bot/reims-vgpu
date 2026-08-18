@@ -806,10 +806,14 @@ pub fn settle_for_mapping(
 ) {
     let reach_started = std::time::Instant::now();
     let s = &*state;
-    crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(site, || {
-        crate::runtime::drain::note_store_route("wbdebt_reach_walk_n");
-        s.mapping_reach_pages(mapping_id)
-    });
+    crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(
+        state.executor.as_ref(),
+        site,
+        || {
+            crate::runtime::drain::note_store_route("wbdebt_reach_walk_n");
+            s.mapping_reach_pages(mapping_id)
+        },
+    );
     crate::runtime::drain::note_store_route_us(
         "wbdebt_reach_us",
         reach_started.elapsed().as_micros() as u64,
@@ -829,13 +833,17 @@ pub fn settle_for_texture<M: HostMemory + HostOps>(
 ) {
     pay_for_texture(state, host, task_id, texture_ref);
     let (tasks, page_shift, page_size) = (&state.tasks, state.page_shift, state.page_size());
-    crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(site, || {
-        let want = reims_vgpu_paging::span::pages_spanned(gva, span, page_size);
-        let gpas = crate::runtime::gva_mem::task_gva_page_gpas(
-            host, tasks, task_id, gva, span, page_shift,
-        );
-        (gpas.len() as u64 == want).then_some(gpas)
-    });
+    crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(
+        state.executor.as_ref(),
+        site,
+        || {
+            let want = reims_vgpu_paging::span::pages_spanned(gva, span, page_size);
+            let gpas = crate::runtime::gva_mem::task_gva_page_gpas(
+                host, tasks, task_id, gva, span, page_shift,
+            );
+            (gpas.len() as u64 == want).then_some(gpas)
+        },
+    );
 }
 
 /// [`settle_for_mapping`] for a caller that cannot name the mapping it is about
@@ -846,7 +854,7 @@ pub fn settle_unnamed<M: HostMemory + HostOps>(
     site: crate::runtime::render_writeback::SettleSite,
 ) {
     pay_all(state, host);
-    crate::runtime::render_writeback::settle_guest_writes(site);
+    crate::runtime::render_writeback::settle_guest_writes(state.executor.as_ref(), site);
 }
 
 /// Submit exactly the resources named by an asynchronous synchronize command.

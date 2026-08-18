@@ -454,14 +454,14 @@ impl PendingWrites {
     /// One relaxed atomic load in the common case — the same gate
     /// `settle_guest_writes_unless_disjoint` opens with — so a bind with nothing
     /// outstanding pays what it paid before.
-    fn over(gpas: &[u64]) -> Self {
+    fn over(executor: &dyn crate::runtime::executor::Executor, gpas: &[u64]) -> Self {
         #[cfg(feature = "backend-vulkan")]
         {
             use crate::backend::vulkan::engine::GuestWriteReach as Reach;
-            if !crate::backend::vulkan::engine::guest_writes_outstanding() {
+            if !executor.guest_writes_outstanding() {
                 return Self::Disjoint;
             }
-            match crate::backend::vulkan::engine::guest_writes_reaching(gpas) {
+            match executor.guest_writes_reaching(gpas) {
                 Reach::Disjoint => Self::Disjoint,
                 Reach::Overlap => Self::Overlap,
                 Reach::Unnamed => Self::Unnamed,
@@ -741,7 +741,7 @@ pub fn note_gather(
         // The guest's own statement about this resource, captured by the caller
         // in the identity space that owns it.
         stated_gen: Some(stated_gen),
-        pending: PendingWrites::over(window.gpas),
+        pending: PendingWrites::over(state.executor.as_ref(), window.gpas),
     };
     // Every bind, vouched or not, so the route is a denominator rather than a
     // tally of refusals — the reading wanted is what fraction of binds this

@@ -714,7 +714,7 @@ settle_sites! {
 /// returns without touching a queue when it is clear. `site` is what a boot
 /// reads to find which caller pays for the waits that are not free; see
 /// [`SettleSite`].
-pub fn settle_guest_writes(site: SettleSite) {
+pub fn settle_guest_writes(executor: &dyn crate::runtime::executor::Executor, site: SettleSite) {
     #[cfg(feature = "backend-vulkan")]
     {
         // The flag read is one relaxed-acquire load and clear is the common
@@ -723,11 +723,11 @@ pub fn settle_guest_writes(site: SettleSite) {
         // this load and the wait, which makes the site's count a lower bound by
         // at most one per race — the engine re-reads the flag under its own
         // lock and the ordering is unaffected.
-        if !crate::backend::vulkan::engine::guest_writes_outstanding() {
+        if !executor.guest_writes_outstanding() {
             return;
         }
         let started = std::time::Instant::now();
-        crate::backend::vulkan::engine::quiesce_guest_writes();
+        executor.quiesce_guest_writes();
         crate::runtime::drain::note_store_route(site.route());
         crate::runtime::drain::note_store_route_us(
             site.route_us(),
@@ -759,17 +759,18 @@ pub fn settle_guest_writes(site: SettleSite) {
 /// ruled out — a caller whose walk failed, or a second outstanding writeback
 /// (`gwdebt_unnamed`).
 pub fn settle_guest_writes_unless_disjoint(
+    executor: &dyn crate::runtime::executor::Executor,
     site: SettleSite,
     pages: impl FnOnce() -> Option<Vec<u64>>,
 ) {
     #[cfg(feature = "backend-vulkan")]
     {
-        if !crate::backend::vulkan::engine::guest_writes_outstanding() {
+        if !executor.guest_writes_outstanding() {
             return;
         }
         use crate::backend::vulkan::engine::GuestWriteReach as Reach;
         let reach = match pages() {
-            Some(p) => crate::backend::vulkan::engine::guest_writes_reaching(&p),
+            Some(p) => executor.guest_writes_reaching(&p),
             // The caller could not name its own window, which is the same
             // undecidable as the ledger failing to name the writeback's.
             None => Reach::Unnamed,
@@ -782,7 +783,7 @@ pub fn settle_guest_writes_unless_disjoint(
         if reach == Reach::Disjoint {
             return;
         }
-        settle_guest_writes(site);
+        settle_guest_writes(executor, site);
     }
     #[cfg(not(feature = "backend-vulkan"))]
     {
