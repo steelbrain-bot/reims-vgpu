@@ -2024,9 +2024,9 @@ pub fn resolve_iosurface_texture_resource(
     // Record the ref as live so the explicit delete path retires its associated
     // host-side content as well as the retained resource object.
     let _ = state.insert_object(task_id, ref_);
-    let mapping_id = match resource.decoded() {
+    let (mapping_id, mapper_ref) = match resource.decoded() {
         Ok(crate::runtime::decode::resource::Descriptor::IOSurfaceTexture {
-            mapping_id,
+            mapper_ref,
             pixel_format,
             width,
             height,
@@ -2034,7 +2034,7 @@ pub fn resolve_iosurface_texture_resource(
         }) => {
             if !texture::register_iosurface_texture_geom(
                 state,
-                *mapping_id,
+                mapper_ref.get(),
                 *width,
                 *height,
                 *pixel_format,
@@ -2050,7 +2050,7 @@ pub fn resolve_iosurface_texture_resource(
                 );
                 return None;
             }
-            *mapping_id
+            (mapper_ref.get(), *mapper_ref)
         }
         // Preserve the older headerless decoder as a compatibility rung for
         // descriptors the total object decoder cannot name. This is a cold
@@ -2068,7 +2068,8 @@ pub fn resolve_iosurface_texture_resource(
                 );
                 return None;
             }
-            u32::from_le_bytes(desc.get(..4)?.try_into().ok()?)
+            let raw = u32::from_le_bytes(desc.get(..4)?.try_into().ok()?);
+            (raw, reims_vgpu_protocol::MapperSurfaceRef::new(raw))
         }
         Ok(_) => return None,
     };
@@ -2090,7 +2091,7 @@ pub fn resolve_iosurface_texture_resource(
     let mapping_id = resource.register_iosurface_mapping(mapping_id);
     if !state
         .task_resources
-        .attach_mapper_storage(task_id, ref_, mapping_id)
+        .attach_mapper_storage(task_id, ref_, mapper_ref)
     {
         note_iosurface_texture_fail(
             task_id,

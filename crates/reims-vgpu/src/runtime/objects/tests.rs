@@ -170,17 +170,16 @@ fn resources_keep_construction_input_until_explicit_delete() {
     let retained = resolve_resource(&state, &host, 1, 1).expect("registered object");
     assert!(Arc::ptr_eq(&first, &retained));
     assert_eq!(ld32(&retained.descriptor), 9);
-    assert!(matches!(
-        retained.decoded(),
-        Ok(
-            crate::runtime::decode::resource::Descriptor::IOSurfaceTexture {
-                mapping_id: 9,
-                width: 64,
-                height: 32,
-                ..
-            }
-        )
-    ));
+    let Ok(crate::runtime::decode::resource::Descriptor::IOSurfaceTexture {
+        mapper_ref,
+        width: 64,
+        height: 32,
+        ..
+    }) = retained.decoded()
+    else {
+        panic!("retained descriptor lost its semantic IOSurface texture shape");
+    };
+    assert_eq!(mapper_ref.get(), 9);
     assert_eq!(
         resolve_iosurface_texture_resource(&mut state, 1, 1, &retained),
         Some(9),

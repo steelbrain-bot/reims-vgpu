@@ -1,9 +1,9 @@
 //! Canonical task-owned resource, storage, and mapping graph.
 
 use reims_vgpu_protocol::{
-    BackingGeneration, ByteLength, ByteOffset, ContentVersion, GuestVirtualAddress, MappingId,
-    ObjectKind, ObjectTableRef, PlaneIndex, ResourceId, ResourceObject, StorageId, SubmissionId,
-    SurfaceBackingId, TaskId,
+    BackingGeneration, ByteLength, ByteOffset, ContentVersion, GuestVirtualAddress,
+    MapperSurfaceRef, MappingId, ObjectKind, ObjectTableRef, PlaneIndex, ResourceId,
+    ResourceObject, StorageId, SubmissionId, SurfaceBackingId, TaskId,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{atomic::AtomicU64, Weak};
@@ -346,7 +346,7 @@ pub enum StorageBacking {
     /// Mapper-path surface storage whose shared-backing identity is not yet
     /// established independently of the mapping object.
     MapperSurface {
-        mapping: MappingId,
+        mapper: MapperSurfaceRef,
         plane: PlaneIndex,
     },
     HeapPlacement {
@@ -573,16 +573,16 @@ impl ResourceGraph {
 
     pub fn mapper_storage(
         &mut self,
-        mapping: MappingId,
+        mapper: MapperSurfaceRef,
         plane: PlaneIndex,
     ) -> Result<StorageId, GraphError> {
         if let Some(id) = self.storage.values().find_map(|storage| {
-            (storage.backing == StorageBacking::MapperSurface { mapping, plane })
+            (storage.backing == StorageBacking::MapperSurface { mapper, plane })
                 .then_some(storage.id)
         }) {
             return Ok(id);
         }
-        self.create_storage(StorageBacking::MapperSurface { mapping, plane })
+        self.create_storage(StorageBacking::MapperSurface { mapper, plane })
     }
 
     pub fn registered_surface_storage(
@@ -913,6 +913,22 @@ mod tests {
 
     fn object(value: u32) -> ObjectTableRef<ResourceObject> {
         ObjectTableRef::new(value)
+    }
+
+    #[test]
+    fn mapper_references_do_not_become_page_table_mapping_identities() {
+        let mut graph = ResourceGraph::default();
+        let mapper = MapperSurfaceRef::new(12);
+        let storage = graph.mapper_storage(mapper, PlaneIndex::new(0)).unwrap();
+
+        assert_eq!(
+            graph.storage(storage).unwrap().backing,
+            StorageBacking::MapperSurface {
+                mapper,
+                plane: PlaneIndex::new(0),
+            }
+        );
+        assert!(graph.mapping(MappingId::new(12)).is_none());
     }
 
     #[test]

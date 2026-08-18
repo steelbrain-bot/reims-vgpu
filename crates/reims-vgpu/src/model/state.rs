@@ -7,7 +7,7 @@ use crate::runtime::decode::resource::{
 use reims_vgpu_core::{ReferenceNamespace, ResourceGraph, ResourceNode};
 use reims_vgpu_protocol::{
     ByteLength, ByteOffset, ComputePipelineObject, ContentVersion, EventObject, FenceObject,
-    FunctionObject, GuestVirtualAddress, MappingId, ObjectTableRef, PlaneIndex, ResourceId,
+    FunctionObject, GuestVirtualAddress, MapperSurfaceRef, ObjectTableRef, PlaneIndex, ResourceId,
     ResourceObject, SamplerObject, SerializerRef, SubmissionId, SurfaceBackingId, TaskId,
 };
 #[cfg(feature = "backend-vulkan")]
@@ -1195,7 +1195,12 @@ impl TaskResources {
         }
     }
 
-    pub fn attach_mapper_storage(&self, task_id: u32, ref_: u32, mapping_id: u32) -> bool {
+    pub fn attach_mapper_storage(
+        &self,
+        task_id: u32,
+        ref_: u32,
+        mapper_ref: MapperSurfaceRef,
+    ) -> bool {
         let mut registry = self
             .0
             .lock()
@@ -1209,7 +1214,7 @@ impl TaskResources {
         };
         let storage = registry
             .graph
-            .mapper_storage(MappingId::new(mapping_id), PlaneIndex::new(0))
+            .mapper_storage(mapper_ref, PlaneIndex::new(0))
             .expect("storage identity space remains available");
         registry.graph.attach_initial_storage(id, storage).is_ok()
     }
@@ -1364,7 +1369,11 @@ mod task_resource_graph_tests {
         let texture = resources.register(4, 9, resource(ObjectKind::IOSurfaceTexture));
         let id = texture.semantic_id().unwrap();
 
-        assert!(resources.attach_mapper_storage(4, 9, 12));
+        assert!(resources.attach_mapper_storage(
+            4,
+            9,
+            reims_vgpu_protocol::MapperSurfaceRef::new(12),
+        ));
         let node = resources.resource_node(id).unwrap();
         assert!(node.storage.is_some());
         assert_eq!(node.backing_generation.get(), 1);

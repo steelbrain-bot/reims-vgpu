@@ -37,6 +37,7 @@ macro_rules! scalar_newtype {
 scalar_newtype!(TaskId, u32);
 scalar_newtype!(ResourceNamespaceId, u32);
 scalar_newtype!(MappingId, u32);
+scalar_newtype!(MapperSurfaceRef, u32);
 scalar_newtype!(SurfaceId, u32);
 scalar_newtype!(SurfaceBackingId, u64);
 scalar_newtype!(StorageId, u64);

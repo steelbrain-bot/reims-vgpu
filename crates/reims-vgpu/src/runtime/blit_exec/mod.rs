@@ -702,7 +702,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
             return Err(br(BlitStatus::Unsupported, "iosurface_level_slice"));
         }
         let Ok(ResourceDescriptor::IOSurfaceTexture {
-            mapping_id,
+            mapper_ref,
             pixel_format: tex_fmt,
             width: tex_w,
             height: tex_h,
@@ -714,6 +714,10 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
                 crate::observe::ladder_slug!("iosurface", desc_decode),
             ));
         };
+        // The compatibility mapper registry is still keyed by the wire value;
+        // keep that adaptation here instead of teaching the semantic graph
+        // that a mapper reference is a page-table MappingId.
+        let mapping_id = mapper_ref.get();
         if mapping_id == 0 || tex_w == 0 || tex_h == 0 {
             return Err(br(BlitStatus::MissingResource, "iosurface_zero_geom"));
         }

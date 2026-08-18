@@ -1633,7 +1633,7 @@ pub enum Descriptor {
     DepthStencil(DepthStencilDescriptor),
     TextureView(TextureViewDescriptor),
     IOSurfaceTexture {
-        mapping_id: u32,
+        mapper_ref: reims_vgpu_protocol::MapperSurfaceRef,
         object_ref: u32,
         pixel_format: u16,
         width: u32,
@@ -3727,7 +3727,7 @@ const SERIALIZER_RESOURCE_MIN_LEN: usize = 17;
 /// written as hex at the read sites, which is the convention every other
 /// decoder in this file already follows — an offset that appears only as a
 /// literal cannot be found by a reader checking whether the layout still holds.
-pub const IOSURFACE_TEX_MAPPING_ID: usize = 0x00;
+pub const IOSURFACE_TEX_MAPPER_REF: usize = 0x00;
 pub const IOSURFACE_TEX_OBJECT_REF: usize = 0x10;
 pub const IOSURFACE_TEX_PIXEL_FORMAT: usize = 0x16;
 pub const IOSURFACE_TEX_WIDTH: usize = 0x18;
@@ -3750,8 +3750,8 @@ pub const IOSURFACE_TEX_HEIGHT: usize = 0x1c;
 pub const IOSURFACE_TEX_MIN_LEN: usize = 0x20;
 
 pub fn decode_iosurface_texture_descriptor(bytes: &[u8]) -> Result<Descriptor, DecodeStatus> {
-    // Matches reims-vgpu-iosurface-pages texture descriptor min layout (mappingID,
-    // object self-ref, format, width, height). Live IOSurface texture blobs are longer
+    // IOSurface texture descriptor prefix: mapper reference, object self-ref,
+    // format, width, and height. Live IOSurface texture blobs are longer
     // (0x38/0x58); multi-mip level records are **not** part of this object type
     // — Metal forbids mipmapped IOSurface textures
     // (`newTextureWithDescriptor:iosurface:` rejects mipmapLevelCount > 1),
@@ -3761,7 +3761,9 @@ pub fn decode_iosurface_texture_descriptor(bytes: &[u8]) -> Result<Descriptor, D
         return Err(DecodeStatus::ErrShort("res_iosurface_short"));
     }
     Ok(Descriptor::IOSurfaceTexture {
-        mapping_id: ld32(&bytes[IOSURFACE_TEX_MAPPING_ID..]),
+        mapper_ref: reims_vgpu_protocol::MapperSurfaceRef::new(ld32(
+            &bytes[IOSURFACE_TEX_MAPPER_REF..],
+        )),
         object_ref: ld32(&bytes[IOSURFACE_TEX_OBJECT_REF..]),
         pixel_format: ld16(&bytes[IOSURFACE_TEX_PIXEL_FORMAT..]),
         width: ld32(&bytes[IOSURFACE_TEX_WIDTH..]),

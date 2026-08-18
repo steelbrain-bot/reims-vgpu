@@ -1399,13 +1399,13 @@ fn iosurface_to_iosurface() {
     b[0x1c] = 32;
     match decode_descriptor(ObjectKind::IOSurfaceTexture, &b).unwrap() {
         Descriptor::IOSurfaceTexture {
-            mapping_id,
+            mapper_ref,
             width,
             height,
             pixel_format,
             ..
         } => {
-            assert_eq!(mapping_id, 2);
+            assert_eq!(mapper_ref.get(), 2);
             assert_eq!(width, 64);
             assert_eq!(height, 32);
             assert_eq!(pixel_format, 0x50);

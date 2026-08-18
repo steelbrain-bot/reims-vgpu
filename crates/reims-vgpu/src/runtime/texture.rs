@@ -54,12 +54,12 @@ pub fn register_from_descriptor_bytes(
         .and_then(|kind| decode_descriptor(kind, desc));
     match decoded {
         Ok(Descriptor::IOSurfaceTexture {
-            mapping_id,
+            mapper_ref,
             width,
             height,
             pixel_format,
             ..
-        }) => register_iosurface_texture_geom(state, mapping_id, width, height, pixel_format),
+        }) => register_iosurface_texture_geom(state, mapper_ref.get(), width, height, pixel_format),
         // A buffer, a function, a pipeline: not a refusal. This is called for
         // every object type and only IOSurface texture carries mapping geometry, so the
         // decoder answering "that is a different object" is the normal case and
