@@ -1051,7 +1051,7 @@ pub enum GvaWritebackDecline {
     /// per channel, so a half-float destination can be the same bytes as the
     /// image. The rule was never a width — it is whether the destination's texel
     /// and the resident's are one layout, which is
-    /// [`crate::backend::vulkan::translate::pixel::verbatim_texel`]'s question
+    /// [`crate::contract::pixel_format::verbatim_storage_format`]'s question
     /// and not this doc's to restate.
     ///
     /// `R16_FLOAT` is what lands here now, twice on a driven macos-26 boot: it
@@ -1412,6 +1412,8 @@ pub(crate) struct GvaPlaneDestination {
 pub(crate) struct GvaPlaneGeometry {
     /// The Vulkan format the resident must already hold.
     pub want: ash::vk::Format,
+    /// Backend-independent stored texel the guest destination declares.
+    pub format: reims_vgpu_protocol::StorageImageFormat,
     pub bpt: u64,
     pub row_stride: u64,
     /// The bytes from `target_gva` this plane occupies — the extent the copy
@@ -1438,14 +1440,15 @@ impl GvaPlaneDestination {
         // table alone — this destination serves a compute storage output as
         // readily as a Store, and a storage image is a thing the guest neither
         // renders into nor samples. See
-        // [`crate::backend::vulkan::translate::pixel::verbatim_texel`].
-        let Some((want, bpt)) =
-            crate::backend::vulkan::translate::pixel::verbatim_texel(self.format)
+        // [`crate::contract::pixel_format::verbatim_storage_format`].
+        let Some(format) = crate::contract::pixel_format::verbatim_storage_format(self.format)
         else {
             return Err(GvaWritebackDecline::FormatNeedsConversion {
                 format: self.format,
             });
         };
+        let want = crate::backend::vulkan::translate::pixel::vk_storage_image(format);
+        let bpt = format.bytes_per_texel() as u32;
         let bpt = u64::from(bpt);
         let row_stride = u64::from(self.row_stride);
         if row_stride == 0
@@ -1458,6 +1461,7 @@ impl GvaPlaneDestination {
         }
         Ok(GvaPlaneGeometry {
             want,
+            format,
             bpt,
             row_stride,
             extent: u64::from(self.height.saturating_sub(1)) * row_stride
@@ -1521,6 +1525,7 @@ pub(crate) fn licence_gva_plane<M: HostMemory + HostOps>(
 ) -> Result<GvaPlaneLicence, GvaWritebackDecline> {
     let GvaPlaneGeometry {
         want,
+        format,
         bpt,
         row_stride,
         extent,
@@ -1559,8 +1564,7 @@ pub(crate) fn licence_gva_plane<M: HostMemory + HostOps>(
         row_length_texels: (row_stride / bpt) as u32,
         width: c0.width,
         height: c0.height,
-        format: crate::backend::vulkan::translate::pixel::texel_layout_of(want)
-            .expect("verbatim guest texel has a semantic layout"),
+        format,
     };
     // This device is about to write these guest pages. Without this record a
     // reader holding a gathered image over the same pages
@@ -1752,7 +1756,7 @@ mod gva_copying_arm_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::SettleSite;
+    use super::{GvaPlaneDestination, SettleSite};
 
     /// Two sites sharing a slug would silently sum their waits into one census
     /// line, and the reading would name the wrong caller as the device's largest
@@ -1772,5 +1776,29 @@ mod tests {
             assert_eq!(site.route_us(), format!("{}_us", site.route()), "{site:?}");
         }
         assert_eq!(seen.len(), SettleSite::ALL.len());
+    }
+
+    #[test]
+    fn a_wide_compute_destination_keeps_its_semantic_texel_through_the_copy_licence() {
+        let destination = GvaPlaneDestination {
+            target_gva: 0x1000,
+            width: 3,
+            height: 2,
+            row_stride: 64,
+            format: crate::contract::pixel_format::MTL_FORMAT_RGBA32_FLOAT,
+            texture_ref: 0,
+        };
+        let geometry = destination.geometry().expect("RGBA32Float copies verbatim");
+        assert_eq!(geometry.bpt, 16);
+        assert_eq!(geometry.extent, 64 + 3 * 16);
+        assert_eq!(
+            geometry.format,
+            reims_vgpu_protocol::StorageImageFormat::Rgba32Float
+        );
+        assert_eq!(
+            geometry.want,
+            ash::vk::Format::R32G32B32A32_SFLOAT,
+            "native conversion happens only after semantic selection"
+        );
     }
 }

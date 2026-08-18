@@ -3297,7 +3297,7 @@ pub fn copy_target_to_guest_pages(
     // payments, all on one texture, so the app's whole canvas stayed the zeros
     // its pages were allocated with. The declined fields keep the unfolded
     // spellings so a future firing still says which side held what.
-    let dst_format = crate::translate::pixel::vk_texel_layout(dst.format);
+    let dst_format = crate::format::vk_storage_image(dst.format);
     if !crate::translate::pixel::stored_bytes_agree(snap.format, dst_format) {
         return Err(DrawError::GuestPageWrite(
             GuestWriteDecline::ResidentFormatMismatch {
@@ -5463,7 +5463,7 @@ mod guest_page_target_tests {
             // The format is checked against the resident's and no fixture here
             // reaches a resident, so only its texel width matters — these cases
             // are all four-byte extent arithmetic.
-            format: reims_vgpu_protocol::TexelLayout::Bgra8,
+            format: reims_vgpu_protocol::StorageImageFormat::Bgra8Unorm,
         }
     }
 

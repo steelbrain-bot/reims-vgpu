@@ -243,6 +243,27 @@ impl StorageImageFormat {
     }
 }
 
+impl From<TexelLayout> for StorageImageFormat {
+    fn from(layout: TexelLayout) -> Self {
+        match layout {
+            TexelLayout::Rgba8 => Self::Rgba8Unorm,
+            TexelLayout::Bgra8 => Self::Bgra8Unorm,
+            TexelLayout::R8 => Self::R8Unorm,
+            TexelLayout::Rg8 => Self::Rg8Unorm,
+            TexelLayout::R16Float => Self::R16Float,
+            TexelLayout::R32Float => Self::R32Float,
+            TexelLayout::R16Unorm => Self::R16Unorm,
+            TexelLayout::Rg16Unorm => Self::Rg16Unorm,
+            TexelLayout::Rgba16Float => Self::Rgba16Float,
+            TexelLayout::Rg16Float => Self::Rg16Float,
+            TexelLayout::Rgba16Unorm => Self::Rgba16Unorm,
+            TexelLayout::Rgb10a2Unorm => Self::Rgb10a2Unorm,
+            TexelLayout::Bgr10a2Unorm => Self::Bgr10a2Unorm,
+            TexelLayout::Rg11b10Float => Self::Rg11b10Float,
+        }
+    }
+}
+
 impl TexelLayout {
     /// Every layout in stable table-index order.
     pub const ALL: &'static [Self] = &[
@@ -355,6 +376,14 @@ mod tests {
         assert_eq!(StorageImageFormat::Rgba8Uint.bytes_per_texel(), 4);
         assert_eq!(StorageImageFormat::Rgba16Float.bytes_per_texel(), 8);
         assert_eq!(StorageImageFormat::Rgba32Float.bytes_per_texel(), 16);
+    }
+
+    #[test]
+    fn every_texel_layout_has_an_equally_wide_storage_format() {
+        for &layout in TexelLayout::ALL {
+            let storage = StorageImageFormat::from(layout);
+            assert_eq!(storage.bytes_per_texel(), layout.bytes_per_texel() as usize);
+        }
     }
 
     #[test]

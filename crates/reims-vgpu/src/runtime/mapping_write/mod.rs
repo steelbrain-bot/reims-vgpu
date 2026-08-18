@@ -1040,12 +1040,12 @@ pub(crate) fn licence_iosurface_texture_surface<M: HostMemory + HostOps>(
     // table alone: this licence serves a compute storage output as well as a
     // Store, and a storage image is a thing the guest neither renders into nor
     // samples. See
-    // [`crate::backend::vulkan::translate::pixel::verbatim_texel`].
-    let Some((dst_format, texel)) =
-        crate::backend::vulkan::translate::pixel::verbatim_texel(format)
-    else {
+    // [`crate::contract::pixel_format::verbatim_storage_format`].
+    let Some(semantic_format) = pixel_format::verbatim_storage_format(format) else {
         return Err(GpuWritebackDecline::FormatNeedsConversion { format });
     };
+    let dst_format = crate::backend::vulkan::translate::pixel::vk_storage_image(semantic_format);
+    let texel = semantic_format.bytes_per_texel() as u32;
     // And that the source holds exactly it. See this function's doc for why the
     // render caller's own downstream check stays where it is: the two compare
     // different pairs, and this is the only one the compute rail has.
@@ -1163,8 +1163,7 @@ pub(crate) fn licence_iosurface_texture_surface<M: HostMemory + HostOps>(
         // will read these bytes back as. Every byte offset planned above came
         // from its width, and the engine refuses the copy outright if the
         // resident does not hold exactly this.
-        format: crate::backend::vulkan::translate::pixel::texel_layout_of(dst_format)
-            .expect("verbatim guest texel has a semantic layout"),
+        format: semantic_format,
     };
     // Both witnesses before the copy rather than after it, matching
     // `contig_for_write`: a refused write costs a spurious bump, which makes a

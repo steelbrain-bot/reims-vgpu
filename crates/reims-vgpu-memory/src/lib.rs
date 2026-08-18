@@ -189,14 +189,14 @@ pub struct GuestPageTarget {
     pub width: u32,
     pub height: u32,
     /// Physical texel layout the guest declared for this destination.
-    pub format: reims_vgpu_protocol::TexelLayout,
+    pub format: reims_vgpu_protocol::StorageImageFormat,
 }
 
 impl GuestPageTarget {
     pub fn extent_end(&self) -> u64 {
         let rows_before = u64::from(self.height.saturating_sub(1));
         rows_before * self.pitch_bytes()
-            + u64::from(self.width) * u64::from(self.format.bytes_per_texel())
+            + u64::from(self.width) * self.format.bytes_per_texel() as u64
     }
 
     pub fn window_bytes(&self) -> u64 {
@@ -207,7 +207,7 @@ impl GuestPageTarget {
     }
 
     pub fn pitch_bytes(&self) -> u64 {
-        u64::from(self.row_length_texels.max(self.width)) * u64::from(self.format.bytes_per_texel())
+        u64::from(self.row_length_texels.max(self.width)) * self.format.bytes_per_texel() as u64
     }
 
     pub fn geometry(&self) -> reims_vgpu_paging::regions::WindowGeometry {
@@ -219,7 +219,7 @@ impl GuestPageTarget {
     }
 
     pub fn rows_are_dense(&self) -> bool {
-        self.pitch_bytes() == u64::from(self.width) * u64::from(self.format.bytes_per_texel())
+        self.pitch_bytes() == u64::from(self.width) * self.format.bytes_per_texel() as u64
     }
 }
 
@@ -1325,7 +1325,7 @@ mod tests {
             row_length_texels: 8,
             width: 4,
             height: 2,
-            format: reims_vgpu_protocol::TexelLayout::Bgra8,
+            format: reims_vgpu_protocol::StorageImageFormat::Bgra8Unorm,
         };
 
         assert_eq!(target.pitch_bytes(), 32);

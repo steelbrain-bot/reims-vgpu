@@ -807,6 +807,18 @@ pub fn compute_sampled_image_format(
     })
 }
 
+/// Exact stored texel for a guest declaration a byte-copy rail can serve.
+///
+/// Render and compute declarations converge here before a backend chooses its
+/// native spelling. A copy performs no conversion, so absence means the caller
+/// must take a converting path.
+pub fn verbatim_storage_format(format: u16) -> Option<reims_vgpu_protocol::StorageImageFormat> {
+    if let Some(layout) = store_texel_order(format) {
+        return Some(layout.into());
+    }
+    storage_image_format(format)
+}
+
 /// Storage bytes per texel of a format this host will render into, or `None`
 /// for one it will not.
 ///

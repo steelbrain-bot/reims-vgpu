@@ -262,7 +262,7 @@ pub fn sampled_pixels(
     Ok((layout, srgb_decline(&f, mtl), f.components))
 }
 
-pub use crate::format::{srgb_texel_layout, vk_image_format, vk_texel_layout};
+pub use crate::format::{srgb_texel_layout, vk_image_format, vk_storage_image, vk_texel_layout};
 
 /// The Vulkan format for bytes a CPU loader produced.
 ///
@@ -569,10 +569,7 @@ pub fn color_attachment(
 /// is why: where both answer they must name the same format and the same width,
 /// which is the only way this can be a union rather than a precedence rule.
 pub fn verbatim_texel(mtl: u16) -> Option<(vk::Format, u32)> {
-    if let Some(layout) = pixel_format::store_texel_order(mtl) {
-        return Some((vk_texel_layout(layout), layout.bytes_per_texel()));
-    }
-    let storage = storage_image_from_selector(pixel_format::storage_selector(mtl)?);
+    let storage = pixel_format::verbatim_storage_format(mtl)?;
     Some((
         crate::format::vk_storage_image(storage),
         storage.bytes_per_texel() as u32,
