@@ -53,7 +53,7 @@ pub trait GuestMemoryService: std::fmt::Debug + Send + Sync {
     fn copy_target_to_guest_pages(
         &self,
         _identity: &TargetIdentity,
-        _target: &crate::backend::vulkan::engine::GuestPageTarget,
+        _target: &reims_vgpu_memory::GuestPageTarget,
         _pages: &[u64],
     ) -> Result<(), DrawError> {
         Err(DrawError::Facade(
@@ -286,7 +286,7 @@ impl GuestMemoryService for VulkanExecutor {
     fn copy_target_to_guest_pages(
         &self,
         identity: &TargetIdentity,
-        target: &crate::backend::vulkan::engine::GuestPageTarget,
+        target: &reims_vgpu_memory::GuestPageTarget,
         pages: &[u64],
     ) -> Result<(), DrawError> {
         crate::backend::vulkan::engine::copy_target_to_guest_pages(identity, target, pages)

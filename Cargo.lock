@@ -1129,6 +1129,7 @@ version = "0.1.0"
 dependencies = [
  "reims-vgpu-observe",
  "reims-vgpu-paging",
+ "reims-vgpu-protocol",
 ]
 
 [[package]]

@@ -966,7 +966,7 @@ pub(crate) struct IOSurfaceDestination {
 /// licence already asked. See [`note_iosurface_texture_landed`].
 #[cfg(feature = "backend-vulkan")]
 pub(crate) struct IOSurfaceLicence {
-    pub target: crate::backend::vulkan::engine::GuestPageTarget,
+    pub target: reims_vgpu_memory::GuestPageTarget,
     /// The pages walked, in the surface's own order — what the copy is licensed
     /// over and what every witness on this path is armed against.
     pub gpas: Vec<u64>,
@@ -1154,7 +1154,7 @@ pub(crate) fn licence_iosurface_texture_surface<M: HostMemory + HostOps>(
         )
         .map_err(|refusal| GpuWritebackDecline::GuestRefRefused { refusal })?
     };
-    let target = crate::backend::vulkan::engine::GuestPageTarget {
+    let target = reims_vgpu_memory::GuestPageTarget {
         runs,
         row_length_texels: plan.row_length_texels,
         width: mw,
@@ -1163,7 +1163,8 @@ pub(crate) fn licence_iosurface_texture_surface<M: HostMemory + HostOps>(
         // will read these bytes back as. Every byte offset planned above came
         // from its width, and the engine refuses the copy outright if the
         // resident does not hold exactly this.
-        format: dst_format,
+        format: crate::backend::vulkan::translate::pixel::texel_layout_of(dst_format)
+            .expect("verbatim guest texel has a semantic layout"),
     };
     // Both witnesses before the copy rather than after it, matching
     // `contig_for_write`: a refused write costs a spurious bump, which makes a

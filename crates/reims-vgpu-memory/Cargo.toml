@@ -14,6 +14,7 @@ test-fixtures = ["reims-vgpu-observe/test-fixtures"]
 [dependencies]
 reims-vgpu-observe = { path = "../reims-vgpu-observe" }
 reims-vgpu-paging = { path = "../reims-vgpu-paging" }
+reims-vgpu-protocol = { path = "../reims-vgpu-protocol" }
 
 [dev-dependencies]
 reims-vgpu-observe = { path = "../reims-vgpu-observe", features = ["test-fixtures"] }

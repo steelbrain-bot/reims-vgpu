@@ -113,6 +113,49 @@ pub struct GuestTargetMemory {
     pub footprint: GuestPageFootprint,
 }
 
+/// A render or compute frame's bounded destination in guest pages.
+#[derive(Debug)]
+pub struct GuestPageTarget {
+    pub runs: Vec<GuestWindowRun>,
+    /// Guest row pitch in texels; zero/tighter-than-width means tight rows.
+    pub row_length_texels: u32,
+    pub width: u32,
+    pub height: u32,
+    /// Physical texel layout the guest declared for this destination.
+    pub format: reims_vgpu_protocol::TexelLayout,
+}
+
+impl GuestPageTarget {
+    pub fn extent_end(&self) -> u64 {
+        let rows_before = u64::from(self.height.saturating_sub(1));
+        rows_before * self.pitch_bytes()
+            + u64::from(self.width) * u64::from(self.format.bytes_per_texel())
+    }
+
+    pub fn window_bytes(&self) -> u64 {
+        self.runs
+            .iter()
+            .map(|run| run.guest.requested())
+            .fold(0_u64, u64::saturating_add)
+    }
+
+    pub fn pitch_bytes(&self) -> u64 {
+        u64::from(self.row_length_texels.max(self.width)) * u64::from(self.format.bytes_per_texel())
+    }
+
+    pub fn geometry(&self) -> reims_vgpu_paging::regions::WindowGeometry {
+        reims_vgpu_paging::regions::WindowGeometry {
+            pitch_bytes: self.pitch_bytes(),
+            width_texels: self.width,
+            height_texels: self.height,
+        }
+    }
+
+    pub fn rows_are_dense(&self) -> bool {
+        self.pitch_bytes() == u64::from(self.width) * u64::from(self.format.bytes_per_texel())
+    }
+}
+
 /// One stretch of a [`GuestRunSource`]'s requested window, clipped to it.
 #[derive(Debug)]
 pub struct WindowStretch<'a> {
@@ -1205,6 +1248,24 @@ mod tests {
             .map(|stretch| (stretch.skip, stretch.window_offset, stretch.len))
             .collect();
         assert_eq!(stretches, vec![(0x800, 0, 0x800), (0, 0x800, 0x1000)]);
+    }
+
+    #[test]
+    fn a_guest_page_target_derives_pitch_extent_and_coverage_from_its_layout() {
+        let import = std::sync::Arc::new(import(0x4000, 0x1000));
+        let target = GuestPageTarget {
+            runs: vec![window_run(&import, 0, 0, 0x40)],
+            row_length_texels: 8,
+            width: 4,
+            height: 2,
+            format: reims_vgpu_protocol::TexelLayout::Bgra8,
+        };
+
+        assert_eq!(target.pitch_bytes(), 32);
+        assert_eq!(target.extent_end(), 48);
+        assert_eq!(target.window_bytes(), 0x40);
+        assert!(!target.rows_are_dense());
+        assert_eq!(target.geometry().pitch_bytes, 32);
     }
 
     #[test]

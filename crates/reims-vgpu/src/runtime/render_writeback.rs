@@ -1485,7 +1485,7 @@ impl GvaPlaneDestination {
 /// differently.
 #[cfg(feature = "backend-vulkan")]
 pub(crate) struct GvaPlaneLicence {
-    pub target: crate::backend::vulkan::engine::GuestPageTarget,
+    pub target: reims_vgpu_memory::GuestPageTarget,
     /// The pages walked, in guest-virtual order — what the copy is licensed
     /// over and what every witness on this path is armed against.
     pub gpas: Vec<u64>,
@@ -1552,14 +1552,15 @@ pub(crate) fn licence_gva_plane<M: HostMemory + HostOps>(
     let runs =
         crate::runtime::guest_ram_map::references_for_runs(host, gpas, page_size, in_page, extent)
             .map_err(|refusal| GvaWritebackDecline::GuestRefRefused { refusal })?;
-    let target = crate::backend::vulkan::engine::GuestPageTarget {
+    let target = reims_vgpu_memory::GuestPageTarget {
         runs,
         // Checked above to divide exactly, so this is the guest's pitch and not
         // a rounding of it.
         row_length_texels: (row_stride / bpt) as u32,
         width: c0.width,
         height: c0.height,
-        format: want,
+        format: crate::backend::vulkan::translate::pixel::texel_layout_of(want)
+            .expect("verbatim guest texel has a semantic layout"),
     };
     // This device is about to write these guest pages. Without this record a
     // reader holding a gathered image over the same pages

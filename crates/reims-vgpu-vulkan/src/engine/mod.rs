@@ -58,6 +58,7 @@ pub(crate) use counters::{EngineCounters, TargetReadDelivery};
 pub use draw_phase::{take_window as draw_phase_window, DrawPhaseWindow};
 pub use draw_preparation::DrawPreparationDecline;
 pub use facade_decline::EngineFacadeDecline;
+pub use reims_vgpu_memory::GuestPageTarget;
 pub use types::{guest_target_seed, viewport_slot_count};
 pub use types::{
     AttachmentInitial, BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorWriteMask,
@@ -3191,115 +3192,6 @@ pub fn read_target_leased(identity: &TargetIdentity) -> Result<Option<LeasedFram
     }
 }
 
-/// Where in the guest's own pages a resident's frame lands, as a bounded
-/// reference the engine can bind.
-///
-/// Built by the runtime, which is the only side that knows a mapping's page list
-/// and its row pitch; the engine takes it as given and checks only what it can
-/// see — that the resident matches the extent and that the range is long enough.
-pub struct GuestPageTarget {
-    /// The guest bytes the frame lands in, one bindable reference per
-    /// contiguous stretch, ascending and tiling the window exactly.
-    ///
-    /// A `Vec` because the guest backs a surface in 16 KiB granules that are
-    /// unrelated to each other, so a 1920x1080 window is ~507 stretches and one
-    /// range would name 1/507th of the frame. `references_for_runs` is the only
-    /// producer and it guarantees the tiling; see its doc for what that buys.
-    pub runs: Vec<reims_vgpu_memory::GuestWindowRun>,
-    /// Guest row pitch in **texels** (`bufferRowLength`). Rows past the first
-    /// start this far apart, which is how a padded guest pitch is honoured
-    /// without the inter-row bytes ever being written.
-    pub row_length_texels: u32,
-    pub width: u32,
-    pub height: u32,
-    /// The format the guest reads these bytes back as, from what it declared
-    /// for this destination.
-    ///
-    /// The copy converts nothing, so this is the format the resident must
-    /// already hold; the engine checks the pair and refuses by name rather than
-    /// assuming either side. It lives here and not on the identity because it
-    /// is a property of the *destination* — the runtime is the only side that
-    /// knows what the guest declared, exactly as it is for the row pitch above.
-    ///
-    /// A whole format and not a channel order, because it also fixes how wide a
-    /// texel is, and every byte offset below is computed from that. While every
-    /// resident was eight bits per channel that width was a constant `4`
-    /// written into each of them; a destination four bytes per texel wider
-    /// would have had its rows overlap at half their true pitch.
-    pub format: ash::vk::Format,
-}
-
-impl GuestPageTarget {
-    /// One past the last byte the copy writes: the last texel of the last row.
-    ///
-    /// Padding after the final row is deliberately excluded. Those bytes belong
-    /// to the surface's plane but are not texels this call was given, and the
-    /// copying rail does not write them either — a bound that included them
-    /// would make the two rails land different guest memory for one frame.
-    fn extent_end(&self) -> u64 {
-        let rows_before = u64::from(self.height.saturating_sub(1));
-        rows_before * self.pitch_bytes() + u64::from(self.width) * self.bytes_per_texel()
-    }
-
-    /// Bytes one texel of the destination occupies.
-    ///
-    /// `copy_target_to_guest_pages` has already refused a format this cannot
-    /// answer for — it compares the destination's format against the resident's,
-    /// and a resident exists only at a format these tables know — so the
-    /// fallback is unreachable. It is the four this code used to assume rather
-    /// than a panic, because being wrong here costs a mis-planned copy and not a
-    /// lost boot.
-    fn bytes_per_texel(&self) -> u64 {
-        u64::from(
-            crate::translate::pixel::bytes_per_texel(self.format)
-                .unwrap_or(RESIDENT_READ_BYTES_PER_TEXEL),
-        )
-    }
-
-    /// Guest bytes the runs actually name, summed.
-    ///
-    /// Each run's `requested` and not its `bound_len`: the latter is rounded
-    /// out to the import's granularity, so summing it would claim coverage of
-    /// bytes past the window and turn a short window into one that passes the
-    /// check below.
-    fn window_bytes(&self) -> u64 {
-        self.runs
-            .iter()
-            .map(|r| r.guest.requested())
-            .fold(0u64, u64::saturating_add)
-    }
-
-    /// Guest bytes between the starts of two consecutive rows.
-    fn pitch_bytes(&self) -> u64 {
-        u64::from(self.row_length_texels.max(self.width)) * self.bytes_per_texel()
-    }
-
-    /// The window's byte layout, for planning copy rectangles.
-    fn geometry(&self) -> reims_vgpu_paging::regions::WindowGeometry {
-        reims_vgpu_paging::regions::WindowGeometry {
-            pitch_bytes: self.pitch_bytes(),
-            width_texels: self.width,
-            height_texels: self.height,
-        }
-    }
-
-    /// Whether the window's rows carry no padding, so every byte from the first
-    /// texel to the last is a texel byte.
-    ///
-    /// This is the precondition for the linear path, and it is a statement
-    /// about the *contract* rather than about a workload: when it holds, window
-    /// byte `o` is the frame's byte `o` under a tight packing, so a scratch
-    /// buffer detiled at that packing can be scattered by byte range with no
-    /// row or format arithmetic left to do. When it does not hold, a run's
-    /// bytes include padding that must not be written
-    /// (`reims_vgpu_paging::regions` states why), and a
-    /// `VkBufferCopy` has no way to skip it — so that window takes the
-    /// rectangle path, which does.
-    fn rows_are_dense(&self) -> bool {
-        self.pitch_bytes() == u64::from(self.width) * self.bytes_per_texel()
-    }
-}
-
 /// Copy a resident target straight into the guest's pages, with no host copy of
 /// the frame at any point.
 ///
@@ -3405,11 +3297,12 @@ pub fn copy_target_to_guest_pages(
     // payments, all on one texture, so the app's whole canvas stayed the zeros
     // its pages were allocated with. The declined fields keep the unfolded
     // spellings so a future firing still says which side held what.
-    if !crate::translate::pixel::stored_bytes_agree(snap.format, dst.format) {
+    let dst_format = crate::translate::pixel::vk_texel_layout(dst.format);
+    if !crate::translate::pixel::stored_bytes_agree(snap.format, dst_format) {
         return Err(DrawError::GuestPageWrite(
             GuestWriteDecline::ResidentFormatMismatch {
                 held: snap.format,
-                want: dst.format,
+                want: dst_format,
             },
         ));
     }
@@ -5570,7 +5463,7 @@ mod guest_page_target_tests {
             // The format is checked against the resident's and no fixture here
             // reaches a resident, so only its texel width matters — these cases
             // are all four-byte extent arithmetic.
-            format: crate::translate::pixel::SCANOUT_FORMAT,
+            format: reims_vgpu_protocol::TexelLayout::Bgra8,
         }
     }
 
