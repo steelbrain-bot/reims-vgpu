@@ -108,6 +108,20 @@ pub struct ResolvedBufferToTextureBlit {
     pub aspect: BlitAspect,
 }
 
+/// A texture-to-buffer transfer after both serializer references have resolved.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedTextureToBufferBlit {
+    pub source: ResolvedTextureEndpoint,
+    pub source_origin: TextureOrigin,
+    pub extent: TextureExtent,
+    /// Destination bytes beginning at the command's destination offset and
+    /// extending to the end of the resolved buffer allocation.
+    pub destination: ResolvedBufferRange,
+    pub destination_bytes_per_row: u64,
+    pub destination_bytes_per_image: u64,
+    pub aspect: BlitAspect,
+}
+
 impl ResolvedTextureBacking {
     pub const fn width(&self) -> u32 {
         match self {
@@ -191,6 +205,7 @@ pub enum ResolvedBlit {
         destination: ResolvedBufferRange,
     },
     BufferToTexture(ResolvedBufferToTextureBlit),
+    TextureToBuffer(ResolvedTextureToBufferBlit),
 }
 
 impl ResolvedBlit {
@@ -198,6 +213,7 @@ impl ResolvedBlit {
         match self {
             Self::Fill { destination, .. } | Self::Copy { destination, .. } => destination.content,
             Self::BufferToTexture(operation) => operation.destination.content,
+            Self::TextureToBuffer(operation) => operation.destination.content,
         }
     }
 }
@@ -303,5 +319,44 @@ mod tests {
         });
 
         assert_eq!(operation.destination_content(), destination);
+    }
+
+    #[test]
+    fn resolved_texture_to_buffer_names_the_destination_lifetime() {
+        let source = ContentStamp {
+            resource: ResourceId::new(11, 4),
+            version: ContentVersion::new(6),
+        };
+        let destination = range(12, 8, 0x4000);
+        let operation = ResolvedBlit::TextureToBuffer(ResolvedTextureToBufferBlit {
+            source: ResolvedTextureEndpoint {
+                content: source,
+                backing: ResolvedTextureBacking::Linear(ResolvedLinearTextureLevel {
+                    base_gva: 0x1000,
+                    alloc_size: 0x1000,
+                    level_offset: 0,
+                    row_stride: 64,
+                    slice_stride: 0,
+                    slice_index: 0,
+                    width: 8,
+                    height: 4,
+                    depth: 1,
+                    bpp: 4,
+                    pixel_format: 80,
+                }),
+            },
+            source_origin: TextureOrigin { x: 0, y: 0, z: 0 },
+            extent: TextureExtent {
+                width: 4,
+                height: 1,
+                depth: 1,
+            },
+            destination,
+            destination_bytes_per_row: 16,
+            destination_bytes_per_image: 16,
+            aspect: BlitAspect::Full,
+        });
+
+        assert_eq!(operation.destination_content(), destination.content);
     }
 }
