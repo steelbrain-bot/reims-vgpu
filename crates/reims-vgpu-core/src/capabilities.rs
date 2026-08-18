@@ -1,5 +1,7 @@
 //! Host execution capabilities visible to semantic planning.
 
+use reims_vgpu_protocol::TexelLayout;
+
 /// Host limits used to reduce the device-info values advertised to the guest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceInfoLimits {
@@ -41,9 +43,30 @@ impl Default for ExecutorCapabilities {
     }
 }
 
+/// Read-only host capability service used by semantic planning.
+///
+/// This port answers how an already-decoded operation can be implemented. It
+/// neither advertises guest protocol features nor owns execution, lifecycle,
+/// presentation, or observation services.
+pub trait CapabilityService: std::fmt::Debug + Send + Sync {
+    fn capabilities(&self) -> ExecutorCapabilities {
+        ExecutorCapabilities::default()
+    }
+
+    fn render_target_layout_supported(&self, layout: TexelLayout) -> bool {
+        matches!(layout, TexelLayout::Rgba8 | TexelLayout::Bgra8)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ExecutorCapabilities;
+    use super::{CapabilityService, ExecutorCapabilities};
+    use reims_vgpu_protocol::TexelLayout;
+
+    #[derive(Debug)]
+    struct ConservativeCapabilities;
+
+    impl CapabilityService for ConservativeCapabilities {}
 
     #[test]
     fn conservative_capabilities_do_not_enable_optional_execution_paths() {
@@ -52,5 +75,13 @@ mod tests {
         assert!(!caps.device_info.d24_stencil8);
         assert!(!caps.device_info.native_fp16);
         assert!(!caps.deferred_gpu_only_content);
+    }
+
+    #[test]
+    fn conservative_layout_support_is_independently_queryable() {
+        let service = ConservativeCapabilities;
+        assert!(service.render_target_layout_supported(TexelLayout::Rgba8));
+        assert!(service.render_target_layout_supported(TexelLayout::Bgra8));
+        assert!(!service.render_target_layout_supported(TexelLayout::Rgba16Float));
     }
 }

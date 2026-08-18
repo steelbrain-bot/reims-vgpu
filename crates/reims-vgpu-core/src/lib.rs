@@ -11,7 +11,7 @@ pub mod service;
 pub mod submission;
 pub mod target;
 
-pub use capabilities::{DeviceInfoLimits, ExecutorCapabilities};
+pub use capabilities::{CapabilityService, DeviceInfoLimits, ExecutorCapabilities};
 pub use execution::{
     ExecutionCompletion, ExecutionKind, ExecutionOutput, ExecutionPort, ExecutionReceipt,
     ResolvedSubmission,

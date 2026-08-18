@@ -11,9 +11,9 @@ use crate::model::TargetIdentity;
 use reims_vgpu_protocol::StorageImageFormat;
 
 pub use reims_vgpu_core::{
-    ComputeResidencyService, ExecutionPort, ExecutorCapabilities, GuestWriteReach,
-    GuestWriteService, ResidentContent, ResidentContentBacking, ResidentLease, ResidentService,
-    SubmissionContext, TargetReadback,
+    CapabilityService, ComputeResidencyService, ExecutionPort, ExecutorCapabilities,
+    GuestWriteReach, GuestWriteService, ResidentContent, ResidentContentBacking, ResidentLease,
+    ResidentService, SubmissionContext, TargetReadback,
 };
 
 impl ResidentLease for crate::backend::vulkan::engine::ResidentResourceLease {
@@ -60,22 +60,8 @@ pub trait Executor:
     > + ResidentService
     + GuestWriteService
     + ComputeResidencyService
+    + CapabilityService
 {
-    fn capabilities(&self) -> ExecutorCapabilities {
-        ExecutorCapabilities::default()
-    }
-
-    fn render_target_layout_supported(
-        &self,
-        layout: crate::contract::pixel_format::TexelLayout,
-    ) -> bool {
-        matches!(
-            layout,
-            crate::contract::pixel_format::TexelLayout::Rgba8
-                | crate::contract::pixel_format::TexelLayout::Bgra8
-        )
-    }
-
     fn read_target(&self, _identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
         Err(DrawError::Facade(
             EngineFacadeDecline::ExecutorServiceUnavailable {
@@ -230,27 +216,6 @@ impl Drop for VulkanExecutor {
 }
 
 impl Executor for VulkanExecutor {
-    fn capabilities(&self) -> ExecutorCapabilities {
-        let (max_compute_workgroup_invocations, thread_execution_width) =
-            crate::backend::vulkan::engine::compute_threadgroup_limits();
-        ExecutorCapabilities {
-            device_info: crate::backend::vulkan::engine::device_info_limits(),
-            max_compute_workgroup_invocations,
-            thread_execution_width,
-            max_render_target_dimension:
-                crate::backend::vulkan::engine::max_render_target_dimension(),
-            deferred_gpu_only_content:
-                crate::backend::vulkan::engine::deferred_gpu_only_content_allowed(),
-        }
-    }
-
-    fn render_target_layout_supported(
-        &self,
-        layout: crate::contract::pixel_format::TexelLayout,
-    ) -> bool {
-        crate::backend::vulkan::engine::render_target_layout_supported(layout)
-    }
-
     fn read_target(&self, identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
         crate::backend::vulkan::engine::read_target(identity)
     }
@@ -388,6 +353,29 @@ impl Executor for VulkanExecutor {
         ExecutionScope {
             _engine: Some(crate::backend::vulkan::engine::enter_session(self.session)),
         }
+    }
+}
+
+impl CapabilityService for VulkanExecutor {
+    fn capabilities(&self) -> ExecutorCapabilities {
+        let (max_compute_workgroup_invocations, thread_execution_width) =
+            crate::backend::vulkan::engine::compute_threadgroup_limits();
+        ExecutorCapabilities {
+            device_info: crate::backend::vulkan::engine::device_info_limits(),
+            max_compute_workgroup_invocations,
+            thread_execution_width,
+            max_render_target_dimension:
+                crate::backend::vulkan::engine::max_render_target_dimension(),
+            deferred_gpu_only_content:
+                crate::backend::vulkan::engine::deferred_gpu_only_content_allowed(),
+        }
+    }
+
+    fn render_target_layout_supported(
+        &self,
+        layout: crate::contract::pixel_format::TexelLayout,
+    ) -> bool {
+        crate::backend::vulkan::engine::render_target_layout_supported(layout)
     }
 }
 
@@ -667,11 +655,13 @@ mod tests {
         }
     }
 
-    impl Executor for ScriptedExecutor {
+    impl CapabilityService for ScriptedExecutor {
         fn capabilities(&self) -> ExecutorCapabilities {
             self.capabilities
         }
+    }
 
+    impl Executor for ScriptedExecutor {
         fn reset(&self) {
             self.resets.fetch_add(1, Ordering::Relaxed);
         }
@@ -886,6 +876,7 @@ mod tests {
     #[derive(Debug)]
     struct WrongIdentityExecutor;
 
+    impl CapabilityService for WrongIdentityExecutor {}
     impl Executor for WrongIdentityExecutor {}
     impl ResidentService for WrongIdentityExecutor {}
     impl GuestWriteService for WrongIdentityExecutor {}
