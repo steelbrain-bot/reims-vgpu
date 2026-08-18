@@ -4,11 +4,13 @@ use crate::model::{LruBytesMemo, GFX_MMIO_SIZE, MAX_CHANNELS};
 use crate::runtime::decode::resource::{
     DecodeStatus as ResourceDecodeStatus, Descriptor, ListObjectEntry, SamplerDescriptor,
 };
-use reims_vgpu_core::{ResourceGraph, ResourceNode};
+use reims_vgpu_core::{ReferenceNamespace, ResourceGraph, ResourceNode};
 use reims_vgpu_protocol::{
     ByteLength, ByteOffset, GuestVirtualAddress, MappingId, ObjectRef, PlaneIndex, ResourceId,
-    ResourceObject, SurfaceBackingId, TaskId,
+    ResourceObject, SamplerObject, SurfaceBackingId, TaskId,
 };
+#[cfg(feature = "backend-vulkan")]
+use reims_vgpu_protocol::{DepthStencilObject, RenderPipelineObject};
 #[cfg(feature = "backend-vulkan")]
 use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1271,31 +1273,51 @@ pub struct TaskSamplerState {
 /// lifetimes: an explicit delete removes one reference and task teardown removes
 /// the namespace. A capacity would invent a third lifetime event that the guest
 /// never sent.
-pub struct TaskReferenceStates<T>(Mutex<BTreeMap<(u32, u32), Arc<T>>>);
+struct TaskReferenceState<T, M> {
+    id: ResourceId<M>,
+    value: Arc<T>,
+}
 
-impl<T> Default for TaskReferenceStates<T> {
+struct TaskReferenceStateRegistry<T, M> {
+    values: BTreeMap<(u32, u32), TaskReferenceState<T, M>>,
+    namespace: ReferenceNamespace<M>,
+}
+
+impl<T, M> Default for TaskReferenceStateRegistry<T, M> {
     fn default() -> Self {
-        Self(Mutex::new(BTreeMap::new()))
+        Self {
+            values: BTreeMap::new(),
+            namespace: ReferenceNamespace::default(),
+        }
     }
 }
 
-impl<T> std::fmt::Debug for TaskReferenceStates<T> {
+pub struct TaskReferenceStates<T, M>(Mutex<TaskReferenceStateRegistry<T, M>>);
+
+impl<T, M> Default for TaskReferenceStates<T, M> {
+    fn default() -> Self {
+        Self(Mutex::new(TaskReferenceStateRegistry::default()))
+    }
+}
+
+impl<T, M> std::fmt::Debug for TaskReferenceStates<T, M> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let states = self
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         f.debug_struct("TaskReferenceStates")
-            .field("entries", &states.len())
+            .field("entries", &states.values.len())
             .finish()
     }
 }
 
-impl<T> TaskReferenceStates<T> {
+impl<T, M> TaskReferenceStates<T, M> {
     pub fn contains(&self, task_id: u32, ref_: u32) -> bool {
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values
             .contains_key(&(task_id, ref_))
     }
 
@@ -1303,27 +1325,55 @@ impl<T> TaskReferenceStates<T> {
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values
             .get(&(task_id, ref_))
-            .cloned()
+            .map(|state| Arc::clone(&state.value))
     }
 
     /// Publish a fully constructed object unless another resolver won the race.
     pub fn register(&self, task_id: u32, ref_: u32, state: Arc<T>) -> Arc<T> {
-        Arc::clone(
-            self.0
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .entry((task_id, ref_))
-                .or_insert(state),
-        )
+        let mut registry = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = registry.values.get(&(task_id, ref_)) {
+            return Arc::clone(&existing.value);
+        }
+        let id = registry
+            .namespace
+            .publish(TaskId::new(task_id), ObjectRef::new(ref_))
+            .expect("semantic reference identity space remains available");
+        registry.values.insert(
+            (task_id, ref_),
+            TaskReferenceState {
+                id,
+                value: Arc::clone(&state),
+            },
+        );
+        state
     }
 
-    pub fn delete(&self, task_id: u32, ref_: u32) -> bool {
+    pub fn identity(&self, task_id: u32, ref_: u32) -> Option<ResourceId<M>> {
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&(task_id, ref_))
-            .is_some()
+            .values
+            .get(&(task_id, ref_))
+            .map(|state| state.id)
+    }
+
+    pub fn delete(&self, task_id: u32, ref_: u32) -> bool {
+        let mut registry = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let removed = registry.values.remove(&(task_id, ref_)).is_some();
+        if removed {
+            assert!(registry
+                .namespace
+                .release(TaskId::new(task_id), ObjectRef::new(ref_)));
+        }
+        removed
     }
 
     pub fn delete_task(&self, task_id: u32) -> usize {
@@ -1331,21 +1381,26 @@ impl<T> TaskReferenceStates<T> {
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let before = states.len();
-        states.retain(|&(task, _), _| task != task_id);
-        before - states.len()
+        let before = states.values.len();
+        states.values.retain(|&(task, _), _| task != task_id);
+        let removed = before - states.values.len();
+        let namespace_removed = states.namespace.release_task(TaskId::new(task_id));
+        assert_eq!(removed, namespace_removed);
+        removed
     }
 }
 
 /// Per-task sampler objects, keyed by the sampler API's reference space.
-pub type TaskSamplerStates = TaskReferenceStates<TaskSamplerState>;
+pub type TaskSamplerStates = TaskReferenceStates<TaskSamplerState, SamplerObject>;
 
 /// Per-task render pipeline states, keyed by the pipeline API's reference
 /// space. A state owns its decoded descriptor, translated functions and derived
 /// bind plan exactly as one native pipeline state owns its construction.
 #[cfg(feature = "backend-vulkan")]
-pub type TaskRenderPipelineStates =
-    TaskReferenceStates<crate::runtime::pipeline_resolve::ResolvedRenderPipeline>;
+pub type TaskRenderPipelineStates = TaskReferenceStates<
+    crate::runtime::pipeline_resolve::ResolvedRenderPipeline,
+    RenderPipelineObject,
+>;
 
 /// Per-task depth-stencil states, keyed by that API's reference space.
 ///
@@ -1364,33 +1419,43 @@ pub type TaskRenderPipelineStates =
 /// them — 1 878 843 reads of 32 distinct references over a driven boot, **every
 /// one of them byte-identical to the previous read of the same reference and not
 /// one changed**. The guest publishes the state once and binds it; the delete
-/// command is the invalidation, which is why this needs no capacity and no
-/// generation.
+/// command is the invalidation, which is why this needs no capacity. The
+/// internal generation distinguishes a later reuse of the same guest ref; it
+/// is not another guest-visible lifetime event.
 #[cfg(feature = "backend-vulkan")]
-pub type TaskDepthStencilStates =
-    TaskReferenceStates<crate::runtime::decode::resource::DepthStencilDescriptor>;
+pub type TaskDepthStencilStates = TaskReferenceStates<
+    crate::runtime::decode::resource::DepthStencilDescriptor,
+    DepthStencilObject,
+>;
 
 #[cfg(test)]
 mod task_reference_state_tests {
     use super::TaskReferenceStates;
+    use reims_vgpu_protocol::SamplerObject;
     use std::sync::Arc;
 
     #[test]
     fn explicit_reference_and_task_deletion_are_the_only_retirement_events() {
-        let states = TaskReferenceStates::default();
+        let states = TaskReferenceStates::<_, SamplerObject>::default();
         let first = states.register(1, 7, Arc::new(10u32));
         let raced = states.register(1, 7, Arc::new(11u32));
         states.register(1, 8, Arc::new(12u32));
         states.register(2, 7, Arc::new(13u32));
 
         assert!(Arc::ptr_eq(&first, &raced), "the first construction wins");
+        let first_id = states.identity(1, 7).unwrap();
         assert_eq!(*states.get(1, 7).unwrap(), 10);
         assert!(states.delete(1, 7));
         assert!(!states.contains(1, 7));
+        states.register(1, 7, Arc::new(14u32));
+        let replacement_id = states.identity(1, 7).unwrap();
+        assert_eq!(first_id.index(), replacement_id.index());
+        assert_ne!(first_id.generation(), replacement_id.generation());
         assert!(states.contains(1, 8));
         assert!(states.contains(2, 7));
 
-        assert_eq!(states.delete_task(1), 1);
+        assert_eq!(states.delete_task(1), 2);
+        assert!(!states.contains(1, 7));
         assert!(!states.contains(1, 8));
         assert!(states.contains(2, 7));
         assert_eq!(
@@ -1401,7 +1466,7 @@ mod task_reference_state_tests {
 
     #[test]
     fn a_live_reference_population_has_no_capacity_eviction() {
-        let states = TaskReferenceStates::default();
+        let states = TaskReferenceStates::<_, SamplerObject>::default();
         for ref_ in 0..2048 {
             states.register(3, ref_, Arc::new(ref_));
         }

@@ -16,8 +16,8 @@ pub use identity::{
     StorageId, SubmissionId, SurfaceBackingId, SurfaceId, TaskId,
 };
 pub use resource::{
-    decode_object_list_entry, ObjectKind, ObjectListDecodeError, ObjectListEntry,
-    OBJECT_LIST_ENTRY_LEN,
+    decode_object_list_entry, DepthStencilObject, ObjectKind, ObjectListDecodeError,
+    ObjectListEntry, RenderPipelineObject, SamplerObject, OBJECT_LIST_ENTRY_LEN,
 };
 pub use submission::{
     HeapObject, ResourceObject, ResourceValidity, SegmentBoundary, SegmentKind, SubmissionIdentity,

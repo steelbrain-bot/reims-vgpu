@@ -2,6 +2,13 @@
 
 use core::fmt;
 
+/// Marker for the sampler API's independent reference namespace.
+pub enum SamplerObject {}
+/// Marker for the depth-stencil API's independent reference namespace.
+pub enum DepthStencilObject {}
+/// Marker for the render-pipeline API's independent reference namespace.
+pub enum RenderPipelineObject {}
+
 /// Bytes in one object-list entry.
 pub const OBJECT_LIST_ENTRY_LEN: usize = 12;
 const OBJECT_TYPE_MASK: u32 = 0xff;

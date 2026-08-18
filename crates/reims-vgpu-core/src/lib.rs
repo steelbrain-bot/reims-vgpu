@@ -2,8 +2,10 @@
 //!
 //! This crate deliberately has no QEMU, Vulkan, windowing, or host-OS types.
 
+pub mod namespace;
 pub mod resource;
 
+pub use namespace::{NamespaceError, ReferenceNamespace};
 pub use resource::{
     GraphError, LifecycleState, MappingNode, ResourceGraph, ResourceNode, StorageBacking,
     StorageNode,
