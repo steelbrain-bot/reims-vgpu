@@ -22,6 +22,10 @@ pub enum EngineFacadeDecline {
         expected: &'static str,
         actual: &'static str,
     },
+    ExecutorCompletionCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
     ExecutorCompletionIdentityMismatch {
         expected: SubmissionIdentity,
         actual: SubmissionIdentity,
@@ -47,6 +51,9 @@ impl Decline for EngineFacadeDecline {
             Self::ExecutorCompletionKindMismatch { .. } => {
                 "vk_engine_executor_completion_kind_mismatch"
             }
+            Self::ExecutorCompletionCountMismatch { .. } => {
+                "vk_engine_executor_completion_count_mismatch"
+            }
             Self::ExecutorCompletionIdentityMismatch { .. } => {
                 "vk_engine_executor_completion_identity_mismatch"
             }
@@ -69,6 +76,10 @@ impl Decline for EngineFacadeDecline {
             Self::ExecutorCompletionKindMismatch { expected, actual } => vec![
                 ("expected", (*expected).to_string()),
                 ("actual", (*actual).to_string()),
+            ],
+            Self::ExecutorCompletionCountMismatch { expected, actual } => vec![
+                ("expected", expected.to_string()),
+                ("actual", actual.to_string()),
             ],
             Self::ExecutorCompletionIdentityMismatch { expected, actual } => vec![
                 ("expected_submission", expected.id.get().to_string()),
@@ -124,6 +135,10 @@ mod tests {
                 expected: "draw",
                 actual: "compute",
             },
+            EngineFacadeDecline::ExecutorCompletionCountMismatch {
+                expected: 1,
+                actual: 2,
+            },
             EngineFacadeDecline::ExecutorCompletionIdentityMismatch {
                 expected: SubmissionIdentity {
                     id: reims_vgpu_protocol::SubmissionId::new(1),
@@ -163,7 +178,7 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 7, "the engine façade reason census moved");
+        assert_eq!(before, 8, "the engine façade reason census moved");
         assert_eq!(before, slugs.len(), "duplicate engine façade slug");
     }
 

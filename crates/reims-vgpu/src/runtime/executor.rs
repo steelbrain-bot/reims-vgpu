@@ -14,7 +14,7 @@ pub use reims_vgpu_core::{
     CapabilityService, ComputeResidencyService, ExecutionPort, ExecutorCapabilities,
     GuestWriteReach, GuestWriteService, PresentDecline, PresentationService, ReadbackLease,
     ReadbackService, ResidentContent, ResidentContentBacking, ResidentLease, ResidentService,
-    SubmissionContext, TargetReadback,
+    ResolvedCommand, ResolvedCommandBuffer, SubmissionContext, TargetReadback,
 };
 
 /// Dynamic executor-session scope for one device operation.
@@ -39,7 +39,7 @@ pub fn context_for(state: &crate::model::DeviceState, task_id: u32) -> Submissio
 pub type ResolvedSubmission =
     reims_vgpu_core::ResolvedSubmission<Box<DrawRequest>, Box<ComputeRequest>>;
 pub type ExecutionOutput = reims_vgpu_core::ExecutionOutput<DrawOutput, ComputeOutput>;
-pub type ExecutionCompletion = reims_vgpu_core::ExecutionCompletion<ExecutionOutput>;
+pub type ExecutionCompletion = reims_vgpu_core::ExecutionCompletion<Box<[ExecutionOutput]>>;
 pub type ExecutionReceipt<T> = reims_vgpu_core::ExecutionReceipt<T>;
 
 /// Compatibility port for transfers and synchronization involving guest RAM.
@@ -460,56 +460,70 @@ impl ExecutionPort for VulkanExecutor {
 
     fn execute(&self, submission: Self::Submission) -> Result<Self::Completion, Self::Error> {
         let _scope = self.enter();
-        match submission {
-            ResolvedSubmission::Draw { context, request } => {
-                let gpu_materialized: std::sync::Arc<[reims_vgpu_core::ContentStamp]> = request
-                    .sampled_images
-                    .iter()
-                    .filter(|image| {
-                        matches!(
-                            &image.source,
-                            crate::backend::vulkan::engine::SampledSource::Bytes(_)
-                                | crate::backend::vulkan::engine::SampledSource::GuestRuns(..)
-                        )
-                    })
-                    .filter_map(|image| image.content)
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .into_iter()
-                    .collect::<Vec<_>>()
-                    .into();
-                crate::backend::vulkan::engine::execute_draw_request(&request).map(|output| {
-                    ExecutionCompletion {
-                        submission: context.identity,
-                        output: ExecutionOutput::Draw(output),
-                        gpu_materialized,
-                    }
-                })
-            }
-            ResolvedSubmission::Compute { context, request } => {
-                let gpu_materialized: std::sync::Arc<[reims_vgpu_core::ContentStamp]> = request
-                    .sampled_images
-                    .iter()
-                    .filter(|image| {
-                        matches!(
-                            &image.source,
-                            crate::backend::vulkan::engine::ComputeSampledImageSource::Bytes(_)
-                                | crate::backend::vulkan::engine::ComputeSampledImageSource::GuestPages(_)
-                        )
-                    })
-                    .filter_map(|image| image.content)
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .into_iter()
-                    .collect::<Vec<_>>()
-                    .into();
-                crate::backend::vulkan::engine::execute_compute_request(&request).map(|output| {
-                    ExecutionCompletion {
-                        submission: context.identity,
-                        output: ExecutionOutput::Compute(output),
-                        gpu_materialized,
-                    }
-                })
+        let identity = submission.context.identity;
+        let mut outputs = Vec::new();
+        let mut materialized = std::collections::BTreeSet::new();
+        for command in submission.command_buffer.into_commands().into_vec() {
+            match command {
+                ResolvedCommand::Draw(request) => {
+                    materialized.extend(
+                        request
+                            .sampled_images
+                            .iter()
+                            .filter(|image| {
+                                matches!(
+                                    &image.source,
+                                    crate::backend::vulkan::engine::SampledSource::Bytes(_)
+                                        | crate::backend::vulkan::engine::SampledSource::GuestRuns(
+                                            ..
+                                        )
+                                )
+                            })
+                            .filter_map(|image| image.content),
+                    );
+                    outputs.push(ExecutionOutput::Draw(
+                        crate::backend::vulkan::engine::execute_draw_request(&request)?,
+                    ));
+                }
+                ResolvedCommand::Compute(request) => {
+                    materialized.extend(
+                        request
+                            .sampled_images
+                            .iter()
+                            .filter(|image| {
+                                matches!(
+                                    &image.source,
+                                    crate::backend::vulkan::engine::ComputeSampledImageSource::Bytes(_)
+                                        | crate::backend::vulkan::engine::ComputeSampledImageSource::GuestPages(_)
+                                )
+                            })
+                            .filter_map(|image| image.content),
+                    );
+                    outputs.push(ExecutionOutput::Compute(
+                        crate::backend::vulkan::engine::execute_compute_request(&request)?,
+                    ));
+                }
+                ResolvedCommand::Blit(_) => {
+                    return Err(DrawError::Facade(
+                        EngineFacadeDecline::ExecutorServiceUnavailable {
+                            service: "host_memory_blit",
+                        },
+                    ));
+                }
+                ResolvedCommand::ResourceState(_) => {
+                    return Err(DrawError::Facade(
+                        EngineFacadeDecline::ExecutorServiceUnavailable {
+                            service: "core_resource_state",
+                        },
+                    ));
+                }
             }
         }
+        Ok(ExecutionCompletion {
+            submission: identity,
+            output: outputs.into_boxed_slice(),
+            gpu_materialized: materialized.into_iter().collect::<Vec<_>>().into(),
+        })
     }
 }
 
@@ -520,11 +534,8 @@ pub fn execute_draw(
     request: DrawRequest,
 ) -> Result<ExecutionReceipt<DrawOutput>, DrawError> {
     let expected_identity = context.identity;
-    let expected = ResolvedSubmission::Draw {
-        context,
-        request: Box::new(request),
-    };
-    let expected_kind = expected.kind().as_str();
+    let expected_kind = reims_vgpu_core::ExecutionKind::Draw.as_str();
+    let expected = ResolvedSubmission::single(context, ResolvedCommand::Draw(Box::new(request)));
     let completion = executor.execute(expected)?;
     if completion.submission != expected_identity {
         return Err(DrawError::Facade(
@@ -534,7 +545,16 @@ pub fn execute_draw(
             },
         ));
     }
-    match completion.output {
+    let mut outputs = completion.output.into_vec();
+    if outputs.len() != 1 {
+        return Err(DrawError::Facade(
+            EngineFacadeDecline::ExecutorCompletionCountMismatch {
+                expected: 1,
+                actual: outputs.len(),
+            },
+        ));
+    }
+    match outputs.pop().expect("one checked completion") {
         ExecutionOutput::Draw(output) => Ok(ExecutionReceipt {
             submission: completion.submission,
             output,
@@ -556,11 +576,8 @@ pub fn execute_compute(
     request: ComputeRequest,
 ) -> Result<ExecutionReceipt<ComputeOutput>, DrawError> {
     let expected_identity = context.identity;
-    let expected = ResolvedSubmission::Compute {
-        context,
-        request: Box::new(request),
-    };
-    let expected_kind = expected.kind().as_str();
+    let expected_kind = reims_vgpu_core::ExecutionKind::Compute.as_str();
+    let expected = ResolvedSubmission::single(context, ResolvedCommand::Compute(Box::new(request)));
     let completion = executor.execute(expected)?;
     if completion.submission != expected_identity {
         return Err(DrawError::Facade(
@@ -570,7 +587,16 @@ pub fn execute_compute(
             },
         ));
     }
-    match completion.output {
+    let mut outputs = completion.output.into_vec();
+    if outputs.len() != 1 {
+        return Err(DrawError::Facade(
+            EngineFacadeDecline::ExecutorCompletionCountMismatch {
+                expected: 1,
+                actual: outputs.len(),
+            },
+        ));
+    }
+    match outputs.pop().expect("one checked completion") {
         ExecutionOutput::Compute(output) => Ok(ExecutionReceipt {
             submission: completion.submission,
             output,
@@ -706,20 +732,18 @@ mod tests {
         type Error = DrawError;
 
         fn execute(&self, submission: Self::Submission) -> Result<Self::Completion, Self::Error> {
-            let context = match submission {
-                ResolvedSubmission::Draw { context, .. }
-                | ResolvedSubmission::Compute { context, .. } => context,
-            };
+            let context = submission.context;
             let identity = context.identity;
             self.seen.lock().unwrap().push(context.clone());
             Ok(ExecutionCompletion {
                 submission: identity,
-                output: match self.completion {
+                output: vec![match self.completion {
                     ScriptedCompletion::Draw => ExecutionOutput::Draw(DrawOutput::default()),
                     ScriptedCompletion::Compute => {
                         ExecutionOutput::Compute(ComputeOutput::default())
                     }
-                },
+                }]
+                .into_boxed_slice(),
                 gpu_materialized: Arc::from([]),
             })
         }
@@ -912,16 +936,13 @@ mod tests {
         type Error = DrawError;
 
         fn execute(&self, submission: Self::Submission) -> Result<Self::Completion, Self::Error> {
-            let task = match submission {
-                ResolvedSubmission::Draw { context, .. }
-                | ResolvedSubmission::Compute { context, .. } => context.identity.task,
-            };
+            let task = submission.context.identity.task;
             Ok(ExecutionCompletion {
                 submission: SubmissionIdentity {
                     id: SubmissionId::new(20),
                     task,
                 },
-                output: ExecutionOutput::Draw(DrawOutput::default()),
+                output: vec![ExecutionOutput::Draw(DrawOutput::default())].into_boxed_slice(),
                 gpu_materialized: Arc::from([]),
             })
         }
