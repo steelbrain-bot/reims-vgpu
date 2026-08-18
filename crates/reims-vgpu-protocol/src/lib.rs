@@ -6,11 +6,15 @@
 
 #![no_std]
 
+pub mod blit;
 pub mod identity;
 pub mod pixel;
 pub mod resource;
 pub mod submission;
 
+pub use blit::{
+    BlitCommand, BlitCopyKind, BlitFillSource, BlitKind, BlitPoint, BlitRefKind, BlitSize,
+};
 pub use identity::{
     BackingGeneration, ByteLength, ByteOffset, ContentVersion, GuestPhysicalAddress,
     GuestVirtualAddress, MappingId, ObjectRef, PlaneIndex, ResourceId, ResourceNamespaceId,
