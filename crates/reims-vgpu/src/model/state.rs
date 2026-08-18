@@ -2755,7 +2755,7 @@ pub struct PendingWork {
 }
 
 /// Byte cap for the guest-CPU-produced content memos (`guest_linear_memo`,
-/// `type5_view_memo`, `iosurface_texture_memo`). A cap crossing evicts the coldest entries
+/// `iosurface_plane_view_memo`, `iosurface_texture_memo`). A cap crossing evicts the coldest entries
 /// down to a low-water mark — never a bulk clear — so the hot working set (and
 /// its avoided re-decode/re-convert cost) survives.
 pub const GUEST_LINEAR_MEMO_BYTE_CAP: usize = 128 << 20;
@@ -3201,7 +3201,7 @@ pub struct DeviceState {
     /// lifetime, key space, or eviction policy.
     ///
     /// Each producer used to keep its own counter and the difference was
-    /// measured, not theorised. The guest-linear and type-5 memos shared this
+    /// measured, not theorised. The guest-linear and IOSurface plane view memos shared this
     /// one and were sound; the GVA host cache incremented a *per-entry* field
     /// that restarted at 1 whenever the entry was re-created, and
     /// `evict_gva` re-creates it on every deferred GVA render Store arm. One
@@ -3214,14 +3214,14 @@ pub struct DeviceState {
     pub host_writes: crate::runtime::host_writes::HostWrites,
     /// Reusable native-row read buffer for the guest-linear memo path.
     pub guest_linear_scratch: Vec<u8>,
-    /// Byte-exact revalidated memo for type-5 serialized texture views
+    /// Byte-exact revalidated memo for IOSurface plane view serialized texture views
     /// (median IOSurface planes). Same contract as
     /// [`Self::guest_linear_memo`]: every bind re-reads the native plane
     /// window; conversion + upload (via the returned content identity) are
     /// skipped on unchanged bytes. Keyed by
     /// (mapping_id, plane, width, height, view pixel format). Byte-bounded LRU
     /// ([`GUEST_LINEAR_MEMO_BYTE_CAP`]).
-    pub type5_view_memo: LruBytesMemo<(u32, u32, u32, u32, u16), GuestLinearMemo>,
+    pub iosurface_plane_view_memo: LruBytesMemo<(u32, u32, u32, u32, u16), GuestLinearMemo>,
     /// Byte-exact revalidated memo for the IOSurface texture mapping-backed sampled path
     /// (`load_iosurface_mapping_rgba` — small IOSurface textures below the zero-copy
     /// floor, e.g. dock icons under magnification). Same contract as
@@ -3515,7 +3515,7 @@ impl DeviceState {
             sampled_content_gen: 0,
             host_writes: crate::runtime::host_writes::HostWrites::new(page_shift),
             guest_linear_scratch: Vec::new(),
-            type5_view_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
+            iosurface_plane_view_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             iosurface_texture_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             iosurface_texture_memo_scratch: Vec::new(),
             gva_host_views: Vec::new(),

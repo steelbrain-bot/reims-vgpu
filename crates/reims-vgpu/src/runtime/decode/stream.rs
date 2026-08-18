@@ -155,7 +155,7 @@ pub fn segment_type_name(type_: u32) -> &'static str {
 /// What the stream walker should do with a segment family.
 ///
 /// This exists so the walker's "everything else" arm is a decision rather than a
-/// fallthrough. It used to be `_ => {}`, which gave the same silence to a type-5
+/// fallthrough. It used to be `_ => {}`, which gave the same silence to a IOSurface plane view
 /// envelope the contract says to skip and to a segment family the host has never
 /// seen — and the second of those is unknown wire format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,7 +173,7 @@ pub enum SegmentDisposition {
     /// The wording here was "raw envelope bytes carrying no decodable protection
     /// value", which was a guess written where a measurement now sits. Driven
     /// under `-setSupportsProtectionOptionsEnvelope:` the burst is exactly three
-    /// records: this type-5 header, then **eight fully-written bytes that are the
+    /// records: this IOSurface plane view header, then **eight fully-written bytes that are the
     /// `protectionOptions:` argument verbatim**, then the ordinary segment
     /// header. `reims_vgpu_wire::ops::segment::ProtectionOptionsEnvelope` is the
     /// view; `blit_begin_segment_protected` sends `0x44` and `..._alt` sends

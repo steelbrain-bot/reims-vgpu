@@ -1633,16 +1633,19 @@ fn an_ambiguous_descriptor_declines_where_an_absent_one_still_sizes_a_window() {
     // The wire index is the only thing that separates them, and it reaches
     // each of the two directly.
     assert_eq!(
-        type5_sample_window(m, 0, 4, 2, MTL_FORMAT_R8_UNORM).map(|w| w.0),
+        iosurface_plane_view_sample_window(m, 0, 4, 2, MTL_FORMAT_R8_UNORM).map(|w| w.0),
         Some(512)
     );
     assert_eq!(
-        type5_sample_window(m, 2, 4, 2, MTL_FORMAT_R8_UNORM).map(|w| w.0),
+        iosurface_plane_view_sample_window(m, 2, 4, 2, MTL_FORMAT_R8_UNORM).map(|w| w.0),
         Some(1536)
     );
     // An index past the plane count resolves nothing rather than falling
     // back onto plane 0's bytes.
-    assert_eq!(type5_sample_window(m, 7, 4, 2, MTL_FORMAT_R8_UNORM), None);
+    assert_eq!(
+        iosurface_plane_view_sample_window(m, 7, 4, 2, MTL_FORMAT_R8_UNORM),
+        None
+    );
 }
 
 /// qemu-shim: guest page write IS the surface content (unified memory) —

@@ -20,7 +20,7 @@ use crate::runtime::decode::resource::{
 use crate::runtime::gva_mem;
 use crate::runtime::gva_mem::write_task_gva_arm64e;
 use crate::runtime::host::FakeHost;
-use reims_vgpu_wire::device_desc::Type5Builder;
+use reims_vgpu_wire::device_desc::IOSurfacePlaneViewBuilder;
 
 #[cfg(feature = "backend-vulkan")]
 #[test]
@@ -103,7 +103,7 @@ fn argument_buffer_reflection_decline_carries_the_owner_coordinate() {
     );
 }
 
-/// A type-5 view names its IOSurface plane on the wire (record `+0x20`, the
+/// A IOSurface plane view view names its IOSurface plane on the wire (record `+0x20`, the
 /// `newTextureWithDescriptor:iosurface:plane:` argument). When two planes share
 /// geometry and bytes-per-element the geometry scan cannot separate them and
 /// falls back to inventing a packed window at offset 0 — which is the *first*
@@ -113,7 +113,7 @@ fn argument_buffer_reflection_decline_carries_the_owner_coordinate() {
 /// Shape is the live v0a8 (biplanar video + alpha) layout scaled down: plane 0
 /// and plane 2 are both R8 at identical dims, plane 1 is the RG8 chroma.
 #[test]
-fn stage_texture_type5_plane_index_beats_the_ambiguous_geometry_scan() {
+fn stage_texture_iosurface_plane_view_plane_index_beats_the_ambiguous_geometry_scan() {
     use crate::contract::endian::st16;
     use crate::contract::iosurface_pages::{
         DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_LEN, DEVICE_DESC_PLANES, DEVICE_DESC_PLANE_COUNT,
@@ -134,7 +134,7 @@ fn stage_texture_type5_plane_index_beats_the_ambiguous_geometry_scan() {
     assert!(state.set_object_list(1, 0, 32));
 
     let sid = 3u32;
-    let type5_ref = 10u32;
+    let iosurface_plane_view_ref = 10u32;
     let pfn = 0x20u32;
     let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
     host.map_range(gpa, 0x4000, 0x5a);
@@ -169,26 +169,32 @@ fn stage_texture_type5_plane_index_beats_the_ambiguous_geometry_scan() {
     }
     assert!(state.set_mapping_device_desc(sid, &device_desc));
 
-    // 56-byte type-5 blob: 8-byte head, then kind/blob_len/own_ref and a 0x24
+    // 56-byte IOSurface plane view blob: 8-byte head, then kind/blob_len/own_ref and a 0x24
     // record whose `+0x20` carries the plane index.
     let desc_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E;
-    let type5_desc = Type5Builder::new(sid, 0, 10, 0x42)
+    let iosurface_plane_view_desc = IOSurfacePlaneViewBuilder::new(sid, 0, 10, 0x42)
         .unknown(0x01)
         .geometry(MTL_FORMAT_R8_UNORM, 4, 4, 1)
         .trailer([1, 0, 1, 0, 1, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0])
         // IOSurface plane index = 2 (alpha)
         .plane_index(2);
-    let type5_desc = type5_desc.bytes();
-    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, type5_desc);
-    let off = list_object_entry_offset(type5_ref, 32).unwrap();
+    let iosurface_plane_view_desc = iosurface_plane_view_desc.bytes();
+    write_task_gva_arm64e(
+        &mut host,
+        &state.tasks[1],
+        desc_gva,
+        iosurface_plane_view_desc,
+    );
+    let off = list_object_entry_offset(iosurface_plane_view_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
-    let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((type5_desc.len() as u32) << 8);
+    let packed =
+        (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((iosurface_plane_view_desc.len() as u32) << 8);
     st32(&mut list_entry[0..], packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    let staged = stage_texture_raw(&mut state, &mut host, 1, type5_ref, 33, true)
-        .expect("a type-5 plane view over a mapped surface must stage");
+    let staged = stage_texture_raw(&mut state, &mut host, 1, iosurface_plane_view_ref, 33, true)
+        .expect("a IOSurface plane view plane view over a mapped surface must stage");
     match staged.writeback {
         TextureWriteback::IOSurface {
             surface_offset,
@@ -202,7 +208,7 @@ fn stage_texture_type5_plane_index_beats_the_ambiguous_geometry_scan() {
                  over plane 0 that the ambiguous geometry scan falls back to"
             );
         }
-        _ => panic!("a type-5 view over a surface mapping must write back as IOSurface texture"),
+        _ => panic!("a IOSurface plane view view over a surface mapping must write back as IOSurface texture"),
     }
 }
 
@@ -694,8 +700,11 @@ fn a_compute_refusal_names_its_check_and_ok_names_nothing() {
         "an Ok must not be loggable — that is what keeps the sink clean"
     );
 
-    let st = ComputeStatus::MissingTexture("compute_stage_tex_type5_no_map");
-    assert_eq!(st.refusal(), Some("compute_stage_tex_type5_no_map"));
+    let st = ComputeStatus::MissingTexture("compute_stage_tex_iosurface_plane_view_no_map");
+    assert_eq!(
+        st.refusal(),
+        Some("compute_stage_tex_iosurface_plane_view_no_map")
+    );
     assert_eq!(st.class(), "missing_texture");
     let line = Emit::refusal("compute_record", &st)
         .expect("a refusal renders a line")
@@ -703,7 +712,7 @@ fn a_compute_refusal_names_its_check_and_ok_names_nothing() {
         .render();
     assert_eq!(
         line,
-        "compute_record reason=compute_stage_tex_type5_no_map \
+        "compute_record reason=compute_stage_tex_iosurface_plane_view_no_map \
              class=missing_texture pipe=7"
     );
 }
@@ -1210,12 +1219,12 @@ fn dispatch_missing_texture_fails() {
     ));
 }
 
-/// Live CI wallpaper: type-5 RefTexture → surface backing surface_id must stage via
+/// Live CI wallpaper: IOSurface plane view RefTexture → surface backing surface_id must stage via
 /// ensure_surface + mapping (same order as the `runtime::draw` sample). Without
-/// ensure, stage fell through to type-2/3 with the type-5 ref → always
+/// ensure, stage fell through to type-2/3 with the IOSurface plane view ref → always
 /// MissingTexture (`compute_stage_tex … ot=5`).
 #[test]
-fn stage_texture_type5_ref_resolves_surface_mapping() {
+fn stage_texture_iosurface_plane_view_ref_resolves_surface_mapping() {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
@@ -1226,7 +1235,7 @@ fn stage_texture_type5_ref_resolves_surface_mapping() {
     assert!(state.set_object_list(1, 0, 32));
 
     let sid = 3u32;
-    let type5_ref = 10u32;
+    let iosurface_plane_view_ref = 10u32;
     // Pre-mapped surface backing surface (CI storage target) with one valid page.
     let pfn = 0x20u32;
     let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
@@ -1241,12 +1250,17 @@ fn stage_texture_type5_ref_resolves_surface_mapping() {
     }
     assert!(state.set_mapping_geom(sid, 4, 4, MTL_FORMAT_BGRA8_UNORM));
 
-    // Object-list: type-5 at ref 10 → surface_id=3 (mapping already seeded).
+    // Object-list: IOSurface plane view at ref 10 → surface_id=3 (mapping already seeded).
     let desc_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E; // data pfn base 4 + 2
-    let type5_desc = Type5Builder::new(sid, 0, 0, 0).with_len(16);
-    let type5_desc = type5_desc.bytes();
-    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, type5_desc);
-    let off = list_object_entry_offset(type5_ref, 32).unwrap();
+    let iosurface_plane_view_desc = IOSurfacePlaneViewBuilder::new(sid, 0, 0, 0).with_len(16);
+    let iosurface_plane_view_desc = iosurface_plane_view_desc.bytes();
+    write_task_gva_arm64e(
+        &mut host,
+        &state.tasks[1],
+        desc_gva,
+        iosurface_plane_view_desc,
+    );
+    let off = list_object_entry_offset(iosurface_plane_view_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((16u32) << 8);
     st32(&mut list_entry[0..], packed);
@@ -1254,8 +1268,8 @@ fn stage_texture_type5_ref_resolves_surface_mapping() {
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
     crate::runtime::guest_ram::latch_import_limits(1 << PAGE_SHIFT_ARM64E, 1 << 30, 1 << 30);
-    let staged = stage_texture_raw(&mut state, &mut host, 1, type5_ref, 32, true)
-        .expect("type-5→surface stage must succeed after ensure");
+    let staged = stage_texture_raw(&mut state, &mut host, 1, iosurface_plane_view_ref, 32, true)
+        .expect("IOSurface plane view→surface stage must succeed after ensure");
     crate::runtime::guest_ram::forget_import_limits();
     assert_eq!((staged.width, staged.height), (4, 4));
     assert!(match &staged.input {
@@ -1270,12 +1284,12 @@ fn stage_texture_type5_ref_resolves_surface_mapping() {
     ));
 }
 
-/// A type-5 record is the exact Metal view, even when its single-plane
+/// A IOSurface plane view record is the exact Metal view, even when its single-plane
 /// backing already has valid base geometry. Live pipe 5 exposes each row
 /// of a 1920-wide BGRA8 surface as a 480-wide RGBA32Uint view so one
 /// `uint4` image write stores four packed BGRA pixels.
 #[test]
-fn stage_texture_type5_record_reshapes_stageable_single_plane_surface() {
+fn stage_texture_iosurface_plane_view_record_reshapes_stageable_single_plane_surface() {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::contract::pixel_format::{
         StorageImageSelector, MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_R32_UINT, MTL_FORMAT_RGBA32_UINT,
@@ -1288,7 +1302,7 @@ fn stage_texture_type5_record_reshapes_stageable_single_plane_surface() {
     assert!(state.set_object_list(1, 0, 32));
 
     let sid = 3u32;
-    let type5_ref = 10u32;
+    let iosurface_plane_view_ref = 10u32;
     let pfn = 0x20u32;
     let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
     host.map_range(gpa, 0x4000, 0x5a);
@@ -1304,21 +1318,27 @@ fn stage_texture_type5_record_reshapes_stageable_single_plane_surface() {
 
     // Same 16 bytes per logical row: 4 BGRA8 texels = one RGBA32Uint texel.
     let desc_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E;
-    let type5_desc = Type5Builder::new(sid, 0, 10, 0x42)
+    let iosurface_plane_view_desc = IOSurfacePlaneViewBuilder::new(sid, 0, 10, 0x42)
         .unknown(0x02)
         .geometry(MTL_FORMAT_RGBA32_UINT, 1, 4, 1)
         .trailer([1, 0, 1, 0, 1, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-    let type5_desc = type5_desc.bytes();
-    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, type5_desc);
-    let off = list_object_entry_offset(type5_ref, 32).unwrap();
+    let iosurface_plane_view_desc = iosurface_plane_view_desc.bytes();
+    write_task_gva_arm64e(
+        &mut host,
+        &state.tasks[1],
+        desc_gva,
+        iosurface_plane_view_desc,
+    );
+    let off = list_object_entry_offset(iosurface_plane_view_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
-    let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((type5_desc.len() as u32) << 8);
+    let packed =
+        (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((iosurface_plane_view_desc.len() as u32) << 8);
     st32(&mut list_entry[0..], packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    let staged = stage_texture_raw(&mut state, &mut host, 1, type5_ref, 33, true)
-        .expect("serialized type-5 view must override base surface geometry");
+    let staged = stage_texture_raw(&mut state, &mut host, 1, iosurface_plane_view_ref, 33, true)
+        .expect("serialized IOSurface plane view view must override base surface geometry");
     assert_eq!((staged.width, staged.height), (1, 4));
     assert_eq!(
         staged.storage_selector,
@@ -1355,13 +1375,20 @@ fn stage_texture_type5_record_reshapes_stageable_single_plane_surface() {
     // path), so `storage_selector` is populated — but it is inert here: this
     // view is staged sampled (`is_storage=false`, binding 32), and the
     // selector is only consulted on the storage-bind path.
-    let reshaped = Type5Builder::new(sid, 0, 10, 0x42)
+    let reshaped = IOSurfacePlaneViewBuilder::new(sid, 0, 10, 0x42)
         .unknown(0x02)
         .geometry(MTL_FORMAT_R32_UINT, 4, 4, 1)
         .trailer([1, 0, 1, 0, 1, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
     write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, reshaped.bytes());
-    let sampled = stage_texture_raw(&mut state, &mut host, 1, type5_ref, 32, false)
-        .expect("sample-only R32Uint view must stage from the same IOSurface bytes");
+    let sampled = stage_texture_raw(
+        &mut state,
+        &mut host,
+        1,
+        iosurface_plane_view_ref,
+        32,
+        false,
+    )
+    .expect("sample-only R32Uint view must stage from the same IOSurface bytes");
     assert_eq!((sampled.width, sampled.height), (4, 4));
     assert_eq!(sampled.pixel_format, MTL_FORMAT_R32_UINT);
     assert_eq!(
@@ -1377,12 +1404,12 @@ fn stage_texture_type5_record_reshapes_stageable_single_plane_surface() {
     assert!(matches!(sampled.writeback, TextureWriteback::None));
 }
 
-/// Biplanar surface (device_desc plane_count=2) + type-5 args plane record:
+/// Biplanar surface (device_desc plane_count=2) + IOSurface plane view args plane record:
 /// stage the named plane view (R8 Y) from the plane offset — live class
 /// `compute_dispatch st=Unsupported` / `iosurface_texture_fail reason=multiplane`
 /// (wallpaper '420f', journal 2026-07-14 compute census).
 #[test]
-fn stage_texture_type5_record_stages_biplanar_y_plane() {
+fn stage_texture_iosurface_plane_view_record_stages_biplanar_y_plane() {
     use crate::contract::endian::{st16, st64};
     use crate::contract::iosurface_pages::{
         DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_LEN, DEVICE_DESC_PLANES, DEVICE_DESC_PLANE_COUNT,
@@ -1400,7 +1427,7 @@ fn stage_texture_type5_record_stages_biplanar_y_plane() {
     assert!(state.set_object_list(1, 0, 32));
 
     let sid = 3u32;
-    let type5_ref = 10u32;
+    let iosurface_plane_view_ref = 10u32;
     let pfn = 0x20u32;
     let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
     host.map_range(gpa, 0x4000, 0x77);
@@ -1439,22 +1466,28 @@ fn stage_texture_type5_record_stages_biplanar_y_plane() {
         state.mappings.get(&sid).unwrap()
     ));
 
-    // Type-5 descriptor: sid + args blob carrying the R8 16×8 plane record.
+    // IOSurface plane view descriptor: sid + args blob carrying the R8 16×8 plane record.
     let desc_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E;
     // tag, unk, fmt=R8
-    let type5_desc = Type5Builder::new(sid, 0, 10, 0x42)
+    let iosurface_plane_view_desc = IOSurfacePlaneViewBuilder::new(sid, 0, 10, 0x42)
         .unknown(0x01)
         .geometry(0x0a, 16, 8, 1);
-    let type5_desc = type5_desc.bytes();
-    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, type5_desc);
-    let off = list_object_entry_offset(type5_ref, 32).unwrap();
+    let iosurface_plane_view_desc = iosurface_plane_view_desc.bytes();
+    write_task_gva_arm64e(
+        &mut host,
+        &state.tasks[1],
+        desc_gva,
+        iosurface_plane_view_desc,
+    );
+    let off = list_object_entry_offset(iosurface_plane_view_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
-    let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((type5_desc.len() as u32) << 8);
+    let packed =
+        (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((iosurface_plane_view_desc.len() as u32) << 8);
     st32(&mut list_entry[0..], packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    let staged = stage_texture_raw(&mut state, &mut host, 1, type5_ref, 32, true)
+    let staged = stage_texture_raw(&mut state, &mut host, 1, iosurface_plane_view_ref, 32, true)
         .expect("plane record must stage the Y plane of a biplanar surface");
     assert_eq!((staged.width, staged.height), (16, 8));
     assert_eq!(
@@ -1483,8 +1516,15 @@ fn stage_texture_type5_record_stages_biplanar_y_plane() {
         }
         _ => panic!("expected IOSurface writeback"),
     }
-    let sampled = stage_texture_raw(&mut state, &mut host, 1, type5_ref, 32, false)
-        .expect("sampled type-5 plane must stage without writeback");
+    let sampled = stage_texture_raw(
+        &mut state,
+        &mut host,
+        1,
+        iosurface_plane_view_ref,
+        32,
+        false,
+    )
+    .expect("sampled IOSurface plane view plane must stage without writeback");
     assert!(!sampled.is_storage);
     assert!(matches!(sampled.writeback, TextureWriteback::None));
     let _ = MTL_FORMAT_R8_UNORM;
@@ -1493,7 +1533,7 @@ fn stage_texture_type5_record_stages_biplanar_y_plane() {
 /// Biplanar surface **without** a plane record still fails closed
 /// (no BGRA invent over multi-plane bytes).
 #[test]
-fn stage_texture_type5_multiplanar_without_record_fails_closed() {
+fn stage_texture_iosurface_plane_view_multiplanar_without_record_fails_closed() {
     use crate::contract::iosurface_pages::{
         DEVICE_DESC_LEN, DEVICE_DESC_PLANE_COUNT, PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID,
     };
@@ -1505,7 +1545,7 @@ fn stage_texture_type5_multiplanar_without_record_fails_closed() {
     assert!(state.set_object_list(1, 0, 32));
 
     let sid = 3u32;
-    let type5_ref = 10u32;
+    let iosurface_plane_view_ref = 10u32;
     let pfn = 0x20u32;
     let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
     host.map_range(gpa, 0x4000, 0x5a);
@@ -1525,19 +1565,25 @@ fn stage_texture_type5_multiplanar_without_record_fails_closed() {
         m.format = 0;
     }
 
-    // Type-5 descriptor with sid but NO args record.
+    // IOSurface plane view descriptor with sid but NO args record.
     let desc_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E;
-    let type5_desc = Type5Builder::new(sid, 0, 0, 0).with_len(8);
-    let type5_desc = type5_desc.bytes();
-    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, type5_desc);
-    let off = list_object_entry_offset(type5_ref, 32).unwrap();
+    let iosurface_plane_view_desc = IOSurfacePlaneViewBuilder::new(sid, 0, 0, 0).with_len(8);
+    let iosurface_plane_view_desc = iosurface_plane_view_desc.bytes();
+    write_task_gva_arm64e(
+        &mut host,
+        &state.tasks[1],
+        desc_gva,
+        iosurface_plane_view_desc,
+    );
+    let off = list_object_entry_offset(iosurface_plane_view_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
-    let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((type5_desc.len() as u32) << 8);
+    let packed =
+        (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((iosurface_plane_view_desc.len() as u32) << 8);
     st32(&mut list_entry[0..], packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    match stage_texture_raw(&mut state, &mut host, 1, type5_ref, 32, true) {
+    match stage_texture_raw(&mut state, &mut host, 1, iosurface_plane_view_ref, 32, true) {
         Err(ComputeStatus::Unsupported(_)) => {}
         Err(other) => panic!("expected Unsupported, got {other:?}"),
         Ok(_) => panic!("multiplanar without plane record must fail closed"),
@@ -1757,12 +1803,12 @@ fn compute_stage_admits_full_screen_wide_gamut_without_cap() {
     );
 }
 
-/// Type-5 surface id must not be re-resolved through this task's object
+/// IOSurface plane view surface id must not be re-resolved through this task's object
 /// list: slot `sid` can be a different texture-ref object (id collision).
 /// Live class: ensure=1 then MissingTexture when resolve_iosurface_texture_ref(task,sid)
 /// returned the wrong mapping.
 #[test]
-fn stage_texture_type5_ignores_task_object_list_slot_collision() {
+fn stage_texture_iosurface_plane_view_ignores_task_object_list_slot_collision() {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
@@ -1773,7 +1819,7 @@ fn stage_texture_type5_ignores_task_object_list_slot_collision() {
     assert!(state.set_object_list(1, 0, 32));
 
     let sid = 3u32;
-    let type5_ref = 10u32;
+    let iosurface_plane_view_ref = 10u32;
     let pfn = 0x21u32;
     let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
     host.map_range(gpa, 0x4000, 0xa5);
@@ -1801,20 +1847,25 @@ fn stage_texture_type5_ignores_task_object_list_slot_collision() {
     le_sid[4..12].copy_from_slice(&poison_desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off_sid, &le_sid);
 
-    // type-5 at ref 10 → surface_id 3
+    // IOSurface plane view at ref 10 → surface_id 3
     let desc_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E;
-    let type5_desc = Type5Builder::new(sid, 0, 0, 0).with_len(16);
-    let type5_desc = type5_desc.bytes();
-    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, type5_desc);
-    let off = list_object_entry_offset(type5_ref, 32).unwrap();
+    let iosurface_plane_view_desc = IOSurfacePlaneViewBuilder::new(sid, 0, 0, 0).with_len(16);
+    let iosurface_plane_view_desc = iosurface_plane_view_desc.bytes();
+    write_task_gva_arm64e(
+        &mut host,
+        &state.tasks[1],
+        desc_gva,
+        iosurface_plane_view_desc,
+    );
+    let off = list_object_entry_offset(iosurface_plane_view_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((16u32) << 8);
     st32(&mut list_entry[0..], packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    let staged = stage_texture_raw(&mut state, &mut host, 1, type5_ref, 32, true)
-        .expect("type-5 must stage mapping sid, not poisoned IOSurface texture slot");
+    let staged = stage_texture_raw(&mut state, &mut host, 1, iosurface_plane_view_ref, 32, true)
+        .expect("IOSurface plane view must stage mapping sid, not poisoned IOSurface texture slot");
     assert_eq!((staged.width, staged.height), (4, 4));
     assert!(matches!(
         staged.writeback,
@@ -1822,10 +1873,10 @@ fn stage_texture_type5_ignores_task_object_list_slot_collision() {
     ));
 }
 
-/// Type-5 whose surface_id never maps must fail MissingTexture (not pretend
+/// IOSurface plane view whose surface_id never maps must fail MissingTexture (not pretend
 /// type-2/3 success).
 #[test]
-fn stage_texture_type5_without_surface_is_missing() {
+fn stage_texture_iosurface_plane_view_without_surface_is_missing() {
     use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -1833,20 +1884,32 @@ fn stage_texture_type5_without_surface_is_missing() {
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
 
-    let type5_ref = 11u32;
+    let iosurface_plane_view_ref = 11u32;
     let sid = 99u32; // no mapping
     let desc_gva = (4u64 + 3) << PAGE_SHIFT_ARM64E;
-    let type5_desc = Type5Builder::new(sid, 0, 0, 0).with_len(16);
-    let type5_desc = type5_desc.bytes();
-    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, type5_desc);
-    let off = list_object_entry_offset(type5_ref, 32).unwrap();
+    let iosurface_plane_view_desc = IOSurfacePlaneViewBuilder::new(sid, 0, 0, 0).with_len(16);
+    let iosurface_plane_view_desc = iosurface_plane_view_desc.bytes();
+    write_task_gva_arm64e(
+        &mut host,
+        &state.tasks[1],
+        desc_gva,
+        iosurface_plane_view_desc,
+    );
+    let off = list_object_entry_offset(iosurface_plane_view_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((16u32) << 8);
     st32(&mut list_entry[0..], packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    let st = stage_texture_raw(&mut state, &mut host, 1, type5_ref, 32, false);
+    let st = stage_texture_raw(
+        &mut state,
+        &mut host,
+        1,
+        iosurface_plane_view_ref,
+        32,
+        false,
+    );
     assert!(matches!(st, Err(ComputeStatus::MissingTexture(_))));
 }
 
@@ -2494,7 +2557,7 @@ fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
     // serve it; mapping 2 is staged at a different one, and a copy converts
     // nothing, so no licence could land it however the pages resolve. The format
     // that decides is the bind's own, not the mapping's declaration — the bind
-    // may be a type-5 view reinterpreting the surface, and the staged format is
+    // may be a IOSurface plane view view reinterpreting the surface, and the staged format is
     // the one both the seeding read and the landing write are arithmetic over.
     //
     // Mapping 3 is never registered, so there is nothing to write into.

@@ -445,44 +445,45 @@ fn gva_text(gva: Option<u64>) -> String {
 pub const OBJECT_TYPE_SURFACE: u8 = 4;
 /// RefTextureHandle: surfaceID@0 + cookie@4 + guest blob@8 (texture-ref 28-06-26).
 pub const OBJECT_TYPE_REF_TEXTURE: u8 = 5;
-/// Type-5 RefTexture descriptor (RE `allocateRefTextureHandle` + Metal
+/// IOSurface plane view RefTexture descriptor (RE `allocateRefTextureHandle` + Metal
 /// `initWithDevice:descriptor:iosurface:plane:field:`):
 /// - `surfaceID@0` = `IOSurface::getSurfaceID()` = surface backing heap object id / mid
 /// - `ownerTask@4` = the task whose object list holds that surface
 /// - `args@8..` = **serialized texture args** length `desc_len-8` (MTLTextureDescriptor
 ///   stream for the **plane** view; plane is applied guest-side before serialize)
 ///
-/// See [[reims-vgpu-resource-paging]] type-5 section.
-/// Type-5 descriptor geometry, from the wire crate's Tier-2 view of it.
+/// See [[reims-vgpu-resource-paging]] IOSurface plane view section.
+/// IOSurface plane view descriptor geometry, from the wire crate's Tier-2 view of it.
 ///
 /// The ten offsets these used to be are `offset_of!` on
-/// [`reims_vgpu_wire::device_desc::Type5Header`], `Type5ArgsHeader` and
-/// `Type5TextureRecord`, asserted there against the numbers this module used to
+/// [`reims_vgpu_wire::device_desc::IOSurfacePlaneViewHeader`], `IOSurfacePlaneViewArgsHeader` and
+/// `IOSurfacePlaneViewTextureRecord`, asserted there against the numbers this module used to
 /// state. The two record tags come with them, since a tag is part of the
 /// layout's identity and not of this device's policy.
-pub(crate) use reims_vgpu_wire::device_desc::TYPE5_ARGS;
-// Only `TYPE5_ARGS` is still named by a product path — the decoders read the
+pub(crate) use reims_vgpu_wire::device_desc::IOSURFACE_PLANE_VIEW_ARGS;
+// Only `IOSURFACE_PLANE_VIEW_ARGS` is still named by a product path — the decoders read the
 // rest through the wire views. These five are named only by the tests that
 // assert the layout, so they are gated with those tests rather than left
-// reachable from the staticlib. `TYPE5_RECORD_TAG_PLANE` is not among them:
-// its one caller builds the descriptor with `wire::device_desc::Type5Builder`
+// reachable from the staticlib. `IOSURFACE_PLANE_VIEW_RECORD_TAG_PLANE` is not among them:
+// its one caller builds the descriptor with `wire::device_desc::IOSurfacePlaneViewBuilder`
 // on the line above and now names the tag from the same module.
 #[cfg(test)]
 pub(crate) use reims_vgpu_wire::device_desc::{
-    TYPE5_ARG_RECORD, TYPE5_OWNER_TASK, TYPE5_RECORD_PLANE, TYPE5_RECORD_TAG_COLOR_VIEW,
-    TYPE5_SURFACE_ID,
+    IOSURFACE_PLANE_VIEW_ARG_RECORD, IOSURFACE_PLANE_VIEW_OWNER_TASK,
+    IOSURFACE_PLANE_VIEW_RECORD_PLANE, IOSURFACE_PLANE_VIEW_RECORD_TAG_COLOR_VIEW,
+    IOSURFACE_PLANE_VIEW_SURFACE_ID,
 };
 
-/// Shortest type-5 descriptor: the header, with no args blob behind it.
-pub const TYPE5_MIN_LEN: usize = TYPE5_ARGS;
+/// Shortest IOSurface plane view descriptor: the header, with no args blob behind it.
+pub const IOSURFACE_PLANE_VIEW_MIN_LEN: usize = IOSURFACE_PLANE_VIEW_ARGS;
 
-/// Texture view named by a type-5 descriptor's serialized args record.
+/// Texture view named by a IOSurface plane view descriptor's serialized args record.
 ///
 /// This is not limited to IOSurface planes. The live desktop also uses
 /// row-byte-equivalent reinterpretations such as a 480-wide RGBA32Uint view
 /// over a 1920-wide BGRA8 surface.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Type5TextureView {
+pub struct IOSurfacePlaneViewDescriptor {
     pub pixel_format: u16,
     pub width: u32,
     pub height: u32,
@@ -492,13 +493,13 @@ pub struct Type5TextureView {
     pub plane_index: u32,
 }
 
-/// Report the owner task a type-5 descriptor names, once per distinct value.
+/// Report the owner task a IOSurface plane view descriptor names, once per distinct value.
 ///
 /// Every surface backing surface this device has resolved lived in task 0 — measured
 /// (`surface_backing_claimants`: `claims=1 winner=0` on every surface id of two driven
 /// boots) and structural, since the guest registers IOSurface backings in the
 /// accelerator's kernel task whose id is a hardcoded 0.
-/// [`reims_vgpu_wire::device_desc::TYPE5_OWNER_TASK`] is
+/// [`reims_vgpu_wire::device_desc::IOSURFACE_PLANE_VIEW_OWNER_TASK`] is
 /// the guest saying the same thing on the wire, so this reads 0 forever and
 /// stays on the quiet channel.
 ///
@@ -507,34 +508,34 @@ pub struct Type5TextureView {
 /// first" probe order is no longer the guest's answer, and the field's decoded
 /// meaning is wrong. `first_sight` is keyed on the value alone, so the whole
 /// boot costs one line whichever way it goes.
-fn note_type5_owner_task(desc: &[u8]) {
-    let Ok(h) = reims_vgpu_wire::device_desc::type5_header(desc) else {
+fn note_iosurface_plane_view_owner_task(desc: &[u8]) {
+    let Ok(h) = reims_vgpu_wire::device_desc::iosurface_plane_view_header(desc) else {
         return;
     };
     let task = h.owner_task.get();
-    if !crate::observe::first_sight("type5_owner_task", task as u64) {
+    if !crate::observe::first_sight("iosurface_plane_view_owner_task", task as u64) {
         return;
     }
-    let line = format!("type5_owner_task task={task}");
+    let line = format!("iosurface_plane_view_owner_task task={task}");
     if task == 0 {
         crate::observe::off(line);
     } else {
         crate::observe::fail(format!(
-            "{line} (a type-5 view names a surface owner other than the kernel task; \
+            "{line} (a IOSurface plane view view names a surface owner other than the kernel task; \
              the surface backing search probes task 0 first on the reading that this is always 0)"
         ));
     }
 }
 
-/// Decode the serialized texture-view record from a full type-5 descriptor.
+/// Decode the serialized texture-view record from a full IOSurface plane view descriptor.
 ///
 /// Fail-closed: `None` unless the record tag matches and geometry is sane
 /// (2D, nonzero). The record names the exact Metal view (format + geometry)
 /// over the IOSurface bytes; callers must not replace it with base mapping
 /// geometry merely because the surface itself is otherwise stageable.
-pub fn decode_type5_texture_view(desc: &[u8]) -> Option<Type5TextureView> {
-    note_type5_owner_task(desc);
-    let rec = reims_vgpu_wire::device_desc::type5_texture_record(desc).ok()?;
+pub fn decode_iosurface_plane_view(desc: &[u8]) -> Option<IOSurfacePlaneViewDescriptor> {
+    note_iosurface_plane_view_owner_task(desc);
+    let rec = reims_vgpu_wire::device_desc::iosurface_plane_view_texture_record(desc).ok()?;
     // Both the biplanar-plane tag and the full-colour view variant share the
     // field layout; any other tag stays unknown → fail closed (no invented
     // geometry).
@@ -548,14 +549,15 @@ pub fn decode_type5_texture_view(desc: &[u8]) -> Option<Type5TextureView> {
     if pixel_format == 0 || width == 0 || height == 0 || depth != 1 {
         return None;
     }
-    Some(Type5TextureView {
+    Some(IOSurfacePlaneViewDescriptor {
         pixel_format,
         width,
         height,
         depth,
         // `None` is a blob that stops before the field — pre-plane descriptors
         // and fixtures — which this rail reads as plane 0.
-        plane_index: reims_vgpu_wire::device_desc::type5_record_plane_index(desc).unwrap_or(0),
+        plane_index: reims_vgpu_wire::device_desc::iosurface_plane_view_record_plane_index(desc)
+            .unwrap_or(0),
     })
 }
 
@@ -693,7 +695,7 @@ pub fn iosurface_pixel_format_to_mtl(pixel_format: u32) -> u16 {
     // was in from the field's magnitude, and the caller already knows: every
     // caller here passes a surface backing `pixelFormat` (+0x0c), which is an IOSurface
     // OSType — a four-character code, so never below 0x20202020. The IOSurface texture and
-    // type-5 rails carry their MTL ordinal in a `u16` field of their own and do
+    // IOSurface plane view rails carry their MTL ordinal in a `u16` field of their own and do
     // not route through this function.
     //
     // The magnitude test was also wrong at its own boundary: MTLPixelFormat
@@ -1743,7 +1745,8 @@ fn publish_resource_relations<M: HostMemory>(
             .task_resources
             .attach_registered_surface(task_id, object_ref, object_ref),
         ObjectKind::IOSurfacePlaneView => {
-            let Ok(header) = reims_vgpu_wire::device_desc::type5_header(&resource.descriptor)
+            let Ok(header) =
+                reims_vgpu_wire::device_desc::iosurface_plane_view_header(&resource.descriptor)
             else {
                 return false;
             };
@@ -2896,10 +2899,10 @@ fn resolve_surface_backing_ex<M: HostMemory>(
     // all 256 slots), then the remaining tasks.
     //
     // Task 0 leads because the guest says so, not because it is where surfaces
-    // have happened to be. A type-5 view carries the owning task at
-    // [`TYPE5_OWNER_TASK`] and it is the accelerator's kernel task, whose id is a
+    // have happened to be. A IOSurface plane view view carries the owning task at
+    // [`IOSURFACE_PLANE_VIEW_OWNER_TASK`] and it is the accelerator's kernel task, whose id is a
     // hardcoded 0 and whose slot the task-id allocator reserves before any client
-    // task exists. `note_type5_owner_task` fails loudly if that ever reads
+    // task exists. `note_iosurface_plane_view_owner_task` fails loudly if that ever reads
     // otherwise.
     //
     // The remaining 255 probes are not dead weight on that reading. They cost

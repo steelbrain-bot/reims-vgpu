@@ -794,7 +794,7 @@ impl crate::observe::Decline for ConsoleEfiRowRefused {
 ///
 /// Bare, three of them were claimed by another rail: `unmapped` and `short_view`
 /// were also `import_present`'s words for different checks, and `no_mapping` was
-/// also the type-5 loader's — so `grep reason=unmapped` returned a mix of the
+/// also the IOSurface plane view loader's — so `grep reason=unmapped` returned a mix of the
 /// capture rail and the import rail and could not be read. The `capture_` prefix
 /// is the same fix the slate reasons and the MRT proxies took.
 ///

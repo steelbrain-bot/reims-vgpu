@@ -44,7 +44,7 @@ const ALL_CAPTURE: &[CaptureDecline] = &[
 /// Every capture reason names the rail that wrote it.
 ///
 /// Bare, three of these belonged to other rails too — `unmapped` and
-/// `short_view` to the guest-page import path and `no_mapping` to the type-5
+/// `short_view` to the guest-page import path and `no_mapping` to the IOSurface plane view
 /// loader — so a `grep reason=unmapped` over one boot returned a mix of
 /// subsystems. The prefix is what makes that grep answerable.
 #[test]

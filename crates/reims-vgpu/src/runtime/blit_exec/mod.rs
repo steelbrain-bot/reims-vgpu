@@ -196,9 +196,9 @@ fn reset_tex_wrong_type_dedup_for_test() {
 static T5_DECODE_FAIL_SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u32>>> =
     std::sync::OnceLock::new();
 
-/// One always-on diagnostic per surface id when a type-5 RefTexture's view
+/// One always-on diagnostic per surface id when a IOSurface plane view RefTexture's view
 /// record fails to decode: dumps `desc_len` + head hex so the exact blit-path
-/// type-5 layout can be read offline (the decoder wants tag 0x42 at +0x14, 2D
+/// IOSurface plane view layout can be read offline (the decoder wants tag 0x42 at +0x14, 2D
 /// nonzero geom, depth==1). Deduped so a per-draw repeat cannot flood.
 fn note_t5_decode_fail(sid: u32, bytes: &[u8]) {
     let set = T5_DECODE_FAIL_SEEN.get_or_init(|| std::sync::Mutex::new(Default::default()));
@@ -349,7 +349,7 @@ struct IOSurfaceTextureBacking {
     /// IOSurface-aligned surface row stride (bytes).
     ///
     /// `u32` to match both ends it sits between: `iosurface_texture_sample_window` and
-    /// `type5_sample_window` each return it as one, and its only readers hand
+    /// `iosurface_plane_view_sample_window` each return it as one, and its only readers hand
     /// it to [`mapping_write::SurfaceWindow::bpr`], which is one. It was `u64`,
     /// so both construction sites widened and both readers narrowed straight
     /// back — a round trip that reads exactly like an unchecked truncation of a
@@ -751,7 +751,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         }));
     }
 
-    // Type-5 RefTexture: a serialized Metal texture VIEW over an IOSurface
+    // IOSurface plane view RefTexture: a serialized Metal texture VIEW over an IOSurface
     // (surfaceID at +0). The compute stage path already resolves these; the
     // blit path previously dropped every one as `tex_wrong_type` (~99/six-app
     // launch, all object_type=5), so a blit COPY from a video/biplanar plane
@@ -763,24 +763,24 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
     // whole difference between this and IOSurface texture, whose window resolves the plane
     // by matching geometry and bytes-per-element and so cannot tell two planes
     // that share both apart. A biplanar COPY names exactly such a pair, so this
-    // is the path where dropping the index lands. `type5_sample_window` states
+    // is the path where dropping the index lands. `iosurface_plane_view_sample_window` states
     // the case; a plane it cannot resolve declines here rather than binding
     // whichever plane shares the geometry.
     if entry.kind == ObjectKind::IOSurfacePlaneView {
         if level != 0 || slice != 0 {
             return Err(br(BlitStatus::Unsupported, "t5_level_slice"));
         }
-        let Ok(t5) = reims_vgpu_wire::device_desc::type5_header(bytes) else {
+        let Ok(t5) = reims_vgpu_wire::device_desc::iosurface_plane_view_header(bytes) else {
             return Err(br(BlitStatus::MissingResource, "t5_desc_short"));
         };
         let sid = t5.surface_id.get();
         if sid == 0 {
             return Err(br(BlitStatus::MissingResource, "t5_no_sid"));
         }
-        let Some(view) = objects::decode_type5_texture_view(bytes) else {
+        let Some(view) = objects::decode_iosurface_plane_view(bytes) else {
             // A short/zero-geom record fails closed — no fallback to base geom.
             // Capture why (len/tag/geom) deduped per sid so the exact blit-path
-            // type-5 layout can be decoded without flooding.
+            // IOSurface plane view layout can be decoded without flooding.
             note_t5_decode_fail(sid, bytes);
             return Err(br(BlitStatus::Unsupported, "t5_view_decode"));
         };
@@ -798,13 +798,15 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         let Some(bpp) = pixel_format::bytes_per_pixel(format) else {
             return Err(br(BlitStatus::Unsupported, "t5_fmt_bpp"));
         };
-        let Some((surface_offset, surface_bpr, span_end)) = mapping_write::type5_sample_window(
-            m,
-            view.plane_index,
-            view.width,
-            view.height,
-            format,
-        ) else {
+        let Some((surface_offset, surface_bpr, span_end)) =
+            mapping_write::iosurface_plane_view_sample_window(
+                m,
+                view.plane_index,
+                view.width,
+                view.height,
+                format,
+            )
+        else {
             return Err(br(BlitStatus::Bounds, "t5_sample_window"));
         };
         // Whether this arm runs at all. Without it a change to the window this
@@ -815,7 +817,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         // Read on a driven x86/Vulkan boot (Safari window drag + two
         // web-content-probe runs): **0** — this arm does not execute on that
         // workload at all, while `blit_dest_bound` reads 26, so the blit path
-        // itself does run and it is the type-5 source that is absent. The
+        // itself does run and it is the IOSurface plane view source that is absent. The
         // plane-index resolution above is therefore contract fidelity, not a
         // repair of anything this workload does, and a screen that looks the
         // same after changing it says nothing either way.
@@ -1393,7 +1395,7 @@ fn iosurface_rect_extent(
 /// pages** have live GPU-resident content instead?
 ///
 /// The sampled rail and the blit rail consume the same wire form — an IOSurface texture
-/// IOSurface, named directly or through a type-5 view — and they resolve it
+/// IOSurface, named directly or through a IOSurface plane view view — and they resolve it
 /// completely differently. `draw::vulkan`'s sampled resolver runs a four-rung
 /// ladder whose top rung is `iosurfacerung_resident`, the engine image, and a driven
 /// session puts 64-93 % of its binds there. This resolver has no ladder at all:
@@ -2374,7 +2376,7 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
     };
     // The half `blit_rows_us` cannot see. That counter sits in `copy_row_region`,
     // which only the linear-to-linear fast path reaches; every IOSurface texture and
-    // type-5 endpoint stages through this loop instead, and each of its rows
+    // IOSurface plane view endpoint stages through this loop instead, and each of its rows
     // re-vouches the mapping's guest page table. `mapw_pages_vouched` reads over
     // a million on a driven Maps leg and nothing timed the loop that spends them.
     let bt_rows_started = std::time::Instant::now();
@@ -2967,7 +2969,7 @@ fn exec_copy_texture_to_buffer<M: HostMemory + HostOps>(
     );
     // `blit_rows_us` lives in `copy_row_region`, which only the linear-to-linear
     // fast path reaches. A texture-to-buffer copy stages every row through
-    // `read_texture_row` instead, and for an IOSurface texture or type-5 source that
+    // `read_texture_row` instead, and for an IOSurface texture or IOSurface plane view source that
     // re-vouches the mapping's guest page table per row.
     let stage_rows_started = std::time::Instant::now();
     let mut row = vec![0u8; row_bytes as usize];
@@ -3508,7 +3510,7 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
         Err(st) => return st,
     };
     // The last untimed loop on the rail: a texture-to-texture copy with a
-    // IOSurface texture or type-5 end on either side stages through here rather than
+    // IOSurface texture or IOSurface plane view end on either side stages through here rather than
     // through `copy_row_region`, so `blit_rows_us` reports nothing for it.
     //
     // A plane at a time, not a row at a time: this is the same staging shape the
@@ -3672,7 +3674,7 @@ enum GpuPlaneRefusal {
     /// The destination mapping declines a resident-to-guest-pages copy at this
     /// extent, so there is no window to write.
     DstWindowUnresolved,
-    /// The two derivations of the destination plane disagree. A type-5 view's
+    /// The two derivations of the destination plane disagree. A IOSurface plane view view's
     /// wire plane index lands here: it can name a plane the mapping's own
     /// geometry scan does not resolve to, and the GPU rail takes no index.
     PlaneOffset,

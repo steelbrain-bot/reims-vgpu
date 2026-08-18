@@ -456,7 +456,7 @@ pub fn sample_window_from_device_surface(
 ///
 /// Three ways a window is derived, in order:
 ///
-/// - **A wire-carried plane index** (type-5 record `+0x20`) names its plane
+/// - **A wire-carried plane index** (IOSurface plane view record `+0x20`) names its plane
 ///   record directly. It is the only key that separates same-geometry planes:
 ///   a v0a8 surface's Y plane 0 and alpha plane 2 are both R8 at the luma
 ///   geometry, so the scan below matches two and takes neither.
@@ -1285,7 +1285,7 @@ mod tests {
 
     /// v0a8 (biplanar video + alpha) shape from the live apple.com hero: the
     /// Y and alpha planes share geometry and bpe, so the geometry scan is
-    /// ambiguous by construction — only an explicit wire plane index (type-5
+    /// ambiguous by construction — only an explicit wire plane index (IOSurface plane view
     /// record `+0x20`) separates them.
     #[test]
     fn sample_window_plane_index_selects_among_same_geometry_planes() {

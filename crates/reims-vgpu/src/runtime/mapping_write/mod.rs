@@ -201,7 +201,7 @@ fn refuse(mapping_id: u32, why: SurfaceWriteRefusal) -> bool {
 /// because a capable host takes the import for every guest window and leaves the
 /// copying rails at zero. With the gate closed
 /// (`host_pointer_import=disabled_by_env`, nothing reporting a bound import) the
-/// copying rails carried the whole workload — every type-5 view, every IOSurface texture
+/// copying rails carried the whole workload — every IOSurface plane view view, every IOSurface texture
 /// resident rung and every surface flush of the drag — and **no window failed to
 /// resolve**. Every bind came from a published descriptor, so the estimate above
 /// is the state before the guest fills one rather than a rung this device leans
@@ -237,17 +237,17 @@ pub fn iosurface_texture_sample_window(
     sample_window(m, None, width, height, format)
 }
 
-/// Resolve the sample window for a type-5 serialized view, which — unlike
-/// IOSurface texture — carries the IOSurface plane index on the wire (type-5 record
+/// Resolve the sample window for a IOSurface plane view serialized view, which — unlike
+/// IOSurface texture — carries the IOSurface plane index on the wire (IOSurface plane view record
 /// `+0x20`).
 ///
-/// Every type-5 consumer must come through here rather than through
+/// Every IOSurface plane view consumer must come through here rather than through
 /// [`iosurface_texture_sample_window`], and the distinction is not cosmetic: the wire index
 /// names the plane record directly, and it is the only key that separates
-/// same-geometry planes. Handing a type-5 view's geometry to the IOSurface texture scan
+/// same-geometry planes. Handing a IOSurface plane view view's geometry to the IOSurface texture scan
 /// drops that index, so a bind the wire said was alpha resolves against
 /// whichever same-geometry plane the scan happens to reach.
-pub fn type5_sample_window(
+pub fn iosurface_plane_view_sample_window(
     m: &MappingEntry,
     plane_index: u32,
     width: u32,
@@ -802,7 +802,7 @@ fn plan_guest_window(
 /// plane itself, from the mapping's own declaration, through the same two steps
 /// this function performs. A caller that already holds its own idea of the
 /// destination plane — the blit rail resolves one out of the guest's texture
-/// descriptor, and a type-5 view carries a **wire plane index** this rail has no
+/// descriptor, and a IOSurface plane view view carries a **wire plane index** this rail has no
 /// parameter for — must compare the two before routing a copy here, because a
 /// disagreement is not an error anywhere: the frame lands, in the wrong plane of
 /// the right surface, and the only symptom is the next plane's pixels.
@@ -920,7 +920,7 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
 /// window of which plane a copy lands in is the *caller's* knowledge, and the
 /// two callers here come by it differently — a render Store's destination is the
 /// whole surface, while a compute bind resolves a window at stage time, which
-/// may be a sub-rectangle and, for a type-5 view, names its IOSurface plane on
+/// may be a sub-rectangle and, for a IOSurface plane view view, names its IOSurface plane on
 /// the wire.
 ///
 /// Resolving it inside the licence instead served the Store and silently
@@ -928,7 +928,7 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
 /// remaining compute readbacks on a driven macos-13 boot, all
 /// [`GpuWritebackDecline::GeometryMoved`] — and behind that refusal sat a worse
 /// failure it was hiding: [`iosurface_texture_sample_window`] takes no plane index and
-/// matches by geometry, so a type-5 bind's frame would have landed in whichever
+/// matches by geometry, so a IOSurface plane view bind's frame would have landed in whichever
 /// plane happened to share its dimensions. [`resident_gpu_plane`]'s doc states
 /// the cost of exactly that disagreement, which is that there is no error — the
 /// frame lands in the wrong plane of the right surface and the symptom is the
@@ -2135,7 +2135,7 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
     // `copy_nonoverlapping` out of the mapped span and flushes nothing — so
     // whether an IOSurface texture surface read observed the deferred Store depended on
     // whether its guest pages happened to be contiguous. Three callers read
-    // guest pages through here with no flush of their own: the type-5 view
+    // guest pages through here with no flush of their own: the IOSurface plane view view
     // loader, a blit reading an IOSurface texture backing, and the compute sample
     // stage.
     //
@@ -2183,7 +2183,7 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
     // arm was bounded anyway — which is true, but only by its own slice bounds:
     // that arm reads the window and then indexes rows into it, so an overrunning
     // rect came back as a bare `false` from a `get` that returned `None`. Both
-    // callers do name that (`rd_row_iosurface_io`, `Type5ViewDecline::Read`), so it was
+    // callers do name that (`rd_row_iosurface_io`, `IOSurfacePlaneViewDecline::Read`), so it was
     // never a silent loss, but neither can say the rect left the window, and the
     // fragmented arm is the one a driven x86 boot actually takes. One check above
     // the split gives both arms the same refusal and the same line.

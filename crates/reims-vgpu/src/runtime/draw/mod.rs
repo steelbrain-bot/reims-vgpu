@@ -1973,14 +1973,16 @@ fn sample_miss_detail<M: HostMemory + HostOps>(
         ObjectKind::IOSurfacePlaneView => {
             match objects::read_descriptor(state, host, task_id, &entry) {
                 None => format!("type=5 desc_len={desc_len} reason=no_desc"),
-                Some(d) if reims_vgpu_wire::device_desc::type5_header(&d).is_err() => {
+                Some(d)
+                    if reims_vgpu_wire::device_desc::iosurface_plane_view_header(&d).is_err() =>
+                {
                     format!("type=5 desc_len={desc_len} reason=short_desc")
                 }
                 Some(d) => {
-                    let sid = reims_vgpu_wire::device_desc::type5_header(&d)
+                    let sid = reims_vgpu_wire::device_desc::iosurface_plane_view_header(&d)
                         .map(|h| h.surface_id.get())
                         .unwrap_or(0);
-                    match objects::decode_type5_texture_view(&d) {
+                    match objects::decode_iosurface_plane_view(&d) {
                         Some(view) => format!(
                             "type=5 desc_len={desc_len} surface_id={sid} view={}x{} fmt={:#x} reason=ref_texture_view",
                             view.width, view.height, view.pixel_format
@@ -3692,7 +3694,7 @@ fn prepare_memo_scratch(scratch: &mut Vec<u8>, span: usize, filled: usize) {
 }
 
 /// Byte-exact revalidated memo for the IOSurface texture mapping-backed guest-page sampled
-/// path. Same contract as [`load_linear_guest_memoized`] / the type-5 view memo:
+/// path. Same contract as [`load_linear_guest_memoized`] / the IOSurface plane view view memo:
 /// re-read the native BGRA rect every bind (a guest CPU write is always
 /// observed — neither `map_generation` nor `content_generation` tracks in-place
 /// guest writes), memcmp against the memo, and on an unchanged hit return the
@@ -3736,7 +3738,7 @@ fn load_iosurface_texture_rgba_memoized<M: HostMemory + HostOps>(
         return None;
     }
     // Identity key namespace: bits 63+62 mark IOSurface texture memo content, distinct from
-    // raw-GVA keys (bit 63 clear) and type-5 view keys (bit 63 set, bit 62 clear).
+    // raw-GVA keys (bit 63 clear) and IOSurface plane view view keys (bit 63 set, bit 62 clear).
     // Every producer draws its generation from
     // `DeviceState::next_sampled_content_generation`, so a (key, generation)
     // pair is unique device-wide and content can never alias on a collision.

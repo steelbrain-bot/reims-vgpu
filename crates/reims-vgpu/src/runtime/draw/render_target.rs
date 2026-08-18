@@ -17,8 +17,8 @@
 //!    sticky latch — the latch exists only for the window where the object-list
 //!    entry is transiently missing, and preferring it has twice routed a
 //!    dual-mapping composite onto one mapping.
-//! 3. **Surface backing surface / type-5 `RefTextureHandle`.** The object-list index is
-//!    the surface id; type-5 wraps surface backing and is what product colour targets
+//! 3. **Surface backing surface / IOSurface plane view `RefTextureHandle`.** The object-list index is
+//!    the surface id; IOSurface plane view wraps surface backing and is what product colour targets
 //!    actually bind.
 //! 4. **Type-2/3 linear guest VA.** Wallpaper and background intermediates and
 //!    UI intermediate render targets live here, so an IOSurface texture-only resolve drops
@@ -47,7 +47,7 @@
 //! A zero over an unstated amount of work is not a measurement, so: on the same
 //! boot `mrt_draw_single` counted **179 123** single-attachment draws reaching
 //! the Vulkan encode, every one of which is a colour attachment this ladder had
-//! already resolved, and `rt_type5_view_same` counted **23 951** attachments
+//! already resolved, and `rt_iosurface_plane_view_same` counted **23 951** attachments
 //! that reached the *bottom* of the surface backing/5 rung. Both counters predate the
 //! typed refusals and sit on the success side, which is what makes them usable
 //! as a denominator here.
@@ -107,17 +107,17 @@ fn rt_surface_backing_base_format(format: u16, mapping_id: u32) -> Option<u16> {
 
 /// The format a surface backing colour attachment is **declared** in.
 ///
-/// A type-5 object is a texture view over the surface allocation, and its format
+/// A IOSurface plane view object is a texture view over the surface allocation, and its format
 /// is attachment state: the UNORM and sRGB spellings name identical stored bytes
 /// and differ only in the fixed-function conversion the hardware applies on
 /// render writes. The guest declared that view, so the view's format is the
 /// contract and the base mapping's is what a surface bound without one falls
 /// back to. A type-8 view is a further reinterpretation asked for on top, so it
-/// outranks the type-5 record when both are present.
+/// outranks the IOSurface plane view record when both are present.
 ///
 /// # Why this stopped answering the base mapping's format
 ///
-/// It used to answer `base_fmt` for every type-5 view, on the ground that
+/// It used to answer `base_fmt` for every IOSurface plane view view, on the ground that
 /// honouring the view would fork the resident — the guest binds one surface
 /// through both spellings, and a second spelling that missed would retire the
 /// resident and recreate it empty, alternating two half-filled images frame to
@@ -134,13 +134,13 @@ fn rt_surface_backing_base_format(format: u16, mapping_id: u32) -> Option<u16> {
 ///
 /// # The geometry half is deliberately not honoured
 ///
-/// A type-5 view is taken only where it agrees with the base *extent*, because
+/// A IOSurface plane view view is taken only where it agrees with the base *extent*, because
 /// the resolve this feeds takes the base mapping's geometry. A view describing a
 /// different grid is one this device is not honouring at all, and lifting its
 /// format alone would attach a reinterpretation to a grid that is not its own —
 /// the row-byte-equivalent quarter-width `RGBA32Uint` view over the desktop
 /// target is exactly that shape. That population is
-/// `rt_type5_view_differs_geometry`; it has never been observed on any boot, and
+/// `rt_iosurface_plane_view_differs_geometry`; it has never been observed on any boot, and
 /// it still resolves through the base.
 ///
 /// A view format whose texel is a different *width* from the base's is not a
@@ -149,37 +149,41 @@ fn rt_surface_backing_base_format(format: u16, mapping_id: u32) -> Option<u16> {
 fn rt_surface_backing_declared_format(
     base_fmt: u16,
     base_extent: (u32, u32),
-    type5_view: Option<objects::Type5TextureView>,
+    iosurface_plane_view: Option<objects::IOSurfacePlaneViewDescriptor>,
     view_fmt_override: Option<u16>,
 ) -> u16 {
     let (base_w, base_h) = base_extent;
-    let type5_declared = type5_view
+    let iosurface_plane_view_declared = iosurface_plane_view
         .filter(|view| view.width == base_w && view.height == base_h)
         .map(|view| view.pixel_format)
         .filter(|&fmt| fmt != 0);
-    effective_view_sample_format(base_fmt, view_fmt_override.or(type5_declared)).unwrap_or(base_fmt)
+    effective_view_sample_format(
+        base_fmt,
+        view_fmt_override.or(iosurface_plane_view_declared),
+    )
+    .unwrap_or(base_fmt)
 }
 
-/// Report a type-5 colour attachment whose view record disagrees with the base
+/// Report a IOSurface plane view colour attachment whose view record disagrees with the base
 /// mapping it is resolved through.
 ///
-/// This resolve reads only `surfaceID@0` out of a type-5 descriptor and takes
-/// geometry and format from the mapping. [`objects::decode_type5_texture_view`]'s
+/// This resolve reads only `surfaceID@0` out of a IOSurface plane view descriptor and takes
+/// geometry and format from the mapping. [`objects::decode_iosurface_plane_view`]'s
 /// own contract forbids that — "callers must not replace it with base mapping
 /// geometry merely because the surface itself is otherwise stageable" — and the
 /// live case it names is real: the BGRA8 desktop target is also exposed as a
-/// row-byte-equivalent quarter-width RGBA32Uint view. Every other type-5
+/// row-byte-equivalent quarter-width RGBA32Uint view. Every other IOSurface plane view
 /// consumer binds the view's own geometry.
 ///
 /// It is harmless exactly while view == base, so the question is how often that
 /// holds for a *render target* specifically, which nothing has measured.
-/// `rt_type5_view_differs` against `rt_type5_view_same` answers it. Reported
+/// `rt_iosurface_plane_view_differs` against `rt_iosurface_plane_view_same` answers it. Reported
 /// rather than repaired: taking the view's geometry here changes what every
-/// type-5 colour attachment renders into, and that is not a change to make on an
+/// IOSurface plane view colour attachment renders into, and that is not a change to make on an
 /// unmeasured population.
 ///
 /// **Read on two driven x86/Vulkan boots: `same` 20 273 and 24 360, `differs`
-/// 0, `undecoded` 0.** So on this workload every type-5 colour attachment's view
+/// 0, `undecoded` 0.** So on this workload every IOSurface plane view colour attachment's view
 /// agrees with the base mapping in width, height and format, and resolving
 /// through the base loses nothing. The reinterpretation view the contract names
 /// is real traffic elsewhere — the compute staging path sees it — but it is not
@@ -238,7 +242,7 @@ fn rt_surface_backing_declared_format(
 /// macos-13 boot reads `same` only, with `differs` absent entirely, and
 /// `runtime::census::srgb_census` emits nothing across its six sites. So the
 /// extra encode `bugs/bug-03` measures enters somewhere neither this rail nor
-/// that census watches, and the type-5 view divergence — real, and worth
+/// that census watches, and the IOSurface plane view view divergence — real, and worth
 /// honouring on its own terms — is not its road.
 ///
 /// **`..._geometry` is still a live healthy zero and is still a loss.** It has
@@ -249,18 +253,18 @@ fn rt_surface_backing_declared_format(
 /// surface bound both ways is what exercises the view swap, so a non-zero there
 /// is the reading that says the swap is being taken rather than merely
 /// available.
-fn note_rt_type5_view(
-    view: Option<objects::Type5TextureView>,
+fn note_rt_iosurface_plane_view(
+    view: Option<objects::IOSurfacePlaneViewDescriptor>,
     surface_id: u32,
     base: (u32, u32, u16),
 ) {
     let Some(view) = view else {
-        crate::runtime::drain::note_store_route("rt_type5_view_undecoded");
+        crate::runtime::drain::note_store_route("rt_iosurface_plane_view_undecoded");
         return;
     };
     let (base_w, base_h, base_fmt) = base;
     if view.width == base_w && view.height == base_h && view.pixel_format == base_fmt {
-        crate::runtime::drain::note_store_route("rt_type5_view_same");
+        crate::runtime::drain::note_store_route("rt_iosurface_plane_view_same");
         if differed_before(surface_id) {
             // The reading that decides whether the format repair above is safe.
             // A surface resolved both ways is one this device would key two
@@ -268,31 +272,31 @@ fn note_rt_type5_view(
             // between two images is worse than a frame in the wrong colour
             // space. A boot reporting `differs_format_only` with this at zero is
             // the one that licenses the repair.
-            crate::runtime::drain::note_store_route("rt_type5_view_sid_both_ways");
+            crate::runtime::drain::note_store_route("rt_iosurface_plane_view_sid_both_ways");
         }
         return;
     }
-    crate::runtime::drain::note_store_route("rt_type5_view_differs");
+    crate::runtime::drain::note_store_route("rt_iosurface_plane_view_differs");
     // Which half diverged decides both the counter and what the fail line says
     // happened, so it is asked once. The two halves no longer have the same
     // answer — the format is honoured and the geometry is not — and a single
     // sentence covering both was accurate only while neither was.
     let (route, disposition) = if view.width == base_w && view.height == base_h {
         (
-            "rt_type5_view_differs_format_only",
+            "rt_iosurface_plane_view_differs_format_only",
             "the colour attachment is resolved in the view's format",
         )
     } else {
         (
-            "rt_type5_view_differs_geometry",
+            "rt_iosurface_plane_view_differs_geometry",
             "the colour attachment is resolved with the base mapping's geometry, not the view's",
         )
     };
     crate::runtime::drain::note_store_route(route);
     note_differed(surface_id);
-    if crate::observe::first_sight("rt_type5_view_differs", surface_id as u64) {
+    if crate::observe::first_sight("rt_iosurface_plane_view_differs", surface_id as u64) {
         crate::observe::fail(format!(
-            "rt_type5_view_differs sid={surface_id} view={}x{} fmt={:#x} plane={} \
+            "rt_iosurface_plane_view_differs sid={surface_id} view={}x{} fmt={:#x} plane={} \
              base={base_w}x{base_h} fmt={base_fmt:#x} ({disposition})",
             view.width, view.height, view.pixel_format, view.plane_index
         ));
@@ -300,14 +304,14 @@ fn note_rt_type5_view(
 }
 
 /// Surface ids this ladder has resolved a render target through a *differing*
-/// type-5 view for.
+/// IOSurface plane view view for.
 ///
 /// Bounded, and the bound is the whole design: this exists to answer whether one
 /// surface is bound both ways in one boot, and the population it watches was one
 /// member on the boot that made it necessary. Past [`DIFFERED_MAX`] it stops
 /// admitting rather than growing or evicting — an evicting set would answer
 /// "not seen before" for a surface it had forgotten, which is the direction that
-/// reports the repair as safe when it is not. `rt_type5_view_differ_set_full`
+/// reports the repair as safe when it is not. `rt_iosurface_plane_view_differ_set_full`
 /// says the bound bit, and a boot that reports it has not answered the question.
 const DIFFERED_MAX: usize = 64;
 
@@ -317,7 +321,7 @@ static DIFFERED: std::sync::Mutex<std::collections::BTreeSet<u32>> =
 fn note_differed(surface_id: u32) {
     let mut set = DIFFERED.lock().unwrap_or_else(|e| e.into_inner());
     if set.len() >= DIFFERED_MAX && !set.contains(&surface_id) {
-        crate::runtime::drain::note_store_route("rt_type5_view_differ_set_full");
+        crate::runtime::drain::note_store_route("rt_iosurface_plane_view_differ_set_full");
         return;
     }
     set.insert(surface_id);
@@ -417,12 +421,12 @@ pub(super) enum RenderTargetCause {
     /// The mapping's format is not one Metal can render into.
     IOSurfaceFormat { mapping_id: u32, fmt: u16 },
 
-    /// The type-5 entry's descriptor bytes could not be read.
-    Type5DescRead,
-    /// The bytes were read and are not a type-5 header.
-    Type5DescDecode { len: usize },
-    /// The type-5 header names surface 0, so it wraps nothing.
-    Type5SurfaceZero,
+    /// The IOSurface plane view entry's descriptor bytes could not be read.
+    IOSurfacePlaneViewDescRead,
+    /// The bytes were read and are not a IOSurface plane view header.
+    IOSurfacePlaneViewDescDecode { len: usize },
+    /// The IOSurface plane view header names surface 0, so it wraps nothing.
+    IOSurfacePlaneViewSurfaceZero,
 
     /// A mip>0 view of a surface backing surface. Colour RT materialization is level 0
     /// only.
@@ -529,9 +533,13 @@ impl crate::observe::Decline for RenderTargetRefusal {
             C::IOSurfaceNoMapping { .. } => "rt_iosurface_texture_no_mapping",
             C::IOSurfaceGeometry { .. } => "rt_iosurface_texture_geometry",
             C::IOSurfaceFormat { .. } => "rt_iosurface_texture_format",
-            C::Type5DescRead => crate::observe::ladder_slug!("rt_type5", desc_read),
-            C::Type5DescDecode { .. } => crate::observe::ladder_slug!("rt_type5", desc_decode),
-            C::Type5SurfaceZero => "rt_type5_surface_zero",
+            C::IOSurfacePlaneViewDescRead => {
+                crate::observe::ladder_slug!("rt_iosurface_plane_view", desc_read)
+            }
+            C::IOSurfacePlaneViewDescDecode { .. } => {
+                crate::observe::ladder_slug!("rt_iosurface_plane_view", desc_decode)
+            }
+            C::IOSurfacePlaneViewSurfaceZero => "rt_iosurface_plane_view_surface_zero",
             C::SurfaceBackingMipView { .. } => "rt_surface_backing_mip_view",
             C::SurfaceBackingUnresolved { .. } => "rt_surface_backing_unresolved",
             C::SurfaceBackingNoMapping { .. } => "rt_surface_backing_no_mapping",
@@ -587,7 +595,7 @@ impl crate::observe::Decline for RenderTargetRefusal {
                 v.push(("mid", mapping_id.to_string()));
                 v.push(("fmt", format!("{fmt:#x}")));
             }
-            C::Type5DescDecode { len } => v.push(("desc_len", len.to_string())),
+            C::IOSurfacePlaneViewDescDecode { len } => v.push(("desc_len", len.to_string())),
             C::SurfaceBackingMipView { surface_id, level } => {
                 v.push(("sid", surface_id.to_string()));
                 v.push(("level", level.to_string()));
@@ -681,8 +689,8 @@ impl crate::observe::Decline for RenderTargetRefusal {
             C::ViewSwizzled
             | C::ViewBaseUnbound
             | C::IOSurfaceUnresolved
-            | C::Type5DescRead
-            | C::Type5SurfaceZero
+            | C::IOSurfacePlaneViewDescRead
+            | C::IOSurfacePlaneViewSurfaceZero
             | C::NoListEntry
             | C::LinearDescRead => {}
         }
@@ -878,22 +886,22 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     // index == surface_id (ResourceHeap addObject type=4 objectId=getSurfaceID).
     // Without this, clear-only streams and Store writebacks never touch display
     // mids — guest pages stay empty and dual-mid thrash paints black.
-    // Surface backing: object-list index is surface_id. Type-5 RefTextureHandle: surfaceID@0
-    // (allocateRefTextureHandle) — product color RTs are type-5 wrapping surface backing.
-    let mut type5_view: Option<objects::Type5TextureView> = None;
+    // Surface backing: object-list index is surface_id. IOSurface plane view RefTextureHandle: surfaceID@0
+    // (allocateRefTextureHandle) — product color RTs are IOSurface plane view wrapping surface backing.
+    let mut iosurface_plane_view: Option<objects::IOSurfacePlaneViewDescriptor> = None;
     let surface_backing_sid = match live.as_ref() {
         Some(e) if e.kind == ObjectKind::SurfaceBacking => Some(resolved_ref),
         Some(e) if e.kind == ObjectKind::IOSurfacePlaneView => {
             let desc = objects::read_descriptor(state, host, task_id, e)
-                .ok_or(C::Type5DescRead.at(resolved_ref))?;
-            let sid = reims_vgpu_wire::device_desc::type5_header(&desc)
-                .map_err(|_| C::Type5DescDecode { len: desc.len() }.at(resolved_ref))?
+                .ok_or(C::IOSurfacePlaneViewDescRead.at(resolved_ref))?;
+            let sid = reims_vgpu_wire::device_desc::iosurface_plane_view_header(&desc)
+                .map_err(|_| C::IOSurfacePlaneViewDescDecode { len: desc.len() }.at(resolved_ref))?
                 .surface_id
                 .get();
             if sid == 0 {
-                return Err(C::Type5SurfaceZero.at(resolved_ref));
+                return Err(C::IOSurfacePlaneViewSurfaceZero.at(resolved_ref));
             }
-            type5_view = objects::decode_type5_texture_view(&desc);
+            iosurface_plane_view = objects::decode_iosurface_plane_view(&desc);
             Some(sid)
         }
         _ => None,
@@ -925,7 +933,11 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         }
         let (base_w, base_h, base_raw_fmt) = (m.width, m.height, m.format);
         if live_type == Some(ObjectKind::IOSurfacePlaneView) {
-            note_rt_type5_view(type5_view, surface_id, (base_w, base_h, base_raw_fmt));
+            note_rt_iosurface_plane_view(
+                iosurface_plane_view,
+                surface_id,
+                (base_w, base_h, base_raw_fmt),
+            );
         }
         let base_fmt = rt_surface_backing_base_format(base_raw_fmt, surface_id).ok_or(
             C::SurfaceBackingBaseFormat {
@@ -937,7 +949,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         let fmt = rt_surface_backing_declared_format(
             base_fmt,
             (base_w, base_h),
-            type5_view,
+            iosurface_plane_view,
             view_fmt_override,
         );
         if pixel_format::render_target_bpp(fmt).is_none() {
@@ -1197,7 +1209,7 @@ mod tests {
         assert_eq!(store_route_count("rt_base_fmt_declined"), before + 3);
     }
 
-    /// A type-5 view's declared format reaches the colour attachment, so the
+    /// A IOSurface plane view view's declared format reaches the colour attachment, so the
     /// hardware performs the linear-to-sRGB encode the guest asked for.
     ///
     /// This is the write half of the sRGB round trip. Metal stores `E(L)` into an
@@ -1209,15 +1221,15 @@ mod tests {
     /// The live shape is `view=300x300 fmt=0x51 base=300x300 fmt=0x50`, seen twice
     /// on a driven macos-13 boot at icon size.
     #[test]
-    fn a_type5_views_declared_format_is_what_the_colour_attachment_attaches() {
+    fn a_iosurface_plane_views_declared_format_is_what_the_colour_attachment_attaches() {
         use crate::contract::pixel_format::{
             MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_BGRA8_UNORM_SRGB, MTL_FORMAT_RGBA16_FLOAT,
         };
-        use crate::runtime::objects::Type5TextureView;
+        use crate::runtime::objects::IOSurfacePlaneViewDescriptor;
 
         let extent = (300u32, 300u32);
         let view = |w, h, fmt| {
-            Some(Type5TextureView {
+            Some(IOSurfacePlaneViewDescriptor {
                 pixel_format: fmt,
                 width: w,
                 height: h,
@@ -1274,7 +1286,7 @@ mod tests {
             ),
             MTL_FORMAT_BGRA8_UNORM
         );
-        // A zero format is the type-5 decoder saying it has none, not a
+        // A zero format is the IOSurface plane view decoder saying it has none, not a
         // declaration of format zero.
         assert_eq!(
             rt_surface_backing_declared_format(
@@ -1286,7 +1298,7 @@ mod tests {
             MTL_FORMAT_BGRA8_UNORM
         );
         // A type-8 view is a further reinterpretation the guest asked for on top,
-        // so it outranks the type-5 record.
+        // so it outranks the IOSurface plane view record.
         assert_eq!(
             rt_surface_backing_declared_format(
                 MTL_FORMAT_BGRA8_UNORM,
@@ -1298,7 +1310,7 @@ mod tests {
         );
     }
 
-    /// A type-5 colour attachment must be scored on whether its view agrees with
+    /// A IOSurface plane view colour attachment must be scored on whether its view agrees with
     /// the base mapping, and "no view decoded" must not read as agreement.
     ///
     /// The resolve takes geometry from the base mapping either way, so the counter
@@ -1306,13 +1318,13 @@ mod tests {
     /// undecoded record into `same` would report the ambiguous case as the healthy
     /// one, which is the failure mode that makes a census worthless.
     #[test]
-    fn a_type5_render_target_view_is_scored_against_the_base_it_resolves_through() {
+    fn a_iosurface_plane_view_render_target_view_is_scored_against_the_base_it_resolves_through() {
         use crate::runtime::drain::store_route_count;
-        use crate::runtime::objects::Type5TextureView;
+        use crate::runtime::objects::IOSurfacePlaneViewDescriptor;
 
         let base = (64u32, 32u32, 0x50u16);
         let view = |w, h, fmt| {
-            Some(Type5TextureView {
+            Some(IOSurfacePlaneViewDescriptor {
                 pixel_format: fmt,
                 width: w,
                 height: h,
@@ -1321,27 +1333,36 @@ mod tests {
             })
         };
         let (same0, diff0, und0) = (
-            store_route_count("rt_type5_view_same"),
-            store_route_count("rt_type5_view_differs"),
-            store_route_count("rt_type5_view_undecoded"),
+            store_route_count("rt_iosurface_plane_view_same"),
+            store_route_count("rt_iosurface_plane_view_differs"),
+            store_route_count("rt_iosurface_plane_view_undecoded"),
         );
 
-        note_rt_type5_view(view(64, 32, 0x50), 5, base);
-        assert_eq!(store_route_count("rt_type5_view_same"), same0 + 1);
+        note_rt_iosurface_plane_view(view(64, 32, 0x50), 5, base);
+        assert_eq!(store_route_count("rt_iosurface_plane_view_same"), same0 + 1);
 
         // The live case the contract names: a row-byte-equivalent reinterpretation
         // at a different width and format over the same bytes.
-        note_rt_type5_view(view(16, 32, 0x73), 6, base);
-        assert_eq!(store_route_count("rt_type5_view_differs"), diff0 + 1);
+        note_rt_iosurface_plane_view(view(16, 32, 0x73), 6, base);
+        assert_eq!(
+            store_route_count("rt_iosurface_plane_view_differs"),
+            diff0 + 1
+        );
         // Geometry alone is not the test — a format-only view is still a different
         // view, and it is the one this resolve would silently render as BGRA8.
-        note_rt_type5_view(view(64, 32, 0x73), 7, base);
-        assert_eq!(store_route_count("rt_type5_view_differs"), diff0 + 2);
-
-        note_rt_type5_view(None, 8, base);
-        assert_eq!(store_route_count("rt_type5_view_undecoded"), und0 + 1);
+        note_rt_iosurface_plane_view(view(64, 32, 0x73), 7, base);
         assert_eq!(
-            store_route_count("rt_type5_view_same"),
+            store_route_count("rt_iosurface_plane_view_differs"),
+            diff0 + 2
+        );
+
+        note_rt_iosurface_plane_view(None, 8, base);
+        assert_eq!(
+            store_route_count("rt_iosurface_plane_view_undecoded"),
+            und0 + 1
+        );
+        assert_eq!(
+            store_route_count("rt_iosurface_plane_view_same"),
             same0 + 1,
             "an undecoded record must not be scored as agreement"
         );

@@ -197,7 +197,7 @@ fn strided_window_extent_measures_padded_rows_and_refuses_unrepresentable_stride
     assert_eq!(strided_window_extent(64, 32, 4, 258), None);
     // Zero height has no last row to measure to.
     assert_eq!(strided_window_extent(64, 0, 4, 256), None);
-    // Single-byte texels (the type-5 NV12 luma plane) take every stride.
+    // Single-byte texels (the IOSurface plane view NV12 luma plane) take every stride.
     assert_eq!(strided_window_extent(64, 4, 1, 64), Some((256, 0)));
     assert_eq!(strided_window_extent(64, 4, 1, 96), Some((96 * 3 + 64, 96)));
 }
@@ -275,7 +275,7 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
     ));
     crate::runtime::guest_ram::latch_import_limits(page, 1 << 30, 1 << 30);
     let iosurface_texture_witnesses = crate::runtime::drain::store_route_count("gw_rail_iosurface");
-    let type5_witnesses = crate::runtime::drain::store_route_count("gw_rail_t5");
+    let iosurface_plane_view_witnesses = crate::runtime::drain::store_route_count("gw_rail_t5");
     let iosurface_texture =
         try_iosurface_texture_sample_zero_copy(&mut state, &mut host, mid, 128, 128)
             .expect("the mapping's color plane is sampleable");
@@ -306,11 +306,11 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
             .import(),
     );
 
-    let type5 = try_type5_sample_zero_copy(
+    let iosurface_plane_view = try_iosurface_plane_view_sample_zero_copy(
         &mut state,
         &mut host,
         mid,
-        objects::Type5TextureView {
+        objects::IOSurfacePlaneViewDescriptor {
             pixel_format: MTL_FORMAT_BGRA8_UNORM,
             width: 128,
             height: 128,
@@ -319,19 +319,26 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
         },
     )
     .expect("the serialized plane view is sampleable");
-    let SampledSourceRequest::GuestRuns(type5, _, type5_format, _, type5_identity, ..) = type5
+    let SampledSourceRequest::GuestRuns(
+        iosurface_plane_view,
+        _,
+        iosurface_plane_view_format,
+        _,
+        iosurface_plane_view_identity,
+        ..,
+    ) = iosurface_plane_view
     else {
         panic!("the plane view stays guest-backed")
     };
-    assert_eq!(type5_format, ash::vk::Format::B8G8R8A8_UNORM);
-    assert!(type5_identity.is_some());
+    assert_eq!(iosurface_plane_view_format, ash::vk::Format::B8G8R8A8_UNORM);
+    assert!(iosurface_plane_view_identity.is_some());
     assert_eq!(
         crate::runtime::drain::store_route_count("gw_rail_t5"),
-        type5_witnesses + 1,
+        iosurface_plane_view_witnesses + 1,
         "the imported plane and its copied fallback share one witness"
     );
-    let type5_import = std::sync::Arc::clone(
-        type5
+    let iosurface_plane_view_import = std::sync::Arc::clone(
+        iosurface_plane_view
             .pages
             .as_ref()
             .expect("stable allocation is GPU-addressable")[0]
@@ -342,12 +349,12 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
 
     assert_eq!(
         iosurface_texture_import.id(),
-        type5_import.id(),
+        iosurface_plane_view_import.id(),
         "two views of one mapping must retain the mapping's one import"
     );
     assert!(std::sync::Arc::ptr_eq(
         &iosurface_texture_import,
-        &type5_import
+        &iosurface_plane_view_import
     ));
     assert_eq!(
         state.mappings[&mid]
@@ -2914,6 +2921,7 @@ fn view_swizzle_remaps_rgba8_pixels() {
     // pathway replaced with a component mapping, and an unreported
     // invocation is a texture that silently lost its zero-copy crossing.
     crate::runtime::census::view_swizzle_census::reset_for_tests();
+    let capture = crate::observe::FailCapture::start();
     // Reims VGPU selectors: 0=zero 1=one 2=R 3=G 4=B 5=A → BGRA order + forced alpha one.
     let plan = pixel_format::swizzle_plan(&[4, 3, 2, 1]).unwrap();
     let mut rgba = vec![10u8, 20, 30, 40, 50, 60, 70, 80];
@@ -2934,7 +2942,7 @@ fn view_swizzle_remaps_rgba8_pixels() {
     // One non-identity remap ran and said so; the identity and None calls did
     // not, and neither did the length-rejected one. Read off the always-on sink
     // rather than a counter: the line is what a boot actually has to show.
-    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    let log = capture.lines().join("\n");
     assert_eq!(
         log.match_indices("view_swizzle_cpu_remap").count(),
         1,
@@ -3766,12 +3774,12 @@ fn a_gva_guest_page_load_becomes_an_importable_seed_without_cpu_bytes() {
     );
 }
 
-/// A type-5 ref is not itself a surface id. The descriptor's surface_id
+/// A IOSurface plane view ref is not itself a surface id. The descriptor's surface_id
 /// remains authoritative even when the numeric ref collides with another
 /// live display mapping (live app-launch ref=2 -> sid=71 class).
 #[cfg(feature = "backend-vulkan")]
 #[test]
-fn type5_sample_uses_descriptor_surface_id_not_ref_collision() {
+fn iosurface_plane_view_sample_uses_descriptor_surface_id_not_ref_collision() {
     use crate::contract::endian::st32;
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
@@ -3804,8 +3812,8 @@ fn type5_sample_uses_descriptor_surface_id_not_ref_collision() {
     let texture_ref = 2u32;
     let surface_id = 71u32;
     let desc_gva = 0x1000u64;
-    let built = reims_vgpu_wire::device_desc::Type5Builder::new(surface_id, 0, 0, 0)
-        .with_len(objects::TYPE5_MIN_LEN);
+    let built = reims_vgpu_wire::device_desc::IOSurfacePlaneViewBuilder::new(surface_id, 0, 0, 0)
+        .with_len(objects::IOSURFACE_PLANE_VIEW_MIN_LEN);
     let desc = built.bytes();
     assert!(
         gva_mem::write_task_gva(&mut host, &state.tasks[1], desc_gva, desc, PAGE_SHIFT_X86,)
@@ -3813,7 +3821,8 @@ fn type5_sample_uses_descriptor_surface_id_not_ref_collision() {
     );
     let list_off = list_object_entry_offset(texture_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
-    let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((objects::TYPE5_MIN_LEN as u32) << 8);
+    let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32)
+        | ((objects::IOSURFACE_PLANE_VIEW_MIN_LEN as u32) << 8);
     st32(&mut list_entry, packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     assert!(gva_mem::write_task_gva(
@@ -3850,7 +3859,7 @@ fn type5_sample_uses_descriptor_surface_id_not_ref_collision() {
 
     let (width, height, sampled_mid, sampled) =
         resolve_sampled_source(&mut state, &mut host, 1, texture_ref, None, true)
-            .expect("type-5 descriptor surface must sample");
+            .expect("IOSurface plane view descriptor surface must sample");
     assert_eq!((width, height, sampled_mid), (4, 3, surface_id));
     let SampledSourceRequest::Bytes(sampled, _, layout, _) = sampled else {
         panic!("cache-backed fixture unexpectedly resolved a resident target");
@@ -3869,7 +3878,7 @@ fn type5_sample_uses_descriptor_surface_id_not_ref_collision() {
     let threaded_resource = objects::resolve_resource(&state, &host, 1, texture_ref).ok();
     assert!(
         threaded_resource.is_some(),
-        "type-5 fixture must expose a resource to thread"
+        "IOSurface plane view fixture must expose a resource to thread"
     );
     let (tw, th, tmid, tsrc) = resolve_sampled_source(
         &mut state,
@@ -3943,8 +3952,8 @@ fn iosurface_texture_host_cache_rung_identity_tracks_the_cached_frame() {
     let texture_ref = 2u32;
     let surface_id = 71u32;
     let desc_gva = 0x1000u64;
-    let built = reims_vgpu_wire::device_desc::Type5Builder::new(surface_id, 0, 0, 0)
-        .with_len(objects::TYPE5_MIN_LEN);
+    let built = reims_vgpu_wire::device_desc::IOSurfacePlaneViewBuilder::new(surface_id, 0, 0, 0)
+        .with_len(objects::IOSURFACE_PLANE_VIEW_MIN_LEN);
     let desc = built.bytes();
     assert!(
         gva_mem::write_task_gva(&mut host, &state.tasks[1], desc_gva, desc, PAGE_SHIFT_X86,)
@@ -3952,7 +3961,8 @@ fn iosurface_texture_host_cache_rung_identity_tracks_the_cached_frame() {
     );
     let list_off = list_object_entry_offset(texture_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
-    let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((objects::TYPE5_MIN_LEN as u32) << 8);
+    let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32)
+        | ((objects::IOSURFACE_PLANE_VIEW_MIN_LEN as u32) << 8);
     st32(&mut list_entry, packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     assert!(gva_mem::write_task_gva(
@@ -4071,12 +4081,12 @@ fn iosurface_texture_host_cache_rung_identity_tracks_the_cached_frame() {
 }
 
 /// Live Safari app-launch class: the surface backing base carries an unknown
-/// 2-byte IOSurface FourCC (`LA08`) while the type-5 descriptor carries
+/// 2-byte IOSurface FourCC (`LA08`) while the IOSurface plane view descriptor carries
 /// the exact RG8 Metal view. Defaulting the base to BGRA asks for a
 /// 632-byte row against the wire's 320-byte row and drops the draw.
 #[cfg(feature = "backend-vulkan")]
 #[test]
-fn type5_sample_uses_serialized_rg8_view_over_unknown_surface_fourcc() {
+fn iosurface_plane_view_sample_uses_serialized_rg8_view_over_unknown_surface_fourcc() {
     use crate::contract::endian::{st16, st32, st64};
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::contract::iosurface_pages::{
@@ -4090,7 +4100,7 @@ fn type5_sample_uses_serialized_rg8_view_over_unknown_surface_fourcc() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
 
-    // One-level x86 GVA table for the object list and type-5 descriptor.
+    // One-level x86 GVA table for the object list and IOSurface plane view descriptor.
     let dir_pfn = 2u32;
     let root_pfn = 3u32;
     let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_X86;
@@ -4117,11 +4127,11 @@ fn type5_sample_uses_serialized_rg8_view_over_unknown_surface_fourcc() {
     let height = 154u32;
     let surface_bpr = 320u32;
     let desc_gva = 0x1000u64;
-    let built = reims_vgpu_wire::device_desc::Type5Builder::new(
+    let built = reims_vgpu_wire::device_desc::IOSurfacePlaneViewBuilder::new(
         surface_id,
         0,
         texture_ref,
-        reims_vgpu_wire::device_desc::TYPE5_RECORD_TAG_PLANE,
+        reims_vgpu_wire::device_desc::IOSURFACE_PLANE_VIEW_RECORD_TAG_PLANE,
     )
     .geometry(MTL_FORMAT_RG8_UNORM, width, height, 1);
     let desc = built.bytes();
@@ -4209,12 +4219,12 @@ fn type5_sample_uses_serialized_rg8_view_over_unknown_surface_fourcc() {
     );
 }
 
-/// The type-5 view memo: unchanged plane bytes reuse the converted Arc and
+/// The IOSurface plane view view memo: unchanged plane bytes reuse the converted Arc and
 /// carry a stable content identity (engine upload skipped); a guest write
 /// to the plane is observed on the next bind and mints a new generation.
 #[cfg(feature = "backend-vulkan")]
 #[test]
-fn type5_view_memo_reuses_unchanged_planes_and_invalidates_on_write() {
+fn iosurface_plane_view_memo_reuses_unchanged_planes_and_invalidates_on_write() {
     use crate::contract::endian::{st16, st32, st64};
     use crate::contract::iosurface_pages::{
         DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_BPE, DEVICE_DESC_BPR, DEVICE_DESC_DIMS,
@@ -4266,7 +4276,7 @@ fn type5_view_memo_reuses_unchanged_planes_and_invalidates_on_write() {
     st32(&mut device_desc[DEVICE_DESC_BPR..], surface_bpr);
     st16(&mut device_desc[DEVICE_DESC_BPE..], 2);
     assert!(state.set_mapping_device_desc(surface_id, &device_desc));
-    let view = objects::Type5TextureView {
+    let view = objects::IOSurfacePlaneViewDescriptor {
         pixel_format: MTL_FORMAT_RG8_UNORM,
         width,
         height,
@@ -4275,7 +4285,7 @@ fn type5_view_memo_reuses_unchanged_planes_and_invalidates_on_write() {
     };
 
     let (w1, h1, rgba1, id1, fmt1) =
-        load_type5_view_rgba(&mut state, &mut host, 1, 248, surface_id, view)
+        load_iosurface_plane_view_rgba(&mut state, &mut host, 1, 248, surface_id, view)
             .expect("first materialization");
     assert_eq!((w1, h1), (width, height));
     assert_eq!(
@@ -4292,11 +4302,11 @@ fn type5_view_memo_reuses_unchanged_planes_and_invalidates_on_write() {
     assert_eq!(
         id1.key,
         (1u64 << 63) | surface_id as u64,
-        "identity key namespaces type-5 content above GVA keys"
+        "identity key namespaces IOSurface plane view content above GVA keys"
     );
 
     let (_, _, rgba2, id2, _) =
-        load_type5_view_rgba(&mut state, &mut host, 1, 248, surface_id, view)
+        load_iosurface_plane_view_rgba(&mut state, &mut host, 1, 248, surface_id, view)
             .expect("memo revalidation");
     assert!(
         std::sync::Arc::ptr_eq(&rgba1, &rgba2),
@@ -4307,7 +4317,7 @@ fn type5_view_memo_reuses_unchanged_planes_and_invalidates_on_write() {
     // Guest CPU writes one texel; the next bind must observe it.
     assert!(host.write_gpa(gpa0 + 6, &[0xAA, 0xBB]).is_ok());
     let (_, _, rgba3, id3, _) =
-        load_type5_view_rgba(&mut state, &mut host, 1, 248, surface_id, view)
+        load_iosurface_plane_view_rgba(&mut state, &mut host, 1, 248, surface_id, view)
             .expect("re-materialization after guest write");
     assert!(
         id3.generation > id2.generation,
@@ -4326,50 +4336,50 @@ fn type5_view_memo_reuses_unchanged_planes_and_invalidates_on_write() {
 
 #[cfg(feature = "backend-vulkan")]
 #[test]
-fn type5_view_materializes_only_when_base_identity_differs() {
+fn iosurface_plane_view_materializes_only_when_base_identity_differs() {
     use crate::contract::pixel_format::MTL_FORMAT_RG8_UNORM;
 
-    let exact = objects::Type5TextureView {
+    let exact = objects::IOSurfacePlaneViewDescriptor {
         pixel_format: MTL_FORMAT_BGRA8_UNORM,
         width: 1920,
         height: 1080,
         depth: 1,
         plane_index: 0,
     };
-    assert!(!type5_view_requires_materialization(
+    assert!(!iosurface_plane_view_requires_materialization(
         true,
         1920,
         1080,
         MTL_FORMAT_BGRA8_UNORM,
         exact
     ));
-    assert!(type5_view_requires_materialization(
+    assert!(iosurface_plane_view_requires_materialization(
         true, 1920, 1080, 0, exact
     ));
 
-    let rg8_view = objects::Type5TextureView {
+    let rg8_view = objects::IOSurfacePlaneViewDescriptor {
         pixel_format: MTL_FORMAT_RG8_UNORM,
         width: 158,
         height: 154,
         depth: 1,
         plane_index: 0,
     };
-    assert!(type5_view_requires_materialization(
+    assert!(iosurface_plane_view_requires_materialization(
         true,
         158,
         154,
         MTL_FORMAT_BGRA8_UNORM,
         rg8_view
     ));
-    assert!(type5_view_requires_materialization(
+    assert!(iosurface_plane_view_requires_materialization(
         false,
         158,
         154,
         MTL_FORMAT_RG8_UNORM,
         rg8_view
     ));
-    let volume = objects::Type5TextureView { depth: 2, ..exact };
-    assert!(type5_view_requires_materialization(
+    let volume = objects::IOSurfacePlaneViewDescriptor { depth: 2, ..exact };
+    assert!(iosurface_plane_view_requires_materialization(
         true,
         1920,
         1080,
@@ -4457,34 +4467,34 @@ fn texture_view_decline_preserves_decode_leaf_and_chain_identity() {
     assert!(fields.contains(&("depth", "3".into())));
 }
 
-/// Every type-5 view refusal names its rail (`type5_view_`), renders
+/// Every IOSurface plane view view refusal names its rail (`iosurface_plane_view_`), renders
 /// whitespace-free fields, and is distinct — the same discipline the
-/// capture and import rails took, so `grep reason=type5_view_…` stays
+/// capture and import rails took, so `grep reason=iosurface_plane_view_…` stays
 /// answerable against the blit rail's `t5_*` copy vocabulary next door.
 #[cfg(feature = "backend-vulkan")]
 #[test]
-fn every_type5_view_reason_is_namespaced_distinct_and_log_safe() {
+fn every_iosurface_plane_view_reason_is_namespaced_distinct_and_log_safe() {
     use crate::observe::Decline as _;
-    const ALL: &[Type5ViewDecline] = &[
-        Type5ViewDecline::UnsupportedDepth { depth: 0 },
-        Type5ViewDecline::Unresolved,
-        Type5ViewDecline::FormatBpp,
-        Type5ViewDecline::NoMapping,
-        Type5ViewDecline::SampleWindow {
+    const ALL: &[IOSurfacePlaneViewDecline] = &[
+        IOSurfacePlaneViewDecline::UnsupportedDepth { depth: 0 },
+        IOSurfacePlaneViewDecline::Unresolved,
+        IOSurfacePlaneViewDecline::FormatBpp,
+        IOSurfacePlaneViewDecline::NoMapping,
+        IOSurfacePlaneViewDecline::SampleWindow {
             base_w: 0,
             base_h: 0,
             base_fmt: 0,
             desc: None,
         },
-        Type5ViewDecline::Span {
+        IOSurfacePlaneViewDecline::Span {
             pages: 0,
             page_bytes: 0,
             span_end: 0,
             bpr: 0,
         },
-        Type5ViewDecline::TightOverflow { bpp: 0 },
-        Type5ViewDecline::NativeLen { tight: 0 },
-        Type5ViewDecline::Read {
+        IOSurfacePlaneViewDecline::TightOverflow { bpp: 0 },
+        IOSurfacePlaneViewDecline::NativeLen { tight: 0 },
+        IOSurfacePlaneViewDecline::Read {
             base_w: 0,
             base_h: 0,
             base_fmt: 0,
@@ -4493,15 +4503,15 @@ fn every_type5_view_reason_is_namespaced_distinct_and_log_safe() {
             span_end: 0,
             pages: 0,
         },
-        Type5ViewDecline::RgbaStride,
-        Type5ViewDecline::RgbaLen { stride: 0 },
-        Type5ViewDecline::Convert { row: 0, bpp: 0 },
+        IOSurfacePlaneViewDecline::RgbaStride,
+        IOSurfacePlaneViewDecline::RgbaLen { stride: 0 },
+        IOSurfacePlaneViewDecline::Convert { row: 0, bpp: 0 },
     ];
     let mut slugs: Vec<&str> = Vec::new();
     for d in ALL {
         assert!(
-            d.slug().starts_with("type5_view_"),
-            "{} is not namespaced to the type-5 view rail",
+            d.slug().starts_with("iosurface_plane_view_"),
+            "{} is not namespaced to the IOSurface plane view view rail",
             d.slug()
         );
         for (k, v) in d.fields() {
@@ -4512,7 +4522,11 @@ fn every_type5_view_reason_is_namespaced_distinct_and_log_safe() {
     slugs.sort_unstable();
     let before = slugs.len();
     slugs.dedup();
-    assert_eq!(before, slugs.len(), "duplicate Type5ViewDecline slug");
+    assert_eq!(
+        before,
+        slugs.len(),
+        "duplicate IOSurfacePlaneViewDecline slug"
+    );
 }
 
 /// `SampleWindow` is the only variant carrying transcribed field logic: the
@@ -4522,26 +4536,26 @@ fn every_type5_view_reason_is_namespaced_distinct_and_log_safe() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn sample_window_renders_the_descriptor_or_its_absence() {
-    let present = Type5ViewDecline::SampleWindow {
+    let present = IOSurfacePlaneViewDecline::SampleWindow {
         base_w: 320,
         base_h: 240,
         base_fmt: 0x50,
         desc: Some((64, 64, 0x4c41_3038, 256, 4096)),
     };
     assert_eq!(
-            crate::observe::Emit::decline("type5_draw_view", &present).render(),
-            "type5_draw_view reason=type5_view_sample_window base=320x240 base_fmt=0x50 desc=64x64 desc_fmt=0x4c413038 bpr=256 alloc=4096"
+            crate::observe::Emit::decline("iosurface_plane_view_draw_view", &present).render(),
+            "iosurface_plane_view_draw_view reason=iosurface_plane_view_sample_window base=320x240 base_fmt=0x50 desc=64x64 desc_fmt=0x4c413038 bpr=256 alloc=4096"
         );
 
-    let missing = Type5ViewDecline::SampleWindow {
+    let missing = IOSurfacePlaneViewDecline::SampleWindow {
         base_w: 320,
         base_h: 240,
         base_fmt: 0x50,
         desc: None,
     };
     assert_eq!(
-        crate::observe::Emit::decline("type5_draw_view", &missing).render(),
-        "type5_draw_view reason=type5_view_sample_window base=320x240 base_fmt=0x50 desc=missing"
+        crate::observe::Emit::decline("iosurface_plane_view_draw_view", &missing).render(),
+        "iosurface_plane_view_draw_view reason=iosurface_plane_view_sample_window base=320x240 base_fmt=0x50 desc=missing"
     );
 }
 

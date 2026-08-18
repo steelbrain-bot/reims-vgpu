@@ -931,7 +931,7 @@ pub(super) enum SampledSourceRequest {
 /// | bit 63 | bit 62 | producer | low bits |
 /// |---|---|---|---|
 /// | 0 | 0 | guest linear | the texture's authoritative GVA (`host_gva_surfaces`) |
-/// | 1 | 0 | type-5 view | `plane_index << 32 \| mapping_id` |
+/// | 1 | 0 | IOSurface plane view view | `plane_index << 32 \| mapping_id` |
 /// | 0 | 1 | IOSurface texture host cache | `mapping_id` (`host_surfaces`) |
 /// | 1 | 1 | IOSurface texture guest memo | `mapping_id` (`iosurface_texture_memo`) |
 ///
@@ -962,7 +962,7 @@ impl From<crate::runtime::gather_witness::GatheredIdentity> for LinearSampleIden
     }
 }
 
-type LoadedType5View = (
+type LoadedIOSurfacePlaneView = (
     u32,
     u32,
     std::sync::Arc<Vec<u8>>,
@@ -1143,7 +1143,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     // decided by the entry's `object_type`, and the cases below are distinct
     // values of that single u8 field, so they cannot both apply:
     //
-    //   type-5 RefTextureHandle — carries the surface backing surface id in its
+    //   IOSurface plane view RefTextureHandle — carries the surface backing surface id in its
     //                             descriptor, alongside the Metal texture view
     //   surface backing Surface         — the ref *is* the surface id
     //   IOSurface      — resolves to the mapping id it was created on
@@ -1155,20 +1155,20 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     // other type, so it can only fill a slot the classification above left empty.
     // Hence an `Option`, not a list of candidates to choose between.
     let mut is_linear_tex = false;
-    let mut is_type5 = false;
-    let mut type5_view: Option<objects::Type5TextureView> = None;
+    let mut is_iosurface_plane_view = false;
+    let mut iosurface_plane_view: Option<objects::IOSurfacePlaneViewDescriptor> = None;
     let mut surface: Option<u32> = None;
     let resolved_resource =
         resource.or_else(|| objects::resolve_resource(state, host, task_id, texture_ref).ok());
     if let Some(resource) = resolved_resource.as_ref() {
         let entry = resource.entry;
         if entry.kind == ObjectKind::IOSurfacePlaneView {
-            is_type5 = true;
+            is_iosurface_plane_view = true;
             let desc = &resource.descriptor;
-            if let Ok(t5) = reims_vgpu_wire::device_desc::type5_header(desc) {
+            if let Ok(t5) = reims_vgpu_wire::device_desc::iosurface_plane_view_header(desc) {
                 let sid = t5.surface_id.get();
                 if sid != 0 {
-                    type5_view = objects::decode_type5_texture_view(desc);
+                    iosurface_plane_view = objects::decode_iosurface_plane_view(desc);
                     surface = Some(sid);
                 }
             }
@@ -1180,7 +1180,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
             is_linear_tex = true;
         }
     }
-    if !is_type5 {
+    if !is_iosurface_plane_view {
         // Runs for the linear and unclassified types too, not only for the
         // IOSurface texture hit it can return: the resolve records the ref as live in the
         // task's object set and reports a typed failure when the descriptor is
@@ -1195,20 +1195,20 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     if let Some(mid) = surface {
         // Ensure surface backing pages exist for this surface id.
         let _ = objects::ensure_surface_for_texture_bind(state, host, mid);
-        // A type-5 serialized record is the exact Metal texture view over the
+        // A IOSurface plane view serialized record is the exact Metal texture view over the
         // IOSurface bytes. Materialize it only when it differs from (or cannot
         // be inferred from) the base mapping. Exact base views keep the fast
         // resident/cache path below; an unknown 2-B/texel base FourCC exposed
         // as RG8 must instead use the serialized view's native interpretation.
-        // `type5_view` is set only on the branch that also set `surface` to that
+        // `iosurface_plane_view` is set only on the branch that also set `surface` to that
         // view's own surface id, so reaching here with a view in hand already
         // means `mid` is the surface it describes.
-        if let Some(view) = type5_view {
+        if let Some(view) = iosurface_plane_view {
             let needs_materialization = state
                 .mappings
                 .get(&mid)
                 .map(|m| {
-                    type5_view_requires_materialization(
+                    iosurface_plane_view_requires_materialization(
                         m.has_geom, m.width, m.height, m.format, view,
                     )
                 })
@@ -1220,7 +1220,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // upload the CPU loader below would pay every decoded frame.
                 if let Some(src) = resolved_resource
                     .as_ref()
-                    .and_then(|_| try_type5_sample_zero_copy(state, host, mid, view))
+                    .and_then(|_| try_iosurface_plane_view_sample_zero_copy(state, host, mid, view))
                 {
                     // Success path: a healthy video decodes ~2 planes/frame,
                     // so this fires per-bind (~99k lines/boot). The aggregate
@@ -1229,13 +1229,13 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     // for deep debugging behind REIMS_VGPU_DRAW_LOG (observe::line)
                     // rather than flooding the always-on fail sink.
                     crate::observe::line(format!(
-                        "type5_view_zc ref={texture_ref} sid={mid} view={}x{} fmt={:#x} plane={}",
+                        "iosurface_plane_view_zc ref={texture_ref} sid={mid} view={}x{} fmt={:#x} plane={}",
                         view.width, view.height, view.pixel_format, view.plane_index
                     ));
                     return Some((view.width, view.height, mid, src));
                 }
                 let (w, h, rgba, identity, byte_format) =
-                    load_type5_view_rgba(state, host, task_id, texture_ref, mid, view)?;
+                    load_iosurface_plane_view_rgba(state, host, task_id, texture_ref, mid, view)?;
                 return Some((
                     w,
                     h,
@@ -1691,12 +1691,12 @@ mod resource_resident_ownership_tests {
 }
 
 #[inline]
-pub(super) fn type5_view_requires_materialization(
+pub(super) fn iosurface_plane_view_requires_materialization(
     base_has_geom: bool,
     base_width: u32,
     base_height: u32,
     base_format: u16,
-    view: objects::Type5TextureView,
+    view: objects::IOSurfacePlaneViewDescriptor,
 ) -> bool {
     !base_has_geom
         || view.depth != 1
@@ -1710,20 +1710,20 @@ pub(super) fn type5_view_requires_materialization(
 /// for diagnosis: `(width, height, pixel_format, bytes_per_row, alloc_size)`.
 type SampleWindowDesc = (u32, u32, u32, u32, u32);
 
-/// Why the type-5 serialized-view loader refused to materialize a plane.
+/// Why the IOSurface plane view serialized-view loader refused to materialize a plane.
 ///
-/// # Why these slugs are prefixed `type5_view_`
+/// # Why these slugs are prefixed `iosurface_plane_view_`
 ///
-/// The blit rail's `BlitStatus` already owns a `t5_*` vocabulary for the type-5
+/// The blit rail's `BlitStatus` already owns a `t5_*` vocabulary for the IOSurface plane view
 /// *copy* path (`t5_no_mapping`, `t5_sample_window`, `t5_fmt_bpp`,
 /// `t5_unmapped`), and four of this loader's checks are conceptually the same
 /// words. A bare `no_mapping` was in fact one of three claimants — console
 /// capture, guest-page import and this loader — that the last present-rail
-/// migration recorded as still sharing the word. The `type5_view_` prefix keeps
-/// `grep reason=type5_view_…` answerable against the copy path that shares the
+/// migration recorded as still sharing the word. The `iosurface_plane_view_` prefix keeps
+/// `grep reason=iosurface_plane_view_…` answerable against the copy path that shares the
 /// surface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Type5ViewDecline {
+pub(super) enum IOSurfacePlaneViewDecline {
     /// The serialized view is volumetric; only `depth == 1` planes materialize.
     UnsupportedDepth { depth: u32 },
     /// The mapping's page table is not resident for scanout.
@@ -1771,21 +1771,21 @@ pub(super) enum Type5ViewDecline {
     Convert { row: usize, bpp: u32 },
 }
 
-impl crate::observe::Decline for Type5ViewDecline {
+impl crate::observe::Decline for IOSurfacePlaneViewDecline {
     fn slug(&self) -> &'static str {
         match self {
-            Self::UnsupportedDepth { .. } => "type5_view_unsupported_depth",
-            Self::Unresolved => "type5_view_unresolved",
-            Self::FormatBpp => "type5_view_format_bpp",
-            Self::NoMapping => "type5_view_no_mapping",
-            Self::SampleWindow { .. } => "type5_view_sample_window",
-            Self::Span { .. } => "type5_view_span",
-            Self::TightOverflow { .. } => "type5_view_tight_overflow",
-            Self::NativeLen { .. } => "type5_view_native_len",
-            Self::Read { .. } => "type5_view_read",
-            Self::RgbaStride => "type5_view_rgba_stride",
-            Self::RgbaLen { .. } => "type5_view_rgba_len",
-            Self::Convert { .. } => "type5_view_convert",
+            Self::UnsupportedDepth { .. } => "iosurface_plane_view_unsupported_depth",
+            Self::Unresolved => "iosurface_plane_view_unresolved",
+            Self::FormatBpp => "iosurface_plane_view_format_bpp",
+            Self::NoMapping => "iosurface_plane_view_no_mapping",
+            Self::SampleWindow { .. } => "iosurface_plane_view_sample_window",
+            Self::Span { .. } => "iosurface_plane_view_span",
+            Self::TightOverflow { .. } => "iosurface_plane_view_tight_overflow",
+            Self::NativeLen { .. } => "iosurface_plane_view_native_len",
+            Self::Read { .. } => "iosurface_plane_view_read",
+            Self::RgbaStride => "iosurface_plane_view_rgba_stride",
+            Self::RgbaLen { .. } => "iosurface_plane_view_rgba_len",
+            Self::Convert { .. } => "iosurface_plane_view_convert",
         }
     }
 
@@ -2170,26 +2170,26 @@ fn resolve_iosurface_texture_load_seed<M: HostMemory + HostOps>(
     served.map(|(seed, _)| seed)
 }
 
-/// Materialize the exact serialized Metal view carried by a type-5 object.
+/// Materialize the exact serialized Metal view carried by a IOSurface plane view object.
 ///
 /// The underlying surface backing FourCC is allocation metadata, not necessarily the
 /// sampled Metal format. The view's format/geometry define the native row
 /// interpretation; the surface backing device descriptor supplies its base/BPR/span.
-/// Materialize a type-5 serialized texture view through the byte-exact
+/// Materialize a IOSurface plane view serialized texture view through the byte-exact
 /// revalidated memo (same contract as [`load_linear_guest_memoized`]): every
 /// bind re-reads the native plane window so a guest write is always observed;
 /// conversion, allocation, and — via the returned content identity — the
 /// engine upload are skipped when the bytes are unchanged.
-pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
+pub(super) fn load_iosurface_plane_view_rgba<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     texture_ref: u32,
     mapping_id: u32,
-    view: objects::Type5TextureView,
-) -> Option<LoadedType5View> {
-    let fail = |d: Type5ViewDecline| -> Option<LoadedType5View> {
-        crate::observe::Emit::decline("type5_draw_view", &d)
+    view: objects::IOSurfacePlaneViewDescriptor,
+) -> Option<LoadedIOSurfacePlaneView> {
+    let fail = |d: IOSurfacePlaneViewDecline| -> Option<LoadedIOSurfacePlaneView> {
+        crate::observe::Emit::decline("iosurface_plane_view_draw_view", &d)
             .field("task", task_id)
             .field("ref", texture_ref)
             .field("sid", mapping_id)
@@ -2200,25 +2200,27 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
     };
 
     if view.depth != 1 {
-        return fail(Type5ViewDecline::UnsupportedDepth { depth: view.depth });
+        return fail(IOSurfacePlaneViewDecline::UnsupportedDepth { depth: view.depth });
     }
     if !mapper::ensure_resolved_for_scanout(state, host, mapping_id) {
-        return fail(Type5ViewDecline::Unresolved);
+        return fail(IOSurfacePlaneViewDecline::Unresolved);
     }
     let Some(bpp) = pixel_format::bytes_per_pixel(view.pixel_format) else {
-        return fail(Type5ViewDecline::FormatBpp);
+        return fail(IOSurfacePlaneViewDecline::FormatBpp);
     };
     let (base_off, surface_bpr, span_end, pages_n, base_w, base_h, base_fmt, map_gen) = {
         let Some(m) = state.mappings.get(&mapping_id) else {
-            return fail(Type5ViewDecline::NoMapping);
+            return fail(IOSurfacePlaneViewDecline::NoMapping);
         };
-        let Some((base_off, surface_bpr, span_end)) = mapping_write::type5_sample_window(
-            m,
-            view.plane_index,
-            view.width,
-            view.height,
-            view.pixel_format,
-        ) else {
+        let Some((base_off, surface_bpr, span_end)) =
+            mapping_write::iosurface_plane_view_sample_window(
+                m,
+                view.plane_index,
+                view.width,
+                view.height,
+                view.pixel_format,
+            )
+        else {
             let desc =
                 crate::contract::iosurface_pages::decode_device_surface(&m.device_desc).map(|d| {
                     (
@@ -2229,7 +2231,7 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
                         d.alloc_size,
                     )
                 });
-            return fail(Type5ViewDecline::SampleWindow {
+            return fail(IOSurfacePlaneViewDecline::SampleWindow {
                 base_w: m.width,
                 base_h: m.height,
                 base_fmt: m.format,
@@ -2249,7 +2251,7 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
     };
     let page_bytes = (pages_n as u64).saturating_mul(1u64 << state.page_shift);
     if page_bytes < span_end {
-        return fail(Type5ViewDecline::Span {
+        return fail(IOSurfacePlaneViewDecline::Span {
             pages: pages_n,
             page_bytes,
             span_end,
@@ -2257,13 +2259,13 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
         });
     }
     let Some(tight) = view.width.checked_mul(bpp) else {
-        return fail(Type5ViewDecline::TightOverflow { bpp });
+        return fail(IOSurfacePlaneViewDecline::TightOverflow { bpp });
     };
     let Some(native_len) = (tight as u64)
         .checked_mul(view.height as u64)
         .and_then(host_alloc_len)
     else {
-        return fail(Type5ViewDecline::NativeLen { tight });
+        return fail(IOSurfacePlaneViewDecline::NativeLen { tight });
     };
     let mut native = vec![0u8; native_len];
     if !mapping_write::read_rect_raw_at(
@@ -2285,7 +2287,7 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
         &mut native,
         tight,
     ) {
-        return fail(Type5ViewDecline::Read {
+        return fail(IOSurfacePlaneViewDecline::Read {
             base_w,
             base_h,
             base_fmt,
@@ -2295,7 +2297,7 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
             pages: pages_n,
         });
     }
-    // Identity key namespace: bit 63 marks type-5 view content (guest linear
+    // Identity key namespace: bit 63 marks IOSurface plane view view content (guest linear
     // identities use the raw sampled GVA as key). Every producer draws its
     // generation from `DeviceState::next_sampled_content_generation`, so a
     // (key, generation) pair cannot alias content even on a key collision.
@@ -2320,8 +2322,8 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
     // The half-float colour pair is deliberately **not** here yet. It belongs
     // by the same argument the linear rails took — `texel_to_rgba8`'s arm for
     // it clamps to `[0, 1]` and quantizes to 256 levels — but nothing has ever
-    // measured a type-5 view arriving in one, and this rail is the video-plane
-    // rail. `type5_view_narrowed` below is the measurement; add the arm when it
+    // measured a IOSurface plane view view arriving in one, and this rail is the video-plane
+    // rail. `iosurface_plane_view_narrowed` below is the measurement; add the arm when it
     // fires, not before.
     //
     // The packed 32-bit colour formats take the native rail for the same
@@ -2345,10 +2347,10 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
         view.pixel_format,
     );
     let ok_line = |generation_source: &str, rgba: &[u8]| {
-        // Per-draw success echo — fires on EVERY type-5 plane bind (thousands/sec
+        // Per-draw success echo — fires on EVERY IOSurface plane view plane bind (thousands/sec
         // under video → ~36k lines/boot, 61% of the fail log), burying real
         // failures. The always-on health signal is the `sampled_branch_census`
-        // aggregate (Type5View / T5Memo, noted on both paths below), so this
+        // aggregate (IOSurfacePlaneView / T5Memo, noted on both paths below), so this
         // per-bind detail — and its O(w*h) `rgba_rgb_stats` scan — is diagnostic
         // only: gate both behind REIMS_VGPU_DRAW_LOG so a normal boot stays uncluttered.
         if !crate::observe::draw_log_enabled() {
@@ -2356,13 +2358,13 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
         }
         let (nz, max, _) = crate::observe::rgba_rgb_stats(rgba);
         crate::observe::line(format!(
-            "type5_draw_view ok task={task_id} ref={texture_ref} sid={mapping_id} map_gen={map_gen} view={}x{} fmt={:#x} bpp={bpp} base={base_w}x{base_h} base_fmt={base_fmt:#x} off={base_off} bpr={surface_bpr} span_end={span_end} src={generation_source} rgb_nz={nz} max_rgb={max}",
+            "iosurface_plane_view_draw_view ok task={task_id} ref={texture_ref} sid={mapping_id} map_gen={map_gen} view={}x{} fmt={:#x} bpp={bpp} base={base_w}x{base_h} base_fmt={base_fmt:#x} off={base_off} bpr={surface_bpr} span_end={span_end} src={generation_source} rgb_nz={nz} max_rgb={max}",
             view.width,
             view.height,
             view.pixel_format,
         ));
     };
-    if let Some(m) = state.type5_view_memo.get_touch(&memo_key) {
+    if let Some(m) = state.iosurface_plane_view_memo.get_touch(&memo_key) {
         // Vec equality is length + byte memcmp with early exit on change.
         if m.native == native {
             let rgba = m.rgba.clone();
@@ -2385,13 +2387,13 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
     // memcmp key and the upload payload).
     let rgba: std::sync::Arc<Vec<u8>> = if byte_format.layout() == TexelLayout::Rgba8 {
         let Some(rgba_stride) = view.width.checked_mul(RGBA8_BPP) else {
-            return fail(Type5ViewDecline::RgbaStride);
+            return fail(IOSurfacePlaneViewDecline::RgbaStride);
         };
         let Some(rgba_len) = (rgba_stride as u64)
             .checked_mul(view.height as u64)
             .and_then(host_alloc_len)
         else {
-            return fail(Type5ViewDecline::RgbaLen {
+            return fail(IOSurfacePlaneViewDecline::RgbaLen {
                 stride: rgba_stride,
             });
         };
@@ -2399,9 +2401,9 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
         // The third CPU convert in this crate, and the third that said nothing
         // when it lost precision. `byte_format`'s table above names the video
         // plane formats natively and folds everything else here, so a half-float
-        // type-5 view is quantized on the same terms the linear rails were.
+        // IOSurface plane view view is quantized on the same terms the linear rails were.
         crate::runtime::draw::note_sampled_narrowing(
-            "type5_view_narrowed",
+            "iosurface_plane_view_narrowed",
             texture_ref,
             view.pixel_format,
             view.width,
@@ -2416,7 +2418,7 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
                 view.width,
                 &mut rgba[dst_off..dst_off + rgba_stride as usize],
             ) {
-                return fail(Type5ViewDecline::Convert { row: y, bpp });
+                return fail(IOSurfacePlaneViewDecline::Convert { row: y, bpp });
             }
         }
         std::sync::Arc::new(rgba)
@@ -2426,12 +2428,12 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
     let generation = state.next_sampled_content_generation();
     ok_line("fill", &rgba);
     let entry_bytes = native.len() + rgba.len();
-    state.type5_view_memo.insert(
+    state.iosurface_plane_view_memo.insert(
         memo_key,
         crate::model::GuestLinearMemo {
             native,
             rgba: rgba.clone(),
-            // The type-5 view path re-derives this from the view's own pixel
+            // The IOSurface plane view view path re-derives this from the view's own pixel
             // format on every call, hit or miss, so storing it is a statement of
             // what the bytes are rather than the source anything reads.
             layout: byte_format.layout(),
@@ -2873,7 +2875,7 @@ pub(super) fn strided_level_extent(
 /// window's own page list beside the runs, for the same reason
 /// [`task_gva_guest_run_window`] does.
 ///
-/// Shared by the IOSurface texture attachment seed and the IOSurface texture/type-5 sampled rails,
+/// Shared by the IOSurface texture attachment seed and the IOSurface texture/IOSurface plane view sampled rails,
 /// which reach the same pages through different window math.
 ///
 /// # No settle, for the reason its linear twin already states
@@ -3601,7 +3603,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // still lost, so the census records it rather than letting the fold be
     // silent.
     // **Every layout `sampled_pixels` returns is admitted**, which is the same
-    // rule `try_type5_sample_zero_copy` states and applies: that function is
+    // rule `try_iosurface_plane_view_sample_zero_copy` states and applies: that function is
     // the answer to "which guest bytes sample byte-identically through the
     // matching Vulkan image", and a layout it hands back has already passed
     // the identity-components test inside it. The engine creates the image
@@ -3610,7 +3612,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     //
     // This rail used to narrow that set again, to four-byte colour plus the
     // single-channel floats, on the stated grounds that "R8/Rg8 video planes
-    // keep their existing CPU/type-5 rails". The premise was that R8 and Rg8
+    // keep their existing CPU/IOSurface plane view rails". The premise was that R8 and Rg8
     // only ever arrive as video; they do not. A Safari window drag with no
     // video playing produced 37 704 `Rg8` binds, 49 % of every linear sampled
     // bind in the boot, and each one fell to `load_linear_guest_memoized`'s
@@ -3711,7 +3713,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // writeback ahead of this gather, and a CPU fence wait buys an ordering that
     // holds without it.
     //
-    // `try_iosurface_texture_sample_zero_copy` and `try_type5_sample_zero_copy` are the two
+    // `try_iosurface_texture_sample_zero_copy` and `try_iosurface_plane_view_sample_zero_copy` are the two
     // rails that were already written this way, and this one is now consistent
     // with them.
     //
@@ -3925,7 +3927,7 @@ pub(super) fn try_iosurface_texture_sample_zero_copy<M: HostMemory + HostOps>(
         let (base_off, bpr_u32, _span_end) = iosurface_texture_sample_window(m, w, h, format)?;
         (native, sampled_vk_format, base_off, bpr_u32 as u64)
     };
-    // From the layout the translation chose, as the type-5 rail does, so the
+    // From the layout the translation chose, as the IOSurface plane view rail does, so the
     // texel size cannot disagree with the image the engine creates. The
     // `is_four_byte_color` gate above already fixes it at four.
     let (span, row_length_texels) =
@@ -3954,22 +3956,22 @@ pub(super) fn try_iosurface_texture_sample_zero_copy<M: HostMemory + HostOps>(
     ))
 }
 
-/// Zero-copy rail for a type-5 serialized IOSurface plane view — the video
+/// Zero-copy rail for a IOSurface plane view serialized IOSurface plane view — the video
 /// hot path. VideoToolbox decodes to NV12 (Y = R8, CbCr = RG8; also
-/// BGRA8/RGBA8 surfaces), sampled through the type-5 view path whose CPU
-/// loader (`load_type5_view_rgba`) read + uploaded ~1.5 MB per plane per
+/// BGRA8/RGBA8 surfaces), sampled through the IOSurface plane view view path whose CPU
+/// loader (`load_iosurface_plane_view_rgba`) read + uploaded ~1.5 MB per plane per
 /// decoded frame (census `t5_view`). This gathers the plane's guest pages
 /// directly in the draw CB so the decoded frame never materializes CPU bytes.
 /// Mirrors `try_iosurface_texture_sample_zero_copy`'s page coalescing over the plane
-/// window from `type5_sample_window` (which carries the wire plane index +
+/// window from `iosurface_plane_view_sample_window` (which carries the wire plane index +
 /// biplanar offset); any gate miss falls back to the CPU byte path.
-pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
+pub(super) fn try_iosurface_plane_view_sample_zero_copy<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mid: u32,
-    view: objects::Type5TextureView,
+    view: objects::IOSurfacePlaneViewDescriptor,
 ) -> Option<SampledSourceRequest> {
-    use crate::runtime::mapping_write::type5_sample_window;
+    use crate::runtime::mapping_write::iosurface_plane_view_sample_window;
     let (w, h) = (view.width, view.height);
     if w == 0 || h == 0 || view.depth != 1 {
         return None;
@@ -4002,7 +4004,7 @@ pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
             Err(_) => return None,
         };
         let (base_off, bpr_u32, _span_end) =
-            type5_sample_window(m, view.plane_index, w, h, view.pixel_format)?;
+            iosurface_plane_view_sample_window(m, view.plane_index, w, h, view.pixel_format)?;
         let sampled_vk_format = translate::pixel::translate(view.pixel_format).ok()?.vk;
         (native, sampled_vk_format, bpp, base_off, bpr_u32 as u64)
     };
@@ -4010,7 +4012,7 @@ pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
     let (source, identity, vouch) = witnessed_mapping_sampled_source(
         state,
         host,
-        crate::runtime::gather_witness::GatherRail::Type5,
+        crate::runtime::gather_witness::GatherRail::IOSurfacePlaneView,
         MappedSamplePlane {
             mapping_id: mid,
             base_off,

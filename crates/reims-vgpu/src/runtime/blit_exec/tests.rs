@@ -89,7 +89,7 @@ fn copy_cmd(copy_kind: CopyKind, source: u32, destination: u32) -> Command {
 }
 
 /// Back `mapping_id` with one guest data page at `pfn` and mark it mapped.
-/// This is the surface state every IOSurface texture / type-5 install needs before it
+/// This is the surface state every IOSurface texture / IOSurface plane view install needs before it
 /// can attach geometry or a descriptor.
 fn map_one_page_surface(host: &mut FakeHost, state: &mut DeviceState, mapping_id: u32, pfn: u32) {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
@@ -858,12 +858,12 @@ fn install_iosurface_texture_plane(
     );
 }
 
-/// Install a type-5 RefTexture (object_type=5) that names an IOSurface
+/// Install a IOSurface plane view RefTexture (object_type=5) that names an IOSurface
 /// mapping via `surfaceID@+0` and a serialized 0x62 color-view record
 /// (fmt@+0x16, w@+0x18, h@+0x1c, depth@+0x20, plane@+0x34 — the live blit-
-/// source layout from `decode_type5_texture_view_live_0x62_color_window_view`).
+/// source layout from `decode_iosurface_plane_view_live_0x62_color_window_view`).
 /// Also installs a single-page mapping at `mapping_id` so the resolve lands.
-fn install_type5(
+fn install_iosurface_plane_view(
     host: &mut FakeHost,
     state: &mut DeviceState,
     obj_ref: u32,
@@ -876,13 +876,13 @@ fn install_type5(
     // Mapping (surfaceID == mapping_id): mapped, one data page, latched geom.
     map_one_page_surface(host, state, mapping_id, pfn);
     assert!(state.set_mapping_geom(mapping_id, width, height, format));
-    // Type-5 descriptor: 56-byte blob, 0x62 color-view record.
+    // IOSurface plane view descriptor: 56-byte blob, 0x62 color-view record.
     assert!(state.set_object_list(1, 0, 16));
-    let built = reims_vgpu_wire::device_desc::Type5Builder::new(
+    let built = reims_vgpu_wire::device_desc::IOSurfacePlaneViewBuilder::new(
         mapping_id,
         0,
         obj_ref,
-        objects::TYPE5_RECORD_TAG_COLOR_VIEW,
+        objects::IOSURFACE_PLANE_VIEW_RECORD_TAG_COLOR_VIEW,
     )
     .geometry(format, width, height, 1)
     .with_len(56);
@@ -898,14 +898,15 @@ fn install_type5(
         desc_len as u32,
         desc_gva,
     );
-    let e = objects::lookup_list_entry(state, host, 1, obj_ref).expect("type5 entry");
+    let e =
+        objects::lookup_list_entry(state, host, 1, obj_ref).expect("iosurface_plane_view entry");
     assert_eq!(e.kind, ObjectKind::IOSurfacePlaneView);
 }
 
 /// A blit source must read the plane the wire named, and the only shape that
 /// can prove it is two planes that share geometry and bytes-per-element.
 ///
-/// This branch resolved type-5 views through `iosurface_texture_sample_window`, which
+/// This branch resolved IOSurface plane view views through `iosurface_texture_sample_window`, which
 /// takes no plane index and picks a plane by matching width, height and bpe.
 /// On the v0a8 shape the live apple.com hero produces — Y and alpha both R8
 /// at the luma geometry — that scan matches *two* records, takes neither, and
@@ -917,7 +918,7 @@ fn install_type5(
 /// identical in geometry to plane 0 and differs only in offset, so an
 /// assertion on the offset is exactly the assertion that the index was used.
 #[test]
-fn a_type5_blit_source_reads_the_plane_the_wire_named() {
+fn a_iosurface_plane_view_blit_source_reads_the_plane_the_wire_named() {
     use crate::contract::endian::st64;
     use crate::contract::iosurface_pages::{
         DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_LEN, DEVICE_DESC_PLANES, DEVICE_DESC_PLANE_COUNT,
@@ -934,7 +935,7 @@ fn a_type5_blit_source_reads_the_plane_the_wire_named() {
     let (w, h) = (8u32, 4u32);
     // Plane 2 is the alpha plane: same 8x4 R8 as plane 0, different offset.
     const ALPHA_OFFSET: u32 = 128;
-    install_type5(
+    install_iosurface_plane_view(
         &mut host,
         &mut state,
         obj_ref,
@@ -944,7 +945,7 @@ fn a_type5_blit_source_reads_the_plane_the_wire_named() {
         w,
         h,
     );
-    set_type5_record_plane(&mut host, &state, obj_ref, 2);
+    set_iosurface_plane_view_record_plane(&mut host, &state, obj_ref, 2);
 
     let mut desc = vec![0u8; DEVICE_DESC_LEN];
     st32(&mut desc[DEVICE_DESC_ALLOC_SIZE..], 0x1000);
@@ -986,12 +987,12 @@ fn a_type5_blit_source_reads_the_plane_the_wire_named() {
     // planes 0 and 2 specifically and not a descriptor that resolves nothing.
     let uv = {
         let m = state.mappings.get(&mapping_id).unwrap();
-        mapping_write::type5_sample_window(m, 1, 4, 2, MTL_FORMAT_RG8_UNORM)
+        mapping_write::iosurface_plane_view_sample_window(m, 1, 4, 2, MTL_FORMAT_RG8_UNORM)
     };
     assert_eq!(uv.map(|(off, _, _)| off), Some(64));
 
     let backing = resolve_texture_backing(&mut state, &mut host, 1, obj_ref, 0, 0)
-        .expect("type-5 blit source must resolve");
+        .expect("IOSurface plane view blit source must resolve");
     match backing {
         TextureBacking::IOSurface(t) => assert_eq!(
             t.surface_offset, ALPHA_OFFSET as u64,
@@ -1001,42 +1002,48 @@ fn a_type5_blit_source_reads_the_plane_the_wire_named() {
     }
 }
 
-/// Overwrite the plane index in an installed type-5 record.
+/// Overwrite the plane index in an installed IOSurface plane view record.
 ///
-/// `install_type5` leaves it 0 (the field sits past the fields it writes and
+/// `install_iosurface_plane_view` leaves it 0 (the field sits past the fields it writes and
 /// the blob is zeroed), which is the one value that cannot distinguish a
 /// used index from a dropped one.
-fn set_type5_record_plane(host: &mut FakeHost, state: &DeviceState, obj_ref: u32, plane: u32) {
-    let off = objects::TYPE5_ARG_RECORD + objects::TYPE5_RECORD_PLANE;
+fn set_iosurface_plane_view_record_plane(
+    host: &mut FakeHost,
+    state: &DeviceState,
+    obj_ref: u32,
+    plane: u32,
+) {
+    let off = objects::IOSURFACE_PLANE_VIEW_ARG_RECORD + objects::IOSURFACE_PLANE_VIEW_RECORD_PLANE;
     let desc_gva = 0x180u64 + (obj_ref as u64) * 0x40;
     let mut word = [0u8; 4];
     st32(&mut word, plane);
     write_task_gva_arm64e(host, &state.tasks[1], desc_gva + off as u64, &word);
-    let entry = objects::lookup_list_entry(state, host, 1, obj_ref).expect("type5 entry");
-    let desc = objects::read_descriptor(state, host, 1, &entry).expect("type5 desc");
+    let entry =
+        objects::lookup_list_entry(state, host, 1, obj_ref).expect("iosurface_plane_view entry");
+    let desc = objects::read_descriptor(state, host, 1, &entry).expect("iosurface_plane_view desc");
     assert_eq!(
-        objects::decode_type5_texture_view(&desc)
+        objects::decode_iosurface_plane_view(&desc)
             .expect("view")
             .plane_index,
         plane
     );
 }
 
-/// Regression guard for the type-5 RefTexture blit-source branch
-/// (`resolve_texture_backing_depth` ~588): a type-5 object whose 0x62 record
+/// Regression guard for the IOSurface plane view RefTexture blit-source branch
+/// (`resolve_texture_backing_depth` ~588): a IOSurface plane view object whose 0x62 record
 /// names a BGRA8 view must resolve to an `IOSurface` backing carrying the VIEW
 /// geometry/format (not the base mapping's), so a blit copy from a media /
 /// window backing lands. Mirrors the IOSurface texture install fixtures.
 #[test]
-fn type5_ref_texture_resolves_as_iosurface_texture_blit_backing() {
+fn iosurface_plane_view_ref_texture_resolves_as_iosurface_texture_blit_backing() {
     use crate::contract::pixel_format::bytes_per_pixel;
     let (mut host, mut state) = blit_device();
     let mapping_id = 34u32;
     let obj_ref = 12u32;
     let (w, h, fmt) = (2u32, 2u32, MTL_FORMAT_BGRA8_UNORM);
-    install_type5(&mut host, &mut state, obj_ref, mapping_id, 0x30, fmt, w, h);
+    install_iosurface_plane_view(&mut host, &mut state, obj_ref, mapping_id, 0x30, fmt, w, h);
     let backing = resolve_texture_backing(&mut state, &mut host, 1, obj_ref, 0, 0)
-        .expect("type-5 blit source must resolve");
+        .expect("IOSurface plane view blit source must resolve");
     match backing {
         TextureBacking::IOSurface(t) => {
             assert_eq!(t.mapping_id, mapping_id, "backs the named surface");
@@ -1050,13 +1057,13 @@ fn type5_ref_texture_resolves_as_iosurface_texture_blit_backing() {
     }
 }
 
-/// A type-5 record whose tag is neither 0x42 nor 0x62 is unknown wire → the
+/// A IOSurface plane view record whose tag is neither 0x42 nor 0x62 is unknown wire → the
 /// blit branch must fail closed (`t5_view_decode`), never invent geometry.
 #[test]
-fn type5_unknown_record_tag_fails_closed() {
+fn iosurface_plane_view_unknown_record_tag_fails_closed() {
     let (mut host, mut state) = blit_device();
     let (mapping_id, obj_ref) = (34u32, 12u32);
-    install_type5(
+    install_iosurface_plane_view(
         &mut host,
         &mut state,
         obj_ref,
@@ -1072,12 +1079,12 @@ fn type5_unknown_record_tag_fails_closed() {
     write_task_gva_arm64e(
         &mut host,
         &state.tasks[1],
-        desc_gva + objects::TYPE5_ARG_RECORD as u64,
+        desc_gva + objects::IOSURFACE_PLANE_VIEW_ARG_RECORD as u64,
         &bad,
     );
     match resolve_texture_backing(&mut state, &mut host, 1, obj_ref, 0, 0) {
         Err(st) => assert_eq!(st, BlitStatus::Unsupported),
-        Ok(_) => panic!("unknown type-5 record tag must fail closed"),
+        Ok(_) => panic!("unknown IOSurface plane view record tag must fail closed"),
     }
 }
 
@@ -2871,7 +2878,7 @@ fn the_gpu_whole_plane_arm_refuses_before_it_resolves_anything() {
 /// The GPU whole-plane arm's destination half, and specifically the plane check.
 ///
 /// `write_bgra8_from_resident_gpu` resolves the plane itself, from the mapping's
-/// declaration, and takes no plane index. A type-5 view carries one on the wire
+/// declaration, and takes no plane index. A IOSurface plane view view carries one on the wire
 /// and can therefore name a plane at a `surface_offset` that scan does not reach.
 /// Landing a frame there is silent at every layer — the pixels appear in the next
 /// plane of the same IOSurface — so the disagreement has to refuse before the
@@ -2913,7 +2920,7 @@ fn the_gpu_whole_plane_arm_refuses_a_plane_the_rail_would_not_write() {
         "a mapping that declines the extent has no window to write"
     );
 
-    // The type-5 plane hazard: the guest's descriptor names the second plane of a
+    // The IOSurface plane view plane hazard: the guest's descriptor names the second plane of a
     // biplanar surface, the mapping's own geometry scan resolves the first.
     let second_plane = GpuPlane {
         surface_offset: 0x8000,

@@ -1,5 +1,5 @@
 //! Device-side descriptors reached by GVA: the wire tag 4 surface backing record
-//! and the type-5 reference-texture handle.
+//! and the wire tag 5 reference-texture handle.
 //!
 //! # Provenance
 //!
@@ -44,7 +44,7 @@
 //! available; they are not *known* to be padding, which is why the device still
 //! reports the undecoded span rather than shrinking the record around it.
 //!
-//! # Type-5 — reference texture handle (`allocateRefTextureHandle`)
+//! # Wire tag 5 — reference texture handle (`allocateRefTextureHandle`)
 //!
 //! ```text
 //! +0x00  u32  surface_id      IOSurface::getSurfaceID() = the wire tag 4 object id
@@ -57,7 +57,7 @@
 //! ```text
 //! +0x00  u32  kind            0x2f observed
 //! +0x04  u32  blob_len        == desc_len - 8
-//! +0x08  u32  own_ref         the type-5 object's own ref
+//! +0x08  u32  own_ref         the wire tag 5 object's own ref
 //! +0x0c       record          the serialized plane/view texture record
 //! ```
 //!
@@ -190,10 +190,10 @@ pub fn surface_backing_plane(
     )
 }
 
-/// Header of a type-5 reference-texture descriptor.
+/// Header of a wire tag 5 reference-texture descriptor.
 #[repr(C)]
 #[derive(Debug)]
-pub struct Type5Header {
+pub struct IOSurfacePlaneViewHeader {
     /// `IOSurface::getSurfaceID()` — the wire tag 4 heap object id this handle
     /// references.
     pub surface_id: U32le,
@@ -209,62 +209,65 @@ pub struct Type5Header {
 }
 
 // SAFETY: two align-1 all-bytes-valid `le` scalars.
-unsafe impl Wire for Type5Header {}
+unsafe impl Wire for IOSurfacePlaneViewHeader {}
 
-/// Offset of `surface_id` within a type-5 descriptor.
+/// Offset of `surface_id` within a wire tag 5 descriptor.
 ///
 /// Derived from the view rather than stated, so a fixture carrying live wire
 /// bytes can name the field without restating the layout. Fixtures keep their
 /// literal bytes on purpose — they are what the guest emitted, and bytes
 /// assembled to satisfy the reader would agree with it whether or not it is
 /// right — but the *offsets they index by* must still come from one place.
-pub const TYPE5_SURFACE_ID: usize = core::mem::offset_of!(Type5Header, surface_id);
-/// Offset of `owner_task` within a type-5 descriptor. See
-/// [`TYPE5_SURFACE_ID`].
-pub const TYPE5_OWNER_TASK: usize = core::mem::offset_of!(Type5Header, owner_task);
+pub const IOSURFACE_PLANE_VIEW_SURFACE_ID: usize =
+    core::mem::offset_of!(IOSurfacePlaneViewHeader, surface_id);
+/// Offset of `owner_task` within a wire tag 5 descriptor. See
+/// [`IOSURFACE_PLANE_VIEW_SURFACE_ID`].
+pub const IOSURFACE_PLANE_VIEW_OWNER_TASK: usize =
+    core::mem::offset_of!(IOSurfacePlaneViewHeader, owner_task);
 
-/// Offset of the serialized args blob within a type-5 descriptor.
-pub const TYPE5_ARGS: usize = core::mem::size_of::<Type5Header>();
+/// Offset of the serialized args blob within a wire tag 5 descriptor.
+pub const IOSURFACE_PLANE_VIEW_ARGS: usize = core::mem::size_of::<IOSurfacePlaneViewHeader>();
 
-/// Header of the type-5 args blob.
+/// Header of the wire tag 5 args blob.
 #[repr(C)]
 #[derive(Debug)]
-pub struct Type5ArgsHeader {
+pub struct IOSurfacePlaneViewArgsHeader {
     /// Kind tag. `0x2f` observed.
     pub kind: U32le,
-    /// Blob length, observed equal to `desc_len - TYPE5_ARGS`.
+    /// Blob length, observed equal to `desc_len - IOSURFACE_PLANE_VIEW_ARGS`.
     pub blob_len: U32le,
-    /// The type-5 object's own ref, the same convention the IOSurface texture
+    /// The wire tag 5 object's own ref, the same convention the IOSurface texture
     /// descriptor uses for its object-ref field.
     pub own_ref: U32le,
 }
 
 // SAFETY: three align-1 all-bytes-valid `le` scalars.
-unsafe impl Wire for Type5ArgsHeader {}
+unsafe impl Wire for IOSurfacePlaneViewArgsHeader {}
 
-/// Offset of the serialized texture record within a type-5 descriptor.
-pub const TYPE5_ARG_RECORD: usize = TYPE5_ARGS + core::mem::size_of::<Type5ArgsHeader>();
+/// Offset of the serialized texture record within a wire tag 5 descriptor.
+pub const IOSURFACE_PLANE_VIEW_ARG_RECORD: usize =
+    IOSURFACE_PLANE_VIEW_ARGS + core::mem::size_of::<IOSurfacePlaneViewArgsHeader>();
 
 /// Record tag for an IOSurface plane view.
-pub const TYPE5_RECORD_TAG_PLANE: u8 = 0x42;
+pub const IOSURFACE_PLANE_VIEW_RECORD_TAG_PLANE: u8 = 0x42;
 /// Record tag for a full-colour texture view.
 ///
 /// The layout is byte-identical to the plane form — the tag distinguishes a
 /// variant, not a different geometry encoding — so both decode through this
 /// same view.
-pub const TYPE5_RECORD_TAG_COLOR_VIEW: u8 = 0x62;
+pub const IOSURFACE_PLANE_VIEW_RECORD_TAG_COLOR_VIEW: u8 = 0x62;
 
-/// The serialized texture record inside a type-5 args blob, to the end of
+/// The serialized texture record inside a wire tag 5 args blob, to the end of
 /// `depth`.
 ///
 /// `plane_index` is deliberately not a field: it sits at
-/// [`TYPE5_RECORD_PLANE`], past this record, and is absent from shorter blobs.
+/// [`IOSURFACE_PLANE_VIEW_RECORD_PLANE`], past this record, and is absent from shorter blobs.
 /// Making it a field would mean refusing every descriptor that does not carry
 /// it.
 #[repr(C)]
 #[derive(Debug)]
-pub struct Type5TextureRecord {
-    /// [`TYPE5_RECORD_TAG_PLANE`] or [`TYPE5_RECORD_TAG_COLOR_VIEW`]. Any other
+pub struct IOSurfacePlaneViewTextureRecord {
+    /// [`IOSURFACE_PLANE_VIEW_RECORD_TAG_PLANE`] or [`IOSURFACE_PLANE_VIEW_RECORD_TAG_COLOR_VIEW`]. Any other
     /// value is an unknown record: fail closed rather than invent geometry.
     pub tag: u8,
     pub _unknown: u8,
@@ -277,44 +280,51 @@ pub struct Type5TextureRecord {
 }
 
 // SAFETY: two `u8` and three align-1 `le` scalars, all bytes valid.
-unsafe impl Wire for Type5TextureRecord {}
+unsafe impl Wire for IOSurfacePlaneViewTextureRecord {}
 
-impl Type5TextureRecord {
+impl IOSurfacePlaneViewTextureRecord {
     /// Whether the tag is one of the two forms this device decodes.
     pub fn tag_is_known(&self) -> bool {
-        self.tag == TYPE5_RECORD_TAG_PLANE || self.tag == TYPE5_RECORD_TAG_COLOR_VIEW
+        self.tag == IOSURFACE_PLANE_VIEW_RECORD_TAG_PLANE
+            || self.tag == IOSURFACE_PLANE_VIEW_RECORD_TAG_COLOR_VIEW
     }
 }
 
-/// Bytes of a type-5 texture record up to and including `depth`.
-pub const TYPE5_RECORD_MIN_LEN: usize = core::mem::size_of::<Type5TextureRecord>();
+/// Bytes of a wire tag 5 texture record up to and including `depth`.
+pub const IOSURFACE_PLANE_VIEW_RECORD_MIN_LEN: usize =
+    core::mem::size_of::<IOSurfacePlaneViewTextureRecord>();
 
-/// Offset of the plane index within a type-5 texture record.
+/// Offset of the plane index within a wire tag 5 texture record.
 ///
 /// The `newTextureWithDescriptor:iosurface:plane:` plane argument. A live
 /// three-plane census settles it: Y blobs carry 0, the RG8 chroma blob carries
 /// 1, and a second R8 view of identical geometry carries 2. Geometry cannot
 /// tell Y from alpha, so this field is the only wire key for it.
-pub const TYPE5_RECORD_PLANE: usize = 0x20;
+pub const IOSURFACE_PLANE_VIEW_RECORD_PLANE: usize = 0x20;
 
-/// View the header of a type-5 descriptor.
-pub fn type5_header(desc: &[u8]) -> Result<&Type5Header, WireError> {
-    view::<Type5Header>(desc)
+/// View the header of a wire tag 5 descriptor.
+pub fn iosurface_plane_view_header(desc: &[u8]) -> Result<&IOSurfacePlaneViewHeader, WireError> {
+    view::<IOSurfacePlaneViewHeader>(desc)
 }
 
-/// View the serialized texture record of a type-5 descriptor.
-pub fn type5_texture_record(desc: &[u8]) -> Result<&Type5TextureRecord, WireError> {
-    view_at::<Type5TextureRecord>(desc, TYPE5_ARG_RECORD)
+/// View the serialized texture record of a wire tag 5 descriptor.
+pub fn iosurface_plane_view_texture_record(
+    desc: &[u8],
+) -> Result<&IOSurfacePlaneViewTextureRecord, WireError> {
+    view_at::<IOSurfacePlaneViewTextureRecord>(desc, IOSURFACE_PLANE_VIEW_ARG_RECORD)
 }
 
-/// The plane index a type-5 descriptor's record names, when it carries one.
+/// The plane index a wire tag 5 descriptor's record names, when it carries one.
 ///
 /// `None` for a blob that stops before the field — pre-plane descriptors and
 /// test fixtures — which the caller reads as plane 0.
-pub fn type5_record_plane_index(desc: &[u8]) -> Option<u32> {
-    view_at::<U32le>(desc, TYPE5_ARG_RECORD + TYPE5_RECORD_PLANE)
-        .ok()
-        .map(|w| w.get())
+pub fn iosurface_plane_view_record_plane_index(desc: &[u8]) -> Option<u32> {
+    view_at::<U32le>(
+        desc,
+        IOSURFACE_PLANE_VIEW_ARG_RECORD + IOSURFACE_PLANE_VIEW_RECORD_PLANE,
+    )
+    .ok()
+    .map(|w| w.get())
 }
 
 /// Assemble a wire tag 4 descriptor by the format's own rules, for tests.
@@ -395,43 +405,47 @@ impl SurfaceBackingBuilder {
     }
 }
 
-/// Assemble a type-5 descriptor by the format's own rules, for tests.
+/// Assemble a wire tag 5 descriptor by the format's own rules, for tests.
 ///
 /// Same purpose as [`SurfaceBackingBuilder`]: the descriptor's three nested headers were
 /// being written by hand at their offsets, which is the reader's own arithmetic
 /// spelled a second time.
 #[derive(Debug)]
-pub struct Type5Builder {
-    bytes: [u8; TYPE5_BUILDER_CAP],
+pub struct IOSurfacePlaneViewBuilder {
+    bytes: [u8; IOSURFACE_PLANE_VIEW_BUILDER_CAP],
     len: usize,
 }
 
-/// Longest descriptor [`Type5Builder`] assembles: through the plane index.
-pub const TYPE5_BUILDER_CAP: usize = TYPE5_ARG_RECORD + TYPE5_RECORD_PLANE + 4;
+/// Longest descriptor [`IOSurfacePlaneViewBuilder`] assembles: through the plane index.
+pub const IOSURFACE_PLANE_VIEW_BUILDER_CAP: usize =
+    IOSURFACE_PLANE_VIEW_ARG_RECORD + IOSURFACE_PLANE_VIEW_RECORD_PLANE + 4;
 
-impl Type5Builder {
+impl IOSurfacePlaneViewBuilder {
     /// A descriptor naming `surface_id`, owned by `owner_task`, whose args
     /// blob carries a texture record of `tag`.
     ///
     /// The blob length is written as the args bytes actually present, which is
-    /// what the live wire carries; use [`Type5Builder::with_len`] to produce a
+    /// what the live wire carries; use [`IOSurfacePlaneViewBuilder::with_len`] to produce a
     /// descriptor that disagrees with itself.
     pub fn new(surface_id: u32, owner_task: u32, own_ref: u32, tag: u8) -> Self {
-        let mut bytes = [0u8; TYPE5_BUILDER_CAP];
+        let mut bytes = [0u8; IOSURFACE_PLANE_VIEW_BUILDER_CAP];
         bytes[0x00..0x04].copy_from_slice(&surface_id.to_le_bytes());
         bytes[0x04..0x08].copy_from_slice(&owner_task.to_le_bytes());
-        bytes[TYPE5_ARGS..TYPE5_ARGS + 4].copy_from_slice(&0x2fu32.to_le_bytes());
-        bytes[TYPE5_ARGS + 8..TYPE5_ARGS + 12].copy_from_slice(&own_ref.to_le_bytes());
-        bytes[TYPE5_ARG_RECORD] = tag;
-        let len = TYPE5_ARG_RECORD + TYPE5_RECORD_MIN_LEN;
-        let blob_len = (len - TYPE5_ARGS) as u32;
-        bytes[TYPE5_ARGS + 4..TYPE5_ARGS + 8].copy_from_slice(&blob_len.to_le_bytes());
+        bytes[IOSURFACE_PLANE_VIEW_ARGS..IOSURFACE_PLANE_VIEW_ARGS + 4]
+            .copy_from_slice(&0x2fu32.to_le_bytes());
+        bytes[IOSURFACE_PLANE_VIEW_ARGS + 8..IOSURFACE_PLANE_VIEW_ARGS + 12]
+            .copy_from_slice(&own_ref.to_le_bytes());
+        bytes[IOSURFACE_PLANE_VIEW_ARG_RECORD] = tag;
+        let len = IOSURFACE_PLANE_VIEW_ARG_RECORD + IOSURFACE_PLANE_VIEW_RECORD_MIN_LEN;
+        let blob_len = (len - IOSURFACE_PLANE_VIEW_ARGS) as u32;
+        bytes[IOSURFACE_PLANE_VIEW_ARGS + 4..IOSURFACE_PLANE_VIEW_ARGS + 8]
+            .copy_from_slice(&blob_len.to_le_bytes());
         Self { bytes, len }
     }
 
     /// Write the record's geometry.
     pub fn geometry(mut self, pixel_format: u16, width: u32, height: u32, depth: u32) -> Self {
-        let r = TYPE5_ARG_RECORD;
+        let r = IOSURFACE_PLANE_VIEW_ARG_RECORD;
         self.bytes[r + 0x02..r + 0x04].copy_from_slice(&pixel_format.to_le_bytes());
         self.bytes[r + 0x04..r + 0x08].copy_from_slice(&width.to_le_bytes());
         self.bytes[r + 0x08..r + 0x0c].copy_from_slice(&height.to_le_bytes());
@@ -440,9 +454,9 @@ impl Type5Builder {
     }
 
     /// Write the record's undecoded byte at `+0x01`, for the same reason as
-    /// [`Type5Builder::trailer`].
+    /// [`IOSurfacePlaneViewBuilder::trailer`].
     pub fn unknown(mut self, unknown: u8) -> Self {
-        self.bytes[TYPE5_ARG_RECORD + 0x01] = unknown;
+        self.bytes[IOSURFACE_PLANE_VIEW_ARG_RECORD + 0x01] = unknown;
         self
     }
 
@@ -451,8 +465,11 @@ impl Type5Builder {
     /// Nothing decodes these. They are here so a test carrying bytes a live
     /// capture produced keeps carrying them — a fixture zeroed for convenience
     /// stops being able to catch a decoder that starts reading them.
-    pub fn trailer(mut self, trailer: [u8; TYPE5_RECORD_PLANE - TYPE5_RECORD_MIN_LEN]) -> Self {
-        let at = TYPE5_ARG_RECORD + TYPE5_RECORD_MIN_LEN;
+    pub fn trailer(
+        mut self,
+        trailer: [u8; IOSURFACE_PLANE_VIEW_RECORD_PLANE - IOSURFACE_PLANE_VIEW_RECORD_MIN_LEN],
+    ) -> Self {
+        let at = IOSURFACE_PLANE_VIEW_ARG_RECORD + IOSURFACE_PLANE_VIEW_RECORD_MIN_LEN;
         self.bytes[at..at + trailer.len()].copy_from_slice(&trailer);
         self.len = self.len.max(at + trailer.len());
         self
@@ -461,17 +478,18 @@ impl Type5Builder {
     /// Write the `newTextureWithDescriptor:iosurface:plane:` plane index,
     /// extending the descriptor to reach it.
     pub fn plane_index(mut self, plane: u32) -> Self {
-        let at = TYPE5_ARG_RECORD + TYPE5_RECORD_PLANE;
+        let at = IOSURFACE_PLANE_VIEW_ARG_RECORD + IOSURFACE_PLANE_VIEW_RECORD_PLANE;
         self.bytes[at..at + 4].copy_from_slice(&plane.to_le_bytes());
         self.len = self.len.max(at + 4);
-        let blob_len = (self.len - TYPE5_ARGS) as u32;
-        self.bytes[TYPE5_ARGS + 4..TYPE5_ARGS + 8].copy_from_slice(&blob_len.to_le_bytes());
+        let blob_len = (self.len - IOSURFACE_PLANE_VIEW_ARGS) as u32;
+        self.bytes[IOSURFACE_PLANE_VIEW_ARGS + 4..IOSURFACE_PLANE_VIEW_ARGS + 8]
+            .copy_from_slice(&blob_len.to_le_bytes());
         self
     }
 
     /// Truncate or extend to an exact byte length.
     pub fn with_len(mut self, len: usize) -> Self {
-        self.len = len.min(TYPE5_BUILDER_CAP);
+        self.len = len.min(IOSURFACE_PLANE_VIEW_BUILDER_CAP);
         self
     }
 
@@ -486,25 +504,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn what_the_type5_builder_writes_is_what_the_views_read() {
-        let d = Type5Builder::new(77, 0, 4242, TYPE5_RECORD_TAG_COLOR_VIEW)
-            .geometry(80, 1024, 768, 1)
-            .plane_index(2);
+    fn what_the_iosurface_plane_view_builder_writes_is_what_the_views_read() {
+        let d =
+            IOSurfacePlaneViewBuilder::new(77, 0, 4242, IOSURFACE_PLANE_VIEW_RECORD_TAG_COLOR_VIEW)
+                .geometry(80, 1024, 768, 1)
+                .plane_index(2);
         let desc = d.bytes();
 
-        let h = type5_header(desc).expect("header");
+        let h = iosurface_plane_view_header(desc).expect("header");
         assert_eq!((h.surface_id.get(), h.owner_task.get()), (77, 0));
 
-        let args = view_at::<Type5ArgsHeader>(desc, TYPE5_ARGS).expect("args header");
+        let args = view_at::<IOSurfacePlaneViewArgsHeader>(desc, IOSURFACE_PLANE_VIEW_ARGS)
+            .expect("args header");
         assert_eq!(args.kind.get(), 0x2f);
         assert_eq!(args.own_ref.get(), 4242);
         assert_eq!(
             args.blob_len.get() as usize,
-            desc.len() - TYPE5_ARGS,
+            desc.len() - IOSURFACE_PLANE_VIEW_ARGS,
             "the blob length is the args bytes present, which is what the wire carries"
         );
 
-        let rec = type5_texture_record(desc).expect("record");
+        let rec = iosurface_plane_view_texture_record(desc).expect("record");
         assert!(rec.tag_is_known());
         assert_eq!(
             (
@@ -515,7 +535,7 @@ mod tests {
             ),
             (80, 1024, 768, 1)
         );
-        assert_eq!(type5_record_plane_index(desc), Some(2));
+        assert_eq!(iosurface_plane_view_record_plane_index(desc), Some(2));
     }
 
     /// The builder writes what the views read — the only thing that makes
@@ -603,19 +623,22 @@ mod tests {
         assert_eq!(offset_of!(SurfaceBackingPlaneRecord, height), 0x08);
         assert_eq!(offset_of!(SurfaceBackingPlaneRecord, packed_bpr), 0x0c);
 
-        assert_eq!(offset_of!(Type5Header, surface_id), 0x00);
-        assert_eq!(offset_of!(Type5Header, owner_task), 0x04);
-        assert_eq!(TYPE5_ARGS, 0x08);
-        assert_eq!(offset_of!(Type5ArgsHeader, kind), 0x00);
-        assert_eq!(offset_of!(Type5ArgsHeader, blob_len), 0x04);
-        assert_eq!(offset_of!(Type5ArgsHeader, own_ref), 0x08);
-        assert_eq!(TYPE5_ARG_RECORD, 0x14);
-        assert_eq!(offset_of!(Type5TextureRecord, tag), 0x00);
-        assert_eq!(offset_of!(Type5TextureRecord, pixel_format), 0x02);
-        assert_eq!(offset_of!(Type5TextureRecord, width), 0x04);
-        assert_eq!(offset_of!(Type5TextureRecord, height), 0x08);
-        assert_eq!(offset_of!(Type5TextureRecord, depth), 0x0c);
-        assert_eq!(TYPE5_RECORD_MIN_LEN, 0x10);
+        assert_eq!(offset_of!(IOSurfacePlaneViewHeader, surface_id), 0x00);
+        assert_eq!(offset_of!(IOSurfacePlaneViewHeader, owner_task), 0x04);
+        assert_eq!(IOSURFACE_PLANE_VIEW_ARGS, 0x08);
+        assert_eq!(offset_of!(IOSurfacePlaneViewArgsHeader, kind), 0x00);
+        assert_eq!(offset_of!(IOSurfacePlaneViewArgsHeader, blob_len), 0x04);
+        assert_eq!(offset_of!(IOSurfacePlaneViewArgsHeader, own_ref), 0x08);
+        assert_eq!(IOSURFACE_PLANE_VIEW_ARG_RECORD, 0x14);
+        assert_eq!(offset_of!(IOSurfacePlaneViewTextureRecord, tag), 0x00);
+        assert_eq!(
+            offset_of!(IOSurfacePlaneViewTextureRecord, pixel_format),
+            0x02
+        );
+        assert_eq!(offset_of!(IOSurfacePlaneViewTextureRecord, width), 0x04);
+        assert_eq!(offset_of!(IOSurfacePlaneViewTextureRecord, height), 0x08);
+        assert_eq!(offset_of!(IOSurfacePlaneViewTextureRecord, depth), 0x0c);
+        assert_eq!(IOSURFACE_PLANE_VIEW_RECORD_MIN_LEN, 0x10);
     }
 
     /// A descriptor one byte short of a record is refused, not read past.
@@ -634,15 +657,18 @@ mod tests {
         assert!(surface_backing_plane(&desc, 1).is_ok());
         assert!(surface_backing_plane(&desc[..SURFACE_BACKING_MIN_LEN], 1).is_err());
 
-        assert!(type5_header(&desc[..TYPE5_ARGS]).is_ok());
-        assert!(type5_header(&desc[..TYPE5_ARGS - 1]).is_err());
-        let record_end = TYPE5_ARG_RECORD + TYPE5_RECORD_MIN_LEN;
-        assert!(type5_texture_record(&desc[..record_end]).is_ok());
-        assert!(type5_texture_record(&desc[..record_end - 1]).is_err());
+        assert!(iosurface_plane_view_header(&desc[..IOSURFACE_PLANE_VIEW_ARGS]).is_ok());
+        assert!(iosurface_plane_view_header(&desc[..IOSURFACE_PLANE_VIEW_ARGS - 1]).is_err());
+        let record_end = IOSURFACE_PLANE_VIEW_ARG_RECORD + IOSURFACE_PLANE_VIEW_RECORD_MIN_LEN;
+        assert!(iosurface_plane_view_texture_record(&desc[..record_end]).is_ok());
+        assert!(iosurface_plane_view_texture_record(&desc[..record_end - 1]).is_err());
 
         // The plane index sits past the record, so a blob that stops at the
         // record has no plane to report and must say `None` rather than 0.
-        assert_eq!(type5_record_plane_index(&desc[..record_end]), None);
+        assert_eq!(
+            iosurface_plane_view_record_plane_index(&desc[..record_end]),
+            None
+        );
     }
 
     /// `bytes_per_row` and `bytes_per_element` share one wire word, and the
@@ -663,17 +689,17 @@ mod tests {
 
     #[test]
     fn only_the_two_observed_record_tags_are_known() {
-        let mut desc = [0u8; TYPE5_ARG_RECORD + TYPE5_RECORD_MIN_LEN];
+        let mut desc = [0u8; IOSURFACE_PLANE_VIEW_ARG_RECORD + IOSURFACE_PLANE_VIEW_RECORD_MIN_LEN];
         for (tag, known) in [
-            (TYPE5_RECORD_TAG_PLANE, true),
-            (TYPE5_RECORD_TAG_COLOR_VIEW, true),
+            (IOSURFACE_PLANE_VIEW_RECORD_TAG_PLANE, true),
+            (IOSURFACE_PLANE_VIEW_RECORD_TAG_COLOR_VIEW, true),
             (0x00, false),
             (0x43, false),
             (0xff, false),
         ] {
-            desc[TYPE5_ARG_RECORD] = tag;
+            desc[IOSURFACE_PLANE_VIEW_ARG_RECORD] = tag;
             assert_eq!(
-                type5_texture_record(&desc)
+                iosurface_plane_view_texture_record(&desc)
                     .expect("full record")
                     .tag_is_known(),
                 known,

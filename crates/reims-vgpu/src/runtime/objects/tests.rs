@@ -1,4 +1,4 @@
-use reims_vgpu_wire::device_desc::{SurfaceBackingBuilder, Type5Builder};
+use reims_vgpu_wire::device_desc::{IOSurfacePlaneViewBuilder, SurfaceBackingBuilder};
 
 use super::*;
 use crate::contract::endian::{ld32, st16, st32, st64};
@@ -205,11 +205,11 @@ fn resources_keep_construction_input_until_explicit_delete() {
 fn a_retained_view_retries_its_parent_relation_after_the_parent_appears() {
     let host = FakeHost::new();
     let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let descriptor = Type5Builder::new(
+    let descriptor = IOSurfacePlaneViewBuilder::new(
         7,
         0,
         2,
-        reims_vgpu_wire::device_desc::TYPE5_RECORD_TAG_COLOR_VIEW,
+        reims_vgpu_wire::device_desc::IOSURFACE_PLANE_VIEW_RECORD_TAG_COLOR_VIEW,
     );
     let view = state.task_resources.register(
         1,
@@ -807,7 +807,7 @@ fn the_task_search_reaches_the_owner_when_task_zero_cannot_translate() {
 fn a_surface_id_claimed_by_two_tasks_is_counted_as_two() {
     // Two tasks, each with its own directory and root, both listing eight
     // object slots at GVA 0. Task 0's list page holds a surface backing surface at
-    // slot 3; task 1's holds a type-5 there until the second half of the
+    // slot 3; task 1's holds a IOSurface plane view there until the second half of the
     // test rewrites it.
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -1587,12 +1587,12 @@ fn resolve_surface_backing_candidate_logs_descriptor_decode_failure() {
     clear_surface_backing_fail(sid, 0x20u64 << PAGE_SHIFT_X86);
 }
 
-/// Live wire bytes (boot 093019 `compute_stage_tex type5 … args_hex`):
+/// Live wire bytes (boot 093019 `compute_stage_tex iosurface_plane_view … args_hex`):
 /// R8 1024×1024 = Y plane view of a biplanar 1024×1024 surface.
 #[test]
-fn decode_type5_texture_view_live_r8_y_plane() {
+fn decode_iosurface_plane_view_live_r8_y_plane() {
     let mut desc = vec![0u8; 8];
-    st32(&mut desc[TYPE5_SURFACE_ID..], 8);
+    st32(&mut desc[IOSURFACE_PLANE_VIEW_SURFACE_ID..], 8);
     // args blob: kind 0x2f, len 0x30, own_ref 0x15, record R8 1024×1024 d=1.
     let args = [
         0x2fu8, 0, 0, 0, 0x30, 0, 0, 0, 0x15, 0, 0, 0, // kind, blob_len, own_ref
@@ -1603,7 +1603,7 @@ fn decode_type5_texture_view_live_r8_y_plane() {
         0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x10, 0x00, // trailer (unconsumed)
     ];
     desc.extend_from_slice(&args);
-    let rec = decode_type5_texture_view(&desc).expect("live R8 record decodes");
+    let rec = decode_iosurface_plane_view(&desc).expect("live R8 record decodes");
     assert_eq!(rec.pixel_format, 0x0a);
     assert_eq!((rec.width, rec.height, rec.depth), (1024, 1024, 1));
     // Short record (no +0x20 field) defaults to plane 0.
@@ -1616,7 +1616,7 @@ fn decode_type5_texture_view_live_r8_y_plane() {
 /// record tag `0x62`, not the biplanar `0x42`. Same field layout — must
 /// decode, or the blit path drops the copy.
 #[test]
-fn decode_type5_texture_view_live_0x62_color_window_view() {
+fn decode_iosurface_plane_view_live_0x62_color_window_view() {
     // Exact leading 40 bytes observed, zero-padded to the 56-byte desc_len.
     let head: [u8; 40] = [
         0x22, 0x00, 0x00, 0x00, // surface_id = 34
@@ -1632,7 +1632,7 @@ fn decode_type5_texture_view_live_0x62_color_window_view() {
     ];
     let mut desc = head.to_vec();
     desc.resize(56, 0); // plane field (+0x20 in record) reads 0
-    let rec = decode_type5_texture_view(&desc).expect("0x62 color view must decode");
+    let rec = decode_iosurface_plane_view(&desc).expect("0x62 color view must decode");
     assert_eq!(rec.pixel_format, 0x51);
     assert_eq!((rec.width, rec.height, rec.depth), (1024, 768, 1));
     assert_eq!(rec.plane_index, 0);
@@ -1643,9 +1643,9 @@ fn decode_type5_texture_view_live_0x62_color_window_view() {
 /// `+0x20` — Y views carry 0, the RG8 chroma view 1, the same-geometry
 /// alpha view 2. Geometry cannot separate Y from alpha; this field does.
 #[test]
-fn decode_type5_texture_view_live_v0a8_alpha_plane_index() {
+fn decode_iosurface_plane_view_live_v0a8_alpha_plane_index() {
     let mut desc = vec![0u8; 8];
-    st32(&mut desc[TYPE5_SURFACE_ID..], 0x6d);
+    st32(&mut desc[IOSURFACE_PLANE_VIEW_SURFACE_ID..], 0x6d);
     let args = [
         0x2fu8, 0, 0, 0, 0x30, 0, 0, 0, 0x82, 0x01, 0, 0, // kind, blob_len, own_ref
         0x42, 0x01, 0x0a, 0x00, // tag, unk, fmt=R8
@@ -1657,7 +1657,7 @@ fn decode_type5_texture_view_live_v0a8_alpha_plane_index() {
         0x02, 0x00, 0x00, 0x00, // IOSurface plane index = 2 (alpha)
     ];
     desc.extend_from_slice(&args);
-    let rec = decode_type5_texture_view(&desc).expect("live v0a8 alpha record decodes");
+    let rec = decode_iosurface_plane_view(&desc).expect("live v0a8 alpha record decodes");
     assert_eq!(rec.pixel_format, 0x0a);
     assert_eq!((rec.width, rec.height, rec.depth), (946, 350, 1));
     assert_eq!(rec.plane_index, 2);
@@ -1672,57 +1672,60 @@ fn decode_type5_texture_view_live_v0a8_alpha_plane_index() {
 /// point of having it. Pinning the offset against a descriptor whose *other*
 /// leading dword is non-zero is what makes an off-by-four visible.
 #[test]
-fn the_type5_owner_task_is_read_from_its_own_dword() {
-    let mut desc = [0u8; TYPE5_MIN_LEN];
-    st32(&mut desc[TYPE5_SURFACE_ID..], 0xabcd);
+fn the_iosurface_plane_view_owner_task_is_read_from_its_own_dword() {
+    let mut desc = [0u8; IOSURFACE_PLANE_VIEW_MIN_LEN];
+    st32(&mut desc[IOSURFACE_PLANE_VIEW_SURFACE_ID..], 0xabcd);
     assert_eq!(
-        ld32(&desc[TYPE5_OWNER_TASK..]),
+        ld32(&desc[IOSURFACE_PLANE_VIEW_OWNER_TASK..]),
         0,
         "the surface id must not be read as the owner task"
     );
-    st32(&mut desc[TYPE5_OWNER_TASK..], 7);
-    assert_eq!(ld32(&desc[TYPE5_OWNER_TASK..]), 7);
+    st32(&mut desc[IOSURFACE_PLANE_VIEW_OWNER_TASK..], 7);
+    assert_eq!(ld32(&desc[IOSURFACE_PLANE_VIEW_OWNER_TASK..]), 7);
     assert_eq!(
-        ld32(&desc[TYPE5_SURFACE_ID..]),
+        ld32(&desc[IOSURFACE_PLANE_VIEW_SURFACE_ID..]),
         0xabcd,
         "writing the owner task must not disturb the surface id"
     );
     // Both fields sit inside the minimum descriptor — the array above is
-    // exactly `TYPE5_MIN_LEN` and indexing it proves that — so the census can
+    // exactly `IOSURFACE_PLANE_VIEW_MIN_LEN` and indexing it proves that — so the census can
     // never be silently skipped on a well-formed record.
-    assert_eq!(TYPE5_OWNER_TASK, TYPE5_SURFACE_ID + 4);
+    assert_eq!(
+        IOSURFACE_PLANE_VIEW_OWNER_TASK,
+        IOSURFACE_PLANE_VIEW_SURFACE_ID + 4
+    );
 }
 
 #[test]
-fn decode_type5_texture_view_fail_closed() {
+fn decode_iosurface_plane_view_fail_closed() {
     // Short descriptor (no record).
     let mut short = vec![0u8; 8];
-    st32(&mut short[TYPE5_SURFACE_ID..], 8);
-    assert!(decode_type5_texture_view(&short).is_none());
+    st32(&mut short[IOSURFACE_PLANE_VIEW_SURFACE_ID..], 8);
+    assert!(decode_iosurface_plane_view(&short).is_none());
     // Wrong record tag.
     let mut bad_tag = vec![0u8; 8];
-    st32(&mut bad_tag[TYPE5_SURFACE_ID..], 8);
+    st32(&mut bad_tag[IOSURFACE_PLANE_VIEW_SURFACE_ID..], 8);
     bad_tag.extend_from_slice(&[0u8; 12]);
     bad_tag.extend_from_slice(&[
         0x41, 0x01, 0x0a, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x01, 0, 0, 0,
     ]);
-    assert!(decode_type5_texture_view(&bad_tag).is_none());
+    assert!(decode_iosurface_plane_view(&bad_tag).is_none());
     // Non-2D (depth != 1) fails closed.
     let mut vol = vec![0u8; 8];
-    st32(&mut vol[TYPE5_SURFACE_ID..], 8);
+    st32(&mut vol[IOSURFACE_PLANE_VIEW_SURFACE_ID..], 8);
     vol.extend_from_slice(&[0u8; 12]);
     vol.extend_from_slice(&[
         0x42, 0x07, 0x50, 0x00, 0x40, 0, 0, 0, 0x40, 0, 0, 0, 0x40, 0, 0, 0,
     ]);
-    assert!(decode_type5_texture_view(&vol).is_none());
+    assert!(decode_iosurface_plane_view(&vol).is_none());
     // Zero width fails closed.
     let mut zw = vec![0u8; 8];
-    st32(&mut zw[TYPE5_SURFACE_ID..], 8);
+    st32(&mut zw[IOSURFACE_PLANE_VIEW_SURFACE_ID..], 8);
     zw.extend_from_slice(&[0u8; 12]);
     zw.extend_from_slice(&[
         0x42, 0x01, 0x0a, 0x00, 0, 0, 0, 0, 0x00, 0x04, 0, 0, 0x01, 0, 0, 0,
     ]);
-    assert!(decode_type5_texture_view(&zw).is_none());
+    assert!(decode_iosurface_plane_view(&zw).is_none());
 }
 
 /// The probe's notion of "undecoded" must be exactly the bytes

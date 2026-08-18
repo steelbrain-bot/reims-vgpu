@@ -1389,7 +1389,7 @@ enum TextureWriteback {
         /// window may touch.
         ///
         /// Resolved once, at stage time, through the plane the bind actually
-        /// names: `type5_sample_window` when the wire carried a type-5 view's
+        /// names: `iosurface_plane_view_sample_window` when the wire carried a IOSurface plane view view's
         /// plane index, `iosurface_texture_sample_window` otherwise. Both the read that
         /// seeds the image and the write that lands it use exactly these three
         /// numbers, so the two cannot name different bytes of one surface.
@@ -1609,7 +1609,7 @@ fn iosurface_texture_destination<M: HostMemory + HostOps>(
         return ComputeImageDestination::Host;
     };
     // The window this bind staged against, not one resolved here. It is already
-    // plane-correct for a type-5 view and already a sub-rectangle where the
+    // plane-correct for a IOSurface plane view view and already a sub-rectangle where the
     // dispatch writes one, and it is the same window the readback rail lands
     // through — so the two rails cannot name different bytes of one surface.
     match crate::runtime::mapping_write::licence_iosurface_texture_surface(
@@ -1866,10 +1866,10 @@ pub(crate) fn resident_serve(
     .then_some(ResidentServe::Sample(key, mirror_generation))
 }
 
-/// Load tight raw texels for a compute texture binding (type-2/3, type-5→surface, or IOSurface texture).
+/// Load tight raw texels for a compute texture binding (type-2/3, IOSurface plane view→surface, or IOSurface texture).
 ///
-/// Type-5 (`RefTextureHandle`) is the live CI wallpaper path (`compute_stage_tex … ot=5`).
-/// RE (type-5 wire + `runtime::draw` sample path): surfaceID@0 is a surface backing object id (= mapping
+/// IOSurface plane view (`RefTextureHandle`) is the live CI wallpaper path (`compute_stage_tex … ot=5`).
+/// RE (IOSurface plane view wire + `runtime::draw` sample path): surfaceID@0 is a surface backing object id (= mapping
 /// mid). Product draw samples call [`objects::ensure_surface_for_present`] on that id and
 /// stage from the **mapping registry**, never re-resolving the surface id through the
 /// compute task's object list (that list uses a separate texture-ref namespace — live
@@ -1883,11 +1883,11 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     binding: u32,
     is_storage: bool,
 ) -> Result<StagedTexture, ComputeStatus> {
-    // Type-5 RefTextureHandle → surface_id (live CI binds ot5).
+    // IOSurface plane view RefTextureHandle → surface_id (live CI binds ot5).
     let mut stage_ref = texture_ref;
-    let mut from_type5 = false;
+    let mut from_iosurface_plane_view = false;
     let mut from_surface_backing_direct = false;
-    let mut type5_record: Option<objects::Type5TextureView> = None;
+    let mut iosurface_plane_view_record: Option<objects::IOSurfacePlaneViewDescriptor> = None;
     let mut view_level = 0;
     let mut view_pixel_format = None;
     let mut heap_texture = None;
@@ -1896,8 +1896,8 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     // the id space with surface backing surface mids, so the `mappings.contains(ref)`
     // fallback below would wrongly grab a same-numbered surface (live class:
     // `ref=N ot=2` dragged into the IOSurface texture path and failing silently against
-    // the biplanar wallpaper mid). Same collision the type-5 path documents.
-    // Resolve the object-list entry once: `ref_is_linear` and the type5/surface_backing
+    // the biplanar wallpaper mid). Same collision the IOSurface plane view path documents.
+    // Resolve the object-list entry once: `ref_is_linear` and the iosurface_plane_view/surface_backing
     // classification below both read it for the same ref, and the guest object
     // list is immutable for the life of the dispatch (the device never writes
     // those pages). `ListObjectEntry` is `Copy`, so one guest-DMA read+decode
@@ -2141,14 +2141,14 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     if let Some(entry) = stage_entry {
         if entry.kind == ObjectKind::IOSurfacePlaneView {
             if let Some(desc) = objects::read_descriptor(state, host, task_id, &entry) {
-                if let Ok(t5) = reims_vgpu_wire::device_desc::type5_header(&desc) {
+                if let Ok(t5) = reims_vgpu_wire::device_desc::iosurface_plane_view_header(&desc) {
                     let sid = t5.surface_id.get();
                     if sid != 0 {
                         stage_ref = sid;
-                        from_type5 = true;
-                        type5_record = objects::decode_type5_texture_view(&desc);
+                        from_iosurface_plane_view = true;
+                        iosurface_plane_view_record = objects::decode_iosurface_plane_view(&desc);
                         let ok = objects::ensure_surface_for_present(state, host, sid);
-                        // Per-bind type-5 descriptor RE census (args@+8 holds the
+                        // Per-bind IOSurface plane view descriptor RE census (args@+8 holds the
                         // serialized plane texture; product stage uses mapping geom
                         // only today). This is measurement, not a failure — it fired
                         // ~600×/boot on the always-on sink (same descriptor re-dumped
@@ -2157,16 +2157,20 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                         // ensure failure surfaces downstream as `MissingTexture` (the
                         // mapping lookup below misses), so no always-on line is lost.
                         if crate::observe::draw_log_enabled() {
-                            // The owner task the view names. `note_type5_owner_task`
+                            // The owner task the view names. `note_iosurface_plane_view_owner_task`
                             // is the always-on check on its value; this echo carries
                             // it beside the descriptor it came out of.
                             let owner_task = t5.owner_task.get();
-                            let args_n = desc.len().saturating_sub(objects::TYPE5_ARGS);
+                            let args_n = desc
+                                .len()
+                                .saturating_sub(objects::IOSURFACE_PLANE_VIEW_ARGS);
                             let mut args_hex = String::new();
                             if args_n > 0 {
                                 let n = args_n.min(48);
                                 args_hex.reserve(n * 2);
-                                for b in &desc[objects::TYPE5_ARGS..objects::TYPE5_ARGS + n] {
+                                for b in &desc[objects::IOSURFACE_PLANE_VIEW_ARGS
+                                    ..objects::IOSURFACE_PLANE_VIEW_ARGS + n]
+                                {
                                     use std::fmt::Write as _;
                                     let _ = write!(args_hex, "{b:02x}");
                                 }
@@ -2175,7 +2179,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                                 }
                             }
                             crate::observe::line(format!(
-                                "compute_stage_tex type5 ref={texture_ref} sid={sid} ensure={} owner_task={owner_task} desc_len={} args_n={args_n} args_hex={args_hex}",
+                                "compute_stage_tex iosurface_plane_view ref={texture_ref} sid={sid} ensure={} owner_task={owner_task} desc_len={} args_n={args_n} args_hex={args_hex}",
                                 ok as u8,
                                 desc.len(),
                             ));
@@ -2190,9 +2194,9 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         }
     }
 
-    // Type-5 / direct surface backing: surface id **is** the mapping mid. Never call
+    // IOSurface plane view / direct surface backing: surface id **is** the mapping mid. Never call
     // resolve_iosurface_texture_ref(task, sid) — task object-list indices collide with texture refs.
-    let mapping_id_opt = if from_type5 || from_surface_backing_direct {
+    let mapping_id_opt = if from_iosurface_plane_view || from_surface_backing_direct {
         if stage_ref != 0 && state.mappings.contains_key(&stage_ref) {
             Some(stage_ref)
         } else {
@@ -2211,17 +2215,17 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             }
         })
     };
-    if mapping_id_opt.is_none() && from_type5 {
+    if mapping_id_opt.is_none() && from_iosurface_plane_view {
         crate::observe::fail(format!(
-            "compute_stage_tex type5_no_map ref={texture_ref} sid={stage_ref}"
+            "compute_stage_tex iosurface_plane_view_no_map ref={texture_ref} sid={stage_ref}"
         ));
         return Err(ComputeStatus::MissingTexture(
-            "compute_stage_tex_type5_no_map",
+            "compute_stage_tex_iosurface_plane_view_no_map",
         ));
     }
     if let Some(mapping_id) = mapping_id_opt {
         let _ = mapper::ensure_resolved_for_scanout(state, host, mapping_id);
-        // Geom/format: a type-5 record is the exact Metal texture view over
+        // Geom/format: a IOSurface plane view record is the exact Metal texture view over
         // the IOSurface bytes. It is authoritative even for a stageable
         // single-plane mapping: the live BGRA8 desktop target is exposed as a
         // row-byte-equivalent, quarter-width RGBA32Uint view. Surface backing direct
@@ -2235,7 +2239,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                 "compute_view_iosurface_texture_mip",
             ));
         }
-        let (width, height, format) = if from_type5 || from_surface_backing_direct {
+        let (width, height, format) = if from_iosurface_plane_view || from_surface_backing_direct {
             let m = state
                 .mappings
                 .get(&mapping_id)
@@ -2245,14 +2249,14 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             let multiplanar = objects::mapping_is_multiplanar(m);
             let mapping_stageable =
                 m.has_geom && m.width != 0 && m.height != 0 && m.format != 0 && !multiplanar;
-            if let Some(rec) = type5_record {
+            if let Some(rec) = iosurface_plane_view_record {
                 // `iosurface_texture_sample_window` below matches actual plane records by
                 // geometry+bpe and otherwise verifies a packed row-compatible
                 // view over the same bytes. Per-bind measurement (view vs base
                 // geom), not a failure — verbose-gated to keep the always-on sink
                 // for genuine failures.
                 crate::observe::line(format!(
-                    "compute_stage_tex type5_view mapping={mapping_id} view={}x{} fmt={:#x} base={}x{} fmt={:#x} multiplanar={}",
+                    "compute_stage_tex iosurface_plane_view mapping={mapping_id} view={}x{} fmt={:#x} base={}x{} fmt={:#x} multiplanar={}",
                     rec.width,
                     rec.height,
                     rec.pixel_format,
@@ -2276,7 +2280,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                     // Multi-plane IOSurface without a plane record: fail closed,
                     // do not invent BGRA sample of the whole surface.
                     crate::observe::fail(format!(
-                        "compute_stage_tex iosurface_texture_fail reason=multiplane mapping={mapping_id} {}x{} fmt={:#x} pages={} (no type-5 plane record)",
+                        "compute_stage_tex iosurface_texture_fail reason=multiplane mapping={mapping_id} {}x{} fmt={:#x} pages={} (no IOSurface plane view plane record)",
                         m.width,
                         m.height,
                         m.format,
@@ -2387,17 +2391,21 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         let wire_len = crate::contract::iosurface_pages::decode_device_surface(&m.device_desc)
             .map(|s| s.alloc_size as u64)
             .unwrap_or(0);
-        // A type-5 record names its IOSurface plane on the wire (record `+0x20`,
+        // A IOSurface plane view record names its IOSurface plane on the wire (record `+0x20`,
         // the `newTextureWithDescriptor:iosurface:plane:` argument), so the
         // plane is decided, not inferred. IOSurface texture carries no such field and must
         // still match a plane record by geometry — which is ambiguous whenever
         // two planes share dims and bytes-per-element (v0a8 Y and alpha), and
-        // declines rather than picking one. The draw path already binds type-5
+        // declines rather than picking one. The draw path already binds IOSurface plane view
         // views by index; this is the same resolution on the staging path.
-        let window = match type5_record {
-            Some(rec) => {
-                mapping_write::type5_sample_window(m, rec.plane_index, width, height, stage_fmt)
-            }
+        let window = match iosurface_plane_view_record {
+            Some(rec) => mapping_write::iosurface_plane_view_sample_window(
+                m,
+                rec.plane_index,
+                width,
+                height,
+                stage_fmt,
+            ),
             None => mapping_write::iosurface_texture_sample_window(m, width, height, stage_fmt),
         };
         let (surface_offset, surface_bpr, span_end) = match window {
@@ -2429,12 +2437,12 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             .checked_mul(bpp as u64)
             .ok_or(ComputeStatus::Unsupported("stage_tex_tight_bpr_overflow"))?
             as u32;
-        if from_type5 && type5_record.is_some() {
-            // Per-bind type-5 sample-window measurement, not a failure — verbose-gated
+        if from_iosurface_plane_view && iosurface_plane_view_record.is_some() {
+            // Per-bind IOSurface plane view sample-window measurement, not a failure — verbose-gated
             // (was a per-bind always-on line). Genuine window failures above emit
             // `iosurface_texture_fail reason=window` always-on.
             crate::observe::line(format!(
-                "compute_stage_tex type5_view_window mapping={mapping_id} view={width}x{height} fmt={stage_fmt:#x} bpp={bpp} tight={tight} surface_off={surface_offset} surface_bpr={surface_bpr} span_end={span_end}"
+                "compute_stage_tex iosurface_plane_view_window mapping={mapping_id} view={width}x{height} fmt={stage_fmt:#x} bpp={bpp} tight={tight} surface_off={surface_offset} surface_bpr={surface_bpr} span_end={span_end}"
             ));
         }
         let need_u64 = (tight as u64)
@@ -2606,12 +2614,12 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         } else {
             TextureWriteback::None
         };
-        if from_type5 {
-            // Per-bind type-5 stage SUCCESS census — not a failure; verbose-gated
-            // (was always-on, ~300/boot). Genuine type-5 stage failures above emit
+        if from_iosurface_plane_view {
+            // Per-bind IOSurface plane view stage SUCCESS census — not a failure; verbose-gated
+            // (was always-on, ~300/boot). Genuine IOSurface plane view stage failures above emit
             // `iosurface_texture_fail reason=<slug>` always-on.
             crate::observe::line(format!(
-                "compute_stage_tex type5_ok ref={texture_ref} sid={mapping_id} {width}x{height} fmt={stage_fmt:#x} pages={pages_n}"
+                "compute_stage_tex iosurface_plane_view_ok ref={texture_ref} sid={mapping_id} {width}x{height} fmt={stage_fmt:#x} pages={pages_n}"
             ));
         }
         return Ok(StagedTexture {
