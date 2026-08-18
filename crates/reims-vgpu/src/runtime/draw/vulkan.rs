@@ -1281,9 +1281,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     // An unclassified ref has no resource object to own a
                     // lease. Keep its existing query path so compatibility
                     // traffic still reaches the copying rails.
-                    .unwrap_or_else(|| {
-                        crate::backend::vulkan::engine::resident_content_backing(&resident_id)
-                    });
+                    .unwrap_or_else(|| state.executor.resident_content_backing(&resident_id));
                 let resident_ready = resident_backing
                     != crate::backend::vulkan::engine::ResidentContentBacking::NotReady;
                 if resident_ready {
@@ -1304,7 +1302,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     .get(&mid)
                     .map(|mapping| mapping.surface_content_epoch);
                 let resident_epoch = resident_ready
-                    .then(|| crate::backend::vulkan::engine::resident_content_epoch(&resident_id))
+                    .then(|| state.executor.resident_content_epoch(&resident_id))
                     .flatten();
                 let resident_current = resident_ready
                     && iosurface_texture_resident_is_current(mapping_epoch, resident_epoch);
@@ -1376,7 +1374,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // something was lost.
                 if !resident_ready {
                     if let Some((cause, since_ms)) =
-                        crate::backend::vulkan::engine::resident_absent_after_reclaim(&resident_id)
+                        state.executor.resident_absent_after_reclaim(&resident_id)
                     {
                         crate::runtime::drain::note_store_route(
                             "iosurfacesample_reclaimed_from_pages",
@@ -3300,7 +3298,8 @@ fn gva_resident_ready(
         .map(|resource| resource.resident_target_backing(identity));
     let retained = backing.is_some();
     let ready = retained_resident_is_ready(backing, || {
-        crate::backend::vulkan::engine::resident_content_ready(identity)
+        state.executor.resident_content_backing(identity)
+            != crate::backend::vulkan::engine::ResidentContentBacking::NotReady
     });
     crate::runtime::drain::note_store_route(match (retained, ready) {
         (true, true) => "gva_ready_resource",
@@ -6798,8 +6797,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // ratio of the two is a within-boot number — the only kind that
                 // survives the 1.8x `us_per_draw` drift between boots on this rig.
                 let resident_current = iosurface_texture_load_resident_is_current(|| {
-                    let resident_epoch =
-                        crate::backend::vulkan::engine::resident_content_epoch(&identity);
+                    let resident_epoch = state.executor.resident_content_epoch(&identity);
                     iosurface_texture_resident_is_current(mapping_epoch, resident_epoch)
                 });
                 if resident_current {
@@ -8315,7 +8313,9 @@ fn stamp_iosurface_texture_resident(
     epoch: u32,
 ) {
     if let Some(identity) = iosurface_texture_store_identity(state, req, writeback_guest) {
-        crate::backend::vulkan::engine::stamp_resident_content_epoch(&identity, epoch);
+        state
+            .executor
+            .stamp_resident_content_epoch(&identity, epoch);
         // Both callers reach here only on a route that has already put these
         // pixels outside the image — the synchronous one through `write_bgra8`
         // into the mapping's guest pages, the deferred-readback one through
@@ -8327,7 +8327,7 @@ fn stamp_iosurface_texture_resident(
         // Deliberately not on `arm_surface_resident_store`: that route skips the
         // readback precisely so no copy is made, keeps the frame in the image
         // alone, and holds it with a pin instead.
-        crate::backend::vulkan::engine::note_resident_content_copied_out(&identity);
+        state.executor.note_resident_content_copied_out(&identity);
     }
 }
 

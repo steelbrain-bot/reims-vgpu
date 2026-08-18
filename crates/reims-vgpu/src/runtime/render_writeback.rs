@@ -809,8 +809,8 @@ pub fn retire_linear_residents(state: &mut DeviceState) {
     // whole of the work there.
     #[cfg(feature = "backend-vulkan")]
     for key in &retired {
-        crate::backend::vulkan::engine::unpin_resident_storage(key);
-        crate::backend::vulkan::engine::retire_resident_storage_content(key);
+        state.executor.unpin_resident_storage(key);
+        state.executor.retire_resident_storage_content(key);
         let crate::model::ComputeStorageOrigin::Linear {
             task_id,
             texture_ref,
@@ -1015,9 +1015,9 @@ fn finish(
         .get(&mapping_id)
         .map(|m| m.surface_content_epoch)
     {
-        crate::backend::vulkan::engine::stamp_resident_content_epoch(identity, epoch);
+        state.executor.stamp_resident_content_epoch(identity, epoch);
     }
-    crate::backend::vulkan::engine::note_resident_content_copied_out(identity);
+    state.executor.note_resident_content_copied_out(identity);
     crate::runtime::drain::note_drain_phase(
         crate::runtime::drain::DrainPhase::Flush(crate::runtime::drain::FlushRail::Render),
         started,
@@ -1243,7 +1243,7 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
         .map_err(|inner| GvaWritebackDecline::CopiedReadRefused { inner })?
         .into_rgba8();
     let extent = land_gva_frame_bytes(state, host, task_id, c0, texture_ref, &rgba, pages)?;
-    crate::backend::vulkan::engine::note_resident_content_copied_out(identity);
+    state.executor.note_resident_content_copied_out(identity);
     crate::runtime::drain::note_store_route("gva_flush_copied");
     Ok(extent)
 }
@@ -1605,7 +1605,7 @@ pub(crate) fn copy_resident_into_gva_plane<M: HostMemory + HostOps>(
     // The copy means this image has stopped being the only place these pixels
     // exist, so the reclaim paths may take it — the same handover
     // `store_render_frame` performs in `finish`.
-    crate::backend::vulkan::engine::note_resident_content_copied_out(identity);
+    state.executor.note_resident_content_copied_out(identity);
     // Stamp the decoded resource generation after the copy and after recording
     // this device's own page write. Those two contract-owned records are the
     // complete currency test for a named target.

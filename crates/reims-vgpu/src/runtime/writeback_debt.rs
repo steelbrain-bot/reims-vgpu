@@ -694,7 +694,7 @@ pub fn arm_gva<M: HostMemory + HostOps>(
     };
     let previous = state.pending_writebacks.arm_gva(key, debt);
     if let Some(previous) = previous.filter(|previous| !same_gva_identity(*previous, debt)) {
-        release_gva(previous);
+        release_gva(state.executor.as_ref(), previous);
     }
     true
 }
@@ -725,7 +725,7 @@ pub fn retire_gva_for_task(state: &mut DeviceState, task_id: u32) -> usize {
         retired += 1;
         #[cfg(feature = "backend-vulkan")]
         for debt in debts {
-            release_gva(debt);
+            release_gva(state.executor.as_ref(), debt);
         }
         #[cfg(not(feature = "backend-vulkan"))]
         let _ = debts;
@@ -746,7 +746,7 @@ pub fn retire_gva_resource(state: &mut DeviceState, task_id: u32, texture_ref: u
     let owed = !debts.is_empty();
     #[cfg(feature = "backend-vulkan")]
     for debt in debts {
-        release_gva(debt);
+        release_gva(state.executor.as_ref(), debt);
     }
     #[cfg(not(feature = "backend-vulkan"))]
     let _ = debts;
@@ -790,8 +790,8 @@ pub(crate) fn gva_identity(
 }
 
 #[cfg(feature = "backend-vulkan")]
-fn release_gva(debt: GvaWritebackDebt) {
-    crate::backend::vulkan::engine::note_resident_content_copied_out(&gva_identity(debt));
+fn release_gva(executor: &dyn crate::runtime::executor::Executor, debt: GvaWritebackDebt) {
+    executor.note_resident_content_copied_out(&gva_identity(debt));
 }
 
 /// Wait only for submitted writes that can reach one mapping's pages.
@@ -900,7 +900,7 @@ fn pay_gva<M: HostMemory + HostOps>(
     let now = state.resource_write_stamp(key.task_id, key.texture_ref);
     if !now.quiet_since(debt.guest_write) {
         crate::runtime::drain::note_store_route("gvadebt_abandoned_guest_wrote");
-        release_gva(debt);
+        release_gva(state.executor.as_ref(), debt);
         return true;
     }
     let Some(span) = u64::from(debt.linear.row_stride).checked_mul(u64::from(debt.height)) else {
@@ -908,7 +908,7 @@ fn pay_gva<M: HostMemory + HostOps>(
             "gvadebt_pay_lost task={} texture={} reason=span_overflow",
             key.task_id, key.texture_ref
         ));
-        release_gva(debt);
+        release_gva(state.executor.as_ref(), debt);
         return true;
     };
     // The resource's own declaration decides whether its pages come back, not
@@ -918,7 +918,7 @@ fn pay_gva<M: HostMemory + HostOps>(
     // nothing retired can grow pages back.
     if !reback_gva_resource(state, host, plane) {
         crate::runtime::drain::note_store_route("gvadebt_resource_retired");
-        release_gva(debt);
+        release_gva(state.executor.as_ref(), debt);
         return true;
     }
     let Some((backing_generation, backing_span, ordered)) =
@@ -941,7 +941,7 @@ fn pay_gva<M: HostMemory + HostOps>(
     // reach here: it would have found no plane at all above.
     if backing_generation != debt.generation || backing_span != span {
         crate::runtime::drain::note_store_route("gvadebt_generation_moved");
-        release_gva(debt);
+        release_gva(state.executor.as_ref(), debt);
         return true;
     }
     let pages = crate::runtime::draw::StoreTargetPages::from_ordered(&ordered, span);
@@ -973,7 +973,7 @@ fn pay_gva<M: HostMemory + HostOps>(
             .field("task", key.task_id)
             .field("texture", key.texture_ref)
             .fail();
-        release_gva(debt);
+        release_gva(state.executor.as_ref(), debt);
     } else if let Some((resource, version)) = debt.content {
         if !state
             .task_resources

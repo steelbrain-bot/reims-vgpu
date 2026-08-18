@@ -1905,18 +1905,17 @@ impl ResidentServe {
 /// the guest window or, where the resident is the only copy, names the loss.
 #[cfg(feature = "backend-vulkan")]
 pub(crate) fn resident_serve(
+    executor: &dyn crate::runtime::executor::Executor,
     key: crate::model::ComputeStorageResidencyKey,
     mirror_generation: u32,
     is_storage: bool,
     pixel_format: u16,
 ) -> Option<ResidentServe> {
     if is_storage {
-        return (crate::backend::vulkan::engine::compute_resident_storage_generation(&key)
-            == Some(mirror_generation))
-        .then_some(ResidentServe::Seed(mirror_generation));
+        return (executor.compute_resident_storage_generation(&key) == Some(mirror_generation))
+            .then_some(ResidentServe::Seed(mirror_generation));
     }
-    let (engine_generation, engine_format) =
-        crate::backend::vulkan::engine::compute_resident_sample_source(&key)?;
+    let (engine_generation, engine_format) = executor.compute_resident_sample_source(&key)?;
     (engine_generation == mirror_generation
         && mtl_to_engine_sampled(pixel_format)
             .is_some_and(|f| f.vk_format() == engine_format.vk_format()))
@@ -2132,23 +2131,25 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         #[cfg(feature = "backend-vulkan")]
         let serve = match state.compute_storage_residency.get(&key).copied() {
             None => None,
-            Some(generation) => match resident_serve(key, generation, is_storage, format) {
-                // A heap texture has no guest window to re-read: once the mirror
-                // claims a resident, the engine's copy is the only content, so a
-                // resident the engine can no longer serve is a loss, not a
-                // fallback. The window-backed rails below fall through to the
-                // guest read here instead; this is the arm that must not.
-                None => {
-                    crate::observe::fail(format!(
+            Some(generation) => {
+                match resident_serve(state.executor.as_ref(), key, generation, is_storage, format) {
+                    // A heap texture has no guest window to re-read: once the mirror
+                    // claims a resident, the engine's copy is the only content, so a
+                    // resident the engine can no longer serve is a loss, not a
+                    // fallback. The window-backed rails below fall through to the
+                    // guest read here instead; this is the arm that must not.
+                    None => {
+                        crate::observe::fail(format!(
                             "compute_stage_tex heap_fail reason=resident_lost ref={texture_ref} heap={heap_ref} fmt={format:#x} {width}x{height} gen={generation} use_offset={} offset={offset:#x}",
                             use_offset as u8
                         ));
-                    return Err(ComputeStatus::MissingTexture(
-                        "compute_stage_tex_heap_resident_lost",
-                    ));
+                        return Err(ComputeStatus::MissingTexture(
+                            "compute_stage_tex_heap_resident_lost",
+                        ));
+                    }
+                    serve => serve,
                 }
-                serve => serve,
-            },
+            }
         };
         #[cfg(not(feature = "backend-vulkan"))]
         let serve: Option<ResidentServe> = None;
@@ -2544,7 +2545,13 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             .get(&residency_key)
             .copied()
             .and_then(|mirror_generation| {
-                resident_serve(residency_key, mirror_generation, is_storage, stage_fmt)
+                resident_serve(
+                    state.executor.as_ref(),
+                    residency_key,
+                    mirror_generation,
+                    is_storage,
+                    stage_fmt,
+                )
             });
         #[cfg(not(feature = "backend-vulkan"))]
         let serve: Option<ResidentServe> = None;
@@ -2835,7 +2842,13 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         linear_key,
         crate::runtime::surface_cache::linear_texture_resident_gen(state, &window),
     ) {
-        (Some(key), Some(generation)) => resident_serve(key, generation, is_storage, stage_format),
+        (Some(key), Some(generation)) => resident_serve(
+            state.executor.as_ref(),
+            key,
+            generation,
+            is_storage,
+            stage_format,
+        ),
         _ => None,
     };
     let mut bytes = vec![0u8; need];
@@ -4647,7 +4660,9 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         // resource's only durable content.
         if guest_materialized {
             if let Some(candidate) = t.residency {
-                crate::backend::vulkan::engine::note_resident_storage_copied_out(&candidate.key);
+                state
+                    .executor
+                    .note_resident_storage_copied_out(&candidate.key);
             }
         }
         note_storage_residency_writeback(state, t);

@@ -6,6 +6,7 @@
 
 use crate::backend::vulkan::engine::{
     ComputeOutput, ComputeRequest, DrawError, DrawOutput, DrawRequest, EngineFacadeDecline,
+    ResidentContent, ResidentContentBacking, StorageImageFormat, TargetIdentity,
 };
 use reims_vgpu_protocol::{SegmentBoundary, SubmissionIdentity, SubmissionResourceUse};
 use std::sync::Arc;
@@ -155,6 +156,62 @@ pub trait Executor: std::fmt::Debug + Send + Sync {
         )
     }
 
+    /// Current engine-owned content state for one resolved render target.
+    fn resident_content_backing(&self, _identity: &TargetIdentity) -> ResidentContentBacking {
+        ResidentContentBacking::NotReady
+    }
+
+    fn resident_absent_after_reclaim(
+        &self,
+        _identity: &TargetIdentity,
+    ) -> Option<(crate::backend::vulkan::engine::types::ResidentReclaim, u64)> {
+        None
+    }
+
+    fn resident_content_epoch(&self, _identity: &TargetIdentity) -> Option<u32> {
+        None
+    }
+
+    fn resident_content_state(&self, _identity: &TargetIdentity) -> ResidentContent {
+        ResidentContent::Absent
+    }
+
+    fn stamp_resident_content_epoch(&self, _identity: &TargetIdentity, _epoch: u32) -> bool {
+        false
+    }
+
+    fn note_resident_content_copied_out(&self, _identity: &TargetIdentity) -> bool {
+        false
+    }
+
+    fn compute_resident_storage_generation(
+        &self,
+        _identity: &crate::model::ComputeStorageResidencyKey,
+    ) -> Option<u32> {
+        None
+    }
+
+    fn compute_resident_sample_source(
+        &self,
+        _identity: &crate::model::ComputeStorageResidencyKey,
+    ) -> Option<(u32, StorageImageFormat)> {
+        None
+    }
+
+    fn unpin_resident_storage(&self, _identity: &crate::model::ComputeStorageResidencyKey) {}
+
+    fn retire_resident_storage_content(
+        &self,
+        _identity: &crate::model::ComputeStorageResidencyKey,
+    ) {
+    }
+
+    fn note_resident_storage_copied_out(
+        &self,
+        _identity: &crate::model::ComputeStorageResidencyKey,
+    ) {
+    }
+
     fn execute(&self, submission: ResolvedSubmission) -> Result<ExecutionCompletion, DrawError>;
 
     /// End one guest lifetime while preserving shareable physical-GPU state.
@@ -206,6 +263,62 @@ impl Executor for VulkanExecutor {
         layout: crate::contract::pixel_format::TexelLayout,
     ) -> bool {
         crate::backend::vulkan::engine::render_target_layout_supported(layout)
+    }
+
+    fn resident_content_backing(&self, identity: &TargetIdentity) -> ResidentContentBacking {
+        crate::backend::vulkan::engine::resident_content_backing(identity)
+    }
+
+    fn resident_absent_after_reclaim(
+        &self,
+        identity: &TargetIdentity,
+    ) -> Option<(crate::backend::vulkan::engine::types::ResidentReclaim, u64)> {
+        crate::backend::vulkan::engine::resident_absent_after_reclaim(identity)
+    }
+
+    fn resident_content_epoch(&self, identity: &TargetIdentity) -> Option<u32> {
+        crate::backend::vulkan::engine::resident_content_epoch(identity)
+    }
+
+    fn resident_content_state(&self, identity: &TargetIdentity) -> ResidentContent {
+        crate::backend::vulkan::engine::resident_content_state(identity)
+    }
+
+    fn stamp_resident_content_epoch(&self, identity: &TargetIdentity, epoch: u32) -> bool {
+        crate::backend::vulkan::engine::stamp_resident_content_epoch(identity, epoch)
+    }
+
+    fn note_resident_content_copied_out(&self, identity: &TargetIdentity) -> bool {
+        crate::backend::vulkan::engine::note_resident_content_copied_out(identity)
+    }
+
+    fn compute_resident_storage_generation(
+        &self,
+        identity: &crate::model::ComputeStorageResidencyKey,
+    ) -> Option<u32> {
+        crate::backend::vulkan::engine::compute_resident_storage_generation(identity)
+    }
+
+    fn compute_resident_sample_source(
+        &self,
+        identity: &crate::model::ComputeStorageResidencyKey,
+    ) -> Option<(u32, StorageImageFormat)> {
+        crate::backend::vulkan::engine::compute_resident_sample_source(identity)
+    }
+
+    fn unpin_resident_storage(&self, identity: &crate::model::ComputeStorageResidencyKey) {
+        crate::backend::vulkan::engine::unpin_resident_storage(identity);
+    }
+
+    fn retire_resident_storage_content(&self, identity: &crate::model::ComputeStorageResidencyKey) {
+        crate::backend::vulkan::engine::retire_resident_storage_content(identity);
+    }
+
+    fn note_resident_storage_copied_out(
+        &self,
+        identity: &crate::model::ComputeStorageResidencyKey,
+    ) {
+        crate::backend::vulkan::engine::note_resident_storage_copied_out(identity);
     }
 
     fn execute(&self, submission: ResolvedSubmission) -> Result<ExecutionCompletion, DrawError> {
@@ -334,6 +447,7 @@ mod tests {
     struct ScriptedExecutor {
         completion: ScriptedCompletion,
         capabilities: ExecutorCapabilities,
+        resident_generation: Option<u32>,
         seen: Mutex<Vec<SubmissionContext>>,
         resets: AtomicUsize,
     }
@@ -343,6 +457,7 @@ mod tests {
             Self {
                 completion,
                 capabilities: ExecutorCapabilities::default(),
+                resident_generation: None,
                 seen: Mutex::new(Vec::new()),
                 resets: AtomicUsize::new(0),
             }
@@ -352,11 +467,23 @@ mod tests {
             self.capabilities.max_render_target_dimension = dimension;
             self
         }
+
+        fn with_resident_generation(mut self, generation: u32) -> Self {
+            self.resident_generation = Some(generation);
+            self
+        }
     }
 
     impl Executor for ScriptedExecutor {
         fn capabilities(&self) -> ExecutorCapabilities {
             self.capabilities
+        }
+
+        fn compute_resident_storage_generation(
+            &self,
+            _identity: &crate::model::ComputeStorageResidencyKey,
+        ) -> Option<u32> {
+            self.resident_generation
         }
 
         fn execute(
@@ -426,6 +553,29 @@ mod tests {
 
         let seen = scripted.seen.lock().unwrap();
         assert_eq!(seen.as_slice(), &[context]);
+    }
+
+    #[test]
+    fn device_injected_executor_owns_residency_queries() {
+        let scripted = Arc::new(
+            ScriptedExecutor::new(ScriptedCompletion::Compute).with_resident_generation(41),
+        );
+        let state = DeviceState::new_with_executor(DeviceId(1), 12, scripted);
+        let key = crate::model::ComputeStorageResidencyKey::linear(
+            2,
+            3,
+            0x4000,
+            256,
+            4096,
+            64,
+            16,
+            crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM,
+        );
+
+        assert_eq!(
+            state.executor.compute_resident_storage_generation(&key),
+            Some(41)
+        );
     }
 
     #[test]
