@@ -1909,6 +1909,10 @@ fn a_blit_endpoint_lands_the_writeback_its_texture_still_owes() {
         "this is the private-texture rung, not a surface"
     );
     assert!(
+        state.task_resources.content_stamp(1, 2).is_some(),
+        "a resolved texture endpoint must publish a canonical resource identity"
+    );
+    assert!(
         !state.pending_writebacks.has_gva(key),
         "resolving a blit endpoint must land what the texture owed, not read around it"
     );
@@ -1969,6 +1973,10 @@ fn a_last_array_slice_is_not_charged_for_its_trailing_row_padding() {
         ONE_SLICE + stride > EXACT,
         "the stride form must overcount, or this case proves nothing"
     );
+    // Descriptor bytes belong to the constructed resource lifetime. Retire
+    // that lifetime before publishing the deliberately shorter replacement;
+    // mutating a retained descriptor in place is not a guest operation.
+    assert!(state.task_resources.delete(1, 2));
     set_installed_allocation_size(&mut host, &state, 2, EXACT - 1);
     match resolve_texture_backing(&mut state, &mut host, 1, 2, 0, 1) {
         Err(st) => assert_eq!(st, BlitStatus::Bounds),

@@ -537,22 +537,23 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
     // later.
     note_blit_endpoint_debt(state, task_id, texture_ref);
     crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
-    let Some(entry) = objects::lookup_list_entry(state, host, task_id, texture_ref) else {
-        return Err(br(
-            BlitStatus::MissingResource,
-            crate::observe::ladder_slug!("tex", no_list_entry),
-        ));
-    };
+    // Resolve through the retained resource aggregate, not directly through
+    // mutable object-list bytes.  A successful endpoint therefore has one
+    // generational identity and one descriptor snapshot for its whole guest
+    // lifetime, just like buffers and every other canonical resource family.
+    let resource =
+        objects::resolve_resource(state, host, task_id, texture_ref).map_err(|rung| {
+            br(
+                BlitStatus::MissingResource,
+                crate::observe::ladder_slugs!("tex")(rung),
+            )
+        })?;
+    let entry = resource.entry;
+    let bytes = resource.descriptor.as_ref();
 
     // Type-8 view → base texture (unswizzled; multi-level / array / non-2D allowed).
     if entry.kind == ObjectKind::TextureView {
-        let Some(bytes) = objects::read_descriptor(state, host, task_id, &entry) else {
-            return Err(br(
-                BlitStatus::MissingResource,
-                crate::observe::ladder_slug!("view", desc_read),
-            ));
-        };
-        let Ok(view) = decode_texture_view_descriptor(&bytes) else {
+        let Ok(view) = decode_texture_view_descriptor(bytes) else {
             return Err(br(
                 BlitStatus::MissingResource,
                 crate::observe::ladder_slug!("view", desc_decode),
@@ -697,19 +698,13 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         if level != 0 || slice != 0 {
             return Err(br(BlitStatus::Unsupported, "iosurface_level_slice"));
         }
-        let Some(bytes) = objects::read_descriptor(state, host, task_id, &entry) else {
-            return Err(br(
-                BlitStatus::MissingResource,
-                crate::observe::ladder_slug!("iosurface", desc_read),
-            ));
-        };
         let Ok(ResourceDescriptor::IOSurfaceTexture {
             mapping_id,
             pixel_format: tex_fmt,
             width: tex_w,
             height: tex_h,
             ..
-        }) = decode_iosurface_texture_descriptor(&bytes)
+        }) = decode_iosurface_texture_descriptor(bytes)
         else {
             return Err(br(
                 BlitStatus::MissingResource,
@@ -775,24 +770,18 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         if level != 0 || slice != 0 {
             return Err(br(BlitStatus::Unsupported, "t5_level_slice"));
         }
-        let Some(bytes) = objects::read_descriptor(state, host, task_id, &entry) else {
-            return Err(br(
-                BlitStatus::MissingResource,
-                crate::observe::ladder_slug!("t5", desc_read),
-            ));
-        };
-        let Ok(t5) = reims_vgpu_wire::device_desc::type5_header(&bytes) else {
+        let Ok(t5) = reims_vgpu_wire::device_desc::type5_header(bytes) else {
             return Err(br(BlitStatus::MissingResource, "t5_desc_short"));
         };
         let sid = t5.surface_id.get();
         if sid == 0 {
             return Err(br(BlitStatus::MissingResource, "t5_no_sid"));
         }
-        let Some(view) = objects::decode_type5_texture_view(&bytes) else {
+        let Some(view) = objects::decode_type5_texture_view(bytes) else {
             // A short/zero-geom record fails closed — no fallback to base geom.
             // Capture why (len/tag/geom) deduped per sid so the exact blit-path
             // type-5 layout can be decoded without flooding.
-            note_t5_decode_fail(sid, &bytes);
+            note_t5_decode_fail(sid, bytes);
             return Err(br(BlitStatus::Unsupported, "t5_view_decode"));
         };
         // Surface id IS the type-4 mapping mid (never the task object-list ref —
@@ -851,13 +840,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
             crate::observe::ladder_slug!("tex", wrong_type),
         ));
     }
-    let Some(bytes) = objects::read_descriptor(state, host, task_id, &entry) else {
-        return Err(br(
-            BlitStatus::MissingResource,
-            crate::observe::ladder_slug!("tex", desc_read),
-        ));
-    };
-    let Ok(tex) = decode_texture_descriptor(&bytes) else {
+    let Ok(tex) = decode_texture_descriptor(bytes) else {
         return Err(br(
             BlitStatus::MissingResource,
             crate::observe::ladder_slug!("tex", desc_decode),
