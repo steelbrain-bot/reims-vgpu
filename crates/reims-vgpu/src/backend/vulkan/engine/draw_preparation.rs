@@ -7,11 +7,12 @@
 //! invariants of an already-built engine request.
 
 use crate::backend::vulkan::translate::TranslateReason;
-use crate::runtime::draw::IndexLoadReason;
-use reims_vgpu_vulkan::m2v_cache::M2vCacheDecline;
-use crate::runtime::mtlb::MtlbDecline;
 use reims_vgpu_observe::Decline;
 use reims_vgpu_protocol::ObjectKind;
+use reims_vgpu_vulkan::m2v_cache::M2vCacheDecline;
+use reims_vgpu_vulkan::preparation::{
+    IndexLoadReason, MtlbDecline, PastTableBind, SecondaryMrtRefusal,
+};
 
 /// A specific pipeline/stage preparation failure before engine request validation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,7 +55,7 @@ pub enum DrawPreparationDecline {
     /// refused rather than the one bind dropped.
     BindSlotPastTable {
         pipeline_ref: u32,
-        bind: crate::runtime::draw::PastTableBind,
+        bind: PastTableBind,
     },
     /// The guest's colour list names more than one render target and one of the
     /// secondary attachments cannot be built, so the whole draw is refused.
@@ -64,10 +65,10 @@ pub enum DrawPreparationDecline {
     /// no way to know is wrong — a fragment shader's `location` 1.. outputs go
     /// nowhere and a later pass sampling that attachment reads whatever was
     /// there before. See
-    /// [`crate::runtime::census::present_proxy::MrtDrop`] for which checks bail
+    /// [`reims_vgpu_vulkan::preparation::MrtDrop`] for which checks bail
     SecondaryTargetUnbuildable {
         pipeline_ref: u32,
-        refusal: crate::runtime::census::present_proxy::SecondaryMrtRefusal,
+        refusal: SecondaryMrtRefusal,
     },
     VertexBufferMissing {
         index: u32,
@@ -760,9 +761,9 @@ mod tests {
             },
             DrawPreparationDecline::SecondaryTargetUnbuildable {
                 pipeline_ref: 2,
-                refusal: crate::runtime::census::present_proxy::SecondaryMrtRefusal {
+                refusal: reims_vgpu_vulkan::preparation::SecondaryMrtRefusal {
                     slot: 1,
-                    reason: crate::runtime::census::present_proxy::MrtDrop::GeometryMismatch,
+                    reason: reims_vgpu_vulkan::preparation::MrtDrop::GeometryMismatch,
                 },
             },
             DrawPreparationDecline::VertexBufferMissing {
@@ -962,7 +963,7 @@ mod tests {
 
     #[test]
     fn index_load_preserves_the_shared_reason_and_fields() {
-        use crate::runtime::draw::IndexLoadReason;
+        use reims_vgpu_vulkan::preparation::IndexLoadReason;
 
         let decline = DrawPreparationDecline::IndexLoad {
             reason: IndexLoadReason::OutOfBounds,

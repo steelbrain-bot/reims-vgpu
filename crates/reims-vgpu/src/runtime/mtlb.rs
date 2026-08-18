@@ -59,54 +59,7 @@ pub const AIR_WRAP_MAGIC: [u8; 4] = [0xde, 0xc0, 0x17, 0x0b];
 const WRAPPER_HEADER_LEN: usize = 0x14;
 
 /// A structural refusal while locating the LLVM BitcodeWrapper inside an MTLB.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum MtlbDecline {
-    WrappedAirMissing {
-        data_len: usize,
-    },
-    WrapperHeaderTruncated {
-        offset: usize,
-        data_len: usize,
-    },
-    BlobOutOfBounds {
-        offset: usize,
-        blob_len: u64,
-        data_len: usize,
-    },
-}
-
-impl crate::observe::Decline for MtlbDecline {
-    fn slug(&self) -> &'static str {
-        match self {
-            Self::WrappedAirMissing { .. } => "mtlb_wrapped_air_missing",
-            Self::WrapperHeaderTruncated { .. } => "mtlb_wrapper_header_truncated",
-            Self::BlobOutOfBounds { .. } => "mtlb_blob_out_of_bounds",
-        }
-    }
-
-    fn fields(&self) -> Vec<(&'static str, String)> {
-        match self {
-            Self::WrappedAirMissing { data_len } => vec![("data_len", data_len.to_string())],
-            Self::WrapperHeaderTruncated { offset, data_len } => vec![
-                ("offset", offset.to_string()),
-                ("data_len", data_len.to_string()),
-            ],
-            Self::BlobOutOfBounds {
-                offset,
-                blob_len,
-                data_len,
-            } => vec![
-                ("offset", offset.to_string()),
-                ("blob_len", blob_len.to_string()),
-                ("data_len", data_len.to_string()),
-            ],
-        }
-    }
-}
-
-crate::observe::decline_display!(MtlbDecline);
-
-impl std::error::Error for MtlbDecline {}
+pub use reims_vgpu_vulkan::preparation::MtlbDecline;
 
 /// Which rail asked for a function's MTLB container.
 ///

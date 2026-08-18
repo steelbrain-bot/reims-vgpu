@@ -104,7 +104,6 @@ pub mod sampled_phase;
 pub mod scanout;
 /// SPIR-V set-0 binding relocation for metal2vulkan + internal Vulkan engine (Linux).
 pub mod spirv_bind;
-mod spirv_layout;
 /// How wide a translated vertex shader's stage-in reads are, per `Location`.
 pub mod spirv_vertex_input;
 /// Host surface cache (Linux/Vulkan discrete-GPU present, kb §8.5).

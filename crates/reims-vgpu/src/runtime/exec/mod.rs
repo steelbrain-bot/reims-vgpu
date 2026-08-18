@@ -2982,7 +2982,13 @@ use crate::runtime::draw::BindTableClass as BindClass;
 /// table to widen, which is the whole reason the counter exists. Splitting it is
 /// the same lesson `BlitEncoderSPI` taught one layer up — a family is not
 /// uniform in what its loss means.
-impl BindClass {
+trait BindClassCensus {
+    fn past_table_route(self) -> &'static str;
+    fn apple_table(self) -> u32;
+    fn reach_route(self, reach: u32) -> &'static str;
+}
+
+impl BindClassCensus for BindClass {
     /// The census name for slots this class lost to [`BindClass::table`].
     ///
     /// Also the `reason=` slug of [`BindSlotPastTable`], deliberately: the two

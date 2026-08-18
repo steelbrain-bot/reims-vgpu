@@ -157,39 +157,7 @@ pub const MAX_ANY_BIND_SLOTS: u32 = {
 /// for the class, the reach bands, the drop slug — as its own `impl` on this
 /// type, because those describe how a loss is *reported* rather than what the
 /// table *is*.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BindTableClass {
-    Buffer,
-    Texture,
-    Sampler,
-}
-
-impl BindTableClass {
-    /// This device's bind-index bound for the class.
-    ///
-    /// One constant per class, because the three have different bases: the
-    /// buffer bound is Metal's argument table (and, independently, Apple's own),
-    /// while the texture and sampler bounds are the width of a descriptor
-    /// binding band. A single shared constant made two of the three the wrong
-    /// number by construction — it was Metal's *buffer* table applied to all
-    /// three — which is what [`MAX_TEXTURE_BIND_SLOTS`] records.
-    pub fn table(self) -> u32 {
-        match self {
-            BindTableClass::Buffer => MAX_BUFFER_BIND_SLOTS,
-            BindTableClass::Texture => MAX_TEXTURE_BIND_SLOTS,
-            BindTableClass::Sampler => MAX_SAMPLER_BIND_SLOTS,
-        }
-    }
-
-    /// The name this class carries on a fail line.
-    pub fn name(self) -> &'static str {
-        match self {
-            BindTableClass::Buffer => "buffer",
-            BindTableClass::Texture => "texture",
-            BindTableClass::Sampler => "sampler",
-        }
-    }
-}
+pub use reims_vgpu_vulkan::preparation::BindTableClass;
 
 /// A live bind in one draw request whose slot no argument table of its class can
 /// name.
@@ -197,25 +165,7 @@ impl BindTableClass {
 /// Carries the object ref as well as the slot, because the two say different
 /// things: the slot names which table ran out, and the ref is what the guest
 /// still believes is bound there.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PastTableBind {
-    pub class: BindTableClass,
-    pub stage: crate::runtime::decode::render::Stage,
-    /// The guest's own slot index, so it reads against [`BindTableClass::table`].
-    pub index: u32,
-    /// The object bound there. Never zero — see [`first_bind_past_table`].
-    pub resource_ref: u32,
-}
-
-impl PastTableBind {
-    pub fn stage_name(&self) -> &'static str {
-        match self.stage {
-            crate::runtime::decode::render::Stage::Vertex => "vertex",
-            crate::runtime::decode::render::Stage::Fragment => "fragment",
-            crate::runtime::decode::render::Stage::Unknown => "unknown",
-        }
-    }
-}
+pub use reims_vgpu_vulkan::preparation::PastTableBind;
 
 /// The first live bind in `req` that names a slot past its class's table, if any.
 ///
@@ -243,7 +193,7 @@ impl PastTableBind {
 /// wrong is a host failure that takes the process down, and because the check
 /// that once stood at each consumer had already drifted.
 pub fn first_bind_past_table(req: &DrawEncodeRequest) -> Option<PastTableBind> {
-    use crate::runtime::decode::render::Stage;
+    use reims_vgpu_vulkan::preparation::ShaderStage as Stage;
 
     let buffers = [
         (Stage::Vertex, &req.vertex_buffers),
@@ -1289,45 +1239,7 @@ impl EncodeStatus {
 ///
 /// The type keeps eleven distinct checks visible rather than collapsing an
 /// indexed-draw failure into one uninformative backend error.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IndexLoadReason {
-    TypeUnsupported,
-    CountOverflow,
-    CountZero,
-    EntryMissing,
-    ObjectType,
-    DescRead,
-    DescDecode,
-    BackingMissing,
-    OffsetOverflow,
-    OutOfBounds,
-    ReadFail,
-    /// The guest's `baseVertex` does not fit Vulkan's signed 32-bit
-    /// `vertexOffset`. Metal's is 64-bit, so this is a real narrowing rather
-    /// than an impossible one — but no guest can currently produce it, because
-    /// Apple's serializer truncates `baseVertex` to 16 bits in the compact
-    /// records. A firing here means a wide record carried something enormous.
-    BaseVertexOutOfRange,
-}
-
-impl crate::observe::Decline for IndexLoadReason {
-    fn slug(&self) -> &'static str {
-        match self {
-            Self::TypeUnsupported => "draw_index_type_unsupported",
-            Self::CountOverflow => "draw_index_count_overflow",
-            Self::CountZero => "draw_index_count_zero",
-            Self::EntryMissing => crate::observe::ladder_slug!("draw_index", no_list_entry),
-            Self::ObjectType => crate::observe::ladder_slug!("draw_index", wrong_type),
-            Self::DescRead => crate::observe::ladder_slug!("draw_index", desc_read),
-            Self::DescDecode => crate::observe::ladder_slug!("draw_index", desc_decode),
-            Self::BackingMissing => "draw_index_backing_missing",
-            Self::OffsetOverflow => "draw_index_offset_overflow",
-            Self::OutOfBounds => "draw_index_out_of_bounds",
-            Self::ReadFail => "draw_index_read_fail",
-            Self::BaseVertexOutOfRange => "draw_index_base_vertex_out_of_range",
-        }
-    }
-}
+pub use reims_vgpu_vulkan::preparation::IndexLoadReason;
 
 /// Load the render pipeline a draw named, or say why it could not be loaded.
 ///

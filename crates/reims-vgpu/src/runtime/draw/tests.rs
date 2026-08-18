@@ -1946,7 +1946,11 @@ fn a_live_bind_past_its_table_is_reported_and_a_cleared_one_is_not() {
             first_bind_past_table(&req),
             Some(PastTableBind {
                 class,
-                stage,
+                stage: match stage {
+                    Stage::Vertex => reims_vgpu_vulkan::preparation::ShaderStage::Vertex,
+                    Stage::Fragment => reims_vgpu_vulkan::preparation::ShaderStage::Fragment,
+                    Stage::Unknown => reims_vgpu_vulkan::preparation::ShaderStage::Unknown,
+                },
                 index,
                 resource_ref,
             }),

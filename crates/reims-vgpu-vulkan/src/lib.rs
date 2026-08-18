@@ -14,6 +14,7 @@ pub mod host_pointer;
 pub mod m2v_cache;
 pub mod memory;
 pub mod policy;
+pub mod preparation;
 pub mod push_descriptor;
 pub mod spirv_bind;
 pub mod spirv_layout;

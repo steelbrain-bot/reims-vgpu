@@ -57,19 +57,7 @@ struct ThrashState {
 /// The reasons are still reported through [`note_secondary_mrt_drop`] as well
 /// as carried in the refusal, because the census answers a question the decline
 /// cannot: which check bails, at what geometry, across a whole boot.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MrtDrop {
-    /// The requested slots are not a contiguous run from 0.
-    NonContiguousSlot,
-    /// A secondary attachment's geometry differs from the primary's.
-    GeometryMismatch,
-    /// The secondary's pixel format has no known engine mapping.
-    UnknownFormat,
-    /// The secondary target has no resident identity to render into.
-    NoIdentity,
-    /// The secondary resolves to the primary's own resident.
-    AliasesPrimary,
-}
+pub use reims_vgpu_vulkan::preparation::MrtDrop;
 
 /// Which secondary colour attachment this device could not build, and why.
 ///
@@ -77,38 +65,7 @@ pub enum MrtDrop {
 /// together from the producer to the refusal that names them, and the slot is
 /// the field a reader needs first: `mrt_drop_geometry_mismatch` says what
 /// failed and `slot=1` says which attachment of the guest's list it was.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SecondaryMrtRefusal {
-    /// The Metal colour-attachment slot the guest named for this attachment.
-    pub slot: u32,
-    /// Which build check refused it.
-    pub reason: MrtDrop,
-}
-
-impl crate::observe::Decline for MrtDrop {
-    fn slug(&self) -> &'static str {
-        match self {
-            Self::NonContiguousSlot => "mrt_drop_non_contiguous_slot",
-            Self::GeometryMismatch => "mrt_drop_geometry_mismatch",
-            Self::UnknownFormat => "mrt_drop_unknown_format",
-            Self::NoIdentity => "mrt_drop_no_identity",
-            Self::AliasesPrimary => "mrt_drop_aliases_primary",
-        }
-    }
-}
-
-impl MrtDrop {
-    /// Compact stable code for the dedup key.
-    fn code(self) -> u8 {
-        match self {
-            Self::NonContiguousSlot => 1,
-            Self::GeometryMismatch => 2,
-            Self::UnknownFormat => 3,
-            Self::NoIdentity => 4,
-            Self::AliasesPrimary => 5,
-        }
-    }
-}
+pub use reims_vgpu_vulkan::preparation::SecondaryMrtRefusal;
 
 impl ThrashState {
     const fn new() -> Self {
