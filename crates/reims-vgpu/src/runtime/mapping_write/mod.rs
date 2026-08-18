@@ -1308,7 +1308,6 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     // Land any older device frame before this write replaces the mapping.
     crate::runtime::writeback_debt::settle_for_mapping(
         state,
-        host,
         mapping_id,
         crate::runtime::render_writeback::SettleSite::MappingBgra8Write,
     );
@@ -1657,7 +1656,6 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     // flushing here.
     crate::runtime::writeback_debt::settle_for_mapping(
         state,
-        host,
         mapping_id,
         crate::runtime::render_writeback::SettleSite::MappingRgba8Write,
     );
@@ -1858,7 +1856,6 @@ pub fn write_raw_rows<M: HostMemory + HostOps>(
     // resolves its window only later and is off the hot compute path).
     crate::runtime::writeback_debt::settle_for_mapping(
         state,
-        host,
         mapping_id,
         crate::runtime::render_writeback::SettleSite::MappingRawRowsWrite,
     );
@@ -1945,7 +1942,6 @@ pub fn read_raw_rows<M: HostMemory + HostOps>(
     // resolves its window only later and is off the hot compute path).
     crate::runtime::writeback_debt::settle_for_mapping(
         state,
-        host,
         mapping_id,
         crate::runtime::render_writeback::SettleSite::MappingRawRowsRead,
     );
@@ -2125,7 +2121,6 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
     let settle_started = std::time::Instant::now();
     crate::runtime::writeback_debt::settle_for_mapping(
         state,
-        host,
         mapping_id,
         crate::runtime::render_writeback::SettleSite::MappingRectRead,
     );
@@ -2474,7 +2469,6 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
     let settle_started = std::time::Instant::now();
     crate::runtime::writeback_debt::settle_for_mapping(
         state,
-        host,
         mapping_id,
         crate::runtime::render_writeback::SettleSite::MappingRectWrite,
     );

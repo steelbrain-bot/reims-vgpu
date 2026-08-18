@@ -169,16 +169,10 @@ pub fn apply(
                     task_id,
                     texture_ref: object_id,
                 });
-        let owed_surface = targets
-            .iter()
-            .any(|id| state.pending_writebacks.get(id).is_some());
-        if owed_gva || owed_surface {
+        if owed_gva {
             crate::observe::Emit::decline(
                 "validity_guest_read",
-                &GuestReadDecline::FrameStillOwed {
-                    gva: owed_gva,
-                    surface: owed_surface,
-                },
+                &GuestReadDecline::GvaFrameStillOwed,
             )
             .field("task", task_id)
             .field("object", object_id)
@@ -197,27 +191,19 @@ pub fn apply(
 /// delivering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GuestReadDecline {
-    /// A writeback is still owed to the pages the guest is about to read.
-    ///
-    /// Which ledger owes it is carried rather than collapsed: a GVA plane and a
-    /// surface are delivered by different rails, so a firing that named neither
-    /// would not say which one to go and look at.
-    FrameStillOwed { gva: bool, surface: bool },
+    /// A GVA writeback is still owed to the transfer backing the guest will read.
+    GvaFrameStillOwed,
 }
 
 impl crate::observe::Decline for GuestReadDecline {
     fn slug(&self) -> &'static str {
         match self {
-            Self::FrameStillOwed { .. } => "validity_guest_read_frame_owed",
+            Self::GvaFrameStillOwed => "validity_guest_read_gva_frame_owed",
         }
     }
 
     fn fields(&self) -> Vec<(&'static str, String)> {
-        let Self::FrameStillOwed { gva, surface } = self;
-        vec![
-            ("gva_owed", gva.to_string()),
-            ("surface_owed", surface.to_string()),
-        ]
+        Vec::new()
     }
 }
 

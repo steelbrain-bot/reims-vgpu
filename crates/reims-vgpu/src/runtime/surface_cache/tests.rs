@@ -245,13 +245,7 @@ fn every_host_cache_producer_draws_from_one_generation_source() {
     );
     store_gva_owned(&mut st, 0x5000, 4, 4, px, 0, None, true);
     seen.insert(get_gva_with_gen(&st, 0x5000, 4, 4).expect("gva store").1);
-    assert!(
-        cede_surface_to_resident(&mut st, 7, 4, 4),
-        "cession is a state change and must take a generation too"
-    );
-    seen.insert(st.host_surfaces.get(&7).expect("ceded entry").host_gen);
-
-    assert_eq!(seen.len(), 4, "four stores, four distinct generations");
+    assert_eq!(seen.len(), 3, "three stores, three distinct generations");
     assert!(
         !seen.contains(&0),
         "0 is reserved for 'no host content yet'"
@@ -702,90 +696,6 @@ fn host_surface_cache_hit_validates_geom_and_truncates_to_need() {
         get_from_with_gen(&map, &id, w, h),
         None,
         "under-`need` bytes must not be served",
-    );
-}
-
-/// Ceding a mapping to its resident must stop the cache answering for it —
-/// with a miss, never with the frame the Store superseded.
-///
-/// The whole point of the `skip_readback` rail is that no CPU copy of the new
-/// frame exists, so anything still serving the *old* one is serving a frame
-/// that is now a layer behind. `capture_present_frame` reads
-/// `surface_cache::get` **before** it tries the resident, so a cession that
-/// left the bytes in place would pin the display to the pre-Store frame for as
-/// long as the rail stayed engaged, with nothing to report it.
-///
-/// The restore direction is asserted too: the flush writes through
-/// `mapping_write::write_bgra8`, whose tail republishes this entry, and that
-/// is what ends the cession. A cession that could not be ended would leave the
-/// mapping permanently dependent on a resident that only a pin protects.
-#[test]
-fn a_ceded_surface_serves_a_miss_and_says_it_was_ceded() {
-    use crate::model::{DeviceId, PAGE_SHIFT_X86};
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    let (w, h) = (4u32, 4u32);
-    let need = (w * h * 4) as usize;
-    store(&mut state, 7, w, h, vec![0xA1u8; need]);
-    let before = state.host_surfaces.get(&7).map(|e| e.host_gen).unwrap();
-
-    assert!(cede_surface_to_resident(&mut state, 7, w, h));
-    assert_eq!(
-        get(&state, 7, w, h),
-        None,
-        "a ceded entry must not serve the frame the Store superseded"
-    );
-    assert!(
-        get_shared(&state, 7, w, h).is_none(),
-        "the shared handle must miss wherever the slice does"
-    );
-    assert!(surface_ceded_to_resident(&state, 7, w, h));
-    assert!(
-        state.host_surfaces.get(&7).unwrap().host_gen != before,
-        "the cession is a state change and must advance host_gen"
-    );
-
-    // A geometry this cache would not have stored anyway is refused, so the
-    // arm can fail closed rather than leave a live entry contradicting a
-    // resident-authoritative window.
-    assert!(!cede_surface_to_resident(&mut state, 0, w, h));
-    assert!(!cede_surface_to_resident(&mut state, 7, 0, h));
-    assert!(!cede_surface_to_resident(
-        &mut state,
-        7,
-        w,
-        crate::model::MAX_SCANOUT_DIM + 1
-    ));
-
-    // The flush's republish ends it.
-    store(&mut state, 7, w, h, vec![0xB2u8; need]);
-    assert!(!surface_ceded_to_resident(&state, 7, w, h));
-    assert_eq!(get(&state, 7, w, h).map(|b| b[0]), Some(0xB2));
-}
-
-/// A ceded entry is not the same thing as a stale-geometry one, and the
-/// classifier must not confuse them.
-///
-/// Both make `get` miss, and folding them together would print
-/// `have=4x4` against `want=4x4` on the LOAD-seed decline — a line that reads
-/// as a contradiction rather than as the expected cost of the rail.
-#[test]
-fn cession_is_distinguishable_from_a_stale_geometry_entry() {
-    use crate::model::{DeviceId, PAGE_SHIFT_X86};
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    store(&mut state, 7, 8, 8, vec![0xA1u8; 8 * 8 * 4]);
-    assert!(
-        !surface_ceded_to_resident(&state, 7, 4, 4),
-        "an entry at another geometry is stale, not ceded"
-    );
-    assert!(
-        !surface_ceded_to_resident(&state, 9, 4, 4),
-        "an absent entry is absent, not ceded"
-    );
-    assert!(cede_surface_to_resident(&mut state, 7, 4, 4));
-    assert!(surface_ceded_to_resident(&state, 7, 4, 4));
-    assert!(
-        !surface_ceded_to_resident(&state, 7, 8, 8),
-        "the cession is scoped to the geometry it was taken at"
     );
 }
 

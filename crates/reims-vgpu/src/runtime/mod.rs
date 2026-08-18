@@ -123,7 +123,7 @@ pub mod surface_cache;
 pub mod task_slot;
 /// Texture / type-11 geometry registration.
 pub mod texture;
-/// Track host-authoritative surface and GVA frames, and transfer them on demand.
+/// Track host-authoritative GVA resources and transfer them on demand.
 pub mod writeback_debt;
 
 /// The unit-test host double, gated with its definition. An ungated re-export

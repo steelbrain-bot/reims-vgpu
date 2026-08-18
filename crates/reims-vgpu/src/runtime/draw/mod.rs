@@ -1653,25 +1653,6 @@ fn resolve_buffer_backing<M: HostMemory>(
 /// pre-Store frame. The rail above it settled at a fork two calls up
 /// ([`seed_color_load`]) and the other three callers settled nowhere.
 ///
-/// # Settling is half the obligation and this arm carried only that half
-///
-/// Four rails in this crate read a resource's raw guest bytes on the CPU, and
-/// each owes the same three terms before it may believe them: the
-/// `note_unnamed_reach` census, a payment of whatever the reference names, and
-/// the disjointness-narrowed settle. Three of them — the linear sampled read,
-/// its memoized twin, and the texture-view read — spell all three. This one
-/// spelled the settle alone. All four go through
-/// [`crate::runtime::writeback_debt::settle_for_texture`] now, so there is one
-/// copy of the rule rather than four.
-///
-/// The difference is not academic. A settle waits for writes this device has
-/// already **submitted**; a writeback debt is a frame it rendered and
-/// deliberately did **not** submit, so there is nothing on any queue for the
-/// settle to find and it returns immediately with the owed frame still sitting
-/// in a host resident. The guest's own bytes are then one Store behind, and the
-/// bind that reads them is a sampled texture — an icon, a glyph atlas, a blurred
-/// backdrop — which is the shape this failure takes on screen.
-///
 /// `buffer_ref` is threaded down for exactly this: the payment is by name, and
 /// the name is the buffer whose bytes are about to be read.
 /// [`load_buffer_texture_rgba`] pays for its texture reference as well, because a

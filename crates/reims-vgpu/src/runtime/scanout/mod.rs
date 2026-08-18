@@ -965,17 +965,13 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
         false
     };
 
-    // Deferred-writeback flush-on-access: scanout reads guest pages through a
-    // raw contig view below, which bypasses the hooked readers — land any
-    // resident-authoritative window (compute or render Store) first.
-    //
     // The wait narrows to this mapping's own pages, which `settle_for_mapping`
     // does for every caller now. Here it costs no walk at all: `page_entries`
-    // already *is* the page list, and the writeback rail that lands in them
-    // built its own destination from the same field. A mapping with no page
+    // already *is* the page list, and writers use the same field to build their
+    // destination. A mapping with no page
     // list, or one holding an entry that names no backing, cannot be ruled out
     // and settles.
-    crate::runtime::writeback_debt::settle_for_mapping(state, host, mapping_id, site);
+    crate::runtime::writeback_debt::settle_for_mapping(state, mapping_id, site);
 
     let Some(m) = state.mappings.get(&mapping_id) else {
         return fail(CaptureDecline::NoMapping);

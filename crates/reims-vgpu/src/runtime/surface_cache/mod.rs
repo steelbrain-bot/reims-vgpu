@@ -193,8 +193,8 @@ pub fn get(state: &DeviceState, surface_id: u32, width: u32, height: u32) -> Opt
 /// [`get_shared`], plus the generation that names these exact bytes.
 ///
 /// The generation is the entry's `host_gen`, and it is a sampled-content
-/// identity rather than provenance: every writer of this map — [`store_into`],
-/// [`store_rows`] and [`cede_surface_to_resident`] — takes a fresh
+/// identity rather than provenance: every writer of this map — [`store_into`]
+/// and [`store_rows`] — takes a fresh
 /// [`DeviceState::next_sampled_content_generation`] in the same breath as it
 /// changes the bytes, and [`forget`] removes the entry outright. So a repeated
 /// `(surface_id, generation)` pair is a statement that the bytes have not moved,
@@ -219,78 +219,9 @@ pub fn get_shared_with_gen(
     Some((get_shared(state, surface_id, width, height)?, host_gen))
 }
 
-/// Cede this mapping's cached frame to the engine resident a deferred type-11
-/// render Store just pinned: the entry keeps its geometry and its `host_gen`
-/// lineage, and holds no bytes.
-///
-/// The emptiness **is** the cession, and [`get_from`]'s `bgra.is_empty()` gate is
-/// what enforces it — so every reader that goes through [`get`] or [`get_shared`]
-/// misses and falls through to the source that does hold the frame:
-/// [`crate::runtime::scanout::capture_present_frame`] to
-/// `try_capture_from_resident`, and the type-11 LOAD seed to the surface's own
-/// guest pages, which lands this window first. Nothing has to be taught about a
-/// new state.
-///
-/// Retaining the stale bytes as a fallback would be worse than missing. A Store
-/// that skipped its readback has already superseded them, and a consumer served
-/// the previous frame renders a whole compositing layer one frame behind with no
-/// report — which is the class `deferred_flush_lost reason=cache_miss` cost 15
-/// layers in one boot to close.
-///
-/// Returns false for a geometry this cache would not have stored anyway, so the
-/// caller can refuse to arm rather than leave a live entry contradicting a
-/// resident-authoritative window.
-pub fn cede_surface_to_resident(
-    state: &mut DeviceState,
-    surface_id: u32,
-    width: u32,
-    height: u32,
-) -> bool {
-    if surface_id == 0 || !scanout_extent_ok(width, height) {
-        return false;
-    }
-    let generation = state.next_sampled_content_generation();
-    let entry = state.host_surfaces.entry(surface_id).or_default();
-    entry.host_gen = generation;
-    entry.width = width;
-    entry.height = height;
-    entry.bgra = std::sync::Arc::new(Vec::new());
-    true
-}
-
 /// Drop this mapping's cache entry outright.
-///
-/// Distinct from [`cede_surface_to_resident`], and the difference is which
-/// source the reader is being sent to. A cession says "the engine resident holds
-/// this frame"; this says "nothing host-side does — read the surface's own
-/// pages". It is what a writeback that deliberately left some of the guest's own
-/// bytes in place has to do, because after one of those neither the cache nor the
-/// resident holds the mapping's content: they hold the frame the device rendered,
-/// and the pages hold that frame with the guest's stores still in it.
-///
-/// Removes rather than emptying, so [`surface_ceded_to_resident`] does not read
-/// the result as a cession and report a decline that names the wrong source.
 pub fn forget(state: &mut DeviceState, surface_id: u32) {
     state.host_surfaces.remove(&surface_id);
-}
-
-/// Whether this mapping's cache entry is the ceded shell
-/// [`cede_surface_to_resident`] leaves behind: present at exactly this geometry
-/// and carrying no bytes.
-///
-/// Read by the type-11 LOAD seed's decline classifier so a ceded entry is named
-/// as such instead of being reported as a stale-geometry hit — `get`'s miss is
-/// the same either way, and the two have different fixes.
-pub fn surface_ceded_to_resident(
-    state: &DeviceState,
-    surface_id: u32,
-    width: u32,
-    height: u32,
-) -> bool {
-    state
-        .host_surfaces
-        .get(&surface_id)
-        .is_some_and(|e| e.bgra.is_empty() && e.width == width && e.height == height)
 }
 
 /// [`get`] as a shared handle, for a caller that needs to own the frame past the

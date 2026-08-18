@@ -2350,7 +2350,6 @@ pub fn write_mapping_bytes_only<H: HostMemory + HostOps>(
     // in these pages first so this write applies on top of it, not under it.
     crate::runtime::writeback_debt::settle_for_mapping(
         state,
-        host,
         mapping_id,
         crate::runtime::render_writeback::SettleSite::MappingBytesWrite,
     );
@@ -2426,7 +2425,6 @@ pub fn read_mapping_bytes<H: HostMemory + HostOps>(
     // named with, so both ends of the comparison are one rule.
     crate::runtime::writeback_debt::settle_for_mapping(
         state,
-        host,
         mapping_id,
         crate::runtime::render_writeback::SettleSite::MappingBytesRead,
     );
@@ -2468,7 +2466,6 @@ pub(crate) fn read_mapping_rect<H: HostMemory + HostOps>(
     // map-empty check.
     crate::runtime::writeback_debt::settle_for_mapping(
         state,
-        host,
         mapping_id,
         crate::runtime::render_writeback::SettleSite::MappingBytesRead,
     );

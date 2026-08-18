@@ -9,9 +9,8 @@
 //!
 //! # A resource owns its transfer backing
 //!
-//! Type-11 debts carry a mapping id, geometry, and map generation. GVA debts
-//! carry the task-local texture reference, GVA declaration, geometry, format,
-//! and resource generation. The live GVA resource separately retains the
+//! Debts carry the task-local texture reference, GVA declaration, geometry,
+//! format, and resource generation. The live GVA resource separately retains the
 //! ordered physical pages of its transfer backing. Ordinary task unmap changes
 //! virtual-address bookkeeping but does not retarget that resource. Explicit
 //! discard drops the transfer backing, and the next prepare or synchronize
@@ -24,18 +23,15 @@
 //!
 //! # Validity transitions decide direction
 //!
-//! A GPU Store makes the host image authoritative. A later guest
-//! `clear_host_valid` makes the guest copy newer; payment then abandons the host
-//! image rather than overwriting the guest's work. Surface resources use
-//! `ResourceValidity`'s ordered sequence. Task-GVA resources use the validity
-//! generation keyed by `(task, texture_ref)`, including the case where that
-//! integer collides with an unrelated mapping id.
+//! A GPU Store makes the host image authoritative. A later guest write makes
+//! the transfer backing newer; payment then abandons the host image rather than
+//! overwriting the guest's work. Task-GVA resources use the validity generation
+//! keyed by `(task, texture_ref)`.
 //!
 //! A named synchronize pays only its object list through
-//! [`submit_for_resources`]. Readers that know a mapping or texture call
-//! [`pay_for_mapping`] or [`pay_for_texture`]. Only a genuinely unnameable
-//! aliasing reader uses [`pay_all`]. Completion stamps alone do not publish
-//! resources.
+//! [`submit_for_resources`]. Readers that know a texture call
+//! [`pay_for_texture`]. Only a genuinely unnameable reader uses [`pay_all`].
+//! Completion stamps alone do not publish resources.
 //!
 //! The engine's `gpu_only_content` flag keeps an unpaid image alive. A
 //! successful payment calls `note_resident_content_copied_out`; replacement,
@@ -44,114 +40,6 @@
 //!
 use crate::model::DeviceState;
 use crate::runtime::host::{HostMemory, HostOps};
-
-/// The engine identity of the resident a debt's frame lives in.
-///
-/// This module is compiled on every backend arm and the ledger is backend-
-/// agnostic, but the identity of a resident is not: only the Vulkan engine has
-/// one. An alias rather than a `cfg` on the field, so [`WritebackDebt`] and
-/// [`PendingWritebacks::arm`] have **one** shape on every arm — two shapes is
-/// how a struct starts disagreeing with itself across a feature boundary, and
-/// nothing in the toolchain compares them.
-///
-/// Nothing arms a surface debt on a Metal build: the sole caller is
-/// `runtime::draw::vulkan`. The placeholder is what lets the ledger's own tests
-/// compile there anyway.
-#[cfg(feature = "backend-vulkan")]
-pub type ResidentIdentity = crate::backend::vulkan::engine::TargetIdentity;
-
-/// See the Vulkan spelling above. A named zero-sized type rather than `()`,
-/// because `()` as an argument is a clippy lint at every call site and a reader
-/// cannot tell a deliberate placeholder from a function that forgot to return.
-#[cfg(not(feature = "backend-vulkan"))]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NoResidentIdentity;
-
-/// See [`NoResidentIdentity`].
-#[cfg(not(feature = "backend-vulkan"))]
-pub type ResidentIdentity = NoResidentIdentity;
-
-/// A synthetic resident identity, for tests that arm a debt without a device.
-///
-/// Here rather than in each test module because it is the one place that knows
-/// which arm [`ResidentIdentity`] is on — two spellings of it would be a
-/// divergence across a feature boundary, which is the thing the alias exists to
-/// prevent.
-#[cfg(test)]
-#[cfg(feature = "backend-vulkan")]
-pub(crate) fn test_resident_identity(
-    id: u32,
-    width: u32,
-    height: u32,
-    generation: u64,
-) -> ResidentIdentity {
-    crate::backend::vulkan::engine::TargetIdentity::Surface {
-        id,
-        width,
-        height,
-        generation,
-        format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
-    }
-}
-
-/// The placeholder arm: every identity is the same value, which is exactly true
-/// — a Metal build arms no surface debt at all.
-#[cfg(test)]
-#[cfg(not(feature = "backend-vulkan"))]
-pub(crate) fn test_resident_identity(
-    _id: u32,
-    _width: u32,
-    _height: u32,
-    _generation: u64,
-) -> ResidentIdentity {
-    NoResidentIdentity
-}
-
-/// A frame owed to one type-11 mapping's guest pages.
-///
-/// Values only, and no memory. See the module doc: the rail this replaces held
-/// resolved host pointers and corrupted the guest's page tables with them. A
-/// [`crate::backend::vulkan::engine::TargetIdentity`] is `Copy` and every field
-/// of it is a scalar the protocol handed over, so holding one keeps that rule.
-///
-/// `Clone` and not `Copy`, which the identity's own doc explains: it is a value
-/// either way, and the debt is moved out of the ledger by `take` rather than
-/// copied out of it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WritebackDebt {
-    /// The resident the frame is *in*.
-    ///
-    /// Carried rather than re-derived, and that is the whole of a defect that
-    /// lost every Apple Maps frame on the rail a discrete host has no
-    /// alternative to. `pay` used to rebuild the identity from
-    /// `present_identity::surface_identity`, which reads the mapping's
-    /// generation *now*; the arm site already holds the identity the draw
-    /// registered its resident under — it stamps that identity's content epoch
-    /// one statement earlier — and the two are not the same key when the
-    /// mapping's generation moved between the draw and the Store. A driven boot
-    /// of the copied-resident route read
-    /// `read_target_unknown_identity diverges=generation asked_gen=N held_gen=N-1`
-    /// on three of four mappings, and the frame was refused with the resident
-    /// holding it sitting in the registry.
-    ///
-    /// [`Self::map_generation`] beside it is a different question and both are
-    /// needed: this says *which image the pixels are in*, that says *whether the
-    /// pages are still the ones they were promised to*.
-    pub identity: ResidentIdentity,
-    /// Geometry the Store was taken at, and the geometry the payment writes.
-    pub width: u32,
-    pub height: u32,
-    /// `MappingEntry::map_generation` at the arm.
-    ///
-    /// The payment refuses when the mapping's generation has moved since, so a
-    /// surface the guest has remapped is void rather than paid into pages that
-    /// now back something else. This is about the *destination*; see
-    /// [`Self::identity`] for the source, which used to be inferred from this
-    /// and cannot be.
-    pub map_generation: u32,
-    /// Arm order, for choosing which debt an over-full ledger pays first.
-    pub seq: u64,
-}
 
 /// The guest resource that owns one GVA render attachment.
 ///
@@ -241,15 +129,13 @@ struct GvaResourceState {
     pages: Option<std::sync::Arc<[u64]>>,
 }
 
-/// Every render resource whose current frame exists only in a host resident.
+/// Every GVA render resource whose current frame exists only in a host resident.
 ///
-/// Surface resources key by mapping id; GVA resources key by the plane of the
-/// task-local reference a pass rendered into — see [`GvaPlaneKey`] for why the
-/// plane and not the reference. In either representation, a second Store into
-/// the same thing replaces the first rather than queueing another frame.
+/// Resources key by the plane of the task-local reference a pass rendered into
+/// — see [`GvaPlaneKey`] for why the plane and not the reference. A second Store
+/// into the same plane replaces the first rather than queueing another frame.
 #[derive(Debug, Default)]
 pub struct PendingWritebacks {
-    debts: std::collections::BTreeMap<u32, WritebackDebt>,
     gva_debts: std::collections::BTreeMap<GvaPlaneKey, GvaWritebackDebt>,
     gva_resources: std::collections::BTreeMap<GvaPlaneKey, GvaResourceState>,
     next_seq: u64,
@@ -259,62 +145,13 @@ pub struct PendingWritebacks {
 impl PendingWritebacks {
     /// Mappings currently owed a frame.
     pub fn len(&self) -> usize {
-        self.debts.len() + self.gva_debts.len()
+        self.gva_debts.len()
     }
 
     /// Whether anything is owed at all — the check every reader makes, and the
     /// one that has to be free.
     pub fn is_empty(&self) -> bool {
-        self.debts.is_empty() && self.gva_debts.is_empty()
-    }
-
-    /// What `mapping_id` is owed, if anything.
-    pub fn get(&self, mapping_id: u32) -> Option<WritebackDebt> {
-        self.debts.get(&mapping_id).cloned()
-    }
-
-    /// Take `mapping_id`'s debt, leaving it owed nothing.
-    pub fn take(&mut self, mapping_id: u32) -> Option<WritebackDebt> {
-        self.debts.remove(&mapping_id)
-    }
-
-    /// Every mapping owed a frame, oldest arm first.
-    pub fn mappings_by_age(&self) -> Vec<u32> {
-        let mut all: Vec<(u64, u32)> = self.debts.iter().map(|(id, d)| (d.seq, *id)).collect();
-        all.sort_unstable();
-        all.into_iter().map(|(_, id)| id).collect()
-    }
-
-    /// Record that `mapping_id` is owed a frame.
-    ///
-    /// A mapping already owed a frame is *replaced*: the later frame is the
-    /// fresher answer and the earlier one has been superseded on the GPU
-    /// already. That replacement is the whole saving, so it is counted.
-    ///
-    pub fn arm(
-        &mut self,
-        mapping_id: u32,
-        identity: ResidentIdentity,
-        width: u32,
-        height: u32,
-        map_generation: u32,
-    ) {
-        let seq = self.next_seq;
-        self.next_seq = self.next_seq.wrapping_add(1);
-        let previous = self.debts.insert(
-            mapping_id,
-            WritebackDebt {
-                identity,
-                width,
-                height,
-                map_generation,
-                seq,
-            },
-        );
-        if previous.is_some() {
-            crate::runtime::drain::note_store_route("wbdebt_superseded");
-        }
-        crate::runtime::drain::note_store_route("wbdebt_armed");
+        self.gva_debts.is_empty()
     }
 
     /// Record a host-authoritative frame for one plane of a GVA resource.
@@ -371,10 +208,9 @@ impl PendingWritebacks {
     /// holding the old object's pixels, and the new declaration's image must not
     /// be that one.
     ///
-    /// The surface rail has always worked this way — [`Self::arm`] replaces a
-    /// debt and counts `wbdebt_superseded` — and this is the same rule spelled
-    /// for the resource half of the ledger. The caller owns releasing whatever
-    /// the old generation held; see [`gva_resource_generation`].
+    /// [`Self::arm_gva`] likewise replaces a plane's prior debt. The caller owns
+    /// releasing whatever the old generation held; see
+    /// [`gva_resource_generation`].
     pub fn ensure_gva_resource(
         &mut self,
         key: GvaResourceKey,
@@ -600,77 +436,10 @@ impl PendingWritebacks {
     }
 }
 
-/// Whether the lazy rail is on for this process.
-///
-/// Read once. The rail changes *when* a frame reaches guest pages, not what the
-/// bytes are, so a boot that flipped it midway would be two devices in one log.
-pub fn lazy_writeback_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        let (state, value) = crate::env::read(crate::env::LAZY_WRITEBACK);
-        // Only an explicit `off` narrows to the eager Store. Unset, `on` and an
-        // unrecognized value are all the shipping rail, which is what makes
-        // `Switch::Unrecognized` — an operator's typo — fail toward the measured
-        // default rather than silently selecting the arm it is 45 % slower on.
-        let on = !matches!(state, crate::env::Switch::Off);
-        crate::observe::off(format!(
-            "lazy_writeback on={on} switch={state:?} value={}",
-            value.unwrap_or_else(|| "<unset>".into())
-        ));
-        on
-    })
-}
-
-/// Pay `mapping_id`'s owed frame, if it owes one.
-///
-/// The one call a reader of a named mapping's guest bytes makes before it reads
-/// them. Free when nothing is owed — one `BTreeMap` emptiness check, which is
-/// the answer on nearly every call.
-pub fn pay_for_mapping<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    mapping_id: u32,
-) {
-    if state.pending_writebacks.is_empty() {
-        return;
-    }
-    let Some(debt) = state.pending_writebacks.take(mapping_id) else {
-        return;
-    };
-    pay(state, host, mapping_id, debt, "wbdebt_paid_named");
-}
-
-/// Pay every owed frame.
-///
-/// For a reader that cannot name the mapping it is about to read — a GVA span, a
-/// buffer, a page walk that may alias a surface. Aliasing across the id
-/// namespaces is real, so "cannot say" resolves to "owes all of them".
-///
-/// # Why the disjointness closures those readers already carry do not narrow it
-///
-/// The three GVA readers each build the exact page list they are about to touch,
-/// and hand it to
-/// [`crate::runtime::render_writeback::settle_guest_writes_unless_disjoint`] so a
-/// reader somewhere else entirely does not wait for a surface's writeback. That
-/// narrowing cannot be reused here, and the reason is the rail itself: the test
-/// runs only when a copy is **outstanding**, and an owed frame has not been
-/// submitted at all. With the lazy rail on, the common state is a clear debt
-/// flag and a full ledger, where the closure never runs.
-///
-/// Narrowing this would need a page-extent hint held per debt, and a hint is the
-/// beginning of holding resolved memory — which is what the module doc says this
-/// rail must not do. [`note_unnamed_reach`] is the instrument that says whether
-/// it would be worth it; read its doc before building one.
+/// Pay every owed GVA resource frame.
 pub fn pay_all<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M) {
     if state.pending_writebacks.is_empty() {
         return;
-    }
-    for mapping_id in state.pending_writebacks.mappings_by_age() {
-        let Some(debt) = state.pending_writebacks.take(mapping_id) else {
-            continue;
-        };
-        pay(state, host, mapping_id, debt, "wbdebt_paid_all");
     }
     for plane in state.pending_writebacks.gvas_by_age() {
         let Some(debt) = state.pending_writebacks.take_gva_plane(plane) else {
@@ -680,110 +449,7 @@ pub fn pay_all<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M) {
     }
 }
 
-/// One call in [`REACH_SAMPLE`] does the walk; the rest cost one modulo.
-///
-/// The walk is ~2 000 page-table descents for a 1080p span and the site that
-/// dominates [`pay_all`] runs about 1 700 times a second, so measuring every call
-/// would cost more than the rail saves and would be measuring the instrument.
-/// A census wants a rate and not a total, and a rate converges on a 1-in-64
-/// sample of a population this size: ~26 walks a second against ~1 700 calls.
-const REACH_SAMPLE: u64 = 64;
-
-/// Calls to [`note_unnamed_reach`], for the sample.
-static REACH_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Does an unnameable reader that pays every debt actually read the pages it is
-/// paying for?
-///
-/// # The question, and why it decides the rail's ceiling
-///
-/// The premise the lazy rail was built on read the settle census wrong. Those
-/// counters count settles that **waited**, and on a driven macos-13
-/// sustained-animation boot they total six a second — which is what "840 writes
-/// consumed six times" was derived from. The *calls* are a different population:
-/// `draw::vulkan::load_linear_guest_memoized` alone reaches its settle about
-/// 1 700 times a second, reads the guest pages every one of them, and cannot name
-/// a mapping, so it pays every owed frame. That is why the first driven on-arm
-/// boot coalesced 130 Stores of 577 rather than the ~95 % the premise predicted.
-///
-/// But paying is only *owed* where the read and the surface share pages. A
-/// compositor sampling a glyph atlas while three windows owe frames pays three
-/// copies it will not look at. This counts which it is:
-///
-/// * `wbdebt_reach_overlap` — the sampled read touched a page some debt's
-///   mapping holds. The payment was owed and no narrowing can remove it.
-/// * `wbdebt_reach_disjoint` — it did not. The payment was pure waste, and the
-///   ratio of these two is the prize a page-extent hint per debt would collect.
-/// * `wbdebt_reach_unnamed` — the reader's own walk came back short, so nothing
-///   could be ruled out. A narrowing must treat this as overlap.
-///
-/// `pages` is the reader's own closure, the same one it hands the disjointness
-/// test, so both ends of the comparison stay one rule. It runs only on a sampled
-/// call and only while something is owed.
-/// Private, and that is the half of the repair a reader is most likely to undo.
-/// The census is one of three terms a raw-GVA reader owes and it is worthless on
-/// its own — it reports what the naming missed, so a site that censuses without
-/// paying has measured its own omission and done nothing about it.
-/// [`settle_for_texture`] is the only way to it, and that one spells all three.
-fn note_unnamed_reach(state: &DeviceState, pages: impl FnOnce() -> Option<Vec<u64>>) {
-    if state.pending_writebacks.is_empty() {
-        return;
-    }
-    let n = REACH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if !n.is_multiple_of(REACH_SAMPLE) {
-        return;
-    }
-    let Some(read) = pages() else {
-        crate::runtime::drain::note_store_route("wbdebt_reach_unnamed");
-        return;
-    };
-    let read: std::collections::BTreeSet<u64> = read.into_iter().collect();
-    let overlap = state
-        .pending_writebacks
-        .mappings_by_age()
-        .into_iter()
-        .any(|mapping_id| {
-            state
-                .mapping_reach_pages(mapping_id)
-                .is_some_and(|owed| owed.iter().any(|page| read.contains(page)))
-        });
-    match overlap {
-        true => crate::runtime::drain::note_store_route("wbdebt_reach_overlap"),
-        false => crate::runtime::drain::note_store_route("wbdebt_reach_disjoint"),
-    }
-}
-
-/// Pay whatever a *texture* reference names, for a reader that reaches guest
-/// bytes through a task GVA but knows which resource it is reading.
-///
-/// # Why a GVA reader is nameable after all, and what that measured
-///
-/// The three linear readers walk raw task GVAs, so the first cut of this rail
-/// had them pay every owed frame. [`note_unnamed_reach`] priced that: **173
-/// sampled payments over one driven macos-13 sustained-animation boot, 173
-/// disjoint from every owed surface and not one overlap**, at a 1-in-64 sample
-/// of ~11 000 payments. Meanwhile `wbdebt_paid_all` was 20 391 against
-/// `wbdebt_paid_named` 755, so 96 % of all payments were the ones that read
-/// nothing they paid for, and they cost `sampled_us` 1.64 → 8.49 us a chain.
-///
-/// They are nameable because the guest names them. A debt is keyed by mapping
-/// id, and this device holds two ways from a texture reference to one:
-/// `DeviceState::texture_to_mapping` for the per-task registration, and the id
-/// itself where the guest uses one namespace for both.
-/// [`crate::runtime::resource_validity::apply`] resolves a validity statement
-/// through exactly this pair, so both now go through the one resolver that owns
-/// it, [`crate::model::DeviceState::mappings_named_by`] — this used to be the
-/// same question asked of the same two tables in two different spellings, and
-/// the divergence is in that method's doc.
-///
-/// A reference that resolves to neither names no mapping this device holds, so
-/// no debt can be about it. That is a statement about the registries and not
-/// about a workload — but it is not a statement about raw *page* aliasing, where
-/// a surface's pages are re-used as some other resource's backing with no
-/// mapping entry. [`note_unnamed_reach`] stays wired at these sites as the
-/// standing alarm for exactly that: it samples the read's own page walk against
-/// every owed surface's pages, and `wbdebt_reach_overlap` above zero is a
-/// payment this naming skipped and should not have.
+/// Pay every plane owed by one task-local GVA resource.
 pub fn pay_for_texture<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -797,56 +463,10 @@ pub fn pay_for_texture<M: HostMemory + HostOps>(
         task_id,
         texture_ref,
     };
-    let mut named = false;
     // Every plane the reference owes, not the one that sorts first: a sampled
     // read names the resource, and a mip pyramid's levels are separate debts.
     for (plane, debt) in state.pending_writebacks.take_gva(gva_key) {
-        named = true;
         let _ = pay_gva(state, host, plane, debt, GvaPaySite::Named);
-    }
-    // Both surface spellings, from the one resolver `resource_validity::apply`
-    // uses: a reference that is itself a mapping id, and the per-task
-    // registration. Paying one leaves the ledger holding the other, so asking
-    // for each costs a map lookup and cannot pay the wrong surface.
-    let targets = state.mappings_named_by(task_id, texture_ref);
-    for mapping_id in targets.iter() {
-        if state.pending_writebacks.get(mapping_id).is_some() {
-            named = true;
-            pay_for_mapping(state, host, mapping_id);
-        }
-    }
-    if !named {
-        // "Nothing was owed" is two opposite findings, and this counter reported
-        // them as one at 1.1 M a boot — the same volume as every sampled guest
-        // import, which is what made it read as a healthy zero.
-        //
-        // `_resolved` says the ledger genuinely holds no debt for a surface this
-        // reference does name. `_unresolved` says neither spelling named a live
-        // surface at all: `texture_ref` is not a mapping this device holds and
-        // `texture_to_mapping` names none either. A debt owed by the surface
-        // behind such a reference cannot be found, so that arm is "we did not
-        // look", not "there was nothing there" — and a sampled bind proceeding
-        // past it reads the guest's pages while the newest frame is still in a
-        // resident.
-        //
-        // The split asks [`DeviceState::names_live_mapping`], not whether the
-        // per-task registration answered. It used to ask the latter, which the
-        // reference-is-the-mapping-id spelling never populates, so the census
-        // read 100 % `_unresolved` on both arms of a driven macos-13 boot —
-        // 74 816/74 816 with the guest import on and 185 674/185 674 with it
-        // off. A split whose two arms cannot both be reached measures nothing,
-        // and this one was read as evidence that the naming never resolves.
-        //
-        // The split is emitted beside the total, so
-        // `_resolved + _unresolved == wbdebt_texture_owes_nothing` is checkable
-        // on the census itself.
-        crate::runtime::drain::note_store_route(
-            match state.names_live_mapping(task_id, texture_ref) {
-                true => "wbdebt_texture_owes_nothing_resolved",
-                false => "wbdebt_texture_owes_nothing_unresolved",
-            },
-        );
-        crate::runtime::drain::note_store_route("wbdebt_texture_owes_nothing");
     }
 }
 
@@ -1155,63 +775,16 @@ fn release_gva(debt: GvaWritebackDebt) {
     crate::backend::vulkan::engine::note_resident_content_copied_out(&gva_identity(debt));
 }
 
-/// Pay `mapping_id`'s owed frame and then wait for every submitted guest-page
-/// write **that can reach this mapping's pages** — the whole obligation of a
-/// host-side reader or writer of one named mapping's bytes, in one call.
+/// Wait only for submitted writes that can reach one mapping's pages.
 ///
-/// The two halves are one obligation and are spelled as one function so a new
-/// site cannot discharge half of it. A site that settles without paying reads
-/// the frame *before* the one the guest's own driver last asked for; a site that
-/// pays without settling reads the frame it just submitted and has not waited
-/// for. Both are stale pixels and neither shows up as a refusal.
-///
-/// # Naming a mapping is naming your reach
-///
-/// This used to wait on `settle_guest_writes`, which quiesces every outstanding
-/// guest write wherever it lands, and a disjointness-aware second spelling sat
-/// beside it for the two callers that had noticed. That split was the bug. A
-/// caller that can name the mapping it is about to touch has, by naming it,
-/// already said which pages it needs ordered; waiting for a writeback into some
-/// other surface is an ordering requirement it does not have. So there is one
-/// function again and the imprecise behaviour is unreachable rather than
-/// available.
-///
-/// It cost the largest single number this device has measured. A driven macos-13
-/// Maps leg took the quiesce on **2154 of 2154** `MappingRectWrite` calls for
-/// **17.02 s** — 79 % of the blit rail and 350x the next-largest settle site —
-/// while the payment beside it totalled 1.7 ms. The old doc here claimed "free
-/// when nothing is owed and nothing is outstanding, which is the answer on
-/// nearly every call"; on that site it was the answer on none of them.
-///
-/// The narrowing applies to the *wait* only, never the payment: an owed frame
-/// has not been submitted, so there is nothing outstanding for the test to find
-/// disjoint from, and a debt left unpaid here would be read straight past.
-///
-/// The page set is walked here rather than taken as a closure, and both of those
-/// are deliberate. Walked *here* because the payment needs `state` mutably and
-/// the disjointness test needs it shared, so a caller-supplied closure cannot
-/// hold `state` across both. [`DeviceState::mapping_reach_pages`] because that is
-/// the same function the writeback builds its own destination from, so the two
-/// ends of the comparison are one rule rather than two spellings of it. It stays
-/// lazy: `settle_guest_writes_unless_disjoint` runs the closure only when
-/// something is outstanding, and a mapping that cannot name its pages answers
-/// `None`, which waits.
-pub fn settle_for_mapping<M: HostMemory + HostOps>(
+/// The page set comes from [`DeviceState::mapping_reach_pages`], the same rule
+/// the write path uses for its destination. A mapping that cannot name its pages
+/// answers `None`, which conservatively waits.
+pub fn settle_for_mapping(
     state: &mut DeviceState,
-    host: &mut M,
     mapping_id: u32,
     site: crate::runtime::render_writeback::SettleSite,
 ) {
-    // Charged apart because subtracting the wait cannot tell them apart, and
-    // after the wait went away the remainder was still 4.9 s on a driven leg:
-    // that is either the payment doing work the quiesce used to have already
-    // landed, or the reach walk itself, and those want opposite repairs.
-    let pay_started = std::time::Instant::now();
-    pay_for_mapping(state, host, mapping_id);
-    crate::runtime::drain::note_store_route_us(
-        "wbdebt_pay_us",
-        pay_started.elapsed().as_micros() as u64,
-    );
     let reach_started = std::time::Instant::now();
     let s = &*state;
     crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(site, || {
@@ -1224,39 +797,8 @@ pub fn settle_for_mapping<M: HostMemory + HostOps>(
     );
 }
 
-/// [`settle_for_mapping`] for a reader that names a **resource** and walks a raw
-/// task GVA rather than a mapping — the whole obligation of a CPU read of one
-/// named resource's guest bytes, in one call.
-///
-/// # Why this exists, which is the same reason [`settle_for_mapping`] does
-///
-/// That function's doc says the payment and the wait "are one obligation and are
-/// spelled as one function so a new site cannot discharge half of it", and nine
-/// mapping-named sites go through it. The resource-named readers never got the
-/// equivalent, so each wrote the three terms out by hand: the
-/// [`note_unnamed_reach`] census, the payment, and the disjointness-narrowed
-/// settle, with the page walk spelled twice per site because the census and the
-/// settle each take their own closure.
-///
-/// Three hand-written copies is the shape this repository keeps paying for, and
-/// it failed here in the predicted direction. `draw::read_buffer_bytes_resolved`
-/// carried the settle **alone** — no census and no payment — because it held
-/// `DeviceState` shared and structurally could not pay, so a buffer-backed
-/// sampled texture read the guest's pages with the rendered frame still sitting
-/// in a host resident. A settle waits for writes already submitted; an owed frame
-/// has not been submitted at all, so the wait returns at once and finds nothing.
-///
-/// The three terms are ordered and the order matters. The census runs **first**,
-/// while the ledger still holds what the payment is about to clear — a census
-/// after the payment reports an empty ledger and reads as a healthy zero. The
-/// payment runs before the settle because it is what puts the owed frame on the
-/// queue; settling first would wait for a copy nobody had issued yet.
-///
-/// The walk is done here rather than taken as a closure for the reason
-/// [`settle_for_mapping`] gives: the payment needs `state` mutably and the
-/// disjointness test needs it shared, so one caller-supplied closure cannot span
-/// both. Both terms now get the same walk from the same expression, which is the
-/// point — a site cannot census one span and settle a different one.
+/// Materialize one named GVA resource, then wait for submitted writes that can
+/// reach the task-GVA span a CPU reader is about to access.
 pub fn settle_for_texture<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -1266,22 +808,6 @@ pub fn settle_for_texture<M: HostMemory + HostOps>(
     span: u64,
     site: crate::runtime::render_writeback::SettleSite,
 ) {
-    // The reference names a resource and a surface debt is keyed by mapping id,
-    // so the payment reaches only what this reference resolves to. The census is
-    // the standing alarm for the one thing that naming cannot see — raw page
-    // aliasing, where a surface's pages back some other resource with no mapping
-    // entry — and `wbdebt_reach_overlap` must stay at zero.
-    {
-        let (tasks, page_shift) = (&state.tasks, state.page_shift);
-        let page_size = state.page_size();
-        note_unnamed_reach(state, || {
-            let want = reims_vgpu_paging::span::pages_spanned(gva, span, page_size);
-            let gpas = crate::runtime::gva_mem::task_gva_page_gpas(
-                host, tasks, task_id, gva, span, page_shift,
-            );
-            (gpas.len() as u64 == want).then_some(gpas)
-        });
-    }
     pay_for_texture(state, host, task_id, texture_ref);
     let (tasks, page_shift, page_size) = (&state.tasks, state.page_shift, state.page_size());
     crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(site, || {
@@ -1320,74 +846,6 @@ pub fn submit_for_resources<M: HostMemory + HostOps>(
 ) {
     for &object_id in object_ids {
         pay_for_texture(state, host, task_id, object_id);
-    }
-}
-
-/// Run the Store the debt stands for, now.
-///
-/// Everything the copy needs is resolved here and not at the arm — the identity
-/// from the mapping's *current* generation, the page walk inside
-/// `store_render_frame`. Two answers other than writing, and both release the
-/// resident's `gpu_only_content` where they can, because that flag is what keeps
-/// the reclaim off an image holding pixels nothing else has:
-///
-/// * **The guest superseded the frame.** `clear_host_valid` after the arm means
-///   the guest wrote these pages itself, and landing an older frame on top of
-///   its work is the write-ordering hazard `render_writeback`'s doc names
-///   fourth. [`crate::runtime::resource_validity::licence_of`] is the existing
-///   happens-before and it is read rather than re-derived.
-/// * **The mapping's generation moved.** The guest remapped the surface, so the
-///   identity this debt was armed under names a resident that is now an orphan,
-///   and the pages it would be written into belong to something else. There is
-///   no way to name that orphan from here — the current generation resolves to a
-///   different identity — so its `gpu_only_content` outlives it and one image
-///   leaks per occurrence. `wbdebt_generation_moved` is how a boot says how many;
-///   a reading above single digits is the signal to carry the arm's whole
-///   identity rather than the four integers that re-derive it.
-#[cfg(feature = "backend-vulkan")]
-fn pay<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    mapping_id: u32,
-    debt: WritebackDebt,
-    route: &'static str,
-) {
-    let Some(entry) = state.mappings.get(&mapping_id) else {
-        crate::runtime::drain::note_store_route("wbdebt_generation_moved");
-        return;
-    };
-    let (map_generation, validity) = (entry.map_generation, entry.validity);
-    if map_generation != debt.map_generation {
-        crate::runtime::drain::note_store_route("wbdebt_generation_moved");
-        return;
-    }
-    // The resident the draw registered, not the one a fresh derivation would
-    // name today. See `WritebackDebt::identity`.
-    let identity = debt.identity;
-    if crate::runtime::resource_validity::licence_of(validity)
-        == crate::runtime::resource_validity::WritebackLicence::Superseded
-    {
-        crate::runtime::drain::note_store_route("wbdebt_abandoned_guest_wrote");
-        crate::backend::vulkan::engine::note_resident_content_copied_out(&identity);
-        return;
-    }
-    crate::runtime::drain::note_store_route(route);
-    if !crate::runtime::render_writeback::store_render_frame(
-        state,
-        host,
-        mapping_id,
-        &identity,
-        debt.width,
-        debt.height,
-    ) {
-        // `store_render_frame` reports its own loss on the failure channel; this
-        // names the rail that owed it, because a debt paid late and refused is a
-        // different investigation from a Store refused where it was issued.
-        crate::observe::fail(format!(
-            "wbdebt_pay_lost mapping={mapping_id} {}x{} reason=store_refused",
-            debt.width, debt.height
-        ));
-        crate::backend::vulkan::engine::note_resident_content_copied_out(&identity);
     }
 }
 
@@ -1501,23 +959,6 @@ fn pay_gva<M: HostMemory + HostOps>(
     true
 }
 
-/// [`pay`] on an arm with no Vulkan engine to owe a frame to.
-///
-/// Unreachable rather than merely unused: the only arm site is the type-11
-/// surface Store in `draw::vulkan`, so the ledger is empty on this arm and both
-/// callers return at their emptiness check before reaching here. It exists so
-/// the reader-side helpers can be one set of functions on both arms instead of
-/// two spellings the settle sites would have to choose between.
-#[cfg(not(feature = "backend-vulkan"))]
-fn pay<M: HostMemory + HostOps>(
-    _state: &mut DeviceState,
-    _host: &mut M,
-    _mapping_id: u32,
-    _debt: WritebackDebt,
-    _route: &'static str,
-) {
-}
-
 #[cfg(not(feature = "backend-vulkan"))]
 fn pay_gva<M: HostMemory + HostOps>(
     _state: &mut DeviceState,
@@ -1532,108 +973,7 @@ fn pay_gva<M: HostMemory + HostOps>(
 #[cfg(test)]
 mod tests {
 
-    /// A synthetic resident identity for a mapping, so the ledger's tests can
-    /// arm a debt without a device. The surface namespace and the mapping id
-    /// are what the ledger keys on; the rest is only carried.
-    use super::test_resident_identity as ident;
     use super::*;
-
-    /// The coalescing the rail exists for, at the container: a second arm into
-    /// one mapping replaces the first rather than queueing beside it, so N
-    /// Stores between two reads cost one copy and not N.
-    /// The ledger hands back the resident the frame is **in**, verbatim, even
-    /// when the mapping's own generation has moved past it.
-    ///
-    /// This is the defect that lost every Apple Maps frame on the
-    /// copied-resident route, and it is the whole of it: `pay` rebuilt
-    /// the identity from `present_identity::surface_identity`, which reads the
-    /// mapping's generation *now*, while the draw had registered its resident
-    /// under the generation current when the stream started. A driven boot read
-    /// `read_target_unknown_identity diverges=generation asked_gen=N held_gen=N-1`
-    /// and refused the Store with the resident holding the pixels sitting in the
-    /// registry.
-    ///
-    /// So the identity is armed and taken and never derived, and the divergence
-    /// below is deliberate: `map_generation` is 9 and the resident is at 8,
-    /// which is exactly the state the boot was in.
-    #[test]
-    #[cfg(feature = "backend-vulkan")]
-    fn a_debt_remembers_the_resident_it_was_armed_with_and_not_the_mapping() {
-        let mut pending = PendingWritebacks::default();
-        let resident = ident(7, 1920, 1080, 8);
-        pending.arm(7, resident.clone(), 1920, 1080, 9);
-        let debt = pending.take(7).expect("the debt was armed");
-        assert_eq!(
-            debt.identity, resident,
-            "the payment would read a resident the draw never wrote"
-        );
-        assert_eq!(
-            debt.identity.generation(),
-            8,
-            "the resident's generation, not the mapping's"
-        );
-        assert_eq!(
-            debt.map_generation, 9,
-            "the destination guard still watches the mapping"
-        );
-    }
-
-    #[test]
-    fn a_second_arm_into_one_mapping_replaces_the_first() {
-        let mut pending = PendingWritebacks::default();
-        pending.arm(7, ident(7, 1920, 1080, 3), 1920, 1080, 3);
-        pending.arm(7, ident(7, 1920, 1080, 3), 1920, 1080, 3);
-        assert_eq!(pending.len(), 1, "one mapping owes one frame");
-        let debt = pending.take(7).expect("mapping 7 owes a frame");
-        assert_eq!(debt.seq, 1, "the later Store is the one owed");
-        assert!(pending.is_empty());
-    }
-
-    /// Geometry travels with the debt, because the payment writes at the
-    /// geometry the Store was taken at and the mapping may have been re-declared
-    /// since.
-    #[test]
-    fn a_debt_carries_the_geometry_its_store_was_taken_at() {
-        let mut pending = PendingWritebacks::default();
-        pending.arm(4, ident(4, 800, 600, 11), 800, 600, 11);
-        let debt = pending.get(4).expect("mapping 4 owes a frame");
-        assert_eq!(
-            (debt.width, debt.height, debt.map_generation),
-            (800, 600, 11)
-        );
-    }
-
-    /// Debt lifetime follows the resource, not an arbitrary container size.
-    #[test]
-    fn surface_debts_are_not_evicted_by_capacity() {
-        let mut pending = PendingWritebacks::default();
-        const DISTINCT_RESOURCES: u32 = 64;
-        for id in 0..DISTINCT_RESOURCES {
-            pending.arm(id, ident(id, 64, 64, 1), 64, 64, 1);
-        }
-        assert_eq!(pending.len(), DISTINCT_RESOURCES as usize);
-        assert!(
-            (0..DISTINCT_RESOURCES).all(|id| pending.get(id).is_some()),
-            "every live resource keeps its host-authoritative frame"
-        );
-        pending.arm(0, ident(0, 64, 64, 1), 64, 64, 1);
-        assert_eq!(
-            pending.len(),
-            DISTINCT_RESOURCES as usize,
-            "re-arming replaces only that resource's prior frame"
-        );
-    }
-
-    /// Age order is arm order and not mapping id, because `pay_all` walks it and
-    /// the oldest owed frame is the one most likely to be read.
-    #[test]
-    fn mappings_come_back_in_arm_order() {
-        let mut pending = PendingWritebacks::default();
-        pending.arm(9, ident(9, 1, 1, 1), 1, 1, 1);
-        pending.arm(2, ident(2, 1, 1, 1), 1, 1, 1);
-        pending.arm(5, ident(5, 1, 1, 1), 1, 1, 1);
-        assert_eq!(pending.mappings_by_age(), vec![9, 2, 5]);
-    }
 
     fn gva_debt(generation: u64) -> GvaWritebackDebt {
         GvaWritebackDebt {
@@ -1845,103 +1185,5 @@ mod tests {
             .note_write(key.task_id, key.texture_ref);
         assert!(!gva_resident_authoritative(&state, &identity));
         assert!(state.pending_writebacks.get_gva(key).is_some());
-    }
-
-    /// "This texture owes nothing" splits into a surface with no debt and a
-    /// reference that named no surface at all.
-    ///
-    /// The second is not a reading about the ledger — it is a reading about the
-    /// lookup. No spelling named a mapping this device holds, so a debt owed by
-    /// the surface behind that reference could not have been found whether or
-    /// not one existed, and a sampled bind proceeding past it reads the guest's
-    /// pages while the newest frame is still in a resident. One counter reported
-    /// both at 1.1 M a boot, which is every sampled guest import, and that
-    /// volume is what made it read as a healthy zero.
-    ///
-    /// The middle case is the one this test exists for. A reference that **is**
-    /// its own mapping id resolves perfectly and never populates
-    /// `texture_to_mapping`, so a split that asked only that registration
-    /// reported it as "we could not look" — and since that is the dominant
-    /// spelling, the split read 100 % `_unresolved` on both arms of a driven
-    /// boot and could not have read anything else.
-    #[test]
-    fn a_texture_that_owes_nothing_says_whether_it_named_a_surface_at_all() {
-        use crate::runtime::drain::store_route_count;
-
-        // Baselines rather than a clear: these counters are process-global and
-        // another test in this binary may have moved them.
-        let resolved0 = store_route_count("wbdebt_texture_owes_nothing_resolved");
-        let unresolved0 = store_route_count("wbdebt_texture_owes_nothing_unresolved");
-        let total0 = store_route_count("wbdebt_texture_owes_nothing");
-
-        let mut state = DeviceState::new(crate::model::DeviceId::default(), 12);
-        let mut host = crate::runtime::FakeHost::new();
-        // The ledger has to be non-empty or `pay_for_texture` returns at its
-        // emptiness check and neither counter is reached. Mapping 7 owes; the
-        // three references below are about other surfaces.
-        state
-            .pending_writebacks
-            .arm(7, ident(7, 64, 64, 1), 64, 64, 1);
-        // Reference 21 names mapping 9 through the per-task registration, and
-        // this device holds mapping 9. It owes nothing.
-        state.mappings.entry(9).or_default().mapped = true;
-        state.texture_to_mapping.insert((1, 21), 9);
-        pay_for_texture(&mut state, &mut host, 1, 21);
-        assert_eq!(
-            store_route_count("wbdebt_texture_owes_nothing_resolved") - resolved0,
-            1
-        );
-        assert_eq!(
-            store_route_count("wbdebt_texture_owes_nothing_unresolved") - unresolved0,
-            0
-        );
-
-        // Reference 30 *is* a mapping this device holds. It owes nothing, and it
-        // resolves — through the spelling that never touches the registration.
-        state.mappings.entry(30).or_default().mapped = true;
-        pay_for_texture(&mut state, &mut host, 1, 30);
-        assert_eq!(
-            store_route_count("wbdebt_texture_owes_nothing_resolved") - resolved0,
-            2,
-            "a reference that is its own mapping id has resolved"
-        );
-        assert_eq!(
-            store_route_count("wbdebt_texture_owes_nothing_unresolved") - unresolved0,
-            0
-        );
-
-        // Reference 22 names nothing: not a mapping this device holds, and no
-        // `texture_to_mapping` entry.
-        pay_for_texture(&mut state, &mut host, 1, 22);
-        assert_eq!(
-            store_route_count("wbdebt_texture_owes_nothing_resolved") - resolved0,
-            2
-        );
-        assert_eq!(
-            store_route_count("wbdebt_texture_owes_nothing_unresolved") - unresolved0,
-            1
-        );
-        assert_eq!(
-            store_route_count("wbdebt_texture_owes_nothing") - total0,
-            3,
-            "the split has to add up to the total it divides"
-        );
-    }
-
-    /// A synchronize list is a scope, not merely a trigger. Publishing one
-    /// object must leave an unrelated resource host-authoritative.
-    #[test]
-    fn asynchronous_resource_synchronization_submits_only_named_objects() {
-        let mut state = DeviceState::new(crate::model::DeviceId::default(), 12);
-        let mut host = crate::runtime::FakeHost::new();
-        state
-            .pending_writebacks
-            .arm(7, ident(7, 64, 64, 1), 64, 64, 1);
-        state
-            .pending_writebacks
-            .arm(8, ident(8, 64, 64, 1), 64, 64, 1);
-        submit_for_resources(&mut state, &mut host, 1, &[7]);
-        assert!(state.pending_writebacks.get(7).is_none());
-        assert!(state.pending_writebacks.get(8).is_some());
     }
 }

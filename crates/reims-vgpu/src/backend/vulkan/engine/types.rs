@@ -1785,12 +1785,9 @@ impl StorageImageFormat {
 /// Protocol-derived render-target identity (resource state, not content hash).
 ///
 /// Every field of every variant is a scalar the protocol handed over, so an
-/// identity is a *value* and never a handle. That is what lets
-/// [`crate::runtime::writeback_debt::WritebackDebt`] hold one without breaking
-/// the rule its module doc states — the rail this replaces held resolved host
-/// pointers and corrupted the guest's page tables with them. It is `Clone` and
-/// not `Copy` only because several hundred call sites spell the clone, and
-/// rewriting them would bury whatever change asked for it.
+/// identity is a *value* and never a handle. It is `Clone` and not `Copy` only
+/// because several hundred call sites spell the clone, and rewriting them would
+/// bury whatever change asked for it.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum TargetIdentity {
     /// Type-4 mapping / surface id namespace.

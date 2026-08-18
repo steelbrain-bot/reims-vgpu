@@ -1462,11 +1462,9 @@ fn note_t2t_shape(
 /// outside, and the screen cannot tell them apart either.
 ///
 /// `gva` is the interesting one. It counts blit endpoints whose real content was
-/// sitting in an engine resident behind an armed [`crate::runtime::writeback_debt::GvaWritebackDebt`],
-/// i.e. copies that read guest pages the render never reached. `surface` is the
-/// type-11/type-4 spelling, which `mapping_write`'s own settle already covered
-/// from the other side, so a large `surface` next to a zero `gva` says this
-/// change bought nothing new.
+/// sitting in an engine resident behind an armed
+/// [`crate::runtime::writeback_debt::GvaWritebackDebt`], i.e. copies that read
+/// transfer backing the render never reached.
 fn note_blit_endpoint_debt(state: &DeviceState, task_id: u32, texture_ref: u32) {
     if state.pending_writebacks.is_empty() {
         return;
@@ -1479,15 +1477,6 @@ fn note_blit_endpoint_debt(state: &DeviceState, task_id: u32, texture_ref: u32) 
         })
     {
         crate::runtime::drain::note_store_route("blit_endpoint_owed_gva");
-    }
-    let mapped = state
-        .texture_to_mapping
-        .get(&(task_id, texture_ref))
-        .copied();
-    if state.pending_writebacks.get(texture_ref).is_some()
-        || mapped.is_some_and(|id| state.pending_writebacks.get(id).is_some())
-    {
-        crate::runtime::drain::note_store_route("blit_endpoint_owed_surface");
     }
 }
 

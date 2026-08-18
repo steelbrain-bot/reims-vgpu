@@ -2623,13 +2623,10 @@ pub struct DeviceState {
     /// ([`crate::runtime::render_writeback::retire_linear_residents`]) so the
     /// pinned images become LRU-evictable instead of leaking.
     pub retired_linear_residents: Vec<ComputeStorageResidencyKey>,
-    /// Surface and GVA resources whose latest frame is still only in the engine
-    /// resident, because nothing has synchronized or read their guest pages
-    /// since the Store that produced it. See
+    /// GVA resources whose latest frame is still only in the engine resident,
+    /// because nothing has synchronized or read their transfer backing since
+    /// the Store that produced it. See
     /// [`crate::runtime::writeback_debt`], which owns every transition.
-    ///
-    /// Empty unless [`crate::env::LAZY_WRITEBACK`] is on, and empty on the
-    /// `backend-metal` arm, which arms nothing.
     pub pending_writebacks: crate::runtime::writeback_debt::PendingWritebacks,
     /// GVA render target → a hash of the guest physical pages its engine
     /// resident was last armed over.

@@ -98,20 +98,11 @@ fn window_publish_key_advances_for_in_place_present() {
     );
 }
 
-/// A lazy type-11 Store publishes new pixels without writing a guest page, so
-/// the mapping's `content_generation` holds still across frames that genuinely
-/// differ — and the host window's publish key must move anyway.
-///
-/// Ungated, unlike its `present_epoch` sibling above: that term is macOS-only
-/// and this one is not, and the arm that measured the defect is x86/Vulkan.
-/// Without `frame_content_epoch` in the key, a driven macos-13 boot with
-/// `REIMS_VGPU_LAZY_WRITEBACK=on` published 60 fresh frames a second against 314
-/// `same_key`, where the eager arm published 81 against 131 — real frames
-/// discarded as unchanged, and the guest halved its own draw rate to match the
-/// vblank that follows the present.
+/// A host publication can advance without a guest-page generation change, so
+/// the host window's publish key includes the content epoch.
 #[cfg(feature = "host-window")]
 #[test]
-fn window_publish_key_moves_for_a_lazy_store_that_wrote_no_guest_page() {
+fn window_publish_key_moves_for_a_host_publication() {
     use super::window_publish::window_frame_key;
     let mut state = crate::model::DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_ARM64E);
     state.set_mapping_geom(7, 8, 4, 0x1e);
@@ -136,13 +127,12 @@ fn window_publish_key_moves_for_a_lazy_store_that_wrote_no_guest_page() {
 
     assert_eq!(
         state.present.frame_generation, generation,
-        "a lazy Store writes no guest page, so the page stamp must not move — \
-         which is what makes the pixel stamp the only term that can"
+        "host publication does not itself change the guest-page generation"
     );
     assert_ne!(
         window_frame_key(&state.present),
         first,
-        "two lazy Stores into one surface are two frames and must publish twice"
+        "two host publications into one surface are two frames and must publish twice"
     );
 }
 

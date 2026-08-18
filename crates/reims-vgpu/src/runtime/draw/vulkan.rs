@@ -1835,18 +1835,6 @@ enum Type11SeedDecline {
     /// a different fix (the entry is stale, not missing), and folding it into
     /// `NoEntry` would hide which one a future boot hit.
     GeomMismatch { have_w: u32, have_h: u32 },
-    /// An entry exists at exactly this geometry but its bytes were ceded to the
-    /// pinned resident of a deferred type-11 Store that skipped its readback
-    /// (`surface_cache::cede_surface_to_resident`).
-    ///
-    /// Distinct from [`Self::GeomMismatch`] because the geometries *match* — folding
-    /// it there would print `have=1920x1080` against `want=1920x1080` and read as
-    /// a contradiction — and distinct from [`Self::NoEntry`] because nothing
-    /// is missing: the frame is on the GPU, and the guest-pages rung below lands
-    /// this very window on its way to reading them, so the seed is served with
-    /// the Store's own pixels. Expected, and worth naming so its rate can be read
-    /// against the elision that is supposed to make it rare.
-    CededToResident,
 }
 
 impl crate::observe::Decline for Type11SeedDecline {
@@ -1854,13 +1842,12 @@ impl crate::observe::Decline for Type11SeedDecline {
         match self {
             Self::NoEntry => "type11_seed_cache_absent",
             Self::GeomMismatch { .. } => "type11_seed_cache_geom",
-            Self::CededToResident => "type11_seed_cache_ceded",
         }
     }
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
-            Self::NoEntry | Self::CededToResident => Vec::new(),
+            Self::NoEntry => Vec::new(),
             Self::GeomMismatch { have_w, have_h } => vec![("have", format!("{have_w}x{have_h}"))],
         }
     }
@@ -1953,13 +1940,6 @@ fn note_type11_load_seed(
         return;
     }
     let d = match have {
-        Some(_)
-            if crate::runtime::surface_cache::surface_ceded_to_resident(
-                state, mapping_id, w, h,
-            ) =>
-        {
-            Type11SeedDecline::CededToResident
-        }
         Some((have_w, have_h)) => Type11SeedDecline::GeomMismatch { have_w, have_h },
         None => Type11SeedDecline::NoEntry,
     };
@@ -2082,10 +2062,6 @@ fn try_type11_target_guest_seed<M: HostMemory + HostOps>(
     let (span, row_length_texels) =
         strided_window_extent(w, h, u64::from(layout.bytes_per_texel()), bpr)?;
 
-    // A debt is not submitted work, so queue order cannot put it before the
-    // seed read until this call turns it into work. A submitted payment and the
-    // draw use the same queue; no CPU settle is needed between them.
-    crate::runtime::writeback_debt::pay_for_mapping(state, host, mapping_id);
     let (gpas, runs) = mapping_window_guest_runs(state, host, mapping_id, base_off, span)?;
     let page = state.page_size();
     Some(GuestTargetSeed {
@@ -3896,22 +3872,6 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
     // `is_four_byte_color` gate above already fixes it at four.
     let (span, row_length_texels) =
         strided_window_extent(w, h, native.bytes_per_texel() as u64, bpr)?;
-    // The owed frame, before anything looks at the pages that owe it.
-    //
-    // The comment on the linear rail explains why this rail needs no *settle* —
-    // a submitted writeback is already ahead of this gather in queue order, so a
-    // CPU fence wait buys nothing. A writeback **debt** is a different object: it
-    // has not been submitted, there is no command for queue order to order, and
-    // the surface's pages hold the frame before the one the resident is holding.
-    // Gathering them without paying binds the guest a stale frame.
-    //
-    // Paid before `note_gather` and not after, because the payment writes those
-    // pages: the witness has to see the write, or it vouches for bytes that
-    // changed underneath the vouch.
-    //
-    // Free when nothing is owed — `pay_for_mapping` is one emptiness check on
-    // the ledger, which is the answer on nearly every call.
-    crate::runtime::writeback_debt::pay_for_mapping(state, host, mid);
     let (source, identity, vouch) = witnessed_mapping_sampled_source(
         state,
         host,
@@ -3989,9 +3949,6 @@ pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
         (native, sampled_vk_format, bpp, base_off, bpr_u32 as u64)
     };
     let (span, row_length_texels) = strided_window_extent(w, h, bpp as u64, bpr)?;
-    // The owed frame, for the reason `try_type11_sample_zero_copy` states: a
-    // debt is not a submitted writeback and queue order cannot order it.
-    crate::runtime::writeback_debt::pay_for_mapping(state, host, mid);
     let (source, identity, vouch) = witnessed_mapping_sampled_source(
         state,
         host,
@@ -8573,20 +8530,6 @@ pub(crate) fn read_resident_chain(
 /// the two calls. Read that variant's doc before reintroducing a derivation
 /// anywhere on this path — deriving it a second *time* is as wrong as deriving
 /// it a second *way*.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SurfaceStorePlan {
-    DeferCopy,
-    CopyNow,
-}
-
-fn surface_store_plan(lazy_enabled: bool) -> SurfaceStorePlan {
-    if lazy_enabled {
-        SurfaceStorePlan::DeferCopy
-    } else {
-        SurfaceStorePlan::CopyNow
-    }
-}
-
 fn store_surface_resident<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -8599,114 +8542,11 @@ fn store_surface_resident<M: HostMemory + HostOps>(
     // below succeeds, and leaving it un-reset on a refused write would fold this
     // pass into the next Store's reading.
     note_pass_scissor_union(width, height);
-    let lazy = crate::runtime::writeback_debt::lazy_writeback_enabled();
-    let plan = surface_store_plan(lazy);
-    if plan == SurfaceStorePlan::DeferCopy
-        && arm_surface_writeback_debt(state, mapping_id, identity, width, height)
-    {
-        return true;
-    }
     if !crate::runtime::render_writeback::store_render_frame(
         state, host, mapping_id, identity, width, height,
     ) {
         return false;
     }
-    true
-}
-
-/// Record that `mapping_id` is owed this frame, and hand the currency witness to
-/// the resident holding it.
-///
-/// `true` when the debt is armed and the caller owes the guest nothing further
-/// this Store. `false` sends the caller down the ordinary eager Store, which is
-/// what a mapping this device holds no entry for gets.
-///
-/// # Why the resident is stamped here, where no copy has happened
-///
-/// The stamp says the resident holds the mapping's content, and it is what
-/// licenses the type-11 attachment LOAD to seed from that image instead of
-/// reading a whole frame back out of guest memory — 802 elided against 36
-/// uploaded on a driven boot. `registry_mark_ready` clears it on every draw that
-/// renders into the resident, so a Store that did not re-stamp would hand the
-/// next LOAD a refusal, the LOAD would read the guest's pages, and reading them
-/// is exactly what pays the debt. The rail would collapse to the eager one with
-/// extra bookkeeping.
-///
-/// It is sound for that consumer and it is the *only* consumer: the resident
-/// holds this surface's newest pixels, which is what a LOAD asks for. It would
-/// not be sound for a writeback that read the stamp to decide it could skip the
-/// copy — with a debt outstanding the pages hold something older, not something
-/// equal. `render_writeback`'s doc measures that elision as never once firing
-/// and says not to build it; whoever revisits that has to read this first.
-fn arm_surface_writeback_debt(
-    state: &mut DeviceState,
-    mapping_id: u32,
-    identity: &crate::backend::vulkan::engine::TargetIdentity,
-    width: u32,
-    height: u32,
-) -> bool {
-    let Some(map_generation) = state.mappings.get(&mapping_id).map(|m| m.map_generation) else {
-        return false;
-    };
-    // The host surface cache is the *other* host-side copy of this mapping, and
-    // this Store has just superseded it without writing a byte anywhere. The
-    // eager arm ends with `surface_cache::forget` for exactly this reason; this
-    // arm cedes instead, because here the resident genuinely does hold the frame
-    // and a cession says so — see [`surface_cache::cede_surface_to_resident`],
-    // which was written for this call and had no caller.
-    //
-    // Without it the type-11 sampled ladder's host-cache rung serves the
-    // *previous* frame for as long as the debt is outstanding: that rung is
-    // gated on the guest-write witness alone, which by construction cannot see a
-    // publish this device made itself, and it sits above both rungs that read
-    // the guest's own pages, so nothing below corrects it. It repairs when the
-    // debt is paid, which is what makes it a flicker rather than a stuck layer.
-    //
-    // A geometry this cache would not have stored is refused rather than armed,
-    // per that function's contract: leaving a live entry beside a
-    // resident-authoritative window is the state this whole call exists to
-    // prevent, and the eager Store is always available.
-    if !crate::runtime::surface_cache::cede_surface_to_resident(state, mapping_id, width, height) {
-        crate::runtime::drain::note_store_route("wbdebt_uncedable_geometry");
-        return false;
-    }
-    // The *third* host-side claim on this window, and the one this arm was
-    // missing. `compute_storage_residency` records that a storage image and the
-    // guest's pages both hold a window a compute dispatch wrote back, so
-    // `compute_exec::stage_texture_raw` may serve the storage image and skip the
-    // guest read entirely. This Store has just superseded both halves of that
-    // claim without writing a byte, so the next dispatch staging the same window
-    // would be fed the earlier dispatch's image and never see the render frame.
-    //
-    // The eager arm has always done this — `write_bgra8_from_resident_gpu` calls
-    // `invalidate_storage_residency_window` over the same extent — so without it
-    // here the two arms of `env::LAZY_WRITEBACK` disagree about what the GPU
-    // observes, which is the one thing that switch's doc promises they never do.
-    // Nothing else drops an entry from that map and no guest-write witness feeds
-    // it, so a stale claim is held until the window is written some other way.
-    if let Some(m) = state.mappings.get(&mapping_id) {
-        let format = if m.format != 0 {
-            m.format
-        } else {
-            pixel_format::MTL_FORMAT_BGRA8_UNORM
-        };
-        if let Some((base_off, _bpr, span_end)) =
-            crate::runtime::mapping_write::type11_sample_window(m, width, height, format)
-        {
-            state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
-        }
-    }
-    // The one call that says "these pixels changed and the guest's pages do not
-    // hold them yet". It advances the surface's content epoch, which is what the
-    // stamp below records, and `ResourceValidity::host_published_seq`, which is
-    // what orders this frame against the guest's own later claim to have written
-    // the same pages — `writeback_debt::pay` reads that ordering back through
-    // `resource_validity::licence_of` and abandons a frame the guest superseded.
-    let epoch = state.note_surface_content_published(mapping_id);
-    crate::backend::vulkan::engine::stamp_resident_content_epoch(identity, epoch);
-    state
-        .pending_writebacks
-        .arm(mapping_id, identity.clone(), width, height, map_generation);
     true
 }
 
@@ -8744,12 +8584,6 @@ mod vulkan_split_tests {
     use super::*;
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
     use crate::runtime::host::FakeHost;
-
-    #[test]
-    fn an_engine_owned_store_obeys_the_writeback_policy() {
-        assert_eq!(surface_store_plan(true), SurfaceStorePlan::DeferCopy);
-        assert_eq!(surface_store_plan(false), SurfaceStorePlan::CopyNow);
-    }
 
     /// The blank-with-host-entry loss must be reported as a subset of a
     /// population, not as a bare count.
@@ -9371,264 +9205,6 @@ mod vulkan_split_tests {
             ..Default::default()
         };
         assert!(!type11_load_is_a_seed_candidate(&c0));
-    }
-
-    /// A type-11 `LOAD` whose host cache misses seeds from the surface's own
-    /// guest pages, and only refuses when those cannot serve the extent.
-    ///
-    /// Without the guest-pages rung this returns `None`, `target_rgba8` stays
-    /// unset, and `exec` resolves the pass load action to `Clear` against the
-    /// hardcoded `[0,0,0,0]` — so the guest's request to preserve its surface
-    /// became a transparent-black wipe that the matching Store published. One
-    /// x86/Vulkan boot measured 121 distinct (mapping, geometry) instances of that
-    /// in ~170 s, four at the full 1920x1080 composite extent, with the host
-    /// window 62-90 % near-black during a desktop drag against 0.001 % at idle.
-    ///
-    /// Every one of those 121 lines had `want == mapgeom` and `hostgen=0`: the
-    /// cache had never held the surface and its pages were readable. That pair is
-    /// what makes reading them the fix rather than a guess.
-    /// The lazy type-11 Store publishes a frame nothing has written down yet, so
-    /// the host surface cache — the other host-side copy of the same mapping —
-    /// must stop naming the frame before it.
-    ///
-    /// The eager Store's GPU-direct arm ends in `surface_cache::forget` and says
-    /// why; the lazy arm published a strictly newer frame and left the entry
-    /// alone. The consumer that would read it is the type-11 sampled ladder's
-    /// host-cache rung, gated on the guest-write witness alone — which cannot
-    /// see a publish this device made itself — and sitting above both rungs that
-    /// read the guest's pages, so nothing below it corrects the answer.
-    ///
-    /// Asserted through `get_shared_with_gen`, which is the accessor that rung
-    /// actually calls: a cession leaves the entry present and empty, so a test
-    /// that only asked whether the map contained the key would pass either way.
-    #[test]
-    fn arming_a_writeback_debt_stops_the_host_cache_naming_the_previous_frame() {
-        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-        use crate::runtime::mapping_write::write_bgra8;
-
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        let mut host = FakeHost::new();
-        let mid = 912u32;
-        let pfn = 0x31u32;
-        let gpa = (pfn as u64) << PAGE_SHIFT_X86;
-        host.map_range(gpa, 0x4000, 0);
-        state.map_surface(mid);
-        {
-            let m = state.mappings.get_mut(&mid).unwrap();
-            m.mapped = true;
-            m.mapping_internal = 1;
-            m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
-        }
-        let (w, h) = (4u32, 2u32);
-        assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
-
-        // Frame N, mirrored into the host cache by the write itself.
-        let frame_n = vec![0x11u8; (w * h * 4) as usize];
-        assert!(write_bgra8(
-            &mut state,
-            &mut host,
-            mid,
-            &frame_n,
-            w * 4,
-            w,
-            h
-        ));
-        assert!(
-            crate::runtime::surface_cache::get_shared_with_gen(&state, mid, w, h).is_some(),
-            "the cache has to be warm or this test proves nothing"
-        );
-
-        // Frame N+1, rendered and deliberately not written down.
-        let identity = crate::backend::vulkan::engine::TargetIdentity::Gva {
-            gva: gpa,
-            width: w,
-            height: h,
-            generation: 1,
-            format: gva_resident_format(MTL_FORMAT_BGRA8_UNORM),
-        };
-        // The third host-side claim on the same window: a compute dispatch's
-        // storage image, recorded as holding what the guest's pages hold. This
-        // Store supersedes both halves of that claim.
-        let (base_off, bpr, span_end) = crate::runtime::mapping_write::type11_sample_window(
-            state.mappings.get(&mid).expect("mapped above"),
-            w,
-            h,
-            MTL_FORMAT_BGRA8_UNORM,
-        )
-        .expect("a latched geometry resolves its window");
-        let residency = crate::model::ComputeStorageResidencyKey {
-            mapping_id: mid,
-            map_generation: state.mappings[&mid].map_generation,
-            surface_offset: base_off,
-            surface_bpr: bpr,
-            span_end,
-            width: w,
-            height: h,
-            pixel_format: MTL_FORMAT_BGRA8_UNORM,
-            texture_ref: 0,
-        };
-        state
-            .compute_storage_residency
-            .insert(residency, Default::default());
-
-        assert!(
-            arm_surface_writeback_debt(&mut state, mid, &identity, w, h),
-            "a mapped surface at a cacheable geometry arms"
-        );
-        assert!(
-            crate::runtime::surface_cache::get_shared_with_gen(&state, mid, w, h).is_none(),
-            "frame N is still on offer while frame N+1 exists only on the GPU"
-        );
-        assert!(
-            !state.compute_storage_residency.contains_key(&residency),
-            "the eager arm invalidates this window and the lazy one published a \
-             strictly newer frame into it; leaving the claim standing feeds the \
-             next dispatch the earlier dispatch's storage image instead of the \
-             render frame, and the two arms of LAZY_WRITEBACK then disagree \
-             about what the GPU observes"
-        );
-    }
-
-    /// The Store lands the frame in the slot the *draw* registered, even when
-    /// the mapping's generation has moved since.
-    ///
-    /// `map_generation` is part of [`crate::backend::vulkan::engine::TargetIdentity::Surface`],
-    /// so a Store that re-derives its identity from `DeviceState` asks the
-    /// registry for a key one generation ahead of the one `registry_ensure`
-    /// was handed, and the registry answers `read_target_unknown_identity
-    /// diverges=generation asked_gen=N held_gen=N-1`. Every Maps frame went
-    /// that way on the copied-resident route.
-    ///
-    /// The repair is that the identity travels out of the draw on
-    /// [`M2vDrawSpan::ResidentSurfaceStore`] rather than being asked for twice,
-    /// so this test bumps the generation between the two points and asserts the
-    /// debt still names the draw's key. Before it, the ledger recorded the
-    /// generation this test bumps to.
-    #[test]
-    fn the_store_names_the_slot_the_draw_registered_after_the_mapping_generation_moves() {
-        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-        use crate::runtime::mapping_write::write_bgra8;
-
-        if !crate::runtime::writeback_debt::lazy_writeback_enabled() {
-            // The eager arm stores through the engine instead of the ledger and
-            // has no debt to inspect. Reported rather than silently passing.
-            eprintln!("skipped: REIMS_VGPU_LAZY_WRITEBACK=off selects the eager Store");
-            return;
-        }
-
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        let mut host = FakeHost::new();
-        let mid = 913u32;
-        let pfn = 0x37u32;
-        let gpa = (pfn as u64) << PAGE_SHIFT_X86;
-        host.map_range(gpa, 0x4000, 0);
-        state.map_surface(mid);
-        {
-            let m = state.mappings.get_mut(&mid).unwrap();
-            m.mapped = true;
-            m.mapping_internal = 1;
-            m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
-        }
-        let (w, h) = (4u32, 2u32);
-        assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
-        // Warms the host cache, so the cession inside the arm has something to
-        // cede and the arm is testing its own gate rather than an empty one.
-        assert!(write_bgra8(
-            &mut state,
-            &mut host,
-            mid,
-            &vec![0x22u8; (w * h * 4) as usize],
-            w * 4,
-            w,
-            h
-        ));
-
-        // The key the draw would have handed `registry_ensure`.
-        let drawn = crate::runtime::present_identity::surface_identity(&state, mid, w, h);
-        crate::model::DeviceState::bump_map_generation(state.mappings.get_mut(&mid).unwrap());
-        assert_ne!(
-            crate::runtime::present_identity::surface_identity(&state, mid, w, h),
-            drawn,
-            "the bump has to change what a second derivation answers or this \
-             test cannot see the defect"
-        );
-
-        assert!(
-            store_surface_resident(&mut state, &mut host, &drawn, mid, w, h),
-            "a copied resident at a cacheable geometry defers"
-        );
-        assert_eq!(
-            state
-                .pending_writebacks
-                .get(mid)
-                .expect("the deferred plan arms a debt")
-                .identity,
-            drawn,
-            "the ledger has to name the image the draw rendered into"
-        );
-    }
-
-    /// The type-11 zero-copy sampled rail hands the engine the surface's guest
-    /// pages, so an owed frame has to be written into them first.
-    ///
-    /// The rail is exempt from the *settle* and its comment says why: a
-    /// submitted writeback is already ahead of this gather in queue order. That
-    /// argument does not reach a writeback **debt**, which is not submitted at
-    /// all — there is no command for queue order to order, and the pages hold
-    /// the frame before the one the resident is holding. The exemption was
-    /// written before the debt rail existed and silently took the payment with
-    /// it.
-    #[test]
-    fn the_type11_zero_copy_gather_pays_the_frame_those_pages_owe() {
-        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-
-        let (w, h) = (128u32, 128u32);
-        let span = (w * h * 4) as u64;
-
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        let mut host = FakeHost::new();
-        // The rail refuses a host whose page views are transient before it ever
-        // builds one — see `type11_zero_copy_declines_transient_host_mappings`.
-        host.stable_map_pages = true;
-        let mid = 913u32;
-        let first_pfn = 0x40u32;
-        let pages = (span >> PAGE_SHIFT_X86) as u32;
-        host.map_range((first_pfn as u64) << PAGE_SHIFT_X86, span as usize, 0);
-        state.map_surface(mid);
-        {
-            let m = state.mappings.get_mut(&mid).unwrap();
-            m.mapped = true;
-            m.mapping_internal = 1;
-            m.page_entries = (0..pages)
-                .map(|i| ((first_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
-                .collect();
-        }
-        assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
-        let map_generation = state.mappings.get(&mid).unwrap().map_generation;
-        state.pending_writebacks.arm(
-            mid,
-            crate::runtime::writeback_debt::test_resident_identity(
-                mid,
-                w,
-                h,
-                u64::from(map_generation),
-            ),
-            w,
-            h,
-            map_generation,
-        );
-
-        assert!(
-            try_type11_sample_zero_copy(&mut state, &mut host, mid, w, h).is_some(),
-            "the rail has to take, or this test proves nothing about what it does"
-        );
-        assert!(
-            state.pending_writebacks.get(mid).is_none(),
-            "the gather bound pages still owed a frame this device never wrote down"
-        );
     }
 
     /// A stage that binds a sampler and no texture is still in the sampled band,
