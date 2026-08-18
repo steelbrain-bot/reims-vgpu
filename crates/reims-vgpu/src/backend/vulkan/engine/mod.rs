@@ -1561,19 +1561,7 @@ struct GuestWriteFootprint {
     armed: Vec<Vec<u64>>,
 }
 
-/// What the ledger can say about a reader's window.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum GuestWriteReach {
-    /// Nothing outstanding lands in any of the pages asked about. The caller may
-    /// read them without settling.
-    Disjoint,
-    /// An outstanding writeback lands in one of them.
-    Overlap,
-    /// The ledger cannot say, so the caller must settle. Distinguished from
-    /// [`Self::Overlap`] because the two want opposite fixes: an overlap is a
-    /// wait genuinely owed and this is precision the ledger failed to keep.
-    Unnamed,
-}
+pub use reims_vgpu_core::GuestWriteReach;
 
 /// Record the guest pages a writeback about to be submitted will land in.
 ///
@@ -2259,16 +2247,7 @@ pub fn resident_content_epoch(identity: &TargetIdentity) -> Option<u32> {
 ///   the flush rebuilt another. That is a lost frame *and* a leaked pin, and it
 ///   is the same defect shape as `74748d2` and `021e64b`, which is why it must
 ///   not hide inside the same `None` as the expected case.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResidentContent {
-    /// No slot at this identity: evicted, never created, or named differently
-    /// by whoever is asking.
-    Absent,
-    /// Slot present, stamp cleared by a draw since it was written.
-    Unstamped,
-    /// Slot present and vouched for at this mapping content epoch.
-    Epoch(u32),
-}
+pub use reims_vgpu_core::ResidentContent;
 
 /// [`ResidentContent`] for one identity — the reading a deferred window takes
 /// before it believes a resident still holds its frame.
@@ -3071,48 +3050,7 @@ unsafe fn copy_image_level0_to_host_delivered(
     out
 }
 
-/// A resident target's pixels plus the physical channel order they came out in.
-///
-/// Reported rather than derivable, and read from the registry slot under the
-/// same lock as the copy, so it is the order of the image the bytes were
-/// actually copied out of. A caller that re-derived it from the identity would
-/// be restating a rule the engine owns; when the two disagree the symptom is an
-/// R/B exchange on a whole frame, which is a colour defect no assertion in this
-/// crate was watching for.
-pub struct TargetReadback {
-    pub pixels: Vec<u8>,
-    /// BGRA8 when true, semantic RGBA8 otherwise.
-    pub bgra: bool,
-}
-
-impl TargetReadback {
-    /// The frame in semantic RGBA8, exchanging R and B only when it is not
-    /// already in that order.
-    pub fn into_rgba8(mut self) -> Vec<u8> {
-        if self.bgra {
-            for px in self.pixels.chunks_exact_mut(4) {
-                px.swap(0, 2);
-            }
-        }
-        self.pixels
-    }
-
-    /// The frame in guest scanout order (BGRA8), exchanging only when needed.
-    ///
-    /// The mirror of `into_rgba8`, for the guest-page writers that are declared in
-    /// scanout order (`mapping_write::write_bgra8`). Both exist so that neither
-    /// caller has to know which namespace it is reading: a `Surface` resident is
-    /// already BGRA and this is a no-op, and a resident that is not stays correct
-    /// instead of landing R and B exchanged in guest memory.
-    pub fn into_bgra8(mut self) -> Vec<u8> {
-        if !self.bgra {
-            for px in self.pixels.chunks_exact_mut(4) {
-                px.swap(0, 2);
-            }
-        }
-        self.pixels
-    }
-}
+pub use reims_vgpu_core::TargetReadback;
 
 /// A resident target's frame, still in the Vulkan readback buffer it was copied
 /// into, borrowed rather than copied out.

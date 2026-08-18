@@ -7,6 +7,7 @@ pub mod execution;
 pub mod namespace;
 pub mod residency;
 pub mod resource;
+pub mod service;
 pub mod submission;
 pub mod target;
 
@@ -21,5 +22,6 @@ pub use resource::{
     ContentAuthority, ContentError, ContentState, GraphError, LifecycleState, MappingNode,
     PendingContentWrite, ReplicaVersions, ResourceGraph, ResourceNode, StorageBacking, StorageNode,
 };
+pub use service::{GuestWriteReach, ResidentContent, TargetReadback};
 pub use submission::SubmissionContext;
 pub use target::{TargetIdentity, TargetKeyDivergence};

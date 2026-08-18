@@ -768,7 +768,7 @@ pub fn settle_guest_writes_unless_disjoint(
         if !executor.guest_writes_outstanding() {
             return;
         }
-        use crate::backend::vulkan::engine::GuestWriteReach as Reach;
+        use reims_vgpu_core::GuestWriteReach as Reach;
         let reach = match pages() {
             Some(p) => executor.guest_writes_reaching(&p),
             // The caller could not name its own window, which is the same

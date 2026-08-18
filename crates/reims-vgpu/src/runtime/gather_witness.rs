@@ -457,7 +457,7 @@ impl PendingWrites {
     fn over(executor: &dyn crate::runtime::executor::Executor, gpas: &[u64]) -> Self {
         #[cfg(feature = "backend-vulkan")]
         {
-            use crate::backend::vulkan::engine::GuestWriteReach as Reach;
+            use reims_vgpu_core::GuestWriteReach as Reach;
             if !executor.guest_writes_outstanding() {
                 return Self::Disjoint;
             }

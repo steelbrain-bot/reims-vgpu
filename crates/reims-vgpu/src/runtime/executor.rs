@@ -6,12 +6,13 @@
 
 use crate::backend::vulkan::engine::{
     ComputeOutput, ComputeRequest, DrawError, DrawOutput, DrawRequest, EngineFacadeDecline,
-    GuestWriteReach, ResidentContent, StorageImageFormat, TargetReadback,
+    StorageImageFormat,
 };
 use crate::model::TargetIdentity;
 
 pub use reims_vgpu_core::{
-    ExecutionPort, ExecutorCapabilities, ResidentContentBacking, ResidentLease, SubmissionContext,
+    ExecutionPort, ExecutorCapabilities, GuestWriteReach, ResidentContent, ResidentContentBacking,
+    ResidentLease, SubmissionContext, TargetReadback,
 };
 
 impl ResidentLease for crate::backend::vulkan::engine::ResidentResourceLease {
