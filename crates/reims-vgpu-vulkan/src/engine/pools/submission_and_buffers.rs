@@ -27,11 +27,11 @@ use super::*;
 /// but stated nowhere the holder could check. Carrying the extent beside the
 /// pointer is the same rule `staging_write_ptr` and `read_back_slot` answer
 /// through `slot_span_fits`.
-#[derive(Clone, Copy, Debug)]
 pub(crate) struct ReadbackLease {
     pub token: u64,
     pub ptr: usize,
     pub slot_size: u64,
+    pub(super) returns: Arc<ReadbackLeaseReturns>,
 }
 
 #[cfg(test)]
@@ -172,6 +172,7 @@ impl ResourcePools {
     pub(crate) fn new() -> Self {
         super::super::publish_batch_open(false);
         Self {
+            readback_lease_returns: Arc::new(ReadbackLeaseReturns::default()),
             staging_free: HashMap::new(),
             staging_live: Vec::new(),
             gather_free: HashMap::new(),
@@ -3169,11 +3170,14 @@ impl ResourcePools {
         // Before the slot leaves the pool: the counter is what a teardown reads
         // to decide whether a borrow is live, and it must never see the slot
         // gone while the count still says nobody has it.
-        READBACK_LEASES_OUT.fetch_add(1, Ordering::AcqRel);
+        self.readback_lease_returns
+            .outstanding
+            .fetch_add(1, Ordering::AcqRel);
         let lease = ReadbackLease {
             token,
             ptr: slot.mapped,
             slot_size: slot.size,
+            returns: Arc::clone(&self.readback_lease_returns),
         };
         self.readback_leased.push(LeasedReadback { token, slot });
         Some(lease)
@@ -3186,7 +3190,7 @@ impl ResourcePools {
     /// the calls that follow a lease, and a lease that is still out is simply
     /// not in the drained set.
     pub(crate) fn reclaim_returned_readback_leases(&mut self) {
-        let returned = std::mem::take(&mut *RETURNED_READBACK_LEASES.lock());
+        let returned = std::mem::take(&mut *self.readback_lease_returns.returned.lock());
         for token in returned {
             let Some(index) = self.readback_leased.iter().position(|l| l.token == token) else {
                 // A teardown collected the leases while this token was in

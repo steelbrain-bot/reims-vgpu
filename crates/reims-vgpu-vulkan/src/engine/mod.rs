@@ -2774,7 +2774,10 @@ enum ReadbackDelivery {
 /// The result of a readback in whichever of the two forms was asked for.
 enum ReadbackResult {
     Copied(Vec<u8>),
-    Leased { token: u64, ptr: usize, len: usize },
+    Leased {
+        lease: pools::ReadbackLease,
+        len: usize,
+    },
 }
 
 /// Returns an unhanded-on readback lease when its scope exits.
@@ -2801,7 +2804,7 @@ impl ReadbackLeaseGuard {
 impl Drop for ReadbackLeaseGuard {
     fn drop(&mut self) {
         if let Some(lease) = self.0.take() {
-            pools::return_readback_lease(lease.token);
+            pools::return_readback_lease(lease);
         }
     }
 }
@@ -2838,8 +2841,8 @@ unsafe fn copy_image_level0_to_host(
         // Unreachable by construction — `Copy` was asked for one line above —
         // and stated as a decline rather than a panic because this rail runs on
         // the drain worker, where a panic takes the device down.
-        ReadbackResult::Leased { token, .. } => {
-            pools::return_readback_lease(token);
+        ReadbackResult::Leased { lease, .. } => {
+            pools::return_readback_lease(lease);
             Err(DrawError::TargetRead(
                 reason::TargetReadDecline::NoReadyContent,
             ))
@@ -3099,18 +3102,17 @@ unsafe fn copy_image_level0_to_host_delivered(
                 },
             )
             .fail_once(0);
-            pools::return_readback_lease(lease.token);
+            pools::return_readback_lease(lease);
             pools::read_back_slot(ctx, &readback, rb_size, ops.map, ops.invalidate)
                 .map(ReadbackResult::Copied)
         }
         Some(lease) => match pools::invalidate_slot_for_read(ctx, &readback, ops.invalidate) {
             Ok(()) => Ok(ReadbackResult::Leased {
-                token: lease.token,
-                ptr: lease.ptr,
+                lease,
                 len: rb_size as usize,
             }),
             Err(e) => {
-                pools::return_readback_lease(lease.token);
+                pools::return_readback_lease(lease);
                 Err(e)
             }
         },
@@ -3153,7 +3155,7 @@ pub use reims_vgpu_core::TargetReadback;
 /// the engine should end the lease first. Ending it is device-free and cannot
 /// block on anything the holder owns.
 pub struct LeasedFrame {
-    token: u64,
+    lease: Option<pools::ReadbackLease>,
     ptr: usize,
     len: usize,
     /// BGRA8 when true, semantic RGBA8 otherwise. Reported by the registry slot
@@ -3186,7 +3188,9 @@ impl reims_vgpu_core::ReadbackLease for LeasedFrame {
 
 impl Drop for LeasedFrame {
     fn drop(&mut self) {
-        pools::return_readback_lease(self.token);
+        if let Some(lease) = self.lease.take() {
+            pools::return_readback_lease(lease);
+        }
     }
 }
 
@@ -3248,12 +3252,15 @@ pub fn read_target_leased(identity: &TargetIdentity) -> Result<Option<LeasedFram
         pools.registry_note_access(identity, read_access);
         counters.note_target_read(rb_size, TargetReadDelivery::Host);
         Ok(match delivered {
-            ReadbackResult::Leased { token, ptr, len } => Some(LeasedFrame {
-                token,
-                ptr,
-                len,
-                bgra: snap.bgra(),
-            }),
+            ReadbackResult::Leased { lease, len } => {
+                let ptr = lease.ptr;
+                Some(LeasedFrame {
+                    lease: Some(lease),
+                    ptr,
+                    len,
+                    bgra: snap.bgra(),
+                })
+            }
             // The slot had no mapping to lend, so the readback fell back to a
             // copy. Drop it and let the caller take its own copying path rather
             // than hand back a `Vec` this signature has no room for; that costs

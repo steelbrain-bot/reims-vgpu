@@ -7,6 +7,7 @@ use ash::vk::Handle;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Instant;
 
 use super::buffer_slab::{BufferSlabToken, BUFFER_SLAB_IDLE_KEEP_EMPTY};
@@ -149,28 +150,24 @@ pub(crate) struct LeasedReadback {
     pub slot: BufferSlot,
 }
 
+#[derive(Default)]
+pub(crate) struct ReadbackLeaseReturns {
+    returned: parking_lot::Mutex<Vec<u64>>,
+    outstanding: std::sync::atomic::AtomicUsize,
+}
+
 /// Tokens of leases whose holder has finished with the mapping.
 ///
-/// Its own lock rather than a field of [`ResourcePools`], and that is the whole
-/// point of the channel. Ending a lease must never need the engine lock: the
+/// Its own shared state rather than the engine lock is the whole point of the
+/// channel. Each pool owns one such state and every lease carries it. Ending a
+/// lease must never need the engine lock: the
 /// thread that ends one may be racing a teardown that already holds that lock
 /// and is waiting for this very lease to come back, and a return path that
 /// asked for the lock would close the cycle. So a holder drops a token here and
-/// walks away; the next engine-locked pool operation collects it
+/// walks away; the next engine-locked operation on that same pool collects it
 /// ([`ResourcePools::reclaim_returned_readback_leases`]).
 ///
 /// Nothing under this lock ever takes another, which is what keeps it a leaf.
-static RETURNED_READBACK_LEASES: parking_lot::Mutex<Vec<u64>> = parking_lot::Mutex::new(Vec::new());
-
-/// Leases handed out and not yet returned, readable without any lock.
-///
-/// A teardown that is about to `vkFreeMemory` a leased slot has to know whether
-/// a borrow of its mapping is still live, and it cannot ask `readback_leased`
-/// for that — a token sitting in [`RETURNED_READBACK_LEASES`] is a lease whose
-/// holder is gone but whose slot has not been collected yet. This counter moves
-/// with the *holder*, so zero means no pointer is outstanding.
-static READBACK_LEASES_OUT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 /// Distinct token per lease, so a return can name the slot it is giving back
 /// without carrying a Vulkan handle across the lock boundary.
 static NEXT_READBACK_LEASE_TOKEN: std::sync::atomic::AtomicU64 =
@@ -180,20 +177,16 @@ static NEXT_READBACK_LEASE_TOKEN: std::sync::atomic::AtomicU64 =
 ///
 /// Device-free by construction — a readback slot owns its mapping for life, so
 /// there is no `vkUnmapMemory` owed and nothing here needs the engine.
-pub(crate) fn return_readback_lease(token: u64) {
-    RETURNED_READBACK_LEASES.lock().push(token);
+pub(crate) fn return_readback_lease(lease: ReadbackLease) {
+    lease.returns.returned.lock().push(lease.token);
     // After the token is queued, never before: a teardown that observes zero
     // must be able to conclude the slot is collectable, and a decrement ahead
     // of the push would let it observe zero with the token still in flight.
-    READBACK_LEASES_OUT.fetch_sub(1, Ordering::AcqRel);
-}
-
-/// Whether any lease holder is still reading a readback mapping.
-pub(crate) fn readback_leases_outstanding() -> usize {
-    READBACK_LEASES_OUT.load(Ordering::Acquire)
+    lease.returns.outstanding.fetch_sub(1, Ordering::AcqRel);
 }
 
 pub(crate) struct ResourcePools {
+    readback_lease_returns: Arc<ReadbackLeaseReturns>,
     /// Size-bucketed free host-visible buffers (TRANSFER_SRC | VERTEX | INDEX | STORAGE).
     staging_free: HashMap<u64, Vec<BufferSlot>>,
     /// In-use staging slots returned after submit/wait.
@@ -3490,9 +3483,38 @@ pub(super) unsafe fn invalidate_slot_for_read(
 
 #[cfg(test)]
 mod staging_mapping_tests {
-    use super::{readback_leases_outstanding, return_readback_lease, DeviceContext, ResourcePools};
+    use super::{return_readback_lease, DeviceContext, ReadbackLease, ResourcePools};
     use crate::engine::counters::EngineCounters;
     use ash::vk;
+    use std::sync::Arc;
+
+    #[test]
+    fn returning_one_pools_lease_cannot_be_collected_by_another_pool() {
+        let first = ResourcePools::new();
+        let second = ResourcePools::new();
+        first
+            .readback_lease_returns
+            .outstanding
+            .store(1, std::sync::atomic::Ordering::Release);
+        let lease = ReadbackLease {
+            token: 7,
+            ptr: 0,
+            slot_size: 0,
+            returns: Arc::clone(&first.readback_lease_returns),
+        };
+
+        return_readback_lease(lease);
+
+        assert_eq!(&*first.readback_lease_returns.returned.lock(), &[7]);
+        assert!(second.readback_lease_returns.returned.lock().is_empty());
+        assert_eq!(
+            first
+                .readback_lease_returns
+                .outstanding
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+    }
 
     /// A staging slot carries its own host mapping, and keeps it across recycle.
     ///
@@ -3711,7 +3733,6 @@ mod staging_mapping_tests {
         }
 
         let lease = pools.lease_readback().expect("a mapped cached slot leases");
-        let token = lease.token;
         assert_eq!(
             lease.ptr, slot.mapped,
             "the lease must lend the slot's mapping"
@@ -3728,7 +3749,10 @@ mod staging_mapping_tests {
             "a slot acquired for 4 KiB lends at least 4 KiB"
         );
         assert_eq!(
-            readback_leases_outstanding(),
+            pools
+                .readback_lease_returns
+                .outstanding
+                .load(std::sync::atomic::Ordering::Acquire),
             1,
             "a teardown reads this to decide whether a borrow is live"
         );
@@ -3741,9 +3765,12 @@ mod staging_mapping_tests {
             "the leased slot was handed out again under a live borrow"
         );
 
-        return_readback_lease(token);
+        return_readback_lease(lease);
         assert_eq!(
-            readback_leases_outstanding(),
+            pools
+                .readback_lease_returns
+                .outstanding
+                .load(std::sync::atomic::Ordering::Acquire),
             0,
             "the borrow is over the moment the holder says so"
         );

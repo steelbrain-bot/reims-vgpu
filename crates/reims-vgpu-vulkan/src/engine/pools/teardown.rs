@@ -82,7 +82,7 @@ impl ResourcePools {
         // Leased slots are the one class here whose memory a live borrow may
         // still be reading, and freeing it unmaps that borrow's pointer — a
         // read after this line is a fault, not a stale pixel. So wait for the
-        // holders rather than for a fence: `readback_leases_outstanding` moves
+        // holders rather than for a fence: the pool-owned outstanding count moves
         // with the holder, and a holder never blocks on the engine lock while
         // it holds a lease, so it always makes progress and this always
         // terminates.
@@ -91,12 +91,20 @@ impl ResourcePools {
         // races: it is generous against a scatter that takes ~1 ms, and expiry
         // is reported rather than assumed away.
         let lease_deadline = std::time::Instant::now() + LEASE_QUIESCE;
-        while readback_leases_outstanding() != 0 {
+        while self
+            .readback_lease_returns
+            .outstanding
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+        {
             if std::time::Instant::now() >= lease_deadline {
                 reims_vgpu_observe::Emit::decline(
                     "vk_pools_destroy",
                     &ReadbackLeaseQuiesceExpired {
-                        outstanding: readback_leases_outstanding(),
+                        outstanding: self
+                            .readback_lease_returns
+                            .outstanding
+                            .load(std::sync::atomic::Ordering::Acquire),
                         waited_ms: LEASE_QUIESCE.as_millis() as u64,
                     },
                 )
