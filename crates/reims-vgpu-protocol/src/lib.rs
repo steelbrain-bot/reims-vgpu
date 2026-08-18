@@ -20,6 +20,6 @@ pub use resource::{
     ObjectListEntry, RenderPipelineObject, SamplerObject, OBJECT_LIST_ENTRY_LEN,
 };
 pub use submission::{
-    HeapObject, ResourceObject, ResourceValidity, SegmentBoundary, SegmentKind, SubmissionIdentity,
-    SubmissionResourceUse,
+    HeapObject, IndirectCommandBufferObject, ResourceObject, ResourceValidity, SegmentBoundary,
+    SegmentKind, SubmissionIdentity, SubmissionResourceUse,
 };

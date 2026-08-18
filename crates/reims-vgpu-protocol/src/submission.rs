@@ -13,6 +13,14 @@ pub enum ResourceObject {}
 /// accidental resource relation.
 pub enum HeapObject {}
 
+/// Marker for the indirect-command-buffer allocator's reference namespace.
+///
+/// These references are created and destroyed independently of task resource
+/// list entries. An equal integer in the two namespaces does not identify the
+/// same object.
+#[derive(Debug)]
+pub enum IndirectCommandBufferObject {}
+
 /// The four validity transitions carried beside one submitted resource.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResourceValidity {

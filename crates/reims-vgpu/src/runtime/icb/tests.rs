@@ -74,11 +74,11 @@ fn an_icb_decline_renders_its_check_and_its_class() {
     assert_eq!(line, "render_icb reason=icb_frc_index_span_zero class=args");
 }
 
-/// Process-global ICB cache is shared across tests — serialize metal ICB tests.
+/// Serialize the ICB tests that compare crate-wide observation counters.
 ///
 /// Taken with `unwrap_or_else(|e| e.into_inner())`, never a bare `unwrap`:
-/// the guard only orders access to a process-global cache, so a poisoned
-/// lock carries no unsound state. A bare `unwrap` turns the *first* failing
+/// the guard only orders test observations, so a poisoned lock carries no
+/// unsound state. A bare `unwrap` turns the *first* failing
 /// test into a cascade — when the `compute_mul3add1.mtlb` fixture went
 /// missing, 3 real failures poisoned this lock and reported as 43, burying
 /// the one root cause under 40 `PoisonError`s.
@@ -126,14 +126,10 @@ fn unit_mesh_threads_draw() -> IcbRenderDraw {
     })
 }
 
-/// Hold the encode lock for this test and clear the process-global ICB cache
-/// under it. Thirty-six bodies opened with these two statements; taking the
-/// lock without clearing, or clearing without holding it, are both bugs the
-/// pairing prevents.
+/// Hold the encode lock for this test. The backend encoder used by these tests
+/// is shared; semantic ICB state itself is device-owned.
 fn icb_test_guard() -> std::sync::MutexGuard<'static, ()> {
-    let guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    clear_icb_cache();
-    guard
+    ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A device with task 1 defined and its page tables walked — what every body
@@ -1067,6 +1063,83 @@ fn a_0x1d1_query_is_refused_and_binds_nothing() {
     let after = decode_icb_command_range(&state, &host, 1, 9, 0, 1)
         .expect_err("the query must not have bound the reply buffer as command memory");
     assert_eq!(after, IcbStatus::Missing("icb_fill_no_command_memory"));
+}
+
+#[test]
+fn icb_lifetimes_are_device_owned_generational_and_task_scoped() {
+    let _guard = icb_test_guard();
+    let (mut host_a, mut state_a) = icb_device();
+    let (mut host_b, state_b) = icb_device();
+    let desc = make_icb_desc_bytes(1, 1, false);
+    let gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    put_object(&mut host_a, &state_a, 9, OBJECT_TYPE_TYPE7, gva, &desc);
+    put_object(&mut host_b, &state_b, 9, OBJECT_TYPE_TYPE7, gva, &desc);
+
+    resolve_icb_record(&state_a, &host_a, 1, 9).expect("record first device ICB");
+    resolve_icb_record(&state_b, &host_b, 1, 9).expect("record second device ICB");
+    let first = state_a.icb_registry.identity(1, 9).expect("first identity");
+    bind_icb_command_memory(
+        &state_a,
+        1,
+        9,
+        IcbCommandMemory {
+            gva: 0x4000,
+            byte_len: 64,
+        },
+    )
+    .expect("bind only the first device");
+    assert!(
+        state_b
+            .icb_registry
+            .snapshot(1, 9)
+            .expect("second record")
+            .command_memory
+            .is_none(),
+        "equal task/ref pairs on different devices must not share state"
+    );
+
+    let mut changed = state_a
+        .icb_registry
+        .snapshot(1, 9)
+        .expect("first record")
+        .desc;
+    changed.max_kernel_buffer_bind_count += 1;
+    state_a
+        .icb_registry
+        .record(1, 9, changed)
+        .expect("replace changed declaration");
+    let changed_identity = state_a
+        .icb_registry
+        .identity(1, 9)
+        .expect("changed identity");
+    assert_eq!(first.index(), changed_identity.index());
+    assert_ne!(first.generation(), changed_identity.generation());
+    assert!(
+        state_a
+            .icb_registry
+            .snapshot(1, 9)
+            .expect("changed record")
+            .command_memory
+            .is_none(),
+        "any declaration change invalidates command memory decoded under the old layout"
+    );
+
+    assert!(state_a.icb_registry.delete(1, 9));
+    assert_eq!(state_a.icb_registry.identity(1, 9), None);
+    resolve_icb_record(&state_a, &host_a, 1, 9).expect("recreate deleted ICB");
+    let replacement = state_a
+        .icb_registry
+        .identity(1, 9)
+        .expect("replacement identity");
+    assert_eq!(changed_identity.index(), replacement.index());
+    assert_ne!(changed_identity.generation(), replacement.generation());
+
+    assert!(state_a.delete_task(1));
+    assert_eq!(state_a.icb_registry.identity(1, 9), None);
+    assert!(
+        state_b.icb_registry.identity(1, 9).is_some(),
+        "tearing down one device's task must not touch another device"
+    );
 }
 
 /// Wire encode↔decode of object TG memory lengths + MeshThreadgroups.

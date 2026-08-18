@@ -2785,6 +2785,12 @@ pub struct DeviceState {
     /// them with resource deletion or task teardown.
     #[cfg(feature = "backend-vulkan")]
     pub task_render_pipeline_states: TaskRenderPipelineStates,
+    /// Indirect-command-buffer declarations and guest command-memory spans.
+    ///
+    /// ICB refs form their own task-local namespace. Device ownership ensures
+    /// two emulated GPUs cannot observe each other's declarations and makes a
+    /// reset retire the namespace with the rest of this state.
+    pub(crate) icb_registry: crate::runtime::icb::IcbRegistry,
     /// Type-11 texture object ref → mapping_id: (task_id, ref) -> mapping_id.
     pub texture_to_mapping: BTreeMap<(u32, u32), u32>,
     pub mappings: BTreeMap<u32, MappingEntry>,
@@ -3152,6 +3158,7 @@ impl DeviceState {
             task_depth_stencil_states: TaskDepthStencilStates::default(),
             #[cfg(feature = "backend-vulkan")]
             task_render_pipeline_states: TaskRenderPipelineStates::default(),
+            icb_registry: crate::runtime::icb::IcbRegistry::default(),
             texture_to_mapping: BTreeMap::new(),
             mappings: BTreeMap::new(),
             host_surfaces: BTreeMap::new(),
@@ -3591,6 +3598,10 @@ impl DeviceState {
             "pipeline_state_task_deleted",
             self.task_render_pipeline_states.delete_task(task_id) as u64,
         );
+        crate::runtime::drain::note_store_route_n(
+            "icb_task_deleted",
+            self.icb_registry.delete_task(task_id) as u64,
+        );
         // A deleted task's whole address space goes with it, so its live
         // mappings are not leaks and a reused id must not inherit them.
         self.map_audit.remove(&task_id);
@@ -3653,6 +3664,10 @@ impl DeviceState {
         crate::runtime::drain::note_store_route_n(
             "pipeline_state_task_deleted",
             self.task_render_pipeline_states.delete_task(task_id) as u64,
+        );
+        crate::runtime::drain::note_store_route_n(
+            "icb_task_deleted",
+            self.icb_registry.delete_task(task_id) as u64,
         );
         self.retire_task_linear_residents(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);

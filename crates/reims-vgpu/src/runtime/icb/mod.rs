@@ -5,8 +5,8 @@
 //! Guest create is serialized by
 //! `PGSerializer newIndirectCommandBufferWithDescriptor:layout:maxCommandCount:options:allocator:`
 //! into an 88-byte type-7 body (tag `0x36`) including a 52-byte command
-//! **layout** at `+0x1c`. Product materializes a host ICB and caches it per
-//! `(task_id, icb_ref)`.
+//! **layout** at `+0x1c`. Product records the semantic declaration per device,
+//! task, and ICB reference.
 //!
 //! ## Command fills — buffer-backed, not stream opcodes
 //!
@@ -44,8 +44,9 @@ use crate::runtime::decode::resource::{
 }; // slot-encoder fixtures only
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::objects;
-use std::collections::HashMap;
-use std::sync::OnceLock;
+use reims_vgpu_core::ReferenceNamespace;
+use reims_vgpu_protocol::{IndirectCommandBufferObject, ObjectRef, ResourceId, TaskId};
+use std::collections::BTreeMap;
 
 /// A refusal on the indirect-command-buffer rail.
 ///
@@ -1208,16 +1209,130 @@ fn note_unapplied_icb_flags(task_id: u32, icb_ref: u32, desc: &IndirectCommandBu
 /// Split out because the two halves have different lifetimes as well as
 /// different portability: a descriptor change re-materializes the host object
 /// but does not by itself say the guest re-pointed its command memory.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct IcbRecord {
     desc: IndirectCommandBufferDescriptor,
     /// Guest ICB backing buffer (the command slots the guest filled).
     command_memory: Option<IcbCommandMemory>,
 }
 
-fn icb_registry() -> &'static parking_lot::Mutex<HashMap<(u32, u32), IcbRecord>> {
-    static REGISTRY: OnceLock<parking_lot::Mutex<HashMap<(u32, u32), IcbRecord>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+#[derive(Debug)]
+struct IcbEntry {
+    id: ResourceId<IndirectCommandBufferObject>,
+    record: IcbRecord,
+}
+
+#[derive(Debug, Default)]
+struct IcbRegistryInner {
+    namespace: ReferenceNamespace<IndirectCommandBufferObject>,
+    records: BTreeMap<(u32, u32), IcbEntry>,
+}
+
+/// Device-owned semantic ICB state.
+///
+/// The guest allocates ICB references per task. Keeping the registry on the
+/// device makes reset and multi-device isolation structural, while the typed
+/// namespace makes delete/reuse a new internal lifetime.
+#[derive(Debug, Default)]
+pub(crate) struct IcbRegistry {
+    inner: parking_lot::Mutex<IcbRegistryInner>,
+}
+
+impl IcbRegistry {
+    fn record(
+        &self,
+        task_id: u32,
+        icb_ref: u32,
+        desc: IndirectCommandBufferDescriptor,
+    ) -> Result<IndirectCommandBufferDescriptor, IcbStatus> {
+        let mut inner = self.inner.lock();
+        if let Some(entry) = inner.records.get(&(task_id, icb_ref)) {
+            if entry.record.desc == desc {
+                return Ok(entry.record.desc.clone());
+            }
+        }
+
+        let task = TaskId::new(task_id);
+        let object = ObjectRef::new(icb_ref);
+        inner.records.remove(&(task_id, icb_ref));
+        inner.namespace.release(task, object);
+        let id = inner
+            .namespace
+            .publish(task, object)
+            .map_err(|_| IcbStatus::Args("icb_identity_space_exhausted"))?;
+        inner.records.insert(
+            (task_id, icb_ref),
+            IcbEntry {
+                id,
+                record: IcbRecord {
+                    desc: desc.clone(),
+                    command_memory: None,
+                },
+            },
+        );
+        Ok(desc)
+    }
+
+    fn bind(&self, task_id: u32, icb_ref: u32, mem: IcbCommandMemory) -> Result<(), IcbStatus> {
+        let mut inner = self.inner.lock();
+        let entry = inner
+            .records
+            .get_mut(&(task_id, icb_ref))
+            .ok_or(IcbStatus::Missing("icb_bind_memory_not_cached"))?;
+        entry.record.command_memory = Some(mem);
+        Ok(())
+    }
+
+    fn snapshot(&self, task_id: u32, icb_ref: u32) -> Option<IcbRecord> {
+        let inner = self.inner.lock();
+        let entry = inner.records.get(&(task_id, icb_ref))?;
+        debug_assert_eq!(
+            inner
+                .namespace
+                .resolve(TaskId::new(task_id), ObjectRef::new(icb_ref)),
+            Some(entry.id)
+        );
+        Some(entry.record.clone())
+    }
+
+    pub(crate) fn delete(&self, task_id: u32, icb_ref: u32) -> bool {
+        let mut inner = self.inner.lock();
+        let removed = inner.records.remove(&(task_id, icb_ref)).is_some();
+        let released = inner
+            .namespace
+            .release(TaskId::new(task_id), ObjectRef::new(icb_ref));
+        debug_assert_eq!(removed, released);
+        removed
+    }
+
+    pub(crate) fn delete_task(&self, task_id: u32) -> usize {
+        let mut inner = self.inner.lock();
+        let before = inner.records.len();
+        inner.records.retain(|&(task, _), _| task != task_id);
+        let removed = before - inner.records.len();
+        let released = inner.namespace.release_task(TaskId::new(task_id));
+        debug_assert_eq!(removed, released);
+        removed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn identity(
+        &self,
+        task_id: u32,
+        icb_ref: u32,
+    ) -> Option<ResourceId<IndirectCommandBufferObject>> {
+        self.inner
+            .lock()
+            .records
+            .get(&(task_id, icb_ref))
+            .map(|entry| entry.id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(&self, task_id: u32, icb_ref: u32) {
+        self.record(task_id, icb_ref, IndirectCommandBufferDescriptor::default())
+            .expect("test ICB identity");
+    }
 }
 
 /// Load the guest's ICB descriptor and record it, on every pathway.
@@ -1234,50 +1349,12 @@ pub fn resolve_icb_record<M: HostMemory + HostOps>(
     icb_ref: u32,
 ) -> Result<IndirectCommandBufferDescriptor, IcbStatus> {
     let desc = load_icb_descriptor(state, host, task_id, icb_ref)?;
-    let mut reg = icb_registry().lock();
-    match reg.get_mut(&(task_id, icb_ref)) {
-        Some(rec)
-            if rec.desc.max_command_count == desc.max_command_count
-                && rec.desc.command_types == desc.command_types =>
-        {
-            Ok(rec.desc.clone())
-        }
-        slot => {
-            // A refreshed descriptor starts with no command memory, and that
-            // drops whatever `bind_icb_command_memory` had recorded for this
-            // ref. Unobservable today because nothing binds it, but whoever
-            // finds the wire record that does has to decide here whether a
-            // create-body change invalidates the buffer too — the guest may
-            // have changed only `maxCommandCount` and still be filling the
-            // same slots.
-            let command_memory = None;
-            let rec = IcbRecord {
-                desc: desc.clone(),
-                command_memory,
-            };
-            match slot {
-                Some(existing) => *existing = rec,
-                None => {
-                    reg.insert((task_id, icb_ref), rec);
-                }
-            }
-            Ok(desc)
-        }
-    }
+    state.icb_registry.record(task_id, icb_ref, desc)
 }
 
 // ---------------------------------------------------------------------------
-// Host ICB cache: (task_id, icb_ref) → filled Metal ICB + retained resources
+// ICB auxiliary records and command-memory association
 // ---------------------------------------------------------------------------
-
-/// Drop every recorded ICB and every cached host ICB (tests / task teardown).
-///
-/// One entry point for both maps: they are keyed alike and a registry entry
-/// outliving its host object would name a descriptor no `MTLIndirectCommandBuffer`
-/// was built from. On the Vulkan arm there is no second map to clear.
-pub fn clear_icb_cache() {
-    icb_registry().lock().clear();
-}
 
 /// Info-segment opcode for `PGSerializerInfoCommandEncoder icbHostResourceInfo:info:`.
 ///
@@ -1426,6 +1503,7 @@ pub fn icb_fill_outcome(
 /// Fills are not stream opcodes; the guest writes this buffer via
 /// `PGSerializerIndirectComputeCommand`. Product re-decodes it at execute.
 pub fn bind_icb_command_memory(
+    state: &DeviceState,
     task_id: u32,
     icb_ref: u32,
     mem: IcbCommandMemory,
@@ -1433,12 +1511,7 @@ pub fn bind_icb_command_memory(
     if icb_ref == 0 || mem.gva == 0 || mem.byte_len == 0 {
         return Err(IcbStatus::Args("icb_bind_memory_bad_args"));
     }
-    let mut reg = icb_registry().lock();
-    let rec = reg
-        .get_mut(&(task_id, icb_ref))
-        .ok_or(IcbStatus::Missing("icb_bind_memory_not_cached"))?;
-    rec.command_memory = Some(mem);
-    Ok(())
+    state.icb_registry.bind(task_id, icb_ref, mem)
 }
 
 /// Associate ICB command memory from a type-1 buffer object-list ref (sync path).
@@ -1473,7 +1546,7 @@ pub fn associate_icb_backing_buffer_ref<M: HostMemory + HostOps>(
         gva,
         byte_len: need,
     };
-    bind_icb_command_memory(task_id, icb_ref, mem)?;
+    bind_icb_command_memory(state, task_id, icb_ref, mem)?;
     Ok(mem)
 }
 
@@ -1750,9 +1823,9 @@ pub fn decode_icb_command_range<M: HostMemory + HostOps>(
     use crate::runtime::gva_mem;
 
     let (layout, max_kernel, max_vertex, max_fragment, command_types, max_cmds, mem) = {
-        let reg = icb_registry().lock();
-        let rec = reg
-            .get(&(task_id, icb_ref))
+        let rec = state
+            .icb_registry
+            .snapshot(task_id, icb_ref)
             .ok_or(IcbStatus::Missing("icb_fill_not_cached"))?;
         let mem = rec
             .command_memory
