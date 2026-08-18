@@ -2754,7 +2754,7 @@ fn partial_draw_preserves_a_native_guest_target_seed() {
             row_length_texels: 0,
             pages: None,
         },
-        format: reims_vgpu::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+        format: reims_vgpu_protocol::TexelLayout::Bgra8,
     });
     req.scissors = vec![ScissorResource {
         x: 0,

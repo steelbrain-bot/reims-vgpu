@@ -1560,29 +1560,20 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
         }
     }
     if let Some(seed) = &req.target_guest_seed {
-        let target_format = req
+        let target_layout = req
             .target_identity
             .as_ref()
-            .map(|identity| {
-                super::super::translate::pixel::vk_texel_layout(identity.resident_layout())
-            })
-            .unwrap_or(super::super::translate::pixel::RESIDENT_RGBA_FORMAT);
-        if seed.format != target_format {
+            .map(TargetIdentity::resident_layout)
+            .unwrap_or(reims_vgpu_protocol::TexelLayout::Rgba8);
+        if seed.format != target_layout {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::TargetGuestSeedFormat {
-                    source: seed.format,
-                    target: target_format,
+                    source: super::super::translate::pixel::vk_texel_layout(seed.format),
+                    target: super::super::translate::pixel::vk_texel_layout(target_layout),
                 },
             ));
         }
-        let Some(texel) = super::super::translate::pixel::bytes_per_texel(seed.format) else {
-            return Err(DrawError::DrawValidation(
-                DrawValidationDecline::TargetGuestSeedFormat {
-                    source: seed.format,
-                    target: target_format,
-                },
-            ));
-        };
+        let texel = seed.format.bytes_per_texel();
         let tight_row =
             (req.width as usize)
                 .checked_mul(texel as usize)
@@ -7017,7 +7008,7 @@ mod tests {
                     row_length_texels,
                     pages: None,
                 },
-                format: crate::translate::pixel::RESIDENT_RGBA_FORMAT,
+                format: reims_vgpu_protocol::TexelLayout::Rgba8,
             }),
             ..DrawRequest::default()
         }
@@ -7484,7 +7475,8 @@ mod tests {
         assert!(validate_v1(&req).is_ok());
 
         let mut wrong_format = guest_target_seed_req(4, 2, 40, 40, 6);
-        wrong_format.target_guest_seed.as_mut().unwrap().format = vk::Format::B8G8R8A8_UNORM;
+        wrong_format.target_guest_seed.as_mut().unwrap().format =
+            reims_vgpu_protocol::TexelLayout::Bgra8;
         assert_eq!(
             validation_slug(&wrong_format),
             "vk_draw_validate_target_guest_seed_format"

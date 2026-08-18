@@ -113,6 +113,73 @@ pub struct GuestTargetMemory {
     pub footprint: GuestPageFootprint,
 }
 
+/// A render attachment's prior contents in its bounded guest-memory form.
+#[derive(Clone, Debug)]
+pub struct GuestTargetSeed {
+    pub source: GuestRunSource,
+    /// Physical texel layout of the guest bytes.
+    pub format: reims_vgpu_protocol::TexelLayout,
+}
+
+/// Describe the exact guest-memory window needed to seed an attachment LOAD.
+pub fn guest_target_seed(
+    memory: &GuestTargetMemory,
+    width: u32,
+    height: u32,
+    format: reims_vgpu_protocol::TexelLayout,
+) -> Option<GuestTargetSeed> {
+    if width == 0 || height == 0 || memory.import.is_retired() {
+        return None;
+    }
+    let texel = u64::from(format.bytes_per_texel());
+    let tight_row = u64::from(width).checked_mul(texel)?;
+    let row_pitch = memory.backing.row_pitch;
+    if row_pitch < tight_row || !row_pitch.is_multiple_of(texel) {
+        return None;
+    }
+    let span = u64::from(height - 1)
+        .checked_mul(row_pitch)?
+        .checked_add(tight_row)?;
+    let resource_end = memory
+        .backing
+        .resource_offset
+        .checked_add(memory.backing.resource_len)?;
+    let plane_end = memory.backing.plane_offset.checked_add(span)?;
+    if memory.backing.plane_offset < memory.backing.resource_offset || plane_end > resource_end {
+        return None;
+    }
+    let slice = memory
+        .import
+        .slice(memory.backing.plane_offset, span)
+        .ok()?;
+    let guest = GuestRef::new(std::sync::Arc::clone(&memory.import), slice).ok()?;
+    let host_ptr = memory
+        .import
+        .host_base()
+        .checked_add(usize::try_from(memory.backing.plane_offset).ok()?)?;
+    let row_length_texels = if row_pitch == tight_row {
+        0
+    } else {
+        u32::try_from(row_pitch / texel).ok()?
+    };
+    Some(GuestTargetSeed {
+        source: GuestRunSource {
+            runs: std::sync::Arc::new(vec![GuestRun {
+                host_ptr,
+                len: span,
+            }]),
+            source_offset: 0,
+            total_len: span,
+            row_length_texels,
+            pages: Some(std::sync::Arc::new(vec![GuestWindowRun {
+                window_offset: 0,
+                guest,
+            }])),
+        },
+        format,
+    })
+}
+
 /// A render or compute frame's bounded destination in guest pages.
 #[derive(Debug)]
 pub struct GuestPageTarget {
@@ -1266,6 +1333,41 @@ mod tests {
         assert_eq!(target.window_bytes(), 0x40);
         assert!(!target.rows_are_dense());
         assert_eq!(target.geometry().pitch_bytes, 32);
+    }
+
+    #[test]
+    fn a_guest_target_seed_derives_its_load_window_from_the_plane_contract() {
+        let import = std::sync::Arc::new(
+            GuestRamImport::new_host_allocation(0x1000_0000, 0x4000, 0x1000)
+                .expect("aligned import"),
+        );
+        let memory = GuestTargetMemory {
+            backing: GuestTargetBacking {
+                allocation_host_ptr: import.host_base(),
+                allocation_len: import.len(),
+                resource_offset: 0x1000,
+                resource_len: 0x2000,
+                plane_offset: 0x1200,
+                row_pitch: 32,
+            },
+            import,
+            footprint: GuestPageFootprint::new(std::sync::Arc::from([0x5000, 0x6000]), 0x1000)
+                .expect("footprint"),
+        };
+
+        let seed = guest_target_seed(&memory, 4, 2, reims_vgpu_protocol::TexelLayout::Rgba8)
+            .expect("the plane contains two padded rows");
+        assert_eq!(seed.source.total_len, 48, "one stride plus the final row");
+        assert_eq!(seed.source.row_length_texels, 8);
+        assert_eq!(seed.source.runs[0].host_ptr, 0x1000_1200);
+        assert_eq!(seed.source.pages.as_ref().unwrap().len(), 1);
+
+        let mut outside = memory.clone();
+        outside.backing.plane_offset = 0x2ff8;
+        assert!(
+            guest_target_seed(&outside, 4, 2, reims_vgpu_protocol::TexelLayout::Rgba8,).is_none(),
+            "a plane extending beyond its resource is not widened into its neighbour"
+        );
     }
 
     #[test]

@@ -58,8 +58,8 @@ pub(crate) use counters::{EngineCounters, TargetReadDelivery};
 pub use draw_phase::{take_window as draw_phase_window, DrawPhaseWindow};
 pub use draw_preparation::DrawPreparationDecline;
 pub use facade_decline::EngineFacadeDecline;
-pub use reims_vgpu_memory::GuestPageTarget;
-pub use types::{guest_target_seed, viewport_slot_count};
+pub use reims_vgpu_memory::{guest_target_seed, GuestPageTarget};
+pub use types::viewport_slot_count;
 pub use types::{
     AttachmentInitial, BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorWriteMask,
     ComputeBufferBacking, ComputeBufferResource, ComputeBufferResult, ComputeImageDestination,

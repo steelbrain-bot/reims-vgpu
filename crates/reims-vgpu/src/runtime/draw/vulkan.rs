@@ -1927,7 +1927,7 @@ enum IOSurfaceLoadSeed {
     ),
     /// The mapping's native texels as bounded guest-RAM runs. The engine imports
     /// them when possible and uses the runs themselves for its CPU fallback.
-    Guest(crate::backend::vulkan::engine::GuestTargetSeed),
+    Guest(reims_vgpu_memory::GuestTargetSeed),
 }
 
 impl IOSurfaceSeedRung {
@@ -2081,10 +2081,10 @@ fn try_iosurface_texture_target_guest_seed<M: HostMemory + HostOps>(
     w: u32,
     h: u32,
     target_format: ash::vk::Format,
-) -> Option<crate::backend::vulkan::engine::GuestTargetSeed> {
-    use crate::backend::vulkan::engine::GuestTargetSeed;
+) -> Option<reims_vgpu_memory::GuestTargetSeed> {
     use crate::runtime::mapping_write::iosurface_texture_sample_window;
     use reims_vgpu_memory::GuestRunSource;
+    use reims_vgpu_memory::GuestTargetSeed;
 
     if w == 0 || h == 0 || !mapper::ensure_resolved_for_scanout(state, host, mapping_id) {
         return None;
@@ -2108,8 +2108,7 @@ fn try_iosurface_texture_target_guest_seed<M: HostMemory + HostOps>(
         let (base_off, bpr, _) = iosurface_texture_sample_window(mapping, w, h, format)?;
         (base_off, u64::from(bpr), layout)
     };
-    let source_format = translate::pixel::vk_texel_layout(layout);
-    if source_format != target_format {
+    if translate::pixel::texel_layout_of(target_format) != Some(layout) {
         return None;
     }
     let (span, row_length_texels) =
@@ -2125,7 +2124,7 @@ fn try_iosurface_texture_target_guest_seed<M: HostMemory + HostOps>(
             row_length_texels,
             pages: guest_page_window(host, gpas, page, base_off % page, span),
         },
-        format: source_format,
+        format: layout,
     })
 }
 
@@ -5494,7 +5493,7 @@ pub(super) fn prepare_vertex_step_function(
 #[derive(Default)]
 pub(super) struct GvaLoadResolution {
     pub identity: Option<crate::model::TargetIdentity>,
-    pub guest_seed: Option<crate::backend::vulkan::engine::GuestTargetSeed>,
+    pub guest_seed: Option<reims_vgpu_memory::GuestTargetSeed>,
 }
 
 /// Discharge colour0's typed GVA LOAD source after its packed allocation has
@@ -5538,13 +5537,10 @@ pub(super) fn resolve_gva_load_source<M: HostMemory + HostOps>(
         return GvaLoadResolution::default();
     };
     let (tex_ref, gva, width, height) = (c0.texture_ref, c0.target_gva(), c0.width, c0.height);
-    let target_format = identity.as_ref().map(|identity| {
-        crate::backend::vulkan::translate::pixel::vk_texel_layout(identity.resident_layout())
-    });
+    let target_format = identity.as_ref().map(|identity| identity.resident_layout());
     if let Some(seed) = guest_backing.and_then(|backing| {
-        target_format.and_then(|format| {
-            crate::backend::vulkan::engine::guest_target_seed(backing, width, height, format)
-        })
+        target_format
+            .and_then(|format| reims_vgpu_memory::guest_target_seed(backing, width, height, format))
     }) {
         crate::runtime::drain::note_store_route("gvaseed_guest_pages");
         return GvaLoadResolution {
@@ -9398,7 +9394,7 @@ mod vulkan_split_tests {
         let IOSurfaceLoadSeed::Guest(seed) = seed else {
             panic!("a cold cache should preserve the native guest-page source");
         };
-        assert_eq!(seed.format, ash::vk::Format::B8G8R8A8_UNORM);
+        assert_eq!(seed.format, reims_vgpu_protocol::TexelLayout::Bgra8);
         let (_, bpr, _) = crate::runtime::mapping_write::iosurface_texture_sample_window(
             &state.mappings[&mid],
             w,
