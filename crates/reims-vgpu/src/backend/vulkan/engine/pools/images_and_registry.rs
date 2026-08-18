@@ -2612,7 +2612,7 @@ pub(super) mod pin_count_tests {
             width: 16,
             height: 16,
             generation: 0,
-            format: crate::contract::pixel_format::TexelLayout::Bgra8,
+            format: reims_vgpu_protocol::TexelLayout::Bgra8,
         }
     }
 
@@ -2895,7 +2895,7 @@ pub(super) mod pin_count_tests {
             width: 16,
             height: 16,
             generation: 1,
-            format: crate::contract::pixel_format::TexelLayout::Bgra8,
+            format: reims_vgpu_protocol::TexelLayout::Bgra8,
         }
     }
 

@@ -648,7 +648,7 @@ mod tests {
             DrawValidationDecline::SampledNoLinearTexelFootprint {
                 binding: 32,
                 format: crate::backend::vulkan::translate::pixel::vk_texel_layout(
-                    crate::contract::pixel_format::TexelLayout::Bgra8,
+                    reims_vgpu_protocol::TexelLayout::Bgra8,
                 ),
             },
             DrawValidationDecline::SampledBytesLength {

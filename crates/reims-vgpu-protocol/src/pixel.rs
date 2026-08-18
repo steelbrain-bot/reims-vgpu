@@ -133,7 +133,7 @@ impl TexelLayout {
     }
 
     /// Bytes occupied by one texel in guest linear storage.
-    pub fn bytes_per_texel(self) -> u32 {
+    pub const fn bytes_per_texel(self) -> u32 {
         match self {
             Self::R8 => 1,
             Self::Rg8 | Self::R16Float | Self::R16Unorm => 2,

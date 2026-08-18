@@ -111,7 +111,7 @@ mod tests {
             width: 64,
             height: 32,
             generation: 9,
-            format: crate::contract::pixel_format::TexelLayout::Bgra8,
+            format: reims_vgpu_protocol::TexelLayout::Bgra8,
         }
     }
 

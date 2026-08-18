@@ -1539,14 +1539,14 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
         let Some(expected) = reims_vgpu_protocol::tight_image_bytes(
             req.width,
             req.height,
-            crate::contract::pixel_format::RGBA8_BPP as usize,
+            reims_vgpu_protocol::TexelLayout::Rgba8.bytes_per_texel() as usize,
         ) else {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::UnrepresentableImageBytes {
                     width: req.width,
                     height: req.height,
                     layers: 1,
-                    bytes_per_texel: crate::contract::pixel_format::RGBA8_BPP,
+                    bytes_per_texel: reims_vgpu_protocol::TexelLayout::Rgba8.bytes_per_texel(),
                 },
             ));
         };
@@ -3367,7 +3367,7 @@ pub(crate) unsafe fn execute_draw_inner(
     phase.enter(super::draw_phase::Phase::StageSeed);
     let seed_wide = seed_bytes.and_then(|rgba8| {
         let layout = crate::backend::vulkan::translate::pixel::texel_layout_of(color0_format)?;
-        if layout.bytes_per_texel() == crate::contract::pixel_format::RGBA8_BPP {
+        if layout.bytes_per_texel() == reims_vgpu_protocol::TexelLayout::Rgba8.bytes_per_texel() {
             return None;
         }
         Some((rgba8, layout))
@@ -6187,7 +6187,7 @@ mod tests {
             width: 64,
             height: 32,
             generation: 3,
-            format: crate::contract::pixel_format::TexelLayout::Bgra8,
+            format: reims_vgpu_protocol::TexelLayout::Bgra8,
         }
     }
 
@@ -6992,7 +6992,7 @@ mod tests {
                 content: None,
                 byte_origin: Default::default(),
                 format: crate::backend::vulkan::translate::pixel::vk_texel_layout(
-                    crate::contract::pixel_format::TexelLayout::Bgra8,
+                    reims_vgpu_protocol::TexelLayout::Bgra8,
                 ),
                 identity: None,
                 resource_lifetime: None,
@@ -7087,7 +7087,7 @@ mod tests {
             width: 16,
             height: 16,
             generation: 1,
-            format: crate::contract::pixel_format::TexelLayout::Bgra8,
+            format: reims_vgpu_protocol::TexelLayout::Bgra8,
         };
         let first = target_sample(identity.clone());
         let mut second = target_sample(identity);
@@ -7113,7 +7113,7 @@ mod tests {
             width: 16,
             height: 16,
             generation: 1,
-            format: crate::contract::pixel_format::TexelLayout::Bgra8,
+            format: reims_vgpu_protocol::TexelLayout::Bgra8,
         };
         let mut req = DrawRequest {
             target_identity: Some(primary.clone()),
@@ -7140,7 +7140,7 @@ mod tests {
             width: 16,
             height: 16,
             generation: 1,
-            format: crate::contract::pixel_format::TexelLayout::Bgra8,
+            format: reims_vgpu_protocol::TexelLayout::Bgra8,
         };
         assert_eq!(
             feedback_color_index(&req, &target_sample(unrelated), true),
@@ -7301,7 +7301,7 @@ mod tests {
                 width: 16,
                 height: 16,
                 generation: 1,
-                format: crate::contract::pixel_format::TexelLayout::Bgra8,
+                format: reims_vgpu_protocol::TexelLayout::Bgra8,
             },
             width: 16,
             height: 16,

@@ -11,7 +11,7 @@ use super::device_lost::DeviceLostDecline;
 use super::init_decline::InitDecline;
 use super::types::DrawError;
 use super::vk_call::{VkCall, VkOp};
-use crate::contract::pixel_format::TexelLayout;
+use reims_vgpu_protocol::TexelLayout;
 use reims_vgpu_vulkan::api_floor;
 use reims_vgpu_vulkan::capabilities::{DriverQuirk, HostGpuCaps};
 use reims_vgpu_vulkan::device_select::select_physical_device;
@@ -484,7 +484,7 @@ pub(crate) struct DeviceContext {
     pub spirv_storage_write_without_format: bool,
     pub spirv_storage_read_without_format: bool,
     pub spirv_storage_extended_formats: bool,
-    /// For each [`crate::contract::pixel_format::TexelLayout`], whether this
+    /// For each [`reims_vgpu_protocol::TexelLayout`], whether this
     /// host can sample its Vulkan format with linear filtering; gates the
     /// native sampled rails (see [`DeviceFeatures::sampled_linear_filter`]).
     pub sampled_linear_filter: [bool; TexelLayout::ALL.len()],

@@ -2078,7 +2078,7 @@ mod tests {
             width: 64,
             height: 64,
             generation: 0,
-            format: crate::contract::pixel_format::TexelLayout::Bgra8,
+            format: reims_vgpu_protocol::TexelLayout::Bgra8,
         };
 
         let mut req = DrawRequest {
@@ -2153,7 +2153,7 @@ mod tests {
             width: 64,
             height: 64,
             generation: 1,
-            format: crate::contract::pixel_format::TexelLayout::Bgra8,
+            format: reims_vgpu_protocol::TexelLayout::Bgra8,
         }));
     }
 
@@ -2182,7 +2182,7 @@ mod tests {
             width: 1920,
             height: 1080,
             generation: 4,
-            format: crate::contract::pixel_format::TexelLayout::Bgra8,
+            format: reims_vgpu_protocol::TexelLayout::Bgra8,
         };
         assert_eq!(
             (surface.width(), surface.height(), surface.generation()),
@@ -2215,7 +2215,7 @@ mod tests {
                 width: 1920,
                 height: 1080,
                 generation: 4,
-                format: crate::contract::pixel_format::TexelLayout::Bgra8,
+                format: reims_vgpu_protocol::TexelLayout::Bgra8,
             },
             TargetIdentity::Texture {
                 ref_: 12,
@@ -2229,7 +2229,7 @@ mod tests {
                 width: 8,
                 height: 8,
                 generation: 4,
-                format: crate::contract::pixel_format::TexelLayout::Bgra8,
+                format: reims_vgpu_protocol::TexelLayout::Bgra8,
             },
         ];
         for identity in &all {
@@ -2258,7 +2258,7 @@ mod tests {
             width: 1920,
             height: 1080,
             generation: 2,
-            format: crate::contract::pixel_format::TexelLayout::Bgra8,
+            format: reims_vgpu_protocol::TexelLayout::Bgra8,
         };
         assert_eq!(
             asked.diverges_from(&asked.with_generation(1)),
@@ -2270,7 +2270,7 @@ mod tests {
                 width: 1920,
                 height: 900,
                 generation: 2,
-                format: crate::contract::pixel_format::TexelLayout::Bgra8,
+                format: reims_vgpu_protocol::TexelLayout::Bgra8,
             }),
             TargetKeyDivergence::Geometry
         );
@@ -2293,7 +2293,7 @@ mod tests {
                 width: 1920,
                 height: 1080,
                 generation: 2,
-                format: crate::contract::pixel_format::TexelLayout::Rgba16Float,
+                format: reims_vgpu_protocol::TexelLayout::Rgba16Float,
             }),
             TargetKeyDivergence::Other
         );
@@ -2386,7 +2386,7 @@ mod tests {
             width: 8,
             height: 8,
             generation: 0,
-            format: crate::contract::pixel_format::TexelLayout::Bgra8,
+            format: reims_vgpu_protocol::TexelLayout::Bgra8,
         }
         .is_bgra());
         for (format, bgra) in [
@@ -2447,9 +2447,9 @@ mod tests {
             generation: 7,
             format,
         };
-        let rgba8 = at(crate::contract::pixel_format::TexelLayout::Rgba8);
-        let bgra8 = at(crate::contract::pixel_format::TexelLayout::Bgra8);
-        let rgba16f = at(crate::contract::pixel_format::TexelLayout::Rgba16Float);
+        let rgba8 = at(reims_vgpu_protocol::TexelLayout::Rgba8);
+        let bgra8 = at(reims_vgpu_protocol::TexelLayout::Bgra8);
+        let rgba16f = at(reims_vgpu_protocol::TexelLayout::Rgba16Float);
         assert_ne!(rgba8, bgra8);
         assert_ne!(
             rgba8, rgba16f,
@@ -2485,8 +2485,8 @@ mod tests {
             generation: 7,
             format,
         };
-        let rgba8 = at(crate::contract::pixel_format::TexelLayout::Rgba8);
-        let rgba16f = at(crate::contract::pixel_format::TexelLayout::Rgba16Float);
+        let rgba8 = at(reims_vgpu_protocol::TexelLayout::Rgba8);
+        let rgba16f = at(reims_vgpu_protocol::TexelLayout::Rgba16Float);
         assert_ne!(rgba8, rgba16f, "two images, so two registry slots");
         assert!(
             rgba8.aliases(&rgba16f),
@@ -2500,7 +2500,7 @@ mod tests {
             width: 64,
             height: 64,
             generation: 7,
-            format: crate::contract::pixel_format::TexelLayout::Rgba8,
+            format: reims_vgpu_protocol::TexelLayout::Rgba8,
         };
         assert!(!rgba8.aliases(&elsewhere));
         assert!(!rgba8.aliases(&TargetIdentity::Surface {
@@ -2508,7 +2508,7 @@ mod tests {
             width: 64,
             height: 64,
             generation: 7,
-            format: crate::contract::pixel_format::TexelLayout::Bgra8,
+            format: reims_vgpu_protocol::TexelLayout::Bgra8,
         }));
     }
 }

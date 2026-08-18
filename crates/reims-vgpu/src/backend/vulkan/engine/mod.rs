@@ -715,11 +715,10 @@ struct DeviceCapabilitySnapshot(u64);
 
 const CAP_MAX_DIMENSION_BITS: u32 = u32::BITS;
 const CAP_LAYOUT_SHIFT: u32 = CAP_MAX_DIMENSION_BITS;
-const CAP_GPU_ONLY_BIT: u32 =
-    CAP_LAYOUT_SHIFT + crate::contract::pixel_format::TexelLayout::ALL.len() as u32;
+const CAP_GPU_ONLY_BIT: u32 = CAP_LAYOUT_SHIFT + reims_vgpu_protocol::TexelLayout::ALL.len() as u32;
 const CAP_SAMPLED_FILTER_SHIFT: u32 = CAP_GPU_ONLY_BIT + 1;
 const CAP_PUBLISHED_BIT: u32 =
-    CAP_SAMPLED_FILTER_SHIFT + crate::contract::pixel_format::TexelLayout::ALL.len() as u32;
+    CAP_SAMPLED_FILTER_SHIFT + reims_vgpu_protocol::TexelLayout::ALL.len() as u32;
 const _: () = assert!(CAP_PUBLISHED_BIT < u64::BITS);
 
 impl DeviceCapabilitySnapshot {
@@ -756,10 +755,7 @@ impl DeviceCapabilitySnapshot {
         self.0 as u32
     }
 
-    fn render_target_layout_supported(
-        self,
-        layout: crate::contract::pixel_format::TexelLayout,
-    ) -> bool {
+    fn render_target_layout_supported(self, layout: reims_vgpu_protocol::TexelLayout) -> bool {
         self.0 & (1_u64 << (CAP_LAYOUT_SHIFT + layout.index() as u32)) != 0
     }
 
@@ -769,7 +765,7 @@ impl DeviceCapabilitySnapshot {
 
     fn sampled_layout_linear_filter_if_published(
         self,
-        layout: crate::contract::pixel_format::TexelLayout,
+        layout: reims_vgpu_protocol::TexelLayout,
     ) -> Option<bool> {
         (self.0 & (1_u64 << CAP_PUBLISHED_BIT) != 0)
             .then_some(self.0 & (1_u64 << (CAP_SAMPLED_FILTER_SHIFT + layout.index() as u32)) != 0)
@@ -796,7 +792,7 @@ fn clear_device_capabilities() {
 #[cfg(test)]
 mod device_capability_snapshot_tests {
     use super::*;
-    use crate::contract::pixel_format::TexelLayout;
+    use reims_vgpu_protocol::TexelLayout;
 
     #[test]
     fn the_no_device_snapshot_is_the_conservative_contract() {
@@ -2312,8 +2308,8 @@ pub fn note_resident_content_copied_out(identity: &TargetIdentity) -> bool {
 /// answers `false`, which narrows to the format the target would have had
 /// anyway — an override or an unresolved device may never widen what the
 /// device does.
-pub fn render_target_layout_supported(layout: crate::contract::pixel_format::TexelLayout) -> bool {
-    use crate::contract::pixel_format::TexelLayout;
+pub fn render_target_layout_supported(layout: reims_vgpu_protocol::TexelLayout) -> bool {
+    use reims_vgpu_protocol::TexelLayout;
     if matches!(layout, TexelLayout::Rgba8 | TexelLayout::Bgra8) {
         return true;
     }
@@ -2573,9 +2569,7 @@ pub fn supports_storage_image_write_without_format() -> bool {
 ///
 /// Returns `false` — declining the rail, leaving the sample fail-visible — if
 /// the engine cannot initialize.
-pub fn supports_sampled_layout_linear_filter(
-    layout: crate::contract::pixel_format::TexelLayout,
-) -> bool {
+pub fn supports_sampled_layout_linear_filter(layout: reims_vgpu_protocol::TexelLayout) -> bool {
     if let Some(supported) = device_capabilities().sampled_layout_linear_filter_if_published(layout)
     {
         return supported;
@@ -4524,7 +4518,7 @@ fn readback_bytes_per_texel(format: ash::vk::Format) -> u32 {
 /// frame owes no exchange and says so.
 fn narrow_readback_to_rgba8(
     out: Vec<u8>,
-    layout: crate::contract::pixel_format::TexelLayout,
+    layout: reims_vgpu_protocol::TexelLayout,
     format: ash::vk::Format,
     pixels: u64,
     bgra: bool,
@@ -4823,13 +4817,7 @@ fn resident_read_snapshot(
 fn readback_snapshot(
     pools: &pools::ResourcePools,
     identity: &TargetIdentity,
-) -> Result<
-    (
-        ResidentReadSnapshot,
-        crate::contract::pixel_format::TexelLayout,
-    ),
-    DrawError,
-> {
+) -> Result<(ResidentReadSnapshot, reims_vgpu_protocol::TexelLayout), DrawError> {
     let snap = resident_read_snapshot(pools, identity)?;
     let layout = crate::backend::vulkan::translate::pixel::texel_layout_of(snap.format).ok_or(
         DrawError::TargetRead(reason::TargetReadDecline::TexelNotFourBytes {
@@ -5688,7 +5676,7 @@ mod guest_page_target_tests {
 #[cfg(test)]
 mod readback_width_tests {
     use super::*;
-    use crate::contract::pixel_format::TexelLayout;
+    use reims_vgpu_protocol::TexelLayout;
 
     /// The slot a readback is taken into and the narrowing that consumes it must
     /// derive their texel width from the same place.

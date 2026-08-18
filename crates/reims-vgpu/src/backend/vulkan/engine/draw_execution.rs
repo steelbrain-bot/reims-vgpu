@@ -382,7 +382,7 @@ mod tests {
             width: 64,
             height: 32,
             generation: 9,
-            format: crate::contract::pixel_format::TexelLayout::Bgra8,
+            format: reims_vgpu_protocol::TexelLayout::Bgra8,
         }
     }
 
@@ -498,7 +498,7 @@ mod tests {
                     width: 80,
                     height: 60,
                     generation: 11,
-                    format: crate::contract::pixel_format::TexelLayout::Bgra8,
+                    format: reims_vgpu_protocol::TexelLayout::Bgra8,
                 },
                 "surface",
                 ("identity_id", "7"),
@@ -520,7 +520,7 @@ mod tests {
                     width: 80,
                     height: 60,
                     generation: 11,
-                    format: crate::contract::pixel_format::TexelLayout::Rgba8,
+                    format: reims_vgpu_protocol::TexelLayout::Rgba8,
                 },
                 "gva",
                 ("identity_gva", "0x1234"),
