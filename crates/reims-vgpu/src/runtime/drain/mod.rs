@@ -1571,13 +1571,11 @@ fn note_packet_stamp_waits<H: HostMemory + HostOps>(
         // fires is a stall that was real.
         #[cfg(feature = "backend-vulkan")]
         if source == UnmetSource::Queued {
-            note_store_route(
-                if crate::backend::vulkan::engine::submit_batch_for_waiting_stamp(index) {
-                    "stamp_waiter_flushed_batch"
-                } else {
-                    "stamp_waiter_already_in_flight"
-                },
-            );
+            note_store_route(if state.executor.submit_batch_for_waiting_stamp(index) {
+                "stamp_waiter_flushed_batch"
+            } else {
+                "stamp_waiter_already_in_flight"
+            });
         }
         verdict = verdict.and(StampVerdict::Hold);
         if crate::observe::first_sight(
@@ -1832,9 +1830,8 @@ fn stamp_word_order_on_fifo<H: HostMemory + HostOps>(
     // would let the older completion overwrite the slot with a prior value.
     // Reads count just as much as writes: once this stamp moves, the guest may
     // repaint or free pages a preceding command buffer still sources.
-    let guest_access = crate::backend::vulkan::engine::guest_access_outstanding();
-    let fifo_pending =
-        crate::backend::vulkan::engine::stamp_completion::fifo_has_pending_stamp(index);
+    let guest_access = state.executor.guest_access_outstanding();
+    let fifo_pending = state.executor.completion_stamp_pending(index);
     if StampOrder::from_debt(guest_access, fifo_pending) == StampOrder::CpuReady {
         return StampOrder::CpuReady;
     }
@@ -1862,14 +1859,16 @@ fn stamp_word_order_on_fifo<H: HostMemory + HostOps>(
     // before enqueueing because the completion thread owns the next write and
     // reading the word afterward says nothing about what this device promised.
     note_stamp_direction(host, gpa, index, value);
-    let queued =
-        match crate::backend::vulkan::engine::write_completion_stamp(&guest_ref, index, value) {
-            Ok(()) => true,
-            Err(_) => {
-                note_store_route("stamp_gpu_engine_declined");
-                false
-            }
-        };
+    let queued = match state
+        .executor
+        .write_completion_stamp(&guest_ref, index, value)
+    {
+        Ok(()) => true,
+        Err(_) => {
+            note_store_route("stamp_gpu_engine_declined");
+            false
+        }
+    };
     if queued && !guest_access {
         note_store_route("stamp_pending_fifo_chained");
     }
@@ -1933,7 +1932,7 @@ pub fn write_stamp<H: HostMemory + HostOps>(
             return;
         }
         if order.needs_blocking_fallback() {
-            crate::backend::vulkan::engine::quiesce_completion_stamps(index);
+            state.executor.quiesce_completion_stamps(index);
             // The asynchronous route was required but could not carry the
             // completion. Only this answer may re-read global debt: CpuReady
             // already proved the packet had nothing preceding it, and work
@@ -1942,7 +1941,7 @@ pub fn write_stamp<H: HostMemory + HostOps>(
                 state.executor.as_ref(),
                 crate::runtime::render_writeback::SettleSite::CompletionStamp,
             );
-            crate::backend::vulkan::engine::quiesce_guest_reads();
+            state.executor.quiesce_guest_reads();
         }
     }
     #[cfg(not(feature = "backend-vulkan"))]
@@ -2694,12 +2693,12 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                                 // A declined asynchronous route still owes both
                                 // guest reads and writes before the CPU publishes
                                 // the word, and must let an older root word land.
-                                crate::backend::vulkan::engine::quiesce_completion_stamps(0);
+                                state.executor.quiesce_completion_stamps(0);
                                 crate::runtime::render_writeback::settle_guest_writes(
                                     state.executor.as_ref(),
                                     crate::runtime::render_writeback::SettleSite::RootStamp,
                                 );
-                                crate::backend::vulkan::engine::quiesce_guest_reads();
+                                state.executor.quiesce_guest_reads();
                             }
                         }
                         #[cfg(not(feature = "backend-vulkan"))]

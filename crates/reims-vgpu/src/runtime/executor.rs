@@ -259,6 +259,35 @@ pub trait Executor: std::fmt::Debug + Send + Sync {
 
     fn quiesce_guest_writes(&self) {}
 
+    fn guest_access_outstanding(&self) -> bool {
+        false
+    }
+
+    fn completion_stamp_pending(&self, _index: u32) -> bool {
+        false
+    }
+
+    fn submit_batch_for_waiting_stamp(&self, _index: u32) -> bool {
+        false
+    }
+
+    fn write_completion_stamp(
+        &self,
+        _guest_ref: &crate::runtime::guest_ram::GuestRef,
+        _index: u32,
+        _value: u32,
+    ) -> Result<(), DrawError> {
+        Err(DrawError::Facade(
+            EngineFacadeDecline::ExecutorServiceUnavailable {
+                service: "completion_stamp",
+            },
+        ))
+    }
+
+    fn quiesce_completion_stamps(&self, _index: u32) {}
+
+    fn quiesce_guest_reads(&self) {}
+
     fn execute(&self, submission: ResolvedSubmission) -> Result<ExecutionCompletion, DrawError>;
 
     /// End one guest lifetime while preserving shareable physical-GPU state.
@@ -402,6 +431,35 @@ impl Executor for VulkanExecutor {
 
     fn quiesce_guest_writes(&self) {
         crate::backend::vulkan::engine::quiesce_guest_writes();
+    }
+
+    fn guest_access_outstanding(&self) -> bool {
+        crate::backend::vulkan::engine::guest_access_outstanding()
+    }
+
+    fn completion_stamp_pending(&self, index: u32) -> bool {
+        crate::backend::vulkan::engine::stamp_completion::fifo_has_pending_stamp(index)
+    }
+
+    fn submit_batch_for_waiting_stamp(&self, index: u32) -> bool {
+        crate::backend::vulkan::engine::submit_batch_for_waiting_stamp(index)
+    }
+
+    fn write_completion_stamp(
+        &self,
+        guest_ref: &crate::runtime::guest_ram::GuestRef,
+        index: u32,
+        value: u32,
+    ) -> Result<(), DrawError> {
+        crate::backend::vulkan::engine::write_completion_stamp(guest_ref, index, value)
+    }
+
+    fn quiesce_completion_stamps(&self, index: u32) {
+        crate::backend::vulkan::engine::quiesce_completion_stamps(index);
+    }
+
+    fn quiesce_guest_reads(&self) {
+        crate::backend::vulkan::engine::quiesce_guest_reads();
     }
 
     fn execute(&self, submission: ResolvedSubmission) -> Result<ExecutionCompletion, DrawError> {
