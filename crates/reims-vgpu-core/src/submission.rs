@@ -13,6 +13,9 @@ use std::sync::Arc;
 pub struct SubmissionContext {
     pub identity: SubmissionIdentity,
     pub resources: Arc<[SubmissionResourceUse]>,
+    /// Every admitted segment in command-buffer order.
+    pub segments: Arc<[SegmentBoundary]>,
+    /// Segment containing the operation currently submitted to the executor.
     pub segment: Option<SegmentBoundary>,
 }
 
@@ -25,6 +28,7 @@ impl SubmissionContext {
                 task: TaskId::new(task_id),
             },
             resources: Arc::from([]),
+            segments: Arc::from([]),
             segment: None,
         }
     }
@@ -40,6 +44,7 @@ mod tests {
         assert_eq!(context.identity.task.get(), 7);
         assert_eq!(context.identity.id.get(), 0);
         assert!(context.resources.is_empty());
+        assert!(context.segments.is_empty());
         assert_eq!(context.segment, None);
     }
 }

@@ -57,6 +57,9 @@ pub enum SegmentKind {
 /// The segment containing a backend operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SegmentBoundary {
+    /// Child command-buffer position within the submitted command-buffer list.
+    pub stream_index: u32,
+    /// Segment position within that child command buffer.
     pub index: u32,
     pub kind: SegmentKind,
     pub continues_previous: bool,

@@ -277,6 +277,7 @@ fn a_render_encoder_continuation_keeps_pipeline_state_across_child_buffers() {
         &mut state,
         &mut host,
         1,
+        0,
         &render_segment(&set_pipeline, false, true),
         &mut out,
         &mut open,
@@ -284,6 +285,7 @@ fn a_render_encoder_continuation_keeps_pipeline_state_across_child_buffers() {
     walk_submitted_stream(
         &mut state,
         &mut host,
+        1,
         1,
         &render_segment(&draw, true, true),
         &mut out,
@@ -301,6 +303,7 @@ fn a_render_encoder_continuation_keeps_pipeline_state_across_child_buffers() {
         &mut state,
         &mut host,
         1,
+        2,
         &render_segment(&[], true, false),
         &mut out,
         &mut open,
@@ -308,6 +311,48 @@ fn a_render_encoder_continuation_keeps_pipeline_state_across_child_buffers() {
     assert!(
         open.is_none(),
         "the closing segment owns encoder retirement"
+    );
+}
+
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn submission_context_preserves_every_child_buffer_segment_in_order() {
+    use crate::runtime::decode::stream::{
+        SEGMENT_HEADER_LEN, SEGMENT_TYPE_COMPUTE, SEGMENT_TYPE_RENDER,
+    };
+
+    fn segment(type_: u8, continues_previous: bool, continues_next: bool) -> Vec<u8> {
+        let mut bytes = vec![0u8; SEGMENT_HEADER_LEN];
+        st32(&mut bytes[0..4], SEGMENT_HEADER_LEN as u32);
+        bytes[4] = type_;
+        bytes[5] = u8::from(continues_previous);
+        bytes[6] = u8::from(continues_next);
+        bytes
+    }
+
+    let streams = vec![
+        segment(SEGMENT_TYPE_RENDER, false, true),
+        segment(SEGMENT_TYPE_COMPUTE, true, false),
+    ];
+    let boundaries = semantic_submission_segments(&streams);
+    assert_eq!(
+        boundaries.as_ref(),
+        [
+            SegmentBoundary {
+                stream_index: 0,
+                index: 0,
+                kind: SegmentKind::Render,
+                continues_previous: false,
+                continues_next: true,
+            },
+            SegmentBoundary {
+                stream_index: 1,
+                index: 0,
+                kind: SegmentKind::Compute,
+                continues_previous: true,
+                continues_next: false,
+            },
+        ]
     );
 }
 

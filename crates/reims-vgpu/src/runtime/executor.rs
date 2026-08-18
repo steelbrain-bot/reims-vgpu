@@ -799,7 +799,15 @@ mod tests {
                     set_guest: true,
                 },
             }]),
+            segments: Arc::from([SegmentBoundary {
+                stream_index: 2,
+                index: 3,
+                kind: SegmentKind::Render,
+                continues_previous: false,
+                continues_next: true,
+            }]),
             segment: Some(SegmentBoundary {
+                stream_index: 2,
                 index: 3,
                 kind: SegmentKind::Render,
                 continues_previous: true,

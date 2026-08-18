@@ -827,18 +827,27 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
             )
             .collect::<Vec<_>>()
             .into();
+        let segments = semantic_submission_segments(&streams);
         state.active_submission = Some(crate::runtime::executor::SubmissionContext {
             identity,
             resources,
+            segments,
             segment: None,
         });
     }
 
     let mut open_encoder = None;
-    for stream in streams {
+    for (stream_index, stream) in (0u32..).zip(streams) {
         let walk_started = std::time::Instant::now();
-        let finish_ns =
-            walk_submitted_stream(state, host, task_id, &stream, &mut out, &mut open_encoder);
+        let finish_ns = walk_submitted_stream(
+            state,
+            host,
+            task_id,
+            stream_index,
+            &stream,
+            &mut out,
+            &mut open_encoder,
+        );
         let walk_ns = (walk_started.elapsed().as_nanos() as u64).saturating_sub(finish_ns);
         measured_ns += walk_ns;
         crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Walk, walk_ns);
@@ -1309,6 +1318,47 @@ fn finish_open_encoder<M: HostMemory + HostOps>(
     started.elapsed().as_nanos() as u64
 }
 
+#[cfg(feature = "backend-vulkan")]
+fn semantic_segment_boundary(
+    stream_index: u32,
+    segment: &stream::Segment,
+) -> Option<SegmentBoundary> {
+    let kind = match segment.type_ {
+        SEGMENT_TYPE_RENDER => SegmentKind::Render,
+        SEGMENT_TYPE_COMPUTE => SegmentKind::Compute,
+        SEGMENT_TYPE_BLIT => SegmentKind::Blit,
+        SEGMENT_TYPE_EVENT => SegmentKind::Event,
+        SEGMENT_TYPE_INFO => SegmentKind::Info,
+        _ => return None,
+    };
+    Some(SegmentBoundary {
+        stream_index,
+        index: segment.index,
+        kind,
+        continues_previous: segment.begin_flag != 0,
+        continues_next: segment.unidentified_u8 != 0,
+    })
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn semantic_submission_segments(streams: &[Vec<u8>]) -> Arc<[SegmentBoundary]> {
+    streams
+        .iter()
+        .zip(0u32..)
+        .filter_map(|(bytes, stream_index)| {
+            stream::iter_segments(bytes)
+                .ok()
+                .map(|segments| (stream_index, segments))
+        })
+        .flat_map(|(stream_index, segments)| {
+            segments
+                .into_iter()
+                .filter_map(move |segment| semantic_segment_boundary(stream_index, &segment))
+        })
+        .collect::<Vec<_>>()
+        .into()
+}
+
 /// Walk one submitted child buffer under the segment-header encoder lifetime.
 ///
 /// `open` is submission state, not stream state: the closing flag of one child
@@ -1320,6 +1370,7 @@ fn walk_submitted_stream<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
+    stream_index: u32,
     bytes: &[u8],
     out: &mut ExecResult,
     open: &mut Option<OpenEncoder>,
@@ -1353,20 +1404,7 @@ fn walk_submitted_stream<M: HostMemory + HostOps>(
 
         #[cfg(feature = "backend-vulkan")]
         if let Some(context) = state.active_submission.as_mut() {
-            let kind = match seg.type_ {
-                SEGMENT_TYPE_RENDER => SegmentKind::Render,
-                SEGMENT_TYPE_COMPUTE => SegmentKind::Compute,
-                SEGMENT_TYPE_BLIT => SegmentKind::Blit,
-                SEGMENT_TYPE_EVENT => SegmentKind::Event,
-                SEGMENT_TYPE_INFO => SegmentKind::Info,
-                _ => unreachable!("walk disposition admitted no segment kind"),
-            };
-            context.segment = Some(SegmentBoundary {
-                index: seg.index,
-                kind,
-                continues_previous: seg.begin_flag != 0,
-                continues_next: seg.unidentified_u8 != 0,
-            });
+            context.segment = semantic_segment_boundary(stream_index, &seg);
         }
 
         let mut encoder = if seg.begin_flag != 0 {
