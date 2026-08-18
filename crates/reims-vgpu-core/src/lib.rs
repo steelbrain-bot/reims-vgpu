@@ -10,6 +10,7 @@ pub mod endian;
 pub mod execution;
 pub mod namespace;
 pub mod pixel_format;
+pub mod render;
 pub mod residency;
 pub mod resource;
 pub mod resource_state;
@@ -36,6 +37,15 @@ pub use execution::{
     ResourceStateCompletion,
 };
 pub use namespace::{NamespaceError, ReferenceNamespace};
+pub use render::{
+    viewport_slot_count, AttachmentInitial, AttachmentSlot, BlendFactor, BlendOp,
+    BlendStateResource, BufferContent, CullMode, DepthClipMode, DepthState, DrawOutput,
+    DrawRequest, FillMode, IndexType, IndexedDrawResource, PrimitiveTopology, SampledByteOrigin,
+    SampledContentIdentity, SampledImageResource, SampledSource, ScissorResource,
+    SecondaryColorTarget, SeedOrder, StencilFaceOps, StencilOp, StencilState,
+    StorageBufferResource, VertexAttributeFormat, VertexAttributeResource, VertexStepFunction,
+    ViewportResource, VisibilityResultMode,
+};
 pub use residency::{
     ComputeResidencyService, ComputeStorageOrigin, ComputeStorageResidencyKey, GatherVouch,
     ResidentContentBacking,

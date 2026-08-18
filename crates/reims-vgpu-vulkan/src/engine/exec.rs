@@ -3136,7 +3136,7 @@ pub(crate) unsafe fn execute_draw_inner(
             frag: frag_digest,
             attrs: attr_keys,
             topology: req.primitive_topology,
-            blend: req.blend.map(|b| b.key()),
+            blend: req.blend.as_ref().map(super::types::blend_key),
             secondary_blend: {
                 let mut per_slot = [None; MAX_SECONDARY_ATTACH];
                 for (slot, target) in req
@@ -3145,7 +3145,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     .take(MAX_SECONDARY_ATTACH)
                     .enumerate()
                 {
-                    per_slot[slot] = target.blend.map(|b| b.key());
+                    per_slot[slot] = target.blend.as_ref().map(super::types::blend_key);
                 }
                 per_slot
             },
@@ -5268,8 +5268,12 @@ pub(crate) unsafe fn execute_draw_inner(
     unsafe { pools.bind_vertex_buffers(&ctx.device, cb, counters, &vertex_bufs) };
     match (&req.indexed, &index_slot) {
         (Some(indexed), Some(ibuf)) => {
-            ctx.device
-                .cmd_bind_index_buffer(cb, ibuf.buffer, ibuf.offset, indexed.index_type.vk());
+            ctx.device.cmd_bind_index_buffer(
+                cb,
+                ibuf.buffer,
+                ibuf.offset,
+                crate::translate::raster::vk_index_type(indexed.index_type),
+            );
             ctx.device.cmd_draw_indexed(
                 cb,
                 indexed.index_count,

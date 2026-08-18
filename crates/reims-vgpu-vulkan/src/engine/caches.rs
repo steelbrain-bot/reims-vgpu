@@ -2344,8 +2344,8 @@ impl ObjectCaches {
         if !vertex_binding_divisors.is_empty() {
             vtx_input = vtx_input.push_next(&mut vertex_divisor_state);
         }
-        let input_asm =
-            vk::PipelineInputAssemblyStateCreateInfo::default().topology(key.topology.vk());
+        let input_asm = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(crate::translate::raster::vk_topology(key.topology));
         // Dynamic viewport/scissor so L5 key need not include extent (flip flag is static).
         // Stencil reference is dynamic (Metal's `SetStencilReferenceValue` is a
         // command distinct from the state object) so distinct references reuse
@@ -2401,12 +2401,12 @@ impl ObjectCaches {
                 Some(b) => vk::PipelineColorBlendAttachmentState::default()
                     .color_write_mask(write)
                     .blend_enable(true)
-                    .src_color_blend_factor(b.src_color.vk())
-                    .dst_color_blend_factor(b.dst_color.vk())
-                    .color_blend_op(b.color_op.vk())
-                    .src_alpha_blend_factor(b.src_alpha.vk())
-                    .dst_alpha_blend_factor(b.dst_alpha.vk())
-                    .alpha_blend_op(b.alpha_op.vk()),
+                    .src_color_blend_factor(crate::translate::blend::vk_factor(b.src_color))
+                    .dst_color_blend_factor(crate::translate::blend::vk_factor(b.dst_color))
+                    .color_blend_op(crate::translate::blend::vk_operation(b.color_op))
+                    .src_alpha_blend_factor(crate::translate::blend::vk_factor(b.src_alpha))
+                    .dst_alpha_blend_factor(crate::translate::blend::vk_factor(b.dst_alpha))
+                    .alpha_blend_op(crate::translate::blend::vk_operation(b.alpha_op)),
                 None => vk::PipelineColorBlendAttachmentState::default()
                     .color_write_mask(write)
                     .blend_enable(false),
@@ -2434,9 +2434,9 @@ impl ObjectCaches {
         // left 0 here and supplied dynamically per draw.
         let stencil_face = |ops: super::types::StencilFaceOps| {
             vk::StencilOpState::default()
-                .fail_op(ops.fail_op.vk())
-                .pass_op(ops.pass_op.vk())
-                .depth_fail_op(ops.depth_fail_op.vk())
+                .fail_op(crate::translate::raster::vk_stencil_op(ops.fail_op))
+                .pass_op(crate::translate::raster::vk_stencil_op(ops.pass_op))
+                .depth_fail_op(crate::translate::raster::vk_stencil_op(ops.depth_fail_op))
                 .compare_op(crate::translate::raster::vk_compare_op(ops.compare))
                 .compare_mask(ops.read_mask)
                 .write_mask(ops.write_mask)
