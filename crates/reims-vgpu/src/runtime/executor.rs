@@ -1,22 +1,20 @@
 //! Device-owned backend submission port.
 //!
-//! The request payloads are the existing engine request types during the
-//! compatibility migration. The surrounding identity, full resource list and
-//! segment boundary are backend-independent and already cross the final port.
+//! Draw remains on the compatibility request during migration. Compute and the
+//! surrounding identity, full resource list, and segment boundary are already
+//! backend-independent and cross the final port directly.
 
-use crate::backend::vulkan::engine::{
-    ComputeOutput, ComputeRequest, DrawError, DrawOutput, DrawRequest, EngineFacadeDecline,
-};
+use crate::backend::vulkan::engine::{DrawError, DrawOutput, DrawRequest, EngineFacadeDecline};
 use crate::model::TargetIdentity;
 use reims_vgpu_protocol::StorageImageFormat;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 pub use reims_vgpu_core::{
-    CapabilityService, ComputeResidencyService, ExecutionPort, ExecutorCapabilities,
-    GuestWriteReach, GuestWriteService, PresentDecline, PresentationService, ReadbackLease,
-    ReadbackService, ResidentContent, ResidentContentBacking, ResidentService, ResolvedCommand,
-    ResolvedCommandBuffer, ResourceLifetimeRef, SubmissionContext, TargetReadback,
+    CapabilityService, ComputeOutput, ComputeRequest, ComputeResidencyService, ExecutionPort,
+    ExecutorCapabilities, GuestWriteReach, GuestWriteService, PresentDecline, PresentationService,
+    ReadbackLease, ReadbackService, ResidentContent, ResidentContentBacking, ResidentService,
+    ResolvedCommand, ResolvedCommandBuffer, ResourceLifetimeRef, SubmissionContext, TargetReadback,
 };
 
 /// Dynamic executor-session scope for one device operation.

@@ -9,5 +9,6 @@ license = "GPL-2.0-or-later"
 name = "reims_vgpu_core"
 
 [dependencies]
+reims-vgpu-memory = { path = "../reims-vgpu-memory" }
 reims-vgpu-paging = { path = "../reims-vgpu-paging" }
 reims-vgpu-protocol = { path = "../reims-vgpu-protocol" }

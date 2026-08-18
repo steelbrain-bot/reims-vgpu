@@ -4,6 +4,7 @@
 
 pub mod blit;
 pub mod capabilities;
+pub mod compute;
 pub mod draw;
 pub mod endian;
 pub mod execution;
@@ -20,6 +21,14 @@ pub mod visibility;
 
 pub use blit::{BufferFillPattern, ResolvedBufferBlit, ResolvedBufferRange};
 pub use capabilities::{CapabilityService, DeviceInfoLimits, ExecutorCapabilities, MAX_CHANNELS};
+pub use compute::{
+    ComputeBufferBacking, ComputeBufferOutput, ComputeBufferResource, ComputeBufferResult,
+    ComputeImageDestination, ComputeImageResult, ComputeOutput, ComputeRequest,
+    ComputeResidentSampleBind, ComputeSampledImageResource, ComputeSampledImageSource,
+    ComputeStorageImageResource, ComputeStorageImageSeed, ComputeStorageResidency,
+    SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter,
+    SamplerMipFilter, SamplerResource,
+};
 pub use execution::{
     execute_resolved_submission, BlitCompletion, CommandExecution, ExecutionCompletion,
     ExecutionKind, ExecutionOutput, ExecutionPort, ExecutionReceipt, ResolvedCommand,

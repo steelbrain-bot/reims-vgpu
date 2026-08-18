@@ -3208,7 +3208,12 @@ pub(crate) unsafe fn execute_draw_inner(
     phase.enter(super::draw_phase::Phase::PipelineSampler);
     let mut sampler_handles = Vec::new();
     for s in &req.samplers {
-        let h = caches.get_or_create_sampler(ctx, &s.state_key(), counters, pools)?;
+        let h = caches.get_or_create_sampler(
+            ctx,
+            &super::types::sampler_state_key(s),
+            counters,
+            pools,
+        )?;
         sampler_handles.push((s.binding, h));
     }
 

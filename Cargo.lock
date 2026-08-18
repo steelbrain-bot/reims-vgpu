@@ -1119,6 +1119,7 @@ version = "0.1.0"
 name = "reims-vgpu-core"
 version = "0.1.0"
 dependencies = [
+ "reims-vgpu-memory",
  "reims-vgpu-paging",
  "reims-vgpu-protocol",
 ]

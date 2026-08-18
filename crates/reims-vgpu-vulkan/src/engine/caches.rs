@@ -2055,17 +2055,19 @@ impl ObjectCaches {
             .device
             .create_sampler(
                 &vk::SamplerCreateInfo::default()
-                    .mag_filter(mag_filter.vk())
-                    .min_filter(min_filter.vk())
-                    .mipmap_mode(mip_filter.vk())
-                    .address_mode_u(address_mode_u.vk())
-                    .address_mode_v(address_mode_v.vk())
-                    .address_mode_w(conformed.address_mode_w.vk())
+                    .mag_filter(crate::translate::sampler::vk_filter(mag_filter))
+                    .min_filter(crate::translate::sampler::vk_filter(min_filter))
+                    .mipmap_mode(crate::translate::sampler::vk_mipmap_mode(mip_filter))
+                    .address_mode_u(crate::translate::sampler::vk_address_mode(address_mode_u))
+                    .address_mode_v(crate::translate::sampler::vk_address_mode(address_mode_v))
+                    .address_mode_w(crate::translate::sampler::vk_address_mode(
+                        conformed.address_mode_w,
+                    ))
                     .mip_lod_bias(0.0)
                     .anisotropy_enable(max_anisotropy_req > 1)
                     .max_anisotropy(max_anisotropy)
                     .compare_enable(compare_function != super::types::SamplerCompareFunction::Never)
-                    .compare_op(compare_function.vk())
+                    .compare_op(crate::translate::raster::vk_compare_op(compare_function))
                     .min_lod(min_lod)
                     .max_lod(max_lod)
                     .border_color(translate::sampler::vk_border_color_with_clamp_to_zero(
@@ -2435,7 +2437,7 @@ impl ObjectCaches {
                 .fail_op(ops.fail_op.vk())
                 .pass_op(ops.pass_op.vk())
                 .depth_fail_op(ops.depth_fail_op.vk())
-                .compare_op(ops.compare.vk())
+                .compare_op(crate::translate::raster::vk_compare_op(ops.compare))
                 .compare_mask(ops.read_mask)
                 .write_mask(ops.write_mask)
                 .reference(0)
@@ -2443,7 +2445,7 @@ impl ObjectCaches {
         let mut depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
             .depth_test_enable(key.depth_test)
             .depth_write_enable(key.depth_write)
-            .depth_compare_op(key.depth_compare.vk())
+            .depth_compare_op(crate::translate::raster::vk_compare_op(key.depth_compare))
             .depth_bounds_test_enable(false)
             .stencil_test_enable(key.stencil.is_some());
         if let Some(s) = key.stencil {

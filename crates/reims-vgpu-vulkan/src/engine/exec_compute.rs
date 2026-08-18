@@ -691,7 +691,12 @@ pub(crate) unsafe fn execute_compute_inner(
 
     let mut sampler_handles = Vec::new();
     for sampler in &req.samplers {
-        let handle = caches.get_or_create_sampler(ctx, &sampler.state_key(), counters, pools)?;
+        let handle = caches.get_or_create_sampler(
+            ctx,
+            &super::types::sampler_state_key(sampler),
+            counters,
+            pools,
+        )?;
         sampler_handles.push((sampler.binding, handle));
     }
 

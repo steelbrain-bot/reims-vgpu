@@ -6,10 +6,19 @@
 use ash::vk;
 
 use crate::translate;
+pub use reims_vgpu_core::{
+    ComputeBufferBacking, ComputeBufferOutput, ComputeBufferResource, ComputeBufferResult,
+    ComputeImageDestination, ComputeImageResult, ComputeOutput, ComputeRequest,
+    ComputeResidentSampleBind, ComputeSampledImageResource, ComputeSampledImageSource,
+    ComputeStorageImageResource, ComputeStorageImageSeed, ComputeStorageResidency,
+    SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter,
+    SamplerMipFilter, SamplerResource,
+};
 pub use reims_vgpu_memory::{
     GuestRun, GuestRunSource, GuestTargetBacking, GuestTargetMemory, GuestTargetSeed, WindowStretch,
 };
 pub use reims_vgpu_protocol::ColorWriteMask;
+pub use reims_vgpu_protocol::StorageImageFormat;
 
 /// Named engine failure. Stable prefixes for observe greps (`vk_engine_*`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1056,145 +1065,6 @@ pub enum SampledByteOrigin {
     LinearTexture,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub enum SamplerFilter {
-    #[default]
-    Nearest,
-    Linear,
-}
-
-impl SamplerFilter {
-    pub(crate) fn vk(self) -> vk::Filter {
-        translate::sampler::vk_filter(self)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub enum SamplerMipFilter {
-    #[default]
-    NotMipmapped,
-    Nearest,
-    Linear,
-}
-
-impl SamplerMipFilter {
-    pub(crate) fn vk(self) -> vk::SamplerMipmapMode {
-        translate::sampler::vk_mipmap_mode(self)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub enum SamplerAddressMode {
-    #[default]
-    ClampToEdge,
-    MirrorClampToEdge,
-    Repeat,
-    MirrorRepeat,
-    ClampToZero,
-    ClampToBorderColor,
-}
-
-impl SamplerAddressMode {
-    pub(crate) fn vk(self) -> vk::SamplerAddressMode {
-        translate::sampler::vk_address_mode(self)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub enum SamplerBorderColor {
-    #[default]
-    TransparentBlack,
-    OpaqueBlack,
-    OpaqueWhite,
-}
-
-// Deliberately no `vk()` here. A sampler's border colour is not a property of
-// the declared colour alone: Metal's `ClampToZero` address mode forces
-// transparent black whatever the descriptor says, so the two must be decided
-// together — see `translate::sampler::vk_border_color_with_clamp_to_zero`.
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub enum SamplerCompareFunction {
-    #[default]
-    Never,
-    Less,
-    Equal,
-    LessEqual,
-    Greater,
-    NotEqual,
-    GreaterEqual,
-    Always,
-}
-
-impl SamplerCompareFunction {
-    pub(crate) fn vk(self) -> vk::CompareOp {
-        translate::raster::vk_compare_op(self)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub struct SamplerResource {
-    pub binding: u32,
-    pub min_filter: SamplerFilter,
-    pub mag_filter: SamplerFilter,
-    pub mip_filter: SamplerMipFilter,
-    pub address_mode_u: SamplerAddressMode,
-    pub address_mode_v: SamplerAddressMode,
-    pub address_mode_w: SamplerAddressMode,
-    pub border_color: SamplerBorderColor,
-    pub compare_function: SamplerCompareFunction,
-    pub lod_min: u32, // f32 bits for Hash
-    pub lod_max: u32,
-    pub max_anisotropy: u32,
-    pub unnormalized_coordinates: bool,
-}
-
-impl SamplerResource {
-    pub fn normalized_default(binding: u32) -> Self {
-        Self {
-            binding,
-            min_filter: SamplerFilter::Linear,
-            mag_filter: SamplerFilter::Linear,
-            mip_filter: SamplerMipFilter::NotMipmapped,
-            address_mode_u: SamplerAddressMode::ClampToEdge,
-            address_mode_v: SamplerAddressMode::ClampToEdge,
-            address_mode_w: SamplerAddressMode::ClampToEdge,
-            border_color: SamplerBorderColor::TransparentBlack,
-            compare_function: SamplerCompareFunction::Never,
-            lod_min: 0.0f32.to_bits(),
-            lod_max: f32::MAX.to_bits(),
-            max_anisotropy: 1,
-            unnormalized_coordinates: false,
-        }
-    }
-
-    pub fn lod_min_f32(&self) -> f32 {
-        f32::from_bits(self.lod_min)
-    }
-
-    pub fn lod_max_f32(&self) -> f32 {
-        f32::from_bits(self.lod_max)
-    }
-
-    /// State without binding (for L6 cache key).
-    pub(crate) fn state_key(&self) -> SamplerStateKey {
-        SamplerStateKey {
-            min_filter: self.min_filter,
-            mag_filter: self.mag_filter,
-            mip_filter: self.mip_filter,
-            address_mode_u: self.address_mode_u,
-            address_mode_v: self.address_mode_v,
-            address_mode_w: self.address_mode_w,
-            border_color: self.border_color,
-            compare_function: self.compare_function,
-            lod_min: self.lod_min,
-            lod_max: self.lod_max,
-            max_anisotropy: self.max_anisotropy,
-            unnormalized_coordinates: self.unnormalized_coordinates,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct SamplerStateKey {
     pub min_filter: SamplerFilter,
@@ -1209,6 +1079,23 @@ pub(crate) struct SamplerStateKey {
     pub lod_max: u32,
     pub max_anisotropy: u32,
     pub unnormalized_coordinates: bool,
+}
+
+pub(crate) fn sampler_state_key(sampler: &SamplerResource) -> SamplerStateKey {
+    SamplerStateKey {
+        min_filter: sampler.min_filter,
+        mag_filter: sampler.mag_filter,
+        mip_filter: sampler.mip_filter,
+        address_mode_u: sampler.address_mode_u,
+        address_mode_v: sampler.address_mode_v,
+        address_mode_w: sampler.address_mode_w,
+        border_color: sampler.border_color,
+        compare_function: sampler.compare_function,
+        lod_min: sampler.lod_min,
+        lod_max: sampler.lod_max,
+        max_anisotropy: sampler.max_anisotropy,
+        unnormalized_coordinates: sampler.unnormalized_coordinates,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -1312,318 +1199,6 @@ pub(crate) struct BlendKey {
 
 /// Named compute failure. Same `vk_engine_*` prefix family as draw.
 pub type ComputeError = DrawError;
-
-/// Inputs for one compute dispatch. Engine receives resolved bytes + SPIR-V only.
-#[derive(Debug, Default)]
-pub struct ComputeRequest {
-    /// Vulkan-dialect compute SPIR-V (LocalSize baked in by metal2vulkan).
-    pub spirv: Vec<u32>,
-    /// Entry point name (m2v kernel entry is `"main"`).
-    pub entry: String,
-    /// Workgroup counts in (x, y, z). Runtime converts threads→groups when needed.
-    pub grid: [u32; 3],
-    /// Storage-buffer descriptors with reflected shader write access.
-    pub storage_buffers: Vec<ComputeBufferResource>,
-    /// Sampled images (binding, format, geometry, immutable input bytes).
-    pub sampled_images: Vec<ComputeSampledImageResource>,
-    /// Separate sampler descriptors used by sampled-image operands.
-    pub samplers: Vec<SamplerResource>,
-    /// Storage images (binding, format, geometry, seed bytes); always read back.
-    pub storage_images: Vec<ComputeStorageImageResource>,
-}
-
-#[derive(Debug, Default)]
-pub struct ComputeOutput {
-    /// Writable-buffer readbacks only. Read-only descriptors never cross the
-    /// device→host boundary after dispatch.
-    pub buffers: Vec<ComputeBufferOutput>,
-    /// One result per requested storage image, in request order (same length as
-    /// `storage_images`).
-    ///
-    /// Which variant comes back is decided entirely by the matching request's
-    /// [`ComputeStorageImageResource::destination`] — the engine does not choose
-    /// a rail here, it honours the one it was given, so the caller can pair
-    /// result `i` with its own destination without asking the engine what it
-    /// did.
-    pub images: Vec<ComputeImageResult>,
-}
-
-/// Where one storage image's post-dispatch pixels land.
-///
-/// The two variants are the two ways of naming the same landing site, which is
-/// why this is one field and not a `Vec<u8>` with a flag beside it: a request
-/// carrying both a host buffer and a guest window could name two destinations,
-/// and nothing downstream could say which one the guest would read.
-///
-/// This replaces a deleted `images_direct` boolean. The flag went when the
-/// deferred-flush rail was retired and the direct arm went with it; the render
-/// side got [`crate::runtime::render_writeback`] as its replacement and this
-/// rail got nothing, so every image came back through a host readback. See
-/// [`ComputeImageResult`].
-#[derive(Default)]
-pub enum ComputeImageDestination {
-    /// The engine reads the pixels back into host memory and the caller writes
-    /// guest memory itself.
-    ///
-    /// The default, and the *only* form available on a host whose
-    /// `VK_EXT_external_memory_host` capability is not
-    /// [`crate::host_pointer::HostPointerImport::Supported`].
-    /// It is not a fallback bolted in front of a general path: on such a host it
-    /// is the general path, and it is what a discrete GPU takes whenever staging
-    /// is the correct answer.
-    #[default]
-    Host,
-    /// The dispatch's own image→buffer copy lands directly in these guest pages
-    /// and no pixels cross device→host.
-    ///
-    /// Carries the same [`super::GuestPageTarget`] the render rail writes through, so
-    /// the guest-window geometry has exactly one spelling in this crate.
-    ///
-    /// # Why the guest cannot see these pages before the copy lands
-    ///
-    /// The copy is only *submitted*, so the ordering argument is the whole
-    /// licence for this variant, and it is inherited rather than built. Arming
-    /// `record_guest_write_debt` sets the process-global `GUEST_WRITE_DEBT`,
-    /// which makes `guest_access_outstanding()` true, which removes
-    /// `StampOrder::CpuReady` from the answers
-    /// `runtime::drain::stamp_word_order_on_fifo` may give. The stamp is then
-    /// handed to `write_completion_stamp`, and the completion thread waits the
-    /// queue's monotonic timeline before it release-stores the word the guest
-    /// polls. This dispatch submitted through the same `ResourcePools` ring and
-    /// the same `submit_guest_work` the render rail uses, so its timeline value
-    /// is below the awaited one and the bytes are in RAM before the guest is
-    /// told anything.
-    ///
-    /// Nothing in that chain names a rail — it is the contract the render rail
-    /// happened to be the only caller of. Two things it is easy to misread:
-    /// the `settle_guest_writes` in `write_stamp` is on the *declined* path
-    /// only and is not what carries a healthy boot, and `write_completion_stamp`
-    /// takes only the *read* debt, deliberately leaving this write debt set so
-    /// later stamps stay ordered until a host reader settles it.
-    GuestPages {
-        target: Box<super::GuestPageTarget>,
-        /// The pages the copy is licensed over, in guest-virtual order.
-        ///
-        /// Carried beside the target and not derived from it, for the same
-        /// reason `copy_target_to_guest_pages` takes the two separately: the
-        /// target holds *host* references into those pages and the write debt
-        /// has to be armed on their guest-physical addresses, which a reference
-        /// cannot be turned back into. One walk produced both.
-        pages: Vec<u64>,
-    },
-}
-
-impl std::fmt::Debug for ComputeImageDestination {
-    /// Names the arm and the window's size, never the window's addresses. A
-    /// [`super::GuestPageTarget`] holds live host pointers into guest RAM, and a
-    /// derived `Debug` would put them in any log line that formats a
-    /// `ComputeRequest`.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Host => f.write_str("Host"),
-            Self::GuestPages { target, pages } => write!(
-                f,
-                "GuestPages({}x{}, {} runs, {} pages)",
-                target.width,
-                target.height,
-                target.runs.len(),
-                pages.len()
-            ),
-        }
-    }
-}
-
-/// What one storage image's dispatch produced, paired with the destination that
-/// was asked for.
-#[derive(Debug)]
-pub enum ComputeImageResult {
-    /// Readback pixels, for [`ComputeImageDestination::Host`]. Tight rows: the
-    /// caller re-pitches them into the guest's window.
-    Bytes(Vec<u8>),
-    /// The copy into the guest's own pages is on the queue, for
-    /// [`ComputeImageDestination::GuestPages`]. There are no bytes to hand back
-    /// because none were read.
-    ///
-    /// The caller owes a settle before anything reads those pages, not a
-    /// writeback — the same debt the render rail arms through
-    /// `record_guest_write_debt`. `bytes` is what the copy will land, for the
-    /// census, and is not a length of anything the caller holds.
-    Landed { bytes: u64 },
-}
-
-impl ComputeImageResult {
-    /// The readback pixels, or `None` where the engine wrote guest pages
-    /// directly and never read any.
-    ///
-    /// `None` is not an error and not an empty frame — it means the bytes are
-    /// already where they were going. A caller that treats it as "no output"
-    /// would silently drop a landed frame, so match the variant where the two
-    /// cases need different work and use this only where they do not.
-    pub fn bytes(&self) -> Option<&[u8]> {
-        match self {
-            Self::Bytes(bytes) => Some(bytes),
-            Self::Landed { .. } => None,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct ComputeBufferResource {
-    pub binding: u32,
-    /// Complete ownership of the bytes bound as this storage descriptor.
-    pub backing: ComputeBufferBacking,
-    /// Structurally proven write access in the SPIR-V pointer-use graph.
-    pub writable: bool,
-}
-
-#[derive(Debug)]
-pub enum ComputeBufferBacking {
-    /// Host-owned bytes, used on hosts that cannot import the guest allocation.
-    Bytes(Vec<u8>),
-    /// The retained guest allocation itself. `write_pages` is the exact
-    /// physical footprint published when a writable descriptor is bound
-    /// directly; source and destination therefore name one incarnation.
-    GuestPages {
-        source: GuestRunSource,
-        write_pages: Vec<u64>,
-    },
-}
-
-impl ComputeBufferBacking {
-    pub fn len(&self) -> usize {
-        match self {
-            Self::Bytes(bytes) => bytes.len(),
-            Self::GuestPages { source, .. } => source.total_len as usize,
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-#[derive(Debug)]
-pub struct ComputeBufferOutput {
-    pub binding: u32,
-    pub result: ComputeBufferResult,
-}
-
-impl ComputeBufferOutput {
-    pub fn bytes(&self) -> Option<&[u8]> {
-        self.result.bytes()
-    }
-}
-
-#[derive(Debug)]
-pub enum ComputeBufferResult {
-    /// The engine used a host-visible buffer and returned its contents.
-    Bytes(Vec<u8>),
-    /// The shader wrote the imported guest allocation itself. The write is
-    /// queued and covered by the guest-write completion ledger.
-    Landed { bytes: u64 },
-}
-
-impl ComputeBufferResult {
-    pub fn bytes(&self) -> Option<&[u8]> {
-        match self {
-            Self::Bytes(bytes) => Some(bytes),
-            Self::Landed { .. } => None,
-        }
-    }
-}
-
-/// Storage image for compute. Formats mirror the live `simg_u32_to_vk_storage` map.
-///
-/// Single-layer 2D only: a compute texture binding is staged from one IOSurface texture
-/// plane window or one linear GVA level, both of which are a flat `width ×
-/// height` rectangle. There is no decoded slice or depth axis on this rail, so
-/// the engine builds `TYPE_2D` unconditionally.
-#[derive(Debug)]
-pub struct ComputeStorageImageResource {
-    pub binding: u32,
-    pub array_element: u32,
-    pub descriptor_count: u32,
-    pub format: StorageImageFormat,
-    pub width: u32,
-    pub height: u32,
-    /// Prior contents read into the image before the dispatch. The variant is
-    /// the complete source decision: no placeholder byte vector or companion
-    /// flag can disagree with it.
-    pub seed: ComputeStorageImageSeed,
-    /// Where the post-dispatch pixels go. See [`ComputeImageDestination`].
-    pub destination: ComputeImageDestination,
-    /// Exact IOSurface texture resource lifetime/view contract for persistent GPU
-    /// storage. `None` keeps the conservative transient upload path.
-    pub residency: Option<ComputeStorageResidency>,
-}
-
-#[derive(Debug)]
-pub enum ComputeStorageImageSeed {
-    /// Tight host bytes. This is the complete fallback on a host that cannot
-    /// retain/import guest pages.
-    Bytes(Vec<u8>),
-    /// The guest allocation itself, including its physical row pitch.
-    GuestPages(GuestRunSource),
-    /// The matching compute-storage resident already holds the current
-    /// generation; no seed copy is required.
-    Resident,
-}
-
-/// Bind request for a sampled input whose window content the engine already
-/// holds GPU-resident (a prior dispatch's storage output). The engine copies
-/// the resident image into the transient sampled image device-locally instead
-/// of uploading `bytes` (which is a zero placeholder and must never reach the
-/// GPU): the copy never aliases the live resident, so the same dispatch may
-/// also storage-write that identity. A missing/mismatched resident fails
-/// visibly with a `vk_compute_exec_resident_sample_*` decline naming the check
-/// that refused.
-#[derive(Clone, Copy, Debug)]
-pub struct ComputeResidentSampleBind {
-    pub identity: reims_vgpu_core::ComputeStorageResidencyKey,
-    /// Generation the caller verified against the registry at stage time.
-    pub generation: u32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ComputeStorageResidency {
-    pub identity: reims_vgpu_core::ComputeStorageResidencyKey,
-    /// Generation represented by `bytes` before this dispatch.
-    pub seed_generation: u32,
-    /// Generation guest memory will represent after successful writeback.
-    pub output_generation: u32,
-}
-
-/// Read-only sampled image for compute. The format set is shared with storage
-/// images because both are derived from the same Metal pixel-format contract;
-/// descriptor access is carried separately by the request field.
-///
-/// Single-layer 2D only, for the same reason as
-/// [`ComputeStorageImageResource`].
-#[derive(Debug)]
-pub struct ComputeSampledImageResource {
-    pub binding: u32,
-    pub array_element: u32,
-    pub descriptor_count: u32,
-    pub format: StorageImageFormat,
-    pub width: u32,
-    pub height: u32,
-    pub source: ComputeSampledImageSource,
-    pub content: Option<reims_vgpu_core::ContentStamp>,
-}
-
-#[derive(Debug)]
-pub enum ComputeSampledImageSource {
-    /// Tight host bytes for synthetic inputs and hosts without a retained guest
-    /// allocation.
-    Bytes(Vec<u8>),
-    /// The exact guest allocation/window the resource object retains.
-    GuestPages(GuestRunSource),
-    /// A prior storage dispatch's resident image, copied device-locally so the
-    /// sampled view cannot alias a simultaneous storage write.
-    Resident(ComputeResidentSampleBind),
-}
-
-pub use reims_vgpu_protocol::StorageImageFormat;
 
 // ---------------------------------------------------------------------------
 // Draw residency (workstream D)
@@ -1824,12 +1399,12 @@ mod tests {
     fn sampler_cache_state_excludes_binding_but_preserves_sampler_state() {
         let first = SamplerResource::normalized_default(3);
         let mut rebound = SamplerResource::normalized_default(27);
-        assert_eq!(first.state_key(), rebound.state_key());
+        assert_eq!(sampler_state_key(&first), sampler_state_key(&rebound));
         assert_eq!(first.lod_min_f32(), 0.0);
         assert_eq!(first.lod_max_f32(), f32::MAX);
 
         rebound.address_mode_v = SamplerAddressMode::Repeat;
-        assert_ne!(first.state_key(), rebound.state_key());
+        assert_ne!(sampler_state_key(&first), sampler_state_key(&rebound));
     }
 
     #[test]
