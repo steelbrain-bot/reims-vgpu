@@ -625,10 +625,7 @@ pub struct TaskResource {
     /// matching identity instead of overwriting an unrelated child lease.
     #[cfg(feature = "backend-vulkan")]
     resident_targets: Mutex<
-        HashMap<
-            crate::backend::vulkan::engine::TargetIdentity,
-            Box<dyn crate::runtime::executor::ResidentLease>,
-        >,
+        HashMap<crate::model::TargetIdentity, Box<dyn crate::runtime::executor::ResidentLease>>,
     >,
 }
 
@@ -716,8 +713,8 @@ impl TaskResource {
     pub fn resident_target_backing(
         &self,
         executor: &dyn crate::runtime::executor::Executor,
-        identity: &crate::backend::vulkan::engine::TargetIdentity,
-    ) -> crate::backend::vulkan::engine::ResidentContentBacking {
+        identity: &crate::model::TargetIdentity,
+    ) -> crate::runtime::executor::ResidentContentBacking {
         self.resident_target_backing_with(identity, |identity| {
             executor.retain_resident_resource(identity)
         })
@@ -726,12 +723,12 @@ impl TaskResource {
     #[cfg(feature = "backend-vulkan")]
     fn resident_target_backing_with(
         &self,
-        identity: &crate::backend::vulkan::engine::TargetIdentity,
+        identity: &crate::model::TargetIdentity,
         retain: impl FnOnce(
-            &crate::backend::vulkan::engine::TargetIdentity,
+            &crate::model::TargetIdentity,
         ) -> Option<Box<dyn crate::runtime::executor::ResidentLease>>,
-    ) -> crate::backend::vulkan::engine::ResidentContentBacking {
-        use crate::backend::vulkan::engine::ResidentContentBacking;
+    ) -> crate::runtime::executor::ResidentContentBacking {
+        use crate::runtime::executor::ResidentContentBacking;
 
         let mut held = self
             .resident_targets
@@ -806,10 +803,35 @@ impl TaskResourceLifetimeRef {
 #[cfg(all(test, feature = "backend-vulkan"))]
 mod task_resource_resident_tests {
     use super::*;
-    use crate::backend::vulkan::engine::{
-        ResidentContentBacking, ResidentResourceLease, TargetIdentity,
-    };
+    use crate::model::TargetIdentity;
+    use crate::runtime::executor::{ResidentContentBacking, ResidentLease};
     use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[derive(Debug)]
+    struct TestLease {
+        identity: TargetIdentity,
+        epoch: u64,
+        epoch_source: Arc<AtomicU64>,
+    }
+
+    impl ResidentLease for TestLease {
+        fn matches(&self, identity: &TargetIdentity) -> bool {
+            self.identity == *identity && self.epoch == self.epoch_source.load(Ordering::Acquire)
+        }
+
+        fn backing(&self) -> ResidentContentBacking {
+            ResidentContentBacking::DeviceAllocation
+        }
+    }
+
+    fn lease(identity: &TargetIdentity, epoch_source: &Arc<AtomicU64>) -> Box<dyn ResidentLease> {
+        Box::new(TestLease {
+            identity: identity.clone(),
+            epoch: epoch_source.load(Ordering::Acquire),
+            epoch_source: Arc::clone(epoch_source),
+        })
+    }
 
     fn identity(generation: u64) -> TargetIdentity {
         TargetIdentity::Surface {
@@ -829,16 +851,13 @@ mod task_resource_resident_tests {
         );
         let first = identity(1);
         let acquisitions = Cell::new(0_u32);
+        let epoch = Arc::new(AtomicU64::new(1));
         let acquired_before =
             crate::runtime::drain::census::store_route_count("resident_resource_acquired");
 
         let backing = resource.resident_target_backing_with(&first, |identity| {
             acquisitions.set(acquisitions.get() + 1);
-            Some(Box::new(ResidentResourceLease::test_new(
-                identity.clone(),
-                ResidentContentBacking::DeviceAllocation,
-            ))
-                as Box<dyn crate::runtime::executor::ResidentLease>)
+            Some(lease(identity, &epoch))
         });
         assert_eq!(backing, ResidentContentBacking::DeviceAllocation);
         assert_eq!(acquisitions.get(), 1);
@@ -857,14 +876,10 @@ mod task_resource_resident_tests {
             "a warm bind must not be counted as another acquisition"
         );
 
-        crate::backend::vulkan::engine::test_advance_resident_resource_epoch();
+        epoch.fetch_add(1, Ordering::Release);
         let backing = resource.resident_target_backing_with(&first, |identity| {
             acquisitions.set(acquisitions.get() + 1);
-            Some(Box::new(ResidentResourceLease::test_new(
-                identity.clone(),
-                ResidentContentBacking::DeviceAllocation,
-            ))
-                as Box<dyn crate::runtime::executor::ResidentLease>)
+            Some(lease(identity, &epoch))
         });
         assert_eq!(backing, ResidentContentBacking::DeviceAllocation);
         assert_eq!(acquisitions.get(), 2, "an engine reset reacquires once");
@@ -872,11 +887,7 @@ mod task_resource_resident_tests {
         let replacement = identity(2);
         let backing = resource.resident_target_backing_with(&replacement, |identity| {
             acquisitions.set(acquisitions.get() + 1);
-            Some(Box::new(ResidentResourceLease::test_new(
-                identity.clone(),
-                ResidentContentBacking::DeviceAllocation,
-            ))
-                as Box<dyn crate::runtime::executor::ResidentLease>)
+            Some(lease(identity, &epoch))
         });
         assert_eq!(backing, ResidentContentBacking::DeviceAllocation);
         assert_eq!(
@@ -903,7 +914,7 @@ mod task_resource_resident_tests {
 
         // The synthetic leases have no registry pins behind them. Make the
         // final drop stale so it exercises the reset-safe no-op release.
-        crate::backend::vulkan::engine::test_advance_resident_resource_epoch();
+        epoch.fetch_add(1, Ordering::Release);
     }
 
     #[test]
@@ -2182,7 +2193,7 @@ pub struct MappingEntry {
     /// falls back to the CPU seed rather than loading from a resident whose
     /// currency nothing established.
     ///
-    /// Compared against [`crate::backend::vulkan::engine::resident_content_epoch`]
+    /// Compared against [`crate::runtime::executor::Executor::resident_content_epoch`]
     /// to decide whether an IOSurface texture LOAD may take `LoadOp::LoadFromTarget` and
     /// skip its CPU seed entirely. Never read to decide *what* to present or
     /// draw — only whether a known-equal upload can be elided.

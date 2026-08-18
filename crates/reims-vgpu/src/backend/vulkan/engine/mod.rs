@@ -2110,11 +2110,6 @@ impl ResidentResourceLease {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn test_advance_resident_resource_epoch() {
-    lock_engine().resident_epoch.fetch_add(1, Ordering::Release);
-}
-
 impl Drop for ResidentResourceLease {
     fn drop(&mut self) {
         let Some(incarnation) = self.incarnation else {
