@@ -11,6 +11,7 @@ use crate::observe::Decline;
 use crate::runtime::draw::IndexLoadReason;
 use crate::runtime::m2v_cache::M2vCacheDecline;
 use crate::runtime::mtlb::MtlbDecline;
+use reims_vgpu_protocol::ObjectKind;
 
 /// A specific pipeline/stage preparation failure before engine request validation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,7 +155,7 @@ pub enum DrawPreparationDecline {
     SamplerObjectType {
         sampler_ref: u32,
         binding: u32,
-        object_type: u8,
+        object_type: ObjectKind,
     },
     SamplerDescriptorMissing {
         sampler_ref: u32,
@@ -849,7 +850,7 @@ mod tests {
             DrawPreparationDecline::SamplerObjectType {
                 sampler_ref: 5,
                 binding: 64,
-                object_type: 8,
+                object_type: ObjectKind::TextureView,
             },
             DrawPreparationDecline::SamplerDescriptorMissing {
                 sampler_ref: 5,

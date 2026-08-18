@@ -76,7 +76,7 @@ fn resolve_type11_from_list() {
     setup_task_with_list(&mut host, &mut state);
     // Sanity: list entry readable
     let e = lookup_list_entry(&state, &host, 1, 1).expect("list entry");
-    assert_eq!(e.object_type, 11);
+    assert_eq!(e.kind, ObjectKind::IOSurfaceTexture);
     assert_eq!(e.descriptor_gva, 0x40);
     let mid = resolve_type11_ref(&mut state, &host, 1, 1).expect("type11");
     assert_eq!(mid, 9);
@@ -219,11 +219,41 @@ fn task_lifetime_retires_all_of_its_resource_objects() {
 }
 
 #[test]
-fn the_resource_registry_accepts_exactly_the_resource_constructor_types() {
-    let accepted: Vec<u8> = (0..=u8::MAX)
-        .filter(|&object_type| object_type_is_resource(object_type))
-        .collect();
-    assert_eq!(accepted, [1, 2, 3, 4, 5, 8, 9, 11, 12, 13, 14, 15]);
+fn the_resource_registry_accepts_exactly_the_resource_constructor_kinds() {
+    let accepted: Vec<ObjectKind> = [
+        ObjectKind::Buffer,
+        ObjectKind::Texture,
+        ObjectKind::SurfaceBacking,
+        ObjectKind::IOSurfacePlaneView,
+        ObjectKind::Function,
+        ObjectKind::StateDescriptor,
+        ObjectKind::TextureView,
+        ObjectKind::MemorylessTexture,
+        ObjectKind::IOSurfaceTexture,
+        ObjectKind::DualPlaneTexture,
+        ObjectKind::ResourceHandle,
+        ObjectKind::HeapBuffer,
+        ObjectKind::ExternalBuffer,
+    ]
+    .into_iter()
+    .filter(|&kind| object_kind_is_resource(kind))
+    .collect();
+    assert_eq!(
+        accepted,
+        [
+            ObjectKind::Buffer,
+            ObjectKind::Texture,
+            ObjectKind::SurfaceBacking,
+            ObjectKind::IOSurfacePlaneView,
+            ObjectKind::TextureView,
+            ObjectKind::MemorylessTexture,
+            ObjectKind::IOSurfaceTexture,
+            ObjectKind::DualPlaneTexture,
+            ObjectKind::ResourceHandle,
+            ObjectKind::HeapBuffer,
+            ObjectKind::ExternalBuffer,
+        ]
+    );
 }
 
 /// Serializer state has its own lifetime. A `DeleteResource`-scoped registry
@@ -242,13 +272,13 @@ fn non_resource_descriptors_are_read_again() {
     let _ = host.write_gpa(data_gpa + 24, &entry);
     let _ = host.write_gpa(data_gpa + 0x80, &1u32.to_le_bytes());
 
-    let (_, first) = resolve_descriptor(&state, &host, 1, 2, &[OBJECT_TYPE_TYPE7])
+    let (_, first) = resolve_descriptor(&state, &host, 1, 2, &[ObjectKind::StateDescriptor])
         .expect("first serializer descriptor");
     assert_eq!(ld32(&first), 1);
     assert!(state.task_resources.get(1, 2).is_none());
 
     let _ = host.write_gpa(data_gpa + 0x80, &2u32.to_le_bytes());
-    let (_, second) = resolve_descriptor(&state, &host, 1, 2, &[OBJECT_TYPE_TYPE7])
+    let (_, second) = resolve_descriptor(&state, &host, 1, 2, &[ObjectKind::StateDescriptor])
         .expect("updated serializer descriptor");
     assert_eq!(ld32(&second), 2);
     assert!(state.task_resources.get(1, 2).is_none());
@@ -2003,25 +2033,25 @@ fn undecoded_type4_span_is_exactly_what_the_decoder_skips() {
 /// branches removes.
 #[test]
 fn the_shared_ladder_names_the_rung_that_refused() {
-    use crate::runtime::decode::resource::{OBJECT_TYPE_BUFFER, OBJECT_TYPE_IOSURFACE};
+    use crate::runtime::decode::resource::OBJECT_TYPE_IOSURFACE;
 
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     setup_task_with_list(&mut host, &mut state);
 
     // Ref 1 is a type-11 entry whose descriptor is mapped: all three rungs pass.
-    let (entry, bytes) =
-        resolve_descriptor(&state, &host, 1, 1, &[OBJECT_TYPE_IOSURFACE]).expect("all rungs pass");
-    assert_eq!(entry.object_type, OBJECT_TYPE_IOSURFACE);
+    let (entry, bytes) = resolve_descriptor(&state, &host, 1, 1, &[ObjectKind::IOSurfaceTexture])
+        .expect("all rungs pass");
+    assert_eq!(entry.kind, ObjectKind::IOSurfaceTexture);
     assert!(!bytes.is_empty(), "the descriptor bytes come back with it");
 
     // Same ref, asked for as a buffer: the tag it found travels with the
     // refusal, so a rail no longer re-formats `ot=` from an entry it has
     // already dropped.
     assert_eq!(
-        resolve_descriptor(&state, &host, 1, 1, &[OBJECT_TYPE_BUFFER]),
+        resolve_descriptor(&state, &host, 1, 1, &[ObjectKind::Buffer]),
         Err(LadderRung::WrongType {
-            got: OBJECT_TYPE_IOSURFACE
+            got: ObjectKind::IOSurfaceTexture
         })
     );
 
@@ -2047,7 +2077,7 @@ fn the_shared_ladder_names_the_rung_that_refused() {
     // The declared length travels with the rung: the entry above says 0x20
     // bytes, and by the time a rail reports this the entry is gone.
     assert_eq!(
-        resolve_descriptor(&state, &host, 1, 2, &[OBJECT_TYPE_IOSURFACE]),
+        resolve_descriptor(&state, &host, 1, 2, &[ObjectKind::IOSurfaceTexture]),
         Err(LadderRung::DescRead { declared_len: 0x20 })
     );
 }

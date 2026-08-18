@@ -37,7 +37,7 @@
 //! been does not exist on a healthy guest.
 
 use crate::model::DeviceState;
-use crate::runtime::decode::resource::{decode_function_descriptor, OBJECT_TYPE_FUNCTION};
+use crate::runtime::decode::resource::{decode_function_descriptor, ObjectKind};
 use crate::runtime::draw::host_alloc_len;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::{gva_mem, objects};
@@ -156,7 +156,7 @@ pub fn load_mtlb<M: HostMemory + HostOps>(
         host,
         task_id,
         func_ref,
-        &[OBJECT_TYPE_FUNCTION],
+        &[ObjectKind::Function],
     ) {
         Ok(found) => found,
         Err(rung) => {
@@ -247,6 +247,8 @@ fn blob_at(data: &[u8], off: usize) -> Result<&[u8], MtlbDecline> {
 
 #[cfg(test)]
 mod tests {
+    use crate::runtime::decode::resource::OBJECT_TYPE_FUNCTION;
+
     use super::*;
     use crate::contract::endian::{st32, st64};
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
@@ -308,7 +310,7 @@ mod tests {
             line.contains(&format!(
                 "reason={}",
                 crate::observe::ladder_slug!("", wrong_type)
-            )) && line.contains("ot=11"),
+            )) && line.contains("ot=iosurface_texture"),
             "the draw rail must name the rung and the tag it found: {line}"
         );
         drop(cap);
@@ -316,7 +318,8 @@ mod tests {
         let cap = crate::observe::FailCapture::start();
         assert!(load_mtlb(&state, &host, 1, 1, AirLoadRail::Compute).is_none());
         assert!(
-            cap.one("compute_load_mtlb").contains("ot=11"),
+            cap.one("compute_load_mtlb")
+                .contains("ot=iosurface_texture"),
             "the compute rail keeps its own event name"
         );
     }

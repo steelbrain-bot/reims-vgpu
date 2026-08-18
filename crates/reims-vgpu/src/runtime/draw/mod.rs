@@ -38,8 +38,7 @@ use crate::runtime::decode::resource::TextureDescriptor;
 use crate::runtime::decode::resource::{
     decode_buffer_texture_descriptor, decode_depth_stencil_descriptor,
     decode_render_pipeline_descriptor, decode_texture_descriptor, texture_type8_opcode,
-    BufferTextureDescriptor, DecodeStatus, RenderPipelineDescriptor, OBJECT_TYPE_IOSURFACE,
-    OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT, OBJECT_TYPE_TEXTURE_VIEW, OBJECT_TYPE_TYPE7,
+    BufferTextureDescriptor, DecodeStatus, ObjectKind, RenderPipelineDescriptor,
     TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
 };
 use crate::runtime::gva_mem;
@@ -641,7 +640,7 @@ fn load_depth_stencil_descriptor<M: HostMemory + HostOps>(
         return Ok((*state_).clone());
     }
     let (_entry, desc) =
-        objects::resolve_descriptor(state, host, task_id, ds_ref, &[OBJECT_TYPE_TYPE7])
+        objects::resolve_descriptor(state, host, task_id, ds_ref, &[ObjectKind::StateDescriptor])
             .map_err(crate::observe::ladder_slugs!("depth_stencil"))?;
     let decoded = decode_depth_stencil_descriptor(&desc)
         .map_err(|_| crate::observe::ladder_slug!("depth_stencil", desc_decode))?;
@@ -1374,15 +1373,19 @@ pub(crate) fn load_render_pipeline<M: HostMemory + HostOps>(
     }
     let report = crate::observe::RungReport::new("draw_load_pipeline", "pipe_ref");
     // Live object-list: render pipeline is type-7 with subtype 0x0e.
-    let (_entry, desc) =
-        match objects::resolve_descriptor(state, host, task_id, pipeline_ref, &[OBJECT_TYPE_TYPE7])
-        {
-            Ok(found) => found,
-            Err(rung) => {
-                report.rung(task_id, pipeline_ref, rung);
-                return None;
-            }
-        };
+    let (_entry, desc) = match objects::resolve_descriptor(
+        state,
+        host,
+        task_id,
+        pipeline_ref,
+        &[ObjectKind::StateDescriptor],
+    ) {
+        Ok(found) => found,
+        Err(rung) => {
+            report.rung(task_id, pipeline_ref, rung);
+            return None;
+        }
+    };
     let Ok(p) = decode_render_pipeline_descriptor(&desc) else {
         report.reason(
             task_id,
@@ -1683,7 +1686,7 @@ fn buffer_texture_descriptor<M: HostMemory + HostOps>(
             &owned
         }
     };
-    if resource.entry.object_type != OBJECT_TYPE_TEXTURE_VIEW {
+    if resource.entry.kind != ObjectKind::TextureView {
         return None;
     }
     let desc_bytes = &resource.descriptor;
@@ -2080,10 +2083,10 @@ fn sample_miss_detail<M: HostMemory + HostOps>(
     let Some(entry) = objects::lookup_list_entry(state, host, task_id, texture_ref) else {
         return "reason=no_list_entry".into();
     };
-    let ot = entry.object_type;
+    let kind = entry.kind;
     let desc_len = entry.descriptor_length;
-    match ot {
-        objects::OBJECT_TYPE_REF_TEXTURE => {
+    match kind {
+        ObjectKind::IOSurfacePlaneView => {
             match objects::read_descriptor(state, host, task_id, &entry) {
                 None => format!("type=5 desc_len={desc_len} reason=no_desc"),
                 Some(d) if reims_vgpu_wire::device_desc::type5_header(&d).is_err() => {
@@ -2104,7 +2107,7 @@ fn sample_miss_detail<M: HostMemory + HostOps>(
                 }
             }
         }
-        OBJECT_TYPE_IOSURFACE => {
+        ObjectKind::IOSurfaceTexture => {
             let Some(mid) = objects::resolve_type11_ref(state, host, task_id, texture_ref) else {
                 return format!("type=11 desc_len={desc_len} reason=type11_resolve");
             };
@@ -2120,7 +2123,7 @@ fn sample_miss_detail<M: HostMemory + HostOps>(
                     m.page_entries.len()
                 )}
         }
-        OBJECT_TYPE_TEXTURE_VIEW => {
+        ObjectKind::TextureView => {
             // Opcode-9 buffer-backed textures share the type-8 tag but are not views.
             if let Some(bt) = buffer_texture_descriptor(state, host, task_id, texture_ref, None) {
                 return format!(
@@ -2151,16 +2154,16 @@ fn sample_miss_detail<M: HostMemory + HostOps>(
                     view.pixel_format
                 )}
         }
-        OBJECT_TYPE_TEXTURE | OBJECT_TYPE_TEXTURE_VARIANT => {
+        ObjectKind::Texture => {
             let Some(desc_bytes) = objects::read_descriptor(state, host, task_id, &entry) else {
-                return format!("type={ot} desc_len={desc_len} reason=desc_read");
+                return format!("kind={kind} desc_len={desc_len} reason=desc_read");
             };
             match decode_texture_descriptor(&desc_bytes) {
-                Err(_) => format!("type={ot} desc_len={desc_len} reason=desc_decode"),
+                Err(_) => format!("kind={kind} desc_len={desc_len} reason=desc_decode"),
                 Ok(tex) => {
                     let l0 = tex.level(0);
                     format!(
-                        "type={ot} desc_len={desc_len} has_fmt={} fmt={:#x} mips={} handle={:#x} alloc={} L0={}x{} bpr={} reason=linear_sample",
+                        "kind={kind} desc_len={desc_len} has_fmt={} fmt={:#x} mips={} handle={:#x} alloc={} L0={}x{} bpr={} reason=linear_sample",
                         u8::from(tex.declared_pixel_format().is_some()),
                         tex.declared_pixel_format().unwrap_or(0),
                         tex.mipmap_level_count,
@@ -2187,22 +2190,20 @@ fn sample_miss_detail<M: HostMemory + HostOps>(
 /// `None` so their existing, type-specific diagnostics remain in charge.
 #[cfg(feature = "backend-vulkan")]
 fn retained_linear_sample_miss_detail(resource: &crate::model::TaskResource) -> Option<String> {
-    if resource.entry.object_type != OBJECT_TYPE_TEXTURE
-        && resource.entry.object_type != OBJECT_TYPE_TEXTURE_VARIANT
-    {
+    if resource.entry.kind != ObjectKind::Texture {
         return None;
     }
-    let ot = resource.entry.object_type;
+    let kind = resource.entry.kind;
     let desc_len = resource.entry.descriptor_length;
     match resource.decoded() {
         Err(why) => Some(format!(
-            "type={ot} desc_len={desc_len} retained=1 reason={}",
+            "kind={kind} desc_len={desc_len} retained=1 reason={}",
             why.slug()
         )),
         Ok(crate::runtime::decode::resource::Descriptor::Texture(tex)) => {
             let l0 = tex.level(0);
             Some(format!(
-                "type={ot} desc_len={desc_len} retained=1 has_fmt={} fmt={:#x} \
+                "kind={kind} desc_len={desc_len} retained=1 has_fmt={} fmt={:#x} \
                  mips={} handle={:#x} alloc={} data_off={} used={} L0={}x{} \
                  L0_off={} bpr={} reason=linear_sample",
                 u8::from(tex.declared_pixel_format().is_some()),
@@ -2219,7 +2220,7 @@ fn retained_linear_sample_miss_detail(resource: &crate::model::TaskResource) -> 
             ))
         }
         Ok(_) => Some(format!(
-            "type={ot} desc_len={desc_len} retained=1 reason=decoded_kind_mismatch"
+            "kind={kind} desc_len={desc_len} retained=1 reason=decoded_kind_mismatch"
         )),
     }
 }

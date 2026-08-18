@@ -6,7 +6,7 @@
 
 use crate::contract::iosurface_pages::decode_texture_descriptor;
 use crate::model::{is_mapping_id, DeviceState};
-use crate::runtime::decode::resource::{decode_descriptor, Descriptor};
+use crate::runtime::decode::resource::{decode_descriptor, DecodeStatus, Descriptor, ObjectKind};
 
 /// Register geometry from a decoded type-11 / IOSurface texture descriptor.
 pub fn register_type11_geom(
@@ -43,7 +43,10 @@ pub fn register_from_descriptor_bytes(
             Err(_) => false,
         }
     };
-    match decode_descriptor(object_type, desc) {
+    let decoded = ObjectKind::from_wire_tag(object_type)
+        .ok_or(DecodeStatus::ErrUnknownType("res_object_type_unknown"))
+        .and_then(|kind| decode_descriptor(kind, desc));
+    match decoded {
         Ok(Descriptor::IOSurfaceTexture {
             mapping_id,
             width,

@@ -645,7 +645,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 if gva_ok {
                     let producer_object_type =
                         objects::lookup_list_entry(state, host, req.task_id, c0.texture_ref)
-                            .map(|entry| entry.object_type)
+                            .map(|entry| entry.wire_tag())
                             .unwrap_or(0);
                     host_cache_store_gva_layer(
                         state,
@@ -978,9 +978,7 @@ pub(super) fn sampled_texture_descriptor<M: HostMemory>(
 )> {
     let resource = objects::resolve_resource(state, host, task_id, texture_ref).ok()?;
     let entry = resource.entry;
-    use crate::runtime::decode::resource::{OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT};
-    if entry.object_type != OBJECT_TYPE_TEXTURE && entry.object_type != OBJECT_TYPE_TEXTURE_VARIANT
-    {
+    if entry.kind != ObjectKind::Texture {
         return None;
     }
     Some((entry, std::sync::Arc::clone(&resource.descriptor)))
@@ -1105,7 +1103,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         resource.or_else(|| objects::resolve_resource(state, host, task_id, texture_ref).ok());
     if let Some(resource) = resolved_resource.as_ref() {
         let entry = resource.entry;
-        if entry.object_type == objects::OBJECT_TYPE_REF_TEXTURE {
+        if entry.kind == ObjectKind::IOSurfacePlaneView {
             is_type5 = true;
             let desc = &resource.descriptor;
             if let Ok(t5) = reims_vgpu_wire::device_desc::type5_header(desc) {
@@ -1116,12 +1114,10 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 }
             }
         }
-        if entry.object_type == objects::OBJECT_TYPE_SURFACE {
+        if entry.kind == ObjectKind::SurfaceBacking {
             surface = Some(texture_ref);
         }
-        if entry.object_type == OBJECT_TYPE_TEXTURE
-            || entry.object_type == OBJECT_TYPE_TEXTURE_VARIANT
-        {
+        if entry.kind == ObjectKind::Texture {
             is_linear_tex = true;
         }
     }
@@ -1218,9 +1214,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // cannot supply anyway.
                 let resident_backing = resolved_resource
                     .as_ref()
-                    .filter(|resource| {
-                        resource_type_owns_surface_resident(resource.entry.object_type)
-                    })
+                    .filter(|resource| resource_type_owns_surface_resident(resource.entry.kind))
                     .map(|resource| resource.resident_target_backing(&resident_id))
                     // An unclassified ref has no resource object to own a
                     // lease. Keep its existing query path so compatibility
@@ -1575,12 +1569,10 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
 /// its lifetime; a view additionally names its parent, but that does not make
 /// its own reference transient. Other object kinds can reach this resolver as
 /// probes, but cannot produce the `surface` value whose resident is retained.
-fn resource_type_owns_surface_resident(object_type: u8) -> bool {
+fn resource_type_owns_surface_resident(kind: ObjectKind) -> bool {
     matches!(
-        object_type,
-        objects::OBJECT_TYPE_SURFACE
-            | objects::OBJECT_TYPE_REF_TEXTURE
-            | crate::runtime::decode::resource::OBJECT_TYPE_IOSURFACE
+        kind,
+        ObjectKind::SurfaceBacking | ObjectKind::IOSurfacePlaneView | ObjectKind::IOSurfaceTexture
     )
 }
 
@@ -1591,12 +1583,8 @@ fn resource_type_owns_surface_resident(object_type: u8) -> bool {
 /// may therefore retain the engine allocation for that same lifetime. Surface
 /// texture forms use [`resource_type_owns_surface_resident`] instead, while an
 /// anonymous attachment keeps the registry-query fallback.
-fn resource_type_owns_gva_resident(object_type: u8) -> bool {
-    matches!(
-        object_type,
-        crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE
-            | crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_VARIANT
-    )
+fn resource_type_owns_gva_resident(kind: ObjectKind) -> bool {
+    kind == ObjectKind::Texture
 }
 
 #[cfg(test)]
@@ -1606,16 +1594,16 @@ mod resource_resident_ownership_tests {
     #[test]
     fn every_surface_texture_construction_form_owns_its_resident() {
         for object_type in [
-            objects::OBJECT_TYPE_SURFACE,
-            objects::OBJECT_TYPE_REF_TEXTURE,
-            crate::runtime::decode::resource::OBJECT_TYPE_IOSURFACE,
+            ObjectKind::SurfaceBacking,
+            ObjectKind::IOSurfacePlaneView,
+            ObjectKind::IOSurfaceTexture,
         ] {
             assert!(resource_type_owns_surface_resident(object_type));
         }
         for object_type in [
-            crate::runtime::decode::resource::OBJECT_TYPE_BUFFER,
-            crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE,
-            crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_VARIANT,
+            ObjectKind::Buffer,
+            ObjectKind::Texture,
+            ObjectKind::Function,
         ] {
             assert!(!resource_type_owns_surface_resident(object_type));
         }
@@ -1623,17 +1611,14 @@ mod resource_resident_ownership_tests {
 
     #[test]
     fn linear_texture_construction_forms_own_their_gva_resident() {
-        for object_type in [
-            crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE,
-            crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_VARIANT,
-        ] {
+        for object_type in [ObjectKind::Texture] {
             assert!(resource_type_owns_gva_resident(object_type));
         }
         for object_type in [
-            objects::OBJECT_TYPE_SURFACE,
-            objects::OBJECT_TYPE_REF_TEXTURE,
-            crate::runtime::decode::resource::OBJECT_TYPE_IOSURFACE,
-            crate::runtime::decode::resource::OBJECT_TYPE_BUFFER,
+            ObjectKind::SurfaceBacking,
+            ObjectKind::IOSurfacePlaneView,
+            ObjectKind::IOSurfaceTexture,
+            ObjectKind::Buffer,
         ] {
             assert!(!resource_type_owns_gva_resident(object_type));
         }
@@ -3240,7 +3225,7 @@ fn gva_resident_ready(
     let backing = (texture_ref != 0)
         .then(|| state.task_resources.get(task_id, texture_ref))
         .flatten()
-        .filter(|resource| resource_type_owns_gva_resident(resource.entry.object_type))
+        .filter(|resource| resource_type_owns_gva_resident(resource.entry.kind))
         .map(|resource| resource.resident_target_backing(identity));
     let retained = backing.is_some();
     let ready = retained_resident_is_ready(backing, || {
@@ -6192,10 +6177,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // the bind keeps whatever content rail it was already on.
                     let view_swizzle = texture_resource
                         .as_ref()
-                        .filter(|resource| {
-                            resource.entry.object_type
-                                == crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_VIEW
-                        })
+                        .filter(|resource| resource.entry.kind == ObjectKind::TextureView)
                         .and_then(|_| resolve_texture_view(state, host, req.task_id, texture_ref))
                         .and_then(|view| view.swizzle)
                         .filter(|plan| !pixel_format::swizzle_is_identity(plan));

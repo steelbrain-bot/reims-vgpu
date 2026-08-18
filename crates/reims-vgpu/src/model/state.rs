@@ -631,10 +631,7 @@ impl TaskResource {
     /// Resolve this resource's immutable construction descriptor once.
     pub fn decoded(&self) -> &Result<Descriptor, ResourceDecodeStatus> {
         self.decoded.get_or_init(|| {
-            crate::runtime::decode::resource::decode_descriptor(
-                self.entry.object_type,
-                &self.descriptor,
-            )
+            crate::runtime::decode::resource::decode_descriptor(self.entry.kind, &self.descriptor)
         })
     }
 
@@ -774,7 +771,10 @@ mod task_resource_resident_tests {
 
     #[test]
     fn a_resource_retains_each_child_identity_until_the_resource_ends() {
-        let resource = TaskResource::new(ListObjectEntry::default(), Arc::from([]));
+        let resource = TaskResource::new(
+            ListObjectEntry::new(reims_vgpu_protocol::ObjectKind::Buffer, 0, 0),
+            Arc::from([]),
+        );
         let first = identity(1);
         let acquisitions = Cell::new(0_u32);
         let acquired_before =
@@ -853,7 +853,10 @@ mod task_resource_resident_tests {
 
     #[test]
     fn an_unavailable_target_is_counted_and_retried() {
-        let resource = TaskResource::new(ListObjectEntry::default(), Arc::from([]));
+        let resource = TaskResource::new(
+            ListObjectEntry::new(reims_vgpu_protocol::ObjectKind::Buffer, 0, 0),
+            Arc::from([]),
+        );
         let unavailable_before =
             crate::runtime::drain::census::store_route_count("resident_resource_unavailable");
         let attempts = Cell::new(0_u32);

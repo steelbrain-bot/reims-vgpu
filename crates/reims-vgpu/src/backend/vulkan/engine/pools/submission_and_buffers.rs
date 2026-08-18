@@ -3975,7 +3975,11 @@ mod recycle_tests {
     fn a_discarded_cache_leaves_no_entry_and_no_bytes() {
         let mut pools = ResourcePools::new();
         let resource = std::sync::Arc::new(crate::model::TaskResource::new(
-            Default::default(),
+            reims_vgpu_protocol::ObjectListEntry::new(
+                reims_vgpu_protocol::ObjectKind::Buffer,
+                0,
+                0,
+            ),
             std::sync::Arc::from([]),
         ));
         let owner = resource.lifetime_ref();
@@ -4099,7 +4103,11 @@ mod recycle_tests {
         let slot = null_slot(8, 8);
         let key = slot.key();
         let resource = std::sync::Arc::new(crate::model::TaskResource::new(
-            Default::default(),
+            reims_vgpu_protocol::ObjectListEntry::new(
+                reims_vgpu_protocol::ObjectKind::Buffer,
+                0,
+                0,
+            ),
             std::sync::Arc::from([]),
         ));
         let owner = resource.lifetime_ref();
@@ -4141,7 +4149,11 @@ mod recycle_tests {
         let slot = null_slot(8, 8);
         let key = slot.key();
         let resource = std::sync::Arc::new(crate::model::TaskResource::new(
-            Default::default(),
+            reims_vgpu_protocol::ObjectListEntry::new(
+                reims_vgpu_protocol::ObjectKind::Buffer,
+                0,
+                0,
+            ),
             std::sync::Arc::from([]),
         ));
         let owner = resource.lifetime_ref();
@@ -4399,7 +4411,11 @@ mod recycle_tests {
     fn sampled_cache_entries_follow_resource_lifetime_not_age() {
         let mut pools = ResourcePools::new();
         let resource = std::sync::Arc::new(crate::model::TaskResource::new(
-            Default::default(),
+            reims_vgpu_protocol::ObjectListEntry::new(
+                reims_vgpu_protocol::ObjectKind::Buffer,
+                0,
+                0,
+            ),
             std::sync::Arc::from([]),
         ));
         let owner = resource.lifetime_ref();

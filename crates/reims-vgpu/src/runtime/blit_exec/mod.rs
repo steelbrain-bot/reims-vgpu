@@ -43,9 +43,8 @@ use crate::runtime::decode::blit::{self, BlitAspect, Command, CopyKind, Kind, Po
 use crate::runtime::decode::resource::{
     decode_buffer_descriptor, decode_iosurface_texture_descriptor, decode_texture_descriptor,
     decode_texture_view_descriptor, texture_view_type_is_3d, texture_view_type_supported,
-    texture_view_type_uses_slices, Descriptor as ResourceDescriptor, OBJECT_TYPE_BUFFER,
-    OBJECT_TYPE_IOSURFACE, OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT,
-    OBJECT_TYPE_TEXTURE_VIEW, TEXTURE_VIEW_MTL_TYPE_2D,
+    texture_view_type_uses_slices, Descriptor as ResourceDescriptor, ObjectKind,
+    TEXTURE_VIEW_MTL_TYPE_2D,
 };
 use crate::runtime::draw::{self, host_alloc_len};
 use crate::runtime::fence_exec::{self, FenceStatus};
@@ -156,7 +155,7 @@ fn clear_blit_fail_reason() {
 /// object actually is (buffer bound as texture = a decode/tracking bug vs. a
 /// legit guest race), which is the load-bearing field for diagnosis.
 static TEX_WRONG_TYPE_SEEN: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashSet<(u32, u32, u8)>>,
+    std::sync::Mutex<std::collections::HashSet<(u32, u32, ObjectKind)>>,
 > = std::sync::OnceLock::new();
 
 /// Emit ONE always-on `blit tex_wrong_type` line per distinct
@@ -166,7 +165,7 @@ static TEX_WRONG_TYPE_SEEN: std::sync::OnceLock<
 fn note_tex_wrong_type(
     task_id: u32,
     texture_ref: u32,
-    object_type: u8,
+    object_type: ObjectKind,
     level: u16,
     slice: u16,
 ) -> bool {
@@ -421,7 +420,7 @@ fn resolve_buffer<M: HostMemory + HostOps>(
         return Err(br(BlitStatus::MissingResource, "buf_ref_zero"));
     }
     let (_entry, bytes) =
-        objects::resolve_descriptor(state, host, task_id, buffer_ref, &[OBJECT_TYPE_BUFFER])
+        objects::resolve_descriptor(state, host, task_id, buffer_ref, &[ObjectKind::Buffer])
             .map_err(|rung| {
                 br(
                     BlitStatus::MissingResource,
@@ -523,7 +522,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
     };
 
     // Type-8 view → base texture (unswizzled; multi-level / array / non-2D allowed).
-    if entry.object_type == OBJECT_TYPE_TEXTURE_VIEW {
+    if entry.kind == ObjectKind::TextureView {
         let Some(bytes) = objects::read_descriptor(state, host, task_id, &entry) else {
             return Err(br(
                 BlitStatus::MissingResource,
@@ -671,7 +670,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
     // Type-11 IOSurface: single level, 2D, mapping page table.
     // Non-zero level/slice is fail-closed (Metal disallows mipmapped IOSurfaces).
     // Texture object dims/format select the plane when the mapping is multi-plane.
-    if entry.object_type == OBJECT_TYPE_IOSURFACE {
+    if entry.kind == ObjectKind::IOSurfaceTexture {
         if level != 0 || slice != 0 {
             return Err(br(BlitStatus::Unsupported, "t11_level_slice"));
         }
@@ -749,7 +748,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
     // is the path where dropping the index lands. `type5_sample_window` states
     // the case; a plane it cannot resolve declines here rather than binding
     // whichever plane shares the geometry.
-    if entry.object_type == objects::OBJECT_TYPE_REF_TEXTURE {
+    if entry.kind == ObjectKind::IOSurfacePlaneView {
         if level != 0 || slice != 0 {
             return Err(br(BlitStatus::Unsupported, "t5_level_slice"));
         }
@@ -822,9 +821,8 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         }));
     }
 
-    if entry.object_type != OBJECT_TYPE_TEXTURE && entry.object_type != OBJECT_TYPE_TEXTURE_VARIANT
-    {
-        let _ = note_tex_wrong_type(task_id, texture_ref, entry.object_type, level, slice);
+    if entry.kind != ObjectKind::Texture {
+        let _ = note_tex_wrong_type(task_id, texture_ref, entry.kind, level, slice);
         return Err(br(
             BlitStatus::MissingResource,
             crate::observe::ladder_slug!("tex", wrong_type),

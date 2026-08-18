@@ -31,7 +31,7 @@ pub(crate) enum TextureViewDecline {
     },
     HopObjectNotView {
         texture_ref: u32,
-        object_type: u8,
+        object_type: ObjectKind,
     },
     HopDescriptorMissing {
         texture_ref: u32,
@@ -258,15 +258,13 @@ fn decode_texture_view_hop_reasoned<M: HostMemory + HostOps>(
     task_id: u32,
     texture_ref: u32,
 ) -> Result<(u32, u32, Option<pixel_format::SwizzlePlan>, Option<u16>), TextureViewDecline> {
-    use crate::runtime::decode::resource::{
-        decode_texture_view_descriptor, texture_type8_header, OBJECT_TYPE_TEXTURE_VIEW,
-    };
+    use crate::runtime::decode::resource::{decode_texture_view_descriptor, texture_type8_header};
     let (_entry, desc) = objects::resolve_descriptor(
         state,
         host,
         task_id,
         texture_ref,
-        &[OBJECT_TYPE_TEXTURE_VIEW],
+        &[ObjectKind::TextureView],
     )
     .map_err(|rung| match rung {
         objects::LadderRung::NoListEntry => TextureViewDecline::HopEntryMissing { texture_ref },
@@ -346,8 +344,6 @@ pub(crate) fn resolve_texture_view_reasoned<M: HostMemory + HostOps>(
     task_id: u32,
     texture_ref: u32,
 ) -> Result<ViewResolve, TextureViewDecline> {
-    use crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_VIEW;
-
     let (mut base, level, swizzle, pixel_format) =
         decode_texture_view_hop_reasoned(state, host, task_id, texture_ref)?;
 
@@ -359,7 +355,7 @@ pub(crate) fn resolve_texture_view_reasoned<M: HostMemory + HostOps>(
             // visibly (same as a one-hop miss on an unmapped base).
             break;
         };
-        if entry.object_type != OBJECT_TYPE_TEXTURE_VIEW {
+        if entry.kind != ObjectKind::TextureView {
             break;
         }
         depth += 1;
@@ -372,7 +368,7 @@ pub(crate) fn resolve_texture_view_reasoned<M: HostMemory + HostOps>(
 
     // Final base must not still be a type-8 view past the chain cap.
     if let Some(entry) = objects::lookup_list_entry(state, host, task_id, base) {
-        if entry.object_type == OBJECT_TYPE_TEXTURE_VIEW {
+        if entry.kind == ObjectKind::TextureView {
             return Err(TextureViewDecline::ChainOverflow { base, depth });
         }
     }
@@ -526,7 +522,7 @@ pub(crate) enum LinearLoadRefusal {
     /// The texture ref is not in this task's object list.
     ObjectListMiss,
     /// The list entry is not a texture or texture variant.
-    NotATexture { object_type: u8 },
+    NotATexture { object_type: ObjectKind },
     /// The entry's descriptor bytes could not be read from guest memory.
     DescriptorUnreadable,
     /// The descriptor bytes are not a decodable texture descriptor.
@@ -747,18 +743,13 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     site: crate::runtime::render_writeback::SettleSite,
 ) -> Result<(Vec<u8>, SampledByteFormat), LinearLoadRefusal> {
     use LinearLoadRefusal as R;
-    let (_entry, desc_bytes) = objects::resolve_descriptor(
-        state,
-        host,
-        task_id,
-        texture_ref,
-        &[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT],
-    )
-    .map_err(|rung| match rung {
-        objects::LadderRung::NoListEntry => R::ObjectListMiss,
-        objects::LadderRung::WrongType { got } => R::NotATexture { object_type: got },
-        objects::LadderRung::DescRead { .. } => R::DescriptorUnreadable,
-    })?;
+    let (_entry, desc_bytes) =
+        objects::resolve_descriptor(state, host, task_id, texture_ref, &[ObjectKind::Texture])
+            .map_err(|rung| match rung {
+                objects::LadderRung::NoListEntry => R::ObjectListMiss,
+                objects::LadderRung::WrongType { got } => R::NotATexture { object_type: got },
+                objects::LadderRung::DescRead { .. } => R::DescriptorUnreadable,
+            })?;
     let tex = decode_texture_descriptor(&desc_bytes).map_err(|_| R::DescriptorUndecodable)?;
     let base_fmt = tex.declared_pixel_format().ok_or(R::NoPixelFormat)?;
     let sample_fmt = effective_view_sample_format(base_fmt, format_override).ok_or(
@@ -1152,7 +1143,9 @@ mod texture_view_split_tests {
         use crate::observe::Decline;
         let all = [
             LinearLoadRefusal::ObjectListMiss,
-            LinearLoadRefusal::NotATexture { object_type: 9 },
+            LinearLoadRefusal::NotATexture {
+                object_type: ObjectKind::MemorylessTexture,
+            },
             LinearLoadRefusal::DescriptorUnreadable,
             LinearLoadRefusal::DescriptorUndecodable,
             LinearLoadRefusal::NoPixelFormat,

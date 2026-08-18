@@ -1,5 +1,6 @@
 use super::*;
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
+use crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE;
 use crate::runtime::gva_mem::write_task_gva_arm64e;
 use crate::runtime::host::FakeHost;
 
@@ -4355,7 +4356,7 @@ fn texture_view_declines_are_specific_and_log_safe() {
         TextureViewDecline::HopEntryMissing { texture_ref: 1 },
         TextureViewDecline::HopObjectNotView {
             texture_ref: 1,
-            object_type: 2,
+            object_type: ObjectKind::Texture,
         },
         TextureViewDecline::HopDescriptorMissing {
             texture_ref: 1,
@@ -5952,7 +5953,9 @@ fn every_buffer_span_refusal_has_its_own_reason_slug() {
 
     let all = [
         BufferSpanRefusal::Rung(LadderRung::NoListEntry),
-        BufferSpanRefusal::Rung(LadderRung::WrongType { got: 2 }),
+        BufferSpanRefusal::Rung(LadderRung::WrongType {
+            got: ObjectKind::Texture,
+        }),
         BufferSpanRefusal::Rung(LadderRung::DescRead { declared_len: 96 }),
         BufferSpanRefusal::Decode,
         BufferSpanRefusal::NoBacking,
@@ -5988,7 +5991,7 @@ fn every_buffer_span_refusal_has_its_own_reason_slug() {
     );
 
     // The detail field carries what each refusal knows and nothing it does not.
-    assert_eq!(super::buffer_refusal_detail(all[1], 12), "ty=2");
+    assert_eq!(super::buffer_refusal_detail(all[1], 12), "ty=texture");
     assert_eq!(super::buffer_refusal_detail(all[2], 12), "desc_len=96");
     assert_eq!(super::buffer_refusal_detail(all[4], 12), "shift=12");
     assert!(super::buffer_refusal_detail(all[0], 12).is_empty());
@@ -6135,7 +6138,10 @@ fn a_gva_span_no_store_has_stamped_refuses_the_resident_sample_rung() {
     let no_entry = store_route_count("gvaw_no_entry");
     let absent = store_route_count("gvarung_resident_absent");
     let served = store_route_count("gvarung_resident");
-    let resource = crate::model::TaskResource::new(Default::default(), std::sync::Arc::from([]));
+    let resource = crate::model::TaskResource::new(
+        reims_vgpu_protocol::ObjectListEntry::new(ObjectKind::Buffer, 0, 0),
+        std::sync::Arc::from([]),
+    );
     let sampled_only = store_route_count("gvarung_sampled_only");
     assert!(
         super::try_gva_resident_sample(&mut state, &mut host, 1, 7, &resource, &tex).is_none(),

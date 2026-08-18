@@ -141,7 +141,7 @@ fn install_buffer(
         desc_gva,
     );
     let e = objects::lookup_list_entry(state, host, 1, obj_ref).expect("entry");
-    assert_eq!(e.object_type, OBJECT_TYPE_BUFFER);
+    assert_eq!(e.kind, ObjectKind::Buffer);
 }
 
 /// A blit's destination bound is the pages the command named, and it holds
@@ -871,7 +871,7 @@ fn install_type5(
         desc_gva,
     );
     let e = objects::lookup_list_entry(state, host, 1, obj_ref).expect("type5 entry");
-    assert_eq!(e.object_type, objects::OBJECT_TYPE_REF_TEXTURE);
+    assert_eq!(e.kind, ObjectKind::IOSurfacePlaneView);
 }
 
 /// A blit source must read the plane the wire named, and the only shape that
@@ -2553,28 +2553,16 @@ fn blit_geometry_helpers_clamp_bpp_and_aspect() {
 fn tex_wrong_type_enrichment_dedups_per_ref_and_type() {
     reset_tex_wrong_type_dedup_for_test();
     // First sighting of a (task, ref, type) emits; repeats are deduped.
-    assert!(note_tex_wrong_type(7, 0x40, OBJECT_TYPE_BUFFER, 0, 0));
+    assert!(note_tex_wrong_type(7, 0x40, ObjectKind::Buffer, 0, 0));
     for _ in 0..20 {
-        assert!(!note_tex_wrong_type(7, 0x40, OBJECT_TYPE_BUFFER, 0, 0));
+        assert!(!note_tex_wrong_type(7, 0x40, ObjectKind::Buffer, 0, 0));
     }
     // A different ref is a distinct failure -> reports once.
-    assert!(note_tex_wrong_type(7, 0x41, OBJECT_TYPE_BUFFER, 0, 0));
+    assert!(note_tex_wrong_type(7, 0x41, ObjectKind::Buffer, 0, 0));
     // Same ref but a different actual object_type also reports (the type is
     // the diagnostic field, so a type change must not be masked).
-    assert!(note_tex_wrong_type(
-        7,
-        0x40,
-        crate::runtime::decode::resource::OBJECT_TYPE_FUNCTION,
-        0,
-        0
-    ));
-    assert!(!note_tex_wrong_type(
-        7,
-        0x40,
-        crate::runtime::decode::resource::OBJECT_TYPE_FUNCTION,
-        0,
-        0
-    ));
+    assert!(note_tex_wrong_type(7, 0x40, ObjectKind::Function, 0, 0));
+    assert!(!note_tex_wrong_type(7, 0x40, ObjectKind::Function, 0, 0));
 }
 
 /// The precondition the `repack_storage_assumed` enrichment exists for.

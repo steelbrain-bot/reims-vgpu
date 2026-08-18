@@ -430,7 +430,7 @@ pub(super) enum RenderTargetCause {
     /// The surface's backing could not be resolved.
     Type4Unresolved {
         surface_id: u32,
-        live_type: Option<u8>,
+        live_type: Option<ObjectKind>,
     },
     /// The surface resolved and left no mapping under its id.
     Type4NoMapping { surface_id: u32 },
@@ -455,7 +455,7 @@ pub(super) enum RenderTargetCause {
     /// treated as a decode error.
     NoListEntry,
     /// Something is under the ref and it is not a texture.
-    WrongType { object_type: u8 },
+    WrongType { object_type: ObjectKind },
     /// The texture entry's descriptor bytes could not be read.
     LinearDescRead,
     /// The bytes were read and are not a texture descriptor. Carries the
@@ -792,14 +792,14 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     //    full-screen desktop composites onto only one mid (mid=3 nz=6M vs
     //    mid=4 stuck logo nz=1.97M; damage rects then preserved logo via Load).
     let live = objects::lookup_list_entry(state, host, task_id, resolved_ref);
-    let live_type = live.as_ref().map(|e| e.object_type);
+    let live_type = live.as_ref().map(|e| e.kind);
     if let Some(ot) = live_type {
-        if ot != OBJECT_TYPE_IOSURFACE {
+        if ot != ObjectKind::IOSurfaceTexture {
             // Live list says not type-11 — drop any recycled-ref latch.
             state.texture_to_mapping.remove(&(task_id, resolved_ref));
         }
     }
-    let try_type11 = live_type == Some(OBJECT_TYPE_IOSURFACE)
+    let try_type11 = live_type == Some(ObjectKind::IOSurfaceTexture)
         || (live_type.is_none()
             && state
                 .texture_to_mapping
@@ -813,7 +813,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         // Live list is source of truth for mapping_id when the entry is type-11.
         // Latch is only a fallback when the list entry is transiently missing
         // (resolve_type11_ref refreshes the latch from the live descriptor).
-        let mapping_id = if live_type == Some(OBJECT_TYPE_IOSURFACE) {
+        let mapping_id = if live_type == Some(ObjectKind::IOSurfaceTexture) {
             objects::resolve_type11_ref(state, host, task_id, resolved_ref).or_else(|| {
                 state
                     .texture_to_mapping
@@ -878,8 +878,8 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     // (allocateRefTextureHandle) — product color RTs are type-5 wrapping type-4.
     let mut type5_view: Option<objects::Type5TextureView> = None;
     let type4_sid = match live.as_ref() {
-        Some(e) if e.object_type == objects::OBJECT_TYPE_SURFACE => Some(resolved_ref),
-        Some(e) if e.object_type == objects::OBJECT_TYPE_REF_TEXTURE => {
+        Some(e) if e.kind == ObjectKind::SurfaceBacking => Some(resolved_ref),
+        Some(e) if e.kind == ObjectKind::IOSurfacePlaneView => {
             let desc = objects::read_descriptor(state, host, task_id, e)
                 .ok_or(C::Type5DescRead.at(resolved_ref))?;
             let sid = reims_vgpu_wire::device_desc::type5_header(&desc)
@@ -920,7 +920,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             .at(resolved_ref));
         }
         let (base_w, base_h, base_raw_fmt) = (m.width, m.height, m.format);
-        if live_type == Some(objects::OBJECT_TYPE_REF_TEXTURE) {
+        if live_type == Some(ObjectKind::IOSurfacePlaneView) {
             note_rt_type5_view(type5_view, surface_id, (base_w, base_h, base_raw_fmt));
         }
         let base_fmt = rt_type4_base_format(base_raw_fmt, surface_id).ok_or(
@@ -946,10 +946,9 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     }
     // type-2/3 linear GVA (wallpaper/background layers, UI intermediate RTs).
     let entry = live.ok_or(C::NoListEntry.at(resolved_ref))?;
-    if entry.object_type != OBJECT_TYPE_TEXTURE && entry.object_type != OBJECT_TYPE_TEXTURE_VARIANT
-    {
+    if entry.kind != ObjectKind::Texture {
         return Err(C::WrongType {
-            object_type: entry.object_type,
+            object_type: entry.kind,
         }
         .at(resolved_ref));
     }
@@ -1125,6 +1124,8 @@ fn resolve_render_target<M: HostMemory + HostOps>(
 /// is the file the plan wants to stop growing.
 #[cfg(test)]
 mod tests {
+    use crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE;
+
     use super::*;
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
     use crate::runtime::host::FakeHost;

@@ -27,9 +27,8 @@ use crate::runtime::decode::compute::{
 };
 use crate::runtime::decode::resource::{
     decode_heap_texture, decode_texture_descriptor, decode_type7_descriptor, texture_type8_opcode,
-    ComputeStageInputDescriptor, Descriptor as ResourceDescriptor, HEAP_TEXTURE_OPCODE,
-    HEAP_TEXTURE_WIDE_OPCODE, OBJECT_TYPE_BUFFER, OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT,
-    OBJECT_TYPE_TEXTURE_VIEW, OBJECT_TYPE_TYPE7, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE,
+    ComputeStageInputDescriptor, Descriptor as ResourceDescriptor, ObjectKind, HEAP_TEXTURE_OPCODE,
+    HEAP_TEXTURE_WIDE_OPCODE, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE,
     TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
 };
 use crate::runtime::draw::{host_alloc_len, StoreTargetPages};
@@ -973,15 +972,19 @@ pub(crate) fn load_compute_pipeline<M: HostMemory + HostOps>(
         report.reason(task_id, pipeline_ref, reason, &detail);
         None
     };
-    let (_entry, desc) =
-        match objects::resolve_descriptor(state, host, task_id, pipeline_ref, &[OBJECT_TYPE_TYPE7])
-        {
-            Ok(found) => found,
-            Err(rung) => {
-                report.rung(task_id, pipeline_ref, rung);
-                return None;
-            }
-        };
+    let (_entry, desc) = match objects::resolve_descriptor(
+        state,
+        host,
+        task_id,
+        pipeline_ref,
+        &[ObjectKind::StateDescriptor],
+    ) {
+        Ok(found) => found,
+        Err(rung) => {
+            report.rung(task_id, pipeline_ref, rung);
+            return None;
+        }
+    };
     let Ok(decoded) = decode_type7_descriptor(&desc) else {
         return miss(
             crate::observe::ladder_slug!("", desc_decode),
@@ -1138,7 +1141,7 @@ fn resolve_buffer_stage_plan<M: HostMemory + HostOps>(
         host,
         task_id,
         bind.buffer_ref,
-        &[OBJECT_TYPE_BUFFER],
+        &[ObjectKind::Buffer],
     ) {
         Ok(found) => found,
         Err(rung) => {
@@ -1920,7 +1923,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     // serves both instead of two.
     let ref_entry = objects::lookup_list_entry(state, host, task_id, texture_ref);
     if let Some(entry) = ref_entry {
-        if entry.object_type == OBJECT_TYPE_TEXTURE_VIEW {
+        if entry.kind == ObjectKind::TextureView {
             let Some(desc) = objects::read_descriptor(state, host, task_id, &entry) else {
                 crate::observe::fail(format!(
                     "compute_stage_tex view_fail reason=no_desc ref={texture_ref} desc_len={}",
@@ -2149,12 +2152,10 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     }
     let stage_entry = objects::lookup_list_entry(state, host, task_id, stage_ref);
     let ref_is_linear = stage_entry
-        .map(|e| {
-            e.object_type == OBJECT_TYPE_TEXTURE || e.object_type == OBJECT_TYPE_TEXTURE_VARIANT
-        })
+        .map(|e| e.kind == ObjectKind::Texture)
         .unwrap_or(false);
     if let Some(entry) = stage_entry {
-        if entry.object_type == objects::OBJECT_TYPE_REF_TEXTURE {
+        if entry.kind == ObjectKind::IOSurfacePlaneView {
             if let Some(desc) = objects::read_descriptor(state, host, task_id, &entry) {
                 if let Ok(t5) = reims_vgpu_wire::device_desc::type5_header(&desc) {
                     let sid = t5.surface_id.get();
@@ -2198,7 +2199,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                     }
                 }
             }
-        } else if entry.object_type == objects::OBJECT_TYPE_SURFACE {
+        } else if entry.kind == ObjectKind::SurfaceBacking {
             // Direct type-4 surface bind (same id space as present mids).
             from_type4_direct = true;
             let _ = objects::ensure_surface_for_present(state, host, stage_ref);
@@ -2657,7 +2658,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         host,
         task_id,
         stage_ref,
-        &[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT],
+        &[ObjectKind::Texture],
     ) {
         Ok(found) => found,
         Err(rung) => {
@@ -3981,8 +3982,8 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             }
             Err(e) => {
                 let ot = objects::lookup_list_entry(state, host, task_id, t.texture_ref)
-                    .map(|en| en.object_type)
-                    .unwrap_or(0);
+                    .map(|en| en.kind.to_string())
+                    .unwrap_or_else(|| "absent".to_string());
                 crate::observe::fail(format!(
                     "compute_linux stage_tex fail reason={} pipe={} i={} ref={} ot={} bind={} access={} class={}",
                     e.reason(),

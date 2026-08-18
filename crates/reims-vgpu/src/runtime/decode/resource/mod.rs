@@ -12,6 +12,8 @@ use reims_vgpu_wire::ops::{
 };
 use reims_vgpu_wire::OP_HEADER_LEN as OP_HDR;
 
+pub use reims_vgpu_protocol::{ObjectKind, ObjectListEntry as ListObjectEntry};
+
 /// A refusal from the descriptor decoder.
 ///
 /// This decoder sits upstream of every rail — blit, compute, render, mipmap and
@@ -1696,31 +1698,18 @@ pub enum Descriptor {
     IndirectCommandBuffer(IndirectCommandBufferDescriptor),
 }
 
-/// Live Reims VGPU object-list entry size (kb + reims-vgpu-resource-format).
-pub const OBJECT_LIST_ENTRY_LEN: usize = 12;
-pub const OBJECT_LIST_ENTRY_HEADER: usize = 0;
-pub const OBJECT_LIST_ENTRY_DESC_GVA: usize = 4;
-pub const OBJECT_TYPE_MASK: u32 = 0xff;
-pub const OBJECT_DESC_LEN_SHIFT: u32 = 8;
-
-/// Wire object-list entry: `[type:u8 | desc_len:u24]<< packed u32` + `desc_gva:u64`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ListObjectEntry {
-    pub object_type: u8,
-    pub descriptor_length: u32,
-    pub descriptor_gva: u64,
-}
+/// Live Reims VGPU object-list entry size.
+pub use reims_vgpu_protocol::OBJECT_LIST_ENTRY_LEN;
 
 /// Decode one 12-byte object-list entry (live arm Reims VGPU contract).
 pub fn decode_list_object_entry(bytes: &[u8]) -> Result<ListObjectEntry, DecodeStatus> {
-    if bytes.len() < OBJECT_LIST_ENTRY_LEN {
-        return Err(DecodeStatus::ErrShort("res_list_entry_short"));
-    }
-    let first = ld32(&bytes[OBJECT_LIST_ENTRY_HEADER..]);
-    Ok(ListObjectEntry {
-        object_type: (first & OBJECT_TYPE_MASK) as u8,
-        descriptor_length: first >> OBJECT_DESC_LEN_SHIFT,
-        descriptor_gva: ld64(&bytes[OBJECT_LIST_ENTRY_DESC_GVA..]),
+    reims_vgpu_protocol::decode_object_list_entry(bytes).map_err(|error| match error {
+        reims_vgpu_protocol::ObjectListDecodeError::Short { .. } => {
+            DecodeStatus::ErrShort("res_list_entry_short")
+        }
+        reims_vgpu_protocol::ObjectListDecodeError::UnknownKind { .. } => {
+            DecodeStatus::ErrUnknownType("res_object_type_unknown")
+        }
     })
 }
 
@@ -4568,19 +4557,25 @@ pub fn decode_type7_descriptor(bytes: &[u8]) -> Result<Descriptor, DecodeStatus>
     }
 }
 
-pub fn decode_descriptor(object_type: u8, bytes: &[u8]) -> Result<Descriptor, DecodeStatus> {
-    match object_type {
-        OBJECT_TYPE_BUFFER => Ok(Descriptor::Buffer(decode_buffer_descriptor(bytes)?)),
-        OBJECT_TYPE_TEXTURE | OBJECT_TYPE_TEXTURE_VARIANT => {
-            Ok(Descriptor::Texture(decode_texture_descriptor(bytes)?))
-        }
-        OBJECT_TYPE_FUNCTION => Ok(Descriptor::Function(decode_function_descriptor(bytes)?)),
-        OBJECT_TYPE_TYPE7 => decode_type7_descriptor(bytes),
-        OBJECT_TYPE_TEXTURE_VIEW => Ok(Descriptor::TextureView(decode_texture_view_descriptor(
+pub fn decode_descriptor(kind: ObjectKind, bytes: &[u8]) -> Result<Descriptor, DecodeStatus> {
+    match kind {
+        ObjectKind::Buffer => Ok(Descriptor::Buffer(decode_buffer_descriptor(bytes)?)),
+        ObjectKind::Texture => Ok(Descriptor::Texture(decode_texture_descriptor(bytes)?)),
+        ObjectKind::Function => Ok(Descriptor::Function(decode_function_descriptor(bytes)?)),
+        ObjectKind::StateDescriptor => decode_type7_descriptor(bytes),
+        ObjectKind::TextureView => Ok(Descriptor::TextureView(decode_texture_view_descriptor(
             bytes,
         )?)),
-        OBJECT_TYPE_IOSURFACE => decode_iosurface_texture_descriptor(bytes),
-        _ => Err(DecodeStatus::ErrUnknownType("res_object_type_unknown")),
+        ObjectKind::IOSurfaceTexture => decode_iosurface_texture_descriptor(bytes),
+        ObjectKind::SurfaceBacking
+        | ObjectKind::IOSurfacePlaneView
+        | ObjectKind::MemorylessTexture
+        | ObjectKind::DualPlaneTexture
+        | ObjectKind::ResourceHandle
+        | ObjectKind::HeapBuffer
+        | ObjectKind::ExternalBuffer => Err(DecodeStatus::ErrUnsupported(
+            "res_descriptor_owned_by_surface_path",
+        )),
     }
 }
 

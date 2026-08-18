@@ -1100,6 +1100,7 @@ dependencies = [
  "parking_lot",
  "raw-window-handle",
  "reims-vgpu-paging",
+ "reims-vgpu-protocol",
  "reims-vgpu-wire",
  "serde_json",
  "winit",
@@ -1107,6 +1108,13 @@ dependencies = [
 
 [[package]]
 name = "reims-vgpu-paging"
+version = "0.1.0"
+dependencies = [
+ "reims-vgpu-wire",
+]
+
+[[package]]
+name = "reims-vgpu-protocol"
 version = "0.1.0"
 dependencies = [
  "reims-vgpu-wire",

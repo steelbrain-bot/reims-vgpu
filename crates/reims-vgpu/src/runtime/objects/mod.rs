@@ -22,8 +22,8 @@ use crate::contract::iosurface_pages::{
 };
 use crate::model::{DeviceState, MappingEntry, TaskResource, TaskTable};
 use crate::runtime::decode::resource::{
-    decode_list_object_entry, list_object_entry_offset, ListObjectEntry, OBJECT_LIST_ENTRY_LEN,
-    OBJECT_TYPE_IOSURFACE,
+    decode_list_object_entry, list_object_entry_offset, ListObjectEntry, ObjectKind,
+    OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_IOSURFACE,
 };
 use crate::runtime::gva_mem;
 use crate::runtime::host::HostMemory;
@@ -1411,7 +1411,7 @@ fn note_slot_empty_claimants<M: HostMemory>(
         .map(|&(other, entry)| {
             let held = slot_recheck::first_page_population(state, host, other)
                 .map_or(-1i64, |p| p.populated as i64);
-            format!("{other}:holds={held}:type={}", entry.object_type)
+            format!("{other}:holds={held}:kind={}", entry.kind)
         })
         .collect();
     crate::observe::off(format!(
@@ -1540,7 +1540,7 @@ pub enum LadderRung {
     ///
     /// Carries the tag it found, because every rail that reports this rung was
     /// formatting `ot={}` by hand from the entry it no longer has by then.
-    WrongType { got: u8 },
+    WrongType { got: ObjectKind },
     /// The entry names descriptor bytes that could not be read — the ref is
     /// live, and its descriptor GVA is not mapped right now.
     ///
@@ -1576,7 +1576,7 @@ pub fn resolve_sampler_state<M: HostMemory>(
     task_id: u32,
     sampler_ref: u32,
 ) -> Result<Arc<crate::model::TaskSamplerState>, SamplerResolveError> {
-    use crate::runtime::decode::resource::{decode_sampler_descriptor, OBJECT_TYPE_TYPE7};
+    use crate::runtime::decode::resource::decode_sampler_descriptor;
 
     if let Some(sampler) = state.task_sampler_states.get(task_id, sampler_ref) {
         return Ok(sampler);
@@ -1584,9 +1584,9 @@ pub fn resolve_sampler_state<M: HostMemory>(
 
     let entry = lookup_list_entry(state, host, task_id, sampler_ref)
         .ok_or(SamplerResolveError::Rung(LadderRung::NoListEntry))?;
-    if entry.object_type != OBJECT_TYPE_TYPE7 {
+    if entry.kind != ObjectKind::StateDescriptor {
         return Err(SamplerResolveError::Rung(LadderRung::WrongType {
-            got: entry.object_type,
+            got: entry.kind,
         }));
     }
     let bytes = read_descriptor(state, host, task_id, &entry).ok_or(SamplerResolveError::Rung(
@@ -1613,22 +1613,22 @@ pub fn resolve_sampler_state<M: HostMemory>(
     Ok(sampler)
 }
 
-/// Object tags constructed through the task's resource registry.
-///
-/// Bit `n` names object type `n + 1`. The resource constructor accepts exactly
-/// types 1, 2, 3, 4, 5, 8, 9, 11, 12, 13, 14, and 15. Function (6), mutable
-/// serializer state (7), and type 10 have separate registries and lifetimes, so
-/// retaining their descriptors until `DeleteResource` would conflate distinct
-/// APIs. An immutable render pipeline constructed from a type-7 descriptor is
-/// retained separately in `DeviceState::task_render_pipeline_states`; the
-/// serializer bytes themselves remain outside this resource registry.
-const RESOURCE_CONSTRUCTOR_TYPE_MASK: u16 = 0x7d9f;
-
-fn object_type_is_resource(object_type: u8) -> bool {
-    object_type
-        .checked_sub(1)
-        .filter(|&bit| bit < u16::BITS as u8)
-        .is_some_and(|bit| RESOURCE_CONSTRUCTOR_TYPE_MASK & (1u16 << bit) != 0)
+/// Whether a semantic object is owned by the task resource registry.
+fn object_kind_is_resource(kind: ObjectKind) -> bool {
+    matches!(
+        kind,
+        ObjectKind::Buffer
+            | ObjectKind::Texture
+            | ObjectKind::SurfaceBacking
+            | ObjectKind::IOSurfacePlaneView
+            | ObjectKind::TextureView
+            | ObjectKind::IOSurfaceTexture
+            | ObjectKind::MemorylessTexture
+            | ObjectKind::DualPlaneTexture
+            | ObjectKind::ResourceHandle
+            | ObjectKind::HeapBuffer
+            | ObjectKind::ExternalBuffer
+    )
 }
 
 /// Retrieve or construct the resource named by `task_id` / `obj_ref`.
@@ -1649,10 +1649,8 @@ pub fn resolve_resource<M: HostMemory>(
     }
 
     let entry = lookup_list_entry(state, host, task_id, obj_ref).ok_or(LadderRung::NoListEntry)?;
-    if !object_type_is_resource(entry.object_type) {
-        return Err(LadderRung::WrongType {
-            got: entry.object_type,
-        });
+    if !object_kind_is_resource(entry.kind) {
+        return Err(LadderRung::WrongType { got: entry.kind });
     }
     let bytes = read_descriptor(state, host, task_id, &entry).ok_or(LadderRung::DescRead {
         declared_len: entry.descriptor_length,
@@ -1683,12 +1681,12 @@ pub fn resolve_descriptor<M: HostMemory>(
     host: &M,
     task_id: u32,
     obj_ref: u32,
-    want: &[u8],
+    want: &[ObjectKind],
 ) -> Result<(ListObjectEntry, Arc<[u8]>), LadderRung> {
     if let Some(resource) = state.task_resources.get(task_id, obj_ref) {
-        if !want.contains(&resource.entry.object_type) {
+        if !want.contains(&resource.entry.kind) {
             return Err(LadderRung::WrongType {
-                got: resource.entry.object_type,
+                got: resource.entry.kind,
             });
         }
         return Ok((resource.entry, Arc::clone(&resource.descriptor)));
@@ -1698,15 +1696,13 @@ pub fn resolve_descriptor<M: HostMemory>(
     // asking for the wrong kind must not turn an unreadable descriptor into a
     // different refusal merely because resource retention is enabled.
     let entry = lookup_list_entry(state, host, task_id, obj_ref).ok_or(LadderRung::NoListEntry)?;
-    if !want.contains(&entry.object_type) {
-        return Err(LadderRung::WrongType {
-            got: entry.object_type,
-        });
+    if !want.contains(&entry.kind) {
+        return Err(LadderRung::WrongType { got: entry.kind });
     }
     let bytes = read_descriptor(state, host, task_id, &entry).ok_or(LadderRung::DescRead {
         declared_len: entry.descriptor_length,
     })?;
-    if !object_type_is_resource(entry.object_type) {
+    if !object_kind_is_resource(entry.kind) {
         return Ok((entry, Arc::from(bytes)));
     }
     let descriptor: Arc<[u8]> = Arc::from(bytes);
@@ -1715,9 +1711,9 @@ pub fn resolve_descriptor<M: HostMemory>(
         obj_ref,
         Arc::new(TaskResource::new(entry, descriptor)),
     );
-    if !want.contains(&resource.entry.object_type) {
+    if !want.contains(&resource.entry.kind) {
         return Err(LadderRung::WrongType {
-            got: resource.entry.object_type,
+            got: resource.entry.kind,
         });
     }
     Ok((resource.entry, Arc::clone(&resource.descriptor)))
@@ -1776,16 +1772,16 @@ pub fn resolve_buffer_span_from_resource(
     state: &DeviceState,
     resource: &crate::model::TaskResource,
 ) -> Result<(u64, u64), BufferSpanRefusal> {
-    if resource.entry.object_type != crate::runtime::decode::resource::OBJECT_TYPE_BUFFER {
+    if resource.entry.kind != ObjectKind::Buffer {
         return Err(BufferSpanRefusal::Rung(LadderRung::WrongType {
-            got: resource.entry.object_type,
+            got: resource.entry.kind,
         }));
     }
     let desc = match resource.decoded() {
         Ok(crate::runtime::decode::resource::Descriptor::Buffer(desc)) => desc,
         Ok(_) => {
             return Err(BufferSpanRefusal::Rung(LadderRung::WrongType {
-                got: resource.entry.object_type,
+                got: resource.entry.kind,
             }));
         }
         Err(_) => return Err(BufferSpanRefusal::Decode),
@@ -1810,7 +1806,7 @@ pub fn resolve_type11_ref<M: HostMemory>(
             // second lookup is only on the failed-construction path; successful
             // binds retrieve the retained resource without a guest read.
             if let Some(entry) = lookup_list_entry(state, host, task_id, ref_)
-                .filter(|entry| entry.object_type == OBJECT_TYPE_IOSURFACE)
+                .filter(|entry| entry.kind == ObjectKind::IOSurfaceTexture)
             {
                 note_type11_fail(
                     task_id,
@@ -1818,7 +1814,7 @@ pub fn resolve_type11_ref<M: HostMemory>(
                     crate::observe::ladder_slug!("type11", desc_read),
                     format!(
                         "type11_resolve_fail reason=type11_desc_read task={task_id} ref={ref_} obj_type={} desc_gva={:#x} desc_len={}",
-                        entry.object_type, entry.descriptor_gva, entry.descriptor_length
+                        entry.kind, entry.descriptor_gva, entry.descriptor_length
                     ),
                 );
             }
@@ -1843,7 +1839,7 @@ pub fn resolve_type11_resource(
 ) -> Option<u32> {
     let entry = resource.entry;
     let desc = &resource.descriptor;
-    if entry.object_type != OBJECT_TYPE_IOSURFACE {
+    if entry.kind != ObjectKind::IOSurfaceTexture {
         // Legitimate: this ref is a different object type, not a texture. Normal
         // control flow (resolve_type11_refs skips it) — never a failure.
         return None;
@@ -2510,7 +2506,7 @@ fn note_replace_physical_unmapped_after_invalidation<M: HostMemory>(
     texture_cache: bool,
     linear_cache: bool,
 ) {
-    let object_type = lookup_list_entry(state, host, task_id, object_id).map(|e| e.object_type);
+    let object_type = lookup_list_entry(state, host, task_id, object_id).map(|e| e.kind);
     crate::runtime::drain::note_store_route("replace_physical_unknown_object");
     if texture_cache {
         crate::runtime::drain::note_store_route("replace_physical_unmapped_texture_invalidated");
@@ -2555,7 +2551,7 @@ fn type4_claimant_tasks<M: HostMemory>(state: &DeviceState, host: &M, surface_id
         .live_ids()
         .filter(|&task_id| {
             probe_list_entry(state, host, task_id, surface_id)
-                .is_some_and(|e| e.object_type == OBJECT_TYPE_SURFACE)
+                .is_some_and(|e| e.kind == ObjectKind::SurfaceBacking)
         })
         .collect()
 }
@@ -2732,7 +2728,7 @@ fn resolve_type4_surface_ex<M: HostMemory>(
         let Some(entry) = probe_list_entry(state, host, task_id, surface_id) else {
             continue;
         };
-        if entry.object_type != OBJECT_TYPE_SURFACE {
+        if entry.kind != ObjectKind::SurfaceBacking {
             continue;
         }
         let Some(desc) = read_descriptor(state, host, task_id, &entry) else {

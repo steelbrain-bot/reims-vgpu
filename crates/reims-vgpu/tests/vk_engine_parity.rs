@@ -58,7 +58,7 @@ fn engine_test_session() -> std::sync::MutexGuard<'static, ()> {
 /// real task resource supplies; dropping it is the cache boundary.
 fn sampled_resource_owner() -> std::sync::Arc<reims_vgpu::model::TaskResource> {
     std::sync::Arc::new(reims_vgpu::model::TaskResource::new(
-        Default::default(),
+        reims_vgpu_protocol::ObjectListEntry::new(reims_vgpu_protocol::ObjectKind::Buffer, 0, 0),
         std::sync::Arc::from([]),
     ))
 }

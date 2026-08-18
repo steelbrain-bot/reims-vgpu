@@ -1757,7 +1757,10 @@ fn a_texture_slot_replaces_object_identity_only_on_a_later_setter() {
     let first = state.task_resources.register(
         1,
         9,
-        Arc::new(TaskResource::new(ListObjectEntry::default(), Arc::from([]))),
+        Arc::new(TaskResource::new(
+            ListObjectEntry::new(reims_vgpu_protocol::ObjectKind::Buffer, 0, 0),
+            Arc::from([]),
+        )),
     );
     let total = OP_HEADER_LEN + render::BIND_ENTRIES + 4;
     let mut command = vec![0u8; total];
@@ -1785,7 +1788,10 @@ fn a_texture_slot_replaces_object_identity_only_on_a_later_setter() {
     let replacement = state.task_resources.register(
         1,
         9,
-        Arc::new(TaskResource::new(ListObjectEntry::default(), Arc::from([]))),
+        Arc::new(TaskResource::new(
+            ListObjectEntry::new(reims_vgpu_protocol::ObjectKind::Buffer, 0, 0),
+            Arc::from([]),
+        )),
     );
     assert!(Arc::ptr_eq(
         acc.fragment_textures[0].resource.as_ref().unwrap(),

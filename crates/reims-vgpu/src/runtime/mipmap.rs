@@ -11,8 +11,7 @@
 use crate::contract::pixel_format::{self, RGBA8_BPP};
 use crate::model::DeviceState;
 use crate::runtime::decode::resource::{
-    decode_texture_descriptor, OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT,
-    TEXTURE_MAX_MIP_LEVELS,
+    decode_texture_descriptor, ObjectKind, TEXTURE_MAX_MIP_LEVELS,
 };
 use crate::runtime::draw::host_alloc_len;
 use crate::runtime::gva_mem;
@@ -159,21 +158,16 @@ fn resolve_multi_mip_texture<M: HostMemory + HostOps>(
     // from one holding a buffer from one whose descriptor would not read. That
     // costs nothing on a healthy guest — a driven boot of 177 746 draws fired no
     // rung at all — so a line from here is an event, not noise.
-    let (_entry, desc_bytes) = objects::resolve_descriptor(
-        state,
-        host,
-        task_id,
-        texture_ref,
-        &[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT],
-    )
-    .map_err(|rung| {
-        crate::observe::RungReport::new("mipmap_resolve", "tex_ref").rung(
-            task_id,
-            texture_ref,
-            rung,
-        );
-        MipmapStatus::MissingTexture
-    })?;
+    let (_entry, desc_bytes) =
+        objects::resolve_descriptor(state, host, task_id, texture_ref, &[ObjectKind::Texture])
+            .map_err(|rung| {
+                crate::observe::RungReport::new("mipmap_resolve", "tex_ref").rung(
+                    task_id,
+                    texture_ref,
+                    rung,
+                );
+                MipmapStatus::MissingTexture
+            })?;
     let tex = match decode_texture_descriptor(&desc_bytes) {
         Ok(t) => t,
         Err(e) => {

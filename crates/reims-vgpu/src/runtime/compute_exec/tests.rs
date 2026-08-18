@@ -10,7 +10,7 @@ use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
 use crate::runtime::decode::compute;
 use crate::runtime::decode::resource::{
     list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER, OBJECT_TYPE_IOSURFACE,
-    RESOURCE_PAGE_SHIFT,
+    OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TYPE7, RESOURCE_PAGE_SHIFT,
 };
 /// Compute-pipeline descriptor constants used by the backend execute test.
 #[cfg(feature = "backend-vulkan")]

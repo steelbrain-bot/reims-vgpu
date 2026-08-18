@@ -14,6 +14,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use super::stamp_completion::SubmissionNote;
 
 type Reply = mpsc::SyncSender<Result<QueueOutcome, vk::Result>>;
+#[cfg(feature = "host-window")]
 type PresentReply = mpsc::SyncSender<Result<bool, vk::Result>>;
 
 #[derive(Clone, Copy, Debug)]
@@ -37,10 +38,12 @@ struct OwnedSubmit {
 /// ordering point, then waited after that lock is released.  Keeping the
 /// receiver as a value makes the split explicit: accepting the transaction and
 /// completing the host driver calls are two different events.
+#[cfg(feature = "host-window")]
 pub(crate) struct PendingPresent {
     receiver: mpsc::Receiver<Result<bool, vk::Result>>,
 }
 
+#[cfg(feature = "host-window")]
 impl PendingPresent {
     pub(crate) fn wait(self) -> Result<bool, vk::Result> {
         self.receiver
@@ -54,6 +57,7 @@ enum Request {
         submit: OwnedSubmit,
         reply: Option<Reply>,
     },
+    #[cfg(feature = "host-window")]
     PresentTransaction {
         submit: OwnedSubmit,
         loader: ash::khr::swapchain::Device,
@@ -251,6 +255,7 @@ impl QueueOwner {
     /// gap in the queue-owner FIFO.  Packaging the pair is what lets the caller
     /// release the engine lock after enqueue without allowing guest work to
     /// appear between the semaphore signal and its consumer.
+    #[cfg(feature = "host-window")]
     pub(crate) fn enqueue_present(
         &self,
         transaction: super::context::PresentTransaction<'_>,
@@ -363,6 +368,7 @@ fn run(
                     let _ = reply.send(result.map(|_| QueueOutcome::Unit));
                 }
             }
+            #[cfg(feature = "host-window")]
             Request::PresentTransaction {
                 submit,
                 loader,
@@ -422,6 +428,7 @@ fn run(
     }
 }
 
+#[cfg(any(test, feature = "host-window"))]
 fn complete_present_transaction(
     failure: &FailureLatch,
     submit: impl FnOnce() -> Result<(), vk::Result>,
@@ -542,6 +549,7 @@ mod tests {
         assert_eq!(probe.latest_queued(), None);
     }
 
+    #[cfg(feature = "host-window")]
     #[test]
     fn a_pending_display_transaction_returns_its_exact_completion() {
         let (reply, receiver) = mpsc::sync_channel(1);
@@ -552,6 +560,7 @@ mod tests {
         sender.join().unwrap();
     }
 
+    #[cfg(feature = "host-window")]
     #[test]
     fn a_lost_display_transaction_owner_cannot_look_successful() {
         let (reply, receiver) = mpsc::sync_channel(1);

@@ -1856,11 +1856,11 @@ fn handle_blit_record<M: HostMemory + HostOps>(
                     // `Refusal` supplies it, and an uninstrumented site now reads
                     // `blit_unattributed` rather than rendering a bare `reason=`.
                     let src_ty = objects::lookup_list_entry(state, host, task_id, cmd.source)
-                        .map(|e| e.object_type)
-                        .unwrap_or(0);
+                        .map(|e| e.kind.to_string())
+                        .unwrap_or_else(|| "absent".to_string());
                     let dst_ty = objects::lookup_list_entry(state, host, task_id, cmd.destination)
-                        .map(|e| e.object_type)
-                        .unwrap_or(0);
+                        .map(|e| e.kind.to_string())
+                        .unwrap_or_else(|| "absent".to_string());
                     if let Some(e) = crate::observe::Emit::refusal("blit_fail", &st) {
                         e.field("st", format!("{st:?}"))
                             .field("kind", format!("{:?}", cmd.kind))

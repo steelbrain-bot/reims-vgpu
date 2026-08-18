@@ -30,13 +30,13 @@ use crate::model::DeviceState;
 use crate::runtime::decode::resource::{
     decode_type7_descriptor, icb_layout_attribute_stride_slot_count,
     icb_layout_kernel_tg_slot_count, icb_layout_table_len, Descriptor as ResourceDescriptor,
-    IcbCommandLayout, IndirectCommandBufferDescriptor, ICB_ATTRIBUTE_STRIDE_ENTRY_SIZE,
+    IcbCommandLayout, IndirectCommandBufferDescriptor, ObjectKind, ICB_ATTRIBUTE_STRIDE_ENTRY_SIZE,
     ICB_BUFFER_BIND_STRIDE, ICB_CMD_TYPE_CONCURRENT_DISPATCH_THREADGROUPS,
     ICB_CMD_TYPE_CONCURRENT_DISPATCH_THREADS, ICB_CMD_TYPE_DRAW, ICB_CMD_TYPE_DRAW_INDEXED,
     ICB_CMD_TYPE_DRAW_INDEXED_PATCHES, ICB_CMD_TYPE_DRAW_MESH_THREADGROUPS,
     ICB_CMD_TYPE_DRAW_MESH_THREADS, ICB_CMD_TYPE_DRAW_PATCHES, ICB_CONCURRENT_DISPATCH_ARGS_LEN,
     ICB_DRAW_INDEXED_PATCHES_ARGS_LEN, ICB_DRAW_MESH_ARGS_LEN, ICB_DRAW_PATCHES_ARGS_LEN,
-    ICB_TESSELLATION_FACTOR_LEN, ICB_TG_MEMORY_STRIDE, OBJECT_TYPE_TYPE7,
+    ICB_TESSELLATION_FACTOR_LEN, ICB_TG_MEMORY_STRIDE,
 }; // ICB_TG_MEMORY_STRIDE: object + kernel TG length tables
 #[cfg(test)]
 use crate::runtime::decode::resource::{
@@ -1123,18 +1123,22 @@ pub fn load_icb_descriptor<M: HostMemory + HostOps>(
     // is not type-7 means the guest described something, wrongly, while a
     // missing entry or unreadable bytes mean it described nothing this device
     // can see yet.
-    let (_entry, desc) =
-        objects::resolve_descriptor(state, host, task_id, icb_ref, &[OBJECT_TYPE_TYPE7]).map_err(
-            |rung| {
-                let slug = crate::observe::ladder_slugs!("icb")(rung);
-                match rung {
-                    objects::LadderRung::NoListEntry | objects::LadderRung::DescRead { .. } => {
-                        IcbStatus::Missing(slug)
-                    }
-                    objects::LadderRung::WrongType { .. } => IcbStatus::BadDescriptor(slug),
-                }
-            },
-        )?;
+    let (_entry, desc) = objects::resolve_descriptor(
+        state,
+        host,
+        task_id,
+        icb_ref,
+        &[ObjectKind::StateDescriptor],
+    )
+    .map_err(|rung| {
+        let slug = crate::observe::ladder_slugs!("icb")(rung);
+        match rung {
+            objects::LadderRung::NoListEntry | objects::LadderRung::DescRead { .. } => {
+                IcbStatus::Missing(slug)
+            }
+            objects::LadderRung::WrongType { .. } => IcbStatus::BadDescriptor(slug),
+        }
+    })?;
     match decode_type7_descriptor(&desc) {
         Ok(ResourceDescriptor::IndirectCommandBuffer(icb)) => {
             note_unapplied_icb_flags(task_id, icb_ref, &icb);

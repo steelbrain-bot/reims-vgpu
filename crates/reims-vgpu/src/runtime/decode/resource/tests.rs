@@ -596,7 +596,9 @@ fn every_short_read_names_the_field_it_ran_out_on() {
     // The other three classes, so the whole vocabulary is exercised rather
     // than just the one that used to swallow everything.
     assert_eq!(
-        decode_descriptor(0xfe, &[0u8; 64]).unwrap_err().slug(),
+        decode_list_object_entry(&[0xfe, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+            .unwrap_err()
+            .slug(),
         "res_object_type_unknown"
     );
     let mut type7 = [0u8; 64];
@@ -1362,7 +1364,7 @@ fn list_entry_and_buffer() {
     // desc_gva
     list[4] = 0x80;
     let le = decode_list_object_entry(&list).unwrap();
-    assert_eq!(le.object_type, 11);
+    assert_eq!(le.kind, ObjectKind::IOSurfaceTexture);
     assert_eq!(le.descriptor_length, 0x20);
     assert_eq!(le.descriptor_gva, 0x80);
 
@@ -1388,7 +1390,7 @@ fn iosurface_type11() {
     b[0x16] = 0x50;
     b[0x18] = 64;
     b[0x1c] = 32;
-    match decode_descriptor(11, &b).unwrap() {
+    match decode_descriptor(ObjectKind::IOSurfaceTexture, &b).unwrap() {
         Descriptor::IOSurfaceTexture {
             mapping_id,
             width,
@@ -3041,9 +3043,9 @@ fn hex_to_bytes(s: &str) -> Vec<u8> {
 
 #[test]
 fn property_fuzz_types() {
-    for t in 0u8..16 {
+    for kind in (0u8..16).filter_map(ObjectKind::from_wire_tag) {
         let bytes = vec![0u8; 128];
-        let _ = decode_descriptor(t, &bytes);
+        let _ = decode_descriptor(kind, &bytes);
     }
 }
 
