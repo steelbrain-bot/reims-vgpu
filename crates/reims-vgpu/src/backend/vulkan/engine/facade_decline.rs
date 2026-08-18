@@ -10,6 +10,7 @@ use super::draw_execution::identity_fields;
 use super::types::TargetIdentity;
 use crate::model::ComputeStorageResidencyKey;
 use crate::observe::Decline;
+use reims_vgpu_protocol::SubmissionIdentity;
 
 /// A specific engine façade or host-window presenter state failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -17,6 +18,10 @@ pub enum EngineFacadeDecline {
     ExecutorCompletionKindMismatch {
         expected: &'static str,
         actual: &'static str,
+    },
+    ExecutorCompletionIdentityMismatch {
+        expected: SubmissionIdentity,
+        actual: SubmissionIdentity,
     },
     WindowPresenterNotAttached,
     StorageReadResidentAbsent {
@@ -38,6 +43,9 @@ impl Decline for EngineFacadeDecline {
             Self::ExecutorCompletionKindMismatch { .. } => {
                 "vk_engine_executor_completion_kind_mismatch"
             }
+            Self::ExecutorCompletionIdentityMismatch { .. } => {
+                "vk_engine_executor_completion_identity_mismatch"
+            }
             Self::WindowPresenterNotAttached => "vk_engine_window_presenter_not_attached",
             Self::StorageReadResidentAbsent { .. } => "vk_engine_storage_read_resident_absent",
             Self::StorageReadGenerationMismatch { .. } => {
@@ -54,6 +62,12 @@ impl Decline for EngineFacadeDecline {
             Self::ExecutorCompletionKindMismatch { expected, actual } => vec![
                 ("expected", (*expected).to_string()),
                 ("actual", (*actual).to_string()),
+            ],
+            Self::ExecutorCompletionIdentityMismatch { expected, actual } => vec![
+                ("expected_submission", expected.id.get().to_string()),
+                ("expected_task", expected.task.get().to_string()),
+                ("actual_submission", actual.id.get().to_string()),
+                ("actual_task", actual.task.get().to_string()),
             ],
             Self::WindowPresenterNotAttached => Vec::new(),
             Self::StorageReadResidentAbsent { identity } => residency_fields(identity),
@@ -110,6 +124,16 @@ mod tests {
                 expected: "draw",
                 actual: "compute",
             },
+            EngineFacadeDecline::ExecutorCompletionIdentityMismatch {
+                expected: SubmissionIdentity {
+                    id: reims_vgpu_protocol::SubmissionId::new(1),
+                    task: reims_vgpu_protocol::TaskId::new(2),
+                },
+                actual: SubmissionIdentity {
+                    id: reims_vgpu_protocol::SubmissionId::new(3),
+                    task: reims_vgpu_protocol::TaskId::new(4),
+                },
+            },
             EngineFacadeDecline::WindowPresenterNotAttached,
             EngineFacadeDecline::StorageReadResidentAbsent {
                 identity: residency(),
@@ -139,7 +163,7 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 5, "the engine façade reason census moved");
+        assert_eq!(before, 6, "the engine façade reason census moved");
         assert_eq!(before, slugs.len(), "duplicate engine façade slug");
     }
 

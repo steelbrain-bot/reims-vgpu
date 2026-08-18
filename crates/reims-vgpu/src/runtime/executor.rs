@@ -53,19 +53,22 @@ pub fn context_for(state: &crate::model::DeviceState, task_id: u32) -> Submissio
         .unwrap_or_else(|| SubmissionContext::standalone(task_id))
 }
 
-/// One fully resolved operation accepted by the execution port.
-pub enum ResolvedSubmission<'a> {
+/// One fully resolved, owned operation accepted by the execution port.
+///
+/// Owning both context and request lets an executor retain or queue the work;
+/// no decoded accumulator can mutate the inputs after submission.
+pub enum ResolvedSubmission {
     Draw {
-        context: &'a SubmissionContext,
-        request: &'a DrawRequest,
+        context: SubmissionContext,
+        request: Box<DrawRequest>,
     },
     Compute {
-        context: &'a SubmissionContext,
-        request: &'a ComputeRequest,
+        context: SubmissionContext,
+        request: Box<ComputeRequest>,
     },
 }
 
-impl ResolvedSubmission<'_> {
+impl ResolvedSubmission {
     fn kind(&self) -> &'static str {
         match self {
             Self::Draw { .. } => "draw",
@@ -74,14 +77,14 @@ impl ResolvedSubmission<'_> {
     }
 }
 
-/// Completion returned through the same port as its submission.
+/// Operation-specific result carried by a completion fact.
 #[derive(Debug)]
-pub enum ExecutionCompletion {
+pub enum ExecutionOutput {
     Draw(DrawOutput),
     Compute(ComputeOutput),
 }
 
-impl ExecutionCompletion {
+impl ExecutionOutput {
     fn kind(&self) -> &'static str {
         match self {
             Self::Draw(_) => "draw",
@@ -90,10 +93,16 @@ impl ExecutionCompletion {
     }
 }
 
+/// Immutable completion returned through the same port as its submission.
+#[derive(Debug)]
+pub struct ExecutionCompletion {
+    pub submission: SubmissionIdentity,
+    pub output: ExecutionOutput,
+}
+
 /// Backend execution contract implemented per device.
 pub trait Executor: std::fmt::Debug + Send + Sync {
-    fn execute(&self, submission: ResolvedSubmission<'_>)
-        -> Result<ExecutionCompletion, DrawError>;
+    fn execute(&self, submission: ResolvedSubmission) -> Result<ExecutionCompletion, DrawError>;
 
     /// End one guest lifetime while preserving shareable physical-GPU state.
     fn reset(&self) {}
@@ -125,19 +134,24 @@ impl Drop for VulkanExecutor {
 }
 
 impl Executor for VulkanExecutor {
-    fn execute(
-        &self,
-        submission: ResolvedSubmission<'_>,
-    ) -> Result<ExecutionCompletion, DrawError> {
+    fn execute(&self, submission: ResolvedSubmission) -> Result<ExecutionCompletion, DrawError> {
         let _scope = self.enter();
         match submission {
-            ResolvedSubmission::Draw { request, .. } => {
-                crate::backend::vulkan::engine::execute_draw_request(request)
-                    .map(ExecutionCompletion::Draw)
+            ResolvedSubmission::Draw { context, request } => {
+                crate::backend::vulkan::engine::execute_draw_request(&request).map(|output| {
+                    ExecutionCompletion {
+                        submission: context.identity,
+                        output: ExecutionOutput::Draw(output),
+                    }
+                })
             }
-            ResolvedSubmission::Compute { request, .. } => {
-                crate::backend::vulkan::engine::execute_compute_request(request)
-                    .map(ExecutionCompletion::Compute)
+            ResolvedSubmission::Compute { context, request } => {
+                crate::backend::vulkan::engine::execute_compute_request(&request).map(|output| {
+                    ExecutionCompletion {
+                        submission: context.identity,
+                        output: ExecutionOutput::Compute(output),
+                    }
+                })
             }
         }
     }
@@ -157,13 +171,26 @@ impl Executor for VulkanExecutor {
 /// Execute a draw and enforce that the executor returns the matching completion.
 pub fn execute_draw(
     executor: &dyn Executor,
-    context: &SubmissionContext,
-    request: &DrawRequest,
+    context: SubmissionContext,
+    request: DrawRequest,
 ) -> Result<DrawOutput, DrawError> {
-    let expected = ResolvedSubmission::Draw { context, request };
+    let expected_identity = context.identity;
+    let expected = ResolvedSubmission::Draw {
+        context,
+        request: Box::new(request),
+    };
     let expected_kind = expected.kind();
-    match executor.execute(expected)? {
-        ExecutionCompletion::Draw(output) => Ok(output),
+    let completion = executor.execute(expected)?;
+    if completion.submission != expected_identity {
+        return Err(DrawError::Facade(
+            EngineFacadeDecline::ExecutorCompletionIdentityMismatch {
+                expected: expected_identity,
+                actual: completion.submission,
+            },
+        ));
+    }
+    match completion.output {
+        ExecutionOutput::Draw(output) => Ok(output),
         other => Err(DrawError::Facade(
             EngineFacadeDecline::ExecutorCompletionKindMismatch {
                 expected: expected_kind,
@@ -176,13 +203,26 @@ pub fn execute_draw(
 /// Execute a compute dispatch and enforce the matching completion kind.
 pub fn execute_compute(
     executor: &dyn Executor,
-    context: &SubmissionContext,
-    request: &ComputeRequest,
+    context: SubmissionContext,
+    request: ComputeRequest,
 ) -> Result<ComputeOutput, DrawError> {
-    let expected = ResolvedSubmission::Compute { context, request };
+    let expected_identity = context.identity;
+    let expected = ResolvedSubmission::Compute {
+        context,
+        request: Box::new(request),
+    };
     let expected_kind = expected.kind();
-    match executor.execute(expected)? {
-        ExecutionCompletion::Compute(output) => Ok(output),
+    let completion = executor.execute(expected)?;
+    if completion.submission != expected_identity {
+        return Err(DrawError::Facade(
+            EngineFacadeDecline::ExecutorCompletionIdentityMismatch {
+                expected: expected_identity,
+                actual: completion.submission,
+            },
+        ));
+    }
+    match completion.output {
+        ExecutionOutput::Compute(output) => Ok(output),
         other => Err(DrawError::Facade(
             EngineFacadeDecline::ExecutorCompletionKindMismatch {
                 expected: expected_kind,
@@ -230,18 +270,22 @@ mod tests {
     impl Executor for ScriptedExecutor {
         fn execute(
             &self,
-            submission: ResolvedSubmission<'_>,
+            submission: ResolvedSubmission,
         ) -> Result<ExecutionCompletion, DrawError> {
             let context = match submission {
                 ResolvedSubmission::Draw { context, .. }
                 | ResolvedSubmission::Compute { context, .. } => context,
             };
+            let identity = context.identity;
             self.seen.lock().unwrap().push(context.clone());
-            Ok(match self.completion {
-                ScriptedCompletion::Draw => ExecutionCompletion::Draw(DrawOutput::default()),
-                ScriptedCompletion::Compute => {
-                    ExecutionCompletion::Compute(ComputeOutput::default())
-                }
+            Ok(ExecutionCompletion {
+                submission: identity,
+                output: match self.completion {
+                    ScriptedCompletion::Draw => ExecutionOutput::Draw(DrawOutput::default()),
+                    ScriptedCompletion::Compute => {
+                        ExecutionOutput::Compute(ComputeOutput::default())
+                    }
+                },
             })
         }
 
@@ -282,7 +326,12 @@ mod tests {
         let state = DeviceState::new_with_executor(DeviceId(1), 12, scripted.clone());
         let context = context();
 
-        execute_draw(state.executor.as_ref(), &context, &DrawRequest::default()).unwrap();
+        execute_draw(
+            state.executor.as_ref(),
+            context.clone(),
+            DrawRequest::default(),
+        )
+        .unwrap();
 
         let seen = scripted.seen.lock().unwrap();
         assert_eq!(seen.as_slice(), &[context]);
@@ -291,7 +340,7 @@ mod tests {
     #[test]
     fn executor_cannot_return_a_completion_for_another_operation_kind() {
         let scripted = ScriptedExecutor::new(ScriptedCompletion::Compute);
-        let error = execute_draw(&scripted, &context(), &DrawRequest::default()).unwrap_err();
+        let error = execute_draw(&scripted, context(), DrawRequest::default()).unwrap_err();
 
         assert!(matches!(
             error,
@@ -302,10 +351,48 @@ mod tests {
         ));
     }
 
+    #[derive(Debug)]
+    struct WrongIdentityExecutor;
+
+    impl Executor for WrongIdentityExecutor {
+        fn execute(
+            &self,
+            submission: ResolvedSubmission,
+        ) -> Result<ExecutionCompletion, DrawError> {
+            let task = match submission {
+                ResolvedSubmission::Draw { context, .. }
+                | ResolvedSubmission::Compute { context, .. } => context.identity.task,
+            };
+            Ok(ExecutionCompletion {
+                submission: SubmissionIdentity {
+                    id: SubmissionId::new(20),
+                    task,
+                },
+                output: ExecutionOutput::Draw(DrawOutput::default()),
+            })
+        }
+    }
+
+    #[test]
+    fn completion_identity_must_match_the_owned_submission() {
+        let error =
+            execute_draw(&WrongIdentityExecutor, context(), DrawRequest::default()).unwrap_err();
+        assert!(matches!(
+            error,
+            DrawError::Facade(EngineFacadeDecline::ExecutorCompletionIdentityMismatch {
+                expected,
+                actual,
+            }) if expected == context().identity && actual == SubmissionIdentity {
+                id: SubmissionId::new(20),
+                task: TaskId::new(7),
+            }
+        ));
+    }
+
     #[test]
     fn compute_uses_the_same_execution_port() {
         let scripted = ScriptedExecutor::new(ScriptedCompletion::Compute);
-        execute_compute(&scripted, &context(), &ComputeRequest::default()).unwrap();
+        execute_compute(&scripted, context(), ComputeRequest::default()).unwrap();
 
         assert_eq!(scripted.seen.lock().unwrap().len(), 1);
     }
@@ -322,14 +409,14 @@ mod tests {
         first.reset();
         execute_draw(
             first.state.executor.as_ref(),
-            &context(),
-            &DrawRequest::default(),
+            context(),
+            DrawRequest::default(),
         )
         .unwrap();
         execute_draw(
             second.state.executor.as_ref(),
-            &context(),
-            &DrawRequest::default(),
+            context(),
+            DrawRequest::default(),
         )
         .unwrap();
 

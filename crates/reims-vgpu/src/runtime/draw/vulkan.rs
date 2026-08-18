@@ -7815,9 +7815,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Engine);
         let executor = std::sync::Arc::clone(&state.executor);
         let submission = crate::runtime::executor::context_for(state, req.task_id);
-        let out =
-            crate::runtime::executor::execute_draw(executor.as_ref(), &submission, &resources)?;
-        if resources.target_identity.is_some() {
+        let has_target_identity = resources.target_identity.is_some();
+        let out = crate::runtime::executor::execute_draw(executor.as_ref(), submission, resources)?;
+        if has_target_identity {
             if let Some(resource) = req.colors.first().and_then(|color| color.resource.as_ref()) {
                 resource.note_render_target_use();
             }

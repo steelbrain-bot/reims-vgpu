@@ -4452,19 +4452,19 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         samplers,
         storage_images,
     };
-    let run_engine = |req: &ComputeRequest| {
+    let run_engine = |req: ComputeRequest| {
         let engine_done = spawn_compute_engine_stall_watchdog(
             acc.pipeline_ref,
-            req,
+            &req,
             std::time::Duration::from_millis(COMPUTE_ENGINE_STALL_PROXY_MS),
         );
         let executor = std::sync::Arc::clone(&state.executor);
         let submission = crate::runtime::executor::context_for(state, task_id);
-        let out = crate::runtime::executor::execute_compute(executor.as_ref(), &submission, req);
+        let out = crate::runtime::executor::execute_compute(executor.as_ref(), submission, req);
         engine_done.store(true, std::sync::atomic::Ordering::Release);
         out
     };
-    let out_result = run_engine(&req);
+    let out_result = run_engine(req);
     let out = match out_result {
         Ok(o) => o,
         Err(e) => {
