@@ -8,8 +8,9 @@ use crate::backend::vulkan::engine::{
     ComputeOutput, ComputeRequest, DrawError, DrawOutput, DrawRequest, EngineFacadeDecline,
     GuestWriteReach, ResidentContent, StorageImageFormat, TargetIdentity, TargetReadback,
 };
-use reims_vgpu_protocol::{SegmentBoundary, SubmissionIdentity, SubmissionResourceUse};
-use std::sync::Arc;
+use reims_vgpu_protocol::SubmissionIdentity;
+
+pub use reims_vgpu_core::SubmissionContext;
 
 /// Backend-independent classification of a retained target's current content.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -69,14 +70,6 @@ impl Default for ExecutorCapabilities {
     }
 }
 
-/// Protocol context shared by every operation in one submitted command stream.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SubmissionContext {
-    pub identity: SubmissionIdentity,
-    pub resources: Arc<[SubmissionResourceUse]>,
-    pub segment: Option<SegmentBoundary>,
-}
-
 /// Dynamic executor-session scope for one device operation.
 pub struct ExecutionScope {
     _engine: Option<crate::backend::vulkan::engine::SessionScope>,
@@ -85,22 +78,6 @@ pub struct ExecutionScope {
 impl ExecutionScope {
     fn none() -> Self {
         Self { _engine: None }
-    }
-}
-
-impl SubmissionContext {
-    /// Context for direct test/tool calls that do not originate in an EXEC
-    /// packet. Product submissions always replace this with their decoded
-    /// resource list and segment boundary.
-    pub fn standalone(task_id: u32) -> Self {
-        Self {
-            identity: SubmissionIdentity {
-                id: reims_vgpu_protocol::SubmissionId::new(0),
-                task: reims_vgpu_protocol::TaskId::new(task_id),
-            },
-            resources: Arc::from([]),
-            segment: None,
-        }
     }
 }
 
@@ -746,11 +723,12 @@ mod tests {
     use super::*;
     use crate::model::{DeviceId, DeviceState};
     use reims_vgpu_protocol::{
-        ObjectRef, ResourceValidity, SegmentKind, SubmissionId, SubmissionResourceUse, TaskId,
+        ObjectRef, ResourceValidity, SegmentBoundary, SegmentKind, SubmissionId,
+        SubmissionResourceUse, TaskId,
     };
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
-        Mutex,
+        Arc, Mutex,
     };
 
     #[derive(Clone, Copy, Debug)]

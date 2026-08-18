@@ -3085,7 +3085,7 @@ pub struct DeviceState {
     pub(crate) executor: Arc<dyn crate::runtime::executor::Executor>,
     /// Submission metadata currently being decoded and executed.
     #[cfg(feature = "backend-vulkan")]
-    pub(crate) active_submission: Option<crate::runtime::executor::SubmissionContext>,
+    pub(crate) active_submission: Option<reims_vgpu_core::SubmissionContext>,
     /// Next device-local submission generation.
     #[cfg(feature = "backend-vulkan")]
     pub(crate) next_submission_id: u64,

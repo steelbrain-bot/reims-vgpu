@@ -4,6 +4,7 @@
 
 pub mod namespace;
 pub mod resource;
+pub mod submission;
 pub mod target;
 
 pub use namespace::{NamespaceError, ReferenceNamespace};
@@ -11,4 +12,5 @@ pub use resource::{
     ContentAuthority, ContentError, ContentState, GraphError, LifecycleState, MappingNode,
     PendingContentWrite, ReplicaVersions, ResourceGraph, ResourceNode, StorageBacking, StorageNode,
 };
+pub use submission::SubmissionContext;
 pub use target::{TargetIdentity, TargetKeyDivergence};
