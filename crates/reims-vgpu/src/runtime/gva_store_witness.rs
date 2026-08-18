@@ -35,10 +35,10 @@ impl GvaTargetKey {
     pub fn of(
         task_id: u32,
         texture_ref: u32,
-        identity: &crate::backend::vulkan::engine::TargetIdentity,
+        identity: &crate::model::TargetIdentity,
     ) -> Option<Self> {
         match *identity {
-            crate::backend::vulkan::engine::TargetIdentity::Gva {
+            crate::model::TargetIdentity::Gva {
                 gva,
                 width,
                 height,

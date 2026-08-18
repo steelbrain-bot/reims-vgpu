@@ -12,8 +12,8 @@
 
 #![cfg(feature = "backend-vulkan")]
 
-use crate::backend::vulkan::engine::TargetIdentity;
 use crate::model::DeviceState;
+use crate::model::TargetIdentity;
 use ash::vk;
 
 /// Build a protocol-stable resident identity for this mapping at its current

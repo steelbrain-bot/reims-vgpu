@@ -855,7 +855,7 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mapping_id: u32,
-    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    identity: &crate::model::TargetIdentity,
     width: u32,
     height: u32,
 ) -> Result<u64, GpuWritebackDecline> {

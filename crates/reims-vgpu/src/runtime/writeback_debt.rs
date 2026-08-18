@@ -422,9 +422,9 @@ impl PendingWritebacks {
     #[cfg(feature = "backend-vulkan")]
     fn gva_for_identity(
         &self,
-        identity: &crate::backend::vulkan::engine::TargetIdentity,
+        identity: &crate::model::TargetIdentity,
     ) -> Option<(GvaPlaneKey, GvaWritebackDebt)> {
-        let crate::backend::vulkan::engine::TargetIdentity::Gva {
+        let crate::model::TargetIdentity::Gva {
             gva,
             width,
             height,
@@ -520,7 +520,7 @@ pub fn pay_for_texture<M: HostMemory + HostOps>(
 /// ever be reused. The line names both declarations so that reading can be made
 /// from a log rather than from a rebuild.
 ///
-/// [`TargetIdentity::Gva`]: crate::backend::vulkan::engine::TargetIdentity::Gva
+/// [`TargetIdentity::Gva`]: crate::model::TargetIdentity::Gva
 #[cfg(feature = "backend-vulkan")]
 pub fn gva_resource_generation<M: HostMemory>(
     state: &mut DeviceState,
@@ -649,11 +649,11 @@ pub fn arm_gva<M: HostMemory + HostOps>(
     _host: &mut M,
     task_id: u32,
     c0: &crate::runtime::draw::ColorRtRequest,
-    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    identity: &crate::model::TargetIdentity,
     submission: reims_vgpu_protocol::SubmissionId,
 ) -> bool {
     let Some((generation, resident_layout)) = (match *identity {
-        crate::backend::vulkan::engine::TargetIdentity::Gva {
+        crate::model::TargetIdentity::Gva {
             generation, format, ..
         } => Some((generation, format)),
         _ => None,
@@ -703,7 +703,7 @@ pub fn arm_gva<M: HostMemory + HostOps>(
 #[cfg(feature = "backend-vulkan")]
 pub fn gva_resident_authoritative(
     state: &DeviceState,
-    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    identity: &crate::model::TargetIdentity,
 ) -> bool {
     let Some((plane, debt)) = state.pending_writebacks.gva_for_identity(identity) else {
         return false;
@@ -776,10 +776,8 @@ fn same_gva_identity(a: GvaWritebackDebt, b: GvaWritebackDebt) -> bool {
 /// debt fields is how two spellings of one resident start disagreeing. There is
 /// one derivation and it is here.
 #[cfg(feature = "backend-vulkan")]
-pub(crate) fn gva_identity(
-    debt: GvaWritebackDebt,
-) -> crate::backend::vulkan::engine::TargetIdentity {
-    crate::backend::vulkan::engine::TargetIdentity::Gva {
+pub(crate) fn gva_identity(debt: GvaWritebackDebt) -> crate::model::TargetIdentity {
+    crate::model::TargetIdentity::Gva {
         gva: debt.linear.target_gva(),
         width: debt.width,
         height: debt.height,

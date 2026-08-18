@@ -884,15 +884,12 @@ pub(super) enum SampledSourceRequest {
     /// Engine-resident allocation plus the exact view format this sampled
     /// texture declared. Allocation identity and view interpretation are
     /// separate parts of the texture contract.
-    Target(
-        crate::backend::vulkan::engine::TargetIdentity,
-        ash::vk::Format,
-    ),
+    Target(crate::model::TargetIdentity, ash::vk::Format),
     /// The render attachment and fragment binding name the same serialized
     /// texture. The engine either binds that image through native feedback or
     /// produces the capability fallback entirely on the GPU.
     Attachment(
-        crate::backend::vulkan::engine::TargetIdentity,
+        crate::model::TargetIdentity,
         crate::backend::vulkan::engine::AttachmentInitial,
         ash::vk::Format,
     ),
@@ -1014,7 +1011,7 @@ pub(super) fn fragment_attachment_alias_initial(
 }
 
 pub(super) fn attachment_alias_source(
-    identity: crate::backend::vulkan::engine::TargetIdentity,
+    identity: crate::model::TargetIdentity,
     format: ash::vk::Format,
     initial: crate::backend::vulkan::engine::AttachmentInitial,
 ) -> SampledSourceRequest {
@@ -3293,7 +3290,7 @@ fn gva_resident_ready(
     state: &DeviceState,
     task_id: u32,
     texture_ref: u32,
-    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    identity: &crate::model::TargetIdentity,
 ) -> bool {
     let backing = (texture_ref != 0)
         .then(|| state.task_resources.get(task_id, texture_ref))
@@ -3330,7 +3327,7 @@ pub(super) fn gva_resident_if_current<M: HostMemory + HostOps>(
     host: &mut M,
     task_id: u32,
     span: GvaSpan,
-) -> Result<crate::backend::vulkan::engine::TargetIdentity, GvaResidentRefusal> {
+) -> Result<crate::model::TargetIdentity, GvaResidentRefusal> {
     use crate::runtime::gva_store_witness::{reach, GvaTargetKey};
 
     let GvaSpan {
@@ -3363,7 +3360,7 @@ pub(super) fn gva_resident_if_current<M: HostMemory + HostOps>(
         return Err(GvaResidentRefusal::NoGeneration);
     }
     let resident_format = gva_resident_format(state.executor.as_ref(), format);
-    let identity = crate::backend::vulkan::engine::TargetIdentity::Gva {
+    let identity = crate::model::TargetIdentity::Gva {
         gva,
         width: w,
         height: h,
@@ -5116,7 +5113,7 @@ enum M2vDrawSpan {
     /// — see [`Self::ResidentSurfaceStore`] for what a second derivation costs.
     ResidentGvaStore {
         submission: reims_vgpu_protocol::SubmissionId,
-        identity: crate::backend::vulkan::engine::TargetIdentity,
+        identity: crate::model::TargetIdentity,
     },
     /// IOSurface texture composite Store executed into its registry resident with
     /// `skip_readback`: the caller copies that image into the mapping's guest
@@ -5145,7 +5142,7 @@ enum M2vDrawSpan {
     /// rail a host without `VK_EXT_external_memory_host` has.
     ResidentSurfaceStore {
         submission: reims_vgpu_protocol::SubmissionId,
-        identity: crate::backend::vulkan::engine::TargetIdentity,
+        identity: crate::model::TargetIdentity,
     },
 }
 
@@ -5290,7 +5287,7 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
     task_id: u32,
     colors: &[ColorRtRequest],
     pipeline: &crate::runtime::decode::resource::RenderPipelineDescriptor,
-    primary: &crate::backend::vulkan::engine::TargetIdentity,
+    primary: &crate::model::TargetIdentity,
     fb_w: u32,
     fb_h: u32,
     blend_constants: [f32; 4],
@@ -5496,7 +5493,7 @@ pub(super) fn prepare_vertex_step_function(
 
 #[derive(Default)]
 pub(super) struct GvaLoadResolution {
-    pub identity: Option<crate::backend::vulkan::engine::TargetIdentity>,
+    pub identity: Option<crate::model::TargetIdentity>,
     pub guest_seed: Option<crate::backend::vulkan::engine::GuestTargetSeed>,
 }
 
@@ -7188,7 +7185,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // The rail's own resident, not a bool: the span this returns has to name
         // the key the draw registered, and a flag beside `resources` would let a
         // caller derive a second one. See `M2vDrawSpan::ResidentSurfaceStore`.
-        let mut gva_resident_store: Option<crate::backend::vulkan::engine::TargetIdentity> = None;
+        let mut gva_resident_store: Option<crate::model::TargetIdentity> = None;
         if req.chain_from_resident || (store_is_store && !writeback_guest) {
             if let Some(identity) = render_chain_identity(state, req) {
                 resources.target_identity = Some(identity);
@@ -7230,8 +7227,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         //
         // The rail's own resident, not a bool, for the reason `gva_resident_store`
         // states: the span carries this value out to the Store.
-        let mut surface_resident_store: Option<crate::backend::vulkan::engine::TargetIdentity> =
-            None;
+        let mut surface_resident_store: Option<crate::model::TargetIdentity> = None;
         if resources.target_identity.is_none() {
             resources.target_identity = iosurface_texture_resident_target.clone();
         }
@@ -8014,7 +8010,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
 pub(super) fn depth_chain_identity(
     req: &DrawEncodeRequest,
     with_stencil: bool,
-) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
+) -> Option<crate::model::TargetIdentity> {
     let depth = req.depth_attach.as_ref()?;
     if depth.texture_ref == 0 {
         return None;
@@ -8024,7 +8020,7 @@ pub(super) fn depth_chain_identity(
     if width == 0 || height == 0 {
         return None;
     }
-    Some(crate::backend::vulkan::engine::TargetIdentity::Texture {
+    Some(crate::model::TargetIdentity::Texture {
         ref_: depth.texture_ref,
         width,
         height,
@@ -8036,7 +8032,7 @@ pub(super) fn depth_chain_identity(
 pub(crate) fn render_chain_identity(
     state: &DeviceState,
     req: &DrawEncodeRequest,
-) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
+) -> Option<crate::model::TargetIdentity> {
     let c0 = req.colors.first()?;
     let (width, height) = (c0.width, c0.height);
     if width == 0 || height == 0 {
@@ -8060,8 +8056,8 @@ fn color_target_identity<M: HostMemory + HostOps>(
     color: &ColorRtRequest,
     format: ash::vk::Format,
     known_gva_generation: Option<u64>,
-) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
-    use crate::backend::vulkan::engine::TargetIdentity;
+) -> Option<crate::model::TargetIdentity> {
+    use crate::model::TargetIdentity;
 
     if color.width == 0 || color.height == 0 {
         return None;
@@ -8142,7 +8138,7 @@ pub(super) fn iosurface_texture_store_identity(
     state: &DeviceState,
     req: &DrawEncodeRequest,
     writeback_guest: bool,
-) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
+) -> Option<crate::model::TargetIdentity> {
     if !writeback_guest {
         return None;
     }
@@ -8176,7 +8172,7 @@ pub(super) fn iosurface_texture_store_identity(
 fn iosurface_texture_render_identity(
     state: &DeviceState,
     req: &DrawEncodeRequest,
-) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
+) -> Option<crate::model::TargetIdentity> {
     let c0 = req.colors.first()?;
     if c0.mapping_id() == 0
         || !crate::contract::pass_action::store_action_publishes_single_sample(c0.store_action)
@@ -8271,7 +8267,7 @@ fn iosurface_texture_load_is_a_seed_candidate(c0: &ColorRtRequest) -> bool {
 pub(super) fn iosurface_texture_load_currency_query(
     state: &DeviceState,
     req: &DrawEncodeRequest,
-) -> Option<(crate::backend::vulkan::engine::TargetIdentity, Option<u32>)> {
+) -> Option<(crate::model::TargetIdentity, Option<u32>)> {
     let c0 = req.colors.first()?;
     if !iosurface_texture_load_is_a_seed_candidate(c0) {
         return None;
@@ -8445,7 +8441,7 @@ pub(crate) fn gva_span_alloc_generation<M: HostMemory + HostOps>(
 pub(crate) fn gva_chain_identity(
     executor: &dyn crate::runtime::executor::Executor,
     req: &DrawEncodeRequest,
-) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
+) -> Option<crate::model::TargetIdentity> {
     let c0 = req.colors.first()?;
     if c0.mapping_id() != 0 || c0.target_gva() == 0 {
         return None;
@@ -8454,7 +8450,7 @@ pub(crate) fn gva_chain_identity(
     if w == 0 || h == 0 {
         return None;
     }
-    Some(crate::backend::vulkan::engine::TargetIdentity::Gva {
+    Some(crate::model::TargetIdentity::Gva {
         gva: c0.target_gva(),
         width: w,
         height: h,
@@ -8466,7 +8462,7 @@ pub(crate) fn gva_chain_identity(
 /// The format the resident behind a GVA render target must hold: the one the
 /// guest declared for that attachment.
 ///
-/// This is [`crate::backend::vulkan::engine::TargetIdentity::resident_layout`]'s
+/// This is [`crate::model::TargetIdentity::resident_layout`]'s
 /// rule applied to the one namespace that has a declaration to follow, and it is
 /// a function rather than an expression at each producer because the producers
 /// key *the same registry slot*. A primary and a secondary attachment that
@@ -8553,7 +8549,7 @@ pub(crate) fn gva_resident_format(
 /// which made every GVA resident RGBA and every Store a per-row conversion.
 /// `TargetIdentity::Gva` now carries the order the guest declared for that
 /// render target — see `is_bgra` on
-/// [`crate::backend::vulkan::engine::TargetIdentity`] for why it is keyed on the
+/// [`crate::model::TargetIdentity`] for why it is keyed on the
 /// identity and what a change there has to keep true.
 ///
 /// The identity is the caller's, never re-derived here: both callers hold the
@@ -8564,7 +8560,7 @@ pub(crate) fn gva_resident_format(
 pub(crate) fn read_resident_chain(
     executor: &dyn crate::runtime::executor::Executor,
     req: &DrawEncodeRequest,
-    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    identity: &crate::model::TargetIdentity,
 ) -> Option<Vec<u8>> {
     match executor.read_target(identity) {
         // Every caller of this function — `writeback_chain_rgba` and the GVA
@@ -8624,7 +8620,7 @@ pub(crate) fn read_resident_chain(
 fn store_surface_resident<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
-    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    identity: &crate::model::TargetIdentity,
     mapping_id: u32,
     width: u32,
     height: u32,
@@ -9151,7 +9147,7 @@ mod vulkan_split_tests {
         let b: std::collections::HashSet<u64> = [0x4000, 0x5000, 0x7000].into_iter().collect();
 
         let gen = |pages: &std::collections::HashSet<u64>| super::gva_page_set_hash(pages);
-        let identity = |generation: u64| crate::backend::vulkan::engine::TargetIdentity::Gva {
+        let identity = |generation: u64| crate::model::TargetIdentity::Gva {
             gva: 0x8000,
             width: 64,
             height: 64,
@@ -9724,7 +9720,7 @@ mod vulkan_split_tests {
     /// image.
     #[test]
     fn a_secondary_attachment_is_named_by_its_own_guest_pages() {
-        use crate::backend::vulkan::engine::TargetIdentity;
+        use crate::model::TargetIdentity;
         use crate::runtime::decode::resource::{PipelineColorAttachment, RenderPipelineDescriptor};
 
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);

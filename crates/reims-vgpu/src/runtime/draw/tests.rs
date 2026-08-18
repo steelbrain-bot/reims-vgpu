@@ -998,7 +998,7 @@ fn stage_in_buffer_read_as_ssbo_is_bound_as_storage() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn gva_chain_identity_rules() {
-    use crate::backend::vulkan::engine::TargetIdentity;
+    use crate::model::TargetIdentity;
     let executor = crate::runtime::executor::VulkanExecutor::default();
     let mut req = DrawEncodeRequest::default();
     assert_eq!(
@@ -1049,7 +1049,7 @@ fn gva_chain_identity_rules() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn render_chain_identity_covers_iosurface_texture_and_gva_targets() {
-    use crate::backend::vulkan::engine::TargetIdentity;
+    use crate::model::TargetIdentity;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     assert!(state.map_surface(5));
@@ -1337,7 +1337,7 @@ fn attachment_alias_preserves_each_declared_load_action() {
 fn attachment_alias_source_keeps_one_texture_identity() {
     use crate::backend::vulkan::engine::AttachmentInitial;
 
-    let identity = crate::backend::vulkan::engine::TargetIdentity::Gva {
+    let identity = crate::model::TargetIdentity::Gva {
         gva: 0x4000,
         width: 2,
         height: 1,
@@ -4604,7 +4604,7 @@ fn a_secondary_mrt_slot_binds_its_own_blend() {
             ..ColorRtRequest::default()
         },
     ];
-    let primary = crate::backend::vulkan::engine::TargetIdentity::Gva {
+    let primary = crate::model::TargetIdentity::Gva {
         gva: 0x1000,
         width: 64,
         height: 64,
@@ -4688,7 +4688,7 @@ fn an_unbuildable_secondary_refuses_the_draw_rather_than_dropping_to_single_rt()
         ],
         ..RenderPipelineDescriptor::default()
     };
-    let primary = crate::backend::vulkan::engine::TargetIdentity::Gva {
+    let primary = crate::model::TargetIdentity::Gva {
         gva: 0x1000,
         width: 64,
         height: 64,
@@ -4839,7 +4839,7 @@ fn two_secondaries_over_one_destination_refuse_the_draw_like_a_primary_alias() {
             .collect(),
         ..RenderPipelineDescriptor::default()
     };
-    let primary = crate::backend::vulkan::engine::TargetIdentity::Gva {
+    let primary = crate::model::TargetIdentity::Gva {
         gva: 0x1000,
         width: 64,
         height: 64,
@@ -6240,7 +6240,7 @@ fn a_gva_span_no_store_has_stamped_refuses_the_resident_sample_rung() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_depth_attachment_is_keyed_on_the_guest_texture_the_pass_bound() {
-    use crate::backend::vulkan::engine::TargetIdentity;
+    use crate::model::TargetIdentity;
     use crate::runtime::decode::render::DepthAttachment;
     use crate::runtime::draw::vulkan::depth_chain_identity;
 

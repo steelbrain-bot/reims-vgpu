@@ -843,7 +843,7 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mapping_id: u32,
-    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    identity: &crate::model::TargetIdentity,
     width: u32,
     height: u32,
 ) -> bool {
@@ -1001,7 +1001,7 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
 fn finish(
     state: &mut DeviceState,
     mapping_id: u32,
-    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    identity: &crate::model::TargetIdentity,
     frame_len: usize,
     started: std::time::Instant,
 ) {
@@ -1201,7 +1201,7 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
-    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    identity: &crate::model::TargetIdentity,
     c0: &crate::runtime::draw::ColorRtRequest,
     texture_ref: u32,
     pages: Option<&crate::runtime::draw::StoreTargetPages>,
@@ -1353,7 +1353,7 @@ fn store_gva_frame_direct<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
-    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    identity: &crate::model::TargetIdentity,
     c0: &crate::runtime::draw::ColorRtRequest,
     texture_ref: u32,
     pages: Option<&crate::runtime::draw::StoreTargetPages>,
@@ -1589,7 +1589,7 @@ pub(crate) fn copy_resident_into_gva_plane<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
-    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    identity: &crate::model::TargetIdentity,
     c0: &GvaPlaneDestination,
     pages: Option<&crate::runtime::draw::StoreTargetPages>,
 ) -> Result<u64, GvaWritebackDecline> {

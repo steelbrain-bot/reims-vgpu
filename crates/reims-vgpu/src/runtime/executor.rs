@@ -6,8 +6,9 @@
 
 use crate::backend::vulkan::engine::{
     ComputeOutput, ComputeRequest, DrawError, DrawOutput, DrawRequest, EngineFacadeDecline,
-    GuestWriteReach, ResidentContent, StorageImageFormat, TargetIdentity, TargetReadback,
+    GuestWriteReach, ResidentContent, StorageImageFormat, TargetReadback,
 };
+use crate::model::TargetIdentity;
 use reims_vgpu_protocol::SubmissionIdentity;
 
 pub use reims_vgpu_core::SubmissionContext;
