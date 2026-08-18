@@ -293,11 +293,8 @@ pub fn opcode_confidence(opcode: u32) -> OpcodeConfidence {
 /// entries are known to be inside the record the guest itself sized. What the
 /// cap added was a second, lower bound with no derivation behind it.
 ///
-/// Which index a backend can actually bind is a *backend* question and is
-/// already answered there — `REIMS_VGPU_METAL_MAX_BUFFERS` and
-/// `valid_buffer_binding` on the Metal arm, the descriptor-set limits on the
-/// Vulkan one. A decoder that pre-empts them refuses guest work neither of them
-/// would have.
+/// Which index Vulkan can actually bind is a backend question. A decoder that
+/// pre-empts that answer can refuse otherwise valid guest work.
 ///
 /// **The limit those caps were reaching for has since been measured, and it is
 /// three numbers rather than one** — see [`reims_vgpu_wire::ops::bind_limit`],

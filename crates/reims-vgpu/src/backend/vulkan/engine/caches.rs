@@ -126,10 +126,7 @@ pub(crate) fn canonicalize_layout_bindings(
 /// The fourth spelling of one number, and the last one to be pinned. The wire
 /// record's colour-slot array is the truth,
 /// [`crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS`] derives from
-/// it, and `backend::metal::REIMS_VGPU_METAL_MAX_COLOR_RTS` is held equal to it
-/// by an assertion beside itself. This one is that bound minus one, on the arm
-/// the other assertion cannot reach — `REIMS_VGPU_METAL_MAX_COLOR_RTS` is behind
-/// `feature = "backend-metal"`, so nothing in a Vulkan build compared the two.
+/// by an assertion beside itself. This one is that bound minus one.
 ///
 /// A drift here is refused rather than lost: `execute_draw_inner` returns
 /// [`super::reason::DrawReason::SecondaryAttachmentCap`] for a request past this
@@ -617,8 +614,7 @@ const NEGATIVE_CAP: usize = 1024;
 ///
 /// Two of those numbers matter beyond this arm. `passes=4` against the 64 this
 /// cache carried is the widest margin here; and `pipelines=92` is *above* the
-/// 64-slot render-pipeline table the Metal arm carried, which is how that arm's
-/// cap was shown to be binding — see [`crate::model::content_cache`].
+/// retired capacity that was previously used for pipelines.
 ///
 /// Unbounded is also the faithful failure mode. When a guest really does ask for
 /// more distinct pipelines than the host can hold, the create itself returns
@@ -2377,7 +2373,6 @@ impl ObjectCaches {
         //
         // The secondaries used to be forced unblended here, justified by a
         // comment saying the decode side did not carry per-attachment blend
-        // state. It did, and had all along — the Metal arm reads exactly these
         // fields per slot. Only this key collapsed them, so a guest MRT
         // pipeline that asked to blend slot 1 silently got a raw store.
         //

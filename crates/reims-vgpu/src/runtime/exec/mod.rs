@@ -1,7 +1,6 @@
 //! CmdExecIndirect2: load streams, multi-attachment clears, Metal draw attempt.
 //!
 //! Clear-only passes write guest mapping pages (archive render_clear).
-//! Draws try Metal encode when pipeline MTLBs resolve; otherwise color targets
 //! are still marked dirty for DisplaySwap.
 
 use crate::contract::draw::DrawArgs;
@@ -201,7 +200,7 @@ struct StreamAccum {
     /// Recording it lets [`StreamAccum::bind_snapshot`] refuse. That is the
     /// funnel both consumers of the stream's state pass through — a decoded draw
     /// and an end-of-stream ICB execute — which is why the refusal lives there
-    /// and not in either backend's encoder.
+    /// and not in the backend encoder.
     ///
     /// **Sticky, and it cannot go stale.** There is no retirement path and none
     /// is needed: this field describes the accumulator beside it. A
@@ -615,8 +614,8 @@ pub struct ExecResult {
     pub type11_mappings: Vec<u32>,
     pub saw_draw: bool,
     pub clears_applied: u32,
-    pub metal_draws_ok: u32,
-    pub metal_draws_fail: u32,
+    pub draws_ok: u32,
+    pub draws_fail: u32,
     /// Render-pass attachment sets resolved from guest objects. One Metal
     /// render stream has one fixed attachment set regardless of draw count.
     pub render_attachment_resolves: u32,
@@ -780,8 +779,7 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         );
         pending
     };
-    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-    let translation_pending = false;
+
     if translation_pending {
         out.deferred = true;
         note_exec_header(exec_started, measured_ns);
@@ -1777,7 +1775,6 @@ fn handle_blit_record<M: HostMemory + HostOps>(
         // dropped one, so they stay fail-visible as well as counted.
         //
         // Counted rather than executed on purpose. `runtime::icb` materializes
-        // host ICBs on the Metal arm only, and it reads 0.00% on a driven x86
         // boot — so the count is what says whether an executor is worth building,
         // and for which of the two.
         BlitKind::IcbRange if cmd.opcode == wire_blit::OPCODE_OPTIMIZE_ICB => {
@@ -3122,8 +3119,7 @@ impl StreamRefusal {
 // `spirv_bind::widen_sampled_bands` closed. A `<` here would mean this device
 // accepts a slot it cannot name; a `>` would mean the gap is back.
 const _: () = assert!(reims_vgpu_wire::ops::bind_limit::TEXTURE == MAX_TEXTURE_BIND_SLOTS);
-// Buffers: two independent derivations of one table size — Apple's serializer
-// truncates there and Metal's `REIMS_VGPU_METAL_MAX_BUFFERS` stops there.
+// Buffers: the bound is Apple's serializer table size.
 const _: () = assert!(reims_vgpu_wire::ops::bind_limit::BUFFER == MAX_BUFFER_BIND_SLOTS);
 // Samplers: Apple truncates well below the bound, so this slug cannot fire on a
 // stream Apple's serializer wrote. A reading is a guest writing its own stream,
@@ -3617,17 +3613,16 @@ fn finish_stream<M: HostMemory + HostOps>(
         let mut chain_rgba: Option<Vec<u8>> = None;
         // Occlusion counts, keyed by the guest byte offset each lands at.
         //
-        // Summed rather than replaced because one Metal counter can span
-        // several draws and every backend here runs one query per draw: Metal
-        // accumulates into the buffer word itself, so the equivalent is the sum
-        // of what each draw passed. Several offsets in one pass are legal and
+        // Summed rather than replaced because the guest counter can span
+        // several draws while Vulkan runs one query per draw. The equivalent is
+        // the sum of what each draw passed. Several offsets in one pass are legal and
         // independent, which is why this is a map and not a scalar.
         let mut visibility_counts: std::collections::BTreeMap<u64, u64> =
             std::collections::BTreeMap::new();
         // Resident render-pass chain: intermediate records keep their content
         // on the engine target (no CPU chain buffer); records 2+ LoadFromTarget.
         let mut resident_chain = false;
-        let mut saw_nometal = false;
+        let mut saw_backend_unavailable = false;
         let first_draw = draw_list.first().copied();
         let mut first_req = first_draw.and_then(|pd| {
             out.render_attachment_resolves = out.render_attachment_resolves.saturating_add(1);
@@ -3650,11 +3645,11 @@ fn finish_stream<M: HostMemory + HostOps>(
         if first_draw.is_some() && first_req.is_none() {
             let refs: Vec<u32> = acc.color_slots.iter().map(|(_, a)| a.texture_ref).collect();
             crate::observe::fail(format!(
-                "metal_draw mrt_request fail task={task_id} pipe={} slots={refs:?} di=0/{}",
+                "draw mrt_request fail task={task_id} pipe={} slots={refs:?} di=0/{}",
                 first_draw.map(|pd| pd.pipeline_ref).unwrap_or(0),
                 draw_list.len()
             ));
-            out.metal_draws_fail = out.metal_draws_fail.saturating_add(1);
+            out.draws_fail = out.draws_fail.saturating_add(1);
             dirty_color_targets(state, host, task_id, &acc.color_targets);
         }
         for (di, pd) in draw_list.iter().enumerate() {
@@ -3771,7 +3766,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                 );
                 match encode {
                     (EncodeStatus::Ok, Some(rgba)) => {
-                        out.metal_draws_ok += 1;
+                        out.draws_ok += 1;
                         if !resident_chain {
                             chain_rgba = Some(rgba);
                         }
@@ -3779,13 +3774,13 @@ fn finish_stream<M: HostMemory + HostOps>(
                     (EncodeStatus::Ok, None) if req.chain_resident_established => {
                         // Resident render-pass chain intermediate: content stays
                         // on the engine target; the next record loads it there.
-                        out.metal_draws_ok += 1;
+                        out.draws_ok += 1;
                         resident_chain = true;
                     }
                     (EncodeStatus::Ok, None) => {
                         // Intermediate must return color0 for chaining; treat as
                         // break so we do not composite later draws on a missing seed.
-                        out.metal_draws_ok += 1;
+                        out.draws_ok += 1;
                         if !do_writeback && !unified {
                             // Every draw after this one is dropped, so say so.
                             // The two sibling break arms below report through
@@ -3821,9 +3816,9 @@ fn finish_stream<M: HostMemory + HostOps>(
                             break;
                         }
                     }
-                    (st @ EncodeStatus::NoMetal(_), _) => {
-                        saw_nometal = true;
-                        out.metal_draws_fail += 1;
+                    (st @ EncodeStatus::BackendUnavailable(_), _) => {
+                        saw_backend_unavailable = true;
+                        out.draws_fail += 1;
                         note_draw_encode_fail(task_id, pd.pipeline_ref, st, di, draw_list.len());
                         land_chain_before_abandon(
                             state,
@@ -3833,18 +3828,17 @@ fn finish_stream<M: HostMemory + HostOps>(
                             &req,
                             &mut chain_rgba,
                             ChainEnd {
-                                cause: draw::ChainAbandonCause::NoMetal,
+                                cause: draw::ChainAbandonCause::BackendUnavailable,
                                 resident: resident_chain,
                             },
                         );
                         break;
                     }
-                    // `Ok` and the distinct clear-fallback `NoMetal` recovery
+                    // `Ok` and the distinct clear-fallback `BackendUnavailable` recovery
                     // are exhausted above. Every remaining status is a typed
-                    // terminal refusal, including the Metal-only carrier when
-                    // that feature exists.
+                    // terminal refusal.
                     (st, _) => {
-                        out.metal_draws_fail += 1;
+                        out.draws_fail += 1;
                         note_draw_encode_fail(task_id, pd.pipeline_ref, st, di, draw_list.len());
                         // If earlier GVA draws produced a chain image, land it
                         // before abandoning the packet. Unified targets already
@@ -3869,22 +3863,22 @@ fn finish_stream<M: HostMemory + HostOps>(
         }
         fin.enter(crate::runtime::drain::FinishPhase::Tail);
         write_visibility_results(state, host, task_id, acc, &visibility_counts);
-        // Encode never landed Stores (NoMetal stubs, missing MTLB/pipeline, or
+        // Encode never landed Stores (unavailable operations, missing MTLB/pipeline, or
         // mrt resolve fail). Honor CLEAR load+store into guest/host pages so
         // dual-buffer display mids at least hold the pass clear color (archive
         // CLEAR seed — not a content heuristic). Applies for any draw-fail
-        // class, not only NoMetal: mrt_request fail used to skip this and left
+        // class, not only BackendUnavailable: mrt_request fail used to skip this and left
         // mid pages empty → nz_swing thrash on x86 Linux product.
-        if out.metal_draws_ok == 0 && !acc.clears.is_empty() {
+        if out.draws_ok == 0 && !acc.clears.is_empty() {
             for att in acc.clears_reaching_guest_pages() {
                 if apply_clear(state, host, task_id, att) {
                     out.clears_applied = out.clears_applied.saturating_add(1);
                 }
             }
-            if out.clears_applied > 0 || saw_nometal || out.metal_draws_fail > 0 {
+            if out.clears_applied > 0 || saw_backend_unavailable || out.draws_fail > 0 {
                 crate::observe::fail(format!(
-                    "draw_fail_clear_fallback task={task_id} clears={} draws_fail={} nometal={}",
-                    out.clears_applied, out.metal_draws_fail, saw_nometal as u8
+                    "draw_fail_clear_fallback task={task_id} clears={} draws_fail={} backend_unavailable={}",
+                    out.clears_applied, out.draws_fail, saw_backend_unavailable as u8
                 ));
             }
         }
@@ -4000,7 +3994,7 @@ fn write_visibility_results<M: HostMemory + HostOps>(
 
 /// Why a draw list stopped early while every draw in it had encoded `Ok`.
 ///
-/// This is the one abandon path that no counter can see. `metal_draws_fail`
+/// This is the one abandon path that no counter can see. `draws_fail`
 /// stays 0, so `packet_failed` is false and even the packet-level
 /// `exec_indirect2` line is suppressed; the draws after this point are dropped
 /// with the packet still reported as successful.
@@ -4334,7 +4328,7 @@ struct ChainEnd {
 /// Land the chain image this packet has produced before abandoning it.
 ///
 /// Three records break a multi-draw chain: a typed terminal refusal, the
-/// `NoMetal` carrier, and an intermediate that returned no colour0. All three
+/// `BackendUnavailable` carrier, and an intermediate that returned no colour0. All three
 /// leave earlier GVA draws' pixels only on the engine target, and dropping
 /// them left dual-mid pages black while the content generation advanced — so
 /// the resident is read back and written out first, and the colour targets are

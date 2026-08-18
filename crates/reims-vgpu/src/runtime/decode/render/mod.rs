@@ -43,7 +43,6 @@ fn narrow_count(value: u64) -> Result<u32, DecodeStatus> {
 /// hold — the selector's own argument, overruled.
 ///
 /// Three arms of this device disagree about that value and were never diffed
-/// against each other. This one clamps it. `backend::metal::render` refuses it
 /// by name as `metal_render_instance_count_zero` — a refusal this clamp makes
 /// unreachable, so the two cannot both be describing the contract. And
 /// `runtime::icb` decodes the same argument out of an ICB slot and hands it
@@ -60,13 +59,11 @@ fn narrow_count(value: u64) -> Result<u32, DecodeStatus> {
 /// command on this workload reaches the clamp, and it is inert rather than
 /// load-bearing — which is also why it has not been replaced. Both candidate
 /// replacements (pass the zero through as the ICB path does, or refuse it as
-/// `backend::metal::render` does) would be unobservable here, so the reading
 /// cannot choose between them, and Metal's own validation rejects
 /// `instanceCount:0` outright — which is the reason to doubt any guest emits it.
 ///
 /// A firing is the signal. It would mean a real selector carries zero, and the
 /// arm that receives it decides the pixels: this one draws one instance, the
-/// Metal backend refuses the draw, the ICB path draws nothing.
 ///
 /// Because this is the single site, the count it guarantees is what let the
 /// four further `.max(1)`s downstream of it go: two in `runtime::exec`, one in
@@ -176,7 +173,6 @@ pub(crate) const PASS_TAIL_TARGET_WIDTH: usize = 0x0c;
 #[cfg(test)]
 pub(crate) const PASS_TAIL_TARGET_HEIGHT: usize = 0x14;
 // The five load/store ordinals this record carries are declared in
-// `contract::pass_action`, not here: both backends and the Metal C ABI mirror
 // consume them, and while they lived in this decoder the mirror's copy was the
 // only spelling the encode path could reach.
 pub const PASS_MIN_PAYLOAD: usize = PASS_COLOR_ATTACH_OFF + PASS_COLOR_ATTACH_STRIDE;
@@ -521,7 +517,6 @@ fn scissor_from_wire(r: &wire::ScissorRect) -> ScissorRect {
 }
 
 /// Lift one wire viewport, in the `[originX, originY, width, height, znear,
-/// zfar]` order both backends read it back in. Shared by the singular and
 /// plural viewport opcodes for the same reason as [`scissor_from_wire`].
 fn viewport_from_wire(v: &wire::Viewport) -> [f64; 6] {
     [

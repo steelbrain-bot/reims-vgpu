@@ -49,9 +49,6 @@ use crate::qemu::host_ops::{NullHost, QemuHost, ReimsVgpuHostOps};
 use crate::model::{Device, DeviceId};
 use crate::runtime::{HostAction, HostOps};
 
-#[cfg(feature = "backend-metal")]
-type SelectedBackend = crate::backend::metal::MetalBackend;
-
 #[cfg(feature = "backend-vulkan")]
 type SelectedBackend = crate::backend::vulkan::VulkanBackend;
 
@@ -213,14 +210,7 @@ fn lock_for_drain(slot: &BoundDevice) -> parking_lot::MutexGuard<'_, DeviceInner
 }
 
 fn make_backend() -> SelectedBackend {
-    #[cfg(feature = "backend-metal")]
-    {
-        crate::backend::metal::MetalBackend::new()
-    }
-    #[cfg(feature = "backend-vulkan")]
-    {
-        crate::backend::vulkan::VulkanBackend::new()
-    }
+    crate::backend::vulkan::VulkanBackend::new()
 }
 
 /// Create a device. `ops` is the QEMU host-service table (nullable for tests).
@@ -805,14 +795,7 @@ pub fn device_pop_action(id: u64) -> Option<HostAction> {
 }
 
 pub fn backend_name() -> &'static str {
-    #[cfg(feature = "backend-metal")]
-    {
-        "metal"
-    }
-    #[cfg(feature = "backend-vulkan")]
-    {
-        "vulkan"
-    }
+    "vulkan"
 }
 
 /// Run one C ABI entry body, turning a panic into `on_panic` rather than

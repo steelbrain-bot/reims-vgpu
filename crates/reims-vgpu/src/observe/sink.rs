@@ -1,4 +1,4 @@
-//! Temporary bring-up log for metal/scanout (research). Append-only `/tmp/reims-vgpu-draw.log`.
+//! Temporary bring-up log for draw/scanout research. Append-only `/tmp/reims-vgpu-draw.log`.
 //!
 //! Verbose lines: `REIMS_VGPU_DRAW_LOG=1` only — full-frame logging otherwise stalls the
 //! guest compositor. Failures always append (lightweight, fail-visible).
@@ -462,7 +462,7 @@ pub fn line(msg: impl AsRef<str>) {
     emit(Sink::Draw, msg.as_ref());
 }
 
-/// Always-on fail-visible line (writeback / Metal / missing resource / offline OFF).
+/// Always-on fail-visible line (writeback / backend / missing resource / offline OFF).
 pub fn fail(msg: impl AsRef<str>) {
     emit(Sink::Fail, msg.as_ref());
     if enabled() {
@@ -528,7 +528,6 @@ pub fn bgra_rgb_stats(bgra: &[u8]) -> (usize, u8, [u8; 4]) {
 /// On x86_64 this dispatches to an SSE2 vectorized kernel (16 bytes/iteration,
 /// ~11× the scalar loop measured at opt-level 2); SSE2 is baseline for the
 /// arch so no runtime feature detection is needed. The scalar body remains the
-/// reference on other targets (arm backend-metal build) and the oracle the
 /// `bgra_present_stats_byte_exact_with_sse2` unit asserts against.
 #[inline]
 pub fn bgra_present_stats(bgra: &[u8]) -> (usize, u8, usize, u8, [u8; 4]) {

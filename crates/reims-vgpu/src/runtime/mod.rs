@@ -19,16 +19,8 @@ pub mod census;
 /// boundary, which is 82% of it.
 pub mod chain_phase;
 /// Product-path compute bind/dispatch (pipeline + buffers + direct dispatch).
-// See the note on `backend::metal`: `Status` is a 264-byte `Copy` payload
-// carried on failure paths, and boxing it would cost the refusal vocabulary
-// that makes each one greppable.
-#[allow(clippy::result_large_err, clippy::large_enum_variant)]
 pub mod compute_exec;
-/// Multi-record compute encoder session (control-flow SPI + ICB execute).
-// See the note on `backend::metal`: `Status` is a 264-byte `Copy` payload
-// carried on failure paths, and boxing it would cost the refusal vocabulary
-// that makes each one greppable.
-#[allow(clippy::result_large_err, clippy::large_enum_variant)]
+/// Multi-record compute sequencing state.
 pub mod compute_session;
 pub mod decode;
 pub mod drain;
@@ -53,7 +45,6 @@ pub mod guest_ram;
 /// address becomes a bindable reference.
 pub mod guest_ram_map;
 /// Scattered guest windows → image-copy rectangles. Pure arithmetic, ungated so
-/// both backends and every test arm reach it.
 /// Task GVA → guest RAM reads.
 pub mod gva_mem;
 /// GVA Store currency is used by Vulkan residents and retained in the decoded
@@ -70,11 +61,7 @@ pub mod host_writes;
 /// Type-7 ICB (0x36) materialization, host command fills, execute writeback.
 pub mod icb;
 
-/// Metal draw encode + writeback when MTLBs resolve.
-// See the note on `backend::metal`: `Status` is a 264-byte `Copy` payload
-// carried on failure paths, and boxing it would cost the refusal vocabulary
-// that makes each one greppable.
-#[allow(clippy::result_large_err, clippy::large_enum_variant)]
+/// Draw encode and writeback when MTLBs resolve.
 pub mod draw;
 pub mod input;
 /// Process-global metal2vulkan SPIR-V cache (AIR content hash → SPIR-V).

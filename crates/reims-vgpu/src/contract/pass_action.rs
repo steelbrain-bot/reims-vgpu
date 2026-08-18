@@ -3,29 +3,17 @@
 //!
 //! Two adjacent 16-bit words of every colour, depth and stencil attachment. The
 //! guest writes the Metal SDK's own ordinals into them, so the numbers here are
-//! simultaneously a wire fact and an SDK fact — which is why the conversion on
-//! the Metal encode path is an identity: nothing is mapped, only widened.
+//! simultaneously a wire fact and an SDK fact.
 //!
 //! # Why they live here rather than in the decoder or the backend
 //!
-//! They were declared twice. `runtime::decode::render` had them as `u16` under
-//! `PASS_*`, `backend::metal::abi` as `u32` under `REIMS_VGPU_MTL_*`, five
-//! ordinals each, and nothing in the toolchain compared the two — the only
-//! thing that touched both was an identity `match` in [`crate::runtime::draw`]
-//! that read as a translation table. A value that arrives on the wire and is
-//! consumed by both backends belongs beside the other wire/SDK numbers, per this
-//! module tree's own doc; `backend::metal::abi` keeps its spelling because that
-//! file is a mirror of an archived C header and the mirror is its provenance,
-//! with `const` assertions there pinning the two equal on every arm that
-//! compiles it.
+//! A value that arrives on the wire and is consumed by the runtime and Vulkan
+//! translator belongs beside the other wire/SDK numbers, not in either consumer.
 //!
 //! # The widths differ, and that is the whole conversion
 //!
-//! The attachment prefix spells an action in 16 bits; the Metal C shim takes an
-//! `MTLLoadAction`/`MTLStoreAction` as `uint32_t`. So the declaration that
-//! crosses to C is `u32` and this one is `u16`, and everything between them is a
-//! widening — see [`crate::runtime::draw`]'s `map_load_action`, which returns
-//! DontCare for a value outside the set and widens every value inside it.
+//! The attachment prefix spells an action in 16 bits. The runtime preserves
+//! that width until it translates the decoded action.
 
 /// `MTLLoadActionDontCare` — the attachment's prior contents may be discarded.
 pub const MTL_LOAD_ACTION_DONT_CARE: u16 = 0;

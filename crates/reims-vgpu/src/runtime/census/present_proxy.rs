@@ -50,7 +50,6 @@ struct ThrashState {
 /// the class above was reachable. It now refuses the whole draw through
 /// [`crate::backend::vulkan::engine::DrawPreparationDecline::SecondaryTargetUnbuildable`],
 /// so a guest that asks for N render targets never gets 1 without being told.
-/// What settled it was the other arm: `backend::metal::render` attaches every
 /// entry of the same colour list by its own slot number, so Metal already
 /// rendered what Vulkan was dropping, and the divergence — not a fresh argument
 /// about what Vulkan ought to do — is the finding.

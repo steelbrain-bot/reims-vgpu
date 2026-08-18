@@ -26,7 +26,7 @@ fn render_pass_chain_edges_follow_the_decoded_encoder() {
 /// The abandon line must say how much guest work it dropped.
 ///
 /// This break was silent, and the counter that would have caught it
-/// (`metal_draws_fail`) stays 0 on this path because the draw encoded
+/// (`draws_fail`) stays 0 on this path because the draw encoded
 /// `Ok` — so `packet_failed` is false and the packet-level line is
 /// suppressed too. The whole value of the line is the amount lost:
 /// breaking at 0 of 8 drops a whole composite, breaking at 7 of 8 drops
@@ -1057,7 +1057,7 @@ fn a_colour_attachment_naming_a_subresource_this_device_cannot_bind_refuses_the_
 
     // The source and resolve destination stay distinct through stream decode.
     // Collapsing them here turns a resolve operation into single-sample drawing
-    // and loses coverage before either backend sees the request.
+    // and loses coverage before the backend sees the request.
     let acc = run(&pass_resolving(0, 0, 0, 0x99));
     assert_eq!(acc.color_slots.len(), 1);
     assert_eq!(acc.color_slots[0].1.texture_ref, 77);
@@ -1907,50 +1907,39 @@ fn a_dropped_draw_names_which_check_refused_not_just_its_class() {
     // Distinct from every other pipeline in the suite: `fail_once` latches per
     // (reason, pipeline) for the whole process.
     let pipe = 249_001u32;
-    note_draw_encode_fail(
-        task,
-        pipe,
-        EncodeStatus::BadArgs("draw_mtl_zero_geom"),
-        1,
-        3,
-    );
+    note_draw_encode_fail(task, pipe, EncodeStatus::BadArgs("draw_zero_geom"), 1, 3);
     let body = sink_body();
     assert!(
-        body.lines().any(|l| l
-            .contains("draw_encode_fail reason=draw_mtl_zero_geom class=bad_args")
-            && l.contains(&format!("pipe={pipe}"))
-            && l.contains(&format!("task={task}"))
-            && l.contains("di=1/3")),
+        body.lines().any(
+            |l| l.contains("draw_encode_fail reason=draw_zero_geom class=bad_args")
+                && l.contains(&format!("pipe={pipe}"))
+                && l.contains(&format!("task={task}"))
+                && l.contains("di=1/3")
+        ),
         "the boundary line must carry the specific check and the class:\n{body}"
     );
 
     // Latched per (reason, pipeline): the guest re-submits the same failing
     // draw every frame, so a repeat adds nothing the first line did not…
-    note_draw_encode_fail(
-        task,
-        pipe,
-        EncodeStatus::BadArgs("draw_mtl_zero_geom"),
-        2,
-        3,
-    );
+    note_draw_encode_fail(task, pipe, EncodeStatus::BadArgs("draw_zero_geom"), 2, 3);
     // …but a *different* check on the same pipeline is a different event and
     // must still be visible. Latching on the class would have hidden it, which
     // is exactly the failure this migration removes.
     note_draw_encode_fail(
         task,
         pipe,
-        EncodeStatus::MetalFailed("draw_mtl_core_failed"),
+        EncodeStatus::BackendFailed("draw_core_failed"),
         2,
         3,
     );
     let body = sink_body();
     assert_eq!(
-        body.matches("reason=draw_mtl_zero_geom").count(),
+        body.matches("reason=draw_zero_geom").count(),
         1,
         "a re-attempted refusal must log once:\n{body}"
     );
     assert!(
-        body.contains("reason=draw_mtl_core_failed"),
+        body.contains("reason=draw_core_failed"),
         "a second check on the same pipeline must not be latched away:\n{body}"
     );
 
@@ -2125,8 +2114,8 @@ fn finish_stream_clear_only_branch_without_draws() {
     });
     // No draws → clear-only branch (attempts apply_clear; unresolvable ref).
     finish_stream(&mut state, &mut host, 1, &mut out, &acc);
-    assert_eq!(out.metal_draws_ok, 0);
-    assert_eq!(out.metal_draws_fail, 0);
+    assert_eq!(out.draws_ok, 0);
+    assert_eq!(out.draws_fail, 0);
 }
 
 #[test]
@@ -2187,16 +2176,16 @@ fn finish_stream_with_draws_skips_guest_clear_prelude() {
         stencil_attach: None,
     });
     finish_stream(&mut state, &mut host, 1, &mut out, &acc);
-    // Unresolvable RT → mrt_request fail before encode (not NoMetal); no clear.
+    // Unresolvable RT → mrt_request fail before encode (not BackendUnavailable); no clear.
     assert_eq!(
         out.clears_applied, 0,
         "unresolvable multi-draw must not guest-clear"
     );
 }
 
-/// Linux NoMetal: draws fail but CLEAR seed still Stores into type-4 pages.
+/// Linux BackendUnavailable: draws fail but CLEAR seed still Stores into type-4 pages.
 #[test]
-fn nometal_draw_falls_back_to_type4_clear() {
+fn backend_unavailable_draw_falls_back_to_type4_clear() {
     use crate::contract::endian::{st32, st64};
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::runtime::decode::render::ColorAttachment;
@@ -2303,15 +2292,15 @@ fn nometal_draw_falls_back_to_type4_clear() {
         "one render stream resolves its fixed attachment set once"
     );
     // Non-Apple: Linux encode Stores CLEAR load into type-4 (Ok) or
-    // NoMetal clear fallback — either path must land green BGRA.
+    // BackendUnavailable clear fallback — either path must land green BGRA.
     #[cfg(feature = "backend-vulkan")]
     {
         assert!(
-            out.metal_draws_ok >= 1 || out.clears_applied >= 1 || out.metal_draws_fail >= 1,
+            out.draws_ok >= 1 || out.clears_applied >= 1 || out.draws_fail >= 1,
             "expected clear store path: ok={} clear={} fail={}",
-            out.metal_draws_ok,
+            out.draws_ok,
             out.clears_applied,
-            out.metal_draws_fail
+            out.draws_fail
         );
         let mut px = [0u8; 4];
         assert!(host.read_gpa(page, &mut px).is_ok());

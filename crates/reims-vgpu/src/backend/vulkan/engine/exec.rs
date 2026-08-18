@@ -411,7 +411,6 @@ struct PassObstacles {
 
 /// Whether the draw belongs inside the render pass the command buffer is
 /// currently recording. Both facts are required: matching Vulkan objects do
-/// not join distinct Metal encoders, and an encoder continuation cannot reuse
 /// a pass that an intervening outside-pass command already closed.
 fn continues_open_render_pass(continues_encoder: bool, open_pass_matches: bool) -> bool {
     continues_encoder && open_pass_matches
@@ -2823,7 +2822,6 @@ pub(crate) unsafe fn execute_draw_inner(
     }));
     let joins = no_join.is_none();
     // The ceiling on render-pass continuation. A command buffer may carry
-    // unrelated Metal encoders and targets, but only same-target successors
     // inside one decoded encoder can retain the pass instance. This split says
     // how much of batching even belongs to that population; the obstacle ladder
     // at the draw records why individual candidates still have to close.
@@ -4039,7 +4037,6 @@ pub(crate) unsafe fn execute_draw_inner(
     };
 
     phase.enter(super::draw_phase::Phase::Descriptors);
-    // Push descriptors are the Vulkan spelling closest to Metal encoder
     // binding state: the writes become commands in this command buffer, with no
     // separately allocated object. The layout cache made the same decision.
     let push_descriptors = layout_key.uses_push_descriptors(ctx.caps.push_descriptor);
@@ -7781,7 +7778,6 @@ mod tests {
     /// `MTLVertexStepFunctionConstant`, the decoder preserves a declared zero
     /// for exactly that reason, and this binding's divisor is 0 whatever the
     /// rate says — so declining the pair lost the whole draw over a field
-    /// nothing downstream reads. The Metal arm always asked for the pair; this
     /// arm asked `rate == 0` alone. The sibling half of the assertion is what
     /// keeps the repair from becoming "stop checking the rate".
     #[test]

@@ -10,24 +10,16 @@
 //!
 //! # Why the pair lives here
 //!
-//! Both backends narrow it and they disagreed. The Metal arm asked
-//! `rate == 0 && step != Constant`; the Vulkan arm's draw validation asked
-//! `rate == 0` alone, so it declined the canonical Constant spelling — with
+//! Draw validation once asked `rate == 0` alone, so it declined the canonical Constant spelling — with
 //! `vk_draw_validate_zero_vertex_step_rate`, a decline that loses the whole
 //! draw — while ignoring the rate for exactly that step function everywhere
 //! downstream (its divisor is 0 whatever the rate says). The decoder's own doc
-//! settles which arm was right: "a layout that declared **zero** means zero —
+//! settles the rule: "a layout that declared **zero** means zero —
 //! that is what `MTLVertexStepFunctionConstant` pairs with — so nothing here
 //! clamps it up".
 //!
-//! The ordinals are here for a second reason. `backend::metal` reached them
-//! through `metal` 0.33's `MTLVertexStepFunction` discriminants, and that crate
-//! is measured to number the *sibling* `MTLStepFunction` wrongly in six of nine
-//! places — see `backend::metal::mtl_enum`, which carries the table and now also
-//! carries `const` assertions pinning this enum's five discriminants to the
-//! ordinals below. (Named in prose, not linked: that module is
-//! `backend-metal`-gated, so a link from here is unresolved on every Vulkan-arm
-//! doc build.)
+//! The ordinals live here because they are guest contract values consumed by
+//! both decode validation and Vulkan translation.
 //!
 //! [`VertexAttribute::step_function_ordinal`]: crate::runtime::decode::resource::VertexAttribute::step_function_ordinal
 //! [`VertexAttribute::step_rate`]: crate::runtime::decode::resource::VertexAttribute::step_rate
@@ -50,9 +42,9 @@ pub const MTL_VERTEX_STEP_FUNCTION_PER_PATCH_CONTROL_POINT: u32 = 4;
 /// rejects the descriptor — so refusing it by name is a report, not a policy.
 ///
 /// The step function is taken as its raw ordinal rather than a narrowed type on
-/// purpose: an undeclared ordinal has its own refusal at each backend, and this
+/// purpose: an undeclared ordinal has its own refusal at translation, and this
 /// predicate must not double as that one. It answers only "is the rate right for
-/// this step", and for an ordinal neither backend accepts the answer is the same
+/// this step", and for an ordinal the backend cannot accept the answer is the same
 /// as for `PerVertex` — which is what a caller checking the pair before the
 /// ordinal would want anyway.
 #[must_use]

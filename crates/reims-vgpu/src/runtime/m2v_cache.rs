@@ -537,15 +537,12 @@ impl Slot {
 /// outright, which is what the old doc itself named as the answer, and it is
 /// cheaper than a wider hash because a wider hash only moves the exponent.
 ///
-/// It is also the shape the rest of this crate uses:
-/// [`crate::model::content_cache`] buckets by a `u64` prefilter and decides on
-/// `CacheEntry::matches`, and [`crate::backend::blob`] buckets a shader by its
-/// digest and decides on the retained bytes.
+/// It is also the shape used by the Vulkan resident caches: a digest selects a
+/// candidate and retained content decides the hit.
 ///
 /// This doc used to close by calling itself "the one digest-keyed cache in the
 /// crate that trusted its key", on the strength of a sweep run when it was
 /// fixed. **The sweep was wrong by three, and how it went wrong is the useful
-/// part.** `backend::metal::cache`'s `BlobKey` was a digest beside the blob's
 /// *length*, and its own doc argued that carrying the length made it an
 /// identity — so a reader auditing for "digest alone" read the length as the
 /// confirming compare and moved on. It is not one. It makes a collision need

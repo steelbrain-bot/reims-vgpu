@@ -73,9 +73,9 @@ fn sampled_image_shape(
 ///
 /// `writeback_guest` is the archive multi-draw store plan (only the last record
 /// of a serialized render-pass chain writes guest memory). Intermediate records **must still
-/// encode** and return color0 for chaining — returning `NoMetal` when
+/// encode** and return color0 for chaining — returning `BackendUnavailable` when
 /// `!writeback_guest` aborted every multi-draw stream after the first
-/// record (live `draw_fail_clear_fallback nometal=1` on clear+draw packets).
+/// record (live `draw_fail_clear_fallback backend_unavailable=1` on clear+draw packets).
 pub fn encode_draw_chain<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -375,7 +375,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             }
             Err(e) => {
                 // Always-on + latched: a rejected engine draw falls to the
-                // clear-store fallback and surfaces as a bare `no_metal`
+                // clear-store fallback and surfaces as a bare `backend_unavailable`
                 // (the Safari padded-stride reject was invisible on a normal
                 // boot — the content layer stayed blank with zero fail lines).
                 // The decline names the specific check as the primary `reason=`
@@ -792,7 +792,10 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             }),
         )
     } else {
-        (EncodeStatus::NoMetal("draw_vk_nothing_stored"), None)
+        (
+            EncodeStatus::BackendUnavailable("draw_vk_nothing_stored"),
+            None,
+        )
     }
 }
 
@@ -987,8 +990,8 @@ pub(super) fn sampled_texture_descriptor<M: HostMemory>(
 ///
 /// Backend-neutral: the returned [`SampledSourceRequest`] is either an engine
 /// target to bind directly (zero-copy) or CPU bytes to upload, so this is the
-/// resolver the engine draw path uses. Distinct from [`load_sampled_rgba`],
-/// which is the Metal-path resolver and always materializes RGBA8 bytes.
+/// resolver the engine draw path uses. Distinct from [`load_sampled_rgba_static`],
+/// which always materializes RGBA8 bytes.
 ///
 /// # The type-11 ladder is measured, and every rung carries load
 ///
@@ -1980,9 +1983,8 @@ fn note_type11_load_seed(
 /// before recording the copy. Any writeback debt is paid before the page view is
 /// built, so it observes this device's latest Store rather than pre-Store bytes.
 ///
-/// The sibling Metal path already had rung 2: type-11 `seed_color_load` falls
-/// through to the same reader via `load_sampled_rgba_static`. Only the Vulkan arm
-/// stopped at the cache.
+/// Type-11 `seed_color_load` falls through to the same reader via
+/// `load_sampled_rgba_static`.
 ///
 /// `None` means the guest's LOAD could not be honoured at all, and
 /// [`note_type11_load_seed`] has already said which check refused.
@@ -5209,8 +5211,6 @@ fn note_type11_store_route(route: &'static str) {
 /// in those pages before. Refusing is what a GPU does with a render pass it
 /// cannot build.
 ///
-/// The Metal arm is what settled the question rather than an argument about
-/// what Vulkan ought to do: `backend::metal::render` attaches every entry of
 /// this same colour list at its own slot number and has never degraded, so the
 /// two arms disagreed about one wire form and only one of them was silent.
 #[allow(
@@ -5349,10 +5349,8 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
             c.clear_color[2] as f32,
             c.clear_color[3] as f32,
         ];
-        // This slot's own blend, resolved exactly as the Metal arm resolves it:
-        // find the pipeline's attachment entry for this Metal slot. No
-        // `or_else(first())` fallback here — the Metal path has one for its
-        // compat `color0` alias, but a secondary slot with no entry of its own
+        // Find the pipeline's attachment entry for this guest slot. No
+        // `or_else(first())` fallback: a secondary slot with no entry of its own
         // has no blend state, and borrowing slot 0's would be inventing one.
         // The mask is read from the same entry but *not* through the
         // `blending_enabled` filter below: `MTLColorWriteMask` applies whether
@@ -6751,7 +6749,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             }
         }
         if let Some(c0) = req.colors.first() {
-            // Out of contract is DontCare here, same as on the Metal arm, and
             // it says so through the same helper — this arm used to take an
             // unknown load action into the `_ => {}` below and blank the
             // attachment in silence.
@@ -7232,8 +7229,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // its own backing, while a copied resident is always landed before its
         // guest pages become a later seed, so neither needs a separate
         // front-frame retention policy.
-        // Metal path always passes color0 blend into the encoder. Linux/engine
-        // previously left `resources.blend = None` → opaque replace for every
+        // The engine previously left `resources.blend = None`, selecting opaque replace for every
         // draw, so Load seeds (gray/wallpaper/logo bases) were wiped by sparse
         // dock/chrome layers that Metal would alpha-blend over the attachment.
         // Contract: type-7 color attachment blend tags (decode/resource).

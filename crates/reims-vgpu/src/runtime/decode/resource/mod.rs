@@ -1176,38 +1176,6 @@ pub const MTL_COLOR_WRITE_MASK_GREEN: u32 = 1 << 2;
 pub const MTL_COLOR_WRITE_MASK_RED: u32 = 1 << 3;
 pub const MTL_COLOR_WRITE_MASK_ALL: u32 = 0xf;
 
-/// Where the sampler-creation record (type-7 subtype 0x03) puts each field, for
-/// the synthetic buffers the tests below assemble.
-///
-/// Derived from the view `decode_sampler_descriptor` actually reads. These were
-/// eight literals from a ported C header, and `ops::sampler`'s module doc says
-/// the two derivations agree — which was worth stating precisely because until
-/// the fixtures existed nothing had compared them. Deriving them is how that
-/// stays true without anyone re-checking it.
-///
-/// Two of them were also *anonymous*: `SAMPLER_DESC_WORD16` and `_WORD20` named
-/// their own offsets because the C header did not know what was there. The
-/// oracle does — `flags`, whose low nibble is the only written part, and
-/// `lodMinClamp` — so they are named for the fields now.
-///
-/// The cfg is their one consumer's, `icb::tests::put_type7_sampler`, which
-/// builds a sampler for the Metal ICB encoder and is gated the same way. Naming
-/// that cfg here rather than reaching for `allow(dead_code)` is what keeps the
-/// Vulkan arm able to say these are unreferenced if the consumer ever goes.
-#[cfg(all(test, feature = "backend-metal", target_os = "macos"))]
-pub(crate) mod sampler_desc {
-    use super::{offset_of, w_smp, OP_HDR};
-
-    pub(crate) const LEN: usize = w_smp::NEW_SAMPLER_TOTAL_LEN as usize;
-    pub(crate) const TAG: usize = offset_of!(reims_vgpu_wire::OpHeader, opcode);
-    pub(crate) const DECLARED_LEN: usize = offset_of!(reims_vgpu_wire::OpHeader, length);
-    pub(crate) const ID: usize = OP_HDR + offset_of!(w_smp::SamplerBody, object_ref);
-    pub(crate) const STATE_BITS: usize = OP_HDR + offset_of!(w_smp::SamplerBody, state);
-    pub(crate) const FLAGS: usize = OP_HDR + offset_of!(w_smp::SamplerBody, flags);
-    pub(crate) const LOD_MIN: usize = OP_HDR + offset_of!(w_smp::SamplerBody, lod_min_clamp);
-    pub(crate) const LOD_MAX: usize = OP_HDR + offset_of!(w_smp::SamplerBody, lod_max_clamp);
-}
-
 /// Live function descriptor (reims_vgpu_resource_format.h).
 pub const FUNCTION_DESC_BLOB_GVA: usize = 0;
 pub const FUNCTION_DESC_BLOB_SIZE: usize = 8;
@@ -1288,10 +1256,9 @@ pub const PIPELINE_TAG_TESSELLATION_OUTPUT_WINDING_ORDER: u8 = 0x12;
 pub const DEFAULT_RASTER_SAMPLE_COUNT: u32 = 1;
 /// Mesh SPI section offset (analog of classic [`PIPELINE_TAG_COLOR_ATTACH_OFFSET`]).
 ///
-/// Live host Metal `-[_MTLDevice serializeMeshRenderPipelineDescriptor:]`
-/// differentials (2026-07-12, Apple M3 Max): same compact first-subrecord
-/// grammar as classic type-7 (`[fieldCount]×[tag][0x04][u32]`). Presence of
-/// this tag selects the mesh role map for tags 0x01/0x02/0x03.
+/// Mesh descriptors use the same compact first-subrecord grammar as classic
+/// type-7 (`[fieldCount]×[tag][0x04][u32]`). Presence of this tag selects the
+/// mesh role map for tags 0x01/0x02/0x03.
 pub const PIPELINE_TAG_MESH_SECTION_OFFSET: u8 = 0x14;
 /// Mesh object-stage function — same wire tag as classic vertex (`0x01`).
 #[cfg(test)]
@@ -1370,7 +1337,6 @@ const VERTEX_LAYOUT_TAGS_CONSUMED: [u8; 4] = [
 
 /// `MTLVertexDescriptor.attributes` is a 31-slot array, so a descriptor naming
 /// more is malformed rather than something we chose not to read. The same
-/// number is [`crate::backend::metal::constants::REIMS_VGPU_METAL_MAX_ATTRS`],
 /// which is the Metal limit itself; this is the decode side of it, stated here
 /// because the Vulkan arm decodes the same descriptor and must lose the same
 /// attributes or none.
@@ -2394,7 +2360,6 @@ pub const PIPELINE_TAG_COMPUTE_STAGE_INPUT_OFFSET: u8 = 0x03;
 ///   render pass descriptor carries the depth and stencil textures a draw
 ///   renders into, and this device takes them from there. Both backends then
 ///   pin the host format — Vulkan to `TRANSIENT_DEPTH_FORMAT` or the device's
-///   queried combined format, the Metal arm to `DEPTH32_FLOAT` in
 ///   `validate_depth_attachment` — so there is no arm on which the guest's
 ///   declared format could change the attachment it gets. Dropping them cannot
 ///   change what the guest observes; the attachment it observes is the one its

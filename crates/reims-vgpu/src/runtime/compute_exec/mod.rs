@@ -12,17 +12,12 @@
 //! - `0xc8`/`0xca` direct dispatch; `0xc9`/`0xe6` indirect (guest args → direct encode)
 //! - `0xdb` dispatch type (serial/concurrent)
 //!
-//! Fences: stream walk (`fence_exec`). Control-flow (`0xdc`–`0xe2`) encodes
-//! host Metal SPI on a multi-record [`crate::runtime::compute_session`] (same
-//! encoder for the segment). ICB (`0xe4`/`0xe5`) materializes type-7 `0x36` and
-//! executes filled host command slots (CPU fill via [`crate::runtime::icb`];
-//! stream fill opcodes remain unknown). Nested dispatches on an open session
-//! encode onto that encoder (inside SPI); writeback runs after session commit.
-//! Barriers and compressed-texture flush are ordered no-ops.
+//! Fences use the stream walk (`fence_exec`). Control-flow (`0xdc`–`0xe2`) and
+//! ICB execution (`0xe4`/`0xe5`) are decoded but return typed unsupported
+//! refusals. Barriers and compressed-texture flush are ordered no-ops.
 //!
-//! One-shot encode uses [`crate::backend::metal::compute::compute_core`]; nested
-//! encode uses `compute_encode_on_encoder`. Buffer and storage-image writeback
-//! is GVA / type-11 staged.
+//! Direct dispatch uses the Vulkan engine. Buffer and storage-image writeback
+//! is staged through GVA or type-11 mappings.
 
 use crate::contract::endian::ld32;
 use crate::contract::pixel_format;
@@ -45,7 +40,7 @@ use crate::runtime::mapping_write;
 use crate::runtime::mtlb::{load_mtlb, AirLoadRail};
 use crate::runtime::objects;
 
-/// Cap on Metal compute buffer slots (matches backend `REIMS_VGPU_METAL_MAX_BUFFERS`).
+/// Compute buffer slot count from the guest serializer's argument-table limit.
 pub const MAX_COMPUTE_BUFFER_SLOTS: u32 = 31;
 /// Cap on compute texture stream indices (Metal bind = `TEXTURE_BINDING_BASE +
 /// index`). Metal's compute texture argument table, and Apple's serializer's:
@@ -64,7 +59,6 @@ pub const MAX_COMPUTE_SAMPLER_SLOTS: u32 = 16;
 // this rail treats as "the shader does not use this binding" and skips. A
 // silent drop, from two constants that never name each other.
 //
-// `backend::metal::constants` states the same relation for the Metal argument
 // tables, in the same form and for the same reason; this side had the caps and
 // the bands in two modules with nothing between them.
 const _: () = assert!(
@@ -113,12 +107,8 @@ pub const STAGE_IN_INDIRECT_ARGS_LEN: usize = 24;
 /// allocation) at a slot this device cannot represent, so the dispatch runs
 /// *missing that bind* — wrong compute output with no other symptom.
 ///
-/// The cap comparison is exclusive (`index >= MAX_*`) to match the backend,
-/// which sizes its argument-table arrays to exactly these counts
-/// (`[false; REIMS_VGPU_METAL_MAX_BUFFERS]`) and guards
-/// `idx >= REIMS_VGPU_METAL_MAX_*` before indexing — so slot `MAX` is out of
-/// range and a bind there is a genuine drop, not a boundary the accum should
-/// have accepted.
+/// The cap comparison is exclusive (`index >= MAX_*`) because each `MAX_*` is
+/// the serializer's slot count, so slot `MAX` is out of range.
 ///
 /// # It is a `Decline` rather than a `format!`, and that is the point
 ///
@@ -498,10 +488,7 @@ impl ComputeAccum {
     /// singular, carries a full `u32`, and the guest applies no bound to it, so
     /// there is no protocol cap to compare against.
     ///
-    /// What does bound it is the *host's* argument table, and only one backend
-    /// has one: `backend::metal::compute::bind_threadgroup_memory` refuses at
-    /// `REIMS_VGPU_METAL_MAX_THREADGROUP_MEMORY` and names the check. The Vulkan
-    /// rail consumes none of these binds — SPIR-V declares workgroup shared
+    /// The Vulkan rail consumes none of these binds — SPIR-V declares workgroup shared
     /// memory statically — so a cap applied here would have taken slots away
     /// from an arm that has no table to run out of. That is the mistake
     /// [`crate::runtime::draw::MAX_SAMPLER_BIND_SLOTS`]' doc names, and a cap of
@@ -548,15 +535,14 @@ impl ComputeAccum {
 /// Every refusing variant carries the **registered slug of the check that
 /// refused**, not just its class. Before that payload existed, nine of these
 /// variants were payload-free and 129 construction sites collapsed into them —
-/// `MetalFailed` alone spoke for 38 checks, `MissingTexture` for 25 — so a live
+/// `BackendFailed` alone spoke for 38 checks, `MissingTexture` for 25 — so a live
 /// `compute_dispatches_fail` counter told you a dispatch died and nothing else.
 /// The slug is what makes the class greppable; the class is what decides the
 /// caller's recovery.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComputeStatus {
     Ok,
-    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-    MetalBackend(crate::backend::metal::error::Status),
+
     MissingPipeline(&'static str),
     MissingMtlb(&'static str),
     MissingBuffer(&'static str),
@@ -564,8 +550,7 @@ pub enum ComputeStatus {
     MissingSampler(&'static str),
     BadGrid(&'static str),
     GuestIo(&'static str),
-    MetalFailed(&'static str),
-    NoMetal(&'static str),
+    BackendFailed(&'static str),
     Unsupported(&'static str),
 }
 
@@ -575,8 +560,7 @@ impl crate::observe::Refusal for ComputeStatus {
             // The only non-refusal. Keeping it in the same enum is what makes
             // `Emit::refusal` unable to log a success by accident.
             Self::Ok => None,
-            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-            Self::MetalBackend(status) => status.refusal(),
+
             Self::MissingPipeline(slug)
             | Self::MissingMtlb(slug)
             | Self::MissingBuffer(slug)
@@ -584,22 +568,16 @@ impl crate::observe::Refusal for ComputeStatus {
             | Self::MissingSampler(slug)
             | Self::BadGrid(slug)
             | Self::GuestIo(slug)
-            | Self::MetalFailed(slug)
-            | Self::NoMetal(slug)
+            | Self::BackendFailed(slug)
             | Self::Unsupported(slug) => Some(slug),
         }
     }
 
     fn fields(&self) -> Vec<(&'static str, String)> {
-        // The class next to the reason: `MissingTexture` vs `MetalFailed` is
+        // The class next to the reason: `MissingTexture` vs `BackendFailed` is
         // what the caller acted on, and a reader correlating a log line with a
         // recovery path needs both.
-        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-        if let Self::MetalBackend(status) = self {
-            let mut fields = crate::observe::Refusal::fields(status);
-            fields.push(("recovery", "metal_failed".to_string()));
-            return fields;
-        }
+
         vec![("class", self.class().to_string())]
     }
 }
@@ -610,14 +588,7 @@ impl ComputeStatus {
     pub fn class(&self) -> &'static str {
         match self {
             Self::Ok => "ok",
-            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-            Self::MetalBackend(status) => {
-                if status.is_args() {
-                    "metal_args"
-                } else {
-                    "metal_execute"
-                }
-            }
+
             Self::MissingPipeline(_) => "missing_pipeline",
             Self::MissingMtlb(_) => "missing_mtlb",
             Self::MissingBuffer(_) => "missing_buffer",
@@ -625,8 +596,7 @@ impl ComputeStatus {
             Self::MissingSampler(_) => "missing_sampler",
             Self::BadGrid(_) => "bad_grid",
             Self::GuestIo(_) => "guest_io",
-            Self::MetalFailed(_) => "metal_failed",
-            Self::NoMetal(_) => "no_metal",
+            Self::BackendFailed(_) => "backend_failed",
             Self::Unsupported(_) => "unsupported",
         }
     }
@@ -757,36 +727,15 @@ pub fn apply_record<M: HostMemory + HostOps>(
 /// named in the always-on log.
 ///
 /// `WRITE_DESCRIPTOR` carries this ordinal straight off the wire and nothing
-/// bounds it: the decoder stores `d.dispatch_type.get()` unexamined, and the
-/// accumulator used to store that. The narrowing lived at the far end of the
-/// rail instead — inside `execute_dispatch_metal`, as
-/// `if acc.dispatch_type == CONCURRENT { CONCURRENT } else { SERIAL }` — which
-/// is `Serial` for every value the device does not recognise, chosen silently.
-///
-/// Three things were wrong with it being there, and all three are why the rule
-/// now lives here, beside the field it constrains:
-///
-/// - **It was invisible.** A guest asking for a dispatch type this device has no
-///   contract for got a *serial* encoder and no line anywhere. Serial and
-///   concurrent differ in whether Metal may overlap the dispatches in a segment,
-///   so the substitution is a real change to what the guest asked for.
-/// - **It made a written refusal unreachable.** `backend::metal::compute`'s
-///   `mtl_dispatch_type` returns `None` for an unrecognised ordinal and its
-///   caller declines with `metal_compute_dispatch_type_invalid` — a typed
-///   refusal that could never fire, because the only producer feeding it had
-///   already replaced every unrecognised value with `Serial`.
-/// - **It only ran on one arm.** `execute_dispatch_metal` is
-///   `backend-metal`-gated, so on a Vulkan host the field was accepted, stored
-///   and then read by nobody. The value is a *guest contract* fact, not a
-///   backend one, so both arms now score it the same way and the check runs on
-///   the pathway this repository can boot.
+/// bounds it. An earlier consumer silently treated every value other than
+/// `Concurrent` as `Serial`; this boundary instead records an unrecognised
+/// ordinal before applying that compatibility substitution.
 ///
 /// The substitution is kept rather than turned into a decline, deliberately. The
 /// Metal SDK's `MTLDispatchType` has exactly `Serial` and `Concurrent`, so an
 /// out-of-range ordinal here is far more likely to be *this device* reading the
-/// wrong wire offset than a guest asking for something new — and declining the
-/// dispatch would turn a decode bug into lost guest work on a pathway no boot
-/// available here can exercise. So it is reported and counted first. If
+/// wrong wire offset than a guest asking for something new. So it is reported
+/// and counted first. If
 /// `compute_dispatch_type_unknown` is ever seen, the evidence to decide arrives
 /// before the behaviour change does.
 fn accepted_dispatch_type(task_id: u32, declared: u32) -> u32 {
@@ -1164,19 +1113,6 @@ struct BufferStagePlan {
     avail: u64,
     want: usize,
     gva: u64,
-}
-
-/// Conservative whole-allocation staging used by the Metal-direct callers,
-/// which do not translate the shader through the reflection-producing path.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-pub(crate) fn stage_buffer<M: HostMemory + HostOps>(
-    state: &DeviceState,
-    host: &M,
-    task_id: u32,
-    bind: &ComputeBufferBind,
-) -> Result<StagedBuffer, ComputeStatus> {
-    let plan = resolve_buffer_stage_plan(state, host, task_id, bind, None)?;
-    materialize_buffer_host(state, host, task_id, bind, plan)
 }
 
 fn resolve_buffer_stage_plan<M: HostMemory + HostOps>(
@@ -1718,12 +1654,7 @@ pub(crate) struct StagedTexture {
     pub array_element: u32,
     #[cfg(feature = "backend-vulkan")]
     pub descriptor_count: u32,
-    /// The guest ref this was staged from. Carried so a refusal downstream can
-    /// name the object the guest bound and not only the slot it bound it to.
-    /// Read by the direct-Metal rail's format refusal; the Vulkan arm reaches
-    /// its images by another route and never asks.
-    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-    pub texture_ref: u32,
+
     /// Raw Metal pixel format from the exact texture/view descriptor.
     pub pixel_format: u16,
     /// Product storage-selector ABI when this Metal format is storage-capable.
@@ -1732,14 +1663,11 @@ pub(crate) struct StagedTexture {
     /// `None` for a format that is not a storage image.
     ///
     /// Carried as the enum rather than as its `u32` ordinal. It used to be
-    /// narrowed to `u32` the moment `pixel_format::storage_selector` produced
-    /// it, at three staging sites, which pushed the coverage question past every
-    /// compiler that could have answered it: both backends then matched raw
-    /// integers, and the Metal one had silently been missing a member.
+    /// narrowed to `u32` at staging sites, which pushed the coverage question
+    /// past the compiler's exhaustiveness checks.
     pub storage_selector: Option<pixel_format::StorageImageSelector>,
     pub width: u32,
     pub height: u32,
-    /// Metal-direct stages through host bytes. On Vulkan this becomes the
     /// post-dispatch host result only; the pre-dispatch source is the typed
     /// `input` below and never consults this field.
     pub bytes: Vec<u8>,
@@ -1758,86 +1686,7 @@ enum VulkanTextureInput {
     Resident(ResidentServe),
 }
 
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-use crate::backend::metal::abi::{ReimsVgpuComputeSampledImage, ReimsVgpuStorageImage};
-
-impl StagedTexture {
-    /// The Metal storage-image selector for this texture's guest pixel format,
-    /// or a named refusal.
-    ///
-    /// Sample-only formats such as `RGB9E5Float` have no selector by design, so
-    /// this is a real class rather than an internal error — a guest binding one
-    /// into a compute slot loses that bind, and the line has to say which
-    /// object at which slot in which format.
-    ///
-    /// Three sites asked this one question and each carried its own answer:
-    /// `reason=metal_selector_missing` twice and `reason=no_backend_selector`
-    /// once, under two event names, returning three different refusal slugs,
-    /// with one line carrying `ref`, another `storage` and the third neither.
-    /// A grep for any of the three names found a third of the occurrences.
-    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-    pub(crate) fn storage_selector_or_refuse(
-        &self,
-        task_id: u32,
-        pipeline_ref: u32,
-    ) -> Result<pixel_format::StorageImageSelector, ComputeStatus> {
-        self.storage_selector.ok_or_else(|| {
-            crate::observe::fail(format!(
-                "compute_texture_format fail reason=no_backend_selector task={task_id} \
-                 pipe={pipeline_ref} bind={} ref={} fmt={:#x} storage={}",
-                self.binding, self.texture_ref, self.pixel_format, self.is_storage as u8
-            ));
-            ComputeStatus::Unsupported("compute_no_backend_selector")
-        })
-    }
-}
-
-/// Split staged compute textures into the two ABI image lists Metal binds.
-///
-/// A storage-capable bind becomes a `ReimsVgpuStorageImage` the kernel writes
-/// through; everything else becomes a sampled image. Both rails that reach the
-/// direct-Metal encoder — the ICB session's inherited binds and the standalone
-/// dispatch — carried a copy of this, byte-identical apart from the refusal
-/// above.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-#[allow(clippy::type_complexity)]
-pub(crate) fn split_staged_textures(
-    staged: &mut [StagedTexture],
-    task_id: u32,
-    pipeline_ref: u32,
-) -> Result<
-    (
-        Vec<ReimsVgpuStorageImage>,
-        Vec<ReimsVgpuComputeSampledImage>,
-    ),
-    ComputeStatus,
-> {
-    let mut storage: Vec<ReimsVgpuStorageImage> = Vec::new();
-    let mut sampled: Vec<ReimsVgpuComputeSampledImage> = Vec::new();
-    for t in staged {
-        let selector = t.storage_selector_or_refuse(task_id, pipeline_ref)?;
-        if t.is_storage {
-            storage.push(ReimsVgpuStorageImage {
-                binding: t.binding,
-                format: selector,
-                width: t.width,
-                height: t.height,
-                data: t.bytes.as_mut_ptr(),
-                len: t.bytes.len(),
-            });
-        } else {
-            sampled.push(ReimsVgpuComputeSampledImage::unswizzled(
-                t.binding,
-                selector,
-                t.width,
-                t.height,
-                t.bytes.as_ptr(),
-                t.bytes.len(),
-            ));
-        }
-    }
-    Ok((storage, sampled))
-}
+impl StagedTexture {}
 
 #[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1969,11 +1818,9 @@ fn log_storage_image_access(pipe: u32, binding: u32, access: &str, bytes: u64) {
 /// sampled rail only the source.
 ///
 /// Declared unconditionally although only the Vulkan backend can produce one,
-/// so the rails that carry the answer through a `backend-metal` build can still
 /// name its type. Each used to substitute its own loose tuple of the same
 /// fields under `cfg(not(backend-vulkan))`, spelled out once per rail.
 /// [`resident_serve`] is the only producer and it is gated on the Vulkan
-/// backend, so on a `backend-metal` build both variants are constructed
 /// nowhere. The rails still read the type — `serve` is `None` there and their
 /// accessor calls compile unchanged — which is the whole point of declaring it
 /// unconditionally.
@@ -2277,8 +2124,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             array_element: 0,
             #[cfg(feature = "backend-vulkan")]
             descriptor_count: 1,
-            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-            texture_ref,
+
             pixel_format: format,
             storage_selector,
             width,
@@ -2776,8 +2622,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             array_element: 0,
             #[cfg(feature = "backend-vulkan")]
             descriptor_count: 1,
-            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-            texture_ref,
+
             pixel_format: stage_fmt,
             storage_selector,
             width,
@@ -3115,8 +2960,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         array_element: 0,
         #[cfg(feature = "backend-vulkan")]
         descriptor_count: 1,
-        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-        texture_ref,
+
         pixel_format: stage_format,
         storage_selector,
         width: w,
@@ -3634,10 +3478,6 @@ pub fn execute_dispatch<M: HostMemory + HostOps>(
     acc: &ComputeAccum,
     cmd: &ComputeCommand,
 ) -> ComputeStatus {
-    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-    {
-        execute_dispatch_metal(state, host, task_id, acc, cmd, None)
-    }
     #[cfg(feature = "backend-vulkan")]
     {
         execute_dispatch_linux(state, host, task_id, acc, cmd)
@@ -3653,134 +3493,19 @@ pub(crate) fn execute_dispatch_nested<M: HostMemory + HostOps>(
     cmd: &ComputeCommand,
     session: &mut crate::runtime::compute_session::ComputeSession,
 ) -> ComputeStatus {
-    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-    {
-        execute_dispatch_metal(state, host, task_id, acc, cmd, Some(session))
-    }
     #[cfg(feature = "backend-vulkan")]
     {
         // Nested/control-flow SPI has no Linux compute path. Fail-visible via
         // the returned status: `exec.rs::note_compute_refusal` names the slug
         // at the rail boundary for every non-`Ok` compute record.
         let _ = (state, host, task_id, acc, cmd, session);
-        ComputeStatus::NoMetal("compute_nested_no_vulkan_path")
+        ComputeStatus::Unsupported("compute_nested_session_unimplemented")
     }
-}
-
-/// One nested dispatch's deferred writeback (GPU → host staging → GVA after session commit).
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-pub(crate) struct NestedDispatchJob {
-    staged_bufs: Vec<StagedBuffer>,
-    /// Storage textures only (sampled need no writeback).
-    storage_tex: Vec<StagedTexture>,
-    mtl_buffers: Vec<metal::Buffer>,
-    mtl_storage: Vec<metal::Texture>,
-}
-
-/// Build a deferred writeback job for ICB-filled kernel buffers (no storage textures).
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-pub(crate) fn nested_job_from_icb_buffers(
-    staged_bufs: Vec<StagedBuffer>,
-    mtl_buffers: Vec<metal::Buffer>,
-) -> NestedDispatchJob {
-    nested_job_from_icb_resources(staged_bufs, mtl_buffers, Vec::new(), Vec::new())
-}
-
-/// Staged compute buffers as the C ABI records the Metal encoder reads.
-///
-/// The pointers borrow `staged`, so the returned vector must not outlive it.
-/// `backing_*` stay null: a staged buffer owns its bytes, and only the
-/// indirect-argument path fills a backing allocation in afterwards.
-#[cfg(all(target_os = "macos", feature = "backend-metal"))]
-fn abi_buffers(staged: &mut [StagedBuffer]) -> Vec<crate::backend::metal::abi::ReimsVgpuBuffer> {
-    use crate::backend::metal::abi::ReimsVgpuBuffer;
-    staged
-        .iter_mut()
-        .map(|s| ReimsVgpuBuffer {
-            binding: s.bind.index,
-            data: s.bytes.as_mut_ptr(),
-            len: s.bytes.len(),
-            attribute_stride: s.bind.attribute_stride,
-            has_attribute_stride: u32::from(s.bind.has_attribute_stride),
-            reserved0: 0,
-            backing_data: std::ptr::null_mut(),
-            backing_len: 0,
-            backing_offset: 0,
-        })
-        .collect()
-}
-
-/// Deferred writeback for parent-encoder ICB inheritance (buffers + storage textures).
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-pub(crate) fn nested_job_from_icb_resources(
-    staged_bufs: Vec<StagedBuffer>,
-    mtl_buffers: Vec<metal::Buffer>,
-    storage_tex: Vec<StagedTexture>,
-    mtl_storage: Vec<metal::Texture>,
-) -> NestedDispatchJob {
-    NestedDispatchJob {
-        staged_bufs,
-        storage_tex,
-        mtl_buffers,
-        mtl_storage,
-    }
-}
-
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-pub(crate) fn flush_nested_jobs<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    task_id: u32,
-    jobs: &mut [NestedDispatchJob],
-) -> ComputeStatus {
-    use crate::backend::metal::abi::ReimsVgpuStorageImage;
-    use crate::backend::metal::compute::compute_writeback_from_mtl;
-
-    let mut err_buf = [0i8; 256];
-    for job in jobs.iter_mut() {
-        let mut reims_vgpu_bufs = abi_buffers(&mut job.staged_bufs);
-        let mut storage: Vec<ReimsVgpuStorageImage> = job
-            .storage_tex
-            .iter_mut()
-            .map(|t| ReimsVgpuStorageImage {
-                binding: t.binding,
-                format: t
-                    .storage_selector
-                    .expect("storage texture staged with a storage selector"),
-                width: t.width,
-                height: t.height,
-                data: t.bytes.as_mut_ptr(),
-                len: t.bytes.len(),
-            })
-            .collect();
-        let st = compute_writeback_from_mtl(
-            &mut reims_vgpu_bufs,
-            &job.mtl_buffers,
-            &mut storage,
-            &job.mtl_storage,
-            (err_buf.as_mut_ptr(), err_buf.len()),
-        );
-        if !st.is_ok() {
-            return ComputeStatus::MetalFailed("compute_nested_writeback_metal");
-        }
-        for s in &job.staged_bufs {
-            if let Err(e) = writeback_buffer(state, host, task_id, None, "nested_flush", s) {
-                return e;
-            }
-        }
-        for t in &job.storage_tex {
-            if let Err(e) = writeback_texture(state, host, task_id, t) {
-                return e;
-            }
-        }
-    }
-    ComputeStatus::Ok
 }
 
 /// The dispatch extents, narrowed from the wire's `u64` by [`u32_dim`].
 ///
 /// The type is [`crate::contract::extent::Extent3`], which both this decoder
-/// and the Metal backend it dispatches through now name. It used to be private
 /// here, which protected construction and stopped at the backend call — see its
 /// doc for why that was the wrong half of the journey to protect.
 use crate::contract::extent::Extent3;
@@ -4023,14 +3748,14 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     // The function blob is an MTLB container; llvm-dis needs the wrapped AIR
     // bitcode member (same extract the render path does — passing the raw
     // container was the live `llvm-dis: file doesn't start with bitcode
-    // header` MetalFailed class).
+    // header` BackendFailed class).
     let air = match crate::runtime::mtlb::extract_air(&mtlb) {
         Ok(a) => a,
         Err(e) => {
             crate::observe::Emit::decline("compute_linux_air_extract", &e)
                 .field("pipe", acc.pipeline_ref)
                 .fail_once(acc.pipeline_ref as u64);
-            return ComputeStatus::MetalFailed("compute_vk_air_extract");
+            return ComputeStatus::BackendFailed("compute_vk_air_extract");
         }
     };
     let kernel_shader = match crate::runtime::m2v_cache::translate_cached_kernel_reflected(
@@ -4043,7 +3768,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             crate::observe::Emit::decline("compute_linux_m2v", &e)
                 .field("pipe", acc.pipeline_ref)
                 .fail_once(acc.pipeline_ref as u64);
-            return ComputeStatus::MetalFailed("compute_vk_translate");
+            return ComputeStatus::BackendFailed("compute_vk_translate");
         }
     };
     if let Some(unsupported) = crate::runtime::spirv_bind::first_unsupported_vulkan_interface(
@@ -4084,7 +3809,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             crate::observe::Emit::decline("compute_linux_spirv_parse", &e)
                 .field("pipe", acc.pipeline_ref)
                 .fail_once(acc.pipeline_ref as u64);
-            return ComputeStatus::MetalFailed("compute_vk_spirv_parse");
+            return ComputeStatus::BackendFailed("compute_vk_spirv_parse");
         }
     };
 
@@ -4713,7 +4438,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             if unsupported {
                 return ComputeStatus::Unsupported("engine_run_unsupported");
             }
-            return ComputeStatus::MetalFailed("compute_vk_engine_run");
+            return ComputeStatus::BackendFailed("compute_vk_engine_run");
         }
     };
     if out.buffers.len() != buffer_writable_count || out.images.len() != storage_count {
@@ -4725,7 +4450,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             out.images.len(),
             storage_count
         ));
-        return ComputeStatus::MetalFailed("compute_vk_readback_count");
+        return ComputeStatus::BackendFailed("compute_vk_readback_count");
     }
     let vk_engine::ComputeOutput {
         buffers: output_buffers,
@@ -4740,7 +4465,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 "compute_linux readback binding mismatch pipe={} bind={}",
                 acc.pipeline_ref, buffer.binding
             ));
-            return ComputeStatus::MetalFailed("compute_vk_readback_binding");
+            return ComputeStatus::BackendFailed("compute_vk_readback_binding");
         };
         match buffer.result {
             crate::backend::vulkan::engine::ComputeBufferResult::Bytes(bytes) => {
@@ -5176,338 +4901,6 @@ fn specialized_storage_image_format(
         return Err("spirv_guest_numeric_class_mismatch");
     }
     Ok(specialized)
-}
-
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn stage_input_to_apv(
-    si: &ComputeStageInputDescriptor,
-) -> crate::backend::metal::abi::ReimsVgpuComputeStageInputDescriptor {
-    use crate::backend::metal::abi::{
-        ReimsVgpuComputeStageInputAttribute, ReimsVgpuComputeStageInputDescriptor,
-        ReimsVgpuComputeStageInputLayout, REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_ATTRIBUTES,
-        REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_LAYOUTS,
-    };
-    let mut out = ReimsVgpuComputeStageInputDescriptor {
-        word0: si.word0,
-        header0: si.header0,
-        header1: si.header1,
-        attribute_count: si.attributes.len() as u32,
-        layout_count: si.layouts.len() as u32,
-        index_type: si.index_type,
-        index_buffer_index: si.index_buffer_index,
-        attributes: [ReimsVgpuComputeStageInputAttribute {
-            raw_bits: 0,
-            location: 0,
-            format: 0,
-            offset: 0,
-            buffer_index: 0,
-            reserved0: 0,
-        }; REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_ATTRIBUTES],
-        layouts: [ReimsVgpuComputeStageInputLayout {
-            raw_bits: 0,
-            buffer_index: 0,
-            step_function: 0,
-            step_rate: 0,
-            stride: 0,
-        }; REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_LAYOUTS],
-    };
-    for (i, a) in si
-        .attributes
-        .iter()
-        .enumerate()
-        .take(REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_ATTRIBUTES)
-    {
-        out.attributes[i] = ReimsVgpuComputeStageInputAttribute {
-            raw_bits: a.raw_bits,
-            location: a.location,
-            format: a.format,
-            offset: a.offset,
-            buffer_index: a.buffer_index,
-            reserved0: 0,
-        };
-    }
-    for (i, l) in si
-        .layouts
-        .iter()
-        .enumerate()
-        .take(REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_LAYOUTS)
-    {
-        out.layouts[i] = ReimsVgpuComputeStageInputLayout {
-            raw_bits: l.raw_bits,
-            buffer_index: l.buffer_index,
-            step_function: l.step_function,
-            step_rate: l.step_rate,
-            stride: l.stride,
-        };
-    }
-    out
-}
-
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn execute_dispatch_metal<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    task_id: u32,
-    acc: &ComputeAccum,
-    cmd: &ComputeCommand,
-    session: Option<&mut crate::runtime::compute_session::ComputeSession>,
-) -> ComputeStatus {
-    use crate::backend::metal::abi::texture_binds_as_storage;
-    use crate::backend::metal::abi::{
-        ReimsVgpuComputeImageblockDimensions, ReimsVgpuComputeStageInRegion,
-        ReimsVgpuComputeStageInRegionIndirectArguments, ReimsVgpuComputeTextureUsage,
-        ReimsVgpuSampler, ReimsVgpuThreadgroupMemory, REIMS_VGPU_BINDING_SAMPLER_BASE,
-        REIMS_VGPU_BINDING_TEXTURE_BASE,
-    };
-    use crate::backend::metal::compute::{
-        compute_core, compute_encode_on_encoder, reflect_compute_textures_mtlb,
-    };
-    if acc.pipeline_ref == 0 {
-        return ComputeStatus::MissingPipeline("compute_mtl_pipeline_ref_zero");
-    }
-    let Some(pipeline) = load_compute_pipeline(state, host, task_id, acc.pipeline_ref) else {
-        return ComputeStatus::MissingPipeline("compute_mtl_pipeline_load");
-    };
-    let Some(mtlb) = load_mtlb(
-        state,
-        host,
-        task_id,
-        pipeline.kernel_func_ref,
-        AirLoadRail::Compute,
-    ) else {
-        return ComputeStatus::MissingMtlb("compute_mtl_mtlb_load");
-    };
-
-    let DispatchDims {
-        grid,
-        threadgroup: tg,
-        dispatch_threads,
-    } = match resolve_dispatch_dims_reported(state, host, task_id, cmd, acc) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-
-    // No narrowing here: `accepted_dispatch_type` scored this ordinal when the
-    // record was applied, on both arms, and named the substitution if it made
-    // one. Re-deciding it at the encode would be the same rule in a second
-    // place, and the second place is the one that could not report.
-    let dispatch_type = acc.dispatch_type;
-
-    // Stage-input descriptor from pipeline (optional).
-    let reims_vgpu_stage_input = pipeline.stage_input.as_ref().map(stage_input_to_apv);
-
-    // Direct / indirect stage-in region.
-    let direct_region = acc
-        .stage_in_region
-        .as_ref()
-        .map(|r| ReimsVgpuComputeStageInRegion {
-            origin_x: r.origin_x,
-            origin_y: r.origin_y,
-            origin_z: r.origin_z,
-            size_x: r.size_x,
-            size_y: r.size_y,
-            size_z: r.size_z,
-        });
-    let mut indirect_region_args: Option<ReimsVgpuComputeStageInRegionIndirectArguments> = None;
-    if let Some(ind) = &acc.stage_in_region_indirect {
-        let raw = match read_buffer_window(
-            state,
-            host,
-            task_id,
-            ind.buffer_ref,
-            ind.buffer_offset,
-            STAGE_IN_INDIRECT_ARGS_LEN,
-        ) {
-            Ok(b) => b,
-            Err(e) => return e,
-        };
-        indirect_region_args = Some(ReimsVgpuComputeStageInRegionIndirectArguments {
-            origin_x: ld32(&raw[0..]),
-            origin_y: ld32(&raw[4..]),
-            origin_z: ld32(&raw[8..]),
-            size_x: ld32(&raw[12..]),
-            size_y: ld32(&raw[16..]),
-            size_z: ld32(&raw[20..]),
-        });
-    }
-    let imageblock = acc
-        .imageblock
-        .as_ref()
-        .map(|d| ReimsVgpuComputeImageblockDimensions {
-            width: d.width,
-            height: d.height,
-        });
-    let tg_mem: Vec<ReimsVgpuThreadgroupMemory> = acc
-        .threadgroup_memory
-        .iter()
-        .map(|t| ReimsVgpuThreadgroupMemory {
-            index: t.index,
-            length: t.length,
-        })
-        .collect();
-
-    let mut staged_bufs: Vec<StagedBuffer> = Vec::new();
-    for b in &acc.buffers {
-        match stage_buffer_with_extent(state, host, task_id, b, None) {
-            Ok(s) => staged_bufs.push(s),
-            Err(e) => return e,
-        }
-    }
-
-    // Texture reflection: access decides storage vs sampled materialization.
-    // The reflection owns its own list — no caller-side capacity, so a kernel
-    // declaring more bindings than some local buffer happened to hold is not a
-    // refused dispatch.
-    let mut err_buf = [0i8; 256];
-    let usages: Vec<ReimsVgpuComputeTextureUsage> = if acc.textures.is_empty() {
-        Vec::new()
-    } else {
-        match reflect_compute_textures_mtlb(&mtlb, (err_buf.as_mut_ptr(), err_buf.len())) {
-            Ok(u) => u,
-            Err(st) => return ComputeStatus::MetalBackend(st),
-        }
-    };
-
-    let mut staged_tex: Vec<StagedTexture> = Vec::new();
-    for t in &acc.textures {
-        let binding = REIMS_VGPU_BINDING_TEXTURE_BASE + t.index;
-        let is_storage = texture_binds_as_storage(&usages, binding);
-        let stage_call_started = std::time::Instant::now();
-        match stage_texture_raw(state, host, task_id, t.texture_ref, binding, is_storage) {
-            Ok(s) => {
-                // Measure-only: localize per-texture stage cost (the
-                // transition-window guest stall).
-                let us = stage_call_started.elapsed().as_micros() as u64;
-                if us > 1500 {
-                    crate::observe::off(format!(
-                        "compute_stage_slow pipe={} ref={} bind={binding} storage={} {}x{} fmt={:#x} us={us}",
-                        acc.pipeline_ref,
-                        t.texture_ref,
-                        is_storage as u8,
-                        s.width,
-                        s.height,
-                        s.pixel_format
-                    ));
-                }
-                staged_tex.push(s)
-            }
-            Err(e) => return e,
-        }
-    }
-
-    // Samplers.
-    let mut reims_vgpu_samplers: Vec<ReimsVgpuSampler> = Vec::new();
-    for s in &acc.samplers {
-        let sampler = match objects::resolve_sampler_state(state, host, task_id, s.sampler_ref) {
-            Ok(sampler) => sampler,
-            Err(objects::SamplerResolveError::Rung(rung)) => {
-                return ComputeStatus::MissingSampler(crate::observe::ladder_slugs!(
-                    "compute_mtl_sampler"
-                )(rung))
-            }
-            Err(objects::SamplerResolveError::Decode { .. }) => {
-                return ComputeStatus::MissingSampler(crate::observe::ladder_slug!(
-                    "compute_mtl_sampler",
-                    desc_decode
-                ))
-            }
-        };
-        reims_vgpu_samplers.push(crate::runtime::draw::sampler_record(
-            REIMS_VGPU_BINDING_SAMPLER_BASE + s.index,
-            &sampler.descriptor,
-            s.has_lod_clamp.then_some((s.lod_min_bits, s.lod_max_bits)),
-            false,
-        ));
-    }
-
-    let mut reims_vgpu_bufs = abi_buffers(&mut staged_bufs);
-
-    // Keep raw pointers valid: build storage/sampled from staged_tex after mut split.
-    let (mut storage, sampled) =
-        match split_staged_textures(&mut staged_tex, task_id, acc.pipeline_ref) {
-            Ok(split) => split,
-            Err(e) => return e,
-        };
-
-    // Nested: encode onto open session encoder; writeback after segment commit.
-    if let Some(sess) = session {
-        let retain = match compute_encode_on_encoder(
-            &sess.device,
-            &sess.encoder,
-            &mtlb,
-            &mut reims_vgpu_bufs,
-            &mut storage,
-            &sampled,
-            &reims_vgpu_samplers,
-            &tg_mem,
-            direct_region.as_ref(),
-            indirect_region_args.as_ref(),
-            imageblock.as_ref(),
-            reims_vgpu_stage_input.as_ref(),
-            dispatch_threads,
-            grid,
-            tg,
-            (err_buf.as_mut_ptr(), err_buf.len()),
-        ) {
-            Ok(r) => r,
-            Err(st) => return ComputeStatus::MetalBackend(st),
-        };
-        // Split storage textures out of staged_tex for deferred writeback alignment.
-        let storage_tex: Vec<StagedTexture> =
-            staged_tex.into_iter().filter(|t| t.is_storage).collect();
-        if storage_tex.len() != retain.images.len() {
-            return ComputeStatus::MetalFailed("compute_mtl_retain_image_count");
-        }
-        sess.retained.extend(retain.buffers.iter().cloned());
-        sess.retained.extend(retain.indirect.iter().cloned());
-        sess.nested_jobs.push(NestedDispatchJob {
-            staged_bufs,
-            storage_tex,
-            mtl_buffers: retain.buffers,
-            mtl_storage: retain.images,
-        });
-        return ComputeStatus::Ok;
-    }
-
-    let st = compute_core(
-        &mtlb,
-        &mut reims_vgpu_bufs,
-        &mut storage,
-        &sampled,
-        &reims_vgpu_samplers,
-        &tg_mem,
-        direct_region.as_ref(),
-        indirect_region_args.as_ref(),
-        imageblock.as_ref(),
-        reims_vgpu_stage_input.as_ref(),
-        dispatch_threads,
-        dispatch_type,
-        grid,
-        tg,
-        (err_buf.as_mut_ptr(), err_buf.len()),
-    );
-    if !st.is_ok() {
-        return ComputeStatus::MetalBackend(st);
-    }
-
-    for s in &staged_bufs {
-        if let Err(e) = writeback_buffer(
-            state,
-            host,
-            task_id,
-            Some(acc.pipeline_ref),
-            "metal_dispatch",
-            s,
-        ) {
-            return e;
-        }
-    }
-    for t in &staged_tex {
-        if let Err(e) = writeback_texture(state, host, task_id, t) {
-            return e;
-        }
-    }
-    ComputeStatus::Ok
 }
 
 #[cfg(test)]

@@ -483,9 +483,8 @@ pub(crate) fn effective_view_sample_format_reasoned(
 /// for free on the image view, so the Vulkan pathway uses
 /// `SampledImageResource::swizzle` and never calls this; every invocation here
 /// is a texture that gave up its zero-copy crossing to be remapped by hand. The
-/// Metal-direct pathway still needs it, so it reports itself rather than being
 /// deleted.
-#[cfg(any(test, all(feature = "backend-metal", target_os = "macos")))]
+#[cfg(test)]
 pub(super) fn apply_view_swizzle_rgba8(
     rgba: &mut [u8],
     plan: Option<&pixel_format::SwizzlePlan>,
@@ -682,8 +681,6 @@ impl NativeUploads {
     /// says so rather than inheriting them.
     ///
     /// Gated because the only rail that opts into a native upload is the
-    /// Vulkan one; the Metal arm's single caller drops the layout and takes
-    /// [`Self::NONE`]. Ungated it is dead code on `backend-metal`, which the
     /// cross-compiled clippy run is what catches.
     #[cfg(any(feature = "backend-vulkan", test))]
     pub const BGRA8: Self = Self {

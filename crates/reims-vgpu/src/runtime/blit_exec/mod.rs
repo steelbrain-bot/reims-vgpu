@@ -3857,7 +3857,6 @@ fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
 /// A GVA debt is only ever armed by `draw::vulkan`, so this arm's ledger holds
 /// none and the fast path would refuse `SrcNotResident` on every record. It is
 /// spelled as a fall-through rather than as a `cfg` at the call site so the
-/// whole-surface form reads the same on both backends.
 #[cfg(not(feature = "backend-vulkan"))]
 fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
     _state: &mut DeviceState,

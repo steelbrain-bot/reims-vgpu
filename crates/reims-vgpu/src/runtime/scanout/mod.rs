@@ -58,7 +58,6 @@ pub enum ScanoutCopyResult {
 /// when geometry and page table produced a full image.
 ///
 /// Backend-agnostic on purpose: it resolves and scatters guest pages and
-/// touches no engine, and the Metal arm's `load_type11_mapping_rgba` needs it
 /// for the same reason the Vulkan arm does.
 pub fn read_mapping_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
     state: &mut DeviceState,
@@ -307,10 +306,6 @@ pub fn capture_present_frame(
     // `capture_fail` proxy) instead of silently diverging onto another path.
     // Live evidence for the delete: `capture_source resident=51 guest=0` across a
     // full boot (pre-convergence included), zero `present_capture FAIL`.
-    //
-    // Consequence for the non-Vulkan backends: they have no resident registry, so
-    // capture fails there and the console holds its prior retain. That is the
-    // known arm/Metal breakage this pathway already carries.
     if !from_host_cache && !try_capture_from_resident(state, &mut buf, mapping_id, width, height) {
         crate::observe::off(format!(
             "present_capture FAIL mid={mapping_id} {width}x{height} gen={generation} \

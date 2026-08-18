@@ -3,7 +3,6 @@
 //! Registers, rings, tasks/objects, mapper, present/cursor, stamps — the
 //! ApplePV-shaped model. No parsing of wire bytes here; no backend execution.
 
-pub(crate) mod content_cache;
 mod lru_memo;
 mod regs;
 mod state;
@@ -52,8 +51,8 @@ impl<B: Backend> Device<B> {
 
     /// Reset after releasing every HostOps view owned by this guest lifetime.
     pub fn reset_with_host<H: HostOps>(&mut self, host: &mut H) -> usize {
-        // Backend aliases (notably Metal type-11 textures) must die before the
-        // underlying contiguous guest-memory views are unmapped.
+        // Backend aliases must die before their contiguous guest-memory views
+        // are unmapped.
         self.backend.reset();
         let views = self.state.take_all_host_views();
         let count = views.len();

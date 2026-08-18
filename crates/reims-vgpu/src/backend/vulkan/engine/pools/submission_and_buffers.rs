@@ -1568,7 +1568,6 @@ impl ResourcePools {
     ///
     /// `narrow_to_target` is [`crate::env::BATCH_MIXED_TARGETS`] switched off.
     /// The default is that the batch's own target does not decide this: a draw
-    /// from another Metal encoder closes any retained pass before beginning its
     /// own, while the flush itself reads only the CB, fence, and accumulated
     /// descriptor sets. The readback rail likewise appends a copy of *some
     /// other* target's image to whatever batch is recording. Passing the

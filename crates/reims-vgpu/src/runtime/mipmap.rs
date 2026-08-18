@@ -4,10 +4,9 @@
 //! IOSurface textures, so there is no legal multi-mip type-11 body to generate
 //! into. Non-type-2/3 refs fail as missing/unsupported at resolve.
 //!
-//! Primary path: host Metal `generateMipmapsForTexture:` on a temporary Shared
-//! multi-level texture (native guest pixel format). CPU box-filter remains as a
-//! no-device fallback for filterable unorm formats that convert through RGBA8.
-//! Single-level textures fail visibly (Metal rejects `mipmapLevelCount == 1`).
+//! Filterable unorm formats are converted through RGBA8 and generated with a
+//! CPU box filter. Single-level textures fail visibly because the command has
+//! no upper mip level to populate.
 
 use crate::contract::pixel_format::{self, RGBA8_BPP};
 use crate::model::DeviceState;
@@ -19,14 +18,6 @@ use crate::runtime::draw::host_alloc_len;
 use crate::runtime::gva_mem;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::objects;
-
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-use crate::backend::metal::mipmap as metal_mip;
-// The refusal type is portable data and lives in `contract::mipmap` so its
-// checks can be executed on a host with no Apple linker. The import still
-// carries this gate, because only this arm can produce one.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-use crate::contract::mipmap::MetalMipmapError;
 
 /// Outcome of a generateMipmaps attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,19 +35,16 @@ pub enum MipmapStatus {
     /// resolve — and because the dispatch site reports every non-`Ok` status, so
     /// an unbound ref was reaching the log as a missing texture.
     UnboundTexture,
-    /// `mipmapLevelCount <= 1` — not a valid Metal no-op.
+    /// `mipmapLevelCount <= 1` — there is no destination level to generate.
     SingleLevel,
     /// Level layouts incomplete / out of range / zero geometry.
     IncompleteLayout,
-    /// Pixel format has no filterable Metal path (and no CPU fallback).
+    /// Pixel format has no supported CPU filtering path.
     UnsupportedFormat,
     /// Pathological size or host buffer cap.
     Capacity,
     /// Guest GVA read/write failed.
     GuestIo,
-    /// The exact Metal-side check that rejected generation.
-    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-    Metal(MetalMipmapError),
 }
 
 impl crate::observe::Refusal for MipmapStatus {
@@ -77,17 +65,11 @@ impl crate::observe::Refusal for MipmapStatus {
             Self::UnsupportedFormat => "mipmap_unsupported_format",
             Self::Capacity => "mipmap_capacity",
             Self::GuestIo => "mipmap_guest_io",
-            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-            Self::Metal(error) => return Some(crate::observe::Decline::slug(error)),
         })
     }
 
     fn fields(&self) -> Vec<(&'static str, String)> {
-        match self {
-            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-            Self::Metal(error) => crate::observe::Decline::fields(error),
-            _ => Vec::new(),
-        }
+        Vec::new()
     }
 }
 
@@ -97,8 +79,7 @@ impl crate::observe::Refusal for MipmapStatus {
 /// uniform grid (integer bounds). Dimensions must be non-zero; destination may
 /// not exceed the source in either axis.
 ///
-/// Kept as the no-device fallback and pure unit-test helper; product path prefers
-/// Metal-filtered generation.
+/// Used by the product path and directly by its unit tests.
 fn downsample_rgba8_box(
     src: &[u8],
     src_w: u32,
@@ -365,22 +346,6 @@ fn store_level_tight_native<M: HostMemory + HostOps>(
     Ok(())
 }
 
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn generate_via_metal(
-    fmt: u16,
-    width: u32,
-    height: u32,
-    levels: u32,
-    level0: &[u8],
-) -> Result<Vec<(u32, u32, Vec<u8>)>, MetalMipmapError> {
-    metal_mip::generate_mipmaps_filtered(fmt, width, height, levels, level0).map(|chain| {
-        chain
-            .into_iter()
-            .map(|level| (level.width, level.height, level.tight_bytes))
-            .collect()
-    })
-}
-
 /// No-device fallback: RGBA8 box filter for formats with row conversion.
 fn generate_via_box_filter(
     fmt: u16,
@@ -475,33 +440,10 @@ pub fn generate_mipmaps_linear<M: HostMemory + HostOps>(
         Err(st) => return st,
     };
 
-    // Prefer Metal-filtered generation in the guest's native pixel format.
-    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-    let chain = match generate_via_metal(fmt, l0_w, l0_h, levels as u32, &level0) {
-        Ok(chain) => chain,
-        Err(error @ MetalMipmapError::NoDevice) => {
-            // Correct but slower: retain the CPU box-filter fallback, and make
-            // the missing Metal device visible as a typed degradation.
-            crate::observe::Emit::decline("mipmap_metal_fallback", &error)
-                .field("texture", texture_ref)
-                .field("format", format!("{fmt:#x}"))
-                .field("width", l0_w)
-                .field("height", l0_h)
-                .off();
-            // Soft fallback only when no MTL device is available.
-            match generate_via_box_filter(fmt, l0_w, l0_h, levels, &level0) {
-                Ok(c) => c,
-                Err(st) => return st,
-            }
-        }
-        Err(error) => return MipmapStatus::Metal(error),
-    };
-    #[cfg(feature = "backend-vulkan")]
     let chain = match generate_via_box_filter(fmt, l0_w, l0_h, levels, &level0) {
-        Ok(c) => c,
-        Err(st) => return st,
+        Ok(chain) => chain,
+        Err(status) => return status,
     };
-
     if chain.len() != levels {
         return MipmapStatus::IncompleteLayout;
     }
@@ -548,20 +490,6 @@ mod tests {
         let n = slugs.len();
         slugs.dedup();
         assert_eq!(slugs.len(), n, "two mipmap outcomes share a slug");
-
-        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-        {
-            let status = MipmapStatus::Metal(MetalMipmapError::Level0TooShort {
-                len: 15,
-                expected: 16,
-            });
-            assert_eq!(status.refusal(), Some("metal_mipmap_level0_too_short"));
-            assert_eq!(
-                status.fields(),
-                vec![("len", "15".to_string()), ("expected", "16".to_string())],
-                "the runtime wrapper must retain the Metal leaf's structured facts"
-            );
-        }
     }
 
     /// The two ways a base ref yields no texture are different statements, and

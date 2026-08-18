@@ -2,16 +2,9 @@
 //!
 //! # A digest is a bucket, and width is not what makes it safe
 //!
-//! This doc used to record an asymmetry — that the Metal arm identified shaders
-//! by a 64-bit fingerprint and never compared the bytes, while this arm's rule
-//! was 128 bits — and to send readers to that struct for "why it was recorded
-//! rather than changed". Both halves have since gone the other way, and a reader
-//! who follows the old account will go looking for a hazard that is not there.
-//!
-//! [`crate::backend::blob`] removed the class from the Metal caches by retaining
-//! the blob and comparing it, and [`crate::backend::render_pso_key`] carries the
-//! same account for pipeline state. `engine::pools`'s sampled cache followed:
-//! its 128-bit content fingerprint now picks a candidate and
+//! A digest selects a candidate; retained content decides whether that candidate
+//! is the same object. `engine::pools`'s sampled cache follows that rule: its
+//! 128-bit content fingerprint picks a candidate and
 //! `ResidentSampledSlot::content` decides the hit.
 //!
 //! So the rule this module's name states is a *bucketing* rule, not an identity

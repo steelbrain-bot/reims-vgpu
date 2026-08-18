@@ -13,12 +13,12 @@ unchanged.
 
 macOS already includes a paravirtual GPU driver named `AppleParavirtGPU.kext`.
 reims-vgpu provides the QEMU device that driver attaches to, then decodes the guest's GPU command
-stream on the host and executes it through Metal (TODO) or Vulkan, with Vulkan translation handled
+stream on the host and executes it through Vulkan, with shader translation handled
 by [`metal2vulkan`](https://github.com/steelbrain/metal2vulkan). There is no custom macOS kext and
 no guest driver to install.
 
 Contributions are welcome. I am especially interested in collaborating with developers who want to
-work on correctness, visual glitches, synchronization bugs, command-stream decoding, Metal/Vulkan
+work on correctness, visual glitches, synchronization bugs, command-stream decoding, Vulkan
 translation, and making more host/guest combinations reliable.
 
 ![reims-vgpu running an arm64 macOS 13 Ventura guest desktop on an Apple Silicon host](assets/readme/reims-vgpu-macos-arm64-desktop.png)
@@ -29,7 +29,7 @@ translation, and making more host/guest combinations reliable.
 
 *x86_64 macOS 13 Ventura guest on a Linux host.*
 
-## Three pathways
+## Supported pathways
 
 `crates/reims-vgpu` targets the following host/guest/backend combinations. Agents pick the pathway
 their unit of work is on.
@@ -37,13 +37,12 @@ their unit of work is on.
 | Pathway | Host | Guest | Device attach | Backend | Boot |
 |---|---|---|---|---|---|
 | **x86 macOS / Linux Vulkan** | Linux x86_64 (KVM) | x86_64 macOS Metal guest | PCI `reims-vgpu-pci` | host **Vulkan** via `metal2vulkan` | `vm/boot-x86.sh` |
-| **arm64 macOS / macOS Metal** | Apple Silicon macOS (HVF) | arm64 macOS Metal guest (`vmapple`) | sysbus MMIO `reims-vgpu-mmio` | host **Metal** | `vm/boot-arm64.sh` |
 | **arm64 macOS / macOS Vulkan** | Apple Silicon macOS (HVF) | arm64 macOS Metal guest (`vmapple`) | sysbus MMIO `reims-vgpu-mmio` | host **Vulkan** via `metal2vulkan` through MoltenVK | `vm/boot-arm64.sh` |
 
 - QEMU device shims: `vendor/qemu` tracks
   [`steelbrain/qemu-reims-vgpu@host-reims-vgpu-vmapple`](https://github.com/steelbrain/qemu-reims-vgpu/tree/host-reims-vgpu-vmapple)
   (thin C — QOM/MMIO/IRQ/console/HostOps only)
-- Product logic: `crates/reims-vgpu` (decode + device model + Metal/Vulkan backends)
+- Product logic: `crates/reims-vgpu` (decode + device model + Vulkan backend)
 - Wire layouts: `crates/reims-vgpu-wire` (derived serializer views/parsers; decode uses these as the layout authority for covered records)
 - Vulkan translator dependency: public `steelbrain/metal2vulkan` Git crate. On macOS, the Vulkan
   host backend runs through MoltenVK.
@@ -59,8 +58,7 @@ macOS 13 Ventura is the recommended guest release for bring-up.
 ### x86_64 guest on Linux (KVM)
 
 1. **Host prep.** You need KVM (`/dev/kvm`), a working NVIDIA (or other) Vulkan stack for the product
-   backend, and build deps for the in-tree QEMU (`scripts/qemu-build/qemu-build.sh --target x86_64
-   --backend vulkan`).
+   backend, and build deps for the in-tree QEMU (`scripts/qemu-build/qemu-build.sh --target x86_64`).
 
 2. **Generate OpenCore, OVMF, and a guest disk with [OSX-KVM](https://github.com/kholia/OSX-KVM).**
    **macOS 13 is recommended**.Follow that project’s docs to fetch recovery media, build OpenCore,
@@ -112,7 +110,7 @@ macOS 13 Ventura is the recommended guest release for bring-up.
    vm/boot-x86.sh --testing --device vmware-svga
 
    # Product Reims VGPU device (needs in-tree QEMU + reims-vgpu Vulkan)
-   REIMS_VGPU_BACKEND=vulkan scripts/qemu-build/qemu-build.sh --target x86_64
+   scripts/qemu-build/qemu-build.sh --target x86_64
    vm/boot-x86.sh --testing --device reims-vgpu-pci --rail macos-15
 
    # Host-window screenshot on the Linux/Plasma host
@@ -130,7 +128,7 @@ Arm bring-up is **in-tree**: Virtualization.framework via Homebrew **`macosvm`**
 1. Install **`macosvm`**, and build the vendored QEMU:
 
    ```bash
-   scripts/qemu-build/qemu-build.sh --target aarch64 --backend metal
+   scripts/qemu-build/qemu-build.sh --target aarch64
    ```
 
 2. Provision a guest from a UniversalMac IPSW with the project helpers in

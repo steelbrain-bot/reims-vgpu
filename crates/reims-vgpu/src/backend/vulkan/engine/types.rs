@@ -702,7 +702,6 @@ pub struct SecondaryColorTarget {
     /// (yet) carry per-attachment blend state". It did:
     /// `decode::resource::RenderPipelineDescriptor::color_attachments` is a
     /// `Vec<PipelineColorAttachment>` and each entry has carried its own six
-    /// blend fields all along — the Metal arm has read them per slot for as
     /// long as MRT has existed. Only the Vulkan `PipelineKey` collapsed them to
     /// one, so a guest MRT pipeline that blended slot 1 got a raw store.
     pub blend: Option<BlendStateResource>,

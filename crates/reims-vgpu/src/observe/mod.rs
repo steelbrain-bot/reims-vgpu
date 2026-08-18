@@ -7,8 +7,8 @@
 //! `model/` and `host_window/` all reject guest work and all owe the reader a
 //! reason. It lived under `runtime/` only because that is where the first
 //! caller happened to be, and the result was the lapse this module exists to
-//! close: 451 fail sites in `runtime/` against 0 in `backend/metal/`,
-//! `contract/` and `qemu/`.
+//! close: failure reporting was concentrated in `runtime/`, while `backend/`,
+//! `contract/` and `qemu/` had none.
 //!
 //! `translate/` and `caps/` are the other half of the argument. They are pure —
 //! they return typed declines and log nothing, which is correct — so the sink

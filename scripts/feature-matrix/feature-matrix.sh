@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
-# Compile every supported reims-vgpu arm, tests included, plus the option ROM.
+# Compile both Vulkan host pathways, tests included, plus the option ROM.
 #
-# The project supports three arms, one per host GPU API actually available:
-# Metal on Apple, Vulkan through MoltenVK on Apple, and Vulkan on a native
-# Linux ICD. QEMU's meson picks one per build and day-to-day work compiles one,
-# so a rename or a cfg change could break another arm silently for days. This
-# script is the gate.
+# The same backend uses MoltenVK on macOS and a native ICD on Linux. A target or
+# cfg change can still break one host while the other compiles, so this script
+# checks both.
 #
 # It checks `--all-targets`, not the bare default, so arm-specific test code
 # compiles too. Compiling is not enough on its own: a test that compiles on an
@@ -18,7 +16,6 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORKSPACE_DIR="${REPO}"
-CROSS_TARGET="${CROSS_TARGET:-x86_64-unknown-linux-gnu}"
 CARGO_CMD="check"
 COUNT_TESTS=1
 
@@ -37,14 +34,13 @@ a green run. Counting links the test binaries, which is slower than checking;
 pass --no-counts to skip it. The cross-compiled arm cannot be counted because
 its binaries do not run on this host.
 
-The three supported arms, one per host GPU API actually available:
+The two supported pathways use one feature set:
 
-  Metal              --features backend-metal                     Apple only
   Vulkan / MoltenVK  --no-default-features
                        --features backend-vulkan,host-window      Apple
   Vulkan / native    same feature set                             Linux
 
-A fourth cell checks crates/reims-vgpu-efi, the PCI option ROM every x86 boot
+A third cell checks crates/reims-vgpu-efi, the PCI option ROM every x86 boot
 builds. It is a separate workspace targeting x86_64-unknown-uefi, so it is not
 a backend arm — but it ships, and nothing else in the repository checks it.
 
@@ -52,29 +48,12 @@ Two cells before all of those run `cargo fmt --all -- --check`, once per
 workspace. rustfmt.toml at the repo root is the format and both workspaces are
 kept clean under it, so these are no-ops until a change leaves a diff.
 
-The feature sets are exactly what vendor/qemu/hw/display/meson.build passes for
-REIMS_VGPU_BACKEND=metal and REIMS_VGPU_BACKEND=vulkan. An Apple host builds
-all three natively (the Linux one by cross check). A Linux host builds the
-native Vulkan arm and cross-checks the other two.
-
-The Metal arm cross-checks from any host. src/lib.rs rejects backend-metal on
-`not(target_os = "macos")` — that is a condition on the *target*, not on the
-host, so `--target *-apple-darwin` satisfies it and the real cfgs are
-exercised. `cargo check` needs no Apple SDK. This script used to skip the arm
-off Apple on the theory that Metal could not be cross-checked at all, and the
-arm rotted to 11 errors unnoticed; every one of them was in first-party code
-that this cell catches.
-
-Checking is all that is claimed: it type-checks the arm, it does not link
-against a real SDK and cannot run it.
+The feature set is exactly what vendor/qemu/hw/display/meson.build passes.
 
 Warnings do not fail an arm; the count is printed so drift stays visible.
 
 env:
   CROSS_TARGET   Linux target to cross-check (default x86_64-unknown-linux-gnu)
-  METAL_TARGET   Apple target to cross-check the Metal arm against off Apple
-                 (default: aarch64-apple-darwin if installed, else
-                 x86_64-apple-darwin)
 EOF
 }
 
@@ -110,6 +89,11 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 
 HOST_TRIPLE="$(rustc -vV | awk '/^host: /{print $2}')"
+case "$HOST_TRIPLE" in
+  *-apple-*) DEFAULT_CROSS_TARGET="x86_64-unknown-linux-gnu" ;;
+  *) DEFAULT_CROSS_TARGET="aarch64-apple-darwin" ;;
+esac
+CROSS_TARGET="${CROSS_TARGET:-$DEFAULT_CROSS_TARGET}"
 
 if ! rustc --print target-list | grep -qx "$CROSS_TARGET"; then
   echo "feature-matrix: ERROR: unknown target '$CROSS_TARGET'" >&2
@@ -123,7 +107,6 @@ if [ "$CROSS_TARGET" != "$HOST_TRIPLE" ] &&
 fi
 
 # Feature sets, verbatim from vendor/qemu/hw/display/meson.build.
-FEATURES_METAL="--features backend-metal"
 FEATURES_VULKAN="--no-default-features --features backend-vulkan,host-window"
 
 FAILED=0
@@ -172,8 +155,7 @@ run_cell() {
 # own cell shape rather than a feature set. `cargo fmt --all -- --check` exits
 # non-zero and prints the offending hunks; on a clean tree it is silent and
 # costs a second. A missing rustfmt is a FAIL and not a SKIP: a gate that
-# quietly stands down on the machine that lacks the tool is how the Metal arm
-# rotted to 11 errors.
+# quietly stands down on the machine that lacks the tool is not a gate.
 fmt_cell() {
   local label="$1" dir="$2"
   local log status
@@ -236,43 +218,7 @@ echo "[feature-matrix] host=$HOST_TRIPLE cross=$CROSS_TARGET cargo=$CARGO_CMD"
 fmt_cell "rustfmt / workspace" "$WORKSPACE_DIR"
 fmt_cell "rustfmt / reims-vgpu-efi" "$REPO/crates/reims-vgpu-efi"
 
-# Arm 1 — Metal. Native on Apple, cross-checked everywhere else: lib.rs gates
-# backend-metal on target_os, so an Apple *target* is all the arm needs. Only
-# the run half is Apple-only, which is why the off-Apple cell never counts
-# tests.
-case "$HOST_TRIPLE" in
-  *-apple-*)
-    run_cell "metal / $HOST_TRIPLE" "" "$FEATURES_METAL"
-    count_cell "metal / $HOST_TRIPLE" "$FEATURES_METAL"
-    ;;
-  *)
-    # arm64 macOS is the pathway this arm actually ships on, so prefer it and
-    # fall back to the x86 Apple target; both carry target_os = "macos" and so
-    # exercise the same cfgs.
-    if [ -z "${METAL_TARGET:-}" ]; then
-      for cand in aarch64-apple-darwin x86_64-apple-darwin; do
-        if rustup target list --installed 2>/dev/null | grep -qx "$cand"; then
-          METAL_TARGET="$cand"
-          break
-        fi
-      done
-    fi
-    if [ -n "${METAL_TARGET:-}" ]; then
-      run_cell "metal / $METAL_TARGET" "$METAL_TARGET" "$FEATURES_METAL"
-      if [ "$COUNT_TESTS" -eq 1 ]; then
-        COUNTS+=("$(printf '%-46s %s' "metal / $METAL_TARGET" \
-          "(cross-compiled — cannot run here)")")
-      fi
-    else
-      # Not a pass. Say which command restores the cell, because the last time
-      # this arm went unchecked it accumulated 11 errors.
-      RESULTS+=("$(printf '%-4s %-46s %s' "SKIP" "metal / $HOST_TRIPLE" \
-        "(rustup target add aarch64-apple-darwin)")")
-    fi
-    ;;
-esac
-
-# Arms 2 and 3 — Vulkan through MoltenVK on Apple, native ICD on Linux. Same
+# Vulkan through MoltenVK on Apple, native ICD on Linux. The same
 # feature set; the host is what differs.
 run_cell "vulkan,host-window / $HOST_TRIPLE" "" "$FEATURES_VULKAN"
 count_cell "vulkan,host-window / $HOST_TRIPLE" "$FEATURES_VULKAN"
@@ -284,11 +230,10 @@ if [ "$CROSS_TARGET" != "$HOST_TRIPLE" ]; then
   fi
 fi
 
-# Arm 4 — the PCI option ROM. Not a backend arm and not a workspace member: it
+# The PCI option ROM is not a backend arm and not a workspace member: it
 # is its own workspace targeting x86_64-unknown-uefi, and `vm/boot-x86.sh`
 # rebuilds it before every x86 boot. It was invisible to this script and to
-# every command in AGENTS.md, which is the same gap that let the Metal arm rot
-# to 11 errors: a live crate nothing checks.
+# every command in AGENTS.md: a live crate nothing checks.
 #
 # `--all-targets` cannot be used here. The bin is `#![no_main]` with the `uefi`
 # crate's panic handler, so building its test harness collides with `std`'s —

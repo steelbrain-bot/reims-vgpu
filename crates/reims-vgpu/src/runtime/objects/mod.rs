@@ -34,7 +34,7 @@ pub mod slot_recheck;
 
 /// Fail-visible, de-duplicated per `(task_id, ref)`, for the type-11 resolve
 /// blind spot: an object ref that IS a type-11 IOSurface texture but whose
-/// descriptor cannot be read, cannot register a Metal/Vulkan texture, or carries
+/// descriptor cannot be read, cannot register a host texture, or carries
 /// `mapping_id==0` used to collapse into a bare `None` → a coarse
 /// `MissingTexture` at the draw site with no reason. `resolve_type11_ref` runs
 /// per-draw per-ref (very hot), so a bare fail line would flood; the latch logs

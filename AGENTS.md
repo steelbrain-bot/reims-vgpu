@@ -24,18 +24,17 @@ what was once true, it goes in one of the three places above.
 
 This research project emulates Apple's paravirtualized GPU on the host. An unmodified macOS guest
 uses Apple's own GPU drivers; our QEMU device and Rust backend decode the command stream and
-execute it through Metal or Vulkan. We ship no guest driver.
+execute it through Vulkan. We ship no guest driver.
 
-`crates/reims-vgpu` supports three first-class pathways:
+`crates/reims-vgpu` supports two first-class pathways:
 
 | Pathway | Host | Guest | Attach | Page shift | Backend | Boot |
 |---|---|---|---|---|---|---|
 | x86 macOS / Linux Vulkan | Linux x86_64 (KVM) | x86_64 macOS Metal guest | PCI (`reims-vgpu-pci`) | 12 | Vulkan | `vm/boot-x86.sh` |
-| arm64 macOS / macOS Metal | Apple Silicon macOS (HVF) | arm64 macOS Metal guest | sysbus MMIO (`reims-vgpu-mmio`) | 14 | Metal-direct | `vm/boot-arm64.sh` |
 | arm64 macOS / macOS Vulkan | Apple Silicon macOS (HVF) | arm64 macOS Metal guest | sysbus MMIO (`reims-vgpu-mmio`) | 14 | Vulkan through MoltenVK | `vm/boot-arm64.sh` |
 
 Pathway-specific facts must be verified on the pathway being changed. Do not generalize from arm64
-to x86, from Metal to Vulkan, or from one host GPU class to another. Some rails run on exactly one
+to x86 or from one host GPU class to another. Some rails run on exactly one
 pathway — the arm64-only mapper rail is the standing example — and no boot on the other host can
 measure them.
 
@@ -44,7 +43,7 @@ measure them.
 - `vendor/qemu` - QEMU fork with the thin device shim: QOM, MMIO/BAR, IRQ/MSI, console/display
   integration, and HostOps plumbing.
 - `crates/reims-vgpu` - Rust staticlib that owns protocol decode, device model, memory mapping,
-  command planning/execution, scheduling, and Metal/Vulkan backend behavior.
+  command planning/execution, scheduling, and Vulkan backend behavior.
 - `crates/reims-vgpu/src/observe/` - crate-wide observability: fail logs, typed decline reasons,
   emission helpers, and gates.
 - `crates/reims-vgpu-wire` - derived wire-format views, with their own `AGENTS.md`. Where that file
@@ -184,7 +183,7 @@ values** — that a table is wide enough for the mask indexing it, that two bind
 overlap, that five bit-masks tile a word, that an external crate's enum discriminant still matches
 the ordinal this device decodes. `rustc` evaluates these on every arm that compiles the file,
 including the cross-compiled `--target aarch64-apple-darwin` clippy run, which is why they reach
-Metal code no Linux host can run tests for.
+platform-gated code that native Linux tests cannot execute.
 
 **Declaring a constant and then asserting it equals what you just declared it to be is not a
 check.** `pub const X: u64 = u64::MAX;` followed by `assert!(X == u64::MAX)` proves nothing. Nor
@@ -331,20 +330,6 @@ State exactly what you verified. A single green boot does not prove an entire cl
 claims such as "zero-copy everywhere" or "no fallback remains" require an audit of every place that
 could falsify them. One workload on one pathway proves one workload on one pathway.
 
-### A Subagent Shares Your Working Tree
-
-A delegated agent runs in this same checkout, so anything it does to git happens to you. Brief every
-one of them read-only, by name: no `checkout`, `switch`, `stash`, `reset`, `restore` or `commit`.
-The failure is quiet — an agent that runs `git checkout HEAD~1` to get a "clean build" and does not
-return leaves HEAD detached, and the next commit lands off the branch where nothing but the reflog
-can find it. Check `git status` after any delegated run before committing.
-
-**The same rule binds you, and the likeliest way to break it is reverting a probe.** Stubbing a gate
-out to prove a test really fails without it is the right habit; undoing it with `git checkout --
-<file>` takes every uncommitted edit in that file with it, including the change you were probing.
-Copy the file aside and copy it back, or edit the stub out the way you edited it in. Never reach for
-git to undo a probe.
-
 ## Before A Broad Sweep
 
 Deletion and audit sweeps over this crate have been run many times. What each concluded lives next
@@ -421,9 +406,8 @@ Triage its output before editing anything, because most of it is not rot. Three 
 the first is:
 
 - **The symbol exists nowhere.** Real rot, and the only class worth a commit. Confirm with a grep
-  for the leaf name; run the doc build on the Metal arm too (`--target aarch64-apple-darwin
-  --features backend-metal`) and take the intersection, or a `backend-metal`-gated target will read
-  as missing on the Vulkan arm.
+  for the leaf name; run the doc build for both supported targets and take the intersection, or a
+  platform-gated target can read as missing on the other host.
 - **A bare name inside a `//!` module doc.** These never resolve here whatever they name — a
   `pub fn` in that same module fails exactly as a deleted one does, and `self::` does not help.
   Only a fully-qualified `crate::…` path resolves from a `//!` doc. Cosmetic; the reference is
@@ -491,8 +475,7 @@ with the raw wire captured on first sighting (`runtime/exec/report.rs`). A test 
 
 ## Support Matrix
 
-arm64 and x86 are both first-class. Metal and Vulkan are both first-class where the host supports
-them.
+arm64 and x86 are both first-class. Vulkan is the backend on both pathways.
 
 The Vulkan backend must support all four memory/import cells:
 
@@ -515,9 +498,8 @@ path. Gate on capabilities, not vendor names, driver names, or API-version assum
 
 The GPU reads and writes guest memory through the mapping QEMU already holds over each RAMBlock,
 imported once and held for the VM's lifetime. The primitive is per platform and the three converge:
-`VK_EXT_external_memory_host` on Linux and Windows, the same extension through MoltenVK on macOS,
-and `newBufferWithBytesNoCopy` on the Metal-direct arm — which is what MoltenVK implements the
-extension over.
+`VK_EXT_external_memory_host` on Linux and Windows, and the same extension through MoltenVK on
+macOS.
 
 Portability is why. dma-buf is a Linux kernel object and there is no Windows equivalent —
 `VK_KHR_external_memory_win32` moves NT handles for GPU-allocated or D3D resources, not arbitrary
@@ -982,36 +964,10 @@ Run the relevant native tests serially from the repo root:
 
 ```sh
 cargo test -p reims-vgpu --no-default-features --features backend-vulkan,host-window -- --test-threads=1
-cargo test -p reims-vgpu --no-default-features --features backend-metal -- --test-threads=1
 ```
 
-`backend-metal` is Apple-only; run that arm only on Apple hosts. Run the feature matrix from the
-repo root when cfgs, features, backend boundaries, or shared Rust code change:
-
-**On a non-Apple host, the test functions under `backend/metal/` do not run, and nothing in the
-output says so.** This is worse than the fixture gap below, which at least reports `ignored`: these
-tests are `cfg`-ed out of the arm you can run, so a Linux session's green count simply does not
-include them and reads exactly like a clean tree. The cross-compiled clippy and `cargo check`
-commands above *compile* them, which is why a code warning there is still caught — but
-`cargo test --target aarch64-apple-darwin … --no-run` fails at the **link** step (no Apple linker,
-no macOS SDK), so no binary is ever produced. Do not read "compiles on the Metal arm" as "its tests
-passed"; nobody on a Linux host has run them.
-
-Nothing counts them any more — a source scan used to, and went with the rest. Do not try to restore
-the count with a `grep` for `#[test]`: that is what the scan did, and it was wrong by four, because
-the prose in those files says "a `const` assertion rather than a `#[test]`" and the grep counted the
-sentences. The gap is real and unclosed: work on `backend/metal/` needs an Apple host to be tested
-at all.
-
-Where a file under `backend/metal/` is pure logic, **move it out of the gated tree** rather than
-working around the gate — `backend::hash` is the worked example, and its two tests now run on every
-arm instead of on none. The bar is that it names nothing from the `metal` crate; state in the
-module's own doc why it sits outside `metal`, or the next reader moves it back.
-
-Copying the file to `/tmp` and building with bare `rustc --test` still works for a one-off reading,
-and needs the `//!` module doc stripped if it links outside the file. It is not a gate: nothing
-re-runs it. A file that reaches `crate::` for more than constants needs its dependency closure
-copied too, which is usually the point at which the logic belongs in `contract/` instead.
+Run the feature matrix from the repo root when cfgs, features, backend boundaries, or shared Rust
+code change:
 
 ```sh
 scripts/feature-matrix/feature-matrix.sh
@@ -1030,13 +986,6 @@ either suite covers what they cover, so a green run is not evidence about a wire
 with `scripts/wire-oracle/wire-oracle.sh` on an Apple host, and set `REIMS_WIRE_FIXTURES_REQUIRED=1`
 there so their absence fails the build.
 
-**The `backend-metal` `--lib` arm is expected to be green.** It used to carry six standing failures
-in a module that has since been deleted outright, and this file used to tell you to expect them;
-they were Vulkan-rail tests compiled unconditionally, and they carried the gate before the module
-went. A red there is a real
-result again — do not restore the exception, and do not silence a new one by weakening what it
-asserts.
-
 ## Commit Guidelines
 
 Commit only work you wrote. Never commit third-party code or intellectual property, including Apple
@@ -1051,12 +1000,10 @@ Each commit should have a detailed message body that states:
 - What tests, clippy runs, feature-matrix checks, or live-VM verification were performed.
 - What was not verified, if anything.
 
-Rust commits should be warning-free under clippy with `-D warnings` for every affected matrix arm.
-**All three run on a Linux host** — the Metal arm needs its `--target`, and with it clippy analyses
-the `backend-metal` code without an Apple machine:
+Rust commits should be warning-free under clippy with `-D warnings` for both supported targets:
 
 ```sh
-cargo clippy -p reims-vgpu --target aarch64-apple-darwin --all-targets --no-default-features --features backend-metal -- -D warnings
+cargo clippy -p reims-vgpu --target aarch64-apple-darwin --all-targets --no-default-features --features backend-vulkan,host-window -- -D warnings
 cargo clippy -p reims-vgpu --all-targets --no-default-features --features backend-vulkan,host-window -- -D warnings
 cargo clippy -p reims-vgpu --target x86_64-unknown-linux-gnu --all-targets --no-default-features --features backend-vulkan,host-window -- -D warnings
 ```
@@ -1072,20 +1019,11 @@ cargo clippy --profile test --lib -- -D warnings           # the host-runnable l
 ```
 
 Expect zero from all three. **`scripts/feature-matrix` does not cover this**: it runs `cargo check`,
-so its `warnings=0` is a rustc count and it cannot see a clippy lint on any arm. That gap plus a
-"the Metal command is Apple-only" line that used to sit here is how a `clippy::question_mark` in
-`runtime/draw/mod.rs` survived several commits that each said "clippy clean" — every one of
-them was clean on the arms it ran, and nobody on a Linux host ran the Metal one.
+so its `warnings=0` is a rustc count and it cannot see a clippy lint.
 
 Do not hide warnings, skip an affected arm, or commit a dropped test
 count without calling it out — and **do not read "clippy clean" in a commit body as covering every
 arm**; it means the arms that commit ran.
-
-One standing clippy exception, carried by `#[allow]`s at the module declaration that states the
-reason. `backend::metal::error::Status` is large by design — the payload is what makes each refusal
-name the check that refused, and it is `Copy` and compared by value at hundreds of sites — so
-`result_large_err` and `large_enum_variant` are exempted there. **A new error type that is large for
-no such reason should still be boxed**, not added to the exemption.
 
 ### Always run `cargo fmt`
 
@@ -1119,15 +1057,3 @@ Two things the mandate does not license:
 - **rustfmt does not touch comment prose.** `wrap_comments` is off, which is its default, so every
   `//!` and `///` in this crate stays exactly as written — the module docs that carry this project's
   durable reasoning are yours to wrap by hand, and rustfmt will not second-guess them.
-
-### Never transmute a guest ordinal into a Metal enum
-
-The `MTL*` types are fieldless `#[repr(u64)]` enums, so producing one whose discriminant is not a
-declared variant is **undefined behavior, not a decode error** — the same rule
-`reims-vgpu-wire`'s invariant 4 states for wire structs. A decoded guest value is an arbitrary
-`u32`, so `transmute` is never the conversion.
-
-`backend::metal::mtl_enum` is the only way across: name every variant, get `None` for anything
-else, turn that into a typed refusal. Add a table there rather than a cast, and read that module's
-doc first — two of these enums have interior holes, so a `<= max` range check is not a substitute,
-and `MTLStepFunction`'s names in `metal` 0.33 are not Apple's.

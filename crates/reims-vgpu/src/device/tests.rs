@@ -17,9 +17,8 @@ fn lifecycle() {
 }
 
 #[test]
-fn exactly_one_backend_name() {
-    let n = backend_name();
-    assert!(n == "metal" || n == "vulkan");
+fn backend_name_is_vulkan() {
+    assert_eq!(backend_name(), "vulkan");
 }
 
 #[test]

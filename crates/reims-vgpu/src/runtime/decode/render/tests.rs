@@ -608,8 +608,8 @@ fn a_scissor_covers_its_target_only_when_every_term_says_so() {
 ///
 /// The rule had two consumers and the second carried its own copy testing
 /// `level` and `resolve_texture_ref` only — so a depth buffer bound at
-/// slice 5 was refused by the stream decode and would have been accepted by
-/// the Metal rail. This drives each field on its own, from both shapes, so
+/// slice 5 was refused by one consumer and accepted by another. This drives
+/// each field on its own, from both shapes, so
 /// a consumer that reconstructs three of the four fails here rather than at
 /// a guest that binds an array layer.
 ///

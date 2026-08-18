@@ -364,7 +364,6 @@ pub fn imports() -> Vec<Arc<GuestRamImport>> {
 /// leaves the lazy path to handle a backend that is genuinely late.
 ///
 /// The device-side half is Vulkan-only because only Vulkan has a device-side
-/// half: the Metal-direct arm builds a `newBufferWithBytesNoCopy` per call
 /// against unified memory and holds no per-RAMBlock import to warm.
 pub fn warm<H: HostOps + ?Sized>(host: &mut H) {
     if granularity().is_none() {

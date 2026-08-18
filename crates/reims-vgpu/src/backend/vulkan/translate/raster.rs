@@ -450,13 +450,8 @@ mod tests {
         assert_eq!(DepthClipMode::default(), DepthClipMode::Clip);
     }
 
-    /// One Apple enum, spelled once here and once in
-    /// `backend::metal::mtl_enum::visibility_result_mode`, with nothing in the
-    /// toolchain comparing them. A mode this arm records and that one refuses
-    /// is a guest that culls correctly on one host and reads a stale word on
-    /// the other, so both are held to [`crate::contract::visibility`] — this
-    /// one as a test, the Metal one as a `const` block, because its tests run
-    /// on no machine anybody edits from.
+    /// The recorded Apple enum is held to [`crate::contract::visibility`] so a
+    /// new mode cannot silently fall out of the Vulkan mapping.
     #[test]
     fn the_recorded_visibility_modes_are_the_ones_the_contract_names() {
         use crate::contract::visibility::{

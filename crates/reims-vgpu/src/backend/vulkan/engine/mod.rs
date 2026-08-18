@@ -1,4 +1,4 @@
-//! Persistent Vulkan draw + compute engine for the Linux metal2vulkan product path.
+//! Persistent Vulkan draw and compute engine for both product pathways.
 //!
 //! Facade: [`execute_draw_request`] / [`execute_compute_request`] /
 //! [`read_target`]. Caches L2–L7 + Lc + memory pools so a warm

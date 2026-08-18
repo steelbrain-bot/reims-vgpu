@@ -112,7 +112,7 @@ impl std::error::Error for MtlbDecline {}
 pub enum AirLoadRail {
     /// Compute dispatch, its sessions, and compute ICB bodies.
     Compute,
-    /// Render draws on either backend, and render ICB bodies.
+    /// Render draws and render ICB bodies.
     Draw,
 }
 

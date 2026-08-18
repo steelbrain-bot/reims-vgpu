@@ -64,7 +64,6 @@ pub enum DrawPreparationDecline {
     /// nowhere and a later pass sampling that attachment reads whatever was
     /// there before. See
     /// [`crate::runtime::census::present_proxy::MrtDrop`] for which checks bail
-    /// and why the Metal arm is the one that settled it.
     SecondaryTargetUnbuildable {
         pipeline_ref: u32,
         refusal: crate::runtime::census::present_proxy::SecondaryMrtRefusal,

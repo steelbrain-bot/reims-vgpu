@@ -1128,7 +1128,6 @@ pub fn negotiate_protocol_version(requested: u32) -> u32 {
 /// on every driven boot recorded so far.
 ///
 /// It is *not* narrowed to 1 the way key 11's primitive mask was narrowed to
-/// what both backends execute, and the difference is that Metal guarantees
 /// sample count 4 on every device it runs on. An `MTLDevice` answering 1 is a
 /// shape no macOS guest has ever had to handle, so narrowing trades a known
 /// refusal for an unknown one. The honest repair is to rasterize at the count
@@ -1160,7 +1159,6 @@ pub const DEVICE_INFO_KEY_DUAL_PLANE_TEXTURES: u32 = 12;
 ///
 /// This key has no term in [`DeviceInfoLimits`], so no host reduction touches
 /// it, which is the shape key 11 had when it was authorising primitive types
-/// both backends refuse. The question is worth answering here rather than
 /// re-asking, because the answer is the opposite one and for a reason that
 /// generalises.
 ///
@@ -1168,7 +1166,6 @@ pub const DEVICE_INFO_KEY_DUAL_PLANE_TEXTURES: u32 = 12;
 /// primitive types — the refusal is permanent, so the honest advertisement is
 /// the narrow one. Framebuffer read is not that: the Vulkan arm implements the
 /// attachment-0 fetch through a subpass input attachment, which is Vulkan 1.0
-/// core and needs no capability; the Metal arm serves an Apple GPU, whose
 /// families all have it. What is missing is only the fetch of a *secondary* MRT
 /// attachment, which `runtime::draw::vulkan` refuses by name as
 /// `draw_prepare_color_input_mrt_unsupported`.
@@ -1423,7 +1420,6 @@ pub fn device_info_caps(limits: &DeviceInfoLimits, version: u32) -> Vec<(u32, u3
 /// **instruction to the guest** about what it may build, and one it cannot
 /// re-ask about later. Key 11 is what that costs when it is left as a number:
 /// it read `1023` from a capture for as long as this table existed, which
-/// authorised four primitive types both backends refuse, and nothing said so
 /// because the entry was a pair of integers.
 ///
 /// A new entry therefore gets a `DEVICE_INFO_KEY_*` constant whose doc says what

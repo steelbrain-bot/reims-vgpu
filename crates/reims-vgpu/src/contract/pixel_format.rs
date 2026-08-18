@@ -147,21 +147,12 @@ pub const MTL_FORMAT_X24_STENCIL8: u16 = 262;
 /// The compute rail's own narrowing of `MTLPixelFormat` to the formats a
 /// storage image may be, produced once by [`storage_selector`].
 ///
-/// # Every backend owes an answer for every member
+/// # The backend owes an answer for every member
 ///
 /// This travels as the enum, never as its ordinal, and that is load-bearing
-/// rather than tidiness. It used to be narrowed to `u32` the moment
-/// [`storage_selector`] produced it, and both backends then matched raw
-/// integers — the Vulkan one with thirteen `s if s == S::X as u32` guard arms,
-/// the Metal one against a hand-copied list of constants. Neither shape has
-/// coverage a compiler can check, and the Metal one had silently gone a member
-/// short: `R32Uint` was declared here and had no arm there, so every `R32Uint`
-/// storage bind on the whole arm64 pathway refused while the x86 pathway ran it.
-///
-/// Both maps are now exhaustive `match`es over this type and both are total, so
-/// adding a variant here fails the build until each backend names it. The Metal
-/// arm's half of that is reached from a Linux host only by the cross-compiled
-/// clippy run, which is the point of stating the rule here rather than there.
+/// rather than tidiness. Narrowing it to `u32` would make every consumer match
+/// integers, which has no exhaustiveness check. Keeping the type means adding a
+/// variant here fails the build until the Vulkan mapping names it.
 ///
 /// The discriminants are explicit because they are logged as `simg=` and read
 /// back from boots; nothing else depends on their values.

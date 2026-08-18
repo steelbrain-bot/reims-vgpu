@@ -1,15 +1,9 @@
 //! `MTLVisibilityResultMode`: which occlusion-query modes this device records.
 //!
-//! # Why the set lives here and not in either backend
+//! # Why the set lives here
 //!
-//! One Apple enum is spelled twice — [`crate::backend::vulkan::translate::raster`]
-//! maps it to `VisibilityResultMode` and `backend::metal::mtl_enum` maps it to
-//! `MTLVisibilityResultMode` — and nothing in the toolchain compares the two.
-//! A mode one arm records and the other refuses is a guest that culls correctly
-//! on one host and reads a stale word on the other, which is the per-pathway
-//! divergence `AGENTS.md` asks to be pinned wherever a value crosses a boundary
-//! twice. Each backend carries a check against this constant, so the two arms
-//! cannot disagree about what a guest may arm.
+//! The decoder and [`crate::backend::vulkan::translate::raster`] both consume
+//! this Apple enum. One shared set keeps admission and translation aligned.
 //!
 //! # The ordinals
 //!
@@ -19,8 +13,7 @@
 //! query rather than into a query with a mode, and a backend handed it anyway
 //! is being asked to answer a question nobody posed.
 
-/// Bit `n` set means `MTLVisibilityResultMode(n)` is a mode both backends
-/// record. See the module doc for what is deliberately absent.
+/// Bit `n` set means `MTLVisibilityResultMode(n)` is a mode this device records.
 pub const RECORDABLE_VISIBILITY_RESULT_MODES: u32 = 0b110;
 
 /// Whether `mtl` is a visibility result mode this device records.
@@ -35,18 +28,14 @@ pub const fn visibility_result_mode_recordable(mtl: u32) -> bool {
 /// *recordable* ordinal of four other Metal enums this crate decodes and the
 /// reader cannot tell which one a literal means.
 ///
-/// The Vulkan translator matches on it directly. The Metal encoder does not:
-/// by the point it decides, the ordinal has become an
-/// `MTLVisibilityResultMode` and `Disabled` is that type's own spelling of the
-/// same fact, which is the stronger one to compare against.
+/// The Vulkan translator matches on it directly.
 pub const VISIBILITY_RESULT_MODE_DISABLED: u32 = 0;
 
 /// One past the highest ordinal the enum declares, for a sweep that wants to
 /// prove a table refuses everything outside the set rather than sampling it.
 ///
-/// Four past rather than one, on the rule `mtl_enum`'s own tables use: a table
-/// that accepted one ordinal beyond the last variant would pass a sweep that
-/// stopped at the last variant.
+/// Four past rather than one so a table that accepted an adjacent undeclared
+/// ordinal would fail the sweep.
 pub const VISIBILITY_RESULT_MODE_SWEEP_END: u32 = 7;
 
 #[cfg(test)]

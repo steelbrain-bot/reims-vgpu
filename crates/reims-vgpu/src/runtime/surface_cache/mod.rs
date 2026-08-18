@@ -1,8 +1,8 @@
 //! Host surface cache for Linux/Vulkan discrete-GPU present (kb tahoe-x86 §8.5).
 //!
-//! On Apple Metal hosts, GPU Stores land in guest IOSurface pages (unified
-//! memory). On this Linux product rail guest type-4 pages are **not** filled by
-//! the host GPU until encode writeback; historical product painted from a
+//! On Apple unified-memory hosts, GPU stores can land in guest IOSurface pages.
+//! On the Linux product rail guest type-4 pages are **not** filled by the host
+//! GPU until encode writeback; the product paints from a
 //! **host render-cache** keyed by surface_id. This module is that cache.
 //!
 //! Namespace split (2026-07-13 live x86):

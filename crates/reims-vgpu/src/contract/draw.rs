@@ -9,14 +9,13 @@
 /// [`crate::model::DEVICE_INFO_KEY_PRIMITIVE_TYPE_MASK`], for any `type <= 8`,
 /// and falls back to `type < 5` when the key is absent. So the number this
 /// device publishes decides which primitive types the guest is permitted to
-/// build a draw out of — and a bit set for a type no backend can translate is a
+/// build a draw out of — and a bit set for a type the backend cannot translate is a
 /// draw this device refuses *after* the guest has committed to it.
 ///
 /// The capture that table came from carried `1023`: bits 0..=9, authorising the
-/// four non-public types 5..=8 on top of the public enum. Both backends refuse
-/// those by name — `translate::raster::primitive_topology` answers
-/// `UnknownPrimitiveType` and `backend::metal::mtl_enum::primitive_type` answers
-/// `None` — so every one of those bits was a promise this device cannot keep.
+/// four non-public types 5..=8 on top of the public enum. Vulkan translation
+/// refuses those as `UnknownPrimitiveType`, so every one of those bits was a
+/// promise this device cannot keep.
 /// Narrowing to what it can execute is the rule
 /// [`crate::model::device_info_caps`] already applies to the GPU-dependent keys:
 /// answering higher than the host can execute does not degrade gracefully.
@@ -24,8 +23,8 @@
 /// Widening it again needs the *meaning* of 5..=8 first. They are not in the
 /// public `MTLPrimitiveType` enum and nothing here has decoded one, so setting a
 /// bit for one would be a number chosen to match a capture rather than a
-/// contract. Each backend's translator carries the test that holds this constant
-/// to the arms that actually exist.
+/// contract. The Vulkan translator carries the test that holds this constant to
+/// the executable set.
 pub const EXECUTABLE_PRIMITIVE_TYPES: u32 = 0b1_1111;
 
 /// Whether `mtl` is a primitive type this device advertises and can execute.
@@ -39,14 +38,8 @@ pub const fn primitive_type_executable(mtl: u32) -> bool {
 ///
 /// Its own type for the same reason [`super::extent::Extent3`] is: the hazard is
 /// at the call boundary, not at construction. These five were decoded into a
-/// struct and then destructured back into loose `u32`s to cross two of them —
-/// `draw::mrt_draw_request` took `(vertex_count, instance_count,
-/// primitive_type, first_vertex, base_instance)` and
-/// `backend::metal::render::render_core_mrt`, one call further down the same
-/// draw, took the same five as `(vertex_count, first_vertex, instance_count,
-/// base_instance, primitive_type)`. Two orders, both positional, both all-`u32`
-/// or all-`usize`, so every one of the 120 permutations compiled at each site
-/// and the two sites did not even agree with each other.
+/// struct and then destructured back into five loose positional `u32`s. All 120
+/// permutations compiled, so the typed value now crosses the whole boundary.
 ///
 /// A transposition here does not fail: it draws a valid primitive of the wrong
 /// shape, or the right vertices of the wrong instance, which nothing downstream

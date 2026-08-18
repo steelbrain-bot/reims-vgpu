@@ -2875,7 +2875,6 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         // against each other and reading them in the other order invites
         // treating the engine's phases as the whole draw, which is the
         // misreading this line exists to correct. Not gated on the backend —
-        // the timer is runtime-side and the Metal arm can adopt it without a
         // second census.
         emit_chain_phase();
         emit_object_cache_levels();
@@ -3353,40 +3352,6 @@ fn emit_stage_phase() {
     ));
 }
 
-#[cfg(not(feature = "backend-vulkan"))]
-fn emit_engine_delta() {}
-
-/// The Metal arm's counterpart. Same question, same cadence, different tables:
-/// this arm builds `MTLFunction` / `MTLRenderPipelineState` /
-/// `MTLComputePipelineState` / `MTLSamplerState` / `MTLDepthStencilState` and
-/// compute reflections, and holds them in `backend::metal::cache`.
-///
-/// No `m2v` field: AIR reaches Metal directly on this arm, so
-/// `runtime::m2v_cache` is never populated and a zero there would read as an
-/// empty cache rather than an absent rail.
-#[cfg(all(
-    not(feature = "backend-vulkan"),
-    feature = "backend-metal",
-    target_os = "macos"
-))]
-fn emit_object_cache_levels() {
-    let [functions, render_pso, compute_pso, samplers, depth_stencil, reflections] =
-        crate::backend::metal::cache_levels();
-    crate::observe::off(format!(
-        "object_cache_levels (levels, not per-interval) functions={functions} \
-         render_pso={render_pso} compute_pso={compute_pso} samplers={samplers} \
-         depth_stencil={depth_stencil} reflections={reflections}"
-    ));
-}
-
-/// No compiled-object caches on this build: either no backend, or the Metal
-/// feature without the Apple target that carries `backend::metal::cache`.
-#[cfg(not(any(
-    feature = "backend-vulkan",
-    all(feature = "backend-metal", target_os = "macos")
-)))]
-fn emit_object_cache_levels() {}
-
 /// The engine mutex's wait and hold time over the same window, split by which
 /// thread class asked for it.
 ///
@@ -3401,9 +3366,6 @@ fn emit_engine_lock(win_ms: u64) {
         crate::observe::off(line);
     }
 }
-
-#[cfg(not(feature = "backend-vulkan"))]
-fn emit_engine_lock(_win_ms: u64) {}
 
 /// Count a drain wake-up that returned before taking the device lock.
 pub fn note_drain_skipped() {

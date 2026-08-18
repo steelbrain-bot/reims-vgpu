@@ -41,12 +41,8 @@ pub struct Extent3 {
 /// texels has no levels, and answering 1 there would size a read of a texture
 /// that does not exist.
 ///
-/// Here rather than in either backend because both rails need the same answer
-/// and each used to hold its own copy — `backend::metal::mipmap` for the
-/// filtered generator, and a cfg-forked `metal_mip_extent_local` in
-/// `runtime::mipmap` whose Vulkan arm reimplemented the line the Metal arm
-/// called. That fork also decided nothing: the two arms were identical, so the
-/// only thing the `#[cfg]` could ever change was which copy ran.
+/// Here rather than in the backend because resolution, CPU mip generation, and
+/// Vulkan execution all need the same answer.
 ///
 /// The runtime resolver rejects any stored mip layout whose extent disagrees
 /// with this, so a wrong formula either refuses valid mip chains or accepts a
@@ -63,8 +59,8 @@ pub fn mip_extent(base: u32, level: u32) -> u32 {
     // then clamping to one is the same formula continued, and it agrees with
     // every level below. The level is a decoded guest field —
     // `TEXTURE_MAX_MIP_LEVELS` bounds the ones the decoder admits, but this is
-    // `pub` in `contract` and the Metal generator reaches it directly, so it
-    // states its own domain rather than borrowing the decoder's.
+    // `pub` in `contract`, so it states its own domain rather than borrowing
+    // the decoder's.
     base.checked_shr(level).unwrap_or(0).max(1)
 }
 
@@ -80,10 +76,8 @@ pub fn mip_extent(base: u32, level: u32) -> u32 {
 /// callers are all length checks of the form "does the guest's buffer hold a
 /// whole image", and `0` would pass every one of them.
 ///
-/// Here rather than in `backend::metal`, where it lived, for the reason
-/// [`mip_extent`] gives: it is arithmetic both rails need, `backend::metal` is
-/// behind a feature gate, and `runtime::compute_session` was already reaching
-/// through that gate to borrow it.
+/// Here rather than in the backend for the reason [`mip_extent`] gives: it is
+/// contract arithmetic used by several runtime paths.
 pub fn tight_image_bytes(width: u32, height: u32, bytes_per_pixel: usize) -> Option<usize> {
     if width == 0 || height == 0 || bytes_per_pixel == 0 {
         return None;
@@ -134,15 +128,8 @@ pub fn tight_layered_image_bytes(
 /// alongside it are not two facts but one, and deriving them separately is what
 /// lets them disagree.
 ///
-/// They did. `runtime::draw::metal_icb` sized an ICB colour attachment's
-/// staging from the *guest* attachment's bytes-per-pixel while creating a
-/// BGRA8Unorm texture and passing `width * 4` as the stride, so for any format
-/// narrower than four bytes ([`crate::contract::pixel_format::R8_BPP`],
-/// [`crate::contract::pixel_format::RG8_BPP`]) Metal read past the end of the
-/// buffer and copied whatever followed it on the host heap into a render target
-/// the guest reads back. The writeback half of that same function computed the
-/// length correctly, ten lines away. One quantity, two derivations, and only
-/// one of them right.
+/// Keeping the stride and allocation length together prevents a caller from
+/// sizing storage for one texel width while submitting a different row stride.
 ///
 /// Same `None` contract as [`tight_image_bytes`], and for the same reason: a
 /// zero on any axis is not a zero-length image, it is a geometry no caller here
@@ -291,8 +278,7 @@ mod tests {
         assert_eq!(mip_extent(100, 3), 12);
     }
 
-    /// Moved here from `backend::metal::util`, where it could only run on an
-    /// Apple host. Every case is one the callers actually guard against.
+    /// Every case is one the callers actually guard against.
     #[test]
     fn a_tight_image_is_the_product_and_an_empty_one_has_no_length() {
         assert_eq!(tight_image_bytes(2, 3, 4), Some(24));

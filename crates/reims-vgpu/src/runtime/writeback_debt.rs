@@ -283,7 +283,6 @@ impl PendingWritebacks {
     /// Gated on the arm that calls it. Unlike [`Self::gva_resource_backing`],
     /// which the tests in this module exercise directly, the only reader of
     /// this one is [`gva_resource_generation`], which is Vulkan-only — so
-    /// admitting `test` here leaves it dead on the Metal arm's test build.
     #[cfg(feature = "backend-vulkan")]
     fn gva_resource_status(&self, plane: GvaPlaneKey) -> Option<(u64, u64, bool)> {
         self.gva_resources

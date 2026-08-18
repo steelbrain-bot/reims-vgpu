@@ -1933,7 +1933,6 @@ pub fn write_stamp<H: HostMemory + HostOps>(
 /// What the GPU behind this host can execute, for the device-info keys that
 /// describe the GPU rather than the protocol.
 ///
-/// The Metal backend serves an Apple GPU to an Apple guest, so the table's own
 /// values already describe the executing device and there is nothing to reduce.
 /// The Vulkan backend runs on anything from a discrete part to an iGPU at the
 /// Vulkan floor, which is exactly the case a fixed table gets wrong.
@@ -2210,16 +2209,12 @@ const COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY: u32 = 4;
 /// `maxTotalThreadsPerThreadgroup` is *also* per-pipeline in Metal — a
 /// register-heavy kernel reports less than the device maximum, and the canonical
 /// app pattern divides it by `threadExecutionWidth` to pick a threadgroup shape.
-/// So on the Metal arm this over-promises: the guest sizes a dispatch from the
-/// device number and the PSO this device builds from its kernel may refuse it.
-/// On the Vulkan arm there is nothing better to say — core Vulkan has no
+/// The device number and the PSO built from its kernel may differ. Core Vulkan has no
 /// per-pipeline invocation limit, so `maxComputeWorkGroupInvocations` *is* the
 /// answer.
 ///
-/// Not fixed, and deliberately: closing it means building the PSO on the query
-/// path to ask its own limit, which is Metal-arm-only work whose harm no boot
-/// this checkout can take would measure. The proxy that would rank it is a
-/// dispatch refused for threadgroup size on a driven arm64 boot.
+/// Closing the gap would require a contract-backed per-pipeline answer. The
+/// proxy that would rank it is a dispatch refused for threadgroup size.
 ///
 /// A 0 there is not a silent omission but it is not free either. The guest's own
 /// default for an unanswered key is also 0, so this reply and no reply are
@@ -2233,7 +2228,6 @@ const COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY: u32 = 4;
 /// reflection can make it right.
 fn compute_info_caps() -> [(u32, u32); 3] {
     // Apple GPUs report 1024 and 32 across every family the arm64 pathway
-    // targets, and the Metal backend serves an Apple GPU to an Apple guest.
     #[cfg(not(feature = "backend-vulkan"))]
     let (max_total_threads, thread_execution_width) = (1024, 32);
     #[cfg(feature = "backend-vulkan")]
@@ -4199,8 +4193,8 @@ fn exec_summary(channel_id: u32, result: &crate::runtime::exec::ExecResult, plen
         result.streams_loaded,
         result.saw_draw as u8,
         result.clears_applied,
-        result.metal_draws_ok,
-        result.metal_draws_fail,
+        result.draws_ok,
+        result.draws_fail,
         result.render_attachment_resolves,
         result.render_guest_stores,
         result.render_icb_ok,
@@ -4487,7 +4481,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 // Healthy packets are expected control flow and stay quiet
                 // unless the draw log is on — the per-packet form ran ~1k
                 // lines/s under Safari scroll.
-                let packet_failed = result.metal_draws_fail > 0
+                let packet_failed = result.draws_fail > 0
                     || result.render_icb_fail > 0
                     || result.compute_control_fail > 0
                     || result.compute_icb_fail > 0;
@@ -4501,7 +4495,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         "TRANSPORT reason=sync_exec_lock_hold ch={channel_id} task={} total_us={} draws={} rt_resolves={} guest_stores={} threshold_us={SYNC_EXEC_STALL_US}",
                         result.task_id,
                         result.total_us,
-                        result.metal_draws_ok.saturating_add(result.metal_draws_fail),
+                        result.draws_ok.saturating_add(result.draws_fail),
                         result.render_attachment_resolves,
                         result.render_guest_stores
                     ));

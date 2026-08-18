@@ -40,7 +40,6 @@
 //! # Only the Vulkan draw path writes it, and that is not an oversight
 //!
 //! Two of the fields — the translated module word counts — do not exist on the
-//! Metal-direct arm, where the guest's own AIR is handed to the Metal compiler
 //! and never becomes SPIR-V. A Metal producer would have to record different
 //! fields for a different failure, so it belongs in its own trail if a Metal
 //! host is ever seen wedging, not in this one with two columns zeroed. The type
@@ -162,7 +161,6 @@ pub struct SampledNote {
     /// Which rail supplied the texels: see [`SampledNote::kind_name`].
     pub kind: u8,
     /// `VkFormat`'s raw value. Kept as the number rather than a name because
-    /// this type compiles on the Metal-direct arm, where `ash` does not exist.
     pub format: u32,
     pub width: u32,
     pub height: u32,
@@ -262,7 +260,6 @@ pub struct SamplerNote {
     /// sampler is ever bound below `SAMPLER_BINDING_BASE`.
     pub binding: u32,
     /// `N` nearest, `L` linear. ASCII rather than the backend's enum because
-    /// this type compiles on the Metal-direct arm, where
     /// `backend::vulkan::engine` does not exist — the same constraint that
     /// keeps [`SampledNote::format`] a raw number.
     pub min_filter: u8,
@@ -550,7 +547,6 @@ fn frag_words_band(words: u32) -> &'static str {
 ///
 /// The submission ring is [`crate::backend::vulkan::engine::pools::RING_DEPTH`]
 /// deep, and that constant is not nameable here: this module compiles on the
-/// Metal-direct arm, where `backend::vulkan` does not exist. So the relation is
 /// asserted on the Vulkan side, where both names are in scope — see the
 /// `const _` beside `RING_DEPTH`. A capacity larger than the ring is harmless
 /// (the extra entries are never written); one smaller would silently drop the

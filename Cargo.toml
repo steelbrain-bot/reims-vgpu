@@ -1,6 +1,6 @@
 # Cargo workspace for the project's host-side product crate.
 #
-# Product path: crates/reims-vgpu (protocol + C ABI + Metal|Vulkan backend).
+# Product path: crates/reims-vgpu (protocol + C ABI + Vulkan backend).
 # UEFI option ROM: crates/reims-vgpu-efi (own Cargo workspace — x86_64-unknown-uefi;
 # not a member here so host builds never pull the no_std PE graph).
 [workspace]

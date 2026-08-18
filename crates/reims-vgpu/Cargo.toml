@@ -2,7 +2,7 @@
 name = "reims-vgpu"
 version = "0.1.0"
 edition = "2021"
-description = "Reims vGPU host path: protocol, device, QEMU C ABI, Metal/Vulkan backends"
+description = "Reims vGPU host path: protocol, device, QEMU C ABI, and Vulkan backend"
 license = "GPL-2.0-or-later"
 
 [lints.rust]
@@ -14,15 +14,9 @@ crate-type = ["staticlib", "rlib"]
 name = "reims_vgpu"
 
 [features]
-# The project supports exactly three arms, one per host GPU API actually
-# available: Metal on Apple, Vulkan through MoltenVK on Apple, and Vulkan on a
-# native Linux ICD. backend-metal is therefore **Apple-only** — src/lib.rs
-# rejects it elsewhere with a compile_error!. There is no host-stub Metal arm;
-# a binary that links but cannot draw is worse than a build that fails.
-default = ["backend-metal"]
-backend-metal = []
-# Product Vulkan encode: self-contained ash engine + metal2vulkan
-# (native Vulkan on Linux, MoltenVK on macOS).
+default = ["backend-vulkan"]
+# Product encode: self-contained ash engine + metal2vulkan. This feature
+# uses native Vulkan on Linux and MoltenVK on macOS.
 # No vkcompute on any edge (product or dev) — engine is self-contained.
 backend-vulkan = ["dep:ash"]
 # Host-owned presentation window (kb host-window): Rust winit window +
@@ -52,12 +46,7 @@ winit = { version = "0.30", optional = true }
 ash-window = { version = "0.13", optional = true }
 raw-window-handle = { version = "0.6", optional = true }
 
-# Metal encode is macOS-only; `backend-metal` is rejected on any other host.
 [target.'cfg(target_os = "macos")'.dependencies]
-metal = "0.33"
-objc = "0.2"
-block = "0.1"
-foreign-types = "0.5"
 libc = "0.2"
 
 [dev-dependencies]

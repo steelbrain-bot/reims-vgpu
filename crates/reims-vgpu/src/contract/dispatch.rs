@@ -2,7 +2,7 @@
 //! counts a compute grid resolves to, and the three extents a mesh draw encodes.
 //!
 //! All three are read off the wire and none is backend-specific, so each is
-//! answered here once rather than at every backend's encode site. Each is a
+//! answered here once rather than at each encode site. Each is a
 //! *closed* rule with a substitution behind it, which is why they are functions
 //! and not open-coded comparisons — see
 //! [`crate::contract::dispatch::workgroup_counts`] for what the split version of
@@ -27,17 +27,8 @@
 //!
 //! The value arrives on the wire, from the guest, and is decoded by
 //! [`crate::runtime::decode::compute`] — none of which is backend-specific. It
-//! was previously reachable only through `backend::metal::abi`, which is
-//! `backend-metal`-gated, so the shared code that accepts the field could not
-//! name the values it was accepting and the one place that narrowed it ran on a
-//! single arm. `contract/` is where a number that comes from the wire and the
-//! SDK belongs, per this module tree's own doc.
-//!
-//! `backend::metal::abi` keeps its own spelling of the pair, because that module
-//! is a mirror of an archived C header and its provenance is the point. A `const`
-//! assertion there pins the two spellings equal, so a divergence is a build
-//! failure on every arm that compiles the mirror — including the cross-compiled
-//! `--target aarch64-apple-darwin` clippy run `AGENTS.md` requires from Linux.
+//! `contract/` is where a number that comes from the wire and SDK belongs, so
+//! decode and Vulkan execution share one spelling.
 
 /// `MTLDispatchTypeSerial` — dispatches in a segment may not overlap.
 pub const MTL_DISPATCH_TYPE_SERIAL: u32 = 0;

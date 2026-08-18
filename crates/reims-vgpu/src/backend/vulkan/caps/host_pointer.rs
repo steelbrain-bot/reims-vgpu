@@ -6,7 +6,6 @@
 //! `VK_EXT_external_memory_host` is the one primitive that spans every host
 //! this device targets: Linux, Windows, and macOS through MoltenVK, which
 //! implements it over `newBufferWithBytesNoCopy` — the same call the
-//! Metal-direct arm makes. dma-buf is a Linux kernel object and always will be,
 //! and `VK_KHR_external_memory_win32` is not the Windows equivalent: it moves
 //! NT handles for GPU-allocated or D3D resources, not arbitrary host pointers.
 //!

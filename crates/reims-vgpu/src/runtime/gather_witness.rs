@@ -432,7 +432,6 @@ struct WitnessReadings {
 /// executed could land in the window being judged.
 ///
 /// The three arms are the engine's `GuestWriteReach`, restated here so this
-/// module's signature does not name a backend type — the Metal arm has no such
 /// queue and answers [`Self::Disjoint`] by construction. Only `Disjoint` may
 /// vouch, but the other two are kept apart because they want different repairs:
 /// an `Overlap` is this device really writing the window it samples, and an

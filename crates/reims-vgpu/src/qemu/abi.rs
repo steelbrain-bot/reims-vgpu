@@ -1077,7 +1077,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_name_metal_default() {
+    fn backend_name_is_vulkan() {
         let mut buf = [0i8; 32];
         assert_eq!(
             unsafe { reims_vgpu_qemu_backend_name(buf.as_mut_ptr(), buf.len()) },
@@ -1086,7 +1086,7 @@ mod tests {
         let s = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
             .to_str()
             .unwrap();
-        assert!(s == "metal" || s == "vulkan", "got {s}");
+        assert_eq!(s, "vulkan");
     }
 
     #[test]

@@ -1,7 +1,6 @@
-//! Self-contained Vulkan execution backend (build-time alternate to Metal).
+//! Self-contained Vulkan execution backend.
 //!
-//! Ownership mirrors [`crate::backend::metal`]: all host GPU work for this rail
-//! lives under `backend/vulkan/`, driven by `ash`. Product draw encode uses the
+//! All host GPU work lives under `backend/vulkan/`, driven by `ash`. Product draw encode uses the
 //! internal [`engine`] (persistent ash context + content-keyed caches). This
 //! crate has no external graphics-executor dependency; AIR translation comes
 //! from the pinned public `metal2vulkan` crate.

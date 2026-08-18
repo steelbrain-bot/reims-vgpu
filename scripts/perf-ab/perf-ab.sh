@@ -86,7 +86,7 @@ say() { echo "perf-ab: $*"; }
 # issues, which kills this runner instead of the previous VM.
 if [ -z "${QEMU_BIN:-}" ]; then
   say "building QEMU once for the whole run ..."
-  if ! "$REPO/scripts/qemu-build/qemu-build.sh" --backend vulkan \
+  if ! "$REPO/scripts/qemu-build/qemu-build.sh" \
        >"$OUT/qemu-build.log" 2>&1; then
     say "qemu build failed; see $OUT/qemu-build.log"
     exit 2

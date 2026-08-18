@@ -204,9 +204,8 @@ static LAST: OnceLock<Mutex<HashMap<(&'static str, u64), u64>>> = OnceLock::new(
 /// keys built from fixture values (a mapping id and a PFN, a task id, a texture
 /// ref) is as easy as picking the same round number. Whether they collide
 /// depends on which runs first, and libtest orders by name — so the suite's
-/// greenness rested on the alphabet. Renaming `runtime::metal_draw` to
-/// `runtime::draw` moved several hundred tests from after `runtime::mapper` to
-/// before it and turned one such pair red.
+/// greenness rested on the alphabet. Moving a large test module changed the
+/// ordering and turned one such pair red.
 ///
 /// [`crate::observe::sink::FailCapture::start`] calls this, so any test that
 /// captures the sink starts from an empty latch and is order-independent by

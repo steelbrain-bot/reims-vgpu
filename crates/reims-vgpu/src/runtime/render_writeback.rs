@@ -619,9 +619,8 @@ macro_rules! settle_sites {
 
 settle_sites! {
     /// `draw::texture_view::load_linear_texture_impl` — CPU read of a linear
-    /// texture's guest pages, reached from the Metal-only `load_sampled_rgba`
-    /// ladder. The two arms that reach it on the Vulkan pathway name themselves
-    /// below.
+    /// texture's guest pages. The two callers on the Vulkan pathway name
+    /// themselves below.
     LinearTextureLoad => "settle_linear_texture_load",
     /// The same leaf, reached from `draw::seed_color_load` — the colour LOAD
     /// seed reading the attachment's own guest pages to seed a
@@ -806,7 +805,6 @@ pub fn retire_linear_residents(state: &mut DeviceState) {
         return;
     }
     let retired = std::mem::take(&mut state.retired_linear_residents);
-    // The engine that holds these pins is the Vulkan one; a `backend-metal`
     // build arms nothing that could have pinned them, so taking the list is the
     // whole of the work there.
     #[cfg(feature = "backend-vulkan")]

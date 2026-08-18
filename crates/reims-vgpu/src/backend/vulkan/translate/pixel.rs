@@ -208,7 +208,6 @@ pub fn is_srgb(mtl: u16) -> bool {
 ///
 /// Callers still choose which layouts they accept: a rail that only handles
 /// four-byte texels asks [`TexelLayout::is_four_byte_color`] rather than a
-/// narrower entry point, so this table stays the single Metal-side rule.
 pub fn sampled_pixels(
     mtl: u16,
 ) -> Result<(TexelLayout, Option<TranslateReason>, SwizzlePlan), TranslateReason> {

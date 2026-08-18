@@ -1007,7 +1007,6 @@ const _: () = assert!(
 );
 
 /// The hang trail keeps one outstanding-submission record per ring slot, and it
-/// cannot name [`RING_DEPTH`] itself: that module compiles on the Metal-direct
 /// arm too, where `backend::vulkan` does not exist. This is the only place both
 /// constants are in scope, so the relation is asserted here. A trail too short
 /// would drop exactly the slot a wedge is on and report `outstanding` as if the
@@ -1348,10 +1347,8 @@ struct ResidentSampledSlot {
     /// sampled pixels the guest never uploaded, with nothing to refuse and
     /// nothing to log. The standing argument was the birthday bound — about
     /// `2^-116` across a 64-entry cache — and that arithmetic is right and is
-    /// the wrong shape, for the reason [`crate::backend::blob`] gives for the
-    /// Metal caches it removed the same class from: it prices a failure this
-    /// device cannot observe if it ever happens, and a wider digest only moves
-    /// the exponent.
+    /// the wrong shape: it prices a failure this device cannot observe if it
+    /// ever happens, and a wider digest only moves the exponent.
     ///
     /// The cost the copy was dropped for was a "cold full-frame `memcmp` on
     /// every hit", which assumed entries are frames. A driven x86/Vulkan boot
@@ -2176,7 +2173,7 @@ const TARGET_FREE_CAP_TOTAL: usize = 32;
 /// all. The cap does not merely fail to bind; there is nothing for it to bind.
 ///
 /// That is a narrower claim than it looks. It is one workload on one pathway,
-/// and it says nothing about the arm/Metal pathway or about a guest that drives
+/// and it says nothing about a guest that drives
 /// the `else` branch in `exec.rs` — a draw with no resident target. Anyone
 /// moving this number needs a workload that reaches here first, because on the
 /// evidence available today the number is unexercised rather than adequate.

@@ -5,7 +5,6 @@
 //! Guest pages reach the host GPU by importing the host virtual address range
 //! that QEMU's RAMBlock already maps — `VK_EXT_external_memory_host` on Linux
 //! and Windows, the same extension through MoltenVK on macOS, and
-//! `newBufferWithBytesNoCopy` on the Metal-direct arm. One primitive, all three
 //! hosts. What that mechanism does *not* carry is a bound: the pointer handed to
 //! the driver is an ordinary host address, and an offset arithmetic slip past the
 //! end of the RAMBlock reaches this process's own memory — device state, our own
@@ -371,8 +370,7 @@ impl GuestRamError {
 /// `VkBuffer`, or an `MTLBuffer`) lives beside this in the backend, keyed by
 /// [`Self::id`]. This type is deliberately backend-free: the bound is pure
 /// arithmetic, and keeping it out of a backend-gated module is what lets its
-/// tests run on the Metal arm's build as well as the Vulkan one. On a Linux host
-/// nothing under `backend/metal/` runs its tests at all.
+/// target-specific modules otherwise do not run their tests at all.
 #[derive(Debug)]
 pub struct GuestRamImport {
     id: ImportId,
@@ -389,7 +387,6 @@ pub struct GuestRamImport {
     /// Bytes covered, in both address spaces. Always a multiple of `align`.
     len: u64,
     /// The backend's import granularity — `minImportedHostPointerAlignment` on
-    /// Vulkan, the host page size on Metal-direct.
     align: u64,
 }
 
@@ -399,7 +396,6 @@ impl GuestRamImport {
     /// `align` is the backend's queried import granularity, never a guessed
     /// constant: `minImportedHostPointerAlignment` from
     /// `VkPhysicalDeviceExternalMemoryHostPropertiesEXT`, or the host page size
-    /// on the Metal-direct arm. Both the base and the length must satisfy it,
     /// which is a requirement of the import call and not a preference of ours.
     ///
     /// Where the block's base does not meet it, the covered span is trimmed
@@ -718,7 +714,6 @@ impl GuestSlice {
 /// # Why this is a latch and not a parameter
 ///
 /// The granularity is measured from the GPU — `minImportedHostPointerAlignment`
-/// on Vulkan, the host page size on the Metal-direct arm — and it is needed by
 /// [`crate::runtime::guest_ram_map`], which runs on the runtime side and holds
 /// no device context. The alternative is threading a number from the backend
 /// through every decode path that might name guest memory, which is how a site

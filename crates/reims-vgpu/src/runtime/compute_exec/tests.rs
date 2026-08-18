@@ -13,10 +13,7 @@ use crate::runtime::decode::resource::{
     RESOURCE_PAGE_SHIFT,
 };
 /// Compute-pipeline descriptor constants used by the backend execute test.
-#[cfg(any(
-    feature = "backend-vulkan",
-    all(feature = "backend-metal", target_os = "macos")
-))]
+#[cfg(feature = "backend-vulkan")]
 use crate::runtime::decode::resource::{
     OBJECT_TYPE_FUNCTION, PIPELINE_TAG_KERNEL_FUNC, TYPE7_FIRST_TLVS, TYPE7_OBJECT_COMPUTE_PIPELINE,
 };
@@ -476,8 +473,8 @@ fn accum_stage_in_tg_imageblock_and_control_fail_closed() {
         matches!(
             st,
             Some(ComputeStatus::Ok)
-                | Some(ComputeStatus::NoMetal(_))
-                | Some(ComputeStatus::MetalFailed(_))
+                | Some(ComputeStatus::BackendFailed(_))
+                | Some(ComputeStatus::Unsupported(_))
         ),
         "unexpected {st:?}"
     );
@@ -709,23 +706,6 @@ fn a_compute_refusal_names_its_check_and_ok_names_nothing() {
         "compute_record reason=compute_stage_tex_type5_no_map \
              class=missing_texture pipe=7"
     );
-
-    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-    {
-        let status = crate::backend::metal::error::Status::args(
-            "metal_compute_reflection_usage_output_missing",
-        )
-        .field("capacity", 8usize);
-        let st = ComputeStatus::MetalBackend(status);
-        assert_eq!(st.class(), "metal_args");
-        assert_eq!(
-            Emit::refusal("compute_record", &st)
-                .expect("the exact Metal refusal must survive the runtime carrier")
-                .render(),
-            "compute_record reason=metal_compute_reflection_usage_output_missing \
-                 class=args capacity=8 recovery=metal_failed"
-        );
-    }
 }
 
 /// Two different buffer-staging checks, two different slugs — the property
@@ -860,11 +840,7 @@ fn dispatch_missing_pipeline() {
     // The slug names *which* pipeline check refused, and it differs by
     // backend: both arms open with `pipeline_ref == 0`, and before the
     // status carried a reason the two were indistinguishable in the log.
-    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-    assert_eq!(
-        st,
-        ComputeStatus::MissingPipeline("compute_mtl_pipeline_ref_zero")
-    );
+
     #[cfg(feature = "backend-vulkan")]
     assert_eq!(
         st,
@@ -872,11 +848,10 @@ fn dispatch_missing_pipeline() {
     );
 }
 
-/// Linux without vulkan feature: dispatch is NoMetal (census). With
-/// backend-vulkan, missing pipeline is MissingPipeline (real encode path).
+/// A dispatch reaches the Vulkan encoder while nested sessions refuse by name.
 #[test]
 #[cfg(feature = "backend-vulkan")]
-fn dispatch_nometal_with_texture_binds() {
+fn dispatch_backend_unavailable_with_texture_binds() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
@@ -908,20 +883,23 @@ fn dispatch_nometal_with_texture_binds() {
             ComputeStatus::MissingPipeline(_)
                 | ComputeStatus::MissingMtlb(_)
                 | ComputeStatus::MissingTexture(_)
-                | ComputeStatus::MetalFailed(_)
+                | ComputeStatus::BackendFailed(_)
                 | ComputeStatus::Unsupported(_)
         ),
         "vulkan path attempts encode, got {st:?}"
     );
-    // Nested short-circuit remains NoMetal on Linux (SPI not wired).
+    // Nested sessions are decoded but not implemented.
     let mut session = crate::runtime::compute_session::ComputeSession { control_depth: 0 };
     let st2 = execute_dispatch_nested(&mut state, &mut host, 1, &acc, &cmd, &mut session);
-    assert_eq!(st2, ComputeStatus::NoMetal("compute_nested_no_vulkan_path"));
+    assert_eq!(
+        st2,
+        ComputeStatus::Unsupported("compute_nested_session_unimplemented")
+    );
 }
 
 #[test]
 #[cfg(feature = "backend-vulkan")]
-fn dispatch_missing_pipeline_not_nometal() {
+fn dispatch_missing_pipeline_not_backend_unavailable() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
@@ -947,76 +925,7 @@ fn dispatch_missing_pipeline_not_nometal() {
 /// it came from. The assertions below are on the line's shape, so a fourth
 /// spelling has to fail here before it can reach the log.
 #[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn a_format_with_no_storage_selector_refuses_the_same_way_from_every_rail() {
-    use crate::runtime::compute_exec::{split_staged_textures, ComputeStatus, StagedTexture};
-
-    let mut no_selector = StagedTexture {
-        binding: 33,
-        texture_ref: 44,
-        // A sample-only format: `contract::pixel_format::storage_selector` has
-        // no entry for it by design, which is exactly the class this refuses.
-        pixel_format: crate::contract::pixel_format::MTL_FORMAT_R32_FLOAT,
-        storage_selector: None,
-        width: 4,
-        height: 4,
-        bytes: vec![0; 64],
-        is_storage: true,
-        #[cfg(feature = "backend-vulkan")]
-        residency: None,
-        #[cfg(feature = "backend-vulkan")]
-        seed_skipped: false,
-        #[cfg(feature = "backend-vulkan")]
-        sample_resident: None,
-        writeback: TextureWriteback::None,
-    };
-
-    assert_eq!(
-        no_selector.storage_selector_or_refuse(7, 9),
-        Err(ComputeStatus::Unsupported("compute_no_backend_selector")),
-        "the refusal slug is one string, not one per rail"
-    );
-    assert_eq!(
-        split_staged_textures(std::slice::from_mut(&mut no_selector), 7, 9).err(),
-        Some(ComputeStatus::Unsupported("compute_no_backend_selector")),
-        "the split refuses through the same helper, not a second copy of it"
-    );
-
-    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
-    let line = log
-        .lines()
-        .rev()
-        .find(|l| l.starts_with("compute_texture_format "))
-        .expect("a lost bind must name itself");
-    for field in [
-        "reason=no_backend_selector",
-        "task=7",
-        "pipe=9",
-        "bind=33",
-        "ref=44",
-        "storage=1",
-    ] {
-        assert!(
-            line.contains(field),
-            "the line must carry {field}; one of the three copies dropped it: {line}"
-        );
-    }
-
-    // And a format that does have a selector goes through.
-    let mut ok = StagedTexture {
-        storage_selector: Some(pixel_format::StorageImageSelector::Rgba8Unorm),
-        ..no_selector
-    };
-    let (storage, sampled) =
-        split_staged_textures(std::slice::from_mut(&mut ok), 7, 9).expect("selector present");
-    assert_eq!((storage.len(), sampled.len()), (1, 0));
-}
-
-#[test]
-#[cfg(any(
-    feature = "backend-vulkan",
-    all(feature = "backend-metal", target_os = "macos")
-))]
+#[cfg(feature = "backend-vulkan")]
 fn dispatch_buffer_kernel_mul3add1() {
     use std::path::PathBuf;
     let mtlb_paths = [
@@ -1116,7 +1025,7 @@ fn dispatch_buffer_kernel_mul3add1() {
         matches!(
             st,
             ComputeStatus::Ok
-                | ComputeStatus::MetalFailed(_)
+                | ComputeStatus::BackendFailed(_)
                 | ComputeStatus::BadGrid(_)
                 | ComputeStatus::Unsupported(_)
         ),
@@ -1155,14 +1064,13 @@ fn dispatch_missing_texture_fails() {
     cmd.grid = compute::Size3 { x: 1, y: 1, z: 1 };
     cmd.threads_per_threadgroup = compute::Size3 { x: 1, y: 1, z: 1 };
     // Missing pipeline object → MissingPipeline before texture stage.
-    // Non-Apple metal stubs short-circuit to NoMetal (Linux product).
     let st = execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
     assert!(matches!(
         st,
         ComputeStatus::MissingPipeline(_)
             | ComputeStatus::MissingTexture(_)
-            | ComputeStatus::MetalFailed(_)
-            | ComputeStatus::NoMetal(_)
+            | ComputeStatus::BackendFailed(_)
+            | ComputeStatus::Unsupported(_)
     ));
 }
 
@@ -1645,8 +1553,7 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
         array_element: 0,
         #[cfg(feature = "backend-vulkan")]
         descriptor_count: 1,
-        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-        texture_ref: 44,
+
         pixel_format: MTL_FORMAT_RGBA8_UNORM,
         storage_selector: Some(pixel_format::StorageImageSelector::Rgba8Unorm),
         width: 2,
@@ -2350,7 +2257,6 @@ fn a_staged_buffer_carries_the_pages_its_writeback_is_bounded_to() {
 /// the GVA licence and put 91 % of the class back on the readback rail.
 ///
 /// Vulkan-only: the direct arm is a `VK_EXT_external_memory_host` import, and
-/// `StagedTexture` does not carry a residency candidate on the Metal arm at all.
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
@@ -2377,8 +2283,7 @@ fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
         array_element: 0,
         #[cfg(feature = "backend-vulkan")]
         descriptor_count: 1,
-        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-        texture_ref: 44,
+
         pixel_format: MTL_FORMAT_RGBA8_UNORM,
         storage_selector: Some(pixel_format::StorageImageSelector::Rgba8Unorm),
         width: 2,
@@ -2662,11 +2567,8 @@ fn a_resident_answer_is_a_seed_or_a_sample_and_never_both() {
 ///
 /// `WRITE_DESCRIPTOR` puts this ordinal on the wire unbounded: the decoder
 /// stores `d.dispatch_type.get()` with no range check, so whatever the guest
-/// wrote reaches the accumulator. What used to happen next was
-/// `if x == CONCURRENT { CONCURRENT } else { SERIAL }`, at the far end of the
-/// rail inside `execute_dispatch_metal` — so a guest asking for a dispatch type
-/// this device has no contract for got a *serial* encoder, silently, on the one
-/// arm that read the field at all.
+/// wrote reaches the accumulator. An unknown value must be reported before the
+/// compatibility substitution to `Serial`.
 ///
 /// Both halves are the test. A substitution nobody can see is the failure this
 /// commit exists to end; a line spent on the ordinary `Serial` and `Concurrent`
@@ -2813,8 +2715,7 @@ fn a_heap_texture_mirror_outlives_the_per_mapping_cap() {
         array_element: 0,
         #[cfg(feature = "backend-vulkan")]
         descriptor_count: 1,
-        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-        texture_ref: key.texture_ref,
+
         pixel_format: key.pixel_format,
         storage_selector: Some(pixel_format::StorageImageSelector::Rgba8Uint),
         width: key.width,

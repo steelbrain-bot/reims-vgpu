@@ -60,7 +60,7 @@
 //! **The rest of the second class, and all of the third, still read zero on
 //! archived boots of this rig** — x86/PCI/Vulkan, driven under the window-drag
 //! and web-content probes as well as idle. For the second, each names a real
-//! Metal feature this workload does not reach, which is the reading that makes
+//! guest feature this workload does not reach, which is the reading that makes
 //! leaving them open a measurement rather than a bet. For the third the zero is
 //! structural on this
 //! rig and says less: no host here declines a three-component vertex format, so

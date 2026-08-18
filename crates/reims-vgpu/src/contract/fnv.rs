@@ -3,15 +3,10 @@
 //! # Why a backend-neutral home
 //!
 //! Several places in this crate fold with FNV-1a, and only one family of them
-//! is a backend: the sampled gather witness names a window with it, the panic
+//! is backend-adjacent: the sampled gather witness names a window with it, the panic
 //! latch folds an entry point and its raise site into the discriminant it
-//! dedupes on, and the Metal backend's compiled-object caches key shaders and
-//! descriptors with it. The constants used to be declared inside the Metal
-//! backend's own hash module, behind `feature = "backend-metal"` — so the sites
-//! outside it *could not* name them even if their authors had looked, and wrote
-//! the basis and the prime out as literals instead. (That module is
-//! [`crate::backend::hash`] now, and ungated, for a different reason its own doc
-//! gives.)
+//! dedupes on, and the shader pipeline indexes use the same fold. Keeping the
+//! published constants here prevents those sites from restating them as literals.
 //!
 //! They wrote them out in different shapes. Before this module existed the
 //! basis appeared as `0xcbf2_9ce4_8422_2325` at three sites and as

@@ -19,8 +19,7 @@ use crate::runtime::decode::resource::{
 /// The table used to stop at 14 and its test asserted 15 as "past the end".
 /// It is not: `MTLRenderPipeline.h` on the macOS 26 SDK runs to
 /// `MTLBlendFactorOneMinusSource1Alpha = 18`, so 14 is the fifteenth of
-/// nineteen and the four dual-source factors were refused device-wide, on this
-/// arm and on the Metal one, with both claiming to cover the SDK range.
+/// nineteen, so the four dual-source factors were refused device-wide.
 ///
 /// 15-18 are the dual-source factors, which read the fragment shader's second
 /// colour output. Vulkan spells them `SRC1_*` and gates them behind
