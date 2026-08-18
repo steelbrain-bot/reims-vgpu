@@ -1543,6 +1543,7 @@ mod tests {
                     generation: 9,
                 },
             ),
+            content: None,
         }
     }
     fn resident_sample_key() -> StorageImageKey {
@@ -1670,6 +1671,7 @@ mod tests {
                 width: 1,
                 height: 1,
                 source: super::super::types::ComputeSampledImageSource::Bytes(vec![0; 4]),
+                content: None,
             }],
             samplers: vec![SamplerResource::normalized_default(64)],
             storage_images: vec![ComputeStorageImageResource {

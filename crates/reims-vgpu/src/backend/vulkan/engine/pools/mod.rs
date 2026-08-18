@@ -3016,6 +3016,7 @@ mod sampled_key_tests {
             one_dim,
             multisampled: false,
             source: SampledSource::Bytes(std::sync::Arc::new(Vec::new())),
+            content: None,
             byte_origin: Default::default(),
             format: ash::vk::Format::R8G8B8A8_UNORM,
             identity: None,

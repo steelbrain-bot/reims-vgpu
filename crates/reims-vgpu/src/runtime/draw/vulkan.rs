@@ -6508,6 +6508,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     one_dim,
                     multisampled,
                     source,
+                    content: texture_resource.as_ref().and_then(|resource| {
+                        state.task_resources.content_stamp_for(resource.as_ref())
+                    }),
                     byte_origin,
                     format: sampled_vk_format,
                     identity: bytes_identity.map(|i| {
@@ -6622,6 +6625,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 source: crate::backend::vulkan::engine::SampledSource::Bytes(std::sync::Arc::new(
                     crate::contract::pixel_format::solid_rgba8(1, 1, &[0.0; 4]),
                 )),
+                content: None,
                 byte_origin: crate::backend::vulkan::engine::SampledByteOrigin::Synthetic,
                 format: ash::vk::Format::R8G8B8A8_UNORM,
                 identity: None,
@@ -7863,6 +7867,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         let has_target_identity = resources.target_identity.is_some();
         let receipt =
             crate::runtime::executor::execute_draw(executor.as_ref(), submission, resources)?;
+        state
+            .task_resources
+            .record_gpu_materializations(receipt.gpu_materialized.iter().copied());
         let completed_submission = receipt.submission.id;
         let out = receipt.output;
         if has_target_identity {

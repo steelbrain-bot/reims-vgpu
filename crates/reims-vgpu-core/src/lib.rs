@@ -19,8 +19,9 @@ pub use execution::{
 pub use namespace::{NamespaceError, ReferenceNamespace};
 pub use residency::{ResidentContentBacking, ResidentLease};
 pub use resource::{
-    ContentAuthority, ContentError, ContentState, GraphError, LifecycleState, MappingNode,
-    PendingContentWrite, ReplicaVersions, ResourceGraph, ResourceNode, StorageBacking, StorageNode,
+    ContentAuthority, ContentError, ContentStamp, ContentState, GraphError, LifecycleState,
+    MappingNode, PendingContentWrite, ReplicaVersions, ResourceGraph, ResourceNode, StorageBacking,
+    StorageNode,
 };
 pub use service::{
     GuestWriteReach, GuestWriteService, ResidentContent, ResidentReclaim, ResidentService,

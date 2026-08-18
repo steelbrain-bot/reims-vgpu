@@ -10,6 +10,13 @@ use std::sync::{Arc, Mutex};
 
 type AnyResourceId = ResourceId<ResourceObject>;
 
+/// Exact semantic content represented by one executor operand or effect.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ContentStamp {
+    pub resource: ResourceId<ResourceObject>,
+    pub version: ContentVersion,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LifecycleState {
     Created,
@@ -140,6 +147,20 @@ impl ContentState {
         Ok(())
     }
 
+    /// Record that an executor materialized this exact current version.
+    ///
+    /// Unlike [`Self::copy_guest_to_gpu_completed`], the source replica is
+    /// already established by the stamped operand.  The version check is the
+    /// authority: a completion for content superseded since submission cannot
+    /// make the stale GPU replica current.
+    pub fn gpu_materialized(&mut self, version: ContentVersion) -> Result<(), ContentError> {
+        if self.current != version {
+            return Err(ContentError::StaleSource);
+        }
+        self.replicas.gpu = Some(version);
+        Ok(())
+    }
+
     pub fn current_in_guest(&self) -> bool {
         self.replicas.guest == Some(self.current)
     }
@@ -234,6 +255,13 @@ impl ContentAuthority {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .copy_gpu_to_guest_completed(version)
+    }
+
+    pub fn gpu_materialized(&self, version: ContentVersion) -> Result<(), ContentError> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .gpu_materialized(version)
     }
 }
 
@@ -862,6 +890,22 @@ mod tests {
             .copy_gpu_to_guest_completed(planned.version)
             .unwrap();
         assert!(content.current_in_guest());
+    }
+
+    #[test]
+    fn a_stamped_materialization_cannot_revive_superseded_content() {
+        let mut content = ContentState::default();
+        let submitted = content.current;
+        let newer = content.guest_wrote().unwrap();
+
+        assert_eq!(
+            content.gpu_materialized(submitted),
+            Err(ContentError::StaleSource)
+        );
+        assert_eq!(content.current, newer);
+        assert!(!content.current_in_gpu());
+        assert_eq!(content.gpu_materialized(newer), Ok(()));
+        assert!(content.current_in_gpu());
     }
 
     #[test]

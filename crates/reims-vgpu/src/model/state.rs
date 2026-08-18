@@ -1070,6 +1070,44 @@ impl TaskResources {
         Some((id, registry.graph.resource(id)?.content.current()))
     }
 
+    /// Snapshot content through an already resolved task resource.
+    pub fn content_stamp_for(
+        &self,
+        resource: &TaskResource,
+    ) -> Option<reims_vgpu_core::ContentStamp> {
+        let id = resource.semantic_id()?;
+        let registry = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Some(reims_vgpu_core::ContentStamp {
+            resource: id,
+            version: registry.graph.resource(id)?.content.current(),
+        })
+    }
+
+    /// Apply persistent GPU materializations returned by a successful executor
+    /// completion. Stale stamps are ignored: a newer guest write remains the
+    /// sole current version and the old GPU copy cannot regain authority.
+    pub fn record_gpu_materializations(
+        &self,
+        stamps: impl IntoIterator<Item = reims_vgpu_core::ContentStamp>,
+    ) -> usize {
+        let registry = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        stamps
+            .into_iter()
+            .filter(|stamp| {
+                registry
+                    .graph
+                    .resource(stamp.resource)
+                    .is_some_and(|node| node.content.gpu_materialized(stamp.version).is_ok())
+            })
+            .count()
+    }
+
     /// Apply a completed GPU Store to the resource version state.
     ///
     /// The current executor reports render operations synchronously. Reserving
@@ -1445,6 +1483,34 @@ mod task_resource_graph_tests {
 
         assert_eq!(snapshot[0], (ObjectRef::new(9), Some(id), Some(version)));
         resources.complete_submission(SubmissionId::new(1), [id]);
+    }
+
+    #[test]
+    fn executor_materialization_applies_only_to_the_exact_stamped_version() {
+        let resources = TaskResources::default();
+        let resource = resources.register(4, 9, resource(ObjectKind::Texture));
+        let stale = resources.content_stamp_for(resource.as_ref()).unwrap();
+        let current = resources.note_guest_write(4, 9).unwrap();
+
+        assert_eq!(resources.record_gpu_materializations([stale]), 0);
+        assert!(!resources
+            .resource_node(stale.resource)
+            .unwrap()
+            .content
+            .snapshot()
+            .current_in_gpu());
+
+        let current = reims_vgpu_core::ContentStamp {
+            resource: stale.resource,
+            version: current,
+        };
+        assert_eq!(resources.record_gpu_materializations([current]), 1);
+        assert!(resources
+            .resource_node(current.resource)
+            .unwrap()
+            .content
+            .snapshot()
+            .current_in_gpu());
     }
 
     #[test]

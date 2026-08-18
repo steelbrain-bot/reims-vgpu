@@ -1045,6 +1045,9 @@ pub struct SampledImageResource {
     /// cannot be uploaded into one with a buffer-to-image copy.
     pub multisampled: bool,
     pub source: SampledSource,
+    /// Canonical content represented by a persistent upload, when this source
+    /// came from a resolved guest resource rather than synthetic bytes.
+    pub content: Option<reims_vgpu_core::ContentStamp>,
     /// API resource family that produced [`SampledSource::Bytes`].
     ///
     /// This is accounting metadata, not an execution selector: it cannot change
@@ -1650,6 +1653,7 @@ pub struct ComputeSampledImageResource {
     pub width: u32,
     pub height: u32,
     pub source: ComputeSampledImageSource,
+    pub content: Option<reims_vgpu_core::ContentStamp>,
 }
 
 #[derive(Debug)]

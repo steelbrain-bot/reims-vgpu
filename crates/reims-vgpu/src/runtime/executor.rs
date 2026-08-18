@@ -506,18 +506,50 @@ impl ExecutionPort for VulkanExecutor {
         let _scope = self.enter();
         match submission {
             ResolvedSubmission::Draw { context, request } => {
+                let gpu_materialized: std::sync::Arc<[reims_vgpu_core::ContentStamp]> = request
+                    .sampled_images
+                    .iter()
+                    .filter(|image| {
+                        matches!(
+                            &image.source,
+                            crate::backend::vulkan::engine::SampledSource::Bytes(_)
+                                | crate::backend::vulkan::engine::SampledSource::GuestRuns(..)
+                        )
+                    })
+                    .filter_map(|image| image.content)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .into();
                 crate::backend::vulkan::engine::execute_draw_request(&request).map(|output| {
                     ExecutionCompletion {
                         submission: context.identity,
                         output: ExecutionOutput::Draw(output),
+                        gpu_materialized,
                     }
                 })
             }
             ResolvedSubmission::Compute { context, request } => {
+                let gpu_materialized: std::sync::Arc<[reims_vgpu_core::ContentStamp]> = request
+                    .sampled_images
+                    .iter()
+                    .filter(|image| {
+                        matches!(
+                            &image.source,
+                            crate::backend::vulkan::engine::ComputeSampledImageSource::Bytes(_)
+                                | crate::backend::vulkan::engine::ComputeSampledImageSource::GuestPages(_)
+                        )
+                    })
+                    .filter_map(|image| image.content)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .into();
                 crate::backend::vulkan::engine::execute_compute_request(&request).map(|output| {
                     ExecutionCompletion {
                         submission: context.identity,
                         output: ExecutionOutput::Compute(output),
+                        gpu_materialized,
                     }
                 })
             }
@@ -550,6 +582,7 @@ pub fn execute_draw(
         ExecutionOutput::Draw(output) => Ok(ExecutionReceipt {
             submission: completion.submission,
             output,
+            gpu_materialized: completion.gpu_materialized,
         }),
         other => Err(DrawError::Facade(
             EngineFacadeDecline::ExecutorCompletionKindMismatch {
@@ -585,6 +618,7 @@ pub fn execute_compute(
         ExecutionOutput::Compute(output) => Ok(ExecutionReceipt {
             submission: completion.submission,
             output,
+            gpu_materialized: completion.gpu_materialized,
         }),
         other => Err(DrawError::Facade(
             EngineFacadeDecline::ExecutorCompletionKindMismatch {
@@ -707,6 +741,7 @@ mod tests {
                         ExecutionOutput::Compute(ComputeOutput::default())
                     }
                 },
+                gpu_materialized: Arc::from([]),
             })
         }
     }
@@ -890,6 +925,7 @@ mod tests {
                     task,
                 },
                 output: ExecutionOutput::Draw(DrawOutput::default()),
+                gpu_materialized: Arc::from([]),
             })
         }
     }

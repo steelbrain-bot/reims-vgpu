@@ -4364,6 +4364,10 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 width: t.width,
                 height: t.height,
                 source,
+                content: state
+                    .task_resources
+                    .content_stamp(task_id, t.resource_ref)
+                    .map(|(resource, version)| reims_vgpu_core::ContentStamp { resource, version }),
             });
         }
     }
@@ -4411,6 +4415,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                     &[0.0; 4],
                 ),
             ),
+            content: None,
         });
     }
 
@@ -4503,7 +4508,12 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     };
     let out_result = run_engine(req);
     let (completed_submission, out) = match out_result {
-        Ok(receipt) => (receipt.submission.id, receipt.output),
+        Ok(receipt) => {
+            state
+                .task_resources
+                .record_gpu_materializations(receipt.gpu_materialized.iter().copied());
+            (receipt.submission.id, receipt.output)
+        }
         Err(e) => {
             let unsupported = matches!(&e, DrawError::Unsupported(_));
             crate::observe::Emit::decline("compute_linux_engine", &e)

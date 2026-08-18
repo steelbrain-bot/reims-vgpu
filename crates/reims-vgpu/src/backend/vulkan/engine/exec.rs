@@ -6989,6 +6989,7 @@ mod tests {
                     // the gather is the only disposition this fixture can take.
                     crate::runtime::gather_witness::GatherVouch::Fresh,
                 ),
+                content: None,
                 byte_origin: Default::default(),
                 format: crate::backend::vulkan::translate::pixel::vk_texel_layout(
                     crate::contract::pixel_format::TexelLayout::Bgra8,
@@ -7070,6 +7071,7 @@ mod tests {
             one_dim: false,
             multisampled: false,
             source: SampledSource::Target(identity),
+            content: None,
             byte_origin: Default::default(),
             format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
             identity: None,

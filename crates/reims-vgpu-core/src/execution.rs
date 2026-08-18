@@ -6,7 +6,7 @@
 //! completion identity belong to the semantic core; a backend supplies only
 //! its operation payload and result types.
 
-use crate::SubmissionContext;
+use crate::{ContentStamp, SubmissionContext};
 use reims_vgpu_protocol::SubmissionIdentity;
 
 /// One fully owned operation accepted by an execution backend.
@@ -68,6 +68,8 @@ impl<Draw, Compute> ExecutionOutput<Draw, Compute> {
 pub struct ExecutionCompletion<Output> {
     pub submission: SubmissionIdentity,
     pub output: Output,
+    /// Current semantic versions materialized as persistent GPU replicas.
+    pub gpu_materialized: std::sync::Arc<[ContentStamp]>,
 }
 
 /// Validated completion identity paired with its operation-specific output.
@@ -75,6 +77,7 @@ pub struct ExecutionCompletion<Output> {
 pub struct ExecutionReceipt<Output> {
     pub submission: SubmissionIdentity,
     pub output: Output,
+    pub gpu_materialized: std::sync::Arc<[ContentStamp]>,
 }
 
 /// The core-owned submission/completion boundary implemented by a backend.
@@ -120,6 +123,7 @@ mod tests {
                 task: TaskId::new(3),
             },
             output: ExecutionOutput::<u32, ()>::Draw(17),
+            gpu_materialized: std::sync::Arc::from([]),
         };
 
         assert_eq!(completion.output.kind(), ExecutionKind::Draw);
