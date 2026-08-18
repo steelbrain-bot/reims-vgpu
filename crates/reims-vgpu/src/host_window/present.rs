@@ -3,7 +3,7 @@
 //!
 //! This file owns the window and the event loop. The surface, the swapchain and
 //! the acquire → clear/blit → present sequence live in
-//! [`crate::backend::vulkan::engine::window_present`], on the device that
+//! the executor's window-presentation service, on the device that
 //! rendered the frame; this file drives them and decides *when* to present. It
 //! also translates window input via [`super::input_map`] and hands each
 //! [`HostAction`] to the [`InputSink`] (the device wires that to the prompt
@@ -115,7 +115,7 @@ const ENGINE_WINDOW_REDRAW_BACKSTOP: std::time::Duration =
 /// logged `host_window_reattach status=ok attempt=3`, spent the budget, and sat
 /// out every later loss with the picture gone — which is most of the defect the
 /// re-attach exists to remove, reintroduced by its own bound.
-const MAX_ENGINE_REATTACHES: u32 = crate::backend::vulkan::engine::MAX_DEVICE_RECREATES;
+const MAX_ENGINE_REATTACHES: u32 = crate::runtime::executor::MAX_WINDOW_REATTACHES;
 /// How long a guest-driven native resize request may stay unmatched by a
 /// winit `Resized` event before the always-on alarm names it. Live requests
 /// apply within single-digit milliseconds; one second means the window system
@@ -306,8 +306,8 @@ impl WindowWaker {
 /// rendered into. `bgra` is empty on presents the device elided the readback
 /// for, and the presenter rejects a short buffer rather than blitting a torn
 /// frame.
-fn window_cpu_frame(frame: &Frame) -> crate::backend::vulkan::engine::WindowCpuFrame<'_> {
-    crate::backend::vulkan::engine::WindowCpuFrame {
+fn window_cpu_frame(frame: &Frame) -> crate::runtime::executor::WindowCpuFrame<'_> {
+    crate::runtime::executor::WindowCpuFrame {
         bgra: &frame.bgra,
         width: frame.width,
         height: frame.height,
@@ -609,7 +609,7 @@ pub fn run(
     let _scope = executor.enter();
     let event_loop = build_event_loop()?;
     wake.arm(event_loop.create_proxy());
-    let mut app = App::new(config, on_input, frames, stop);
+    let mut app = App::new(executor, config, on_input, frames, stop);
     event_loop
         .run_app(&mut app)
         .map_err(|e| WindowError::RunApp(e.to_string()))
@@ -658,7 +658,7 @@ pub fn start_main_thread(
         }
         let event_loop = build_event_loop()?;
         wake.arm(event_loop.create_proxy());
-        let app = App::new(config, on_input, frames, stop);
+        let app = App::new(executor.clone(), config, on_input, frames, stop);
         let engine_scope = executor.enter();
         *slot = Some(MainThreadWindow {
             id,
@@ -721,6 +721,7 @@ fn build_event_loop() -> Result<EventLoop<FramePublished>, WindowError> {
 }
 
 struct App {
+    executor: std::sync::Arc<dyn crate::runtime::executor::Executor>,
     config: WindowConfig,
     on_input: InputSink,
     frames: FrameSlot,
@@ -886,7 +887,7 @@ impl ApplicationHandler<FramePublished> for App {
                 return;
             }
         };
-        match Self::attach_engine(&window) {
+        match self.attach_engine(&window) {
             Ok(()) => {
                 self.engine_attached = true;
                 // Kick the first frame; RedrawRequested re-arms each subsequent
@@ -941,7 +942,7 @@ impl ApplicationHandler<FramePublished> for App {
             WindowEvent::Resized(size) => {
                 let applied = (size.width.max(1), size.height.max(1));
                 if self.engine_attached {
-                    crate::backend::vulkan::engine::window_present_resize(applied.0, applied.1);
+                    self.executor.resize_window_presenter(applied.0, applied.1);
                     self.note_guest_resize_applied(applied);
                 }
                 // Fresh swapchain images hold nothing; the seq gate would
@@ -994,7 +995,7 @@ impl ApplicationHandler<FramePublished> for App {
         // takes the presenter — the engine's own device-loss flush — did not
         // know to.
         if self.engine_attached {
-            crate::backend::vulkan::engine::window_present_detach();
+            self.executor.detach_window_presenter();
             self.engine_attached = false;
         }
         self.window = None;
@@ -1080,8 +1081,15 @@ impl App {
     /// `start_main_thread` on macOS's main thread — and every field but the
     /// four they are given is fixed. Written out at each site, a field added
     /// to the struct could be initialised in one and missed in the other.
-    fn new(config: WindowConfig, on_input: InputSink, frames: FrameSlot, stop: StopFlag) -> Self {
+    fn new(
+        executor: std::sync::Arc<dyn crate::runtime::executor::Executor>,
+        config: WindowConfig,
+        on_input: InputSink,
+        frames: FrameSlot,
+        stop: StopFlag,
+    ) -> Self {
         Self {
+            executor,
             config,
             on_input,
             frames,
@@ -1168,7 +1176,7 @@ impl App {
     /// window that already exists. `window_present_attach` is idempotent — it
     /// returns `Ok` if a presenter is already there — so calling it twice is
     /// safe, and it is the engine that publishes the attached flag.
-    fn attach_engine(window: &Arc<Window>) -> Result<(), WindowError> {
+    fn attach_engine(&self, window: &Arc<Window>) -> Result<(), WindowError> {
         let display = window
             .display_handle()
             .map_err(|error| WindowError::AttachDisplayHandle(error.to_string()))?
@@ -1178,13 +1186,9 @@ impl App {
             .map_err(|error| WindowError::AttachWindowHandle(error.to_string()))?
             .as_raw();
         let size = window.inner_size();
-        crate::backend::vulkan::engine::window_present_attach(
-            display,
-            handle,
-            size.width.max(1),
-            size.height.max(1),
-        )
-        .map_err(|error| WindowError::AttachEngine(error.to_string()))
+        self.executor
+            .attach_window_presenter(display, handle, size.width.max(1), size.height.max(1))
+            .map_err(|error| WindowError::AttachEngine(error.to_string()))
     }
 
     /// Rebuild the presenter after the engine device was lost and recreated.
@@ -1215,7 +1219,7 @@ impl App {
             return;
         }
         self.engine_reattempts += 1;
-        match Self::attach_engine(&window) {
+        match self.attach_engine(&window) {
             Ok(()) => {
                 // The presenter is new, so nothing on screen came from it and
                 // the sequence this loop last presented is not its history.
@@ -1275,13 +1279,13 @@ impl App {
             return;
         }
         self.loop_census.draws_fresh += 1;
-        let result = crate::backend::vulkan::engine::window_present_frame(
+        let result = self.executor.present_window_frame(
             frame.as_ref().and_then(|frame| frame.resident.as_ref()),
             frame.as_deref().map(window_cpu_frame),
         );
         match result {
-            Ok(crate::backend::vulkan::engine::WindowPresentOutcome::Busy) => {}
-            Ok(crate::backend::vulkan::engine::WindowPresentOutcome::Presented {
+            Ok(crate::runtime::executor::WindowPresentOutcome::Busy) => {}
+            Ok(crate::runtime::executor::WindowPresentOutcome::Presented {
                 direct,
                 width,
                 height,
@@ -1340,12 +1344,7 @@ impl App {
                 // presenter's own: it says the presenter is *gone*, which on a
                 // running window means a device loss destroyed it. See
                 // [`Self::reattach_engine`].
-                if matches!(
-                    error,
-                    crate::backend::vulkan::engine::DrawError::Facade(
-                        crate::backend::vulkan::engine::EngineFacadeDecline::WindowPresenterNotAttached
-                    )
-                ) {
+                if crate::runtime::executor::window_presenter_was_detached(&error) {
                     self.reattach_engine();
                 }
             }
@@ -1393,7 +1392,7 @@ impl App {
         if let Some(applied) = immediate {
             // Applied synchronously — winit emits no later `Resized` for it.
             let applied = (applied.width.max(1), applied.height.max(1));
-            crate::backend::vulkan::engine::window_present_resize(applied.0, applied.1);
+            self.executor.resize_window_presenter(applied.0, applied.1);
             self.engine_redraw_required = true;
             self.note_guest_resize_applied(applied);
         }

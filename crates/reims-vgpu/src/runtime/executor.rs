@@ -43,6 +43,75 @@ pub type ExecutionCompletion = reims_vgpu_core::ExecutionCompletion<Box<[Executi
 pub type ExecutionReceipt<T> = reims_vgpu_core::ExecutionReceipt<T>;
 pub type StampAnnounce = std::sync::Arc<dyn Fn(u32) + Send + Sync>;
 
+#[cfg(feature = "host-window")]
+#[derive(Clone, Copy, Debug)]
+pub struct WindowCpuFrame<'a> {
+    pub bgra: &'a [u8],
+    pub width: u32,
+    pub height: u32,
+    pub seq: u64,
+}
+
+#[cfg(feature = "host-window")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowPresentOutcome {
+    Busy,
+    Presented {
+        direct: bool,
+        width: u32,
+        height: u32,
+        swapchain_images: usize,
+        suboptimal: bool,
+    },
+}
+
+/// Native-window lifecycle and presentation owned by one executor session.
+pub trait WindowPresentationService: std::fmt::Debug + Send + Sync {
+    #[cfg(feature = "host-window")]
+    fn attach_window_presenter(
+        &self,
+        _display: raw_window_handle::RawDisplayHandle,
+        _window: raw_window_handle::RawWindowHandle,
+        _width: u32,
+        _height: u32,
+    ) -> Result<(), DrawError> {
+        Err(DrawError::Facade(
+            EngineFacadeDecline::ExecutorServiceUnavailable {
+                service: "window_present_attach",
+            },
+        ))
+    }
+
+    #[cfg(feature = "host-window")]
+    fn resize_window_presenter(&self, _width: u32, _height: u32) {}
+
+    #[cfg(feature = "host-window")]
+    fn present_window_frame(
+        &self,
+        _source: Option<&reims_vgpu_core::PresentationSource>,
+        _cpu: Option<WindowCpuFrame<'_>>,
+    ) -> Result<WindowPresentOutcome, DrawError> {
+        Err(DrawError::Facade(
+            EngineFacadeDecline::ExecutorServiceUnavailable {
+                service: "window_present_frame",
+            },
+        ))
+    }
+
+    #[cfg(feature = "host-window")]
+    fn detach_window_presenter(&self) {}
+}
+
+#[cfg(feature = "host-window")]
+pub const MAX_WINDOW_REATTACHES: u32 = crate::backend::vulkan::engine::MAX_DEVICE_RECREATES;
+
+pub fn window_presenter_was_detached(error: &DrawError) -> bool {
+    matches!(
+        error,
+        DrawError::Facade(EngineFacadeDecline::WindowPresenterNotAttached)
+    )
+}
+
 /// Compatibility port for transfers and synchronization involving guest RAM.
 ///
 /// Its concrete reference types remain runtime-owned during the migration, but
@@ -184,6 +253,7 @@ pub trait Executor:
     + MaintenanceService
     + SessionService
     + ObservationService
+    + WindowPresentationService
 {
 }
 
@@ -488,6 +558,63 @@ impl PresentationService for VulkanExecutor {
         return crate::backend::vulkan::engine::window_present_attached();
         #[cfg(not(feature = "host-window"))]
         false
+    }
+}
+
+impl WindowPresentationService for VulkanExecutor {
+    #[cfg(feature = "host-window")]
+    fn attach_window_presenter(
+        &self,
+        display: raw_window_handle::RawDisplayHandle,
+        window: raw_window_handle::RawWindowHandle,
+        width: u32,
+        height: u32,
+    ) -> Result<(), DrawError> {
+        crate::backend::vulkan::engine::window_present_attach(display, window, width, height)
+    }
+
+    #[cfg(feature = "host-window")]
+    fn resize_window_presenter(&self, width: u32, height: u32) {
+        crate::backend::vulkan::engine::window_present_resize(width, height);
+    }
+
+    #[cfg(feature = "host-window")]
+    fn present_window_frame(
+        &self,
+        source: Option<&reims_vgpu_core::PresentationSource>,
+        cpu: Option<WindowCpuFrame<'_>>,
+    ) -> Result<WindowPresentOutcome, DrawError> {
+        let cpu = cpu.map(|cpu| crate::backend::vulkan::engine::WindowCpuFrame {
+            bgra: cpu.bgra,
+            width: cpu.width,
+            height: cpu.height,
+            seq: cpu.seq,
+        });
+        crate::backend::vulkan::engine::window_present_frame(source, cpu).map(|outcome| {
+            match outcome {
+                crate::backend::vulkan::engine::WindowPresentOutcome::Busy => {
+                    WindowPresentOutcome::Busy
+                }
+                crate::backend::vulkan::engine::WindowPresentOutcome::Presented {
+                    direct,
+                    width,
+                    height,
+                    swapchain_images,
+                    suboptimal,
+                } => WindowPresentOutcome::Presented {
+                    direct,
+                    width,
+                    height,
+                    swapchain_images,
+                    suboptimal,
+                },
+            }
+        })
+    }
+
+    #[cfg(feature = "host-window")]
+    fn detach_window_presenter(&self) {
+        crate::backend::vulkan::engine::window_present_detach();
     }
 }
 
@@ -890,6 +1017,7 @@ mod tests {
     }
 
     impl PresentationService for ScriptedExecutor {}
+    impl WindowPresentationService for ScriptedExecutor {}
     impl GuestMemoryService for ScriptedExecutor {}
     impl MaintenanceService for ScriptedExecutor {}
     impl ObservationService for ScriptedExecutor {}
@@ -1123,6 +1251,7 @@ mod tests {
 
     impl CapabilityService for WrongIdentityExecutor {}
     impl PresentationService for WrongIdentityExecutor {}
+    impl WindowPresentationService for WrongIdentityExecutor {}
     impl GuestMemoryService for WrongIdentityExecutor {}
     impl MaintenanceService for WrongIdentityExecutor {}
     impl ObservationService for WrongIdentityExecutor {}

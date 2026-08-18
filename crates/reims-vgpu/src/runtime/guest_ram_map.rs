@@ -793,6 +793,7 @@ mod tests {
 
     impl crate::runtime::executor::CapabilityService for NoopExecutor {}
     impl crate::runtime::executor::PresentationService for NoopExecutor {}
+    impl crate::runtime::executor::WindowPresentationService for NoopExecutor {}
     impl crate::runtime::executor::GuestMemoryService for NoopExecutor {}
     impl crate::runtime::executor::MaintenanceService for NoopExecutor {}
     impl crate::runtime::executor::ObservationService for NoopExecutor {}
