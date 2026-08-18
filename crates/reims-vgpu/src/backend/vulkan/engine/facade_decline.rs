@@ -8,8 +8,8 @@
 use super::compute_execution::residency_fields;
 use super::draw_execution::identity_fields;
 use super::types::TargetIdentity;
-use crate::model::ComputeStorageResidencyKey;
 use crate::observe::Decline;
+use reims_vgpu_core::ComputeStorageResidencyKey;
 use reims_vgpu_protocol::SubmissionIdentity;
 
 /// A specific engine façade or host-window presenter state failure.

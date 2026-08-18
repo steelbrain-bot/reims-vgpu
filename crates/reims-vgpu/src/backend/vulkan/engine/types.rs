@@ -1624,14 +1624,14 @@ pub enum ComputeStorageImageSeed {
 /// that refused.
 #[derive(Clone, Copy, Debug)]
 pub struct ComputeResidentSampleBind {
-    pub identity: crate::model::ComputeStorageResidencyKey,
+    pub identity: reims_vgpu_core::ComputeStorageResidencyKey,
     /// Generation the caller verified against the registry at stage time.
     pub generation: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ComputeStorageResidency {
-    pub identity: crate::model::ComputeStorageResidencyKey,
+    pub identity: reims_vgpu_core::ComputeStorageResidencyKey,
     /// Generation represented by `bytes` before this dispatch.
     pub seed_generation: u32,
     /// Generation guest memory will represent after successful writeback.

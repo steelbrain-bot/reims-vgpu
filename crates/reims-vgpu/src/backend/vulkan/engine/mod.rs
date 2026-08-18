@@ -2338,7 +2338,7 @@ pub fn max_render_target_dimension() -> u32 {
 /// the reply table's own values: the served reply is only ever *reduced* by
 /// this, so a boot that answers before the device is up must not be the one
 /// that promises the most.
-pub fn device_info_limits() -> crate::model::DeviceInfoLimits {
+pub fn device_info_limits() -> reims_vgpu_core::DeviceInfoLimits {
     use reims_vgpu_vulkan::device_features::{
         VULKAN_MIN_COMPUTE_SHARED_MEMORY_BYTES, VULKAN_MIN_COMPUTE_WORKGROUP_SIZE,
     };
@@ -2346,14 +2346,14 @@ pub fn device_info_limits() -> crate::model::DeviceInfoLimits {
         .owner
         .ctx
         .as_ref()
-        .map(|ctx| crate::model::DeviceInfoLimits {
+        .map(|ctx| reims_vgpu_core::DeviceInfoLimits {
             max_sample_count: ctx.features.max_sample_count,
             d24_stencil8: ctx.features.d24_unorm_s8_attachment,
             max_threads_per_threadgroup: ctx.features.max_compute_workgroup_size,
             max_threadgroup_memory_bytes: ctx.features.max_compute_shared_memory_bytes,
             native_fp16: ctx.features.float16,
         })
-        .unwrap_or(crate::model::DeviceInfoLimits {
+        .unwrap_or(reims_vgpu_core::DeviceInfoLimits {
             max_sample_count: 1,
             d24_stencil8: false,
             max_threads_per_threadgroup: VULKAN_MIN_COMPUTE_WORKGROUP_SIZE,
@@ -2451,7 +2451,7 @@ fn engine_probe_decline(probe: EngineProbe, error: &DrawError) -> crate::observe
 /// not create devices or allocate; returns `None` when the engine is uninit
 /// or the key is absent.
 pub fn compute_resident_storage_generation(
-    identity: &crate::model::ComputeStorageResidencyKey,
+    identity: &reims_vgpu_core::ComputeStorageResidencyKey,
 ) -> Option<u32> {
     let mut guard = lock_engine();
     guard.pools.compute_resident_generation(identity)
@@ -2467,7 +2467,7 @@ pub fn compute_resident_storage_generation(
 /// whole request on mismatch). Does not create devices or allocate; returns
 /// `None` when the engine is uninit or the key is absent.
 pub fn compute_resident_sample_source(
-    identity: &crate::model::ComputeStorageResidencyKey,
+    identity: &reims_vgpu_core::ComputeStorageResidencyKey,
 ) -> Option<(u32, StorageImageFormat)> {
     let mut guard = lock_engine();
     guard.pools.compute_resident_sample_source(identity)
@@ -2476,7 +2476,7 @@ pub fn compute_resident_sample_source(
 /// Drop the deferred-writeback pin of a resident whose guest window can no
 /// longer be flushed (ReplacePhysical / unmap drop paths). The resident stays
 /// registered — only LRU protection ends. No-op for an absent identity.
-pub fn unpin_resident_storage(identity: &crate::model::ComputeStorageResidencyKey) {
+pub fn unpin_resident_storage(identity: &reims_vgpu_core::ComputeStorageResidencyKey) {
     let mut guard = lock_engine();
     guard.pools.pin_resident_storage(identity, false);
 }
@@ -2490,7 +2490,7 @@ pub fn unpin_resident_storage(identity: &crate::model::ComputeStorageResidencyKe
 /// entry from leaking its pinned VRAM image for the boot, and without this the
 /// leak would simply change its name. Never call it on a live object — the whole
 /// point of the flag is that content nobody has copied out is not disposable.
-pub fn retire_resident_storage_content(identity: &crate::model::ComputeStorageResidencyKey) {
+pub fn retire_resident_storage_content(identity: &reims_vgpu_core::ComputeStorageResidencyKey) {
     let mut guard = lock_engine();
     guard.pools.note_compute_storage_content_retired(identity);
 }
@@ -2533,7 +2533,7 @@ pub fn retire_guest_import(import_id: crate::runtime::guest_ram::ImportId) {
 /// before a later reader can be assumed to find them in guest memory. Clearing
 /// for `HostOnly` would make a heap output reclaimable after its temporary
 /// readback buffer had already been dropped.
-pub fn note_resident_storage_copied_out(identity: &crate::model::ComputeStorageResidencyKey) {
+pub fn note_resident_storage_copied_out(identity: &reims_vgpu_core::ComputeStorageResidencyKey) {
     let mut guard = lock_engine();
     guard.pools.note_compute_storage_copied_out(identity);
 }
@@ -3589,7 +3589,7 @@ pub(super) enum GuestWriteSource<'a> {
     /// destroys the held image when the same identity arrives at a new shape, and
     /// `compute_rekey_refusal` — the only thing that stops it — reads `pinned`.
     /// See `ResourcePools::pin_resident_storage`.
-    ResidentStorage(&'a crate::model::ComputeStorageResidencyKey),
+    ResidentStorage(&'a reims_vgpu_core::ComputeStorageResidencyKey),
     /// A storage buffer bound directly over an imported guest allocation.
     /// The import registry owns the Vulkan buffer, and retiring the allocation
     /// routes destruction through the ring graveyard, so there is no separate

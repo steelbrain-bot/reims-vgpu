@@ -6,8 +6,8 @@
 //! staged.
 
 use super::types::StorageImageFormat;
-use crate::model::ComputeStorageResidencyKey;
 use crate::observe::Decline;
+use reims_vgpu_core::ComputeStorageResidencyKey;
 
 /// A specific failure while preparing a validated compute dispatch.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -251,7 +251,7 @@ pub(super) fn residency_fields(
         ("residency_pixel_format", identity.pixel_format.to_string()),
     ];
     match identity.origin {
-        crate::model::ComputeStorageOrigin::Surface {
+        reims_vgpu_core::ComputeStorageOrigin::Surface {
             mapping_id,
             map_generation,
             surface_offset,
@@ -265,7 +265,7 @@ pub(super) fn residency_fields(
             ("residency_surface_bpr", surface_bpr.to_string()),
             ("residency_span_end", span_end.to_string()),
         ]),
-        crate::model::ComputeStorageOrigin::Linear {
+        reims_vgpu_core::ComputeStorageOrigin::Linear {
             task_id,
             texture_ref,
             gva,
@@ -279,7 +279,7 @@ pub(super) fn residency_fields(
             ("residency_row_stride", row_stride.to_string()),
             ("residency_span_end", span_end.to_string()),
         ]),
-        crate::model::ComputeStorageOrigin::Heap {
+        reims_vgpu_core::ComputeStorageOrigin::Heap {
             task_id,
             texture_ref,
         } => fields.extend([

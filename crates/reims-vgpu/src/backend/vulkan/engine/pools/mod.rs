@@ -20,7 +20,7 @@ use super::types::{DrawError, ResidentReclaim, StorageImageFormat, TargetIdentit
 use super::vk_call::{VkCall, VkOp};
 use super::{buffer_slab, color_subresource_range, gpu_span, host_ram, reason, slab, types};
 use crate::backend::vulkan::translate;
-use crate::model::ComputeStorageResidencyKey;
+use reims_vgpu_core::ComputeStorageResidencyKey;
 use reims_vgpu_vulkan::memory::{MappedMemoryKind, MemoryClass};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -628,7 +628,7 @@ pub(crate) struct ResourcePools {
     /// registry. Separate because the release has to reach the registry that
     /// holds the image; identical in discipline, and it travels to the same ring
     /// slot in the same `seal_entry`.
-    compute_write_pins_live: Vec<crate::model::ComputeStorageResidencyKey>,
+    compute_write_pins_live: Vec<reims_vgpu_core::ComputeStorageResidencyKey>,
     initialized: bool,
 }
 
@@ -1158,7 +1158,7 @@ pub(crate) struct PendingGpuCleanup {
     /// fence is their lifetime boundary.
     unpin_residents: Vec<TargetIdentity>,
     /// The same, in the compute-storage registry.
-    unpin_compute_residents: Vec<crate::model::ComputeStorageResidencyKey>,
+    unpin_compute_residents: Vec<reims_vgpu_core::ComputeStorageResidencyKey>,
 }
 
 /// What one sealed entry hands back: the cleanup its ring slot owes once the

@@ -1489,8 +1489,8 @@ mod tests {
         ComputeResidentSampleBind, ComputeSampledImageResource, ComputeStorageImageResource,
         SamplerResource, StorageImageFormat,
     };
-    use crate::model::ComputeStorageResidencyKey;
     use crate::observe::Decline;
+    use reims_vgpu_core::ComputeStorageResidencyKey;
 
     /// A dispatch whose layout omits a binding its module samples is refused by
     /// number, and one that only omits an unreferenced binding is not.
