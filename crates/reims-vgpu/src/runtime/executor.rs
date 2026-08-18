@@ -100,6 +100,13 @@ pub struct ExecutionCompletion {
     pub output: ExecutionOutput,
 }
 
+/// Validated completion identity paired with its operation-specific output.
+#[derive(Debug)]
+pub struct ExecutionReceipt<T> {
+    pub submission: SubmissionIdentity,
+    pub output: T,
+}
+
 /// Backend execution contract implemented per device.
 pub trait Executor: std::fmt::Debug + Send + Sync {
     fn execute(&self, submission: ResolvedSubmission) -> Result<ExecutionCompletion, DrawError>;
@@ -173,7 +180,7 @@ pub fn execute_draw(
     executor: &dyn Executor,
     context: SubmissionContext,
     request: DrawRequest,
-) -> Result<DrawOutput, DrawError> {
+) -> Result<ExecutionReceipt<DrawOutput>, DrawError> {
     let expected_identity = context.identity;
     let expected = ResolvedSubmission::Draw {
         context,
@@ -190,7 +197,10 @@ pub fn execute_draw(
         ));
     }
     match completion.output {
-        ExecutionOutput::Draw(output) => Ok(output),
+        ExecutionOutput::Draw(output) => Ok(ExecutionReceipt {
+            submission: completion.submission,
+            output,
+        }),
         other => Err(DrawError::Facade(
             EngineFacadeDecline::ExecutorCompletionKindMismatch {
                 expected: expected_kind,
@@ -205,7 +215,7 @@ pub fn execute_compute(
     executor: &dyn Executor,
     context: SubmissionContext,
     request: ComputeRequest,
-) -> Result<ComputeOutput, DrawError> {
+) -> Result<ExecutionReceipt<ComputeOutput>, DrawError> {
     let expected_identity = context.identity;
     let expected = ResolvedSubmission::Compute {
         context,
@@ -222,7 +232,10 @@ pub fn execute_compute(
         ));
     }
     match completion.output {
-        ExecutionOutput::Compute(output) => Ok(output),
+        ExecutionOutput::Compute(output) => Ok(ExecutionReceipt {
+            submission: completion.submission,
+            output,
+        }),
         other => Err(DrawError::Facade(
             EngineFacadeDecline::ExecutorCompletionKindMismatch {
                 expected: expected_kind,

@@ -255,6 +255,9 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // which of those a record hit depends on whether an identity resolved, and
     // that is not a condition the Store block can re-derive.
     let mut draw_bgra = false;
+    // Set only by a validated executor receipt. Every content transition below
+    // cites this identity instead of recovering one from mutable ambient state.
+    let mut completed_submission = None;
     // IOSurface texture composite Store: the frame was written into the mapping's guest
     // pages by `store_surface_resident`, so this encode owes the caller nothing
     // further.
@@ -267,7 +270,12 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     if req.pipeline_ref != 0 && (req.vertex_count > 0 || req.indexed.is_some()) {
         req.chain_resident_established = false;
         match try_metal2vulkan_draw(state, host, req, writeback_guest) {
-            Ok(M2vDrawSpan::Pixels { bytes, bgra }) => {
+            Ok(M2vDrawSpan::Pixels {
+                submission,
+                bytes,
+                bgra,
+            }) => {
+                completed_submission = Some(submission);
                 draw_rgba = Some(bytes);
                 draw_bgra = bgra;
                 crate::observe::line(format!(
@@ -275,7 +283,8 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     req.pipeline_ref, pass_w, pass_h, req.vertex_count
                 ));
             }
-            Ok(M2vDrawSpan::ResidentChain) => {
+            Ok(M2vDrawSpan::ResidentChain { submission }) => {
+                completed_submission = Some(submission);
                 req.chain_resident_established = true;
                 crate::observe::line(format!(
                     "linux_m2v_draw ok resident_chain pipe={} {}x{} mid={} gva={:#x}",
@@ -286,11 +295,22 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     req.colors.first().map(|c| c.target_gva()).unwrap_or(0)
                 ));
             }
-            Ok(M2vDrawSpan::ResidentGvaStore { identity }) => {
+            Ok(M2vDrawSpan::ResidentGvaStore {
+                submission,
+                identity,
+            }) => {
+                completed_submission = Some(submission);
                 let _store_span = StoreCostSpan::new("gva_store_us");
                 note_iosurface_texture_store_route("gva_flush");
                 let landed = req.colors.first().is_some_and(|c0| {
-                    crate::runtime::writeback_debt::arm_gva(state, host, req.task_id, c0, &identity)
+                    crate::runtime::writeback_debt::arm_gva(
+                        state,
+                        host,
+                        req.task_id,
+                        c0,
+                        &identity,
+                        submission,
+                    )
                 });
                 if landed {
                     note_iosurface_texture_store_route("gva_resident_authoritative");
@@ -312,7 +332,11 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     ));
                 }
             }
-            Ok(M2vDrawSpan::ResidentSurfaceStore { identity }) => {
+            Ok(M2vDrawSpan::ResidentSurfaceStore {
+                submission,
+                identity,
+            }) => {
+                completed_submission = Some(submission);
                 // Into the same `iosurface_store_us` bucket the synchronous and `Owned`
                 // routes report, because the whole claim of this rail is that the
                 // bucket shrinks. Leaving it unbracketed would move the arm's cost
@@ -345,7 +369,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                             let _span = StoreCostSpan::new("iosurface_publish_us");
                             publish_surface_store(state, host, mid, cw, ch, fmt);
                         }
-                        record_materialized_store(state, req.task_id, texture_ref);
+                        record_materialized_store(state, req.task_id, texture_ref, submission);
                         surface_store_armed = true;
                         crate::observe::line(format!(
                             "linux_m2v_draw ok resident_surface_store pipe={} {}x{} mid={mid}",
@@ -573,7 +597,13 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         ));
                     }
                     if ok {
-                        record_materialized_store(state, req.task_id, c0.texture_ref);
+                        record_materialized_store(
+                            state,
+                            req.task_id,
+                            c0.texture_ref,
+                            completed_submission
+                                .expect("materialized engine pixels carry a completion identity"),
+                        );
                         // `None`, for the same reason the deferred arm above
                         // returns it: this whole block runs only under
                         // `writeback_guest`, which `multi_draw_store_plan` grants
@@ -714,7 +744,13 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 false
             };
             if ok {
-                record_materialized_store(state, req.task_id, c0.texture_ref);
+                record_materialized_store(
+                    state,
+                    req.task_id,
+                    c0.texture_ref,
+                    completed_submission
+                        .expect("materialized engine pixels carry a completion identity"),
+                );
                 // `None`: everything from here up is under `writeback_guest`,
                 // which `multi_draw_store_plan` grants only to `di == last_i`, so
                 // the chain value has no record N+1 to seed and every other
@@ -812,14 +848,12 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
 /// Vulkan may reach this through a resident surface, a host readback, or a
 /// direct guest write. Those choices affect transfer cost only; all have a
 /// completed GPU result and the same bytes in the guest replica.
-fn record_materialized_store(state: &mut DeviceState, task_id: u32, texture_ref: u32) {
-    let Some(submission) = state
-        .active_submission
-        .as_ref()
-        .map(|active| active.identity.id)
-    else {
-        return;
-    };
+fn record_materialized_store(
+    state: &mut DeviceState,
+    task_id: u32,
+    texture_ref: u32,
+    submission: reims_vgpu_protocol::SubmissionId,
+) {
     let _ =
         state
             .task_resources
@@ -5057,12 +5091,18 @@ enum M2vDrawSpan {
     /// writeback — all want guest scanout order, and a BGRA resident hands them
     /// exactly that. Normalizing to RGBA here would restate a whole framebuffer
     /// per Store purely to have the Store restate it back.
-    Pixels { bytes: Vec<u8>, bgra: bool },
+    Pixels {
+        submission: reims_vgpu_protocol::SubmissionId,
+        bytes: Vec<u8>,
+        bgra: bool,
+    },
     /// Intermediate record of a resident render-pass chain: content stays on
     /// the protocol-keyed engine target (no CPU pixels, no fence wait, no guest
     /// Store this record). The final record reads back and performs the
     /// contract Store on portability devices.
-    ResidentChain,
+    ResidentChain {
+        submission: reims_vgpu_protocol::SubmissionId,
+    },
     /// Final/single record of a GVA render Store executed into the registry
     /// resident with `skip_readback`. A copied resident becomes authoritative
     /// under a resource-scoped debt; a guest-backed resident has already
@@ -5072,6 +5112,7 @@ enum M2vDrawSpan {
     /// `identity` is the key the draw registered, carried rather than re-derived
     /// — see [`Self::ResidentSurfaceStore`] for what a second derivation costs.
     ResidentGvaStore {
+        submission: reims_vgpu_protocol::SubmissionId,
         identity: crate::backend::vulkan::engine::TargetIdentity,
     },
     /// IOSurface texture composite Store executed into its registry resident with
@@ -5100,6 +5141,7 @@ enum M2vDrawSpan {
     /// held_gen=N-1` — the whole Maps frame lost, on the only render-target
     /// rail a host without `VK_EXT_external_memory_host` has.
     ResidentSurfaceStore {
+        submission: reims_vgpu_protocol::SubmissionId,
         identity: crate::backend::vulkan::engine::TargetIdentity,
     },
 }
@@ -7816,7 +7858,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         let executor = std::sync::Arc::clone(&state.executor);
         let submission = crate::runtime::executor::context_for(state, req.task_id);
         let has_target_identity = resources.target_identity.is_some();
-        let out = crate::runtime::executor::execute_draw(executor.as_ref(), submission, resources)?;
+        let receipt =
+            crate::runtime::executor::execute_draw(executor.as_ref(), submission, resources)?;
+        let completed_submission = receipt.submission.id;
+        let out = receipt.output;
         if has_target_identity {
             if let Some(resource) = req.colors.first().and_then(|color| color.resource.as_ref()) {
                 resource.note_render_target_use();
@@ -7885,15 +7930,24 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         let pixels_bgra = out.pixels_bgra;
         let pixels = out.pixels;
         if resident_render_chain {
-            return Ok(M2vDrawSpan::ResidentChain);
+            return Ok(M2vDrawSpan::ResidentChain {
+                submission: completed_submission,
+            });
         }
         if let Some(identity) = gva_resident_store {
-            return Ok(M2vDrawSpan::ResidentGvaStore { identity });
+            return Ok(M2vDrawSpan::ResidentGvaStore {
+                submission: completed_submission,
+                identity,
+            });
         }
         if let Some(identity) = surface_resident_store {
-            return Ok(M2vDrawSpan::ResidentSurfaceStore { identity });
+            return Ok(M2vDrawSpan::ResidentSurfaceStore {
+                submission: completed_submission,
+                identity,
+            });
         }
         Ok(M2vDrawSpan::Pixels {
+            submission: completed_submission,
             bytes: pixels,
             bgra: pixels_bgra,
         })

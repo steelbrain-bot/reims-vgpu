@@ -646,6 +646,7 @@ pub fn arm_gva<M: HostMemory + HostOps>(
     task_id: u32,
     c0: &crate::runtime::draw::ColorRtRequest,
     identity: &crate::backend::vulkan::engine::TargetIdentity,
+    submission: reims_vgpu_protocol::SubmissionId,
 ) -> bool {
     let Some(generation) = (match *identity {
         crate::backend::vulkan::engine::TargetIdentity::Gva { generation, .. } => Some(generation),
@@ -675,13 +676,11 @@ pub fn arm_gva<M: HostMemory + HostOps>(
         height: c0.height,
         format: c0.format,
         generation,
-        content: state.active_submission.as_ref().and_then(|submission| {
-            state.task_resources.record_completed_gpu_store(
-                task_id,
-                c0.texture_ref,
-                submission.identity.id,
-            )
-        }),
+        content: state.task_resources.record_completed_gpu_store(
+            task_id,
+            c0.texture_ref,
+            submission,
+        ),
         guest_write: state.resource_write_stamp(task_id, c0.texture_ref),
         seq: 0,
     };

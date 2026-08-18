@@ -4466,7 +4466,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     };
     let out_result = run_engine(req);
     let out = match out_result {
-        Ok(o) => o,
+        Ok(receipt) => receipt.output,
         Err(e) => {
             let unsupported = matches!(&e, DrawError::Unsupported(_));
             crate::observe::Emit::decline("compute_linux_engine", &e)
