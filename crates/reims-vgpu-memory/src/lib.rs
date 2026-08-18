@@ -94,6 +94,25 @@ pub struct GuestRunSource {
     pub pages: Option<std::sync::Arc<Vec<GuestWindowRun>>>,
 }
 
+/// One guest surface plane within a stable shared host allocation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct GuestTargetBacking {
+    pub allocation_host_ptr: usize,
+    pub allocation_len: u64,
+    pub resource_offset: u64,
+    pub resource_len: u64,
+    pub plane_offset: u64,
+    pub row_pitch: u64,
+}
+
+/// An importable guest allocation and the exact physical pages it owns.
+#[derive(Clone, Debug)]
+pub struct GuestTargetMemory {
+    pub backing: GuestTargetBacking,
+    pub import: std::sync::Arc<GuestRamImport>,
+    pub footprint: GuestPageFootprint,
+}
+
 /// One stretch of a [`GuestRunSource`]'s requested window, clipped to it.
 #[derive(Debug)]
 pub struct WindowStretch<'a> {

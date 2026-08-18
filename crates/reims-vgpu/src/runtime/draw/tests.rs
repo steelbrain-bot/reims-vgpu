@@ -3712,8 +3712,8 @@ fn a_gva_guest_page_load_becomes_an_importable_seed_without_cpu_bytes() {
         crate::runtime::guest_ram::GuestRamImport::new_host_allocation(0x2000_0000, 0x4000, 0x1000)
             .expect("aligned packed allocation"),
     );
-    let backing = crate::backend::vulkan::engine::GuestTargetMemory {
-        backing: crate::backend::vulkan::engine::GuestTargetBacking {
+    let backing = reims_vgpu_memory::GuestTargetMemory {
+        backing: reims_vgpu_memory::GuestTargetBacking {
             allocation_host_ptr: import.host_base(),
             allocation_len: import.len(),
             resource_offset: 0,

@@ -5509,7 +5509,7 @@ pub(super) fn resolve_gva_load_source<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     req: &mut DrawEncodeRequest,
-    guest_backing: Option<&crate::backend::vulkan::engine::GuestTargetMemory>,
+    guest_backing: Option<&reims_vgpu_memory::GuestTargetMemory>,
     chain_load_from_target: &mut bool,
 ) -> GvaLoadResolution {
     use super::GvaLoadSource;
@@ -5542,7 +5542,9 @@ pub(super) fn resolve_gva_load_source<M: HostMemory + HostOps>(
         crate::backend::vulkan::translate::pixel::vk_texel_layout(identity.resident_layout())
     });
     if let Some(seed) = guest_backing.and_then(|backing| {
-        target_format.and_then(|format| backing.load_seed(width, height, format))
+        target_format.and_then(|format| {
+            crate::backend::vulkan::engine::guest_target_seed(backing, width, height, format)
+        })
     }) {
         crate::runtime::drain::note_store_route("gvaseed_guest_pages");
         return GvaLoadResolution {
@@ -8201,7 +8203,7 @@ pub(super) fn gva_guest_target_backing<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
     req: &DrawEncodeRequest,
-) -> Option<crate::backend::vulkan::engine::GuestTargetMemory> {
+) -> Option<reims_vgpu_memory::GuestTargetMemory> {
     if !host.map_pages_stable() {
         return None;
     }
@@ -8235,8 +8237,8 @@ pub(super) fn gva_guest_target_backing<H: HostMemory + HostOps>(
     if plane_offset >= packed.import.len() {
         return None;
     }
-    Some(crate::backend::vulkan::engine::GuestTargetMemory {
-        backing: crate::backend::vulkan::engine::GuestTargetBacking {
+    Some(reims_vgpu_memory::GuestTargetMemory {
+        backing: reims_vgpu_memory::GuestTargetBacking {
             allocation_host_ptr: packed.import.host_base(),
             allocation_len: packed.import.len(),
             resource_offset: packed.head,

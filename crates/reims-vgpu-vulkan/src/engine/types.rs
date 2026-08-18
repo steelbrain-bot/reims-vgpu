@@ -6,7 +6,9 @@
 use ash::vk;
 
 use crate::translate;
-pub use reims_vgpu_memory::{GuestRun, GuestRunSource, WindowStretch};
+pub use reims_vgpu_memory::{
+    GuestRun, GuestRunSource, GuestTargetBacking, GuestTargetMemory, WindowStretch,
+};
 pub use reims_vgpu_protocol::ColorWriteMask;
 
 /// Named engine failure. Stable prefixes for observe greps (`vk_engine_*`).
@@ -1721,107 +1723,67 @@ pub struct GuestTargetSeed {
     pub format: ash::vk::Format,
 }
 
-/// One guest surface plane within a stable shared host allocation.
-///
-/// `allocation_host_ptr..allocation_len` is the parent object imported into
-/// Vulkan. `resource_offset..resource_len` is the guest allocation within that
-/// parent, and `plane_offset` identifies the attachment's first texel within
-/// the same parent-relative coordinate space. `row_pitch` is the plane's
-/// declared physical stride. Keeping both bounds and the plane coordinates
-/// together lets the engine derive `vkBindImageMemory`'s offset without
-/// manufacturing a pointer before the plane or extending the image into an
-/// adjacent guest resource.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct GuestTargetBacking {
-    pub allocation_host_ptr: usize,
-    pub allocation_len: u64,
-    /// Declared guest resource within the imported parent. This is zero/full
-    /// for a mapping import and a checked subwindow when a type-2/3 allocation
-    /// reuses the VM's broader RAMBlock import.
-    pub resource_offset: u64,
-    pub resource_len: u64,
-    pub plane_offset: u64,
-    pub row_pitch: u64,
-}
-
-/// An importable guest allocation and the physical pages it owns.
-///
-/// Keeping these together makes the retained resource its own synchronization
-/// authority: once admitted, the engine can publish the exact footprint that
-/// was validated with the allocation instead of reconstructing it at Store.
-#[derive(Clone, Debug)]
-pub struct GuestTargetMemory {
-    pub backing: GuestTargetBacking,
-    /// The parent allocation whose one backend import all child views share.
-    pub import: std::sync::Arc<reims_vgpu_memory::GuestRamImport>,
-    pub footprint: reims_vgpu_memory::GuestPageFootprint,
-}
-
-impl GuestTargetMemory {
-    /// Describe this attachment's prior contents as a bounded guest-buffer
-    /// source for a LOAD.
-    ///
-    /// The allocation already owns the stable import and exact plane geometry;
-    /// deriving the seed here keeps the target and its LOAD source on one
-    /// contract. The returned window includes row padding between rows but no
-    /// padding after the final row, matching `vkCmdCopyBufferToImage`.
-    pub fn load_seed(
-        &self,
-        width: u32,
-        height: u32,
-        format: vk::Format,
-    ) -> Option<GuestTargetSeed> {
-        if width == 0 || height == 0 || self.import.is_retired() {
-            return None;
-        }
-        let texel = u64::from(translate::pixel::bytes_per_texel(format)?);
-        let tight_row = u64::from(width).checked_mul(texel)?;
-        let row_pitch = self.backing.row_pitch;
-        if row_pitch < tight_row || !row_pitch.is_multiple_of(texel) {
-            return None;
-        }
-        let span = u64::from(height - 1)
-            .checked_mul(row_pitch)?
-            .checked_add(tight_row)?;
-        let resource_end = self
-            .backing
-            .resource_offset
-            .checked_add(self.backing.resource_len)?;
-        let plane_end = self.backing.plane_offset.checked_add(span)?;
-        if self.backing.plane_offset < self.backing.resource_offset || plane_end > resource_end {
-            return None;
-        }
-        let slice = self.import.slice(self.backing.plane_offset, span).ok()?;
-        let guest =
-            reims_vgpu_memory::GuestRef::new(std::sync::Arc::clone(&self.import), slice).ok()?;
-        let host_ptr = self
-            .import
-            .host_base()
-            .checked_add(usize::try_from(self.backing.plane_offset).ok()?)?;
-        let row_length_texels = if row_pitch == tight_row {
-            0
-        } else {
-            u32::try_from(row_pitch / texel).ok()?
-        };
-        Some(GuestTargetSeed {
-            source: GuestRunSource {
-                runs: std::sync::Arc::new(vec![GuestRun {
-                    host_ptr,
-                    len: span,
-                }]),
-                source_offset: 0,
-                total_len: span,
-                row_length_texels,
-                pages: Some(std::sync::Arc::new(vec![
-                    reims_vgpu_memory::GuestWindowRun {
-                        window_offset: 0,
-                        guest,
-                    },
-                ])),
-            },
-            format,
-        })
+/// Convert a memory-owned attachment backing into the native seed request the
+/// Vulkan executor needs for a LOAD.
+pub fn guest_target_seed(
+    memory: &GuestTargetMemory,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+) -> Option<GuestTargetSeed> {
+    if width == 0 || height == 0 || memory.import.is_retired() {
+        return None;
     }
+    let texel = u64::from(translate::pixel::bytes_per_texel(format)?);
+    let tight_row = u64::from(width).checked_mul(texel)?;
+    let row_pitch = memory.backing.row_pitch;
+    if row_pitch < tight_row || !row_pitch.is_multiple_of(texel) {
+        return None;
+    }
+    let span = u64::from(height - 1)
+        .checked_mul(row_pitch)?
+        .checked_add(tight_row)?;
+    let resource_end = memory
+        .backing
+        .resource_offset
+        .checked_add(memory.backing.resource_len)?;
+    let plane_end = memory.backing.plane_offset.checked_add(span)?;
+    if memory.backing.plane_offset < memory.backing.resource_offset || plane_end > resource_end {
+        return None;
+    }
+    let slice = memory
+        .import
+        .slice(memory.backing.plane_offset, span)
+        .ok()?;
+    let guest =
+        reims_vgpu_memory::GuestRef::new(std::sync::Arc::clone(&memory.import), slice).ok()?;
+    let host_ptr = memory
+        .import
+        .host_base()
+        .checked_add(usize::try_from(memory.backing.plane_offset).ok()?)?;
+    let row_length_texels = if row_pitch == tight_row {
+        0
+    } else {
+        u32::try_from(row_pitch / texel).ok()?
+    };
+    Some(GuestTargetSeed {
+        source: GuestRunSource {
+            runs: std::sync::Arc::new(vec![GuestRun {
+                host_ptr,
+                len: span,
+            }]),
+            source_offset: 0,
+            total_len: span,
+            row_length_texels,
+            pages: Some(std::sync::Arc::new(vec![
+                reims_vgpu_memory::GuestWindowRun {
+                    window_offset: 0,
+                    guest,
+                },
+            ])),
+        },
+        format,
+    })
 }
 
 /// Producer-assigned identity + generation for sampled working-set accounting.
@@ -1863,8 +1825,7 @@ mod tests {
             .expect("footprint"),
         };
 
-        let seed = memory
-            .load_seed(4, 2, vk::Format::R8G8B8A8_UNORM)
+        let seed = guest_target_seed(&memory, 4, 2, vk::Format::R8G8B8A8_UNORM)
             .expect("the plane contains two padded rows");
         assert_eq!(seed.source.total_len, 48, "one stride plus the final row");
         assert_eq!(seed.source.row_length_texels, 8);
@@ -1874,9 +1835,7 @@ mod tests {
         let mut outside = memory.clone();
         outside.backing.plane_offset = 0x2ff8;
         assert!(
-            outside
-                .load_seed(4, 2, vk::Format::R8G8B8A8_UNORM)
-                .is_none(),
+            guest_target_seed(&outside, 4, 2, vk::Format::R8G8B8A8_UNORM).is_none(),
             "a plane extending beyond its declared resource is not widened into its neighbour"
         );
     }
