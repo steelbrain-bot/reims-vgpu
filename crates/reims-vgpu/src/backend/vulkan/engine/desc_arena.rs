@@ -63,7 +63,7 @@ fn free_sets_call(result: Result<(), vk::Result>) -> Result<(), VkCall> {
 /// have to change.
 struct SetExceedsBlock;
 
-impl crate::observe::Decline for SetExceedsBlock {
+impl reims_vgpu_observe::Decline for SetExceedsBlock {
     fn slug(&self) -> &'static str {
         "desc_set_exceeds_block_budget"
     }
@@ -226,7 +226,7 @@ impl DescriptorArena {
                     error,
                     vk::Result::ERROR_OUT_OF_POOL_MEMORY | vk::Result::ERROR_FRAGMENTED_POOL
                 ) {
-                    crate::observe::Emit::decline("desc_arena_alloc", &SetExceedsBlock)
+                    reims_vgpu_observe::Emit::decline("desc_arena_alloc", &SetExceedsBlock)
                         .field("per_type", DESC_BLOCK_PER_TYPE)
                         .field("max_sets", DESC_BLOCK_MAX_SETS)
                         .fail_once(0);
@@ -252,7 +252,7 @@ impl DescriptorArena {
         for (pool, group) in group_by_pool(&self.blocks, sets) {
             if !group.is_empty() {
                 if let Err(error) = free_sets_call(device.free_descriptor_sets(pool, &group)) {
-                    crate::observe::Emit::decline("desc_arena_free", &error)
+                    reims_vgpu_observe::Emit::decline("desc_arena_free", &error)
                         .field("sets", group.len())
                         .fail_once(pool.as_raw());
                 }
@@ -353,11 +353,11 @@ mod tests {
 
     #[test]
     fn descriptor_free_failure_names_the_free_operation() {
-        use crate::observe::Decline as _;
+        use reims_vgpu_observe::Decline as _;
         let error = free_sets_call(Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY))
             .expect_err("synthetic free failure must decline");
         assert_eq!(error.slug(), "vk_desc_arena_free_sets");
-        let line = crate::observe::Emit::decline("desc_arena_free", &error)
+        let line = reims_vgpu_observe::Emit::decline("desc_arena_free", &error)
             .field("sets", 3)
             .render();
         assert!(line.starts_with("desc_arena_free reason=vk_desc_arena_free_sets "));
@@ -391,7 +391,7 @@ mod device_tests {
     /// did not; it is a live gate on a strict driver and inert on a lenient one.
     #[test]
     fn a_set_no_block_can_serve_is_refused_without_growing_the_arena() {
-        crate::observe::redirect_logs_for_tests();
+        reims_vgpu_observe::redirect_logs_for_tests();
         let mut ctx = match unsafe { DeviceContext::create() } {
             Ok(c) => c,
             Err(e) => {
@@ -449,7 +449,7 @@ mod device_tests {
     /// fault. Skips cleanly when no GPU / Vulkan is present.
     #[test]
     fn arena_grows_on_exhaustion_and_frees_route_correctly() {
-        crate::observe::redirect_logs_for_tests();
+        reims_vgpu_observe::redirect_logs_for_tests();
         let mut ctx = match unsafe { DeviceContext::create() } {
             Ok(c) => c,
             Err(e) => {

@@ -29,7 +29,7 @@ impl ResourcePools {
                 if let Err(result) = device.wait_for_fences(&[slot.fence], true, FENCE_TIMEOUT_NS) {
                     let decline =
                         DrawError::VkCall(VkCall::new(VkOp::PoolsWaitFencesDestroy, result));
-                    crate::observe::Emit::decline("vk_pools_destroy", &decline).fail_once(0);
+                    reims_vgpu_observe::Emit::decline("vk_pools_destroy", &decline).fail_once(0);
                 }
             }
         }
@@ -93,7 +93,7 @@ impl ResourcePools {
         let lease_deadline = std::time::Instant::now() + LEASE_QUIESCE;
         while readback_leases_outstanding() != 0 {
             if std::time::Instant::now() >= lease_deadline {
-                crate::observe::Emit::decline(
+                reims_vgpu_observe::Emit::decline(
                     "vk_pools_destroy",
                     &ReadbackLeaseQuiesceExpired {
                         outstanding: readback_leases_outstanding(),
@@ -238,7 +238,7 @@ struct ReadbackLeaseQuiesceExpired {
     waited_ms: u64,
 }
 
-impl crate::observe::Decline for ReadbackLeaseQuiesceExpired {
+impl reims_vgpu_observe::Decline for ReadbackLeaseQuiesceExpired {
     fn slug(&self) -> &'static str {
         "readback_lease_quiesce_expired"
     }

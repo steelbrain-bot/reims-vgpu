@@ -31,7 +31,7 @@
 
 use ash::vk;
 
-use crate::observe::Decline;
+use reims_vgpu_observe::Decline;
 
 /// One fallible Vulkan operation the engine makes, named by *(rail, operation)*.
 ///
@@ -708,7 +708,7 @@ mod tests {
             VkOp::PoolsCreateFence,
             vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
         );
-        let line = crate::observe::Emit::decline("vk_pools", &c).render();
+        let line = reims_vgpu_observe::Emit::decline("vk_pools", &c).render();
         assert!(
             line.starts_with("vk_pools reason=vk_pools_create_fence vk_result="),
             "{line}"

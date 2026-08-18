@@ -9,7 +9,7 @@
 
 use ash::vk;
 
-use crate::observe::Decline;
+use reims_vgpu_observe::Decline;
 
 /// A specific check that prevented the Vulkan engine from initializing.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -121,7 +121,7 @@ impl Decline for InitDecline {
     }
 }
 
-crate::observe::decline_display!(InitDecline);
+reims_vgpu_observe::decline_display!(InitDecline);
 
 #[cfg(test)]
 mod tests {
@@ -182,7 +182,7 @@ mod tests {
     #[test]
     fn driver_loader_and_api_versions_reach_log_safe_fields() {
         for decline in all() {
-            let line = crate::observe::Emit::decline("vk_init_test", &decline).render();
+            let line = reims_vgpu_observe::Emit::decline("vk_init_test", &decline).render();
             assert!(line.starts_with(&format!("vk_init_test reason={}", decline.slug())));
             for field in line.split(' ').skip(1) {
                 assert!(!field.is_empty(), "empty field in {line:?}");

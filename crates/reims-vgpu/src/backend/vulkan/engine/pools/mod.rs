@@ -2388,7 +2388,7 @@ fn slab_retain_enabled() -> bool {
     *ON.get_or_init(|| {
         let (state, value) = crate::env::read(crate::env::SLAB_RETAIN);
         let on = !matches!(state, crate::env::Switch::Off);
-        crate::observe::off(format!(
+        reims_vgpu_observe::off(format!(
             "slab_retain on={on} switch={state:?} value={}",
             value.unwrap_or_else(|| "<unset>".into())
         ));
@@ -2634,7 +2634,7 @@ fn batch_max_draws(topology: reims_vgpu_vulkan::memory::MemoryTopology) -> u64 {
         // silent difference between what a bisect thinks it measured and
         // what ran, which is the one thing an arm must never be.
         crate::env::Count::Refused(raw) => {
-            crate::observe::fail(format!(
+            reims_vgpu_observe::fail(format!(
                 "batch_draws_refused value={raw} ceiling={default} \
                      (a count from 1 to the ceiling narrows the cap; anything \
                       else would widen it or stop every batch)"
@@ -2642,7 +2642,7 @@ fn batch_max_draws(topology: reims_vgpu_vulkan::memory::MemoryTopology) -> u64 {
             default
         }
     };
-    crate::observe::off(format!(
+    reims_vgpu_observe::off(format!(
         "batch_draws cap={cap} topology={} default={default} ceiling={BATCH_MAX_DRAWS}",
         topology.slug()
     ));
@@ -2920,7 +2920,7 @@ fn emit_alloc_site_census() {
             ALLOC_SITE_US[i].load(Ordering::Relaxed) / 1000,
         );
     }
-    crate::observe::off(line);
+    reims_vgpu_observe::off(line);
 }
 
 /// A single host→staging step that blocked long enough to cost frames.
@@ -2972,7 +2972,7 @@ impl Drop for SlowStagingWrite {
         if n >= SLOW_STAGING_LINE_CAP {
             return;
         }
-        crate::observe::off(format!(
+        reims_vgpu_observe::off(format!(
             "staging_write_slow kind={} us={us} bytes={} runs={}{}",
             self.kind,
             self.bytes,
@@ -3506,7 +3506,7 @@ mod staging_mapping_tests {
     /// nothing else would notice.
     #[test]
     fn a_staging_slot_keeps_one_mapping_across_recycle() {
-        crate::observe::redirect_logs_for_tests();
+        reims_vgpu_observe::redirect_logs_for_tests();
         let mut ctx = match unsafe { DeviceContext::create() } {
             Ok(c) => c,
             Err(e) => {
@@ -3558,7 +3558,7 @@ mod staging_mapping_tests {
     /// test is that the count does not track the acquire count.
     #[test]
     fn a_cold_staging_burst_allocates_blocks_not_buffers() {
-        crate::observe::redirect_logs_for_tests();
+        reims_vgpu_observe::redirect_logs_for_tests();
         let mut ctx = match unsafe { DeviceContext::create() } {
             Ok(c) => c,
             Err(e) => {
@@ -3615,7 +3615,7 @@ mod staging_mapping_tests {
     /// `mapped` with a wrong bind offset aliases only on the GPU side.
     #[test]
     fn two_carves_from_one_block_do_not_alias() {
-        crate::observe::redirect_logs_for_tests();
+        reims_vgpu_observe::redirect_logs_for_tests();
         let mut ctx = match unsafe { DeviceContext::create() } {
             Ok(c) => c,
             Err(e) => {
@@ -3680,7 +3680,7 @@ mod staging_mapping_tests {
     /// rather than as a leak.
     #[test]
     fn a_leased_readback_slot_leaves_the_pool_and_comes_back() {
-        crate::observe::redirect_logs_for_tests();
+        reims_vgpu_observe::redirect_logs_for_tests();
         let mut ctx = match unsafe { DeviceContext::create() } {
             Ok(c) => c,
             Err(e) => {

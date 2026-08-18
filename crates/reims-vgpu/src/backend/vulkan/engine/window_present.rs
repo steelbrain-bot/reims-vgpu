@@ -43,7 +43,7 @@ pub(crate) enum WindowPresentDecline {
     },
 }
 
-impl crate::observe::Decline for WindowPresentDecline {
+impl reims_vgpu_observe::Decline for WindowPresentDecline {
     fn slug(&self) -> &'static str {
         match self {
             Self::SuboptimalPersistent { .. } => "window_present_suboptimal_persistent",
@@ -90,7 +90,7 @@ pub(crate) enum SlateReason {
     GeomMismatch,
 }
 
-impl crate::observe::Decline for SlateReason {
+impl reims_vgpu_observe::Decline for SlateReason {
     /// Slugs carry a `slate_` prefix.
     ///
     /// They were bare (`no_source`, `geom_mismatch`, …) while this type was an
@@ -127,7 +127,7 @@ enum StagingError {
     },
 }
 
-impl crate::observe::Decline for StagingError {
+impl reims_vgpu_observe::Decline for StagingError {
     fn slug(&self) -> &'static str {
         match self {
             Self::Call(call) => call.slug(),
@@ -655,11 +655,11 @@ impl WindowPresenter {
             let (state, value) = crate::env::read(crate::env::PRESENT_DEPTH);
             match state {
                 crate::env::Switch::Off => {
-                    crate::observe::off("present_depth reason=present_depth_disabled_by_env");
+                    reims_vgpu_observe::off("present_depth reason=present_depth_disabled_by_env");
                     1
                 }
                 crate::env::Switch::Unrecognized => {
-                    crate::observe::fail(format!(
+                    reims_vgpu_observe::fail(format!(
                         "present_depth reason=present_depth_env_unrecognized value={}",
                         value.unwrap_or_default()
                     ));
@@ -884,7 +884,7 @@ impl WindowPresenter {
         }
         if let Err(error) = ctx.device.wait_for_fences(&fences, true, u64::MAX) {
             let decline = VkCall::new(VkOp::WindowFenceStatus, error);
-            crate::observe::Emit::decline("host_window_staging_wait", &decline).fail_once(0);
+            reims_vgpu_observe::Emit::decline("host_window_staging_wait", &decline).fail_once(0);
         }
     }
 
@@ -1050,7 +1050,7 @@ impl WindowPresenter {
             // loop should keep accumulating toward the alarm.
             self.suboptimal_streak = 0;
         }
-        crate::observe::off(swapchain_recreated_line(
+        reims_vgpu_observe::off(swapchain_recreated_line(
             from,
             extent,
             self.recreate_reason,
@@ -1416,7 +1416,7 @@ impl WindowPresenter {
                             width: self.extent.width,
                             height: self.extent.height,
                         };
-                        crate::observe::Emit::decline("host_window_present", &decline).fail();
+                        reims_vgpu_observe::Emit::decline("host_window_present", &decline).fail();
                     }
                 } else {
                     self.suboptimal_streak = 0;
@@ -1474,7 +1474,7 @@ impl WindowPresenter {
             // A host that cannot allocate staging cannot allocate it next frame
             // either, so this latches to one line per boot rather than one per
             // present.
-            crate::observe::Emit::decline("host_window_staging", &error).fail_once(0);
+            reims_vgpu_observe::Emit::decline("host_window_staging", &error).fail_once(0);
             return None;
         }
         let staging = self.staging.as_mut()?;
@@ -1640,7 +1640,7 @@ impl WindowPresenter {
         } else {
             "absent".to_string()
         };
-        let emit = crate::observe::Emit::decline(
+        let emit = reims_vgpu_observe::Emit::decline(
             if covered {
                 "host_window_cpu_fallback"
             } else {
@@ -1668,7 +1668,7 @@ impl WindowPresenter {
         };
         // `off()`, not `fail()`: the run *ending* is the window recovering, so
         // it is a census line rather than a drop, per the curated-fail rule.
-        crate::observe::Emit::decline("host_window_slate_end", &reason)
+        reims_vgpu_observe::Emit::decline("host_window_slate_end", &reason)
             .field("frames", self.slate_run)
             .field("covered", u8::from(self.slate_covered))
             .off();
@@ -1687,7 +1687,7 @@ impl WindowPresenter {
         if elapsed.as_millis() < 1_000 {
             return;
         }
-        crate::observe::off(window_cadence_line(
+        reims_vgpu_observe::off(window_cadence_line(
             elapsed.as_millis() as u64,
             self.cadence_presents,
             self.cadence_direct,
@@ -1723,7 +1723,7 @@ impl WindowPresenter {
     ) {
         if let Err(error) = ctx.queue_wait_idle() {
             let decline = VkCall::new(VkOp::WindowDestroyQueueWaitIdle, error);
-            crate::observe::Emit::decline("host_window_destroy", &decline).fail_once(0);
+            reims_vgpu_observe::Emit::decline("host_window_destroy", &decline).fail_once(0);
         }
         if let Some(pools) = pools {
             for frame in &mut self.frames {
@@ -2113,7 +2113,7 @@ mod tests {
     /// and the `THRASH geom_mismatch` proxy.
     #[test]
     fn slate_reason_slugs_are_distinct_and_namespaced() {
-        use crate::observe::Decline;
+        use reims_vgpu_observe::Decline;
         let mut slugs = [
             SlateReason::NoSource,
             SlateReason::NoResident,
@@ -2134,7 +2134,7 @@ mod tests {
 
     #[test]
     fn non_aborting_present_degradations_keep_exact_geometry() {
-        use crate::observe::Decline as _;
+        use reims_vgpu_observe::Decline as _;
         let suboptimal = WindowPresentDecline::SuboptimalPersistent {
             streak: 60,
             width: 1440,
@@ -2150,7 +2150,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            crate::observe::Emit::decline("host_window_present", &suboptimal).render(),
+            reims_vgpu_observe::Emit::decline("host_window_present", &suboptimal).render(),
             "host_window_present reason=window_present_suboptimal_persistent \
              streak=60 width=1440 height=1080"
         );

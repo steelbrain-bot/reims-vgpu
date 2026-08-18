@@ -139,7 +139,7 @@ fn announce(index: u32) {
         // device's prompt queue, and holding `HOOK` across it would put this
         // module's mutex under the device's.
         Some(hook) => hook(index),
-        None => crate::observe::fail(format!(
+        None => reims_vgpu_observe::fail(format!(
             "stamp_announce_no_hook reason=stamp_announce_no_hook index={index} \
              (a stamp completed with no device bound to raise its interrupt; the guest \
              waiting on it will sleep to its one-second deadline)"
@@ -420,7 +420,7 @@ impl StampCompletion {
         let Some(slot) =
             ((index as usize) < reims_vgpu_core::MAX_CHANNELS).then_some(index as usize)
         else {
-            crate::observe::fail(format!(
+            reims_vgpu_observe::fail(format!(
                 "stamp_fifo_out_of_range reason=stamp_fifo_out_of_range index={index} \
                  max_channels={}",
                 reims_vgpu_core::MAX_CHANNELS
@@ -466,7 +466,7 @@ impl StampCompletion {
         let Some(slot) =
             ((index as usize) < reims_vgpu_core::MAX_CHANNELS).then_some(index as usize)
         else {
-            crate::observe::fail(format!(
+            reims_vgpu_observe::fail(format!(
                 "stamp_fifo_out_of_range reason=stamp_fifo_out_of_range index={index} \
                  max_channels={}",
                 reims_vgpu_core::MAX_CHANNELS
@@ -592,8 +592,8 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
         match classify_wait(wait, shared.stop.load(Ordering::Acquire)) {
             CompletionWait::Completed => {}
             CompletionWait::Retry => {
-                if crate::observe::first_sight("stamp_wait_timeout", timeline) {
-                    crate::observe::fail(format!(
+                if reims_vgpu_observe::first_sight("stamp_wait_timeout", timeline) {
+                    reims_vgpu_observe::fail(format!(
                         "stamp_wait_timeout reason=stamp_wait_timeout index={} value={} \
                          (the submission carrying this stamp's word has not executed within the \
                          fence deadline; its completion remains pending)",
@@ -605,12 +605,12 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
                     // must signal. Treating a FIFO ordinal as a ring slot would
                     // produce plausible-looking evidence for unrelated work.
                     match crate::runtime::gpu_hang_trail::submission_for_timeline(timeline) {
-                        Some((slot, submission)) => crate::observe::fail(format!(
+                        Some((slot, submission)) => reims_vgpu_observe::fail(format!(
                             "stamp_wait_timeout_submission reason=stamp_wait_timeout \
                              index={} value={} slot={} held=[{}]",
                             waiting.index, timeline, slot, submission
                         )),
-                        None => crate::observe::fail(format!(
+                        None => reims_vgpu_observe::fail(format!(
                             "stamp_wait_timeout_submission reason=stamp_wait_timeout \
                              index={} value={} held=none \
                              (no live submission-ring entry carries this timeline point)",
@@ -618,21 +618,21 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
                         )),
                     }
                     if let Some(outstanding) = crate::runtime::gpu_hang_trail::outstanding() {
-                        crate::observe::fail(format!(
+                        reims_vgpu_observe::fail(format!(
                             "stamp_wait_timeout_queue reason=stamp_wait_timeout index={} \
                              value={} {outstanding}",
                             waiting.index, timeline
                         ));
                     }
                     if let Some(trail) = crate::runtime::gpu_hang_trail::trail() {
-                        crate::observe::fail(format!(
+                        reims_vgpu_observe::fail(format!(
                             "stamp_wait_timeout_trail reason=stamp_wait_timeout index={} \
                              value={} {trail}",
                             waiting.index, timeline
                         ));
                     }
                     if let Some(firsts) = crate::runtime::gpu_hang_trail::recent_pipeline_firsts() {
-                        crate::observe::fail(format!(
+                        reims_vgpu_observe::fail(format!(
                             "stamp_wait_timeout_pipes reason=stamp_wait_timeout index={} \
                              value={} {firsts}",
                             waiting.index, timeline
@@ -642,7 +642,7 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
                 continue;
             }
             CompletionWait::Failed(e) => {
-                crate::observe::fail(format!(
+                reims_vgpu_observe::fail(format!(
                     "stamp_wait_failed reason=stamp_wait_failed index={} value={} err={e:?} \
                      (the completion remains unpublished)",
                     waiting.index, timeline
@@ -658,7 +658,7 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
             CompletionWait::Stopping => return,
         }
         if !publish_stamp_word(&waiting) {
-            crate::observe::fail(format!(
+            reims_vgpu_observe::fail(format!(
                 "stamp_cpu_store_failed reason=stamp_cpu_store_failed index={} value={:#x} \
                  (the completed queue point could not publish its checked shared word; \
                  its interrupt was withheld)",

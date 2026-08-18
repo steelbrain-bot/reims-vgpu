@@ -23,7 +23,7 @@
 //! here owns.
 
 use crate::backend::vulkan::translate::TranslateReason;
-use crate::observe::Decline;
+use reims_vgpu_observe::Decline;
 
 /// A request the engine understood and declined.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -312,7 +312,7 @@ pub enum DrawReason {
     },
 }
 
-impl crate::observe::Decline for DrawReason {
+impl reims_vgpu_observe::Decline for DrawReason {
     /// Stable slug for `reason=` in the always-on fail log. One per distinct
     /// check, never shared.
     fn slug(&self) -> &'static str {

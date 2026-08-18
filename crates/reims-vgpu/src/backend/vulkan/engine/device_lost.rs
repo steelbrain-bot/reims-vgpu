@@ -8,7 +8,7 @@
 
 use ash::vk;
 
-use crate::observe::Decline;
+use reims_vgpu_observe::Decline;
 
 use super::types::DrawError;
 use super::vk_call::VkOp;
@@ -158,7 +158,7 @@ impl Decline for DeviceLostDecline {
     }
 }
 
-crate::observe::decline_display!(DeviceLostDecline);
+reims_vgpu_observe::decline_display!(DeviceLostDecline);
 
 #[cfg(test)]
 mod tests {
@@ -222,7 +222,7 @@ mod tests {
     #[test]
     fn driver_and_recreate_failures_keep_their_load_bearing_cause() {
         for decline in all() {
-            let line = crate::observe::Emit::decline("device_lost_test", &decline).render();
+            let line = reims_vgpu_observe::Emit::decline("device_lost_test", &decline).render();
             assert!(line.starts_with(&format!("device_lost_test reason={}", decline.slug())));
             for field in line.split(' ').skip(1) {
                 assert!(!field.is_empty(), "empty field in {line:?}");
@@ -234,7 +234,7 @@ mod tests {
         }
 
         let recreate = &all()[1];
-        let line = crate::observe::Emit::decline("device_lost_test", recreate).render();
+        let line = reims_vgpu_observe::Emit::decline("device_lost_test", recreate).render();
         assert!(
             line.contains("cause=vk_init_create_device vk_result="),
             "{line}"

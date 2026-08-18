@@ -70,7 +70,7 @@ use super::context::DeviceContext;
 use super::scatter_shader::GUEST_SCATTER_SPIRV;
 use super::types::DrawError;
 use super::vk_call::{VkCall, VkOp};
-use crate::observe::Decline;
+use reims_vgpu_observe::Decline;
 
 /// Bytes in the word this kernel copies in. Every offset and length a run
 /// carries has to be a whole number of these or the run cannot be expressed.
@@ -154,7 +154,7 @@ impl Decline for ScatterDecline {
     }
 }
 
-crate::observe::decline::decline_display!(ScatterDecline);
+reims_vgpu_observe::decline::decline_display!(ScatterDecline);
 
 /// One run as the planner sees it, before it becomes word indices.
 ///

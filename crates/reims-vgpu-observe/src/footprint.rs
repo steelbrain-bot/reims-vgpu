@@ -246,7 +246,7 @@ impl Footprint {
         out
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-fixtures"))]
     fn reset(&self) {
         for cell in self.bits.iter() {
             cell.store(0, Ordering::Relaxed);
@@ -399,12 +399,12 @@ pub fn census_lines(now_ms: u64) -> Vec<String> {
 /// if no other test is marking concurrently. `--test-threads=1` is the project
 /// rule and this does not depend on it: a global whose correctness rests on the
 /// runner's flags breaks for whoever runs a single test by name.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-fixtures"))]
 static TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Take the set exclusively for a test and clear it. Held for the caller's scope.
-#[cfg(test)]
-pub(crate) fn exclusive_for_tests() -> std::sync::MutexGuard<'static, ()> {
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn exclusive_for_tests() -> std::sync::MutexGuard<'static, ()> {
     let g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
     FOOTPRINT.reset();
     g

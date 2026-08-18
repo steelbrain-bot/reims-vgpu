@@ -33,8 +33,8 @@ use std::collections::HashMap;
 
 use ash::vk;
 
-use crate::observe::Decline;
 use crate::runtime::guest_ram::{GuestRamError, GuestRamImport, GuestRef};
+use reims_vgpu_observe::Decline;
 use reims_vgpu_vulkan::host_pointer::ImportTypeRefusal;
 
 /// One host allocation living on the GPU as a bindable buffer, with no copy
@@ -189,7 +189,7 @@ impl Decline for HostRamDecline {
     }
 }
 
-crate::observe::decline_display!(HostRamDecline);
+reims_vgpu_observe::decline_display!(HostRamDecline);
 
 /// A guest-memory range the engine can bind right now.
 ///
@@ -499,7 +499,7 @@ unsafe fn import_ramblock(
     // any more and there cannot be one: a pick whose heap could not hold the
     // import is a refusal now, so every line here is an import the device was
     // allowed to make.
-    crate::observe::off(format!(
+    reims_vgpu_observe::off(format!(
         "host_ram_import id={} bytes={size} mtype={memory_type_index} heap={} heap_mb={} \
          probe_us={probe_us} alloc_us={} ok={}",
         import.id().get(),
@@ -609,7 +609,7 @@ impl Decline for GuestWriteDecline {
     }
 }
 
-crate::observe::decline::decline_display!(GuestWriteDecline);
+reims_vgpu_observe::decline::decline_display!(GuestWriteDecline);
 
 #[cfg(test)]
 mod tests {

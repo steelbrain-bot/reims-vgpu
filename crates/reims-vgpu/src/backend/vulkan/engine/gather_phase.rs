@@ -143,7 +143,7 @@ pub(crate) enum Part {
 
 const PARTS: usize = 4;
 
-/// Nanoseconds, per [`crate::observe::phase_clock`]. Tens of thousands of spans
+/// Nanoseconds, per [`reims_vgpu_observe::phase_clock`]. Tens of thousands of spans
 /// a second is exactly the population a microsecond accumulator reports as
 /// free.
 static NS: [AtomicU64; PARTS] = [const { AtomicU64::new(0) }; PARTS];
@@ -167,7 +167,7 @@ pub struct GatherPhaseWindow {
 /// which arm a boot ran.
 pub fn take_window() -> Option<GatherPhaseWindow> {
     let us =
-        |p: Part| crate::observe::phase_clock::to_us(NS[p as usize].swap(0, Ordering::Relaxed));
+        |p: Part| reims_vgpu_observe::phase_clock::to_us(NS[p as usize].swap(0, Ordering::Relaxed));
     let n = |p: Part| N[p as usize].swap(0, Ordering::Relaxed);
     let w = GatherPhaseWindow {
         plan_us: us(Part::Plan),
@@ -201,7 +201,7 @@ impl Drop for Span {
     fn drop(&mut self) {
         let slot = self.part as usize;
         NS[slot].fetch_add(
-            crate::observe::phase_clock::charge_ns(self.started.elapsed()),
+            reims_vgpu_observe::phase_clock::charge_ns(self.started.elapsed()),
             Ordering::Relaxed,
         );
         N[slot].fetch_add(1, Ordering::Relaxed);

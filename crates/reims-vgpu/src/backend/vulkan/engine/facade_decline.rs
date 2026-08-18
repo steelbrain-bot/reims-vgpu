@@ -8,8 +8,8 @@
 use super::compute_execution::residency_fields;
 use super::draw_execution::identity_fields;
 use super::types::TargetIdentity;
-use crate::observe::Decline;
 use reims_vgpu_core::ComputeStorageResidencyKey;
+use reims_vgpu_observe::Decline;
 use reims_vgpu_protocol::SubmissionIdentity;
 
 /// A specific engine façade or host-window presenter state failure.
@@ -95,7 +95,7 @@ impl Decline for EngineFacadeDecline {
     }
 }
 
-crate::observe::decline_display!(EngineFacadeDecline);
+reims_vgpu_observe::decline_display!(EngineFacadeDecline);
 
 #[cfg(test)]
 mod tests {
@@ -170,7 +170,7 @@ mod tests {
     #[test]
     fn engine_facade_fields_are_structured_and_log_safe() {
         for decline in all() {
-            let line = crate::observe::Emit::decline("engine_facade_test", &decline).render();
+            let line = reims_vgpu_observe::Emit::decline("engine_facade_test", &decline).render();
             assert!(line.starts_with(&format!("engine_facade_test reason={}", decline.slug())));
             for field in line.split(' ').skip(1) {
                 assert!(!field.is_empty(), "empty field in {line:?}");

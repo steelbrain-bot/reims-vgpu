@@ -524,7 +524,7 @@ unsafe fn plan_buffer_gather_dispatches(
                     counters
                         .buffer_gather_declined
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    crate::observe::Emit::decline("buffer_gather_plan", &decline).fail_once(0);
+                    reims_vgpu_observe::Emit::decline("buffer_gather_plan", &decline).fail_once(0);
                     return Ok(None);
                 }
             }
@@ -805,14 +805,14 @@ unsafe fn import_guest_buffer_window(
     let bound = match unsafe { pools.bind_guest_ram(ctx, stretch.guest) } {
         Ok(bound) => bound,
         Err(inner) => {
-            crate::observe::Emit::decline("vk_buffer_import", &inner).fail_once(0);
+            reims_vgpu_observe::Emit::decline("vk_buffer_import", &inner).fail_once(0);
             return None;
         }
     };
     let offset = bound.offset + bound.head + stretch.skip;
     let align = buffer_bind_offset_alignment(role, ctx.storage_buffer_offset_align);
     if !offset.is_multiple_of(align) {
-        crate::observe::Emit::decline(
+        reims_vgpu_observe::Emit::decline(
             "vk_buffer_import",
             &BufferImportDecline::BindOffsetAlignment { offset, align },
         )
@@ -846,14 +846,14 @@ pub(super) unsafe fn import_guest_compute_buffer_window(
     let bound = match unsafe { pools.bind_guest_ram(ctx, stretch.guest) } {
         Ok(bound) => bound,
         Err(inner) => {
-            crate::observe::Emit::decline("vk_compute_buffer_import", &inner).fail_once(0);
+            reims_vgpu_observe::Emit::decline("vk_compute_buffer_import", &inner).fail_once(0);
             return None;
         }
     };
     let offset = bound.offset + bound.head + stretch.skip;
     let align = ctx.storage_buffer_offset_align;
     if !offset.is_multiple_of(align) {
-        crate::observe::Emit::decline(
+        reims_vgpu_observe::Emit::decline(
             "vk_compute_buffer_import",
             &BufferImportDecline::BindOffsetAlignment { offset, align },
         )
@@ -950,7 +950,7 @@ unsafe fn gather_guest_buffer_window(
         let bound = match unsafe { pools.bind_guest_ram(ctx, stretch.guest) } {
             Ok(bound) => bound,
             Err(inner) => {
-                crate::observe::Emit::decline("vk_buffer_gather", &inner).fail_once(0);
+                reims_vgpu_observe::Emit::decline("vk_buffer_gather", &inner).fail_once(0);
                 return Ok(None);
             }
         };
@@ -963,7 +963,7 @@ unsafe fn gather_guest_buffer_window(
     // previous user of the slot left there, which is wrong pixels rather than
     // slow ones. Checked here because this is the last place that can see it.
     if covered != src.total_len {
-        crate::observe::Emit::decline(
+        reims_vgpu_observe::Emit::decline(
             "vk_buffer_gather",
             &BufferImportDecline::GatherShort {
                 covered,
@@ -1026,7 +1026,7 @@ enum BufferImportDecline {
     GatherShort { covered: u64, want: u64 },
 }
 
-impl crate::observe::Decline for BufferImportDecline {
+impl reims_vgpu_observe::Decline for BufferImportDecline {
     fn slug(&self) -> &'static str {
         match self {
             Self::BindOffsetAlignment { .. } => "buffer_import_bind_offset_alignment",
@@ -1046,7 +1046,7 @@ impl crate::observe::Decline for BufferImportDecline {
     }
 }
 
-crate::observe::decline::decline_display!(BufferImportDecline);
+reims_vgpu_observe::decline::decline_display!(BufferImportDecline);
 
 /// Where the buffer half of a guest-sourced sampled upload came from.
 ///
@@ -1308,7 +1308,7 @@ pub(super) unsafe fn prepare_guest_texel_window(
         let bound = match unsafe { pools.bind_guest_ram(ctx, stretch.guest) } {
             Ok(bound) => bound,
             Err(inner) => {
-                crate::observe::Emit::decline("vk_sampled_import", &inner).fail_once(0);
+                reims_vgpu_observe::Emit::decline("vk_sampled_import", &inner).fail_once(0);
                 return Ok(None);
             }
         };
@@ -1320,7 +1320,7 @@ pub(super) unsafe fn prepare_guest_texel_window(
         // such texture from the start of the allocation.
         let offset = bound.offset + bound.head + stretch.skip;
         if !offset.is_multiple_of(GUEST_IMPORT_COPY_OFFSET_ALIGN) {
-            crate::observe::Emit::decline(
+            reims_vgpu_observe::Emit::decline(
                 "vk_sampled_import",
                 &SampledImportDecline::CopyOffsetAlignment { offset },
             )
@@ -1343,7 +1343,7 @@ pub(super) unsafe fn prepare_guest_texel_window(
         let bound = match unsafe { pools.bind_guest_ram(ctx, stretch.guest) } {
             Ok(bound) => bound,
             Err(inner) => {
-                crate::observe::Emit::decline("vk_sampled_import", &inner).fail_once(0);
+                reims_vgpu_observe::Emit::decline("vk_sampled_import", &inner).fail_once(0);
                 return Ok(None);
             }
         };
@@ -1356,7 +1356,7 @@ pub(super) unsafe fn prepare_guest_texel_window(
     // previous user of the slot left there, which is wrong pixels rather than
     // slow ones. Checked here because this is the last place that can see it.
     if covered != src.total_len {
-        crate::observe::Emit::decline(
+        reims_vgpu_observe::Emit::decline(
             "vk_sampled_import",
             &SampledImportDecline::GatherShort {
                 covered,
@@ -1399,7 +1399,7 @@ enum SampledImportDecline {
     GatherShort { covered: u64, want: u64 },
 }
 
-impl crate::observe::Decline for SampledImportDecline {
+impl reims_vgpu_observe::Decline for SampledImportDecline {
     fn slug(&self) -> &'static str {
         match self {
             Self::CopyOffsetAlignment { .. } => "sampled_import_copy_offset_alignment",
@@ -1417,7 +1417,7 @@ impl crate::observe::Decline for SampledImportDecline {
     }
 }
 
-crate::observe::decline::decline_display!(SampledImportDecline);
+reims_vgpu_observe::decline::decline_display!(SampledImportDecline);
 
 /// Shared validation for a draw-time buffer's content source. A `GuestRuns`
 /// span must be internally consistent: the requested subrange fits in `runs`,
@@ -2229,14 +2229,14 @@ fn batch_mixed_targets_disabled() -> bool {
         let (state, value) = crate::env::read(crate::env::BATCH_MIXED_TARGETS);
         match state {
             crate::env::Switch::Off => {
-                crate::observe::off("batch_mixed reason=batch_mixed_targets_disabled_by_env");
+                reims_vgpu_observe::off("batch_mixed reason=batch_mixed_targets_disabled_by_env");
                 true
             }
             // An unrecognized spelling is named rather than silently read as the
             // default. It still takes the default arm: this switch may only turn
             // a rail off, and a value nobody can parse is not that.
             crate::env::Switch::Unrecognized => {
-                crate::observe::fail(format!(
+                reims_vgpu_observe::fail(format!(
                     "batch_mixed reason=batch_mixed_targets_env_unrecognized value={}",
                     value.unwrap_or_default()
                 ));
@@ -2258,14 +2258,14 @@ fn batch_depth_disabled() -> bool {
         let (state, value) = crate::env::read(crate::env::BATCH_DEPTH);
         match state {
             crate::env::Switch::Off => {
-                crate::observe::off("batch_depth reason=batch_depth_disabled_by_env");
+                reims_vgpu_observe::off("batch_depth reason=batch_depth_disabled_by_env");
                 true
             }
             // Named rather than silently read as the default. It still takes the
             // default arm: this switch may only turn a rail off, and a value
             // nobody can parse is not that.
             crate::env::Switch::Unrecognized => {
-                crate::observe::fail(format!(
+                reims_vgpu_observe::fail(format!(
                     "batch_depth reason=batch_depth_env_unrecognized value={}",
                     value.unwrap_or_default()
                 ));
@@ -2531,8 +2531,8 @@ unsafe fn acquire_depth_view(
 /// different question at a hundred times the volume.
 fn note_depth_load_without_content(width: u32, height: u32, stencil: bool) {
     let key = (u64::from(width) << 32) ^ (u64::from(height) << 1) ^ u64::from(stencil);
-    if crate::observe::first_sight("depth_load_without_content", key) {
-        crate::observe::fail(format!(
+    if reims_vgpu_observe::first_sight("depth_load_without_content", key) {
+        reims_vgpu_observe::fail(format!(
             "depth_load reason=depth_load_without_content {width}x{height} \
              stencil={} (pass asked LOAD, resident holds nothing; cleared)",
             u8::from(stencil)
@@ -3812,8 +3812,8 @@ pub(crate) unsafe fn execute_draw_inner(
                     if *samples > 1 {
                         crate::runtime::drain::note_store_route("sampled_resident_multisample");
                         let key = (u64::from(resource.binding) << 32) | u64::from(*samples);
-                        if crate::observe::first_sight("sampled_resident_multisample", key) {
-                            crate::observe::off(format!(
+                        if reims_vgpu_observe::first_sight("sampled_resident_multisample", key) {
+                            reims_vgpu_observe::off(format!(
                                 "sampled_resident_multisample binding={} shader_ms={} \
                                  resident_samples={} resident={}x{} ready={} identity={identity:?}",
                                 resource.binding,
@@ -6248,7 +6248,7 @@ mod tests {
     use crate::backend::vulkan::engine::types::{
         GuestRun, GuestRunSource, SampledImageResource, SampledSource,
     };
-    use crate::observe::Decline;
+    use reims_vgpu_observe::Decline;
 
     fn sig(binding: u32) -> BindingSig {
         BindingSig {

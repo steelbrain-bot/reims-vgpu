@@ -7,10 +7,10 @@
 //! invariants of an already-built engine request.
 
 use crate::backend::vulkan::translate::TranslateReason;
-use crate::observe::Decline;
 use crate::runtime::draw::IndexLoadReason;
 use crate::runtime::m2v_cache::M2vCacheDecline;
 use crate::runtime::mtlb::MtlbDecline;
+use reims_vgpu_observe::Decline;
 use reims_vgpu_protocol::ObjectKind;
 
 /// A specific pipeline/stage preparation failure before engine request validation.
@@ -711,7 +711,7 @@ impl Decline for DrawPreparationDecline {
     }
 }
 
-crate::observe::decline_display!(DrawPreparationDecline);
+reims_vgpu_observe::decline_display!(DrawPreparationDecline);
 
 #[cfg(test)]
 mod tests {
@@ -974,7 +974,7 @@ mod tests {
     #[test]
     fn draw_preparation_fields_are_structured_and_log_safe() {
         for decline in all() {
-            let line = crate::observe::Emit::decline("draw_prepare_test", &decline).render();
+            let line = reims_vgpu_observe::Emit::decline("draw_prepare_test", &decline).render();
             assert!(line.starts_with(&format!("draw_prepare_test reason={}", decline.slug())));
             for field in line.split(' ').skip(1) {
                 assert!(!field.is_empty(), "empty field in {line:?}");

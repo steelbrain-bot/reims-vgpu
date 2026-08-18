@@ -158,7 +158,7 @@ impl PipelineCacheDecline {
     }
 }
 
-impl crate::observe::Decline for PipelineCacheDecline {
+impl reims_vgpu_observe::Decline for PipelineCacheDecline {
     fn slug(&self) -> &'static str {
         match self {
             Self::Read { .. } => "vk_pipeline_cache_read",
@@ -645,7 +645,7 @@ impl DeviceContext {
             Ok(None) => vk::API_VERSION_1_0,
             Err(result) => {
                 let decline = InitDecline::EnumerateInstanceVersion { result };
-                crate::observe::Emit::decline("vk_loader_version", &decline).fail_once(0);
+                reims_vgpu_observe::Emit::decline("vk_loader_version", &decline).fail_once(0);
                 vk::API_VERSION_1_0
             }
         };
@@ -766,7 +766,7 @@ impl DeviceContext {
             let driver_info = CStr::from_ptr(driver.driver_info.as_ptr()).to_string_lossy();
             let profile =
                 classify_memory(&instance.get_physical_device_memory_properties(*candidate));
-            crate::observe::off(format!(
+            reims_vgpu_observe::off(format!(
                 "vk_device_candidate index={index} of={} name={name:?} type={device_type:?} \
                  api={} above_floor={} rank={} driver_id={:?} driver={driver_name:?} \
                  driver_info={driver_info:?} memory={} device_local_mb={} \
@@ -791,7 +791,7 @@ impl DeviceContext {
                     found,
                 }
             };
-            crate::observe::Emit::decline("vk_device_select_fail", &decline).fail();
+            reims_vgpu_observe::Emit::decline("vk_device_select_fail", &decline).fail();
             DrawError::Init(decline)
         })?;
         let qfs = instance.get_physical_device_queue_family_properties(pd);
@@ -1041,7 +1041,7 @@ impl DeviceContext {
                 .create_query_pool(&ci, None)
                 .map(|pool| TimestampProbe { pool, scale })
                 .map_err(|e| {
-                    crate::observe::Emit::decline(
+                    reims_vgpu_observe::Emit::decline(
                         "vk_timestamp_pool",
                         &VkCall::new(VkOp::ContextCreateQueryPool, e),
                     )
@@ -1059,7 +1059,7 @@ impl DeviceContext {
                     .create_query_pool(&ci, None)
                     .map(|pool| DrawSpanProbe { pool, scale })
                     .map_err(|e| {
-                        crate::observe::Emit::decline(
+                        reims_vgpu_observe::Emit::decline(
                             "vk_draw_span_pool",
                             &VkCall::new(VkOp::ContextCreateQueryPool, e),
                         )
@@ -1077,7 +1077,7 @@ impl DeviceContext {
             .then(|| super::stamp_completion::StampCompletion::start(&device))
             .transpose()
             .map_err(|e| {
-                crate::observe::Emit::decline(
+                reims_vgpu_observe::Emit::decline(
                     "vk_stamp_completion",
                     &VkCall::new(VkOp::ContextCreateSemaphore, e),
                 )
@@ -1089,7 +1089,7 @@ impl DeviceContext {
         let queue_owner = match super::queue_owner::QueueOwner::start(&device, queue) {
             Ok(owner) => Some(owner),
             Err(error) => {
-                crate::observe::fail(format!(
+                reims_vgpu_observe::fail(format!(
                     "vk_queue_owner_start_failed reason=vk_queue_owner_start_failed error={error} \
                      (queue submission remains synchronous)"
                 ));
@@ -1124,13 +1124,13 @@ impl DeviceContext {
         // decided it, and whether this device can hand a frame to another
         // device without a copy. Load-bearing for portability debugging — "why
         // is this host slow / blank" starts here.
-        crate::observe::off(caps.selection_line(&device_name));
+        reims_vgpu_observe::off(caps.selection_line(&device_name));
         // Beside `vk_caps` rather than inside it: the queue arrangement is a
         // property of the device this engine created, and `HostGpuCaps` is
         // built before any queue family is chosen. `transfer_family=none` is
         // not a degraded reading — it is the arrangement, and it says this
         // boot's copies share the queue its draws are submitted to.
-        crate::observe::off(format!(
+        reims_vgpu_observe::off(format!(
             "vk_queues families={} graphics_family={gq} compute_capable={compute_capable} transfer_family={}",
             qfs.len(),
             transfer_qf
@@ -1138,7 +1138,7 @@ impl DeviceContext {
                 .unwrap_or_else(|| "none".to_owned()),
         ));
         // Fine-grained capabilities that do change what a draw can express.
-        crate::observe::off(format!(
+        reims_vgpu_observe::off(format!(
             "vk_device_select name={device_name:?} type={:?} depth_stencil_format={:?} bgra_storage_composite={} compute_capable={} quirks_no_deferred_batching={} quirks_guest_pages_authoritative={}",
             props.device_type,
             depth_stencil_format,
@@ -1153,11 +1153,11 @@ impl DeviceContext {
         // came back false. The two are not redundant: a rail declining by name
         // and a rail never asked for look identical in a log that only reports
         // what was enabled.
-        crate::observe::off(features.report_line());
+        reims_vgpu_observe::off(features.report_line());
         // What the operator set. A boot whose rails were narrowed from outside
         // the process reads as a slow device unless the narrowing is on the
         // same page as the capabilities.
-        crate::observe::off(crate::env::report_line());
+        reims_vgpu_observe::off(crate::env::report_line());
         // Warm-start the pipeline cache from the previous boot's blob. Cold
         // pipeline compiles are the remaining pre-convergence stall class
         // (~256 ms first use per pipeline); the blob is keyed by the device's
@@ -1169,7 +1169,7 @@ impl DeviceContext {
         let initial_blob = match read_pipeline_cache_blob(&pipeline_cache_path, &props) {
             Ok(blob) => blob,
             Err(decline) => {
-                crate::observe::Emit::decline("vk_pipeline_cache_load", &decline).fail_once(0);
+                reims_vgpu_observe::Emit::decline("vk_pipeline_cache_load", &decline).fail_once(0);
                 None
             }
         };
@@ -1184,7 +1184,7 @@ impl DeviceContext {
                 // Continue cold, while preserving the warm failure and treating
                 // the cold cache as length zero so the next save repairs disk.
                 let decline = PipelineCacheDecline::WarmCreate { result };
-                crate::observe::Emit::decline("vk_pipeline_cache_load", &decline).fail_once(0);
+                reims_vgpu_observe::Emit::decline("vk_pipeline_cache_load", &decline).fail_once(0);
                 let cache = device
                     .create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None)
                     .map_err(|result| {
@@ -1196,7 +1196,7 @@ impl DeviceContext {
                 return Err(DrawError::Init(InitDecline::CreatePipelineCache { result }));
             }
         };
-        crate::observe::off(format!(
+        reims_vgpu_observe::off(format!(
             "vk_pipeline_cache_load bytes={initial_len} path={}",
             pipeline_cache_path.display()
         ));
@@ -1252,7 +1252,7 @@ impl DeviceContext {
             Ok(d) => d,
             Err(e) => {
                 let decline = VkCall::new(VkOp::ContextPipelineCacheGetData, e);
-                crate::observe::Emit::decline("vk_pipeline_cache_save", &decline).fail_once(0);
+                reims_vgpu_observe::Emit::decline("vk_pipeline_cache_save", &decline).fail_once(0);
                 return;
             }
         };
@@ -1261,7 +1261,7 @@ impl DeviceContext {
         // blob — but every boot in between pays a 30 MB write to produce a file
         // whose only use is to be declined.
         if data.len() > PIPELINE_CACHE_MAX_WARM_BYTES {
-            crate::observe::Emit::decline(
+            reims_vgpu_observe::Emit::decline(
                 "vk_pipeline_cache_save",
                 &PipelineCacheDecline::TooLarge {
                     bytes: data.len(),
@@ -1305,14 +1305,15 @@ impl DeviceContext {
         std::thread::spawn(move || {
             let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
             match write_cache_atomic(&path, &tmp, &data, &PERSISTED_LEN) {
-                Ok(CacheSaveOutcome::Landed) => crate::observe::off(format!(
+                Ok(CacheSaveOutcome::Landed) => reims_vgpu_observe::off(format!(
                     "vk_pipeline_cache_save bytes={} path={}",
                     data.len(),
                     path.display()
                 )),
                 Ok(CacheSaveOutcome::Superseded) => {}
                 Err(decline) => {
-                    crate::observe::Emit::decline("vk_pipeline_cache_save", &decline).fail_once(0)
+                    reims_vgpu_observe::Emit::decline("vk_pipeline_cache_save", &decline)
+                        .fail_once(0)
                 }
             }
         });
@@ -1383,9 +1384,9 @@ impl DeviceContext {
                 // table makes the pick differ between call sites says so instead
                 // of latching the first answer for the boot.
                 let key = ((class as u64) << 32) | pick.index as u64;
-                if crate::observe::first_sight("vk_memory_type_pick", key) {
+                if reims_vgpu_observe::first_sight("vk_memory_type_pick", key) {
                     let t = self.memory_properties.memory_types[pick.index as usize];
-                    crate::observe::off(format!(
+                    reims_vgpu_observe::off(format!(
                         "vk_memory_type_pick class={class:?} index={} heap={} flags={:?} \
                          heap_bytes={} bytes={bytes}",
                         pick.index, pick.heap_index, t.property_flags, pick.heap_bytes,
@@ -1414,10 +1415,10 @@ impl DeviceContext {
     ) {
         // The tag is the refusing check and the key is the class, so the two
         // together are the (class, check) pair without a hand-packed word.
-        if !crate::observe::first_sight(refusal.slug(), class as u64) {
+        if !reims_vgpu_observe::first_sight(refusal.slug(), class as u64) {
             return;
         }
-        crate::observe::fail(format!(
+        reims_vgpu_observe::fail(format!(
             "vk_memory_type_refused reason={} class={class:?}",
             refusal
         ));
@@ -1886,7 +1887,7 @@ impl ContextOwner {
         if self.recreate_count == 0 {
             return;
         }
-        crate::observe::fail(format!(
+        reims_vgpu_observe::fail(format!(
             "vk_device_recreate_proven recreates={} (guest work ran on the rebuilt device; \
              the storm budget starts over)",
             self.recreate_count
@@ -1946,7 +1947,7 @@ mod pipeline_cache_blob_tests {
 
         assert_eq!(actual, expected);
         assert_eq!(
-            crate::observe::Decline::slug(&actual),
+            reims_vgpu_observe::Decline::slug(&actual),
             "vk_init_create_device"
         );
         let shown = actual.to_string();
@@ -2014,7 +2015,7 @@ mod pipeline_cache_blob_tests {
 
     #[test]
     fn cold_cache_fallbacks_distinguish_absence_corruption_read_and_driver_rejection() {
-        use crate::observe::Decline as _;
+        use reims_vgpu_observe::Decline as _;
         let root =
             std::env::temp_dir().join(format!("reims-vgpu-cache-load-test-{}", std::process::id()));
         std::fs::remove_dir_all(&root).ok();
@@ -2055,7 +2056,7 @@ mod pipeline_cache_blob_tests {
     /// if the size gate is ever moved after the compatibility gate.
     #[test]
     fn an_oversized_pipeline_cache_blob_is_declined_by_size_not_by_shape() {
-        use crate::observe::Decline as _;
+        use reims_vgpu_observe::Decline as _;
         let root = std::env::temp_dir().join(format!(
             "reims-vgpu-pcap-{}-{:?}",
             std::process::id(),
@@ -2196,7 +2197,7 @@ mod pipeline_cache_blob_tests {
 
     #[test]
     fn cache_persist_failures_name_write_and_rename_separately() {
-        use crate::observe::Decline as _;
+        use reims_vgpu_observe::Decline as _;
         let root = std::env::temp_dir().join(format!(
             "reims-vgpu-cache-error-test-{}",
             std::process::id()

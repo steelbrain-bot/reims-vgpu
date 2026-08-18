@@ -101,7 +101,7 @@ impl FailureLatch {
         let mut failure = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if failure.is_none() {
             *failure = Some(result);
-            crate::observe::fail(format!(
+            reims_vgpu_observe::fail(format!(
                 "vk_queue_async_submit_failed reason=vk_queue_async_submit_failed result={result:?}"
             ));
             // Unlike a synchronous submit, this failure arrives after the

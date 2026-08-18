@@ -607,7 +607,7 @@ impl ResourcePools {
         let (set, pool, grew) = self.desc_arena.allocate(device, dsl)?;
         if grew {
             counters.desc_pool_grow.fetch_add(1, Ordering::Relaxed);
-            crate::observe::off(format!(
+            reims_vgpu_observe::off(format!(
                 "desc_arena_grow blocks={} block_max_sets={DESC_BLOCK_MAX_SETS} cause=pool_exhausted",
                 self.desc_arena.block_count()
             ));
@@ -644,7 +644,7 @@ impl ResourcePools {
             }
             Err(e) => {
                 self.scatter_refused = true;
-                crate::observe::Emit::decline("scatter_pipeline", &e).fail();
+                reims_vgpu_observe::Emit::decline("scatter_pipeline", &e).fail();
                 None
             }
         }
@@ -1289,11 +1289,11 @@ impl ResourcePools {
                     Some(note) => format!("{note}"),
                     None => "none (this slot's work was never recorded)".to_string(),
                 };
-                crate::observe::fail(format!(
+                reims_vgpu_observe::fail(format!(
                     "vk_engine_fence_wedged slot={index} result={e:?} held={held}"
                 ));
                 if let Some(rest) = crate::runtime::gpu_hang_trail::outstanding() {
-                    crate::observe::fail(format!("vk_engine_fence_wedged_queue {rest}"));
+                    reims_vgpu_observe::fail(format!("vk_engine_fence_wedged_queue {rest}"));
                 }
                 Self::wait_error(counters, e, DeviceLostOp::PoolsWaitFencesRetire)
             })?;
@@ -2613,7 +2613,7 @@ impl ResourcePools {
                 );
             }
         }
-        crate::observe::off(format!(
+        reims_vgpu_observe::off(format!(
             "staging_pool hits={} misses={} live={} free_slots={free_slots} free_mb={} miss_bins={} miss_us_bins={us_bins} free_bins={}",
             self.staging_hits,
             self.staging_misses,
@@ -3828,7 +3828,7 @@ pub(crate) struct ReadbackMemoryDegrade {
     type_bits: u32,
 }
 
-impl crate::observe::Decline for ReadbackMemoryDegrade {
+impl reims_vgpu_observe::Decline for ReadbackMemoryDegrade {
     fn slug(&self) -> &'static str {
         "readback_memory_not_cached"
     }
@@ -3852,17 +3852,17 @@ fn note_readback_memory(
     type_bits: u32,
     kind: MappedMemoryKind,
 ) {
-    if !crate::observe::first_sight("readback_memory", u64::from(memory_type)) {
+    if !reims_vgpu_observe::first_sight("readback_memory", u64::from(memory_type)) {
         return;
     }
     let topology = ctx.caps.memory.topology.slug();
     if kind.cached {
-        crate::observe::off(format!(
+        reims_vgpu_observe::off(format!(
             "readback_memory type={memory_type} cached=1 coherent={} topology={topology}",
             u8::from(kind.coherent),
         ));
     } else {
-        crate::observe::Emit::decline(
+        reims_vgpu_observe::Emit::decline(
             "readback_memory",
             &ReadbackMemoryDegrade {
                 memory_type,
@@ -4695,7 +4695,7 @@ mod recycle_tests {
     /// destroy is unconditional.
     #[test]
     fn rekeying_a_pinned_compute_resident_is_refused_rather_than_dropped() {
-        use crate::observe::decline::Decline;
+        use reims_vgpu_observe::decline::Decline;
         let mut pools = ResourcePools::new();
         let pinned = admit_compute_resident(&mut pools, 1, 0, true);
         let unpinned = admit_compute_resident(&mut pools, 2, 0, false);

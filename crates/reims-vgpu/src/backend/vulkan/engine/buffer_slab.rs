@@ -496,7 +496,7 @@ impl BufferSlabPool {
         // handful of times a boot, not once per staging acquire, so
         // `sub_allocs` climbing while `block_allocs` stays flat is the whole
         // claim of this module in one line.
-        crate::observe::off(format!(
+        reims_vgpu_observe::off(format!(
             "{} ev=alloc size={block_size} dedicated={} small={} block_allocs={} \
              block_frees={} sub_allocs={} sub_frees={} resident_mb={} live_kb={} violations={}",
             self.kind.tag(),
@@ -540,7 +540,7 @@ impl BufferSlabPool {
             // entirely. Releasing it would insert an overlap into a live block's
             // free list — the aliasing the poisoning net below exists to stop,
             // arriving from outside where the net cannot see it. Refuse instead.
-            crate::observe::Emit::decline(
+            reims_vgpu_observe::Emit::decline(
                 self.kind.tag(),
                 &SlabDecline::ReleaseWrongPool {
                     token_kind: token.kind.tag(),
@@ -555,7 +555,7 @@ impl BufferSlabPool {
             Ok(true) => {}
             Ok(false) => return,
             Err(decline) => {
-                crate::observe::Emit::decline(self.kind.tag(), &decline)
+                reims_vgpu_observe::Emit::decline(self.kind.tag(), &decline)
                     .fail_once(u64::from(token.block));
                 return;
             }
@@ -606,7 +606,7 @@ impl BufferSlabPool {
         // needs no separate `vkUnmapMemory`.
         device.free_memory(b.memory, None);
         self.block_frees += 1;
-        crate::observe::off(format!(
+        reims_vgpu_observe::off(format!(
             "{} ev=free block_allocs={} block_frees={} sub_allocs={} sub_frees={} \
              resident_mb={} live_kb={}",
             self.kind.tag(),
@@ -703,7 +703,7 @@ impl BufferSlabPool {
                 size: b.plan.size(),
                 free_bytes: b.plan.free_bytes(),
             };
-            crate::observe::Emit::decline(self.kind.tag(), &decline).fail_once(idx as u64);
+            reims_vgpu_observe::Emit::decline(self.kind.tag(), &decline).fail_once(idx as u64);
             return false;
         }
         false
@@ -733,7 +733,7 @@ mod tests {
     /// nothing, and the trim must still be able to give the block back.
     #[test]
     fn an_emptied_block_is_kept_for_reuse_until_idle_trims_it() {
-        crate::observe::redirect_logs_for_tests();
+        reims_vgpu_observe::redirect_logs_for_tests();
         let mut ctx = match unsafe { DeviceContext::create() } {
             Ok(c) => c,
             Err(e) => {

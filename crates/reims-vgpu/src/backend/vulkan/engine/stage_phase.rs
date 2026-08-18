@@ -153,7 +153,7 @@ pub(crate) enum Part {
 
 const PARTS: usize = 6;
 
-/// Nanoseconds, per [`crate::observe::phase_clock`]. This census opens a span
+/// Nanoseconds, per [`reims_vgpu_observe::phase_clock`]. This census opens a span
 /// per staging operation at tens of thousands a second, which is exactly the
 /// population a microsecond accumulator reports as free.
 static NS: [AtomicU64; PARTS] = [const { AtomicU64::new(0) }; PARTS];
@@ -186,7 +186,7 @@ pub struct StagePhaseWindow {
 /// costs no line.
 pub fn take_window() -> Option<StagePhaseWindow> {
     let us =
-        |p: Part| crate::observe::phase_clock::to_us(NS[p as usize].swap(0, Ordering::Relaxed));
+        |p: Part| reims_vgpu_observe::phase_clock::to_us(NS[p as usize].swap(0, Ordering::Relaxed));
     let n = |p: Part| N[p as usize].swap(0, Ordering::Relaxed);
     let b = |p: Part| BYTES[p as usize].swap(0, Ordering::Relaxed);
     let w = StagePhaseWindow {
@@ -247,7 +247,7 @@ impl Drop for Span {
     fn drop(&mut self) {
         let slot = self.part as usize;
         NS[slot].fetch_add(
-            crate::observe::phase_clock::charge_ns(self.started.elapsed()),
+            reims_vgpu_observe::phase_clock::charge_ns(self.started.elapsed()),
             Ordering::Relaxed,
         );
         N[slot].fetch_add(1, Ordering::Relaxed);
@@ -300,7 +300,7 @@ mod tests {
 
     /// A staging operation is sub-microsecond and there are tens of thousands
     /// of them a second, which is the population
-    /// [`crate::observe::phase_clock`] exists for: under a microsecond-
+    /// [`reims_vgpu_observe::phase_clock`] exists for: under a microsecond-
     /// truncating accumulator every span here charges exactly zero and the
     /// column this split was built to divide reads free.
     ///

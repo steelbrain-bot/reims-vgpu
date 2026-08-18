@@ -542,7 +542,7 @@ impl SlabPool {
         // per reflow burst (not per image), so this proves the collapse without
         // flooding — `sub_allocs` climbing while `block_allocs` stays flat is the
         // suballocation win. Off-main-core (drain worker).
-        crate::observe::off(format!(
+        reims_vgpu_observe::off(format!(
             "slab_block ev=alloc size={block_size} dedicated={} small={} block_allocs={} \
              block_frees={} sub_allocs={} live={} violations={}",
             dedicated as u8,
@@ -635,7 +635,7 @@ impl SlabPool {
             Ok(true) => {}
             Ok(false) => return,
             Err(decline) => {
-                crate::observe::Emit::decline("slab", &decline).fail_once(u64::from(block));
+                reims_vgpu_observe::Emit::decline("slab", &decline).fail_once(u64::from(block));
                 return;
             }
         }
@@ -652,7 +652,7 @@ impl SlabPool {
             if let Some(b) = self.blocks[idx].take() {
                 device.free_memory(b.memory, None);
                 self.block_frees += 1;
-                crate::observe::off(format!(
+                reims_vgpu_observe::off(format!(
                     "slab_block ev=free block_allocs={} block_frees={} sub_allocs={} live={}",
                     self.block_allocs,
                     self.block_frees,
@@ -692,7 +692,7 @@ impl SlabPool {
             }
         }
         if freed > 0 {
-            crate::observe::off(format!(
+            reims_vgpu_observe::off(format!(
                 "slab_block ev=idle_trim freed={freed} block_allocs={} block_frees={} \
                  sub_allocs={} live={}",
                 self.block_allocs,
@@ -759,7 +759,7 @@ impl SlabPool {
                 size: b.plan.size(),
                 free_bytes: b.plan.free_bytes(),
             };
-            crate::observe::Emit::decline("slab", &decline).fail_once(idx as u64);
+            reims_vgpu_observe::Emit::decline("slab", &decline).fail_once(idx as u64);
             return false;
         }
         false
@@ -834,7 +834,7 @@ pub enum SlabDecline {
     },
 }
 
-impl crate::observe::Decline for SlabDecline {
+impl reims_vgpu_observe::Decline for SlabDecline {
     fn slug(&self) -> &'static str {
         match self {
             Self::FreeListInvariant { .. } => "vk_slab_free_list_invariant",
@@ -921,7 +921,7 @@ impl crate::observe::Decline for SlabDecline {
     }
 }
 
-crate::observe::decline_display!(SlabDecline);
+reims_vgpu_observe::decline_display!(SlabDecline);
 
 #[cfg(test)]
 mod tests {
@@ -1014,7 +1014,7 @@ mod tests {
 
     #[test]
     fn slab_invariant_decline_names_the_poisoned_block() {
-        use crate::observe::Decline as _;
+        use reims_vgpu_observe::Decline as _;
         let decline = SlabDecline::FreeListInvariant {
             block: 7,
             size: 64 << 20,
@@ -1022,14 +1022,14 @@ mod tests {
         };
         assert_eq!(decline.slug(), "vk_slab_free_list_invariant");
         assert_eq!(
-            crate::observe::Emit::decline("slab", &decline).render(),
+            reims_vgpu_observe::Emit::decline("slab", &decline).render(),
             "slab reason=vk_slab_free_list_invariant block=7 size=67108864 free_bytes=13"
         );
     }
 
     #[test]
     fn impossible_slab_allocations_do_not_masquerade_as_driver_oom() {
-        use crate::observe::Decline as _;
+        use reims_vgpu_observe::Decline as _;
         let zero = SlabDecline::ZeroSize {
             memory_type_bits: 0x81,
         };
@@ -1054,7 +1054,7 @@ mod tests {
 
     #[test]
     fn slab_release_preflight_refuses_every_corrupt_token_class_before_mutation() {
-        use crate::observe::Decline as _;
+        use reims_vgpu_observe::Decline as _;
         let mut plan = BlockPlan::new(4096);
         let live = plan.carve(1024, 1).unwrap();
         assert_eq!(live, 0);
@@ -1089,7 +1089,7 @@ mod tests {
 
     #[test]
     fn slab_registration_rejects_a_live_image_before_a_second_bind() {
-        use crate::observe::Decline as _;
+        use reims_vgpu_observe::Decline as _;
         let mut pool = SlabPool::new();
         let image = vk::Image::from_raw(0x1234);
         pool.live.insert(
@@ -1111,7 +1111,7 @@ mod tests {
 
     #[test]
     fn missing_slab_block_has_an_exact_release_reason() {
-        use crate::observe::Decline as _;
+        use reims_vgpu_observe::Decline as _;
         let pool = SlabPool::new();
         let decline = pool.release_preflight(7, 0, 4096).unwrap_err();
         assert_eq!(decline.slug(), "vk_slab_release_block_missing");

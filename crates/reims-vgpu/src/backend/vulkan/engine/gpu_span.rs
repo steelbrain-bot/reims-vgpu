@@ -317,12 +317,12 @@ pub fn take_window() -> Option<GpuSpanWindow> {
     let mut kind_n = [0u64; KINDS];
     for (i, k) in Kind::ALL.iter().enumerate() {
         kind_us[i] =
-            crate::observe::phase_clock::to_us(KIND_NS[*k as usize].swap(0, Ordering::Relaxed));
+            reims_vgpu_observe::phase_clock::to_us(KIND_NS[*k as usize].swap(0, Ordering::Relaxed));
         kind_n[i] = KIND_N[*k as usize].swap(0, Ordering::Relaxed);
     }
     let w = GpuSpanWindow {
-        busy_us: crate::observe::phase_clock::to_us(BUSY_NS.swap(0, Ordering::Relaxed)),
-        busy_max_us: crate::observe::phase_clock::to_us(MAX_NS.swap(0, Ordering::Relaxed)),
+        busy_us: reims_vgpu_observe::phase_clock::to_us(BUSY_NS.swap(0, Ordering::Relaxed)),
+        busy_max_us: reims_vgpu_observe::phase_clock::to_us(MAX_NS.swap(0, Ordering::Relaxed)),
         read: READ.swap(0, Ordering::Relaxed),
         armed,
         sealed: SEALED.swap(0, Ordering::Relaxed),
@@ -397,7 +397,7 @@ mod tests {
         assert_eq!(w.armed, 2);
         assert_eq!(w.sealed, 1);
         assert_eq!(w.read, 2);
-        assert_eq!(w.busy_max_us, crate::observe::phase_clock::to_us(5_000));
+        assert_eq!(w.busy_max_us, reims_vgpu_observe::phase_clock::to_us(5_000));
         assert_eq!(w.unread, 0);
         assert_eq!(take_window(), None, "the window cleared itself");
     }

@@ -1100,6 +1100,7 @@ dependencies = [
  "parking_lot",
  "raw-window-handle",
  "reims-vgpu-core",
+ "reims-vgpu-observe",
  "reims-vgpu-paging",
  "reims-vgpu-protocol",
  "reims-vgpu-vulkan",
@@ -1115,6 +1116,10 @@ dependencies = [
  "reims-vgpu-paging",
  "reims-vgpu-protocol",
 ]
+
+[[package]]
+name = "reims-vgpu-observe"
+version = "0.1.0"
 
 [[package]]
 name = "reims-vgpu-paging"
@@ -1136,6 +1141,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "reims-vgpu-core",
+ "reims-vgpu-observe",
  "reims-vgpu-protocol",
 ]
 

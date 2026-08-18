@@ -156,7 +156,7 @@ pub fn note_tick() {
         }
     };
     if let Some(line) = line {
-        crate::observe::fail(line);
+        crate::fail(line);
     }
 }
 

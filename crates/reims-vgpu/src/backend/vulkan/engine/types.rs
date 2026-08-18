@@ -115,7 +115,7 @@ impl std::fmt::Display for DrawError {
 
 impl std::error::Error for DrawError {}
 
-impl crate::observe::Decline for DrawError {
+impl reims_vgpu_observe::Decline for DrawError {
     /// Every variant delegates to the typed decline that names its check, so
     /// one event has one reason at every layer.
     fn slug(&self) -> &'static str {

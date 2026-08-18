@@ -4,7 +4,7 @@
 //! seventeen request invariants into `DrawError::Invalid(String)`, including
 //! four descriptor-role checks with identical prose.
 
-use crate::observe::Decline;
+use reims_vgpu_observe::Decline;
 
 /// A specific malformed or internally inconsistent compute request.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -169,7 +169,7 @@ impl Decline for ComputeValidationDecline {
     }
 }
 
-crate::observe::decline_display!(ComputeValidationDecline);
+reims_vgpu_observe::decline_display!(ComputeValidationDecline);
 
 #[cfg(test)]
 mod tests {
@@ -249,7 +249,8 @@ mod tests {
     #[test]
     fn compute_validation_fields_are_structured_and_log_safe() {
         for decline in all() {
-            let line = crate::observe::Emit::decline("compute_validation_test", &decline).render();
+            let line =
+                reims_vgpu_observe::Emit::decline("compute_validation_test", &decline).render();
             assert!(line.starts_with(&format!(
                 "compute_validation_test reason={}",
                 decline.slug()

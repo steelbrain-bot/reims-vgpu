@@ -12,7 +12,7 @@
 //! there is no import to lose.
 
 use super::types::{ResidentReclaim, TargetIdentity};
-use crate::observe::Decline;
+use reims_vgpu_observe::Decline;
 
 /// A specific failure while preparing or executing a validated draw.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -370,7 +370,7 @@ pub(super) fn identity_fields(identity: &TargetIdentity) -> Vec<(&'static str, S
     }
 }
 
-crate::observe::decline_display!(DrawExecutionDecline);
+reims_vgpu_observe::decline_display!(DrawExecutionDecline);
 
 #[cfg(test)]
 mod tests {
@@ -477,7 +477,7 @@ mod tests {
     #[test]
     fn draw_execution_fields_are_structured_and_log_safe() {
         for decline in all() {
-            let line = crate::observe::Emit::decline("draw_execution_test", &decline).render();
+            let line = reims_vgpu_observe::Emit::decline("draw_execution_test", &decline).render();
             assert!(line.starts_with(&format!("draw_execution_test reason={}", decline.slug())));
             for field in line.split(' ').skip(1) {
                 assert!(!field.is_empty(), "empty field in {line:?}");

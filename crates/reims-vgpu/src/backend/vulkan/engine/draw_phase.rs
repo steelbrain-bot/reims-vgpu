@@ -240,7 +240,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use crate::observe::phase_clock::{charge_ns, to_us};
+use reims_vgpu_observe::phase_clock::{charge_ns, to_us};
 
 /// A draw at or above this is a stall rather than a slow frame: at 60 Hz it has
 /// already cost six frames, and the guest's compositor blocks on the same lock
@@ -480,7 +480,7 @@ impl Phase {
 
 const PHASES: usize = Phase::LAST as usize + 1;
 
-/// Nanoseconds, per [`crate::observe::phase_clock`]. `prep_us` and
+/// Nanoseconds, per [`reims_vgpu_observe::phase_clock`]. `prep_us` and
 /// `pipeline_us` are single-digit microseconds over a whole draw, so the spans
 /// inside them are well under what a microsecond accumulator can resolve.
 static ACC: [AtomicU64; PHASES] = [const { AtomicU64::new(0) }; PHASES];
@@ -675,7 +675,7 @@ impl Drop for DrawTimer {
         } else {
             ""
         };
-        crate::observe::off(format!(
+        reims_vgpu_observe::off(format!(
             "draw_stall us={} prep_us={} slot_us={} pipeline_us={} stage_us={} stage_pass_us={} \
              acquire_us={} acquire_sampled_us={} sampled_upload_us={} acquire_readback_us={} \
              descriptors_us={} \

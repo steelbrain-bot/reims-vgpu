@@ -886,7 +886,7 @@ fn emit_create_site_census() {
             CREATE_SITE_COUNTS[site.index()].load(Ordering::Relaxed)
         );
     }
-    crate::observe::off(line);
+    reims_vgpu_observe::off(line);
 }
 
 /// The `note_*` helpers: the increments that are not a bare `fetch_add(1)` at

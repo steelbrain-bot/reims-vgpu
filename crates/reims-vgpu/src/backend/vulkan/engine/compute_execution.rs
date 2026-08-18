@@ -6,8 +6,8 @@
 //! staged.
 
 use super::types::StorageImageFormat;
-use crate::observe::Decline;
 use reims_vgpu_core::ComputeStorageResidencyKey;
+use reims_vgpu_observe::Decline;
 
 /// A specific failure while preparing a validated compute dispatch.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -291,7 +291,7 @@ pub(super) fn residency_fields(
     fields
 }
 
-crate::observe::decline_display!(ComputeExecutionDecline);
+reims_vgpu_observe::decline_display!(ComputeExecutionDecline);
 
 #[cfg(test)]
 mod tests {
@@ -375,7 +375,8 @@ mod tests {
     #[test]
     fn compute_execution_fields_are_structured_and_log_safe() {
         for decline in all() {
-            let line = crate::observe::Emit::decline("compute_execution_test", &decline).render();
+            let line =
+                reims_vgpu_observe::Emit::decline("compute_execution_test", &decline).render();
             assert!(line.starts_with(&format!("compute_execution_test reason={}", decline.slug())));
             for field in line.split(' ').skip(1) {
                 assert!(!field.is_empty(), "empty field in {line:?}");

@@ -121,7 +121,7 @@ impl crate::observe::Decline for MemError {
             Self::QemuReadXregCallbackFailed(_) => "mem_qemu_read_xreg_callback_failed",
             // Delegates, so the walk's own fifteen slugs stay the reason rather
             // than being flattened into one and reconstructed from a field.
-            Self::Unresolved(status) => match crate::observe::Refusal::refusal(status) {
+            Self::Unresolved(status) => match crate::contract::gva_resolve::refusal(*status) {
                 Some(slug) => slug,
                 // `Unresolved(Ok)` is a construction bug, not a walk failure.
                 // Naming it beats reporting a plausible walk reason for

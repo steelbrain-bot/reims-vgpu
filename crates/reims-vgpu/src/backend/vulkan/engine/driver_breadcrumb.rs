@@ -36,7 +36,7 @@
 //!
 //! # The other failure this arming carries: a call that does not return
 //!
-//! Arming also starts [`crate::observe::driver_watch`], because "the driver died
+//! Arming also starts [`reims_vgpu_observe::driver_watch`], because "the driver died
 //! in this call" and "the driver has not come back from this call" are the same
 //! bracket around the same call. A hang is the worse of the two — the process
 //! survives, so nothing is written, and the drain thread holds the device lock
@@ -129,7 +129,7 @@ pub(crate) struct DriverBreadcrumb {
     /// The stage tags whose files this guard owns, empty when nothing was
     /// written.
     stages: Vec<&'static str>,
-    /// Whether this guard owns [`crate::observe::driver_watch`]'s slot. False
+    /// Whether this guard owns [`reims_vgpu_observe::driver_watch`]'s slot. False
     /// when an outer call already held it — see that module's `enter`.
     watching: bool,
 }
@@ -155,7 +155,7 @@ impl DriverBreadcrumb {
         if let Some(hit) = quarantine::check(modules) {
             return Err(hit);
         }
-        let watching = crate::observe::driver_watch::enter(what.to_string());
+        let watching = reims_vgpu_observe::driver_watch::enter(what.to_string());
         let mut stages = Vec::with_capacity(modules.len());
         let mut meta = format!("what={what}\n");
         for (stage, spirv) in modules {
@@ -165,7 +165,7 @@ impl DriverBreadcrumb {
             }
             match std::fs::write(path(stage), &bytes) {
                 Ok(()) => stages.push(*stage),
-                Err(e) => crate::observe::fail(format!(
+                Err(e) => reims_vgpu_observe::fail(format!(
                     "driver_breadcrumb reason=write_failed what={what} stage={stage} err={e}"
                 )),
             }
@@ -192,7 +192,7 @@ impl DriverBreadcrumb {
     fn clear(&mut self) {
         if self.watching {
             self.watching = false;
-            crate::observe::driver_watch::leave();
+            reims_vgpu_observe::driver_watch::leave();
         }
         if self.stages.is_empty() {
             return;
@@ -237,12 +237,12 @@ pub(crate) fn keep_rejected_module(digest: &str, spirv: &[u32]) {
     }
     let path = std::env::temp_dir().join(format!("reims-vgpu-rejected-{digest}.spv"));
     match std::fs::write(&path, &bytes) {
-        Ok(()) => crate::observe::off(format!(
+        Ok(()) => reims_vgpu_observe::off(format!(
             "spirv_rejected_module_kept path={} words={}",
             path.display(),
             spirv.len()
         )),
-        Err(e) => crate::observe::fail(format!(
+        Err(e) => reims_vgpu_observe::fail(format!(
             "spirv_rejected_module reason=write_failed path={} err={e}",
             path.display()
         )),
@@ -301,18 +301,18 @@ mod tests {
     /// the arming site knows where the call is.
     #[test]
     fn an_armed_breadcrumb_puts_the_call_under_the_clock_watch() {
-        crate::observe::driver_watch::leave();
+        reims_vgpu_observe::driver_watch::leave();
         let words = [0x0723_0203u32, 0x0001_0000];
         let crumb = super::DriverBreadcrumb::arm("test_watched", &[("module", &words)])
             .expect("a module nothing has crashed on is not quarantined");
         assert_eq!(
-            crate::observe::driver_watch::watching().as_deref(),
+            reims_vgpu_observe::driver_watch::watching().as_deref(),
             Some("test_watched"),
             "the watch names the call this breadcrumb is bracketing"
         );
         crumb.disarm();
         assert_eq!(
-            crate::observe::driver_watch::watching(),
+            reims_vgpu_observe::driver_watch::watching(),
             None,
             "a returned call is no longer outstanding"
         );

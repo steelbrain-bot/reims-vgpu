@@ -34,7 +34,7 @@
 //! alone to claim the screen is not black.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-fixtures"))]
 use std::{
     fs::{File, OpenOptions},
     io::Write,
@@ -43,9 +43,9 @@ use std::{
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static INIT: AtomicBool = AtomicBool::new(false);
-#[cfg(test)]
+#[cfg(any(test, feature = "test-fixtures"))]
 static FAIL_FILE: Mutex<Option<File>> = Mutex::new(None);
-#[cfg(test)]
+#[cfg(any(test, feature = "test-fixtures"))]
 static DRAW_FILE: Mutex<Option<File>> = Mutex::new(None);
 
 /// Which always-on sink a line targets.
@@ -55,14 +55,17 @@ enum Sink {
     Draw,
 }
 
-pub(crate) fn enabled() -> bool {
+pub fn enabled() -> bool {
     if !INIT.swap(true, Ordering::Relaxed) {
         // Through the shared parse, and read once. Nothing is emitted for an
         // unrecognized value: this is the emit path itself, so a report from
         // here would recurse into the sink that is being asked whether it is
         // enabled. Such a value reads as off, which is what every
         // non-affirmative value already did.
-        let on = crate::env::switch(crate::env::DRAW_LOG) == crate::env::Switch::On;
+        let on = matches!(
+            std::env::var("REIMS_VGPU_DRAW_LOG").as_deref(),
+            Ok("1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES")
+        );
         ENABLED.store(on, Ordering::Relaxed);
     }
     ENABLED.load(Ordering::Relaxed)
@@ -72,7 +75,7 @@ pub(crate) fn enabled() -> bool {
 /// paths skip building expensive *diagnostic-only* detail (e.g. per-peer
 /// full-frame rescans for a log field) on a normal boot without losing the
 /// always-on line itself.
-pub(crate) fn draw_log_enabled() -> bool {
+pub fn draw_log_enabled() -> bool {
     enabled()
 }
 
@@ -84,7 +87,7 @@ pub(crate) fn draw_log_enabled() -> bool {
 /// `pub(crate)` so always-on rate proxies (e.g. display-signal cadence) can
 /// window their counters on the same process-monotonic clock that stamps every
 /// line — no second time base to reconcile against `t=`.
-pub(crate) fn elapsed_ms() -> u128 {
+pub fn elapsed_ms() -> u128 {
     T0.get_or_init(std::time::Instant::now)
         .elapsed()
         .as_millis()
@@ -96,7 +99,7 @@ pub(crate) fn elapsed_ms() -> u128 {
 /// 120 Hz frame is 8333 µs, and rounding it to 8 ms delivers 125 Hz. Paths that
 /// pace something the guest measures need this one; `t=` stamps stay in
 /// milliseconds so line-class censuses keep working.
-pub(crate) fn elapsed_us() -> u64 {
+pub fn elapsed_us() -> u64 {
     T0.get_or_init(std::time::Instant::now)
         .elapsed()
         .as_micros() as u64
@@ -119,17 +122,17 @@ fn test_path(kind: &str) -> String {
     format!("/tmp/reims-vgpu-{kind}-test-{}.log", std::process::id())
 }
 
-pub(crate) fn fail_log_path() -> &'static str {
-    #[cfg(test)]
+pub fn fail_log_path() -> &'static str {
+    #[cfg(any(test, feature = "test-fixtures"))]
     return FAIL_PATH.get_or_init(|| test_path("fail"));
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-fixtures")))]
     FAIL_PATH.get_or_init(|| "/tmp/reims-vgpu-fail.log".to_string())
 }
 
-pub(crate) fn draw_log_path() -> &'static str {
-    #[cfg(test)]
+pub fn draw_log_path() -> &'static str {
+    #[cfg(any(test, feature = "test-fixtures"))]
     return DRAW_PATH.get_or_init(|| test_path("draw"));
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-fixtures")))]
     DRAW_PATH.get_or_init(|| "/tmp/reims-vgpu-draw.log".to_string())
 }
 
@@ -145,7 +148,7 @@ pub fn redirect_logs_for_tests() {
 /// Synchronous single-line append (unit-test builds only). Worker + MMIO proxy
 /// lines may arrive concurrently; keep each record on one physical line so
 /// failure evidence never merges into another event.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-fixtures"))]
 fn append_sync(file: &Mutex<Option<File>>, path: &str, msg: &str, t: u128) {
     let mut file = file.lock().unwrap_or_else(|e| e.into_inner());
     if file.is_none() {
@@ -172,7 +175,7 @@ fn append_sync(file: &Mutex<Option<File>>, path: &str, msg: &str, t: u128) {
 /// `read_to_string` the sink and assert on it.
 fn emit(sink: Sink, msg: &str) {
     let t = elapsed_ms();
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-fixtures"))]
     {
         if matches!(sink, Sink::Fail) {
             if let Some(buf) = CAPTURED.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
@@ -361,7 +364,7 @@ mod writer {
 }
 
 /// Test-only in-memory copy of the always-on stream, armed by [`FailCapture`].
-#[cfg(test)]
+#[cfg(any(test, feature = "test-fixtures"))]
 static CAPTURED: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
 
 /// Records every always-on ([`fail`] / [`off`]) line emitted while it is alive.
@@ -376,10 +379,10 @@ static CAPTURED: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(N
 ///
 /// Relies on the crate's serial test convention (`--test-threads=1`); a second
 /// capture armed concurrently would see the other test's lines.
-#[cfg(test)]
-pub(crate) struct FailCapture;
+#[cfg(any(test, feature = "test-fixtures"))]
+pub struct FailCapture;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-fixtures"))]
 impl FailCapture {
     /// Arm the capture, and drop every dedup latch first.
     ///
@@ -391,7 +394,7 @@ impl FailCapture {
     // resolve on any arm and would read as rot in the intra-doc pass.
     /// See `super::emit::forget_all_latches` for what that costs and why the
     /// clearing belongs here rather than at each fixture.
-    pub(crate) fn start() -> Self {
+    pub fn start() -> Self {
         super::emit::forget_all_latches();
         Self::arm()
     }
@@ -411,7 +414,7 @@ impl FailCapture {
     /// coupling `start` exists to remove — so a test that reaches for it is
     /// claiming the earlier windows are its own, and it must open the sequence
     /// with a `start`.
-    pub(crate) fn resume() -> Self {
+    pub fn resume() -> Self {
         Self::arm()
     }
 
@@ -421,7 +424,7 @@ impl FailCapture {
     }
 
     /// Every always-on line emitted since `start`, in order.
-    pub(crate) fn lines(&self) -> Vec<String> {
+    pub fn lines(&self) -> Vec<String> {
         CAPTURED
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -432,7 +435,7 @@ impl FailCapture {
     /// The one line whose first whitespace token is `slug`. Panics unless
     /// exactly one matched — "no line" and "several lines" are both reasons a
     /// downstream assertion would otherwise pass or fail for the wrong reason.
-    pub(crate) fn one(&self, slug: &str) -> String {
+    pub fn one(&self, slug: &str) -> String {
         let hits: Vec<String> = self
             .lines()
             .into_iter()
@@ -448,7 +451,7 @@ impl FailCapture {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-fixtures"))]
 impl Drop for FailCapture {
     fn drop(&mut self) {
         *CAPTURED.lock().unwrap_or_else(|p| p.into_inner()) = None;

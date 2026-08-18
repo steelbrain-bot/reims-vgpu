@@ -417,7 +417,7 @@ impl ResourcePools {
         }
         // Always visible, for the reason the sibling's line is: a device that has
         // had to do this is one whose next allocation is also likely to fail.
-        crate::observe::fail(format!(
+        reims_vgpu_observe::fail(format!(
             "vram_compute_storage_reclaim_retry residents={freed} recycled={trimmed} \
              held_bytes={} sole_copy={} live={} (an allocation was refused; gave \
              back everything that is neither pinned nor the only copy of its contents)",
@@ -1845,7 +1845,7 @@ impl ResourcePools {
             return false;
         }
         if !pinned && slot.pin_count == 0 {
-            crate::observe::fail(format!(
+            reims_vgpu_observe::fail(format!(
                 "resident_unpin_unbalanced identity={identity:?} \
                  (an unpin with no pin outstanding — some other holder's pin has \
                  already been released on its behalf, or this one was never taken)"
@@ -1889,7 +1889,7 @@ impl ResourcePools {
         }
         let slot = self.registry.get_mut(identity)?;
         let Some(next) = slot.resource_owner_count.checked_add(1) else {
-            crate::observe::fail(format!(
+            reims_vgpu_observe::fail(format!(
                 "resident_resource_owner_overflow identity={identity:?}"
             ));
             // Undo the pin acquired above; the caller receives no lease.
@@ -1943,7 +1943,7 @@ impl ResourcePools {
     fn release_resident_ownership(&mut self, identity: &TargetIdentity) -> Option<bool> {
         let slot = self.registry.get_mut(identity)?;
         if slot.resource_owner_count == 0 {
-            crate::observe::fail(format!(
+            reims_vgpu_observe::fail(format!(
                 "resident_resource_release_unbalanced identity={identity:?}"
             ));
             return Some(false);
@@ -2331,7 +2331,7 @@ impl ResourcePools {
         // allocation failure and one where no allocation ever failed report
         // identically — both silent, both zero draws lost — so the recovery
         // could not be told from never having been needed.
-        crate::observe::fail(format!(
+        reims_vgpu_observe::fail(format!(
             "vram_pool_reclaim_retry released={released} held_bytes={}              (an allocation was refused; emptied the recycle pools, which hold              nothing any command buffer references, and retried)",
             self.slab.held_bytes().0,
         ));
@@ -2435,7 +2435,7 @@ impl ResourcePools {
         // Always visible. A device that has had to do this is one whose next
         // allocation is also likely to fail, and a silent recovery would leave
         // the run before that failure looking healthy.
-        crate::observe::fail(format!(
+        reims_vgpu_observe::fail(format!(
             "vram_reclaim_retry residents={freed} recycled={trimmed} held_bytes={} \
              sole_copy={} live={} (an allocation was refused; gave back everything \
              that is neither pinned nor the only copy of its pixels)",

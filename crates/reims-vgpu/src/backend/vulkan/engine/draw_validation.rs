@@ -8,7 +8,7 @@
 
 use ash::vk;
 
-use crate::observe::Decline;
+use reims_vgpu_observe::Decline;
 
 /// A specific malformed or internally inconsistent draw request.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -521,7 +521,7 @@ impl Decline for DrawValidationDecline {
     }
 }
 
-crate::observe::decline_display!(DrawValidationDecline);
+reims_vgpu_observe::decline_display!(DrawValidationDecline);
 
 #[cfg(test)]
 mod tests {
@@ -714,7 +714,7 @@ mod tests {
     #[test]
     fn draw_validation_fields_are_structured_and_log_safe() {
         for decline in all() {
-            let line = crate::observe::Emit::decline("draw_validation_test", &decline).render();
+            let line = reims_vgpu_observe::Emit::decline("draw_validation_test", &decline).render();
             assert!(line.starts_with(&format!("draw_validation_test reason={}", decline.slug())));
             for field in line.split(' ').skip(1) {
                 assert!(!field.is_empty(), "empty field in {line:?}");

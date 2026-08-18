@@ -43,7 +43,7 @@ pub(crate) struct VertexFormatWidenDecline {
     stride: u32,
 }
 
-impl crate::observe::Decline for VertexFormatWidenDecline {
+impl reims_vgpu_observe::Decline for VertexFormatWidenDecline {
     fn slug(&self) -> &'static str {
         match self {
             Self { .. } => "vk_vertex_format_widened",
@@ -836,7 +836,7 @@ impl ShaderDigestIndex {
     /// something rather than asking for a policy.
     fn insert(&mut self, words: &std::sync::Arc<Vec<u32>>, digest: Digest128) {
         if self.map.len() >= SHADER_DIGEST_ENTRIES {
-            crate::observe::off(format!(
+            reims_vgpu_observe::off(format!(
                 "shader_digest_reset entries={} words={}",
                 self.map.len(),
                 words.len()
@@ -1406,7 +1406,7 @@ impl ObjectCaches {
         hit: &super::driver_breadcrumb::quarantine::Quarantined,
     ) -> DrawError {
         let reason = super::reason::DrawReason::DriverCallQuarantined;
-        crate::observe::Emit::decline("driver_quarantine", &reason)
+        reims_vgpu_observe::Emit::decline("driver_quarantine", &reason)
             .field("site", site)
             .field("key", &hit.key)
             .field("previously", &hit.previously)
@@ -1498,7 +1498,7 @@ impl ObjectCaches {
                 || (need.read_without_format && !ctx.spirv_storage_read_without_format);
             if missing {
                 let err = DrawError::Unsupported(super::reason::DrawReason::SpirvInvalid);
-                crate::observe::fail(format!(
+                reims_vgpu_observe::fail(format!(
                     "spirv_capability reason=host_lacks_feature words={} \
                      need_extended={} need_write={} need_read={} \
                      have_extended={} have_write={} have_read={}",
@@ -1517,7 +1517,7 @@ impl ObjectCaches {
             patched = words.to_vec();
             let added = crate::runtime::spirv_bind::ensure_image_capabilities(&mut patched, &need);
             if added.any() {
-                crate::observe::off(format!(
+                reims_vgpu_observe::off(format!(
                     "spirv_capability added extended={} write={} read={} words={}",
                     added.extended_formats,
                     added.write_without_format,
@@ -1552,7 +1552,7 @@ impl ObjectCaches {
             // Print what the capability derivation saw alongside the
             // validator's complaint. When the two disagree the difference is
             // the whole bug, and neither one alone says which walk is wrong.
-            crate::observe::fail(format!(
+            reims_vgpu_observe::fail(format!(
                 "spirv_validate reason=module_rejected words={} need={:?} imgs={:?} detail={why}",
                 words.len(),
                 crate::runtime::spirv_bind::required_image_capabilities(words),
@@ -1915,7 +1915,7 @@ impl ObjectCaches {
         let conformed = match vulkan_conformed_sampler(key) {
             Ok(k) => k,
             Err(reason) => {
-                crate::observe::Emit::decline("vk_engine_sampler", &reason)
+                reims_vgpu_observe::Emit::decline("vk_engine_sampler", &reason)
                     .field("compare_function", format!("{:?}", key.compare_function))
                     .fail();
                 let err = DrawError::Unsupported(reason);
@@ -1972,7 +1972,7 @@ impl ObjectCaches {
         // needs the normalization known at translate time. That is a
         // `metal2vulkan` input this device does not currently supply.
         if key.unnormalized_coordinates {
-            crate::observe::off(format!(
+            reims_vgpu_observe::off(format!(
                 "sampler_unnormalized min_mag_differed={} conformed={} \
                  min={:?} mag={:?} mip={:?} address_u={:?} address_v={:?} aniso={}",
                 key.min_filter != key.mag_filter,
@@ -2014,7 +2014,7 @@ impl ObjectCaches {
             // caller happens to render it. A capability the host GPU lacks is
             // precisely the class says must
             // never surface as a silently different sampler.
-            crate::observe::Emit::decline("vk_engine_sampler", &reason)
+            reims_vgpu_observe::Emit::decline("vk_engine_sampler", &reason)
                 .field("max_anisotropy", max_anisotropy_req)
                 .fail();
             // The negative cache stores the typed `DrawError`, so a replay
@@ -2038,7 +2038,7 @@ impl ObjectCaches {
             .contains(&super::types::SamplerAddressMode::MirrorClampToEdge);
         if uses_mirror_clamp && !ctx.features.mirror_clamp_to_edge.is_available() {
             let reason = super::reason::DrawReason::SamplerMirrorClampToEdgeUnsupported;
-            crate::observe::Emit::decline("vk_engine_sampler", &reason)
+            reims_vgpu_observe::Emit::decline("vk_engine_sampler", &reason)
                 .field("address_u", format!("{address_mode_u:?}"))
                 .field("address_v", format!("{address_mode_v:?}"))
                 .field("address_w", format!("{:?}", conformed.address_mode_w))
@@ -2156,7 +2156,7 @@ impl ObjectCaches {
                 });
             if uses_dual_source {
                 let reason = super::reason::DrawReason::DualSourceBlendUnsupported;
-                crate::observe::Emit::decline("vk_engine_pipeline", &reason).fail();
+                reims_vgpu_observe::Emit::decline("vk_engine_pipeline", &reason).fail();
                 let err = DrawError::Unsupported(reason);
                 self.pipelines.insert_negative(key.clone(), err.clone());
                 return Err(err);
@@ -2176,14 +2176,14 @@ impl ObjectCaches {
         // the near plane.
         if key.fill_mode != FillMode::default() && !ctx.features.fill_mode_non_solid {
             let reason = super::reason::DrawReason::FillModeNonSolidUnsupported;
-            crate::observe::Emit::decline("vk_engine_pipeline", &reason).fail();
+            reims_vgpu_observe::Emit::decline("vk_engine_pipeline", &reason).fail();
             let err = DrawError::Unsupported(reason);
             self.pipelines.insert_negative(key.clone(), err.clone());
             return Err(err);
         }
         if key.depth_clip != DepthClipMode::default() && !ctx.features.depth_clamp {
             let reason = super::reason::DrawReason::DepthClampUnsupported;
-            crate::observe::Emit::decline("vk_engine_pipeline", &reason).fail();
+            reims_vgpu_observe::Emit::decline("vk_engine_pipeline", &reason).fail();
             let err = DrawError::Unsupported(reason);
             self.pipelines.insert_negative(key.clone(), err.clone());
             return Err(err);
@@ -2217,11 +2217,13 @@ impl ObjectCaches {
                         let err = DrawError::Unsupported(super::reason::DrawReason::VertexFormat(
                             translate_reason,
                         ));
-                        crate::observe::Emit::decline("vk_engine_vertex_format", &translate_reason)
-                            .fail_once(
-                                (u64::from(attr.location) << 32)
-                                    | u64::from(translate_reason.value()),
-                            );
+                        reims_vgpu_observe::Emit::decline(
+                            "vk_engine_vertex_format",
+                            &translate_reason,
+                        )
+                        .fail_once(
+                            (u64::from(attr.location) << 32) | u64::from(translate_reason.value()),
+                        );
                         self.pipelines.insert_negative(key.clone(), err.clone());
                         return Err(err);
                     }
@@ -2239,7 +2241,7 @@ impl ObjectCaches {
                     offset: attr.offset,
                     stride: attr.stride,
                 };
-                crate::observe::Emit::decline("vk_engine_vertex_format", &decline).fail_once(
+                reims_vgpu_observe::Emit::decline("vk_engine_vertex_format", &decline).fail_once(
                     (u64::from(attr.location) << 32) | u64::from(narrow.as_raw() as u32),
                 );
             }
@@ -2471,7 +2473,7 @@ impl ObjectCaches {
         // only one that compiles two at once. A macOS 15 guest's CoreAnimation
         // uber fragment shader has been observed keeping NVIDIA's compiler in
         // here for over ten minutes with the device lock held; see
-        // `crate::observe::driver_watch`, which this arming also starts.
+        // `reims_vgpu_observe::driver_watch`, which this arming also starts.
         let breadcrumb = match super::driver_breadcrumb::DriverBreadcrumb::arm(
             &format!(
                 "create_graphics_pipelines vert_words={} frag_words={}",
@@ -2902,7 +2904,7 @@ mod object_cache_tests {
     #[test]
     fn an_unnormalized_sampler_with_a_compare_function_is_refused_by_name() {
         use super::super::types::SamplerCompareFunction;
-        use crate::observe::Decline as _;
+        use reims_vgpu_observe::Decline as _;
         let mut key = unnormalized_key();
         key.compare_function = SamplerCompareFunction::LessEqual;
         let reason = vulkan_conformed_sampler(&key).expect_err("compare is refused");
@@ -2923,7 +2925,7 @@ mod object_cache_tests {
 
     #[test]
     fn vertex_format_widening_names_both_formats_and_attribute() {
-        use crate::observe::Decline as _;
+        use reims_vgpu_observe::Decline as _;
         let narrow = translate::vertex::vertex_layout(VertexAttributeFormat::UChar3Normalized).vk;
         let binding = translate::VertexFormatSupport::with_unsupported(&[narrow])
             .resolve(VertexAttributeFormat::UChar3Normalized, 12, 32, || {
@@ -2939,7 +2941,7 @@ mod object_cache_tests {
         };
         assert_eq!(decline.slug(), "vk_vertex_format_widened");
         assert_eq!(
-            crate::observe::Emit::decline("vk_engine_vertex_format", &decline).render(),
+            reims_vgpu_observe::Emit::decline("vk_engine_vertex_format", &decline).render(),
             "vk_engine_vertex_format reason=vk_vertex_format_widened \
              from=R8G8B8_UNORM to=R8G8B8A8_UNORM location=3 offset=12 stride=32"
         );

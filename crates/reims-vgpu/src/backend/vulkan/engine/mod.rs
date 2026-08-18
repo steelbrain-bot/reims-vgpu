@@ -389,7 +389,7 @@ impl EngineState {
         match owner.ensure(counters) {
             Ok(_) => true,
             Err(error) => {
-                crate::observe::Emit::decline("vk_device_recreate", &error).fail_once(1);
+                reims_vgpu_observe::Emit::decline("vk_device_recreate", &error).fail_once(1);
                 false
             }
         }
@@ -673,7 +673,7 @@ fn note_batch_open_after_tail(counters: &EngineCounters) {
     if flushed_at == 0 {
         return;
     }
-    let gap = crate::observe::elapsed_us().saturating_sub(flushed_at);
+    let gap = reims_vgpu_observe::elapsed_us().saturating_sub(flushed_at);
     TailReopenBand::of(gap).count(counters);
 }
 
@@ -1143,7 +1143,7 @@ pub fn reset_guest_state() -> GuestResetStats {
     if let Some(ctx) = owner.ctx.as_ref() {
         if let Err(error) = ctx.queue_wait_idle() {
             let decline = VkCall::new(VkOp::GuestResetDeviceWaitIdle, error);
-            crate::observe::Emit::decline("vulkan_guest_reset", &decline).fail_once(0);
+            reims_vgpu_observe::Emit::decline("vulkan_guest_reset", &decline).fail_once(0);
         }
         unsafe {
             #[cfg(feature = "host-window")]
@@ -1154,7 +1154,7 @@ pub fn reset_guest_state() -> GuestResetStats {
         }
     }
     *pools = ResourcePools::new();
-    crate::observe::off(format!(
+    reims_vgpu_observe::off(format!(
         "vulkan_guest_reset resident={} pooled_targets={} sampled={} storage={} context={}",
         stats.resident_targets,
         stats.pooled_targets,
@@ -1410,7 +1410,7 @@ pub fn flush_batched_draws() {
                     .batch_tail_flushes
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 current_session_signals().last_tail_batch_flush_us.store(
-                    crate::observe::elapsed_us(),
+                    reims_vgpu_observe::elapsed_us(),
                     std::sync::atomic::Ordering::Release,
                 );
                 false
@@ -1418,7 +1418,7 @@ pub fn flush_batched_draws() {
             Ok(()) => false,
             Err(e) => {
                 let lost = matches!(e, DrawError::DeviceLost(_));
-                crate::observe::Emit::decline("vk_batch_flush", &e).fail_once(0);
+                reims_vgpu_observe::Emit::decline("vk_batch_flush", &e).fail_once(0);
                 lost
             }
         }
@@ -1684,7 +1684,7 @@ pub fn quiesce_guest_writes() {
         if matches!(e, DrawError::DeviceLost(_)) {
             device_lost::note_device_lost_seen();
         }
-        crate::observe::Emit::decline("vk_guest_write_quiesce", &e).fail_once(0);
+        reims_vgpu_observe::Emit::decline("vk_guest_write_quiesce", &e).fail_once(0);
     }
     // Cleared whether the wait succeeded or failed, for the reason
     // `ResourcePools::quiesce_guest_writes` takes its own debt before waiting:
@@ -1841,7 +1841,7 @@ pub fn write_completion_stamp(
         }
         let Some((_, timeline)) = completion.latest_queued() else {
             let decline = GuestWriteDecline::NoCompletionPoint;
-            crate::observe::Emit::decline("gpu_completion_stamp", &decline).fail();
+            reims_vgpu_observe::Emit::decline("gpu_completion_stamp", &decline).fail();
             return Err(DrawError::GuestPageWrite(decline));
         };
         completion.wait_for_stamp(timeline, index, guest_ref.clone(), value);
@@ -1899,7 +1899,7 @@ pub fn submit_batch_for_waiting_stamp(index: u32) -> bool {
         Err(e) => {
             // The stamp stays parked and the guest keeps waiting, so this is a
             // real loss of forward progress rather than a missed optimisation.
-            crate::observe::fail(format!(
+            reims_vgpu_observe::fail(format!(
                 "stamp_waiter_flush_failed index={index} err={e:?} (a guest \
                  timeline is blocked on a stamp parked in a batch this device \
                  could not submit)"
@@ -1947,7 +1947,7 @@ pub fn quiesce_guest_reads() {
         if matches!(e, DrawError::DeviceLost(_)) {
             device_lost::note_device_lost_seen();
         }
-        crate::observe::Emit::decline("vk_guest_read_quiesce", &e).fail_once(0);
+        reims_vgpu_observe::Emit::decline("vk_guest_read_quiesce", &e).fail_once(0);
     }
 }
 
@@ -2043,7 +2043,7 @@ pub fn prepare_window_resident_present(
     width: u32,
     height: u32,
 ) -> Result<(), reims_vgpu_core::PresentDecline> {
-    let now_ms = crate::observe::elapsed_ms() as u64;
+    let now_ms = reims_vgpu_observe::elapsed_ms() as u64;
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
@@ -2436,8 +2436,8 @@ impl EngineProbe {
     }
 }
 
-fn engine_probe_decline(probe: EngineProbe, error: &DrawError) -> crate::observe::Emit {
-    crate::observe::Emit::decline("vk_engine_probe", error).field("probe", probe.name())
+fn engine_probe_decline(probe: EngineProbe, error: &DrawError) -> reims_vgpu_observe::Emit {
+    reims_vgpu_observe::Emit::decline("vk_engine_probe", error).field("probe", probe.name())
 }
 
 /// Generation of a resident compute storage image, if the engine holds one.
@@ -2633,7 +2633,7 @@ pub fn read_resident_bgra(identity: &TargetIdentity, need: usize) -> Option<Vec<
         // is every one this rail sees on a boot measured so far.
         Ok(rb) => rb.into_bgra8(),
         Err(e) => {
-            let mut emit = crate::observe::Emit::decline("present_capture", &e);
+            let mut emit = reims_vgpu_observe::Emit::decline("present_capture", &e);
             for (key, value) in draw_execution::identity_fields(identity) {
                 emit = emit.field(key, value);
             }
@@ -3020,7 +3020,7 @@ unsafe fn copy_image_level0_to_host_delivered(
         // property of a call three frames up, and `bytes()` builds a slice of
         // `len` over this pointer on the strength of it.
         Some(lease) if !pools::slot_span_fits(rb_size, lease.slot_size) => {
-            crate::observe::Emit::decline(
+            reims_vgpu_observe::Emit::decline(
                 "vk_engine_readback",
                 &draw_execution::DrawExecutionDecline::LeaseBeyondSlot {
                     len: rb_size,
@@ -3874,7 +3874,7 @@ unsafe fn plan_guest_scatter_dispatches(
                 counters
                     .guest_write_scatter_declined
                     .fetch_add(1, Ordering::Relaxed);
-                crate::observe::Emit::decline("scatter_plan", &decline).fail_once(0);
+                reims_vgpu_observe::Emit::decline("scatter_plan", &decline).fail_once(0);
                 return Ok(None);
             }
         }
@@ -4445,7 +4445,9 @@ pub fn warm_guest_ram_imports(
             // The draw path asks again and declines there with the same reason,
             // so this is reported and not propagated: a warm that could not
             // import must not be the thing that decides the rail is off.
-            Err(inner) => crate::observe::Emit::decline("vk_guest_ram_warm", &inner).fail_once(0),
+            Err(inner) => {
+                reims_vgpu_observe::Emit::decline("vk_guest_ram_warm", &inner).fail_once(0)
+            }
         }
     }
     (warmed, bytes)

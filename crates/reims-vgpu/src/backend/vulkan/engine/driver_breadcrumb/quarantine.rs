@@ -109,7 +109,7 @@ fn entries() -> &'static HashMap<String, String> {
             .map(|text| parse_list(&text))
             .unwrap_or_default();
         if !map.is_empty() {
-            crate::observe::fail(format!(
+            reims_vgpu_observe::fail(format!(
                 "driver_quarantine reason=driver_quarantine_loaded calls={} path={} \
                  (each one ended a process that was inside the driver; delete the file to try \
                  them again)",
@@ -140,14 +140,14 @@ fn fold_surviving_breadcrumb() {
     }
     let _ = std::fs::remove_file(super::meta_path());
     if key.is_empty() {
-        crate::observe::fail(format!(
+        reims_vgpu_observe::fail(format!(
             "driver_quarantine reason=driver_quarantine_crash_unkeyed what={what} \
              (a breadcrumb survived, so the last process ended inside this call, but its meta \
              carried no key= line and the call cannot be recognised again)"
         ));
         return;
     }
-    crate::observe::fail(format!(
+    reims_vgpu_observe::fail(format!(
         "driver_quarantine reason=driver_quarantine_ended_in_call what={what} key={key} \
          (the last process ended while inside this driver call — a crash, or a kill of a call that \
          was not coming back; it will be refused from now on)"
@@ -198,12 +198,12 @@ fn append(key: &str, what: &str) {
     match opened {
         Ok(mut f) => {
             if let Err(e) = writeln!(f, "{key}\t{what}") {
-                crate::observe::fail(format!(
+                reims_vgpu_observe::fail(format!(
                     "driver_quarantine reason=driver_quarantine_write_failed key={key} err={e}"
                 ));
             }
         }
-        Err(e) => crate::observe::fail(format!(
+        Err(e) => reims_vgpu_observe::fail(format!(
             "driver_quarantine reason=driver_quarantine_open_failed key={key} err={e}"
         )),
     }

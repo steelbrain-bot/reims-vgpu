@@ -216,7 +216,7 @@ static LAST: OnceLock<Mutex<HashMap<(&'static str, u64), u64>>> = OnceLock::new(
 /// A test that wants a latch *claimed* — to prove an emitter stays quiet, or
 /// that two namespaces do not suppress each other — claims it after `start()`
 /// rather than before.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-fixtures"))]
 pub(crate) fn forget_all_latches() {
     if let Some(s) = SEEN.get() {
         s.lock().unwrap_or_else(|p| p.into_inner()).clear();
@@ -316,7 +316,7 @@ mod tests {
         assert!(state_changed("capture_reset_flip", 1, 7));
         assert!(!state_changed("capture_reset_flip", 1, 7));
 
-        let _cap = crate::observe::sink::FailCapture::start();
+        let _cap = crate::sink::FailCapture::start();
 
         assert!(
             first_sight("capture_reset_reason", 0x99),

@@ -68,11 +68,12 @@ pub trait Decline {
 ///
 /// The `use` is inside the function body so the macro works whether or not the
 /// trait is already in scope where it is invoked.
+#[macro_export]
 macro_rules! decline_display {
     ($ty:ty) => {
         impl std::fmt::Display for $ty {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                use $crate::observe::Decline as _;
+                use $crate::Decline as _;
                 write!(f, "reason={}", self.slug())?;
                 for (key, value) in self.fields() {
                     write!(f, " {key}={value}")?;
@@ -82,7 +83,7 @@ macro_rules! decline_display {
         }
     };
 }
-pub(crate) use decline_display;
+pub use crate::decline_display;
 
 /// A status enum that mixes success with refusal.
 ///
