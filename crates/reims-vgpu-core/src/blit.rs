@@ -1,7 +1,9 @@
 //! Immutable, resource-resolved blit operations.
 
 use crate::{pixel_format::BlitAspect, ContentStamp};
-use reims_vgpu_protocol::{ByteLength, GuestVirtualAddress, MappingId, ResourceId, ResourceObject};
+use reims_vgpu_protocol::{
+    ByteLength, GuestVirtualAddress, MappingId, ObjectTableRef, ResourceId, ResourceObject,
+};
 
 /// One resolved mip level in a task-address texture allocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -122,6 +124,21 @@ pub struct ResolvedTextureToBufferBlit {
     pub aspect: BlitAspect,
 }
 
+/// A texture-region copy after both serializer references have resolved.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedTextureToTextureBlit {
+    pub source: ResolvedTextureEndpoint,
+    pub source_origin: TextureOrigin,
+    pub destination: ResolvedTextureEndpoint,
+    pub destination_origin: TextureOrigin,
+    pub extent: TextureExtent,
+    pub aspect: BlitAspect,
+    /// Typed object name retained only for compatibility cache invalidation on
+    /// the direct resident-to-guest optimization. The destination's authority
+    /// and completion identity are `destination.content`.
+    pub destination_object: ObjectTableRef<ResourceObject>,
+}
+
 impl ResolvedTextureBacking {
     pub const fn width(&self) -> u32 {
         match self {
@@ -206,6 +223,7 @@ pub enum ResolvedBlit {
     },
     BufferToTexture(ResolvedBufferToTextureBlit),
     TextureToBuffer(ResolvedTextureToBufferBlit),
+    TextureToTexture(ResolvedTextureToTextureBlit),
 }
 
 impl ResolvedBlit {
@@ -214,6 +232,7 @@ impl ResolvedBlit {
             Self::Fill { destination, .. } | Self::Copy { destination, .. } => destination.content,
             Self::BufferToTexture(operation) => operation.destination.content,
             Self::TextureToBuffer(operation) => operation.destination.content,
+            Self::TextureToTexture(operation) => operation.destination.content,
         }
     }
 }

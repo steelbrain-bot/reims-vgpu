@@ -23,7 +23,8 @@ pub mod visibility;
 pub use blit::{
     BufferFillPattern, ResolvedBlit, ResolvedBufferRange, ResolvedBufferToTextureBlit,
     ResolvedLinearTextureLevel, ResolvedSurfaceTextureBacking, ResolvedTextureBacking,
-    ResolvedTextureEndpoint, ResolvedTextureToBufferBlit, TextureExtent, TextureOrigin,
+    ResolvedTextureEndpoint, ResolvedTextureToBufferBlit, ResolvedTextureToTextureBlit,
+    TextureExtent, TextureOrigin,
 };
 pub use capabilities::{CapabilityService, DeviceInfoLimits, ExecutorCapabilities, MAX_CHANNELS};
 pub use compute::{

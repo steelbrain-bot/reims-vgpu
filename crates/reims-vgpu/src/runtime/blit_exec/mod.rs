@@ -61,9 +61,9 @@ use reims_vgpu_core::{
     ResolvedLinearTextureLevel as LinearTextureLevel, ResolvedSubmission,
     ResolvedSurfaceTextureBacking as IOSurfaceTextureBacking,
     ResolvedTextureBacking as TextureBacking, ResolvedTextureEndpoint, ResolvedTextureToBufferBlit,
-    TextureExtent, TextureOrigin,
+    ResolvedTextureToTextureBlit, TextureExtent, TextureOrigin,
 };
-use reims_vgpu_protocol::{ByteLength, GuestVirtualAddress, MappingId};
+use reims_vgpu_protocol::{ByteLength, GuestVirtualAddress, MappingId, ObjectTableRef};
 use reims_vgpu_wire::ops::blit as wire_blit;
 
 /// Chunk size for fill/copy host staging (bounded guest IO).
@@ -466,6 +466,60 @@ fn resolve_texture_to_buffer_blit<M: HostMemory + HostOps>(
         destination_bytes_per_image: cmd.destination_bytes_per_image,
         aspect,
     }))
+}
+
+fn resolve_texture_to_texture_blit<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    cmd: &Command,
+) -> Result<ResolvedBlit, BlitStatus> {
+    let source = resolve_texture_endpoint(
+        state,
+        host,
+        task_id,
+        cmd.source,
+        cmd.source_level,
+        cmd.source_slice,
+    )?;
+    let destination = resolve_texture_endpoint(
+        state,
+        host,
+        task_id,
+        cmd.destination,
+        cmd.destination_level,
+        cmd.destination_slice,
+    )?;
+    let (aspect, source_bpp) = copy_aspect_for_options(source.backing.pixel_format(), cmd)?;
+    let (_, destination_bpp) = copy_aspect_for_options(destination.backing.pixel_format(), cmd)?;
+    if source_bpp != destination_bpp {
+        return Err(br(BlitStatus::Unsupported, "t2t_bpp_mismatch"));
+    }
+    Ok(ResolvedBlit::TextureToTexture(
+        ResolvedTextureToTextureBlit {
+            source,
+            source_origin: TextureOrigin {
+                x: cmd.source_origin.x,
+                y: cmd.source_origin.y,
+                z: cmd.source_origin.z,
+            },
+            destination,
+            destination_origin: TextureOrigin {
+                x: cmd.destination_origin.x,
+                y: cmd.destination_origin.y,
+                z: cmd.destination_origin.z,
+            },
+            extent: TextureExtent {
+                width: cmd.source_size.width,
+                height: cmd.source_size.height,
+                depth: cmd.source_size.depth,
+            },
+            aspect,
+            destination_object: ObjectTableRef::<reims_vgpu_protocol::ResourceObject>::new(
+                cmd.destination,
+            ),
+        },
+    ))
 }
 
 fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
@@ -1759,6 +1813,12 @@ fn execute_resolved_blit<M: HostMemory + HostOps>(
                 ResolvedBlit::TextureToBuffer(operation) => {
                     execute_resolved_texture_to_buffer(state, host, task_id, operation)
                 }
+                ResolvedBlit::TextureToTexture(operation) => {
+                    match execute_resolved_texture_to_texture(state, host, task_id, operation) {
+                        BlitStatus::Ok => Ok(()),
+                        status => Err(status),
+                    }
+                }
             }?;
             let Some(version) = state.task_resources.note_guest_write_by_id(destination) else {
                 return Err(br(
@@ -1805,12 +1865,11 @@ fn blit_write_destination(cmd: &Command) -> Option<u32> {
         // texture families settle here temporarily.
         Kind::FillBuffer | Kind::FillBufferPattern4 => None,
         Kind::Copy => match cmd.copy_kind {
-            CopyKind::BufferToBuffer | CopyKind::BufferToTexture | CopyKind::TextureToBuffer => {
-                None
-            }
-            CopyKind::TextureToTexture | CopyKind::TextureToTextureSliceLevel => {
-                Some(cmd.destination)
-            }
+            CopyKind::BufferToBuffer
+            | CopyKind::BufferToTexture
+            | CopyKind::TextureToBuffer
+            | CopyKind::TextureToTexture => None,
+            CopyKind::TextureToTextureSliceLevel => Some(cmd.destination),
             CopyKind::None => None,
         },
         Kind::Fence
@@ -3017,11 +3076,11 @@ fn execute_resolved_texture_to_buffer<M: HostMemory + HostOps>(
     Ok(())
 }
 
-fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
+fn execute_resolved_texture_to_texture<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
-    cmd: &Command,
+    operation: ResolvedTextureToTextureBlit,
 ) -> BlitStatus {
     // `walk_blit_us` says this call costs ~1.1 ms and `blit_t2t_bytes` says it
     // moves ~800 of them, so the cost is not in the copy and a single total
@@ -3029,40 +3088,22 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
     // resolving both endpoints, arming the destination's page window, and the
     // row loop. Whichever of them holds the millisecond is the one to repair.
     let phase_started = std::time::Instant::now();
-    let src = match resolve_texture_backing(
-        state,
-        host,
-        task_id,
-        cmd.source,
-        cmd.source_level,
-        cmd.source_slice,
-    ) {
-        Ok(t) => t,
-        Err(st) => return st,
-    };
-    let dst = match resolve_texture_backing(
-        state,
-        host,
-        task_id,
-        cmd.destination,
-        cmd.destination_level,
-        cmd.destination_slice,
-    ) {
-        Ok(t) => t,
-        Err(st) => return st,
-    };
+    let ResolvedTextureToTextureBlit {
+        source,
+        source_origin,
+        destination,
+        destination_origin,
+        extent,
+        aspect,
+        destination_object,
+    } = operation;
+    let src = source.backing;
+    let dst = destination.backing;
     // Options apply to both ends; plane bpp must agree under the selected aspect.
-    let (aspect, src_bpp) = match copy_aspect_for_options(src.pixel_format(), cmd) {
-        Ok(v) => v,
-        Err(st) => return st,
+    let Some(src_bpp) = pixel_format::blit_aspect_bytes_per_pixel(src.pixel_format(), aspect)
+    else {
+        return br(BlitStatus::Unsupported, "blit_options_aspect_format");
     };
-    let (_, dst_bpp) = match copy_aspect_for_options(dst.pixel_format(), cmd) {
-        Ok(v) => v,
-        Err(st) => return st,
-    };
-    if src_bpp != dst_bpp {
-        return br(BlitStatus::Unsupported, "t2t_bpp_mismatch");
-    }
     if src.pixel_format() != 0
         && dst.pixel_format() != 0
         && src.pixel_format() != dst.pixel_format()
@@ -3073,15 +3114,15 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
     let repack_src = pixel_format::blit_aspect_needs_repack(src.pixel_format(), aspect);
     let repack_dst = pixel_format::blit_aspect_needs_repack(dst.pixel_format(), aspect);
     let any_iosurface = src.is_surface() || dst.is_surface();
-    if any_iosurface && (cmd.source_origin.z != 0 || cmd.destination_origin.z != 0) {
+    if any_iosurface && (source_origin.z != 0 || destination_origin.z != 0) {
         return br(BlitStatus::Unsupported, "t2t_iosurface_z");
     }
-    let sox = cmd.source_origin.x;
-    let soy = cmd.source_origin.y;
-    let soz = cmd.source_origin.z;
-    let dox = cmd.destination_origin.x;
-    let doy = cmd.destination_origin.y;
-    let doz = cmd.destination_origin.z;
+    let sox = source_origin.x;
+    let soy = source_origin.y;
+    let soz = source_origin.z;
+    let dox = destination_origin.x;
+    let doy = destination_origin.y;
+    let doz = destination_origin.z;
     if sox > src.width() as u64
         || soy > src.height() as u64
         || soz > src.depth() as u64
@@ -3097,53 +3138,23 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
     // even come through the extent helper, which made it the quieter of two
     // quiet paths.
     let (Some(copy_w), Some(_)) = (
-        copy_extent(
-            "t2t_src",
-            "w",
-            cmd.source_size.width,
-            src.width() as u64 - sox,
-        ),
-        copy_extent(
-            "t2t_dst",
-            "w",
-            cmd.source_size.width,
-            dst.width() as u64 - dox,
-        ),
+        copy_extent("t2t_src", "w", extent.width, src.width() as u64 - sox),
+        copy_extent("t2t_dst", "w", extent.width, dst.width() as u64 - dox),
     ) else {
         return br(BlitStatus::Bounds, "t2t_extent_oob");
     };
     let (Some(copy_h), Some(_)) = (
-        copy_extent(
-            "t2t_src",
-            "h",
-            cmd.source_size.height,
-            src.height() as u64 - soy,
-        ),
-        copy_extent(
-            "t2t_dst",
-            "h",
-            cmd.source_size.height,
-            dst.height() as u64 - doy,
-        ),
+        copy_extent("t2t_src", "h", extent.height, src.height() as u64 - soy),
+        copy_extent("t2t_dst", "h", extent.height, dst.height() as u64 - doy),
     ) else {
         return br(BlitStatus::Bounds, "t2t_extent_oob");
     };
-    let copy_d = if cmd.source_size.depth == 0 {
+    let copy_d = if extent.depth == 0 {
         0
     } else {
         let (Some(d), Some(_)) = (
-            copy_extent(
-                "t2t_src",
-                "d",
-                cmd.source_size.depth,
-                src.depth() as u64 - soz,
-            ),
-            copy_extent(
-                "t2t_dst",
-                "d",
-                cmd.source_size.depth,
-                dst.depth() as u64 - doz,
-            ),
+            copy_extent("t2t_src", "d", extent.depth, src.depth() as u64 - soz),
+            copy_extent("t2t_dst", "d", extent.depth, dst.depth() as u64 - doz),
         ) else {
             return br(BlitStatus::Bounds, "t2t_extent_oob");
         };
@@ -3540,7 +3551,7 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
                     state,
                     host,
                     task_id,
-                    cmd.destination,
+                    destination_object.get(),
                     s,
                     d,
                 ) {
@@ -4565,7 +4576,12 @@ pub fn execute_blit<M: HostMemory + HostOps>(
                     Err(status) => status,
                 }
             }
-            CopyKind::TextureToTexture => exec_copy_texture_to_texture(state, host, task_id, cmd),
+            CopyKind::TextureToTexture => {
+                match resolve_texture_to_texture_blit(state, host, task_id, cmd) {
+                    Ok(operation) => execute_resolved_blit(state, host, task_id, operation),
+                    Err(status) => status,
+                }
+            }
             CopyKind::TextureToTextureSliceLevel => {
                 exec_copy_texture_to_texture_slice_level(state, host, task_id, cmd)
             }
