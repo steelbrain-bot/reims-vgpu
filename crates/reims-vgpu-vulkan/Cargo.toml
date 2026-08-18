@@ -14,3 +14,4 @@ test-fixtures = []
 [dependencies]
 ash = "0.38"
 reims-vgpu-core = { path = "../reims-vgpu-core" }
+reims-vgpu-protocol = { path = "../reims-vgpu-protocol" }

@@ -266,48 +266,7 @@ pub fn sampled_pixels(
     Ok((layout, srgb_decline(&f, mtl), f.components))
 }
 
-/// The Vulkan format for a guest [`TexelLayout`].
-///
-/// The single crossing from the decode vocabulary to the host one, applied
-/// where the engine creates a sampled image. Linear by construction: a layout
-/// carries no transfer function, so a rail that reaches a sampled image through
-/// here has already recorded whatever [`sampled_pixels`] handed back.
-pub fn vk_texel_layout(layout: TexelLayout) -> vk::Format {
-    match layout {
-        TexelLayout::Rgba8 => vk::Format::R8G8B8A8_UNORM,
-        TexelLayout::Bgra8 => vk::Format::B8G8R8A8_UNORM,
-        TexelLayout::R8 => vk::Format::R8_UNORM,
-        TexelLayout::Rg8 => vk::Format::R8G8_UNORM,
-        TexelLayout::R16Float => vk::Format::R16_SFLOAT,
-        TexelLayout::R32Float => vk::Format::R32_SFLOAT,
-        TexelLayout::R16Unorm => vk::Format::R16_UNORM,
-        TexelLayout::Rg16Unorm => vk::Format::R16G16_UNORM,
-        TexelLayout::Rgba16Unorm => vk::Format::R16G16B16A16_UNORM,
-        TexelLayout::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,
-        TexelLayout::Rg16Float => vk::Format::R16G16_SFLOAT,
-        TexelLayout::Rgb10a2Unorm => vk::Format::A2B10G10R10_UNORM_PACK32,
-        TexelLayout::Bgr10a2Unorm => vk::Format::A2R10G10B10_UNORM_PACK32,
-        TexelLayout::Rg11b10Float => vk::Format::B10G11R11_UFLOAT_PACK32,
-    }
-}
-
-/// The sRGB spelling of a guest [`TexelLayout`], for the layouts that have one.
-///
-/// The counterpart of [`vk_texel_layout`] for an image whose stored values are
-/// sRGB-encoded, so the hardware decodes on sample. `None` for every layout that
-/// cannot hold an sRGB image — see [`TexelLayout::has_srgb_encoding`], which
-/// this agrees with by a `const` assertion below rather than by a second list.
-///
-/// Written as the inverse of [`storage_format`] and held to it by
-/// `the_srgb_spelling_of_a_layout_stores_that_layout`: a pair that disagreed
-/// would key a resident allocation on one format and bind a view of the other.
-pub fn srgb_texel_layout(layout: TexelLayout) -> Option<vk::Format> {
-    match layout {
-        TexelLayout::Rgba8 => Some(vk::Format::R8G8B8A8_SRGB),
-        TexelLayout::Bgra8 => Some(vk::Format::B8G8R8A8_SRGB),
-        _ => None,
-    }
-}
+pub use reims_vgpu_vulkan::format::{srgb_texel_layout, vk_texel_layout};
 
 /// The Vulkan format for bytes a CPU loader produced.
 ///
