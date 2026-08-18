@@ -288,6 +288,19 @@ pub trait Executor: std::fmt::Debug + Send + Sync {
 
     fn quiesce_guest_reads(&self) {}
 
+    fn warm_guest_ram_imports(
+        &self,
+        _imports: &[std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>],
+    ) -> (usize, u64) {
+        (0, 0)
+    }
+
+    fn retire_guest_import(&self, _import: crate::runtime::guest_ram::ImportId) {}
+
+    fn resident_presentable(&self, _identity: &TargetIdentity, _width: u32, _height: u32) -> bool {
+        false
+    }
+
     fn execute(&self, submission: ResolvedSubmission) -> Result<ExecutionCompletion, DrawError>;
 
     /// End one guest lifetime while preserving shareable physical-GPU state.
@@ -460,6 +473,21 @@ impl Executor for VulkanExecutor {
 
     fn quiesce_guest_reads(&self) {
         crate::backend::vulkan::engine::quiesce_guest_reads();
+    }
+
+    fn warm_guest_ram_imports(
+        &self,
+        imports: &[std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>],
+    ) -> (usize, u64) {
+        crate::backend::vulkan::engine::warm_guest_ram_imports(imports)
+    }
+
+    fn retire_guest_import(&self, import: crate::runtime::guest_ram::ImportId) {
+        crate::backend::vulkan::engine::retire_guest_import(import);
+    }
+
+    fn resident_presentable(&self, identity: &TargetIdentity, width: u32, height: u32) -> bool {
+        crate::backend::vulkan::engine::resident_presentable(identity, width, height)
     }
 
     fn execute(&self, submission: ResolvedSubmission) -> Result<ExecutionCompletion, DrawError> {

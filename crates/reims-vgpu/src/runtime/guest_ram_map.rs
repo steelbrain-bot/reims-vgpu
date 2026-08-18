@@ -366,7 +366,10 @@ pub fn imports() -> Vec<Arc<GuestRamImport>> {
 ///
 /// The device-side half is Vulkan-only because only Vulkan has a device-side
 /// against unified memory and holds no per-RAMBlock import to warm.
-pub fn warm<H: GuestRamProvider + ?Sized>(host: &mut H) {
+pub fn warm<H: GuestRamProvider + ?Sized>(
+    host: &mut H,
+    executor: &dyn crate::runtime::executor::Executor,
+) {
     if granularity().is_none() {
         return;
     }
@@ -378,7 +381,7 @@ pub fn warm<H: GuestRamProvider + ?Sized>(host: &mut H) {
     {
         let imports = imports();
         if !imports.is_empty() {
-            let (warmed, bytes) = crate::backend::vulkan::engine::warm_guest_ram_imports(&imports);
+            let (warmed, bytes) = executor.warm_guest_ram_imports(&imports);
             if warmed > 0 {
                 crate::observe::off(format!(
                     "guest_ram_warm blocks={warmed} bytes={bytes} spans={}",
@@ -791,6 +794,25 @@ mod tests {
     /// also a test about the heap. The budget tests name their own.
     const UNBOUNDED: u64 = u64::MAX;
 
+    #[derive(Debug)]
+    struct NoopExecutor;
+
+    impl crate::runtime::executor::Executor for NoopExecutor {
+        fn execute(
+            &self,
+            _submission: crate::runtime::executor::ResolvedSubmission,
+        ) -> Result<
+            crate::runtime::executor::ExecutionCompletion,
+            crate::backend::vulkan::engine::DrawError,
+        > {
+            Err(crate::backend::vulkan::engine::DrawError::Facade(
+                crate::backend::vulkan::engine::EngineFacadeDecline::ExecutorServiceUnavailable {
+                    service: "test",
+                },
+            ))
+        }
+    }
+
     /// Latch a granularity with a budget and a span ceiling that admit
     /// everything, so a test about the granularity is only about that.
     fn latch_granularity(align: u64) {
@@ -1129,7 +1151,7 @@ mod tests {
     fn warming_before_the_backend_publishes_a_granularity_latches_nothing() {
         with_granularity(None, || {
             let mut host = two_spans();
-            warm(&mut host);
+            warm(&mut host, &NoopExecutor);
             assert!(
                 MAP.lock().unwrap_or_else(|p| p.into_inner()).is_none(),
                 "a warm with no granularity must not latch a refusal"
@@ -1137,7 +1159,7 @@ mod tests {
 
             // The backend comes up late; the import must still be available.
             latch_granularity(0x1000);
-            warm(&mut host);
+            warm(&mut host, &NoopExecutor);
             assert_eq!(
                 standing_refusal(&mut host),
                 None,
@@ -1159,8 +1181,8 @@ mod tests {
         });
         let warmed = with_granularity(Some(0x1000), || {
             let mut host = two_spans();
-            warm(&mut host);
-            warm(&mut host);
+            warm(&mut host, &NoopExecutor);
+            warm(&mut host, &NoopExecutor);
             let refusal = standing_refusal(&mut host);
             (refusal, imports().len())
         });

@@ -182,7 +182,7 @@ pub fn gfx_write<H: HostMemory + HostOps>(
             // a display transaction the guest abandons after 1000 ms — see
             // `guest_ram_map::warm` for both halves of the cost and why neither
             // may run before the backend has published a granularity.
-            crate::runtime::guest_ram_map::warm(host);
+            crate::runtime::guest_ram_map::warm(host, state.executor.as_ref());
         }
         GFX_REG_EFI_DISPLAY => state.gfx.efi_display = val,
         GFX_REG_EFI_MODE_SELECT => state.gfx.efi_mode_select = val,

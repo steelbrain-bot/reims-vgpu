@@ -5451,9 +5451,11 @@ fn present_resident_carries(
 ) -> Option<bool> {
     let identity =
         crate::runtime::present_identity::surface_identity(state, mapping, width, height);
-    Some(crate::backend::vulkan::engine::resident_presentable(
-        &identity, width, height,
-    ))
+    Some(
+        state
+            .executor
+            .resident_presentable(&identity, width, height),
+    )
 }
 
 #[cfg(not(feature = "backend-vulkan"))]

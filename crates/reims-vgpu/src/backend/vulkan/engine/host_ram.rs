@@ -799,7 +799,9 @@ mod tests {
         crate::runtime::guest_ram_map::reset();
         let before = super::super::guest_import_census().0;
         let mut host = OneBlock(base as u64);
-        crate::runtime::guest_ram_map::warm(&mut host);
+        let executor = crate::runtime::executor::VulkanExecutor::default();
+        let _scope = crate::runtime::executor::Executor::enter(&executor);
+        crate::runtime::guest_ram_map::warm(&mut host, &executor);
         let after = super::super::guest_import_census().0;
         assert_eq!(
             after - before,
@@ -809,7 +811,7 @@ mod tests {
 
         // And it is once. A warm that re-imported per call would be the
         // per-RAMBlock model turning into a per-call one.
-        crate::runtime::guest_ram_map::warm(&mut host);
+        crate::runtime::guest_ram_map::warm(&mut host, &executor);
         assert_eq!(super::super::guest_import_census().0, after);
         crate::runtime::guest_ram_map::reset();
     }

@@ -1520,7 +1520,7 @@ pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
     // import it, making `unmap_pages` a no-op there until device teardown.
     #[cfg(feature = "backend-vulkan")]
     for import in state.retired_guest_imports.drain(..) {
-        crate::backend::vulkan::engine::retire_guest_import(import);
+        state.executor.retire_guest_import(import);
     }
     #[cfg(not(feature = "backend-vulkan"))]
     state.retired_guest_imports.clear();
