@@ -2407,7 +2407,7 @@ fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
     use crate::runtime::drain::census::store_route_count;
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let held = crate::backend::vulkan::translate::pixel::vk_storage_image(
+    let held = reims_vgpu_vulkan::format::vk_storage_image(
         reims_vgpu_protocol::StorageImageFormat::Rgba8Unorm,
     );
 

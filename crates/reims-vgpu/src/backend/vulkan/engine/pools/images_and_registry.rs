@@ -75,7 +75,7 @@ impl ResourcePools {
             });
             return Ok(slot);
         }
-        let format = crate::backend::vulkan::translate::pixel::vk_storage_image(key.format);
+        let format = reims_vgpu_vulkan::format::vk_storage_image(key.format);
         let image = ctx
             .device
             .create_image(

@@ -1918,8 +1918,8 @@ pub(crate) fn resident_serve(
     let (engine_generation, engine_format) = executor.compute_resident_sample_source(&key)?;
     (engine_generation == mirror_generation
         && mtl_to_engine_sampled(pixel_format).is_some_and(|f| {
-            crate::backend::vulkan::translate::pixel::vk_storage_image(f)
-                == crate::backend::vulkan::translate::pixel::vk_storage_image(engine_format)
+            reims_vgpu_vulkan::format::vk_storage_image(f)
+                == reims_vgpu_vulkan::format::vk_storage_image(engine_format)
         }))
     .then_some(ResidentServe::Sample(key, mirror_generation))
 }
@@ -4310,7 +4310,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                     state,
                     host,
                     t,
-                    crate::backend::vulkan::translate::pixel::vk_storage_image(shader_fmt),
+                    reims_vgpu_vulkan::format::vk_storage_image(shader_fmt),
                 ),
                 residency: t.residency.map(|candidate| {
                     crate::backend::vulkan::engine::ComputeStorageResidency {

@@ -1,7 +1,7 @@
 //! Vulkan representation of backend-independent texel storage layouts.
 
 use ash::vk;
-use reims_vgpu_protocol::TexelLayout;
+use reims_vgpu_protocol::{StorageImageFormat, TexelLayout};
 
 /// Vulkan's linear format spelling for one guest texel layout.
 pub fn vk_texel_layout(layout: TexelLayout) -> vk::Format {
@@ -32,10 +32,39 @@ pub fn srgb_texel_layout(layout: TexelLayout) -> Option<vk::Format> {
     }
 }
 
+/// Vulkan representation of a semantic sampled or storage image format.
+pub fn vk_storage_image(format: StorageImageFormat) -> vk::Format {
+    match format {
+        StorageImageFormat::Rgba32Float => vk::Format::R32G32B32A32_SFLOAT,
+        StorageImageFormat::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,
+        StorageImageFormat::R16Float => vk::Format::R16_SFLOAT,
+        StorageImageFormat::Rgba16Uint => vk::Format::R16G16B16A16_UINT,
+        StorageImageFormat::Rgba8Uint => vk::Format::R8G8B8A8_UINT,
+        StorageImageFormat::Rgba8Sint => vk::Format::R8G8B8A8_SINT,
+        StorageImageFormat::Rgba8Unorm => vk::Format::R8G8B8A8_UNORM,
+        StorageImageFormat::Bgra8Unorm => vk::Format::B8G8R8A8_UNORM,
+        StorageImageFormat::Rg16Float => vk::Format::R16G16_SFLOAT,
+        StorageImageFormat::R8Unorm => vk::Format::R8_UNORM,
+        StorageImageFormat::Rg8Unorm => vk::Format::R8G8_UNORM,
+        StorageImageFormat::Rgba32Uint => vk::Format::R32G32B32A32_UINT,
+        StorageImageFormat::R32Uint => vk::Format::R32_UINT,
+        StorageImageFormat::R32Sint => vk::Format::R32_SINT,
+        StorageImageFormat::R32Float => vk::Format::R32_SFLOAT,
+        StorageImageFormat::Rgb9e5Ufloat => vk::Format::E5B9G9R9_UFLOAT_PACK32,
+        StorageImageFormat::R16Unorm => vk::Format::R16_UNORM,
+        StorageImageFormat::Rg16Unorm => vk::Format::R16G16_UNORM,
+        StorageImageFormat::Rgba16Unorm => vk::Format::R16G16B16A16_UNORM,
+        StorageImageFormat::Rgb10a2Unorm => vk::Format::A2B10G10R10_UNORM_PACK32,
+        StorageImageFormat::Bgr10a2Unorm => vk::Format::A2R10G10B10_UNORM_PACK32,
+        StorageImageFormat::Rg11b10Float => vk::Format::B10G11R11_UFLOAT_PACK32,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{srgb_texel_layout, vk_texel_layout};
-    use reims_vgpu_protocol::TexelLayout;
+    use super::{srgb_texel_layout, vk_storage_image, vk_texel_layout};
+    use ash::vk;
+    use reims_vgpu_protocol::{StorageImageFormat, TexelLayout};
 
     #[test]
     fn every_semantic_layout_has_one_vulkan_storage_format() {
@@ -45,6 +74,19 @@ mod tests {
                 srgb_texel_layout(layout).is_some(),
                 layout.has_srgb_encoding()
             );
+        }
+    }
+
+    #[test]
+    fn semantic_image_formats_map_without_an_undefined_fallback() {
+        let formats = [
+            StorageImageFormat::Rgba32Float,
+            StorageImageFormat::Rgba8Unorm,
+            StorageImageFormat::R16Unorm,
+            StorageImageFormat::Bgr10a2Unorm,
+        ];
+        for format in formats {
+            assert_ne!(vk_storage_image(format), vk::Format::UNDEFINED);
         }
     }
 }

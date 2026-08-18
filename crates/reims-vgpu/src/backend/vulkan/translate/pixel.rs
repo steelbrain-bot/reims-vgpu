@@ -566,7 +566,10 @@ pub fn verbatim_texel(mtl: u16) -> Option<(vk::Format, u32)> {
         return Some((vk_texel_layout(layout), layout.bytes_per_texel()));
     }
     let storage = storage_image_from_selector(pixel_format::storage_selector(mtl)?);
-    Some((vk_storage_image(storage), storage.bytes_per_texel() as u32))
+    Some((
+        reims_vgpu_vulkan::format::vk_storage_image(storage),
+        storage.bytes_per_texel() as u32,
+    ))
 }
 
 /// The engine's storage-image format for a contract [`StorageImageSelector`].
@@ -783,34 +786,6 @@ pub fn bytes_per_texel(format: vk::Format) -> Option<u32> {
     })
 }
 
-/// The Vulkan spelling of an engine storage/compute image format.
-pub fn vk_storage_image(format: StorageImageFormat) -> vk::Format {
-    match format {
-        StorageImageFormat::Rgba32Float => vk::Format::R32G32B32A32_SFLOAT,
-        StorageImageFormat::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,
-        StorageImageFormat::R16Float => vk::Format::R16_SFLOAT,
-        StorageImageFormat::Rgba16Uint => vk::Format::R16G16B16A16_UINT,
-        StorageImageFormat::Rgba8Uint => vk::Format::R8G8B8A8_UINT,
-        StorageImageFormat::Rgba8Sint => vk::Format::R8G8B8A8_SINT,
-        StorageImageFormat::Rgba8Unorm => vk::Format::R8G8B8A8_UNORM,
-        StorageImageFormat::Bgra8Unorm => vk::Format::B8G8R8A8_UNORM,
-        StorageImageFormat::Rg16Float => vk::Format::R16G16_SFLOAT,
-        StorageImageFormat::R8Unorm => vk::Format::R8_UNORM,
-        StorageImageFormat::Rg8Unorm => vk::Format::R8G8_UNORM,
-        StorageImageFormat::Rgba32Uint => vk::Format::R32G32B32A32_UINT,
-        StorageImageFormat::R32Uint => vk::Format::R32_UINT,
-        StorageImageFormat::R32Sint => vk::Format::R32_SINT,
-        StorageImageFormat::R32Float => vk::Format::R32_SFLOAT,
-        StorageImageFormat::Rgb9e5Ufloat => vk::Format::E5B9G9R9_UFLOAT_PACK32,
-        StorageImageFormat::R16Unorm => vk::Format::R16_UNORM,
-        StorageImageFormat::Rg16Unorm => vk::Format::R16G16_UNORM,
-        StorageImageFormat::Rgba16Unorm => vk::Format::R16G16B16A16_UNORM,
-        StorageImageFormat::Rgb10a2Unorm => vk::Format::A2B10G10R10_UNORM_PACK32,
-        StorageImageFormat::Bgr10a2Unorm => vk::Format::A2R10G10B10_UNORM_PACK32,
-        StorageImageFormat::Rg11b10Float => vk::Format::B10G11R11_UFLOAT_PACK32,
-    }
-}
-
 /// The decline a rail owes its caller when it binds the linear sibling of an
 /// sRGB Metal format.
 ///
@@ -932,7 +907,7 @@ mod tests {
             let storage = storage_image_from_selector(selector);
             assert_eq!(
                 vk_texel_layout(layout),
-                vk_storage_image(storage),
+                reims_vgpu_vulkan::format::vk_storage_image(storage),
                 "format {mtl:#x} is two different host texels"
             );
             assert_eq!(
@@ -943,7 +918,10 @@ mod tests {
             // And whichever half answered, the union answers the same thing.
             assert_eq!(
                 verbatim_texel(mtl),
-                Some((vk_storage_image(storage), storage.bytes_per_texel() as u32)),
+                Some((
+                    reims_vgpu_vulkan::format::vk_storage_image(storage),
+                    storage.bytes_per_texel() as u32,
+                )),
                 "format {mtl:#x}"
             );
         }
