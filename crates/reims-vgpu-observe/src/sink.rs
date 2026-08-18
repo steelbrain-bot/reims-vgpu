@@ -188,7 +188,7 @@ fn emit(sink: Sink, msg: &str) {
         };
         append_sync(file, path, msg, t);
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-fixtures")))]
     writer::enqueue(sink, format!("{msg} t={t}"));
 }
 
@@ -201,12 +201,15 @@ fn emit(sink: Sink, msg: &str) {
 /// reintroduces a flood is named on the very boot it lands instead of silently
 /// drowning real failures. Legitimate always-on lines are self-clocked windowed
 /// summaries (`drain_duty`, `store_routes`) well under the threshold.
+#[cfg(any(test, not(feature = "test-fixtures")))]
 const FLOOD_WINDOW_MS: u128 = 1000;
+#[cfg(any(test, not(feature = "test-fixtures")))]
 const FLOOD_THRESHOLD_PER_WINDOW: u64 = 1000;
 
 /// The flood-accounting key for an always-on line: its slug — the first
 /// whitespace token, skipping a leading `OFF ` marker. Groups a runaway line by
 /// kind (`type5_view_zc`, `map_family`, …) so the warning names the culprit.
+#[cfg(any(test, not(feature = "test-fixtures")))]
 fn flood_key(line: &str) -> &str {
     let slug = line.strip_prefix("OFF ").unwrap_or(line);
     slug.split(' ').next().unwrap_or(slug)
@@ -214,11 +217,13 @@ fn flood_key(line: &str) -> &str {
 
 /// Windowed per-prefix counter for the always-on stream. Pure + always compiled
 /// so the threshold/keying is unit-tested without a background thread.
+#[cfg(any(test, not(feature = "test-fixtures")))]
 struct FloodWindow {
     counts: std::collections::HashMap<String, u64>,
     window_start_ms: u128,
 }
 
+#[cfg(any(test, not(feature = "test-fixtures")))]
 impl FloodWindow {
     fn new(now: u128) -> Self {
         Self {
@@ -251,7 +256,7 @@ impl FloodWindow {
 /// channel. The thread batch-drains (block on one, then greedily take the rest)
 /// and flushes after each batch, so failure visibility trails real time by at
 /// most one drain cycle while the hot path stays syscall-free.
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-fixtures")))]
 mod writer {
     use super::{draw_log_path, fail_log_path, Sink};
     use std::io::{BufWriter, Write};
