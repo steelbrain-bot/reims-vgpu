@@ -22,6 +22,27 @@ pub enum ResidentContent {
     Epoch(u32),
 }
 
+/// Why a previously known resident no longer exists.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResidentReclaim {
+    /// Allocation pressure reclaimed a replica whose current bytes survive.
+    AllocationReclaimed,
+    /// The backend recreated the resident representation for the same identity.
+    Recreated,
+    /// The owning semantic resource lifetime ended.
+    ResourceReleased,
+}
+
+impl ResidentReclaim {
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::AllocationReclaimed => "allocation_reclaimed",
+            Self::Recreated => "recreated",
+            Self::ResourceReleased => "resource_released",
+        }
+    }
+}
+
 /// A resident target's pixels and their physical channel order.
 #[derive(Debug, Eq, PartialEq)]
 pub struct TargetReadback {

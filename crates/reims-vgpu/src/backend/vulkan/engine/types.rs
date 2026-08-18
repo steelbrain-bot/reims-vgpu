@@ -1672,39 +1672,7 @@ pub use reims_vgpu_protocol::StorageImageFormat;
 
 pub use crate::model::{TargetIdentity, TargetKeyDivergence};
 
-/// What this device last did with a resident it no longer holds.
-///
-/// A draw that samples a missing resident cannot say, on its own, whether the
-/// pixels were taken from under it or never existed: both read as an absent
-/// registry entry. Those are different defects with different repairs — one is a
-/// reclaim policy that counted an actively-read resident as idle, the other is a
-/// target the guest never rendered into — and telling them apart is the whole
-/// value of recording this.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResidentReclaim {
-    /// An allocation was refused and the reclaim retry gave it back, because it
-    /// was neither pinned nor the only copy of its pixels. A terminal destroy of
-    /// the image, but not of the pixels — the guest's own pages still hold them,
-    /// which is the predicate `ResourcePools::recoverable_residents` selects on.
-    AllocationReclaimed,
-    /// `registry_ensure` replaced it for the same identity at a new geometry,
-    /// generation or format.
-    Recreated,
-    /// The serialized resource that owned this resident was explicitly deleted
-    /// or replaced. The guest ended the resource lifetime, so the host object no
-    /// longer participates in allocation-pressure recovery.
-    ResourceReleased,
-}
-
-impl ResidentReclaim {
-    pub fn slug(self) -> &'static str {
-        match self {
-            Self::AllocationReclaimed => "allocation_reclaimed",
-            Self::Recreated => "recreated",
-            Self::ResourceReleased => "resource_released",
-        }
-    }
-}
+pub use reims_vgpu_core::ResidentReclaim;
 
 pub type PresentRect = (u32, u32, u32, u32);
 

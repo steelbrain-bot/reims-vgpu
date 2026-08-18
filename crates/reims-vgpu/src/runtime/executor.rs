@@ -77,7 +77,7 @@ pub trait Executor:
     fn resident_absent_after_reclaim(
         &self,
         _identity: &TargetIdentity,
-    ) -> Option<(crate::backend::vulkan::engine::types::ResidentReclaim, u64)> {
+    ) -> Option<(reims_vgpu_core::ResidentReclaim, u64)> {
         None
     }
 
@@ -324,7 +324,7 @@ impl Executor for VulkanExecutor {
     fn resident_absent_after_reclaim(
         &self,
         identity: &TargetIdentity,
-    ) -> Option<(crate::backend::vulkan::engine::types::ResidentReclaim, u64)> {
+    ) -> Option<(reims_vgpu_core::ResidentReclaim, u64)> {
         crate::backend::vulkan::engine::resident_absent_after_reclaim(identity)
     }
 
