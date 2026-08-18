@@ -75,6 +75,12 @@ pub struct TargetReadback {
     pub bgra: bool,
 }
 
+/// Borrowed readback bytes whose backend allocation remains pinned until drop.
+pub trait ReadbackLease: Send {
+    fn bytes(&self) -> &[u8];
+    fn is_bgra(&self) -> bool;
+}
+
 impl TargetReadback {
     /// Return semantic RGBA8, exchanging red and blue only when required.
     pub fn into_rgba8(mut self) -> Vec<u8> {
@@ -147,6 +153,24 @@ pub trait GuestWriteService: std::fmt::Debug + Send + Sync {
     }
 
     fn quiesce_guest_writes(&self) {}
+}
+
+/// Pixel readback service over semantic resident identities.
+pub trait ReadbackService: std::fmt::Debug + Send + Sync {
+    type Error;
+
+    fn read_target(&self, identity: &TargetIdentity) -> Result<TargetReadback, Self::Error>;
+
+    fn read_target_leased(
+        &self,
+        _identity: &TargetIdentity,
+    ) -> Result<Option<Box<dyn ReadbackLease>>, Self::Error> {
+        Ok(None)
+    }
+
+    fn read_resident_bgra(&self, _identity: &TargetIdentity, _need: usize) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 /// Host-window presentation service over semantic resident identities.

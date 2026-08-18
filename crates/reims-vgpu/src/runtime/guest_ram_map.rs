@@ -799,6 +799,20 @@ mod tests {
 
     impl crate::runtime::executor::CapabilityService for NoopExecutor {}
     impl crate::runtime::executor::PresentationService for NoopExecutor {}
+    impl crate::runtime::executor::ReadbackService for NoopExecutor {
+        type Error = crate::backend::vulkan::engine::DrawError;
+
+        fn read_target(
+            &self,
+            _identity: &crate::model::TargetIdentity,
+        ) -> Result<crate::runtime::executor::TargetReadback, Self::Error> {
+            Err(crate::backend::vulkan::engine::DrawError::Facade(
+                crate::backend::vulkan::engine::EngineFacadeDecline::ExecutorServiceUnavailable {
+                    service: "target_readback",
+                },
+            ))
+        }
+    }
     impl crate::runtime::executor::Executor for NoopExecutor {}
     impl crate::runtime::executor::ResidentService for NoopExecutor {}
     impl crate::runtime::executor::GuestWriteService for NoopExecutor {}

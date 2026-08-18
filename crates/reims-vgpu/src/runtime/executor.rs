@@ -12,8 +12,9 @@ use reims_vgpu_protocol::StorageImageFormat;
 
 pub use reims_vgpu_core::{
     CapabilityService, ComputeResidencyService, ExecutionPort, ExecutorCapabilities,
-    GuestWriteReach, GuestWriteService, PresentDecline, PresentationService, ResidentContent,
-    ResidentContentBacking, ResidentLease, ResidentService, SubmissionContext, TargetReadback,
+    GuestWriteReach, GuestWriteService, PresentDecline, PresentationService, ReadbackLease,
+    ReadbackService, ResidentContent, ResidentContentBacking, ResidentLease, ResidentService,
+    SubmissionContext, TargetReadback,
 };
 
 impl ResidentLease for crate::backend::vulkan::engine::ResidentResourceLease {
@@ -23,6 +24,16 @@ impl ResidentLease for crate::backend::vulkan::engine::ResidentResourceLease {
 
     fn backing(&self) -> ResidentContentBacking {
         self.backing()
+    }
+}
+
+impl ReadbackLease for crate::backend::vulkan::engine::LeasedFrame {
+    fn bytes(&self) -> &[u8] {
+        self.bytes()
+    }
+
+    fn is_bgra(&self) -> bool {
+        self.bgra
     }
 }
 
@@ -62,26 +73,8 @@ pub trait Executor:
     + ComputeResidencyService
     + CapabilityService
     + PresentationService
+    + ReadbackService<Error = DrawError>
 {
-    fn read_target(&self, _identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
-        Err(DrawError::Facade(
-            EngineFacadeDecline::ExecutorServiceUnavailable {
-                service: "target_readback",
-            },
-        ))
-    }
-
-    fn read_target_leased(
-        &self,
-        _identity: &TargetIdentity,
-    ) -> Result<Option<crate::backend::vulkan::engine::LeasedFrame>, DrawError> {
-        Err(DrawError::Facade(
-            EngineFacadeDecline::ExecutorServiceUnavailable {
-                service: "leased_target_readback",
-            },
-        ))
-    }
-
     fn copy_target_to_guest_pages(
         &self,
         _identity: &TargetIdentity,
@@ -93,10 +86,6 @@ pub trait Executor:
                 service: "target_to_guest_pages",
             },
         ))
-    }
-
-    fn read_resident_bgra(&self, _identity: &TargetIdentity, _need: usize) -> Option<Vec<u8>> {
-        None
     }
 
     fn guest_access_outstanding(&self) -> bool {
@@ -200,17 +189,6 @@ impl Drop for VulkanExecutor {
 }
 
 impl Executor for VulkanExecutor {
-    fn read_target(&self, identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
-        crate::backend::vulkan::engine::read_target(identity)
-    }
-
-    fn read_target_leased(
-        &self,
-        identity: &TargetIdentity,
-    ) -> Result<Option<crate::backend::vulkan::engine::LeasedFrame>, DrawError> {
-        crate::backend::vulkan::engine::read_target_leased(identity)
-    }
-
     fn copy_target_to_guest_pages(
         &self,
         identity: &TargetIdentity,
@@ -218,10 +196,6 @@ impl Executor for VulkanExecutor {
         pages: &[u64],
     ) -> Result<(), DrawError> {
         crate::backend::vulkan::engine::copy_target_to_guest_pages(identity, target, pages)
-    }
-
-    fn read_resident_bgra(&self, identity: &TargetIdentity, need: usize) -> Option<Vec<u8>> {
-        crate::backend::vulkan::engine::read_resident_bgra(identity, need)
     }
 
     fn guest_access_outstanding(&self) -> bool {
@@ -332,6 +306,26 @@ impl CapabilityService for VulkanExecutor {
         layout: crate::contract::pixel_format::TexelLayout,
     ) -> bool {
         crate::backend::vulkan::engine::render_target_layout_supported(layout)
+    }
+}
+
+impl ReadbackService for VulkanExecutor {
+    type Error = DrawError;
+
+    fn read_target(&self, identity: &TargetIdentity) -> Result<TargetReadback, Self::Error> {
+        crate::backend::vulkan::engine::read_target(identity)
+    }
+
+    fn read_target_leased(
+        &self,
+        identity: &TargetIdentity,
+    ) -> Result<Option<Box<dyn ReadbackLease>>, Self::Error> {
+        crate::backend::vulkan::engine::read_target_leased(identity)
+            .map(|lease| lease.map(|lease| Box::new(lease) as Box<dyn ReadbackLease>))
+    }
+
+    fn read_resident_bgra(&self, identity: &TargetIdentity, need: usize) -> Option<Vec<u8>> {
+        crate::backend::vulkan::engine::read_resident_bgra(identity, need)
     }
 }
 
@@ -649,6 +643,18 @@ mod tests {
 
     impl PresentationService for ScriptedExecutor {}
 
+    impl ReadbackService for ScriptedExecutor {
+        type Error = DrawError;
+
+        fn read_target(&self, _identity: &TargetIdentity) -> Result<TargetReadback, Self::Error> {
+            Err(DrawError::Facade(
+                EngineFacadeDecline::ExecutorServiceUnavailable {
+                    service: "target_readback",
+                },
+            ))
+        }
+    }
+
     impl Executor for ScriptedExecutor {
         fn reset(&self) {
             self.resets.fetch_add(1, Ordering::Relaxed);
@@ -866,6 +872,17 @@ mod tests {
 
     impl CapabilityService for WrongIdentityExecutor {}
     impl PresentationService for WrongIdentityExecutor {}
+    impl ReadbackService for WrongIdentityExecutor {
+        type Error = DrawError;
+
+        fn read_target(&self, _identity: &TargetIdentity) -> Result<TargetReadback, Self::Error> {
+            Err(DrawError::Facade(
+                EngineFacadeDecline::ExecutorServiceUnavailable {
+                    service: "target_readback",
+                },
+            ))
+        }
+    }
     impl Executor for WrongIdentityExecutor {}
     impl ResidentService for WrongIdentityExecutor {}
     impl GuestWriteService for WrongIdentityExecutor {}

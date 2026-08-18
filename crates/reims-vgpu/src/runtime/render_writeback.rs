@@ -921,7 +921,7 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
         }
     };
     let (ok, frame_len) = match leased {
-        Some(leased) if leased.bgra => {
+        Some(leased) if leased.is_bgra() => {
             crate::runtime::drain::note_store_route("render_flush_leased");
             let len = leased.bytes().len();
             let ok = crate::runtime::mapping_write::write_bgra8_uncached(
