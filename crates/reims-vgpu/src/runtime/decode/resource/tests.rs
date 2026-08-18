@@ -348,7 +348,7 @@ fn heap_texture_use_offset_ignores_the_ring_bytes_around_it() {
                 record.offset, 0x0123_4ab0,
                 "ring {ring:#04x} byte {byte:#04x}: offset"
             );
-            assert_eq!(record.heap_ref, 6565);
+            assert_eq!(record.heap_ref.get(), 6565);
             assert_eq!(record.descriptor.len(), 32);
         }
     }
@@ -411,7 +411,7 @@ fn a_wide_heap_texture_record_decodes_at_its_own_offsets() {
             record.wide,
             "ring {ring:#04x}: record reports its body width"
         );
-        assert_eq!(record.heap_ref, 6565);
+        assert_eq!(record.heap_ref.get(), 6565);
         assert!(record.use_offset);
         assert_eq!(record.offset, 0x0077_7000);
         assert_eq!(record.descriptor.len(), heap_query::WIDE_TEXTURE_BODY_LEN);

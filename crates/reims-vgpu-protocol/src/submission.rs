@@ -5,6 +5,14 @@ use crate::{ObjectRef, SubmissionId, TaskId};
 /// Marker for a heterogeneous task resource-list reference.
 pub enum ResourceObject {}
 
+/// Marker for the serializer's heap-specific reference namespace.
+///
+/// Heap refs are resolved before heap-placed resources are constructed and do
+/// not name slots in the task's heterogeneous object list. Keeping a separate
+/// marker prevents an equal integer in those two namespaces from becoming an
+/// accidental resource relation.
+pub enum HeapObject {}
+
 /// The four validity transitions carried beside one submitted resource.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResourceValidity {

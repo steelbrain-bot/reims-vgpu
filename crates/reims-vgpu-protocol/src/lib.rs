@@ -20,6 +20,6 @@ pub use resource::{
     OBJECT_LIST_ENTRY_LEN,
 };
 pub use submission::{
-    ResourceObject, ResourceValidity, SegmentBoundary, SegmentKind, SubmissionIdentity,
+    HeapObject, ResourceObject, ResourceValidity, SegmentBoundary, SegmentKind, SubmissionIdentity,
     SubmissionResourceUse,
 };

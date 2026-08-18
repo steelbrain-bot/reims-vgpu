@@ -2393,12 +2393,37 @@ fn a_residency_record_is_bounded_by_its_own_count() {
         let body = |count: u32, entries: usize| {
             let mut v = hdr(op, OP_HEADER_LEN + refs_at + entries * REF_BIND_ENTRY_SIZE);
             st32(&mut v[OP_HEADER_LEN + RESIDENCY_COUNT..], count);
+            for i in 0..entries {
+                st32(
+                    &mut v[OP_HEADER_LEN + refs_at + i * REF_BIND_ENTRY_SIZE..],
+                    5151 + i as u32,
+                );
+            }
             v
         };
 
         let c = decode(&body(2, 2)).unwrap_or_else(|e| panic!("op {op:#x}: {e:?}"));
         assert_eq!(c.kind, kind, "op {op:#x}");
         assert_eq!(c.count, 2, "op {op:#x}");
+        match kind {
+            Kind::UseResource => assert_eq!(
+                c.residency_resources
+                    .iter()
+                    .map(|reference| reference.get())
+                    .collect::<Vec<_>>(),
+                vec![5151, 5152],
+                "op {op:#x} dropped its resource declarations"
+            ),
+            Kind::UseHeap => assert_eq!(
+                c.residency_heaps
+                    .iter()
+                    .map(|reference| reference.get())
+                    .collect::<Vec<_>>(),
+                vec![5151, 5152],
+                "op {op:#x} dropped its heap declarations"
+            ),
+            _ => unreachable!(),
+        }
 
         // One entry short of what the count claims.
         assert_eq!(

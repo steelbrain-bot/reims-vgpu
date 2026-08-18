@@ -6,6 +6,7 @@
 //! remaining accepted opcodes are recognized and returned as typed kinds with
 //! raw length validation where the contract specifies fixed sizes.
 
+use reims_vgpu_protocol::{HeapObject, ObjectRef, ResourceObject};
 use reims_vgpu_wire::ops::render as wire;
 use reims_vgpu_wire::ops::render_pass as wire_pass;
 use reims_vgpu_wire::ops::tile as wire_tile;
@@ -681,6 +682,11 @@ pub struct Command {
     pub pipeline_ref: u32,
     pub first: u32,
     pub count: u32,
+    /// Resource declarations carried by [`Kind::UseResource`].
+    pub residency_resources: Vec<ObjectRef<ResourceObject>>,
+    /// Heap declarations carried by [`Kind::UseHeap`]. Heap refs inhabit the
+    /// serializer's heap namespace, not the task object-list namespace.
+    pub residency_heaps: Vec<ObjectRef<HeapObject>>,
     pub buffer_ref: u32,
     pub buffer_offset: u64,
     /// Multi-entry buffer binds for slots `first..first+count`.
@@ -1430,15 +1436,16 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             Ok(out)
         }
         wire::OPCODE_USE_RESOURCE => {
-            // Refs are not lifted (exec no-ops residency); count bounds the
-            // record via the wire layout (usage+stages pack to 4 bytes, refs
-            // at +8).
             let (head, refs) = wire::use_resource(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::UseResource;
             out.count = head.count.get();
             if out.count as usize != refs.len() {
                 return Err(DecodeStatus::ErrShort);
             }
+            out.residency_resources.extend(
+                refs.iter()
+                    .map(|reference| ObjectRef::new(reference.object_ref.get())),
+            );
             Ok(out)
         }
         wire::OPCODE_USE_HEAP => {
@@ -1449,6 +1456,10 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             if out.count as usize != refs.len() {
                 return Err(DecodeStatus::ErrShort);
             }
+            out.residency_heaps.extend(
+                refs.iter()
+                    .map(|reference| ObjectRef::new(reference.object_ref.get())),
+            );
             Ok(out)
         }
         // The two residency forms that take no `stages:`. A render encoder
@@ -1470,6 +1481,10 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             if out.count as usize != refs.len() {
                 return Err(DecodeStatus::ErrShort);
             }
+            out.residency_resources.extend(
+                refs.iter()
+                    .map(|reference| ObjectRef::new(reference.object_ref.get())),
+            );
             Ok(out)
         }
         wire::OPCODE_USE_HEAPS_NO_STAGES => {
@@ -1480,6 +1495,10 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             if out.count as usize != refs.len() {
                 return Err(DecodeStatus::ErrShort);
             }
+            out.residency_heaps.extend(
+                refs.iter()
+                    .map(|reference| ObjectRef::new(reference.object_ref.get())),
+            );
             Ok(out)
         }
         wire::OPCODE_MEMORY_BARRIER_RESOURCES

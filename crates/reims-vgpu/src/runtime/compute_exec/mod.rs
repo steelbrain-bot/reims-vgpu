@@ -1954,7 +1954,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                     }
                 };
                 let (heap_ref, use_offset, offset) =
-                    (record.heap_ref, record.use_offset, record.offset);
+                    (record.heap_ref.get(), record.use_offset, record.offset);
                 if heap_ref == 0 {
                     crate::observe::fail(format!(
                         "compute_stage_tex heap_fail reason=zero_heap ref={texture_ref}"

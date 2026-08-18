@@ -1,6 +1,7 @@
 //! Compute command decoder (port of `host/utils/reims-vgpu-compute-decode`).
 
 use crate::contract::endian::ld32;
+use reims_vgpu_protocol::{HeapObject, ObjectRef, ResourceObject};
 use reims_vgpu_wire::ops::compute as wire;
 
 /// Shared serializer op-header length from `reims-vgpu-wire`.
@@ -191,8 +192,8 @@ pub struct Command {
     pub buffers: Vec<BufferBinding>,
     pub textures: Vec<RefBinding>,
     pub samplers: Vec<SamplerBinding>,
-    pub resources: Vec<RefBinding>,
-    pub heaps: Vec<RefBinding>,
+    pub resources: Vec<ObjectRef<ResourceObject>>,
+    pub heaps: Vec<ObjectRef<HeapObject>>,
     pub grid: Size3,
     pub threads_per_threadgroup: Size3,
     pub indirect_buffer_ref: u32,
@@ -357,9 +358,8 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.kind = Kind::UseHeaps;
             out.count = count;
             for i in 0..count as usize {
-                out.heaps.push(RefBinding {
-                    ref_: ld32(&payload[4 + i * REF_SIZE..]),
-                });
+                out.heaps
+                    .push(ObjectRef::new(ld32(&payload[4 + i * REF_SIZE..])));
             }
             Ok(out)
         }
@@ -376,9 +376,8 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.count = count;
             out.resource_usage = ld32(&payload[4..]);
             for i in 0..count as usize {
-                out.resources.push(RefBinding {
-                    ref_: ld32(&payload[8 + i * REF_SIZE..]),
-                });
+                out.resources
+                    .push(ObjectRef::new(ld32(&payload[8 + i * REF_SIZE..])));
             }
             Ok(out)
         }
@@ -610,9 +609,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.kind = Kind::BarrierResources;
             out.count = head.count.get();
             for r in refs {
-                out.resources.push(RefBinding {
-                    ref_: r.object_ref.get(),
-                });
+                out.resources.push(ObjectRef::new(r.object_ref.get()));
             }
             Ok(out)
         }
@@ -985,7 +982,7 @@ mod tests {
         let c = decode(&v).expect("the serializer's own record must decode");
         assert_eq!(c.kind, Kind::BarrierResources);
         assert_eq!(c.count, COUNT);
-        let refs: Vec<u32> = c.resources.iter().map(|r| r.ref_).collect();
+        let refs: Vec<u32> = c.resources.iter().map(|r| r.get()).collect();
         assert_eq!(
             refs,
             vec![5151, 4343],
@@ -1060,6 +1057,44 @@ mod tests {
         use reims_vgpu_wire::ops::render as wire;
         assert_ne!(OP_USE_HEAPS, wire::OPCODE_USE_HEAP);
         assert_ne!(OP_USE_RESOURCES, wire::OPCODE_USE_RESOURCE);
+    }
+
+    #[test]
+    fn inherited_residency_records_preserve_their_typed_reference_arrays() {
+        let mut heaps = vec![0u8; COUNT_BASE + 2 * REF_SIZE];
+        st32(&mut heaps, OP_USE_HEAPS);
+        st32(&mut heaps[4..], (COUNT_BASE + 2 * REF_SIZE) as u32);
+        st32(&mut heaps[OP_HEADER_LEN..], 2);
+        st32(&mut heaps[COUNT_BASE..], 5151);
+        st32(&mut heaps[COUNT_BASE + REF_SIZE..], 4343);
+        let heaps = decode(&heaps).expect("heap residency");
+        assert_eq!(heaps.kind, Kind::UseHeaps);
+        assert_eq!(
+            heaps
+                .heaps
+                .iter()
+                .map(|reference| reference.get())
+                .collect::<Vec<_>>(),
+            vec![5151, 4343]
+        );
+
+        let mut resources = vec![0u8; BIND_BASE + 2 * REF_SIZE];
+        st32(&mut resources, OP_USE_RESOURCES);
+        st32(&mut resources[4..], (BIND_BASE + 2 * REF_SIZE) as u32);
+        st32(&mut resources[OP_HEADER_LEN..], 2);
+        st32(&mut resources[COUNT_BASE..], 3);
+        st32(&mut resources[BIND_BASE..], 7171);
+        st32(&mut resources[BIND_BASE + REF_SIZE..], 8181);
+        let resources = decode(&resources).expect("resource residency");
+        assert_eq!(resources.kind, Kind::UseResources);
+        assert_eq!(
+            resources
+                .resources
+                .iter()
+                .map(|reference| reference.get())
+                .collect::<Vec<_>>(),
+            vec![7171, 8181]
+        );
     }
 
     /// Every compute opcode Apple's serializer emits has a constant here, and
