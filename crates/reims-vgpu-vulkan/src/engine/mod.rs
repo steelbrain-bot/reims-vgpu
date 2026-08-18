@@ -115,6 +115,8 @@ struct SessionSignals {
     guest_write_debt: std::sync::atomic::AtomicBool,
     guest_write_pages: std::sync::Mutex<GuestWriteFootprint>,
     stamp_completion: Arc<stamp_completion::SessionState>,
+    #[cfg(feature = "host-window")]
+    window_present_attached: std::sync::atomic::AtomicBool,
 }
 
 thread_local! {
@@ -457,7 +459,17 @@ impl EngineState {
         #[cfg(feature = "host-window")]
         let presenter = self.window_presenter.take();
         #[cfg(feature = "host-window")]
-        note_window_present_attached(false);
+        {
+            note_window_present_attached(false);
+            let signals = SESSION_SIGNALS.lock();
+            for session in self.inactive_sessions.keys() {
+                if let Some(signals) = signals.get(session) {
+                    signals
+                        .window_present_attached
+                        .store(false, Ordering::Release);
+                }
+            }
+        }
         let mut restored_sessions = HashMap::new();
         if let Some(ctx) = self.owner.ctx.as_ref() {
             // A device-loss observer can run while an ended batch is waiting in
@@ -1232,10 +1244,6 @@ pub fn window_present_attach(
 /// present on the only thread that executes guest work, and taking the engine
 /// lock there to read one bit would serialize it against the window thread's
 /// own present.
-#[cfg(feature = "host-window")]
-static WINDOW_PRESENT_ATTACHED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 /// Publish the window's rail choice.
 ///
 /// Private, and called from exactly the three places that assign or take
@@ -1251,12 +1259,16 @@ static WINDOW_PRESENT_ATTACHED: std::sync::atomic::AtomicBool =
 /// without the other.
 #[cfg(feature = "host-window")]
 fn note_window_present_attached(attached: bool) {
-    WINDOW_PRESENT_ATTACHED.store(attached, Ordering::Release);
+    current_session_signals()
+        .window_present_attached
+        .store(attached, Ordering::Release);
 }
 
 #[cfg(feature = "host-window")]
 pub fn window_present_attached() -> bool {
-    WINDOW_PRESENT_ATTACHED.load(Ordering::Acquire)
+    current_session_signals()
+        .window_present_attached
+        .load(Ordering::Acquire)
 }
 
 #[cfg(feature = "host-window")]
@@ -5048,6 +5060,27 @@ pub fn test_poison_and_flush() {
 #[cfg(all(test, feature = "host-window"))]
 mod device_loss_window_rail_tests {
     use super::*;
+
+    #[test]
+    fn one_sessions_window_rail_is_invisible_to_another_session() {
+        let first = SessionId(20_001);
+        let second = SessionId(20_002);
+        {
+            let _first = enter_session(first);
+            note_window_present_attached(true);
+            assert!(window_present_attached());
+        }
+        {
+            let _second = enter_session(second);
+            assert!(!window_present_attached());
+        }
+        {
+            let _first = enter_session(first);
+            note_window_present_attached(false);
+        }
+        SESSION_SIGNALS.lock().remove(&first);
+        SESSION_SIGNALS.lock().remove(&second);
+    }
 
     /// A device-loss flush must leave the window rail claiming nothing.
     ///
