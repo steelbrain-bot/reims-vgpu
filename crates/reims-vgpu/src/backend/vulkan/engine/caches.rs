@@ -1035,7 +1035,7 @@ impl<K: Clone + Eq, V: Copy> ObjectVariantIndex<K, V> {
 /// constant, and `REIMS_VGPU_COLOR_GENERAL=off` moves all of them back at once —
 /// a narrowing, since it restores a transition rather than removing one.
 pub(crate) fn color0_pass_exit_layout() -> vk::ImageLayout {
-    if unified_color_layout() {
+    if single_color_layout() {
         vk::ImageLayout::GENERAL
     } else {
         vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
@@ -1048,7 +1048,7 @@ pub(crate) fn color0_pass_exit_layout() -> vk::ImageLayout {
 /// Read once. This decides the content of cached `VkRenderPass` objects and of
 /// registry records that outlive them, so an answer that changed mid-boot would
 /// leave both built under two layouts in one cache.
-pub(crate) fn unified_color_layout() -> bool {
+pub(crate) fn single_color_layout() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         !matches!(

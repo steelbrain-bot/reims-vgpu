@@ -7230,7 +7230,7 @@ mod tests {
         let after_a_pass = ResidentAccess::ColorWrite(resting);
         let for_a_sample = ResidentAccess::shader_read();
 
-        if super::super::caches::unified_color_layout() {
+        if super::super::caches::single_color_layout() {
             assert_eq!(for_a_sample.layout(), resting);
             assert!(after_a_pass.covered_by_pass_entry());
         } else {

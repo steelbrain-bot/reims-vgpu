@@ -1582,7 +1582,7 @@ impl ResidentAccess {
     /// what makes the transition — and therefore the pass break — come back.
     pub(crate) fn shader_read() -> Self {
         Self::ShaderRead(
-            if crate::backend::vulkan::engine::caches::unified_color_layout() {
+            if crate::backend::vulkan::engine::caches::single_color_layout() {
                 vk::ImageLayout::GENERAL
             } else {
                 vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL

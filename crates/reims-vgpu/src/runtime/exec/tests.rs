@@ -2358,7 +2358,7 @@ fn multi_draw_store_plan_matches_archive_drawjob_writeback() {
 }
 
 #[test]
-fn multi_draw_chain_source_preserves_portable_unified_output() {
+fn multi_draw_chain_source_preserves_cpu_materialized_output() {
     assert_eq!(
         multi_draw_chain_source(true, false),
         MultiDrawChainSource::Resident

@@ -3736,7 +3736,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                 // pass, only the final record performs the guest-visible Store;
                 // importing a full frame after every draw held DeviceInner for
                 // seconds and starved the guest completion/status registers.
-                let unified = req
+                let intermediate_store_is_guest_materialized = req
                     .colors
                     .first()
                     .map(|c| c.mapping_id() != 0)
@@ -3752,9 +3752,10 @@ fn finish_stream<M: HostMemory + HostOps>(
                     }
                     // Chain from the engine resident when available; otherwise
                     // seed from the prior encode output (archive "thread each
-                    // record's output as next initial content"). MoltenVK's
-                    // portability path returns CPU pixels for type-11 mappings,
-                    // so `unified` does not imply that a resident exists.
+                    // record's output as next initial content"). A
+                    // mapping-backed Store reaching guest pages does not imply
+                    // that a resident exists; memory topology is not an input
+                    // to this semantic choice.
                     // Moved, not cloned (multi-MiB).
                     match multi_draw_chain_source(resident_chain, chain_rgba.is_some()) {
                         MultiDrawChainSource::Resident => {
@@ -3768,10 +3769,10 @@ fn finish_stream<M: HostMemory + HostOps>(
                         MultiDrawChainSource::Missing => {
                             crate::observe::fail(format!(
                                 "multi_draw_chain_break reason=prior_output_missing \
-                                 task={task_id} pipe={} di={di}/{} unified={}",
+                                 task={task_id} pipe={} di={di}/{} guest_materialized={}",
                                 pd.pipeline_ref,
                                 draw_list.len(),
-                                unified as u8
+                                intermediate_store_is_guest_materialized as u8
                             ));
                         }
                     }
@@ -3842,7 +3843,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                         // Intermediate must return color0 for chaining; treat as
                         // break so we do not composite later draws on a missing seed.
                         out.draws_ok += 1;
-                        if !do_writeback && !unified {
+                        if !do_writeback && !intermediate_store_is_guest_materialized {
                             // Every draw after this one is dropped, so say so.
                             // The two sibling break arms below report through
                             // `note_draw_encode_fail`; this one encoded `Ok` and
@@ -3902,9 +3903,9 @@ fn finish_stream<M: HostMemory + HostOps>(
                         out.draws_fail += 1;
                         note_draw_encode_fail(task_id, pd.pipeline_ref, st, di, draw_list.len());
                         // If earlier GVA draws produced a chain image, land it
-                        // before abandoning the packet. Unified targets already
-                        // landed each record in guest memory — never write the
-                        // (zero) chain buffer over them.
+                        // before abandoning the packet. Mapping-backed targets
+                        // already landed each record in guest memory — never
+                        // write the (zero) chain buffer over them.
                         land_chain_before_abandon(
                             state,
                             host,
@@ -4395,9 +4396,9 @@ struct ChainEnd {
 /// the resident is read back and written out first, and the colour targets are
 /// marked written either way.
 ///
-/// Unified targets already landed each record in guest memory and must never
-/// take the (zero) chain buffer over them; the one caller where that is
-/// possible gates on it.
+/// Mapping-backed targets already landed each record in guest memory and must
+/// never take the (zero) chain buffer over them; the one caller where that is
+/// possible gates on it. This is a storage/content fact, not host topology.
 fn land_chain_before_abandon<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
