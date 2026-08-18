@@ -61,7 +61,7 @@ impl reims_vgpu_observe::Decline for VertexFormatWidenDecline {
     }
 }
 use crate::backend::vulkan::translate;
-use crate::runtime::spirv_vertex_input::VertexInputWidths;
+use reims_vgpu_vulkan::spirv_vertex_input::VertexInputWidths;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct AttrKey {
@@ -2929,7 +2929,7 @@ mod object_cache_tests {
         let narrow = translate::vertex::vertex_layout(VertexAttributeFormat::UChar3Normalized).vk;
         let binding = translate::VertexFormatSupport::with_unsupported(&[narrow])
             .resolve(VertexAttributeFormat::UChar3Normalized, 12, 32, || {
-                crate::runtime::spirv_vertex_input::InputWidth::Components(3)
+                reims_vgpu_vulkan::spirv_vertex_input::InputWidth::Components(3)
             })
             .unwrap();
         let decline = VertexFormatWidenDecline {

@@ -13,3 +13,4 @@ pub mod host_pointer;
 pub mod memory;
 pub mod policy;
 pub mod push_descriptor;
+pub mod spirv_vertex_input;
