@@ -535,7 +535,7 @@ pub(crate) struct DeviceContext {
     pub timestamps: Option<TimestampProbe>,
     /// Two timestamps per ring slot, for the GPU execution time of a draw
     /// submission. `None` on the same two capability answers as
-    /// [`Self::timestamps`], and additionally when [`crate::env::GPU_SPANS`] is
+    /// [`Self::timestamps`], and additionally when [`reims_vgpu_config::GPU_SPANS`] is
     /// off — which is the whole of how that switch narrows, because a `None` here
     /// means no query is ever reset, written or read.
     ///
@@ -1050,7 +1050,10 @@ impl DeviceContext {
                 .ok()
         });
         let draw_spans = scale
-            .filter(|_| crate::env::read(crate::env::GPU_SPANS).0 != crate::env::Switch::Off)
+            .filter(|_| {
+                reims_vgpu_config::read(reims_vgpu_config::GPU_SPANS).0
+                    != reims_vgpu_config::Switch::Off
+            })
             .and_then(|scale| {
                 let ci = vk::QueryPoolCreateInfo::default()
                     .query_type(vk::QueryType::TIMESTAMP)
@@ -1157,7 +1160,7 @@ impl DeviceContext {
         // What the operator set. A boot whose rails were narrowed from outside
         // the process reads as a slow device unless the narrowing is on the
         // same page as the capabilities.
-        reims_vgpu_observe::off(crate::env::report_line());
+        reims_vgpu_observe::off(reims_vgpu_config::report_line());
         // Warm-start the pipeline cache from the previous boot's blob. Cold
         // pipeline compiles are the remaining pre-convergence stall class
         // (~256 ms first use per pipeline); the blob is keyed by the device's

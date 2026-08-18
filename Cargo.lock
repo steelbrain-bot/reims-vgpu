@@ -1099,6 +1099,7 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "raw-window-handle",
+ "reims-vgpu-config",
  "reims-vgpu-core",
  "reims-vgpu-observe",
  "reims-vgpu-paging",
@@ -1108,6 +1109,10 @@ dependencies = [
  "serde_json",
  "winit",
 ]
+
+[[package]]
+name = "reims-vgpu-config"
+version = "0.1.0"
 
 [[package]]
 name = "reims-vgpu-core"
@@ -1140,6 +1145,7 @@ name = "reims-vgpu-vulkan"
 version = "0.1.0"
 dependencies = [
  "ash",
+ "reims-vgpu-config",
  "reims-vgpu-core",
  "reims-vgpu-observe",
  "reims-vgpu-protocol",

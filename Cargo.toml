@@ -8,6 +8,7 @@ resolver = "2"
 members = [
   "crates/reims-vgpu",
   "crates/reims-vgpu-core",
+  "crates/reims-vgpu-config",
   "crates/reims-vgpu-observe",
   "crates/reims-vgpu-paging",
   "crates/reims-vgpu-protocol",

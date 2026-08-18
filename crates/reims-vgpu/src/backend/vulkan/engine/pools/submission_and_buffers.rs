@@ -1566,7 +1566,7 @@ impl ResourcePools {
     /// -> 108 us/draw). The cap keeps the GPU fed every ~N draws while still
     /// amortizing the per-draw submit+fence cost N-fold.
     ///
-    /// `narrow_to_target` is [`crate::env::BATCH_MIXED_TARGETS`] switched off.
+    /// `narrow_to_target` is [`reims_vgpu_config::BATCH_MIXED_TARGETS`] switched off.
     /// The default is that the batch's own target does not decide this: a draw
     /// own, while the flush itself reads only the CB, fence, and accumulated
     /// descriptor sets. The readback rail likewise appends a copy of *some

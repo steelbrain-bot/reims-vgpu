@@ -15,7 +15,7 @@
 //! ```
 //!
 //! +31.6 ms a second over ~36 700 dispatches is **0.86 µs each**, and that is
-//! the number that keeps [`crate::env::COMPUTE_GATHER`] switched off. A
+//! the number that keeps [`reims_vgpu_config::COMPUTE_GATHER`] switched off. A
 //! command-buffer run-table arena and a recycled descriptor set already took it
 //! down from ~1.05 µs; guessing which of what is left is the next ~0.8 is how a
 //! session spends a day on `vkCmdBindPipeline` and finds it was never the cost.
@@ -229,7 +229,7 @@ mod tests {
     }
 
     /// A boot that never dispatches a gather publishes no line at all, which is
-    /// how the census says which arm of [`crate::env::COMPUTE_GATHER`] ran
+    /// how the census says which arm of [`reims_vgpu_config::COMPUTE_GATHER`] ran
     /// without a second counter to disagree with.
     #[test]
     fn no_gather_publishes_no_window() {

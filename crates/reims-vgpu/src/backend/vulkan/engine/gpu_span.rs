@@ -189,7 +189,7 @@
 //! * **Timestamps have a cost.** Two per submission at ~2 000 submissions a
 //!   second is ~4 000 a second, against the readback rail's existing three per
 //!   composite, and both are far below the ~110 000 an inner per-draw split would
-//!   need. It is small but it is not nothing, so [`crate::env::GPU_SPANS`] can
+//!   need. It is small but it is not nothing, so [`reims_vgpu_config::GPU_SPANS`] can
 //!   take it out and an A/B that needs the absolute floor should.
 //!
 //! # Coverage is reported, because a zero here has three causes
@@ -309,7 +309,7 @@ impl GpuSpanWindow {
 }
 
 /// Take and clear the window. `None` when nothing armed, so a host without
-/// timestamp support and a boot with [`crate::env::GPU_SPANS`] off cost no line
+/// timestamp support and a boot with [`reims_vgpu_config::GPU_SPANS`] off cost no line
 /// — and a line's presence is what says the probe ran.
 pub fn take_window() -> Option<GpuSpanWindow> {
     let armed = ARMED.swap(0, Ordering::Relaxed);

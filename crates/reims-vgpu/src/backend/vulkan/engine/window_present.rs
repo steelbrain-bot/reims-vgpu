@@ -652,20 +652,22 @@ impl WindowPresenter {
     fn present_depth() -> usize {
         static DEPTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         *DEPTH.get_or_init(|| {
-            let (state, value) = crate::env::read(crate::env::PRESENT_DEPTH);
+            let (state, value) = reims_vgpu_config::read(reims_vgpu_config::PRESENT_DEPTH);
             match state {
-                crate::env::Switch::Off => {
+                reims_vgpu_config::Switch::Off => {
                     reims_vgpu_observe::off("present_depth reason=present_depth_disabled_by_env");
                     1
                 }
-                crate::env::Switch::Unrecognized => {
+                reims_vgpu_config::Switch::Unrecognized => {
                     reims_vgpu_observe::fail(format!(
                         "present_depth reason=present_depth_env_unrecognized value={}",
                         value.unwrap_or_default()
                     ));
                     PRESENT_IN_FLIGHT
                 }
-                crate::env::Switch::Unset | crate::env::Switch::On => PRESENT_IN_FLIGHT,
+                reims_vgpu_config::Switch::Unset | reims_vgpu_config::Switch::On => {
+                    PRESENT_IN_FLIGHT
+                }
             }
         })
     }

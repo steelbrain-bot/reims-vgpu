@@ -241,7 +241,7 @@ impl PassKey {
     /// the target it is writing is a property of the *draw*, exactly as it is in
     /// Metal, and it stops closing the render pass.
     ///
-    /// The condition is not decoration. Under [`crate::env::COLOR_GENERAL`]`=off`
+    /// The condition is not decoration. Under [`reims_vgpu_config::COLOR_GENERAL`]`=off`
     /// the resting layout admits no feedback loop, the feedback slots really are
     /// in a different layout, and erasing the field there would merge two draws
     /// whose attachment is in two different layouts — a pass naming a layout its
@@ -337,7 +337,7 @@ pub(crate) fn color_feedback_layout() -> vk::ImageLayout {
 /// transition for either and the registry's record is true for both.
 ///
 /// It matters that this is a question about the layout and not a switch read.
-/// Under [`crate::env::COLOR_GENERAL`]`=off` the resting layout is
+/// Under [`reims_vgpu_config::COLOR_GENERAL`]`=off` the resting layout is
 /// `COLOR_ATTACHMENT_OPTIMAL`, which admits no feedback loop at all, and the
 /// extension layout has to come back — naming the resting layout there would be a
 /// sampled read of an attachment in a layout that forbids it, which is undefined
@@ -1020,7 +1020,7 @@ impl<K: Clone + Eq, V: Copy> ObjectVariantIndex<K, V> {
 /// what makes a feedback colour slot legal (see [`PassKey::color_layout`]).
 /// Do not re-quote the −7.7 %.
 ///
-/// # It is a function, and [`crate::env::COLOR_GENERAL`] is the ablation
+/// # It is a function, and [`reims_vgpu_config::COLOR_GENERAL`] is the ablation
 ///
 /// **Every** spelling of the layout has to move together — the pass's
 /// `finalLayout`, the `initialLayout` a `LOAD` pass names, the subpass
@@ -1051,8 +1051,8 @@ pub(crate) fn single_color_layout() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         !matches!(
-            crate::env::read(crate::env::COLOR_GENERAL).0,
-            crate::env::Switch::Off
+            reims_vgpu_config::read(reims_vgpu_config::COLOR_GENERAL).0,
+            reims_vgpu_config::Switch::Off
         )
     })
 }
@@ -1243,7 +1243,7 @@ fn color_feedback_self_dependency(color0_layout: vk::ImageLayout) -> vk::Subpass
 
 /// Whether the outgoing external dependency names only the attachment stages.
 ///
-/// **Probe, default off.** See [`crate::env::PASS_EXIT_NARROW`] for the whole
+/// **Probe, default off.** See [`reims_vgpu_config::PASS_EXIT_NARROW`] for the whole
 /// argument; in one line, the shipping scope names `TRANSFER | FRAGMENT_SHADER`
 /// with `TRANSFER_READ | SHADER_READ`, which asks this driver for a render-cache
 /// flush and a texture-cache invalidate at **every** `vkCmdEndRenderPass`, and a
@@ -1256,8 +1256,8 @@ fn pass_exit_scope_narrow() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         matches!(
-            crate::env::read(crate::env::PASS_EXIT_NARROW).0,
-            crate::env::Switch::On
+            reims_vgpu_config::read(reims_vgpu_config::PASS_EXIT_NARROW).0,
+            reims_vgpu_config::Switch::On
         )
     })
 }
@@ -3297,7 +3297,7 @@ mod object_cache_tests {
     /// device, and it would be silent. The source scope must not move either:
     /// what is being priced is the *visibility* request, not the ordering one.
     ///
-    /// See [`crate::env::PASS_EXIT_NARROW`] for what the probe is asking and for
+    /// See [`reims_vgpu_config::PASS_EXIT_NARROW`] for what the probe is asking and for
     /// the validation-layer run it owes before it could ever be a default.
     #[test]
     fn the_narrow_pass_exit_keeps_the_consumer_that_issues_no_barrier() {
@@ -3434,7 +3434,7 @@ mod object_cache_tests {
     /// Asserted against that function rather than against a spelled layout, so it
     /// states the relation on both arms: under the shipping layout every slot is
     /// in the *same* layout feedback or not, and under
-    /// [`crate::env::COLOR_GENERAL`]`=off` the feedback slots separate because
+    /// [`reims_vgpu_config::COLOR_GENERAL`]`=off` the feedback slots separate because
     /// `COLOR_ATTACHMENT_OPTIMAL` admits no feedback loop. The failure it guards
     /// is a descriptor and a subpass reference naming one image differently,
     /// which is undefined behaviour reported nowhere.
@@ -3592,7 +3592,7 @@ mod object_cache_tests {
     ///
     /// This is the relation, not a restatement of a constant: it holds for
     /// whatever [`color0_pass_exit_layout`] answers, including under
-    /// [`crate::env::COLOR_GENERAL`], which is the whole reason that answer is a
+    /// [`reims_vgpu_config::COLOR_GENERAL`], which is the whole reason that answer is a
     /// function. It fails if any of the three grows a second spelling — which is
     /// how the MRT secondary arm in `exec` came to publish a hand-written
     /// `COLOR_ATTACHMENT_OPTIMAL` beside a feedback arm that derived.

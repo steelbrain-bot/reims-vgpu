@@ -13,6 +13,7 @@ test-fixtures = []
 
 [dependencies]
 ash = "0.38"
+reims-vgpu-config = { path = "../reims-vgpu-config" }
 reims-vgpu-core = { path = "../reims-vgpu-core" }
 reims-vgpu-observe = { path = "../reims-vgpu-observe" }
 reims-vgpu-protocol = { path = "../reims-vgpu-protocol" }

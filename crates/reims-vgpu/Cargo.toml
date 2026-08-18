@@ -42,6 +42,7 @@ reims-vgpu-protocol = { path = "../reims-vgpu-protocol" }
 # Backend-independent task namespaces, resource/storage/mapping graph, and
 # lifecycle transitions.
 reims-vgpu-core = { path = "../reims-vgpu-core" }
+reims-vgpu-config = { path = "../reims-vgpu-config" }
 reims-vgpu-observe = { path = "../reims-vgpu-observe" }
 # Vulkan capability classification and topology policy. The execution engine
 # migrates behind this boundary incrementally.

@@ -265,7 +265,7 @@ struct GatherDispatch {
 /// headroom that did not exist when it was measured.
 ///
 /// `off` restores the ~13 `VkBufferCopy` regions per gathered window. See
-/// [`crate::env::COMPUTE_GATHER`] for both sets of boots and for why the earlier
+/// [`reims_vgpu_config::COMPUTE_GATHER`] for both sets of boots and for why the earlier
 /// rejection was right at the time.
 /// Whether the layout-churn probe is on. **Default off**, and never anything but
 /// a probe: it adds two image barriers per draw and removes nothing.
@@ -277,8 +277,8 @@ fn layout_churn_probe_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         matches!(
-            crate::env::read(crate::env::LAYOUT_CHURN).0,
-            crate::env::Switch::On
+            reims_vgpu_config::read(reims_vgpu_config::LAYOUT_CHURN).0,
+            reims_vgpu_config::Switch::On
         )
     })
 }
@@ -287,15 +287,15 @@ fn layout_churn_probe_enabled() -> bool {
 /// probe: it adds one empty render pass instance per loading draw and removes
 /// nothing.
 ///
-/// See its one call site for what it prices, and [`crate::env::PASS_CHURN`] for
+/// See its one call site for what it prices, and [`reims_vgpu_config::PASS_CHURN`] for
 /// why the question is not otherwise answerable without building the merge it is
 /// pricing.
 fn pass_churn_probe_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         matches!(
-            crate::env::read(crate::env::PASS_CHURN).0,
-            crate::env::Switch::On
+            reims_vgpu_config::read(reims_vgpu_config::PASS_CHURN).0,
+            reims_vgpu_config::Switch::On
         )
     })
 }
@@ -304,8 +304,8 @@ fn compute_gather_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         !matches!(
-            crate::env::read(crate::env::COMPUTE_GATHER).0,
-            crate::env::Switch::Off
+            reims_vgpu_config::read(reims_vgpu_config::COMPUTE_GATHER).0,
+            reims_vgpu_config::Switch::Off
         )
     })
 }
@@ -2202,7 +2202,7 @@ struct JoinTerms {
     /// which is why this rung shared its condition with `is_mrt` and
     /// `color_input`, the other two terms of `ordinary_ad_hoc_framebuffer`.
     /// Both paths now dispose through [`dispose_ad_hoc_attachments`], so the
-    /// term is only what [`crate::env::BATCH_DEPTH`] restores for an A/B.
+    /// term is only what [`reims_vgpu_config::BATCH_DEPTH`] restores for an A/B.
     depth_barred: bool,
     reads_back: bool,
     has_query: bool,
@@ -2214,7 +2214,7 @@ struct JoinTerms {
     target_switch: bool,
 }
 
-/// Whether [`crate::env::BATCH_MIXED_TARGETS`] is switched off, read once per
+/// Whether [`reims_vgpu_config::BATCH_MIXED_TARGETS`] is switched off, read once per
 /// process.
 ///
 /// Latched for the same reason [`crate::runtime::spirv_bind`]'s extent switch
@@ -2226,28 +2226,28 @@ fn batch_mixed_targets_disabled() -> bool {
     use std::sync::OnceLock;
     static OFF: OnceLock<bool> = OnceLock::new();
     *OFF.get_or_init(|| {
-        let (state, value) = crate::env::read(crate::env::BATCH_MIXED_TARGETS);
+        let (state, value) = reims_vgpu_config::read(reims_vgpu_config::BATCH_MIXED_TARGETS);
         match state {
-            crate::env::Switch::Off => {
+            reims_vgpu_config::Switch::Off => {
                 reims_vgpu_observe::off("batch_mixed reason=batch_mixed_targets_disabled_by_env");
                 true
             }
             // An unrecognized spelling is named rather than silently read as the
             // default. It still takes the default arm: this switch may only turn
             // a rail off, and a value nobody can parse is not that.
-            crate::env::Switch::Unrecognized => {
+            reims_vgpu_config::Switch::Unrecognized => {
                 reims_vgpu_observe::fail(format!(
                     "batch_mixed reason=batch_mixed_targets_env_unrecognized value={}",
                     value.unwrap_or_default()
                 ));
                 false
             }
-            crate::env::Switch::On | crate::env::Switch::Unset => false,
+            reims_vgpu_config::Switch::On | reims_vgpu_config::Switch::Unset => false,
         }
     })
 }
 
-/// Whether [`crate::env::BATCH_DEPTH`] is switched off, read once per process.
+/// Whether [`reims_vgpu_config::BATCH_DEPTH`] is switched off, read once per process.
 ///
 /// Latched for the same reason [`batch_mixed_targets_disabled`] is: this sits on
 /// the per-draw path and `std::env::var_os` is a lock and an allocation.
@@ -2255,23 +2255,23 @@ fn batch_depth_disabled() -> bool {
     use std::sync::OnceLock;
     static OFF: OnceLock<bool> = OnceLock::new();
     *OFF.get_or_init(|| {
-        let (state, value) = crate::env::read(crate::env::BATCH_DEPTH);
+        let (state, value) = reims_vgpu_config::read(reims_vgpu_config::BATCH_DEPTH);
         match state {
-            crate::env::Switch::Off => {
+            reims_vgpu_config::Switch::Off => {
                 reims_vgpu_observe::off("batch_depth reason=batch_depth_disabled_by_env");
                 true
             }
             // Named rather than silently read as the default. It still takes the
             // default arm: this switch may only turn a rail off, and a value
             // nobody can parse is not that.
-            crate::env::Switch::Unrecognized => {
+            reims_vgpu_config::Switch::Unrecognized => {
                 reims_vgpu_observe::fail(format!(
                     "batch_depth reason=batch_depth_env_unrecognized value={}",
                     value.unwrap_or_default()
                 ));
                 false
             }
-            crate::env::Switch::On | crate::env::Switch::Unset => false,
+            reims_vgpu_config::Switch::On | reims_vgpu_config::Switch::Unset => false,
         }
     })
 }
@@ -5324,7 +5324,7 @@ pub(crate) unsafe fn execute_draw_inner(
         // says 82 % of draws could share one instance once the guest gathers
         // recorded between them are hoisted; hoisting needs a second command
         // buffer per batch, and this says what that work would be worth before
-        // any of it is built. See [`crate::env::PASS_CHURN`].
+        // any of it is built. See [`reims_vgpu_config::PASS_CHURN`].
         //
         // Pixel-neutral, which is what makes it a control rather than a change:
         // `LOAD`/`STORE` preserves the attachment and no draw is recorded inside
