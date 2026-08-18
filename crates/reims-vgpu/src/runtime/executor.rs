@@ -9,10 +9,9 @@ use crate::backend::vulkan::engine::{
     GuestWriteReach, ResidentContent, StorageImageFormat, TargetReadback,
 };
 use crate::model::TargetIdentity;
-use reims_vgpu_protocol::SubmissionIdentity;
 
 pub use reims_vgpu_core::{
-    ExecutorCapabilities, ResidentContentBacking, ResidentLease, SubmissionContext,
+    ExecutionPort, ExecutorCapabilities, ResidentContentBacking, ResidentLease, SubmissionContext,
 };
 
 impl ResidentLease for crate::backend::vulkan::engine::ResidentResourceLease {
@@ -44,62 +43,16 @@ pub fn context_for(state: &crate::model::DeviceState, task_id: u32) -> Submissio
         .unwrap_or_else(|| SubmissionContext::standalone(task_id))
 }
 
-/// One fully resolved, owned operation accepted by the execution port.
-///
-/// Owning both context and request lets an executor retain or queue the work;
-/// no decoded accumulator can mutate the inputs after submission.
-pub enum ResolvedSubmission {
-    Draw {
-        context: SubmissionContext,
-        request: Box<DrawRequest>,
-    },
-    Compute {
-        context: SubmissionContext,
-        request: Box<ComputeRequest>,
-    },
-}
-
-impl ResolvedSubmission {
-    fn kind(&self) -> &'static str {
-        match self {
-            Self::Draw { .. } => "draw",
-            Self::Compute { .. } => "compute",
-        }
-    }
-}
-
-/// Operation-specific result carried by a completion fact.
-#[derive(Debug)]
-pub enum ExecutionOutput {
-    Draw(DrawOutput),
-    Compute(ComputeOutput),
-}
-
-impl ExecutionOutput {
-    fn kind(&self) -> &'static str {
-        match self {
-            Self::Draw(_) => "draw",
-            Self::Compute(_) => "compute",
-        }
-    }
-}
-
-/// Immutable completion returned through the same port as its submission.
-#[derive(Debug)]
-pub struct ExecutionCompletion {
-    pub submission: SubmissionIdentity,
-    pub output: ExecutionOutput,
-}
-
-/// Validated completion identity paired with its operation-specific output.
-#[derive(Debug)]
-pub struct ExecutionReceipt<T> {
-    pub submission: SubmissionIdentity,
-    pub output: T,
-}
+pub type ResolvedSubmission =
+    reims_vgpu_core::ResolvedSubmission<Box<DrawRequest>, Box<ComputeRequest>>;
+pub type ExecutionOutput = reims_vgpu_core::ExecutionOutput<DrawOutput, ComputeOutput>;
+pub type ExecutionCompletion = reims_vgpu_core::ExecutionCompletion<ExecutionOutput>;
+pub type ExecutionReceipt<T> = reims_vgpu_core::ExecutionReceipt<T>;
 
 /// Backend execution contract implemented per device.
-pub trait Executor: std::fmt::Debug + Send + Sync {
+pub trait Executor:
+    ExecutionPort<Submission = ResolvedSubmission, Completion = ExecutionCompletion, Error = DrawError>
+{
     fn capabilities(&self) -> ExecutorCapabilities {
         ExecutorCapabilities::default()
     }
@@ -311,8 +264,6 @@ pub trait Executor: std::fmt::Debug + Send + Sync {
     fn window_present_attached(&self) -> bool {
         false
     }
-
-    fn execute(&self, submission: ResolvedSubmission) -> Result<ExecutionCompletion, DrawError>;
 
     /// End one guest lifetime while preserving shareable physical-GPU state.
     fn reset(&self) {}
@@ -569,7 +520,24 @@ impl Executor for VulkanExecutor {
         false
     }
 
-    fn execute(&self, submission: ResolvedSubmission) -> Result<ExecutionCompletion, DrawError> {
+    fn reset(&self) {
+        let _scope = self.enter();
+        crate::backend::vulkan::engine::reset_guest_state();
+    }
+
+    fn enter(&self) -> ExecutionScope {
+        ExecutionScope {
+            _engine: Some(crate::backend::vulkan::engine::enter_session(self.session)),
+        }
+    }
+}
+
+impl ExecutionPort for VulkanExecutor {
+    type Submission = ResolvedSubmission;
+    type Completion = ExecutionCompletion;
+    type Error = DrawError;
+
+    fn execute(&self, submission: Self::Submission) -> Result<Self::Completion, Self::Error> {
         let _scope = self.enter();
         match submission {
             ResolvedSubmission::Draw { context, request } => {
@@ -590,17 +558,6 @@ impl Executor for VulkanExecutor {
             }
         }
     }
-
-    fn reset(&self) {
-        let _scope = self.enter();
-        crate::backend::vulkan::engine::reset_guest_state();
-    }
-
-    fn enter(&self) -> ExecutionScope {
-        ExecutionScope {
-            _engine: Some(crate::backend::vulkan::engine::enter_session(self.session)),
-        }
-    }
 }
 
 /// Execute a draw and enforce that the executor returns the matching completion.
@@ -614,7 +571,7 @@ pub fn execute_draw(
         context,
         request: Box::new(request),
     };
-    let expected_kind = expected.kind();
+    let expected_kind = expected.kind().as_str();
     let completion = executor.execute(expected)?;
     if completion.submission != expected_identity {
         return Err(DrawError::Facade(
@@ -632,7 +589,7 @@ pub fn execute_draw(
         other => Err(DrawError::Facade(
             EngineFacadeDecline::ExecutorCompletionKindMismatch {
                 expected: expected_kind,
-                actual: other.kind(),
+                actual: other.kind().as_str(),
             },
         )),
     }
@@ -649,7 +606,7 @@ pub fn execute_compute(
         context,
         request: Box::new(request),
     };
-    let expected_kind = expected.kind();
+    let expected_kind = expected.kind().as_str();
     let completion = executor.execute(expected)?;
     if completion.submission != expected_identity {
         return Err(DrawError::Facade(
@@ -667,7 +624,7 @@ pub fn execute_compute(
         other => Err(DrawError::Facade(
             EngineFacadeDecline::ExecutorCompletionKindMismatch {
                 expected: expected_kind,
-                actual: other.kind(),
+                actual: other.kind().as_str(),
             },
         )),
     }
@@ -679,7 +636,7 @@ mod tests {
     use crate::model::{DeviceId, DeviceState};
     use reims_vgpu_protocol::{
         ObjectRef, ResourceValidity, SegmentBoundary, SegmentKind, SubmissionId,
-        SubmissionResourceUse, TaskId,
+        SubmissionIdentity, SubmissionResourceUse, TaskId,
     };
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
@@ -756,10 +713,17 @@ mod tests {
             self.write_quiesces.fetch_add(1, Ordering::Relaxed);
         }
 
-        fn execute(
-            &self,
-            submission: ResolvedSubmission,
-        ) -> Result<ExecutionCompletion, DrawError> {
+        fn reset(&self) {
+            self.resets.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    impl ExecutionPort for ScriptedExecutor {
+        type Submission = ResolvedSubmission;
+        type Completion = ExecutionCompletion;
+        type Error = DrawError;
+
+        fn execute(&self, submission: Self::Submission) -> Result<Self::Completion, Self::Error> {
             let context = match submission {
                 ResolvedSubmission::Draw { context, .. }
                 | ResolvedSubmission::Compute { context, .. } => context,
@@ -775,10 +739,6 @@ mod tests {
                     }
                 },
             })
-        }
-
-        fn reset(&self) {
-            self.resets.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -941,11 +901,14 @@ mod tests {
     #[derive(Debug)]
     struct WrongIdentityExecutor;
 
-    impl Executor for WrongIdentityExecutor {
-        fn execute(
-            &self,
-            submission: ResolvedSubmission,
-        ) -> Result<ExecutionCompletion, DrawError> {
+    impl Executor for WrongIdentityExecutor {}
+
+    impl ExecutionPort for WrongIdentityExecutor {
+        type Submission = ResolvedSubmission;
+        type Completion = ExecutionCompletion;
+        type Error = DrawError;
+
+        fn execute(&self, submission: Self::Submission) -> Result<Self::Completion, Self::Error> {
             let task = match submission {
                 ResolvedSubmission::Draw { context, .. }
                 | ResolvedSubmission::Compute { context, .. } => context.identity.task,

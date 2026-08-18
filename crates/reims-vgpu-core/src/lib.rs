@@ -3,6 +3,7 @@
 //! This crate deliberately has no QEMU, Vulkan, windowing, or host-OS types.
 
 pub mod capabilities;
+pub mod execution;
 pub mod namespace;
 pub mod residency;
 pub mod resource;
@@ -10,6 +11,10 @@ pub mod submission;
 pub mod target;
 
 pub use capabilities::{DeviceInfoLimits, ExecutorCapabilities};
+pub use execution::{
+    ExecutionCompletion, ExecutionKind, ExecutionOutput, ExecutionPort, ExecutionReceipt,
+    ResolvedSubmission,
+};
 pub use namespace::{NamespaceError, ReferenceNamespace};
 pub use residency::{ResidentContentBacking, ResidentLease};
 pub use resource::{

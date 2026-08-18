@@ -797,14 +797,14 @@ mod tests {
     #[derive(Debug)]
     struct NoopExecutor;
 
-    impl crate::runtime::executor::Executor for NoopExecutor {
-        fn execute(
-            &self,
-            _submission: crate::runtime::executor::ResolvedSubmission,
-        ) -> Result<
-            crate::runtime::executor::ExecutionCompletion,
-            crate::backend::vulkan::engine::DrawError,
-        > {
+    impl crate::runtime::executor::Executor for NoopExecutor {}
+
+    impl crate::runtime::executor::ExecutionPort for NoopExecutor {
+        type Submission = crate::runtime::executor::ResolvedSubmission;
+        type Completion = crate::runtime::executor::ExecutionCompletion;
+        type Error = crate::backend::vulkan::engine::DrawError;
+
+        fn execute(&self, _submission: Self::Submission) -> Result<Self::Completion, Self::Error> {
             Err(crate::backend::vulkan::engine::DrawError::Facade(
                 crate::backend::vulkan::engine::EngineFacadeDecline::ExecutorServiceUnavailable {
                     service: "test",
