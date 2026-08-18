@@ -11,8 +11,9 @@ pub mod resource;
 pub mod submission;
 
 pub use identity::{
-    ByteLength, ByteOffset, GuestPhysicalAddress, GuestVirtualAddress, MappingId, ObjectRef,
-    ResourceId, ResourceNamespaceId, StorageId, SubmissionId, SurfaceBackingId, SurfaceId, TaskId,
+    BackingGeneration, ByteLength, ByteOffset, ContentVersion, GuestPhysicalAddress,
+    GuestVirtualAddress, MappingId, ObjectRef, PlaneIndex, ResourceId, ResourceNamespaceId,
+    StorageId, SubmissionId, SurfaceBackingId, SurfaceId, TaskId,
 };
 pub use resource::{
     decode_object_list_entry, ObjectKind, ObjectListDecodeError, ObjectListEntry,

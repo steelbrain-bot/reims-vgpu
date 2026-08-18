@@ -1908,6 +1908,20 @@ pub fn resolve_type11_resource(
     }
     state.texture_to_mapping.insert((task_id, ref_), mapping_id);
     let mapping_id = resource.register_type11_mapping(mapping_id);
+    if !state
+        .task_resources
+        .attach_mapper_storage(task_id, ref_, mapping_id)
+    {
+        note_type11_fail(
+            task_id,
+            ref_,
+            "iosurface_texture_resource_graph",
+            format!(
+                "iosurface_texture_resolve_fail reason=iosurface_texture_resource_graph task={task_id} ref={ref_} mapping={mapping_id}"
+            ),
+        );
+        return None;
+    }
     // Resolved: re-arm so a later genuine failure on this ref logs again.
     clear_type11_fail(task_id, ref_);
     Some(mapping_id)

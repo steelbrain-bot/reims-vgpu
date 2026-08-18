@@ -4,6 +4,8 @@ use crate::model::{LruBytesMemo, GFX_MMIO_SIZE, MAX_CHANNELS};
 use crate::runtime::decode::resource::{
     DecodeStatus as ResourceDecodeStatus, Descriptor, ListObjectEntry, SamplerDescriptor,
 };
+use reims_vgpu_core::{ResourceGraph, ResourceNode};
+use reims_vgpu_protocol::{MappingId, ObjectRef, PlaneIndex, ResourceId, ResourceObject, TaskId};
 #[cfg(feature = "backend-vulkan")]
 use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
@@ -573,6 +575,9 @@ impl TaskTable {
 pub struct TaskResource {
     pub entry: ListObjectEntry,
     pub descriptor: Arc<[u8]>,
+    /// Canonical generational identity assigned when the task namespace
+    /// publishes this object.
+    semantic_id: OnceLock<ResourceId<ResourceObject>>,
     /// Typed form of the construction descriptor, decoded exactly once for
     /// this resource lifetime.
     ///
@@ -618,6 +623,7 @@ impl TaskResource {
         Self {
             entry,
             descriptor,
+            semantic_id: OnceLock::new(),
             decoded: OnceLock::new(),
             type11_mapping: OnceLock::new(),
             lifetime: Arc::new(TaskResourceLifetime::new()),
@@ -626,6 +632,10 @@ impl TaskResource {
             #[cfg(feature = "backend-vulkan")]
             resident_targets: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn semantic_id(&self) -> Option<ResourceId<ResourceObject>> {
+        self.semantic_id.get().copied()
     }
 
     /// Resolve this resource's immutable construction descriptor once.
@@ -886,13 +896,20 @@ mod task_resource_resident_tests {
 /// also makes the lifetime rule explicit instead of relying on that outer
 /// serialization.
 #[derive(Debug, Default)]
-pub struct TaskResources(Mutex<BTreeMap<(u32, u32), Arc<TaskResource>>>);
+struct TaskResourceRegistry {
+    objects: BTreeMap<(u32, u32), Arc<TaskResource>>,
+    graph: ResourceGraph,
+}
+
+#[derive(Debug, Default)]
+pub struct TaskResources(Mutex<TaskResourceRegistry>);
 
 impl TaskResources {
     pub fn get(&self, task_id: u32, ref_: u32) -> Option<Arc<TaskResource>> {
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .objects
             .get(&(task_id, ref_))
             .cloned()
     }
@@ -904,31 +921,149 @@ impl TaskResources {
         ref_: u32,
         resource: Arc<TaskResource>,
     ) -> Arc<TaskResource> {
-        Arc::clone(
-            self.0
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .entry((task_id, ref_))
-                .or_insert(resource),
-        )
-    }
-
-    pub fn delete(&self, task_id: u32, ref_: u32) -> bool {
-        self.0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&(task_id, ref_))
-            .is_some()
-    }
-
-    pub fn delete_task(&self, task_id: u32) -> usize {
-        let mut resources = self
+        let mut registry = self
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let before = resources.len();
-        resources.retain(|&(task, _), _| task != task_id);
-        before - resources.len()
+        if let Some(existing) = registry.objects.get(&(task_id, ref_)) {
+            return Arc::clone(existing);
+        }
+        let id = registry
+            .graph
+            .create_resource(
+                TaskId::new(task_id),
+                ObjectRef::new(ref_),
+                resource.entry.kind,
+                None,
+                [],
+            )
+            .expect("an unpublished task reference is free in the resource graph");
+        resource
+            .semantic_id
+            .set(id)
+            .expect("a resource receives one semantic identity");
+        registry
+            .objects
+            .insert((task_id, ref_), Arc::clone(&resource));
+        resource
+    }
+
+    pub fn delete(&self, task_id: u32, ref_: u32) -> bool {
+        let mut registry = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let removed = registry.objects.remove(&(task_id, ref_));
+        if removed.is_some() {
+            registry
+                .graph
+                .release_reference(TaskId::new(task_id), ObjectRef::new(ref_))
+                .expect("published resources have a graph reference");
+        }
+        removed.is_some()
+    }
+
+    pub fn delete_task(&self, task_id: u32) -> usize {
+        let mut registry = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let before = registry.objects.len();
+        registry.objects.retain(|&(task, _), _| task != task_id);
+        let removed = before - registry.objects.len();
+        let graph_removed = registry.graph.release_task(TaskId::new(task_id));
+        debug_assert_eq!(removed, graph_removed);
+        removed
+    }
+
+    pub fn resource_node(&self, id: ResourceId<ResourceObject>) -> Option<ResourceNode> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .graph
+            .resource(id)
+            .cloned()
+    }
+
+    pub fn attach_mapper_storage(&self, task_id: u32, ref_: u32, mapping_id: u32) -> bool {
+        let mut registry = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(id) = registry
+            .objects
+            .get(&(task_id, ref_))
+            .and_then(|resource| resource.semantic_id())
+        else {
+            return false;
+        };
+        if registry
+            .graph
+            .resource(id)
+            .is_some_and(|resource| resource.storage.is_some())
+        {
+            return true;
+        }
+        let storage = registry
+            .graph
+            .mapper_storage(MappingId::new(mapping_id), PlaneIndex::new(0))
+            .expect("storage identity space remains available");
+        registry.graph.attach_initial_storage(id, storage).is_ok()
+    }
+}
+
+#[cfg(test)]
+mod task_resource_graph_tests {
+    use super::*;
+    use reims_vgpu_protocol::ObjectKind;
+
+    fn resource(kind: ObjectKind) -> Arc<TaskResource> {
+        Arc::new(TaskResource::new(
+            ListObjectEntry::new(kind, 0, 0),
+            Arc::from([]),
+        ))
+    }
+
+    #[test]
+    fn task_resource_publication_assigns_one_canonical_identity() {
+        let resources = TaskResources::default();
+        let first = resources.register(4, 9, resource(ObjectKind::Buffer));
+        let raced = resources.register(4, 9, resource(ObjectKind::Buffer));
+        let id = first.semantic_id().expect("published identity");
+
+        assert!(Arc::ptr_eq(&first, &raced));
+        assert_eq!(raced.semantic_id(), Some(id));
+        let node = resources.resource_node(id).expect("canonical node");
+        assert_eq!(node.task, TaskId::new(4));
+        assert_eq!(node.object, ObjectRef::new(9));
+        assert_eq!(node.kind, ObjectKind::Buffer);
+    }
+
+    #[test]
+    fn explicit_delete_and_reference_reuse_advance_the_canonical_generation() {
+        let resources = TaskResources::default();
+        let first = resources.register(4, 9, resource(ObjectKind::Texture));
+        let first_id = first.semantic_id().unwrap();
+        assert!(resources.delete(4, 9));
+        let second = resources.register(4, 9, resource(ObjectKind::Texture));
+        let second_id = second.semantic_id().unwrap();
+
+        assert_eq!(first_id.index(), second_id.index());
+        assert_ne!(first_id.generation(), second_id.generation());
+        assert!(resources.resource_node(first_id).is_none());
+        assert!(resources.resource_node(second_id).is_some());
+    }
+
+    #[test]
+    fn mapper_backed_texture_gets_storage_distinct_from_its_resource_identity() {
+        let resources = TaskResources::default();
+        let texture = resources.register(4, 9, resource(ObjectKind::IOSurfaceTexture));
+        let id = texture.semantic_id().unwrap();
+
+        assert!(resources.attach_mapper_storage(4, 9, 12));
+        let node = resources.resource_node(id).unwrap();
+        assert!(node.storage.is_some());
+        assert_eq!(node.backing_generation.get(), 1);
     }
 }
 

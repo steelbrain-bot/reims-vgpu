@@ -1099,11 +1099,20 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "raw-window-handle",
+ "reims-vgpu-core",
  "reims-vgpu-paging",
  "reims-vgpu-protocol",
  "reims-vgpu-wire",
  "serde_json",
  "winit",
+]
+
+[[package]]
+name = "reims-vgpu-core"
+version = "0.1.0"
+dependencies = [
+ "reims-vgpu-paging",
+ "reims-vgpu-protocol",
 ]
 
 [[package]]

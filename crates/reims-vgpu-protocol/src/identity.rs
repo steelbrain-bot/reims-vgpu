@@ -45,6 +45,9 @@ scalar_newtype!(GuestPhysicalAddress, u64);
 scalar_newtype!(ByteOffset, u64);
 scalar_newtype!(ByteLength, u64);
 scalar_newtype!(SubmissionId, u64);
+scalar_newtype!(BackingGeneration, u64);
+scalar_newtype!(ContentVersion, u64);
+scalar_newtype!(PlaneIndex, u32);
 
 impl fmt::LowerHex for GuestVirtualAddress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
