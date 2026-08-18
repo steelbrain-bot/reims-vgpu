@@ -22,6 +22,9 @@ pub use resource::{
     ContentAuthority, ContentError, ContentState, GraphError, LifecycleState, MappingNode,
     PendingContentWrite, ReplicaVersions, ResourceGraph, ResourceNode, StorageBacking, StorageNode,
 };
-pub use service::{GuestWriteReach, ResidentContent, ResidentReclaim, TargetReadback};
+pub use service::{
+    GuestWriteReach, GuestWriteService, ResidentContent, ResidentReclaim, ResidentService,
+    TargetReadback,
+};
 pub use submission::SubmissionContext;
 pub use target::{TargetIdentity, TargetKeyDivergence};

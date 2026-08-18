@@ -11,8 +11,8 @@ use crate::model::TargetIdentity;
 use reims_vgpu_protocol::StorageImageFormat;
 
 pub use reims_vgpu_core::{
-    ExecutionPort, ExecutorCapabilities, GuestWriteReach, ResidentContent, ResidentContentBacking,
-    ResidentLease, SubmissionContext, TargetReadback,
+    ExecutionPort, ExecutorCapabilities, GuestWriteReach, GuestWriteService, ResidentContent,
+    ResidentContentBacking, ResidentLease, ResidentService, SubmissionContext, TargetReadback,
 };
 
 impl ResidentLease for crate::backend::vulkan::engine::ResidentResourceLease {
@@ -52,7 +52,12 @@ pub type ExecutionReceipt<T> = reims_vgpu_core::ExecutionReceipt<T>;
 
 /// Backend execution contract implemented per device.
 pub trait Executor:
-    ExecutionPort<Submission = ResolvedSubmission, Completion = ExecutionCompletion, Error = DrawError>
+    ExecutionPort<
+        Submission = ResolvedSubmission,
+        Completion = ExecutionCompletion,
+        Error = DrawError,
+    > + ResidentService
+    + GuestWriteService
 {
     fn capabilities(&self) -> ExecutorCapabilities {
         ExecutorCapabilities::default()
@@ -67,34 +72,6 @@ pub trait Executor:
             crate::contract::pixel_format::TexelLayout::Rgba8
                 | crate::contract::pixel_format::TexelLayout::Bgra8
         )
-    }
-
-    /// Current engine-owned content state for one resolved render target.
-    fn resident_content_backing(&self, _identity: &TargetIdentity) -> ResidentContentBacking {
-        ResidentContentBacking::NotReady
-    }
-
-    fn resident_absent_after_reclaim(
-        &self,
-        _identity: &TargetIdentity,
-    ) -> Option<(reims_vgpu_core::ResidentReclaim, u64)> {
-        None
-    }
-
-    fn resident_content_epoch(&self, _identity: &TargetIdentity) -> Option<u32> {
-        None
-    }
-
-    fn resident_content_state(&self, _identity: &TargetIdentity) -> ResidentContent {
-        ResidentContent::Absent
-    }
-
-    fn stamp_resident_content_epoch(&self, _identity: &TargetIdentity, _epoch: u32) -> bool {
-        false
-    }
-
-    fn note_resident_content_copied_out(&self, _identity: &TargetIdentity) -> bool {
-        false
     }
 
     fn compute_resident_storage_generation(
@@ -161,16 +138,6 @@ pub trait Executor:
         None
     }
 
-    fn guest_writes_outstanding(&self) -> bool {
-        false
-    }
-
-    fn guest_writes_reaching(&self, _pages: &[u64]) -> GuestWriteReach {
-        GuestWriteReach::Disjoint
-    }
-
-    fn quiesce_guest_writes(&self) {}
-
     fn guest_access_outstanding(&self) -> bool {
         false
     }
@@ -216,13 +183,6 @@ pub trait Executor:
     fn flush_batched_draws(&self) {}
 
     fn maintain_resources(&self, _now_ms: u64) {}
-
-    fn retain_resident_resource(
-        &self,
-        _identity: &TargetIdentity,
-    ) -> Option<Box<dyn ResidentLease>> {
-        None
-    }
 
     /// Observation-only snapshots. Semantic planning must never read these.
     fn sampled_working_set_census(&self) -> Option<String> {
@@ -317,33 +277,6 @@ impl Executor for VulkanExecutor {
         crate::backend::vulkan::engine::render_target_layout_supported(layout)
     }
 
-    fn resident_content_backing(&self, identity: &TargetIdentity) -> ResidentContentBacking {
-        crate::backend::vulkan::engine::resident_content_backing(identity)
-    }
-
-    fn resident_absent_after_reclaim(
-        &self,
-        identity: &TargetIdentity,
-    ) -> Option<(reims_vgpu_core::ResidentReclaim, u64)> {
-        crate::backend::vulkan::engine::resident_absent_after_reclaim(identity)
-    }
-
-    fn resident_content_epoch(&self, identity: &TargetIdentity) -> Option<u32> {
-        crate::backend::vulkan::engine::resident_content_epoch(identity)
-    }
-
-    fn resident_content_state(&self, identity: &TargetIdentity) -> ResidentContent {
-        crate::backend::vulkan::engine::resident_content_state(identity)
-    }
-
-    fn stamp_resident_content_epoch(&self, identity: &TargetIdentity, epoch: u32) -> bool {
-        crate::backend::vulkan::engine::stamp_resident_content_epoch(identity, epoch)
-    }
-
-    fn note_resident_content_copied_out(&self, identity: &TargetIdentity) -> bool {
-        crate::backend::vulkan::engine::note_resident_content_copied_out(identity)
-    }
-
     fn compute_resident_storage_generation(
         &self,
         identity: &crate::model::ComputeStorageResidencyKey,
@@ -397,18 +330,6 @@ impl Executor for VulkanExecutor {
         crate::backend::vulkan::engine::read_resident_bgra(identity, need)
     }
 
-    fn guest_writes_outstanding(&self) -> bool {
-        crate::backend::vulkan::engine::guest_writes_outstanding()
-    }
-
-    fn guest_writes_reaching(&self, pages: &[u64]) -> GuestWriteReach {
-        crate::backend::vulkan::engine::guest_writes_reaching(pages)
-    }
-
-    fn quiesce_guest_writes(&self) {
-        crate::backend::vulkan::engine::quiesce_guest_writes();
-    }
-
     fn guest_access_outstanding(&self) -> bool {
         crate::backend::vulkan::engine::guest_access_outstanding()
     }
@@ -459,14 +380,6 @@ impl Executor for VulkanExecutor {
 
     fn maintain_resources(&self, now_ms: u64) {
         crate::backend::vulkan::engine::maintain_resources(now_ms);
-    }
-
-    fn retain_resident_resource(
-        &self,
-        identity: &TargetIdentity,
-    ) -> Option<Box<dyn ResidentLease>> {
-        crate::backend::vulkan::engine::retain_resident_resource(identity)
-            .map(|lease| Box::new(lease) as Box<dyn ResidentLease>)
     }
 
     fn sampled_working_set_census(&self) -> Option<String> {
@@ -530,6 +443,57 @@ impl Executor for VulkanExecutor {
         ExecutionScope {
             _engine: Some(crate::backend::vulkan::engine::enter_session(self.session)),
         }
+    }
+}
+
+impl ResidentService for VulkanExecutor {
+    fn resident_content_backing(&self, identity: &TargetIdentity) -> ResidentContentBacking {
+        crate::backend::vulkan::engine::resident_content_backing(identity)
+    }
+
+    fn resident_absent_after_reclaim(
+        &self,
+        identity: &TargetIdentity,
+    ) -> Option<(reims_vgpu_core::ResidentReclaim, u64)> {
+        crate::backend::vulkan::engine::resident_absent_after_reclaim(identity)
+    }
+
+    fn resident_content_epoch(&self, identity: &TargetIdentity) -> Option<u32> {
+        crate::backend::vulkan::engine::resident_content_epoch(identity)
+    }
+
+    fn resident_content_state(&self, identity: &TargetIdentity) -> ResidentContent {
+        crate::backend::vulkan::engine::resident_content_state(identity)
+    }
+
+    fn stamp_resident_content_epoch(&self, identity: &TargetIdentity, epoch: u32) -> bool {
+        crate::backend::vulkan::engine::stamp_resident_content_epoch(identity, epoch)
+    }
+
+    fn note_resident_content_copied_out(&self, identity: &TargetIdentity) -> bool {
+        crate::backend::vulkan::engine::note_resident_content_copied_out(identity)
+    }
+
+    fn retain_resident_resource(
+        &self,
+        identity: &TargetIdentity,
+    ) -> Option<Box<dyn ResidentLease>> {
+        crate::backend::vulkan::engine::retain_resident_resource(identity)
+            .map(|lease| Box::new(lease) as Box<dyn ResidentLease>)
+    }
+}
+
+impl GuestWriteService for VulkanExecutor {
+    fn guest_writes_outstanding(&self) -> bool {
+        crate::backend::vulkan::engine::guest_writes_outstanding()
+    }
+
+    fn guest_writes_reaching(&self, pages: &[u64]) -> GuestWriteReach {
+        crate::backend::vulkan::engine::guest_writes_reaching(pages)
+    }
+
+    fn quiesce_guest_writes(&self) {
+        crate::backend::vulkan::engine::quiesce_guest_writes();
     }
 }
 
@@ -702,6 +666,14 @@ mod tests {
             self.resident_generation
         }
 
+        fn reset(&self) {
+            self.resets.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    impl ResidentService for ScriptedExecutor {}
+
+    impl GuestWriteService for ScriptedExecutor {
         fn guest_writes_outstanding(&self) -> bool {
             self.guest_writes != GuestWriteReach::Disjoint
         }
@@ -712,10 +684,6 @@ mod tests {
 
         fn quiesce_guest_writes(&self) {
             self.write_quiesces.fetch_add(1, Ordering::Relaxed);
-        }
-
-        fn reset(&self) {
-            self.resets.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -903,6 +871,8 @@ mod tests {
     struct WrongIdentityExecutor;
 
     impl Executor for WrongIdentityExecutor {}
+    impl ResidentService for WrongIdentityExecutor {}
+    impl GuestWriteService for WrongIdentityExecutor {}
 
     impl ExecutionPort for WrongIdentityExecutor {
         type Submission = ResolvedSubmission;

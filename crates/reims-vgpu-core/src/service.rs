@@ -1,5 +1,7 @@
 //! Backend-neutral service results used beside the submission port.
 
+use crate::{ResidentContentBacking, ResidentLease, TargetIdentity};
+
 /// What an executor can prove about outstanding writes into a page window.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GuestWriteReach {
@@ -73,6 +75,56 @@ fn swap_red_blue(pixels: &mut [u8]) {
     for pixel in pixels.chunks_exact_mut(4) {
         pixel.swap(0, 2);
     }
+}
+
+/// Executor service for semantic resident-content state.
+pub trait ResidentService: std::fmt::Debug + Send + Sync {
+    fn resident_content_backing(&self, _identity: &TargetIdentity) -> ResidentContentBacking {
+        ResidentContentBacking::NotReady
+    }
+
+    fn resident_absent_after_reclaim(
+        &self,
+        _identity: &TargetIdentity,
+    ) -> Option<(ResidentReclaim, u64)> {
+        None
+    }
+
+    fn resident_content_epoch(&self, _identity: &TargetIdentity) -> Option<u32> {
+        None
+    }
+
+    fn resident_content_state(&self, _identity: &TargetIdentity) -> ResidentContent {
+        ResidentContent::Absent
+    }
+
+    fn stamp_resident_content_epoch(&self, _identity: &TargetIdentity, _epoch: u32) -> bool {
+        false
+    }
+
+    fn note_resident_content_copied_out(&self, _identity: &TargetIdentity) -> bool {
+        false
+    }
+
+    fn retain_resident_resource(
+        &self,
+        _identity: &TargetIdentity,
+    ) -> Option<Box<dyn ResidentLease>> {
+        None
+    }
+}
+
+/// Executor service for synchronizing writes that target guest memory.
+pub trait GuestWriteService: std::fmt::Debug + Send + Sync {
+    fn guest_writes_outstanding(&self) -> bool {
+        false
+    }
+
+    fn guest_writes_reaching(&self, _pages: &[u64]) -> GuestWriteReach {
+        GuestWriteReach::Disjoint
+    }
+
+    fn quiesce_guest_writes(&self) {}
 }
 
 #[cfg(test)]

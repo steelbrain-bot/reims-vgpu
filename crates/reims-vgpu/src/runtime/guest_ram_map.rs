@@ -798,6 +798,8 @@ mod tests {
     struct NoopExecutor;
 
     impl crate::runtime::executor::Executor for NoopExecutor {}
+    impl crate::runtime::executor::ResidentService for NoopExecutor {}
+    impl crate::runtime::executor::GuestWriteService for NoopExecutor {}
 
     impl crate::runtime::executor::ExecutionPort for NoopExecutor {
         type Submission = crate::runtime::executor::ResolvedSubmission;
