@@ -1877,6 +1877,7 @@ fn a_blit_endpoint_lands_the_writeback_its_texture_still_owes() {
                 height: 8,
                 format: MTL_FORMAT_RGBA8_UNORM,
                 generation: 3,
+                content: None,
                 guest_write,
                 seq: 0,
             },

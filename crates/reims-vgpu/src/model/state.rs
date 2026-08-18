@@ -1039,6 +1039,44 @@ impl TaskResources {
         registry.graph.resource_mut(id)?.content.guest_wrote().ok()
     }
 
+    /// Apply a completed GPU Store to the resource version state.
+    ///
+    /// The current executor reports render operations synchronously. Reserving
+    /// and completing here therefore occurs only after its successful
+    /// completion fact; no speculative version becomes authoritative.
+    pub fn record_completed_gpu_store(
+        &self,
+        task_id: u32,
+        ref_: u32,
+        submission: SubmissionId,
+    ) -> Option<(ResourceId<ResourceObject>, ContentVersion)> {
+        let mut registry = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let id = registry
+            .graph
+            .resolve(TaskId::new(task_id), ObjectRef::new(ref_))?;
+        let content = &mut registry.graph.resource_mut(id)?.content;
+        content.gpu_store_planned(submission).ok()?;
+        let version = content.gpu_store_completed(submission).ok()?;
+        Some((id, version))
+    }
+
+    /// Record successful materialization of one exact GPU content version.
+    pub fn record_gpu_to_guest_copy(
+        &self,
+        id: ResourceId<ResourceObject>,
+        version: ContentVersion,
+    ) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .graph
+            .resource_mut(id)
+            .is_some_and(|node| node.content.copy_gpu_to_guest_completed(version).is_ok())
+    }
+
     /// Resolve and enter every constructed resource declared by a submission.
     ///
     /// Residency tables legitimately contain objects which no command has
@@ -1377,6 +1415,29 @@ mod task_resource_graph_tests {
             resources.resource_node(id).unwrap().lifecycle,
             reims_vgpu_core::LifecycleState::Created
         );
+    }
+
+    #[test]
+    fn completed_gpu_store_and_copy_update_one_resource_version() {
+        let resources = TaskResources::default();
+        let resource = resources.register(4, 9, resource(ObjectKind::Texture));
+        let id = resource.semantic_id().unwrap();
+
+        let (stored_id, version) = resources
+            .record_completed_gpu_store(4, 9, SubmissionId::new(3))
+            .unwrap();
+        assert_eq!(stored_id, id);
+        let node = resources.resource_node(id).unwrap();
+        assert_eq!(node.content.current, version);
+        assert!(node.content.current_in_gpu());
+        assert!(!node.content.current_in_guest());
+
+        assert!(resources.record_gpu_to_guest_copy(id, version));
+        assert!(resources
+            .resource_node(id)
+            .unwrap()
+            .content
+            .current_in_guest());
     }
 }
 

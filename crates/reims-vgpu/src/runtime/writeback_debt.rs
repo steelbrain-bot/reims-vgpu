@@ -107,6 +107,13 @@ pub struct GvaWritebackDebt {
     pub height: u32,
     pub format: u16,
     pub generation: u64,
+    /// Exact semantic resource and content version held by the resident.
+    /// `None` is limited to resources not yet constructed in the canonical
+    /// object graph and to synthetic tests.
+    pub content: Option<(
+        reims_vgpu_protocol::ResourceId<reims_vgpu_protocol::ResourceObject>,
+        reims_vgpu_protocol::ContentVersion,
+    )>,
     pub guest_write: crate::runtime::buffer_write_gen::BufferWriteStamp,
     pub seq: u64,
 }
@@ -668,6 +675,13 @@ pub fn arm_gva<M: HostMemory + HostOps>(
         height: c0.height,
         format: c0.format,
         generation,
+        content: state.active_submission.as_ref().and_then(|submission| {
+            state.task_resources.record_completed_gpu_store(
+                task_id,
+                c0.texture_ref,
+                submission.identity.id,
+            )
+        }),
         guest_write: state.buffer_write_gen.stamp(task_id, c0.texture_ref),
         seq: 0,
     };
@@ -954,6 +968,16 @@ fn pay_gva<M: HostMemory + HostOps>(
             .field("texture", key.texture_ref)
             .fail();
         release_gva(debt);
+    } else if let Some((resource, version)) = debt.content {
+        if !state
+            .task_resources
+            .record_gpu_to_guest_copy(resource, version)
+        {
+            crate::observe::fail(format!(
+                "gvadebt_content_transition task={} texture={} reason=stale_content_version",
+                key.task_id, key.texture_ref
+            ));
+        }
     }
     true
 }
@@ -986,6 +1010,7 @@ mod tests {
             height: 64,
             format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
             generation,
+            content: None,
             guest_write: Default::default(),
             seq: 0,
         }
