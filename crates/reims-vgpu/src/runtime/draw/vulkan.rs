@@ -1143,9 +1143,9 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     // decided by the entry's `object_type`, and the cases below are distinct
     // values of that single u8 field, so they cannot both apply:
     //
-    //   type-5 RefTextureHandle — carries the type-4 surface id in its
+    //   type-5 RefTextureHandle — carries the surface backing surface id in its
     //                             descriptor, alongside the Metal texture view
-    //   type-4 Surface         — the ref *is* the surface id
+    //   surface backing Surface         — the ref *is* the surface id
     //   IOSurface      — resolves to the mapping id it was created on
     //
     // The retained resource already carries the total typed decode. The
@@ -1193,7 +1193,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     }
 
     if let Some(mid) = surface {
-        // Ensure type-4 pages exist for this surface id.
+        // Ensure surface backing pages exist for this surface id.
         let _ = objects::ensure_surface_for_texture_bind(state, host, mid);
         // A type-5 serialized record is the exact Metal texture view over the
         // IOSurface bytes. Materialize it only when it differs from (or cannot
@@ -1418,7 +1418,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     crate::runtime::surface_cache::get_shared_with_gen(state, mid, w, h)
                 {
                     // Uploaded in the order the cache already holds. This rung's
-                    // bytes are BGRA8 by construction — it is a type-4 scanout
+                    // bytes are BGRA8 by construction — it is a surface backing scanout
                     // cache — and `B8G8R8A8_UNORM` is a Vulkan-mandatory sampled
                     // format with linear filtering, so declaring the layout costs
                     // nothing and the hardware reads the channels the guest
@@ -1451,7 +1451,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                         generation: host_gen,
                     });
                     note_iosurface_texture_sample_rung("iosurfacerung_host_cache");
-                    // BGRA8 by construction — it is a type-4 scanout cache — but
+                    // BGRA8 by construction — it is a surface backing scanout cache — but
                     // the *values* in it are the surface's, and this cache is
                     // filled from a writeback that reorders channels and decodes
                     // nothing. So the transfer function is the mapping's declared
@@ -2172,9 +2172,9 @@ fn resolve_iosurface_texture_load_seed<M: HostMemory + HostOps>(
 
 /// Materialize the exact serialized Metal view carried by a type-5 object.
 ///
-/// The underlying type-4 FourCC is allocation metadata, not necessarily the
+/// The underlying surface backing FourCC is allocation metadata, not necessarily the
 /// sampled Metal format. The view's format/geometry define the native row
-/// interpretation; the type-4 device descriptor supplies its base/BPR/span.
+/// interpretation; the surface backing device descriptor supplies its base/BPR/span.
 /// Materialize a type-5 serialized texture view through the byte-exact
 /// revalidated memo (same contract as [`load_linear_guest_memoized`]): every
 /// bind re-reads the native plane window so a guest write is always observed;
@@ -6348,7 +6348,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 let mut byte_origin = crate::backend::vulkan::engine::SampledByteOrigin::Synthetic;
                 // Byte layout of a CPU-origin bind. Default RGBA8; a source that
                 // already holds its bytes in an uploadable order keeps them —
-                // BGRA8 from the type-4 scanout cache, a native single/dual-channel
+                // BGRA8 from the surface backing scanout cache, a native single/dual-channel
                 // video plane — and the host spelling is applied once, where the
                 // engine resource is built (`vk_texel_layout` below).
                 let sampled_vk_format;

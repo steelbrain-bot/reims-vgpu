@@ -936,7 +936,7 @@ fn note_exec_header(exec_started: std::time::Instant, measured_ns: u64) {
 ///
 /// `validity_unknown_object` is **not** by itself a defect either, and a reader
 /// scoring it needs to know why: `DeviceState::objects` is populated lazily, by
-/// `objects::resolve_iosurface_texture_ref` and `resolve_type4_surface_ex` at the moment a
+/// `objects::resolve_iosurface_texture_ref` and `resolve_surface_backing_ex` at the moment a
 /// decoded command names a ref. A resource the guest has created in its own
 /// object list but has not yet named in an executed stream is absent from the
 /// set by construction. The table names the submission's whole residency list,
@@ -1921,7 +1921,7 @@ fn handle_blit_record<M: HostMemory + HostOps>(
         // decides whether an executor is worth building.
         //
         // Not executed here on purpose. A texture fill needs the destination
-        // resolved through the type-4/5/11 rails, the region walked per row,
+        // resolved through the surface backing/5/11 rails, the region walked per row,
         // and — for the colour form — the clear colour converted into the
         // texture's pixel format, which is a converter this device does not
         // have. The count is what says whether to build one, and for which of
@@ -2193,8 +2193,8 @@ fn handle_render_record<M: HostMemory + HostOps>(
                         if !out.iosurface_mappings.contains(&m) {
                             out.iosurface_mappings.push(m);
                         }
-                    } else if objects::resolve_type4_surface(state, host, texture_ref) {
-                        // x86 type-4: object ref is surface_id / mapping_id.
+                    } else if objects::resolve_surface_backing(state, host, texture_ref) {
+                        // x86 surface backing: object ref is surface_id / mapping_id.
                         if !out.iosurface_mappings.contains(&texture_ref) {
                             out.iosurface_mappings.push(texture_ref);
                         }
@@ -2439,8 +2439,8 @@ fn handle_render_record<M: HostMemory + HostOps>(
                         if !out.iosurface_mappings.contains(&m) {
                             out.iosurface_mappings.push(m);
                         }
-                    } else if objects::resolve_type4_surface(state, host, published_ref) {
-                        // A type-4 attachment is its own mapping id — the arm
+                    } else if objects::resolve_surface_backing(state, host, published_ref) {
+                        // A surface backing attachment is its own mapping id — the arm
                         // below pushes `att.texture_ref` where the IOSurface texture arm
                         // pushes the id it resolved to.
                         note_pass_extent_for_slot(state, task_id, slot, published_ref, &cmd);
@@ -4415,7 +4415,7 @@ fn dirty_color_targets<M: HostMemory + HostOps>(
             // The guest pages are the only copy of an IOSurface texture surface, so there
             // is no mirror to drop — only bump gen for scanout skips.
             let _ = state.mark_mapping_written(mid);
-        } else if objects::resolve_type4_surface(state, host, tex_ref) {
+        } else if objects::resolve_surface_backing(state, host, tex_ref) {
             let _ = state.mark_mapping_written(tex_ref);
         }
     }

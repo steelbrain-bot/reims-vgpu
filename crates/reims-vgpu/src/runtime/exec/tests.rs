@@ -1204,8 +1204,8 @@ fn the_pass_extent_census_scores_a_fraction_and_clamps_it() {
 ///
 /// This is the arm-parity test. The census used to hang off the IOSurface texture
 /// resolve alone, so on the x86/Vulkan pathway — where the workload takes
-/// the type-4 arm — every band read zero, which is indistinguishable from a
-/// guest that never states an extent. A type-4 attachment *is* its own
+/// the surface backing arm — every band read zero, which is indistinguishable from a
+/// guest that never states an extent. A surface backing attachment *is* its own
 /// mapping id, so the only difference between the two call sites is which
 /// id they pass, and this pins that the scoring does not care which.
 #[test]
@@ -2061,9 +2061,9 @@ fn zero_ref_render_bind_unbinds_existing_slots() {
     assert_eq!(out.sampler_unbinds, 1);
 }
 
-/// x86 type-4 display mid: clear-only stream must Store solid BGRA into pages.
+/// x86 surface backing display mid: clear-only stream must Store solid BGRA into pages.
 #[test]
-fn clear_only_type4_surface_writes_guest_pages() {
+fn clear_only_surface_backing_writes_guest_pages() {
     use crate::contract::endian::{st32, st64};
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
@@ -2096,7 +2096,7 @@ fn clear_only_type4_surface_writes_guest_pages() {
     let _ = host.write_gpa(root_gpa + 0x40 * 4, &d[..4]);
     state.define_task(1, 0x1000, 2);
     assert!(state.set_object_list(1, 0, 8));
-    // Type-4 at surface_id=5.
+    // Surface backing at surface_id=5.
     let mut entry = [0u8; 12];
     st32(
         &mut entry[0..],
@@ -2114,7 +2114,7 @@ fn clear_only_type4_surface_writes_guest_pages() {
     st32(&mut desc[0x20..], 64);
     let _ = host.write_gpa(data_gpa + 0x80, &desc);
 
-    assert!(objects::resolve_type4_surface(&mut state, &host, 5));
+    assert!(objects::resolve_surface_backing(&mut state, &host, 5));
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
     acc.clears.push(ColorAttachment {
@@ -2130,7 +2130,7 @@ fn clear_only_type4_surface_writes_guest_pages() {
     finish_stream(&mut state, &mut host, 1, &mut out, &acc);
     assert!(
         out.clears_applied >= 1,
-        "type-4 clear must apply, got {}",
+        "surface backing clear must apply, got {}",
         out.clears_applied
     );
     // Read first pixel from guest page (BGRA).
@@ -2233,9 +2233,9 @@ fn finish_stream_with_draws_skips_guest_clear_prelude() {
     );
 }
 
-/// Linux BackendUnavailable: draws fail but CLEAR seed still Stores into type-4 pages.
+/// Linux BackendUnavailable: draws fail but CLEAR seed still Stores into surface backing pages.
 #[test]
-fn backend_unavailable_draw_falls_back_to_type4_clear() {
+fn backend_unavailable_draw_falls_back_to_surface_backing_clear() {
     use crate::contract::endian::{st32, st64};
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::runtime::decode::render::ColorAttachment;
@@ -2280,7 +2280,7 @@ fn backend_unavailable_draw_falls_back_to_type4_clear() {
     st32(&mut desc[0x1c..], 16);
     st32(&mut desc[0x20..], 64);
     let _ = host.write_gpa(data_gpa + 0x80, &desc);
-    assert!(objects::resolve_type4_surface(&mut state, &host, 5));
+    assert!(objects::resolve_surface_backing(&mut state, &host, 5));
 
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -2341,7 +2341,7 @@ fn backend_unavailable_draw_falls_back_to_type4_clear() {
         out.render_attachment_resolves, 1,
         "one render stream resolves its fixed attachment set once"
     );
-    // Non-Apple: Linux encode Stores CLEAR load into type-4 (Ok) or
+    // Non-Apple: Linux encode Stores CLEAR load into surface backing (Ok) or
     // BackendUnavailable clear fallback — either path must land green BGRA.
     #[cfg(feature = "backend-vulkan")]
     {

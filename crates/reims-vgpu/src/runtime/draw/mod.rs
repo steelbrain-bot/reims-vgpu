@@ -3389,7 +3389,7 @@ fn seed_color_load<M: HostMemory + HostOps>(
 ) -> Option<Vec<u8>> {
     // Discrete GPU: exact target GVA is the strongest identity across object-ref
     // recycling. Fall back to the type-2/3 texture namespace, never the
-    // unrelated type-4 surface_id namespace. Guest memory is last.
+    // unrelated surface backing surface_id namespace. Guest memory is last.
     if width > 0 && height > 0 {
         if target_gva != 0 {
             // Recency for the encode cache's byte cap; a Load seed served from

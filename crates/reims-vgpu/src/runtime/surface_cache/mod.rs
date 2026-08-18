@@ -1,12 +1,12 @@
 //! Host surface cache for Linux/Vulkan discrete-GPU present (kb tahoe-x86 §8.5).
 //!
 //! On Apple unified-memory hosts, GPU stores can land in guest IOSurface pages.
-//! On the Linux product rail guest type-4 pages are **not** filled by the host
+//! On the Linux product rail guest surface backing pages are **not** filled by the host
 //! GPU until encode writeback; the product paints from a
 //! **host render-cache** keyed by surface_id. This module is that cache.
 //!
 //! Namespace split (2026-07-13 live x86):
-//! - [`store`] / [`get`] — **type-4 surface_id / mapping_id** only (`host_surfaces`)
+//! - [`store`] / [`get`] — **surface backing surface_id / mapping_id** only (`host_surfaces`)
 //! - [`store_texture`] / [`get_texture`] — type-2/3 color targets by task/object ref
 //! - [`store_gva_owned`] / [`get_gva`] — type-2/3 by target GVA (survives ref rebinding)
 //!
@@ -83,7 +83,7 @@ fn get_from_with_gen<'a, K: Ord>(
     Some((&e.bgra[..need], e.host_gen))
 }
 
-/// Insert/replace host-cache pixels for `surface_id` (type-4 present id).
+/// Insert/replace host-cache pixels for `surface_id` (surface backing present id).
 pub fn store(state: &mut DeviceState, surface_id: u32, width: u32, height: u32, bgra: Vec<u8>) {
     store_shared(state, surface_id, width, height, std::sync::Arc::new(bgra));
 }

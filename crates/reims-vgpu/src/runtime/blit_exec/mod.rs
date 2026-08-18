@@ -784,7 +784,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
             note_t5_decode_fail(sid, bytes);
             return Err(br(BlitStatus::Unsupported, "t5_view_decode"));
         };
-        // Surface id IS the type-4 mapping mid (never the task object-list ref —
+        // Surface id IS the surface backing mapping mid (never the task object-list ref —
         // those id spaces collide). Resolve the backing, then the mapping.
         let _ = objects::ensure_surface_for_present(state, host, sid);
         let _ = mapper::ensure_resolved_for_scanout(state, host, sid);

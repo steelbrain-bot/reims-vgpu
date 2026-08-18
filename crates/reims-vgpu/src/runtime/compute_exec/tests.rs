@@ -1210,7 +1210,7 @@ fn dispatch_missing_texture_fails() {
     ));
 }
 
-/// Live CI wallpaper: type-5 RefTexture → type-4 surface_id must stage via
+/// Live CI wallpaper: type-5 RefTexture → surface backing surface_id must stage via
 /// ensure_surface + mapping (same order as the `runtime::draw` sample). Without
 /// ensure, stage fell through to type-2/3 with the type-5 ref → always
 /// MissingTexture (`compute_stage_tex … ot=5`).
@@ -1227,7 +1227,7 @@ fn stage_texture_type5_ref_resolves_surface_mapping() {
 
     let sid = 3u32;
     let type5_ref = 10u32;
-    // Pre-mapped type-4 surface (CI storage target) with one valid page.
+    // Pre-mapped surface backing surface (CI storage target) with one valid page.
     let pfn = 0x20u32;
     let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
     host.map_range(gpa, 0x4000, 0x5a);

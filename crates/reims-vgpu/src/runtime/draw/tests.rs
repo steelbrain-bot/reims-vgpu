@@ -4070,7 +4070,7 @@ fn iosurface_texture_host_cache_rung_identity_tracks_the_cached_frame() {
     );
 }
 
-/// Live Safari app-launch class: the type-4 base carries an unknown
+/// Live Safari app-launch class: the surface backing base carries an unknown
 /// 2-byte IOSurface FourCC (`LA08`) while the type-5 descriptor carries
 /// the exact RG8 Metal view. Defaulting the base to BGRA asks for a
 /// 632-byte row against the wire's 320-byte row and drops the draw.

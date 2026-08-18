@@ -806,7 +806,7 @@ fn mapping_write_invalidates_intersecting_residency_windows_only() {
 #[test]
 fn a_repointed_surface_writes_its_current_backing_and_leaves_the_old_owner_alone() {
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::model::{Type4Walk, PAGE_SHIFT_X86};
+    use crate::model::{SurfaceBackingWalk, PAGE_SHIFT_X86};
 
     let page = 1u64 << PAGE_SHIFT_X86;
     let mut host = FakeHost::new();
@@ -837,7 +837,7 @@ fn a_repointed_surface_writes_its_current_backing_and_leaves_the_old_owner_alone
         m.mapped = true;
         m.page_entries =
             vec![(((data0 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
-        m.type4_walk = Some(Type4Walk {
+        m.surface_backing_walk = Some(SurfaceBackingWalk {
             task_id: 1,
             backing_pfn: 0,
             page_generation: m.page_generation,

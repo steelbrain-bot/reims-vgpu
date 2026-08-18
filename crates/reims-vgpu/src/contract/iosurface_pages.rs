@@ -371,11 +371,11 @@ pub fn device_desc_plane(desc: &[u8], plane_index: u32) -> Option<(DevicePlaneRe
         return None;
     }
     let plane_count = desc[DEVICE_DESC_PLANE_COUNT] as u32;
-    // `TYPE4_PLANE_CAP` is `IOSurfaceGetPlaneCount`'s ceiling and lives beside
+    // `SURFACE_BACKING_PLANE_CAP` is `IOSurfaceGetPlaneCount`'s ceiling and lives beside
     // the plane record it bounds; the literal 8 that stood here was the same
     // rule written a second time, in a file that cannot see if the first moves.
     if plane_count == 0
-        || plane_count > reims_vgpu_wire::device_desc::TYPE4_PLANE_CAP as u32
+        || plane_count > reims_vgpu_wire::device_desc::SURFACE_BACKING_PLANE_CAP as u32
         || plane_index >= plane_count
     {
         return None;
@@ -501,7 +501,7 @@ pub fn sample_window_from_device_desc(
                     // holds.
                     for p in 0..surf
                         .plane_count
-                        .min(reims_vgpu_wire::device_desc::TYPE4_PLANE_CAP as u8)
+                        .min(reims_vgpu_wire::device_desc::SURFACE_BACKING_PLANE_CAP as u8)
                     {
                         if let Some((cand, _)) = device_desc_plane(desc, p as u32) {
                             if cand.width == width
@@ -534,7 +534,7 @@ pub fn sample_window_from_device_desc(
 /// The descriptor answers this exactly when it has arrived; otherwise
 /// [`packed_span_estimate`] gives a count that errs long. Either way the guest's
 /// own allocation bounds it: RE (`allocateBackingHandle`) writes the
-/// page-aligned allocation length at type-4 desc `+0`, independent of the plane
+/// page-aligned allocation length at surface backing desc `+0`, independent of the plane
 /// width/height/pitch filled from the per-plane getters, and we stash it as
 /// `device_desc.alloc_size`. A span past that is a span past the pages the guest
 /// allocated, so it is refused rather than clamped.
@@ -1201,7 +1201,7 @@ mod tests {
     }
 
     /// The page-sizing estimate must not reach past the wire `alloc_size`
-    /// (type-4 `length`). RE: allocateBackingHandle writes length@0
+    /// (surface backing `length`). RE: allocateBackingHandle writes length@0
     /// independently of plane dims.
     #[test]
     fn mapping_span_bound_rejects_a_span_past_alloc_size() {

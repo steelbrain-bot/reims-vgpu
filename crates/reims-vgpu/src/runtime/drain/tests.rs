@@ -523,7 +523,7 @@ fn replace_physical_drops_the_cached_page_list() {
         let m = state.mappings.get_mut(&7).unwrap();
         m.mapped = true;
         m.page_entries = vec![0x11, 0x22, 0x33];
-        m.type4_walk = Some(crate::model::Type4Walk {
+        m.surface_backing_walk = Some(crate::model::SurfaceBackingWalk {
             task_id: 0,
             backing_pfn: 0x20,
             page_generation: m.page_generation,
@@ -558,7 +558,7 @@ fn replace_physical_drops_the_cached_page_list() {
     assert_ne!(
         m.map_generation, generation_before,
         "dropping the list must bump the incarnation, which is what retires the \
-         type-4 walk latch and any state keyed on it"
+         surface backing walk latch and any state keyed on it"
     );
 }
 
@@ -675,7 +675,7 @@ fn replace_physical_retires_only_the_named_resource() {
 
 /// A same-number mapping owned by another task must not capture a task-local
 /// resource re-point. The association names mapping 99; mapping 7 merely shares
-/// its integer and has independent type-4 provenance.
+/// its integer and has independent surface backing provenance.
 #[test]
 fn replace_physical_does_not_confuse_another_tasks_mapping_for_the_resource() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -685,7 +685,7 @@ fn replace_physical_does_not_confuse_another_tasks_mapping_for_the_resource() {
         let m = state.mappings.get_mut(&7).unwrap();
         m.mapped = true;
         m.page_entries = vec![0x77];
-        m.type4_walk = Some(crate::model::Type4Walk {
+        m.surface_backing_walk = Some(crate::model::SurfaceBackingWalk {
             task_id: 1,
             backing_pfn: 0x20,
             page_generation: m.page_generation,

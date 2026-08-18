@@ -17,8 +17,8 @@
 //!    sticky latch — the latch exists only for the window where the object-list
 //!    entry is transiently missing, and preferring it has twice routed a
 //!    dual-mapping composite onto one mapping.
-//! 3. **Type-4 surface / type-5 `RefTextureHandle`.** The object-list index is
-//!    the surface id; type-5 wraps type-4 and is what product colour targets
+//! 3. **Surface backing surface / type-5 `RefTextureHandle`.** The object-list index is
+//!    the surface id; type-5 wraps surface backing and is what product colour targets
 //!    actually bind.
 //! 4. **Type-2/3 linear guest VA.** Wallpaper and background intermediates and
 //!    UI intermediate render targets live here, so an IOSurface texture-only resolve drops
@@ -48,7 +48,7 @@
 //! boot `mrt_draw_single` counted **179 123** single-attachment draws reaching
 //! the Vulkan encode, every one of which is a colour attachment this ladder had
 //! already resolved, and `rt_type5_view_same` counted **23 951** attachments
-//! that reached the *bottom* of the type-4/5 rung. Both counters predate the
+//! that reached the *bottom* of the surface backing/5 rung. Both counters predate the
 //! typed refusals and sit on the success side, which is what makes them usable
 //! as a denominator here.
 //!
@@ -58,10 +58,10 @@
 //! background noise.
 
 use super::*;
-/// The colour render target's base format for a **type-4** surface, or nothing.
+/// The colour render target's base format for a **surface backing** surface, or nothing.
 ///
 /// On this arm `m.format == 0` is not "unset", it is a decoded refusal:
-/// [`objects::apply_type4_backing`] is the only writer of it, and it stores 0 for
+/// [`objects::apply_surface_backing`] is the only writer of it, and it stores 0 for
 /// a multi-plane surface and for a single-plane one whose FourCC it does not
 /// know, saying why — "stage/paint must not invent BGRA".
 /// [`objects::iosurface_pixel_format_to_mtl`] repeats it twice more, and the
@@ -89,7 +89,7 @@ use super::*;
 /// than "refused", and BGRA8 is the display contract's stated default for that
 /// case ([`crate::runtime::compute_exec`]'s `or_bgra8` writes the same rule down).
 /// Those are different zeros and only this one is provably a refusal.
-fn rt_type4_base_format(format: u16, mapping_id: u32) -> Option<u16> {
+fn rt_surface_backing_base_format(format: u16, mapping_id: u32) -> Option<u16> {
     if format != 0 {
         return Some(format);
     }
@@ -97,7 +97,7 @@ fn rt_type4_base_format(format: u16, mapping_id: u32) -> Option<u16> {
     if crate::observe::first_sight("rt_base_fmt_declined", mapping_id as u64) {
         crate::observe::fail(format!(
             "rt_base_fmt_declined mapping={mapping_id} \
-             (the mapping's format is the type-4 decoder's multi-plane / \
+             (the mapping's format is the surface backing decoder's multi-plane / \
              unknown-FourCC refusal, so this surface is not a single-format \
              colour attachment and no format is invented for it)"
         ));
@@ -105,7 +105,7 @@ fn rt_type4_base_format(format: u16, mapping_id: u32) -> Option<u16> {
     None
 }
 
-/// The format a type-4 colour attachment is **declared** in.
+/// The format a surface backing colour attachment is **declared** in.
 ///
 /// A type-5 object is a texture view over the surface allocation, and its format
 /// is attachment state: the UNORM and sRGB spellings name identical stored bytes
@@ -146,7 +146,7 @@ fn rt_type4_base_format(format: u16, mapping_id: u32) -> Option<u16> {
 /// A view format whose texel is a different *width* from the base's is not a
 /// reinterpretation of one allocation at all, so [`effective_view_sample_format`]
 /// refuses it and the base format stands.
-fn rt_type4_declared_format(
+fn rt_surface_backing_declared_format(
     base_fmt: u16,
     base_extent: (u32, u32),
     type5_view: Option<objects::Type5TextureView>,
@@ -424,31 +424,31 @@ pub(super) enum RenderTargetCause {
     /// The type-5 header names surface 0, so it wraps nothing.
     Type5SurfaceZero,
 
-    /// A mip>0 view of a type-4 surface. Colour RT materialization is level 0
+    /// A mip>0 view of a surface backing surface. Colour RT materialization is level 0
     /// only.
-    Type4MipView { surface_id: u32, level: u32 },
+    SurfaceBackingMipView { surface_id: u32, level: u32 },
     /// The surface's backing could not be resolved.
-    Type4Unresolved {
+    SurfaceBackingUnresolved {
         surface_id: u32,
         live_type: Option<ObjectKind>,
     },
     /// The surface resolved and left no mapping under its id.
-    Type4NoMapping { surface_id: u32 },
+    SurfaceBackingNoMapping { surface_id: u32 },
     /// The surface's mapping has no geometry, a zero dimension, or no pages.
-    Type4Geometry {
+    SurfaceBackingGeometry {
         surface_id: u32,
         has_geom: bool,
         width: u32,
         height: u32,
         pages: usize,
     },
-    /// The type-4 decoder refused this surface a format — multi-plane, or a
-    /// FourCC it has no contract for. [`rt_type4_base_format`] carries the
+    /// The surface backing decoder refused this surface a format — multi-plane, or a
+    /// FourCC it has no contract for. [`rt_surface_backing_base_format`] carries the
     /// argument for why no format is invented here; this is the ladder
     /// recording that it stopped there.
-    Type4BaseFormat { surface_id: u32, raw_fmt: u16 },
+    SurfaceBackingBaseFormat { surface_id: u32, raw_fmt: u16 },
     /// The surface's format is not one Metal can render into.
-    Type4Format { surface_id: u32, fmt: u16 },
+    SurfaceBackingFormat { surface_id: u32, fmt: u16 },
 
     /// The guest has put nothing under this ref. Expected while a task's object
     /// list is still being populated, which is why it is reported and not
@@ -532,12 +532,12 @@ impl crate::observe::Decline for RenderTargetRefusal {
             C::Type5DescRead => crate::observe::ladder_slug!("rt_type5", desc_read),
             C::Type5DescDecode { .. } => crate::observe::ladder_slug!("rt_type5", desc_decode),
             C::Type5SurfaceZero => "rt_type5_surface_zero",
-            C::Type4MipView { .. } => "rt_type4_mip_view",
-            C::Type4Unresolved { .. } => "rt_type4_unresolved",
-            C::Type4NoMapping { .. } => "rt_type4_no_mapping",
-            C::Type4Geometry { .. } => "rt_type4_geometry",
-            C::Type4BaseFormat { .. } => "rt_type4_base_format",
-            C::Type4Format { .. } => "rt_type4_format",
+            C::SurfaceBackingMipView { .. } => "rt_surface_backing_mip_view",
+            C::SurfaceBackingUnresolved { .. } => "rt_surface_backing_unresolved",
+            C::SurfaceBackingNoMapping { .. } => "rt_surface_backing_no_mapping",
+            C::SurfaceBackingGeometry { .. } => "rt_surface_backing_geometry",
+            C::SurfaceBackingBaseFormat { .. } => "rt_surface_backing_base_format",
+            C::SurfaceBackingFormat { .. } => "rt_surface_backing_format",
             C::NoListEntry => crate::observe::ladder_slug!("rt", no_list_entry),
             C::WrongType { .. } => crate::observe::ladder_slug!("rt", wrong_type),
             C::LinearDescRead => crate::observe::ladder_slug!("rt_linear", desc_read),
@@ -588,11 +588,11 @@ impl crate::observe::Decline for RenderTargetRefusal {
                 v.push(("fmt", format!("{fmt:#x}")));
             }
             C::Type5DescDecode { len } => v.push(("desc_len", len.to_string())),
-            C::Type4MipView { surface_id, level } => {
+            C::SurfaceBackingMipView { surface_id, level } => {
                 v.push(("sid", surface_id.to_string()));
                 v.push(("level", level.to_string()));
             }
-            C::Type4Unresolved {
+            C::SurfaceBackingUnresolved {
                 surface_id,
                 live_type,
             } => {
@@ -602,8 +602,8 @@ impl crate::observe::Decline for RenderTargetRefusal {
                     live_type.map_or_else(|| "none".to_string(), |t| t.to_string()),
                 ));
             }
-            C::Type4NoMapping { surface_id } => v.push(("sid", surface_id.to_string())),
-            C::Type4Geometry {
+            C::SurfaceBackingNoMapping { surface_id } => v.push(("sid", surface_id.to_string())),
+            C::SurfaceBackingGeometry {
                 surface_id,
                 has_geom,
                 width,
@@ -615,14 +615,14 @@ impl crate::observe::Decline for RenderTargetRefusal {
                 v.push(("dims", format!("{width}x{height}")));
                 v.push(("pages", pages.to_string()));
             }
-            C::Type4BaseFormat {
+            C::SurfaceBackingBaseFormat {
                 surface_id,
                 raw_fmt,
             } => {
                 v.push(("sid", surface_id.to_string()));
                 v.push(("raw_fmt", format!("{raw_fmt:#x}")));
             }
-            C::Type4Format { surface_id, fmt } => {
+            C::SurfaceBackingFormat { surface_id, fmt } => {
                 v.push(("sid", surface_id.to_string()));
                 v.push(("fmt", format!("{fmt:#x}")));
             }
@@ -768,7 +768,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     // The level the pass names is relative to the texture it names, so a pass
     // rendering into level 1 of a view whose own range starts at level 2 lands
     // on the base texture's level 3. Both halves reach every rung below as one
-    // number, which is what keeps the IOSurface texture and type-4 rungs — neither of
+    // number, which is what keeps the IOSurface texture and surface backing rungs — neither of
     // which has a mip layout — refusing an attachment level as loudly as they
     // already refuse a view level.
     let level = view_level.checked_add(att.level).ok_or(
@@ -853,8 +853,8 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             }
             .at(resolved_ref));
         }
-        // Not `rt_type4_base_format`: an IOSurface texture mapping's format has
-        // writers other than the type-4 decoder, so 0 here can mean "not
+        // Not `rt_surface_backing_base_format`: an IOSurface texture mapping's format has
+        // writers other than the surface backing decoder, so 0 here can mean "not
         // latched yet" rather than "refused", and BGRA8 is the display
         // contract's default for that case. See that function.
         let base_fmt = if m.format != 0 {
@@ -874,14 +874,14 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             sample_count: 1,
         });
     }
-    // x86 Ventura/Tahoe type-4 surface/backing (present IOSurface). Object-list
+    // x86 Ventura/Tahoe surface backing surface/backing (present IOSurface). Object-list
     // index == surface_id (ResourceHeap addObject type=4 objectId=getSurfaceID).
     // Without this, clear-only streams and Store writebacks never touch display
     // mids — guest pages stay empty and dual-mid thrash paints black.
-    // Type-4: object-list index is surface_id. Type-5 RefTextureHandle: surfaceID@0
-    // (allocateRefTextureHandle) — product color RTs are type-5 wrapping type-4.
+    // Surface backing: object-list index is surface_id. Type-5 RefTextureHandle: surfaceID@0
+    // (allocateRefTextureHandle) — product color RTs are type-5 wrapping surface backing.
     let mut type5_view: Option<objects::Type5TextureView> = None;
-    let type4_sid = match live.as_ref() {
+    let surface_backing_sid = match live.as_ref() {
         Some(e) if e.kind == ObjectKind::SurfaceBacking => Some(resolved_ref),
         Some(e) if e.kind == ObjectKind::IOSurfacePlaneView => {
             let desc = objects::read_descriptor(state, host, task_id, e)
@@ -898,12 +898,12 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         }
         _ => None,
     };
-    if let Some(surface_id) = type4_sid {
+    if let Some(surface_id) = surface_backing_sid {
         if level != 0 {
-            return Err(C::Type4MipView { surface_id, level }.at(resolved_ref));
+            return Err(C::SurfaceBackingMipView { surface_id, level }.at(resolved_ref));
         }
-        if !objects::resolve_type4_surface(state, host, surface_id) {
-            return Err(C::Type4Unresolved {
+        if !objects::resolve_surface_backing(state, host, surface_id) {
+            return Err(C::SurfaceBackingUnresolved {
                 surface_id,
                 live_type,
             }
@@ -912,9 +912,9 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         let m = state
             .mappings
             .get(&surface_id)
-            .ok_or(C::Type4NoMapping { surface_id }.at(resolved_ref))?;
+            .ok_or(C::SurfaceBackingNoMapping { surface_id }.at(resolved_ref))?;
         if !m.has_geom || m.width == 0 || m.height == 0 || m.page_entries.is_empty() {
-            return Err(C::Type4Geometry {
+            return Err(C::SurfaceBackingGeometry {
                 surface_id,
                 has_geom: m.has_geom,
                 width: m.width,
@@ -927,17 +927,21 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         if live_type == Some(ObjectKind::IOSurfacePlaneView) {
             note_rt_type5_view(type5_view, surface_id, (base_w, base_h, base_raw_fmt));
         }
-        let base_fmt = rt_type4_base_format(base_raw_fmt, surface_id).ok_or(
-            C::Type4BaseFormat {
+        let base_fmt = rt_surface_backing_base_format(base_raw_fmt, surface_id).ok_or(
+            C::SurfaceBackingBaseFormat {
                 surface_id,
                 raw_fmt: base_raw_fmt,
             }
             .at(resolved_ref),
         )?;
-        let fmt =
-            rt_type4_declared_format(base_fmt, (base_w, base_h), type5_view, view_fmt_override);
+        let fmt = rt_surface_backing_declared_format(
+            base_fmt,
+            (base_w, base_h),
+            type5_view,
+            view_fmt_override,
+        );
         if pixel_format::render_target_bpp(fmt).is_none() {
-            return Err(C::Type4Format { surface_id, fmt }.at(resolved_ref));
+            return Err(C::SurfaceBackingFormat { surface_id, fmt }.at(resolved_ref));
         }
         // mapping_id = surface_id; no linear GVA.
         return Ok(ResolvedRenderTarget {
@@ -1163,33 +1167,33 @@ mod tests {
         );
     }
 
-    /// A type-4 colour attachment whose mapping carries the decoder's format
+    /// A surface backing colour attachment whose mapping carries the decoder's format
     /// refusal must be declined, and every decline must be counted.
     ///
-    /// `m.format == 0` on a type-4 mapping has exactly one writer,
-    /// `apply_type4_backing`, and it means multi-plane or unknown FourCC — a surface
+    /// `m.format == 0` on a surface backing mapping has exactly one writer,
+    /// `apply_surface_backing`, and it means multi-plane or unknown FourCC — a surface
     /// that is not a single-format colour attachment. Inventing BGRA8 from it
     /// describes the wrong stride over the wrong bytes and every downstream window
     /// is built from the answer. The counter has to fire on the refusal and only on
     /// it: one that also fired on ordinary formats would answer a different question
     /// and read identically.
     #[test]
-    fn a_type4_render_target_declines_the_decoders_format_refusal() {
+    fn a_surface_backing_render_target_declines_the_decoders_format_refusal() {
         use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
         use crate::runtime::drain::store_route_count;
 
         let before = store_route_count("rt_base_fmt_declined");
         // A format the decoder resolved is passed through untouched and uncounted.
         assert_eq!(
-            rt_type4_base_format(MTL_FORMAT_BGRA8_UNORM, 11),
+            rt_surface_backing_base_format(MTL_FORMAT_BGRA8_UNORM, 11),
             Some(MTL_FORMAT_BGRA8_UNORM)
         );
         assert_eq!(store_route_count("rt_base_fmt_declined"), before);
         // The refusal declines, and is counted per occurrence — the fail line is
         // deduped per mapping, the counter is not.
-        assert_eq!(rt_type4_base_format(0, 11), None);
-        assert_eq!(rt_type4_base_format(0, 12), None);
-        assert_eq!(rt_type4_base_format(0, 11), None);
+        assert_eq!(rt_surface_backing_base_format(0, 11), None);
+        assert_eq!(rt_surface_backing_base_format(0, 12), None);
+        assert_eq!(rt_surface_backing_base_format(0, 11), None);
         assert_eq!(store_route_count("rt_base_fmt_declined"), before + 3);
     }
 
@@ -1224,7 +1228,7 @@ mod tests {
 
         // The defect: an sRGB view over a linear base must attach sRGB.
         assert_eq!(
-            rt_type4_declared_format(
+            rt_surface_backing_declared_format(
                 MTL_FORMAT_BGRA8_UNORM,
                 extent,
                 view(300, 300, MTL_FORMAT_BGRA8_UNORM_SRGB),
@@ -1234,12 +1238,12 @@ mod tests {
         );
         // A surface bound without a view keeps the mapping's own format.
         assert_eq!(
-            rt_type4_declared_format(MTL_FORMAT_BGRA8_UNORM, extent, None, None),
+            rt_surface_backing_declared_format(MTL_FORMAT_BGRA8_UNORM, extent, None, None),
             MTL_FORMAT_BGRA8_UNORM
         );
         // A view that agrees says nothing new.
         assert_eq!(
-            rt_type4_declared_format(
+            rt_surface_backing_declared_format(
                 MTL_FORMAT_BGRA8_UNORM,
                 extent,
                 view(300, 300, MTL_FORMAT_BGRA8_UNORM),
@@ -1251,7 +1255,7 @@ mod tests {
         // takes the base mapping's geometry, so lifting the format alone would
         // attach a reinterpretation to a grid that is not its own.
         assert_eq!(
-            rt_type4_declared_format(
+            rt_surface_backing_declared_format(
                 MTL_FORMAT_BGRA8_UNORM,
                 extent,
                 view(75, 300, MTL_FORMAT_RGBA16_FLOAT),
@@ -1262,7 +1266,7 @@ mod tests {
         // A same-extent view whose texel is a different width is not a
         // reinterpretation of one allocation, and the base format stands.
         assert_eq!(
-            rt_type4_declared_format(
+            rt_surface_backing_declared_format(
                 MTL_FORMAT_BGRA8_UNORM,
                 extent,
                 view(300, 300, MTL_FORMAT_RGBA16_FLOAT),
@@ -1273,13 +1277,18 @@ mod tests {
         // A zero format is the type-5 decoder saying it has none, not a
         // declaration of format zero.
         assert_eq!(
-            rt_type4_declared_format(MTL_FORMAT_BGRA8_UNORM, extent, view(300, 300, 0), None),
+            rt_surface_backing_declared_format(
+                MTL_FORMAT_BGRA8_UNORM,
+                extent,
+                view(300, 300, 0),
+                None
+            ),
             MTL_FORMAT_BGRA8_UNORM
         );
         // A type-8 view is a further reinterpretation the guest asked for on top,
         // so it outranks the type-5 record.
         assert_eq!(
-            rt_type4_declared_format(
+            rt_surface_backing_declared_format(
                 MTL_FORMAT_BGRA8_UNORM,
                 extent,
                 view(300, 300, MTL_FORMAT_BGRA8_UNORM_SRGB),
@@ -1376,9 +1385,9 @@ mod tests {
     ///
     /// This is the terminal-rung property. The IOSurface texture arm used to return only
     /// when the *live* list said IOSurface; a latch-only attempt that failed
-    /// geometry fell through to the type-4 and linear rungs instead. It could
+    /// geometry fell through to the surface backing and linear rungs instead. It could
     /// not resolve there — `live_type` is `None` in that arm by construction,
-    /// so `type4_sid` is `None` and the linear rung's first act is to unwrap
+    /// so `surface_backing_sid` is `None` and the linear rung's first act is to unwrap
     /// the entry that is not there. The fall-through therefore changed nothing
     /// about the outcome and everything about the diagnosis: the ladder
     /// reported `no_list_entry` for a surface whose mapping it had already
@@ -1421,7 +1430,7 @@ mod tests {
     ///
     /// The guest re-issues the same pass every frame, so this path is entered
     /// at draw rate. The two ad-hoc lines this ladder used to emit had no latch
-    /// at all — one of them on the type-4 rung, which a compositing workload
+    /// at all — one of them on the surface backing rung, which a compositing workload
     /// takes for every desktop surface.
     #[test]
     fn a_repeated_refusal_on_the_same_attachment_reports_once() {

@@ -350,7 +350,7 @@ fn vouch_for_write<M: HostMemory + HostOps>(
 /// PFNs, cached on the mapping and returned again on every later call. Its own
 /// doc states the contract — "always revalidate first so a cached contig never
 /// aliases PFNs after ReplacePhysical / guest recycle" — but the revalidation it
-/// names cannot deliver that for a type-4 surface: with no `MappingInternal` it
+/// names cannot deliver that for a surface backing surface: with no `MappingInternal` it
 /// re-resolves nothing and answers "resolvable" on a non-empty list alone. So a
 /// writer holding this pointer is holding whatever those PFNs became, and a
 /// full white frame poked through it is the `0xff`-filled freed guest heap the
@@ -1814,7 +1814,7 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     crate::runtime::surface_cache::store(state, mapping_id, mw, mh, cache);
     // This write just made the host copy and the guest pages agree, so it is the
     // moment the copy's currency can be pinned. Nothing else arms this mapping:
-    // the type-4 sampled ladder's first census read `gw_no_stamp` 14 092 against
+    // the surface backing sampled ladder's first census read `gw_no_stamp` 14 092 against
     // `gw_clean` 0 because only the Vulkan Store rails ever stamped, and the
     // copy that rung serves is written here. Unstamped, the reader cannot tell a
     // surface the guest has rewritten from one it has not, and must assume the

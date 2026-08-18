@@ -1108,7 +1108,7 @@ mod tests {
     /// The rail's whole shape is that the destination is not knowable from the
     /// call — it is whatever the task's page table says at write time — so the
     /// footprint has to be marked from the *resolved* GPA. Marking from the GVA
-    /// instead would be the same substitution the type-4 identity guard exists
+    /// instead would be the same substitution the surface backing identity guard exists
     /// to refuse, and it would fill the set with addresses in low guest RAM,
     /// which is exactly where the panic census's victims live. Every such frame
     /// would then read as a hit.

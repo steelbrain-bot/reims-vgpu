@@ -3385,9 +3385,9 @@ fn present_named_mapping<H: HostMemory + HostOps>(
     state.present.present_mapping = mapping;
     state.present.host_mapping = mapping;
     state.present.valid = true;
-    // x86: present surface_id → type-4 object-list slot (heap index =
+    // x86: present surface_id → surface backing object-list slot (heap index =
     // IOSurface getSurfaceID). Arm: MappingInternal page-table resolve.
-    // Always attempt type-4 when pages empty; then iosfc/mapper path.
+    // Always attempt surface backing when pages empty; then iosfc/mapper path.
     let _ = crate::runtime::objects::ensure_surface_for_present(state, host, mapping);
     let force = state
         .mappings

@@ -316,7 +316,7 @@ pub fn capture_present_frame(
         state.present.capture_scratch = buf;
         return false;
     }
-    // Capture provenance, and there are only two sources to name: the type-4
+    // Capture provenance, and there are only two sources to name: the surface backing
     // surface_cache hit, or the resident. Reaching here with `!from_host_cache`
     // means `try_capture_from_resident` returned true above, and it returns true
     // and there is no third source. This used to read a `last_paint_src`

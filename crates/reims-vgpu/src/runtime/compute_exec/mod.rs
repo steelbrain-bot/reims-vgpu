@@ -1869,7 +1869,7 @@ pub(crate) fn resident_serve(
 /// Load tight raw texels for a compute texture binding (type-2/3, type-5→surface, or IOSurface texture).
 ///
 /// Type-5 (`RefTextureHandle`) is the live CI wallpaper path (`compute_stage_tex … ot=5`).
-/// RE (type-5 wire + `runtime::draw` sample path): surfaceID@0 is a type-4 object id (= mapping
+/// RE (type-5 wire + `runtime::draw` sample path): surfaceID@0 is a surface backing object id (= mapping
 /// mid). Product draw samples call [`objects::ensure_surface_for_present`] on that id and
 /// stage from the **mapping registry**, never re-resolving the surface id through the
 /// compute task's object list (that list uses a separate texture-ref namespace — live
@@ -1886,18 +1886,18 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     // Type-5 RefTextureHandle → surface_id (live CI binds ot5).
     let mut stage_ref = texture_ref;
     let mut from_type5 = false;
-    let mut from_type4_direct = false;
+    let mut from_surface_backing_direct = false;
     let mut type5_record: Option<objects::Type5TextureView> = None;
     let mut view_level = 0;
     let mut view_pixel_format = None;
     let mut heap_texture = None;
     // A linear texture object (type-2/3) must resolve through its own
     // descriptor, never through the mapping registry: its numeric ref shares
-    // the id space with type-4 surface mids, so the `mappings.contains(ref)`
+    // the id space with surface backing surface mids, so the `mappings.contains(ref)`
     // fallback below would wrongly grab a same-numbered surface (live class:
     // `ref=N ot=2` dragged into the IOSurface texture path and failing silently against
     // the biplanar wallpaper mid). Same collision the type-5 path documents.
-    // Resolve the object-list entry once: `ref_is_linear` and the type5/type4
+    // Resolve the object-list entry once: `ref_is_linear` and the type5/surface_backing
     // classification below both read it for the same ref, and the guest object
     // list is immutable for the life of the dispatch (the device never writes
     // those pages). `ListObjectEntry` is `Copy`, so one guest-DMA read+decode
@@ -2184,15 +2184,15 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                 }
             }
         } else if entry.kind == ObjectKind::SurfaceBacking {
-            // Direct type-4 surface bind (same id space as present mids).
-            from_type4_direct = true;
+            // Direct surface backing surface bind (same id space as present mids).
+            from_surface_backing_direct = true;
             let _ = objects::ensure_surface_for_present(state, host, stage_ref);
         }
     }
 
-    // Type-5 / direct type-4: surface id **is** the mapping mid. Never call
+    // Type-5 / direct surface backing: surface id **is** the mapping mid. Never call
     // resolve_iosurface_texture_ref(task, sid) — task object-list indices collide with texture refs.
-    let mapping_id_opt = if from_type5 || from_type4_direct {
+    let mapping_id_opt = if from_type5 || from_surface_backing_direct {
         if stage_ref != 0 && state.mappings.contains_key(&stage_ref) {
             Some(stage_ref)
         } else {
@@ -2200,7 +2200,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         }
     } else if ref_is_linear {
         // Linear texture: never fall back to the mapping registry (id-space
-        // collision with type-4 surface mids). Force the type-2/3 path.
+        // collision with surface backing surface mids). Force the type-2/3 path.
         None
     } else {
         objects::resolve_iosurface_texture_ref(state, host, task_id, stage_ref).or_else(|| {
@@ -2224,7 +2224,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         // Geom/format: a type-5 record is the exact Metal texture view over
         // the IOSurface bytes. It is authoritative even for a stageable
         // single-plane mapping: the live BGRA8 desktop target is exposed as a
-        // row-byte-equivalent, quarter-width RGBA32Uint view. Type-4 direct
+        // row-byte-equivalent, quarter-width RGBA32Uint view. Surface backing direct
         // refs use base mapping geometry. IOSurface texture refs may prefer the
         // IOSurface descriptor on this task's object list.
         if view_level != 0 {
@@ -2235,7 +2235,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                 "compute_view_iosurface_texture_mip",
             ));
         }
-        let (width, height, format) = if from_type5 || from_type4_direct {
+        let (width, height, format) = if from_type5 || from_surface_backing_direct {
             let m = state
                 .mappings
                 .get(&mapping_id)
@@ -2382,7 +2382,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         #[cfg(feature = "backend-vulkan")]
         let mut seed_generation = m.content_generation;
         let pages_n = m.page_entries.len();
-        // Wire type-4 `length` (page-aligned getResidentSize), stashed as device_desc.alloc_size.
+        // Wire surface backing `length` (page-aligned getResidentSize), stashed as device_desc.alloc_size.
         // Independent of plane w/h and of MapMemory2 IOAccelMemory length — measure-only.
         let wire_len = crate::contract::iosurface_pages::decode_device_surface(&m.device_desc)
             .map(|s| s.alloc_size as u64)

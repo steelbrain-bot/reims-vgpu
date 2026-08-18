@@ -146,7 +146,7 @@ pub fn read_task_gva_by_id<M: HostMemory>(
 ///
 /// There is exactly one such shape in this device and it is worth naming,
 /// because using the loud read for it put 18 lines per boot on the fail channel
-/// that meant nothing. `objects::type4_probe_order` walks the live tasks asking
+/// that meant nothing. `objects::surface_backing_probe_order` walks the live tasks asking
 /// "does this one own surface N?", and a task that does not own it has no entry
 /// at that slot — so the walk *must* miss on every task before the owner. The
 /// miss is how the search works.

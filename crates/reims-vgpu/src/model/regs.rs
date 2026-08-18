@@ -185,7 +185,7 @@ pub fn accept_child_channel(channel_id: u32, site: &'static str) -> bool {
 /// sentinel-aware reader will ever consult.
 ///
 /// Four callers knew that and six did not: `runtime::texture` and the two
-/// type-4 backing paths in `runtime::objects` refused zero, while the five
+/// surface backing backing paths in `runtime::objects` refused zero, while the five
 /// `DeviceState` mutators and `mapper::capture_published_request` bounded the
 /// id from above only.
 ///
@@ -197,7 +197,7 @@ pub fn accept_child_channel(channel_id: u32, site: &'static str) -> bool {
 /// full `u32`, and no other structure in the device is sized by mapping id — so
 /// the bound allocated nothing, protected nothing, and its only effect was that
 /// a guest naming id 4096 had its MAP, UNMAP, MappingInternal attach, device
-/// descriptor and geometry silently refused, and every type-4 surface backing
+/// descriptor and geometry silently refused, and every surface backing surface backing
 /// with it. A mapping id is a full `u32` on the wire; the guest chooses it and
 /// the device is not entitled to an opinion about how large it is.
 ///

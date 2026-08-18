@@ -2841,10 +2841,10 @@ pub fn note_drain_tranche(
             crate::observe::off(routes);
         }
         // Beside `store_routes` deliberately: the two are read against each
-        // other. `type4_backing_fail` lines equal `type4_backing_recovered +
-        // type4_backing_superseded` from that line plus this one's `n`, and a
+        // other. `surface_backing_fail` lines equal `surface_backing_recovered +
+        // surface_backing_superseded` from that line plus this one's `n`, and a
         // refusal that never recovered is only visible as the residue.
-        if let Some(outstanding) = crate::runtime::objects::type4_backing_outstanding_census() {
+        if let Some(outstanding) = crate::runtime::objects::surface_backing_outstanding_census() {
             crate::observe::off(outstanding);
         }
         // The same reason and the same place: `store_routes` counts the watches

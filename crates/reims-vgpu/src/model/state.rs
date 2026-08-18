@@ -504,7 +504,7 @@ pub struct TaskEntry {
 /// for one of them to have branched on.
 ///
 /// The two full-range probes in `runtime::objects` are the visible win.
-/// `type4_claimant_tasks` walked all 256 ids and `type4_probe_order` chained
+/// `surface_backing_claimant_tasks` walked all 256 ids and `surface_backing_probe_order` chained
 /// `1..256`; both now walk the live ids, because the ids in between were
 /// refused by the liveness test at the probe and contributed nothing. Same
 /// answer, and the walk is the size of the guest's task set instead of a
@@ -2035,12 +2035,12 @@ pub struct MapperCapture {
 }
 
 /// The guest page table and GPU-VA base a mapping's [`MappingEntry::
-/// page_entries`] were walked from, when the list came from a type-4 surface
+/// page_entries`] were walked from, when the list came from a surface backing surface
 /// plan.
 ///
 /// Latched at the one site that assigns those entries so the two cannot drift
 /// apart. It exists so a later reader can *repeat* the walk without repeating
-/// the search: `resolve_type4_surface_ex` finds the surface object by probing up
+/// the search: `resolve_surface_backing_ex` finds the surface object by probing up
 /// to 256 task object lists, and that cost is why the page list is cached rather
 /// than re-derived. The walk itself is cheap — one page-table translation per
 /// page — and it is the only thing that can say whether the cached list still
@@ -2051,7 +2051,7 @@ pub struct MapperCapture {
 /// walk is unusable by construction rather than by every future writer
 /// remembering to retire a second field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Type4Walk {
+pub struct SurfaceBackingWalk {
     /// Task whose page table translated the backing pages.
     pub task_id: u32,
     /// `getGPUVirtualAddress() >> page_shift` of the surface backing — page `i`
@@ -2297,22 +2297,22 @@ pub struct MappingEntry {
     /// Without it every caller repeats a host mapping attempt that cannot
     /// become possible until the guest changes the list.
     pub contig_refused_gen: Option<u32>,
-    /// Task id that last owned this surface as a type-4 `OBJECT_TYPE_SURFACE`
+    /// Task id that last owned this surface as a surface backing `OBJECT_TYPE_SURFACE`
     /// object (0 = no non-trivial hint; task 0 is always probed first anyway).
-    /// `resolve_type4_surface_ex` probes this task right after task 0 so a
+    /// `resolve_surface_backing_ex` probes this task right after task 0 so a
     /// per-bind present-path scan short-circuits instead of walking all 256
     /// task slots. Purely a search-order hint — a stale/wrong value only costs
     /// one extra probe before the full-table fallback re-finds the owner.
     pub owner_task_hint: u32,
-    /// How [`Self::page_entries`] were derived, when they came from a type-4
-    /// surface plan — see [`Type4Walk`]. `None` for every other source, and for
+    /// How [`Self::page_entries`] were derived, when they came from a surface backing
+    /// surface plan — see [`SurfaceBackingWalk`]. `None` for every other source, and for
     /// a mapping whose list has been invalidated.
     ///
     /// Distinct from [`Self::owner_task_hint`], which is a *search* hint and is
     /// allowed to be wrong. This is a statement about the list that is in the
     /// entry right now: repeat this walk and you must get these entries back, or
     /// the guest has moved the surface underneath us without saying so.
-    pub type4_walk: Option<Type4Walk>,
+    pub surface_backing_walk: Option<SurfaceBackingWalk>,
 }
 
 impl MappingEntry {
@@ -3109,7 +3109,7 @@ pub struct DeviceState {
     /// `(task_id, texture_ref)`.
     ///
     /// Object-list refs are local to a task. Separate from
-    /// [`Self::host_surfaces`] so list ids cannot clobber type-4 present mids,
+    /// [`Self::host_surfaces`] so list ids cannot clobber surface backing present mids,
     /// and task-qualified so one address space cannot replace or evict another
     /// task's same-numbered texture.
     pub host_texture_surfaces: BTreeMap<(u32, u32), HostSurface>,
@@ -4249,7 +4249,7 @@ impl DeviceState {
         e.page_entries.clear();
         e.page_table_kva = 0;
         e.condemned_entries = None;
-        e.type4_walk = None;
+        e.surface_backing_walk = None;
         Self::bump_page_generation(e);
         let (retired, retired_import) = Self::take_mapping_view(e);
         if let Some(view) = retired {
@@ -4292,7 +4292,7 @@ impl DeviceState {
         // page list that just stopped being this surface's.
         //
         // Retiring the guest-write token is what makes that reachable rather
-        // than theoretical. The type-4 sampled ladder's host-cache rung serves
+        // than theoretical. The surface backing sampled ladder's host-cache rung serves
         // its copy unless the witness reports `Wrote`, and a retired token
         // reports `NoStamp` — deliberately not evidence, because "nobody armed
         // this" is a statement about this device and not about the guest. The

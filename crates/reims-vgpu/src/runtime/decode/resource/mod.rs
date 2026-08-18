@@ -557,7 +557,7 @@ pub(crate) const TEXTURE_DESC_BASE_LEN: usize =
 /// Mip level records this device will read from a texture descriptor.
 ///
 /// A **corruption guard, not a capacity choice** — the same kind of bound as
-/// `wire::device_desc::TYPE4_PLANE_CAP`, and it is written here because nothing
+/// `wire::device_desc::SURFACE_BACKING_PLANE_CAP`, and it is written here because nothing
 /// else in this file said so. A pyramid of 16 levels has a base of 2^15 = 32768
 /// pixels in its largest dimension, which is above every Metal texture-size
 /// limit, so a descriptor declaring more levels than this describes a texture
@@ -3708,10 +3708,10 @@ const TYPE7_MIN_LEN: usize = 17;
 /// **Unused on the x86 PCI pathway.** A probe placed at the top of this function
 /// — before the length check, so a short record would also report — emitted
 /// nothing across a full interactive session. IOSurface texture geometry on that pathway
-/// is latched from the **type-4** surface backing descriptor instead
-/// (`runtime/objects`, `decode_type4_surface` -> `set_mapping_geom`). Do not
+/// is latched from the **surface backing** surface backing descriptor instead
+/// (`runtime/objects`, `decode_surface_backing` -> `set_mapping_geom`). Do not
 /// reason about what the guest tells us at surface-create time from this
-/// decoder without re-confirming it runs; measure `decode_type4_surface`.
+/// decoder without re-confirming it runs; measure `decode_surface_backing`.
 /// Offsets in the IOSurface-texture descriptor. Named rather than
 /// written as hex at the read sites, which is the convention every other
 /// decoder in this file already follows — an offset that appears only as a
@@ -3728,7 +3728,7 @@ pub const IOSURFACE_TEX_HEIGHT: usize = 0x1c;
 /// settle it.** A probe emitting every distinct (length, tail) shape from this
 /// decoder was run against a driven x86 PCI boot and emitted nothing at all,
 /// which confirms rather than contradicts
-/// [`crate::runtime::objects::undecoded_type4_surface_bytes`] — that doc already
+/// [`crate::runtime::objects::undecoded_surface_backing_bytes`] — that doc already
 /// records that this decoder does not run on that pathway. The 0x38/0x58 blobs
 /// are an arm64 phenomenon.
 ///

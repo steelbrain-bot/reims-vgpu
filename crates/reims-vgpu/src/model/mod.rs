@@ -18,9 +18,9 @@ pub use state::{
     ChannelRing, ComputeStorageOrigin, ComputeStorageResidencyKey, DeviceId, DeviceState,
     ExecFault, FailEvent, GfxRegs, GuestLinearMemo, GvaBacking, GvaEvictionWitness, GvaHostView,
     HostLinearTexture, HostSurface, MapperCapture, MappingEntry, PacketFault, PresentBacking,
-    PresentState, RenderFlushWitness, ResourceValidity, SurfaceWriteKind, TaskEntry, TaskResource,
-    TaskResourceLifetimeRef, TaskSamplerState, TaskTable, Type4Walk, UnimplementedCommand,
-    GVA_ENCODE_CACHE_BYTE_CAP, GVA_EVICTION_WITNESS_KEYS,
+    PresentState, RenderFlushWitness, ResourceValidity, SurfaceBackingWalk, SurfaceWriteKind,
+    TaskEntry, TaskResource, TaskResourceLifetimeRef, TaskSamplerState, TaskTable,
+    UnimplementedCommand, GVA_ENCODE_CACHE_BYTE_CAP, GVA_EVICTION_WITNESS_KEYS,
 };
 
 use crate::runtime::{self, host::HostOps};

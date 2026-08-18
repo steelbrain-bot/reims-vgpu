@@ -276,10 +276,10 @@ pub(super) const PASS_EXTENT_SLUGS: [&str; 7] = [
 ///
 /// Both arms of the colour-attachment resolve consume the same wire form and
 /// must be scored the same way; only the mapping id differs, because an IOSurface texture
-/// attachment resolves *to* an id and a type-4 attachment *is* one. This existed
+/// attachment resolves *to* an id and a surface backing attachment *is* one. This existed
 /// on the IOSurface texture arm alone, and the consequence was not that the census
 /// undercounted — it was that the census read **zero** on the whole x86/Vulkan
-/// pathway, where the workload takes the type-4 arm. A pathway-shaped blind spot
+/// pathway, where the workload takes the surface backing arm. A pathway-shaped blind spot
 /// reads exactly like "the guest never states an extent", which is the opposite
 /// of what it does.
 ///
