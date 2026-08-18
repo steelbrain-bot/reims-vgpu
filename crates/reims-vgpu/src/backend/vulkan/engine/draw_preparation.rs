@@ -8,7 +8,7 @@
 
 use crate::backend::vulkan::translate::TranslateReason;
 use crate::runtime::draw::IndexLoadReason;
-use crate::runtime::m2v_cache::M2vCacheDecline;
+use reims_vgpu_vulkan::m2v_cache::M2vCacheDecline;
 use crate::runtime::mtlb::MtlbDecline;
 use reims_vgpu_observe::Decline;
 use reims_vgpu_protocol::ObjectKind;
