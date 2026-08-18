@@ -1154,11 +1154,16 @@ name = "reims-vgpu-vulkan"
 version = "0.1.0"
 dependencies = [
  "ash",
+ "ash-window",
  "metal2vulkan",
+ "once_cell",
+ "parking_lot",
+ "raw-window-handle",
  "reims-vgpu-config",
  "reims-vgpu-core",
  "reims-vgpu-memory",
  "reims-vgpu-observe",
+ "reims-vgpu-paging",
  "reims-vgpu-protocol",
  "reims-vgpu-wire",
 ]

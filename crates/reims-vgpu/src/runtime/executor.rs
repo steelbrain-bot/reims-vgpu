@@ -17,26 +17,6 @@ pub use reims_vgpu_core::{
     SubmissionContext, TargetReadback,
 };
 
-impl ResidentLease for crate::backend::vulkan::engine::ResidentResourceLease {
-    fn matches(&self, identity: &TargetIdentity) -> bool {
-        self.matches(identity)
-    }
-
-    fn backing(&self) -> ResidentContentBacking {
-        self.backing()
-    }
-}
-
-impl ReadbackLease for crate::backend::vulkan::engine::LeasedFrame {
-    fn bytes(&self) -> &[u8] {
-        self.bytes()
-    }
-
-    fn is_bgra(&self) -> bool {
-        self.bgra
-    }
-}
-
 /// Dynamic executor-session scope for one device operation.
 pub struct ExecutionScope {
     _engine: Option<crate::backend::vulkan::engine::SessionScope>,

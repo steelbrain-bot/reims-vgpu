@@ -66,6 +66,17 @@ pub unsafe fn query(
     }
 }
 
+/// Query push descriptors with the operator's capability-narrowing switch.
+pub unsafe fn query_configured(
+    instance: &ash::Instance,
+    pd: vk::PhysicalDevice,
+    has_extension: &dyn Fn(&std::ffi::CStr) -> bool,
+) -> PushDescriptorCaps {
+    let enabled = reims_vgpu_config::switch(reims_vgpu_config::PUSH_DESCRIPTORS)
+        != reims_vgpu_config::Switch::Off;
+    unsafe { query(instance, pd, has_extension, enabled) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -331,6 +331,30 @@ pub unsafe fn query(
     }
 }
 
+/// Query host-pointer importability with the operator's capability-narrowing
+/// switch applied.
+pub unsafe fn query_configured(
+    instance: &ash::Instance,
+    pd: vk::PhysicalDevice,
+    has_extension: &dyn Fn(&std::ffi::CStr) -> bool,
+    max_allocation: u64,
+) -> HostPointerCaps {
+    use reims_vgpu_config::{read, Switch, GUEST_IMPORT};
+    let override_value = match read(GUEST_IMPORT) {
+        (Switch::Off, _) => Some(HostPointerImport::DisabledByEnv),
+        (Switch::Unrecognized, value) => {
+            reims_vgpu_observe::fail(format!(
+                "vk_guest_import_env_unrecognized var={GUEST_IMPORT} value={:?} (expected on|off; \
+                 the rail is left to the device)",
+                value.unwrap_or_default()
+            ));
+            None
+        }
+        (Switch::On | Switch::Unset, _) => None,
+    };
+    unsafe { query(instance, pd, has_extension, max_allocation, override_value) }
+}
+
 /// Why an import could not be given a memory type.
 ///
 /// The two arms are different findings about different halves of the call and a

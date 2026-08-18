@@ -1651,4 +1651,51 @@ mod tests {
             );
         });
     }
+
+    /// The protocol handshake warms each RAMBlock before the first draw can
+    /// demand an import. Skips on hosts where import is unavailable.
+    #[test]
+    fn the_handshake_warm_imports_before_any_draw_references_a_byte() {
+        if !crate::backend::vulkan::engine::host_pointer_import_available_for_test() {
+            eprintln!("skip: no Vulkan host-pointer import");
+            return;
+        }
+
+        const LEN: usize = 16 << 20;
+        let layout = std::alloc::Layout::from_size_align(LEN, 4096).expect("valid layout");
+        let base = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!base.is_null(), "allocation for the stand-in RAMBlock");
+
+        struct OneBlock(u64);
+        impl crate::runtime::host::GuestRamProvider for OneBlock {
+            fn guest_ram_regions(
+                &mut self,
+            ) -> Result<
+                Vec<reims_vgpu_memory::GuestRamRegion>,
+                crate::runtime::host::GuestRamRegionsError,
+            > {
+                Ok(vec![reims_vgpu_memory::GuestRamRegion {
+                    gpa_base: 0,
+                    host_va: self.0,
+                    len: LEN as u64,
+                }])
+            }
+        }
+
+        reset();
+        let before = crate::backend::vulkan::engine::guest_import_census().0;
+        let mut host = OneBlock(base as u64);
+        let executor = crate::runtime::executor::VulkanExecutor::default();
+        let _scope = crate::runtime::executor::SessionService::enter(&executor);
+        warm(&mut host, &executor);
+        let after = crate::backend::vulkan::engine::guest_import_census().0;
+        assert_eq!(after - before, LEN as u64);
+
+        warm(&mut host, &executor);
+        assert_eq!(
+            crate::backend::vulkan::engine::guest_import_census().0,
+            after
+        );
+        reset();
+    }
 }

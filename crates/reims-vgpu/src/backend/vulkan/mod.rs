@@ -18,9 +18,8 @@
 //! decision cannot be made twice with two different answers.
 
 pub mod caps;
-pub mod engine;
-pub mod translate;
 pub use reims_vgpu_vulkan::policy;
+pub use reims_vgpu_vulkan::{engine, translate};
 
 struct DeviceTelemetry;
 

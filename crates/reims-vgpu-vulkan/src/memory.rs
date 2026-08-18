@@ -250,6 +250,21 @@ pub unsafe fn reported_max_allocation_size(
     (v11.max_memory_allocation_size != 0).then_some(v11.max_memory_allocation_size)
 }
 
+/// Query the device-wide allocation ceiling, treating an unreported limit as
+/// heap-bounded while keeping that loss of precision visible.
+pub unsafe fn max_allocation_size(instance: &ash::Instance, pd: vk::PhysicalDevice) -> u64 {
+    match unsafe { reported_max_allocation_size(instance, pd) } {
+        Some(size) => size,
+        None => {
+            reims_vgpu_observe::fail(
+                "vk_max_allocation_unreported reason=vk_max_allocation_unreported (the device \
+                 reported maxMemoryAllocationSize=0; allocations are bounded by their heap alone)",
+            );
+            u64::MAX
+        }
+    }
+}
+
 /// A selected memory type, together with the heap behind it.
 ///
 /// The heap travels with the index because the index alone cannot say whether

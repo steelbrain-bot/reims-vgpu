@@ -28,6 +28,7 @@ host-window = [
     "dep:ash-window",
     "dep:raw-window-handle",
     "backend-vulkan",
+    "reims-vgpu-vulkan/host-window",
 ]
 
 [dependencies]
