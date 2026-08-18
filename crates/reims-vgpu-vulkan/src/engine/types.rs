@@ -1019,12 +1019,9 @@ pub struct SampledImageResource {
     /// as (ignored for [`SampledSource::Target`], which carries its own
     /// resident format).
     ///
-    /// Resolved by `translate::pixel::vk_texel_layout` from the contract
-    /// `TexelLayout` the decode rails speak. Storing the Vulkan format rather
-    /// than the layout keeps one spelling on this side of the boundary and
-    /// leaves room for formats no byte-layout enum can name — an sRGB view
-    /// first among them.
-    pub format: vk::Format,
+    /// Backend-independent storage layout and transfer function. The executor
+    /// converts it once when it creates or selects the image view.
+    pub format: reims_vgpu_protocol::ImageFormat,
     /// Producer metadata used only by sampled working-set instrumentation.
     /// Cache selection always requires exact retained-byte equality.
     pub identity: Option<SampledContentIdentity>,

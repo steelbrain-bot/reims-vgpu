@@ -1247,7 +1247,7 @@ impl SampledKey {
             cube: r.cube,
             arrayed: r.arrayed,
             one_dim: r.one_dim,
-            format: r.format,
+            format: crate::format::vk_image_format(r.format),
             swizzle: r.swizzle,
         }
     }
@@ -3014,7 +3014,9 @@ mod sampled_key_tests {
             source: SampledSource::Bytes(std::sync::Arc::new(Vec::new())),
             content: None,
             byte_origin: Default::default(),
-            format: ash::vk::Format::R8G8B8A8_UNORM,
+            format: reims_vgpu_protocol::ImageFormat::linear(
+                reims_vgpu_protocol::TexelLayout::Rgba8,
+            ),
             identity: None,
             resource_lifetime: None,
             swizzle: SwizzlePlan::default(),

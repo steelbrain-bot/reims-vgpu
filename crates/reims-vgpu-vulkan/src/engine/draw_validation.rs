@@ -153,10 +153,6 @@ pub enum DrawValidationDecline {
         binding: u32,
         layers: u32,
     },
-    SampledNoLinearTexelFootprint {
-        binding: u32,
-        format: vk::Format,
-    },
     SampledBytesLength {
         binding: u32,
         actual: usize,
@@ -270,9 +266,6 @@ impl Decline for DrawValidationDecline {
             Self::SampledShapeConflict { .. } => "vk_draw_validate_sampled_shape_conflict",
             Self::SampledCubeGeometry { .. } => "vk_draw_validate_sampled_cube_geometry",
             Self::SampledNonArrayLayers { .. } => "vk_draw_validate_sampled_nonarray_layers",
-            Self::SampledNoLinearTexelFootprint { .. } => {
-                "vk_draw_validate_sampled_no_linear_texel_footprint"
-            }
             Self::SampledBytesLength { .. } => "vk_draw_validate_sampled_bytes_length",
             Self::UnrepresentableImageBytes { .. } => {
                 "vk_draw_validate_unrepresentable_image_bytes"
@@ -431,10 +424,6 @@ impl Decline for DrawValidationDecline {
             Self::SampledNonArrayLayers { binding, layers } => vec![
                 ("binding", binding.to_string()),
                 ("layers", layers.to_string()),
-            ],
-            Self::SampledNoLinearTexelFootprint { binding, format } => vec![
-                ("binding", binding.to_string()),
-                ("format", format!("{format:?}")),
             ],
             Self::SampledBytesLength {
                 binding,
@@ -645,12 +634,6 @@ mod tests {
                 binding: 32,
                 layers: 2,
             },
-            DrawValidationDecline::SampledNoLinearTexelFootprint {
-                binding: 32,
-                format: crate::translate::pixel::vk_texel_layout(
-                    reims_vgpu_protocol::TexelLayout::Bgra8,
-                ),
-            },
             DrawValidationDecline::SampledBytesLength {
                 binding: 32,
                 actual: 3,
@@ -707,7 +690,7 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 51, "the validator's reason census moved");
+        assert_eq!(before, 50, "the validator's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate draw-validation slug");
     }
 

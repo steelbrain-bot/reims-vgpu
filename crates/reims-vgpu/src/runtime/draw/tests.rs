@@ -290,7 +290,10 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
     else {
         panic!("the mapping stays guest-backed")
     };
-    assert_eq!(iosurface_texture_format, ash::vk::Format::B8G8R8A8_SRGB);
+    assert_eq!(
+        iosurface_texture_format,
+        reims_vgpu_protocol::ImageFormat::srgb(reims_vgpu_protocol::TexelLayout::Bgra8).unwrap()
+    );
     assert!(iosurface_texture_identity.is_some());
     assert_eq!(
         crate::runtime::drain::store_route_count("gw_rail_iosurface"),
@@ -330,7 +333,10 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
     else {
         panic!("the plane view stays guest-backed")
     };
-    assert_eq!(iosurface_plane_view_format, ash::vk::Format::B8G8R8A8_UNORM);
+    assert_eq!(
+        iosurface_plane_view_format,
+        reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Bgra8)
+    );
     assert!(iosurface_plane_view_identity.is_some());
     assert_eq!(
         crate::runtime::drain::store_route_count("gw_rail_t5"),
@@ -1351,7 +1357,7 @@ fn attachment_alias_source_keeps_one_texture_identity() {
         generation: 7,
         format: crate::contract::pixel_format::TexelLayout::Rgba8,
     };
-    let format = ash::vk::Format::R8G8B8A8_UNORM;
+    let format = reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8);
     let clear = attachment_alias_source(
         identity.clone(),
         format,
@@ -1362,8 +1368,8 @@ fn attachment_alias_source_keeps_one_texture_identity() {
         SampledSourceRequest::Attachment(
             ref held,
             AttachmentInitial::Clear([0.25, 0.5, 0.75, 1.0]),
-            ash::vk::Format::R8G8B8A8_UNORM,
-        ) if held == &identity
+            held_format,
+        ) if held == &identity && held_format == format
     ));
 
     assert!(matches!(
@@ -1375,8 +1381,8 @@ fn attachment_alias_source_keeps_one_texture_identity() {
         SampledSourceRequest::Attachment(
             ref held,
             AttachmentInitial::Seed,
-            ash::vk::Format::R8G8B8A8_UNORM,
-        ) if held == &identity
+            held_format,
+        ) if held == &identity && held_format == format
     ));
     assert!(matches!(
         attachment_alias_source(
@@ -1387,8 +1393,8 @@ fn attachment_alias_source_keeps_one_texture_identity() {
         SampledSourceRequest::Attachment(
             ref held,
             AttachmentInitial::DontCare,
-            ash::vk::Format::R8G8B8A8_UNORM,
-        ) if held == &identity
+            held_format,
+        ) if held == &identity && held_format == format
     ));
     let load = attachment_alias_source(identity.clone(), format, AttachmentInitial::Seed);
     let SampledSourceRequest::Attachment(held, AttachmentInitial::Seed, held_format) = load else {
@@ -5272,7 +5278,7 @@ fn sampled_plane_keeps_its_copy_source_and_checks_the_packed_extent() {
             0x1001,
             128,
             crate::contract::pixel_format::TexelLayout::Rgba8,
-            ash::vk::Format::R8G8B8A8_UNORM,
+            reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8,),
             super::vulkan::LinearSampleIdentity {
                 key: 1,
                 generation: 1,
@@ -5294,7 +5300,7 @@ fn sampled_plane_keeps_its_copy_source_and_checks_the_packed_extent() {
         0x2000,
         128,
         crate::contract::pixel_format::TexelLayout::Rgba8,
-        ash::vk::Format::R8G8B8A8_UNORM,
+        reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
         super::vulkan::LinearSampleIdentity {
             key: 1,
             generation: 1,

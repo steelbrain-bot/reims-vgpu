@@ -870,7 +870,7 @@ pub(super) enum SampledSourceRequest {
     /// because a layout is linear by construction. While it was one, every CPU
     /// upload of an sRGB guest texture reached the sampler through a `_UNORM`
     /// view and was never decoded, while the zero-copy rails beside it — which
-    /// carry a resolved host format — bound the `_SRGB` spelling and were. One
+    /// carry a semantic image-view format — preserved sRGB and were. One
     /// guest texture, two colours, and which one it got decided by a cost
     /// threshold. Each producer answers from the format it *loaded from*, so a
     /// convert that reorders channels keeps the transfer function it never
@@ -884,14 +884,17 @@ pub(super) enum SampledSourceRequest {
     /// Engine-resident allocation plus the exact view format this sampled
     /// texture declared. Allocation identity and view interpretation are
     /// separate parts of the texture contract.
-    Target(crate::model::TargetIdentity, ash::vk::Format),
+    Target(
+        crate::model::TargetIdentity,
+        reims_vgpu_protocol::ImageFormat,
+    ),
     /// The render attachment and fragment binding name the same serialized
     /// texture. The engine either binds that image through native feedback or
     /// produces the capability fallback entirely on the GPU.
     Attachment(
         crate::model::TargetIdentity,
         crate::backend::vulkan::engine::AttachmentInitial,
-        ash::vk::Format,
+        reims_vgpu_protocol::ImageFormat,
     ),
     /// Zero-copy guest gather: the engine copies the texel bytes from
     /// imported guest RAM inside the draw CB — no CPU read, no memo, no
@@ -902,17 +905,17 @@ pub(super) enum SampledSourceRequest {
     ///
     /// The last field is the **format's own** channel plan, not the guest's
     /// view swizzle: this rail binds guest bytes untouched, so a format whose
-    /// Metal channels do not sit identically on the Vulkan format carrying them
+    /// Metal channels do not sit identically on the backend format carrying them
     /// needs that difference expressed on the image view. It is composed with
     /// the type-8 view swizzle at the push site. Identity for every format but
     /// `A8Unorm`.
     GuestRuns(
         reims_vgpu_memory::GuestRunSource,
         TexelLayout,
-        /// Exact Vulkan image/view format. This is distinct from the texel
+        /// Exact semantic image/view format. This is distinct from the texel
         /// layout because linear and sRGB formats carry the same bytes while
         /// applying different fixed-function sampling conversions.
-        ash::vk::Format,
+        reims_vgpu_protocol::ImageFormat,
         /// Consecutive depth planes carried by the source window.
         u32,
         Option<LinearSampleIdentity>,
@@ -1012,7 +1015,7 @@ pub(super) fn fragment_attachment_alias_initial(
 
 pub(super) fn attachment_alias_source(
     identity: crate::model::TargetIdentity,
-    format: ash::vk::Format,
+    format: reims_vgpu_protocol::ImageFormat,
     initial: crate::backend::vulkan::engine::AttachmentInitial,
 ) -> SampledSourceRequest {
     SampledSourceRequest::Attachment(identity, initial, format)
@@ -1314,9 +1317,12 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     note_iosurface_texture_sample_rung("iosurfacerung_resident_swizzled");
                 } else if resident_current {
                     note_iosurface_texture_sample_rung("iosurfacerung_resident");
-                    let format = crate::backend::vulkan::translate::pixel::vk_texel_layout(
-                        resident_id.resident_layout(),
-                    );
+                    let declared = if m.format == 0 {
+                        pixel_format::MTL_FORMAT_BGRA8_UNORM
+                    } else {
+                        m.format
+                    };
+                    let format = translate::pixel::sampled_image_format(declared).ok()?;
                     return Some((w, h, mid, SampledSourceRequest::Target(resident_id, format)));
                 } else if resident_ready {
                     note_iosurface_texture_sample_rung("iosurfacerung_resident_refused");
@@ -2725,7 +2731,7 @@ pub(super) fn linear_sample_from_packed(
     span: u64,
     row_length_texels: u32,
     native: TexelLayout,
-    format: ash::vk::Format,
+    format: reims_vgpu_protocol::ImageFormat,
     identity: LinearSampleIdentity,
     vouch: crate::runtime::gather_witness::GatherVouch,
     native_components: pixel_format::SwizzlePlan,
@@ -3557,7 +3563,7 @@ pub(super) fn try_gva_resident_sample<M: HostMemory + HostOps>(
             return None;
         }
     };
-    let format = translate::pixel::translate(declared_format).ok()?.vk;
+    let format = translate::pixel::sampled_image_format(declared_format).ok()?;
     note_store_route("gvarung_resident");
     Some((w, h, SampledSourceRequest::Target(identity, format)))
 }
@@ -3634,7 +3640,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // for all but `A8Unorm`, whose byte rides in `R8_UNORM`. It is composed with
     // the guest's type-8 view swizzle where the image view is built, so this
     // rail no longer has to refuse a format for having one.
-    let (native, sampled_vk_format, native_components) =
+    let (native, sampled_format, native_components) =
         match translate::pixel::sampled_pixels(declared_format) {
             // Deduped per declared format, which is a handful of values a boot
             // enumerates in a handful of lines. The number is the guest's own
@@ -3673,7 +3679,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                     crate::runtime::drain::note_store_route("zc_lin_layout_unfilterable");
                     return None;
                 }
-                let format = translate::pixel::translate(declared_format).ok()?.vk;
+                let format = translate::pixel::sampled_image_format(declared_format).ok()?;
                 (layout, format, components)
             }
         };
@@ -3796,7 +3802,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                 span,
                 row_length_texels,
                 native,
-                sampled_vk_format,
+                sampled_format,
                 LinearSampleIdentity::from(seen.identity),
                 seen.vouch,
                 native_components,
@@ -3815,7 +3821,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                     pages: Some(std::sync::Arc::clone(&packed.pages)),
                 },
                 native,
-                sampled_vk_format,
+                sampled_format,
                 planes,
                 Some(LinearSampleIdentity::from(seen.identity)),
                 seen.vouch,
@@ -3868,7 +3874,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                 pages: guest_page_window(host, gpas, page as u64, gva % page as u64, span),
             },
             native,
-            sampled_vk_format,
+            sampled_format,
             planes,
             Some(LinearSampleIdentity::from(seen.identity)),
             seen.vouch,
@@ -3895,7 +3901,7 @@ pub(super) fn try_iosurface_texture_sample_zero_copy<M: HostMemory + HostOps>(
     if w == 0 || h == 0 {
         return None;
     }
-    let (native, sampled_vk_format, base_off, bpr) = {
+    let (native, sampled_format, base_off, bpr) = {
         let m = state.mappings.get(&mid)?;
         if !m.mapped || m.page_entries.is_empty() {
             return None;
@@ -3920,9 +3926,9 @@ pub(super) fn try_iosurface_texture_sample_zero_copy<M: HostMemory + HostOps>(
             }
             _ => return None,
         };
-        let sampled_vk_format = translate::pixel::translate(format).ok()?.vk;
+        let sampled_format = translate::pixel::sampled_image_format(format).ok()?;
         let (base_off, bpr_u32, _span_end) = iosurface_texture_sample_window(m, w, h, format)?;
-        (native, sampled_vk_format, base_off, bpr_u32 as u64)
+        (native, sampled_format, base_off, bpr_u32 as u64)
     };
     // From the layout the translation chose, as the IOSurface plane view rail does, so the
     // texel size cannot disagree with the image the engine creates. The
@@ -3943,7 +3949,7 @@ pub(super) fn try_iosurface_texture_sample_zero_copy<M: HostMemory + HostOps>(
     Some(SampledSourceRequest::GuestRuns(
         source,
         native,
-        sampled_vk_format,
+        sampled_format,
         1,
         Some(identity),
         vouch,
@@ -3977,7 +3983,7 @@ pub(super) fn try_iosurface_plane_view_sample_zero_copy<M: HostMemory + HostOps>
     if !mapper::ensure_resolved_for_scanout(state, host, mid) {
         return None;
     }
-    let (native, sampled_vk_format, bpp, base_off, bpr) = {
+    let (native, sampled_format, bpp, base_off, bpr) = {
         let m = state.mappings.get(&mid)?;
         if !m.mapped || m.page_entries.is_empty() {
             return None;
@@ -4002,8 +4008,8 @@ pub(super) fn try_iosurface_plane_view_sample_zero_copy<M: HostMemory + HostOps>
         };
         let (base_off, bpr_u32, _span_end) =
             iosurface_plane_view_sample_window(m, view.plane_index, w, h, view.pixel_format)?;
-        let sampled_vk_format = translate::pixel::translate(view.pixel_format).ok()?.vk;
-        (native, sampled_vk_format, bpp, base_off, bpr_u32 as u64)
+        let sampled_format = translate::pixel::sampled_image_format(view.pixel_format).ok()?;
+        (native, sampled_format, bpp, base_off, bpr_u32 as u64)
     };
     let (span, row_length_texels) = strided_window_extent(w, h, bpp as u64, bpr)?;
     let (source, identity, vouch) = witnessed_mapping_sampled_source(
@@ -4020,7 +4026,7 @@ pub(super) fn try_iosurface_plane_view_sample_zero_copy<M: HostMemory + HostOps>
     Some(SampledSourceRequest::GuestRuns(
         source,
         native,
-        sampled_vk_format,
+        sampled_format,
         1,
         Some(identity),
         vouch,
@@ -6324,11 +6330,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 texture_ref,
                             },
                         ))?;
-                        (
-                            aw,
-                            ah,
-                            attachment_alias_source(identity, native_format, alias),
-                        )
+                        (aw, ah, attachment_alias_source(identity, format, alias))
                     } else {
                         drop(alias_span);
                         let _s = crate::runtime::sampled_phase::Span::open(
@@ -6368,7 +6370,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // BGRA8 from the surface backing scanout cache, a native single/dual-channel
                 // video plane — and the host spelling is applied once, where the
                 // engine resource is built (`vk_texel_layout` below).
-                let sampled_vk_format;
+                let sampled_format;
                 // How the bound texels' channels sit on the host format, from
                 // the rail that produced them. Identity for every CPU-origin
                 // bind, because those loaders have already put the channels
@@ -6383,12 +6385,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 let source = match loaded {
                     SampledSourceRequest::Bytes(rgba, identity, byte_format, origin) => {
                         bytes_identity = identity;
-                        sampled_vk_format = translate::pixel::vk_sampled_bytes(byte_format);
+                        sampled_format = translate::pixel::sampled_byte_image_format(byte_format);
                         byte_origin = origin;
                         crate::backend::vulkan::engine::SampledSource::Bytes(rgba)
                     }
                     SampledSourceRequest::Target(identity, format) => {
-                        sampled_vk_format = format;
+                        sampled_format = format;
                         // The source resolver carries the sampled texture's
                         // exact view format beside the allocation identity. A
                         // resident attachment view is not necessarily the view
@@ -6409,7 +6411,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         crate::backend::vulkan::engine::SampledSource::Target(identity)
                     }
                     SampledSourceRequest::Attachment(identity, initial, format) => {
-                        sampled_vk_format = format;
+                        sampled_format = format;
                         crate::backend::vulkan::engine::SampledSource::Attachment {
                             identity,
                             initial,
@@ -6424,7 +6426,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         vouch,
                         components,
                     ) => {
-                        sampled_vk_format = format;
+                        sampled_format = format;
                         sampled_components = components;
                         source_planes = planes;
                         bytes_identity = identity;
@@ -6529,7 +6531,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         state.task_resources.content_stamp_for(resource.as_ref())
                     }),
                     byte_origin,
-                    format: sampled_vk_format,
+                    format: sampled_format,
                     identity: bytes_identity.map(|i| {
                         crate::backend::vulkan::engine::SampledContentIdentity {
                             key: i.key,
@@ -6644,7 +6646,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 )),
                 content: None,
                 byte_origin: crate::backend::vulkan::engine::SampledByteOrigin::Synthetic,
-                format: ash::vk::Format::R8G8B8A8_UNORM,
+                format: reims_vgpu_protocol::ImageFormat::linear(
+                    reims_vgpu_protocol::TexelLayout::Rgba8,
+                ),
                 identity: None,
                 resource_lifetime: None,
                 swizzle: Default::default(),
@@ -7677,7 +7681,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     | crate::backend::vulkan::engine::SampledSource::Attachment { .. } => 2,
                     crate::backend::vulkan::engine::SampledSource::GuestRuns(..) => 3,
                 },
-                format: image.format.as_raw() as u32,
+                format: translate::pixel::vk_image_format(image.format).as_raw() as u32,
                 width: image.width,
                 height: image.height,
                 // Only the CPU-bytes rail has bytes here to read. The gather

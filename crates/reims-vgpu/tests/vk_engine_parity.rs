@@ -626,7 +626,9 @@ fn depth_test_honored_compare_and_clear_wired() {
             multisampled: false,
             source: SampledSource::Bytes(std::sync::Arc::new(rgba.repeat(4))),
             byte_origin: Default::default(),
-            format: ash::vk::Format::R8G8B8A8_UNORM,
+            format: reims_vgpu_protocol::ImageFormat::linear(
+                reims_vgpu_protocol::TexelLayout::Rgba8,
+            ),
             identity: None,
             content: None,
             resource_lifetime: None,
@@ -761,7 +763,9 @@ fn depth_test_honored_on_resident_target_path() {
             multisampled: false,
             source: SampledSource::Bytes(std::sync::Arc::new(rgba.repeat(4))),
             byte_origin: Default::default(),
-            format: ash::vk::Format::R8G8B8A8_UNORM,
+            format: reims_vgpu_protocol::ImageFormat::linear(
+                reims_vgpu_protocol::TexelLayout::Rgba8,
+            ),
             identity: None,
             content: None,
             resource_lifetime: None,
@@ -903,7 +907,9 @@ fn stencil_test_honored_compare_ref_and_clear_wired() {
             multisampled: false,
             source: SampledSource::Bytes(std::sync::Arc::new(rgba.repeat(4))),
             byte_origin: Default::default(),
-            format: ash::vk::Format::R8G8B8A8_UNORM,
+            format: reims_vgpu_protocol::ImageFormat::linear(
+                reims_vgpu_protocol::TexelLayout::Rgba8,
+            ),
             identity: None,
             content: None,
             resource_lifetime: None,
@@ -1061,7 +1067,7 @@ fn sampled_and_sampler_still_renders() {
             255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
         ])),
         byte_origin: Default::default(),
-        format: ash::vk::Format::R8G8B8A8_UNORM,
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
         identity: None,
         content: None,
         resource_lifetime: Some(sampled_owner.lifetime_ref()),
@@ -1168,7 +1174,7 @@ fn sampled_upload_happens_once_across_more_draws_than_the_ring_is_deep() {
             255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
         ])),
         byte_origin: Default::default(),
-        format: ash::vk::Format::R8G8B8A8_UNORM,
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
         identity: None,
         content: None,
         resource_lifetime: Some(sampled_owner.lifetime_ref()),
@@ -1248,7 +1254,7 @@ fn resident_sample_bind_avoids_roundtrip_and_remains_loadable() {
         multisampled: false,
         source: SampledSource::Target(source.clone()),
         byte_origin: Default::default(),
-        format: ash::vk::Format::R8G8B8A8_UNORM,
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
         identity: None,
         content: None,
         resource_lifetime: None,
@@ -1353,7 +1359,8 @@ fn resident_sample_uses_the_bindings_compatible_format_view() {
         multisampled: false,
         source: SampledSource::Target(source),
         byte_origin: Default::default(),
-        format: ash::vk::Format::B8G8R8A8_SRGB,
+        format: reims_vgpu_protocol::ImageFormat::srgb(reims_vgpu_protocol::TexelLayout::Bgra8)
+            .unwrap(),
         identity: None,
         content: None,
         resource_lifetime: None,
@@ -1414,7 +1421,7 @@ fn resident_sample_alias_uses_native_feedback_or_snapshot_fallback() {
         multisampled: false,
         source: SampledSource::Target(identity.clone()),
         byte_origin: Default::default(),
-        format: ash::vk::Format::R8G8B8A8_UNORM,
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
         identity: None,
         content: None,
         resource_lifetime: None,
@@ -1434,7 +1441,7 @@ fn resident_sample_alias_uses_native_feedback_or_snapshot_fallback() {
         multisampled: false,
         source: SampledSource::Target(identity.clone()),
         byte_origin: Default::default(),
-        format: ash::vk::Format::R8G8B8A8_UNORM,
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
         identity: None,
         content: None,
         resource_lifetime: None,
@@ -1533,7 +1540,9 @@ fn attachment_initial_contents_are_sampled_without_a_host_upload() {
             multisampled: false,
             source: SampledSource::Attachment { identity, initial },
             byte_origin: Default::default(),
-            format: reims_vgpu::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+            format: reims_vgpu_protocol::ImageFormat::linear(
+                reims_vgpu_protocol::TexelLayout::Bgra8,
+            ),
             identity: None,
             content: None,
             resource_lifetime: None,
@@ -1642,7 +1651,7 @@ fn sampled_identity_never_overrides_changed_content() {
             255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
         ])),
         byte_origin: Default::default(),
-        format: ash::vk::Format::R8G8B8A8_UNORM,
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
         identity: Some(SampledContentIdentity {
             key: 0x1234_5000,
             generation: 1,
@@ -2185,7 +2194,7 @@ fn sampled_rgba_upload_to_bgra_target_preserves_semantic_channels() {
         multisampled: false,
         source: SampledSource::Bytes(std::sync::Arc::new(rgba.repeat(4))),
         byte_origin: Default::default(),
-        format: ash::vk::Format::R8G8B8A8_UNORM,
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
         identity: None,
         content: None,
         resource_lifetime: Some(sampled_owner.lifetime_ref()),
@@ -2350,7 +2359,7 @@ fn reflected_static_sampler_descriptor_samples_texture() {
         multisampled: false,
         source: SampledSource::Bytes(std::sync::Arc::new(rgba.repeat(4))),
         byte_origin: Default::default(),
-        format: ash::vk::Format::R8G8B8A8_UNORM,
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
         identity: None,
         content: None,
         resource_lifetime: Some(sampled_owner.lifetime_ref()),
@@ -2458,7 +2467,7 @@ fn sampled_bgra8_bytes_upload_matches_rgba8_semantic_color() {
 
     // Render the color once via an Rgba8 upload and once via a Bgra8 upload; the
     // sampled output must be byte-identical.
-    let render = |bytes: Vec<u8>, format: ash::vk::Format, id: u32| {
+    let render = |bytes: Vec<u8>, format: reims_vgpu_protocol::ImageFormat, id: u32| {
         let identity = TargetIdentity::Surface {
             id,
             width: w,
@@ -2514,11 +2523,19 @@ fn sampled_bgra8_bytes_upload_matches_rgba8_semantic_color() {
         }
     };
 
-    let Some(rgba_out) = render(rgba.repeat(4), ash::vk::Format::R8G8B8A8_UNORM, 90) else {
+    let Some(rgba_out) = render(
+        rgba.repeat(4),
+        reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
+        90,
+    ) else {
         return;
     };
-    let bgra_out =
-        render(bgra.repeat(4), ash::vk::Format::B8G8R8A8_UNORM, 91).expect("bgra8 render");
+    let bgra_out = render(
+        bgra.repeat(4),
+        reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Bgra8),
+        91,
+    )
+    .expect("bgra8 render");
 
     let center = ((h / 2) * w + w / 2) as usize * 4;
     // Both uploads carry the identical semantic color, so the guest-visible BGRA
@@ -2620,7 +2637,9 @@ fn a_view_swizzle_is_performed_by_the_image_view_not_the_cpu() {
             multisampled: false,
             source: SampledSource::Bytes(std::sync::Arc::new(source.repeat(4))),
             byte_origin: Default::default(),
-            format: ash::vk::Format::R8G8B8A8_UNORM,
+            format: reims_vgpu_protocol::ImageFormat::linear(
+                reims_vgpu_protocol::TexelLayout::Rgba8,
+            ),
             identity: None,
             content: None,
             resource_lifetime: None,
@@ -3660,7 +3679,7 @@ fn mrt_secondary_attachment_becomes_sampleable_resident() {
         multisampled: false,
         source: SampledSource::Target(secondary.clone()),
         byte_origin: Default::default(),
-        format: ash::vk::Format::R8G8B8A8_UNORM,
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
         identity: None,
         content: None,
         resource_lifetime: None,

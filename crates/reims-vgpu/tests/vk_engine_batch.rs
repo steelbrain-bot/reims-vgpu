@@ -748,7 +748,7 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
             reims_vgpu::runtime::gather_witness::GatherVouch::Fresh,
         ),
         byte_origin: Default::default(),
-        format: ash::vk::Format::R8G8B8A8_UNORM,
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
         identity: None,
         content: None,
         resource_lifetime: None,

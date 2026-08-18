@@ -283,18 +283,29 @@ pub use crate::format::{srgb_texel_layout, vk_image_format, vk_texel_layout};
 /// bytes are what they are.
 ///
 /// [b]: crate::runtime::draw::vulkan
-pub fn vk_sampled_bytes(format: SampledByteFormat) -> vk::Format {
-    let linear = vk_texel_layout(format.layout());
+pub fn sampled_byte_image_format(format: SampledByteFormat) -> ImageFormat {
+    let linear = ImageFormat::linear(format.layout());
     let Some(mtl) = format.srgb_source() else {
         return linear;
     };
-    match srgb_texel_layout(format.layout()) {
+    match ImageFormat::srgb(format.layout()) {
         Some(srgb) => srgb,
         None => {
             crate::srgb_census::note_downgrade(crate::srgb_census::site::SAMPLED_BYTE_UPLOAD, mtl);
             linear
         }
     }
+}
+
+pub fn vk_sampled_bytes(format: SampledByteFormat) -> vk::Format {
+    vk_image_format(sampled_byte_image_format(format))
+}
+
+/// Semantic image-view format for a sampled guest declaration.
+pub fn sampled_image_format(mtl: u16) -> Result<ImageFormat, TranslateReason> {
+    let (layout, _, _) = sampled_pixels(mtl)?;
+    let transfer = translate(mtl)?.transfer;
+    ImageFormat::with_transfer(layout, transfer).ok_or(TranslateReason::NoSampledLayout(mtl))
 }
 
 /// The [`TexelLayout`] a Vulkan format is, or `None` for a format that is not
@@ -1491,6 +1502,10 @@ mod tests {
             let (format, decline) = color_attachment(mtl).unwrap();
             assert!(format.is_srgb());
             assert_eq!(decline, None, "colour attachment must preserve sRGB");
+            assert!(
+                sampled_image_format(mtl).unwrap().is_srgb(),
+                "sampled request must preserve sRGB semantically"
+            );
         }
         // The converse: a linear format must never produce the decline, or the
         // proxy floods and stops meaning anything.

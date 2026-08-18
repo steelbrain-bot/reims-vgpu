@@ -1885,19 +1885,9 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 },
             ));
         }
-        // Footprint of one texel of the image's own format. `None` means a
-        // format whose bytes are not one number per texel (block-compressed,
-        // multi-planar) reached a rail that sizes a linear buffer — decline by
-        // name rather than compute a wrong length.
-        let Some(texel) = super::super::translate::pixel::bytes_per_texel(image.format) else {
-            return Err(DrawError::DrawValidation(
-                DrawValidationDecline::SampledNoLinearTexelFootprint {
-                    binding: image.binding,
-                    format: image.format,
-                },
-            ));
-        };
-        let texel = texel as usize;
+        // The semantic request type only admits formats with a defined texel
+        // layout, so a linear footprint is guaranteed before Vulkan sees it.
+        let texel = image.format.layout().bytes_per_texel() as usize;
         // Four factors, so the widening the operands already carry is not
         // enough — see the target-seed check above for why two of them exhaust
         // a u64 on their own. `contract::extent` owns the checked form.
@@ -3844,7 +3834,12 @@ pub(crate) unsafe fn execute_draw_inner(
                     _resident_samples,
                 ) = held.expect("validated resident is held");
                 let source_view = pools
-                    .registry_sample_view(ctx, identity, resource.format, counters)?
+                    .registry_sample_view(
+                        ctx,
+                        identity,
+                        crate::format::vk_image_format(resource.format),
+                        counters,
+                    )?
                     .expect("validated resident is held");
                 // Two reasons a resident cannot be bound through its own view.
                 //
@@ -6977,7 +6972,7 @@ mod tests {
                 ),
                 content: None,
                 byte_origin: Default::default(),
-                format: crate::translate::pixel::vk_texel_layout(
+                format: reims_vgpu_protocol::ImageFormat::linear(
                     reims_vgpu_protocol::TexelLayout::Bgra8,
                 ),
                 identity: None,
@@ -7059,7 +7054,9 @@ mod tests {
             source: SampledSource::Target(identity),
             content: None,
             byte_origin: Default::default(),
-            format: crate::translate::pixel::SCANOUT_FORMAT,
+            format: reims_vgpu_protocol::ImageFormat::linear(
+                reims_vgpu_protocol::TexelLayout::Bgra8,
+            ),
             identity: None,
             resource_lifetime: None,
             swizzle: Default::default(),
