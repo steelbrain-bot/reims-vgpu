@@ -19,5 +19,5 @@
 
 pub mod caps;
 pub mod engine;
-pub mod policy;
 pub mod translate;
+pub use reims_vgpu_vulkan::policy;

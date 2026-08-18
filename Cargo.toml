@@ -10,6 +10,7 @@ members = [
   "crates/reims-vgpu-core",
   "crates/reims-vgpu-paging",
   "crates/reims-vgpu-protocol",
+  "crates/reims-vgpu-vulkan",
   "crates/reims-vgpu-wire",
 ]
 exclude = [

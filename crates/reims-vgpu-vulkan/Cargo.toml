@@ -1,0 +1,16 @@
+[package]
+name = "reims-vgpu-vulkan"
+version = "0.1.0"
+edition = "2021"
+description = "Vulkan capability and execution policy for Reims vGPU"
+license = "GPL-2.0-or-later"
+
+[lib]
+name = "reims_vgpu_vulkan"
+
+[features]
+test-fixtures = []
+
+[dependencies]
+ash = "0.38"
+reims-vgpu-core = { path = "../reims-vgpu-core" }

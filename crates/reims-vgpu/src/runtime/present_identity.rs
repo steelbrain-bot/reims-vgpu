@@ -14,6 +14,7 @@
 
 use crate::model::DeviceState;
 use crate::model::TargetIdentity;
+#[cfg(test)]
 use ash::vk;
 
 /// Build a protocol-stable resident identity for this mapping at its current

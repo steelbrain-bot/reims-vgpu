@@ -9,11 +9,14 @@
 mod discrete;
 mod unified;
 
-use super::caps::memory_topology::{MemoryClass, MemoryRequest, MemoryTopology};
+use crate::memory::{MemoryClass, MemoryRequest, MemoryTopology};
 
-pub(crate) const UNIFIED_DEFAULT_BATCH_DRAWS: u64 = 128;
-pub(crate) const DISCRETE_DEFAULT_BATCH_DRAWS: u64 = 32;
-pub(crate) const MAX_BATCH_DRAWS: u64 = UNIFIED_DEFAULT_BATCH_DRAWS;
+/// Unified-memory default for the maximum draws retained in one batch.
+pub const UNIFIED_DEFAULT_BATCH_DRAWS: u64 = 128;
+/// Discrete-memory default for the maximum draws retained in one batch.
+pub const DISCRETE_DEFAULT_BATCH_DRAWS: u64 = 32;
+/// Largest topology-selected default accepted by the batching control.
+pub const MAX_BATCH_DRAWS: u64 = UNIFIED_DEFAULT_BATCH_DRAWS;
 
 /// Decisions a host-memory topology may make.
 trait TopologyPolicy {
@@ -29,24 +32,28 @@ enum PolicyKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct MemoryPlacementPolicy(PolicyKind);
+/// Sealed placement and batching policy selected from structural topology.
+pub struct MemoryPlacementPolicy(PolicyKind);
 
 impl MemoryPlacementPolicy {
-    pub(crate) const fn new(topology: MemoryTopology) -> Self {
+    /// Select the policy for a classified physical-device topology.
+    pub const fn new(topology: MemoryTopology) -> Self {
         match topology {
             MemoryTopology::Unified => Self(PolicyKind::Unified(unified::UnifiedMemoryPolicy)),
             MemoryTopology::Discrete => Self(PolicyKind::Discrete(discrete::DiscreteMemoryPolicy)),
         }
     }
 
-    pub(crate) fn request(self, class: MemoryClass) -> MemoryRequest {
+    /// Build the Vulkan memory-property request for an allocation purpose.
+    pub fn request(self, class: MemoryClass) -> MemoryRequest {
         match self.0 {
             PolicyKind::Unified(policy) => policy.request(class),
             PolicyKind::Discrete(policy) => policy.request(class),
         }
     }
 
-    pub(crate) fn default_batch_draws(self) -> u64 {
+    /// Default draw batch size for this topology.
+    pub fn default_batch_draws(self) -> u64 {
         match self.0 {
             PolicyKind::Unified(policy) => policy.default_batch_draws(),
             PolicyKind::Discrete(policy) => policy.default_batch_draws(),

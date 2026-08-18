@@ -1102,6 +1102,7 @@ dependencies = [
  "reims-vgpu-core",
  "reims-vgpu-paging",
  "reims-vgpu-protocol",
+ "reims-vgpu-vulkan",
  "reims-vgpu-wire",
  "serde_json",
  "winit",
@@ -1127,6 +1128,14 @@ name = "reims-vgpu-protocol"
 version = "0.1.0"
 dependencies = [
  "reims-vgpu-wire",
+]
+
+[[package]]
+name = "reims-vgpu-vulkan"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "reims-vgpu-core",
 ]
 
 [[package]]
