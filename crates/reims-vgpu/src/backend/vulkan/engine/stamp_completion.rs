@@ -604,7 +604,7 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
                     // while the former is the exact Vulkan submission that
                     // must signal. Treating a FIFO ordinal as a ring slot would
                     // produce plausible-looking evidence for unrelated work.
-                    match crate::runtime::gpu_hang_trail::submission_for_timeline(timeline) {
+                    match reims_vgpu_vulkan::gpu_hang_trail::submission_for_timeline(timeline) {
                         Some((slot, submission)) => reims_vgpu_observe::fail(format!(
                             "stamp_wait_timeout_submission reason=stamp_wait_timeout \
                              index={} value={} slot={} held=[{}]",
@@ -617,21 +617,23 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
                             waiting.index, timeline
                         )),
                     }
-                    if let Some(outstanding) = crate::runtime::gpu_hang_trail::outstanding() {
+                    if let Some(outstanding) = reims_vgpu_vulkan::gpu_hang_trail::outstanding() {
                         reims_vgpu_observe::fail(format!(
                             "stamp_wait_timeout_queue reason=stamp_wait_timeout index={} \
                              value={} {outstanding}",
                             waiting.index, timeline
                         ));
                     }
-                    if let Some(trail) = crate::runtime::gpu_hang_trail::trail() {
+                    if let Some(trail) = reims_vgpu_vulkan::gpu_hang_trail::trail() {
                         reims_vgpu_observe::fail(format!(
                             "stamp_wait_timeout_trail reason=stamp_wait_timeout index={} \
                              value={} {trail}",
                             waiting.index, timeline
                         ));
                     }
-                    if let Some(firsts) = crate::runtime::gpu_hang_trail::recent_pipeline_firsts() {
+                    if let Some(firsts) =
+                        reims_vgpu_vulkan::gpu_hang_trail::recent_pipeline_firsts()
+                    {
                         reims_vgpu_observe::fail(format!(
                             "stamp_wait_timeout_pipes reason=stamp_wait_timeout index={} \
                              value={} {firsts}",

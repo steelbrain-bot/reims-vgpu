@@ -9,6 +9,7 @@ pub mod capabilities;
 pub mod device_features;
 pub mod device_select;
 pub mod format;
+pub mod gpu_hang_trail;
 pub mod host_pointer;
 pub mod memory;
 pub mod policy;

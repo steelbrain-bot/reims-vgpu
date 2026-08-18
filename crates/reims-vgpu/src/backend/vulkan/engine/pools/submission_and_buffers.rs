@@ -1285,14 +1285,14 @@ impl ResourcePools {
                 // sessions of switch-bisecting could not reach. Emitted before
                 // the error is mapped, because `wait_error` may turn it into a
                 // device loss and the teardown that follows clears the ring.
-                let held = match crate::runtime::gpu_hang_trail::submission(index) {
+                let held = match reims_vgpu_vulkan::gpu_hang_trail::submission(index) {
                     Some(note) => format!("{note}"),
                     None => "none (this slot's work was never recorded)".to_string(),
                 };
                 reims_vgpu_observe::fail(format!(
                     "vk_engine_fence_wedged slot={index} result={e:?} held={held}"
                 ));
-                if let Some(rest) = crate::runtime::gpu_hang_trail::outstanding() {
+                if let Some(rest) = reims_vgpu_vulkan::gpu_hang_trail::outstanding() {
                     reims_vgpu_observe::fail(format!("vk_engine_fence_wedged_queue {rest}"));
                 }
                 Self::wait_error(counters, e, DeviceLostOp::PoolsWaitFencesRetire)
@@ -1312,7 +1312,7 @@ impl ResourcePools {
         self.in_flight = self.in_flight.saturating_sub(1);
         // Its fence has signalled, so this submission is no longer a candidate
         // for a wedge. Paired with the `note_submit` in `finish_entry_async`.
-        crate::runtime::gpu_hang_trail::note_retired(index);
+        reims_vgpu_vulkan::gpu_hang_trail::note_retired(index);
         self.drain_cleanup(&ctx.device, pending);
         self.release_graveyard(&ctx.device, 1 << index);
         Ok(())
@@ -1487,7 +1487,7 @@ impl ResourcePools {
         // submit paths reach — a batch flush and a lone draw's own submit. The
         // trail's per-slot record is cleared again in `retire_slot`, so a slot
         // holding one is a submission whose fence has not signalled.
-        crate::runtime::gpu_hang_trail::note_submit(self.cur, timeline);
+        reims_vgpu_vulkan::gpu_hang_trail::note_submit(self.cur, timeline);
         self.admit_recorded_sampled(admissions);
     }
 

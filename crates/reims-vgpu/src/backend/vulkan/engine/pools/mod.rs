@@ -1012,7 +1012,7 @@ const _: () = assert!(
 /// would drop exactly the slot a wedge is on and report `outstanding` as if the
 /// ring were shallower than it is.
 const _: () = assert!(
-    RING_DEPTH <= crate::runtime::gpu_hang_trail::SUBMIT_SLOTS,
+    RING_DEPTH <= reims_vgpu_vulkan::gpu_hang_trail::SUBMIT_SLOTS,
     "the hang trail must hold one submission record per ring slot"
 );
 
