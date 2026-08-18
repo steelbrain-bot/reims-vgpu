@@ -16,7 +16,7 @@ pub use identity::{
     GuestVirtualAddress, MappingId, ObjectRef, PlaneIndex, ResourceId, ResourceNamespaceId,
     StorageId, SubmissionId, SurfaceBackingId, SurfaceId, TaskId,
 };
-pub use pixel::TexelLayout;
+pub use pixel::{StorageImageFormat, TexelLayout};
 pub use resource::{
     decode_object_list_entry, ComputePipelineObject, DepthStencilObject, EventObject, FenceObject,
     FunctionObject, ObjectKind, ObjectListDecodeError, ObjectListEntry, RenderPipelineObject,

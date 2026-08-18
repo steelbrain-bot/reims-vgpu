@@ -37,6 +37,62 @@ pub enum TexelLayout {
     Rg11b10Float,
 }
 
+/// Typed texel format carried by semantic sampled and storage image requests.
+///
+/// Access and capability requirements are separate from this vocabulary: the
+/// same stored format can be sampled on a host which cannot expose it for
+/// storage writes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum StorageImageFormat {
+    #[default]
+    Rgba32Float,
+    Rgba16Float,
+    R16Float,
+    Rgba16Uint,
+    Rgba8Uint,
+    Rgba8Sint,
+    Rgba8Unorm,
+    Bgra8Unorm,
+    Rg16Float,
+    R8Unorm,
+    Rg8Unorm,
+    Rgba32Uint,
+    R32Uint,
+    R32Sint,
+    R32Float,
+    Rgb9e5Ufloat,
+    R16Unorm,
+    Rg16Unorm,
+    Rgba16Unorm,
+    Rgb10a2Unorm,
+    Bgr10a2Unorm,
+    Rg11b10Float,
+}
+
+impl StorageImageFormat {
+    /// Bytes occupied by one stored texel.
+    pub const fn bytes_per_texel(self) -> usize {
+        match self {
+            Self::Rgba32Float | Self::Rgba32Uint => 16,
+            Self::Rgba16Float | Self::Rgba16Uint | Self::Rgba16Unorm => 8,
+            Self::Rg16Float | Self::Rg16Unorm => 4,
+            Self::R16Float | Self::Rg8Unorm | Self::R16Unorm => 2,
+            Self::R8Unorm => 1,
+            Self::Rgba8Uint
+            | Self::Rgba8Sint
+            | Self::Rgba8Unorm
+            | Self::Bgra8Unorm
+            | Self::R32Uint
+            | Self::R32Sint
+            | Self::R32Float
+            | Self::Rgb9e5Ufloat
+            | Self::Rgb10a2Unorm
+            | Self::Bgr10a2Unorm
+            | Self::Rg11b10Float => 4,
+        }
+    }
+}
+
 impl TexelLayout {
     /// Every layout in stable table-index order.
     pub const ALL: &'static [Self] = &[
@@ -119,7 +175,7 @@ impl TexelLayout {
 
 #[cfg(test)]
 mod tests {
-    use super::TexelLayout;
+    use super::{StorageImageFormat, TexelLayout};
 
     #[test]
     fn all_is_a_total_unique_index() {
@@ -138,5 +194,13 @@ mod tests {
         for &layout in TexelLayout::ALL {
             assert!(!layout.cpu_loader_arm_is_lossy() || layout.has_cpu_loader_arm());
         }
+    }
+
+    #[test]
+    fn semantic_image_formats_report_their_storage_width() {
+        assert_eq!(StorageImageFormat::R8Unorm.bytes_per_texel(), 1);
+        assert_eq!(StorageImageFormat::Rgba8Uint.bytes_per_texel(), 4);
+        assert_eq!(StorageImageFormat::Rgba16Float.bytes_per_texel(), 8);
+        assert_eq!(StorageImageFormat::Rgba32Float.bytes_per_texel(), 16);
     }
 }

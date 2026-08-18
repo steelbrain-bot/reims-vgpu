@@ -22,11 +22,11 @@
 use ash::vk;
 
 use super::reason::TranslateReason;
-use crate::backend::vulkan::engine::StorageImageFormat;
 use crate::contract::pixel_format::{
     self, SampledByteFormat, StorageImageSelector, SwizzlePlan, SwizzleSource, TexelLayout,
     COMPONENT_A, COMPONENT_B, COMPONENT_G, COMPONENT_R,
 };
+use reims_vgpu_protocol::StorageImageFormat;
 
 /// Whether a format's stored values carry the sRGB electro-optical transfer
 /// function, which the hardware applies on sample and reverses on write.
@@ -566,7 +566,7 @@ pub fn verbatim_texel(mtl: u16) -> Option<(vk::Format, u32)> {
         return Some((vk_texel_layout(layout), layout.bytes_per_texel()));
     }
     let storage = storage_image_from_selector(pixel_format::storage_selector(mtl)?);
-    Some((storage.vk_format(), storage.bytes_per_texel() as u32))
+    Some((vk_storage_image(storage), storage.bytes_per_texel() as u32))
 }
 
 /// The engine's storage-image format for a contract [`StorageImageSelector`].
@@ -932,7 +932,7 @@ mod tests {
             let storage = storage_image_from_selector(selector);
             assert_eq!(
                 vk_texel_layout(layout),
-                storage.vk_format(),
+                vk_storage_image(storage),
                 "format {mtl:#x} is two different host texels"
             );
             assert_eq!(
@@ -943,7 +943,7 @@ mod tests {
             // And whichever half answered, the union answers the same thing.
             assert_eq!(
                 verbatim_texel(mtl),
-                Some((storage.vk_format(), storage.bytes_per_texel() as u32)),
+                Some((vk_storage_image(storage), storage.bytes_per_texel() as u32)),
                 "format {mtl:#x}"
             );
         }

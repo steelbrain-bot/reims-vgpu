@@ -357,7 +357,8 @@ fn resident_sample_exact(
     bind: ComputeResidentSampleBind,
     src_key: StorageImageKey,
 ) -> Result<(), DrawError> {
-    let exact = src_key.format.vk_format() == resource.format.vk_format()
+    let exact = crate::backend::vulkan::translate::pixel::vk_storage_image(src_key.format)
+        == crate::backend::vulkan::translate::pixel::vk_storage_image(resource.format)
         && src_key.width == resource.width
         && src_key.height == resource.height;
     if !exact {

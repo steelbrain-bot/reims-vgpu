@@ -1896,8 +1896,8 @@ fn storage_access_proxy_names_writeonly_seed_cost() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn storage_format_specialization_preserves_raw_views_and_runtime_shape() {
-    use crate::backend::vulkan::engine::StorageImageFormat as V;
     use crate::runtime::spirv_bind::ImageFormat as S;
+    use reims_vgpu_protocol::StorageImageFormat as V;
 
     assert_eq!(
         mtl_to_engine_sampled(pixel_format::MTL_FORMAT_R32_UINT),
@@ -2007,8 +2007,8 @@ fn storage_format_specialization_preserves_raw_views_and_runtime_shape() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn r32f_write_images_specialize_to_the_bound_guest_surface() {
-    use crate::backend::vulkan::engine::StorageImageFormat as V;
     use crate::runtime::spirv_bind::ImageFormat as S;
+    use reims_vgpu_protocol::StorageImageFormat as V;
 
     assert_eq!(
         spirv_image_format_to_engine_storage(S::R32Float),
@@ -2072,8 +2072,8 @@ fn r32f_write_images_specialize_to_the_bound_guest_surface() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn same_class_equal_width_storage_formats_take_the_guest_surface_not_the_placeholder() {
-    use crate::backend::vulkan::engine::StorageImageFormat as V;
     use crate::runtime::spirv_bind::ImageFormat as S;
+    use reims_vgpu_protocol::StorageImageFormat as V;
 
     // 4 bytes both sides, float class both sides — the measured case.
     assert_eq!(
@@ -2407,7 +2407,9 @@ fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
     use crate::runtime::drain::census::store_route_count;
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let held = crate::backend::vulkan::engine::StorageImageFormat::Rgba8Unorm.vk_format();
+    let held = crate::backend::vulkan::translate::pixel::vk_storage_image(
+        reims_vgpu_protocol::StorageImageFormat::Rgba8Unorm,
+    );
 
     let linear = |pages: crate::runtime::draw::StoreTargetPages| TextureWriteback::Linear {
         pages,

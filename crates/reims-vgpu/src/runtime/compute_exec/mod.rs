@@ -1917,8 +1917,10 @@ pub(crate) fn resident_serve(
     }
     let (engine_generation, engine_format) = executor.compute_resident_sample_source(&key)?;
     (engine_generation == mirror_generation
-        && mtl_to_engine_sampled(pixel_format)
-            .is_some_and(|f| f.vk_format() == engine_format.vk_format()))
+        && mtl_to_engine_sampled(pixel_format).is_some_and(|f| {
+            crate::backend::vulkan::translate::pixel::vk_storage_image(f)
+                == crate::backend::vulkan::translate::pixel::vk_storage_image(engine_format)
+        }))
     .then_some(ResidentServe::Sample(key, mirror_generation))
 }
 
@@ -4249,11 +4251,9 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 // is never silent on an unsupported device.
                 if matches!(
                     guest_fmt,
-                    crate::backend::vulkan::engine::StorageImageFormat::Bgra8Unorm
-                ) && matches!(
-                    fmt,
-                    crate::backend::vulkan::engine::StorageImageFormat::Rgba8Unorm
-                ) {
+                    reims_vgpu_protocol::StorageImageFormat::Bgra8Unorm
+                ) && matches!(fmt, reims_vgpu_protocol::StorageImageFormat::Rgba8Unorm)
+                {
                     crate::observe::fail(format!(
                         "compute_linux bgra_storage_composite pipe={} bind={} mode=degraded_rb_swap reason=no_storage_image_write_without_format {}x{}",
                         acc.pipeline_ref, t.binding, t.width, t.height
@@ -4306,7 +4306,12 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 // capability; the direct arm needs the guest-RAM import, and
                 // where that is absent the licence declines by name and this
                 // reads back exactly as it always did.
-                destination: direct_destination(state, host, t, shader_fmt.vk_format()),
+                destination: direct_destination(
+                    state,
+                    host,
+                    t,
+                    crate::backend::vulkan::translate::pixel::vk_storage_image(shader_fmt),
+                ),
                 residency: t.residency.map(|candidate| {
                     crate::backend::vulkan::engine::ComputeStorageResidency {
                         identity: candidate.key,
@@ -4396,7 +4401,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             binding,
             array_element: 0,
             descriptor_count: 1,
-            format: crate::backend::vulkan::engine::StorageImageFormat::Rgba8Unorm,
+            format: reims_vgpu_protocol::StorageImageFormat::Rgba8Unorm,
             width: NEUTRAL_SAMPLED_IMAGE_EXTENT,
             height: NEUTRAL_SAMPLED_IMAGE_EXTENT,
             source: crate::backend::vulkan::engine::ComputeSampledImageSource::Bytes(
@@ -4809,14 +4814,12 @@ fn spirv_words_le(bytes: &[u8]) -> Result<Vec<u32>, ComputeSpirvDecline> {
 /// Those two refusals are gone with the `Option`.
 fn selector_to_engine_storage(
     selector: pixel_format::StorageImageSelector,
-) -> crate::backend::vulkan::engine::StorageImageFormat {
+) -> reims_vgpu_protocol::StorageImageFormat {
     crate::backend::vulkan::translate::pixel::storage_image_from_selector(selector)
 }
 
 #[cfg(feature = "backend-vulkan")]
-fn mtl_to_engine_sampled(
-    format: u16,
-) -> Option<crate::backend::vulkan::engine::StorageImageFormat> {
+fn mtl_to_engine_sampled(format: u16) -> Option<reims_vgpu_protocol::StorageImageFormat> {
     // The *sampled* admission, not the storage one. Asking `storage_image` here
     // cost macOS 14 and macOS 15 a whole `DispatchThreadgroups` a boot on
     // `MTLPixelFormatR16Unorm`, which is sampleable everywhere and is not a
@@ -4827,9 +4830,9 @@ fn mtl_to_engine_sampled(
 #[cfg(feature = "backend-vulkan")]
 fn spirv_image_format_to_engine_storage(
     format: crate::runtime::spirv_bind::ImageFormat,
-) -> Option<crate::backend::vulkan::engine::StorageImageFormat> {
-    use crate::backend::vulkan::engine::StorageImageFormat as V;
+) -> Option<reims_vgpu_protocol::StorageImageFormat> {
     use crate::runtime::spirv_bind::ImageFormat as S;
+    use reims_vgpu_protocol::StorageImageFormat as V;
     Some(match format {
         S::Rgba32Float => V::Rgba32Float,
         S::Rgba16Float => V::Rgba16Float,
@@ -4857,8 +4860,8 @@ fn spirv_image_format_to_engine_storage(
 /// Kept apart from the specialization table below because that table also
 /// refuses formats whose storage path is unproven, and the class of a format is
 /// a fact about it that holds whether or not we are willing to target it.
-fn guest_numeric_class(guest: crate::backend::vulkan::engine::StorageImageFormat) -> u8 {
-    use crate::backend::vulkan::engine::StorageImageFormat as V;
+fn guest_numeric_class(guest: reims_vgpu_protocol::StorageImageFormat) -> u8 {
+    use reims_vgpu_protocol::StorageImageFormat as V;
     match guest {
         V::Rgba32Float
         | V::Rgba16Float
@@ -4883,12 +4886,12 @@ fn guest_numeric_class(guest: crate::backend::vulkan::engine::StorageImageFormat
 
 #[cfg(feature = "backend-vulkan")]
 fn specialized_storage_image_format(
-    guest: crate::backend::vulkan::engine::StorageImageFormat,
+    guest: reims_vgpu_protocol::StorageImageFormat,
     shader: crate::runtime::spirv_bind::ImageFormat,
     write_without_format: bool,
 ) -> Result<crate::runtime::spirv_bind::ImageFormat, &'static str> {
-    use crate::backend::vulkan::engine::StorageImageFormat as V;
     use crate::runtime::spirv_bind::ImageFormat as S;
+    use reims_vgpu_protocol::StorageImageFormat as V;
 
     let Some(shader_engine) = spirv_image_format_to_engine_storage(shader) else {
         return Err("spirv_storage_format_unsupported");
