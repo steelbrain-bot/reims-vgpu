@@ -295,8 +295,8 @@ pub fn vk_sampled_bytes(format: SampledByteFormat) -> vk::Format {
     match srgb_texel_layout(format.layout()) {
         Some(srgb) => srgb,
         None => {
-            crate::runtime::census::srgb_census::note_downgrade(
-                crate::runtime::census::srgb_census::site::SAMPLED_BYTE_UPLOAD,
+            reims_vgpu_vulkan::srgb_census::note_downgrade(
+                reims_vgpu_vulkan::srgb_census::site::SAMPLED_BYTE_UPLOAD,
                 mtl,
             );
             linear
@@ -2296,7 +2296,7 @@ mod tests {
     fn the_downgrade_slug_matches_the_always_on_census() {
         assert_eq!(
             TranslateReason::SrgbDowngraded(0).slug(),
-            crate::runtime::census::srgb_census::SRGB_DOWNGRADED_SLUG
+            reims_vgpu_vulkan::srgb_census::SRGB_DOWNGRADED_SLUG
         );
     }
 }

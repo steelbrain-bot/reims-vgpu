@@ -19,4 +19,5 @@ pub mod push_descriptor;
 pub mod spirv_bind;
 pub mod spirv_layout;
 pub mod spirv_vertex_input;
+pub mod srgb_census;
 pub mod telemetry;
