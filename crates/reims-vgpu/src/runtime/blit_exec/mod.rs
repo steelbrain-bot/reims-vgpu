@@ -60,8 +60,9 @@ use reims_vgpu_core::{
     ResolvedBlit, ResolvedBufferRange, ResolvedBufferToTextureBlit, ResolvedCommand,
     ResolvedLinearTextureLevel as LinearTextureLevel, ResolvedSubmission,
     ResolvedSurfaceTextureBacking as IOSurfaceTextureBacking,
-    ResolvedTextureBacking as TextureBacking, ResolvedTextureEndpoint, ResolvedTextureToBufferBlit,
-    ResolvedTextureToTextureBlit, TextureExtent, TextureOrigin,
+    ResolvedTextureBacking as TextureBacking, ResolvedTextureCopyBatch, ResolvedTextureEndpoint,
+    ResolvedTextureLevelCopy, ResolvedTextureToBufferBlit, ResolvedTextureToTextureBlit,
+    TextureExtent, TextureOrigin,
 };
 use reims_vgpu_protocol::{ByteLength, GuestVirtualAddress, MappingId, ObjectTableRef};
 use reims_vgpu_wire::ops::blit as wire_blit;
@@ -363,7 +364,23 @@ fn resolve_texture_backing<M: HostMemory + HostOps>(
     level: u16,
     slice: u16,
 ) -> Result<TextureBacking, BlitStatus> {
-    resolve_texture_backing_depth(state, host, task_id, texture_ref, level, slice, 0)
+    resolve_texture_backing_depth(state, host, task_id, texture_ref, level, slice, 0, true)
+}
+
+/// Resolve immutable texture storage without making its guest bytes current.
+///
+/// Planning uses this only when execution owns the decision between a resident
+/// GPU copy and a guest-byte fallback. The latter must explicitly settle the
+/// endpoint before reading or partially overwriting it.
+fn resolve_texture_backing_unsettled<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    level: u16,
+    slice: u16,
+) -> Result<TextureBacking, BlitStatus> {
+    resolve_texture_backing_depth(state, host, task_id, texture_ref, level, slice, 0, false)
 }
 
 fn resolve_texture_endpoint<M: HostMemory + HostOps>(
@@ -382,6 +399,98 @@ fn resolve_texture_endpoint<M: HostMemory + HostOps>(
         content: ContentStamp { resource, version },
         backing,
     })
+}
+
+fn resolve_texture_endpoint_unsettled<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    level: u16,
+    slice: u16,
+) -> Result<ResolvedTextureEndpoint, BlitStatus> {
+    let backing =
+        resolve_texture_backing_unsettled(state, host, task_id, texture_ref, level, slice)?;
+    let Some((resource, version)) = state.task_resources.content_stamp(task_id, texture_ref) else {
+        return Err(br(BlitStatus::MissingResource, "tex_no_semantic_identity"));
+    };
+    Ok(ResolvedTextureEndpoint {
+        content: ContentStamp { resource, version },
+        backing,
+    })
+}
+
+fn resolve_texture_copy_batch<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    cmd: &Command,
+) -> Result<ResolvedBlit, BlitStatus> {
+    if cmd.slice_count == 0 || cmd.level_count == 0 {
+        return Err(BlitStatus::ZeroExtent);
+    }
+    if cmd.source == 0 || cmd.destination == 0 {
+        return Err(br(BlitStatus::MissingResource, "sl_missing_ref"));
+    }
+    let mut levels = Vec::with_capacity(usize::from(cmd.level_count));
+    for level_delta in 0..cmd.level_count {
+        let sl_resolve_started = std::time::Instant::now();
+        let source_level = cmd
+            .source_level
+            .checked_add(level_delta)
+            .ok_or_else(|| br(BlitStatus::Bounds, "sl_src_level_overflow"))?;
+        let destination_level = cmd
+            .destination_level
+            .checked_add(level_delta)
+            .ok_or_else(|| br(BlitStatus::Bounds, "sl_dst_level_overflow"))?;
+        let mut slices = Vec::with_capacity(usize::from(cmd.slice_count));
+        for slice_delta in 0..cmd.slice_count {
+            let source_slice = cmd
+                .source_slice
+                .checked_add(slice_delta)
+                .ok_or_else(|| br(BlitStatus::Bounds, "sl_src_slice_overflow"))?;
+            let destination_slice = cmd
+                .destination_slice
+                .checked_add(slice_delta)
+                .ok_or_else(|| br(BlitStatus::Bounds, "sl_dst_slice_overflow"))?;
+            slices.push((
+                resolve_texture_endpoint_unsettled(
+                    state,
+                    host,
+                    task_id,
+                    cmd.source,
+                    source_level,
+                    source_slice,
+                )?,
+                resolve_texture_endpoint_unsettled(
+                    state,
+                    host,
+                    task_id,
+                    cmd.destination,
+                    destination_level,
+                    destination_slice,
+                )?,
+            ));
+        }
+        let first_slice = slices.remove(0);
+        levels.push(ResolvedTextureLevelCopy {
+            first_slice,
+            remaining_slices: slices.into_boxed_slice(),
+        });
+        crate::runtime::drain::note_store_route_us(
+            "sl_resolve_us",
+            sl_resolve_started.elapsed().as_micros() as u64,
+        );
+    }
+    let first_level = levels.remove(0);
+    Ok(ResolvedBlit::TextureCopyBatch(ResolvedTextureCopyBatch {
+        source_object: ObjectTableRef::new(cmd.source),
+        destination_object: ObjectTableRef::new(cmd.destination),
+        source_base_slice: cmd.source_slice,
+        destination_base_slice: cmd.destination_slice,
+        first_level,
+        remaining_levels: levels.into_boxed_slice(),
+    }))
 }
 
 fn resolve_buffer_to_texture_blit<M: HostMemory + HostOps>(
@@ -538,6 +647,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
     // `whole_surface_0x13e_volume_rejects_multi_slice` noticed — by the refusal
     // order changing, not by the field.
     view_depth: u32,
+    settle_guest_bytes: bool,
 ) -> Result<TextureBacking, BlitStatus> {
     if texture_ref == 0 {
         return Err(br(BlitStatus::MissingResource, "tex_ref_zero"));
@@ -584,8 +694,10 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
     // rect are the resource's content and must be real; and leaving the debt
     // armed would let it land the pre-blit resident over the blit's own bytes
     // later.
-    note_blit_endpoint_debt(state, task_id, texture_ref);
-    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
+    if settle_guest_bytes {
+        note_blit_endpoint_debt(state, task_id, texture_ref);
+        crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
+    }
     // Resolve through the retained resource aggregate, not directly through
     // mutable object-list bytes.  A successful endpoint therefore has one
     // generational identity and one descriptor snapshot for its whole guest
@@ -695,6 +807,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
             abs_level as u16,
             abs_slice as u16,
             view_depth + 1,
+            settle_guest_bytes,
         )?;
         // Geometry constraints for non-2D types.
         match &backing {
@@ -1819,6 +1932,12 @@ fn execute_resolved_blit<M: HostMemory + HostOps>(
                         status => Err(status),
                     }
                 }
+                ResolvedBlit::TextureCopyBatch(operation) => {
+                    match execute_resolved_texture_copy_batch(state, host, task_id, operation) {
+                        BlitStatus::Ok => Ok(()),
+                        status => Err(status),
+                    }
+                }
             }?;
             let Some(version) = state.task_resources.note_guest_write_by_id(destination) else {
                 return Err(br(
@@ -1868,8 +1987,8 @@ fn blit_write_destination(cmd: &Command) -> Option<u32> {
             CopyKind::BufferToBuffer
             | CopyKind::BufferToTexture
             | CopyKind::TextureToBuffer
-            | CopyKind::TextureToTexture => None,
-            CopyKind::TextureToTextureSliceLevel => Some(cmd.destination),
+            | CopyKind::TextureToTexture
+            | CopyKind::TextureToTextureSliceLevel => None,
             CopyKind::None => None,
         },
         Kind::Fence
@@ -3810,7 +3929,8 @@ fn gpu_whole_plane_destination(
 /// pages into the destination's — two crossings of a frame to move content the
 /// GPU already holds.
 ///
-/// So this arm never resolves the source, and **never pays the source's debt**.
+/// Planning resolves the source's immutable storage geometry, but this arm
+/// **never pays the source's debt**.
 /// The source's own guest pages stay stale and stay owed; the debt stays armed,
 /// and the next genuine guest-byte reader — a sample, a compute bind, a
 /// `CmdSynchronizeResources` — is what lands them. That is what the Metal
@@ -3818,7 +3938,7 @@ fn gpu_whole_plane_destination(
 /// host visibility, and `synchronizeResource:` is the separate call that means
 /// "make this CPU-visible".
 ///
-/// The *destination*'s debt is still paid, by the resolve below, and must be:
+/// The *destination*'s debt is still paid before this policy runs, and must be:
 /// leaving it armed would let a pre-blit resident land over this copy's bytes
 /// later.
 ///
@@ -3830,46 +3950,30 @@ fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
-    cmd: &Command,
+    source_object: ObjectTableRef<reims_vgpu_protocol::ResourceObject>,
+    destination_object: ObjectTableRef<reims_vgpu_protocol::ResourceObject>,
+    level_count: u16,
+    slice_count: u16,
+    destination: &TextureBacking,
 ) -> Option<BlitStatus> {
     use crate::runtime::drain::note_store_route;
     let key = crate::runtime::writeback_debt::GvaResourceKey {
         task_id,
-        texture_ref: cmd.source,
+        texture_ref: source_object.get(),
     };
     let debt = state.pending_writebacks.get_gva(key);
     if let Err(refusal) = gpu_whole_plane_admissible(
-        cmd.level_count,
-        cmd.slice_count,
-        cmd.source,
-        cmd.destination,
+        level_count,
+        slice_count,
+        source_object.get(),
+        destination_object.get(),
         debt.is_some(),
     ) {
         note_store_route(refusal.route());
         return None;
     }
     let debt = debt?;
-    // Resolving the destination — and only the destination — is what pays its
-    // debt, and it is the reason this call sits here rather than after the loop
-    // below has resolved both endpoints.
-    let dst = match resolve_texture_backing(
-        state,
-        host,
-        task_id,
-        cmd.destination,
-        cmd.destination_level,
-        cmd.destination_slice,
-    ) {
-        Ok(t) => t,
-        Err(_) => {
-            // The host path re-resolves and returns this same refusal with its
-            // own reason, so saying anything more here would double-count one
-            // failure under two names.
-            note_store_route("sl_gpu_dst_unresolved");
-            return None;
-        }
-    };
-    let TextureBacking::Surface(t) = &dst else {
+    let TextureBacking::Surface(t) = destination else {
         note_store_route(GpuPlaneRefusal::DstNotIOSurface.route());
         return None;
     };
@@ -3961,7 +4065,11 @@ fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
     _state: &mut DeviceState,
     _host: &mut M,
     _task_id: u32,
-    _cmd: &Command,
+    _source_object: ObjectTableRef<reims_vgpu_protocol::ResourceObject>,
+    _destination_object: ObjectTableRef<reims_vgpu_protocol::ResourceObject>,
+    _level_count: u16,
+    _slice_count: u16,
+    _destination: &TextureBacking,
 ) -> Option<BlitStatus> {
     None
 }
@@ -4181,46 +4289,45 @@ fn try_copy_iosurface_plane_to_linear_on_gpu<M: HostMemory + HostOps>(
     }
 }
 
-/// Zero `slice_count` or `level_count` is a Metal no-op ([`BlitStatus::ZeroExtent`]).
-fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
+/// Execute one non-empty, fully resolved multi-slice/multi-level copy.
+fn execute_resolved_texture_copy_batch<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
-    cmd: &Command,
+    operation: ResolvedTextureCopyBatch,
 ) -> BlitStatus {
-    if cmd.slice_count == 0 || cmd.level_count == 0 {
-        return BlitStatus::ZeroExtent;
-    }
-    if cmd.source == 0 || cmd.destination == 0 {
-        return br(BlitStatus::MissingResource, "sl_missing_ref");
-    }
-    // Before the loop, because the loop's first act is to resolve the source and
-    // resolving is what pays its debt. See [`try_copy_whole_plane_on_gpu`].
-    if let Some(status) = try_copy_whole_plane_on_gpu(state, host, task_id, cmd) {
+    let ResolvedTextureCopyBatch {
+        source_object,
+        destination_object,
+        source_base_slice,
+        destination_base_slice,
+        first_level,
+        remaining_levels,
+    } = operation;
+    let level_count = u16::try_from(1usize.saturating_add(remaining_levels.len()))
+        .expect("wire level count fits u16");
+    let slice_count = u16::try_from(1usize.saturating_add(first_level.remaining_slices.len()))
+        .expect("wire slice count fits u16");
+
+    // A partial destination overwrite must preserve bytes outside the copied
+    // region before either execution policy runs.
+    note_blit_endpoint_debt(state, task_id, destination_object.get());
+    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, destination_object.get());
+    if let Some(status) = try_copy_whole_plane_on_gpu(
+        state,
+        host,
+        task_id,
+        source_object,
+        destination_object,
+        level_count,
+        slice_count,
+        &first_level.first_slice.1.backing,
+    ) {
         return status;
     }
-    for level_i in 0..cmd.level_count {
-        let src_level = match cmd.source_level.checked_add(level_i) {
-            Some(v) => v,
-            None => return br(BlitStatus::Bounds, "sl_src_level_overflow"),
-        };
-        let dst_level = match cmd.destination_level.checked_add(level_i) {
-            Some(v) => v,
-            None => return br(BlitStatus::Bounds, "sl_dst_level_overflow"),
-        };
-        let last_slice_delta = match cmd.slice_count.checked_sub(1) {
-            Some(v) => v,
-            None => return br(BlitStatus::Bounds, "sl_slice_count_underflow"),
-        };
-        let src_last_slice = match cmd.source_slice.checked_add(last_slice_delta) {
-            Some(v) => v,
-            None => return br(BlitStatus::Bounds, "sl_src_slice_overflow"),
-        };
-        let dst_last_slice = match cmd.destination_slice.checked_add(last_slice_delta) {
-            Some(v) => v,
-            None => return br(BlitStatus::Bounds, "sl_dst_slice_overflow"),
-        };
-
+    note_blit_endpoint_debt(state, task_id, source_object.get());
+    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, source_object.get());
+    for level in std::iter::once(&first_level).chain(remaining_levels.iter()) {
         // `blit_kind_t2t_sl_us` charges this function 28.8 s of a 29.1 s rail
         // while `blit_rows_us` — its linear arm's whole copy — reads 0.275 s.
         // Between those two numbers sit the resolves below, and this form runs
@@ -4228,33 +4335,8 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
         // multiplier nobody has measured. `sl_levels_n` is the denominator that
         // says whether a level loop of two or of twelve is being paid for.
         crate::runtime::drain::note_store_route("sl_levels_n");
-        let sl_resolve_started = std::time::Instant::now();
-        // Resolve the starting slice at this level for geometry / format.
-        // Volume (depth>1) forms use slice 0 only; non-zero source_slice on a
-        // depth-1 packing fails at resolve (Bounds). For volumes we require
-        // sliceCount==1 and slices 0 before any multi-slice last-index walk.
-        let src0 = match resolve_texture_backing(
-            state,
-            host,
-            task_id,
-            cmd.source,
-            src_level,
-            cmd.source_slice,
-        ) {
-            Ok(t) => t,
-            Err(st) => return st,
-        };
-        let dst0 = match resolve_texture_backing(
-            state,
-            host,
-            task_id,
-            cmd.destination,
-            dst_level,
-            cmd.destination_slice,
-        ) {
-            Ok(t) => t,
-            Err(st) => return st,
-        };
+        let src0 = &level.first_slice.0.backing;
+        let dst0 = &level.first_slice.1.backing;
         if src0.bpp() != dst0.bpp() {
             return br(BlitStatus::Unsupported, "sl_bpp_mismatch");
         }
@@ -4270,10 +4352,6 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
         if src0.depth() != dst0.depth() {
             return br(BlitStatus::Bounds, "sl_depth_mismatch");
         }
-        crate::runtime::drain::note_store_route_us(
-            "sl_resolve_us",
-            sl_resolve_started.elapsed().as_micros() as u64,
-        );
         let w = src0.width();
         let h = src0.height();
         let d = src0.depth();
@@ -4283,29 +4361,12 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
         let is_volume = d > 1;
         // Metal 3D whole-surface: sliceCount must be 1, slices 0; full depth of mip.
         if is_volume {
-            if cmd.slice_count != 1 || cmd.source_slice != 0 || cmd.destination_slice != 0 {
+            if slice_count != 1 || source_base_slice != 0 || destination_base_slice != 0 {
                 return br(BlitStatus::Unsupported, "sl_volume_slice_constraint");
             }
             // IOSurface texture is 2D (depth 1); volume endpoints are linear only.
             if src0.is_surface() || dst0.is_surface() {
                 return br(BlitStatus::Unsupported, "sl_volume_iosurface");
-            }
-        } else if cmd.slice_count > 1 {
-            // Array form: last slice must resolve (view / packing bounds).
-            if let Err(st) =
-                resolve_texture_backing(state, host, task_id, cmd.source, src_level, src_last_slice)
-            {
-                return st;
-            }
-            if let Err(st) = resolve_texture_backing(
-                state,
-                host,
-                task_id,
-                cmd.destination,
-                dst_level,
-                dst_last_slice,
-            ) {
-                return st;
             }
         }
         let bpp = src0.bpp();
@@ -4315,8 +4376,8 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
         };
 
         // Linear: multi-slice (depth-1) or full volume (depth>1).
-        if let (TextureBacking::Linear(ref sl), TextureBacking::Linear(ref dl)) = (&src0, &dst0) {
-            if !is_volume && cmd.slice_count > 1 && (sl.slice_stride == 0 || dl.slice_stride == 0) {
+        if let (TextureBacking::Linear(sl), TextureBacking::Linear(dl)) = (src0, dst0) {
+            if !is_volume && slice_count > 1 && (sl.slice_stride == 0 || dl.slice_stride == 0) {
                 return br(BlitStatus::Unsupported, "sl_slice_stride_zero");
             }
             let src_off = match sl.texel_offset(0, 0, 0) {
@@ -4347,7 +4408,7 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
                     _ => return br(BlitStatus::Bounds, "sl_dst_bpi_zero"),
                 };
                 (src_bpi, dst_bpi, d as u64)
-            } else if cmd.slice_count <= 1 {
+            } else if slice_count <= 1 {
                 // One image, so neither stride is ever stepped: both consumers
                 // scale it by `image_count - 1`, which is zero here —
                 // `strided_span`'s `last_image` term and `copy_region`'s `z`
@@ -4362,7 +4423,7 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
                     1u64,
                 )
             } else {
-                (sl.slice_stride, dl.slice_stride, cmd.slice_count as u64)
+                (sl.slice_stride, dl.slice_stride, u64::from(slice_count))
             };
             // Same allocation overlap check (conservative).
             if sl.base_gva == dl.base_gva {
@@ -4404,26 +4465,11 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
         // stages the slice whole now; see [`read_texture_rect`].
         let sl_mixed_started = std::time::Instant::now();
         let mut staged = vec![0u8; (row_bytes.saturating_mul(h as u64)) as usize];
-        for si in 0..cmd.slice_count {
-            let ss = match cmd.source_slice.checked_add(si) {
-                Some(v) => v,
-                None => return br(BlitStatus::Bounds, "sl_inner_src_slice_overflow"),
-            };
-            let ds = match cmd.destination_slice.checked_add(si) {
-                Some(v) => v,
-                None => return br(BlitStatus::Bounds, "sl_inner_dst_slice_overflow"),
-            };
-            let src = match resolve_texture_backing(state, host, task_id, cmd.source, src_level, ss)
-            {
-                Ok(t) => t,
-                Err(st) => return st,
-            };
-            let dst =
-                match resolve_texture_backing(state, host, task_id, cmd.destination, dst_level, ds)
-                {
-                    Ok(t) => t,
-                    Err(st) => return st,
-                };
+        for (source, destination) in
+            std::iter::once(&level.first_slice).chain(level.remaining_slices.iter())
+        {
+            let src = &source.backing;
+            let dst = &destination.backing;
             if src.width() != w || src.height() != h || dst.width() != w || dst.height() != h {
                 return br(BlitStatus::Bounds, "sl_inner_dim_mismatch");
             }
@@ -4431,7 +4477,7 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
                 state,
                 host,
                 task_id,
-                &dst,
+                dst,
                 Point { x: 0, y: 0, z: 0 },
                 w,
                 h as u64,
@@ -4445,7 +4491,7 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
                 state,
                 host,
                 task_id,
-                &src,
+                src,
                 Point { x: 0, y: 0, z: 0 },
                 row_bytes,
                 h as u64,
@@ -4457,7 +4503,7 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
                 state,
                 host,
                 task_id,
-                &dst,
+                dst,
                 Point { x: 0, y: 0, z: 0 },
                 row_bytes,
                 h as u64,
@@ -4583,7 +4629,14 @@ pub fn execute_blit<M: HostMemory + HostOps>(
                 }
             }
             CopyKind::TextureToTextureSliceLevel => {
-                exec_copy_texture_to_texture_slice_level(state, host, task_id, cmd)
+                if cmd.slice_count == 0 || cmd.level_count == 0 {
+                    BlitStatus::ZeroExtent
+                } else {
+                    match resolve_texture_copy_batch(state, host, task_id, cmd) {
+                        Ok(operation) => execute_resolved_blit(state, host, task_id, operation),
+                        Err(status) => status,
+                    }
+                }
             }
             CopyKind::None => br(BlitStatus::Unsupported, "copy_kind_none"),
         },

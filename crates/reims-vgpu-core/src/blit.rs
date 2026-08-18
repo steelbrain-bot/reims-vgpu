@@ -139,6 +139,26 @@ pub struct ResolvedTextureToTextureBlit {
     pub destination_object: ObjectTableRef<ResourceObject>,
 }
 
+/// All slice pairs at one mip level of a whole-texture copy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedTextureLevelCopy {
+    pub first_slice: (ResolvedTextureEndpoint, ResolvedTextureEndpoint),
+    pub remaining_slices: Box<[(ResolvedTextureEndpoint, ResolvedTextureEndpoint)]>,
+}
+
+/// One multi-slice, multi-level texture copy resolved without forcing guest
+/// bytes current. Execution may consume an authoritative resident directly;
+/// its guest-byte fallback explicitly settles the named resources first.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedTextureCopyBatch {
+    pub source_object: ObjectTableRef<ResourceObject>,
+    pub destination_object: ObjectTableRef<ResourceObject>,
+    pub source_base_slice: u16,
+    pub destination_base_slice: u16,
+    pub first_level: ResolvedTextureLevelCopy,
+    pub remaining_levels: Box<[ResolvedTextureLevelCopy]>,
+}
+
 impl ResolvedTextureBacking {
     pub const fn width(&self) -> u32 {
         match self {
@@ -224,6 +244,7 @@ pub enum ResolvedBlit {
     BufferToTexture(ResolvedBufferToTextureBlit),
     TextureToBuffer(ResolvedTextureToBufferBlit),
     TextureToTexture(ResolvedTextureToTextureBlit),
+    TextureCopyBatch(ResolvedTextureCopyBatch),
 }
 
 impl ResolvedBlit {
@@ -233,6 +254,7 @@ impl ResolvedBlit {
             Self::BufferToTexture(operation) => operation.destination.content,
             Self::TextureToBuffer(operation) => operation.destination.content,
             Self::TextureToTexture(operation) => operation.destination.content,
+            Self::TextureCopyBatch(operation) => operation.first_level.first_slice.1.content,
         }
     }
 }
@@ -250,6 +272,25 @@ mod tests {
             },
             address: GuestVirtualAddress::new(address),
             length: ByteLength::new(16),
+        }
+    }
+
+    fn linear_endpoint(index: u32) -> ResolvedTextureEndpoint {
+        ResolvedTextureEndpoint {
+            content: range(index, 1, u64::from(index) << 12).content,
+            backing: ResolvedTextureBacking::Linear(ResolvedLinearTextureLevel {
+                base_gva: u64::from(index) << 12,
+                alloc_size: 0x1000,
+                level_offset: 0,
+                row_stride: 64,
+                slice_stride: 0,
+                slice_index: 0,
+                width: 8,
+                height: 4,
+                depth: 1,
+                bpp: 4,
+                pixel_format: 80,
+            }),
         }
     }
 
@@ -374,6 +415,24 @@ mod tests {
             destination_bytes_per_row: 16,
             destination_bytes_per_image: 16,
             aspect: BlitAspect::Full,
+        });
+
+        assert_eq!(operation.destination_content(), destination.content);
+    }
+
+    #[test]
+    fn a_texture_copy_batch_is_non_empty_by_construction() {
+        let destination = linear_endpoint(22);
+        let operation = ResolvedBlit::TextureCopyBatch(ResolvedTextureCopyBatch {
+            source_object: ObjectTableRef::new(7),
+            destination_object: ObjectTableRef::new(9),
+            source_base_slice: 0,
+            destination_base_slice: 0,
+            first_level: ResolvedTextureLevelCopy {
+                first_slice: (linear_endpoint(21), destination.clone()),
+                remaining_slices: Box::new([]),
+            },
+            remaining_levels: Box::new([]),
         });
 
         assert_eq!(operation.destination_content(), destination.content);
