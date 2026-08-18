@@ -892,7 +892,7 @@ impl VertexStepFunction {
     /// The inverse of [`translate::vertex::step_function`], which is where the
     /// three accepted ordinals are chosen and where the round trip is pinned.
     /// It exists so a rule stated over the *wire* value — the step/rate pair in
-    /// [`crate::contract::vertex_step`] — can be asked on this side without a
+    /// [`reims_vgpu_protocol::vertex_step`] — can be asked on this side without a
     /// second copy of the mapping.
     pub fn mtl_ordinal(self) -> u32 {
         use reims_vgpu_protocol::vertex_step as step;

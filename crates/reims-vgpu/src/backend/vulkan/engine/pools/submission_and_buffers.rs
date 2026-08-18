@@ -3974,15 +3974,8 @@ mod recycle_tests {
     #[test]
     fn a_discarded_cache_leaves_no_entry_and_no_bytes() {
         let mut pools = ResourcePools::new();
-        let resource = std::sync::Arc::new(crate::model::TaskResource::new(
-            reims_vgpu_protocol::ObjectListEntry::new(
-                reims_vgpu_protocol::ObjectKind::Buffer,
-                0,
-                0,
-            ),
-            std::sync::Arc::from([]),
-        ));
-        let owner = resource.lifetime_ref();
+        let resource = reims_vgpu_core::ResourceLifetime::new();
+        let owner = resource.reference();
 
         for i in 0..3u32 {
             let slot = null_slot(16 + i, 16);
@@ -4102,15 +4095,8 @@ mod recycle_tests {
 
         let slot = null_slot(8, 8);
         let key = slot.key();
-        let resource = std::sync::Arc::new(crate::model::TaskResource::new(
-            reims_vgpu_protocol::ObjectListEntry::new(
-                reims_vgpu_protocol::ObjectKind::Buffer,
-                0,
-                0,
-            ),
-            std::sync::Arc::from([]),
-        ));
-        let owner = resource.lifetime_ref();
+        let resource = reims_vgpu_core::ResourceLifetime::new();
+        let owner = resource.reference();
         // File the retained blob under the *incoming* blob's digest. This is the
         // collision, forced rather than found.
         pools.sampled_cache.push(ResidentSampledSlot {
@@ -4148,15 +4134,8 @@ mod recycle_tests {
         let content: Vec<u8> = (0..64u8).map(|b| b.wrapping_mul(7)).collect();
         let slot = null_slot(8, 8);
         let key = slot.key();
-        let resource = std::sync::Arc::new(crate::model::TaskResource::new(
-            reims_vgpu_protocol::ObjectListEntry::new(
-                reims_vgpu_protocol::ObjectKind::Buffer,
-                0,
-                0,
-            ),
-            std::sync::Arc::from([]),
-        ));
-        let owner = resource.lifetime_ref();
+        let resource = reims_vgpu_core::ResourceLifetime::new();
+        let owner = resource.reference();
         pools.sampled_cache.push(ResidentSampledSlot {
             slot,
             fingerprint: SampledFingerprint::Content(sampled_content_hash(&content)),
@@ -4408,15 +4387,8 @@ mod recycle_tests {
     #[test]
     fn sampled_cache_entries_follow_resource_lifetime_not_age() {
         let mut pools = ResourcePools::new();
-        let resource = std::sync::Arc::new(crate::model::TaskResource::new(
-            reims_vgpu_protocol::ObjectListEntry::new(
-                reims_vgpu_protocol::ObjectKind::Buffer,
-                0,
-                0,
-            ),
-            std::sync::Arc::from([]),
-        ));
-        let owner = resource.lifetime_ref();
+        let resource = reims_vgpu_core::ResourceLifetime::new();
+        let owner = resource.reference();
         let push = |pools: &mut ResourcePools, w: u32, h: u32, touch: u64, len: usize| {
             pools.sampled_cache_bytes = pools.sampled_cache_bytes.saturating_add(len);
             pools.sampled_cache.push(ResidentSampledSlot {

@@ -2219,8 +2219,8 @@ pub fn resident_absent_after_reclaim(
 /// `None` when the identity is absent, evicted, or has not been vouched for
 /// since its last draw.
 ///
-/// Compared by the IOSurface texture LOAD against
-/// [`crate::model::MappingEntry::surface_content_epoch`]: equal means the
+/// Compared by the IOSurface texture LOAD against the mapping's published
+/// surface-content epoch: equal means the
 /// resident already holds exactly the bytes a CPU seed would upload, so the
 /// pass may load straight from the resident and skip the upload. Every way the
 /// answer can be unknown — no slot, recycled image, a draw since the stamp —
