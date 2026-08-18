@@ -4,6 +4,7 @@
 
 pub mod blit;
 pub mod capabilities;
+pub mod draw;
 pub mod endian;
 pub mod execution;
 pub mod namespace;
@@ -15,6 +16,7 @@ pub mod service;
 pub mod submission;
 pub mod target;
 pub mod texel;
+pub mod visibility;
 
 pub use blit::{BufferFillPattern, ResolvedBufferBlit, ResolvedBufferRange};
 pub use capabilities::{CapabilityService, DeviceInfoLimits, ExecutorCapabilities, MAX_CHANNELS};

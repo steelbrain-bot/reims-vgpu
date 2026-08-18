@@ -160,7 +160,7 @@ pub fn vk_index_type(index: IndexType) -> vk::IndexType {
 /// disarming is a thing the guest is entitled to ask for, and an unknown
 /// ordinal is not.
 pub fn visibility_result_mode(mtl: u32) -> Result<Option<VisibilityResultMode>, TranslateReason> {
-    use crate::contract::visibility::VISIBILITY_RESULT_MODE_DISABLED;
+    use reims_vgpu_core::visibility::VISIBILITY_RESULT_MODE_DISABLED;
     Ok(match mtl {
         // The one arm that is a *meaning* rather than a mode, so it is the one
         // arm spelled from the contract rather than as a literal beside its
@@ -278,7 +278,7 @@ mod tests {
         for mtl in 0..=8u32 {
             assert_eq!(
                 primitive_topology(mtl).is_ok(),
-                crate::contract::draw::primitive_type_executable(mtl),
+                reims_vgpu_core::draw::primitive_type_executable(mtl),
                 "primitive type {mtl}: advertisement and translation disagree"
             );
         }
@@ -454,7 +454,7 @@ mod tests {
     /// new mode cannot silently fall out of the Vulkan mapping.
     #[test]
     fn the_recorded_visibility_modes_are_the_ones_the_contract_names() {
-        use crate::contract::visibility::{
+        use reims_vgpu_core::visibility::{
             visibility_result_mode_recordable, VISIBILITY_RESULT_MODE_DISABLED,
             VISIBILITY_RESULT_MODE_SWEEP_END,
         };
