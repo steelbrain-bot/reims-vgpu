@@ -163,7 +163,7 @@ pub struct ResolvedRenderPipeline {
     /// Present only for a state registered under the guest pipeline object's
     /// lifetime. The memo-off ablation reconstructs per draw and therefore has
     /// no retained identity to publish to a backend cache.
-    pub pipeline_object: Option<crate::backend::vulkan::engine::PipelineObjectIdentity>,
+    pub pipeline_lifetime: Option<reims_vgpu_core::ResourceLifetime>,
     pub desc: Arc<RenderPipelineDescriptor>,
     pub vertex: Arc<CachedShader>,
     pub fragment: Arc<CachedShader>,
@@ -202,7 +202,7 @@ pub(crate) fn retained_pipeline_with_desc_for_test(
     };
     let desc = Arc::new(desc);
     Arc::new(ResolvedRenderPipeline {
-        pipeline_object: Some(crate::backend::vulkan::engine::PipelineObjectIdentity::new()),
+        pipeline_lifetime: Some(reims_vgpu_core::ResourceLifetime::new()),
         bind_plan: Arc::new(VertexBindPlan::build(&desc)),
         desc,
         vertex: Arc::new(CachedShader::new(
@@ -306,7 +306,7 @@ pub fn resolve<M: HostMemory + HostOps>(
     note_store_route("pipe_memo_miss");
 
     let mut resolved = resolve_uncached(state, host, task_id, pipeline_ref)?;
-    resolved.pipeline_object = Some(crate::backend::vulkan::engine::PipelineObjectIdentity::new());
+    resolved.pipeline_lifetime = Some(reims_vgpu_core::ResourceLifetime::new());
     let resolved = Arc::new(resolved);
     Ok(state.task_render_pipeline_states.register(
         task_id,
@@ -422,7 +422,7 @@ fn resolve_uncached<M: HostMemory + HostOps>(
     })?;
     let bind_plan = Arc::new(VertexBindPlan::build(&desc));
     Ok(ResolvedRenderPipeline {
-        pipeline_object: None,
+        pipeline_lifetime: None,
         desc: Arc::new(desc),
         vertex,
         fragment,
@@ -474,7 +474,7 @@ mod tests {
             retained_pipeline_for_test(),
         );
         let first_id = first
-            .pipeline_object
+            .pipeline_lifetime
             .as_ref()
             .expect("a retained state has an object identity")
             .id();
@@ -506,7 +506,7 @@ mod tests {
         );
         assert_ne!(
             replacement
-                .pipeline_object
+                .pipeline_lifetime
                 .as_ref()
                 .expect("the replacement is retained")
                 .id(),

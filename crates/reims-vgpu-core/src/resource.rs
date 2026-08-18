@@ -22,7 +22,7 @@ struct ResourceLifetimeToken {
 ///
 /// Backend caches receive only [`ResourceLifetimeRef`]. Entries therefore die
 /// with the guest-owned resource rather than an invented capacity or timer.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ResourceLifetime(Arc<ResourceLifetimeToken>);
 
 impl Default for ResourceLifetime {
@@ -48,6 +48,10 @@ impl ResourceLifetime {
             id: self.0.id,
             live: Arc::downgrade(&self.0),
         }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.0.id
     }
 }
 

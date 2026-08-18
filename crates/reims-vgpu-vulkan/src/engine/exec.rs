@@ -3209,7 +3209,7 @@ pub(crate) unsafe fn execute_draw_inner(
         indexes,
         ctx,
         &pipeline_key,
-        req.pipeline_object.as_ref(),
+        req.pipeline_lifetime.as_ref(),
         vert_module,
         &req.vert_spirv,
         frag_module,

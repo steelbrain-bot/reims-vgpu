@@ -888,7 +888,7 @@ impl SessionCacheIndexes {
 }
 
 struct ObjectVariantIndex<K, V> {
-    map: HashMap<std::num::NonZeroU64, (std::sync::Weak<super::types::PipelineObjectLife>, K, V)>,
+    map: HashMap<u64, (reims_vgpu_core::ResourceLifetimeRef, K, V)>,
 }
 
 impl<K, V> Default for ObjectVariantIndex<K, V> {
@@ -910,26 +910,26 @@ impl<K: Clone + Eq, V: Copy> ObjectVariantIndex<K, V> {
     /// draw for nothing. A `Weak` reads `strong_count() == 0` exactly when its
     /// value has been dropped, which is the same question `upgrade().is_none()`
     /// asked.
-    fn get(&mut self, identity: &super::types::PipelineObjectIdentity, key: &K) -> Option<V> {
+    fn get(&mut self, identity: &reims_vgpu_core::ResourceLifetime, key: &K) -> Option<V> {
         let id = identity.id();
         let (life, held_key, pipeline) = self.map.get(&id)?;
-        if life.strong_count() == 0 {
+        if !life.is_live() {
             self.map.remove(&id);
             return None;
         }
         (held_key == key).then_some(*pipeline)
     }
 
-    fn remember(&mut self, identity: &super::types::PipelineObjectIdentity, key: &K, value: V) {
+    fn remember(&mut self, identity: &reims_vgpu_core::ResourceLifetime, key: &K, value: V) {
         let id = identity.id();
         if !self.map.contains_key(&id) {
             // Object construction is rare. Reap identities whose runtime
             // object has gone before admitting the new one, so the index
             // follows object lifetime without a capacity or eviction policy.
-            self.map.retain(|_, (life, _, _)| life.strong_count() != 0);
+            self.map.retain(|_, (life, _, _)| life.is_live());
         }
         self.map
-            .insert(id, (identity.downgrade(), key.clone(), value));
+            .insert(id, (identity.reference(), key.clone(), value));
     }
 
     fn clear(&mut self) {
@@ -2096,7 +2096,7 @@ impl ObjectCaches {
         indexes: &mut SessionCacheIndexes,
         ctx: &DeviceContext,
         key: &PipelineKey,
-        pipeline_object: Option<&super::types::PipelineObjectIdentity>,
+        pipeline_lifetime: Option<&reims_vgpu_core::ResourceLifetime>,
         vert_module: vk::ShaderModule,
         // The post-relocation words `vert_module` was built from. Read only to
         // answer how wide this shader's stage-in reads are, and only on a host
@@ -2112,7 +2112,7 @@ impl ObjectCaches {
         counters: &EngineCounters,
         pools: &mut ResourcePools,
     ) -> Result<vk::Pipeline, DrawError> {
-        if let Some(identity) = pipeline_object {
+        if let Some(identity) = pipeline_lifetime {
             if let Some(pipeline) = indexes.pipeline_objects.get(identity, key) {
                 counters.pipeline_hits.fetch_add(1, Ordering::Relaxed);
                 counters
@@ -2130,7 +2130,7 @@ impl ObjectCaches {
             if front {
                 counters.pipeline_front_hits.fetch_add(1, Ordering::Relaxed);
             }
-            if let Some(identity) = pipeline_object {
+            if let Some(identity) = pipeline_lifetime {
                 indexes.pipeline_objects.remember(identity, key, p);
             }
             return Ok(p);
@@ -2505,7 +2505,7 @@ impl ObjectCaches {
         if let Some(old) = self.pipelines.insert(key.clone(), pipe) {
             pools.dispose(&ctx.device, DeferredHandle::Pipeline(old));
         }
-        if let Some(identity) = pipeline_object {
+        if let Some(identity) = pipeline_lifetime {
             indexes.pipeline_objects.remember(identity, key, pipe);
         }
         Ok(pipe)
@@ -3029,8 +3029,8 @@ mod object_cache_tests {
     #[test]
     fn retained_object_front_requires_the_same_identity_and_exact_variant() {
         let mut index: ObjectVariantIndex<u32, u32> = ObjectVariantIndex::default();
-        let first = super::super::types::PipelineObjectIdentity::new();
-        let second = super::super::types::PipelineObjectIdentity::new();
+        let first = reims_vgpu_core::ResourceLifetime::new();
+        let second = reims_vgpu_core::ResourceLifetime::new();
 
         index.remember(&first, &7, 70);
         assert_eq!(index.get(&first, &7), Some(70));
@@ -3049,12 +3049,12 @@ mod object_cache_tests {
     #[test]
     fn retained_object_front_reaps_dead_identities_without_capacity_eviction() {
         let mut index: ObjectVariantIndex<u32, u32> = ObjectVariantIndex::default();
-        let first = super::super::types::PipelineObjectIdentity::new();
+        let first = reims_vgpu_core::ResourceLifetime::new();
         index.remember(&first, &1, 10);
         assert_eq!(index.map.len(), 1);
         drop(first);
 
-        let second = super::super::types::PipelineObjectIdentity::new();
+        let second = reims_vgpu_core::ResourceLifetime::new();
         index.remember(&second, &2, 20);
         assert_eq!(index.map.len(), 1, "the expired object's weak entry went");
         assert_eq!(index.get(&second, &2), Some(20));

@@ -328,56 +328,13 @@ pub struct StencilState {
     pub clear_value: u32,
 }
 
-/// Identity of one retained guest render-pipeline state.
-///
-/// The token carries no Vulkan object and exposes no guest reference. It lets
-/// the engine remember the last exact Vulkan variant used by this immutable
-/// pipeline object without globally hashing the object's complete content key
-/// on every draw. A weak copy in the engine index follows this token's
-/// lifetime, so deleting the guest object does not leave an immortal identity
-/// entry behind.
-#[derive(Clone, Debug)]
-pub struct PipelineObjectIdentity {
-    id: std::num::NonZeroU64,
-    life: std::sync::Arc<PipelineObjectLife>,
-}
-
-#[derive(Debug)]
-pub(crate) struct PipelineObjectLife;
-
-impl PipelineObjectIdentity {
-    pub fn new() -> Self {
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        let raw = NEXT
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
-                next.checked_add(1)
-            })
-            .expect("retained pipeline identity space exhausted");
-        Self {
-            id: std::num::NonZeroU64::new(raw)
-                .expect("pipeline identity allocator never publishes zero"),
-            life: std::sync::Arc::new(PipelineObjectLife),
-        }
-    }
-
-    pub fn id(&self) -> std::num::NonZeroU64 {
-        self.id
-    }
-
-    pub(crate) fn downgrade(&self) -> std::sync::Weak<PipelineObjectLife> {
-        std::sync::Arc::downgrade(&self.life)
-    }
-}
-
 /// Inputs for one offscreen draw. Engine receives resolved bytes + post-reloc SPIR-V only.
 #[derive(Debug, Default)]
 pub struct DrawRequest {
     /// The retained guest pipeline object this draw resolved, when the retained
     /// lifecycle is enabled. Vulkan still compares the complete variant key;
     /// this identity only chooses the object's exact front entry.
-    pub pipeline_object: Option<PipelineObjectIdentity>,
+    pub pipeline_lifetime: Option<reims_vgpu_core::ResourceLifetime>,
     /// Shared from the runtime translation cache — the engine never mutates
     /// module words; `Arc` avoids a full-module copy per draw.
     pub vert_spirv: std::sync::Arc<Vec<u32>>,
