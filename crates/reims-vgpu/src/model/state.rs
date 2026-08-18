@@ -6,8 +6,8 @@ use crate::runtime::decode::resource::{
 };
 use reims_vgpu_core::{ReferenceNamespace, ResourceGraph, ResourceNode};
 use reims_vgpu_protocol::{
-    ByteLength, ByteOffset, GuestVirtualAddress, MappingId, ObjectRef, PlaneIndex, ResourceId,
-    ResourceObject, SamplerObject, SurfaceBackingId, TaskId,
+    ByteLength, ByteOffset, EventObject, FenceObject, GuestVirtualAddress, MappingId, ObjectRef,
+    PlaneIndex, ResourceId, ResourceObject, SamplerObject, SurfaceBackingId, TaskId,
 };
 #[cfg(feature = "backend-vulkan")]
 use reims_vgpu_protocol::{DepthStencilObject, RenderPipelineObject};
@@ -1392,6 +1392,83 @@ impl<T, M> TaskReferenceStates<T, M> {
 
 /// Per-task sampler objects, keyed by the sampler API's reference space.
 pub type TaskSamplerStates = TaskReferenceStates<TaskSamplerState, SamplerObject>;
+
+#[derive(Debug)]
+struct TaskGenerationState<M> {
+    id: ResourceId<M>,
+    value: u64,
+}
+
+/// Mutable monotonic values in one API-specific task/reference namespace.
+///
+/// Fence and event references can carry equal integers without aliasing. A
+/// fence reference is shared across render, compute, and blit encoders; those
+/// are operation sites over one object, not separate allocators.
+#[derive(Debug)]
+pub struct TaskGenerationStates<M> {
+    values: BTreeMap<(u32, u32), TaskGenerationState<M>>,
+    namespace: ReferenceNamespace<M>,
+}
+
+impl<M> Default for TaskGenerationStates<M> {
+    fn default() -> Self {
+        Self {
+            values: BTreeMap::new(),
+            namespace: ReferenceNamespace::default(),
+        }
+    }
+}
+
+impl<M> TaskGenerationStates<M> {
+    fn generation(&self, task_id: u32, ref_: u32) -> Option<u64> {
+        let state = self.values.get(&(task_id, ref_))?;
+        debug_assert_eq!(
+            self.namespace
+                .resolve(TaskId::new(task_id), ObjectRef::new(ref_)),
+            Some(state.id)
+        );
+        Some(state.value)
+    }
+
+    fn set_generation(&mut self, task_id: u32, ref_: u32, value: u64) {
+        if let Some(state) = self.values.get_mut(&(task_id, ref_)) {
+            state.value = value;
+            return;
+        }
+        let id = self
+            .namespace
+            .publish(TaskId::new(task_id), ObjectRef::new(ref_))
+            .expect("synchronization identity space remains available");
+        self.values
+            .insert((task_id, ref_), TaskGenerationState { id, value });
+    }
+
+    fn delete(&mut self, task_id: u32, ref_: u32) -> bool {
+        let removed = self.values.remove(&(task_id, ref_)).is_some();
+        if removed {
+            assert!(self
+                .namespace
+                .release(TaskId::new(task_id), ObjectRef::new(ref_)));
+        }
+        removed
+    }
+
+    fn delete_task(&mut self, task_id: u32) -> usize {
+        let before = self.values.len();
+        self.values.retain(|&(task, _), _| task != task_id);
+        let removed = before - self.values.len();
+        assert_eq!(removed, self.namespace.release_task(TaskId::new(task_id)));
+        removed
+    }
+
+    #[cfg(test)]
+    fn identity(&self, task_id: u32, ref_: u32) -> Option<ResourceId<M>> {
+        self.values.get(&(task_id, ref_)).map(|state| state.id)
+    }
+}
+
+pub type TaskFenceStates = TaskGenerationStates<FenceObject>;
+pub type TaskEventStates = TaskGenerationStates<EventObject>;
 
 /// Per-task render pipeline states, keyed by the pipeline API's reference
 /// space. A state owns its decoded descriptor, translated functions and derived
@@ -2996,14 +3073,11 @@ pub struct DeviceState {
     pub mapper_capture: Option<MapperCapture>,
     /// Cached IOSurfaceParavirtMapperDevice KVA from capture.
     pub mapper_device_kva: u64,
-    /// Sync value table for event + encoder fence domains.
-    ///
-    /// Key: `(task_id, domain_tag, ref)` → value (event: explicit signal value;
-    /// fence: monotonic generation). Domain tags match
-    /// [`crate::runtime::plan::event_sync::Domain`] as `u8` (`1` = event,
-    /// `2` = blitFence, `3` = computeFence, `4` = renderFence). Stored as a
-    /// plain map so `model` does not depend on the planner types.
-    pub fence_generations: BTreeMap<(u32, u8, u32), u64>,
+    /// Encoder fence generations in the fence allocator's task-local reference
+    /// namespace. Render, compute, and blit operate on the same fence object.
+    pub task_fence_states: TaskFenceStates,
+    /// Explicit event values in the event allocator's separate namespace.
+    pub task_event_states: TaskEventStates,
     /// Child channel currently being drained (0 = none). Convenience for
     /// single-level skip; prefer [`Self::draining_mask`] for nested drains.
     pub draining_channel: u32,
@@ -3072,15 +3146,6 @@ pub struct DeviceState {
     /// `gva_view_stale`; the view self-heals via retire + rebuild).
     pub view_stale_reads: u64,
 }
-
-/// Domain tag for ch-event segment events (matches event_sync::Domain::Event).
-pub const FENCE_DOMAIN_EVENT: u8 = 1;
-/// Domain tag for blit fences (matches event_sync::Domain::BlitFence).
-pub const FENCE_DOMAIN_BLIT: u8 = 2;
-/// Domain tag for compute fences.
-pub const FENCE_DOMAIN_COMPUTE: u8 = 3;
-/// Domain tag for render fences.
-pub const FENCE_DOMAIN_RENDER: u8 = 4;
 
 impl DeviceState {
     /// GPA for a guest PFN under this device's page size.
@@ -3183,7 +3248,8 @@ impl DeviceState {
             display: DisplayHandshake::default(),
             #[cfg(test)]
             fails: Vec::new(),
-            fence_generations: BTreeMap::new(),
+            task_fence_states: TaskFenceStates::default(),
+            task_event_states: TaskEventStates::default(),
             draining_channel: 0,
             draining_mask: 0,
             retired_views: Vec::new(),
@@ -3261,20 +3327,43 @@ impl DeviceState {
         views
     }
 
-    /// Snapshot fence generation if present.
-    pub fn fence_generation(&self, task_id: u32, domain: u8, fence_ref: u32) -> Option<u64> {
-        self.fence_generations
-            .get(&(task_id, domain, fence_ref))
-            .copied()
+    /// Snapshot the generation of one fence object if it has been updated.
+    pub fn fence_generation(&self, task_id: u32, fence_ref: u32) -> Option<u64> {
+        self.task_fence_states.generation(task_id, fence_ref)
     }
 
     /// Store fence generation (monotonic update owned by the planner).
-    pub fn set_fence_generation(&mut self, task_id: u32, domain: u8, fence_ref: u32, value: u64) {
+    pub fn set_fence_generation(&mut self, task_id: u32, fence_ref: u32, value: u64) {
         if fence_ref == 0 {
             return;
         }
-        self.fence_generations
-            .insert((task_id, domain, fence_ref), value);
+        self.task_fence_states
+            .set_generation(task_id, fence_ref, value);
+    }
+
+    pub fn event_generation(&self, task_id: u32, event_ref: u32) -> Option<u64> {
+        self.task_event_states.generation(task_id, event_ref)
+    }
+
+    pub fn set_event_generation(&mut self, task_id: u32, event_ref: u32, value: u64) {
+        if event_ref == 0 {
+            return;
+        }
+        self.task_event_states
+            .set_generation(task_id, event_ref, value);
+    }
+
+    pub(crate) fn delete_fence(&mut self, task_id: u32, fence_ref: u32) -> bool {
+        self.task_fence_states.delete(task_id, fence_ref)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fence_identity(
+        &self,
+        task_id: u32,
+        fence_ref: u32,
+    ) -> Option<ResourceId<FenceObject>> {
+        self.task_fence_states.identity(task_id, fence_ref)
     }
 
     /// Record a clear-only write to `mapping_id` (display_clear / CLEAR Store).
@@ -3602,6 +3691,14 @@ impl DeviceState {
             "icb_task_deleted",
             self.icb_registry.delete_task(task_id) as u64,
         );
+        crate::runtime::drain::note_store_route_n(
+            "fence_task_deleted",
+            self.task_fence_states.delete_task(task_id) as u64,
+        );
+        crate::runtime::drain::note_store_route_n(
+            "event_task_deleted",
+            self.task_event_states.delete_task(task_id) as u64,
+        );
         // A deleted task's whole address space goes with it, so its live
         // mappings are not leaks and a reused id must not inherit them.
         self.map_audit.remove(&task_id);
@@ -3668,6 +3765,14 @@ impl DeviceState {
         crate::runtime::drain::note_store_route_n(
             "icb_task_deleted",
             self.icb_registry.delete_task(task_id) as u64,
+        );
+        crate::runtime::drain::note_store_route_n(
+            "fence_task_deleted",
+            self.task_fence_states.delete_task(task_id) as u64,
+        );
+        crate::runtime::drain::note_store_route_n(
+            "event_task_deleted",
+            self.task_event_states.delete_task(task_id) as u64,
         );
         self.retire_task_linear_residents(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);

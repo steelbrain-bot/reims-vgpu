@@ -8,6 +8,12 @@ pub enum SamplerObject {}
 pub enum DepthStencilObject {}
 /// Marker for the render-pipeline API's independent reference namespace.
 pub enum RenderPipelineObject {}
+/// Marker for the fence API's independent reference namespace.
+#[derive(Debug)]
+pub enum FenceObject {}
+/// Marker for the event API's independent reference namespace.
+#[derive(Debug)]
+pub enum EventObject {}
 
 /// Bytes in one object-list entry.
 pub const OBJECT_LIST_ENTRY_LEN: usize = 12;

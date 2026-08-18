@@ -1,10 +1,10 @@
 //! Event/fence synchronization planner.
 //!
 //! A pure decision function and nothing else: given the generation currently
-//! stored for a `(task, domain, ref)` and a requested signal/wait, decide
+//! stored for a task-local event or fence reference and a requested signal/wait, decide
 //! whether to advance the stored value, treat the operation as already
 //! satisfied, or leave it pending. The storage itself is
-//! [`crate::model::DeviceState::fence_generations`]; this module holds no state
+//! [`crate::model::DeviceState`]; this module holds no state
 //! and performs no I/O, so the whole event/fence contract is testable without a
 //! device.
 

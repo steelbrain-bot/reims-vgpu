@@ -7,7 +7,7 @@
 use super::*;
 use crate::contract::endian::{st16, st32, st64};
 use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA8_UNORM};
-use crate::model::{DeviceId, FENCE_DOMAIN_BLIT, PAGE_SHIFT_ARM64E};
+use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
 use crate::runtime::decode::blit::{self, Point, Size};
 use crate::runtime::decode::resource::{
     list_object_entry_offset, LINEAR_DESC_HANDLE, LINEAR_DESC_MIN_LEN, LINEAR_DESC_SIZE,
@@ -2408,18 +2408,16 @@ fn whole_surface_0x13e_volume_rejects_nonzero_slice() {
 
 #[test]
 fn blit_fence_update_then_wait() {
-    use crate::model::FENCE_DOMAIN_BLIT;
-
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut upd = Command::default();
     upd.kind = Kind::Fence;
     upd.opcode = wire_blit::OPCODE_UPDATE_FENCE;
     upd.fence = 7;
     assert_eq!(execute_blit_fence(&mut state, 1, &upd), BlitStatus::Ok);
-    assert_eq!(state.fence_generation(1, FENCE_DOMAIN_BLIT, 7), Some(1));
+    assert_eq!(state.fence_generation(1, 7), Some(1));
     // Second update advances generation.
     assert_eq!(execute_blit_fence(&mut state, 1, &upd), BlitStatus::Ok);
-    assert_eq!(state.fence_generation(1, FENCE_DOMAIN_BLIT, 7), Some(2));
+    assert_eq!(state.fence_generation(1, 7), Some(2));
     let mut wait = Command::default();
     wait.kind = Kind::Fence;
     wait.opcode = wire_blit::OPCODE_WAIT_FOR_FENCE;
@@ -2438,7 +2436,7 @@ fn blit_fence_wait_pending_without_update() {
         execute_blit_fence(&mut state, 1, &wait),
         BlitStatus::FencePending
     );
-    assert!(state.fence_generation(1, FENCE_DOMAIN_BLIT, 3).is_none());
+    assert!(state.fence_generation(1, 3).is_none());
 }
 
 #[test]

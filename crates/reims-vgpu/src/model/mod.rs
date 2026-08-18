@@ -18,8 +18,7 @@ pub use state::{
     GuestLinearMemo, GvaBacking, GvaEvictionWitness, GvaHostView, HostLinearTexture, HostSurface,
     MapperCapture, MappingEntry, PacketFault, PresentBacking, PresentState, RenderFlushWitness,
     ResourceValidity, SurfaceWriteKind, TaskEntry, TaskResource, TaskResourceLifetimeRef,
-    TaskSamplerState, TaskTable, Type4Walk, UnimplementedCommand, FENCE_DOMAIN_BLIT,
-    FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER, GVA_ENCODE_CACHE_BYTE_CAP,
+    TaskSamplerState, TaskTable, Type4Walk, UnimplementedCommand, GVA_ENCODE_CACHE_BYTE_CAP,
     GVA_EVICTION_WITNESS_KEYS,
 };
 

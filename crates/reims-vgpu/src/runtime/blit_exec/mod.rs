@@ -21,8 +21,8 @@
 //!     copies full `width×height×depth` of that mip (depth planes via
 //!     `bytes_per_image`); linear type-2/3 only
 //!   - zero `sliceCount`/`levelCount` are Metal no-ops
-//! - **Fences** `0x13c` update / `0x13d` wait: blit-fence domain generation via
-//!   [`crate::runtime::plan::event_sync`]; waits that are not yet satisfied are
+//! - **Fences** `0x13c` update / `0x13d` wait: operations on the shared fence
+//!   object via [`crate::runtime::plan::event_sync`]; waits that are not yet satisfied are
 //!   soft-pending (do not block drain), matching the unified-memory in-order path
 //!
 //! Not executed (fail visibly / soft miss):
@@ -4372,7 +4372,7 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
     BlitStatus::Ok
 }
 
-/// Execute blit fence update (`0x13c`) or wait (`0x13d`) on the blit-fence domain.
+/// Execute blit fence update (`0x13c`) or wait (`0x13d`) on the named fence object.
 ///
 /// See [`fence_exec::execute_fence`].
 pub fn execute_blit_fence(state: &mut DeviceState, task_id: u32, cmd: &Command) -> BlitStatus {

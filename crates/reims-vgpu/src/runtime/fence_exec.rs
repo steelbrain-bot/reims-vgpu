@@ -1,13 +1,11 @@
 //! Product-path event + encoder fence sync (event / blit / compute / render).
 //!
 //! Uses [`crate::runtime::plan::event_sync`] for planning and
-//! [`DeviceState::fence_generations`] for storage. Unsatisfied waits are
+//! device-owned typed event and fence namespaces for storage. Unsatisfied waits are
 //! soft-pending and do not block the drain (unified-memory in-order path).
 //! Event timeouts are fail-closed as unsupported (no deferred timer).
 
-use crate::model::{
-    DeviceState, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER,
-};
+use crate::model::DeviceState;
 use crate::runtime::decode::event::{Command as EventCommand, Kind as EventCmdKind};
 use crate::runtime::plan::event_sync::{self, Decision, Domain, EventKind, FenceAction};
 
@@ -73,17 +71,6 @@ fn refused(
     status
 }
 
-/// Map event-sync domain to the compact tag stored on [`DeviceState`].
-pub fn domain_tag(domain: Domain) -> Option<u8> {
-    match domain {
-        Domain::Event => Some(FENCE_DOMAIN_EVENT),
-        Domain::BlitFence => Some(FENCE_DOMAIN_BLIT),
-        Domain::ComputeFence => Some(FENCE_DOMAIN_COMPUTE),
-        Domain::RenderFence => Some(FENCE_DOMAIN_RENDER),
-        Domain::Unknown => None,
-    }
-}
-
 /// Execute fence update or wait on the given encoder domain (blit/compute/render).
 pub fn execute_fence(
     state: &mut DeviceState,
@@ -95,7 +82,7 @@ pub fn execute_fence(
     if fence_ref == 0 {
         return FenceStatus::Missing;
     }
-    let Some(tag) = domain_tag(domain) else {
+    if domain == Domain::Unknown {
         return refused(
             FenceStatus::Unsupported("fence_domain_unknown"),
             fence_ref,
@@ -105,7 +92,7 @@ pub fn execute_fence(
                     .field("action", format!("{action:?}"))
             },
         );
-    };
+    }
     if domain == Domain::Event {
         return refused(
             FenceStatus::Unsupported("fence_event_in_fence_path"),
@@ -116,10 +103,10 @@ pub fn execute_fence(
             },
         );
     }
-    let current = state.fence_generation(task_id, tag, fence_ref);
+    let current = state.fence_generation(task_id, fence_ref);
     let plan = event_sync::plan_fence(action, domain, current);
     if plan.updates_state {
-        state.set_fence_generation(task_id, tag, fence_ref, plan.update_value);
+        state.set_fence_generation(task_id, fence_ref, plan.update_value);
     }
     match plan.decision {
         Decision::SignalUpdate | Decision::SignalNoop | Decision::WaitSatisfied => FenceStatus::Ok,
@@ -165,11 +152,10 @@ pub fn execute_event(state: &mut DeviceState, task_id: u32, cmd: &EventCommand) 
             );
         }
     };
-    let tag = FENCE_DOMAIN_EVENT;
-    let current = state.fence_generation(task_id, tag, cmd.event_ref);
+    let current = state.event_generation(task_id, cmd.event_ref);
     let plan = event_sync::plan_event(kind, cmd.value, cmd.has_timeout, current);
     if plan.updates_state {
-        state.set_fence_generation(task_id, tag, cmd.event_ref, plan.update_value);
+        state.set_event_generation(task_id, cmd.event_ref, plan.update_value);
     }
     match plan.decision {
         Decision::SignalUpdate | Decision::SignalNoop | Decision::WaitSatisfied => FenceStatus::Ok,
@@ -197,10 +183,7 @@ mod tests {
 
     use super::*;
     use crate::contract::endian::{st32, st64};
-    use crate::model::{
-        DeviceId, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER,
-        PAGE_SHIFT_ARM64E,
-    };
+    use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
     use crate::runtime::decode::event::{
         OP_SIGNAL_EVENT, OP_WAIT_EVENT, OP_WAIT_EVENT_TIMEOUT, SIGNAL_WAIT_PAYLOAD_LEN, TIMEOUT,
         WAIT_TIMEOUT_PAYLOAD_LEN,
@@ -225,25 +208,23 @@ mod tests {
     }
 
     #[test]
-    fn blit_compute_render_domains_independent() {
+    fn blit_compute_and_render_share_one_fence_object() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        // Same ref id, three domains.
+        // The encoder selects the operation syntax, not a separate allocator.
         assert_eq!(
             execute_fence(&mut state, 1, Domain::BlitFence, 5, FenceAction::Update),
             FenceStatus::Ok
         );
         assert_eq!(
-            execute_fence(&mut state, 1, Domain::ComputeFence, 5, FenceAction::Update,),
+            execute_fence(&mut state, 1, Domain::ComputeFence, 5, FenceAction::Wait,),
             FenceStatus::Ok
         );
         assert_eq!(
             execute_fence(&mut state, 1, Domain::RenderFence, 5, FenceAction::Update,),
             FenceStatus::Ok
         );
-        assert_eq!(state.fence_generation(1, FENCE_DOMAIN_BLIT, 5), Some(1));
-        assert_eq!(state.fence_generation(1, FENCE_DOMAIN_COMPUTE, 5), Some(1));
-        assert_eq!(state.fence_generation(1, FENCE_DOMAIN_RENDER, 5), Some(1));
-        // Wait each domain satisfied independently.
+        assert_eq!(state.fence_generation(1, 5), Some(2));
+        // Any encoder can wait on the shared fence object.
         for d in [Domain::BlitFence, Domain::ComputeFence, Domain::RenderFence] {
             assert_eq!(
                 execute_fence(&mut state, 1, d, 5, FenceAction::Wait),
@@ -273,7 +254,7 @@ mod tests {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let sig = event_cmd(OP_SIGNAL_EVENT, 7, 100, None);
         assert_eq!(execute_event(&mut state, 1, &sig), FenceStatus::Ok);
-        assert_eq!(state.fence_generation(1, FENCE_DOMAIN_EVENT, 7), Some(100));
+        assert_eq!(state.event_generation(1, 7), Some(100));
 
         let wait_ok = event_cmd(OP_WAIT_EVENT, 7, 100, None);
         assert_eq!(execute_event(&mut state, 1, &wait_ok), FenceStatus::Ok);
@@ -285,7 +266,7 @@ mod tests {
         // Advance signal, then wait satisfied.
         let sig2 = event_cmd(OP_SIGNAL_EVENT, 7, 101, None);
         assert_eq!(execute_event(&mut state, 1, &sig2), FenceStatus::Ok);
-        assert_eq!(state.fence_generation(1, FENCE_DOMAIN_EVENT, 7), Some(101));
+        assert_eq!(state.event_generation(1, 7), Some(101));
         assert_eq!(execute_event(&mut state, 1, &wait_hi), FenceStatus::Ok);
     }
 
@@ -305,15 +286,32 @@ mod tests {
             execute_event(&mut state, 1, &event_cmd(OP_SIGNAL_EVENT, 3, 50, None)),
             FenceStatus::Ok
         );
-        assert_eq!(state.fence_generation(1, FENCE_DOMAIN_EVENT, 3), Some(50));
+        assert_eq!(state.event_generation(1, 3), Some(50));
 
-        // Same ref on blit fence domain is independent.
+        // An equal ref in the fence namespace is independent of the event.
         assert_eq!(
             execute_fence(&mut state, 1, Domain::BlitFence, 3, FenceAction::Update),
             FenceStatus::Ok
         );
-        assert_eq!(state.fence_generation(1, FENCE_DOMAIN_BLIT, 3), Some(1));
-        assert_eq!(state.fence_generation(1, FENCE_DOMAIN_EVENT, 3), Some(50));
+        assert_eq!(state.fence_generation(1, 3), Some(1));
+        assert_eq!(state.event_generation(1, 3), Some(50));
+    }
+
+    #[test]
+    fn task_teardown_retires_event_and_fence_namespaces() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        state.define_task(1, 0x1000, 2);
+        assert_eq!(
+            execute_fence(&mut state, 1, Domain::RenderFence, 3, FenceAction::Update),
+            FenceStatus::Ok
+        );
+        assert_eq!(
+            execute_event(&mut state, 1, &event_cmd(OP_SIGNAL_EVENT, 3, 50, None)),
+            FenceStatus::Ok
+        );
+        assert!(state.delete_task(1));
+        assert_eq!(state.fence_generation(1, 3), None);
+        assert_eq!(state.event_generation(1, 3), None);
     }
 
     #[test]

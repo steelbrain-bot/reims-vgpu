@@ -473,7 +473,6 @@ fn compute_preflight_collects_pipeline_and_local_size_without_duplicates() {
 
 #[test]
 fn event_segment_signal_wait_in_stream() {
-    use crate::model::FENCE_DOMAIN_EVENT;
     use crate::runtime::decode::event::SIGNAL_WAIT_PAYLOAD_LEN;
     use crate::runtime::decode::stream::{SEGMENT_HEADER_LEN, SEGMENT_TYPE_EVENT};
 
@@ -513,7 +512,7 @@ fn event_segment_signal_wait_in_stream() {
     // The signal landed, and the pending wait for 8 left it alone. The
     // three per-op counters this used to assert had no product reader; the
     // generation store is what the next wait actually reads.
-    assert_eq!(state.fence_generation(1, FENCE_DOMAIN_EVENT, 11), Some(7));
+    assert_eq!(state.event_generation(1, 11), Some(7));
 }
 
 #[test]
@@ -4988,8 +4987,7 @@ fn a_visibility_count_lands_at_the_guest_offset_the_pass_named() {
 /// the store is what a later wait actually reads, so it is the thing whose loss
 /// costs the guest its ordering.
 #[test]
-fn a_render_encoder_fence_reaches_the_render_fence_domain() {
-    use crate::model::{FENCE_DOMAIN_BLIT, FENCE_DOMAIN_RENDER};
+fn a_render_encoder_fence_reaches_the_shared_fence_object() {
     use crate::runtime::decode::stream::{SEGMENT_HEADER_LEN, SEGMENT_TYPE_RENDER};
     use reims_vgpu_wire::ops::render as wire_render;
 
@@ -5027,16 +5025,9 @@ fn a_render_encoder_fence_reaches_the_render_fence_domain() {
     // Two updates: the first seeds the generation, the second advances it. A
     // dropped fence leaves `None` here, which is what this used to read.
     assert_eq!(
-        state.fence_generation(1, FENCE_DOMAIN_RENDER, FENCE_REF),
+        state.fence_generation(1, FENCE_REF),
         Some(2),
-        "both updates landed on the render-fence domain"
-    );
-    // And they landed on the *render* domain specifically — the constants this
-    // arm used to compare against belong to the blit encoder.
-    assert_eq!(
-        state.fence_generation(1, FENCE_DOMAIN_BLIT, FENCE_REF),
-        None,
-        "a render fence does not touch the blit encoder's domain"
+        "both render updates landed on the fence object"
     );
 }
 
