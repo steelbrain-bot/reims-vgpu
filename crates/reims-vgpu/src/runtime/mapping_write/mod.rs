@@ -893,7 +893,7 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
     let licence = licence_iosurface_texture_surface(
         state,
         host,
-        identity.resident_format(),
+        crate::backend::vulkan::translate::pixel::vk_texel_layout(identity.resident_layout()),
         &IOSurfaceDestination {
             mapping_id,
             base_off,

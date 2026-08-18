@@ -467,7 +467,7 @@ pub struct DrawRequest {
     pub target_identity: Option<TargetIdentity>,
     /// Format of colour attachment zero's texture view.
     ///
-    /// This can differ from [`TargetIdentity::resident_format`] without naming
+    /// This can differ from [`TargetIdentity::resident_layout`] without naming
     /// another allocation. Metal texture views over one surface commonly use
     /// the linear and sRGB members of one format-compatibility class; Vulkan
     /// represents that distinction on the image view and render pass.
@@ -1834,65 +1834,6 @@ pub struct WindowPresentSource {
     pub identity: TargetIdentity,
 }
 
-impl TargetIdentity {
-    /// Physical channel order of the resident image behind this identity.
-    ///
-    /// The rule is one sentence: **a resident holds the bytes its destination
-    /// stores.** Rendering it that way makes a raw image→buffer copy land the
-    /// frame in guest memory unchanged, which is what deletes the whole-frame
-    /// CPU swizzle and the blocking readback in front of it.
-    ///
-    /// Each namespace answers it from what it knows:
-    ///
-    /// * `Surface` backs an IOSurface texture guest IOSurface, whose plane carries a
-    ///   declared pixel format exactly as a GVA target does — usually guest
-    ///   scanout order, and not always.
-    /// * `Gva` is a render target the guest declared a pixel format for, and
-    ///   that declaration is the answer — carried in the key as a whole
-    ///   [`vk::Format`], not just its order. Two allocations at one address
-    ///   declaring different formats are two keys and therefore two slots,
-    ///   which is what stops them recreating one image between them.
-    /// * `Texture` and `Anonymous` have no destination to follow — nothing
-    ///   copies them out to guest memory byte-for-byte — so they stay RGBA.
-    ///
-    /// This is a property of the *identity*, not of the draw, and that is the
-    /// whole point: `ResourcePools::registry` is keyed by identity and
-    /// `registry_ensure` destroys and recreates the image whenever a draw's
-    /// requested order disagrees with the slot's. Several runtime paths render
-    /// into one identity in a frame — a composite Store, a chain intermediate,
-    /// an MRT primary — and deriving the order from the key they already agree
-    /// on is what makes them agree here too. A per-path predicate would let one
-    /// of them recreate the image every frame, which reads as `target_evicts`
-    /// climbing and costs a fresh allocation plus a lost `content_ready` per
-    /// composite.
-    ///
-    /// Nothing downstream of here assumes either order: the seed upload folds
-    /// an exchange into the staging copy when the seed and the attachment
-    /// disagree, and every readback reports the order it copied. The identity
-    /// is the only place the answer was pinned to a namespace.
-    pub fn is_bgra(&self) -> bool {
-        translate::pixel::has_bgra_order(self.resident_format())
-    }
-
-    /// The format of the resident image behind this identity — the answer
-    /// `registry_ensure` creates the image with and the render pass is built
-    /// against.
-    ///
-    /// [`Self::is_bgra`] is now a question *about* this rather than the thing
-    /// the key stores, because a channel order cannot express how wide a
-    /// channel is. The two namespaces the guest declares a format for —
-    /// `Surface` and `Gva` — answer with that declaration; `Texture` and
-    /// `Anonymous` have none to follow and answer with the constant they
-    /// always did.
-    ///
-    /// Whoever reads this to size a buffer must go through
-    /// [`translate::pixel::bytes_per_texel`] rather than assuming four. That
-    /// assumption is exactly what made a wider format unrepresentable.
-    pub fn resident_format(&self) -> vk::Format {
-        translate::pixel::vk_texel_layout(self.resident_layout())
-    }
-}
-
 /// Byte order of a CPU load seed, relative to the attachment it seeds.
 ///
 /// Vulkan buffer→image copies perform no format conversion, so the staged bytes
@@ -2601,7 +2542,11 @@ mod tests {
                 generation: 0,
                 format: translate::pixel::texel_layout_of(stored).unwrap(),
             };
-            assert_eq!(gva.resident_format(), stored, "{gva:?} must answer its key");
+            assert_eq!(
+                translate::pixel::vk_texel_layout(gva.resident_layout()),
+                stored,
+                "{gva:?} must answer its key"
+            );
             assert_eq!(gva.is_bgra(), bgra, "{gva:?} must answer from its key");
         }
         for other in [

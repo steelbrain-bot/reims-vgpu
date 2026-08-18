@@ -1723,7 +1723,7 @@ mod tests {
     /// Every renderable declaration's allocation is a [`TexelLayout`] this
     /// device can name.
     ///
-    /// `TargetIdentity::resident_format`'s doc calls itself "the answer
+    /// `TargetIdentity::resident_layout`'s doc calls itself "the answer
     /// `registry_ensure` creates the image with", and
     /// `draw::vulkan::gva_resident_format` is what has to make that true: it
     /// takes the same `color_attachment` result the image is built from, folds

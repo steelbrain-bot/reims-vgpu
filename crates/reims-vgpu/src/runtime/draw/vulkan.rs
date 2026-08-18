@@ -1317,7 +1317,9 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     note_iosurface_texture_sample_rung("iosurfacerung_resident_swizzled");
                 } else if resident_current {
                     note_iosurface_texture_sample_rung("iosurfacerung_resident");
-                    let format = resident_id.resident_format();
+                    let format = crate::backend::vulkan::translate::pixel::vk_texel_layout(
+                        resident_id.resident_layout(),
+                    );
                     return Some((w, h, mid, SampledSourceRequest::Target(resident_id, format)));
                 } else if resident_ready {
                     note_iosurface_texture_sample_rung("iosurfacerung_resident_refused");
@@ -5539,7 +5541,9 @@ pub(super) fn resolve_gva_load_source<M: HostMemory + HostOps>(
         return GvaLoadResolution::default();
     };
     let (tex_ref, gva, width, height) = (c0.texture_ref, c0.target_gva(), c0.width, c0.height);
-    let target_format = identity.as_ref().map(|identity| identity.resident_format());
+    let target_format = identity.as_ref().map(|identity| {
+        crate::backend::vulkan::translate::pixel::vk_texel_layout(identity.resident_layout())
+    });
     if let Some(seed) = guest_backing.and_then(|backing| {
         target_format.and_then(|format| backing.load_seed(width, height, format))
     }) {
@@ -6890,7 +6894,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         // misclassify that record as a pooled RGBA target here.
                         let target_format = iosurface_texture_render_identity(state, req)
                             .as_ref()
-                            .map(|identity| identity.resident_format())
+                            .map(|identity| {
+                                crate::backend::vulkan::translate::pixel::vk_texel_layout(
+                                    identity.resident_layout(),
+                                )
+                            })
                             .unwrap_or(translate::pixel::RESIDENT_RGBA_FORMAT);
                         match resolve_iosurface_texture_load_seed(
                             state,
@@ -8458,7 +8466,7 @@ pub(crate) fn gva_chain_identity(
 /// The format the resident behind a GVA render target must hold: the one the
 /// guest declared for that attachment.
 ///
-/// This is [`crate::backend::vulkan::engine::TargetIdentity::resident_format`]'s
+/// This is [`crate::backend::vulkan::engine::TargetIdentity::resident_layout`]'s
 /// rule applied to the one namespace that has a declaration to follow, and it is
 /// a function rather than an expression at each producer because the producers
 /// key *the same registry slot*. A primary and a secondary attachment that

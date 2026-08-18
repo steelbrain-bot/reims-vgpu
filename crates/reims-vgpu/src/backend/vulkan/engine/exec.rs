@@ -1563,7 +1563,9 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
         let target_format = req
             .target_identity
             .as_ref()
-            .map(|identity| identity.resident_format())
+            .map(|identity| {
+                super::super::translate::pixel::vk_texel_layout(identity.resident_layout())
+            })
             .unwrap_or(super::super::translate::pixel::RESIDENT_RGBA_FORMAT);
         if seed.format != target_format {
             return Err(DrawError::DrawValidation(
@@ -2652,7 +2654,7 @@ pub(crate) unsafe fn execute_draw_inner(
     let color0_format = req.color_attachment_format.unwrap_or_else(|| {
         req.target_identity
             .as_ref()
-            .map(|id| id.resident_format())
+            .map(|id| super::super::translate::pixel::vk_texel_layout(id.resident_layout()))
             .unwrap_or(crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT)
     });
     let attachment_feedback_available = ctx.features.attachment_feedback_loop_layout;

@@ -124,7 +124,7 @@ mod tests {
         declare(&mut state, MTL_FORMAT_BGRA8_UNORM);
         let bgra8 = surface_identity(&state, 7, 64, 32);
         assert_eq!(
-            bgra8.resident_format(),
+            crate::backend::vulkan::translate::pixel::vk_texel_layout(bgra8.resident_layout(),),
             SCANOUT_FORMAT,
             "a scanout-order plane is the format it always was"
         );
@@ -132,7 +132,7 @@ mod tests {
         declare(&mut state, MTL_FORMAT_RGBA16_FLOAT);
         let half = surface_identity(&state, 7, 64, 32);
         assert_eq!(
-            half.resident_format(),
+            crate::backend::vulkan::translate::pixel::vk_texel_layout(half.resident_layout(),),
             vk::Format::R16G16B16A16_SFLOAT,
             "a half-float plane renders in half float, not at eight bits"
         );
@@ -164,7 +164,9 @@ mod tests {
         assert!(state.map_surface(7));
         // Never declared: `has_geom` false, so there is no format to read.
         assert_eq!(
-            surface_identity(&state, 7, 64, 32).resident_format(),
+            crate::backend::vulkan::translate::pixel::vk_texel_layout(
+                surface_identity(&state, 7, 64, 32).resident_layout(),
+            ),
             SCANOUT_FORMAT
         );
         // Declared as a format with no `TexelLayout` to store into.
@@ -176,12 +178,16 @@ mod tests {
             m.format = crate::contract::pixel_format::MTL_FORMAT_RGBA32_FLOAT;
         }
         assert_eq!(
-            surface_identity(&state, 7, 64, 32).resident_format(),
+            crate::backend::vulkan::translate::pixel::vk_texel_layout(
+                surface_identity(&state, 7, 64, 32).resident_layout(),
+            ),
             SCANOUT_FORMAT
         );
         // And a mapping this device has never seen at all.
         assert_eq!(
-            surface_identity(&state, 999, 64, 32).resident_format(),
+            crate::backend::vulkan::translate::pixel::vk_texel_layout(
+                surface_identity(&state, 999, 64, 32).resident_layout(),
+            ),
             SCANOUT_FORMAT
         );
     }

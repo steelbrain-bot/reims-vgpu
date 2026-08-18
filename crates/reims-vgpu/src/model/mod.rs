@@ -5,12 +5,11 @@
 
 mod lru_memo;
 mod regs;
-mod resource_identity;
 mod state;
 
 pub(crate) use lru_memo::LruBytesMemo;
 pub(crate) use regs::*;
-pub use resource_identity::{TargetIdentity, TargetKeyDivergence};
+pub use reims_vgpu_core::{TargetIdentity, TargetKeyDivergence};
 // `GfxRegs` has no in-crate importer and is here for the five doc comments
 // that link `model::GfxRegs::child_doorbell_rung`. `state` is a private
 // `mod`, so this is the only path those links can name — and rustc's

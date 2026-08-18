@@ -1227,7 +1227,7 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
         // decided entirely by this pair — so without it a channel-order defect
         // on this rail is a screenshot and no reading.
         .field("fmt", format!("{:#x}", c0.format))
-        .field("resident", format!("{:?}", identity.resident_format()))
+        .field("resident", format!("{:?}", identity.resident_layout()))
         .fail_once(c0.target_gva());
     crate::runtime::drain::note_store_route("gva_flush_gpu_declined");
     let Some(pages) = pages else {
@@ -1593,7 +1593,13 @@ pub(crate) fn copy_resident_into_gva_plane<M: HostMemory + HostOps>(
     c0: &GvaPlaneDestination,
     pages: Option<&crate::runtime::draw::StoreTargetPages>,
 ) -> Result<u64, GvaWritebackDecline> {
-    let licence = licence_gva_plane(state, host, identity.resident_format(), c0, pages)?;
+    let licence = licence_gva_plane(
+        state,
+        host,
+        crate::backend::vulkan::translate::pixel::vk_texel_layout(identity.resident_layout()),
+        c0,
+        pages,
+    )?;
     let GvaPlaneLicence {
         target,
         gpas,

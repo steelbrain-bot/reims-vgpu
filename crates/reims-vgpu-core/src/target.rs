@@ -1,9 +1,9 @@
 //! Backend-independent identities for renderable guest resources.
 
-use crate::contract::pixel_format::TexelLayout;
+use reims_vgpu_protocol::TexelLayout;
 
-/// Protocol-derived render-target identity (resource state, not content hash).
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
+/// Protocol-derived render-target identity (resource state, not content hash).
 pub enum TargetIdentity {
     Surface {
         id: u32,
@@ -37,8 +37,8 @@ impl Default for TargetIdentity {
     }
 }
 
-/// First semantic field on which two target keys disagree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// First semantic field on which two target keys disagree.
 pub enum TargetKeyDivergence {
     Absent,
     Namespace,
@@ -99,14 +99,7 @@ impl TargetIdentity {
         if (self.width(), self.height()) != (held.width(), held.height()) {
             return TargetKeyDivergence::Geometry;
         }
-        let mut regenerated = self.clone();
-        match &mut regenerated {
-            Self::Surface { generation, .. }
-            | Self::Texture { generation, .. }
-            | Self::Gva { generation, .. } => *generation = held.generation(),
-            Self::Anonymous { .. } => {}
-        }
-        if regenerated == *held {
+        if self.with_generation(held.generation()) == *held {
             TargetKeyDivergence::Generation
         } else {
             TargetKeyDivergence::Other
@@ -142,5 +135,77 @@ impl TargetIdentity {
             Self::Surface { format, .. } | Self::Gva { format, .. } => *format,
             Self::Texture { .. } | Self::Anonymous { .. } => TexelLayout::Rgba8,
         }
+    }
+    pub fn is_bgra(&self) -> bool {
+        self.resident_layout() == TexelLayout::Bgra8
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TargetIdentity, TargetKeyDivergence};
+    use reims_vgpu_protocol::TexelLayout;
+
+    fn surface(generation: u64, width: u32) -> TargetIdentity {
+        TargetIdentity::Surface {
+            id: 7,
+            width,
+            height: 32,
+            generation,
+            format: TexelLayout::Bgra8,
+        }
+    }
+
+    #[test]
+    fn divergence_distinguishes_geometry_generation_and_namespace() {
+        let held = surface(2, 64);
+        assert_eq!(
+            surface(2, 65).diverges_from(&held),
+            TargetKeyDivergence::Geometry
+        );
+        assert_eq!(
+            surface(3, 64).diverges_from(&held),
+            TargetKeyDivergence::Generation
+        );
+        assert_eq!(
+            TargetIdentity::Gva {
+                gva: 7,
+                width: 64,
+                height: 32,
+                generation: 2,
+                format: TexelLayout::Bgra8,
+            }
+            .diverges_from(&held),
+            TargetKeyDivergence::Namespace
+        );
+    }
+
+    #[test]
+    fn aliases_ignore_versioned_shape_but_not_namespace() {
+        let a = surface(2, 64);
+        assert!(a.aliases(&surface(9, 128)));
+        assert!(!a.aliases(&TargetIdentity::Texture {
+            ref_: 7,
+            width: 64,
+            height: 32,
+            generation: 2,
+            stencil: false,
+        }));
+    }
+
+    #[test]
+    fn resident_layout_is_semantic() {
+        assert!(surface(0, 64).is_bgra());
+        assert_eq!(
+            TargetIdentity::Texture {
+                ref_: 1,
+                width: 8,
+                height: 8,
+                generation: 0,
+                stencil: false,
+            }
+            .resident_layout(),
+            TexelLayout::Rgba8
+        );
     }
 }
