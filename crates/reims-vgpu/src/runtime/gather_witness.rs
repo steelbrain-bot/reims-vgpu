@@ -842,24 +842,7 @@ pub fn note_gather(
 /// identity is what the engine *binds on* and this is what it *reports* — a
 /// `Fresh` bind still retains under its new identity, which is exactly what lets
 /// the next quiet bind hit.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GatherVouch {
-    /// Both halves said the bytes cannot have moved since the gather that filled
-    /// the retained image, so the identity is one the cache may already hold.
-    Vouched,
-    /// Either half saw a write, the window was re-pointed, or no token could
-    /// answer — the generation was spent this bind and names bytes no retained
-    /// image was ever built from.
-    Fresh,
-}
-
-impl GatherVouch {
-    /// True only for [`GatherVouch::Vouched`], so a caller cannot spell the
-    /// question as "is there an identity" — there always is.
-    pub fn is_vouched(self) -> bool {
-        matches!(self, Self::Vouched)
-    }
-}
+pub use reims_vgpu_core::GatherVouch;
 
 /// What the engine may bind a retained image on without looking at a byte.
 ///

@@ -1066,7 +1066,7 @@ impl EngineCounters {
     /// The caller derived it from `identity.is_some()` for one boot, which is
     /// not the witness's answer but the producer's, and the producer names every
     /// window it is handed.
-    pub fn note_sampled_gather_witness(&self, vouch: crate::runtime::gather_witness::GatherVouch) {
+    pub fn note_sampled_gather_witness(&self, vouch: reims_vgpu_core::GatherVouch) {
         let field = if vouch.is_vouched() {
             &self.sampled_gather_vouched
         } else {
@@ -1098,7 +1098,7 @@ impl EngineCounters {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::gather_witness::GatherVouch;
+    use reims_vgpu_core::GatherVouch;
 
     /// The pooled total is what the census used to carry alone, and it read the
     /// same whether the bytes were a draw's tail or a compute output bound for

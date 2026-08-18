@@ -3,6 +3,21 @@
 use crate::TargetIdentity;
 use reims_vgpu_protocol::StorageImageFormat;
 
+/// Whether a retained guest-memory gather is licensed for identity reuse.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GatherVouch {
+    /// The bytes cannot have changed since the retained gather was produced.
+    Vouched,
+    /// The bind must gather current bytes and publish a new identity.
+    Fresh,
+}
+
+impl GatherVouch {
+    pub const fn is_vouched(self) -> bool {
+        matches!(self, Self::Vouched)
+    }
+}
+
 /// Guest-semantic origin of a compute-resident texture.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ComputeStorageOrigin {

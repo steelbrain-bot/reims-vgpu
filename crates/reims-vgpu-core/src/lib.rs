@@ -22,7 +22,7 @@ pub use execution::{
 };
 pub use namespace::{NamespaceError, ReferenceNamespace};
 pub use residency::{
-    ComputeResidencyService, ComputeStorageOrigin, ComputeStorageResidencyKey,
+    ComputeResidencyService, ComputeStorageOrigin, ComputeStorageResidencyKey, GatherVouch,
     ResidentContentBacking, ResidentLease,
 };
 pub use resource::{

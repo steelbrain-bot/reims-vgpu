@@ -6985,7 +6985,7 @@ mod tests {
                     },
                     // No witness ran for a synthetic source, so nothing vouches:
                     // the gather is the only disposition this fixture can take.
-                    crate::runtime::gather_witness::GatherVouch::Fresh,
+                    reims_vgpu_core::GatherVouch::Fresh,
                 ),
                 content: None,
                 byte_origin: Default::default(),

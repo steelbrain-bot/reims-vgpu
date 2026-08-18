@@ -1735,7 +1735,7 @@ pub enum SampledSource {
     /// into an owned optimal image, without a CPU read or content hash. The
     /// witness is carried for diagnostics only; it cannot replace the decoded
     /// subresource-coherency contract needed to reuse a copied image.
-    GuestRuns(GuestRunSource, crate::runtime::gather_witness::GatherVouch),
+    GuestRuns(GuestRunSource, reims_vgpu_core::GatherVouch),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
