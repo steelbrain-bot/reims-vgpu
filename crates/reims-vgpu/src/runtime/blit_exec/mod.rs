@@ -57,10 +57,11 @@ use crate::runtime::objects;
 use crate::runtime::plan::event_sync::{Domain as FenceDomain, FenceAction};
 use reims_vgpu_core::{
     BlitCompletion, BufferFillPattern, CommandExecution, ContentStamp, ExecutionOutput,
-    ResolvedBufferBlit, ResolvedBufferRange, ResolvedCommand,
+    ResolvedBlit, ResolvedBufferRange, ResolvedBufferToTextureBlit, ResolvedCommand,
     ResolvedLinearTextureLevel as LinearTextureLevel, ResolvedSubmission,
     ResolvedSurfaceTextureBacking as IOSurfaceTextureBacking,
-    ResolvedTextureBacking as TextureBacking,
+    ResolvedTextureBacking as TextureBacking, ResolvedTextureEndpoint, TextureExtent,
+    TextureOrigin,
 };
 use reims_vgpu_protocol::{ByteLength, GuestVirtualAddress, MappingId};
 use reims_vgpu_wire::ops::blit as wire_blit;
@@ -363,6 +364,66 @@ fn resolve_texture_backing<M: HostMemory + HostOps>(
     slice: u16,
 ) -> Result<TextureBacking, BlitStatus> {
     resolve_texture_backing_depth(state, host, task_id, texture_ref, level, slice, 0)
+}
+
+fn resolve_texture_endpoint<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    level: u16,
+    slice: u16,
+) -> Result<ResolvedTextureEndpoint, BlitStatus> {
+    let backing = resolve_texture_backing(state, host, task_id, texture_ref, level, slice)?;
+    let Some((resource, version)) = state.task_resources.content_stamp(task_id, texture_ref) else {
+        return Err(br(BlitStatus::MissingResource, "tex_no_semantic_identity"));
+    };
+    Ok(ResolvedTextureEndpoint {
+        content: ContentStamp { resource, version },
+        backing,
+    })
+}
+
+fn resolve_buffer_to_texture_blit<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    cmd: &Command,
+) -> Result<ResolvedBlit, BlitStatus> {
+    let source = resolve_buffer(state, host, task_id, cmd.source)?;
+    let remaining = source
+        .size
+        .checked_sub(cmd.source_offset)
+        .ok_or_else(|| br(BlitStatus::Bounds, "b2t_src_offset_oob"))?;
+    let source = source
+        .range(cmd.source_offset, remaining)
+        .ok_or_else(|| br(BlitStatus::Bounds, "b2t_src_range_oob"))?;
+    let destination = resolve_texture_endpoint(
+        state,
+        host,
+        task_id,
+        cmd.destination,
+        cmd.destination_level,
+        cmd.destination_slice,
+    )?;
+    let (aspect, _) = copy_aspect_for_options(destination.backing.pixel_format(), cmd)?;
+    Ok(ResolvedBlit::BufferToTexture(ResolvedBufferToTextureBlit {
+        source,
+        source_bytes_per_row: cmd.source_bytes_per_row,
+        source_bytes_per_image: cmd.source_bytes_per_image,
+        destination,
+        destination_origin: TextureOrigin {
+            x: cmd.destination_origin.x,
+            y: cmd.destination_origin.y,
+            z: cmd.destination_origin.z,
+        },
+        extent: TextureExtent {
+            width: cmd.source_size.width,
+            height: cmd.source_size.height,
+            depth: cmd.source_size.depth,
+        },
+        aspect,
+    }))
 }
 
 fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
@@ -1612,13 +1673,13 @@ fn copy_bytes<M: HostMemory + HostOps>(
 /// The capability handler owns the host-memory transfer and produces the
 /// destination's canonical content version as its completion fact. Ordering,
 /// submission identity and completion assembly remain core-owned.
-fn execute_resolved_buffer_blit<M: HostMemory + HostOps>(
+fn execute_resolved_blit<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
-    operation: ResolvedBufferBlit,
+    operation: ResolvedBlit,
 ) -> BlitStatus {
-    let destination = operation.destination().resource();
+    let destination = operation.destination_content().resource;
     let context = crate::runtime::executor::context_for(state, task_id);
     let submission =
         ResolvedSubmission::<(), ()>::single(context, ResolvedCommand::Blit(operation));
@@ -1628,7 +1689,7 @@ fn execute_resolved_buffer_blit<M: HostMemory + HostOps>(
         |()| -> Result<CommandExecution<()>, BlitStatus> { unreachable!() },
         |operation| {
             match operation {
-                ResolvedBufferBlit::Fill {
+                ResolvedBlit::Fill {
                     destination,
                     pattern,
                 } => write_fill_pattern(
@@ -1639,7 +1700,7 @@ fn execute_resolved_buffer_blit<M: HostMemory + HostOps>(
                     destination.length.get(),
                     pattern.bytes(),
                 ),
-                ResolvedBufferBlit::Copy {
+                ResolvedBlit::Copy {
                     source,
                     destination,
                 } => copy_bytes(
@@ -1650,6 +1711,9 @@ fn execute_resolved_buffer_blit<M: HostMemory + HostOps>(
                     destination.address.get(),
                     source.length.get(),
                 ),
+                ResolvedBlit::BufferToTexture(operation) => {
+                    execute_resolved_buffer_to_texture(state, host, task_id, operation)
+                }
             }?;
             let Some(version) = state.task_resources.note_guest_write_by_id(destination) else {
                 return Err(br(
@@ -1691,14 +1755,13 @@ fn execute_resolved_buffer_blit<M: HostMemory + HostOps>(
 /// resource transition. Zero-extent and refused operations never call it.
 fn blit_write_destination(cmd: &Command) -> Option<u32> {
     match cmd.kind {
-        // Buffer destinations transition inside the immutable command's
-        // completion handler. The remaining texture families have not yet
-        // moved into the resolved blit IR and settle here temporarily.
+        // Buffer destinations and buffer-to-texture destinations transition
+        // inside the immutable command's completion handler. The remaining
+        // texture families settle here temporarily.
         Kind::FillBuffer | Kind::FillBufferPattern4 => None,
         Kind::Copy => match cmd.copy_kind {
-            CopyKind::BufferToBuffer => None,
-            CopyKind::BufferToTexture
-            | CopyKind::TextureToBuffer
+            CopyKind::BufferToBuffer | CopyKind::BufferToTexture => None,
+            CopyKind::TextureToBuffer
             | CopyKind::TextureToTexture
             | CopyKind::TextureToTextureSliceLevel => Some(cmd.destination),
             CopyKind::None => None,
@@ -1919,11 +1982,11 @@ fn exec_fill_buffer<M: HostMemory + HostOps>(
     let Some(destination) = buf.range(cmd.range_location, cmd.range_length) else {
         return br(BlitStatus::Bounds, "fill_range_oob");
     };
-    execute_resolved_buffer_blit(
+    execute_resolved_blit(
         state,
         host,
         task_id,
-        ResolvedBufferBlit::Fill {
+        ResolvedBlit::Fill {
             destination,
             pattern: BufferFillPattern::Byte(cmd.fill_value),
         },
@@ -1978,11 +2041,11 @@ fn exec_fill_buffer_pattern4<M: HostMemory + HostOps>(
     let Some(destination) = buf.range(cmd.range_location, cmd.range_length) else {
         return br(BlitStatus::Bounds, "fill_pattern4_range_oob");
     };
-    execute_resolved_buffer_blit(
+    execute_resolved_blit(
         state,
         host,
         task_id,
-        ResolvedBufferBlit::Fill {
+        ResolvedBlit::Fill {
             destination,
             pattern: BufferFillPattern::Word(pattern),
         },
@@ -2029,11 +2092,11 @@ fn exec_copy_buffer_to_buffer<M: HostMemory + HostOps>(
     ) else {
         return br(BlitStatus::Bounds, "b2b_resolved_range_oob");
     };
-    execute_resolved_buffer_blit(
+    execute_resolved_blit(
         state,
         host,
         task_id,
-        ResolvedBufferBlit::Copy {
+        ResolvedBlit::Copy {
             source,
             destination,
         },
@@ -2471,99 +2534,93 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
     Ok(())
 }
 
-fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
+fn execute_resolved_buffer_to_texture<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
-    cmd: &Command,
-) -> BlitStatus {
-    let src = match resolve_buffer(state, host, task_id, cmd.source) {
-        Ok(b) => b,
-        Err(st) => return st,
+    operation: ResolvedBufferToTextureBlit,
+) -> Result<(), BlitStatus> {
+    let ResolvedBufferToTextureBlit {
+        source,
+        source_bytes_per_row,
+        source_bytes_per_image,
+        destination,
+        destination_origin,
+        extent,
+        aspect,
+    } = operation;
+    let src = LinearBuffer {
+        content: source.content,
+        gva: source.address.get(),
+        size: source.length.get(),
     };
-    let dst = match resolve_texture_backing(
-        state,
-        host,
-        task_id,
-        cmd.destination,
-        cmd.destination_level,
-        cmd.destination_slice,
-    ) {
-        Ok(t) => t,
-        Err(st) => return st,
-    };
-    let (aspect, copy_bpp) = match copy_aspect_for_options(dst.pixel_format(), cmd) {
-        Ok(v) => v,
-        Err(st) => return st,
-    };
+    let dst = destination.backing;
+    let copy_bpp = pixel_format::blit_aspect_bytes_per_pixel(dst.pixel_format(), aspect)
+        .ok_or_else(|| br(BlitStatus::Unsupported, "blit_options_aspect_format"))?;
     let repack = pixel_format::blit_aspect_needs_repack(dst.pixel_format(), aspect);
     // IOSurface texture is 2D only.
-    if dst.is_surface() && (cmd.destination_origin.z != 0 || cmd.source_size.depth > 1) {
-        if cmd.source_size.depth == 0 {
-            return BlitStatus::ZeroExtent;
+    if dst.is_surface() && (destination_origin.z != 0 || extent.depth > 1) {
+        if extent.depth == 0 {
+            return Err(BlitStatus::ZeroExtent);
         }
-        if cmd.destination_origin.z != 0 || cmd.source_size.depth != 1 {
-            return br(BlitStatus::Unsupported, "b2t_iosurface_z_or_depth");
+        if destination_origin.z != 0 || extent.depth != 1 {
+            return Err(br(BlitStatus::Unsupported, "b2t_iosurface_z_or_depth"));
         }
     }
-    let ox = cmd.destination_origin.x;
-    let oy = cmd.destination_origin.y;
-    let oz = cmd.destination_origin.z;
+    let ox = destination_origin.x;
+    let oy = destination_origin.y;
+    let oz = destination_origin.z;
     if ox > dst.width() as u64 || oy > dst.height() as u64 || oz > dst.depth() as u64 {
-        return br(BlitStatus::Bounds, "b2t_origin_oob");
+        return Err(br(BlitStatus::Bounds, "b2t_origin_oob"));
     }
     // Refused rather than clipped, and the origin check directly above is why
     // the two now agree: one wire record names a region, and both halves of it
     // are checked the same way.
     let (Some(copy_w), Some(copy_h)) = (
-        copy_extent("b2t", "w", cmd.source_size.width, dst.width() as u64 - ox),
-        copy_extent("b2t", "h", cmd.source_size.height, dst.height() as u64 - oy),
+        copy_extent("b2t", "w", extent.width, dst.width() as u64 - ox),
+        copy_extent("b2t", "h", extent.height, dst.height() as u64 - oy),
     ) else {
-        return br(BlitStatus::Bounds, "b2t_extent_oob");
+        return Err(br(BlitStatus::Bounds, "b2t_extent_oob"));
     };
-    let copy_d = if cmd.source_size.depth == 0 {
+    let copy_d = if extent.depth == 0 {
         0
     } else {
-        match copy_extent("b2t", "d", cmd.source_size.depth, dst.depth() as u64 - oz) {
+        match copy_extent("b2t", "d", extent.depth, dst.depth() as u64 - oz) {
             Some(d) => d,
-            None => return br(BlitStatus::Bounds, "b2t_extent_oob"),
+            None => return Err(br(BlitStatus::Bounds, "b2t_extent_oob")),
         }
     };
     if copy_w == 0 || copy_h == 0 || copy_d == 0 {
-        return BlitStatus::ZeroExtent;
+        return Err(BlitStatus::ZeroExtent);
     }
     // Buffer-side plane bpp (aspect-aware).
     let row_bytes = match copy_w.checked_mul(copy_bpp as u64) {
         Some(v) => v,
-        None => return br(BlitStatus::Capacity, "b2t_row_bytes_overflow"),
+        None => return Err(br(BlitStatus::Capacity, "b2t_row_bytes_overflow")),
     };
-    let src_bpr = if cmd.source_bytes_per_row != 0 {
-        cmd.source_bytes_per_row
+    let src_bpr = if source_bytes_per_row != 0 {
+        source_bytes_per_row
     } else {
         row_bytes
     };
     if src_bpr < row_bytes {
-        return br(BlitStatus::Bounds, "b2t_src_bpr_lt_row");
+        return Err(br(BlitStatus::Bounds, "b2t_src_bpr_lt_row"));
     }
-    let src_bpi = if cmd.source_bytes_per_image != 0 {
-        cmd.source_bytes_per_image
+    let src_bpi = if source_bytes_per_image != 0 {
+        source_bytes_per_image
     } else {
         match src_bpr.checked_mul(copy_h) {
             Some(v) => v,
-            None => return br(BlitStatus::Capacity, "b2t_src_bpi_overflow"),
+            None => return Err(br(BlitStatus::Capacity, "b2t_src_bpi_overflow")),
         }
     };
     // Combined DS + aspect: plane repack path (not raw GVA span).
     if repack {
-        let src_gva = match src.gva.checked_add(cmd.source_offset) {
-            Some(v) => v,
-            None => return br(BlitStatus::Bounds, "b2t_repack_gva_overflow"),
-        };
-        return match copy_buffer_texture_rows_aspect(
+        return copy_buffer_texture_rows_aspect(
             state,
             host,
             task_id,
-            src_gva,
+            src.gva,
             src_bpr,
             src_bpi,
             &dst,
@@ -2578,20 +2635,17 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
             copy_bpp,
             aspect,
             true,
-        ) {
-            Ok(()) => BlitStatus::Ok,
-            Err(st) => st,
-        };
+        );
     }
     // Prefer direct GVA row-span when both sides linear (dst only texture here).
     if let TextureBacking::Linear(ref lt) = dst {
         let dst_off = match lt.texel_offset(ox, oy, oz) {
             Some(v) => v,
-            None => return br(BlitStatus::Bounds, "b2t_dst_texel_oob"),
+            None => return Err(br(BlitStatus::Bounds, "b2t_dst_texel_oob")),
         };
         let dst_bpi = match lt.bytes_per_image() {
             Some(v) => v,
-            None => return br(BlitStatus::Capacity, "b2t_dst_bpi_overflow"),
+            None => return Err(br(BlitStatus::Capacity, "b2t_dst_bpi_overflow")),
         };
         let last = match dst_off
             .checked_add((copy_d - 1).saturating_mul(dst_bpi))
@@ -2599,36 +2653,31 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
             .and_then(|v| v.checked_add(row_bytes))
         {
             Some(v) => v,
-            None => return br(BlitStatus::Bounds, "b2t_dst_span_overflow"),
+            None => return Err(br(BlitStatus::Bounds, "b2t_dst_span_overflow")),
         };
         if lt.alloc_size != 0 && last > lt.alloc_size {
-            return br(BlitStatus::Bounds, "b2t_dst_alloc_oob");
+            return Err(br(BlitStatus::Bounds, "b2t_dst_alloc_oob"));
         }
-        let src_span = match cmd
-            .source_offset
-            .checked_add((copy_d - 1).saturating_mul(src_bpi))
-            .and_then(|v| v.checked_add((copy_h - 1).saturating_mul(src_bpr)))
+        let src_span = match (copy_d - 1)
+            .saturating_mul(src_bpi)
+            .checked_add((copy_h - 1).saturating_mul(src_bpr))
             .and_then(|v| v.checked_add(row_bytes))
         {
             Some(v) => v,
-            None => return br(BlitStatus::Bounds, "b2t_src_span_overflow"),
+            None => return Err(br(BlitStatus::Bounds, "b2t_src_span_overflow")),
         };
         if src_span > src.size {
-            return br(BlitStatus::Bounds, "b2t_src_span_oob");
+            return Err(br(BlitStatus::Bounds, "b2t_src_span_oob"));
         }
-        let src_gva = match src.gva.checked_add(cmd.source_offset) {
-            Some(v) => v,
-            None => return br(BlitStatus::Bounds, "b2t_src_gva_overflow"),
-        };
         let dst_gva = match lt.base_gva.checked_add(dst_off) {
             Some(v) => v,
-            None => return br(BlitStatus::Bounds, "b2t_dst_gva_overflow"),
+            None => return Err(br(BlitStatus::Bounds, "b2t_dst_gva_overflow")),
         };
-        return match copy_row_region(
+        return copy_row_region(
             host,
             state,
             task_id,
-            src_gva,
+            src.gva,
             src_bpr,
             src_bpi,
             dst_gva,
@@ -2637,23 +2686,19 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
             row_bytes,
             copy_h,
             copy_d,
-        ) {
-            Ok(()) => BlitStatus::Ok,
-            Err(st) => st,
-        };
+        );
     }
     // IOSurface texture destination: row-stage from buffer GVA.
-    let src_span = match cmd
-        .source_offset
-        .checked_add((copy_d - 1).saturating_mul(src_bpi))
-        .and_then(|v| v.checked_add((copy_h - 1).saturating_mul(src_bpr)))
+    let src_span = match (copy_d - 1)
+        .saturating_mul(src_bpi)
+        .checked_add((copy_h - 1).saturating_mul(src_bpr))
         .and_then(|v| v.checked_add(row_bytes))
     {
         Some(v) => v,
-        None => return br(BlitStatus::Bounds, "b2t_iosurface_src_span_overflow"),
+        None => return Err(br(BlitStatus::Bounds, "b2t_iosurface_src_span_overflow")),
     };
     if src_span > src.size {
-        return br(BlitStatus::Bounds, "b2t_iosurface_src_span_oob");
+        return Err(br(BlitStatus::Bounds, "b2t_iosurface_src_span_oob"));
     }
     // `None` for the IOSurface texture destination this arm is for, which the mapping rail
     // authorises instead; a linear destination reaching here is still bounded.
@@ -2673,19 +2718,18 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
         copy_bpp,
     ) {
         Ok(v) => v,
-        Err(st) => return st,
+        Err(st) => return Err(st),
     };
     let mut row = vec![0u8; row_bytes as usize];
     for z in 0..copy_d {
         for y in 0..copy_h {
             let s = match src
                 .gva
-                .checked_add(cmd.source_offset)
-                .and_then(|b| b.checked_add(z.saturating_mul(src_bpi)))
+                .checked_add(z.saturating_mul(src_bpi))
                 .and_then(|b| b.checked_add(y.saturating_mul(src_bpr)))
             {
                 Some(v) => v,
-                None => return br(BlitStatus::Bounds, "b2t_iosurface_src_gva_overflow"),
+                None => return Err(br(BlitStatus::Bounds, "b2t_iosurface_src_gva_overflow")),
             };
             if gva_mem::read_task_gva_by_id(
                 host,
@@ -2697,7 +2741,7 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
             )
             .is_err()
             {
-                return br(BlitStatus::GuestIo, "b2t_iosurface_read_io");
+                return Err(br(BlitStatus::GuestIo, "b2t_iosurface_read_io"));
             }
             if let Err(st) = write_texture_row(
                 state,
@@ -2714,11 +2758,11 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
                 &row,
                 allowed.as_ref(),
             ) {
-                return st;
+                return Err(st);
             }
         }
     }
-    BlitStatus::Ok
+    Ok(())
 }
 
 fn exec_copy_texture_to_buffer<M: HostMemory + HostOps>(
@@ -4491,7 +4535,12 @@ pub fn execute_blit<M: HostMemory + HostOps>(
         Kind::FillBufferPattern4 => exec_fill_buffer_pattern4(state, host, task_id, cmd),
         Kind::Copy => match cmd.copy_kind {
             CopyKind::BufferToBuffer => exec_copy_buffer_to_buffer(state, host, task_id, cmd),
-            CopyKind::BufferToTexture => exec_copy_buffer_to_texture(state, host, task_id, cmd),
+            CopyKind::BufferToTexture => {
+                match resolve_buffer_to_texture_blit(state, host, task_id, cmd) {
+                    Ok(operation) => execute_resolved_blit(state, host, task_id, operation),
+                    Err(status) => status,
+                }
+            }
             CopyKind::TextureToBuffer => exec_copy_texture_to_buffer(state, host, task_id, cmd),
             CopyKind::TextureToTexture => exec_copy_texture_to_texture(state, host, task_id, cmd),
             CopyKind::TextureToTextureSliceLevel => {

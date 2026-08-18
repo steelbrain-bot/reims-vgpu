@@ -21,8 +21,9 @@ pub mod texel;
 pub mod visibility;
 
 pub use blit::{
-    BufferFillPattern, ResolvedBufferBlit, ResolvedBufferRange, ResolvedLinearTextureLevel,
-    ResolvedSurfaceTextureBacking, ResolvedTextureBacking,
+    BufferFillPattern, ResolvedBlit, ResolvedBufferRange, ResolvedBufferToTextureBlit,
+    ResolvedLinearTextureLevel, ResolvedSurfaceTextureBacking, ResolvedTextureBacking,
+    ResolvedTextureEndpoint, TextureExtent, TextureOrigin,
 };
 pub use capabilities::{CapabilityService, DeviceInfoLimits, ExecutorCapabilities, MAX_CHANNELS};
 pub use compute::{

@@ -1,6 +1,6 @@
 //! Immutable, resource-resolved blit operations.
 
-use crate::ContentStamp;
+use crate::{pixel_format::BlitAspect, ContentStamp};
 use reims_vgpu_protocol::{ByteLength, GuestVirtualAddress, MappingId, ResourceId, ResourceObject};
 
 /// One resolved mip level in a task-address texture allocation.
@@ -69,6 +69,43 @@ pub struct ResolvedSurfaceTextureBacking {
 pub enum ResolvedTextureBacking {
     Linear(ResolvedLinearTextureLevel),
     Surface(ResolvedSurfaceTextureBacking),
+}
+
+/// One generational texture resource paired with its resolved guest storage.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedTextureEndpoint {
+    pub content: ContentStamp,
+    pub backing: ResolvedTextureBacking,
+}
+
+/// Texel origin within a resolved texture level.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TextureOrigin {
+    pub x: u64,
+    pub y: u64,
+    pub z: u64,
+}
+
+/// Three-dimensional extent of a texture transfer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TextureExtent {
+    pub width: u64,
+    pub height: u64,
+    pub depth: u64,
+}
+
+/// A buffer-to-texture transfer after both serializer references have resolved.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedBufferToTextureBlit {
+    /// Source bytes beginning at the command's source offset and extending to
+    /// the end of the resolved buffer allocation.
+    pub source: ResolvedBufferRange,
+    pub source_bytes_per_row: u64,
+    pub source_bytes_per_image: u64,
+    pub destination: ResolvedTextureEndpoint,
+    pub destination_origin: TextureOrigin,
+    pub extent: TextureExtent,
+    pub aspect: BlitAspect,
 }
 
 impl ResolvedTextureBacking {
@@ -142,9 +179,9 @@ impl BufferFillPattern {
     }
 }
 
-/// A blit whose serializer references, bounds, and backing addresses are resolved.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ResolvedBufferBlit {
+/// A blit whose serializer references and backing identities are resolved.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResolvedBlit {
     Fill {
         destination: ResolvedBufferRange,
         pattern: BufferFillPattern,
@@ -153,12 +190,14 @@ pub enum ResolvedBufferBlit {
         source: ResolvedBufferRange,
         destination: ResolvedBufferRange,
     },
+    BufferToTexture(ResolvedBufferToTextureBlit),
 }
 
-impl ResolvedBufferBlit {
-    pub const fn destination(self) -> ResolvedBufferRange {
+impl ResolvedBlit {
+    pub const fn destination_content(&self) -> ContentStamp {
         match self {
-            Self::Fill { destination, .. } | Self::Copy { destination, .. } => destination,
+            Self::Fill { destination, .. } | Self::Copy { destination, .. } => destination.content,
+            Self::BufferToTexture(operation) => operation.destination.content,
         }
     }
 }
@@ -181,12 +220,15 @@ mod tests {
 
     #[test]
     fn resolved_blits_carry_generational_resources_not_serializer_ordinals() {
-        let operation = ResolvedBufferBlit::Copy {
+        let operation = ResolvedBlit::Copy {
             source: range(7, 2, 0x1000),
             destination: range(7, 3, 0x2000),
         };
 
-        assert_eq!(operation.destination().resource(), ResourceId::new(7, 3));
+        assert_eq!(
+            operation.destination_content().resource,
+            ResourceId::new(7, 3)
+        );
     }
 
     #[test]
@@ -226,5 +268,40 @@ mod tests {
             unreachable!()
         };
         assert_eq!(surface.mapping_id, MappingId::new(9));
+    }
+
+    #[test]
+    fn resolved_buffer_to_texture_carries_only_generational_endpoints() {
+        let destination = ContentStamp {
+            resource: ResourceId::new(11, 4),
+            version: ContentVersion::new(6),
+        };
+        let operation = ResolvedBlit::BufferToTexture(ResolvedBufferToTextureBlit {
+            source: range(7, 3, 0x2000),
+            source_bytes_per_row: 64,
+            source_bytes_per_image: 256,
+            destination: ResolvedTextureEndpoint {
+                content: destination,
+                backing: ResolvedTextureBacking::Surface(ResolvedSurfaceTextureBacking {
+                    mapping_id: MappingId::new(9),
+                    width: 8,
+                    height: 4,
+                    surface_offset: 0,
+                    row_stride: 64,
+                    span_end: 256,
+                    bpp: 4,
+                    pixel_format: 80,
+                }),
+            },
+            destination_origin: TextureOrigin { x: 0, y: 0, z: 0 },
+            extent: TextureExtent {
+                width: 8,
+                height: 4,
+                depth: 1,
+            },
+            aspect: BlitAspect::Full,
+        });
+
+        assert_eq!(operation.destination_content(), destination);
     }
 }

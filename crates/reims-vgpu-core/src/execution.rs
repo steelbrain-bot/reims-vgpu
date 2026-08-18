@@ -7,7 +7,7 @@
 //! lifetime they may update. [`SubmissionContext`] retains the command stream's
 //! complete segment and resource-participation envelope beside those commands.
 
-use crate::{ContentStamp, ResolvedBufferBlit, ResolvedResourceState, SubmissionContext};
+use crate::{ContentStamp, ResolvedBlit, ResolvedResourceState, SubmissionContext};
 use reims_vgpu_protocol::SubmissionIdentity;
 
 /// One fully owned command in a resolved command buffer.
@@ -15,7 +15,7 @@ use reims_vgpu_protocol::SubmissionIdentity;
 pub enum ResolvedCommand<Draw, Compute> {
     Draw(Draw),
     Compute(Compute),
-    Blit(ResolvedBufferBlit),
+    Blit(ResolvedBlit),
     ResourceState(ResolvedResourceState),
 }
 
@@ -193,7 +193,7 @@ pub fn execute_resolved_submission<Draw, Compute, DrawOutput, ComputeOutput, Err
     submission: ResolvedSubmission<Draw, Compute>,
     mut draw: impl FnMut(Draw) -> Result<CommandExecution<DrawOutput>, Error>,
     mut compute: impl FnMut(Compute) -> Result<CommandExecution<ComputeOutput>, Error>,
-    mut blit: impl FnMut(ResolvedBufferBlit) -> Result<CommandExecution<BlitCompletion>, Error>,
+    mut blit: impl FnMut(ResolvedBlit) -> Result<CommandExecution<BlitCompletion>, Error>,
     mut resource_state: impl FnMut(
         ResolvedResourceState,
     ) -> Result<CommandExecution<ResourceStateCompletion>, Error>,
@@ -267,7 +267,7 @@ mod tests {
             context: context.clone(),
             command_buffer: ResolvedCommandBuffer::new(vec![
                 ResolvedCommand::Draw(41),
-                ResolvedCommand::Blit(ResolvedBufferBlit::Copy {
+                ResolvedCommand::Blit(ResolvedBlit::Copy {
                     source: range(1),
                     destination: range(2),
                 }),
