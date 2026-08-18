@@ -1681,6 +1681,10 @@ fn staged_span_pages<M: HostMemory>(
 }
 
 pub(crate) struct StagedTexture {
+    /// Object-list reference resolved at staging time. Content effects use
+    /// this identity after the executor receipt arrives; the destination
+    /// shape below is only a placement and must not stand in for identity.
+    pub resource_ref: u32,
     pub binding: u32,
     #[cfg(feature = "backend-vulkan")]
     pub array_element: u32,
@@ -2151,6 +2155,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             use_offset as u8
         ));
         return Ok(StagedTexture {
+            resource_ref: stage_ref,
             binding,
             #[cfg(feature = "backend-vulkan")]
             array_element: 0,
@@ -2655,6 +2660,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             ));
         }
         return Ok(StagedTexture {
+            resource_ref: stage_ref,
             binding,
             #[cfg(feature = "backend-vulkan")]
             array_element: 0,
@@ -2993,6 +2999,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         }
     }
     Ok(StagedTexture {
+        resource_ref: stage_ref,
         binding,
         #[cfg(feature = "backend-vulkan")]
         array_element: 0,
@@ -3121,12 +3128,18 @@ fn write_linear_texture_bulk<M: HostMemory + HostOps>(
     true
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuestMaterialization {
+    Materialized,
+    HostOnly,
+}
+
 fn writeback_texture<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     tex: &StagedTexture,
-) -> Result<(), ComputeStatus> {
+) -> Result<GuestMaterialization, ComputeStatus> {
     // Which destination namespace a compute storage output lands in, and — on
     // the linear arm — whether its guest rows are dense. Both are properties of
     // the guest's own window rather than of this device, and neither is
@@ -3170,7 +3183,7 @@ fn writeback_texture<M: HostMemory + HostOps>(
     }
 
     match &tex.writeback {
-        TextureWriteback::None => Ok(()),
+        TextureWriteback::None => Ok(GuestMaterialization::HostOnly),
         TextureWriteback::Linear {
             texture_ref,
             gva,
@@ -3259,7 +3272,7 @@ fn writeback_texture<M: HostMemory + HostOps>(
                     // its own comment is that the host cache keeps the
                     // authoritative bytes.
                     crate::runtime::surface_cache::note_gva_landed(state, *gva);
-                    Ok(())
+                    Ok(GuestMaterialization::Materialized)
                 }
                 // Nothing resolves under this task, so there is nowhere to put
                 // the result. The host cache keeps the authoritative bytes and
@@ -3270,7 +3283,7 @@ fn writeback_texture<M: HostMemory + HostOps>(
                         "compute_writeback_tex cache_only reason=linear_unmapped task={task_id} ref={texture_ref} bind={} gva={gva:#x} fmt={pixel_format:#x} dims={}x{} bpp={} row_stride={row_stride}",
                         tex.binding, width, height, bpp
                     ));
-                    Ok(())
+                    Ok(GuestMaterialization::HostOnly)
                 }
                 LinearWrite::Failed => {
                     Err(ComputeStatus::GuestIo("compute_wb_tex_linear_guest_write"))
@@ -3329,7 +3342,7 @@ fn writeback_texture<M: HostMemory + HostOps>(
                     "compute_wb_tex_iosurface_texture_write",
                 ));
             }
-            Ok(())
+            Ok(GuestMaterialization::Materialized)
         }
     }
 }
@@ -4465,8 +4478,8 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         out
     };
     let out_result = run_engine(req);
-    let out = match out_result {
-        Ok(receipt) => receipt.output,
+    let (completed_submission, out) = match out_result {
+        Ok(receipt) => (receipt.submission.id, receipt.output),
         Err(e) => {
             let unsupported = matches!(&e, DrawError::Unsupported(_));
             crate::observe::Emit::decline("compute_linux_engine", &e)
@@ -4493,6 +4506,40 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         buffers: output_buffers,
         images: output_images,
     } = out;
+    // A resource can occupy more than one writable binding. Complete its GPU
+    // version once, immediately after the first successful output, and let a
+    // later alias strengthen that same version to guest-materialized. Publishing
+    // here (rather than after the whole loop) also preserves output A when
+    // writeback B fails.
+    let mut content_effects = std::collections::BTreeMap::<
+        u32,
+        (
+            reims_vgpu_protocol::ResourceId<reims_vgpu_protocol::ResourceObject>,
+            reims_vgpu_protocol::ContentVersion,
+            bool,
+        ),
+    >::new();
+    let mut record_content_effect = |state: &DeviceState,
+                                     resource_ref: u32,
+                                     guest_materialized: bool| {
+        if let Some((id, version, already_materialized)) = content_effects.get_mut(&resource_ref) {
+            if guest_materialized && !*already_materialized {
+                *already_materialized =
+                    state.task_resources.record_gpu_to_guest_copy(*id, *version);
+            }
+            return;
+        }
+        let Some((id, version)) = state.task_resources.record_completed_gpu_store(
+            task_id,
+            resource_ref,
+            completed_submission,
+        ) else {
+            return;
+        };
+        let materialized =
+            guest_materialized && state.task_resources.record_gpu_to_guest_copy(id, version);
+        content_effects.insert(resource_ref, (id, version, materialized));
+    };
     for buffer in output_buffers {
         let Some(s) = staged_bufs
             .iter_mut()
@@ -4523,22 +4570,31 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 crate::runtime::drain::note_store_route_n("compute_buffer_wb_landed_bytes", bytes);
             }
         }
+        record_content_effect(state, s.bind.buffer_ref, true);
     }
     for (t, result) in staged_tex
         .iter_mut()
         .filter(|texture| texture.is_storage)
         .zip(output_images)
     {
-        match result {
+        let guest_materialized = match result {
             ComputeImageResult::Bytes(bytes) => {
                 t.bytes = bytes;
-                if let Err(e) = writeback_texture(state, host, task_id, t) {
-                    return e;
+                match writeback_texture(state, host, task_id, t) {
+                    Ok(materialization) => materialization == GuestMaterialization::Materialized,
+                    Err(e) => return e,
                 }
             }
             // The engine copied straight into the guest's pages, so there is no
             // writeback to do and no bytes to do it from.
             ComputeImageResult::Landed { bytes } => {
+                if matches!(t.writeback, TextureWriteback::None) {
+                    crate::observe::fail(format!(
+                        "compute_linux readback destination mismatch pipe={} bind={} result=landed destination=none",
+                        acc.pipeline_ref, t.binding
+                    ));
+                    return ComputeStatus::BackendFailed("compute_vk_landed_without_destination");
+                }
                 crate::runtime::drain::note_store_route("compute_wb_landed");
                 let _ = bytes;
                 // The guest's pages are the only place this frame exists now,
@@ -4578,17 +4634,20 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                     ),
                     TextureWriteback::None => {}
                 }
+                true
+            }
+        };
+        // Only an actual guest write makes the resident reproducible. A heap
+        // texture has no guest destination: its host readback is transient,
+        // and declaring that copy sufficient would let reclaim discard the
+        // resource's only durable content.
+        if guest_materialized {
+            if let Some(candidate) = t.residency {
+                crate::backend::vulkan::engine::note_resident_storage_copied_out(&candidate.key);
             }
         }
-        // The output is in the guest's pages now, so the engine's image has
-        // stopped being the only copy and the reclaim paths may take it. The
-        // deferred branch above reaches the same edge through its own flush;
-        // without this one a synchronously-written resident stayed flagged
-        // unreproducible forever and no reclaim could ever touch it.
-        if let Some(candidate) = t.residency {
-            crate::backend::vulkan::engine::note_resident_storage_copied_out(&candidate.key);
-        }
         note_storage_residency_writeback(state, t);
+        record_content_effect(state, t.resource_ref, guest_materialized);
     }
 
     // A dispatch that completed is expected control flow; every refusal on this

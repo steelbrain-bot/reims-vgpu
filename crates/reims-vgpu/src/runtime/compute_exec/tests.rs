@@ -1101,6 +1101,25 @@ fn dispatch_buffer_kernel_mul3add1() {
         le[4..12].copy_from_slice(&bdesc_gva.to_le_bytes());
         write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
     }
+    let resource = state.task_resources.register(
+        1,
+        7,
+        std::sync::Arc::new(crate::model::TaskResource::new(
+            crate::runtime::decode::resource::ListObjectEntry::new(
+                reims_vgpu_protocol::ObjectKind::Buffer,
+                0,
+                0,
+            ),
+            std::sync::Arc::from(bdesc.clone()),
+        )),
+    );
+    let resource_id = resource.semantic_id().expect("canonical buffer identity");
+    let before = state
+        .task_resources
+        .resource_node(resource_id)
+        .expect("canonical buffer")
+        .content
+        .snapshot();
 
     let mut acc = ComputeAccum::default();
     acc.set_pipeline(6);
@@ -1154,6 +1173,15 @@ fn dispatch_buffer_kernel_mul3add1() {
             .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
             .collect();
         assert_eq!(out, vec![4, 7, 10, 13]);
+        let after = state
+            .task_resources
+            .resource_node(resource_id)
+            .expect("canonical buffer")
+            .content
+            .snapshot();
+        assert!(after.current > before.current);
+        assert!(after.current_in_gpu());
+        assert!(after.current_in_guest());
     }
 }
 
@@ -1656,6 +1684,7 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
     let gva = 0x101000u64;
     let rgba = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
     let staged = StagedTexture {
+        resource_ref: texture_ref,
         binding: 32,
         #[cfg(feature = "backend-vulkan")]
         array_element: 0,
@@ -1684,7 +1713,7 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
 
     assert_eq!(
         writeback_texture(&mut state, &mut host, task_id, &staged),
-        Ok(())
+        Ok(GuestMaterialization::HostOnly)
     );
     assert_eq!(
         surface_cache::get_linear_texture(
@@ -2386,6 +2415,7 @@ fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
         bpp: 4,
     };
     let staged = |writeback, residency| StagedTexture {
+        resource_ref: 44,
         binding: 32,
         #[cfg(feature = "backend-vulkan")]
         array_element: 0,
@@ -2818,6 +2848,7 @@ fn a_heap_texture_mirror_outlives_the_per_mapping_cap() {
     const HEAP_TEXTURES: u32 = 4 * STORAGE_RESIDENCY_WINDOWS_PER_MAPPING as u32;
 
     let staged = |key: ComputeStorageResidencyKey| StagedTexture {
+        resource_ref: key.texture_ref,
         binding: 33,
         #[cfg(feature = "backend-vulkan")]
         array_element: 0,

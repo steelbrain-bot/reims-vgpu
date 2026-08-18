@@ -2551,11 +2551,12 @@ pub fn retire_guest_import(import_id: crate::runtime::guest_ram::ImportId) {
 /// the shape of the leak `retire_resident_storage_content` was written to stop
 /// for a *dead* cache entry, arriving instead through the live path.
 ///
-/// Called after the writeback rather than after the readback, which is the
-/// stricter of the two and deliberately so: the readback only moves the bytes
-/// into a host `Vec`, and it is `writeback_texture` returning `Ok` that says a
-/// later reader can find them. Clearing at the readback would open a window
-/// where a reclaim takes a resident whose output reached nowhere.
+/// Called after materialization rather than after readback, which is the
+/// stricter of the two and deliberately so: readback only moves the bytes into
+/// a transient host `Vec`. `writeback_texture` must report `Materialized`
+/// before a later reader can be assumed to find them in guest memory. Clearing
+/// for `HostOnly` would make a heap output reclaimable after its temporary
+/// readback buffer had already been dropped.
 pub fn note_resident_storage_copied_out(identity: &crate::model::ComputeStorageResidencyKey) {
     let mut guard = lock_engine();
     guard.pools.note_compute_storage_copied_out(identity);

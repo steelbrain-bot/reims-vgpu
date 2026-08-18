@@ -537,8 +537,8 @@ impl ResourcePools {
         u64::from(key.width) * u64::from(key.height) * key.format.bytes_per_texel() as u64
     }
 
-    /// Record that a compute-storage resident's pixels have been copied out to
-    /// the host, so the reclaim paths may take it.
+    /// Record that a compute-storage resident's pixels have reached a durable
+    /// replica outside the image, so the reclaim paths may take it.
     ///
     /// Only for a readback that actually landed. Both unpin paths that abort —
     /// `flush_storage_one`'s failure arm and `lifecycle`'s window-cleared arm —
