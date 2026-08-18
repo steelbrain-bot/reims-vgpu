@@ -106,6 +106,10 @@ pub struct GvaWritebackDebt {
     pub width: u32,
     pub height: u32,
     pub format: u16,
+    /// Semantic layout chosen for the resident when the draw was resolved.
+    /// Payment and release reuse it instead of asking mutable backend state to
+    /// reconstruct the identity later.
+    pub resident_layout: crate::contract::pixel_format::TexelLayout,
     pub generation: u64,
     /// Exact semantic resource and content version held by the resident.
     /// `None` is limited to resources not yet constructed in the canonical
@@ -648,8 +652,11 @@ pub fn arm_gva<M: HostMemory + HostOps>(
     identity: &crate::backend::vulkan::engine::TargetIdentity,
     submission: reims_vgpu_protocol::SubmissionId,
 ) -> bool {
-    let Some(generation) = (match *identity {
-        crate::backend::vulkan::engine::TargetIdentity::Gva { generation, .. } => Some(generation),
+    let Some((generation, resident_layout)) = (match *identity {
+        crate::backend::vulkan::engine::TargetIdentity::Gva {
+            generation, format, ..
+        } => crate::backend::vulkan::translate::pixel::texel_layout_of(format)
+            .map(|layout| (generation, layout)),
         _ => None,
     }) else {
         return false;
@@ -675,6 +682,7 @@ pub fn arm_gva<M: HostMemory + HostOps>(
         width: c0.width,
         height: c0.height,
         format: c0.format,
+        resident_layout,
         generation,
         content: state.task_resources.record_completed_gpu_store(
             task_id,
@@ -758,7 +766,7 @@ fn same_gva_identity(a: GvaWritebackDebt, b: GvaWritebackDebt) -> bool {
         && a.width == b.width
         && a.height == b.height
         && a.generation == b.generation
-        && a.format == b.format
+        && a.resident_layout == b.resident_layout
 }
 
 /// The engine resident one armed GVA debt names.
@@ -777,7 +785,7 @@ pub(crate) fn gva_identity(
         width: debt.width,
         height: debt.height,
         generation: debt.generation,
-        format: crate::runtime::draw::gva_resident_format(debt.format),
+        format: crate::backend::vulkan::translate::pixel::vk_texel_layout(debt.resident_layout),
     }
 }
 
@@ -1007,6 +1015,7 @@ mod tests {
             width: 64,
             height: 64,
             format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+            resident_layout: crate::contract::pixel_format::TexelLayout::Bgra8,
             generation,
             content: None,
             guest_write: Default::default(),

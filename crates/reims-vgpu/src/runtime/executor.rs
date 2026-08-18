@@ -144,6 +144,17 @@ pub trait Executor: std::fmt::Debug + Send + Sync {
         ExecutorCapabilities::default()
     }
 
+    fn render_target_layout_supported(
+        &self,
+        layout: crate::contract::pixel_format::TexelLayout,
+    ) -> bool {
+        matches!(
+            layout,
+            crate::contract::pixel_format::TexelLayout::Rgba8
+                | crate::contract::pixel_format::TexelLayout::Bgra8
+        )
+    }
+
     fn execute(&self, submission: ResolvedSubmission) -> Result<ExecutionCompletion, DrawError>;
 
     /// End one guest lifetime while preserving shareable physical-GPU state.
@@ -188,6 +199,13 @@ impl Executor for VulkanExecutor {
             deferred_gpu_only_content:
                 crate::backend::vulkan::engine::deferred_gpu_only_content_allowed(),
         }
+    }
+
+    fn render_target_layout_supported(
+        &self,
+        layout: crate::contract::pixel_format::TexelLayout,
+    ) -> bool {
+        crate::backend::vulkan::engine::render_target_layout_supported(layout)
     }
 
     fn execute(&self, submission: ResolvedSubmission) -> Result<ExecutionCompletion, DrawError> {

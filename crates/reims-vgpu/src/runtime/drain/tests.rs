@@ -630,6 +630,7 @@ fn replace_physical_retires_only_the_named_resource() {
         width: 64,
         height: 64,
         format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        resident_layout: crate::contract::pixel_format::TexelLayout::Bgra8,
         generation,
         content: None,
         guest_write: Default::default(),

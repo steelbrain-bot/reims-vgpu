@@ -3359,7 +3359,7 @@ pub(super) fn gva_resident_if_current<M: HostMemory + HostOps>(
     if generation == 0 {
         return Err(GvaResidentRefusal::NoGeneration);
     }
-    let resident_format = gva_resident_format(format);
+    let resident_format = gva_resident_format(state.executor.as_ref(), format);
     let identity = crate::backend::vulkan::engine::TargetIdentity::Gva {
         gva,
         width: w,
@@ -5517,7 +5517,7 @@ pub(super) fn resolve_gva_load_source<M: HostMemory + HostOps>(
     if req.gva_load_source == GvaLoadSource::None || *chain_load_from_target {
         return GvaLoadResolution::default();
     }
-    let identity = gva_chain_identity(req);
+    let identity = gva_chain_identity(state.executor.as_ref(), req);
     if req.gva_load_source == GvaLoadSource::Resident {
         let ready = identity.clone().filter(|identity| {
             let texture_ref = req.colors.first().map(|c0| c0.texture_ref).unwrap_or(0);
@@ -7191,7 +7191,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             }
         }
         if gpu_only_content_allowed && store_is_store && writeback_guest {
-            if let Some(identity) = gva_chain_identity(req) {
+            if let Some(identity) = gva_chain_identity(state.executor.as_ref(), req) {
                 // Only the eligibility call can still vary here: the enclosing
                 // `&&` already established `store_is_store && writeback_guest`.
                 // (The sibling rail above re-tests its pair for real, because
@@ -8042,7 +8042,7 @@ pub(crate) fn render_chain_identity(
             height,
         ));
     }
-    gva_chain_identity(req)
+    gva_chain_identity(state.executor.as_ref(), req)
 }
 
 fn color_target_identity<M: HostMemory + HostOps>(
@@ -8432,6 +8432,7 @@ pub(crate) fn gva_span_alloc_generation<M: HostMemory + HostOps>(
 /// `(gva, width, height)` alone, and the cross-pass resident Load below hands a
 /// new allocation the previous one's pixels as its prior content.
 pub(crate) fn gva_chain_identity(
+    executor: &dyn crate::runtime::executor::Executor,
     req: &DrawEncodeRequest,
 ) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
     let c0 = req.colors.first()?;
@@ -8447,7 +8448,7 @@ pub(crate) fn gva_chain_identity(
         width: w,
         height: h,
         generation: req.gva_alloc_gen,
-        format: gva_resident_format(c0.format),
+        format: gva_resident_format(executor, c0.format),
     })
 }
 
@@ -8481,7 +8482,10 @@ pub(crate) fn gva_chain_identity(
 /// for per host: a widening that reads the spec's table instead of the device
 /// is the shape AGENTS.md names, and this one would fail at `vkCreateImage`
 /// rather than decline.
-pub(crate) fn gva_resident_format(format: u16) -> ash::vk::Format {
+pub(crate) fn gva_resident_format(
+    executor: &dyn crate::runtime::executor::Executor,
+    format: u16,
+) -> ash::vk::Format {
     use crate::backend::vulkan::translate::pixel;
     // The declaration the *attachment* will be built from, folded onto its
     // allocation family, which is what `registry_ensure` creates the image in.
@@ -8503,9 +8507,7 @@ pub(crate) fn gva_resident_format(format: u16) -> ash::vk::Format {
     match pixel::texel_layout_of(allocation) {
         // Capability, never an API-version assumption: the host is asked whether
         // it renders to and blends this layout.
-        Some(layout) if crate::backend::vulkan::engine::render_target_layout_supported(layout) => {
-            allocation
-        }
+        Some(layout) if executor.render_target_layout_supported(layout) => allocation,
         _ => pixel::RESIDENT_RGBA_FORMAT,
     }
 }
@@ -8643,12 +8645,6 @@ fn gva_store_defer_eligible(req: &DrawEncodeRequest) -> bool {
         || c0.texture_ref == 0
         || req.gva_alloc_gen == 0
     {
-        return false;
-    }
-    let Some(identity) = gva_chain_identity(req) else {
-        return false;
-    };
-    if identity.width() != c0.width || identity.height() != c0.height {
         return false;
     }
     pixel_format::tight_row_bytes(c0.width, c0.format)
@@ -9097,7 +9093,8 @@ mod vulkan_split_tests {
         let gen_a = super::gva_alloc_generation(&mut state, &mut host, &req);
         assert_ne!(gen_a, 0, "a fully walked GVA span must name its allocation");
         req.gva_alloc_gen = gen_a;
-        let id_a = super::gva_chain_identity(&req).expect("a GVA color0 has a chain identity");
+        let id_a = super::gva_chain_identity(state.executor.as_ref(), &req)
+            .expect("a GVA color0 has a chain identity");
 
         // The same buffer rendered again: same pages, so the same resident.
         assert_eq!(
@@ -9111,7 +9108,8 @@ mod vulkan_split_tests {
         let gen_b = super::gva_alloc_generation(&mut state, &mut host, &req);
         assert_eq!(gen_b, gen_a);
         req.gva_alloc_gen = gen_b;
-        let id_b = super::gva_chain_identity(&req).expect("a GVA color0 has a chain identity");
+        let id_b = super::gva_chain_identity(state.executor.as_ref(), &req)
+            .expect("a GVA color0 has a chain identity");
         assert_eq!(id_a, id_b);
 
         assert!(crate::runtime::writeback_debt::retire_gva_resource(
@@ -9368,14 +9366,9 @@ mod vulkan_split_tests {
         // refused rather than showing a bare `None`: every rung on this ladder
         // declines by name, and the panic message is where that is worth reading.
         let cap = crate::observe::sink::FailCapture::start();
-        let served = resolve_iosurface_texture_load_seed(
-            &mut state,
-            &mut host,
-            mid,
-            w,
-            h,
-            gva_resident_format(MTL_FORMAT_BGRA8_UNORM),
-        );
+        let resident_format = gva_resident_format(state.executor.as_ref(), MTL_FORMAT_BGRA8_UNORM);
+        let served =
+            resolve_iosurface_texture_load_seed(&mut state, &mut host, mid, w, h, resident_format);
         let seed = served.unwrap_or_else(|| {
             panic!(
                 "a cold cache must not lose the guest's LOAD; sink said {:?}",
@@ -9410,15 +9403,10 @@ mod vulkan_split_tests {
             px.copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xFF]);
         }
         crate::runtime::surface_cache::store(&mut state, mid, w, h, cached);
-        let IOSurfaceLoadSeed::Host(bytes, order) = resolve_iosurface_texture_load_seed(
-            &mut state,
-            &mut host,
-            mid,
-            w,
-            h,
-            gva_resident_format(MTL_FORMAT_BGRA8_UNORM),
-        )
-        .expect("a warm cache must serve") else {
+        let IOSurfaceLoadSeed::Host(bytes, order) =
+            resolve_iosurface_texture_load_seed(&mut state, &mut host, mid, w, h, resident_format)
+                .expect("a warm cache must serve")
+        else {
             panic!("a live cache is the freshest rung");
         };
         assert_eq!(order, crate::backend::vulkan::engine::SeedOrder::Bgra8);
@@ -9434,7 +9422,7 @@ mod vulkan_split_tests {
                 mid,
                 w,
                 h + 1,
-                gva_resident_format(MTL_FORMAT_BGRA8_UNORM),
+                resident_format,
             )
             .is_none(),
             "a mismatched extent must refuse by name, not seed something else"

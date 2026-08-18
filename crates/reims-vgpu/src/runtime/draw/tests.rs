@@ -999,8 +999,13 @@ fn stage_in_buffer_read_as_ssbo_is_bound_as_storage() {
 #[test]
 fn gva_chain_identity_rules() {
     use crate::backend::vulkan::engine::TargetIdentity;
+    let executor = crate::runtime::executor::VulkanExecutor::default();
     let mut req = DrawEncodeRequest::default();
-    assert_eq!(gva_chain_identity(&req), None, "no colors → no identity");
+    assert_eq!(
+        gva_chain_identity(&executor, &req),
+        None,
+        "no colors → no identity"
+    );
     req.colors.push(ColorRtRequest {
         slot: 0,
         texture_ref: 9,
@@ -1010,7 +1015,7 @@ fn gva_chain_identity_rules() {
         ..Default::default()
     });
     assert_eq!(
-        gva_chain_identity(&req),
+        gva_chain_identity(&executor, &req),
         Some(TargetIdentity::Gva {
             gva: 0x1234_0000,
             width: 16,
@@ -1022,19 +1027,23 @@ fn gva_chain_identity_rules() {
     );
     req.colors[0].width = 0;
     assert_eq!(
-        gva_chain_identity(&req),
+        gva_chain_identity(&executor, &req),
         None,
         "a zero-extent attachment has no identity"
     );
     req.colors[0].width = 16;
     req.colors[0].storage = mapping_target_storage(5);
     assert_eq!(
-        gva_chain_identity(&req),
+        gva_chain_identity(&executor, &req),
         None,
         "IOSurface texture targets never take the GVA identity"
     );
     req.colors[0].storage = ColorTargetStorage::None;
-    assert_eq!(gva_chain_identity(&req), None, "gva=0 → no identity");
+    assert_eq!(
+        gva_chain_identity(&executor, &req),
+        None,
+        "gva=0 → no identity"
+    );
 }
 
 #[cfg(feature = "backend-vulkan")]
@@ -3619,7 +3628,7 @@ fn a_gva_load_from_resident_draw_with_no_resident_puts_the_seed_back() {
         ..Default::default()
     };
     assert!(
-        crate::runtime::draw::vulkan::gva_chain_identity(&req).is_some(),
+        crate::runtime::draw::vulkan::gva_chain_identity(state.executor.as_ref(), &req).is_some(),
         "the elided request must still name an identity — the arm under test is \
          the one where that identity has no ready resident, not the one where \
          there is nothing to look up"
