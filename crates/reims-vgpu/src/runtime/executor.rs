@@ -146,6 +146,22 @@ pub trait ObservationService: std::fmt::Debug + Send + Sync {
         None
     }
 
+    fn gpu_span_window(&self) -> Option<crate::backend::vulkan::engine::gpu_span::GpuSpanWindow> {
+        None
+    }
+
+    fn gather_phase_window(
+        &self,
+    ) -> Option<crate::backend::vulkan::engine::gather_phase::GatherPhaseWindow> {
+        None
+    }
+
+    fn stage_phase_window(
+        &self,
+    ) -> Option<crate::backend::vulkan::engine::stage_phase::StagePhaseWindow> {
+        None
+    }
+
     fn take_engine_lock_census(&self, _win_ms: u64) -> Option<String> {
         None
     }
@@ -340,6 +356,22 @@ impl ObservationService for VulkanExecutor {
 
     fn draw_phase_window(&self) -> Option<crate::backend::vulkan::engine::DrawPhaseWindow> {
         crate::backend::vulkan::engine::draw_phase_window()
+    }
+
+    fn gpu_span_window(&self) -> Option<crate::backend::vulkan::engine::gpu_span::GpuSpanWindow> {
+        crate::backend::vulkan::engine::gpu_span::take_window()
+    }
+
+    fn gather_phase_window(
+        &self,
+    ) -> Option<crate::backend::vulkan::engine::gather_phase::GatherPhaseWindow> {
+        crate::backend::vulkan::engine::gather_phase::take_window()
+    }
+
+    fn stage_phase_window(
+        &self,
+    ) -> Option<crate::backend::vulkan::engine::stage_phase::StagePhaseWindow> {
+        crate::backend::vulkan::engine::stage_phase::take_window()
     }
 
     fn take_engine_lock_census(&self, win_ms: u64) -> Option<String> {

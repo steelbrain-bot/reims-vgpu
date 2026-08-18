@@ -3247,9 +3247,9 @@ fn emit_draw_phase(executor: &dyn crate::runtime::executor::Executor) {
         w.max_us,
         w.stalls,
     ));
-    emit_stage_phase();
-    emit_gather_phase();
-    emit_gpu_span();
+    emit_stage_phase(executor);
+    emit_gather_phase(executor);
+    emit_gpu_span(executor);
 }
 
 /// Beside `draw_phase`, because it is the one column in it the GPU wrote.
@@ -3278,8 +3278,8 @@ fn emit_draw_phase(executor: &dyn crate::runtime::executor::Executor) {
 /// the writeback's own positive control halved the frame rate and lowered
 /// `busy_us` by 48 % while per-submission GPU cost moved 1.5 %.
 #[cfg(feature = "backend-vulkan")]
-fn emit_gpu_span() {
-    let Some(w) = crate::backend::vulkan::engine::gpu_span::take_window() else {
+fn emit_gpu_span(executor: &dyn crate::runtime::executor::Executor) {
+    let Some(w) = executor.gpu_span_window() else {
         return;
     };
     crate::observe::off(format!(
@@ -3313,8 +3313,8 @@ fn emit_gpu_span() {
 /// [`crate::backend::vulkan::engine::gather_phase`] for what each part is and
 /// what would remove it.
 #[cfg(feature = "backend-vulkan")]
-fn emit_gather_phase() {
-    let Some(w) = crate::backend::vulkan::engine::gather_phase::take_window() else {
+fn emit_gather_phase(executor: &dyn crate::runtime::executor::Executor) {
+    let Some(w) = executor.gather_phase_window() else {
         return;
     };
     crate::observe::off(format!(
@@ -3327,8 +3327,8 @@ fn emit_gather_phase() {
 /// Under `draw_phase`, dividing its largest column — `stage_us` is 83 % of that
 /// phase's second on a driven drag, and the five parts want opposite fixes.
 #[cfg(feature = "backend-vulkan")]
-fn emit_stage_phase() {
-    let Some(w) = crate::backend::vulkan::engine::stage_phase::take_window() else {
+fn emit_stage_phase(executor: &dyn crate::runtime::executor::Executor) {
+    let Some(w) = executor.stage_phase_window() else {
         return;
     };
     crate::observe::off(format!(
