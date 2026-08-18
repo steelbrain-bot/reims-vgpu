@@ -62,19 +62,12 @@ pub type ExecutionOutput = reims_vgpu_core::ExecutionOutput<DrawOutput, ComputeO
 pub type ExecutionCompletion = reims_vgpu_core::ExecutionCompletion<ExecutionOutput>;
 pub type ExecutionReceipt<T> = reims_vgpu_core::ExecutionReceipt<T>;
 
-/// Backend execution contract implemented per device.
-pub trait Executor:
-    ExecutionPort<
-        Submission = ResolvedSubmission,
-        Completion = ExecutionCompletion,
-        Error = DrawError,
-    > + ResidentService
-    + GuestWriteService
-    + ComputeResidencyService
-    + CapabilityService
-    + PresentationService
-    + ReadbackService<Error = DrawError>
-{
+/// Compatibility port for transfers and synchronization involving guest RAM.
+///
+/// Its concrete reference types remain runtime-owned during the migration, but
+/// execution, capability, presentation, and readback services cannot grow
+/// guest-memory policy through this boundary.
+pub trait GuestMemoryService: std::fmt::Debug + Send + Sync {
     fn copy_target_to_guest_pages(
         &self,
         _identity: &TargetIdentity,
@@ -125,7 +118,22 @@ pub trait Executor:
     }
 
     fn retire_guest_import(&self, _import: crate::runtime::guest_ram::ImportId) {}
+}
 
+/// Backend execution contract implemented per device.
+pub trait Executor:
+    ExecutionPort<
+        Submission = ResolvedSubmission,
+        Completion = ExecutionCompletion,
+        Error = DrawError,
+    > + ResidentService
+    + GuestWriteService
+    + ComputeResidencyService
+    + CapabilityService
+    + PresentationService
+    + ReadbackService<Error = DrawError>
+    + GuestMemoryService
+{
     fn flush_batched_draws(&self) {}
 
     fn maintain_resources(&self, _now_ms: u64) {}
@@ -188,7 +196,7 @@ impl Drop for VulkanExecutor {
     }
 }
 
-impl Executor for VulkanExecutor {
+impl GuestMemoryService for VulkanExecutor {
     fn copy_target_to_guest_pages(
         &self,
         identity: &TargetIdentity,
@@ -237,7 +245,9 @@ impl Executor for VulkanExecutor {
     fn retire_guest_import(&self, import: crate::runtime::guest_ram::ImportId) {
         crate::backend::vulkan::engine::retire_guest_import(import);
     }
+}
 
+impl Executor for VulkanExecutor {
     fn flush_batched_draws(&self) {
         crate::backend::vulkan::engine::flush_batched_draws();
     }
@@ -642,6 +652,7 @@ mod tests {
     }
 
     impl PresentationService for ScriptedExecutor {}
+    impl GuestMemoryService for ScriptedExecutor {}
 
     impl ReadbackService for ScriptedExecutor {
         type Error = DrawError;
@@ -872,6 +883,7 @@ mod tests {
 
     impl CapabilityService for WrongIdentityExecutor {}
     impl PresentationService for WrongIdentityExecutor {}
+    impl GuestMemoryService for WrongIdentityExecutor {}
     impl ReadbackService for WrongIdentityExecutor {
         type Error = DrawError;
 

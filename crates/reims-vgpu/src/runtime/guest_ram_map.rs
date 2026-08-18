@@ -799,6 +799,7 @@ mod tests {
 
     impl crate::runtime::executor::CapabilityService for NoopExecutor {}
     impl crate::runtime::executor::PresentationService for NoopExecutor {}
+    impl crate::runtime::executor::GuestMemoryService for NoopExecutor {}
     impl crate::runtime::executor::ReadbackService for NoopExecutor {
         type Error = crate::backend::vulkan::engine::DrawError;
 
