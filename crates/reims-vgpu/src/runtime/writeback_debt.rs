@@ -114,7 +114,7 @@ pub struct GvaWritebackDebt {
         reims_vgpu_protocol::ResourceId<reims_vgpu_protocol::ResourceObject>,
         reims_vgpu_protocol::ContentVersion,
     )>,
-    pub guest_write: crate::runtime::buffer_write_gen::BufferWriteStamp,
+    pub guest_write: crate::runtime::buffer_write_gen::ResourceWriteStamp,
     pub seq: u64,
 }
 
@@ -682,7 +682,7 @@ pub fn arm_gva<M: HostMemory + HostOps>(
                 submission.identity.id,
             )
         }),
-        guest_write: state.buffer_write_gen.stamp(task_id, c0.texture_ref),
+        guest_write: state.resource_write_stamp(task_id, c0.texture_ref),
         seq: 0,
     };
     let previous = state.pending_writebacks.arm_gva(key, debt);
@@ -703,8 +703,7 @@ pub fn gva_resident_authoritative(
         return false;
     };
     state
-        .buffer_write_gen
-        .stamp(plane.resource.task_id, plane.resource.texture_ref)
+        .resource_write_stamp(plane.resource.task_id, plane.resource.texture_ref)
         .quiet_since(debt.guest_write)
 }
 
@@ -891,7 +890,7 @@ fn pay_gva<M: HostMemory + HostOps>(
 ) -> bool {
     let key = plane.resource;
     let identity = gva_identity(debt);
-    let now = state.buffer_write_gen.stamp(key.task_id, key.texture_ref);
+    let now = state.resource_write_stamp(key.task_id, key.texture_ref);
     if !now.quiet_since(debt.guest_write) {
         crate::runtime::drain::note_store_route("gvadebt_abandoned_guest_wrote");
         release_gva(debt);

@@ -143,11 +143,9 @@ pub fn apply(
     }
     out.missed = !hit;
     if ops.clear_host_valid != 0 {
-        // The dirty bit belongs to the task-local resource object, so retain
-        // that statement under its native `(task, object)` identity whether or
-        // not the object also names a mapping. Mapping generations are views
-        // used by mapping-owned caches; this is the object-owned source from
-        // which GVA buffers and linear textures derive their freshness.
+        // Preserve the statement if it preceded object construction. Once the
+        // object exists, consumers use the canonical content version updated
+        // above; this fallback can no longer decide its currency.
         state.buffer_write_gen.note_write(task_id, object_id);
         crate::runtime::drain::note_store_route(site.clear_host_route());
     }
@@ -420,7 +418,7 @@ mod tests {
             texture_ref,
         };
         let debt = |state: &mut DeviceState| {
-            let before = state.buffer_write_gen.stamp(task_id, texture_ref);
+            let before = state.resource_write_stamp(task_id, texture_ref);
             let _ = state.pending_writebacks.arm_gva(
                 key,
                 crate::runtime::writeback_debt::GvaWritebackDebt {
@@ -492,7 +490,7 @@ mod tests {
             task_id,
             texture_ref,
         };
-        let before = state.buffer_write_gen.stamp(task_id, texture_ref);
+        let before = state.resource_write_stamp(task_id, texture_ref);
         let _ = state.pending_writebacks.arm_gva(
             key,
             crate::runtime::writeback_debt::GvaWritebackDebt {
@@ -523,8 +521,7 @@ mod tests {
         assert_eq!(out.bumped, 1, "the colliding mapping still invalidates");
         assert!(
             !state
-                .buffer_write_gen
-                .stamp(task_id, texture_ref)
+                .resource_write_stamp(task_id, texture_ref)
                 .quiet_since(before),
             "the distinct GVA resource must see the same guest-write declaration"
         );

@@ -8,7 +8,7 @@
 //!
 //! The guest statement is carried in its owning namespace: mapping-backed
 //! windows use MappingEntry::content_generation, while task-local resources
-//! use BufferWriteStamp. An unchanged generation and a quiet device-write
+//! use `ResourceWriteStamp`. An unchanged version and a quiet device-write
 //! verdict preserve the sampled identity. A changed generation, a device write,
 //! or an unaddressed statement spends the identity and forces a gather.
 //! Hypervisor dirty-page observations are not an input: the decoded resource
@@ -131,7 +131,7 @@ impl GatherKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatedGeneration {
     Mapping(u32),
-    TaskResource(crate::runtime::buffer_write_gen::BufferWriteStamp),
+    TaskResource(crate::runtime::buffer_write_gen::ResourceWriteStamp),
 }
 
 /// What the last bind of one window observed.

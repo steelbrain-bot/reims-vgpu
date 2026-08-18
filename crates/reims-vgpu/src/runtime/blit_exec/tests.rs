@@ -1862,7 +1862,7 @@ fn a_blit_endpoint_lands_the_writeback_its_texture_still_owes() {
         task_id: 1,
         texture_ref: 2,
     };
-    let guest_write = state.buffer_write_gen.stamp(key.task_id, key.texture_ref);
+    let guest_write = state.resource_write_stamp(key.task_id, key.texture_ref);
     assert_eq!(
         state.pending_writebacks.arm_gva(
             key,

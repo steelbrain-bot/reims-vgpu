@@ -1,6 +1,6 @@
-//! Guest-declared write generations for task-local GVA resources.
+//! Pre-construction fallback for guest-declared resource writes.
 //!
-//! # Why this state is separate
+//! # Why this state still exists
 //!
 //! [`crate::runtime::resource_validity::apply`] takes the guest's validity quad
 //! for one object id. GVA render resources are owned by a task-local texture
@@ -8,10 +8,11 @@
 //! guest-write declarations therefore need a generation keyed by
 //! `(task, object)` rather than inferred from the physical backing chosen later.
 //!
-//! A Store stamps the generation beside a host-authoritative GVA image. If the
-//! guest later declares that object written, the changed stamp abandons that
-//! image instead of copying its older pixels over the guest's newer bytes.
-//! [`crate::runtime::writeback_debt`] owns both the stamp and the decision.
+//! Constructed objects use the canonical resource graph's `(ResourceId,
+//! ContentVersion)` through [`ResourceWriteStamp::Resolved`]. This ledger is
+//! retained only for the ordering case where a validity record names a task
+//! reference before its construction record has been decoded. Once the object
+//! exists, this fallback can no longer decide its currency.
 //!
 //! # Lifetime
 //!
@@ -23,6 +24,48 @@
 //! clean after the bytes moved.
 
 use std::collections::HashMap;
+
+use reims_vgpu_protocol::{ContentVersion, ResourceId, ResourceObject};
+
+/// The resource-owned content observation recorded beside a derived copy.
+///
+/// A resolved stamp is generational: deleting and recreating the same guest
+/// reference changes its `ResourceId`, even if its first content version has
+/// the same numeric value. The unresolved variant is deliberately explicit and
+/// cannot compare equal to a later resolved resource.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResourceWriteStamp {
+    Resolved {
+        resource: ResourceId<ResourceObject>,
+        version: ContentVersion,
+    },
+    Unresolved(BufferWriteStamp),
+}
+
+impl Default for ResourceWriteStamp {
+    fn default() -> Self {
+        Self::Unresolved(BufferWriteStamp::default())
+    }
+}
+
+impl ResourceWriteStamp {
+    pub fn quiet_since(self, earlier: Self) -> bool {
+        match (self, earlier) {
+            (
+                Self::Resolved {
+                    resource: now_resource,
+                    version: now_version,
+                },
+                Self::Resolved {
+                    resource: old_resource,
+                    version: old_version,
+                },
+            ) => now_resource == old_resource && now_version == old_version,
+            (Self::Unresolved(now), Self::Unresolved(old)) => now.quiet_since(old),
+            _ => false,
+        }
+    }
+}
 
 /// Per-object write generations in the guest's task-local resource namespace.
 #[derive(Default, Debug)]

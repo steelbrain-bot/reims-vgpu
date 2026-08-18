@@ -3738,7 +3738,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
             len: span,
         }];
         let stated = crate::runtime::gather_witness::StatedGeneration::TaskResource(
-            state.buffer_write_gen.stamp(task_id, texture_ref),
+            state.resource_write_stamp(task_id, texture_ref),
         );
         let seen = crate::runtime::gather_witness::note_gather(
             state,
@@ -3805,7 +3805,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     };
     let page = state.page_size() as usize;
     let stated = crate::runtime::gather_witness::StatedGeneration::TaskResource(
-        state.buffer_write_gen.stamp(task_id, texture_ref),
+        state.resource_write_stamp(task_id, texture_ref),
     );
     let seen = crate::runtime::gather_witness::note_gather(
         state,

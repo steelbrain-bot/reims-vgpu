@@ -13,7 +13,7 @@
 //! record, so they acquire no entry and conservatively miss this shortcut.
 
 use crate::model::DeviceState;
-use crate::runtime::buffer_write_gen::BufferWriteStamp;
+use crate::runtime::buffer_write_gen::ResourceWriteStamp;
 use crate::runtime::host_writes::HostWriteVerdict;
 use std::collections::BTreeMap;
 
@@ -61,7 +61,7 @@ impl GvaTargetKey {
 #[derive(Debug)]
 struct Entry {
     gpas: Vec<u64>,
-    guest_write: BufferWriteStamp,
+    guest_write: ResourceWriteStamp,
     host_epoch_at_store: u64,
 }
 
@@ -94,7 +94,7 @@ pub fn note_store(state: &mut DeviceState, key: GvaTargetKey, gpas: &[u64]) {
     }
     let entry = Entry {
         gpas: gpas.to_vec(),
-        guest_write: state.buffer_write_gen.stamp(key.task_id, key.texture_ref),
+        guest_write: state.resource_write_stamp(key.task_id, key.texture_ref),
         host_epoch_at_store: state.host_writes.epoch(),
     };
     state.gva_store_witness.entries.insert(key, entry);
@@ -144,7 +144,7 @@ pub fn reach(state: &DeviceState, key: GvaTargetKey) -> GvaWriteReach {
     let Some(entry) = state.gva_store_witness.entries.get(&key) else {
         return GvaWriteReach::NoEntry;
     };
-    let now = state.buffer_write_gen.stamp(key.task_id, key.texture_ref);
+    let now = state.resource_write_stamp(key.task_id, key.texture_ref);
     if !now.quiet_since(entry.guest_write) {
         return GvaWriteReach::GuestWrote;
     }

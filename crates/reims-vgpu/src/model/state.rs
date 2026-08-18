@@ -1039,6 +1039,23 @@ impl TaskResources {
         registry.graph.resource_mut(id)?.content.guest_wrote().ok()
     }
 
+    /// Snapshot the canonical identity and content version of a constructed
+    /// task resource.
+    pub fn content_stamp(
+        &self,
+        task_id: u32,
+        ref_: u32,
+    ) -> Option<(ResourceId<ResourceObject>, ContentVersion)> {
+        let registry = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let id = registry
+            .graph
+            .resolve(TaskId::new(task_id), ObjectRef::new(ref_))?;
+        Some((id, registry.graph.resource(id)?.content.current))
+    }
+
     /// Apply a completed GPU Store to the resource version state.
     ///
     /// The current executor reports render operations synchronously. Reserving
@@ -1411,6 +1428,39 @@ mod task_resource_graph_tests {
 
         assert_eq!(snapshot[0], (ObjectRef::new(9), Some(id), Some(version)));
         resources.complete_submission(SubmissionId::new(1), [id]);
+    }
+
+    #[test]
+    fn constructed_resource_content_supersedes_the_unresolved_write_fallback() {
+        let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        let unresolved = state.resource_write_stamp(4, 9);
+        state.buffer_write_gen.note_write(4, 9);
+        assert!(
+            !state.resource_write_stamp(4, 9).quiet_since(unresolved),
+            "the fallback must preserve writes which precede construction"
+        );
+
+        let resource = state
+            .task_resources
+            .register(4, 9, resource(ObjectKind::Buffer));
+        let initial = state.resource_write_stamp(4, 9);
+        assert!(
+            !initial.quiet_since(unresolved),
+            "a generational resource identity cannot equal an unresolved slot"
+        );
+
+        state.buffer_write_gen.note_write(4, 9);
+        assert!(
+            state.resource_write_stamp(4, 9).quiet_since(initial),
+            "the fallback counter cannot invalidate a constructed resource"
+        );
+
+        state.task_resources.note_guest_write(4, 9).unwrap();
+        assert!(
+            !state.resource_write_stamp(4, 9).quiet_since(initial),
+            "the canonical content version owns constructed-resource currency"
+        );
+        assert!(resource.semantic_id().is_some());
     }
 
     #[test]
@@ -3164,12 +3214,12 @@ pub struct DeviceState {
     /// See [`crate::runtime::bound_buffers`].
     #[cfg(feature = "backend-vulkan")]
     pub bound_buffers: crate::runtime::bound_buffers::BoundBuffers,
-    /// When the guest last declared a write to each task-local resource object.
+    /// Pre-construction fallback for guest writes to task-local references.
     ///
-    /// This preserves the validity statement in the resource-ref namespace;
-    /// mapping generations preserve the same statement in mapping-id space.
-    /// Ungated, because the producer is the decoder rather than a backend. See
-    /// [`crate::runtime::buffer_write_gen`].
+    /// Constructed objects use [`TaskResources`]' canonical content version;
+    /// this preserves validity records which arrive before object construction.
+    /// Ungated, because the producer is the decoder rather than a backend.
+    /// See [`crate::runtime::buffer_write_gen`].
     pub buffer_write_gen: crate::runtime::buffer_write_gen::BufferWriteGens,
     /// Monotonic source for every sampled-content generation this device
     /// hands the engine. Read only through
@@ -3360,6 +3410,25 @@ pub struct DeviceState {
 }
 
 impl DeviceState {
+    /// Content currency in the resource namespace that owns it.
+    ///
+    /// Constructed resources always use the canonical graph. The legacy
+    /// counter is consulted only when construction has not yet established a
+    /// resource identity, preserving validity records which arrive first.
+    pub fn resource_write_stamp(
+        &self,
+        task_id: u32,
+        object_id: u32,
+    ) -> crate::runtime::buffer_write_gen::ResourceWriteStamp {
+        use crate::runtime::buffer_write_gen::ResourceWriteStamp;
+        self.task_resources
+            .content_stamp(task_id, object_id)
+            .map(|(resource, version)| ResourceWriteStamp::Resolved { resource, version })
+            .unwrap_or_else(|| {
+                ResourceWriteStamp::Unresolved(self.buffer_write_gen.stamp(task_id, object_id))
+            })
+    }
+
     /// GPA for a guest PFN under this device's page size.
     #[inline]
     pub fn pfn_gpa(&self, pfn: u32) -> u64 {
