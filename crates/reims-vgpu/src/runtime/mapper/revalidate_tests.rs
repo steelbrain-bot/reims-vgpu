@@ -269,8 +269,8 @@ fn invalidate_mapping_pages_bumps_map_generation_and_clears() {
     assert_eq!(m.contig_ptr, 0);
     assert!(m.contig_import.is_none());
     assert!(m.map_generation != gen0);
-    assert_eq!(state.retired_views, vec![(0xdead, 4096)]);
-    assert_eq!(state.retired_guest_imports, vec![import_id]);
+    assert_eq!(state.pending_host_releases.views(), vec![(0xdead, 4096)]);
+    assert_eq!(state.pending_host_releases.guest_imports(), vec![import_id]);
 }
 
 /// Invalidating a mapping's pages drops the host-side copy of those pages.

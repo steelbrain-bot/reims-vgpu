@@ -163,7 +163,7 @@ mod tests {
     #[test]
     fn reset_view_collection_detaches_every_guest_alias() {
         let mut d = dev();
-        d.state.retired_views.push((0x1000, 0x2000));
+        d.state.pending_host_releases.retire_view((0x1000, 0x2000));
         d.state.mappings.insert(
             7,
             MappingEntry {
@@ -187,7 +187,7 @@ mod tests {
             views,
             vec![(0x1000, 0x2000), (0x3000, 0x4000), (0x5000, 0x6000)]
         );
-        assert!(d.state.retired_views.is_empty());
+        assert!(d.state.pending_host_releases.views().is_empty());
         assert!(d.state.gva_host_views.is_empty());
         assert_eq!(d.state.mappings[&7].contig_ptr, 0);
         assert_eq!(d.state.mappings[&7].contig_len, 0);

@@ -432,7 +432,7 @@ fn both_linear_store_paths_admit_the_same_windows() {
 }
 
 /// Task/object deletion of a resident-authoritative entry queues the
-/// engine unpin key (the runtime drains `retired_linear_residents`).
+/// executor release effect.
 #[test]
 fn linear_resident_retires_on_task_and_object_delete() {
     use crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT;
@@ -451,21 +451,24 @@ fn linear_resident_retires_on_task_and_object_delete() {
     // A pending guest-flush obligation dies with the entry (boot-16 rule:
     // never write guest pages at a lifetime boundary).
     assert!(st.delete_task(6));
-    assert_eq!(st.retired_linear_residents.len(), 1);
-    let key = st.retired_linear_residents[0];
+    assert_eq!(st.pending_host_releases.linear_residents().len(), 1);
+    let key = st.pending_host_releases.linear_residents()[0];
     assert!(key.is_linear());
     assert_eq!(key.linear_window(), Some((6, 21, 0x30_2000, 32, 64)));
     crate::runtime::render_writeback::retire_linear_residents(&mut st);
-    assert!(st.retired_linear_residents.is_empty());
+    assert!(st.pending_host_releases.linear_residents().is_empty());
 
     st.define_task(6, 0x1000, 1);
     st.insert_object(6, 21);
     assert!(note_linear_texture_resident(&mut st, &win, 5));
     assert!(st.delete_object(6, 21));
-    assert_eq!(st.retired_linear_residents.len(), 1);
-    assert_eq!(st.retired_linear_residents[0].resource_ref(), Some(21));
+    assert_eq!(st.pending_host_releases.linear_residents().len(), 1);
+    assert_eq!(
+        st.pending_host_releases.linear_residents()[0].resource_ref(),
+        Some(21)
+    );
     // Non-resident entries retire nothing.
-    st.retired_linear_residents.clear();
+    let _ = st.pending_host_releases.take_linear_residents();
     let px = vec![0u8; 4 * 2 * 8];
     st.insert_object(6, 22);
     assert!(store_linear_texture(
@@ -478,7 +481,7 @@ fn linear_resident_retires_on_task_and_object_delete() {
         &px,
     ));
     assert!(st.delete_object(6, 22));
-    assert!(st.retired_linear_residents.is_empty());
+    assert!(st.pending_host_releases.linear_residents().is_empty());
 }
 
 #[test]

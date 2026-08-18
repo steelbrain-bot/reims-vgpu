@@ -2452,7 +2452,9 @@ fn apply_surface_backing<M: HostMemory>(
         // Contiguous view must be rebuilt.
         let mut retired_import = None;
         if m.contig_ptr != 0 {
-            state.retired_views.push((m.contig_ptr, m.contig_len));
+            state
+                .pending_host_releases
+                .retire_view((m.contig_ptr, m.contig_len));
             m.contig_ptr = 0;
             m.contig_len = 0;
             m.contig_footprint = None;
@@ -2462,7 +2464,7 @@ fn apply_surface_backing<M: HostMemory>(
             });
         }
         if let Some(import) = retired_import {
-            state.retired_guest_imports.push(import);
+            state.pending_host_releases.retire_guest_import(import);
         }
     }
 

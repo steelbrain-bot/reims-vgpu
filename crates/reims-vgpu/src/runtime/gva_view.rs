@@ -81,7 +81,7 @@ pub(crate) fn task_matches(view_task: u32, wire_task: u32) -> bool {
 
 /// Retire every registered GVA view that overlaps `[gva, gva+length)` under `task_id`.
 ///
-/// Pushes `(ptr, ptr_len)` into `retired_views` for [`mapper::flush_retired_views`].
+/// Emits a typed view-release effect for [`mapper::flush_retired_views`].
 /// Does **not** evict `host_gva_surfaces` (encode content is retained across
 /// Unmap — a mapping that churns and comes back must not black out the
 /// wallpaper); it marks the overlapping entries suspect instead, so the next
@@ -104,7 +104,7 @@ pub fn retire_gva_views_overlapping(
         if task_matches(v.task_id, task_id) && ranges_overlap(v.gva, v.length, gva, length) {
             let v = state.gva_host_views.swap_remove(i);
             if v.ptr != 0 && v.ptr_len != 0 {
-                state.retired_views.push((v.ptr, v.ptr_len));
+                state.pending_host_releases.retire_view((v.ptr, v.ptr_len));
             }
             n = n.saturating_add(1);
         } else {
@@ -284,7 +284,7 @@ fn ensure_gva_view<H: HostMemory + HostOps>(
             if w.ptr == view.ptr && w.gva == view.gva && w.task_id == view.task_id {
                 let w = state.gva_host_views.swap_remove(i);
                 if w.ptr != 0 && w.ptr_len != 0 {
-                    state.retired_views.push((w.ptr, w.ptr_len));
+                    state.pending_host_releases.retire_view((w.ptr, w.ptr_len));
                 }
             } else {
                 i += 1;
@@ -1621,7 +1621,7 @@ mod tests {
             .gva_host_views
             .iter()
             .any(|v| v.ptr == 0xcccc && v.task_id == 3));
-        assert_eq!(state.retired_views, vec![(0xaaaa, 0x2000)]);
+        assert_eq!(state.pending_host_releases.views(), vec![(0xaaaa, 0x2000)]);
     }
 
     #[test]
@@ -1639,7 +1639,7 @@ mod tests {
         let n = retire_gva_views_overlapping(&mut state, 2, 0x2000, 0x1000);
         assert_eq!(n, 1);
         assert!(state.gva_host_views.is_empty());
-        assert_eq!(state.retired_views, vec![(0x1111, 0x1000)]);
+        assert_eq!(state.pending_host_releases.views(), vec![(0x1111, 0x1000)]);
     }
 
     #[test]
@@ -1665,7 +1665,7 @@ mod tests {
         assert!(state.delete_task(1));
         assert_eq!(state.gva_host_views.len(), 1);
         assert_eq!(state.gva_host_views[0].ptr, 0xeeee);
-        assert_eq!(state.retired_views, vec![(0xdddd, 0x1000)]);
+        assert_eq!(state.pending_host_releases.views(), vec![(0xdddd, 0x1000)]);
     }
 
     #[test]

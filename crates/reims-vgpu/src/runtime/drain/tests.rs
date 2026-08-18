@@ -3569,7 +3569,10 @@ fn unmap_memory_retains_gva_host_cache_for_sample() {
     // HostOps view of the unmapped range is gone; other GVA view kept.
     assert_eq!(state.gva_host_views.len(), 1);
     assert_eq!(state.gva_host_views[0].ptr, 0xcafe_0000);
-    assert_eq!(state.retired_views, vec![(0xfeed_0000, 0x10000)]);
+    assert_eq!(
+        state.pending_host_releases.views(),
+        vec![(0xfeed_0000, 0x10000)]
+    );
 }
 
 /// RE pageBacking Invalidate: clr hostValid → bump content_generation.

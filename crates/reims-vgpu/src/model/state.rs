@@ -2096,7 +2096,7 @@ pub struct MappingEntry {
     /// for the guest mapping. Guest CPU writes and host page reads see this
     /// allocation directly; on a capable unified-memory backend an imported
     /// render attachment retains the same view. Retired (never freed in place)
-    /// whenever `page_entries` change; see `DeviceState::retired_views`.
+    /// whenever `page_entries` change; see [`PendingHostReleases`].
     pub contig_ptr: usize,
     pub contig_len: usize,
     /// Guest-physical pages represented by `contig_ptr`, in allocation order.
@@ -2787,6 +2787,58 @@ impl NamedMappings {
     }
 }
 
+/// Typed release effects produced by model mutations which require host or
+/// executor services to finish.
+///
+/// The model cannot call `HostOps`, and it must not own backend objects. It can
+/// still describe the exact teardown work it caused. Consumers drain imports
+/// before host views because a backend allocation may alias the view; linear
+/// resident release is a separate executor effect.
+#[derive(Debug, Default)]
+pub struct PendingHostReleases {
+    views: Vec<(usize, usize)>,
+    guest_imports: Vec<crate::runtime::guest_ram::ImportId>,
+    linear_residents: Vec<ComputeStorageResidencyKey>,
+}
+
+impl PendingHostReleases {
+    pub fn retire_view(&mut self, view: (usize, usize)) {
+        self.views.push(view);
+    }
+
+    pub fn retire_guest_import(&mut self, import: crate::runtime::guest_ram::ImportId) {
+        self.guest_imports.push(import);
+    }
+
+    pub fn retire_linear_resident(&mut self, identity: ComputeStorageResidencyKey) {
+        self.linear_residents.push(identity);
+    }
+
+    pub fn take_views(&mut self) -> Vec<(usize, usize)> {
+        std::mem::take(&mut self.views)
+    }
+
+    pub fn take_guest_imports(&mut self) -> Vec<crate::runtime::guest_ram::ImportId> {
+        std::mem::take(&mut self.guest_imports)
+    }
+
+    pub fn take_linear_residents(&mut self) -> Vec<ComputeStorageResidencyKey> {
+        std::mem::take(&mut self.linear_residents)
+    }
+
+    pub fn views(&self) -> &[(usize, usize)] {
+        &self.views
+    }
+
+    pub fn guest_imports(&self) -> &[crate::runtime::guest_ram::ImportId] {
+        &self.guest_imports
+    }
+
+    pub fn linear_residents(&self) -> &[ComputeStorageResidencyKey] {
+        &self.linear_residents
+    }
+}
+
 /// Full device model state (backend-independent).
 #[derive(Debug)]
 pub struct DeviceState {
@@ -3132,23 +3184,13 @@ pub struct DeviceState {
     /// `drain_other_child_fifos` must skip **all** bits set — otherwise it can
     /// re-enter a mid-packet channel and re-process the same head.
     pub draining_mask: u32,
-    /// Contiguous mapping views (`MappingEntry::contig_ptr`) whose page tables
-    /// changed. `DeviceState` cannot unmap (no HostOps); the runtime flushes
-    /// these via `HostOps::unmap_pages` after retiring the backend objects and
-    /// parent allocations that alias them (`mapper::flush_retired_views`).
-    pub retired_views: Vec<(usize, usize)>,
-    /// Backend parent allocations detached with `retired_views`. The runtime
-    /// retires the GPU import before releasing the host view it aliases.
-    pub retired_guest_imports: Vec<crate::runtime::guest_ram::ImportId>,
+    /// Host/executor release effects emitted by mapping and object lifetime
+    /// transitions. Drained in dependency order by the composition runtime.
+    pub pending_host_releases: PendingHostReleases,
     /// Task-GVA HostOps views (zero-copy import substrate). Dropped on
-    /// overlapping UnmapMemory/MapMemory2; flushed via `retired_views`.
+    /// overlapping UnmapMemory/MapMemory2; flushed through typed host-release
+    /// effects.
     pub gva_host_views: Vec<GvaHostView>,
-    /// Linear-window residency keys whose `host_linear_textures` entry died
-    /// (task/object delete). `DeviceState` cannot reach the engine; the
-    /// runtime unpins these
-    /// ([`crate::runtime::render_writeback::retire_linear_residents`]) so the
-    /// pinned images become LRU-evictable instead of leaking.
-    pub retired_linear_residents: Vec<ComputeStorageResidencyKey>,
     /// GVA resources whose latest frame is still only in the engine resident,
     /// because nothing has synchronized or read their transfer backing since
     /// the Store that produced it. See
@@ -3320,9 +3362,7 @@ impl DeviceState {
             task_event_states: TaskEventStates::default(),
             draining_channel: 0,
             draining_mask: 0,
-            retired_views: Vec::new(),
-            retired_guest_imports: Vec::new(),
-            retired_linear_residents: Vec::new(),
+            pending_host_releases: PendingHostReleases::default(),
             pending_writebacks: crate::runtime::writeback_debt::PendingWritebacks::default(),
             completion_stamp_seq: 0,
             stamp_ledger: Default::default(),
@@ -3345,7 +3385,7 @@ impl DeviceState {
     }
 
     /// Detach `e`'s contiguous view for later unmap (page table changed).
-    /// Returns the retired (ptr, len) to push into `retired_views`.
+    /// Returns the retired `(ptr, len)` host-view release effect.
     fn take_mapping_view(
         e: &mut MappingEntry,
     ) -> (
@@ -3375,14 +3415,14 @@ impl DeviceState {
     /// Returning the views lets the runtime invalidate backend aliases first,
     /// then release them through the bound HostOps implementation.
     pub fn take_all_host_views(&mut self) -> Vec<(usize, usize)> {
-        let mut views = std::mem::take(&mut self.retired_views);
+        let mut views = self.pending_host_releases.take_views();
         for mapping in self.mappings.values_mut() {
             let (view, import) = Self::take_mapping_view(mapping);
             if let Some(view) = view {
                 views.push(view);
             }
             if let Some(import) = import {
-                self.retired_guest_imports.push(import);
+                self.pending_host_releases.retire_guest_import(import);
             }
         }
         #[cfg(feature = "backend-vulkan")]
@@ -3676,13 +3716,13 @@ impl DeviceState {
     }
 
     /// Queue the engine-unpin for a dying linear cache entry that still owns a
-    /// resident image (see `retired_linear_residents`).
+    /// resident image.
     fn retire_linear_resident(&mut self, task_id: u32, texture_ref: u32, e: &HostLinearTexture) {
         if e.resident_gen == 0 || e.row_stride > u32::MAX as u64 {
             return;
         }
-        self.retired_linear_residents
-            .push(ComputeStorageResidencyKey::linear(
+        self.pending_host_releases
+            .retire_linear_resident(ComputeStorageResidencyKey::linear(
                 task_id,
                 texture_ref,
                 e.gva,
@@ -3802,15 +3842,15 @@ impl DeviceState {
     /// host pointers into pages the guest is about to recycle, so leaving one
     /// live is a read of memory that no longer belongs to the surface (the
     /// WindowServer SIGSEGV class [`crate::runtime::gva_view::write_span_within`]
-    /// documents). `retired_views` is
-    /// drained by `mapper::flush_retired_views` through `HostOps::unmap_pages`.
+    /// documents). The typed view-release effects are drained by
+    /// `mapper::flush_retired_views` through `HostOps::unmap_pages`.
     fn retire_task_gva_views(&mut self, task_id: u32) {
         let mut i = 0;
         while i < self.gva_host_views.len() {
             if self.gva_host_views[i].task_id == task_id {
                 let v = self.gva_host_views.swap_remove(i);
                 if v.ptr != 0 && v.ptr_len != 0 {
-                    self.retired_views.push((v.ptr, v.ptr_len));
+                    self.pending_host_releases.retire_view((v.ptr, v.ptr_len));
                 }
             } else {
                 i += 1;
@@ -3866,7 +3906,7 @@ impl DeviceState {
         // GVA encode cache retained until Unmap of that range.
         // Task teardown ≡ all GPU VA maps for this task go away — retire any
         // HostOps views we held (does not touch host_gva_surfaces encode).
-        // Runtime flushes retired_views via HostOps::unmap_pages.
+        // Runtime drains the typed view effects via HostOps::unmap_pages.
         self.retire_task_gva_views(task_id);
         #[cfg(feature = "backend-vulkan")]
         {
@@ -4046,10 +4086,10 @@ impl DeviceState {
         Self::bump_page_generation(e);
         let (retired, retired_import) = Self::take_mapping_view(e);
         if let Some(view) = retired {
-            self.retired_views.push(view);
+            self.pending_host_releases.retire_view(view);
         }
         if let Some(import) = retired_import {
-            self.retired_guest_imports.push(import);
+            self.pending_host_releases.retire_guest_import(import);
         }
         #[cfg(feature = "backend-vulkan")]
         self.retire_mapping_gather_witness(mapping_id);
@@ -4074,10 +4114,10 @@ impl DeviceState {
         Self::bump_page_generation(e);
         let (retired, retired_import) = Self::take_mapping_view(e);
         if let Some(view) = retired {
-            self.retired_views.push(view);
+            self.pending_host_releases.retire_view(view);
         }
         if let Some(import) = retired_import {
-            self.retired_guest_imports.push(import);
+            self.pending_host_releases.retire_guest_import(import);
         }
         #[cfg(feature = "backend-vulkan")]
         self.retire_mapping_gather_witness(mapping_id);
@@ -4140,10 +4180,10 @@ impl DeviceState {
         Self::bump_page_generation(e);
         let (retired, retired_import) = Self::take_mapping_view(e);
         if let Some(v) = retired {
-            self.retired_views.push(v);
+            self.pending_host_releases.retire_view(v);
         }
         if let Some(import) = retired_import {
-            self.retired_guest_imports.push(import);
+            self.pending_host_releases.retire_guest_import(import);
         }
         #[cfg(feature = "backend-vulkan")]
         self.retire_mapping_gather_witness(mapping_id);
@@ -4173,10 +4213,10 @@ impl DeviceState {
         e.page_table_kva = 0;
         let (retired, retired_import) = Self::take_mapping_view(e);
         if let Some(v) = retired {
-            self.retired_views.push(v);
+            self.pending_host_releases.retire_view(v);
         }
         if let Some(import) = retired_import {
-            self.retired_guest_imports.push(import);
+            self.pending_host_releases.retire_guest_import(import);
         }
         #[cfg(feature = "backend-vulkan")]
         self.retire_mapping_gather_witness(mapping_id);
@@ -4226,10 +4266,10 @@ impl DeviceState {
         e.format = 0;
         let (retired, retired_import) = Self::take_mapping_view(e);
         if let Some(v) = retired {
-            self.retired_views.push(v);
+            self.pending_host_releases.retire_view(v);
         }
         if let Some(import) = retired_import {
-            self.retired_guest_imports.push(import);
+            self.pending_host_releases.retire_guest_import(import);
         }
         #[cfg(feature = "backend-vulkan")]
         self.retire_mapping_gather_witness(mapping_id);
@@ -4267,10 +4307,10 @@ impl DeviceState {
             e.format = 0;
             let (retired, retired_import) = Self::take_mapping_view(e);
             if let Some(v) = retired {
-                self.retired_views.push(v);
+                self.pending_host_releases.retire_view(v);
             }
             if let Some(import) = retired_import {
-                self.retired_guest_imports.push(import);
+                self.pending_host_releases.retire_guest_import(import);
             }
             #[cfg(feature = "backend-vulkan")]
             self.retire_mapping_gather_witness(mapping_id);
@@ -4319,10 +4359,10 @@ impl DeviceState {
         e.format = 0;
         let (retired, retired_import) = Self::take_mapping_view(e);
         if let Some(v) = retired {
-            self.retired_views.push(v);
+            self.pending_host_releases.retire_view(v);
         }
         if let Some(import) = retired_import {
-            self.retired_guest_imports.push(import);
+            self.pending_host_releases.retire_guest_import(import);
         }
         #[cfg(feature = "backend-vulkan")]
         self.retire_mapping_gather_witness(mapping_id);

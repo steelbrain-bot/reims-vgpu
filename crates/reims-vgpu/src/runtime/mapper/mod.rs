@@ -685,10 +685,10 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         }
     }
     if let Some(v) = retired {
-        state.retired_views.push(v);
+        state.pending_host_releases.retire_view(v);
     }
     if let Some(import) = retired_import {
-        state.retired_guest_imports.push(import);
+        state.pending_host_releases.retire_guest_import(import);
     }
     if incarnation_changed {
         // The condemned backing really died and the id now carries a new
@@ -1522,13 +1522,14 @@ pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
     // first. Existing child images and recorded buffers hold it through their
     // fence-safe retirement; the host view is stable on every backend that can
     // import it, making `unmap_pages` a no-op there until device teardown.
+    let imports = state.pending_host_releases.take_guest_imports();
     #[cfg(feature = "backend-vulkan")]
-    for import in state.retired_guest_imports.drain(..) {
+    for import in imports {
         state.executor.retire_guest_import(import);
     }
     #[cfg(not(feature = "backend-vulkan"))]
-    state.retired_guest_imports.clear();
-    for (ptr, len) in state.retired_views.drain(..) {
+    let _ = imports;
+    for (ptr, len) in state.pending_host_releases.take_views() {
         host.unmap_pages(ptr, len);
     }
 }

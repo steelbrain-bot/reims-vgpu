@@ -802,10 +802,10 @@ pub fn settle_guest_writes_unless_disjoint(
 /// Task teardown means the GPU VA maps are gone, so nothing here writes guest
 /// pages — the deleted object's bytes are not guest work any more.
 pub fn retire_linear_residents(state: &mut DeviceState) {
-    if state.retired_linear_residents.is_empty() {
+    if state.pending_host_releases.linear_residents().is_empty() {
         return;
     }
-    let retired = std::mem::take(&mut state.retired_linear_residents);
+    let retired = state.pending_host_releases.take_linear_residents();
     // build arms nothing that could have pinned them, so taking the list is the
     // whole of the work there.
     #[cfg(feature = "backend-vulkan")]
