@@ -102,7 +102,8 @@ pub(crate) const DESC_BLOCK_MAX_SETS: u32 =
 /// the three, since a descriptor type is served by exactly one class and this
 /// budget is per type. The compute path is single-stage and its three slot caps
 /// are all at or below these, so it stays under this.
-const MAX_SET_DESCRIPTORS_PER_TYPE: u32 = 2 * crate::runtime::draw::MAX_ANY_BIND_SLOTS;
+const MAX_SET_DESCRIPTORS_PER_TYPE: u32 =
+    2 * reims_vgpu_vulkan::spirv_bind::MAX_DESCRIPTOR_CLASS_BINDINGS;
 /// Per-type descriptor budget within one block.
 ///
 /// It used to be `DESC_BLOCK_MAX_SETS`, so a block of single-binding sets

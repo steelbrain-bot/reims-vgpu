@@ -170,6 +170,9 @@ pub const SAMPLER_BINDING_BASE: u32 = 160;
 /// they are unbindable either way, so preserving the band never makes them worse.
 pub const COLOR_INPUT_BINDING_BASE: u32 = 192;
 
+/// Widest descriptor class in the backend's set-zero band map.
+pub const MAX_DESCRIPTOR_CLASS_BINDINGS: u32 = SAMPLER_BINDING_BASE - TEXTURE_BINDING_BASE;
+
 /// How far [`widen_sampled_bands`] moves a sampler or ColorInput decoration.
 ///
 /// One offset for both bands, so their spacing is preserved and the widen is a
