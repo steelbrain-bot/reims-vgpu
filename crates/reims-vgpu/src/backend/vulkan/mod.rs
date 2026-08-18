@@ -9,8 +9,9 @@
 //! [`crate::runtime::executor::Executor`] implementation.
 //!
 //! [`caps`] classifies the bound host GPU into the four-cell support matrix
-//! (unified/discrete memory × has/has-no DMA) that every path here must keep
-//! working. Capability decisions belong there, not at call sites.
+//! (unified/discrete memory × has/has-no import) that every path here must keep
+//! working. [`policy`] owns the independent unified and discrete placement and
+//! scheduling choices; host-pointer import remains an orthogonal capability.
 //!
 //! [`translate`] is the matching seam for *state*: decoded Metal formats and
 //! pipeline enums become Vulkan ones there and nowhere else, so the same
@@ -18,4 +19,5 @@
 
 pub mod caps;
 pub mod engine;
+pub mod policy;
 pub mod translate;

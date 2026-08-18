@@ -2607,17 +2607,13 @@ const STAGING_MISS_EMIT_EVERY: u64 = 512;
 /// request. The decision uses the existing structural memory-topology
 /// classification, never a vendor or driver name; misclassification can change
 /// performance only.
-pub(crate) const BATCH_MAX_DRAWS: u64 = 128;
-const DISCRETE_BATCH_MAX_DRAWS: u64 = 32;
-
-const fn batch_default_draws(
+pub(crate) const BATCH_MAX_DRAWS: u64 = crate::backend::vulkan::policy::MAX_BATCH_DRAWS;
+#[cfg(test)]
+const DISCRETE_BATCH_MAX_DRAWS: u64 = crate::backend::vulkan::policy::DISCRETE_DEFAULT_BATCH_DRAWS;
+fn batch_default_draws(
     topology: crate::backend::vulkan::caps::memory_topology::MemoryTopology,
 ) -> u64 {
-    use crate::backend::vulkan::caps::memory_topology::MemoryTopology;
-    match topology {
-        MemoryTopology::Unified => BATCH_MAX_DRAWS,
-        MemoryTopology::Discrete => DISCRETE_BATCH_MAX_DRAWS,
-    }
+    crate::backend::vulkan::policy::MemoryPlacementPolicy::new(topology).default_batch_draws()
 }
 
 /// The draws-per-command-buffer cap this device runs with.

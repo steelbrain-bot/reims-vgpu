@@ -104,7 +104,8 @@ pub struct MemoryRequest {
 impl MemoryTopology {
     /// Flags to request for a [`MemoryClass`] on this topology.
     ///
-    /// The only topology-dependent choices:
+    /// The topology-dependent choices implemented by
+    /// [`crate::backend::vulkan::policy`]:
     ///
     /// * `Upload` on `Unified` prefers `DEVICE_LOCAL` — the same DRAM, so the
     ///   GPU reads the CPU's writes with no transfer at all. On `Discrete` a
@@ -133,38 +134,7 @@ impl MemoryTopology {
     /// `vkInvalidateMappedMemoryRanges` before it reads. [`MemoryRequest`] is
     /// only a query; `ResourcePools::create_readback_buffer` records which it got.
     pub fn request(self, class: MemoryClass) -> MemoryRequest {
-        use vk::MemoryPropertyFlags as F;
-        let host = F::HOST_VISIBLE | F::HOST_COHERENT;
-        match (class, self) {
-            (MemoryClass::Upload, Self::Unified) => MemoryRequest {
-                required: host,
-                preferred: vec![F::DEVICE_LOCAL],
-            },
-            (MemoryClass::Upload, Self::Discrete) => MemoryRequest {
-                required: host,
-                preferred: Vec::new(),
-            },
-            (MemoryClass::Readback, Self::Unified) => MemoryRequest {
-                required: F::HOST_VISIBLE,
-                preferred: vec![
-                    F::DEVICE_LOCAL | F::HOST_CACHED,
-                    F::HOST_CACHED,
-                    F::HOST_COHERENT,
-                ],
-            },
-            (MemoryClass::Readback, Self::Discrete) => MemoryRequest {
-                required: F::HOST_VISIBLE,
-                preferred: vec![F::HOST_CACHED, F::HOST_COHERENT],
-            },
-            (MemoryClass::DeviceLocal, _) => MemoryRequest {
-                required: F::DEVICE_LOCAL,
-                preferred: Vec::new(),
-            },
-            (MemoryClass::DeviceLocalPreferred, _) => MemoryRequest {
-                required: F::empty(),
-                preferred: vec![F::DEVICE_LOCAL],
-            },
-        }
+        crate::backend::vulkan::policy::MemoryPlacementPolicy::new(self).request(class)
     }
 }
 
