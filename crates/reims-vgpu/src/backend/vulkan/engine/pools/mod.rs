@@ -1197,7 +1197,7 @@ pub(crate) struct SampledSlot {
     /// whose view swizzles differently would silently remap a later bind's
     /// channels. Identity is the overwhelmingly common case and keeps its own
     /// free list, so a rare swizzled bind cannot fragment the hot one.
-    pub swizzle: crate::contract::pixel_format::SwizzlePlan,
+    pub swizzle: reims_vgpu_protocol::SwizzlePlan,
 }
 
 /// Which lifetime owns a newly acquired sampled image. Upload images may enter
@@ -1227,7 +1227,7 @@ pub(crate) struct SampledKey {
     pub(crate) arrayed: bool,
     pub(crate) one_dim: bool,
     pub(crate) format: ash::vk::Format,
-    pub(crate) swizzle: crate::contract::pixel_format::SwizzlePlan,
+    pub(crate) swizzle: reims_vgpu_protocol::SwizzlePlan,
 }
 
 impl SampledKey {
@@ -2998,7 +2998,7 @@ mod teardown;
 mod sampled_key_tests {
     use super::SampledKey;
     use crate::backend::vulkan::engine::types::{SampledImageResource, SampledSource};
-    use crate::contract::pixel_format::SwizzlePlan;
+    use reims_vgpu_protocol::SwizzlePlan;
 
     fn resource(arrayed: bool, volume: bool, cube: bool, one_dim: bool) -> SampledImageResource {
         SampledImageResource {
@@ -3105,7 +3105,7 @@ mod sampled_key_tests {
                 ..plain
             },
             SampledKey {
-                swizzle: crate::contract::pixel_format::swizzle_plan(&[4, 3, 2, 1]).unwrap(),
+                swizzle: reims_vgpu_protocol::swizzle_plan(&[4, 3, 2, 1]).unwrap(),
                 ..plain
             },
         ];

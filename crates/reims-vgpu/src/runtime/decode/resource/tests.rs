@@ -2623,14 +2623,14 @@ fn a_colour_attachment_write_mask_decodes_and_defaults_to_all() {
         masked.first().map(|c| c.write_mask),
         Some(ColorWriteMask::new(MTL_COLOR_WRITE_MASK_ALPHA).unwrap())
     );
-    assert_ne!(masked[0].write_mask.bits, MTL_COLOR_WRITE_MASK_ALL);
+    assert_ne!(masked[0].write_mask.bits(), MTL_COLOR_WRITE_MASK_ALL);
 
     // Same entry with the tag dropped: `all`, not `none`. This is the arm
     // a derived `Default` on a bare `u32` would have made a black
     // attachment, and every pipeline in the tree takes it.
     buf[entry] = 1;
     let plain = parse_color_attachments(&buf, buf.len(), off).expect("a well-formed table decodes");
-    assert_eq!(plain[0].write_mask.bits, MTL_COLOR_WRITE_MASK_ALL);
+    assert_eq!(plain[0].write_mask.bits(), MTL_COLOR_WRITE_MASK_ALL);
     assert_eq!(plain[0].write_mask, ColorWriteMask::default());
 }
 
@@ -2682,7 +2682,7 @@ fn a_write_mask_outside_the_four_bits_refuses_the_pipeline() {
     // is about the range and not about the tag being present.
     st32(&mut buf[entry + 3..], MTL_COLOR_WRITE_MASK_ALL);
     let ok = parse_color_attachments(&buf, buf.len(), off).expect("0xf is a mask Metal can hold");
-    assert_eq!(ok[0].write_mask.bits, MTL_COLOR_WRITE_MASK_ALL);
+    assert_eq!(ok[0].write_mask.bits(), MTL_COLOR_WRITE_MASK_ALL);
 }
 
 /// The measured case, from an x86/Vulkan boot in Dark appearance: a 27x27

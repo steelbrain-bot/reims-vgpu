@@ -26,7 +26,10 @@ pub use identity::{
     GuestVirtualAddress, MappingId, ObjectRef, PlaneIndex, ResourceId, ResourceNamespaceId,
     StorageId, SubmissionId, SurfaceBackingId, SurfaceId, TaskId,
 };
-pub use pixel::{StorageImageFormat, TexelLayout};
+pub use pixel::{
+    apply_swizzle_rgba8, swizzle_identity, swizzle_is_identity, swizzle_plan, StorageImageFormat,
+    SwizzlePlan, SwizzleSource, TexelLayout,
+};
 pub use resource::{
     decode_object_list_entry, ColorWriteMask, ComputePipelineObject, DepthStencilObject,
     EventObject, FenceObject, FunctionObject, ObjectKind, ObjectListDecodeError, ObjectListEntry,

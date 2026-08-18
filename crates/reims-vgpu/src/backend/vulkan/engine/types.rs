@@ -1081,7 +1081,7 @@ pub struct SampledImageResource {
     /// rewriting texels is what lets a swizzled texture stay on whatever
     /// content rail it was already on, including the zero-copy one — a CPU
     /// remap would force every swizzled bind onto the upload path.
-    pub swizzle: crate::contract::pixel_format::SwizzlePlan,
+    pub swizzle: reims_vgpu_protocol::SwizzlePlan,
 }
 
 /// Contract-level source of a CPU-materialized sampled image.

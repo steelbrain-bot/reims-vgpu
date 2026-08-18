@@ -37,6 +37,102 @@ pub enum TexelLayout {
     Rg11b10Float,
 }
 
+/// Source selected for one output channel of a texture view.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SwizzleSource {
+    Zero = 0,
+    One = 1,
+    R = 2,
+    G = 3,
+    B = 4,
+    A = 5,
+}
+
+/// Semantic texture-view channel mapping, independent of host image APIs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SwizzlePlan {
+    pub source: [SwizzleSource; 4],
+}
+
+impl Default for SwizzlePlan {
+    fn default() -> Self {
+        swizzle_identity()
+    }
+}
+
+impl SwizzlePlan {
+    pub fn is_identity(&self) -> bool {
+        *self == swizzle_identity()
+    }
+
+    /// Apply this mapping after `inner`, folding two view mappings into one.
+    pub fn after(self, inner: &Self) -> Self {
+        let mut source = self.source;
+        for slot in &mut source {
+            *slot = match *slot {
+                SwizzleSource::Zero => SwizzleSource::Zero,
+                SwizzleSource::One => SwizzleSource::One,
+                SwizzleSource::R => inner.source[0],
+                SwizzleSource::G => inner.source[1],
+                SwizzleSource::B => inner.source[2],
+                SwizzleSource::A => inner.source[3],
+            };
+        }
+        Self { source }
+    }
+}
+
+pub const fn swizzle_identity() -> SwizzlePlan {
+    SwizzlePlan {
+        source: [
+            SwizzleSource::R,
+            SwizzleSource::G,
+            SwizzleSource::B,
+            SwizzleSource::A,
+        ],
+    }
+}
+
+const fn swizzle_selector_source(selector: u8) -> Option<SwizzleSource> {
+    Some(match selector {
+        0 => SwizzleSource::Zero,
+        1 => SwizzleSource::One,
+        2 => SwizzleSource::R,
+        3 => SwizzleSource::G,
+        4 => SwizzleSource::B,
+        5 => SwizzleSource::A,
+        _ => return None,
+    })
+}
+
+pub fn swizzle_plan(raw: &[u8; 4]) -> Option<SwizzlePlan> {
+    let mut source = [SwizzleSource::Zero; 4];
+    for (destination, selector) in source.iter_mut().zip(raw) {
+        *destination = swizzle_selector_source(*selector)?;
+    }
+    Some(SwizzlePlan { source })
+}
+
+pub fn swizzle_is_identity(plan: &SwizzlePlan) -> bool {
+    plan.is_identity()
+}
+
+pub fn apply_swizzle_rgba8(plan: &SwizzlePlan, input: [u8; 4]) -> [u8; 4] {
+    let mut output = [0; 4];
+    for (component, source) in output.iter_mut().zip(plan.source) {
+        *component = match source {
+            SwizzleSource::Zero => 0,
+            SwizzleSource::One => u8::MAX,
+            SwizzleSource::R => input[0],
+            SwizzleSource::G => input[1],
+            SwizzleSource::B => input[2],
+            SwizzleSource::A => input[3],
+        };
+    }
+    output
+}
+
 /// Typed texel format carried by semantic sampled and storage image requests.
 ///
 /// Access and capability requirements are separate from this vocabulary: the
@@ -175,7 +271,10 @@ impl TexelLayout {
 
 #[cfg(test)]
 mod tests {
-    use super::{StorageImageFormat, TexelLayout};
+    use super::{
+        apply_swizzle_rgba8, swizzle_identity, swizzle_plan, StorageImageFormat, SwizzlePlan,
+        TexelLayout,
+    };
 
     #[test]
     fn all_is_a_total_unique_index() {
@@ -202,5 +301,14 @@ mod tests {
         assert_eq!(StorageImageFormat::Rgba8Uint.bytes_per_texel(), 4);
         assert_eq!(StorageImageFormat::Rgba16Float.bytes_per_texel(), 8);
         assert_eq!(StorageImageFormat::Rgba32Float.bytes_per_texel(), 16);
+    }
+
+    #[test]
+    fn swizzles_are_semantic_and_composable() {
+        let reverse = swizzle_plan(&[4, 3, 2, 5]).unwrap();
+        assert_eq!(apply_swizzle_rgba8(&reverse, [1, 2, 3, 4]), [3, 2, 1, 4]);
+        assert_eq!(reverse.after(&swizzle_identity()), reverse);
+        assert_eq!(SwizzlePlan::default(), swizzle_identity());
+        assert!(swizzle_plan(&[6, 2, 3, 4]).is_none());
     }
 }

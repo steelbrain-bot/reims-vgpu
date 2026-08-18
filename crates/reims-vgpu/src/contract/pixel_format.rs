@@ -185,7 +185,10 @@ pub enum SampledClass {
     Rg16Float,
 }
 
-pub use reims_vgpu_protocol::TexelLayout;
+pub use reims_vgpu_protocol::{
+    apply_swizzle_rgba8, swizzle_identity, swizzle_is_identity, swizzle_plan, SwizzlePlan,
+    SwizzleSource, TexelLayout,
+};
 
 /// What a CPU loader produced for a sampled bind: the channel layout the bytes
 /// are in, and the guest format whose transfer function they still carry.
@@ -263,74 +266,6 @@ impl SampledByteFormat {
     /// reports it, where naming the guest format is the whole value of the line.
     pub fn srgb_source(self) -> Option<u16> {
         self.source.filter(|&source| is_srgb(source))
-    }
-}
-
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum SwizzleSource {
-    Zero = 0,
-    One = 1,
-    R = 2,
-    G = 3,
-    B = 4,
-    A = 5,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct SwizzlePlan {
-    pub source: [SwizzleSource; COMPONENT_COUNT],
-}
-
-impl Default for SwizzlePlan {
-    fn default() -> Self {
-        swizzle_identity()
-    }
-}
-
-impl SwizzlePlan {
-    /// Whether this plan moves nothing — every output channel takes its own
-    /// input.
-    ///
-    /// Derived from [`swizzle_identity`] rather than spelling the four sources a
-    /// second time, so there is nothing for a second spelling to disagree with.
-    /// The question is asked wherever a rail can carry channels one way but not
-    /// the other: a hardware component mapping expresses any plan, and a view
-    /// this device did not create expresses only this one.
-    pub fn is_identity(&self) -> bool {
-        *self == swizzle_identity()
-    }
-
-    /// This plan applied **after** `inner`, as one plan.
-    ///
-    /// Two remaps stack whenever a texture's own channel layout does not sit
-    /// identically on the host format carrying it *and* the guest asked for a
-    /// view swizzle on top. `A8Unorm` is the standing case: its byte rides in
-    /// `R8_UNORM`, so the format contributes "alpha is in red" and the guest's
-    /// type-8 view contributes whatever it asked for. Binding either alone
-    /// gives the shader the wrong channels.
-    ///
-    /// A hardware component mapping takes one plan, not two, so they have to be
-    /// folded here. The fold is a lookup, because a plan is a function from
-    /// output channel to input channel: this plan names a channel of `inner`'s
-    /// *output*, and `inner` says where that came from. A constant selector has
-    /// no channel to chase and passes through.
-    ///
-    /// Composition is not commutative and the argument order is the one that
-    /// reads: `view.after(&format)`.
-    pub fn after(self, inner: &SwizzlePlan) -> SwizzlePlan {
-        let mut source = self.source;
-        for slot in &mut source {
-            *slot = match *slot {
-                SwizzleSource::Zero => SwizzleSource::Zero,
-                SwizzleSource::One => SwizzleSource::One,
-                SwizzleSource::R => inner.source[COMPONENT_R],
-                SwizzleSource::G => inner.source[COMPONENT_G],
-                SwizzleSource::B => inner.source[COMPONENT_B],
-                SwizzleSource::A => inner.source[COMPONENT_A],
-            };
-        }
-        SwizzlePlan { source }
     }
 }
 
@@ -967,62 +902,6 @@ pub fn tight_row_bytes(width: u32, format: u16) -> Option<u32> {
     }
     let bpp = bytes_per_pixel(format)?;
     width.checked_mul(bpp)
-}
-
-pub fn swizzle_identity() -> SwizzlePlan {
-    SwizzlePlan {
-        source: [
-            SwizzleSource::R,
-            SwizzleSource::G,
-            SwizzleSource::B,
-            SwizzleSource::A,
-        ],
-    }
-}
-
-fn swizzle_selector_source(selector: u8) -> Option<SwizzleSource> {
-    Some(match selector {
-        0 => SwizzleSource::Zero,
-        1 => SwizzleSource::One,
-        2 => SwizzleSource::R,
-        3 => SwizzleSource::G,
-        4 => SwizzleSource::B,
-        5 => SwizzleSource::A,
-        _ => return None,
-    })
-}
-
-pub fn swizzle_plan(raw: &[u8; COMPONENT_COUNT]) -> Option<SwizzlePlan> {
-    let mut source = [SwizzleSource::Zero; COMPONENT_COUNT];
-    for i in 0..COMPONENT_COUNT {
-        source[i] = swizzle_selector_source(raw[i])?;
-    }
-    Some(SwizzlePlan { source })
-}
-
-pub fn swizzle_is_identity(plan: &SwizzlePlan) -> bool {
-    plan.source
-        == [
-            SwizzleSource::R,
-            SwizzleSource::G,
-            SwizzleSource::B,
-            SwizzleSource::A,
-        ]
-}
-
-pub fn apply_swizzle_rgba8(plan: &SwizzlePlan, in_rgba: [u8; 4]) -> [u8; 4] {
-    let mut out = [0u8; 4];
-    for (component, source) in out.iter_mut().zip(plan.source) {
-        *component = match source {
-            SwizzleSource::Zero => UNORM8_MIN,
-            SwizzleSource::One => UNORM8_MAX,
-            SwizzleSource::R => in_rgba[COMPONENT_R],
-            SwizzleSource::G => in_rgba[COMPONENT_G],
-            SwizzleSource::B => in_rgba[COMPONENT_B],
-            SwizzleSource::A => in_rgba[COMPONENT_A],
-        };
-    }
-    out
 }
 
 pub fn f64_to_unorm8(value: f64) -> u8 {
