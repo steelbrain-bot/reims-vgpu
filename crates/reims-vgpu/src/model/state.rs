@@ -817,7 +817,7 @@ mod task_resource_resident_tests {
             width: 64,
             height: 32,
             generation,
-            format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+            format: crate::contract::pixel_format::TexelLayout::Bgra8,
         }
     }
 

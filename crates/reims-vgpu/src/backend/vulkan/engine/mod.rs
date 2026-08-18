@@ -4768,7 +4768,7 @@ mod resident_read_order_tests {
                 width: 4,
                 height: 2,
                 generation: 1,
-                format: pixel::storage_format(declared),
+                format: pixel::texel_layout_of(pixel::storage_format(declared)).unwrap(),
             };
             assert_eq!(
                 snapshot(declared).bgra(),

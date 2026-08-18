@@ -1781,86 +1781,7 @@ impl StorageImageFormat {
 // Draw residency (workstream D)
 // ---------------------------------------------------------------------------
 
-/// Protocol-derived render-target identity (resource state, not content hash).
-///
-/// Every field of every variant is a scalar the protocol handed over, so an
-/// identity is a *value* and never a handle. It is `Clone` and not `Copy` only
-/// because several hundred call sites spell the clone, and rewriting them would
-/// bury whatever change asked for it.
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub enum TargetIdentity {
-    /// Type-4 mapping / surface id namespace.
-    Surface {
-        id: u32,
-        width: u32,
-        height: u32,
-        generation: u64,
-        /// This target's resident image format, from the pixel format the
-        /// mapping declares for its own plane.
-        ///
-        /// An IOSurface texture mapping is not BGRA8 by its contract, which is what this
-        /// namespace assumed for as long as it held no format: it declares a
-        /// format, `mapping_write` reads that declaration to lay out the
-        /// writeback, and macOS 26 declares `MTLPixelFormatRGBA16Float` for
-        /// some of its compositing surfaces. Rendering those into a BGRA8
-        /// resident quantized the guest's half-float compositing to eight bits
-        /// with nothing to say so — the same loss the `Gva` namespace had, for
-        /// the same reason, found the same way.
-        ///
-        /// [`crate::runtime::present_identity::surface_identity`] is the only
-        /// producer, and it resolves this through
-        /// [`crate::runtime::mapping_write::mapping_store_format`] — the same
-        /// function the writeback lays its rows out from, so the resident and
-        /// its destination cannot disagree about what the guest asked for.
-        format: vk::Format,
-    },
-    /// Type-2/3 texture ref namespace.
-    Texture {
-        ref_: u32,
-        width: u32,
-        height: u32,
-        generation: u64,
-        /// Whether this resident carries a stencil aspect beside its depth one.
-        ///
-        /// **Part of the key because it selects the image's format**, and the
-        /// registry's reuse test compares formats: a depth texture drawn into
-        /// with the stencil test on and then off would otherwise retire and
-        /// recreate its resident on every alternation — one allocation per draw
-        /// again, and arrived at by a path that looks like reuse. The two are
-        /// genuinely different images, so they are two residents, each stable.
-        ///
-        /// Always `false` for a colour target, which is what every non-depth
-        /// constructor of this variant passes.
-        stencil: bool,
-    },
-    /// Guest-VA surface namespace.
-    Gva {
-        gva: u64,
-        width: u32,
-        height: u32,
-        generation: u64,
-        /// This target's resident image format, from the pixel format the guest
-        /// declared for the attachment.
-        ///
-        /// See [`TargetIdentity::is_bgra`] for why it has to be part of the key
-        /// rather than a per-draw argument, and why this namespace is the one
-        /// that carries it: a surface is BGRA by its own contract and a pooled
-        /// target has no declaration to follow, but a GVA render target's
-        /// declaration is the whole answer.
-        ///
-        /// It is a format and not a `bgra: bool` because the guest declares
-        /// more than a channel order. A flag can only ever reconstruct
-        /// `B8G8R8A8_UNORM` or `R8G8B8A8_UNORM`, so every render target was
-        /// eight bits per channel whatever was asked for — the twin, on the
-        /// Store side, of the sampled-half-float bug. It also made this key
-        /// disagree with the image for a secondary MRT attachment, whose
-        /// resident is created from the guest's real format while its identity
-        /// claimed `bgra = false`.
-        format: vk::Format,
-    },
-    /// Anonymous / no protocol identity (oracle / one-shot draws).
-    Anonymous { slot: u64 },
-}
+pub use crate::model::{TargetIdentity, TargetKeyDivergence};
 
 /// What this device last did with a resident it no longer holds.
 ///
@@ -1913,143 +1834,7 @@ pub struct WindowPresentSource {
     pub identity: TargetIdentity,
 }
 
-impl Default for TargetIdentity {
-    fn default() -> Self {
-        Self::Anonymous { slot: 0 }
-    }
-}
-
-/// Why a registry lookup missed, given the closest key the registry does hold.
-///
-/// A miss is not one finding. The registry is keyed by whole
-/// [`TargetIdentity`], so every field of it can be the reason, and each has a
-/// different repair: a namespace difference is two producers disagreeing about
-/// which object this is, a geometry difference is a surface that resized under
-/// a caller holding the old extent, a generation difference is a key that moved
-/// between the draw and the reader, and `Other` is a format. Reporting the miss
-/// without saying which sent one session hunting a stale generation that was
-/// the minority case.
-///
-/// Ordered from coarsest to finest, and answered as the *first* difference
-/// rather than the only one — the same rule
-/// [`super::pools::PassEchoField`] states for its own ladder, and for the same
-/// reason: two identities in different namespaces are not about one object, so
-/// nothing finer about them is worth reporting.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TargetKeyDivergence {
-    /// Nothing in the registry names this object at all.
-    Absent,
-    /// The registry holds this id in a different namespace — a mapping id
-    /// against a texture ref, a GVA against a surface.
-    Namespace,
-    /// Same object, different extent.
-    Geometry,
-    /// Same object and extent, and the key moved.
-    Generation,
-    /// Same object and extent, and re-generating still does not match. The only
-    /// field left is the format, and a new field would land here too rather
-    /// than be misreported as one of the above.
-    Other,
-}
-
-impl TargetKeyDivergence {
-    /// The name this goes on the fail line as.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Absent => "absent",
-            Self::Namespace => "namespace",
-            Self::Geometry => "geometry",
-            Self::Generation => "generation",
-            Self::Other => "other",
-        }
-    }
-}
-
 impl TargetIdentity {
-    pub fn width(&self) -> u32 {
-        match self {
-            Self::Surface { width, .. } | Self::Texture { width, .. } | Self::Gva { width, .. } => {
-                *width
-            }
-            Self::Anonymous { .. } => 0,
-        }
-    }
-
-    pub fn height(&self) -> u32 {
-        match self {
-            Self::Surface { height, .. }
-            | Self::Texture { height, .. }
-            | Self::Gva { height, .. } => *height,
-            Self::Anonymous { .. } => 0,
-        }
-    }
-
-    pub fn generation(&self) -> u64 {
-        match self {
-            Self::Surface { generation, .. }
-            | Self::Texture { generation, .. }
-            | Self::Gva { generation, .. } => *generation,
-            Self::Anonymous { .. } => 0,
-        }
-    }
-
-    /// Which namespace this identity is in, and what names it there.
-    ///
-    /// Two identities with the same answer are about the same guest object; two
-    /// with different answers cannot be, whatever else they agree on. That is
-    /// what splits "the registry holds nothing for this key" into "it holds
-    /// nothing for this object" and "it holds this object under a key differing
-    /// in geometry, format or generation" — see [`TargetKeyDivergence`].
-    ///
-    /// The discriminant is folded in rather than returned beside the value: a
-    /// mapping id 7 and a texture ref 7 are different objects, and a bare `u64`
-    /// would call them one.
-    pub fn namespaced_id(&self) -> (u8, u64) {
-        match self {
-            Self::Surface { id, .. } => (0, u64::from(*id)),
-            Self::Texture { ref_, .. } => (1, u64::from(*ref_)),
-            Self::Gva { gva, .. } => (2, *gva),
-            Self::Anonymous { slot } => (3, *slot),
-        }
-    }
-
-    /// How `held` differs from this identity, for a registry lookup that missed.
-    pub fn diverges_from(&self, held: &Self) -> TargetKeyDivergence {
-        if self.namespaced_id() != held.namespaced_id() {
-            return TargetKeyDivergence::Namespace;
-        }
-        if (self.width(), self.height()) != (held.width(), held.height()) {
-            return TargetKeyDivergence::Geometry;
-        }
-        // Whatever is left is spared by re-generation or it is not. Asked with
-        // `PartialEq` so a field this enum gains lands in `Other` rather than
-        // being reported as a generation difference it is not.
-        if self.with_generation(held.generation()) == *held {
-            return TargetKeyDivergence::Generation;
-        }
-        TargetKeyDivergence::Other
-    }
-
-    /// The same target named at a different generation.
-    ///
-    /// Exists so that "is this the same surface under a newer key?" can be asked
-    /// with `PartialEq` rather than by a hand-written field-by-field comparison:
-    /// `a.with_generation(b.generation()) == *b` is total over every field this
-    /// enum has now and every one it gains, where a comparison spelling out the
-    /// fields it cares about goes stale the moment one is added. `Anonymous`
-    /// carries no generation, so it is returned unchanged and compares as
-    /// itself.
-    pub fn with_generation(&self, generation: u64) -> Self {
-        let mut next = self.clone();
-        match &mut next {
-            Self::Surface { generation: g, .. }
-            | Self::Texture { generation: g, .. }
-            | Self::Gva { generation: g, .. } => *g = generation,
-            Self::Anonymous { .. } => {}
-        }
-        next
-    }
-
     /// Physical channel order of the resident image behind this identity.
     ///
     /// The rule is one sentence: **a resident holds the bytes its destination
@@ -2089,29 +1874,6 @@ impl TargetIdentity {
         translate::pixel::has_bgra_order(self.resident_format())
     }
 
-    /// Whether these two identities name the same destination, whatever format
-    /// each declares for it.
-    ///
-    /// Not `==`. Equality is the *registry* question — do these share one image
-    /// — and the format belongs in it, because two formats at one address are
-    /// two images. This is the *conflict* question, asked of two attachments of
-    /// one render pass, and there the answer must ignore the format: a pass with
-    /// two colour attachments over one guest span writes that span twice, and
-    /// which of the two lands is whichever Store runs last.
-    ///
-    /// The distinction only appeared once the key could hold a format. While it
-    /// held a `bgra: bool`, `==` answered this by accident for every pair that
-    /// shared an order, and the two questions were indistinguishable.
-    pub fn aliases(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Surface { id: a, .. }, Self::Surface { id: b, .. }) => a == b,
-            (Self::Gva { gva: a, .. }, Self::Gva { gva: b, .. }) => a == b,
-            (Self::Texture { ref_: a, .. }, Self::Texture { ref_: b, .. }) => a == b,
-            (Self::Anonymous { slot: a }, Self::Anonymous { slot: b }) => a == b,
-            _ => false,
-        }
-    }
-
     /// The format of the resident image behind this identity — the answer
     /// `registry_ensure` creates the image with and the render pass is built
     /// against.
@@ -2127,11 +1889,7 @@ impl TargetIdentity {
     /// [`translate::pixel::bytes_per_texel`] rather than assuming four. That
     /// assumption is exactly what made a wider format unrepresentable.
     pub fn resident_format(&self) -> vk::Format {
-        match self {
-            Self::Surface { format, .. } => *format,
-            Self::Gva { format, .. } => *format,
-            Self::Texture { .. } | Self::Anonymous { .. } => translate::pixel::RESIDENT_RGBA_FORMAT,
-        }
+        translate::pixel::vk_texel_layout(self.resident_layout())
     }
 }
 
@@ -2518,7 +2276,7 @@ mod tests {
             width: 64,
             height: 64,
             generation: 0,
-            format: vk::Format::B8G8R8A8_UNORM,
+            format: crate::contract::pixel_format::TexelLayout::Bgra8,
         };
 
         let mut req = DrawRequest {
@@ -2536,7 +2294,7 @@ mod tests {
             identity: surface(2),
             width: 64,
             height: 64,
-            format: vk::Format::B8G8R8A8_UNORM,
+            format: translate::pixel::SCANOUT_FORMAT,
             clear: [0.0; 4],
             load: false,
             blend: None,
@@ -2593,7 +2351,7 @@ mod tests {
             width: 64,
             height: 64,
             generation: 1,
-            format: vk::Format::B8G8R8A8_UNORM,
+            format: crate::contract::pixel_format::TexelLayout::Bgra8,
         }));
     }
 
@@ -2622,7 +2380,7 @@ mod tests {
             width: 1920,
             height: 1080,
             generation: 4,
-            format: translate::pixel::SCANOUT_FORMAT,
+            format: crate::contract::pixel_format::TexelLayout::Bgra8,
         };
         assert_eq!(
             (surface.width(), surface.height(), surface.generation()),
@@ -2655,7 +2413,7 @@ mod tests {
                 width: 1920,
                 height: 1080,
                 generation: 4,
-                format: translate::pixel::SCANOUT_FORMAT,
+                format: crate::contract::pixel_format::TexelLayout::Bgra8,
             },
             TargetIdentity::Texture {
                 ref_: 12,
@@ -2669,7 +2427,7 @@ mod tests {
                 width: 8,
                 height: 8,
                 generation: 4,
-                format: translate::pixel::SCANOUT_FORMAT,
+                format: crate::contract::pixel_format::TexelLayout::Bgra8,
             },
         ];
         for identity in &all {
@@ -2698,7 +2456,7 @@ mod tests {
             width: 1920,
             height: 1080,
             generation: 2,
-            format: translate::pixel::SCANOUT_FORMAT,
+            format: crate::contract::pixel_format::TexelLayout::Bgra8,
         };
         assert_eq!(
             asked.diverges_from(&asked.with_generation(1)),
@@ -2710,7 +2468,7 @@ mod tests {
                 width: 1920,
                 height: 900,
                 generation: 2,
-                format: translate::pixel::SCANOUT_FORMAT,
+                format: crate::contract::pixel_format::TexelLayout::Bgra8,
             }),
             TargetKeyDivergence::Geometry
         );
@@ -2733,7 +2491,7 @@ mod tests {
                 width: 1920,
                 height: 1080,
                 generation: 2,
-                format: vk::Format::R16G16B16A16_SFLOAT,
+                format: crate::contract::pixel_format::TexelLayout::Rgba16Float,
             }),
             TargetKeyDivergence::Other
         );
@@ -2826,7 +2584,7 @@ mod tests {
             width: 8,
             height: 8,
             generation: 0,
-            format: translate::pixel::SCANOUT_FORMAT,
+            format: crate::contract::pixel_format::TexelLayout::Bgra8,
         }
         .is_bgra());
         for (format, bgra) in [
@@ -2835,14 +2593,15 @@ mod tests {
             (ash::vk::Format::R8G8B8A8_SRGB, false),
             (ash::vk::Format::B8G8R8A8_SRGB, true),
         ] {
+            let stored = translate::pixel::storage_format(format);
             let gva = TargetIdentity::Gva {
                 gva: 0x1000,
                 width: 8,
                 height: 8,
                 generation: 0,
-                format,
+                format: translate::pixel::texel_layout_of(stored).unwrap(),
             };
-            assert_eq!(gva.resident_format(), format, "{gva:?} must answer its key");
+            assert_eq!(gva.resident_format(), stored, "{gva:?} must answer its key");
             assert_eq!(gva.is_bgra(), bgra, "{gva:?} must answer from its key");
         }
         for other in [
@@ -2882,9 +2641,9 @@ mod tests {
             generation: 7,
             format,
         };
-        let rgba8 = at(translate::pixel::RESIDENT_RGBA_FORMAT);
-        let bgra8 = at(translate::pixel::SCANOUT_FORMAT);
-        let rgba16f = at(vk::Format::R16G16B16A16_SFLOAT);
+        let rgba8 = at(crate::contract::pixel_format::TexelLayout::Rgba8);
+        let bgra8 = at(crate::contract::pixel_format::TexelLayout::Bgra8);
+        let rgba16f = at(crate::contract::pixel_format::TexelLayout::Rgba16Float);
         assert_ne!(rgba8, bgra8);
         assert_ne!(
             rgba8, rgba16f,
@@ -2920,8 +2679,8 @@ mod tests {
             generation: 7,
             format,
         };
-        let rgba8 = at(translate::pixel::RESIDENT_RGBA_FORMAT);
-        let rgba16f = at(vk::Format::R16G16B16A16_SFLOAT);
+        let rgba8 = at(crate::contract::pixel_format::TexelLayout::Rgba8);
+        let rgba16f = at(crate::contract::pixel_format::TexelLayout::Rgba16Float);
         assert_ne!(rgba8, rgba16f, "two images, so two registry slots");
         assert!(
             rgba8.aliases(&rgba16f),
@@ -2935,7 +2694,7 @@ mod tests {
             width: 64,
             height: 64,
             generation: 7,
-            format: translate::pixel::RESIDENT_RGBA_FORMAT,
+            format: crate::contract::pixel_format::TexelLayout::Rgba8,
         };
         assert!(!rgba8.aliases(&elsewhere));
         assert!(!rgba8.aliases(&TargetIdentity::Surface {
@@ -2943,7 +2702,7 @@ mod tests {
             width: 64,
             height: 64,
             generation: 7,
-            format: translate::pixel::SCANOUT_FORMAT,
+            format: crate::contract::pixel_format::TexelLayout::Bgra8,
         }));
     }
 }

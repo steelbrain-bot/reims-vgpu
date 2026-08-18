@@ -2612,7 +2612,7 @@ pub(super) mod pin_count_tests {
             width: 16,
             height: 16,
             generation: 0,
-            format: translate::pixel::SCANOUT_FORMAT,
+            format: crate::contract::pixel_format::TexelLayout::Bgra8,
         }
     }
 
@@ -2895,7 +2895,7 @@ pub(super) mod pin_count_tests {
             width: 16,
             height: 16,
             generation: 1,
-            format: translate::pixel::SCANOUT_FORMAT,
+            format: crate::contract::pixel_format::TexelLayout::Bgra8,
         }
     }
 

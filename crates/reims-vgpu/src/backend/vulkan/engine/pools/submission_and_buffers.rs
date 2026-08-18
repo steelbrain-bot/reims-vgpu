@@ -5008,7 +5008,7 @@ mod recycle_tests {
             width: 16,
             height: 16,
             generation: 0,
-            format: translate::pixel::SCANOUT_FORMAT,
+            format: crate::contract::pixel_format::TexelLayout::Bgra8,
         };
         /// One thing that ends a remembered bind's life, named for the failure
         /// message.
@@ -5097,7 +5097,7 @@ mod recycle_tests {
             width: 16,
             height: 16,
             generation: 0,
-            format: translate::pixel::SCANOUT_FORMAT,
+            format: crate::contract::pixel_format::TexelLayout::Bgra8,
         };
         assert!(
             !pools.take_guest_write_debt(),
@@ -5138,7 +5138,7 @@ mod recycle_tests {
             width: 16,
             height: 16,
             generation: 3,
-            format: translate::pixel::SCANOUT_FORMAT,
+            format: crate::contract::pixel_format::TexelLayout::Bgra8,
         };
         pools.registry.insert(
             identity.clone(),
@@ -5197,7 +5197,7 @@ mod recycle_tests {
             width: 16,
             height: 16,
             generation: 1,
-            format: translate::pixel::SCANOUT_FORMAT,
+            format: crate::contract::pixel_format::TexelLayout::Bgra8,
         };
         pools.registry.insert(
             identity.clone(),
@@ -5323,7 +5323,7 @@ mod recycle_tests {
             width: 16,
             height: 16,
             generation: 1,
-            format: translate::pixel::SCANOUT_FORMAT,
+            format: crate::contract::pixel_format::TexelLayout::Bgra8,
         };
         pools.registry.insert(
             identity.clone(),
@@ -5361,7 +5361,7 @@ mod recycle_tests {
             width: 16,
             height: 16,
             generation: 0,
-            format: translate::pixel::SCANOUT_FORMAT,
+            format: crate::contract::pixel_format::TexelLayout::Bgra8,
         };
         // No slot at all: nothing to pin, and nothing for a reclaim to take.
         pools.note_guest_write_recorded(GuestWriteSource::ResidentTarget(&identity));
@@ -5815,7 +5815,7 @@ mod scatter_descriptor_sets_do_not_alias {
                 width: 1024,
                 height: 768,
                 generation: 1,
-                format: vk::Format::B8G8R8A8_UNORM,
+                format: crate::contract::pixel_format::TexelLayout::Bgra8,
             },
             width: 1024,
             height: 768,

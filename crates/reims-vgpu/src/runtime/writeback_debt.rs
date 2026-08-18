@@ -655,8 +655,7 @@ pub fn arm_gva<M: HostMemory + HostOps>(
     let Some((generation, resident_layout)) = (match *identity {
         crate::backend::vulkan::engine::TargetIdentity::Gva {
             generation, format, ..
-        } => crate::backend::vulkan::translate::pixel::texel_layout_of(format)
-            .map(|layout| (generation, layout)),
+        } => Some((generation, format)),
         _ => None,
     }) else {
         return false;
@@ -785,7 +784,7 @@ pub(crate) fn gva_identity(
         width: debt.width,
         height: debt.height,
         generation: debt.generation,
-        format: crate::backend::vulkan::translate::pixel::vk_texel_layout(debt.resident_layout),
+        format: debt.resident_layout,
     }
 }
 

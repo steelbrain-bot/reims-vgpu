@@ -1021,7 +1021,7 @@ fn gva_chain_identity_rules() {
             width: 16,
             height: 16,
             generation: 0,
-            format: crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
+            format: crate::contract::pixel_format::TexelLayout::Rgba8,
         }),
         "color0 declares the extent"
     );
@@ -1080,7 +1080,7 @@ fn render_chain_identity_covers_iosurface_texture_and_gva_targets() {
             width: 64,
             height: 32,
             generation: 0,
-            format: crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
+            format: crate::contract::pixel_format::TexelLayout::Rgba8,
         })
     );
 }
@@ -1342,7 +1342,7 @@ fn attachment_alias_source_keeps_one_texture_identity() {
         width: 2,
         height: 1,
         generation: 7,
-        format: ash::vk::Format::R8G8B8A8_UNORM,
+        format: crate::contract::pixel_format::TexelLayout::Rgba8,
     };
     let format = ash::vk::Format::R8G8B8A8_UNORM;
     let clear = attachment_alias_source(
@@ -4609,7 +4609,7 @@ fn a_secondary_mrt_slot_binds_its_own_blend() {
         width: 64,
         height: 64,
         generation: 0,
-        format: crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
+        format: crate::contract::pixel_format::TexelLayout::Rgba8,
     };
 
     let mut host = crate::runtime::host::FakeHost::new();
@@ -4693,7 +4693,7 @@ fn an_unbuildable_secondary_refuses_the_draw_rather_than_dropping_to_single_rt()
         width: 64,
         height: 64,
         generation: 0,
-        format: crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
+        format: crate::contract::pixel_format::TexelLayout::Rgba8,
     };
     let slot0 = ColorRtRequest {
         slot: 0,
@@ -4844,7 +4844,7 @@ fn two_secondaries_over_one_destination_refuse_the_draw_like_a_primary_alias() {
         width: 64,
         height: 64,
         generation: 0,
-        format: crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
+        format: crate::contract::pixel_format::TexelLayout::Rgba8,
     };
     let rt = |slot: u32, texture_ref: u32, target_gva: u64, format: u16| ColorRtRequest {
         slot,

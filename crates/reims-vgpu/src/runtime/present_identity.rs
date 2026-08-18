@@ -34,14 +34,16 @@ use ash::vk;
 /// is what this namespace answered for every mapping before it could answer at
 /// all; the GPU writeback rail then refuses that pair by name and the copying
 /// rail converts, exactly as it did.
-fn surface_format(state: &DeviceState, mapping_id: u32) -> vk::Format {
+fn surface_format(
+    state: &DeviceState,
+    mapping_id: u32,
+) -> crate::contract::pixel_format::TexelLayout {
     state
         .mappings
         .get(&mapping_id)
         .map(crate::runtime::mapping_write::mapping_store_format)
         .and_then(crate::contract::pixel_format::store_texel_order)
-        .map(crate::backend::vulkan::translate::pixel::vk_texel_layout)
-        .unwrap_or(crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT)
+        .unwrap_or(crate::contract::pixel_format::TexelLayout::Bgra8)
 }
 
 pub fn surface_identity(

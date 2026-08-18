@@ -6185,7 +6185,7 @@ mod tests {
             width: 64,
             height: 32,
             generation: 3,
-            format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+            format: crate::contract::pixel_format::TexelLayout::Bgra8,
         }
     }
 
@@ -7083,7 +7083,7 @@ mod tests {
             width: 16,
             height: 16,
             generation: 1,
-            format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+            format: crate::contract::pixel_format::TexelLayout::Bgra8,
         };
         let first = target_sample(identity.clone());
         let mut second = target_sample(identity);
@@ -7109,7 +7109,7 @@ mod tests {
             width: 16,
             height: 16,
             generation: 1,
-            format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+            format: crate::contract::pixel_format::TexelLayout::Bgra8,
         };
         let mut req = DrawRequest {
             target_identity: Some(primary.clone()),
@@ -7136,7 +7136,7 @@ mod tests {
             width: 16,
             height: 16,
             generation: 1,
-            format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+            format: crate::contract::pixel_format::TexelLayout::Bgra8,
         };
         assert_eq!(
             feedback_color_index(&req, &target_sample(unrelated), true),
@@ -7297,7 +7297,7 @@ mod tests {
                 width: 16,
                 height: 16,
                 generation: 1,
-                format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+                format: crate::contract::pixel_format::TexelLayout::Bgra8,
             },
             width: 16,
             height: 16,

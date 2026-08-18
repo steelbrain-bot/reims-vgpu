@@ -8097,7 +8097,8 @@ fn color_target_identity<M: HostMemory + HostOps>(
         width: color.width,
         height: color.height,
         generation,
-        format,
+        format: crate::backend::vulkan::translate::pixel::texel_layout_of(format)
+            .unwrap_or(crate::contract::pixel_format::TexelLayout::Rgba8),
     })
 }
 
@@ -8487,7 +8488,7 @@ pub(crate) fn gva_chain_identity(
 pub(crate) fn gva_resident_format(
     executor: &dyn crate::runtime::executor::Executor,
     format: u16,
-) -> ash::vk::Format {
+) -> crate::contract::pixel_format::TexelLayout {
     use crate::backend::vulkan::translate::pixel;
     // The declaration the *attachment* will be built from, folded onto its
     // allocation family, which is what `registry_ensure` creates the image in.
@@ -8503,14 +8504,14 @@ pub(crate) fn gva_resident_format(
     // — read the wrong width for the image it was describing. `R16Float` and
     // `RG16Float` are both in the guest's vocabulary on boots on record.
     let Ok((attachment, _)) = pixel::color_attachment(format) else {
-        return pixel::RESIDENT_RGBA_FORMAT;
+        return crate::contract::pixel_format::TexelLayout::Rgba8;
     };
     let allocation = pixel::ResidentFormat::of(attachment).allocation();
     match pixel::texel_layout_of(allocation) {
         // Capability, never an API-version assumption: the host is asked whether
         // it renders to and blends this layout.
-        Some(layout) if executor.render_target_layout_supported(layout) => allocation,
-        _ => pixel::RESIDENT_RGBA_FORMAT,
+        Some(layout) if executor.render_target_layout_supported(layout) => layout,
+        _ => crate::contract::pixel_format::TexelLayout::Rgba8,
     }
 }
 
@@ -9147,7 +9148,7 @@ mod vulkan_split_tests {
             width: 64,
             height: 64,
             generation,
-            format: crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
+            format: crate::contract::pixel_format::TexelLayout::Rgba8,
         };
 
         assert_eq!(
@@ -9369,7 +9370,9 @@ mod vulkan_split_tests {
         // refused rather than showing a bare `None`: every rung on this ladder
         // declines by name, and the panic message is where that is worth reading.
         let cap = crate::observe::sink::FailCapture::start();
-        let resident_format = gva_resident_format(state.executor.as_ref(), MTL_FORMAT_BGRA8_UNORM);
+        let resident_format = crate::backend::vulkan::translate::pixel::vk_texel_layout(
+            gva_resident_format(state.executor.as_ref(), MTL_FORMAT_BGRA8_UNORM),
+        );
         let served =
             resolve_iosurface_texture_load_seed(&mut state, &mut host, mid, w, h, resident_format);
         let seed = served.unwrap_or_else(|| {
@@ -9763,7 +9766,7 @@ mod vulkan_split_tests {
             width: 8,
             height: 8,
             generation: 0,
-            format: crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
+            format: crate::contract::pixel_format::TexelLayout::Rgba8,
         };
 
         let mut gen_of = |host: &mut FakeHost| {

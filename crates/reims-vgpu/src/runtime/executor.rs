@@ -927,7 +927,7 @@ mod tests {
             width: 16,
             height: 16,
             generation: 3,
-            format: crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
+            format: crate::contract::pixel_format::TexelLayout::Rgba8,
         };
 
         assert!(matches!(
