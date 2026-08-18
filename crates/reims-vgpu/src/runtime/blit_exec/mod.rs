@@ -4,13 +4,13 @@
 //! - `fillBuffer` (0x132) on type-1 buffers
 //! - `copyFromBuffer:toBuffer:` (0x12d) on type-1 buffers
 //! - Rectangular buffer↔texture / texture↔texture copies on linear type-2/3
-//! - Same rectangular copies with **type-11 IOSurface** texture endpoints
+//! - Same rectangular copies with **IOSurface** texture endpoints
 //!   (level 0, slice 0, depth 1) via mapping page tables; multi-plane (biplanar)
 //!   sample windows from cached `sIOSurfaceDeviceDescriptor` selected by texture
 //!   geometry (width/height/bpe), not a wire plane index
 //! - **Type-8 texture views** as copy endpoints: unswizzled views over type-2/3
-//!   or type-11 bases; multi-level / array / non-2D Metal types when geometry matches
-//!   (type-11 bases remain single-level / single-slice — see below)
+//!   or IOSurface texture bases; multi-level / array / non-2D Metal types when geometry matches
+//!   (IOSurface texture bases remain single-level / single-slice — see below)
 //! - **`MTLBlitOption`**: None; DepthFromDepthStencil / StencilFromDepthStencil;
 //!   combined DS plane packing on linear GVA; unknown bits / RowLinearPVRTC fail
 //! - **`0x13e` whole-surface** texture→texture: for each level in
@@ -30,11 +30,11 @@
 //! - multisample view types
 //! - RowLinearPVRTC / unknown option bits
 //! - overlapping same-buffer B2B windows
-//! - type-11 multi-mip / non-zero level or slice — **not a missing feature**: Metal
+//! - IOSurface texture multi-mip / non-zero level or slice — **not a missing feature**: Metal
 //!   forbids mipmapped IOSurface textures (`newTextureWithDescriptor:iosurface:`
 //!   rejects `mipmapLevelCount > 1`). Product path fail-closes; do not invent a
 //!   pyramid layout in the mapping.
-//! - 3D whole-surface with `sliceCount!=1`, non-zero slices, or type-11 endpoint
+//! - 3D whole-surface with `sliceCount!=1`, non-zero slices, or IOSurface texture endpoint
 
 use crate::contract::pixel_format::{self, MTL_FORMAT_BGRA8_UNORM};
 use crate::model::DeviceState;
@@ -66,7 +66,7 @@ pub enum BlitStatus {
     Ok,
     /// Missing object, wrong kind, or unreadable descriptor.
     MissingResource,
-    /// Opcode / options / view / slice / 3D / type-11 not on this path.
+    /// Opcode / options / view / slice / 3D / IOSurface texture not on this path.
     Unsupported,
     /// Offset/length/extent outside allocation or level bounds.
     Bounds,
@@ -314,7 +314,7 @@ struct LinearTextureLevel {
     pixel_format: u16,
 }
 
-/// Type-11 IOSurface texture (single level, 2D).
+/// IOSurface-backed texture (single level, 2D).
 ///
 /// Metal rejects mipmapped IOSurface textures (`mipmapLevelCount > 1` fails
 /// descriptor validation on `newTextureWithDescriptor:iosurface:plane:`). The
@@ -324,7 +324,7 @@ struct LinearTextureLevel {
 /// Multi-plane (biplanar 420): sample window comes from the cached guest device
 /// descriptor via geometry match (texture width/height/bpe); `surface_offset` is
 /// the plane base in the shared mapping.
-struct Type11Texture {
+struct IOSurfaceTextureBacking {
     mapping_id: u32,
     width: u32,
     height: u32,
@@ -332,7 +332,7 @@ struct Type11Texture {
     surface_offset: u64,
     /// IOSurface-aligned surface row stride (bytes).
     ///
-    /// `u32` to match both ends it sits between: `type11_sample_window` and
+    /// `u32` to match both ends it sits between: `iosurface_texture_sample_window` and
     /// `type5_sample_window` each return it as one, and its only readers hand
     /// it to [`mapping_write::SurfaceWindow::bpr`], which is one. It was `u64`,
     /// so both construction sites widened and both readers narrowed straight
@@ -347,42 +347,42 @@ struct Type11Texture {
 
 enum TextureBacking {
     Linear(LinearTextureLevel),
-    Type11(Type11Texture),
+    IOSurface(IOSurfaceTextureBacking),
 }
 
 impl TextureBacking {
     fn width(&self) -> u32 {
         match self {
             TextureBacking::Linear(t) => t.width,
-            TextureBacking::Type11(t) => t.width,
+            TextureBacking::IOSurface(t) => t.width,
         }
     }
     fn height(&self) -> u32 {
         match self {
             TextureBacking::Linear(t) => t.height,
-            TextureBacking::Type11(t) => t.height,
+            TextureBacking::IOSurface(t) => t.height,
         }
     }
     fn depth(&self) -> u32 {
         match self {
             TextureBacking::Linear(t) => t.depth,
-            TextureBacking::Type11(_) => 1,
+            TextureBacking::IOSurface(_) => 1,
         }
     }
     fn bpp(&self) -> u32 {
         match self {
             TextureBacking::Linear(t) => t.bpp,
-            TextureBacking::Type11(t) => t.bpp,
+            TextureBacking::IOSurface(t) => t.bpp,
         }
     }
     fn pixel_format(&self) -> u16 {
         match self {
             TextureBacking::Linear(t) => t.pixel_format,
-            TextureBacking::Type11(t) => t.pixel_format,
+            TextureBacking::IOSurface(t) => t.pixel_format,
         }
     }
-    fn is_type11(&self) -> bool {
-        matches!(self, TextureBacking::Type11(_))
+    fn is_iosurface_texture(&self) -> bool {
+        matches!(self, TextureBacking::IOSurface(_))
     }
 }
 
@@ -635,14 +635,14 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
                     return Err(br(BlitStatus::Unsupported, "view_1d_height"));
                 }
             }
-            TextureBacking::Type11(_) => {
+            TextureBacking::IOSurface(_) => {
                 // Metal forbids mipmapped / multi-slice IOSurface textures; see
-                // Type11Texture. Fail closed rather than inventing layout.
+                // IOSurfaceTextureBacking. Fail closed rather than inventing layout.
                 if abs_level != 0 || abs_slice != 0 {
-                    return Err(br(BlitStatus::Unsupported, "view_t11_level_slice"));
+                    return Err(br(BlitStatus::Unsupported, "view_iosurface_level_slice"));
                 }
                 if texture_view_type_uses_slices(view_type) || texture_view_type_is_3d(view_type) {
-                    return Err(br(BlitStatus::Unsupported, "view_t11_type"));
+                    return Err(br(BlitStatus::Unsupported, "view_iosurface_type"));
                 }
             }
         }
@@ -657,7 +657,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
                     t.bpp = pixel_format::bytes_per_pixel(eff)
                         .ok_or_else(|| br(BlitStatus::Unsupported, "view_fmt_bpp"))?;
                 }
-                TextureBacking::Type11(t) => {
+                TextureBacking::IOSurface(t) => {
                     t.pixel_format = eff;
                     t.bpp = pixel_format::bytes_per_pixel(eff)
                         .ok_or_else(|| br(BlitStatus::Unsupported, "view_fmt_bpp"))?;
@@ -667,17 +667,17 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         return Ok(backing);
     }
 
-    // Type-11 IOSurface: single level, 2D, mapping page table.
+    // IOSurface: single level, 2D, mapping page table.
     // Non-zero level/slice is fail-closed (Metal disallows mipmapped IOSurfaces).
     // Texture object dims/format select the plane when the mapping is multi-plane.
     if entry.kind == ObjectKind::IOSurfaceTexture {
         if level != 0 || slice != 0 {
-            return Err(br(BlitStatus::Unsupported, "t11_level_slice"));
+            return Err(br(BlitStatus::Unsupported, "iosurface_level_slice"));
         }
         let Some(bytes) = objects::read_descriptor(state, host, task_id, &entry) else {
             return Err(br(
                 BlitStatus::MissingResource,
-                crate::observe::ladder_slug!("t11", desc_read),
+                crate::observe::ladder_slug!("iosurface", desc_read),
             ));
         };
         let Ok(ResourceDescriptor::IOSurfaceTexture {
@@ -690,20 +690,20 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         else {
             return Err(br(
                 BlitStatus::MissingResource,
-                crate::observe::ladder_slug!("t11", desc_decode),
+                crate::observe::ladder_slug!("iosurface", desc_decode),
             ));
         };
         if mapping_id == 0 || tex_w == 0 || tex_h == 0 {
-            return Err(br(BlitStatus::MissingResource, "t11_zero_geom"));
+            return Err(br(BlitStatus::MissingResource, "iosurface_zero_geom"));
         }
         // Latch texture→mapping and refresh pages / device desc.
-        let _ = objects::resolve_type11_ref(state, host, task_id, texture_ref);
+        let _ = objects::resolve_iosurface_texture_ref(state, host, task_id, texture_ref);
         let _ = mapper::ensure_resolved_for_scanout(state, host, mapping_id);
         let Some(m) = state.mappings.get(&mapping_id) else {
-            return Err(br(BlitStatus::MissingResource, "t11_no_mapping"));
+            return Err(br(BlitStatus::MissingResource, "iosurface_no_mapping"));
         };
         if !m.mapped || m.page_entries.is_empty() {
-            return Err(br(BlitStatus::MissingResource, "t11_unmapped"));
+            return Err(br(BlitStatus::MissingResource, "iosurface_unmapped"));
         }
         let format = if tex_fmt != 0 {
             tex_fmt
@@ -713,15 +713,15 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
             MTL_FORMAT_BGRA8_UNORM
         };
         let Some(bpp) = pixel_format::bytes_per_pixel(format) else {
-            return Err(br(BlitStatus::Unsupported, "t11_fmt_bpp"));
+            return Err(br(BlitStatus::Unsupported, "iosurface_fmt_bpp"));
         };
         let Some((surface_offset, surface_bpr, span_end)) =
-            mapping_write::type11_sample_window(m, tex_w, tex_h, format)
+            mapping_write::iosurface_texture_sample_window(m, tex_w, tex_h, format)
         else {
-            return Err(br(BlitStatus::Bounds, "t11_sample_window"));
+            return Err(br(BlitStatus::Bounds, "iosurface_sample_window"));
         };
-        note_blit_t11_resident(state, mapping_id);
-        return Ok(TextureBacking::Type11(Type11Texture {
+        note_blit_iosurface_resident(state, mapping_id);
+        return Ok(TextureBacking::IOSurface(IOSurfaceTextureBacking {
             mapping_id,
             width: tex_w,
             height: tex_h,
@@ -742,7 +742,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
     //
     // Resolve it with the view's own geometry, format **and plane index**. The
     // plane is on the wire here (record `+0x20`) and must be used: it is the
-    // whole difference between this and type-11, whose window resolves the plane
+    // whole difference between this and IOSurface texture, whose window resolves the plane
     // by matching geometry and bytes-per-element and so cannot tell two planes
     // that share both apart. A biplanar COPY names exactly such a pair, so this
     // is the path where dropping the index lands. `type5_sample_window` states
@@ -808,8 +808,8 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         // repair of anything this workload does, and a screen that looks the
         // same after changing it says nothing either way.
         crate::runtime::drain::note_store_route("blit_t5_plane_device");
-        note_blit_t11_resident(state, sid);
-        return Ok(TextureBacking::Type11(Type11Texture {
+        note_blit_iosurface_resident(state, sid);
+        return Ok(TextureBacking::IOSurface(IOSurfaceTextureBacking {
             mapping_id: sid,
             width: view.width,
             height: view.height,
@@ -996,15 +996,15 @@ fn read_texture_row<M: HostMemory + HostOps>(
             }
             Ok(())
         }
-        TextureBacking::Type11(t) => {
+        TextureBacking::IOSurface(t) => {
             if oz != 0 {
-                return Err(br(BlitStatus::Unsupported, "rd_row_t11_z"));
+                return Err(br(BlitStatus::Unsupported, "rd_row_iosurface_z"));
             }
             let y = oy
                 .checked_add(row_i)
-                .ok_or_else(|| br(BlitStatus::Bounds, "rd_row_t11_y_overflow"))?;
+                .ok_or_else(|| br(BlitStatus::Bounds, "rd_row_iosurface_y_overflow"))?;
             if y > u32::MAX as u64 || ox > u32::MAX as u64 {
-                return Err(br(BlitStatus::Bounds, "rd_row_t11_coord_range"));
+                return Err(br(BlitStatus::Bounds, "rd_row_iosurface_coord_range"));
             }
             let pixels = (row_bytes / t.bpp as u64) as u32;
             if !mapping_write::read_rect_raw_at(
@@ -1026,7 +1026,7 @@ fn read_texture_row<M: HostMemory + HostOps>(
                 &mut buf[..row_bytes as usize],
                 row_bytes as u32,
             ) {
-                return Err(br(BlitStatus::GuestIo, "rd_row_t11_io"));
+                return Err(br(BlitStatus::GuestIo, "rd_row_iosurface_io"));
             }
             Ok(())
         }
@@ -1037,7 +1037,7 @@ fn read_texture_row<M: HostMemory + HostOps>(
 /// destination region resolved to before its row loop started
 /// ([`texture_region_window`]).
 ///
-/// `allowed` is not consulted on the type-11 arm: that write goes through the
+/// `allowed` is not consulted on the IOSurface texture arm: that write goes through the
 /// mapping rail, whose authorisation is the page list the guest declared for
 /// the mapping itself. That is a different and equally explicit model, not an
 /// unbounded one.
@@ -1092,15 +1092,15 @@ fn write_texture_row<M: HostMemory + HostOps>(
             }
             Ok(())
         }
-        TextureBacking::Type11(t) => {
+        TextureBacking::IOSurface(t) => {
             if oz != 0 {
-                return Err(br(BlitStatus::Unsupported, "wr_row_t11_z"));
+                return Err(br(BlitStatus::Unsupported, "wr_row_iosurface_z"));
             }
             let y = oy
                 .checked_add(row_i)
-                .ok_or_else(|| br(BlitStatus::Bounds, "wr_row_t11_y_overflow"))?;
+                .ok_or_else(|| br(BlitStatus::Bounds, "wr_row_iosurface_y_overflow"))?;
             if y > u32::MAX as u64 || ox > u32::MAX as u64 {
-                return Err(br(BlitStatus::Bounds, "wr_row_t11_coord_range"));
+                return Err(br(BlitStatus::Bounds, "wr_row_iosurface_coord_range"));
             }
             let pixels = (row_bytes / t.bpp as u64) as u32;
             if !mapping_write::write_rect_raw_at(
@@ -1122,7 +1122,7 @@ fn write_texture_row<M: HostMemory + HostOps>(
                 &buf[..row_bytes as usize],
                 row_bytes as u32,
             ) {
-                return Err(br(BlitStatus::GuestIo, "wr_row_t11_io"));
+                return Err(br(BlitStatus::GuestIo, "wr_row_iosurface_io"));
             }
             Ok(())
         }
@@ -1182,14 +1182,14 @@ fn read_texture_rect<M: HostMemory + HostOps>(
             );
             Ok(())
         }
-        TextureBacking::Type11(t) => {
+        TextureBacking::IOSurface(t) => {
             let (pixels, height, origin_x, origin_y) =
-                t11_rect_extent(t, origin, row_bytes, row_count)?;
+                iosurface_rect_extent(t, origin, row_bytes, row_count)?;
             if !mapping_write::read_rect_raw_at(
                 state,
                 host,
                 t.mapping_id,
-                t11_window(t),
+                iosurface_window(t),
                 mapping_write::Rect {
                     origin_x,
                     origin_y,
@@ -1199,7 +1199,7 @@ fn read_texture_rect<M: HostMemory + HostOps>(
                 &mut buf[..need as usize],
                 row_bytes as u32,
             ) {
-                return Err(br(BlitStatus::GuestIo, "rd_rect_t11_io"));
+                return Err(br(BlitStatus::GuestIo, "rd_rect_iosurface_io"));
             }
             Ok(())
         }
@@ -1209,7 +1209,7 @@ fn read_texture_rect<M: HostMemory + HostOps>(
 /// A linear level's rectangle as the GVA rail's own shape: where it starts and
 /// how its rows are laid out.
 ///
-/// This is the linear endpoint's missing rect description. The type-11 endpoint
+/// This is the linear endpoint's missing rect description. The IOSurface texture endpoint
 /// has had one since it landed — [`mapping_write::write_rect_raw_at`] and
 /// friends — while the linear endpoint had only [`write_texture_row`] and
 /// [`read_texture_row`], so [`write_texture_rect`] and [`read_texture_rect`]
@@ -1264,7 +1264,7 @@ fn linear_rect(
 /// [`write_texture_row`]; see [`read_texture_rect`] for why the rect is the
 /// unit.
 ///
-/// A rect that covers a type-11 plane entirely goes through
+/// A rect that covers an IOSurface texture plane entirely goes through
 /// [`mapping_write::write_full_rect_raw_at`], whose fragmented arm imports each
 /// maximal packed GPA run once instead of once per row. The two calls address
 /// identical guest bytes; only the fragmented staging differs.
@@ -1303,9 +1303,9 @@ fn write_texture_rect<M: HostMemory + HostOps>(
             );
             Ok(())
         }
-        TextureBacking::Type11(t) => {
+        TextureBacking::IOSurface(t) => {
             let (pixels, height, origin_x, origin_y) =
-                t11_rect_extent(t, origin, row_bytes, row_count)?;
+                iosurface_rect_extent(t, origin, row_bytes, row_count)?;
             let src = &buf[..need as usize];
             let ok = if origin_x == 0 && origin_y == 0 && pixels == t.width && height == t.height {
                 mapping_write::write_full_rect_raw_at(
@@ -1326,7 +1326,7 @@ fn write_texture_rect<M: HostMemory + HostOps>(
                     state,
                     host,
                     t.mapping_id,
-                    t11_window(t),
+                    iosurface_window(t),
                     mapping_write::Rect {
                         origin_x,
                         origin_y,
@@ -1338,18 +1338,18 @@ fn write_texture_rect<M: HostMemory + HostOps>(
                 )
             };
             if !ok {
-                return Err(br(BlitStatus::GuestIo, "wr_rect_t11_io"));
+                return Err(br(BlitStatus::GuestIo, "wr_rect_iosurface_io"));
             }
             Ok(())
         }
     }
 }
 
-/// The mapping-rail sample window a type-11 texture backing names.
+/// The mapping-rail sample window an IOSurface texture backing names.
 ///
 /// Spelled once so the four rect/row call sites cannot drift on which of the
 /// four fields a copy presents.
-fn t11_window(t: &Type11Texture) -> mapping_write::SurfaceWindow {
+fn iosurface_window(t: &IOSurfaceTextureBacking) -> mapping_write::SurfaceWindow {
     mapping_write::SurfaceWindow {
         base_off: t.surface_offset,
         bpr: t.row_stride,
@@ -1360,38 +1360,38 @@ fn t11_window(t: &Type11Texture) -> mapping_write::SurfaceWindow {
 
 /// Narrow a rect's texel geometry to the `u32` the mapping rail's [`mapping_write::Rect`]
 /// is expressed in, refusing by name rather than truncating.
-fn t11_rect_extent(
-    t: &Type11Texture,
+fn iosurface_rect_extent(
+    t: &IOSurfaceTextureBacking,
     origin: Point,
     row_bytes: u64,
     row_count: u64,
 ) -> Result<(u32, u32, u32, u32), BlitStatus> {
     if origin.z != 0 {
-        return Err(br(BlitStatus::Unsupported, "rect_t11_z"));
+        return Err(br(BlitStatus::Unsupported, "rect_iosurface_z"));
     }
     if t.bpp == 0 {
-        return Err(br(BlitStatus::Bounds, "rect_t11_bpp_zero"));
+        return Err(br(BlitStatus::Bounds, "rect_iosurface_bpp_zero"));
     }
     let origin_x =
-        u32::try_from(origin.x).map_err(|_| br(BlitStatus::Bounds, "rect_t11_x_range"))?;
+        u32::try_from(origin.x).map_err(|_| br(BlitStatus::Bounds, "rect_iosurface_x_range"))?;
     let origin_y =
-        u32::try_from(origin.y).map_err(|_| br(BlitStatus::Bounds, "rect_t11_y_range"))?;
-    let height =
-        u32::try_from(row_count).map_err(|_| br(BlitStatus::Bounds, "rect_t11_height_range"))?;
+        u32::try_from(origin.y).map_err(|_| br(BlitStatus::Bounds, "rect_iosurface_y_range"))?;
+    let height = u32::try_from(row_count)
+        .map_err(|_| br(BlitStatus::Bounds, "rect_iosurface_height_range"))?;
     let pixels = u32::try_from(row_bytes / t.bpp as u64)
-        .map_err(|_| br(BlitStatus::Bounds, "rect_t11_width_range"))?;
+        .map_err(|_| br(BlitStatus::Bounds, "rect_iosurface_width_range"))?;
     Ok((pixels, height, origin_x, origin_y))
 }
 
 /// Census: does the surface this blit is about to copy through its **guest
 /// pages** have live GPU-resident content instead?
 ///
-/// The sampled rail and the blit rail consume the same wire form — a type-11
+/// The sampled rail and the blit rail consume the same wire form — an IOSurface texture
 /// IOSurface, named directly or through a type-5 view — and they resolve it
 /// completely differently. `draw::vulkan`'s sampled resolver runs a four-rung
-/// ladder whose top rung is `t11rung_resident`, the engine image, and a driven
+/// ladder whose top rung is `iosurfacerung_resident`, the engine image, and a driven
 /// session puts 64-93 % of its binds there. This resolver has no ladder at all:
-/// it returns a [`Type11Texture`] over the mapping's guest pages every time, and
+/// it returns a [`IOSurfaceTextureBacking`] over the mapping's guest pages every time, and
 /// the copy then reads and writes those pages on the CPU.
 ///
 /// That is only sound while the guest pages hold the surface's newest content.
@@ -1401,7 +1401,7 @@ fn t11_rect_extent(
 /// copy reads whatever the pages held before. A blit is not a decode failure and
 /// not a refusal: it succeeds, and the pixels are simply not the guest's.
 ///
-/// So this counts rather than branches. `blit_t11_resident_ready` above zero
+/// So this counts rather than branches. `blit_iosurface_resident_ready` above zero
 /// says this device is copying a surface whose authoritative content is on the
 /// GPU, which is the reading that decides whether the blit rail needs the
 /// sampled rail's ladder. `_not_ready` beside it is the denominator, so a zero
@@ -1430,12 +1430,14 @@ fn note_t2t_shape(
     copy_bpp: u32,
 ) {
     use crate::runtime::drain::{note_store_route, note_store_route_n};
-    note_store_route(match (src.is_type11(), dst.is_type11()) {
-        (false, false) => "blit_t2t_linear_linear",
-        (false, true) => "blit_t2t_linear_t11",
-        (true, false) => "blit_t2t_t11_linear",
-        (true, true) => "blit_t2t_t11_t11",
-    });
+    note_store_route(
+        match (src.is_iosurface_texture(), dst.is_iosurface_texture()) {
+            (false, false) => "blit_t2t_linear_linear",
+            (false, true) => "blit_t2t_linear_iosurface",
+            (true, false) => "blit_t2t_iosurface_linear",
+            (true, true) => "blit_t2t_iosurface_to_iosurface",
+        },
+    );
     let bytes = copy_w
         .saturating_mul(copy_h)
         .saturating_mul(copy_d)
@@ -1478,7 +1480,7 @@ fn note_blit_endpoint_debt(state: &DeviceState, task_id: u32, texture_ref: u32) 
     }
 }
 
-fn note_blit_t11_resident(state: &DeviceState, mapping_id: u32) {
+fn note_blit_iosurface_resident(state: &DeviceState, mapping_id: u32) {
     #[cfg(feature = "backend-vulkan")]
     {
         // This census asks the engine a question, and asking takes the engine
@@ -1501,7 +1503,7 @@ fn note_blit_t11_resident(state: &DeviceState, mapping_id: u32) {
             return;
         };
         if !m.has_geom || m.width == 0 || m.height == 0 {
-            crate::runtime::drain::note_store_route("blit_t11_resident_no_geom");
+            crate::runtime::drain::note_store_route("blit_iosurface_resident_no_geom");
             return;
         }
         let (w, h) = (m.width, m.height);
@@ -1509,9 +1511,9 @@ fn note_blit_t11_resident(state: &DeviceState, mapping_id: u32) {
         crate::runtime::drain::note_store_route(
             match crate::backend::vulkan::engine::resident_content_backing(&id) {
                 crate::backend::vulkan::engine::ResidentContentBacking::NotReady => {
-                    "blit_t11_resident_not_ready"
+                    "blit_iosurface_resident_not_ready"
                 }
-                _ => "blit_t11_resident_ready",
+                _ => "blit_iosurface_resident_ready",
             },
         );
     }
@@ -1540,7 +1542,7 @@ use gva_mem::dest_window;
 /// first row to last, so a level, slice or plane stride this bound does not
 /// model cannot place a row outside the set it authorises.
 ///
-/// `Ok(None)` for a type-11 texture: that write goes through the mapping rail,
+/// `Ok(None)` for an IOSurface texture: that write goes through the mapping rail,
 /// authorised by the page list the guest declared for the mapping. Walking a
 /// GVA span for it would bound the wrong address space.
 ///
@@ -2235,11 +2237,11 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
     // kind. Same three readings, so the two halves are comparable line for line.
     {
         use crate::runtime::drain::{note_store_route, note_store_route_n};
-        note_store_route(match (to_texture, tex.is_type11()) {
+        note_store_route(match (to_texture, tex.is_iosurface_texture()) {
             (true, false) => "blit_b2t_linear",
-            (true, true) => "blit_b2t_t11",
+            (true, true) => "blit_b2t_iosurface",
             (false, false) => "blit_t2b_linear",
-            (false, true) => "blit_t2b_t11",
+            (false, true) => "blit_t2b_iosurface",
         });
         let bytes = (plane_row as u64)
             .saturating_mul(copy_h)
@@ -2287,7 +2289,7 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
         dest_window(state, host, task_id, buf_base_gva, span)
     };
     // The half `blit_rows_us` cannot see. That counter sits in `copy_row_region`,
-    // which only the linear-to-linear fast path reaches; every type-11 and
+    // which only the linear-to-linear fast path reaches; every IOSurface texture and
     // type-5 endpoint stages through this loop instead, and each of its rows
     // re-vouches the mapping's guest page table. `mapw_pages_vouched` reads over
     // a million on a driven Maps leg and nothing timed the loop that spends them.
@@ -2474,13 +2476,13 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
         Err(st) => return st,
     };
     let repack = pixel_format::blit_aspect_needs_repack(dst.pixel_format(), aspect);
-    // Type-11 is 2D only.
-    if dst.is_type11() && (cmd.destination_origin.z != 0 || cmd.source_size.depth > 1) {
+    // IOSurface texture is 2D only.
+    if dst.is_iosurface_texture() && (cmd.destination_origin.z != 0 || cmd.source_size.depth > 1) {
         if cmd.source_size.depth == 0 {
             return BlitStatus::ZeroExtent;
         }
         if cmd.destination_origin.z != 0 || cmd.source_size.depth != 1 {
-            return br(BlitStatus::Unsupported, "b2t_t11_z_or_depth");
+            return br(BlitStatus::Unsupported, "b2t_iosurface_z_or_depth");
         }
     }
     let ox = cmd.destination_origin.x;
@@ -2619,7 +2621,7 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
             Err(st) => st,
         };
     }
-    // Type-11 destination: row-stage from buffer GVA.
+    // IOSurface texture destination: row-stage from buffer GVA.
     let src_span = match cmd
         .source_offset
         .checked_add((copy_d - 1).saturating_mul(src_bpi))
@@ -2627,12 +2629,12 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
         .and_then(|v| v.checked_add(row_bytes))
     {
         Some(v) => v,
-        None => return br(BlitStatus::Bounds, "b2t_t11_src_span_overflow"),
+        None => return br(BlitStatus::Bounds, "b2t_iosurface_src_span_overflow"),
     };
     if src_span > src.size {
-        return br(BlitStatus::Bounds, "b2t_t11_src_span_oob");
+        return br(BlitStatus::Bounds, "b2t_iosurface_src_span_oob");
     }
-    // `None` for the type-11 destination this arm is for, which the mapping rail
+    // `None` for the IOSurface texture destination this arm is for, which the mapping rail
     // authorises instead; a linear destination reaching here is still bounded.
     let allowed = match texture_region_window(
         state,
@@ -2662,7 +2664,7 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
                 .and_then(|b| b.checked_add(y.saturating_mul(src_bpr)))
             {
                 Some(v) => v,
-                None => return br(BlitStatus::Bounds, "b2t_t11_src_gva_overflow"),
+                None => return br(BlitStatus::Bounds, "b2t_iosurface_src_gva_overflow"),
             };
             if gva_mem::read_task_gva_by_id(
                 host,
@@ -2674,7 +2676,7 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
             )
             .is_err()
             {
-                return br(BlitStatus::GuestIo, "b2t_t11_read_io");
+                return br(BlitStatus::GuestIo, "b2t_iosurface_read_io");
             }
             if let Err(st) = write_texture_row(
                 state,
@@ -2724,12 +2726,12 @@ fn exec_copy_texture_to_buffer<M: HostMemory + HostOps>(
         Ok(b) => b,
         Err(st) => return st,
     };
-    if src.is_type11() && (cmd.source_origin.z != 0 || cmd.source_size.depth > 1) {
+    if src.is_iosurface_texture() && (cmd.source_origin.z != 0 || cmd.source_size.depth > 1) {
         if cmd.source_size.depth == 0 {
             return BlitStatus::ZeroExtent;
         }
         if cmd.source_origin.z != 0 || cmd.source_size.depth != 1 {
-            return br(BlitStatus::Unsupported, "t2b_t11_z_or_depth");
+            return br(BlitStatus::Unsupported, "t2b_iosurface_z_or_depth");
         }
     }
     let ox = cmd.source_origin.x;
@@ -2881,7 +2883,7 @@ fn exec_copy_texture_to_buffer<M: HostMemory + HostOps>(
     );
     // `blit_rows_us` lives in `copy_row_region`, which only the linear-to-linear
     // fast path reaches. A texture-to-buffer copy stages every row through
-    // `read_texture_row` instead, and for a type-11 or type-5 source that
+    // `read_texture_row` instead, and for an IOSurface texture or type-5 source that
     // re-vouches the mapping's guest page table per row.
     let stage_rows_started = std::time::Instant::now();
     let mut row = vec![0u8; row_bytes as usize];
@@ -2987,9 +2989,9 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
     let copy_bpp = src_bpp;
     let repack_src = pixel_format::blit_aspect_needs_repack(src.pixel_format(), aspect);
     let repack_dst = pixel_format::blit_aspect_needs_repack(dst.pixel_format(), aspect);
-    let any_t11 = src.is_type11() || dst.is_type11();
-    if any_t11 && (cmd.source_origin.z != 0 || cmd.destination_origin.z != 0) {
-        return br(BlitStatus::Unsupported, "t2t_t11_z");
+    let any_iosurface = src.is_iosurface_texture() || dst.is_iosurface_texture();
+    if any_iosurface && (cmd.source_origin.z != 0 || cmd.destination_origin.z != 0) {
+        return br(BlitStatus::Unsupported, "t2t_iosurface_z");
     }
     let sox = cmd.source_origin.x;
     let soy = cmd.source_origin.y;
@@ -3064,8 +3066,8 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
         };
         d
     };
-    if any_t11 && copy_d > 1 {
-        return br(BlitStatus::Unsupported, "t2t_t11_volume");
+    if any_iosurface && copy_d > 1 {
+        return br(BlitStatus::Unsupported, "t2t_iosurface_volume");
     }
     if copy_w == 0 || copy_h == 0 || copy_d == 0 {
         return BlitStatus::ZeroExtent;
@@ -3402,7 +3404,7 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
             Err(st) => st,
         };
     }
-    // Mixed or type-11↔type-11: stage rows.
+    // Mixed or IOSurface texture↔IOSurface texture: stage rows.
     let allowed = match texture_region_window(
         state,
         host,
@@ -3422,7 +3424,7 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
         Err(st) => return st,
     };
     // The last untimed loop on the rail: a texture-to-texture copy with a
-    // type-11 or type-5 end on either side stages through here rather than
+    // IOSurface texture or type-5 end on either side stages through here rather than
     // through `copy_row_region`, so `blit_rows_us` reports nothing for it.
     //
     // A plane at a time, not a row at a time: this is the same staging shape the
@@ -3432,28 +3434,33 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
     // Whether a GPU-side copy serves this pair, and if not, which term stops it.
     // `engine::copy_target_to_guest_pages` takes no source rectangle: it copies
     // level 0 of the resident whole, at origin zero, into a destination whose
-    // geometry is the resident's own. So a type-11 source going to a linear
+    // geometry is the resident's own. So an IOSurface texture source going to a linear
     // destination is reachable only when both ends are the whole plane at the
     // origin, and the three counters partition the population so a reading says
-    // how much of it that is. See [`try_copy_t11_plane_to_linear_on_gpu`] for
+    // how much of it that is. See [`try_copy_iosurface_plane_to_linear_on_gpu`] for
     // what the arm below is instead of, which is the settle the staging loop
     // pays to make the source's guest bytes readable.
-    if src.is_type11() && !dst.is_type11() {
+    if src.is_iosurface_texture() && !dst.is_iosurface_texture() {
         let whole_src =
             sox == 0 && soy == 0 && copy_w == src.width() as u64 && copy_h == src.height() as u64;
         let whole_dst =
             dox == 0 && doy == 0 && copy_w == dst.width() as u64 && copy_h == dst.height() as u64;
         crate::runtime::drain::note_store_route(match (whole_src, whole_dst) {
-            (true, true) => "blit_t2t_t11_whole_plane",
-            (true, false) => "blit_t2t_t11_dst_partial",
-            (false, _) => "blit_t2t_t11_src_partial",
+            (true, true) => "blit_t2t_iosurface_whole_plane",
+            (true, false) => "blit_t2t_iosurface_dst_partial",
+            (false, _) => "blit_t2t_iosurface_src_partial",
         });
         #[cfg(feature = "backend-vulkan")]
         if whole_src && whole_dst {
-            if let (TextureBacking::Type11(s), TextureBacking::Linear(d)) = (&src, &dst) {
-                if let Some(status) =
-                    try_copy_t11_plane_to_linear_on_gpu(state, host, task_id, cmd.destination, s, d)
-                {
+            if let (TextureBacking::IOSurface(s), TextureBacking::Linear(d)) = (&src, &dst) {
+                if let Some(status) = try_copy_iosurface_plane_to_linear_on_gpu(
+                    state,
+                    host,
+                    task_id,
+                    cmd.destination,
+                    s,
+                    d,
+                ) {
                     return status;
                 }
             }
@@ -3577,7 +3584,7 @@ enum GpuPlaneRefusal {
     SrcNotResident,
     /// The destination is a linear guest allocation, which has no mapping for a
     /// GPU-side copy to name.
-    DstNotType11,
+    DstNotIOSurface,
     /// The destination mapping declines a resident-to-guest-pages copy at this
     /// extent, so there is no window to write.
     DstWindowUnresolved,
@@ -3600,7 +3607,7 @@ impl GpuPlaneRefusal {
             Self::MultiLevel => "sl_gpu_multi_level",
             Self::SelfCopy => "sl_gpu_self_copy",
             Self::SrcNotResident => "sl_gpu_src_not_resident",
-            Self::DstNotType11 => "sl_gpu_dst_not_t11",
+            Self::DstNotIOSurface => "sl_gpu_dst_not_iosurface",
             Self::DstWindowUnresolved => "sl_gpu_dst_window",
             Self::PlaneOffset => "sl_gpu_plane_offset",
             Self::GeometryDiffers => "sl_gpu_geometry_differs",
@@ -3647,7 +3654,7 @@ fn gpu_whole_plane_destination(
     src: GpuResidentSource,
 ) -> Result<(), GpuPlaneRefusal> {
     let Some(dst) = dst else {
-        return Err(GpuPlaneRefusal::DstNotType11);
+        return Err(GpuPlaneRefusal::DstNotIOSurface);
     };
     let Some(window) = window else {
         return Err(GpuPlaneRefusal::DstWindowUnresolved);
@@ -3768,8 +3775,8 @@ fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
             return None;
         }
     };
-    let TextureBacking::Type11(t) = &dst else {
-        note_store_route(GpuPlaneRefusal::DstNotType11.route());
+    let TextureBacking::IOSurface(t) = &dst else {
+        note_store_route(GpuPlaneRefusal::DstNotIOSurface.route());
         return None;
     };
     let plane = GpuPlane {
@@ -3865,14 +3872,14 @@ fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
     None
 }
 
-/// Why one whole-plane type-11 to guest-linear copy is not the GPU arm's, for
+/// Why one whole-plane IOSurface texture to guest-linear copy is not the GPU arm's, for
 /// the terms that can be decided from the two endpoints alone.
 ///
 /// Every variant is a **fall-through and not a loss**: the staging loop runs
 /// unchanged and lands the same pixels. They are counters for that reason, and
 /// with `t2t_gpu_src_not_resident`, `t2t_gpu_dst_unbounded`,
 /// `t2t_gpu_engine_declined` and `t2t_gpu_landed` they partition
-/// `blit_t2t_t11_whole_plane`, so a census that does not add up is the bug.
+/// `blit_t2t_iosurface_whole_plane`, so a census that does not add up is the bug.
 #[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum T2tGvaRefusal {
@@ -3911,17 +3918,17 @@ impl T2tGvaRefusal {
     }
 }
 
-/// The destination plane a whole-plane type-11 to guest-linear copy would write,
+/// The destination plane a whole-plane IOSurface texture to guest-linear copy would write,
 /// and its span, or the typed reason there is none.
 ///
-/// Everything [`try_copy_t11_plane_to_linear_on_gpu`] can decide before it asks
+/// Everything [`try_copy_iosurface_plane_to_linear_on_gpu`] can decide before it asks
 /// the engine anything or walks the guest's page table, which is also everything
 /// about it that a test can reach without a GPU. `surface` is the mapping's own
 /// declared geometry and `None` when it has none.
 #[cfg(feature = "backend-vulkan")]
 fn gpu_t2t_gva_plane(
     surface: Option<(u32, u32)>,
-    src: &Type11Texture,
+    src: &IOSurfaceTextureBacking,
     dst: &LinearTextureLevel,
     destination_ref: u32,
 ) -> Result<
@@ -4001,12 +4008,12 @@ fn gpu_t2t_gva_plane(
 /// caller then runs the host path unchanged, so nothing here can lose a frame —
 /// only spend one.
 #[cfg(feature = "backend-vulkan")]
-fn try_copy_t11_plane_to_linear_on_gpu<M: HostMemory + HostOps>(
+fn try_copy_iosurface_plane_to_linear_on_gpu<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     destination_ref: u32,
-    src: &Type11Texture,
+    src: &IOSurfaceTextureBacking,
     dst: &LinearTextureLevel,
 ) -> Option<BlitStatus> {
     use crate::runtime::drain::note_store_route;
@@ -4183,9 +4190,9 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
             if cmd.slice_count != 1 || cmd.source_slice != 0 || cmd.destination_slice != 0 {
                 return br(BlitStatus::Unsupported, "sl_volume_slice_constraint");
             }
-            // Type-11 is 2D (depth 1); volume endpoints are linear only.
-            if src0.is_type11() || dst0.is_type11() {
-                return br(BlitStatus::Unsupported, "sl_volume_t11");
+            // IOSurface texture is 2D (depth 1); volume endpoints are linear only.
+            if src0.is_iosurface_texture() || dst0.is_iosurface_texture() {
+                return br(BlitStatus::Unsupported, "sl_volume_iosurface");
             }
         } else if cmd.slice_count > 1 {
             // Array form: last slice must resolve (view / packing bounds).
@@ -4289,11 +4296,11 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
             continue;
         }
 
-        // Type-11 / mixed: depth-1 only (type-11 is 2D); per-slice whole-surface.
+        // IOSurface texture / mixed: depth-1 only (IOSurface texture is 2D); per-slice whole-surface.
         if is_volume {
             return br(BlitStatus::Unsupported, "sl_volume_mixed");
         }
-        // The slice/level form's type-11 arm. It used to stage one row at a
+        // The slice/level form's IOSurface texture arm. It used to stage one row at a
         // time, and a driven Maps leg charged that loop 30.15 s of a 30.28 s
         // blit rail to move 14.6 MB, against 0.12 s for the resolves beside it
         // and 0.22 s for every strided guest-RAM copy in the device. The bytes
@@ -4417,7 +4424,7 @@ pub(crate) fn blit_status_from_fence(status: FenceStatus) -> BlitStatus {
 /// that other modules own or that are protocol no-ops (caller should not count
 /// those as copy/fill failures). Fences use [`execute_blit_fence`].
 ///
-/// Nothing follows a successful copy. A blit into a type-11 destination writes
+/// Nothing follows a successful copy. A blit into an IOSurface texture destination writes
 /// the guest pages directly and no GPU object caches those bytes, so the
 /// content is coherent by construction and there is nothing to invalidate.
 /// Each arm resolved its own destination in order to write it, so a second

@@ -323,7 +323,7 @@ mod tests {
     fn both_rails_name_the_rung_that_refused_under_their_own_event() {
         let mut host = FakeHost::new();
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        // Object type 11 is an IOSurface, not the type-6 function this loads.
+        // IOSurface wire tag 11 is not the function tag this loader accepts.
         task_with_one_object(&mut host, &mut state, 11, &[0u8; 0x20]);
 
         let cap = crate::observe::FailCapture::start();

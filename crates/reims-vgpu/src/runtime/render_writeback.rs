@@ -11,7 +11,7 @@
 //!
 //! [`crate::runtime::writeback_debt`] is the rail this doc spent four sections
 //! designing and one section burying, built in the one shape the four guest
-//! panics do not rule out: type-11 mappings are resolved at payment, while a
+//! panics do not rule out: IOSurface texture mappings are resolved at payment, while a
 //! live GVA resource retains the physical-page identity of its transfer
 //! backing without retaining raw host pointers. Read that
 //! module's doc first if you are here about deferral; what follows is the
@@ -19,7 +19,7 @@
 //! in the ways below.
 //!
 //! Twelve driven macos-13 sustained-animation boots, six an arm: **90 % of
-//! type-11 Stores are superseded before anything reads their pages**, `store_us`
+//! IOSurface texture Stores are superseded before anything reads their pages**, `store_us`
 //! falls 0.89 against 9.56 us a chain, `draw_us` 14.62 against 26.52, and five
 //! of six on-arm boots present at 105.8-109.2 Hz against a 77.2-78.6 Hz
 //! baseline. GVA targets use the same ownership rule now; their debt is keyed by
@@ -94,7 +94,7 @@
 //! `registry_mark_ready` clears that stamp on every draw that renders into the
 //! resident, so `resident_content_epoch(identity) == m.surface_content_epoch` at
 //! the top of a Store means nothing has changed the pixels since the last one.
-//! It is the same comparison the type-11 attachment LOAD already elides its CPU
+//! It is the same comparison the IOSurface texture attachment LOAD already elides its CPU
 //! seed on, read from the writing side.
 //!
 //! **It is zero, and not nearly zero.** A census partitioning every
@@ -337,7 +337,7 @@
 //!
 //!   Read that against [`SettleSite::ScanoutPaint`] and not against the slug it
 //!   used to share. `scanout::paint_mapping` has two callers — the console, and
-//!   `read_mapping_bgra8`, which is a draw materialising a sampled type-11
+//!   `read_mapping_bgra8`, which is a draw materialising a sampled IOSurface texture
 //!   texture — and until the sampled arm got [`SettleSite::SampledMappingRead`]
 //!   they charged one route. A macos-11 Safari-torture leg read 985 waits and
 //!   1.42 s on it, which is three orders of magnitude off the console's rate and
@@ -661,12 +661,12 @@ settle_sites! {
     /// times in a whole boot", and that is true of the console. It was not true
     /// of this *slug*, because `paint_mapping` has two callers and both charged
     /// it: the console's `scanout_copy_mapping`, and `read_mapping_bgra8`, which
-    /// is sampled type-11 bind materialisation on a draw. A macos-11
+    /// is sampled IOSurface texture bind materialisation on a draw. A macos-11
     /// Safari-torture leg read 985 waits and 1.42 s here, which is the second
     /// caller, and the doc's six-a-boot reading was being applied to a number
     /// three orders of magnitude off it. The sampled arm names itself below.
     ScanoutPaint => "settle_scanout_paint",
-    /// `scanout::read_mapping_bgra8` — a draw materialising a sampled type-11
+    /// `scanout::read_mapping_bgra8` — a draw materialising a sampled IOSurface texture
     /// texture out of a mapping's guest pages.
     ///
     /// Shares `paint_mapping`'s leaf with the console above and nothing else:
@@ -680,7 +680,7 @@ settle_sites! {
     CompletionStamp => "settle_completion_stamp",
     /// `drain::drain_main_fifo` — the root packet's completion stamp.
     RootStamp => "settle_root_stamp",
-    /// `mapping_write::write_bgra8_inner` — the copying type-11 Store.
+    /// `mapping_write::write_bgra8_inner` — the copying IOSurface texture Store.
     MappingBgra8Write => "settle_mapping_bgra8_write",
     /// `mapping_write::write_rgba8_image_changed`.
     MappingRgba8Write => "settle_mapping_rgba8_write",

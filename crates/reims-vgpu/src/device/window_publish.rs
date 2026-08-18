@@ -40,7 +40,7 @@ pub(super) fn window_frame_key(present: &crate::model::PresentState) -> WindowFr
     (
         present.frame_mapping,
         present.frame_generation,
-        // The pixel stamp beside the page stamp. A lazy type-11 Store publishes
+        // The pixel stamp beside the page stamp. A lazy IOSurface texture Store publishes
         // a new frame without writing a guest page, so `frame_generation` holds
         // still across frames that genuinely differ and this is the only term
         // that moves — see `PresentState::frame_content_epoch`.

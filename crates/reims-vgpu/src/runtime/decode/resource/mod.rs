@@ -3772,12 +3772,12 @@ const TYPE7_MIN_LEN: usize = 17;
 
 /// **Unused on the x86 PCI pathway.** A probe placed at the top of this function
 /// — before the length check, so a short record would also report — emitted
-/// nothing across a full interactive session. Type-11 geometry on that pathway
+/// nothing across a full interactive session. IOSurface texture geometry on that pathway
 /// is latched from the **type-4** surface backing descriptor instead
 /// (`runtime/objects`, `decode_type4_surface` -> `set_mapping_geom`). Do not
 /// reason about what the guest tells us at surface-create time from this
 /// decoder without re-confirming it runs; measure `decode_type4_surface`.
-/// Offsets in the type-11 IOSurface-texture descriptor. Named rather than
+/// Offsets in the IOSurface-texture descriptor. Named rather than
 /// written as hex at the read sites, which is the convention every other
 /// decoder in this file already follows — an offset that appears only as a
 /// literal cannot be found by a reader checking whether the layout still holds.
@@ -3805,12 +3805,12 @@ pub const IOSURFACE_TEX_MIN_LEN: usize = 0x20;
 
 pub fn decode_iosurface_texture_descriptor(bytes: &[u8]) -> Result<Descriptor, DecodeStatus> {
     // Matches reims-vgpu-iosurface-pages texture descriptor min layout (mappingID,
-    // object self-ref, format, width, height). Live type-11 blobs are longer
+    // object self-ref, format, width, height). Live IOSurface texture blobs are longer
     // (0x38/0x58); multi-mip level records are **not** part of this object type
     // — Metal forbids mipmapped IOSurface textures
     // (`newTextureWithDescriptor:iosurface:` rejects mipmapLevelCount > 1),
     // and product resolve fail-closes non-zero levels rather than inventing
-    // a pyramid packing in the mapping (see blit_exec::Type11Texture).
+    // a pyramid packing in the mapping (see blit_exec::IOSurfaceTexture).
     if bytes.len() < IOSURFACE_TEX_MIN_LEN {
         return Err(DecodeStatus::ErrShort("res_iosurface_short"));
     }

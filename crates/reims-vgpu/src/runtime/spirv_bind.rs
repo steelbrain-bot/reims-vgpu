@@ -2986,7 +2986,7 @@ pub enum ReflectedComputeTexture {
     Absent,
     /// A single-layer, non-multisampled 2D texture, carrying its
     /// sampled-vs-storage class. This is the only shape the compute rail can
-    /// stage: a binding comes from one type-11 plane window or one linear GVA
+    /// stage: a binding comes from one IOSurface texture plane window or one linear GVA
     /// level, both flat `width × height` rectangles.
     Plain2d(ImageAccess),
     /// The shader declares a shape with a slice, depth, or sample axis the

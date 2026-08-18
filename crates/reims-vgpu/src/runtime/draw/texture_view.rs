@@ -347,7 +347,7 @@ pub(crate) fn resolve_texture_view_reasoned<M: HostMemory + HostOps>(
     let (mut base, level, swizzle, pixel_format) =
         decode_texture_view_hop_reasoned(state, host, task_id, texture_ref)?;
 
-    // Collapse nested type-8 bases to a non-view texture (type-11 / type-2/3).
+    // Collapse nested type-8 bases to a non-view texture (IOSurface texture / type-2/3).
     let mut depth = 0u32;
     for _ in 1..MAX_TEXTURE_VIEW_CHAIN {
         let Some(entry) = objects::lookup_list_entry(state, host, task_id, base) else {

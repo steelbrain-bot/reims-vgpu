@@ -581,7 +581,7 @@ pub fn color_attachment(
 /// reads — so asking it was a render-target question about a destination that is
 /// not one, and the answer was `FormatNeedsConversion` for every 32-bit-per-
 /// channel plane. On a driven macos-13 boot that was all five remaining compute
-/// readbacks: four linear at `MTLPixelFormatRGBA32Float` and one type-11 at
+/// readbacks: four linear at `MTLPixelFormatRGBA32Float` and one IOSurface texture at
 /// `MTLPixelFormatRGBA32Uint` whose source image held `R32G32B32A32_UINT`, the
 /// very texel the guest had declared.
 ///

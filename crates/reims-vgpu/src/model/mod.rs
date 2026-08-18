@@ -121,7 +121,7 @@ impl Device {
 
     /// BH body: drain pending work.
     ///
-    /// `state.texture_to_mapping` is the authoritative type-11 ref → mapping
+    /// `state.texture_to_mapping` is the authoritative IOSurface texture ref → mapping
     /// table and is read directly by `runtime/draw`. This used to also
     /// copy it into the backend on every drain, into a map nothing ever read.
     pub fn drain<H: runtime::host::HostMemory + HostOps>(&mut self, host: &mut H) {

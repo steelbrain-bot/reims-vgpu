@@ -36,8 +36,8 @@ use crate::contract::fnv;
 pub enum GatherRail {
     /// Linear guest texture addressed through task GVA.
     Linear,
-    /// Type-11 mapping-backed sampled bind.
-    Type11,
+    /// IOSurface texture mapping-backed sampled bind.
+    IOSurface,
     /// Type-5 serialized IOSurface plane view (the video path).
     Type5,
 }
@@ -47,7 +47,7 @@ impl GatherRail {
     fn names(self) -> (&'static str, &'static str) {
         match self {
             Self::Linear => ("gw_rail_linear", "gw_rail_linear_kb"),
-            Self::Type11 => ("gw_rail_t11", "gw_rail_t11_kb"),
+            Self::IOSurface => ("gw_rail_iosurface", "gw_rail_iosurface_kb"),
             Self::Type5 => ("gw_rail_t5", "gw_rail_t5_kb"),
         }
     }
@@ -57,7 +57,7 @@ impl GatherRail {
 ///
 /// The two shapes are the two ways the producers name a window: a task-GVA span
 /// (the linear texture rail, which has no mapping) and a mapping-relative offset
-/// (the type-11 and type-5 rails). Those two rails can name the same
+/// (the IOSurface texture and type-5 rails). Those two rails can name the same
 /// `(mid, base_off)` for a single-plane surface, and that is harmless — same
 /// mapping, same offset and same span is the same bytes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]

@@ -562,7 +562,7 @@ fn replace_physical_drops_the_cached_page_list() {
     );
 }
 
-/// A re-point naming a type-11 resource reaches the mapping associated with its
+/// A re-point naming an IOSurface texture resource reaches the mapping associated with its
 /// task-local ref. This is the packet family the arm used to drop entirely —
 /// 57 % of the re-points on a driven boot found no mapping under `object_id` —
 /// and dropping it leaves the texture's page list trusted while it names pages
@@ -571,7 +571,7 @@ fn replace_physical_drops_the_cached_page_list() {
 fn replace_physical_routes_through_the_texture_ref_when_no_mapping_owns_the_id() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    // Mapping 41 backs a type-11 texture the guest registered at object-list
+    // Mapping 41 backs an IOSurface texture the guest registered at object-list
     // ref 12 of task 3. Nothing is mapped under id 12.
     state.map_surface(41);
     {

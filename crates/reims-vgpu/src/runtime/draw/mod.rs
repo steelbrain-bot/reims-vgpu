@@ -2,7 +2,7 @@
 //!
 //! Loads per-function MTLB containers from the object list, materializes stream
 //! binds (vertex/fragment buffers, optional index buffer, viewport/scissor),
-//! hands them to the backend, and writes the RGBA result into the type-11
+//! hands them to the backend, and writes the RGBA result into the IOSurface texture
 //! mapping via [`mapping_write`]. [`vulkan`] translates the guest shaders and
 //! submits the draw through [`crate::backend::vulkan::engine`].
 
@@ -370,7 +370,7 @@ fn swap_rb_channels(src: &[u8]) -> Vec<u8> {
 /// a direction, because that is what makes the call sites auditable: a readback's
 /// order is a property of the attachment it came out of, so the caller states the
 /// fact it was told and the ordering logic lives here. Spelled as a direction
-/// ("swizzle if type-11") each site would re-derive the predicate, which is how
+/// ("swizzle if IOSurface texture") each site would re-derive the predicate, which is how
 /// the two halves of a conversion end up disagreeing.
 ///
 /// The exchange is an involution, so one routine serves both directions. Trailing
@@ -817,7 +817,7 @@ impl LinearColorTarget {
 
 /// One color RT for MRT encode/writeback.
 ///
-/// Archive `ApplePVGPURenderTarget`: either type-11 IOSurface or a type-2/3
+/// Archive `ApplePVGPURenderTarget`: either IOSurface or a type-2/3
 /// guest-allocation plane. Wallpaper/background layers are the latter form.
 #[derive(Clone, Debug, Default)]
 pub struct ColorRtRequest {
@@ -1878,7 +1878,7 @@ fn load_index_bytes_reason<M: HostMemory + HostOps>(
     Ok(buf)
 }
 
-/// Guest Store seed for type-11 `image_changed` / GVA partial writeback.
+/// Guest Store seed for IOSurface texture `image_changed` / GVA partial writeback.
 ///
 /// Metal `storeAction=Store` writes the **whole** attachment after the pass.
 /// Diff-only writeback is Store-equivalent only when `loadAction=Load` and
@@ -2080,13 +2080,15 @@ fn sample_miss_detail<M: HostMemory + HostOps>(
             }
         }
         ObjectKind::IOSurfaceTexture => {
-            let Some(mid) = objects::resolve_type11_ref(state, host, task_id, texture_ref) else {
-                return format!("type=11 desc_len={desc_len} reason=type11_resolve");
+            let Some(mid) =
+                objects::resolve_iosurface_texture_ref(state, host, task_id, texture_ref)
+            else {
+                return format!("type=11 desc_len={desc_len} reason=iosurface_texture_resolve");
             };
             match state.mappings.get(&mid) {
                 None => format!("type=11 mid={mid} desc_len={desc_len} reason=no_mapping"),
                 Some(m) => format!(
-                    "type=11 mid={mid} desc_len={desc_len} geom={} {}x{} fmt={:#x} mapped={} pages={} reason=type11_sample",
+                    "type=11 mid={mid} desc_len={desc_len} geom={} {}x{} fmt={:#x} mapped={} pages={} reason=iosurface_texture_sample",
                     m.has_geom as u8,
                     m.width,
                     m.height,
@@ -2197,7 +2199,7 @@ fn retained_linear_sample_miss_detail(resource: &crate::model::TaskResource) -> 
     }
 }
 
-/// What the guest says a type-11 mapping's texel **values** are, seen through an
+/// What the guest says an IOSurface texture mapping's texel **values** are, seen through an
 /// optional type-8 view format.
 ///
 /// Distinct from the byte *order* its loaders hand back, and that distinction is
@@ -2241,7 +2243,7 @@ fn mapping_declared_format(
     }
 }
 
-/// Sample a type-11 mapping as tight RGBA8 from guest pages.
+/// Sample an IOSurface texture mapping as tight RGBA8 from guest pages.
 ///
 /// Guest pages ARE the surface content: the CPU writeback lands Stores in them
 /// and guest CPU writes are immediately visible. There is exactly one source;
@@ -2251,7 +2253,7 @@ fn mapping_declared_format(
 /// mapped with a live `MappingInternal` and no latched W×H yet; resolving first
 /// decodes the guest device-surface descriptor and latches the geometry, so the
 /// sample succeeds instead of bailing out on `!has_geom` and dropping the bind.
-fn load_type11_mapping_rgba<M: HostMemory + HostOps>(
+fn load_iosurface_mapping_rgba<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mapping_id: u32,
@@ -2545,7 +2547,7 @@ fn host_cache_store_rgba8(
     );
 }
 
-/// Advance the guest-visible publish milestones for a type-11 Store whose
+/// Advance the guest-visible publish milestones for an IOSurface texture Store whose
 /// pixels have landed in the mapping's guest pages.
 ///
 /// Route-independent: the synchronous `cpu_portability` Store calls it inline,
@@ -2683,7 +2685,7 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
     }
     // An abandoned portability chain must still preserve the last successful
     // record. This is an error recovery rail, not normal product behavior: land
-    // the resident readback into the type-11 mapping, publish the Composite
+    // the resident readback into the IOSurface texture mapping, publish the Composite
     // Store, and keep the degradation fail-visible.
     crate::observe::fail(format!(
         "writeback_chain_rgba reason=resident_chain_abandoned_cpu_recovery \
@@ -2957,7 +2959,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             }
         } else if att.load_action == MTL_LOAD_ACTION_LOAD && mapping_id == 0 {
             // A GVA linear target needs a CPU seed when no mapping is available.
-            // Type-11 is seeded later instead, at the attachment site in
+            // IOSurface texture is seeded later instead, at the attachment site in
             // `encode_draw` — the same place the guest-backed alias used to be
             // built, and the same seed it already took whenever the alias was
             // refused. Seeding here would need the mapping read twice.
@@ -3457,10 +3459,10 @@ fn write_gva_rows_within<M: HostMemory + HostOps>(
     Ok(())
 }
 
-/// Seed color RT LOAD from guest type-11 (BGRA→RGBA) or type-2/3/view linear RGBA.
+/// Seed color RT LOAD from guest IOSurface texture (BGRA→RGBA) or type-2/3/view linear RGBA.
 ///
 /// Every color RT is an ephemeral host RT now, so every `Load` needs this: the
-/// type-11 guest-memory alias that let Metal Load read the surface bytes in
+/// IOSurface texture guest-memory alias that let Metal Load read the surface bytes in
 /// place is deleted. This used to run only on the alias-reject fallback
 /// (unaligned offset or row stride, span out of range, no device), which is why
 /// it is already a complete path and not a new one.
@@ -3489,8 +3491,8 @@ fn seed_color_load<M: HostMemory + HostOps>(
         // `.agents/repros/gva-seed-serve-census.sh`) served **1 558 colour LOAD
         // seeds from this lookup and missed 0**. `load_seed_ok_color` was 1 558
         // in the same window, so every colour LOAD seed the device produced came
-        // from here; the other 1 462 of `load_seed_ok` are type-11 and take
-        // `resolve_type11_load_seed`.
+        // from here; the other 1 462 of `load_seed_ok` are IOSurface texture and take
+        // `resolve_iosurface_texture_load_seed`.
         //
         // That is what a LOAD seed is worth: `MTLLoadActionLoad` says the guest
         // is drawing onto the content already in this attachment, so a seed that
@@ -3661,7 +3663,7 @@ fn seed_color_load<M: HostMemory + HostOps>(
     //
     // So each leaf under `load_sampled_rgba_static` owns it, narrowed on what it
     // actually reads — `read_buffer_bytes_resolved` on the buffer's span,
-    // `scanout::paint_mapping` behind `load_type11_mapping_rgba`, and
+    // `scanout::paint_mapping` behind `load_iosurface_mapping_rgba`, and
     // `draw::texture_view::load_linear_texture_impl` for the linear arm. The
     // buffer leaf had no settle at all before that, on any of its four callers.
     // The seed arm: this leaf is shared with the sampled resolve and the two
@@ -3705,10 +3707,10 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
             },
         );
     }
-    // Type-11 path via resolve.
-    if let Some(mid) = objects::resolve_type11_ref(state, host, task_id, texture_ref) {
+    // IOSurface texture path via resolve.
+    if let Some(mid) = objects::resolve_iosurface_texture_ref(state, host, task_id, texture_ref) {
         let source = mapping_declared_format(state, mid, None);
-        return load_type11_mapping_rgba(state, host, mid, None).map(|(_, _, r)| {
+        return load_iosurface_mapping_rgba(state, host, mid, None).map(|(_, _, r)| {
             (
                 r,
                 SampledByteFormat::from_source(TexelLayout::Rgba8, source),
@@ -3726,13 +3728,13 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
         } else {
             (texture_ref, 0, None)
         };
-    // Type-11 base through a view (format override may reinterpret BGRA storage).
-    if let Some(mid) = objects::resolve_type11_ref(state, host, task_id, tex_ref) {
+    // IOSurface texture base through a view (format override may reinterpret BGRA storage).
+    if let Some(mid) = objects::resolve_iosurface_texture_ref(state, host, task_id, tex_ref) {
         if level != 0 {
             return None;
         }
         let source = mapping_declared_format(state, mid, fmt_override);
-        return load_type11_mapping_rgba(state, host, mid, fmt_override).map(|(_, _, r)| {
+        return load_iosurface_mapping_rgba(state, host, mid, fmt_override).map(|(_, _, r)| {
             (
                 r,
                 SampledByteFormat::from_source(TexelLayout::Rgba8, source),
@@ -3741,7 +3743,7 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
     }
     // The only rung here that can answer in anything but RGBA8. The three above
     // convert unconditionally — `load_buffer_texture_rgba` and
-    // `load_type11_mapping_rgba` have no native arm — so they state the layout
+    // `load_iosurface_mapping_rgba` have no native arm — so they state the layout
     // they always produced rather than being handed a choice they cannot make.
     // All four still name the guest format their values were read from, because
     // a convert to RGBA8 reorders channels and does not decode.
@@ -3777,7 +3779,7 @@ fn prepare_memo_scratch(scratch: &mut Vec<u8>, span: usize, filled: usize) {
     scratch[filled..].fill(0);
 }
 
-/// Byte-exact revalidated memo for the type-11 mapping-backed guest-page sampled
+/// Byte-exact revalidated memo for the IOSurface texture mapping-backed guest-page sampled
 /// path. Same contract as [`load_linear_guest_memoized`] / the type-5 view memo:
 /// re-read the native BGRA rect every bind (a guest CPU write is always
 /// observed — neither `map_generation` nor `content_generation` tracks in-place
@@ -3785,10 +3787,10 @@ fn prepare_memo_scratch(scratch: &mut Vec<u8>, span: usize, filled: usize) {
 /// cached RGBA `Arc` + a namespaced content identity so BOTH the CPU convert/
 /// alloc AND the engine's content hash + GPU upload are skipped. A dock-
 /// magnification burst re-binds the same static icons ~1000×, so this collapses
-/// the `t11_guest` CPU copies that saturate the serial drain worker (the
+/// the `iosurface_guest` CPU copies that saturate the serial drain worker (the
 /// dock-hover whole-VM freeze). Returns `(rgba, identity)`.
 #[cfg(feature = "backend-vulkan")]
-fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
+fn load_iosurface_texture_rgba_memoized<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mid: u32,
@@ -3809,7 +3811,7 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
     // Coherence re-read: land any resident-authoritative writeback and read the
     // current native BGRA (read_mapping_bgra8 runs ensure_resolved_for_scanout +
     // flush internally). Reuse the scratch so a memo hit costs no allocation.
-    let mut scratch = std::mem::take(&mut state.type11_memo_scratch);
+    let mut scratch = std::mem::take(&mut state.iosurface_texture_memo_scratch);
     prepare_memo_scratch(
         &mut scratch,
         span,
@@ -3818,21 +3820,21 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
     if !{
         crate::runtime::scanout::read_mapping_bgra8(state, host, mid, &mut scratch, stride, w, h)
     } {
-        state.type11_memo_scratch = scratch;
+        state.iosurface_texture_memo_scratch = scratch;
         return None;
     }
-    // Identity key namespace: bits 63+62 mark type-11 memo content, distinct from
+    // Identity key namespace: bits 63+62 mark IOSurface texture memo content, distinct from
     // raw-GVA keys (bit 63 clear) and type-5 view keys (bit 63 set, bit 62 clear).
     // Every producer draws its generation from
     // `DeviceState::next_sampled_content_generation`, so a (key, generation)
     // pair is unique device-wide and content can never alias on a collision.
     let identity_key = (1u64 << 63) | (1u64 << 62) | mid as u64;
     let key = (mid, w, h);
-    if let Some(m) = state.type11_memo.get_touch(&key) {
+    if let Some(m) = state.iosurface_texture_memo.get_touch(&key) {
         if m.native == scratch {
             let rgba = m.rgba.clone();
             let generation = m.generation;
-            state.type11_memo_scratch = scratch;
+            state.iosurface_texture_memo_scratch = scratch;
             return Some((
                 rgba,
                 LinearSampleIdentity {
@@ -3854,13 +3856,13 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
         )
     });
     if !converted {
-        state.type11_memo_scratch = scratch;
+        state.iosurface_texture_memo_scratch = scratch;
         return None;
     }
     let rgba = std::sync::Arc::new(rgba);
     let generation = state.next_sampled_content_generation();
     let entry_bytes = scratch.len() + rgba.len();
-    state.type11_memo.insert(
+    state.iosurface_texture_memo.insert(
         key,
         crate::model::GuestLinearMemo {
             native: scratch,

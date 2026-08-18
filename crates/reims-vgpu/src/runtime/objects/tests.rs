@@ -9,34 +9,34 @@ use crate::runtime::decode::resource::TYPE7_OBJECT_SAMPLER;
 use crate::runtime::host::FakeHost;
 
 #[test]
-fn type11_fail_latch_dedups_per_task_ref_and_rearms_on_clear() {
+fn iosurface_texture_fail_latch_dedups_per_task_ref_and_rearms_on_clear() {
     // Flood guard for the per-draw-per-ref resolve path: a genuinely-broken
-    // type-11 ref logs each reason once, isolates per (task,ref), and
+    // IOSurface texture ref logs each reason once, isolates per (task,ref), and
     // re-arms on resolve. Unique ids so this never races real refs across
     // the process-global latch.
     let (t, r, r2) = (0xAB01u32, 0xCD01u32, 0xCD02u32);
-    clear_type11_fail(t, r);
-    clear_type11_fail(t, r2);
+    clear_iosurface_texture_fail(t, r);
+    clear_iosurface_texture_fail(t, r2);
     let seen = |task: u32, rf: u32, reason: &'static str| {
-        type11_fail_latch()
+        iosurface_texture_fail_latch()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .contains(&(task, rf, reason))
     };
-    note_type11_fail(t, r, "type11_register", "x".into());
-    assert!(seen(t, r, "type11_register"));
+    note_iosurface_texture_fail(t, r, "iosurface_texture_register", "x".into());
+    assert!(seen(t, r, "iosurface_texture_register"));
     // Distinct reason on the same ref tracked independently.
-    note_type11_fail(t, r, "type11_desc_read", "x".into());
-    assert!(seen(t, r, "type11_desc_read"));
+    note_iosurface_texture_fail(t, r, "iosurface_texture_desc_read", "x".into());
+    assert!(seen(t, r, "iosurface_texture_desc_read"));
     // A different ref is untouched.
-    assert!(!seen(t, r2, "type11_register"));
-    note_type11_fail(t, r2, "type11_register", "x".into());
+    assert!(!seen(t, r2, "iosurface_texture_register"));
+    note_iosurface_texture_fail(t, r2, "iosurface_texture_register", "x".into());
     // Clearing r re-arms only r, leaves r2.
-    clear_type11_fail(t, r);
-    assert!(!seen(t, r, "type11_register"));
-    assert!(!seen(t, r, "type11_desc_read"));
-    assert!(seen(t, r2, "type11_register"));
-    clear_type11_fail(t, r2);
+    clear_iosurface_texture_fail(t, r);
+    assert!(!seen(t, r, "iosurface_texture_register"));
+    assert!(!seen(t, r, "iosurface_texture_desc_read"));
+    assert!(seen(t, r2, "iosurface_texture_register"));
+    clear_iosurface_texture_fail(t, r2);
 }
 
 fn setup_task_with_list(host: &mut FakeHost, state: &mut DeviceState) {
@@ -70,7 +70,7 @@ fn setup_task_with_list(host: &mut FakeHost, state: &mut DeviceState) {
 }
 
 #[test]
-fn resolve_type11_from_list() {
+fn resolve_iosurface_texture_from_list() {
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     setup_task_with_list(&mut host, &mut state);
@@ -78,27 +78,27 @@ fn resolve_type11_from_list() {
     let e = lookup_list_entry(&state, &host, 1, 1).expect("list entry");
     assert_eq!(e.kind, ObjectKind::IOSurfaceTexture);
     assert_eq!(e.descriptor_gva, 0x40);
-    let mid = resolve_type11_ref(&mut state, &host, 1, 1).expect("type11");
+    let mid = resolve_iosurface_texture_ref(&mut state, &host, 1, 1).expect("iosurface_texture");
     assert_eq!(mid, 9);
     let m = state.mappings.get(&9).unwrap();
     assert!(m.has_geom);
     assert_eq!((m.width, m.height, m.format), (64, 32, 0x50));
 }
 
-/// Registering a type-11 texture is construction, not bind-time repair.
+/// Registering an IOSurface texture is construction, not bind-time repair.
 ///
 /// Once the task owns the texture object, later binds retrieve that object and
 /// must not replay its serialized descriptor over mutable mapping state. A new
 /// descriptor can take effect only after the resource lifetime ends.
 #[test]
-fn a_retained_type11_texture_runs_construction_side_effects_once() {
+fn a_retained_iosurface_texture_runs_construction_side_effects_once() {
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     setup_task_with_list(&mut host, &mut state);
     let resource = resolve_resource(&state, &host, 1, 1).expect("construction");
 
     assert_eq!(
-        resolve_type11_resource(&mut state, 1, 1, &resource),
+        resolve_iosurface_texture_resource(&mut state, 1, 1, &resource),
         Some(9)
     );
     {
@@ -109,7 +109,7 @@ fn a_retained_type11_texture_runs_construction_side_effects_once() {
     }
 
     assert_eq!(
-        resolve_type11_resource(&mut state, 1, 1, &resource),
+        resolve_iosurface_texture_resource(&mut state, 1, 1, &resource),
         Some(9)
     );
     let mapping = &state.mappings[&9];
@@ -182,7 +182,7 @@ fn resources_keep_construction_input_until_explicit_delete() {
         )
     ));
     assert_eq!(
-        resolve_type11_resource(&mut state, 1, 1, &retained),
+        resolve_iosurface_texture_resource(&mut state, 1, 1, &retained),
         Some(9),
         "the retained typed object resolves after its construction bytes become unreadable"
     );
@@ -195,7 +195,7 @@ fn resources_keep_construction_input_until_explicit_delete() {
     assert!(!Arc::ptr_eq(&first, &replacement));
     assert_eq!(ld32(&replacement.descriptor), 10);
     assert_eq!(
-        resolve_type11_resource(&mut state, 1, 1, &replacement),
+        resolve_iosurface_texture_resource(&mut state, 1, 1, &replacement),
         Some(10),
         "the replacement lifetime runs its own construction side effects"
     );
@@ -618,7 +618,7 @@ fn decode_type4_biplanar_420f_planes() {
     let surf = decode_device_surface(&dev).expect("device");
     assert_eq!(surf.plane_count, 2);
     assert_eq!(surf.alloc_size, 0x180000);
-    // Type-11 Y plane: R8 1024×1024 matches plane0 (contract geometry key).
+    // IOSurface texture Y plane: R8 1024×1024 matches plane0 (contract geometry key).
     let y = sample_window_from_device_desc(
         Some(&dev),
         None,
@@ -2084,7 +2084,7 @@ fn the_shared_ladder_names_the_rung_that_refused() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     setup_task_with_list(&mut host, &mut state);
 
-    // Ref 1 is a type-11 entry whose descriptor is mapped: all three rungs pass.
+    // Ref 1 is an IOSurface texture entry whose descriptor is mapped: all three rungs pass.
     let (entry, bytes) = resolve_descriptor(&state, &host, 1, 1, &[ObjectKind::IOSurfaceTexture])
         .expect("all rungs pass");
     assert_eq!(entry.kind, ObjectKind::IOSurfaceTexture);
@@ -2215,7 +2215,7 @@ fn a_repoint_drops_the_ref_keyed_host_copies_of_the_object() {
 /// equal.
 ///
 /// This is the compositor failure class: task 0 owns type-4 surface 1 while
-/// task 1 owns type-11 resource 1, which resolves to mapping 9. Re-pointing the
+/// task 1 owns IOSurface texture resource 1, which resolves to mapping 9. Re-pointing the
 /// latter must retire mapping 9 and leave task 0's surface intact. The old
 /// global-id-first route did the opposite.
 #[test]
@@ -2224,7 +2224,10 @@ fn a_repoint_resolves_the_resource_in_its_task_before_touching_a_mapping() {
     let mut host = FakeHost::new();
     setup_task_with_list(&mut host, &mut state);
 
-    assert_eq!(resolve_type11_ref(&mut state, &host, 1, 1), Some(9));
+    assert_eq!(
+        resolve_iosurface_texture_ref(&mut state, &host, 1, 1),
+        Some(9)
+    );
 
     assert!(state.map_surface(1));
     {
@@ -2238,7 +2241,10 @@ fn a_repoint_resolves_the_resource_in_its_task_before_touching_a_mapping() {
         });
     }
     {
-        let resource = state.mappings.get_mut(&9).expect("type-11 mapping");
+        let resource = state
+            .mappings
+            .get_mut(&9)
+            .expect("IOSurface texture mapping");
         resource.mapped = true;
         resource.page_entries = vec![0x6789_a001];
     }
@@ -2252,7 +2258,7 @@ fn a_repoint_resolves_the_resource_in_its_task_before_touching_a_mapping() {
     );
     assert!(
         state.mappings[&9].page_entries.is_empty(),
-        "the task-local type-11 association names the mapping to invalidate"
+        "the task-local IOSurface texture association names the mapping to invalidate"
     );
 }
 

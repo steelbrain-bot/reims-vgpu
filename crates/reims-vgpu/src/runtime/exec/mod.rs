@@ -75,7 +75,7 @@ struct RenderIcbExecute {
 /// Archive `apple_pv_gpu_render_worker_run` executes **every** draw in order,
 /// seeding draw N from draw N-1's writeback. Product previously kept only
 /// `last_draw`, which dropped the logo when the pill was the final draw in the
-/// same stream (journal: logo RG8 168×206 + pill → one type-11 FB).
+/// same stream (journal: logo RG8 168×206 + pill → one IOSurface texture FB).
 #[derive(Clone, Debug, Default)]
 struct PendingDraw {
     pipeline_ref: u32,
@@ -616,7 +616,7 @@ pub struct ExecResult {
     /// The caller must keep this packet at the channel head and retry it.
     pub deferred: bool,
     pub texture_refs: Vec<u32>,
-    pub type11_mappings: Vec<u32>,
+    pub iosurface_mappings: Vec<u32>,
     pub saw_draw: bool,
     pub clears_applied: u32,
     pub draws_ok: u32,
@@ -927,7 +927,7 @@ fn note_exec_header(exec_started: std::time::Instant, measured_ns: u64) {
 ///
 /// `validity_unknown_object` is **not** by itself a defect either, and a reader
 /// scoring it needs to know why: `DeviceState::objects` is populated lazily, by
-/// `objects::resolve_type11_ref` and `resolve_type4_surface_ex` at the moment a
+/// `objects::resolve_iosurface_texture_ref` and `resolve_type4_surface_ex` at the moment a
 /// decoded command names a ref. A resource the guest has created in its own
 /// object list but has not yet named in an executed stream is absent from the
 /// set by construction. The table names the submission's whole residency list,
@@ -2149,15 +2149,16 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     if !out.texture_refs.contains(&texture_ref) {
                         out.texture_refs.push(texture_ref);
                     }
-                    if let Some(m) = objects::resolve_type11_ref(state, host, task_id, texture_ref)
+                    if let Some(m) =
+                        objects::resolve_iosurface_texture_ref(state, host, task_id, texture_ref)
                     {
-                        if !out.type11_mappings.contains(&m) {
-                            out.type11_mappings.push(m);
+                        if !out.iosurface_mappings.contains(&m) {
+                            out.iosurface_mappings.push(m);
                         }
                     } else if objects::resolve_type4_surface(state, host, texture_ref) {
                         // x86 type-4: object ref is surface_id / mapping_id.
-                        if !out.type11_mappings.contains(&texture_ref) {
-                            out.type11_mappings.push(texture_ref);
+                        if !out.iosurface_mappings.contains(&texture_ref) {
+                            out.iosurface_mappings.push(texture_ref);
                         }
                     }
                     Some(TextureBind {
@@ -2394,19 +2395,19 @@ fn handle_render_record<M: HostMemory + HostOps>(
                         out.texture_refs.push(att.resolve_texture_ref);
                     }
                     if let Some(m) =
-                        objects::resolve_type11_ref(state, host, task_id, published_ref)
+                        objects::resolve_iosurface_texture_ref(state, host, task_id, published_ref)
                     {
                         note_pass_extent_for_slot(state, task_id, slot, m, &cmd);
-                        if !out.type11_mappings.contains(&m) {
-                            out.type11_mappings.push(m);
+                        if !out.iosurface_mappings.contains(&m) {
+                            out.iosurface_mappings.push(m);
                         }
                     } else if objects::resolve_type4_surface(state, host, published_ref) {
                         // A type-4 attachment is its own mapping id — the arm
-                        // below pushes `att.texture_ref` where the type-11 arm
+                        // below pushes `att.texture_ref` where the IOSurface texture arm
                         // pushes the id it resolved to.
                         note_pass_extent_for_slot(state, task_id, slot, published_ref, &cmd);
-                        if !out.type11_mappings.contains(&published_ref) {
-                            out.type11_mappings.push(published_ref);
+                        if !out.iosurface_mappings.contains(&published_ref) {
+                            out.iosurface_mappings.push(published_ref);
                         }
                     }
                     // The load action decides this, and only the load action.
@@ -3324,7 +3325,7 @@ struct BindTables<'a, B> {
 ///
 /// `make` builds the bind for a live slot and returns `None` for the zero ref,
 /// which keeps the ref field's name — and any side registration, such as the
-/// texture arm's type-11 mapping list — with the caller. The clear count comes
+/// texture arm's IOSurface texture mapping list — with the caller. The clear count comes
 /// back as a return value rather than through an `&mut` counter so `make` can
 /// hold the rest of `ExecResult`.
 fn apply_binds<T: Copy, B: Clone>(
@@ -3731,7 +3732,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                 fill_draw_binds_from_pending(&mut req, pd);
                 (req.continues_render_pass, req.render_pass_continues) =
                     render_pass_chain_position(di, draw_list.len());
-                // A resident type-11 target carries attachment contents between
+                // A resident IOSurface texture target carries attachment contents between
                 // records without a CPU chain buffer. Like a native Metal render
                 // pass, only the final record performs the guest-visible Store;
                 // importing a full frame after every draw held DeviceInner for
@@ -3743,7 +3744,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                     .unwrap_or(false);
                 // Records 2+ of a chain composite over the prior record: force
                 // loadAction=Load on every color. Leaving the pass action alone
-                // on a type-11 target let a CLEAR re-run before each record,
+                // on an IOSurface texture target let a CLEAR re-run before each record,
                 // wiping the full composite drawn by record 1 (live poison=1:
                 // mid peak 10.9M native → 2.5M after later records).
                 if di > 0 {
@@ -4366,8 +4367,8 @@ fn dirty_color_targets<M: HostMemory + HostOps>(
     refs: &[u32],
 ) {
     for &tex_ref in refs {
-        if let Some(mid) = objects::resolve_type11_ref(state, host, task_id, tex_ref) {
-            // The guest pages are the only copy of a type-11 surface, so there
+        if let Some(mid) = objects::resolve_iosurface_texture_ref(state, host, task_id, tex_ref) {
+            // The guest pages are the only copy of an IOSurface texture surface, so there
             // is no mirror to drop — only bump gen for scanout skips.
             let _ = state.mark_mapping_written(mid);
         } else if objects::resolve_type4_surface(state, host, tex_ref) {
@@ -4465,7 +4466,7 @@ fn apply_clear<M: HostMemory + HostOps>(
     } else {
         *att
     };
-    // Prefer full draw-path resolve (type-11 or type-2/3 GVA wallpaper targets).
+    // Prefer full draw-path resolve (IOSurface texture or type-2/3 GVA wallpaper targets).
     let Some(req) =
         // A clear-only pass: no pipeline and no geometry, so every draw
         // argument including the base instance is zero by construction.

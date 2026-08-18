@@ -139,7 +139,7 @@ pub enum Part {
     /// `to_vec` of the prior record's seed for a Load one — so this is where a
     /// draw sampling the target it is drawing into pays for the copy.
     ResolveAlias = 1,
-    /// `resolve_sampled_source`: the type-11 rung ladder and the linear guest
+    /// `resolve_sampled_source`: the IOSurface texture rung ladder and the linear guest
     /// rungs, for every bind the alias branch above did not claim.
     ResolveSource = 2,
     /// `load_vulkan_sampler` over the record's vertex and fragment sampler

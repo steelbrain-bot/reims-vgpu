@@ -3449,7 +3449,7 @@ pub fn note_readback_gpu_us(barrier_us: u64, copy_us: u64) {
 /// The routes are the attribution for `engine_delta`'s readback bytes: only
 /// `cpu_portability` reads a full frame back and CPU-copies it into the guest's
 /// pages, and only it is forced to — `gva_store_defer_eligible` refuses any
-/// target with a nonzero `mapping_id`, so a type-11 composite Store has no
+/// target with a nonzero `mapping_id`, so an IOSurface texture composite Store has no
 /// deferred rail to take. Whether that is 2 Stores a second or 20 decides
 /// whether building one is worth it, and the route's own first-appearance line
 /// is deduplicated per process and cannot say.
@@ -3483,14 +3483,14 @@ thread_local! {
 /// ```text
 /// AUC 0.75  surface_flush             permutation p = 0.021 raw
 /// AUC 0.73  load_seed_ok                            p = 0.914 Bonferroni
-/// AUC 0.72  type11_seed_uploaded      (43 columns tested)
-/// AUC 0.72  type11_seed_guest_wrote
-/// AUC 0.71  t11_gw_ref_moved
+/// AUC 0.72  iosurface_texture_seed_uploaded      (43 columns tested)
+/// AUC 0.72  iosurface_texture_seed_guest_wrote
+/// AUC 0.71  iosurface_gw_ref_moved
 /// ```
 ///
 /// Corrected for having looked at 43 columns, nothing is distinguishable from
 /// noise. The leaders are also largely one quantity wearing different names — a
-/// type-11 seed upload is a `load_seed_ok_mapping` — so they are one weak
+/// IOSurface texture seed upload is a `load_seed_ok_mapping` — so they are one weak
 /// signal, not five.
 ///
 /// The reason is structural rather than a gap to be filled by adding counters.

@@ -228,7 +228,7 @@ pub struct Type5ArgsHeader {
     pub kind: U32le,
     /// Blob length, observed equal to `desc_len - TYPE5_ARGS`.
     pub blob_len: U32le,
-    /// The type-5 object's own ref, the same convention the type-11 texture
+    /// The type-5 object's own ref, the same convention the IOSurface texture
     /// descriptor uses for its object-ref field.
     pub own_ref: U32le,
 }

@@ -16,7 +16,7 @@
 //! census, because a session already did and was wrong.
 //!
 //! This census reports the sites listed in [`site`] and nothing else. It once
-//! carried three more — the linear, type-11 and type-5 **zero-copy** sampled
+//! carried three more — the linear, IOSurface texture and type-5 **zero-copy** sampled
 //! rails — which were removed when those rails were changed to bind the
 //! `_SRGB` view and honour the qualifier. They had no emitter for some time
 //! before that, so the census was answering for a population it no longer

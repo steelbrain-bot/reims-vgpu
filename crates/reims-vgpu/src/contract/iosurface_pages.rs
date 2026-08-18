@@ -6,12 +6,12 @@ use crate::contract::{align_up_u64, checked_add_u64, checked_mul_u64};
 
 pub const U32_SIZE: usize = 4;
 
-/// Minimum typed type-11 object-list descriptor length (geometry prefix).
+/// Minimum typed IOSurface texture object-list descriptor length (geometry prefix).
 /// Live blobs are often longer (0x38/0x58) with an unused/constant tail.
-/// There is no multi-mip level-record layout on type-11: Metal rejects
+/// There is no multi-mip level-record layout on IOSurface texture: Metal rejects
 /// mipmapped IOSurface textures (`mipmapLevelCount > 1`).
 ///
-/// `TYPE11_` rather than `TEXTURE_DESC_`, which is what these were called.
+/// `IOSURFACE_TEXTURE_` rather than `TEXTURE_DESC_`, which is what these were called.
 /// `runtime::decode::resource` declares a `TEXTURE_DESC_WIDTH`, a
 /// `TEXTURE_DESC_HEIGHT` and a `TEXTURE_DESC_PIXEL_FORMAT` of its own for the
 /// serialized `MTLTextureDescriptor` — a different record, at 60, 64 and 86
@@ -19,12 +19,12 @@ pub const U32_SIZE: usize = 4;
 /// `runtime::texture` imports from both modules in the same file. Neither value
 /// is out of range for the other's record, so picking the wrong import yields a
 /// plausible width rather than a bounds failure.
-pub const TYPE11_DESC_MIN_LEN: usize = 0x20;
-pub const TYPE11_DESC_MAPPING_ID: usize = 0x00;
-pub const TYPE11_DESC_OBJECT_REF: usize = 0x10;
-pub const TYPE11_DESC_PIXEL_FORMAT: usize = 0x16;
-pub const TYPE11_DESC_WIDTH: usize = 0x18;
-pub const TYPE11_DESC_HEIGHT: usize = 0x1c;
+pub const IOSURFACE_TEXTURE_DESC_MIN_LEN: usize = 0x20;
+pub const IOSURFACE_TEXTURE_DESC_MAPPING_ID: usize = 0x00;
+pub const IOSURFACE_TEXTURE_DESC_OBJECT_REF: usize = 0x10;
+pub const IOSURFACE_TEXTURE_DESC_PIXEL_FORMAT: usize = 0x16;
+pub const IOSURFACE_TEXTURE_DESC_WIDTH: usize = 0x18;
+pub const IOSURFACE_TEXTURE_DESC_HEIGHT: usize = 0x1c;
 
 /// One entry of the guest's mapper request array: `{type, mapping_id, reserved}`.
 ///
@@ -461,7 +461,7 @@ pub fn sample_window_from_device_surface(
 ///   a v0a8 surface's Y plane 0 and alpha plane 2 are both R8 at the luma
 ///   geometry, so the scan below matches two and takes neither.
 /// - **A single-plane surface** uses the surface-level base and pitch.
-/// - **A multi-plane surface with no wire index** (type-11) matches width,
+/// - **A multi-plane surface with no wire index** (IOSurface texture) matches width,
 ///   height and bytes-per-element, and takes the plane only when *exactly one*
 ///   matches.
 pub fn sample_window_from_device_desc(
@@ -612,18 +612,18 @@ pub fn required_entry_count(
 }
 
 pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Status> {
-    if bytes.len() < TYPE11_DESC_MIN_LEN {
+    if bytes.len() < IOSURFACE_TEXTURE_DESC_MIN_LEN {
         return Err(Status::ErrShortDescriptor(
             "iosurface_texture_descriptor_short",
         ));
     }
     Ok(TextureDescriptor {
-        mapping_id64: ld64(&bytes[TYPE11_DESC_MAPPING_ID..]),
-        mapping_id: ld32(&bytes[TYPE11_DESC_MAPPING_ID..]),
-        object_ref: ld32(&bytes[TYPE11_DESC_OBJECT_REF..]),
-        pixel_format: ld16(&bytes[TYPE11_DESC_PIXEL_FORMAT..]),
-        width: ld32(&bytes[TYPE11_DESC_WIDTH..]),
-        height: ld32(&bytes[TYPE11_DESC_HEIGHT..]),
+        mapping_id64: ld64(&bytes[IOSURFACE_TEXTURE_DESC_MAPPING_ID..]),
+        mapping_id: ld32(&bytes[IOSURFACE_TEXTURE_DESC_MAPPING_ID..]),
+        object_ref: ld32(&bytes[IOSURFACE_TEXTURE_DESC_OBJECT_REF..]),
+        pixel_format: ld16(&bytes[IOSURFACE_TEXTURE_DESC_PIXEL_FORMAT..]),
+        width: ld32(&bytes[IOSURFACE_TEXTURE_DESC_WIDTH..]),
+        height: ld32(&bytes[IOSURFACE_TEXTURE_DESC_HEIGHT..]),
     })
 }
 

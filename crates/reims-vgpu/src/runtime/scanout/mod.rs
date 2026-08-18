@@ -6,8 +6,8 @@
 //! otherwise we fall back to the programmed EFI framebuffer or clear.
 //!
 //! Early-boot / present policy (archive apple-pv-gpu + live Monterey + PGDisplay):
-//! - Front formats: archive prefers type-11 **RGBA16Float** (0x73); live Monterey
-//!   boot logo/progress also stores full-screen type-11 **BGRA8** / **RGBA8**
+//! - Front formats: archive prefers IOSurface texture **RGBA16Float** (0x73); live Monterey
+//!   boot logo/progress also stores full-screen IOSurface texture **BGRA8** / **RGBA8**
 //!   before the first DisplaySwap — paint those formats too pre-boundary.
 //! - Geometry barrier (archive same_geom): first early paint establishes console
 //!   size from the **guest surface** (mapper geom / job size); later pre-boundary
@@ -29,10 +29,10 @@ use crate::contract::pixel_format::{
 use crate::model::{scanout_extent_ok, DeviceState, EFI_BOOT_HEIGHT, EFI_BOOT_WIDTH};
 use crate::runtime::host::HostMemory;
 
-/// Type-11 color formats that may be the compositor front before DisplaySwap.
+/// IOSurface texture color formats that may be the compositor front before DisplaySwap.
 ///
 /// Archive `front_buffer` is RGBA16Float only; live Monterey also draws the
-/// early boot logo into BGRA8/RGBA8 type-11 full-frame targets. Not a size list.
+/// early boot logo into BGRA8/RGBA8 IOSurface texture full-frame targets. Not a size list.
 #[inline]
 fn is_front_buffer_format(fmt: u16) -> bool {
     matches!(
@@ -54,7 +54,7 @@ pub enum ScanoutCopyResult {
 
 /// Read mapping pages into `dst` without updating present/paint generation.
 ///
-/// Used by draw bind materialization (sampled type-11 textures). Returns true
+/// Used by draw bind materialization (sampled IOSurface textures). Returns true
 /// when geometry and page table produced a full image.
 ///
 /// Backend-agnostic on purpose: it resolves and scatters guest pages and
@@ -185,7 +185,7 @@ pub fn capture_present_frame(
         return false;
     }
     // "These are different pixels", which `generation` cannot say for a lazy
-    // type-11 Store: it leaves the frame in the engine resident and writes no
+    // IOSurface texture Store: it leaves the frame in the engine resident and writes no
     // guest page, so `content_generation` holds still while the pixels move.
     // Read from the entry here rather than threaded in, because the caller
     // resolved `generation` from that same entry and a second parameter is a
@@ -288,7 +288,7 @@ pub fn capture_present_frame(
     //
     // The proxies need the finished frame's BYTES; they do not need those bytes
     // to be in guest pages. This reads the resident and nothing else: no
-    // `flush_intersecting`. Nothing is owed — a type-11 render Store lands its
+    // `flush_intersecting`. Nothing is owed — an IOSurface texture render Store lands its
     // own guest-page writeback (`mapping_write::write_rgba8_image_changed`), and
     // the deferred rails that remain (compute storage, linear, GVA) are keyed on
     // resources this capture does not touch and flush on a genuine guest read
@@ -367,7 +367,7 @@ pub fn capture_present_frame(
     state.present.frame_content_epoch = content_epoch;
     state.present.frame_valid = true;
     // Force the next host paint to blit +0x188. Early pre-boundary paints may
-    // have latched painted_mapping/generation (live type-11 paint_mapping or
+    // have latched painted_mapping/generation (live IOSurface texture paint_mapping or
     // paint_efi_console) to the same mid+gen; with encode_pending=false that made
     // copy_to_bgra8 return Unchanged and left the QEMU console on frozen EFI
     // while +0x188 held logo+pill (live serial-20260715-054015:
@@ -822,7 +822,7 @@ enum CaptureDecline {
     BppUnknown { format: u16 },
     /// The pixel format has no known tight row size.
     TightRowUnknown { format: u16 },
-    /// No type-11 sample window could be derived.
+    /// No IOSurface texture sample window could be derived.
     NoSampleWindow,
     /// The descriptor's row stride is narrower than a tight row.
     BprBelowTight { bpr: u64, tight: u32 },
@@ -947,7 +947,7 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
         width,
         height,
     } = dst;
-    use crate::runtime::mapping_write::type11_sample_window;
+    use crate::runtime::mapping_write::iosurface_texture_sample_window;
 
     // Every `false` return here shows as a black/stale console; log the specific
     // reason so the "why is it black" class is diagnosable (scanout audit Rank-3).
@@ -981,7 +981,7 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
     if m.page_entries.is_empty() {
         return fail(CaptureDecline::NoPages);
     }
-    // Geometry must be latched (same rule as write_bgra8 / archive scanout_type11).
+    // Geometry must be latched (same rule as write_bgra8 / archive scanout_iosurface_texture).
     if !m.has_geom || m.width == 0 || m.height == 0 {
         return fail(CaptureDecline::NoGeom);
     }
@@ -1006,7 +1006,8 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
         return fail(CaptureDecline::TightRowUnknown { format });
     };
     // Same sample window as writeback (device descriptor base/bpr when present).
-    let Some((base_off, bpr_u32, span_end)) = type11_sample_window(m, mw, mh, format) else {
+    let Some((base_off, bpr_u32, span_end)) = iosurface_texture_sample_window(m, mw, mh, format)
+    else {
         return fail(CaptureDecline::NoSampleWindow);
     };
     let bpr = bpr_u32 as usize;
@@ -1146,14 +1147,14 @@ pub fn present_dims(state: &DeviceState, mapping_id: u32) -> (u32, u32) {
     (0, 0)
 }
 
-/// After a successful type-11 color writeback: maybe latch front mapping / paint.
+/// After a successful IOSurface texture color writeback: maybe latch front mapping / paint.
 ///
 /// Contract:
 /// - **PGDisplay**: present names one surface; mode size = that surface's geom
 ///   (`modeChangeHandler` sizeInPixels). We never invent host mode sizes.
 /// - **Archive same_geom**: paint pre-boundary only when console unset or job
 ///   W×H equals established console (strips/other RTs do not resize the window).
-/// - **Live Monterey**: early logo also lands in BGRA8/RGBA8 type-11 (not only
+/// - **Live Monterey**: early logo also lands in BGRA8/RGBA8 IOSurface texture (not only
 ///   0x73); accept those formats pre-boundary. Post-boundary paint is DisplaySwap
 ///   only — writebacks must not rename `present_mapping` after `frame_flush_seen`.
 pub fn note_front_buffer_writeback<M: HostMemory + crate::runtime::host::HostOps>(
@@ -1223,7 +1224,7 @@ pub fn note_front_buffer_writeback<M: HostMemory + crate::runtime::host::HostOps
     }
 
     // HostAction size = mapper registry geom when known (archive
-    // scanout_type11_mapping / PG sizeInPixels from the named surface).
+    // scanout_iosurface_mapping / PG sizeInPixels from the named surface).
     let (paint_w, paint_h) = if has_geom {
         (map_w, map_h)
     } else {

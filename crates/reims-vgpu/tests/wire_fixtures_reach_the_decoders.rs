@@ -182,7 +182,7 @@ fn blit_verdict(bytes: &[u8]) -> Reading {
 /// as a class. Two are worth their own line:
 ///
 /// * `0x0c`, the IOSurface-backed texture. `decode_iosurface_texture_descriptor`
-///   looks like its record reader and is not: that function reads the **type-11
+///   looks like its record reader and is not: that function reads the **IOSurface texture
 ///   object-list descriptor**, a structure the kernel and IOSurface write,
 ///   whose live blobs run `0x38`/`0x58` bytes against this record's 48. Its own
 ///   doc says so and says it does not run on the x86 pathway at all. Feeding a
@@ -352,7 +352,7 @@ fn serializer_verdict(bytes: &[u8], opcode: u32) -> Reading {
         }
         // The IOSurface-backed texture and its `TextureDescriptor2` form. Only
         // the embedded descriptor is signed, for the reason in `body` above:
-        // what reaches this device for an IOSurface texture is the type-11
+        // what reaches this device for an IOSurface texture is the IOSurface texture
         // object-list descriptor, a different structure entirely.
         0x0c => body(bytes, narrow, false),
         0x39 => body(bytes, wide, true),

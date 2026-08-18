@@ -1,4 +1,4 @@
-//! Tests for the type-11 mapped-surface writers.
+//! Tests for the IOSurface texture mapped-surface writers.
 //!
 //! Out of line for the reason the sibling `runtime/` modules that already do
 //! this have: colocated, these 2,291 lines were 48% of `mapping_write.rs` — the
@@ -19,7 +19,7 @@ use crate::runtime::host::FakeHost;
 ///
 /// The row pitch is asserted by its relationships, not as a number: a
 /// 4-wide BGRA8 surface reports `bpr = 128` against a tight row of 16,
-/// because `type11_sample_window` aligns the pitch up. Hard-coding either
+/// because `iosurface_texture_sample_window` aligns the pitch up. Hard-coding either
 /// value would make this a test of that alignment rather than of which
 /// field holds what.
 #[test]
@@ -544,7 +544,7 @@ fn a_writeback_refused_because_the_geometry_moved_says_so_by_name() {
     }
 }
 
-/// The type-11 licence judges the window it is given, not the surface's extent.
+/// The IOSurface texture licence judges the window it is given, not the surface's extent.
 ///
 /// A render Store's destination *is* the surface, so that caller refuses a frame
 /// whose rect is not the mapping's latched geometry — the test above drives
@@ -562,7 +562,7 @@ fn a_writeback_refused_because_the_geometry_moved_says_so_by_name() {
 /// licence still owns, and therefore says both got through all of them.
 #[cfg(feature = "backend-vulkan")]
 #[test]
-fn a_type11_licence_judges_the_callers_window_and_not_the_surfaces_extent() {
+fn a_iosurface_texture_licence_judges_the_callers_window_and_not_the_surfaces_extent() {
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::model::PAGE_SHIFT_X86;
     const PAGE: u64 = 1 << PAGE_SHIFT_X86;
@@ -589,7 +589,7 @@ fn a_type11_licence_judges_the_callers_window_and_not_the_surfaces_extent() {
     let held = crate::backend::vulkan::translate::pixel::vk_texel_layout(
         pixel_format::store_texel_order(MTL_FORMAT_BGRA8_UNORM).expect("BGRA8 has a linear texel"),
     );
-    let dest = |width, height| Type11SurfaceDestination {
+    let dest = |width, height| IOSurfaceDestination {
         mapping_id: 7,
         base_off: 0,
         bpr: 64 * 4,
@@ -599,8 +599,8 @@ fn a_type11_licence_judges_the_callers_window_and_not_the_surfaces_extent() {
         format: MTL_FORMAT_BGRA8_UNORM,
     };
 
-    let whole = licence_type11_surface(&mut state, &mut host, held, &dest(64, 64));
-    let part = licence_type11_surface(&mut state, &mut host, held, &dest(44, 26));
+    let whole = licence_iosurface_texture_surface(&mut state, &mut host, held, &dest(64, 64));
+    let part = licence_iosurface_texture_surface(&mut state, &mut host, held, &dest(44, 26));
     for (what, got) in [("the whole surface", whole), ("a sub-rectangle", part)] {
         match got {
             Err(GpuWritebackDecline::GuestRefRefused { .. }) => {}
@@ -613,11 +613,11 @@ fn a_type11_licence_judges_the_callers_window_and_not_the_surfaces_extent() {
     crate::runtime::guest_ram_map::reset();
 }
 
-/// A type-11 destination follows its mapping allocation, not the amount of
+/// An IOSurface texture destination follows its mapping allocation, not the amount of
 /// unrelated RAM in the VM. A host may be unable to keep every RAMBlock
 /// imported while still admitting this exact resource-sized allocation.
 #[test]
-fn a_type11_resource_import_survives_a_whole_ram_map_refusal() {
+fn a_iosurface_texture_resource_import_survives_a_whole_ram_map_refusal() {
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::model::PAGE_SHIFT_X86;
     const PAGE: u64 = 1 << PAGE_SHIFT_X86;
@@ -659,11 +659,11 @@ fn a_type11_resource_import_survives_a_whole_ram_map_refusal() {
     let held = crate::backend::vulkan::translate::pixel::vk_texel_layout(
         pixel_format::store_texel_order(MTL_FORMAT_BGRA8_UNORM).expect("BGRA8 has a linear texel"),
     );
-    let licence = licence_type11_surface(
+    let licence = licence_iosurface_texture_surface(
         &mut state,
         &mut host,
         held,
-        &Type11SurfaceDestination {
+        &IOSurfaceDestination {
             mapping_id: 7,
             base_off: 0,
             bpr: 64 * 4,
@@ -785,7 +785,7 @@ fn mapping_write_invalidates_intersecting_residency_windows_only() {
     assert!(state.compute_storage_residency.contains_key(&survivor));
 }
 
-/// A direct type-11 writeback must not land in a page the guest re-pointed
+/// A direct IOSurface texture writeback must not land in a page the guest re-pointed
 /// away, and this asserts it in the currency of the bug: the bytes of the
 /// page the surface moved to.
 ///
@@ -1308,7 +1308,7 @@ fn read_rect_raw_fragmented_pages_with_padded_rows() {
 /// A sub-rectangle of a padded plane over scattered guest pages reads through
 /// one page-table walk, not through a plane-sized window.
 ///
-/// This is the source half of every type-11 to linear blit. Before the
+/// This is the source half of every IOSurface texture to linear blit. Before the
 /// rectangle shape reached this rail the arm below materialised the *whole*
 /// sample window into a fresh zeroed `Vec` and then copied the wanted rows out
 /// of it, so a rectangle covering a fraction of the plane still paid for all of
@@ -1596,11 +1596,11 @@ fn an_ambiguous_descriptor_declines_where_an_absent_one_still_sizes_a_window() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     state.map_surface(8);
 
-    // No descriptor yet: geometry came from the type-11 texture object and
+    // No descriptor yet: geometry came from the IOSurface texture object and
     // the aligned row stands in for the pitch. 4 R8 texels align to 128.
     let m = state.mappings.get(&8).expect("mapping");
     assert_eq!(
-        type11_sample_window(m, 4, 2, MTL_FORMAT_R8_UNORM),
+        iosurface_texture_sample_window(m, 4, 2, MTL_FORMAT_R8_UNORM),
         Some((0, 128, 256)),
         "with nothing published there are no planes to confuse"
     );
@@ -1625,7 +1625,7 @@ fn an_ambiguous_descriptor_declines_where_an_absent_one_still_sizes_a_window() {
 
     let m = state.mappings.get(&8).expect("mapping");
     assert_eq!(
-        type11_sample_window(m, 4, 2, MTL_FORMAT_R8_UNORM),
+        iosurface_texture_sample_window(m, 4, 2, MTL_FORMAT_R8_UNORM),
         None,
         "two planes match and neither is the answer, so nothing is bound"
     );

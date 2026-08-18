@@ -138,7 +138,7 @@ pub fn device_scanout_may_paint(id: u64, mapping_id: u32) -> Option<bool> {
 /// screenshot heuristic:
 ///
 /// - `frame_flush_seen` (DisplaySwap / x86 present): product owns the console.
-/// - Else if `early_front_latched` (same-geom type-11 front writeback): the
+/// - Else if `early_front_latched` (same-geom IOSurface texture front writeback): the
 ///   product early paint, logo + pill, before the swap.
 /// - Else: BAR1 / guest-programmed `efi_fb_start` (UEFI + PE log console).
 ///

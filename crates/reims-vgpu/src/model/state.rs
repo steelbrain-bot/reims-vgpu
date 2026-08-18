@@ -601,11 +601,11 @@ pub struct TaskResource {
     /// in-progress state also breaks malformed parent cycles without turning a
     /// recursive lookup into unbounded recursion.
     relation_publication: AtomicU8,
-    /// Type-11 construction side effects, completed once for this resource
+    /// IOSurface texture construction side effects, completed once for this resource
     /// lifetime. The mapping id is immutable construction state; physical
     /// backing replacement invalidates the mapping's pages without rebuilding
     /// the texture object.
-    type11_mapping: OnceLock<u32>,
+    iosurface_mapping: OnceLock<u32>,
     /// Identity whose strong lifetime is exactly this serialized resource.
     /// Direct backend objects keep only a weak reference, so deletion—not an
     /// arbitrary idle timeout—makes them reclaimable.
@@ -640,7 +640,7 @@ impl TaskResource {
             semantic_id: OnceLock::new(),
             decoded: OnceLock::new(),
             relation_publication: AtomicU8::new(RELATIONS_UNPUBLISHED),
-            type11_mapping: OnceLock::new(),
+            iosurface_mapping: OnceLock::new(),
             lifetime: Arc::new(TaskResourceLifetime::new()),
             #[cfg(feature = "backend-vulkan")]
             was_render_target: AtomicBool::new(false),
@@ -699,12 +699,12 @@ impl TaskResource {
         self.was_render_target.load(Ordering::Acquire)
     }
 
-    pub(crate) fn registered_type11_mapping(&self) -> Option<u32> {
-        self.type11_mapping.get().copied()
+    pub(crate) fn registered_iosurface_mapping(&self) -> Option<u32> {
+        self.iosurface_mapping.get().copied()
     }
 
-    pub(crate) fn register_type11_mapping(&self, mapping_id: u32) -> u32 {
-        *self.type11_mapping.get_or_init(|| mapping_id)
+    pub(crate) fn register_iosurface_mapping(&self, mapping_id: u32) -> u32 {
+        *self.iosurface_mapping.get_or_init(|| mapping_id)
     }
 
     /// Retain and classify the engine target named by this resource.
@@ -2106,14 +2106,14 @@ pub struct MappingEntry {
     /// The host framework carries the matching pair as `PGResource._hostValid` /
     /// `._guestValid`, set through `setIsHostValid:` / `setIsGuestValid:`.
     pub validity: ResourceValidity,
-    /// Epoch of this mapping's *surface content* in the sense a type-11 render
+    /// Epoch of this mapping's *surface content* in the sense an IOSurface texture render
     /// LOAD needs: it advances whenever the pixels that Load would seed from
     /// could have changed, wherever they live.
     ///
     /// Strictly coarser than [`Self::content_generation`], and deliberately so.
     /// `content_generation` counts writes to the mapping's *guest pages*, which
     /// misses the one publisher that writes only the host shadow: the deferred
-    /// type-11 Store stores into `surface_cache` and arms a window instead of
+    /// IOSurface texture Store stores into `surface_cache` and arms a window instead of
     /// scattering into guest pages. `surface_cache` holds exactly one entry per
     /// mapping, so a sibling Store at a *different* geometry replaces the entry
     /// an older geometry's resident is being compared against while
@@ -2124,7 +2124,7 @@ pub struct MappingEntry {
     /// currency nothing established.
     ///
     /// Compared against [`crate::backend::vulkan::engine::resident_content_epoch`]
-    /// to decide whether a type-11 LOAD may take `LoadOp::LoadFromTarget` and
+    /// to decide whether an IOSurface texture LOAD may take `LoadOp::LoadFromTarget` and
     /// skip its CPU seed entirely. Never read to decide *what* to present or
     /// draw — only whether a known-equal upload can be elided.
     pub surface_content_epoch: u32,
@@ -2235,7 +2235,7 @@ impl MappingEntry {
 /// Three window kinds share this shape (`texture_ref` appended last so the
 /// `(mapping_id, …)` ordering prefix — and every mapping-keyed range scan —
 /// is unchanged):
-/// - **Surface window** (`mapping_id != 0`): a type-11 IOSurface view;
+/// - **Surface window** (`mapping_id != 0`): an IOSurface view;
 ///   `texture_ref == 0`.
 /// - **Linear window** (`mapping_id == 0`): a type-2/3 raw task-GVA texture,
 ///   identity-matched to its `host_linear_textures` cache entry —
@@ -2542,7 +2542,7 @@ pub struct PresentState {
     pub present_mapping: u32,
     pub host_mapping: u32,
     pub frame_flush_seen: bool,
-    /// Latest type-11 **Composite** writeback mid (logo/desktop content).
+    /// Latest IOSurface texture **Composite** writeback mid (logo/desktop content).
     /// Pre-boundary: sticky early feed for gfx_update when present_mapping is a
     /// ClearOnly flip buffer (dual-mid buffer-setup thrash class).
     /// Post-boundary: dual-mid *peer* tracker, read only by the failure/census
@@ -2610,7 +2610,7 @@ pub struct PresentState {
     /// different pixels", where `frame_generation` is "the guest's pages hold
     /// something different".
     ///
-    /// The two came apart when the lazy type-11 Store
+    /// The two came apart when the lazy IOSurface texture Store
     /// ([`crate::runtime::writeback_debt`]) started leaving a frame in the engine
     /// resident and owing the pages a copy: the pixels move every frame and the
     /// generation does not. Anything asking "is this a new frame to show" has to
@@ -2737,7 +2737,7 @@ pub struct PendingWork {
 }
 
 /// Byte cap for the guest-CPU-produced content memos (`guest_linear_memo`,
-/// `type5_view_memo`, `type11_memo`). A cap crossing evicts the coldest entries
+/// `type5_view_memo`, `iosurface_texture_memo`). A cap crossing evicts the coldest entries
 /// down to a low-water mark — never a bulk clear — so the hot working set (and
 /// its avoided re-decode/re-convert cost) survives.
 pub const GUEST_LINEAR_MEMO_BYTE_CAP: usize = 128 << 20;
@@ -3080,7 +3080,7 @@ pub struct DeviceState {
     /// two emulated GPUs cannot observe each other's declarations and makes a
     /// reset retire the namespace with the rest of this state.
     pub(crate) icb_registry: crate::runtime::icb::IcbRegistry,
-    /// Type-11 texture object ref → mapping_id: (task_id, ref) -> mapping_id.
+    /// IOSurface texture object ref → mapping_id: (task_id, ref) -> mapping_id.
     pub texture_to_mapping: BTreeMap<(u32, u32), u32>,
     pub mappings: BTreeMap<u32, MappingEntry>,
     /// Host render-cache keyed by surface_id / mapping_id (Linux/Vulkan rail).
@@ -3197,26 +3197,26 @@ pub struct DeviceState {
     /// Reusable native-row read buffer for the guest-linear memo path.
     pub guest_linear_scratch: Vec<u8>,
     /// Byte-exact revalidated memo for type-5 serialized texture views
-    /// (media IOSurface planes). Same contract as
+    /// (median IOSurface planes). Same contract as
     /// [`Self::guest_linear_memo`]: every bind re-reads the native plane
     /// window; conversion + upload (via the returned content identity) are
     /// skipped on unchanged bytes. Keyed by
     /// (mapping_id, plane, width, height, view pixel format). Byte-bounded LRU
     /// ([`GUEST_LINEAR_MEMO_BYTE_CAP`]).
     pub type5_view_memo: LruBytesMemo<(u32, u32, u32, u32, u16), GuestLinearMemo>,
-    /// Byte-exact revalidated memo for the type-11 mapping-backed sampled path
-    /// (`load_type11_mapping_rgba` — small IOSurface textures below the zero-copy
+    /// Byte-exact revalidated memo for the IOSurface texture mapping-backed sampled path
+    /// (`load_iosurface_mapping_rgba` — small IOSurface textures below the zero-copy
     /// floor, e.g. dock icons under magnification). Same contract as
     /// [`Self::guest_linear_memo`]: every bind re-reads the native BGRA rect;
     /// the BGRA->RGBA convert + the two per-bind allocs + the engine's content
     /// hash+upload (via the returned content identity) are skipped on unchanged
     /// bytes. A dock-magnification burst re-binds the same static icons ~1000x,
-    /// so this collapses the `t11_guest` CPU copies that otherwise saturate the
+    /// so this collapses the `iosurface_guest` CPU copies that otherwise saturate the
     /// serial drain worker (dock-hover freeze). Keyed by (mapping_id, w, h).
     /// Byte-bounded LRU ([`GUEST_LINEAR_MEMO_BYTE_CAP`]).
-    pub type11_memo: LruBytesMemo<(u32, u32, u32), GuestLinearMemo>,
-    /// Reusable native BGRA read buffer for the type-11 memo re-read.
-    pub type11_memo_scratch: Vec<u8>,
+    pub iosurface_texture_memo: LruBytesMemo<(u32, u32, u32), GuestLinearMemo>,
+    /// Reusable native BGRA read buffer for the IOSurface texture memo re-read.
+    pub iosurface_texture_memo_scratch: Vec<u8>,
     /// Last guest-visible generation produced by a compute storage-image
     /// writeback, keyed by the exact window it was produced for.
     ///
@@ -3483,8 +3483,8 @@ impl DeviceState {
             host_writes: crate::runtime::host_writes::HostWrites::new(page_shift),
             guest_linear_scratch: Vec::new(),
             type5_view_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
-            type11_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
-            type11_memo_scratch: Vec::new(),
+            iosurface_texture_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
+            iosurface_texture_memo_scratch: Vec::new(),
             gva_host_views: Vec::new(),
             view_stale_reads: 0,
         }
@@ -4048,7 +4048,7 @@ impl DeviceState {
     /// This device carries two ways from a reference to a surface, because the
     /// guest has two: on some paths the reference *is* the mapping id, and on
     /// the rest [`Self::texture_to_mapping`] holds the per-task registration a
-    /// type-11 create recorded. A statement about the reference — a validity
+    /// IOSurface texture create recorded. A statement about the reference — a validity
     /// quad, an owed render frame — is a statement about every mapping it
     /// names, so the candidate set is one rule and lives here.
     ///
@@ -4674,7 +4674,7 @@ impl DeviceState {
     ///
     /// Also advances [`MappingEntry::surface_content_epoch`], so every one of
     /// this crate's guest-page writers keeps that epoch closed for free — the
-    /// completeness property the type-11 `LoadFromTarget` gate rests on.
+    /// completeness property the IOSurface texture `LoadFromTarget` gate rests on.
     pub fn mark_mapping_written(&mut self, mapping_id: u32) -> u32 {
         let seq = self.next_validity_seq();
         let Some(m) = self.mappings.get_mut(&mapping_id) else {
@@ -4702,7 +4702,7 @@ impl DeviceState {
     }
 
     /// Advance a mapping's content stamps for a publish that changed its pixels
-    /// *without* writing its guest pages — the lazy type-11 Store of
+    /// *without* writing its guest pages — the lazy IOSurface texture Store of
     /// [`crate::runtime::writeback_debt`], which leaves the frame in the engine
     /// resident and owes the pages a copy.
     ///

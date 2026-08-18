@@ -1157,7 +1157,7 @@ fn the_pass_extent_census_scores_a_fraction_and_clamps_it() {
 /// The extent census scores whichever resolve arm supplied the mapping id,
 /// and only for slot 0.
 ///
-/// This is the arm-parity test. The census used to hang off the type-11
+/// This is the arm-parity test. The census used to hang off the IOSurface texture
 /// resolve alone, so on the x86/Vulkan pathway — where the workload takes
 /// the type-4 arm — every band read zero, which is indistinguishable from a
 /// guest that never states an extent. A type-4 attachment *is* its own

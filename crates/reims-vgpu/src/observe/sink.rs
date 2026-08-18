@@ -12,7 +12,7 @@
 //! | `OFF present_paint` | HostAction paint / Unchanged |
 //! | `OFF host_cache_store` | Discrete-GPU host surface cache write |
 //! | `OFF host_cache_evict` | Cache drop (unmap/delete) |
-//! | `OFF m2v_store` | metal2vulkan Store to type-11/type-4 mid (incl. is_front) |
+//! | `OFF m2v_store` | metal2vulkan Store to IOSurface texture/type-4 mid (incl. is_front) |
 //! | `OFF m2v_store_gva` | metal2vulkan Store to type-2/3 GVA |
 //! | `OFF m2v_load_seed` | Load seed path (host_cache vs missing) |
 //! | `OFF load_seed_black` | Deduplicated zero-RGB Load seed preserved by protocol provenance |

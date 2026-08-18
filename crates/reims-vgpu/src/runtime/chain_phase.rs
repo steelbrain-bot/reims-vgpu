@@ -142,7 +142,7 @@ pub enum Phase {
     /// path and this boot has none.
     PipelineXlate = 12,
     /// The CLEAR-seed Store loop at the head of `draw_vk`: one full-surface
-    /// solid buffer per colour attachment, a channel swap for a type-11 target,
+    /// solid buffer per colour attachment, a channel swap for an IOSurface texture target,
     /// and the write of it into the guest's pages.
     ///
     /// # Why the prep span is split at all
@@ -157,7 +157,7 @@ pub enum Phase {
     /// GVA fallback, taken before any GPU work so the set predates the submit.
     PrepPages = 14,
     /// The four target-identity rails: resident render chain, GVA deferred
-    /// store, type-11 surface resident, and the Load-from-target identity.
+    /// store, IOSurface texture surface resident, and the Load-from-target identity.
     ///
     /// # Why the assemble span is split at all
     ///

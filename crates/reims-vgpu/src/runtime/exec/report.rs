@@ -275,9 +275,9 @@ pub(super) const PASS_EXTENT_SLUGS: [&str; 7] = [
 /// Score slot 0's attachment, whichever resolve arm found it.
 ///
 /// Both arms of the colour-attachment resolve consume the same wire form and
-/// must be scored the same way; only the mapping id differs, because a type-11
+/// must be scored the same way; only the mapping id differs, because an IOSurface texture
 /// attachment resolves *to* an id and a type-4 attachment *is* one. This existed
-/// on the type-11 arm alone, and the consequence was not that the census
+/// on the IOSurface texture arm alone, and the consequence was not that the census
 /// undercounted — it was that the census read **zero** on the whole x86/Vulkan
 /// pathway, where the workload takes the type-4 arm. A pathway-shaped blind spot
 /// reads exactly like "the guest never states an extent", which is the opposite

@@ -141,7 +141,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 continue;
             }
             // Neither writer below takes a full-surface RGBA copy — the GVA
-            // landing repeats a single row and the type-11 landing builds its own
+            // landing repeats a single row and the IOSurface texture landing builds its own
             // image in the mapping's order — so the only reader of one is the
             // clear-only exit, and it is the one place that builds it.
             let solid = (i == 0).then_some((c.width, c.height, c.clear_color));
@@ -175,7 +175,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 )
                 .is_ok()
             } else if c.mapping_id() != 0 {
-                // Type-11 CLEAR. `write_bgra8` takes guest scanout order and
+                // IOSurface texture CLEAR. `write_bgra8` takes guest scanout order and
                 // converts to the mapping's native format per row; it handles a
                 // fragmented mapping too, staging native rows and landing them
                 // through `mapper::write_mapping_bytes`. (A comment here used to
@@ -186,9 +186,9 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 // word, so the exchange belongs to the word and doing it per
                 // texel cost an allocation and two passes over the whole
                 // surface. See `contract::pixel_format::solid_bgra8`.
-                let _span = StoreCostSpan::new("clear_seed_t11_us");
-                crate::runtime::drain::note_store_route("clear_seed_t11");
-                crate::runtime::drain::note_store_route_n("clear_seed_t11_kb", seed_kb);
+                let _span = StoreCostSpan::new("clear_seed_iosurface_us");
+                crate::runtime::drain::note_store_route("clear_seed_iosurface");
+                crate::runtime::drain::note_store_route_n("clear_seed_iosurface_kb", seed_kb);
                 let bgra = solid_bgra8(c.width, c.height, &c.clear_color);
                 let stride = c.width.saturating_mul(RGBA8_BPP);
                 mapping_write::write_bgra8(
@@ -249,13 +249,13 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Prep);
     // metal2vulkan path: load MTLB → AIR → SPIR-V → internal Vulkan engine offscreen.
     let mut draw_rgba: Option<Vec<u8>> = None;
-    // Physical order of `draw_rgba`. A type-11 composite Store renders into a
+    // Physical order of `draw_rgba`. An IOSurface texture composite Store renders into a
     // BGRA `Surface` resident, so its readback is already in guest scanout
     // order; the pooled and GVA targets stay RGBA. Carried instead of assumed —
     // which of those a record hit depends on whether an identity resolved, and
     // that is not a condition the Store block can re-derive.
     let mut draw_bgra = false;
-    // Type-11 composite Store: the frame was written into the mapping's guest
+    // IOSurface texture composite Store: the frame was written into the mapping's guest
     // pages by `store_surface_resident`, so this encode owes the caller nothing
     // further.
     let mut surface_store_armed = false;
@@ -288,19 +288,19 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             }
             Ok(M2vDrawSpan::ResidentGvaStore { identity }) => {
                 let _store_span = StoreCostSpan::new("gva_store_us");
-                note_type11_store_route("gva_flush");
+                note_iosurface_texture_store_route("gva_flush");
                 let landed = req.colors.first().is_some_and(|c0| {
                     crate::runtime::writeback_debt::arm_gva(state, host, req.task_id, c0, &identity)
                 });
                 if landed {
-                    note_type11_store_route("gva_resident_authoritative");
+                    note_iosurface_texture_store_route("gva_resident_authoritative");
                     gva_store_armed = true;
                 } else {
                     // The copying rail: read the resident the draw just
                     // rendered into and let the synchronous Store block below
                     // run exactly as it does for a Store that never skipped its
                     // readback. `read_resident_chain` fail-logs a lost resident.
-                    note_type11_store_route("gva_store_sync");
+                    note_iosurface_texture_store_route("gva_store_sync");
                     draw_rgba = read_resident_chain(req, &identity);
                     crate::observe::line(format!(
                         "linux_m2v_draw ok resident_gva_store pipe={} {}x{} gva={:#x} rgba={}",
@@ -313,13 +313,13 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 }
             }
             Ok(M2vDrawSpan::ResidentSurfaceStore { identity }) => {
-                // Into the same `t11_store_us` bucket the synchronous and `Owned`
+                // Into the same `iosurface_store_us` bucket the synchronous and `Owned`
                 // routes report, because the whole claim of this rail is that the
                 // bucket shrinks. Leaving it unbracketed would move the arm's cost
                 // into the residual `draw_phase` cannot attribute — which is
                 // exactly the 28 % hole `b872e43` had to instrument, and it would
                 // read as a win of the same size as the work it hid.
-                let _store_span = StoreCostSpan::new("t11_store_us");
+                let _store_span = StoreCostSpan::new("iosurface_store_us");
                 let c0_store = req.colors.first().map(|c0| {
                     (
                         c0.mapping_id(),
@@ -336,13 +336,13 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     .unwrap_or(false);
                 match (stored, c0_store) {
                     (true, Some((mid, cw, ch, fmt, texture_ref))) => {
-                        note_type11_store_route("surface_resident");
+                        note_iosurface_texture_store_route("surface_resident");
                         // The same two publishes the `Owned` rail performs at arm
                         // time, for the same reason: `dense_frame_seq` gates
                         // `present_unbacked`, and a route that skipped it would
                         // make that gate structurally dead.
                         {
-                            let _span = StoreCostSpan::new("t11_publish_us");
+                            let _span = StoreCostSpan::new("iosurface_publish_us");
                             publish_surface_store(state, host, mid, cw, ch, fmt);
                         }
                         record_materialized_store(state, req.task_id, texture_ref);
@@ -360,7 +360,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         // a Store that never skipped its readback. This pays the
                         // readback the rail exists to avoid, which is the point —
                         // the fallback is a cost, never a lost frame.
-                        note_type11_store_route("surface_resident_sync");
+                        note_iosurface_texture_store_route("surface_resident_sync");
                         draw_rgba = read_resident_chain(req, &identity);
                         crate::observe::line(format!(
                             "linux_m2v_draw ok resident_surface_store_sync_fallback pipe={} {}x{} mid={} rgba={}",
@@ -423,7 +423,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
         return (EncodeStatus::Ok, None);
     }
 
-    // Deferred type-11 composite Store: the window names the pinned resident and
+    // Deferred IOSurface texture composite Store: the window names the pinned resident and
     // the guest write lands on first access. `None`, not the frame, for the same
     // reason the `Owned` route returns `None` — `writeback_guest` is granted only
     // to the last record of a packet, so there is no record N+1 to seed.
@@ -431,7 +431,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
         return (EncodeStatus::Ok, None);
     }
 
-    // A type-11 composite Store reaches the guest only through the CPU writeback
+    // An IOSurface texture composite Store reaches the guest only through the CPU writeback
     // below. The DMA rail that used to short-circuit it here — a resident BGRA
     // target landed straight in the mapping's guest pages through an imported
     // host pointer — is gone, because a pointer the GPU can read is one it can
@@ -440,11 +440,11 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // Taken, not borrowed. Every exit from this block returns the frame, and
     // borrowing forced each of them to `rgba.clone()` a whole framebuffer — 8 MB
     // at 1080p, at the 28-111 Stores/s `store_routes` measures, on the drain
-    // worker `drain_duty` shows at duty 0.93-0.99. The deferred type-11 arm is
+    // worker `drain_duty` shows at duty 0.93-0.99. The deferred IOSurface texture arm is
     // the hot one and it cloned purely to hand back the buffer it already owned.
     if let Some(mut rgba) = draw_rgba.take() {
         // Intermediate multi-draw GVA records: return color0 for chaining without
-        // guest Store (archive store plan). Resident type-11 intermediates
+        // guest Store (archive store plan). Resident IOSurface texture intermediates
         // returned above without materializing CPU pixels.
         if !writeback_guest {
             // A chain value seeds the next record, and `DrawRequest` states a
@@ -458,7 +458,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             // and producing them is an O(w*h) pass over a whole framebuffer
             // readback — 2 073 600 pixels per Store at 1080p, at the 28-111
             // Stores/s `store_routes` measures under load. Computing it here
-            // paid that on every route, including the type-11 one whose only
+            // paid that on every route, including the IOSurface texture one whose only
             // consumer is a `observe::line` a normal boot discards. Each arm
             // now scans only when it is about to write a line.
             // A free function, not a closure over `rgba`: the deferred arm below
@@ -471,7 +471,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             }
             let ok = if c0.mapping_id() != 0 {
                 // Unconditional. This used to be `if
-                // type11_cpu_store_fallback_allowed(import_allowed)`, where
+                // iosurface_texture_cpu_store_fallback_allowed(import_allowed)`, where
                 // `import_allowed` asked whether the device could import a host
                 // pointer over the mapping's guest pages; when it could, the
                 // draw took the import rail and landing here was a fail-closed
@@ -479,12 +479,12 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 // invariant. There is no invariant left to preserve, and the
                 // else arm was a refusal for a rail that cannot be chosen.
                 {
-                    // Brackets the whole type-11 arm, into the same per-second
+                    // Brackets the whole IOSurface texture arm, into the same per-second
                     // window it divides into. `draw_phase` stops at the engine
                     // boundary, so this arm — the cache publish, the window arm,
                     // the guest scatter — is the bulk of the ~245 ms/s (28 % of
                     // `draw_us`) that no phase claimed.
-                    let _span = StoreCostSpan::new("t11_store_us");
+                    let _span = StoreCostSpan::new("iosurface_store_us");
                     // Every consumer below wants guest scanout order: the
                     // deferred window's `write_bgra8`, `surface_cache`, and the
                     // synchronous route. A `Surface` resident reads back in that
@@ -494,10 +494,10 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     // resolve rendered into a pooled RGBA target.
                     let mut bgra = rgba;
                     {
-                        let _span = StoreCostSpan::new("t11_convert_us");
+                        let _span = StoreCostSpan::new("iosurface_convert_us");
                         reorder_rb_in_place(&mut bgra, draw_bgra, true);
                     }
-                    note_type11_store_route("cpu_portability");
+                    note_iosurface_texture_store_route("cpu_portability");
                     // `write_bgra8`, not `write_rgba8_image_changed`: the frame is
                     // already in guest scanout order, and that entry point would
                     // have to exchange every row back to read it. Both share the
@@ -532,7 +532,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         // CPU-portability Store path: no mapping's
                         // `dense_frame_seq` would ever advance.
                         {
-                            let _span = StoreCostSpan::new("t11_publish_us");
+                            let _span = StoreCostSpan::new("iosurface_publish_us");
                             publish_surface_store(
                                 state,
                                 host,
@@ -543,7 +543,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                             );
                         }
                         if let Some(epoch) = sync_epoch {
-                            stamp_type11_resident(state, req, writeback_guest, epoch);
+                            stamp_iosurface_texture_resident(state, req, writeback_guest, epoch);
                         }
                         if crate::observe::draw_log_enabled() {
                             // Order-independent: both fields reduce over the three
@@ -589,7 +589,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 }
             } else if c0.target_gva() != 0 {
                 // What this Store would cost if it were served the way the
-                // type-11 surface Store is served.
+                // IOSurface texture surface Store is served.
                 //
                 // That rail lands its frame with `copy_target_to_guest_pages` —
                 // the GPU writes the guest's pages and no byte crosses host
@@ -782,7 +782,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
         // above because the four exits before this one return without it.
         //
         // The route is what says the deferral is worth having: read it against
-        // `clear_seed_gva` + `clear_seed_t11`, which count the seeds, and the
+        // `clear_seed_gva` + `clear_seed_iosurface`, which count the seeds, and the
         // difference is the full-surface images that used to be built and
         // dropped. A boot where the two are equal has nothing to save here.
         (
@@ -901,8 +901,8 @@ pub(super) enum SampledSourceRequest {
 /// |---|---|---|---|
 /// | 0 | 0 | guest linear | the texture's authoritative GVA (`host_gva_surfaces`) |
 /// | 1 | 0 | type-5 view | `plane_index << 32 \| mapping_id` |
-/// | 0 | 1 | type-11 host cache | `mapping_id` (`host_surfaces`) |
-/// | 1 | 1 | type-11 guest memo | `mapping_id` (`type11_memo`) |
+/// | 0 | 1 | IOSurface texture host cache | `mapping_id` (`host_surfaces`) |
+/// | 1 | 1 | IOSurface texture guest memo | `mapping_id` (`iosurface_texture_memo`) |
 ///
 /// GVAs are well under 2^62, so the unflagged row cannot collide with a flagged
 /// one. `generation` comes from
@@ -1018,19 +1018,19 @@ pub(super) fn sampled_texture_descriptor<M: HostMemory>(
 /// resolver the engine draw path uses. Distinct from [`load_sampled_rgba_static`],
 /// which always materializes RGBA8 bytes.
 ///
-/// # The type-11 ladder is measured, and every rung carries load
+/// # The IOSurface texture ladder is measured, and every rung carries load
 ///
-/// Four rungs offer the same type-11 surface, and the obvious reading is that
+/// Four rungs offer the same IOSurface texture surface, and the obvious reading is that
 /// three of them are redundant with the first. They are not. A DRIVEN x86/Vulkan
 /// session — four Safari page loads, each scrolled six pages and then dragged by
 /// its title bar — split as:
 ///
-///   t11rung_resident         31 916   93.0 %   engine image, taken zero-copy
-///   t11rung_host_cache        1 694    4.9 %   surface_cache's BGRA mirror
-///   t11rung_zero_copy           705    2.1 %   guest pages, gathered
-///   t11rung_guest_memo          150    0.4 %   guest pages, CPU convert
-///   t11rung_miss                  0             no source at all
-///   t11rung_resident_refused        2            guest overwrote the resident
+///   iosurfacerung_resident         31 916   93.0 %   engine image, taken zero-copy
+///   iosurfacerung_host_cache        1 694    4.9 %   surface_cache's BGRA mirror
+///   iosurfacerung_zero_copy           705    2.1 %   guest pages, gathered
+///   iosurfacerung_guest_memo          150    0.4 %   guest pages, CPU convert
+///   iosurfacerung_miss                  0             no source at all
+///   iosurfacerung_resident_refused        2            guest overwrote the resident
 ///
 /// Measure this on a DRIVEN session or not at all. The same census on an
 /// undriven boot to the desktop reported 12 / 5 / 8 / 0, which is far too quiet
@@ -1041,12 +1041,12 @@ pub(super) fn sampled_texture_descriptor<M: HostMemory>(
 /// WebGL aquarium, Wikipedia and apple.com, page scrolls and two title-bar
 /// drags — reproduced the shape on a smaller population:
 ///
-///   t11rung_resident         15 992   64.5 %
-///   t11rung_host_cache        5 777   23.3 %
-///   t11rung_zero_copy         3 036   12.2 %
-///   t11rung_guest_memo           62    0.25 %
-///   t11rung_miss                  0
-///   t11rung_resident_refused      0
+///   iosurfacerung_resident         15 992   64.5 %
+///   iosurfacerung_host_cache        5 777   23.3 %
+///   iosurfacerung_zero_copy         3 036   12.2 %
+///   iosurfacerung_guest_memo           62    0.25 %
+///   iosurfacerung_miss                  0
+///   iosurfacerung_resident_refused      0
 ///
 /// The order is the same and no rung is empty, so the two runs agree on which
 /// rungs carry load. The share does move with the drive — live 3D and a WebGL
@@ -1061,7 +1061,7 @@ pub(super) fn sampled_texture_descriptor<M: HostMemory>(
 ///   A render Store defers its writeback into guest pages, so between the Store
 ///   and its flush the cache is the only host-side copy that holds the new
 ///   pixels; the pages still hold the old ones. Its 1 694 binds are that window.
-/// - `t11rung_resident_refused` firing twice is not evidence the guest-write
+/// - `iosurfacerung_resident_refused` firing twice is not evidence the guest-write
 ///   witness is dead weight. Those are the binds where the guest CPU painted
 ///   over a surface the engine still claimed to hold, and the rung sits above
 ///   both page-reading rungs, so nothing below would have corrected it. Two
@@ -1115,9 +1115,10 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     //   type-5 RefTextureHandle — carries the type-4 surface id in its
     //                             descriptor, alongside the Metal texture view
     //   type-4 Surface         — the ref *is* the surface id
-    //   type-11 IOSurface      — resolves to the mapping id it was created on
+    //   IOSurface      — resolves to the mapping id it was created on
     //
-    // The retained resource already carries the total typed decode. Type 11 can
+    // The retained resource already carries the total typed decode. The
+    // IOSurface texture wire tag can
     // therefore fill the slot directly from that object rather than looking up
     // and decoding the same reference a second time. It returns `None` for every
     // other type, so it can only fill a slot the classification above left empty.
@@ -1150,12 +1151,12 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     }
     if !is_type5 {
         // Runs for the linear and unclassified types too, not only for the
-        // type-11 hit it can return: the resolve records the ref as live in the
+        // IOSurface texture hit it can return: the resolve records the ref as live in the
         // task's object set and reports a typed failure when the descriptor is
         // unreadable. Both are wanted for any ref a draw sampled.
         surface = surface.or_else(|| {
             resolved_resource.as_ref().and_then(|resource| {
-                objects::resolve_type11_resource(state, task_id, texture_ref, resource)
+                objects::resolve_iosurface_texture_resource(state, task_id, texture_ref, resource)
             })
         });
     }
@@ -1254,7 +1255,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 if resident_ready {
                     crate::runtime::drain::note_store_route(match resident_backing {
                         crate::backend::vulkan::engine::ResidentContentBacking::DeviceAllocation => {
-                            "t11sample_ready_device_allocation"
+                            "iosurfacesample_ready_device_allocation"
                         }
                         crate::backend::vulkan::engine::ResidentContentBacking::NotReady => {
                             unreachable!("resident_ready excludes this arm")
@@ -1271,21 +1272,21 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 let resident_epoch = resident_ready
                     .then(|| crate::backend::vulkan::engine::resident_content_epoch(&resident_id))
                     .flatten();
-                let resident_current =
-                    resident_ready && type11_resident_is_current(mapping_epoch, resident_epoch);
+                let resident_current = resident_ready
+                    && iosurface_texture_resident_is_current(mapping_epoch, resident_epoch);
 
                 // A bind whose view remaps channels cannot take a resident
                 // directly — the engine hands the swizzle to the image view and
                 // the direct bind has none — so it falls straight to a byte rung
                 // that can apply it.
                 if resident_current && !may_bind_resident {
-                    note_type11_sample_rung("t11rung_resident_swizzled");
+                    note_iosurface_texture_sample_rung("iosurfacerung_resident_swizzled");
                 } else if resident_current {
-                    note_type11_sample_rung("t11rung_resident");
+                    note_iosurface_texture_sample_rung("iosurfacerung_resident");
                     let format = resident_id.resident_format();
                     return Some((w, h, mid, SampledSourceRequest::Target(resident_id, format)));
                 } else if resident_ready {
-                    note_type11_sample_rung("t11rung_resident_refused");
+                    note_iosurface_texture_sample_rung("iosurfacerung_resident_refused");
                 }
 
                 // Falling through because the resident is *gone* is not the same
@@ -1303,9 +1304,9 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // is nothing left to merge from — the image is destroyed — yet
                 // it takes this fall-through with no merge and no refusal.
                 //
-                // For most surfaces that is correct: a type-11 surface's pages
+                // For most surfaces that is correct: an IOSurface texture surface's pages
                 // are its content, the flush rails write them, and reading them
-                // back is what `resolve_type11_load_seed` already calls "a cache
+                // back is what `resolve_iosurface_texture_load_seed` already calls "a cache
                 // miss is a reason to read them".
                 //
                 // # The unsound case this line was added to count is closed
@@ -1343,7 +1344,9 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     if let Some((cause, since_ms)) =
                         crate::backend::vulkan::engine::resident_absent_after_reclaim(&resident_id)
                     {
-                        crate::runtime::drain::note_store_route("t11sample_reclaimed_from_pages");
+                        crate::runtime::drain::note_store_route(
+                            "iosurfacesample_reclaimed_from_pages",
+                        );
                         // How long after we destroyed it the guest came back.
                         // This is the half `resident_resample_peak_ms` cannot
                         // see: that peak only observes residents that survived
@@ -1414,7 +1417,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                         key: (1u64 << 62) | mid as u64,
                         generation: host_gen,
                     });
-                    note_type11_sample_rung("t11rung_host_cache");
+                    note_iosurface_texture_sample_rung("iosurfacerung_host_cache");
                     // BGRA8 by construction — it is a type-4 scanout cache — but
                     // the *values* in it are the surface's, and this cache is
                     // filled from a writeback that reorders channels and decodes
@@ -1442,17 +1445,19 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // same pixels — so it stays quiet, like the type-2/3 rail's.
                 if let Some(src) = resolved_resource
                     .as_ref()
-                    .and_then(|_| try_type11_sample_zero_copy(state, host, mid, w, h))
+                    .and_then(|_| try_iosurface_texture_sample_zero_copy(state, host, mid, w, h))
                 {
-                    note_type11_sample_rung("t11rung_zero_copy");
+                    note_iosurface_texture_sample_rung("iosurfacerung_zero_copy");
                     return Some((w, h, mid, src));
                 }
                 // The memo skips the convert/alloc on unchanged content and
                 // returns a content identity so the engine skips re-hash+upload;
-                // its census (T11Memo hit / T11Guest fill) is emitted internally.
+                // its census (IOSurfaceMemo hit / IOSurfaceGuest fill) is emitted internally.
                 let memo_source = crate::runtime::draw::mapping_declared_format(state, mid, None);
-                if let Some((rgba, identity)) = load_type11_rgba_memoized(state, host, mid) {
-                    note_type11_sample_rung("t11rung_guest_memo");
+                if let Some((rgba, identity)) =
+                    load_iosurface_texture_rgba_memoized(state, host, mid)
+                {
+                    note_iosurface_texture_sample_rung("iosurfacerung_guest_memo");
                     return Some((
                         w,
                         h,
@@ -1473,7 +1478,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     // (mid, geometry) so a steady repeat stays at one line.
                     use std::collections::HashSet;
                     use std::sync::Mutex;
-                    note_type11_sample_rung("t11rung_miss");
+                    note_iosurface_texture_sample_rung("iosurfacerung_miss");
                     static SEEN: Mutex<Option<HashSet<(u32, u32, u32)>>> = Mutex::new(None);
                     let mut guard = SEEN.lock().unwrap_or_else(|e| e.into_inner());
                     if guard.get_or_insert_with(HashSet::new).insert((mid, w, h)) {
@@ -1813,7 +1818,7 @@ impl crate::observe::Decline for Type5ViewDecline {
     }
 }
 
-/// Why a type-11 attachment `LOAD` could not be seeded with the surface's own
+/// Why an IOSurface texture attachment `LOAD` could not be seeded with the surface's own
 /// prior contents.
 ///
 /// This is not a degradation the caller absorbs. `exec` resolves the pass load
@@ -1832,7 +1837,7 @@ impl crate::observe::Decline for Type5ViewDecline {
 /// existed: **121 distinct (mapping, geometry) wipes** in ~170 s, four of them at
 /// the full 1920x1080 composite extent, against 0 in the idle phase.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Type11SeedDecline {
+enum IOSurfaceSeedDecline {
     /// The cache holds no entry for this mapping id and the mapping's own pages
     /// could not be read at the requested extent either.
     ///
@@ -1852,11 +1857,11 @@ enum Type11SeedDecline {
     GeomMismatch { have_w: u32, have_h: u32 },
 }
 
-impl crate::observe::Decline for Type11SeedDecline {
+impl crate::observe::Decline for IOSurfaceSeedDecline {
     fn slug(&self) -> &'static str {
         match self {
-            Self::NoEntry => "type11_seed_cache_absent",
-            Self::GeomMismatch { .. } => "type11_seed_cache_geom",
+            Self::NoEntry => "iosurface_texture_seed_cache_absent",
+            Self::GeomMismatch { .. } => "iosurface_texture_seed_cache_geom",
         }
     }
 
@@ -1868,19 +1873,19 @@ impl crate::observe::Decline for Type11SeedDecline {
     }
 }
 
-/// Which rung of the type-11 `LOAD` seed ladder produced the attachment's prior
+/// Which rung of the IOSurface texture `LOAD` seed ladder produced the attachment's prior
 /// contents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Type11SeedRung {
+enum IOSurfaceSeedRung {
     /// The host render cache held this mapping at exactly this geometry.
     Cache,
     /// The cache missed and the surface's own guest IOSurface pages were read.
     GuestPages,
 }
 
-/// A type-11 attachment's prior contents, kept in the representation of the
+/// An IOSurface texture attachment's prior contents, kept in the representation of the
 /// freshest rung that supplied them.
-enum Type11LoadSeed {
+enum IOSurfaceLoadSeed {
     /// Host-owned bytes from the render cache, or the universal converted
     /// fallback when the native guest-page view cannot be described.
     Host(
@@ -1892,7 +1897,7 @@ enum Type11LoadSeed {
     Guest(crate::backend::vulkan::engine::GuestTargetSeed),
 }
 
-impl Type11SeedRung {
+impl IOSurfaceSeedRung {
     fn name(self) -> &'static str {
         match self {
             Self::Cache => "cache_hit",
@@ -1901,7 +1906,7 @@ impl Type11SeedRung {
     }
 }
 
-/// Report which way the type-11 `LOAD` seed branch went, once per
+/// Report which way the IOSurface texture `LOAD` seed branch went, once per
 /// `(mapping, requested geometry, outcome)`.
 ///
 /// Every outcome reports, because a zero on the miss arm has to be readable. A
@@ -1919,12 +1924,12 @@ impl Type11SeedRung {
 /// The mapping's own latched geometry and generation ride along on every arm:
 /// `want == mapgeom` is the condition under which the guest-pages rung can serve
 /// at all, so the pair says whether a miss was recoverable.
-fn note_type11_load_seed(
+fn note_iosurface_texture_load_seed(
     state: &DeviceState,
     mapping_id: u32,
     w: u32,
     h: u32,
-    served: Option<Type11SeedRung>,
+    served: Option<IOSurfaceSeedRung>,
 ) {
     let (map_w, map_h, map_gen) = state
         .mappings
@@ -1938,30 +1943,30 @@ fn note_type11_load_seed(
     // sits on a branch the census measures at 28-111 entries a second.
     let outcome_bits = match served {
         None => 0u64,
-        Some(Type11SeedRung::Cache) => 1,
-        Some(Type11SeedRung::GuestPages) => 2,
+        Some(IOSurfaceSeedRung::Cache) => 1,
+        Some(IOSurfaceSeedRung::GuestPages) => 2,
     };
     let disc =
         (u64::from(mapping_id) << 40) | (u64::from(w) << 20) | u64::from(h) | (outcome_bits << 62);
     if let Some(rung) = served {
-        if !crate::observe::first_sight("type11_load_seed_served", disc) {
+        if !crate::observe::first_sight("iosurface_texture_load_seed_served", disc) {
             return;
         }
         crate::observe::off(format!(
-            "type11_load_seed outcome={} mid={mapping_id} want={w}x{h} \
+            "iosurface_texture_load_seed outcome={} mid={mapping_id} want={w}x{h} \
              mapgeom={map_w}x{map_h} mapgen={map_gen} hostgen={host_gen}",
             rung.name()
         ));
         return;
     }
     let d = match have {
-        Some((have_w, have_h)) => Type11SeedDecline::GeomMismatch { have_w, have_h },
-        None => Type11SeedDecline::NoEntry,
+        Some((have_w, have_h)) => IOSurfaceSeedDecline::GeomMismatch { have_w, have_h },
+        None => IOSurfaceSeedDecline::NoEntry,
     };
     if !crate::observe::first_sight(crate::observe::Decline::slug(&d), disc) {
         return;
     }
-    crate::observe::Emit::decline("type11_load_seed", &d)
+    crate::observe::Emit::decline("iosurface_texture_load_seed", &d)
         .field("mid", mapping_id)
         .field("want", format!("{w}x{h}"))
         .field("mapgeom", format!("{map_w}x{map_h}"))
@@ -1970,7 +1975,7 @@ fn note_type11_load_seed(
         .fail();
 }
 
-/// The prior contents of a type-11 attachment under `MTL_LOAD_ACTION_LOAD`,
+/// The prior contents of an IOSurface texture attachment under `MTL_LOAD_ACTION_LOAD`,
 /// with the byte order they are in.
 ///
 /// Two rungs, in freshness order:
@@ -1981,7 +1986,7 @@ fn note_type11_load_seed(
 ///    the R/B exchange rides the engine's single copy into mapped staging rather
 ///    than materializing a converted frame here.
 /// 2. **The surface's own guest IOSurface pages.** The cache is an accelerator,
-///    not the surface. What a type-11 attachment *contains* is its pages, so a
+///    not the surface. What an IOSurface texture attachment *contains* is its pages, so a
 ///    cache miss is a reason to read them — not a reason to drop the guest's
 ///    LOAD. Without this rung the pass began with `LoadOp::CLEAR` against the
 ///    hardcoded `[0,0,0,0]` primary clear and the matching Store published that
@@ -1995,24 +2000,24 @@ fn note_type11_load_seed(
 /// before recording the copy. Any writeback debt is paid before the page view is
 /// built, so it observes this device's latest Store rather than pre-Store bytes.
 ///
-/// Type-11 `seed_color_load` falls through to the same reader via
+/// IOSurface texture `seed_color_load` falls through to the same reader via
 /// `load_sampled_rgba_static`.
 ///
 /// `None` means the guest's LOAD could not be honoured at all, and
-/// [`note_type11_load_seed`] has already said which check refused.
+/// [`note_iosurface_texture_load_seed`] has already said which check refused.
 /// Band how long after pressure recovery the guest wanted the resident again.
 /// The fixed reference interval keeps existing census buckets comparable; it
 /// has no role in deciding whether the resident remains alive.
 fn reclaimed_resample_band(since_ms: u64) -> &'static str {
     let cutoff = crate::backend::vulkan::engine::IDLE_MAINTENANCE_START_MS;
     if since_ms < cutoff {
-        "t11sample_reclaimed_within_1x_cutoff"
+        "iosurfacesample_reclaimed_within_1x_cutoff"
     } else if since_ms < cutoff * 2 {
-        "t11sample_reclaimed_within_2x_cutoff"
+        "iosurfacesample_reclaimed_within_2x_cutoff"
     } else if since_ms < cutoff * 4 {
-        "t11sample_reclaimed_within_4x_cutoff"
+        "iosurfacesample_reclaimed_within_4x_cutoff"
     } else {
-        "t11sample_reclaimed_past_4x_cutoff"
+        "iosurfacesample_reclaimed_past_4x_cutoff"
     }
 }
 
@@ -2036,7 +2041,7 @@ fn stage_uses_sampled_band(textures: &[TextureBind], samplers: &[SamplerBind]) -
     textures.iter().any(|t| t.texture_ref != 0) || samplers.iter().any(|s| s.sampler_ref != 0)
 }
 
-fn try_type11_target_guest_seed<M: HostMemory + HostOps>(
+fn try_iosurface_texture_target_guest_seed<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mapping_id: u32,
@@ -2045,7 +2050,7 @@ fn try_type11_target_guest_seed<M: HostMemory + HostOps>(
     target_format: ash::vk::Format,
 ) -> Option<crate::backend::vulkan::engine::GuestTargetSeed> {
     use crate::backend::vulkan::engine::{GuestRunSource, GuestTargetSeed};
-    use crate::runtime::mapping_write::type11_sample_window;
+    use crate::runtime::mapping_write::iosurface_texture_sample_window;
 
     if w == 0 || h == 0 || !mapper::ensure_resolved_for_scanout(state, host, mapping_id) {
         return None;
@@ -2066,7 +2071,7 @@ fn try_type11_target_guest_seed<M: HostMemory + HostOps>(
             mapping.format
         };
         let layout = pixel_format::store_texel_order(format)?;
-        let (base_off, bpr, _) = type11_sample_window(mapping, w, h, format)?;
+        let (base_off, bpr, _) = iosurface_texture_sample_window(mapping, w, h, format)?;
         (base_off, u64::from(bpr), layout)
     };
     let source_format = translate::pixel::vk_texel_layout(layout);
@@ -2090,14 +2095,14 @@ fn try_type11_target_guest_seed<M: HostMemory + HostOps>(
     })
 }
 
-fn resolve_type11_load_seed<M: HostMemory + HostOps>(
+fn resolve_iosurface_texture_load_seed<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mapping_id: u32,
     w: u32,
     h: u32,
     target_format: ash::vk::Format,
-) -> Option<Type11LoadSeed> {
+) -> Option<IOSurfaceLoadSeed> {
     use crate::backend::vulkan::engine::SeedOrder;
     // `clear_host_valid` removes this mapping's cache entry at the contract
     // boundary. A hit therefore already means no later guest validity
@@ -2105,25 +2110,30 @@ fn resolve_type11_load_seed<M: HostMemory + HostOps>(
     let cached = crate::runtime::surface_cache::get_shared(state, mapping_id, w, h);
     let served = if let Some(bgra) = cached {
         Some((
-            Type11LoadSeed::Host(bgra, SeedOrder::Bgra8),
-            Type11SeedRung::Cache,
+            IOSurfaceLoadSeed::Host(bgra, SeedOrder::Bgra8),
+            IOSurfaceSeedRung::Cache,
         ))
     } else {
-        try_type11_target_guest_seed(state, host, mapping_id, w, h, target_format)
-            .map(|seed| (Type11LoadSeed::Guest(seed), Type11SeedRung::GuestPages))
+        try_iosurface_texture_target_guest_seed(state, host, mapping_id, w, h, target_format)
+            .map(|seed| {
+                (
+                    IOSurfaceLoadSeed::Guest(seed),
+                    IOSurfaceSeedRung::GuestPages,
+                )
+            })
             .or_else(|| {
-                load_type11_mapping_rgba(state, host, mapping_id, None)
+                load_iosurface_mapping_rgba(state, host, mapping_id, None)
                     .map(|(_, _, r)| r)
                     .filter(|rgba| rgba.len() == (w as usize) * (h as usize) * 4)
                     .map(|rgba| {
                         (
-                            Type11LoadSeed::Host(std::sync::Arc::new(rgba), SeedOrder::Rgba8),
-                            Type11SeedRung::GuestPages,
+                            IOSurfaceLoadSeed::Host(std::sync::Arc::new(rgba), SeedOrder::Rgba8),
+                            IOSurfaceSeedRung::GuestPages,
                         )
                     })
             })
     };
-    note_type11_load_seed(state, mapping_id, w, h, served.as_ref().map(|s| s.1));
+    note_iosurface_texture_load_seed(state, mapping_id, w, h, served.as_ref().map(|s| s.1));
     served.map(|(seed, _)| seed)
 }
 
@@ -2830,7 +2840,7 @@ pub(super) fn strided_level_extent(
 /// window's own page list beside the runs, for the same reason
 /// [`task_gva_guest_run_window`] does.
 ///
-/// Shared by the type-11 attachment seed and the type-11/type-5 sampled rails,
+/// Shared by the IOSurface texture attachment seed and the IOSurface texture/type-5 sampled rails,
 /// which reach the same pages through different window math.
 ///
 /// # No settle, for the reason its linear twin already states
@@ -3667,7 +3677,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // writeback ahead of this gather, and a CPU fence wait buys an ordering that
     // holds without it.
     //
-    // `try_type11_sample_zero_copy` and `try_type5_sample_zero_copy` are the two
+    // `try_iosurface_texture_sample_zero_copy` and `try_type5_sample_zero_copy` are the two
     // rails that were already written this way, and this one is now consistent
     // with them.
     //
@@ -3834,21 +3844,21 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     ))
 }
 
-/// Zero-copy rail for type-11 mapping-backed sampled binds. Eligible when
+/// Zero-copy rail for IOSurface texture mapping-backed sampled binds. Eligible when
 /// the mapping's raw bytes sample byte-identically through a native UNORM
 /// image (BGRA8/RGBA8 families — the CPU loader's `texel_to_rgba8` is a
 /// byte pass-through/swizzle for exactly these) and the caller established
 /// the resident is not authoritative. Mirrors `paint_mapping`'s window math
-/// (`type11_sample_window`) and its flush-on-access rule; any gate miss
+/// (`iosurface_texture_sample_window`) and its flush-on-access rule; any gate miss
 /// falls back to the CPU byte path.
-pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
+pub(super) fn try_iosurface_texture_sample_zero_copy<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mid: u32,
     w: u32,
     h: u32,
 ) -> Option<SampledSourceRequest> {
-    use crate::runtime::mapping_write::type11_sample_window;
+    use crate::runtime::mapping_write::iosurface_texture_sample_window;
     if w == 0 || h == 0 {
         return None;
     }
@@ -3870,7 +3880,7 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
         let native = match translate::pixel::sampled_pixels(format) {
             Ok((layout, _decline, components)) if layout.is_four_byte_color() => {
                 if !pixel_format::swizzle_is_identity(&components) {
-                    crate::runtime::drain::note_store_route("zc_t11_needs_swizzle");
+                    crate::runtime::drain::note_store_route("zc_iosurface_needs_swizzle");
                     return None;
                 }
                 layout
@@ -3878,7 +3888,7 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
             _ => return None,
         };
         let sampled_vk_format = translate::pixel::translate(format).ok()?.vk;
-        let (base_off, bpr_u32, _span_end) = type11_sample_window(m, w, h, format)?;
+        let (base_off, bpr_u32, _span_end) = iosurface_texture_sample_window(m, w, h, format)?;
         (native, sampled_vk_format, base_off, bpr_u32 as u64)
     };
     // From the layout the translation chose, as the type-5 rail does, so the
@@ -3889,7 +3899,7 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
     let (source, identity, vouch) = witnessed_mapping_sampled_source(
         state,
         host,
-        crate::runtime::gather_witness::GatherRail::Type11,
+        crate::runtime::gather_witness::GatherRail::IOSurface,
         MappedSamplePlane {
             mapping_id: mid,
             base_off,
@@ -3916,7 +3926,7 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
 /// loader (`load_type5_view_rgba`) read + uploaded ~1.5 MB per plane per
 /// decoded frame (census `t5_view`). This gathers the plane's guest pages
 /// directly in the draw CB so the decoded frame never materializes CPU bytes.
-/// Mirrors `try_type11_sample_zero_copy`'s page coalescing over the plane
+/// Mirrors `try_iosurface_texture_sample_zero_copy`'s page coalescing over the plane
 /// window from `type5_sample_window` (which carries the wire plane index +
 /// biplanar offset); any gate miss falls back to the CPU byte path.
 pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
@@ -3946,7 +3956,7 @@ pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
         // never disagree with the image the engine creates.
         // A multiplanar view's planes are the video luma/chroma formats, all of
         // which sit identically on their Vulkan spellings. Required rather than
-        // assumed, for the reason the type-11 rail states.
+        // assumed, for the reason the IOSurface texture rail states.
         let (native, bpp) = match translate::pixel::sampled_pixels(view.pixel_format) {
             Ok((layout, _decline, components)) => {
                 if !pixel_format::swizzle_is_identity(&components) {
@@ -4546,22 +4556,22 @@ pub(super) fn sync_store_allowed_pages<M: HostMemory>(
     sync_store_target_pages(state, host, task_id, color0?)
 }
 
-/// Record the extent of type-11 LOADs served from a current resident.
+/// Record the extent of IOSurface texture LOADs served from a current resident.
 ///
 /// The mapping/resident epoch equality is the decision. These bands only price
 /// the saved guest-memory transfer and never feed behavior.
-fn note_type11_elision_extent(w: u32, h: u32) {
+fn note_iosurface_texture_elision_extent(w: u32, h: u32) {
     let texels = (w as u64).saturating_mul(h as u64);
     crate::runtime::drain::note_store_route(match texels {
-        0..=4_096 => "t11elide_le_64x64",
-        4_097..=65_536 => "t11elide_le_256x256",
-        65_537..=262_144 => "t11elide_le_512x512",
-        262_145..=1_048_576 => "t11elide_le_1024x1024",
-        _ => "t11elide_display",
+        0..=4_096 => "iosurfaceelide_le_64x64",
+        4_097..=65_536 => "iosurfaceelide_le_256x256",
+        65_537..=262_144 => "iosurfaceelide_le_512x512",
+        262_145..=1_048_576 => "iosurfaceelide_le_1024x1024",
+        _ => "iosurfaceelide_display",
     });
     // The bytes, so the buckets can be priced without assuming a distribution
     // inside each one. RGBA8 is the seed's own upload format.
-    crate::runtime::drain::note_store_route_n("t11elide_texels", texels);
+    crate::runtime::drain::note_store_route_n("iosurfaceelide_texels", texels);
 }
 
 /// Census: does this draw's scissor cover the target the pass declared, and if
@@ -4613,7 +4623,7 @@ fn note_type11_elision_extent(w: u32, h: u32) {
 /// Scored per round across the break, no counter in this crate separates a
 /// corrupt round from a clean one — `lin_rung_guest_blank`,
 /// `lin_rung_blank_with_host_entry`, `lin_rung_guest_memo`, `gvac_suspect`,
-/// `type11_seed_elided` and `draw_partial_load_from_target` are all simply
+/// `iosurface_texture_seed_elided` and `draw_partial_load_from_target` are all simply
 /// proportional to round length, and the set of decline names is identical on
 /// both sides. A defect that is stable on screen for minutes and leaves no
 /// trace in a census this large will not be found by adding another counter to
@@ -5042,7 +5052,7 @@ enum M2vDrawSpan {
     None,
     /// CPU-side pixels (readback path), in the order the engine reports.
     ///
-    /// The order is carried rather than normalized because a type-11 composite
+    /// The order is carried rather than normalized because an IOSurface texture composite
     /// Store's consumers — `surface_cache`, the deferred window, the guest-page
     /// writeback — all want guest scanout order, and a BGRA resident hands them
     /// exactly that. Normalizing to RGBA here would restate a whole framebuffer
@@ -5064,7 +5074,7 @@ enum M2vDrawSpan {
     ResidentGvaStore {
         identity: crate::backend::vulkan::engine::TargetIdentity,
     },
-    /// Type-11 composite Store executed into its registry resident with
+    /// IOSurface texture composite Store executed into its registry resident with
     /// `skip_readback`: the caller copies that image into the mapping's guest
     /// pages through [`crate::runtime::render_writeback`], which never brings
     /// the frame across host memory.
@@ -5079,7 +5089,7 @@ enum M2vDrawSpan {
     ///
     /// `identity` is the exact key this record handed `registry_ensure`, so the
     /// image the Store reads is the image the draw rendered into by
-    /// construction. The Store used to call `type11_store_identity` a second
+    /// construction. The Store used to call `iosurface_texture_store_identity` a second
     /// time instead, on the grounds that it is the same function that produced
     /// `DrawRequest::target_identity` — but it is not the same *value*. That
     /// identity carries `MappingEntry::map_generation`, the draw mutates
@@ -5146,7 +5156,7 @@ impl Drop for StoreCostSpan {
     }
 }
 
-/// Name which of the six routes a type-11 Store took: counted every time, and
+/// Name which of the six routes an IOSurface texture Store took: counted every time, and
 /// fail-logged once per route per process so a boot's route *set* is readable
 /// without the draw log.
 ///
@@ -5187,7 +5197,7 @@ impl Drop for StoreCostSpan {
 /// host GPU class to another, and this is exactly that boundary. Measuring these
 /// four needs a host whose quirk set turns deferral off, or one where the pin
 /// refuses — not another boot here.
-fn note_type11_store_route(route: &'static str) {
+fn note_iosurface_texture_store_route(route: &'static str) {
     use std::sync::Mutex;
     static SEEN: Mutex<Option<std::collections::BTreeSet<&'static str>>> = Mutex::new(None);
     crate::runtime::drain::note_store_route(route);
@@ -5197,7 +5207,7 @@ fn note_type11_store_route(route: &'static str) {
             return;
         }
     }
-    crate::observe::fail(format!("type11_store_route route={route}"));
+    crate::observe::fail(format!("iosurface_texture_store_route route={route}"));
 }
 
 /// Build the engine's secondary MRT attachments (slot 1..) from a draw's color
@@ -5301,7 +5311,7 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
             }
         };
         // Identity mirrors the primary namespaces: type-2/3 linear GVA, else
-        // type-11 surface.
+        // IOSurface texture surface.
         //
         // A secondary GVA is named by its own backing pages, exactly like color0
         // — the primary's generation describes a different address (a secondary
@@ -6710,7 +6720,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // name that new generation rather than the one paired with the retired
         // alias.
         let gva_guest_backing = gva_guest_target_backing(state, host, req);
-        let type11_resident_target = type11_store_identity(state, req, writeback_guest);
+        let iosurface_texture_resident_target =
+            iosurface_texture_store_identity(state, req, writeback_guest);
         if req.chain_from_resident && render_chain_identity(state, req).is_some() {
             // The serialized chain names the resident it intends to load;
             // existence and readiness are engine state and are validated
@@ -6732,28 +6743,30 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         );
         let mut gva_load_identity = resolved_gva_load.identity;
         let mut target_guest_seed = resolved_gva_load.guest_seed;
-        // A copied type-11 target may carry a LOAD only while the Store's
+        // A copied IOSurface texture target may carry a LOAD only while the Store's
         // resident epoch matches the mapping epoch. Both guest CPU writes and
         // device writes advance that epoch through their decoded validity or
         // write paths, so the comparison needs no memory-observation channel.
         if !chain_load_from_target {
-            if let Some((identity, mapping_epoch)) = type11_load_currency_query(state, req) {
+            if let Some((identity, mapping_epoch)) =
+                iosurface_texture_load_currency_query(state, req)
+            {
                 // Both arms counted, into the same one-second window as
                 // `drain_duty`. An elision count alone cannot tell "the seed was
                 // skipped" from "this record was never a candidate", and the
                 // ratio of the two is a within-boot number — the only kind that
                 // survives the 1.8x `us_per_draw` drift between boots on this rig.
-                let resident_current = type11_load_resident_is_current(|| {
+                let resident_current = iosurface_texture_load_resident_is_current(|| {
                     let resident_epoch =
                         crate::backend::vulkan::engine::resident_content_epoch(&identity);
-                    type11_resident_is_current(mapping_epoch, resident_epoch)
+                    iosurface_texture_resident_is_current(mapping_epoch, resident_epoch)
                 });
                 if resident_current {
                     chain_load_from_target = true;
-                    crate::runtime::drain::note_store_route("type11_seed_elided");
-                    note_type11_elision_extent(w, h);
+                    crate::runtime::drain::note_store_route("iosurface_texture_seed_elided");
+                    note_iosurface_texture_elision_extent(w, h);
                 } else {
-                    crate::runtime::drain::note_store_route("type11_seed_provided");
+                    crate::runtime::drain::note_store_route("iosurface_texture_seed_provided");
                 }
             }
         }
@@ -6834,11 +6847,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         // own the packet's final guest writeback. The Store-only
                         // identity below is deliberately narrower and would
                         // misclassify that record as a pooled RGBA target here.
-                        let target_format = type11_render_identity(state, req)
+                        let target_format = iosurface_texture_render_identity(state, req)
                             .as_ref()
                             .map(|identity| identity.resident_format())
                             .unwrap_or(translate::pixel::RESIDENT_RGBA_FORMAT);
-                        match resolve_type11_load_seed(
+                        match resolve_iosurface_texture_load_seed(
                             state,
                             host,
                             c0.mapping_id(),
@@ -6846,11 +6859,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             h,
                             target_format,
                         ) {
-                            Some(Type11LoadSeed::Host(bytes, order)) => {
+                            Some(IOSurfaceLoadSeed::Host(bytes, order)) => {
                                 target_rgba8 = Some(bytes);
                                 seed_order = order;
                             }
-                            Some(Type11LoadSeed::Guest(seed)) => target_guest_seed = Some(seed),
+                            Some(IOSurfaceLoadSeed::Guest(seed)) => target_guest_seed = Some(seed),
                             None => {}
                         }
                     }
@@ -7149,7 +7162,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 }
             }
         }
-        // A type-11 composite Store renders into its registry resident, and skips
+        // An IOSurface texture composite Store renders into its registry resident, and skips
         // its readback when the deferred rail can name that resident as the
         // window's frame instead of owning a CPU copy of it.
         //
@@ -7171,7 +7184,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         let mut surface_resident_store: Option<crate::backend::vulkan::engine::TargetIdentity> =
             None;
         if resources.target_identity.is_none() {
-            resources.target_identity = type11_resident_target.clone();
+            resources.target_identity = iosurface_texture_resident_target.clone();
         }
         // Whether the slot this record renders into is the one this rail would
         // pin, asked by comparing the two identities rather than by testing that
@@ -7181,14 +7194,14 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // `target_identity` already set when it is the last record of a resident
         // render-pass chain: the block above resolved `render_chain_identity` so
         // the record could take `LoadOp::LoadFromTarget`, and for `mapping_id != 0`
-        // that *is* the `surface_identity` `type11_store_identity` returns. An
+        // that *is* the `surface_identity` `iosurface_texture_store_identity` returns. An
         // `is_none()` test read that agreement as a conflict and kept the readback
         // for 100 % of the population. The GVA rail cannot collide — its identity
         // requires `mapping_id == 0` and this one requires `mapping_id != 0` — so a
         // genuine mismatch means another namespace owns the attachment and the
         // frame this rail would vouch for is not in the slot it would pin.
-        let renders_into_surface_identity =
-            type11_resident_target.is_some() && resources.target_identity == type11_resident_target;
+        let renders_into_surface_identity = iosurface_texture_resident_target.is_some()
+            && resources.target_identity == iosurface_texture_resident_target;
         // `!skip_readback` is implied — a set flag means one of the rails above
         // claimed this record, and each returns its own span before
         // `ResidentSurfaceStore` is reached, so a record that armed here as well
@@ -7200,12 +7213,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // this same value, and which is what `registry_ensure` will be
             // handed. Taken from here rather than unwrapped from the `Option`
             // above so the span cannot name a slot the draw did not register.
-            surface_resident_store = type11_resident_target.clone();
+            surface_resident_store = iosurface_texture_resident_target.clone();
         }
         // A first-failure classifier for a composite Store that still reads
         // back used to sit here. Its outer gate was never once true — none of
         // its four counters, nor its `else` arm, appears anywhere in the
-        // always-on log across every boot it holds. Every type-11 Store either
+        // always-on log across every boot it holds. Every IOSurface texture Store either
         // skips its readback or is not a writeback Store.
         if chain_load_from_target {
             // The GVA Load elision validated its own identity and is the only
@@ -7231,7 +7244,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             resources.load_from_target = true;
             resources.target_rgba8 = None;
         }
-        // Type-11 Load used to have a GPU rail here — ~170 lines of front-frame
+        // IOSurface texture Load used to have a GPU rail here — ~170 lines of front-frame
         // retention policy resolving which resident image held the frame the
         // guest computes its damage against. It was reachable only under
         // `try_import`. A shared resident now keeps the guest allocation as
@@ -7892,7 +7905,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
 /// Engine-resident identity for a color0 render-pass chain.
 ///
 /// This identity lives only from the first serialized record through its final
-/// Store. Type-11 targets use their current protocol mapping identity; linear
+/// Store. IOSurface texture targets use their current protocol mapping identity; linear
 /// type-2/3 targets use the GVA identity below. Unlike deferred writeback, this
 /// lifetime is safe on portability-subset devices because the final record
 /// materializes guest bytes before the packet completes.
@@ -8035,7 +8048,7 @@ fn color_target_identity<M: HostMemory + HostOps>(
     })
 }
 
-/// The registry resident a type-11 composite Store renders into, if this record
+/// The registry resident an IOSurface texture composite Store renders into, if this record
 /// is one.
 ///
 /// Unlike the GVA rail this is **not** a `skip_readback` deferral: a composite
@@ -8054,7 +8067,7 @@ fn color_target_identity<M: HostMemory + HostOps>(
 /// `chain_from_resident` is **not** a refusal, and used to be. The last record of
 /// a resident render-pass chain is both the chain's consumer and the packet's
 /// guest-visible Store, and refusing it here cost the whole composite readback
-/// population: `t11_keep_chain_from_resident` measured equal to
+/// population: `iosurface_keep_chain_from_resident` measured equal to
 /// `surface_deferred` in all twelve windows of one boot, 112-132 Stores a second
 /// at 366-372 MB/s, with every other keep-reason at zero. Nothing about the chain
 /// changes which slot this record renders into — `retarget_render_pass_draw`
@@ -8063,7 +8076,7 @@ fn color_target_identity<M: HostMemory + HostOps>(
 /// [`render_chain_identity`] — and the intermediates already render into that
 /// resident under `skip_readback` with `LoadOp::LoadFromTarget`. The last record
 /// differs only in what happens *after* the draw.
-pub(super) fn type11_store_identity(
+pub(super) fn iosurface_texture_store_identity(
     state: &DeviceState,
     req: &DrawEncodeRequest,
     writeback_guest: bool,
@@ -8071,11 +8084,11 @@ pub(super) fn type11_store_identity(
     if !writeback_guest {
         return None;
     }
-    type11_render_identity(state, req)
+    iosurface_texture_render_identity(state, req)
 }
 
-/// The registry resident this record renders its type-11 color0 *into*, whatever
-/// its role in the packet — the strict superset of [`type11_store_identity`],
+/// The registry resident this record renders its IOSurface texture color0 *into*, whatever
+/// its role in the packet — the strict superset of [`iosurface_texture_store_identity`],
 /// which is this same slot restricted to the record that also stores it for the
 /// guest.
 ///
@@ -8086,10 +8099,10 @@ pub(super) fn type11_store_identity(
 /// Conflating them cost the whole seed elision on multi-record packets: record 1
 /// of a chain has `writeback_guest == false`, so the currency check keyed on the
 /// Store identity never ran for it, and its LOAD fell through to
-/// `resolve_type11_load_seed` — which, with the host cache ceded to the resident
+/// `resolve_iosurface_texture_load_seed` — which, with the host cache ceded to the resident
 /// rail, reads the mapping's guest pages and therefore lands the very window the
 /// rail armed. One boot measured that loop directly: `surface_flush /
-/// surface_resident` = 1369/1373, one flush per arm, with `type11_load_seed`
+/// surface_resident` = 1369/1373, one flush per arm, with `iosurface_texture_load_seed`
 /// reporting `outcome=guest_pages` 110 times against 17 `cache_hit` and
 /// `hostgen=0` on every one.
 ///
@@ -8098,7 +8111,7 @@ pub(super) fn type11_store_identity(
 /// `!writeback_guest` intermediate, and the composite-Store rail claims it for the
 /// last record. So the condition here is the same one those blocks share, asked
 /// once.
-fn type11_render_identity(
+fn iosurface_texture_render_identity(
     state: &DeviceState,
     req: &DrawEncodeRequest,
 ) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
@@ -8175,11 +8188,11 @@ pub(super) fn gva_guest_target_backing<H: HostMemory + HostOps>(
 /// it must be a LOAD, and no explicit seed may already have been selected for
 /// it by RT provenance. Separate from the currency question so the two counters
 /// on the branch below divide candidates, not all draws.
-fn type11_load_is_a_seed_candidate(c0: &ColorRtRequest) -> bool {
+fn iosurface_texture_load_is_a_seed_candidate(c0: &ColorRtRequest) -> bool {
     c0.load_action == MTL_LOAD_ACTION_LOAD && c0.target_seed_rgba.is_none()
 }
 
-/// The `(resident, mapping epoch)` pair a record's type-11 LOAD has to compare to
+/// The `(resident, mapping epoch)` pair a record's IOSurface texture LOAD has to compare to
 /// decide whether the image it is about to render into already holds the seed —
 /// or `None` when this record's LOAD is not one a resident could serve at all.
 ///
@@ -8193,15 +8206,15 @@ fn type11_load_is_a_seed_candidate(c0: &ColorRtRequest) -> bool {
 /// a rescheduling with a GPU round trip added: `surface_flush / surface_resident`
 /// = 1369/1373 on one boot. Structure rather than a test, because a unit test on
 /// the resolver passes whatever the call site then decides to pass it.
-pub(super) fn type11_load_currency_query(
+pub(super) fn iosurface_texture_load_currency_query(
     state: &DeviceState,
     req: &DrawEncodeRequest,
 ) -> Option<(crate::backend::vulkan::engine::TargetIdentity, Option<u32>)> {
     let c0 = req.colors.first()?;
-    if !type11_load_is_a_seed_candidate(c0) {
+    if !iosurface_texture_load_is_a_seed_candidate(c0) {
         return None;
     }
-    let identity = type11_render_identity(state, req)?;
+    let identity = iosurface_texture_render_identity(state, req)?;
     let mapping_epoch = state
         .mappings
         .get(&c0.mapping_id())
@@ -8209,8 +8222,8 @@ pub(super) fn type11_load_currency_query(
     Some((identity, mapping_epoch))
 }
 
-/// Count which contract-owned rung served a type-11 sampled bind.
-fn note_type11_sample_rung(rung: &'static str) {
+/// Count which contract-owned rung served an IOSurface texture sampled bind.
+fn note_iosurface_texture_sample_rung(rung: &'static str) {
     crate::runtime::drain::note_store_route(rung);
 }
 
@@ -8221,31 +8234,34 @@ fn note_type11_sample_rung(rung: &'static str) {
 /// mapping has no entry" and "this image was never stamped" as agreement and
 /// load undefined memory as though it were the guest's prior frame. That is
 /// precisely the black-layer class. Absence on either side is a refusal.
-fn type11_resident_is_current(mapping_epoch: Option<u32>, resident_epoch: Option<u32>) -> bool {
+fn iosurface_texture_resident_is_current(
+    mapping_epoch: Option<u32>,
+    resident_epoch: Option<u32>,
+) -> bool {
     mapping_epoch.is_some() && mapping_epoch == resident_epoch
 }
 
-fn type11_load_resident_is_current(copied_currency: impl FnOnce() -> bool) -> bool {
+fn iosurface_texture_load_resident_is_current(copied_currency: impl FnOnce() -> bool) -> bool {
     copied_currency()
 }
 
 /// Record that the resident this Store rendered into holds the mapping's
 /// content as of `epoch`, so the surface's next LOAD can skip its CPU seed.
 ///
-/// Keyed through [`type11_store_identity`] — the same call the draw's
+/// Keyed through [`iosurface_texture_store_identity`] — the same call the draw's
 /// `target_identity` came from — so the slot stamped is the slot rendered into.
 /// A miss is expected and silent: the identity resolves to `None` when this
 /// record never took the resident path, and `stamp_resident_content_epoch`
 /// refuses a slot that was evicted between the draw and here. Both leave the
 /// stamp absent, which costs a seed and never a wrong frame.
 ///
-fn stamp_type11_resident(
+fn stamp_iosurface_texture_resident(
     state: &mut DeviceState,
     req: &DrawEncodeRequest,
     writeback_guest: bool,
     epoch: u32,
 ) {
-    if let Some(identity) = type11_store_identity(state, req, writeback_guest) {
+    if let Some(identity) = iosurface_texture_store_identity(state, req, writeback_guest) {
         crate::backend::vulkan::engine::stamp_resident_content_epoch(&identity, epoch);
         // Both callers reach here only on a route that has already put these
         // pixels outside the image — the synchronous one through `write_bgra8`
@@ -8514,7 +8530,7 @@ pub(crate) fn read_resident_chain(
         }
     }
 }
-/// Land a type-11 render Store's frame in the guest's pages, from the resident
+/// Land an IOSurface texture render Store's frame in the guest's pages, from the resident
 /// the draw just rendered into.
 ///
 /// The Store never reads the frame back off the GPU: the copy's destination is
@@ -8531,7 +8547,7 @@ pub(crate) fn read_resident_chain(
 /// [`M2vDrawSpan::ResidentSurfaceStore`], so the image read here is the image
 /// the draw rendered into by construction.
 ///
-/// It used to be [`type11_store_identity`] called again here, on the argument
+/// It used to be [`iosurface_texture_store_identity`] called again here, on the argument
 /// that this is the same function that produced the draw's `target_identity`.
 /// The same function is not the same value: that identity carries
 /// `MappingEntry::map_generation`, and the draw mutates `DeviceState` between
@@ -9094,16 +9110,16 @@ mod vulkan_split_tests {
 
     #[test]
     fn an_unstamped_resident_never_matches_a_mapping_with_no_epoch() {
-        assert!(!type11_resident_is_current(None, None));
-        assert!(!type11_resident_is_current(None, Some(0)));
-        assert!(!type11_resident_is_current(Some(7), None));
+        assert!(!iosurface_texture_resident_is_current(None, None));
+        assert!(!iosurface_texture_resident_is_current(None, Some(0)));
+        assert!(!iosurface_texture_resident_is_current(Some(7), None));
     }
 
     #[test]
     fn an_engine_owned_load_uses_copy_currency() {
         for copied_answer in [false, true] {
             assert_eq!(
-                type11_load_resident_is_current(|| copied_answer),
+                iosurface_texture_load_resident_is_current(|| copied_answer),
                 copied_answer
             );
         }
@@ -9114,8 +9130,8 @@ mod vulkan_split_tests {
     /// current against a resident explicitly stamped with 0.
     #[test]
     fn epoch_zero_is_current_only_against_an_explicit_stamp() {
-        assert!(type11_resident_is_current(Some(0), Some(0)));
-        assert!(!type11_resident_is_current(Some(0), None));
+        assert!(iosurface_texture_resident_is_current(Some(0), Some(0)));
+        assert!(!iosurface_texture_resident_is_current(Some(0), None));
     }
 
     /// The elision is exact equality, not "at least as new". A resident stamped
@@ -9124,9 +9140,9 @@ mod vulkan_split_tests {
     /// fall back to the CPU seed.
     #[test]
     fn any_epoch_movement_since_the_stamp_refuses_the_elision() {
-        assert!(type11_resident_is_current(Some(4), Some(4)));
-        assert!(!type11_resident_is_current(Some(5), Some(4)));
-        assert!(!type11_resident_is_current(Some(4), Some(5)));
+        assert!(iosurface_texture_resident_is_current(Some(4), Some(4)));
+        assert!(!iosurface_texture_resident_is_current(Some(5), Some(4)));
+        assert!(!iosurface_texture_resident_is_current(Some(4), Some(5)));
     }
 
     /// Every guest-page writer in this crate goes through
@@ -9149,7 +9165,7 @@ mod vulkan_split_tests {
         );
     }
 
-    /// The deferred type-11 publish writes only the host shadow — no guest
+    /// The deferred IOSurface texture publish writes only the host shadow — no guest
     /// page, so `mark_mapping_written` never runs — and it is the one writer
     /// that would otherwise change the mapping's pixels invisibly to the epoch.
     /// `surface_cache` holds one entry per mapping, so a sibling Store at
@@ -9198,10 +9214,10 @@ mod vulkan_split_tests {
             load_action: MTL_LOAD_ACTION_LOAD,
             ..Default::default()
         };
-        assert!(type11_load_is_a_seed_candidate(&c0));
+        assert!(iosurface_texture_load_is_a_seed_candidate(&c0));
 
         c0.target_seed_rgba = Some(vec![0u8; 4]);
-        assert!(!type11_load_is_a_seed_candidate(&c0));
+        assert!(!iosurface_texture_load_is_a_seed_candidate(&c0));
     }
 
     /// A CLEAR is not a LOAD. Eliding a seed there would replace the guest's
@@ -9212,7 +9228,7 @@ mod vulkan_split_tests {
             load_action: MTL_LOAD_ACTION_CLEAR,
             ..Default::default()
         };
-        assert!(!type11_load_is_a_seed_candidate(&c0));
+        assert!(!iosurface_texture_load_is_a_seed_candidate(&c0));
     }
 
     /// A stage that binds a sampler and no texture is still in the sampled band,
@@ -9255,7 +9271,7 @@ mod vulkan_split_tests {
     }
 
     #[test]
-    fn a_type11_load_seed_falls_back_to_the_surfaces_own_guest_pages() {
+    fn a_iosurface_texture_load_seed_falls_back_to_the_surfaces_own_guest_pages() {
         use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
         use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
         use crate::runtime::mapping_write::write_bgra8;
@@ -9299,7 +9315,7 @@ mod vulkan_split_tests {
         // refused rather than showing a bare `None`: every rung on this ladder
         // declines by name, and the panic message is where that is worth reading.
         let cap = crate::observe::sink::FailCapture::start();
-        let served = resolve_type11_load_seed(
+        let served = resolve_iosurface_texture_load_seed(
             &mut state,
             &mut host,
             mid,
@@ -9314,11 +9330,11 @@ mod vulkan_split_tests {
             )
         });
         drop(cap);
-        let Type11LoadSeed::Guest(seed) = seed else {
+        let IOSurfaceLoadSeed::Guest(seed) = seed else {
             panic!("a cold cache should preserve the native guest-page source");
         };
         assert_eq!(seed.format, ash::vk::Format::B8G8R8A8_UNORM);
-        let (_, bpr, _) = crate::runtime::mapping_write::type11_sample_window(
+        let (_, bpr, _) = crate::runtime::mapping_write::iosurface_texture_sample_window(
             &state.mappings[&mid],
             w,
             h,
@@ -9341,7 +9357,7 @@ mod vulkan_split_tests {
             px.copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xFF]);
         }
         crate::runtime::surface_cache::store(&mut state, mid, w, h, cached);
-        let Type11LoadSeed::Host(bytes, order) = resolve_type11_load_seed(
+        let IOSurfaceLoadSeed::Host(bytes, order) = resolve_iosurface_texture_load_seed(
             &mut state,
             &mut host,
             mid,
@@ -9359,7 +9375,7 @@ mod vulkan_split_tests {
         // and refusing is right: a seed of the wrong length is rejected by the
         // engine anyway, and the decline names both geometries.
         assert!(
-            resolve_type11_load_seed(
+            resolve_iosurface_texture_load_seed(
                 &mut state,
                 &mut host,
                 mid,
@@ -9372,7 +9388,7 @@ mod vulkan_split_tests {
         );
     }
 
-    /// The type-11 `LOAD` seed branch reports both ways, and the miss arm names
+    /// The IOSurface texture `LOAD` seed branch reports both ways, and the miss arm names
     /// the geometry the cache actually holds.
     ///
     /// The miss is a whole-layer loss, not a degradation: with no seed the engine
@@ -9389,7 +9405,7 @@ mod vulkan_split_tests {
     /// `first_sight` latches per `(reason, discriminant)` for the life of the
     /// process and never resets.
     #[test]
-    fn the_type11_load_seed_branch_reports_both_ways() {
+    fn the_iosurface_texture_load_seed_branch_reports_both_ways() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         let mid = 909u32;
         state.map_surface(mid);
@@ -9409,14 +9425,14 @@ mod vulkan_split_tests {
             let hits: Vec<String> = cap
                 .lines()
                 .into_iter()
-                .filter(|l| l.contains("type11_load_seed"))
+                .filter(|l| l.contains("iosurface_texture_load_seed"))
                 .collect();
             assert_eq!(hits.len(), 1, "expected exactly one line, got {hits:?}");
             hits.into_iter().next().unwrap_or_default()
         };
 
         let cap = crate::observe::sink::FailCapture::start();
-        note_type11_load_seed(&state, mid, 8, 4, Some(Type11SeedRung::Cache));
+        note_iosurface_texture_load_seed(&state, mid, 8, 4, Some(IOSurfaceSeedRung::Cache));
         let hit = only(&cap);
         assert!(hit.contains("outcome=cache_hit"), "{hit}");
         assert!(hit.contains("mapgeom=8x4"), "{hit}");
@@ -9427,7 +9443,7 @@ mod vulkan_split_tests {
         // rate is the only thing that prices the guest-pages fallback, and fusing
         // it would make the fix unmeasurable the moment it worked.
         let cap = crate::observe::sink::FailCapture::resume();
-        note_type11_load_seed(&state, mid, 4, 4, Some(Type11SeedRung::GuestPages));
+        note_iosurface_texture_load_seed(&state, mid, 4, 4, Some(IOSurfaceSeedRung::GuestPages));
         let pages = only(&cap);
         assert!(pages.contains("outcome=guest_pages"), "{pages}");
         drop(cap);
@@ -9436,19 +9452,22 @@ mod vulkan_split_tests {
         // geometry is the load-bearing field, since it says a Store at another
         // extent orphaned every window still living at this one.
         let cap = crate::observe::sink::FailCapture::resume();
-        note_type11_load_seed(&state, mid, 8, 1, None);
+        note_iosurface_texture_load_seed(&state, mid, 8, 1, None);
         let geom = only(&cap);
-        assert!(geom.contains("reason=type11_seed_cache_geom"), "{geom}");
+        assert!(
+            geom.contains("reason=iosurface_texture_seed_cache_geom"),
+            "{geom}"
+        );
         assert!(geom.contains("have=8x4"), "{geom}");
         assert!(geom.contains("want=8x1"), "{geom}");
         drop(cap);
 
         // A mapping the cache has never held reports absence, not a geometry.
         let cap = crate::observe::sink::FailCapture::resume();
-        note_type11_load_seed(&state, 910, 8, 4, None);
+        note_iosurface_texture_load_seed(&state, 910, 8, 4, None);
         let absent = only(&cap);
         assert!(
-            absent.contains("reason=type11_seed_cache_absent"),
+            absent.contains("reason=iosurface_texture_seed_cache_absent"),
             "{absent}"
         );
         assert!(!absent.contains("have="), "{absent}");
@@ -9460,10 +9479,10 @@ mod vulkan_split_tests {
         // ones made are exactly what this last one asserts, and `start` would
         // clear them and see all four lines again.
         let cap = crate::observe::sink::FailCapture::resume();
-        note_type11_load_seed(&state, mid, 8, 4, Some(Type11SeedRung::Cache));
-        note_type11_load_seed(&state, mid, 4, 4, Some(Type11SeedRung::GuestPages));
-        note_type11_load_seed(&state, mid, 8, 1, None);
-        note_type11_load_seed(&state, 910, 8, 4, None);
+        note_iosurface_texture_load_seed(&state, mid, 8, 4, Some(IOSurfaceSeedRung::Cache));
+        note_iosurface_texture_load_seed(&state, mid, 4, 4, Some(IOSurfaceSeedRung::GuestPages));
+        note_iosurface_texture_load_seed(&state, mid, 8, 1, None);
+        note_iosurface_texture_load_seed(&state, 910, 8, 4, None);
         assert!(
             cap.lines().is_empty(),
             "second sighting must be latched: {:?}",
@@ -9567,17 +9586,17 @@ mod vulkan_split_tests {
 
         // Routes distinct from every product route so this test cannot be
         // satisfied by a line some other case in this binary emitted.
-        note_type11_store_route("test_route_a");
-        note_type11_store_route("test_route_a");
-        note_type11_store_route("test_route_a");
-        note_type11_store_route("test_route_b");
+        note_iosurface_texture_store_route("test_route_a");
+        note_iosurface_texture_store_route("test_route_a");
+        note_iosurface_texture_store_route("test_route_a");
+        note_iosurface_texture_store_route("test_route_b");
 
         let whole = std::fs::read_to_string(path).expect("fail log");
         let appended = &whole[mark.min(whole.len())..];
         let count = |route: &str| {
             appended
                 .lines()
-                .filter(|l| l.contains(&format!("type11_store_route route={route}")))
+                .filter(|l| l.contains(&format!("iosurface_texture_store_route route={route}")))
                 .count()
         };
         assert_eq!(count("test_route_a"), 1, "three calls, one line");

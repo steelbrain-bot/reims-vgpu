@@ -1384,7 +1384,7 @@ fn list_entry_and_buffer() {
 }
 
 #[test]
-fn iosurface_type11() {
+fn iosurface_to_iosurface() {
     let mut b = [0u8; 0x20];
     b[0] = 2;
     b[0x16] = 0x50;

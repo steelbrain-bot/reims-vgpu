@@ -1,4 +1,4 @@
-//! Object-list lookup, type-11 registration, and x86 type-4 surface backing.
+//! Object-list lookup, IOSurface texture registration, and x86 type-4 surface backing.
 //!
 //! Live layout (reims-vgpu-resource-format): entry `ref` is at
 //! `(object_list_pfn << PAGE_SHIFT) + ref * 12` in the task GVA space —
@@ -32,28 +32,28 @@ use std::sync::Arc;
 
 pub mod slot_recheck;
 
-/// Fail-visible, de-duplicated per `(task_id, ref)`, for the type-11 resolve
-/// blind spot: an object ref that IS a type-11 IOSurface texture but whose
+/// Fail-visible, de-duplicated per `(task_id, ref)`, for the IOSurface texture resolve
+/// blind spot: an object ref that IS an IOSurface-backed texture but whose
 /// descriptor cannot be read, cannot register a host texture, or carries
 /// `mapping_id==0` used to collapse into a bare `None` → a coarse
-/// `MissingTexture` at the draw site with no reason. `resolve_type11_ref` runs
+/// `MissingTexture` at the draw site with no reason. `resolve_iosurface_texture_ref` runs
 /// per-draw per-ref (very hot), so a bare fail line would flood; the latch logs
 /// each `(task,ref,reason)` once and is cleared when the ref resolves
-/// ([`clear_type11_fail`]). Only genuine failures for a *confirmed IOSurface*
+/// ([`clear_iosurface_texture_fail`]). Only genuine failures for a *confirmed IOSurface*
 /// ref are routed here — the legitimate "ref is a different object type" and
 /// unbound-slot returns stay silent. Runs on the drain worker (off the QEMU main
 /// core).
-type Type11Failure = (u32, u32, &'static str);
-type Type11FailureSet = std::collections::HashSet<Type11Failure>;
+type IOSurfaceTextureFailure = (u32, u32, &'static str);
+type IOSurfaceTextureFailureSet = std::collections::HashSet<IOSurfaceTextureFailure>;
 
-fn type11_fail_latch() -> &'static std::sync::Mutex<Type11FailureSet> {
+fn iosurface_texture_fail_latch() -> &'static std::sync::Mutex<IOSurfaceTextureFailureSet> {
     use std::sync::{Mutex, OnceLock};
-    static SEEN: OnceLock<Mutex<Type11FailureSet>> = OnceLock::new();
-    SEEN.get_or_init(|| Mutex::new(Type11FailureSet::new()))
+    static SEEN: OnceLock<Mutex<IOSurfaceTextureFailureSet>> = OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(IOSurfaceTextureFailureSet::new()))
 }
 
-fn note_type11_fail(task_id: u32, ref_: u32, reason: &'static str, detail: String) {
-    let mut guard = type11_fail_latch()
+fn note_iosurface_texture_fail(task_id: u32, ref_: u32, reason: &'static str, detail: String) {
+    let mut guard = iosurface_texture_fail_latch()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     if guard.insert((task_id, ref_, reason)) {
@@ -63,8 +63,8 @@ fn note_type11_fail(task_id: u32, ref_: u32, reason: &'static str, detail: Strin
 
 /// Re-arm the fail latch for a ref that just resolved, so a later genuine
 /// failure on the same ref is logged again (catches flapping).
-fn clear_type11_fail(task_id: u32, ref_: u32) {
-    let mut guard = type11_fail_latch()
+fn clear_iosurface_texture_fail(task_id: u32, ref_: u32) {
+    let mut guard = iosurface_texture_fail_latch()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     guard.retain(|(t, r, _)| !(*t == task_id && *r == ref_));
@@ -672,7 +672,7 @@ pub fn iosurface_pixel_format_to_mtl(pixel_format: u32) -> u16 {
     // "already an MTLPixelFormat ordinal". That decided which *encoding* a field
     // was in from the field's magnitude, and the caller already knows: every
     // caller here passes a type-4 `pixelFormat` (+0x0c), which is an IOSurface
-    // OSType — a four-character code, so never below 0x20202020. The type-11 and
+    // OSType — a four-character code, so never below 0x20202020. The IOSurface texture and
     // type-5 rails carry their MTL ordinal in a `u16` field of their own and do
     // not route through this function.
     //
@@ -740,7 +740,7 @@ fn decode_type4_plane(desc: &[u8], plane_index: usize) -> Option<Type4Plane> {
 /// surface identity can classify a brand-new buffer before its first draw.
 ///
 /// Narrow: this is the type-4 record on the x86 PCI pathway. It says nothing
-/// about type-11 (`decode_iosurface_texture_descriptor`, which does not run
+/// about IOSurface texture (`decode_iosurface_texture_descriptor`, which does not run
 /// here and whose 0x38/0x58 blobs are still read only to 0x20), and a
 /// create-time record we never read at all would be invisible to it.
 ///
@@ -780,7 +780,7 @@ pub fn undecoded_type4_surface_bytes(desc: &[u8]) -> Vec<u8> {
 /// new *value* is the interesting event here, so that is the key.
 ///
 /// Runs before the decoder's own validity checks, so a record that fails to
-/// decode still reports. An earlier version of this probe on the type-11
+/// decode still reports. An earlier version of this probe on the IOSurface texture
 /// descriptor sat after its length check and emitted nothing at all on a live
 /// boot; "the decoder never ran" and "the tail is constant" produced the same
 /// silence, which is the reading the probe exists to rule out.
@@ -1002,7 +1002,7 @@ fn synthesize_device_desc_from_type4(surf: &Type4Surface) -> Vec<u8> {
     }
     if multi && surf.plane_count > 0 {
         // Multi-plane: publish plane records; sample_window_from_device_desc
-        // matches type-11 R8/RG8 binds by (w,h,bpe), and declines when two
+        // matches IOSurface texture R8/RG8 binds by (w,h,bpe), and declines when two
         // planes share all three. Do not invent bases from format alone.
         let n = (surf.plane_count as usize).min(TYPE4_PLANE_CAP);
         device_desc[DEVICE_DESC_PLANE_COUNT] = n as u8;
@@ -1937,10 +1937,10 @@ pub fn resolve_buffer_span_from_resource(
         .ok_or(BufferSpanRefusal::NoBacking)
 }
 
-/// Resolve object ref and, if type-11, latch mapping geometry + cache the entry.
+/// Resolve object ref and, if IOSurface texture, latch mapping geometry + cache the entry.
 ///
-/// Returns the mapping_id for type-11 textures, or None.
-pub fn resolve_type11_ref<M: HostMemory>(
+/// Returns the mapping_id for IOSurface textures, or None.
+pub fn resolve_iosurface_texture_ref<M: HostMemory>(
     state: &mut DeviceState,
     host: &M,
     task_id: u32,
@@ -1949,18 +1949,18 @@ pub fn resolve_type11_ref<M: HostMemory>(
     let resource = match resolve_resource(state, host, task_id, ref_) {
         Ok(resource) => resource,
         Err(LadderRung::DescRead { .. }) => {
-            // Keep this failure scoped to a confirmed type-11 object. The
+            // Keep this failure scoped to a confirmed IOSurface texture object. The
             // second lookup is only on the failed-construction path; successful
             // binds retrieve the retained resource without a guest read.
             if let Some(entry) = lookup_list_entry(state, host, task_id, ref_)
                 .filter(|entry| entry.kind == ObjectKind::IOSurfaceTexture)
             {
-                note_type11_fail(
+                note_iosurface_texture_fail(
                     task_id,
                     ref_,
-                    crate::observe::ladder_slug!("type11", desc_read),
+                    crate::observe::ladder_slug!("iosurface_texture", desc_read),
                     format!(
-                        "type11_resolve_fail reason=type11_desc_read task={task_id} ref={ref_} obj_type={} desc_gva={:#x} desc_len={}",
+                        "iosurface_texture_resolve_fail reason=iosurface_texture_desc_read task={task_id} ref={ref_} obj_type={} desc_gva={:#x} desc_len={}",
                         entry.kind, entry.descriptor_gva, entry.descriptor_length
                     ),
                 );
@@ -1969,16 +1969,16 @@ pub fn resolve_type11_ref<M: HostMemory>(
         }
         Err(_) => return None,
     };
-    resolve_type11_resource(state, task_id, ref_, &resource)
+    resolve_iosurface_texture_resource(state, task_id, ref_, &resource)
 }
 
-/// Resolve an already-retained type-11 resource to its mapping.
+/// Resolve an already-retained IOSurface texture resource to its mapping.
 ///
 /// Draw preparation resolves each bound reference once and threads the
 /// resulting object through all of its consumers. Keeping this half separate
-/// prevents the type-11 branch from looking the same reference up again and
+/// prevents the IOSurface texture branch from looking the same reference up again and
 /// reparsing immutable construction bytes on every bind.
-pub fn resolve_type11_resource(
+pub fn resolve_iosurface_texture_resource(
     state: &mut DeviceState,
     task_id: u32,
     ref_: u32,
@@ -1988,10 +1988,10 @@ pub fn resolve_type11_resource(
     let desc = &resource.descriptor;
     if entry.kind != ObjectKind::IOSurfaceTexture {
         // Legitimate: this ref is a different object type, not a texture. Normal
-        // control flow (resolve_type11_refs skips it) — never a failure.
+        // control flow (resolve_iosurface_texture_refs skips it) — never a failure.
         return None;
     }
-    if let Some(mapping_id) = resource.registered_type11_mapping() {
+    if let Some(mapping_id) = resource.registered_iosurface_mapping() {
         return Some(mapping_id);
     }
     // Record the ref as live so the explicit delete path retires its associated
@@ -2005,13 +2005,19 @@ pub fn resolve_type11_resource(
             height,
             ..
         }) => {
-            if !texture::register_type11_geom(state, *mapping_id, *width, *height, *pixel_format) {
-                note_type11_fail(
+            if !texture::register_iosurface_texture_geom(
+                state,
+                *mapping_id,
+                *width,
+                *height,
+                *pixel_format,
+            ) {
+                note_iosurface_texture_fail(
                     task_id,
                     ref_,
-                    "type11_register",
+                    "iosurface_texture_register",
                     format!(
-                        "type11_resolve_fail reason=type11_register task={task_id} ref={ref_} desc_len={}",
+                        "iosurface_texture_resolve_fail reason=iosurface_texture_register task={task_id} ref={ref_} desc_len={}",
                         desc.len()
                     ),
                 );
@@ -2024,12 +2030,12 @@ pub fn resolve_type11_resource(
         // refusal path; successfully constructed resources take the typed arm.
         Err(_) => {
             if !texture::register_from_descriptor_bytes(state, OBJECT_TYPE_IOSURFACE, desc) {
-                note_type11_fail(
+                note_iosurface_texture_fail(
                     task_id,
                     ref_,
-                    "type11_register",
+                    "iosurface_texture_register",
                     format!(
-                        "type11_resolve_fail reason=type11_register task={task_id} ref={ref_} desc_len={}",
+                        "iosurface_texture_resolve_fail reason=iosurface_texture_register task={task_id} ref={ref_} desc_len={}",
                         desc.len()
                     ),
                 );
@@ -2042,24 +2048,24 @@ pub fn resolve_type11_resource(
     if mapping_id == 0 {
         // Defensive for a compatibility decoder that ever accepts the sentinel
         // mapping id without registering it.
-        note_type11_fail(
+        note_iosurface_texture_fail(
             task_id,
             ref_,
-            "type11_mapping_zero",
+            "iosurface_mapping_zero",
             format!(
-                "type11_resolve_fail reason=type11_mapping_zero task={task_id} ref={ref_} desc_len={}",
+                "iosurface_texture_resolve_fail reason=iosurface_mapping_zero task={task_id} ref={ref_} desc_len={}",
                 desc.len()
             ),
         );
         return None;
     }
     state.texture_to_mapping.insert((task_id, ref_), mapping_id);
-    let mapping_id = resource.register_type11_mapping(mapping_id);
+    let mapping_id = resource.register_iosurface_mapping(mapping_id);
     if !state
         .task_resources
         .attach_mapper_storage(task_id, ref_, mapping_id)
     {
-        note_type11_fail(
+        note_iosurface_texture_fail(
             task_id,
             ref_,
             "iosurface_texture_resource_graph",
@@ -2070,7 +2076,7 @@ pub fn resolve_type11_resource(
         return None;
     }
     // Resolved: re-arm so a later genuine failure on this ref logs again.
-    clear_type11_fail(task_id, ref_);
+    clear_iosurface_texture_fail(task_id, ref_);
     Some(mapping_id)
 }
 
@@ -2512,7 +2518,7 @@ fn record_type4_owner(state: &mut DeviceState, surface_id: u32, task_id: u32) {
 /// draw sees an unbound texture until that surface happens to be mapped again.
 ///
 /// A latched type-4 walk is the exact provenance of a direct surface mapping.
-/// Type-11 resources carry the task/ref-to-mapping association established at
+/// IOSurface texture resources carry the task/ref-to-mapping association established at
 /// construction. Both routes require the packet's task; a bare integer match is
 /// not ownership.
 ///
@@ -2770,7 +2776,7 @@ fn note_type4_claimants<M: HostMemory>(
 ///
 /// Multi-plane and unknown-FourCC surfaces get `0`, and that zero is a decoded
 /// refusal rather than an absence — stage and paint must not invent BGRA, and
-/// type-11 selects planes through `device_desc` instead.
+/// IOSurface texture selects planes through `device_desc` instead.
 /// [`iosurface_pixel_format_to_mtl`] states the same rule for the conversion.
 ///
 /// Named rather than inlined at [`apply_type4_backing`] because

@@ -535,7 +535,7 @@ pub enum GuestWriteDecline {
     /// lives.
     ///
     /// Stated as a disagreement between the two rather than as "the resident is
-    /// not BGRA", because both orders reach this call: a type-11 mapping's pages
+    /// not BGRA", because both orders reach this call: an IOSurface texture mapping's pages
     /// are guest scanout order and a GVA render target's are whatever the guest
     /// declared for it. A rail that spelled the rule as one fixed order refused
     /// every RGBA destination it could have served unchanged.

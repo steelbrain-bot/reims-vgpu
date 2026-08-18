@@ -844,7 +844,7 @@ impl ResourcePools {
     ///   ago, so it carries no content stamp and no epoch; nothing has
     ///   transitioned it, so its layout is `UNDEFINED`; and no window holds it,
     ///   so it is unpinned. These are not defaults a creation site may pick —
-    ///   `registry_mark_ready_at` and the type-11 LOAD gate read them, and an arm
+    ///   `registry_mark_ready_at` and the IOSurface texture LOAD gate read them, and an arm
     ///   that guessed differently would be
     ///   answering a question the others think they already asked.
     /// - **The diagnostic clock belongs to the registry.** `last_touch_ms` comes
@@ -2653,7 +2653,7 @@ pub(super) mod pin_count_tests {
 
     /// A draw into this identity invalidates any stamp on it. The image's
     /// pixels just changed, and until something publishes them as the mapping's
-    /// content the type-11 LOAD gate must not treat them as current — otherwise
+    /// content the IOSurface texture LOAD gate must not treat them as current — otherwise
     /// an intermediate record's output is loaded as though it were the guest's
     /// prior frame.
     ///
@@ -3017,7 +3017,7 @@ pub(super) mod pin_count_tests {
     /// pixels, no layout transition behind it and no window holding it.
     ///
     /// Each of these four is read by a different rail — `registry_mark_ready`,
-    /// the type-11 LOAD gate's epoch check, the barrier tracker and the idle
+    /// the IOSurface texture LOAD gate's epoch check, the barrier tracker and the idle
     /// drain — so an arm that registered a slot with any of them set differently
     /// would be answering a question the other rails believe they already asked.
     #[test]

@@ -328,7 +328,7 @@ pub fn capture_at_producer<H: HostMemory + HostOps>(
 
 /// Apply a capture to the mapping named by the just-drained ring entry.
 pub fn apply_capture(state: &mut DeviceState, cap: &MapperCapture, mapping_id: u32) -> bool {
-    // Neither branch below releases a deferred writeback window. A type-11
+    // Neither branch below releases a deferred writeback window. An IOSurface texture
     // render Store writes guest pages on its own path, so an UNMAP (or a MAP
     // that re-backs the slot with a different MappingInternal, orphaning the
     // old identity) leaves no mapping-keyed render obligation behind, because a
@@ -503,7 +503,7 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         }
     }
 
-    // Texture-path geom (type-11 object dims) refines span for single-plane; for
+    // Texture-path geom (IOSurface texture object dims) refines span for single-plane; for
     // multi-plane, prefer alloc_size already latched from the device descriptor.
     if let Some(m) = state.mappings.get(&mapping_id) {
         if m.has_geom && m.width > 0 && m.height > 0 {
@@ -934,10 +934,10 @@ pub(crate) fn plan_adoption_decision(
     )
 }
 
-/// True when the cached page table covers the type-11 sample/write span for
+/// True when the cached page table covers the IOSurface texture sample/write span for
 /// the latched geom (archive table build uses the same min_size).
 ///
-/// Early resolve often runs before type-11 object dims land (`min_size` =
+/// Early resolve often runs before IOSurface texture object dims land (`min_size` =
 /// PAGE_SIZE only). Leaving a short `page_entries` while `has_geom` is true
 /// makes Store writeback and sample page walks fail-closed on tiles (Favourites
 /// 249² with ~16 pages vs ~63 required) while the Metal attachment still holds
@@ -968,7 +968,7 @@ pub fn pages_cover_geom(state: &DeviceState, mapping_id: u32) -> bool {
     covered >= span_end.max(page_size)
 }
 
-/// Ensure pages (and geom if possible) before scanout paint / type-11 Store.
+/// Ensure pages (and geom if possible) before scanout paint / IOSurface texture Store.
 ///
 /// Re-resolves when the table is empty, geom is missing, **or** the cached page
 /// count cannot cover the latched W×H sample window (stale early resolve).
@@ -1200,7 +1200,7 @@ pub fn type4_pages_witness<H: HostMemory>(
     };
     let Some(walk) = m.type4_walk else {
         // No type-4 walk was ever latched for this mapping, so this witness has
-        // never had anything to say about it. The type-11 rail lives here.
+        // never had anything to say about it. The IOSurface texture rail lives here.
         return Type4Witness::Unwitnessed("no_walk");
     };
     if walk.page_generation != m.page_generation {

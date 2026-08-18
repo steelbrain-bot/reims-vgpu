@@ -1,4 +1,4 @@
-//! The resident identity a type-11 guest surface renders into.
+//! The resident identity an IOSurface texture guest surface renders into.
 //!
 //! A compatible surface resident is a Vulkan image imported over the guest
 //! allocation itself. Rendering, attachment LOAD, Store synchronization, and

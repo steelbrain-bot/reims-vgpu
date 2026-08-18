@@ -5749,7 +5749,7 @@ pub(crate) unsafe fn execute_draw_inner(
     //
     // That is a reading about the workload and **not** a licence to delete the
     // tail. `skip_readback` has to be decided before submit, and a Store that
-    // neither defer rail can take still has to land its pixels: a type-11 Store
+    // neither defer rail can take still has to land its pixels: an IOSurface texture Store
     // always defers (`draw::vulkan` records why), but a GVA Store whose
     // `row_stride` is short of the format's tight row bytes fails
     // `gva_store_defer_eligible` and keeps its readback. Delete this and that

@@ -181,7 +181,7 @@ fn refuse(mapping_id: u32, why: SurfaceWriteRefusal) -> bool {
 /// - **The mapping has published no descriptor.** `MappingInternal.descriptor`
 ///   reads zero until the guest fills it, which `mapper::resolve` documents as a
 ///   real state rather than a failure, and the geometry then comes from the
-///   type-11 texture object instead. There are no plane records to confuse here;
+///   IOSurface texture object instead. There are no plane records to confuse here;
 ///   the single unknown is the pitch, and [`packed_span_estimate`]'s aligned row
 ///   stands in for it over a surface starting at offset 0.
 /// - **The descriptor is published and resolves nothing.** Here the guest *has*
@@ -201,7 +201,7 @@ fn refuse(mapping_id: u32, why: SurfaceWriteRefusal) -> bool {
 /// because a capable host takes the import for every guest window and leaves the
 /// copying rails at zero. With the gate closed
 /// (`host_pointer_import=disabled_by_env`, nothing reporting a bound import) the
-/// copying rails carried the whole workload — every type-5 view, every type-11
+/// copying rails carried the whole workload — every type-5 view, every IOSurface texture
 /// resident rung and every surface flush of the drag — and **no window failed to
 /// resolve**. Every bind came from a published descriptor, so the estimate above
 /// is the state before the guest fills one rather than a rung this device leans
@@ -222,13 +222,13 @@ fn sample_window(
     sample_window_from_device_desc(Some(desc), plane_index, format, width, height)
 }
 
-/// Resolve the sample window for a type-11 texture binding on a mapping.
+/// Resolve the sample window for an IOSurface texture binding on a mapping.
 ///
-/// Type-11 is the case with **no wire plane index**: nothing on the wire names
+/// IOSurface texture is the case with **no wire plane index**: nothing on the wire names
 /// which plane the texture wants, so a multi-plane surface is resolved by
 /// matching width, height and bytes-per-element, and the plane is taken only
 /// when exactly one matches. See [`sample_window`] for what each outcome means.
-pub fn type11_sample_window(
+pub fn iosurface_texture_sample_window(
     m: &MappingEntry,
     width: u32,
     height: u32,
@@ -238,13 +238,13 @@ pub fn type11_sample_window(
 }
 
 /// Resolve the sample window for a type-5 serialized view, which — unlike
-/// type-11 — carries the IOSurface plane index on the wire (type-5 record
+/// IOSurface texture — carries the IOSurface plane index on the wire (type-5 record
 /// `+0x20`).
 ///
 /// Every type-5 consumer must come through here rather than through
-/// [`type11_sample_window`], and the distinction is not cosmetic: the wire index
+/// [`iosurface_texture_sample_window`], and the distinction is not cosmetic: the wire index
 /// names the plane record directly, and it is the only key that separates
-/// same-geometry planes. Handing a type-5 view's geometry to the type-11 scan
+/// same-geometry planes. Handing a type-5 view's geometry to the IOSurface texture scan
 /// drops that index, so a bind the wire said was alpha resolves against
 /// whichever same-geometry plane the scan happens to reach.
 pub fn type5_sample_window(
@@ -816,7 +816,7 @@ pub fn resident_gpu_plane(m: &MappingEntry, width: u32, height: u32) -> Option<(
     if mw != width || mh != height {
         return None;
     }
-    let (base_off, bpr, _span_end) = type11_sample_window(m, mw, mh, format)?;
+    let (base_off, bpr, _span_end) = iosurface_texture_sample_window(m, mw, mh, format)?;
     Some((base_off, bpr, format))
 }
 
@@ -841,7 +841,7 @@ pub fn resident_gpu_plane(m: &MappingEntry, width: u32, height: u32) -> Option<(
 /// ([`DeviceState::note_host_wrote_mapping`]) and the page footprint: a rail that
 /// lands frames without recording that it did makes
 /// [`crate::runtime::gather_witness`] attribute its own writes to the guest, and
-/// the type-11 resident rung above it then refuses residents and gathers whole
+/// the IOSurface texture resident rung above it then refuses residents and gathers whole
 /// surfaces per bind. That failure is measured and it costs more than this rail
 /// saves.
 ///
@@ -862,7 +862,7 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
     // This rail's own window, and the reason the licence does not resolve one:
     // a Store's destination *is* the surface, so a frame whose extent is not
     // the mapping's latched geometry is a frame for a mapping that has moved
-    // under it. That is a scanout rule and not a property of a type-11
+    // under it. That is a scanout rule and not a property of an IOSurface texture
     // destination — a compute dispatch writing a sub-rectangle is ordinary — so
     // it is asked here, by the caller it belongs to.
     if !scanout_extent_ok(width, height) {
@@ -883,18 +883,18 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
             frame_height: height,
         });
     }
-    let Some((base_off, bpr, span_end)) = type11_sample_window(m, mw, mh, format) else {
+    let Some((base_off, bpr, span_end)) = iosurface_texture_sample_window(m, mw, mh, format) else {
         return Err(GpuWritebackDecline::WindowUnresolved {
             width: mw,
             height: mh,
             format,
         });
     };
-    let licence = licence_type11_surface(
+    let licence = licence_iosurface_texture_surface(
         state,
         host,
         identity.resident_format(),
-        &Type11SurfaceDestination {
+        &IOSurfaceDestination {
             mapping_id,
             base_off,
             bpr,
@@ -910,13 +910,13 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
         &licence.gpas,
     )
     .map_err(|inner| GpuWritebackDecline::Engine { inner })?;
-    note_type11_landed(state, mapping_id, licence.base_off, licence.span_end);
+    note_iosurface_texture_landed(state, mapping_id, licence.base_off, licence.span_end);
     Ok(licence.span_end - licence.base_off)
 }
 
-/// A window of a type-11 surface mapping the GPU is asked to write.
+/// A window of an IOSurface texture surface mapping the GPU is asked to write.
 ///
-/// The type-11 counterpart of
+/// The IOSurface texture counterpart of
 /// [`crate::runtime::render_writeback::GvaPlaneDestination`], and it exists for
 /// the same reason: the licence must not resolve its own destination. Which
 /// window of which plane a copy lands in is the *caller's* knowledge, and the
@@ -929,7 +929,7 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
 /// mis-served everything else. It refused every sub-rectangle — 15 of the 19
 /// remaining compute readbacks on a driven macos-13 boot, all
 /// [`GpuWritebackDecline::GeometryMoved`] — and behind that refusal sat a worse
-/// failure it was hiding: [`type11_sample_window`] takes no plane index and
+/// failure it was hiding: [`iosurface_texture_sample_window`] takes no plane index and
 /// matches by geometry, so a type-5 bind's frame would have landed in whichever
 /// plane happened to share its dimensions. [`resident_gpu_plane`]'s doc states
 /// the cost of exactly that disagreement, which is that there is no error — the
@@ -940,7 +940,7 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
 /// format the window was resolved against; the licence derives the bytes per
 /// texel from it rather than taking one, so there is no second answer to carry.
 #[cfg(feature = "backend-vulkan")]
-pub(crate) struct Type11SurfaceDestination {
+pub(crate) struct IOSurfaceDestination {
     pub mapping_id: u32,
     /// Byte offset of the window's first texel within the mapping.
     pub base_off: u64,
@@ -953,9 +953,9 @@ pub(crate) struct Type11SurfaceDestination {
     pub format: u16,
 }
 
-/// A licensed direct-to-guest-pages destination over a type-11 surface mapping.
+/// A licensed direct-to-guest-pages destination over an IOSurface texture surface mapping.
 ///
-/// The type-11 counterpart of
+/// The IOSurface texture counterpart of
 /// [`crate::runtime::render_writeback::GvaPlaneLicence`], and it exists for the
 /// same reason: the two rails that write a guest surface from the GPU — a render
 /// Store and a compute storage-image output — differ only in the image they copy
@@ -965,9 +965,9 @@ pub(crate) struct Type11SurfaceDestination {
 ///
 /// `base_off` and `span_end` are carried because the landing note needs them and
 /// deriving them a second time would be a second answer to a question the
-/// licence already asked. See [`note_type11_landed`].
+/// licence already asked. See [`note_iosurface_texture_landed`].
 #[cfg(feature = "backend-vulkan")]
-pub(crate) struct Type11SurfaceLicence {
+pub(crate) struct IOSurfaceLicence {
     pub target: crate::backend::vulkan::engine::GuestPageTarget,
     /// The pages walked, in the surface's own order — what the copy is licensed
     /// over and what every witness on this path is armed against.
@@ -977,11 +977,11 @@ pub(crate) struct Type11SurfaceLicence {
     pub span_end: u64,
 }
 
-/// Licence a caller's type-11 surface window as a destination the GPU may copy
+/// Licence a caller's IOSurface texture surface window as a destination the GPU may copy
 /// into, or give the typed reason it may not.
 ///
 /// Takes the window rather than resolving one — see
-/// [`Type11SurfaceDestination`] for why that division is where it is. What is
+/// [`IOSurfaceDestination`] for why that division is where it is. What is
 /// shared between the two rails, and therefore lives here, is the format rule,
 /// the page-list plan, the page walk, the guest-RAM references and the two
 /// guest-write witnesses.
@@ -1003,20 +1003,20 @@ pub(crate) struct Type11SurfaceLicence {
 /// pages itself, so there is no second pair to compare and this is the only
 /// place the question can be asked. A storage image takes its format from the
 /// specialized SPIR-V texel format, which has no reason to match the format the
-/// bind staged its window against — banded at 3 of 35 type-11 windows on a
+/// bind staged its window against — banded at 3 of 35 IOSurface texture windows on a
 /// driven macos-13 boot — so on that rail it is not a healthy zero either.
 ///
 /// Asking it for both callers rather than for the one that needs it keeps the
 /// rule in the licence, where a third writer of a guest surface would meet it
 /// without knowing to look.
 #[cfg(feature = "backend-vulkan")]
-pub(crate) fn licence_type11_surface<M: HostMemory + HostOps>(
+pub(crate) fn licence_iosurface_texture_surface<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     held: ash::vk::Format,
-    dst: &Type11SurfaceDestination,
-) -> Result<Type11SurfaceLicence, GpuWritebackDecline> {
-    let &Type11SurfaceDestination {
+    dst: &IOSurfaceDestination,
+) -> Result<IOSurfaceLicence, GpuWritebackDecline> {
+    let &IOSurfaceDestination {
         mapping_id,
         base_off,
         bpr,
@@ -1077,7 +1077,7 @@ pub(crate) fn licence_type11_surface<M: HostMemory + HostOps>(
     //
     // What used to stand here was the deferred rail's flush-on-access, whose
     // justification was that landing a pending window "can invalidate the
-    // mapping". There are no windows: a type-11 render Store lands its frame at
+    // mapping". There are no windows: an IOSurface texture render Store lands its frame at
     // the Store (see `render_writeback`'s module doc). Measured at **5 204
     // settles and 7.29 s blocked** on a driven Safari-drag boot — 42 % of every
     // wait in the device — for an ordering the queue already had.
@@ -1181,7 +1181,7 @@ pub(crate) fn licence_type11_surface<M: HostMemory + HostOps>(
         ReadbackPhase::Resolve,
         resolve_started.elapsed().as_micros() as u64,
     );
-    Ok(Type11SurfaceLicence {
+    Ok(IOSurfaceLicence {
         target,
         gpas,
         base_off,
@@ -1189,7 +1189,7 @@ pub(crate) fn licence_type11_surface<M: HostMemory + HostOps>(
     })
 }
 
-/// What a landed type-11 GPU write owes the rest of the device.
+/// What a landed IOSurface texture GPU write owes the rest of the device.
 ///
 /// Called once the copy is *issued*, not once it has completed, and by both
 /// rails that issue one — the render Store, which submits and waits, and the
@@ -1201,9 +1201,9 @@ pub(crate) fn licence_type11_surface<M: HostMemory + HostOps>(
 /// Every one of these errs in the same direction on purpose: a cache forgotten
 /// early costs a re-read of bytes that are about to change anyway, while one
 /// forgotten late hands out a stale frame as fresh. The same argument the
-/// witnesses in [`licence_type11_surface`] are armed on.
+/// witnesses in [`licence_iosurface_texture_surface`] are armed on.
 #[cfg(feature = "backend-vulkan")]
-pub(crate) fn note_type11_landed(
+pub(crate) fn note_iosurface_texture_landed(
     state: &mut DeviceState,
     mapping_id: u32,
     base_off: u64,
@@ -1235,7 +1235,7 @@ fn mapping_write_geometry(m: &MappingEntry, width: u32, height: u32) -> (u32, u3
 /// The Metal pixel format a Store into this mapping's plane must land in.
 ///
 /// A mapping that has declared its own geometry owns this, and a zero format
-/// there means guest scanout order — the format every type-11 plane had before
+/// there means guest scanout order — the format every IOSurface texture plane had before
 /// any of them declared otherwise, so it is the contract's default and not a
 /// guess. A mapping that has declared no geometry has declared no format either.
 ///
@@ -1319,7 +1319,8 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
             },
         );
     }
-    let Some((base_off, bpr_u32, span_end)) = type11_sample_window(m, mw, mh, format) else {
+    let Some((base_off, bpr_u32, span_end)) = iosurface_texture_sample_window(m, mw, mh, format)
+    else {
         return refuse(
             mapping_id,
             SurfaceWriteRefusal::WindowUnresolved {
@@ -1590,9 +1591,9 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     true
 }
 
-/// Write a tight RGBA8 image into a type-11 mapping, optionally as changed-spans.
+/// Write a tight RGBA8 image into an IOSurface texture mapping, optionally as changed-spans.
 ///
-/// Archive `apple_pv_gpu_write_type11_image_changed`: when `seed_rgba` is present
+/// Archive `apple_pv_gpu_write_iosurface_texture_image_changed`: when `seed_rgba` is present
 /// (same layout as `rgba`), only contiguous native-format spans that differ from
 /// the seed are written. Equivalent to a full `storeAction=Store` when the seed
 /// was the Metal Load attachment content (unchanged texels match guest), without
@@ -1651,7 +1652,8 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
             },
         );
     }
-    let Some((base_off, bpr_u32, span_end)) = type11_sample_window(m, mw, mh, format) else {
+    let Some((base_off, bpr_u32, span_end)) = iosurface_texture_sample_window(m, mw, mh, format)
+    else {
         return refuse(
             mapping_id,
             SurfaceWriteRefusal::WindowUnresolved {
@@ -2013,11 +2015,11 @@ pub fn read_raw_rows<M: HostMemory + HostOps>(
 ///
 /// The resolution [`read_rect_raw`] and [`write_rect_raw`] share: the latched
 /// format (BGRA8 when the mapping never declared one), the plane window
-/// [`type11_sample_window`] decodes for it, and the texel size. Returns
+/// [`iosurface_texture_sample_window`] decodes for it, and the texel size. Returns
 /// `(base_offset, bytes_per_row, span_end, bytes_per_texel)`, or `None` when
 /// the mapping is gone, carries no latched geometry, has no decodable window,
 /// has an unknown format, or the rectangle leaves the surface.
-/// Where a mapped type-11 surface's texels sit, and how wide one is.
+/// Where a mapped IOSurface texture surface's texels sit, and how wide one is.
 ///
 /// `mapping_geom_window` used to return this as `Option<(u64, u32, u64, u32)>`,
 /// a shape whose meaning existed only in the destructuring patterns of the two
@@ -2065,7 +2067,7 @@ fn mapping_geom_window(state: &DeviceState, mapping_id: u32, rect: Rect) -> Opti
     } else {
         MTL_FORMAT_BGRA8_UNORM
     };
-    let (base_off, bpr, span_end) = type11_sample_window(m, m.width, m.height, format)?;
+    let (base_off, bpr, span_end) = iosurface_texture_sample_window(m, m.width, m.height, format)?;
     let bpp = pixel_format::bytes_per_pixel(format)?;
     if origin_x.saturating_add(width) > m.width || origin_y.saturating_add(height) > m.height {
         return None;
@@ -2078,7 +2080,7 @@ fn mapping_geom_window(state: &DeviceState, mapping_id: u32, rect: Rect) -> Opti
     })
 }
 
-/// Read a rectangular texel region from a mapped type-11 IOSurface.
+/// Read a rectangular texel region from a mapped IOSurface.
 /// Contig HostOps view when possible; else multi-import.
 #[cfg(test)]
 pub fn read_rect_raw<M: HostMemory + HostOps>(
@@ -2133,10 +2135,10 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
     // paths below was ever covered. The fragmented path ends in
     // `read_mapping_bytes`, which flushes; the `contig_for_span` path is a raw
     // `copy_nonoverlapping` out of the mapped span and flushes nothing — so
-    // whether a type-11 surface read observed the deferred Store depended on
+    // whether an IOSurface texture surface read observed the deferred Store depended on
     // whether its guest pages happened to be contiguous. Three callers read
     // guest pages through here with no flush of their own: the type-5 view
-    // loader, a blit reading a type-11 texture backing, and the compute sample
+    // loader, a blit reading an IOSurface texture backing, and the compute sample
     // stage.
     //
     // `flush_intersecting` returns immediately when nothing is armed, so this
@@ -2183,7 +2185,7 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
     // arm was bounded anyway — which is true, but only by its own slice bounds:
     // that arm reads the window and then indexes rows into it, so an overrunning
     // rect came back as a bare `false` from a `get` that returned `None`. Both
-    // callers do name that (`rd_row_t11_io`, `Type5ViewDecline::Read`), so it was
+    // callers do name that (`rd_row_iosurface_io`, `Type5ViewDecline::Read`), so it was
     // never a silent loss, but neither can say the rect left the window, and the
     // fragmented arm is the one a driven x86 boot actually takes. One check above
     // the split gives both arms the same refusal and the same line.
@@ -2299,9 +2301,9 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
     true
 }
 
-/// Write a rectangular texel region into a mapped type-11 IOSurface.
+/// Write a rectangular texel region into a mapped IOSurface.
 ///
-/// Uses latched mapping geom + [`type11_sample_window`]. Prefer
+/// Uses latched mapping geom + [`iosurface_texture_sample_window`]. Prefer
 /// [`write_rect_raw_at`] for an explicit plane window.
 #[allow(
     clippy::too_many_arguments,

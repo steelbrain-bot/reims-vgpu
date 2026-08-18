@@ -1,6 +1,6 @@
-//! Type-11 / texture geometry registration onto the IOSurface mapping table.
+//! IOSurface texture / texture geometry registration onto the IOSurface mapping table.
 //!
-//! Archive: `apple_pv_gpu_register_type11_texture` latches width/height/format
+//! Archive: `apple_pv_gpu_register_iosurface_texture` latches width/height/format
 //! on the mapping when a texture descriptor is resolved. Device-desc geom
 //! (mapper path) and texture-path geom share [`DeviceState::set_mapping_geom`].
 
@@ -8,8 +8,8 @@ use crate::contract::iosurface_pages::decode_texture_descriptor;
 use crate::model::{is_mapping_id, DeviceState};
 use crate::runtime::decode::resource::{decode_descriptor, DecodeStatus, Descriptor, ObjectKind};
 
-/// Register geometry from a decoded type-11 / IOSurface texture descriptor.
-pub fn register_type11_geom(
+/// Register geometry from a decoded IOSurface texture / IOSurface texture descriptor.
+pub fn register_iosurface_texture_geom(
     state: &mut DeviceState,
     mapping_id: u32,
     width: u32,
@@ -27,7 +27,7 @@ pub fn register_type11_geom(
     state.set_mapping_geom(mapping_id, width, height, format)
 }
 
-/// Decode descriptor bytes and, if type-11, latch mapping geometry.
+/// Decode descriptor bytes and, if IOSurface texture, latch mapping geometry.
 pub fn register_from_descriptor_bytes(
     state: &mut DeviceState,
     object_type: u8,
@@ -36,10 +36,16 @@ pub fn register_from_descriptor_bytes(
     // Also accept the raw iosurface texture layout without a type byte.
     let headerless = |state: &mut DeviceState| {
         // No length test here: `decode_texture_descriptor`'s own first line is
-        // `bytes.len() < TYPE11_DESC_MIN_LEN`, so a copy of it one call above
+        // `bytes.len() < IOSURFACE_TEXTURE_DESC_MIN_LEN`, so a copy of it one call above
         // could only ever disagree with the arm it is guarding.
         match decode_texture_descriptor(desc) {
-            Ok(t) => register_type11_geom(state, t.mapping_id, t.width, t.height, t.pixel_format),
+            Ok(t) => register_iosurface_texture_geom(
+                state,
+                t.mapping_id,
+                t.width,
+                t.height,
+                t.pixel_format,
+            ),
             Err(_) => false,
         }
     };
@@ -53,20 +59,20 @@ pub fn register_from_descriptor_bytes(
             height,
             pixel_format,
             ..
-        }) => register_type11_geom(state, mapping_id, width, height, pixel_format),
+        }) => register_iosurface_texture_geom(state, mapping_id, width, height, pixel_format),
         // A buffer, a function, a pipeline: not a refusal. This is called for
-        // every object type and only type-11 carries mapping geometry, so the
+        // every object type and only IOSurface texture carries mapping geometry, so the
         // decoder answering "that is a different object" is the normal case and
         // must stay out of the log.
         Ok(_) => headerless(state),
         Err(e) => {
             let recovered = headerless(state);
             if !recovered {
-                // Both forms refused, so a type-11 registration was genuinely
+                // Both forms refused, so an IOSurface texture registration was genuinely
                 // dropped. `_ => false` used to give this the same silence as
                 // the `Ok(_)` arm above, which is the collapse: a malformed
                 // descriptor and a buffer object looked identical.
-                crate::observe::Emit::decline("type11_register", &e)
+                crate::observe::Emit::decline("iosurface_texture_register", &e)
                     .field("obj_type", object_type)
                     .field("len", desc.len())
                     .fail_once(object_type as u64);
@@ -85,9 +91,9 @@ mod tests {
     use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
 
     #[test]
-    fn type11_geom_and_generation() {
+    fn iosurface_texture_geom_and_generation() {
         let mut s = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        assert!(register_type11_geom(&mut s, 5, 640, 480, 0x50));
+        assert!(register_iosurface_texture_geom(&mut s, 5, 640, 480, 0x50));
         let m = s.mappings.get(&5).unwrap();
         assert!(m.has_geom);
         assert_eq!((m.width, m.height, m.format), (640, 480, 0x50));
@@ -109,14 +115,14 @@ mod tests {
     /// A headerless blob one byte short of the record latches nothing, and does
     /// so through the decoder rather than through a length test above it.
     ///
-    /// The removed guard was `desc.len() >= TYPE11_DESC_MIN_LEN` immediately
+    /// The removed guard was `desc.len() >= IOSURFACE_TEXTURE_DESC_MIN_LEN` immediately
     /// before `decode_texture_descriptor`, whose own first line is the same
     /// comparison. This pins that the refusal survived the removal, at exactly
-    /// the boundary the two shared: `TYPE11_DESC_MIN_LEN - 1` refuses and
-    /// `TYPE11_DESC_MIN_LEN` does not.
+    /// the boundary the two shared: `IOSURFACE_TEXTURE_DESC_MIN_LEN - 1` refuses and
+    /// `IOSURFACE_TEXTURE_DESC_MIN_LEN` does not.
     #[test]
     fn a_short_headerless_descriptor_is_refused_by_the_decoder_alone() {
-        let min = crate::contract::iosurface_pages::TYPE11_DESC_MIN_LEN;
+        let min = crate::contract::iosurface_pages::IOSURFACE_TEXTURE_DESC_MIN_LEN;
         let mut s = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
 
         let mut short = vec![0u8; min - 1];

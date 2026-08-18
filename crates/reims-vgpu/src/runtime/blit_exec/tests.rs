@@ -89,7 +89,7 @@ fn copy_cmd(copy_kind: CopyKind, source: u32, destination: u32) -> Command {
 }
 
 /// Back `mapping_id` with one guest data page at `pfn` and mark it mapped.
-/// This is the surface state every type-11 / type-5 install needs before it
+/// This is the surface state every IOSurface texture / type-5 install needs before it
 /// can attach geometry or a descriptor.
 fn map_one_page_surface(host: &mut FakeHost, state: &mut DeviceState, mapping_id: u32, pfn: u32) {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
@@ -513,7 +513,7 @@ fn copy_b2b_overlap_rejected() {
 }
 
 #[test]
-fn copy_buffer_to_type11_roundtrip() {
+fn copy_buffer_to_iosurface_texture_roundtrip() {
     let (mut host, mut state) = blit_device();
     // Buffer with 8 BGRA pixels (one row of 2 pixels for a 2x1 copy).
     install_buffer(&mut host, &mut state, 1, 1, 256);
@@ -521,9 +521,9 @@ fn copy_buffer_to_type11_roundtrip() {
     let src_gva = 1u64 << RESOURCE_PAGE_SHIFT;
     write_task_gva_arm64e(&mut host, &state.tasks[1], src_gva, &pat);
 
-    // Type-11 object ref 3 → mapping 9, 2x2 BGRA.
+    // IOSurface texture object ref 3 → mapping 9, 2x2 BGRA.
     let mapping_id = 9u32;
-    install_type11(&mut host, &mut state, 3, mapping_id, 0x20);
+    install_iosurface_texture(&mut host, &mut state, 3, mapping_id, 0x20);
 
     let mut cmd = copy_cmd(CopyKind::BufferToTexture, 1, 3);
     cmd.source_offset = 0;
@@ -558,12 +558,12 @@ fn copy_buffer_to_type11_roundtrip() {
     assert!(state.mappings[&mapping_id].content_generation > gen_before);
 }
 
-/// type-11→type-11 copy lands source bytes in dest pages (unified content).
+/// IOSurface texture→IOSurface texture copy lands source bytes in dest pages (unified content).
 #[test]
-fn copy_type11_to_type11_writes_dst_pages() {
+fn copy_iosurface_texture_to_iosurface_texture_writes_dst_pages() {
     let (mut host, mut state) = blit_device();
-    install_type11(&mut host, &mut state, 3, 3, 0x20);
-    install_type11(&mut host, &mut state, 4, 4, 0x21);
+    install_iosurface_texture(&mut host, &mut state, 3, 3, 0x20);
+    install_iosurface_texture(&mut host, &mut state, 4, 4, 0x21);
     // Seed source mid=3 pages with a known pattern.
     let src_pat = [9u8, 8, 7, 6, 5, 4, 3, 2, 1, 0, 11, 12, 13, 14, 15, 16];
     assert!(mapping_write::write_rect_raw(
@@ -617,8 +617,8 @@ fn copy_type11_to_type11_writes_dst_pages() {
 #[test]
 fn an_extent_past_the_edge_is_refused_like_an_origin_past_the_edge() {
     let (mut host, mut state) = blit_device();
-    install_type11(&mut host, &mut state, 3, 3, 0x20); // 2×2 BGRA, mid 3
-    install_type11(&mut host, &mut state, 4, 4, 0x21); // 2×2 BGRA, mid 4
+    install_iosurface_texture(&mut host, &mut state, 3, 3, 0x20); // 2×2 BGRA, mid 3
+    install_iosurface_texture(&mut host, &mut state, 4, 4, 0x21); // 2×2 BGRA, mid 4
     install_buffer(&mut host, &mut state, 5, 5, 4096);
 
     // Origin in range, extent past the edge: 3 wide out of a 2-wide texture.
@@ -673,8 +673,8 @@ fn an_extent_past_the_edge_is_refused_like_an_origin_past_the_edge() {
 #[test]
 fn copy_executor_reason_slugs_name_distinct_sites() {
     let (mut host, mut state) = blit_device();
-    install_type11(&mut host, &mut state, 3, 3, 0x20); // 2×2 BGRA, mid 3
-    install_type11(&mut host, &mut state, 4, 4, 0x21); // 2×2 BGRA, mid 4
+    install_iosurface_texture(&mut host, &mut state, 3, 3, 0x20); // 2×2 BGRA, mid 3
+    install_iosurface_texture(&mut host, &mut state, 4, 4, 0x21); // 2×2 BGRA, mid 4
     install_buffer(&mut host, &mut state, 5, 5, 4096);
 
     // texture→texture: destination origin past a 2×2 target → Bounds.
@@ -691,7 +691,7 @@ fn copy_executor_reason_slugs_name_distinct_sites() {
     );
     assert_eq!(blit_fail_reason(), "t2t_origin_oob");
 
-    // texture→texture: a type-11 endpoint with a non-zero z origin (type-11 is
+    // texture→texture: an IOSurface texture endpoint with a non-zero z origin (IOSurface texture is
     // 2D) → Unsupported, a DIFFERENT reason under the same executor.
     let mut cmd = copy_cmd(CopyKind::TextureToTexture, 3, 4);
     cmd.source_origin.z = 1;
@@ -704,7 +704,7 @@ fn copy_executor_reason_slugs_name_distinct_sites() {
         execute_blit(&mut state, &mut host, 1, &cmd),
         BlitStatus::Unsupported
     );
-    assert_eq!(blit_fail_reason(), "t2t_t11_z");
+    assert_eq!(blit_fail_reason(), "t2t_iosurface_z");
 
     // texture→buffer: source origin past bounds → Bounds "t2b_origin_oob".
     let mut cmd = copy_cmd(CopyKind::TextureToBuffer, 3, 5);
@@ -734,7 +734,7 @@ fn copy_executor_reason_slugs_name_distinct_sites() {
     );
     assert_eq!(blit_fail_reason(), "b2t_origin_oob");
 
-    // A full-target valid type-11→type-11 copy succeeds and resets the channel,
+    // A full-target valid IOSurface texture→IOSurface texture copy succeeds and resets the channel,
     // so no stale slug leaks into the next command's dispatch line.
     let mut cmd = copy_cmd(CopyKind::TextureToTexture, 3, 4);
     cmd.source_size = Size {
@@ -746,8 +746,8 @@ fn copy_executor_reason_slugs_name_distinct_sites() {
     assert_eq!(blit_fail_reason(), "");
 }
 
-/// Install type-11 object-list entry + mapping pages (2×2 BGRA).
-fn install_type11(
+/// Install IOSurface texture object-list entry + mapping pages (2×2 BGRA).
+fn install_iosurface_texture(
     host: &mut FakeHost,
     state: &mut DeviceState,
     obj_ref: u32,
@@ -756,7 +756,7 @@ fn install_type11(
 ) {
     map_one_page_surface(host, state, mapping_id, pfn);
     assert!(state.set_mapping_geom(mapping_id, 2, 2, MTL_FORMAT_BGRA8_UNORM));
-    install_type11_plane(
+    install_iosurface_texture_plane(
         host,
         state,
         obj_ref,
@@ -800,7 +800,7 @@ fn install_biplanar_mapping(
     // Surface-level geom is not the plane; leave has_geom false until texture latch.
 }
 
-fn install_type11_plane(
+fn install_iosurface_texture_plane(
     host: &mut FakeHost,
     state: &mut DeviceState,
     obj_ref: u32,
@@ -877,7 +877,7 @@ fn install_type5(
 /// A blit source must read the plane the wire named, and the only shape that
 /// can prove it is two planes that share geometry and bytes-per-element.
 ///
-/// This branch resolved type-5 views through `type11_sample_window`, which
+/// This branch resolved type-5 views through `iosurface_texture_sample_window`, which
 /// takes no plane index and picks a plane by matching width, height and bpe.
 /// On the v0a8 shape the live apple.com hero produces — Y and alpha both R8
 /// at the luma geometry — that scan matches *two* records, takes neither, and
@@ -948,7 +948,7 @@ fn a_type5_blit_source_reads_the_plane_the_wire_named() {
     // it resolves nothing at all, which is what this test exists to exclude.
     let ambiguous = {
         let m = state.mappings.get(&mapping_id).unwrap();
-        mapping_write::type11_sample_window(m, w, h, MTL_FORMAT_R8_UNORM)
+        mapping_write::iosurface_texture_sample_window(m, w, h, MTL_FORMAT_R8_UNORM)
     };
     assert!(
         ambiguous.is_none(),
@@ -965,11 +965,11 @@ fn a_type5_blit_source_reads_the_plane_the_wire_named() {
     let backing = resolve_texture_backing(&mut state, &mut host, 1, obj_ref, 0, 0)
         .expect("type-5 blit source must resolve");
     match backing {
-        TextureBacking::Type11(t) => assert_eq!(
+        TextureBacking::IOSurface(t) => assert_eq!(
             t.surface_offset, ALPHA_OFFSET as u64,
             "the wire named plane 2, and only the wire index can reach it"
         ),
-        TextureBacking::Linear(_) => panic!("expected Type11 backing, got Linear"),
+        TextureBacking::Linear(_) => panic!("expected IOSurface backing, got Linear"),
     }
 }
 
@@ -996,11 +996,11 @@ fn set_type5_record_plane(host: &mut FakeHost, state: &DeviceState, obj_ref: u32
 
 /// Regression guard for the type-5 RefTexture blit-source branch
 /// (`resolve_texture_backing_depth` ~588): a type-5 object whose 0x62 record
-/// names a BGRA8 view must resolve to a `Type11` backing carrying the VIEW
+/// names a BGRA8 view must resolve to an `IOSurface` backing carrying the VIEW
 /// geometry/format (not the base mapping's), so a blit copy from a media /
-/// window backing lands. Mirrors the type-11 install fixtures.
+/// window backing lands. Mirrors the IOSurface texture install fixtures.
 #[test]
-fn type5_ref_texture_resolves_as_type11_blit_backing() {
+fn type5_ref_texture_resolves_as_iosurface_texture_blit_backing() {
     use crate::contract::pixel_format::bytes_per_pixel;
     let (mut host, mut state) = blit_device();
     let mapping_id = 34u32;
@@ -1010,7 +1010,7 @@ fn type5_ref_texture_resolves_as_type11_blit_backing() {
     let backing = resolve_texture_backing(&mut state, &mut host, 1, obj_ref, 0, 0)
         .expect("type-5 blit source must resolve");
     match backing {
-        TextureBacking::Type11(t) => {
+        TextureBacking::IOSurface(t) => {
             assert_eq!(t.mapping_id, mapping_id, "backs the named surface");
             assert_eq!((t.width, t.height), (w, h), "view geometry, not base");
             assert_eq!(t.pixel_format, fmt);
@@ -1018,7 +1018,7 @@ fn type5_ref_texture_resolves_as_type11_blit_backing() {
             assert!(u64::from(t.row_stride) >= u64::from(w) * u64::from(t.bpp));
             assert!(t.span_end >= u64::from(t.row_stride) * u64::from(h));
         }
-        TextureBacking::Linear(_) => panic!("expected Type11 backing, got Linear"),
+        TextureBacking::Linear(_) => panic!("expected IOSurface backing, got Linear"),
     }
 }
 
@@ -1054,13 +1054,13 @@ fn type5_unknown_record_tag_fails_closed() {
 }
 
 #[test]
-fn biplanar_type11_y_and_uv_planes_distinct() {
+fn biplanar_iosurface_texture_y_and_uv_planes_distinct() {
     use crate::contract::pixel_format::{MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG8_UNORM};
     let (mut host, mut state) = blit_device();
     let mapping_id = 7u32;
     install_biplanar_mapping(&mut host, &mut state, mapping_id, 0x30);
     // Y plane texture ref 10, UV plane texture ref 11 — same mapping_id.
-    install_type11_plane(
+    install_iosurface_texture_plane(
         &mut host,
         &mut state,
         10,
@@ -1069,7 +1069,7 @@ fn biplanar_type11_y_and_uv_planes_distinct() {
         4,
         2,
     );
-    install_type11_plane(
+    install_iosurface_texture_plane(
         &mut host,
         &mut state,
         11,
@@ -1265,11 +1265,11 @@ fn install_type8_view(
 }
 
 #[test]
-fn copy_buffer_to_type8_view_of_type11() {
+fn copy_buffer_to_type8_view_of_iosurface_texture() {
     let (mut host, mut state) = blit_device();
     install_buffer(&mut host, &mut state, 1, 1, 256);
     let mapping_id = 9u32;
-    install_type11(&mut host, &mut state, 3, mapping_id, 0x20);
+    install_iosurface_texture(&mut host, &mut state, 3, mapping_id, 0x20);
     // View ref 8 → base 3, level 0, BGRA identity.
     install_type8_view(&mut host, &mut state, 8, 3, MTL_FORMAT_BGRA8_UNORM, 0, None);
     let pat = [0xaau8, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44];
@@ -1306,7 +1306,7 @@ fn copy_buffer_to_type8_view_of_type11() {
 fn type8_swizzled_view_rejected_for_blit() {
     let (mut host, mut state) = blit_device();
     install_buffer(&mut host, &mut state, 1, 1, 256);
-    install_type11(&mut host, &mut state, 3, 9, 0x20);
+    install_iosurface_texture(&mut host, &mut state, 3, 9, 0x20);
     // Non-identity swizzle BGRA order selectors.
     install_type8_view(
         &mut host,
@@ -1331,11 +1331,11 @@ fn type8_swizzled_view_rejected_for_blit() {
 }
 
 #[test]
-fn type8_level_base_on_type11_rejected() {
+fn type8_level_base_on_iosurface_texture_rejected() {
     // Metal forbids mipmapped IOSurfaces; view level_base=1 fail-closes.
     let (mut host, mut state) = blit_device();
     install_buffer(&mut host, &mut state, 1, 1, 256);
-    install_type11(&mut host, &mut state, 3, 9, 0x20);
+    install_iosurface_texture(&mut host, &mut state, 3, 9, 0x20);
     install_type8_view(
         &mut host,
         &mut state,
@@ -1713,8 +1713,8 @@ fn copy_buffer_to_multilevel_view_l1() {
 fn multilevel_view_relative_level_oob() {
     let (mut host, mut state) = blit_device();
     install_buffer(&mut host, &mut state, 1, 1, 64);
-    install_type11(&mut host, &mut state, 3, 9, 0x20);
-    // View over type-11 with level_count=1, level_base=0; command level 1 is OOB.
+    install_iosurface_texture(&mut host, &mut state, 3, 9, 0x20);
+    // View over IOSurface texture with level_count=1, level_base=0; command level 1 is OOB.
     install_type8_view(&mut host, &mut state, 8, 3, MTL_FORMAT_BGRA8_UNORM, 0, None);
     let mut cmd = copy_cmd(CopyKind::BufferToTexture, 1, 8);
     cmd.destination_level = 1; // relative 1 >= count 1
@@ -1944,7 +1944,7 @@ fn a_last_array_slice_is_not_charged_for_its_trailing_row_padding() {
             assert!(t.texel_offset(3, 1, 0).unwrap() + 4 <= EXACT);
             t.slice_stride
         }
-        TextureBacking::Type11(_) => panic!("linear texture resolved as type-11"),
+        TextureBacking::IOSurface(_) => panic!("linear texture resolved as IOSurface texture"),
     };
 
     // The bound this replaced charged a second whole stride and refused this
@@ -1999,7 +1999,7 @@ fn whole_surface_0x13e_single_level_copy() {
     assert_eq!(&back[16..32], &pat[16..32]);
 }
 
-/// A type-11 whole-surface `0x13e` moves every row, in order.
+/// An IOSurface texture whole-surface `0x13e` moves every row, in order.
 ///
 /// This arm stages the slice whole rather than a row at a time, because a
 /// per-row call into the mapping rail re-pays that rail's per-*rect* costs —
@@ -2015,10 +2015,10 @@ fn whole_surface_0x13e_single_level_copy() {
 /// buffer entire — a whole-buffer compare of a uniform fill would pass on a
 /// copy that wrote row 0 twice.
 #[test]
-fn a_type11_whole_surface_copy_lands_every_row_in_order() {
+fn a_iosurface_texture_whole_surface_copy_lands_every_row_in_order() {
     let (mut host, mut state) = blit_device();
-    install_type11(&mut host, &mut state, 2, 20, 0x40);
-    install_type11(&mut host, &mut state, 3, 21, 0x50);
+    install_iosurface_texture(&mut host, &mut state, 2, 20, 0x40);
+    install_iosurface_texture(&mut host, &mut state, 3, 21, 0x50);
 
     // 2×2 BGRA: two rows of 8 bytes, each row its own byte value.
     let src_pixels: [u8; 16] = [
@@ -2045,7 +2045,7 @@ fn a_type11_whole_surface_copy_lands_every_row_in_order() {
     assert_eq!(
         execute_blit(&mut state, &mut host, 1, &cmd),
         BlitStatus::Ok,
-        "a type-11 to type-11 whole-surface copy must execute"
+        "an IOSurface texture to IOSurface texture whole-surface copy must execute"
     );
 
     let mut back = [0u8; 16];
@@ -2652,7 +2652,7 @@ fn copy_region_io_enrichment_dedups_per_page_and_direction() {
 /// only pinned this arm at eight would pass again the moment the other one
 /// moved, which is the failure that produced the divergence in the first place.
 ///
-/// The chain runs `MAX_TEXTURE_VIEW_CHAIN` views down to a type-11 base, each
+/// The chain runs `MAX_TEXTURE_VIEW_CHAIN` views down to an IOSurface texture base, each
 /// view a plain identity hop, so the only thing that can refuse it is depth.
 #[test]
 fn a_copy_follows_a_view_chain_as_deep_as_a_sample_does() {
@@ -2661,10 +2661,10 @@ fn a_copy_follows_a_view_chain_as_deep_as_a_sample_does() {
     let (mut host, mut state) = blit_device();
     install_buffer(&mut host, &mut state, 1, 1, 256);
     let mapping_id = 9u32;
-    install_type11(&mut host, &mut state, 3, mapping_id, 0x20);
+    install_iosurface_texture(&mut host, &mut state, 3, mapping_id, 0x20);
 
     // Views live at refs `outermost` down to `base_view`, each viewing the next
-    // lower ref; the lowest views the type-11 at ref 3. The object list holds
+    // lower ref; the lowest views the IOSurface texture at ref 3. The object list holds
     // 16 entries, so the deepest legal chain has to fit under that.
     let base_view = 4u32;
     let outermost = base_view + MAX_TEXTURE_VIEW_CHAIN as u32 - 1;
@@ -2691,7 +2691,7 @@ fn a_copy_follows_a_view_chain_as_deep_as_a_sample_does() {
         .expect("the sample arm follows the contract's deepest chain");
     assert_eq!(
         resolved.base_texture_ref, 3,
-        "the sample arm must land on the type-11 base, not stop inside the chain"
+        "the sample arm must land on the IOSurface texture base, not stop inside the chain"
     );
 
     // The copy arm must reach the same base, and land real pixels through it.
@@ -2748,7 +2748,7 @@ fn a_copy_refuses_a_view_chain_the_sample_arm_also_refuses() {
 
     let (mut host, mut state) = blit_device();
     install_buffer(&mut host, &mut state, 1, 1, 256);
-    install_type11(&mut host, &mut state, 3, 9, 0x20);
+    install_iosurface_texture(&mut host, &mut state, 3, 9, 0x20);
 
     let base_view = 4u32;
     let outermost = base_view + MAX_TEXTURE_VIEW_CHAIN as u32; // one view too many
@@ -2867,7 +2867,7 @@ fn the_gpu_whole_plane_arm_refuses_a_plane_the_rail_would_not_write() {
     );
     assert_eq!(
         gpu_whole_plane_destination(None, Some(window), src),
-        Err(DstNotType11),
+        Err(DstNotIOSurface),
         "a linear allocation has no mapping for the rail to name"
     );
     assert_eq!(
@@ -3036,7 +3036,7 @@ fn the_gpu_whole_plane_arm_compares_stored_texels_and_not_transfer_functions() {
     );
 }
 
-/// The GPU arm for a whole-plane type-11 source going to a guest-linear
+/// The GPU arm for a whole-plane IOSurface texture source going to a guest-linear
 /// destination, decided from the two endpoints alone.
 ///
 /// The staging loop this stands in front of reads the source's *guest bytes*,
@@ -3048,13 +3048,13 @@ fn the_gpu_whole_plane_arm_compares_stored_texels_and_not_transfer_functions() {
 /// byte copy, and never about whether the guest's pages are readable.
 #[cfg(feature = "backend-vulkan")]
 #[test]
-fn a_whole_surface_type11_source_reaches_the_destinations_own_guest_plane() {
+fn a_whole_surface_iosurface_texture_source_reaches_the_destinations_own_guest_plane() {
     use T2tGvaRefusal::*;
 
     const W: u32 = 64;
     const H: u32 = 32;
     const BPR: u64 = 256;
-    let src = Type11Texture {
+    let src = IOSurfaceTextureBacking {
         mapping_id: 7,
         width: W,
         height: H,
@@ -3105,7 +3105,7 @@ fn a_whole_surface_type11_source_reaches_the_destinations_own_guest_plane() {
     assert_eq!(
         gpu_t2t_gva_plane(
             Some((W, H)),
-            &Type11Texture {
+            &IOSurfaceTextureBacking {
                 surface_offset: 0x8000,
                 ..src
             },

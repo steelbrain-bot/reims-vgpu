@@ -13,7 +13,7 @@
 //! 1. **Type-8 view → base.** A view resolves to the texture it wraps, and
 //!    carries a format override and a mip level forward with it. A swizzled view
 //!    is refused rather than resolved.
-//! 2. **Type-11 IOSurface.** Geometry comes from the live mapping, never from a
+//! 2. **IOSurface.** Geometry comes from the live mapping, never from a
 //!    sticky latch — the latch exists only for the window where the object-list
 //!    entry is transiently missing, and preferring it has twice routed a
 //!    dual-mapping composite onto one mapping.
@@ -21,7 +21,7 @@
 //!    the surface id; type-5 wraps type-4 and is what product colour targets
 //!    actually bind.
 //! 4. **Type-2/3 linear guest VA.** Wallpaper and background intermediates and
-//!    UI intermediate render targets live here, so a type-11-only resolve drops
+//!    UI intermediate render targets live here, so an IOSurface texture-only resolve drops
 //!    those passes entirely.
 //!
 //! The order is live-type-driven at every step: the object list is re-read and
@@ -84,7 +84,7 @@ use super::*;
 /// not "unreachable" — the first surface to take it will now be named and
 /// refused rather than named and rendered wrong.
 ///
-/// The **type-11** arm deliberately does not come through here. A type-11
+/// The **IOSurface texture** arm deliberately does not come through here. An IOSurface texture
 /// mapping's format has other writers, so its 0 can mean "not latched yet" rather
 /// than "refused", and BGRA8 is the display contract's stated default for that
 /// case ([`crate::runtime::compute_exec`]'s `or_bgra8` writes the same rule down).
@@ -400,22 +400,22 @@ pub(super) enum RenderTargetCause {
         view_level: u32,
         attachment_level: u32,
     },
-    /// A mip>0 view of an IOSurface. Type-11 sample windows carry planes, not
+    /// A mip>0 view of an IOSurface. IOSurface texture sample windows carry planes, not
     /// mip levels, so this geometry has no contract behind it.
-    Type11MipView { level: u32 },
+    IOSurfaceMipView { level: u32 },
     /// Neither the live descriptor nor the latch produced a mapping id.
-    Type11Unresolved,
+    IOSurfaceUnresolved,
     /// The mapping id resolved and names no live mapping.
-    Type11NoMapping { mapping_id: u32 },
+    IOSurfaceNoMapping { mapping_id: u32 },
     /// The mapping has no latched geometry, or a zero dimension.
-    Type11Geometry {
+    IOSurfaceGeometry {
         mapping_id: u32,
         has_geom: bool,
         width: u32,
         height: u32,
     },
     /// The mapping's format is not one Metal can render into.
-    Type11Format { mapping_id: u32, fmt: u16 },
+    IOSurfaceFormat { mapping_id: u32, fmt: u16 },
 
     /// The type-5 entry's descriptor bytes could not be read.
     Type5DescRead,
@@ -524,11 +524,11 @@ impl crate::observe::Decline for RenderTargetRefusal {
             C::ViewSwizzled => "rt_view_swizzled",
             C::ViewBaseUnbound => "rt_view_base_unbound",
             C::LevelOverflow { .. } => "rt_level_overflow",
-            C::Type11MipView { .. } => "rt_type11_mip_view",
-            C::Type11Unresolved => "rt_type11_unresolved",
-            C::Type11NoMapping { .. } => "rt_type11_no_mapping",
-            C::Type11Geometry { .. } => "rt_type11_geometry",
-            C::Type11Format { .. } => "rt_type11_format",
+            C::IOSurfaceMipView { .. } => "rt_iosurface_texture_mip_view",
+            C::IOSurfaceUnresolved => "rt_iosurface_texture_unresolved",
+            C::IOSurfaceNoMapping { .. } => "rt_iosurface_texture_no_mapping",
+            C::IOSurfaceGeometry { .. } => "rt_iosurface_texture_geometry",
+            C::IOSurfaceFormat { .. } => "rt_iosurface_texture_format",
             C::Type5DescRead => crate::observe::ladder_slug!("rt_type5", desc_read),
             C::Type5DescDecode { .. } => crate::observe::ladder_slug!("rt_type5", desc_decode),
             C::Type5SurfaceZero => "rt_type5_surface_zero",
@@ -562,7 +562,7 @@ impl crate::observe::Decline for RenderTargetRefusal {
         use RenderTargetCause as C;
         let mut v = vec![("base", self.base_ref.to_string())];
         match self.cause {
-            C::Type11MipView { level } | C::LinearLevelGva { level } => {
+            C::IOSurfaceMipView { level } | C::LinearLevelGva { level } => {
                 v.push(("level", level.to_string()))
             }
             C::LevelOverflow {
@@ -572,8 +572,8 @@ impl crate::observe::Decline for RenderTargetRefusal {
                 v.push(("view_level", view_level.to_string()));
                 v.push(("attachment_level", attachment_level.to_string()));
             }
-            C::Type11NoMapping { mapping_id } => v.push(("mid", mapping_id.to_string())),
-            C::Type11Geometry {
+            C::IOSurfaceNoMapping { mapping_id } => v.push(("mid", mapping_id.to_string())),
+            C::IOSurfaceGeometry {
                 mapping_id,
                 has_geom,
                 width,
@@ -583,7 +583,7 @@ impl crate::observe::Decline for RenderTargetRefusal {
                 v.push(("has_geom", has_geom.to_string()));
                 v.push(("dims", format!("{width}x{height}")));
             }
-            C::Type11Format { mapping_id, fmt } => {
+            C::IOSurfaceFormat { mapping_id, fmt } => {
                 v.push(("mid", mapping_id.to_string()));
                 v.push(("fmt", format!("{fmt:#x}")));
             }
@@ -680,7 +680,7 @@ impl crate::observe::Decline for RenderTargetRefusal {
             C::ZeroExtent { width, height } => v.push(("dims", format!("{width}x{height}"))),
             C::ViewSwizzled
             | C::ViewBaseUnbound
-            | C::Type11Unresolved
+            | C::IOSurfaceUnresolved
             | C::Type5DescRead
             | C::Type5SurfaceZero
             | C::NoListEntry
@@ -690,9 +690,9 @@ impl crate::observe::Decline for RenderTargetRefusal {
     }
 }
 
-/// Archive `apple_pv_gpu_lookup_render_target`: type-11 first, else type-2/3 GVA.
+/// Archive `apple_pv_gpu_lookup_render_target`: IOSurface texture first, else type-2/3 GVA.
 ///
-/// Wallpaper/background intermediates are type-2/3 guest-VA; type-11-only resolve
+/// Wallpaper/background intermediates are type-2/3 guest-VA; IOSurface texture-only resolve
 /// drops those passes (black wallpaper). Color RT formats are the Metal color-
 /// renderable set admitted by [`pixel_format::render_target_bpp`] (RGBA8 family,
 /// BGRA8 family, RGBA16Float) — bring-up only listed compositor BGRA8/0x73.
@@ -768,7 +768,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     // The level the pass names is relative to the texture it names, so a pass
     // rendering into level 1 of a view whose own range starts at level 2 lands
     // on the base texture's level 3. Both halves reach every rung below as one
-    // number, which is what keeps the type-11 and type-4 rungs — neither of
+    // number, which is what keeps the IOSurface texture and type-4 rungs — neither of
     // which has a mip layout — refusing an attachment level as loudly as they
     // already refuse a view level.
     let level = view_level.checked_add(att.level).ok_or(
@@ -782,11 +782,11 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         return Err(C::ViewBaseUnbound.at(resolved_ref));
     }
     // Archive lookup order is by **live** object-list type + descriptor, not a
-    // sticky cache: type-11 first, else type-2/3. Guest reuses object refs;
+    // sticky cache: IOSurface texture first, else type-2/3. Guest reuses object refs;
     // two failure modes for a stale `texture_to_mapping` latch:
-    // 1) live type is now type-2/3 → must not force type-11 (live residual
+    // 1) live type is now type-2/3 → must not force IOSurface texture (live residual
     //    mrt color RT resolve fail ref=199 type=2 fmt=0x73 480x64).
-    // 2) live type is still type-11 but descriptor mapping_id changed (or a
+    // 2) live type is still IOSurface texture but descriptor mapping_id changed (or a
     //    recycled ref now names a different mid) → must re-read the live
     //    descriptor, not prefer the latch. Preferring latch routed dual-mid
     //    full-screen desktop composites onto only one mid (mid=3 nz=6M vs
@@ -795,53 +795,57 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     let live_type = live.as_ref().map(|e| e.kind);
     if let Some(ot) = live_type {
         if ot != ObjectKind::IOSurfaceTexture {
-            // Live list says not type-11 — drop any recycled-ref latch.
+            // Live list says not IOSurface texture — drop any recycled-ref latch.
             state.texture_to_mapping.remove(&(task_id, resolved_ref));
         }
     }
-    let try_type11 = live_type == Some(ObjectKind::IOSurfaceTexture)
+    let try_iosurface_texture = live_type == Some(ObjectKind::IOSurfaceTexture)
         || (live_type.is_none()
             && state
                 .texture_to_mapping
                 .contains_key(&(task_id, resolved_ref)));
-    if try_type11 {
-        // Type-11 sample windows carry planes, not mip levels — a mip>0 view
+    if try_iosurface_texture {
+        // IOSurface texture sample windows carry planes, not mip levels — a mip>0 view
         // of an IOSurface has no contract-backed layout; fail visibly.
         if level != 0 {
-            return Err(C::Type11MipView { level }.at(resolved_ref));
+            return Err(C::IOSurfaceMipView { level }.at(resolved_ref));
         }
-        // Live list is source of truth for mapping_id when the entry is type-11.
+        // Live list is source of truth for mapping_id when the entry is IOSurface texture.
         // Latch is only a fallback when the list entry is transiently missing
-        // (resolve_type11_ref refreshes the latch from the live descriptor).
+        // (resolve_iosurface_texture_ref refreshes the latch from the live descriptor).
         let mapping_id = if live_type == Some(ObjectKind::IOSurfaceTexture) {
-            objects::resolve_type11_ref(state, host, task_id, resolved_ref).or_else(|| {
-                state
-                    .texture_to_mapping
-                    .get(&(task_id, resolved_ref))
-                    .copied()
-            })
+            objects::resolve_iosurface_texture_ref(state, host, task_id, resolved_ref).or_else(
+                || {
+                    state
+                        .texture_to_mapping
+                        .get(&(task_id, resolved_ref))
+                        .copied()
+                },
+            )
         } else {
             state
                 .texture_to_mapping
                 .get(&(task_id, resolved_ref))
                 .copied()
-                .or_else(|| objects::resolve_type11_ref(state, host, task_id, resolved_ref))
+                .or_else(|| {
+                    objects::resolve_iosurface_texture_ref(state, host, task_id, resolved_ref)
+                })
         }
-        .ok_or(C::Type11Unresolved.at(resolved_ref))?;
+        .ok_or(C::IOSurfaceUnresolved.at(resolved_ref))?;
         let _ = mapper::ensure_resolved_for_scanout(state, host, mapping_id);
         // This rung is terminal either way, and both directions were already
-        // true before it said so. A live type-11 that fails geometry must not
+        // true before it said so. A live IOSurface texture that fails geometry must not
         // be decoded as type-2/3 — that is the sticky-latch bug above. And in
         // the only other case that reaches here, `live_type` is `None`
-        // (`try_type11` admits nothing else), so every rung below ends at
+        // (`try_iosurface_texture` admits nothing else), so every rung below ends at
         // `NoListEntry`: falling through reported the ladder's least specific
-        // refusal for a failure the type-11 rung had already diagnosed.
+        // refusal for a failure the IOSurface texture rung had already diagnosed.
         let m = state
             .mappings
             .get(&mapping_id)
-            .ok_or(C::Type11NoMapping { mapping_id }.at(resolved_ref))?;
+            .ok_or(C::IOSurfaceNoMapping { mapping_id }.at(resolved_ref))?;
         if !m.has_geom || m.width == 0 || m.height == 0 {
-            return Err(C::Type11Geometry {
+            return Err(C::IOSurfaceGeometry {
                 mapping_id,
                 has_geom: m.has_geom,
                 width: m.width,
@@ -849,7 +853,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             }
             .at(resolved_ref));
         }
-        // Not `rt_type4_base_format`: a type-11 mapping's format has
+        // Not `rt_type4_base_format`: an IOSurface texture mapping's format has
         // writers other than the type-4 decoder, so 0 here can mean "not
         // latched yet" rather than "refused", and BGRA8 is the display
         // contract's default for that case. See that function.
@@ -860,7 +864,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         };
         let fmt = effective_view_sample_format(base_fmt, view_fmt_override).unwrap_or(base_fmt);
         if pixel_format::render_target_bpp(fmt).is_none() {
-            return Err(C::Type11Format { mapping_id, fmt }.at(resolved_ref));
+            return Err(C::IOSurfaceFormat { mapping_id, fmt }.at(resolved_ref));
         }
         return Ok(ResolvedRenderTarget {
             storage: super::ColorTargetStorage::Mapping(mapping_id),
@@ -1367,10 +1371,10 @@ mod tests {
         );
     }
 
-    /// A type-11 latch whose mapping has no geometry is reported as that, not
+    /// An IOSurface texture latch whose mapping has no geometry is reported as that, not
     /// as the missing object-list entry three rungs further down.
     ///
-    /// This is the terminal-rung property. The type-11 arm used to return only
+    /// This is the terminal-rung property. The IOSurface texture arm used to return only
     /// when the *live* list said IOSurface; a latch-only attempt that failed
     /// geometry fell through to the type-4 and linear rungs instead. It could
     /// not resolve there — `live_type` is `None` in that arm by construction,
@@ -1380,7 +1384,7 @@ mod tests {
     /// reported `no_list_entry` for a surface whose mapping it had already
     /// found and measured.
     #[test]
-    fn a_type11_latch_without_geometry_names_the_geometry_check() {
+    fn a_iosurface_texture_latch_without_geometry_names_the_geometry_check() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         let host = FakeHost::new();
         let tex_ref = 0x5c2u32;
@@ -1394,7 +1398,7 @@ mod tests {
         assert!(lookup_render_target(&mut state, &host, 4, attach(tex_ref)).is_none());
         let line = cap.one("rt_resolve");
         assert!(
-            line.starts_with("rt_resolve reason=rt_type11_geometry "),
+            line.starts_with("rt_resolve reason=rt_iosurface_texture_geometry "),
             "the rung that found the mapping must be the one that reports: {line}"
         );
         assert!(

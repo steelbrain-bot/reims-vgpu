@@ -1576,7 +1576,7 @@ impl ComputeBufferResult {
 
 /// Storage image for compute. Formats mirror the live `simg_u32_to_vk_storage` map.
 ///
-/// Single-layer 2D only: a compute texture binding is staged from one type-11
+/// Single-layer 2D only: a compute texture binding is staged from one IOSurface texture
 /// plane window or one linear GVA level, both of which are a flat `width ×
 /// height` rectangle. There is no decoded slice or depth axis on this rail, so
 /// the engine builds `TYPE_2D` unconditionally.
@@ -1594,7 +1594,7 @@ pub struct ComputeStorageImageResource {
     pub seed: ComputeStorageImageSeed,
     /// Where the post-dispatch pixels go. See [`ComputeImageDestination`].
     pub destination: ComputeImageDestination,
-    /// Exact type-11 resource lifetime/view contract for persistent GPU
+    /// Exact IOSurface texture resource lifetime/view contract for persistent GPU
     /// storage. `None` keeps the conservative transient upload path.
     pub residency: Option<ComputeStorageResidency>,
 }
@@ -1798,7 +1798,7 @@ pub enum TargetIdentity {
         /// This target's resident image format, from the pixel format the
         /// mapping declares for its own plane.
         ///
-        /// A type-11 mapping is not BGRA8 by its contract, which is what this
+        /// An IOSurface texture mapping is not BGRA8 by its contract, which is what this
         /// namespace assumed for as long as it held no format: it declares a
         /// format, `mapping_write` reads that declaration to lay out the
         /// writeback, and macOS 26 declares `MTLPixelFormatRGBA16Float` for
@@ -2059,7 +2059,7 @@ impl TargetIdentity {
     ///
     /// Each namespace answers it from what it knows:
     ///
-    /// * `Surface` backs a type-11 guest IOSurface, whose plane carries a
+    /// * `Surface` backs an IOSurface texture guest IOSurface, whose plane carries a
     ///   declared pixel format exactly as a GVA target does — usually guest
     ///   scanout order, and not always.
     /// * `Gva` is a render target the guest declared a pixel format for, and
@@ -2807,7 +2807,7 @@ mod tests {
     ///
     /// `Surface` answers from the format its mapping declared, and one
     /// constructed at the scanout format reports BGRA: every CPU consumer of a
-    /// type-11 composite Store is declared in guest scanout order, so an RGBA
+    /// IOSurface texture composite Store is declared in guest scanout order, so an RGBA
     /// resident under a scanout-declared mapping costs a whole-frame exchange
     /// per Store.
     ///

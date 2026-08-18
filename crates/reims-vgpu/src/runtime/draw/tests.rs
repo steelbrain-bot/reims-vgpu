@@ -204,7 +204,7 @@ fn strided_window_extent_measures_padded_rows_and_refuses_unrepresentable_stride
 
 #[test]
 #[cfg(feature = "backend-vulkan")]
-fn type11_zero_copy_declines_transient_host_mappings() {
+fn iosurface_texture_zero_copy_declines_transient_host_mappings() {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
@@ -228,7 +228,10 @@ fn type11_zero_copy_declines_transient_host_mappings() {
     }
     assert!(state.set_mapping_geom(mid, width, height, MTL_FORMAT_BGRA8_UNORM));
 
-    assert!(try_type11_sample_zero_copy(&mut state, &mut host, mid, width, height,).is_none());
+    assert!(
+        try_iosurface_texture_sample_zero_copy(&mut state, &mut host, mid, width, height,)
+            .is_none()
+    );
     assert_eq!(
         host.map_pages_calls, 0,
         "transient hosts must decline before creating an importable view"
@@ -271,23 +274,31 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
         crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB,
     ));
     crate::runtime::guest_ram::latch_import_limits(page, 1 << 30, 1 << 30);
-    let type11_witnesses = crate::runtime::drain::store_route_count("gw_rail_t11");
+    let iosurface_texture_witnesses = crate::runtime::drain::store_route_count("gw_rail_iosurface");
     let type5_witnesses = crate::runtime::drain::store_route_count("gw_rail_t5");
-    let type11 = try_type11_sample_zero_copy(&mut state, &mut host, mid, 128, 128)
-        .expect("the mapping's color plane is sampleable");
-    let SampledSourceRequest::GuestRuns(type11, _, type11_format, _, type11_identity, ..) = type11
+    let iosurface_texture =
+        try_iosurface_texture_sample_zero_copy(&mut state, &mut host, mid, 128, 128)
+            .expect("the mapping's color plane is sampleable");
+    let SampledSourceRequest::GuestRuns(
+        iosurface_texture,
+        _,
+        iosurface_texture_format,
+        _,
+        iosurface_texture_identity,
+        ..,
+    ) = iosurface_texture
     else {
         panic!("the mapping stays guest-backed")
     };
-    assert_eq!(type11_format, ash::vk::Format::B8G8R8A8_SRGB);
-    assert!(type11_identity.is_some());
+    assert_eq!(iosurface_texture_format, ash::vk::Format::B8G8R8A8_SRGB);
+    assert!(iosurface_texture_identity.is_some());
     assert_eq!(
-        crate::runtime::drain::store_route_count("gw_rail_t11"),
-        type11_witnesses + 1,
+        crate::runtime::drain::store_route_count("gw_rail_iosurface"),
+        iosurface_texture_witnesses + 1,
         "the imported source and its copied fallback share one witness"
     );
-    let type11_import = std::sync::Arc::clone(
-        type11
+    let iosurface_texture_import = std::sync::Arc::clone(
+        iosurface_texture
             .pages
             .as_ref()
             .expect("stable allocation is GPU-addressable")[0]
@@ -330,17 +341,20 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
     crate::runtime::guest_ram::forget_import_limits();
 
     assert_eq!(
-        type11_import.id(),
+        iosurface_texture_import.id(),
         type5_import.id(),
         "two views of one mapping must retain the mapping's one import"
     );
-    assert!(std::sync::Arc::ptr_eq(&type11_import, &type5_import));
+    assert!(std::sync::Arc::ptr_eq(
+        &iosurface_texture_import,
+        &type5_import
+    ));
     assert_eq!(
         state.mappings[&mid]
             .contig_import
             .as_ref()
             .map(|import| import.id()),
-        Some(type11_import.id())
+        Some(iosurface_texture_import.id())
     );
 }
 
@@ -370,7 +384,7 @@ fn small_mapping_sampled_plane_uses_its_imported_copy_source() {
         vec![((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT | PAGE_ENTRY_VALID];
     assert!(state.set_mapping_geom(mid, width, height, MTL_FORMAT_BGRA8_UNORM));
     crate::runtime::guest_ram::latch_import_limits(page, 1 << 30, 1 << 30);
-    let sampled = try_type11_sample_zero_copy(&mut state, &mut host, mid, width, height)
+    let sampled = try_iosurface_texture_sample_zero_copy(&mut state, &mut host, mid, width, height)
         .expect("a directly-backed sampled resource has no size crossover");
     let SampledSourceRequest::GuestRuns(source, ..) = sampled else {
         panic!("the mapping stays guest-backed")
@@ -937,7 +951,7 @@ fn swap_rb_channels_matches_two_pass_and_preserves_tail() {
 /// the order asked for, and match `swap_rb_channels` when it is not.
 ///
 /// The no-op half is the whole point of threading the order rather than
-/// normalizing: a type-11 composite Store's readback now arrives BGRA, so this is
+/// normalizing: an IOSurface texture composite Store's readback now arrives BGRA, so this is
 /// the call that used to be a 776 us whole-frame pass and is now a compare. A
 /// future edit that made it exchange unconditionally would restore that cost
 /// silently — the pixels would still be right.
@@ -979,7 +993,7 @@ fn stage_in_buffer_read_as_ssbo_is_bound_as_storage() {
 }
 
 /// Resident GVA chain wiring: the identity is built only for GVA color0
-/// (never type-11), and its extent is color0's declared geometry — the one
+/// (never IOSurface texture), and its extent is color0's declared geometry — the one
 /// place a draw states what it renders into.
 #[cfg(feature = "backend-vulkan")]
 #[test]
@@ -1017,7 +1031,7 @@ fn gva_chain_identity_rules() {
     assert_eq!(
         gva_chain_identity(&req),
         None,
-        "type-11 targets never take the GVA identity"
+        "IOSurface texture targets never take the GVA identity"
     );
     req.colors[0].storage = ColorTargetStorage::None;
     assert_eq!(gva_chain_identity(&req), None, "gva=0 → no identity");
@@ -1025,7 +1039,7 @@ fn gva_chain_identity_rules() {
 
 #[cfg(feature = "backend-vulkan")]
 #[test]
-fn render_chain_identity_covers_type11_and_gva_targets() {
+fn render_chain_identity_covers_iosurface_texture_and_gva_targets() {
     use crate::backend::vulkan::engine::TargetIdentity;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -1067,7 +1081,7 @@ fn render_chain_identity_covers_type11_and_gva_targets() {
 /// from so it can skip its own readback.
 ///
 /// Refusing `chain_from_resident` here cost the entire remaining composite
-/// readback population — `t11_keep_chain_from_resident` measured equal to
+/// readback population — `iosurface_keep_chain_from_resident` measured equal to
 /// `surface_deferred` in every window of one boot. The assertion that matters is
 /// the *equality*: `retarget_render_pass_draw` builds every record of a packet
 /// from one attachment template, so the record that loads from the resident is by
@@ -1090,7 +1104,7 @@ fn a_chained_composite_store_names_the_resident_it_loads_from() {
         ..Default::default()
     });
 
-    let unchained = type11_store_identity(&state, &req, true);
+    let unchained = iosurface_texture_store_identity(&state, &req, true);
     assert!(
         unchained.is_some(),
         "an unchained composite Store resolves its resident"
@@ -1098,13 +1112,13 @@ fn a_chained_composite_store_names_the_resident_it_loads_from() {
 
     req.chain_from_resident = true;
     assert_eq!(
-        type11_store_identity(&state, &req, true),
+        iosurface_texture_store_identity(&state, &req, true),
         unchained,
         "a chained Store must name the same resident an unchained one does — it is \
          the same attachment template, so the chain cannot move the slot"
     );
     assert_eq!(
-        type11_store_identity(&state, &req, true),
+        iosurface_texture_store_identity(&state, &req, true),
         render_chain_identity(&state, &req),
         "the Store identity and the LoadFromTarget identity must be one slot"
     );
@@ -1113,20 +1127,20 @@ fn a_chained_composite_store_names_the_resident_it_loads_from() {
     // separates the packet's last record from its intermediates, and an
     // intermediate has no guest Store to defer.
     assert_eq!(
-        type11_store_identity(&state, &req, false),
+        iosurface_texture_store_identity(&state, &req, false),
         None,
         "an intermediate record stores nothing guest-visible"
     );
     req.colors[0].store_action = crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE;
     assert_eq!(
-        type11_store_identity(&state, &req, true),
+        iosurface_texture_store_identity(&state, &req, true),
         None,
         "a record that discards its target has no frame to defer"
     );
     req.colors[0].store_action = MTL_STORE_ACTION_STORE;
     req.colors[0].storage = ColorTargetStorage::None;
     assert_eq!(
-        type11_store_identity(&state, &req, true),
+        iosurface_texture_store_identity(&state, &req, true),
         None,
         "a GVA target is the other rail's; this one requires a mapping"
     );
@@ -1164,8 +1178,9 @@ fn an_intermediate_record_can_still_ask_about_the_resident_it_renders_into() {
     // The query the LOAD actually asks. It takes no `writeback_guest`, so an
     // intermediate and a final record get the same answer by construction — which
     // is the property, and it is structural rather than asserted.
-    let (identity, mapping_epoch) = type11_load_currency_query(&state, &req)
-        .expect("a LOAD into a mapped type-11 surface is a candidate the resident could serve");
+    let (identity, mapping_epoch) = iosurface_texture_load_currency_query(&state, &req).expect(
+        "a LOAD into a mapped IOSurface texture surface is a candidate the resident could serve",
+    );
     assert_eq!(
         Some(identity.clone()),
         render_chain_identity(&state, &req),
@@ -1173,18 +1188,18 @@ fn an_intermediate_record_can_still_ask_about_the_resident_it_renders_into() {
     );
     assert_eq!(
         Some(identity),
-        type11_store_identity(&state, &req, true),
+        iosurface_texture_store_identity(&state, &req, true),
         "the Store identity is the same slot, restricted — not a different one"
     );
     assert_eq!(
         mapping_epoch,
         Some(0),
         "a freshly mapped surface has published nothing, and 0 is that value — the \
-         `is_some` guard in `type11_resident_is_current` is what keeps it from \
+         `is_some` guard in `iosurface_texture_resident_is_current` is what keeps it from \
          matching an unstamped slot"
     );
     assert_eq!(
-        type11_store_identity(&state, &req, false),
+        iosurface_texture_store_identity(&state, &req, false),
         None,
         "…while only the packet's last record may leave its frame on the resident"
     );
@@ -1193,25 +1208,25 @@ fn an_intermediate_record_can_still_ask_about_the_resident_it_renders_into() {
     // all, or the counters below it would divide all draws instead of candidates.
     req.colors[0].load_action = crate::contract::pass_action::MTL_LOAD_ACTION_CLEAR;
     assert!(
-        type11_load_currency_query(&state, &req).is_none(),
+        iosurface_texture_load_currency_query(&state, &req).is_none(),
         "a CLEAR has no prior content to be current"
     );
     req.colors[0].load_action = MTL_LOAD_ACTION_LOAD;
     req.colors[0].target_seed_rgba = Some(vec![0u8; 128 * 64 * 4]);
     assert!(
-        type11_load_currency_query(&state, &req).is_none(),
+        iosurface_texture_load_currency_query(&state, &req).is_none(),
         "an explicit seed was already selected by RT provenance"
     );
     req.colors[0].target_seed_rgba = None;
     req.colors[0].store_action = crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE;
     assert!(
-        type11_load_currency_query(&state, &req).is_none(),
+        iosurface_texture_load_currency_query(&state, &req).is_none(),
         "a record that discards its target renders into no resident worth naming"
     );
     req.colors[0].store_action = MTL_STORE_ACTION_STORE;
     req.colors[0].storage = ColorTargetStorage::None;
     assert!(
-        type11_load_currency_query(&state, &req).is_none(),
+        iosurface_texture_load_currency_query(&state, &req).is_none(),
         "a GVA target is the other rail's"
     );
 }
@@ -2212,7 +2227,7 @@ fn blend_state_maps_src_alpha_one_minus() {
     assert!(translate::blend::operation(9).is_err());
 }
 
-/// qemu-shim: guest Load with unresolvable type-11 pages still encodes
+/// qemu-shim: guest Load with unresolvable IOSurface texture pages still encodes
 /// (archive NULL seed / Metal Clear invent) — does not drop the pass.
 #[test]
 fn mrt_draw_request_load_seed_miss_still_encodes() {
@@ -2223,7 +2238,7 @@ fn mrt_draw_request_load_seed_miss_still_encodes() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     state.define_task(1, 0x1000, 2);
-    // Type-11 registered with geom but empty page table → seed read fails.
+    // IOSurface texture registered with geom but empty page table → seed read fails.
     assert!(state.map_surface(9));
     assert!(state.set_mapping_geom(9, 8, 8, MTL_FORMAT_BGRA8_UNORM));
     // gen must be non-zero for Load path to attempt a snapshot (archive).
@@ -2356,11 +2371,11 @@ fn mrt_draw_request_refuses_a_resolve_destination_with_different_geometry() {
     }));
 }
 
-/// qemu-shim: type-8 view of type-11 is a valid color RT (archive
+/// qemu-shim: type-8 view of IOSurface texture is a valid color RT (archive
 /// resource_resolve_texture view chain). Without this, App Store UI pipes
 /// that bind a view as color attachment drop the entire MRT pass.
 #[test]
-fn mrt_draw_request_type8_view_of_type11_as_color_rt() {
+fn mrt_draw_request_type8_view_of_iosurface_texture_as_color_rt() {
     use crate::contract::endian::{st16, st32, st64};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
@@ -2381,7 +2396,7 @@ fn mrt_draw_request_type8_view_of_type11_as_color_rt() {
     // Object list at GVA page 0; count covers live residual slot 211.
     assert!(state.set_object_list(1, 0, 256));
 
-    // Base type-11 mid 9 latched as texture ref 3.
+    // Base IOSurface texture mid 9 latched as texture ref 3.
     assert!(state.map_surface(9));
     assert!(state.set_mapping_geom(9, 64, 64, MTL_FORMAT_BGRA8_UNORM));
     state.mappings.get_mut(&9).unwrap().content_generation = 1;
@@ -2422,7 +2437,7 @@ fn mrt_draw_request_type8_view_of_type11_as_color_rt() {
 
     let att = clear_black_attachment(view_ref);
     let req = single_rt_draw_request(&mut state, &mut host, 12, att)
-        .expect("type-8 view of type-11 must resolve as color RT");
+        .expect("type-8 view of IOSurface texture must resolve as color RT");
     assert_eq!(req.colors[0].mapping_id(), 9);
     assert_eq!(req.colors[0].width, 64);
     assert_eq!(req.colors[0].height, 64);
@@ -2430,10 +2445,10 @@ fn mrt_draw_request_type8_view_of_type11_as_color_rt() {
 }
 
 /// Archive `REIMS_VGPU_RESOURCE_RESOLVE_MAX_VIEW_CHAIN`: nested type-8 → type-8 →
-/// type-11 must collapse to the non-view base. One-hop resolve left the mid
+/// IOSurface texture must collapse to the non-view base. One-hop resolve left the mid
 /// base as type-8 and dropped the MRT pass (`view_base_or_swizzle`).
 #[test]
-fn mrt_draw_request_nested_type8_view_chain_to_type11() {
+fn mrt_draw_request_nested_type8_view_chain_to_iosurface_texture() {
     use crate::contract::endian::{st16, st32, st64};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
@@ -2488,19 +2503,19 @@ fn mrt_draw_request_nested_type8_view_chain_to_type11() {
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 256));
 
-    // type-11 mid 9 as texture ref 3.
+    // IOSurface texture mid 9 as texture ref 3.
     assert!(state.map_surface(9));
     assert!(state.set_mapping_geom(9, 64, 64, MTL_FORMAT_BGRA8_UNORM));
     state.mappings.get_mut(&9).unwrap().content_generation = 1;
     state.texture_to_mapping.insert((1, 3), 9);
 
-    // Inner view 8 → base 3 (type-11); outer view 211 → base 8 (type-8).
+    // Inner view 8 → base 3 (IOSurface texture); outer view 211 → base 8 (type-8).
     write_type8_view(&mut host, &state, 8, 3, 0x280);
     write_type8_view(&mut host, &state, 211, 8, 0x300);
 
     let att = clear_black_attachment(211);
     let req = single_rt_draw_request(&mut state, &mut host, 12, att)
-        .expect("nested type-8→type-8→type-11 must resolve as color RT");
+        .expect("nested type-8→type-8→IOSurface texture must resolve as color RT");
     assert_eq!(req.colors[0].mapping_id(), 9);
     assert_eq!(req.colors[0].width, 64);
     assert_eq!(req.colors[0].height, 64);
@@ -2580,10 +2595,10 @@ fn mrt_draw_request_type8_swizzled_view_rejected_as_color_rt() {
 }
 
 /// qemu-shim: type-2 linear RGBA16Float is a valid color RT. Stale
-/// `texture_to_mapping` from a prior type-11 at the same ref must not
+/// `texture_to_mapping` from a prior IOSurface texture at the same ref must not
 /// fail-closed (live residual ref=199 type=2 fmt=0x73).
 #[test]
-fn mrt_draw_request_type2_rgba16f_as_color_rt_despite_stale_t11_latch() {
+fn mrt_draw_request_type2_rgba16f_as_color_rt_despite_stale_iosurface_latch() {
     use crate::contract::endian::{st16, st32, st64};
     use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA16_FLOAT};
     use crate::runtime::decode::resource::{
@@ -2598,7 +2613,7 @@ fn mrt_draw_request_type2_rgba16f_as_color_rt_despite_stale_t11_latch() {
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 16);
     assert!(state.set_object_list(1, 0, 256));
 
-    // Stale type-11 latch at ref 199 (guest recycled the ref to type-2).
+    // Stale IOSurface texture latch at ref 199 (guest recycled the ref to type-2).
     assert!(state.map_surface(99));
     assert!(state.set_mapping_geom(99, 64, 64, MTL_FORMAT_BGRA8_UNORM));
     state.texture_to_mapping.insert((1, 199), 99);
@@ -2631,7 +2646,7 @@ fn mrt_draw_request_type2_rgba16f_as_color_rt_despite_stale_t11_latch() {
 
     let att = clear_black_attachment(tex_ref);
     let req = single_rt_draw_request(&mut state, &mut host, 12, att)
-        .expect("type-2 RGBA16F RT must resolve despite stale type-11 latch");
+        .expect("type-2 RGBA16F RT must resolve despite stale IOSurface texture latch");
     assert_eq!(req.colors[0].mapping_id(), 0);
     assert_eq!(req.colors[0].width, w);
     assert_eq!(req.colors[0].height, h);
@@ -2644,11 +2659,11 @@ fn mrt_draw_request_type2_rgba16f_as_color_rt_despite_stale_t11_latch() {
     assert!(!state.texture_to_mapping.contains_key(&(1, tex_ref)));
 }
 
-/// Live type-11 descriptor mapping_id wins over a stale texture_to_mapping
+/// Live IOSurface texture descriptor mapping_id wins over a stale texture_to_mapping
 /// latch (dual-mid recycled-ref residual: full desktop Store must land on
 /// the mid named by the live descriptor, not a prior latch).
 #[test]
-fn mrt_draw_request_type11_live_mapping_overrides_stale_latch() {
+fn mrt_draw_request_iosurface_texture_live_mapping_overrides_stale_latch() {
     use crate::contract::endian::{st16, st32};
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
@@ -2671,7 +2686,7 @@ fn mrt_draw_request_type11_live_mapping_overrides_stale_latch() {
     let _ = host.write_gpa(root_gpa, &d[..4]);
     state.define_task(1, 0x1000, 2);
     assert!(state.set_object_list(1, 0, 8));
-    // Live type-11 at ref=1 → mapping_id=4 (descriptor first u32).
+    // Live IOSurface texture at ref=1 → mapping_id=4 (descriptor first u32).
     let mut entry = [0u8; 12];
     st32(&mut entry[0..], 11u32 | (0x20u32 << 8));
     entry[4..12].copy_from_slice(&0x40u64.to_le_bytes());
@@ -2692,7 +2707,7 @@ fn mrt_draw_request_type11_live_mapping_overrides_stale_latch() {
 
     let att = clear_black_attachment(1);
     let req = single_rt_draw_request(&mut state, &mut host, 12, att)
-        .expect("live type-11 RT must resolve");
+        .expect("live IOSurface texture RT must resolve");
     assert_eq!(
         req.colors[0].mapping_id(),
         4,
@@ -3883,7 +3898,7 @@ fn type5_sample_uses_descriptor_surface_id_not_ref_collision() {
 /// `next_sampled_content_generation` in the same breath as it changes the bytes.
 #[cfg(feature = "backend-vulkan")]
 #[test]
-fn type11_host_cache_rung_identity_tracks_the_cached_frame() {
+fn iosurface_texture_host_cache_rung_identity_tracks_the_cached_frame() {
     use crate::contract::endian::st32;
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
@@ -3995,7 +4010,7 @@ fn type11_host_cache_rung_identity_tracks_the_cached_frame() {
     assert_eq!(
         first_id.key,
         (1u64 << 62) | surface_id as u64,
-        "bit 62 alone is the type-11 host-cache namespace"
+        "bit 62 alone is the IOSurface texture host-cache namespace"
     );
     let stored_gen = crate::runtime::surface_cache::get_shared_with_gen(&state, surface_id, 4, 3)
         .expect("the frame just stored must be readable")
@@ -5683,7 +5698,7 @@ fn a_draw_skipped_after_an_engine_refusal_is_counted_with_the_vertices_it_cost()
     );
 }
 
-/// A type-11 sample must resolve the mapping *before* it reads its geometry.
+/// An IOSurface texture sample must resolve the mapping *before* it reads its geometry.
 ///
 /// A mapped surface with a live `MappingInternal` can have no latched W×H yet:
 /// that geometry lives in the guest device-surface descriptor, and
@@ -5696,7 +5711,7 @@ fn a_draw_skipped_after_an_engine_refusal_is_counted_with_the_vertices_it_cost()
 /// `set_mapping_geom` — so this passes with the resolve first and fails with it
 /// after the geometry read.
 #[test]
-fn type11_sample_resolves_geometry_before_reading_it() {
+fn iosurface_texture_sample_resolves_geometry_before_reading_it() {
     use crate::contract::endian::{st32, st64};
     use crate::contract::iosurface_pages::{
         DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_BPR, DEVICE_DESC_DIMS, DEVICE_DESC_LEN,
@@ -5791,8 +5806,8 @@ fn type11_sample_resolves_geometry_before_reading_it() {
         );
     }
 
-    let (gw, gh, rgba) = load_type11_mapping_rgba(&mut state, &mut host, mid, None).expect(
-        "a mapped type-11 surface whose dims are still only in the device descriptor \
+    let (gw, gh, rgba) = load_iosurface_mapping_rgba(&mut state, &mut host, mid, None).expect(
+        "a mapped IOSurface texture surface whose dims are still only in the device descriptor \
          must sample, not drop the bind",
     );
     assert_eq!((gw, gh), (w, h), "geometry must come from the resolve");

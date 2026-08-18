@@ -190,7 +190,7 @@ fn stage_texture_type5_plane_index_beats_the_ambiguous_geometry_scan() {
     let staged = stage_texture_raw(&mut state, &mut host, 1, type5_ref, 33, true)
         .expect("a type-5 plane view over a mapped surface must stage");
     match staged.writeback {
-        TextureWriteback::Type11 {
+        TextureWriteback::IOSurface {
             surface_offset,
             surface_bpr,
             ..
@@ -202,7 +202,7 @@ fn stage_texture_type5_plane_index_beats_the_ambiguous_geometry_scan() {
                  over plane 0 that the ambiguous geometry scan falls back to"
             );
         }
-        _ => panic!("a type-5 view over a surface mapping must write back as type-11"),
+        _ => panic!("a type-5 view over a surface mapping must write back as IOSurface texture"),
     }
 }
 
@@ -1238,7 +1238,7 @@ fn stage_texture_type5_ref_resolves_surface_mapping() {
     assert!(staged.bytes.is_empty(), "the input has one typed owner");
     assert!(matches!(
         staged.writeback,
-        TextureWriteback::Type11 { mapping_id: 3, .. }
+        TextureWriteback::IOSurface { mapping_id: 3, .. }
     ));
 }
 
@@ -1306,7 +1306,7 @@ fn stage_texture_type5_record_reshapes_stageable_single_plane_surface() {
         "guest pages must not be materialized"
     );
     match staged.writeback {
-        TextureWriteback::Type11 {
+        TextureWriteback::IOSurface {
             mapping_id,
             surface_bpr,
             width,
@@ -1319,7 +1319,7 @@ fn stage_texture_type5_record_reshapes_stageable_single_plane_surface() {
             assert_eq!((width, height), (1, 4));
             assert_eq!(pixel_format::bytes_per_pixel(format), Some(16));
         }
-        _ => panic!("expected Type11 writeback through the texture view"),
+        _ => panic!("expected IOSurface writeback through the texture view"),
     }
 
     // A sampled R32Uint view retains its exact format/geometry. R32Uint is
@@ -1351,7 +1351,7 @@ fn stage_texture_type5_record_reshapes_stageable_single_plane_surface() {
 
 /// Biplanar surface (device_desc plane_count=2) + type-5 args plane record:
 /// stage the named plane view (R8 Y) from the plane offset — live class
-/// `compute_dispatch st=Unsupported` / `type11_fail reason=multiplane`
+/// `compute_dispatch st=Unsupported` / `iosurface_texture_fail reason=multiplane`
 /// (wallpaper '420f', journal 2026-07-14 compute census).
 #[test]
 fn stage_texture_type5_record_stages_biplanar_y_plane() {
@@ -1443,7 +1443,7 @@ fn stage_texture_type5_record_stages_biplanar_y_plane() {
         "guest pages must not be materialized"
     );
     match staged.writeback {
-        TextureWriteback::Type11 {
+        TextureWriteback::IOSurface {
             mapping_id,
             surface_offset,
             surface_bpr,
@@ -1453,7 +1453,7 @@ fn stage_texture_type5_record_stages_biplanar_y_plane() {
             assert_eq!(surface_offset, 0);
             assert_eq!(surface_bpr, 64);
         }
-        _ => panic!("expected Type11 writeback"),
+        _ => panic!("expected IOSurface writeback"),
     }
     let sampled = stage_texture_raw(&mut state, &mut host, 1, type5_ref, 32, false)
         .expect("sampled type-5 plane must stage without writeback");
@@ -1725,7 +1725,7 @@ fn compute_stage_admits_full_screen_wide_gamut_without_cap() {
 
 /// Type-5 surface id must not be re-resolved through this task's object
 /// list: slot `sid` can be a different texture-ref object (id collision).
-/// Live class: ensure=1 then MissingTexture when resolve_type11_ref(task,sid)
+/// Live class: ensure=1 then MissingTexture when resolve_iosurface_texture_ref(task,sid)
 /// returned the wrong mapping.
 #[test]
 fn stage_texture_type5_ignores_task_object_list_slot_collision() {
@@ -1753,17 +1753,17 @@ fn stage_texture_type5_ignores_task_object_list_slot_collision() {
     }
     assert!(state.set_mapping_geom(sid, 4, 4, MTL_FORMAT_BGRA8_UNORM));
 
-    // Poison: object-list slot `sid` is type-11 with mapping_id=99 (not mapped).
-    // Pre-fix path would resolve_type11_ref(task, sid) → 99 → MissingTexture.
+    // Poison: object-list slot `sid` is IOSurface texture with mapping_id=99 (not mapped).
+    // Pre-fix path would resolve_iosurface_texture_ref(task, sid) → 99 → MissingTexture.
     let poison_desc_gva = (4u64 + 1) << PAGE_SHIFT_ARM64E;
     let mut iosurf = vec![0u8; 64];
     st32(&mut iosurf[0..], 99); // fake mapping_id
     write_task_gva_arm64e(&mut host, &state.tasks[1], poison_desc_gva, &iosurf);
     let off_sid = list_object_entry_offset(sid, 32).unwrap();
     let mut le_sid = [0u8; OBJECT_LIST_ENTRY_LEN];
-    // type-11 = OBJECT_TYPE_IOSURFACE
-    let packed_t11 = (OBJECT_TYPE_IOSURFACE as u32) | ((64u32) << 8);
-    st32(&mut le_sid[0..], packed_t11);
+    // IOSurface texture = OBJECT_TYPE_IOSURFACE
+    let packed_iosurface = (OBJECT_TYPE_IOSURFACE as u32) | ((64u32) << 8);
+    st32(&mut le_sid[0..], packed_iosurface);
     le_sid[4..12].copy_from_slice(&poison_desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off_sid, &le_sid);
 
@@ -1780,11 +1780,11 @@ fn stage_texture_type5_ignores_task_object_list_slot_collision() {
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
     let staged = stage_texture_raw(&mut state, &mut host, 1, type5_ref, 32, true)
-        .expect("type-5 must stage mapping sid, not poisoned type-11 slot");
+        .expect("type-5 must stage mapping sid, not poisoned IOSurface texture slot");
     assert_eq!((staged.width, staged.height), (4, 4));
     assert!(matches!(
         staged.writeback,
-        TextureWriteback::Type11 { mapping_id: 3, .. }
+        TextureWriteback::IOSurface { mapping_id: 3, .. }
     ));
 }
 
@@ -2339,7 +2339,7 @@ fn a_staged_buffer_carries_the_pages_its_writeback_is_bounded_to() {
 ///
 /// Both destination shapes have one, and the shapes differ only in which licence
 /// answers — a guest-linear plane goes to `licence_gva_plane` and a tiled surface
-/// mapping to `licence_type11_surface`. Residency is not a shape at all: a
+/// mapping to `licence_iosurface_texture_surface`. Residency is not a shape at all: a
 /// registered resident is a perfectly good source for a copy, and
 /// what holds it across a submitted-not-waited copy is the engine's pin, taken
 /// where the write debt is armed and released from the ring slot's cleanup.
@@ -2355,7 +2355,7 @@ fn a_staged_buffer_carries_the_pages_its_writeback_is_bounded_to() {
 /// identically to one an earlier gate caught. The census route is what
 /// distinguishes them, so each case is asserted on its own counter.
 ///
-/// The type-11 cases assert the thing that is easiest to regress back to. That
+/// The IOSurface texture cases assert the thing that is easiest to regress back to. That
 /// class was the largest this arm did not reach — 35 of the 51 storage
 /// destinations of a driven macos-13 boot — and the reason was a `return` on the
 /// destination's *shape*, before anything about the surface had been asked. A
@@ -2426,11 +2426,11 @@ fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
         "the licence refusal is the gate that caught it"
     );
 
-    // A type-11 destination is not a guest-linear plane at all. It is also the
+    // An IOSurface texture destination is not a guest-linear plane at all. It is also the
     // largest class this arm does not reach, so the same call must band whether
     // a raw copy could ever have served it — the route counter says how many
     // there are and the split says how many are reachable.
-    let type11 = |mapping_id, format| TextureWriteback::Type11 {
+    let iosurface_texture = |mapping_id, format| TextureWriteback::IOSurface {
         mapping_id,
         surface_offset: 0,
         surface_bpr: 8,
@@ -2439,7 +2439,7 @@ fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
         height: 2,
         format,
     };
-    let unlicensed = || store_route_count("compute_dst_host_type11_unlicensed");
+    let unlicensed = || store_route_count("compute_dst_host_iosurface_texture_unlicensed");
     for mapping_id in [1, 2] {
         state.mappings.insert(
             mapping_id,
@@ -2479,16 +2479,16 @@ fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
             is_host(&direct_destination(
                 &mut state,
                 &mut host,
-                &staged(type11(mapping_id, format), None),
+                &staged(iosurface_texture(mapping_id, format), None),
                 held,
             )),
-            "no guest-RAM import, so every type-11 licence is refused here"
+            "no guest-RAM import, so every IOSurface texture licence is refused here"
         );
     }
     assert_eq!(
         unlicensed(),
         before + 3,
-        "the type-11 licence is what refused, not the destination's shape"
+        "the IOSurface texture licence is what refused, not the destination's shape"
     );
     // A delta and not an absolute: these counters are process-global and this
     // suite runs serially in one binary, so a zero read absolutely would be
@@ -2496,7 +2496,7 @@ fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
     assert_eq!(
         store_route_count("compute_dst_host_not_linear"),
         not_linear,
-        "a type-11 destination is no longer turned away for not being linear"
+        "an IOSurface texture destination is no longer turned away for not being linear"
     );
 
     // And the case this test exists for: a resident window is routed on its

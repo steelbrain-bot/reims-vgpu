@@ -1,7 +1,7 @@
 //! `generateMipmaps` (blit opcode `0x133`) for multi-mip type-2/3 linear textures.
 //!
-//! Type-11 IOSurface textures are out of scope: Metal forbids mipmapped
-//! IOSurface textures, so there is no legal multi-mip type-11 body to generate
+//! IOSurface-backed textures are out of scope: Metal forbids mipmapped
+//! IOSurface textures, so there is no legal multi-mip IOSurface texture body to generate
 //! into. Non-type-2/3 refs fail as missing/unsupported at resolve.
 //!
 //! Filterable unorm formats are converted through RGBA8 and generated with a

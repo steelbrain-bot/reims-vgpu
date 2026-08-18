@@ -4267,7 +4267,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
             apply_define_task2(state, host, &packet.payload, Some(channel_id));
         }
         // A short SET_OBJECT_LIST leaves the task's object list unbound — every
-        // type-11 texture/object resolve on it then fails
+        // IOSurface texture/object resolve on it then fails
         // (object_list_count==0). Never on a well-formed boot.
         CHILD_OP_SET_OBJECT_LIST => {
             apply_set_object_list(state, &packet.payload, Some(channel_id));
@@ -4329,7 +4329,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
         }
         /*
          * Scanout policy:
-         * - Early boot: front type-11 writebacks paint while !frame_flush_seen
+         * - Early boot: front IOSurface texture writebacks paint while !frame_flush_seen
          *   and job W×H matches established console (no mid-switch thrash).
          * - After first boundary: display presents paint (op8 DisplaySwap on
          *   arm ch4, **or** the op6/op7 transactions on x86 Ventura/Tahoe
@@ -4488,7 +4488,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
             } else {
                 // Process this channel's exec packet. Archive does not drain
                 // other child FIFOs here; surface RAW is render_wait_surface on
-                // the specific type-11/GVA key at sample/Load/swap sites.
+                // the specific IOSurface texture/GVA key at sample/Load/swap sites.
                 let result =
                     crate::runtime::exec::process_exec_indirect2(state, host, &packet.payload);
                 let channel_bit = 1u32.checked_shl(channel_id).unwrap_or(0);

@@ -1191,7 +1191,7 @@ pub fn render_target_bpp(format: u16) -> Option<u32> {
 /// resident's format; say `None` and the only route left is
 /// [`convert_rgba8_to_row`], which is a CPU pass over the frame.
 ///
-/// Named once because both writeback rails ask it — the type-11 mapping rail
+/// Named once because both writeback rails ask it — the IOSurface texture mapping rail
 /// wants `Bgra8` specifically and the GVA rail takes whichever layout its
 /// resident was built in — and a rail that re-lists the formats drifts the
 /// first time one is added.
@@ -1350,7 +1350,7 @@ pub fn solid_rgba8(w: u32, h: u32, clear: &[f64; 4]) -> Vec<u8> {
 
 /// [`solid_rgba8`] with the red and blue channels exchanged — the same image a
 /// caller used to obtain by building the RGBA one and swapping every texel of
-/// it, which is what a type-11 mapping's native order needs.
+/// it, which is what an IOSurface texture mapping's native order needs.
 ///
 /// Building it directly is the point. A CLEAR seed that lands in a mapping used
 /// to cost two allocations and four passes over the image — zero the RGBA

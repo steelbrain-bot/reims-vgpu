@@ -88,7 +88,7 @@ pub fn store(state: &mut DeviceState, surface_id: u32, width: u32, height: u32, 
     store_shared(state, surface_id, width, height, std::sync::Arc::new(bgra));
 }
 
-/// [`store`] for a frame already held behind an `Arc` — the type-11 render Store
+/// [`store`] for a frame already held behind an `Arc` — the IOSurface texture render Store
 /// arms its deferred window with the same allocation, so the frame is stored
 /// once and referenced twice.
 pub fn store_shared(
@@ -200,7 +200,7 @@ pub fn get(state: &DeviceState, surface_id: u32, width: u32, height: u32) -> Opt
 /// `(surface_id, generation)` pair is a statement that the bytes have not moved,
 /// which is what lets the sampled cache skip re-hashing a frame it already holds.
 ///
-/// The caller is the type-11 sampled ladder's host-cache rung, which without
+/// The caller is the IOSurface texture sampled ladder's host-cache rung, which without
 /// this had no identity to offer and drove every bind through the content
 /// digest: 116 lookups a second over 201 MB, hashed twice each. It takes the
 /// frame as a handle rather than a slice because it hands the bytes to the

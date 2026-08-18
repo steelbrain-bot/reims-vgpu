@@ -1744,7 +1744,7 @@ pub(crate) struct ResidentTargetSlot {
     /// `None` is the fail-closed default and it is what every reset restores:
     /// slot creation, image recycle, and both `registry_mark_ready*` arms — so
     /// a draw that stores into this identity without going on to publish the
-    /// mapping's content leaves the slot unvouched, and the type-11 LOAD gate
+    /// mapping's content leaves the slot unvouched, and the IOSurface texture LOAD gate
     /// falls back to its CPU seed. An `Option` rather than a sentinel because
     /// epoch 0 ("nothing published since attach") is a legal *mapping* value
     /// and a bare `0 == 0` would match an image that was never stamped at all.
@@ -1833,7 +1833,7 @@ pub(crate) struct ResidentTargetSlot {
     ///   evicts                                   0          0
     ///   slab_mib peak held                     464        464
     ///   slab_mib settled carved/held         45/72     52/208
-    ///   t11sample_reclaimed_from_pages (sum)    33         39
+    ///   iosurfacesample_reclaimed_from_pages (sum)    33         39
     /// ```
     ///
     /// - **`cap_no_victim=0` on both.** Not once did the then-live capacity walk
@@ -1855,11 +1855,11 @@ pub(crate) struct ResidentTargetSlot {
     ///   reclaim would have to work with, and `registry_sole_copy_peak` against
     ///   `registry_non_pinned_peak` is the ratio that says how much.
     ///
-    /// ## This does **not** reduce `t11sample_reclaimed_from_pages`
+    /// ## This does **not** reduce `iosurfacesample_reclaimed_from_pages`
     ///
     /// 33 against 39, i.e. no reduction and if anything slightly up inside the
     /// run-to-run spread. An earlier revision of this doc claimed a fall from
-    /// "36-44" to 12; that was wrong. `t11sample_reclaimed_from_pages` is a
+    /// "36-44" to 12; that was wrong. `iosurfacesample_reclaimed_from_pages` is a
     /// `store_routes` counter and therefore **per-window**, and the 12 was a
     /// `sort -n | tail -1` over the samples — the busiest window read as a boot
     /// total. Summed, the two arms are the same.
