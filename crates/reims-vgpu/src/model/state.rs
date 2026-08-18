@@ -715,10 +715,11 @@ impl TaskResource {
     #[cfg(feature = "backend-vulkan")]
     pub fn resident_target_backing(
         &self,
+        executor: &dyn crate::runtime::executor::Executor,
         identity: &crate::backend::vulkan::engine::TargetIdentity,
     ) -> crate::backend::vulkan::engine::ResidentContentBacking {
         self.resident_target_backing_with(identity, |identity| {
-            crate::backend::vulkan::engine::retain_resident_resource(identity)
+            executor.retain_resident_resource(identity)
         })
     }
 

@@ -53,8 +53,9 @@ pub mod vk_call;
 mod window_present;
 
 pub use context::MAX_DEVICE_RECREATES;
-pub(crate) use counters::{CounterSnapshot, EngineCounters, TargetReadDelivery};
-pub(crate) use draw_phase::take_window as draw_phase_window;
+pub use counters::CounterSnapshot;
+pub(crate) use counters::{EngineCounters, TargetReadDelivery};
+pub use draw_phase::{take_window as draw_phase_window, DrawPhaseWindow};
 pub(crate) use draw_preparation::DrawPreparationDecline;
 pub(crate) use facade_decline::EngineFacadeDecline;
 pub use types::viewport_slot_count;

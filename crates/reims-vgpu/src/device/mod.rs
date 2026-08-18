@@ -565,7 +565,7 @@ pub fn device_drain(id: u64) -> bool {
     // inside the tranche flush on their own (engine begin_entry), this bounds
     // only the idle-tail latency of the last same-target run.
     #[cfg(feature = "backend-vulkan")]
-    crate::backend::vulkan::engine::flush_batched_draws();
+    device.state.executor.flush_batched_draws();
     let tail_us = tail_started.elapsed().as_micros() as u64;
     let boundary_started = std::time::Instant::now();
     publish_present_boundary(&slot, device.state.present.frame_flush_seen);
@@ -577,6 +577,7 @@ pub fn device_drain(id: u64) -> bool {
     #[cfg(feature = "host-window")]
     window_publish::publish_window_frame(&slot, &mut device.state);
     crate::runtime::drain::note_drain_tranche(
+        device.state.executor.as_ref(),
         drain_us,
         publish_started.elapsed().as_micros() as u64,
     );
@@ -702,7 +703,10 @@ pub fn device_poll(id: u64) -> bool {
     // governed by resource lifetime and allocation pressure.
     #[cfg(feature = "backend-vulkan")]
     {
-        crate::backend::vulkan::engine::maintain_resources(crate::observe::elapsed_ms() as u64);
+        device
+            .state
+            .executor
+            .maintain_resources(crate::observe::elapsed_ms() as u64);
     }
     // Pre-boundary early-console → host window (headless-safe: the heartbeat
     // drives poll even under -display none). No-op post-boundary or with no

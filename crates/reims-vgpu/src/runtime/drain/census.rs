@@ -2783,7 +2783,11 @@ pub fn note_drain_setup(ns: u64) {
 }
 
 /// Accumulate one completed drain tranche; emits at most once per second.
-pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
+pub fn note_drain_tranche(
+    executor: &dyn crate::runtime::executor::Executor,
+    drain_us: u64,
+    publish_us: u64,
+) {
     if let Some(line) = DRAIN_DUTY.note(drain_us, publish_us, crate::observe::elapsed_ms() as u64) {
         crate::observe::off(line);
         // Immediately after `drain_duty`, so the two read as one record: the
@@ -2832,7 +2836,7 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         }
         // Under `window_publish`, which says how many frames were offered but
         // not why fewer reached the screen.
-        emit_engine_lock(DRAIN_DUTY.last_window_ms());
+        emit_engine_lock(executor, DRAIN_DUTY.last_window_ms());
         if let Some(routes) = take_store_routes() {
             crate::observe::off(routes);
         }
@@ -2860,25 +2864,25 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         // routes say which cap fired and this says how much the workload wanted,
         // and neither is interpretable without the other.
         #[cfg(feature = "backend-vulkan")]
-        if let Some(wanted) = crate::backend::vulkan::engine::sampled_working_set_census() {
+        if let Some(wanted) = executor.sampled_working_set_census() {
             crate::observe::off(wanted);
         }
         // The same question one rail over, and the one with no cache behind it
         // yet: `buffer_guest_gathers` says how many gathers ran and this says
         // how few distinct windows they were.
         #[cfg(feature = "backend-vulkan")]
-        if let Some(wanted) = crate::backend::vulkan::engine::buffer_gather_working_set_census() {
+        if let Some(wanted) = executor.buffer_gather_working_set_census() {
             crate::observe::off(wanted);
         }
-        emit_engine_delta();
+        emit_engine_delta(executor);
         // After `emit_engine_delta`, which emits `draw_phase`: the two divide
         // against each other and reading them in the other order invites
         // treating the engine's phases as the whole draw, which is the
         // misreading this line exists to correct. Not gated on the backend —
         // second census.
         emit_chain_phase();
-        emit_object_cache_levels();
-        emit_guest_import_levels();
+        emit_object_cache_levels(executor);
+        emit_guest_import_levels(executor);
     }
 }
 
@@ -2946,8 +2950,8 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
 /// `mib` is the same level and is not a rate: it is guest RAM the device can
 /// currently reach, against what the machine reported.
 #[cfg(feature = "backend-vulkan")]
-fn emit_guest_import_levels() {
-    let (bytes, count, aliases) = crate::backend::vulkan::engine::guest_import_census();
+fn emit_guest_import_levels(executor: &dyn crate::runtime::executor::Executor) {
+    let (bytes, count, aliases) = executor.guest_import_census();
     let (spans, span_bytes) = crate::runtime::guest_ram_map::span_census();
     // An engine that never imported emits nothing, so a host on a negative
     // `host_pointer` rung — or a boot before the first guest window — costs no
@@ -2965,7 +2969,7 @@ fn emit_guest_import_levels() {
 }
 
 #[cfg(not(feature = "backend-vulkan"))]
-fn emit_guest_import_levels() {}
+fn emit_guest_import_levels(_executor: &dyn crate::runtime::executor::Executor) {}
 
 /// Live entry counts of the caches that hold one entry per distinct guest
 /// object, as **levels** rather than per-window deltas.
@@ -2981,9 +2985,9 @@ fn emit_guest_import_levels() {}
 /// `m2v` counts translated shaders (`runtime::m2v_cache`); the rest are the
 /// Vulkan engine's immutable-object caches.
 #[cfg(feature = "backend-vulkan")]
-fn emit_object_cache_levels() {
+fn emit_object_cache_levels(executor: &dyn crate::runtime::executor::Executor) {
     let [shaders, layouts, passes, pipelines, samplers, compute_pipelines] =
-        crate::backend::vulkan::engine::object_cache_levels();
+        executor.object_cache_levels();
     let (_, _, m2v) = crate::runtime::m2v_cache::stats();
     crate::observe::off(format!(
         "object_cache_levels (levels, not per-interval) m2v={m2v} shaders={shaders} \
@@ -2993,10 +2997,10 @@ fn emit_object_cache_levels() {
 }
 
 #[cfg(feature = "backend-vulkan")]
-fn emit_engine_delta() {
+fn emit_engine_delta(executor: &dyn crate::runtime::executor::Executor) {
     use crate::backend::vulkan::engine::CounterSnapshot;
     static PREV: std::sync::Mutex<Option<CounterSnapshot>> = std::sync::Mutex::new(None);
-    let now = crate::backend::vulkan::engine::counter_snapshot();
+    let now = executor.counter_snapshot();
     let Ok(mut prev) = PREV.lock() else {
         return;
     };
@@ -3011,7 +3015,7 @@ fn emit_engine_delta() {
     }
     crate::observe::off(line);
     emit_registry_pressure(&now);
-    emit_draw_phase();
+    emit_draw_phase(executor);
 }
 
 /// How far the resident registries reached, and what the populations that
@@ -3192,8 +3196,8 @@ fn emit_sampled_phase() {
 ///
 /// Silent when no draw ran, so an idle desktop costs nothing.
 #[cfg(feature = "backend-vulkan")]
-fn emit_draw_phase() {
-    let Some(w) = crate::backend::vulkan::engine::draw_phase_window() else {
+fn emit_draw_phase(executor: &dyn crate::runtime::executor::Executor) {
+    let Some(w) = executor.draw_phase_window() else {
         return;
     };
     crate::observe::off(format!(
@@ -3361,8 +3365,8 @@ fn emit_stage_phase() {
 /// disagree the first candidate is that the window thread could not have the
 /// engine while the worker held it.
 #[cfg(feature = "backend-vulkan")]
-fn emit_engine_lock(win_ms: u64) {
-    if let Some(line) = crate::backend::vulkan::engine::take_engine_lock_census(win_ms) {
+fn emit_engine_lock(executor: &dyn crate::runtime::executor::Executor, win_ms: u64) {
+    if let Some(line) = executor.take_engine_lock_census(win_ms) {
         crate::observe::off(line);
     }
 }

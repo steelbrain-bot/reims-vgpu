@@ -1277,7 +1277,9 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 let resident_backing = resolved_resource
                     .as_ref()
                     .filter(|resource| resource_type_owns_surface_resident(resource.entry.kind))
-                    .map(|resource| resource.resident_target_backing(&resident_id))
+                    .map(|resource| {
+                        resource.resident_target_backing(state.executor.as_ref(), &resident_id)
+                    })
                     // An unclassified ref has no resource object to own a
                     // lease. Keep its existing query path so compatibility
                     // traffic still reaches the copying rails.
@@ -3295,7 +3297,7 @@ fn gva_resident_ready(
         .then(|| state.task_resources.get(task_id, texture_ref))
         .flatten()
         .filter(|resource| resource_type_owns_gva_resident(resource.entry.kind))
-        .map(|resource| resource.resident_target_backing(identity));
+        .map(|resource| resource.resident_target_backing(state.executor.as_ref(), identity));
     let retained = backing.is_some();
     let ready = retained_resident_is_ready(backing, || {
         state.executor.resident_content_backing(identity)

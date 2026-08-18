@@ -301,6 +301,59 @@ pub trait Executor: std::fmt::Debug + Send + Sync {
         false
     }
 
+    fn flush_batched_draws(&self) {}
+
+    fn maintain_resources(&self, _now_ms: u64) {}
+
+    fn retain_resident_resource(
+        &self,
+        _identity: &TargetIdentity,
+    ) -> Option<crate::backend::vulkan::engine::ResidentResourceLease> {
+        None
+    }
+
+    /// Observation-only snapshots. Semantic planning must never read these.
+    fn sampled_working_set_census(&self) -> Option<String> {
+        None
+    }
+
+    fn buffer_gather_working_set_census(&self) -> Option<String> {
+        None
+    }
+
+    fn guest_import_census(&self) -> (u64, usize, usize) {
+        (0, 0, 0)
+    }
+
+    fn object_cache_levels(&self) -> [usize; 6] {
+        [0; 6]
+    }
+
+    fn counter_snapshot(&self) -> crate::backend::vulkan::engine::CounterSnapshot {
+        Default::default()
+    }
+
+    fn draw_phase_window(&self) -> Option<crate::backend::vulkan::engine::DrawPhaseWindow> {
+        None
+    }
+
+    fn take_engine_lock_census(&self, _win_ms: u64) -> Option<String> {
+        None
+    }
+
+    fn prepare_window_resident_present(
+        &self,
+        _identity: &TargetIdentity,
+        _width: u32,
+        _height: u32,
+    ) -> Result<(), &'static str> {
+        Err("winpub_window_not_attached")
+    }
+
+    fn window_present_attached(&self) -> bool {
+        false
+    }
+
     fn execute(&self, submission: ResolvedSubmission) -> Result<ExecutionCompletion, DrawError>;
 
     /// End one guest lifetime while preserving shareable physical-GPU state.
@@ -488,6 +541,73 @@ impl Executor for VulkanExecutor {
 
     fn resident_presentable(&self, identity: &TargetIdentity, width: u32, height: u32) -> bool {
         crate::backend::vulkan::engine::resident_presentable(identity, width, height)
+    }
+
+    fn flush_batched_draws(&self) {
+        crate::backend::vulkan::engine::flush_batched_draws();
+    }
+
+    fn maintain_resources(&self, now_ms: u64) {
+        crate::backend::vulkan::engine::maintain_resources(now_ms);
+    }
+
+    fn retain_resident_resource(
+        &self,
+        identity: &TargetIdentity,
+    ) -> Option<crate::backend::vulkan::engine::ResidentResourceLease> {
+        crate::backend::vulkan::engine::retain_resident_resource(identity)
+    }
+
+    fn sampled_working_set_census(&self) -> Option<String> {
+        crate::backend::vulkan::engine::sampled_working_set_census()
+    }
+
+    fn buffer_gather_working_set_census(&self) -> Option<String> {
+        crate::backend::vulkan::engine::buffer_gather_working_set_census()
+    }
+
+    fn guest_import_census(&self) -> (u64, usize, usize) {
+        crate::backend::vulkan::engine::guest_import_census()
+    }
+
+    fn object_cache_levels(&self) -> [usize; 6] {
+        crate::backend::vulkan::engine::object_cache_levels()
+    }
+
+    fn counter_snapshot(&self) -> crate::backend::vulkan::engine::CounterSnapshot {
+        crate::backend::vulkan::engine::counter_snapshot()
+    }
+
+    fn draw_phase_window(&self) -> Option<crate::backend::vulkan::engine::DrawPhaseWindow> {
+        crate::backend::vulkan::engine::draw_phase_window()
+    }
+
+    fn take_engine_lock_census(&self, win_ms: u64) -> Option<String> {
+        crate::backend::vulkan::engine::take_engine_lock_census(win_ms)
+    }
+
+    fn prepare_window_resident_present(
+        &self,
+        identity: &TargetIdentity,
+        width: u32,
+        height: u32,
+    ) -> Result<(), &'static str> {
+        #[cfg(feature = "host-window")]
+        return crate::backend::vulkan::engine::prepare_window_resident_present(
+            identity, width, height,
+        );
+        #[cfg(not(feature = "host-window"))]
+        {
+            let _ = (identity, width, height);
+            Err("winpub_window_not_attached")
+        }
+    }
+
+    fn window_present_attached(&self) -> bool {
+        #[cfg(feature = "host-window")]
+        return crate::backend::vulkan::engine::window_present_attached();
+        #[cfg(not(feature = "host-window"))]
+        false
     }
 
     fn execute(&self, submission: ResolvedSubmission) -> Result<ExecutionCompletion, DrawError> {
