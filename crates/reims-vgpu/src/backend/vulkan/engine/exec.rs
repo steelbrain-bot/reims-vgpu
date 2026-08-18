@@ -3389,7 +3389,7 @@ pub(crate) unsafe fn execute_draw_inner(
         };
         let pixels = req.width.saturating_mul(req.height);
         let mut wide = vec![0u8; (pixels as usize) * (layout.bytes_per_texel() as usize)];
-        if !crate::contract::pixel_format::expand_rgba8_to_texel(layout, src, pixels, &mut wide) {
+        if !reims_vgpu_core::expand_rgba8_to_texel(layout, src, pixels, &mut wide) {
             return Err(DrawError::DrawExecution(
                 DrawExecutionDecline::SeedFormatUnwritable {
                     format: color0_format,

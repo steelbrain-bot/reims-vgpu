@@ -12,6 +12,7 @@ pub mod resource_state;
 pub mod service;
 pub mod submission;
 pub mod target;
+pub mod texel;
 
 pub use blit::{BufferFillPattern, ResolvedBufferBlit, ResolvedBufferRange};
 pub use capabilities::{CapabilityService, DeviceInfoLimits, ExecutorCapabilities, MAX_CHANNELS};
@@ -36,3 +37,6 @@ pub use service::{
 };
 pub use submission::SubmissionContext;
 pub use target::{TargetIdentity, TargetKeyDivergence};
+pub use texel::{
+    expand_rgba8_to_texel, f16_to_f32, f16_to_unorm8, narrow_texel_to_rgba8, unorm8_to_f16,
+};

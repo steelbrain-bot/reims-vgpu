@@ -4528,7 +4528,7 @@ fn narrow_readback_to_rgba8(
     }
     let count = u32::try_from(pixels).unwrap_or(u32::MAX);
     let mut narrowed = vec![0u8; (pixels * u64::from(RESIDENT_READ_BYTES_PER_TEXEL)) as usize];
-    if !crate::contract::pixel_format::narrow_texel_to_rgba8(layout, &out, count, &mut narrowed) {
+    if !reims_vgpu_core::narrow_texel_to_rgba8(layout, &out, count, &mut narrowed) {
         return Err(DrawError::TargetRead(
             reason::TargetReadDecline::TexelNotFourBytes { format },
         ));
@@ -5725,7 +5725,7 @@ mod readback_width_tests {
                     // small and require the same answer.
                     let mut dst = vec![0u8; (PIXELS * 4) as usize];
                     assert!(
-                        !crate::contract::pixel_format::narrow_texel_to_rgba8(
+                        !reims_vgpu_core::narrow_texel_to_rgba8(
                             layout,
                             &vec![0u8; sized * 8],
                             PIXELS as u32,

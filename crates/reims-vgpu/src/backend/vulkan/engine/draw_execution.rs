@@ -73,7 +73,7 @@ pub enum DrawExecutionDecline {
     ///
     /// The seed is eight bits per channel and a buffer→image copy converts
     /// nothing, so it has to be restated as the attachment's own texels before
-    /// it is staged. `pixel_format::expand_rgba8_to_texel` names the layouts
+    /// it is staged. [`reims_vgpu_core::expand_rgba8_to_texel`] names the layouts
     /// that can be, and this is the refusal for one that cannot — a wiring
     /// error rather than a guest condition, since a render target is only ever
     /// created at a layout that rail covers.

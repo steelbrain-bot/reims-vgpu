@@ -272,26 +272,6 @@ impl SampledByteFormat {
 const UNORM8_MIN: u8 = 0x00;
 const UNORM8_MAX: u8 = 0xff;
 
-const F16_SIGN_MASK: u16 = 0x8000;
-const F16_EXP_SHIFT: u32 = 10;
-const F16_EXP_MASK: u32 = 0x1f;
-const F16_MANT_MASK: u32 = 0x03ff;
-const F16_HIDDEN_BIT: u32 = 0x0400;
-const F16_EXP_BIAS: i32 = 15;
-const F16_EXP_INF_NAN: u32 = F16_EXP_MASK;
-const F16_INF_BITS: u16 = 0x7c00;
-const F16_SUBNORMAL_EXP_MIN: i32 = -10;
-const F16_SUBNORMAL_SHIFT_BASE: i32 = 14;
-const F16_F32_SIGN_SHIFT: u32 = 16;
-const F32_EXP_SHIFT: u32 = 23;
-const F32_EXP_MASK: u32 = 0xff;
-const F32_MANT_MASK: u32 = 0x007f_ffff;
-const F32_HIDDEN_BIT: u32 = 0x0080_0000;
-const F32_EXP_BIAS: i32 = 127;
-const F32_INF_BITS: u32 = 0x7f80_0000;
-const F16_F32_MANT_SHIFT: u32 = 13;
-const F32_TO_F16_ROUND_BIT: u32 = 0x1000;
-
 /// Bytes one texel of `format` occupies in guest linear storage, or `None` for
 /// a format this contract does not define.
 ///
@@ -1006,29 +986,7 @@ fn solid_image8(w: u32, h: u32, px: [u8; 4]) -> Vec<u8> {
 }
 
 pub fn f16_to_f32(half_bits: u16) -> f32 {
-    let sign = (u32::from(half_bits & F16_SIGN_MASK)) << F16_F32_SIGN_SHIFT;
-    let exp = (u32::from(half_bits) >> F16_EXP_SHIFT) & F16_EXP_MASK;
-    let mut mant = u32::from(half_bits) & F16_MANT_MASK;
-    let bits = if exp == 0 {
-        if mant == 0 {
-            sign
-        } else {
-            let mut normal_exp: i32 = 1;
-            while (mant & F16_HIDDEN_BIT) == 0 {
-                mant <<= 1;
-                normal_exp -= 1;
-            }
-            mant &= F16_MANT_MASK;
-            sign | (((normal_exp - F16_EXP_BIAS + F32_EXP_BIAS) as u32) << F32_EXP_SHIFT)
-                | (mant << F16_F32_MANT_SHIFT)
-        }
-    } else if exp == F16_EXP_INF_NAN {
-        sign | F32_INF_BITS | (mant << F16_F32_MANT_SHIFT)
-    } else {
-        let f32_exp = (exp as i32 - F16_EXP_BIAS + F32_EXP_BIAS) as u32;
-        sign | (f32_exp << F32_EXP_SHIFT) | (mant << F16_F32_MANT_SHIFT)
-    };
-    f32::from_bits(bits)
+    reims_vgpu_core::f16_to_f32(half_bits)
 }
 
 fn build_f16_to_unorm8_lut() -> Box<[u8; 65536]> {
@@ -1053,36 +1011,7 @@ fn f16_to_unorm8_lut() -> &'static [u8; 65536] {
 }
 
 fn unorm8_to_f16_slow(value: u8) -> u16 {
-    let f = f32::from(value) / f32::from(UNORM8_MAX);
-    let x = f.to_bits();
-    let sign = ((x >> F16_F32_SIGN_SHIFT) as u16) & F16_SIGN_MASK;
-    let e = ((x >> F32_EXP_SHIFT) & F32_EXP_MASK) as i32 - F32_EXP_BIAS + F16_EXP_BIAS;
-    let mut m = x & F32_MANT_MASK;
-
-    if f <= 0.0 {
-        return sign;
-    }
-    if e >= F16_EXP_INF_NAN as i32 {
-        return sign | F16_INF_BITS;
-    }
-    if e <= 0 {
-        if e < F16_SUBNORMAL_EXP_MIN {
-            return sign;
-        }
-        m |= F32_HIDDEN_BIT;
-        let shift = (F16_SUBNORMAL_SHIFT_BASE - e) as u32;
-        let mut hm = m >> shift;
-        if ((m >> (shift - 1)) & 1) != 0 {
-            hm += 1;
-        }
-        return sign | (hm as u16);
-    }
-
-    let mut h = sign | (((e as u32) << F16_EXP_SHIFT) as u16) | ((m >> F16_F32_MANT_SHIFT) as u16);
-    if (m & F32_TO_F16_ROUND_BIT) != 0 {
-        h = h.wrapping_add(1);
-    }
-    h
+    reims_vgpu_core::unorm8_to_f16(value)
 }
 
 fn unorm8_to_f16_lut() -> &'static [u16; 256] {
