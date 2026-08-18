@@ -6,6 +6,7 @@
 
 pub mod api_floor;
 pub mod device_select;
+pub mod host_pointer;
 pub mod memory;
 pub mod policy;
 pub mod push_descriptor;

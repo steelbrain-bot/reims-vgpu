@@ -36,7 +36,7 @@
 //!
 //! A preference expressed in flags cannot see how much of a pool there is, and
 //! on a part whose `DEVICE_LOCAL` heap is a carve-out the two answers disagree.
-//! The APU shape in [`fixtures::amd_apu_host_heap`] is the worked case: a 2 GiB
+//! The APU shape in the `amd_apu_host_heap` test fixture is the worked case: a 2 GiB
 //! device-local carve-out beside 14 GiB of system RAM, classified `Unified`, so
 //! `MemoryClass::Upload` prefers `DEVICE_LOCAL` and the whole-RAMBlock
 //! guest-memory import — 16 GiB on a 16 GiB guest — is charged to the 2 GiB

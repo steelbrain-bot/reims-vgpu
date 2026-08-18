@@ -19,7 +19,7 @@ use super::api_floor::meets_floor;
 /// second. Higher is better.
 ///
 /// Ranking is orthogonal to the API floor: a device below
-/// [`api_floor::MIN_SUPPORTED_API`] is filtered out before ranking, so a
+/// [`crate::api_floor::MIN_SUPPORTED_API`] is filtered out before ranking, so a
 /// top-ranked device the engine cannot drive never wins over a usable one.
 pub fn rank_physical_device(device_type: vk::PhysicalDeviceType) -> u8 {
     match device_type {
