@@ -119,9 +119,8 @@ impl VertexBindPlan {
             // from the pipeline alone is allowed to be wrong in.
             .filter(|a| {
                 a.format != 0
-                    && crate::backend::vulkan::translate::vertex::step_function(
-                        a.declared_step_function,
-                    ) == Ok(reims_vgpu_core::VertexStepFunction::Constant)
+                    && a.declared_step_function
+                        == Some(reims_vgpu_protocol::vertex_step::MTL_VERTEX_STEP_FUNCTION_CONSTANT)
             })
             .map(|a| a.buffer_index)
             .collect();
