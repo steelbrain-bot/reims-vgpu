@@ -4757,11 +4757,11 @@ fn spirv_words_le(bytes: &[u8]) -> Result<Vec<u32>, ComputeSpirvDecline> {
         .collect())
 }
 
-/// Thin `Option` adapters over the canonical tables in
-/// [`crate::backend::vulkan::translate::pixel`].
+/// Thin adapters over the canonical tables in
+/// [`reims_vgpu_core::pixel_format`].
 ///
 /// These two used to *be* the tables — a second copy of the selector→engine and
-/// Metal→engine mappings living in the compute path, where nothing checked them
+/// Metal→semantic mappings living in the compute path, where nothing checked them
 /// against the pixel table they had to agree with. The call sites below are all
 /// `if let Some(..)` / `let Some(..) else`, so the adapters keep that shape; the
 /// decision itself now happens in exactly one place.
@@ -4777,7 +4777,7 @@ fn spirv_words_le(bytes: &[u8]) -> Result<Vec<u32>, ComputeSpirvDecline> {
 fn selector_to_engine_storage(
     selector: pixel_format::StorageImageSelector,
 ) -> reims_vgpu_protocol::StorageImageFormat {
-    crate::backend::vulkan::translate::pixel::storage_image_from_selector(selector)
+    pixel_format::storage_image_format_from_selector(selector)
 }
 
 #[cfg(feature = "backend-vulkan")]
@@ -4786,7 +4786,7 @@ fn mtl_to_engine_sampled(format: u16) -> Option<reims_vgpu_protocol::StorageImag
     // cost macOS 14 and macOS 15 a whole `DispatchThreadgroups` a boot on
     // `MTLPixelFormatR16Unorm`, which is sampleable everywhere and is not a
     // storage format — see `translate::pixel::sampled_image`.
-    crate::backend::vulkan::translate::pixel::sampled_image(format).ok()
+    pixel_format::compute_sampled_image_format(format)
 }
 
 #[cfg(feature = "backend-vulkan")]

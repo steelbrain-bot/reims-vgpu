@@ -595,22 +595,7 @@ pub fn verbatim_texel(mtl: u16) -> Option<(vk::Format, u32)> {
 /// decline unnecessary: every selector the contract can produce has an engine
 /// format, and a new one cannot be added without this answering for it.
 pub fn storage_image_from_selector(selector: StorageImageSelector) -> StorageImageFormat {
-    use reims_vgpu_core::pixel_format::StorageImageSelector as S;
-    match selector {
-        S::Rgba8Uint => StorageImageFormat::Rgba8Uint,
-        S::Rgba8Sint => StorageImageFormat::Rgba8Sint,
-        S::Rgba16Uint => StorageImageFormat::Rgba16Uint,
-        S::Rgba16Float => StorageImageFormat::Rgba16Float,
-        S::Rgba32Float => StorageImageFormat::Rgba32Float,
-        S::Rgba8Unorm => StorageImageFormat::Rgba8Unorm,
-        S::Bgra8Unorm => StorageImageFormat::Bgra8Unorm,
-        S::R16Float => StorageImageFormat::R16Float,
-        S::Rg16Float => StorageImageFormat::Rg16Float,
-        S::R8Unorm => StorageImageFormat::R8Unorm,
-        S::Rg8Unorm => StorageImageFormat::Rg8Unorm,
-        S::Rgba32Uint => StorageImageFormat::Rgba32Uint,
-        S::R32Uint => StorageImageFormat::R32Uint,
-    }
+    reims_vgpu_core::pixel_format::storage_image_format_from_selector(selector)
 }
 
 /// The engine's storage-image format for a Metal pixel format.
@@ -651,15 +636,7 @@ pub fn storage_image(mtl: u16) -> Result<StorageImageFormat, TranslateReason> {
     // unknown value declines as `unknown_pixel_format` rather than as a missing
     // storage layout — those are different bugs and want different slugs.
     translate(mtl)?;
-    match mtl {
-        pf::MTL_FORMAT_R32_UINT => return Ok(StorageImageFormat::R32Uint),
-        pf::MTL_FORMAT_R32_SINT => return Ok(StorageImageFormat::R32Sint),
-        pf::MTL_FORMAT_R32_FLOAT => return Ok(StorageImageFormat::R32Float),
-        pf::MTL_FORMAT_RGB9E5_FLOAT => return Ok(StorageImageFormat::Rgb9e5Ufloat),
-        _ => {}
-    }
-    let selector = pf::storage_selector(mtl).ok_or(TranslateReason::NoStorageImageFormat(mtl))?;
-    Ok(storage_image_from_selector(selector))
+    pf::storage_image_format(mtl).ok_or(TranslateReason::NoStorageImageFormat(mtl))
 }
 
 /// The compute path's admission for a **sampled** image bind.
@@ -703,17 +680,8 @@ pub fn sampled_image(mtl: u16) -> Result<StorageImageFormat, TranslateReason> {
     // `translate` call keeps an entirely unknown value declining as
     // `unknown_pixel_format` rather than as a missing layout, exactly as
     // `storage_image` does for the same reason.
-    let sampled_only = match mtl {
-        pf::MTL_FORMAT_R16_UNORM => StorageImageFormat::R16Unorm,
-        pf::MTL_FORMAT_RG16_UNORM => StorageImageFormat::Rg16Unorm,
-        pf::MTL_FORMAT_RGBA16_UNORM => StorageImageFormat::Rgba16Unorm,
-        pf::MTL_FORMAT_RGB10A2_UNORM => StorageImageFormat::Rgb10a2Unorm,
-        pf::MTL_FORMAT_BGR10A2_UNORM => StorageImageFormat::Bgr10a2Unorm,
-        pf::MTL_FORMAT_RG11B10_FLOAT => StorageImageFormat::Rg11b10Float,
-        _ => return storage_image(mtl),
-    };
     translate(mtl)?;
-    Ok(sampled_only)
+    pf::compute_sampled_image_format(mtl).ok_or(TranslateReason::NoStorageImageFormat(mtl))
 }
 
 /// The guest's scanout byte order, in Vulkan terms.

@@ -749,6 +749,64 @@ pub fn storage_selector(format: u16) -> Option<StorageImageSelector> {
     })
 }
 
+/// Backend-independent storage-image format selected by the contract table.
+///
+/// This is total over [`StorageImageSelector`]. Backends translate the result
+/// into a native image format only when they create a view.
+pub const fn storage_image_format_from_selector(
+    selector: StorageImageSelector,
+) -> reims_vgpu_protocol::StorageImageFormat {
+    use reims_vgpu_protocol::StorageImageFormat as F;
+    use StorageImageSelector as S;
+    match selector {
+        S::Rgba8Uint => F::Rgba8Uint,
+        S::Rgba8Sint => F::Rgba8Sint,
+        S::Rgba16Uint => F::Rgba16Uint,
+        S::Rgba16Float => F::Rgba16Float,
+        S::Rgba32Float => F::Rgba32Float,
+        S::Rgba8Unorm => F::Rgba8Unorm,
+        S::Bgra8Unorm => F::Bgra8Unorm,
+        S::R16Float => F::R16Float,
+        S::Rg16Float => F::Rg16Float,
+        S::R8Unorm => F::R8Unorm,
+        S::Rg8Unorm => F::Rg8Unorm,
+        S::Rgba32Uint => F::Rgba32Uint,
+        S::R32Uint => F::R32Uint,
+    }
+}
+
+/// Storage-image interpretation of one declared Metal pixel format.
+pub fn storage_image_format(format: u16) -> Option<reims_vgpu_protocol::StorageImageFormat> {
+    use reims_vgpu_protocol::StorageImageFormat as F;
+    Some(match format {
+        MTL_FORMAT_R32_UINT => F::R32Uint,
+        MTL_FORMAT_R32_SINT => F::R32Sint,
+        MTL_FORMAT_R32_FLOAT => F::R32Float,
+        MTL_FORMAT_RGB9E5_FLOAT => F::Rgb9e5Ufloat,
+        _ => storage_image_format_from_selector(storage_selector(format)?),
+    })
+}
+
+/// Sampled-image interpretation used by compute requests.
+///
+/// Sampling admits several formats which are not storage-writable. Keeping
+/// this superset in core prevents a runtime planner from asking a backend's
+/// storage table for a sampled binding.
+pub fn compute_sampled_image_format(
+    format: u16,
+) -> Option<reims_vgpu_protocol::StorageImageFormat> {
+    use reims_vgpu_protocol::StorageImageFormat as F;
+    Some(match format {
+        MTL_FORMAT_R16_UNORM => F::R16Unorm,
+        MTL_FORMAT_RG16_UNORM => F::Rg16Unorm,
+        MTL_FORMAT_RGBA16_UNORM => F::Rgba16Unorm,
+        MTL_FORMAT_RGB10A2_UNORM => F::Rgb10a2Unorm,
+        MTL_FORMAT_BGR10A2_UNORM => F::Bgr10a2Unorm,
+        MTL_FORMAT_RG11B10_FLOAT => F::Rg11b10Float,
+        _ => storage_image_format(format)?,
+    })
+}
+
 /// Storage bytes per texel of a format this host will render into, or `None`
 /// for one it will not.
 ///
@@ -2158,6 +2216,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn compute_format_selection_is_backend_independent_and_role_specific() {
+        use reims_vgpu_protocol::StorageImageFormat as F;
+
+        for raw in 0..=u16::MAX {
+            assert_eq!(
+                storage_selector(raw).map(storage_image_format_from_selector),
+                storage_image_format(raw).filter(|_| {
+                    !matches!(
+                        raw,
+                        MTL_FORMAT_R32_SINT | MTL_FORMAT_R32_FLOAT | MTL_FORMAT_RGB9E5_FLOAT
+                    )
+                }),
+                "selector and semantic storage format diverged at {raw:#x}"
+            );
+        }
+        assert_eq!(
+            compute_sampled_image_format(MTL_FORMAT_R16_UNORM),
+            Some(F::R16Unorm)
+        );
+        assert_eq!(storage_image_format(MTL_FORMAT_R16_UNORM), None);
+        assert_eq!(
+            storage_image_format(MTL_FORMAT_R32_FLOAT),
+            Some(F::R32Float)
+        );
+        assert_eq!(compute_sampled_image_format(0xffff), None);
     }
 
     /// A [`TexelLayout`]'s width is the width of the guest format it stands for.
