@@ -223,8 +223,20 @@ struct StreamAccum {
 /// the enum: their presence is what lets the continuation check reject a type
 /// change instead of dispatching the next segment through the wrong decoder.
 enum OpenEncoder {
-    Render(StreamAccum),
-    Compute(crate::runtime::compute_session::ComputeSegment),
+    /// Both stateful arms are boxed. Their payloads are the only large things
+    /// here — a `StreamAccum` is about 496 bytes, most of it the six
+    /// `BindTable`s, and a `ComputeSegment` about 232 — while the three
+    /// stateless arms carry nothing. Inline, the enum is as wide as its largest
+    /// payload for the whole life of every open encoder, and
+    /// [`OpenEncoder::new`] returns it by value, so an encoder-begin copies
+    /// that width whichever arm it opened. Boxed, the move is a pointer.
+    ///
+    /// The allocation is per encoder-begin, which is per render pass or per
+    /// compute segment, not per draw or per dispatch: exactly one
+    /// `OpenEncoder` is live per task, and the records inside a segment all
+    /// mutate it through the same borrow.
+    Render(Box<StreamAccum>),
+    Compute(Box<crate::runtime::compute_session::ComputeSegment>),
     Blit,
     Event,
     Info,
@@ -233,10 +245,8 @@ enum OpenEncoder {
 impl OpenEncoder {
     fn new(type_: u8) -> Option<Self> {
         match type_ {
-            SEGMENT_TYPE_RENDER => Some(Self::Render(StreamAccum::default())),
-            SEGMENT_TYPE_COMPUTE => Some(Self::Compute(
-                crate::runtime::compute_session::ComputeSegment::default(),
-            )),
+            SEGMENT_TYPE_RENDER => Some(Self::Render(Box::default())),
+            SEGMENT_TYPE_COMPUTE => Some(Self::Compute(Box::default())),
             SEGMENT_TYPE_BLIT => Some(Self::Blit),
             SEGMENT_TYPE_EVENT => Some(Self::Event),
             SEGMENT_TYPE_INFO => Some(Self::Info),

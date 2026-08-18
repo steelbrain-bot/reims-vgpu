@@ -5620,25 +5620,26 @@ pub(crate) unsafe fn execute_draw_inner(
     phase.enter(super::draw_phase::Phase::PostSampled);
     let mut sampled_retains: Vec<super::pools::SampledRetain> = Vec::new();
     for prepared in &sampled {
-        match prepared {
-            PreparedSampled::Upload {
-                binding,
-                array_element,
-                image,
-                ..
-            } => {
-                if let Some((SampledSource::Bytes(bytes), resource_lifetime)) =
-                    sampled_resource_at(req, *binding, *array_element)
-                        .map(|resource| (&resource.source, resource.resource_lifetime.clone()))
-                {
-                    sampled_retains.push(super::pools::SampledRetain {
-                        image: image.image,
-                        content: super::pools::SampledRetainContent::Bytes(bytes.clone()),
-                        resource_lifetime,
-                    });
-                }
+        // Only an `Upload` can be retained by content: it is the one arm whose
+        // bytes this device holds and can compare. Every other arm either reads
+        // guest pages live or names a resident the registry already owns.
+        if let PreparedSampled::Upload {
+            binding,
+            array_element,
+            image,
+            ..
+        } = prepared
+        {
+            if let Some((SampledSource::Bytes(bytes), resource_lifetime)) =
+                sampled_resource_at(req, *binding, *array_element)
+                    .map(|resource| (&resource.source, resource.resource_lifetime.clone()))
+            {
+                sampled_retains.push(super::pools::SampledRetain {
+                    image: image.image,
+                    content: super::pools::SampledRetainContent::Bytes(bytes.clone()),
+                    resource_lifetime,
+                });
             }
-            _ => {}
         }
     }
     for image in &sampled {

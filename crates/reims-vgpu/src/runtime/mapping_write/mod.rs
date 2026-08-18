@@ -443,11 +443,13 @@ pub fn write_bgra8<M: HostMemory + HostOps>(
         state,
         host,
         mapping_id,
-        src,
+        SourceFrame {
+            bytes: src,
+            stride: src_stride,
+            width,
+            height,
+        },
         CacheOutcome::Publish(None),
-        src_stride,
-        width,
-        height,
     )
 }
 
@@ -483,11 +485,13 @@ pub fn write_bgra8_owned<M: HostMemory + HostOps>(
         state,
         host,
         mapping_id,
-        src.as_slice(),
+        SourceFrame {
+            bytes: src.as_slice(),
+            stride: src_stride,
+            width,
+            height,
+        },
         CacheOutcome::Publish(Some(src)),
-        src_stride,
-        width,
-        height,
     )
 }
 
@@ -523,11 +527,13 @@ pub fn write_bgra8_uncached<M: HostMemory + HostOps>(
         state,
         host,
         mapping_id,
-        src,
+        SourceFrame {
+            bytes: src,
+            stride: src_stride,
+            width,
+            height,
+        },
         CacheOutcome::Invalidate,
-        src_stride,
-        width,
-        height,
     )
 }
 
@@ -1258,16 +1264,34 @@ enum CacheOutcome<'a> {
     Invalidate,
 }
 
+/// The frame a writeback was handed: row-major BGRA8 bytes and the geometry
+/// that reads them.
+///
+/// One type rather than four arguments because the four are one fact and are
+/// checked against each other before a byte moves — `stride` is validated
+/// against `width`, and `width`/`height` against the mapping's latched extent.
+/// Four positional arguments of two types is also the shape in which a caller
+/// silently transposes `width` and `height`, and nothing downstream could tell.
+struct SourceFrame<'a> {
+    bytes: &'a [u8],
+    stride: u32,
+    width: u32,
+    height: u32,
+}
+
 fn write_bgra8_inner<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mapping_id: u32,
-    src: &[u8],
+    frame: SourceFrame<'_>,
     cache: CacheOutcome<'_>,
-    src_stride: u32,
-    width: u32,
-    height: u32,
 ) -> bool {
+    let SourceFrame {
+        bytes: src,
+        stride: src_stride,
+        width,
+        height,
+    } = frame;
     if !scanout_extent_ok(width, height) {
         return refuse(mapping_id, SurfaceWriteRefusal::Geometry { width, height });
     }
