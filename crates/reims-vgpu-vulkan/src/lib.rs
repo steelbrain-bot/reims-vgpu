@@ -4,5 +4,7 @@
 //! as placement and transfer choices. Guest-visible resource lifetime and
 //! content authority remain in `reims-vgpu-core`.
 
+pub mod api_floor;
+pub mod device_select;
 pub mod memory;
 pub mod policy;

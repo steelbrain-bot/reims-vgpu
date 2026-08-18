@@ -43,12 +43,12 @@
 //!    that only reaches a log line is a fact, and belongs in the format string
 //!    at the site that measured it.
 
-pub mod api_floor;
 pub mod device_features;
-pub mod device_select;
 pub mod host_pointer;
 pub mod memory_topology;
 pub mod push_descriptor;
+
+pub use reims_vgpu_vulkan::{api_floor, device_select};
 
 pub(crate) use host_pointer::{HostPointerCaps, HostPointerImport};
 pub(crate) use memory_topology::{MappedMemoryKind, MemoryClass, MemoryProfile};
