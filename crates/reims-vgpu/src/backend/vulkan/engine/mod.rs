@@ -1789,7 +1789,7 @@ mod stamp_point_source_tests {
 /// draw batch is still recording, the stamp enters the bounded pending queue
 /// without closing it; the batch's eventual successful submit assigns the
 /// point. The completion thread waits that point, release-stores the word
-/// through its checked [`crate::runtime::guest_ram::GuestRef`], and raises the
+/// through its checked [`reims_vgpu_memory::GuestRef`], and raises the
 /// interrupt. Queue order makes one point cover every earlier guest-memory read
 /// and write without manufacturing a submission or a command-buffer boundary
 /// for the four-byte stamp.
@@ -1806,7 +1806,7 @@ mod stamp_point_source_tests {
 /// it the blocking way. Nothing is enqueued unless a successful FIFO submission
 /// has published the completion point being waited.
 pub fn write_completion_stamp(
-    guest_ref: &crate::runtime::guest_ram::GuestRef,
+    guest_ref: &reims_vgpu_memory::GuestRef,
     index: u32,
     value: u32,
 ) -> Result<(), DrawError> {
@@ -2497,7 +2497,7 @@ pub fn retire_resident_storage_content(identity: &reims_vgpu_core::ComputeStorag
 /// allocation ends. Existing child images keep the import until their own
 /// fence-safe retirement; an allocation with no children enters the same
 /// graveyard immediately so already-recorded buffer accesses finish first.
-pub fn retire_guest_import(import_id: crate::runtime::guest_ram::ImportId) {
+pub fn retire_guest_import(import_id: reims_vgpu_memory::ImportId) {
     let mut guard = lock_engine();
     let Some(device) = guard.owner.ctx.as_ref().map(|ctx| ctx.device.clone()) else {
         return;
@@ -3196,7 +3196,7 @@ pub struct GuestPageTarget {
     /// unrelated to each other, so a 1920x1080 window is ~507 stretches and one
     /// range would name 1/507th of the frame. `references_for_runs` is the only
     /// producer and it guarantees the tiling; see its doc for what that buys.
-    pub runs: Vec<crate::runtime::guest_ram_map::GuestWindowRun>,
+    pub runs: Vec<reims_vgpu_memory::GuestWindowRun>,
     /// Guest row pitch in **texels** (`bufferRowLength`). Rows past the first
     /// start this far apart, which is how a padded guest pitch is honoured
     /// without the inter-row bytes ever being written.
@@ -4422,7 +4422,7 @@ unsafe fn release_guest_copy_to_host(
 /// no import capability never reaches this at all, because the resolution that
 /// produces `imports` refuses first.
 pub fn warm_guest_ram_imports(
-    imports: &[std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>],
+    imports: &[std::sync::Arc<reims_vgpu_memory::GuestRamImport>],
 ) -> (usize, u64) {
     let mut guard = lock_engine();
     let EngineState {
@@ -5519,7 +5519,7 @@ mod guest_page_target_tests {
     /// A target over a synthetic import large enough that the bound under test
     /// is the extent arithmetic and not the import's own length.
     fn target(width: u32, height: u32, row_length_texels: u32) -> GuestPageTarget {
-        use crate::runtime::guest_ram::{GuestRamImport, GuestRamRegion, GuestRef};
+        use reims_vgpu_memory::{GuestRamImport, GuestRamRegion, GuestRef};
         let import = std::sync::Arc::new(
             GuestRamImport::new(
                 GuestRamRegion {
@@ -5536,7 +5536,7 @@ mod guest_page_target_tests {
             // One run covering the whole window: this fixture is about the
             // extent arithmetic, and a contiguous window is exactly what
             // `references_for_runs` returns a single run for.
-            runs: vec![crate::runtime::guest_ram_map::GuestWindowRun {
+            runs: vec![reims_vgpu_memory::GuestWindowRun {
                 window_offset: 0,
                 guest: GuestRef::new(import, slice).expect("its own import"),
             }],

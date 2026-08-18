@@ -898,19 +898,19 @@ impl DeviceContext {
         // granularity from a device that declined the handle type.
         match host_pointer.rung {
             reims_vgpu_vulkan::host_pointer::HostPointerImport::Supported => {
-                crate::runtime::guest_ram::latch_import_limits(
+                reims_vgpu_memory::latch_import_limits(
                     host_pointer.min_alignment,
                     host_pointer.heap_budget,
                     host_pointer.span_max,
                 );
             }
-            _ => crate::runtime::guest_ram::forget_import_limits(),
+            _ => reims_vgpu_memory::forget_import_limits(),
         }
         // Every import this process holds names a `VkDeviceMemory` that dies
         // with the device below. Dropping them here, before the new one exists,
         // is what makes a recreate rebuild against fresh identities instead of
         // resolving a stale slice against a handle that is gone.
-        crate::runtime::guest_ram_map::reset();
+        reims_vgpu_vulkan::telemetry::guest_imports_invalidated();
         let portability_subset = has_device_extension(vk::KHR_PORTABILITY_SUBSET_NAME);
         let vertex_attribute_divisor = has_device_extension(vk::KHR_VERTEX_ATTRIBUTE_DIVISOR_NAME);
         #[cfg(feature = "host-window")]

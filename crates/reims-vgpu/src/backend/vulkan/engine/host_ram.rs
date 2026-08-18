@@ -15,7 +15,7 @@
 //! buffer reference; its many draw offsets are still only bounds checks.
 //!
 //! [`HostRamImports`] keys both forms by
-//! [`crate::runtime::guest_ram::ImportId`], so one allocation identity is never
+//! [`reims_vgpu_memory::ImportId`], so one allocation identity is never
 //! imported twice. The driver is allowed to refuse a packed alias; that answer
 //! is remembered and its caller gathers instead. The census separates RAMBlock
 //! entries from aliases so resource-shaped growth is visible.
@@ -33,7 +33,7 @@ use std::collections::HashMap;
 
 use ash::vk;
 
-use crate::runtime::guest_ram::{GuestRamError, GuestRamImport, GuestRef};
+use reims_vgpu_memory::{GuestRamError, GuestRamImport, GuestRef};
 use reims_vgpu_observe::Decline;
 use reims_vgpu_vulkan::host_pointer::ImportTypeRefusal;
 
@@ -44,7 +44,7 @@ pub(crate) struct ImportedHostRam {
     pub buffer: vk::Buffer,
     pub memory: vk::DeviceMemory,
     /// Bytes the import covers. The buffer spans all of it, so every
-    /// [`crate::runtime::guest_ram::BoundRange`] inside the import is a valid
+    /// [`reims_vgpu_memory::BoundRange`] inside the import is a valid
     /// offset into this one buffer.
     pub size: vk::DeviceSize,
 }
@@ -284,7 +284,7 @@ impl HostRamImports {
     /// before destruction, so no GPU buffer reference can outlive the import.
     pub(crate) fn retire(
         &mut self,
-        import_id: crate::runtime::guest_ram::ImportId,
+        import_id: reims_vgpu_memory::ImportId,
     ) -> Option<ImportedHostRam> {
         self.remove_live(import_id.get())
     }
@@ -785,10 +785,10 @@ mod tests {
             fn guest_ram_regions(
                 &mut self,
             ) -> Result<
-                Vec<crate::runtime::guest_ram::GuestRamRegion>,
+                Vec<reims_vgpu_memory::GuestRamRegion>,
                 crate::runtime::host::GuestRamRegionsError,
             > {
-                Ok(vec![crate::runtime::guest_ram::GuestRamRegion {
+                Ok(vec![reims_vgpu_memory::GuestRamRegion {
                     gpa_base: 0,
                     host_va: self.0,
                     len: LEN as u64,

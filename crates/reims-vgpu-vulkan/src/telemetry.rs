@@ -21,6 +21,7 @@ pub trait BackendTelemetry: Send + Sync {
     fn route_us(&self, _name: &'static str, _micros: u64) {}
     fn readback_phase(&self, _phase: ReadbackPhase, _micros: u64) {}
     fn readback_gpu_us(&self, _barrier: u64, _copy: u64) {}
+    fn guest_imports_invalidated(&self) {}
 }
 
 static TELEMETRY: OnceLock<&'static dyn BackendTelemetry> = OnceLock::new();
@@ -54,4 +55,8 @@ pub fn note_readback_phase(phase: ReadbackPhase, micros: u64) {
 
 pub fn note_readback_gpu_us(barrier: u64, copy: u64) {
     with_telemetry(|telemetry| telemetry.readback_gpu_us(barrier, copy));
+}
+
+pub fn guest_imports_invalidated() {
+    with_telemetry(|telemetry| telemetry.guest_imports_invalidated());
 }

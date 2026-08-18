@@ -54,6 +54,10 @@ impl reims_vgpu_vulkan::telemetry::BackendTelemetry for DeviceTelemetry {
     fn readback_gpu_us(&self, barrier: u64, copy: u64) {
         crate::runtime::drain::note_readback_gpu_us(barrier, copy);
     }
+
+    fn guest_imports_invalidated(&self) {
+        crate::runtime::guest_ram_map::reset();
+    }
 }
 
 static DEVICE_TELEMETRY: DeviceTelemetry = DeviceTelemetry;

@@ -156,7 +156,7 @@ struct Waiting {
     /// Stamp slot index, for the interrupt-status bit.
     index: u32,
     /// The checked shared-memory word written before the interrupt is raised.
-    word: crate::runtime::guest_ram::GuestRef,
+    word: reims_vgpu_memory::GuestRef,
     /// The FIFO completion value published into `word`.
     stamp: u32,
     /// When this stamp was registered, for the publish-latency census.
@@ -414,7 +414,7 @@ impl StampCompletion {
         &self,
         timeline: u64,
         index: u32,
-        word: crate::runtime::guest_ram::GuestRef,
+        word: reims_vgpu_memory::GuestRef,
         stamp: u32,
     ) {
         let Some(slot) =
@@ -460,7 +460,7 @@ impl StampCompletion {
     pub(crate) fn queue_for_next_submission(
         &self,
         index: u32,
-        word: crate::runtime::guest_ram::GuestRef,
+        word: reims_vgpu_memory::GuestRef,
         stamp: u32,
     ) -> bool {
         let Some(slot) =
@@ -741,7 +741,7 @@ mod tests {
     fn waiting(index: u32, stamp: u32) -> Waiting {
         let mut word = Box::new(0u32);
         let import = Arc::new(
-            crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
+            reims_vgpu_memory::GuestRamImport::new_host_allocation(
                 (&mut *word) as *mut u32 as usize,
                 std::mem::size_of::<u32>() as u64,
                 std::mem::align_of::<u32>() as u64,
@@ -755,7 +755,7 @@ mod tests {
         Waiting {
             point: CompletionPoint::Submitted(u64::from(stamp) + 1),
             index,
-            word: crate::runtime::guest_ram::GuestRef::new(import, slice).expect("guest word"),
+            word: reims_vgpu_memory::GuestRef::new(import, slice).expect("guest word"),
             stamp,
             queued_at: std::time::Instant::now(),
         }
@@ -909,7 +909,7 @@ mod tests {
     fn completed_waiting_entry_publishes_its_word() {
         let mut words = [0u32; 2];
         let import = Arc::new(
-            crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
+            reims_vgpu_memory::GuestRamImport::new_host_allocation(
                 words.as_mut_ptr() as usize,
                 std::mem::size_of_val(&words) as u64,
                 std::mem::align_of_val(&words) as u64,
@@ -917,7 +917,7 @@ mod tests {
             .expect("test import"),
         );
         let slice = import.slice(4, 4).expect("second word");
-        let word = crate::runtime::guest_ram::GuestRef::new(import, slice).expect("guest word");
+        let word = reims_vgpu_memory::GuestRef::new(import, slice).expect("guest word");
         let waiting = Waiting {
             point: CompletionPoint::Submitted(7),
             index: 2,

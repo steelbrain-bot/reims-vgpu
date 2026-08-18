@@ -446,13 +446,7 @@ pub fn reference<H: GuestRamProvider + ?Sized>(
 /// not from the start of a page and not from the start of the import. It is
 /// what a copy's source offset is measured in, which is the only thing a
 /// consumer needs and the only thing it may not compute for itself.
-#[derive(Debug)]
-pub struct GuestWindowRun {
-    /// Byte offset of this run's first byte within the requested window.
-    pub window_offset: u64,
-    /// The bindable reference for this run's bytes.
-    pub guest: GuestRef,
-}
+pub use reims_vgpu_memory::GuestWindowRun;
 
 /// [`reference_for_pages`] for a window that is *not* one contiguous stretch:
 /// one reference per maximal GPA run, in window order.

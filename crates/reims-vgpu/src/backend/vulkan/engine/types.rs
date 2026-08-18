@@ -1809,7 +1809,7 @@ pub struct GuestRunSource {
     ///
     /// `Arc` because a source is cloned per bind and these are shared, immutable
     /// and never rebuilt.
-    pub pages: Option<std::sync::Arc<Vec<crate::runtime::guest_ram_map::GuestWindowRun>>>,
+    pub pages: Option<std::sync::Arc<Vec<reims_vgpu_memory::GuestWindowRun>>>,
 }
 
 /// One stretch of a [`GuestRunSource`]'s window, already clipped to it.
@@ -1817,12 +1817,12 @@ pub struct GuestRunSource {
 /// `skip` is the distance from the stretch's own first requested byte to the
 /// first byte of the window that lands in it, and `window_offset` is where those
 /// bytes belong in the assembled window. Neither is the number nearest to hand:
-/// a [`crate::runtime::guest_ram_map::GuestWindowRun`] is positioned against the
+/// a [`reims_vgpu_memory::GuestWindowRun`] is positioned against the
 /// whole allocation its `pages` list describes, while the window is
 /// `source_offset..source_offset + total_len` inside that.
 #[derive(Debug)]
 pub struct WindowStretch<'a> {
-    pub guest: &'a crate::runtime::guest_ram::GuestRef,
+    pub guest: &'a reims_vgpu_memory::GuestRef,
     pub skip: u64,
     pub window_offset: u64,
     pub len: u64,
@@ -1932,8 +1932,8 @@ pub struct GuestTargetBacking {
 pub struct GuestTargetMemory {
     pub backing: GuestTargetBacking,
     /// The parent allocation whose one backend import all child views share.
-    pub import: std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
-    pub footprint: crate::runtime::guest_ram::GuestPageFootprint,
+    pub import: std::sync::Arc<reims_vgpu_memory::GuestRamImport>,
+    pub footprint: reims_vgpu_memory::GuestPageFootprint,
 }
 
 impl GuestTargetMemory {
@@ -1972,8 +1972,7 @@ impl GuestTargetMemory {
         }
         let slice = self.import.slice(self.backing.plane_offset, span).ok()?;
         let guest =
-            crate::runtime::guest_ram::GuestRef::new(std::sync::Arc::clone(&self.import), slice)
-                .ok()?;
+            reims_vgpu_memory::GuestRef::new(std::sync::Arc::clone(&self.import), slice).ok()?;
         let host_ptr = self
             .import
             .host_base()
@@ -1993,7 +1992,7 @@ impl GuestTargetMemory {
                 total_len: span,
                 row_length_texels,
                 pages: Some(std::sync::Arc::new(vec![
-                    crate::runtime::guest_ram_map::GuestWindowRun {
+                    reims_vgpu_memory::GuestWindowRun {
                         window_offset: 0,
                         guest,
                     },
@@ -2023,12 +2022,8 @@ mod tests {
     #[test]
     fn a_guest_target_derives_its_load_window_from_its_own_plane_contract() {
         let import = std::sync::Arc::new(
-            crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
-                0x1000_0000,
-                0x4000,
-                0x1000,
-            )
-            .expect("aligned import"),
+            reims_vgpu_memory::GuestRamImport::new_host_allocation(0x1000_0000, 0x4000, 0x1000)
+                .expect("aligned import"),
         );
         let memory = GuestTargetMemory {
             backing: GuestTargetBacking {
@@ -2040,7 +2035,7 @@ mod tests {
                 row_pitch: 32,
             },
             import,
-            footprint: crate::runtime::guest_ram::GuestPageFootprint::new(
+            footprint: reims_vgpu_memory::GuestPageFootprint::new(
                 std::sync::Arc::from([0x5000, 0x6000]),
                 0x1000,
             )

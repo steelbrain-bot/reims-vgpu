@@ -105,7 +105,7 @@ impl ResourcePools {
     pub(crate) unsafe fn retire_guest_import(
         &mut self,
         device: &ash::Device,
-        import_id: crate::runtime::guest_ram::ImportId,
+        import_id: reims_vgpu_memory::ImportId,
     ) {
         if let Some(parent) = self.host_ram_imports.retire(import_id) {
             reims_vgpu_vulkan::telemetry::note_route("guest_import_retired_now");
@@ -140,7 +140,7 @@ impl ResourcePools {
     pub(crate) unsafe fn bind_guest_ram(
         &mut self,
         ctx: &DeviceContext,
-        guest_ref: &crate::runtime::guest_ram::GuestRef,
+        guest_ref: &reims_vgpu_memory::GuestRef,
     ) -> Result<host_ram::BoundGuestRam, host_ram::HostRamDecline> {
         unsafe { self.host_ram_imports.bind(ctx, guest_ref) }
     }
@@ -153,7 +153,7 @@ impl ResourcePools {
     pub(crate) unsafe fn warm_guest_ram(
         &mut self,
         ctx: &DeviceContext,
-        import: &crate::runtime::guest_ram::GuestRamImport,
+        import: &reims_vgpu_memory::GuestRamImport,
     ) -> Result<bool, host_ram::HostRamDecline> {
         unsafe { self.host_ram_imports.warm(ctx, import) }
     }

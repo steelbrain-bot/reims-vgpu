@@ -6433,10 +6433,8 @@ mod tests {
     /// One import over a plausible RAMBlock, for building references the
     /// planners can be asked about. The host address is compared and never
     /// dereferenced, which is what lets a unit test hold one.
-    fn window_runs(
-        stretches: &[(u64, u64, u64)],
-    ) -> Vec<crate::runtime::guest_ram_map::GuestWindowRun> {
-        use crate::runtime::guest_ram::{GuestRamImport, GuestRamRegion, GuestRef};
+    fn window_runs(stretches: &[(u64, u64, u64)]) -> Vec<reims_vgpu_memory::GuestWindowRun> {
+        use reims_vgpu_memory::{GuestRamImport, GuestRamRegion, GuestRef};
         let import = std::sync::Arc::new(
             GuestRamImport::new(
                 GuestRamRegion {
@@ -6451,7 +6449,7 @@ mod tests {
         stretches
             .iter()
             .map(
-                |&(window_offset, offset, len)| crate::runtime::guest_ram_map::GuestWindowRun {
+                |&(window_offset, offset, len)| reims_vgpu_memory::GuestWindowRun {
                     window_offset,
                     guest: GuestRef::new(
                         std::sync::Arc::clone(&import),
@@ -6467,7 +6465,7 @@ mod tests {
     /// `pages`. `runs` is the CPU gather's view of the same bytes and is not
     /// consulted by anything under test here.
     fn source_over(
-        pages: Vec<crate::runtime::guest_ram_map::GuestWindowRun>,
+        pages: Vec<reims_vgpu_memory::GuestWindowRun>,
         source_offset: u64,
         total_len: u64,
     ) -> super::super::types::GuestRunSource {
@@ -6801,7 +6799,7 @@ mod tests {
     /// import, which rounds out to a `head` of 24 and a bound length of 4096.
     #[test]
     fn a_gather_region_reads_the_requested_bytes_and_not_the_rounding() {
-        use crate::runtime::guest_ram::{GuestRamImport, GuestRamRegion, GuestRef};
+        use reims_vgpu_memory::{GuestRamImport, GuestRamRegion, GuestRef};
         let import = std::sync::Arc::new(
             GuestRamImport::new(
                 GuestRamRegion {
@@ -6819,7 +6817,7 @@ mod tests {
         assert_eq!(slice.bound_len(), 4096, "and out to the granule at the end");
 
         let src = source_over(
-            vec![crate::runtime::guest_ram_map::GuestWindowRun {
+            vec![reims_vgpu_memory::GuestWindowRun {
                 window_offset: 512,
                 guest: GuestRef::new(std::sync::Arc::clone(&import), slice)
                     .expect("the slice came from this import"),

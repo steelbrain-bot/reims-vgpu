@@ -16,6 +16,7 @@ ash = "0.38"
 metal2vulkan = { git = "https://github.com/steelbrain/metal2vulkan.git", rev = "8b78eaca3be72b4e596aa1c790a4cd114ac1e9ec" }
 reims-vgpu-config = { path = "../reims-vgpu-config" }
 reims-vgpu-core = { path = "../reims-vgpu-core" }
+reims-vgpu-memory = { path = "../reims-vgpu-memory" }
 reims-vgpu-observe = { path = "../reims-vgpu-observe" }
 reims-vgpu-protocol = { path = "../reims-vgpu-protocol" }
 reims-vgpu-wire = { path = "../reims-vgpu-wire" }
