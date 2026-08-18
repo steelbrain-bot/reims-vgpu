@@ -20,7 +20,10 @@ pub mod target;
 pub mod texel;
 pub mod visibility;
 
-pub use blit::{BufferFillPattern, ResolvedBufferBlit, ResolvedBufferRange};
+pub use blit::{
+    BufferFillPattern, ResolvedBufferBlit, ResolvedBufferRange, ResolvedLinearTextureLevel,
+    ResolvedSurfaceTextureBacking, ResolvedTextureBacking,
+};
 pub use capabilities::{CapabilityService, DeviceInfoLimits, ExecutorCapabilities, MAX_CHANNELS};
 pub use compute::{
     ComputeBufferBacking, ComputeBufferOutput, ComputeBufferResource, ComputeBufferResult,

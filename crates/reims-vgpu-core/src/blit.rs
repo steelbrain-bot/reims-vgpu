@@ -1,7 +1,116 @@
 //! Immutable, resource-resolved blit operations.
 
 use crate::ContentStamp;
-use reims_vgpu_protocol::{ByteLength, GuestVirtualAddress, ResourceId, ResourceObject};
+use reims_vgpu_protocol::{ByteLength, GuestVirtualAddress, MappingId, ResourceId, ResourceObject};
+
+/// One resolved mip level in a task-address texture allocation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedLinearTextureLevel {
+    /// Allocation base guest virtual address.
+    pub base_gva: u64,
+    pub alloc_size: u64,
+    pub level_offset: u64,
+    pub row_stride: u64,
+    /// Byte stride between array slices or cube faces; zero for one slice.
+    pub slice_stride: u64,
+    /// Absolute array slice or cube face selected by view resolution.
+    pub slice_index: u32,
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub bpp: u32,
+    pub pixel_format: u16,
+}
+
+impl ResolvedLinearTextureLevel {
+    pub fn bytes_per_image(&self) -> Option<u64> {
+        self.row_stride.checked_mul(u64::from(self.height))
+    }
+
+    /// Byte offset of texel origin `(x, y, z)` within the allocation.
+    pub fn texel_offset(&self, x: u64, y: u64, z: u64) -> Option<u64> {
+        let plane = z.checked_mul(self.bytes_per_image()?)?;
+        let slice = if self.slice_index == 0 || self.slice_stride == 0 {
+            0
+        } else {
+            u64::from(self.slice_index).checked_mul(self.slice_stride)?
+        };
+        self.level_offset
+            .checked_add(slice)?
+            .checked_add(plane)?
+            .checked_add(y.checked_mul(self.row_stride)?)?
+            .checked_add(x.checked_mul(u64::from(self.bpp))?)
+    }
+}
+
+/// One resolved plane in a registered surface mapping.
+///
+/// Registered-surface textures are single-level and two-dimensional. Plane
+/// selection has already happened before this value exists; `surface_offset`,
+/// `row_stride`, and `span_end` describe the selected window in the mapping.
+/// The mapping remains a typed relation and is not interchangeable with an
+/// object-table or serializer reference.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedSurfaceTextureBacking {
+    pub mapping_id: MappingId,
+    pub width: u32,
+    pub height: u32,
+    pub surface_offset: u64,
+    /// The surface-window contract carries its row stride as `u32` end to end.
+    pub row_stride: u32,
+    /// Exclusive end of the selected plane window in the mapping.
+    pub span_end: u64,
+    pub bpp: u32,
+    pub pixel_format: u16,
+}
+
+/// Backend-independent guest storage behind one resolved texture endpoint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResolvedTextureBacking {
+    Linear(ResolvedLinearTextureLevel),
+    Surface(ResolvedSurfaceTextureBacking),
+}
+
+impl ResolvedTextureBacking {
+    pub const fn width(&self) -> u32 {
+        match self {
+            Self::Linear(texture) => texture.width,
+            Self::Surface(texture) => texture.width,
+        }
+    }
+
+    pub const fn height(&self) -> u32 {
+        match self {
+            Self::Linear(texture) => texture.height,
+            Self::Surface(texture) => texture.height,
+        }
+    }
+
+    pub const fn depth(&self) -> u32 {
+        match self {
+            Self::Linear(texture) => texture.depth,
+            Self::Surface(_) => 1,
+        }
+    }
+
+    pub const fn bpp(&self) -> u32 {
+        match self {
+            Self::Linear(texture) => texture.bpp,
+            Self::Surface(texture) => texture.bpp,
+        }
+    }
+
+    pub const fn pixel_format(&self) -> u16 {
+        match self {
+            Self::Linear(texture) => texture.pixel_format,
+            Self::Surface(texture) => texture.pixel_format,
+        }
+    }
+
+    pub const fn is_surface(&self) -> bool {
+        matches!(self, Self::Surface(_))
+    }
+}
 
 /// One checked byte range over a resolved buffer resource.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,5 +187,44 @@ mod tests {
         };
 
         assert_eq!(operation.destination().resource(), ResourceId::new(7, 3));
+    }
+
+    #[test]
+    fn resolved_texture_storage_keeps_mapping_identity_and_level_geometry() {
+        let linear = ResolvedLinearTextureLevel {
+            base_gva: 0x1000,
+            alloc_size: 0x8000,
+            level_offset: 0x200,
+            row_stride: 64,
+            slice_stride: 0x1000,
+            slice_index: 2,
+            width: 8,
+            height: 4,
+            depth: 1,
+            bpp: 4,
+            pixel_format: 80,
+        };
+        assert_eq!(linear.bytes_per_image(), Some(256));
+        assert_eq!(
+            linear.texel_offset(3, 2, 0),
+            Some(0x200 + 0x2000 + 128 + 12)
+        );
+
+        let surface = ResolvedTextureBacking::Surface(ResolvedSurfaceTextureBacking {
+            mapping_id: MappingId::new(9),
+            width: 1920,
+            height: 1080,
+            surface_offset: 0,
+            row_stride: 7680,
+            span_end: 8_294_400,
+            bpp: 4,
+            pixel_format: 80,
+        });
+        assert!(surface.is_surface());
+        assert_eq!(surface.depth(), 1);
+        let ResolvedTextureBacking::Surface(surface) = surface else {
+            unreachable!()
+        };
+        assert_eq!(surface.mapping_id, MappingId::new(9));
     }
 }

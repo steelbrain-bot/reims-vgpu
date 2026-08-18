@@ -995,7 +995,7 @@ fn a_iosurface_plane_view_blit_source_reads_the_plane_the_wire_named() {
     let backing = resolve_texture_backing(&mut state, &mut host, 1, obj_ref, 0, 0)
         .expect("IOSurface plane view blit source must resolve");
     match backing {
-        TextureBacking::IOSurface(t) => assert_eq!(
+        TextureBacking::Surface(t) => assert_eq!(
             t.surface_offset, ALPHA_OFFSET as u64,
             "the wire named plane 2, and only the wire index can reach it"
         ),
@@ -1046,8 +1046,8 @@ fn iosurface_plane_view_ref_texture_resolves_as_iosurface_texture_blit_backing()
     let backing = resolve_texture_backing(&mut state, &mut host, 1, obj_ref, 0, 0)
         .expect("IOSurface plane view blit source must resolve");
     match backing {
-        TextureBacking::IOSurface(t) => {
-            assert_eq!(t.mapping_id, mapping_id, "backs the named surface");
+        TextureBacking::Surface(t) => {
+            assert_eq!(t.mapping_id.get(), mapping_id, "backs the named surface");
             assert_eq!((t.width, t.height), (w, h), "view geometry, not base");
             assert_eq!(t.pixel_format, fmt);
             assert_eq!(t.bpp, bytes_per_pixel(fmt).unwrap());
@@ -1985,7 +1985,7 @@ fn a_last_array_slice_is_not_charged_for_its_trailing_row_padding() {
             assert!(t.texel_offset(3, 1, 0).unwrap() + 4 <= EXACT);
             t.slice_stride
         }
-        TextureBacking::IOSurface(_) => panic!("linear texture resolved as IOSurface texture"),
+        TextureBacking::Surface(_) => panic!("linear texture resolved as IOSurface texture"),
     };
 
     // The bound this replaced charged a second whole stride and refused this
@@ -3100,7 +3100,7 @@ fn a_whole_surface_iosurface_texture_source_reaches_the_destinations_own_guest_p
     const H: u32 = 32;
     const BPR: u64 = 256;
     let src = IOSurfaceTextureBacking {
-        mapping_id: 7,
+        mapping_id: MappingId::new(7),
         width: W,
         height: H,
         surface_offset: 0,
