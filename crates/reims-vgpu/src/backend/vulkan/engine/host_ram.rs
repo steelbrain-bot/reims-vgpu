@@ -800,7 +800,7 @@ mod tests {
         let before = super::super::guest_import_census().0;
         let mut host = OneBlock(base as u64);
         let executor = crate::runtime::executor::VulkanExecutor::default();
-        let _scope = crate::runtime::executor::Executor::enter(&executor);
+        let _scope = crate::runtime::executor::SessionService::enter(&executor);
         crate::runtime::guest_ram_map::warm(&mut host, &executor);
         let after = super::super::guest_import_census().0;
         assert_eq!(

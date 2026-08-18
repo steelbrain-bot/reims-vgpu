@@ -120,6 +120,24 @@ pub trait GuestMemoryService: std::fmt::Debug + Send + Sync {
     fn retire_guest_import(&self, _import: crate::runtime::guest_ram::ImportId) {}
 }
 
+/// Backend housekeeping which does not itself execute a guest command.
+pub trait MaintenanceService: std::fmt::Debug + Send + Sync {
+    fn flush_batched_draws(&self) {}
+
+    fn maintain_resources(&self, _now_ms: u64) {}
+}
+
+/// Per-vGPU backend-session selection and teardown.
+pub trait SessionService: std::fmt::Debug + Send + Sync {
+    /// End one guest lifetime while preserving shareable physical-GPU state.
+    fn reset(&self) {}
+
+    /// Select this executor's device-local backend session for a product call.
+    fn enter(&self) -> ExecutionScope {
+        ExecutionScope::none()
+    }
+}
+
 /// Backend execution contract implemented per device.
 pub trait Executor:
     ExecutionPort<
@@ -133,11 +151,9 @@ pub trait Executor:
     + PresentationService
     + ReadbackService<Error = DrawError>
     + GuestMemoryService
+    + MaintenanceService
+    + SessionService
 {
-    fn flush_batched_draws(&self) {}
-
-    fn maintain_resources(&self, _now_ms: u64) {}
-
     /// Observation-only snapshots. Semantic planning must never read these.
     fn sampled_working_set_census(&self) -> Option<String> {
         None
@@ -165,14 +181,6 @@ pub trait Executor:
 
     fn take_engine_lock_census(&self, _win_ms: u64) -> Option<String> {
         None
-    }
-
-    /// End one guest lifetime while preserving shareable physical-GPU state.
-    fn reset(&self) {}
-
-    /// Select this executor's device-local backend session for a product call.
-    fn enter(&self) -> ExecutionScope {
-        ExecutionScope::none()
     }
 }
 
@@ -248,14 +256,6 @@ impl GuestMemoryService for VulkanExecutor {
 }
 
 impl Executor for VulkanExecutor {
-    fn flush_batched_draws(&self) {
-        crate::backend::vulkan::engine::flush_batched_draws();
-    }
-
-    fn maintain_resources(&self, now_ms: u64) {
-        crate::backend::vulkan::engine::maintain_resources(now_ms);
-    }
-
     fn sampled_working_set_census(&self) -> Option<String> {
         crate::backend::vulkan::engine::sampled_working_set_census()
     }
@@ -283,7 +283,19 @@ impl Executor for VulkanExecutor {
     fn take_engine_lock_census(&self, win_ms: u64) -> Option<String> {
         crate::backend::vulkan::engine::take_engine_lock_census(win_ms)
     }
+}
 
+impl MaintenanceService for VulkanExecutor {
+    fn flush_batched_draws(&self) {
+        crate::backend::vulkan::engine::flush_batched_draws();
+    }
+
+    fn maintain_resources(&self, now_ms: u64) {
+        crate::backend::vulkan::engine::maintain_resources(now_ms);
+    }
+}
+
+impl SessionService for VulkanExecutor {
     fn reset(&self) {
         let _scope = self.enter();
         crate::backend::vulkan::engine::reset_guest_state();
@@ -653,6 +665,7 @@ mod tests {
 
     impl PresentationService for ScriptedExecutor {}
     impl GuestMemoryService for ScriptedExecutor {}
+    impl MaintenanceService for ScriptedExecutor {}
 
     impl ReadbackService for ScriptedExecutor {
         type Error = DrawError;
@@ -666,11 +679,13 @@ mod tests {
         }
     }
 
-    impl Executor for ScriptedExecutor {
+    impl SessionService for ScriptedExecutor {
         fn reset(&self) {
             self.resets.fetch_add(1, Ordering::Relaxed);
         }
     }
+
+    impl Executor for ScriptedExecutor {}
 
     impl ResidentService for ScriptedExecutor {}
 
@@ -884,6 +899,8 @@ mod tests {
     impl CapabilityService for WrongIdentityExecutor {}
     impl PresentationService for WrongIdentityExecutor {}
     impl GuestMemoryService for WrongIdentityExecutor {}
+    impl MaintenanceService for WrongIdentityExecutor {}
+    impl SessionService for WrongIdentityExecutor {}
     impl ReadbackService for WrongIdentityExecutor {
         type Error = DrawError;
 
