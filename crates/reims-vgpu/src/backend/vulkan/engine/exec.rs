@@ -1536,7 +1536,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
         // third factor that overflows. A refusal rather than a clamp, because
         // this length is what the next line compares the buffer against and a
         // wrapped one would let a short buffer match.
-        let Some(expected) = crate::contract::extent::tight_image_bytes(
+        let Some(expected) = reims_vgpu_protocol::tight_image_bytes(
             req.width,
             req.height,
             crate::contract::pixel_format::RGBA8_BPP as usize,
@@ -1725,7 +1725,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
         // preserves it, and this binding's divisor is 0 whatever the rate says.
         // Asking `rate == 0` alone declined that guest's draw outright, for a
         // field nothing downstream reads. `contract::vertex_step` owns the pair.
-        if !crate::contract::vertex_step::step_rate_in_contract(
+        if !reims_vgpu_protocol::step_rate_in_contract(
             attribute.step_function.mtl_ordinal(),
             attribute.step_rate,
         ) {
@@ -1910,7 +1910,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
         // Four factors, so the widening the operands already carry is not
         // enough — see the target-seed check above for why two of them exhaust
         // a u64 on their own. `contract::extent` owns the checked form.
-        let Some(expected) = crate::contract::extent::tight_layered_image_bytes(
+        let Some(expected) = reims_vgpu_protocol::tight_layered_image_bytes(
             image.width,
             image.height,
             image.layers,

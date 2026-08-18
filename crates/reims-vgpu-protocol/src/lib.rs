@@ -7,14 +7,19 @@
 #![no_std]
 
 pub mod blit;
+pub mod geometry;
 pub mod identity;
 pub mod pixel;
 pub mod resource;
 pub mod resource_state;
 pub mod submission;
+pub mod vertex_step;
 
 pub use blit::{
     BlitCommand, BlitCopyKind, BlitFillSource, BlitKind, BlitPoint, BlitRefKind, BlitSize,
+};
+pub use geometry::{
+    mip_extent, tight_image_bytes, tight_image_layout, tight_layered_image_bytes, Extent3,
 };
 pub use identity::{
     BackingGeneration, ByteLength, ByteOffset, ContentVersion, GuestPhysicalAddress,
@@ -31,4 +36,9 @@ pub use resource_state::ResourceValidityOps;
 pub use submission::{
     HeapObject, IndirectCommandBufferObject, ResourceObject, ResourceValidity, SegmentBoundary,
     SegmentKind, SubmissionIdentity, SubmissionResourceUse,
+};
+pub use vertex_step::{
+    step_rate_in_contract, MTL_VERTEX_STEP_FUNCTION_CONSTANT,
+    MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE, MTL_VERTEX_STEP_FUNCTION_PER_PATCH,
+    MTL_VERTEX_STEP_FUNCTION_PER_PATCH_CONTROL_POINT, MTL_VERTEX_STEP_FUNCTION_PER_VERTEX,
 };

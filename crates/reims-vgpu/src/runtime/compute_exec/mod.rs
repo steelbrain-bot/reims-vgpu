@@ -3523,12 +3523,19 @@ pub(crate) fn execute_dispatch_nested<M: HostMemory + HostOps>(
 
 /// The dispatch extents, narrowed from the wire's `u64` by [`u32_dim`].
 ///
-/// The type is [`crate::contract::extent::Extent3`], which both this decoder
-/// here, which protected construction and stopped at the backend call — see its
-/// doc for why that was the wrong half of the journey to protect.
-use crate::contract::extent::Extent3;
+/// The protocol-owned type crosses both this decoder and the backend call;
+/// keeping it only around construction would protect the half of the journey
+/// where the fields are not yet interchangeable.
+use reims_vgpu_protocol::Extent3;
 
-impl Extent3 {
+/// Runtime sources from which this composition layer can construct a semantic
+/// protocol extent.
+trait ResolveExtent: Sized {
+    fn from_wire(s: crate::runtime::decode::compute::Size3) -> Result<Self, ComputeStatus>;
+    fn from_indirect(raw: &[u8], at: usize) -> Result<Self, ComputeStatus>;
+}
+
+impl ResolveExtent for Extent3 {
     /// From a decoded wire `Size3`, refusing each component out of range.
     fn from_wire(s: crate::runtime::decode::compute::Size3) -> Result<Self, ComputeStatus> {
         Ok(Self {

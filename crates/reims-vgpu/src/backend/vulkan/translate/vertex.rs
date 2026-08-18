@@ -376,7 +376,7 @@ mod tests {
     /// agrees with the declaration.
     #[test]
     fn an_accepted_step_function_round_trips_to_its_own_ordinal() {
-        use crate::contract::vertex_step as step;
+        use reims_vgpu_protocol::vertex_step as step;
         for ordinal in [
             step::MTL_VERTEX_STEP_FUNCTION_CONSTANT,
             step::MTL_VERTEX_STEP_FUNCTION_PER_VERTEX,

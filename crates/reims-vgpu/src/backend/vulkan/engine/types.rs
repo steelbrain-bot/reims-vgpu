@@ -895,7 +895,7 @@ impl VertexStepFunction {
     /// [`crate::contract::vertex_step`] — can be asked on this side without a
     /// second copy of the mapping.
     pub fn mtl_ordinal(self) -> u32 {
-        use crate::contract::vertex_step as step;
+        use reims_vgpu_protocol::vertex_step as step;
         match self {
             Self::Constant => step::MTL_VERTEX_STEP_FUNCTION_CONSTANT,
             Self::PerVertex => step::MTL_VERTEX_STEP_FUNCTION_PER_VERTEX,
