@@ -27,8 +27,8 @@ pub use resource::{
     StorageNode,
 };
 pub use service::{
-    GuestWriteReach, GuestWriteService, ResidentContent, ResidentReclaim, ResidentService,
-    TargetReadback,
+    GuestWriteReach, GuestWriteService, PresentDecline, PresentationService, ResidentContent,
+    ResidentReclaim, ResidentService, TargetReadback,
 };
 pub use submission::SubmissionContext;
 pub use target::{TargetIdentity, TargetKeyDivergence};

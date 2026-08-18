@@ -336,7 +336,7 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
     if !state.executor.window_present_attached() {
         crate::runtime::drain::note_store_route("winpub_window_not_attached");
     } else if let Err(route) = resident_present {
-        crate::runtime::drain::note_store_route(route);
+        crate::runtime::drain::note_store_route(route.slug());
     }
     // No resident carries this present (firmware framebuffer, a mapping the
     // compositor cleared but never rendered into, the frames after a device

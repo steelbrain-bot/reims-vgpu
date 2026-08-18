@@ -2009,15 +2009,21 @@ fn resident_present_decision(
     identity: &TargetIdentity,
     width: u32,
     height: u32,
-) -> Result<(), &'static str> {
+) -> Result<(), reims_vgpu_core::PresentDecline> {
     let Some(slot) = pools.registry_get(identity) else {
-        return Err("winpub_no_resident");
+        return Err(reims_vgpu_core::PresentDecline::NoResident);
     };
     match pools::slot_present_decline(slot, width, height) {
         None => Ok(()),
-        Some(pools::ResidentPresentDecline::ContentNotReady) => Err("winpub_content_not_ready"),
-        Some(pools::ResidentPresentDecline::ScanoutOrder) => Err("winpub_scanout_order"),
-        Some(pools::ResidentPresentDecline::Geometry) => Err("winpub_geometry"),
+        Some(pools::ResidentPresentDecline::ContentNotReady) => {
+            Err(reims_vgpu_core::PresentDecline::ContentNotReady)
+        }
+        Some(pools::ResidentPresentDecline::ScanoutOrder) => {
+            Err(reims_vgpu_core::PresentDecline::ScanoutOrder)
+        }
+        Some(pools::ResidentPresentDecline::Geometry) => {
+            Err(reims_vgpu_core::PresentDecline::Geometry)
+        }
     }
 }
 
@@ -2040,7 +2046,7 @@ pub fn prepare_window_resident_present(
     identity: &TargetIdentity,
     width: u32,
     height: u32,
-) -> Result<(), &'static str> {
+) -> Result<(), reims_vgpu_core::PresentDecline> {
     let now_ms = crate::observe::elapsed_ms() as u64;
     let mut guard = lock_engine();
     let EngineState {

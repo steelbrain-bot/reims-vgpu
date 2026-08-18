@@ -45,6 +45,28 @@ impl ResidentReclaim {
     }
 }
 
+/// Why the direct host-window presentation route cannot carry a frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PresentDecline {
+    WindowNotAttached,
+    NoResident,
+    ContentNotReady,
+    ScanoutOrder,
+    Geometry,
+}
+
+impl PresentDecline {
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::WindowNotAttached => "winpub_window_not_attached",
+            Self::NoResident => "winpub_no_resident",
+            Self::ContentNotReady => "winpub_content_not_ready",
+            Self::ScanoutOrder => "winpub_scanout_order",
+            Self::Geometry => "winpub_geometry",
+        }
+    }
+}
+
 /// A resident target's pixels and their physical channel order.
 #[derive(Debug, Eq, PartialEq)]
 pub struct TargetReadback {
@@ -127,9 +149,29 @@ pub trait GuestWriteService: std::fmt::Debug + Send + Sync {
     fn quiesce_guest_writes(&self) {}
 }
 
+/// Host-window presentation service over semantic resident identities.
+pub trait PresentationService: std::fmt::Debug + Send + Sync {
+    fn resident_presentable(&self, _identity: &TargetIdentity, _width: u32, _height: u32) -> bool {
+        false
+    }
+
+    fn prepare_window_resident_present(
+        &self,
+        _identity: &TargetIdentity,
+        _width: u32,
+        _height: u32,
+    ) -> Result<(), PresentDecline> {
+        Err(PresentDecline::WindowNotAttached)
+    }
+
+    fn window_present_attached(&self) -> bool {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::TargetReadback;
+    use super::{PresentDecline, TargetReadback};
 
     #[test]
     fn readback_converts_only_when_the_requested_order_differs() {
@@ -150,5 +192,20 @@ mod tests {
             .into_bgra8(),
             vec![3, 2, 1, 4, 7, 6, 5, 8]
         );
+    }
+
+    #[test]
+    fn presentation_declines_have_stable_observation_names() {
+        assert_eq!(
+            PresentDecline::WindowNotAttached.slug(),
+            "winpub_window_not_attached"
+        );
+        assert_eq!(PresentDecline::NoResident.slug(), "winpub_no_resident");
+        assert_eq!(
+            PresentDecline::ContentNotReady.slug(),
+            "winpub_content_not_ready"
+        );
+        assert_eq!(PresentDecline::ScanoutOrder.slug(), "winpub_scanout_order");
+        assert_eq!(PresentDecline::Geometry.slug(), "winpub_geometry");
     }
 }

@@ -12,8 +12,8 @@ use reims_vgpu_protocol::StorageImageFormat;
 
 pub use reims_vgpu_core::{
     CapabilityService, ComputeResidencyService, ExecutionPort, ExecutorCapabilities,
-    GuestWriteReach, GuestWriteService, ResidentContent, ResidentContentBacking, ResidentLease,
-    ResidentService, SubmissionContext, TargetReadback,
+    GuestWriteReach, GuestWriteService, PresentDecline, PresentationService, ResidentContent,
+    ResidentContentBacking, ResidentLease, ResidentService, SubmissionContext, TargetReadback,
 };
 
 impl ResidentLease for crate::backend::vulkan::engine::ResidentResourceLease {
@@ -61,6 +61,7 @@ pub trait Executor:
     + GuestWriteService
     + ComputeResidencyService
     + CapabilityService
+    + PresentationService
 {
     fn read_target(&self, _identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
         Err(DrawError::Facade(
@@ -136,10 +137,6 @@ pub trait Executor:
 
     fn retire_guest_import(&self, _import: crate::runtime::guest_ram::ImportId) {}
 
-    fn resident_presentable(&self, _identity: &TargetIdentity, _width: u32, _height: u32) -> bool {
-        false
-    }
-
     fn flush_batched_draws(&self) {}
 
     fn maintain_resources(&self, _now_ms: u64) {}
@@ -171,19 +168,6 @@ pub trait Executor:
 
     fn take_engine_lock_census(&self, _win_ms: u64) -> Option<String> {
         None
-    }
-
-    fn prepare_window_resident_present(
-        &self,
-        _identity: &TargetIdentity,
-        _width: u32,
-        _height: u32,
-    ) -> Result<(), &'static str> {
-        Err("winpub_window_not_attached")
-    }
-
-    fn window_present_attached(&self) -> bool {
-        false
     }
 
     /// End one guest lifetime while preserving shareable physical-GPU state.
@@ -280,10 +264,6 @@ impl Executor for VulkanExecutor {
         crate::backend::vulkan::engine::retire_guest_import(import);
     }
 
-    fn resident_presentable(&self, identity: &TargetIdentity, width: u32, height: u32) -> bool {
-        crate::backend::vulkan::engine::resident_presentable(identity, width, height)
-    }
-
     fn flush_batched_draws(&self) {
         crate::backend::vulkan::engine::flush_batched_draws();
     }
@@ -320,30 +300,6 @@ impl Executor for VulkanExecutor {
         crate::backend::vulkan::engine::take_engine_lock_census(win_ms)
     }
 
-    fn prepare_window_resident_present(
-        &self,
-        identity: &TargetIdentity,
-        width: u32,
-        height: u32,
-    ) -> Result<(), &'static str> {
-        #[cfg(feature = "host-window")]
-        return crate::backend::vulkan::engine::prepare_window_resident_present(
-            identity, width, height,
-        );
-        #[cfg(not(feature = "host-window"))]
-        {
-            let _ = (identity, width, height);
-            Err("winpub_window_not_attached")
-        }
-    }
-
-    fn window_present_attached(&self) -> bool {
-        #[cfg(feature = "host-window")]
-        return crate::backend::vulkan::engine::window_present_attached();
-        #[cfg(not(feature = "host-window"))]
-        false
-    }
-
     fn reset(&self) {
         let _scope = self.enter();
         crate::backend::vulkan::engine::reset_guest_state();
@@ -376,6 +332,36 @@ impl CapabilityService for VulkanExecutor {
         layout: crate::contract::pixel_format::TexelLayout,
     ) -> bool {
         crate::backend::vulkan::engine::render_target_layout_supported(layout)
+    }
+}
+
+impl PresentationService for VulkanExecutor {
+    fn resident_presentable(&self, identity: &TargetIdentity, width: u32, height: u32) -> bool {
+        crate::backend::vulkan::engine::resident_presentable(identity, width, height)
+    }
+
+    fn prepare_window_resident_present(
+        &self,
+        identity: &TargetIdentity,
+        width: u32,
+        height: u32,
+    ) -> Result<(), PresentDecline> {
+        #[cfg(feature = "host-window")]
+        return crate::backend::vulkan::engine::prepare_window_resident_present(
+            identity, width, height,
+        );
+        #[cfg(not(feature = "host-window"))]
+        {
+            let _ = (identity, width, height);
+            Err(PresentDecline::WindowNotAttached)
+        }
+    }
+
+    fn window_present_attached(&self) -> bool {
+        #[cfg(feature = "host-window")]
+        return crate::backend::vulkan::engine::window_present_attached();
+        #[cfg(not(feature = "host-window"))]
+        false
     }
 }
 
@@ -661,6 +647,8 @@ mod tests {
         }
     }
 
+    impl PresentationService for ScriptedExecutor {}
+
     impl Executor for ScriptedExecutor {
         fn reset(&self) {
             self.resets.fetch_add(1, Ordering::Relaxed);
@@ -877,6 +865,7 @@ mod tests {
     struct WrongIdentityExecutor;
 
     impl CapabilityService for WrongIdentityExecutor {}
+    impl PresentationService for WrongIdentityExecutor {}
     impl Executor for WrongIdentityExecutor {}
     impl ResidentService for WrongIdentityExecutor {}
     impl GuestWriteService for WrongIdentityExecutor {}

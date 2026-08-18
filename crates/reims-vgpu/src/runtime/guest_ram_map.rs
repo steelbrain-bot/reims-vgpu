@@ -798,6 +798,7 @@ mod tests {
     struct NoopExecutor;
 
     impl crate::runtime::executor::CapabilityService for NoopExecutor {}
+    impl crate::runtime::executor::PresentationService for NoopExecutor {}
     impl crate::runtime::executor::Executor for NoopExecutor {}
     impl crate::runtime::executor::ResidentService for NoopExecutor {}
     impl crate::runtime::executor::GuestWriteService for NoopExecutor {}
