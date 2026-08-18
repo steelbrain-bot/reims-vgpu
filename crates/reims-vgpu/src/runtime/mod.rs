@@ -61,7 +61,7 @@ pub mod heap_query;
 pub mod host;
 /// Which guest pages this device has written, and when.
 pub mod host_writes;
-/// Type-7 ICB (0x36) materialization, host command fills, execute writeback.
+/// ICB descriptor materialization, host command fills, and execute writeback.
 pub mod icb;
 
 /// Draw encode and writeback when MTLBs resolve.

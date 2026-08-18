@@ -85,7 +85,7 @@ pub fn operation(mtl: u32) -> Result<BlendOp, TranslateReason> {
     })
 }
 
-/// A whole decoded type-7 colour-attachment blend descriptor.
+/// A whole decoded render-pipeline colour-attachment blend descriptor.
 ///
 /// Fails on the first unrepresentable component rather than substituting a
 /// default for it — a blend that silently becomes `ONE, ZERO` is a rendering

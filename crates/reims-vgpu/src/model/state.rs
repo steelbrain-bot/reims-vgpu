@@ -1839,7 +1839,7 @@ pub type TaskRenderPipelineStates = TaskReferenceStates<
 /// A depth-stencil state is an immutable object with its own explicit delete
 /// command (`OPCODE_DELETE_DEPTH_STENCIL_STATE`), exactly like a sampler state
 /// and a render pipeline state, so it belongs in this namespace and not in
-/// [`TaskResources`] — whose type mask deliberately excludes object type 7,
+/// [`TaskResources`] — whose type mask deliberately excludes state descriptors,
 /// because that tag is also worn by mutable serializer descriptors and two
 /// reference spaces sharing one map would destroy each other's entries when
 /// their integers collide.

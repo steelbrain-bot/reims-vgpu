@@ -2369,7 +2369,7 @@ impl ObjectCaches {
             .front_face(translate::raster::vk_front_face(key.front_face_ccw))
             .line_width(1.0);
         // `rasterSampleCount` is a property of `MTLRenderPipelineDescriptor`,
-        // so it reaches this device inside the type-7 pipeline's own
+        // so it reaches this device inside the render pipeline's own
         // compact-TLV block. The pass key carries that decoded count, and the
         // render-pass attachment is created with the same value; unsupported
         // count/attachment combinations are refused before either object is

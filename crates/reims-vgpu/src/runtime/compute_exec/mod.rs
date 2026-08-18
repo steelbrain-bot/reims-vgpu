@@ -1,7 +1,7 @@
 //! Product-path compute bind/dispatch for `SEGMENT_TYPE_COMPUTE`.
 //!
 //! Executable surface:
-//! - `0xd0` set compute pipeline (type-7 → kernel function MTLB + optional stage-input)
+//! - `0xd0` set compute pipeline (descriptor → kernel function MTLB + optional stage-input)
 //! - `0xcb` / `0xd9` set buffers (+ optional attribute stride for dynamic stage-input layouts)
 //! - `0xcf` / `0xda` set buffer offset (+ optional attribute stride)
 //! - `0xce` set textures (type-2/3 GVA + IOSurface texture; sample vs storage via reflection)
@@ -26,7 +26,7 @@ use crate::runtime::decode::compute::{
     BufferBinding, Command as ComputeCommand, Kind, RefBinding, SamplerBinding,
 };
 use crate::runtime::decode::resource::{
-    decode_heap_texture, decode_texture_descriptor, decode_type7_descriptor, texture_type8_opcode,
+    decode_heap_texture, decode_state_descriptor, decode_texture_descriptor, texture_type8_opcode,
     ComputeStageInputDescriptor, Descriptor as ResourceDescriptor, ObjectKind, HEAP_TEXTURE_OPCODE,
     HEAP_TEXTURE_WIDE_OPCODE, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE,
     TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
@@ -928,7 +928,7 @@ pub(crate) struct LoadedComputePipeline {
     pub stage_input: Option<ComputeStageInputDescriptor>,
 }
 
-/// What a type-7's stage-input block means for the pipeline carrying it.
+/// What a compute pipeline's stage-input block means for the pipeline carrying it.
 ///
 /// Three outcomes, and the whole point of naming them is that two of them are
 /// not the same: [`Self::Absent`] is a kernel that declares no per-thread input,
@@ -997,7 +997,7 @@ pub(crate) fn load_compute_pipeline<M: HostMemory + HostOps>(
             return None;
         }
     };
-    let Ok(decoded) = decode_type7_descriptor(&desc) else {
+    let Ok(decoded) = decode_state_descriptor(&desc) else {
         return miss(
             crate::observe::ladder_slug!("", desc_decode),
             format!("desc_len={}", desc.len()),

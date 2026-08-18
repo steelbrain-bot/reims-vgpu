@@ -11,11 +11,12 @@
 //! namespace. Resource-list deletion belongs to a separate reference space and
 //! cannot retire a pipeline merely because its integer collides.
 //!
-//! The broad type-7 serializer object is not itself a retained resource: other
-//! type-7 subtypes are mutable serializer state. A render pipeline *constructed
+//! The broad state-descriptor serializer object is not itself a retained
+//! resource: its sibling descriptor classes are mutable serializer state. A
+//! render pipeline *constructed
 //! from* that serializer is a distinct, immutable object with the explicit
 //! lifetime above. Keeping pipelines in their own typed registry preserves that
-//! distinction instead of either retaining every type-7 descriptor or re-reading
+//! distinction instead of either retaining every state descriptor or re-reading
 //! pipeline construction input on every draw.
 //!
 //! This used to be an insertion-bounded process-global memo. Every hit re-read

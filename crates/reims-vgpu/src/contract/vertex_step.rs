@@ -1,6 +1,6 @@
 //! `MTLVertexStepFunction` ordinals, and the step rate that pairs with each.
 //!
-//! A type-7 pipeline descriptor's buffer layout carries a step function and a
+//! A render-pipeline descriptor's buffer layout carries a step function and a
 //! step rate, decoded by [`crate::runtime::decode::resource`] into
 //! [`VertexAttribute::step_function_ordinal`] and [`VertexAttribute::step_rate`].
 //! The two are one rule and not two fields: `MTLVertexBufferLayoutDescriptor`

@@ -4533,8 +4533,12 @@ pub fn decode_icb_descriptor(
     })
 }
 
-/// Decode type-7 container (sampler / depth-stencil / pipelines / ICB).
-pub fn decode_type7_descriptor(bytes: &[u8]) -> Result<Descriptor, DecodeStatus> {
+/// Decode a state descriptor (sampler, depth-stencil, pipeline, or ICB).
+///
+/// The object-list wire tag is consumed by [`ObjectKind::StateDescriptor`].
+/// Callers beyond this module deal only in the semantic family and decoded
+/// descriptor variants.
+pub fn decode_state_descriptor(bytes: &[u8]) -> Result<Descriptor, DecodeStatus> {
     if bytes.len() < 4 {
         return Err(DecodeStatus::ErrShort("res_type7_short"));
     }
@@ -4557,12 +4561,19 @@ pub fn decode_type7_descriptor(bytes: &[u8]) -> Result<Descriptor, DecodeStatus>
     }
 }
 
+/// Raw wire-family name retained for decoder fixtures that construct tag-7
+/// records directly.
+#[cfg(test)]
+pub fn decode_type7_descriptor(bytes: &[u8]) -> Result<Descriptor, DecodeStatus> {
+    decode_state_descriptor(bytes)
+}
+
 pub fn decode_descriptor(kind: ObjectKind, bytes: &[u8]) -> Result<Descriptor, DecodeStatus> {
     match kind {
         ObjectKind::Buffer => Ok(Descriptor::Buffer(decode_buffer_descriptor(bytes)?)),
         ObjectKind::Texture => Ok(Descriptor::Texture(decode_texture_descriptor(bytes)?)),
         ObjectKind::Function => Ok(Descriptor::Function(decode_function_descriptor(bytes)?)),
-        ObjectKind::StateDescriptor => decode_type7_descriptor(bytes),
+        ObjectKind::StateDescriptor => decode_state_descriptor(bytes),
         ObjectKind::TextureView => Ok(Descriptor::TextureView(decode_texture_view_descriptor(
             bytes,
         )?)),

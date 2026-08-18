@@ -7303,7 +7303,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // The engine previously left `resources.blend = None`, selecting opaque replace for every
         // draw, so Load seeds (gray/wallpaper/logo bases) were wiped by sparse
         // dock/chrome layers that Metal would alpha-blend over the attachment.
-        // Contract: type-7 color attachment blend tags (decode/resource).
+        // Contract: render-pipeline color attachment blend tags (decode/resource).
         // Outside the `blending_enabled` guard below, and deliberately: an
         // unblended attachment with a mask still leaves its unwritten channels
         // alone, so gating the mask on blending would drop it exactly where the

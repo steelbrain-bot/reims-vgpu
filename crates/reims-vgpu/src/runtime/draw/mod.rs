@@ -621,9 +621,9 @@ fn depth_stencil_descriptor_is_trivial(
         && !d.back_stencil_enabled
 }
 
-/// Decode the type-7 depth-stencil descriptor a draw bound, on the Linux path
+/// Decode the depth-stencil descriptor a draw bound, on the Linux path
 /// `load_render_pipeline`: object-list lookup → descriptor read → decode (which
-/// validates the type-7 depth-stencil tag). Returns the specific reason slug on
+/// validates the depth-stencil construction opcode). Returns the specific reason slug on
 /// failure so the caller — which only reaches this for a bound `ds_ref != 0`, i.e.
 /// a guest that explicitly asked for a depth-stencil state — can fail-visibly
 /// name why the state silently fell back to no-depth instead of dropping it into
@@ -1372,7 +1372,7 @@ pub(crate) fn load_render_pipeline<M: HostMemory + HostOps>(
         return None;
     }
     let report = crate::observe::RungReport::new("draw_load_pipeline", "pipe_ref");
-    // Live object-list: render pipeline is type-7 with subtype 0x0e.
+    // Live object-list: this reference must resolve to a render pipeline.
     let (_entry, desc) = match objects::resolve_descriptor(
         state,
         host,

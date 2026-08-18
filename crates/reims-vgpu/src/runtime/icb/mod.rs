@@ -4,7 +4,7 @@
 //!
 //! Guest create is serialized by
 //! `PGSerializer newIndirectCommandBufferWithDescriptor:layout:maxCommandCount:options:allocator:`
-//! into an 88-byte type-7 body (tag `0x36`) including a 52-byte command
+//! into an ICB construction body including a 52-byte command
 //! **layout** at `+0x1c`. Product records the semantic declaration per device,
 //! task, and ICB reference.
 //!
@@ -28,7 +28,7 @@ use crate::contract::endian::{ld32, ld64}; // ld64: 0x1d1 gpu_address + dispatch
 use crate::model::DeviceState;
 
 use crate::runtime::decode::resource::{
-    decode_type7_descriptor, icb_layout_attribute_stride_slot_count,
+    decode_state_descriptor, icb_layout_attribute_stride_slot_count,
     icb_layout_kernel_tg_slot_count, icb_layout_table_len, Descriptor as ResourceDescriptor,
     IcbCommandLayout, IndirectCommandBufferDescriptor, ObjectKind, ICB_ATTRIBUTE_STRIDE_ENTRY_SIZE,
     ICB_BUFFER_BIND_STRIDE, ICB_CMD_TYPE_CONCURRENT_DISPATCH_THREADGROUPS,
@@ -181,7 +181,7 @@ pub struct IcbThreadgroupMemory {
 #[derive(Clone, Debug)]
 pub struct IcbComputeFill {
     pub command_index: u32,
-    /// Type-7 compute pipeline object-list ref (kernel function + optional stage-in).
+    /// Compute-pipeline object-list ref (kernel function + optional stage-in).
     pub pipeline_ref: u32,
     pub buffers: Vec<IcbKernelBufferBind>,
     /// `setThreadgroupMemoryLength:atIndex:` entries (wire: u64 lengths table).
@@ -1110,7 +1110,7 @@ pub fn encode_compute_command_slot(
     Ok(slot)
 }
 
-/// Load and decode a type-7 ICB descriptor for `icb_ref` on the task object list.
+/// Load and decode an ICB descriptor for `icb_ref` on the task object list.
 pub fn load_icb_descriptor<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
@@ -1121,7 +1121,7 @@ pub fn load_icb_descriptor<M: HostMemory + HostOps>(
         return Err(IcbStatus::Missing("icb_desc_ref_zero"));
     }
     // The two statuses this rail splits the ladder into, stated once: a tag that
-    // is not type-7 means the guest described something, wrongly, while a
+    // is not a state descriptor means the guest described something wrongly, while a
     // missing entry or unreadable bytes mean it described nothing this device
     // can see yet.
     let (_entry, desc) = objects::resolve_descriptor(
@@ -1140,7 +1140,7 @@ pub fn load_icb_descriptor<M: HostMemory + HostOps>(
             objects::LadderRung::WrongType { .. } => IcbStatus::BadDescriptor(slug),
         }
     })?;
-    match decode_type7_descriptor(&desc) {
+    match decode_state_descriptor(&desc) {
         Ok(ResourceDescriptor::IndirectCommandBuffer(icb)) => {
             note_unapplied_icb_flags(task_id, icb_ref, &icb);
             Ok(icb)
@@ -1529,7 +1529,7 @@ pub fn associate_icb_backing_buffer_ref<M: HostMemory + HostOps>(
     if icb_ref == 0 || buffer_ref == 0 {
         return Err(IcbStatus::Args("icb_associate_ref_zero"));
     }
-    // Record the type-7 create layout if it is not already recorded. This used
+    // Record the ICB create layout if it is not already recorded. This used
     // to materialize the host `MTLIndirectCommandBuffer` as a side effect, which
     // is why associating a backing buffer refused outright on the Vulkan arm —
     // the association is guest bookkeeping and needs no host object at all.
