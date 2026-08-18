@@ -13,6 +13,7 @@ members = [
   "crates/reims-vgpu-observe",
   "crates/reims-vgpu-paging",
   "crates/reims-vgpu-protocol",
+  "crates/reims-vgpu-testkit",
   "crates/reims-vgpu-vulkan",
   "crates/reims-vgpu-wire",
 ]

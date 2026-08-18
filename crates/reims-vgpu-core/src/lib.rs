@@ -23,7 +23,8 @@ pub use capabilities::{CapabilityService, DeviceInfoLimits, ExecutorCapabilities
 pub use execution::{
     execute_resolved_submission, BlitCompletion, CommandExecution, ExecutionCompletion,
     ExecutionKind, ExecutionOutput, ExecutionPort, ExecutionReceipt, ResolvedCommand,
-    ResolvedCommandBuffer, ResolvedSubmission, ResourceStateCompletion,
+    ResolvedCommandBuffer, ResolvedExecutionCompletion, ResolvedSubmission,
+    ResourceStateCompletion,
 };
 pub use namespace::{NamespaceError, ReferenceNamespace};
 pub use residency::{

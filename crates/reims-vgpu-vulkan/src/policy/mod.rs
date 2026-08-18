@@ -79,6 +79,7 @@ fn topology_independent_request(class: MemoryClass) -> Option<MemoryRequest> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reims_vgpu_testkit::{assert_four_cell_guest_equivalence, GuestEffects};
 
     #[test]
     fn topology_cannot_change_device_local_semantics() {
@@ -100,5 +101,38 @@ mod tests {
             MemoryPlacementPolicy::new(MemoryTopology::Discrete).default_batch_draws(),
             DISCRETE_DEFAULT_BATCH_DRAWS
         );
+    }
+
+    #[test]
+    fn all_four_memory_cells_preserve_one_semantic_trace() {
+        let metrics = assert_four_cell_guest_equivalence(
+            MemoryTopology::Unified,
+            MemoryTopology::Discrete,
+            |cell| {
+                let policy = MemoryPlacementPolicy::new(cell.topology);
+                (
+                    GuestEffects {
+                        memory: vec![0x10, 0x20, 0x30, 0x40],
+                        stamps: vec![(3, 9)],
+                        interrupts: vec![1],
+                        refusals: Vec::new(),
+                        presented: vec![0x30, 0x20, 0x10, 0xff],
+                    },
+                    (
+                        policy.request(MemoryClass::Upload),
+                        policy.request(MemoryClass::Readback),
+                        policy.default_batch_draws(),
+                        cell.host_pointer_import,
+                    ),
+                )
+            },
+        );
+
+        assert_ne!(metrics[0].0, metrics[2].0, "upload placement may differ");
+        assert_ne!(metrics[0].1, metrics[2].1, "readback placement may differ");
+        assert!(metrics[0].3);
+        assert!(!metrics[1].3);
+        assert!(metrics[2].3);
+        assert!(!metrics[3].3);
     }
 }

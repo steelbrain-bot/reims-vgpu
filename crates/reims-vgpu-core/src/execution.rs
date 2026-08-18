@@ -162,6 +162,10 @@ pub struct ExecutionCompletion<Output> {
     pub gpu_materialized: std::sync::Arc<[ContentStamp]>,
 }
 
+/// Completion shape for an ordered resolved command buffer.
+pub type ResolvedExecutionCompletion<Draw, Compute> =
+    ExecutionCompletion<Box<[ExecutionOutput<Draw, Compute>]>>;
+
 /// Validated completion identity paired with its operation-specific output.
 #[derive(Debug)]
 pub struct ExecutionReceipt<Output> {
@@ -193,7 +197,7 @@ pub fn execute_resolved_submission<Draw, Compute, DrawOutput, ComputeOutput, Err
     mut resource_state: impl FnMut(
         ResolvedResourceState,
     ) -> Result<CommandExecution<ResourceStateCompletion>, Error>,
-) -> Result<ExecutionCompletion<Box<[ExecutionOutput<DrawOutput, ComputeOutput>]>>, Error> {
+) -> Result<ResolvedExecutionCompletion<DrawOutput, ComputeOutput>, Error> {
     let identity = submission.context.identity;
     let mut outputs = Vec::with_capacity(submission.command_buffer.commands().len());
     let mut materialized = std::collections::BTreeSet::new();

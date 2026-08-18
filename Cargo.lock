@@ -1150,6 +1150,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "reims-vgpu-testkit"
+version = "0.1.0"
+dependencies = [
+ "reims-vgpu-core",
+]
+
+[[package]]
 name = "reims-vgpu-vulkan"
 version = "0.1.0"
 dependencies = [
@@ -1165,6 +1172,7 @@ dependencies = [
  "reims-vgpu-observe",
  "reims-vgpu-paging",
  "reims-vgpu-protocol",
+ "reims-vgpu-testkit",
  "reims-vgpu-wire",
 ]
 
