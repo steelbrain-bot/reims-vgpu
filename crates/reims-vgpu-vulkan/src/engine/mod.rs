@@ -107,24 +107,44 @@ impl SessionId {
     }
 }
 
+#[derive(Default)]
+struct SessionSignals {
+    batch_open: std::sync::atomic::AtomicBool,
+    last_tail_batch_flush_us: AtomicU64,
+    guest_read_debt: std::sync::atomic::AtomicBool,
+    guest_write_debt: std::sync::atomic::AtomicBool,
+    guest_write_pages: std::sync::Mutex<GuestWriteFootprint>,
+}
+
 thread_local! {
     static CURRENT_SESSION: Cell<SessionId> = const { Cell::new(SessionId(0)) };
+    static CURRENT_SESSION_SIGNALS: std::cell::RefCell<Option<Arc<SessionSignals>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Restores the caller's prior session when a nested device operation ends.
 pub struct SessionScope {
     previous: SessionId,
+    previous_signals: Option<Arc<SessionSignals>>,
 }
 
 impl Drop for SessionScope {
     fn drop(&mut self) {
         CURRENT_SESSION.set(self.previous);
+        CURRENT_SESSION_SIGNALS.with(|slot| {
+            slot.replace(self.previous_signals.take());
+        });
     }
 }
 
 pub fn enter_session(session: SessionId) -> SessionScope {
+    let signals = session_signals_for(session);
     let previous = CURRENT_SESSION.replace(session);
-    SessionScope { previous }
+    let previous_signals = CURRENT_SESSION_SIGNALS.with(|slot| slot.replace(Some(signals)));
+    SessionScope {
+        previous,
+        previous_signals,
+    }
 }
 
 pub fn release_session(session: SessionId) {
@@ -151,12 +171,6 @@ pub fn release_session(session: SessionId) {
     SESSION_SIGNALS.lock().remove(&session);
 }
 
-#[derive(Default)]
-struct SessionSignals {
-    batch_open: std::sync::atomic::AtomicBool,
-    last_tail_batch_flush_us: AtomicU64,
-}
-
 static SESSION_SIGNALS: Lazy<Mutex<HashMap<SessionId, Arc<SessionSignals>>>> = Lazy::new(|| {
     let mut sessions = HashMap::new();
     sessions.insert(SessionId(0), Arc::new(SessionSignals::default()));
@@ -173,7 +187,14 @@ fn session_signals_for(session: SessionId) -> Arc<SessionSignals> {
 }
 
 fn current_session_signals() -> Arc<SessionSignals> {
-    session_signals_for(CURRENT_SESSION.get())
+    CURRENT_SESSION_SIGNALS.with(|slot| {
+        if let Some(signals) = slot.borrow().as_ref() {
+            return Arc::clone(signals);
+        }
+        let signals = session_signals_for(CURRENT_SESSION.get());
+        slot.replace(Some(Arc::clone(&signals)));
+        signals
+    })
 }
 
 /// The colour aspect of a single-mip, single-layer image — the shape of every
@@ -1469,19 +1490,14 @@ mod end_of_tranche_gate_tests {
 /// it is submitted; cleared under the same lock once the ring has retired. A
 /// thread that reads `false` therefore observed a point at which no writeback
 /// was outstanding.
-static GUEST_WRITE_DEBT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 /// Whether a recorded command buffer can still read imported guest RAM.
 ///
 /// Kept beside the write-side debt so completion-stamp routing can answer the
 /// common no-work case without taking the engine lock. The pool owns the ledger;
 /// this atomic is only its lock-free summary.
-pub(super) static GUEST_READ_DEBT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 /// Which guest pages the outstanding writeback lands in, when it can be said.
 ///
-/// [`GUEST_WRITE_DEBT`] answers "is anything outstanding", and every caller that
+/// [`guest_writes_outstanding`] answers "is anything outstanding", and every caller that
 /// reads guest bytes then blocks on the answer. But a writeback lands in one
 /// surface's pages and most of the readers asking are reading somewhere else
 /// entirely — a glyph atlas, a small linear texture, a uniform staging window —
@@ -1505,7 +1521,7 @@ pub(super) static GUEST_READ_DEBT: std::sync::atomic::AtomicBool =
 /// what bounds writebacks in flight: a ninth submission blocks in `begin_entry`
 /// on the oldest fence rather than being recorded.
 ///
-/// **The two drift, and overflow is routine.** [`GUEST_WRITE_DEBT`] is cleared
+/// **The two drift, and overflow is routine.** The outstanding-write signal is cleared
 /// only by an actual settle, never by the ring retiring a fence on its own, so
 /// an entry outlives the copy it names for as long as nothing blocks. A single
 /// entry measured `gwdebt_unnamed` 14 125 against 16 626 arms; the ring's worth
@@ -1528,16 +1544,14 @@ pub(super) static GUEST_READ_DEBT: std::sync::atomic::AtomicBool =
 ///
 /// # Ordering
 ///
-/// Armed under the engine lock immediately before [`GUEST_WRITE_DEBT`] is
+/// Armed under the engine lock immediately before the outstanding-write signal is
 /// published, and cleared under the same lock immediately after it is cleared,
 /// so a reader that observes the flag set observes a footprint that already
 /// names the write, and a reader that observes it clear needs nothing. Readers
 /// take only this mutex and never the engine lock — taking that at every guest
 /// read is the cost the flag exists to avoid.
-static GUEST_WRITE_PAGES: std::sync::Mutex<GuestWriteFootprint> =
-    std::sync::Mutex::new(GuestWriteFootprint { armed: Vec::new() });
-
-/// The page lists behind [`GUEST_WRITE_PAGES`].
+/// The page lists behind one session's guest-write signal.
+#[derive(Default)]
 struct GuestWriteFootprint {
     /// One entry per outstanding writeback, each ascending and deduplicated.
     /// Sorted at arm time — armed thousands of times a boot and asked tens of
@@ -1561,9 +1575,10 @@ pub use reims_vgpu_core::GuestWriteReach;
 
 /// Record the guest pages a writeback about to be submitted will land in.
 ///
-/// Called under the engine lock, beside the [`GUEST_WRITE_DEBT`] publish.
+/// Called under the engine lock, beside the outstanding-write publish.
 fn arm_guest_write_pages(pages: &[u64]) {
-    let Ok(mut f) = GUEST_WRITE_PAGES.lock() else {
+    let signals = current_session_signals();
+    let Ok(mut f) = signals.guest_write_pages.lock() else {
         // A poisoned lock means nothing is recorded, and it stays poisoned, so
         // `guest_writes_reaching` answers `Unnamed` for the rest of the boot.
         // That is the safe direction and needs no flag here.
@@ -1589,11 +1604,12 @@ fn arm_guest_write_pages(pages: &[u64]) {
 }
 
 /// Forget the outstanding writebacks' pages. Called under the engine lock, after
-/// the wait has landed and [`GUEST_WRITE_DEBT`] is cleared.
+/// the wait has landed and the outstanding-write signal is cleared.
 fn clear_guest_write_pages() {
-    if let Ok(mut f) = GUEST_WRITE_PAGES.lock() {
+    let signals = current_session_signals();
+    if let Ok(mut f) = signals.guest_write_pages.lock() {
         f.armed.clear();
-    }
+    };
 }
 
 /// What the ledger can say about `pages` — see [`GuestWriteReach`].
@@ -1605,7 +1621,8 @@ fn clear_guest_write_pages() {
 /// `pages` need not be sorted; it is the reader's window and is usually a
 /// handful of entries against a whole frame's worth here.
 pub fn guest_writes_reaching(pages: &[u64]) -> GuestWriteReach {
-    let Ok(f) = GUEST_WRITE_PAGES.lock() else {
+    let signals = current_session_signals();
+    let Ok(f) = signals.guest_write_pages.lock() else {
         return GuestWriteReach::Unnamed;
     };
     if f.armed.is_empty() {
@@ -1658,7 +1675,8 @@ pub fn guest_writes_reaching(pages: &[u64]) -> GuestWriteReach {
 /// mapping bytes.
 pub fn quiesce_guest_writes() {
     use std::sync::atomic::Ordering;
-    if !GUEST_WRITE_DEBT.load(Ordering::Acquire) {
+    let signals = current_session_signals();
+    if !signals.guest_write_debt.load(Ordering::Acquire) {
         return;
     }
     let started = std::time::Instant::now();
@@ -1671,7 +1689,7 @@ pub fn quiesce_guest_writes() {
     } = &mut *guard;
     let Some(ctx) = owner.ctx.as_ref() else {
         // No device, so nothing can be in flight and nothing can settle it.
-        GUEST_WRITE_DEBT.store(false, Ordering::Release);
+        signals.guest_write_debt.store(false, Ordering::Release);
         clear_guest_write_pages();
         return;
     };
@@ -1690,7 +1708,7 @@ pub fn quiesce_guest_writes() {
     // `ResourcePools::quiesce_guest_writes` takes its own debt before waiting:
     // the slot stays pending either way and the next claimant re-waits, so the
     // ordering survives without every later settle re-running a failing wait.
-    GUEST_WRITE_DEBT.store(false, Ordering::Release);
+    signals.guest_write_debt.store(false, Ordering::Release);
     // Under the same lock as the flag it accompanies, so no reader can see the
     // flag set beside a footprint that has already been forgotten.
     clear_guest_write_pages();
@@ -1710,12 +1728,23 @@ pub fn quiesce_guest_writes() {
 /// The same flag [`quiesce_guest_writes`] short-circuits on. Host-side readers
 /// use this to avoid taking the engine lock when no GPU write can race them.
 pub fn guest_writes_outstanding() -> bool {
-    GUEST_WRITE_DEBT.load(std::sync::atomic::Ordering::Acquire)
+    current_session_signals()
+        .guest_write_debt
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+
+pub(super) fn publish_guest_read_debt(outstanding: bool) {
+    current_session_signals()
+        .guest_read_debt
+        .store(outstanding, std::sync::atomic::Ordering::Release);
 }
 
 /// Whether a completion stamp must be queued behind guest-memory access.
 pub fn guest_access_outstanding() -> bool {
-    GUEST_READ_DEBT.load(std::sync::atomic::Ordering::Acquire) || guest_writes_outstanding()
+    current_session_signals()
+        .guest_read_debt
+        .load(std::sync::atomic::Ordering::Acquire)
+        || guest_writes_outstanding()
 }
 
 /// Where one FIFO completion stamp obtained its ordering point.
@@ -3240,7 +3269,7 @@ pub fn read_target_leased(identity: &TargetIdentity) -> Result<Option<LeasedFram
 ///
 /// The copy is driven entirely by `dst`. `pages` is the same destination spelled
 /// as guest page addresses, which is the only spelling a later reader of those
-/// bytes can compare its own window against — see [`GUEST_WRITE_PAGES`]. Both
+/// bytes can compare its own window against — see [`guest_writes_reaching`]. Both
 /// callers walk it to build `dst.runs` and hand the walk's own output here, so
 /// the two cannot describe different memory.
 pub fn copy_target_to_guest_pages(
@@ -3515,7 +3544,9 @@ pub(super) fn record_guest_write_debt(
     arm_guest_write_pages(pages);
     // Published after the ledger entry and while the engine lock is still held,
     // so no thread can observe the flag clear while a write is outstanding.
-    GUEST_WRITE_DEBT.store(true, std::sync::atomic::Ordering::Release);
+    current_session_signals()
+        .guest_write_debt
+        .store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// How one frame gets from a resident image into the guest's stretches.
@@ -5149,6 +5180,47 @@ mod group_by_buffer_tests {
 #[cfg(test)]
 mod guest_write_footprint_tests {
     use super::*;
+
+    #[test]
+    fn guest_access_signals_belong_to_the_device_session() {
+        let first = SessionId(10_001);
+        let second = SessionId(10_002);
+        {
+            let _first = enter_session(first);
+            clear_guest_write_pages();
+            arm_guest_write_pages(&[0x4000]);
+            current_session_signals()
+                .guest_write_debt
+                .store(true, Ordering::Release);
+            assert!(guest_writes_outstanding());
+            assert_eq!(guest_writes_reaching(&[0x4000]), GuestWriteReach::Overlap);
+        }
+        {
+            let _second = enter_session(second);
+            assert!(!guest_writes_outstanding());
+            assert_eq!(
+                guest_writes_reaching(&[0x4000]),
+                GuestWriteReach::Unnamed,
+                "another device cannot inherit the first device's page footprint"
+            );
+            publish_guest_read_debt(true);
+            assert!(guest_access_outstanding());
+            publish_guest_read_debt(false);
+        }
+        {
+            let _first = enter_session(first);
+            assert!(guest_writes_outstanding());
+            assert!(!current_session_signals()
+                .guest_read_debt
+                .load(Ordering::Acquire));
+            current_session_signals()
+                .guest_write_debt
+                .store(false, Ordering::Release);
+            clear_guest_write_pages();
+        }
+        SESSION_SIGNALS.lock().remove(&first);
+        SESSION_SIGNALS.lock().remove(&second);
+    }
 
     /// The whole point: a reader whose window shares no page with the
     /// outstanding writeback is let through, and one that shares a single page

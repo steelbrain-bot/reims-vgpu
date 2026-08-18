@@ -1935,7 +1935,7 @@ impl ResourcePools {
     /// executes, so the next completion stamp waits for it.
     pub(crate) fn note_guest_read_recorded(&mut self) {
         self.guest_reads_in_flight = true;
-        super::super::GUEST_READ_DEBT.store(true, Ordering::Release);
+        super::super::publish_guest_read_debt(true);
     }
 
     /// The buffer this command buffer already staged or gathered for the bind
@@ -2300,7 +2300,7 @@ impl ResourcePools {
     /// `false`.
     pub(crate) fn take_guest_read_debt(&mut self) -> bool {
         let had_debt = std::mem::take(&mut self.guest_reads_in_flight);
-        super::super::GUEST_READ_DEBT.store(false, Ordering::Release);
+        super::super::publish_guest_read_debt(false);
         had_debt
     }
 
@@ -5152,7 +5152,7 @@ mod recycle_tests {
     /// leak: nothing releases a pin the ledger did not record in
     /// `guest_write_pins_live`, so the image would never be reclaimable again.
     /// Skipping the *debt* would be the correctness bug — the whole ordering
-    /// argument for a submitted-not-waited copy is that `GUEST_WRITE_DEBT`
+    /// argument for a submitted-not-waited copy is that the session's guest-write debt
     /// removes `StampOrder::CpuReady` from the stamp's answers, so a guest told
     /// the dispatch finished would read its pages before the copy landed.
     #[test]
