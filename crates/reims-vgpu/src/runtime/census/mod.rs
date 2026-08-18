@@ -55,15 +55,10 @@
 //! change is a guest that starts populating the tail, and that is now a typed
 //! decline raised at the record, not a counter nobody reads.
 //!
-//! `deferred_windows` was the third: peak population and forced-eviction count
-//! for the three deferred-window caps (GVA 16, surface 16, storage 8), built to
-//! answer whether any of them had ever bound. Across every boot in a 72 MB
-//! accumulated log it emitted exactly two distinct lines, differing only in
-//! `storage_peak` (1 vs 2) — every peak far under its cap, every `evicted` zero.
-//! That answer is recorded on the three constants. The alarm it was standing in
-//! for survives at each enforcing site, where it belongs: the storage rail's
-//! evictions are `compute_mirror_evicted`. Those fire when a cap binds instead of
-//! restating a level once a second forever.
+//! `deferred_windows` was the third: a population census for deferred state.
+//! State whose loss costs guest work now follows guest resource/content
+//! lifetimes rather than a capacity, so there is no eviction policy for this
+//! census to justify.
 //!
 //! The test to apply: name the reading the next window could produce that the
 //! last thousand did not. If there isn't one, the census has become a probe.

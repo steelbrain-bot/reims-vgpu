@@ -1731,36 +1731,6 @@ struct ComputeStorageResidencyCandidate {
     seed_generation: u32,
 }
 
-/// Bound on mirror entries per mapping: a ping-pong canvas needs 2, planar
-/// layouts a few more; anything beyond is assumed to be stale-key debris.
-///
-/// **The 8 is not derived, and the eviction below is the only thing standing
-/// between this map and unbounded growth.** If every stale key were already
-/// invalidated — `invalidate_storage_residency_window` runs on every overlap,
-/// and every guest-page writer calls it — no cap would be needed at all, and
-/// this would be a mechanism covering for an incomplete invalidation rather
-/// than a bound. Which of those it is has never been measured, because the
-/// eviction was silent.
-///
-/// `compute_mirror_evicted` is that measurement, and its **first reading is
-/// zero**: one driven x86/Vulkan boot — Chess, Maps, the WebGL aquarium,
-/// Wikipedia and apple.com, with page-downs and title-bar drags — evicted
-/// nothing. So the cap does not bind on this workload and is a runaway guard,
-/// not a working policy.
-///
-/// That is one boot and one workload, which is not enough to delete a guard
-/// that is the only bound on this map. What would be: the same zero across a
-/// boot that drives multiplanar video and several ping-pong canvases at once,
-/// which is the case the "planar layouts a few more" guess was aimed at.
-///
-/// How close the population came was measured separately, and reads **2**
-/// across every boot in a 72 MB accumulated log. That is exactly the ping-pong
-/// canvas this doc predicted needs 2, so the shape of the guess is confirmed
-/// while the number is not: 8 is 4x the observed high-water mark, and nothing
-/// has yet produced the "planar layouts a few more" case that chose it.
-#[cfg(feature = "backend-vulkan")]
-const STORAGE_RESIDENCY_WINDOWS_PER_MAPPING: usize = 8;
-
 #[cfg(feature = "backend-vulkan")]
 fn note_storage_residency_writeback(state: &mut DeviceState, texture: &StagedTexture) {
     let Some(candidate) = texture.residency else {
@@ -1785,41 +1755,13 @@ fn note_storage_residency_writeback(state: &mut DeviceState, texture: &StagedTex
     let generation = next_mapping_content_generation(candidate.seed_generation);
     // Drop intersecting windows (normally already gone, because the writeback
     // wrote guest pages and every guest-page writer calls the same overlap
-    // invalidation — kept here as defense in depth); keep disjoint siblings
-    // (ping-pong canvases) but bound the count.
+    // invalidation — kept here as defense in depth). Disjoint siblings are
+    // independent live content and remain until their mapping/resource
+    // lifetime or a write to their own window retires them.
     let Some((mapping_id, surface_offset, span_end)) = candidate.key.surface_window() else {
         return;
     };
     state.invalidate_storage_residency_window(mapping_id, surface_offset, span_end);
-    let siblings: Vec<crate::model::ComputeStorageResidencyKey> = state
-        .compute_storage_residency
-        .keys()
-        .filter(|key| {
-            key.surface_window()
-                .is_some_and(|(candidate, _, _)| candidate == mapping_id)
-                && **key != candidate.key
-        })
-        .cloned()
-        .collect();
-    // Counting the window inserted below, so the cap bounds the population this
-    // mapping actually holds.
-    let over_cap = (siblings.len() + 1).saturating_sub(STORAGE_RESIDENCY_WINDOWS_PER_MAPPING);
-    for victim in siblings.iter().take(over_cap) {
-        state.compute_storage_residency.remove(victim);
-        // Dropping a mirror entry costs the next read of that window its
-        // resident and sends it back to guest pages. That is safe, but it is
-        // not free and it must not be invisible.
-        crate::observe::off(format!(
-            "compute_mirror_evicted mid={mapping_id} off={} end={} siblings={} cap={}",
-            victim
-                .surface_window()
-                .map(|(_, start, _)| start)
-                .unwrap_or(0),
-            victim.surface_window().map(|(_, _, end)| end).unwrap_or(0),
-            siblings.len(),
-            STORAGE_RESIDENCY_WINDOWS_PER_MAPPING
-        ));
-    }
     state
         .compute_storage_residency
         .insert(candidate.key, generation);

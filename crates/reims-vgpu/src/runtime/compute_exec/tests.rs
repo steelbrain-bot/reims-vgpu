@@ -2813,37 +2813,25 @@ fn a_truncated_stage_input_is_not_the_same_as_an_absent_one() {
     );
 }
 
-/// A heap texture's residency mirror is never evicted by the per-mapping cap.
-///
-/// `compute_storage_residency` holds three keyings and only one of them has a
-/// guest fallback. A mapping-backed entry dropped by the cap costs the next read
-/// its resident and sends it back to that mapping's guest pages. A **heap**
-/// texture has no guest pages at all — it is host-only — so an absent entry
-/// stages `vec![0; need]` and the kernel reads a blank texture.
-///
-/// The key's typed origin now keeps them apart at the cap's own filter:
-/// `surface_window` cannot return a heap or linear identity. The early return
-/// remains because heap mirrors are unbounded by guest lifetime rather than by
-/// an invented per-mapping number.
-///
-/// So drive well past `STORAGE_RESIDENCY_WINDOWS_PER_MAPPING` distinct heap
-/// textures and assert every one is still there. This fails the moment that
-/// heap handling or origin filtering regresses.
+/// Every disjoint live window remains resident until a guest-owned lifetime or
+/// content transition retires it. Heap textures have no guest fallback at all;
+/// mapping windows have a fallback, but discarding their current GPU replica
+/// still costs guest work and is not a cache policy.
 #[test]
 #[cfg(feature = "backend-vulkan")]
-fn a_heap_texture_mirror_outlives_the_per_mapping_cap() {
+fn live_compute_mirrors_are_not_evicted_by_an_invented_capacity() {
     use super::{
         note_storage_residency_writeback, ComputeStorageResidencyCandidate, StagedTexture,
-        TextureWriteback, STORAGE_RESIDENCY_WINDOWS_PER_MAPPING,
+        TextureWriteback,
     };
     use crate::model::ComputeStorageResidencyKey;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    // Four times the cap, so this stays a real margin if the cap is retuned.
-    const HEAP_TEXTURES: u32 = 4 * STORAGE_RESIDENCY_WINDOWS_PER_MAPPING as u32;
+    const LIVE_WINDOWS: u32 = 32;
+    const SURFACE_RESOURCE_REF: u32 = 99;
 
     let staged = |key: ComputeStorageResidencyKey| StagedTexture {
-        resource_ref: key.resource_ref().expect("heap object reference"),
+        resource_ref: key.resource_ref().unwrap_or(SURFACE_RESOURCE_REF),
         binding: 33,
         #[cfg(feature = "backend-vulkan")]
         array_element: 0,
@@ -2866,7 +2854,7 @@ fn a_heap_texture_mirror_outlives_the_per_mapping_cap() {
         writeback: TextureWriteback::None,
     };
 
-    for tex in 0..HEAP_TEXTURES {
+    for tex in 0..LIVE_WINDOWS {
         let key = ComputeStorageResidencyKey::heap(1, tex, 16, 16, 0x50);
         assert!(matches!(
             key.origin,
@@ -2874,14 +2862,18 @@ fn a_heap_texture_mirror_outlives_the_per_mapping_cap() {
         ));
         note_storage_residency_writeback(&mut state, &staged(key));
     }
+    for window in 0..LIVE_WINDOWS {
+        let start = u64::from(window) * 0x100;
+        let key = ComputeStorageResidencyKey::surface(7, 1, start, 16, start + 0x100, 4, 4, 0x50);
+        note_storage_residency_writeback(&mut state, &staged(key));
+    }
 
     assert_eq!(
         state.compute_storage_residency.len(),
-        HEAP_TEXTURES as usize,
-        "every heap texture's mirror is retained; the per-mapping cap must not \
-         reach a key whose loss stages a blank texture"
+        (2 * LIVE_WINDOWS) as usize,
+        "every independently live mirror remains owned"
     );
-    for tex in 0..HEAP_TEXTURES {
+    for tex in 0..LIVE_WINDOWS {
         let key = ComputeStorageResidencyKey::heap(1, tex, 16, 16, 0x50);
         assert!(
             state.compute_storage_residency.contains_key(&key),
