@@ -1712,7 +1712,8 @@ fn copy_bytes<M: HostMemory + HostOps>(
 }
 
 /// Execute an immutable buffer operation after serializer refs and bounds have
-/// been resolved, then advance canonical content for the written resource.
+/// been resolved. Canonical completion is applied once by [`execute_blit`]
+/// alongside every other blit destination family.
 fn execute_resolved_buffer_blit<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -1744,22 +1745,54 @@ fn execute_resolved_buffer_blit<M: HostMemory + HostOps>(
         ),
     };
     match result {
-        Ok(()) => {
-            let destination = operation.destination();
-            if state
-                .task_resources
-                .note_guest_write_by_id(destination.resource())
-                .is_none()
-            {
-                return br(
-                    BlitStatus::MissingResource,
-                    "buffer_completion_resource_gone",
-                );
-            }
-            BlitStatus::Ok
-        }
+        Ok(()) => BlitStatus::Ok,
         Err(status) => status,
     }
+}
+
+/// Semantic destination of a command which can complete a guest-memory write.
+///
+/// This is deliberately independent of backing class: unified and discrete
+/// placement may choose different transports, but both complete the same
+/// resource transition. Zero-extent and refused operations never call it.
+fn blit_write_destination(cmd: &Command) -> Option<u32> {
+    match cmd.kind {
+        Kind::FillBuffer | Kind::FillBufferPattern4 => Some(cmd.buffer),
+        Kind::Copy => match cmd.copy_kind {
+            CopyKind::BufferToBuffer
+            | CopyKind::BufferToTexture
+            | CopyKind::TextureToBuffer
+            | CopyKind::TextureToTexture
+            | CopyKind::TextureToTextureSliceLevel => Some(cmd.destination),
+            CopyKind::None => None,
+        },
+        Kind::Fence
+        | Kind::Resource
+        | Kind::Image
+        | Kind::Unknown
+        | Kind::IcbRange
+        | Kind::IcbCopy
+        | Kind::FillTexture
+        | Kind::InvalidateCompressedTexture => None,
+    }
+}
+
+/// Apply the content transition named by a successful synchronous blit.
+fn complete_blit_write(state: &DeviceState, task_id: u32, cmd: &Command) -> BlitStatus {
+    let Some(object_ref) = blit_write_destination(cmd) else {
+        return BlitStatus::Ok;
+    };
+    let Some(resource) = state.task_resources.identity(task_id, object_ref) else {
+        return br(BlitStatus::MissingResource, "blit_completion_resource_gone");
+    };
+    if state
+        .task_resources
+        .note_guest_write_by_id(resource)
+        .is_none()
+    {
+        return br(BlitStatus::MissingResource, "blit_completion_resource_gone");
+    }
+    BlitStatus::Ok
 }
 
 /// [`copy_bytes`] with the destination window supplied rather than captured.
@@ -4514,7 +4547,7 @@ pub fn execute_blit<M: HostMemory + HostOps>(
         Kind::Fence => "blit_kind_fence_us",
         _ => "blit_kind_other_us",
     };
-    let status = match cmd.kind {
+    let mut status = match cmd.kind {
         Kind::FillBuffer => exec_fill_buffer(state, host, task_id, cmd),
         Kind::FillBufferPattern4 => exec_fill_buffer_pattern4(state, host, task_id, cmd),
         Kind::Copy => match cmd.copy_kind {
@@ -4547,6 +4580,9 @@ pub fn execute_blit<M: HostMemory + HostOps>(
             br(BlitStatus::Unsupported, "blit_kind_spi_misrouted")
         }
     };
+    if status == BlitStatus::Ok {
+        status = complete_blit_write(state, task_id, cmd);
+    }
     crate::runtime::drain::note_store_route_us(
         kind_route,
         kind_started.elapsed().as_micros() as u64,

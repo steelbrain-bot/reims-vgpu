@@ -566,10 +566,24 @@ fn copy_buffer_to_iosurface_texture_roundtrip() {
         8
     ));
     assert_eq!(back, pat);
-    // Blit again — unified memory: pages are the only content; gen advances.
+    // Blit again — unified memory: pages are the only content; both the legacy
+    // mapping witness and canonical resource authority advance.
     let gen_before = state.mappings[&mapping_id].content_generation;
+    let (resource_before, version_before) = state
+        .task_resources
+        .content_stamp(1, 3)
+        .expect("the resolved destination has canonical content state");
     assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
     assert!(state.mappings[&mapping_id].content_generation > gen_before);
+    let (resource_after, version_after) = state
+        .task_resources
+        .content_stamp(1, 3)
+        .expect("the destination survives synchronous completion");
+    assert_eq!(resource_after, resource_before);
+    assert!(
+        version_after > version_before,
+        "a completed texture write must advance canonical content"
+    );
 }
 
 /// IOSurface texture→IOSurface texture copy lands source bytes in dest pages (unified content).
