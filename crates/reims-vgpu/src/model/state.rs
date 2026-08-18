@@ -624,9 +624,8 @@ pub struct TaskResource {
     /// several child identities concurrently; page recycling replaces only the
     /// matching identity instead of overwriting an unrelated child lease.
     #[cfg(feature = "backend-vulkan")]
-    resident_targets: Mutex<
-        HashMap<crate::model::TargetIdentity, Box<dyn crate::runtime::executor::ResidentLease>>,
-    >,
+    resident_targets:
+        Mutex<HashMap<crate::model::TargetIdentity, Box<dyn reims_vgpu_core::ResidentLease>>>,
 }
 
 impl TaskResource {
@@ -714,7 +713,7 @@ impl TaskResource {
         &self,
         executor: &dyn crate::runtime::executor::Executor,
         identity: &crate::model::TargetIdentity,
-    ) -> crate::runtime::executor::ResidentContentBacking {
+    ) -> reims_vgpu_core::ResidentContentBacking {
         self.resident_target_backing_with(identity, |identity| {
             executor.retain_resident_resource(identity)
         })
@@ -726,9 +725,9 @@ impl TaskResource {
         identity: &crate::model::TargetIdentity,
         retain: impl FnOnce(
             &crate::model::TargetIdentity,
-        ) -> Option<Box<dyn crate::runtime::executor::ResidentLease>>,
-    ) -> crate::runtime::executor::ResidentContentBacking {
-        use crate::runtime::executor::ResidentContentBacking;
+        ) -> Option<Box<dyn reims_vgpu_core::ResidentLease>>,
+    ) -> reims_vgpu_core::ResidentContentBacking {
+        use reims_vgpu_core::ResidentContentBacking;
 
         let mut held = self
             .resident_targets
@@ -804,7 +803,7 @@ impl TaskResourceLifetimeRef {
 mod task_resource_resident_tests {
     use super::*;
     use crate::model::TargetIdentity;
-    use crate::runtime::executor::{ResidentContentBacking, ResidentLease};
+    use reims_vgpu_core::{ResidentContentBacking, ResidentLease};
     use std::cell::Cell;
     use std::sync::atomic::{AtomicU64, Ordering};
 

@@ -11,24 +11,9 @@ use crate::backend::vulkan::engine::{
 use crate::model::TargetIdentity;
 use reims_vgpu_protocol::SubmissionIdentity;
 
-pub use reims_vgpu_core::{ExecutorCapabilities, SubmissionContext};
-
-/// Backend-independent classification of a retained target's current content.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ResidentContentBacking {
-    NotReady,
-    DeviceAllocation,
-}
-
-/// Opaque executor ownership of one backend resident for a guest resource.
-///
-/// Dropping the token performs the backend's fence-safe release. Semantic
-/// resource state can test identity continuity and content availability but
-/// cannot inspect or operate the backend allocation itself.
-pub trait ResidentLease: std::fmt::Debug + Send {
-    fn matches(&self, identity: &TargetIdentity) -> bool;
-    fn backing(&self) -> ResidentContentBacking;
-}
+pub use reims_vgpu_core::{
+    ExecutorCapabilities, ResidentContentBacking, ResidentLease, SubmissionContext,
+};
 
 impl ResidentLease for crate::backend::vulkan::engine::ResidentResourceLease {
     fn matches(&self, identity: &TargetIdentity) -> bool {

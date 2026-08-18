@@ -4,12 +4,14 @@
 
 pub mod capabilities;
 pub mod namespace;
+pub mod residency;
 pub mod resource;
 pub mod submission;
 pub mod target;
 
 pub use capabilities::{DeviceInfoLimits, ExecutorCapabilities};
 pub use namespace::{NamespaceError, ReferenceNamespace};
+pub use residency::{ResidentContentBacking, ResidentLease};
 pub use resource::{
     ContentAuthority, ContentError, ContentState, GraphError, LifecycleState, MappingNode,
     PendingContentWrite, ReplicaVersions, ResourceGraph, ResourceNode, StorageBacking, StorageNode,

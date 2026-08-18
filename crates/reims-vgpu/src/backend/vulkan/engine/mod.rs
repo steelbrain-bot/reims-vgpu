@@ -2069,7 +2069,7 @@ pub fn prepare_window_resident_present(
     resident_present_decision(pools, identity, width, height)
 }
 
-pub use crate::runtime::executor::ResidentContentBacking;
+pub use reims_vgpu_core::ResidentContentBacking;
 
 /// One live resource object's ownership of a resident target.
 ///
