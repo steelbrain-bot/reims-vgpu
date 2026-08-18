@@ -29,7 +29,7 @@ pub use execution::{
 pub use namespace::{NamespaceError, ReferenceNamespace};
 pub use residency::{
     ComputeResidencyService, ComputeStorageOrigin, ComputeStorageResidencyKey, GatherVouch,
-    ResidentContentBacking, ResidentLease,
+    ResidentContentBacking,
 };
 pub use resource::{
     ContentAuthority, ContentError, ContentStamp, ContentState, GraphError, LifecycleState,

@@ -9,12 +9,14 @@ use crate::backend::vulkan::engine::{
 };
 use crate::model::TargetIdentity;
 use reims_vgpu_protocol::StorageImageFormat;
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 pub use reims_vgpu_core::{
     CapabilityService, ComputeResidencyService, ExecutionPort, ExecutorCapabilities,
     GuestWriteReach, GuestWriteService, PresentDecline, PresentationService, ReadbackLease,
-    ReadbackService, ResidentContent, ResidentContentBacking, ResidentLease, ResidentService,
-    ResolvedCommand, ResolvedCommandBuffer, SubmissionContext, TargetReadback,
+    ReadbackService, ResidentContent, ResidentContentBacking, ResidentService, ResolvedCommand,
+    ResolvedCommandBuffer, ResourceLifetimeRef, SubmissionContext, TargetReadback,
 };
 
 /// Dynamic executor-session scope for one device operation.
@@ -172,6 +174,76 @@ pub trait Executor:
 #[derive(Debug)]
 pub struct VulkanExecutor {
     session: crate::backend::vulkan::engine::SessionId,
+    resident_leases:
+        Mutex<ResidentLeaseStore<crate::backend::vulkan::engine::ResidentResourceLease>>,
+}
+
+trait ExecutorResidentLease: std::fmt::Debug + Send {
+    fn matches(&self, identity: &TargetIdentity) -> bool;
+    fn backing(&self) -> ResidentContentBacking;
+}
+
+impl ExecutorResidentLease for crate::backend::vulkan::engine::ResidentResourceLease {
+    fn matches(&self, identity: &TargetIdentity) -> bool {
+        self.matches(identity)
+    }
+
+    fn backing(&self) -> ResidentContentBacking {
+        self.backing()
+    }
+}
+
+#[derive(Debug)]
+struct HeldResident<L> {
+    owner: ResourceLifetimeRef,
+    lease: L,
+}
+
+#[derive(Debug)]
+struct ResidentLeaseStore<L> {
+    entries: HashMap<(u64, TargetIdentity), HeldResident<L>>,
+}
+
+impl<L> Default for ResidentLeaseStore<L> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+}
+
+impl<L: ExecutorResidentLease> ResidentLeaseStore<L> {
+    fn retain_with(
+        &mut self,
+        owner: ResourceLifetimeRef,
+        identity: &TargetIdentity,
+        acquire: impl FnOnce(&TargetIdentity) -> Option<L>,
+    ) -> (ResidentContentBacking, bool) {
+        self.reap_dead();
+        let key = (owner.id(), identity.clone());
+        if let Some(held) = self
+            .entries
+            .get(&key)
+            .filter(|held| held.lease.matches(identity))
+        {
+            return (held.lease.backing(), false);
+        }
+        self.entries.remove(&key);
+        let Some(lease) = acquire(identity) else {
+            return (ResidentContentBacking::NotReady, false);
+        };
+        let backing = lease.backing();
+        self.entries.insert(key, HeldResident { owner, lease });
+        (backing, true)
+    }
+
+    fn reap_dead(&mut self) {
+        self.entries.retain(|_, held| held.owner.is_live());
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
 }
 
 impl Default for VulkanExecutor {
@@ -179,12 +251,17 @@ impl Default for VulkanExecutor {
         crate::backend::vulkan::install_telemetry();
         Self {
             session: crate::backend::vulkan::engine::SessionId::allocate(),
+            resident_leases: Mutex::new(ResidentLeaseStore::default()),
         }
     }
 }
 
 impl Drop for VulkanExecutor {
     fn drop(&mut self) {
+        self.resident_leases
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         crate::backend::vulkan::engine::release_session(self.session);
     }
 }
@@ -278,6 +355,10 @@ impl MaintenanceService for VulkanExecutor {
     }
 
     fn maintain_resources(&self, now_ms: u64) {
+        self.resident_leases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .reap_dead();
         crate::backend::vulkan::engine::maintain_resources(now_ms);
     }
 }
@@ -285,6 +366,10 @@ impl MaintenanceService for VulkanExecutor {
 impl SessionService for VulkanExecutor {
     fn reset(&self) {
         let _scope = self.enter();
+        self.resident_leases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         crate::backend::vulkan::engine::reset_guest_state();
     }
 
@@ -398,10 +483,24 @@ impl ResidentService for VulkanExecutor {
 
     fn retain_resident_resource(
         &self,
+        owner: ResourceLifetimeRef,
         identity: &TargetIdentity,
-    ) -> Option<Box<dyn ResidentLease>> {
-        crate::backend::vulkan::engine::retain_resident_resource(identity)
-            .map(|lease| Box::new(lease) as Box<dyn ResidentLease>)
+    ) -> ResidentContentBacking {
+        let (backing, acquired) = self
+            .resident_leases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain_with(owner, identity, |identity| {
+                crate::backend::vulkan::engine::retain_resident_resource(identity)
+            });
+        crate::runtime::drain::note_store_route(if acquired {
+            "resident_resource_acquired"
+        } else if backing == ResidentContentBacking::NotReady {
+            "resident_resource_unavailable"
+        } else {
+            return backing;
+        });
+        backing
     }
 }
 
@@ -605,9 +704,100 @@ mod tests {
         SubmissionIdentity, SubmissionResourceUse, TaskId,
     };
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     };
+
+    #[derive(Debug)]
+    struct TestResidentLease {
+        identity: TargetIdentity,
+        live: Arc<AtomicBool>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl ExecutorResidentLease for TestResidentLease {
+        fn matches(&self, identity: &TargetIdentity) -> bool {
+            self.identity == *identity && self.live.load(Ordering::Acquire)
+        }
+
+        fn backing(&self) -> ResidentContentBacking {
+            ResidentContentBacking::DeviceAllocation
+        }
+    }
+
+    impl Drop for TestResidentLease {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn test_target(generation: u64) -> TargetIdentity {
+        TargetIdentity::Gva {
+            gva: 0x4000,
+            width: 64,
+            height: 32,
+            generation,
+            format: crate::contract::pixel_format::TexelLayout::Bgra8,
+        }
+    }
+
+    #[test]
+    fn executor_retains_children_until_the_semantic_owner_ends() {
+        let owner = reims_vgpu_core::ResourceLifetime::new();
+        let first = test_target(1);
+        let second = test_target(2);
+        let live = Arc::new(AtomicBool::new(true));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let acquisitions = AtomicUsize::new(0);
+        let mut store = ResidentLeaseStore::default();
+
+        for identity in [&first, &first, &second] {
+            let (backing, _) = store.retain_with(owner.reference(), identity, |identity| {
+                acquisitions.fetch_add(1, Ordering::Relaxed);
+                Some(TestResidentLease {
+                    identity: identity.clone(),
+                    live: Arc::clone(&live),
+                    drops: Arc::clone(&drops),
+                })
+            });
+            assert_eq!(backing, ResidentContentBacking::DeviceAllocation);
+        }
+        assert_eq!(acquisitions.load(Ordering::Relaxed), 2);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+
+        drop(owner);
+        store.reap_dead();
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn stale_executor_lease_is_reacquired_under_the_same_identity() {
+        let owner = reims_vgpu_core::ResourceLifetime::new();
+        let identity = test_target(1);
+        let first_live = Arc::new(AtomicBool::new(true));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut store = ResidentLeaseStore::default();
+
+        store.retain_with(owner.reference(), &identity, |identity| {
+            Some(TestResidentLease {
+                identity: identity.clone(),
+                live: Arc::clone(&first_live),
+                drops: Arc::clone(&drops),
+            })
+        });
+        first_live.store(false, Ordering::Release);
+        let (backing, acquired) = store.retain_with(owner.reference(), &identity, |identity| {
+            Some(TestResidentLease {
+                identity: identity.clone(),
+                live: Arc::new(AtomicBool::new(true)),
+                drops: Arc::clone(&drops),
+            })
+        });
+
+        assert_eq!(backing, ResidentContentBacking::DeviceAllocation);
+        assert!(acquired);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
 
     #[derive(Clone, Copy, Debug)]
     enum ScriptedCompletion {

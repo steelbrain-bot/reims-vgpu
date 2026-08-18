@@ -1,6 +1,5 @@
 //! Opaque ownership contracts for executor-local residents.
 
-use crate::TargetIdentity;
 use reims_vgpu_protocol::StorageImageFormat;
 
 /// Whether a retained guest-memory gather is licensed for identity reuse.
@@ -195,16 +194,6 @@ pub trait ComputeResidencyService: std::fmt::Debug + Send + Sync {
 pub enum ResidentContentBacking {
     NotReady,
     DeviceAllocation,
-}
-
-/// Opaque executor ownership of one backend resident for a guest resource.
-///
-/// Dropping the token performs the executor's fence-safe release. Core state
-/// can check identity continuity and content availability, but cannot inspect
-/// or operate the backend allocation.
-pub trait ResidentLease: std::fmt::Debug + Send {
-    fn matches(&self, identity: &TargetIdentity) -> bool;
-    fn backing(&self) -> ResidentContentBacking;
 }
 
 #[cfg(test)]

@@ -2099,16 +2099,6 @@ impl ResidentResourceLease {
     }
 }
 
-impl reims_vgpu_core::ResidentLease for ResidentResourceLease {
-    fn matches(&self, identity: &TargetIdentity) -> bool {
-        self.matches(identity)
-    }
-
-    fn backing(&self) -> ResidentContentBacking {
-        self.backing()
-    }
-}
-
 impl Drop for ResidentResourceLease {
     fn drop(&mut self) {
         let Some(incarnation) = self.incarnation else {

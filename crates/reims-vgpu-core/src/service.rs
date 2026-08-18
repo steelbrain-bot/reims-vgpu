@@ -1,6 +1,6 @@
 //! Backend-neutral service results used beside the submission port.
 
-use crate::{ResidentContentBacking, ResidentLease, TargetIdentity};
+use crate::{ResidentContentBacking, ResourceLifetimeRef, TargetIdentity};
 
 /// What an executor can prove about outstanding writes into a page window.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -134,11 +134,18 @@ pub trait ResidentService: std::fmt::Debug + Send + Sync {
         false
     }
 
+    /// Retain `identity` inside this executor for exactly `owner`'s semantic
+    /// lifetime and report the resident's current backing class.
+    ///
+    /// The weak lifetime proof is deliberately the only ownership token that
+    /// crosses this port. Backend leases remain executor-local and are reaped
+    /// after the semantic resource is deleted.
     fn retain_resident_resource(
         &self,
+        _owner: ResourceLifetimeRef,
         _identity: &TargetIdentity,
-    ) -> Option<Box<dyn ResidentLease>> {
-        None
+    ) -> ResidentContentBacking {
+        ResidentContentBacking::NotReady
     }
 }
 

@@ -12,10 +12,7 @@ use reims_vgpu_protocol::{
 };
 #[cfg(feature = "backend-vulkan")]
 use reims_vgpu_protocol::{DepthStencilObject, RenderPipelineObject};
-#[cfg(feature = "backend-vulkan")]
-use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(feature = "backend-vulkan")]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -615,17 +612,7 @@ pub struct TaskResource {
     /// its bind need not probe the mutable Store/witness registries. This is
     /// resource state carried by the decoded attachment use, not an inference
     /// from its address, shape, or contents.
-    #[cfg(feature = "backend-vulkan")]
     was_render_target: AtomicBool,
-    /// Engine objects retained for this serialized resource lifetime.
-    ///
-    /// The lease owns its resident pin and allocation classification. Its
-    /// Each identity includes the mapping generation. A resource may own
-    /// several child identities concurrently; page recycling replaces only the
-    /// matching identity instead of overwriting an unrelated child lease.
-    #[cfg(feature = "backend-vulkan")]
-    resident_targets:
-        Mutex<HashMap<crate::model::TargetIdentity, Box<dyn reims_vgpu_core::ResidentLease>>>,
 }
 
 impl TaskResource {
@@ -638,10 +625,7 @@ impl TaskResource {
             relation_publication: AtomicU8::new(RELATIONS_UNPUBLISHED),
             iosurface_mapping: OnceLock::new(),
             lifetime: reims_vgpu_core::ResourceLifetime::new(),
-            #[cfg(feature = "backend-vulkan")]
             was_render_target: AtomicBool::new(false),
-            #[cfg(feature = "backend-vulkan")]
-            resident_targets: Mutex::new(HashMap::new()),
         }
     }
 
@@ -682,12 +666,10 @@ impl TaskResource {
         self.lifetime.reference()
     }
 
-    #[cfg(feature = "backend-vulkan")]
     pub(crate) fn note_render_target_use(&self) {
         self.was_render_target.store(true, Ordering::Release);
     }
 
-    #[cfg(feature = "backend-vulkan")]
     pub(crate) fn was_render_target(&self) -> bool {
         self.was_render_target.load(Ordering::Acquire)
     }
@@ -700,57 +682,15 @@ impl TaskResource {
         *self.iosurface_mapping.get_or_init(|| mapping_id)
     }
 
-    /// Retain and classify the engine target named by this resource.
-    ///
-    /// Warm binds read the resource-owned lease without entering the engine.
-    /// A changed identity or engine epoch releases the old lease and resolves
-    /// a new one; execution remains the authority for mutable content state.
+    /// Ask the device executor to retain and classify the target named by this
+    /// semantic resource lifetime. Backend ownership remains executor-local.
     #[cfg(feature = "backend-vulkan")]
     pub fn resident_target_backing(
         &self,
         executor: &dyn crate::runtime::executor::Executor,
         identity: &crate::model::TargetIdentity,
     ) -> reims_vgpu_core::ResidentContentBacking {
-        self.resident_target_backing_with(identity, |identity| {
-            executor.retain_resident_resource(identity)
-        })
-    }
-
-    #[cfg(feature = "backend-vulkan")]
-    fn resident_target_backing_with(
-        &self,
-        identity: &crate::model::TargetIdentity,
-        retain: impl FnOnce(
-            &crate::model::TargetIdentity,
-        ) -> Option<Box<dyn reims_vgpu_core::ResidentLease>>,
-    ) -> reims_vgpu_core::ResidentContentBacking {
-        use reims_vgpu_core::ResidentContentBacking;
-
-        let mut held = self
-            .resident_targets
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(lease) = held.get(identity).filter(|lease| lease.matches(identity)) {
-            return lease.backing();
-        }
-        // An engine reset invalidates the lease under this exact identity, but
-        // another identity is another child resource, not a replacement. A
-        // texture can own several views/surfaces concurrently.
-        held.remove(identity);
-        let acquired = retain(identity);
-        let backing = acquired
-            .as_ref()
-            .map(|lease| lease.backing())
-            .unwrap_or(ResidentContentBacking::NotReady);
-        if let Some(lease) = acquired {
-            held.insert(identity.clone(), lease);
-        }
-        crate::runtime::drain::note_store_route(if backing != ResidentContentBacking::NotReady {
-            "resident_resource_acquired"
-        } else {
-            "resident_resource_unavailable"
-        });
-        backing
+        executor.retain_resident_resource(self.lifetime_ref(), identity)
     }
 }
 
@@ -760,150 +700,6 @@ const RELATIONS_PUBLISHED: u8 = 2;
 
 /// Compatibility name while runtime requests migrate to core vocabulary.
 pub type TaskResourceLifetimeRef = reims_vgpu_core::ResourceLifetimeRef;
-
-#[cfg(all(test, feature = "backend-vulkan"))]
-mod task_resource_resident_tests {
-    use super::*;
-    use crate::model::TargetIdentity;
-    use reims_vgpu_core::{ResidentContentBacking, ResidentLease};
-    use std::cell::Cell;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    #[derive(Debug)]
-    struct TestLease {
-        identity: TargetIdentity,
-        epoch: u64,
-        epoch_source: Arc<AtomicU64>,
-    }
-
-    impl ResidentLease for TestLease {
-        fn matches(&self, identity: &TargetIdentity) -> bool {
-            self.identity == *identity && self.epoch == self.epoch_source.load(Ordering::Acquire)
-        }
-
-        fn backing(&self) -> ResidentContentBacking {
-            ResidentContentBacking::DeviceAllocation
-        }
-    }
-
-    fn lease(identity: &TargetIdentity, epoch_source: &Arc<AtomicU64>) -> Box<dyn ResidentLease> {
-        Box::new(TestLease {
-            identity: identity.clone(),
-            epoch: epoch_source.load(Ordering::Acquire),
-            epoch_source: Arc::clone(epoch_source),
-        })
-    }
-
-    fn identity(generation: u64) -> TargetIdentity {
-        TargetIdentity::Surface {
-            id: 9,
-            width: 64,
-            height: 32,
-            generation,
-            format: crate::contract::pixel_format::TexelLayout::Bgra8,
-        }
-    }
-
-    #[test]
-    fn a_resource_retains_each_child_identity_until_the_resource_ends() {
-        let resource = TaskResource::new(
-            ListObjectEntry::new(reims_vgpu_protocol::ObjectKind::Buffer, 0, 0),
-            Arc::from([]),
-        );
-        let first = identity(1);
-        let acquisitions = Cell::new(0_u32);
-        let epoch = Arc::new(AtomicU64::new(1));
-        let acquired_before =
-            crate::runtime::drain::census::store_route_count("resident_resource_acquired");
-
-        let backing = resource.resident_target_backing_with(&first, |identity| {
-            acquisitions.set(acquisitions.get() + 1);
-            Some(lease(identity, &epoch))
-        });
-        assert_eq!(backing, ResidentContentBacking::DeviceAllocation);
-        assert_eq!(acquisitions.get(), 1);
-        assert_eq!(
-            crate::runtime::drain::census::store_route_count("resident_resource_acquired"),
-            acquired_before + 1
-        );
-
-        let backing = resource.resident_target_backing_with(&first, |_| {
-            panic!("a warm bind must not reacquire its live resource")
-        });
-        assert_eq!(backing, ResidentContentBacking::DeviceAllocation);
-        assert_eq!(
-            crate::runtime::drain::census::store_route_count("resident_resource_acquired"),
-            acquired_before + 1,
-            "a warm bind must not be counted as another acquisition"
-        );
-
-        epoch.fetch_add(1, Ordering::Release);
-        let backing = resource.resident_target_backing_with(&first, |identity| {
-            acquisitions.set(acquisitions.get() + 1);
-            Some(lease(identity, &epoch))
-        });
-        assert_eq!(backing, ResidentContentBacking::DeviceAllocation);
-        assert_eq!(acquisitions.get(), 2, "an engine reset reacquires once");
-
-        let replacement = identity(2);
-        let backing = resource.resident_target_backing_with(&replacement, |identity| {
-            acquisitions.set(acquisitions.get() + 1);
-            Some(lease(identity, &epoch))
-        });
-        assert_eq!(backing, ResidentContentBacking::DeviceAllocation);
-        assert_eq!(
-            acquisitions.get(),
-            3,
-            "a new mapping generation reacquires once"
-        );
-
-        assert_eq!(
-            resource.resident_target_backing_with(&first, |_| {
-                panic!("adding a child identity must not evict the first child")
-            }),
-            ResidentContentBacking::DeviceAllocation
-        );
-        assert_eq!(
-            acquisitions.get(),
-            3,
-            "both child identities remain retained"
-        );
-        assert_eq!(
-            crate::runtime::drain::census::store_route_count("resident_resource_acquired"),
-            acquired_before + 3
-        );
-
-        // The synthetic leases have no registry pins behind them. Make the
-        // final drop stale so it exercises the reset-safe no-op release.
-        epoch.fetch_add(1, Ordering::Release);
-    }
-
-    #[test]
-    fn an_unavailable_target_is_counted_and_retried() {
-        let resource = TaskResource::new(
-            ListObjectEntry::new(reims_vgpu_protocol::ObjectKind::Buffer, 0, 0),
-            Arc::from([]),
-        );
-        let unavailable_before =
-            crate::runtime::drain::census::store_route_count("resident_resource_unavailable");
-        let attempts = Cell::new(0_u32);
-
-        for _ in 0..2 {
-            assert_eq!(
-                resource.resident_target_backing_with(&identity(1), |_| {
-                    attempts.set(attempts.get() + 1);
-                    None
-                }),
-                ResidentContentBacking::NotReady
-            );
-        }
-        assert_eq!(attempts.get(), 2, "an absent target must remain retryable");
-        assert_eq!(
-            crate::runtime::drain::census::store_route_count("resident_resource_unavailable"),
-            unavailable_before + 2
-        );
-    }
-}
 
 /// Per-task resource objects, keyed by the guest's `(task, reference)` pair.
 ///
