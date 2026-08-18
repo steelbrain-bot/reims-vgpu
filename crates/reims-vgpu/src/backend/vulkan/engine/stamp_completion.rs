@@ -722,7 +722,7 @@ fn publish_stamp_word(waiting: &Waiting) -> bool {
 /// any band that stopped at "slower than a frame".
 fn note_publish_latency(elapsed: std::time::Duration) {
     let us = elapsed.as_micros() as u64;
-    crate::runtime::drain::census::note_store_route(match us {
+    reims_vgpu_vulkan::telemetry::note_route(match us {
         0..=99 => "stamp_publish_lt100us",
         100..=999 => "stamp_publish_lt1ms",
         1_000..=3_999 => "stamp_publish_lt4ms",
@@ -731,7 +731,7 @@ fn note_publish_latency(elapsed: std::time::Duration) {
         64_000..=499_999 => "stamp_publish_lt500ms",
         _ => "stamp_publish_ge500ms",
     });
-    crate::runtime::drain::census::note_store_route_us("stamp_publish_us", us);
+    reims_vgpu_vulkan::telemetry::note_route_us("stamp_publish_us", us);
 }
 
 #[cfg(test)]

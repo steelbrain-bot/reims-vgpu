@@ -1675,13 +1675,13 @@ impl ResourcePools {
             height,
         };
         if let Some(fb) = self.ad_hoc_framebuffers.get(&key) {
-            crate::runtime::drain::note_store_route("adhoc_fb_hit");
+            reims_vgpu_vulkan::telemetry::note_route("adhoc_fb_hit");
             return Ok(*fb);
         }
         let fb = unsafe {
             self.create_mrt_framebuffer(ctx, render_pass, views, width, height, counters)
         }?;
-        crate::runtime::drain::note_store_route("adhoc_fb_miss");
+        reims_vgpu_vulkan::telemetry::note_route("adhoc_fb_miss");
         self.ad_hoc_framebuffers.insert(key, fb);
         Ok(fb)
     }
@@ -1708,7 +1708,7 @@ impl ResourcePools {
         for key in doomed {
             if let Some(fb) = self.ad_hoc_framebuffers.remove(&key) {
                 unsafe { device.destroy_framebuffer(fb, None) };
-                crate::runtime::drain::note_store_route("adhoc_fb_purged");
+                reims_vgpu_vulkan::telemetry::note_route("adhoc_fb_purged");
             }
         }
     }
@@ -1931,7 +1931,7 @@ impl ResourcePools {
         incarnation: super::ResidentIncarnation,
     ) -> Option<bool> {
         if self.registry.get(identity)?.incarnation != incarnation {
-            crate::runtime::drain::note_store_route("resident_resource_release_stale_incarnation");
+            reims_vgpu_vulkan::telemetry::note_route("resident_resource_release_stale_incarnation");
             return None;
         }
         self.release_resident_ownership(identity)
@@ -2552,7 +2552,7 @@ impl ResourcePools {
         if let Some(slot) = self.registry.get_mut(identity) {
             let idle_ms = touch.saturating_sub(slot.last_touch_ms);
             slot.last_touch_ms = touch;
-            crate::runtime::drain::note_store_route(resident_resample_band(idle_ms));
+            reims_vgpu_vulkan::telemetry::note_route(resident_resample_band(idle_ms));
             // The bands give the distribution; this gives the margin. They
             // answer different questions: the peak preserves the longest exact
             // reuse interval while the bands keep a cheap distribution.

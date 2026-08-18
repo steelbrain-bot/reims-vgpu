@@ -21,3 +21,43 @@ pub mod caps;
 pub mod engine;
 pub mod translate;
 pub use reims_vgpu_vulkan::policy;
+
+struct DeviceTelemetry;
+
+impl reims_vgpu_vulkan::telemetry::BackendTelemetry for DeviceTelemetry {
+    fn route(&self, name: &'static str) {
+        crate::runtime::drain::note_store_route(name);
+    }
+
+    fn route_n(&self, name: &'static str, count: u64) {
+        crate::runtime::drain::note_store_route_n(name, count);
+    }
+
+    fn route_us(&self, name: &'static str, micros: u64) {
+        crate::runtime::drain::note_store_route_us(name, micros);
+    }
+
+    fn readback_phase(&self, phase: reims_vgpu_vulkan::telemetry::ReadbackPhase, micros: u64) {
+        use crate::runtime::drain::ReadbackPhase as DevicePhase;
+        use reims_vgpu_vulkan::telemetry::ReadbackPhase as BackendPhase;
+        let phase = match phase {
+            BackendPhase::Submit => DevicePhase::Submit,
+            BackendPhase::Fence => DevicePhase::Fence,
+            BackendPhase::Map => DevicePhase::Map,
+            BackendPhase::Write => DevicePhase::Write,
+            BackendPhase::Vouch => DevicePhase::Vouch,
+            BackendPhase::Resolve => DevicePhase::Resolve,
+        };
+        crate::runtime::drain::note_readback_phase(phase, micros);
+    }
+
+    fn readback_gpu_us(&self, barrier: u64, copy: u64) {
+        crate::runtime::drain::note_readback_gpu_us(barrier, copy);
+    }
+}
+
+static DEVICE_TELEMETRY: DeviceTelemetry = DeviceTelemetry;
+
+pub(crate) fn install_telemetry() {
+    reims_vgpu_vulkan::telemetry::install(&DEVICE_TELEMETRY);
+}

@@ -196,6 +196,7 @@ pub struct VulkanExecutor {
 
 impl Default for VulkanExecutor {
     fn default() -> Self {
+        crate::backend::vulkan::install_telemetry();
         Self {
             session: crate::backend::vulkan::engine::SessionId::allocate(),
         }

@@ -308,7 +308,7 @@ unsafe fn prepare_compute_guest_texels(
     if let Some(texels) =
         super::exec::prepare_guest_texel_window(ctx, pools, counters, source, gathers)?
     {
-        crate::runtime::drain::note_store_route(match role {
+        reims_vgpu_vulkan::telemetry::note_route(match role {
             ComputeTexelRole::Sampled => "compute_sampled_guest_pages",
             ComputeTexelRole::StorageSeed => "compute_storage_seed_guest_pages",
         });
@@ -334,11 +334,11 @@ unsafe fn prepare_compute_guest_texels(
     match role {
         ComputeTexelRole::Sampled => {
             counters.note_compute_sampled_upload(source.total_len);
-            crate::runtime::drain::note_store_route("compute_sampled_guest_cpu_fallback");
+            reims_vgpu_vulkan::telemetry::note_route("compute_sampled_guest_cpu_fallback");
         }
         ComputeTexelRole::StorageSeed => {
             counters.note_compute_storage_seed_upload(source.total_len);
-            crate::runtime::drain::note_store_route("compute_storage_seed_guest_cpu_fallback");
+            reims_vgpu_vulkan::telemetry::note_route("compute_storage_seed_guest_cpu_fallback");
         }
     }
     Ok(PreparedTexelSource {
@@ -588,7 +588,7 @@ pub(crate) unsafe fn execute_compute_inner(
                         source.source_offset,
                         source.total_len,
                     )?;
-                    crate::runtime::drain::note_store_route("compute_buffer_guest_cpu_fallback");
+                    reims_vgpu_vulkan::telemetry::note_route("compute_buffer_guest_cpu_fallback");
                     (super::exec::BoundBuffer::from(slot), Some(slot), None)
                 }
             }

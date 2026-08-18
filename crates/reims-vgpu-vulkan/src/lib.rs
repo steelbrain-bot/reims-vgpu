@@ -14,3 +14,4 @@ pub mod memory;
 pub mod policy;
 pub mod push_descriptor;
 pub mod spirv_vertex_input;
+pub mod telemetry;

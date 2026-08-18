@@ -1337,7 +1337,7 @@ pub fn execute_draw_request(req: &DrawRequest) -> Result<DrawOutput, DrawError> 
         // and no other counter in this device could see it.
         let n = pools.discard_cb_binds_owed_a_gather();
         if n > 0 {
-            crate::runtime::drain::note_store_route_n("cb_bind_dropped_unfilled_gather", n as u64);
+            reims_vgpu_vulkan::telemetry::note_route_n("cb_bind_dropped_unfilled_gather", n as u64);
         }
     }
     match result {
@@ -1445,7 +1445,7 @@ mod end_of_tranche_gate_tests {
 
 /// Wait until nothing this device has recorded will read guest RAM again.
 ///
-/// Called from [`crate::runtime::drain::write_stamp`], immediately before the
+/// Called immediately before the runtime publishes a completion stamp to the
 /// guest is told a packet finished. The stamp's own contract is that everything
 /// the packet named may be freed or repainted from that moment, and a draw that
 /// binds guest pages as a copy source reads them when its command buffer
@@ -1581,7 +1581,7 @@ fn arm_guest_write_pages(pages: &[u64]) {
             oldest.extend_from_slice(&sorted);
             oldest.sort_unstable();
             oldest.dedup();
-            crate::runtime::drain::note_store_route("gwdebt_merged");
+            reims_vgpu_vulkan::telemetry::note_route("gwdebt_merged");
             return;
         }
     }
@@ -1699,8 +1699,8 @@ pub fn quiesce_guest_writes() {
     // windows, which is the whole of what this change did to the rail, so
     // `fence` no longer tracks `submit` and a reading that assumes it does is
     // reading the old shape.
-    crate::runtime::drain::note_readback_phase(
-        crate::runtime::drain::ReadbackPhase::Fence,
+    reims_vgpu_vulkan::telemetry::note_readback_phase(
+        reims_vgpu_vulkan::telemetry::ReadbackPhase::Fence,
         started.elapsed().as_micros() as u64,
     );
 }
@@ -2987,7 +2987,7 @@ unsafe fn copy_image_level0_to_host_delivered(
     // Split three ways rather than timed as a whole: the submit and the copy
     // scale with the surface, the fence does not scale with anything we control,
     // and the fix for one is not the fix for the others.
-    use crate::runtime::drain::{note_readback_phase, ReadbackPhase};
+    use reims_vgpu_vulkan::telemetry::{note_readback_phase, ReadbackPhase};
     note_readback_phase(
         ReadbackPhase::Submit,
         submit_started.elapsed().as_micros() as u64,
@@ -4115,7 +4115,7 @@ unsafe fn copy_image_level0_to_buffer(
     snap: &ResidentReadSnapshot,
     plan: &GuestCopyPlan,
 ) -> Result<(), DrawError> {
-    use crate::runtime::drain::{note_readback_phase, ReadbackPhase};
+    use reims_vgpu_vulkan::telemetry::{note_readback_phase, ReadbackPhase};
     let submit_started = std::time::Instant::now();
     // Appended to a recording batch where there is one, for the reason
     // `copy_image_level0_to_host_delivered` gives: `begin_entry` would submit
@@ -4539,7 +4539,7 @@ fn narrow_readback_to_rgba8(
     // frame this returns carries eight bits of a channel the guest asked for
     // sixteen of. A non-zero reading names the population that would be
     // repaired by teaching this rail's consumers the wider texel.
-    crate::runtime::drain::note_store_route("target_read_narrowed");
+    reims_vgpu_vulkan::telemetry::note_route("target_read_narrowed");
     Ok((narrowed, false))
 }
 

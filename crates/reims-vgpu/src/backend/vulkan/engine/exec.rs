@@ -2818,7 +2818,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // this ladder stopped refusing; without a name of its own on the way *in*,
     // the only visible effect would be a term that stopped firing, which reads
     // identically to a workload that stopped presenting one.
-    crate::runtime::drain::note_store_route(no_join.unwrap_or(if samples_own_target {
+    reims_vgpu_vulkan::telemetry::note_route(no_join.unwrap_or(if samples_own_target {
         "join_appended_self_alias"
     } else {
         "join_appended"
@@ -2829,7 +2829,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // how much of batching even belongs to that population; the obstacle ladder
     // at the draw records why individual candidates still have to close.
     if joins {
-        crate::runtime::drain::note_store_route(
+        reims_vgpu_vulkan::telemetry::note_route(
             match batch_target.as_ref().and_then(|t| pools.batch_target_is(t)) {
                 Some(true) => "join_same_target",
                 Some(false) => "join_other_target",
@@ -3639,8 +3639,8 @@ pub(crate) unsafe fn execute_draw_inner(
         } {
             Some(source) => {
                 pools.note_guest_read_recorded();
-                crate::runtime::drain::note_store_route("target_seed_guest_import");
-                crate::runtime::drain::note_store_route_n(
+                reims_vgpu_vulkan::telemetry::note_route("target_seed_guest_import");
+                reims_vgpu_vulkan::telemetry::note_route_n(
                     "target_seed_guest_import_bytes",
                     seed.source.total_len,
                 );
@@ -3668,7 +3668,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     )?;
                 }
                 counters.note_seed_upload(seed.source.total_len);
-                crate::runtime::drain::note_store_route("target_seed_guest_cpu_fallback");
+                reims_vgpu_vulkan::telemetry::note_route("target_seed_guest_cpu_fallback");
                 Some(GuestTexels::Scratch(slot))
             }
         },
@@ -3810,7 +3810,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     .flatten();
                 if let Some((_, _, _, _, ready, width, height, samples)) = held.as_ref() {
                     if *samples > 1 {
-                        crate::runtime::drain::note_store_route("sampled_resident_multisample");
+                        reims_vgpu_vulkan::telemetry::note_route("sampled_resident_multisample");
                         let key = (u64::from(resource.binding) << 32) | u64::from(*samples);
                         if reims_vgpu_observe::first_sight("sampled_resident_multisample", key) {
                             reims_vgpu_observe::off(format!(
@@ -3874,7 +3874,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 if let Some(_attachment_index) =
                     feedback_color_index(req, resource, attachment_feedback_available)
                 {
-                    crate::runtime::drain::note_store_route("sampled_self_feedback_loop");
+                    reims_vgpu_vulkan::telemetry::note_route("sampled_self_feedback_loop");
                     sampled.push(PreparedSampled::Feedback {
                         binding: resource.binding,
                         array_element: resource.array_element,
@@ -3888,9 +3888,9 @@ pub(crate) unsafe fn execute_draw_inner(
                         // it, so they are alarms and a zero on them is the
                         // healthy reading.
                         Some(slot) => {
-                            crate::runtime::drain::note_store_route(slot.sampled_self_route())
+                            reims_vgpu_vulkan::telemetry::note_route(slot.sampled_self_route())
                         }
-                        None => crate::runtime::drain::note_store_route(
+                        None => reims_vgpu_vulkan::telemetry::note_route(
                             "sampled_resident_swizzle_snapshot",
                         ),
                     }
@@ -5053,17 +5053,17 @@ pub(crate) unsafe fn execute_draw_inner(
     // partition of each other rather than two counts of loosely the same thing.
     if joins && !continues {
         if let Some(field) = pools.pass_echo_delta(&echo) {
-            crate::runtime::drain::note_store_route(field.route());
+            reims_vgpu_vulkan::telemetry::note_route(field.route());
             // `passdiff_compat` is itself one bucket over nine attachment-shape
             // fields, and it became the dominant one when the framebuffer
             // identity blocker was fixed. The finer route rides along with the
             // coarse one so the two cannot be charged apart.
             if let Some(detail) = field.detail_route() {
-                crate::runtime::drain::note_store_route(detail);
+                reims_vgpu_vulkan::telemetry::note_route(detail);
             }
         }
     }
-    crate::runtime::drain::note_store_route(if !joins {
+    reims_vgpu_vulkan::telemetry::note_route(if !joins {
         "passmerge_no_join"
     } else if !continues {
         "passmerge_pass_differs"
@@ -5072,7 +5072,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .first
             .map_or("passmerge_reachable", PassObstacle::route)
     });
-    crate::runtime::drain::note_store_route(if !joins {
+    reims_vgpu_vulkan::telemetry::note_route(if !joins {
         "passheld_no_join"
     } else if !continues {
         "passheld_pass_differs"
@@ -5082,7 +5082,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .map_or("passheld_reachable", PassObstacle::held_route)
     });
     if continues_open {
-        crate::runtime::drain::note_store_route("pass_continued");
+        reims_vgpu_vulkan::telemetry::note_route("pass_continued");
         counters
             .render_pass_continuations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5090,13 +5090,13 @@ pub(crate) unsafe fn execute_draw_inner(
         // An encoder boundary, a different pass instance, or an intervening
         // outside-pass command closes whatever the predecessor left open.
         unsafe { pools.close_open_pass(&ctx.device, cb) };
-        crate::runtime::drain::note_store_route(pass_begin_area_band(req.width, req.height));
-        crate::runtime::drain::note_store_route(if pass_key.load_seed {
+        reims_vgpu_vulkan::telemetry::note_route(pass_begin_area_band(req.width, req.height));
+        reims_vgpu_vulkan::telemetry::note_route(if pass_key.load_seed {
             "passbegin_load"
         } else {
             "passbegin_clear"
         });
-        crate::runtime::drain::note_store_route("passbegin_color0_resident");
+        reims_vgpu_vulkan::telemetry::note_route("passbegin_color0_resident");
         ctx.device
             .cmd_begin_render_pass(cb, &rp_begin, vk::SubpassContents::INLINE);
         pools.note_pass_opened(echo);
@@ -5310,7 +5310,7 @@ pub(crate) unsafe fn execute_draw_inner(
         && !pass_churn_probe_enabled()
         && !layout_churn_probe_enabled();
     if keep_pass_open {
-        crate::runtime::drain::note_store_route("pass_left_open");
+        reims_vgpu_vulkan::telemetry::note_route("pass_left_open");
     } else {
         unsafe { pools.close_open_pass(&ctx.device, cb) };
     }
@@ -6122,7 +6122,7 @@ fn pass_exit_needs_no_barrier(prior: super::pools::ResidentAccess) -> bool {
 ///
 /// The pooled census that scored those boots, and why no counter in it can
 /// resolve this class, is recorded on
-/// [`crate::runtime::drain::note_store_route`].
+/// [`reims_vgpu_vulkan::telemetry::note_route`].
 pub(super) unsafe fn barrier_resident_for_transfer_read(
     device: &ash::Device,
     cb: vk::CommandBuffer,

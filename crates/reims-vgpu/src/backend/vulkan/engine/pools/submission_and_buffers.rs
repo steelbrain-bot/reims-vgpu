@@ -108,10 +108,10 @@ impl ResourcePools {
         import_id: crate::runtime::guest_ram::ImportId,
     ) {
         if let Some(parent) = self.host_ram_imports.retire(import_id) {
-            crate::runtime::drain::note_store_route("guest_import_retired_now");
+            reims_vgpu_vulkan::telemetry::note_route("guest_import_retired_now");
             self.dispose(device, DeferredHandle::GuestAllocation(parent));
         } else {
-            crate::runtime::drain::note_store_route("guest_import_retired_unimported");
+            reims_vgpu_vulkan::telemetry::note_route("guest_import_retired_unimported");
         }
     }
 
@@ -1221,7 +1221,7 @@ impl ResourcePools {
         {
             let us =
                 |from: usize, to: usize| probe.scale.elapsed_ns(ticks[from], ticks[to]) / 1_000;
-            crate::runtime::drain::note_readback_gpu_us(us(0, 1), us(1, 2));
+            reims_vgpu_vulkan::telemetry::note_readback_gpu_us(us(0, 1), us(1, 2));
         }
     }
 
@@ -1543,7 +1543,7 @@ impl ResourcePools {
         if self.sampled_cache.is_empty() {
             return Vec::new();
         }
-        crate::runtime::drain::note_store_route("sampled_cache_discarded");
+        reims_vgpu_vulkan::telemetry::note_route("sampled_cache_discarded");
         let mut taken = Vec::with_capacity(self.sampled_cache.len());
         while !self.sampled_cache.is_empty() {
             taken.push(self.remove_sampled_entry(0));
@@ -2053,8 +2053,8 @@ impl ResourcePools {
     /// unconditional clear would have become a real cost.
     fn forget_cb_bound_buffers(&mut self, why: &'static str, entries_slug: &'static str) {
         let n = self.cb_bound_buffers.len() as u64;
-        crate::runtime::drain::note_store_route(why);
-        crate::runtime::drain::note_store_route_n(entries_slug, n);
+        reims_vgpu_vulkan::telemetry::note_route(why);
+        reims_vgpu_vulkan::telemetry::note_route_n(entries_slug, n);
         self.cb_bound_buffers.clear();
         // The owed list names keys in the map that just went, so it cannot
         // outlive it — a surviving key would later remove whatever unrelated
@@ -2917,11 +2917,11 @@ impl ResourcePools {
             // convict either the loop or the memory.
             let started = std::time::Instant::now();
             exchange_rb_into(rgba, std::slice::from_raw_parts_mut(ptr, rgba.len()));
-            crate::runtime::drain::note_store_route_us(
+            reims_vgpu_vulkan::telemetry::note_route_us(
                 "swap_rb_us",
                 started.elapsed().as_micros() as u64,
             );
-            crate::runtime::drain::note_store_route_n("swap_rb_kb", (rgba.len() / 1024) as u64);
+            reims_vgpu_vulkan::telemetry::note_route_n("swap_rb_kb", (rgba.len() / 1024) as u64);
         }
         Ok(())
     }
@@ -3255,7 +3255,7 @@ impl ResourcePools {
         // from it then means either "never called" or "always hit" — two states
         // a reader cannot separate, which is the sampling-point trap this exists
         // to escape. Taken here, a zero means the function did not run.
-        crate::runtime::drain::note_store_route(target_pool_depth_band(self.target_order.len()));
+        reims_vgpu_vulkan::telemetry::note_route(target_pool_depth_band(self.target_order.len()));
         let map_key = (key, render_pass.as_raw());
         if self.targets.contains_key(&map_key) {
             return Ok(self.targets.get(&map_key).unwrap());
@@ -3347,7 +3347,7 @@ impl ResourcePools {
                     // this slot is scratch and holds no guest resource's content
                     // — but an uncounted eviction is one nobody can rank against
                     // the re-creates it causes.
-                    crate::runtime::drain::note_store_route("target_pool_evict");
+                    reims_vgpu_vulkan::telemetry::note_route("target_pool_evict");
                     self.dispose(&ctx.device, DeferredHandle::Framebuffer(old.framebuffer));
                     self.dispose(
                         &ctx.device,
@@ -3730,7 +3730,7 @@ impl ResourcePools {
         resource_lifetime: Option<&reims_vgpu_core::ResourceLifetimeRef>,
     ) {
         let Some(owner) = resource_lifetime.filter(|owner| owner.is_live()) else {
-            crate::runtime::drain::note_store_route("sampled_admit_no_lifetime");
+            reims_vgpu_vulkan::telemetry::note_route("sampled_admit_no_lifetime");
             self.sampled_live.push(slot);
             return;
         };
@@ -3756,13 +3756,13 @@ impl ResourcePools {
                 && entry.content.as_deref() == retained.as_deref()
         });
         if let Some(index) = duplicate {
-            crate::runtime::drain::note_store_route("sampled_admit_duplicate");
+            reims_vgpu_vulkan::telemetry::note_route("sampled_admit_duplicate");
             let existing = &mut self.sampled_cache[index];
             existing.retain_owner(owner);
             self.sampled_live.push(slot);
             return;
         }
-        crate::runtime::drain::note_store_route("sampled_admit_kept");
+        reims_vgpu_vulkan::telemetry::note_route("sampled_admit_kept");
         self.sampled_cache_bytes = self.sampled_cache_bytes.saturating_add(content_len);
         let touch = self.idle_clock_ms;
         self.push_sampled_entry(ResidentSampledSlot {
