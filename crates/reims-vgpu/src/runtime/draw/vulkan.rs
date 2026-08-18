@@ -320,17 +320,22 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 // exactly the 28 % hole `b872e43` had to instrument, and it would
                 // read as a win of the same size as the work it hid.
                 let _store_span = StoreCostSpan::new("t11_store_us");
-                let c0_store = req
-                    .colors
-                    .first()
-                    .map(|c0| (c0.mapping_id(), c0.width, c0.height, c0.format));
+                let c0_store = req.colors.first().map(|c0| {
+                    (
+                        c0.mapping_id(),
+                        c0.width,
+                        c0.height,
+                        c0.format,
+                        c0.texture_ref,
+                    )
+                });
                 let stored = c0_store
-                    .map(|(mid, cw, ch, _)| {
+                    .map(|(mid, cw, ch, _, _)| {
                         store_surface_resident(state, host, &identity, mid, cw, ch)
                     })
                     .unwrap_or(false);
                 match (stored, c0_store) {
-                    (true, Some((mid, cw, ch, fmt))) => {
+                    (true, Some((mid, cw, ch, fmt, texture_ref))) => {
                         note_type11_store_route("surface_resident");
                         // The same two publishes the `Owned` rail performs at arm
                         // time, for the same reason: `dense_frame_seq` gates
@@ -340,6 +345,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                             let _span = StoreCostSpan::new("t11_publish_us");
                             publish_surface_store(state, host, mid, cw, ch, fmt);
                         }
+                        record_materialized_store(state, req.task_id, texture_ref);
                         surface_store_armed = true;
                         crate::observe::line(format!(
                             "linux_m2v_draw ok resident_surface_store pipe={} {}x{} mid={mid}",
@@ -567,6 +573,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         ));
                     }
                     if ok {
+                        record_materialized_store(state, req.task_id, c0.texture_ref);
                         // `None`, for the same reason the deferred arm above
                         // returns it: this whole block runs only under
                         // `writeback_guest`, which `multi_draw_store_plan` grants
@@ -707,6 +714,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 false
             };
             if ok {
+                record_materialized_store(state, req.task_id, c0.texture_ref);
                 // `None`: everything from here up is under `writeback_guest`,
                 // which `multi_draw_store_plan` grants only to `di == last_i`, so
                 // the chain value has no record N+1 to seed and every other
@@ -797,6 +805,25 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             None,
         )
     }
+}
+
+/// Publish the one semantic outcome shared by synchronous Store rails.
+///
+/// Vulkan may reach this through a resident surface, a host readback, or a
+/// direct guest write. Those choices affect transfer cost only; all have a
+/// completed GPU result and the same bytes in the guest replica.
+fn record_materialized_store(state: &mut DeviceState, task_id: u32, texture_ref: u32) {
+    let Some(submission) = state
+        .active_submission
+        .as_ref()
+        .map(|active| active.identity.id)
+    else {
+        return;
+    };
+    let _ =
+        state
+            .task_resources
+            .record_completed_materialized_store(task_id, texture_ref, submission);
 }
 
 /// Sampled texture source + geometry for an engine draw.

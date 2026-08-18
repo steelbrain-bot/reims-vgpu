@@ -1077,6 +1077,19 @@ impl TaskResources {
             .is_some_and(|node| node.content.copy_gpu_to_guest_completed(version).is_ok())
     }
 
+    /// Apply the synchronous Store outcome where GPU execution and its
+    /// guest-memory materialization have both completed.
+    pub fn record_completed_materialized_store(
+        &self,
+        task_id: u32,
+        ref_: u32,
+        submission: SubmissionId,
+    ) -> Option<(ResourceId<ResourceObject>, ContentVersion)> {
+        let (id, version) = self.record_completed_gpu_store(task_id, ref_, submission)?;
+        self.record_gpu_to_guest_copy(id, version)
+            .then_some((id, version))
+    }
+
     /// Resolve and enter every constructed resource declared by a submission.
     ///
     /// Residency tables legitimately contain objects which no command has
