@@ -100,6 +100,13 @@ pub fn apply(
         // not a record.
         return out;
     }
+    if ops.clear_host_valid != 0 {
+        // The object graph owns content authority for every constructed
+        // resource, including buffers and textures without a MappingEntry.
+        // Mapping generations below remain cache invalidation witnesses during
+        // the migration; they no longer stand in for the resource's version.
+        state.task_resources.note_guest_write(task_id, object_id);
+    }
     let targets = state.mappings_named_by(task_id, object_id);
     let mut hit = false;
     for id in targets.iter() {

@@ -6,9 +6,9 @@ use crate::runtime::decode::resource::{
 };
 use reims_vgpu_core::{ReferenceNamespace, ResourceGraph, ResourceNode};
 use reims_vgpu_protocol::{
-    ByteLength, ByteOffset, ComputePipelineObject, EventObject, FenceObject, FunctionObject,
-    GuestVirtualAddress, MappingId, ObjectRef, PlaneIndex, ResourceId, ResourceObject,
-    SamplerObject, SurfaceBackingId, TaskId,
+    ByteLength, ByteOffset, ComputePipelineObject, ContentVersion, EventObject, FenceObject,
+    FunctionObject, GuestVirtualAddress, MappingId, ObjectRef, PlaneIndex, ResourceId,
+    ResourceObject, SamplerObject, SubmissionId, SurfaceBackingId, TaskId,
 };
 #[cfg(feature = "backend-vulkan")]
 use reims_vgpu_protocol::{DepthStencilObject, RenderPipelineObject};
@@ -1026,6 +1026,77 @@ impl TaskResources {
             .cloned()
     }
 
+    /// Record a CPU write against the canonical resource identity, when that
+    /// object has already been constructed.
+    pub fn note_guest_write(&self, task_id: u32, ref_: u32) -> Option<ContentVersion> {
+        let mut registry = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let id = registry
+            .graph
+            .resolve(TaskId::new(task_id), ObjectRef::new(ref_))?;
+        registry.graph.resource_mut(id)?.content.guest_wrote().ok()
+    }
+
+    /// Resolve and enter every constructed resource declared by a submission.
+    ///
+    /// Residency tables legitimately contain objects which no command has
+    /// constructed in this process yet. Those remain unresolved in the
+    /// immutable envelope instead of being assigned a guessed identity.
+    pub fn begin_submission(
+        &self,
+        task_id: u32,
+        submission: SubmissionId,
+        objects: impl IntoIterator<Item = ObjectRef<ResourceObject>>,
+    ) -> Vec<(
+        ObjectRef<ResourceObject>,
+        Option<ResourceId<ResourceObject>>,
+        Option<ContentVersion>,
+    )> {
+        let mut registry = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        objects
+            .into_iter()
+            .map(|object| {
+                let Some(id) = registry.graph.resolve(TaskId::new(task_id), object) else {
+                    return (object, None, None);
+                };
+                let expected = registry.graph.resource(id).map(|node| node.content.current);
+                registry
+                    .graph
+                    .prepare(id, submission)
+                    .expect("a resolved resource exists");
+                registry
+                    .graph
+                    .submit(id, submission)
+                    .expect("the resource was prepared in this transition");
+                (object, Some(id), expected)
+            })
+            .collect()
+    }
+
+    /// Pair one submission's successful prepare/submit transitions.
+    pub fn complete_submission(
+        &self,
+        submission: SubmissionId,
+        resources: impl IntoIterator<Item = ResourceId<ResourceObject>>,
+    ) {
+        let mut registry = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let resources: BTreeSet<_> = resources.into_iter().collect();
+        for id in resources {
+            registry
+                .graph
+                .complete(id, submission)
+                .expect("submission resources complete exactly once");
+        }
+    }
+
     pub fn attach_mapper_storage(&self, task_id: u32, ref_: u32, mapping_id: u32) -> bool {
         let mut registry = self
             .0
@@ -1253,6 +1324,59 @@ mod task_resource_graph_tests {
         assert!(resources.resource_node(buffer_id).is_some());
         assert!(resources.delete(4, 10));
         assert!(resources.resource_node(buffer_id).is_none());
+    }
+
+    #[test]
+    fn submission_snapshot_retains_a_deleted_resource_until_completion() {
+        let resources = TaskResources::default();
+        let resource = resources.register(4, 9, resource(ObjectKind::Texture));
+        let id = resource.semantic_id().unwrap();
+        let submission = SubmissionId::new(12);
+
+        let snapshot = resources.begin_submission(4, submission, [ObjectRef::new(9)]);
+        assert_eq!(
+            snapshot,
+            vec![(ObjectRef::new(9), Some(id), Some(ContentVersion::new(1)))]
+        );
+        assert_eq!(
+            resources.resource_node(id).unwrap().lifecycle,
+            reims_vgpu_core::LifecycleState::InFlight
+        );
+
+        assert!(resources.delete(4, 9));
+        assert!(resources.resource_node(id).is_some());
+        resources.complete_submission(submission, [id]);
+        assert!(resources.resource_node(id).is_none());
+    }
+
+    #[test]
+    fn pre_submission_guest_write_is_the_expected_content_version() {
+        let resources = TaskResources::default();
+        let resource = resources.register(4, 9, resource(ObjectKind::Buffer));
+        let id = resource.semantic_id().unwrap();
+
+        let version = resources.note_guest_write(4, 9).unwrap();
+        let snapshot = resources.begin_submission(4, SubmissionId::new(1), [ObjectRef::new(9)]);
+
+        assert_eq!(snapshot[0], (ObjectRef::new(9), Some(id), Some(version)));
+        resources.complete_submission(SubmissionId::new(1), [id]);
+    }
+
+    #[test]
+    fn repeated_residency_records_complete_one_resource_participation() {
+        let resources = TaskResources::default();
+        let resource = resources.register(4, 9, resource(ObjectKind::Buffer));
+        let id = resource.semantic_id().unwrap();
+        let submission = SubmissionId::new(5);
+
+        let snapshot =
+            resources.begin_submission(4, submission, [ObjectRef::new(9), ObjectRef::new(9)]);
+        assert_eq!(snapshot.len(), 2);
+        resources.complete_submission(submission, snapshot.iter().filter_map(|item| item.1));
+        assert_eq!(
+            resources.resource_node(id).unwrap().lifecycle,
+            reims_vgpu_core::LifecycleState::Created
+        );
     }
 }
 

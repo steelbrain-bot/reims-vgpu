@@ -258,6 +258,8 @@ mod tests {
             },
             resources: Arc::from([SubmissionResourceUse {
                 object: ObjectRef::new(31),
+                resource: None,
+                expected_content: None,
                 validity: ResourceValidity {
                     clear_host: true,
                     set_host: false,

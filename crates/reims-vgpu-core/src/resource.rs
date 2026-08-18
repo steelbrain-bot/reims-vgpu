@@ -1,9 +1,9 @@
 //! Canonical task-owned resource, storage, and mapping graph.
 
 use reims_vgpu_protocol::{
-    BackingGeneration, ByteLength, ByteOffset, GuestVirtualAddress, MappingId, ObjectKind,
-    ObjectRef, PlaneIndex, ResourceId, ResourceObject, StorageId, SubmissionId, SurfaceBackingId,
-    TaskId,
+    BackingGeneration, ByteLength, ByteOffset, ContentVersion, GuestVirtualAddress, MappingId,
+    ObjectKind, ObjectRef, PlaneIndex, ResourceId, ResourceObject, StorageId, SubmissionId,
+    SurfaceBackingId, TaskId,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -15,6 +15,148 @@ pub enum LifecycleState {
     Prepared,
     InFlight,
     Released,
+}
+
+/// Versions held by the three places resource bytes can reside.
+///
+/// `None` means that replica does not contain bytes from this resource's
+/// current lifetime. Currency is always derived by comparing a replica with
+/// [`ContentState::current`]; there is no independent "GPU only" latch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReplicaVersions {
+    pub guest: Option<ContentVersion>,
+    pub gpu: Option<ContentVersion>,
+    pub host: Option<ContentVersion>,
+}
+
+/// A version reserved for a submitted GPU write which has not completed yet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PendingContentWrite {
+    pub submission: SubmissionId,
+    pub version: ContentVersion,
+}
+
+/// The sole authority for which replica contains a resource's newest bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContentState {
+    pub current: ContentVersion,
+    pub replicas: ReplicaVersions,
+    pending_gpu_writes: BTreeMap<SubmissionId, ContentVersion>,
+    next_version: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContentError {
+    SubmissionAlreadyWrites,
+    SubmissionDidNotPlanWrite,
+    StaleSource,
+    WouldLoseCurrentContent,
+    VersionSpaceExhausted,
+}
+
+impl Default for ContentState {
+    fn default() -> Self {
+        let initial = ContentVersion::new(1);
+        Self {
+            current: initial,
+            replicas: ReplicaVersions {
+                guest: Some(initial),
+                gpu: None,
+                host: None,
+            },
+            pending_gpu_writes: BTreeMap::new(),
+            next_version: 2,
+        }
+    }
+}
+
+impl ContentState {
+    fn reserve_version(&mut self) -> Result<ContentVersion, ContentError> {
+        let version = ContentVersion::new(self.next_version);
+        self.next_version = self
+            .next_version
+            .checked_add(1)
+            .ok_or(ContentError::VersionSpaceExhausted)?;
+        Ok(version)
+    }
+
+    pub fn guest_wrote(&mut self) -> Result<ContentVersion, ContentError> {
+        let version = self.reserve_version()?;
+        self.current = version;
+        self.replicas.guest = Some(version);
+        Ok(version)
+    }
+
+    pub fn gpu_store_planned(
+        &mut self,
+        submission: SubmissionId,
+    ) -> Result<PendingContentWrite, ContentError> {
+        if self.pending_gpu_writes.contains_key(&submission) {
+            return Err(ContentError::SubmissionAlreadyWrites);
+        }
+        let version = self.reserve_version()?;
+        self.pending_gpu_writes.insert(submission, version);
+        Ok(PendingContentWrite {
+            submission,
+            version,
+        })
+    }
+
+    pub fn gpu_store_completed(
+        &mut self,
+        submission: SubmissionId,
+    ) -> Result<ContentVersion, ContentError> {
+        let version = self
+            .pending_gpu_writes
+            .remove(&submission)
+            .ok_or(ContentError::SubmissionDidNotPlanWrite)?;
+        self.replicas.gpu = Some(version);
+        if version > self.current {
+            self.current = version;
+        }
+        Ok(version)
+    }
+
+    pub fn copy_gpu_to_guest_completed(
+        &mut self,
+        version: ContentVersion,
+    ) -> Result<(), ContentError> {
+        if self.replicas.gpu != Some(version) || self.current != version {
+            return Err(ContentError::StaleSource);
+        }
+        self.replicas.guest = Some(version);
+        Ok(())
+    }
+
+    pub fn copy_guest_to_gpu_completed(
+        &mut self,
+        version: ContentVersion,
+    ) -> Result<(), ContentError> {
+        if self.replicas.guest != Some(version) || self.current != version {
+            return Err(ContentError::StaleSource);
+        }
+        self.replicas.gpu = Some(version);
+        Ok(())
+    }
+
+    pub fn current_in_guest(&self) -> bool {
+        self.replicas.guest == Some(self.current)
+    }
+
+    pub fn current_in_gpu(&self) -> bool {
+        self.replicas.gpu == Some(self.current)
+    }
+
+    pub fn replace_guest_backing(&mut self) -> Result<(), ContentError> {
+        if self.current_in_guest()
+            && self.replicas.gpu != Some(self.current)
+            && self.replicas.host != Some(self.current)
+        {
+            return Err(ContentError::WouldLoseCurrentContent);
+        }
+        self.replicas.guest = None;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -76,6 +218,7 @@ pub struct ResourceNode {
     pub lifecycle: LifecycleState,
     pub storage: Option<StorageId>,
     pub backing_generation: BackingGeneration,
+    pub content: ContentState,
     pub parents: BTreeSet<AnyResourceId>,
     pub children: BTreeSet<AnyResourceId>,
     pub in_flight: BTreeSet<SubmissionId>,
@@ -211,6 +354,7 @@ impl ResourceGraph {
                 lifecycle: LifecycleState::Created,
                 storage,
                 backing_generation: BackingGeneration::new(1),
+                content: ContentState::default(),
                 parents,
                 children: BTreeSet::new(),
                 in_flight: BTreeSet::new(),
@@ -231,6 +375,10 @@ impl ResourceGraph {
 
     pub fn resource(&self, id: AnyResourceId) -> Option<&ResourceNode> {
         self.resources.get(&id)
+    }
+
+    pub fn resource_mut(&mut self, id: AnyResourceId) -> Option<&mut ResourceNode> {
+        self.resources.get_mut(&id)
     }
 
     pub fn create_storage(&mut self, backing: StorageBacking) -> Result<StorageId, GraphError> {
@@ -592,6 +740,56 @@ mod tests {
 
     fn object(value: u32) -> ObjectRef<ResourceObject> {
         ObjectRef::new(value)
+    }
+
+    #[test]
+    fn delayed_gpu_completion_cannot_overwrite_a_newer_guest_write() {
+        let mut content = ContentState::default();
+        let planned = content.gpu_store_planned(SubmissionId::new(4)).unwrap();
+        let guest = content.guest_wrote().unwrap();
+
+        assert!(guest > planned.version);
+        assert_eq!(
+            content.gpu_store_completed(SubmissionId::new(4)),
+            Ok(planned.version)
+        );
+        assert_eq!(content.current, guest);
+        assert!(content.current_in_guest());
+        assert!(!content.current_in_gpu());
+        assert_eq!(
+            content.copy_gpu_to_guest_completed(planned.version),
+            Err(ContentError::StaleSource)
+        );
+    }
+
+    #[test]
+    fn gpu_only_content_is_derived_from_replica_versions() {
+        let mut content = ContentState::default();
+        let planned = content.gpu_store_planned(SubmissionId::new(9)).unwrap();
+        content.gpu_store_completed(SubmissionId::new(9)).unwrap();
+
+        assert_eq!(content.current, planned.version);
+        assert!(content.current_in_gpu());
+        assert!(!content.current_in_guest());
+        content
+            .copy_gpu_to_guest_completed(planned.version)
+            .unwrap();
+        assert!(content.current_in_guest());
+    }
+
+    #[test]
+    fn replacing_the_only_current_replica_is_refused() {
+        let mut content = ContentState::default();
+        assert_eq!(
+            content.replace_guest_backing(),
+            Err(ContentError::WouldLoseCurrentContent)
+        );
+
+        let current = content.current;
+        content.copy_guest_to_gpu_completed(current).unwrap();
+        content.replace_guest_backing().unwrap();
+        assert!(!content.current_in_guest());
+        assert!(content.current_in_gpu());
     }
 
     #[test]

@@ -791,6 +791,10 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         return out;
     }
 
+    // Apply pre-submission validity before snapshotting expected content
+    // versions into the immutable executor envelope.
+    consume_resource_table(state, task_id, &resource_descs);
+
     #[cfg(feature = "backend-vulkan")]
     {
         let identity = SubmissionIdentity {
@@ -798,17 +802,29 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
             task: TaskId::new(task_id),
         };
         state.next_submission_id = state.next_submission_id.wrapping_add(1).max(1);
+        let resolved = state.task_resources.begin_submission(
+            task_id,
+            identity.id,
+            resource_descs
+                .iter()
+                .map(|desc| ObjectRef::<ResourceObject>::new(desc.object_id)),
+        );
         let resources: std::sync::Arc<[SubmissionResourceUse]> = resource_descs
             .iter()
-            .map(|desc| SubmissionResourceUse {
-                object: ObjectRef::<ResourceObject>::new(desc.object_id),
-                validity: ResourceValidity {
-                    clear_host: desc.ops.clear_host_valid != 0,
-                    set_host: desc.ops.set_host_valid != 0,
-                    clear_guest: desc.ops.clear_guest_valid != 0,
-                    set_guest: desc.ops.set_guest_valid != 0,
+            .zip(resolved)
+            .map(
+                |(desc, (object, resource, expected_content))| SubmissionResourceUse {
+                    object,
+                    resource,
+                    expected_content,
+                    validity: ResourceValidity {
+                        clear_host: desc.ops.clear_host_valid != 0,
+                        set_host: desc.ops.set_host_valid != 0,
+                        clear_guest: desc.ops.clear_guest_valid != 0,
+                        set_guest: desc.ops.set_guest_valid != 0,
+                    },
                 },
-            })
+            )
             .collect::<Vec<_>>()
             .into();
         state.active_submission = Some(crate::runtime::executor::SubmissionContext {
@@ -817,13 +833,6 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
             segment: None,
         });
     }
-
-    // Before any of this submission's work runs. Each record states what was
-    // true of its resource *before* the submission, so a pending window holding
-    // pixels the guest has since overwritten has to go now — landing it later
-    // would replace the guest's own bytes with a frame the guest has declared
-    // stale.
-    consume_resource_table(state, task_id, &resource_descs);
 
     let mut open_encoder = None;
     for stream in streams {
@@ -848,6 +857,12 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     }
     #[cfg(feature = "backend-vulkan")]
     {
+        if let Some(context) = state.active_submission.as_ref() {
+            state.task_resources.complete_submission(
+                context.identity.id,
+                context.resources.iter().filter_map(|use_| use_.resource),
+            );
+        }
         state.active_submission = None;
     }
     note_exec_header(exec_started, measured_ns);

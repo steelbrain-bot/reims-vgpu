@@ -7,6 +7,6 @@ pub mod resource;
 
 pub use namespace::{NamespaceError, ReferenceNamespace};
 pub use resource::{
-    GraphError, LifecycleState, MappingNode, ResourceGraph, ResourceNode, StorageBacking,
-    StorageNode,
+    ContentError, ContentState, GraphError, LifecycleState, MappingNode, PendingContentWrite,
+    ReplicaVersions, ResourceGraph, ResourceNode, StorageBacking, StorageNode,
 };
