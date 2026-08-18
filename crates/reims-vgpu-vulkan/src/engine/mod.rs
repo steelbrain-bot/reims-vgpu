@@ -114,6 +114,7 @@ struct SessionSignals {
     guest_read_debt: std::sync::atomic::AtomicBool,
     guest_write_debt: std::sync::atomic::AtomicBool,
     guest_write_pages: std::sync::Mutex<GuestWriteFootprint>,
+    stamp_completion: Arc<stamp_completion::SessionState>,
 }
 
 thread_local! {
@@ -195,6 +196,15 @@ fn current_session_signals() -> Arc<SessionSignals> {
         slot.replace(Some(Arc::clone(&signals)));
         signals
     })
+}
+
+/// Bind the active executor session's completion wakeup to its owning device.
+pub fn install_stamp_announce(hook: stamp_completion::AnnounceStamp) {
+    stamp_completion::install_announce(&current_session_signals().stamp_completion, hook);
+}
+
+pub fn completion_stamp_pending(index: u32) -> bool {
+    stamp_completion::fifo_has_pending_stamp(&current_session_signals().stamp_completion, index)
 }
 
 /// The colour aspect of a single-mip, single-layer image — the shape of every
@@ -1840,6 +1850,8 @@ pub fn write_completion_stamp(
     value: u32,
 ) -> Result<(), DrawError> {
     use host_ram::GuestWriteDecline;
+    let session = CURRENT_SESSION.get();
+    let stamp_signals = Arc::clone(&current_session_signals().stamp_completion);
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
@@ -1859,8 +1871,14 @@ pub fn write_completion_stamp(
         }));
     };
     let had_batch = pools.batch_open_recording().is_some();
-    let deferred =
-        had_batch && completion.queue_for_next_submission(index, guest_ref.clone(), value);
+    let deferred = had_batch
+        && completion.queue_for_next_submission(
+            session,
+            Arc::clone(&stamp_signals),
+            index,
+            guest_ref.clone(),
+            value,
+        );
     if !deferred {
         // A full pending ring cannot wait while this thread owns the open
         // command buffer: submitting it is what lets completions retire. This
@@ -1873,7 +1891,14 @@ pub fn write_completion_stamp(
             reims_vgpu_observe::Emit::decline("gpu_completion_stamp", &decline).fail();
             return Err(DrawError::GuestPageWrite(decline));
         };
-        completion.wait_for_stamp(timeline, index, guest_ref.clone(), value);
+        completion.wait_for_stamp(
+            session,
+            stamp_signals,
+            timeline,
+            index,
+            guest_ref.clone(),
+            value,
+        );
     }
     // The queued stamp now carries the ordering for every guest read recorded
     // before this submission. A later read records a fresh debt; retaining this
@@ -1907,7 +1932,10 @@ pub fn write_completion_stamp(
 pub fn submit_batch_for_waiting_stamp(index: u32) -> bool {
     // Lock-free, and false in the common case, so a held packet does not take
     // the engine lock merely to discover there is nothing parked for it.
-    if !stamp_completion::fifo_has_unsubmitted_stamp(index) {
+    if !stamp_completion::fifo_has_unsubmitted_stamp(
+        &current_session_signals().stamp_completion,
+        index,
+    ) {
         return false;
     }
     let mut guard = lock_engine();
@@ -1941,7 +1969,9 @@ pub fn submit_batch_for_waiting_stamp(index: u32) -> bool {
 /// Let every older completion on `index` publish before a CPU fallback writes
 /// a newer value into that FIFO's shared stamp slot.
 pub fn quiesce_completion_stamps(index: u32) {
-    if !stamp_completion::fifo_has_pending_stamp(index) {
+    let session = CURRENT_SESSION.get();
+    if !stamp_completion::fifo_has_pending_stamp(&current_session_signals().stamp_completion, index)
+    {
         return;
     }
     let guard = lock_engine();
@@ -1951,7 +1981,7 @@ pub fn quiesce_completion_stamps(index: u32) {
         .as_ref()
         .and_then(|ctx| ctx.stamp_completion.as_ref())
     {
-        completion.wait_for_fifo_idle(index);
+        completion.wait_for_fifo_idle(session, index);
     }
 }
 

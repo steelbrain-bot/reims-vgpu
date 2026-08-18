@@ -226,6 +226,16 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
     let child_doorbell_rung = Arc::clone(&dev.state.gfx.child_doorbell_rung);
     let intr_fault = Arc::clone(&dev.state.gfx.interrupt_fault);
     let fifo_read_live = Arc::clone(&dev.state.gfx.fifo_read);
+    // The completion thread's way back to the guest. Installed here rather than
+    // built into the engine because the engine must not know what a
+    // `BoundDevice` is, and looked up by id rather than captured by `Arc` so a
+    // stale hook cannot keep a torn-down device alive.
+    #[cfg(feature = "backend-vulkan")]
+    dev.state
+        .executor
+        .install_stamp_announce(std::sync::Arc::new(move |index: u32| {
+            announce_stamp_interrupt(id, index)
+        }));
     DEVICES.lock().insert(
         id,
         Arc::new(BoundDevice {
@@ -259,14 +269,6 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
             early_last_ns: AtomicU64::new(0),
         }),
     );
-    // The completion thread's way back to the guest. Installed here rather than
-    // built into the engine because the engine must not know what a
-    // `BoundDevice` is, and looked up by id rather than captured by `Arc` so a
-    // stale hook cannot keep a torn-down device alive.
-    #[cfg(feature = "backend-vulkan")]
-    crate::backend::vulkan::engine::stamp_completion::install_announce(std::sync::Arc::new(
-        move |index: u32| announce_stamp_interrupt(id, index),
-    ));
     Some(id)
 }
 

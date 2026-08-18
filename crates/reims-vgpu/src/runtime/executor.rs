@@ -41,6 +41,7 @@ pub type ResolvedSubmission =
 pub type ExecutionOutput = reims_vgpu_core::ExecutionOutput<DrawOutput, ComputeOutput>;
 pub type ExecutionCompletion = reims_vgpu_core::ExecutionCompletion<Box<[ExecutionOutput]>>;
 pub type ExecutionReceipt<T> = reims_vgpu_core::ExecutionReceipt<T>;
+pub type StampAnnounce = std::sync::Arc<dyn Fn(u32) + Send + Sync>;
 
 /// Compatibility port for transfers and synchronization involving guest RAM.
 ///
@@ -48,6 +49,8 @@ pub type ExecutionReceipt<T> = reims_vgpu_core::ExecutionReceipt<T>;
 /// execution, capability, presentation, and readback services cannot grow
 /// guest-memory policy through this boundary.
 pub trait GuestMemoryService: std::fmt::Debug + Send + Sync {
+    fn install_stamp_announce(&self, _hook: StampAnnounce) {}
+
     fn copy_target_to_guest_pages(
         &self,
         _identity: &TargetIdentity,
@@ -281,6 +284,11 @@ impl Drop for VulkanExecutor {
 }
 
 impl GuestMemoryService for VulkanExecutor {
+    fn install_stamp_announce(&self, hook: StampAnnounce) {
+        let _scope = crate::backend::vulkan::engine::enter_session(self.session);
+        crate::backend::vulkan::engine::install_stamp_announce(hook);
+    }
+
     fn copy_target_to_guest_pages(
         &self,
         identity: &TargetIdentity,
@@ -295,7 +303,7 @@ impl GuestMemoryService for VulkanExecutor {
     }
 
     fn completion_stamp_pending(&self, index: u32) -> bool {
-        crate::backend::vulkan::engine::stamp_completion::fifo_has_pending_stamp(index)
+        crate::backend::vulkan::engine::completion_stamp_pending(index)
     }
 
     fn submit_batch_for_waiting_stamp(&self, index: u32) -> bool {

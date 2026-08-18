@@ -62,23 +62,50 @@ use std::sync::{Arc, Condvar, Mutex};
 /// channel's completion capacity.
 const FIFO_PENDING_STAMP_CAPACITY: usize = 32;
 
-/// FIFOs with at least one completion whose word has not yet been published.
+/// One vGPU session's lock-free completion projections.
 ///
 /// The drain worker needs this before taking the engine lock: a CPU-only stamp
 /// still has to join the completion queue when an older stamp for the same FIFO
 /// is pending, or it can publish ahead and the older completion later moves the
-/// guest's fence backwards. There is one process-global engine and one
-/// completion worker, so this is the lock-free projection of that worker's
-/// per-FIFO counts.
-static PENDING_FIFO_MASK: AtomicU32 = AtomicU32::new(0);
+/// guest's fence backwards. The physical queue and completion worker are shared,
+/// but a guest FIFO belongs to exactly one vGPU session.
+#[derive(Default)]
+pub(super) struct SessionState {
+    pending_fifo_mask: AtomicU32,
+    unsubmitted_fifo_mask: AtomicU32,
+    announce: Mutex<Option<AnnounceStamp>>,
+}
+
+impl std::fmt::Debug for SessionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionState")
+            .field(
+                "pending_fifo_mask",
+                &self.pending_fifo_mask.load(Ordering::Relaxed),
+            )
+            .field(
+                "unsubmitted_fifo_mask",
+                &self.unsubmitted_fifo_mask.load(Ordering::Relaxed),
+            )
+            .field(
+                "announce_installed",
+                &self
+                    .announce
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_some(),
+            )
+            .finish()
+    }
+}
 
 const _: () = assert!(reims_vgpu_core::MAX_CHANNELS <= u32::BITS as usize);
 
-pub fn fifo_has_pending_stamp(index: u32) -> bool {
-    index < u32::BITS && PENDING_FIFO_MASK.load(Ordering::Acquire) & (1u32 << index) != 0
+pub(super) fn fifo_has_pending_stamp(state: &SessionState, index: u32) -> bool {
+    index < u32::BITS && state.pending_fifo_mask.load(Ordering::Acquire) & (1u32 << index) != 0
 }
 
-/// The subset of [`PENDING_FIFO_MASK`] whose completion point is a submission
+/// The subset of the session's pending mask whose completion point is a submission
 /// **this device has not made yet** — a stamp registered against the open
 /// batch's future point by [`Completion::queue_for_next_submission`].
 ///
@@ -90,11 +117,9 @@ pub fn fifo_has_pending_stamp(index: u32) -> bool {
 /// present runs, or the pending ring fills. So a timeline blocked on one is
 /// blocked until unrelated work happens to arrive, which on a quiet channel can
 /// be tens of milliseconds.
-static UNSUBMITTED_FIFO_MASK: AtomicU32 = AtomicU32::new(0);
-
 /// Whether FIFO `index` is owed a stamp that is parked on an unsubmitted batch.
-pub(crate) fn fifo_has_unsubmitted_stamp(index: u32) -> bool {
-    index < u32::BITS && UNSUBMITTED_FIFO_MASK.load(Ordering::Acquire) & (1u32 << index) != 0
+pub(super) fn fifo_has_unsubmitted_stamp(state: &SessionState, index: u32) -> bool {
+    index < u32::BITS && state.unsubmitted_fifo_mask.load(Ordering::Acquire) & (1u32 << index) != 0
 }
 
 /// Raise the guest-visible interrupt for a completed stamp slot.
@@ -104,18 +129,6 @@ pub(crate) fn fifo_has_unsubmitted_stamp(index: u32) -> bool {
 /// crate's held, so an implementation must not reach for the device lock.
 pub type AnnounceStamp = Arc<dyn Fn(u32) + Send + Sync>;
 
-/// The installed announcement hook.
-///
-/// A global rather than a constructor argument because the two events have no
-/// order between them: the device layer binds when QEMU realizes the device, and
-/// the engine builds its context lazily on the first draw. Whichever happens
-/// first, the thread reads the hook when it has something to announce.
-///
-/// **A stamp completing with no hook installed is a lost wakeup**, so it is
-/// fail-visible rather than silent — it means a submission reached the GPU
-/// before this device was bound, which nothing should be able to arrange.
-static HOOK: std::sync::Mutex<Option<AnnounceStamp>> = std::sync::Mutex::new(None);
-
 /// Install the hook the completion thread announces through. Idempotent; the
 /// last caller wins, which is what a device rebind wants.
 ///
@@ -124,25 +137,28 @@ static HOOK: std::sync::Mutex<Option<AnnounceStamp>> = std::sync::Mutex::new(Non
 /// device holds nothing and announces nothing — an uninstall would only be a
 /// second way to reach the same state, and a race against a completion already
 /// in flight.
-pub fn install_announce(hook: AnnounceStamp) {
-    *HOOK.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook);
+pub(super) fn install_announce(state: &SessionState, hook: AnnounceStamp) {
+    *state.announce.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook);
 }
 
-fn announce(index: u32) {
-    let hook = HOOK
+fn announce(waiting: &Waiting) {
+    let hook = waiting
+        .signals
+        .announce
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .map(Arc::clone);
     match hook {
         // Called with no lock of this module's held: the hook reaches the
-        // device's prompt queue, and holding `HOOK` across it would put this
-        // module's mutex under the device's.
-        Some(hook) => hook(index),
+        // device's prompt queue, and holding the session hook mutex across it
+        // would put this module's mutex under the device's.
+        Some(hook) => hook(waiting.index),
         None => reims_vgpu_observe::fail(format!(
-            "stamp_announce_no_hook reason=stamp_announce_no_hook index={index} \
+            "stamp_announce_no_hook reason=stamp_announce_no_hook index={} \
              (a stamp completed with no device bound to raise its interrupt; the guest \
-             waiting on it will sleep to its one-second deadline)"
+             waiting on it will sleep to its one-second deadline)",
+            waiting.index
         )),
     }
 }
@@ -150,6 +166,8 @@ fn announce(index: u32) {
 /// One stamp waiting for its queue point, in FIFO order.
 #[derive(Clone, Debug)]
 struct Waiting {
+    session: super::SessionId,
+    signals: Arc<SessionState>,
     /// The exact submission this completion belongs to, before or after that
     /// submission has reached `vkQueueSubmit`.
     point: CompletionPoint,
@@ -185,27 +203,36 @@ enum CompletionPoint {
 #[derive(Default)]
 struct PendingQueue {
     waiting: std::collections::VecDeque<Waiting>,
-    per_fifo: [usize; reims_vgpu_core::MAX_CHANNELS],
+    per_fifo: std::collections::HashMap<(super::SessionId, u32), usize>,
 }
 
 impl PendingQueue {
-    fn is_full(&self, index: usize) -> bool {
-        self.per_fifo[index] == FIFO_PENDING_STAMP_CAPACITY
+    fn is_full(&self, session: super::SessionId, index: u32) -> bool {
+        self.per_fifo.get(&(session, index)).copied().unwrap_or(0) == FIFO_PENDING_STAMP_CAPACITY
     }
 
     fn push(&mut self, waiting: Waiting) {
-        self.per_fifo[waiting.index as usize] += 1;
+        *self
+            .per_fifo
+            .entry((waiting.session, waiting.index))
+            .or_default() += 1;
         self.waiting.push_back(waiting);
     }
 
     fn pop_front(&mut self) -> Option<Waiting> {
         let waiting = self.waiting.pop_front()?;
-        self.per_fifo[waiting.index as usize] -= 1;
+        let key = (waiting.session, waiting.index);
+        if let Some(count) = self.per_fifo.get_mut(&key) {
+            *count -= 1;
+            if *count == 0 {
+                self.per_fifo.remove(&key);
+            }
+        }
         Some(waiting)
     }
 
-    fn has_pending(&self, index: usize) -> bool {
-        self.per_fifo[index] != 0
+    fn has_pending(&self, session: super::SessionId, index: u32) -> bool {
+        self.per_fifo.contains_key(&(session, index))
     }
 
     fn bind_submission(&mut self, timeline: u64) -> usize {
@@ -229,15 +256,22 @@ impl PendingQueue {
     /// counter stepped per promotion would clear the bit while one of those is
     /// still parked.
     fn republish_unsubmitted(&self) {
-        let mut mask = 0u32;
+        let mut masks: std::collections::HashMap<usize, (Arc<SessionState>, u32)> =
+            std::collections::HashMap::new();
         for waiting in &self.waiting {
+            let key = Arc::as_ptr(&waiting.signals) as usize;
+            let (_, mask) = masks
+                .entry(key)
+                .or_insert_with(|| (Arc::clone(&waiting.signals), 0));
             if matches!(waiting.point, CompletionPoint::NextSubmission(_))
                 && waiting.index < u32::BITS
             {
-                mask |= 1u32 << waiting.index;
+                *mask |= 1u32 << waiting.index;
             }
         }
-        UNSUBMITTED_FIFO_MASK.store(mask, Ordering::Release);
+        for (_, (signals, mask)) in masks {
+            signals.unsubmitted_fifo_mask.store(mask, Ordering::Release);
+        }
     }
 }
 
@@ -410,25 +444,25 @@ impl StampCompletion {
     }
 
     /// Retire one FIFO completion after `timeline` completes.
-    pub(crate) fn wait_for_stamp(
+    pub(super) fn wait_for_stamp(
         &self,
+        session: super::SessionId,
+        signals: Arc<SessionState>,
         timeline: u64,
         index: u32,
         word: reims_vgpu_memory::GuestRef,
         stamp: u32,
     ) {
-        let Some(slot) =
-            ((index as usize) < reims_vgpu_core::MAX_CHANNELS).then_some(index as usize)
-        else {
+        if index as usize >= reims_vgpu_core::MAX_CHANNELS {
             reims_vgpu_observe::fail(format!(
                 "stamp_fifo_out_of_range reason=stamp_fifo_out_of_range index={index} \
                  max_channels={}",
                 reims_vgpu_core::MAX_CHANNELS
             ));
             return;
-        };
+        }
         let mut queue = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
-        while queue.is_full(slot) && !self.shared.stop.load(Ordering::Acquire) {
+        while queue.is_full(session, index) && !self.shared.stop.load(Ordering::Acquire) {
             queue = self
                 .shared
                 .wake
@@ -439,6 +473,8 @@ impl StampCompletion {
             return;
         }
         queue.push(Waiting {
+            session,
+            signals: Arc::clone(&signals),
             point: CompletionPoint::Submitted(timeline),
             index,
             word,
@@ -446,7 +482,9 @@ impl StampCompletion {
 
             queued_at: std::time::Instant::now(),
         });
-        PENDING_FIFO_MASK.fetch_or(1u32 << index, Ordering::Release);
+        signals
+            .pending_fifo_mask
+            .fetch_or(1u32 << index, Ordering::Release);
         drop(queue);
         self.shared.wake.notify_one();
     }
@@ -457,24 +495,24 @@ impl StampCompletion {
     /// pending ring is full. The caller owns the open command buffer, so
     /// sleeping there would prevent the very submission that can make room;
     /// it must submit the batch and retry against that concrete point.
-    pub(crate) fn queue_for_next_submission(
+    pub(super) fn queue_for_next_submission(
         &self,
+        session: super::SessionId,
+        signals: Arc<SessionState>,
         index: u32,
         word: reims_vgpu_memory::GuestRef,
         stamp: u32,
     ) -> bool {
-        let Some(slot) =
-            ((index as usize) < reims_vgpu_core::MAX_CHANNELS).then_some(index as usize)
-        else {
+        if index as usize >= reims_vgpu_core::MAX_CHANNELS {
             reims_vgpu_observe::fail(format!(
                 "stamp_fifo_out_of_range reason=stamp_fifo_out_of_range index={index} \
                  max_channels={}",
                 reims_vgpu_core::MAX_CHANNELS
             ));
             return false;
-        };
+        }
         let mut queue = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
-        if queue.is_full(slot) || self.shared.stop.load(Ordering::Acquire) {
+        if queue.is_full(session, index) || self.shared.stop.load(Ordering::Acquire) {
             return false;
         }
         // The engine lock serializes this read with reservation. No other
@@ -482,6 +520,8 @@ impl StampCompletion {
         // flushing its open batch, so this is the batch's exact future point.
         let target = self.shared.next_submission();
         queue.push(Waiting {
+            session,
+            signals: Arc::clone(&signals),
             point: CompletionPoint::NextSubmission(target),
             index,
             word,
@@ -489,8 +529,12 @@ impl StampCompletion {
 
             queued_at: std::time::Instant::now(),
         });
-        PENDING_FIFO_MASK.fetch_or(1u32 << index, Ordering::Release);
-        UNSUBMITTED_FIFO_MASK.fetch_or(1u32 << index, Ordering::Release);
+        signals
+            .pending_fifo_mask
+            .fetch_or(1u32 << index, Ordering::Release);
+        signals
+            .unsubmitted_fifo_mask
+            .fetch_or(1u32 << index, Ordering::Release);
         drop(queue);
         self.shared.wake.notify_one();
         true
@@ -502,14 +546,12 @@ impl StampCompletion {
     /// already be settled while its completion worker has not yet stored the
     /// older word; waiting on the GPU alone would still permit that older store
     /// to land after the fallback and move the guest's fence backwards.
-    pub(crate) fn wait_for_fifo_idle(&self, index: u32) {
-        let Some(slot) =
-            ((index as usize) < reims_vgpu_core::MAX_CHANNELS).then_some(index as usize)
-        else {
+    pub(crate) fn wait_for_fifo_idle(&self, session: super::SessionId, index: u32) {
+        if index as usize >= reims_vgpu_core::MAX_CHANNELS {
             return;
-        };
+        }
         let mut queue = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
-        while queue.has_pending(slot) && !self.shared.stop.load(Ordering::Acquire) {
+        while queue.has_pending(session, index) && !self.shared.stop.load(Ordering::Acquire) {
             queue = self
                 .shared
                 .wake
@@ -542,8 +584,18 @@ impl StampCompletion {
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
-        PENDING_FIFO_MASK.store(0, Ordering::Release);
-        UNSUBMITTED_FIFO_MASK.store(0, Ordering::Release);
+        let queue = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+        for waiting in &queue.waiting {
+            waiting
+                .signals
+                .pending_fifo_mask
+                .store(0, Ordering::Release);
+            waiting
+                .signals
+                .unsubmitted_fifo_mask
+                .store(0, Ordering::Release);
+        }
+        drop(queue);
         unsafe { device.destroy_semaphore(self.semaphore, None) };
     }
 }
@@ -669,13 +721,15 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
         {
             let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
             queue.pop_front();
-            let slot = waiting.index as usize;
-            if !queue.has_pending(slot) {
-                PENDING_FIFO_MASK.fetch_and(!(1u32 << waiting.index), Ordering::Release);
+            if !queue.has_pending(waiting.session, waiting.index) {
+                waiting
+                    .signals
+                    .pending_fifo_mask
+                    .fetch_and(!(1u32 << waiting.index), Ordering::Release);
             }
         }
         shared.wake.notify_all();
-        announce(waiting.index);
+        announce(&waiting);
     }
 }
 
@@ -737,6 +791,7 @@ fn note_publish_latency(elapsed: std::time::Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::SessionId;
 
     fn waiting(index: u32, stamp: u32) -> Waiting {
         let mut word = Box::new(0u32);
@@ -753,6 +808,8 @@ mod tests {
         Box::leak(word);
         let slice = import.slice(0, 4).expect("stamp word");
         Waiting {
+            session: SessionId(1),
+            signals: Arc::new(SessionState::default()),
             point: CompletionPoint::Submitted(u64::from(stamp) + 1),
             index,
             word: reims_vgpu_memory::GuestRef::new(import, slice).expect("guest word"),
@@ -794,19 +851,76 @@ mod tests {
         for stamp in 0..FIFO_PENDING_STAMP_CAPACITY as u32 {
             queue.push(waiting(0, stamp));
         }
-        assert!(queue.is_full(0));
-        assert!(!queue.is_full(1));
+        let session = SessionId(1);
+        assert!(queue.is_full(session, 0));
+        assert!(!queue.is_full(session, 1));
         queue.push(waiting(1, 0xfeed));
 
         for stamp in 0..FIFO_PENDING_STAMP_CAPACITY as u32 {
             let entry = queue.pop_front().expect("root completion");
             assert_eq!((entry.index, entry.stamp), (0, stamp));
         }
-        assert!(!queue.has_pending(0));
-        assert!(queue.has_pending(1));
+        assert!(!queue.has_pending(session, 0));
+        assert!(queue.has_pending(session, 1));
         let child = queue.pop_front().expect("child completion");
         assert_eq!((child.index, child.stamp), (1, 0xfeed));
-        assert!(!queue.has_pending(1));
+        assert!(!queue.has_pending(session, 1));
+    }
+
+    #[test]
+    fn identical_fifo_ordinals_in_two_sessions_have_independent_pressure_and_projection() {
+        let first = SessionId(1);
+        let second = SessionId(2);
+        let first_signals = Arc::new(SessionState::default());
+        let second_signals = Arc::new(SessionState::default());
+        let mut queue = PendingQueue::default();
+        for stamp in 0..FIFO_PENDING_STAMP_CAPACITY as u32 {
+            let mut entry = deferred(0, stamp, 7);
+            entry.session = first;
+            entry.signals = Arc::clone(&first_signals);
+            queue.push(entry);
+        }
+        let mut other = deferred(0, 0xfeed, 9);
+        other.session = second;
+        other.signals = Arc::clone(&second_signals);
+        queue.push(other);
+        queue.republish_unsubmitted();
+
+        assert!(queue.is_full(first, 0));
+        assert!(!queue.is_full(second, 0));
+        assert!(fifo_has_unsubmitted_stamp(&first_signals, 0));
+        assert!(fifo_has_unsubmitted_stamp(&second_signals, 0));
+
+        assert_eq!(queue.bind_submission(7), FIFO_PENDING_STAMP_CAPACITY);
+        assert!(!fifo_has_unsubmitted_stamp(&first_signals, 0));
+        assert!(fifo_has_unsubmitted_stamp(&second_signals, 0));
+    }
+
+    #[test]
+    fn a_completion_announces_only_through_its_own_session_hook() {
+        let first_count = Arc::new(AtomicU32::new(0));
+        let second_count = Arc::new(AtomicU32::new(0));
+        let first_signals = Arc::new(SessionState::default());
+        let second_signals = Arc::new(SessionState::default());
+        install_announce(&first_signals, {
+            let count = Arc::clone(&first_count);
+            Arc::new(move |_| {
+                count.fetch_add(1, Ordering::Relaxed);
+            })
+        });
+        install_announce(&second_signals, {
+            let count = Arc::clone(&second_count);
+            Arc::new(move |_| {
+                count.fetch_add(1, Ordering::Relaxed);
+            })
+        });
+        let mut completed = waiting(0, 1);
+        completed.signals = first_signals;
+
+        announce(&completed);
+
+        assert_eq!(first_count.load(Ordering::Relaxed), 1);
+        assert_eq!(second_count.load(Ordering::Relaxed), 0);
     }
 
     /// The unsubmitted projection clears only when a FIFO has no stamp left on
@@ -820,39 +934,40 @@ mod tests {
     #[test]
     fn the_unsubmitted_projection_survives_a_partial_bind() {
         let mut queue = PendingQueue::default();
-        UNSUBMITTED_FIFO_MASK.store(0, Ordering::Release);
 
         // Two batches' worth of stamps on one FIFO, plus a sibling's.
         let mut early = waiting(1, 0x10);
+        let signals = Arc::clone(&early.signals);
         early.point = CompletionPoint::NextSubmission(7);
         let mut late = waiting(1, 0x11);
+        late.signals = Arc::clone(&signals);
         late.point = CompletionPoint::NextSubmission(9);
         let mut other = waiting(2, 0x20);
+        other.signals = Arc::clone(&signals);
         other.point = CompletionPoint::NextSubmission(9);
         queue.push(early);
         queue.push(late);
         queue.push(other);
         queue.republish_unsubmitted();
-        assert!(fifo_has_unsubmitted_stamp(1));
-        assert!(fifo_has_unsubmitted_stamp(2));
+        assert!(fifo_has_unsubmitted_stamp(&signals, 1));
+        assert!(fifo_has_unsubmitted_stamp(&signals, 2));
 
         // Submitting batch 7 binds only the early one.
         assert_eq!(queue.bind_submission(7), 1);
         assert!(
-            fifo_has_unsubmitted_stamp(1),
+            fifo_has_unsubmitted_stamp(&signals, 1),
             "FIFO 1 still has a stamp on batch 9, so its batch must still be \
              submittable on demand"
         );
-        assert!(fifo_has_unsubmitted_stamp(2));
+        assert!(fifo_has_unsubmitted_stamp(&signals, 2));
 
         // Submitting batch 9 binds the rest, and both bits clear.
         assert_eq!(queue.bind_submission(9), 2);
         assert!(
-            !fifo_has_unsubmitted_stamp(1),
+            !fifo_has_unsubmitted_stamp(&signals, 1),
             "with everything in flight there is nothing left to submit early"
         );
-        assert!(!fifo_has_unsubmitted_stamp(2));
-        UNSUBMITTED_FIFO_MASK.store(0, Ordering::Release);
+        assert!(!fifo_has_unsubmitted_stamp(&signals, 2));
     }
 
     /// Reservation order is submission order; reserving alone does not publish
@@ -919,6 +1034,8 @@ mod tests {
         let slice = import.slice(4, 4).expect("second word");
         let word = reims_vgpu_memory::GuestRef::new(import, slice).expect("guest word");
         let waiting = Waiting {
+            session: SessionId(1),
+            signals: Arc::new(SessionState::default()),
             point: CompletionPoint::Submitted(7),
             index: 2,
             word,
@@ -1075,7 +1192,7 @@ mod tests {
                 owners.push(Some(batch));
             }
         }
-        let fifo_levels = queue.per_fifo;
+        let fifo_levels = queue.per_fifo.clone();
 
         for submitted in 1..=BATCHES {
             assert_eq!(
