@@ -138,23 +138,8 @@ pub trait SessionService: std::fmt::Debug + Send + Sync {
     }
 }
 
-/// Backend execution contract implemented per device.
-pub trait Executor:
-    ExecutionPort<
-        Submission = ResolvedSubmission,
-        Completion = ExecutionCompletion,
-        Error = DrawError,
-    > + ResidentService
-    + GuestWriteService
-    + ComputeResidencyService
-    + CapabilityService
-    + PresentationService
-    + ReadbackService<Error = DrawError>
-    + GuestMemoryService
-    + MaintenanceService
-    + SessionService
-{
-    /// Observation-only snapshots. Semantic planning must never read these.
+/// Observation-only backend snapshots. Semantic planning must never read this port.
+pub trait ObservationService: std::fmt::Debug + Send + Sync {
     fn sampled_working_set_census(&self) -> Option<String> {
         None
     }
@@ -182,6 +167,25 @@ pub trait Executor:
     fn take_engine_lock_census(&self, _win_ms: u64) -> Option<String> {
         None
     }
+}
+
+/// Backend execution contract implemented per device.
+pub trait Executor:
+    ExecutionPort<
+        Submission = ResolvedSubmission,
+        Completion = ExecutionCompletion,
+        Error = DrawError,
+    > + ResidentService
+    + GuestWriteService
+    + ComputeResidencyService
+    + CapabilityService
+    + PresentationService
+    + ReadbackService<Error = DrawError>
+    + GuestMemoryService
+    + MaintenanceService
+    + SessionService
+    + ObservationService
+{
 }
 
 /// Compatibility adapter over the current Vulkan engine facade.
@@ -255,7 +259,7 @@ impl GuestMemoryService for VulkanExecutor {
     }
 }
 
-impl Executor for VulkanExecutor {
+impl ObservationService for VulkanExecutor {
     fn sampled_working_set_census(&self) -> Option<String> {
         crate::backend::vulkan::engine::sampled_working_set_census()
     }
@@ -284,6 +288,8 @@ impl Executor for VulkanExecutor {
         crate::backend::vulkan::engine::take_engine_lock_census(win_ms)
     }
 }
+
+impl Executor for VulkanExecutor {}
 
 impl MaintenanceService for VulkanExecutor {
     fn flush_batched_draws(&self) {
@@ -666,6 +672,7 @@ mod tests {
     impl PresentationService for ScriptedExecutor {}
     impl GuestMemoryService for ScriptedExecutor {}
     impl MaintenanceService for ScriptedExecutor {}
+    impl ObservationService for ScriptedExecutor {}
 
     impl ReadbackService for ScriptedExecutor {
         type Error = DrawError;
@@ -900,6 +907,7 @@ mod tests {
     impl PresentationService for WrongIdentityExecutor {}
     impl GuestMemoryService for WrongIdentityExecutor {}
     impl MaintenanceService for WrongIdentityExecutor {}
+    impl ObservationService for WrongIdentityExecutor {}
     impl SessionService for WrongIdentityExecutor {}
     impl ReadbackService for WrongIdentityExecutor {
         type Error = DrawError;
