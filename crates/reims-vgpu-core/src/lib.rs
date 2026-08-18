@@ -14,7 +14,7 @@ pub mod submission;
 pub mod target;
 
 pub use blit::{BufferFillPattern, ResolvedBufferBlit, ResolvedBufferRange};
-pub use capabilities::{CapabilityService, DeviceInfoLimits, ExecutorCapabilities};
+pub use capabilities::{CapabilityService, DeviceInfoLimits, ExecutorCapabilities, MAX_CHANNELS};
 pub use execution::{
     ExecutionCompletion, ExecutionKind, ExecutionOutput, ExecutionPort, ExecutionReceipt,
     ResolvedSubmission,

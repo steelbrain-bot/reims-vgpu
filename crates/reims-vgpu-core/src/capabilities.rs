@@ -2,6 +2,10 @@
 
 use reims_vgpu_protocol::TexelLayout;
 
+/// Maximum number of FIFO channels represented by the device's `u32` masks.
+pub const MAX_CHANNELS: usize = 32;
+const _: () = assert!(MAX_CHANNELS <= u32::BITS as usize);
+
 /// Host limits used to reduce the device-info values advertised to the guest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceInfoLimits {

@@ -72,7 +72,7 @@ const FIFO_PENDING_STAMP_CAPACITY: usize = 32;
 /// per-FIFO counts.
 static PENDING_FIFO_MASK: AtomicU32 = AtomicU32::new(0);
 
-const _: () = assert!(crate::model::MAX_CHANNELS <= u32::BITS as usize);
+const _: () = assert!(reims_vgpu_core::MAX_CHANNELS <= u32::BITS as usize);
 
 pub(crate) fn fifo_has_pending_stamp(index: u32) -> bool {
     index < u32::BITS && PENDING_FIFO_MASK.load(Ordering::Acquire) & (1u32 << index) != 0
@@ -185,7 +185,7 @@ enum CompletionPoint {
 #[derive(Default)]
 struct PendingQueue {
     waiting: std::collections::VecDeque<Waiting>,
-    per_fifo: [usize; crate::model::MAX_CHANNELS],
+    per_fifo: [usize; reims_vgpu_core::MAX_CHANNELS],
 }
 
 impl PendingQueue {
@@ -417,12 +417,13 @@ impl StampCompletion {
         word: crate::runtime::guest_ram::GuestRef,
         stamp: u32,
     ) {
-        let Some(slot) = ((index as usize) < crate::model::MAX_CHANNELS).then_some(index as usize)
+        let Some(slot) =
+            ((index as usize) < reims_vgpu_core::MAX_CHANNELS).then_some(index as usize)
         else {
             crate::observe::fail(format!(
                 "stamp_fifo_out_of_range reason=stamp_fifo_out_of_range index={index} \
                  max_channels={}",
-                crate::model::MAX_CHANNELS
+                reims_vgpu_core::MAX_CHANNELS
             ));
             return;
         };
@@ -462,12 +463,13 @@ impl StampCompletion {
         word: crate::runtime::guest_ram::GuestRef,
         stamp: u32,
     ) -> bool {
-        let Some(slot) = ((index as usize) < crate::model::MAX_CHANNELS).then_some(index as usize)
+        let Some(slot) =
+            ((index as usize) < reims_vgpu_core::MAX_CHANNELS).then_some(index as usize)
         else {
             crate::observe::fail(format!(
                 "stamp_fifo_out_of_range reason=stamp_fifo_out_of_range index={index} \
                  max_channels={}",
-                crate::model::MAX_CHANNELS
+                reims_vgpu_core::MAX_CHANNELS
             ));
             return false;
         };
@@ -501,7 +503,8 @@ impl StampCompletion {
     /// older word; waiting on the GPU alone would still permit that older store
     /// to land after the fallback and move the guest's fence backwards.
     pub(crate) fn wait_for_fifo_idle(&self, index: u32) {
-        let Some(slot) = ((index as usize) < crate::model::MAX_CHANNELS).then_some(index as usize)
+        let Some(slot) =
+            ((index as usize) < reims_vgpu_core::MAX_CHANNELS).then_some(index as usize)
         else {
             return;
         };

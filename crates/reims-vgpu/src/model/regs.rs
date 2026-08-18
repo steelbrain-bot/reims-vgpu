@@ -117,7 +117,7 @@ pub const EFI_BUILTIN_CONNECTED: u32 = 1;
 /// root page, which has room for `(page_size - CHILD_REG_BLOCK_OFFSET) /
 /// CHILD_REG_BLOCK_STRIDE` blocks — 153 on a 4 KiB page — and which the guest
 /// indexes with no bound check of its own.
-pub const MAX_CHANNELS: usize = 32;
+pub use reims_vgpu_core::MAX_CHANNELS;
 
 /// `active_child_mask`, `pending.child_mask` and `child_doorbell_rung` are each
 /// a `u32` carrying one bit per channel, and every producer reaches them with a
@@ -126,7 +126,6 @@ pub const MAX_CHANNELS: usize = 32;
 /// those shifts overflow, which Rust panics on in debug and wraps in release.
 /// The masks would have to widen with the constant, so this refuses the change
 /// at the constant rather than at the four shift sites.
-const _: () = assert!(MAX_CHANNELS <= u32::BITS as usize);
 
 /// Whether `channel_id` names a child channel this device has.
 ///
