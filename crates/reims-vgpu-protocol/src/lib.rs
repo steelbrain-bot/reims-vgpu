@@ -28,8 +28,8 @@ pub use identity::{
     TaskId,
 };
 pub use pixel::{
-    apply_swizzle_rgba8, swizzle_identity, swizzle_is_identity, swizzle_plan, StorageImageFormat,
-    SwizzlePlan, SwizzleSource, TexelLayout,
+    apply_swizzle_rgba8, swizzle_identity, swizzle_is_identity, swizzle_plan, ImageFormat,
+    StorageImageFormat, SwizzlePlan, SwizzleSource, TexelLayout, TransferFunction,
 };
 pub use resource::{
     decode_object_list_entry, ColorWriteMask, ComputePipelineObject, DepthStencilObject,

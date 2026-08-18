@@ -26,16 +26,12 @@ use reims_vgpu_core::pixel_format::{
     self, SampledByteFormat, StorageImageSelector, SwizzlePlan, SwizzleSource, TexelLayout,
     COMPONENT_A, COMPONENT_B, COMPONENT_G, COMPONENT_R,
 };
-use reims_vgpu_protocol::StorageImageFormat;
+use reims_vgpu_protocol::{ImageFormat, StorageImageFormat};
+
+pub use reims_vgpu_protocol::TransferFunction;
 
 /// Whether a format's stored values carry the sRGB electro-optical transfer
 /// function, which the hardware applies on sample and reverses on write.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TransferFunction {
-    Linear,
-    Srgb,
-}
-
 /// One decoded Metal pixel format, expressed in Vulkan terms.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PixelFormat {
@@ -266,7 +262,7 @@ pub fn sampled_pixels(
     Ok((layout, srgb_decline(&f, mtl), f.components))
 }
 
-pub use crate::format::{srgb_texel_layout, vk_texel_layout};
+pub use crate::format::{srgb_texel_layout, vk_image_format, vk_texel_layout};
 
 /// The Vulkan format for bytes a CPU loader produced.
 ///
@@ -486,9 +482,9 @@ pub fn has_bgra_order(format: vk::Format) -> bool {
 /// Every Vulkan format a colour attachment may take, and the decline for a
 /// format the rail does not render to.
 ///
-/// The result is the resolved [`vk::Format`] rather than an engine enum, so an
-/// sRGB target reaches an sRGB attachment and gets Vulkan's fixed-function
-/// linear-to-sRGB conversion on writes.
+/// The result is a semantic [`ImageFormat`], so an sRGB target retains its
+/// transfer function without exposing the backend's native format vocabulary
+/// to the resolved draw request. Vulkan converts it once at execution.
 ///
 /// The narrowing is deliberate and stays. Metal renders to far more formats
 /// than this device carries; admitting one the rest of the pass machinery has
@@ -508,12 +504,15 @@ pub fn has_bgra_order(format: vk::Format) -> bool {
 /// commit can half-land.
 pub fn color_attachment(
     mtl: u16,
-) -> Result<(vk::Format, Option<TranslateReason>), TranslateReason> {
+) -> Result<(ImageFormat, Option<TranslateReason>), TranslateReason> {
     let f = translate(mtl)?;
     if pixel_format::render_target_bpp(mtl).is_none() {
         return Err(TranslateReason::NoColorAttachmentFormat(mtl));
     }
-    Ok((f.vk, None))
+    let layout = texel_layout_of(f.vk).ok_or(TranslateReason::NoColorAttachmentFormat(mtl))?;
+    let format = ImageFormat::with_transfer(layout, f.transfer)
+        .ok_or(TranslateReason::NoColorAttachmentFormat(mtl))?;
+    Ok((format, None))
 }
 
 /// The host texel a guest format's own bytes already are, and how wide it is —
@@ -1490,10 +1489,7 @@ mod tests {
             );
 
             let (format, decline) = color_attachment(mtl).unwrap();
-            assert!(matches!(
-                format,
-                vk::Format::R8G8B8A8_SRGB | vk::Format::B8G8R8A8_SRGB
-            ));
+            assert!(format.is_srgb());
             assert_eq!(decline, None, "colour attachment must preserve sRGB");
         }
         // The converse: a linear format must never produce the decline, or the
@@ -1679,7 +1675,8 @@ mod tests {
             let Ok((attachment, _)) = color_attachment(mtl) else {
                 continue;
             };
-            let allocation = ResidentFormat::of(attachment).allocation();
+            let allocation =
+                ResidentFormat::of(crate::format::vk_image_format(attachment)).allocation();
             assert!(
                 texel_layout_of(allocation).is_some(),
                 "renderable {mtl:#x} allocates as {allocation:?}, which no \
@@ -1737,11 +1734,11 @@ mod tests {
         );
         assert_eq!(
             color_attachment(p::MTL_FORMAT_BGRA8_UNORM_SRGB).unwrap().0,
-            vk::Format::B8G8R8A8_SRGB
+            ImageFormat::srgb(TexelLayout::Bgra8).unwrap()
         );
         assert_eq!(
             color_attachment(p::MTL_FORMAT_RGBA8_UNORM_SRGB).unwrap().0,
-            vk::Format::R8G8B8A8_SRGB
+            ImageFormat::srgb(TexelLayout::Rgba8).unwrap()
         );
         // …and each one hands back the decline that loss owes, so the hold is
         // measured rather than assumed.

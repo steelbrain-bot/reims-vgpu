@@ -3611,7 +3611,7 @@ fn mrt_secondary_attachment_becomes_sampleable_resident() {
         identity: secondary.clone(),
         width: 16,
         height: 16,
-        format: ash::vk::Format::R8G8B8A8_UNORM,
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
         clear: [0.0, 0.0, 1.0, 1.0],
         load: false,
         // Unblended: this parity case checks the attachment is written at
@@ -3704,7 +3704,9 @@ fn mrt_rg16float_secondary_builds_and_renders() {
         identity: mask.clone(),
         width: 32,
         height: 32,
-        format: ash::vk::Format::R16G16_SFLOAT,
+        format: reims_vgpu_protocol::ImageFormat::linear(
+            reims_vgpu_protocol::TexelLayout::Rg16Float,
+        ),
         clear: [1.0, 0.5, 0.0, 0.0],
         load: false,
         // Unblended: this is the vibrancy coverage-mask shape, and a mask is a
@@ -3771,7 +3773,9 @@ fn depth_and_mrt_secondary_render_in_one_pass() {
             identity: secondary.clone(),
             width: w,
             height: h,
-            format: ash::vk::Format::R8G8B8A8_UNORM,
+            format: reims_vgpu_protocol::ImageFormat::linear(
+                reims_vgpu_protocol::TexelLayout::Rgba8,
+            ),
             clear: [0.0, 0.0, 1.0, 1.0],
             load: false,
             blend: None,

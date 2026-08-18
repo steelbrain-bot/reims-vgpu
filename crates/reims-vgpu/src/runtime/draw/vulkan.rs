@@ -5360,7 +5360,14 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
         // Without one this attachment is keyed on `(gva, width, height)` alone
         // and two guest allocations reusing that address at that geometry share
         // one GPU image — the wrong-content class `74748d2` closed for color0.
-        let Some(identity) = color_target_identity(state, host, task_id, c, format, None) else {
+        let Some(identity) = color_target_identity(
+            state,
+            host,
+            task_id,
+            c,
+            translate::pixel::vk_image_format(format),
+            None,
+        ) else {
             crate::runtime::census::present_proxy::note_secondary_mrt_drop(
                 crate::runtime::census::present_proxy::MrtDrop::NoIdentity,
                 c.width,
@@ -6294,6 +6301,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 )
                             })?
                             .0;
+                        let native_format = translate::pixel::vk_image_format(format);
                         let identity = if req
                             .colors
                             .first()
@@ -6301,7 +6309,14 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         {
                             render_chain_identity(state, req)
                         } else {
-                            color_target_identity(state, host, req.task_id, color, format, None)
+                            color_target_identity(
+                                state,
+                                host,
+                                req.task_id,
+                                color,
+                                native_format,
+                                None,
+                            )
                         }
                         .ok_or(DrawError::DrawPreparation(
                             DrawPreparationDecline::AttachmentAliasIdentityMissing {
@@ -6309,7 +6324,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 texture_ref,
                             },
                         ))?;
-                        (aw, ah, attachment_alias_source(identity, format, alias))
+                        (
+                            aw,
+                            ah,
+                            attachment_alias_source(identity, native_format, alias),
+                        )
                     } else {
                         drop(alias_span);
                         let _s = crate::runtime::sampled_phase::Span::open(
@@ -8515,7 +8534,7 @@ pub(crate) fn gva_resident_format(
     let Ok((attachment, _)) = pixel::color_attachment(format) else {
         return crate::contract::pixel_format::TexelLayout::Rgba8;
     };
-    let allocation = pixel::ResidentFormat::of(attachment).allocation();
+    let allocation = pixel::ResidentFormat::of(pixel::vk_image_format(attachment)).allocation();
     match pixel::texel_layout_of(allocation) {
         // Capability, never an API-version assumption: the host is asked whether
         // it renders to and blends this layout.

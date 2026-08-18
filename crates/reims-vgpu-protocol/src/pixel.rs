@@ -37,6 +37,60 @@ pub enum TexelLayout {
     Rg11b10Float,
 }
 
+/// Fixed-function interpretation applied when an image is sampled or written.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum TransferFunction {
+    #[default]
+    Linear,
+    Srgb,
+}
+
+/// Backend-independent image-view format.
+///
+/// Stored bytes and their fixed-function transfer are distinct: linear and
+/// sRGB views may name the same allocation without naming the same rendering
+/// operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ImageFormat {
+    layout: TexelLayout,
+    transfer: TransferFunction,
+}
+
+impl ImageFormat {
+    pub const fn linear(layout: TexelLayout) -> Self {
+        Self {
+            layout,
+            transfer: TransferFunction::Linear,
+        }
+    }
+
+    pub fn srgb(layout: TexelLayout) -> Option<Self> {
+        layout.has_srgb_encoding().then_some(Self {
+            layout,
+            transfer: TransferFunction::Srgb,
+        })
+    }
+
+    pub fn with_transfer(layout: TexelLayout, transfer: TransferFunction) -> Option<Self> {
+        match transfer {
+            TransferFunction::Linear => Some(Self::linear(layout)),
+            TransferFunction::Srgb => Self::srgb(layout),
+        }
+    }
+
+    pub const fn layout(self) -> TexelLayout {
+        self.layout
+    }
+
+    pub const fn transfer(self) -> TransferFunction {
+        self.transfer
+    }
+
+    pub const fn is_srgb(self) -> bool {
+        matches!(self.transfer, TransferFunction::Srgb)
+    }
+}
+
 /// Source selected for one output channel of a texture view.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -272,8 +326,8 @@ impl TexelLayout {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_swizzle_rgba8, swizzle_identity, swizzle_plan, StorageImageFormat, SwizzlePlan,
-        TexelLayout,
+        apply_swizzle_rgba8, swizzle_identity, swizzle_plan, ImageFormat, StorageImageFormat,
+        SwizzlePlan, TexelLayout,
     };
 
     #[test]
@@ -301,6 +355,17 @@ mod tests {
         assert_eq!(StorageImageFormat::Rgba8Uint.bytes_per_texel(), 4);
         assert_eq!(StorageImageFormat::Rgba16Float.bytes_per_texel(), 8);
         assert_eq!(StorageImageFormat::Rgba32Float.bytes_per_texel(), 16);
+    }
+
+    #[test]
+    fn image_views_keep_storage_and_transfer_as_separate_semantic_facts() {
+        let linear = ImageFormat::linear(TexelLayout::Bgra8);
+        let srgb = ImageFormat::srgb(TexelLayout::Bgra8).unwrap();
+
+        assert_eq!(linear.layout(), srgb.layout());
+        assert_ne!(linear.transfer(), srgb.transfer());
+        assert!(srgb.is_srgb());
+        assert!(ImageFormat::srgb(TexelLayout::R16Float).is_none());
     }
 
     #[test]

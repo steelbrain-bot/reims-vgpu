@@ -431,7 +431,7 @@ pub struct DrawRequest {
     /// another allocation. Metal texture views over one surface commonly use
     /// the linear and sRGB members of one format-compatibility class; Vulkan
     /// represents that distinction on the image view and render pass.
-    pub color_attachment_format: Option<vk::Format>,
+    pub color_attachment_format: Option<reims_vgpu_protocol::ImageFormat>,
     /// Load the live GPU image for [`DrawRequest::target_identity`] instead of
     /// seeding the attachment from the CPU. Requires that resident to exist.
     ///
@@ -644,12 +644,10 @@ pub struct SecondaryColorTarget {
     pub identity: TargetIdentity,
     pub width: u32,
     pub height: u32,
-    /// Attachment format, already resolved from the guest's `MTLPixelFormat` by
-    /// `translate::pixel::color_attachment`. A real `VkFormat` rather than a
-    /// three-way enum, so the render pass, the pipeline key and the image agree
-    /// by construction and an sRGB attachment is expressible the day the rail
-    /// flips.
-    pub format: vk::Format,
+    /// Attachment format, already resolved from the guest's declaration into
+    /// backend-independent storage and transfer facts. The executor converts it
+    /// once when it builds the image view, render pass, and pipeline key.
+    pub format: reims_vgpu_protocol::ImageFormat,
     /// Clear value used when `load` is false (semantic float channels).
     pub clear: [f32; 4],
     /// true ⇒ LOAD the existing resident content; false ⇒ CLEAR to `clear`.
@@ -1756,7 +1754,9 @@ mod tests {
             identity: surface(2),
             width: 64,
             height: 64,
-            format: translate::pixel::SCANOUT_FORMAT,
+            format: reims_vgpu_protocol::ImageFormat::linear(
+                reims_vgpu_protocol::TexelLayout::Bgra8,
+            ),
             clear: [0.0; 4],
             load: false,
             blend: None,

@@ -4659,7 +4659,7 @@ mod resident_read_order_tests {
                 .0;
             let readback = TargetReadback {
                 pixels: stored.clone(),
-                bgra: snapshot(attachment).bgra(),
+                bgra: snapshot(crate::format::vk_image_format(attachment)).bgra(),
             };
             let rgba = readback.into_rgba8();
             let mut landed = vec![0u8; stored.len()];

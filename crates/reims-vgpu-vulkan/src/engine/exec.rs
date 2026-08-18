@@ -2642,12 +2642,15 @@ pub(crate) unsafe fn execute_draw_inner(
     // Slot 0's view supplies the attachment format. The identity names the
     // allocation behind it; treating those as the same question loses Metal's
     // compatible-format texture views (most visibly UNORM versus sRGB).
-    let color0_format = req.color_attachment_format.unwrap_or_else(|| {
-        req.target_identity
-            .as_ref()
-            .map(|id| super::super::translate::pixel::vk_texel_layout(id.resident_layout()))
-            .unwrap_or(crate::translate::pixel::RESIDENT_RGBA_FORMAT)
-    });
+    let color0_format = req.color_attachment_format.map_or_else(
+        || {
+            req.target_identity
+                .as_ref()
+                .map(|id| super::super::translate::pixel::vk_texel_layout(id.resident_layout()))
+                .unwrap_or(crate::translate::pixel::RESIDENT_RGBA_FORMAT)
+        },
+        crate::format::vk_image_format,
+    );
     let attachment_feedback_available = ctx.features.attachment_feedback_loop_layout;
     // A guest-sourced sampled bind used to force the immediate-submit path.
     // Its read of guest RAM happens when the CB *executes*, and this device
@@ -2974,7 +2977,7 @@ pub(crate) unsafe fn execute_draw_inner(
             ));
         }
         pass_key.secondary[i] = SecondaryAttachKey {
-            format: sec.format,
+            format: crate::format::vk_image_format(sec.format),
             load: sec.load,
         };
     }
@@ -5921,7 +5924,7 @@ unsafe fn ad_hoc_attachment_views(
             sec.height,
             1,
             sec.identity.generation(),
-            sec.format,
+            crate::format::vk_image_format(sec.format),
             counters,
         )?;
         views.push(view);
@@ -7288,7 +7291,9 @@ mod tests {
             },
             width: 16,
             height: 16,
-            format: crate::translate::pixel::SCANOUT_FORMAT,
+            format: reims_vgpu_protocol::ImageFormat::linear(
+                reims_vgpu_protocol::TexelLayout::Bgra8,
+            ),
             clear,
             load: false,
             blend: None,

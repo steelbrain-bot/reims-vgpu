@@ -1,7 +1,7 @@
 //! Vulkan representation of backend-independent texel storage layouts.
 
 use ash::vk;
-use reims_vgpu_protocol::{StorageImageFormat, TexelLayout};
+use reims_vgpu_protocol::{ImageFormat, StorageImageFormat, TexelLayout, TransferFunction};
 
 /// Vulkan's linear format spelling for one guest texel layout.
 pub fn vk_texel_layout(layout: TexelLayout) -> vk::Format {
@@ -29,6 +29,15 @@ pub fn srgb_texel_layout(layout: TexelLayout) -> Option<vk::Format> {
         TexelLayout::Rgba8 => Some(vk::Format::R8G8B8A8_SRGB),
         TexelLayout::Bgra8 => Some(vk::Format::B8G8R8A8_SRGB),
         _ => None,
+    }
+}
+
+/// Vulkan representation of a semantic image-view format.
+pub fn vk_image_format(format: ImageFormat) -> vk::Format {
+    match format.transfer() {
+        TransferFunction::Linear => vk_texel_layout(format.layout()),
+        TransferFunction::Srgb => srgb_texel_layout(format.layout())
+            .expect("ImageFormat only constructs sRGB-capable layouts"),
     }
 }
 
@@ -62,7 +71,7 @@ pub fn vk_storage_image(format: StorageImageFormat) -> vk::Format {
 
 #[cfg(test)]
 mod tests {
-    use super::{srgb_texel_layout, vk_storage_image, vk_texel_layout};
+    use super::{srgb_texel_layout, vk_image_format, vk_storage_image, vk_texel_layout};
     use ash::vk;
     use reims_vgpu_protocol::{StorageImageFormat, TexelLayout};
 
@@ -88,5 +97,13 @@ mod tests {
         for format in formats {
             assert_ne!(vk_storage_image(format), vk::Format::UNDEFINED);
         }
+    }
+
+    #[test]
+    fn image_view_transfer_selects_the_native_view_without_changing_storage() {
+        let linear = reims_vgpu_protocol::ImageFormat::linear(TexelLayout::Bgra8);
+        let srgb = reims_vgpu_protocol::ImageFormat::srgb(TexelLayout::Bgra8).unwrap();
+        assert_eq!(vk_image_format(linear), vk::Format::B8G8R8A8_UNORM);
+        assert_eq!(vk_image_format(srgb), vk::Format::B8G8R8A8_SRGB);
     }
 }
