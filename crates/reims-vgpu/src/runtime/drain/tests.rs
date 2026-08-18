@@ -4489,7 +4489,11 @@ fn the_device_info_reply_stops_below_the_guests_key_table_length() {
 /// here so the absence stays a decision instead of looking like an oversight.
 #[test]
 fn the_compute_info_reply_answers_three_of_the_guests_four_keys() {
-    let answered: Vec<u32> = compute_info_caps().iter().map(|&(k, _)| k).collect();
+    let answered: Vec<u32> =
+        compute_info_caps(crate::runtime::executor::ExecutorCapabilities::default())
+            .iter()
+            .map(|&(k, _)| k)
+            .collect();
     assert_eq!(
         answered,
         vec![
@@ -4597,7 +4601,7 @@ fn a_device_info_reply_cut_short_by_the_guests_count_names_the_keys_it_lost() {
 /// that hold whichever number lands there.
 #[test]
 fn the_compute_info_reply_answers_device_limits_not_a_fixed_triple() {
-    let caps = compute_info_caps();
+    let caps = compute_info_caps(crate::runtime::executor::ExecutorCapabilities::default());
     let keys: Vec<u32> = caps.iter().map(|&(k, _)| k).collect();
     assert_eq!(
         keys,

@@ -5734,7 +5734,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     // The bound is the device's own `maxImageDimension2D`, not a fixed number:
     // a guest driving a 5K or 6K display names render targets past the Vulkan
     // 1.2 floor of 4096, and every desktop GPU reports 16384.
-    let max_dim = crate::backend::vulkan::engine::max_render_target_dimension();
+    let max_dim = state.executor.capabilities().max_render_target_dimension;
     if w == 0 || h == 0 || w > max_dim || h > max_dim {
         return Err(DrawError::DrawPreparation(
             DrawPreparationDecline::GeometryUnsupported {
@@ -6748,8 +6748,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         let mut target_rgba8: Option<std::sync::Arc<Vec<u8>>> = None;
         let mut target_clear = [0.0f32; 4];
         let mut seed_order = crate::backend::vulkan::engine::SeedOrder::Rgba8;
-        let gpu_only_content_allowed =
-            crate::backend::vulkan::engine::deferred_gpu_only_content_allowed();
+        let gpu_only_content_allowed = state.executor.capabilities().deferred_gpu_only_content;
         // Records 2+ of a resident render-pass chain load the prior record's
         // content directly from the engine target (no CPU seed, no re-upload).
         let mut chain_load_from_target = false;

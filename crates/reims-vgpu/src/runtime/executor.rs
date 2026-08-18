@@ -10,6 +10,37 @@ use crate::backend::vulkan::engine::{
 use reims_vgpu_protocol::{SegmentBoundary, SubmissionIdentity, SubmissionResourceUse};
 use std::sync::Arc;
 
+/// Host-GPU facts available to semantic planning.
+///
+/// These values describe what the executor can implement. They do not encode
+/// guest protocol features or select a guest resource lifetime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExecutorCapabilities {
+    pub device_info: crate::model::DeviceInfoLimits,
+    pub max_compute_workgroup_invocations: u32,
+    pub thread_execution_width: u32,
+    pub max_render_target_dimension: u32,
+    pub deferred_gpu_only_content: bool,
+}
+
+impl Default for ExecutorCapabilities {
+    fn default() -> Self {
+        Self {
+            device_info: crate::model::DeviceInfoLimits {
+                max_sample_count: 1,
+                d24_stencil8: false,
+                max_threads_per_threadgroup: [128, 128, 64],
+                max_threadgroup_memory_bytes: 16_384,
+                native_fp16: false,
+            },
+            max_compute_workgroup_invocations: 128,
+            thread_execution_width: 1,
+            max_render_target_dimension: 4096,
+            deferred_gpu_only_content: false,
+        }
+    }
+}
+
 /// Protocol context shared by every operation in one submitted command stream.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubmissionContext {
@@ -109,6 +140,10 @@ pub struct ExecutionReceipt<T> {
 
 /// Backend execution contract implemented per device.
 pub trait Executor: std::fmt::Debug + Send + Sync {
+    fn capabilities(&self) -> ExecutorCapabilities {
+        ExecutorCapabilities::default()
+    }
+
     fn execute(&self, submission: ResolvedSubmission) -> Result<ExecutionCompletion, DrawError>;
 
     /// End one guest lifetime while preserving shareable physical-GPU state.
@@ -141,6 +176,20 @@ impl Drop for VulkanExecutor {
 }
 
 impl Executor for VulkanExecutor {
+    fn capabilities(&self) -> ExecutorCapabilities {
+        let (max_compute_workgroup_invocations, thread_execution_width) =
+            crate::backend::vulkan::engine::compute_threadgroup_limits();
+        ExecutorCapabilities {
+            device_info: crate::backend::vulkan::engine::device_info_limits(),
+            max_compute_workgroup_invocations,
+            thread_execution_width,
+            max_render_target_dimension:
+                crate::backend::vulkan::engine::max_render_target_dimension(),
+            deferred_gpu_only_content:
+                crate::backend::vulkan::engine::deferred_gpu_only_content_allowed(),
+        }
+    }
+
     fn execute(&self, submission: ResolvedSubmission) -> Result<ExecutionCompletion, DrawError> {
         let _scope = self.enter();
         match submission {
@@ -266,6 +315,7 @@ mod tests {
     #[derive(Debug)]
     struct ScriptedExecutor {
         completion: ScriptedCompletion,
+        capabilities: ExecutorCapabilities,
         seen: Mutex<Vec<SubmissionContext>>,
         resets: AtomicUsize,
     }
@@ -274,13 +324,23 @@ mod tests {
         fn new(completion: ScriptedCompletion) -> Self {
             Self {
                 completion,
+                capabilities: ExecutorCapabilities::default(),
                 seen: Mutex::new(Vec::new()),
                 resets: AtomicUsize::new(0),
             }
         }
+
+        fn with_max_render_target_dimension(mut self, dimension: u32) -> Self {
+            self.capabilities.max_render_target_dimension = dimension;
+            self
+        }
     }
 
     impl Executor for ScriptedExecutor {
+        fn capabilities(&self) -> ExecutorCapabilities {
+            self.capabilities
+        }
+
         fn execute(
             &self,
             submission: ResolvedSubmission,
@@ -348,6 +408,34 @@ mod tests {
 
         let seen = scripted.seen.lock().unwrap();
         assert_eq!(seen.as_slice(), &[context]);
+    }
+
+    #[test]
+    fn executor_capabilities_are_device_owned() {
+        let first = Arc::new(
+            ScriptedExecutor::new(ScriptedCompletion::Draw).with_max_render_target_dimension(4096),
+        );
+        let second = Arc::new(
+            ScriptedExecutor::new(ScriptedCompletion::Draw)
+                .with_max_render_target_dimension(16_384),
+        );
+        let first_state = DeviceState::new_with_executor(DeviceId(1), 12, first);
+        let second_state = DeviceState::new_with_executor(DeviceId(2), 12, second);
+
+        assert_eq!(
+            first_state
+                .executor
+                .capabilities()
+                .max_render_target_dimension,
+            4096
+        );
+        assert_eq!(
+            second_state
+                .executor
+                .capabilities()
+                .max_render_target_dimension,
+            16_384
+        );
     }
 
     #[test]

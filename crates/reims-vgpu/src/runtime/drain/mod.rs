@@ -1974,21 +1974,10 @@ pub fn write_stamp<H: HostMemory + HostOps>(
 /// values already describe the executing device and there is nothing to reduce.
 /// The Vulkan backend runs on anything from a discrete part to an iGPU at the
 /// Vulkan floor, which is exactly the case a fixed table gets wrong.
-fn device_info_limits() -> crate::model::DeviceInfoLimits {
-    #[cfg(not(feature = "backend-vulkan"))]
-    {
-        crate::model::DeviceInfoLimits {
-            max_sample_count: u32::MAX,
-            d24_stencil8: true,
-            max_threads_per_threadgroup: [u32::MAX; 3],
-            max_threadgroup_memory_bytes: u32::MAX,
-            native_fp16: true,
-        }
-    }
-    #[cfg(feature = "backend-vulkan")]
-    {
-        crate::backend::vulkan::engine::device_info_limits()
-    }
+fn device_info_limits(
+    executor: &dyn crate::runtime::executor::Executor,
+) -> crate::model::DeviceInfoLimits {
+    executor.capabilities().device_info
 }
 
 /// Answer `CmdGetDeviceInfo` into the guest's reply page.
@@ -2014,6 +2003,7 @@ fn device_info_limits() -> crate::model::DeviceInfoLimits {
 /// that can run nothing. Answering too much is a lie the guest acts on;
 /// answering too little is a zero it also acts on.
 fn reply_device_info<H: HostMemory + HostOps>(
+    executor: &dyn crate::runtime::executor::Executor,
     host: &mut H,
     key_table_len: u32,
     count: u32,
@@ -2034,7 +2024,7 @@ fn reply_device_info<H: HostMemory + HostOps>(
         ));
         return Err(MemError::BadArgs);
     }
-    let limits = device_info_limits();
+    let limits = device_info_limits(executor);
     let served = crate::model::device_info_caps(&limits, version);
     // Withhold every key the guest just said it does not parse. This is not a
     // reduction of what the device can do — a key the guest discards on arrival
@@ -2264,13 +2254,11 @@ const COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY: u32 = 4;
 /// open question rather than a known cost. What is established is that the 0 is
 /// wrong for any kernel that declares threadgroup memory, and that only
 /// reflection can make it right.
-fn compute_info_caps() -> [(u32, u32); 3] {
-    // Apple GPUs report 1024 and 32 across every family the arm64 pathway
-    #[cfg(not(feature = "backend-vulkan"))]
-    let (max_total_threads, thread_execution_width) = (1024, 32);
-    #[cfg(feature = "backend-vulkan")]
-    let (max_total_threads, thread_execution_width) =
-        crate::backend::vulkan::engine::compute_threadgroup_limits();
+fn compute_info_caps(caps: crate::runtime::executor::ExecutorCapabilities) -> [(u32, u32); 3] {
+    let (max_total_threads, thread_execution_width) = (
+        caps.max_compute_workgroup_invocations,
+        caps.thread_execution_width,
+    );
     [
         (COMPUTE_INFO_KEY_MAX_TOTAL_THREADS, max_total_threads),
         (
@@ -2312,7 +2300,7 @@ fn reply_compute_info<H: HostMemory + HostOps>(
         return false;
     };
     let mut wrote = 0u32;
-    for (key, value) in compute_info_caps() {
+    for (key, value) in compute_info_caps(state.executor.capabilities()) {
         // Exclusive, like its device-info twin: the guest writes
         // `highest_key_it_parses + 1` here, and its parser's own table stops one
         // below. It sends 5 against a table whose arms are keys 1..=4, so an
@@ -2477,6 +2465,7 @@ fn process_root_packet<H: HostMemory + HostOps>(
                 let count = ld32(&packet.payload[DEVICE_INFO_TAHOE_COUNT..]);
                 let pfn = ld32(&packet.payload[DEVICE_INFO_TAHOE_REPLY_PFN..]);
                 let _ = reply_device_info(
+                    state.executor.as_ref(),
                     host,
                     key_table_len,
                     count,
@@ -2500,6 +2489,7 @@ fn process_root_packet<H: HostMemory + HostOps>(
                 // table holds and the count alone bounds it, which is what this
                 // arm has always done.
                 let _ = reply_device_info(
+                    state.executor.as_ref(),
                     host,
                     u32::MAX,
                     count,
