@@ -48,7 +48,10 @@
 
 use crate::model::{DeviceState, ResourceValidity};
 use crate::runtime::decode::fifo::InvalidateValidityOps;
-use reims_vgpu_core::ResolvedResourceState;
+use reims_vgpu_core::{
+    CommandExecution, ExecutionOutput, ResolvedCommand, ResolvedResourceState, ResolvedSubmission,
+    ResourceStateCompletion,
+};
 use reims_vgpu_protocol::{ObjectRef, ResourceObject};
 
 /// Which producer delivered a quad. Only used to name the counters, so an arm
@@ -97,7 +100,32 @@ pub fn apply(
         resource: state.task_resources.identity(task_id, object_id),
         ops,
     };
-    apply_resolved(state, task_id, update, site)
+    let context = crate::runtime::executor::context_for(state, task_id);
+    let submission =
+        ResolvedSubmission::<(), ()>::single(context, ResolvedCommand::ResourceState(update));
+    let outcome = std::cell::Cell::new(None);
+    let completion = reims_vgpu_core::execute_resolved_submission(
+        submission,
+        |()| -> Result<CommandExecution<()>, std::convert::Infallible> { unreachable!() },
+        |()| -> Result<CommandExecution<()>, std::convert::Infallible> { unreachable!() },
+        |_| -> Result<CommandExecution<_>, std::convert::Infallible> { unreachable!() },
+        |update| {
+            outcome.set(Some(apply_resolved(state, task_id, update, site)));
+            Ok(CommandExecution::without_gpu_materialization(
+                ResourceStateCompletion { update },
+            ))
+        },
+    )
+    .expect("resource-state execution is infallible");
+    debug_assert!(matches!(
+        completion.output.as_ref(),
+        [ExecutionOutput::ResourceState(ResourceStateCompletion {
+            update: completed
+        })] if *completed == update
+    ));
+    outcome
+        .get()
+        .expect("the single resource-state command was executed")
 }
 
 fn apply_resolved(

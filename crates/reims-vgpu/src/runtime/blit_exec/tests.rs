@@ -333,9 +333,10 @@ fn fill_buffer_roundtrip() {
         .task_resources
         .content_stamp(1, 7)
         .expect("the resolved resource survives completion");
-    assert!(
-        second_version > first_version,
-        "each completed guest-memory write advances canonical content"
+    assert_eq!(
+        second_version.get(),
+        first_version.get() + 1,
+        "one immutable blit completion advances canonical content exactly once"
     );
 }
 

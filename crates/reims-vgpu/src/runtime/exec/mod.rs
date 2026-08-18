@@ -791,10 +791,6 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         return out;
     }
 
-    // Apply pre-submission validity before snapshotting expected content
-    // versions into the immutable executor envelope.
-    consume_resource_table(state, task_id, &resource_descs);
-
     #[cfg(feature = "backend-vulkan")]
     {
         let identity = SubmissionIdentity {
@@ -802,9 +798,29 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
             task: TaskId::new(task_id),
         };
         state.next_submission_id = state.next_submission_id.wrapping_add(1).max(1);
+        state.active_submission = Some(crate::runtime::executor::SubmissionContext {
+            identity,
+            resources: std::sync::Arc::from([]),
+            segments: semantic_submission_segments(&streams),
+            segment: None,
+        });
+    }
+
+    // Validity commands are ordered at the head of this submission. They run
+    // under its identity before expected content is snapshotted, because a
+    // guest-write declaration creates the version the following commands must
+    // expect.
+    consume_resource_table(state, task_id, &resource_descs);
+
+    #[cfg(feature = "backend-vulkan")]
+    {
+        let context = state
+            .active_submission
+            .as_ref()
+            .expect("submission identity was installed before validity");
         let resolved = state.task_resources.begin_submission(
             task_id,
-            identity.id,
+            context.identity.id,
             resource_descs
                 .iter()
                 .map(|desc| ObjectRef::<ResourceObject>::new(desc.object_id)),
@@ -827,13 +843,11 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
             )
             .collect::<Vec<_>>()
             .into();
-        let segments = semantic_submission_segments(&streams);
-        state.active_submission = Some(crate::runtime::executor::SubmissionContext {
-            identity,
-            resources,
-            segments,
-            segment: None,
-        });
+        state
+            .active_submission
+            .as_mut()
+            .expect("submission identity remains active")
+            .resources = resources;
     }
 
     let mut open_encoder = None;

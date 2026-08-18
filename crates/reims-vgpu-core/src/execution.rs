@@ -110,6 +110,29 @@ pub struct ResourceStateCompletion {
     pub update: ResolvedResourceState,
 }
 
+/// One command handler's output and any persistent GPU replicas it created.
+#[derive(Debug)]
+pub struct CommandExecution<Output> {
+    pub output: Output,
+    pub gpu_materialized: std::sync::Arc<[ContentStamp]>,
+}
+
+impl<Output> CommandExecution<Output> {
+    pub fn new(
+        output: Output,
+        gpu_materialized: impl Into<std::sync::Arc<[ContentStamp]>>,
+    ) -> Self {
+        Self {
+            output,
+            gpu_materialized: gpu_materialized.into(),
+        }
+    }
+
+    pub fn without_gpu_materialization(output: Output) -> Self {
+        Self::new(output, std::sync::Arc::from([]))
+    }
+}
+
 /// Operation-specific result carried by a completion fact.
 #[derive(Debug)]
 pub enum ExecutionOutput<Draw, Compute> {
@@ -154,6 +177,65 @@ pub trait ExecutionPort: std::fmt::Debug + Send + Sync {
     type Error;
 
     fn execute(&self, submission: Self::Submission) -> Result<Self::Completion, Self::Error>;
+}
+
+/// Execute every command in order and build one immutable completion.
+///
+/// The caller supplies capability handlers, but not ordering, identity, output
+/// assembly, or materialization de-duplication. This is the shared execution
+/// seam for a Vulkan-only handler and the composition handler which also owns
+/// guest-memory blits and core state transitions.
+pub fn execute_resolved_submission<Draw, Compute, DrawOutput, ComputeOutput, Error>(
+    submission: ResolvedSubmission<Draw, Compute>,
+    mut draw: impl FnMut(Draw) -> Result<CommandExecution<DrawOutput>, Error>,
+    mut compute: impl FnMut(Compute) -> Result<CommandExecution<ComputeOutput>, Error>,
+    mut blit: impl FnMut(ResolvedBufferBlit) -> Result<CommandExecution<BlitCompletion>, Error>,
+    mut resource_state: impl FnMut(
+        ResolvedResourceState,
+    ) -> Result<CommandExecution<ResourceStateCompletion>, Error>,
+) -> Result<ExecutionCompletion<Box<[ExecutionOutput<DrawOutput, ComputeOutput>]>>, Error> {
+    let identity = submission.context.identity;
+    let mut outputs = Vec::with_capacity(submission.command_buffer.commands().len());
+    let mut materialized = std::collections::BTreeSet::new();
+    for command in submission.command_buffer.into_commands().into_vec() {
+        let execution = match command {
+            ResolvedCommand::Draw(command) => {
+                let execution = draw(command)?;
+                CommandExecution::new(
+                    ExecutionOutput::Draw(execution.output),
+                    execution.gpu_materialized,
+                )
+            }
+            ResolvedCommand::Compute(command) => {
+                let execution = compute(command)?;
+                CommandExecution::new(
+                    ExecutionOutput::Compute(execution.output),
+                    execution.gpu_materialized,
+                )
+            }
+            ResolvedCommand::Blit(command) => {
+                let execution = blit(command)?;
+                CommandExecution::new(
+                    ExecutionOutput::Blit(execution.output),
+                    execution.gpu_materialized,
+                )
+            }
+            ResolvedCommand::ResourceState(command) => {
+                let execution = resource_state(command)?;
+                CommandExecution::new(
+                    ExecutionOutput::ResourceState(execution.output),
+                    execution.gpu_materialized,
+                )
+            }
+        };
+        materialized.extend(execution.gpu_materialized.iter().copied());
+        outputs.push(execution.output);
+    }
+    Ok(ExecutionCompletion {
+        submission: identity,
+        output: outputs.into_boxed_slice(),
+        gpu_materialized: materialized.into_iter().collect::<Vec<_>>().into(),
+    })
 }
 
 #[cfg(test)]
@@ -230,5 +312,44 @@ mod tests {
         let buffer: ResolvedCommandBuffer<(), ()> =
             ResolvedCommandBuffer::single(ResolvedCommand::ResourceState(update));
         assert_eq!(buffer.commands()[0].kind(), ExecutionKind::ResourceState);
+    }
+
+    #[test]
+    fn one_dispatcher_owns_order_outputs_and_materialization_deduplication() {
+        use std::cell::RefCell;
+
+        let context = SubmissionContext::standalone(7);
+        let first = range(1).content;
+        let second = range(2).content;
+        let submission = ResolvedSubmission {
+            context: context.clone(),
+            command_buffer: ResolvedCommandBuffer::new(vec![
+                ResolvedCommand::Draw(1),
+                ResolvedCommand::Compute(2),
+                ResolvedCommand::Draw(3),
+            ]),
+        };
+        let order = RefCell::new(Vec::new());
+        let completion = execute_resolved_submission(
+            submission,
+            |draw| {
+                order.borrow_mut().push(draw);
+                Ok::<_, ()>(CommandExecution::new(draw * 10, vec![first]))
+            },
+            |compute| {
+                order.borrow_mut().push(compute);
+                Ok::<_, ()>(CommandExecution::new(compute * 10, vec![first, second]))
+            },
+            |_| unreachable!(),
+            |_| unreachable!(),
+        )
+        .unwrap();
+
+        assert_eq!(*order.borrow(), [1, 2, 3]);
+        assert_eq!(completion.submission, context.identity);
+        assert_eq!(completion.gpu_materialized.as_ref(), &[first, second]);
+        assert!(matches!(completion.output[0], ExecutionOutput::Draw(10)));
+        assert!(matches!(completion.output[1], ExecutionOutput::Compute(20)));
+        assert!(matches!(completion.output[2], ExecutionOutput::Draw(30)));
     }
 }

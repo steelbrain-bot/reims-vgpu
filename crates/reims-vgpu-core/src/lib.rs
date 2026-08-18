@@ -21,9 +21,9 @@ pub mod visibility;
 pub use blit::{BufferFillPattern, ResolvedBufferBlit, ResolvedBufferRange};
 pub use capabilities::{CapabilityService, DeviceInfoLimits, ExecutorCapabilities, MAX_CHANNELS};
 pub use execution::{
-    BlitCompletion, ExecutionCompletion, ExecutionKind, ExecutionOutput, ExecutionPort,
-    ExecutionReceipt, ResolvedCommand, ResolvedCommandBuffer, ResolvedSubmission,
-    ResourceStateCompletion,
+    execute_resolved_submission, BlitCompletion, CommandExecution, ExecutionCompletion,
+    ExecutionKind, ExecutionOutput, ExecutionPort, ExecutionReceipt, ResolvedCommand,
+    ResolvedCommandBuffer, ResolvedSubmission, ResourceStateCompletion,
 };
 pub use namespace::{NamespaceError, ReferenceNamespace};
 pub use residency::{

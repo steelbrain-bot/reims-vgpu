@@ -55,7 +55,10 @@ use crate::runtime::mapper::RectStride;
 use crate::runtime::mapping_write;
 use crate::runtime::objects;
 use crate::runtime::plan::event_sync::{Domain as FenceDomain, FenceAction};
-use reims_vgpu_core::{BufferFillPattern, ContentStamp, ResolvedBufferBlit, ResolvedBufferRange};
+use reims_vgpu_core::{
+    BlitCompletion, BufferFillPattern, CommandExecution, ContentStamp, ExecutionOutput,
+    ResolvedBufferBlit, ResolvedBufferRange, ResolvedCommand, ResolvedSubmission,
+};
 use reims_vgpu_protocol::{ByteLength, GuestVirtualAddress};
 use reims_vgpu_wire::ops::blit as wire_blit;
 
@@ -1713,41 +1716,79 @@ fn copy_bytes<M: HostMemory + HostOps>(
     )
 }
 
-/// Execute an immutable buffer operation after serializer refs and bounds have
-/// been resolved. Canonical completion is applied once by [`execute_blit`]
-/// alongside every other blit destination family.
+/// Execute an immutable buffer operation through the shared command-buffer seam.
+///
+/// The capability handler owns the host-memory transfer and produces the
+/// destination's canonical content version as its completion fact. Ordering,
+/// submission identity and completion assembly remain core-owned.
 fn execute_resolved_buffer_blit<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     operation: ResolvedBufferBlit,
 ) -> BlitStatus {
-    let result = match operation {
-        ResolvedBufferBlit::Fill {
-            destination,
-            pattern,
-        } => write_fill_pattern(
-            host,
-            state,
-            task_id,
-            destination.address.get(),
-            destination.length.get(),
-            pattern.bytes(),
-        ),
-        ResolvedBufferBlit::Copy {
-            source,
-            destination,
-        } => copy_bytes(
-            host,
-            state,
-            task_id,
-            source.address.get(),
-            destination.address.get(),
-            source.length.get(),
-        ),
-    };
-    match result {
-        Ok(()) => BlitStatus::Ok,
+    let destination = operation.destination().resource();
+    let context = crate::runtime::executor::context_for(state, task_id);
+    let submission =
+        ResolvedSubmission::<(), ()>::single(context, ResolvedCommand::Blit(operation));
+    let completion = reims_vgpu_core::execute_resolved_submission(
+        submission,
+        |()| -> Result<CommandExecution<()>, BlitStatus> { unreachable!() },
+        |()| -> Result<CommandExecution<()>, BlitStatus> { unreachable!() },
+        |operation| {
+            match operation {
+                ResolvedBufferBlit::Fill {
+                    destination,
+                    pattern,
+                } => write_fill_pattern(
+                    host,
+                    state,
+                    task_id,
+                    destination.address.get(),
+                    destination.length.get(),
+                    pattern.bytes(),
+                ),
+                ResolvedBufferBlit::Copy {
+                    source,
+                    destination,
+                } => copy_bytes(
+                    host,
+                    state,
+                    task_id,
+                    source.address.get(),
+                    destination.address.get(),
+                    source.length.get(),
+                ),
+            }?;
+            let Some(version) = state.task_resources.note_guest_write_by_id(destination) else {
+                return Err(br(
+                    BlitStatus::MissingResource,
+                    "blit_completion_resource_gone",
+                ));
+            };
+            Ok(CommandExecution::without_gpu_materialization(
+                BlitCompletion {
+                    written: Some(ContentStamp {
+                        resource: destination,
+                        version,
+                    }),
+                },
+            ))
+        },
+        |_| -> Result<CommandExecution<_>, BlitStatus> { unreachable!() },
+    );
+    match completion {
+        Ok(completion)
+            if matches!(
+                completion.output.as_ref(),
+                [ExecutionOutput::Blit(BlitCompletion {
+                    written: Some(ContentStamp { resource, .. })
+                })] if *resource == destination
+            ) =>
+        {
+            BlitStatus::Ok
+        }
+        Ok(_) => br(BlitStatus::Unsupported, "blit_completion_mismatch"),
         Err(status) => status,
     }
 }
@@ -1759,10 +1800,13 @@ fn execute_resolved_buffer_blit<M: HostMemory + HostOps>(
 /// resource transition. Zero-extent and refused operations never call it.
 fn blit_write_destination(cmd: &Command) -> Option<u32> {
     match cmd.kind {
-        Kind::FillBuffer | Kind::FillBufferPattern4 => Some(cmd.buffer),
+        // Buffer destinations transition inside the immutable command's
+        // completion handler. The remaining texture families have not yet
+        // moved into the resolved blit IR and settle here temporarily.
+        Kind::FillBuffer | Kind::FillBufferPattern4 => None,
         Kind::Copy => match cmd.copy_kind {
-            CopyKind::BufferToBuffer
-            | CopyKind::BufferToTexture
+            CopyKind::BufferToBuffer => None,
+            CopyKind::BufferToTexture
             | CopyKind::TextureToBuffer
             | CopyKind::TextureToTexture
             | CopyKind::TextureToTextureSliceLevel => Some(cmd.destination),

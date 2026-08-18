@@ -460,70 +460,55 @@ impl ExecutionPort for VulkanExecutor {
 
     fn execute(&self, submission: Self::Submission) -> Result<Self::Completion, Self::Error> {
         let _scope = self.enter();
-        let identity = submission.context.identity;
-        let mut outputs = Vec::new();
-        let mut materialized = std::collections::BTreeSet::new();
-        for command in submission.command_buffer.into_commands().into_vec() {
-            match command {
-                ResolvedCommand::Draw(request) => {
-                    materialized.extend(
-                        request
-                            .sampled_images
-                            .iter()
-                            .filter(|image| {
-                                matches!(
-                                    &image.source,
-                                    crate::backend::vulkan::engine::SampledSource::Bytes(_)
-                                        | crate::backend::vulkan::engine::SampledSource::GuestRuns(
-                                            ..
-                                        )
-                                )
-                            })
-                            .filter_map(|image| image.content),
-                    );
-                    outputs.push(ExecutionOutput::Draw(
-                        crate::backend::vulkan::engine::execute_draw_request(&request)?,
-                    ));
-                }
-                ResolvedCommand::Compute(request) => {
-                    materialized.extend(
-                        request
-                            .sampled_images
-                            .iter()
-                            .filter(|image| {
-                                matches!(
-                                    &image.source,
-                                    crate::backend::vulkan::engine::ComputeSampledImageSource::Bytes(_)
-                                        | crate::backend::vulkan::engine::ComputeSampledImageSource::GuestPages(_)
-                                )
-                            })
-                            .filter_map(|image| image.content),
-                    );
-                    outputs.push(ExecutionOutput::Compute(
-                        crate::backend::vulkan::engine::execute_compute_request(&request)?,
-                    ));
-                }
-                ResolvedCommand::Blit(_) => {
-                    return Err(DrawError::Facade(
-                        EngineFacadeDecline::ExecutorServiceUnavailable {
-                            service: "host_memory_blit",
-                        },
-                    ));
-                }
-                ResolvedCommand::ResourceState(_) => {
-                    return Err(DrawError::Facade(
-                        EngineFacadeDecline::ExecutorServiceUnavailable {
-                            service: "core_resource_state",
-                        },
-                    ));
-                }
-            }
-        }
-        Ok(ExecutionCompletion {
-            submission: identity,
-            output: outputs.into_boxed_slice(),
-            gpu_materialized: materialized.into_iter().collect::<Vec<_>>().into(),
-        })
+        reims_vgpu_core::execute_resolved_submission(
+            submission,
+            |request| {
+                let materialized = request
+                    .sampled_images
+                    .iter()
+                    .filter(|image| {
+                        matches!(
+                            &image.source,
+                            crate::backend::vulkan::engine::SampledSource::Bytes(_)
+                                | crate::backend::vulkan::engine::SampledSource::GuestRuns(..)
+                        )
+                    })
+                    .filter_map(|image| image.content)
+                    .collect::<Vec<_>>();
+                let output = crate::backend::vulkan::engine::execute_draw_request(&request)?;
+                Ok(reims_vgpu_core::CommandExecution::new(output, materialized))
+            },
+            |request| {
+                let materialized = request
+                    .sampled_images
+                    .iter()
+                    .filter(|image| {
+                        matches!(
+                            &image.source,
+                            crate::backend::vulkan::engine::ComputeSampledImageSource::Bytes(_)
+                                | crate::backend::vulkan::engine::ComputeSampledImageSource::GuestPages(_)
+                        )
+                    })
+                    .filter_map(|image| image.content)
+                    .collect::<Vec<_>>();
+                let output = crate::backend::vulkan::engine::execute_compute_request(&request)?;
+                Ok(reims_vgpu_core::CommandExecution::new(output, materialized))
+            },
+            |_| {
+                Err(DrawError::Facade(
+                    EngineFacadeDecline::ExecutorServiceUnavailable {
+                        service: "host_memory_blit",
+                    },
+                ))
+            },
+            |_| {
+                Err(DrawError::Facade(
+                    EngineFacadeDecline::ExecutorServiceUnavailable {
+                        service: "core_resource_state",
+                    },
+                ))
+            },
+        )
     }
 }
 
