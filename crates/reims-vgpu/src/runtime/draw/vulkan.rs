@@ -879,7 +879,7 @@ pub(super) enum SampledSourceRequest {
         std::sync::Arc<Vec<u8>>,
         Option<LinearSampleIdentity>,
         SampledByteFormat,
-        crate::backend::vulkan::engine::SampledByteOrigin,
+        reims_vgpu_core::SampledByteOrigin,
     ),
     /// Engine-resident allocation plus the exact view format this sampled
     /// texture declared. Allocation identity and view interpretation are
@@ -893,7 +893,7 @@ pub(super) enum SampledSourceRequest {
     /// produces the capability fallback entirely on the GPU.
     Attachment(
         crate::model::TargetIdentity,
-        crate::backend::vulkan::engine::AttachmentInitial,
+        reims_vgpu_core::AttachmentInitial,
         reims_vgpu_protocol::ImageFormat,
     ),
     /// Zero-copy guest gather: the engine copies the texel bytes from
@@ -990,12 +990,12 @@ pub(super) fn fragment_attachment_alias_initial(
     req: &DrawEncodeRequest,
     texture_index: u32,
     texture_ref: u32,
-) -> Option<(u32, u32, crate::backend::vulkan::engine::AttachmentInitial)> {
+) -> Option<(u32, u32, reims_vgpu_core::AttachmentInitial)> {
     let color = req
         .colors
         .iter()
         .find(|color| color.slot == texture_index && color.texture_ref == texture_ref)?;
-    use crate::backend::vulkan::engine::AttachmentInitial;
+    use reims_vgpu_core::AttachmentInitial;
     match color.load_action {
         MTL_LOAD_ACTION_CLEAR => Some((
             color.width,
@@ -1016,7 +1016,7 @@ pub(super) fn fragment_attachment_alias_initial(
 pub(super) fn attachment_alias_source(
     identity: crate::model::TargetIdentity,
     format: reims_vgpu_protocol::ImageFormat,
-    initial: crate::backend::vulkan::engine::AttachmentInitial,
+    initial: reims_vgpu_core::AttachmentInitial,
 ) -> SampledSourceRequest {
     SampledSourceRequest::Attachment(identity, initial, format)
 }
@@ -1137,7 +1137,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 std::sync::Arc::new(rgba),
                 None,
                 SampledByteFormat::from_source(TexelLayout::Rgba8, source),
-                crate::backend::vulkan::engine::SampledByteOrigin::BufferBackedTexture,
+                reims_vgpu_core::SampledByteOrigin::BufferBackedTexture,
             ),
         ));
     }
@@ -1247,7 +1247,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                         rgba,
                         Some(identity),
                         byte_format,
-                        crate::backend::vulkan::engine::SampledByteOrigin::SerializedSurfaceView,
+                        reims_vgpu_core::SampledByteOrigin::SerializedSurfaceView,
                     ),
                 ));
             }
@@ -1284,14 +1284,14 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     // lease. Keep its existing query path so compatibility
                     // traffic still reaches the copying rails.
                     .unwrap_or_else(|| state.executor.resident_content_backing(&resident_id));
-                let resident_ready = resident_backing
-                    != crate::backend::vulkan::engine::ResidentContentBacking::NotReady;
+                let resident_ready =
+                    resident_backing != reims_vgpu_core::ResidentContentBacking::NotReady;
                 if resident_ready {
                     crate::runtime::drain::note_store_route(match resident_backing {
-                        crate::backend::vulkan::engine::ResidentContentBacking::DeviceAllocation => {
+                        reims_vgpu_core::ResidentContentBacking::DeviceAllocation => {
                             "iosurfacesample_ready_device_allocation"
                         }
-                        crate::backend::vulkan::engine::ResidentContentBacking::NotReady => {
+                        reims_vgpu_core::ResidentContentBacking::NotReady => {
                             unreachable!("resident_ready excludes this arm")
                         }
                     });
@@ -1471,7 +1471,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                             bgra,
                             identity,
                             SampledByteFormat::from_source(TexelLayout::Bgra8, source),
-                            crate::backend::vulkan::engine::SampledByteOrigin::SurfaceHostCache,
+                            reims_vgpu_core::SampledByteOrigin::SurfaceHostCache,
                         ),
                     ));
                 }
@@ -1505,7 +1505,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                             rgba,
                             Some(identity),
                             SampledByteFormat::from_source(TexelLayout::Rgba8, memo_source),
-                            crate::backend::vulkan::engine::SampledByteOrigin::SurfaceGuestFallback,
+                            reims_vgpu_core::SampledByteOrigin::SurfaceGuestFallback,
                         ),
                     ));
                 }
@@ -1577,7 +1577,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                         rgba,
                         identity,
                         byte_format,
-                        crate::backend::vulkan::engine::SampledByteOrigin::LinearTexture,
+                        reims_vgpu_core::SampledByteOrigin::LinearTexture,
                     ),
                 ));
             }
@@ -1627,7 +1627,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
             std::sync::Arc::new(bytes),
             None,
             layout,
-            crate::backend::vulkan::engine::SampledByteOrigin::LinearTexture,
+            reims_vgpu_core::SampledByteOrigin::LinearTexture,
         ),
     ))
 }
@@ -1927,10 +1927,7 @@ enum IOSurfaceSeedRung {
 enum IOSurfaceLoadSeed {
     /// Host-owned bytes from the render cache, or the universal converted
     /// fallback when the native guest-page view cannot be described.
-    Host(
-        std::sync::Arc<Vec<u8>>,
-        crate::backend::vulkan::engine::SeedOrder,
-    ),
+    Host(std::sync::Arc<Vec<u8>>, reims_vgpu_core::SeedOrder),
     /// The mapping's native texels as bounded guest-RAM runs. The engine imports
     /// them when possible and uses the runs themselves for its CPU fallback.
     Guest(reims_vgpu_memory::GuestTargetSeed),
@@ -2142,7 +2139,7 @@ fn resolve_iosurface_texture_load_seed<M: HostMemory + HostOps>(
     h: u32,
     target_format: ash::vk::Format,
 ) -> Option<IOSurfaceLoadSeed> {
-    use crate::backend::vulkan::engine::SeedOrder;
+    use reims_vgpu_core::SeedOrder;
     // `clear_host_valid` removes this mapping's cache entry at the contract
     // boundary. A hit therefore already means no later guest validity
     // statement superseded the stored bytes.
@@ -3017,7 +3014,7 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
 /// one thing on the draw that built it and another on every draw after.
 fn bound_buffer_content(
     bound: &crate::runtime::bound_buffers::BoundBuffer,
-) -> crate::backend::vulkan::engine::BufferContent {
+) -> reims_vgpu_core::BufferContent {
     use crate::backend::vulkan::engine;
     engine::BufferContent::GuestRuns(reims_vgpu_memory::GuestRunSource {
         runs: std::sync::Arc::clone(&bound.runs),
@@ -3037,7 +3034,7 @@ fn packed_buffer_content(
     buffer_ref: u32,
     offset: u64,
     extent_cap: Option<u64>,
-) -> Option<crate::backend::vulkan::engine::BufferContent> {
+) -> Option<reims_vgpu_core::BufferContent> {
     let packed = match state.bound_buffers.packed(task_id, buffer_ref)? {
         crate::runtime::bound_buffers::PackedBufferResolution::Available(packed) => packed,
         crate::runtime::bound_buffers::PackedBufferResolution::Unavailable { .. } => return None,
@@ -3045,9 +3042,7 @@ fn packed_buffer_content(
     let full = packed.size.checked_sub(offset).filter(|&span| span != 0)?;
     let span = extent_cap.map_or(full, |cap| full.min(cap));
     let source = packed.buffer_source(offset, span)?;
-    Some(crate::backend::vulkan::engine::BufferContent::GuestRuns(
-        source,
-    ))
+    Some(reims_vgpu_core::BufferContent::GuestRuns(source))
 }
 
 /// Load one draw-time buffer bind: the zero-copy rail when allowed and
@@ -3095,7 +3090,7 @@ fn held_buffer_content(
     buffer_ref: u32,
     offset: u64,
     extent_cap: Option<u64>,
-) -> Option<crate::backend::vulkan::engine::BufferContent> {
+) -> Option<reims_vgpu_core::BufferContent> {
     if let Some(content) = packed_buffer_content(state, task_id, buffer_ref, offset, extent_cap) {
         crate::runtime::drain::note_store_route("zc_buffer_held_packed");
         return Some(content);
@@ -3132,7 +3127,7 @@ pub(super) fn load_buffer_content_resolved<M: HostMemory + HostOps>(
     allow_zero_copy: bool,
     extent_cap: Option<u64>,
     backing: &BufferBacking,
-) -> Option<crate::backend::vulkan::engine::BufferContent> {
+) -> Option<reims_vgpu_core::BufferContent> {
     // Resolve the backing (object-list entry + descriptor) once and share it
     // between the zero-copy attempt and the CPU fallback.
     if allow_zero_copy {
@@ -3167,7 +3162,7 @@ pub(super) fn load_buffer_content_resolved<M: HostMemory + HostOps>(
     let bytes = read_buffer_bytes_resolved(
         state, host, task_id, buffer_ref, backing, offset, extent_cap,
     )?;
-    Some(crate::backend::vulkan::engine::BufferContent::from(bytes))
+    Some(reims_vgpu_core::BufferContent::from(bytes))
 }
 
 // Same shape as `load_buffer_content_resolved`, which this forwards to.
@@ -3181,7 +3176,7 @@ pub(super) fn load_buffer_content<M: HostMemory + HostOps>(
     offset: u64,
     allow_zero_copy: bool,
     extent_cap: Option<u64>,
-) -> Option<crate::backend::vulkan::engine::BufferContent> {
+) -> Option<reims_vgpu_core::BufferContent> {
     if allow_zero_copy {
         if let Some(content) = held_buffer_content(state, task_id, buffer_ref, offset, extent_cap) {
             return Some(content);
@@ -3211,7 +3206,7 @@ fn load_index_content_reason<M: HostMemory + HostOps>(
     host: &mut M,
     task_id: u32,
     info: &IndexedDrawInfo,
-) -> Result<crate::backend::vulkan::engine::BufferContent, IndexLoadReason> {
+) -> Result<reims_vgpu_core::BufferContent, IndexLoadReason> {
     let (backing, need) = resolve_index_window_reason(state, host, task_id, info)?;
     let extent = Some(need as u64);
     if let Some(content) = held_buffer_content(
@@ -3273,10 +3268,10 @@ pub(super) enum GvaResidentRefusal {
 }
 
 fn retained_resident_is_ready(
-    backing: Option<crate::backend::vulkan::engine::ResidentContentBacking>,
+    backing: Option<reims_vgpu_core::ResidentContentBacking>,
     registry_query: impl FnOnce() -> bool,
 ) -> bool {
-    use crate::backend::vulkan::engine::ResidentContentBacking;
+    use reims_vgpu_core::ResidentContentBacking;
 
     match backing {
         Some(ResidentContentBacking::DeviceAllocation) => true,
@@ -3305,7 +3300,7 @@ fn gva_resident_ready(
     let retained = backing.is_some();
     let ready = retained_resident_is_ready(backing, || {
         state.executor.resident_content_backing(identity)
-            != crate::backend::vulkan::engine::ResidentContentBacking::NotReady
+            != reims_vgpu_core::ResidentContentBacking::NotReady
     });
     crate::runtime::drain::note_store_route(match (retained, ready) {
         (true, true) => "gva_ready_resource",
@@ -3410,7 +3405,7 @@ pub(super) fn gva_resident_if_current<M: HostMemory + HostOps>(
 #[cfg(test)]
 mod gva_resident_ownership_tests {
     use super::*;
-    use crate::backend::vulkan::engine::ResidentContentBacking;
+    use reims_vgpu_core::ResidentContentBacking;
     use std::cell::Cell;
 
     #[test]
@@ -5297,11 +5292,11 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
     fb_h: u32,
     blend_constants: [f32; 4],
 ) -> Result<
-    Vec<crate::backend::vulkan::engine::SecondaryColorTarget>,
+    Vec<reims_vgpu_core::SecondaryColorTarget>,
     crate::runtime::census::present_proxy::SecondaryMrtRefusal,
 > {
-    use crate::backend::vulkan::engine::SecondaryColorTarget;
     use crate::runtime::census::present_proxy::SecondaryMrtRefusal;
+    use reims_vgpu_core::SecondaryColorTarget;
     if colors.len() <= 1 {
         return Ok(Vec::new());
     }
@@ -5480,7 +5475,7 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
 /// attribute next to it.
 pub(super) fn prepare_vertex_attribute_format(
     attribute: &crate::runtime::decode::resource::VertexAttribute,
-) -> Result<crate::backend::vulkan::engine::VertexAttributeFormat, DrawPreparationDecline> {
+) -> Result<reims_vgpu_core::VertexAttributeFormat, DrawPreparationDecline> {
     translate::vertex::attribute_format(attribute.format).map_err(|reason| {
         DrawPreparationDecline::VertexAttributeFormat {
             location: attribute.location,
@@ -5493,7 +5488,7 @@ pub(super) fn prepare_vertex_attribute_format(
 
 pub(super) fn prepare_vertex_step_function(
     attribute: &crate::runtime::decode::resource::VertexAttribute,
-) -> Result<crate::backend::vulkan::engine::VertexStepFunction, DrawPreparationDecline> {
+) -> Result<reims_vgpu_core::VertexStepFunction, DrawPreparationDecline> {
     translate::vertex::step_function(attribute.declared_step_function).map_err(|reason| {
         DrawPreparationDecline::VertexStepFunctionUnsupported {
             location: attribute.location,
@@ -5797,7 +5792,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             req.instance_count,
             req.indexed.is_some(),
         );
-        let mut vtx_storage: Vec<(u32, crate::backend::vulkan::engine::BufferContent)> = Vec::new();
+        let mut vtx_storage: Vec<(u32, reims_vgpu_core::BufferContent)> = Vec::new();
         // The three `bind_phase` spans below divide `chain_phase`'s `binds_us`,
         // which is this draw path's largest column and covered three costs with
         // one number. Each is a lexical scope so an early `return Err` charges
@@ -5830,7 +5825,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             crate::runtime::bind_phase::note_access(access);
             let content = if crate::runtime::spirv_bind::may_serve_neutral(access, feeds_stage_in) {
                 crate::runtime::bind_phase::note_neutral_served();
-                crate::backend::vulkan::engine::BufferContent::Bytes(
+                reims_vgpu_core::BufferContent::Bytes(
                     crate::runtime::spirv_bind::neutral_bind_bytes(),
                 )
             } else {
@@ -5858,8 +5853,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             vtx_storage.push((b.index, content));
         }
         drop(vertex_span);
-        let mut frag_storage: Vec<(u32, crate::backend::vulkan::engine::BufferContent)> =
-            Vec::new();
+        let mut frag_storage: Vec<(u32, reims_vgpu_core::BufferContent)> = Vec::new();
         let fragment_span =
             crate::runtime::bind_phase::Span::open(crate::runtime::bind_phase::Part::FragmentLoad);
         for b in req.fragment_buffers.iter() {
@@ -5883,7 +5877,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // which are a different index space from the fragment stage's.
             let content = if crate::runtime::spirv_bind::may_serve_neutral(access, false) {
                 crate::runtime::bind_phase::note_neutral_served();
-                crate::backend::vulkan::engine::BufferContent::Bytes(
+                reims_vgpu_core::BufferContent::Bytes(
                     crate::runtime::spirv_bind::neutral_bind_bytes(),
                 )
             } else {
@@ -5912,7 +5906,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         }
         drop(fragment_span);
         // Stage-in attributes from pipeline vertex block + bound buffer bytes.
-        let mut attrs: Vec<crate::backend::vulkan::engine::VertexAttributeResource> = Vec::new();
+        let mut attrs: Vec<reims_vgpu_core::VertexAttributeResource> = Vec::new();
         let mut stage_in_bufs: std::collections::BTreeSet<u32> = Default::default();
         let attrs_span =
             crate::runtime::bind_phase::Span::open(crate::runtime::bind_phase::Part::Attrs);
@@ -5940,7 +5934,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 .iter()
                 .find(|(idx, _)| *idx == a.buffer_index)
                 .map(|(_, d)| d.clone())
-                .unwrap_or_else(|| crate::backend::vulkan::engine::BufferContent::from(Vec::new()));
+                .unwrap_or_else(|| reims_vgpu_core::BufferContent::from(Vec::new()));
             if !content.is_empty() {
                 stage_in_bufs.insert(a.buffer_index);
             } else if a.format != 0 {
@@ -5957,7 +5951,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             }
             let step = prepare_vertex_step_function(a).map_err(DrawError::DrawPreparation)?;
             let step_rate = a.step_rate();
-            attrs.push(crate::backend::vulkan::engine::VertexAttributeResource {
+            attrs.push(reims_vgpu_core::VertexAttributeResource {
                 location: a.location,
                 // One Vulkan binding per location (archive render_draw_core).
                 binding: a.location,
@@ -6020,7 +6014,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // the "blank Safari body text" class. Bind a stage-in buffer as storage
         // too whenever the adopted vertex reflection structurally declares a
         // buffer at that binding (never name-keyed).
-        let mut storage: Vec<crate::backend::vulkan::engine::StorageBufferResource> = Vec::new();
+        let mut storage: Vec<reims_vgpu_core::StorageBufferResource> = Vec::new();
         for (idx, content) in &vtx_storage {
             if !vertex_buffer_needs_storage_binding(
                 &v_shader.reflection,
@@ -6029,7 +6023,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             ) {
                 continue;
             }
-            storage.push(crate::backend::vulkan::engine::StorageBufferResource {
+            storage.push(reims_vgpu_core::StorageBufferResource {
                 binding: *idx,
                 content: content.clone(),
             });
@@ -6040,7 +6034,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             } else {
                 *idx
             };
-            storage.push(crate::backend::vulkan::engine::StorageBufferResource {
+            storage.push(reims_vgpu_core::StorageBufferResource {
                 binding,
                 content: content.clone(),
             });
@@ -6196,8 +6190,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // sampler to texture index left sampler 67 empty → black samples.
         // Fragment sampled resources use +FRAG_SAMPLED when either both stages
         // sample or fragment buffers moved into the sampled/static-sampler band.
-        let mut images: Vec<crate::backend::vulkan::engine::SampledImageResource> = Vec::new();
-        let mut samplers: Vec<crate::backend::vulkan::engine::SamplerResource> = Vec::new();
+        let mut images: Vec<reims_vgpu_core::SampledImageResource> = Vec::new();
+        let mut samplers: Vec<reims_vgpu_core::SamplerResource> = Vec::new();
         let mut sampler_binds: std::collections::BTreeSet<u32> = Default::default();
         // Where each provisioned sampler's state came from, keyed by binding, for
         // the hang trail. A `SamplerResource` cannot be asked this after the
@@ -6364,7 +6358,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     }
                 };
                 let mut bytes_identity = None;
-                let mut byte_origin = crate::backend::vulkan::engine::SampledByteOrigin::Synthetic;
+                let mut byte_origin = reims_vgpu_core::SampledByteOrigin::Synthetic;
                 // Byte layout of a CPU-origin bind. Default RGBA8; a source that
                 // already holds its bytes in an uploadable order keeps them —
                 // BGRA8 from the surface backing scanout cache, a native single/dual-channel
@@ -6387,7 +6381,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         bytes_identity = identity;
                         sampled_format = translate::pixel::sampled_byte_image_format(byte_format);
                         byte_origin = origin;
-                        crate::backend::vulkan::engine::SampledSource::Bytes(rgba)
+                        reims_vgpu_core::SampledSource::Bytes(rgba)
                     }
                     SampledSourceRequest::Target(identity, format) => {
                         sampled_format = format;
@@ -6408,14 +6402,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         // statically uses. The engine's
                         // `used_binding_absent_from_layout` then refused the
                         // whole draw, which cost the guest every pixel of it.
-                        crate::backend::vulkan::engine::SampledSource::Target(identity)
+                        reims_vgpu_core::SampledSource::Target(identity)
                     }
                     SampledSourceRequest::Attachment(identity, initial, format) => {
                         sampled_format = format;
-                        crate::backend::vulkan::engine::SampledSource::Attachment {
-                            identity,
-                            initial,
-                        }
+                        reims_vgpu_core::SampledSource::Attachment { identity, initial }
                     }
                     SampledSourceRequest::GuestRuns(
                         src,
@@ -6430,7 +6421,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         sampled_components = components;
                         source_planes = planes;
                         bytes_identity = identity;
-                        crate::backend::vulkan::engine::SampledSource::GuestRuns(src, vouch)
+                        reims_vgpu_core::SampledSource::GuestRuns(src, vouch)
                     }
                 };
                 let array_element = reflected_descriptor
@@ -6514,7 +6505,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 } else {
                     (tw, th)
                 };
-                images.push(crate::backend::vulkan::engine::SampledImageResource {
+                images.push(reims_vgpu_core::SampledImageResource {
                     binding: img_bind,
                     array_element,
                     descriptor_count,
@@ -6532,11 +6523,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     }),
                     byte_origin,
                     format: sampled_format,
-                    identity: bytes_identity.map(|i| {
-                        crate::backend::vulkan::engine::SampledContentIdentity {
-                            key: i.key,
-                            generation: i.generation,
-                        }
+                    identity: bytes_identity.map(|i| reims_vgpu_core::SampledContentIdentity {
+                        key: i.key,
+                        generation: i.generation,
                     }),
                     resource_lifetime: texture_resource
                         .as_ref()
@@ -6629,7 +6618,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                  pipe={} idx={index} binding={img_bind} kind={kind:?} 1x1",
                 req.pipeline_ref
             ));
-            images.push(crate::backend::vulkan::engine::SampledImageResource {
+            images.push(reims_vgpu_core::SampledImageResource {
                 binding: img_bind,
                 array_element: 0,
                 descriptor_count: 1,
@@ -6641,11 +6630,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 cube: shape.cube,
                 one_dim: shape.one_dim,
                 multisampled: false,
-                source: crate::backend::vulkan::engine::SampledSource::Bytes(std::sync::Arc::new(
+                source: reims_vgpu_core::SampledSource::Bytes(std::sync::Arc::new(
                     crate::contract::pixel_format::solid_rgba8(1, 1, &[0.0; 4]),
                 )),
                 content: None,
-                byte_origin: crate::backend::vulkan::engine::SampledByteOrigin::Synthetic,
+                byte_origin: reims_vgpu_core::SampledByteOrigin::Synthetic,
                 format: reims_vgpu_protocol::ImageFormat::linear(
                     reims_vgpu_protocol::TexelLayout::Rgba8,
                 ),
@@ -6673,9 +6662,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             .map_err(DrawError::DrawPreparation)?
                     } else {
                         sampler_origin.insert(smp_bind, b'd');
-                        crate::backend::vulkan::engine::SamplerResource::normalized_default(
-                            smp_bind,
-                        )
+                        reims_vgpu_core::SamplerResource::normalized_default(smp_bind)
                     };
                     // A bind record's own clamps override the sampler object's.
                     // That is what `setVertexSamplerStates:lodMinClamps:
@@ -6754,11 +6741,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             );
                         } else {
                             sampler_origin.insert(binding, b'd');
-                            samplers.push(
-                                crate::backend::vulkan::engine::SamplerResource::normalized_default(
-                                    binding,
-                                ),
-                            );
+                            samplers.push(reims_vgpu_core::SamplerResource::normalized_default(
+                                binding,
+                            ));
                         }
                     }
                 }
@@ -6774,7 +6759,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // does it, which is what `MTLLoadActionClear` asks for.
         let mut target_rgba8: Option<std::sync::Arc<Vec<u8>>> = None;
         let mut target_clear = [0.0f32; 4];
-        let mut seed_order = crate::backend::vulkan::engine::SeedOrder::Rgba8;
+        let mut seed_order = reims_vgpu_core::SeedOrder::Rgba8;
         let gpu_only_content_allowed = state.executor.capabilities().deferred_gpu_only_content;
         // Records 2+ of a resident render-pass chain load the prior record's
         // content directly from the engine target (no CPU seed, no re-upload).
@@ -6971,7 +6956,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             }
         }
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
-        let mut resources = crate::backend::vulkan::engine::DrawRequest {
+        let mut resources = reims_vgpu_core::DrawRequest {
             pipeline_lifetime: resolved.pipeline_lifetime.clone(),
             // Honor the guest's face-culling state, its winding, and its
             // primitive type. All three come from `translate::raster`, and all
@@ -6983,7 +6968,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             cull_mode: raster_or_default(
                 req.cull_mode,
                 translate::raster::cull_mode,
-                crate::backend::vulkan::engine::CullMode::None,
+                reims_vgpu_core::CullMode::None,
                 req.pipeline_ref,
                 "cull_mode_unmapped",
             ),
@@ -7003,14 +6988,14 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             fill_mode: raster_or_default(
                 req.fill_mode,
                 translate::raster::fill_mode,
-                crate::backend::vulkan::engine::FillMode::Fill,
+                reims_vgpu_core::FillMode::Fill,
                 req.pipeline_ref,
                 "fill_mode_unmapped",
             ),
             depth_clip: raster_or_default(
                 req.depth_clip_mode,
                 translate::raster::depth_clip_mode,
-                crate::backend::vulkan::engine::DepthClipMode::Clip,
+                reims_vgpu_core::DepthClipMode::Clip,
                 req.pipeline_ref,
                 "depth_clip_mode_unmapped",
             ),
@@ -7024,7 +7009,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             primitive_topology: raster_or_default(
                 Some(req.primitive_type),
                 translate::raster::primitive_topology,
-                crate::backend::vulkan::engine::PrimitiveTopology::Triangle,
+                reims_vgpu_core::PrimitiveTopology::Triangle,
                 req.pipeline_ref,
                 "primitive_type_unmapped",
             ),
@@ -7038,7 +7023,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 .colors
                 .first()
                 .is_some_and(|color| color.multisample_source_ref != 0),
-            ..crate::backend::vulkan::engine::DrawRequest::default()
+            ..reims_vgpu_core::DrawRequest::default()
         };
         let resolving_colors = req
             .colors
@@ -7084,7 +7069,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         resources.viewports = req
             .viewports
             .iter()
-            .map(|vp| crate::backend::vulkan::engine::ViewportResource {
+            .map(|vp| reims_vgpu_core::ViewportResource {
                 x: vp[0] as f32,
                 y: vp[1] as f32,
                 width: vp[2] as f32,
@@ -7124,7 +7109,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         resources.scissors = req
             .scissors
             .iter()
-            .map(|s| crate::backend::vulkan::engine::ScissorResource {
+            .map(|s| reims_vgpu_core::ScissorResource {
                 x: s.x,
                 y: s.y,
                 width: s.width,
@@ -7141,7 +7126,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 load_index_content_reason(state, host, req.task_id, idx).map_err(|reason| {
                     DrawError::DrawPreparation(DrawPreparationDecline::IndexLoad { reason })
                 })?;
-            resources.indexed = Some(crate::backend::vulkan::engine::IndexedDrawResource {
+            resources.indexed = Some(reims_vgpu_core::IndexedDrawResource {
                 index_type,
                 index_count: idx.index_count,
                 // Vulkan's vertexOffset is a signed 32-bit field where Metal's
@@ -7430,7 +7415,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             // fail-visibly (unknown wire stays unknown); depth is
                             // still honored.
                             let stencil = if ds.front_stencil_enabled || ds.back_stencil_enabled {
-                                use crate::backend::vulkan::engine::{
+                                use reims_vgpu_core::{
                                     SamplerCompareFunction, StencilFaceOps, StencilOp, StencilState,
                                 };
                                 const PASS_THROUGH: StencilFaceOps = StencilFaceOps {
@@ -7514,7 +7499,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             } else {
                                 None
                             };
-                            resources.depth = Some(crate::backend::vulkan::engine::DepthState {
+                            resources.depth = Some(reims_vgpu_core::DepthState {
                                 identity: depth_chain_identity(req, stencil.is_some()),
                                 test_enable: true,
                                 write_enable: ds.depth_write_enabled,
@@ -7669,17 +7654,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // bindings are neither first nor contiguous.
         let mut sampled_notes = [crate::runtime::gpu_hang_trail::SampledNote::default();
             crate::runtime::gpu_hang_trail::SAMPLED_KEPT];
-        let mut by_binding: Vec<&crate::backend::vulkan::engine::SampledImageResource> =
+        let mut by_binding: Vec<&reims_vgpu_core::SampledImageResource> =
             resources.sampled_images.iter().collect();
         by_binding.sort_unstable_by_key(|i| i.binding);
         for (slot, image) in sampled_notes.iter_mut().zip(by_binding.iter()) {
             *slot = crate::runtime::gpu_hang_trail::SampledNote {
                 binding: image.binding,
                 kind: match &image.source {
-                    crate::backend::vulkan::engine::SampledSource::Bytes(_) => 1,
-                    crate::backend::vulkan::engine::SampledSource::Target(_)
-                    | crate::backend::vulkan::engine::SampledSource::Attachment { .. } => 2,
-                    crate::backend::vulkan::engine::SampledSource::GuestRuns(..) => 3,
+                    reims_vgpu_core::SampledSource::Bytes(_) => 1,
+                    reims_vgpu_core::SampledSource::Target(_)
+                    | reims_vgpu_core::SampledSource::Attachment { .. } => 2,
+                    reims_vgpu_core::SampledSource::GuestRuns(..) => 3,
                 },
                 format: translate::pixel::vk_image_format(image.format).as_raw() as u32,
                 width: image.width,
@@ -7689,7 +7674,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // the GPU; reading either one would be a device-memory access
                 // taken to write a log line, which is not a trade this makes.
                 texel0: match &image.source {
-                    crate::backend::vulkan::engine::SampledSource::Bytes(b) => b
+                    reims_vgpu_core::SampledSource::Bytes(b) => b
                         .get(..4)
                         .map(|t| u32::from_le_bytes([t[0], t[1], t[2], t[3]]))
                         .unwrap_or(0),
@@ -7704,11 +7689,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // this list and of nothing the trail recorded before.
         let mut sampler_notes = [crate::runtime::gpu_hang_trail::SamplerNote::default();
             crate::runtime::gpu_hang_trail::SAMPLER_KEPT];
-        let mut smp_by_binding: Vec<&crate::backend::vulkan::engine::SamplerResource> =
+        let mut smp_by_binding: Vec<&reims_vgpu_core::SamplerResource> =
             resources.samplers.iter().collect();
         smp_by_binding.sort_unstable_by_key(|s| s.binding);
         for (slot, smp) in sampler_notes.iter_mut().zip(smp_by_binding.iter()) {
-            use crate::backend::vulkan::engine::{
+            use reims_vgpu_core::{
                 SamplerAddressMode as A, SamplerFilter as F, SamplerMipFilter as M,
             };
             let filter = |f: F| match f {
@@ -7755,8 +7740,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             vertex_count,
             instance_count: req.instance_count,
             indexed: resources.indexed.as_ref().map(|indexed| {
-                use crate::backend::vulkan::engine::BufferContent;
                 use crate::runtime::gpu_hang_trail::{IndexSource, IndexedNote};
+                use reims_vgpu_core::BufferContent;
                 IndexedNote {
                     index_count: indexed.index_count,
                     index_width: indexed.index_type.byte_size() as u8,
@@ -9447,7 +9432,7 @@ mod vulkan_split_tests {
         else {
             panic!("a live cache is the freshest rung");
         };
-        assert_eq!(order, crate::backend::vulkan::engine::SeedOrder::Bgra8);
+        assert_eq!(order, reims_vgpu_core::SeedOrder::Bgra8);
         assert_eq!(&bytes[..4], &[0xAA, 0xBB, 0xCC, 0xFF]);
 
         // An extent the surface is not latched at cannot be served by either rung,

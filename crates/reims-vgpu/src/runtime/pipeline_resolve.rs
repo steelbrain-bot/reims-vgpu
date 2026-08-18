@@ -121,7 +121,7 @@ impl VertexBindPlan {
                 a.format != 0
                     && crate::backend::vulkan::translate::vertex::step_function(
                         a.declared_step_function,
-                    ) == Ok(crate::backend::vulkan::engine::VertexStepFunction::Constant)
+                    ) == Ok(reims_vgpu_core::VertexStepFunction::Constant)
             })
             .map(|a| a.buffer_index)
             .collect();

@@ -569,13 +569,13 @@ fn frag_unbound_scan_reports_only_missing_standard_kinds() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn reflected_static_sampler_maps_exact_state_and_rejects_unimplemented_modes() {
-    use crate::backend::vulkan::engine::{
-        SamplerAddressMode as EngineAddress, SamplerFilter as EngineFilter,
-        SamplerMipFilter as EngineMip,
-    };
     use metal2vulkan::reflect::{
         SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerCoordinates,
         SamplerFilter, SamplerMipFilter, SamplerReduction, StaticSamplerState,
+    };
+    use reims_vgpu_core::{
+        SamplerAddressMode as EngineAddress, SamplerFilter as EngineFilter,
+        SamplerMipFilter as EngineMip,
     };
 
     let mut state = StaticSamplerState {
@@ -1258,7 +1258,7 @@ fn an_intermediate_record_can_still_ask_about_the_resident_it_renders_into() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn attachment_alias_selection_uses_only_the_texture_contract() {
-    use crate::backend::vulkan::engine::AttachmentInitial;
+    use reims_vgpu_core::AttachmentInitial;
 
     let mut req = DrawEncodeRequest::default();
     req.colors.push(ColorRtRequest {
@@ -1299,7 +1299,7 @@ fn attachment_alias_selection_uses_only_the_texture_contract() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn attachment_alias_preserves_each_declared_load_action() {
-    use crate::backend::vulkan::engine::AttachmentInitial;
+    use reims_vgpu_core::AttachmentInitial;
 
     let task_id = std::process::id();
     let texture_ref = 0xe000_0000u32.wrapping_add(task_id);
@@ -1348,7 +1348,7 @@ fn attachment_alias_preserves_each_declared_load_action() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn attachment_alias_source_keeps_one_texture_identity() {
-    use crate::backend::vulkan::engine::AttachmentInitial;
+    use reims_vgpu_core::AttachmentInitial;
 
     let identity = crate::model::TargetIdentity::Gva {
         gva: 0x4000,
@@ -2098,11 +2098,11 @@ fn vertex_attribute_preparation_returns_exact_declines() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn vulkan_sampler_preserves_guest_coordinate_and_filter_state() {
-    use crate::backend::vulkan::engine::{
+    use crate::runtime::decode::resource::SamplerDescriptor;
+    use reims_vgpu_core::{
         SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter,
         SamplerMipFilter,
     };
-    use crate::runtime::decode::resource::SamplerDescriptor;
 
     let decoded = SamplerDescriptor {
         min_filter: 0,
@@ -2236,19 +2236,10 @@ fn blend_state_maps_src_alpha_one_minus() {
         [0.0; 4],
     )
     .expect("map");
-    assert_eq!(
-        b.src_color,
-        crate::backend::vulkan::engine::BlendFactor::SrcAlpha
-    );
-    assert_eq!(
-        b.dst_color,
-        crate::backend::vulkan::engine::BlendFactor::OneMinusSrcAlpha
-    );
-    assert_eq!(b.color_op, crate::backend::vulkan::engine::BlendOp::Add);
-    assert_eq!(
-        b.src_alpha,
-        crate::backend::vulkan::engine::BlendFactor::One
-    );
+    assert_eq!(b.src_color, reims_vgpu_core::BlendFactor::SrcAlpha);
+    assert_eq!(b.dst_color, reims_vgpu_core::BlendFactor::OneMinusSrcAlpha);
+    assert_eq!(b.color_op, reims_vgpu_core::BlendOp::Add);
+    assert_eq!(b.src_alpha, reims_vgpu_core::BlendFactor::One);
     assert!(translate::blend::factor(99).is_err());
     assert!(translate::blend::operation(9).is_err());
 }
@@ -4646,7 +4637,7 @@ fn a_secondary_mrt_slot_binds_its_own_blend() {
         "slot 1 declares blending_enabled — before this fix every secondary \
              was forced unblended",
     );
-    use crate::backend::vulkan::engine::{BlendFactor, BlendOp};
+    use reims_vgpu_core::{BlendFactor, BlendOp};
     assert_eq!(blend.src_color, BlendFactor::One, "slot 1's own src factor");
     assert_eq!(blend.dst_color, BlendFactor::One, "slot 1's own dst factor");
     assert_eq!(blend.color_op, BlendOp::Add);
@@ -5105,7 +5096,7 @@ fn draw_buffers_bind_one_packed_resource_at_each_decoded_offset() {
         &backing,
     )
     .expect("the small declared resource resolves");
-    let crate::backend::vulkan::engine::BufferContent::GuestRuns(first_source) = first else {
+    let reims_vgpu_core::BufferContent::GuestRuns(first_source) = first else {
         panic!("a small resource must not be routed through a CPU snapshot")
     };
     assert_eq!(first_source.source_offset, 0);
@@ -5130,7 +5121,7 @@ fn draw_buffers_bind_one_packed_resource_at_each_decoded_offset() {
         &backing,
     )
     .expect("the retained resource serves a later offset directly");
-    let crate::backend::vulkan::engine::BufferContent::GuestRuns(source) = content else {
+    let reims_vgpu_core::BufferContent::GuestRuns(source) = content else {
         panic!("the draw stays on the guest-memory rail")
     };
     crate::runtime::guest_ram::forget_import_limits();

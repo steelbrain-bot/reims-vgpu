@@ -1525,7 +1525,7 @@ fn note_blit_iosurface_resident(state: &DeviceState, mapping_id: u32) {
         let id = crate::runtime::present_identity::surface_identity(state, mapping_id, w, h);
         crate::runtime::drain::note_store_route(
             match state.executor.resident_content_backing(&id) {
-                crate::backend::vulkan::engine::ResidentContentBacking::NotReady => {
+                reims_vgpu_core::ResidentContentBacking::NotReady => {
                     "blit_iosurface_resident_not_ready"
                 }
                 _ => "blit_iosurface_resident_ready",
@@ -4171,7 +4171,7 @@ fn try_copy_iosurface_plane_to_linear_on_gpu<M: HostMemory + HostOps>(
     );
     if matches!(
         state.executor.resident_content_backing(&identity),
-        crate::backend::vulkan::engine::ResidentContentBacking::NotReady
+        reims_vgpu_core::ResidentContentBacking::NotReady
     ) {
         // The source's bytes are its guest pages' bytes already, so the host
         // path is reading what it should and is the cheap arm rather than the

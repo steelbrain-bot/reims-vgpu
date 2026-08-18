@@ -1111,8 +1111,8 @@ fn vulkan_fixed_state_gap(req: &DrawEncodeRequest) -> String {
 #[cfg(feature = "backend-vulkan")]
 fn engine_stencil_face(
     f: &crate::runtime::decode::resource::DepthStencilFace,
-) -> Result<crate::backend::vulkan::engine::StencilFaceOps, translate::TranslateReason> {
-    Ok(crate::backend::vulkan::engine::StencilFaceOps {
+) -> Result<reims_vgpu_core::StencilFaceOps, translate::TranslateReason> {
+    Ok(reims_vgpu_core::StencilFaceOps {
         compare: translate::raster::compare_function(f.compare_function)?,
         fail_op: translate::raster::stencil_operation(f.stencil_failure_operation)?,
         depth_fail_op: translate::raster::stencil_operation(f.depth_failure_operation)?,
@@ -2216,8 +2216,8 @@ fn vulkan_sampler_resource(
     sampler_ref: u32,
     binding: u32,
     sampler: &crate::runtime::decode::resource::SamplerDescriptor,
-) -> Result<crate::backend::vulkan::engine::SamplerResource, DrawPreparationDecline> {
-    use crate::backend::vulkan::engine::SamplerResource;
+) -> Result<reims_vgpu_core::SamplerResource, DrawPreparationDecline> {
+    use reims_vgpu_core::SamplerResource;
 
     Ok(SamplerResource {
         binding,
@@ -2292,15 +2292,15 @@ pub fn reflected_static_sampler_resource(
     stage: &'static str,
     binding: u32,
     sampler: metal2vulkan::reflect::StaticSamplerState,
-) -> Result<crate::backend::vulkan::engine::SamplerResource, DrawPreparationDecline> {
-    use crate::backend::vulkan::engine::{
-        SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter,
-        SamplerMipFilter, SamplerResource,
-    };
+) -> Result<reims_vgpu_core::SamplerResource, DrawPreparationDecline> {
     use metal2vulkan::reflect::{
         SamplerAddressMode as ReflectedAddress, SamplerBorderColor as ReflectedBorder,
         SamplerCompareFunction as ReflectedCompare, SamplerCoordinates,
         SamplerFilter as ReflectedFilter, SamplerMipFilter as ReflectedMip, SamplerReduction,
+    };
+    use reims_vgpu_core::{
+        SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter,
+        SamplerMipFilter, SamplerResource,
     };
 
     if sampler.reduction != SamplerReduction::WeightedAverage {
@@ -2381,7 +2381,7 @@ pub(crate) fn load_vulkan_sampler<M: HostMemory + HostOps>(
     task_id: u32,
     sampler_ref: u32,
     binding: u32,
-) -> Result<crate::backend::vulkan::engine::SamplerResource, DrawPreparationDecline> {
+) -> Result<reims_vgpu_core::SamplerResource, DrawPreparationDecline> {
     let sampler =
         objects::resolve_sampler_state(state, host, task_id, sampler_ref).map_err(|failure| {
             match failure {

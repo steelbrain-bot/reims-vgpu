@@ -1927,7 +1927,7 @@ fn stage_texture_iosurface_plane_view_without_surface_is_missing() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn incomplete_compute_engine_call_fires_stall_proxy() {
-    use crate::backend::vulkan::engine::ComputeRequest;
+    use reims_vgpu_core::ComputeRequest;
     use std::time::Duration;
 
     let pipe = 0xf000_0000 | (std::process::id() & 0x0fff_ffff);
@@ -2476,9 +2476,9 @@ fn a_staged_buffer_carries_the_pages_its_writeback_is_bounded_to() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
-    use crate::backend::vulkan::engine::ComputeImageDestination;
     use crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM;
     use crate::runtime::drain::census::store_route_count;
+    use reims_vgpu_core::ComputeImageDestination;
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let held = reims_vgpu_vulkan::format::vk_storage_image(

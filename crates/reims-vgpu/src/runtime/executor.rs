@@ -598,8 +598,8 @@ impl ExecutionPort for VulkanExecutor {
                     .filter(|image| {
                         matches!(
                             &image.source,
-                            crate::backend::vulkan::engine::SampledSource::Bytes(_)
-                                | crate::backend::vulkan::engine::SampledSource::GuestRuns(..)
+                            reims_vgpu_core::SampledSource::Bytes(_)
+                                | reims_vgpu_core::SampledSource::GuestRuns(..)
                         )
                     })
                     .filter_map(|image| image.content)
@@ -614,8 +614,8 @@ impl ExecutionPort for VulkanExecutor {
                     .filter(|image| {
                         matches!(
                             &image.source,
-                            crate::backend::vulkan::engine::ComputeSampledImageSource::Bytes(_)
-                                | crate::backend::vulkan::engine::ComputeSampledImageSource::GuestPages(_)
+                            reims_vgpu_core::ComputeSampledImageSource::Bytes(_)
+                                | reims_vgpu_core::ComputeSampledImageSource::GuestPages(_)
                         )
                     })
                     .filter_map(|image| image.content)

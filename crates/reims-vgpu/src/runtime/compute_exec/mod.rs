@@ -1501,8 +1501,8 @@ fn direct_destination<M: HostMemory + HostOps>(
     host: &mut M,
     tex: &StagedTexture,
     held: ash::vk::Format,
-) -> crate::backend::vulkan::engine::ComputeImageDestination {
-    use crate::backend::vulkan::engine::ComputeImageDestination;
+) -> reims_vgpu_core::ComputeImageDestination {
+    use reims_vgpu_core::ComputeImageDestination;
     let TextureWriteback::Linear {
         texture_ref,
         gva,
@@ -1576,7 +1576,7 @@ fn direct_destination<M: HostMemory + HostOps>(
 ///
 /// The destination that *can* describe it already existed on the render rail,
 /// resolving the sample window, walking the mapping's page entries and building
-/// the same [`crate::backend::vulkan::engine::GuestPageTarget`] this rail wants.
+/// the same [`reims_vgpu_memory::GuestPageTarget`] this rail wants.
 /// It is now [`crate::runtime::mapping_write::licence_iosurface_texture_surface`] and both
 /// rails ask it, so the surface geometry, the format rule, the page walk and the
 /// guest-RAM references have one spelling rather than two.
@@ -1590,8 +1590,8 @@ fn iosurface_texture_destination<M: HostMemory + HostOps>(
     host: &mut M,
     tex: &StagedTexture,
     held: ash::vk::Format,
-) -> crate::backend::vulkan::engine::ComputeImageDestination {
-    use crate::backend::vulkan::engine::ComputeImageDestination;
+) -> reims_vgpu_core::ComputeImageDestination {
+    use reims_vgpu_core::ComputeImageDestination;
     let TextureWriteback::IOSurface {
         mapping_id,
         surface_offset,
@@ -3697,9 +3697,10 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     acc: &ComputeAccum,
     cmd: &ComputeCommand,
 ) -> ComputeStatus {
-    use crate::backend::vulkan::engine::{
-        self as vk_engine, ComputeBufferResource, ComputeImageResult, ComputeRequest,
-        ComputeSampledImageResource, ComputeStorageImageResource, DrawError,
+    use crate::backend::vulkan::engine::{self as vk_engine, DrawError};
+    use reims_vgpu_core::{
+        ComputeBufferResource, ComputeImageResult, ComputeRequest, ComputeSampledImageResource,
+        ComputeStorageImageResource,
     };
 
     if acc.pipeline_ref == 0 {
@@ -4064,10 +4065,10 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             backing: match std::mem::replace(&mut s.input, VulkanBufferInput::HostBytes(Vec::new()))
             {
                 VulkanBufferInput::HostBytes(bytes) => {
-                    crate::backend::vulkan::engine::ComputeBufferBacking::Bytes(bytes)
+                    reims_vgpu_core::ComputeBufferBacking::Bytes(bytes)
                 }
                 VulkanBufferInput::GuestPages(source) => {
-                    crate::backend::vulkan::engine::ComputeBufferBacking::GuestPages {
+                    reims_vgpu_core::ComputeBufferBacking::GuestPages {
                         source,
                         write_pages: s.pages.iter().copied().collect(),
                     }
@@ -4233,13 +4234,13 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             let seed =
                 match std::mem::replace(&mut t.input, VulkanTextureInput::HostBytes(Vec::new())) {
                     VulkanTextureInput::HostBytes(bytes) => {
-                        crate::backend::vulkan::engine::ComputeStorageImageSeed::Bytes(bytes)
+                        reims_vgpu_core::ComputeStorageImageSeed::Bytes(bytes)
                     }
                     VulkanTextureInput::GuestPages(source) => {
-                        crate::backend::vulkan::engine::ComputeStorageImageSeed::GuestPages(source)
+                        reims_vgpu_core::ComputeStorageImageSeed::GuestPages(source)
                     }
                     VulkanTextureInput::Resident(ResidentServe::Seed(_)) => {
-                        crate::backend::vulkan::engine::ComputeStorageImageSeed::Resident
+                        reims_vgpu_core::ComputeStorageImageSeed::Resident
                     }
                     VulkanTextureInput::Resident(ResidentServe::Sample(..)) => {
                         crate::observe::fail(format!(
@@ -4269,15 +4270,15 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                     t,
                     reims_vgpu_vulkan::format::vk_storage_image(shader_fmt),
                 ),
-                residency: t.residency.map(|candidate| {
-                    crate::backend::vulkan::engine::ComputeStorageResidency {
+                residency: t
+                    .residency
+                    .map(|candidate| reims_vgpu_core::ComputeStorageResidency {
                         identity: candidate.key,
                         seed_generation: candidate.seed_generation,
                         output_generation: next_mapping_content_generation(
                             candidate.seed_generation,
                         ),
-                    }
-                }),
+                    }),
             });
         } else {
             let Some(sampled_fmt) = mtl_to_engine_sampled(t.pixel_format) else {
@@ -4290,16 +4291,14 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             let source =
                 match std::mem::replace(&mut t.input, VulkanTextureInput::HostBytes(Vec::new())) {
                     VulkanTextureInput::HostBytes(bytes) => {
-                        crate::backend::vulkan::engine::ComputeSampledImageSource::Bytes(bytes)
+                        reims_vgpu_core::ComputeSampledImageSource::Bytes(bytes)
                     }
                     VulkanTextureInput::GuestPages(source) => {
-                        crate::backend::vulkan::engine::ComputeSampledImageSource::GuestPages(
-                            source,
-                        )
+                        reims_vgpu_core::ComputeSampledImageSource::GuestPages(source)
                     }
                     VulkanTextureInput::Resident(ResidentServe::Sample(identity, generation)) => {
-                        crate::backend::vulkan::engine::ComputeSampledImageSource::Resident(
-                            crate::backend::vulkan::engine::ComputeResidentSampleBind {
+                        reims_vgpu_core::ComputeSampledImageSource::Resident(
+                            reims_vgpu_core::ComputeResidentSampleBind {
                                 identity,
                                 generation,
                             },
@@ -4365,13 +4364,11 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             format: reims_vgpu_protocol::StorageImageFormat::Rgba8Unorm,
             width: NEUTRAL_SAMPLED_IMAGE_EXTENT,
             height: NEUTRAL_SAMPLED_IMAGE_EXTENT,
-            source: crate::backend::vulkan::engine::ComputeSampledImageSource::Bytes(
-                pixel_format::solid_rgba8(
-                    NEUTRAL_SAMPLED_IMAGE_EXTENT,
-                    NEUTRAL_SAMPLED_IMAGE_EXTENT,
-                    &[0.0; 4],
-                ),
-            ),
+            source: reims_vgpu_core::ComputeSampledImageSource::Bytes(pixel_format::solid_rgba8(
+                NEUTRAL_SAMPLED_IMAGE_EXTENT,
+                NEUTRAL_SAMPLED_IMAGE_EXTENT,
+                &[0.0; 4],
+            )),
             content: None,
         });
     }
@@ -4433,11 +4430,9 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 };
                 samplers.push(sampler);
             } else {
-                samplers.push(
-                    crate::backend::vulkan::engine::SamplerResource::normalized_default(
-                        reflected.binding,
-                    ),
-                );
+                samplers.push(reims_vgpu_core::SamplerResource::normalized_default(
+                    reflected.binding,
+                ));
             }
         }
     }
@@ -4543,7 +4538,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             return ComputeStatus::BackendFailed("compute_vk_readback_binding");
         };
         match buffer.result {
-            crate::backend::vulkan::engine::ComputeBufferResult::Bytes(bytes) => {
+            reims_vgpu_core::ComputeBufferResult::Bytes(bytes) => {
                 s.bytes = bytes;
                 if let Err(e) = writeback_buffer(
                     state,
@@ -4556,7 +4551,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                     return e;
                 }
             }
-            crate::backend::vulkan::engine::ComputeBufferResult::Landed { bytes } => {
+            reims_vgpu_core::ComputeBufferResult::Landed { bytes } => {
                 crate::runtime::drain::note_store_route("compute_buffer_wb_landed");
                 crate::runtime::drain::note_store_route_n("compute_buffer_wb_landed_bytes", bytes);
             }
@@ -4692,7 +4687,7 @@ const COMPUTE_ENGINE_STALL_PROXY_MS: u64 = 2_000;
 #[cfg(feature = "backend-vulkan")]
 fn spawn_compute_engine_stall_watchdog(
     pipeline_ref: u32,
-    req: &crate::backend::vulkan::engine::ComputeRequest,
+    req: &reims_vgpu_core::ComputeRequest,
     threshold: std::time::Duration,
 ) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
     use std::sync::atomic::{AtomicBool, Ordering};
