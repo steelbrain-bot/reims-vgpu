@@ -6,7 +6,7 @@
 use ash::vk;
 
 use crate::backend::vulkan::translate;
-pub use crate::runtime::decode::resource::ColorWriteMask;
+pub use reims_vgpu_protocol::ColorWriteMask;
 
 /// Named engine failure. Stable prefixes for observe greps (`vk_engine_*`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -241,7 +241,7 @@ pub struct DepthState {
     ///
     /// The depth buffer is **the guest's resource**, not this device's scratch:
     /// the guest allocated a depth texture and bound it, and
-    /// [`crate::runtime::decode::render::DepthAttachment::texture_ref`] is its
+    /// The decoded depth attachment's texture reference is its
     /// ref. Carrying it lets the engine resolve one resident per guest texture
     /// out of the registry, which is what makes the depth allocation live as
     /// long as the guest's texture does instead of as long as one draw.

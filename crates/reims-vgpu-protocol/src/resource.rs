@@ -2,6 +2,48 @@
 
 use core::fmt;
 
+/// Number of color attachments carried by one render pass and pipeline.
+///
+/// Derived from the wire array width so pass decoding, pipeline decoding, and
+/// backend allocation cannot acquire independent bounds.
+pub const MAX_COLOR_ATTACHMENTS: usize =
+    reims_vgpu_wire::ops::render_pass::RENDER_PASS_COLOR_ATTACHMENTS;
+
+// `MTLColorWriteMask` bits, in Metal's alpha-first ordering.
+pub const MTL_COLOR_WRITE_MASK_NONE: u32 = 0;
+pub const MTL_COLOR_WRITE_MASK_ALPHA: u32 = 1 << 0;
+pub const MTL_COLOR_WRITE_MASK_BLUE: u32 = 1 << 1;
+pub const MTL_COLOR_WRITE_MASK_GREEN: u32 = 1 << 2;
+pub const MTL_COLOR_WRITE_MASK_RED: u32 = 1 << 3;
+pub const MTL_COLOR_WRITE_MASK_ALL: u32 = 0xf;
+
+/// Channels written by one render-pipeline color attachment.
+///
+/// Default is `all`, matching Metal descriptor semantics; a derived zero
+/// default would instead suppress every color write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ColorWriteMask {
+    bits: u32,
+}
+
+impl Default for ColorWriteMask {
+    fn default() -> Self {
+        Self {
+            bits: MTL_COLOR_WRITE_MASK_ALL,
+        }
+    }
+}
+
+impl ColorWriteMask {
+    pub fn new(bits: u32) -> Option<Self> {
+        (bits <= MTL_COLOR_WRITE_MASK_ALL).then_some(Self { bits })
+    }
+
+    pub const fn bits(self) -> u32 {
+        self.bits
+    }
+}
+
 /// Marker for the sampler API's independent reference namespace.
 pub enum SamplerObject {}
 /// Marker for the depth-stencil API's independent reference namespace.
@@ -196,5 +238,14 @@ mod tests {
             decode_object_list_entry(&entry(0xfe, 16, 0x7000)),
             Err(ObjectListDecodeError::UnknownKind { wire_tag: 0xfe })
         );
+    }
+
+    #[test]
+    fn color_write_masks_are_total_over_the_contract_bits() {
+        assert_eq!(ColorWriteMask::default().bits(), MTL_COLOR_WRITE_MASK_ALL);
+        for bits in 0..=MTL_COLOR_WRITE_MASK_ALL {
+            assert_eq!(ColorWriteMask::new(bits).unwrap().bits(), bits);
+        }
+        assert_eq!(ColorWriteMask::new(MTL_COLOR_WRITE_MASK_ALL + 1), None);
     }
 }

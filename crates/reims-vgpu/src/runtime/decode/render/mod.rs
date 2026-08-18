@@ -154,7 +154,7 @@ pub(crate) const PASS_DEPTH_ATTACH_CLEAR_DEPTH: usize =
 #[cfg(test)]
 pub(crate) const PASS_STENCIL_ATTACH_CLEAR_STENCIL: usize =
     core::mem::offset_of!(wire_pass::StencilAttachmentBody, clear_stencil);
-pub const PASS_MAX_COLOR_ATTACHMENTS: usize = wire_pass::RENDER_PASS_COLOR_ATTACHMENTS;
+pub const PASS_MAX_COLOR_ATTACHMENTS: usize = reims_vgpu_protocol::MAX_COLOR_ATTACHMENTS;
 
 /// Offset of the pass-level tail, past the last colour slot.
 ///

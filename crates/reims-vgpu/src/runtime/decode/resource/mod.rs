@@ -12,7 +12,11 @@ use reims_vgpu_wire::ops::{
 };
 use reims_vgpu_wire::OP_HEADER_LEN as OP_HDR;
 
-pub use reims_vgpu_protocol::{ObjectKind, ObjectListEntry as ListObjectEntry};
+pub use reims_vgpu_protocol::{
+    ColorWriteMask, ObjectKind, ObjectListEntry as ListObjectEntry, MTL_COLOR_WRITE_MASK_ALL,
+    MTL_COLOR_WRITE_MASK_ALPHA, MTL_COLOR_WRITE_MASK_BLUE, MTL_COLOR_WRITE_MASK_GREEN,
+    MTL_COLOR_WRITE_MASK_NONE, MTL_COLOR_WRITE_MASK_RED,
+};
 
 /// A refusal from the descriptor decoder.
 ///
@@ -619,44 +623,6 @@ impl VertexAttribute {
     }
 }
 
-/// `MTLColorWriteMask` for one attachment, in Metal's own bit order.
-///
-/// A newtype rather than a bare `u32` for one reason: the value that means
-/// "write every channel" is `0xf`, and the value a derived `Default` would
-/// produce is `0` — which means *write nothing*. `PipelineColorAttachment` is
-/// built with `..Default::default()` in the decoder and defaulted outright at
-/// several call sites, so a bare field would make an omitted mask a black
-/// attachment. Here the omission is unwritable: `Default` is `all`, which is
-/// also what an entry that does not carry tag `0x09` means on the wire.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ColorWriteMask {
-    /// Private so the only ways to obtain one are [`ColorWriteMask::new`],
-    /// which range-checks, and `Default`, which is `all`. A `pub` field would
-    /// also make this a decode field needing its own coverage disposition,
-    /// when the disposition that matters is `PipelineColorAttachment`'s.
-    bits: u32,
-}
-
-impl Default for ColorWriteMask {
-    fn default() -> Self {
-        Self {
-            bits: MTL_COLOR_WRITE_MASK_ALL,
-        }
-    }
-}
-
-impl ColorWriteMask {
-    /// `None` for a value outside `MTLColorWriteMask`'s four bits — see
-    /// [`ColorWriteMaskOutOfRange`], which is what the decoder reports for it.
-    pub fn new(bits: u32) -> Option<Self> {
-        (bits <= MTL_COLOR_WRITE_MASK_ALL).then_some(Self { bits })
-    }
-
-    pub fn bits(self) -> u32 {
-        self.bits
-    }
-}
-
 /// One pipeline color-attachment entry (format + blend) from the type-7 color section.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PipelineColorAttachment {
@@ -1171,12 +1137,6 @@ pub const BLEND_OP_ADD: u32 = 0;
 // where a member has no reader. `_NONE` has one on the Vulkan arm only, and
 // gating it on that arm would make the mirror's completeness depend on which
 // backend is compiled — which is the property a mirror exists to not have.
-pub const MTL_COLOR_WRITE_MASK_NONE: u32 = 0;
-pub const MTL_COLOR_WRITE_MASK_ALPHA: u32 = 1 << 0;
-pub const MTL_COLOR_WRITE_MASK_BLUE: u32 = 1 << 1;
-pub const MTL_COLOR_WRITE_MASK_GREEN: u32 = 1 << 2;
-pub const MTL_COLOR_WRITE_MASK_RED: u32 = 1 << 3;
-pub const MTL_COLOR_WRITE_MASK_ALL: u32 = 0xf;
 
 /// Live function descriptor (reims_vgpu_resource_format.h).
 pub const FUNCTION_DESC_BLOB_GVA: usize = 0;
@@ -3390,15 +3350,7 @@ fn note_color_table_truncated(
 /// section naming more than eight is malformed rather than something we chose
 /// not to read. Same bound as `render::PASS_MAX_COLOR_ATTACHMENTS`, stated here
 /// because this is the pipeline-descriptor side of the same Metal limit.
-const MAX_COLOR_ATTACHMENTS: usize = 8;
-// The doc above says "same bound" and then writes the number again, which is the
-// one thing that cannot keep it true. The pass side derives its copy from the
-// wire record's own array width (`wire::RENDER_PASS_COLOR_ATTACHMENTS`), so this
-// pin makes the claim checkable: if Apple's record ever carries more slots, the
-// two sides part at compile time instead of this one refusing pipeline
-// descriptors the pass decoder happily accepts.
-const _: () =
-    assert!(MAX_COLOR_ATTACHMENTS == crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS);
+const MAX_COLOR_ATTACHMENTS: usize = reims_vgpu_protocol::MAX_COLOR_ATTACHMENTS;
 
 /// Parse all color-attachment entries.
 ///

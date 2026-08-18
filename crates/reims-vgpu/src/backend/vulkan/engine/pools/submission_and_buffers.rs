@@ -4225,8 +4225,7 @@ mod recycle_tests {
         }
         assert_eq!(
             pools.attachment_snapshot_free.count_for(&key),
-            BATCH_MAX_DRAWS as usize
-                * (crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS + 1)
+            BATCH_MAX_DRAWS as usize * (reims_vgpu_protocol::MAX_COLOR_ATTACHMENTS + 1)
         );
         assert!(
             pools
@@ -4255,8 +4254,7 @@ mod recycle_tests {
         assert!(pool.admit(over.key(), over).is_some());
         assert_eq!(
             pool.len(),
-            BATCH_MAX_DRAWS as usize
-                * (crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS + 1)
+            BATCH_MAX_DRAWS as usize * (reims_vgpu_protocol::MAX_COLOR_ATTACHMENTS + 1)
         );
     }
 

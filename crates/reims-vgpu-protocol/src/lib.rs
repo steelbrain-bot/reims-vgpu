@@ -28,9 +28,11 @@ pub use identity::{
 };
 pub use pixel::{StorageImageFormat, TexelLayout};
 pub use resource::{
-    decode_object_list_entry, ComputePipelineObject, DepthStencilObject, EventObject, FenceObject,
-    FunctionObject, ObjectKind, ObjectListDecodeError, ObjectListEntry, RenderPipelineObject,
-    SamplerObject, OBJECT_LIST_ENTRY_LEN,
+    decode_object_list_entry, ColorWriteMask, ComputePipelineObject, DepthStencilObject,
+    EventObject, FenceObject, FunctionObject, ObjectKind, ObjectListDecodeError, ObjectListEntry,
+    RenderPipelineObject, SamplerObject, MAX_COLOR_ATTACHMENTS, MTL_COLOR_WRITE_MASK_ALL,
+    MTL_COLOR_WRITE_MASK_ALPHA, MTL_COLOR_WRITE_MASK_BLUE, MTL_COLOR_WRITE_MASK_GREEN,
+    MTL_COLOR_WRITE_MASK_NONE, MTL_COLOR_WRITE_MASK_RED, OBJECT_LIST_ENTRY_LEN,
 };
 pub use resource_state::ResourceValidityOps;
 pub use submission::{
