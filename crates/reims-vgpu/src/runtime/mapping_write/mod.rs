@@ -904,12 +904,10 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
             format,
         },
     )?;
-    crate::backend::vulkan::engine::copy_target_to_guest_pages(
-        identity,
-        &licence.target,
-        &licence.gpas,
-    )
-    .map_err(|inner| GpuWritebackDecline::Engine { inner })?;
+    state
+        .executor
+        .copy_target_to_guest_pages(identity, &licence.target, &licence.gpas)
+        .map_err(|inner| GpuWritebackDecline::Engine { inner })?;
     note_iosurface_texture_landed(state, mapping_id, licence.base_off, licence.span_end);
     Ok(licence.span_end - licence.base_off)
 }

@@ -133,7 +133,7 @@ fn try_capture_from_resident(
     let need = buf.len();
     let identity =
         crate::runtime::present_identity::surface_identity(state, mapping_id, width, height);
-    let Some(bgra) = crate::backend::vulkan::engine::read_resident_bgra(&identity, need) else {
+    let Some(bgra) = state.executor.read_resident_bgra(&identity, need) else {
         return false;
     };
     debug_assert_eq!(bgra.len(), need);

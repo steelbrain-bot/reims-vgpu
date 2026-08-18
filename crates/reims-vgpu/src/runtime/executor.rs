@@ -6,7 +6,7 @@
 
 use crate::backend::vulkan::engine::{
     ComputeOutput, ComputeRequest, DrawError, DrawOutput, DrawRequest, EngineFacadeDecline,
-    ResidentContent, ResidentContentBacking, StorageImageFormat, TargetIdentity,
+    ResidentContent, ResidentContentBacking, StorageImageFormat, TargetIdentity, TargetReadback,
 };
 use reims_vgpu_protocol::{SegmentBoundary, SubmissionIdentity, SubmissionResourceUse};
 use std::sync::Arc;
@@ -212,6 +212,42 @@ pub trait Executor: std::fmt::Debug + Send + Sync {
     ) {
     }
 
+    fn read_target(&self, _identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
+        Err(DrawError::Facade(
+            EngineFacadeDecline::ExecutorServiceUnavailable {
+                service: "target_readback",
+            },
+        ))
+    }
+
+    fn read_target_leased(
+        &self,
+        _identity: &TargetIdentity,
+    ) -> Result<Option<crate::backend::vulkan::engine::LeasedFrame>, DrawError> {
+        Err(DrawError::Facade(
+            EngineFacadeDecline::ExecutorServiceUnavailable {
+                service: "leased_target_readback",
+            },
+        ))
+    }
+
+    fn copy_target_to_guest_pages(
+        &self,
+        _identity: &TargetIdentity,
+        _target: &crate::backend::vulkan::engine::GuestPageTarget,
+        _pages: &[u64],
+    ) -> Result<(), DrawError> {
+        Err(DrawError::Facade(
+            EngineFacadeDecline::ExecutorServiceUnavailable {
+                service: "target_to_guest_pages",
+            },
+        ))
+    }
+
+    fn read_resident_bgra(&self, _identity: &TargetIdentity, _need: usize) -> Option<Vec<u8>> {
+        None
+    }
+
     fn execute(&self, submission: ResolvedSubmission) -> Result<ExecutionCompletion, DrawError>;
 
     /// End one guest lifetime while preserving shareable physical-GPU state.
@@ -319,6 +355,30 @@ impl Executor for VulkanExecutor {
         identity: &crate::model::ComputeStorageResidencyKey,
     ) {
         crate::backend::vulkan::engine::note_resident_storage_copied_out(identity);
+    }
+
+    fn read_target(&self, identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
+        crate::backend::vulkan::engine::read_target(identity)
+    }
+
+    fn read_target_leased(
+        &self,
+        identity: &TargetIdentity,
+    ) -> Result<Option<crate::backend::vulkan::engine::LeasedFrame>, DrawError> {
+        crate::backend::vulkan::engine::read_target_leased(identity)
+    }
+
+    fn copy_target_to_guest_pages(
+        &self,
+        identity: &TargetIdentity,
+        target: &crate::backend::vulkan::engine::GuestPageTarget,
+        pages: &[u64],
+    ) -> Result<(), DrawError> {
+        crate::backend::vulkan::engine::copy_target_to_guest_pages(identity, target, pages)
+    }
+
+    fn read_resident_bgra(&self, identity: &TargetIdentity, need: usize) -> Option<Vec<u8>> {
+        crate::backend::vulkan::engine::read_resident_bgra(identity, need)
     }
 
     fn execute(&self, submission: ResolvedSubmission) -> Result<ExecutionCompletion, DrawError> {
@@ -576,6 +636,31 @@ mod tests {
             state.executor.compute_resident_storage_generation(&key),
             Some(41)
         );
+    }
+
+    #[test]
+    fn an_executor_without_readback_refuses_by_service_name() {
+        let state = DeviceState::new_with_executor(
+            DeviceId(1),
+            12,
+            Arc::new(ScriptedExecutor::new(ScriptedCompletion::Draw)),
+        );
+        let identity = TargetIdentity::Gva {
+            gva: 0x8000,
+            width: 16,
+            height: 16,
+            generation: 3,
+            format: crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
+        };
+
+        assert!(matches!(
+            state.executor.read_target(&identity),
+            Err(DrawError::Facade(
+                EngineFacadeDecline::ExecutorServiceUnavailable {
+                    service: "target_readback"
+                }
+            ))
+        ));
     }
 
     #[test]

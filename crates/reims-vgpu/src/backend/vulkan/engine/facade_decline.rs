@@ -15,6 +15,9 @@ use reims_vgpu_protocol::SubmissionIdentity;
 /// A specific engine façade or host-window presenter state failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EngineFacadeDecline {
+    ExecutorServiceUnavailable {
+        service: &'static str,
+    },
     ExecutorCompletionKindMismatch {
         expected: &'static str,
         actual: &'static str,
@@ -40,6 +43,7 @@ pub enum EngineFacadeDecline {
 impl Decline for EngineFacadeDecline {
     fn slug(&self) -> &'static str {
         match self {
+            Self::ExecutorServiceUnavailable { .. } => "vk_engine_executor_service_unavailable",
             Self::ExecutorCompletionKindMismatch { .. } => {
                 "vk_engine_executor_completion_kind_mismatch"
             }
@@ -59,6 +63,9 @@ impl Decline for EngineFacadeDecline {
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
+            Self::ExecutorServiceUnavailable { service } => {
+                vec![("service", (*service).to_string())]
+            }
             Self::ExecutorCompletionKindMismatch { expected, actual } => vec![
                 ("expected", (*expected).to_string()),
                 ("actual", (*actual).to_string()),
@@ -110,6 +117,9 @@ mod tests {
 
     fn all() -> Vec<EngineFacadeDecline> {
         vec![
+            EngineFacadeDecline::ExecutorServiceUnavailable {
+                service: "target_readback",
+            },
             EngineFacadeDecline::ExecutorCompletionKindMismatch {
                 expected: "draw",
                 actual: "compute",
@@ -153,7 +163,7 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 6, "the engine façade reason census moved");
+        assert_eq!(before, 7, "the engine façade reason census moved");
         assert_eq!(before, slugs.len(), "duplicate engine façade slug");
     }
 

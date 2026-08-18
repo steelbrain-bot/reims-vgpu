@@ -4419,7 +4419,7 @@ fn land_chain_before_abandon<M: HostMemory + HostOps>(
     #[cfg(feature = "backend-vulkan")]
     if end.resident && chain_rgba.is_none() {
         if let Some(identity) = draw::render_chain_identity(state, req) {
-            *chain_rgba = draw::read_resident_chain(req, &identity);
+            *chain_rgba = draw::read_resident_chain(state.executor.as_ref(), req, &identity);
         }
     }
     #[cfg(not(feature = "backend-vulkan"))]

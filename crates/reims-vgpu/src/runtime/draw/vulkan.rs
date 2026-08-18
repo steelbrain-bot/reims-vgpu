@@ -321,7 +321,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     // run exactly as it does for a Store that never skipped its
                     // readback. `read_resident_chain` fail-logs a lost resident.
                     note_iosurface_texture_store_route("gva_store_sync");
-                    draw_rgba = read_resident_chain(req, &identity);
+                    draw_rgba = read_resident_chain(state.executor.as_ref(), req, &identity);
                     crate::observe::line(format!(
                         "linux_m2v_draw ok resident_gva_store pipe={} {}x{} gva={:#x} rgba={}",
                         req.pipeline_ref,
@@ -385,7 +385,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         // readback the rail exists to avoid, which is the point —
                         // the fallback is a cost, never a lost frame.
                         note_iosurface_texture_store_route("surface_resident_sync");
-                        draw_rgba = read_resident_chain(req, &identity);
+                        draw_rgba = read_resident_chain(state.executor.as_ref(), req, &identity);
                         crate::observe::line(format!(
                             "linux_m2v_draw ok resident_surface_store_sync_fallback pipe={} {}x{} mid={} rgba={}",
                             req.pipeline_ref,
@@ -8551,10 +8551,11 @@ pub(crate) fn gva_resident_format(
 /// mapping generation than the one the registry holds. See
 /// [`M2vDrawSpan::ResidentSurfaceStore`].
 pub(crate) fn read_resident_chain(
+    executor: &dyn crate::runtime::executor::Executor,
     req: &DrawEncodeRequest,
     identity: &crate::backend::vulkan::engine::TargetIdentity,
 ) -> Option<Vec<u8>> {
-    match crate::backend::vulkan::engine::read_target(identity) {
+    match executor.read_target(identity) {
         // Every caller of this function — `writeback_chain_rgba` and the GVA
         // arm-refusal fallback — has an RGBA contract, so the exchange happens
         // here, once, rather than at three call sites that would each have to

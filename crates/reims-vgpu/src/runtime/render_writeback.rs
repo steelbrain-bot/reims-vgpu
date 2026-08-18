@@ -903,7 +903,7 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
     // to lend. Reading the `Err` as fatal cost 34 frames a boot on exactly the
     // host class that has no second rail, and no boot of a capable host could
     // have shown it.
-    let leased = match crate::backend::vulkan::engine::read_target_leased(identity) {
+    let leased = match state.executor.read_target_leased(identity) {
         Ok(leased) => leased,
         Err(decline) => {
             // The typed fields, not `Display`. `TargetReadDecline::UnknownIdentity`
@@ -946,7 +946,7 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
         leased => {
             drop(leased);
             crate::runtime::drain::note_store_route("render_flush_copied");
-            match crate::backend::vulkan::engine::read_target(identity) {
+            match state.executor.read_target(identity) {
                 Ok(rb) => {
                     // Shared rather than owned outright: the write's tail
                     // publishes this frame to the surface cache, and a cache
@@ -1239,7 +1239,9 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
     // pass and not the no-op this comment used to claim. Both spellings of that
     // declaration must reach the same answer; `ResidentReadSnapshot::bgra` is
     // where they do, and where they did not.
-    let rgba = crate::backend::vulkan::engine::read_target(identity)
+    let rgba = state
+        .executor
+        .read_target(identity)
         .map_err(|inner| GvaWritebackDecline::CopiedReadRefused { inner })?
         .into_rgba8();
     let extent = land_gva_frame_bytes(state, host, task_id, c0, texture_ref, &rgba, pages)?;
@@ -1596,7 +1598,9 @@ pub(crate) fn copy_resident_into_gva_plane<M: HostMemory + HostOps>(
         gpas,
         extent,
     } = &licence;
-    crate::backend::vulkan::engine::copy_target_to_guest_pages(identity, target, gpas)
+    state
+        .executor
+        .copy_target_to_guest_pages(identity, target, gpas)
         .map_err(|inner| GvaWritebackDecline::Engine { inner })?;
     let extent = *extent;
     // Nothing here leaves a host copy of the frame, so neither GVA-keyed cache
