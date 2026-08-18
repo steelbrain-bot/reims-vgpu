@@ -1787,16 +1787,18 @@ fn note_storage_residency_writeback(state: &mut DeviceState, texture: &StagedTex
     // wrote guest pages and every guest-page writer calls the same overlap
     // invalidation — kept here as defense in depth); keep disjoint siblings
     // (ping-pong canvases) but bound the count.
-    let mapping_id = candidate.key.mapping_id;
-    state.invalidate_storage_residency_window(
-        mapping_id,
-        candidate.key.surface_offset,
-        candidate.key.span_end,
-    );
+    let Some((mapping_id, surface_offset, span_end)) = candidate.key.surface_window() else {
+        return;
+    };
+    state.invalidate_storage_residency_window(mapping_id, surface_offset, span_end);
     let siblings: Vec<crate::model::ComputeStorageResidencyKey> = state
         .compute_storage_residency
         .keys()
-        .filter(|key| key.mapping_id == mapping_id && **key != candidate.key)
+        .filter(|key| {
+            key.surface_window()
+                .is_some_and(|(candidate, _, _)| candidate == mapping_id)
+                && **key != candidate.key
+        })
         .cloned()
         .collect();
     // Counting the window inserted below, so the cap bounds the population this
@@ -1809,8 +1811,11 @@ fn note_storage_residency_writeback(state: &mut DeviceState, texture: &StagedTex
         // not free and it must not be invisible.
         crate::observe::off(format!(
             "compute_mirror_evicted mid={mapping_id} off={} end={} siblings={} cap={}",
-            victim.surface_offset,
-            victim.span_end,
+            victim
+                .surface_window()
+                .map(|(_, start, _)| start)
+                .unwrap_or(0),
+            victim.surface_window().map(|(_, _, end)| end).unwrap_or(0),
             siblings.len(),
             STORAGE_RESIDENCY_WINDOWS_PER_MAPPING
         ));
@@ -2506,7 +2511,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             ));
         }
         #[cfg(feature = "backend-vulkan")]
-        let residency_key = crate::model::ComputeStorageResidencyKey {
+        let residency_key = crate::model::ComputeStorageResidencyKey::surface(
             mapping_id,
             map_generation,
             surface_offset,
@@ -2514,9 +2519,8 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             span_end,
             width,
             height,
-            pixel_format: stage_fmt,
-            texture_ref: 0,
-        };
+            stage_fmt,
+        );
         // Chained-dispatch restage skip: when guest pages still hold exactly
         // our own last writeback for THIS WINDOW (mirror entry survives only
         // while no intersecting guest write lands — `DeviceState::

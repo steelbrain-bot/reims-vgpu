@@ -2281,40 +2281,67 @@ impl MappingEntry {
     }
 }
 
+/// Storage origin of a compute-resident texture.
+///
+/// These are different guest-semantic identities, not alternate spellings of
+/// one flat key. In particular a task id is never stored in a mapping-generation
+/// field and absence of a mapping is never encoded as `mapping_id == 0`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ComputeStorageOrigin {
+    Surface {
+        mapping_id: u32,
+        map_generation: u32,
+        surface_offset: u64,
+        surface_bpr: u32,
+        span_end: u64,
+    },
+    Linear {
+        task_id: u32,
+        texture_ref: u32,
+        gva: u64,
+        row_stride: u32,
+        span_end: u64,
+    },
+    Heap {
+        task_id: u32,
+        texture_ref: u32,
+    },
+}
+
 /// Exact protocol-backed compute storage-image view eligible for residency.
-///
-/// `map_generation` separates recycled mapping lifetimes. The remaining fields
-/// distinguish Metal texture views over one IOSurface; equal mapping ids alone
-/// are not enough when formats or plane windows differ.
-///
-/// Three window kinds share this shape (`texture_ref` appended last so the
-/// `(mapping_id, …)` ordering prefix — and every mapping-keyed range scan —
-/// is unchanged):
-/// - **Surface window** (`mapping_id != 0`): an IOSurface view;
-///   `texture_ref == 0`.
-/// - **Linear window** (`mapping_id == 0`): a type-2/3 raw task-GVA texture,
-///   identity-matched to its `host_linear_textures` cache entry —
-///   `map_generation` holds the task id, `surface_offset` the level-0 GVA,
-///   `surface_bpr` the row stride, `span_end` `row_stride * height`, and
-///   `texture_ref` the object-list ref. Mapping-keyed scans never see these
-///   (real mapping ids are nonzero).
-/// - **Heap texture** (`mapping_id == 0`, `surface_offset == 0`): a host-only
-///   opcode-0x15 texture. `map_generation` holds the task id and `texture_ref`
-///   the heap-texture object ref. It has no guest GVA to flush or restage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ComputeStorageResidencyKey {
-    pub mapping_id: u32,
-    pub map_generation: u32,
-    pub surface_offset: u64,
-    pub surface_bpr: u32,
-    pub span_end: u64,
+    pub origin: ComputeStorageOrigin,
     pub width: u32,
     pub height: u32,
     pub pixel_format: u16,
-    pub texture_ref: u32,
 }
 
 impl ComputeStorageResidencyKey {
+    pub fn surface(
+        mapping_id: u32,
+        map_generation: u32,
+        surface_offset: u64,
+        surface_bpr: u32,
+        span_end: u64,
+        width: u32,
+        height: u32,
+        pixel_format: u16,
+    ) -> Self {
+        Self {
+            origin: ComputeStorageOrigin::Surface {
+                mapping_id,
+                map_generation,
+                surface_offset,
+                surface_bpr,
+                span_end,
+            },
+            width,
+            height,
+            pixel_format,
+        }
+    }
+
     /// Identity of a linear (type-2/3 raw task-GVA) texture window.
     #[allow(
         clippy::too_many_arguments,
@@ -2331,15 +2358,16 @@ impl ComputeStorageResidencyKey {
         pixel_format: u16,
     ) -> Self {
         Self {
-            mapping_id: 0,
-            map_generation: task_id,
-            surface_offset: gva,
-            surface_bpr: row_stride,
-            span_end,
+            origin: ComputeStorageOrigin::Linear {
+                task_id,
+                texture_ref,
+                gva,
+                row_stride,
+                span_end,
+            },
             width,
             height,
             pixel_format,
-            texture_ref,
         }
     }
 
@@ -2352,26 +2380,55 @@ impl ComputeStorageResidencyKey {
         pixel_format: u16,
     ) -> Self {
         Self {
-            mapping_id: 0,
-            map_generation: task_id,
-            surface_offset: 0,
-            surface_bpr: 0,
-            span_end: 0,
+            origin: ComputeStorageOrigin::Heap {
+                task_id,
+                texture_ref,
+            },
             width,
             height,
             pixel_format,
-            texture_ref,
         }
     }
 
-    /// True for a linear task-GVA window (see the struct doc).
     pub fn is_linear(&self) -> bool {
-        self.mapping_id == 0 && self.surface_offset != 0
+        matches!(self.origin, ComputeStorageOrigin::Linear { .. })
     }
 
-    /// True for a host-only opcode-0x15 heap texture.
     pub fn is_heap(&self) -> bool {
-        self.mapping_id == 0 && self.surface_offset == 0
+        matches!(self.origin, ComputeStorageOrigin::Heap { .. })
+    }
+
+    pub fn surface_window(&self) -> Option<(u32, u64, u64)> {
+        match self.origin {
+            ComputeStorageOrigin::Surface {
+                mapping_id,
+                surface_offset,
+                span_end,
+                ..
+            } => Some((mapping_id, surface_offset, span_end)),
+            ComputeStorageOrigin::Linear { .. } | ComputeStorageOrigin::Heap { .. } => None,
+        }
+    }
+
+    pub fn linear_window(&self) -> Option<(u32, u32, u64, u32, u64)> {
+        match self.origin {
+            ComputeStorageOrigin::Linear {
+                task_id,
+                texture_ref,
+                gva,
+                row_stride,
+                span_end,
+            } => Some((task_id, texture_ref, gva, row_stride, span_end)),
+            ComputeStorageOrigin::Surface { .. } | ComputeStorageOrigin::Heap { .. } => None,
+        }
+    }
+
+    pub fn resource_ref(&self) -> Option<u32> {
+        match self.origin {
+            ComputeStorageOrigin::Linear { texture_ref, .. }
+            | ComputeStorageOrigin::Heap { texture_ref, .. } => Some(texture_ref),
+            ComputeStorageOrigin::Surface { .. } => None,
+        }
     }
 }
 
@@ -3272,8 +3329,8 @@ pub struct DeviceState {
     pub iosurface_texture_memo: LruBytesMemo<(u32, u32, u32), GuestLinearMemo>,
     /// Reusable native BGRA read buffer for the IOSurface texture memo re-read.
     pub iosurface_texture_memo_scratch: Vec<u8>,
-    /// Last guest-visible generation produced by a compute storage-image
-    /// writeback, keyed by the exact window it was produced for.
+    /// Last resident generation produced by a compute storage-image dispatch,
+    /// keyed by its exact semantic origin and view geometry.
     ///
     /// **It selects behaviour.** `compute_exec`'s texture staging reads it to
     /// decide whether the engine's resident answers a bind, and for a
@@ -3290,28 +3347,24 @@ pub struct DeviceState {
     /// # What may remove an entry, and why the cap cannot reach the two that
     /// # have no fallback
     ///
-    /// Three keyings share this map, and only one of them is subject to the
+    /// Three typed origins share this map, and only one is subject to the
     /// per-mapping population cap in `compute_exec`:
     ///
-    /// - **Mapping-backed** (`mapping_id != 0`) — the only kind the cap's
-    ///   sibling walk can select, because it filters on an equal `mapping_id`.
+    /// - **Mapping-backed** ([`ComputeStorageOrigin::Surface`]) — the only kind
+    ///   the cap's sibling walk can select.
     ///   Dropping one costs the next read its resident and sends it back to the
     ///   mapping's guest pages, which is a cost and not a loss.
-    /// - **Linear** ([`ComputeStorageResidencyKey::linear`]) — `mapping_id` is
-    ///   0, and `note_storage_residency_writeback` returns before the insert:
+    /// - **Linear** ([`ComputeStorageResidencyKey::linear`]) —
+    ///   `note_storage_residency_writeback` returns before the insert:
     ///   authority for these lives in the `host_linear_textures` entry's
     ///   `resident_gen`, never here.
-    /// - **Heap** ([`ComputeStorageResidencyKey::heap`]) — `mapping_id` is also
-    ///   0, and that function inserts and returns *before* the cap runs.
+    /// - **Heap** ([`ComputeStorageResidencyKey::heap`]) — that function
+    ///   inserts and returns *before* the cap runs.
     ///
-    /// So the cap is genuinely per-mapping, and the two keyings with no guest
-    /// fallback are outside it — but only because of an early return two
-    /// modules away, not because the filter distinguishes them. Both set
-    /// `mapping_id` to 0, so they would share one bucket if the eviction ever
-    /// saw them. An audit read the filter alone and concluded heap textures
-    /// were being evicted into zero-filled binds; that is wrong today and would
-    /// be right the moment a caller reached the cap with a zero-keyed
-    /// candidate. Anything that changes when the cap runs must re-check this.
+    /// The cap is therefore genuinely per mapping. Its filter asks
+    /// `surface_window`, which cannot return a task-address or heap identity;
+    /// a future caller cannot accidentally place those origins in a synthetic
+    /// zero-mapping bucket.
     pub compute_storage_residency: BTreeMap<ComputeStorageResidencyKey, u32>,
     /// Mapping ids the fence-bound writeback has landed a render window on,
     /// for one measurement and nothing else: does the guest declare its CPU
@@ -4311,7 +4364,9 @@ impl DeviceState {
     /// write breaks that claim; disjoint windows (ping-pong canvases) survive.
     pub fn invalidate_storage_residency_window(&mut self, mapping_id: u32, lo: u64, hi: u64) {
         self.compute_storage_residency.retain(|key, _| {
-            key.mapping_id != mapping_id || key.span_end <= lo || key.surface_offset >= hi
+            key.surface_window().is_none_or(|(candidate, start, end)| {
+                candidate != mapping_id || end <= lo || start >= hi
+            })
         });
     }
 

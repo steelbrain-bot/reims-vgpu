@@ -1525,17 +1525,7 @@ mod tests {
     }
 
     fn residency_identity() -> ComputeStorageResidencyKey {
-        ComputeStorageResidencyKey {
-            mapping_id: 7,
-            map_generation: 8,
-            surface_offset: 0,
-            surface_bpr: 4,
-            span_end: 4,
-            width: 1,
-            height: 1,
-            pixel_format: 80,
-            texture_ref: 0,
-        }
+        ComputeStorageResidencyKey::surface(7, 8, 0, 4, 4, 1, 1, 80)
     }
 
     fn resident_sample_resource() -> ComputeSampledImageResource {

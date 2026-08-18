@@ -1662,8 +1662,13 @@ fn stage_heap_texture_uses_host_only_residency_identity() {
     let residency = staged.residency.expect("heap texture needs GPU residency");
     assert!(residency.key.is_heap());
     assert!(!residency.key.is_linear());
-    assert_eq!(residency.key.map_generation, 1);
-    assert_eq!(residency.key.texture_ref, texture_ref);
+    assert_eq!(
+        residency.key.origin,
+        crate::model::ComputeStorageOrigin::Heap {
+            task_id: 1,
+            texture_ref,
+        }
+    );
     assert_eq!(residency.seed_generation, 0);
 }
 
@@ -2666,17 +2671,7 @@ fn a_staged_window_records_its_pages_in_guest_virtual_order() {
 /// or to neither.
 #[test]
 fn a_resident_answer_is_a_seed_or_a_sample_and_never_both() {
-    let key = crate::model::ComputeStorageResidencyKey {
-        mapping_id: 7,
-        map_generation: 3,
-        surface_offset: 0,
-        surface_bpr: 16,
-        span_end: 64,
-        width: 4,
-        height: 4,
-        pixel_format: 0x50,
-        texture_ref: 9,
-    };
+    let key = crate::model::ComputeStorageResidencyKey::surface(7, 3, 0, 16, 64, 4, 4, 0x50);
     for (serve, what) in [
         (ResidentServe::Seed(11), "seed"),
         (ResidentServe::Sample(key, 12), "sample"),
@@ -2824,16 +2819,14 @@ fn a_truncated_stage_input_is_not_the_same_as_an_absent_one() {
 /// texture has no guest pages at all — it is host-only — so an absent entry
 /// stages `vec![0; need]` and the kernel reads a blank texture.
 ///
-/// The two are kept apart by `note_storage_residency_writeback` returning before
-/// the cap runs, not by the cap's own filter: `ComputeStorageResidencyKey::heap`
-/// and `::linear` both set `mapping_id` to 0, so they would share one bucket if
-/// the eviction ever saw them. An audit that read the filter alone concluded
-/// heap textures were already being evicted into zero-filled binds. It was
-/// wrong, and it was wrong by one early return.
+/// The key's typed origin now keeps them apart at the cap's own filter:
+/// `surface_window` cannot return a heap or linear identity. The early return
+/// remains because heap mirrors are unbounded by guest lifetime rather than by
+/// an invented per-mapping number.
 ///
 /// So drive well past `STORAGE_RESIDENCY_WINDOWS_PER_MAPPING` distinct heap
 /// textures and assert every one is still there. This fails the moment that
-/// early return moves.
+/// heap handling or origin filtering regresses.
 #[test]
 #[cfg(feature = "backend-vulkan")]
 fn a_heap_texture_mirror_outlives_the_per_mapping_cap() {
@@ -2848,7 +2841,7 @@ fn a_heap_texture_mirror_outlives_the_per_mapping_cap() {
     const HEAP_TEXTURES: u32 = 4 * STORAGE_RESIDENCY_WINDOWS_PER_MAPPING as u32;
 
     let staged = |key: ComputeStorageResidencyKey| StagedTexture {
-        resource_ref: key.texture_ref,
+        resource_ref: key.resource_ref().expect("heap object reference"),
         binding: 33,
         #[cfg(feature = "backend-vulkan")]
         array_element: 0,
@@ -2873,11 +2866,10 @@ fn a_heap_texture_mirror_outlives_the_per_mapping_cap() {
 
     for tex in 0..HEAP_TEXTURES {
         let key = ComputeStorageResidencyKey::heap(1, tex, 16, 16, 0x50);
-        assert_eq!(
-            key.mapping_id, 0,
-            "a heap key sits in the same bucket a linear key does; that is the \
-             whole reason this test exists"
-        );
+        assert!(matches!(
+            key.origin,
+            crate::model::ComputeStorageOrigin::Heap { .. }
+        ));
         note_storage_residency_writeback(&mut state, &staged(key));
     }
 

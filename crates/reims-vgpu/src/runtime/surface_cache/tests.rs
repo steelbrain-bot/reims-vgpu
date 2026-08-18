@@ -454,9 +454,7 @@ fn linear_resident_retires_on_task_and_object_delete() {
     assert_eq!(st.retired_linear_residents.len(), 1);
     let key = st.retired_linear_residents[0];
     assert!(key.is_linear());
-    assert_eq!(key.map_generation, 6);
-    assert_eq!(key.texture_ref, 21);
-    assert_eq!(key.surface_offset, 0x30_2000);
+    assert_eq!(key.linear_window(), Some((6, 21, 0x30_2000, 32, 64)));
     crate::runtime::render_writeback::retire_linear_residents(&mut st);
     assert!(st.retired_linear_residents.is_empty());
 
@@ -465,7 +463,7 @@ fn linear_resident_retires_on_task_and_object_delete() {
     assert!(note_linear_texture_resident(&mut st, &win, 5));
     assert!(st.delete_object(6, 21));
     assert_eq!(st.retired_linear_residents.len(), 1);
-    assert_eq!(st.retired_linear_residents[0].texture_ref, 21);
+    assert_eq!(st.retired_linear_residents[0].resource_ref(), Some(21));
     // Non-resident entries retire nothing.
     st.retired_linear_residents.clear();
     let px = vec![0u8; 4 * 2 * 8];

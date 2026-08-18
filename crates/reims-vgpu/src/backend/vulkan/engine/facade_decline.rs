@@ -95,17 +95,7 @@ mod tests {
     use super::*;
 
     fn residency() -> ComputeStorageResidencyKey {
-        ComputeStorageResidencyKey {
-            mapping_id: 7,
-            map_generation: 8,
-            surface_offset: 0x9000,
-            surface_bpr: 256,
-            span_end: 4096,
-            width: 64,
-            height: 32,
-            pixel_format: 80,
-            texture_ref: 11,
-        }
+        ComputeStorageResidencyKey::surface(7, 8, 0x9000, 256, 4096, 64, 32, 80)
     }
 
     fn identity() -> TargetIdentity {

@@ -564,17 +564,8 @@ fn compute_storage_image_rgba8unorm_known_result() {
     let w = 4u32;
     let h = 4u32;
     let seed = vec![0u8; (w * h * 4) as usize];
-    let identity = ComputeStorageResidencyKey {
-        mapping_id: 77,
-        map_generation: 3,
-        surface_offset: 0,
-        surface_bpr: w * 4,
-        span_end: (w * h * 4) as u64,
-        width: w,
-        height: h,
-        pixel_format: 0x46,
-        texture_ref: 0,
-    };
+    let identity =
+        ComputeStorageResidencyKey::surface(77, 3, 0, w * 4, (w * h * 4) as u64, w, h, 0x46);
     let req = ComputeRequest {
         spirv: words.clone(),
         entry: "main".into(),
@@ -742,16 +733,8 @@ fn every_admitted_compute_storage_resident_survives_past_the_retired_slot_cap() 
     // real allocation failure is in play and the only thing that could remove one
     // of these is a count.
     const ADMITS: u32 = 80;
-    let identity = |i: u32| ComputeStorageResidencyKey {
-        mapping_id: 0x900 + i,
-        map_generation: 3,
-        surface_offset: 0,
-        surface_bpr: w * 4,
-        span_end: (w * h * 4) as u64,
-        width: w,
-        height: h,
-        pixel_format: 0x46,
-        texture_ref: 0,
+    let identity = |i: u32| {
+        ComputeStorageResidencyKey::surface(0x900 + i, 3, 0, w * 4, (w * h * 4) as u64, w, h, 0x46)
     };
     let request = |i: u32, seed_generation: u32| ComputeRequest {
         spirv: words.clone(),
@@ -831,18 +814,17 @@ fn compute_storage_image_bgra8unorm_is_not_channel_swapped() {
     let w = 4u32;
     let h = 4u32;
     let seed = vec![0u8; (w * h * 4) as usize];
-    let identity = ComputeStorageResidencyKey {
-        mapping_id: 78,
-        map_generation: 3,
-        surface_offset: 0,
-        surface_bpr: w * 4,
-        span_end: (w * h * 4) as u64,
-        width: w,
-        height: h,
+    let identity = ComputeStorageResidencyKey::surface(
+        78,
+        3,
+        0,
+        w * 4,
+        (w * h * 4) as u64,
+        w,
+        h,
         // MTLPixelFormatBGRA8Unorm.
-        pixel_format: 0x50,
-        texture_ref: 0,
-    };
+        0x50,
+    );
     let req = ComputeRequest {
         spirv: words,
         entry: "main".into(),
@@ -899,17 +881,8 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
     };
     let w = 4u32;
     let h = 4u32;
-    let identity = ComputeStorageResidencyKey {
-        mapping_id: 91,
-        map_generation: 1,
-        surface_offset: 0,
-        surface_bpr: w * 4,
-        span_end: (w * h * 4) as u64,
-        width: w,
-        height: h,
-        pixel_format: 0x46,
-        texture_ref: 0,
-    };
+    let identity =
+        ComputeStorageResidencyKey::surface(91, 1, 0, w * 4, (w * h * 4) as u64, w, h, 0x46);
     let make = |grid: [u32; 3], seed_generation: u32, output_generation: u32, skipped: bool| {
         ComputeRequest {
             spirv: words.clone(),
@@ -1002,17 +975,8 @@ fn compute_sampled_resident_copy_and_lost_resident() {
     };
     let w = 4u32;
     let h = 4u32;
-    let identity = ComputeStorageResidencyKey {
-        mapping_id: 93,
-        map_generation: 1,
-        surface_offset: 0,
-        surface_bpr: w * 4,
-        span_end: (w * h * 4) as u64,
-        width: w,
-        height: h,
-        pixel_format: 0x46,
-        texture_ref: 0,
-    };
+    let identity =
+        ComputeStorageResidencyKey::surface(93, 1, 0, w * 4, (w * h * 4) as u64, w, h, 0x46);
     // Full red fill establishes the resident at generation 2.
     let fill_req = ComputeRequest {
         spirv: fill_words,

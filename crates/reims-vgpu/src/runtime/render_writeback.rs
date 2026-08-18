@@ -811,14 +811,21 @@ pub fn retire_linear_residents(state: &mut DeviceState) {
     for key in &retired {
         crate::backend::vulkan::engine::unpin_resident_storage(key);
         crate::backend::vulkan::engine::retire_resident_storage_content(key);
+        let crate::model::ComputeStorageOrigin::Linear {
+            task_id,
+            texture_ref,
+            gva,
+            ..
+        } = key.origin
+        else {
+            crate::observe::fail(format!(
+                "linear_resident_retired reason=non_linear_identity identity={key:?}"
+            ));
+            continue;
+        };
         crate::observe::off(format!(
             "linear_resident_retired task={} ref={} gva={:#x} {}x{} fmt={:#x}",
-            key.map_generation,
-            key.texture_ref,
-            key.surface_offset,
-            key.width,
-            key.height,
-            key.pixel_format
+            task_id, texture_ref, gva, key.width, key.height, key.pixel_format
         ));
     }
     #[cfg(not(feature = "backend-vulkan"))]

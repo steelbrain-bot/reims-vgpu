@@ -760,16 +760,17 @@ fn mapping_write_invalidates_intersecting_residency_windows_only() {
     let m = state.mappings.get_mut(&7).unwrap();
     m.mapping_internal = 1;
     m.page_entries = vec![entry];
-    let window = |surface_offset: u64, span_end: u64| ComputeStorageResidencyKey {
-        mapping_id: 7,
-        map_generation: state.mappings[&7].map_generation,
-        surface_offset,
-        surface_bpr: 32,
-        span_end,
-        width: 8,
-        height: 2,
-        pixel_format: MTL_FORMAT_BGRA8_UNORM,
-        texture_ref: 0,
+    let window = |surface_offset: u64, span_end: u64| {
+        ComputeStorageResidencyKey::surface(
+            7,
+            state.mappings[&7].map_generation,
+            surface_offset,
+            32,
+            span_end,
+            8,
+            2,
+            MTL_FORMAT_BGRA8_UNORM,
+        )
     };
     let hit = window(0, 64);
     let survivor = window(1024, 1088);

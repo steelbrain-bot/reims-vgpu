@@ -14,12 +14,12 @@ pub(crate) use regs::*;
 // `mod`, so this is the only path those links can name — and rustc's
 // unused-import lint cannot see a doc link, so it will call this dead.
 pub use state::{
-    ChannelRing, ComputeStorageResidencyKey, DeviceId, DeviceState, ExecFault, FailEvent, GfxRegs,
-    GuestLinearMemo, GvaBacking, GvaEvictionWitness, GvaHostView, HostLinearTexture, HostSurface,
-    MapperCapture, MappingEntry, PacketFault, PresentBacking, PresentState, RenderFlushWitness,
-    ResourceValidity, SurfaceWriteKind, TaskEntry, TaskResource, TaskResourceLifetimeRef,
-    TaskSamplerState, TaskTable, Type4Walk, UnimplementedCommand, GVA_ENCODE_CACHE_BYTE_CAP,
-    GVA_EVICTION_WITNESS_KEYS,
+    ChannelRing, ComputeStorageOrigin, ComputeStorageResidencyKey, DeviceId, DeviceState,
+    ExecFault, FailEvent, GfxRegs, GuestLinearMemo, GvaBacking, GvaEvictionWitness, GvaHostView,
+    HostLinearTexture, HostSurface, MapperCapture, MappingEntry, PacketFault, PresentBacking,
+    PresentState, RenderFlushWitness, ResourceValidity, SurfaceWriteKind, TaskEntry, TaskResource,
+    TaskResourceLifetimeRef, TaskSamplerState, TaskTable, Type4Walk, UnimplementedCommand,
+    GVA_ENCODE_CACHE_BYTE_CAP, GVA_EVICTION_WITNESS_KEYS,
 };
 
 use crate::runtime::{self, host::HostOps};

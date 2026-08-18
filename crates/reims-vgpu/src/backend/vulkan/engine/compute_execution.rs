@@ -245,23 +245,50 @@ fn binding_identity_fields(
 pub(super) fn residency_fields(
     identity: &ComputeStorageResidencyKey,
 ) -> Vec<(&'static str, String)> {
-    vec![
-        ("residency_mapping_id", identity.mapping_id.to_string()),
-        (
-            "residency_map_generation",
-            identity.map_generation.to_string(),
-        ),
-        (
-            "residency_surface_offset",
-            format!("{:#x}", identity.surface_offset),
-        ),
-        ("residency_surface_bpr", identity.surface_bpr.to_string()),
-        ("residency_span_end", identity.span_end.to_string()),
+    let mut fields = vec![
         ("residency_width", identity.width.to_string()),
         ("residency_height", identity.height.to_string()),
         ("residency_pixel_format", identity.pixel_format.to_string()),
-        ("residency_texture_ref", identity.texture_ref.to_string()),
-    ]
+    ];
+    match identity.origin {
+        crate::model::ComputeStorageOrigin::Surface {
+            mapping_id,
+            map_generation,
+            surface_offset,
+            surface_bpr,
+            span_end,
+        } => fields.extend([
+            ("residency_kind", "surface".to_string()),
+            ("residency_mapping_id", mapping_id.to_string()),
+            ("residency_map_generation", map_generation.to_string()),
+            ("residency_surface_offset", format!("{surface_offset:#x}")),
+            ("residency_surface_bpr", surface_bpr.to_string()),
+            ("residency_span_end", span_end.to_string()),
+        ]),
+        crate::model::ComputeStorageOrigin::Linear {
+            task_id,
+            texture_ref,
+            gva,
+            row_stride,
+            span_end,
+        } => fields.extend([
+            ("residency_kind", "linear".to_string()),
+            ("residency_task", task_id.to_string()),
+            ("residency_texture_ref", texture_ref.to_string()),
+            ("residency_gva", format!("{gva:#x}")),
+            ("residency_row_stride", row_stride.to_string()),
+            ("residency_span_end", span_end.to_string()),
+        ]),
+        crate::model::ComputeStorageOrigin::Heap {
+            task_id,
+            texture_ref,
+        } => fields.extend([
+            ("residency_kind", "heap".to_string()),
+            ("residency_task", task_id.to_string()),
+            ("residency_texture_ref", texture_ref.to_string()),
+        ]),
+    }
+    fields
 }
 
 crate::observe::decline_display!(ComputeExecutionDecline);
@@ -271,17 +298,7 @@ mod tests {
     use super::*;
 
     fn identity() -> ComputeStorageResidencyKey {
-        ComputeStorageResidencyKey {
-            mapping_id: 7,
-            map_generation: 8,
-            surface_offset: 0x9000,
-            surface_bpr: 256,
-            span_end: 4096,
-            width: 64,
-            height: 32,
-            pixel_format: 80,
-            texture_ref: 11,
-        }
+        ComputeStorageResidencyKey::surface(7, 8, 0x9000, 256, 4096, 64, 32, 80)
     }
 
     fn all() -> Vec<ComputeExecutionDecline> {
@@ -375,15 +392,42 @@ mod tests {
         assert_eq!(
             residency_fields(&identity()),
             vec![
+                ("residency_width", "64".into()),
+                ("residency_height", "32".into()),
+                ("residency_pixel_format", "80".into()),
+                ("residency_kind", "surface".into()),
                 ("residency_mapping_id", "7".into()),
                 ("residency_map_generation", "8".into()),
                 ("residency_surface_offset", "0x9000".into()),
                 ("residency_surface_bpr", "256".into()),
                 ("residency_span_end", "4096".into()),
-                ("residency_width", "64".into()),
-                ("residency_height", "32".into()),
-                ("residency_pixel_format", "80".into()),
+            ]
+        );
+        assert_eq!(
+            residency_fields(&ComputeStorageResidencyKey::linear(
+                4, 11, 0xa000, 512, 8192, 32, 16, 70,
+            )),
+            vec![
+                ("residency_width", "32".into()),
+                ("residency_height", "16".into()),
+                ("residency_pixel_format", "70".into()),
+                ("residency_kind", "linear".into()),
+                ("residency_task", "4".into()),
                 ("residency_texture_ref", "11".into()),
+                ("residency_gva", "0xa000".into()),
+                ("residency_row_stride", "512".into()),
+                ("residency_span_end", "8192".into()),
+            ]
+        );
+        assert_eq!(
+            residency_fields(&ComputeStorageResidencyKey::heap(4, 12, 8, 4, 60)),
+            vec![
+                ("residency_width", "8".into()),
+                ("residency_height", "4".into()),
+                ("residency_pixel_format", "60".into()),
+                ("residency_kind", "heap".into()),
+                ("residency_task", "4".into()),
+                ("residency_texture_ref", "12".into()),
             ]
         );
     }
