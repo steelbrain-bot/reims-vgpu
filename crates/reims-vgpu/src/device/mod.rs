@@ -49,13 +49,10 @@ use crate::qemu::host_ops::{NullHost, QemuHost, ReimsVgpuHostOps};
 use crate::model::{Device, DeviceId};
 use crate::runtime::{HostAction, HostOps};
 
-#[cfg(feature = "backend-vulkan")]
-type SelectedBackend = crate::backend::vulkan::VulkanBackend;
-
 /// Mutable protocol/backend state. The drain worker may hold this lock across
 /// shader translation and a GPU wait, so MMIO producers must never wait for it.
 struct DeviceInner {
-    device: Device<SelectedBackend>,
+    device: Device,
     /// Actions for the QEMU BH to apply after drain.
     actions: VecDeque<HostAction>,
 }
@@ -209,10 +206,6 @@ fn lock_for_drain(slot: &BoundDevice) -> parking_lot::MutexGuard<'_, DeviceInner
     inner
 }
 
-fn make_backend() -> SelectedBackend {
-    crate::backend::vulkan::VulkanBackend::new()
-}
-
 /// Create a device. `ops` is the QEMU host-service table (nullable for tests).
 ///
 /// `page_shift` must be [`crate::model::PAGE_SHIFT_X86`] (12) or [`crate::model::PAGE_SHIFT_ARM64E`] (14).
@@ -226,8 +219,7 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
     let id = *id_guard;
     *id_guard = id.saturating_add(1);
     drop(id_guard);
-    let backend = make_backend();
-    let dev = Device::new(DeviceId(id), backend, page_shift);
+    let dev = Device::new(DeviceId(id), page_shift);
     let intr_disp = Arc::clone(&dev.state.gfx.interrupt_status_disp);
     let intr_gpu = Arc::clone(&dev.state.gfx.interrupt_status_gpu);
     let child_doorbell_rung = Arc::clone(&dev.state.gfx.child_doorbell_rung);

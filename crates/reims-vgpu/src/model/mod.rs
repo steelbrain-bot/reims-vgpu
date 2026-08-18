@@ -23,29 +23,38 @@ pub use state::{
     GVA_EVICTION_WITNESS_KEYS,
 };
 
-use crate::backend::Backend;
 use crate::runtime::{self, host::HostOps};
 
-/// Device instance: protocol state + selected backend.
+/// Device instance: protocol state plus its device-owned execution port.
 ///
 /// MMIO and drain behavior live in [`crate::runtime`]; this type holds state
 /// and forwards.
-pub struct Device<B: Backend> {
+pub struct Device {
     pub state: DeviceState,
-    pub backend: B,
 }
 
-impl<B: Backend> Device<B> {
+impl Device {
     /// `page_shift`: [`PAGE_SHIFT_X86`] or [`PAGE_SHIFT_ARM64E`]. Required — no default.
-    pub fn new(id: DeviceId, backend: B, page_shift: u32) -> Self {
+    pub fn new(id: DeviceId, page_shift: u32) -> Self {
         Self {
             state: DeviceState::new(id, page_shift),
-            backend,
+        }
+    }
+
+    #[cfg(feature = "backend-vulkan")]
+    pub fn new_with_executor(
+        id: DeviceId,
+        page_shift: u32,
+        executor: std::sync::Arc<dyn crate::runtime::executor::Executor>,
+    ) -> Self {
+        Self {
+            state: DeviceState::new_with_executor(id, page_shift, executor),
         }
     }
 
     pub fn reset(&mut self) {
-        self.backend.reset();
+        #[cfg(feature = "backend-vulkan")]
+        self.state.executor.reset();
         self.state.reset();
     }
 
@@ -53,7 +62,8 @@ impl<B: Backend> Device<B> {
     pub fn reset_with_host<H: HostOps>(&mut self, host: &mut H) -> usize {
         // Backend aliases must die before their contiguous guest-memory views
         // are unmapped.
-        self.backend.reset();
+        #[cfg(feature = "backend-vulkan")]
+        self.state.executor.reset();
         let views = self.state.take_all_host_views();
         let count = views.len();
         for (ptr, len) in views {
@@ -114,7 +124,6 @@ mod tests {
     use crate::model::{PAGE_SHIFT_ARM64E, PAGE_SIZE_ARM64E, PAGE_SIZE_X86};
 
     use super::*;
-    use crate::backend::NullBackend;
     use crate::contract::endian::st32;
     use crate::runtime::host::{HostActionKind, HostMemory};
     use crate::runtime::FakeHost;
@@ -129,8 +138,8 @@ mod tests {
         assert_eq!(stamp_slot_offset(4096, PAGE_SIZE_ARM64E), None);
     }
 
-    fn dev() -> Device<NullBackend> {
-        Device::new(DeviceId(1), NullBackend, PAGE_SHIFT_ARM64E)
+    fn dev() -> Device {
+        Device::new(DeviceId(1), PAGE_SHIFT_ARM64E)
     }
 
     #[test]
@@ -166,7 +175,7 @@ mod tests {
         assert_eq!(d.state.mappings[&7].contig_len, 0);
     }
 
-    fn setup_boot_regs(d: &mut Device<NullBackend>, h: &mut FakeHost) {
+    fn setup_boot_regs(d: &mut Device, h: &mut FakeHost) {
         d.gfx_write(h, GFX_REG_VERSION, 0x3e, MMIO_U32);
         assert_eq!(d.gfx_read(GFX_REG_VERSION, MMIO_U32), 0x3e);
         d.gfx_write(h, GFX_REG_FIFO_BASE_PAGE, 0x10, MMIO_U32);

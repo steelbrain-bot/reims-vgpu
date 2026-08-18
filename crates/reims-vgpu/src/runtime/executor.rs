@@ -83,6 +83,9 @@ impl ExecutionCompletion {
 pub trait Executor: std::fmt::Debug + Send + Sync {
     fn execute(&self, submission: ResolvedSubmission<'_>)
         -> Result<ExecutionCompletion, DrawError>;
+
+    /// End one guest lifetime while preserving shareable physical-GPU state.
+    fn reset(&self) {}
 }
 
 /// Compatibility adapter over the current Vulkan engine facade.
@@ -104,6 +107,10 @@ impl Executor for VulkanExecutor {
                     .map(ExecutionCompletion::Compute)
             }
         }
+    }
+
+    fn reset(&self) {
+        crate::backend::vulkan::engine::reset_guest_state();
     }
 }
 
@@ -152,7 +159,10 @@ mod tests {
     use reims_vgpu_protocol::{
         ObjectRef, ResourceValidity, SegmentKind, SubmissionId, SubmissionResourceUse, TaskId,
     };
-    use std::sync::Mutex;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
 
     #[derive(Clone, Copy, Debug)]
     enum ScriptedCompletion {
@@ -164,6 +174,7 @@ mod tests {
     struct ScriptedExecutor {
         completion: ScriptedCompletion,
         seen: Mutex<Vec<SubmissionContext>>,
+        resets: AtomicUsize,
     }
 
     impl ScriptedExecutor {
@@ -171,6 +182,7 @@ mod tests {
             Self {
                 completion,
                 seen: Mutex::new(Vec::new()),
+                resets: AtomicUsize::new(0),
             }
         }
     }
@@ -191,6 +203,10 @@ mod tests {
                     ExecutionCompletion::Compute(ComputeOutput::default())
                 }
             })
+        }
+
+        fn reset(&self) {
+            self.resets.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -250,5 +266,35 @@ mod tests {
         execute_compute(&scripted, &context(), &ComputeRequest::default()).unwrap();
 
         assert_eq!(scripted.seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn resetting_one_device_preserves_its_executor_and_does_not_reset_another() {
+        let first_executor = Arc::new(ScriptedExecutor::new(ScriptedCompletion::Draw));
+        let second_executor = Arc::new(ScriptedExecutor::new(ScriptedCompletion::Draw));
+        let mut first =
+            crate::model::Device::new_with_executor(DeviceId(1), 12, first_executor.clone());
+        let mut second =
+            crate::model::Device::new_with_executor(DeviceId(2), 12, second_executor.clone());
+
+        first.reset();
+        execute_draw(
+            first.state.executor.as_ref(),
+            &context(),
+            &DrawRequest::default(),
+        )
+        .unwrap();
+        execute_draw(
+            second.state.executor.as_ref(),
+            &context(),
+            &DrawRequest::default(),
+        )
+        .unwrap();
+
+        assert_eq!(first_executor.resets.load(Ordering::Relaxed), 1);
+        assert_eq!(second_executor.resets.load(Ordering::Relaxed), 0);
+        assert_eq!(first_executor.seen.lock().unwrap().len(), 1);
+        assert_eq!(second_executor.seen.lock().unwrap().len(), 1);
+        second.reset();
     }
 }

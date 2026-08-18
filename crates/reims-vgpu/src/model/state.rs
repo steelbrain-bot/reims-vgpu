@@ -3094,6 +3094,8 @@ impl DeviceState {
         }
         let id = self.id;
         let page_shift = self.page_shift;
+        #[cfg(feature = "backend-vulkan")]
+        let executor = Arc::clone(&self.executor);
         // Keep the interrupt-status Arcs wired to the registry slot: the
         // lock-free ISR read rail clones them once at device create.
         let intr_disp = Arc::clone(&self.gfx.interrupt_status_disp);
@@ -3109,6 +3111,10 @@ impl DeviceState {
         // before it names a channel that no longer exists.
         child_rung.store(0, Ordering::Release);
         *self = Self::new(id, page_shift);
+        #[cfg(feature = "backend-vulkan")]
+        {
+            self.executor = executor;
+        }
         self.gfx.interrupt_status_disp = intr_disp;
         self.gfx.interrupt_status_gpu = intr_gpu;
         self.gfx.interrupt_fault = intr_fault;

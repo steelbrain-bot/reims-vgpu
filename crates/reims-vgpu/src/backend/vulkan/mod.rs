@@ -5,8 +5,8 @@
 //! crate has no external graphics-executor dependency; AIR translation comes
 //! from the pinned public `metal2vulkan` crate.
 //!
-//! The [`Backend`] trait carries only guest-lifetime reset; the live draw seam
-//! is `runtime/draw::try_metal2vulkan_draw` → [`engine::execute_draw_request`].
+//! Product submission and guest-lifetime reset enter through the device-owned
+//! [`crate::runtime::executor::Executor`] implementation.
 //!
 //! [`caps`] classifies the bound host GPU into the four-cell support matrix
 //! (unified/discrete memory × has/has-no DMA) that every path here must keep
@@ -19,39 +19,3 @@
 pub mod caps;
 pub mod engine;
 pub mod translate;
-
-use crate::backend::Backend;
-
-/// Vulkan-rail backend handle.
-///
-/// Carries no state: the device and instance live in [`engine`]'s process-global
-/// context, which spins up lazily at the first real encode so off-VM protocol
-/// tests can construct this shell without a Vulkan ICD.
-#[derive(Debug, Default)]
-pub struct VulkanBackend;
-
-impl VulkanBackend {
-    pub fn new() -> Self {
-        Self
-    }
-
-    pub fn name(&self) -> &'static str {
-        "vulkan"
-    }
-}
-
-impl Backend for VulkanBackend {
-    fn reset(&mut self) {
-        engine::reset_guest_state();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn name_is_vulkan() {
-        assert_eq!(VulkanBackend::new().name(), "vulkan");
-    }
-}
