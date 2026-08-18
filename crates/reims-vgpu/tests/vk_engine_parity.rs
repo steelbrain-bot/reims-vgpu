@@ -24,8 +24,8 @@ use reims_vgpu::backend::vulkan::engine::{
 /// against a resident in guest scanout order — several assert on the byte order
 /// of what they read back. Naming the constant once keeps that premise in one
 /// place and makes a test that wants a different format say so.
-const SURFACE_TEST_FORMAT: ash::vk::Format =
-    reims_vgpu::backend::vulkan::translate::pixel::SCANOUT_FORMAT;
+const SURFACE_TEST_FORMAT: reims_vgpu::contract::pixel_format::TexelLayout =
+    reims_vgpu::contract::pixel_format::TexelLayout::Bgra8;
 
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -628,6 +628,7 @@ fn depth_test_honored_compare_and_clear_wired() {
             byte_origin: Default::default(),
             format: ash::vk::Format::R8G8B8A8_UNORM,
             identity: None,
+            content: None,
             resource_lifetime: None,
             swizzle: Default::default(),
         });
@@ -762,6 +763,7 @@ fn depth_test_honored_on_resident_target_path() {
             byte_origin: Default::default(),
             format: ash::vk::Format::R8G8B8A8_UNORM,
             identity: None,
+            content: None,
             resource_lifetime: None,
             swizzle: Default::default(),
         });
@@ -903,6 +905,7 @@ fn stencil_test_honored_compare_ref_and_clear_wired() {
             byte_origin: Default::default(),
             format: ash::vk::Format::R8G8B8A8_UNORM,
             identity: None,
+            content: None,
             resource_lifetime: None,
             swizzle: Default::default(),
         });
@@ -1060,6 +1063,7 @@ fn sampled_and_sampler_still_renders() {
         byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
+        content: None,
         resource_lifetime: Some(sampled_owner.lifetime_ref()),
         swizzle: Default::default(),
     });
@@ -1166,6 +1170,7 @@ fn sampled_upload_happens_once_across_more_draws_than_the_ring_is_deep() {
         byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
+        content: None,
         resource_lifetime: Some(sampled_owner.lifetime_ref()),
         swizzle: Default::default(),
     });
@@ -1245,6 +1250,7 @@ fn resident_sample_bind_avoids_roundtrip_and_remains_loadable() {
         byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
+        content: None,
         resource_lifetime: None,
         swizzle: Default::default(),
     });
@@ -1285,7 +1291,7 @@ fn resident_sample_uses_the_bindings_compatible_format_view() {
         width: 16,
         height: 16,
         generation: 1,
-        format: ash::vk::Format::B8G8R8A8_UNORM,
+        format: reims_vgpu::contract::pixel_format::TexelLayout::Bgra8,
     };
     let mut produce = engine_req(&source_v, &source_f, 16, 16);
     produce.target_identity = Some(source.clone());
@@ -1349,6 +1355,7 @@ fn resident_sample_uses_the_bindings_compatible_format_view() {
         byte_origin: Default::default(),
         format: ash::vk::Format::B8G8R8A8_SRGB,
         identity: None,
+        content: None,
         resource_lifetime: None,
         swizzle: Default::default(),
     });
@@ -1409,6 +1416,7 @@ fn resident_sample_alias_uses_native_feedback_or_snapshot_fallback() {
         byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
+        content: None,
         resource_lifetime: None,
         swizzle: Default::default(),
     });
@@ -1428,6 +1436,7 @@ fn resident_sample_alias_uses_native_feedback_or_snapshot_fallback() {
         byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
+        content: None,
         resource_lifetime: None,
         swizzle: Default::default(),
     });
@@ -1524,8 +1533,9 @@ fn attachment_initial_contents_are_sampled_without_a_host_upload() {
             multisampled: false,
             source: SampledSource::Attachment { identity, initial },
             byte_origin: Default::default(),
-            format: SURFACE_TEST_FORMAT,
+            format: reims_vgpu::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
             identity: None,
+            content: None,
             resource_lifetime: None,
             swizzle: Default::default(),
         });
@@ -1637,6 +1647,7 @@ fn sampled_identity_never_overrides_changed_content() {
             key: 0x1234_5000,
             generation: 1,
         }),
+        content: None,
         resource_lifetime: Some(sampled_owner.lifetime_ref()),
         swizzle: Default::default(),
     });
@@ -2176,6 +2187,7 @@ fn sampled_rgba_upload_to_bgra_target_preserves_semantic_channels() {
         byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
+        content: None,
         resource_lifetime: Some(sampled_owner.lifetime_ref()),
         swizzle: Default::default(),
     });
@@ -2340,6 +2352,7 @@ fn reflected_static_sampler_descriptor_samples_texture() {
         byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
+        content: None,
         resource_lifetime: Some(sampled_owner.lifetime_ref()),
         swizzle: Default::default(),
     });
@@ -2481,6 +2494,7 @@ fn sampled_bgra8_bytes_upload_matches_rgba8_semantic_color() {
             byte_origin: Default::default(),
             format,
             identity: None,
+            content: None,
             resource_lifetime: None,
             swizzle: Default::default(),
         });
@@ -2608,6 +2622,7 @@ fn a_view_swizzle_is_performed_by_the_image_view_not_the_cpu() {
             byte_origin: Default::default(),
             format: ash::vk::Format::R8G8B8A8_UNORM,
             identity: None,
+            content: None,
             resource_lifetime: None,
             swizzle: plan,
         });
@@ -2739,7 +2754,7 @@ fn partial_draw_preserves_a_native_guest_target_seed() {
             row_length_texels: 0,
             pages: None,
         },
-        format: SURFACE_TEST_FORMAT,
+        format: reims_vgpu::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
     });
     req.scissors = vec![ScissorResource {
         x: 0,
@@ -3231,7 +3246,7 @@ fn gva_chain_resident_single_readback_matches_cpu_seed_chain() {
         width: 16,
         height: 16,
         generation: 0,
-        format: reims_vgpu::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
+        format: reims_vgpu::contract::pixel_format::TexelLayout::Rgba8,
     };
     engine::reset_draw_counters();
     let before = engine::counter_snapshot();
@@ -3293,7 +3308,7 @@ fn gva_deferred_store_flush_read_matches_sync_store() {
         width: 16,
         height: 16,
         generation: 0,
-        format: reims_vgpu::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
+        format: reims_vgpu::contract::pixel_format::TexelLayout::Rgba8,
     };
     engine::reset_draw_counters();
     let before = engine::counter_snapshot();
@@ -3647,6 +3662,7 @@ fn mrt_secondary_attachment_becomes_sampleable_resident() {
         byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
+        content: None,
         resource_lifetime: None,
         swizzle: Default::default(),
     });
@@ -3680,7 +3696,7 @@ fn mrt_rg16float_secondary_builds_and_renders() {
         width: 32,
         height: 32,
         generation: 0,
-        format: reims_vgpu::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
+        format: reims_vgpu::contract::pixel_format::TexelLayout::Rgba8,
     };
     let mut mrt = engine_req(&v, &f, 32, 32);
     mrt.target_identity = Some(primary.clone());
@@ -3828,7 +3844,7 @@ fn single_rt_draw_unaffected_by_mrt_path() {
         width: 16,
         height: 16,
         generation: 0,
-        format: reims_vgpu::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
+        format: reims_vgpu::contract::pixel_format::TexelLayout::Rgba8,
     };
     assert!(!engine::resident_content_ready(&never));
 }

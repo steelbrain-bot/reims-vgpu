@@ -23,8 +23,8 @@ use reims_vgpu::backend::vulkan::engine::{
 /// against a resident in guest scanout order — several assert on the byte order
 /// of what they read back. Naming the constant once keeps that premise in one
 /// place and makes a test that wants a different format say so.
-const SURFACE_TEST_FORMAT: ash::vk::Format =
-    reims_vgpu::backend::vulkan::translate::pixel::SCANOUT_FORMAT;
+const SURFACE_TEST_FORMAT: reims_vgpu::contract::pixel_format::TexelLayout =
+    reims_vgpu::contract::pixel_format::TexelLayout::Bgra8;
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -750,6 +750,7 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
         byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
+        content: None,
         resource_lifetime: None,
         swizzle: Default::default(),
     });
