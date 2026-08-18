@@ -1,4 +1,4 @@
-use reims_vgpu_wire::device_desc::Type4Builder;
+use reims_vgpu_wire::device_desc::{Type4Builder, Type5Builder};
 
 use super::*;
 use crate::contract::endian::{ld32, st16, st32, st64};
@@ -199,6 +199,51 @@ fn resources_keep_construction_input_until_explicit_delete() {
         Some(10),
         "the replacement lifetime runs its own construction side effects"
     );
+}
+
+#[test]
+fn a_retained_view_retries_its_parent_relation_after_the_parent_appears() {
+    let host = FakeHost::new();
+    let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let descriptor = Type5Builder::new(
+        7,
+        0,
+        2,
+        reims_vgpu_wire::device_desc::TYPE5_RECORD_TAG_COLOR_VIEW,
+    );
+    let view = state.task_resources.register(
+        1,
+        2,
+        Arc::new(TaskResource::new(
+            ListObjectEntry::new(ObjectKind::IOSurfacePlaneView, 0, 0),
+            Arc::from(descriptor.bytes()),
+        )),
+    );
+    let view_id = view.semantic_id().unwrap();
+
+    ensure_resource_relations(&state, &host, 1, 2, &view);
+    assert_eq!(
+        state.task_resources.resource_node(view_id).unwrap().storage,
+        None
+    );
+
+    let surface = state.task_resources.register(
+        0,
+        7,
+        Arc::new(TaskResource::new(
+            ListObjectEntry::new(ObjectKind::SurfaceBacking, 0, 0),
+            Arc::from([]),
+        )),
+    );
+    ensure_resource_relations(&state, &host, 1, 2, &view);
+
+    let surface_node = state
+        .task_resources
+        .resource_node(surface.semantic_id().unwrap())
+        .unwrap();
+    let view_node = state.task_resources.resource_node(view_id).unwrap();
+    assert_eq!(view_node.storage, surface_node.storage);
+    assert!(view_node.parents.contains(&surface_node.id));
 }
 
 #[test]

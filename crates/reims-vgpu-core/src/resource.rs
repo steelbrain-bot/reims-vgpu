@@ -28,11 +28,14 @@ pub enum StorageBacking {
     BufferRange {
         buffer: AnyResourceId,
         offset: ByteOffset,
-        length: ByteLength,
+        bytes_per_row: ByteLength,
     },
     IOSurfacePlane {
         surface: SurfaceBackingId,
         plane: PlaneIndex,
+    },
+    RegisteredSurface {
+        surface: SurfaceBackingId,
     },
     /// Mapper-path surface storage whose shared-backing identity is not yet
     /// established independently of the mapping object.
@@ -84,7 +87,9 @@ pub enum GraphError {
     ReferenceUnbound,
     ResourceAbsent,
     ParentAbsent,
+    ParentCycle,
     StorageAbsent,
+    StorageConflict,
     MappingAlreadyExists,
     MappingAbsent,
     SubmissionNotPrepared,
@@ -123,6 +128,26 @@ impl Default for ResourceGraph {
 }
 
 impl ResourceGraph {
+    fn parent_edge_would_cycle(&self, parent: AnyResourceId, child: AnyResourceId) -> bool {
+        if parent == child {
+            return true;
+        }
+        let mut pending = vec![child];
+        let mut visited = BTreeSet::new();
+        while let Some(candidate) = pending.pop() {
+            if !visited.insert(candidate) {
+                continue;
+            }
+            if candidate == parent {
+                return true;
+            }
+            if let Some(resource) = self.resources.get(&candidate) {
+                pending.extend(resource.children.iter().copied());
+            }
+        }
+        false
+    }
+
     pub fn create_resource(
         &mut self,
         task: TaskId,
@@ -243,6 +268,132 @@ impl ResourceGraph {
         self.create_storage(StorageBacking::MapperSurface { mapping, plane })
     }
 
+    pub fn registered_surface_storage(
+        &mut self,
+        surface: SurfaceBackingId,
+    ) -> Result<StorageId, GraphError> {
+        if let Some(id) = self.storage.values().find_map(|storage| {
+            (storage.backing == StorageBacking::RegisteredSurface { surface }).then_some(storage.id)
+        }) {
+            return Ok(id);
+        }
+        self.create_storage(StorageBacking::RegisteredSurface { surface })
+    }
+
+    pub fn task_address_storage(
+        &mut self,
+        task: TaskId,
+        address: GuestVirtualAddress,
+        length: ByteLength,
+    ) -> Result<StorageId, GraphError> {
+        if let Some(id) = self.storage.values().find_map(|storage| {
+            (storage.backing
+                == StorageBacking::TaskAddress {
+                    task,
+                    address,
+                    length,
+                })
+            .then_some(storage.id)
+        }) {
+            return Ok(id);
+        }
+        self.create_storage(StorageBacking::TaskAddress {
+            task,
+            address,
+            length,
+        })
+    }
+
+    pub fn link_parent(
+        &mut self,
+        child: AnyResourceId,
+        parent: AnyResourceId,
+    ) -> Result<(), GraphError> {
+        let parent_storage = self
+            .resources
+            .get(&parent)
+            .ok_or(GraphError::ParentAbsent)?
+            .storage;
+        let child_storage = self
+            .resources
+            .get(&child)
+            .ok_or(GraphError::ResourceAbsent)?
+            .storage;
+        if self.parent_edge_would_cycle(parent, child) {
+            return Err(GraphError::ParentCycle);
+        }
+        if matches!((child_storage, parent_storage), (Some(child), Some(parent)) if child != parent)
+        {
+            return Err(GraphError::StorageConflict);
+        }
+        self.resources
+            .get_mut(&parent)
+            .unwrap()
+            .children
+            .insert(child);
+        let child_node = self.resources.get_mut(&child).unwrap();
+        child_node.parents.insert(parent);
+        if child_node.storage.is_none() {
+            if let Some(storage) = parent_storage {
+                child_node.storage = Some(storage);
+                self.storage
+                    .get_mut(&storage)
+                    .ok_or(GraphError::StorageAbsent)?
+                    .owners
+                    .insert(child);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn link_buffer_range(
+        &mut self,
+        child: AnyResourceId,
+        buffer: AnyResourceId,
+        offset: ByteOffset,
+        bytes_per_row: ByteLength,
+    ) -> Result<(), GraphError> {
+        if !self.resources.contains_key(&buffer) {
+            return Err(GraphError::ParentAbsent);
+        }
+        let child_storage = self
+            .resources
+            .get(&child)
+            .ok_or(GraphError::ResourceAbsent)?
+            .storage;
+        if self.parent_edge_would_cycle(buffer, child) {
+            return Err(GraphError::ParentCycle);
+        }
+        let backing = StorageBacking::BufferRange {
+            buffer,
+            offset,
+            bytes_per_row,
+        };
+        let existing = self
+            .storage
+            .values()
+            .find_map(|storage| (storage.backing == backing).then_some(storage.id));
+        if child_storage.is_some_and(|storage| Some(storage) != existing) {
+            return Err(GraphError::StorageConflict);
+        }
+        let storage = match existing {
+            Some(storage) => storage,
+            None => self.create_storage(backing)?,
+        };
+        self.attach_initial_storage(child, storage)?;
+        self.resources
+            .get_mut(&buffer)
+            .expect("parent validated")
+            .children
+            .insert(child);
+        self.resources
+            .get_mut(&child)
+            .expect("child validated")
+            .parents
+            .insert(buffer);
+        Ok(())
+    }
+
     pub fn attach_initial_storage(
         &mut self,
         id: AnyResourceId,
@@ -255,8 +406,12 @@ impl ResourceGraph {
             .resources
             .get_mut(&id)
             .ok_or(GraphError::ResourceAbsent)?;
-        if node.storage.is_some() {
-            return Err(GraphError::ReferenceAlreadyBound);
+        if let Some(existing) = node.storage {
+            return if existing == storage {
+                Ok(())
+            } else {
+                Err(GraphError::StorageConflict)
+            };
         }
         node.storage = Some(storage);
         self.storage.get_mut(&storage).unwrap().owners.insert(id);
@@ -524,5 +679,113 @@ mod tests {
         assert_eq!(graph.resource(id).unwrap().id, id);
         graph.release_mapping(mapping).unwrap();
         assert!(graph.resource(id).is_some());
+    }
+
+    #[test]
+    fn a_registered_surface_and_its_view_share_one_storage_identity() {
+        let mut graph = ResourceGraph::default();
+        let storage = graph
+            .registered_surface_storage(SurfaceBackingId::new(44))
+            .unwrap();
+        let surface = graph
+            .create_resource(
+                task(),
+                object(1),
+                ObjectKind::SurfaceBacking,
+                Some(storage),
+                [],
+            )
+            .unwrap();
+        let view = graph
+            .create_resource(task(), object(2), ObjectKind::IOSurfacePlaneView, None, [])
+            .unwrap();
+
+        graph.link_parent(view, surface).unwrap();
+
+        assert_eq!(graph.resource(view).unwrap().storage, Some(storage));
+        assert_eq!(graph.storage(storage).unwrap().owners.len(), 2);
+        graph.release_reference(task(), object(1)).unwrap();
+        assert!(graph.resource(surface).is_some());
+    }
+
+    #[test]
+    fn resources_over_the_same_task_allocation_share_storage_identity() {
+        let mut graph = ResourceGraph::default();
+        let first = graph
+            .task_address_storage(
+                task(),
+                GuestVirtualAddress::new(0x4000),
+                ByteLength::new(0x2000),
+            )
+            .unwrap();
+        let second = graph
+            .task_address_storage(
+                task(),
+                GuestVirtualAddress::new(0x4000),
+                ByteLength::new(0x2000),
+            )
+            .unwrap();
+        let other_task = graph
+            .task_address_storage(
+                TaskId::new(8),
+                GuestVirtualAddress::new(0x4000),
+                ByteLength::new(0x2000),
+            )
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_ne!(first, other_task);
+    }
+
+    #[test]
+    fn a_buffer_texture_owns_a_typed_range_and_retains_its_buffer() {
+        let mut graph = ResourceGraph::default();
+        let buffer = graph
+            .create_resource(task(), object(1), ObjectKind::Buffer, None, [])
+            .unwrap();
+        let texture = graph
+            .create_resource(task(), object(2), ObjectKind::TextureView, None, [])
+            .unwrap();
+
+        graph
+            .link_buffer_range(texture, buffer, ByteOffset::new(96), ByteLength::new(512))
+            .unwrap();
+
+        let texture_node = graph.resource(texture).unwrap();
+        assert!(texture_node.parents.contains(&buffer));
+        assert_eq!(
+            graph
+                .storage(texture_node.storage.unwrap())
+                .unwrap()
+                .backing,
+            StorageBacking::BufferRange {
+                buffer,
+                offset: ByteOffset::new(96),
+                bytes_per_row: ByteLength::new(512),
+            }
+        );
+        graph.release_reference(task(), object(1)).unwrap();
+        assert!(graph.resource(buffer).is_some());
+        graph.release_reference(task(), object(2)).unwrap();
+        assert!(graph.resource(buffer).is_none());
+    }
+
+    #[test]
+    fn parent_relations_cannot_form_a_retention_cycle() {
+        let mut graph = ResourceGraph::default();
+        let first = graph
+            .create_resource(task(), object(1), ObjectKind::TextureView, None, [])
+            .unwrap();
+        let second = graph
+            .create_resource(task(), object(2), ObjectKind::TextureView, None, [])
+            .unwrap();
+
+        graph.link_parent(second, first).unwrap();
+        assert_eq!(
+            graph.link_parent(first, second),
+            Err(GraphError::ParentCycle)
+        );
+        assert!(!graph.resource(first).unwrap().parents.contains(&second));
+        assert!(!graph.resource(second).unwrap().children.contains(&first));
     }
 }

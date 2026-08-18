@@ -1645,6 +1645,7 @@ pub fn resolve_resource<M: HostMemory>(
     obj_ref: u32,
 ) -> Result<Arc<TaskResource>, LadderRung> {
     if let Some(resource) = state.task_resources.get(task_id, obj_ref) {
+        ensure_resource_relations(state, host, task_id, obj_ref, &resource);
         return Ok(resource);
     }
 
@@ -1657,7 +1658,151 @@ pub fn resolve_resource<M: HostMemory>(
     })?;
     let descriptor: Arc<[u8]> = Arc::from(bytes);
     let resource = Arc::new(TaskResource::new(entry, descriptor));
-    Ok(state.task_resources.register(task_id, obj_ref, resource))
+    let resource = state.task_resources.register(task_id, obj_ref, resource);
+    ensure_resource_relations(state, host, task_id, obj_ref, &resource);
+    Ok(resource)
+}
+
+fn ensure_resource_relations<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    object_ref: u32,
+    resource: &Arc<TaskResource>,
+) {
+    if !resource.begin_relation_publication() {
+        return;
+    }
+    let published = publish_resource_relations(state, host, task_id, object_ref, resource);
+    resource.finish_relation_publication(published);
+}
+
+/// Publish construction relations that are explicit in decoded descriptors.
+fn publish_resource_relations<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    object_ref: u32,
+    resource: &Arc<TaskResource>,
+) -> bool {
+    match resource.entry.kind {
+        ObjectKind::Buffer => {
+            let Ok(crate::runtime::decode::resource::Descriptor::Buffer(buffer)) =
+                resource.decoded()
+            else {
+                return false;
+            };
+            let Some((address, length)) = buffer.backing_gva_size(state.page_shift) else {
+                return false;
+            };
+            state
+                .task_resources
+                .attach_task_address(task_id, object_ref, address, length)
+        }
+        ObjectKind::Texture => {
+            let Ok(crate::runtime::decode::resource::Descriptor::Texture(texture)) =
+                resource.decoded()
+            else {
+                return false;
+            };
+            let Some(address) = texture.allocation_base_gva(state.page_shift) else {
+                return false;
+            };
+            if texture.allocation_size == 0 {
+                return false;
+            }
+            state.task_resources.attach_task_address(
+                task_id,
+                object_ref,
+                address,
+                texture.allocation_size,
+            )
+        }
+        ObjectKind::SurfaceBacking => state
+            .task_resources
+            .attach_registered_surface(task_id, object_ref, object_ref),
+        ObjectKind::IOSurfacePlaneView => {
+            let Ok(header) = reims_vgpu_wire::device_desc::type5_header(&resource.descriptor)
+            else {
+                return false;
+            };
+            let parent_task = header.owner_task.get();
+            let parent_ref = header.surface_id.get();
+            if parent_ref == 0 || (parent_task == task_id && parent_ref == object_ref) {
+                return false;
+            }
+            let Ok(parent) = resolve_resource(state, host, parent_task, parent_ref) else {
+                return false;
+            };
+            if parent.entry.kind == ObjectKind::SurfaceBacking {
+                state
+                    .task_resources
+                    .link_view(task_id, object_ref, parent_task, parent_ref)
+            } else {
+                false
+            }
+        }
+        ObjectKind::TextureView => {
+            if matches!(
+                crate::runtime::decode::resource::texture_type8_opcode(&resource.descriptor),
+                Some(crate::runtime::decode::resource::TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE)
+                    | Some(
+                        crate::runtime::decode::resource::TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE
+                    )
+            ) {
+                let Ok(buffer_texture) =
+                    crate::runtime::decode::resource::decode_buffer_texture_descriptor(
+                        &resource.descriptor,
+                    )
+                else {
+                    return false;
+                };
+                if buffer_texture.buffer_ref == 0 || buffer_texture.buffer_ref == object_ref {
+                    return false;
+                }
+                let Ok(buffer) = resolve_resource(state, host, task_id, buffer_texture.buffer_ref)
+                else {
+                    return false;
+                };
+                if buffer.entry.kind != ObjectKind::Buffer {
+                    return false;
+                }
+                return state.task_resources.link_buffer_texture(
+                    task_id,
+                    object_ref,
+                    buffer_texture.buffer_ref,
+                    buffer_texture.offset,
+                    buffer_texture.bytes_per_row,
+                );
+            }
+            let Ok(crate::runtime::decode::resource::Descriptor::TextureView(view)) =
+                resource.decoded()
+            else {
+                return false;
+            };
+            let parent_ref = view.base_texture_ref;
+            if parent_ref == 0 || parent_ref == object_ref {
+                return false;
+            }
+            let Ok(parent) = resolve_resource(state, host, task_id, parent_ref) else {
+                return false;
+            };
+            if matches!(
+                parent.entry.kind,
+                ObjectKind::Texture
+                    | ObjectKind::TextureView
+                    | ObjectKind::IOSurfaceTexture
+                    | ObjectKind::IOSurfacePlaneView
+            ) {
+                state
+                    .task_resources
+                    .link_view(task_id, object_ref, task_id, parent_ref)
+            } else {
+                false
+            }
+        }
+        _ => true,
+    }
 }
 
 /// Look `obj_ref` up in `task_id`'s list, require its type to be one of `want`,
@@ -1689,6 +1834,7 @@ pub fn resolve_descriptor<M: HostMemory>(
                 got: resource.entry.kind,
             });
         }
+        ensure_resource_relations(state, host, task_id, obj_ref, &resource);
         return Ok((resource.entry, Arc::clone(&resource.descriptor)));
     }
 
@@ -1711,6 +1857,7 @@ pub fn resolve_descriptor<M: HostMemory>(
         obj_ref,
         Arc::new(TaskResource::new(entry, descriptor)),
     );
+    ensure_resource_relations(state, host, task_id, obj_ref, &resource);
     if !want.contains(&resource.entry.kind) {
         return Err(LadderRung::WrongType {
             got: resource.entry.kind,

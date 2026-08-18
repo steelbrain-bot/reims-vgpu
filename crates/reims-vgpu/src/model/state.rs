@@ -5,13 +5,16 @@ use crate::runtime::decode::resource::{
     DecodeStatus as ResourceDecodeStatus, Descriptor, ListObjectEntry, SamplerDescriptor,
 };
 use reims_vgpu_core::{ResourceGraph, ResourceNode};
-use reims_vgpu_protocol::{MappingId, ObjectRef, PlaneIndex, ResourceId, ResourceObject, TaskId};
+use reims_vgpu_protocol::{
+    ByteLength, ByteOffset, GuestVirtualAddress, MappingId, ObjectRef, PlaneIndex, ResourceId,
+    ResourceObject, SurfaceBackingId, TaskId,
+};
 #[cfg(feature = "backend-vulkan")]
 use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "backend-vulkan")]
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Opaque device instance id (QEMU handle).
@@ -587,6 +590,14 @@ pub struct TaskResource {
     /// total decoder refuses, and keep that refusal too so those consumers do
     /// not silently widen the total contract.
     decoded: OnceLock<Result<Descriptor, ResourceDecodeStatus>>,
+    /// Publication state for descriptor-declared graph relations.
+    ///
+    /// A descriptor can be snapshotted before the object it names has appeared
+    /// in the task's object list. Unlike descriptor construction, publishing
+    /// that relationship therefore remains retryable on later resolves. The
+    /// in-progress state also breaks malformed parent cycles without turning a
+    /// recursive lookup into unbounded recursion.
+    relation_publication: AtomicU8,
     /// Type-11 construction side effects, completed once for this resource
     /// lifetime. The mapping id is immutable construction state; physical
     /// backing replacement invalidates the mapping's pages without rebuilding
@@ -625,6 +636,7 @@ impl TaskResource {
             descriptor,
             semantic_id: OnceLock::new(),
             decoded: OnceLock::new(),
+            relation_publication: AtomicU8::new(RELATIONS_UNPUBLISHED),
             type11_mapping: OnceLock::new(),
             lifetime: Arc::new(TaskResourceLifetime::new()),
             #[cfg(feature = "backend-vulkan")]
@@ -636,6 +648,28 @@ impl TaskResource {
 
     pub fn semantic_id(&self) -> Option<ResourceId<ResourceObject>> {
         self.semantic_id.get().copied()
+    }
+
+    pub(crate) fn begin_relation_publication(&self) -> bool {
+        self.relation_publication
+            .compare_exchange(
+                RELATIONS_UNPUBLISHED,
+                RELATIONS_PUBLISHING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub(crate) fn finish_relation_publication(&self, published: bool) {
+        self.relation_publication.store(
+            if published {
+                RELATIONS_PUBLISHED
+            } else {
+                RELATIONS_UNPUBLISHED
+            },
+            Ordering::Release,
+        );
     }
 
     /// Resolve this resource's immutable construction descriptor once.
@@ -722,6 +756,10 @@ impl TaskResource {
         backing
     }
 }
+
+const RELATIONS_UNPUBLISHED: u8 = 0;
+const RELATIONS_PUBLISHING: u8 = 1;
+const RELATIONS_PUBLISHED: u8 = 2;
 
 static NEXT_TASK_RESOURCE_LIFETIME: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
@@ -997,18 +1035,112 @@ impl TaskResources {
         else {
             return false;
         };
-        if registry
-            .graph
-            .resource(id)
-            .is_some_and(|resource| resource.storage.is_some())
-        {
-            return true;
-        }
         let storage = registry
             .graph
             .mapper_storage(MappingId::new(mapping_id), PlaneIndex::new(0))
             .expect("storage identity space remains available");
         registry.graph.attach_initial_storage(id, storage).is_ok()
+    }
+
+    pub fn attach_registered_surface(&self, task_id: u32, ref_: u32, surface_id: u32) -> bool {
+        let mut registry = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(id) = registry
+            .objects
+            .get(&(task_id, ref_))
+            .and_then(|resource| resource.semantic_id())
+        else {
+            return false;
+        };
+        let storage = registry
+            .graph
+            .registered_surface_storage(SurfaceBackingId::new(u64::from(surface_id)))
+            .expect("storage identity space remains available");
+        registry.graph.attach_initial_storage(id, storage).is_ok()
+    }
+
+    pub fn attach_task_address(&self, task_id: u32, ref_: u32, address: u64, length: u64) -> bool {
+        let mut registry = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(id) = registry
+            .objects
+            .get(&(task_id, ref_))
+            .and_then(|resource| resource.semantic_id())
+        else {
+            return false;
+        };
+        let storage = registry
+            .graph
+            .task_address_storage(
+                TaskId::new(task_id),
+                GuestVirtualAddress::new(address),
+                ByteLength::new(length),
+            )
+            .expect("storage identity space remains available");
+        registry.graph.attach_initial_storage(id, storage).is_ok()
+    }
+
+    pub fn link_view(
+        &self,
+        task_id: u32,
+        view_ref: u32,
+        parent_task: u32,
+        parent_ref: u32,
+    ) -> bool {
+        let mut registry = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let child = registry
+            .objects
+            .get(&(task_id, view_ref))
+            .and_then(|resource| resource.semantic_id());
+        let parent = registry
+            .objects
+            .get(&(parent_task, parent_ref))
+            .and_then(|resource| resource.semantic_id());
+        match (child, parent) {
+            (Some(child), Some(parent)) => registry.graph.link_parent(child, parent).is_ok(),
+            _ => false,
+        }
+    }
+
+    pub fn link_buffer_texture(
+        &self,
+        task_id: u32,
+        texture_ref: u32,
+        buffer_ref: u32,
+        offset: u64,
+        bytes_per_row: u64,
+    ) -> bool {
+        let mut registry = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let child = registry
+            .objects
+            .get(&(task_id, texture_ref))
+            .and_then(|resource| resource.semantic_id());
+        let parent = registry
+            .objects
+            .get(&(task_id, buffer_ref))
+            .and_then(|resource| resource.semantic_id());
+        match (child, parent) {
+            (Some(child), Some(parent)) => registry
+                .graph
+                .link_buffer_range(
+                    child,
+                    parent,
+                    ByteOffset::new(offset),
+                    ByteLength::new(bytes_per_row),
+                )
+                .is_ok(),
+            _ => false,
+        }
     }
 }
 
@@ -1064,6 +1196,60 @@ mod task_resource_graph_tests {
         let node = resources.resource_node(id).unwrap();
         assert!(node.storage.is_some());
         assert_eq!(node.backing_generation.get(), 1);
+    }
+
+    #[test]
+    fn registered_surface_view_retains_and_shares_its_parents_storage() {
+        let resources = TaskResources::default();
+        let surface = resources.register(0, 12, resource(ObjectKind::SurfaceBacking));
+        let view = resources.register(4, 9, resource(ObjectKind::IOSurfacePlaneView));
+        let surface_id = surface.semantic_id().unwrap();
+        let view_id = view.semantic_id().unwrap();
+
+        assert!(resources.attach_registered_surface(0, 12, 12));
+        assert!(resources.link_view(4, 9, 0, 12));
+
+        let surface_node = resources.resource_node(surface_id).unwrap();
+        let view_node = resources.resource_node(view_id).unwrap();
+        assert_eq!(surface_node.storage, view_node.storage);
+        assert!(view_node.parents.contains(&surface_id));
+        assert!(resources.delete(0, 12));
+        assert!(resources.resource_node(surface_id).is_some());
+        assert!(resources.delete(4, 9));
+        assert!(resources.resource_node(surface_id).is_none());
+    }
+
+    #[test]
+    fn task_address_aliases_share_storage_but_not_resource_identity() {
+        let resources = TaskResources::default();
+        let buffer = resources.register(4, 9, resource(ObjectKind::Buffer));
+        let texture = resources.register(4, 10, resource(ObjectKind::Texture));
+
+        assert!(resources.attach_task_address(4, 9, 0x4000, 0x2000));
+        assert!(resources.attach_task_address(4, 10, 0x4000, 0x2000));
+        let buffer_node = resources
+            .resource_node(buffer.semantic_id().unwrap())
+            .unwrap();
+        let texture_node = resources
+            .resource_node(texture.semantic_id().unwrap())
+            .unwrap();
+
+        assert_ne!(buffer_node.id, texture_node.id);
+        assert_eq!(buffer_node.storage, texture_node.storage);
+    }
+
+    #[test]
+    fn buffer_texture_relation_retains_the_source_buffer() {
+        let resources = TaskResources::default();
+        let buffer = resources.register(4, 9, resource(ObjectKind::Buffer));
+        let _texture = resources.register(4, 10, resource(ObjectKind::TextureView));
+        let buffer_id = buffer.semantic_id().unwrap();
+
+        assert!(resources.link_buffer_texture(4, 10, 9, 96, 512));
+        assert!(resources.delete(4, 9));
+        assert!(resources.resource_node(buffer_id).is_some());
+        assert!(resources.delete(4, 10));
+        assert!(resources.resource_node(buffer_id).is_none());
     }
 }
 
