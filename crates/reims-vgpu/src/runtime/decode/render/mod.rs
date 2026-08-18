@@ -6,7 +6,7 @@
 //! remaining accepted opcodes are recognized and returned as typed kinds with
 //! raw length validation where the contract specifies fixed sizes.
 
-use reims_vgpu_protocol::{HeapObject, ObjectRef, ResourceObject};
+use reims_vgpu_protocol::{HeapObject, ObjectTableRef, ResourceObject};
 use reims_vgpu_wire::ops::render as wire;
 use reims_vgpu_wire::ops::render_pass as wire_pass;
 use reims_vgpu_wire::ops::tile as wire_tile;
@@ -683,10 +683,10 @@ pub struct Command {
     pub first: u32,
     pub count: u32,
     /// Resource declarations carried by [`Kind::UseResource`].
-    pub residency_resources: Vec<ObjectRef<ResourceObject>>,
+    pub residency_resources: Vec<ObjectTableRef<ResourceObject>>,
     /// Heap declarations carried by [`Kind::UseHeap`]. Heap refs inhabit the
     /// serializer's heap namespace, not the task object-list namespace.
-    pub residency_heaps: Vec<ObjectRef<HeapObject>>,
+    pub residency_heaps: Vec<ObjectTableRef<HeapObject>>,
     pub buffer_ref: u32,
     pub buffer_offset: u64,
     /// Multi-entry buffer binds for slots `first..first+count`.
@@ -1444,7 +1444,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             }
             out.residency_resources.extend(
                 refs.iter()
-                    .map(|reference| ObjectRef::new(reference.object_ref.get())),
+                    .map(|reference| ObjectTableRef::new(reference.object_ref.get())),
             );
             Ok(out)
         }
@@ -1458,7 +1458,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             }
             out.residency_heaps.extend(
                 refs.iter()
-                    .map(|reference| ObjectRef::new(reference.object_ref.get())),
+                    .map(|reference| ObjectTableRef::new(reference.object_ref.get())),
             );
             Ok(out)
         }
@@ -1483,7 +1483,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             }
             out.residency_resources.extend(
                 refs.iter()
-                    .map(|reference| ObjectRef::new(reference.object_ref.get())),
+                    .map(|reference| ObjectTableRef::new(reference.object_ref.get())),
             );
             Ok(out)
         }
@@ -1497,7 +1497,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             }
             out.residency_heaps.extend(
                 refs.iter()
-                    .map(|reference| ObjectRef::new(reference.object_ref.get())),
+                    .map(|reference| ObjectTableRef::new(reference.object_ref.get())),
             );
             Ok(out)
         }

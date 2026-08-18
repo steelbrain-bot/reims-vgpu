@@ -52,7 +52,7 @@ use reims_vgpu_core::{
     CommandExecution, ExecutionOutput, ResolvedCommand, ResolvedResourceState, ResolvedSubmission,
     ResourceStateCompletion,
 };
-use reims_vgpu_protocol::{ObjectRef, ResourceObject};
+use reims_vgpu_protocol::{ObjectTableRef, ResourceObject};
 
 /// Which producer delivered a quad. Only used to name the counters, so an arm
 /// can tell an exec-table statement from an invalidate-command one.
@@ -96,7 +96,7 @@ pub fn apply(
     site: ValiditySite,
 ) -> ValidityOutcome {
     let update = ResolvedResourceState {
-        object: ObjectRef::<ResourceObject>::new(object_id),
+        object: ObjectTableRef::<ResourceObject>::new(object_id),
         resource: state.task_resources.identity(task_id, object_id),
         ops,
     };

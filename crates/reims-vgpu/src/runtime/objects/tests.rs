@@ -376,7 +376,9 @@ fn sampler_construction_is_retained_until_its_own_explicit_delete() {
     assert_eq!(retained.descriptor.lod_min_clamp, 1.25);
 
     // The sampler API's delete edge, not resource deletion, permits ref reuse.
-    assert!(state.task_sampler_states.delete(1, 2));
+    assert!(state
+        .task_sampler_states
+        .delete(1, reims_vgpu_protocol::SerializerRef::new(2)));
     assert!(state.set_object_list(1, 0, 8));
     let replacement = resolve_sampler_state(&state, &host, 1, 2).expect("replacement sampler");
     assert!(!Arc::ptr_eq(&first, &replacement));
@@ -407,7 +409,10 @@ fn failed_sampler_construction_is_not_retained_and_can_retry() {
         resolve_sampler_state(&state, &host, 1, 2),
         Err(SamplerResolveError::Decode { .. })
     ));
-    assert!(state.task_sampler_states.get(1, 2).is_none());
+    assert!(state
+        .task_sampler_states
+        .get(1, reims_vgpu_protocol::SerializerRef::new(2))
+        .is_none());
 
     put_sampler_object(&mut host, 2, 0x80, 3.0);
     let sampler = resolve_sampler_state(&state, &host, 1, 2).expect("published retry");
@@ -423,7 +428,10 @@ fn task_teardown_retires_sampler_objects_without_touching_outstanding_owners() {
     let sampler = resolve_sampler_state(&state, &host, 1, 2).expect("sampler");
 
     assert!(state.delete_task(1));
-    assert!(state.task_sampler_states.get(1, 2).is_none());
+    assert!(state
+        .task_sampler_states
+        .get(1, reims_vgpu_protocol::SerializerRef::new(2))
+        .is_none());
     assert_eq!(sampler.descriptor.lod_min_clamp, 2.0);
 }
 

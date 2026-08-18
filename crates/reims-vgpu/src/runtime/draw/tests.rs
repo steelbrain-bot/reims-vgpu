@@ -2338,7 +2338,7 @@ fn mrt_draw_request_gets_attachment_samples_from_the_bound_pipeline_before_encod
     }
     state.task_render_pipeline_states.register(
         1,
-        7,
+        reims_vgpu_protocol::SerializerRef::new(7),
         crate::runtime::pipeline_resolve::retained_pipeline_with_desc_for_test(
             RenderPipelineDescriptor {
                 raster_sample_count: 4,
@@ -6411,9 +6411,11 @@ fn a_retained_depth_stencil_state_is_served_without_reading_guest_memory() {
         depth_write_enabled: true,
         ..Default::default()
     };
-    state
-        .task_depth_stencil_states
-        .register(2, 7, std::sync::Arc::new(retained.clone()));
+    state.task_depth_stencil_states.register(
+        2,
+        reims_vgpu_protocol::SerializerRef::new(7),
+        std::sync::Arc::new(retained.clone()),
+    );
 
     assert_eq!(
         super::load_depth_stencil_descriptor(&state, &host, 2, 7).ok(),
@@ -6421,7 +6423,9 @@ fn a_retained_depth_stencil_state_is_served_without_reading_guest_memory() {
         "the retained state answers with no guest read available at all"
     );
 
-    assert!(state.task_depth_stencil_states.delete(2, 7));
+    assert!(state
+        .task_depth_stencil_states
+        .delete(2, reims_vgpu_protocol::SerializerRef::new(7)));
     assert!(
         super::load_depth_stencil_descriptor(&state, &host, 2, 7).is_err(),
         "and the delete is a real invalidation, not a counter"

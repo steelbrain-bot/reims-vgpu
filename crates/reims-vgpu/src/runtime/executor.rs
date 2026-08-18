@@ -601,7 +601,7 @@ mod tests {
     use super::*;
     use crate::model::{DeviceId, DeviceState};
     use reims_vgpu_protocol::{
-        ObjectRef, ResourceValidity, SegmentBoundary, SegmentKind, SubmissionId,
+        ObjectTableRef, ResourceValidity, SegmentBoundary, SegmentKind, SubmissionId,
         SubmissionIdentity, SubmissionResourceUse, TaskId,
     };
     use std::sync::{
@@ -741,7 +741,7 @@ mod tests {
                 task: TaskId::new(7),
             },
             resources: Arc::from([SubmissionResourceUse {
-                object: ObjectRef::new(31),
+                object: ObjectTableRef::new(31),
                 resource: None,
                 expected_content: None,
                 validity: ResourceValidity {

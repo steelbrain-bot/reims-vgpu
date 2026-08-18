@@ -269,10 +269,10 @@ pub fn translations_ready<M: HostMemory + HostOps>(
     if !memo_enabled() {
         return false;
     }
-    if !state
-        .task_render_pipeline_states
-        .contains(task_id, pipeline_ref)
-    {
+    if !state.task_render_pipeline_states.contains(
+        task_id,
+        reims_vgpu_protocol::SerializerRef::new(pipeline_ref),
+    ) {
         note_store_route("preflight_memo_absent");
         return false;
     }
@@ -296,7 +296,10 @@ pub fn resolve<M: HostMemory + HostOps>(
         return resolve_uncached(state, host, task_id, pipeline_ref).map(Arc::new);
     }
 
-    if let Some(resolved) = state.task_render_pipeline_states.get(task_id, pipeline_ref) {
+    if let Some(resolved) = state.task_render_pipeline_states.get(
+        task_id,
+        reims_vgpu_protocol::SerializerRef::new(pipeline_ref),
+    ) {
         note_store_route("pipe_memo_hit");
         return Ok(resolved);
     }
@@ -305,9 +308,11 @@ pub fn resolve<M: HostMemory + HostOps>(
     let mut resolved = resolve_uncached(state, host, task_id, pipeline_ref)?;
     resolved.pipeline_object = Some(crate::backend::vulkan::engine::PipelineObjectIdentity::new());
     let resolved = Arc::new(resolved);
-    Ok(state
-        .task_render_pipeline_states
-        .register(task_id, pipeline_ref, resolved))
+    Ok(state.task_render_pipeline_states.register(
+        task_id,
+        reims_vgpu_protocol::SerializerRef::new(pipeline_ref),
+        resolved,
+    ))
 }
 
 /// The sample count an attachment bound with this pipeline must carry.
@@ -326,7 +331,10 @@ pub fn attachment_sample_count<M: HostMemory + HostOps>(
     pipeline_ref: u32,
 ) -> Option<u32> {
     if memo_enabled() {
-        if let Some(resolved) = state.task_render_pipeline_states.get(task_id, pipeline_ref) {
+        if let Some(resolved) = state.task_render_pipeline_states.get(
+            task_id,
+            reims_vgpu_protocol::SerializerRef::new(pipeline_ref),
+        ) {
             return Some(resolved.desc.raster_sample_count.max(1));
         }
     }
@@ -460,9 +468,11 @@ mod tests {
 
         let mut state = DeviceState::new(DeviceId(1), 12);
         state.define_task(3, 1 << 20, 7);
-        let first = state
-            .task_render_pipeline_states
-            .register(3, 9, retained_pipeline_for_test());
+        let first = state.task_render_pipeline_states.register(
+            3,
+            reims_vgpu_protocol::SerializerRef::new(9),
+            retained_pipeline_for_test(),
+        );
         let first_id = first
             .pipeline_object
             .as_ref()
@@ -472,20 +482,28 @@ mod tests {
         assert!(state.set_object_list(3, 11, 64));
         assert!(Arc::ptr_eq(
             &first,
-            &state.task_render_pipeline_states.get(3, 9).unwrap()
+            &state
+                .task_render_pipeline_states
+                .get(3, reims_vgpu_protocol::SerializerRef::new(9))
+                .unwrap()
         ));
-        assert!(state.task_render_pipeline_states.delete(3, 9));
-        assert!(!state.task_render_pipeline_states.contains(3, 9));
+        assert!(state
+            .task_render_pipeline_states
+            .delete(3, reims_vgpu_protocol::SerializerRef::new(9)));
+        assert!(!state
+            .task_render_pipeline_states
+            .contains(3, reims_vgpu_protocol::SerializerRef::new(9)));
         assert_eq!(
             Arc::strong_count(&first),
             1,
             "the encoder owner remains valid"
         );
 
-        let replacement =
-            state
-                .task_render_pipeline_states
-                .register(3, 9, retained_pipeline_for_test());
+        let replacement = state.task_render_pipeline_states.register(
+            3,
+            reims_vgpu_protocol::SerializerRef::new(9),
+            retained_pipeline_for_test(),
+        );
         assert_ne!(
             replacement
                 .pipeline_object
@@ -497,15 +515,21 @@ mod tests {
         );
         state.define_task(3, 1 << 20, 8);
         assert!(
-            !state.task_render_pipeline_states.contains(3, 9),
+            !state
+                .task_render_pipeline_states
+                .contains(3, reims_vgpu_protocol::SerializerRef::new(9)),
             "task redefinition ends the old task namespace"
         );
 
-        state
-            .task_render_pipeline_states
-            .register(3, 9, retained_pipeline_for_test());
+        state.task_render_pipeline_states.register(
+            3,
+            reims_vgpu_protocol::SerializerRef::new(9),
+            retained_pipeline_for_test(),
+        );
         assert!(state.delete_task(3));
-        assert!(!state.task_render_pipeline_states.contains(3, 9));
+        assert!(!state
+            .task_render_pipeline_states
+            .contains(3, reims_vgpu_protocol::SerializerRef::new(9)));
     }
 
     /// The two sets [`VertexBindPlan`] carries used to be rebuilt inside the

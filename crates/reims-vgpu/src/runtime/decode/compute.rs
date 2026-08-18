@@ -1,7 +1,7 @@
 //! Compute command decoder (port of `host/utils/reims-vgpu-compute-decode`).
 
 use crate::contract::endian::ld32;
-use reims_vgpu_protocol::{HeapObject, ObjectRef, ResourceObject};
+use reims_vgpu_protocol::{HeapObject, ObjectTableRef, ResourceObject};
 use reims_vgpu_wire::ops::compute as wire;
 
 /// Shared serializer op-header length from `reims-vgpu-wire`.
@@ -192,8 +192,8 @@ pub struct Command {
     pub buffers: Vec<BufferBinding>,
     pub textures: Vec<RefBinding>,
     pub samplers: Vec<SamplerBinding>,
-    pub resources: Vec<ObjectRef<ResourceObject>>,
-    pub heaps: Vec<ObjectRef<HeapObject>>,
+    pub resources: Vec<ObjectTableRef<ResourceObject>>,
+    pub heaps: Vec<ObjectTableRef<HeapObject>>,
     pub grid: Size3,
     pub threads_per_threadgroup: Size3,
     pub indirect_buffer_ref: u32,
@@ -359,7 +359,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.count = count;
             for i in 0..count as usize {
                 out.heaps
-                    .push(ObjectRef::new(ld32(&payload[4 + i * REF_SIZE..])));
+                    .push(ObjectTableRef::new(ld32(&payload[4 + i * REF_SIZE..])));
             }
             Ok(out)
         }
@@ -377,7 +377,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.resource_usage = ld32(&payload[4..]);
             for i in 0..count as usize {
                 out.resources
-                    .push(ObjectRef::new(ld32(&payload[8 + i * REF_SIZE..])));
+                    .push(ObjectTableRef::new(ld32(&payload[8 + i * REF_SIZE..])));
             }
             Ok(out)
         }
@@ -609,7 +609,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.kind = Kind::BarrierResources;
             out.count = head.count.get();
             for r in refs {
-                out.resources.push(ObjectRef::new(r.object_ref.get()));
+                out.resources.push(ObjectTableRef::new(r.object_ref.get()));
             }
             Ok(out)
         }

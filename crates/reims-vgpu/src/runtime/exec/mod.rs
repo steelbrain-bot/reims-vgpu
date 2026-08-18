@@ -50,7 +50,7 @@ use crate::runtime::plan::event_sync::{Domain as FenceDomain, FenceAction};
 use crate::runtime::task_slot::{resolve_task_word, TaskWordSite};
 #[cfg(feature = "backend-vulkan")]
 use reims_vgpu_protocol::{
-    ObjectRef, ResourceObject, ResourceValidity, SegmentBoundary, SegmentKind, SubmissionId,
+    ObjectTableRef, ResourceObject, ResourceValidity, SegmentBoundary, SegmentKind, SubmissionId,
     SubmissionIdentity, SubmissionResourceUse, TaskId,
 };
 use reims_vgpu_wire::ops::blit as wire_blit;
@@ -823,7 +823,7 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
             context.identity.id,
             resource_descs
                 .iter()
-                .map(|desc| ObjectRef::<ResourceObject>::new(desc.object_id)),
+                .map(|desc| ObjectTableRef::<ResourceObject>::new(desc.object_id)),
         );
         let resources: std::sync::Arc<[SubmissionResourceUse]> = resource_descs
             .iter()

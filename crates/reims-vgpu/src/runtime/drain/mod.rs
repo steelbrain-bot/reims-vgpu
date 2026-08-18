@@ -298,7 +298,9 @@ fn apply_delete_object(state: &mut DeviceState, channel_id: u32, payload: &[u8],
     let object_ref = rec.object_ref.get();
     note_store_route(delete_object_kind_route(op.opcode()));
     if op.opcode() == reims_vgpu_wire::ops::destroy::OPCODE_DELETE_SAMPLER_STATE {
-        let retired = state.task_sampler_states.delete(task_id, object_ref);
+        let retired = state
+            .task_sampler_states
+            .delete(task_id, reims_vgpu_protocol::SerializerRef::new(object_ref));
         note_store_route(if retired {
             "sampler_state_deleted"
         } else {
@@ -327,7 +329,7 @@ fn apply_delete_object(state: &mut DeviceState, channel_id: u32, payload: &[u8],
     if op.opcode() == reims_vgpu_wire::ops::destroy::OPCODE_DELETE_COMPUTE_PIPELINE_STATE {
         let retired = state
             .task_compute_pipeline_states
-            .delete(task_id, object_ref);
+            .delete(task_id, reims_vgpu_protocol::SerializerRef::new(object_ref));
         note_store_route(if retired {
             "compute_pipeline_state_deleted"
         } else {
@@ -336,7 +338,9 @@ fn apply_delete_object(state: &mut DeviceState, channel_id: u32, payload: &[u8],
         return;
     }
     if op.opcode() == reims_vgpu_wire::ops::destroy::OPCODE_DELETE_FUNCTION {
-        let retired = state.task_function_states.delete(task_id, object_ref);
+        let retired = state
+            .task_function_states
+            .delete(task_id, reims_vgpu_protocol::SerializerRef::new(object_ref));
         note_store_route(if retired {
             "function_state_deleted"
         } else {
@@ -349,7 +353,9 @@ fn apply_delete_object(state: &mut DeviceState, channel_id: u32, payload: &[u8],
         // The invalidation for `task_depth_stencil_states`, and the whole reason
         // that retention is sound: the guest names the end of the object's life
         // rather than leaving this device to guess it from the bytes.
-        let retired = state.task_depth_stencil_states.delete(task_id, object_ref);
+        let retired = state
+            .task_depth_stencil_states
+            .delete(task_id, reims_vgpu_protocol::SerializerRef::new(object_ref));
         note_store_route(if retired {
             "ds_state_deleted"
         } else {
@@ -361,7 +367,7 @@ fn apply_delete_object(state: &mut DeviceState, channel_id: u32, payload: &[u8],
     if op.opcode() == reims_vgpu_wire::ops::destroy::OPCODE_DELETE_RENDER_PIPELINE_STATE {
         let retired = state
             .task_render_pipeline_states
-            .delete(task_id, object_ref);
+            .delete(task_id, reims_vgpu_protocol::SerializerRef::new(object_ref));
         note_store_route(if retired {
             "pipeline_state_deleted"
         } else {

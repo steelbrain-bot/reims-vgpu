@@ -61,14 +61,14 @@ impl fmt::LowerHex for GuestPhysicalAddress {
     }
 }
 
-/// A task-local slot in a typed resource namespace.
+/// A task-local slot in the kernel object-table namespace.
 #[repr(transparent)]
-pub struct ObjectRef<T> {
+pub struct ObjectTableRef<T> {
     value: u32,
     marker: PhantomData<fn() -> T>,
 }
 
-impl<T> ObjectRef<T> {
+impl<T> ObjectTableRef<T> {
     pub const fn new(value: u32) -> Self {
         Self {
             value,
@@ -81,41 +81,110 @@ impl<T> ObjectRef<T> {
     }
 }
 
-impl<T> Clone for ObjectRef<T> {
+impl<T> Clone for ObjectTableRef<T> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<T> Copy for ObjectRef<T> {}
+impl<T> Copy for ObjectTableRef<T> {}
 
-impl<T> fmt::Debug for ObjectRef<T> {
+impl<T> fmt::Debug for ObjectTableRef<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("ObjectRef").field(&self.value).finish()
+        f.debug_tuple("ObjectTableRef").field(&self.value).finish()
     }
 }
 
-impl<T> PartialEq for ObjectRef<T> {
+impl<T> PartialEq for ObjectTableRef<T> {
     fn eq(&self, other: &Self) -> bool {
         self.value == other.value
     }
 }
 
-impl<T> Eq for ObjectRef<T> {}
+impl<T> Eq for ObjectTableRef<T> {}
 
-impl<T> PartialOrd for ObjectRef<T> {
+impl<T> PartialOrd for ObjectTableRef<T> {
     fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<T> Ord for ObjectRef<T> {
+impl<T> Ord for ObjectTableRef<T> {
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
         self.value.cmp(&other.value)
     }
 }
 
-impl<T> Hash for ObjectRef<T> {
+impl<T> Hash for ObjectTableRef<T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.value.hash(state);
+    }
+}
+
+/// A slot in one serializer object's task-local, family-specific namespace.
+///
+/// It intentionally has no conversion to or from [`ObjectTableRef`]. The wire
+/// integers can be equal while naming unrelated lifetimes.
+///
+/// ```compile_fail
+/// use reims_vgpu_protocol::{ObjectTableRef, SamplerObject, SerializerRef};
+/// fn delete_sampler(_: SerializerRef<SamplerObject>) {}
+/// delete_sampler(ObjectTableRef::<SamplerObject>::new(7));
+/// ```
+#[repr(transparent)]
+pub struct SerializerRef<T> {
+    value: u32,
+    marker: PhantomData<fn() -> T>,
+}
+
+impl<T> SerializerRef<T> {
+    pub const fn new(value: u32) -> Self {
+        Self {
+            value,
+            marker: PhantomData,
+        }
+    }
+
+    pub const fn get(self) -> u32 {
+        self.value
+    }
+}
+
+impl<T> Clone for SerializerRef<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for SerializerRef<T> {}
+
+impl<T> fmt::Debug for SerializerRef<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("SerializerRef").field(&self.value).finish()
+    }
+}
+
+impl<T> PartialEq for SerializerRef<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
+}
+
+impl<T> Eq for SerializerRef<T> {}
+
+impl<T> PartialOrd for SerializerRef<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<T> Ord for SerializerRef<T> {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.value.cmp(&other.value)
+    }
+}
+
+impl<T> Hash for SerializerRef<T> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.value.hash(state);
     }
@@ -199,8 +268,8 @@ mod tests {
 
     #[test]
     fn typed_namespaces_do_not_share_a_runtime_representation_owner() {
-        let buffer = ObjectRef::<Buffer>::new(7);
-        let texture = ObjectRef::<Texture>::new(7);
+        let buffer = ObjectTableRef::<Buffer>::new(7);
+        let texture = ObjectTableRef::<Texture>::new(7);
         assert_eq!(buffer.get(), texture.get());
 
         let first = ResourceId::<Buffer>::new(3, 4);

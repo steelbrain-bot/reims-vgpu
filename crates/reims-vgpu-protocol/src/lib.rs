@@ -23,8 +23,8 @@ pub use geometry::{
 };
 pub use identity::{
     BackingGeneration, ByteLength, ByteOffset, ContentVersion, GuestPhysicalAddress,
-    GuestVirtualAddress, MappingId, ObjectRef, PlaneIndex, ResourceId, ResourceNamespaceId,
-    StorageId, SubmissionId, SurfaceBackingId, SurfaceId, TaskId,
+    GuestVirtualAddress, MappingId, ObjectTableRef, PlaneIndex, ResourceId, ResourceNamespaceId,
+    SerializerRef, StorageId, SubmissionId, SurfaceBackingId, SurfaceId, TaskId,
 };
 pub use pixel::{
     apply_swizzle_rgba8, swizzle_identity, swizzle_is_identity, swizzle_plan, StorageImageFormat,

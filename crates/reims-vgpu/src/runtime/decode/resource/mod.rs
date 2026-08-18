@@ -3446,7 +3446,7 @@ pub fn parse_color_attachments(
 pub struct HeapTextureRecord<'a> {
     /// Ref of the heap the texture is placed in. Never 0 for a well-formed
     /// record; the caller decides what a 0 means for its own path.
-    pub heap_ref: reims_vgpu_protocol::ObjectRef<reims_vgpu_protocol::HeapObject>,
+    pub heap_ref: reims_vgpu_protocol::ObjectTableRef<reims_vgpu_protocol::HeapObject>,
     /// Whether [`HeapTextureRecord::offset`] is the guest's request or is to be
     /// ignored. The serializer writes the offset either way.
     pub use_offset: bool,
@@ -3491,7 +3491,7 @@ pub fn decode_heap_texture(bytes: &[u8]) -> Result<HeapTextureRecord<'_>, Decode
             let desc_at = OP_HDR + offset_of!(w_heap::NewHeapTextureBody, desc);
             let use_offset_at = OP_HDR + offset_of!(w_heap::NewHeapTextureBody, use_offset_bits);
             Ok(HeapTextureRecord {
-                heap_ref: reims_vgpu_protocol::ObjectRef::new(b.heap_ref.get()),
+                heap_ref: reims_vgpu_protocol::ObjectTableRef::new(b.heap_ref.get()),
                 use_offset: b.use_offset(),
                 offset: b.offset.get(),
                 descriptor: &bytes[desc_at..use_offset_at],
@@ -3508,7 +3508,7 @@ pub fn decode_heap_texture(bytes: &[u8]) -> Result<HeapTextureRecord<'_>, Decode
             let use_offset_at =
                 OP_HDR + offset_of!(w_heap::NewHeapTextureWideBody, use_offset_bits);
             Ok(HeapTextureRecord {
-                heap_ref: reims_vgpu_protocol::ObjectRef::new(b.heap_ref.get()),
+                heap_ref: reims_vgpu_protocol::ObjectTableRef::new(b.heap_ref.get()),
                 use_offset: b.use_offset(),
                 offset: b.offset.get(),
                 descriptor: &bytes[desc_at..use_offset_at],

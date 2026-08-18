@@ -110,7 +110,10 @@ pub fn load_mtlb<M: HostMemory + HostOps>(
     if func_ref == 0 {
         return None;
     }
-    if let Some(function) = state.task_function_states.get(task_id, func_ref) {
+    if let Some(function) = state
+        .task_function_states
+        .get(task_id, reims_vgpu_protocol::SerializerRef::new(func_ref))
+    {
         crate::runtime::drain::note_store_route("function_state_hit");
         return Some(Arc::clone(&function.mtlb));
     }
@@ -174,9 +177,11 @@ pub fn load_mtlb<M: HostMemory + HostOps>(
     let function = Arc::new(LoadedFunction {
         mtlb: Arc::clone(&mtlb),
     });
-    let retained = state
-        .task_function_states
-        .register(task_id, func_ref, function);
+    let retained = state.task_function_states.register(
+        task_id,
+        reims_vgpu_protocol::SerializerRef::new(func_ref),
+        function,
+    );
     Some(Arc::clone(&retained.mtlb))
 }
 

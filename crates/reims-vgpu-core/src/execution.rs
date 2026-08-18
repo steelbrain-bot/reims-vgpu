@@ -309,7 +309,7 @@ mod tests {
     #[test]
     fn resource_state_is_a_command_not_mutable_submission_metadata() {
         let update = ResolvedResourceState {
-            object: reims_vgpu_protocol::ObjectRef::new(5),
+            object: reims_vgpu_protocol::ObjectTableRef::new(5),
             resource: None,
             ops: reims_vgpu_protocol::ResourceValidityOps::PAGE_ON,
         };

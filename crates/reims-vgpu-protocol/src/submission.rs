@@ -1,6 +1,6 @@
 //! Semantic metadata carried by every backend submission.
 
-use crate::{ContentVersion, ObjectRef, ResourceId, SubmissionId, TaskId};
+use crate::{ContentVersion, ObjectTableRef, ResourceId, SubmissionId, TaskId};
 
 /// Marker for a heterogeneous task resource-list reference.
 pub enum ResourceObject {}
@@ -33,7 +33,7 @@ pub struct ResourceValidity {
 /// One resource participating in a guest submission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SubmissionResourceUse {
-    pub object: ObjectRef<ResourceObject>,
+    pub object: ObjectTableRef<ResourceObject>,
     /// Canonical identity when the object has already been constructed.
     /// Resource tables may also name declared residency entries which no
     /// command has resolved yet; those deliberately remain unresolved.
@@ -80,7 +80,7 @@ mod tests {
     #[test]
     fn resource_validity_is_not_a_wire_dword() {
         let use_ = SubmissionResourceUse {
-            object: ObjectRef::new(7),
+            object: ObjectTableRef::new(7),
             resource: None,
             expected_content: None,
             validity: ResourceValidity {

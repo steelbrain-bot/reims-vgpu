@@ -971,10 +971,10 @@ pub(crate) fn load_compute_pipeline<M: HostMemory + HostOps>(
     if pipeline_ref == 0 {
         return None;
     }
-    if let Some(pipeline) = state
-        .task_compute_pipeline_states
-        .get(task_id, pipeline_ref)
-    {
+    if let Some(pipeline) = state.task_compute_pipeline_states.get(
+        task_id,
+        reims_vgpu_protocol::SerializerRef::new(pipeline_ref),
+    ) {
         crate::runtime::drain::note_store_route("compute_pipeline_state_hit");
         return Some(pipeline);
     }
@@ -1044,11 +1044,11 @@ pub(crate) fn load_compute_pipeline<M: HostMemory + HostOps>(
                 kernel_mtlb,
                 stage_input,
             });
-            Some(
-                state
-                    .task_compute_pipeline_states
-                    .register(task_id, pipeline_ref, pipeline),
-            )
+            Some(state.task_compute_pipeline_states.register(
+                task_id,
+                reims_vgpu_protocol::SerializerRef::new(pipeline_ref),
+                pipeline,
+            ))
         }
         ResourceDescriptor::ComputePipeline(_) => miss("kernel_func_zero", String::new()),
         _ => miss("not_compute_pipeline", String::new()),

@@ -585,7 +585,10 @@ fn load_depth_stencil_descriptor<M: HostMemory + HostOps>(
     task_id: u32,
     ds_ref: u32,
 ) -> Result<crate::runtime::decode::resource::DepthStencilDescriptor, &'static str> {
-    if let Some(state_) = state.task_depth_stencil_states.get(task_id, ds_ref) {
+    if let Some(state_) = state
+        .task_depth_stencil_states
+        .get(task_id, reims_vgpu_protocol::SerializerRef::new(ds_ref))
+    {
         crate::runtime::drain::note_store_route("ds_state_held");
         return Ok((*state_).clone());
     }
@@ -603,9 +606,11 @@ fn load_depth_stencil_descriptor<M: HostMemory + HostOps>(
     // `resolve_sampler_state`: a descriptor still being published can succeed on
     // retry, and retaining a failure would make that retry impossible.
     crate::runtime::drain::note_store_route("ds_state_constructed");
-    Ok((*state
-        .task_depth_stencil_states
-        .register(task_id, ds_ref, std::sync::Arc::new(decoded)))
+    Ok((*state.task_depth_stencil_states.register(
+        task_id,
+        reims_vgpu_protocol::SerializerRef::new(ds_ref),
+        std::sync::Arc::new(decoded),
+    ))
     .clone())
 }
 

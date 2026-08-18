@@ -1,6 +1,6 @@
 //! Resource-resolved state transitions carried outside the wire decoder.
 
-use reims_vgpu_protocol::{ObjectRef, ResourceId, ResourceObject, ResourceValidityOps};
+use reims_vgpu_protocol::{ObjectTableRef, ResourceId, ResourceObject, ResourceValidityOps};
 
 /// One decoded validity statement paired with the resource lifetime it names.
 ///
@@ -10,7 +10,7 @@ use reims_vgpu_protocol::{ObjectRef, ResourceId, ResourceObject, ResourceValidit
 /// equality never substitutes for a resource identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResolvedResourceState {
-    pub object: ObjectRef<ResourceObject>,
+    pub object: ObjectTableRef<ResourceObject>,
     pub resource: Option<ResourceId<ResourceObject>>,
     pub ops: ResourceValidityOps,
 }
@@ -22,7 +22,7 @@ mod tests {
     #[test]
     fn an_unconstructed_reference_is_not_invented_as_a_resource_identity() {
         let update = ResolvedResourceState {
-            object: ObjectRef::new(7),
+            object: ObjectTableRef::new(7),
             resource: None,
             ops: ResourceValidityOps::PAGE_ON,
         };

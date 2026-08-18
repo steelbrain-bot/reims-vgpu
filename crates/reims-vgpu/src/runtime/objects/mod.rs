@@ -1601,7 +1601,10 @@ pub fn resolve_sampler_state<M: HostMemory>(
 ) -> Result<Arc<crate::model::TaskSamplerState>, SamplerResolveError> {
     use crate::runtime::decode::resource::decode_sampler_descriptor;
 
-    if let Some(sampler) = state.task_sampler_states.get(task_id, sampler_ref) {
+    if let Some(sampler) = state.task_sampler_states.get(
+        task_id,
+        reims_vgpu_protocol::SerializerRef::new(sampler_ref),
+    ) {
         return Ok(sampler);
     }
 
@@ -1629,7 +1632,7 @@ pub fn resolve_sampler_state<M: HostMemory>(
         })?;
     let sampler = state.task_sampler_states.register(
         task_id,
-        sampler_ref,
+        reims_vgpu_protocol::SerializerRef::new(sampler_ref),
         Arc::new(crate::model::TaskSamplerState { descriptor }),
     );
     crate::runtime::drain::note_store_route("sampler_state_constructed");

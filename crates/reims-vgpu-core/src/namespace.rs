@@ -1,6 +1,6 @@
 //! Generational task/reference namespaces for semantic objects without storage.
 
-use reims_vgpu_protocol::{ObjectRef, ResourceId, TaskId};
+use reims_vgpu_protocol::{ResourceId, SerializerRef, TaskId};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -23,7 +23,7 @@ struct Slot<M> {
 /// internal lifetime.
 #[derive(Debug)]
 pub struct ReferenceNamespace<M> {
-    slots: BTreeMap<(TaskId, ObjectRef<M>), Slot<M>>,
+    slots: BTreeMap<(TaskId, SerializerRef<M>), Slot<M>>,
     next_index: u32,
 }
 
@@ -40,7 +40,7 @@ impl<M> ReferenceNamespace<M> {
     pub fn publish(
         &mut self,
         task: TaskId,
-        object: ObjectRef<M>,
+        object: SerializerRef<M>,
     ) -> Result<ResourceId<M>, NamespaceError> {
         if let Some(current) = self
             .slots
@@ -72,13 +72,13 @@ impl<M> ReferenceNamespace<M> {
         Ok(id)
     }
 
-    pub fn resolve(&self, task: TaskId, object: ObjectRef<M>) -> Option<ResourceId<M>> {
+    pub fn resolve(&self, task: TaskId, object: SerializerRef<M>) -> Option<ResourceId<M>> {
         self.slots
             .get(&(task, object))
             .and_then(|slot| slot.current)
     }
 
-    pub fn release(&mut self, task: TaskId, object: ObjectRef<M>) -> bool {
+    pub fn release(&mut self, task: TaskId, object: SerializerRef<M>) -> bool {
         self.slots
             .get_mut(&(task, object))
             .and_then(|slot| slot.current.take())
@@ -105,7 +105,7 @@ mod tests {
     #[test]
     fn reference_reuse_advances_generation_and_tasks_are_independent() {
         let mut namespace = ReferenceNamespace::<Sampler>::default();
-        let object = ObjectRef::new(7);
+        let object = SerializerRef::new(7);
         let first = namespace.publish(TaskId::new(1), object).unwrap();
         assert_eq!(namespace.publish(TaskId::new(1), object).unwrap(), first);
         let other_task = namespace.publish(TaskId::new(2), object).unwrap();

@@ -2,7 +2,7 @@
 
 use reims_vgpu_protocol::{
     BackingGeneration, ByteLength, ByteOffset, ContentVersion, GuestVirtualAddress, MappingId,
-    ObjectKind, ObjectRef, PlaneIndex, ResourceId, ResourceObject, StorageId, SubmissionId,
+    ObjectKind, ObjectTableRef, PlaneIndex, ResourceId, ResourceObject, StorageId, SubmissionId,
     SurfaceBackingId, TaskId,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -378,7 +378,7 @@ pub struct MappingNode {
 pub struct ResourceNode {
     pub id: AnyResourceId,
     pub task: TaskId,
-    pub object: ObjectRef<ResourceObject>,
+    pub object: ObjectTableRef<ResourceObject>,
     pub kind: ObjectKind,
     pub lifecycle: LifecycleState,
     pub storage: Option<StorageId>,
@@ -414,7 +414,7 @@ struct NamespaceSlot {
 /// One authority for object-name reuse and resource/storage/mapping lifetime.
 #[derive(Debug)]
 pub struct ResourceGraph {
-    slots: BTreeMap<(TaskId, ObjectRef<ResourceObject>), NamespaceSlot>,
+    slots: BTreeMap<(TaskId, ObjectTableRef<ResourceObject>), NamespaceSlot>,
     resources: BTreeMap<AnyResourceId, ResourceNode>,
     storage: BTreeMap<StorageId, StorageNode>,
     mappings: BTreeMap<MappingId, MappingNode>,
@@ -459,7 +459,7 @@ impl ResourceGraph {
     pub fn create_resource(
         &mut self,
         task: TaskId,
-        object: ObjectRef<ResourceObject>,
+        object: ObjectTableRef<ResourceObject>,
         kind: ObjectKind,
         storage: Option<StorageId>,
         parents: impl IntoIterator<Item = AnyResourceId>,
@@ -534,7 +534,7 @@ impl ResourceGraph {
     pub fn resolve(
         &self,
         task: TaskId,
-        object: ObjectRef<ResourceObject>,
+        object: ObjectTableRef<ResourceObject>,
     ) -> Option<AnyResourceId> {
         self.slots
             .get(&(task, object))
@@ -826,7 +826,7 @@ impl ResourceGraph {
     pub fn release_reference(
         &mut self,
         task: TaskId,
-        object: ObjectRef<ResourceObject>,
+        object: ObjectTableRef<ResourceObject>,
     ) -> Result<AnyResourceId, GraphError> {
         let id = self
             .slots
@@ -911,8 +911,8 @@ mod tests {
         TaskId::new(3)
     }
 
-    fn object(value: u32) -> ObjectRef<ResourceObject> {
-        ObjectRef::new(value)
+    fn object(value: u32) -> ObjectTableRef<ResourceObject> {
+        ObjectTableRef::new(value)
     }
 
     #[test]

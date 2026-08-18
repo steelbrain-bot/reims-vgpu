@@ -7,8 +7,8 @@ use crate::runtime::decode::resource::{
 use reims_vgpu_core::{ReferenceNamespace, ResourceGraph, ResourceNode};
 use reims_vgpu_protocol::{
     ByteLength, ByteOffset, ComputePipelineObject, ContentVersion, EventObject, FenceObject,
-    FunctionObject, GuestVirtualAddress, MappingId, ObjectRef, PlaneIndex, ResourceId,
-    ResourceObject, SamplerObject, SubmissionId, SurfaceBackingId, TaskId,
+    FunctionObject, GuestVirtualAddress, MappingId, ObjectTableRef, PlaneIndex, ResourceId,
+    ResourceObject, SamplerObject, SerializerRef, SubmissionId, SurfaceBackingId, TaskId,
 };
 #[cfg(feature = "backend-vulkan")]
 use reims_vgpu_protocol::{DepthStencilObject, RenderPipelineObject};
@@ -953,7 +953,7 @@ impl TaskResources {
             .graph
             .create_resource(
                 TaskId::new(task_id),
-                ObjectRef::new(ref_),
+                ObjectTableRef::new(ref_),
                 resource.entry.kind,
                 None,
                 [],
@@ -978,7 +978,7 @@ impl TaskResources {
         if removed.is_some() {
             registry
                 .graph
-                .release_reference(TaskId::new(task_id), ObjectRef::new(ref_))
+                .release_reference(TaskId::new(task_id), ObjectTableRef::new(ref_))
                 .expect("published resources have a graph reference");
         }
         removed.is_some()
@@ -1015,7 +1015,7 @@ impl TaskResources {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let id = registry
             .graph
-            .resolve(TaskId::new(task_id), ObjectRef::new(ref_))?;
+            .resolve(TaskId::new(task_id), ObjectTableRef::new(ref_))?;
         registry.graph.resource(id)?.content.guest_wrote().ok()
     }
 
@@ -1041,7 +1041,7 @@ impl TaskResources {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let id = registry
             .graph
-            .resolve(TaskId::new(task_id), ObjectRef::new(ref_))?;
+            .resolve(TaskId::new(task_id), ObjectTableRef::new(ref_))?;
         Some((id, registry.graph.resource(id)?.content.current()))
     }
 
@@ -1100,7 +1100,7 @@ impl TaskResources {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let id = registry
             .graph
-            .resolve(TaskId::new(task_id), ObjectRef::new(ref_))?;
+            .resolve(TaskId::new(task_id), ObjectTableRef::new(ref_))?;
         let content = &registry.graph.resource(id)?.content;
         content.gpu_store_planned(submission).ok()?;
         let version = content.gpu_store_completed(submission).ok()?;
@@ -1143,9 +1143,9 @@ impl TaskResources {
         &self,
         task_id: u32,
         submission: SubmissionId,
-        objects: impl IntoIterator<Item = ObjectRef<ResourceObject>>,
+        objects: impl IntoIterator<Item = ObjectTableRef<ResourceObject>>,
     ) -> Vec<(
-        ObjectRef<ResourceObject>,
+        ObjectTableRef<ResourceObject>,
         Option<ResourceId<ResourceObject>>,
         Option<ContentVersion>,
     )> {
@@ -1339,7 +1339,7 @@ mod task_resource_graph_tests {
         assert_eq!(raced.semantic_id(), Some(id));
         let node = resources.resource_node(id).expect("canonical node");
         assert_eq!(node.task, TaskId::new(4));
-        assert_eq!(node.object, ObjectRef::new(9));
+        assert_eq!(node.object, ObjectTableRef::new(9));
         assert_eq!(node.kind, ObjectKind::Buffer);
     }
 
@@ -1431,10 +1431,14 @@ mod task_resource_graph_tests {
         let id = resource.semantic_id().unwrap();
         let submission = SubmissionId::new(12);
 
-        let snapshot = resources.begin_submission(4, submission, [ObjectRef::new(9)]);
+        let snapshot = resources.begin_submission(4, submission, [ObjectTableRef::new(9)]);
         assert_eq!(
             snapshot,
-            vec![(ObjectRef::new(9), Some(id), Some(ContentVersion::new(1)))]
+            vec![(
+                ObjectTableRef::new(9),
+                Some(id),
+                Some(ContentVersion::new(1))
+            )]
         );
         assert_eq!(
             resources.resource_node(id).unwrap().lifecycle,
@@ -1454,9 +1458,13 @@ mod task_resource_graph_tests {
         let id = resource.semantic_id().unwrap();
 
         let version = resources.note_guest_write(4, 9).unwrap();
-        let snapshot = resources.begin_submission(4, SubmissionId::new(1), [ObjectRef::new(9)]);
+        let snapshot =
+            resources.begin_submission(4, SubmissionId::new(1), [ObjectTableRef::new(9)]);
 
-        assert_eq!(snapshot[0], (ObjectRef::new(9), Some(id), Some(version)));
+        assert_eq!(
+            snapshot[0],
+            (ObjectTableRef::new(9), Some(id), Some(version))
+        );
         resources.complete_submission(SubmissionId::new(1), [id]);
     }
 
@@ -1528,8 +1536,11 @@ mod task_resource_graph_tests {
         let id = resource.semantic_id().unwrap();
         let submission = SubmissionId::new(5);
 
-        let snapshot =
-            resources.begin_submission(4, submission, [ObjectRef::new(9), ObjectRef::new(9)]);
+        let snapshot = resources.begin_submission(
+            4,
+            submission,
+            [ObjectTableRef::new(9), ObjectTableRef::new(9)],
+        );
         assert_eq!(snapshot.len(), 2);
         resources.complete_submission(submission, snapshot.iter().filter_map(|item| item.1));
         assert_eq!(
@@ -1588,7 +1599,7 @@ struct TaskReferenceState<T, M> {
 }
 
 struct TaskReferenceStateRegistry<T, M> {
-    values: BTreeMap<(u32, u32), TaskReferenceState<T, M>>,
+    values: BTreeMap<(TaskId, SerializerRef<M>), TaskReferenceState<T, M>>,
     namespace: ReferenceNamespace<M>,
 }
 
@@ -1622,38 +1633,38 @@ impl<T, M> std::fmt::Debug for TaskReferenceStates<T, M> {
 }
 
 impl<T, M> TaskReferenceStates<T, M> {
-    pub fn contains(&self, task_id: u32, ref_: u32) -> bool {
+    pub fn contains(&self, task_id: u32, ref_: SerializerRef<M>) -> bool {
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .values
-            .contains_key(&(task_id, ref_))
+            .contains_key(&(TaskId::new(task_id), ref_))
     }
 
-    pub fn get(&self, task_id: u32, ref_: u32) -> Option<Arc<T>> {
+    pub fn get(&self, task_id: u32, ref_: SerializerRef<M>) -> Option<Arc<T>> {
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .values
-            .get(&(task_id, ref_))
+            .get(&(TaskId::new(task_id), ref_))
             .map(|state| Arc::clone(&state.value))
     }
 
     /// Publish a fully constructed object unless another resolver won the race.
-    pub fn register(&self, task_id: u32, ref_: u32, state: Arc<T>) -> Arc<T> {
+    pub fn register(&self, task_id: u32, ref_: SerializerRef<M>, state: Arc<T>) -> Arc<T> {
         let mut registry = self
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(existing) = registry.values.get(&(task_id, ref_)) {
+        if let Some(existing) = registry.values.get(&(TaskId::new(task_id), ref_)) {
             return Arc::clone(&existing.value);
         }
         let id = registry
             .namespace
-            .publish(TaskId::new(task_id), ObjectRef::new(ref_))
+            .publish(TaskId::new(task_id), ref_)
             .expect("semantic reference identity space remains available");
         registry.values.insert(
-            (task_id, ref_),
+            (TaskId::new(task_id), ref_),
             TaskReferenceState {
                 id,
                 value: Arc::clone(&state),
@@ -1662,25 +1673,26 @@ impl<T, M> TaskReferenceStates<T, M> {
         state
     }
 
-    pub fn identity(&self, task_id: u32, ref_: u32) -> Option<ResourceId<M>> {
+    pub fn identity(&self, task_id: u32, ref_: SerializerRef<M>) -> Option<ResourceId<M>> {
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .values
-            .get(&(task_id, ref_))
+            .get(&(TaskId::new(task_id), ref_))
             .map(|state| state.id)
     }
 
-    pub fn delete(&self, task_id: u32, ref_: u32) -> bool {
+    pub fn delete(&self, task_id: u32, ref_: SerializerRef<M>) -> bool {
         let mut registry = self
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let removed = registry.values.remove(&(task_id, ref_)).is_some();
+        let removed = registry
+            .values
+            .remove(&(TaskId::new(task_id), ref_))
+            .is_some();
         if removed {
-            assert!(registry
-                .namespace
-                .release(TaskId::new(task_id), ObjectRef::new(ref_)));
+            assert!(registry.namespace.release(TaskId::new(task_id), ref_));
         }
         removed
     }
@@ -1691,7 +1703,9 @@ impl<T, M> TaskReferenceStates<T, M> {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let before = states.values.len();
-        states.values.retain(|&(task, _), _| task != task_id);
+        states
+            .values
+            .retain(|&(task, _), _| task != TaskId::new(task_id));
         let removed = before - states.values.len();
         let namespace_removed = states.namespace.release_task(TaskId::new(task_id));
         assert_eq!(removed, namespace_removed);
@@ -1741,7 +1755,7 @@ impl<M> TaskGenerationStates<M> {
         let state = self.values.get(&(task_id, ref_))?;
         debug_assert_eq!(
             self.namespace
-                .resolve(TaskId::new(task_id), ObjectRef::new(ref_)),
+                .resolve(TaskId::new(task_id), SerializerRef::new(ref_)),
             Some(state.id)
         );
         Some(state.value)
@@ -1754,7 +1768,7 @@ impl<M> TaskGenerationStates<M> {
         }
         let id = self
             .namespace
-            .publish(TaskId::new(task_id), ObjectRef::new(ref_))
+            .publish(TaskId::new(task_id), SerializerRef::new(ref_))
             .expect("synchronization identity space remains available");
         self.values
             .insert((task_id, ref_), TaskGenerationState { id, value });
@@ -1765,7 +1779,7 @@ impl<M> TaskGenerationStates<M> {
         if removed {
             assert!(self
                 .namespace
-                .release(TaskId::new(task_id), ObjectRef::new(ref_)));
+                .release(TaskId::new(task_id), SerializerRef::new(ref_)));
         }
         removed
     }
@@ -1825,33 +1839,35 @@ pub type TaskDepthStencilStates = TaskReferenceStates<
 #[cfg(test)]
 mod task_reference_state_tests {
     use super::TaskReferenceStates;
-    use reims_vgpu_protocol::SamplerObject;
+    use reims_vgpu_protocol::{SamplerObject, SerializerRef};
     use std::sync::Arc;
 
     #[test]
     fn explicit_reference_and_task_deletion_are_the_only_retirement_events() {
         let states = TaskReferenceStates::<_, SamplerObject>::default();
-        let first = states.register(1, 7, Arc::new(10u32));
-        let raced = states.register(1, 7, Arc::new(11u32));
-        states.register(1, 8, Arc::new(12u32));
-        states.register(2, 7, Arc::new(13u32));
+        let seven = SerializerRef::new(7);
+        let eight = SerializerRef::new(8);
+        let first = states.register(1, seven, Arc::new(10u32));
+        let raced = states.register(1, seven, Arc::new(11u32));
+        states.register(1, eight, Arc::new(12u32));
+        states.register(2, seven, Arc::new(13u32));
 
         assert!(Arc::ptr_eq(&first, &raced), "the first construction wins");
-        let first_id = states.identity(1, 7).unwrap();
-        assert_eq!(*states.get(1, 7).unwrap(), 10);
-        assert!(states.delete(1, 7));
-        assert!(!states.contains(1, 7));
-        states.register(1, 7, Arc::new(14u32));
-        let replacement_id = states.identity(1, 7).unwrap();
+        let first_id = states.identity(1, seven).unwrap();
+        assert_eq!(*states.get(1, seven).unwrap(), 10);
+        assert!(states.delete(1, seven));
+        assert!(!states.contains(1, seven));
+        states.register(1, seven, Arc::new(14u32));
+        let replacement_id = states.identity(1, seven).unwrap();
         assert_eq!(first_id.index(), replacement_id.index());
         assert_ne!(first_id.generation(), replacement_id.generation());
-        assert!(states.contains(1, 8));
-        assert!(states.contains(2, 7));
+        assert!(states.contains(1, eight));
+        assert!(states.contains(2, seven));
 
         assert_eq!(states.delete_task(1), 2);
-        assert!(!states.contains(1, 7));
-        assert!(!states.contains(1, 8));
-        assert!(states.contains(2, 7));
+        assert!(!states.contains(1, seven));
+        assert!(!states.contains(1, eight));
+        assert!(states.contains(2, seven));
         assert_eq!(
             *first, 10,
             "an encoder owner remains valid after registry deletion"
@@ -1862,10 +1878,10 @@ mod task_reference_state_tests {
     fn a_live_reference_population_has_no_capacity_eviction() {
         let states = TaskReferenceStates::<_, SamplerObject>::default();
         for ref_ in 0..2048 {
-            states.register(3, ref_, Arc::new(ref_));
+            states.register(3, SerializerRef::new(ref_), Arc::new(ref_));
         }
         for ref_ in 0..2048 {
-            assert_eq!(*states.get(3, ref_).unwrap(), ref_);
+            assert_eq!(*states.get(3, SerializerRef::new(ref_)).unwrap(), ref_);
         }
     }
 }

@@ -981,16 +981,18 @@ fn compute_pipeline_state_is_immutable_until_delete_and_reuse() {
     let first = load_compute_pipeline(&state, &host, 1, 6).expect("first pipeline");
     let first_identity = state
         .task_compute_pipeline_states
-        .identity(1, 6)
+        .identity(1, reims_vgpu_protocol::SerializerRef::new(6))
         .expect("first identity");
     let first_function_identity = state
         .task_function_states
-        .identity(1, 5)
+        .identity(1, reims_vgpu_protocol::SerializerRef::new(5))
         .expect("first function identity");
     assert_eq!(first.kernel_func_ref, 5);
     assert_eq!(&*first.kernel_mtlb, &[1, 2, 3, 4]);
 
-    assert!(state.task_function_states.delete(1, 5));
+    assert!(state
+        .task_function_states
+        .delete(1, reims_vgpu_protocol::SerializerRef::new(5)));
     write_task_gva_arm64e(&mut host, &state.tasks[1], blob_gva, &[9, 8, 7, 6]);
     let replacement_function = crate::runtime::mtlb::load_mtlb(
         &state,
@@ -1002,7 +1004,7 @@ fn compute_pipeline_state_is_immutable_until_delete_and_reuse() {
     .expect("replacement function");
     let replacement_function_identity = state
         .task_function_states
-        .identity(1, 5)
+        .identity(1, reims_vgpu_protocol::SerializerRef::new(5))
         .expect("replacement function identity");
     assert_eq!(&*replacement_function, &[9, 8, 7, 6]);
     assert_eq!(
@@ -1025,11 +1027,13 @@ fn compute_pipeline_state_is_immutable_until_delete_and_reuse() {
         "a live pipeline retains the function payload it was constructed from"
     );
 
-    assert!(state.task_compute_pipeline_states.delete(1, 6));
+    assert!(state
+        .task_compute_pipeline_states
+        .delete(1, reims_vgpu_protocol::SerializerRef::new(6)));
     let replacement = load_compute_pipeline(&state, &host, 1, 6).expect("replacement pipeline");
     let replacement_identity = state
         .task_compute_pipeline_states
-        .identity(1, 6)
+        .identity(1, reims_vgpu_protocol::SerializerRef::new(6))
         .expect("replacement identity");
     assert_eq!(replacement.kernel_func_ref, 9);
     assert_eq!(&*replacement.kernel_mtlb, &[9, 8, 7, 6]);

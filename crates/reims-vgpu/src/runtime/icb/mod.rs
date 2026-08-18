@@ -45,7 +45,7 @@ use crate::runtime::decode::resource::{
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::objects;
 use reims_vgpu_core::ReferenceNamespace;
-use reims_vgpu_protocol::{IndirectCommandBufferObject, ObjectRef, ResourceId, TaskId};
+use reims_vgpu_protocol::{IndirectCommandBufferObject, ResourceId, SerializerRef, TaskId};
 use std::collections::BTreeMap;
 
 /// A refusal on the indirect-command-buffer rail.
@@ -1225,7 +1225,7 @@ struct IcbEntry {
 #[derive(Debug, Default)]
 struct IcbRegistryInner {
     namespace: ReferenceNamespace<IndirectCommandBufferObject>,
-    records: BTreeMap<(u32, u32), IcbEntry>,
+    records: BTreeMap<(TaskId, SerializerRef<IndirectCommandBufferObject>), IcbEntry>,
 }
 
 /// Device-owned semantic ICB state.
@@ -1246,22 +1246,22 @@ impl IcbRegistry {
         desc: IndirectCommandBufferDescriptor,
     ) -> Result<IndirectCommandBufferDescriptor, IcbStatus> {
         let mut inner = self.inner.lock();
-        if let Some(entry) = inner.records.get(&(task_id, icb_ref)) {
+        let task = TaskId::new(task_id);
+        let object = SerializerRef::new(icb_ref);
+        if let Some(entry) = inner.records.get(&(task, object)) {
             if entry.record.desc == desc {
                 return Ok(entry.record.desc.clone());
             }
         }
 
-        let task = TaskId::new(task_id);
-        let object = ObjectRef::new(icb_ref);
-        inner.records.remove(&(task_id, icb_ref));
+        inner.records.remove(&(task, object));
         inner.namespace.release(task, object);
         let id = inner
             .namespace
             .publish(task, object)
             .map_err(|_| IcbStatus::Args("icb_identity_space_exhausted"))?;
         inner.records.insert(
-            (task_id, icb_ref),
+            (task, object),
             IcbEntry {
                 id,
                 record: IcbRecord {
@@ -1277,7 +1277,7 @@ impl IcbRegistry {
         let mut inner = self.inner.lock();
         let entry = inner
             .records
-            .get_mut(&(task_id, icb_ref))
+            .get_mut(&(TaskId::new(task_id), SerializerRef::new(icb_ref)))
             .ok_or(IcbStatus::Missing("icb_bind_memory_not_cached"))?;
         entry.record.command_memory = Some(mem);
         Ok(())
@@ -1285,11 +1285,10 @@ impl IcbRegistry {
 
     fn snapshot(&self, task_id: u32, icb_ref: u32) -> Option<IcbRecord> {
         let inner = self.inner.lock();
-        let entry = inner.records.get(&(task_id, icb_ref))?;
+        let object = SerializerRef::new(icb_ref);
+        let entry = inner.records.get(&(TaskId::new(task_id), object))?;
         debug_assert_eq!(
-            inner
-                .namespace
-                .resolve(TaskId::new(task_id), ObjectRef::new(icb_ref)),
+            inner.namespace.resolve(TaskId::new(task_id), object),
             Some(entry.id)
         );
         Some(entry.record.clone())
@@ -1297,10 +1296,12 @@ impl IcbRegistry {
 
     pub(crate) fn delete(&self, task_id: u32, icb_ref: u32) -> bool {
         let mut inner = self.inner.lock();
-        let removed = inner.records.remove(&(task_id, icb_ref)).is_some();
-        let released = inner
-            .namespace
-            .release(TaskId::new(task_id), ObjectRef::new(icb_ref));
+        let object = SerializerRef::new(icb_ref);
+        let removed = inner
+            .records
+            .remove(&(TaskId::new(task_id), object))
+            .is_some();
+        let released = inner.namespace.release(TaskId::new(task_id), object);
         debug_assert_eq!(removed, released);
         removed
     }
@@ -1308,7 +1309,9 @@ impl IcbRegistry {
     pub(crate) fn delete_task(&self, task_id: u32) -> usize {
         let mut inner = self.inner.lock();
         let before = inner.records.len();
-        inner.records.retain(|&(task, _), _| task != task_id);
+        inner
+            .records
+            .retain(|&(task, _), _| task != TaskId::new(task_id));
         let removed = before - inner.records.len();
         let released = inner.namespace.release_task(TaskId::new(task_id));
         debug_assert_eq!(removed, released);
@@ -1324,7 +1327,7 @@ impl IcbRegistry {
         self.inner
             .lock()
             .records
-            .get(&(task_id, icb_ref))
+            .get(&(TaskId::new(task_id), SerializerRef::new(icb_ref)))
             .map(|entry| entry.id)
     }
 

@@ -5535,7 +5535,7 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
     let fence_identity = state.fence_identity(2, 17).expect("fence identity");
     state.task_compute_pipeline_states.register(
         2,
-        18,
+        reims_vgpu_protocol::SerializerRef::new(18),
         std::sync::Arc::new(crate::runtime::compute_exec::LoadedComputePipeline {
             kernel_func_ref: 7,
             kernel_mtlb: std::sync::Arc::from([]),
@@ -5544,31 +5544,33 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
     );
     state.task_function_states.register(
         2,
-        19,
+        reims_vgpu_protocol::SerializerRef::new(19),
         std::sync::Arc::new(crate::runtime::mtlb::LoadedFunction {
             mtlb: std::sync::Arc::from([1, 2, 3, 4]),
         }),
     );
     state.task_sampler_states.register(
         2,
-        11,
+        reims_vgpu_protocol::SerializerRef::new(11),
         std::sync::Arc::new(crate::model::TaskSamplerState {
             descriptor: Default::default(),
         }),
     );
     #[cfg(feature = "backend-vulkan")]
     {
-        state
-            .task_depth_stencil_states
-            .register(2, 12, std::sync::Arc::new(Default::default()));
+        state.task_depth_stencil_states.register(
+            2,
+            reims_vgpu_protocol::SerializerRef::new(12),
+            std::sync::Arc::new(Default::default()),
+        );
         state.task_render_pipeline_states.register(
             2,
-            13,
+            reims_vgpu_protocol::SerializerRef::new(13),
             crate::runtime::pipeline_resolve::retained_pipeline_for_test(),
         );
         state.task_render_pipeline_states.register(
             2,
-            15,
+            reims_vgpu_protocol::SerializerRef::new(15),
             crate::runtime::pipeline_resolve::retained_pipeline_for_test(),
         );
     }
@@ -5602,7 +5604,10 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
         "sampler deletion must not cross into the resource-list ref space"
     );
     assert!(
-        state.task_sampler_states.get(2, 11).is_none(),
+        state
+            .task_sampler_states
+            .get(2, reims_vgpu_protocol::SerializerRef::new(11))
+            .is_none(),
         "the sampler opcode retires the same integer only in its own ref space"
     );
 
@@ -5614,7 +5619,10 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
     );
     #[cfg(feature = "backend-vulkan")]
     assert!(
-        state.task_depth_stencil_states.get(2, 12).is_none(),
+        state
+            .task_depth_stencil_states
+            .get(2, reims_vgpu_protocol::SerializerRef::new(12))
+            .is_none(),
         "the depth-stencil destroy opcode retires its own retained state, which \
          is the whole invalidation behind retaining it at all"
     );
@@ -5631,7 +5639,10 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
     );
     #[cfg(feature = "backend-vulkan")]
     assert!(
-        state.task_render_pipeline_states.get(2, 13).is_none(),
+        state
+            .task_render_pipeline_states
+            .get(2, reims_vgpu_protocol::SerializerRef::new(13))
+            .is_none(),
         "the render-pipeline destroy opcode retires its own retained state"
     );
     assert!(
@@ -5673,7 +5684,10 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
         4,
         &destroy_packet(2, OPCODE_DELETE_COMPUTE_PIPELINE_STATE, 18),
     );
-    assert!(state.task_compute_pipeline_states.get(2, 18).is_none());
+    assert!(state
+        .task_compute_pipeline_states
+        .get(2, reims_vgpu_protocol::SerializerRef::new(18))
+        .is_none());
     assert!(
         state.objects.contains(&(2, 18)),
         "compute-pipeline deletion must retire only its pipeline namespace"
@@ -5685,7 +5699,10 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
         4,
         &destroy_packet(2, OPCODE_DELETE_FUNCTION, 19),
     );
-    assert!(state.task_function_states.get(2, 19).is_none());
+    assert!(state
+        .task_function_states
+        .get(2, reims_vgpu_protocol::SerializerRef::new(19))
+        .is_none());
     assert!(
         state.objects.contains(&(2, 19)),
         "function deletion must retire only the function namespace"
@@ -5697,7 +5714,9 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
     );
     #[cfg(feature = "backend-vulkan")]
     assert!(
-        state.task_render_pipeline_states.contains(2, 15),
+        state
+            .task_render_pipeline_states
+            .contains(2, reims_vgpu_protocol::SerializerRef::new(15)),
         "resource-list deletion must not cross into the pipeline ref space"
     );
 
