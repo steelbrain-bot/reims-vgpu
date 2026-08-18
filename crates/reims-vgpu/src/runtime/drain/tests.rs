@@ -5498,7 +5498,7 @@ fn a_delete_object_record_must_fit_the_payload_that_carries_it() {
 fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
     use reims_vgpu_wire::ops::destroy::{
         DELETE_TOTAL_LEN, OPCODE_DELETE_COMPUTE_PIPELINE_STATE, OPCODE_DELETE_DEPTH_STENCIL_STATE,
-        OPCODE_DELETE_FENCE, OPCODE_DELETE_INDIRECT_COMMAND_BUFFER,
+        OPCODE_DELETE_FENCE, OPCODE_DELETE_FUNCTION, OPCODE_DELETE_INDIRECT_COMMAND_BUFFER,
         OPCODE_DELETE_RENDER_PIPELINE_STATE, OPCODE_DELETE_SAMPLER_STATE, OPCODE_DELETE_TEXTURE,
     };
     let mut host = FakeHost::new();
@@ -5521,7 +5521,7 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
     let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
     state.define_task(2, 0x2000, 9);
     assert!(state.set_object_list(2, 3, 64));
-    for ref_ in [10, 11, 12, 13, 14, 15, 16, 17, 18] {
+    for ref_ in [10, 11, 12, 13, 14, 15, 16, 17, 18, 19] {
         assert!(state.insert_object(2, ref_));
     }
     state.icb_registry.insert_for_test(2, 16);
@@ -5532,7 +5532,15 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
         18,
         std::sync::Arc::new(crate::runtime::compute_exec::LoadedComputePipeline {
             kernel_func_ref: 7,
+            kernel_mtlb: std::sync::Arc::from([]),
             stage_input: None,
+        }),
+    );
+    state.task_function_states.register(
+        2,
+        19,
+        std::sync::Arc::new(crate::runtime::mtlb::LoadedFunction {
+            mtlb: std::sync::Arc::from([1, 2, 3, 4]),
         }),
     );
     state.task_sampler_states.register(
@@ -5663,6 +5671,18 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
     assert!(
         state.objects.contains(&(2, 18)),
         "compute-pipeline deletion must retire only its pipeline namespace"
+    );
+
+    process_child_packet(
+        &mut state,
+        &mut host,
+        4,
+        &destroy_packet(2, OPCODE_DELETE_FUNCTION, 19),
+    );
+    assert!(state.task_function_states.get(2, 19).is_none());
+    assert!(
+        state.objects.contains(&(2, 19)),
+        "function deletion must retire only the function namespace"
     );
 
     assert!(

@@ -1,7 +1,7 @@
-//! Guest type-6 function objects: loading the MTLB container, and carving the
+//! Guest function objects: loading the MTLB container, and carving the
 //! wrapped AIR out of it.
 //!
-//! Each type-6 object's descriptor names an MTLB container in guest memory;
+//! Each function descriptor names an MTLB container in guest memory;
 //! metal2vulkan consumes the LLVM BitcodeWrapper (`0x0b17c0de`) record inside.
 //! [`load_mtlb`](crate::runtime::mtlb::load_mtlb) does the first half
 //! (object list → container bytes) and
@@ -41,6 +41,13 @@ use crate::runtime::decode::resource::{decode_function_descriptor, ObjectKind};
 use crate::runtime::draw::host_alloc_len;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::{gva_mem, objects};
+use std::sync::Arc;
+
+/// Immutable function construction state retained for the guest object lifetime.
+#[derive(Debug)]
+pub(crate) struct LoadedFunction {
+    pub mtlb: Arc<[u8]>,
+}
 
 /// LLVM BitcodeWrapperHeader magic `0x0b17c0de` LE.
 ///
@@ -126,7 +133,11 @@ impl AirLoadRail {
     }
 }
 
-/// Load a type-6 function object's MTLB container out of guest memory.
+/// Resolve a function object's immutable MTLB container.
+///
+/// The first resolution reads guest memory and retains the payload under the
+/// function reference lifetime. Later callers receive the same bytes until an
+/// explicit function delete or task teardown ends that lifetime.
 ///
 /// `None` means the caller gets no shader; every reason for it but one is
 /// written to the fail log under [`AirLoadRail::event`], because the callers all
@@ -142,12 +153,17 @@ pub fn load_mtlb<M: HostMemory + HostOps>(
     task_id: u32,
     func_ref: u32,
     rail: AirLoadRail,
-) -> Option<Vec<u8>> {
+) -> Option<Arc<[u8]>> {
     if func_ref == 0 {
         return None;
     }
+    if let Some(function) = state.task_function_states.get(task_id, func_ref) {
+        crate::runtime::drain::note_store_route("function_state_hit");
+        return Some(Arc::clone(&function.mtlb));
+    }
+    crate::runtime::drain::note_store_route("function_state_miss");
     let report = crate::observe::RungReport::new(rail.event(), "func_ref");
-    let miss = |reason: &str, detail: String| -> Option<Vec<u8>> {
+    let miss = |reason: &str, detail: String| -> Option<Arc<[u8]>> {
         report.reason(task_id, func_ref, reason, &detail);
         None
     };
@@ -201,7 +217,14 @@ pub fn load_mtlb<M: HostMemory + HostOps>(
             format!("blob_gva={:#x} blob_size={}", f.blob_gva, f.blob_size),
         );
     }
-    Some(mtlb)
+    let mtlb: Arc<[u8]> = mtlb.into();
+    let function = Arc::new(LoadedFunction {
+        mtlb: Arc::clone(&mtlb),
+    });
+    let retained = state
+        .task_function_states
+        .register(task_id, func_ref, function);
+    Some(Arc::clone(&retained.mtlb))
 }
 
 /// Extract the wrapped-AIR blob from an MTLB container or bare wrapper.

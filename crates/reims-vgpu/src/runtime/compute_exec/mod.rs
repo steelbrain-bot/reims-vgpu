@@ -36,7 +36,6 @@ use crate::runtime::gva_mem;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::mapper;
 use crate::runtime::mapping_write;
-use crate::runtime::mtlb::{load_mtlb, AirLoadRail};
 use crate::runtime::objects;
 
 /// Compute buffer slot count from the guest serializer's argument-table limit.
@@ -918,6 +917,10 @@ fn apply_record_inner<M: HostMemory + HostOps>(
 #[derive(Clone, Debug)]
 pub(crate) struct LoadedComputePipeline {
     pub kernel_func_ref: u32,
+    /// Function payload retained by the pipeline lifetime. Releasing the
+    /// function reference cannot invalidate a pipeline already constructed
+    /// from it.
+    pub kernel_mtlb: std::sync::Arc<[u8]>,
     /// Product-ready stage-input. `None` means the descriptor declared none —
     /// and only that. A descriptor whose entries exceeded the decoder's caps
     /// refuses the pipeline (`stage_input_over_cap`) rather than landing here as
@@ -1027,8 +1030,18 @@ pub(crate) fn load_compute_pipeline<M: HostMemory + HostOps>(
                     );
                 }
             };
+            let Some(kernel_mtlb) = crate::runtime::mtlb::load_mtlb(
+                state,
+                host,
+                task_id,
+                cp.kernel_func_ref,
+                crate::runtime::mtlb::AirLoadRail::Compute,
+            ) else {
+                return miss("kernel_function_missing", String::new());
+            };
             let pipeline = std::sync::Arc::new(LoadedComputePipeline {
                 kernel_func_ref: cp.kernel_func_ref,
+                kernel_mtlb,
                 stage_input,
             });
             Some(
@@ -3694,9 +3707,10 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         if crate::observe::first_sight("compute_stage_input_contract", u64::from(acc.pipeline_ref))
         {
             crate::observe::off(format!(
-                "compute_stage_input_contract pipe={} attrs={:?} layouts={:?} index_type={} \
+                "compute_stage_input_contract pipe={} function={} attrs={:?} layouts={:?} index_type={} \
                  index_buffer={}",
                 acc.pipeline_ref,
+                pipeline.kernel_func_ref,
                 stage_input.attributes,
                 stage_input.layouts,
                 stage_input.index_type,
@@ -3751,15 +3765,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     // bind through the end of its allocation.
     //
     // MTLB → AIR → SPIR-V (LocalSize = threadgroup dims).
-    let Some(mtlb) = load_mtlb(
-        state,
-        host,
-        task_id,
-        pipeline.kernel_func_ref,
-        AirLoadRail::Compute,
-    ) else {
-        return ComputeStatus::MissingMtlb("compute_vk_mtlb_load");
-    };
+    let mtlb = std::sync::Arc::clone(&pipeline.kernel_mtlb);
     // The function blob is an MTLB container; llvm-dis needs the wrapped AIR
     // bitcode member (same extract the render path does — passing the raw
     // container was the live `llvm-dis: file doesn't start with bitcode

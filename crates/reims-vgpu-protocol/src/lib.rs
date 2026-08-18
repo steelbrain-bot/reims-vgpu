@@ -17,8 +17,8 @@ pub use identity::{
 };
 pub use resource::{
     decode_object_list_entry, ComputePipelineObject, DepthStencilObject, EventObject, FenceObject,
-    ObjectKind, ObjectListDecodeError, ObjectListEntry, RenderPipelineObject, SamplerObject,
-    OBJECT_LIST_ENTRY_LEN,
+    FunctionObject, ObjectKind, ObjectListDecodeError, ObjectListEntry, RenderPipelineObject,
+    SamplerObject, OBJECT_LIST_ENTRY_LEN,
 };
 pub use submission::{
     HeapObject, IndirectCommandBufferObject, ResourceObject, ResourceValidity, SegmentBoundary,

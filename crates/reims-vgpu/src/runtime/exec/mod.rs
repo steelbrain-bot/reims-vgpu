@@ -1112,15 +1112,7 @@ fn preflight_compute_translations<M: HostMemory + HostOps>(
         note_preflight_pipe();
         let air_started = std::time::Instant::now();
         let loaded = compute_exec::load_compute_pipeline(state, host, task_id, pipeline_ref)
-            .and_then(|pipeline| {
-                crate::runtime::mtlb::load_mtlb(
-                    state,
-                    host,
-                    task_id,
-                    pipeline.kernel_func_ref,
-                    crate::runtime::mtlb::AirLoadRail::Compute,
-                )
-            });
+            .map(|pipeline| std::sync::Arc::clone(&pipeline.kernel_mtlb));
         note_preflight_part(PreflightPart::Air, air_started.elapsed().as_nanos() as u64);
         let Some(mtlb) = loaded else {
             continue;

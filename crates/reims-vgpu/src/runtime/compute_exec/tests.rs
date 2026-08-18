@@ -924,6 +924,29 @@ fn compute_pipeline_state_is_immutable_until_delete_and_reuse() {
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
 
+    let blob_gva = 0x180u64;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], blob_gva, &[1, 2, 3, 4]);
+    let mut function = [0u8; 32];
+    st64(&mut function[0..], blob_gva);
+    st32(&mut function[8..], 4);
+    let function_gva = 0x100u64;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], function_gva, &function);
+    let function_off = list_object_entry_offset(5, 32).unwrap();
+    let mut function_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(
+        &mut function_entry[0..],
+        (OBJECT_TYPE_FUNCTION as u32) | (32u32 << 8),
+    );
+    function_entry[4..12].copy_from_slice(&function_gva.to_le_bytes());
+    write_task_gva_arm64e(&mut host, &state.tasks[1], function_off, &function_entry);
+    let second_function_off = list_object_entry_offset(9, 32).unwrap();
+    write_task_gva_arm64e(
+        &mut host,
+        &state.tasks[1],
+        second_function_off,
+        &function_entry,
+    );
+
     let mut descriptor = vec![0u8; 32];
     st32(&mut descriptor[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
     st32(&mut descriptor[4..], 32);
@@ -944,13 +967,47 @@ fn compute_pipeline_state_is_immutable_until_delete_and_reuse() {
         .task_compute_pipeline_states
         .identity(1, 6)
         .expect("first identity");
+    let first_function_identity = state
+        .task_function_states
+        .identity(1, 5)
+        .expect("first function identity");
     assert_eq!(first.kernel_func_ref, 5);
+    assert_eq!(&*first.kernel_mtlb, &[1, 2, 3, 4]);
+
+    assert!(state.task_function_states.delete(1, 5));
+    write_task_gva_arm64e(&mut host, &state.tasks[1], blob_gva, &[9, 8, 7, 6]);
+    let replacement_function = crate::runtime::mtlb::load_mtlb(
+        &state,
+        &host,
+        1,
+        5,
+        crate::runtime::mtlb::AirLoadRail::Compute,
+    )
+    .expect("replacement function");
+    let replacement_function_identity = state
+        .task_function_states
+        .identity(1, 5)
+        .expect("replacement function identity");
+    assert_eq!(&*replacement_function, &[9, 8, 7, 6]);
+    assert_eq!(
+        first_function_identity.index(),
+        replacement_function_identity.index()
+    );
+    assert_ne!(
+        first_function_identity.generation(),
+        replacement_function_identity.generation()
+    );
 
     st32(&mut descriptor[TYPE7_FIRST_TLVS + 3..], 9);
     write_task_gva_arm64e(&mut host, &state.tasks[1], descriptor_gva, &descriptor);
     let retained = load_compute_pipeline(&state, &host, 1, 6).expect("retained pipeline");
     assert!(std::sync::Arc::ptr_eq(&first, &retained));
     assert_eq!(retained.kernel_func_ref, 5);
+    assert_eq!(
+        &*retained.kernel_mtlb,
+        &[1, 2, 3, 4],
+        "a live pipeline retains the function payload it was constructed from"
+    );
 
     assert!(state.task_compute_pipeline_states.delete(1, 6));
     let replacement = load_compute_pipeline(&state, &host, 1, 6).expect("replacement pipeline");
@@ -959,6 +1016,7 @@ fn compute_pipeline_state_is_immutable_until_delete_and_reuse() {
         .identity(1, 6)
         .expect("replacement identity");
     assert_eq!(replacement.kernel_func_ref, 9);
+    assert_eq!(&*replacement.kernel_mtlb, &[9, 8, 7, 6]);
     assert_eq!(first_identity.index(), replacement_identity.index());
     assert_ne!(
         first_identity.generation(),

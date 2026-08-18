@@ -1412,44 +1412,16 @@ pub(crate) fn load_render_pipeline<M: HostMemory + HostOps>(
 /// The two MTLB containers a render pipeline's stages live in, without
 /// extracting or copying the AIR out of them.
 ///
-/// This replaced a `load_render_air_pair` that did the same three resolves and
-/// then `to_vec`'d both blobs — named in prose rather than linked, because it no
-/// longer exists. Its consumer is `m2v_cache::ensure_cached_async`, which takes
-/// `&[u8]`, digests it, and retains nothing unless the lookup misses; on a boot
-/// where every shader is already translated both copies were waste, at
-/// **12 650-12 786 pipeline refs a second**. The preflight was its only caller,
-/// so there was no second consumer needing owned bytes and nothing to keep it
-/// for.
-///
-/// # It bought 5 %, not 71 %, and that is the useful part of the reading
-///
-/// Two driven macos-13 boots either side of the change, same rail and probe,
-/// with `refs` and `cache` as controls — both unchanged, so the delta is
-/// attributable to this rather than to the two builds differing elsewhere:
-///
-/// ```text
-///                  with copies    borrowed
-/// air_us/pipe      4.34 / 4.30   4.06 / 4.17    -4.7 %
-/// refs_us/call     0.41 / 0.40   0.41 / 0.42    control
-/// cache_us/pipe    1.30 / 1.31   1.33 / 1.36    control
-/// ```
-///
-/// So **two allocations and two memcpys of a shader blob are ~0.2 us of a 4.3 us
-/// resolve.** The other 4.1 us is the three guest-memory resolves this function
-/// still does — the pipeline descriptor, then a descriptor and a blob read for
-/// each of the two stages. Anyone shortening this path should aim there, and not
-/// at the copies again.
-///
-/// The remaining ~50 ms/s comes off only by not calling this at all. See
-/// [`crate::runtime::drain::PreflightPart`] for the memo that would do it, and
-/// for the fact that makes it soundable: the m2v cache never evicts.
+/// Each function payload is retained by its guest object lifetime. The `Arc`s
+/// returned here are therefore both the no-copy preflight input and ownership
+/// that keeps the immutable containers alive while translation borrows them.
 #[cfg(feature = "backend-vulkan")]
 pub(crate) fn load_render_mtlb_pair<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
     pipeline_ref: u32,
-) -> Result<(Vec<u8>, Vec<u8>), DrawPreparationDecline> {
+) -> Result<(std::sync::Arc<[u8]>, std::sync::Arc<[u8]>), DrawPreparationDecline> {
     let pd = load_render_pipeline(state, host, task_id, pipeline_ref).ok_or(
         DrawPreparationDecline::PipelineMissing {
             task_id,

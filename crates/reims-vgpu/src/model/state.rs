@@ -6,9 +6,9 @@ use crate::runtime::decode::resource::{
 };
 use reims_vgpu_core::{ReferenceNamespace, ResourceGraph, ResourceNode};
 use reims_vgpu_protocol::{
-    ByteLength, ByteOffset, ComputePipelineObject, EventObject, FenceObject, GuestVirtualAddress,
-    MappingId, ObjectRef, PlaneIndex, ResourceId, ResourceObject, SamplerObject, SurfaceBackingId,
-    TaskId,
+    ByteLength, ByteOffset, ComputePipelineObject, EventObject, FenceObject, FunctionObject,
+    GuestVirtualAddress, MappingId, ObjectRef, PlaneIndex, ResourceId, ResourceObject,
+    SamplerObject, SurfaceBackingId, TaskId,
 };
 #[cfg(feature = "backend-vulkan")]
 use reims_vgpu_protocol::{DepthStencilObject, RenderPipelineObject};
@@ -1397,6 +1397,10 @@ pub type TaskSamplerStates = TaskReferenceStates<TaskSamplerState, SamplerObject
 /// Per-task compute pipeline states, keyed by that API's reference space.
 pub type TaskComputePipelineStates =
     TaskReferenceStates<crate::runtime::compute_exec::LoadedComputePipeline, ComputePipelineObject>;
+
+/// Per-task shader functions, keyed by the function API's reference space.
+pub type TaskFunctionStates =
+    TaskReferenceStates<crate::runtime::mtlb::LoadedFunction, FunctionObject>;
 
 #[derive(Debug)]
 struct TaskGenerationState<M> {
@@ -2862,6 +2866,8 @@ pub struct DeviceState {
     /// Immutable compute pipeline declarations in their own serializer
     /// reference space.
     pub(crate) task_compute_pipeline_states: TaskComputePipelineStates,
+    /// Immutable shader containers in the function API's reference space.
+    pub(crate) task_function_states: TaskFunctionStates,
     /// Immutable depth-stencil objects in that API's separate ref space.
     #[cfg(feature = "backend-vulkan")]
     pub task_depth_stencil_states: TaskDepthStencilStates,
@@ -3228,6 +3234,7 @@ impl DeviceState {
             task_resources: TaskResources::default(),
             task_sampler_states: TaskSamplerStates::default(),
             task_compute_pipeline_states: TaskComputePipelineStates::default(),
+            task_function_states: TaskFunctionStates::default(),
             #[cfg(feature = "backend-vulkan")]
             task_depth_stencil_states: TaskDepthStencilStates::default(),
             #[cfg(feature = "backend-vulkan")]
@@ -3701,6 +3708,10 @@ impl DeviceState {
             self.task_render_pipeline_states.delete_task(task_id) as u64,
         );
         crate::runtime::drain::note_store_route_n(
+            "function_state_task_deleted",
+            self.task_function_states.delete_task(task_id) as u64,
+        );
+        crate::runtime::drain::note_store_route_n(
             "icb_task_deleted",
             self.icb_registry.delete_task(task_id) as u64,
         );
@@ -3778,6 +3789,10 @@ impl DeviceState {
         crate::runtime::drain::note_store_route_n(
             "pipeline_state_task_deleted",
             self.task_render_pipeline_states.delete_task(task_id) as u64,
+        );
+        crate::runtime::drain::note_store_route_n(
+            "function_state_task_deleted",
+            self.task_function_states.delete_task(task_id) as u64,
         );
         crate::runtime::drain::note_store_route_n(
             "icb_task_deleted",
