@@ -299,7 +299,7 @@ pub enum DrawReason {
     /// **Expected to stay at zero.** `runtime::draw`'s
     /// `frag_unbound_textures_to_neutralize` fills the one repairable class
     /// before the request is built, and
-    /// [`crate::runtime::spirv_bind::descriptor_static_use`] answers
+    /// [`reims_vgpu_vulkan::spirv_bind::descriptor_static_use`] answers
     /// `NotDeclared` for anything that is not a `UniformConstant`, so a storage
     /// buffer — whose root that walk cannot resolve — is never refused on a
     /// guess. A firing therefore names a class the neutralizing pass does not

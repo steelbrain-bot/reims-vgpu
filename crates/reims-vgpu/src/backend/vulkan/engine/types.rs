@@ -673,7 +673,7 @@ pub fn viewport_slot_count(req: &DrawRequest) -> usize {
 /// `runtime::spirv_bind::COLOR_INPUT_BINDING_BASE` by a unit test there, because
 /// the two constants live on opposite sides of the runtime/engine layering.
 /// Both fragment relocations preserve it.
-pub const COLOR_INPUT_BINDING: u32 = 192;
+pub const COLOR_INPUT_BINDING: u32 = reims_vgpu_vulkan::spirv_bind::COLOR_INPUT_BINDING_BASE;
 
 /// One MRT color attachment beyond the primary (slot 0). Persisted as its own
 /// registry resident so a later draw can sample it.

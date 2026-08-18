@@ -1490,7 +1490,7 @@ impl ObjectCaches {
         counters
             .shader_hash_words
             .fetch_add(words.len() as u64, Ordering::Relaxed);
-        let need = crate::runtime::spirv_bind::required_image_capabilities(words);
+        let need = reims_vgpu_vulkan::spirv_bind::required_image_capabilities(words);
         let mut patched;
         let words: &[u32] = if need.any() {
             let missing = (need.extended_formats && !ctx.spirv_storage_extended_formats)
@@ -1515,7 +1515,8 @@ impl ObjectCaches {
                 return Err(err);
             }
             patched = words.to_vec();
-            let added = crate::runtime::spirv_bind::ensure_image_capabilities(&mut patched, &need);
+            let added =
+                reims_vgpu_vulkan::spirv_bind::ensure_image_capabilities(&mut patched, &need);
             if added.any() {
                 reims_vgpu_observe::off(format!(
                     "spirv_capability added extended={} write={} read={} words={}",
@@ -1544,9 +1545,9 @@ impl ObjectCaches {
         // undefined behaviour inside a driver rather than an error it returns,
         // and one has been observed ending the VM process — so it becomes a
         // negative cache entry here and the guest's work is declined by name.
-        // See `crate::runtime::spirv_bind::validate`.
-        if let crate::runtime::spirv_bind::SpirvValidation::Rejected(why) =
-            crate::runtime::spirv_bind::validate(words)
+        // See `reims_vgpu_vulkan::spirv_bind::validate`.
+        if let reims_vgpu_vulkan::spirv_bind::SpirvValidation::Rejected(why) =
+            reims_vgpu_vulkan::spirv_bind::validate(words)
         {
             let err = DrawError::Unsupported(super::reason::DrawReason::SpirvInvalid);
             // Print what the capability derivation saw alongside the
@@ -1555,8 +1556,8 @@ impl ObjectCaches {
             reims_vgpu_observe::fail(format!(
                 "spirv_validate reason=module_rejected words={} need={:?} imgs={:?} detail={why}",
                 words.len(),
-                crate::runtime::spirv_bind::required_image_capabilities(words),
-                crate::runtime::spirv_bind::image_type_census(words),
+                reims_vgpu_vulkan::spirv_bind::required_image_capabilities(words),
+                reims_vgpu_vulkan::spirv_bind::image_type_census(words),
             ));
             // The complaint above names instructions by result id, which cannot
             // be read without the module they belong to. Keep it.

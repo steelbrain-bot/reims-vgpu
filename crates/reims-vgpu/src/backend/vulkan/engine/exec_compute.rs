@@ -404,15 +404,16 @@ fn resident_sample_exact(
 /// guest left empty — so this is the backstop for a class those passes do not
 /// cover, and a firing names a real gap rather than noise.
 ///
-/// [`crate::runtime::spirv_bind::descriptor_static_use`] answers `NotDeclared`
+/// [`reims_vgpu_vulkan::spirv_bind::descriptor_static_use`] answers `NotDeclared`
 /// for anything that is not a `UniformConstant` descriptor, so a storage buffer,
 /// whose root this walk cannot resolve, is never refused on a guess.
 fn used_binding_absent_from_layout(spirv: &[u32], layout: &[BindingSig]) -> Option<u32> {
-    crate::runtime::spirv_bind::declared_binding_numbers(spirv)
+    reims_vgpu_vulkan::spirv_bind::declared_binding_numbers(spirv)
         .into_iter()
         .find(|binding| {
             !layout.iter().any(|b| b.binding == *binding)
-                && crate::runtime::spirv_bind::descriptor_static_use(spirv, *binding).is_violation()
+                && reims_vgpu_vulkan::spirv_bind::descriptor_static_use(spirv, *binding)
+                    .is_violation()
         })
 }
 
@@ -1503,7 +1504,7 @@ mod tests {
     /// refusal from swallowing legal dispatches with it.
     #[test]
     fn a_used_binding_the_layout_omits_is_refused_and_a_declared_unused_one_is_not() {
-        let spirv = crate::runtime::spirv_bind::test_module_with_two_sampled_images(33, 34);
+        let spirv = reims_vgpu_vulkan::spirv_bind::test_module_with_two_sampled_images(33, 34);
         let sig = |binding| BindingSig {
             binding,
             ty: vk::DescriptorType::SAMPLED_IMAGE.as_raw() as u32,
