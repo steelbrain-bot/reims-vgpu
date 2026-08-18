@@ -907,7 +907,7 @@ pub(super) enum SampledSourceRequest {
     /// the type-8 view swizzle at the push site. Identity for every format but
     /// `A8Unorm`.
     GuestRuns(
-        crate::backend::vulkan::engine::GuestRunSource,
+        reims_vgpu_memory::GuestRunSource,
         TexelLayout,
         /// Exact Vulkan image/view format. This is distinct from the texel
         /// layout because linear and sRGB formats carry the same bytes while
@@ -2082,8 +2082,9 @@ fn try_iosurface_texture_target_guest_seed<M: HostMemory + HostOps>(
     h: u32,
     target_format: ash::vk::Format,
 ) -> Option<crate::backend::vulkan::engine::GuestTargetSeed> {
-    use crate::backend::vulkan::engine::{GuestRunSource, GuestTargetSeed};
+    use crate::backend::vulkan::engine::GuestTargetSeed;
     use crate::runtime::mapping_write::iosurface_texture_sample_window;
+    use reims_vgpu_memory::GuestRunSource;
 
     if w == 0 || h == 0 || !mapper::ensure_resolved_for_scanout(state, host, mapping_id) {
         return None;
@@ -2503,7 +2504,7 @@ pub(super) fn task_gva_guest_run_window<M: HostMemory + HostOps>(
     task_id: u32,
     gva: u64,
     span: u64,
-) -> Result<(Vec<u64>, Vec<crate::backend::vulkan::engine::GuestRun>), WindowRefusal> {
+) -> Result<(Vec<u64>, Vec<reims_vgpu_memory::GuestRun>), WindowRefusal> {
     if !guest_run_alias_available(host) {
         return Err(WindowRefusal::NoAlias);
     }
@@ -2700,13 +2701,12 @@ fn coalesce_pages_to_runs<M: HostOps>(
     page: u64,
     head_off: u64,
     span: u64,
-) -> Option<Vec<crate::backend::vulkan::engine::GuestRun>> {
-    use crate::backend::vulkan::engine;
+) -> Option<Vec<reims_vgpu_memory::GuestRun>> {
     let stretches = reims_vgpu_paging::runs::coalesce_window(window, page, head_off, span)?;
-    let mut runs: Vec<engine::GuestRun> = Vec::with_capacity(stretches.len());
+    let mut runs: Vec<reims_vgpu_memory::GuestRun> = Vec::with_capacity(stretches.len());
     for s in stretches {
         let base = host.map_pages(&window[s.pages], page as usize)? as u64;
-        runs.push(engine::GuestRun {
+        runs.push(reims_vgpu_memory::GuestRun {
             host_ptr: (base + s.start_offset) as usize,
             len: s.len,
         });
@@ -2755,7 +2755,7 @@ fn mapped_sampled_source<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     plane: MappedSamplePlane,
-) -> Option<crate::backend::vulkan::engine::GuestRunSource> {
+) -> Option<reims_vgpu_memory::GuestRunSource> {
     let MappedSamplePlane {
         mapping_id,
         base_off,
@@ -2782,12 +2782,10 @@ fn witnessed_mapping_sampled_source<M: HostMemory + HostOps>(
     rail: crate::runtime::gather_witness::GatherRail,
     plane: MappedSamplePlane,
 ) -> Option<(
-    crate::backend::vulkan::engine::GuestRunSource,
+    reims_vgpu_memory::GuestRunSource,
     LinearSampleIdentity,
     crate::runtime::gather_witness::GatherVouch,
 )> {
-    use crate::backend::vulkan::engine;
-
     let retained = mapped_sampled_source(state, host, plane);
     let (gpas, runs) =
         mapping_window_guest_runs(state, host, plane.mapping_id, plane.base_off, plane.span)?;
@@ -2810,7 +2808,7 @@ fn witnessed_mapping_sampled_source<M: HostMemory + HostOps>(
             page_size: page,
         },
     );
-    let source = retained.unwrap_or_else(|| engine::GuestRunSource {
+    let source = retained.unwrap_or_else(|| reims_vgpu_memory::GuestRunSource {
         runs: std::sync::Arc::new(runs),
         source_offset: 0,
         total_len: plane.span,
@@ -2898,7 +2896,7 @@ fn mapping_window_guest_runs<M: HostMemory + HostOps>(
     mid: u32,
     base_off: u64,
     span: u64,
-) -> Option<(Vec<u64>, Vec<crate::backend::vulkan::engine::GuestRun>)> {
+) -> Option<(Vec<u64>, Vec<reims_vgpu_memory::GuestRun>)> {
     if !guest_run_alias_available(host) {
         return None;
     }
@@ -3016,7 +3014,7 @@ fn bound_buffer_content(
     bound: &crate::runtime::bound_buffers::BoundBuffer,
 ) -> crate::backend::vulkan::engine::BufferContent {
     use crate::backend::vulkan::engine;
-    engine::BufferContent::GuestRuns(engine::GuestRunSource {
+    engine::BufferContent::GuestRuns(reims_vgpu_memory::GuestRunSource {
         runs: std::sync::Arc::clone(&bound.runs),
         source_offset: bound.source_offset,
         total_len: bound.span,
@@ -3769,7 +3767,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     if let Some(packed) = packed {
         let page = state.page_size();
         let witness = packed.witness_window(layout.offset, span)?;
-        let witness_runs = [engine::GuestRun {
+        let witness_runs = [reims_vgpu_memory::GuestRun {
             host_ptr: witness.host_ptr,
             len: span,
         }];
@@ -3810,7 +3808,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
             w,
             h,
             SampledSourceRequest::GuestRuns(
-                engine::GuestRunSource {
+                reims_vgpu_memory::GuestRunSource {
                     runs: std::sync::Arc::clone(&packed.runs),
                     source_offset: layout.offset,
                     total_len: span,
@@ -3863,7 +3861,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
         w,
         h,
         SampledSourceRequest::GuestRuns(
-            engine::GuestRunSource {
+            reims_vgpu_memory::GuestRunSource {
                 runs: std::sync::Arc::new(runs),
                 source_offset: 0,
                 total_len: span,

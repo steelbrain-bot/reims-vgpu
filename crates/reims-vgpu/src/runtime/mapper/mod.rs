@@ -1821,9 +1821,9 @@ pub fn guest_texel_source<H: HostMemory + HostOps>(
     plane_offset: u64,
     span: u64,
     row_length_texels: u32,
-) -> Option<crate::backend::vulkan::engine::GuestRunSource> {
-    use crate::backend::vulkan::engine::{GuestRun, GuestRunSource};
+) -> Option<reims_vgpu_memory::GuestRunSource> {
     use crate::runtime::guest_ram::GuestRef;
+    use reims_vgpu_memory::{GuestRun, GuestRunSource};
 
     let (import, _footprint) = ensure_contig_import_with_footprint(state, host, mapping_id)?;
     let end = plane_offset.checked_add(span)?;

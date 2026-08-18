@@ -4979,30 +4979,28 @@ fn guest_runs_decline_on_unstable_host_mappings() {
     let gva = 8u64;
 
     // A task whose page table really does resolve `[gva, gva+16)` onto `data0`.
-    let walkable = |stable: bool| -> Result<
-        Vec<crate::backend::vulkan::engine::GuestRun>,
-        super::vulkan::WindowRefusal,
-    > {
-        let mut host = FakeHost::new();
-        host.strict_linux_map = true;
-        host.stable_map_pages = stable;
-        let (dir_gpa, root_gpa, data0) =
-            (2u64 << page_shift, 3u64 << page_shift, 4u64 << page_shift);
-        for gpa in [dir_gpa, root_gpa, data0] {
-            host.map_range(gpa, page as usize, 0);
-        }
-        let mut d = [0u8; 8];
-        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
-        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
-        host.write_gpa(dir_gpa, &d).unwrap();
-        let mut pte = [0u8; 4];
-        st32(&mut pte, 4);
-        host.write_gpa(root_gpa, &pte).unwrap();
+    let walkable =
+        |stable: bool| -> Result<Vec<reims_vgpu_memory::GuestRun>, super::vulkan::WindowRefusal> {
+            let mut host = FakeHost::new();
+            host.strict_linux_map = true;
+            host.stable_map_pages = stable;
+            let (dir_gpa, root_gpa, data0) =
+                (2u64 << page_shift, 3u64 << page_shift, 4u64 << page_shift);
+            for gpa in [dir_gpa, root_gpa, data0] {
+                host.map_range(gpa, page as usize, 0);
+            }
+            let mut d = [0u8; 8];
+            st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+            st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+            host.write_gpa(dir_gpa, &d).unwrap();
+            let mut pte = [0u8; 4];
+            st32(&mut pte, 4);
+            host.write_gpa(root_gpa, &pte).unwrap();
 
-        let mut state = DeviceState::new(DeviceId(1), page_shift);
-        state.define_task(1, page, 2);
-        task_gva_guest_run_window(&state, &mut host, 1, gva, 16).map(|(_, runs)| runs)
-    };
+            let mut state = DeviceState::new(DeviceId(1), page_shift);
+            state.define_task(1, page, 2);
+            task_gva_guest_run_window(&state, &mut host, 1, gva, 16).map(|(_, runs)| runs)
+        };
 
     assert!(
         walkable(true).is_ok_and(|runs| !runs.is_empty()),

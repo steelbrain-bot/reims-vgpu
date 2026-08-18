@@ -70,6 +70,83 @@
 
 use reims_vgpu_observe::{Decline, Emit};
 
+/// One packed-contiguous guest-RAM span exposed through a stable host alias.
+#[derive(Clone, Copy, Debug)]
+pub struct GuestRun {
+    /// Host VA of the span start (page-aligned base + in-page offset).
+    pub host_ptr: usize,
+    /// Byte length of the span.
+    pub len: u64,
+}
+
+/// A bounded guest-memory window and its two equivalent transport views.
+///
+/// `runs` lets a CPU fallback gather from stable host aliases. `pages` names
+/// the same bytes as checked RAMBlock references so a capable executor can bind
+/// or copy them without re-deriving their bounds.
+#[derive(Clone, Debug)]
+pub struct GuestRunSource {
+    pub runs: std::sync::Arc<Vec<GuestRun>>,
+    pub source_offset: u64,
+    pub total_len: u64,
+    /// Guest row stride in texels; zero means tightly packed rows.
+    pub row_length_texels: u32,
+    pub pages: Option<std::sync::Arc<Vec<GuestWindowRun>>>,
+}
+
+/// One stretch of a [`GuestRunSource`]'s requested window, clipped to it.
+#[derive(Debug)]
+pub struct WindowStretch<'a> {
+    pub guest: &'a GuestRef,
+    pub skip: u64,
+    pub window_offset: u64,
+    pub len: u64,
+}
+
+impl GuestRunSource {
+    /// The source window as one importable guest stretch, when it fits wholly
+    /// inside the one checked RAMBlock reference supplied by the resolver.
+    pub fn single_stretch(&self) -> Option<WindowStretch<'_>> {
+        let [only] = self.pages.as_ref()?.as_slice() else {
+            return None;
+        };
+        if only.window_offset != 0 {
+            return None;
+        }
+        let end = self.source_offset.checked_add(self.total_len)?;
+        if end > only.guest.requested() {
+            return None;
+        }
+        Some(WindowStretch {
+            guest: &only.guest,
+            skip: self.source_offset,
+            window_offset: 0,
+            len: self.total_len,
+        })
+    }
+
+    /// Every checked guest stretch touched by this source window, in window
+    /// order. Returned lengths tile `total_len` when the source is valid.
+    pub fn window_stretches(&self) -> Option<impl Iterator<Item = WindowStretch<'_>> + '_> {
+        let pages = self.pages.as_ref()?;
+        let wanted_end = self.source_offset.checked_add(self.total_len)?;
+        Some(pages.iter().filter_map(move |run| {
+            let run_end = run.window_offset.checked_add(run.guest.requested())?;
+            let start = run.window_offset.max(self.source_offset);
+            let end = run_end.min(wanted_end);
+            if start >= end {
+                return None;
+            }
+            Some(WindowStretch {
+                guest: &run.guest,
+                skip: start - run.window_offset,
+                window_offset: start - self.source_offset,
+                len: end - start,
+            })
+        }))
+    }
+}
+
 fn align_up_u64(value: u64, align: u64) -> Option<u64> {
     if !align.is_power_of_two() {
         return None;
@@ -1048,6 +1125,67 @@ mod tests {
             align,
         )
         .expect("region is aligned and non-empty")
+    }
+
+    fn window_run(
+        import: &std::sync::Arc<GuestRamImport>,
+        window_offset: u64,
+        import_offset: u64,
+        len: u64,
+    ) -> GuestWindowRun {
+        let slice = import
+            .slice(import_offset, len)
+            .expect("bounded test slice");
+        GuestWindowRun {
+            window_offset,
+            guest: GuestRef::new(std::sync::Arc::clone(import), slice)
+                .expect("slice belongs to import"),
+        }
+    }
+
+    #[test]
+    fn a_guest_run_source_exposes_one_bounded_direct_stretch() {
+        let import = std::sync::Arc::new(import(0x4000, 0x1000));
+        let source = GuestRunSource {
+            runs: std::sync::Arc::new(vec![GuestRun {
+                host_ptr: 0x7f00_0000_0000,
+                len: 0x2000,
+            }]),
+            source_offset: 0x180,
+            total_len: 0x800,
+            row_length_texels: 0,
+            pages: Some(std::sync::Arc::new(vec![window_run(&import, 0, 0, 0x2000)])),
+        };
+
+        let stretch = source.single_stretch().expect("one checked stretch");
+        assert_eq!(
+            (stretch.skip, stretch.window_offset, stretch.len),
+            (0x180, 0, 0x800)
+        );
+    }
+
+    #[test]
+    fn a_guest_run_source_clips_each_scattered_stretch_to_its_window() {
+        let import = std::sync::Arc::new(import(0x4000, 0x1000));
+        let source = GuestRunSource {
+            runs: std::sync::Arc::new(Vec::new()),
+            source_offset: 0x800,
+            total_len: 0x1800,
+            row_length_texels: 0,
+            pages: Some(std::sync::Arc::new(vec![
+                window_run(&import, 0, 0, 0x1000),
+                window_run(&import, 0x1000, 0x2000, 0x1000),
+                window_run(&import, 0x2000, 0x3000, 0x1000),
+            ])),
+        };
+
+        assert!(source.single_stretch().is_none());
+        let stretches: Vec<_> = source
+            .window_stretches()
+            .expect("checked pages exist")
+            .map(|stretch| (stretch.skip, stretch.window_offset, stretch.len))
+            .collect();
+        assert_eq!(stretches, vec![(0x800, 0, 0x800), (0, 0x800, 0x1000)]);
     }
 
     #[test]

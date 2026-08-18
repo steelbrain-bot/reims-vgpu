@@ -42,8 +42,8 @@ pub const MTL_FORMAT_R8_UNORM: u16 = 0x0a;
 /// into compute dispatches, which is what surfaced it.
 ///
 /// Being *declared* is not being *sampled*: an integer texel must not be run
-/// through the unorm converters, so it has no [`crate::backend::vulkan`] texel
-/// layout and no storage selector, and both of those decline it by name.
+/// through the unorm converters, so it has no executor texel layout and no
+/// storage selector, and both of those decline it by name.
 pub const MTL_FORMAT_R8_UINT: u16 = 0x0d;
 /// `MTLPixelFormatR16Unorm`. The luma plane of a ten-bit biplanar video
 /// surface (`'x420'`), where the eight-bit shape uses
@@ -280,10 +280,9 @@ const UNORM8_MAX: u8 = 0xff;
 /// `X32_Stencil8` and `X24_Stencil8` are **stencil-aspect views of a combined
 /// depth-stencil texture**, not formats with storage of their own. This answers
 /// the size of the cell they view — 8 and 4 — because that is what every caller
-/// of this function needs: [`crate::backend::vulkan::translate::pixel`] binds
-/// them to `D32_SFLOAT_S8_UINT` and `D24_UNORM_S8_UINT`, whose texels are
-/// exactly those widths, and a resource sized at anything else is a short
-/// allocation.
+/// of this function needs: executor translation binds them to the native
+/// combined depth-stencil formats, whose texels are exactly those widths, and
+/// a resource sized at anything else is a short allocation.
 ///
 /// An external per-format table will say **1** for both, and it is not wrong —
 /// it is describing the stencil plane alone, which is a different question. This

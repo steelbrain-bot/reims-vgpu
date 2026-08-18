@@ -336,10 +336,7 @@ impl GatherWitness {
 /// Every run's `host_ptr` must be a live mapping of at least `len` bytes — the
 /// same precondition the gather itself relies on, read at the same point in the
 /// draw.
-pub(crate) unsafe fn fold_runs(
-    runs: &[crate::backend::vulkan::engine::GuestRun],
-    span: u64,
-) -> u128 {
+pub(crate) unsafe fn fold_runs(runs: &[reims_vgpu_memory::GuestRun], span: u64) -> u128 {
     let mut a: u64 = 0x9e37_79b9_7f4a_7c15;
     let mut b: u64 = 0xc2b2_ae3d_27d4_eb4f;
     let mut remaining = span;
@@ -500,7 +497,7 @@ pub struct GatherWindow<'a> {
     /// Page-aligned guest addresses the window covers, in window order.
     pub gpas: &'a [u64],
     /// Coalesced host spans the gather reads, covering `span` bytes in order.
-    pub runs: &'a [crate::backend::vulkan::engine::GuestRun],
+    pub runs: &'a [reims_vgpu_memory::GuestRun],
     /// Byte length of the window.
     pub span: u64,
     /// Guest page size the `gpas` are expressed in.
@@ -1074,7 +1071,7 @@ fn observe(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::vulkan::engine::GuestRun;
+    use reims_vgpu_memory::GuestRun;
 
     const KEY: GatherKey = GatherKey::Mapping {
         mid: 11,

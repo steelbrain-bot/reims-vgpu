@@ -1132,7 +1132,7 @@ pub(crate) struct StagedBuffer {
 #[cfg(feature = "backend-vulkan")]
 enum VulkanBufferInput {
     HostBytes(Vec<u8>),
-    GuestPages(crate::backend::vulkan::engine::GuestRunSource),
+    GuestPages(reims_vgpu_memory::GuestRunSource),
 }
 
 #[derive(Clone, Copy)]
@@ -1718,7 +1718,7 @@ pub(crate) struct StagedTexture {
 #[cfg(feature = "backend-vulkan")]
 enum VulkanTextureInput {
     HostBytes(Vec<u8>),
-    GuestPages(crate::backend::vulkan::engine::GuestRunSource),
+    GuestPages(reims_vgpu_memory::GuestRunSource),
     Resident(ResidentServe),
 }
 

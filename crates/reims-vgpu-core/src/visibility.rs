@@ -2,8 +2,8 @@
 //!
 //! # Why the set lives here
 //!
-//! The decoder and [`crate::backend::vulkan::translate::raster`] both consume
-//! this Apple enum. One shared set keeps admission and translation aligned.
+//! The decoder and executor translation both consume this Apple enum. One
+//! shared set keeps admission and translation aligned.
 //!
 //! # The ordinals
 //!

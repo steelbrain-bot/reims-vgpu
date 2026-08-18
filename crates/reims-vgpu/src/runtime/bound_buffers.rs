@@ -99,8 +99,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::backend::vulkan::engine::GuestRun;
 use crate::runtime::guest_ram_map::GuestWindowRun;
+use reims_vgpu_memory::GuestRun;
 
 /// One task buffer reconstructed as a stable, contiguous host allocation.
 ///
@@ -165,7 +165,7 @@ impl PackedBuffer {
         &self,
         offset: u64,
         span: u64,
-    ) -> Option<crate::backend::vulkan::engine::GuestRunSource> {
+    ) -> Option<reims_vgpu_memory::GuestRunSource> {
         self.texel_source(offset, span, 0)
     }
 
@@ -189,9 +189,9 @@ impl PackedBuffer {
         offset: u64,
         span: u64,
         row_length_texels: u32,
-    ) -> Option<crate::backend::vulkan::engine::GuestRunSource> {
+    ) -> Option<reims_vgpu_memory::GuestRunSource> {
         offset.checked_add(span).filter(|&end| end <= self.size)?;
-        Some(crate::backend::vulkan::engine::GuestRunSource {
+        Some(reims_vgpu_memory::GuestRunSource {
             runs: Arc::clone(&self.runs),
             source_offset: offset,
             total_len: span,
