@@ -2069,12 +2069,7 @@ pub fn prepare_window_resident_present(
     resident_present_decision(pools, identity, width, height)
 }
 
-/// Whether an engine-owned resident currently holds usable pixels.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ResidentContentBacking {
-    NotReady,
-    DeviceAllocation,
-}
+pub use crate::runtime::executor::ResidentContentBacking;
 
 /// One live resource object's ownership of a resident target.
 ///

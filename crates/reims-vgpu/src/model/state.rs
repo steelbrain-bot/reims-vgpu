@@ -627,7 +627,7 @@ pub struct TaskResource {
     resident_targets: Mutex<
         HashMap<
             crate::backend::vulkan::engine::TargetIdentity,
-            crate::backend::vulkan::engine::ResidentResourceLease,
+            Box<dyn crate::runtime::executor::ResidentLease>,
         >,
     >,
 }
@@ -729,7 +729,7 @@ impl TaskResource {
         identity: &crate::backend::vulkan::engine::TargetIdentity,
         retain: impl FnOnce(
             &crate::backend::vulkan::engine::TargetIdentity,
-        ) -> Option<crate::backend::vulkan::engine::ResidentResourceLease>,
+        ) -> Option<Box<dyn crate::runtime::executor::ResidentLease>>,
     ) -> crate::backend::vulkan::engine::ResidentContentBacking {
         use crate::backend::vulkan::engine::ResidentContentBacking;
 
@@ -834,10 +834,11 @@ mod task_resource_resident_tests {
 
         let backing = resource.resident_target_backing_with(&first, |identity| {
             acquisitions.set(acquisitions.get() + 1);
-            Some(ResidentResourceLease::test_new(
+            Some(Box::new(ResidentResourceLease::test_new(
                 identity.clone(),
                 ResidentContentBacking::DeviceAllocation,
             ))
+                as Box<dyn crate::runtime::executor::ResidentLease>)
         });
         assert_eq!(backing, ResidentContentBacking::DeviceAllocation);
         assert_eq!(acquisitions.get(), 1);
@@ -859,10 +860,11 @@ mod task_resource_resident_tests {
         crate::backend::vulkan::engine::test_advance_resident_resource_epoch();
         let backing = resource.resident_target_backing_with(&first, |identity| {
             acquisitions.set(acquisitions.get() + 1);
-            Some(ResidentResourceLease::test_new(
+            Some(Box::new(ResidentResourceLease::test_new(
                 identity.clone(),
                 ResidentContentBacking::DeviceAllocation,
             ))
+                as Box<dyn crate::runtime::executor::ResidentLease>)
         });
         assert_eq!(backing, ResidentContentBacking::DeviceAllocation);
         assert_eq!(acquisitions.get(), 2, "an engine reset reacquires once");
@@ -870,10 +872,11 @@ mod task_resource_resident_tests {
         let replacement = identity(2);
         let backing = resource.resident_target_backing_with(&replacement, |identity| {
             acquisitions.set(acquisitions.get() + 1);
-            Some(ResidentResourceLease::test_new(
+            Some(Box::new(ResidentResourceLease::test_new(
                 identity.clone(),
                 ResidentContentBacking::DeviceAllocation,
             ))
+                as Box<dyn crate::runtime::executor::ResidentLease>)
         });
         assert_eq!(backing, ResidentContentBacking::DeviceAllocation);
         assert_eq!(

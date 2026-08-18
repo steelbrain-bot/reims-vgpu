@@ -6,11 +6,37 @@
 
 use crate::backend::vulkan::engine::{
     ComputeOutput, ComputeRequest, DrawError, DrawOutput, DrawRequest, EngineFacadeDecline,
-    GuestWriteReach, ResidentContent, ResidentContentBacking, StorageImageFormat, TargetIdentity,
-    TargetReadback,
+    GuestWriteReach, ResidentContent, StorageImageFormat, TargetIdentity, TargetReadback,
 };
 use reims_vgpu_protocol::{SegmentBoundary, SubmissionIdentity, SubmissionResourceUse};
 use std::sync::Arc;
+
+/// Backend-independent classification of a retained target's current content.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResidentContentBacking {
+    NotReady,
+    DeviceAllocation,
+}
+
+/// Opaque executor ownership of one backend resident for a guest resource.
+///
+/// Dropping the token performs the backend's fence-safe release. Semantic
+/// resource state can test identity continuity and content availability but
+/// cannot inspect or operate the backend allocation itself.
+pub trait ResidentLease: std::fmt::Debug + Send {
+    fn matches(&self, identity: &TargetIdentity) -> bool;
+    fn backing(&self) -> ResidentContentBacking;
+}
+
+impl ResidentLease for crate::backend::vulkan::engine::ResidentResourceLease {
+    fn matches(&self, identity: &TargetIdentity) -> bool {
+        self.matches(identity)
+    }
+
+    fn backing(&self) -> ResidentContentBacking {
+        self.backing()
+    }
+}
 
 /// Host-GPU facts available to semantic planning.
 ///
@@ -308,7 +334,7 @@ pub trait Executor: std::fmt::Debug + Send + Sync {
     fn retain_resident_resource(
         &self,
         _identity: &TargetIdentity,
-    ) -> Option<crate::backend::vulkan::engine::ResidentResourceLease> {
+    ) -> Option<Box<dyn ResidentLease>> {
         None
     }
 
@@ -554,8 +580,9 @@ impl Executor for VulkanExecutor {
     fn retain_resident_resource(
         &self,
         identity: &TargetIdentity,
-    ) -> Option<crate::backend::vulkan::engine::ResidentResourceLease> {
+    ) -> Option<Box<dyn ResidentLease>> {
         crate::backend::vulkan::engine::retain_resident_resource(identity)
+            .map(|lease| Box::new(lease) as Box<dyn ResidentLease>)
     }
 
     fn sampled_working_set_census(&self) -> Option<String> {
