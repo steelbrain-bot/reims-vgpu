@@ -97,13 +97,10 @@
 //!   `HashSet` of every mapped GPA in the device, on the drain worker that
 //!   `drain_duty` shows at 0.93-0.99.
 //!
-//! The class it watched for — a write through a page list the guest tore down —
-//! is refused rather than merely observed, by guards that already fail loudly:
-//! `mapping_write`'s `vouch_stale`, the `backing_condemned` hold,
-//! and the drain unmap / ReplacePhysical sites that drop-with-fail instead of
-//! writing through recycled pages. Those are product behaviour; this module is
-//! not, and a second opinion that could not read its own answer is not worth a
-//! per-Unmap scan of the whole mapping table.
+//! A guest lifetime transition retires its page plan and mapping import. A raw
+//! physical-page match is not a second ownership oracle: shared storage and
+//! recycled pages make that inference ambiguous, so this module records writes
+//! and does not turn their addresses into product behavior.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 

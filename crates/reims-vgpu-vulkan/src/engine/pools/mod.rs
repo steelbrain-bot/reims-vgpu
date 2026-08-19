@@ -525,6 +525,9 @@ pub(crate) struct ResourcePools {
     /// therefore frees the handle on the last fence that could be reading it,
     /// not on the whole ring going idle.
     graveyard: Vec<(SlotMask, DeferredHandle)>,
+    /// Guest allocation identities whose imported memory has passed its final
+    /// fence and can no longer access the corresponding host allocation.
+    completed_guest_imports: Vec<reims_vgpu_memory::ImportId>,
     /// Resident-target recycle pool: images displaced from the identity registry
     /// (generation bump / geometry change / LRU), held by (geometry, format) for
     /// reuse instead of destroyed. Kills the per-frame `vkCreateImage`+
@@ -1097,7 +1100,10 @@ impl ResourcePools {
                     device.free_memory(memory, None);
                 }
             }
-            DeferredHandle::GuestAllocation(parent) => parent.destroy(device),
+            DeferredHandle::GuestAllocation(parent) => {
+                let import = parent.destroy(device);
+                self.completed_guest_imports.push(import);
+            }
             DeferredHandle::RecycleSampled(slot) => {
                 device.destroy_image_view(slot.view, None);
                 device.destroy_image(slot.image, None);

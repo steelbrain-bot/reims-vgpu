@@ -85,7 +85,7 @@ pub use mapper::{MapperCapture, MapperService};
 pub use mapping::{MappingContentState, ResourceValidity};
 pub use materialization::{
     BoundWindowKey, GuestAddressSpan, MaterializationOwner, MaterializationRegistry,
-    MaterializationShape,
+    MaterializationRetirement, MaterializationShape,
 };
 pub use namespace::{NamespaceError, ReferenceNamespace, TaskReferenceStates};
 pub use node_guard::{NodeVerdict, NodeWatch};

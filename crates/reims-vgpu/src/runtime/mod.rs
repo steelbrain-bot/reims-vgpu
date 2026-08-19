@@ -36,8 +36,8 @@ pub mod fence_exec;
 pub mod gather_witness;
 /// Guest-physical control-plane writes via HostOps map_pages.
 pub mod gpa_map;
-/// The bound on every GPU reference to guest RAM — one import per RAMBlock,
-/// and the only type that can name a byte inside one.
+/// The bound on every GPU reference to guest RAM: VM-lifetime RAMBlock imports
+/// and guest-lifetime packed mapping imports share this one checked type.
 pub mod guest_ram;
 /// This process's imports of guest RAM, and the one place a guest physical
 /// address becomes a bindable reference.

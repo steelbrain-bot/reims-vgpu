@@ -66,6 +66,12 @@ pub struct MaterializationShape {
     pub max_offsets: u32,
 }
 
+/// Values removed by one decoded guest-lifetime transition.
+pub struct MaterializationRetirement<Resource> {
+    pub window_count: usize,
+    pub resources: Vec<Resource>,
+}
+
 /// Unbounded retained materializations tied to decoded guest lifetimes.
 #[derive(Debug)]
 pub struct MaterializationRegistry<Window, Resource> {
@@ -83,6 +89,70 @@ impl<Window, Resource> Default for MaterializationRegistry<Window, Resource> {
 }
 
 impl<Window, Resource> MaterializationRegistry<Window, Resource> {
+    fn take_where(
+        &mut self,
+        mut window: impl FnMut(BoundWindowKey, GuestAddressSpan) -> bool,
+        mut resource: impl FnMut(MaterializationOwner, GuestAddressSpan) -> bool,
+    ) -> MaterializationRetirement<Resource> {
+        let mut window_count = 0;
+        let mut kept_windows = BTreeMap::new();
+        for (key, entry) in std::mem::take(&mut self.windows) {
+            if window(key, entry.span) {
+                window_count += 1;
+            } else {
+                kept_windows.insert(key, entry);
+            }
+        }
+        self.windows = kept_windows;
+
+        let mut resources = Vec::new();
+        let mut kept_resources = BTreeMap::new();
+        for (owner, entry) in std::mem::take(&mut self.resources) {
+            if resource(owner, entry.span) {
+                resources.push(entry.value);
+            } else {
+                kept_resources.insert(owner, entry);
+            }
+        }
+        self.resources = kept_resources;
+        MaterializationRetirement {
+            window_count,
+            resources,
+        }
+    }
+
+    pub fn take_task(&mut self, task: TaskId) -> MaterializationRetirement<Resource> {
+        self.take_where(
+            |key, _| key.owner.task == task,
+            |owner, _| owner.task == task,
+        )
+    }
+
+    pub fn take_object(
+        &mut self,
+        owner: MaterializationOwner,
+    ) -> MaterializationRetirement<Resource> {
+        self.take_where(
+            |key, _| key.owner == owner,
+            |candidate, _| candidate == owner,
+        )
+    }
+
+    pub fn take_range(
+        &mut self,
+        task: TaskId,
+        span: GuestAddressSpan,
+    ) -> MaterializationRetirement<Resource> {
+        self.take_where(
+            |key, entry| key.owner.task == task && entry.overlaps(span),
+            |owner, entry| owner.task == task && entry.overlaps(span),
+        )
+    }
+
+    pub fn take_all(&mut self) -> MaterializationRetirement<Resource> {
+        self.take_where(|_, _| true, |_, _| true)
+    }
+
     pub fn window(&self, key: BoundWindowKey) -> Option<&Window> {
         self.windows.get(&key).map(|entry| &entry.value)
     }
@@ -100,39 +170,29 @@ impl<Window, Resource> MaterializationRegistry<Window, Resource> {
         owner: MaterializationOwner,
         span: GuestAddressSpan,
         value: Resource,
-    ) {
-        self.resources.insert(owner, Retained { span, value });
+    ) -> Option<Resource> {
+        self.resources
+            .insert(owner, Retained { span, value })
+            .map(|entry| entry.value)
     }
 
     /// Retire one task's materializations. The count preserves the existing
     /// bind-window census; whole-resource retirement is still performed but is
     /// not misreported as a draw-path resolution.
     pub fn retire_task(&mut self, task: TaskId) -> usize {
-        let before = self.windows.len();
-        self.windows.retain(|key, _| key.owner.task != task);
-        self.resources.retain(|owner, _| owner.task != task);
-        before - self.windows.len()
+        self.take_task(task).window_count
     }
 
     pub fn retire_object(&mut self, owner: MaterializationOwner) -> usize {
-        let before = self.windows.len();
-        self.windows.retain(|key, _| key.owner != owner);
-        self.resources.remove(&owner);
-        before - self.windows.len()
+        self.take_object(owner).window_count
     }
 
     pub fn retire_range(&mut self, task: TaskId, span: GuestAddressSpan) -> usize {
-        let before = self.windows.len();
-        self.windows
-            .retain(|key, entry| key.owner.task != task || !entry.span.overlaps(span));
-        self.resources
-            .retain(|owner, entry| owner.task != task || !entry.span.overlaps(span));
-        before - self.windows.len()
+        self.take_range(task, span).window_count
     }
 
     pub fn clear(&mut self) {
-        self.windows.clear();
-        self.resources.clear();
+        let _ = self.take_all();
     }
 
     pub fn window_len(&self) -> usize {
@@ -205,6 +265,21 @@ mod tests {
         assert_eq!(registry.window(key(owner, 0)), None);
         assert_eq!(registry.resource(owner), None);
         assert_eq!(registry.window(key(owner, 1)), Some(&2));
+    }
+
+    #[test]
+    fn take_range_returns_the_owned_resource_value() {
+        let mut registry = MaterializationRegistry::<u8, u32>::default();
+        let owner = owner(1, 3);
+        assert_eq!(
+            registry.insert_resource(owner, span(0x1000, 0x2000), 0xfeed),
+            None
+        );
+
+        let retired = registry.take_range(TaskId::new(1), span(0x1800, 1));
+        assert_eq!(retired.window_count, 0);
+        assert_eq!(retired.resources, vec![0xfeed]);
+        assert!(registry.is_empty());
     }
 
     #[test]

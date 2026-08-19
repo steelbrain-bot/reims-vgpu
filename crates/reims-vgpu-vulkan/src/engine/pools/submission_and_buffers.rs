@@ -112,7 +112,13 @@ impl ResourcePools {
             self.dispose(device, DeferredHandle::GuestAllocation(parent));
         } else {
             crate::telemetry::note_route("guest_import_retired_unimported");
+            self.completed_guest_imports.push(import_id);
         }
+    }
+
+    /// Take allocation identities whose backend access has ended.
+    pub(crate) fn take_completed_guest_imports(&mut self) -> Vec<reims_vgpu_memory::ImportId> {
+        std::mem::take(&mut self.completed_guest_imports)
     }
 
     pub(crate) fn guest_reset_counts(&self) -> (usize, usize, usize, usize) {
@@ -232,6 +238,7 @@ impl ResourcePools {
             cur: 0,
             in_flight: 0,
             graveyard: Vec::new(),
+            completed_guest_imports: Vec::new(),
             target_free: FreePool::new(TARGET_FREE_CAP_PER_KEY, TARGET_FREE_CAP_TOTAL),
             open_batch: None,
             batch_max_draws: BATCH_MAX_DRAWS,

@@ -16,6 +16,7 @@ pub struct Device {
     pub state: crate::model::DeviceState,
     pub(crate) executor: Arc<dyn Executor>,
     pub(crate) bound_buffers: crate::runtime::bound_buffers::BoundBuffers,
+    pending_imported_views: Vec<(reims_vgpu_memory::ImportId, usize, usize)>,
 }
 
 /// Composition result of replacing a task's semantic and host-side lifetime.
@@ -94,11 +95,68 @@ impl Device {
             ),
             executor,
             bound_buffers: Default::default(),
+            pending_imported_views: Vec::new(),
         }
     }
 
+    fn release_completed_imported_views<H: HostOps>(&mut self, host: &mut H) -> usize {
+        let completed = self.executor.take_completed_guest_imports();
+        let mut released = 0;
+        for import in completed {
+            if let Some(index) = self
+                .pending_imported_views
+                .iter()
+                .position(|(pending, _, _)| *pending == import)
+            {
+                let (_, ptr, len) = self.pending_imported_views.swap_remove(index);
+                host.unmap_pages(ptr, len);
+                released += 1;
+            }
+        }
+        released
+    }
+
+    /// Drain host-allocation effects without releasing an alias while the
+    /// backend can still access it from an in-flight submission.
+    fn process_host_release_effects<H: HostOps>(
+        &mut self,
+        host: &mut H,
+        effects: Vec<HostReleaseEffect>,
+    ) -> usize {
+        let mut released = self.release_completed_imported_views(host);
+        for effect in effects {
+            match effect {
+                HostReleaseEffect::RetireGuestImport(import) => {
+                    let _ = self.executor.retire_guest_import(import);
+                }
+                HostReleaseEffect::RetireImportedView { import, ptr, len } => {
+                    self.pending_imported_views.push((import, ptr, len));
+                    if self.executor.retire_guest_import(import) {
+                        let (_, ptr, len) = self
+                            .pending_imported_views
+                            .pop()
+                            .expect("the just-published imported view is pending");
+                        host.unmap_pages(ptr, len);
+                        released += 1;
+                    }
+                }
+                HostReleaseEffect::ReleaseView { ptr, len } => {
+                    host.unmap_pages(ptr, len);
+                    released += 1;
+                }
+                HostReleaseEffect::RetireLinearResident(_) => unreachable!(),
+            }
+        }
+        released + self.release_completed_imported_views(host)
+    }
+
+    pub(crate) fn flush_host_release_effects<H: HostOps>(&mut self, host: &mut H) -> usize {
+        let effects = self.state.host_materializations.take_host_view_effects();
+        self.process_host_release_effects(host, effects)
+    }
+
     fn reset_model(&mut self) {
-        self.bound_buffers.clear();
+        self.retire_all_bound_buffers();
         let effect = self.state.reset();
         if let Some(hold) = effect.translation_hold {
             crate::observe::fail(format!(
@@ -118,25 +176,36 @@ impl Device {
         self.reset_model();
     }
 
+    fn apply_bound_buffer_retirement(
+        &mut self,
+        retired: crate::runtime::bound_buffers::BoundBufferRetirement,
+    ) -> usize {
+        for alias in retired.aliases {
+            self.state
+                .host_materializations
+                .retire_materialization(Some((alias.ptr, alias.len)), Some(alias.import));
+        }
+        retired.window_count
+    }
+
+    fn retire_all_bound_buffers(&mut self) -> usize {
+        let retired = self.bound_buffers.take_all();
+        self.apply_bound_buffer_retirement(retired)
+    }
+
     /// Reset after releasing every host page view owned by this guest lifetime.
     pub fn reset_with_host<H: HostOps>(&mut self, host: &mut H) -> usize {
         let executor = Arc::clone(&self.executor);
         let _scope = executor.enter();
         executor.reset();
-        let effects = self.state.take_all_host_release_effects();
         let mut count = 0;
-        for effect in effects {
-            match effect {
-                HostReleaseEffect::RetireGuestImport(import) => {
-                    self.executor.retire_guest_import(import);
-                }
-                HostReleaseEffect::ReleaseView { ptr, len } => {
-                    host.unmap_pages(ptr, len);
-                    count += 1;
-                }
-                HostReleaseEffect::RetireLinearResident(_) => unreachable!(),
-            }
+        for (_, ptr, len) in self.pending_imported_views.drain(..) {
+            host.unmap_pages(ptr, len);
+            count += 1;
         }
+        self.retire_all_bound_buffers();
+        let effects = self.state.take_all_host_release_effects();
+        count += self.process_host_release_effects(host, effects);
         self.reset_model();
         count
     }
@@ -161,7 +230,8 @@ impl Device {
     ) -> ObjectListTransition {
         let gva_resources_retired =
             crate::runtime::writeback_debt::retire_gva_for_task(self, task_id);
-        let bound_buffers_retired = self.bound_buffers.retire_task(task_id);
+        let retired = self.bound_buffers.take_task(task_id);
+        let bound_buffers_retired = self.apply_bound_buffer_retirement(retired);
         let applied = self.set_object_list(task_id, pfn, count);
         ObjectListTransition {
             applied,
@@ -180,7 +250,8 @@ impl Device {
     ) -> TaskDefinitionTransition {
         let gva_resources_retired =
             crate::runtime::writeback_debt::retire_gva_for_task(self, task_id);
-        let bound_buffers_retired = self.bound_buffers.retire_task(task_id);
+        let retired = self.bound_buffers.take_task(task_id);
+        let bound_buffers_retired = self.apply_bound_buffer_retirement(retired);
         let semantic = self.state.define_task(task_id, length, directory_pfn);
         TaskDefinitionTransition {
             semantic,
@@ -193,7 +264,8 @@ impl Device {
     pub fn delete_task_transition(&mut self, task_id: u32) -> TaskDeletionTransition {
         let gva_resources_retired =
             crate::runtime::writeback_debt::retire_gva_for_task(self, task_id);
-        let bound_buffers_retired = self.bound_buffers.retire_task(task_id);
+        let retired = self.bound_buffers.take_task(task_id);
+        let bound_buffers_retired = self.apply_bound_buffer_retirement(retired);
         let semantic = self.state.delete_task(task_id);
         TaskDeletionTransition {
             semantic,
@@ -210,7 +282,8 @@ impl Device {
     ) -> ObjectDeletionTransition {
         let gva_resource_retired =
             crate::runtime::writeback_debt::retire_gva_resource(self, task_id, ref_);
-        let bound_buffers_retired = self.bound_buffers.retire_ref(task_id, ref_);
+        let retired = self.bound_buffers.take_ref(task_id, ref_);
+        let bound_buffers_retired = self.apply_bound_buffer_retirement(retired);
         let semantic_removed = self.state.delete_object(task_id, ref_);
         ObjectDeletionTransition {
             semantic_removed,
@@ -253,6 +326,16 @@ impl Device {
 
     pub fn map_surface(&mut self, mapping_id: u32) -> bool {
         match self.state.try_map_surface(mapping_id) {
+            Ok(()) => true,
+            Err(decline) => {
+                Self::emit_state_mutation(decline);
+                false
+            }
+        }
+    }
+
+    pub(crate) fn ensure_surface_slot(&mut self, mapping_id: u32) -> bool {
+        match self.state.ensure_surface_slot(mapping_id) {
             Ok(()) => true,
             Err(decline) => {
                 Self::emit_state_mutation(decline);
@@ -329,7 +412,8 @@ impl Device {
 
     /// Retire every held address materialization for one object reference.
     pub(crate) fn retire_bound_buffers_for_ref(&mut self, task_id: u32, ref_: u32) -> usize {
-        self.bound_buffers.retire_ref(task_id, ref_)
+        let retired = self.bound_buffers.take_ref(task_id, ref_);
+        self.apply_bound_buffer_retirement(retired)
     }
 
     /// Retire held address materializations overlapping a changed task range.
@@ -339,7 +423,8 @@ impl Device {
         gva: u64,
         len: u64,
     ) -> usize {
-        self.bound_buffers.retire_range(task_id, gva, len)
+        let retired = self.bound_buffers.take_range(task_id, gva, len);
+        self.apply_bound_buffer_retirement(retired)
     }
 
     /// Publish one typed semantic failure through the device observation sink.

@@ -3685,6 +3685,9 @@ fn apply_map_family<H: HostMemory + HostOps>(
                 "map_memory2"
             };
             crate::runtime::gva_view::log_retire(op, task_id, gva, length, n);
+            if family == MapFamily::MapMemory2 {
+                crate::runtime::gva_view::publish_mapping_import(state, host, task_id, gva, length);
+            }
         }
         // A map notification is not a Store command and does not authorize a
         // cached surface write into the new mapping. Deferred render Stores
@@ -3698,26 +3701,11 @@ fn apply_map_family<H: HostMemory + HostOps>(
         // reuse/clear write pixels into pages the guest has recycled.
         let object_id = reims_vgpu_core::endian::ld32(&packet.payload[0..]);
         let task_id = reims_vgpu_core::endian::ld32(&packet.payload[4..]);
-        // Never write guest pages here — the delete trails the guest's
-        // CPU-side release asynchronously and the pages may already be
-        // recycled (boot-16 PTE-corruption panic: a 14.7 MB delete-time
-        // flush landed pixel bytes in a PTE page). But the id itself
-        // may ALSO already be re-used by a live surface whose paint is
-        // still deferred (~20 ms recycle under scroll — black-band
-        // class), so content state must survive until the next page
-        // resolve proves which incarnation this delete was for
-        // (fingerprint compare in mapper::resolve). A second delete
-        // with no resolve between is genuinely dead: tear down fully.
-        let mode = if state.mapping_backing_condemned(object_id) {
-            let _ = state.unmap_surface(object_id);
-            "dead"
-        } else if state.condemn_surface_backing(object_id) {
-            "condemn"
-        } else {
-            // No resolved pages ⇒ nothing a stale delete could hurt.
-            let _ = state.unmap_surface(object_id);
-            "unmapped"
-        };
+        // This operation is the backing lifetime boundary. It never writes
+        // guest pages; it retires the named backing and every representation
+        // derived from that lifetime exactly once.
+        let removed = state.unmap_surface(object_id);
+        let mode = if removed { "retired" } else { "absent" };
         crate::runtime::mapper::flush_retired_views(state, host);
         if crate::observe::draw_log_enabled() {
             crate::observe::line(format!(
@@ -4300,8 +4288,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
         // stamp-and-forget family below, behind an `else if` on this opcode that
         // the family's own pattern list does not include — structurally
         // unreachable, and the richer of the two: it routed the object id
-        // through `texture_to_mapping`, condemned with a page fingerprint rather
-        // than clearing, and took the deferred windows. Everything it did lives
+        // through `texture_to_mapping` and took the deferred windows. Everything it did lives
         // in `objects::replace_physical` now, so the packet has one meaning
         // again. `mapping_page_drift` reporting "the guest re-pointed this
         // surface and no packet said so" is what a lost half of it looks like

@@ -527,9 +527,7 @@ impl crate::runtime::host::HostPageViews for QemuHost<'_> {
         if let Some(f) = self.ops.unmap_pages {
             // SAFETY: ptr/len came from a successful map_pages.
             unsafe { f(self.ops.ctx, ptr as *mut c_void, len) }
-        } else if !self.map_pages_stable() {
-            // Stable aliases explicitly require no release. A missing callback
-            // is a leak only for a transient view.
+        } else {
             QemuHostDecline::UnmapPagesCallbackMissing { ptr, len }.emit(ptr as u64);
         }
     }

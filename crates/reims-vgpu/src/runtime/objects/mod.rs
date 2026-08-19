@@ -2279,7 +2279,7 @@ fn apply_surface_backing<M: HostMemory>(
         ));
     }
 
-    if !state.map_surface(surface_id) {
+    if !state.ensure_surface_slot(surface_id) {
         defer_surface_backing_fail(
             surface_id,
             "map_surface",
@@ -2331,8 +2331,7 @@ fn apply_surface_backing<M: HostMemory>(
     // the same span as the plan before it, so the unchanged case is filtered
     // out before reaching this line. The one way to arrive here unchanged is
     // the first visit for a surface, and there `prior` is empty, which makes
-    // `changed` true. The mapper's copy is not in that position — its
-    // reprieve path can repopulate an emptied entry list with no change.
+    // `changed` true.
     if let Some((lo, hi)) = span {
         let key =
             crate::runtime::mapper::span_first_sight_key(surface_id, lo, hi, state_page_shift);
@@ -2412,15 +2411,8 @@ fn record_surface_backing_owner(state: &mut Device, surface_id: u32, task_id: u3
 /// state keyed on that incarnation, and the next resolve re-walks the page table
 /// the guest has already rewritten.
 ///
-/// The list is *cleared* rather than condemned, which is where this packet parts
-/// from `DeleteIOSurfaceBacking2` even though the two look alike. A delete may
-/// be trailing a recycled id whose slot already carries a live surface, so it
-/// stashes a fingerprint and lets the next resolve decide. A re-point carries no
-/// such ambiguity — by its own contract the PFNs under this GPU-VA have already
-/// changed — and condemning would leave `map_generation` unmoved, so a resident
-/// gathered from the old pages would stay eligible until some later resolve
-/// disqualified it. Clearing fails closed on the packet that says the pages
-/// moved; on this rail that is the direction every ambiguity resolves toward.
+/// The list is cleared immediately because the packet says the PFNs under this
+/// GPU-VA have changed. The next access must resolve the replacement backing.
 ///
 /// # The packet names a task-local resource
 ///

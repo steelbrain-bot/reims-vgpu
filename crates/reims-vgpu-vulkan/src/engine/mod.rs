@@ -2670,12 +2670,18 @@ pub fn retire_resident_storage_content(identity: &reims_vgpu_core::ComputeStorag
 /// allocation ends. Existing child images keep the import until their own
 /// fence-safe retirement; an allocation with no children enters the same
 /// graveyard immediately so already-recorded buffer accesses finish first.
-pub fn retire_guest_import(import_id: reims_vgpu_memory::ImportId) {
+pub fn retire_guest_import(import_id: reims_vgpu_memory::ImportId) -> bool {
     let mut guard = lock_engine();
     let Some(device) = guard.owner.ctx.as_ref().map(|ctx| ctx.device.clone()) else {
-        return;
+        return true;
     };
     unsafe { guard.pools.retire_guest_import(&device, import_id) };
+    false
+}
+
+/// Allocation identities whose final backend access has retired.
+pub fn take_completed_guest_imports() -> Vec<reims_vgpu_memory::ImportId> {
+    lock_engine().pools.take_completed_guest_imports()
 }
 
 /// A synchronous compute writeback landed this resident's output in the guest's

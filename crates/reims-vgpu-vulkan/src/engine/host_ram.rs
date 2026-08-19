@@ -10,9 +10,10 @@
 //!
 //! # One import per allocation identity
 //!
-//! RAMBlocks are imported once for the device's life. A scattered task buffer
-//! may also arrive as a stable packed host alias, created once per live guest
-//! buffer reference; its many draw offsets are still only bounds checks.
+//! RAMBlocks are imported once for the device's life. A scattered task mapping
+//! may also arrive as a stable packed host alias, created once for that mapping
+//! and shared by its resources; their draw offsets are still only bounds
+//! checks. A resource-owned alias is the fallback when no mapping import exists.
 //!
 //! [`HostRamImports`] keys both forms by
 //! [`reims_vgpu_memory::ImportId`], so one allocation identity is never
@@ -41,6 +42,7 @@ use reims_vgpu_observe::Decline;
 /// between it and the guest's own view of those bytes.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ImportedHostRam {
+    pub import_id: reims_vgpu_memory::ImportId,
     pub buffer: vk::Buffer,
     pub memory: vk::DeviceMemory,
     /// Bytes the import covers. The buffer spans all of it, so every
@@ -58,11 +60,12 @@ impl ImportedHostRam {
     ///
     /// No submission may still reference `buffer`, and `device` must be the one
     /// the import was made against.
-    pub(crate) unsafe fn destroy(self, device: &ash::Device) {
+    pub(crate) unsafe fn destroy(self, device: &ash::Device) -> reims_vgpu_memory::ImportId {
         unsafe {
             device.destroy_buffer(self.buffer, None);
             device.free_memory(self.memory, None);
         }
+        self.import_id
     }
 }
 
@@ -216,7 +219,7 @@ struct LiveImport {
 #[derive(Default)]
 pub(crate) struct HostRamImports {
     live: HashMap<u64, LiveImport>,
-    /// `true` for RAMBlock-coordinate imports, `false` for packed task aliases.
+    /// `true` for GPA-coordinate RAMBlock imports, `false` for packed aliases.
     kinds: HashMap<u64, bool>,
     /// Driver refusals are properties of this pointer/device pair. Holding the
     /// answer prevents every draw from repeating a failed allocation.
@@ -229,8 +232,8 @@ impl HostRamImports {
         self.live.remove(&key).map(|entry| entry.allocation)
     }
 
-    /// Resolve `guest_ref` to a bindable range, importing its RAMBlock if this
-    /// is the first reference into it.
+    /// Resolve `guest_ref` to a bindable range, importing its host allocation
+    /// if this is the first reference into it.
     ///
     /// # Safety
     ///
@@ -256,11 +259,11 @@ impl HostRamImports {
         })
     }
 
-    /// Import `import`'s RAMBlock now, if it is not imported already.
+    /// Import `import`'s host allocation now, if it is not imported already.
     ///
     /// [`Self::bind`] does this on whatever draw happens to reference the block
     /// first, and on a discrete host that draw pays seconds for it — see
-    /// [`import_ramblock`]'s own note. This is the same work with no reference
+    /// [`import_host_allocation`]'s own note. This is the same work with no reference
     /// to name, so a caller that knows the RAMBlocks before the guest asks for
     /// any of their bytes can pay it where nothing is waiting on a frame.
     ///
@@ -289,8 +292,8 @@ impl HostRamImports {
         self.remove_live(import_id.get())
     }
 
-    /// The one place a RAMBlock becomes an import, so "have we imported this
-    /// block" is asked once and cannot be answered two ways.
+    /// The one place a host allocation becomes a backend import, so an identity
+    /// cannot be imported through two competing paths.
     ///
     /// # Safety
     ///
@@ -310,7 +313,7 @@ impl HostRamImports {
         if let Some(decline) = self.declined.get(&key) {
             return Err(*decline);
         }
-        let made = match unsafe { import_ramblock(ctx, import) } {
+        let made = match unsafe { import_host_allocation(ctx, import) } {
             Ok(made) => made,
             Err(decline) => {
                 self.declined.insert(key, decline);
@@ -340,14 +343,14 @@ impl HostRamImports {
         self.live.values().map(|l| l.allocation.size).sum()
     }
 
-    /// How many RAMBlocks are imported. One or two on an ordinary machine, and
-    /// the number that must not grow with the workload — a rising count here is
-    /// the per-resource import the model exists to avoid.
+    /// Counts of GPA-coordinate RAMBlock imports and packed aliases. RAMBlocks
+    /// are VM-lifetime; aliases follow guest mapping/resource lifetimes and may
+    /// therefore rise and fall with the workload.
     pub(crate) fn counts(&self) -> (usize, usize) {
         self.live.keys().fold((0, 0), |(ramblocks, aliases), key| {
             // Every live entry is created from the import passed to `ensure`;
             // retain its kind beside the handle so the census does not call a
-            // packed task allocation a RAMBlock.
+            // packed host allocation a RAMBlock.
             if self.kinds.get(key).copied().unwrap_or(false) {
                 (ramblocks + 1, aliases)
             } else {
@@ -357,12 +360,12 @@ impl HostRamImports {
     }
 }
 
-/// Import one RAMBlock's whole host mapping.
+/// Import one bounded host allocation.
 ///
 /// # Cost, and why it is timed
 ///
 /// This is the only expensive step on the whole guest-memory rail, and it is
-/// paid once per RAMBlock per device. Which of its two halves costs what is not
+/// paid once per allocation identity. Which of its two halves costs what is not
 /// a thing a reader can assume: `vkGetMemoryHostPointerPropertiesEXT` asks the
 /// driver about a pointer and `vkAllocateMemory` is where a driver that pins
 /// takes its `get_user_pages` over every page of a multi-gigabyte mapping. The
@@ -373,7 +376,7 @@ impl HostRamImports {
 /// # Safety
 ///
 /// As [`HostRamImports::bind`].
-unsafe fn import_ramblock(
+unsafe fn import_host_allocation(
     ctx: &super::context::DeviceContext,
     import: &GuestRamImport,
 ) -> Result<ImportedHostRam, HostRamDecline> {
@@ -475,6 +478,7 @@ unsafe fn import_ramblock(
 
         match unsafe { ctx.device.bind_buffer_memory(buffer, memory, 0) } {
             Ok(()) => Ok(ImportedHostRam {
+                import_id: import.id(),
                 buffer,
                 memory,
                 size,

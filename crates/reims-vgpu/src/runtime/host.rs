@@ -457,15 +457,13 @@ pub trait HostPageViews {
     /// Release a view obtained from [`HostPageViews::map_pages`].
     fn unmap_pages(&mut self, _ptr: usize, _len: usize) {}
 
-    /// True when [`HostPageViews::map_pages`] returns a **stable** alias of guest
-    /// RAM: the pointer stays valid for the device lifetime,
-    /// [`HostPageViews::unmap_pages`] is a no-op, and the address is never recycled
-    /// for unrelated memory.
+    /// True when [`HostPageViews::map_pages`] returns an alias that may be
+    /// retained and imported by the backend. It stays valid until the matching
+    /// [`HostPageViews::unmap_pages`] after backend access has completed.
     ///
     /// This is a claim about a CPU-side *view* only, and says nothing about the
-    /// GPU rail: guest RAM reaches the GPU by importing the spans
-    /// [`GuestRamProvider::guest_ram_regions`] names, which are QEMU's own RAMBlock
-    /// mappings and never a view this call built.
+    /// GPU rail: the backend may import this exact view, so its completion is
+    /// part of the release ordering.
     ///
     /// Default `false` — the conservative answer, so a host that has not
     /// declared stability keeps the portable CPU writeback.

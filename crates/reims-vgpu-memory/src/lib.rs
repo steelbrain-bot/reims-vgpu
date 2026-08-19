@@ -47,10 +47,9 @@
 //! host is ever observed migrating a page under a live import, that is a real
 //! defect with a measurement, not a gap in this doc.
 //!
-//! Page recycling is unchanged and still load-bearing: the guest reassigning a
-//! GPA to a different allocation while we hold a reference over it is the
-//! PTE-corruption class the surface page-ownership guards exist for.
-//! It applied to the dma-buf and it applies here.
+//! Page recycling is unchanged and still load-bearing: an import is retired
+//! with the guest allocation that owns it. Physical-page equality is not an
+//! ownership test; distinct views may intentionally name shared storage.
 //!
 //! # RAMBlock imports and packed task-buffer aliases
 //!
@@ -61,12 +60,13 @@
 //! it is why a scattered surface is not un-importable: it is N slices over one
 //! import.
 //!
-//! A task buffer whose physical pages are scattered has no single range inside
+//! A task mapping whose physical pages are scattered has no single range inside
 //! a RAMBlock. On a host that can construct a stable packed alias, that alias is
-//! a second kind of import: one per live `(task, buffer reference)`, sliced for
-//! every offset bind and retired with the reference or its mappings. Importing
-//! the alias is optional; a driver may refuse it and the existing gather remains
-//! the correctness path. It is never attempted per draw.
+//! a second kind of import: one per live mapping, sliced by the resources that
+//! mapping backs and retired with the mapping. A resource-owned alias remains a
+//! fallback only when no mapping import is available. Importing either alias is
+//! optional; a driver may refuse it and the existing gather remains the
+//! correctness path. Neither is attempted per draw.
 
 use reims_vgpu_observe::{Decline, Emit};
 
@@ -682,8 +682,10 @@ impl GuestRamError {
 /// One bounded host allocation, and the only thing that can name a byte in it.
 ///
 /// A RAMBlock form is created at device init and held for the VM's lifetime. A
-/// packed task-buffer form is created once per live guest buffer reference. Both
-/// are sliced by checked relative offsets; neither is created per draw/window.
+/// packed form normally belongs to one live task mapping and is shared by the
+/// resources backed by that mapping; a resource may own one only when no
+/// mapping import exists. Both are sliced by checked relative offsets; neither
+/// is created per draw/window.
 ///
 /// The backend's handle for the import (a `VkDeviceMemory` and its whole-region
 /// `VkBuffer`, or an `MTLBuffer`) lives beside this in the backend, keyed by

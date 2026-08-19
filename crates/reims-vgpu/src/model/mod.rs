@@ -96,15 +96,15 @@ mod tests {
         });
 
         let effects = d.state.take_all_host_release_effects();
-        assert_eq!(
+        assert!(matches!(
             effects.first(),
-            Some(&HostReleaseEffect::RetireGuestImport(import_id)),
-            "an import must be revoked before any aliased view is unmapped"
-        );
+            Some(HostReleaseEffect::RetireImportedView { import, .. }) if *import == import_id
+        ));
         let mut views: Vec<_> = effects
             .iter()
             .filter_map(|effect| match effect {
-                HostReleaseEffect::ReleaseView { ptr, len } => Some((*ptr, *len)),
+                HostReleaseEffect::ReleaseView { ptr, len }
+                | HostReleaseEffect::RetireImportedView { ptr, len, .. } => Some((*ptr, *len)),
                 HostReleaseEffect::RetireGuestImport(_)
                 | HostReleaseEffect::RetireLinearResident(_) => None,
             })

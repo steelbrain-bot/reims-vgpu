@@ -1462,8 +1462,6 @@ pub(crate) struct SurfacePageState {
     pub(crate) generation: u32,
     /// Guest page-table entries (valid bit + PFN); empty until resolved.
     pub(crate) entries: Vec<u32>,
-    /// Retired plan retained only to classify an asynchronous trailing delete.
-    pub(crate) condemned: Option<Vec<u32>>,
     /// Guest address of the page-table source for the current plan.
     pub(crate) table_kva: u64,
     /// Contract derivation of [`Self::entries`] when it came from a surface
@@ -2158,10 +2156,9 @@ mod present_backpressure_state_tests {
 ///
 /// Distinct from a mapping's contiguous page-plan materialization (iosfc
 /// `mapping_id` page list).
-/// Created on demand by the GVA-view resolver; torn
-/// down on overlapping UnmapMemory / MapMemory2 / delete_task so we never keep
-/// a host alias after the guest drops the GPU page-table mapping (Apple
-/// `unmapMemory` analogue). Does **not** own discrete encode content
+/// Published for MapMemory2, with on-demand construction retained for CPU-only
+/// access; torn down on overlapping UnmapMemory / MapMemory2 / delete_task.
+/// Does **not** own discrete encode content
 /// (`host_gva_surfaces`) — that cache is retained across Unmap (wallpaper class).
 #[derive(Debug, Default)]
 pub struct GvaHostView {
@@ -2174,14 +2171,13 @@ pub struct GvaHostView {
     /// Ownership-bearing host page view. `None` exists only for an
     /// unverifiable synthetic fixture; product construction always supplies it.
     pub(crate) host_view: Option<HostPageView>,
-    /// Leaf GPA of the view's first page at build time.
-    ///
-    /// A registered view is always ONE contiguous run of guest frames —
-    /// `ensure_gva_view` refuses a fragmented span before mapping it — so this
-    /// plus `ptr_len` is the whole GPA list, and the reuse verify re-walks the
-    /// span and compares every page against it. `0` = unverifiable (fixtures),
-    /// skip.
-    pub first_gpa: u64,
+    /// Exact page-table result the host alias was built from. An empty list is
+    /// reserved for synthetic fixtures which cannot be revalidated.
+    pub page_gpas: Arc<[u64]>,
+    /// Backend-visible allocation over this view. A RAMBlock import is borrowed
+    /// from the VM lifetime; a host-allocation import is owned by this mapping.
+    pub(crate) import: Option<Arc<reims_vgpu_memory::GuestRamImport>>,
+    pub(crate) import_head: u64,
 }
 
 impl GvaHostView {
@@ -2190,14 +2186,16 @@ impl GvaHostView {
         gva: u64,
         length: u64,
         host_view: HostPageView,
-        first_gpa: u64,
+        page_gpas: Arc<[u64]>,
     ) -> Self {
         Self {
             task_id,
             gva,
             length,
             host_view: Some(host_view),
-            first_gpa,
+            page_gpas,
+            import: None,
+            import_head: 0,
         }
     }
 
@@ -2208,7 +2206,7 @@ impl GvaHostView {
             gva,
             length,
             HostPageView::new(ptr, ptr_len).expect("fixture host view"),
-            0,
+            Arc::from([]),
         )
     }
 
@@ -2222,6 +2220,33 @@ impl GvaHostView {
 
     pub(crate) fn take_host_view(&mut self) -> Option<(usize, usize)> {
         self.host_view.take().map(HostPageView::release)
+    }
+
+    pub(crate) fn install_import(
+        &mut self,
+        import: Arc<reims_vgpu_memory::GuestRamImport>,
+        import_head: u64,
+    ) {
+        self.import = Some(import);
+        self.import_head = import_head;
+    }
+
+    pub(crate) fn import(&self) -> Option<&Arc<reims_vgpu_memory::GuestRamImport>> {
+        self.import.as_ref()
+    }
+
+    pub(crate) fn import_head(&self) -> u64 {
+        self.import_head
+    }
+
+    fn take_owned_import(&mut self) -> Option<reims_vgpu_memory::ImportId> {
+        self.import
+            .take()
+            .filter(|import| import.gpa_base().is_none())
+            .map(|import| {
+                import.retire();
+                import.id()
+            })
     }
 }
 
@@ -3660,7 +3685,17 @@ impl NamedMappings {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostReleaseEffect {
     RetireGuestImport(reims_vgpu_memory::ImportId),
-    ReleaseView { ptr: usize, len: usize },
+    /// Revoke the backend import, then release its host alias only after the
+    /// backend reports that the final GPU access has retired.
+    RetireImportedView {
+        import: reims_vgpu_memory::ImportId,
+        ptr: usize,
+        len: usize,
+    },
+    ReleaseView {
+        ptr: usize,
+        len: usize,
+    },
     RetireLinearResident(ComputeStorageResidencyKey),
 }
 
@@ -3716,7 +3751,6 @@ pub struct MappingInvalidationEffect {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SurfacePlanAdoption {
     pub(crate) pages_changed: bool,
-    pub(crate) reprieved: bool,
     pub(crate) previous_page_count: usize,
     pub(crate) lifecycle_generation: u32,
 }
@@ -3760,6 +3794,21 @@ impl PendingHostReleases {
             .push(HostReleaseEffect::RetireGuestImport(import));
     }
 
+    fn retire_materialization(
+        &mut self,
+        view: Option<(usize, usize)>,
+        import: Option<reims_vgpu_memory::ImportId>,
+    ) {
+        match (view, import) {
+            (Some((ptr, len)), Some(import)) => self
+                .effects
+                .push(HostReleaseEffect::RetireImportedView { import, ptr, len }),
+            (Some(view), None) => self.retire_view(view),
+            (None, Some(import)) => self.retire_guest_import(import),
+            (None, None) => {}
+        }
+    }
+
     fn retire_linear_resident(&mut self, identity: ComputeStorageResidencyKey) {
         self.effects
             .push(HostReleaseEffect::RetireLinearResident(identity));
@@ -3768,7 +3817,9 @@ impl PendingHostReleases {
     fn take_linear_residents(&mut self) -> Vec<ComputeStorageResidencyKey> {
         self.take_matching(|effect| match effect {
             HostReleaseEffect::RetireLinearResident(identity) => Some(identity),
-            HostReleaseEffect::RetireGuestImport(_) | HostReleaseEffect::ReleaseView { .. } => None,
+            HostReleaseEffect::RetireGuestImport(_)
+            | HostReleaseEffect::RetireImportedView { .. }
+            | HostReleaseEffect::ReleaseView { .. } => None,
         })
     }
 
@@ -3776,16 +3827,17 @@ impl PendingHostReleases {
     /// Imports are revoked before any view they may alias is unmapped.
     fn take_host_view_effects(&mut self) -> Vec<HostReleaseEffect> {
         let effects = self.take_matching(|effect| match effect {
-            HostReleaseEffect::RetireGuestImport(_) | HostReleaseEffect::ReleaseView { .. } => {
-                Some(effect)
-            }
+            HostReleaseEffect::RetireGuestImport(_)
+            | HostReleaseEffect::RetireImportedView { .. }
+            | HostReleaseEffect::ReleaseView { .. } => Some(effect),
             HostReleaseEffect::RetireLinearResident(_) => None,
         });
         let mut imports = Vec::new();
         let mut views = Vec::new();
         for effect in effects {
             match effect {
-                HostReleaseEffect::RetireGuestImport(_) => imports.push(effect),
+                HostReleaseEffect::RetireGuestImport(_)
+                | HostReleaseEffect::RetireImportedView { .. } => imports.push(effect),
                 HostReleaseEffect::ReleaseView { .. } => views.push(effect),
                 HostReleaseEffect::RetireLinearResident(_) => unreachable!(),
             }
@@ -3805,7 +3857,8 @@ impl PendingHostReleases {
         self.effects
             .iter()
             .filter_map(|effect| match *effect {
-                HostReleaseEffect::ReleaseView { ptr, len } => Some((ptr, len)),
+                HostReleaseEffect::ReleaseView { ptr, len }
+                | HostReleaseEffect::RetireImportedView { ptr, len, .. } => Some((ptr, len)),
                 HostReleaseEffect::RetireGuestImport(_)
                 | HostReleaseEffect::RetireLinearResident(_) => None,
             })
@@ -3818,6 +3871,7 @@ impl PendingHostReleases {
             .iter()
             .filter_map(|effect| match *effect {
                 HostReleaseEffect::RetireGuestImport(import) => Some(import),
+                HostReleaseEffect::RetireImportedView { import, .. } => Some(import),
                 HostReleaseEffect::ReleaseView { .. }
                 | HostReleaseEffect::RetireLinearResident(_) => None,
             })
@@ -3833,6 +3887,7 @@ impl PendingHostReleases {
                 HostReleaseEffect::RetireGuestImport(_) | HostReleaseEffect::ReleaseView { .. } => {
                     None
                 }
+                HostReleaseEffect::RetireImportedView { .. } => None,
             })
             .collect()
     }
@@ -3868,12 +3923,21 @@ pub(crate) struct HostMaterializationState {
 }
 
 impl HostMaterializationState {
+    #[cfg(test)]
     pub(crate) fn retire_view(&mut self, view: (usize, usize)) {
         self.releases.retire_view(view);
     }
 
     pub(crate) fn retire_guest_import(&mut self, import: reims_vgpu_memory::ImportId) {
         self.releases.retire_guest_import(import);
+    }
+
+    pub(crate) fn retire_materialization(
+        &mut self,
+        view: Option<(usize, usize)>,
+        import: Option<reims_vgpu_memory::ImportId>,
+    ) {
+        self.releases.retire_materialization(view, import);
     }
 
     pub(crate) fn retire_linear_resident(&mut self, identity: ComputeStorageResidencyKey) {
@@ -3903,6 +3967,13 @@ impl HostMaterializationState {
         self.gva_views.iter().find(|view| predicate(view))
     }
 
+    pub(crate) fn find_gva_view_mut(
+        &mut self,
+        predicate: impl Fn(&GvaHostView) -> bool,
+    ) -> Option<&mut GvaHostView> {
+        self.gva_views.iter_mut().find(|view| predicate(view))
+    }
+
     pub(crate) fn retire_gva_views_where(
         &mut self,
         predicate: impl Fn(&GvaHostView) -> bool,
@@ -3912,9 +3983,9 @@ impl HostMaterializationState {
         while index < self.gva_views.len() {
             if predicate(&self.gva_views[index]) {
                 let mut view = self.gva_views.swap_remove(index);
-                if let Some(host_view) = view.take_host_view() {
-                    self.releases.retire_view(host_view);
-                }
+                let host_view = view.take_host_view();
+                let import = view.take_owned_import();
+                self.releases.retire_materialization(host_view, import);
                 retired = retired.saturating_add(1);
             } else {
                 index += 1;
@@ -3925,9 +3996,9 @@ impl HostMaterializationState {
 
     pub(crate) fn retire_all_gva_views(&mut self) {
         for mut view in self.gva_views.drain(..) {
-            if let Some(host_view) = view.take_host_view() {
-                self.releases.retire_view(host_view);
-            }
+            let host_view = view.take_host_view();
+            let import = view.take_owned_import();
+            self.releases.retire_materialization(host_view, import);
         }
     }
 
@@ -4260,12 +4331,8 @@ impl DeviceState {
     pub fn take_all_host_release_effects(&mut self) -> Vec<HostReleaseEffect> {
         for mapping in self.surfaces.mappings.values_mut() {
             let (view, import) = Self::take_mapping_view(mapping);
-            if let Some(import) = import {
-                self.host_materializations.retire_guest_import(import);
-            }
-            if let Some(view) = view {
-                self.host_materializations.retire_view(view);
-            }
+            self.host_materializations
+                .retire_materialization(view, import);
         }
         self.content.sampled.gather_witness.clear();
         self.content.gva_stores.clear();
@@ -4793,9 +4860,8 @@ impl DeviceState {
 
     /// Adopt one mapper-resolved page plan as an indivisible lifecycle change.
     ///
-    /// A condemned fingerprint equal to the new plan reprieves the same
-    /// incarnation. A different plan advances both logical and physical
-    /// generations and retires every host object tied to the prior pages.
+    /// A different plan advances both logical and physical generations and
+    /// retires every host object tied to the prior pages.
     pub(crate) fn adopt_mapper_surface_plan(
         &mut self,
         surface: SurfaceId,
@@ -4806,13 +4872,8 @@ impl DeviceState {
     ) -> Option<SurfacePlanAdoption> {
         let (effect, retired_view, retired_import) = {
             let mapping = self.surfaces.mappings.get_mut(&surface.get())?;
-            let condemned = mapping.pages.condemned.take();
             let previous_page_count = mapping.pages.entries.len();
-            let pages_changed = condemned
-                .as_deref()
-                .map_or(mapping.pages.entries.as_slice(), |pages| pages)
-                != entries.as_slice();
-            let reprieved = condemned.is_some() && !pages_changed;
+            let pages_changed = mapping.pages.entries != entries;
             let (retired_view, retired_import) = if pages_changed {
                 let retired = mapping.materialization.retire();
                 Self::bump_map_generation(mapping);
@@ -4831,7 +4892,6 @@ impl DeviceState {
             (
                 SurfacePlanAdoption {
                     pages_changed,
-                    reprieved,
                     previous_page_count,
                     lifecycle_generation: mapping.lifecycle.generation,
                 },
@@ -4839,12 +4899,8 @@ impl DeviceState {
                 retired_import,
             )
         };
-        if let Some(view) = retired_view {
-            self.host_materializations.retire_view(view);
-        }
-        if let Some(import) = retired_import {
-            self.host_materializations.retire_guest_import(import);
-        }
+        self.host_materializations
+            .retire_materialization(retired_view, retired_import);
         Some(effect)
     }
 
@@ -4859,11 +4915,7 @@ impl DeviceState {
     ) -> Option<RegisteredSurfacePlanAdoption> {
         let (effect, retired_view, retired_import) = {
             let mapping = self.surfaces.mappings.get_mut(&surface.get())?;
-            let prior = mapping
-                .pages
-                .condemned
-                .take()
-                .unwrap_or_else(|| std::mem::take(&mut mapping.pages.entries));
+            let prior = std::mem::take(&mut mapping.pages.entries);
             let changed = prior != entries;
             let replaced = !prior.is_empty() && changed;
             if changed {
@@ -4889,12 +4941,8 @@ impl DeviceState {
                 retired_import,
             )
         };
-        if let Some(view) = retired_view {
-            self.host_materializations.retire_view(view);
-        }
-        if let Some(import) = retired_import {
-            self.host_materializations.retire_guest_import(import);
-        }
+        self.host_materializations
+            .retire_materialization(retired_view, retired_import);
         Some(effect)
     }
 
@@ -4912,15 +4960,10 @@ impl DeviceState {
             return false;
         }
         e.pages.entries = entries;
-        e.pages.condemned = None;
         Self::bump_page_generation(e);
         let (retired, retired_import) = Self::take_mapping_view(e);
-        if let Some(view) = retired {
-            self.host_materializations.retire_view(view);
-        }
-        if let Some(import) = retired_import {
-            self.host_materializations.retire_guest_import(import);
-        }
+        self.host_materializations
+            .retire_materialization(retired, retired_import);
         self.retire_mapping_gather_witness(mapping_id);
         true
     }
@@ -4996,16 +5039,11 @@ impl DeviceState {
         let had = !e.pages.entries.is_empty() || e.materialization.has_view();
         e.pages.entries.clear();
         e.pages.table_kva = 0;
-        e.pages.condemned = None;
         e.pages.surface_walk = None;
         Self::bump_page_generation(e);
         let (retired, retired_import) = Self::take_mapping_view(e);
-        if let Some(view) = retired {
-            self.host_materializations.retire_view(view);
-        }
-        if let Some(import) = retired_import {
-            self.host_materializations.retire_guest_import(import);
-        }
+        self.host_materializations
+            .retire_materialization(retired, retired_import);
         self.retire_mapping_gather_witness(mapping_id);
         had
     }
@@ -5047,9 +5085,6 @@ impl DeviceState {
         // pane — never gets that Store, so the stale frame is held for the life
         // of the guest.
         //
-        // `condemn_surface_backing` already drops it for the same class of
-        // event, and the two sit in the same `if`/`else` in the ReplacePhysical
-        // teardown, so leaving it here made one arm of one decision correct.
         let dropped_host_cache = self.host_replicas.forget_surface(mapping_id);
         let Some(e) = self.surfaces.mappings.get_mut(&mapping_id) else {
             return MappingInvalidationEffect {
@@ -5060,16 +5095,11 @@ impl DeviceState {
         let had = !e.pages.entries.is_empty() || e.materialization.has_view();
         e.pages.entries.clear();
         e.pages.table_kva = 0;
-        e.pages.condemned = None;
         Self::bump_map_generation(e);
         Self::bump_page_generation(e);
         let (retired, retired_import) = Self::take_mapping_view(e);
-        if let Some(v) = retired {
-            self.host_materializations.retire_view(v);
-        }
-        if let Some(import) = retired_import {
-            self.host_materializations.retire_guest_import(import);
-        }
+        self.host_materializations
+            .retire_materialization(retired, retired_import);
         self.retire_mapping_gather_witness(mapping_id);
         MappingInvalidationEffect {
             had_page_state: had,
@@ -5077,50 +5107,27 @@ impl DeviceState {
         }
     }
 
-    /// Trailing `DeleteIOSurfaceBacking2`: retire the page bindings — nothing
-    /// may write through possibly-recycled pages (boot-16 PTE-corruption
-    /// rule) — but KEEP content state (map_generation, geometry, resident
-    /// identity, deferred windows). The deleted backing may belong to a PRIOR
-    /// incarnation of a recycled id whose slot already carries a live surface
-    /// with an unflushed paint (black-band class): the next page resolve
-    /// compares against the stashed fingerprint and either reprieves (same
-    /// plan) or bumps + drops (different plan). Returns whether a fingerprint
-    /// was stashed; on `false` the caller should fall back to full teardown.
-    pub fn condemn_surface_backing(&mut self, mapping_id: u32) -> bool {
-        self.forget_compositor_mapping(mapping_id);
-        self.host_replicas.forget_surface(mapping_id);
-        let Some(e) = self.surfaces.mappings.get_mut(&mapping_id) else {
-            return false;
-        };
-        if e.pages.entries.is_empty() {
-            return false;
-        }
-        e.pages.condemned = Some(std::mem::take(&mut e.pages.entries));
-        Self::bump_page_generation(e);
-        e.pages.table_kva = 0;
-        let (retired, retired_import) = Self::take_mapping_view(e);
-        if let Some(v) = retired {
-            self.host_materializations.retire_view(v);
-        }
-        if let Some(import) = retired_import {
-            self.host_materializations.retire_guest_import(import);
-        }
-        self.retire_mapping_gather_witness(mapping_id);
-        true
-    }
-
-    /// Whether `mapping_id` sits in the condemned state (backing deleted, no
-    /// resolve since). A second delete in this state is genuinely dead — the
-    /// caller tears down for real.
-    pub fn mapping_backing_condemned(&self, mapping_id: u32) -> bool {
-        self.surfaces
-            .mappings
-            .get(&mapping_id)
-            .is_some_and(|e| e.pages.condemned.is_some())
-    }
-
     pub fn map_surface(&mut self, mapping_id: u32) -> bool {
         self.try_map_surface(mapping_id).is_ok()
+    }
+
+    /// Ensure a resolver has a registry slot without asserting a new mapping
+    /// lifetime. Backing adoption and replacement remain separate transitions.
+    pub(crate) fn ensure_surface_slot(
+        &mut self,
+        mapping_id: u32,
+    ) -> Result<(), StateMutationDecline> {
+        self.observations.observe_mapping_id(mapping_id);
+        if !crate::model::is_surface_mapping_id(mapping_id) {
+            return Err(StateMutationDecline::MapSurfaceIdSentinel { mapping_id });
+        }
+        self.surfaces
+            .mappings
+            .entry(mapping_id)
+            .or_default()
+            .lifecycle
+            .active = true;
+        Ok(())
     }
 
     pub(crate) fn try_map_surface(&mut self, mapping_id: u32) -> Result<(), StateMutationDecline> {
@@ -5130,43 +5137,19 @@ impl DeviceState {
         }
         let e = self.surfaces.mappings.entry(mapping_id).or_default();
         e.lifecycle.active = true;
-        // Fresh MAP invalidates any previous page table / geom for this slot.
-        // Stale has_geom after 1920→1440 remap blocks writebacks (size mismatch)
-        // and freezes host console at the old mode. The MAP notify often TRAILS
-        // our eager resolve of the same surface (a Store discovers the mapping
-        // before the guest's notification drains) — so never bump eagerly:
-        // stash the page fingerprint and let the next resolve decide (same
-        // plan = same incarnation, generation and deferred windows survive;
-        // different plan = genuine new surface, bump + drop there). Geometry
-        // stays cleared either way — samples fail-closed until re-resolve, so
-        // a genuinely new surface can never be served the old resident.
-        if !e.pages.entries.is_empty() && e.pages.condemned.is_none() {
-            e.pages.condemned = Some(std::mem::take(&mut e.pages.entries));
-        } else {
-            e.pages.entries.clear();
-        }
+        e.pages.entries.clear();
+        Self::bump_map_generation(e);
         Self::bump_page_generation(e);
         e.pages.table_kva = 0;
         e.declaration.clear();
         e.content.guest_page_generation = 0;
         e.content.surface_epoch = 0;
         let (retired, retired_import) = Self::take_mapping_view(e);
-        if let Some(v) = retired {
-            self.host_materializations.retire_view(v);
-        }
-        if let Some(import) = retired_import {
-            self.host_materializations.retire_guest_import(import);
-        }
+        self.host_materializations
+            .retire_materialization(retired, retired_import);
         self.retire_mapping_gather_witness(mapping_id);
-        // Fresh MAP: prior host-cache for this surface_id is stale, and so is
-        // any present evidence — the slot may hold a NEW surface.
         self.host_replicas.forget_surface(mapping_id);
-        // Present evidence is stamped with the incarnation and deliberately NOT
-        // dropped here. A fresh MAP does not yet know whether this is a new
-        // surface — that is what the fingerprint compare decides, bumping the
-        // generation when it is. Dropping it eagerly demoted a proven swapchain
-        // buffer to a private resident for every draw until its next present,
-        // which is the black-desktop class.
+        self.forget_compositor_mapping(mapping_id);
         Ok(())
     }
 
@@ -5256,18 +5239,13 @@ impl DeviceState {
             e.lifecycle.active = false;
             e.pages.entries.clear();
             e.pages.table_kva = 0;
-            e.pages.condemned = None;
             e.lifecycle.internal_kva = 0;
             e.declaration.clear();
             Self::bump_map_generation(e);
             Self::bump_page_generation(e);
             let (retired, retired_import) = Self::take_mapping_view(e);
-            if let Some(v) = retired {
-                self.host_materializations.retire_view(v);
-            }
-            if let Some(import) = retired_import {
-                self.host_materializations.retire_guest_import(import);
-            }
+            self.host_materializations
+                .retire_materialization(retired, retired_import);
             self.retire_mapping_gather_witness(mapping_id);
             self.host_replicas.forget_surface(mapping_id);
             Ok(true)
@@ -5306,7 +5284,6 @@ impl DeviceState {
         e.lifecycle.internal_kva = mapping_internal;
         e.pages.entries.clear();
         e.pages.table_kva = 0;
-        e.pages.condemned = None;
         e.declaration.clear();
         e.content.guest_page_generation = 0;
         e.content.surface_epoch = 0;
@@ -5314,12 +5291,8 @@ impl DeviceState {
         Self::bump_page_generation(e);
         // New MappingInternal ⇒ new surface; force device-desc re-resolve.
         let (retired, retired_import) = Self::take_mapping_view(e);
-        if let Some(v) = retired {
-            self.host_materializations.retire_view(v);
-        }
-        if let Some(import) = retired_import {
-            self.host_materializations.retire_guest_import(import);
-        }
+        self.host_materializations
+            .retire_materialization(retired, retired_import);
         self.retire_mapping_gather_witness(mapping_id);
         // New MappingInternal ⇒ new surface, and the `bump_map_generation`
         // above is what retires the stale present evidence: it is stamped with

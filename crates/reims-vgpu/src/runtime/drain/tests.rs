@@ -784,7 +784,7 @@ fn a_short_replace_physical_is_reported_and_drops_nothing() {
 }
 
 #[test]
-fn delete_iosurface_backing_condemns_then_second_delete_tears_down() {
+fn delete_iosurface_backing_retires_the_named_lifetime_once() {
     let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     assert!(state.map_surface(3));
@@ -811,21 +811,16 @@ fn delete_iosurface_backing_condemns_then_second_delete_tears_down() {
             },
         );
     };
-    // First delete: the id may already carry a live re-used incarnation
-    // (the delete trails the guest release) — condemn: retire bindings,
-    // keep content state for the resolve-time fingerprint decision.
-    delete(&mut state, &mut host);
-    let m = state.surfaces.mappings.get(&3).unwrap();
-    assert!(m.lifecycle.active, "condemn keeps the slot live");
-    assert!(m.pages.entries.is_empty(), "bindings must be retired");
-    assert_eq!(m.pages.condemned.as_deref(), Some(&[0x101u32][..]));
-    // Second delete with no resolve between: genuinely dead — full
-    // teardown.
     delete(&mut state, &mut host);
     let m = state.surfaces.mappings.get(&3).unwrap();
     assert!(!m.lifecycle.active);
     assert!(m.pages.entries.is_empty());
-    assert!(m.pages.condemned.is_none());
+    assert_eq!(m.lifecycle.internal_kva, 0);
+    // Repeating a delete is idempotent; it is not a confirmation protocol.
+    delete(&mut state, &mut host);
+    let m = state.surfaces.mappings.get(&3).unwrap();
+    assert!(!m.lifecycle.active);
+    assert!(m.pages.entries.is_empty());
     assert_eq!(m.lifecycle.internal_kva, 0);
 }
 

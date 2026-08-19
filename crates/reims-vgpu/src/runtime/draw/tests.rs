@@ -5525,6 +5525,7 @@ fn sampled_plane_keeps_its_copy_source_and_checks_the_packed_extent() {
         .unwrap(),
         runs: std::sync::Arc::new(Vec::new()),
         pages: std::sync::Arc::new(Vec::new()),
+        owned_alias: None,
     };
     assert!(
         super::linear_sample_from_packed(

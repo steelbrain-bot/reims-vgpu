@@ -648,7 +648,6 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         )
         .expect("map_surface published the surface slot");
     let pages_changed = adoption.pages_changed;
-    let reprieved = adoption.reprieved;
     let prev_pages = adoption.previous_page_count;
 
     // The guest-physical footprint this incarnation authorises us to write.
@@ -677,12 +676,6 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
     // `pages_changed` on the reasoning that `map_gen` climbing past 100
     // proved that branch ran — but `bump_map_generation` has five other
     // call sites, so the generation was never evidence about this one.
-    //
-    // `pages_changed` is genuinely false here even on a first population:
-    // the reprieve path (`condemned` holds the fingerprint, the plan
-    // matches it) repopulates an emptied `page_entries` with
-    // `pages_changed == false`. The adoption below is what every write is
-    // then bounded by, so that is what has to be reported.
     //
     // Dedup is `first_sight` on the span itself, which keeps it bounded by
     // *distinct footprints* rather than by resolve rate — a mapping
@@ -716,166 +709,13 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
             ));
         }
     }
-    if reprieved {
-        // Wrong-PFN guard on the REPRIEVE path — the blind spot the rewire guard
-        // above cannot cover. A reprieve keeps this mapping's page plan WITHOUT
-        // bumping `map_generation` (the delete looked stale: the plan still
-        // fingerprints the condemned pages). But a guest that FREED the backing
-        // and handed the SAME physical pages to another surface — yet has not
-        // rewired this mapping's GPU page table away from them — fingerprints
-        // identical here, so `pages_changed` is false and the rewire guard never
-        // runs. A render Store landing through the kept plan would then write
-        // pages another live surface owns, or recycled userspace heap, which is
-        // the WindowServer malloc free-list corruption class.
-        //
-        // This used to run only when the reprieve found an armed deferred
-        // window, on the reasoning that a still-armed flush was the thing that
-        // would DMA through the stale plan. Stores land at the Store now, so
-        // there is no armed set to qualify on and the hazard belongs to the page
-        // plan rather than to any pending write — so the check runs on every
-        // reprieve. Reprieves are rare; this is not a hot path.
-        //
-        // A detected cross-surface alias is a proven ownership violation, so
-        // fail closed: name it, invalidate the plan, and make this resolve fail.
-        if !surface_pages_are_exclusively_owned(state, mapping_id, "reprieve") {
-            return false;
-        }
-    }
     if width > 0 && height > 0 {
         let _ = state.set_mapping_geom(mapping_id, width, height, format);
-    }
-    // Wrong-PFN rewire-race guard: a freshly adopted page plan must not alias
-    // a *different* live surface's guest pages. Two distinct live IOSurface
-    // mappings backing the same physical page means one holds a stale/wrong
-    // PFN — a pixel writeback through it scribbles the other surface, or (if
-    // the page was recycled to userspace) guest heap: the WindowServer malloc
-    // free-list corruption class. A detected alias is a proven ownership
-    // violation, so fail closed: name it, drop deferred writes, invalidate the
-    // adopted plan, and make this resolve fail. Runs only on a genuine rewire
-    // (`pages_changed`), on the drain worker.
-    if pages_changed && !surface_pages_are_exclusively_owned(state, mapping_id, "rewire") {
-        return false;
     }
     // Resolved: re-arm the fail latch so a later genuine failure (a re-map that
     // goes bad, a corrupted descriptor) is logged again rather than swallowed.
     clear_resolve_fail(mapping_id);
     true
-}
-
-/// Whether `mapping_id`'s adopted page plan is free of cross-surface aliasing.
-///
-/// Two distinct live IOSurface mappings backing the same guest physical page
-/// means one holds a stale PFN, and a pixel writeback through it scribbles the
-/// other surface — or, if the page was recycled to userspace, guest heap. So a
-/// detection is a proven ownership violation and this fails closed: it names
-/// the collision, drops the deferred writes and invalidates the plan, and the
-/// caller must fail its resolve.
-///
-/// `site` names which rewire reached here (`reprieve` or `rewire`) so the two
-/// populations stay separable in the log.
-fn surface_pages_are_exclusively_owned(state: &mut Device, mapping_id: u32, site: &str) -> bool {
-    let Some((gpa, owner)) = first_surface_page_collision(state, mapping_id) else {
-        return true;
-    };
-    let mine_pages = state
-        .surfaces
-        .mappings
-        .get(&mapping_id)
-        .map(|m| m.pages.entries.len())
-        .unwrap_or(0);
-    fail_closed_surface_page_collision(state, mapping_id, gpa, owner, mine_pages, site);
-    false
-}
-
-/// Detect the wrong-PFN rewire-race corruption vector: the mapping `mapping_id`
-/// just adopted a fresh page plan whose page base is also owned by a
-/// *different* currently-live surface mapping. Two distinct live IOSurface
-/// mappings must never back the same guest physical page; if they do, one holds
-/// a stale/wrong PFN and a writeback through it corrupts memory it does not own
-/// (see the WindowServer heap-corruption class).
-///
-/// A detection **fails the resolve closed** — see
-/// [`surface_pages_are_exclusively_owned`], which is how both call sites reach
-/// this. It is not measure-only; the doc said so for a while and was wrong,
-/// which is the worse way round for a detector on the guest-corruption rail.
-///
-/// Cost O(this_pages + Σ other live pages); called only on a rewire.
-fn first_surface_page_collision(state: &Device, mapping_id: u32) -> Option<(u64, u32)> {
-    let page_shift = state.page_shift;
-    let page = state.page_size();
-    let page_base = |gpa: u64| gpa & !(page - 1);
-    let m = state.surfaces.mappings.get(&mapping_id)?;
-    if !m.lifecycle.active || m.pages.entries.is_empty() {
-        return None;
-    }
-    let mine: std::collections::HashSet<u64> = m
-        .pages
-        .entries
-        .iter()
-        .filter_map(|&e| reims_vgpu_paging::geometry::mapper_entry_gpa(e, page_shift))
-        .map(page_base)
-        .collect();
-    if mine.is_empty() {
-        return None;
-    }
-    for (other_id, other) in state.surfaces.mappings.iter() {
-        if other_id == mapping_id || !other.lifecycle.active || other.pages.entries.is_empty() {
-            continue;
-        }
-        for &e in &other.pages.entries {
-            if let Some(gpa) = reims_vgpu_paging::geometry::mapper_entry_gpa(e, page_shift) {
-                if mine.contains(&page_base(gpa)) {
-                    return Some((page_base(gpa), other_id));
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Always-on, deduped-per-`(mid, owner, gpa)` fail line for a cross-surface
-/// page alias. Off-main-core (drain worker resolve path). Fires zero on a
-/// healthy boot (distinct live surfaces never share a physical page).
-fn note_surface_page_collision(
-    mapping_id: u32,
-    gpa: u64,
-    owner: u32,
-    mine_pages: usize,
-    path: &str,
-) {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
-    static SEEN: OnceLock<Mutex<HashSet<(u32, u32, u64)>>> = OnceLock::new();
-    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
-    if seen
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert((mapping_id, owner, gpa))
-    {
-        crate::observe::fail(format!(
-            "mapping_pages fail reason=surface_page_collision path={path} mid={mapping_id} \
-             owner={owner} gpa={gpa:#x} mine_pages={mine_pages}"
-        ));
-    }
-}
-
-/// A cross-surface page alias is a structural ownership violation: any
-/// host-authored pixel write through `mapping_id` can scribble another live
-/// surface or, for the recycled-heap variant, a userspace heap page. Keep the
-/// always-on forensic line, then fail closed by dropping deferred windows and
-/// invalidating the adopted page plan so the next writer must re-resolve instead
-/// of writing through known-bad pages.
-fn fail_closed_surface_page_collision(
-    state: &mut Device,
-    mapping_id: u32,
-    gpa: u64,
-    owner: u32,
-    mine_pages: usize,
-    path: &str,
-) {
-    note_surface_page_collision(mapping_id, gpa, owner, mine_pages, path);
-    let effect = state.invalidate_mapping_pages(mapping_id);
-    crate::runtime::note_mapping_invalidation(effect);
 }
 
 /// Lowest and highest page-aligned GPA a page-entry list resolves to.
@@ -1029,22 +869,19 @@ pub fn revalidate_mapping_pages<H: HostMemory + HostOps>(
 ///   content-drop risk, and the only one that also emits the `st=invalidate`
 ///   line below.
 ///
-/// The empty-page-list outcome is not one outcome. Four different states reach
+/// The empty-page-list outcome is not one outcome. Three different states reach
 /// it, and they were all reported as `revalidate_no_pages` with a doc comment
 /// calling the class "a transient (re)wire gap" — one of the four, asserted for
 /// all of them. 106 render-flush losses across 73 boots carry that slug and none
 /// of them says which state produced it. Each check now owns its own:
-/// - `revalidate_condemned` — `DeleteIOSurfaceBacking2` moved the page list into
-///   `condemned_entries` and no resolve has re-adopted it. The guest deleted the
-///   backing; there is nothing safe to write through.
 /// - `revalidate_no_internal` — no `MappingInternal`, so **no resolve was ever
 ///   attempted**, and the page list is empty for some other reason. Note that a
 ///   zero `mapping_internal` is NOT itself a sign of missing backing: measured on
 ///   the rail, 2280 render windows in one boot were armed on mappings with
 ///   `mapping_internal == 0` and `page_entries.len() == 2040`, and all but two
 ///   flushed normally, because a non-empty page list returns `None` above.
-/// - `revalidate_resolve_miss` — resolve ran and missed, with no live page table
-///   to condemn (so not `resolve_fail`).
+/// - `revalidate_resolve_miss` — resolve ran and missed, without the unreadable
+///   live page table that produces `resolve_fail`.
 /// - `revalidate_empty_after_resolve` — resolve ran and *succeeded*, and the page
 ///   list is still empty. The genuinely surprising one.
 /// - `revalidate_unmapped_late` / `revalidate_gone_late` — the mapping was
@@ -1106,7 +943,6 @@ pub fn revalidate_mapping_reason<H: HostMemory + HostOps>(
     match state.surfaces.mappings.get(&mapping_id) {
         Some(m) if m.lifecycle.active && !m.pages.entries.is_empty() => None,
         Some(m) if !m.lifecycle.active => Some("revalidate_unmapped_late"),
-        Some(m) if m.pages.condemned.is_some() => Some("revalidate_condemned"),
         Some(_) if !resolve_ran => Some("revalidate_no_internal"),
         Some(_) if !resolve_ok => Some("revalidate_resolve_miss"),
         Some(_) => Some("revalidate_empty_after_resolve"),
@@ -1518,32 +1354,18 @@ fn revalidate_timing_is_slow(elapsed_us: u64) -> bool {
 
 /// Release contiguous views whose page tables changed.
 ///
-/// A GPU object can retain a view only when [`HostOps::map_pages_stable`]
-/// promises the address for the device lifetime; `unmap_pages` is a no-op on
-/// exactly that host. A transient view is never admitted to a backend import,
-/// so its only users are CPU copies that finish inside their own call.
+/// A GPU object can retain a view only when
+/// [`crate::runtime::host::HostPageViews::map_pages_stable`]
+/// promises the address through backend completion. A transient view is never
+/// admitted to a backend import, so its users finish inside their own call.
 pub fn flush_retired_views<H: HostOps>(state: &mut Device, host: &mut H) {
-    // The backend allocation aliases the host view, so revoke the GPU parent
-    // first. Existing child images and recorded buffers hold it through their
-    // fence-safe retirement; the host view is stable on every backend that can
-    // import it, making `unmap_pages` a no-op there until device teardown.
-    for effect in state.host_materializations.take_host_view_effects() {
-        match effect {
-            crate::model::HostReleaseEffect::RetireGuestImport(import) => {
-                state.executor.retire_guest_import(import);
-            }
-            crate::model::HostReleaseEffect::ReleaseView { ptr, len } => {
-                host.unmap_pages(ptr, len);
-            }
-            crate::model::HostReleaseEffect::RetireLinearResident(_) => unreachable!(),
-        }
-    }
+    state.flush_host_release_effects(host);
 }
 
 /// Revalidate + collect page-aligned GPAs for a mapped surface (GVA order).
 ///
-/// Fails closed on empty / invalid entries and known transport/control-page
-/// aliases. Does not invent PFNs. Every consumer immediately passes the
+/// Fails closed on empty or invalid entries. It neither invents PFNs nor infers
+/// ownership from their numeric addresses. Every consumer immediately passes the
 /// returned GPAs to `HostOps::map_pages`, whose host callback is the
 /// authoritative RAM/range validator; repeating `is_ram_gpa` once per page
 /// here makes full-frame surfaces perform thousands of duplicate QEMU address
@@ -1570,113 +1392,7 @@ pub fn mapping_page_gpas<H: HostMemory + HostOps>(
     if gpas.is_empty() || gpas.len() != m.pages.entries.len() {
         return None;
     }
-    if let Some((gpa, owner)) = { first_control_page_collision(state, &gpas) } {
-        crate::observe::fail(format!(
-            "mapping_pages fail reason=control_page_collision mid={mapping_id} gpa={gpa:#x} owner={owner} pages={}",
-            gpas.len()
-        ));
-        return None;
-    }
     Some(gpas)
-}
-
-/// A render surface must never alias pages that the device knows are live
-/// transport or task-control structures. `is_ram_gpa` alone cannot distinguish
-/// an IOSurface page from a FIFO/page-table page; reject the provable overlap
-/// before either CPU or GPU writes touch it.
-///
-/// Every region compared here is guest-**physical** by construction, which is
-/// what makes the comparison mean anything: `gfx.root_page`, `gfx.fifo_base_page`
-/// and `directory_pfn` are PFNs the guest writes and every other consumer turns
-/// into a GPA with `pfn_gpa`/`pfn_to_gpa` before a physical read, while
-/// `iosfc.ring_base` and `child_rings[..].page_gpas` are already GPAs and are
-/// read raw.
-///
-/// **A task's object list is not, and so cannot be checked here.**
-/// `object_list_pfn << page_shift` is an address in that task's *virtual* space:
-/// [`crate::runtime::objects::lookup_list_entry`] builds it, names it
-/// `entry_gva` and reads it through `gva_mem::read_task_gva_by_id`, and
-/// `gva_mem`'s own doc states the rule — "a GVA has no meaning apart from the
-/// page table it is resolved against". Testing it against surface GPAs compares
-/// two different address spaces, so it can only ever produce a coincidence, and
-/// the coincidence is not remote: tasks put their object lists in low pages.
-/// That arm therefore rejected a legitimate surface — losing real guest work —
-/// on a numeric collision, while a genuine alias stayed invisible to it. It also
-/// strided the span at 16 bytes where the contract's `OBJECT_LIST_ENTRY_LEN` is
-/// 12, oversizing the window it got wrong by a third.
-///
-/// Making it meaningful would mean walking the task's page table over the whole
-/// object-list span on every call, which is the cost this function's range-query
-/// shape exists to avoid, to enforce a rule the protocol never states and that
-/// no boot has ever seen violated. Do not re-add it without those GPAs in hand.
-fn first_control_page_collision(state: &Device, gpas: &[u64]) -> Option<(u64, &'static str)> {
-    let page = state.page_size();
-    let page_base = |gpa: u64| gpa & !(page - 1);
-    // Probe the SURFACE, not the control structures. A live task can advertise a
-    // million object-list slots — 4,096 x86 pages — and an object list is one
-    // contiguous span, so asking "does the surface hold this page?" once per
-    // control page enumerated the whole span page by page. Sorted, the same
-    // question is one range query per task.
-    //
-    // Measured on the x86/Vulkan rail before this shape: 414 µs per call, 71 024
-    // calls in a 120 s arm, 29.4 s of wall clock spent proving a full-screen
-    // IOSurface does not alias a FIFO ring.
-    let mut pages: Vec<u64> = gpas.iter().map(|&gpa| page_base(gpa)).collect();
-    pages.sort_unstable();
-    let holds = |gpa: u64| pages.binary_search(&page_base(gpa)).is_ok();
-    // The lowest surface page in `[start, end)`, if any. `start` is page-aligned
-    // and every entry is a page base, so a hit is exactly one of the pages a
-    // per-page enumeration would have reported — same page, same reported gpa.
-    let holds_range = |start: u64, len: u64| -> Option<u64> {
-        let end = start.saturating_add(len);
-        let i = pages.partition_point(|&p| p < start);
-        pages.get(i).copied().filter(|&p| p < end)
-    };
-
-    if state.registers.gfx.root_page != 0
-        && holds((state.registers.gfx.root_page as u64) << state.page_shift)
-    {
-        return Some((
-            (state.registers.gfx.root_page as u64) << state.page_shift,
-            "gfx_root",
-        ));
-    }
-    // The main FIFO is as long as the guest said it is, not one page. The ring
-    // spans `fifo_length` bytes from the base page — `drain_main_fifo` reads it
-    // over exactly that extent, `fifo_start` being the header offset *inside*
-    // it — and it is routinely more than one page, so probing only the first
-    // let a surface alias the rest of the ring undetected.
-    if state.registers.gfx.fifo_base_page != 0 {
-        let base = (state.registers.gfx.fifo_base_page as u64) << state.page_shift;
-        if let Some(gpa) = holds_range(base, state.registers.gfx.fifo_length.max(1) as u64) {
-            return Some((gpa, "root_fifo"));
-        }
-    }
-    // Still the first page only. `iosfc.capacity` would give the ring's extent
-    // the way `fifo_length` does above, but nothing in this crate consumes it —
-    // it is written and read back over MMIO and never bounds anything — so its
-    // units are not established, and sizing a rejection window from a field
-    // whose meaning is a guess is how a legitimate surface gets refused. Bound
-    // it when a consumer settles whether it counts entries or bytes.
-    if state.registers.iosfc.ring_base != 0 && holds(state.registers.iosfc.ring_base) {
-        return Some((page_base(state.registers.iosfc.ring_base), "iosfc_ring"));
-    }
-    for ring in &state.scheduling.child_rings {
-        for &gpa in &ring.page_gpas {
-            if holds(gpa) {
-                return Some((page_base(gpa), "child_fifo"));
-            }
-        }
-    }
-    for (_, task) in state.tasks.live() {
-        if task.directory_pfn != 0 {
-            let gpa = (task.directory_pfn as u64) << state.page_shift;
-            if holds(gpa) {
-                return Some((gpa, "task_directory"));
-            }
-        }
-    }
-    None
 }
 
 /// Device-wide count of [`ensure_contig_view`] calls the host refused,
@@ -1687,7 +1403,8 @@ static CONTIG_REFUSED_SERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::
 
 /// Contiguous host-VA view over the mapping's guest pages (unified memory).
 ///
-/// Builds the view on first use via [`HostOps::map_pages`]. The host may return
+/// Builds the view on first use via
+/// [`crate::runtime::host::HostPageViews::map_pages`]. The host may return
 /// a direct run or reconstruct a scattered page list as one shared virtual
 /// alias; either answer is the same packed byte sequence to the caller.
 /// Returns `(ptr, len)`.

@@ -357,7 +357,16 @@ pub trait GuestImportService: std::fmt::Debug + Send + Sync {
         (0, 0)
     }
 
-    fn retire_guest_import(&self, _import: reims_vgpu_memory::ImportId) {}
+    /// End backend access to an allocation. `true` means no asynchronous
+    /// backend owner remains; otherwise completion is reported by
+    /// [`Self::take_completed_guest_imports`].
+    fn retire_guest_import(&self, _import: reims_vgpu_memory::ImportId) -> bool {
+        true
+    }
+
+    fn take_completed_guest_imports(&self) -> Vec<reims_vgpu_memory::ImportId> {
+        Vec::new()
+    }
 }
 
 /// Backend housekeeping which does not itself execute a guest command.
@@ -812,8 +821,12 @@ impl GuestImportService for VulkanExecutor {
         reims_vgpu_vulkan::engine::warm_guest_ram_imports(imports)
     }
 
-    fn retire_guest_import(&self, import: reims_vgpu_memory::ImportId) {
-        reims_vgpu_vulkan::engine::retire_guest_import(import);
+    fn retire_guest_import(&self, import: reims_vgpu_memory::ImportId) -> bool {
+        reims_vgpu_vulkan::engine::retire_guest_import(import)
+    }
+
+    fn take_completed_guest_imports(&self) -> Vec<reims_vgpu_memory::ImportId> {
+        reims_vgpu_vulkan::engine::take_completed_guest_imports()
     }
 }
 
