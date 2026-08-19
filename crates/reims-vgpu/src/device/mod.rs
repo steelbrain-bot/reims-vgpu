@@ -529,6 +529,14 @@ pub fn device_drain(id: u64) -> bool {
         return true;
     };
     let DeviceInner { device, actions } = &mut *d;
+    // The drain transaction extends past `Device::drain`: its tail flushes the
+    // submission batch, resolves the resident presented by that work, publishes
+    // it to the device-owned window, and samples the same backend state. Those
+    // are all operations of this device session. Scoping only `Device::drain`
+    // parks its residents and presenter before the tail reaches them, so every
+    // tail call observes the default session instead.
+    let executor = Arc::clone(&device.executor);
+    let _executor_scope = executor.enter();
     let mut host = QemuHost::new(&ops, actions, &slot.prompt_actions);
     // Presentation-path selector for this tranche: with a live host window the
     // drain publishes frames + self-acks; without one every present must

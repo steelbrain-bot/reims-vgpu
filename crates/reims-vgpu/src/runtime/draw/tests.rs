@@ -653,6 +653,18 @@ fn reflected_sampled_collision_uses_semantic_kind_and_metal_index() {
     fragment.bindings[0].metal_index = 32;
     fragment.bindings[0].kind = reims_vgpu_core::ShaderResourceKind::ColorInput;
     assert!(!reflected_sampled_binding_collision(&vertex, &fragment));
+
+    vertex.bindings[0].kind = reims_vgpu_core::ShaderResourceKind::Sampler;
+    vertex.bindings[0].metal_index = 0;
+    fragment.bindings[0].kind = reims_vgpu_core::ShaderResourceKind::StaticSampler;
+    fragment.bindings[0].metal_index = 0;
+    assert!(reflected_sampled_binding_collision(&vertex, &fragment));
+
+    vertex.bindings[0].kind = reims_vgpu_core::ShaderResourceKind::Texture;
+    assert!(
+        !reflected_sampled_binding_collision(&vertex, &fragment),
+        "texture and sampler indices live in distinct executable bands"
+    );
 }
 
 #[test]

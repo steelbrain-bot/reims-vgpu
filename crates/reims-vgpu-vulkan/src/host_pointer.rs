@@ -195,9 +195,10 @@ pub struct HostPointerCaps {
     /// import correctly, which is not the same question as how much it can hold.
     ///
     /// [`Self::heap_budget`] independently bounds the reachable heap. This
-    /// value is the intersection of `maxMemoryAllocationSize` and, where Vulkan
-    /// 1.3 exposes it, `maxBufferSize`. A RAMBlock longer than the resulting API
-    /// limit is imported in several allocations.
+    /// value is the intersection of `maxMemoryAllocationSize`, where Vulkan
+    /// 1.3 exposes it `maxBufferSize`, and the measured host-pointer import size
+    /// representation below. A RAMBlock longer than the result is imported in
+    /// several zero-copy allocations.
     ///
     /// Zero on every rung but [`HostPointerImport::Supported`].
     pub span_max: u64,
@@ -220,14 +221,29 @@ impl HostPointerCaps {
     }
 }
 
-/// Intersect the API limits that apply to one imported buffer and round the
+/// End of the size domain a host-pointer import may use reliably.
+///
+/// `VkDeviceSize` is wider, but host-pointer imports have been measured through
+/// implementations that narrow the imported allocation length to `u32`: a
+/// non-zero high word silently aliases the low-word length, while an exact
+/// multiple of this value is rejected. Keeping every import below the end of
+/// that representation prevents both outcomes. This is a transport bound, not
+/// a topology or driver-name policy; a RAMBlock is tiled by several zero-copy
+/// imports and every byte remains directly GPU-addressable.
+const HOST_POINTER_IMPORT_SIZE_END: u64 = u32::MAX as u64 + 1;
+
+/// Intersect every limit that applies to one imported buffer and round the
 /// result down to the device's import granularity.
 fn import_span_max_from_limits(
     max_allocation: u64,
     max_buffer: Option<u64>,
     min_alignment: u64,
 ) -> u64 {
-    max_allocation.min(max_buffer.unwrap_or(u64::MAX)) & !(min_alignment - 1)
+    let representation_max = HOST_POINTER_IMPORT_SIZE_END.saturating_sub(min_alignment);
+    max_allocation
+        .min(max_buffer.unwrap_or(u64::MAX))
+        .min(representation_max)
+        & !(min_alignment - 1)
 }
 
 /// Resolve host-pointer importability against one physical device.
@@ -509,23 +525,24 @@ mod tests {
         }
     }
 
-    /// The span is the intersection of limits the API reports, not a guessed
-    /// size that happens to avoid one implementation defect. A capable device
-    /// may therefore admit a single allocation larger than 2 GiB.
+    /// API limits and the measured host-pointer size representation jointly
+    /// bound an import. The representation bound is one aligned granule below
+    /// `2^32`: the exact endpoint is the rejected/wrapped value, while every
+    /// chunk below it remains a direct import rather than a copied fallback.
     #[test]
-    fn the_single_import_limit_is_derived_only_from_reported_limits() {
+    fn the_single_import_limit_intersects_api_and_transport_bounds() {
         const GIB: u64 = 1 << 30;
         assert_eq!(
             import_span_max_from_limits(12 * GIB, Some(6 * GIB), 0x1000),
-            6 * GIB
+            4 * GIB - 0x1000
         );
         assert_eq!(
-            import_span_max_from_limits(12 * GIB, None, 0x1000),
-            12 * GIB
+            import_span_max_from_limits(2 * GIB, Some(6 * GIB), 0x1000),
+            2 * GIB
         );
         assert_eq!(
-            import_span_max_from_limits(16 * GIB + 0x7ff, None, 0x1000),
-            16 * GIB
+            import_span_max_from_limits(12 * GIB, None, 0x4000),
+            4 * GIB - 0x4000
         );
     }
 

@@ -475,29 +475,33 @@ fn reflected_sampled_binding_collision(
     vertex: &reims_vgpu_core::ShaderInterface,
     fragment: &reims_vgpu_core::ShaderInterface,
 ) -> bool {
+    #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+    enum SampledClass {
+        Texture,
+        Sampler,
+    }
+
+    let sampled_key = |binding: &reims_vgpu_core::ShaderResourceBinding| match binding.kind {
+        reims_vgpu_core::ShaderResourceKind::Texture
+        | reims_vgpu_core::ShaderResourceKind::TextureArray => {
+            Some((SampledClass::Texture, binding.metal_index))
+        }
+        reims_vgpu_core::ShaderResourceKind::Sampler
+        | reims_vgpu_core::ShaderResourceKind::StaticSampler => {
+            Some((SampledClass::Sampler, binding.metal_index))
+        }
+        _ => None,
+    };
     let vertex_bindings = vertex
         .bindings
         .iter()
-        .filter(|binding| {
-            matches!(
-                binding.kind,
-                reims_vgpu_core::ShaderResourceKind::Texture
-                    | reims_vgpu_core::ShaderResourceKind::TextureArray
-            )
-        })
-        .map(|binding| binding.metal_index)
+        .filter_map(sampled_key)
         .collect::<std::collections::BTreeSet<_>>();
     fragment
         .bindings
         .iter()
-        .filter(|binding| {
-            matches!(
-                binding.kind,
-                reims_vgpu_core::ShaderResourceKind::Texture
-                    | reims_vgpu_core::ShaderResourceKind::TextureArray
-            )
-        })
-        .any(|binding| vertex_bindings.contains(&binding.metal_index))
+        .filter_map(sampled_key)
+        .any(|binding| vertex_bindings.contains(&binding))
 }
 
 /// Decode the depth-stencil descriptor a draw bound, on the Linux path

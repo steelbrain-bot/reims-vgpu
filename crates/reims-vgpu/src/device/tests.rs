@@ -92,6 +92,101 @@ fn drain_without_ops_is_ok() {
     assert!(device_destroy(id));
 }
 
+/// The device drain owns one backend transaction, including work performed
+/// after the FIFO body. A session scope around `Device::drain` alone ends too
+/// early: the submission-tail flush then runs against another device's/default
+/// backend state and the window cannot see the resident just rendered.
+#[test]
+fn drain_tail_remains_in_the_device_executor_session() {
+    use crate::runtime::executor::*;
+    use reims_vgpu_core::{
+        CapabilityService, ComputeResidencyService, ExecutionPort, GuestWriteService,
+        PresentationService, ReadbackService, ResidentService,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    #[derive(Debug)]
+    struct ScopeGuard(Arc<AtomicUsize>);
+
+    impl Drop for ScopeGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    #[derive(Debug)]
+    struct ScopeProbe {
+        depth: Arc<AtomicUsize>,
+        tail_was_scoped: AtomicBool,
+    }
+
+    impl ExecutionPort for ScopeProbe {
+        type Submission = ResolvedSubmission;
+        type Completion = ExecutionCompletion;
+        type Error = DrawError;
+
+        fn execute(&self, _submission: Self::Submission) -> Result<Self::Completion, Self::Error> {
+            unreachable!("an empty drain executes no command buffer")
+        }
+    }
+    impl ResidentService for ScopeProbe {}
+    impl GuestWriteService for ScopeProbe {}
+    impl ComputeResidencyService for ScopeProbe {}
+    impl CapabilityService for ScopeProbe {}
+    impl PresentationService for ScopeProbe {}
+    impl ReadbackService for ScopeProbe {
+        type Error = DrawError;
+
+        fn read_target(
+            &self,
+            _identity: &crate::model::TargetIdentity,
+        ) -> Result<reims_vgpu_core::TargetReadback, Self::Error> {
+            unreachable!("an empty drain reads no target")
+        }
+    }
+    impl GuestPageTransferService for ScopeProbe {}
+    impl CompletionService for ScopeProbe {}
+    impl SubmissionBatchService for ScopeProbe {
+        fn flush_submission_tail(&self) {
+            self.tail_was_scoped
+                .store(self.depth.load(Ordering::Acquire) != 0, Ordering::Release);
+        }
+    }
+    impl GuestImportService for ScopeProbe {}
+    impl MaintenanceService for ScopeProbe {}
+    impl SessionService for ScopeProbe {
+        fn enter(&self) -> ExecutionScope {
+            self.depth.fetch_add(1, Ordering::AcqRel);
+            ExecutionScope::test(ScopeGuard(Arc::clone(&self.depth)))
+        }
+    }
+    impl ObservationService for ScopeProbe {}
+    impl ShaderTranslationService for ScopeProbe {}
+    impl RenderBufferPlanningService for ScopeProbe {}
+    impl WindowPresentationService for ScopeProbe {}
+    impl Executor for ScopeProbe {}
+
+    let probe = Arc::new(ScopeProbe {
+        depth: Arc::new(AtomicUsize::new(0)),
+        tail_was_scoped: AtomicBool::new(false),
+    });
+    let id = device_create(Some(ReimsVgpuHostOps::null()), PAGE_SHIFT_ARM64E).expect("create");
+    let slot = device_slot(id).expect("slot");
+    slot.inner.lock().device.executor = probe.clone();
+
+    assert!(device_drain(id));
+    assert!(
+        probe.tail_was_scoped.load(Ordering::Acquire),
+        "the submission tail must observe the same session as the drained work"
+    );
+    assert_eq!(
+        probe.depth.load(Ordering::Acquire),
+        0,
+        "the complete drain transaction releases its session before returning"
+    );
+    assert!(device_destroy(id));
+}
+
 #[cfg(all(feature = "host-window", target_os = "macos"))]
 #[test]
 fn window_publish_key_advances_for_in_place_present() {

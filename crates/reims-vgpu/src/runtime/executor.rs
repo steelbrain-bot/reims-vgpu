@@ -77,11 +77,25 @@ pub(crate) fn mark_drain_thread() {
 /// Dynamic executor-session scope for one device operation.
 pub struct ExecutionScope {
     _engine: Option<reims_vgpu_vulkan::engine::SessionScope>,
+    #[cfg(test)]
+    _test: Option<Box<dyn std::any::Any>>,
 }
 
 impl ExecutionScope {
     fn none() -> Self {
-        Self { _engine: None }
+        Self {
+            _engine: None,
+            #[cfg(test)]
+            _test: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test(guard: impl std::any::Any) -> Self {
+        Self {
+            _engine: None,
+            _test: Some(Box::new(guard)),
+        }
     }
 }
 
@@ -1145,6 +1159,8 @@ impl SessionService for VulkanExecutor {
     fn enter(&self) -> ExecutionScope {
         ExecutionScope {
             _engine: Some(reims_vgpu_vulkan::engine::enter_session(&self.session)),
+            #[cfg(test)]
+            _test: None,
         }
     }
 }
