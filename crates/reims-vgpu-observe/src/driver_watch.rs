@@ -21,7 +21,7 @@
 //! # Why the tick comes from the poll
 //!
 //! The reporter cannot be the thread that is stuck, so it is
-//! [`crate::device::device_poll`] — QEMU's display-timer callback, which runs on
+//! `reims-vgpu::device::device_poll` — QEMU's display-timer callback, which runs on
 //! a different thread and, on the contended path, takes no lock at all. That is
 //! the same property `vbl_contended_pulse` relies on to keep the guest's time
 //! base alive while the drain is busy, and it is what makes this report arrive
@@ -37,7 +37,7 @@
 //!
 //! # What arms it
 //!
-//! [`crate::backend::vulkan::engine::driver_breadcrumb::DriverBreadcrumb`], which
+//! `reims-vgpu-vulkan::engine::driver_breadcrumb::DriverBreadcrumb`, which
 //! already brackets exactly the calls that can end or hang the process. It
 //! writes the module to disk for the crash case; this watches the clock for the
 //! hang case. One arming, two failure modes.
@@ -131,7 +131,7 @@ pub fn leave() {
 /// What the device is inside right now, if anything.
 ///
 /// The read side of the slot. The arming is one line inside
-/// [`crate::backend::vulkan::engine::driver_breadcrumb::DriverBreadcrumb::arm`]
+/// `reims-vgpu-vulkan::engine::driver_breadcrumb::DriverBreadcrumb::arm`
 /// and nothing else observes it, so without this the coupling between the two
 /// modules has no test — and a lost arming is invisible exactly the way the
 /// wedge it reports is.

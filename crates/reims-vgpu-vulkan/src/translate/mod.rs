@@ -10,7 +10,7 @@
 //! fold appeared at twelve independent sites, none referencing a shared rule
 //! and none recording that a choice had been made at all.
 //!
-//! [`super::caps`] already proved the fix for *device capability* — one module
+//! [`crate::capabilities`] already proved the fix for *device capability* — one module
 //! classifies, everything else consumes, a source gate stops erosion. This is
 //! the same shape for *format and pipeline state*.
 //!
@@ -45,7 +45,7 @@
 //! * Keep every co-varying property (byte size, texel size, aspect) in the same
 //!   table as the format it belongs to.
 //! * Never gate on a driver name, a vendor id, or an API version — that is
-//!   [`super::caps`]'s job and it has its own rules.
+//!   [`crate::capabilities`]'s job and it has its own rules.
 
 pub mod blend;
 pub mod pixel;

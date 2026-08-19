@@ -98,7 +98,7 @@ pub(crate) const DESC_BLOCK_MAX_SETS: u32 =
 /// One render set merges both stages: `exec` builds a single binding list from
 /// `req.storage_buffers`, `req.sampled_images` and `req.samplers`, and each
 /// stage binds at most that class's own bound of each. So the worst case is two
-/// stages' worth of [`crate::runtime::draw::MAX_ANY_BIND_SLOTS`], the widest of
+/// stages' worth of [`reims_vgpu_core::MAX_ANY_BIND_SLOTS`], the widest of
 /// the three, since a descriptor type is served by exactly one class and this
 /// budget is per type. The compute path is single-stage and its three slot caps
 /// are all at or below these, so it stays under this.

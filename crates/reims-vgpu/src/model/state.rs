@@ -2158,7 +2158,7 @@ mod present_backpressure_state_tests {
 ///
 /// Distinct from a mapping's contiguous page-plan materialization (iosfc
 /// `mapping_id` page list).
-/// Created on demand via [`crate::runtime::gva_view::ensure_gva_view`]; torn
+/// Created on demand by the GVA-view resolver; torn
 /// down on overlapping UnmapMemory / MapMemory2 / delete_task so we never keep
 /// a host alias after the guest drops the GPU page-table mapping (Apple
 /// `unmapMemory` analogue). Does **not** own discrete encode content
@@ -4360,7 +4360,7 @@ impl DeviceState {
     }
 
     /// Advance the per-present epoch counter and return the new value. Call
-    /// EXACTLY ONCE per present cycle (see [`PresentState::present_epoch`]).
+    /// exactly once per present cycle.
     pub fn advance_present_epoch(&mut self) -> u64 {
         self.presentation.present.advance_present_epoch()
     }

@@ -130,7 +130,7 @@ impl ResourcePools {
     /// The bindable range `guest_ref` names, importing its RAMBlock if this is
     /// the first reference into it.
     ///
-    /// Unlike [`Self::import_guest_window`] there is nothing to displace: an
+    /// Unlike a per-window import there is nothing to displace: an
     /// import is per RAMBlock and lives as long as the device, so no caller can
     /// find the buffer it just bound freed underneath a submission in flight.
     ///

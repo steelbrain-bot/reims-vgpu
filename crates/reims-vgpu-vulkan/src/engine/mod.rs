@@ -976,7 +976,7 @@ mod device_capability_snapshot_tests {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EngineLockSite {
     /// The drain worker executing guest commands. Recognised by the thread
-    /// having entered [`crate::qemu::abi::reims_vgpu_qemu_device_drain`] at
+    /// having entered `reims-vgpu::qemu::abi::reims_vgpu_qemu_device_drain` at
     /// least once, which is a property no other thread has.
     Worker,
     /// Every other entry point QEMU reaches: a vCPU inside an MMIO store, the
@@ -1556,7 +1556,7 @@ mod end_of_tranche_gate_tests {
 /// entirely — a glyph atlas, a small linear texture, a uniform staging window —
 /// so the wait they take is for a write that will never touch a byte they read.
 /// A driven Safari-drag boot spent **11.5 s** in one such reader
-/// ([`crate::runtime::render_writeback::SettleSite::LinearMemoRead`]) alone.
+/// (`reims-vgpu::runtime::render_writeback::SettleSite::LinearMemoRead`) alone.
 ///
 /// This names the pages so a disjoint reader can be let through. The currency is
 /// the guest page address, because it is the only one the two sides share: the
@@ -1565,12 +1565,12 @@ mod end_of_tranche_gate_tests {
 /// [`GuestPageTarget::runs`] carries neither — a [`GuestRef`] deliberately does
 /// not expose an absolute position.
 ///
-/// [`GuestRef`]: crate::runtime::guest_ram_map::GuestRef
+/// [`GuestRef`]: reims-vgpu::runtime::guest_ram_map::GuestRef
 ///
 /// # How many writebacks are named, and what happens past that
 ///
 /// One destination's page list per armed-and-unsettled writeback, up to
-/// [`RING_DEPTH`] of them. The bound is the submission ring's, because that is
+/// `pools::RING_DEPTH` of them. The bound is the submission ring's, because that is
 /// what bounds writebacks in flight: a ninth submission blocks in `begin_entry`
 /// on the oldest fence rather than being recorded.
 ///
@@ -1613,7 +1613,7 @@ struct GuestWriteFootprint {
     ///
     /// Kept as separate lists rather than merged into one, so a settle could
     /// retire them individually later without re-deriving which page belonged to
-    /// which copy. Never longer than [`RING_DEPTH`]; past that, an arm folds
+    /// which copy. Never longer than `pools::RING_DEPTH`; past that, an arm folds
     /// into entry zero, which gives up exactly that future retirement and
     /// nothing else.
     ///
@@ -2476,7 +2476,7 @@ pub fn note_resident_content_copied_out(identity: &TargetIdentity) -> bool {
 ///
 /// Anything wider is a real question and is asked of the device:
 /// [`crate::device_features::DeviceFeatures::color_attachment_blend`]
-/// holds one probe per [`TexelLayout`] for `COLOR_ATTACHMENT` *and*
+/// holds one probe per [`reims_vgpu_protocol::TexelLayout`] for `COLOR_ATTACHMENT` *and*
 /// `COLOR_ATTACHMENT_BLEND` under optimal tiling. No device yet resolved
 /// answers `false`, which narrows to the format the target would have had
 /// anyway — an override or an unresolved device may never widen what the
@@ -4598,7 +4598,7 @@ const RESIDENT_READ_BYTES_PER_TEXEL: u32 = 4;
 ///
 /// The fallback is unreachable for a real resident (an image exists only at a
 /// format these tables know) and is the four this code used to assume rather
-/// than a panic, on the same grounds as [`GuestPageTarget::bytes_per_texel`].
+/// than a panic, on the same grounds as the semantic guest-page format width.
 fn readback_bytes_per_texel(format: ash::vk::Format) -> u32 {
     crate::translate::pixel::bytes_per_texel(format).unwrap_or(RESIDENT_READ_BYTES_PER_TEXEL)
 }
@@ -4741,7 +4741,7 @@ impl ResidentReadSnapshot {
     /// `REIMS_VGPU_GUEST_IMPORT=off`, against a correct one on the GPU-direct
     /// rail that never asks this question.
     ///
-    /// [`translate::pixel::has_bgra_order`] is the crate's name for the
+    /// [`crate::translate::pixel::has_bgra_order`] is the crate's name for the
     /// question, is what [`TargetIdentity::is_bgra`] already asks, and states
     /// the rule in its own doc: the transfer function is irrelevant because
     /// UNORM and sRGB views interpret the same four stored bytes.

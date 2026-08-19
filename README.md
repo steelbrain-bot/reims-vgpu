@@ -31,8 +31,8 @@ translation, and making more host/guest combinations reliable.
 
 ## Supported pathways
 
-`crates/reims-vgpu` targets the following host/guest/backend combinations. Agents pick the pathway
-their unit of work is on.
+The project targets the following host/guest/backend combinations. Agents pick the pathway their
+unit of work is on.
 
 | Pathway | Host | Guest | Device attach | Backend | Boot |
 |---|---|---|---|---|---|
@@ -42,8 +42,15 @@ their unit of work is on.
 - QEMU device shims: `vendor/qemu` tracks
   [`steelbrain/qemu-reims-vgpu@host-reims-vgpu-vmapple`](https://github.com/steelbrain/qemu-reims-vgpu/tree/host-reims-vgpu-vmapple)
   (thin C — QOM/MMIO/IRQ/console/HostOps only)
-- Product logic: `crates/reims-vgpu` (decode + device model + Vulkan backend)
-- Wire layouts: `crates/reims-vgpu-wire` (derived serializer views/parsers; decode uses these as the layout authority for covered records)
+- Composition/staticlib: `crates/reims-vgpu` (decode orchestration, device scheduling, QEMU ABI,
+  and core-to-executor adapters)
+- Semantic model: `crates/reims-vgpu-protocol` + `crates/reims-vgpu-core` (typed contract,
+  generational resources, lifecycle/content authority, and immutable execution commands)
+- Guest memory: `crates/reims-vgpu-paging` + `crates/reims-vgpu-memory`
+- Vulkan executor: `crates/reims-vgpu-vulkan` (capabilities, topology policy, GPU sessions and
+  execution)
+- Wire layouts: `crates/reims-vgpu-wire` (derived serializer views/parsers; decode uses these as
+  the layout authority for covered records)
 - Vulkan translator dependency: public `steelbrain/metal2vulkan` Git crate. On macOS, the Vulkan
   host backend runs through MoltenVK.
 - VM lifecycle: `vm/` (snapshot-revert; arm and x86 guest boot scripts)
@@ -61,7 +68,7 @@ macOS 13 Ventura is the recommended guest release for bring-up.
    backend, and build deps for the in-tree QEMU (`scripts/qemu-build/qemu-build.sh --target x86_64`).
 
 2. **Generate OpenCore, OVMF, and a guest disk with [OSX-KVM](https://github.com/kholia/OSX-KVM).**
-   **macOS 13 is recommended**.Follow that project’s docs to fetch recovery media, build OpenCore,
+   **macOS 13 is recommended**. Follow that project’s docs to fetch recovery media, build OpenCore,
    and install macOS under QEMU+KVM. The point of this step is only to produce a
    **working, post-Setup-Assistant guest** plus the usual OpenCore/OVMF pieces — not to stay on
    OSX-KVM’s long-term launcher.
@@ -158,31 +165,35 @@ Arm bring-up is **in-tree**: Virtualization.framework via Homebrew **`macosvm`**
 - Say which rail a result came from. A number from `macos-11` and a number from `macos-26` are two
   measurements, not one — that separation is the whole reason snapshots are per-rail.
 - Never commit disks, IPSWs, or OpenCore/OVMF runtime under `vm/`.
-- Device/backend work lives in `crates/reims-vgpu` + the thin shims in `vendor/qemu`; rebuild QEMU after
-  product changes before claiming a live boot result.
+- Device work follows the ownership map in [`docs/architecture.md`](docs/architecture.md); the
+  shipping staticlib is `crates/reims-vgpu` and the shims remain thin under `vendor/qemu`. Rebuild
+  QEMU after product changes before claiming a live boot result.
 
 ### Environment overrides
 
 Set on the boot command; every one is optional and every default is "let the device decide". The
-full list, with the parse, is `crates/reims-vgpu/src/env.rs`. Each accepts `1`/`on`/`true`/`yes` and
-`0`/`off`/`false`/`no`, case-insensitively.
+full list and parser live in `crates/reims-vgpu-config`; `crates/reims-vgpu/src/env.rs` is a
+compatibility re-export. Boolean switches accept the documented on/off spellings; numeric and mode
+controls document their own domains beside their definitions.
 
 | Variable | Effect |
 |---|---|
-| `REIMS_VGPU_DMABUF=off` | Stop reaching guest pages through a dma-buf, even where the host can. Every guest-memory rail takes the copying path instead — which is what runs on any host without `VK_EXT_external_memory_dma_buf`, so this is how that half is exercised on a machine that has it. |
+| `REIMS_VGPU_GUEST_IMPORT=off` | Disable `VK_EXT_external_memory_host` guest-RAM imports and exercise the copying rails used when host-pointer import is unavailable. |
 | `REIMS_VGPU_DRAW_LOG=on` | Verbose per-draw detail on top of the always-on failure log. |
 
 An override can only **narrow** what the device does. There is no way to switch a rail *on* that the
 host reported it cannot run: capability is measured from the device at startup, and asking a driver
-for an extension it does not advertise fails device creation rather than degrading. `REIMS_VGPU_DMABUF`
-has no on direction for that reason — on a host without the extension it is already off, and the
-`vk_caps` line in `/tmp/reims-vgpu-fail.log` names which check said so.
+for an extension it does not advertise fails device creation rather than degrading. On a host
+without host-pointer import the copying rail is already selected, and the `vk_caps` line in
+`/tmp/reims-vgpu-fail.log` names which check said so.
 
 ## Repo layout
 
 ```text
-AGENTS.md           - repo operating guide for agents
-crates/             - Rust crates (`reims-vgpu`, `reims-vgpu-wire`, `reims-vgpu-efi`)
+AGENTS.md           - concise operating constraints for agents
+docs/architecture.md - crate ownership, semantic seam, and regression gates
+crates/             - wire, protocol, paging/memory, semantic core, Vulkan executor, composition,
+                      support crates, and the separate UEFI option ROM
 scripts/            - host setup, VM lifecycle, screenshot, and diagnostic helpers
 vendor/             - vendored QEMU submodule and patch record
 vm/                 - VM launch/configuration glue; images are private/untracked
@@ -190,12 +201,13 @@ vm/                 - VM launch/configuration glue; images are private/untracked
 
 `crates/reims-vgpu-wire` holds zero-copy views and parsers for the Apple
 paravirtualized GPU serializer format, derived from Apple's own encoder rather
-than inferred from captures. `crates/reims-vgpu`'s `runtime::decode` uses those
-exports for opcodes, record framing, and field layouts on wire-covered
-families (encoder blit/compute/render binds and state, and the create records
-above); decode remains the mapping layer into the device's `Command` / `Kind`
-model and decline naming. Gaps without a wire export (FIFO, event opcodes,
-unobserved compute residency, pipeline TLV) stay local to decode.
+than inferred from captures. `crates/reims-vgpu`'s `runtime::decode` maps those
+views once into semantic values owned by `reims-vgpu-protocol` and
+`reims-vgpu-core`. Resolved commands then cross the executor boundary without
+raw object tags, unresolved task-local references, or Vulkan-native payloads.
+See [`docs/architecture.md`](docs/architecture.md) for the maintained ownership
+map and the invariants that keep memory-topology optimization separate from
+resource lifetime and guest-visible behavior.
 
 
 ## License

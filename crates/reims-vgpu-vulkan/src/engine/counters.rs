@@ -2,7 +2,7 @@
 //!
 //! # The vocabulary is declared once
 //!
-//! [`engine_counters!`] takes the counter names and generates the six things
+//! `engine_counters!` takes the counter names and generates the six things
 //! that used to spell them out separately: the atomic [`EngineCounters`], the
 //! plain-`u64` [`CounterSnapshot`], and the four whole-vocabulary walks
 //! [`EngineCounters::snapshot`], [`EngineCounters::reset`],
@@ -206,7 +206,7 @@ engine_counters! {
         allocs,
         shader_hits,
         shader_misses,
-        /// SPIR-V words walked by [`super::caches::Caches::get_or_create_shader`]
+        /// SPIR-V words walked by the shader cache's create-or-lookup transition
         /// before it can look anything up, summed over every call including the
         /// hits.
         ///

@@ -6,7 +6,7 @@
 ///
 /// The guest driver answers `-[MTLDevice supportsPrimitiveType:]` by testing
 /// bit `type` of the device-info value for
-/// [`crate::model::DEVICE_INFO_KEY_PRIMITIVE_TYPE_MASK`], for any `type <= 8`,
+/// `reims-vgpu::model::DEVICE_INFO_KEY_PRIMITIVE_TYPE_MASK`, for any `type <= 8`,
 /// and falls back to `type < 5` when the key is absent. So the number this
 /// device publishes decides which primitive types the guest is permitted to
 /// build a draw out of — and a bit set for a type the backend cannot translate is a
@@ -17,7 +17,7 @@
 /// refuses those as `UnknownPrimitiveType`, so every one of those bits was a
 /// promise this device cannot keep.
 /// Narrowing to what it can execute is the rule
-/// [`crate::model::device_info_caps`] already applies to the GPU-dependent keys:
+/// `reims-vgpu::model::device_info_caps` already applies to the GPU-dependent keys:
 /// answering higher than the host can execute does not degrade gracefully.
 ///
 /// Widening it again needs the *meaning* of 5..=8 first. They are not in the
@@ -36,7 +36,7 @@ pub const fn primitive_type_executable(mtl: u32) -> bool {
 /// What a `drawPrimitives` / `drawIndexedPrimitives` record asks for, as one
 /// value.
 ///
-/// Its own type for the same reason [`super::extent::Extent3`] is: the hazard is
+/// Its own type for the same reason `reims-vgpu-protocol::Extent3` is: the hazard is
 /// at the call boundary, not at construction. These five were decoded into a
 /// struct and then destructured back into five loose positional `u32`s. All 120
 /// permutations compiled, so the typed value now crosses the whole boundary.
@@ -72,7 +72,7 @@ pub struct DrawArgs {
 /// ```
 ///
 /// `baseVertex` is the one signed field, for the same reason
-/// [`crate::runtime::draw::IndexedDrawInfo::base_vertex`] is: read as
+/// `reims-vgpu::runtime::draw::IndexedDrawInfo::base_vertex` is: read as
 /// unsigned, a negative one becomes a huge index rather than an error.
 ///
 /// Nothing here is a `#[repr(C)]` view over guest bytes — the block is loaded

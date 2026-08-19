@@ -16,7 +16,7 @@
 //! while the expensive ones are barely touched — which reads exactly like "the
 //! expensive part is the whole cost", the conclusion a split exists to test.
 //!
-//! [`crate::runtime::bind_phase`] shows the shape directly. Its `attrs_us`
+//! `reims-vgpu::runtime::bind_phase` shows the shape directly. Its `attrs_us`
 //! column read `0`, `3`, `23`, `10`, `0`, `0` on consecutive driven windows
 //! against a `vertex_us` in the thousands: a column reporting the fraction of
 //! attribute walks that happened to cross a microsecond boundary, not what the

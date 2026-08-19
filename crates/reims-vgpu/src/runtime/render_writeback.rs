@@ -255,7 +255,7 @@
 //! ## The two gates a compute scatter needs, both already open
 //!
 //! * The imported guest buffer must be bindable as a storage buffer. It already
-//!   is: `caps::host_pointer::GUEST_IMPORT_USAGE` includes `STORAGE_BUFFER`, and
+//!   is: `reims-vgpu-vulkan::host_pointer::GUEST_IMPORT_USAGE` includes `STORAGE_BUFFER`, and
 //!   that is the exact usage set the capability query asks the driver about — so
 //!   a host that admits the import admits this.
 //! * The offsets must be addressable in 4-byte units. Run offsets and lengths are

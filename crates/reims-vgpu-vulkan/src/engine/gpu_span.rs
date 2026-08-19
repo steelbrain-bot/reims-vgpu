@@ -118,7 +118,7 @@
 //! **A draw submission is 96.9 % of this device's GPU time**, and the guest-page
 //! writeback — the rail several sessions treated as the largest GPU cost — is
 //! 3.6 %. That is not a refutation of those sessions: it is what
-//! [`crate::runtime::writeback_debt`] *did*, by eliding 90 % of IOSurface texture Stores.
+//! `reims-vgpu::runtime::writeback_debt` *did*, by eliding 90 % of IOSurface texture Stores.
 //! The remaining Store submissions are 72 a second against 1 961 draw ones.
 //!
 //! `readback` and `compute` at exactly zero are healthy zeros on this workload,

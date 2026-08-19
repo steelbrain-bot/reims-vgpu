@@ -1,5 +1,8 @@
 # Reims vGPU Architecture Refactor Plan
 
+This is the completed implementation record. The concise, maintained ownership contract and
+regression gates now live in [`docs/architecture.md`](../docs/architecture.md).
+
 Status: implementation complete for the established contract; grounded against paired mapper
 producer/consumer analysis, controlled serializer oracles, and a driven arm64 boot. Mapper
 descriptor composition, identity width, ordinary ownership, rollback, and pathway differences are

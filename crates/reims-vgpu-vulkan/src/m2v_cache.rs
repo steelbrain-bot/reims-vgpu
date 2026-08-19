@@ -110,7 +110,7 @@ impl M2vCacheDecline {
     /// just then" into "this shader never renders again", and because the cache
     /// is unbounded and nothing evicts, "again" means for the life of the
     /// process. It is the same rule
-    /// [`crate::backend::vulkan::engine::types::DrawError::out_of_memory`]
+    /// [`crate::engine::types::DrawError::out_of_memory`]
     /// states for the object caches.
     ///
     /// The translate declines are deliberately *not* here even though
@@ -333,7 +333,7 @@ pub struct ShaderVariant {
     ///
     /// Twelve interleaved driven macos-13 sustained-animation boots, two pinned
     /// binaries differing only by this and by
-    /// [`crate::runtime::pipeline_resolve::VertexBindPlan`], scored over the
+    /// [`reims_vgpu_core::VertexBindPlan`], scored over the
     /// fast population. Per draw, median over busy census windows, then mean and
     /// range across boots:
     ///

@@ -26,7 +26,7 @@
 //!   `VertexStepFunctionPerPatch`, `FormatNotVertexBuffer`. The guest asked for
 //!   something legal and lost the work. These are gaps, and the repair is to
 //!   build the path — never to stop advertising the capability, unless *no host*
-//!   could ever serve it. [`crate::model::DEVICE_INFO_KEY_FRAMEBUFFER_READ`]
+//!   could ever serve it. `reims-vgpu::model::DEVICE_INFO_KEY_FRAMEBUFFER_READ`
 //!   carries that rule and the pair of cases that establish it.
 //! - **The value is in contract, this backend has a path, and the path would
 //!   answer something else.** `VertexFormatWidenReadAsFour`,
@@ -176,7 +176,7 @@ pub enum TranslateReason {
     /// Its own slug because the repair is different. A firing of
     /// [`Self::VertexFormatWidenReadAsFour`] is this device correctly refusing
     /// something it cannot represent; a firing of this one means
-    /// [`crate::runtime::spirv_vertex_input`] met a module shape it does not
+    /// [`crate::spirv_vertex_input`] met a module shape it does not
     /// handle, and the repair is to teach it that shape.
     VertexFormatWidenShaderUnreadable(i32),
 }

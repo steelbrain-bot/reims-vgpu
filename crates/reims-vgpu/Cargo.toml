@@ -2,7 +2,7 @@
 name = "reims-vgpu"
 version = "0.1.0"
 edition = "2021"
-description = "Reims vGPU host path: protocol, device, QEMU C ABI, and Vulkan backend"
+description = "Reims vGPU composition staticlib: device orchestration, QEMU C ABI, and executor adapters"
 license = "GPL-2.0-or-later"
 
 [lints.rust]
@@ -41,8 +41,8 @@ reims-vgpu-core = { path = "../reims-vgpu-core" }
 reims-vgpu-config = { path = "../reims-vgpu-config" }
 reims-vgpu-memory = { path = "../reims-vgpu-memory" }
 reims-vgpu-observe = { path = "../reims-vgpu-observe" }
-# Vulkan capability classification and topology policy. The execution engine
-# migrates behind this boundary incrementally.
+# Vulkan capability classification, topology policy, native execution, and
+# device-scoped GPU sessions.
 reims-vgpu-vulkan = { path = "../reims-vgpu-vulkan" }
 # Guest address resolution above the wire page-table format: span walks, GPA
 # run coalescing, window region planning. `no_std` + alloc, no host traits.

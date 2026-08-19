@@ -6,7 +6,7 @@
 //! Vulkan requires only a subset of formats to be usable as vertex attributes,
 //! and every three-component 8- and 16-bit format is outside it. A device that
 //! declines one is handed its mandatory four-component sibling instead, which
-//! [`crate::backend::vulkan::translate::support`] calls the widening fallback.
+//! [`crate::translate::support`] calls the widening fallback.
 //!
 //! That substitution is exact **only** for a shader that reads three components
 //! or fewer, and the difference is not in the bytes — it is in what Vulkan does
@@ -26,12 +26,12 @@
 //! is not what the engine is given: `DrawRequest` carries post-relocation SPIR-V
 //! and nothing else, on purpose. Walking the module also answers about the
 //! bytes that will actually be compiled rather than about a description of
-//! them, which is the same reason [`crate::runtime::spirv_bind`] rewrites
+//! them, which is the same reason this crate's `spirv_bind` module rewrites
 //! bindings by walking types instead of trusting the translator's numbering.
 //!
 //! # The walk
 //!
-//! Structural, in the shape of [`crate::runtime::spirv_bind::image_format`]:
+//! Structural, in the shape of `crate::spirv_bind::image_format`:
 //! collect `OpDecorate <id> Location <n>`, the `OpVariable`s in the `Input`
 //! storage class, the `OpTypePointer`s they point through, and the component
 //! count of every scalar and vector type; then join them.

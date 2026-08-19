@@ -1512,7 +1512,7 @@ impl WindowPresenter {
     /// Provide a host-visible LINEAR staging image at exactly `width`x`height`.
     ///
     /// A geometry change destroys the previous one, which is safe here because
-    /// [`Self::present`] retires the in-flight fence before reaching this point,
+    /// the presentation entry point retires the in-flight fence before reaching this point,
     /// so no queued blit still reads it.
     unsafe fn ensure_staging(
         &mut self,

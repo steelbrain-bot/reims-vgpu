@@ -19,7 +19,8 @@ builds. Steps:
 1. Populates the submodule if needed (`git submodule update --init vendor/qemu`).
 2. Resolves `--target` (or `QEMU_TARGET`).
 3. Builds `crates/reims-vgpu` as a staticlib and links it into the device shim:
-   - ash-based in-crate engine (native Vulkan on Linux, MoltenVK on macOS).
+   - the staticlib composes `reims-vgpu-core` with the `reims-vgpu-vulkan` executor (native Vulkan
+     on Linux, MoltenVK on macOS).
 4. **aarch64:** expects `CONFIG_VMAPPLE`, HVF/Cocoa configure, verifies `-M vmapple`.
 5. **x86_64:** `x86_64-softmmu`, HVF/Cocoa off; lists PCI/sysbus device help as applicable.
 

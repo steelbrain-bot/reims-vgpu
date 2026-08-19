@@ -1494,7 +1494,7 @@ impl ResourcePools {
     /// Contents are *not* preserved by this: the pass still CLEARs, and
     /// `DepthState::load` is still false. What became persistent is the
     /// allocation, not the pixels. See
-    /// [`crate::runtime::draw::vulkan::depth_chain_identity`] for why that
+    /// `reims-vgpu::runtime::draw::depth_chain_identity` for why that
     /// distinction is what lets the identity carry generation zero.
     // The arguments are the depth attachment's decoded geometry; a struct here
     // would only rename the same fields at every call site.

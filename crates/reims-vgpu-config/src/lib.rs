@@ -29,7 +29,7 @@
 /// Guest RAM reaches the GPU as a host-pointer import over whole RAMBlocks.
 /// Setting this off makes the device take the copying rails on a host that
 /// could have imported — see
-/// [`crate::backend::vulkan::caps::host_pointer`].
+/// `reims-vgpu-vulkan::host_pointer`.
 ///
 /// This is the switch that matters for verification. Where the import works
 /// every guest window takes it and the copying rails run zero times, so a green
@@ -141,7 +141,7 @@ pub const DRAW_LOG: &str = "REIMS_VGPU_DRAW_LOG";
 pub const GPU_STAMP: &str = "REIMS_VGPU_GPU_STAMP";
 
 /// Setting this off stops the two guest-page write guards —
-/// [`crate::runtime::node_guard`] and [`crate::runtime::released_pages`] — from
+/// `reims-vgpu::runtime::{node_guard,released_pages}` — from
 /// observing anything. They decide nothing, so this changes no guest-visible
 /// behavior; what it removes is the page-table descent and the page-list resolve
 /// that each map and unmap packet pays for them, on the drain thread, while it
@@ -157,7 +157,7 @@ pub const GPU_STAMP: &str = "REIMS_VGPU_GPU_STAMP";
 /// the drain thread is exactly the kind that could perturb its own subject.
 pub const PAGE_GUARDS: &str = "REIMS_VGPU_PAGE_GUARDS";
 
-/// Setting this **on** makes [`crate::runtime::range_coverage`] walk the guest's
+/// Setting this **on** makes `reims-vgpu::runtime::range_coverage` walk the guest's
 /// page table across every page of every map and unmap range. Default off, and
 /// it is the only variable here whose default is the quiet one.
 ///
@@ -247,7 +247,7 @@ pub const BATCH_DEPTH: &str = "REIMS_VGPU_BATCH_DEPTH";
 ///
 /// The wider arm — the default — binds a neutral page for such a bind instead of
 /// gathering the guest's, because
-/// [`crate::runtime::spirv_bind::ReflectedBufferAccess::Unused`] means no shader
+/// `reims-vgpu-core::ReflectedBufferAccess::Unused` means no shader
 /// invocation reads through the descriptor. The descriptor is still written, so
 /// the pipeline layout is byte-for-byte what it was; only the contents change,
 /// and only for binds nothing reads.
@@ -345,7 +345,7 @@ pub const STAMP_COALESCE: &str = "REIMS_VGPU_STAMP_COALESCE";
 /// fence the GPU takes longer to signal.
 ///
 /// That answers the question for this host class and it is written up where the
-/// rail is, in [`crate::runtime::render_writeback`]. The probe stays because the
+/// rail is, in `reims-vgpu::runtime::render_writeback`. The probe stays because the
 /// answer is a property of the **host**, not of this device: a discrete GPU
 /// crossing PCIe per region and a unified-memory host writing into the same
 /// physical pages have no reason to agree, and only one of the two has been
@@ -364,7 +364,7 @@ pub const SCATTER_SPLIT: &str = "REIMS_VGPU_SCATTER_SPLIT";
 /// and it stays the form for a run whose geometry the dispatch cannot express.
 ///
 /// It exists because it is the A/B. The region count is measured to be ~35 % of
-/// frame time (see [`crate::runtime::render_writeback`]), and the only way to
+/// frame time (see `reims-vgpu::runtime::render_writeback`), and the only way to
 /// hold that number against this repair on a given host is to run the host both
 /// ways in one binary.
 pub const COMPUTE_SCATTER: &str = "REIMS_VGPU_COMPUTE_SCATTER";
@@ -385,7 +385,7 @@ pub const COMPUTE_SCATTER: &str = "REIMS_VGPU_COMPUTE_SCATTER";
 pub const SLAB_RETAIN: &str = "REIMS_VGPU_SLAB_RETAIN";
 
 /// `on` audits **every** vouched gather bind instead of one in
-/// [`crate::runtime::gather_witness::AUDIT_STRIDE`].
+/// `reims-vgpu::runtime::gather_witness::AUDIT_STRIDE`.
 ///
 /// It narrows in the sense this module requires, and it is the only switch here
 /// that narrows by doing *more* work: the fold is a read of the window, and a
@@ -432,7 +432,7 @@ pub const CLEAR_SEED: &str = "REIMS_VGPU_CLEAR_SEED";
 ///
 /// It exists because the memo's correctness rests on a stated claim about what a
 /// guest does to a live pipeline object — see
-/// [`crate::runtime::pipeline_resolve`] — and a claim about a guest is worth a
+/// `reims-vgpu::runtime::pipeline_resolve` — and a claim about a guest is worth a
 /// binary that can be run both ways against that guest.
 pub const PIPELINE_MEMO: &str = "REIMS_VGPU_PIPELINE_MEMO";
 
@@ -492,7 +492,7 @@ pub const PIPELINE_MEMO: &str = "REIMS_VGPU_PIPELINE_MEMO";
 /// but it is 1.4x on the count, not 18x.
 ///
 /// **The per-dispatch cost, and the next reading is an instrument and not a
-/// guess.** [`crate::backend::vulkan::engine::gather_phase`] splits the 0.86 us
+/// guess.** `reims-vgpu-vulkan::engine::gather_phase` splits the 0.86 us
 /// four ways — the run-table planning, the shared staging arena, the descriptor
 /// set, and the command-buffer calls — because guessing which of them is the
 /// next 0.8 us is how a session spends a day on `vkCmdBindPipeline` and finds it
@@ -541,7 +541,7 @@ pub const PIPELINE_MEMO: &str = "REIMS_VGPU_PIPELINE_MEMO";
 ///
 /// **The GPU cost is now measured directly rather than inferred from a wall-clock
 /// wait.** Every reading above reaches for `slot_us`, which is the drain worker
-/// blocked on a ring fence. [`crate::backend::vulkan::engine::gpu_span`] times the
+/// blocked on a ring fence. `reims-vgpu-vulkan::engine::gpu_span` times the
 /// submission on the GPU's own clock instead. Driven macos-13 sustained boots,
 /// same pin, matched compositing regime, with the *planned* region count carried
 /// as the control so "byte-identical output" is checkable rather than asserted:
@@ -626,7 +626,7 @@ pub const COMPUTE_GATHER: &str = "REIMS_VGPU_COMPUTE_GATHER";
 /// pipeline flush point on some hardware, so an A/B that needs the absolute floor
 /// — anything ranking submission shape or ring depth — should take it out on both
 /// arms and say that it did. See
-/// [`crate::backend::vulkan::engine::gpu_span`] for what the pair measures and
+/// `reims-vgpu-vulkan::engine::gpu_span` for what the pair measures and
 /// the two caveats that belong to the reading rather than to the code.
 pub const GPU_SPANS: &str = "REIMS_VGPU_GPU_SPANS";
 
@@ -708,7 +708,7 @@ pub const LAYOUT_CHURN: &str = "REIMS_VGPU_LAYOUT_CHURN";
 /// # What it prices, and why nothing else can
 ///
 /// Every batched draw opens and closes its own render pass. `passmerge_*` /
-/// `passheld_*` (see [`crate::backend::vulkan::engine`]'s `PassObstacles`) say
+/// `passheld_*` (see `reims-vgpu-vulkan::engine`'s `PassObstacles`) say
 /// how many of them *could* share one: 82 % of draws, once the guest gathers
 /// they record between the draws are hoisted out of the way. Hoisting them
 /// needs a second command buffer per batch, which is a large change to the ring,
@@ -810,7 +810,7 @@ pub const PASS_CHURN: &str = "REIMS_VGPU_PASS_CHURN";
 ///
 /// # Why it is a probe and not the default
 ///
-/// The scope is not decorative. `super::backend::vulkan::engine::caches`'
+/// The scope is not decorative. `reims-vgpu-vulkan::engine::caches`'
 /// `external_dependencies` records that this pass once declared its external
 /// dependencies only for depth, and the colour attachment silently lost the
 /// implicit ones — three `SYNC-HAZARD` findings from the Khronos synchronization
@@ -944,7 +944,7 @@ pub const FULLSCREEN: &str = "REIMS_VGPU_FULLSCREEN";
 /// It is also the instrument that says *which* submission hung. At a cap of one
 /// the ring holds one draw per slot, so a fence that never signals names a
 /// single draw rather than up to thirty-two, and
-/// [`crate::runtime::gpu_hang_trail`]'s ring covers every submission still in
+/// `reims-vgpu-vulkan::gpu_hang_trail`'s ring covers every submission still in
 /// flight instead of the last half millisecond of a batch.
 pub const BATCH_DRAWS: &str = "REIMS_VGPU_BATCH_DRAWS";
 
@@ -1027,7 +1027,7 @@ const OFF_SPELLINGS: [&str; 4] = ["0", "off", "false", "no"];
 /// to quote it.
 ///
 /// Pure: it reads the environment and parses, and emits nothing. Deliberately —
-/// [`crate::observe`] itself reads a variable through here, so an emit on this
+/// `reims-vgpu-observe` itself reads a variable through here, so an emit on this
 /// path would recurse through the sink that is asking whether it is enabled.
 /// The caller emits, and it is better placed to: it knows which rail the answer
 /// gates and what the consequence of refusing is.

@@ -34,7 +34,7 @@ pub const MTL_FORMAT_R8_UNORM: u16 = reims_vgpu_protocol::metal_pixel::MTL_FORMA
 ///
 /// Declared for the same reason as [`MTL_FORMAT_RGBA16_UNORM`] below: its
 /// absence was a *decode* gap, not a rail gap. `bytes_per_pixel` answered `None`
-/// for it, and since [`crate::runtime::draw::effective_view_sample_format`] asks
+/// for it, and since `reims-vgpu::runtime::draw::effective_view_sample_format` asks
 /// that question about both the base and the view before anything else looks at
 /// the bind, every path refused it as `format_incompatible` — a slug that reads
 /// as "the guest asked for an illegal reinterpretation" when what happened is
@@ -92,7 +92,7 @@ pub const MTL_FORMAT_BGRA8_UNORM_SRGB: u16 =
 /// and `BGR10A2Unorm` consecutively from 90; this table carried the fourth of
 /// the five and none of the others, so a guest naming any of the rest was
 /// refused at the *width* gate — `bytes_per_pixel` answered `None`, and
-/// [`crate::runtime::draw::effective_view_sample_format`] asks that before
+/// `reims-vgpu::runtime::draw::effective_view_sample_format` asks that before
 /// anything else looks at the bind. The refusal reads as "the guest asked for an
 /// illegal reinterpretation" when what happened is that this crate had never
 /// heard of the format. That is the same gap [`MTL_FORMAT_R8_UINT`] records, one
@@ -554,7 +554,7 @@ pub fn depth_stencil_packing(format: u16) -> Option<DepthStencilPacking> {
 ///
 /// Three states, and exactly three: `MTLBlitOption`'s depth and stencil bits
 /// are mutually exclusive, and
-/// [`crate::runtime::decode::blit::parse_blit_options`] refuses the pair with
+/// `reims-vgpu::runtime::decode::blit::parse_blit_options` refuses the pair with
 /// `ConflictingAspects` rather than producing one.
 ///
 /// Lives here, below the decoder, because every consumer of the choice is a

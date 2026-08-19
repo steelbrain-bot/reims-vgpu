@@ -207,7 +207,7 @@ static LAST: OnceLock<Mutex<HashMap<(&'static str, u64), u64>>> = OnceLock::new(
 /// greenness rested on the alphabet. Moving a large test module changed the
 /// ordering and turned one such pair red.
 ///
-/// [`crate::observe::sink::FailCapture::start`] calls this, so any test that
+/// [`crate::sink::FailCapture::start`] calls this, so any test that
 /// captures the sink starts from an empty latch and is order-independent by
 /// construction. That is the whole cure: it is not possible to write the bug
 /// above in a capturing test, and no fixture needs a value chosen to dodge

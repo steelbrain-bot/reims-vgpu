@@ -230,7 +230,7 @@ pub use crate::format::{srgb_texel_layout, vk_image_format, vk_storage_image, vk
 
 /// The Vulkan format for bytes a CPU loader produced.
 ///
-/// The one crossing for the [`SampledSourceRequest::Bytes`-shaped rails][b], and
+/// The one crossing for the `SampledSourceRequest::Bytes`-shaped rails, and
 /// the reason [`SampledByteFormat`] carries the source format: a
 /// [`TexelLayout`] alone is linear by construction, so every CPU upload of an
 /// sRGB guest texture used to reach the sampler through a `_UNORM` view while
@@ -246,7 +246,6 @@ pub use crate::format::{srgb_texel_layout, vk_image_format, vk_storage_image, vk
 /// qualifier reached this far — and the linear spelling is bound, because the
 /// bytes are what they are.
 ///
-/// [b]: crate::runtime::draw::vulkan
 pub fn sampled_byte_image_format(format: SampledByteFormat) -> ImageFormat {
     let (image, downgrade) = format.image_format();
     if let Some(mtl) = downgrade {

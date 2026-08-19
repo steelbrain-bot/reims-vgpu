@@ -4,8 +4,8 @@
 //! This is the one place guest memory becomes something the engine can bind.
 //! Which *bytes* a draw reaches is decided before it gets here and is carried by
 //! a [`GuestRef`], whose bound cannot be skipped — see
-//! [`crate::runtime::guest_ram`] for why that is a type and not a review rule,
-//! and [`super::super::caps::host_pointer`] for the capability that gates the
+//! `reims-vgpu::runtime::guest_ram` for why that is a type and not a review rule,
+//! and [`crate::host_pointer`] for the capability that gates the
 //! whole rail.
 //!
 //! # One import per allocation identity
@@ -26,7 +26,7 @@
 //! specification says the pages were pinned while it lived. amdgpu and the
 //! NVIDIA driver call `get_user_pages` at import time in practice; that is an
 //! observation about two drivers rather than a contract. The honest statement is
-//! in [`crate::runtime::guest_ram`]'s module doc and is not repeated as a
+//! in `reims-vgpu::runtime::guest_ram`'s module doc and is not repeated as a
 //! guarantee here.
 
 use std::collections::HashMap;
@@ -119,7 +119,7 @@ pub enum HostRamDecline {
     /// `vkBindBufferMemory` failed after a successful import.
     BindBuffer { result: vk::Result },
     /// The reference did not survive its own bound. Carries the check that
-    /// refused, from [`crate::runtime::guest_ram`].
+    /// refused, from `reims-vgpu::runtime::guest_ram`.
     Bound { inner: GuestRamError },
 }
 

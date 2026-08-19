@@ -128,7 +128,7 @@ pub fn tight_image_bytes(width: u32, height: u32, bytes_per_pixel: usize) -> Opt
 /// widens its operands, which reads as safe and is — but only just: two `u32`s
 /// at their maximum multiply to a hair under `u64::MAX`, so **one more factor
 /// overflows**, and both a layer count and a bytes-per-texel are exactly that
-/// third factor. `backend::vulkan::engine::exec`'s `validate_v1` had both, where
+/// third factor. `reims-vgpu-vulkan::engine::exec`'s `validate_v1` had both, where
 /// an overflow panic would have aborted the process from inside the function
 /// whose whole job is to survive a malformed request.
 pub fn tight_layered_image_bytes(

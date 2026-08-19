@@ -762,7 +762,7 @@ pub const DISPLAY_DESC_HEIGHT_MM: u64 = 0x16;
 ///
 /// **No guest on this device reads this pair today**, and that is worth stating
 /// so nobody reads a fix into it: the capability arrives at protocol rung 0x2a
-/// and [`version_reply`] clamps down and never up, so a stock guest asking for 4
+/// and [`negotiate_protocol_version`] clamps down and never up, so a stock guest asking for 4
 /// gets 4 and stays below it. What writing them buys is that the field is not a
 /// zero waiting for the first guest that does negotiate higher — a 0 x 0 mm panel
 /// — and that this device publishes what the reference implementation publishes

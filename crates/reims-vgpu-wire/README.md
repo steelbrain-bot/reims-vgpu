@@ -159,7 +159,7 @@ Covered families used today:
 | `decode::render` | `ops::render`, `ops::render_pass`, `ops::tile` | `op` framing + draw/state parsers and views |
 | `decode::resource` | `ops::{sampler,depth_stencil,texture_view,icb,heap_texture,backed_texture,…}` | parsers for covered create records (sampler, depth/stencil, texture views, ICB, heap/buffer textures) |
 | `decode::stream` | `ops::segment`, `OP_HEADER_LEN` | segment header types and record framing constants |
-| `contract::gva` / page walk | `page_table` | GVA walk layout |
+| `reims-vgpu-paging` page walk | `page_table` | GVA walk layout |
 
 What stays local in decode (wire has no export):
 

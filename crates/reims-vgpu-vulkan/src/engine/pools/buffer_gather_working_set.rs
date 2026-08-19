@@ -24,7 +24,7 @@
 //!
 //! The `Arc<Vec<GuestWindowRun>>` behind the gather's [`super::super::types::GuestRunSource`],
 //! by address, paired with the window's byte length. That allocation is owned by
-//! [`crate::runtime::bound_buffers`], which resolves a bind once and holds it
+//! `reims-vgpu::runtime::bound_buffers`, which resolves a bind once and holds it
 //! until the guest moves an address — so the pointer is stable across
 //! submissions for exactly as long as the resolution it names is, which is the
 //! span a cache would have to survive. It is the same key the engine's
@@ -75,8 +75,8 @@
 //!
 //! Recurrence is about **keys**, not bytes: it says the same window comes back,
 //! not that its contents are unchanged. A sound hit needs the decoded resource
-//! generation plus [`crate::runtime::host_writes`] for aliasing device writes;
-//! [`crate::runtime::gather_witness`] owns that rule for sampled resources.
+//! generation plus the core page-exact host-write ledger for aliasing device writes;
+//! `reims-vgpu::runtime::gather_witness` owns that rule for sampled resources.
 
 use std::collections::HashMap;
 

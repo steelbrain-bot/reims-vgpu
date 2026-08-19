@@ -14,7 +14,7 @@
 //!
 //! | part | what it is | what would fix it |
 //! |---|---|---|
-//! | `acquire` | [`ResourcePools::acquire_staging`] | pool sizing; a miss creates a buffer and allocates memory |
+//! | `acquire` | `ResourcePools::acquire_staging` | pool sizing; a miss creates a buffer and allocates memory |
 //! | `bytes` | `write_staging` from a `BufferContent::Bytes` | **the second copy** — those bytes were already assembled out of guest RAM by `load_buffer_content`, which `bind_phase` charges separately |
 //! | `runs` | `write_staging_from_runs` | **taking the copy off the CPU** — it is one copy, but it is the CPU's; see below. Zero on a host that can import |
 //! | `gather` | `exec`'s `gather_guest_buffer_window` | nothing on the CPU side — this is what `runs` gave way to, and it plans a GPU copy rather than making one |

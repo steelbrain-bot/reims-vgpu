@@ -1,7 +1,7 @@
 # vm/ — macOS guests for the reims-vgpu pathways
 
-`crates/reims-vgpu` runs one Vulkan backend over two host/guest pathways. Pick the boot script for
-the guest architecture you are on.
+The `reims-vgpu` composition staticlib runs one semantic core and one Vulkan executor over two
+host/guest pathways. Pick the boot script for the guest architecture you are on.
 
 | Pathway | Script | Host accel | Backend | Typical device |
 |---|---|---|---|---|

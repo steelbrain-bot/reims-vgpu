@@ -807,7 +807,7 @@ impl PassEchoField {
 /// stencil — so a cached dynamic value is not safe across a pipeline change.
 ///
 /// **So a pipeline change clears the dynamic half.** That is the whole rule, it
-/// is one line in [`Self::bind_pipeline`], and it makes the question "which
+/// is one line in `ResourcePools::bind_graphics_pipeline`, and it makes the question "which
 /// states did which pipeline declare dynamic" one nobody has to answer.
 ///
 /// `cb` is carried for the reason [`PassEcho`] carries it: a command buffer
@@ -1000,7 +1000,7 @@ const _: () = assert!(
 );
 
 /// The hang trail keeps one outstanding-submission record per ring slot, and it
-/// arm too, where `backend::vulkan` does not exist. This is the only place both
+/// arm too, where no executor is available. This is the only place both
 /// constants are in scope, so the relation is asserted here. A trail too short
 /// would drop exactly the slot a wedge is on and report `outstanding` as if the
 /// ring were shallower than it is.
@@ -1586,7 +1586,7 @@ impl ResidentAccess {
     /// pass, so a draw sampling the image needs no barrier of its own.
     ///
     /// This is the sampled-image twin of
-    /// [`crate::engine::exec::pass_exit_needs_no_barrier`], and it is only ever
+    /// `crate::engine::exec::pass_exit_needs_no_barrier`, and it is only ever
     /// consulted once the layouts already match — it answers **visibility**, not
     /// placement. Both halves are required and the caller checks the other.
     ///
@@ -1595,7 +1595,7 @@ impl ResidentAccess {
     /// dependency is a memory dependency over its whole scope rather than over
     /// the attachment alone — which is what lets it cover an image that is not an
     /// attachment of this pass at all.
-    /// [`crate::engine::caches::external_dependencies`] names
+    /// `crate::engine::caches::external_dependencies` names
     /// `COLOR_ATTACHMENT_OUTPUT | TRANSFER` with the attachment writes and
     /// `TRANSFER_WRITE` in its source scope, and `VERTEX_SHADER |
     /// FRAGMENT_SHADER` with `SHADER_READ` in its destination scope.
@@ -2393,7 +2393,7 @@ fn slab_retain_enabled() -> bool {
 /// `None` is what stops the 100 ms drain interval from overriding the hot
 /// release path's own churn budget between two frames of a live animation. The
 /// pass has nothing to do in that case: the hot path already returns every block
-/// past [`slab::SLAB_KEEP_EMPTY`] as it empties, so an unsettled pass can only
+/// past `slab::SLAB_KEEP_EMPTY` as it empties, so an unsettled pass can only
 /// trim *below* a budget that was chosen to absorb exactly this churn.
 fn idle_slab_trim_keep(settled: bool) -> Option<usize> {
     if settled || !slab_retain_enabled() {
@@ -2552,7 +2552,7 @@ const STAGING_MISS_EMIT_EVERY: u64 = 512;
 /// boot) and it is flat.
 ///
 /// So 32 buys **17 % fewer guest bytes copied per draw**, 55 % fewer ring
-/// blocks, 12 % less blocking in [`Phase::Slot`] and 22 % less command
+/// blocks, 12 % less blocking in `draw_phase::Phase::Slot` and 22 % less command
 /// recording, and the device serves **10 % more guest draws** in the same forty
 /// seconds at three points lower duty (0.91 -> 0.88). The frame rate does not
 /// move, and saying it does would be reading noise: what moved is headroom.

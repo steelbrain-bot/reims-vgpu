@@ -26,7 +26,7 @@
 //!
 //! # Why this rail exists
 //!
-//! [`crate::runtime::render_writeback`]'s module doc carries the measurement and
+//! `reims-vgpu::runtime::render_writeback`'s module doc carries the measurement and
 //! the reasoning; the short form is that the guest backs a surface in 16 KiB
 //! physically-contiguous granules, so one 1080p writeback is ~507 runs and the
 //! `Linear` plan's scatter was one `VkBufferCopy` region each. Quadrupling the

@@ -97,7 +97,7 @@ pub enum MapRefusal {
     ///
     /// The backend publishes this budget as the roomiest heap an import can be
     /// *charged to* — the same population of memory types
-    /// `caps::memory_topology::select_memory_type` will choose from, since every
+    /// `reims-vgpu-vulkan`'s memory selector will choose from, since every
     /// import goes through it carrying one class's required flags. So a sum that
     /// passes here has a heap that each individual chunk fits, and the exact
     /// per-allocation check at the pick — which refuses rather than making a

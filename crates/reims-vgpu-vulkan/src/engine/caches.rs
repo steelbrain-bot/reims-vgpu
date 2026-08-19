@@ -309,7 +309,7 @@ impl PassKey {
 ///
 /// One function because four places name this: the subpass attachment reference,
 /// the `finalLayout`, the sampled descriptor
-/// ([`super::exec::PreparedSampled::descriptor_layout`]) and the registry record
+/// (`super::exec::PreparedSampled::descriptor_layout`) and the registry record
 /// the pass leaves behind. A descriptor naming a layout the attachment reference
 /// does not is undefined behaviour, and it is not an error anywhere.
 pub(crate) fn color_feedback_layout() -> vk::ImageLayout {
@@ -1026,7 +1026,7 @@ impl<K: Clone + Eq, V: Copy> ObjectVariantIndex<K, V> {
 /// `finalLayout`, the `initialLayout` a `LOAD` pass names, the subpass
 /// reference, the registry's record of where the pass left the image, the layout
 /// a sampled descriptor declares, and the comparisons
-/// [`super::exec::pass_exit_needs_no_barrier`] and
+/// `super::exec::pass_exit_needs_no_barrier` and
 /// [`super::pools::ResidentAccess::covered_by_pass_entry`] make. A `const` plus a
 /// switch read beside it would be that second spelling, and two of them
 /// disagreeing is a barrier naming an `oldLayout` the image is not in, which is
@@ -1094,7 +1094,7 @@ pub(crate) fn single_color_layout() -> bool {
 /// Every slot now exits at [`color0_pass_exit_layout`], so the nearest consumer
 /// is usually the next draw into the same target — which is why the attachment
 /// stages and accesses are in the destination scope, and why
-/// [`super::exec::pass_exit_needs_no_barrier`] may then drop that draw's own
+/// `super::exec::pass_exit_needs_no_barrier` may then drop that draw's own
 /// barrier entirely. `TRANSFER` and `FRAGMENT_SHADER` stay named because a
 /// readback, a present blit or a later sample can follow instead; each of those
 /// issues its own transition, and this is the scope that transition orders

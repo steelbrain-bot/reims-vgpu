@@ -667,7 +667,7 @@ impl SlabPool {
     ///
     /// `keep` is per size class, matching [`Self::empty_block_victims`].
     ///
-    /// [`release_range`] retains `SLAB_KEEP_EMPTY` empty blocks per class to
+    /// [`Self::release_range`] retains `SLAB_KEEP_EMPTY` empty blocks per class to
     /// absorb steady-state churn without re-paying a `vkAllocateMemory` on the
     /// reverse of a fullscreen toggle — but it only runs on an image *release*,
     /// so at settled idle (no releases) those empty blocks sit resident forever

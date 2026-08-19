@@ -39,7 +39,7 @@ pub const FENCE_TIMEOUT_NS: u64 = 5_000_000_000; // 5s
 
 /// `sizeof(VkPipelineCacheHeaderVersionOne)` (Vulkan spec §Pipeline Cache
 /// Header): u32 headerSize, u32 headerVersion, u32 vendorID, u32 deviceID,
-/// u8[16] pipelineCacheUUID — all integers little-endian.
+/// `u8[16]` pipelineCacheUUID — all integers little-endian.
 const PIPELINE_CACHE_HEADER_ONE_LEN: usize = 32;
 
 /// Largest warm-start blob worth handing the driver, and largest worth writing
@@ -486,7 +486,7 @@ pub(crate) struct DeviceContext {
     pub spirv_storage_extended_formats: bool,
     /// For each [`reims_vgpu_protocol::TexelLayout`], whether this
     /// host can sample its Vulkan format with linear filtering; gates the
-    /// native sampled rails (see [`DeviceFeatures::sampled_linear_filter`]).
+    /// native sampled rails (see `DeviceFeatures::sampled_linear_filter`).
     pub sampled_linear_filter: [bool; TexelLayout::ALL.len()],
     pub pipeline_cache: vk::PipelineCache,
     pub vertex_divisor: VertexDivisorCapabilities,
@@ -505,7 +505,7 @@ pub(crate) struct DeviceContext {
     /// it — a 16 GiB guest against a limit that is a `uint32_t` — so the
     /// guest-scatter kernel binds a window over the block rather than the block,
     /// and this is the bound that window is checked against. See
-    /// [`super::guest_scatter::build_run_table`].
+    /// [`super::guest_scatter::build_run_tables`].
     pub max_storage_buffer_range: u64,
     /// Which vertex attribute formats this device accepts in a vertex buffer,
     /// probed once. Vulkan makes the three-component 8/16-bit formats optional,

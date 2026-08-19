@@ -18,7 +18,7 @@
 //!
 //! So this keeps the last few pieces of work this device recorded, in memory,
 //! and prints them when a drain tranche is caught holding the engine past
-//! [`crate::runtime::drain::SYNC_EXEC_STALL_US`] — which on the boots measured
+//! `reims-vgpu::runtime::drain::SYNC_EXEC_STALL_US` — which on the boots measured
 //! so far is the moment the engine wedges, and which fires on the drain thread
 //! while it is blocked, so the tail of the trail is the work it is blocked on.
 //!
@@ -32,7 +32,7 @@
 //! blocks inside it, so the work that matters is the last handful and not the
 //! last thousand.
 //!
-//! It is deliberately *not* gated behind [`crate::env::DRAW_LOG`]. That switch
+//! It is deliberately *not* gated behind `reims-vgpu-config::DRAW_LOG`. That switch
 //! turns on a per-draw log flood, which is itself a drain cost heavy enough to
 //! change what it measures; this writes seven integers into a fixed array and
 //! prints nothing until something has already gone wrong.
@@ -248,7 +248,7 @@ impl std::fmt::Display for SampledNote {
 /// value. This device has two ways to bind `LINEAR` where the guest did not ask
 /// for it — a bind whose `sampler_ref` is `0`, and a binding the residual
 /// SPIR-V scan provisions a default for — and both produce
-/// [`SamplerResource::normalized_default`], which is `Linear`/`Linear`. Nothing
+/// [`reims_vgpu_core::SamplerResource::normalized_default`], which is `Linear`/`Linear`. Nothing
 /// distinguished those from a translated guest sampler after the fact.
 ///
 /// [`Self::provenance`] is therefore the field this exists for. The filters and
@@ -260,7 +260,7 @@ pub struct SamplerNote {
     /// sampler is ever bound below `SAMPLER_BINDING_BASE`.
     pub binding: u32,
     /// `N` nearest, `L` linear. ASCII rather than the backend's enum because
-    /// `backend::vulkan::engine` does not exist — the same constraint that
+    /// the Vulkan engine is unavailable — the same constraint that
     /// keeps [`SampledNote::format`] a raw number.
     pub min_filter: u8,
     pub mag_filter: u8,
@@ -272,7 +272,7 @@ pub struct SamplerNote {
     pub address_v: u8,
     /// Where the state came from: `g` a translated guest sampler object, `c` an
     /// AIR constexpr sampler carried in reflection, `d` this device's own
-    /// [`SamplerResource::normalized_default`] — which is `LINEAR` and which no
+    /// [`reims_vgpu_core::SamplerResource::normalized_default`] — which is `LINEAR` and which no
     /// guest asked for.
     pub provenance: u8,
     /// Unnormalized texel coordinates, which changes what a UV in `[0, 1]`
@@ -545,7 +545,7 @@ fn frag_words_band(words: u32) -> &'static str {
 
 /// Submission slots this can describe.
 ///
-/// The submission ring is [`crate::backend::vulkan::engine::pools::RING_DEPTH`]
+/// The submission ring is `crate::engine::pools::RING_DEPTH`
 /// deep, and that constant is not nameable here: this module compiles on the
 /// asserted on the Vulkan side, where both names are in scope — see the
 /// `const _` beside `RING_DEPTH`. A capacity larger than the ring is harmless
@@ -600,7 +600,7 @@ pub struct SubmitNote {
 
 /// Draws recorded per submission, in arrival order.
 ///
-/// Four rather than [`super::super::backend`]'s batch cap of 32: the wedged
+/// Four rather than the discrete-memory batch default of 32: the wedged
 /// submissions measured on this rail carry two, so four holds the whole of the
 /// case this exists for while keeping the log line readable. `draws` is always
 /// the true count, so a truncation can never read as a complete list.

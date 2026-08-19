@@ -21,8 +21,8 @@
 //!
 //! `AGENTS.md` bans source-grep scanners, and the test that used to hold the old
 //! ban was one. Its replacement is rule 1 of the "Before A Broad Sweep" ladder —
-//! *make the invariant unrepresentable*. [`GuestSlice`](crate::runtime::guest_ram::GuestSlice) has exactly one
-//! constructor, [`GuestRamImport::slice`](crate::runtime::guest_ram::GuestRamImport::slice), which bounds-checks with checked
+//! *make the invariant unrepresentable*. `reims-vgpu::runtime::guest_ram::GuestSlice` has exactly one
+//! constructor, `GuestRamImport::slice`, which bounds-checks with checked
 //! arithmetic against the import's own length. There is no second way to build
 //! one, no public field that hands back a raw pointer or an absolute offset a
 //! call site could re-add to something, and no `From` conversion. A new import
@@ -31,7 +31,7 @@
 //!
 //! The absolute position of a slice inside its import is obtainable only by
 //! presenting the slice back to the import that made it
-//! ([`GuestRamImport::resolve`](crate::runtime::guest_ram::GuestRamImport::resolve)), which is also where the cross-import check
+//! (`GuestRamImport::resolve`), which is also where the cross-import check
 //! lives. That is the same rule as the C shim boundary in `AGENTS.md`: export
 //! what the backend binds, not the inputs it binds from.
 //!
@@ -56,7 +56,7 @@
 //!
 //! GPA → HVA is linear *within* a RAMBlock, so one import covers every guest
 //! page in it and a resource becomes an `(offset, len)` pair rather than a page
-//! list somebody has to export. That is what makes [`GuestRamImport::slice`](crate::runtime::guest_ram::GuestRamImport::slice)
+//! list somebody has to export. That is what makes `GuestRamImport::slice`
 //! free — no ioctl, no allocation, no cache, no kernel reference per page — and
 //! it is why a scattered surface is not un-importable: it is N slices over one
 //! import.
@@ -462,7 +462,7 @@ impl GuestPageFootprint {
 /// One RAMBlock as the host shim describes it: where it starts in guest physical
 /// address space, where QEMU mapped it, and how long it is.
 ///
-/// This is the shape [`crate::runtime::host::GuestRamProvider::guest_ram_regions`] hands back,
+/// This is the shape `reims-vgpu::runtime::host::GuestRamProvider::guest_ram_regions` hands back,
 /// and it is deliberately not `map_pages` with a different return type.
 /// `map_pages` answers "give me a view of these specific pages" and may build a
 /// transient one the caller must release; this answers "where does guest RAM
@@ -1033,7 +1033,7 @@ impl GuestSlice {
 /// # Why this is a latch and not a parameter
 ///
 /// The granularity is measured from the GPU — `minImportedHostPointerAlignment`
-/// [`crate::runtime::guest_ram_map`], which runs on the runtime side and holds
+/// `reims-vgpu::runtime::guest_ram_map`, which runs on the runtime side and holds
 /// no device context. The alternative is threading a number from the backend
 /// through every decode path that might name guest memory, which is how a site
 /// ends up with a default nobody measured.
@@ -1213,7 +1213,7 @@ pub fn report_host_allocation_import_refusal(
 /// host-pointer limits and return the alignment its owner must preserve.
 ///
 /// The allocation is judged on its own length. In particular, this does not
-/// consult [`crate::runtime::guest_ram_map::standing_refusal`]: that answer is
+/// consult `reims-vgpu::runtime::guest_ram_map::standing_refusal`: that answer is
 /// about the optional import of every RAMBlock in the VM, while this allocation
 /// follows one guest resource's decoded lifetime. Coupling the two disables a
 /// legal resource import whenever unrelated RAM makes the whole-VM sum too

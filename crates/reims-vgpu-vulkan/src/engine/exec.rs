@@ -585,7 +585,7 @@ unsafe fn plan_buffer_gather_dispatches(
 /// Arm 2 exists because arm 1 turned out to be unreachable on a real workload:
 /// the guest backs a surface in 16 KiB physically-contiguous granules, so a
 /// driven boot put 98.5 % of these windows at 9-32 stretches and **none at all**
-/// at one. See [`crate::runtime::draw::vulkan`]'s `guest_page_window` for the
+/// at one. See `reims-vgpu::runtime::draw`'s guest-page window planner for the
 /// measurement and what it cost — 3.6 GB/s of CPU `memcpy`, two thirds of every
 /// draw's staging phase.
 ///
@@ -2209,7 +2209,7 @@ struct JoinTerms {
 /// Whether [`reims_vgpu_config::BATCH_MIXED_TARGETS`] is switched off, read once per
 /// process.
 ///
-/// Latched for the same reason [`crate::runtime::spirv_bind`]'s extent switch
+/// Latched for the same reason this crate's `spirv_bind` extent switch
 /// is: this sits on the per-draw path and `std::env::var_os` is a lock and an
 /// allocation, and the variable cannot change under a running device. The
 /// refusal is named once, on the off channel, so a boot whose submission count
@@ -6061,7 +6061,7 @@ fn target_prior_access(
 /// `initialLayout` a `LOAD` pass names. So there is **no layout transition to
 /// perform**, and the only remaining job a barrier could do is order the
 /// previous pass's colour store against this pass's load — which
-/// [`super::caches::external_dependencies`] already does, unconditionally, on
+/// `super::caches::external_dependencies` already does, unconditionally, on
 /// every pass this device builds: its incoming dependency runs
 /// `VK_SUBPASS_EXTERNAL → 0` with `COLOR_ATTACHMENT_OUTPUT` /
 /// `COLOR_ATTACHMENT_WRITE` in the source scope and the attachment stages and

@@ -172,7 +172,7 @@
 //! The paragraph this replaces said the gather path had no content cache at all
 //! and that it was *not* established whether the IOSurface texture seed witness could
 //! cover these run lists, "the first thing to check before building on this".
-//! [`crate::runtime::gather_witness`] observes page-write evidence, but that is
+//! `reims-vgpu::runtime::gather_witness` observes page-write evidence, but that is
 //! not the decoded per-subresource coherence contract. A guest-page gather has
 //! no retained CPU bytes to compare, so its copied image is transient and every
 //! later bind gathers again. A durable reuse path must represent the guest's

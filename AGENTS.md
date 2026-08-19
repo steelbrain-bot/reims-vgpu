@@ -26,7 +26,7 @@ This research project emulates Apple's paravirtualized GPU on the host. An unmod
 uses Apple's own GPU drivers; our QEMU device and Rust backend decode the command stream and
 execute it through Vulkan. We ship no guest driver.
 
-`crates/reims-vgpu` supports two first-class pathways:
+The project supports two first-class pathways:
 
 | Pathway | Host | Guest | Attach | Page shift | Backend | Boot |
 |---|---|---|---|---|---|---|
@@ -42,17 +42,43 @@ measure them.
 
 - `vendor/qemu` - QEMU fork with the thin device shim: QOM, MMIO/BAR, IRQ/MSI, console/display
   integration, and HostOps plumbing.
-- `crates/reims-vgpu` - Rust staticlib that owns protocol decode, device model, memory mapping,
-  command planning/execution, scheduling, and Vulkan backend behavior.
-- `crates/reims-vgpu/src/observe/` - crate-wide observability: fail logs, typed decline reasons,
-  emission helpers, and gates.
-- `crates/reims-vgpu-wire` - derived wire-format views, with their own `AGENTS.md`. Where that file
-  is stricter than this one, it wins.
+- `crates/reims-vgpu-wire` - borrowed wire-format views; its stricter `AGENTS.md` wins locally.
+- `crates/reims-vgpu-protocol` - decoded semantic vocabulary and typed identities.
+- `crates/reims-vgpu-paging` / `crates/reims-vgpu-memory` - page resolution and bounded guest-memory
+  plans.
+- `crates/reims-vgpu-core` - backend-independent resource graph, lifecycle/content authority,
+  normalized commands, executor ports, and presentation semantics.
+- `crates/reims-vgpu-vulkan` - Vulkan capabilities, topology policy, native objects, execution, and
+  session-owned GPU state.
+- `crates/reims-vgpu` - composition staticlib: byte decoding, orchestration, QEMU ABI, and adapters
+  between the semantic core and Vulkan executor.
+- `crates/reims-vgpu-observe` / `crates/reims-vgpu-config` - shared observability and operator
+  configuration.
 - `vm/` - snapshot-revert boot scripts for arm64 and x86 guests.
 - `bugs/` - gitignored. One directory per defect that belongs to `metal2vulkan` rather than here.
 
 Start with the owning source modules and nearby tests when changing device, decode, present, or
 backend behavior. Keep durable design facts in code comments close to the behavior they explain.
+The maintained ownership map is [`docs/architecture.md`](docs/architecture.md).
+
+### Preserve The Semantic Seam
+
+- Parse guest bytes once: wire layouts stay in `reims-vgpu-wire`; decoded meaning belongs in
+  `reims-vgpu-protocol` or `reims-vgpu-core`.
+- Resolve reusable task/object names to generational `ResourceId`s before storing execution,
+  residency, witness, or content-authority state. Raw names may remain only at decode, namespace,
+  pre-construction, and explicitly documented compatibility boundaries.
+- Core commands are immutable, backend-neutral, and fully resolved. Vulkan handles, formats,
+  placement choices, and native shader payloads do not cross into them; completion facts return
+  separately and are what advance semantic state.
+- Resource identity, backing/view relations, content versions, and teardown are shared semantics.
+  Unified/discrete policy may choose placement, transfer, and batching only; import availability is
+  a separate measured capability.
+- `reims-vgpu-protocol` and `reims-vgpu-core` must not depend on the composition crate or Vulkan.
+  QEMU shims remain transport-only.
+
+Enforce these rules with types and behavioral fixtures: stale object-slot reuse, two-device reset
+isolation, and the four topology/import cells. Do not add a source-text architecture scanner.
 
 ### A translator defect is packaged, not described
 
@@ -84,21 +110,17 @@ arm that made the repair reachable was already sitting one commit ahead of what 
 
 ### C Is A Thin Shim
 
-C and Objective-C in the QEMU path exist to connect QEMU to Rust. Keep product logic in
-`crates/reims-vgpu`: protocol interpretation, resource state, scheduling, GPU encode, present model,
-backend policy, and performance behavior belong in Rust.
+C and Objective-C in the QEMU path exist to connect QEMU to Rust. Keep product logic in the owning
+Rust crate named by `docs/architecture.md`; the `reims-vgpu` composition crate exposes the QEMU ABI.
 
 A shim that calls two queries and branches on the pair has reconstructed a rule, which is the same
 violation as writing one. Export the answer, not the inputs — and delete the inputs, because a shim
 that can still assemble its own answer eventually will.
 
 Once a `reims_vgpu_qemu_*` entry point is wrapped in the shared `reims-vgpu-shim.c`, that wrapper is
-the only caller; neither device shim may reach the raw entry point. This has cost twice, both times
-on who owns the host console — `reims_vgpu_qemu_scanout_may_paint` assembled shim-side from two
-other queries, and `reims_vgpu_qemu_console_feed` called raw by the arm64 shim, which read a failed
-call as "not early". A test used to check this by parsing the C; it was a source grep and is gone.
-Each shim is built for a different host, so a re-inlined call fails on whichever pathway is not
-being booted — check both shims by hand when you touch one.
+the only caller; neither device shim may reach the raw entry point. Each shim is built for a
+different host, so check both by hand when touching one. Do not restore the retired source-text
+call-shape test.
 
 Anything crossing the boundary lives twice, once in Rust and once in
 `crates/reims-vgpu/include/reims_vgpu_qemu_abi.h`, and nothing else in the toolchain compares the
@@ -141,19 +163,9 @@ tests are not safe to run in parallel.
 finds.** No `read_to_string` over `src/`, no regex for a call shape, no walking `src/` to build a
 census of sites, no verdict table keyed by file and line that a new match must be added to.
 
-This crate accumulated forty such scanners — 17,000 lines, more than the behavioural suite — and
-retired all of them at once. They fail in three ways that no amount of care fixes:
-
-- **They test spelling, not behavior.** A scanner proves a `push` sits near a `len()` comparison. It
-  cannot prove the guest keeps its work, which is the only thing that matters. A rename satisfies
-  one; a real regression walks past it.
-- **They are wrong in the direction that reads as thorough.** One scan here was off by 40 % because
-  `use ops::{texture_view as w_view}` never puts the family name after the token `ops::`. It
-  reported a clean sweep of a population it could not see, and its output looked identical to a
-  correct one.
-- **Their verdict tables become the work.** A table demanding a written line per site turns every
-  edit into a documentation exercise against the scanner rather than against the device, and the
-  lines go stale the moment the code they describe moves.
+Source scanners test spelling rather than behavior, miss aliases and indirect forms, and turn
+file/line verdict tables into stale maintenance work. A clean scan is therefore not evidence that
+the guest-visible invariant holds.
 
 What to do instead, in order of preference:
 
@@ -235,7 +247,8 @@ window means WindowServer crashed`: a signal that correlates with the answer, qu
 wrong on four boots that all read green.
 
 Two things that look like side channels and are not. **Host capability is measured, not inferred**:
-asking the device what it supports is the contract, which is why `caps::memory_topology` reads two
+asking the device what it supports is the contract, which is why `reims-vgpu-vulkan::memory`
+classifies topology from two
 structural signals and why gating on a vendor or driver name — a correlate — is banned in the same
 breath. And **an instrument may observe whatever it likes**, because it changes nothing the guest
 sees; a probe, a census, or an audit is not bound by this rule. The line is whether the observation
@@ -300,13 +313,9 @@ refusal on the fail channel naming what was dropped, so the overflow is visible 
 absorbed as a slow path. A silent eviction and a `reason=` line cost the same microseconds and only
 one of them can be found.
 
-**Both worked examples are already in the tree, and they are precedent rather than debt.**
-`backend::vulkan::engine::caches` held 1024 entries (64 for render passes) evicting in insertion
-order, which discards the compositor's pipeline — created first, bound every frame — and pays a
-driver-side shader compile per frame forever after. `model::content_cache` held 96/64/64/64/32/16
-and overwrote a rotating slot; a boot that settles at 92 distinct render pipelines against 64 slots
-is how that cap was shown to be binding. Both are unbounded now, keyed by content, and both module
-docs carry the argument. Read one before adding a bound anywhere.
+The former Vulkan pipeline caches and host-copy caches are the worked examples: both are now
+unbounded and keyed by contract-owned content or guest lifetimes. Their owning module docs carry
+the reasoning; read one before adding a bound anywhere.
 
 ### No Magic Numbers
 
@@ -486,8 +495,9 @@ The Vulkan backend must support all four memory/import cells:
 On a unified host the import *is* the rail: a `GuestSlice` binds directly and there is no
 device-local mirror. On a discrete host the device-local resource is the working memory and the
 import is its backing store, so the copy between them is GPU-side and correct rather than a
-fallback. `caps::memory_topology` decides which, from two structural signals — do not add a third
-classifier and do not branch on vendor or driver name. A misclassification must stay a
+fallback. `reims-vgpu-vulkan::memory` classifies the device from two structural signals and
+`reims-vgpu-vulkan::policy` owns the consequences — do not add a third classifier and do not branch
+on vendor or driver name. A misclassification must stay a
 **performance** bug: nothing may branch on topology in a way that changes what the guest observes.
 
 Vulkan 1.2 is the baseline. Anything above Vulkan 1.2 must have a fallback or a capability-gated
@@ -520,7 +530,8 @@ method on the import, not a field on the slice.
 nothing at `vkCreateDevice`, and runs every guest-memory rail through the copying path. Those rails
 are not a legacy arm: they are the only arm on such a host, and they are the arm a discrete GPU
 takes regardless, because there the copy into VRAM is the point. Both halves are gated — the
-capability at `caps::host_pointer`, and the reference at `runtime/guest_ram_map.rs`, which refuses
+capability at `reims-vgpu-vulkan::host_pointer`, and the reference at
+`runtime/guest_ram_map.rs`, which refuses
 by name when no backend published a granularity.
 
 **Page recycling is unchanged and still load-bearing.** The guest reassigning a GPA to a different
@@ -554,16 +565,18 @@ So the deferred-flush rail — the device's largest cost — is retired, by writ
 directly. **`runtime/storage_flush/` went with it and no longer exists**; do not go looking for it,
 and do not read a reference to it in an older commit body or `kb/` entry as a live path. Its two
 halves are now `runtime/render_writeback.rs`, whose module doc lists the four hazards the deferred
-window carried and why each cannot arise in the direct path, and `runtime/host_writes.rs`, the
-per-page record of which guest pages this device has written. Read `render_writeback`'s doc before
+window carried and why each cannot arise in the direct path, and
+`reims-vgpu-core::content_tracking::HostWrites`, the per-page record of which guest pages this
+device has written. Read `render_writeback`'s doc before
 assuming a landing is safe to skip. Note that `runtime/gva_view.rs::ensure_gva_view` hands back a
 host pointer but is not a window resolver — it requires the span to be one contiguous page run and
 returns `None` otherwise.
 
 ### Environment overrides
 
-Every variable the crate reads is named in `crates/reims-vgpu/src/env.rs`, which also owns the parse.
-Read a variable through it or the second spelling of "off" is a divergence nothing can find.
+Every supported variable is named and parsed in `crates/reims-vgpu-config`; the composition crate's
+`env` module is only a compatibility re-export. Read configuration through that shared vocabulary
+or the second spelling of "off" is a divergence nothing can find.
 
 **An override may only narrow what the device does; it may never widen it.** A switch can turn off a
 rail the host could have run. It can never turn on one the host reported it cannot: capability is

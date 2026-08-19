@@ -107,7 +107,7 @@ pub(super) fn fifo_has_pending_stamp(state: &SessionState, index: u32) -> bool {
 
 /// The subset of the session's pending mask whose completion point is a submission
 /// **this device has not made yet** — a stamp registered against the open
-/// batch's future point by [`Completion::queue_for_next_submission`].
+/// batch's future point by `StampCompletion::queue_for_next_submission`.
 ///
 /// The distinction is the whole difference between a guest waiting on the GPU
 /// and a guest waiting on *us*. A `Submitted` stamp is in flight and nothing can
