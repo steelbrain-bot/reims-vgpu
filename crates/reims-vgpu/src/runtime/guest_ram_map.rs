@@ -346,7 +346,7 @@ pub fn imports() -> Vec<Arc<GuestRamImport>> {
 /// a host pointer chained, which is where a driver that pins takes a reference
 /// on every page of guest RAM — seconds, proportional to the RAM the VM was
 /// given, and measured per block by
-/// [`crate::backend::vulkan::engine::warm_guest_ram_imports`].
+/// [`reims_vgpu_vulkan::engine::warm_guest_ram_imports`].
 ///
 /// Both were lazy and both landed on the guest's first `gather`, inside its
 /// first draw, inside a display transaction the guest abandons after 1000 ms.
@@ -377,7 +377,6 @@ pub fn warm<H: GuestRamProvider + ?Sized>(
     if !already {
         with_map(host, |_| ());
     }
-    #[cfg(feature = "backend-vulkan")]
     {
         let imports = imports();
         if !imports.is_empty() {
@@ -615,7 +614,7 @@ pub fn reference_for_pages<H: GuestRamProvider + ?Sized>(
 /// same six gathers.
 ///
 /// The seconds are `vkAllocateMemory` with the host pointer chained, measured
-/// per RAMBlock at [`crate::backend::vulkan::engine::warm_guest_ram_imports`],
+/// per RAMBlock at [`reims_vgpu_vulkan::engine::warm_guest_ram_imports`],
 /// which is now also warmed from [`warm`]. The table below is the state before
 /// that, kept because its second row is what ruled out a per-byte cost and sent
 /// the search to one-time setup:
@@ -794,19 +793,24 @@ mod tests {
     impl crate::runtime::executor::CapabilityService for NoopExecutor {}
     impl crate::runtime::executor::PresentationService for NoopExecutor {}
     impl crate::runtime::executor::WindowPresentationService for NoopExecutor {}
-    impl crate::runtime::executor::GuestMemoryService for NoopExecutor {}
+    impl crate::runtime::executor::GuestPageTransferService for NoopExecutor {}
+    impl crate::runtime::executor::CompletionService for NoopExecutor {}
+    impl crate::runtime::executor::SubmissionBatchService for NoopExecutor {}
+    impl crate::runtime::executor::GuestImportService for NoopExecutor {}
     impl crate::runtime::executor::MaintenanceService for NoopExecutor {}
     impl crate::runtime::executor::ObservationService for NoopExecutor {}
+    impl crate::runtime::executor::ShaderTranslationService for NoopExecutor {}
+    impl crate::runtime::executor::RenderBufferPlanningService for NoopExecutor {}
     impl crate::runtime::executor::SessionService for NoopExecutor {}
     impl crate::runtime::executor::ReadbackService for NoopExecutor {
-        type Error = crate::backend::vulkan::engine::DrawError;
+        type Error = crate::runtime::executor::DrawError;
 
         fn read_target(
             &self,
             _identity: &crate::model::TargetIdentity,
         ) -> Result<crate::runtime::executor::TargetReadback, Self::Error> {
-            Err(crate::backend::vulkan::engine::DrawError::Facade(
-                crate::backend::vulkan::engine::EngineFacadeDecline::ExecutorServiceUnavailable {
+            Err(crate::runtime::executor::DrawError::Facade(
+                crate::runtime::executor::EngineFacadeDecline::ExecutorServiceUnavailable {
                     service: "target_readback",
                 },
             ))
@@ -820,16 +824,95 @@ mod tests {
     impl crate::runtime::executor::ExecutionPort for NoopExecutor {
         type Submission = crate::runtime::executor::ResolvedSubmission;
         type Completion = crate::runtime::executor::ExecutionCompletion;
-        type Error = crate::backend::vulkan::engine::DrawError;
+        type Error = crate::runtime::executor::DrawError;
 
         fn execute(&self, _submission: Self::Submission) -> Result<Self::Completion, Self::Error> {
-            Err(crate::backend::vulkan::engine::DrawError::Facade(
-                crate::backend::vulkan::engine::EngineFacadeDecline::ExecutorServiceUnavailable {
+            Err(crate::runtime::executor::DrawError::Facade(
+                crate::runtime::executor::EngineFacadeDecline::ExecutorServiceUnavailable {
                     service: "test",
                 },
             ))
         }
     }
+
+    #[derive(Debug, Default)]
+    struct RecordingWarmExecutor {
+        imports: std::sync::Mutex<std::collections::BTreeSet<reims_vgpu_memory::ImportId>>,
+        bytes: std::sync::atomic::AtomicU64,
+    }
+
+    impl RecordingWarmExecutor {
+        fn bytes(&self) -> u64 {
+            self.bytes.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl crate::runtime::executor::CapabilityService for RecordingWarmExecutor {}
+    impl crate::runtime::executor::PresentationService for RecordingWarmExecutor {}
+    impl crate::runtime::executor::WindowPresentationService for RecordingWarmExecutor {}
+    impl crate::runtime::executor::MaintenanceService for RecordingWarmExecutor {}
+    impl crate::runtime::executor::SubmissionBatchService for RecordingWarmExecutor {}
+    impl crate::runtime::executor::ObservationService for RecordingWarmExecutor {}
+    impl crate::runtime::executor::ShaderTranslationService for RecordingWarmExecutor {}
+    impl crate::runtime::executor::RenderBufferPlanningService for RecordingWarmExecutor {}
+    impl crate::runtime::executor::SessionService for RecordingWarmExecutor {}
+    impl crate::runtime::executor::ResidentService for RecordingWarmExecutor {}
+    impl crate::runtime::executor::GuestWriteService for RecordingWarmExecutor {}
+    impl crate::runtime::executor::ComputeResidencyService for RecordingWarmExecutor {}
+
+    impl crate::runtime::executor::GuestPageTransferService for RecordingWarmExecutor {}
+    impl crate::runtime::executor::CompletionService for RecordingWarmExecutor {}
+
+    impl crate::runtime::executor::GuestImportService for RecordingWarmExecutor {
+        fn warm_guest_ram_imports(
+            &self,
+            imports: &[std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>],
+        ) -> (usize, u64) {
+            let mut known = self.imports.lock().unwrap_or_else(|p| p.into_inner());
+            let mut warmed = 0;
+            let mut bytes = 0u64;
+            for import in imports {
+                if known.insert(import.id()) {
+                    warmed += 1;
+                    bytes = bytes.saturating_add(import.len());
+                }
+            }
+            self.bytes
+                .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+            (warmed, bytes)
+        }
+    }
+
+    impl crate::runtime::executor::ReadbackService for RecordingWarmExecutor {
+        type Error = crate::runtime::executor::DrawError;
+
+        fn read_target(
+            &self,
+            _identity: &crate::model::TargetIdentity,
+        ) -> Result<crate::runtime::executor::TargetReadback, Self::Error> {
+            Err(crate::runtime::executor::DrawError::Facade(
+                crate::runtime::executor::EngineFacadeDecline::ExecutorServiceUnavailable {
+                    service: "test",
+                },
+            ))
+        }
+    }
+
+    impl crate::runtime::executor::ExecutionPort for RecordingWarmExecutor {
+        type Submission = crate::runtime::executor::ResolvedSubmission;
+        type Completion = crate::runtime::executor::ExecutionCompletion;
+        type Error = crate::runtime::executor::DrawError;
+
+        fn execute(&self, _submission: Self::Submission) -> Result<Self::Completion, Self::Error> {
+            Err(crate::runtime::executor::DrawError::Facade(
+                crate::runtime::executor::EngineFacadeDecline::ExecutorServiceUnavailable {
+                    service: "test",
+                },
+            ))
+        }
+    }
+
+    impl crate::runtime::executor::Executor for RecordingWarmExecutor {}
 
     /// Latch a granularity with a budget and a span ceiling that admit
     /// everything, so a test about the granularity is only about that.
@@ -1653,19 +1736,11 @@ mod tests {
         });
     }
 
-    /// The protocol handshake warms each RAMBlock before the first draw can
-    /// demand an import. Skips on hosts where import is unavailable.
+    /// The protocol handshake publishes each RAMBlock to the executor before
+    /// the first draw can demand an import, and does so only once per import.
     #[test]
     fn the_handshake_warm_imports_before_any_draw_references_a_byte() {
-        if !crate::backend::vulkan::engine::host_pointer_import_available_for_test() {
-            eprintln!("skip: no Vulkan host-pointer import");
-            return;
-        }
-
-        const LEN: usize = 16 << 20;
-        let layout = std::alloc::Layout::from_size_align(LEN, 4096).expect("valid layout");
-        let base = unsafe { std::alloc::alloc_zeroed(layout) };
-        assert!(!base.is_null(), "allocation for the stand-in RAMBlock");
+        const LEN: u64 = 16 << 20;
 
         struct OneBlock(u64);
         impl crate::runtime::host::GuestRamProvider for OneBlock {
@@ -1678,25 +1753,19 @@ mod tests {
                 Ok(vec![reims_vgpu_memory::GuestRamRegion {
                     gpa_base: 0,
                     host_va: self.0,
-                    len: LEN as u64,
+                    len: LEN,
                 }])
             }
         }
 
-        reset();
-        let before = crate::backend::vulkan::engine::guest_import_census().0;
-        let mut host = OneBlock(base as u64);
-        let executor = crate::runtime::executor::VulkanExecutor::default();
-        let _scope = crate::runtime::executor::SessionService::enter(&executor);
-        warm(&mut host, &executor);
-        let after = crate::backend::vulkan::engine::guest_import_census().0;
-        assert_eq!(after - before, LEN as u64);
+        with_granularity(Some(4096), || {
+            let mut host = OneBlock(0x7f00_0000_0000);
+            let executor = RecordingWarmExecutor::default();
+            warm(&mut host, &executor);
+            assert_eq!(executor.bytes(), LEN);
 
-        warm(&mut host, &executor);
-        assert_eq!(
-            crate::backend::vulkan::engine::guest_import_census().0,
-            after
-        );
-        reset();
+            warm(&mut host, &executor);
+            assert_eq!(executor.bytes(), LEN);
+        });
     }
 }

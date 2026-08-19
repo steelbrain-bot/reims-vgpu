@@ -1367,7 +1367,7 @@ impl DeviceContext {
     ) -> Option<u32> {
         let picked = self.memory_type_with(type_bits, bytes, &self.caps.memory_request(class));
         // Once per class per boot. What a class *asks* for is in
-        // `MemoryTopology::request` and readable from source; what it *gets* is
+        // `MemoryPlacementPolicy::request` and readable from source; what it *gets* is
         // not, because it depends on this device's memory-type table, and the
         // two answers have very different costs. `vk_alloc_sites` prices
         // `MemoryClass::Upload` at 2.54 ms per MiB allocated against 0.48 for

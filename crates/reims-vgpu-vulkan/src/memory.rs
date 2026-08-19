@@ -101,42 +101,13 @@ pub struct MemoryRequest {
     pub preferred: Vec<vk::MemoryPropertyFlags>,
 }
 
-impl MemoryTopology {
-    /// Flags to request for a [`MemoryClass`] on this topology.
-    ///
-    /// The topology-dependent choices implemented by
-    /// [`crate::policy`]:
-    ///
-    /// * `Upload` on `Unified` prefers `DEVICE_LOCAL` — the same DRAM, so the
-    ///   GPU reads the CPU's writes with no transfer at all. On `Discrete` a
-    ///   `DEVICE_LOCAL|HOST_VISIBLE` type is a scarce BAR window (256 MiB
-    ///   without resizable BAR); spending it on bulk uploads starves the paths
-    ///   that genuinely need it, so plain host memory + a DMA copy is correct.
-    /// * `Readback` on `Unified` prefers `DEVICE_LOCAL|HOST_CACHED` — the
-    ///   render target's own pool, so the copy is a same-pool blit and the CPU
-    ///   read is cached. On `Discrete` the buffer must live in system RAM
-    ///   (`HOST_CACHED`); reading a BAR window from the CPU is uncached and
-    ///   catastrophically slow.
-    ///
-    /// `Readback` requires only `HOST_VISIBLE`, and that is the whole point of
-    /// the class. Adding `HOST_COHERENT` to the requirement reads as harmless —
-    /// Vulkan guarantees a `HOST_VISIBLE|HOST_COHERENT` type exists, so the
-    /// selection never fails — and on any driver whose cached type is *not*
-    /// coherent it silently discards both preferences and lands every readback
-    /// in uncached memory. Intel ANV is exactly that driver: its five types are
-    /// `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT` (0x07) and
-    /// `DEVICE_LOCAL|HOST_VISIBLE|HOST_CACHED` (0x0b), and nothing carries both
-    /// bits. Measured cost of the fallback on an Intel ARL iGPU: 460 MB/s for a
-    /// full-target readback, 7-11 ms per 3.2 MB frame, 70-86 % of all draw time.
-    ///
-    /// So coherence is the *last* preference rather than a requirement, and a
-    /// caller that gets a non-coherent type owes
-    /// `vkInvalidateMappedMemoryRanges` before it reads. [`MemoryRequest`] is
-    /// only a query; `ResourcePools::create_readback_buffer` records which it got.
-    pub fn request(self, class: MemoryClass) -> MemoryRequest {
-        crate::policy::MemoryPlacementPolicy::new(self).request(class)
-    }
-}
+// Placement consequences of `MemoryTopology` are owned by
+// `policy::MemoryPlacementPolicy`. Unified upload prefers DEVICE_LOCAL while
+// discrete upload avoids spending a scarce BAR window. Unified readback
+// prefers DEVICE_LOCAL|HOST_CACHED while discrete readback prefers ordinary
+// HOST_CACHED memory. Readback requires only HOST_VISIBLE: coherence remains a
+// last preference, and a selected non-coherent type owes an explicit
+// invalidate before CPU access.
 
 /// Summary of the bound device's memory layout: the topology plus the sizes the
 /// VRAM proxy reports.
@@ -252,6 +223,10 @@ pub unsafe fn reported_max_allocation_size(
 
 /// Query the device-wide allocation ceiling, treating an unreported limit as
 /// heap-bounded while keeping that loss of precision visible.
+///
+/// # Safety
+///
+/// `pd` must be a physical device belonging to `instance`.
 pub unsafe fn max_allocation_size(instance: &ash::Instance, pd: vk::PhysicalDevice) -> u64 {
     match unsafe { reported_max_allocation_size(instance, pd) } {
         Some(size) => size,
@@ -649,6 +624,10 @@ mod tests {
     use super::fixtures::*;
     use super::*;
 
+    fn request(topology: MemoryTopology, class: MemoryClass) -> MemoryRequest {
+        crate::policy::MemoryPlacementPolicy::new(topology).request(class)
+    }
+
     /// The flags half of [`select_memory_type`], for the tests that are about
     /// which *properties* a class lands on. Zero bytes fits every heap, so the
     /// capacity stage is a no-op and these read as they did before it existed.
@@ -757,7 +736,7 @@ mod tests {
             ),
         ];
         for (name, props, topology) in devices {
-            let req = topology.request(MemoryClass::Readback);
+            let req = request(topology, MemoryClass::Readback);
             let index = pick_index(&props, !0, &req).unwrap_or_else(|| panic!("{name}: no type"));
             let kind = MappedMemoryKind::of(&props, index);
             assert!(
@@ -780,7 +759,7 @@ mod tests {
     #[test]
     fn a_readback_type_may_be_cached_without_being_coherent() {
         let intel = intel_igpu();
-        let req = MemoryTopology::Unified.request(MemoryClass::Readback);
+        let req = request(MemoryTopology::Unified, MemoryClass::Readback);
         let index = pick_index(&intel, !0, &req).expect("intel readback type");
         assert_eq!(index, 1, "the first cached type, not the coherent type 0");
         assert_eq!(
@@ -821,7 +800,7 @@ mod tests {
             ],
         );
         for topology in [MemoryTopology::Unified, MemoryTopology::Discrete] {
-            let req = topology.request(MemoryClass::Readback);
+            let req = request(topology, MemoryClass::Readback);
             let index = pick_index(&props, !0, &req).expect("host-visible type exists");
             assert_eq!(
                 MappedMemoryKind::of(&props, index),
@@ -839,12 +818,10 @@ mod tests {
     #[test]
     fn upload_preference_follows_topology() {
         use vk::MemoryPropertyFlags as F;
-        assert!(MemoryTopology::Unified
-            .request(MemoryClass::Upload)
+        assert!(request(MemoryTopology::Unified, MemoryClass::Upload)
             .preferred
             .contains(&F::DEVICE_LOCAL));
-        assert!(MemoryTopology::Discrete
-            .request(MemoryClass::Upload)
+        assert!(request(MemoryTopology::Discrete, MemoryClass::Upload)
             .preferred
             .is_empty());
     }
@@ -854,7 +831,7 @@ mod tests {
     #[test]
     fn selection_takes_best_preference_first() {
         let props = apple_m3_max();
-        let req = MemoryTopology::Unified.request(MemoryClass::Readback);
+        let req = request(MemoryTopology::Unified, MemoryClass::Readback);
         assert_eq!(pick_index(&props, !0, &req), Some(1));
     }
 
@@ -863,7 +840,7 @@ mod tests {
     #[test]
     fn discrete_readback_avoids_the_bar_window() {
         let props = nvidia_discrete_rebar();
-        let req = MemoryTopology::Discrete.request(MemoryClass::Readback);
+        let req = request(MemoryTopology::Discrete, MemoryClass::Readback);
         assert_eq!(pick_index(&props, !0, &req), Some(2));
     }
 
@@ -889,7 +866,7 @@ mod tests {
         for (name, props) in &devices {
             for topology in [MemoryTopology::Unified, MemoryTopology::Discrete] {
                 for class in classes {
-                    let req = topology.request(class);
+                    let req = request(topology, class);
                     let picked = pick_index(props, !0, &req);
                     assert!(
                         picked.is_some(),
@@ -910,7 +887,7 @@ mod tests {
     #[test]
     fn type_bits_mask_is_respected() {
         let props = apple_m3_max();
-        let req = MemoryTopology::Unified.request(MemoryClass::Readback);
+        let req = request(MemoryTopology::Unified, MemoryClass::Readback);
         // Mask out type 1 (the only host-visible type) → no candidate at all.
         assert_eq!(pick_index(&props, 0b101, &req), None);
         // Allow it again and it is chosen.
@@ -940,7 +917,7 @@ mod tests {
                 MemoryClass::DeviceLocal,
                 MemoryClass::DeviceLocalPreferred,
             ] {
-                let req = profile.topology.request(class);
+                let req = request(profile.topology, class);
                 assert!(
                     pick_index(&props, !0, &req).is_some(),
                     "{name}/{class:?} must resolve a memory type"
@@ -968,9 +945,7 @@ mod tests {
     fn an_allocation_larger_than_a_heap_does_not_get_charged_to_it() {
         const GIB: u64 = 1 << 30;
         let props = amd_apu_host_heap();
-        let req = classify_memory(&props)
-            .topology
-            .request(MemoryClass::Upload);
+        let req = request(classify_memory(&props).topology, MemoryClass::Upload);
 
         // Under the 2 GiB carve-out: the device-local preference still wins.
         let small = select_memory_type(&props, !0, &req, GIB, u64::MAX).expect("a type");
@@ -1006,9 +981,7 @@ mod tests {
     fn a_size_past_the_device_maximum_is_refused_whatever_the_heaps_hold() {
         const GIB: u64 = 1 << 30;
         let props = amd_apu_host_heap();
-        let req = classify_memory(&props)
-            .topology
-            .request(MemoryClass::Upload);
+        let req = request(classify_memory(&props).topology, MemoryClass::Upload);
 
         assert!(
             select_memory_type(&props, !0, &req, 6 * GIB, u64::MAX).is_ok(),
@@ -1050,7 +1023,7 @@ mod tests {
                 MemoryClass::DeviceLocal,
                 MemoryClass::DeviceLocalPreferred,
             ] {
-                let req = profile.topology.request(class);
+                let req = request(profile.topology, class);
                 // The roomiest heap any type with the required flags draws
                 // from, which is the number the refusal must carry.
                 let roomiest = roomiest_heap_for(&props, &req);
@@ -1080,7 +1053,7 @@ mod tests {
     #[test]
     fn the_pick_carries_the_heap_it_came_from() {
         let props = nvidia_discrete();
-        let req = MemoryTopology::Discrete.request(MemoryClass::DeviceLocal);
+        let req = request(MemoryTopology::Discrete, MemoryClass::DeviceLocal);
         let pick =
             select_memory_type(&props, !0, &req, 1 << 20, u64::MAX).expect("a device-local type");
         let t = props.memory_types[pick.index as usize];

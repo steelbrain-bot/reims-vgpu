@@ -10,7 +10,7 @@
 //! out, and, before the move, three prose mentions of `device_scanout_copy` in.
 //!
 //! `use super::*` rather than a named list, for the reason
-//! `crate::runtime::draw::vulkan` gives and `window_publish` repeats: a chapter of the
+//! `crate::runtime::draw::execution` gives and `window_publish` repeats: a chapter of the
 //! root lifted out whole should not read as a redesign.
 
 use super::*;
@@ -62,7 +62,7 @@ impl ConsoleFeed {
 /// owns the screen. This is the one copy; the shims paint what it returns.
 ///
 /// The boundary check is deliberately the **monotonic** latch and not
-/// `state.present.frame_flush_seen`. The latter is not monotonic — a flush-less
+/// `state.presentation.present.content_boundary_crossed()`. The latter is not monotonic across reset — a flush-less
 /// (ClearOnly) present clears it — and on the arm64 MMIO console that re-armed
 /// the early paint mid-session, flickering stale pre-boundary GOP content (the
 /// Apple logo at the old geometry) against live product presents.
@@ -81,7 +81,7 @@ pub fn device_console_feed(id: u64) -> Option<ConsoleFeed> {
         return Some(ConsoleFeed::Firmware);
     };
     Some(
-        match crate::runtime::scanout::early_scanout_target(&d.device.state) {
+        match crate::runtime::scanout::early_scanout_target(&d.device) {
             // `Early` guarantees a paintable target, so the shims do not re-test
             // the geometry — both used to, which is a decode rule living in C.
             // A zero here is not a target, it is the absence of one.
@@ -180,9 +180,9 @@ pub fn device_efi_console_copy(
     let Some(mut d) = slot.inner.try_lock() else {
         return false;
     };
-    #[cfg(feature = "backend-vulkan")]
-    let _scope = d.device.state.executor.enter();
-    if d.device.state.gfx.efi_fb_start == 0 {
+    let executor = Arc::clone(&d.device.executor);
+    let _scope = executor.enter();
+    if d.device.state.registers.gfx.efi_fb_start == 0 {
         return false;
     }
     let Some(ops) = slot.ops else {
@@ -190,7 +190,7 @@ pub fn device_efi_console_copy(
     };
     let DeviceInner { device, actions } = &mut *d;
     let host = QemuHost::new(&ops, actions, &slot.prompt_actions);
-    crate::runtime::scanout::paint_efi_console(&device.state, &host, dst, dst_stride, width, height)
+    crate::runtime::scanout::paint_efi_console(device, &host, dst, dst_stride, width, height)
 }
 
 /// Fill a host BGRA8 framebuffer from the named guest mapping (or EFI FB).
@@ -223,8 +223,8 @@ pub fn device_scanout_copy(
         };
         d
     };
-    #[cfg(feature = "backend-vulkan")]
-    let _scope = d.device.state.executor.enter();
+    let executor = Arc::clone(&d.device.executor);
+    let _scope = executor.enter();
     if let Some(ops) = slot.ops {
         let DeviceInner { device, actions } = &mut *d;
         let mut host = QemuHost::new(&ops, actions, &slot.prompt_actions);
@@ -233,23 +233,16 @@ pub fn device_scanout_copy(
         // that case from capture-fail retry without draining guest commands in
         // this QEMU display context; do not discard the only scanout action.
         let rc = crate::runtime::scanout::copy_to_bgra8(
-            &mut device.state,
-            &mut host,
-            mapping_id,
-            dst,
-            dst_stride,
-            width,
-            height,
-            generation,
+            device, &mut host, mapping_id, dst, dst_stride, width, height, generation,
         );
-        note_scanout_copy_consumed(&mut device.state, &mut host, &slot, rc, present_action);
+        note_scanout_copy_consumed(device, &mut host, &slot, rc, present_action);
         rc
     } else {
         // No QEMU ops table is bound (unit tests / headless create), so every
         // guest read fails and the copy falls back to a black clear.
         let mut host = NullHost;
         let rc = crate::runtime::scanout::copy_to_bgra8(
-            &mut d.device.state,
+            &mut d.device,
             &mut host,
             mapping_id,
             dst,
@@ -258,7 +251,7 @@ pub fn device_scanout_copy(
             height,
             generation,
         );
-        note_scanout_copy_consumed(&mut d.device.state, &mut host, &slot, rc, present_action);
+        note_scanout_copy_consumed(&mut d.device, &mut host, &slot, rc, present_action);
         rc
     }
 }
@@ -280,7 +273,7 @@ pub fn device_scanout_copy(
 /// arm cleared the pending flag after a failed copy without recording the
 /// consumption, which is the stranding the paragraph above forbids.
 fn note_scanout_copy_consumed<H: HostOps>(
-    state: &mut crate::model::DeviceState,
+    state: &mut crate::runtime::Device,
     host: &mut H,
     slot: &BoundDevice,
     rc: crate::runtime::scanout::ScanoutCopyResult,
@@ -313,10 +306,7 @@ pub struct CursorGlyphInfo {
 pub fn device_cursor_glyph_info(id: u64) -> Option<CursorGlyphInfo> {
     let slot = device_slot(id)?;
     let d = slot.inner.try_lock()?;
-    let c = &d.device.state.cursor;
-    if !c.glyph_ready || c.pixels.is_empty() {
-        return None;
-    }
+    let c = d.device.state.presentation.cursor.glyph()?;
     Some(CursorGlyphInfo {
         width: c.width as u32,
         height: c.height as u32,
@@ -330,10 +320,7 @@ pub fn device_cursor_glyph_info(id: u64) -> Option<CursorGlyphInfo> {
 pub fn device_cursor_glyph_copy(id: u64, out: &mut [u32]) -> Option<usize> {
     let slot = device_slot(id)?;
     let d = slot.inner.try_lock()?;
-    let c = &d.device.state.cursor;
-    if !c.glyph_ready || c.pixels.is_empty() {
-        return None;
-    }
+    let c = d.device.state.presentation.cursor.glyph()?;
     let n = c.pixels.len().min(out.len());
     out[..n].copy_from_slice(&c.pixels[..n]);
     Some(n)

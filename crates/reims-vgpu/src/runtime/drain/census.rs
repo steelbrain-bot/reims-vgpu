@@ -2863,14 +2863,12 @@ pub fn note_drain_tranche(
         // Beside the engine counters it has to be read against: the eviction
         // routes say which cap fired and this says how much the workload wanted,
         // and neither is interpretable without the other.
-        #[cfg(feature = "backend-vulkan")]
         if let Some(wanted) = executor.sampled_working_set_census() {
             crate::observe::off(wanted);
         }
         // The same question one rail over, and the one with no cache behind it
         // yet: `buffer_guest_gathers` says how many gathers ran and this says
         // how few distinct windows they were.
-        #[cfg(feature = "backend-vulkan")]
         if let Some(wanted) = executor.buffer_gather_working_set_census() {
             crate::observe::off(wanted);
         }
@@ -2949,7 +2947,6 @@ pub fn note_drain_tranche(
 ///
 /// `mib` is the same level and is not a rate: it is guest RAM the device can
 /// currently reach, against what the machine reported.
-#[cfg(feature = "backend-vulkan")]
 fn emit_guest_import_levels(executor: &dyn crate::runtime::executor::Executor) {
     let (bytes, count, aliases) = executor.guest_import_census();
     let (spans, span_bytes) = crate::runtime::guest_ram_map::span_census();
@@ -2968,9 +2965,6 @@ fn emit_guest_import_levels(executor: &dyn crate::runtime::executor::Executor) {
     ));
 }
 
-#[cfg(not(feature = "backend-vulkan"))]
-fn emit_guest_import_levels(_executor: &dyn crate::runtime::executor::Executor) {}
-
 /// Live entry counts of the caches that hold one entry per distinct guest
 /// object, as **levels** rather than per-window deltas.
 ///
@@ -2982,13 +2976,12 @@ fn emit_guest_import_levels(_executor: &dyn crate::runtime::executor::Executor) 
 /// some key is carrying per-frame state, and the argument is wrong for that
 /// cache. A settling level is the argument holding.
 ///
-/// `m2v` counts translated shaders (`runtime::m2v_cache`); the rest are the
+/// `m2v` counts translated shaders (`reims_vgpu_vulkan::m2v_cache`); the rest are the
 /// Vulkan engine's immutable-object caches.
-#[cfg(feature = "backend-vulkan")]
 fn emit_object_cache_levels(executor: &dyn crate::runtime::executor::Executor) {
     let [shaders, layouts, passes, pipelines, samplers, compute_pipelines] =
         executor.object_cache_levels();
-    let (_, _, m2v) = crate::runtime::m2v_cache::stats();
+    let m2v = executor.shader_translation_cache_level();
     crate::observe::off(format!(
         "object_cache_levels (levels, not per-interval) m2v={m2v} shaders={shaders} \
          layouts={layouts} passes={passes} pipelines={pipelines} samplers={samplers} \
@@ -2996,9 +2989,8 @@ fn emit_object_cache_levels(executor: &dyn crate::runtime::executor::Executor) {
     ));
 }
 
-#[cfg(feature = "backend-vulkan")]
 fn emit_engine_delta(executor: &dyn crate::runtime::executor::Executor) {
-    use crate::backend::vulkan::engine::CounterSnapshot;
+    use crate::runtime::executor::CounterSnapshot;
     static PREV: std::sync::Mutex<Option<CounterSnapshot>> = std::sync::Mutex::new(None);
     let now = executor.counter_snapshot();
     let Ok(mut prev) = PREV.lock() else {
@@ -3069,8 +3061,7 @@ fn emit_engine_delta(executor: &dyn crate::runtime::executor::Executor) {
 /// slot count to evict for. `vram_reclaim_retry` and
 /// `vram_compute_storage_reclaim_retry` on the fail channel are what report a
 /// reclaim now, and they fire only when an allocation was actually refused.
-#[cfg(feature = "backend-vulkan")]
-fn emit_registry_pressure(now: &crate::backend::vulkan::engine::CounterSnapshot) {
+fn emit_registry_pressure(now: &crate::runtime::executor::CounterSnapshot) {
     crate::observe::off(format!(
         "registry_pressure (levels, not per-interval) peak={} peak_mib={} \
          resident_samples={} resample_peak_ms={}/{} \
@@ -3079,7 +3070,7 @@ fn emit_registry_pressure(now: &crate::backend::vulkan::engine::CounterSnapshot)
         now.registry_non_pinned_peak_bytes >> 20,
         now.sampled_gpu_binds,
         now.resident_resample_peak_ms,
-        crate::backend::vulkan::engine::IDLE_MAINTENANCE_START_MS,
+        crate::runtime::executor::IDLE_MAINTENANCE_START_MS,
         now.slab_carved_bytes >> 20,
         now.slab_held_bytes >> 20,
         now.registry_sole_copy_peak,
@@ -3195,7 +3186,6 @@ fn emit_sampled_phase() {
 /// staging half of `setup_us` scale with bytes, `wait_us` does not.
 ///
 /// Silent when no draw ran, so an idle desktop costs nothing.
-#[cfg(feature = "backend-vulkan")]
 fn emit_draw_phase(executor: &dyn crate::runtime::executor::Executor) {
     let Some(w) = executor.draw_phase_window() else {
         return;
@@ -3277,7 +3267,6 @@ fn emit_draw_phase(executor: &dyn crate::runtime::executor::Executor) {
 /// by `draw_phase draws` or by the kind's own `*_n` before comparing two arms —
 /// the writeback's own positive control halved the frame rate and lowered
 /// `busy_us` by 48 % while per-submission GPU cost moved 1.5 %.
-#[cfg(feature = "backend-vulkan")]
 fn emit_gpu_span(executor: &dyn crate::runtime::executor::Executor) {
     let Some(w) = executor.gpu_span_window() else {
         return;
@@ -3310,9 +3299,8 @@ fn emit_gpu_span(executor: &dyn crate::runtime::executor::Executor) {
 ///
 /// Emitted only when a gather dispatched, so the line's presence is itself the
 /// statement that this boot ran the dispatch arm — see
-/// [`crate::backend::vulkan::engine::gather_phase`] for what each part is and
+/// [`reims_vgpu_vulkan::engine::gather_phase`] for what each part is and
 /// what would remove it.
-#[cfg(feature = "backend-vulkan")]
 fn emit_gather_phase(executor: &dyn crate::runtime::executor::Executor) {
     let Some(w) = executor.gather_phase_window() else {
         return;
@@ -3326,7 +3314,6 @@ fn emit_gather_phase(executor: &dyn crate::runtime::executor::Executor) {
 
 /// Under `draw_phase`, dividing its largest column — `stage_us` is 83 % of that
 /// phase's second on a driven drag, and the five parts want opposite fixes.
-#[cfg(feature = "backend-vulkan")]
 fn emit_stage_phase(executor: &dyn crate::runtime::executor::Executor) {
     let Some(w) = executor.stage_phase_window() else {
         return;
@@ -3364,7 +3351,6 @@ fn emit_stage_phase(executor: &dyn crate::runtime::executor::Executor) {
 /// `host_window_cadence presents` is what reached the screen, and when the two
 /// disagree the first candidate is that the window thread could not have the
 /// engine while the worker held it.
-#[cfg(feature = "backend-vulkan")]
 fn emit_engine_lock(executor: &dyn crate::runtime::executor::Executor, win_ms: u64) {
     if let Some(line) = executor.take_engine_lock_census(win_ms) {
         crate::observe::off(line);

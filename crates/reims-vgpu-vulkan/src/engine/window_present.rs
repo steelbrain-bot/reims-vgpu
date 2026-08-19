@@ -380,7 +380,7 @@ impl BlitSource {
 pub enum WindowPresentOutcome {
     Busy,
     Presented {
-        direct: bool,
+        route: reims_vgpu_core::PresentationRoute,
         width: u32,
         height: u32,
         swapchain_images: usize,
@@ -1129,10 +1129,11 @@ impl WindowPresenter {
 
         pools.batch_flush(ctx, counters)?;
         let selected = source.and_then(|source| {
-            let slot = pools.registry_get(&source.identity)?;
-            super::pools::slot_presentable(slot, source.width, source.height).then(|| {
+            let source = source.source();
+            let slot = pools.registry_get(source.identity())?;
+            super::pools::slot_presentable(slot, source.width(), source.height()).then(|| {
                 (
-                    source.identity.clone(),
+                    source.identity().clone(),
                     slot.image,
                     slot.access,
                     slot.width,
@@ -1149,7 +1150,7 @@ impl WindowPresenter {
             // Failure path only: re-read the slot to name WHY the resident could
             // not carry. Cheap because it never runs on a good frame.
             let state = source
-                .and_then(|source| pools.registry_get(&source.identity))
+                .and_then(|source| pools.registry_get(source.source().identity()))
                 .map_or(CandidateState::default(), |slot| CandidateState {
                     resident: true,
                     content_ready: slot.content_ready,
@@ -1157,7 +1158,10 @@ impl WindowPresenter {
                     width: slot.width,
                     height: slot.height,
                 });
-            let want = source.map_or((0, 0), |s| (s.width, s.height));
+            let want = source.map_or((0, 0), |s| {
+                let source = s.source();
+                (source.width(), source.height())
+            });
             let reason = classify_slate(source.is_some(), want, state);
             let staged = cpu
                 .filter(cpu_frame_complete)
@@ -1247,7 +1251,7 @@ impl WindowPresenter {
                 // native resize normally makes this the full window within
                 // milliseconds). The window input path maps pointer positions
                 // through this same transform.
-                let vp = crate::viewport::aspect_fit(
+                let vp = reims_vgpu_core::aspect_fit_viewport(
                     (base_width, base_height),
                     (self.extent.width, self.extent.height),
                 );
@@ -1426,7 +1430,11 @@ impl WindowPresenter {
                 self.note_cadence(true, finished.direct);
                 Ok(WindowPresentDispatch::Complete(
                     WindowPresentOutcome::Presented {
-                        direct: finished.direct,
+                        route: if finished.direct {
+                            reims_vgpu_core::PresentationRoute::Resident
+                        } else {
+                            reims_vgpu_core::PresentationRoute::CpuBgra
+                        },
                         width: finished.width,
                         height: finished.height,
                         swapchain_images: finished.swapchain_images,

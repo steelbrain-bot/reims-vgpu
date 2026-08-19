@@ -2,7 +2,7 @@
 //!
 //! C owns the QEMU DisplaySurface; Rust fills it (apple-gfx's
 //! encodeCurrentFrame / getBytes role). Page-table paint uses
-//! [`crate::contract::iosurface_pages`] when the mapping has entries;
+//! [`reims_vgpu_protocol::iosurface`] when the mapping has entries;
 //! otherwise we fall back to the programmed EFI framebuffer or clear.
 //!
 //! Early-boot / present policy (archive apple-pv-gpu + live Monterey + PGDisplay):
@@ -22,12 +22,13 @@
 //!   it (`hostPresentCount`). Freeze is at present (before stamp completion
 //!   lets the guest recycle the mid), not deferred to BH after stamp.
 
-use crate::contract::pixel_format::{
+use crate::model::{scanout_extent_ok, EFI_BOOT_HEIGHT, EFI_BOOT_WIDTH};
+use crate::runtime::host::HostMemory;
+use crate::runtime::Device;
+use reims_vgpu_core::pixel_format::{
     self, convert_rgba8_to_row, convert_row_to_rgba8, MTL_FORMAT_BGRA8_UNORM,
     MTL_FORMAT_RGBA16_FLOAT, MTL_FORMAT_RGBA8_UNORM, RGBA8_BPP,
 };
-use crate::model::{scanout_extent_ok, DeviceState, EFI_BOOT_HEIGHT, EFI_BOOT_WIDTH};
-use crate::runtime::host::HostMemory;
 
 /// IOSurface texture color formats that may be the compositor front before DisplaySwap.
 ///
@@ -60,7 +61,7 @@ pub enum ScanoutCopyResult {
 /// Backend-agnostic on purpose: it resolves and scatters guest pages and
 /// for the same reason the Vulkan arm does.
 pub fn read_mapping_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     mapping_id: u32,
     dst: &mut [u8],
@@ -106,9 +107,8 @@ pub fn read_mapping_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
 /// first capture onward, and the line count is bounded by log2 of the capture
 /// count — about twenty lines per boot even if the rate rises by orders of
 /// magnitude, so there is no interval to re-tune when it does.
-fn maybe_log_capture_sampling(state: &DeviceState) {
-    let full = state.present.full_captures;
-    let light = state.present.light_captures;
+fn maybe_log_capture_sampling(state: &Device) {
+    let (full, light) = state.presentation.present.capture_counts();
     let total = full.wrapping_add(light);
     if total != 0 && total.is_power_of_two() {
         crate::observe::off(format!("capture_sampling full={full} light={light}"));
@@ -122,9 +122,8 @@ fn maybe_log_capture_sampling(state: &DeviceState) {
 /// (keep-prior) — there is no guest-page path left for the caller to take. A miss
 /// is an expected steady-state condition (cold mid / no resident yet), so it is
 /// counted in the `capture_source` census rather than logged per present.
-#[cfg(feature = "backend-vulkan")]
 fn try_capture_from_resident(
-    state: &mut crate::model::DeviceState,
+    state: &mut crate::runtime::Device,
     buf: &mut Vec<u8>,
     mapping_id: u32,
     width: u32,
@@ -137,21 +136,10 @@ fn try_capture_from_resident(
         return false;
     };
     debug_assert_eq!(bgra.len(), need);
-    // Move (not copy) the readback in; the untouched scratch returns to the pool.
-    state.present.capture_scratch = std::mem::replace(buf, bgra);
+    // Move (not copy) the readback in. Publishing the completed capture recycles
+    // the prior retained frame as the next scratch buffer.
+    *buf = bgra;
     true
-}
-
-/// Non-Vulkan backends have no resident registry; capture stays on guest pages.
-#[cfg(not(feature = "backend-vulkan"))]
-fn try_capture_from_resident(
-    _state: &mut crate::model::DeviceState,
-    _buf: &mut [u8],
-    _mapping_id: u32,
-    _width: u32,
-    _height: u32,
-) -> bool {
-    false
 }
 
 /// Snapshot the named mapping into the stable present frame.
@@ -167,7 +155,7 @@ fn try_capture_from_resident(
 /// keeps the prior retain rather than opening a third vein — see the note at the
 /// resident read for why the guest-page fallback was deleted instead of kept.
 pub fn capture_present_frame(
-    state: &mut DeviceState,
+    state: &mut Device,
     mapping_id: u32,
     width: u32,
     height: u32,
@@ -191,9 +179,10 @@ pub fn capture_present_frame(
     // resolved `generation` from that same entry and a second parameter is a
     // second chance for the two to name different mappings.
     let content_epoch = state
+        .surfaces
         .mappings
         .get(&mapping_id)
-        .map(|m| m.surface_content_epoch)
+        .map(|m| m.content.surface_epoch)
         .unwrap_or(0);
     state.advance_present_epoch();
     // --- Capture readback elision ---
@@ -221,7 +210,7 @@ pub fn capture_present_frame(
     //
     // Consequence: with a resident carrying, `frame_bgra` holds no frame for this
     // present, and the branch below drops it so that stays literally true.
-    let display_needs_cpu_frame = !state.present.display_from_resident;
+    let display_needs_cpu_frame = !state.presentation.present.display_from_resident();
     if !display_needs_cpu_frame {
         // Publish the new resident and leave `frame_bgra` empty: the window
         // ignores CPU pixels while the resident carries the display. A publish
@@ -244,20 +233,18 @@ pub fn capture_present_frame(
         // prevent, reintroduced through a buffer it could not see was stale. The
         // console blit is gated on the same emptiness and would have painted
         // those bytes as the live frame.
-        state.present.frame_bgra.clear();
-        state.present.frame_mapping = mapping_id;
-        state.present.frame_width = width;
-        state.present.frame_height = height;
-        state.present.frame_generation = generation;
-        state.present.frame_content_epoch = content_epoch;
-        state.present.frame_valid = true;
-        // First host paint after a present blits +0x188 (mirror the full path).
-        state.present.frame_encode_pending = true;
-        state.present.light_captures = state.present.light_captures.wrapping_add(1);
+        state.presentation.present.publish_light_frame(
+            mapping_id,
+            width,
+            height,
+            generation,
+            content_epoch,
+        );
+        state.presentation.present.note_light_capture();
         maybe_log_capture_sampling(state);
         return true;
     }
-    state.present.full_captures = state.present.full_captures.wrapping_add(1);
+    state.presentation.present.note_full_capture();
     maybe_log_capture_sampling(state);
     // Attribute this capture's lock hold to the tranche `capture_us` bucket (it
     // runs on the present drain, not a render draw). Every real return below
@@ -269,7 +256,7 @@ pub fn capture_present_frame(
     // `copy_from_slice`, `paint_mapping` row fill, or the reuse-store copy), so
     // no pre-zero is needed. On failure `buf` returns to `capture_scratch`
     // unchanged, leaving the prior `frame_bgra` retain intact (keep-prior).
-    let mut buf = std::mem::take(&mut state.present.capture_scratch);
+    let mut buf = state.presentation.present.take_capture_scratch();
     buf.clear();
     buf.resize(need, 0);
     // Prefer host render-cache when encode/clear wrote it (Linux discrete GPU
@@ -310,10 +297,11 @@ pub fn capture_present_frame(
         crate::observe::off(format!(
             "present_capture FAIL mid={mapping_id} {width}x{height} gen={generation} \
              reason=no_resident_content present_mapping={} frame_mapping={}",
-            state.present.present_mapping, state.present.frame_mapping
+            state.presentation.present.presented_mapping(),
+            state.presentation.present.frame().mapping()
         ));
         // Recycle the untouched scratch; the prior retain stays intact.
-        state.present.capture_scratch = buf;
+        state.presentation.present.return_capture_scratch(buf);
         return false;
     }
     // Capture provenance, and there are only two sources to name: the surface backing
@@ -351,28 +339,27 @@ pub fn capture_present_frame(
             px0[1],
             px0[2],
             px0[3],
-            state.present.present_mapping,
-            state.present.frame_mapping,
-            state.present.frame_flush_seen as u8,
+            state.presentation.present.presented_mapping(),
+            state.presentation.present.frame().mapping(),
+            state.presentation.present.content_boundary_crossed() as u8,
         ));
     }
     // Publish the new frame and recycle the old retain buffer as the next
     // capture scratch (warm 8 MiB alloc, no per-present malloc/free/zero).
-    let old_frame = std::mem::replace(&mut state.present.frame_bgra, buf);
-    state.present.capture_scratch = old_frame;
-    state.present.frame_mapping = mapping_id;
-    state.present.frame_width = width;
-    state.present.frame_height = height;
-    state.present.frame_generation = generation;
-    state.present.frame_content_epoch = content_epoch;
-    state.present.frame_valid = true;
+    state.presentation.present.publish_captured_frame(
+        buf,
+        mapping_id,
+        width,
+        height,
+        generation,
+        content_epoch,
+    );
     // Force the next host paint to blit +0x188. Early pre-boundary paints may
     // have latched painted_mapping/generation (live IOSurface texture paint_mapping or
     // paint_efi_console) to the same mid+gen; with encode_pending=false that made
     // copy_to_bgra8 return Unchanged and left the QEMU console on frozen EFI
     // while +0x188 held logo+pill (live serial-20260715-054015:
     // present_capture rgb_nz≈6k then present_paint Unchanged only).
-    state.present.frame_encode_pending = true;
     true
 }
 
@@ -424,13 +411,19 @@ fn blit_bgra_buffer(src: &[u8], dst: &mut [u8], dst_stride: u32, width: u32, hei
 /// Mid-writeback is_front Stores must **not** recapture +0x188 (archive:
 /// post-boundary front writebacks do not paint — tile-through thrash).
 fn blit_present_snapshot(
-    state: &DeviceState,
+    state: &Device,
     dst: &mut [u8],
     dst_stride: u32,
     width: u32,
     height: u32,
 ) -> bool {
-    blit_bgra_buffer(&state.present.frame_bgra, dst, dst_stride, width, height)
+    blit_bgra_buffer(
+        state.presentation.present.frame().pixels(),
+        dst,
+        dst_stride,
+        width,
+        height,
+    )
 }
 
 /// Fill `dst` (BGRA8, `dst_stride` bytes/row) for the named mapping.
@@ -451,7 +444,7 @@ fn blit_present_snapshot(
     reason = "the scanout copy API mirrors its destination and present geometry"
 )]
 pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     mapping_id: u32,
     dst: &mut [u8],
@@ -469,24 +462,30 @@ pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
     }
     // PGDisplay encodeCurrentFrame always re-shows +0x188 when the retain
     // matches paint geom — frozen at presentFrame (present boundary only).
-    if state.present.frame_valid
-        && state.present.frame_width == width
-        && state.present.frame_height == height
-        && !state.present.frame_bgra.is_empty()
+    if state.presentation.present.frame().is_valid()
+        && state
+            .presentation
+            .present
+            .frame()
+            .matches_geometry(width, height)
+        && !state.presentation.present.frame().pixels().is_empty()
     {
-        if !state.present.frame_encode_pending
-            && state.present.painted_mapping == state.present.frame_mapping
-            && state.present.painted_generation == state.present.frame_generation
+        if !state.presentation.present.frame().encode_pending()
+            && state.presentation.present.console_already_painted(
+                state.presentation.present.frame().mapping(),
+                state.presentation.present.frame().generation(),
+            )
         {
             crate::observe::off(format!(
                 "present_paint Unchanged mid={} gen={} (console already holds +0x188)",
-                state.present.frame_mapping, state.present.frame_generation
+                state.presentation.present.frame().mapping(),
+                state.presentation.present.frame().generation()
             ));
             return ScanoutCopyResult::Unchanged;
         }
         if blit_present_snapshot(state, dst, dst_stride, width, height) {
-            let shown_mid = state.present.frame_mapping;
-            let shown_gen = state.present.frame_generation;
+            let shown_mid = state.presentation.present.frame().mapping();
+            let shown_gen = state.presentation.present.frame().generation();
             // Reuse the fused scan `capture_present_frame` already ran over this
             // frozen frame instead of two more full 8 MiB passes under the lock.
             // `frame_bgra` has a single writer (capture), so a matching
@@ -502,7 +501,7 @@ pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
             // `present_proxy` summary.
             if crate::observe::draw_log_enabled() {
                 let (nz, maxb, rgb_nz, max_rgb, px0) =
-                    crate::observe::bgra_present_stats(&state.present.frame_bgra);
+                    crate::observe::bgra_present_stats(state.presentation.present.frame().pixels());
                 crate::observe::line(format!(
                     "scanout paint_snapshot mid={} (action mid={} gen={}) {}x{} retain_gen={} nz={} max={}",
                     shown_mid, mapping_id, expected_generation, width, height, shown_gen, nz, maxb
@@ -512,47 +511,55 @@ pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
                     px0[0], px0[1], px0[2], px0[3]
                 ));
             }
-            state.present.valid = true;
-            state.present.width = width;
-            state.present.height = height;
-            state.present.generation = shown_gen;
-            state.present.painted_mapping = shown_mid;
-            state.present.painted_generation = shown_gen;
+            state
+                .presentation
+                .present
+                .record_console_paint(shown_mid, width, height, shown_gen);
             // First successful +0x188 blit after capture clears encode pending.
-            state.present.frame_encode_pending = false;
+            state.presentation.present.mark_frame_encoded();
             return ScanoutCopyResult::Painted;
         }
     }
 
     // Present-path after first content boundary: never fall through to live
     // paint_mapping of a clear-only dual-mid (would freeze console black).
-    let post_boundary = state.present.frame_flush_seen
-        && width == state.present.width
-        && height == state.present.height;
+    let post_boundary = state.presentation.present.content_boundary_crossed()
+        && state
+            .presentation
+            .present
+            .console_matches_geometry(width, height);
 
     if post_boundary {
-        let is_current_present =
-            mapping_id == state.present.host_mapping || mapping_id == state.present.present_mapping;
+        let is_current_present = state.presentation.present.is_current_present(mapping_id);
 
         // Capture failed at DisplaySwap for the still-current present — retry once.
         if is_current_present
-            && (state.present.frame_encode_pending || !state.present.frame_valid)
-            && (expected_generation == 0 || expected_generation == state.present.generation)
+            && (state.presentation.present.frame().encode_pending()
+                || !state.presentation.present.frame().is_valid())
+            && (expected_generation == 0
+                || expected_generation == state.presentation.present.console_generation())
         {
             let gen = if expected_generation != 0 {
                 expected_generation
             } else {
-                state.present.generation
+                state.presentation.present.console_generation()
             };
             let _ = capture_present_frame(state, mapping_id, width, height, gen);
-            if state.present.frame_valid
-                && state.present.frame_width == width
-                && state.present.frame_height == height
+            if state.presentation.present.frame().is_valid()
+                && state
+                    .presentation
+                    .present
+                    .frame()
+                    .matches_geometry(width, height)
                 && blit_present_snapshot(state, dst, dst_stride, width, height)
             {
-                state.present.painted_mapping = state.present.frame_mapping;
-                state.present.painted_generation = state.present.frame_generation;
-                state.present.frame_encode_pending = false;
+                let shown_mid = state.presentation.present.frame().mapping();
+                let shown_gen = state.presentation.present.frame().generation();
+                state
+                    .presentation
+                    .present
+                    .record_painted_identity(shown_mid, shown_gen);
+                state.presentation.present.mark_frame_encoded();
                 return ScanoutCopyResult::Painted;
             }
         }
@@ -593,12 +600,12 @@ pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
             "scanout paint_mapping ok mid={} {}x{} gen={} nz={} max={}",
             mapping_id, width, height, expected_generation, nz, maxb
         ));
-        state.present.valid = true;
-        state.present.width = width;
-        state.present.height = height;
-        state.present.generation = expected_generation;
-        state.present.painted_mapping = mapping_id;
-        state.present.painted_generation = expected_generation;
+        state.presentation.present.record_console_paint(
+            mapping_id,
+            width,
+            height,
+            expected_generation,
+        );
         ScanoutCopyResult::Painted
     } else if paint_efi_console(state, host, dst, dst_stride, width, height) {
         // EFI/BAR1 fallback fills the console for early verbose boot only.
@@ -606,10 +613,10 @@ pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
         // that made post-capture Unchanged skip +0x188 (logo/pill retain)
         // while the console still held EFI text.
         crate::observe::line(format!("scanout paint_efi ok {}x{}", width, height));
-        state.present.valid = true;
-        state.present.width = width;
-        state.present.height = height;
-        state.present.generation = expected_generation;
+        state
+            .presentation
+            .present
+            .establish_console(width, height, expected_generation);
         ScanoutCopyResult::Painted
     } else {
         // Always-on: a total paint failure means a black/stale console. Logging
@@ -629,14 +636,14 @@ pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
 /// the guest relocates the kernel video console off BAR1 into system RAM
 /// (live serial: `console relocated to 0xf1000000` while BAR1 freezes).
 pub fn paint_efi_console<M: HostMemory + crate::runtime::host::HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     dst: &mut [u8],
     dst_stride: u32,
     width: u32,
     height: u32,
 ) -> bool {
-    let fb = state.gfx.efi_fb_start;
+    let fb = state.registers.gfx.efi_fb_start;
     if fb == 0 {
         return false;
     }
@@ -649,8 +656,8 @@ pub fn paint_efi_console<M: HostMemory + crate::runtime::host::HostOps>(
     if width != efi_w || height != efi_h {
         return false;
     }
-    let stride = if state.gfx.efi_fb_stride != 0 {
-        state.gfx.efi_fb_stride
+    let stride = if state.registers.gfx.efi_fb_stride != 0 {
+        state.registers.gfx.efi_fb_stride
     } else {
         efi_w.saturating_mul(RGBA8_BPP)
     };
@@ -935,7 +942,7 @@ struct PaintDst<'a> {
 /// and the sampled arm's invisible. Taken as an argument rather than named here
 /// so a third caller has to state which it is.
 fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     mapping_id: u32,
     dst: PaintDst<'_>,
@@ -968,27 +975,27 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
     // and settles.
     crate::runtime::writeback_debt::settle_for_mapping(state, mapping_id, site);
 
-    let Some(m) = state.mappings.get(&mapping_id) else {
+    let Some(m) = state.surfaces.mappings.get(&mapping_id) else {
         return fail(CaptureDecline::NoMapping);
     };
     // Split the two teardown-window causes so a scanout paint miss names which
     // one fired (AGENTS.md: each distinct check owns its slug) — `unmapped` is
     // the guest having paged the surface off, `no_pages` an empty page list from
     // a resolve gap; both are benign-transient but must stay distinguishable.
-    if !m.mapped {
+    if !m.lifecycle.active {
         return fail(CaptureDecline::Unmapped);
     }
-    if m.page_entries.is_empty() {
+    if m.pages.entries.is_empty() {
         return fail(CaptureDecline::NoPages);
     }
     // Geometry must be latched (same rule as write_bgra8 / archive scanout_iosurface_texture).
-    if !m.has_geom || m.width == 0 || m.height == 0 {
+    if !m.has_geometry() || m.width_or_zero() == 0 || m.height_or_zero() == 0 {
         return fail(CaptureDecline::NoGeom);
     }
-    let mw = m.width;
-    let mh = m.height;
-    let format = if m.format != 0 {
-        m.format
+    let mw = m.width_or_zero();
+    let mh = m.height_or_zero();
+    let format = if m.format_or_zero() != 0 {
+        m.format_or_zero()
     } else {
         MTL_FORMAT_BGRA8_UNORM
     };
@@ -1135,14 +1142,14 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
 }
 
 /// Resolve host-visible width/height for a scanout action from guest mapping geom.
-pub fn present_dims(state: &DeviceState, mapping_id: u32) -> (u32, u32) {
-    if let Some(m) = state.mappings.get(&mapping_id) {
-        if m.has_geom && m.width > 0 && m.height > 0 {
-            return (m.width, m.height);
+pub fn present_dims(state: &Device, mapping_id: u32) -> (u32, u32) {
+    if let Some(m) = state.surfaces.mappings.get(&mapping_id) {
+        if m.has_geometry() && m.width_or_zero() > 0 && m.height_or_zero() > 0 {
+            return (m.width_or_zero(), m.height_or_zero());
         }
     }
-    if state.present.width > 0 && state.present.height > 0 {
-        return (state.present.width, state.present.height);
+    if let Some(geometry) = state.presentation.present.console_dimensions() {
+        return geometry;
     }
     (0, 0)
 }
@@ -1158,7 +1165,7 @@ pub fn present_dims(state: &DeviceState, mapping_id: u32) -> (u32, u32) {
 ///   0x73); accept those formats pre-boundary. Post-boundary paint is DisplaySwap
 ///   only — writebacks must not rename `present_mapping` after `frame_flush_seen`.
 pub fn note_front_buffer_writeback<M: HostMemory + crate::runtime::host::HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     mapping_id: u32,
     width: u32,
@@ -1170,17 +1177,18 @@ pub fn note_front_buffer_writeback<M: HostMemory + crate::runtime::host::HostOps
     if mapping_id == 0 || !scanout_extent_ok(width, height) {
         return;
     }
-    let (map_fmt, mapped_ok, has_geom, map_w, map_h, gen) = match state.mappings.get(&mapping_id) {
-        Some(m) => (
-            m.format,
-            m.mapped && !m.page_entries.is_empty(),
-            m.has_geom && m.width > 0 && m.height > 0,
-            m.width,
-            m.height,
-            m.content_generation,
-        ),
-        None => return,
-    };
+    let (map_fmt, mapped_ok, has_geom, map_w, map_h, gen) =
+        match state.surfaces.mappings.get(&mapping_id) {
+            Some(m) => (
+                m.format_or_zero(),
+                m.lifecycle.active && !m.pages.entries.is_empty(),
+                m.has_geometry() && m.width_or_zero() > 0 && m.height_or_zero() > 0,
+                m.width_or_zero(),
+                m.height_or_zero(),
+                m.content.guest_page_generation,
+            ),
+            None => return,
+        };
     let fmt = if rt_format != 0 { rt_format } else { map_fmt };
     if !is_front_buffer_format(fmt) {
         return;
@@ -1193,20 +1201,20 @@ pub fn note_front_buffer_writeback<M: HostMemory + crate::runtime::host::HostOps
     // `present_mapping` (PGDisplay presents the surface named by DisplaySwap).
     // Still track Composite full-FB writebacks as dual-mid peer for ClearOnly
     // present capture (x86: present mid 2/3 ClearOnly, content mid 1/4/5).
-    if state.present.frame_flush_seen {
+    if state.presentation.present.content_boundary_crossed() {
         if matches!(
             state.surface_write_kind(mapping_id),
             crate::model::SurfaceWriteKind::Composite
-        ) && state.present.width > 0
-            && state.present.height > 0
-            && width == state.present.width
-            && height == state.present.height
+        ) && state
+            .presentation
+            .present
+            .console_matches_geometry(width, height)
         {
             // Track the latest Composite full-FB writeback. Pre-boundary this
             // feeds `early_scanout_target`; post-boundary it is the peer named
             // on the `front_wb` / `present_order_hold` lines. Always update
             // here so a later writeback into the same mid refreshes the gen.
-            state.present.early_front_mapping = mapping_id;
+            state.presentation.present.note_early_composite(mapping_id);
         }
         return;
     }
@@ -1214,12 +1222,19 @@ pub fn note_front_buffer_writeback<M: HostMemory + crate::runtime::host::HostOps
     // Archive same_geom vs s->surface: first enqueue establishes provisional
     // console size; later early-boot paints only when job matches. No min/max
     // dimension clamps — different sizes are refused, not rewritten to EFI.
-    let console_established =
-        state.present.valid && state.present.width > 0 && state.present.height > 0;
-    if console_established && (width != state.present.width || height != state.present.height) {
+    let console_established = state.presentation.present.console_geometry().is_some();
+    if console_established
+        && !state
+            .presentation
+            .present
+            .console_matches_geometry(width, height)
+    {
         // Still latch which front the compositor is writing for early_scanout,
         // but do not resize/paint (mode change waits for DisplaySwap).
-        state.present.present_mapping = mapping_id;
+        state
+            .presentation
+            .present
+            .note_present_candidate(mapping_id);
         return;
     }
 
@@ -1237,11 +1252,14 @@ pub fn note_front_buffer_writeback<M: HostMemory + crate::runtime::host::HostOps
     // Establish console size at enqueue so subsequent different-geom writebacks
     // hit the barrier even before C finishes copy (archive surface after paint
     // is sequential; our async HostAction queue needs the latch here).
-    state.present.present_mapping = mapping_id;
-    state.present.valid = true;
-    state.present.width = paint_w;
-    state.present.height = paint_h;
-    state.present.generation = gen;
+    state
+        .presentation
+        .present
+        .note_present_candidate(mapping_id);
+    state
+        .presentation
+        .present
+        .establish_console(paint_w, paint_h, gen);
     // Sticky early front: only Composite Stores own the pre-boundary console.
     // ClearOnly buffer-setup presents may overwrite present_mapping but must not
     // clear this — otherwise gfx_update falls back to BAR1 (kdp log thrash).
@@ -1249,12 +1267,12 @@ pub fn note_front_buffer_writeback<M: HostMemory + crate::runtime::host::HostOps
         state.surface_write_kind(mapping_id),
         crate::model::SurfaceWriteKind::Composite
     ) {
-        state.present.early_front_mapping = mapping_id;
+        state.presentation.present.note_early_composite(mapping_id);
     }
 
     crate::observe::line(format!(
         "front_wb LATCH mid={mapping_id} {paint_w}x{paint_h} gen={gen} fmt={fmt:#x} early_front={} (pre-boundary early paint enqueue)",
-        state.present.early_front_mapping
+        state.presentation.present.early_composite_mapping()
     ));
     host.enqueue(HostAction::scanout_gen(mapping_id, paint_w, paint_h, gen));
 }
@@ -1291,11 +1309,11 @@ pub fn note_front_buffer_writeback<M: HostMemory + crate::runtime::host::HostOps
 ///
 /// Blast radius, for whoever revisits this: it returns `None` once
 /// `frame_flush_seen`, so all of it is early boot only.
-pub fn early_scanout_target(state: &DeviceState) -> Option<(u32, u32, u32, u32)> {
-    if state.present.frame_flush_seen {
+pub fn early_scanout_target(state: &Device) -> Option<(u32, u32, u32, u32)> {
+    if state.presentation.present.content_boundary_crossed() {
         return None;
     }
-    let mapping_id = state.present.early_front_mapping;
+    let mapping_id = state.presentation.present.early_composite_mapping();
     if mapping_id == 0 {
         return None;
     }
@@ -1303,29 +1321,27 @@ pub fn early_scanout_target(state: &DeviceState) -> Option<(u32, u32, u32, u32)>
     if matches!(
         state.surface_write_kind(mapping_id),
         crate::model::SurfaceWriteKind::ClearOnly
-    ) && !state.present.frame_valid
+    ) && !state.presentation.present.frame().is_valid()
     {
         return None;
     }
-    let m = state.mappings.get(&mapping_id)?;
-    if !m.mapped {
+    let m = state.surfaces.mappings.get(&mapping_id)?;
+    if !m.lifecycle.active {
         return None;
     }
-    if m.format != 0 && !is_front_buffer_format(m.format) {
+    if m.format_or_zero() != 0 && !is_front_buffer_format(m.format_or_zero()) {
         return None;
     }
     let (w, h) = present_dims(state, mapping_id);
     if w == 0 || h == 0 {
         return None;
     }
-    if state.present.valid
-        && state.present.width > 0
-        && state.present.height > 0
-        && (w != state.present.width || h != state.present.height)
+    if state.presentation.present.console_geometry().is_some()
+        && !state.presentation.present.console_matches_geometry(w, h)
     {
         return None;
     }
-    Some((mapping_id, w, h, m.content_generation))
+    Some((mapping_id, w, h, m.content.guest_page_generation))
 }
 
 #[cfg(test)]

@@ -36,7 +36,7 @@
 //! | phase | from | to | what would fix it |
 //! |---|---|---|---|
 //! | `prep` | `encode_draw_chain` entry | the metal2vulkan call | the CLEAR-only fast path, which never leaves this phase |
-//! | `pipeline` | there | both shaders translated | `runtime::pipeline_resolve` (backend-vulkan only, so named not linked), which is what the five bars below it were measured to justify |
+//! | `pipeline` | there | both shaders translated | `runtime::pipeline_resolve`, which is what the five bars below it were measured to justify |
 //! | `binds` | there | vertex/fragment buffer content materialized | zero-copy buffer binds |
 //! | `sampled` | there | every sampled image and sampler resolved | the gather witness and the sampled cache |
 //! | `seed` | there | the colour Load seed resolved | resident Load elision |

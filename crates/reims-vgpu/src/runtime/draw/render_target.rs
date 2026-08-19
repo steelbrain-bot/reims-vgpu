@@ -60,7 +60,7 @@
 use super::*;
 /// The colour render target's base format for a **surface backing** surface, or nothing.
 ///
-/// On this arm `m.format == 0` is not "unset", it is a decoded refusal:
+/// On this arm `m.format_or_zero() == 0` is not "unset", it is a decoded refusal:
 /// [`objects::apply_surface_backing`] is the only writer of it, and it stores 0 for
 /// a multi-plane surface and for a single-plane one whose FourCC it does not
 /// know, saying why — "stage/paint must not invent BGRA".
@@ -719,7 +719,7 @@ impl crate::observe::Decline for RenderTargetRefusal {
 /// handled here rather than in [`resolve_render_target`] so that everything the
 /// resolver can return is a genuine loss, and every one of them is reported.
 pub(super) fn lookup_render_target<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &M,
     task_id: u32,
     att: crate::runtime::decode::render::ColorAttachment,
@@ -753,7 +753,7 @@ pub(super) fn lookup_render_target<M: HostMemory + HostOps>(
 /// bug at a time, and a source-scanning gate over it would have to understand
 /// four rungs of control flow to say anything.
 fn resolve_render_target<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &M,
     task_id: u32,
     att: crate::runtime::decode::render::ColorAttachment,
@@ -791,7 +791,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     }
     // Archive lookup order is by **live** object-list type + descriptor, not a
     // sticky cache: IOSurface texture first, else type-2/3. Guest reuses object refs;
-    // two failure modes for a stale `texture_to_mapping` latch:
+    // two failure modes for a stale IOSurface mapping relation:
     // 1) live type is now type-2/3 → must not force IOSurface texture (live residual
     //    mrt color RT resolve fail ref=199 type=2 fmt=0x73 480x64).
     // 2) live type is still IOSurface texture but descriptor mapping_id changed (or a
@@ -803,15 +803,21 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     let live_type = live.as_ref().map(|e| e.kind);
     if let Some(ot) = live_type {
         if ot != ObjectKind::IOSurfaceTexture {
-            // Live list says not IOSurface texture — drop any recycled-ref latch.
-            state.texture_to_mapping.remove(&(task_id, resolved_ref));
+            // Synthetic fixtures may carry the retired side-map relation. A
+            // product relation belongs to its retained resource and disappears
+            // with that resource's explicit deletion.
+            #[cfg(test)]
+            state
+                .fixtures
+                .texture_to_mapping
+                .remove(&(task_id, resolved_ref));
         }
     }
     let try_iosurface_texture = live_type == Some(ObjectKind::IOSurfaceTexture)
         || (live_type.is_none()
             && state
-                .texture_to_mapping
-                .contains_key(&(task_id, resolved_ref)));
+                .registered_texture_mapping(task_id, resolved_ref)
+                .is_some());
     if try_iosurface_texture {
         // IOSurface texture sample windows carry planes, not mip levels — a mip>0 view
         // of an IOSurface has no contract-backed layout; fail visibly.
@@ -822,19 +828,14 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         // Latch is only a fallback when the list entry is transiently missing
         // (resolve_iosurface_texture_ref refreshes the latch from the live descriptor).
         let mapping_id = if live_type == Some(ObjectKind::IOSurfaceTexture) {
-            objects::resolve_iosurface_texture_ref(state, host, task_id, resolved_ref).or_else(
-                || {
-                    state
-                        .texture_to_mapping
-                        .get(&(task_id, resolved_ref))
-                        .copied()
-                },
-            )
+            // A live mapper descriptor whose explicit mapper-service edge is
+            // absent must refuse. Falling back to an older texture latch here
+            // aliases two namespaces and can render into the previous surface
+            // after a reference is recycled.
+            objects::resolve_iosurface_texture_ref(state, host, task_id, resolved_ref)
         } else {
             state
-                .texture_to_mapping
-                .get(&(task_id, resolved_ref))
-                .copied()
+                .registered_texture_mapping(task_id, resolved_ref)
                 .or_else(|| {
                     objects::resolve_iosurface_texture_ref(state, host, task_id, resolved_ref)
                 })
@@ -849,15 +850,16 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         // `NoListEntry`: falling through reported the ladder's least specific
         // refusal for a failure the IOSurface texture rung had already diagnosed.
         let m = state
+            .surfaces
             .mappings
             .get(&mapping_id)
             .ok_or(C::IOSurfaceNoMapping { mapping_id }.at(resolved_ref))?;
-        if !m.has_geom || m.width == 0 || m.height == 0 {
+        if !m.has_geometry() || m.width_or_zero() == 0 || m.height_or_zero() == 0 {
             return Err(C::IOSurfaceGeometry {
                 mapping_id,
-                has_geom: m.has_geom,
-                width: m.width,
-                height: m.height,
+                has_geom: m.has_geometry(),
+                width: m.width_or_zero(),
+                height: m.height_or_zero(),
             }
             .at(resolved_ref));
         }
@@ -865,8 +867,8 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         // writers other than the surface backing decoder, so 0 here can mean "not
         // latched yet" rather than "refused", and BGRA8 is the display
         // contract's default for that case. See that function.
-        let base_fmt = if m.format != 0 {
-            m.format
+        let base_fmt = if m.format_or_zero() != 0 {
+            m.format_or_zero()
         } else {
             MTL_FORMAT_BGRA8_UNORM
         };
@@ -876,8 +878,8 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         }
         return Ok(ResolvedRenderTarget {
             storage: super::ColorTargetStorage::Mapping(mapping_id),
-            width: m.width,
-            height: m.height,
+            width: m.width_or_zero(),
+            height: m.height_or_zero(),
             format: fmt,
             sample_count: 1,
         });
@@ -892,16 +894,22 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     let surface_backing_sid = match live.as_ref() {
         Some(e) if e.kind == ObjectKind::SurfaceBacking => Some(resolved_ref),
         Some(e) if e.kind == ObjectKind::IOSurfacePlaneView => {
-            let desc = objects::read_descriptor(state, host, task_id, e)
-                .ok_or(C::IOSurfacePlaneViewDescRead.at(resolved_ref))?;
-            let sid = reims_vgpu_wire::device_desc::iosurface_plane_view_header(&desc)
-                .map_err(|_| C::IOSurfacePlaneViewDescDecode { len: desc.len() }.at(resolved_ref))?
-                .surface_id
-                .get();
+            let resource = objects::resolve_resource(state, host, task_id, resolved_ref)
+                .map_err(|_| C::IOSurfacePlaneViewDescRead.at(resolved_ref))?;
+            let t5 = match objects::decoded_resource(&resource) {
+                Ok(crate::runtime::decode::resource::Descriptor::IOSurfacePlaneView(view)) => view,
+                _ => {
+                    return Err(C::IOSurfacePlaneViewDescDecode {
+                        len: resource.descriptor().len(),
+                    }
+                    .at(resolved_ref));
+                }
+            };
+            let sid = t5.surface.get();
             if sid == 0 {
                 return Err(C::IOSurfacePlaneViewSurfaceZero.at(resolved_ref));
             }
-            iosurface_plane_view = objects::decode_iosurface_plane_view(&desc);
+            iosurface_plane_view = t5.view;
             Some(sid)
         }
         _ => None,
@@ -918,20 +926,26 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             .at(resolved_ref));
         }
         let m = state
+            .surfaces
             .mappings
             .get(&surface_id)
             .ok_or(C::SurfaceBackingNoMapping { surface_id }.at(resolved_ref))?;
-        if !m.has_geom || m.width == 0 || m.height == 0 || m.page_entries.is_empty() {
+        if !m.has_geometry()
+            || m.width_or_zero() == 0
+            || m.height_or_zero() == 0
+            || m.pages.entries.is_empty()
+        {
             return Err(C::SurfaceBackingGeometry {
                 surface_id,
-                has_geom: m.has_geom,
-                width: m.width,
-                height: m.height,
-                pages: m.page_entries.len(),
+                has_geom: m.has_geometry(),
+                width: m.width_or_zero(),
+                height: m.height_or_zero(),
+                pages: m.pages.entries.len(),
             }
             .at(resolved_ref));
         }
-        let (base_w, base_h, base_raw_fmt) = (m.width, m.height, m.format);
+        let (base_w, base_h, base_raw_fmt) =
+            (m.width_or_zero(), m.height_or_zero(), m.format_or_zero());
         if live_type == Some(ObjectKind::IOSurfacePlaneView) {
             note_rt_iosurface_plane_view(
                 iosurface_plane_view,
@@ -958,8 +972,8 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         // mapping_id = surface_id; no linear GVA.
         return Ok(ResolvedRenderTarget {
             storage: super::ColorTargetStorage::Mapping(surface_id),
-            width: m.width,
-            height: m.height,
+            width: m.width_or_zero(),
+            height: m.height_or_zero(),
             format: fmt,
             sample_count: 1,
         });
@@ -972,14 +986,23 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         }
         .at(resolved_ref));
     }
-    let desc_bytes = objects::read_descriptor(state, host, task_id, &entry)
-        .ok_or(C::LinearDescRead.at(resolved_ref))?;
-    let tex = decode_texture_descriptor(&desc_bytes).map_err(|status| {
-        C::LinearDescDecode {
-            decode: crate::observe::Decline::slug(&status),
+    let resource = objects::resolve_resource(state, host, task_id, resolved_ref)
+        .map_err(|_| C::LinearDescRead.at(resolved_ref))?;
+    let tex = match objects::decoded_resource(&resource) {
+        Ok(crate::runtime::decode::resource::Descriptor::Texture(tex)) => tex,
+        Err(status) => {
+            return Err(C::LinearDescDecode {
+                decode: status.slug(),
+            }
+            .at(resolved_ref));
         }
-        .at(resolved_ref)
-    })?;
+        Ok(_) => {
+            return Err(C::WrongType {
+                object_type: resource.entry().kind,
+            }
+            .at(resolved_ref));
+        }
+    };
     if tex.declared_pixel_format().is_none()
         || tex.extent().is_none()
         || tex.declared_row_stride().is_none()
@@ -1182,7 +1205,7 @@ mod tests {
     /// A surface backing colour attachment whose mapping carries the decoder's format
     /// refusal must be declined, and every decline must be counted.
     ///
-    /// `m.format == 0` on a surface backing mapping has exactly one writer,
+    /// `m.format_or_zero() == 0` on a surface backing mapping has exactly one writer,
     /// `apply_surface_backing`, and it means multi-plane or unknown FourCC — a surface
     /// that is not a single-format colour attachment. Inventing BGRA8 from it
     /// describes the wrong stride over the wrong bytes and every downstream window
@@ -1191,8 +1214,8 @@ mod tests {
     /// and read identically.
     #[test]
     fn a_surface_backing_render_target_declines_the_decoders_format_refusal() {
-        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
         use crate::runtime::drain::store_route_count;
+        use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
         let before = store_route_count("rt_base_fmt_declined");
         // A format the decoder resolved is passed through untouched and uncounted.
@@ -1222,10 +1245,10 @@ mod tests {
     /// on a driven macos-13 boot at icon size.
     #[test]
     fn a_iosurface_plane_views_declared_format_is_what_the_colour_attachment_attaches() {
-        use crate::contract::pixel_format::{
+        use crate::runtime::objects::IOSurfacePlaneViewDescriptor;
+        use reims_vgpu_core::pixel_format::{
             MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_BGRA8_UNORM_SRGB, MTL_FORMAT_RGBA16_FLOAT,
         };
-        use crate::runtime::objects::IOSurfacePlaneViewDescriptor;
 
         let extent = (300u32, 300u32);
         let view = |w, h, fmt| {
@@ -1379,7 +1402,7 @@ mod tests {
     /// for that as one bare `None`.
     #[test]
     fn an_unbound_attachment_stays_quiet_and_a_missing_one_names_its_rung() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
         let host = FakeHost::new();
 
         let cap = crate::observe::FailCapture::start();
@@ -1415,14 +1438,14 @@ mod tests {
     /// found and measured.
     #[test]
     fn a_iosurface_texture_latch_without_geometry_names_the_geometry_check() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
         let host = FakeHost::new();
         let tex_ref = 0x5c2u32;
 
         // A mapping exists and is latched for this ref, and the guest has not
         // declared its geometry yet.
         assert!(state.map_surface(77));
-        state.texture_to_mapping.insert((4, tex_ref), 77);
+        state.fixtures.texture_to_mapping.insert((4, tex_ref), 77);
 
         let cap = crate::observe::FailCapture::start();
         assert!(lookup_render_target(&mut state, &host, 4, attach(tex_ref)).is_none());
@@ -1455,7 +1478,7 @@ mod tests {
     /// takes for every desktop surface.
     #[test]
     fn a_repeated_refusal_on_the_same_attachment_reports_once() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
         let host = FakeHost::new();
         let tex_ref = 0x5c3u32;
 
@@ -1486,8 +1509,6 @@ mod tests {
     /// at LOD 0.
     #[test]
     fn a_colour_attachment_at_mip_one_resolves_that_levels_own_plane() {
-        use crate::contract::endian::{st16, st32, st64};
-        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
         use crate::model::PAGE_SHIFT_ARM64E;
         use crate::runtime::decode::resource::{
             list_object_entry_offset, LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_LIST_ENTRY_LEN,
@@ -1498,8 +1519,10 @@ mod tests {
             TEXTURE_LEVEL_SIZE, TEXTURE_LEVEL_WIDTH,
         };
         use crate::runtime::gva_mem::{self, write_task_gva_arm64e};
+        use reims_vgpu_core::endian::{st16, st32, st64};
+        use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let mut host = FakeHost::new();
         gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 16);
         assert!(state.set_object_list(1, 0, 256));
@@ -1600,8 +1623,6 @@ mod tests {
     /// rows overlapping in guest memory.
     #[test]
     fn a_linear_target_with_a_stride_narrower_than_its_own_row_names_both_numbers() {
-        use crate::contract::endian::{st16, st32, st64};
-        use crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT;
         use crate::model::PAGE_SHIFT_ARM64E;
         use crate::runtime::decode::resource::{
             list_object_entry_offset, LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_LIST_ENTRY_LEN,
@@ -1609,8 +1630,10 @@ mod tests {
             TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_WIDTH,
         };
         use crate::runtime::gva_mem::{self, write_task_gva_arm64e};
+        use reims_vgpu_core::endian::{st16, st32, st64};
+        use reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA16_FLOAT;
 
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let mut host = FakeHost::new();
         gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 16);
         assert!(state.set_object_list(1, 0, 256));

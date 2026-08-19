@@ -55,11 +55,11 @@ pub const MTL_BLIT_OPTION_KNOWN_MASK: u32 = MTL_BLIT_OPTION_DEPTH_FROM_DEPTH_STE
 
 /// Selected texture aspect for a buffer↔texture / options-bearing copy.
 ///
-/// Defined in [`crate::contract::pixel_format`], which is where every consumer
+/// Defined in [`reims_vgpu_core::pixel_format`], which is where every consumer
 /// of the choice lives, and re-exported here because this is where it is
 /// produced. One type, so the decoder's refusal of depth+stencil is the only
 /// place that state is ever considered.
-pub(crate) use crate::contract::pixel_format::BlitAspect;
+pub(crate) use reims_vgpu_core::pixel_format::BlitAspect;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlitOptionError {
@@ -492,8 +492,8 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::endian::{st16, st32, st64};
     use core::mem::offset_of;
+    use reims_vgpu_core::endian::{st16, st32, st64};
     use reims_vgpu_wire::OP_HEADER_LEN;
 
     // format offsets (payload-relative)
@@ -860,7 +860,7 @@ mod tests {
     /// that Apple never emits them.
     #[test]
     fn an_icb_blit_record_is_read_rather_than_refused_whole() {
-        use crate::contract::endian::st64;
+        use reims_vgpu_core::endian::st64;
         use reims_vgpu_wire::ops::blit as wire;
 
         for (op, wire_op) in [

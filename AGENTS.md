@@ -398,8 +398,7 @@ off, or a field two bytes too wide:
 
 ```sh
 RUSTDOCFLAGS="-A rustdoc::private_intra_doc_links" cargo doc -p reims-vgpu \
-  --no-deps --document-private-items \
-  --no-default-features --features backend-vulkan,host-window
+  --no-deps --document-private-items --no-default-features --features host-window
 ```
 
 Triage its output before editing anything, because most of it is not rot. Three classes, and only
@@ -963,7 +962,7 @@ field as an upper bound.
 Run the relevant native tests serially from the repo root:
 
 ```sh
-cargo test -p reims-vgpu --no-default-features --features backend-vulkan,host-window -- --test-threads=1
+cargo test -p reims-vgpu --no-default-features --features host-window -- --test-threads=1
 ```
 
 Run the feature matrix from the repo root when cfgs, features, backend boundaries, or shared Rust
@@ -1003,9 +1002,9 @@ Each commit should have a detailed message body that states:
 Rust commits should be warning-free under clippy with `-D warnings` for both supported targets:
 
 ```sh
-cargo clippy -p reims-vgpu --target aarch64-apple-darwin --all-targets --no-default-features --features backend-vulkan,host-window -- -D warnings
-cargo clippy -p reims-vgpu --all-targets --no-default-features --features backend-vulkan,host-window -- -D warnings
-cargo clippy -p reims-vgpu --target x86_64-unknown-linux-gnu --all-targets --no-default-features --features backend-vulkan,host-window -- -D warnings
+cargo clippy -p reims-vgpu --target aarch64-apple-darwin --all-targets --no-default-features --features host-window -- -D warnings
+cargo clippy -p reims-vgpu --all-targets --no-default-features --features host-window -- -D warnings
+cargo clippy -p reims-vgpu --target x86_64-unknown-linux-gnu --all-targets --no-default-features --features host-window -- -D warnings
 ```
 
 A commit touching `crates/reims-vgpu-efi` — its own workspace, so the commands above do not reach it

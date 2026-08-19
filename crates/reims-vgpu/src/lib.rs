@@ -2,13 +2,11 @@
 //!
 //! | Module | Role |
 //! | --- | --- |
-//! | [`contract`] | Stable facts: formats, layouts, pure arithmetic |
 //! | [`model`] | Live guest-visible state (regs, rings, objects, present) |
-//! | [`runtime`] | Drain / parse / resolve / plan / HostActions |
-//! | [`backend`] | Trait + self-contained [`backend::vulkan`] implementation |
+//! | [`runtime`] | Composition, drain, resolution, and executor adaptation |
 //! | [`qemu`] | QEMU C ABI surface only |
 //!
-//! The product path is self-contained `ash` ([`backend::vulkan::engine`]).
+//! The product executor is the sibling `reims-vgpu-vulkan` crate.
 //!
 //! # The two supported pathways
 //!
@@ -16,8 +14,8 @@
 //!
 //! | Arm | `cfg` | Host GPU API |
 //! | --- | --- | --- |
-//! | Vulkan / MoltenVK | `all(feature = "backend-vulkan", target_os = "macos")` | MoltenVK |
-//! | Vulkan / native | `all(feature = "backend-vulkan", target_os = "linux")` | native ICD |
+//! | Vulkan / MoltenVK | `target_os = "macos"` | MoltenVK |
+//! | Vulkan / native | `target_os = "linux"` | native ICD |
 //!
 //! **Gate the host on `target_os` and nothing else.** `macos` and `linux` are
 //! the only two values this crate names, so the pathways differ in one term
@@ -26,25 +24,20 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(rust_2018_idioms)]
 
-#[cfg(not(feature = "backend-vulkan"))]
-compile_error!("enable the backend-vulkan feature");
-
 // Vulkan reaches the GPU through MoltenVK on macOS and a native ICD on Linux.
 // Any other host is untested rather than known-broken — name it here so a new
 // port is a deliberate edit to this list, not an accident.
-#[cfg(all(
-    feature = "backend-vulkan",
-    not(any(target_os = "macos", target_os = "linux"))
-))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 compile_error!(
-    "backend-vulkan is supported on target_os = \"macos\" (MoltenVK) and \
+    "the Vulkan backend is supported on target_os = \"macos\" (MoltenVK) and \
      target_os = \"linux\" (native ICD) only"
 );
 
-pub mod contract;
 /// Every environment variable this device reads, and the rule that an override
 /// may only narrow what it does — see the module doc.
 pub mod env;
+#[cfg(test)]
+mod iosurface_contract_tests;
 pub mod model;
 /// Crate-wide observability: the always-on fail sink and the decline
 /// vocabulary. Above `runtime/` because every subsystem owes the reader a
@@ -53,11 +46,10 @@ pub mod model;
 pub mod observe;
 pub mod runtime;
 
-pub mod backend;
 pub mod qemu;
 
 /// Host-owned presentation window (winit + VkSurfaceKHR) — see
-/// [[host-window]]. The `host-window` feature implies `backend-vulkan`, and is
+/// [[host-window]]. The `host-window` feature adds the windowing adapter and is
 /// enabled for every verification command the x86 pathway is checked with.
 #[cfg(feature = "host-window")]
 pub mod host_window;

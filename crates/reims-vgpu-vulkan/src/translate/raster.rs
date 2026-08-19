@@ -17,82 +17,42 @@ use crate::engine::{
 
 /// `MTLPrimitiveType` (SDK numeric values).
 pub fn primitive_topology(mtl: u32) -> Result<PrimitiveTopology, TranslateReason> {
-    Ok(match mtl {
-        0 => PrimitiveTopology::Point,
-        1 => PrimitiveTopology::Line,
-        2 => PrimitiveTopology::LineStrip,
-        3 => PrimitiveTopology::Triangle,
-        4 => PrimitiveTopology::TriangleStrip,
-        other => return Err(TranslateReason::UnknownPrimitiveType(other)),
-    })
+    reims_vgpu_protocol::primitive_topology(mtl)
+        .map_err(|_| TranslateReason::UnknownPrimitiveType(mtl))
 }
 
 /// `MTLCullMode` (SDK numeric values).
 pub fn cull_mode(mtl: u32) -> Result<CullMode, TranslateReason> {
-    Ok(match mtl {
-        0 => CullMode::None,
-        1 => CullMode::Front,
-        2 => CullMode::Back,
-        other => return Err(TranslateReason::UnknownCullMode(other)),
-    })
+    reims_vgpu_protocol::cull_mode(mtl).map_err(|_| TranslateReason::UnknownCullMode(mtl))
 }
 
 /// `MTLTriangleFillMode` (SDK numeric values).
 pub fn fill_mode(mtl: u32) -> Result<FillMode, TranslateReason> {
-    Ok(match mtl {
-        0 => FillMode::Fill,
-        1 => FillMode::Lines,
-        other => return Err(TranslateReason::UnknownFillMode(other)),
-    })
+    reims_vgpu_protocol::fill_mode(mtl).map_err(|_| TranslateReason::UnknownFillMode(mtl))
 }
 
 /// `MTLDepthClipMode` (SDK numeric values).
 pub fn depth_clip_mode(mtl: u32) -> Result<DepthClipMode, TranslateReason> {
-    Ok(match mtl {
-        0 => DepthClipMode::Clip,
-        1 => DepthClipMode::Clamp,
-        other => return Err(TranslateReason::UnknownDepthClipMode(other)),
-    })
+    reims_vgpu_protocol::depth_clip_mode(mtl)
+        .map_err(|_| TranslateReason::UnknownDepthClipMode(mtl))
 }
 
 /// `MTLWinding` → whether the front face is counter-clockwise.
 pub fn front_face_ccw(mtl: u32) -> Result<bool, TranslateReason> {
-    match mtl {
-        0 => Ok(false), // MTLWindingClockwise, Metal's default
-        1 => Ok(true),  // MTLWindingCounterClockwise
-        other => Err(TranslateReason::UnknownWinding(other)),
-    }
+    reims_vgpu_protocol::front_face_ccw(mtl).map_err(|_| TranslateReason::UnknownWinding(mtl))
 }
 
 /// `MTLCompareFunction` (SDK numeric values). Depth test, stencil test and
 /// sampler compare all carry this same Metal enum.
 pub fn compare_function(mtl: u32) -> Result<SamplerCompareFunction, TranslateReason> {
-    Ok(match mtl {
-        0 => SamplerCompareFunction::Never,
-        1 => SamplerCompareFunction::Less,
-        2 => SamplerCompareFunction::Equal,
-        3 => SamplerCompareFunction::LessEqual,
-        4 => SamplerCompareFunction::Greater,
-        5 => SamplerCompareFunction::NotEqual,
-        6 => SamplerCompareFunction::GreaterEqual,
-        7 => SamplerCompareFunction::Always,
-        other => return Err(TranslateReason::UnknownCompareFunction(other)),
-    })
+    reims_vgpu_protocol::compare_function(mtl)
+        .map_err(|_| TranslateReason::UnknownCompareFunction(mtl))
 }
 
 /// `MTLStencilOperation` (SDK numeric values).
 pub fn stencil_operation(mtl: u32) -> Result<StencilOp, TranslateReason> {
-    Ok(match mtl {
-        0 => StencilOp::Keep,
-        1 => StencilOp::Zero,
-        2 => StencilOp::Replace,
-        3 => StencilOp::IncrementClamp,
-        4 => StencilOp::DecrementClamp,
-        5 => StencilOp::Invert,
-        6 => StencilOp::IncrementWrap,
-        7 => StencilOp::DecrementWrap,
-        other => return Err(TranslateReason::UnknownStencilOperation(other)),
-    })
+    reims_vgpu_protocol::stencil_operation(mtl)
+        .map_err(|_| TranslateReason::UnknownStencilOperation(mtl))
 }
 
 /// `MTLIndexType` (SDK numeric values).
@@ -101,11 +61,7 @@ pub fn stencil_operation(mtl: u32) -> Result<StencilOp, TranslateReason> {
 /// Vulkan consume it; `None` therefore remains a classification here, and the
 /// caller turns it into `IndexLoadReason::TypeUnsupported`.
 pub fn index_type(mtl: u32) -> Option<IndexType> {
-    match mtl {
-        0 => Some(IndexType::U16),
-        1 => Some(IndexType::U32),
-        _ => None,
-    }
+    reims_vgpu_protocol::index_type(mtl).ok()
 }
 
 pub fn vk_topology(topology: PrimitiveTopology) -> vk::PrimitiveTopology {
@@ -149,27 +105,6 @@ pub fn vk_index_type(index: IndexType) -> vk::IndexType {
         IndexType::U16 => vk::IndexType::UINT16,
         IndexType::U32 => vk::IndexType::UINT32,
     }
-}
-
-/// `MTLVisibilityResultMode` (SDK numeric values) → whether a draw arms an
-/// occlusion query, and what it counts.
-///
-/// `Ok(None)` is `MTLVisibilityResultModeDisabled`, the Metal default: the guest
-/// disarmed the query, so the draw runs without one. That is why this returns
-/// an `Option` inside the `Result` rather than folding `0` into the error arm —
-/// disarming is a thing the guest is entitled to ask for, and an unknown
-/// ordinal is not.
-pub fn visibility_result_mode(mtl: u32) -> Result<Option<VisibilityResultMode>, TranslateReason> {
-    use reims_vgpu_core::visibility::VISIBILITY_RESULT_MODE_DISABLED;
-    Ok(match mtl {
-        // The one arm that is a *meaning* rather than a mode, so it is the one
-        // arm spelled from the contract rather than as a literal beside its
-        // neighbours.
-        VISIBILITY_RESULT_MODE_DISABLED => None,
-        1 => Some(VisibilityResultMode::Boolean),
-        2 => Some(VisibilityResultMode::Counting),
-        other => return Err(TranslateReason::UnknownVisibilityResultMode(other)),
-    })
 }
 
 /// The query-control flags an armed mode records with.
@@ -268,7 +203,7 @@ mod tests {
 
     /// Every primitive type this device *advertises* has an arm here.
     ///
-    /// [`crate::contract::draw::EXECUTABLE_PRIMITIVE_TYPES`] is what the guest
+    /// [`reims_vgpu_core::draw::EXECUTABLE_PRIMITIVE_TYPES`] is what the guest
     /// reads as permission, so a bit set there without an arm here is a draw the
     /// guest was invited to make and this rail refuses. Both directions are
     /// asserted: an arm without the bit would be a type this device can execute
@@ -448,31 +383,6 @@ mod tests {
         // first variant.
         assert_eq!(FillMode::default(), FillMode::Fill);
         assert_eq!(DepthClipMode::default(), DepthClipMode::Clip);
-    }
-
-    /// The recorded Apple enum is held to [`crate::contract::visibility`] so a
-    /// new mode cannot silently fall out of the Vulkan mapping.
-    #[test]
-    fn the_recorded_visibility_modes_are_the_ones_the_contract_names() {
-        use reims_vgpu_core::visibility::{
-            visibility_result_mode_recordable, VISIBILITY_RESULT_MODE_DISABLED,
-            VISIBILITY_RESULT_MODE_SWEEP_END,
-        };
-        for mtl in 0..VISIBILITY_RESULT_MODE_SWEEP_END {
-            let recorded = matches!(visibility_result_mode(mtl), Ok(Some(_)));
-            assert_eq!(
-                recorded,
-                visibility_result_mode_recordable(mtl),
-                "ordinal {mtl}: this arm and the device contract disagree about \
-                 whether an occlusion query armed with it is recorded"
-            );
-        }
-        // The disarming ordinal is `Ok(None)` rather than a refusal: it is the
-        // absence of a query, which is a thing a stream legitimately says.
-        assert_eq!(
-            visibility_result_mode(VISIBILITY_RESULT_MODE_DISABLED),
-            Ok(None)
-        );
     }
 
     #[test]

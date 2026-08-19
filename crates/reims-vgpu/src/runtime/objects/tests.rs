@@ -1,12 +1,40 @@
 use reims_vgpu_wire::device_desc::{IOSurfacePlaneViewBuilder, SurfaceBackingBuilder};
 
 use super::*;
-use crate::contract::endian::{ld32, st16, st32, st64};
-use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-use crate::contract::iosurface_pages::DEVICE_DESC_PLANE_COUNT;
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
 use crate::runtime::decode::resource::SERIALIZER_RESOURCE_OBJECT_SAMPLER;
 use crate::runtime::host::FakeHost;
+use reims_vgpu_core::endian::{ld32, st16, st32, st64};
+use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+use reims_vgpu_protocol::DEVICE_DESC_PLANE_COUNT;
+
+fn mapper_texture_descriptor(
+    mapper_ref: u64,
+    object_ref: u32,
+    pixel_format: u16,
+    width: u32,
+    height: u32,
+) -> [u8; 56] {
+    let mut desc = [0u8; 56];
+    st64(&mut desc[0..], mapper_ref);
+    st32(
+        &mut desc[8..],
+        reims_vgpu_wire::ops::backed_texture::OPCODE_IOSURFACE_TEXTURE,
+    );
+    st32(
+        &mut desc[12..],
+        reims_vgpu_wire::ops::backed_texture::IOSURFACE_TEXTURE_TOTAL_LEN,
+    );
+    st32(&mut desc[16..], object_ref);
+    st32(&mut desc[20..], u32::from(pixel_format) << 16 | 2);
+    st32(&mut desc[24..], width);
+    st32(&mut desc[28..], height);
+    st32(&mut desc[32..], 1);
+    st16(&mut desc[36..], 1);
+    st16(&mut desc[38..], 1);
+    st16(&mut desc[40..], 1);
+    desc
+}
 
 #[test]
 fn iosurface_texture_fail_latch_dedups_per_task_ref_and_rearms_on_clear() {
@@ -39,7 +67,15 @@ fn iosurface_texture_fail_latch_dedups_per_task_ref_and_rearms_on_clear() {
     clear_iosurface_texture_fail(t, r2);
 }
 
-fn setup_task_with_list(host: &mut FakeHost, state: &mut DeviceState) {
+fn setup_task_with_list(host: &mut FakeHost, state: &mut Device) {
+    assert!(state.map_mapper_surface(
+        reims_vgpu_protocol::MapperSurfaceRef::new(9),
+        reims_vgpu_protocol::MapperResolvedSurfaceId::new(9)
+    ));
+    assert!(state.map_mapper_surface(
+        reims_vgpu_protocol::MapperSurfaceRef::new(10),
+        reims_vgpu_protocol::MapperResolvedSurfaceId::new(10)
+    ));
     // Same 1-level map as gva_mem test: GVA page 0 → data pfn 4.
     let dir_gpa = 2u64 << PAGE_SHIFT_ARM64E;
     let root_gpa = 3u64 << PAGE_SHIFT_ARM64E;
@@ -58,21 +94,17 @@ fn setup_task_with_list(host: &mut FakeHost, state: &mut DeviceState) {
     // list base GVA 0 (pfn field 0 allowed)
     assert!(state.set_object_list(1, 0, 8));
     let mut entry = [0u8; 12];
-    st32(&mut entry[0..], 11u32 | (0x20u32 << 8));
+    st32(&mut entry[0..], 11u32 | (56u32 << 8));
     entry[4..12].copy_from_slice(&0x40u64.to_le_bytes());
     let _ = host.write_gpa(data_gpa + 12, &entry);
-    let mut desc = [0u8; 0x20];
-    st32(&mut desc[0..], 9);
-    st16(&mut desc[0x16..], 0x50);
-    st32(&mut desc[0x18..], 64);
-    st32(&mut desc[0x1c..], 32);
+    let desc = mapper_texture_descriptor(9, 1, 0x50, 64, 32);
     let _ = host.write_gpa(data_gpa + 0x40, &desc);
 }
 
 #[test]
 fn resolve_iosurface_texture_from_list() {
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     setup_task_with_list(&mut host, &mut state);
     // Sanity: list entry readable
     let e = lookup_list_entry(&state, &host, 1, 1).expect("list entry");
@@ -80,9 +112,12 @@ fn resolve_iosurface_texture_from_list() {
     assert_eq!(e.descriptor_gva, 0x40);
     let mid = resolve_iosurface_texture_ref(&mut state, &host, 1, 1).expect("iosurface_texture");
     assert_eq!(mid, 9);
-    let m = state.mappings.get(&9).unwrap();
-    assert!(m.has_geom);
-    assert_eq!((m.width, m.height, m.format), (64, 32, 0x50));
+    let m = state.surfaces.mappings.get(&9).unwrap();
+    assert!(m.has_geometry());
+    assert_eq!(
+        m.geometry().map(|g| (g.width, g.height, g.format)),
+        Some((64, 32, 0x50))
+    );
 }
 
 /// Registering an IOSurface texture is construction, not bind-time repair.
@@ -93,7 +128,7 @@ fn resolve_iosurface_texture_from_list() {
 #[test]
 fn a_retained_iosurface_texture_runs_construction_side_effects_once() {
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     setup_task_with_list(&mut host, &mut state);
     let resource = resolve_resource(&state, &host, 1, 1).expect("construction");
 
@@ -102,19 +137,24 @@ fn a_retained_iosurface_texture_runs_construction_side_effects_once() {
         Some(9)
     );
     {
-        let mapping = state.mappings.get_mut(&9).expect("registered mapping");
-        mapping.width = 17;
-        mapping.height = 19;
-        mapping.format = 0x71;
+        let mapping = state
+            .surfaces
+            .mappings
+            .get_mut(&9)
+            .expect("registered mapping");
+        mapping.publish_geometry_for_test(17, 19, 0x71);
     }
 
     assert_eq!(
         resolve_iosurface_texture_resource(&mut state, 1, 1, &resource),
         Some(9)
     );
-    let mapping = &state.mappings[&9];
+    let mapping = &state.surfaces.mappings[&9];
     assert_eq!(
-        (mapping.width, mapping.height, mapping.format),
+        mapping
+            .geometry()
+            .map(|g| (g.width, g.height, g.format))
+            .expect("geometry"),
         (17, 19, 0x71),
         "a warm bind must not replay immutable construction input"
     );
@@ -127,19 +167,21 @@ fn a_retained_iosurface_texture_runs_construction_side_effects_once() {
 #[test]
 fn a_texture_bind_reuses_backing_until_physical_invalidation() {
     let host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     assert!(state.map_surface(9));
     {
-        let mapping = state.mappings.get_mut(&9).expect("surface mapping");
-        mapping.mapped = true;
-        mapping.has_geom = true;
-        mapping.width = 64;
-        mapping.height = 32;
-        mapping.page_entries = vec![0x1234_5001];
+        let mapping = state
+            .surfaces
+            .mappings
+            .get_mut(&9)
+            .expect("surface mapping");
+        mapping.lifecycle.active = true;
+        mapping.publish_geometry_for_test(64, 32, 0);
+        mapping.pages.entries = vec![0x1234_5001];
     }
 
     assert!(ensure_surface_for_texture_bind(&mut state, &host, 9));
-    assert!(state.invalidate_mapping_pages(9));
+    assert!(state.invalidate_mapping_pages(9).had_page_state);
     assert!(
         !ensure_surface_for_texture_bind(&mut state, &host, 9),
         "the invalidated page plan must be rebuilt before the texture binds"
@@ -156,12 +198,12 @@ fn a_texture_bind_reuses_backing_until_physical_invalidation() {
 #[test]
 fn resources_keep_construction_input_until_explicit_delete() {
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     setup_task_with_list(&mut host, &mut state);
     let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
 
     let first = resolve_resource(&state, &host, 1, 1).expect("first construction");
-    assert_eq!(ld32(&first.descriptor), 9);
+    assert_eq!(ld32(first.descriptor()), 9);
 
     // Rewrite the descriptor and move the list somewhere unreadable. Neither
     // operation changes the already-registered object.
@@ -169,17 +211,14 @@ fn resources_keep_construction_input_until_explicit_delete() {
     assert!(state.set_object_list(1, 0xdead, 8));
     let retained = resolve_resource(&state, &host, 1, 1).expect("registered object");
     assert!(Arc::ptr_eq(&first, &retained));
-    assert_eq!(ld32(&retained.descriptor), 9);
-    let Ok(crate::runtime::decode::resource::Descriptor::IOSurfaceTexture {
-        mapper_ref,
-        width: 64,
-        height: 32,
-        ..
-    }) = retained.decoded()
+    assert_eq!(ld32(retained.descriptor()), 9);
+    let Ok(crate::runtime::decode::resource::Descriptor::MapperIOSurfaceTextureView(view)) =
+        decoded_resource(&retained)
     else {
         panic!("retained descriptor lost its semantic IOSurface texture shape");
     };
-    assert_eq!(mapper_ref.get(), 9);
+    assert_eq!(view.mapper_surface.get(), 9);
+    assert_eq!((view.declaration.width, view.declaration.height), (64, 32));
     assert_eq!(
         resolve_iosurface_texture_resource(&mut state, 1, 1, &retained),
         Some(9),
@@ -192,7 +231,7 @@ fn resources_keep_construction_input_until_explicit_delete() {
     assert!(state.set_object_list(1, 0, 8));
     let replacement = resolve_resource(&state, &host, 1, 1).expect("replacement construction");
     assert!(!Arc::ptr_eq(&first, &replacement));
-    assert_eq!(ld32(&replacement.descriptor), 10);
+    assert_eq!(ld32(replacement.descriptor()), 10);
     assert_eq!(
         resolve_iosurface_texture_resource(&mut state, 1, 1, &replacement),
         Some(10),
@@ -203,14 +242,14 @@ fn resources_keep_construction_input_until_explicit_delete() {
 #[test]
 fn a_retained_view_retries_its_parent_relation_after_the_parent_appears() {
     let host = FakeHost::new();
-    let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let descriptor = IOSurfacePlaneViewBuilder::new(
         7,
         0,
         2,
         reims_vgpu_wire::device_desc::IOSURFACE_PLANE_VIEW_RECORD_TAG_COLOR_VIEW,
     );
-    let view = state.task_resources.register(
+    let view = state.task_objects.resources.register(
         1,
         2,
         Arc::new(TaskResource::new(
@@ -222,11 +261,16 @@ fn a_retained_view_retries_its_parent_relation_after_the_parent_appears() {
 
     ensure_resource_relations(&state, &host, 1, 2, &view);
     assert_eq!(
-        state.task_resources.resource_node(view_id).unwrap().storage,
+        state
+            .task_objects
+            .resources
+            .resource_node(view_id)
+            .unwrap()
+            .storage,
         None
     );
 
-    let surface = state.task_resources.register(
+    let surface = state.task_objects.resources.register(
         0,
         7,
         Arc::new(TaskResource::new(
@@ -237,10 +281,11 @@ fn a_retained_view_retries_its_parent_relation_after_the_parent_appears() {
     ensure_resource_relations(&state, &host, 1, 2, &view);
 
     let surface_node = state
-        .task_resources
+        .task_objects
+        .resources
         .resource_node(surface.semantic_id().unwrap())
         .unwrap();
-    let view_node = state.task_resources.resource_node(view_id).unwrap();
+    let view_node = state.task_objects.resources.resource_node(view_id).unwrap();
     assert_eq!(view_node.storage, surface_node.storage);
     assert!(view_node.parents.contains(&surface_node.id));
 }
@@ -248,15 +293,15 @@ fn a_retained_view_retries_its_parent_relation_after_the_parent_appears() {
 #[test]
 fn task_lifetime_retires_all_of_its_resource_objects() {
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     setup_task_with_list(&mut host, &mut state);
     let resource = resolve_resource(&state, &host, 1, 1).expect("construction");
-    assert!(state.task_resources.get(1, 1).is_some());
+    assert!(state.task_objects.resources.get(1, 1).is_some());
 
-    assert!(state.delete_task(1));
-    assert!(state.task_resources.get(1, 1).is_none());
+    assert!(state.delete_task(1).is_some());
+    assert!(state.task_objects.resources.get(1, 1).is_none());
     assert_eq!(
-        ld32(&resource.descriptor),
+        ld32(resource.descriptor()),
         9,
         "an outstanding host owner remains valid"
     );
@@ -307,7 +352,7 @@ fn non_resource_descriptors_are_read_again() {
     use crate::runtime::decode::resource::OBJECT_TYPE_SERIALIZER_RESOURCE;
 
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     setup_task_with_list(&mut host, &mut state);
     let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
     let mut entry = [0u8; 12];
@@ -322,13 +367,13 @@ fn non_resource_descriptors_are_read_again() {
     let (_, first) = resolve_descriptor(&state, &host, 1, 2, &[ObjectKind::SerializerResource])
         .expect("first serializer descriptor");
     assert_eq!(ld32(&first), 1);
-    assert!(state.task_resources.get(1, 2).is_none());
+    assert!(state.task_objects.resources.get(1, 2).is_none());
 
     let _ = host.write_gpa(data_gpa + 0x80, &2u32.to_le_bytes());
     let (_, second) = resolve_descriptor(&state, &host, 1, 2, &[ObjectKind::SerializerResource])
         .expect("updated serializer descriptor");
     assert_eq!(ld32(&second), 2);
-    assert!(state.task_resources.get(1, 2).is_none());
+    assert!(state.task_objects.resources.get(1, 2).is_none());
 }
 
 fn put_sampler_object(host: &mut FakeHost, ref_: u32, descriptor_gva: u64, lod_min: f32) {
@@ -359,12 +404,12 @@ fn put_sampler_object(host: &mut FakeHost, ref_: u32, descriptor_gva: u64, lod_m
 #[test]
 fn sampler_construction_is_retained_until_its_own_explicit_delete() {
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     setup_task_with_list(&mut host, &mut state);
     put_sampler_object(&mut host, 2, 0x80, 1.25);
 
     let first = resolve_sampler_state(&state, &host, 1, 2).expect("first sampler");
-    assert_eq!(first.descriptor.lod_min_clamp, 1.25);
+    assert_eq!(first.lod_min_clamp, 1.25);
 
     // Neither mutable descriptor bytes nor a moved object-list pointer mutate
     // an already-constructed sampler object.
@@ -372,16 +417,17 @@ fn sampler_construction_is_retained_until_its_own_explicit_delete() {
     assert!(state.set_object_list(1, 0xdead, 8));
     let retained = resolve_sampler_state(&state, &host, 1, 2).expect("retained sampler");
     assert!(Arc::ptr_eq(&first, &retained));
-    assert_eq!(retained.descriptor.lod_min_clamp, 1.25);
+    assert_eq!(retained.lod_min_clamp, 1.25);
 
     // The sampler API's delete edge, not resource deletion, permits ref reuse.
     assert!(state
-        .task_sampler_states
+        .task_objects
+        .samplers
         .delete(1, reims_vgpu_protocol::SerializerRef::new(2)));
     assert!(state.set_object_list(1, 0, 8));
     let replacement = resolve_sampler_state(&state, &host, 1, 2).expect("replacement sampler");
     assert!(!Arc::ptr_eq(&first, &replacement));
-    assert_eq!(replacement.descriptor.lod_min_clamp, 7.5);
+    assert_eq!(replacement.lod_min_clamp, 7.5);
 }
 
 #[test]
@@ -389,7 +435,7 @@ fn failed_sampler_construction_is_not_retained_and_can_retry() {
     use crate::runtime::decode::resource::OBJECT_TYPE_SERIALIZER_RESOURCE;
 
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     setup_task_with_list(&mut host, &mut state);
     let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
     let mut short_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
@@ -409,29 +455,31 @@ fn failed_sampler_construction_is_not_retained_and_can_retry() {
         Err(SamplerResolveError::Decode { .. })
     ));
     assert!(state
-        .task_sampler_states
+        .task_objects
+        .samplers
         .get(1, reims_vgpu_protocol::SerializerRef::new(2))
         .is_none());
 
     put_sampler_object(&mut host, 2, 0x80, 3.0);
     let sampler = resolve_sampler_state(&state, &host, 1, 2).expect("published retry");
-    assert_eq!(sampler.descriptor.lod_min_clamp, 3.0);
+    assert_eq!(sampler.lod_min_clamp, 3.0);
 }
 
 #[test]
 fn task_teardown_retires_sampler_objects_without_touching_outstanding_owners() {
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     setup_task_with_list(&mut host, &mut state);
     put_sampler_object(&mut host, 2, 0x80, 2.0);
     let sampler = resolve_sampler_state(&state, &host, 1, 2).expect("sampler");
 
-    assert!(state.delete_task(1));
+    assert!(state.delete_task(1).is_some());
     assert!(state
-        .task_sampler_states
+        .task_objects
+        .samplers
         .get(1, reims_vgpu_protocol::SerializerRef::new(2))
         .is_none());
-    assert_eq!(sampler.descriptor.lod_min_clamp, 2.0);
+    assert_eq!(sampler.lod_min_clamp, 2.0);
 }
 
 /// The surface backing decoder refuses a descriptor it cannot decode as declared, and
@@ -546,7 +594,7 @@ fn decode_surface_backing_plane0() {
     assert!(!surface_backing_is_multiplanar(&s));
     assert_eq!(
         iosurface_pixel_format_to_mtl(s.pixel_format),
-        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM
+        reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM
     );
 }
 
@@ -578,7 +626,7 @@ fn a_small_value_is_not_read_as_an_mtl_ordinal() {
     // on, not a narrowing of what the converter accepts.
     assert_eq!(
         iosurface_pixel_format_to_mtl(0x4247_5241),
-        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM
+        reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM
     );
 }
 
@@ -623,7 +671,7 @@ fn decode_surface_backing_biplanar_420f_planes() {
     );
     let dev = synthesize_device_desc_from_surface_backing(&s);
     assert_eq!(dev[DEVICE_DESC_PLANE_COUNT], 2);
-    use crate::contract::iosurface_pages::{
+    use reims_vgpu_protocol::{
         decode_device_surface, mapping_span_bound, sample_window_from_device_desc,
         DEVICE_DESC_PIXEL_FORMAT,
     };
@@ -638,7 +686,7 @@ fn decode_surface_backing_biplanar_420f_planes() {
     let y = sample_window_from_device_desc(
         Some(&dev),
         None,
-        crate::contract::pixel_format::MTL_FORMAT_R8_UNORM,
+        reims_vgpu_core::pixel_format::MTL_FORMAT_R8_UNORM,
         1024,
         1024,
     )
@@ -649,7 +697,7 @@ fn decode_surface_backing_biplanar_420f_planes() {
     let uv = sample_window_from_device_desc(
         Some(&dev),
         None,
-        crate::contract::pixel_format::MTL_FORMAT_RG8_UNORM,
+        reims_vgpu_core::pixel_format::MTL_FORMAT_RG8_UNORM,
         512,
         512,
     )
@@ -661,14 +709,14 @@ fn decode_surface_backing_biplanar_420f_planes() {
     assert!(sample_window_from_device_desc(
         Some(&dev),
         None,
-        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM,
         1024,
         1024,
     )
     .is_none());
     assert!(mapping_span_bound(
         Some(&dev),
-        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM,
         1024,
         1024,
     )
@@ -684,7 +732,7 @@ fn decode_surface_backing_biplanar_420f_planes() {
 #[test]
 fn resolve_surface_backing_refuses_to_substitute_the_gva_when_the_walk_fails() {
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     state.page_shift = PAGE_SHIFT_X86;
     // The identity candidate is backed RAM: `read_gpa` succeeds on it, which
     // is the whole of what the old gate checked.
@@ -726,9 +774,10 @@ fn resolve_surface_backing_refuses_to_substitute_the_gva_when_the_walk_fails() {
     // The refusal happens before any mutation, so no fabricated entry is
     // left behind for a later writer to aim at.
     let fabricated = state
+        .surfaces
         .mappings
         .get(&3)
-        .map(|m| m.mapped || !m.page_entries.is_empty())
+        .map(|m| m.lifecycle.active || !m.pages.entries.is_empty())
         .unwrap_or(false);
     assert!(!fabricated, "refusal must not cache a fabricated backing");
 }
@@ -744,7 +793,7 @@ fn resolve_surface_backing_refuses_to_substitute_the_gva_when_the_walk_fails() {
 #[test]
 fn the_task_search_reaches_the_owner_when_task_zero_cannot_translate() {
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     state.page_shift = PAGE_SHIFT_X86;
     let dir0_gpa = 2u64 << PAGE_SHIFT_X86;
     let root0_gpa = 3u64 << PAGE_SHIFT_X86;
@@ -803,10 +852,10 @@ fn the_task_search_reaches_the_owner_when_task_zero_cannot_translate() {
         resolve_surface_backing(&mut state, &host, 3),
         "the owning task can translate the backing, so the resolve must succeed"
     );
-    let m = state.mappings.get(&3).unwrap();
-    assert_eq!(m.page_entries.len(), 1);
+    let m = state.surfaces.mappings.get(&3).unwrap();
+    assert_eq!(m.pages.entries.len(), 1);
     assert_eq!(
-        entry_gpa_shift(m.page_entries[0], PAGE_SHIFT_X86),
+        entry_gpa_shift(m.pages.entries[0], PAGE_SHIFT_X86),
         Some(real_page),
         "the backing must come from the task that could translate it, \
          not from task 0's untranslatable GVA"
@@ -826,7 +875,7 @@ fn a_surface_id_claimed_by_two_tasks_is_counted_as_two() {
     // slot 3; task 1's holds a IOSurface plane view there until the second half of the
     // test rewrites it.
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     state.page_shift = PAGE_SHIFT_X86;
     let dir0_gpa = 2u64 << PAGE_SHIFT_X86;
     let root0_gpa = 3u64 << PAGE_SHIFT_X86;
@@ -912,7 +961,7 @@ fn a_surface_id_claimed_by_two_tasks_is_counted_as_two() {
 #[test]
 fn resolve_surface_backing_force_rebuilds_when_task_translation_moves() {
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     state.page_shift = PAGE_SHIFT_X86;
     let dir_gpa = 2u64 << PAGE_SHIFT_X86;
     let root_gpa = 3u64 << PAGE_SHIFT_X86;
@@ -952,33 +1001,33 @@ fn resolve_surface_backing_force_rebuilds_when_task_translation_moves() {
 
     assert!(resolve_surface_backing(&mut state, &host, 3));
     {
-        let m = state.mappings.get(&3).unwrap();
-        assert_eq!(m.page_entries.len(), 1);
+        let m = state.surfaces.mappings.get(&3).unwrap();
+        assert_eq!(m.pages.entries.len(), 1);
         assert_eq!(
-            entry_gpa_shift(m.page_entries[0], PAGE_SHIFT_X86),
+            entry_gpa_shift(m.pages.entries[0], PAGE_SHIFT_X86),
             Some(old_page)
         );
-        assert_eq!(m.map_generation, 1);
+        assert_eq!(m.lifecycle.generation, 1);
     }
     // Guest remaps GVA page 1 onto a new physical page (same id/geometry).
     st32(&mut d[..4], 6);
     let _ = host.write_gpa(root_gpa + 4, &d[..4]);
     assert!(resolve_surface_backing_force(&mut state, &host, 3));
     {
-        let m = state.mappings.get(&3).unwrap();
+        let m = state.surfaces.mappings.get(&3).unwrap();
         assert_eq!(
-            entry_gpa_shift(m.page_entries[0], PAGE_SHIFT_X86),
+            entry_gpa_shift(m.pages.entries[0], PAGE_SHIFT_X86),
             Some(new_page),
             "force-resolve must follow the moved translation"
         );
-        assert_eq!(m.map_generation, 2, "page move bumps map_generation");
+        assert_eq!(m.lifecycle.generation, 2, "page move bumps map_generation");
     }
     // Unchanged translation: force keeps the table without a rebuild.
     assert!(resolve_surface_backing_force(&mut state, &host, 3));
-    let m = state.mappings.get(&3).unwrap();
-    assert_eq!(m.map_generation, 2);
+    let m = state.surfaces.mappings.get(&3).unwrap();
+    assert_eq!(m.lifecycle.generation, 2);
     assert_eq!(
-        entry_gpa_shift(m.page_entries[0], PAGE_SHIFT_X86),
+        entry_gpa_shift(m.pages.entries[0], PAGE_SHIFT_X86),
         Some(new_page)
     );
 }
@@ -991,7 +1040,7 @@ fn resolve_surface_backing_force_rebuilds_when_task_translation_moves() {
 #[test]
 fn apply_surface_backing_fail_latches_reason_and_rearms() {
     let host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     state.page_shift = PAGE_SHIFT_X86;
     // A surface_id other surface backing tests do not touch (they use 3).
     let sid = 11u32;
@@ -1316,7 +1365,7 @@ fn a_surface_backing_refusal_the_next_attach_resolves_is_reported_as_recovered()
 #[test]
 fn a_refused_surface_backing_walk_names_the_check_that_refused() {
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     setup_task_with_list(&mut host, &mut state);
     let task = state.tasks.get(1).expect("fixture defines task 1");
 
@@ -1408,7 +1457,7 @@ fn a_refused_object_list_entry_names_the_geometry_behind_its_address() {
 #[test]
 fn a_task_with_no_object_list_resolves_nothing_not_its_neighbours_list() {
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let dir_gpa = 2u64 << PAGE_SHIFT_X86;
     let root_gpa = 3u64 << PAGE_SHIFT_X86;
     let data_gpa = 4u64 << PAGE_SHIFT_X86;
@@ -1476,7 +1525,7 @@ fn a_task_with_no_object_list_resolves_nothing_not_its_neighbours_list() {
 #[test]
 fn the_probe_and_the_named_lookup_answer_identically() {
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let dir_gpa = 2u64 << PAGE_SHIFT_X86;
     let root_gpa = 3u64 << PAGE_SHIFT_X86;
     let data_gpa = 4u64 << PAGE_SHIFT_X86;
@@ -1526,7 +1575,7 @@ fn the_probe_and_the_named_lookup_answer_identically() {
 
 fn setup_surface_backing_candidate(
     host: &mut FakeHost,
-    state: &mut DeviceState,
+    state: &mut Device,
     surface_id: u32,
     desc_gva: u64,
     desc_len: u32,
@@ -1563,7 +1612,7 @@ fn setup_surface_backing_candidate(
 #[test]
 fn resolve_surface_backing_candidate_logs_descriptor_read_failure() {
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let sid = 17u32;
     clear_surface_backing_fail(sid, 0x20u64 << PAGE_SHIFT_X86);
     let _ = setup_surface_backing_candidate(&mut host, &mut state, sid, 0x3000, 0x30);
@@ -1585,7 +1634,7 @@ fn resolve_surface_backing_candidate_logs_descriptor_read_failure() {
 #[test]
 fn resolve_surface_backing_candidate_logs_descriptor_decode_failure() {
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let sid = 18u32;
     clear_surface_backing_fail(sid, 0x20u64 << PAGE_SHIFT_X86);
     let data_gpa = setup_surface_backing_candidate(&mut host, &mut state, sid, 0x80, 0x30);
@@ -1770,7 +1819,7 @@ fn decode_iosurface_plane_view_fail_closed() {
 /// for every read window built over it.
 #[test]
 fn a_latched_backing_is_stale_when_any_of_geometry_or_format_moved() {
-    use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA8_UNORM};
+    use reims_vgpu_core::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA8_UNORM};
     let surf = |w: u32, h: u32, fourcc: u32| SurfaceBackingDescriptor {
         length: 0x1000,
         backing_pfn: 1,
@@ -1794,12 +1843,7 @@ fn a_latched_backing_is_stale_when_any_of_geometry_or_format_moved() {
         MTL_FORMAT_RGBA8_UNORM
     );
 
-    let m = MappingEntry {
-        width: 8,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        ..Default::default()
-    };
+    let m = SurfaceMappingEntry::default().with_geometry_for_test(8, 4, MTL_FORMAT_BGRA8_UNORM);
     assert!(backing_matches_latched_geom(&m, &surf(8, 4, BGRA)));
     assert!(
         !backing_matches_latched_geom(&m, &surf(8, 5, BGRA)),
@@ -1838,12 +1882,7 @@ fn a_multiplane_backing_compares_equal_to_the_zero_it_latched() {
     );
     assert_eq!(latched_mapping_format(&surf), 0, "multi-plane latches 0");
 
-    let m = MappingEntry {
-        width: 8,
-        height: 4,
-        format: 0,
-        ..Default::default()
-    };
+    let m = SurfaceMappingEntry::default().with_geometry_for_test(8, 4, 0);
     assert!(backing_matches_latched_geom(&m, &surf));
     // Dropping to one plane makes it a single-plane BGRA8 surface, which is
     // a real change of what the mapping describes.
@@ -1863,8 +1902,8 @@ fn a_multiplane_backing_compares_equal_to_the_zero_it_latched() {
 /// `sample_window_from_device_plane` treats a plane's.
 #[test]
 fn a_single_plane_backing_publishes_the_offset_its_pixels_start_at() {
-    use crate::contract::iosurface_pages::{decode_device_surface, sample_window_from_device_desc};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_protocol::{decode_device_surface, sample_window_from_device_desc};
     const BASE: u32 = 0x800;
     let (w, h, bpr) = (8u32, 4u32, 32u32);
     let mut surf = SurfaceBackingDescriptor {
@@ -1926,7 +1965,7 @@ fn a_single_plane_backing_publishes_the_offset_its_pixels_start_at() {
 /// with a format that refuses every sample window and every render target.
 #[test]
 fn the_device_descriptor_format_word_survives_both_of_its_encodings() {
-    use crate::contract::pixel_format::{
+    use reims_vgpu_core::pixel_format::{
         bytes_per_pixel, MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA16_FLOAT,
     };
 
@@ -1984,7 +2023,7 @@ fn the_device_descriptor_format_word_survives_both_of_its_encodings() {
 fn the_surface_backing_probe_order_visits_task_zero_first_and_every_live_task_once() {
     use std::collections::HashSet;
 
-    let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
     // Deliberately sparse, and one id far past the retired 256 ceiling: the
     // probe must reach a task the old fixed range could not even name.
     let live = [0u32, 1, 7, 300, 70_000];
@@ -2100,7 +2139,7 @@ fn the_shared_ladder_names_the_rung_that_refused() {
     use crate::runtime::decode::resource::OBJECT_TYPE_IOSURFACE;
 
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     setup_task_with_list(&mut host, &mut state);
 
     // Ref 1 is an IOSurface texture entry whose descriptor is mapped: all three rungs pass.
@@ -2162,11 +2201,11 @@ fn the_shared_ladder_names_the_rung_that_refused() {
 /// Fails without the fix: both entries survive the packet.
 #[test]
 fn a_repoint_drops_the_ref_keyed_host_copies_of_the_object() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     let (task, object) = (7u32, 4242u32);
 
-    state.host_texture_surfaces.insert(
+    state.host_replicas.texture_surfaces.insert(
         (task, object),
         crate::model::HostSurface {
             width: 4,
@@ -2180,7 +2219,7 @@ fn a_repoint_drops_the_ref_keyed_host_copies_of_the_object() {
             source_gva: 0,
         },
     );
-    state.host_texture_surfaces.insert(
+    state.host_replicas.texture_surfaces.insert(
         (task + 1, object),
         crate::model::HostSurface {
             width: 4,
@@ -2194,7 +2233,7 @@ fn a_repoint_drops_the_ref_keyed_host_copies_of_the_object() {
             source_gva: 0,
         },
     );
-    state.host_linear_textures.insert(
+    state.host_replicas.linear_textures.insert(
         (task, object),
         crate::model::HostLinearTexture {
             gva: 0x1000,
@@ -2209,22 +2248,29 @@ fn a_repoint_drops_the_ref_keyed_host_copies_of_the_object() {
     );
     // No mapping owns the id, which is the route this covers: three quarters of
     // the re-points on a driven boot take it.
-    assert!(!state.mappings.contains_key(&object));
+    assert!(!state.surfaces.mappings.contains_key(&object));
 
     super::replace_physical(&mut state, &mut host, task, object);
 
     assert!(
-        !state.host_texture_surfaces.contains_key(&(task, object)),
+        !state
+            .host_replicas
+            .texture_surfaces
+            .contains_key(&(task, object)),
         "the ref-keyed texture copy was read from pages the guest has re-pointed"
     );
     assert!(
         state
-            .host_texture_surfaces
+            .host_replicas
+            .texture_surfaces
             .contains_key(&(task + 1, object)),
         "a re-point must not evict another task's same-numbered texture copy"
     );
     assert!(
-        !state.host_linear_textures.contains_key(&(task, object)),
+        !state
+            .host_replicas
+            .linear_textures
+            .contains_key(&(task, object)),
         "the ref-keyed linear copy was read from pages the guest has re-pointed"
     );
 }
@@ -2239,7 +2285,7 @@ fn a_repoint_drops_the_ref_keyed_host_copies_of_the_object() {
 /// global-id-first route did the opposite.
 #[test]
 fn a_repoint_resolves_the_resource_in_its_task_before_touching_a_mapping() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     setup_task_with_list(&mut host, &mut state);
 
@@ -2250,33 +2296,38 @@ fn a_repoint_resolves_the_resource_in_its_task_before_touching_a_mapping() {
 
     assert!(state.map_surface(1));
     {
-        let surface = state.mappings.get_mut(&1).expect("surface mapping");
-        surface.mapped = true;
-        surface.page_entries = vec![0x1234_5001];
-        surface.surface_backing_walk = Some(crate::model::SurfaceBackingWalk {
+        let surface = state
+            .surfaces
+            .mappings
+            .get_mut(&1)
+            .expect("surface mapping");
+        surface.lifecycle.active = true;
+        surface.pages.entries = vec![0x1234_5001];
+        surface.pages.surface_walk = Some(crate::model::SurfaceBackingWalk {
             task_id: 0,
             backing_pfn: 0x20,
-            page_generation: surface.page_generation,
+            page_generation: surface.pages.generation,
         });
     }
     {
         let resource = state
+            .surfaces
             .mappings
             .get_mut(&9)
             .expect("IOSurface texture mapping");
-        resource.mapped = true;
-        resource.page_entries = vec![0x6789_a001];
+        resource.lifecycle.active = true;
+        resource.pages.entries = vec![0x6789_a001];
     }
 
     super::replace_physical(&mut state, &mut host, 1, 1);
 
     assert_eq!(
-        state.mappings[&1].page_entries,
+        state.surfaces.mappings[&1].pages.entries,
         vec![0x1234_5001],
         "a same-number resource in another task does not own this surface"
     );
     assert!(
-        state.mappings[&9].page_entries.is_empty(),
+        state.surfaces.mappings[&9].pages.entries.is_empty(),
         "the task-local IOSurface texture association names the mapping to invalidate"
     );
 }
@@ -2286,31 +2337,39 @@ fn a_repoint_resolves_the_resource_in_its_task_before_touching_a_mapping() {
 /// re-points.
 #[test]
 fn a_repoint_retires_a_surface_backing_mapping_owned_by_the_packet_task() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     assert!(state.map_surface(7));
     let prior_generation = {
-        let surface = state.mappings.get_mut(&7).expect("surface mapping");
-        surface.mapped = true;
-        surface.page_entries = vec![0x1234_5001];
-        surface.surface_backing_walk = Some(crate::model::SurfaceBackingWalk {
+        let surface = state
+            .surfaces
+            .mappings
+            .get_mut(&7)
+            .expect("surface mapping");
+        surface.lifecycle.active = true;
+        surface.pages.entries = vec![0x1234_5001];
+        surface.pages.surface_walk = Some(crate::model::SurfaceBackingWalk {
             task_id: 3,
             backing_pfn: 0x20,
-            page_generation: surface.page_generation,
+            page_generation: surface.pages.generation,
         });
-        surface.map_generation
+        surface.lifecycle.generation
     };
 
     super::replace_physical(&mut state, &mut host, 3, 7);
 
-    assert!(state.mappings[&7].page_entries.is_empty());
-    assert_ne!(state.mappings[&7].map_generation, prior_generation);
+    assert!(state.surfaces.mappings[&7].pages.entries.is_empty());
     assert_ne!(
-        state.mappings[&7]
-            .surface_backing_walk
+        state.surfaces.mappings[&7].lifecycle.generation,
+        prior_generation
+    );
+    assert_ne!(
+        state.surfaces.mappings[&7]
+            .pages
+            .surface_walk
             .expect("the old walk remains only as provenance")
             .page_generation,
-        state.mappings[&7].page_generation,
+        state.surfaces.mappings[&7].pages.generation,
         "the generation bump makes the retired walk unusable as currency"
     );
 }
@@ -2324,11 +2383,11 @@ fn a_repoint_retires_a_surface_backing_mapping_owned_by_the_packet_task() {
 /// evicting its neighbours would turn a benign majority into a new loss.
 #[test]
 fn a_repoint_of_an_object_this_device_holds_nothing_for_touches_no_neighbour() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     let (task, object, neighbour) = (7u32, 4242u32, 4243u32);
 
-    state.host_linear_textures.insert(
+    state.host_replicas.linear_textures.insert(
         (task, neighbour),
         crate::model::HostLinearTexture {
             gva: 0x1000,
@@ -2342,7 +2401,7 @@ fn a_repoint_of_an_object_this_device_holds_nothing_for_touches_no_neighbour() {
         },
     );
     // The same ref under a different task must also survive.
-    state.host_linear_textures.insert(
+    state.host_replicas.linear_textures.insert(
         (task + 1, object),
         crate::model::HostLinearTexture {
             gva: 0x2000,
@@ -2359,11 +2418,17 @@ fn a_repoint_of_an_object_this_device_holds_nothing_for_touches_no_neighbour() {
     super::replace_physical(&mut state, &mut host, task, object);
 
     assert!(
-        state.host_linear_textures.contains_key(&(task, neighbour)),
+        state
+            .host_replicas
+            .linear_textures
+            .contains_key(&(task, neighbour)),
         "a different ref in the same task is a different object"
     );
     assert!(
-        state.host_linear_textures.contains_key(&(task + 1, object)),
+        state
+            .host_replicas
+            .linear_textures
+            .contains_key(&(task + 1, object)),
         "the same ref in a different task is a different object"
     );
 }

@@ -9,15 +9,17 @@
 //! a host pointer after the GPU page-table mapping is gone.
 //!
 //! Distinct from:
-//! - [`MappingEntry::contig_ptr`] — iosfc `mapping_id` page list (MAP/UNMAP ring)
-//! - [`DeviceState::host_gva_surfaces`] — discrete encode cache (retained on Unmap)
+//! - the mapping materialization's contiguous view — iosfc `mapping_id` page list
+//!   (MAP/UNMAP ring)
+//! - [`HostReplicaState::gva_surfaces`] — discrete encode cache (retained on Unmap)
 //!
 //! See [[map-memory2]] GPU-import model and HostOps `map_pages` / `unmap_pages`.
 
-use crate::model::{DeviceState, GvaHostView, TaskEntry, TaskTable};
+use crate::model::{GvaHostView, TaskEntry, TaskTable};
 use crate::runtime::gva_mem::HostPhys;
 use crate::runtime::host::{HostMemory, HostOps, MemError};
 use crate::runtime::mapper::{RectStride, RunCopy};
+use crate::runtime::Device;
 use reims_vgpu_paging::resolve::{geometry_for_page_shift, Task};
 use reims_vgpu_paging::runs::{contig_page_runs, contig_run_count};
 use reims_vgpu_paging::span::span_page_bases;
@@ -89,7 +91,7 @@ pub(crate) fn task_matches(view_task: u32, wire_task: u32) -> bool {
 ///
 /// Returns the number of views retired. Always-on proxy when `n > 0` is logged by caller.
 pub fn retire_gva_views_overlapping(
-    state: &mut DeviceState,
+    state: &mut Device,
     task_id: u32,
     gva: u64,
     length: u64,
@@ -97,20 +99,9 @@ pub fn retire_gva_views_overlapping(
     if gva == 0 || length == 0 {
         return 0;
     }
-    let mut n = 0u32;
-    let mut i = 0;
-    while i < state.gva_host_views.len() {
-        let v = &state.gva_host_views[i];
-        if task_matches(v.task_id, task_id) && ranges_overlap(v.gva, v.length, gva, length) {
-            let v = state.gva_host_views.swap_remove(i);
-            if v.ptr != 0 && v.ptr_len != 0 {
-                state.pending_host_releases.retire_view((v.ptr, v.ptr_len));
-            }
-            n = n.saturating_add(1);
-        } else {
-            i += 1;
-        }
-    }
+    let n = state.host_materializations.retire_gva_views_where(|view| {
+        task_matches(view.task_id, task_id) && ranges_overlap(view.gva, view.length, gva, length)
+    });
     // The GVA-keyed encode cache survives this deliberately — a mapping that
     // churns and comes back must not black out the wallpaper — and its entries
     // used to be marked "suspect" here so the next reader would re-walk and
@@ -128,12 +119,7 @@ pub fn retire_gva_views_overlapping(
 }
 
 /// Find a covering view for `task_id` + `[gva, gva+length)` if one is registered.
-fn find_covering_view(
-    state: &DeviceState,
-    task_id: u32,
-    gva: u64,
-    length: u64,
-) -> Option<&GvaHostView> {
+fn find_covering_view(state: &Device, task_id: u32, gva: u64, length: u64) -> Option<&GvaHostView> {
     if length == 0 {
         return None;
     }
@@ -151,11 +137,11 @@ fn find_covering_view(
     // The overlap-retire site keeps [`task_matches`] deliberately: widening is
     // conservative there (dropping a view that did not need dropping costs one
     // re-walk) and narrowing it could leave a stale view live to be read later.
-    state.gva_host_views.iter().find(|v| {
+    state.host_materializations.find_gva_view(|v| {
         v.task_id == task_id
             && v.gva <= gva
             && gva.saturating_add(length) <= v.gva.saturating_add(v.length)
-            && v.ptr != 0
+            && v.host_view.is_some()
     })
 }
 
@@ -230,7 +216,7 @@ fn collect_span_gpas<M: HostMemory>(
 /// use [`write_span_within`] / [`read_span`] which multi-import maximal runs. Does not invent
 /// PTEs.
 fn ensure_gva_view<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut H,
     task_id: u32,
     gva: u64,
@@ -240,8 +226,11 @@ fn ensure_gva_view<H: HostMemory + HostOps>(
         return None;
     }
     if let Some(v) = find_covering_view(state, task_id, gva, length) {
-        let (vptr, vlen) = (v.ptr, v.ptr_len);
-        let view = v.clone();
+        let (vptr, vlen) = (v.ptr(), v.ptr_len());
+        let view_task_id = v.task_id;
+        let view_gva = v.gva;
+        let view_length = v.length;
+        let view_is_current = view_gpas_current(host, state, v);
         // Staleness verify, on EVERY reuse: re-translate the view's first/last
         // leaf and compare GPAs. A guest PT rewire that the Unmap/Map2 notifies
         // missed (or that raced ahead of the FIFO) makes the cached view alias
@@ -266,30 +255,21 @@ fn ensure_gva_view<H: HostMemory + HostOps>(
         // module being idle in general — a 14-bit page shift covers the same
         // span in a quarter of the pages and can plausibly hit.
         crate::runtime::drain::note_store_route("view_reuse");
-        if view_gpas_current(host, state, &view) {
+        if view_is_current {
             return Some((vptr, vlen));
         }
         crate::runtime::drain::note_store_route("view_stale");
-        state.view_stale_reads = state.view_stale_reads.saturating_add(1);
-        let n = state.view_stale_reads;
+        state.observations.view_stale_reads = state.observations.view_stale_reads.saturating_add(1);
+        let n = state.observations.view_stale_reads;
         if n == 1 || n.is_multiple_of(256) {
             crate::observe::fail(format!(
                 "gva_view_stale task={} gva={:#x} len={:#x} count={n}",
-                view.task_id, view.gva, view.length
+                view_task_id, view_gva, view_length
             ));
         }
-        let mut i = 0;
-        while i < state.gva_host_views.len() {
-            let w = &state.gva_host_views[i];
-            if w.ptr == view.ptr && w.gva == view.gva && w.task_id == view.task_id {
-                let w = state.gva_host_views.swap_remove(i);
-                if w.ptr != 0 && w.ptr_len != 0 {
-                    state.pending_host_releases.retire_view((w.ptr, w.ptr_len));
-                }
-            } else {
-                i += 1;
-            }
-        }
+        state.host_materializations.retire_gva_views_where(|view| {
+            view.ptr() == vptr && view.gva == view_gva && view.task_id == view_task_id
+        });
     }
     // Flush any pending unmaps before allocating a new view (Darwin private VA).
     crate::runtime::mapper::flush_retired_views(state, host);
@@ -324,14 +304,19 @@ fn ensure_gva_view<H: HostMemory + HostOps>(
     let ptr = host.map_pages(&gpas, page_sz)?;
     let page_sz = (1usize) << page_shift;
     let ptr_len = gpas.len().saturating_mul(page_sz);
-    state.gva_host_views.push(GvaHostView {
-        task_id: resolved_tid,
-        gva,
-        length,
-        ptr,
-        ptr_len,
-        first_gpa: gpas.first().copied().unwrap_or(0),
-    });
+    let Some(host_view) = crate::model::HostPageView::new(ptr, ptr_len) else {
+        host.unmap_pages(ptr, ptr_len);
+        return None;
+    };
+    state
+        .host_materializations
+        .publish_gva_view(GvaHostView::new(
+            resolved_tid,
+            gva,
+            length,
+            host_view,
+            gpas.first().copied().unwrap_or(0),
+        ));
     Some((ptr, ptr_len))
 }
 
@@ -342,7 +327,7 @@ fn ensure_gva_view<H: HostMemory + HostOps>(
 /// uses and a cheap canary for larger spans (2 leaf walks, ~1 µs each).
 fn view_gpas_current<H: HostMemory>(
     host: &H,
-    state: &DeviceState,
+    state: &Device,
     v: &crate::model::GvaHostView,
 ) -> bool {
     if v.first_gpa == 0 {
@@ -372,7 +357,7 @@ fn view_gpas_current<H: HostMemory>(
     // first GPA and the page count, with no per-view GPA list to store. And the
     // ends-only form already paid for two page-table walks; this is one walk
     // over the span with the level cache warm for all of it.
-    gpas.len() == v.ptr_len >> page_shift
+    gpas.len() == v.ptr_len() >> page_shift
         && gpas
             .iter()
             .enumerate()
@@ -402,7 +387,7 @@ pub fn log_retire(op: &str, task_id: u32, gva: u64, length: u64, n: u32) {
 /// `(host_ptr, available_bytes_from_ptr)` covering at least `length`, or `None`
 /// if any page is unmapped / non-contiguous on the host.
 pub fn host_ptr_for_span<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut H,
     task_id: u32,
     gva: u64,
@@ -459,14 +444,14 @@ fn span_within_window(gpas: &[u64], allowed: WindowPages<'_>) -> bool {
 /// Write `buf` into guest `[gva, gva+buf.len())`, bounded to the pages a
 /// deferred window was armed on.
 ///
-/// **Writes never reuse a cached view.** A registered `gva_host_views` entry
+/// **Writes never reuse a cached view.** A registered task-GVA host view
 /// goes stale the moment the guest rewires its task PT (tile/page recycle)
 /// and is only retired when the Unmap/Map2 notify drains — a write through
 /// it lands in whatever now owns those host pages (guest heap corruption:
 /// the 2026-07-19 WindowServer SIGSEGV class). Every write walks the PT at
 /// write time: packed spans map once, fragmented spans multi-import per run.
 pub fn write_span_within<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut H,
     task_id: u32,
     gva: u64,
@@ -498,7 +483,7 @@ pub fn write_span_within<H: HostMemory + HostOps>(
 /// reasons: the walk that authorises is the walk that writes, no cached view is
 /// reused, and the pages are recorded as host-written before any byte lands.
 pub(crate) fn write_rect_within<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut H,
     task_id: u32,
     gva: u64,
@@ -515,7 +500,7 @@ pub(crate) fn write_rect_within<H: HostMemory + HostOps>(
 /// The read counterpart of [`write_rect_within`], and the same one-walk
 /// argument. A read authorises nothing, so it carries no window.
 pub(crate) fn read_rect<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut H,
     task_id: u32,
     gva: u64,
@@ -530,7 +515,7 @@ pub(crate) fn read_rect<H: HostMemory + HostOps>(
 ///
 /// Same write-freshness rule as [`write_span_within`]: walks the task PT at call
 /// time and maps the packed span without consulting or registering
-/// `gva_host_views`. The caller must release it with [`unmap_fresh_span`]
+/// the registered task-GVA view set. The caller must release it with [`unmap_fresh_span`]
 /// (product Linux unmap is a no-op alias; Darwin unmaps a real region).
 /// Fragmented spans return `None` — callers fall back to their per-row
 /// multi-import path, which is also fresh.
@@ -549,7 +534,7 @@ pub struct FreshSpan {
 /// See [`span_within_window`]: the check sits on this walk because this walk is
 /// what the returned pointer aliases.
 pub fn map_fresh_span_within<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut H,
     task_id: u32,
     gva: u64,
@@ -637,7 +622,7 @@ pub fn unmap_fresh_span<H: HostOps>(host: &mut H, span: FreshSpan) {
 
 /// Read `buf.len()` bytes from guest `gva` via HostOps map_pages (multi-import).
 pub fn read_span<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut H,
     task_id: u32,
     gva: u64,
@@ -697,12 +682,12 @@ pub fn read_span<H: HostMemory + HostOps>(
 ///
 /// Three steps are write-only and are keyed on the direction, not duplicated:
 /// the [`WindowPages`] containment check, which only a deferred write carries an
-/// authorisation set for; [`DeviceState::note_host_wrote_pages`], which
+/// authorisation set for; [`Device::note_host_wrote_pages`], which
 /// invalidates retained derived content reached through another alias; and the
 /// per-run footprint mark. `allowed` is ignored in the read direction because a
 /// read authorises nothing.
 fn span_multi<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut H,
     task_id: u32,
     gva: u64,
@@ -779,15 +764,16 @@ fn span_multi<H: HostMemory + HostOps>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::endian::st32;
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
     use crate::runtime::host::FakeHost;
+    #[cfg(not(target_os = "macos"))]
     use crate::runtime::host::HostPageViews;
+    use reims_vgpu_core::endian::st32;
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use reims_vgpu_paging::resolve::ResolveStatus;
 
-    fn state_x86() -> DeviceState {
-        DeviceState::new(DeviceId(1), 12)
+    fn state_x86() -> Device {
+        Device::new(DeviceId(1), 12)
     }
 
     #[test]
@@ -979,14 +965,13 @@ mod tests {
         let (ptr, ptr_len) = ensure_gva_view(&mut state, &mut host, 1, page, 3 * page)
             .expect("three packed pages map as one view");
         assert_eq!(ptr_len as u64, 3 * page);
-        let view = crate::model::GvaHostView {
-            task_id: 1,
-            gva: page,
-            length: 3 * page,
-            ptr,
-            ptr_len,
-            first_gpa: 5 << page_shift,
-        };
+        let view = crate::model::GvaHostView::new(
+            1,
+            page,
+            3 * page,
+            crate::model::HostPageView::new(ptr, ptr_len).expect("mapped test view"),
+            5 << page_shift,
+        );
         assert!(
             view_gpas_current(&host, &state, &view),
             "nothing has moved yet"
@@ -1232,14 +1217,11 @@ mod tests {
         assert_eq!(task_match_kind(20, 43), None);
 
         let mut state = state_x86();
-        state.gva_host_views.push(crate::model::GvaHostView {
-            task_id: 20,
-            gva: 0x1000,
-            length: 0x1000,
-            ptr: 0x4000,
-            ptr_len: 0x1000,
-            first_gpa: 0,
-        });
+        state
+            .host_materializations
+            .publish_gva_view(crate::model::GvaHostView::fixture(
+                20, 0x1000, 0x1000, 0x4000, 0x1000,
+            ));
 
         let before = log_mark();
         assert!(find_covering_view(&state, 20, 0x1000, 0x10).is_some());
@@ -1558,8 +1540,8 @@ mod tests {
         state.define_task(1, page, 2);
         let gva = 8u64;
         let (p0, _) = ensure_gva_view(&mut state, &mut host, 1, gva, 16).unwrap();
-        assert_eq!(state.gva_host_views.len(), 1);
-        assert_eq!(state.gva_host_views[0].first_gpa, data0);
+        assert_eq!(state.host_materializations.views().len(), 1);
+        assert_eq!(state.host_materializations.views()[0].first_gpa, data0);
 
         // Rewire the PTE (no Unmap notify) — the registered view is stale.
         let mut pte = [0u8; 4];
@@ -1571,9 +1553,9 @@ mod tests {
         // left `view_stale_reads` at 0.
         let (p2, _) = ensure_gva_view(&mut state, &mut host, 1, gva, 16).unwrap();
         assert_ne!(p2, p0, "a stale view must never be handed back");
-        assert_eq!(state.view_stale_reads, 1);
-        assert_eq!(state.gva_host_views.len(), 1);
-        assert_eq!(state.gva_host_views[0].first_gpa, data1);
+        assert_eq!(state.observations.view_stale_reads, 1);
+        assert_eq!(state.host_materializations.views().len(), 1);
+        assert_eq!(state.host_materializations.views()[0].first_gpa, data1);
         // Writes through the rebuilt view land in the newly wired page.
         // SAFETY: ensure_gva_view mapped the page; gva page offset is 8.
         unsafe { *((p2 as *mut u8).add(gva as usize)) = 0xcc };
@@ -1585,87 +1567,68 @@ mod tests {
     #[test]
     fn unmap_retires_overlapping_view_only() {
         let mut state = state_x86();
-        state.gva_host_views.push(GvaHostView {
-            task_id: 2,
-            gva: 0x1000,
-            length: 0x2000,
-            ptr: 0xaaaa,
-            ptr_len: 0x2000,
-            ..Default::default()
-        });
-        state.gva_host_views.push(GvaHostView {
-            task_id: 2,
-            gva: 0x10000,
-            length: 0x1000,
-            ptr: 0xbbbb,
-            ptr_len: 0x1000,
-            ..Default::default()
-        });
-        state.gva_host_views.push(GvaHostView {
-            task_id: 3,
-            gva: 0x1000,
-            length: 0x2000,
-            ptr: 0xcccc,
-            ptr_len: 0x2000,
-            ..Default::default()
-        });
+        state
+            .host_materializations
+            .publish_gva_view(GvaHostView::fixture(2, 0x1000, 0x2000, 0xaaaa, 0x2000));
+        state
+            .host_materializations
+            .publish_gva_view(GvaHostView::fixture(2, 0x10000, 0x1000, 0xbbbb, 0x1000));
+        state
+            .host_materializations
+            .publish_gva_view(GvaHostView::fixture(3, 0x1000, 0x2000, 0xcccc, 0x2000));
 
         let n = retire_gva_views_overlapping(&mut state, 2, 0x1500, 0x100);
         assert_eq!(n, 1);
-        assert_eq!(state.gva_host_views.len(), 2);
+        assert_eq!(state.host_materializations.views().len(), 2);
         assert!(state
-            .gva_host_views
+            .host_materializations
+            .views()
             .iter()
-            .any(|v| v.ptr == 0xbbbb && v.task_id == 2));
+            .any(|v| v.ptr() == 0xbbbb && v.task_id == 2));
         assert!(state
-            .gva_host_views
+            .host_materializations
+            .views()
             .iter()
-            .any(|v| v.ptr == 0xcccc && v.task_id == 3));
-        assert_eq!(state.pending_host_releases.views(), vec![(0xaaaa, 0x2000)]);
+            .any(|v| v.ptr() == 0xcccc && v.task_id == 3));
+        assert_eq!(
+            state.host_materializations.queued_views(),
+            vec![(0xaaaa, 0x2000)]
+        );
     }
 
     #[test]
     fn unmap_matches_define_task_id_shift() {
         let mut state = state_x86();
         // View stored under resolved task slot 1; wire Unmap may carry raw id 2.
-        state.gva_host_views.push(GvaHostView {
-            task_id: 1,
-            gva: 0x2000,
-            length: 0x1000,
-            ptr: 0x1111,
-            ptr_len: 0x1000,
-            ..Default::default()
-        });
+        state
+            .host_materializations
+            .publish_gva_view(GvaHostView::fixture(1, 0x2000, 0x1000, 0x1111, 0x1000));
         let n = retire_gva_views_overlapping(&mut state, 2, 0x2000, 0x1000);
         assert_eq!(n, 1);
-        assert!(state.gva_host_views.is_empty());
-        assert_eq!(state.pending_host_releases.views(), vec![(0x1111, 0x1000)]);
+        assert!(state.host_materializations.views().is_empty());
+        assert_eq!(
+            state.host_materializations.queued_views(),
+            vec![(0x1111, 0x1000)]
+        );
     }
 
     #[test]
     fn delete_task_retires_views() {
         let mut state = state_x86();
         state.define_task(1, 0x1_0000, 0x100);
-        state.gva_host_views.push(GvaHostView {
-            task_id: 1,
-            gva: 0x3000,
-            length: 0x1000,
-            ptr: 0xdddd,
-            ptr_len: 0x1000,
-            ..Default::default()
-        });
-        state.gva_host_views.push(GvaHostView {
-            task_id: 2,
-            gva: 0x3000,
-            length: 0x1000,
-            ptr: 0xeeee,
-            ptr_len: 0x1000,
-            ..Default::default()
-        });
-        assert!(state.delete_task(1));
-        assert_eq!(state.gva_host_views.len(), 1);
-        assert_eq!(state.gva_host_views[0].ptr, 0xeeee);
-        assert_eq!(state.pending_host_releases.views(), vec![(0xdddd, 0x1000)]);
+        state
+            .host_materializations
+            .publish_gva_view(GvaHostView::fixture(1, 0x3000, 0x1000, 0xdddd, 0x1000));
+        state
+            .host_materializations
+            .publish_gva_view(GvaHostView::fixture(2, 0x3000, 0x1000, 0xeeee, 0x1000));
+        assert!(state.delete_task(1).is_some());
+        assert_eq!(state.host_materializations.views().len(), 1);
+        assert_eq!(state.host_materializations.views()[0].ptr(), 0xeeee);
+        assert_eq!(
+            state.host_materializations.queued_views(),
+            vec![(0xdddd, 0x1000)]
+        );
     }
 
     #[test]
@@ -1678,16 +1641,11 @@ mod tests {
     #[test]
     fn covering_view_reuse() {
         let mut state = state_x86();
-        state.gva_host_views.push(GvaHostView {
-            task_id: 1,
-            gva: 0x1000,
-            length: 0x4000,
-            ptr: 0x9000,
-            ptr_len: 0x4000,
-            ..Default::default()
-        });
+        state
+            .host_materializations
+            .publish_gva_view(GvaHostView::fixture(1, 0x1000, 0x4000, 0x9000, 0x4000));
         let v = find_covering_view(&state, 1, 0x1800, 0x100).unwrap();
-        assert_eq!(v.ptr, 0x9000);
+        assert_eq!(v.ptr(), 0x9000);
         assert!(find_covering_view(&state, 1, 0x1000, 0x5000).is_none());
     }
 }

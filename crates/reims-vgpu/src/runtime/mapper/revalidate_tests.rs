@@ -6,9 +6,12 @@
 //! quarter of the file that was hardest to find.
 
 use super::*;
-use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
 use crate::model::{DeviceId, PAGE_SHIFT_X86};
 use crate::runtime::host::FakeHost;
+use reims_vgpu_paging::geometry::{
+    MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+    MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+};
 
 #[test]
 fn page_table_revalidation_slow_proxy_threshold_is_explicit() {
@@ -24,7 +27,7 @@ fn fragmented_run_import_slow_proxy_threshold_is_explicit() {
 
 #[test]
 fn revalidate_fail_closed_without_internal_and_empty_pages() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let host = FakeHost::new();
     state.map_surface(2);
     // Mapped but no MappingInternal and no pages → not writable.
@@ -33,7 +36,7 @@ fn revalidate_fail_closed_without_internal_and_empty_pages() {
 
 #[test]
 fn revalidate_reason_disambiguates_the_miss() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let host = FakeHost::new();
     // Unknown id → the mapping was never created / already forgotten.
     assert_eq!(
@@ -51,7 +54,13 @@ fn revalidate_reason_disambiguates_the_miss() {
     );
     // Unmapped on entry is caught before the resolve and keeps its own slug.
     state.map_surface(3);
-    state.mappings.get_mut(&3).unwrap().mapped = false;
+    state
+        .surfaces
+        .mappings
+        .get_mut(&3)
+        .unwrap()
+        .lifecycle
+        .active = false;
     assert_eq!(
         revalidate_mapping_reason(&mut state, &host, 3),
         Some("revalidate_unmapped")
@@ -62,7 +71,7 @@ fn revalidate_reason_disambiguates_the_miss() {
     // slug — a deferred window flushing here has nothing safe to write
     // through, rather than nothing resolved yet.
     state.map_surface(5);
-    state.mappings.get_mut(&5).unwrap().page_entries =
+    state.surfaces.mappings.get_mut(&5).unwrap().pages.entries =
         vec![(0x200 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
     assert!(state.condemn_surface_backing(5));
     assert_eq!(
@@ -71,26 +80,26 @@ fn revalidate_reason_disambiguates_the_miss() {
     );
     // A resolvable static page list → success (None).
     state.map_surface(4);
-    state.mappings.get_mut(&4).unwrap().page_entries =
+    state.surfaces.mappings.get_mut(&4).unwrap().pages.entries =
         vec![(0x100 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
     assert_eq!(revalidate_mapping_reason(&mut state, &host, 4), None);
 }
 
 #[test]
 fn surface_page_collision_detects_only_distinct_live_alias() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let entry = |pfn: u32| (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
     let gpa = |pfn: u64| pfn << PAGE_SHIFT_X86;
     // Two distinct live surfaces on disjoint pages → no collision.
     state.map_surface(10);
     state.map_surface(20);
-    state.mappings.get_mut(&10).unwrap().page_entries = vec![entry(0x100), entry(0x101)];
-    state.mappings.get_mut(&20).unwrap().page_entries = vec![entry(0x200), entry(0x201)];
+    state.surfaces.mappings.get_mut(&10).unwrap().pages.entries = vec![entry(0x100), entry(0x101)];
+    state.surfaces.mappings.get_mut(&20).unwrap().pages.entries = vec![entry(0x200), entry(0x201)];
     assert_eq!(first_surface_page_collision(&state, 10), None);
     assert_eq!(first_surface_page_collision(&state, 20), None);
     // Surface 20 rewires onto a page surface 10 still owns → collision,
     // reported against the other owner (10) at the shared GPA.
-    state.mappings.get_mut(&20).unwrap().page_entries = vec![entry(0x101), entry(0x201)];
+    state.surfaces.mappings.get_mut(&20).unwrap().pages.entries = vec![entry(0x101), entry(0x201)];
     assert_eq!(
         first_surface_page_collision(&state, 20),
         Some((gpa(0x101), 10))
@@ -105,7 +114,14 @@ fn surface_page_collision_detects_only_distinct_live_alias() {
     state.unmap_surface(10);
     assert_eq!(first_surface_page_collision(&state, 20), None);
     // Empty / unmapped self → None.
-    state.mappings.get_mut(&20).unwrap().page_entries.clear();
+    state
+        .surfaces
+        .mappings
+        .get_mut(&20)
+        .unwrap()
+        .pages
+        .entries
+        .clear();
     assert_eq!(first_surface_page_collision(&state, 20), None);
 }
 
@@ -119,43 +135,40 @@ fn reprieve_with_aliasing_peer_is_a_detected_collision() {
     // wrong-PFN guard is gated on pages_changed and would never run; the
     // reprieve-path guard must catch it. This asserts both halves the branch
     // composes fire together on that exact state.
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let entry = |pfn: u32| (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
     let gpa = |pfn: u64| pfn << PAGE_SHIFT_X86;
 
     // Mapping 3: condemned, its stashed pages == the plan it re-adopts.
     state.map_surface(3);
     {
-        let m = state.mappings.get_mut(&3).unwrap();
-        m.mapped = true;
-        m.page_entries = vec![entry(0x300), entry(0x301)];
-        m.map_generation = 4;
+        let m = state.surfaces.mappings.get_mut(&3).unwrap();
+        m.lifecycle.active = true;
+        m.pages.entries = vec![entry(0x300), entry(0x301)];
+        m.lifecycle.generation = 4;
     }
     assert!(state.condemn_surface_backing(3));
     // The re-walked plan matches the condemned fingerprint → reprieve.
-    let condemned = state.mappings.get(&3).unwrap().condemned_entries.clone();
     let plan = vec![entry(0x300), entry(0x301)];
-    let (pages_changed, incarnation_changed, reprieved) =
-        plan_adoption_decision(condemned.as_deref(), &[], &plan);
+    let adoption = state
+        .adopt_mapper_surface_plan(reims_vgpu_protocol::SurfaceId::new(3), plan, 0, 0, None)
+        .unwrap();
     assert!(
-        reprieved,
+        adoption.reprieved,
         "same plan as condemned fingerprint must reprieve"
     );
-    assert!(!pages_changed, "reprieve must not see a page change");
-    assert!(!incarnation_changed);
+    assert!(
+        !adoption.pages_changed,
+        "reprieve must not see a page change"
+    );
 
     // Re-adopt the plan (as the resolve would) and stand up a DIFFERENT live
     // surface (20) that now also owns page 0x301 — the guest recycled it.
-    {
-        let m = state.mappings.get_mut(&3).unwrap();
-        m.page_entries = plan.clone();
-        m.condemned_entries = None;
-    }
     state.map_surface(20);
     {
-        let m = state.mappings.get_mut(&20).unwrap();
-        m.mapped = true;
-        m.page_entries = vec![entry(0x301), entry(0x999)];
+        let m = state.surfaces.mappings.get_mut(&20).unwrap();
+        m.lifecycle.active = true;
+        m.pages.entries = vec![entry(0x301), entry(0x999)];
     }
     // The reprieve-path guard's detector fires: mapping 3's re-adopted page
     // 0x301 is also owned by live surface 20 — the wrong-PFN write vector the
@@ -168,7 +181,7 @@ fn reprieve_with_aliasing_peer_is_a_detected_collision() {
 
 #[test]
 fn surface_page_collision_invalidates_mapping_fail_closed() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let entry = |pfn: u32| (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
     let gpa = |pfn: u64| pfn << PAGE_SHIFT_X86;
     const MID: u32 = 0x0CA;
@@ -176,32 +189,32 @@ fn surface_page_collision_invalidates_mapping_fail_closed() {
 
     state.map_surface(MID);
     {
-        let m = state.mappings.get_mut(&MID).unwrap();
-        m.mapped = true;
-        m.map_generation = 7;
-        m.page_entries = vec![entry(0x777), entry(0x778)];
-        m.page_table_kva = 0xABC0;
+        let m = state.surfaces.mappings.get_mut(&MID).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.generation = 7;
+        m.pages.entries = vec![entry(0x777), entry(0x778)];
+        m.pages.table_kva = 0xABC0;
     }
     state.map_surface(OWNER);
     {
-        let m = state.mappings.get_mut(&OWNER).unwrap();
-        m.mapped = true;
-        m.page_entries = vec![entry(0x778)];
+        let m = state.surfaces.mappings.get_mut(&OWNER).unwrap();
+        m.lifecycle.active = true;
+        m.pages.entries = vec![entry(0x778)];
     }
 
     let (shared_gpa, owner) = first_surface_page_collision(&state, MID).expect("must detect alias");
     assert_eq!((shared_gpa, owner), (gpa(0x778), OWNER));
 
     fail_closed_surface_page_collision(&mut state, MID, shared_gpa, owner, 2, "test");
-    let m = state.mappings.get(&MID).unwrap();
-    assert!(m.mapped, "surface stays mapped but unresolved");
+    let m = state.surfaces.mappings.get(&MID).unwrap();
+    assert!(m.lifecycle.active, "surface stays mapped but unresolved");
     assert!(
-        m.page_entries.is_empty(),
+        m.pages.entries.is_empty(),
         "known-bad page plan must be cleared"
     );
-    assert_eq!(m.page_table_kva, 0);
+    assert_eq!(m.pages.table_kva, 0);
     assert_eq!(
-        m.map_generation, 8,
+        m.lifecycle.generation, 8,
         "generation bump makes any deferred writeback fail closed"
     );
     assert_eq!(first_surface_page_collision(&state, MID), None);
@@ -209,26 +222,26 @@ fn surface_page_collision_invalidates_mapping_fail_closed() {
 
 #[test]
 fn revalidate_accepts_static_page_list_without_internal() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let host = FakeHost::new();
     state.map_surface(4);
     {
-        let m = state.mappings.get_mut(&4).unwrap();
-        m.page_entries = vec![(0x100 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        let m = state.surfaces.mappings.get_mut(&4).unwrap();
+        m.pages.entries = vec![(0x100 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
     }
     assert!(revalidate_mapping_pages(&mut state, &host, 4));
 }
 
 #[test]
 fn mapping_io_still_rejects_non_ram_page_at_map_boundary() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     host.strict_linux_map = true;
     let mid = 6;
     assert!(state.map_surface(mid));
     {
-        let m = state.mappings.get_mut(&mid).unwrap();
-        m.page_entries = vec![(0x7f000 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+        m.pages.entries = vec![(0x7f000 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
     }
     let mut byte = [0u8; 1];
     assert!(!read_mapping_bytes(
@@ -249,28 +262,47 @@ fn mapping_io_still_rejects_non_ram_page_at_map_boundary() {
 
 #[test]
 fn invalidate_mapping_pages_bumps_map_generation_and_clears() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     state.map_surface(5);
     let import_id = {
-        let m = state.mappings.get_mut(&5).unwrap();
-        m.page_entries = vec![1];
-        m.contig_ptr = 0xdead;
-        m.contig_len = 4096;
-        m.contig_import = Some(std::sync::Arc::new(
+        let m = state.surfaces.mappings.get_mut(&5).unwrap();
+        m.pages.entries = vec![1];
+        let import = std::sync::Arc::new(
             crate::runtime::guest_ram::GuestRamImport::new_host_allocation(0xdead_0000, 4096, 4096)
                 .expect("synthetic aligned import"),
-        ));
-        m.contig_import.as_ref().unwrap().id()
+        );
+        let import_id = import.id();
+        let mut view = crate::model::SurfaceHostView::new(
+            0xdead,
+            4096,
+            crate::runtime::guest_ram::GuestPageFootprint::new([0x1000].into(), 4096)
+                .expect("synthetic footprint"),
+        )
+        .expect("valid host view");
+        assert!(view.replace_import(import).is_none());
+        m.materialization.install(view);
+        import_id
     };
-    let gen0 = state.mappings.get(&5).unwrap().map_generation;
-    assert!(state.invalidate_mapping_pages(5));
-    let m = state.mappings.get(&5).unwrap();
-    assert!(m.page_entries.is_empty());
-    assert_eq!(m.contig_ptr, 0);
-    assert!(m.contig_import.is_none());
-    assert!(m.map_generation != gen0);
-    assert_eq!(state.pending_host_releases.views(), vec![(0xdead, 4096)]);
-    assert_eq!(state.pending_host_releases.guest_imports(), vec![import_id]);
+    let gen0 = state
+        .surfaces
+        .mappings
+        .get(&5)
+        .unwrap()
+        .lifecycle
+        .generation;
+    assert!(state.invalidate_mapping_pages(5).had_page_state);
+    let m = state.surfaces.mappings.get(&5).unwrap();
+    assert!(m.pages.entries.is_empty());
+    assert!(!m.materialization.has_view());
+    assert!(m.lifecycle.generation != gen0);
+    assert_eq!(
+        state.host_materializations.queued_views(),
+        vec![(0xdead, 4096)]
+    );
+    assert_eq!(
+        state.host_materializations.queued_guest_imports(),
+        vec![import_id]
+    );
 }
 
 /// Invalidating a mapping's pages drops the host-side copy of those pages.
@@ -288,14 +320,12 @@ fn invalidate_mapping_pages_bumps_map_generation_and_clears() {
 /// copy of invalidated pages is still readable, which is the whole defect.
 #[test]
 fn invalidate_mapping_pages_drops_the_host_cache_of_those_pages() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     state.map_surface(5);
     {
-        let m = state.mappings.get_mut(&5).unwrap();
-        m.page_entries = vec![1];
-        m.has_geom = true;
-        m.width = 2;
-        m.height = 2;
+        let m = state.surfaces.mappings.get_mut(&5).unwrap();
+        m.pages.entries = vec![1];
+        m.publish_geometry_for_test(2, 2, 0);
     }
     crate::runtime::surface_cache::store(&mut state, 5, 2, 2, vec![0xab; 2 * 2 * 4]);
     assert!(
@@ -303,7 +333,7 @@ fn invalidate_mapping_pages_drops_the_host_cache_of_those_pages() {
         "the cache entry under test was never stored"
     );
 
-    state.invalidate_mapping_pages(5);
+    let _ = state.invalidate_mapping_pages(5);
 
     assert!(
         crate::runtime::surface_cache::get_shared(&state, 5, 2, 2).is_none(),
@@ -321,7 +351,7 @@ fn invalidate_mapping_pages_drops_the_host_cache_of_those_pages() {
 /// the magnitude the old line carried must still be readable as `served=`.
 #[test]
 fn a_host_refusal_is_cached_but_fragmentation_is_still_offered_to_it() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     host.strict_linux_map = true;
     let page = 1u64 << PAGE_SHIFT_X86;
@@ -334,7 +364,7 @@ fn a_host_refusal_is_cached_but_fragmentation_is_still_offered_to_it() {
     }
     let mid = 9u32;
     state.map_surface(mid);
-    state.mappings.get_mut(&mid).unwrap().page_entries = vec![entry(gpa0), entry(gpa1)];
+    state.surfaces.mappings.get_mut(&mid).unwrap().pages.entries = vec![entry(gpa0), entry(gpa1)];
 
     let cap = crate::observe::FailCapture::start();
     let lines = || -> Vec<String> {
@@ -364,9 +394,9 @@ fn a_host_refusal_is_cached_but_fragmentation_is_still_offered_to_it() {
     // A different page list is a different verdict: the generation bump that
     // retires `contig_ptr` must also retire this.
     {
-        let m = state.mappings.get_mut(&mid).unwrap();
-        m.page_entries = vec![entry(gpa0), entry(gpa1), entry(gpa2)];
-        DeviceState::bump_page_generation(m);
+        let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+        m.pages.entries = vec![entry(gpa0), entry(gpa1), entry(gpa2)];
+        crate::model::DeviceState::bump_page_generation(m);
     }
     assert!(ensure_contig_view(&mut state, &mut host, mid).is_none());
     let after = lines();
@@ -405,7 +435,7 @@ fn a_host_refusal_is_cached_but_fragmentation_is_still_offered_to_it() {
 /// `write_mapping_bytes` still lands bytes via maximal packed runs.
 #[test]
 fn multi_import_fragmented_mapping_write() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     host.strict_linux_map = true;
     let page = 1u64 << PAGE_SHIFT_X86;
@@ -419,8 +449,8 @@ fn multi_import_fragmented_mapping_write() {
     let mid = 9u32;
     state.map_surface(mid);
     {
-        let m = state.mappings.get_mut(&mid).unwrap();
-        m.page_entries = vec![
+        let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+        m.pages.entries = vec![
             (pfn0 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
             (pfn1 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
         ];
@@ -480,7 +510,7 @@ fn a_mapping_write_marks_its_own_frames_and_not_the_gap_between_them() {
     use crate::observe::footprint;
 
     let _fp = footprint::exclusive_for_tests();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     host.strict_linux_map = true;
     let page = 1u64 << PAGE_SHIFT_X86;
@@ -491,8 +521,8 @@ fn a_mapping_write_marks_its_own_frames_and_not_the_gap_between_them() {
     let mid = 9u32;
     state.map_surface(mid);
     {
-        let m = state.mappings.get_mut(&mid).unwrap();
-        m.page_entries = vec![
+        let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+        m.pages.entries = vec![
             (((gpa0 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
             (((gpa1 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
         ];
@@ -554,7 +584,7 @@ fn a_contiguous_mapping_write_marks_only_the_pages_its_offset_reaches() {
     use crate::observe::footprint;
 
     let _fp = footprint::exclusive_for_tests();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     let page = 1u64 << PAGE_SHIFT_X86;
     // Adjacent, so `ensure_contig_view` packs them into one view.
@@ -564,8 +594,8 @@ fn a_contiguous_mapping_write_marks_only_the_pages_its_offset_reaches() {
     let mid = 11u32;
     state.map_surface(mid);
     {
-        let m = state.mappings.get_mut(&mid).unwrap();
-        m.page_entries = vec![
+        let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+        m.pages.entries = vec![
             (((gpa0 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
             (((gpa1 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
         ];

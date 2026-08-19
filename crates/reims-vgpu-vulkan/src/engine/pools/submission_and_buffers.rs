@@ -170,7 +170,6 @@ impl ResourcePools {
     }
 
     pub(crate) fn new() -> Self {
-        super::super::publish_batch_open(false);
         Self {
             readback_lease_returns: Arc::new(ReadbackLeaseReturns::default()),
             staging_free: HashMap::new(),

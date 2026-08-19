@@ -3,22 +3,6 @@
 //! Sources: `apple-pv-gpu.h`, `reims_vgpu_fifo_format.h`.
 //! Values are protocol constants — not content heuristics.
 
-/// Gfx MMIO window size (16 KiB); bounds the sparse register store.
-///
-/// This constant is the owner. `REIMS_VGPU_GFX_MMIO_SIZE` in
-/// `include/reims_vgpu_qemu_abi.h` mirrors it and both shims size their region
-/// from the header — the sysbus gfx window on one, BAR0 on the other — so the
-/// window the guest can address and the bound Rust indexes cannot part without
-/// `the_abi_header_agrees_on_the_gfx_window_size` failing.
-///
-/// The iosfc window's size is not mirrored here. QEMU declares that region
-/// (`REIMS_VGPU_MMIO_IOSFC_MMIO_SIZE` in `reims-vgpu-mmio.c`) and Rust only
-/// needs a bound for state it keeps per offset, which the iosfc rail does not do
-/// — it decodes five named registers and ignores the rest. A second unread copy
-/// of the iosfc size would be a source of truth nothing checks against the one
-/// that actually sizes the `MemoryRegion`.
-pub const GFX_MMIO_SIZE: u64 = 0x4000;
-
 /// Control block base inside the gfx window.
 pub const REG_BASE: u64 = 0x1000;
 
@@ -112,21 +96,20 @@ pub const EFI_BUILTIN_CONNECTED: u32 = 1;
 /// [`EFI_DISPLAY_PORT_COUNT`] published here it creates channels 0..=5.
 ///
 /// The bound is therefore not tight, and it is not load-bearing either — see
-/// [`accept_child_channel`] for what a refusal past it would cost. It is pinned
+/// [`crate::runtime::accept_child_channel`] for what a refusal past it would cost. It is pinned
 /// from above by the three `u32` masks below and from *use* by the layout of the
 /// root page, which has room for `(page_size - CHILD_REG_BLOCK_OFFSET) /
 /// CHILD_REG_BLOCK_STRIDE` blocks — 153 on a 4 KiB page — and which the guest
 /// indexes with no bound check of its own.
 pub use reims_vgpu_core::MAX_CHANNELS;
 
-/// `active_child_mask`, `pending.child_mask` and `child_doorbell_rung` are each
+/// The active and pending child-work masks and `child_doorbell_rung` are each
 /// a `u32` carrying one bit per channel, and every producer reaches them with a
 /// bare `1u32 << channel_id`. That is only defined because a channel id is
 /// bounded by 32 — a `MAX_CHANNELS` above `u32::BITS` would make every one of
 /// those shifts overflow, which Rust panics on in debug and wraps in release.
 /// The masks would have to widen with the constant, so this refuses the change
 /// at the constant rather than at the four shift sites.
-
 /// Whether `channel_id` names a child channel this device has.
 ///
 /// Channel 0 is the root/main FIFO, not a child, so it is refused here for the
@@ -140,40 +123,6 @@ pub use reims_vgpu_core::MAX_CHANNELS;
 /// you did not put side by side.
 pub const fn is_child_channel(channel_id: u32) -> bool {
     channel_id >= 1 && (channel_id as usize) < MAX_CHANNELS
-}
-
-/// [`is_child_channel`], reporting the refusal when the answer is no.
-///
-/// The three sites that gate on a channel id are the two doorbell handlers
-/// (locked and lock-free) and `ensure_child_ring`, and all three used to answer
-/// this question and then say nothing: an `if` with no `else` at the first two,
-/// and a `0` return at the third that is indistinguishable from "ring not valid
-/// yet". A guest ringing channel 32 therefore set no mask bit, scheduled no
-/// bottom half, and was never told — every command it queued there sits in the
-/// ring forever, which is a stalled channel rather than a dropped record and so
-/// does not even look like corruption from the guest's side.
-///
-/// `MAX_CHANNELS` is a bound this device imposes, not one the protocol states,
-/// and nothing tells a guest what it is: `DEVICE_INFO_CAPS` advertises no
-/// channel count, and the register blocks the guest indexes are inside its own
-/// root page rather than in this device's MMIO window. What bounds a guest in
-/// practice is its own enumeration, which stops at id 12 — see
-/// [`MAX_CHANNELS`]. This report is what would say that reading had gone stale.
-///
-/// Latched per channel id, so a guest hammering one out-of-range doorbell costs
-/// one line rather than one per ring; the census route counts every occurrence.
-pub fn accept_child_channel(channel_id: u32, site: &'static str) -> bool {
-    if is_child_channel(channel_id) {
-        return true;
-    }
-    crate::runtime::drain::census::note_store_route("child_channel_out_of_range");
-    if crate::observe::first_sight("channel_outside_device_range", u64::from(channel_id)) {
-        crate::observe::fail(format!(
-            "child_channel_out_of_range reason=channel_outside_device_range \
-             site={site} channel={channel_id} max_channels={MAX_CHANNELS}"
-        ));
-    }
-    false
 }
 
 /// Whether `mapping_id` names a mapping rather than "no mapping".
@@ -193,7 +142,7 @@ pub fn accept_child_channel(channel_id: u32, site: &'static str) -> bool {
 ///
 /// This used to also require `mapping_id < MAX_MAPPINGS` (4096). Nothing was
 /// indexed by that number. Every one of the five `DeviceState` mutators reaches
-/// `self.mappings.entry(mapping_id).or_default()` on a `BTreeMap` keyed by the
+/// `self.surfaces.mappings.entry(mapping_id).or_default()` on a `BTreeMap` keyed by the
 /// full `u32`, and no other structure in the device is sized by mapping id — so
 /// the bound allocated nothing, protected nothing, and its only effect was that
 /// a guest naming id 4096 had its MAP, UNMAP, MappingInternal attach, device
@@ -204,7 +153,7 @@ pub fn accept_child_channel(channel_id: u32, site: &'static str) -> bool {
 /// Zero stays refused because it is a *meaning*, not a size: the sentinel is
 /// read as "unbound" by the draw path, so a mapping stored under it could never
 /// be served.
-pub const fn is_mapping_id(mapping_id: u32) -> bool {
+pub const fn is_surface_mapping_id(mapping_id: u32) -> bool {
     mapping_id >= 1
 }
 
@@ -271,18 +220,18 @@ pub const fn scanout_extent_ok(width: u32, height: u32) -> bool {
     scanout_extent_fault(width, height).is_none()
 }
 
-// Single source of truth for the shifts: `contract::gva::PAGE_SHIFT_*`,
+// Single source of truth for the shifts: `reims_vgpu_paging::geometry::PAGE_SHIFT_*`,
 // re-exported rather than restated. There is **no** bare `PAGE_SIZE` /
 // `PAGE_SHIFT` — those names defaulted to arm16K and caused x86 wild writes
 // (stamp slots). Product code uses `state.page_size()` / `state.page_shift`;
 // fixtures pick an arch-qualified name.
 //
-// The two `PAGE_SIZE_*` below are NOT the `contract::gva` constants of the same
+// The two `PAGE_SIZE_*` below are NOT the `reims_vgpu_paging::geometry` constants of the same
 // name: those are `u32` for page-offset masking, these are the `u64` widening
 // the device's address arithmetic and its fixtures want. Both derive from the
 // one re-exported shift, so they cannot disagree in value — but the names do
 // collide, so import from one module or the other on purpose.
-pub(crate) use crate::contract::gva::{pfn_to_gpa, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
+pub(crate) use reims_vgpu_paging::geometry::{pfn_to_gpa, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
 // Gated with the fixtures that want them. That is the same statement the
 // comment above makes, now enforced rather than asserted: no product path
 // names either one, because product code goes through `state.page_size()`.
@@ -297,8 +246,8 @@ pub const PACKET_TOTAL_SIZE: usize = 0x04;
 pub const PACKET_COMPLETION_STAMP: usize = 0x08;
 pub const PACKET_HEADER_LEN: u32 = 12;
 pub const PACKET_STAMP_LEN: u32 = 8;
-pub const STAMP_INDEX_MASK: u32 = 0xffff;
-pub const STAMP_SLOT_LEN: u32 = 4;
+pub const STAMP_INDEX_MASK: u32 = reims_vgpu_protocol::STAMP_INDEX_MASK;
+pub const STAMP_SLOT_LEN: u32 = reims_vgpu_protocol::STAMP_SLOT_LEN as u32;
 
 /// `CmdDisplaySetSharedStatePage`, the same command as
 /// [`CHILD_OP_SETUP_SHARED_STATE`] and not a second meaning for the number.
@@ -1166,7 +1115,7 @@ pub const DEVICE_INFO_KEY_DUAL_PLANE_TEXTURES: u32 = 12;
 /// the narrow one. Framebuffer read is not that: the Vulkan arm implements the
 /// attachment-0 fetch through a subpass input attachment, which is Vulkan 1.0
 /// families all have it. What is missing is only the fetch of a *secondary* MRT
-/// attachment, which `runtime::draw::vulkan` refuses by name as
+/// attachment, which `runtime::draw::execution` refuses by name as
 /// `draw_prepare_color_input_mrt_unsupported`.
 ///
 /// So the gap is this device's to close, not to hide, and a `0` here would be
@@ -1193,7 +1142,7 @@ pub const DEVICE_INFO_KEY_RGB10A2_GAMMA: u32 = 8;
 /// out on, so it is a promise about what this device can address rather than a
 /// capability it can decline later.
 ///
-/// Distinct from [`crate::contract::iosurface_pages::ROW_BYTES_ALIGN`], which is
+/// Distinct from [`reims_vgpu_protocol::ROW_BYTES_ALIGN`], which is
 /// an IOSurface row estimate for counting pages and is deliberately not a pitch.
 /// Do not relate the two: one is Metal's linear-texture rule and the other is
 /// IOSurface's allocator, and nothing says they are the same number.
@@ -1296,7 +1245,7 @@ pub const DEVICE_INFO_SERIALIZER_VERSION: u32 = 8;
 ///
 /// Not a count and not a maximum: the guest's `supportsPrimitiveType:` tests
 /// **bit `type`** of this value for any `type <= 8`, and answers `type < 5` when
-/// the key is absent. See [`crate::contract::draw::EXECUTABLE_PRIMITIVE_TYPES`]
+/// the key is absent. See [`reims_vgpu_core::draw::EXECUTABLE_PRIMITIVE_TYPES`]
 /// for what this device puts in it and why that is narrower than the capture.
 ///
 /// Narrowing it changed nothing on the x86 pathway, as expected and no more
@@ -1458,7 +1407,7 @@ pub const DEVICE_INFO_CAPS: &[(u32, u32)] = &[
     ),
     (
         DEVICE_INFO_KEY_PRIMITIVE_TYPE_MASK,
-        crate::contract::draw::EXECUTABLE_PRIMITIVE_TYPES,
+        reims_vgpu_core::draw::EXECUTABLE_PRIMITIVE_TYPES,
     ),
     (DEVICE_INFO_KEY_DUAL_PLANE_TEXTURES, 1),
     (DEVICE_INFO_KEY_LINEAR_TEXTURE_ALIGN, 256),
@@ -2154,12 +2103,12 @@ mod tests {
     #[test]
     fn the_mapping_id_bound_refuses_only_the_no_mapping_sentinel() {
         assert!(
-            !is_mapping_id(0),
+            !is_surface_mapping_id(0),
             "0 names no mapping; it must not open an entry"
         );
-        assert!(is_mapping_id(1));
+        assert!(is_surface_mapping_id(1));
         assert!(
-            is_mapping_id(u32::MAX),
+            is_surface_mapping_id(u32::MAX),
             "a mapping id is a full u32 on the wire and its storage is a map"
         );
     }
@@ -2195,7 +2144,7 @@ mod tests {
     fn the_abi_header_agrees_on_the_gfx_window_size() {
         assert_eq!(
             u64::from(crate::qemu::abi::header_define("REIMS_VGPU_GFX_MMIO_SIZE")),
-            GFX_MMIO_SIZE,
+            reims_vgpu_core::GFX_MMIO_SIZE,
             "the shims size the gfx MMIO region from the header; it has drifted \
              from the bound Rust's sparse register store is indexed against"
         );
@@ -2207,7 +2156,7 @@ mod tests {
     /// `reims-vgpu-mmio.c` sizes its `mach_vm_remap` view, its alignment mask
     /// and its packed-contiguity stride from the header's arm64e page size,
     /// while every Rust reader derives the same number from
-    /// `contract::gva::PAGE_SHIFT_ARM64E`. A drift is a view built at one
+    /// `reims_vgpu_paging::geometry::PAGE_SHIFT_ARM64E`. A drift is a view built at one
     /// stride and addressed at another, on one pathway, with no failure at the
     /// seam.
     ///

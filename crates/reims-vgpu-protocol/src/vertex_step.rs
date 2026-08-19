@@ -31,6 +31,62 @@ pub const MTL_VERTEX_STEP_FUNCTION_PER_PATCH: u32 = 3;
 /// `MTLVertexStepFunctionPerPatchControlPoint` — tessellation only.
 pub const MTL_VERTEX_STEP_FUNCTION_PER_PATCH_CONTROL_POINT: u32 = 4;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum VertexStepFunction {
+    Constant,
+    #[default]
+    PerVertex,
+    PerInstance,
+}
+
+impl VertexStepFunction {
+    pub const fn mtl_ordinal(self) -> u32 {
+        match self {
+            Self::Constant => MTL_VERTEX_STEP_FUNCTION_CONSTANT,
+            Self::PerVertex => MTL_VERTEX_STEP_FUNCTION_PER_VERTEX,
+            Self::PerInstance => MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VertexStepDecodeError {
+    TessellationUnsupported(u32),
+    Unknown(u32),
+}
+
+impl VertexStepDecodeError {
+    pub const fn raw(self) -> u32 {
+        match self {
+            Self::TessellationUnsupported(raw) | Self::Unknown(raw) => raw,
+        }
+    }
+
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::TessellationUnsupported(_) => "vertex_step_function_per_patch",
+            Self::Unknown(_) => "unknown_vertex_step_function",
+        }
+    }
+}
+
+pub const fn decode_vertex_step_function(
+    declared: Option<u32>,
+) -> Result<VertexStepFunction, VertexStepDecodeError> {
+    let Some(raw) = declared else {
+        return Ok(VertexStepFunction::PerVertex);
+    };
+    match raw {
+        MTL_VERTEX_STEP_FUNCTION_CONSTANT => Ok(VertexStepFunction::Constant),
+        MTL_VERTEX_STEP_FUNCTION_PER_VERTEX => Ok(VertexStepFunction::PerVertex),
+        MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE => Ok(VertexStepFunction::PerInstance),
+        MTL_VERTEX_STEP_FUNCTION_PER_PATCH | MTL_VERTEX_STEP_FUNCTION_PER_PATCH_CONTROL_POINT => {
+            Err(VertexStepDecodeError::TessellationUnsupported(raw))
+        }
+        other => Err(VertexStepDecodeError::Unknown(other)),
+    }
+}
+
 /// Whether the `(step function, step rate)` pair is one Metal accepts.
 ///
 /// Zero is legal for exactly one step function and required by it. Under any
@@ -91,5 +147,27 @@ mod tests {
                 assert!(step_rate_in_contract(step, rate));
             }
         }
+    }
+
+    #[test]
+    fn step_function_decode_distinguishes_tessellation_from_unknown_values() {
+        assert_eq!(
+            decode_vertex_step_function(None),
+            Ok(VertexStepFunction::PerVertex)
+        );
+        assert_eq!(
+            decode_vertex_step_function(Some(MTL_VERTEX_STEP_FUNCTION_CONSTANT)),
+            Ok(VertexStepFunction::Constant)
+        );
+        assert_eq!(
+            decode_vertex_step_function(Some(MTL_VERTEX_STEP_FUNCTION_PER_PATCH)),
+            Err(VertexStepDecodeError::TessellationUnsupported(
+                MTL_VERTEX_STEP_FUNCTION_PER_PATCH
+            ))
+        );
+        assert_eq!(
+            decode_vertex_step_function(Some(5)),
+            Err(VertexStepDecodeError::Unknown(5))
+        );
     }
 }

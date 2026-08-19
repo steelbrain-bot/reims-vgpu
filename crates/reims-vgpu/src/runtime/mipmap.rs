@@ -8,15 +8,13 @@
 //! CPU box filter. Single-level textures fail visibly because the command has
 //! no upper mip level to populate.
 
-use crate::contract::pixel_format::{self, RGBA8_BPP};
-use crate::model::DeviceState;
-use crate::runtime::decode::resource::{
-    decode_texture_descriptor, ObjectKind, TEXTURE_MAX_MIP_LEVELS,
-};
+use crate::runtime::decode::resource::{Descriptor, ObjectKind, TEXTURE_MAX_MIP_LEVELS};
 use crate::runtime::draw::host_alloc_len;
 use crate::runtime::gva_mem;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::objects;
+use crate::runtime::Device;
+use reims_vgpu_core::pixel_format::{self, RGBA8_BPP};
 
 /// Outcome of a generateMipmaps attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,7 +141,7 @@ struct ResolvedTexture {
 }
 
 fn resolve_multi_mip_texture<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     texture_ref: u32,
@@ -158,30 +156,43 @@ fn resolve_multi_mip_texture<M: HostMemory + HostOps>(
     // from one holding a buffer from one whose descriptor would not read. That
     // costs nothing on a healthy guest — a driven boot of 177 746 draws fired no
     // rung at all — so a line from here is an event, not noise.
-    let (_entry, desc_bytes) =
-        objects::resolve_descriptor(state, host, task_id, texture_ref, &[ObjectKind::Texture])
-            .map_err(|rung| {
-                crate::observe::RungReport::new("mipmap_resolve", "tex_ref").rung(
-                    task_id,
-                    texture_ref,
-                    rung,
-                );
-                MipmapStatus::MissingTexture
-            })?;
-    let tex = match decode_texture_descriptor(&desc_bytes) {
-        Ok(t) => t,
+    let resource =
+        objects::resolve_resource(state, host, task_id, texture_ref).map_err(|rung| {
+            crate::observe::RungReport::new("mipmap_resolve", "tex_ref").rung(
+                task_id,
+                texture_ref,
+                rung,
+            );
+            MipmapStatus::MissingTexture
+        })?;
+    if resource.entry().kind != ObjectKind::Texture {
+        crate::observe::RungReport::new("mipmap_resolve", "tex_ref").rung(
+            task_id,
+            texture_ref,
+            objects::LadderRung::WrongType {
+                got: resource.entry().kind,
+            },
+        );
+        return Err(MipmapStatus::MissingTexture);
+    }
+    let tex = match objects::decoded_resource(&resource) {
+        Ok(Descriptor::Texture(texture)) => texture.clone(),
         Err(e) => {
             // Not missing — malformed. `MipmapStatus::MissingTexture` is the
             // coarse class four checks above already answer with, so without
             // this line a truncated descriptor and an unbound ref reach the
             // sink wearing the same name.
-            crate::observe::Emit::decline("mipmap_texture_desc", &e)
-                .field("task", task_id)
-                .field("tex", texture_ref)
-                .field("len", desc_bytes.len())
-                .fail_once(texture_ref as u64);
+            crate::observe::Emit::decline(
+                "mipmap_texture_desc",
+                &crate::runtime::decode::resource::DecodeDecline(*e),
+            )
+            .field("task", task_id)
+            .field("tex", texture_ref)
+            .field("len", resource.descriptor().len())
+            .fail_once(texture_ref as u64);
             return Err(MipmapStatus::MissingTexture);
         }
+        Ok(_) => return Err(MipmapStatus::MissingTexture),
     };
     let Some(fmt) = tex.declared_pixel_format() else {
         return Err(MipmapStatus::UnsupportedFormat);
@@ -204,8 +215,8 @@ fn resolve_multi_mip_texture<M: HostMemory + HostOps>(
     let l0 = tex.levels[0];
     for level in 0..levels {
         let layout = &tex.levels[level];
-        let exp_w = crate::contract::extent::mip_extent(l0.width, level as u32);
-        let exp_h = crate::contract::extent::mip_extent(l0.height, level as u32);
+        let exp_w = reims_vgpu_protocol::mip_extent(l0.width, level as u32);
+        let exp_h = reims_vgpu_protocol::mip_extent(l0.height, level as u32);
         if layout.width != exp_w
             || layout.height != exp_h
             || layout.width == 0
@@ -219,7 +230,7 @@ fn resolve_multi_mip_texture<M: HostMemory + HostOps>(
 
 /// Load one level as tightly packed native-format bytes.
 fn load_level_tight_native<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     tex: &crate::runtime::decode::resource::TextureDescriptor,
@@ -278,7 +289,7 @@ fn load_level_tight_native<M: HostMemory + HostOps>(
 
 /// Write tightly packed native rows into a decoded level layout.
 fn store_level_tight_native<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     tex: &crate::runtime::decode::resource::TextureDescriptor,
@@ -382,8 +393,8 @@ fn generate_via_box_filter(
     let mut prev_w = width;
     let mut prev_h = height;
     for level in 1..levels {
-        let dw = crate::contract::extent::mip_extent(width, level as u32);
-        let dh = crate::contract::extent::mip_extent(height, level as u32);
+        let dw = reims_vgpu_protocol::mip_extent(width, level as u32);
+        let dh = reims_vgpu_protocol::mip_extent(height, level as u32);
         let Some(next_rgba) = downsample_rgba8_box(&prev, prev_w, prev_h, dw, dh) else {
             return Err(MipmapStatus::IncompleteLayout);
         };
@@ -416,7 +427,7 @@ fn generate_via_box_filter(
 
 /// Execute blit `0x133 generateMipmaps` for a type-2/3 multi-mip linear texture.
 pub fn generate_mipmaps_linear<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     texture_ref: u32,
@@ -459,8 +470,8 @@ pub fn generate_mipmaps_linear<M: HostMemory + HostOps>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM;
     use crate::observe::Refusal;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA8_UNORM;
 
     /// `Ok` must produce no line, every other outcome must produce a distinct
     /// one. Before this the dispatch site logged `st={st:?}` with no `reason=`
@@ -500,7 +511,7 @@ mod tests {
         use crate::model::{DeviceId, PAGE_SHIFT_X86};
         use crate::runtime::host::FakeHost;
 
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
         let mut host = FakeHost::new();
 
         let cap = crate::observe::FailCapture::start();

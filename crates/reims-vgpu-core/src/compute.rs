@@ -2,53 +2,9 @@
 
 use reims_vgpu_memory::{GuestPageTarget, GuestRunSource};
 use reims_vgpu_protocol::StorageImageFormat;
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub enum SamplerFilter {
-    #[default]
-    Nearest,
-    Linear,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub enum SamplerMipFilter {
-    #[default]
-    NotMipmapped,
-    Nearest,
-    Linear,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub enum SamplerAddressMode {
-    #[default]
-    ClampToEdge,
-    MirrorClampToEdge,
-    Repeat,
-    MirrorRepeat,
-    ClampToZero,
-    ClampToBorderColor,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub enum SamplerBorderColor {
-    #[default]
-    TransparentBlack,
-    OpaqueBlack,
-    OpaqueWhite,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub enum SamplerCompareFunction {
-    #[default]
-    Never,
-    Less,
-    Equal,
-    LessEqual,
-    Greater,
-    NotEqual,
-    GreaterEqual,
-    Always,
-}
+pub use reims_vgpu_protocol::{
+    SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter, SamplerMipFilter,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct SamplerResource {
@@ -99,11 +55,12 @@ impl SamplerResource {
 /// Fully resolved inputs for one compute dispatch.
 ///
 /// Every guest reference has already been resolved. The executor receives
-/// shader words, semantic resource descriptions, and bounded memory sources;
-/// it never receives a wire tag or an object-table ordinal.
+/// a prepared shader identity, semantic resource descriptions, and bounded
+/// memory sources; it never receives backend-native shader words, a wire tag,
+/// or an object-table ordinal.
 #[derive(Debug, Default)]
 pub struct ComputeRequest {
-    pub spirv: Vec<u32>,
+    pub program: crate::PreparedShaderStage,
     pub entry: String,
     pub grid: [u32; 3],
     pub storage_buffers: Vec<ComputeBufferResource>,

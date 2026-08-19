@@ -1,6 +1,5 @@
 use super::*;
 
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_cpu_only_stamp_publishes_now_unless_its_fifo_has_an_older_completion() {
     assert_eq!(StampOrder::from_debt(false, false), StampOrder::CpuReady);
@@ -29,15 +28,17 @@ fn a_partial_packet_is_control_flow_and_never_a_logged_fault() {
 fn present_scanout_action_follows_window_active() {
     use crate::runtime::host::{FakeHost, HostActionKind};
 
-    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(crate::model::DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    state.present.frame_mapping = 7;
-    state.present.frame_generation = 42;
+    state
+        .presentation
+        .present
+        .set_frame_identity_for_test(7, 0, 0, 42, 0);
 
     // No host window (arm64 MMIO / REIMS_VGPU_WINDOW=0): the QEMU console is the
     // display — the present MUST enqueue the CPU ScanoutUpdate and request
     // the action boundary, or the console freezes at its last paint.
-    state.present.window_active = false;
+    state.presentation.present.set_window_active(false);
     enqueue_present_scanout(&mut state, &mut host, 1440, 1080);
     let scan: Vec<_> = host
         .actions
@@ -49,13 +50,13 @@ fn present_scanout_action_follows_window_active() {
     assert_eq!(scan[0].a1, 1440);
     assert_eq!(scan[0].a2, 1080);
     assert_eq!(scan[0].a3, 42);
-    assert_eq!(state.present.unpainted_presents, 1);
-    assert!(state.pending.host_action_yield);
+    assert_eq!(state.presentation.present.unpainted_presents(), 1);
+    assert!(state.scheduling.pending.host_action_yielded());
 
     // Live host window: the drain publishes + self-acks; no CPU paint
     // action (QEMU runs -display none, the surface is painted for nobody).
     host.actions.clear();
-    state.present.window_active = true;
+    state.presentation.present.set_window_active(true);
     enqueue_present_scanout(&mut state, &mut host, 1440, 1080);
     assert!(
         !host
@@ -70,13 +71,14 @@ fn present_scanout_action_follows_window_active() {
 ///
 /// These tests used to observe the present through the `ScanoutUpdate`
 /// action's `a0`. No CPU paint action is produced per present any more, so
-/// the observable moves to the retain in `state.present` — which is what the
+/// the observable moves to the retain in `state.presentation.present` — which is what the
 /// window reads. The gate mirrors the `paint_mid` selection that used to pick
 /// the action's mapping, so "the mapping that would have been painted" and
 /// "the mapping the window shows" stay the same assertion.
-fn presented_mapping(state: &DeviceState) -> Option<u32> {
-    let p = &state.present;
-    (p.frame_valid && p.frame_mapping != 0 && !p.frame_bgra.is_empty()).then_some(p.frame_mapping)
+fn presented_mapping(state: &Device) -> Option<u32> {
+    let p = &state.presentation.present;
+    (p.frame().is_valid() && p.frame().mapping() != 0 && !p.frame().pixels().is_empty())
+        .then_some(p.frame().mapping())
 }
 
 /// These selection tests run the windowless (QEMU-console) configuration,
@@ -284,51 +286,44 @@ fn display_descriptor_advertises_four_modes_incl_4k() {
 
 #[test]
 fn present_page_identity_reports_alias_and_disjoint_peers() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let entry = |pfn: u32| (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
     // Present-named surface (surface-id namespace): pages A.
     assert!(state.map_surface(4));
     {
-        let m = state.mappings.get_mut(&4).unwrap();
-        m.mapped = true;
-        m.has_geom = true;
-        m.width = 4;
-        m.height = 4;
-        m.page_entries = vec![entry(0x100), entry(0x101)];
+        let m = state.surfaces.mappings.get_mut(&4).unwrap();
+        m.lifecycle.active = true;
+        m.publish_geometry_for_test(4, 4, 0);
+        m.pages.entries = vec![entry(0x100), entry(0x101)];
     }
     // Composite peer aliasing the SAME pages (mapping namespace).
     assert!(state.map_surface(1));
     {
-        let m = state.mappings.get_mut(&1).unwrap();
-        m.mapped = true;
-        m.has_geom = true;
-        m.width = 4;
-        m.height = 4;
-        m.page_entries = vec![entry(0x100), entry(0x101)];
+        let m = state.surfaces.mappings.get_mut(&1).unwrap();
+        m.lifecycle.active = true;
+        m.publish_geometry_for_test(4, 4, 0);
+        m.pages.entries = vec![entry(0x100), entry(0x101)];
     }
-    state
-        .surface_write_kind
-        .insert(1, crate::model::SurfaceWriteKind::Composite);
+    state.note_surface_composite(1);
     // Same-geometry peer with disjoint pages.
     assert!(state.map_surface(2));
     {
-        let m = state.mappings.get_mut(&2).unwrap();
-        m.mapped = true;
-        m.has_geom = true;
-        m.width = 4;
-        m.height = 4;
-        m.page_entries = vec![entry(0x200), entry(0x201)];
+        let m = state.surfaces.mappings.get_mut(&2).unwrap();
+        m.lifecycle.active = true;
+        m.publish_geometry_for_test(4, 4, 0);
+        m.pages.entries = vec![entry(0x200), entry(0x201)];
     }
     // Different geometry: excluded entirely.
     assert!(state.map_surface(9));
     {
-        let m = state.mappings.get_mut(&9).unwrap();
-        m.mapped = true;
-        m.has_geom = true;
-        m.width = 8;
-        m.height = 8;
-        m.page_entries = vec![entry(0x100)];
+        let m = state.surfaces.mappings.get_mut(&9).unwrap();
+        m.lifecycle.active = true;
+        m.publish_geometry_for_test(8, 8, 0);
+        m.pages.entries = vec![entry(0x100)];
     }
     let line = present_page_identity_line(&state, 4, 4, 4).expect("line");
     assert!(line.contains("present_page_identity mid=4 4x4 pages=2 valid=2"));
@@ -348,32 +343,28 @@ fn present_page_identity_reports_alias_and_disjoint_peers() {
 
 #[test]
 fn display_swap_paints_mapping_geom_not_console_fallback() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     // Established boot console 1920×1080.
-    state.present.valid = true;
-    state.present.width = 1920;
-    state.present.height = 1080;
+    state.presentation.present.establish_console(1920, 1080, 0);
     assert!(state.map_surface(3));
     {
-        let m = state.mappings.get_mut(&3).unwrap();
-        m.mapped = true;
-        m.has_geom = true;
-        m.width = 1440;
-        m.height = 1080;
-        m.content_generation = 5;
-        m.page_entries = vec![1];
+        let m = state.surfaces.mappings.get_mut(&3).unwrap();
+        m.lifecycle.active = true;
+        m.publish_geometry_for_test(1440, 1080, 0);
+        m.content.guest_page_generation = 5;
+        m.pages.entries = vec![1];
     }
     let pkt = present_packet(CHILD_OP_DISPLAY_SWAP, 3);
     process_child_packet(&mut state, &mut host, 4, &pkt);
-    assert!(state.present.frame_flush_seen);
-    assert_eq!(state.present.width, 1440);
-    assert_eq!(state.present.height, 1080);
-    // Geometry is asserted above off `state.present`. The mapping identity
+    assert!(state.presentation.present.content_boundary_crossed());
+    assert_eq!(state.presentation.present.console_width(), 1440);
+    assert_eq!(state.presentation.present.console_height(), 1080);
+    // Geometry is asserted above off `state.presentation.present`. The mapping identity
     // moves from the (now absent) action's a0 to `present_mapping` — the
     // accepted present. NOT the retain: the capture fails here (no guest
     // pages), which the old action tolerated via its `paint_mid` fallback.
-    assert_eq!(state.present.present_mapping, 3);
+    assert_eq!(state.presentation.present.presented_mapping(), 3);
     assert_coalesced_paint_action(&host, "mapping geom, not console fallback");
 }
 
@@ -389,11 +380,14 @@ fn display_swap_paints_mapping_geom_not_console_fallback() {
 /// buffer the guest never asked for.
 #[test]
 fn clear_only_present_captures_the_surface_the_transaction_names() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::mapping_write::write_bgra8;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let w = 1920u32;
     let h = 1080u32;
@@ -414,10 +408,10 @@ fn clear_only_present_captures_the_surface_the_transaction_names() {
         }
         assert!(state.map_surface(mid));
         {
-            let m = state.mappings.get_mut(&mid).unwrap();
-            m.mapped = true;
-            m.mapping_internal = mid as u64;
-            m.page_entries = entries;
+            let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+            m.lifecycle.active = true;
+            m.lifecycle.internal_kva = mid as u64;
+            m.pages.entries = entries;
         }
         assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
     }
@@ -425,12 +419,10 @@ fn clear_only_present_captures_the_surface_the_transaction_names() {
     let gray = vec![0xAAu8; need];
     assert!(write_bgra8(&mut state, &mut host, 1, &gray, stride, w, h));
     state.note_surface_composite(1);
-    state.present.early_front_mapping = 1;
-    state.present.valid = true;
-    state.present.width = w;
-    state.present.height = h;
-    assert!(!state.present.frame_flush_seen);
-    assert!(!state.present.frame_valid);
+    state.presentation.present.note_early_composite(1);
+    state.presentation.present.establish_console(w, h, 0);
+    assert!(!state.presentation.present.content_boundary_crossed());
+    assert!(!state.presentation.present.frame().is_valid());
 
     // Mid 2: the surface the guest names, cleared to opaque black.
     let mut clear = vec![0u8; need];
@@ -454,18 +446,24 @@ fn clear_only_present_captures_the_surface_the_transaction_names() {
         &present_packet(CHILD_OP_DISPLAY_TRANSACTION2, 2),
     );
 
-    assert_eq!(state.present.present_mapping, 2, "guest names mid 2");
+    assert_eq!(
+        state.presentation.present.presented_mapping(),
+        2,
+        "guest names mid 2"
+    );
     assert!(
-        state.present.frame_flush_seen,
+        state.presentation.present.content_boundary_crossed(),
         "a non-init present leaves BAR1"
     );
-    assert!(state.present.frame_valid);
+    assert!(state.presentation.present.frame().is_valid());
     assert_eq!(
-        state.present.frame_mapping, 2,
+        state.presentation.present.frame().mapping(),
+        2,
         "+0x188 holds the named mid, not the Composite peer"
     );
     assert_eq!(
-        state.present.frame_bgra[0], 0x00,
+        state.presentation.present.frame().pixels()[0],
+        0x00,
         "captured the named surface's cleared pages, not the peer's 0xAA"
     );
     assert_eq!(
@@ -479,7 +477,7 @@ fn clear_only_present_captures_the_surface_the_transaction_names() {
 /// CmdDeleteTask (root 0x20) must clear the task — not flood UnknownRootOpcode.
 #[test]
 fn delete_task_root_clears_active_task() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     state.define_task(3, 0x1000, 2);
     assert!(state.tasks[3].active);
@@ -516,20 +514,26 @@ fn delete_task_root_clears_active_task() {
 /// is what `mapping_page_drift`'s "no packet said so" was reporting.
 #[test]
 fn replace_physical_drops_the_cached_page_list() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     state.map_surface(7);
     {
-        let m = state.mappings.get_mut(&7).unwrap();
-        m.mapped = true;
-        m.page_entries = vec![0x11, 0x22, 0x33];
-        m.surface_backing_walk = Some(crate::model::SurfaceBackingWalk {
+        let m = state.surfaces.mappings.get_mut(&7).unwrap();
+        m.lifecycle.active = true;
+        m.pages.entries = vec![0x11, 0x22, 0x33];
+        m.pages.surface_walk = Some(crate::model::SurfaceBackingWalk {
             task_id: 0,
             backing_pfn: 0x20,
-            page_generation: m.page_generation,
+            page_generation: m.pages.generation,
         });
     }
-    let generation_before = state.mappings.get(&7).unwrap().map_generation;
+    let generation_before = state
+        .surfaces
+        .mappings
+        .get(&7)
+        .unwrap()
+        .lifecycle
+        .generation;
 
     let mut payload = vec![0u8; 8];
     payload[4..8].copy_from_slice(&7u32.to_le_bytes()); // {task 0, object 7}
@@ -550,13 +554,13 @@ fn replace_physical_drops_the_cached_page_list() {
             .any(|e| matches!(e, FailEvent::UnknownChildOpcode { opcode: 0x3c, .. })),
         "0x3c must not flood UnknownChildOpcode"
     );
-    let m = state.mappings.get(&7).unwrap();
+    let m = state.surfaces.mappings.get(&7).unwrap();
     assert!(
-        m.page_entries.is_empty(),
+        m.pages.entries.is_empty(),
         "the announced re-point must drop the stale page list"
     );
     assert_ne!(
-        m.map_generation, generation_before,
+        m.lifecycle.generation, generation_before,
         "dropping the list must bump the incarnation, which is what retires the \
          surface backing walk latch and any state keyed on it"
     );
@@ -569,18 +573,24 @@ fn replace_physical_drops_the_cached_page_list() {
 /// that back something else.
 #[test]
 fn replace_physical_routes_through_the_texture_ref_when_no_mapping_owns_the_id() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     // Mapping 41 backs an IOSurface texture the guest registered at object-list
     // ref 12 of task 3. Nothing is mapped under id 12.
     state.map_surface(41);
     {
-        let m = state.mappings.get_mut(&41).unwrap();
-        m.mapped = true;
-        m.page_entries = vec![0x51, 0x52];
+        let m = state.surfaces.mappings.get_mut(&41).unwrap();
+        m.lifecycle.active = true;
+        m.pages.entries = vec![0x51, 0x52];
     }
-    state.texture_to_mapping.insert((3, 12), 41);
-    let generation_before = state.mappings.get(&41).unwrap().map_generation;
+    state.fixtures.texture_to_mapping.insert((3, 12), 41);
+    let generation_before = state
+        .surfaces
+        .mappings
+        .get(&41)
+        .unwrap()
+        .lifecycle
+        .generation;
 
     let mut payload = vec![0u8; 8];
     payload[0..4].copy_from_slice(&3u32.to_le_bytes()); // task 3
@@ -595,13 +605,13 @@ fn replace_physical_routes_through_the_texture_ref_when_no_mapping_owns_the_id()
     };
     process_child_packet(&mut state, &mut host, 2, &pkt);
 
-    let m = state.mappings.get(&41).unwrap();
+    let m = state.surfaces.mappings.get(&41).unwrap();
     assert!(
-        m.page_entries.is_empty(),
+        m.pages.entries.is_empty(),
         "a re-point that names a texture ref must reach the mapping behind it"
     );
     assert_ne!(
-        m.map_generation, generation_before,
+        m.lifecycle.generation, generation_before,
         "the incarnation must move, or a resident gathered from the old pages \
          stays eligible"
     );
@@ -614,7 +624,7 @@ fn replace_physical_routes_through_the_texture_ref_when_no_mapping_owns_the_id()
 fn replace_physical_retires_only_the_named_resource() {
     use crate::runtime::writeback_debt::{GvaResourceKey, GvaWritebackDebt};
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let key = |texture_ref| GvaResourceKey {
         task_id: 3,
@@ -629,19 +639,25 @@ fn replace_physical_retires_only_the_named_resource() {
         },
         width: 64,
         height: 64,
-        format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
-        resident_layout: crate::contract::pixel_format::TexelLayout::Bgra8,
+        format: reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        resident_layout: reims_vgpu_core::pixel_format::TexelLayout::Bgra8,
         generation,
         content: None,
         guest_write: Default::default(),
         seq: 0,
     };
     assert_eq!(
-        state.pending_writebacks.arm_gva(key(12), debt(0x4000, 1)),
+        state
+            .content
+            .pending_writebacks
+            .arm_gva(key(12), debt(0x4000, 1)),
         None
     );
     assert_eq!(
-        state.pending_writebacks.arm_gva(key(13), debt(0x8000, 2)),
+        state
+            .content
+            .pending_writebacks
+            .arm_gva(key(13), debt(0x8000, 2)),
         None
     );
 
@@ -662,9 +678,10 @@ fn replace_physical_retires_only_the_named_resource() {
         },
     );
 
-    assert!(state.pending_writebacks.get_gva(key(12)).is_none());
+    assert!(state.content.pending_writebacks.get_gva(key(12)).is_none());
     assert_eq!(
         state
+            .content
             .pending_writebacks
             .get_gva(key(13))
             .map(|debt| debt.generation),
@@ -678,26 +695,26 @@ fn replace_physical_retires_only_the_named_resource() {
 /// its integer and has independent surface backing provenance.
 #[test]
 fn replace_physical_does_not_confuse_another_tasks_mapping_for_the_resource() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     state.map_surface(7);
     {
-        let m = state.mappings.get_mut(&7).unwrap();
-        m.mapped = true;
-        m.page_entries = vec![0x77];
-        m.surface_backing_walk = Some(crate::model::SurfaceBackingWalk {
+        let m = state.surfaces.mappings.get_mut(&7).unwrap();
+        m.lifecycle.active = true;
+        m.pages.entries = vec![0x77];
+        m.pages.surface_walk = Some(crate::model::SurfaceBackingWalk {
             task_id: 1,
             backing_pfn: 0x20,
-            page_generation: m.page_generation,
+            page_generation: m.pages.generation,
         });
     }
     state.map_surface(99);
     {
-        let m = state.mappings.get_mut(&99).unwrap();
-        m.mapped = true;
-        m.page_entries = vec![0xaa];
+        let m = state.surfaces.mappings.get_mut(&99).unwrap();
+        m.lifecycle.active = true;
+        m.pages.entries = vec![0xaa];
     }
-    state.texture_to_mapping.insert((0, 7), 99);
+    state.fixtures.texture_to_mapping.insert((0, 7), 99);
 
     let mut payload = vec![0u8; 8];
     payload[4..8].copy_from_slice(&7u32.to_le_bytes()); // {task 0, object 7}
@@ -712,12 +729,19 @@ fn replace_physical_does_not_confuse_another_tasks_mapping_for_the_resource() {
     process_child_packet(&mut state, &mut host, 2, &pkt);
 
     assert_eq!(
-        state.mappings.get(&7).unwrap().page_entries,
+        state.surfaces.mappings.get(&7).unwrap().pages.entries,
         vec![0x77],
         "task 1's surface 7 is unrelated to task 0's resource 7"
     );
     assert!(
-        state.mappings.get(&99).unwrap().page_entries.is_empty(),
+        state
+            .surfaces
+            .mappings
+            .get(&99)
+            .unwrap()
+            .pages
+            .entries
+            .is_empty(),
         "the task-local association names mapping 99"
     );
 }
@@ -727,13 +751,13 @@ fn replace_physical_does_not_confuse_another_tasks_mapping_for_the_resource() {
 /// must not silently drop a list it could not identify.
 #[test]
 fn a_short_replace_physical_is_reported_and_drops_nothing() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     state.map_surface(7);
     {
-        let m = state.mappings.get_mut(&7).unwrap();
-        m.mapped = true;
-        m.page_entries = vec![0x11];
+        let m = state.surfaces.mappings.get_mut(&7).unwrap();
+        m.lifecycle.active = true;
+        m.pages.entries = vec![0x11];
     }
     let pkt = Packet {
         opcode: CHILD_OP_REPLACE_PHYSICAL,
@@ -745,22 +769,29 @@ fn a_short_replace_physical_is_reported_and_drops_nothing() {
     };
     process_child_packet(&mut state, &mut host, 2, &pkt);
     assert!(
-        !state.mappings.get(&7).unwrap().page_entries.is_empty(),
+        !state
+            .surfaces
+            .mappings
+            .get(&7)
+            .unwrap()
+            .pages
+            .entries
+            .is_empty(),
         "a packet too short to name an object must not invalidate one"
     );
 }
 
 #[test]
 fn delete_iosurface_backing_condemns_then_second_delete_tears_down() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     assert!(state.map_surface(3));
     {
-        let m = state.mappings.get_mut(&3).unwrap();
-        m.page_entries = vec![0x101];
-        m.mapping_internal = 0x1234;
+        let m = state.surfaces.mappings.get_mut(&3).unwrap();
+        m.pages.entries = vec![0x101];
+        m.lifecycle.internal_kva = 0x1234;
     }
-    let delete = |state: &mut DeviceState, host: &mut FakeHost| {
+    let delete = |state: &mut Device, host: &mut FakeHost| {
         let mut payload = Vec::new();
         payload.extend_from_slice(&3u32.to_le_bytes()); // objectID
         payload.extend_from_slice(&1u32.to_le_bytes()); // taskID
@@ -782,18 +813,18 @@ fn delete_iosurface_backing_condemns_then_second_delete_tears_down() {
     // (the delete trails the guest release) — condemn: retire bindings,
     // keep content state for the resolve-time fingerprint decision.
     delete(&mut state, &mut host);
-    let m = state.mappings.get(&3).unwrap();
-    assert!(m.mapped, "condemn keeps the slot live");
-    assert!(m.page_entries.is_empty(), "bindings must be retired");
-    assert_eq!(m.condemned_entries.as_deref(), Some(&[0x101u32][..]));
+    let m = state.surfaces.mappings.get(&3).unwrap();
+    assert!(m.lifecycle.active, "condemn keeps the slot live");
+    assert!(m.pages.entries.is_empty(), "bindings must be retired");
+    assert_eq!(m.pages.condemned.as_deref(), Some(&[0x101u32][..]));
     // Second delete with no resolve between: genuinely dead — full
     // teardown.
     delete(&mut state, &mut host);
-    let m = state.mappings.get(&3).unwrap();
-    assert!(!m.mapped);
-    assert!(m.page_entries.is_empty());
-    assert!(m.condemned_entries.is_none());
-    assert_eq!(m.mapping_internal, 0);
+    let m = state.surfaces.mappings.get(&3).unwrap();
+    assert!(!m.lifecycle.active);
+    assert!(m.pages.entries.is_empty());
+    assert!(m.pages.condemned.is_none());
+    assert_eq!(m.lifecycle.internal_kva, 0);
 }
 
 /// Direct Composite-named present (no ClearOnly pairing): the transaction
@@ -806,11 +837,14 @@ fn delete_iosurface_backing_condemns_then_second_delete_tears_down() {
 /// when one moved, and visible thrash as the choice oscillates.
 #[test]
 fn composite_named_present_captures_the_named_member_however_far_it_lags() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::mapping_write::write_bgra8;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let w = 1920u32;
     let h = 1080u32;
@@ -830,10 +864,10 @@ fn composite_named_present_captures_the_named_member_however_far_it_lags() {
         }
         assert!(state.map_surface(mid));
         {
-            let m = state.mappings.get_mut(&mid).unwrap();
-            m.mapped = true;
-            m.mapping_internal = mid as u64;
-            m.page_entries = entries;
+            let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+            m.lifecycle.active = true;
+            m.lifecycle.internal_kva = mid as u64;
+            m.pages.entries = entries;
         }
         assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
     }
@@ -845,11 +879,9 @@ fn composite_named_present_captures_the_named_member_however_far_it_lags() {
     state.note_surface_composite(5);
     // Both members are genuine swapchain buffers that alternate as the presented
     // front.
-    state.present.valid = true;
-    state.present.width = w;
-    state.present.height = h;
+    state.presentation.present.establish_console(w, h, 0);
 
-    let present_named = |state: &mut DeviceState, host: &mut FakeHost, mid: u32| {
+    let present_named = |state: &mut Device, host: &mut FakeHost, mid: u32| {
         process_child_packet(
             state,
             host,
@@ -863,10 +895,11 @@ fn composite_named_present_captures_the_named_member_however_far_it_lags() {
     state.note_dense_frame_published(1, w, h);
     present_named(&mut state, &mut host, 5);
     assert_eq!(
-        state.present.frame_mapping, 5,
+        state.presentation.present.frame().mapping(),
+        5,
         "alternation captures the named member"
     );
-    assert_eq!(state.present.frame_bgra[0], 0x55);
+    assert_eq!(state.presentation.present.frame().pixels()[0], 0x55);
 
     // Drive the named member's full-frame sequence arbitrarily far behind its
     // peer's: mid 1 publishes a long run while mid 5 receives none. The guest
@@ -877,19 +910,21 @@ fn composite_named_present_captures_the_named_member_however_far_it_lags() {
     }
     // Read the lag straight out of the per-mapping counters — the point of this
     // test is that the lag exists and changes nothing about what is captured.
-    let named_seq = state.present.dense_frame_seq[&5];
-    let peer_seq = state.present.dense_frame_seq[&1];
+    let named_seq = state.present_backing_sequence_for_test(5);
+    let peer_seq = state.present_backing_sequence_for_test(1);
     assert!(
         peer_seq - named_seq >= lag_runs,
         "the lag this test needs is present: {peer_seq} - {named_seq}"
     );
     present_named(&mut state, &mut host, 5);
     assert_eq!(
-        state.present.frame_mapping, 5,
+        state.presentation.present.frame().mapping(),
+        5,
         "the guest named mid 5; no sequence comparison may substitute a peer"
     );
     assert_eq!(
-        state.present.frame_bgra[0], 0x55,
+        state.presentation.present.frame().pixels()[0],
+        0x55,
         "captured the named member's content, not the peer's"
     );
 }
@@ -900,9 +935,9 @@ fn composite_named_present_captures_the_named_member_however_far_it_lags() {
 /// once ready, the packet completes normally.
 #[test]
 fn present_holds_for_translation_deferred_on_other_channel() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    state.translation_deferred_mask = 1 << 1;
+    state.scheduling.translation.defer(1 << 1);
 
     assert_eq!(
         present_named_mapping(&mut state, &mut host, 5, 2),
@@ -913,35 +948,35 @@ fn present_holds_for_translation_deferred_on_other_channel() {
         ChildPacketDisposition::Deferred
     );
 
-    assert_eq!(state.present_translation_holds, 1);
-    assert_eq!(state.present_translation_hold_mask, 1 << 5);
-    assert_eq!(state.present.present_mapping, 0);
-    assert!(!state.present.frame_flush_seen);
+    assert_eq!(state.scheduling.translation.present_hold_episodes(), 1);
+    assert_eq!(state.scheduling.translation.present_hold_mask(), 1 << 5);
+    assert_eq!(state.presentation.present.presented_mapping(), 0);
+    assert!(!state.presentation.present.content_boundary_crossed());
 
-    state.translation_deferred_mask = 0;
+    state.scheduling.translation.ready(1 << 1);
     assert_eq!(
         present_named_mapping(&mut state, &mut host, 5, 2),
         ChildPacketDisposition::Complete
     );
-    assert_eq!(state.present_translation_hold_mask, 0);
-    assert_eq!(state.present.present_mapping, 2);
-    assert!(state.present.frame_flush_seen);
+    assert_eq!(state.scheduling.translation.present_hold_mask(), 0);
+    assert_eq!(state.presentation.present.presented_mapping(), 2);
+    assert!(state.presentation.present.content_boundary_crossed());
 }
 
 /// The currently executing display channel cannot be an overtaken sibling
 /// and is excluded from the proxy mask.
 #[test]
 fn present_does_not_hold_for_current_channel_translation_bit() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    state.translation_deferred_mask = 1 << 5;
+    state.scheduling.translation.defer(1 << 5);
 
     assert_eq!(
         present_named_mapping(&mut state, &mut host, 5, 2),
         ChildPacketDisposition::Complete
     );
 
-    assert_eq!(state.present_translation_holds, 0);
+    assert_eq!(state.scheduling.translation.present_hold_episodes(), 0);
 }
 
 /// A cold-translation EXEC owns the scheduler timeline even though its AIR
@@ -949,7 +984,7 @@ fn present_does_not_hold_for_current_channel_translation_bit() {
 /// its stamp and task-map state untouched until that boundary is ready.
 #[test]
 fn translation_deferred_holds_sibling_unmap_head_and_stamp() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     let page_size = state.page_size() as usize;
     let channel = 2u32;
@@ -983,46 +1018,56 @@ fn translation_deferred_holds_sibling_unmap_head_and_stamp() {
     host.put_u32(regs_gpa + CHILD_REG_HEAD, 0);
     host.put_u32(regs_gpa + CHILD_REG_STAMP_INDEX, 1);
     host.put_u32(regs_gpa + CHILD_REG_BASE_PFN, list_pfn);
-    state.gfx.root_page = root_pfn;
-    state.gfx.fifo_base_page = stamp_pfn;
-    state.active_child_mask = producer_bit | sibling_bit;
-    state.pending.child_mask = sibling_bit;
-    state.translation_deferred_mask = producer_bit;
+    state.registers.gfx.root_page = root_pfn;
+    state.registers.gfx.fifo_base_page = stamp_pfn;
+    state
+        .state
+        .scheduling
+        .pending
+        .replace_active_children(producer_bit | sibling_bit);
+    state.scheduling.pending.replace_children(sibling_bit);
+    state.scheduling.translation.defer(producer_bit);
 
     drain_pending(&mut state, &mut host);
     drain_pending(&mut state, &mut host);
     assert_eq!(host.get_u32(regs_gpa + CHILD_REG_HEAD), 0);
     assert_eq!(host.get_u32(stamp_gpa + 4), 0);
-    assert_eq!(state.translation_order_hold_mask, sibling_bit);
-    assert_eq!(state.translation_order_holds, 1, "poll retries coalesce");
+    assert_eq!(state.scheduling.translation.order_hold_mask(), sibling_bit);
+    assert_eq!(
+        state.scheduling.translation.order_hold_episodes(),
+        1,
+        "poll retries coalesce"
+    );
 
     note_translation_order_hold(&mut state, ROOT_FIFO_BIT);
     assert_eq!(
-        state.translation_order_holds, 1,
+        state.scheduling.translation.order_hold_episodes(),
+        1,
         "new timeline bits in one ownership interval remain one episode"
     );
 
     // Simulate the immutable AIR worker becoming ready. The real producer
     // retry clears this bit in process_child_packet before siblings resume.
-    state.translation_deferred_mask = 0;
+    state.scheduling.translation.ready(producer_bit);
     drain_pending(&mut state, &mut host);
     assert_eq!(host.get_u32(regs_gpa + CHILD_REG_HEAD), packet.len() as u32);
     assert_eq!(host.get_u32(stamp_gpa + 4), 0x55);
-    assert_eq!(state.translation_order_hold_mask, 0);
+    assert_eq!(state.scheduling.translation.order_hold_mask(), 0);
 }
 
 /// FIFO redefine/free retires scheduler ownership so a removed producer
 /// cannot strand later display transactions behind a stale bit.
 #[test]
 fn free_fifo_clears_translation_scheduler_state() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let bit = 1 << 1;
-    state.active_child_mask = bit;
-    state.pending.child_mask = bit;
-    state.translation_deferred_mask = bit;
-    state.translation_order_hold_mask = bit;
-    state.present_translation_hold_mask = bit;
+    state.scheduling.pending.replace_active_children(bit);
+    state.scheduling.pending.replace_children(bit);
+    state.scheduling.translation.defer(bit);
+    state.scheduling.translation.hold_order(bit);
+    state.scheduling.translation.defer(1 << 2);
+    state.scheduling.translation.present_barrier(bit);
 
     process_root_packet(
         &mut state,
@@ -1037,86 +1082,84 @@ fn free_fifo_clears_translation_scheduler_state() {
         },
     );
 
-    assert_eq!(state.active_child_mask & bit, 0);
-    assert_eq!(state.pending.child_mask & bit, 0);
-    assert_eq!(state.translation_deferred_mask & bit, 0);
-    assert_eq!(state.translation_order_hold_mask & bit, 0);
-    assert_eq!(state.present_translation_hold_mask & bit, 0);
+    assert_eq!(state.scheduling.pending.active_child_mask() & bit, 0);
+    assert_eq!(state.scheduling.pending.child_mask() & bit, 0);
+    assert_eq!(state.scheduling.translation.deferred_mask() & bit, 0);
+    assert_eq!(state.scheduling.translation.order_hold_mask() & bit, 0);
+    assert_eq!(state.scheduling.translation.present_hold_mask() & bit, 0);
 }
 
 /// First Composite present takes the leave-BAR1 boundary.
 #[test]
 fn composite_present_sets_frame_flush_boundary() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     assert!(state.map_surface(4));
     {
-        let m = state.mappings.get_mut(&4).unwrap();
-        m.mapped = true;
-        m.has_geom = true;
-        m.width = 1920;
-        m.height = 1080;
-        m.content_generation = 2;
-        m.page_entries = vec![1];
+        let m = state.surfaces.mappings.get_mut(&4).unwrap();
+        m.lifecycle.active = true;
+        m.publish_geometry_for_test(1920, 1080, 0);
+        m.content.guest_page_generation = 2;
+        m.pages.entries = vec![1];
     }
     state.note_surface_composite(4);
 
     let pkt = present_packet(CHILD_OP_DISPLAY_TRANSACTION2, 4);
     process_child_packet(&mut state, &mut host, 5, &pkt);
-    assert!(state.present.frame_flush_seen);
+    assert!(state.presentation.present.content_boundary_crossed());
     assert_coalesced_paint_action(&host, "composite sets flush boundary");
 }
 
 #[test]
 fn display_swap_without_geom_holds_last_frame() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    state.present.valid = true;
-    state.present.width = 1920;
-    state.present.height = 1080;
+    state.presentation.present.establish_console(1920, 1080, 0);
     assert!(state.map_surface(9));
     // Mapped but no has_geom — do not resize/paint.
     let pkt = present_packet(CHILD_OP_DISPLAY_SWAP, 9);
     process_child_packet(&mut state, &mut host, 4, &pkt);
-    assert!(state.present.frame_flush_seen);
-    assert_eq!(state.present.present_mapping, 9);
+    assert!(state.presentation.present.content_boundary_crossed());
+    assert_eq!(state.presentation.present.presented_mapping(), 9);
     // Console size unchanged; no scanout HostAction.
-    assert_eq!(state.present.width, 1920);
-    assert_eq!(state.present.height, 1080);
+    assert_eq!(state.presentation.present.console_width(), 1920);
+    assert_eq!(state.presentation.present.console_height(), 1080);
     assert!(host.actions.is_empty());
 }
 
 #[test]
 fn map_surface_clears_stale_geom() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     assert!(state.map_surface(1));
     assert!(state.set_mapping_geom(1, 1920, 1080, 0x73));
-    assert!(state.mappings[&1].has_geom);
+    assert!(state.surfaces.mappings[&1].has_geometry());
     assert!(state.map_surface(1));
-    let m = &state.mappings[&1];
-    assert!(!m.has_geom);
-    assert_eq!(m.width, 0);
-    assert_eq!(m.height, 0);
+    let m = &state.surfaces.mappings[&1];
+    assert!(!m.has_geometry());
+    assert_eq!(m.geometry(), None);
 }
 
 /// x86 Ventura/Tahoe display pipe: present opcode 6 paints like DisplaySwap.
 #[test]
 fn present_x86_op6_paints_surface_id_mapping() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::mapping_write::write_bgra8;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let pfn = 0x71u32;
     let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
     host.map_range(gpa, 0x4000, 0);
     assert!(state.map_surface(5));
     {
-        let m = state.mappings.get_mut(&5).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        let m = state.surfaces.mappings.get_mut(&5).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
     }
     assert!(state.set_mapping_geom(5, 2, 2, MTL_FORMAT_BGRA8_UNORM));
     let px = [0x22u8; 16];
@@ -1128,11 +1171,15 @@ fn present_x86_op6_paints_surface_id_mapping() {
         5,
         &present_packet(CHILD_OP_DISPLAY_TRANSACTION2, 5),
     );
-    assert_eq!(state.present.present_mapping, 5);
-    assert!(state.present.frame_flush_seen);
-    assert!(state.present.frame_valid || state.present.frame_encode_pending);
+    assert_eq!(state.presentation.present.presented_mapping(), 5);
+    assert!(state.presentation.present.content_boundary_crossed());
     assert!(
-        state.present.frame_valid || state.present.frame_encode_pending,
+        state.presentation.present.frame().is_valid()
+            || state.presentation.present.frame().encode_pending()
+    );
+    assert!(
+        state.presentation.present.frame().is_valid()
+            || state.presentation.present.frame().encode_pending(),
         "op6 present hands the window a frame (or defers to encode)"
     );
     assert_coalesced_paint_action(&host, "x86 op6 present");
@@ -1142,53 +1189,62 @@ fn present_x86_op6_paints_surface_id_mapping() {
 /// presents; host paint clears the counter (entry-side backpressure).
 #[test]
 fn display_swap_unpainted_presents_counts_until_paint() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::mapping_write::write_bgra8;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let pfn = 0x70u32;
     let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
     host.map_range(gpa, 0x4000, 0);
     assert!(state.map_surface(3));
     {
-        let m = state.mappings.get_mut(&3).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        let m = state.surfaces.mappings.get_mut(&3).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
     }
     assert!(state.set_mapping_geom(3, 2, 2, MTL_FORMAT_BGRA8_UNORM));
     let px = [0x11u8; 16];
     assert!(write_bgra8(&mut state, &mut host, 3, &px, 8, 2, 2));
 
-    let swap = |state: &mut DeviceState, host: &mut FakeHost| {
+    let swap = |state: &mut Device, host: &mut FakeHost| {
         process_child_packet(state, host, 4, &present_packet(CHILD_OP_DISPLAY_SWAP, 3));
     };
 
-    assert_eq!(state.present.unpainted_presents, 0);
+    assert_eq!(state.presentation.present.unpainted_presents(), 0);
     swap(&mut state, &mut host);
     assert_eq!(
-        state.present.unpainted_presents, 1,
+        state.presentation.present.unpainted_presents(),
+        1,
         "first accepted DisplaySwap counts as unpainted"
     );
     swap(&mut state, &mut host);
     assert_eq!(
-        state.present.unpainted_presents, 2,
+        state.presentation.present.unpainted_presents(),
+        2,
         "second accepted DisplaySwap reaches apple-gfx pending_frames cap"
     );
     // process_child_packet itself does not gate — drain_child_fifo does.
     // Counter keeps climbing if tests call process directly (stamp still fires).
     swap(&mut state, &mut host);
-    assert_eq!(state.present.unpainted_presents, 3);
+    assert_eq!(state.presentation.present.unpainted_presents(), 3);
     note_present_paint_consumed(&mut state);
     assert_eq!(
-        state.present.unpainted_presents, 0,
+        state.presentation.present.unpainted_presents(),
+        0,
         "host paint clears entry-side present backpressure"
     );
     // Gate predicate used by drain_child_fifo.
     assert!(
-        state.present.unpainted_presents < MAX_UNPAINTED_PRESENTS,
+        !state
+            .presentation
+            .present
+            .present_backpressure_at_cap(MAX_UNPAINTED_PRESENTS),
         "after paint, DisplaySwap entry is open"
     );
 }
@@ -1200,20 +1256,23 @@ fn display_swap_unpainted_presents_counts_until_paint() {
 /// read-clears the word).
 #[test]
 fn display_swap_signals_present_complete_on_shared_page() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let pfn = 0x70u32;
     let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
     host.map_range(gpa, 0x4000, 0);
     assert!(state.map_surface(3));
     {
-        let m = state.mappings.get_mut(&3).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        let m = state.surfaces.mappings.get_mut(&3).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
     }
     assert!(state.set_mapping_geom(3, 2, 2, MTL_FORMAT_BGRA8_UNORM));
 
@@ -1221,8 +1280,7 @@ fn display_swap_signals_present_complete_on_shared_page() {
     // a stale ONLINE pending bit must survive the present OR.
     let shared = 0x9000_0000u64;
     host.map_range(shared, 0x1000, 0);
-    state.display.shared_gpa = shared;
-    state.display.display_index = 0;
+    state.presentation.display.reinitialize(0, shared);
     host.put_u32(
         shared + DISPLAY_SHARED_ENABLE_MASK,
         DISPLAY_PRESENT_EVENT_MASK | DISPLAY_ONLINE_EVENT_MASK,
@@ -1253,6 +1311,7 @@ fn display_swap_signals_present_complete_on_shared_page() {
     );
     assert_ne!(
         state
+            .registers
             .gfx
             .interrupt_status_disp
             .load(std::sync::atomic::Ordering::Acquire)
@@ -1272,6 +1331,7 @@ fn display_swap_signals_present_complete_on_shared_page() {
     // is what a live macOS 13 guest showed — `+0x100` reading `0x3` against an
     // enable mask of `0xc`, both bits set by this device and neither wanted.
     state
+        .registers
         .gfx
         .interrupt_status_disp
         .store(0, std::sync::atomic::Ordering::Release);
@@ -1288,6 +1348,7 @@ fn display_swap_signals_present_complete_on_shared_page() {
     );
     assert_eq!(
         state
+            .registers
             .gfx
             .interrupt_status_disp
             .load(std::sync::atomic::Ordering::Acquire),
@@ -1298,10 +1359,11 @@ fn display_swap_signals_present_complete_on_shared_page() {
     // An unreadable enable mask must not be read as permission. The guest
     // published this page's address itself, so a read of it the host cannot
     // perform is not a reason to start signalling classes nobody asked for.
-    state.display.shared_gpa = 0xdead_0000_0000;
+    state.presentation.display.reinitialize(0, 0xdead_0000_0000);
     signal_display_present_complete(&mut state, &mut host);
     assert_eq!(
         state
+            .registers
             .gfx
             .interrupt_status_disp
             .load(std::sync::atomic::Ordering::Acquire),
@@ -1314,42 +1376,67 @@ fn display_swap_signals_present_complete_on_shared_page() {
 /// pending_frames >= 2). Stamp of accepted presents remains at retain.
 #[test]
 fn display_swap_entry_gated_when_unpainted_at_cap() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    state.present.unpainted_presents = MAX_UNPAINTED_PRESENTS;
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    state
+        .presentation
+        .present
+        .set_unpainted_presents_for_test(MAX_UNPAINTED_PRESENTS);
     assert!(
-        state.present.unpainted_presents >= MAX_UNPAINTED_PRESENTS,
+        state
+            .presentation
+            .present
+            .present_backpressure_at_cap(MAX_UNPAINTED_PRESENTS),
         "drain_child_fifo must hold DisplaySwap when unpainted at cap"
     );
     note_present_paint_consumed(&mut state);
     assert!(
-        state.present.unpainted_presents < MAX_UNPAINTED_PRESENTS,
+        !state
+            .presentation
+            .present
+            .present_backpressure_at_cap(MAX_UNPAINTED_PRESENTS),
         "paint re-opens DisplaySwap entry"
     );
 }
 
 #[test]
 fn present_action_starvation_proxy_is_once_per_held_head() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    state.present.unpainted_presents = MAX_UNPAINTED_PRESENTS;
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
+    state
+        .presentation
+        .present
+        .set_unpainted_presents_for_test(MAX_UNPAINTED_PRESENTS);
 
     note_present_backpressure_hold(&mut state, 5, 464, 592);
-    note_present_backpressure_hold(&mut state, 5, 464, 592);
-    assert_eq!(state.present.backpressure_hold_count, 1);
-
-    note_present_paint_consumed(&mut state);
-    state.present.unpainted_presents = MAX_UNPAINTED_PRESENTS;
     note_present_backpressure_hold(&mut state, 5, 464, 592);
     assert_eq!(
-        state.present.backpressure_hold_count, 2,
+        state
+            .presentation
+            .present
+            .backpressure_hold_count_for_test(),
+        1
+    );
+
+    note_present_paint_consumed(&mut state);
+    state
+        .presentation
+        .present
+        .set_unpainted_presents_for_test(MAX_UNPAINTED_PRESENTS);
+    note_present_backpressure_hold(&mut state, 5, 464, 592);
+    assert_eq!(
+        state
+            .presentation
+            .present
+            .backpressure_hold_count_for_test(),
+        2,
         "a later hold after paint is a distinct starvation episode"
     );
 }
 
 #[test]
 fn child_drain_yields_after_present_for_display_consumer() {
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     let page_size = state.page_size() as usize;
     let channel = 5u32;
@@ -1383,10 +1470,13 @@ fn child_drain_yields_after_present_for_display_consumer() {
     host.put_u32(regs_gpa + CHILD_REG_HEAD, 0);
     host.put_u32(regs_gpa + CHILD_REG_STAMP_INDEX, 1);
     host.put_u32(regs_gpa + CHILD_REG_BASE_PFN, list_pfn);
-    state.gfx.root_page = root_pfn;
-    state.gfx.fifo_base_page = stamp_pfn;
-    state.active_child_mask = 1u32 << channel;
-    state.pending.child_mask = 1u32 << channel;
+    state.registers.gfx.root_page = root_pfn;
+    state.registers.gfx.fifo_base_page = stamp_pfn;
+    state
+        .scheduling
+        .pending
+        .replace_active_children(1u32 << channel);
+    state.scheduling.pending.replace_children(1u32 << channel);
 
     drain_pending(&mut state, &mut host);
     assert_eq!(
@@ -1394,10 +1484,10 @@ fn child_drain_yields_after_present_for_display_consumer() {
         first.len() as u32,
         "the first drain slice must stop after accepting one present"
     );
-    assert_ne!(state.pending.child_mask & (1u32 << channel), 0);
-    assert_eq!(state.present.unpainted_presents, 1);
+    assert_ne!(state.scheduling.pending.child_mask() & (1u32 << channel), 0);
+    assert_eq!(state.presentation.present.unpainted_presents(), 1);
     assert!(
-        state.pending.host_action_yield,
+        state.scheduling.pending.host_action_yielded(),
         "an accepted present must end the drain slice"
     );
     assert_coalesced_paint_action(&host, "first present");
@@ -1410,7 +1500,7 @@ fn child_drain_yields_after_present_for_display_consumer() {
     host.actions.clear();
     drain_pending(&mut state, &mut host);
     assert_eq!(host.get_u32(regs_gpa + CHILD_REG_HEAD), ring.len() as u32);
-    assert_eq!(state.present.unpainted_presents, 1);
+    assert_eq!(state.presentation.present.unpainted_presents(), 1);
     assert_coalesced_paint_action(&host, "second present after ack");
     assert_eq!(host.get_u32(stamp_gpa + 4), 22);
 }
@@ -1419,19 +1509,21 @@ fn child_drain_yields_after_present_for_display_consumer() {
 /// content_generation (Load/scanout semantics restart).
 #[test]
 fn set_mapping_geom_size_change_resets_content_generation() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     assert!(state.map_surface(4));
     assert!(state.set_mapping_geom(4, 1920, 1080, 0x73));
     {
-        let m = state.mappings.get_mut(&4).unwrap();
-        m.content_generation = 42;
+        let m = state.surfaces.mappings.get_mut(&4).unwrap();
+        m.content.guest_page_generation = 42;
     }
     assert!(state.set_mapping_geom(4, 1440, 1080, 0x73));
-    let m = &state.mappings[&4];
-    assert_eq!(m.width, 1440);
-    assert_eq!(m.height, 1080);
+    let m = &state.surfaces.mappings[&4];
     assert_eq!(
-        m.content_generation, 0,
+        m.geometry().map(|g| (g.width, g.height)),
+        Some((1440, 1080))
+    );
+    assert_eq!(
+        m.content.guest_page_generation, 0,
         "new size must not keep prior gen (new surface identity)"
     );
     // Same declaration again: preserve gen (no identity change).
@@ -1443,12 +1535,12 @@ fn set_mapping_geom_size_change_resets_content_generation() {
     // the claim too, and that axis is covered by
     // `model::state::mapping_declaration_tests`.
     {
-        let m = state.mappings.get_mut(&4).unwrap();
-        m.content_generation = 3;
+        let m = state.surfaces.mappings.get_mut(&4).unwrap();
+        m.content.guest_page_generation = 3;
     }
     assert!(state.set_mapping_geom(4, 1440, 1080, 0x73));
     assert_eq!(
-        state.mappings[&4].content_generation, 3,
+        state.surfaces.mappings[&4].content.guest_page_generation, 3,
         "an unchanged declaration preserves generation"
     );
 }
@@ -1456,37 +1548,46 @@ fn set_mapping_geom_size_change_resets_content_generation() {
 /// Archive render_wait_surface helper: no rings → no-op, no panic.
 #[test]
 fn drain_other_child_fifos_is_a_safe_noop_without_rings() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    state.active_child_mask = (1 << 1) | (1 << 4);
-    state.pending.child_mask = 1 << 1;
-    state.gfx.control_fifo = 1;
+    state
+        .scheduling
+        .pending
+        .replace_active_children((1 << 1) | (1 << 4));
+    state.scheduling.pending.replace_children(1 << 1);
+    state.registers.gfx.control_fifo = 1;
     // No root_page / rings: the drain returns immediately.
     drain_other_child_fifos(&mut state, &mut host, 4);
     assert_eq!(
-        state.pending.child_mask, 0,
+        state.scheduling.pending.child_mask(),
+        0,
         "the sibling drain consumes the pending mask"
     );
 }
 
 #[test]
 fn poll_rescue_only_publishes_work_for_async_drain() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    state.gfx.control_fifo = 0x1000;
+    state.registers.gfx.control_fifo = 0x1000;
     state
+        .registers
         .gfx
         .fifo_read
         .store(3, std::sync::atomic::Ordering::Release);
-    state.gfx.fifo_written = 4;
-    state.active_child_mask = (1 << 2) | (1 << 5);
+    state.registers.gfx.fifo_written = 4;
+    state
+        .scheduling
+        .pending
+        .replace_active_children((1 << 2) | (1 << 5));
 
     assert!(publish_stranded_fifos(&mut state, &mut host));
-    assert!(state.pending.main_drain);
-    assert_eq!(state.pending.child_mask, (1 << 2) | (1 << 5));
+    assert!(state.scheduling.pending.main_requested());
+    assert_eq!(state.scheduling.pending.child_mask(), (1 << 2) | (1 << 5));
     assert!(host.bh_scheduled);
     assert_eq!(
         state
+            .registers
             .gfx
             .fifo_read
             .load(std::sync::atomic::Ordering::Acquire),
@@ -1499,20 +1600,23 @@ fn poll_rescue_only_publishes_work_for_async_drain() {
 /// returns current content_generation. Does not drain other FIFOs.
 #[test]
 fn wait_surface_noop_when_no_async_job() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::mapping_write::write_bgra8;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let pfn = 0x22u32;
     host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
     assert!(state.map_surface(7));
     {
-        let m = state.mappings.get_mut(&7).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        let m = state.surfaces.mappings.get_mut(&7).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
     }
     assert!(state.set_mapping_geom(7, 2, 2, MTL_FORMAT_BGRA8_UNORM));
     assert!(write_bgra8(
@@ -1531,12 +1635,15 @@ fn wait_surface_noop_when_no_async_job() {
 /// Regression gate for P1 dual-mid flicker (measure before fix).
 #[test]
 fn display_swap_encodes_at_present_after_wait_surface() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::mapping_write::write_bgra8;
     use crate::runtime::scanout::{copy_to_bgra8, ScanoutCopyResult};
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let pfn = 0x21u32;
     let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
@@ -1544,10 +1651,10 @@ fn display_swap_encodes_at_present_after_wait_surface() {
     let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
     assert!(state.map_surface(3));
     {
-        let m = state.mappings.get_mut(&3).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
+        let m = state.surfaces.mappings.get_mut(&3).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![entry];
     }
     assert!(state.set_mapping_geom(3, 2, 2, MTL_FORMAT_BGRA8_UNORM));
     let px = [
@@ -1555,21 +1662,27 @@ fn display_swap_encodes_at_present_after_wait_surface() {
         0xFF,
     ];
     assert!(write_bgra8(&mut state, &mut host, 3, &px, 8, 2, 2));
-    let gen = state.mappings.get(&3).unwrap().content_generation;
+    let gen = state
+        .surfaces
+        .mappings
+        .get(&3)
+        .unwrap()
+        .content
+        .guest_page_generation;
     let pkt = present_packet(CHILD_OP_DISPLAY_SWAP, 3);
     process_child_packet(&mut state, &mut host, 4, &pkt);
-    assert!(state.present.frame_flush_seen);
+    assert!(state.presentation.present.content_boundary_crossed());
     assert!(
-        state.present.frame_valid,
+        state.presentation.present.frame().is_valid(),
         "DisplaySwap freezes surface at present after wait_surface"
     );
     // Capture forces one host blit of +0x188 (encode_pending) so early
     // painted mid/gen cannot Unchanged-skip logo/pill onto frozen EFI.
     assert!(
-        state.present.frame_encode_pending,
+        state.presentation.present.frame().encode_pending(),
         "successful capture must force first paint of retain"
     );
-    assert_eq!(state.present.frame_mapping, 3);
+    assert_eq!(state.presentation.present.frame().mapping(), 3);
     assert_eq!(presented_mapping(&state), Some(3));
     assert_coalesced_paint_action(&host, "encode at present");
     // Host paint re-shows frozen snapshot.
@@ -1579,12 +1692,15 @@ fn display_swap_encodes_at_present_after_wait_surface() {
         ScanoutCopyResult::Painted
     );
     assert_eq!(&dst[..], &px[..]);
-    assert!(!state.present.frame_encode_pending);
+    assert!(!state.presentation.present.frame().encode_pending());
 
     // Guest mutates mapping after stamp (recycle) — re-show still frozen.
     let mut_px = [0xAAu8; 16];
     assert!(write_bgra8(&mut state, &mut host, 3, &mut_px, 8, 2, 2));
-    state.present.painted_generation = 0;
+    state
+        .presentation
+        .present
+        .set_painted_generation_for_test(0);
     assert_eq!(
         copy_to_bgra8(&mut state, &mut host, 3, &mut dst, 8, 2, 2, gen),
         ScanoutCopyResult::Painted
@@ -1600,22 +1716,25 @@ fn display_swap_encodes_at_present_after_wait_surface() {
 /// hostPresentCount re-shows the last successful present until capture works.
 #[test]
 fn display_swap_capture_fail_keeps_prior_retain() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::mapping_write::write_bgra8;
     use crate::runtime::scanout::{copy_to_bgra8, ScanoutCopyResult};
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let pfn = 0x40u32;
     let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
     host.map_range(gpa, 0x4000, 0);
     assert!(state.map_surface(5));
     {
-        let m = state.mappings.get_mut(&5).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        let m = state.surfaces.mappings.get_mut(&5).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
     }
     assert!(state.set_mapping_geom(5, 2, 2, MTL_FORMAT_BGRA8_UNORM));
     let full = [
@@ -1623,16 +1742,16 @@ fn display_swap_capture_fail_keeps_prior_retain() {
     ];
     assert!(write_bgra8(&mut state, &mut host, 5, &full, 8, 2, 2));
 
-    let swap = |state: &mut DeviceState, host: &mut FakeHost, mid: u32| {
+    let swap = |state: &mut Device, host: &mut FakeHost, mid: u32| {
         host.actions.clear();
         process_child_packet(state, host, 4, &present_packet(CHILD_OP_DISPLAY_SWAP, mid));
     };
 
     // First swap: full dock composite retained.
     swap(&mut state, &mut host, 5);
-    assert!(state.present.frame_valid);
-    assert_eq!(state.present.frame_mapping, 5);
-    let gen_ok = state.present.frame_generation;
+    assert!(state.presentation.present.frame().is_valid());
+    assert_eq!(state.presentation.present.frame().mapping(), 5);
+    let gen_ok = state.presentation.present.frame().generation();
     let mut dst = vec![0u8; 16];
     assert_eq!(
         copy_to_bgra8(&mut state, &mut host, 5, &mut dst, 8, 2, 2, gen_ok),
@@ -1642,23 +1761,24 @@ fn display_swap_capture_fail_keeps_prior_retain() {
 
     // Second swap: pages unreadable + host-cache gone → capture fails.
     {
-        let m = state.mappings.get_mut(&5).unwrap();
-        m.page_entries.clear();
+        let m = state.surfaces.mappings.get_mut(&5).unwrap();
+        m.pages.entries.clear();
         // Bump gen so HostAction is distinct; guest would still name mid 5.
-        m.content_generation = gen_ok + 1;
+        m.content.guest_page_generation = gen_ok + 1;
     }
     crate::runtime::surface_cache::forget(&mut state, 5);
     swap(&mut state, &mut host, 5);
     assert!(
-        state.present.frame_encode_pending,
+        state.presentation.present.frame().encode_pending(),
         "capture fail must set pending retry"
     );
     assert!(
-        state.present.frame_valid,
+        state.presentation.present.frame().is_valid(),
         "PGDisplay +0x188 prior retain must survive capture fail"
     );
     assert_eq!(
-        state.present.frame_mapping, 5,
+        state.presentation.present.frame().mapping(),
+        5,
         "prior retain mapping unchanged"
     );
     assert_eq!(
@@ -1668,7 +1788,10 @@ fn display_swap_capture_fail_keeps_prior_retain() {
     );
     assert_coalesced_paint_action(&host, "capture fail keeps prior retain");
     // hostPresentCount / HostAction still shows the last good full composite.
-    state.present.painted_generation = 0;
+    state
+        .presentation
+        .present
+        .set_painted_generation_for_test(0);
     assert_eq!(
         copy_to_bgra8(&mut state, &mut host, 5, &mut dst, 8, 2, 2, gen_ok + 1),
         ScanoutCopyResult::Painted
@@ -1685,10 +1808,13 @@ fn display_swap_capture_fail_keeps_prior_retain() {
 /// retain only — never mixes mid A partial with mid B full.
 #[test]
 fn display_swap_dual_mid_full_composites_both_retain() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::mapping_write::write_bgra8;
     use crate::runtime::scanout::{copy_to_bgra8, ScanoutCopyResult};
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
 
     // 4×2 BGRA: row0 = "dock" strip (distinct L/R icons), row1 = wallpaper.
     fn frame(left: [u8; 4], right: [u8; 4], wall: [u8; 4]) -> Vec<u8> {
@@ -1716,34 +1842,34 @@ fn display_swap_dual_mid_full_composites_both_retain() {
         [0x00, 0xAA, 0x00, 0xFF],
     );
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     for (mid, pfn) in [(3u32, 0x30u32), (4u32, 0x31u32)] {
         let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
         host.map_range(gpa, 0x4000, 0);
         assert!(state.map_surface(mid));
         {
-            let m = state.mappings.get_mut(&mid).unwrap();
-            m.mapped = true;
-            m.mapping_internal = 1;
-            m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+            let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+            m.lifecycle.active = true;
+            m.lifecycle.internal_kva = 1;
+            m.pages.entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
         }
         assert!(state.set_mapping_geom(mid, 2, 2, MTL_FORMAT_BGRA8_UNORM));
     }
     assert!(write_bgra8(&mut state, &mut host, 3, &full_a, 8, 2, 2));
     assert!(write_bgra8(&mut state, &mut host, 4, &partial_b, 8, 2, 2));
 
-    let swap = |state: &mut DeviceState, host: &mut FakeHost, mid: u32| {
+    let swap = |state: &mut Device, host: &mut FakeHost, mid: u32| {
         host.actions.clear();
         process_child_packet(state, host, 4, &present_packet(CHILD_OP_DISPLAY_SWAP, mid));
     };
 
     // Present mid3 full dock → +0x188.
     swap(&mut state, &mut host, 3);
-    assert!(state.present.frame_valid);
-    assert_eq!(state.present.frame_mapping, 3);
+    assert!(state.presentation.present.frame().is_valid());
+    assert_eq!(state.presentation.present.frame().mapping(), 3);
     let mut dst = vec![0u8; 16];
-    let gen3 = state.present.frame_generation;
+    let gen3 = state.presentation.present.frame().generation();
     assert_eq!(
         copy_to_bgra8(&mut state, &mut host, 3, &mut dst, 8, 2, 2, gen3),
         ScanoutCopyResult::Painted
@@ -1757,11 +1883,15 @@ fn display_swap_dual_mid_full_composites_both_retain() {
     // Present mid4 while guest still has partial dock on mid4 (overwrites +0x188).
     swap(&mut state, &mut host, 4);
     assert_eq!(
-        state.present.frame_mapping, 4,
+        state.presentation.present.frame().mapping(),
+        4,
         "DisplaySwap must re-retain mid4"
     );
-    let gen4p = state.present.frame_generation;
-    state.present.painted_generation = 0; // force paint (same gen as mid3 possible)
+    let gen4p = state.presentation.present.frame().generation();
+    state
+        .presentation
+        .present
+        .set_painted_generation_for_test(0); // force paint (same gen as mid3 possible)
     assert_eq!(
         copy_to_bgra8(&mut state, &mut host, 4, &mut dst, 8, 2, 2, gen4p),
         ScanoutCopyResult::Painted
@@ -1773,7 +1903,10 @@ fn display_swap_dual_mid_full_composites_both_retain() {
     );
     // Late HostAction for mid3: encodeCurrentFrame shows current +0x188
     // (mid4 partial), not a mid3 backlog and not live mid3 if recycled.
-    state.present.painted_generation = 0;
+    state
+        .presentation
+        .present
+        .set_painted_generation_for_test(0);
     assert_eq!(
         copy_to_bgra8(&mut state, &mut host, 3, &mut dst, 8, 2, 2, gen3),
         ScanoutCopyResult::Painted
@@ -1787,7 +1920,7 @@ fn display_swap_dual_mid_full_composites_both_retain() {
     // Guest finishes full dock on mid4; DisplaySwap freezes full composite.
     assert!(write_bgra8(&mut state, &mut host, 4, &full_b, 8, 2, 2));
     swap(&mut state, &mut host, 4);
-    let gen4 = state.present.frame_generation;
+    let gen4 = state.presentation.present.frame().generation();
     assert_eq!(
         copy_to_bgra8(&mut state, &mut host, 4, &mut dst, 8, 2, 2, gen4),
         ScanoutCopyResult::Painted
@@ -1799,7 +1932,10 @@ fn display_swap_dual_mid_full_composites_both_retain() {
     );
     // Live mid3 rewrite must not affect +0x188 hostPresentCount re-show.
     assert!(write_bgra8(&mut state, &mut host, 3, &full_a, 8, 2, 2));
-    state.present.painted_generation = 0;
+    state
+        .presentation
+        .present
+        .set_painted_generation_for_test(0);
     assert_eq!(
         copy_to_bgra8(&mut state, &mut host, 3, &mut dst, 8, 2, 2, gen3),
         ScanoutCopyResult::Painted
@@ -1815,26 +1951,24 @@ fn display_swap_dual_mid_full_composites_both_retain() {
 /// the named surface (guest mid3/mid4). Both composites land independently.
 #[test]
 fn display_swap_alternating_mappings_both_paint() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     for mid in [3u32, 4u32] {
         assert!(state.map_surface(mid));
-        let m = state.mappings.get_mut(&mid).unwrap();
-        m.mapped = true;
-        m.has_geom = true;
-        m.width = 1440;
-        m.height = 1080;
-        m.content_generation = mid * 10;
-        m.page_entries = vec![1];
+        let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+        m.lifecycle.active = true;
+        m.publish_geometry_for_test(1440, 1080, 0);
+        m.content.guest_page_generation = mid * 10;
+        m.pages.entries = vec![1];
     }
     for mid in [3u32, 4u32, 3u32] {
         host.actions.clear();
         let pkt = present_packet(CHILD_OP_DISPLAY_SWAP, mid);
         process_child_packet(&mut state, &mut host, 4, &pkt);
-        assert!(state.present.frame_flush_seen);
-        assert_eq!(state.present.present_mapping, mid);
-        assert_eq!(state.present.width, 1440);
-        assert_eq!(state.present.height, 1080);
+        assert!(state.presentation.present.content_boundary_crossed());
+        assert_eq!(state.presentation.present.presented_mapping(), mid);
+        assert_eq!(state.presentation.present.console_width(), 1440);
+        assert_eq!(state.presentation.present.console_height(), 1080);
         assert_coalesced_paint_action(&host, "alternating mappings");
     }
 }
@@ -1843,29 +1977,26 @@ fn display_swap_alternating_mappings_both_paint() {
 /// the first frame boundary — writebacks and ch2 present-into-mid must not.
 #[test]
 fn only_display_swap_paints_after_frame_flush_seen() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT;
     use crate::runtime::scanout::note_front_buffer_writeback;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA16_FLOAT;
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    state.present.frame_flush_seen = true;
-    state.present.valid = true;
-    state.present.width = 1440;
-    state.present.height = 1080;
-    state.present.present_mapping = 3;
-    state.present.host_mapping = 3;
+    state.presentation.present.cross_content_boundary();
+    state.presentation.present.establish_console(1440, 1080, 0);
+    state.presentation.present.begin_present(3);
     // Back buffer mid=4 writeback (compositor composite into non-front).
     assert!(state.map_surface(4));
     {
-        let m = state.mappings.get_mut(&4).unwrap();
-        m.mapped = true;
-        m.has_geom = true;
-        m.width = 1440;
-        m.height = 1080;
-        m.format = MTL_FORMAT_RGBA16_FLOAT;
-        m.content_generation = 9;
-        m.page_entries = vec![(1u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        let m = state.surfaces.mappings.get_mut(&4).unwrap();
+        m.lifecycle.active = true;
+        m.publish_geometry_for_test(1440, 1080, MTL_FORMAT_RGBA16_FLOAT);
+        m.content.guest_page_generation = 9;
+        m.pages.entries = vec![(1u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
     }
     note_front_buffer_writeback(
         &mut state,
@@ -1880,58 +2011,65 @@ fn only_display_swap_paints_after_frame_flush_seen() {
         "post-boundary writeback must not paint"
     );
     assert_eq!(
-        state.present.present_mapping, 3,
+        state.presentation.present.presented_mapping(),
+        3,
         "writeback must not rename presented mid after DisplaySwap"
     );
 
     // DisplaySwap with geom → paint named mapping.
     assert!(state.map_surface(5));
     {
-        let m = state.mappings.get_mut(&5).unwrap();
-        m.mapped = true;
-        m.has_geom = true;
-        m.width = 1440;
-        m.height = 1080;
-        m.content_generation = 10;
-        m.page_entries = vec![(2u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        let m = state.surfaces.mappings.get_mut(&5).unwrap();
+        m.lifecycle.active = true;
+        m.publish_geometry_for_test(1440, 1080, 0);
+        m.content.guest_page_generation = 10;
+        m.pages.entries = vec![(2u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
     }
     let pkt = present_packet(CHILD_OP_DISPLAY_SWAP, 5);
     process_child_packet(&mut state, &mut host, 4, &pkt);
     assert_coalesced_paint_action(&host, "post-flush display swap");
-    assert_eq!(state.present.present_mapping, 5);
+    assert_eq!(state.presentation.present.presented_mapping(), 5);
 }
 
 #[test]
 fn display_online_waits_for_enable_mask_then_signals() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let gpa = 0x7b000000u64;
     host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
-    state.display.shared_gpa = gpa;
-    state.display.display_index = 0;
+    state.presentation.display.reinitialize(0, gpa);
     // No enable mask yet — even after divisor ticks, no IRQ.
-    state.display.poll_ctr = DISPLAY_ONLINE_POLL_DIVISOR - 1;
+    state
+        .presentation
+        .display
+        .set_poll_count(DISPLAY_ONLINE_POLL_DIVISOR - 1);
     try_display_online(&mut state, &mut host);
     assert!(host.actions.is_empty());
-    assert_eq!(state.display.online_tries, 0);
+    assert_eq!(state.presentation.display.online_tries(), 0);
     // Guest enable() published bit 2.
     let mut m = [0u8; 4];
     st32(&mut m, DISPLAY_ONLINE_EVENT_MASK);
     host.write_gpa(gpa + DISPLAY_SHARED_ENABLE_MASK, &m)
         .unwrap();
-    state.display.poll_ctr = DISPLAY_ONLINE_POLL_DIVISOR - 1;
+    state
+        .presentation
+        .display
+        .set_poll_count(DISPLAY_ONLINE_POLL_DIVISOR - 1);
     try_display_online(&mut state, &mut host);
     assert_eq!(host.actions.len(), 1);
     assert_eq!(host.actions[0].kind, HostActionKind::IrqGfxPulse);
-    assert_eq!(state.display.online_tries, 1);
+    assert_eq!(state.presentation.display.online_tries(), 1);
     let mut pending = [0u8; 4];
     host.read_gpa(gpa + DISPLAY_SHARED_PENDING, &mut pending)
         .unwrap();
     assert_eq!(ld32(&pending), DISPLAY_ONLINE_EVENT_MASK);
     // After ack, no more asserts.
-    state.display.online_acked = true;
+    state.presentation.display.acknowledge_online();
     host.actions.clear();
-    state.display.poll_ctr = DISPLAY_ONLINE_POLL_DIVISOR - 1;
+    state
+        .presentation
+        .display
+        .set_poll_count(DISPLAY_ONLINE_POLL_DIVISOR - 1);
     try_display_online(&mut state, &mut host);
     assert!(host.actions.is_empty());
 }
@@ -1952,12 +2090,11 @@ fn display_online_waits_for_enable_mask_then_signals() {
 /// fifty.
 #[test]
 fn the_first_online_pulse_does_not_wait_out_the_reassert_cadence() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let gpa = 0x7b000000u64;
     host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
-    state.display.shared_gpa = gpa;
-    state.display.display_index = 0;
+    state.presentation.display.reinitialize(0, gpa);
     let mut m = [0u8; 4];
     st32(&mut m, DISPLAY_ONLINE_EVENT_MASK);
     host.write_gpa(gpa + DISPLAY_SHARED_ENABLE_MASK, &m)
@@ -1965,12 +2102,13 @@ fn the_first_online_pulse_does_not_wait_out_the_reassert_cadence() {
 
     // Exactly the state `apply_setup_shared_state` leaves behind, and then one
     // single poll.
-    state.display.poll_ctr = 0;
-    state.display.online_tries = 0;
+    state.presentation.display.set_poll_count(0);
+    state.presentation.display.set_online_tries(0);
     try_display_online(&mut state, &mut host);
 
     assert_eq!(
-        state.display.online_tries, 1,
+        state.presentation.display.online_tries(),
+        1,
         "the enable bit was set, so the first poll should have pulsed ONLINE \
          rather than waiting for poll {DISPLAY_ONLINE_POLL_DIVISOR}"
     );
@@ -1985,7 +2123,7 @@ fn the_first_online_pulse_does_not_wait_out_the_reassert_cadence() {
         host.actions.is_empty(),
         "the divisor still paces every pulse after the first"
     );
-    assert_eq!(state.display.online_tries, 1);
+    assert_eq!(state.presentation.display.online_tries(), 1);
 }
 
 /// Display-lifecycle instrumentation: SETUP_SHARED_STATE, ONLINE ack, and the
@@ -1995,7 +2133,7 @@ fn the_first_online_pulse_does_not_wait_out_the_reassert_cadence() {
 /// display rebuild that is the standing overlay lead.
 #[test]
 fn display_lifecycle_events_are_always_logged() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let index = 0u32;
     let pfn = 0x7bu32;
@@ -2027,18 +2165,21 @@ fn display_lifecycle_events_are_always_logged() {
         next_head: 0,
     };
     process_child_packet(&mut state, &mut host, 4, &ack);
-    assert!(state.display.online_acked);
+    assert!(state.presentation.display.is_online());
     // First ONLINE signal (guest published enable bit 2).
     let mut m = [0u8; 4];
     st32(&mut m, DISPLAY_ONLINE_EVENT_MASK);
     host.write_gpa(gpa + DISPLAY_SHARED_ENABLE_MASK, &m)
         .unwrap();
-    state.display.online_acked = false;
-    state.display.poll_ctr = DISPLAY_ONLINE_POLL_DIVISOR - 1;
+    state.presentation.display.withdraw_online_ack();
+    state
+        .presentation
+        .display
+        .set_poll_count(DISPLAY_ONLINE_POLL_DIVISOR - 1);
     try_display_online(&mut state, &mut host);
 
     // Second setup while previously ONLINE: reinit=1 (the post-converge rebuild).
-    state.display.online_acked = true;
+    state.presentation.display.acknowledge_online();
     process_child_packet(&mut state, &mut host, 4, &setup);
 
     let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
@@ -2088,13 +2229,15 @@ fn the_two_ways_online_gives_up_are_both_fail_visible() {
     // never enables cannot reach this branch at all, which is what
     // `a_guest_that_never_enables_cannot_reach_the_online_cap` pins.
     {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let mut host = FakeHost::new();
         let gpa = 0x7c000000u64;
         host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
-        state.display.shared_gpa = gpa;
-        state.display.display_index = index;
-        state.display.online_tries = DISPLAY_ONLINE_MAX_TRIES;
+        state.presentation.display.reinitialize(index, gpa);
+        state
+            .presentation
+            .display
+            .set_online_tries(DISPLAY_ONLINE_MAX_TRIES);
         try_display_online(&mut state, &mut host);
         assert!(
             host.actions.is_empty(),
@@ -2112,15 +2255,18 @@ fn the_two_ways_online_gives_up_are_both_fail_visible() {
     // would test the wrong thing.
     let unreadable = u64::MAX - DISPLAY_SHARED_ENABLE_MASK - 1;
     {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let mut host = FakeHost::new();
-        state.display.shared_gpa = unreadable;
-        state.display.display_index = index;
-        state.display.poll_ctr = DISPLAY_ONLINE_POLL_DIVISOR - 1;
+        state.presentation.display.reinitialize(index, unreadable);
+        state
+            .presentation
+            .display
+            .set_poll_count(DISPLAY_ONLINE_POLL_DIVISOR - 1);
         try_display_online(&mut state, &mut host);
         assert!(host.actions.is_empty());
         assert_eq!(
-            state.display.online_tries, 0,
+            state.presentation.display.online_tries(),
+            0,
             "an unreadable mask is not an assert"
         );
     }
@@ -2161,25 +2307,28 @@ fn a_guest_that_never_enables_cannot_reach_the_online_cap() {
     // so sharing one with another test would consume the latch and leave this
     // asserting on a line some earlier test emitted.
     let index = 21u32;
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let gpa = 0x7d000000u64;
     // Mapped and readable, and left as zeroes: a readable mask with the enable
     // bit clear is exactly the state under test, and an *unmapped* page would
     // take the unreadable arm instead.
     host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
-    state.display.shared_gpa = gpa;
-    state.display.display_index = index;
+    state.presentation.display.reinitialize(index, gpa);
 
     // Past the reporting bound, so the next acted poll is the one that reports.
     // Poll the full divisor so the cadence gate is crossed rather than assumed.
-    state.display.poll_ctr = DISPLAY_ONLINE_MAX_TRIES * DISPLAY_ONLINE_POLL_DIVISOR + 1;
+    state
+        .presentation
+        .display
+        .set_poll_count(DISPLAY_ONLINE_MAX_TRIES * DISPLAY_ONLINE_POLL_DIVISOR + 1);
     for _ in 0..DISPLAY_ONLINE_POLL_DIVISOR {
         try_display_online(&mut state, &mut host);
     }
 
     assert_eq!(
-        state.display.online_tries, 0,
+        state.presentation.display.online_tries(),
+        0,
         "no ONLINE pulse was sent, so the cap can never be reached this way — \
          which is why the abandon line cannot mean what it used to say"
     );
@@ -2524,11 +2673,14 @@ fn the_window_publish_census_keeps_its_three_refusals_apart() {
 /// **and** the guest's pages must hold exactly what was written.
 #[test]
 fn a_fragmented_writeback_stages_nothing_when_the_staged_frame_is_the_source() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::mapping_write::write_bgra8;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     // This test prices the fallback after a host declines a scattered alias.
     // The default fixture can build a packed bounce view and would correctly
@@ -2551,10 +2703,10 @@ fn a_fragmented_writeback_stages_nothing_when_the_staged_frame_is_the_source() {
     }
     assert!(state.map_surface(9));
     {
-        let m = state.mappings.get_mut(&9).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 9;
-        m.page_entries = entries;
+        let m = state.surfaces.mappings.get_mut(&9).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 9;
+        m.pages.entries = entries;
     }
     assert!(state.set_mapping_geom(9, w, h, MTL_FORMAT_BGRA8_UNORM));
 
@@ -2599,11 +2751,14 @@ fn a_fragmented_writeback_stages_nothing_when_the_staged_frame_is_the_source() {
 /// distinguishes publishing from copying: the bytes are equal either way.
 #[test]
 fn an_owned_writeback_publishes_its_frame_to_the_cache_without_copying_it() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::mapping_write::write_bgra8_owned;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let (w, h) = (64u32, 16u32);
     let stride = w * 4;
@@ -2612,10 +2767,10 @@ fn an_owned_writeback_publishes_its_frame_to_the_cache_without_copying_it() {
     host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x8000, 0);
     assert!(state.map_surface(7));
     {
-        let m = state.mappings.get_mut(&7).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 7;
-        m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        let m = state.surfaces.mappings.get_mut(&7).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 7;
+        m.pages.entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
     }
     assert!(state.set_mapping_geom(7, w, h, MTL_FORMAT_BGRA8_UNORM));
 
@@ -2677,11 +2832,14 @@ fn an_owned_writeback_publishes_its_frame_to_the_cache_without_copying_it() {
 /// filled.
 #[test]
 fn a_borrowed_writeback_drops_the_cache_entry_rather_than_leaving_it_stale() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::mapping_write::{write_bgra8_owned, write_bgra8_uncached};
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let (w, h) = (64u32, 16u32);
     let stride = w * 4;
@@ -2690,10 +2848,10 @@ fn a_borrowed_writeback_drops_the_cache_entry_rather_than_leaving_it_stale() {
     host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x8000, 0);
     assert!(state.map_surface(9));
     {
-        let m = state.mappings.get_mut(&9).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 9;
-        m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        let m = state.surfaces.mappings.get_mut(&9).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 9;
+        m.pages.entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
     }
     assert!(state.set_mapping_geom(9, w, h, MTL_FORMAT_BGRA8_UNORM));
 
@@ -2742,7 +2900,7 @@ fn a_borrowed_writeback_drops_the_cache_entry_rather_than_leaving_it_stale() {
 fn the_surface_cache_reuses_its_buffer_but_never_one_someone_else_is_holding() {
     use crate::runtime::surface_cache;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let (w, h) = (16u32, 8u32);
     let need = (w as usize) * (h as usize) * 4;
 
@@ -2756,7 +2914,7 @@ fn the_surface_cache_reuses_its_buffer_but_never_one_someone_else_is_holding() {
     assert_eq!(second[0], 0x22, "and must hold the new frame");
 
     // A window armed on this allocation is exactly what the `Arc` is for.
-    let held = state.host_surfaces.get(&4).unwrap().bgra.clone();
+    let held = state.host_replicas.surfaces.get(&4).unwrap().bgra.clone();
     surface_cache::store_rows(&mut state, 4, w, h, &vec![0x33u8; need], w * 4);
     assert_eq!(
         held[0], 0x22,
@@ -3025,14 +3183,13 @@ fn the_vcpu_lock_census_reports_a_window_that_never_blocked() {
 /// re-register during normal boot bring-up is expected, not the overlay).
 #[test]
 fn signal_display_vbl_after_online_uses_shared_time_limiter() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let last_ms = std::sync::atomic::AtomicU64::new(0);
     let gpa = 0x7c000000u64;
     host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
-    state.display.shared_gpa = gpa;
-    state.display.display_index = 0;
-    state.display.online_acked = true;
+    state.presentation.display.reinitialize(0, gpa);
+    state.presentation.display.acknowledge_online();
     // This test is about the limiter, so it models a guest that asked for VBL.
     // Without the bit the path declines before the limiter is reached and every
     // count below reads zero — see
@@ -3077,6 +3234,7 @@ fn signal_display_vbl_after_online_uses_shared_time_limiter() {
     assert_ne!(ld32(&pending) & DISPLAY_VBL_EVENT_MASK, 0);
     assert_ne!(
         state
+            .registers
             .gfx
             .interrupt_status_disp
             .load(std::sync::atomic::Ordering::Acquire)
@@ -3106,14 +3264,13 @@ fn signal_display_vbl_after_online_uses_shared_time_limiter() {
 /// tick to honour it.
 #[test]
 fn signal_display_vbl_declines_a_class_the_guest_did_not_enable() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let last_ms = std::sync::atomic::AtomicU64::new(0);
     let gpa = 0x7c000000u64;
     host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
-    state.display.shared_gpa = gpa;
-    state.display.display_index = 0;
-    state.display.online_acked = true;
+    state.presentation.display.reinitialize(0, gpa);
+    state.presentation.display.acknowledge_online();
 
     // The two masks a real x86 guest was measured publishing. Neither carries
     // the VBL bit, so neither is owed a VBL pending bit — but `0x0e` carries the
@@ -3129,6 +3286,7 @@ fn signal_display_vbl_declines_a_class_the_guest_did_not_enable() {
         host.put_u32(gpa + DISPLAY_SHARED_PENDING, 0);
         host.actions.clear();
         state
+            .registers
             .gfx
             .interrupt_status_disp
             .store(0, std::sync::atomic::Ordering::Release);
@@ -3151,6 +3309,7 @@ fn signal_display_vbl_declines_a_class_the_guest_did_not_enable() {
         );
         assert_eq!(
             state
+                .registers
                 .gfx
                 .interrupt_status_disp
                 .load(std::sync::atomic::Ordering::Acquire)
@@ -3277,14 +3436,13 @@ fn claim_display_vbl_long_stall_resyncs_without_burst() {
 /// Stand up a display whose shared page is mapped and whose ONLINE is acked, so
 /// `signal_display_vbl_at` reaches the enable-mask read.
 #[cfg(test)]
-fn one_shot_display() -> (DeviceState, FakeHost, u64) {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+fn one_shot_display() -> (Device, FakeHost, u64) {
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let gpa = 0x7c000000u64;
     host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
-    state.display.shared_gpa = gpa;
-    state.display.display_index = 0;
-    state.display.online_acked = true;
+    state.presentation.display.reinitialize(0, gpa);
+    state.presentation.display.acknowledge_online();
     (state, host, gpa)
 }
 
@@ -3467,13 +3625,12 @@ fn acked_stale_online_bit_is_suppressed_not_redelivered() {
     };
     let before = logged();
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let gpa = 0x7d00_0000u64;
     host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
-    state.display.shared_gpa = gpa;
-    state.display.display_index = 0;
-    state.display.online_acked = true;
+    state.presentation.display.reinitialize(0, gpa);
+    state.presentation.display.acknowledge_online();
     host.put_u32(
         gpa + DISPLAY_SHARED_ENABLE_MASK,
         DISPLAY_PRESENT_EVENT_MASK | DISPLAY_ONLINE_EVENT_MASK,
@@ -3510,14 +3667,14 @@ fn acked_stale_online_bit_is_suppressed_not_redelivered() {
 /// HostOps GVA views covering the range **must** be retired (Apple unmapMemory).
 #[test]
 fn unmap_memory_retains_gva_host_cache_for_sample() {
-    use crate::contract::endian::{st32, st64};
     use crate::model::GvaHostView;
     use crate::model::CHILD_OP_UNMAP_MEMORY;
     use crate::runtime::surface_cache;
+    use reims_vgpu_core::endian::{st32, st64};
 
     let page_shift = PAGE_SHIFT_X86;
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), page_shift);
+    let mut state = Device::new(DeviceId(1), page_shift);
     let gva = 0x2c22000u64;
     let w = 32u32;
     let h = 24u32;
@@ -3531,23 +3688,19 @@ fn unmap_memory_retains_gva_host_cache_for_sample() {
     }
     surface_cache::store_gva_owned(&mut state, gva, w, h, bgra, 0, None, true);
     // Simulated HostOps view of the same GVA (zero-copy import substrate).
-    state.gva_host_views.push(GvaHostView {
-        task_id: 1,
-        gva,
-        length: 0x10000,
-        ptr: 0xfeed_0000,
-        ptr_len: 0x10000,
-        ..Default::default()
-    });
+    state
+        .host_materializations
+        .publish_gva_view(GvaHostView::fixture(1, gva, 0x10000, 0xfeed_0000, 0x10000));
     // Unrelated range must survive.
-    state.gva_host_views.push(GvaHostView {
-        task_id: 1,
-        gva: 0x4000_0000,
-        length: 0x1000,
-        ptr: 0xcafe_0000,
-        ptr_len: 0x1000,
-        ..Default::default()
-    });
+    state
+        .host_materializations
+        .publish_gva_view(GvaHostView::fixture(
+            1,
+            0x4000_0000,
+            0x1000,
+            0xcafe_0000,
+            0x1000,
+        ));
 
     let mut unmap_pl = vec![0u8; 20];
     st32(&mut unmap_pl[0..4], 1);
@@ -3567,10 +3720,10 @@ fn unmap_memory_retains_gva_host_cache_for_sample() {
     let got = surface_cache::get_gva(&state, gva, w, h).expect("retain after Unmap");
     assert_eq!(&got[0..4], &[185, 126, 81, 255]);
     // HostOps view of the unmapped range is gone; other GVA view kept.
-    assert_eq!(state.gva_host_views.len(), 1);
-    assert_eq!(state.gva_host_views[0].ptr, 0xcafe_0000);
+    assert_eq!(state.host_materializations.views().len(), 1);
+    assert_eq!(state.host_materializations.views()[0].ptr(), 0xcafe_0000);
     assert_eq!(
-        state.pending_host_releases.views(),
+        state.host_materializations.queued_views(),
         vec![(0xfeed_0000, 0x10000)]
     );
 }
@@ -3578,16 +3731,16 @@ fn unmap_memory_retains_gva_host_cache_for_sample() {
 /// RE pageBacking Invalidate: clr hostValid → bump content_generation.
 #[test]
 fn invalidate_resources_bumps_mapping_content_generation() {
-    use crate::contract::endian::st32;
     use crate::model::CHILD_OP_INVALIDATE_RESOURCES;
     use crate::runtime::decode::fifo::CHILD_INVALIDATE_PAGEON_FLAGS;
+    use reims_vgpu_core::endian::st32;
 
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     assert!(state.map_surface(0x2a));
     {
-        let m = state.mappings.get_mut(&0x2a).unwrap();
-        m.content_generation = 7;
+        let m = state.surfaces.mappings.get_mut(&0x2a).unwrap();
+        m.content.guest_page_generation = 7;
     }
     let mut pl = vec![0u8; 16];
     st32(&mut pl[0..], 0);
@@ -3607,17 +3760,20 @@ fn invalidate_resources_bumps_mapping_content_generation() {
             next_head: 0,
         },
     );
-    assert_eq!(state.mappings[&0x2a].content_generation, 8);
+    assert_eq!(
+        state.surfaces.mappings[&0x2a].content.guest_page_generation,
+        8
+    );
 }
 
 /// MapMemory2 product path must **not** write guest GVA (flush disabled after
 /// freelist PTE panic correlation). Helper still unit-tested in surface_cache.
 #[test]
 fn map_memory2_does_not_flush_gva_host_cache_on_wire() {
-    use crate::contract::endian::{st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::model::CHILD_OP_MAP_MEMORY2;
     use crate::runtime::surface_cache;
+    use reims_vgpu_core::endian::{st32, st64};
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 
     let page_shift = PAGE_SHIFT_X86;
     let mut host = FakeHost::new();
@@ -3634,7 +3790,7 @@ fn map_memory2_does_not_flush_gva_host_cache_on_wire() {
     st32(&mut d[..4], 5);
     let _ = host.write_gpa(root_gpa + 4, &d[..4]);
 
-    let mut state = DeviceState::new(DeviceId(1), page_shift);
+    let mut state = Device::new(DeviceId(1), page_shift);
     state.define_task(1, 0x1000, 2);
     let gva = 1u64 << page_shift;
     let mut bgra = vec![0u8; 16];
@@ -3673,16 +3829,19 @@ fn map_memory2_does_not_flush_gva_host_cache_on_wire() {
 /// Synchronize 0x35 is stamp + wait only — no host_cache→guest write (RE audit).
 #[test]
 fn synchronize_resources_does_not_write_guest_pages() {
-    use crate::contract::endian::st32;
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::model::CHILD_OP_SYNCHRONIZE_RESOURCES;
     use crate::runtime::surface_cache;
+    use reims_vgpu_core::endian::st32;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
 
     let page_shift = PAGE_SHIFT_X86;
     let page_size = 1u64 << page_shift;
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), page_shift);
+    let mut state = Device::new(DeviceId(1), page_shift);
     let mid = 0x2au32;
     let w = 2u32;
     let h = 2u32;
@@ -3691,9 +3850,9 @@ fn synchronize_resources_does_not_write_guest_pages() {
     host.map_range(gpa, page_size as usize, 0);
     assert!(state.map_surface(mid));
     {
-        let m = state.mappings.get_mut(&mid).unwrap();
-        m.mapped = true;
-        m.page_entries =
+        let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+        m.lifecycle.active = true;
+        m.pages.entries =
             vec![(((pfn as u64) << PAGE_ENTRY_PFN_SHIFT) | (PAGE_ENTRY_VALID as u64)) as u32];
     }
     assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
@@ -3733,15 +3892,15 @@ fn synchronize_resources_does_not_write_guest_pages() {
 /// set guestValid alone must not bump host content generation.
 #[test]
 fn invalidate_without_clr_host_does_not_bump_generation() {
-    use crate::contract::endian::st32;
     use crate::model::CHILD_OP_INVALIDATE_RESOURCES;
+    use reims_vgpu_core::endian::st32;
 
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     assert!(state.map_surface(0x2a));
     {
-        let m = state.mappings.get_mut(&0x2a).unwrap();
-        m.content_generation = 7;
+        let m = state.surfaces.mappings.get_mut(&0x2a).unwrap();
+        m.content.guest_page_generation = 7;
     }
     // LE bytes 00 00 00 01 = only set_guest_valid
     let mut pl = vec![0u8; 16];
@@ -3762,7 +3921,10 @@ fn invalidate_without_clr_host_does_not_bump_generation() {
             next_head: 0,
         },
     );
-    assert_eq!(state.mappings[&0x2a].content_generation, 7);
+    assert_eq!(
+        state.surfaces.mappings[&0x2a].content.guest_page_generation,
+        7
+    );
 }
 
 /// `present_unbacked` gate: a member presented twice with no full-frame Store
@@ -3780,7 +3942,7 @@ fn invalidate_without_clr_host_does_not_bump_generation() {
 fn present_backing_gate_fires_only_when_a_member_gained_nothing() {
     let w = 1920u32;
     let h = 1080u32;
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     for mid in [1u32, 5u32] {
         state.map_surface(mid);
         state.note_dense_frame_published(mid, w, h);
@@ -3813,10 +3975,7 @@ fn present_backing_gate_fires_only_when_a_member_gained_nothing() {
 
     // Backing is the seq itself, whatever advanced it: a member that reaches the
     // source's seq is quiet again on its next present.
-    state.present.dense_frame_seq.insert(
-        5,
-        state.present.dense_frame_seq.get(&1).copied().unwrap_or(0),
-    );
+    state.copy_present_backing_sequence_for_test(1, 5);
     assert_eq!(state.note_present_backing(5), None);
 
     // A recycled mapping id must not compare against its predecessor's witness.
@@ -3841,7 +4000,7 @@ fn present_backing_gate_fires_only_when_a_member_gained_nothing() {
 fn present_backing_gate_reports_a_surface_nothing_ever_stored() {
     let w = 1920u32;
     let h = 1080u32;
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     state.map_surface(6);
 
     // Never Stored, first present: the black-screen case.
@@ -3980,7 +4139,7 @@ fn present_backing_names_its_own_reason_and_restale_carries_its_seq() {
 /// standing means guest packets are parked behind a load that never finished.
 #[test]
 fn a_translation_hold_is_census_and_only_an_unreleased_one_fails() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
 
     // The wait: census only, nothing on the failure channel.
     {
@@ -4005,7 +4164,7 @@ fn a_translation_hold_is_census_and_only_an_unreleased_one_fails() {
     {
         let cap = crate::observe::FailCapture::start();
         super::release_translation_order_holds(&mut state);
-        assert_eq!(state.translation_order_hold_mask, 0);
+        assert_eq!(state.scheduling.translation.order_hold_mask(), 0);
         state.reset();
         assert!(
             !cap.lines()
@@ -4019,9 +4178,9 @@ fn a_translation_hold_is_census_and_only_an_unreleased_one_fails() {
     // A hold still standing at reset IS a loss, and it says so on the failure
     // channel carrying the masks it read.
     {
-        let mut stuck = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut stuck = Device::new(DeviceId(1), PAGE_SHIFT_X86);
         super::note_translation_order_hold(&mut stuck, 0b110);
-        stuck.translation_deferred_mask = 0b10;
+        stuck.scheduling.translation.defer(0b10);
         let cap = crate::observe::FailCapture::start();
         stuck.reset();
         let line = cap.one("translation_hold_unreleased");
@@ -4029,7 +4188,11 @@ fn a_translation_hold_is_census_and_only_an_unreleased_one_fails() {
             line.contains("held_mask=0x6") && line.contains("producer_mask=0x2"),
             "the failure must carry what it read: {line}"
         );
-        assert_eq!(stuck.translation_order_hold_mask, 0, "reset still resets");
+        assert_eq!(
+            stuck.scheduling.translation.order_hold_mask(),
+            0,
+            "reset still resets"
+        );
     }
 }
 
@@ -4047,7 +4210,7 @@ fn a_translation_hold_is_census_and_only_an_unreleased_one_fails() {
 #[test]
 fn the_display_flush_fence_is_a_named_command_and_not_a_defect() {
     use crate::runtime::drain::store_route_count;
-    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     let fence = |plen: usize| Packet {
         opcode: CHILD_OP_NOP,
@@ -4100,7 +4263,7 @@ fn the_display_flush_fence_is_a_named_command_and_not_a_defect() {
 #[test]
 fn an_overlong_display_transaction_alarms_once_per_shape() {
     use crate::runtime::drain::store_route_count;
-    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
     let packet = |opcode: u16, plen: usize| Packet {
         opcode,
         stamp_waits: Vec::new(),
@@ -4120,7 +4283,7 @@ fn an_overlong_display_transaction_alarms_once_per_shape() {
         quiet,
         "a command at its declared size is the contract, not an event"
     );
-    assert!(state.display.txn_payload_samples.is_empty());
+    assert_eq!(state.observations.display_txn_shape_count(), 0);
 
     // A payload past the trailer is the one thing that falsifies the decode.
     for _ in 0..8 {
@@ -4132,7 +4295,7 @@ fn an_overlong_display_transaction_alarms_once_per_shape() {
         "the counter carries the magnitude on every occurrence"
     );
     assert_eq!(
-        state.display.txn_payload_samples.len(),
+        state.observations.display_txn_shape_count(),
         1,
         "but the line is latched per shape"
     );
@@ -4141,7 +4304,7 @@ fn an_overlong_display_transaction_alarms_once_per_shape() {
     // the same length would be overlong for op6 - the sizes are per command.
     note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION2, 0x24));
     assert_eq!(
-        state.display.txn_payload_samples.len(),
+        state.observations.display_txn_shape_count(),
         2,
         "0x24 is this command's overlong even though it is op7's exact size"
     );
@@ -4162,7 +4325,7 @@ fn an_overlong_display_transaction_alarms_once_per_shape() {
 /// and a reboot.
 #[test]
 fn the_overlong_alarm_dumps_the_tail_and_explains_the_right_command() {
-    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(crate::model::DeviceId(1), PAGE_SHIFT_ARM64E);
     let packet = |opcode: u16, payload: Vec<u8>| Packet {
         opcode,
         stamp_waits: Vec::new(),
@@ -4401,7 +4564,7 @@ fn a_define_task_length_is_the_full_eight_byte_field_on_both_arms() {
 #[cfg(test)]
 fn device_info_reply(max_key: u32, count: u32) -> Vec<(u32, u32)> {
     const REPLY_PFN: u32 = 0x40;
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
 
     let mut payload = vec![0u8; DEVICE_INFO_TAHOE_REPLY_PFN + 4];
@@ -4646,7 +4809,7 @@ fn the_compute_info_reply_answers_device_limits_not_a_fixed_triple() {
 /// already named theirs and are included so the vocabulary stays one word.
 #[test]
 fn every_short_control_packet_names_itself() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let short = |opcode: u16, len: usize| Packet {
         opcode,
@@ -4657,7 +4820,7 @@ fn every_short_control_packet_names_itself() {
         next_head: 0,
     };
 
-    let before_mask = state.active_child_mask;
+    let before_mask = state.scheduling.pending.active_child_mask();
     for (opcode, need) in [
         (ROOT_OP_DEVICE_INFO_TAHOE, DEVICE_INFO_TAHOE_REPLY_PFN + 4),
         (
@@ -4672,7 +4835,8 @@ fn every_short_control_packet_names_itself() {
         process_root_packet(&mut state, &mut host, &short(opcode, need - 1));
     }
     assert_eq!(
-        state.active_child_mask, before_mask,
+        state.scheduling.pending.active_child_mask(),
+        before_mask,
         "a short DEFINE_FIFO must not open a channel"
     );
 
@@ -4688,7 +4852,8 @@ fn every_short_control_packet_names_itself() {
         process_child_packet(&mut state, &mut host, 4, &short(opcode, need - 1));
     }
     assert_eq!(
-        state.display.shared_gpa, 0,
+        state.presentation.display.shared_page(),
+        None,
         "a short SETUP_SHARED_STATE must not latch a display page"
     );
 
@@ -4726,7 +4891,7 @@ fn every_short_control_packet_names_itself() {
 /// display pipe index.
 #[test]
 fn root_opcode_one_sets_up_the_display_shared_state() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
 
     // `{u32 pipe index, u32 shared-state page PFN}`.
@@ -4745,9 +4910,14 @@ fn root_opcode_one_sets_up_the_display_shared_state() {
         },
     );
 
-    assert_eq!(state.display.display_index, 2, "the pipe index latched");
+    let page = state
+        .presentation
+        .display
+        .shared_page()
+        .expect("display page");
+    assert_eq!(page.display_index, 2, "the pipe index latched");
     assert_eq!(
-        state.display.shared_gpa,
+        page.gpa,
         state.pfn_gpa(0x40),
         "and the shared-state page, from the same payload the child arm reads"
     );
@@ -4770,7 +4940,7 @@ fn root_opcode_one_sets_up_the_display_shared_state() {
 /// regresses, the task is gone and the display never latched.
 #[test]
 fn a_pipe_index_that_looks_like_an_opcode_is_still_a_pipe_index() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     state.define_task(3, 0x1000, 2);
 
@@ -4789,13 +4959,18 @@ fn a_pipe_index_that_looks_like_an_opcode_is_still_a_pipe_index() {
         },
     );
 
+    let page = state
+        .presentation
+        .display
+        .shared_page()
+        .expect("display page");
     assert_eq!(
-        state.display.display_index,
+        page.display_index,
         u32::from(ROOT_OP_DELETE_TASK),
         "the word is a pipe index and latched as one"
     );
     assert_eq!(
-        state.display.shared_gpa,
+        page.gpa,
         state.pfn_gpa(3),
         "and the second word is the page, not a task id"
     );
@@ -4818,16 +4993,16 @@ fn a_packet_whose_stamp_wait_is_unmet_is_held_until_the_slot_reaches_it() {
     const AWAITED_VALUE: u32 = 7;
     const ROOT_STAMP: u32 = 0xABC;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     let page_size = 1usize << PAGE_SHIFT_X86;
 
     let fifo_pfn = 0x40u32;
     let fifo_gpa = (fifo_pfn as u64) << PAGE_SHIFT_X86;
     host.map_range(fifo_gpa, 3 * page_size, 0);
-    state.gfx.fifo_base_page = fifo_pfn;
-    state.gfx.fifo_start = page_size as u32;
-    state.gfx.fifo_length = 2 * page_size as u32;
+    state.registers.gfx.fifo_base_page = fifo_pfn;
+    state.registers.gfx.fifo_start = page_size as u32;
+    state.registers.gfx.fifo_length = 2 * page_size as u32;
 
     // One root packet carrying a single wait record, and nothing else: the
     // payload is empty so the only thing that can move is the head.
@@ -4842,10 +5017,11 @@ fn a_packet_whose_stamp_wait_is_unmet_is_held_until_the_slot_reaches_it() {
     gpa_map::write_bytes(&mut host, fifo_gpa + page_size as u64, &packet, page_size)
         .expect("seed the root ring");
     state
+        .registers
         .gfx
         .fifo_read
         .store(0, std::sync::atomic::Ordering::Release);
-    state.gfx.fifo_written = total;
+    state.registers.gfx.fifo_written = total;
 
     let slot_gpa = |slot: u32| fifo_gpa + stamp_slot_offset(slot, page_size as u64).unwrap();
     let read_slot = |host: &FakeHost, slot: u32| {
@@ -4859,6 +5035,7 @@ fn a_packet_whose_stamp_wait_is_unmet_is_held_until_the_slot_reaches_it() {
 
     assert_eq!(
         state
+            .registers
             .gfx
             .fifo_read
             .load(std::sync::atomic::Ordering::Acquire),
@@ -4873,12 +5050,12 @@ fn a_packet_whose_stamp_wait_is_unmet_is_held_until_the_slot_reaches_it() {
          finished that never started"
     );
     assert_ne!(
-        state.stamp_deferred_mask & ROOT_FIFO_BIT,
+        state.completion_publications.held_timelines() & ROOT_FIFO_BIT,
         0,
         "the hold has to be recorded, or nothing re-offers this timeline"
     );
     assert!(
-        state.pending.main_drain,
+        state.scheduling.pending.main_requested(),
         "a held root head is unfinished work: clearing the flag would leave the \
          retry to whichever later doorbell happened to set it again"
     );
@@ -4887,6 +5064,7 @@ fn a_packet_whose_stamp_wait_is_unmet_is_held_until_the_slot_reaches_it() {
     drain_main_fifo(&mut state, &mut host);
     assert_eq!(
         state
+            .registers
             .gfx
             .fifo_read
             .load(std::sync::atomic::Ordering::Acquire),
@@ -4901,6 +5079,7 @@ fn a_packet_whose_stamp_wait_is_unmet_is_held_until_the_slot_reaches_it() {
 
     assert_eq!(
         state
+            .registers
             .gfx
             .fifo_read
             .load(std::sync::atomic::Ordering::Acquire),
@@ -4913,12 +5092,12 @@ fn a_packet_whose_stamp_wait_is_unmet_is_held_until_the_slot_reaches_it() {
         "and its completion stamp lands exactly once, from the run that happened"
     );
     assert_eq!(
-        state.stamp_deferred_mask & ROOT_FIFO_BIT,
+        state.completion_publications.held_timelines() & ROOT_FIFO_BIT,
         0,
         "the hold bit describes the last drain, so a drain that ran clears it"
     );
     assert!(
-        !state.pending.main_drain,
+        !state.scheduling.pending.main_requested(),
         "and a drained ring is not pending work"
     );
 }
@@ -4936,16 +5115,16 @@ fn a_stamp_wait_naming_a_slot_that_cannot_exist_runs_rather_than_parking() {
     use crate::model::DeviceId;
     use crate::runtime::host::FakeHost;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     let page_size = 1usize << PAGE_SHIFT_X86;
 
     let fifo_pfn = 0x40u32;
     let fifo_gpa = (fifo_pfn as u64) << PAGE_SHIFT_X86;
     host.map_range(fifo_gpa, 3 * page_size, 0);
-    state.gfx.fifo_base_page = fifo_pfn;
-    state.gfx.fifo_start = page_size as u32;
-    state.gfx.fifo_length = 2 * page_size as u32;
+    state.registers.gfx.fifo_base_page = fifo_pfn;
+    state.registers.gfx.fifo_start = page_size as u32;
+    state.registers.gfx.fifo_length = 2 * page_size as u32;
 
     // One past the last slot the guest page can hold, which `stamp_slot_offset`
     // refuses and `stamp_slot_index`'s mask does not fold back into range.
@@ -4967,15 +5146,17 @@ fn a_stamp_wait_naming_a_slot_that_cannot_exist_runs_rather_than_parking() {
     gpa_map::write_bytes(&mut host, fifo_gpa + page_size as u64, &packet, page_size)
         .expect("seed the root ring");
     state
+        .registers
         .gfx
         .fifo_read
         .store(0, std::sync::atomic::Ordering::Release);
-    state.gfx.fifo_written = total;
+    state.registers.gfx.fifo_written = total;
 
     drain_main_fifo(&mut state, &mut host);
 
     assert_eq!(
         state
+            .registers
             .gfx
             .fifo_read
             .load(std::sync::atomic::Ordering::Acquire),
@@ -4984,7 +5165,7 @@ fn a_stamp_wait_naming_a_slot_that_cannot_exist_runs_rather_than_parking() {
          ever decide it"
     );
     assert_eq!(
-        state.stamp_deferred_mask & ROOT_FIFO_BIT,
+        state.completion_publications.held_timelines() & ROOT_FIFO_BIT,
         0,
         "and no hold is recorded, so nothing re-offers a packet that already ran"
     );
@@ -5107,16 +5288,16 @@ fn a_stamp_hold_nothing_can_satisfy_costs_one_round_and_returns() {
     use crate::model::DeviceId;
     use crate::runtime::host::FakeHost;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     let page_size = 1usize << PAGE_SHIFT_X86;
 
     let fifo_pfn = 0x40u32;
     let fifo_gpa = (fifo_pfn as u64) << PAGE_SHIFT_X86;
     host.map_range(fifo_gpa, 3 * page_size, 0);
-    state.gfx.fifo_base_page = fifo_pfn;
-    state.gfx.fifo_start = page_size as u32;
-    state.gfx.fifo_length = 2 * page_size as u32;
+    state.registers.gfx.fifo_base_page = fifo_pfn;
+    state.registers.gfx.fifo_start = page_size as u32;
+    state.registers.gfx.fifo_length = 2 * page_size as u32;
 
     // The awaited slot is one this ring's only packet cannot advance, because
     // the packet is the one waiting on it.
@@ -5130,24 +5311,26 @@ fn a_stamp_hold_nothing_can_satisfy_costs_one_round_and_returns() {
     gpa_map::write_bytes(&mut host, fifo_gpa + page_size as u64, &packet, page_size)
         .expect("seed the root ring");
     state
+        .registers
         .gfx
         .fifo_read
         .store(0, std::sync::atomic::Ordering::Release);
-    state.gfx.fifo_written = total;
+    state.registers.gfx.fifo_written = total;
 
-    state.stamp_deferred_mask = ROOT_FIFO_BIT;
-    let seq_before = state.completion_stamp_seq;
+    state.completion_publications.hold_timeline(ROOT_FIFO_BIT);
+    let seq_before = state.completion_publications.progress();
 
     // Terminating at all is the assertion: a loop without the progress
     // condition never returns from here.
     retry_stamp_held_timelines(&mut state, &mut host);
 
     assert_eq!(
-        state.completion_stamp_seq, seq_before,
+        state.completion_publications.progress(),
+        seq_before,
         "nothing ran, so no fence moved"
     );
     assert_ne!(
-        state.stamp_deferred_mask & ROOT_FIFO_BIT,
+        state.completion_publications.held_timelines() & ROOT_FIFO_BIT,
         0,
         "and the timeline is handed back still held, which is what a later \
          doorbell re-offers rather than a drop"
@@ -5334,7 +5517,7 @@ fn a_dispatched_command_this_device_declines_names_itself() {
         ),
         (CHILD_OP_DELAY, UnimplementedCommand::Delay, plain()),
     ] {
-        let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+        let mut state = Device::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
         let plen = payload.len() as u32;
         let pkt = Packet {
             opcode,
@@ -5426,7 +5609,7 @@ fn a_delete_object_record_must_fit_the_payload_that_carries_it() {
         ("a record overrunning by one byte", overrun),
         ("a record length whose bound arithmetic overflows", wrapping),
     ] {
-        let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+        let mut state = Device::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
         let cap = crate::observe::FailCapture::start();
         let disposition = process_child_packet(&mut state, &mut host, 3, &packet(payload));
         let lines = cap.lines();
@@ -5452,7 +5635,7 @@ fn a_delete_object_record_must_fit_the_payload_that_carries_it() {
     let mut exact = vec![0u8; 12];
     st32(&mut exact[0..], 0x11);
     st32(&mut exact[8..], 8);
-    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
     let cap = crate::observe::FailCapture::start();
     process_child_packet(&mut state, &mut host, 3, &packet(exact));
     let lines = cap.lines();
@@ -5498,7 +5681,7 @@ fn a_delete_object_record_must_fit_the_payload_that_carries_it() {
 /// the pipeline registry.
 ///
 /// The retained render-pipeline registry is a Vulkan-arm structure
-/// ([`crate::model::state::DeviceState::task_render_pipeline_states`] and
+/// ([`crate::model::DeviceState::task_objects.render_pipelines`] and
 /// [`crate::runtime::pipeline_resolve`] are both gated on it), so the statements
 /// that populate and interrogate it are gated the same way. Everything else —
 /// including that the pipeline destroy opcode leaves the object table alone on
@@ -5527,51 +5710,52 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
         }
     };
 
-    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
     state.define_task(2, 0x2000, 9);
     assert!(state.set_object_list(2, 3, 64));
     for ref_ in [10, 11, 12, 13, 14, 15, 16, 17, 18, 19] {
         assert!(state.insert_object(2, ref_));
     }
-    state.icb_registry.insert_for_test(2, 16);
+    state
+        .task_objects
+        .indirect_command_buffers
+        .record(2, 16, Default::default())
+        .expect("test ICB identity");
     state.set_fence_generation(2, 17, 4);
     let fence_identity = state.fence_identity(2, 17).expect("fence identity");
-    state.task_compute_pipeline_states.register(
+    state.task_objects.compute_pipelines.register(
         2,
         reims_vgpu_protocol::SerializerRef::new(18),
-        std::sync::Arc::new(crate::runtime::compute_exec::LoadedComputePipeline {
+        std::sync::Arc::new(crate::model::LoadedComputePipeline {
             kernel_func_ref: 7,
             kernel_mtlb: std::sync::Arc::from([]),
             stage_input: None,
         }),
     );
-    state.task_function_states.register(
+    state.task_objects.functions.register(
         2,
         reims_vgpu_protocol::SerializerRef::new(19),
-        std::sync::Arc::new(crate::runtime::mtlb::LoadedFunction {
+        std::sync::Arc::new(crate::model::LoadedFunction {
             mtlb: std::sync::Arc::from([1, 2, 3, 4]),
         }),
     );
-    state.task_sampler_states.register(
+    state.task_objects.samplers.register(
         2,
         reims_vgpu_protocol::SerializerRef::new(11),
-        std::sync::Arc::new(crate::model::TaskSamplerState {
-            descriptor: Default::default(),
-        }),
+        std::sync::Arc::new(Default::default()),
     );
-    #[cfg(feature = "backend-vulkan")]
     {
-        state.task_depth_stencil_states.register(
+        state.task_objects.depth_stencil.register(
             2,
             reims_vgpu_protocol::SerializerRef::new(12),
             std::sync::Arc::new(Default::default()),
         );
-        state.task_render_pipeline_states.register(
+        state.task_objects.render_pipelines.register(
             2,
             reims_vgpu_protocol::SerializerRef::new(13),
             crate::runtime::pipeline_resolve::retained_pipeline_for_test(),
         );
-        state.task_render_pipeline_states.register(
+        state.task_objects.render_pipelines.register(
             2,
             reims_vgpu_protocol::SerializerRef::new(15),
             crate::runtime::pipeline_resolve::retained_pipeline_for_test(),
@@ -5591,7 +5775,7 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
         "the stamps must retire, or the guest waits forever"
     );
     assert!(
-        state.objects.contains(&(2, 10)),
+        state.fixtures.objects.contains(&(2, 10)),
         "the record's ref is a serializer ref; keying the object table with it \
          destroys an unrelated object that merely shares the integer"
     );
@@ -5603,12 +5787,13 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
         &destroy_packet(2, OPCODE_DELETE_SAMPLER_STATE, 11),
     );
     assert!(
-        state.objects.contains(&(2, 11)),
+        state.fixtures.objects.contains(&(2, 11)),
         "sampler deletion must not cross into the resource-list ref space"
     );
     assert!(
         state
-            .task_sampler_states
+            .task_objects
+            .samplers
             .get(2, reims_vgpu_protocol::SerializerRef::new(11))
             .is_none(),
         "the sampler opcode retires the same integer only in its own ref space"
@@ -5620,17 +5805,17 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
         4,
         &destroy_packet(2, OPCODE_DELETE_DEPTH_STENCIL_STATE, 12),
     );
-    #[cfg(feature = "backend-vulkan")]
     assert!(
         state
-            .task_depth_stencil_states
+            .task_objects
+            .depth_stencil
             .get(2, reims_vgpu_protocol::SerializerRef::new(12))
             .is_none(),
         "the depth-stencil destroy opcode retires its own retained state, which \
          is the whole invalidation behind retaining it at all"
     );
     assert!(
-        state.objects.contains(&(2, 12)),
+        state.fixtures.objects.contains(&(2, 12)),
         "depth-stencil deletion must not cross into the resource-list ref space"
     );
 
@@ -5640,16 +5825,16 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
         4,
         &destroy_packet(2, OPCODE_DELETE_RENDER_PIPELINE_STATE, 13),
     );
-    #[cfg(feature = "backend-vulkan")]
     assert!(
         state
-            .task_render_pipeline_states
+            .task_objects
+            .render_pipelines
             .get(2, reims_vgpu_protocol::SerializerRef::new(13))
             .is_none(),
         "the render-pipeline destroy opcode retires its own retained state"
     );
     assert!(
-        state.objects.contains(&(2, 13)),
+        state.fixtures.objects.contains(&(2, 13)),
         "pipeline deletion must not cross into the resource-list ref space"
     );
 
@@ -5659,9 +5844,12 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
         4,
         &destroy_packet(2, OPCODE_DELETE_INDIRECT_COMMAND_BUFFER, 16),
     );
-    assert_eq!(state.icb_registry.identity(2, 16), None);
+    assert_eq!(
+        state.task_objects.indirect_command_buffers.identity(2, 16),
+        None
+    );
     assert!(
-        state.objects.contains(&(2, 16)),
+        state.fixtures.objects.contains(&(2, 16)),
         "ICB deletion must retire only the ICB namespace"
     );
 
@@ -5673,7 +5861,7 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
     );
     assert_eq!(state.fence_generation(2, 17), None);
     assert!(
-        state.objects.contains(&(2, 17)),
+        state.fixtures.objects.contains(&(2, 17)),
         "fence deletion must retire only the fence namespace"
     );
     state.set_fence_generation(2, 17, 1);
@@ -5688,11 +5876,12 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
         &destroy_packet(2, OPCODE_DELETE_COMPUTE_PIPELINE_STATE, 18),
     );
     assert!(state
-        .task_compute_pipeline_states
+        .task_objects
+        .compute_pipelines
         .get(2, reims_vgpu_protocol::SerializerRef::new(18))
         .is_none());
     assert!(
-        state.objects.contains(&(2, 18)),
+        state.fixtures.objects.contains(&(2, 18)),
         "compute-pipeline deletion must retire only its pipeline namespace"
     );
 
@@ -5703,11 +5892,12 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
         &destroy_packet(2, OPCODE_DELETE_FUNCTION, 19),
     );
     assert!(state
-        .task_function_states
+        .task_objects
+        .functions
         .get(2, reims_vgpu_protocol::SerializerRef::new(19))
         .is_none());
     assert!(
-        state.objects.contains(&(2, 19)),
+        state.fixtures.objects.contains(&(2, 19)),
         "function deletion must retire only the function namespace"
     );
 
@@ -5715,10 +5905,10 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
         state.delete_object(2, 15),
         "the colliding resource-list object exists"
     );
-    #[cfg(feature = "backend-vulkan")]
     assert!(
         state
-            .task_render_pipeline_states
+            .task_objects
+            .render_pipelines
             .contains(2, reims_vgpu_protocol::SerializerRef::new(15)),
         "resource-list deletion must not cross into the pipeline ref space"
     );
@@ -5727,7 +5917,7 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
     // even read, so it must also leave the table alone.
     process_child_packet(&mut state, &mut host, 4, &destroy_packet(2, 0x3ec, 14));
     assert!(
-        state.objects.contains(&(2, 14)),
+        state.fixtures.objects.contains(&(2, 14)),
         "0x3ec is unclaimed inside the destroy span and names no destroy at all"
     );
 }
@@ -5763,7 +5953,7 @@ fn a_delete_object_counts_the_kind_its_record_names() {
         }
     };
 
-    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
     state.define_task(2, 0x2000, 9);
 
     let sampler_before = store_route_count("child_delete_object_sampler_state");
@@ -5815,7 +6005,7 @@ fn a_delete_object_counts_the_kind_its_record_names() {
 fn a_retired_slot_is_reported_as_retired_and_not_as_undecodable() {
     let mut host = FakeHost::new();
     for opcode in CHILD_DEPRECATED_OPS {
-        let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+        let mut state = Device::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
         let pkt = Packet {
             opcode,
             stamp_waits: Vec::new(),
@@ -5889,7 +6079,7 @@ fn the_discarding_commands_share_the_synchronize_record_layout() {
             next_head: 0,
         };
 
-        let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+        let mut state = Device::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
         assert_eq!(
             process_child_packet(&mut state, &mut host, 2, &packet(&good)),
             ChildPacketDisposition::Complete
@@ -5911,7 +6101,7 @@ fn the_discarding_commands_share_the_synchronize_record_layout() {
 
         // The malformed one proves the payload reached the decoder.
         let cap = crate::observe::FailCapture::start();
-        let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+        let mut state = Device::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
         process_child_packet(&mut state, &mut host, 2, &packet(&liar));
         let line = cap.one("map_family");
         assert!(
@@ -5945,8 +6135,8 @@ fn the_discarding_commands_share_the_synchronize_record_layout() {
 /// `map_memory2_does_not_flush_gva_host_cache_on_wire` and the view-retire tests.
 #[test]
 fn each_map_family_command_takes_its_own_branch() {
-    use crate::contract::endian::st32;
     use crate::runtime::decode::fifo::CHILD_INVALIDATE_PAGEON_FLAGS;
+    use reims_vgpu_core::endian::st32;
 
     const MAPPING: u32 = 0x2a;
 
@@ -5986,9 +6176,15 @@ fn each_map_family_command_takes_its_own_branch() {
         ),
     ] {
         let mut host = FakeHost::new();
-        let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+        let mut state = Device::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
         assert!(state.map_surface(MAPPING));
-        state.mappings.get_mut(&MAPPING).unwrap().content_generation = 7;
+        state
+            .surfaces
+            .mappings
+            .get_mut(&MAPPING)
+            .unwrap()
+            .content
+            .guest_page_generation = 7;
 
         assert_eq!(
             process_child_packet(
@@ -6012,7 +6208,11 @@ fn each_map_family_command_takes_its_own_branch() {
         // records, so the generation bump is its signature. A mis-bound arm
         // either loses the bump or produces one for a command that never
         // invalidates anything.
-        let generation = state.mappings.get(&MAPPING).map(|m| m.content_generation);
+        let generation = state
+            .surfaces
+            .mappings
+            .get(&MAPPING)
+            .map(|m| m.content.guest_page_generation);
         if bumps_generation {
             assert_eq!(
                 generation,
@@ -6034,7 +6234,7 @@ fn each_map_family_command_takes_its_own_branch() {
         // could hurt, so it unmaps outright. The slot survives — the id can be
         // reused — so what separates it is the mapped bit, not the entry.
         assert_eq!(
-            state.mappings[&MAPPING].mapped,
+            state.surfaces.mappings[&MAPPING].lifecycle.active,
             opcode != CHILD_OP_DELETE_IOSURFACE_BACKING2,
             "{opcode:#x}: only the backing delete unmaps the surface"
         );
@@ -6074,7 +6274,7 @@ fn an_opcode_past_the_dispatch_ceiling_is_reported_apart_from_an_unassigned_slot
 
     // 0x0b is inside the ceiling and has no handler on the reference host.
     let cap = crate::observe::FailCapture::start();
-    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
     process_child_packet(&mut state, &mut host, 2, &packet(0x0b));
     assert!(
         state
@@ -6093,7 +6293,7 @@ fn an_opcode_past_the_dispatch_ceiling_is_reported_apart_from_an_unassigned_slot
     drop(cap);
 
     let cap = crate::observe::FailCapture::start();
-    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
     process_child_packet(&mut state, &mut host, 2, &packet(CHILD_OP_MAX + 1));
     let line = cap.one("child_opcode_out_of_range");
     assert!(
@@ -6127,7 +6327,7 @@ fn an_opcode_past_the_dispatch_ceiling_is_reported_apart_from_an_unassigned_slot
 #[test]
 fn a_declined_command_is_latched_in_the_log_and_counted_in_the_census() {
     use crate::runtime::drain::store_route_count;
-    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     let mut payload = vec![0u8; 8];
     st32(&mut payload[0..], 0x11);
@@ -6185,13 +6385,12 @@ fn a_declined_command_is_latched_in_the_log_and_counted_in_the_census() {
 fn no_display_signal_path_sets_a_bit_the_guest_did_not_enable() {
     use crate::model::DISPLAY_EVENT_MASK_ALL;
     for mask in 0..=DISPLAY_EVENT_MASK_ALL {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let mut host = FakeHost::new();
         let gpa = 0x7c000000u64;
         host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
-        state.display.shared_gpa = gpa;
-        state.display.display_index = 0;
-        state.display.online_acked = true;
+        state.presentation.display.reinitialize(0, gpa);
+        state.presentation.display.acknowledge_online();
         host.put_u32(gpa + DISPLAY_SHARED_ENABLE_MASK, mask);
         host.put_u32(gpa + DISPLAY_SHARED_PENDING, 0);
 
@@ -6224,13 +6423,12 @@ fn no_display_signal_path_sets_a_bit_the_guest_did_not_enable() {
 #[test]
 fn display_offline_is_never_signalled_even_when_the_guest_arms_it() {
     use crate::model::{DISPLAY_EVENT_MASK_ALL, DISPLAY_OFFLINE_EVENT_MASK};
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let gpa = 0x7c000000u64;
     host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
-    state.display.shared_gpa = gpa;
-    state.display.display_index = 0;
-    state.display.online_acked = true;
+    state.presentation.display.reinitialize(0, gpa);
+    state.presentation.display.acknowledge_online();
     // Everything armed, including offline: the most permissive guest there is.
     host.put_u32(gpa + DISPLAY_SHARED_ENABLE_MASK, DISPLAY_EVENT_MASK_ALL);
     host.put_u32(gpa + DISPLAY_SHARED_PENDING, 0);
@@ -6264,13 +6462,12 @@ fn display_offline_is_never_signalled_even_when_the_guest_arms_it() {
 /// goes live, and nothing ever retires it.
 #[test]
 fn the_refresh_tick_signals_the_transaction_class_when_that_is_what_the_guest_armed() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let gpa = 0x7c000000u64;
     host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
-    state.display.shared_gpa = gpa;
-    state.display.display_index = 0;
-    state.display.online_acked = true;
+    state.presentation.display.reinitialize(0, gpa);
+    state.presentation.display.acknowledge_online();
     // Exactly what a macOS 11 guest publishes: transaction + online + offline,
     // and no VBL for the life of the boot.
     host.put_u32(
@@ -6309,13 +6506,12 @@ fn the_refresh_tick_signals_the_transaction_class_when_that_is_what_the_guest_ar
 /// not turn a mask it did not expect into a doubled doorbell rate.
 #[test]
 fn a_refresh_tick_that_signals_both_classes_raises_one_interrupt() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let gpa = 0x7c000000u64;
     host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
-    state.display.shared_gpa = gpa;
-    state.display.display_index = 0;
-    state.display.online_acked = true;
+    state.presentation.display.reinitialize(0, gpa);
+    state.presentation.display.acknowledge_online();
     host.put_u32(
         gpa + DISPLAY_SHARED_ENABLE_MASK,
         DISPLAY_VBL_EVENT_MASK | DISPLAY_PRESENT_EVENT_MASK,
@@ -6345,7 +6541,7 @@ fn a_refresh_tick_that_signals_both_classes_raises_one_interrupt() {
 #[test]
 fn the_map_interval_audit_counts_a_clean_pairing_and_not_only_a_finding() {
     use crate::runtime::drain::store_route_count;
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
 
     // task@0 u32, gva@4 u64, length@12 u64 — the layout `apply_map_family`

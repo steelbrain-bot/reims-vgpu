@@ -109,7 +109,12 @@ pub struct HostGpuCaps {
 impl HostGpuCaps {
     /// Flags to request for `class` on this device.
     pub fn memory_request(&self, class: MemoryClass) -> crate::memory::MemoryRequest {
-        self.memory.topology.request(class)
+        self.memory_policy().request(class)
+    }
+
+    /// The only behavior-bearing interpretation of the structural topology.
+    pub const fn memory_policy(&self) -> crate::policy::MemoryPlacementPolicy {
+        crate::policy::MemoryPlacementPolicy::new(self.memory.topology)
     }
 
     /// One-shot, fail-visible summary of the classification. Load-bearing for

@@ -1,19 +1,18 @@
 // Only the compute-preflight test names these opcodes, and that test is
 // Vulkan-only — this device compiles no compute preflight without it.
-#[cfg(feature = "backend-vulkan")]
 use reims_vgpu_wire::ops::compute as wire_compute;
 
 use reims_vgpu_wire::OP_HEADER_LEN;
 
 use super::*;
-use crate::contract::endian::{st16, st32, st64};
-use crate::contract::pass_action::{MTL_LOAD_ACTION_CLEAR, MTL_STORE_ACTION_STORE};
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
 use crate::runtime::decode::render::{
     PASS_ATTACH_CLEAR_COLOR, PASS_ATTACH_LOAD_ACTION, PASS_ATTACH_STORE_ACTION, PASS_ATTACH_TEXREF,
     PASS_COLOR_ATTACH_OFF, PASS_COLOR_ATTACH_STRIDE,
 };
 use crate::runtime::host::FakeHost;
+use reims_vgpu_core::endian::{st16, st32, st64};
+use reims_vgpu_protocol::pass_action::{MTL_LOAD_ACTION_CLEAR, MTL_STORE_ACTION_STORE};
 
 #[test]
 fn render_pass_chain_edges_follow_the_decoded_encoder() {
@@ -61,7 +60,7 @@ fn chain_abandon_reports_how_many_draws_were_lost() {
 
 #[test]
 fn short_payload_noop() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let r = process_exec_indirect2(&mut state, &mut host, &[0u8; 4]);
     assert_eq!(r.streams_loaded, 0);
@@ -83,7 +82,7 @@ fn short_payload_noop() {
 /// is a probe that cannot distinguish the cases.
 #[test]
 fn an_exec_packet_naming_a_dead_slot_is_refused_not_aimed_at_its_neighbour() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     state.define_task(3, 0x1_0000, 2);
     assert!(state.tasks[3].active);
@@ -119,7 +118,7 @@ fn a_resource_record_that_populates_its_unrecovered_tail_says_so() {
     use crate::runtime::decode::fifo::{
         CHILD_EXEC_RESOURCE_OBJECT_ID, CHILD_EXEC_RESOURCE_TAIL, CHILD_EXEC_RESOURCE_VALIDITY_OPS,
     };
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     state.define_task(3, 0x1_0000, 2);
 
@@ -200,7 +199,7 @@ fn a_stream_that_will_not_frame_says_so_instead_of_executing_nothing() {
     // stream the framing decoder rejected executed zero records and produced
     // zero log lines — byte-for-byte indistinguishable at the sink from an
     // idle guest that submitted nothing.
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -268,7 +267,7 @@ fn a_render_encoder_continuation_keeps_pipeline_state_across_child_buffers() {
     st16(&mut draw[12..14], 0);
     st16(&mut draw[14..16], 3);
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut open = None;
@@ -314,7 +313,6 @@ fn a_render_encoder_continuation_keeps_pipeline_state_across_child_buffers() {
     );
 }
 
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn submission_context_preserves_every_child_buffer_segment_in_order() {
     use crate::runtime::decode::stream::{
@@ -457,7 +455,6 @@ fn an_unknown_segment_family_is_refused_and_the_type_5_envelope_is_not() {
     );
 }
 
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn render_preflight_collects_content_pipelines_without_duplicates() {
     use crate::runtime::decode::stream::{SEGMENT_HEADER_LEN, SEGMENT_TYPE_RENDER};
@@ -480,7 +477,6 @@ fn render_preflight_collects_content_pipelines_without_duplicates() {
     assert_eq!(render_pipeline_refs(&stream), vec![41, 77]);
 }
 
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn compute_preflight_collects_pipeline_and_local_size_without_duplicates() {
     use crate::runtime::decode::stream::{SEGMENT_HEADER_LEN, SEGMENT_TYPE_COMPUTE};
@@ -548,7 +544,7 @@ fn event_segment_signal_wait_in_stream() {
     let mut stream = Vec::new();
     push_segment(&mut stream, SEGMENT_TYPE_EVENT, &records);
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -629,7 +625,7 @@ fn an_indexed_draw_with_no_index_buffer_is_named() {
         cmd
     };
     let run = |cmd: &[u8]| {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let host = FakeHost::new();
         let mut out = ExecResult::default();
         let mut acc = StreamAccum {
@@ -669,6 +665,47 @@ fn an_indexed_draw_with_no_index_buffer_is_named() {
         log.contains(&format!("op={:#x}", wire_render::OPCODE_DRAW_INDEXED)),
         "the line must name which indexed form fired, since each reads the \
          ref at a different offset"
+    );
+}
+
+/// Primitive topology is parsed at the stream-normalization boundary. An
+/// ordinal outside the advertised semantic enum must refuse this draw rather
+/// than reaching the executor as a triangle through a defaulting conversion.
+#[test]
+fn an_unknown_primitive_topology_refuses_the_draw_without_a_fallback() {
+    let mut command = vec![0u8; wire_render::DRAW_TOTAL_LEN as usize];
+    st32(&mut command[0..4], wire_render::OPCODE_DRAW);
+    st32(&mut command[4..8], wire_render::DRAW_TOTAL_LEN);
+    st32(&mut command[8..12], 5); // outside the public MTLPrimitiveType enum
+    st16(&mut command[12..14], 0);
+    st16(&mut command[14..16], 3);
+
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum {
+        pipeline_ref: 0x41,
+        ..Default::default()
+    };
+    handle_render_record(
+        &mut state,
+        &host,
+        1,
+        wire_render::OPCODE_DRAW,
+        &command,
+        &mut out,
+        &mut acc,
+    );
+
+    assert!(acc.saw_draw, "the decoded guest operation was observed");
+    assert!(
+        acc.draws.is_empty(),
+        "an unknown topology must not become an executable draw"
+    );
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    assert!(
+        log.contains("reason=unknown_primitive_type") && log.contains("raw=5"),
+        "the refusal must preserve the contract field and exact ordinal; got:\n{log}"
     );
 }
 
@@ -715,7 +752,7 @@ fn an_unsupported_depth_attachment_is_named_not_just_dropped() {
         cmd
     };
     let run = |cmd: &[u8]| {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let host = FakeHost::new();
         let mut out = ExecResult::default();
         let mut acc = StreamAccum::default();
@@ -839,8 +876,8 @@ fn an_unsupported_depth_attachment_is_named_not_just_dropped() {
 /// This counted and rendered anyway until the arms beside it stopped doing so.
 #[test]
 fn a_pass_declaring_more_array_layers_than_this_device_draws_refuses_the_draws() {
-    use crate::contract::endian::st32;
     use crate::runtime::decode::render::{PASS_ATTACH_TEXREF, PASS_COLOR_ATTACH_OFF};
+    use reims_vgpu_core::endian::st32;
 
     // A full-length record, not the `PASS_MIN_PAYLOAD` one the arms below use:
     // the array length is read only from the whole `RenderPassBody`, and a
@@ -861,7 +898,7 @@ fn a_pass_declaring_more_array_layers_than_this_device_draws_refuses_the_draws()
         cmd
     };
     let run = |cmd: &[u8]| {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let host = FakeHost::new();
         let mut out = ExecResult::default();
         let mut acc = StreamAccum::default();
@@ -928,7 +965,7 @@ fn a_pass_declaring_more_array_layers_than_this_device_draws_refuses_the_draws()
 /// is entitled to ask; this is the refusal that says what that costs.
 #[test]
 fn a_pass_declaring_a_raster_sample_count_this_device_cannot_rasterize_refuses_the_draws() {
-    use crate::contract::endian::st32;
+    use reims_vgpu_core::endian::st32;
 
     let record = |count: u32| {
         let total = wire_pass::DEFAULT_RASTER_SAMPLE_COUNT_TOTAL_LEN as usize;
@@ -939,7 +976,7 @@ fn a_pass_declaring_a_raster_sample_count_this_device_cannot_rasterize_refuses_t
         cmd
     };
     let run = |cmd: &[u8]| {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let host = FakeHost::new();
         let mut out = ExecResult::default();
         let mut acc = StreamAccum::default();
@@ -1015,11 +1052,11 @@ fn a_pass_declaring_a_raster_sample_count_this_device_cannot_rasterize_refuses_t
 ///
 #[test]
 fn a_colour_attachment_naming_a_subresource_this_device_cannot_bind_refuses_the_draws() {
-    use crate::contract::endian::st32;
     use crate::runtime::decode::render::{
         PASS_ATTACH_DEPTH_PLANE, PASS_ATTACH_LEVEL, PASS_ATTACH_RESOLVEREF, PASS_ATTACH_SLICE,
         PASS_ATTACH_TEXREF, PASS_COLOR_ATTACH_OFF, PASS_MIN_PAYLOAD,
     };
+    use reims_vgpu_core::endian::st32;
 
     let pass_resolving = |level: u16, slice: u16, plane: u16, resolve: u32| {
         let total = OP_HEADER_LEN + PASS_MIN_PAYLOAD;
@@ -1039,7 +1076,7 @@ fn a_colour_attachment_naming_a_subresource_this_device_cannot_bind_refuses_the_
     };
     let pass = |level: u16, slice: u16, plane: u16| pass_resolving(level, slice, plane, 0);
     let run = |cmd: &[u8]| {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let host = FakeHost::new();
         let mut out = ExecResult::default();
         let mut acc = StreamAccum::default();
@@ -1134,7 +1171,7 @@ fn a_colour_attachment_naming_a_subresource_this_device_cannot_bind_refuses_the_
 /// read them side by side. Bands that drifted apart would make that
 /// comparison silently wrong rather than obviously so.
 ///
-/// Declared twice because `coverage_band` is behind `backend-vulkan` and
+/// Declared twice because `coverage_band` belongs to the Vulkan execution path and
 /// this census runs on every backend. This is the comparison that keeps the
 /// duplication honest.
 #[test]
@@ -1146,7 +1183,6 @@ fn the_two_coverage_censuses_use_the_same_bands() {
             band < PASS_EXTENT_SLUGS.len(),
             "pct {pct} banded out of range"
         );
-        #[cfg(feature = "backend-vulkan")]
         assert_eq!(
             band,
             crate::runtime::draw::coverage_band_for_test(pct),
@@ -1212,7 +1248,7 @@ fn the_pass_extent_census_scores_a_fraction_and_clamps_it() {
 fn the_pass_extent_census_scores_either_resolve_arm() {
     use crate::runtime::drain::store_route_count;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let cmd = crate::runtime::decode::render::Command {
         pass_render_target_width: 960,
         pass_render_target_height: 540,
@@ -1250,7 +1286,7 @@ fn the_pass_extent_census_scores_either_resolve_arm() {
 fn stream_accum_upserts_buffer_and_viewport() {
     // wire opcodes via wire_render import
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -1338,7 +1374,7 @@ fn stream_accum_upserts_buffer_and_viewport() {
 
 #[test]
 fn wide_indexed_draw_reaches_pending_draw() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum {
@@ -1360,7 +1396,7 @@ fn wide_indexed_draw_reaches_pending_draw() {
     assert!(out.saw_draw);
     assert_eq!(acc.draws.len(), 1);
     let indexed = acc.draws[0].indexed.as_ref().expect("indexed draw");
-    assert_eq!(indexed.index_type, 0);
+    assert_eq!(indexed.index_type, Ok(reims_vgpu_protocol::IndexType::U16));
     assert_eq!(indexed.index_buffer_ref, 0x3e);
     assert_eq!(indexed.index_count, 6);
     assert_eq!(indexed.index_buffer_offset, 0x10100);
@@ -1369,7 +1405,7 @@ fn wide_indexed_draw_reaches_pending_draw() {
         DrawArgs {
             vertex_count: 6,
             instance_count: 1,
-            primitive_type: 3,
+            primitive_topology: reims_vgpu_protocol::PrimitiveTopology::Triangle,
             first_vertex: 0,
             base_instance: 0
         }
@@ -1387,9 +1423,9 @@ fn wide_indexed_draw_reaches_pending_draw() {
 /// `DrawEncodeRequest` fails here.
 #[test]
 fn a_base_vertex_and_base_instance_reach_the_pending_draw() {
-    use crate::contract::endian::st16;
+    use reims_vgpu_core::endian::st16;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum {
@@ -1438,7 +1474,7 @@ fn a_base_vertex_and_base_instance_reach_the_pending_draw() {
 /// code at exactly 64.
 #[test]
 fn every_decoded_draw_in_a_stream_reaches_the_draw_list() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum {
@@ -1486,7 +1522,7 @@ fn every_decoded_draw_in_a_stream_reaches_the_draw_list() {
 /// pushed with pipeline 61 and both assertions fail.
 #[test]
 fn setting_the_render_pipeline_to_ref_zero_unbinds_it() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum {
@@ -1544,7 +1580,7 @@ fn setting_the_render_pipeline_to_ref_zero_unbinds_it() {
 /// either way, which is exactly how a regression here would hide.
 #[test]
 fn draws_sharing_a_bind_table_share_its_allocation() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum {
@@ -1635,7 +1671,7 @@ fn draw_preparation_keeps_every_recorded_bind_table_allocation() {
 /// snapshot the guest already committed to.
 #[test]
 fn a_bind_after_a_draw_does_not_rewrite_that_draws_snapshot() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum {
@@ -1702,10 +1738,10 @@ fn a_recorded_buffer_bind_retains_its_object_across_offset_change_and_ref_reuse(
     use crate::runtime::objects;
 
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
-    let put_buffer = |host: &mut FakeHost, state: &DeviceState, handle: u32, size: u64| {
+    let put_buffer = |host: &mut FakeHost, state: &Device, handle: u32, size: u64| {
         let descriptor_gva = 0x180;
         let mut descriptor = [0u8; 16];
         st64(&mut descriptor, size);
@@ -1796,9 +1832,9 @@ fn a_texture_slot_replaces_object_identity_only_on_a_later_setter() {
     use crate::model::TaskResource;
     use crate::runtime::decode::resource::ListObjectEntry;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
-    let first = state.task_resources.register(
+    let first = state.task_objects.resources.register(
         1,
         9,
         Arc::new(TaskResource::new(
@@ -1828,8 +1864,8 @@ fn a_texture_slot_replaces_object_identity_only_on_a_later_setter() {
         &first
     ));
 
-    assert!(state.task_resources.delete(1, 9));
-    let replacement = state.task_resources.register(
+    assert!(state.task_objects.resources.delete(1, 9));
+    let replacement = state.task_objects.resources.register(
         1,
         9,
         Arc::new(TaskResource::new(
@@ -1862,7 +1898,7 @@ fn accepted_render_without_executor_is_fail_visible() {
     // lock and clear it so this test always observes its first-sighting line.
     let _guard = UNIMPL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     reset_unimplemented_opcode_dedup_for_test();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum {
@@ -2009,7 +2045,7 @@ fn a_dropped_draw_names_which_check_refused_not_just_its_class() {
 fn zero_ref_render_bind_unbinds_existing_slots() {
     // wire opcodes via wire_render import
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -2064,14 +2100,17 @@ fn zero_ref_render_bind_unbinds_existing_slots() {
 /// x86 surface backing display mid: clear-only stream must Store solid BGRA into pages.
 #[test]
 fn clear_only_surface_backing_writes_guest_pages() {
-    use crate::contract::endian::{st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::objects::{self, OBJECT_TYPE_SURFACE};
+    use reims_vgpu_core::endian::{st32, st64};
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
 
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     state.page_shift = PAGE_SHIFT_X86;
     // Surface pages at pfn 0x40 (one 4K page is enough for 16×16).
     let page = 0x40u64 << PAGE_SHIFT_X86;
@@ -2137,8 +2176,8 @@ fn clear_only_surface_backing_writes_guest_pages() {
     let mut px = [0u8; 4];
     assert!(host.read_gpa(page, &mut px).is_ok());
     assert_eq!(px, [0, 0, 255, 255], "expected opaque red BGRA, got {px:?}");
-    let m = state.mappings.get(&5).expect("mapping");
-    assert!(m.content_generation > 0 || m.mapped);
+    let m = state.surfaces.mappings.get(&5).expect("mapping");
+    assert!(m.content.guest_page_generation > 0 || m.lifecycle.active);
     let _ = PAGE_ENTRY_VALID;
     let _ = PAGE_ENTRY_PFN_SHIFT;
 }
@@ -2148,7 +2187,7 @@ fn clear_only_surface_backing_writes_guest_pages() {
 #[test]
 fn finish_stream_clear_only_branch_without_draws() {
     use crate::runtime::decode::render::ColorAttachment;
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -2172,7 +2211,7 @@ fn finish_stream_clear_only_branch_without_draws() {
 fn finish_stream_with_draws_skips_guest_clear_prelude() {
     use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::draw::BufferBind;
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -2195,7 +2234,7 @@ fn finish_stream_with_draws_skips_guest_clear_prelude() {
         draw: DrawArgs {
             vertex_count: 3,
             instance_count: 1,
-            primitive_type: 3,
+            primitive_topology: reims_vgpu_protocol::PrimitiveTopology::Triangle,
             first_vertex: 0,
             base_instance: 0,
         },
@@ -2215,10 +2254,10 @@ fn finish_stream_with_draws_skips_guest_clear_prelude() {
         viewports: Vec::new(),
         scissors: Vec::new(),
         blend_color: None,
-        cull_mode: None,
-        front_facing: None,
-        fill_mode: None,
-        depth_clip_mode: None,
+        cull_mode: reims_vgpu_protocol::CullMode::None,
+        front_face_ccw: false,
+        fill_mode: reims_vgpu_protocol::FillMode::Fill,
+        depth_clip_mode: reims_vgpu_protocol::DepthClipMode::Clip,
         depth_bias: None,
         depth_stencil_ref: 0,
         stencil_ref: None,
@@ -2236,14 +2275,14 @@ fn finish_stream_with_draws_skips_guest_clear_prelude() {
 /// Linux BackendUnavailable: draws fail but CLEAR seed still Stores into surface backing pages.
 #[test]
 fn backend_unavailable_draw_falls_back_to_surface_backing_clear() {
-    use crate::contract::endian::{st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::draw::BufferBind;
     use crate::runtime::objects::{self, OBJECT_TYPE_SURFACE};
+    use reims_vgpu_core::endian::{st32, st64};
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     state.page_shift = PAGE_SHIFT_X86;
     let page = 0x50u64 << PAGE_SHIFT_X86;
     host.map_range(page, 0x2000, 0);
@@ -2303,7 +2342,7 @@ fn backend_unavailable_draw_falls_back_to_surface_backing_clear() {
         draw: DrawArgs {
             vertex_count: 3,
             instance_count: 1,
-            primitive_type: 3,
+            primitive_topology: reims_vgpu_protocol::PrimitiveTopology::Triangle,
             first_vertex: 0,
             base_instance: 0,
         },
@@ -2323,10 +2362,10 @@ fn backend_unavailable_draw_falls_back_to_surface_backing_clear() {
         viewports: Vec::new(),
         scissors: Vec::new(),
         blend_color: None,
-        cull_mode: None,
-        front_facing: None,
-        fill_mode: None,
-        depth_clip_mode: None,
+        cull_mode: reims_vgpu_protocol::CullMode::None,
+        front_face_ccw: false,
+        fill_mode: reims_vgpu_protocol::FillMode::Fill,
+        depth_clip_mode: reims_vgpu_protocol::DepthClipMode::Clip,
         depth_bias: None,
         depth_stencil_ref: 0,
         stencil_ref: None,
@@ -2343,7 +2382,6 @@ fn backend_unavailable_draw_falls_back_to_surface_backing_clear() {
     );
     // Non-Apple: Linux encode Stores CLEAR load into surface backing (Ok) or
     // BackendUnavailable clear fallback — either path must land green BGRA.
-    #[cfg(feature = "backend-vulkan")]
     {
         assert!(
             out.draws_ok >= 1 || out.clears_applied >= 1 || out.draws_fail >= 1,
@@ -2425,7 +2463,7 @@ fn render_pass_template_reuses_attachment_without_load_seed() {
         pipeline_ref: 7,
         vertex_count: 3,
         instance_count: 1,
-        primitive_type: 3,
+        primitive_topology: reims_vgpu_protocol::PrimitiveTopology::Triangle,
         colors: vec![draw::ColorRtRequest {
             slot: 0,
             texture_ref: 11,
@@ -2435,8 +2473,8 @@ fn render_pass_template_reuses_attachment_without_load_seed() {
             height: 1080,
             format: 0x50,
             sample_count: 1,
-            load_action: MTL_LOAD_ACTION_CLEAR,
-            store_action: MTL_STORE_ACTION_STORE,
+            load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
+            store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
             clear_color: [0.1, 0.2, 0.3, 1.0],
             target_seed_rgba: Some(vec![0xbb; 16]),
             multisample_source_ref: 0,
@@ -2445,7 +2483,10 @@ fn render_pass_template_reuses_attachment_without_load_seed() {
     };
     let template = render_pass_attachment_template(&first);
     assert!(template.colors[0].target_seed_rgba.is_none());
-    assert_eq!(template.colors[0].load_action, MTL_LOAD_ACTION_LOAD);
+    assert_eq!(
+        template.colors[0].load_action,
+        reims_vgpu_protocol::pass_action::LoadAction::Load
+    );
     assert_eq!(template.colors[0].mapping_id(), 3);
     assert_eq!(
         (template.colors[0].width, template.colors[0].height),
@@ -2457,7 +2498,7 @@ fn render_pass_template_reuses_attachment_without_load_seed() {
         draw: DrawArgs {
             vertex_count: 6,
             instance_count: 2,
-            primitive_type: 4,
+            primitive_topology: reims_vgpu_protocol::PrimitiveTopology::TriangleStrip,
             first_vertex: 9,
             base_instance: 0,
         },
@@ -2469,10 +2510,15 @@ fn render_pass_template_reuses_attachment_without_load_seed() {
         (
             req.vertex_count,
             req.instance_count,
-            req.primitive_type,
+            req.primitive_topology,
             req.first_vertex
         ),
-        (6, 2, 4, 9)
+        (
+            6,
+            2,
+            reims_vgpu_protocol::PrimitiveTopology::TriangleStrip,
+            9,
+        )
     );
     assert_eq!(req.colors.len(), 1);
     assert_eq!(req.colors[0].mapping_id(), 3);
@@ -2530,8 +2576,8 @@ fn dropped_clear_logs_once_per_reason_target() {
 /// pass by coincidence.
 #[test]
 fn a_store_action_override_reaches_the_slot_it_names() {
-    use crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE;
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_DONT_CARE;
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -2615,11 +2661,11 @@ fn a_store_action_override_reaches_the_slot_it_names() {
 /// the wrong one cannot pass.
 #[test]
 fn a_depth_or_stencil_store_action_override_reaches_its_own_attachment() {
-    use crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE;
     use crate::runtime::decode::render::StencilAttachment;
     use crate::runtime::drain::store_route_count;
+    use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_DONT_CARE;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -2629,7 +2675,7 @@ fn a_depth_or_stencil_store_action_override_reaches_its_own_attachment() {
         let mut c = vec![0u8; total];
         st32(&mut c[0..], opcode);
         st32(&mut c[4..], total as u32);
-        crate::contract::endian::st64(&mut c[reims_vgpu_wire::OP_HEADER_LEN..], action);
+        reims_vgpu_core::endian::st64(&mut c[reims_vgpu_wire::OP_HEADER_LEN..], action);
         c
     };
     let mut send = |acc: &mut StreamAccum, opcode: u32, action: u64| {
@@ -2718,9 +2764,9 @@ fn a_depth_or_stencil_store_action_override_reaches_its_own_attachment() {
 /// three times — fails here rather than passing on a degenerate fixture.
 #[test]
 fn a_plural_scissor_record_reaches_the_accumulator_whole() {
-    use crate::contract::endian::st64;
+    use reims_vgpu_core::endian::st64;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -2804,10 +2850,10 @@ fn a_plural_scissor_record_reaches_the_accumulator_whole() {
 /// selects, so dropping slot 1 silently renumbers slot 2.
 #[test]
 fn an_empty_rect_in_a_plural_scissor_record_keeps_the_previous_state() {
-    use crate::contract::endian::st64;
     use crate::runtime::drain::store_route_count;
+    use reims_vgpu_core::endian::st64;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -2895,7 +2941,7 @@ fn a_bind_past_the_last_table_slot_reports_what_it_dropped() {
     let c = render::decode(&command).expect("an over-table texture run must decode");
     assert_eq!(c.ref_binds.len(), COUNT as usize);
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -3016,7 +3062,7 @@ fn a_sampler_above_apples_table_but_inside_ours_still_binds() {
         0x3333,
     );
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -3054,7 +3100,7 @@ fn a_sampler_above_apples_table_but_inside_ours_still_binds() {
 #[test]
 fn a_texture_bind_past_the_old_band_binds_and_keeps_its_own_descriptor() {
     use crate::runtime::drain::store_route_count;
-    use crate::runtime::spirv_bind::{SAMPLER_BINDING_BASE, TEXTURE_BINDING_BASE};
+    use reims_vgpu_vulkan::spirv_bind::{SAMPLER_BINDING_BASE, TEXTURE_BINDING_BASE};
     use reims_vgpu_wire::ops::bind_limit;
 
     // Past the old 32-wide band, inside Apple's table, and far enough in that
@@ -3082,7 +3128,7 @@ fn a_texture_bind_past_the_old_band_binds_and_keeps_its_own_descriptor() {
         st32(&mut command[at..], 0x9000 + i as u32);
     }
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -3149,7 +3195,7 @@ fn the_last_texture_slot_binds_where_the_same_buffer_slot_does_not() {
         command
     };
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -3242,7 +3288,7 @@ fn every_bind_record_lands_in_one_reach_band_and_the_top_one_reconciles() {
     ];
     let read = || bands.map(store_route_count);
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -3310,7 +3356,7 @@ fn every_bind_record_lands_in_one_reach_band_and_the_top_one_reconciles() {
 fn a_decoded_record_that_no_arm_applies_names_what_happened_instead() {
     use crate::runtime::drain::store_route_count;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -3398,7 +3444,7 @@ fn a_decoded_record_that_no_arm_applies_names_what_happened_instead() {
 /// warns about at `SamplerLodBind`.
 #[test]
 fn a_sampler_bind_carries_its_own_lod_clamps_per_slot() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -3488,7 +3534,7 @@ fn an_indirect_draw_takes_its_counts_from_the_guest_buffer() {
     // uses on the compute rail.
     let build = |words: &[u32]| {
         let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
         assert!(state.set_object_list(1, 0, 32));
         let bytes: Vec<u8> = words.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -3533,10 +3579,10 @@ fn an_indirect_draw_takes_its_counts_from_the_guest_buffer() {
         );
         assert_eq!(
             acc.draws[0].draw,
-            crate::contract::draw::DrawArgs {
+            reims_vgpu_core::draw::DrawArgs {
                 vertex_count: 11,
                 instance_count: 22,
-                primitive_type: 4,
+                primitive_topology: reims_vgpu_protocol::PrimitiveTopology::TriangleStrip,
                 first_vertex: 33,
                 base_instance: 44,
             }
@@ -3575,7 +3621,11 @@ fn an_indirect_draw_takes_its_counts_from_the_guest_buffer() {
         let pd = &acc.draws[0];
         assert_eq!(pd.draw.vertex_count, 11, "indexCount");
         assert_eq!(pd.draw.instance_count, 22);
-        assert_eq!(pd.draw.primitive_type, 3, "from the record, not the block");
+        assert_eq!(
+            pd.draw.primitive_topology,
+            reims_vgpu_protocol::PrimitiveTopology::Triangle,
+            "from the record, not the block"
+        );
         assert_eq!(
             pd.draw.first_vertex, 0,
             "indexStart offsets the index buffer, never the vertex fetch"
@@ -3586,9 +3636,12 @@ fn an_indirect_draw_takes_its_counts_from_the_guest_buffer() {
         assert_eq!(idx.index_count, 11);
         assert_eq!(idx.base_vertex, 44, "baseVertex, the block's signed field");
         assert_eq!(
-            idx.index_buffer_offset,
-            0x100 + 33 * 4,
-            "indexStart 33 at four bytes per UInt32 index, past the record's own offset"
+            idx.index_buffer_offset, 0x100,
+            "the record's byte offset remains independent of index element width"
+        );
+        assert_eq!(
+            idx.index_start, 33,
+            "the indirect element offset stays typed"
         );
     }
 
@@ -3632,7 +3685,7 @@ fn an_indirect_draw_takes_its_counts_from_the_guest_buffer() {
 /// range, `0x15` carries the range literally.
 #[test]
 fn every_icb_execute_in_a_stream_is_kept_in_order() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -3711,7 +3764,7 @@ fn a_later_icb_execute_opens_its_pass_with_load() {
             1u32,
             ColorAttachment {
                 texture_ref: 12,
-                load_action: crate::contract::pass_action::MTL_LOAD_ACTION_DONT_CARE,
+                load_action: reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_DONT_CARE,
                 store_action: MTL_STORE_ACTION_STORE,
                 clear_color: [0.0; 4],
                 // A second attachment whose action is *not* CLEAR, so the
@@ -3755,7 +3808,7 @@ fn a_later_icb_execute_opens_its_pass_with_load() {
 fn a_buffer_offset_that_lands_on_nothing_reports_which_way_it_missed() {
     use crate::runtime::drain::store_route_count;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -3839,7 +3892,7 @@ fn a_residency_or_barrier_record_is_counted_rather_than_dropped_in_silence() {
             0,
         ),
     ] {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let host = FakeHost::new();
         let mut out = ExecResult::default();
         let mut acc = StreamAccum::default();
@@ -3873,8 +3926,8 @@ fn a_residency_or_barrier_record_is_counted_rather_than_dropped_in_silence() {
 /// cannot tell those apart cannot answer the question they exist to answer.
 #[test]
 fn each_icb_blit_record_reaches_a_counter_that_names_which_one_it_is() {
-    use crate::contract::endian::st64;
     use crate::runtime::drain::store_route_count;
+    use reims_vgpu_core::endian::st64;
     use reims_vgpu_wire::ops::blit as wire;
 
     let range = |op: u32| {
@@ -3913,7 +3966,7 @@ fn each_icb_blit_record_reaches_a_counter_that_names_which_one_it_is() {
         ),
         (wire_blit::OPCODE_COPY_ICB, copy(), "blit_icb_copy_dropped"),
     ] {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let mut host = FakeHost::new();
         let before = store_route_count(route);
         handle_blit_record(&mut state, &mut host, 1, op, &command);
@@ -3928,7 +3981,7 @@ fn each_icb_blit_record_reaches_a_counter_that_names_which_one_it_is() {
     // reach either of the dropped-work counters. Sharing one would put a
     // correct no-op in the same bucket as stale commands executing.
     for route in ["blit_icb_reset_dropped", "blit_icb_copy_dropped"] {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let mut host = FakeHost::new();
         let before = store_route_count(route);
         let command = range(wire_blit::OPCODE_OPTIMIZE_ICB);
@@ -3959,8 +4012,8 @@ fn each_icb_blit_record_reaches_a_counter_that_names_which_one_it_is() {
 /// boot's reading unusable for deciding which executor to build.
 #[test]
 fn each_blit_spi_record_reaches_a_counter_that_names_which_one_it_is() {
-    use crate::contract::endian::st64;
     use crate::runtime::drain::store_route_count;
+    use reims_vgpu_core::endian::st64;
     use reims_vgpu_wire::ops::blit as wire;
 
     // A texture fill of either form: identical through the region, then the
@@ -4029,7 +4082,7 @@ fn each_blit_spi_record_reaches_a_counter_that_names_which_one_it_is() {
             INVALID,
         ),
     ] {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let mut host = FakeHost::new();
         let others: Vec<(&str, u64)> = [COLOR, BYTES, INVALID]
             .into_iter()
@@ -4064,7 +4117,7 @@ fn each_blit_spi_record_reaches_a_counter_that_names_which_one_it_is() {
     st64(&mut v[reims_vgpu_wire::OP_HEADER_LEN + 4..], 0);
     st64(&mut v[reims_vgpu_wire::OP_HEADER_LEN + 12..], 8);
     st32(&mut v[reims_vgpu_wire::OP_HEADER_LEN + 20..], 0x89ab_cdef);
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let before: Vec<u64> = [COLOR, BYTES, INVALID]
         .into_iter()
@@ -4095,7 +4148,7 @@ fn each_blit_spi_record_reaches_a_counter_that_names_which_one_it_is() {
 /// entry is the guest's number and not padding.
 #[test]
 fn a_strided_vertex_bind_lands_in_the_table_carrying_its_stride() {
-    use crate::contract::endian::st64;
+    use reims_vgpu_core::endian::st64;
 
     let total = reims_vgpu_wire::OP_HEADER_LEN
         + render::BIND_ENTRIES
@@ -4119,7 +4172,7 @@ fn a_strided_vertex_bind_lands_in_the_table_carrying_its_stride() {
     st64(&mut command[e + 4..], 0x2345);
     st64(&mut command[e + 12..], 0x3456);
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -4211,8 +4264,8 @@ fn a_strided_vertex_bind_lands_in_the_table_carrying_its_stride() {
 /// replaced their rows.
 #[test]
 fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
-    use crate::contract::endian::st64;
     use crate::runtime::drain::store_route_count;
+    use reims_vgpu_core::endian::st64;
 
     // (opcode, total length, payload writer, route, whether a default-valued
     // record of the same opcode must NOT count).
@@ -4469,7 +4522,7 @@ fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
     ];
 
     let run = |op: u32, total: usize, write: Writer| {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let host = FakeHost::new();
         let mut out = ExecResult::default();
         let mut acc = StreamAccum::default();
@@ -4503,13 +4556,13 @@ fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
 }
 
 /// `setTriangleFillMode:` and `setDepthClipMode:` land in the stream's state
-/// and travel to a draw, ordinal for ordinal.
+/// and travel to a draw as semantic state.
 ///
 /// Both records share one 16-byte wire form and one decode arm, so the opcode
 /// is the only thing that says which state a record sets — swapping the two
 /// arms compiles, renders, and wireframes a pass that asked to be clamped.
-/// Each is therefore driven on its own and the *other* slot asserted still
-/// unset.
+/// Each is therefore driven on its own and the sibling asserted at its Metal
+/// default.
 ///
 /// The default value is latched too. A stream that sets Lines and then sets
 /// Fill again is asking for Fill, so an arm that skipped `mode == 0` — which
@@ -4518,10 +4571,10 @@ fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
 /// wireframed.
 #[test]
 fn a_fill_mode_and_a_depth_clip_mode_reach_the_stream_state() {
-    use crate::contract::endian::st64;
+    use reims_vgpu_core::endian::st64;
 
     let drive = |op: u32, mode: u64| {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let host = FakeHost::new();
         let mut out = ExecResult::default();
         let mut acc = StreamAccum::default();
@@ -4535,35 +4588,194 @@ fn a_fill_mode_and_a_depth_clip_mode_reach_the_stream_state() {
 
     for mode in [0u64, 1] {
         let acc = drive(wire_render::OPCODE_SET_TRIANGLE_FILL_MODE, mode);
-        assert_eq!(acc.fill_mode, Some(mode as u32), "fill mode {mode}");
         assert_eq!(
-            acc.depth_clip_mode, None,
+            acc.raster.fill_mode,
+            Ok(if mode == 0 {
+                reims_vgpu_protocol::FillMode::Fill
+            } else {
+                reims_vgpu_protocol::FillMode::Lines
+            }),
+            "fill mode {mode}"
+        );
+        assert_eq!(
+            acc.raster.depth_clip_mode,
+            Ok(reims_vgpu_protocol::DepthClipMode::Clip),
             "fill mode {mode} set the sibling"
         );
         let acc = drive(wire_render::OPCODE_SET_DEPTH_CLIP_MODE, mode);
-        assert_eq!(acc.depth_clip_mode, Some(mode as u32), "depth clip {mode}");
-        assert_eq!(acc.fill_mode, None, "depth clip {mode} set the sibling");
+        assert_eq!(
+            acc.raster.depth_clip_mode,
+            Ok(if mode == 0 {
+                reims_vgpu_protocol::DepthClipMode::Clip
+            } else {
+                reims_vgpu_protocol::DepthClipMode::Clamp
+            }),
+            "depth clip {mode}"
+        );
+        assert_eq!(
+            acc.raster.fill_mode,
+            Ok(reims_vgpu_protocol::FillMode::Fill),
+            "depth clip {mode} set the sibling"
+        );
     }
 
     // The record's field is 64 bits wide and the backend takes 32. A word
     // whose low half is zero must not arrive as the Metal default, which
     // would render silently; it arrives as a value no `MTLTriangleFillMode`
-    // has, and the backend names it.
+    // has, and makes the stream unrepresentable by its own name.
     let acc = drive(wire_render::OPCODE_SET_TRIANGLE_FILL_MODE, 1u64 << 32);
-    assert_eq!(acc.fill_mode, Some(u32::MAX));
+    assert_eq!(
+        acc.raster.fill_mode,
+        Err(RasterStateRefusal {
+            field: RasterStateField::FillMode,
+            raw: 1u64 << 32,
+        })
+    );
+    assert!(matches!(
+        acc.bind_snapshot(),
+        Err(StreamRefusal::Raster(RasterStateRefusal {
+            field: RasterStateField::FillMode,
+            raw,
+        })) if raw == 1u64 << 32
+    ));
 
     // And a draw carries them. `bind_snapshot` builds its `PendingDraw` with
     // `..Default::default()`, so a field added to the accumulator and not to
     // the snapshot reaches no draw at all and nothing else would say so.
     let mut acc = drive(wire_render::OPCODE_SET_TRIANGLE_FILL_MODE, 1);
-    acc.depth_clip_mode = Some(1);
+    acc.raster.depth_clip_mode = Ok(reims_vgpu_protocol::DepthClipMode::Clamp);
     let pd = acc.bind_snapshot().expect("state is representable");
-    assert_eq!(pd.fill_mode, Some(1));
-    assert_eq!(pd.depth_clip_mode, Some(1));
+    assert_eq!(pd.fill_mode, reims_vgpu_protocol::FillMode::Lines);
+    assert_eq!(
+        pd.depth_clip_mode,
+        reims_vgpu_protocol::DepthClipMode::Clamp
+    );
     let mut req = crate::runtime::draw::DrawEncodeRequest::default();
     fill_draw_binds_from_pending(&mut req, &pd);
-    assert_eq!(req.fill_mode, Some(1));
-    assert_eq!(req.depth_clip_mode, Some(1));
+    assert_eq!(req.fill_mode, reims_vgpu_protocol::FillMode::Lines);
+    assert_eq!(
+        req.depth_clip_mode,
+        reims_vgpu_protocol::DepthClipMode::Clamp
+    );
+}
+
+#[test]
+fn invalid_sticky_raster_state_refuses_until_that_field_is_replaced() {
+    use reims_vgpu_core::endian::st64;
+
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    let mut drive = |op: u32, raw: u64, acc: &mut StreamAccum| {
+        let mut command = vec![0u8; wire_render::SET_MODE_TOTAL_LEN as usize];
+        st32(&mut command[0..], op);
+        st32(&mut command[4..], wire_render::SET_MODE_TOTAL_LEN);
+        st64(&mut command[reims_vgpu_wire::OP_HEADER_LEN..], raw);
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, acc);
+    };
+
+    drive(wire_render::OPCODE_SET_CULL_MODE, 1u64 << 32, &mut acc);
+    assert!(matches!(
+        acc.bind_snapshot(),
+        Err(StreamRefusal::Raster(RasterStateRefusal {
+            field: RasterStateField::CullMode,
+            raw,
+        })) if raw == 1u64 << 32
+    ));
+
+    drive(wire_render::OPCODE_SET_CULL_MODE, 2, &mut acc);
+    assert_eq!(
+        acc.bind_snapshot().unwrap().cull_mode,
+        reims_vgpu_protocol::CullMode::Back
+    );
+
+    drive(wire_render::OPCODE_SET_FRONT_FACING, 7, &mut acc);
+    assert!(matches!(
+        acc.bind_snapshot(),
+        Err(StreamRefusal::Raster(RasterStateRefusal {
+            field: RasterStateField::FrontFacing,
+            raw: 7,
+        }))
+    ));
+    drive(wire_render::OPCODE_SET_FRONT_FACING, 1, &mut acc);
+    let snapshot = acc.bind_snapshot().unwrap();
+    assert_eq!(snapshot.cull_mode, reims_vgpu_protocol::CullMode::Back);
+    assert!(snapshot.front_face_ccw);
+}
+
+#[test]
+fn attachment_actions_refuse_snapshots_until_the_exact_attachment_is_replaced() {
+    let mut acc = StreamAccum {
+        depth_attach: Some(DepthAttachment {
+            texture_ref: 11,
+            load_action: 3,
+            store_action: MTL_STORE_ACTION_STORE,
+            clear_depth: 0.25,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert!(matches!(
+        acc.bind_snapshot(),
+        Err(StreamRefusal::PassAction(PassActionRefusal {
+            aspect: "depth",
+            action: PassActionKind::Load,
+            raw: 3,
+            ..
+        }))
+    ));
+
+    acc.depth_attach.as_mut().unwrap().load_action = MTL_LOAD_ACTION_LOAD;
+    acc.stencil_attach = Some(StencilAttachment {
+        texture_ref: 12,
+        load_action: MTL_LOAD_ACTION_CLEAR,
+        store_action: 4,
+        clear_stencil: 9,
+        ..Default::default()
+    });
+    assert!(matches!(
+        acc.bind_snapshot(),
+        Err(StreamRefusal::PassAction(PassActionRefusal {
+            aspect: "stencil",
+            action: PassActionKind::Store,
+            raw: 4,
+            ..
+        }))
+    ));
+
+    acc.stencil_attach.as_mut().unwrap().store_action = MTL_STORE_ACTION_STORE;
+    acc.color_slots.push((
+        2,
+        ColorAttachment {
+            texture_ref: 13,
+            load_action: MTL_LOAD_ACTION_CLEAR,
+            store_action: 5,
+            ..Default::default()
+        },
+    ));
+    assert!(matches!(
+        acc.bind_snapshot(),
+        Err(StreamRefusal::PassAction(PassActionRefusal {
+            aspect: "color",
+            slot: 2,
+            action: PassActionKind::Store,
+            raw: 5,
+        }))
+    ));
+
+    acc.color_slots[0].1.store_action = MTL_STORE_ACTION_STORE;
+    let snapshot = acc
+        .bind_snapshot()
+        .expect("all attachment actions are semantic");
+    assert_eq!(
+        snapshot.depth_attach.unwrap().load_action,
+        reims_vgpu_protocol::pass_action::LoadAction::Load
+    );
+    assert_eq!(
+        snapshot.stencil_attach.unwrap().store_action,
+        reims_vgpu_protocol::pass_action::StoreAction::Store
+    );
 }
 
 /// Every command buffer the submission declares is visited, however many
@@ -4588,7 +4800,7 @@ fn a_fill_mode_and_a_depth_clip_mode_reach_the_stream_state() {
 #[test]
 fn every_declared_command_buffer_is_visited_not_just_the_first_sixteen() {
     const N_CB: u32 = 33;
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     state.define_task(3, 0x1_0000, 2);
 
@@ -4665,7 +4877,7 @@ fn a_bind_past_the_table_refuses_the_draws_that_would_read_it() {
     const FIRST: u32 = MAX_BUFFER_BIND_SLOTS + 4;
 
     let draw = |acc: &mut StreamAccum| {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let host = FakeHost::new();
         let mut out = ExecResult::default();
         let mut command = vec![0u8; 0x20];
@@ -4710,7 +4922,7 @@ fn a_bind_past_the_table_refuses_the_draws_that_would_read_it() {
         0x4444,
     );
     {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let host = FakeHost::new();
         let mut out = ExecResult::default();
         handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
@@ -4773,7 +4985,7 @@ fn a_buffer_offset_past_the_table_refuses_the_stream() {
     st32(&mut command[4..], total as u32);
     st32(&mut command[OP_HEADER_LEN + BUFFER_OFFSET_INDEX..], FIRST);
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum {
@@ -4836,7 +5048,7 @@ fn a_buffer_offset_past_the_table_refuses_the_stream() {
 /// one a naive `mode: u32` field would get wrong.
 #[test]
 fn an_armed_visibility_query_and_its_buffer_both_reach_the_accumulator() {
-    let mut state = DeviceState::new(DeviceId(0), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(0), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -4867,11 +5079,11 @@ fn an_armed_visibility_query_and_its_buffer_both_reach_the_accumulator() {
     // Counting at 0x1234.
     arm(&mut acc, 0x1234, 2);
     assert_eq!(
-        acc.visibility,
-        Some(crate::runtime::draw::VisibilityArming {
-            mode: 2,
+        acc.visibility.resolved(),
+        Ok(Some(crate::runtime::draw::VisibilityArming {
+            mode: reims_vgpu_protocol::VisibilityResultMode::Counting,
             offset: 0x1234
-        }),
+        })),
         "a counting query keeps both its mode and the offset it writes to"
     );
 
@@ -4879,19 +5091,45 @@ fn an_armed_visibility_query_and_its_buffer_both_reach_the_accumulator() {
     // second `setVisibilityResultMode:` genuinely supersedes the first.
     arm(&mut acc, 0x20, 1);
     assert_eq!(
-        acc.visibility,
-        Some(crate::runtime::draw::VisibilityArming {
-            mode: 1,
+        acc.visibility.resolved(),
+        Ok(Some(crate::runtime::draw::VisibilityArming {
+            mode: reims_vgpu_protocol::VisibilityResultMode::Boolean,
             offset: 0x20
-        }),
+        })),
         "a second arming replaces the first rather than accumulating"
     );
 
     // Disabled clears it, rather than arming a query with mode 0.
     arm(&mut acc, 0x20, 0);
     assert_eq!(
-        acc.visibility, None,
+        acc.visibility.resolved(),
+        Ok(None),
         "MTLVisibilityResultModeDisabled disarms; it is not a third mode"
+    );
+
+    // Preserve all 64 wire bits. Narrowing this value before validation used
+    // to turn it into Disabled and silently disarm a query the guest did not
+    // ask to disarm.
+    let invalid = (1u64 << 32) | 1;
+    arm(&mut acc, 0x40, invalid);
+    assert_eq!(
+        acc.visibility.resolved(),
+        Err(VisibilityStateRefusal { raw: invalid })
+    );
+    assert!(matches!(
+        acc.bind_snapshot(),
+        Err(StreamRefusal::Visibility(VisibilityStateRefusal { raw })) if raw == invalid
+    ));
+
+    // A later valid setter replaces only this sticky field and makes snapshots
+    // executable again.
+    arm(&mut acc, 0x48, 2);
+    assert_eq!(
+        acc.bind_snapshot().unwrap().visibility,
+        Some(crate::runtime::draw::VisibilityArming {
+            mode: reims_vgpu_protocol::VisibilityResultMode::Counting,
+            offset: 0x48,
+        })
     );
 }
 
@@ -4912,15 +5150,15 @@ fn an_armed_visibility_query_and_its_buffer_both_reach_the_accumulator() {
 /// single-offset fixture.
 #[test]
 fn a_visibility_count_lands_at_the_guest_offset_the_pass_named() {
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER, RESOURCE_PAGE_SHIFT,
     };
     use crate::runtime::gva_mem;
     use crate::runtime::host::HostMemory;
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
 
     // A task with a one-level page directory, the same shape the ICB fixtures
     // build: without it no GVA resolves and the writeback would refuse for a
@@ -5061,7 +5299,7 @@ fn a_render_encoder_fence_reaches_the_shared_fence_object() {
     stream[4] = SEGMENT_TYPE_RENDER;
     stream.extend_from_slice(&records);
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -5095,11 +5333,11 @@ fn a_render_encoder_fence_reaches_the_shared_fence_object() {
 /// without restoring the seed leaves the original bug.
 #[test]
 fn a_clear_seeds_the_pass_for_any_store_action_and_publishes_only_for_store() {
-    use crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE;
     use crate::runtime::decode::render::{
         PASS_ATTACH_LOAD_ACTION, PASS_ATTACH_STORE_ACTION, PASS_ATTACH_TEXREF,
         PASS_COLOR_ATTACH_OFF,
     };
+    use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_DONT_CARE;
 
     let seeded = |store_action: u16| {
         let mut payload = vec![0u8; 0x400];
@@ -5118,7 +5356,7 @@ fn a_clear_seeds_the_pass_for_any_store_action_and_publishes_only_for_store() {
         st32(&mut cmd[4..], (OP_HEADER_LEN + payload.len()) as u32);
         cmd[OP_HEADER_LEN..].copy_from_slice(&payload);
 
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let host = FakeHost::new();
         let mut out = ExecResult::default();
         let mut acc = StreamAccum::default();

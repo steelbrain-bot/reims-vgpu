@@ -1,7 +1,7 @@
 //! Command-stream framing decoder (port of `host/utils/reims-vgpu-stream-decode`).
 
-use crate::contract::endian::ld32;
-use crate::contract::size_fits_u32;
+use reims_vgpu_core::endian::ld32;
+use reims_vgpu_protocol::size_fits_u32;
 
 // Segment types and header length from `reims-vgpu-wire` (observed serializer
 // surface). Re-exported so stream walkers share one path with the wire crate.
@@ -439,7 +439,7 @@ pub fn iter_segments(bytes: &[u8]) -> Result<Vec<Segment>, DecodeStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::endian::st32;
+    use reims_vgpu_core::endian::st32;
 
     /// The four chain routes are distinct, and each pair of flags selects its
     /// own. A collision would fold two populations into one bucket, which is

@@ -22,7 +22,7 @@
 //!     `bytes_per_image`); linear type-2/3 only
 //!   - zero `sliceCount`/`levelCount` are Metal no-ops
 //! - **Fences** `0x13c` update / `0x13d` wait: operations on the shared fence
-//!   object via [`crate::runtime::plan::event_sync`]; waits that are not yet satisfied are
+//!   object via [`reims_vgpu_core::synchronization`]; waits that are not yet satisfied are
 //!   soft-pending (do not block drain), matching the unified-memory in-order path
 //!
 //! Not executed (fail visibly / soft miss):
@@ -36,15 +36,11 @@
 //!   pyramid layout in the mapping.
 //! - 3D whole-surface with `sliceCount!=1`, non-zero slices, or IOSurface texture endpoint
 
-use crate::contract::pixel_format::{self, MTL_FORMAT_BGRA8_UNORM};
-use crate::model::DeviceState;
 use crate::observe::Decline;
 use crate::runtime::decode::blit::{self, BlitAspect, Command, CopyKind, Kind, Point};
 use crate::runtime::decode::resource::{
-    decode_buffer_descriptor, decode_iosurface_texture_descriptor, decode_texture_descriptor,
-    decode_texture_view_descriptor, texture_view_type_is_3d, texture_view_type_supported,
-    texture_view_type_uses_slices, Descriptor as ResourceDescriptor, ObjectKind,
-    TEXTURE_VIEW_MTL_TYPE_2D,
+    texture_view_type_is_3d, texture_view_type_supported, texture_view_type_uses_slices,
+    Descriptor as ResourceDescriptor, ObjectKind, TEXTURE_VIEW_MTL_TYPE_2D,
 };
 use crate::runtime::draw::{self, host_alloc_len};
 use crate::runtime::fence_exec::{self, FenceStatus};
@@ -54,7 +50,8 @@ use crate::runtime::mapper;
 use crate::runtime::mapper::RectStride;
 use crate::runtime::mapping_write;
 use crate::runtime::objects;
-use crate::runtime::plan::event_sync::{Domain as FenceDomain, FenceAction};
+use crate::runtime::Device;
+use reims_vgpu_core::pixel_format::{self, MTL_FORMAT_BGRA8_UNORM};
 use reims_vgpu_core::{
     BlitCompletion, BufferFillPattern, CommandExecution, ContentStamp, ExecutionOutput,
     ResolvedBlit, ResolvedBufferRange, ResolvedBufferToTextureBlit, ResolvedCommand,
@@ -64,6 +61,7 @@ use reims_vgpu_core::{
     ResolvedTextureLevelCopy, ResolvedTextureToBufferBlit, ResolvedTextureToTextureBlit,
     TextureExtent, TextureOrigin,
 };
+use reims_vgpu_core::{FenceAction, SynchronizationDomain as FenceDomain};
 use reims_vgpu_protocol::{ByteLength, GuestVirtualAddress, MappingId, ObjectTableRef};
 use reims_vgpu_wire::ops::blit as wire_blit;
 
@@ -321,7 +319,7 @@ impl LinearBuffer {
 }
 
 fn resolve_buffer<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     buffer_ref: u32,
@@ -329,15 +327,19 @@ fn resolve_buffer<M: HostMemory + HostOps>(
     if buffer_ref == 0 {
         return Err(br(BlitStatus::MissingResource, "buf_ref_zero"));
     }
-    let (_entry, bytes) =
-        objects::resolve_descriptor(state, host, task_id, buffer_ref, &[ObjectKind::Buffer])
-            .map_err(|rung| {
-                br(
-                    BlitStatus::MissingResource,
-                    crate::observe::ladder_slugs!("buf")(rung),
-                )
-            })?;
-    let Ok(buf) = decode_buffer_descriptor(&bytes) else {
+    let resource = objects::resolve_resource(state, host, task_id, buffer_ref).map_err(|rung| {
+        br(
+            BlitStatus::MissingResource,
+            crate::observe::ladder_slugs!("buf")(rung),
+        )
+    })?;
+    if resource.entry().kind != ObjectKind::Buffer {
+        return Err(br(
+            BlitStatus::MissingResource,
+            crate::observe::ladder_slug!("buf", wrong_type),
+        ));
+    }
+    let Ok(ResourceDescriptor::Buffer(buf)) = objects::decoded_resource(&resource) else {
         return Err(br(
             BlitStatus::MissingResource,
             crate::observe::ladder_slug!("buf", desc_decode),
@@ -346,7 +348,11 @@ fn resolve_buffer<M: HostMemory + HostOps>(
     let Some((gva, size)) = buf.backing_gva_size(state.page_shift) else {
         return Err(br(BlitStatus::MissingResource, "buf_no_backing"));
     };
-    let Some((resource, version)) = state.task_resources.content_stamp(task_id, buffer_ref) else {
+    let Some((resource, version)) = state
+        .task_objects
+        .resources
+        .content_stamp(task_id, buffer_ref)
+    else {
         return Err(br(BlitStatus::MissingResource, "buf_no_semantic_identity"));
     };
     Ok(LinearBuffer {
@@ -357,14 +363,25 @@ fn resolve_buffer<M: HostMemory + HostOps>(
 }
 
 fn resolve_texture_backing<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     texture_ref: u32,
     level: u16,
     slice: u16,
 ) -> Result<TextureBacking, BlitStatus> {
-    resolve_texture_backing_depth(state, host, task_id, texture_ref, level, slice, 0, true)
+    resolve_texture_backing_depth(
+        state,
+        host,
+        task_id,
+        TextureResolveRequest {
+            texture_ref,
+            level,
+            slice,
+            view_depth: 0,
+            settle_guest_bytes: true,
+        },
+    )
 }
 
 /// Resolve immutable texture storage without making its guest bytes current.
@@ -373,18 +390,29 @@ fn resolve_texture_backing<M: HostMemory + HostOps>(
 /// GPU copy and a guest-byte fallback. The latter must explicitly settle the
 /// endpoint before reading or partially overwriting it.
 fn resolve_texture_backing_unsettled<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     texture_ref: u32,
     level: u16,
     slice: u16,
 ) -> Result<TextureBacking, BlitStatus> {
-    resolve_texture_backing_depth(state, host, task_id, texture_ref, level, slice, 0, false)
+    resolve_texture_backing_depth(
+        state,
+        host,
+        task_id,
+        TextureResolveRequest {
+            texture_ref,
+            level,
+            slice,
+            view_depth: 0,
+            settle_guest_bytes: false,
+        },
+    )
 }
 
 fn resolve_texture_endpoint<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     texture_ref: u32,
@@ -392,7 +420,11 @@ fn resolve_texture_endpoint<M: HostMemory + HostOps>(
     slice: u16,
 ) -> Result<ResolvedTextureEndpoint, BlitStatus> {
     let backing = resolve_texture_backing(state, host, task_id, texture_ref, level, slice)?;
-    let Some((resource, version)) = state.task_resources.content_stamp(task_id, texture_ref) else {
+    let Some((resource, version)) = state
+        .task_objects
+        .resources
+        .content_stamp(task_id, texture_ref)
+    else {
         return Err(br(BlitStatus::MissingResource, "tex_no_semantic_identity"));
     };
     Ok(ResolvedTextureEndpoint {
@@ -402,7 +434,7 @@ fn resolve_texture_endpoint<M: HostMemory + HostOps>(
 }
 
 fn resolve_texture_endpoint_unsettled<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     texture_ref: u32,
@@ -411,7 +443,11 @@ fn resolve_texture_endpoint_unsettled<M: HostMemory + HostOps>(
 ) -> Result<ResolvedTextureEndpoint, BlitStatus> {
     let backing =
         resolve_texture_backing_unsettled(state, host, task_id, texture_ref, level, slice)?;
-    let Some((resource, version)) = state.task_resources.content_stamp(task_id, texture_ref) else {
+    let Some((resource, version)) = state
+        .task_objects
+        .resources
+        .content_stamp(task_id, texture_ref)
+    else {
         return Err(br(BlitStatus::MissingResource, "tex_no_semantic_identity"));
     };
     Ok(ResolvedTextureEndpoint {
@@ -421,7 +457,7 @@ fn resolve_texture_endpoint_unsettled<M: HostMemory + HostOps>(
 }
 
 fn resolve_texture_copy_batch<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     cmd: &Command,
@@ -494,7 +530,7 @@ fn resolve_texture_copy_batch<M: HostMemory + HostOps>(
 }
 
 fn resolve_buffer_to_texture_blit<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     cmd: &Command,
@@ -536,7 +572,7 @@ fn resolve_buffer_to_texture_blit<M: HostMemory + HostOps>(
 }
 
 fn resolve_texture_to_buffer_blit<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     cmd: &Command,
@@ -578,7 +614,7 @@ fn resolve_texture_to_buffer_blit<M: HostMemory + HostOps>(
 }
 
 fn resolve_texture_to_texture_blit<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     cmd: &Command,
@@ -631,24 +667,31 @@ fn resolve_texture_to_texture_blit<M: HostMemory + HostOps>(
     ))
 }
 
-fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    task_id: u32,
+#[derive(Clone, Copy)]
+struct TextureResolveRequest {
     texture_ref: u32,
     level: u16,
     slice: u16,
-    // How many texture-view hops deep this recursion is — **not** a texture's
-    // depth. It was spelled `depth`, and a local named `depth` further down held
-    // the level's plane count and shadowed it, so one word meant two unrelated
-    // things in one body and `LinearTextureLevel { depth }` took whichever was
-    // in scope at that line. Removing the local silently rebound that field to
-    // the view hop count, and only
-    // `whole_surface_0x13e_volume_rejects_multi_slice` noticed — by the refusal
-    // order changing, not by the field.
     view_depth: u32,
     settle_guest_bytes: bool,
+}
+
+fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
+    state: &mut Device,
+    host: &mut M,
+    task_id: u32,
+    request: TextureResolveRequest,
 ) -> Result<TextureBacking, BlitStatus> {
+    let TextureResolveRequest {
+        texture_ref,
+        level,
+        slice,
+        // How many texture-view hops deep this recursion is — **not** a texture's
+        // depth. Keeping it in this typed request prevents it from being confused
+        // with the level's declared depth.
+        view_depth,
+        settle_guest_bytes,
+    } = request;
     if texture_ref == 0 {
         return Err(br(BlitStatus::MissingResource, "tex_ref_zero"));
     }
@@ -709,12 +752,12 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
                 crate::observe::ladder_slugs!("tex")(rung),
             )
         })?;
-    let entry = resource.entry;
-    let bytes = resource.descriptor.as_ref();
+    let entry = resource.entry();
+    let bytes = resource.descriptor().as_ref();
 
     // Type-8 view → base texture (unswizzled; multi-level / array / non-2D allowed).
     if entry.kind == ObjectKind::TextureView {
-        let Ok(view) = decode_texture_view_descriptor(bytes) else {
+        let Ok(ResourceDescriptor::TextureView(view)) = objects::decoded_resource(&resource) else {
             return Err(br(
                 BlitStatus::MissingResource,
                 crate::observe::ladder_slug!("view", desc_decode),
@@ -803,11 +846,13 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
             state,
             host,
             task_id,
-            view.base_texture_ref,
-            abs_level as u16,
-            abs_slice as u16,
-            view_depth + 1,
-            settle_guest_bytes,
+            TextureResolveRequest {
+                texture_ref: view.base_texture_ref,
+                level: abs_level as u16,
+                slice: abs_slice as u16,
+                view_depth: view_depth + 1,
+                settle_guest_bytes,
+            },
         )?;
         // Geometry constraints for non-2D types.
         match &backing {
@@ -860,39 +905,40 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         if level != 0 || slice != 0 {
             return Err(br(BlitStatus::Unsupported, "iosurface_level_slice"));
         }
-        let Ok(ResourceDescriptor::IOSurfaceTexture {
-            mapper_ref,
-            pixel_format: tex_fmt,
-            width: tex_w,
-            height: tex_h,
-            ..
-        }) = decode_iosurface_texture_descriptor(bytes)
+        let Ok(ResourceDescriptor::MapperIOSurfaceTextureView(view)) =
+            objects::decoded_resource(&resource)
         else {
             return Err(br(
                 BlitStatus::MissingResource,
                 crate::observe::ladder_slug!("iosurface", desc_decode),
             ));
         };
-        // The compatibility mapper registry is still keyed by the wire value;
-        // keep that adaptation here instead of teaching the semantic graph
-        // that a mapper reference is a page-table MappingId.
-        let mapping_id = mapper_ref.get();
-        if mapping_id == 0 || tex_w == 0 || tex_h == 0 {
+        let tex_w = view.declaration.width;
+        let tex_h = view.declaration.height;
+        let tex_fmt = view.declaration.pixel_format;
+        if tex_w == 0 || tex_h == 0 {
             return Err(br(BlitStatus::MissingResource, "iosurface_zero_geom"));
         }
         // Latch texture→mapping and refresh pages / device desc.
-        let _ = objects::resolve_iosurface_texture_ref(state, host, task_id, texture_ref);
+        let Some(mapping_id) =
+            objects::resolve_iosurface_texture_ref(state, host, task_id, texture_ref)
+        else {
+            return Err(br(
+                BlitStatus::MissingResource,
+                "iosurface_mapper_surface_unresolved",
+            ));
+        };
         let _ = mapper::ensure_resolved_for_scanout(state, host, mapping_id);
-        let Some(m) = state.mappings.get(&mapping_id) else {
+        let Some(m) = state.surfaces.mappings.get(&mapping_id) else {
             return Err(br(BlitStatus::MissingResource, "iosurface_no_mapping"));
         };
-        if !m.mapped || m.page_entries.is_empty() {
+        if !m.lifecycle.active || m.pages.entries.is_empty() {
             return Err(br(BlitStatus::MissingResource, "iosurface_unmapped"));
         }
         let format = if tex_fmt != 0 {
             tex_fmt
-        } else if m.format != 0 {
-            m.format
+        } else if m.format_or_zero() != 0 {
+            m.format_or_zero()
         } else {
             MTL_FORMAT_BGRA8_UNORM
         };
@@ -936,14 +982,15 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         if level != 0 || slice != 0 {
             return Err(br(BlitStatus::Unsupported, "t5_level_slice"));
         }
-        let Ok(t5) = reims_vgpu_wire::device_desc::iosurface_plane_view_header(bytes) else {
+        let Ok(ResourceDescriptor::IOSurfacePlaneView(t5)) = objects::decoded_resource(&resource)
+        else {
             return Err(br(BlitStatus::MissingResource, "t5_desc_short"));
         };
-        let sid = t5.surface_id.get();
+        let sid = t5.surface.get();
         if sid == 0 {
             return Err(br(BlitStatus::MissingResource, "t5_no_sid"));
         }
-        let Some(view) = objects::decode_iosurface_plane_view(bytes) else {
+        let Some(view) = t5.view else {
             // A short/zero-geom record fails closed — no fallback to base geom.
             // Capture why (len/tag/geom) deduped per sid so the exact blit-path
             // IOSurface plane view layout can be decoded without flooding.
@@ -954,10 +1001,10 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         // those id spaces collide). Resolve the backing, then the mapping.
         let _ = objects::ensure_surface_for_present(state, host, sid);
         let _ = mapper::ensure_resolved_for_scanout(state, host, sid);
-        let Some(m) = state.mappings.get(&sid) else {
+        let Some(m) = state.surfaces.mappings.get(&sid) else {
             return Err(br(BlitStatus::MissingResource, "t5_no_mapping"));
         };
-        if !m.mapped || m.page_entries.is_empty() {
+        if !m.lifecycle.active || m.pages.entries.is_empty() {
             return Err(br(BlitStatus::MissingResource, "t5_unmapped"));
         }
         let format = view.pixel_format;
@@ -1008,7 +1055,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
             crate::observe::ladder_slug!("tex", wrong_type),
         ));
     }
-    let Ok(tex) = decode_texture_descriptor(bytes) else {
+    let Ok(ResourceDescriptor::Texture(tex)) = objects::decoded_resource(&resource) else {
         return Err(br(
             BlitStatus::MissingResource,
             crate::observe::ladder_slug!("tex", desc_decode),
@@ -1125,7 +1172,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
     reason = "the row helper still names the plane geometry a row walk needs"
 )]
 fn read_texture_row<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     tex: &TextureBacking,
@@ -1220,7 +1267,7 @@ fn read_texture_row<M: HostMemory + HostOps>(
     reason = "the row helper still names the plane geometry a row walk needs"
 )]
 fn write_texture_row<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     tex: &TextureBacking,
@@ -1329,7 +1376,7 @@ fn write_texture_row<M: HostMemory + HostOps>(
     reason = "the rect helper names the same geometry its row counterpart does"
 )]
 fn read_texture_rect<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     tex: &TextureBacking,
@@ -1447,7 +1494,7 @@ fn linear_rect(
     reason = "the rect helper names the same geometry its row counterpart does"
 )]
 fn write_texture_rect<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     tex: &TextureBacking,
@@ -1562,7 +1609,7 @@ fn iosurface_rect_extent(
 ///
 /// The sampled rail and the blit rail consume the same wire form — an IOSurface texture
 /// IOSurface, named directly or through a IOSurface plane view view — and they resolve it
-/// completely differently. `draw::vulkan`'s sampled resolver runs a four-rung
+/// completely differently. `draw::execution`'s sampled resolver runs a four-rung
 /// ladder whose top rung is `iosurfacerung_resident`, the engine image, and a driven
 /// session puts 64-93 % of its binds there. This resolver has no ladder at all:
 /// it returns a [`IOSurfaceTextureBacking`] over the mapping's guest pages every time, and
@@ -1637,11 +1684,12 @@ fn note_t2t_shape(
 /// sitting in an engine resident behind an armed
 /// [`crate::runtime::writeback_debt::GvaWritebackDebt`], i.e. copies that read
 /// transfer backing the render never reached.
-fn note_blit_endpoint_debt(state: &DeviceState, task_id: u32, texture_ref: u32) {
-    if state.pending_writebacks.is_empty() {
+fn note_blit_endpoint_debt(state: &Device, task_id: u32, texture_ref: u32) {
+    if state.content.pending_writebacks.is_empty() {
         return;
     }
     if state
+        .content
         .pending_writebacks
         .has_gva(crate::runtime::writeback_debt::GvaResourceKey {
             task_id,
@@ -1652,8 +1700,7 @@ fn note_blit_endpoint_debt(state: &DeviceState, task_id: u32, texture_ref: u32) 
     }
 }
 
-fn note_blit_iosurface_resident(state: &DeviceState, mapping_id: u32) {
-    #[cfg(feature = "backend-vulkan")]
+fn note_blit_iosurface_resident(state: &Device, mapping_id: u32) {
     {
         // This census asks the engine a question, and asking takes the engine
         // lock — the same lock the draw rail holds while it encodes and submits.
@@ -1671,17 +1718,17 @@ fn note_blit_iosurface_resident(state: &DeviceState, mapping_id: u32) {
                 );
             }
         }
-        let Some(m) = state.mappings.get(&mapping_id) else {
+        let Some(m) = state.surfaces.mappings.get(&mapping_id) else {
             return;
         };
-        if !m.has_geom || m.width == 0 || m.height == 0 {
+        if !m.has_geometry() || m.width_or_zero() == 0 || m.height_or_zero() == 0 {
             crate::runtime::drain::note_store_route("blit_iosurface_resident_no_geom");
             return;
         }
-        let (w, h) = (m.width, m.height);
+        let (w, h) = (m.width_or_zero(), m.height_or_zero());
         let id = crate::runtime::present_identity::surface_identity(state, mapping_id, w, h);
         crate::runtime::drain::note_store_route(
-            match state.executor.resident_content_backing(&id) {
+            match state.executor.resident_read_plan(&id).backing {
                 reims_vgpu_core::ResidentContentBacking::NotReady => {
                     "blit_iosurface_resident_not_ready"
                 }
@@ -1689,8 +1736,6 @@ fn note_blit_iosurface_resident(state: &DeviceState, mapping_id: u32) {
             },
         );
     }
-    #[cfg(not(feature = "backend-vulkan"))]
-    let _ = (state, mapping_id);
 }
 
 fn range_fits(offset: u64, length: u64, size: u64) -> bool {
@@ -1729,7 +1774,7 @@ use gva_mem::dest_window;
     reason = "the window mirrors the copy extent the row loop walks"
 )]
 fn texture_region_window<M: HostMemory>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     tex: &TextureBacking,
@@ -1809,7 +1854,7 @@ fn strided_span(
 /// multiple of the pattern width would shift every byte after the first tile.
 fn write_fill_pattern<M: HostMemory + HostOps>(
     host: &mut M,
-    state: &mut DeviceState,
+    state: &mut Device,
     task_id: u32,
     gva: u64,
     length: u64,
@@ -1856,7 +1901,7 @@ fn write_fill_pattern<M: HostMemory + HostOps>(
 
 fn copy_bytes<M: HostMemory + HostOps>(
     host: &mut M,
-    state: &mut DeviceState,
+    state: &mut Device,
     task_id: u32,
     src_gva: u64,
     dst_gva: u64,
@@ -1883,7 +1928,7 @@ fn copy_bytes<M: HostMemory + HostOps>(
 /// destination's canonical content version as its completion fact. Ordering,
 /// submission identity and completion assembly remain core-owned.
 fn execute_resolved_blit<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     operation: ResolvedBlit,
@@ -1891,7 +1936,7 @@ fn execute_resolved_blit<M: HostMemory + HostOps>(
     let destination = operation.destination_content().resource;
     let context = crate::runtime::executor::context_for(state, task_id);
     let submission =
-        ResolvedSubmission::<(), ()>::single(context, ResolvedCommand::Blit(operation));
+        ResolvedSubmission::<(), ()>::single(context, ResolvedCommand::Blit(Box::new(operation)));
     let completion = reims_vgpu_core::execute_resolved_submission(
         submission,
         |()| -> Result<CommandExecution<()>, BlitStatus> { unreachable!() },
@@ -1939,7 +1984,11 @@ fn execute_resolved_blit<M: HostMemory + HostOps>(
                     }
                 }
             }?;
-            let Some(version) = state.task_resources.note_guest_write_by_id(destination) else {
+            let Some(version) = state
+                .task_objects
+                .resources
+                .note_guest_write_by_id(destination)
+            else {
                 return Err(br(
                     BlitStatus::MissingResource,
                     "blit_completion_resource_gone",
@@ -2003,15 +2052,16 @@ fn blit_write_destination(cmd: &Command) -> Option<u32> {
 }
 
 /// Apply the content transition named by a successful synchronous blit.
-fn complete_blit_write(state: &DeviceState, task_id: u32, cmd: &Command) -> BlitStatus {
+fn complete_blit_write(state: &Device, task_id: u32, cmd: &Command) -> BlitStatus {
     let Some(object_ref) = blit_write_destination(cmd) else {
         return BlitStatus::Ok;
     };
-    let Some(resource) = state.task_resources.identity(task_id, object_ref) else {
+    let Some(resource) = state.task_objects.resources.identity(task_id, object_ref) else {
         return br(BlitStatus::MissingResource, "blit_completion_resource_gone");
     };
     if state
-        .task_resources
+        .task_objects
+        .resources
         .note_guest_write_by_id(resource)
         .is_none()
     {
@@ -2032,7 +2082,7 @@ fn complete_blit_write(state: &DeviceState, task_id: u32, cmd: &Command) -> Blit
 )]
 fn copy_bytes_within<M: HostMemory + HostOps>(
     host: &mut M,
-    state: &mut DeviceState,
+    state: &mut Device,
     task_id: u32,
     src_gva: u64,
     dst_gva: u64,
@@ -2083,7 +2133,7 @@ fn copy_bytes_within<M: HostMemory + HostOps>(
 )]
 fn copy_row_region<M: HostMemory + HostOps>(
     host: &mut M,
-    state: &mut DeviceState,
+    state: &mut Device,
     task_id: u32,
     src_base: u64,
     src_row_stride: u64,
@@ -2192,7 +2242,7 @@ fn copy_row_region<M: HostMemory + HostOps>(
 }
 
 fn exec_fill_buffer<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     cmd: &Command,
@@ -2247,7 +2297,7 @@ fn exec_fill_buffer<M: HostMemory + HostOps>(
 /// healthy zero, and a non-zero reading is the measured argument for going and
 /// deriving the phase rule.
 fn exec_fill_buffer_pattern4<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     cmd: &Command,
@@ -2278,7 +2328,7 @@ fn exec_fill_buffer_pattern4<M: HostMemory + HostOps>(
 }
 
 fn exec_copy_buffer_to_buffer<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     cmd: &Command,
@@ -2419,7 +2469,7 @@ fn texture_storage_bpp(format: u16) -> Result<u32, BlitStatus> {
     reason = "the row helper keeps packed texture coordinates and format explicit"
 )]
 fn read_texture_storage_row<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     tex: &TextureBacking,
@@ -2464,7 +2514,7 @@ fn read_texture_storage_row<M: HostMemory + HostOps>(
     reason = "the row helper keeps packed texture coordinates and format explicit"
 )]
 fn write_texture_storage_row<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     tex: &TextureBacking,
@@ -2506,7 +2556,7 @@ fn write_texture_storage_row<M: HostMemory + HostOps>(
     reason = "the blit executor mirrors the decoded buffer, texture, and aspect fields"
 )]
 fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     buf_base_gva: u64,
@@ -2760,7 +2810,7 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
 }
 
 fn execute_resolved_buffer_to_texture<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     operation: ResolvedBufferToTextureBlit,
@@ -2927,7 +2977,7 @@ fn execute_resolved_buffer_to_texture<M: HostMemory + HostOps>(
     }
     // `None` for the IOSurface texture destination this arm is for, which the mapping rail
     // authorises instead; a linear destination reaching here is still bounded.
-    let allowed = match texture_region_window(
+    let allowed = texture_region_window(
         state,
         host,
         task_id,
@@ -2941,10 +2991,7 @@ fn execute_resolved_buffer_to_texture<M: HostMemory + HostOps>(
         copy_h,
         copy_d,
         copy_bpp,
-    ) {
-        Ok(v) => v,
-        Err(st) => return Err(st),
-    };
+    )?;
     let mut row = vec![0u8; row_bytes as usize];
     for z in 0..copy_d {
         for y in 0..copy_h {
@@ -2968,7 +3015,7 @@ fn execute_resolved_buffer_to_texture<M: HostMemory + HostOps>(
             {
                 return Err(br(BlitStatus::GuestIo, "b2t_iosurface_read_io"));
             }
-            if let Err(st) = write_texture_row(
+            write_texture_row(
                 state,
                 host,
                 task_id,
@@ -2982,16 +3029,14 @@ fn execute_resolved_buffer_to_texture<M: HostMemory + HostOps>(
                 row_bytes,
                 &row,
                 allowed.as_ref(),
-            ) {
-                return Err(st);
-            }
+            )?;
         }
     }
     Ok(())
 }
 
 fn execute_resolved_texture_to_buffer<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     operation: ResolvedTextureToBufferBlit,
@@ -3150,7 +3195,7 @@ fn execute_resolved_texture_to_buffer<M: HostMemory + HostOps>(
     let mut row = vec![0u8; row_bytes as usize];
     for z in 0..copy_d {
         for y in 0..copy_h {
-            if let Err(st) = read_texture_row(
+            read_texture_row(
                 state,
                 host,
                 task_id,
@@ -3163,9 +3208,7 @@ fn execute_resolved_texture_to_buffer<M: HostMemory + HostOps>(
                 y,
                 row_bytes,
                 &mut row,
-            ) {
-                return Err(st);
-            }
+            )?;
             let d = match dst_base
                 .checked_add(z.saturating_mul(dst_bpi))
                 .and_then(|b| b.checked_add(y.saturating_mul(dst_bpr)))
@@ -3196,7 +3239,7 @@ fn execute_resolved_texture_to_buffer<M: HostMemory + HostOps>(
 }
 
 fn execute_resolved_texture_to_texture<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     operation: ResolvedTextureToTextureBlit,
@@ -3663,7 +3706,6 @@ fn execute_resolved_texture_to_texture<M: HostMemory + HostOps>(
             (true, false) => "blit_t2t_iosurface_dst_partial",
             (false, _) => "blit_t2t_iosurface_src_partial",
         });
-        #[cfg(feature = "backend-vulkan")]
         if whole_src && whole_dst {
             if let (TextureBacking::Surface(s), TextureBacking::Linear(d)) = (&src, &dst) {
                 if let Some(status) = try_copy_iosurface_plane_to_linear_on_gpu(
@@ -3738,7 +3780,6 @@ fn execute_resolved_texture_to_texture<M: HostMemory + HostOps>(
 /// A [`TextureBacking`] says where a texture's *guest bytes* are, which is the
 /// question every other consumer in this module asks. This is the other one:
 /// which plane of which surface a GPU-side copy would land in.
-#[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct GpuPlane {
     width: u32,
@@ -3755,7 +3796,6 @@ struct GpuPlane {
 ///
 /// The two are independent derivations of one plane and the whole safety of the
 /// GPU arm is that they agree. See [`mapping_write::resident_gpu_plane`].
-#[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct GpuMappingWindow {
     surface_offset: u64,
@@ -3765,7 +3805,6 @@ struct GpuMappingWindow {
 
 /// The source's real content, as the engine holds it behind an armed
 /// [`crate::runtime::writeback_debt::GvaWritebackDebt`].
-#[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct GpuResidentSource {
     width: u32,
@@ -3784,7 +3823,6 @@ struct GpuResidentSource {
 /// form: its origins are (0,0,0) and its extent is the endpoints' full
 /// width/height by construction of the opcode, so a rect check here would be an
 /// arm no guest command can take.
-#[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GpuPlaneRefusal {
     /// More than one level or slice: the GPU arm copies one plane.
@@ -3814,7 +3852,6 @@ enum GpuPlaneRefusal {
 }
 
 impl GpuPlaneRefusal {
-    #[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
     fn route(self) -> &'static str {
         match self {
             Self::MultiLevel => "sl_gpu_multi_level",
@@ -3834,7 +3871,6 @@ impl GpuPlaneRefusal {
 /// Split from [`gpu_whole_plane_destination`] because resolving the destination
 /// is the expensive half and it is also the half with the side effect: it pays
 /// the destination's own debt. This decides whether that is worth doing.
-#[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
 fn gpu_whole_plane_admissible(
     level_count: u16,
     slice_count: u16,
@@ -3860,7 +3896,6 @@ fn gpu_whole_plane_admissible(
 /// `dst` is `None` for a linear endpoint and `window` is `None` when the mapping
 /// declines the extent, so the two `Option`s are the caller's two resolution
 /// steps and not defensive wrapping.
-#[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
 fn gpu_whole_plane_destination(
     dst: Option<GpuPlane>,
     window: Option<GpuMappingWindow>,
@@ -3904,10 +3939,10 @@ fn gpu_whole_plane_destination(
     // reads 81/81/80 and equality calls that a disagreement forever. A `None`
     // still refuses — a format with no byte-copy layout is one where the copy
     // would have to convert, which this arm does not do.
-    let texel = crate::contract::pixel_format::store_texel_order(dst.pixel_format);
+    let texel = reims_vgpu_core::pixel_format::store_texel_order(dst.pixel_format);
     if texel.is_none()
-        || crate::contract::pixel_format::store_texel_order(src.pixel_format) != texel
-        || crate::contract::pixel_format::store_texel_order(window.pixel_format) != texel
+        || reims_vgpu_core::pixel_format::store_texel_order(src.pixel_format) != texel
+        || reims_vgpu_core::pixel_format::store_texel_order(window.pixel_format) != texel
     {
         return Err(GpuPlaneRefusal::FormatDiffers);
     }
@@ -3945,23 +3980,33 @@ fn gpu_whole_plane_destination(
 /// Returns `None` for every fall-through, having named it on a counter. The
 /// caller then runs the host path unchanged, so nothing here can lose a frame —
 /// only spend one.
-#[cfg(feature = "backend-vulkan")]
-fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    task_id: u32,
+struct WholePlaneGpuCopy<'a> {
     source_object: ObjectTableRef<reims_vgpu_protocol::ResourceObject>,
     destination_object: ObjectTableRef<reims_vgpu_protocol::ResourceObject>,
     level_count: u16,
     slice_count: u16,
-    destination: &TextureBacking,
+    destination: &'a TextureBacking,
+}
+
+fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
+    state: &mut Device,
+    host: &mut M,
+    task_id: u32,
+    copy: WholePlaneGpuCopy<'_>,
 ) -> Option<BlitStatus> {
     use crate::runtime::drain::note_store_route;
+    let WholePlaneGpuCopy {
+        source_object,
+        destination_object,
+        level_count,
+        slice_count,
+        destination,
+    } = copy;
     let key = crate::runtime::writeback_debt::GvaResourceKey {
         task_id,
         texture_ref: source_object.get(),
     };
-    let debt = state.pending_writebacks.get_gva(key);
+    let debt = state.content.pending_writebacks.get_gva(key);
     if let Err(refusal) = gpu_whole_plane_admissible(
         level_count,
         slice_count,
@@ -3986,6 +4031,7 @@ fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
     };
     let mapping_id = t.mapping_id.get();
     let window = state
+        .surfaces
         .mappings
         .get(&mapping_id)
         .and_then(|m| mapping_write::resident_gpu_plane(m, plane.width, plane.height))
@@ -4055,25 +4101,6 @@ fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
     }
 }
 
-/// [`try_copy_whole_plane_on_gpu`] on an arm with no Vulkan engine.
-///
-/// A GVA debt is only ever armed by `draw::vulkan`, so this arm's ledger holds
-/// none and the fast path would refuse `SrcNotResident` on every record. It is
-/// spelled as a fall-through rather than as a `cfg` at the call site so the
-#[cfg(not(feature = "backend-vulkan"))]
-fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
-    _state: &mut DeviceState,
-    _host: &mut M,
-    _task_id: u32,
-    _source_object: ObjectTableRef<reims_vgpu_protocol::ResourceObject>,
-    _destination_object: ObjectTableRef<reims_vgpu_protocol::ResourceObject>,
-    _level_count: u16,
-    _slice_count: u16,
-    _destination: &TextureBacking,
-) -> Option<BlitStatus> {
-    None
-}
-
 /// Why one whole-plane IOSurface texture to guest-linear copy is not the GPU arm's, for
 /// the terms that can be decided from the two endpoints alone.
 ///
@@ -4082,7 +4109,6 @@ fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
 /// with `t2t_gpu_src_not_resident`, `t2t_gpu_dst_unbounded`,
 /// `t2t_gpu_engine_declined` and `t2t_gpu_landed` they partition
 /// `blit_t2t_iosurface_whole_plane`, so a census that does not add up is the bug.
-#[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum T2tGvaRefusal {
     /// The source names no mapping this device holds, or one that has not
@@ -4106,7 +4132,6 @@ enum T2tGvaRefusal {
     DstExtentOob,
 }
 
-#[cfg(feature = "backend-vulkan")]
 impl T2tGvaRefusal {
     fn route(&self) -> &'static str {
         match self {
@@ -4127,7 +4152,6 @@ impl T2tGvaRefusal {
 /// the engine anything or walks the guest's page table, which is also everything
 /// about it that a test can reach without a GPU. `surface` is the mapping's own
 /// declared geometry and `None` when it has none.
-#[cfg(feature = "backend-vulkan")]
 fn gpu_t2t_gva_plane(
     surface: Option<(u32, u32)>,
     src: &IOSurfaceTextureBacking,
@@ -4209,9 +4233,8 @@ fn gpu_t2t_gva_plane(
 /// Returns `None` for every fall-through, having named it on a counter. The
 /// caller then runs the host path unchanged, so nothing here can lose a frame —
 /// only spend one.
-#[cfg(feature = "backend-vulkan")]
 fn try_copy_iosurface_plane_to_linear_on_gpu<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     destination_ref: u32,
@@ -4220,10 +4243,11 @@ fn try_copy_iosurface_plane_to_linear_on_gpu<M: HostMemory + HostOps>(
 ) -> Option<BlitStatus> {
     use crate::runtime::drain::note_store_route;
     let surface = state
+        .surfaces
         .mappings
         .get(&src.mapping_id.get())
-        .filter(|m| m.has_geom)
-        .map(|m| (m.width, m.height));
+        .filter(|m| m.has_geometry())
+        .map(|m| (m.width_or_zero(), m.height_or_zero()));
     let (plane, geometry) = match gpu_t2t_gva_plane(surface, src, dst, destination_ref) {
         Ok(v) => v,
         Err(refusal) => {
@@ -4238,7 +4262,7 @@ fn try_copy_iosurface_plane_to_linear_on_gpu<M: HostMemory + HostOps>(
         src.height,
     );
     if matches!(
-        state.executor.resident_content_backing(&identity),
+        state.executor.resident_read_plan(&identity).backing,
         reims_vgpu_core::ResidentContentBacking::NotReady
     ) {
         // The source's bytes are its guest pages' bytes already, so the host
@@ -4291,7 +4315,7 @@ fn try_copy_iosurface_plane_to_linear_on_gpu<M: HostMemory + HostOps>(
 
 /// Execute one non-empty, fully resolved multi-slice/multi-level copy.
 fn execute_resolved_texture_copy_batch<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     operation: ResolvedTextureCopyBatch,
@@ -4317,11 +4341,13 @@ fn execute_resolved_texture_copy_batch<M: HostMemory + HostOps>(
         state,
         host,
         task_id,
-        source_object,
-        destination_object,
-        level_count,
-        slice_count,
-        &first_level.first_slice.1.backing,
+        WholePlaneGpuCopy {
+            source_object,
+            destination_object,
+            level_count,
+            slice_count,
+            destination: &first_level.first_slice.1.backing,
+        },
     ) {
         return status;
     }
@@ -4524,7 +4550,7 @@ fn execute_resolved_texture_copy_batch<M: HostMemory + HostOps>(
 /// Execute blit fence update (`0x13c`) or wait (`0x13d`) on the named fence object.
 ///
 /// See [`fence_exec::execute_fence`].
-pub fn execute_blit_fence(state: &mut DeviceState, task_id: u32, cmd: &Command) -> BlitStatus {
+pub fn execute_blit_fence(state: &mut Device, task_id: u32, cmd: &Command) -> BlitStatus {
     clear_blit_fail_reason();
     if cmd.kind != Kind::Fence {
         return br(BlitStatus::Unsupported, "fence_wrong_kind");
@@ -4572,7 +4598,7 @@ pub(crate) fn blit_status_from_fence(status: FenceStatus) -> BlitStatus {
 /// Each arm resolved its own destination in order to write it, so a second
 /// resolve afterwards only repeats the page walk.
 pub fn execute_blit<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     cmd: &Command,

@@ -1,6 +1,7 @@
 //! Opaque ownership contracts for executor-local residents.
 
 use reims_vgpu_protocol::StorageImageFormat;
+use std::collections::BTreeMap;
 
 /// Whether a retained guest-memory gather is licensed for identity reuse.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -166,6 +167,48 @@ impl ComputeStorageResidencyKey {
     }
 }
 
+/// Semantic generations of compute-resident subresources.
+///
+/// This ledger states which executor generation still represents the current
+/// guest-visible content. It does not own the native resident: the executor
+/// answers that independently through [`ComputeResidencyService`]. Keeping the
+/// two facts separate makes a lost native resident a typed execution outcome
+/// without turning backend availability into content authority.
+#[derive(Debug, Default)]
+pub struct ComputeResidencyLedger {
+    generations: BTreeMap<ComputeStorageResidencyKey, u32>,
+}
+
+impl ComputeResidencyLedger {
+    pub fn generation(&self, key: &ComputeStorageResidencyKey) -> Option<u32> {
+        self.generations.get(key).copied()
+    }
+
+    pub fn publish(&mut self, key: ComputeStorageResidencyKey, generation: u32) {
+        self.generations.insert(key, generation);
+    }
+
+    pub fn invalidate_surface_window(&mut self, mapping_id: u32, lo: u64, hi: u64) {
+        self.generations.retain(|key, _| {
+            key.surface_window().is_none_or(|(candidate, start, end)| {
+                candidate != mapping_id || end <= lo || start >= hi
+            })
+        });
+    }
+
+    pub fn len(&self) -> usize {
+        self.generations.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.generations.is_empty()
+    }
+
+    pub fn contains(&self, key: &ComputeStorageResidencyKey) -> bool {
+        self.generations.contains_key(key)
+    }
+}
+
 /// Persistent compute-image residency service.
 pub trait ComputeResidencyService: std::fmt::Debug + Send + Sync {
     fn compute_resident_storage_generation(
@@ -198,7 +241,7 @@ pub enum ResidentContentBacking {
 
 #[cfg(test)]
 mod tests {
-    use super::{ComputeStorageOrigin, ComputeStorageResidencyKey};
+    use super::{ComputeResidencyLedger, ComputeStorageOrigin, ComputeStorageResidencyKey};
 
     #[test]
     fn compute_residency_origins_are_disjoint_typed_identities() {
@@ -215,5 +258,22 @@ mod tests {
         assert_eq!(surface.surface_window(), Some((7, 0, 4096)));
         assert_eq!(linear.resource_ref(), Some(2));
         assert!(heap.is_heap());
+    }
+
+    #[test]
+    fn residency_invalidation_retires_only_intersecting_surface_windows() {
+        let hit = ComputeStorageResidencyKey::surface(7, 1, 0, 16, 64, 4, 4, 0x50);
+        let sibling = ComputeStorageResidencyKey::surface(7, 1, 128, 16, 192, 4, 4, 0x50);
+        let heap = ComputeStorageResidencyKey::heap(1, 2, 4, 4, 0x50);
+        let mut ledger = ComputeResidencyLedger::default();
+        ledger.publish(hit, 3);
+        ledger.publish(sibling, 4);
+        ledger.publish(heap, 5);
+
+        ledger.invalidate_surface_window(7, 32, 96);
+
+        assert_eq!(ledger.generation(&hit), None);
+        assert_eq!(ledger.generation(&sibling), Some(4));
+        assert_eq!(ledger.generation(&heap), Some(5));
     }
 }

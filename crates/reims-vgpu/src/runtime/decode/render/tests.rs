@@ -20,7 +20,7 @@ fn every_render_decode_failure_names_its_own_check() {
     assert_eq!(slugs.len(), n, "two render decode checks share a slug");
 }
 use super::*;
-use crate::contract::endian::st32;
+use reims_vgpu_core::endian::st32;
 
 fn hdr(op: u32, len: usize) -> Vec<u8> {
     let mut v = vec![0u8; len];
@@ -102,7 +102,7 @@ fn a_compact_draw_of_the_wrong_length_is_refused_not_guessed() {
 /// `(Triangle, start 0x11111, count 0x22222)`.
 #[test]
 fn the_wide_draw_form_decodes_with_the_compact_forms_field_order() {
-    use crate::contract::endian::st64;
+    use reims_vgpu_core::endian::st64;
 
     let mut v = hdr(wire::OPCODE_DRAW_WIDE, wire::DRAW_WIDE_TOTAL_LEN as usize);
     st32(&mut v[8..], 3); // primitiveType, 32-bit and FIRST
@@ -135,7 +135,7 @@ fn the_wide_draw_form_decodes_with_the_compact_forms_field_order() {
 /// this decoder's named refusals exist to prevent.
 #[test]
 fn a_wide_count_that_cannot_fit_the_commands_field_is_refused_not_truncated() {
-    use crate::contract::endian::st64;
+    use reims_vgpu_core::endian::st64;
 
     let mut v = hdr(wire::OPCODE_DRAW_WIDE, wire::DRAW_WIDE_TOTAL_LEN as usize);
     st32(&mut v[8..], 3);
@@ -160,7 +160,7 @@ fn a_wide_count_that_cannot_fit_the_commands_field_is_refused_not_truncated() {
 /// without [`wire_instance_count`] fails here rather than in a boot.
 #[test]
 fn no_decoded_draw_leaves_a_zero_instance_count() {
-    use crate::contract::endian::st16;
+    use reims_vgpu_core::endian::st16;
 
     // The two compact instanced forms, each with the wire carrying zero.
     let mut inst = hdr(
@@ -204,7 +204,7 @@ fn no_decoded_draw_leaves_a_zero_instance_count() {
 /// crate's `render_draw_indexed_uint32` fixture is the same capture.
 #[test]
 fn a_compact_indexed_draw_reads_its_index_type_from_the_wire() {
-    use crate::contract::endian::st16;
+    use reims_vgpu_core::endian::st16;
 
     let mut v = hdr(
         wire::OPCODE_DRAW_INDEXED,
@@ -334,7 +334,7 @@ fn no_draw_opcode_falls_through_to_the_accepted_catch_all() {
 /// selector was decoded at all.
 #[test]
 fn a_base_instance_draw_carries_its_base_instance() {
-    use crate::contract::endian::st16;
+    use reims_vgpu_core::endian::st16;
 
     let mut v = hdr(
         wire::OPCODE_DRAW_INSTANCED_BASE,
@@ -363,7 +363,7 @@ fn a_base_instance_draw_carries_its_base_instance() {
 /// small negative offset must not read as an index near 65535.
 #[test]
 fn the_full_indexed_draw_puts_its_offset_before_its_count_and_signs_its_base_vertex() {
-    use crate::contract::endian::st16;
+    use reims_vgpu_core::endian::st16;
 
     let mut v = hdr(
         wire::OPCODE_DRAW_INDEXED_INSTANCED_BASE,
@@ -396,7 +396,7 @@ fn the_full_indexed_draw_puts_its_offset_before_its_count_and_signs_its_base_ver
 /// 64 bits rather than truncated to 16.
 #[test]
 fn the_wide_full_indexed_draw_sign_extends_its_base_vertex() {
-    use crate::contract::endian::{st16, st64};
+    use reims_vgpu_core::endian::{st16, st64};
 
     let mut v = hdr(
         wire::OPCODE_DRAW_INDEXED_INSTANCED_BASE_WIDE,
@@ -421,7 +421,7 @@ fn the_wide_full_indexed_draw_sign_extends_its_base_vertex() {
 
 #[test]
 fn wide_indexed_draw_layout() {
-    use crate::contract::endian::st16;
+    use reims_vgpu_core::endian::st16;
 
     let mut v = hdr(wire::OPCODE_DRAW_INDEXED_WIDE, 0x20);
     st16(&mut v[8..], 3); // triangle
@@ -442,7 +442,7 @@ fn wide_indexed_draw_layout() {
 
 #[test]
 fn execute_commands_range_and_indirect() {
-    use crate::contract::endian::st64;
+    use reims_vgpu_core::endian::st64;
     // 0x15 withRange: ref + unaligned location/length
     let mut v = hdr(wire::OPCODE_EXECUTE_COMMANDS_RANGE, EXECUTE_RANGE_CMD_LEN);
     st32(&mut v[8..], 0x3333);
@@ -471,8 +471,8 @@ fn execute_commands_range_and_indirect() {
 
 #[test]
 fn depth_and_stencil_pass_slots() {
-    use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::pass_action::{MTL_LOAD_ACTION_CLEAR, MTL_STORE_ACTION_STORE};
+    use reims_vgpu_core::endian::{st16, st32, st64};
+    use reims_vgpu_protocol::pass_action::{MTL_LOAD_ACTION_CLEAR, MTL_STORE_ACTION_STORE};
     let mut payload = vec![0u8; PASS_MIN_PAYLOAD];
     // depth @0
     st32(
@@ -519,7 +519,7 @@ fn depth_and_stencil_pass_slots() {
 /// long, so the old guard rejected it and returned a defaulted attachment.
 #[test]
 fn depth_and_stencil_records_end_where_the_next_section_begins() {
-    use crate::contract::endian::{st32, st64};
+    use reims_vgpu_core::endian::{st32, st64};
     let mut payload = vec![0u8; PASS_COLOR_ATTACH_OFF];
     st32(
         &mut payload[PASS_DEPTH_ATTACH_OFF + PASS_ATTACH_TEXREF..],
@@ -831,7 +831,7 @@ fn a_bind_record_never_decodes_to_zero_entries() {
 /// than assumed from the family.
 #[test]
 fn each_unapplied_state_decodes_at_its_own_width() {
-    use crate::contract::endian::{st32, st64};
+    use reims_vgpu_core::endian::{st32, st64};
     use reims_vgpu_wire::ops::render as wire;
 
     for (op, wire_op) in [
@@ -937,7 +937,7 @@ fn each_unapplied_state_decodes_at_its_own_width() {
 /// both are asserted.
 #[test]
 fn a_vertex_bind_with_an_attribute_stride_binds_the_buffer_rather_than_being_refused() {
-    use crate::contract::endian::{st32, st64};
+    use reims_vgpu_core::endian::{st32, st64};
     use reims_vgpu_wire::ops::render as wire;
 
     for (op, wire_op) in [
@@ -1039,7 +1039,7 @@ fn a_vertex_bind_with_an_attribute_stride_binds_the_buffer_rather_than_being_ref
 /// unequal and this test asserts on both.
 #[test]
 fn vertex_amplification_decodes_at_the_widths_the_serializer_wrote() {
-    use crate::contract::endian::st32;
+    use reims_vgpu_core::endian::st32;
     use reims_vgpu_wire::ops::render as wire;
 
     for (op, wire_op) in [
@@ -1263,7 +1263,7 @@ fn a_colour_attachments_level_does_not_swallow_its_slice() {
 /// one colour slot, and Apple's own record is 584 bytes.
 #[test]
 fn the_render_pass_tail_is_read_only_when_the_record_carries_one() {
-    use crate::contract::endian::st64;
+    use reims_vgpu_core::endian::st64;
     let full = OP_HEADER_LEN + PASS_TAIL_OFF + 0x1c;
     let mut cmd = vec![0u8; full];
     st32(&mut cmd[0..], wire_pass::OPCODE_RENDER_PASS);
@@ -1342,7 +1342,7 @@ fn every_pass_property_record_reaches_an_arm_of_its_own() {
 
 #[test]
 fn the_store_action_options_are_not_wider_store_actions() {
-    use crate::contract::endian::{st32, st64};
+    use reims_vgpu_core::endian::{st32, st64};
     use reims_vgpu_wire::ops::render as wire;
 
     for (op, wire_op) in [
@@ -1474,7 +1474,7 @@ fn the_store_action_options_are_not_wider_store_actions() {
 /// low half of its 64-bit offset as a count.
 #[test]
 fn a_tile_record_is_decoded_rather_than_accepted_without_a_claim() {
-    use crate::contract::endian::{st32, st64};
+    use reims_vgpu_core::endian::{st32, st64};
     use reims_vgpu_wire::ops::tile as wire_tile;
 
     // The local constants and the serializer's, held together so neither
@@ -1692,7 +1692,7 @@ fn a_tile_record_is_decoded_rather_than_accepted_without_a_claim() {
 /// `reims_vgpu_wire::ops::render`'s, pinned by fixtures.
 #[test]
 fn an_indirect_draw_is_decoded_rather_than_accepted_without_a_claim() {
-    use crate::contract::endian::{st16, st32, st64};
+    use reims_vgpu_core::endian::{st16, st32, st64};
     use reims_vgpu_wire::ops::render as wire;
 
     for (op, wire_op) in [
@@ -1800,7 +1800,7 @@ fn an_indirect_draw_is_decoded_rather_than_accepted_without_a_claim() {
 /// is `x` taken from the high half of the count.
 #[test]
 fn a_plural_viewport_or_scissor_is_the_singular_record_behind_its_own_count() {
-    use crate::contract::endian::{st32, st64};
+    use reims_vgpu_core::endian::{st32, st64};
     use reims_vgpu_wire::ops::render as wire;
 
     assert_eq!(
@@ -1907,7 +1907,7 @@ fn a_plural_viewport_or_scissor_is_the_singular_record_behind_its_own_count() {
 /// clamp for the next slot's sampler.
 #[test]
 fn a_sampler_bind_with_lod_clamps_is_still_a_sampler_bind() {
-    use crate::contract::endian::st32;
+    use reims_vgpu_core::endian::st32;
     use reims_vgpu_wire::ops::render as wire;
 
     assert_eq!(

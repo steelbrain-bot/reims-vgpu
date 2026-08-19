@@ -1,6 +1,11 @@
 //! Semantic resource namespace entries.
 
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
 use core::fmt;
+
+use crate::{ObjectTableRef, ResourceObject, TaskId};
 
 /// Number of color attachments carried by one render pass and pipeline.
 ///
@@ -59,6 +64,618 @@ pub struct PipelineColorAttachment {
     pub op_alpha: u32,
     /// Channels written independently of whether blending is enabled.
     pub write_mask: ColorWriteMask,
+}
+
+/// One vertex attribute and its buffer-layout state from a render pipeline.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VertexAttribute {
+    pub location: u32,
+    pub format: u32,
+    pub offset: u32,
+    pub buffer_index: u32,
+    pub stride: u32,
+    /// `MTLVertexStepFunction` ordinal stated by the layout, when present.
+    pub declared_step_function: Option<u32>,
+    /// `MTLVertexBufferLayoutDescriptor.stepRate` stated by the layout.
+    pub declared_step_rate: Option<u32>,
+}
+
+impl VertexAttribute {
+    /// Metal defaults an omitted step rate to one; a stated zero remains zero.
+    pub fn step_rate(&self) -> u32 {
+        self.declared_step_rate.unwrap_or(1)
+    }
+
+    /// Return the stated step function or the context-specific Metal default.
+    pub fn step_function_ordinal(&self, when_absent: u32) -> u32 {
+        self.declared_step_function.unwrap_or(when_absent)
+    }
+}
+
+/// Immutable semantic declaration of a render-pipeline object.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RenderPipelineDescriptor {
+    pub object_id: u32,
+    pub serialized_payload_len: u32,
+    pub vertex_func_ref: u32,
+    pub fragment_func_ref: u32,
+    pub object_func_ref: u32,
+    pub mesh_func_ref: u32,
+    pub color_attachment_offset: u32,
+    pub has_color_attachment_offset: bool,
+    pub vertex_descriptor_offset: u32,
+    pub has_vertex_descriptor_offset: bool,
+    pub raster_sample_count: u32,
+    pub max_tessellation_factor: u32,
+    pub tessellation_factor_step_function: u32,
+    pub tessellation_output_winding_order: u32,
+    pub vertex_attributes: Vec<VertexAttribute>,
+    pub color0: PipelineColorAttachment,
+    pub color_attachments: Vec<PipelineColorAttachment>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ComputeStageInputAttribute {
+    pub raw_bits: u32,
+    pub location: u32,
+    pub format: u32,
+    pub offset: u32,
+    pub buffer_index: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ComputeStageInputLayout {
+    pub raw_bits: u32,
+    pub buffer_index: u32,
+    pub step_function: u32,
+    pub step_rate: u32,
+    pub stride: u64,
+}
+
+/// Optional stage-input declaration retained by a compute pipeline.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ComputeStageInputDescriptor {
+    pub word0: u32,
+    pub header0: u32,
+    pub header1: u32,
+    pub index_type: u32,
+    pub index_buffer_index: u32,
+    pub attributes: Vec<ComputeStageInputAttribute>,
+    pub layouts: Vec<ComputeStageInputLayout>,
+    /// Entries the boundary could not retain. A nonzero value refuses creation.
+    pub dropped_attributes: u32,
+    /// Layout entries the boundary could not retain. A nonzero value refuses creation.
+    pub dropped_layouts: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ComputePipelineDescriptor {
+    pub kernel_func_ref: u32,
+    pub stage_input: Option<ComputeStageInputDescriptor>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FunctionDescriptor {
+    pub blob_gva: u64,
+    pub blob_size: u32,
+    pub function_id: u32,
+}
+
+/// Immutable semantic sampler declaration.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SamplerDescriptor {
+    pub min_filter: u32,
+    pub mag_filter: u32,
+    pub mip_filter: u32,
+    pub s_address: u32,
+    pub t_address: u32,
+    pub r_address: u32,
+    pub max_anisotropy: u32,
+    pub lod_min_clamp: f32,
+    pub lod_max_clamp: f32,
+    pub compare_function: u32,
+    pub border_color: u32,
+    pub normalized_coordinates: bool,
+    pub support_argument_buffers: bool,
+    pub lod_average: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DepthStencilFace {
+    pub compare_function: u32,
+    pub stencil_failure_operation: u32,
+    pub depth_failure_operation: u32,
+    pub depth_stencil_pass_operation: u32,
+    pub read_mask: u32,
+    pub write_mask: u32,
+}
+
+/// Immutable semantic depth/stencil declaration.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DepthStencilDescriptor {
+    pub depth_stencil_id: u32,
+    pub depth_compare_function: u32,
+    pub depth_write_enabled: bool,
+    pub front_stencil_enabled: bool,
+    pub back_stencil_enabled: bool,
+    pub front_face: DepthStencilFace,
+    pub back_face: DepthStencilFace,
+}
+
+/// Semantic construction descriptor for a linear buffer resource.
+///
+/// The wire retains both the full handle word and the low-width page handle.
+/// Address construction always takes page geometry explicitly so neither guest
+/// architecture can leak a fixed shift into portable code.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BufferDescriptor {
+    pub allocation_size: u64,
+    pub handle64: u64,
+    pub handle: u32,
+}
+
+impl BufferDescriptor {
+    /// Guest VA and allocation size, or `None` when the declaration cannot
+    /// identify a non-empty page-backed allocation.
+    pub fn backing_gva_size(&self, page_shift: u32) -> Option<(u64, u64)> {
+        if self.allocation_size == 0 || self.handle == 0 || page_shift == 0 || page_shift > 30 {
+            return None;
+        }
+        Some(((self.handle as u64) << page_shift, self.allocation_size))
+    }
+}
+
+/// Semantic form of a texture view after its serializer opcode is consumed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextureViewForm {
+    #[default]
+    Simple,
+    Ranged,
+    Swizzled,
+}
+
+/// A task-local texture view over an existing texture resource.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TextureViewDescriptor {
+    pub form: TextureViewForm,
+    pub view_texture_ref: u32,
+    pub base_texture_ref: u32,
+    pub pixel_format: u16,
+    pub texture_type: u16,
+    pub level_base: u64,
+    pub level_count: u64,
+    pub slice_base: u64,
+    pub slice_count: u64,
+    pub swizzle: [u8; 4],
+}
+
+impl TextureViewDescriptor {
+    pub const fn carries_range(&self) -> bool {
+        matches!(
+            self.form,
+            TextureViewForm::Ranged | TextureViewForm::Swizzled
+        )
+    }
+
+    pub const fn carries_swizzle(&self) -> bool {
+        matches!(self.form, TextureViewForm::Swizzled)
+    }
+
+    pub const fn declared_pixel_format(&self) -> Option<u16> {
+        if self.pixel_format == 0 {
+            None
+        } else {
+            Some(self.pixel_format)
+        }
+    }
+}
+
+/// Layout of one mip level within a linear texture allocation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TextureLevelLayout {
+    pub offset: u64,
+    pub size: u64,
+    pub row_stride: u64,
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+}
+
+impl TextureLevelLayout {
+    /// Bytes touched by a row walk, excluding padding after the final row.
+    pub fn read_span(&self, tight_row: u32) -> Option<u64> {
+        self.height
+            .checked_sub(1)
+            .map(u64::from)?
+            .checked_mul(self.row_stride)?
+            .checked_add(u64::from(tight_row))
+    }
+
+    /// Number of contiguous depth planes; zero is the protocol's 2D spelling.
+    pub fn planes(&self) -> u32 {
+        self.depth.max(1)
+    }
+
+    pub fn slice_stride(&self) -> Option<u64> {
+        self.row_stride
+            .checked_mul(u64::from(self.height))?
+            .checked_mul(u64::from(self.planes()))
+    }
+
+    pub fn slice_read_span(&self, tight_row: u32) -> Option<u64> {
+        u64::from(self.planes() - 1)
+            .checked_mul(self.row_stride)?
+            .checked_mul(u64::from(self.height))?
+            .checked_add(self.read_span(tight_row)?)
+    }
+}
+
+/// Semantic construction descriptor for a page-backed linear texture.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LinearTextureDescriptor {
+    pub allocation_size: u64,
+    pub handle: u32,
+    pub mipmap_level_count: u32,
+    pub data_offset: u32,
+    pub bytes_per_element: u8,
+    pub used_size: u32,
+    pub row_stride: u32,
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub declaration: Option<crate::TextureDeclaration>,
+    pub levels: Vec<TextureLevelLayout>,
+}
+
+impl LinearTextureDescriptor {
+    pub fn extent(&self) -> Option<(u32, u32)> {
+        (self.width != 0 && self.height != 0).then_some((self.width, self.height))
+    }
+
+    pub fn declared_row_stride(&self) -> Option<u32> {
+        (self.row_stride != 0).then_some(self.row_stride)
+    }
+
+    pub fn declared_pixel_format(&self) -> Option<u16> {
+        self.declaration
+            .map(|declaration| declaration.pixel_format)
+            .filter(|format| *format != 0)
+    }
+
+    pub fn declared_usage(&self) -> Option<u32> {
+        self.declaration.map(|declaration| declaration.usage)
+    }
+
+    pub fn allocation_base_gva(&self, page_shift: u32) -> Option<u64> {
+        if self.handle == 0 || page_shift == 0 || page_shift > 30 {
+            return None;
+        }
+        Some((self.handle as u64) << page_shift)
+    }
+
+    pub fn backing_gva_size(&self, page_shift: u32) -> Option<(u64, u64)> {
+        if self.allocation_size == 0 || self.handle == 0 {
+            return None;
+        }
+        let base = self.allocation_base_gva(page_shift)?;
+        Some((
+            base.checked_add(u64::from(self.data_offset))?,
+            self.allocation_size,
+        ))
+    }
+
+    pub fn level(&self, level: u32) -> Option<&TextureLevelLayout> {
+        self.levels.get(level as usize)
+    }
+
+    pub fn level_gva(&self, level: u32, page_shift: u32) -> Option<(u64, &TextureLevelLayout)> {
+        let base = self.allocation_base_gva(page_shift)?;
+        let layout = self.level(level)?;
+        if layout.width == 0 || layout.height == 0 || layout.row_stride == 0 {
+            return None;
+        }
+        if self.allocation_size != 0
+            && (layout.offset >= self.allocation_size
+                || self.allocation_size - layout.offset < layout.row_stride)
+        {
+            return None;
+        }
+        Some((base.checked_add(layout.offset)?, layout))
+    }
+}
+
+/// Per-command-slot layout inside an indirect-command-buffer allocation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IcbCommandLayout {
+    pub command_type_offset: u16,
+    pub barrier_offset: u16,
+    pub kernel_dispatch_arguments_offset: u16,
+    pub tessellation_factor_offset: u16,
+    pub pipeline_state_offset: u32,
+    pub vertex_buffer_bind_offset: u32,
+    pub fragment_buffer_bind_offset: u32,
+    pub object_buffer_bind_offset: u32,
+    pub mesh_buffer_bind_offset: u32,
+    pub kernel_buffer_bind_offset: u32,
+    pub attribute_stride_offset: u32,
+    pub object_threadgroup_memory_length_offset: u32,
+    pub threadgroup_memory_length_offset: u32,
+    pub command_arguments_offset: u32,
+    pub command_size: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IndirectCommandBufferDescriptor {
+    pub command_types: u32,
+    pub max_vertex_buffer_bind_count: u16,
+    pub max_fragment_buffer_bind_count: u16,
+    pub max_kernel_buffer_bind_count: u16,
+    pub max_object_buffer_bind_count: u16,
+    pub max_mesh_buffer_bind_count: u16,
+    pub max_kernel_threadgroup_memory_bind_count: u16,
+    pub max_object_threadgroup_memory_bind_count: u16,
+    pub flags: u16,
+    pub max_command_count: u32,
+    pub options: u16,
+    pub layout: IcbCommandLayout,
+}
+
+/// Guest ICB command-memory association used for CPU-side command decoding.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IcbCommandMemory {
+    pub gva: u64,
+    pub byte_len: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IcbUnappliedFlag {
+    SupportRayTracing,
+    SupportDynamicAttributeStride,
+    InheritDepthStencilState,
+    InheritDepthBias,
+    InheritDepthClipMode,
+    InheritCullMode,
+    InheritFrontFacingWinding,
+    InheritTriangleFillMode,
+}
+
+impl IcbUnappliedFlag {
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::SupportRayTracing => "icb_flag_support_ray_tracing_dropped",
+            Self::SupportDynamicAttributeStride => "icb_flag_dynamic_attribute_stride_dropped",
+            Self::InheritDepthStencilState => "icb_flag_no_inherit_depth_stencil_dropped",
+            Self::InheritDepthBias => "icb_flag_no_inherit_depth_bias_dropped",
+            Self::InheritDepthClipMode => "icb_flag_no_inherit_depth_clip_dropped",
+            Self::InheritCullMode => "icb_flag_no_inherit_cull_mode_dropped",
+            Self::InheritFrontFacingWinding => "icb_flag_no_inherit_winding_dropped",
+            Self::InheritTriangleFillMode => "icb_flag_no_inherit_fill_mode_dropped",
+        }
+    }
+}
+
+impl IndirectCommandBufferDescriptor {
+    pub const fn inherit_pipeline_state(&self) -> bool {
+        self.flags & (1 << 0) != 0
+    }
+
+    pub const fn inherit_buffers(&self) -> bool {
+        self.flags & (1 << 1) != 0
+    }
+
+    pub const fn unidentified_flags(&self) -> u16 {
+        self.flags & ((1 << 6) | (1 << 11) | (1 << 12) | (1 << 13) | (1 << 14))
+    }
+
+    pub fn unapplied_flags(&self) -> Vec<IcbUnappliedFlag> {
+        let mut out = Vec::new();
+        for (bit, flag) in [
+            (1 << 2, IcbUnappliedFlag::SupportRayTracing),
+            (1 << 3, IcbUnappliedFlag::SupportDynamicAttributeStride),
+        ] {
+            if self.flags & bit != 0 {
+                out.push(flag);
+            }
+        }
+        for (bit, flag) in [
+            (1 << 4, IcbUnappliedFlag::InheritDepthStencilState),
+            (1 << 5, IcbUnappliedFlag::InheritDepthBias),
+            (1 << 7, IcbUnappliedFlag::InheritDepthClipMode),
+            (1 << 8, IcbUnappliedFlag::InheritCullMode),
+            (1 << 9, IcbUnappliedFlag::InheritFrontFacingWinding),
+            (1 << 10, IcbUnappliedFlag::InheritTriangleFillMode),
+        ] {
+            if self.flags & bit == 0 {
+                out.push(flag);
+            }
+        }
+        out
+    }
+}
+
+/// Semantic result of decoding one object-list construction descriptor.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ResourceDescriptor {
+    Buffer(BufferDescriptor),
+    Texture(LinearTextureDescriptor),
+    SurfaceBacking(SurfaceBackingDescriptor),
+    Sampler(SamplerDescriptor),
+    Function(FunctionDescriptor),
+    RenderPipeline(RenderPipelineDescriptor),
+    ComputePipeline(ComputePipelineDescriptor),
+    DepthStencil(DepthStencilDescriptor),
+    TextureView(TextureViewDescriptor),
+    BufferTexture(BufferTextureDescriptor),
+    HeapTexture(crate::HeapTextureDescriptor),
+    IOSurfacePlaneView(IOSurfacePlaneViewResourceDescriptor),
+    MapperIOSurfaceTextureView(crate::MapperIOSurfaceTextureView),
+    IndirectCommandBuffer(IndirectCommandBufferDescriptor),
+}
+
+/// One plane declared by a registered IOSurface backing object.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SurfaceBackingPlane {
+    pub offset: u32,
+    pub width: u32,
+    pub height: u32,
+    pub bytes_per_row: u32,
+    pub bytes_per_element: u8,
+}
+
+/// Complete semantic construction descriptor for a registered IOSurface.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SurfaceBackingDescriptor {
+    pub length: u64,
+    pub backing_pfn: u32,
+    /// IOSurface pixel-format word: an OSType FourCC or a pathway-produced
+    /// Metal format ordinal, interpreted only by a format adapter.
+    pub pixel_format: u32,
+    pub plane_count: u8,
+    pub planes: [SurfaceBackingPlane; reims_vgpu_wire::device_desc::SURFACE_BACKING_PLANE_CAP],
+    /// Plane-zero conveniences used by the single-plane pathway.
+    pub width: u32,
+    pub height: u32,
+    pub bytes_per_row: u32,
+}
+
+/// Decode one complete registered-surface construction descriptor.
+pub fn decode_surface_backing_descriptor(
+    bytes: &[u8],
+) -> Result<SurfaceBackingDescriptor, ResourceDecodeError> {
+    use reims_vgpu_wire::device_desc as wire;
+
+    let header = wire::surface_backing_header(bytes)
+        .map_err(|_| ResourceDecodeError::ErrShort("res_surface_backing_header"))?;
+    let length = header.length.get();
+    let backing_pfn = header.backing_pfn.get();
+    if length == 0 || backing_pfn == 0 {
+        return Err(ResourceDecodeError::ErrUnsupported(
+            "res_surface_backing_empty",
+        ));
+    }
+    let plane_count = header.plane_count;
+    if usize::from(plane_count) > wire::SURFACE_BACKING_PLANE_CAP {
+        return Err(ResourceDecodeError::ErrUnsupported(
+            "res_surface_backing_plane_count",
+        ));
+    }
+    let mut planes = [SurfaceBackingPlane::default(); wire::SURFACE_BACKING_PLANE_CAP];
+    for (index, plane) in planes.iter_mut().enumerate().take(usize::from(plane_count)) {
+        let record = wire::surface_backing_plane(bytes, index)
+            .map_err(|_| ResourceDecodeError::ErrShort("res_surface_backing_plane"))?;
+        *plane = SurfaceBackingPlane {
+            offset: record.offset.get(),
+            width: record.width.get(),
+            height: record.height.get(),
+            bytes_per_row: record.bytes_per_row(),
+            bytes_per_element: record.bytes_per_element(),
+        };
+    }
+    let plane_zero = planes.first().copied().unwrap_or_default();
+    let (width, height, bytes_per_row) = if plane_count == 0 {
+        (0, 0, 0)
+    } else {
+        (
+            plane_zero.width,
+            plane_zero.height,
+            plane_zero.bytes_per_row,
+        )
+    };
+    Ok(SurfaceBackingDescriptor {
+        length,
+        backing_pfn,
+        pixel_format: header.pixel_format.get(),
+        plane_count,
+        planes,
+        width,
+        height,
+        bytes_per_row,
+    })
+}
+
+/// Semantic texture geometry carried by a registered IOSurface plane view.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IOSurfacePlaneViewDescriptor {
+    pub pixel_format: u16,
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub plane_index: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IOSurfacePlaneViewRecordKind {
+    Plane,
+    ColorView,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IOSurfacePlaneViewDecodeState {
+    Complete,
+    MissingOperation,
+    MissingRecord,
+    UnknownRecordTag(u8),
+    InvalidGeometry,
+}
+
+/// Complete semantic form of a wire tag 5 registered-surface view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IOSurfacePlaneViewResourceDescriptor {
+    pub surface: ObjectTableRef<ResourceObject>,
+    pub owner_task: TaskId,
+    pub operation_kind: Option<u32>,
+    pub operation_length: Option<u32>,
+    pub own_ref: Option<ObjectTableRef<ResourceObject>>,
+    pub record_kind: Option<IOSurfacePlaneViewRecordKind>,
+    /// Producer-carried byte whose public meaning is not established.
+    pub unidentified_record_flags: u8,
+    /// Valid 2D view geometry when the nested record carries one. The surface
+    /// relation remains meaningful when construction has not populated a usable
+    /// texture view yet.
+    pub view: Option<IOSurfacePlaneViewDescriptor>,
+    pub decode_state: IOSurfacePlaneViewDecodeState,
+}
+
+/// A texture view placed over an existing buffer's storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BufferTextureDescriptor {
+    pub new_texture_ref: u32,
+    pub buffer_ref: u32,
+    pub offset: u64,
+    pub bytes_per_row: u64,
+    pub desc: crate::TextureDeclaration,
+}
+
+/// Typed refusal produced while decoding a resource construction descriptor.
+///
+/// The slug is retained at the protocol boundary because it names the exact
+/// failed contract check. Logging adapters may attach the coarse class without
+/// owning or reclassifying the semantic error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResourceDecodeError {
+    ErrShort(&'static str),
+    ErrUnknownType(&'static str),
+    ErrUnsupported(&'static str),
+}
+
+impl ResourceDecodeError {
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::ErrShort(slug) | Self::ErrUnknownType(slug) | Self::ErrUnsupported(slug) => slug,
+        }
+    }
+
+    pub const fn class(self) -> &'static str {
+        match self {
+            Self::ErrShort(_) => "short",
+            Self::ErrUnknownType(_) => "unknown_type",
+            Self::ErrUnsupported(_) => "unsupported",
+        }
+    }
+
+    pub fn fields(self) -> Vec<(&'static str, String)> {
+        vec![("class", self.class().to_string())]
+    }
 }
 
 /// Marker for the sampler API's independent reference namespace.
@@ -264,5 +881,141 @@ mod tests {
             assert_eq!(ColorWriteMask::new(bits).unwrap().bits(), bits);
         }
         assert_eq!(ColorWriteMask::new(MTL_COLOR_WRITE_MASK_ALL + 1), None);
+    }
+
+    #[test]
+    fn linear_buffer_addresses_require_explicit_guest_page_geometry() {
+        let descriptor = BufferDescriptor {
+            allocation_size: 0x3000,
+            handle64: 0x1_0000_0042,
+            handle: 0x42,
+        };
+        assert_eq!(descriptor.backing_gva_size(12), Some((0x42_000, 0x3000)));
+        assert_eq!(descriptor.backing_gva_size(14), Some((0x108_000, 0x3000)));
+        assert_eq!(descriptor.backing_gva_size(0), None);
+    }
+
+    #[test]
+    fn registered_surface_planes_decode_as_one_semantic_descriptor() {
+        let bytes =
+            reims_vgpu_wire::device_desc::SurfaceBackingBuilder::new(0x8000, 0x123, 0x3432_3066, 2)
+                .plane(0, 0, 640, 480, 640, 1)
+                .plane(1, 0x4000, 320, 240, 640, 2);
+        let decoded = decode_surface_backing_descriptor(bytes.bytes()).unwrap();
+        assert_eq!((decoded.length, decoded.backing_pfn), (0x8000, 0x123));
+        assert_eq!(decoded.plane_count, 2);
+        assert_eq!(
+            decoded.planes[1],
+            SurfaceBackingPlane {
+                offset: 0x4000,
+                width: 320,
+                height: 240,
+                bytes_per_row: 640,
+                bytes_per_element: 2,
+            }
+        );
+        assert_eq!((decoded.width, decoded.height), (640, 480));
+    }
+
+    #[test]
+    fn registered_surface_decode_refuses_lossy_plane_prefixes() {
+        use reims_vgpu_wire::device_desc::{
+            surface_backing_len_for, SurfaceBackingBuilder, SURFACE_BACKING_PLANE_CAP,
+        };
+
+        let over_cap = SurfaceBackingBuilder::new(
+            0x1000,
+            1,
+            0x4247_5241,
+            (SURFACE_BACKING_PLANE_CAP + 1) as u8,
+        );
+        assert_eq!(
+            decode_surface_backing_descriptor(over_cap.bytes()),
+            Err(ResourceDecodeError::ErrUnsupported(
+                "res_surface_backing_plane_count"
+            ))
+        );
+
+        let short = SurfaceBackingBuilder::new(0x1000, 1, 0x4247_5241, 2)
+            .with_len(surface_backing_len_for(1));
+        assert_eq!(
+            decode_surface_backing_descriptor(short.bytes()),
+            Err(ResourceDecodeError::ErrShort("res_surface_backing_plane"))
+        );
+    }
+
+    #[test]
+    fn texture_view_semantics_do_not_expose_serializer_opcodes() {
+        let simple = TextureViewDescriptor::default();
+        assert!(!simple.carries_range());
+        assert!(!simple.carries_swizzle());
+
+        let swizzled = TextureViewDescriptor {
+            form: TextureViewForm::Swizzled,
+            pixel_format: 80,
+            ..Default::default()
+        };
+        assert!(swizzled.carries_range());
+        assert!(swizzled.carries_swizzle());
+        assert_eq!(swizzled.declared_pixel_format(), Some(80));
+    }
+
+    #[test]
+    fn linear_texture_geometry_is_checked_in_the_semantic_descriptor() {
+        let descriptor = LinearTextureDescriptor {
+            allocation_size: 0x8000,
+            handle: 0x20,
+            data_offset: 0x100,
+            width: 16,
+            height: 8,
+            row_stride: 128,
+            levels: vec![TextureLevelLayout {
+                offset: 0x400,
+                size: 0x1000,
+                row_stride: 128,
+                width: 16,
+                height: 8,
+                depth: 0,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(descriptor.backing_gva_size(12), Some((0x20_100, 0x8000)));
+        let (gva, level) = descriptor.level_gva(0, 12).unwrap();
+        assert_eq!(gva, 0x20_400);
+        assert_eq!(level.read_span(64), Some(7 * 128 + 64));
+        assert_eq!(level.slice_read_span(64), level.read_span(64));
+        assert_eq!(descriptor.level_gva(1, 12), None);
+    }
+
+    #[test]
+    fn linear_texture_levels_refuse_invalid_allocation_geometry() {
+        let descriptor = LinearTextureDescriptor {
+            allocation_size: 0x1000,
+            handle: 7,
+            levels: vec![TextureLevelLayout {
+                offset: 0x0f80,
+                row_stride: 0x100,
+                width: 8,
+                height: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(descriptor.level_gva(0, 12), None);
+        assert_eq!(descriptor.allocation_base_gva(0), None);
+    }
+
+    #[test]
+    fn indirect_command_flags_are_classified_without_losing_unknown_bits() {
+        let descriptor = IndirectCommandBufferDescriptor {
+            flags: (1 << 0) | (1 << 2) | (1 << 6),
+            ..Default::default()
+        };
+        assert!(descriptor.inherit_pipeline_state());
+        assert!(!descriptor.inherit_buffers());
+        assert_eq!(descriptor.unidentified_flags(), 1 << 6);
+        let unapplied = descriptor.unapplied_flags();
+        assert!(unapplied.contains(&IcbUnappliedFlag::SupportRayTracing));
+        assert!(unapplied.contains(&IcbUnappliedFlag::InheritDepthStencilState));
     }
 }

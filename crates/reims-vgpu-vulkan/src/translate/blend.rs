@@ -34,28 +34,7 @@ use reims_vgpu_protocol::resource::{
 /// "resolve this at specialization time" sentinel rather than a blend factor,
 /// and nothing in this device performs that resolution.
 pub fn factor(mtl: u32) -> Result<BlendFactor, TranslateReason> {
-    Ok(match mtl {
-        0 => BlendFactor::Zero,
-        1 => BlendFactor::One,
-        2 => BlendFactor::SrcColor,
-        3 => BlendFactor::OneMinusSrcColor,
-        4 => BlendFactor::SrcAlpha,
-        5 => BlendFactor::OneMinusSrcAlpha,
-        6 => BlendFactor::DstColor,
-        7 => BlendFactor::OneMinusDstColor,
-        8 => BlendFactor::DstAlpha,
-        9 => BlendFactor::OneMinusDstAlpha,
-        10 => BlendFactor::SrcAlphaSaturated,
-        11 => BlendFactor::ConstantColor,
-        12 => BlendFactor::OneMinusConstantColor,
-        13 => BlendFactor::ConstantAlpha,
-        14 => BlendFactor::OneMinusConstantAlpha,
-        15 => BlendFactor::Src1Color,
-        16 => BlendFactor::OneMinusSrc1Color,
-        17 => BlendFactor::Src1Alpha,
-        18 => BlendFactor::OneMinusSrc1Alpha,
-        other => return Err(TranslateReason::UnknownBlendFactor(other)),
-    })
+    reims_vgpu_protocol::blend_factor(mtl).map_err(|_| TranslateReason::UnknownBlendFactor(mtl))
 }
 
 /// `MTLBlendOperation` (SDK numeric values, Metal header order).
@@ -75,14 +54,8 @@ pub fn factor(mtl: u32) -> Result<BlendFactor, TranslateReason> {
 /// Apple value this device turns down". The first is a bound; the second is a
 /// decision, and only a decision can be wrong.
 pub fn operation(mtl: u32) -> Result<BlendOp, TranslateReason> {
-    Ok(match mtl {
-        0 => BlendOp::Add,
-        1 => BlendOp::Subtract,
-        2 => BlendOp::ReverseSubtract,
-        3 => BlendOp::Min,
-        4 => BlendOp::Max,
-        other => return Err(TranslateReason::UnknownBlendOperation(other)),
-    })
+    reims_vgpu_protocol::blend_operation(mtl)
+        .map_err(|_| TranslateReason::UnknownBlendOperation(mtl))
 }
 
 /// A whole decoded render-pipeline colour-attachment blend descriptor.
@@ -100,14 +73,14 @@ pub fn state(
     a: &PipelineColorAttachment,
     constants: [f32; 4],
 ) -> Result<BlendStateResource, TranslateReason> {
-    Ok(BlendStateResource {
-        src_color: factor(a.src_rgb)?,
-        dst_color: factor(a.dst_rgb)?,
-        color_op: operation(a.op_rgb)?,
-        src_alpha: factor(a.src_alpha)?,
-        dst_alpha: factor(a.dst_alpha)?,
-        alpha_op: operation(a.op_alpha)?,
-        constants,
+    reims_vgpu_protocol::blend_state(a, constants).map_err(|reason| match reason {
+        reims_vgpu_protocol::PipelineStateDecodeError::BlendFactor(value) => {
+            TranslateReason::UnknownBlendFactor(value)
+        }
+        reims_vgpu_protocol::PipelineStateDecodeError::BlendOperation(value) => {
+            TranslateReason::UnknownBlendOperation(value)
+        }
+        _ => unreachable!("blend_state returns only blend decode errors"),
     })
 }
 

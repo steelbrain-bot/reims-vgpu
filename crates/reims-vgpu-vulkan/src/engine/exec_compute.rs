@@ -5,6 +5,7 @@
 use ash::vk;
 use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use super::caches::{
     canonicalize_layout_bindings, BindingSig, ComputePipelineKey, LayoutKey, ObjectCaches,
@@ -88,9 +89,9 @@ enum ComputeImageDst {
 }
 
 pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
-    if req.spirv.is_empty() {
+    if req.program.id.get() == 0 {
         return Err(DrawError::ComputeValidation(
-            ComputeValidationDecline::EmptySpirv,
+            ComputeValidationDecline::MissingProgram,
         ));
     }
     if req.entry.is_empty() {
@@ -407,13 +408,14 @@ fn resident_sample_exact(
 /// [`crate::spirv_bind::descriptor_static_use`] answers `NotDeclared`
 /// for anything that is not a `UniformConstant` descriptor, so a storage buffer,
 /// whose root this walk cannot resolve, is never refused on a guess.
-fn used_binding_absent_from_layout(spirv: &[u32], layout: &[BindingSig]) -> Option<u32> {
-    crate::spirv_bind::declared_binding_numbers(spirv)
-        .into_iter()
-        .find(|binding| {
-            !layout.iter().any(|b| b.binding == *binding)
-                && crate::spirv_bind::descriptor_static_use(spirv, *binding).is_violation()
-        })
+fn used_binding_absent_from_layout(used: &[u32], layout: &[BindingSig]) -> Option<u32> {
+    used.iter()
+        .copied()
+        .find(|binding| !layout.iter().any(|candidate| candidate.binding == *binding))
+}
+
+pub(crate) struct NativeComputeProgram {
+    pub(crate) shader: Arc<crate::m2v_cache::ShaderVariant>,
 }
 
 pub(crate) unsafe fn execute_compute_inner(
@@ -422,6 +424,7 @@ pub(crate) unsafe fn execute_compute_inner(
     pools: &mut ResourcePools,
     counters: &EngineCounters,
     req: &ComputeRequest,
+    program: &NativeComputeProgram,
 ) -> Result<ComputeOutput, DrawError> {
     validate_compute(req)?;
     let force_loss = owner.force_device_lost;
@@ -518,7 +521,9 @@ pub(crate) unsafe fn execute_compute_inner(
         }
     }
 
-    if let Some(binding) = used_binding_absent_from_layout(&req.spirv, &layout_bindings) {
+    if let Some(binding) =
+        used_binding_absent_from_layout(&req.program.used_descriptor_bindings, &layout_bindings)
+    {
         return Err(DrawError::ComputeExecution(
             ComputeExecutionDecline::UsedBindingAbsentFromLayout { binding },
         ));
@@ -528,7 +533,8 @@ pub(crate) unsafe fn execute_compute_inner(
         bindings: layout_bindings,
     };
 
-    let (spirv_digest, module) = caches.get_or_create_shader(ctx, &req.spirv, counters, pools)?;
+    let (spirv_digest, module) =
+        caches.get_or_create_shader(ctx, &program.shader.words, counters, pools)?;
     let (dsl, pipeline_layout) = caches.get_or_create_layout(ctx, &layout_key, counters, pools)?;
     let cpipe_key = ComputePipelineKey {
         spirv: spirv_digest,
@@ -541,7 +547,7 @@ pub(crate) unsafe fn execute_compute_inner(
         &cpipe_key,
         super::caches::ShaderModuleSource {
             module,
-            spirv: &req.spirv,
+            spirv: &program.shader.words,
         },
         pipeline_layout,
         counters,
@@ -1508,7 +1514,6 @@ mod tests {
     /// refusal from swallowing legal dispatches with it.
     #[test]
     fn a_used_binding_the_layout_omits_is_refused_and_a_declared_unused_one_is_not() {
-        let spirv = crate::spirv_bind::test_module_with_two_sampled_images(33, 34);
         let sig = |binding| BindingSig {
             binding,
             ty: vk::DescriptorType::SAMPLED_IMAGE.as_raw() as u32,
@@ -1516,18 +1521,23 @@ mod tests {
             count: 1,
         };
 
-        assert_eq!(used_binding_absent_from_layout(&spirv, &[]), Some(33));
-        assert_eq!(
-            used_binding_absent_from_layout(&spirv, &[sig(34)]),
-            Some(33)
-        );
+        let used = [33];
+        assert_eq!(used_binding_absent_from_layout(&used, &[]), Some(33));
+        assert_eq!(used_binding_absent_from_layout(&used, &[sig(34)]), Some(33));
         // Covering the used binding is sufficient: 34 is declared and never
         // referenced, so leaving it out is legal and must not be reported.
-        assert_eq!(used_binding_absent_from_layout(&spirv, &[sig(33)]), None);
+        assert_eq!(used_binding_absent_from_layout(&used, &[sig(33)]), None);
         assert_eq!(
-            used_binding_absent_from_layout(&spirv, &[sig(33), sig(34)]),
+            used_binding_absent_from_layout(&used, &[sig(33), sig(34)]),
             None
         );
+    }
+
+    fn test_program() -> reims_vgpu_core::PreparedShaderStage {
+        reims_vgpu_core::PreparedShaderStage {
+            id: reims_vgpu_protocol::PreparedShaderId::new(1),
+            ..Default::default()
+        }
     }
 
     fn residency_identity() -> ComputeStorageResidencyKey {
@@ -1584,7 +1594,7 @@ mod tests {
     #[test]
     fn compute_entry_with_interior_nul_is_rejected_before_cache_creation() {
         let req = ComputeRequest {
-            spirv: vec![0x0723_0203],
+            program: test_program(),
             entry: "ma\0in".into(),
             grid: [1, 1, 1],
             ..Default::default()
@@ -1605,7 +1615,7 @@ mod tests {
         second.array_element = 7;
         second.descriptor_count = 8;
         let request = ComputeRequest {
-            spirv: vec![0x0723_0203],
+            program: test_program(),
             entry: "main".into(),
             grid: [1, 1, 1],
             sampled_images: vec![first, second],
@@ -1665,7 +1675,7 @@ mod tests {
     #[test]
     fn sampled_and_storage_images_keep_distinct_descriptor_access() {
         let mut req = ComputeRequest {
-            spirv: vec![0x0723_0203],
+            program: test_program(),
             entry: "main".into(),
             grid: [1, 1, 1],
             sampled_images: vec![ComputeSampledImageResource {

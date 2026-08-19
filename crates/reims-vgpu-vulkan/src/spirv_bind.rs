@@ -228,41 +228,11 @@ const _: () = assert!((SAMPLED_RESOURCE_BINDING_LIMIT - 1)
     .checked_add(FRAG_SAMPLED_RESOURCE_BINDING_OFFSET)
     .is_some());
 
-/// Image dimensionality declared by a translated SPIR-V sampled-image binding.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SampledImageKind {
-    D1,
-    D1Array,
-    D2,
-    D2Multisample,
-    D2Array,
-    D3,
-    Cube,
-    CubeArray,
-}
-
-/// Sampled-vs-storage class of a texture binding, derived from the translator's
-/// reflection (`TextureShape.writable`): a writable texture is a storage image, a
-/// read/sample texture is a sampled image. The declared Metal access qualifier is
-/// authoritative, so this is exact at translate time — there is no `Unknown`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ImageAccess {
-    Sampled,
-    Storage,
-}
-
-/// Content access proven from the SPIR-V use graph for one storage image.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StorageImageAccess {
-    ReadOnly,
-    WriteOnly,
-    ReadWrite,
-    /// The image object escaped or participated in an operation whose content
-    /// access cannot be classified safely.
-    Unknown,
-    /// More than one image variable declares the same binding.
-    AmbiguousBinding,
-}
+pub use reims_vgpu_core::{
+    DescriptorUse, ImageAccess, ReflectedBufferAccess, ReflectedComputeTexture,
+    ReflectedSampledKind, ReflectedSamplerDescriptor, ReflectedTextureAccess,
+    ReflectedTextureDescriptor, SampledImageKind, StorageImageAccess,
+};
 
 /// Explicit storage-image texel format declared by `OpTypeImage`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -616,50 +586,6 @@ pub fn descriptor_static_use(words: &[u32], binding: u32) -> DescriptorUse {
         }
     }
     DescriptorUse::DeclaredUnused
-}
-
-/// What [`descriptor_static_use`] found for one binding.
-///
-/// Four states rather than a `bool` because three of them mean "do not report a
-/// violation" for three different reasons, and a caller that collapses them
-/// cannot say which population it is looking at.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DescriptorUse {
-    /// No variable in the module carries this binding. The reflection named a
-    /// resource the translated shader does not have.
-    NotDeclared,
-    /// The module declares the variable and no instruction references it. Legal
-    /// to leave out of the pipeline layout.
-    DeclaredUnused,
-    /// An instruction references the variable, so the layout must contain it.
-    Used,
-    /// More than one variable carries this binding, so "the" root is not a
-    /// single id. Fails closed: treated as a reason not to claim either answer.
-    Ambiguous,
-}
-
-impl DescriptorUse {
-    /// A stable name for the fail channel and the `store_routes` counter.
-    ///
-    /// One spelling for both, so the reason and the census cannot drift.
-    pub fn slug(self) -> &'static str {
-        match self {
-            Self::NotDeclared => "frag_unbound_not_declared",
-            Self::DeclaredUnused => "frag_unbound_declared_unused",
-            Self::Used => "frag_declared_descriptor_unbound",
-            Self::Ambiguous => "frag_unbound_ambiguous_binding",
-        }
-    }
-
-    /// Whether omitting this binding from the pipeline layout violates the
-    /// specification.
-    ///
-    /// Only [`Self::Used`]. [`Self::Ambiguous`] deliberately does **not** count:
-    /// it means the module has two variables on one binding, which is its own
-    /// defect and must not be reported under a name that says something else.
-    pub fn is_violation(self) -> bool {
-        matches!(self, Self::Used)
-    }
 }
 
 /// Mark every id whose value derives from an already-marked id, to a fixpoint.
@@ -1673,92 +1599,6 @@ pub fn test_module_with_samplers(bindings: &[u32]) -> Vec<u32> {
 /// that build the layout. Pair it with [`descriptor_static_use`], which answers
 /// `NotDeclared` for anything that is not a `UniformConstant` descriptor and so
 /// narrows this to the population that walk can reason about exactly.
-/// [`declared_binding_numbers`] for a module the caller holds behind an `Arc`,
-/// answered from a memo after the first walk.
-///
-/// # Why the walk had to go
-///
-/// The render path asks this once per draw, to check that the pipeline layout
-/// describes every binding the fragment module carries. It is a linear walk of
-/// the whole module plus a sort, a dedup and an allocation, and it cost
-/// **0.34 µs of an 11.8 µs Maps chain** — a fifteenth of the whole render path,
-/// spent re-deriving a property of words that had not changed since the guest
-/// compiled them.
-///
-/// That is the same shape as `pl_shader_us`, which was 63 ms of every second
-/// spent deriving a key for a module already in hand, and the answer is the same
-/// one: memoize on the allocation.
-///
-/// # Why an address is a sound key
-///
-/// Only because the entry holds the `Arc`. While it does, the allocation cannot
-/// be freed, so nothing else can be given that address and the key cannot come
-/// to mean a different module. The words behind an `Arc<Vec<u32>>` are immutable,
-/// so the memoized answer is the one a fresh walk would produce. Drop the `Arc`
-/// from the entry and this becomes a use-after-free dressed as a cache hit —
-/// the same rule, in the same words, as the engine's `ShaderDigestIndex`.
-///
-/// `usize` rather than a raw pointer because the memo is `static` and shared;
-/// the address is compared and never dereferenced.
-///
-/// # The bound
-///
-/// Past [`DECLARED_BINDING_ENTRIES`] the whole memo is dropped rather than one
-/// entry evicted, because there is no recency to evict *by*: every entry is
-/// equally cheap to rebuild, and a boot that reaches the bound is reporting
-/// something rather than asking for a policy. Same disposal, and the same
-/// reason, as the engine's index — and the drop releases the `Arc`s, so a memo
-/// that outlives its modules costs a bounded number of live allocations and not
-/// a leak.
-pub fn declared_binding_numbers_memoized(
-    words: &std::sync::Arc<Vec<u32>>,
-) -> std::sync::Arc<[u32]> {
-    let key = std::sync::Arc::as_ptr(words) as usize;
-    let mut guard = match DECLARED_BINDINGS.lock() {
-        Ok(guard) => guard,
-        // A poisoned memo is a cache, not state: answer from the walk rather
-        // than refusing a draw over it.
-        Err(_) => return std::sync::Arc::from(declared_binding_numbers(words)),
-    };
-    let memo = guard.get_or_insert_with(std::collections::HashMap::new);
-    if let Some((_, declared)) = memo.get(&key) {
-        return std::sync::Arc::clone(declared);
-    }
-    if memo.len() >= DECLARED_BINDING_ENTRIES {
-        reims_vgpu_observe::off(format!(
-            "declared_binding_reset entries={} words={}",
-            memo.len(),
-            words.len()
-        ));
-        memo.clear();
-    }
-    let declared: std::sync::Arc<[u32]> = std::sync::Arc::from(declared_binding_numbers(words));
-    memo.insert(
-        key,
-        (
-            std::sync::Arc::clone(words),
-            std::sync::Arc::clone(&declared),
-        ),
-    );
-    declared
-}
-
-/// Modules the memo holds before it starts over. Sized as the engine's
-/// `SHADER_DIGEST_ENTRIES` is: a driven macos-13 boot binds a few hundred
-/// distinct modules, so this is an order of magnitude of headroom and
-/// `declared_binding_reset` firing is the boot saying otherwise.
-const DECLARED_BINDING_ENTRIES: usize = 4096;
-
-/// Allocation address → the `Arc` that keeps that address meaningful, and the
-/// declared-binding list walked out of it.
-type DeclaredBindingMemo =
-    std::collections::HashMap<usize, (std::sync::Arc<Vec<u32>>, std::sync::Arc<[u32]>)>;
-
-/// `None` until the first walk: `HashMap::new` is not a `const fn`, and a
-/// `OnceLock` beside the mutex would be a second thing to keep in step with it.
-static DECLARED_BINDINGS: std::sync::Mutex<Option<DeclaredBindingMemo>> =
-    std::sync::Mutex::new(None);
-
 pub fn declared_binding_numbers(words: &[u32]) -> Vec<u32> {
     let mut bindings = Vec::new();
     let mut i = HEADER_WORDS;
@@ -1860,6 +1700,16 @@ pub fn sampled_image_bindings(words: &[u32]) -> Vec<u32> {
     bindings.sort_unstable();
     bindings.dedup();
     bindings
+}
+
+/// Statically-used sampled bindings that are absent from `bound`.
+pub fn neutral_sampled_image_bindings(words: &[u32], bound: &[u32]) -> Vec<u32> {
+    sampled_image_bindings(words)
+        .into_iter()
+        .filter(|binding| {
+            !bound.contains(binding) && descriptor_static_use(words, *binding).is_violation()
+        })
+        .collect()
 }
 
 /// SPIR-V `Dim` operand value `SubpassData` — the framebuffer-fetch image.
@@ -2326,21 +2176,6 @@ pub fn first_unsupported_vulkan_interface(
 /// Scalar textures have `array_element = 0, descriptor_count = 1`; a texture
 /// handle array maps consecutive Metal slots onto elements of one descriptor
 /// binding instead of pretending each handle is a separate binding.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ReflectedTextureDescriptor {
-    pub binding: u32,
-    pub array_element: u32,
-    pub descriptor_count: u32,
-    pub access: ReflectedTextureAccess,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReflectedTextureAccess {
-    Sampled,
-    Storage,
-    Unknown,
-}
-
 /// Resolve one reflected sampler into the descriptor numbering used by the
 /// device's executable module. Reflection carries the translator ABI, whose
 /// sampler band starts at [`M2V_SAMPLER_BINDING_BASE`]; [`widen_sampled_bands`]
@@ -2371,13 +2206,107 @@ pub fn reflected_sampler_binding(
     })
 }
 
-/// One sampler in the executable descriptor interface. `static_state` is the
-/// exact AIR constexpr state; `None` means the guest supplies a sampler object
-/// or the runtime provisions the neutral default when that slot is unbound.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ReflectedSamplerDescriptor {
-    pub binding: u32,
-    pub static_state: Option<metal2vulkan::reflect::StaticSamplerState>,
+fn project_static_sampler(
+    state: metal2vulkan::reflect::StaticSamplerState,
+) -> reims_vgpu_core::ReflectedStaticSamplerState {
+    use metal2vulkan::reflect as native;
+    use reims_vgpu_core as semantic;
+    semantic::ReflectedStaticSamplerState {
+        min_filter: match state.min_filter {
+            native::SamplerFilter::Nearest => semantic::ReflectedSamplerFilter::Nearest,
+            native::SamplerFilter::Linear => semantic::ReflectedSamplerFilter::Linear,
+            native::SamplerFilter::Bicubic => semantic::ReflectedSamplerFilter::Bicubic,
+        },
+        mag_filter: match state.mag_filter {
+            native::SamplerFilter::Nearest => semantic::ReflectedSamplerFilter::Nearest,
+            native::SamplerFilter::Linear => semantic::ReflectedSamplerFilter::Linear,
+            native::SamplerFilter::Bicubic => semantic::ReflectedSamplerFilter::Bicubic,
+        },
+        mip_filter: match state.mip_filter {
+            native::SamplerMipFilter::None => semantic::ReflectedSamplerMipFilter::None,
+            native::SamplerMipFilter::Nearest => semantic::ReflectedSamplerMipFilter::Nearest,
+            native::SamplerMipFilter::Linear => semantic::ReflectedSamplerMipFilter::Linear,
+        },
+        address_mode_s: project_sampler_address(state.address_mode_s),
+        address_mode_t: project_sampler_address(state.address_mode_t),
+        address_mode_r: project_sampler_address(state.address_mode_r),
+        coordinates: match state.coordinates {
+            native::SamplerCoordinates::Normalized => {
+                semantic::ReflectedSamplerCoordinates::Normalized
+            }
+            native::SamplerCoordinates::Pixel => semantic::ReflectedSamplerCoordinates::Pixel,
+        },
+        compare_function: match state.compare_function {
+            native::SamplerCompareFunction::None => semantic::ReflectedSamplerCompareFunction::None,
+            native::SamplerCompareFunction::Less => semantic::ReflectedSamplerCompareFunction::Less,
+            native::SamplerCompareFunction::LessEqual => {
+                semantic::ReflectedSamplerCompareFunction::LessEqual
+            }
+            native::SamplerCompareFunction::Greater => {
+                semantic::ReflectedSamplerCompareFunction::Greater
+            }
+            native::SamplerCompareFunction::GreaterEqual => {
+                semantic::ReflectedSamplerCompareFunction::GreaterEqual
+            }
+            native::SamplerCompareFunction::Equal => {
+                semantic::ReflectedSamplerCompareFunction::Equal
+            }
+            native::SamplerCompareFunction::NotEqual => {
+                semantic::ReflectedSamplerCompareFunction::NotEqual
+            }
+            native::SamplerCompareFunction::Always => {
+                semantic::ReflectedSamplerCompareFunction::Always
+            }
+            native::SamplerCompareFunction::Never => {
+                semantic::ReflectedSamplerCompareFunction::Never
+            }
+        },
+        max_anisotropy: state.max_anisotropy,
+        lod_min_clamp: state.lod_min_clamp,
+        lod_max_clamp: state.lod_max_clamp,
+        border_color: match state.border_color {
+            native::SamplerBorderColor::TransparentBlack => {
+                semantic::ReflectedSamplerBorderColor::TransparentBlack
+            }
+            native::SamplerBorderColor::OpaqueBlack => {
+                semantic::ReflectedSamplerBorderColor::OpaqueBlack
+            }
+            native::SamplerBorderColor::OpaqueWhite => {
+                semantic::ReflectedSamplerBorderColor::OpaqueWhite
+            }
+        },
+        reduction: match state.reduction {
+            native::SamplerReduction::WeightedAverage => {
+                semantic::ReflectedSamplerReduction::WeightedAverage
+            }
+            native::SamplerReduction::Minimum => semantic::ReflectedSamplerReduction::Minimum,
+            native::SamplerReduction::Maximum => semantic::ReflectedSamplerReduction::Maximum,
+        },
+        lod_bias: state.lod_bias,
+        raw_words: state.raw_words,
+    }
+}
+
+fn project_sampler_address(
+    address: metal2vulkan::reflect::SamplerAddressMode,
+) -> reims_vgpu_core::ReflectedSamplerAddressMode {
+    match address {
+        metal2vulkan::reflect::SamplerAddressMode::ClampToZero => {
+            reims_vgpu_core::ReflectedSamplerAddressMode::ClampToZero
+        }
+        metal2vulkan::reflect::SamplerAddressMode::ClampToEdge => {
+            reims_vgpu_core::ReflectedSamplerAddressMode::ClampToEdge
+        }
+        metal2vulkan::reflect::SamplerAddressMode::Repeat => {
+            reims_vgpu_core::ReflectedSamplerAddressMode::Repeat
+        }
+        metal2vulkan::reflect::SamplerAddressMode::MirroredRepeat => {
+            reims_vgpu_core::ReflectedSamplerAddressMode::MirroredRepeat
+        }
+        metal2vulkan::reflect::SamplerAddressMode::ClampToBorder => {
+            reims_vgpu_core::ReflectedSamplerAddressMode::ClampToBorder
+        }
+    }
 }
 
 /// Every sampler descriptor declared by a reflected shader, transformed into
@@ -2393,10 +2322,12 @@ pub fn reflected_sampler_descriptors(
         .filter_map(|resource| {
             reflected_sampler_binding(resource, fragment_relocated).map(|binding| {
                 ReflectedSamplerDescriptor {
+                    metal_index: resource.metal_index,
                     binding,
                     static_state: (resource.kind == ResourceKind::StaticSampler)
                         .then_some(resource.static_sampler)
-                        .flatten(),
+                        .flatten()
+                        .map(project_static_sampler),
                 }
             })
         })
@@ -2638,6 +2569,24 @@ impl RenderBufferIndexBounds {
             | BufferIndexSource::LocalInvocationIndex => None,
         }
     }
+
+    fn maximum_interface(self, source: reims_vgpu_core::ShaderBufferIndexSource) -> Option<u64> {
+        use reims_vgpu_core::ShaderBufferIndexSource;
+        match source {
+            ShaderBufferIndexSource::VertexIndex => self.vertex_index,
+            ShaderBufferIndexSource::InstanceIndex => self.instance_index,
+            ShaderBufferIndexSource::GlobalInvocationIdX
+            | ShaderBufferIndexSource::GlobalInvocationIdY
+            | ShaderBufferIndexSource::GlobalInvocationIdZ
+            | ShaderBufferIndexSource::LocalInvocationIdX
+            | ShaderBufferIndexSource::LocalInvocationIdY
+            | ShaderBufferIndexSource::LocalInvocationIdZ
+            | ShaderBufferIndexSource::WorkgroupIdX
+            | ShaderBufferIndexSource::WorkgroupIdY
+            | ShaderBufferIndexSource::WorkgroupIdZ
+            | ShaderBufferIndexSource::LocalInvocationIndex => None,
+        }
+    }
 }
 
 /// Bound a render-stage `[[buffer(n)]]` by the final shader's actual byte
@@ -2707,6 +2656,120 @@ pub fn reflected_compute_buffer_extent(
     })
 }
 
+pub fn reflected_render_buffer_extent_interface(
+    interface: &reims_vgpu_core::ShaderInterface,
+    metal_index: u32,
+    bounds: RenderBufferIndexBounds,
+) -> Option<u64> {
+    reflected_buffer_footprint_extent_interface(interface, metal_index, |source| {
+        bounds.maximum_interface(source)
+    })
+}
+
+pub fn vertex_buffer_extent_interface(
+    interface: &reims_vgpu_core::ShaderInterface,
+    metal_index: u32,
+    feeds_stage_in: bool,
+    bounds: RenderBufferIndexBounds,
+) -> Option<u64> {
+    (!feeds_stage_in)
+        .then(|| reflected_render_buffer_extent_interface(interface, metal_index, bounds))
+        .flatten()
+}
+
+pub fn reflected_compute_buffer_extent_interface(
+    interface: &reims_vgpu_core::ShaderInterface,
+    metal_index: u32,
+    workgroups: [u32; 3],
+    local_size: [u32; 3],
+) -> Option<u64> {
+    use reims_vgpu_core::ShaderBufferIndexSource;
+    let axis_max = |axis: usize| {
+        u64::from(workgroups[axis])
+            .checked_mul(u64::from(local_size[axis]))?
+            .checked_sub(1)
+    };
+    let local_max = |axis: usize| u64::from(local_size[axis]).checked_sub(1);
+    let workgroup_max = |axis: usize| u64::from(workgroups[axis]).checked_sub(1);
+    let local_linear_max = || {
+        local_size
+            .into_iter()
+            .try_fold(1u64, |product, axis| product.checked_mul(u64::from(axis)))?
+            .checked_sub(1)
+    };
+    reflected_buffer_footprint_extent_interface(interface, metal_index, |source| match source {
+        ShaderBufferIndexSource::GlobalInvocationIdX => axis_max(0),
+        ShaderBufferIndexSource::GlobalInvocationIdY => axis_max(1),
+        ShaderBufferIndexSource::GlobalInvocationIdZ => axis_max(2),
+        ShaderBufferIndexSource::LocalInvocationIdX => local_max(0),
+        ShaderBufferIndexSource::LocalInvocationIdY => local_max(1),
+        ShaderBufferIndexSource::LocalInvocationIdZ => local_max(2),
+        ShaderBufferIndexSource::WorkgroupIdX => workgroup_max(0),
+        ShaderBufferIndexSource::WorkgroupIdY => workgroup_max(1),
+        ShaderBufferIndexSource::WorkgroupIdZ => workgroup_max(2),
+        ShaderBufferIndexSource::LocalInvocationIndex => local_linear_max(),
+        ShaderBufferIndexSource::VertexIndex | ShaderBufferIndexSource::InstanceIndex => None,
+    })
+}
+
+fn reflected_buffer_footprint_extent_interface(
+    interface: &reims_vgpu_core::ShaderInterface,
+    metal_index: u32,
+    maximum: impl Fn(reims_vgpu_core::ShaderBufferIndexSource) -> Option<u64>,
+) -> Option<u64> {
+    use reims_vgpu_core::{ShaderBufferExtent, ShaderResourceKind};
+    if buffer_extent_disabled() {
+        return None;
+    }
+    let resource = interface.bindings.iter().find(|resource| {
+        resource.kind == ShaderResourceKind::Buffer && resource.metal_index == metal_index
+    });
+    let declared = match resource.and_then(|resource| resource.extent) {
+        Some(ShaderBufferExtent::Object { bytes }) => {
+            crate::telemetry::note_route("bext_object");
+            crate::telemetry::note_route(band_declared_object(bytes));
+            Some(u64::from(bytes))
+        }
+        Some(ShaderBufferExtent::Unbounded) => {
+            crate::telemetry::note_route("bext_unbounded");
+            None
+        }
+        Some(ShaderBufferExtent::Unknown) => {
+            crate::telemetry::note_route("bext_unknown");
+            None
+        }
+        None => {
+            crate::telemetry::note_route("bext_absent");
+            None
+        }
+    };
+    let footprint = resource
+        .and_then(|resource| resource.footprint.as_ref())
+        .and_then(|footprint| {
+            if footprint.has_unbounded_access {
+                return None;
+            }
+            let mut end = 0u64;
+            for range in &footprint.static_ranges {
+                end = end.max(range.offset.checked_add(range.size)?);
+            }
+            for access in &footprint.strided_accesses {
+                let mut access_end = access.base_offset.checked_add(access.access_size)?;
+                for term in &access.terms {
+                    access_end =
+                        access_end.checked_add(maximum(term.source)?.checked_mul(term.stride)?)?;
+                }
+                end = end.max(access_end);
+            }
+            (end != 0).then_some(end)
+        });
+    match (declared, footprint) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(cap), None) | (None, Some(cap)) => Some(cap),
+        (None, None) => None,
+    }
+}
+
 fn reflected_buffer_footprint_extent(
     reflection: &ShaderReflection,
     metal_index: u32,
@@ -2764,31 +2827,6 @@ fn band_declared_object(bytes: u32) -> &'static str {
         4097..=65536 => "bext_object_le64k",
         _ => "bext_object_gt64k",
     }
-}
-
-/// What reflection says a `[[buffer(n)]]` bind is *for*, as a total answer.
-///
-/// The translator's [`ResourceAccess`] is parsed here, at the one boundary that
-/// reads it, so no consumer downstream matches on an `Option` of a foreign enum
-/// and silently gains a fourth case when the translator declares one.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReflectedBufferAccess {
-    /// The specialized entry point does not dereference this buffer. Its
-    /// descriptor may still have to be bound, but no guest bytes are read
-    /// through it, so nothing needs staging for this draw.
-    Unused,
-    /// The shader reads this buffer and never writes it.
-    ReadOnly,
-    /// The shader may write this buffer. `WriteOnly` and `ReadWrite` collapse
-    /// here because both require device-to-guest writeback after a dispatch.
-    Writable,
-    /// Reflection carries no `Buffer` at this Metal index. A compute encoder may
-    /// ignore that extra guest bind; a render encoder still has to consider the
-    /// separate stage-in use of the same index.
-    Absent,
-    /// Reflection declares the buffer but carries no usable access answer.
-    /// Consumers must retain the conservative read/write path.
-    Unknown,
 }
 
 /// Bytes in the neutral page a [`ReflectedBufferAccess::Unused`] bind is given
@@ -2954,21 +2992,6 @@ pub fn reflected_buffer_access(
     }
 }
 
-/// How reflection describes descriptor `binding` for the sampled render path.
-/// Lets the call site log a genuine gap fail-visibly while staying silent on the
-/// expected "bound but not sampled by this shader" case.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReflectedSampledKind {
-    /// Reflection carries a sampled dimensionality the render path can express.
-    Kind(SampledImageKind),
-    /// Reflection lists a texture shape here the sampled path cannot express (a
-    /// texel `Buffer` or a 3D array) — a genuine unsupported shape.
-    Unsupported,
-    /// Reflection lists no texture shape at this binding — an unused/unbound slot
-    /// (Metal permits binding a texture a shader never samples).
-    Absent,
-}
-
 /// Classify descriptor `binding` for the sampled render path from reflection.
 pub fn reflected_sampled_kind(reflection: &ShaderReflection, binding: u32) -> ReflectedSampledKind {
     match texture_shape_for_binding(reflection, binding) {
@@ -2978,23 +3001,6 @@ pub fn reflected_sampled_kind(reflection: &ShaderReflection, binding: u32) -> Re
             None => ReflectedSampledKind::Unsupported,
         },
     }
-}
-
-/// How the compute rail must treat texture descriptor `binding`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReflectedComputeTexture {
-    /// Reflection lists no texture shape here. Metal permits binding a texture
-    /// the shader never samples or writes, so this is expected control flow —
-    /// the caller stages nothing and invents no access semantics for it.
-    Absent,
-    /// A single-layer, non-multisampled 2D texture, carrying its
-    /// sampled-vs-storage class. This is the only shape the compute rail can
-    /// stage: a binding comes from one IOSurface texture plane window or one linear GVA
-    /// level, both flat `width × height` rectangles.
-    Plain2d(ImageAccess),
-    /// The shader declares a shape with a slice, depth, or sample axis the
-    /// compute rail has no staged source for. `axis` names it for the fail log.
-    UnstageableShape { axis: &'static str },
 }
 
 /// Classify texture descriptor `binding` for the compute rail from the
@@ -3031,6 +3037,37 @@ pub fn reflected_compute_texture(
             ImageAccess::Sampled
         }),
     }
+}
+
+pub fn reflected_storage_image_format_interface(
+    interface: &reims_vgpu_core::ShaderInterface,
+    binding: u32,
+) -> Option<ImageFormat> {
+    use reims_vgpu_protocol::StorageImageFormat;
+    Some(match interface.storage_image_format(binding)? {
+        StorageImageFormat::Rgba32Float => ImageFormat::Rgba32Float,
+        StorageImageFormat::Rgba16Float => ImageFormat::Rgba16Float,
+        StorageImageFormat::R16Float => ImageFormat::R16Float,
+        StorageImageFormat::Rgba16Uint => ImageFormat::Rgba16Uint,
+        StorageImageFormat::Rgba8Uint => ImageFormat::Rgba8Uint,
+        StorageImageFormat::Rgba8Sint => ImageFormat::Rgba8Sint,
+        StorageImageFormat::Rg16Float => ImageFormat::Rg16Float,
+        StorageImageFormat::R32Uint => ImageFormat::R32ui,
+        StorageImageFormat::R32Float => ImageFormat::R32Float,
+        StorageImageFormat::Rgba8Unorm
+        | StorageImageFormat::Bgra8Unorm
+        | StorageImageFormat::R8Unorm
+        | StorageImageFormat::Rg8Unorm
+        | StorageImageFormat::Rgba32Uint
+        | StorageImageFormat::R32Sint
+        | StorageImageFormat::Rgb9e5Ufloat
+        | StorageImageFormat::R16Unorm
+        | StorageImageFormat::Rg16Unorm
+        | StorageImageFormat::Rgba16Unorm
+        | StorageImageFormat::Rgb10a2Unorm
+        | StorageImageFormat::Bgr10a2Unorm
+        | StorageImageFormat::Rg11b10Float => return None,
+    })
 }
 
 /// Validate that the translator's reflection is internally well-formed, once per
@@ -3659,36 +3696,6 @@ mod more_tests {
     fn a_sampled_image_format_does_not_demand_the_storage_capability() {
         let words = module_with(&op_type_image(10, 1, 7));
         assert!(!required_image_capabilities(&words).extended_formats);
-    }
-
-    /// The memo answers what the walk answers, for every module and not only
-    /// for the one it was first asked about.
-    ///
-    /// The hazard a memo keyed on an address carries is that a *second* module
-    /// gets a hit meant for the first, and the failure mode is silent: the draw
-    /// is checked against another shader's binding set, so a real layout gap
-    /// reads as clean. So the assertion is over two modules with disjoint
-    /// bindings, each asked twice and interleaved, against the walking form
-    /// taken on the same words.
-    #[test]
-    fn the_memoized_binding_sweep_answers_per_module_and_not_per_first_call() {
-        let a = std::sync::Arc::new(test_module_with_two_sampled_images(33, 34));
-        let b = std::sync::Arc::new(test_module_with_two_sampled_images(40, 41));
-        let walk = |m: &std::sync::Arc<Vec<u32>>| declared_binding_numbers(m);
-
-        for _ in 0..2 {
-            assert_eq!(
-                declared_binding_numbers_memoized(&a).to_vec(),
-                walk(&a),
-                "the first module keeps its own answer"
-            );
-            assert_eq!(
-                declared_binding_numbers_memoized(&b).to_vec(),
-                walk(&b),
-                "and the second is not served the first one's"
-            );
-        }
-        assert_ne!(walk(&a), walk(&b), "the fixture modules must differ at all");
     }
 
     /// The candidate list is class-blind and the use test is not, which is the
@@ -5498,5 +5505,68 @@ mod more_tests {
         words.extend([(4u32 << 16) | OP_DECORATE as u32, 3, DECORATION_BINDING, 66]);
         words.extend([(4u32 << 16) | OP_DECORATE as u32, 4, DECORATION_BINDING, 99]);
         assert_eq!(sampler_bindings(&words), vec![66]);
+    }
+
+    #[test]
+    fn semantic_shader_interface_preserves_texture_classification() {
+        let shape = TextureShape {
+            dimension: metal2vulkan::meta::TextureDimension::D2,
+            arrayed: false,
+            multisampled: false,
+            component: TextureComponent::Float,
+            writable: true,
+            array_ref: false,
+            array_length: None,
+            storage_format: Some(metal2vulkan::meta::TextureFormat::R32f),
+        };
+        let mut reflection = empty_reflection(ShaderStage::Kernel);
+        reflection.bindings.push(texture_binding(37, shape));
+        let interface = crate::m2v_cache::project_shader_interface(&reflection);
+
+        assert_eq!(
+            reflected_texture_descriptor(&reflection, 5),
+            interface.texture_descriptor(5)
+        );
+        assert_eq!(
+            reflected_compute_texture(&reflection, 37),
+            interface.compute_texture(37)
+        );
+        assert_eq!(
+            reflected_storage_image_format(&reflection, 37),
+            reflected_storage_image_format_interface(&interface, 37)
+        );
+    }
+
+    #[test]
+    fn semantic_shader_interface_preserves_buffer_access_and_bounds() {
+        let mut reflection = empty_reflection(ShaderStage::Kernel);
+        let mut buffer = buffer_binding(3, Some(BufferExtent::Object { bytes: 512 }));
+        buffer.access = Some(ResourceAccess::ReadOnly);
+        buffer.footprint = Some(BufferFootprint {
+            static_ranges: vec![BufferByteRange {
+                offset: 8,
+                size: 16,
+            }],
+            strided_accesses: vec![BufferStridedAccess {
+                base_offset: 32,
+                access_size: 4,
+                terms: vec![BufferStrideTerm {
+                    source: BufferIndexSource::GlobalInvocationIdX,
+                    stride: 8,
+                }],
+            }],
+            has_unbounded_access: false,
+        });
+        reflection.bindings.push(buffer);
+        let interface = crate::m2v_cache::project_shader_interface(&reflection);
+
+        assert_eq!(
+            reflected_buffer_access(&reflection, 3),
+            interface.buffer_access(3)
+        );
+        assert_eq!(
+            reflected_compute_buffer_extent(&reflection, 3, [4, 1, 1], [2, 1, 1]),
+            reflected_compute_buffer_extent_interface(&interface, 3, [4, 1, 1], [2, 1, 1])
+        );
     }
 }

@@ -295,10 +295,10 @@ pub unsafe fn query(
     // topology comes from the same properties, so nothing here is a second
     // policy.
     let props = unsafe { instance.get_physical_device_memory_properties(pd) };
+    let topology = crate::memory::classify_memory(&props).topology;
     let heap_budget = crate::memory::roomiest_heap_for(
         &props,
-        &crate::memory::classify_memory(&props)
-            .topology
+        &crate::policy::MemoryPlacementPolicy::new(topology)
             .request(crate::memory::MemoryClass::Upload),
     );
 
@@ -333,6 +333,10 @@ pub unsafe fn query(
 
 /// Query host-pointer importability with the operator's capability-narrowing
 /// switch applied.
+///
+/// # Safety
+///
+/// `pd` must be a physical device belonging to `instance`.
 pub unsafe fn query_configured(
     instance: &ash::Instance,
     pd: vk::PhysicalDevice,

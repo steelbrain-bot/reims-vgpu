@@ -14,11 +14,7 @@ crate-type = ["staticlib", "rlib"]
 name = "reims_vgpu"
 
 [features]
-default = ["backend-vulkan"]
-# Product encode: self-contained ash engine + metal2vulkan. This feature
-# uses native Vulkan on Linux and MoltenVK on macOS.
-# No vkcompute on any edge (product or dev) — engine is self-contained.
-backend-vulkan = ["dep:ash"]
+default = []
 # Host-owned presentation window (kb host-window): Rust winit window +
 # VkSurfaceKHR/swapchain that replaces QEMU's UI. Off by default so the QEMU
 # staticlib link is unchanged until the window is proven. Pulls the windowing
@@ -27,7 +23,6 @@ host-window = [
     "dep:winit",
     "dep:ash-window",
     "dep:raw-window-handle",
-    "backend-vulkan",
     "reims-vgpu-vulkan/host-window",
 ]
 
@@ -52,9 +47,6 @@ reims-vgpu-vulkan = { path = "../reims-vgpu-vulkan" }
 # Guest address resolution above the wire page-table format: span walks, GPA
 # run coalescing, window region planning. `no_std` + alloc, no host traits.
 reims-vgpu-paging = { path = "../reims-vgpu-paging" }
-ash = { version = "0.38", optional = true }
-# Always available for Linux MTLB→AIR→SPIR-V (encode path + probes).
-metal2vulkan = { git = "https://github.com/steelbrain/metal2vulkan.git", rev = "8b78eaca3be72b4e596aa1c790a4cd114ac1e9ec" }
 winit = { version = "0.30", optional = true }
 ash-window = { version = "0.13", optional = true }
 raw-window-handle = { version = "0.6", optional = true }
@@ -63,6 +55,9 @@ raw-window-handle = { version = "0.6", optional = true }
 libc = "0.2"
 
 [dev-dependencies]
+# Legacy translator-oracle integration fixtures; production translation is
+# owned exclusively by `reims-vgpu-vulkan`.
+metal2vulkan = { git = "https://github.com/steelbrain/metal2vulkan.git", rev = "8b78eaca3be72b4e596aa1c790a4cd114ac1e9ec" }
 # Reads `reims-vgpu-wire`'s oracle fixtures — bytes Apple's own serializer
 # produced — so `wire_fixtures_reach_the_decoders` can run them through this
 # crate's decoders. Test-only: nothing here reaches the staticlib QEMU links.
@@ -70,6 +65,7 @@ serde_json = "1"
 reims-vgpu-vulkan = { path = "../reims-vgpu-vulkan", features = ["test-fixtures"] }
 reims-vgpu-observe = { path = "../reims-vgpu-observe", features = ["test-fixtures"] }
 reims-vgpu-memory = { path = "../reims-vgpu-memory", features = ["test-fixtures"] }
+reims-vgpu-core = { path = "../reims-vgpu-core", features = ["test-fixtures"] }
 
 [build-dependencies]
 cc = "1"

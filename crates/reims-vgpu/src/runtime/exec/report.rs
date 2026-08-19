@@ -258,7 +258,7 @@ pub(super) fn note_depth_stencil_unsupported(
 
 /// Bands for the stated pass extent as a fraction of its attachment's area.
 ///
-/// Same seven bands as the scissor-union census in `draw::vulkan`, so the
+/// Same seven bands as the scissor-union census in `draw::execution`, so the
 /// two are readable side by side — they answer the same question from two
 /// different sources, and the whole point is which of the two carries damage the
 /// other does not.
@@ -287,7 +287,7 @@ pub(super) const PASS_EXTENT_SLUGS: [&str; 7] = [
 /// census, not a resolve, and making it resolve would put a guest-memory walk on
 /// the hottest record in the device.
 pub(super) fn note_pass_extent_for_slot(
-    state: &crate::model::DeviceState,
+    state: &crate::runtime::Device,
     task_id: u32,
     slot: u32,
     mapping_id: u32,
@@ -303,14 +303,18 @@ pub(super) fn note_pass_extent_for_slot(
     // report a handful of tiny surfaces and read as if that were the whole
     // population. The pass names its target either way; the geometry is the part
     // that may be missing, and `?x?` says which.
-    match state.mappings.get(&mapping_id) {
+    match state.surfaces.mappings.get(&mapping_id) {
         Some(e) => {
-            note_pass_target(task_id, mapping_id, Some((e.width, e.height)));
+            note_pass_target(
+                task_id,
+                mapping_id,
+                Some((e.width_or_zero(), e.height_or_zero())),
+            );
             note_pass_extent_coverage(
                 cmd.pass_render_target_width,
                 cmd.pass_render_target_height,
-                e.width,
-                e.height,
+                e.width_or_zero(),
+                e.height_or_zero(),
             );
         }
         None => note_pass_target(task_id, mapping_id, None),
@@ -427,10 +431,10 @@ pub(super) fn note_pass_extent_coverage(pass_w: u64, pass_h: u64, surf_w: u32, s
     crate::runtime::drain::note_store_route(PASS_EXTENT_SLUGS[pass_extent_band(pct)]);
 }
 
-/// The bands, matching `draw::vulkan::coverage_band` exactly.
+/// The bands, matching `draw::execution::coverage_band` exactly.
 ///
 /// Declared here rather than shared because that one is behind
-/// `backend-vulkan` and this census runs on every backend; the two are pinned
+/// the Vulkan executor and this census runs for every submission; the two are pinned
 /// equal by `the_two_coverage_censuses_use_the_same_bands`.
 pub(super) fn pass_extent_band(pct: u64) -> usize {
     match pct {

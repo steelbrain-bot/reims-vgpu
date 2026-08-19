@@ -5,7 +5,8 @@ use core::hash::{Hash, Hasher};
 use core::marker::PhantomData;
 
 macro_rules! scalar_newtype {
-    ($name:ident, $inner:ty) => {
+    ($(#[$meta:meta])* $name:ident, $inner:ty) => {
+        $(#[$meta])*
         #[repr(transparent)]
         #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name($inner);
@@ -37,8 +38,27 @@ macro_rules! scalar_newtype {
 scalar_newtype!(TaskId, u32);
 scalar_newtype!(ResourceNamespaceId, u32);
 scalar_newtype!(MappingId, u32);
-scalar_newtype!(MapperSurfaceRef, u32);
+scalar_newtype!(
+    /// Mapper-service lookup identity carried by mapper-backed IOSurface objects.
+    ///
+    /// This namespace is independent of GPU page-table mappings and registered
+    /// surface backings. The wire producer and consumer both use all 64 bits; a
+    /// low live value does not license narrowing the identity.
+    MapperSurfaceRef,
+    u64
+);
 scalar_newtype!(SurfaceId, u32);
+scalar_newtype!(
+    /// Task-visible surface/host-representation identity obtained by resolving
+    /// a mapper-service reference.
+    ///
+    /// This is deliberately not [`MapperSurfaceRef`], a page-table
+    /// [`MappingId`], or a canonical [`SurfaceBackingId`]. Adapters may still
+    /// project it into a legacy integer-keyed table, but the relation is an
+    /// explicit edge rather than numeric equivalence.
+    MapperResolvedSurfaceId,
+    u32
+);
 scalar_newtype!(SurfaceBackingId, u64);
 scalar_newtype!(StorageId, u64);
 scalar_newtype!(GuestVirtualAddress, u64);
@@ -46,9 +66,18 @@ scalar_newtype!(GuestPhysicalAddress, u64);
 scalar_newtype!(ByteOffset, u64);
 scalar_newtype!(ByteLength, u64);
 scalar_newtype!(SubmissionId, u64);
+scalar_newtype!(
+    /// Executor-prepared shader identity.
+    ///
+    /// The semantic command carries this identity and its decoded interface;
+    /// backend-native module bytes remain in the executor that prepared it.
+    PreparedShaderId,
+    u64
+);
 scalar_newtype!(BackingGeneration, u64);
 scalar_newtype!(ContentVersion, u64);
 scalar_newtype!(PlaneIndex, u32);
+scalar_newtype!(TextureRotation, u8);
 
 impl fmt::LowerHex for GuestVirtualAddress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

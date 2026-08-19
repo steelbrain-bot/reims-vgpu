@@ -3,43 +3,26 @@
 //! Loads per-function MTLB containers from the object list, materializes stream
 //! binds (vertex/fragment buffers, optional index buffer, viewport/scissor),
 //! hands them to the backend, and writes the RGBA result into the IOSurface texture
-//! mapping via [`mapping_write`]. [`vulkan`] translates the guest shaders and
-//! submits the draw through [`crate::backend::vulkan::engine`].
+//! mapping via [`mapping_write`]. [`execution`] resolves semantic execution
+//! inputs and submits the draw through the injected executor.
 
-#[cfg(feature = "backend-vulkan")]
-use crate::backend::vulkan::engine::{DrawError, DrawPreparationDecline};
-#[cfg(feature = "backend-vulkan")]
-use crate::backend::vulkan::translate;
-use crate::contract::pixel_format::{
+use crate::runtime::Device;
+use reims_vgpu_core::pixel_format::{
     self, solid_rgba8, SampledByteFormat, TexelLayout, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP,
 };
-use crate::model::DeviceState;
 // `Decline::slug` on typed draw, coverage, and translation reasons.
 
 use crate::observe::Decline;
 // The one downgrade site left in this tree is the secondary colour attachment,
 // which is Vulkan-only. The CPU upload rails used to report here too and no
 // longer downgrade at all: they carry the source format through to the bind.
-#[cfg(feature = "backend-vulkan")]
 use crate::runtime::census::srgb_census;
 // Only `vulkan` and the tests read it, through this module's `use super::*`;
-#[cfg(any(test, feature = "backend-vulkan"))]
-use crate::contract::pass_action::MTL_LOAD_ACTION_DONT_CARE;
-#[cfg(feature = "backend-vulkan")]
-use crate::contract::pass_action::{is_declared_load_action, is_declared_store_action};
-use crate::contract::pass_action::{
-    MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_LOAD, MTL_STORE_ACTION_STORE,
-};
-use crate::runtime::decode::render::{
-    ColorAttachment, DepthAttachment, ScissorRect, StencilAttachment,
-};
-#[cfg(feature = "backend-vulkan")]
+use crate::runtime::decode::render::{ColorAttachment, ScissorRect};
 use crate::runtime::decode::resource::TextureDescriptor;
 use crate::runtime::decode::resource::{
-    decode_buffer_texture_descriptor, decode_depth_stencil_descriptor,
-    decode_render_pipeline_descriptor, decode_texture_descriptor, texture_type8_opcode,
+    decode_depth_stencil_descriptor, decode_render_pipeline_descriptor, decode_texture_descriptor,
     BufferTextureDescriptor, DecodeStatus, ObjectKind, RenderPipelineDescriptor,
-    TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
 };
 use crate::runtime::gva_mem;
 use crate::runtime::host::{HostMemory, HostOps};
@@ -47,19 +30,46 @@ use crate::runtime::mapper;
 use crate::runtime::mapping_write;
 use crate::runtime::mtlb::{load_mtlb, AirLoadRail};
 use crate::runtime::objects;
+use reims_vgpu_protocol::pass_action::{is_declared_load_action, is_declared_store_action};
+#[cfg(test)]
+use reims_vgpu_protocol::pass_action::{
+    MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_DONT_CARE, MTL_LOAD_ACTION_LOAD, MTL_STORE_ACTION_STORE,
+};
 
-// The Vulkan half of this path. Gated once here rather than per item, and
-// re-exported flat so callers keep naming its items
+// The resolved execution half of this path. Re-exported flat so callers keep naming its items
 // `crate::runtime::draw::<name>`.
-#[cfg(feature = "backend-vulkan")]
-mod vulkan;
+mod execution;
 // Only for `exec`'s pass-extent census, which declares its own copy of these
 // bands because it runs on every backend. See
 // `the_two_coverage_censuses_use_the_same_bands`.
-#[cfg(all(test, feature = "backend-vulkan"))]
-pub(crate) use vulkan::coverage_band_for_test;
-#[cfg(feature = "backend-vulkan")]
-pub use vulkan::*;
+#[cfg(test)]
+pub(crate) use execution::coverage_band_for_test;
+pub use execution::*;
+
+// Immutable semantic request plus its pre-submission completion route. This is
+// the seam between draw planning and Store/observation control flow.
+mod prepared_draw;
+use prepared_draw::*;
+
+// Completion diagnostics are downstream of both planning and execution. They
+// inspect output but own no execution or Store decisions.
+mod observation;
+use observation::*;
+
+// Fixed-function guest ordinals normalize once into complete semantic state.
+mod fixed_state;
+use fixed_state::*;
+
+// Semantic target identity, resident-content currency, and Store publication.
+// Kept beside execution because these rules name guest-visible ownership and
+// lifetime, not the native executor mechanism used to realize them.
+mod resident;
+pub(crate) use resident::*;
+
+// Guest resource lookup, content-authority resolution, and construction of
+// semantic sampled inputs. Native draw assembly consumes this boundary.
+mod sampled_source;
+use sampled_source::*;
 
 // Type-8 texture-view resolution and linear texture loads. Backend-independent,
 // so the module carries no gate of its own; the two items inside it that are
@@ -75,74 +85,19 @@ pub(crate) use texture_view::*;
 mod render_target;
 use render_target::{lookup_render_target, ResolvedRenderTarget};
 
-/// Bind **index** cap for the buffer argument table.
-///
-/// This is [`reims_vgpu_wire::ops::bind_limit::BUFFER`], the slot count at which
-/// Apple's serializer truncates a plural buffer bind. A guest bind at or past
-/// it cannot come from a serialized Apple stream.
-pub const MAX_BUFFER_BIND_SLOTS: u32 = 31;
+// Decoded pass attachments become one complete semantic target set here. A
+// malformed slot refuses the set instead of letting orchestration execute a
+// reduced pass.
+mod attachment_plan;
+pub use attachment_plan::mrt_draw_request;
 
-/// Bind **index** cap for the texture argument table.
-///
-/// A slot count, not a byte budget. Resource byte sizes follow the guest
-/// descriptor and page-table span; nothing here caps them.
-///
-/// # This is Apple's whole texture table, and nothing is refused below it
-///
-/// 128 is `reims_vgpu_wire::ops::bind_limit::TEXTURE` — the size of the argument
-/// table Apple's serializer truncates a plural texture bind at — so no texture
-/// bind an Apple guest can emit reaches this bound. A `const` assertion in
-/// [`crate::runtime::exec`] pins the two equal, and
-/// `render_texture_bind_slot_past_table` stays as the alarm for a stream that
-/// somehow does.
-///
-/// It is also the width of the device's texture binding band, which is what used
-/// to make it 31. The device names a bound resource by one `u32` descriptor
-/// binding that packs class and index into bands, and `metal2vulkan` emits those
-/// bands 32 apart — so texture 40 and sampler 8 were both binding 72, and the
-/// *number* could not say which. Slots 32..127 were dropped for that reason
-/// alone.
-///
-/// [`crate::runtime::spirv_bind::widen_sampled_bands`] removes it. The sampler
-/// and ColorInput bands move up out of the way once per shader, keyed on each
-/// variable's SPIR-V *type* rather than its number, leaving the texture band
-/// exactly 128 wide with the translator's own texture decorations already
-/// correct in it. So this constant is now the same fact twice — Apple's table
-/// and the band's width — and the `const` assertions beside
-/// `SAMPLER_BINDING_BASE` hold it to both.
-pub const MAX_TEXTURE_BIND_SLOTS: u32 = 128;
-
-/// Bind **index** cap for the sampler argument table.
-///
-/// The sampler band is `[160, 192)` — [`crate::runtime::spirv_bind::SAMPLER_BINDING_BASE`]
-/// up to [`crate::runtime::spirv_bind::COLOR_INPUT_BINDING_BASE`] — so this is
-/// the same encoding bound [`MAX_TEXTURE_BIND_SLOTS`] documents, applied to the
-/// next band up.
-///
-/// Apple's serializer truncates samplers at 16 (`bind_limit::SAMPLER`). This
-/// wider bound describes the Vulkan descriptor band; the serializer limit is
-/// asserted separately at the stream boundary.
-pub const MAX_SAMPLER_BIND_SLOTS: u32 = 32;
-
-/// The widest of the three bind bounds.
-///
-/// For sizing something one *descriptor type* draws from, where the type is
-/// served by exactly one class and the caller does not know which — the Vulkan
-/// descriptor arena's per-type block budget is the case. Declared beside the
-/// three constants rather than at the site, so the three-way comparison is not
-/// a fourth copy of the rule.
-pub const MAX_ANY_BIND_SLOTS: u32 = {
-    let widest = if MAX_TEXTURE_BIND_SLOTS > MAX_SAMPLER_BIND_SLOTS {
-        MAX_TEXTURE_BIND_SLOTS
-    } else {
-        MAX_SAMPLER_BIND_SLOTS
-    };
-    if widest > MAX_BUFFER_BIND_SLOTS {
-        widest
-    } else {
-        MAX_BUFFER_BIND_SLOTS
-    }
+pub use reims_vgpu_core::{
+    MAX_ANY_BIND_SLOTS, MAX_BUFFER_BIND_SLOTS, MAX_SAMPLER_BIND_SLOTS, MAX_TEXTURE_BIND_SLOTS,
 };
+
+pub type DrawPreparationDecline =
+    reims_vgpu_core::DrawPreparationDecline<crate::runtime::executor::M2vCacheDecline>;
+pub type RenderMtlbPair = (std::sync::Arc<[u8]>, std::sync::Arc<[u8]>);
 
 /// Which of the three argument tables a bind record names.
 ///
@@ -157,7 +112,7 @@ pub const MAX_ANY_BIND_SLOTS: u32 = {
 /// for the class, the reach bands, the drop slug — as its own `impl` on this
 /// type, because those describe how a loss is *reported* rather than what the
 /// table *is*.
-pub use reims_vgpu_vulkan::preparation::BindTableClass;
+pub use reims_vgpu_core::BindTableClass;
 
 /// A live bind in one draw request whose slot no argument table of its class can
 /// name.
@@ -165,7 +120,7 @@ pub use reims_vgpu_vulkan::preparation::BindTableClass;
 /// Carries the object ref as well as the slot, because the two say different
 /// things: the slot names which table ran out, and the ref is what the guest
 /// still believes is bound there.
-pub use reims_vgpu_vulkan::preparation::PastTableBind;
+pub use reims_vgpu_core::PastTableBind;
 
 /// The first live bind in `req` that names a slot past its class's table, if any.
 ///
@@ -193,7 +148,7 @@ pub use reims_vgpu_vulkan::preparation::PastTableBind;
 /// wrong is a host failure that takes the process down, and because the check
 /// that once stood at each consumer had already drifted.
 pub fn first_bind_past_table(req: &DrawEncodeRequest) -> Option<PastTableBind> {
-    use reims_vgpu_vulkan::preparation::ShaderStage as Stage;
+    use reims_vgpu_core::ShaderStage as Stage;
 
     let buffers = [
         (Stage::Vertex, &req.vertex_buffers),
@@ -326,7 +281,6 @@ fn swap_rb_channels(src: &[u8]) -> Vec<u8> {
 /// The exchange is an involution, so one routine serves both directions. Trailing
 /// bytes that do not fill a whole pixel pass through untouched, matching
 /// [`swap_rb_channels`].
-#[cfg(feature = "backend-vulkan")]
 #[inline]
 fn reorder_rb_in_place(px: &mut [u8], have_bgra: bool, want_bgra: bool) {
     if have_bgra == want_bgra {
@@ -351,15 +305,14 @@ fn reorder_rb_in_place(px: &mut [u8], have_bgra: bool, want_bgra: bool) {
 /// Detection is purely structural: a buffer binding at `idx` in the adopted
 /// reflection for the translated vertex module. Never keyed on a
 /// shader/struct/variable name.
-#[cfg(feature = "backend-vulkan")]
 fn vertex_buffer_needs_storage_binding(
-    reflection: &metal2vulkan::reflect::ShaderReflection,
+    reflection: &reims_vgpu_core::ShaderInterface,
     idx: u32,
     is_stage_in: bool,
 ) -> bool {
     !is_stage_in
         || reflection.bindings.iter().any(|binding| {
-            binding.kind == metal2vulkan::reflect::ResourceKind::Buffer
+            binding.kind == reims_vgpu_core::ShaderResourceKind::Buffer
                 && binding.metal_index == idx
         })
 }
@@ -370,7 +323,6 @@ fn vertex_buffer_needs_storage_binding(
 /// formatted into, because the class decides the SPIR-V binding relocation and a
 /// consumer that wants it back out of a string has to parse one. `Display` is the
 /// only place the prefix exists now.
-#[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FragUnboundClass {
     Buffer,
@@ -378,7 +330,6 @@ pub enum FragUnboundClass {
     Sampler,
 }
 
-#[cfg(feature = "backend-vulkan")]
 impl std::fmt::Display for FragUnboundClass {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -391,7 +342,6 @@ impl std::fmt::Display for FragUnboundClass {
 
 /// One directly-bound fragment resource the shader declares and the draw did not
 /// provide.
-#[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FragUnbound {
     pub class: FragUnboundClass,
@@ -399,7 +349,6 @@ pub struct FragUnbound {
     pub metal_index: u32,
 }
 
-#[cfg(feature = "backend-vulkan")]
 impl std::fmt::Display for FragUnbound {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}{}", self.class, self.metal_index)
@@ -428,9 +377,8 @@ impl std::fmt::Display for FragUnbound {
 ///   two populations cannot tell them apart any more.
 /// - **Not `Ambiguous`.** Two variables on one binding is its own defect and is
 ///   not repaired by picking one of them; `is_violation` already excludes it.
-#[cfg(feature = "backend-vulkan")]
 fn frag_unbound_textures_to_neutralize(
-    uses: &[(FragUnbound, crate::runtime::spirv_bind::DescriptorUse)],
+    uses: &[(FragUnbound, reims_vgpu_core::DescriptorUse)],
 ) -> Vec<u32> {
     uses.iter()
         .filter(|(gap, use_)| use_.is_violation() && gap.class == FragUnboundClass::Texture)
@@ -450,23 +398,22 @@ fn frag_unbound_textures_to_neutralize(
 /// allocates nothing unless a genuine gap exists, which is near-never on a
 /// healthy boot. Unsupported reflected resource families are refused before
 /// this scan and therefore have no second classification here.
-#[cfg(feature = "backend-vulkan")]
 fn frag_unbound_scan(
-    bindings: &[metal2vulkan::reflect::ResourceBinding],
+    bindings: &[reims_vgpu_core::ShaderResourceBinding],
     has_buf: impl Fn(u32) -> bool,
     has_tex: impl Fn(u32) -> bool,
     has_smp: impl Fn(u32) -> bool,
     tex_declared_in_module: impl Fn(u32) -> bool,
 ) -> Vec<FragUnbound> {
-    use metal2vulkan::reflect::ResourceKind;
+    use reims_vgpu_core::ShaderResourceKind;
     let mut unbound: Vec<FragUnbound> = Vec::new();
     for rb in bindings {
         let (cls, provided) = match rb.kind {
-            ResourceKind::Buffer => (FragUnboundClass::Buffer, has_buf(rb.metal_index)),
-            ResourceKind::Texture | ResourceKind::TextureArray => {
+            ShaderResourceKind::Buffer => (FragUnboundClass::Buffer, has_buf(rb.metal_index)),
+            ShaderResourceKind::Texture | ShaderResourceKind::TextureArray => {
                 (FragUnboundClass::Texture, has_tex(rb.metal_index))
             }
-            ResourceKind::Sampler => (FragUnboundClass::Sampler, has_smp(rb.metal_index)),
+            ShaderResourceKind::Sampler => (FragUnboundClass::Sampler, has_smp(rb.metal_index)),
             _ => continue,
         };
         if provided {
@@ -481,8 +428,10 @@ fn frag_unbound_scan(
         // Asked of textures only, because that is the class observed firing and
         // the binding relocation for it is the one this caller can compute. A
         // buffer or sampler reported here is still worth reading as before.
-        if matches!(rb.kind, ResourceKind::Texture | ResourceKind::TextureArray)
-            && !tex_declared_in_module(rb.metal_index)
+        if matches!(
+            rb.kind,
+            ShaderResourceKind::Texture | ShaderResourceKind::TextureArray
+        ) && !tex_declared_in_module(rb.metal_index)
         {
             continue;
         }
@@ -511,64 +460,44 @@ fn frag_unbound_scan(
 /// sampler gap answers [`spirv_bind::DescriptorUse::Used`] unexamined, which
 /// keeps them reported exactly as loudly as before rather than quietly
 /// downgrading a class nobody has measured.
-#[cfg(feature = "backend-vulkan")]
 fn frag_unbound_static_use(
     gap: &FragUnbound,
-    f_words: &[u32],
-    separate_sampled: bool,
-) -> crate::runtime::spirv_bind::DescriptorUse {
-    use crate::runtime::spirv_bind::{
-        self, DescriptorUse, FRAG_SAMPLED_RESOURCE_BINDING_OFFSET, TEXTURE_BINDING_BASE,
-    };
+    variant: &reims_vgpu_core::PreparedShaderVariant,
+) -> reims_vgpu_core::DescriptorUse {
+    use reims_vgpu_core::DescriptorUse;
     if gap.class != FragUnboundClass::Texture {
         return DescriptorUse::Used;
     }
-    let base_off = if separate_sampled {
-        FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
-    } else {
-        0
-    };
-    spirv_bind::descriptor_static_use(f_words, TEXTURE_BINDING_BASE + gap.metal_index + base_off)
+    variant.texture_use(gap.metal_index)
 }
 
-#[cfg(feature = "backend-vulkan")]
 fn reflected_sampled_binding_collision(
-    vertex: &metal2vulkan::reflect::ShaderReflection,
-    fragment: &metal2vulkan::reflect::ShaderReflection,
+    vertex: &reims_vgpu_core::ShaderInterface,
+    fragment: &reims_vgpu_core::ShaderInterface,
 ) -> bool {
-    use crate::runtime::spirv_bind::{COLOR_INPUT_BINDING_BASE, TEXTURE_BINDING_BASE};
-
     let vertex_bindings = vertex
         .bindings
         .iter()
-        .filter_map(|binding| binding.descriptor.map(|descriptor| descriptor.binding))
-        .filter(|binding| (TEXTURE_BINDING_BASE..COLOR_INPUT_BINDING_BASE).contains(binding))
+        .filter(|binding| {
+            matches!(
+                binding.kind,
+                reims_vgpu_core::ShaderResourceKind::Texture
+                    | reims_vgpu_core::ShaderResourceKind::TextureArray
+            )
+        })
+        .map(|binding| binding.metal_index)
         .collect::<std::collections::BTreeSet<_>>();
     fragment
         .bindings
         .iter()
-        .filter_map(|binding| binding.descriptor.map(|descriptor| descriptor.binding))
-        .any(|binding| vertex_bindings.contains(&binding))
-}
-
-/// A depth-stencil state the Linux Vulkan engine can safely ignore because it is
-/// functionally equivalent to no depth/stencil test: depth compare **Always**
-/// (never occludes), depth writes off, and both stencil faces disabled. Anything
-/// else — a real compare function, a depth write, or an enabled stencil face —
-/// changes the rendered result if dropped, so ignoring it (the render path binds
-/// no depth/stencil state) is a genuine mis-execution → wrong occlusion. macOS UI
-/// compositing binds no depth-stencil at all (0 of 455k draws in a live boot); this
-/// only bites 3D content (WebGL / 3D-CSS). `MTLCompareFunctionAlways = 7` is the
-/// Metal API contract value (Never=0, Less=1, …, GreaterEqual=6, Always=7).
-#[cfg(feature = "backend-vulkan")]
-fn depth_stencil_descriptor_is_trivial(
-    d: &crate::runtime::decode::resource::DepthStencilDescriptor,
-) -> bool {
-    const MTL_COMPARE_ALWAYS: u32 = 7;
-    d.depth_compare_function == MTL_COMPARE_ALWAYS
-        && !d.depth_write_enabled
-        && !d.front_stencil_enabled
-        && !d.back_stencil_enabled
+        .filter(|binding| {
+            matches!(
+                binding.kind,
+                reims_vgpu_core::ShaderResourceKind::Texture
+                    | reims_vgpu_core::ShaderResourceKind::TextureArray
+            )
+        })
+        .any(|binding| vertex_bindings.contains(&binding.metal_index))
 }
 
 /// Decode the depth-stencil descriptor a draw bound, on the Linux path
@@ -578,15 +507,15 @@ fn depth_stencil_descriptor_is_trivial(
 /// a guest that explicitly asked for a depth-stencil state — can fail-visibly
 /// name why the state silently fell back to no-depth instead of dropping it into
 /// the same silent hole every other depth/stencil sub-case is instrumented against.
-#[cfg(feature = "backend-vulkan")]
 fn load_depth_stencil_descriptor<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     ds_ref: u32,
 ) -> Result<crate::runtime::decode::resource::DepthStencilDescriptor, &'static str> {
     if let Some(state_) = state
-        .task_depth_stencil_states
+        .task_objects
+        .depth_stencil
         .get(task_id, reims_vgpu_protocol::SerializerRef::new(ds_ref))
     {
         crate::runtime::drain::note_store_route("ds_state_held");
@@ -606,7 +535,7 @@ fn load_depth_stencil_descriptor<M: HostMemory + HostOps>(
     // `resolve_sampler_state`: a descriptor still being published can succeed on
     // retry, and retaining a failure would make that retry impossible.
     crate::runtime::drain::note_store_route("ds_state_constructed");
-    Ok((*state.task_depth_stencil_states.register(
+    Ok((*state.task_objects.depth_stencil.register(
         task_id,
         reims_vgpu_protocol::SerializerRef::new(ds_ref),
         std::sync::Arc::new(decoded),
@@ -676,16 +605,42 @@ pub struct SamplerBind {
     pub lod_clamp: Option<(u32, u32)>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct IndexedDrawInfo {
-    pub index_type: u32,
+    pub index_type:
+        Result<reims_vgpu_protocol::IndexType, reims_vgpu_protocol::IndexTypeDecodeError>,
     pub index_count: u32,
     pub index_buffer_ref: u32,
     pub index_buffer_offset: u64,
+    /// Index offset within the buffer, still in elements. It is converted to
+    /// bytes only after `index_type` has decoded successfully.
+    pub index_start: u32,
     /// Metal `baseVertex` / Vulkan `vertexOffset`, added to every index before
     /// the vertex fetch. Signed, because Metal's is, and because a negative one
     /// read as unsigned becomes a huge index rather than an error.
     pub base_vertex: i64,
+}
+
+impl IndexedDrawInfo {
+    fn raw_index_type(&self) -> u32 {
+        match self.index_type {
+            Ok(value) => value.guest_ordinal(),
+            Err(error) => error.raw,
+        }
+    }
+
+    fn resolved_byte_offset(&self) -> Result<u64, IndexLoadReason> {
+        let width = self
+            .index_type
+            .map_err(|_| IndexLoadReason::TypeUnsupported)?
+            .byte_size() as u64;
+        let start_delta = u64::from(self.index_start)
+            .checked_mul(width)
+            .ok_or(IndexLoadReason::OffsetOverflow)?;
+        self.index_buffer_offset
+            .checked_add(start_delta)
+            .ok_or(IndexLoadReason::OffsetOverflow)
+    }
 }
 
 /// The allocation namespace and byte geometry of one colour attachment.
@@ -728,52 +683,7 @@ impl ColorTargetStorage {
     }
 }
 
-/// One declared texture plane inside its parent type-2/3 allocation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LinearColorTarget {
-    pub allocation_gva: u64,
-    pub allocation_size: u64,
-    pub plane_offset: u64,
-    pub row_stride: u32,
-}
-
-impl LinearColorTarget {
-    fn new(
-        allocation_gva: u64,
-        allocation_size: u64,
-        plane_offset: u64,
-        row_stride: u32,
-    ) -> Option<Self> {
-        if allocation_gva == 0
-            || allocation_size == 0
-            || row_stride == 0
-            || plane_offset >= allocation_size
-        {
-            return None;
-        }
-        allocation_gva.checked_add(plane_offset)?;
-        Some(Self {
-            allocation_gva,
-            allocation_size,
-            plane_offset,
-            row_stride,
-        })
-    }
-
-    pub fn target_gva(&self) -> u64 {
-        self.allocation_gva + self.plane_offset
-    }
-
-    #[cfg(test)]
-    pub(crate) fn whole(target_gva: u64, row_stride: u32, height: u32) -> Self {
-        Self {
-            allocation_gva: target_gva,
-            allocation_size: u64::from(row_stride) * u64::from(height),
-            plane_offset: 0,
-            row_stride,
-        }
-    }
-}
+pub use reims_vgpu_core::LinearColorTarget;
 
 /// One color RT for MRT encode/writeback.
 ///
@@ -794,8 +704,8 @@ pub struct ColorRtRequest {
     /// Sample count of the attachment texture (the multisample source when a
     /// separate resolve texture is present).
     pub sample_count: u32,
-    pub load_action: u16,
-    pub store_action: u16,
+    pub load_action: reims_vgpu_protocol::pass_action::LoadAction,
+    pub store_action: reims_vgpu_protocol::pass_action::StoreAction,
     pub clear_color: [f64; 4],
     pub target_seed_rgba: Option<Vec<u8>>,
     /// Multisample attachment discarded into this request's single-sample
@@ -844,14 +754,27 @@ impl ColorRtRequest {
 /// results by offset rather than assuming one per pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VisibilityArming {
-    /// `MTLVisibilityResultMode`, carried raw and translated per backend, the
-    /// way `cull_mode` and `fill_mode` beside it are: only the backend knows
-    /// whether the host can spell the answer, so only the backend can refuse by
-    /// name. Never `0` — `MTLVisibilityResultModeDisabled` is the `None` around
-    /// this.
-    pub mode: u32,
+    /// Decoded `MTLVisibilityResultMode`. Disabled is the `None` around this;
+    /// unknown ordinals never cross the stream-normalization boundary.
+    pub mode: reims_vgpu_protocol::VisibilityResultMode,
     /// Byte offset into the pass's `visibilityResultBuffer`.
     pub offset: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DepthAttachmentState {
+    pub texture_ref: u32,
+    pub load_action: reims_vgpu_protocol::pass_action::LoadAction,
+    pub store_action: reims_vgpu_protocol::pass_action::StoreAction,
+    pub clear_depth: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StencilAttachmentState {
+    pub texture_ref: u32,
+    pub load_action: reims_vgpu_protocol::pass_action::LoadAction,
+    pub store_action: reims_vgpu_protocol::pass_action::StoreAction,
+    pub clear_stencil: u32,
 }
 
 /// One stage's retained bind table as a draw consumes it.
@@ -872,7 +795,7 @@ pub struct DrawEncodeRequest {
     pub pipeline_ref: u32,
     pub vertex_count: u32,
     pub instance_count: u32,
-    pub primitive_type: u32,
+    pub primitive_topology: reims_vgpu_protocol::PrimitiveTopology,
     pub first_vertex: u32,
     /// Metal `baseInstance` / Vulkan `firstInstance`. Both backends already
     /// take it; until the draw forms that carry one were decoded, both were
@@ -904,29 +827,21 @@ pub struct DrawEncodeRequest {
     /// The occlusion query this draw is armed with, or `None` where the guest
     /// disarmed it (`MTLVisibilityResultModeDisabled`) or never armed one.
     pub visibility: Option<VisibilityArming>,
-    /// Samples the draw passed, filled in by the backend that ran the query.
-    ///
-    /// An **out** field on a request, which is the shape the encode chain
-    /// already uses for what a draw produced rather than what it was asked to
-    /// do. `None` where no query was armed *or* where this backend cannot run
-    /// one; the two are told apart by whether [`Self::visibility`] is set, and
-    /// the backend that cannot names its own refusal.
-    pub visibility_samples: Option<u64>,
     pub indexed: Option<IndexedDrawInfo>,
     pub blend_color: Option<[f32; 4]>,
-    pub cull_mode: Option<u32>,
-    pub front_facing: Option<u32>,
-    /// `MTLTriangleFillMode` from `setTriangleFillMode:`, raw. `None` means the
-    /// stream bound none, so Metal's default (fill) stands.
-    pub fill_mode: Option<u32>,
-    /// `MTLDepthClipMode` from `setDepthClipMode:`, raw. `None` means Metal's
-    /// default (clip).
-    pub depth_clip_mode: Option<u32>,
+    pub cull_mode: reims_vgpu_protocol::CullMode,
+    pub front_face_ccw: bool,
+    /// `MTLTriangleFillMode` from `setTriangleFillMode:`, initialized to the
+    /// Metal default (`Fill`) until the stream replaces it.
+    pub fill_mode: reims_vgpu_protocol::FillMode,
+    /// `MTLDepthClipMode` from `setDepthClipMode:`, initialized to the Metal
+    /// default (`Clip`) until the stream replaces it.
+    pub depth_clip_mode: reims_vgpu_protocol::DepthClipMode,
     pub depth_bias: Option<[f32; 3]>,
     pub depth_stencil_ref: u32,
     pub stencil_ref: Option<(u32, u32)>,
-    pub depth_attach: Option<DepthAttachment>,
-    pub stencil_attach: Option<StencilAttachment>,
+    pub depth_attach: Option<DepthAttachmentState>,
+    pub stencil_attach: Option<StencilAttachmentState>,
     /// Records 2+ of a resident render-pass chain: load the prior record's
     /// content from the engine target instead of a CPU seed. Set by the exec
     /// chain loop (Vulkan rail only); default false.
@@ -944,20 +859,6 @@ pub struct DrawEncodeRequest {
     /// identity; `GuestPages` lets each backend choose its native transport.
     /// Either non-`None` value means `target_seed_rgba` is deliberately absent.
     pub gva_load_source: GvaLoadSource,
-    /// Out-flag: this record kept chain content on the engine-resident
-    /// target (no CPU pixels, no guest Store). The exec chain loop arms
-    /// `chain_from_resident` for the next record when set.
-    pub chain_resident_established: bool,
-    /// Lifetime identity of the color0 GVA render resource.
-    ///
-    /// Resolved once per draw, before any GPU work, by
-    /// `draw::vulkan::gva_alloc_generation`, and carried here so every
-    /// `TargetIdentity::Gva` this draw builds agrees on one `generation`.
-    /// Resource delete changes it; ordinary task map changes and transfer-
-    /// backing discard do not.
-    ///
-    /// 0 means "no allocation named": color0 is not a GVA target, or the span
-    pub gva_alloc_gen: u64,
 }
 
 /// Compact command-level MRT census for the always-on draw proxy.
@@ -965,7 +866,6 @@ pub struct DrawEncodeRequest {
 /// This records only decoded render-pass state. It deliberately does not rank
 /// targets by dimensions, ids, or content; the point is to expose when the
 /// shader/pass contract names more attachments than the backend executes.
-#[cfg(feature = "backend-vulkan")]
 fn color_target_diag(colors: &[ColorRtRequest]) -> String {
     colors
         .iter()
@@ -987,7 +887,6 @@ fn color_target_diag(colors: &[ColorRtRequest]) -> String {
         .join(",")
 }
 
-#[cfg(feature = "backend-vulkan")]
 fn texture_bind_diag(textures: &[TextureBind]) -> String {
     textures
         .iter()
@@ -997,7 +896,6 @@ fn texture_bind_diag(textures: &[TextureBind]) -> String {
         .join(",")
 }
 
-#[cfg(feature = "backend-vulkan")]
 fn buffer_bind_diag(buffers: &[BufferBind]) -> String {
     buffers
         .iter()
@@ -1007,15 +905,20 @@ fn buffer_bind_diag(buffers: &[BufferBind]) -> String {
         .join(",")
 }
 
-#[cfg(feature = "backend-vulkan")]
-fn linux_m2v_draw_failure(error: &DrawError, req: &DrawEncodeRequest) -> crate::observe::Emit {
+fn linux_m2v_draw_failure(
+    error: &impl crate::observe::Decline,
+    req: &DrawEncodeRequest,
+) -> crate::observe::Emit {
     let indexed = req
         .indexed
         .as_ref()
         .map(|idx| {
             format!(
                 "1:ty{}:n{}:r{}+{:#x}",
-                idx.index_type, idx.index_count, idx.index_buffer_ref, idx.index_buffer_offset
+                idx.raw_index_type(),
+                idx.index_count,
+                idx.index_buffer_ref,
+                idx.index_buffer_offset
             )
         })
         .unwrap_or_else(|| "0".to_string());
@@ -1035,7 +938,7 @@ fn linux_m2v_draw_failure(error: &DrawError, req: &DrawEncodeRequest) -> crate::
         )
         .field("vtx", req.vertex_count)
         .field("inst", req.instance_count)
-        .field("prim", req.primitive_type)
+        .field("prim", req.primitive_topology.guest_ordinal())
         .field("first", req.first_vertex)
         .field("idx", indexed)
         .field("colors", format!("[{}]", color_target_diag(&req.colors)))
@@ -1065,106 +968,12 @@ fn linux_m2v_draw_failure(error: &DrawError, req: &DrawEncodeRequest) -> crate::
         )
 }
 
-/// Fixed-function state decoded by the product request but not yet represented
-/// by the Linux Vulkan engine request. This is an always-on diagnostic field;
-/// it never changes draw execution.
-#[cfg(feature = "backend-vulkan")]
-fn vulkan_fixed_state_gap(req: &DrawEncodeRequest) -> String {
-    let mut gaps = Vec::new();
-    // Cull mode and front-facing winding ARE honored by the Vulkan raster state
-    // (see the pipeline builder). Only an out-of-contract value is still a gap —
-    // those stay fail-visible rather than being coerced to a face that silently
-    // draws or drops geometry. What counts as out-of-contract is
-    // `translate::raster`'s answer, not a local bound: a second copy of the
-    // SDK's range here would silently disagree the moment one of them changed.
-    if let Some(value) = req.cull_mode {
-        if translate::raster::cull_mode(value).is_err() {
-            gaps.push(format!("cull:{value}"));
-        }
-    }
-    if let Some(value) = req.front_facing {
-        if translate::raster::front_face_ccw(value).is_err() {
-            gaps.push(format!("front:{value}"));
-        }
-    }
-    // Depth test + attachment AND the stencil test are honored now (see
-    // `resources.depth` wiring): a bound depth-stencil state attaches a transient
-    // (combined) depth-stencil buffer, and a stencil-enabled state wires the
-    // front/back op state + dynamic reference (`stencil_ref`) + stencil clear
-    // (`stencil_attach`). The one still-unrepresented fixed-function field is
-    // depth bias (Metal↔Vulkan constant-bias scale differs — unverifiable
-    // without Apple ground truth). Depth LOAD and out-of-contract stencil ops
-    // degrade with their own fail-visible slugs, not this census.
-    if let Some([bias, slope, clamp]) = req.depth_bias {
-        gaps.push(format!("bias:{bias:.3}/{slope:.3}/{clamp:.3}"));
-    }
-    gaps.join(",")
-}
-
-/// Resolve one decoded `DepthStencilFace` into the engine `StencilFaceOps`.
-///
-/// Declines by name if the compare function or any of the three ops is out of
-/// contract, so the caller can log *which* field it was. The four fields carry
-/// the same two Metal enums the depth path uses, and both live in
-/// `translate::raster` — the one place that decides what an `MTLCompareFunction`
-/// or an `MTLStencilOperation` means.
-#[cfg(feature = "backend-vulkan")]
-fn engine_stencil_face(
-    f: &crate::runtime::decode::resource::DepthStencilFace,
-) -> Result<reims_vgpu_core::StencilFaceOps, translate::TranslateReason> {
-    Ok(reims_vgpu_core::StencilFaceOps {
-        compare: translate::raster::compare_function(f.compare_function)?,
-        fail_op: translate::raster::stencil_operation(f.stencil_failure_operation)?,
-        depth_fail_op: translate::raster::stencil_operation(f.depth_failure_operation)?,
-        pass_op: translate::raster::stencil_operation(f.depth_stencil_pass_operation)?,
-        read_mask: f.read_mask,
-        write_mask: f.write_mask,
-    })
-}
-
-/// Translate one decoded raster field, falling back to Metal's default when the
-/// guest bound nothing and naming the decline when it bound something this
-/// contract does not cover.
-///
-/// The distinction is the whole point. `None` means "the guest never set this",
-/// where Metal's documented default is the correct answer and there is nothing
-/// to report — logging it would flood every draw. `Some(v)` that fails to
-/// translate means the decode produced a value outside the SDK's range, which is
-/// a real gap: the draw still runs (blocking it would lose a frame over a field
-/// that may not matter) but it says so once per `(pipeline, slug)` first.
-#[cfg(feature = "backend-vulkan")]
-fn raster_or_default<T, E>(
-    decoded: Option<u32>,
-    translate_one: impl Fn(u32) -> Result<T, E>,
-    metal_default: T,
-    pipeline_ref: u32,
-    slug: &'static str,
-) -> T {
-    let Some(value) = decoded else {
-        return metal_default;
-    };
-    match translate_one(value) {
-        Ok(mapped) => mapped,
-        Err(_) => {
-            if degrade_log_first(pipeline_ref, slug) {
-                crate::observe::fail(format!(
-                    "raster_state_degraded reason={slug} pipe={pipeline_ref} value={value} \
-                     (out-of-contract Metal value; using Metal's default)"
-                ));
-            }
-            metal_default
-        }
-    }
-}
-
 /// Fire `reason` once per `(pipeline_ref, slug)` so a recurring degradation
-/// (e.g. a whole 3D scene requesting depth LOAD, or every draw of one pipeline
-/// carrying the same out-of-contract raster value) logs once, not per draw.
+/// (for example a whole 3D scene requesting depth LOAD) logs once, not per draw.
 /// Returns true the first time a given key is seen.
 ///
 /// Backend-agnostic on purpose: both encode arms degrade, so both need the same
 /// degradation without flooding per draw, and reported none.
-#[cfg(feature = "backend-vulkan")]
 fn degrade_log_first(pipeline_ref: u32, slug: &'static str) -> bool {
     use std::collections::HashSet;
     use std::sync::Mutex;
@@ -1249,7 +1058,7 @@ impl EncodeStatus {
 ///
 /// The type keeps eleven distinct checks visible rather than collapsing an
 /// indexed-draw failure into one uninformative backend error.
-pub use reims_vgpu_vulkan::preparation::IndexLoadReason;
+pub use reims_vgpu_core::IndexLoadReason;
 
 /// Load the render pipeline a draw named, or say why it could not be loaded.
 ///
@@ -1285,7 +1094,7 @@ pub use reims_vgpu_vulkan::preparation::IndexLoadReason;
 /// paragraph above instead and macOS 26's standing behaviour arrives looking
 /// like a fresh defect, which is a mistake this doc has already cost once.
 pub(crate) fn load_render_pipeline<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     pipeline_ref: u32,
@@ -1337,13 +1146,12 @@ pub(crate) fn load_render_pipeline<M: HostMemory + HostOps>(
 /// Each function payload is retained by its guest object lifetime. The `Arc`s
 /// returned here are therefore both the no-copy preflight input and ownership
 /// that keeps the immutable containers alive while translation borrows them.
-#[cfg(feature = "backend-vulkan")]
 pub(crate) fn load_render_mtlb_pair<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     pipeline_ref: u32,
-) -> Result<(std::sync::Arc<[u8]>, std::sync::Arc<[u8]>), DrawPreparationDecline> {
+) -> Result<RenderMtlbPair, DrawPreparationDecline> {
     let pd = load_render_pipeline(state, host, task_id, pipeline_ref).ok_or(
         DrawPreparationDecline::PipelineMissing {
             task_id,
@@ -1430,7 +1238,7 @@ fn buffer_refusal_detail(refusal: objects::BufferSpanRefusal, page_shift: u32) -
 /// this is the single owner of the `load_buffer *` reason slugs; the ZC and CPU
 /// binds delegate to it so a failure logs exactly once, not once per attempt.
 fn resolve_buffer_backing<M: HostMemory>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     buffer_ref: u32,
@@ -1482,7 +1290,7 @@ fn resolve_buffer_backing<M: HostMemory>(
 /// for the same decoded bind, so it must read the same bounded span; otherwise
 /// host import support would change which guest bytes the command consumes.
 fn read_buffer_bytes_resolved<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     buffer_ref: u32,
@@ -1513,7 +1321,7 @@ fn read_buffer_bytes_resolved<M: HostMemory + HostOps>(
     let (read_gva, read_span) = (gva + offset, want as u64);
     // Census, pay, settle — the whole obligation of a CPU read of one named
     // resource's guest bytes. This site used to carry the settle alone, because
-    // it held `DeviceState` shared and so *could* not pay; see
+    // it held `Device` shared and so *could* not pay; see
     // `writeback_debt::settle_for_texture`, whose doc is about that gap.
     crate::runtime::writeback_debt::settle_for_texture(
         state,
@@ -1547,7 +1355,7 @@ fn read_buffer_bytes_resolved<M: HostMemory + HostOps>(
 
 /// Standalone CPU buffer read (non-draw-setup callers): resolve + read.
 fn load_buffer_bytes<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     buffer_ref: u32,
@@ -1566,7 +1374,7 @@ fn load_buffer_bytes<M: HostMemory + HostOps>(
 /// non-type-8 object or a real texture VIEW (opcode 7/8/0x1b) — those stay on
 /// the view path silently.
 fn buffer_texture_descriptor<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     texture_ref: u32,
@@ -1580,17 +1388,15 @@ fn buffer_texture_descriptor<M: HostMemory + HostOps>(
             &owned
         }
     };
-    if resource.entry.kind != ObjectKind::TextureView {
+    if resource.entry().kind != ObjectKind::TextureView {
         return None;
     }
-    let desc_bytes = &resource.descriptor;
-    if !matches!(
-        texture_type8_opcode(desc_bytes),
-        Some(TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE) | Some(TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE)
-    ) {
-        return None;
+    match objects::decoded_resource(resource) {
+        Ok(crate::runtime::decode::resource::Descriptor::BufferTexture(descriptor)) => {
+            Some(*descriptor)
+        }
+        _ => None,
     }
-    decode_buffer_texture_descriptor(desc_bytes).ok()
 }
 
 /// Say, once per (site, format), that a sampled texture reached the GPU
@@ -1649,7 +1455,7 @@ pub(crate) fn note_sampled_narrowing(
 /// the format is unknown, or the span overruns the buffer) — those are real
 /// dropped-draw causes, not speculative "not ready yet" polls.
 fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     texture_ref: u32,
@@ -1727,12 +1533,10 @@ fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
     Some((w, h, rgba))
 }
 
-fn index_elem_size(index_type: u32) -> Option<usize> {
-    match index_type {
-        0 => Some(2), // MTLIndexTypeUInt16
-        1 => Some(4), // MTLIndexTypeUInt32
-        _ => None,
-    }
+struct ResolvedIndexWindow {
+    backing: BufferBacking,
+    byte_offset: u64,
+    len: usize,
 }
 
 /// Resolve an indexed draw to the guest allocation and exact byte window its
@@ -1740,13 +1544,13 @@ fn index_elem_size(index_type: u32) -> Option<usize> {
 /// upload path consumes them on the CPU, while Vulkan retains this resource
 /// window and lets vertex input consume it when the command executes.
 fn resolve_index_window_reason<M: HostMemory>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     info: &IndexedDrawInfo,
-) -> Result<(BufferBacking, usize), IndexLoadReason> {
+) -> Result<ResolvedIndexWindow, IndexLoadReason> {
     use IndexLoadReason as R;
-    let elem = index_elem_size(info.index_type).ok_or(R::TypeUnsupported)?;
+    let elem = info.index_type.map_err(|_| R::TypeUnsupported)?.byte_size();
     let need = (info.index_count as usize)
         .checked_mul(elem)
         .ok_or(R::CountOverflow)?;
@@ -1763,14 +1567,18 @@ fn resolve_index_window_reason<M: HostMemory>(
             objects::BufferSpanRefusal::Decode => R::DescDecode,
             objects::BufferSpanRefusal::NoBacking => R::BackingMissing,
         })?;
-    let end = info
-        .index_buffer_offset
+    let byte_offset = info.resolved_byte_offset()?;
+    let end = byte_offset
         .checked_add(need as u64)
         .ok_or(R::OffsetOverflow)?;
     if end > size {
         return Err(R::OutOfBounds);
     }
-    Ok((BufferBacking { gva, size }, need))
+    Ok(ResolvedIndexWindow {
+        backing: BufferBacking { gva, size },
+        byte_offset,
+        len: need,
+    })
 }
 
 /// Load the index bytes a bound indexed draw references, returning the **specific**
@@ -1780,19 +1588,19 @@ fn resolve_index_window_reason<M: HostMemory>(
 /// set, so it cannot flood a 2D-UI boot.
 #[cfg(test)]
 fn load_index_bytes_reason<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     info: &IndexedDrawInfo,
 ) -> Result<Vec<u8>, IndexLoadReason> {
     use IndexLoadReason as R;
-    let (backing, need) = resolve_index_window_reason(state, host, task_id, info)?;
-    let mut buf = vec![0u8; need];
+    let window = resolve_index_window_reason(state, host, task_id, info)?;
+    let mut buf = vec![0u8; window.len];
     gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,
         task_id,
-        backing.gva + info.index_buffer_offset,
+        window.backing.gva + window.byte_offset,
         &mut buf,
         state.page_shift,
     )
@@ -1873,10 +1681,8 @@ pub fn load_composite_premult_one_omsa(draw_rgba: &[u8], seed_rgba: &[u8]) -> (V
 /// Whether a decoded load action is one of the three `MTLLoadAction` values,
 /// reporting the one case where it is not.
 ///
-/// A fourth value is a corrupt or unsupported wire word, and both encode arms
-/// treat it as DontCare — which discards whatever the attachment held, so a
-/// so; the Vulkan arm took the same value into a `_ => {}`.
-#[cfg(feature = "backend-vulkan")]
+/// A fourth value is a corrupt or unsupported wire word. Request construction
+/// refuses it before either executor can substitute a native load operation.
 pub(crate) fn load_action_in_contract(pipeline_ref: u32, load_action: u16) -> bool {
     if is_declared_load_action(load_action) {
         return true;
@@ -1885,7 +1691,7 @@ pub(crate) fn load_action_in_contract(pipeline_ref: u32, load_action: u16) -> bo
         crate::observe::fail(format!(
             "pass_state_degraded reason=load_action_unmapped \
              pipe={pipeline_ref} load_action={load_action} \
-             (not one of MTLLoadAction 0/1/2; attachment treated as DontCare)"
+             (not one of MTLLoadAction 0/1/2; attachment refused)"
         ));
     }
     false
@@ -1902,9 +1708,8 @@ pub(crate) fn load_action_in_contract(pipeline_ref: u32, load_action: u16) -> bo
 /// - The Vulkan engine's render-pass key carries `load_seed: bool`, derived from
 ///   whether a seed was *resolved* rather than from the guest's ordinal, so
 ///   DontCare and Clear reach `caches.rs` as the same key and both become
-///   `vk::AttachmentLoadOp::CLEAR` against the record's clear colour.
-///   `vk::AttachmentLoadOp::DONT_CARE` is unreachable for a colour or depth
-///   attachment on that arm.
+///   a native clear against the record's clear colour. The native discard-load
+///   operation is unreachable for a colour or depth attachment on that arm.
 ///
 /// Clearing satisfies DontCare — the contract permits any contents — so this is
 /// not lost guest work and the line is on the OFF channel. What it is not is
@@ -1922,7 +1727,6 @@ pub(crate) fn load_action_in_contract(pipeline_ref: u32, load_action: u16) -> bo
 /// Latched on `(pipeline, slug)` like its siblings: a guest that means DontCare
 /// means it every frame, and repetition would carry nothing the first line did
 /// not.
-#[cfg(feature = "backend-vulkan")]
 pub(crate) fn note_load_action_dont_care(pipeline_ref: u32, width: u32, height: u32) {
     if degrade_log_first(pipeline_ref, "load_action_dont_care_cleared") {
         crate::observe::off(format!(
@@ -1945,7 +1749,6 @@ pub(crate) fn note_load_action_dont_care(pipeline_ref: u32, width: u32, height: 
 /// implements resolve-only for the supported shape and names every other
 /// resolve action as a typed refusal; the encode path likewise refuses
 /// before encoding until it carries the corresponding attachment lifecycle.
-#[cfg(feature = "backend-vulkan")]
 pub(crate) fn store_action_in_contract(pipeline_ref: u32, store_action: u16) -> bool {
     if is_declared_store_action(store_action) {
         return true;
@@ -1955,7 +1758,7 @@ pub(crate) fn store_action_in_contract(pipeline_ref: u32, store_action: u16) -> 
             "pass_state_degraded reason=store_action_unmapped \
              pipe={pipeline_ref} store_action={store_action} \
              (not one of the represented MTLStoreAction values 0/1/2/3; \
-              attachment result may be dropped)"
+              attachment refused)"
         ));
     }
     false
@@ -1966,7 +1769,7 @@ pub(crate) fn store_action_in_contract(pipeline_ref: u32, store_action: u16) -> 
 /// Kept off the success path; only called after a sampled resolver
 /// (`resolve_sampled_source` or `load_sampled_rgba`) returns `None`.
 fn sample_miss_detail<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &M,
     task_id: u32,
     texture_ref: u32,
@@ -1982,11 +1785,11 @@ fn sample_miss_detail<M: HostMemory + HostOps>(
     match kind {
         ObjectKind::IOSurfacePlaneView => {
             match objects::read_descriptor(state, host, task_id, &entry) {
-                None => format!("type=5 desc_len={desc_len} reason=no_desc"),
+                None => format!("kind=iosurface_plane_view desc_len={desc_len} reason=no_desc"),
                 Some(d)
                     if reims_vgpu_wire::device_desc::iosurface_plane_view_header(&d).is_err() =>
                 {
-                    format!("type=5 desc_len={desc_len} reason=short_desc")
+                    format!("kind=iosurface_plane_view desc_len={desc_len} reason=short_desc")
                 }
                 Some(d) => {
                     let sid = reims_vgpu_wire::device_desc::iosurface_plane_view_header(&d)
@@ -1994,11 +1797,11 @@ fn sample_miss_detail<M: HostMemory + HostOps>(
                         .unwrap_or(0);
                     match objects::decode_iosurface_plane_view(&d) {
                         Some(view) => format!(
-                            "type=5 desc_len={desc_len} surface_id={sid} view={}x{} fmt={:#x} reason=ref_texture_view",
+                            "kind=iosurface_plane_view desc_len={desc_len} surface_id={sid} view={}x{} fmt={:#x} reason=ref_texture_view",
                             view.width, view.height, view.pixel_format
                         ),
                         None => format!(
-                            "type=5 desc_len={desc_len} surface_id={sid} reason=ref_texture_no_view"
+                            "kind=iosurface_plane_view desc_len={desc_len} surface_id={sid} reason=ref_texture_no_view"
                         )}
                 }
             }
@@ -2007,25 +1810,33 @@ fn sample_miss_detail<M: HostMemory + HostOps>(
             let Some(mid) =
                 objects::resolve_iosurface_texture_ref(state, host, task_id, texture_ref)
             else {
-                return format!("type=11 desc_len={desc_len} reason=iosurface_texture_resolve");
+                return format!(
+                    "kind=mapper_iosurface_texture_view desc_len={desc_len} \
+                     reason=iosurface_texture_resolve"
+                );
             };
-            match state.mappings.get(&mid) {
-                None => format!("type=11 mid={mid} desc_len={desc_len} reason=no_mapping"),
+            match state.surfaces.mappings.get(&mid) {
+                None => format!(
+                    "kind=mapper_iosurface_texture_view mid={mid} desc_len={desc_len} \
+                     reason=no_mapping"
+                ),
                 Some(m) => format!(
-                    "type=11 mid={mid} desc_len={desc_len} geom={} {}x{} fmt={:#x} mapped={} pages={} reason=iosurface_texture_sample",
-                    m.has_geom as u8,
-                    m.width,
-                    m.height,
-                    m.format,
-                    m.mapped as u8,
-                    m.page_entries.len()
-                )}
+                    "kind=mapper_iosurface_texture_view mid={mid} desc_len={desc_len} geom={} \
+                     {}x{} fmt={:#x} mapped={} pages={} reason=iosurface_texture_sample",
+                    m.has_geometry() as u8,
+                    m.width_or_zero(),
+                    m.height_or_zero(),
+                    m.format_or_zero(),
+                    m.lifecycle.active as u8,
+                    m.pages.entries.len()
+                ),
+            }
         }
         ObjectKind::TextureView => {
             // Opcode-9 buffer-backed textures share the type-8 tag but are not views.
             if let Some(bt) = buffer_texture_descriptor(state, host, task_id, texture_ref, None) {
                 return format!(
-                    "type=8 desc_len={desc_len} buf={} off={} bpr={} {}x{} fmt={:#x} reason=buftex_load",
+                    "kind=buffer_texture desc_len={desc_len} buf={} off={} bpr={} {}x{} fmt={:#x} reason=buftex_load",
                     bt.buffer_ref,
                     bt.offset,
                     bt.bytes_per_row,
@@ -2041,12 +1852,12 @@ fn sample_miss_detail<M: HostMemory + HostOps>(
                         .field("ref", texture_ref)
                         .fail_once(texture_ref as u64);
                     format!(
-                        "type=8 desc_len={desc_len} reason=view_resolve view_reason={}",
+                        "kind=texture_view desc_len={desc_len} reason=view_resolve view_reason={}",
                         why.slug()
                     )
                 }
                 Ok(view) => format!(
-                    "type=8 desc_len={desc_len} base={} level={} fmt_ov={:?} reason=view_base_or_swizzle",
+                    "kind=texture_view desc_len={desc_len} base={} level={} fmt_ov={:?} reason=view_base_or_swizzle",
                     view.base_texture_ref,
                     view.level,
                     view.pixel_format
@@ -2086,14 +1897,13 @@ fn sample_miss_detail<M: HostMemory + HostOps>(
 /// current object list in that case describes a different object and can send
 /// the repair in exactly the wrong direction. Non-linear objects return
 /// `None` so their existing, type-specific diagnostics remain in charge.
-#[cfg(feature = "backend-vulkan")]
 fn retained_linear_sample_miss_detail(resource: &crate::model::TaskResource) -> Option<String> {
-    if resource.entry.kind != ObjectKind::Texture {
+    if resource.entry().kind != ObjectKind::Texture {
         return None;
     }
-    let kind = resource.entry.kind;
-    let desc_len = resource.entry.descriptor_length;
-    match resource.decoded() {
+    let kind = resource.entry().kind;
+    let desc_len = resource.entry().descriptor_length;
+    match crate::runtime::objects::decoded_resource(resource) {
         Err(why) => Some(format!(
             "kind={kind} desc_len={desc_len} retained=1 reason={}",
             why.slug()
@@ -2149,21 +1959,17 @@ fn retained_linear_sample_miss_detail(resource: &crate::model::TaskResource) -> 
 /// [`crate::runtime::mapping_write::mapping_store_format`] already owns what
 /// "nothing declared" resolves to; a default entry is handed to it rather than
 /// that answer being spelled a second time here.
-fn mapping_declared_format(
-    state: &DeviceState,
-    mapping_id: u32,
-    format_override: Option<u16>,
-) -> u16 {
+fn mapping_declared_format(state: &Device, mapping_id: u32, format_override: Option<u16>) -> u16 {
     use crate::runtime::mapping_write::mapping_store_format;
     if let Some(view) = format_override {
         return view;
     }
-    match state.mappings.get(&mapping_id) {
+    match state.surfaces.mappings.get(&mapping_id) {
         Some(entry) => mapping_store_format(entry),
         // Nothing declared. An entry that has latched no geometry is exactly
         // that case, so the owning rule answers it rather than a default being
         // named a second time here.
-        None => mapping_store_format(&crate::model::MappingEntry::default()),
+        None => mapping_store_format(&crate::model::SurfaceMappingEntry::default()),
     }
 }
 
@@ -2178,18 +1984,18 @@ fn mapping_declared_format(
 /// decodes the guest device-surface descriptor and latches the geometry, so the
 /// sample succeeds instead of bailing out on `!has_geom` and dropping the bind.
 fn load_iosurface_mapping_rgba<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     mapping_id: u32,
     format_override: Option<u16>,
 ) -> Option<(u32, u32, Vec<u8>)> {
     let _ = mapper::ensure_resolved_for_scanout(state, host, mapping_id);
     let (w, h) = {
-        let m = state.mappings.get(&mapping_id)?;
-        if !m.has_geom || m.width == 0 || m.height == 0 {
+        let m = state.surfaces.mappings.get(&mapping_id)?;
+        if !m.has_geometry() || m.width_or_zero() == 0 || m.height_or_zero() == 0 {
             return None;
         }
-        (m.width, m.height)
+        (m.width_or_zero(), m.height_or_zero())
     };
     let base_fmt = MTL_FORMAT_BGRA8_UNORM;
     let sample_fmt = effective_view_sample_format(base_fmt, format_override)?;
@@ -2211,7 +2017,6 @@ fn load_iosurface_mapping_rgba<M: HostMemory + HostOps>(
     Some((w, h, rgba))
 }
 
-#[cfg(feature = "backend-vulkan")]
 fn vulkan_sampler_resource(
     sampler_ref: u32,
     binding: u32,
@@ -2221,59 +2026,59 @@ fn vulkan_sampler_resource(
 
     Ok(SamplerResource {
         binding,
-        min_filter: translate::sampler::filter(sampler.min_filter).map_err(|reason| {
+        min_filter: reims_vgpu_protocol::sampler_filter(sampler.min_filter).map_err(|reason| {
             DrawPreparationDecline::SamplerMinFilterTranslation {
                 sampler_ref,
                 binding,
                 reason,
             }
         })?,
-        mag_filter: translate::sampler::filter(sampler.mag_filter).map_err(|reason| {
+        mag_filter: reims_vgpu_protocol::sampler_filter(sampler.mag_filter).map_err(|reason| {
             DrawPreparationDecline::SamplerMagFilterTranslation {
                 sampler_ref,
                 binding,
                 reason,
             }
         })?,
-        mip_filter: translate::sampler::mip_filter(sampler.mip_filter).map_err(|reason| {
-            DrawPreparationDecline::SamplerMipFilterTranslation {
+        mip_filter: reims_vgpu_protocol::sampler_mip_filter(sampler.mip_filter).map_err(
+            |reason| DrawPreparationDecline::SamplerMipFilterTranslation {
                 sampler_ref,
                 binding,
                 reason,
-            }
-        })?,
-        address_mode_u: translate::sampler::address_mode(sampler.s_address).map_err(|reason| {
-            DrawPreparationDecline::SamplerAddressSTranslation {
+            },
+        )?,
+        address_mode_u: reims_vgpu_protocol::sampler_address_mode(sampler.s_address).map_err(
+            |reason| DrawPreparationDecline::SamplerAddressSTranslation {
                 sampler_ref,
                 binding,
                 reason,
-            }
-        })?,
-        address_mode_v: translate::sampler::address_mode(sampler.t_address).map_err(|reason| {
-            DrawPreparationDecline::SamplerAddressTTranslation {
+            },
+        )?,
+        address_mode_v: reims_vgpu_protocol::sampler_address_mode(sampler.t_address).map_err(
+            |reason| DrawPreparationDecline::SamplerAddressTTranslation {
                 sampler_ref,
                 binding,
                 reason,
-            }
-        })?,
-        address_mode_w: translate::sampler::address_mode(sampler.r_address).map_err(|reason| {
-            DrawPreparationDecline::SamplerAddressRTranslation {
+            },
+        )?,
+        address_mode_w: reims_vgpu_protocol::sampler_address_mode(sampler.r_address).map_err(
+            |reason| DrawPreparationDecline::SamplerAddressRTranslation {
                 sampler_ref,
                 binding,
                 reason,
-            }
-        })?,
-        border_color: translate::sampler::border_color(sampler.border_color).map_err(|reason| {
-            DrawPreparationDecline::SamplerBorderColorTranslation {
+            },
+        )?,
+        border_color: reims_vgpu_protocol::sampler_border_color(sampler.border_color).map_err(
+            |reason| DrawPreparationDecline::SamplerBorderColorTranslation {
                 sampler_ref,
                 binding,
                 reason,
-            }
-        })?,
+            },
+        )?,
         // Metal reuses `MTLCompareFunction` for depth, stencil and sampler
         // compare, so this is `raster`'s table rather than `sampler`'s — one
         // Metal enum, one home.
-        compare_function: translate::raster::compare_function(sampler.compare_function).map_err(
+        compare_function: reims_vgpu_protocol::compare_function(sampler.compare_function).map_err(
             |reason| DrawPreparationDecline::SamplerCompareFunctionTranslation {
                 sampler_ref,
                 binding,
@@ -2287,20 +2092,19 @@ fn vulkan_sampler_resource(
     })
 }
 
-#[cfg(feature = "backend-vulkan")]
 pub fn reflected_static_sampler_resource(
     stage: &'static str,
     binding: u32,
-    sampler: metal2vulkan::reflect::StaticSamplerState,
+    sampler: reims_vgpu_core::ReflectedStaticSamplerState,
 ) -> Result<reims_vgpu_core::SamplerResource, DrawPreparationDecline> {
-    use metal2vulkan::reflect::{
-        SamplerAddressMode as ReflectedAddress, SamplerBorderColor as ReflectedBorder,
-        SamplerCompareFunction as ReflectedCompare, SamplerCoordinates,
-        SamplerFilter as ReflectedFilter, SamplerMipFilter as ReflectedMip, SamplerReduction,
-    };
     use reims_vgpu_core::{
-        SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter,
-        SamplerMipFilter, SamplerResource,
+        ReflectedSamplerAddressMode as ReflectedAddress,
+        ReflectedSamplerBorderColor as ReflectedBorder,
+        ReflectedSamplerCompareFunction as ReflectedCompare,
+        ReflectedSamplerCoordinates as SamplerCoordinates,
+        ReflectedSamplerFilter as ReflectedFilter, ReflectedSamplerMipFilter as ReflectedMip,
+        ReflectedSamplerReduction as SamplerReduction, SamplerAddressMode, SamplerBorderColor,
+        SamplerCompareFunction, SamplerFilter, SamplerMipFilter, SamplerResource,
     };
 
     if sampler.reduction != SamplerReduction::WeightedAverage {
@@ -2374,9 +2178,8 @@ pub fn reflected_static_sampler_resource(
     })
 }
 
-#[cfg(feature = "backend-vulkan")]
 pub(crate) fn load_vulkan_sampler<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     sampler_ref: u32,
@@ -2437,13 +2240,13 @@ pub(crate) fn load_vulkan_sampler<M: HostMemory + HostOps>(
                 },
             }
         })?;
-    vulkan_sampler_resource(sampler_ref, binding, &sampler.descriptor)
+    vulkan_sampler_resource(sampler_ref, binding, &sampler)
 }
 
 /// Store encode RGBA8 into **texture_ref** host cache as BGRA (not surface_id).
 #[cfg(test)]
 fn host_cache_store_rgba8(
-    state: &mut DeviceState,
+    state: &mut Device,
     task_id: u32,
     texture_ref: u32,
     width: u32,
@@ -2479,10 +2282,10 @@ fn host_cache_store_rgba8(
 /// same write. Both have just proved
 /// the same thing — `write_rgba8_image_changed` verified geometry and landed a
 /// complete frame — and without it the `present_unbacked` gate is structurally
-/// dead on whichever route skips it, because no mapping's `dense_frame_seq`
+/// dead on whichever route skips it, because no mapping's full-frame evidence
 /// would advance.
 pub(crate) fn publish_surface_store<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     mapping_id: u32,
     width: u32,
@@ -2532,7 +2335,7 @@ impl ChainAbandonCause {
 }
 
 pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     color_slots: &[(u32, crate::runtime::decode::render::ColorAttachment)],
@@ -2635,9 +2438,8 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
 ///
 /// Closing it requires replaying [`crate::runtime::icb::decode_icb_command_range`]
 /// results as draws through the Vulkan engine rather than adding a second decoder.
-#[cfg(feature = "backend-vulkan")]
 pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
-    _state: &mut DeviceState,
+    _state: &mut Device,
     _host: &mut M,
     _req: &DrawEncodeRequest,
     _icb_ref: u32,
@@ -2653,20 +2455,19 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
     reason = "the request builder mirrors the decoded color attachment state"
 )]
 pub fn color_target_request<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &M,
     task_id: u32,
     color: crate::runtime::decode::render::ColorAttachment,
     pipeline_ref: u32,
     vertex_count: u32,
     instance_count: u32,
-    primitive_type: u32,
+    primitive_topology: reims_vgpu_protocol::PrimitiveTopology,
     first_vertex: u32,
     base_instance: u32,
 ) -> Option<DrawEncodeRequest> {
     let color_texture_ref = color.texture_ref;
     let rt = lookup_render_target(state, host, task_id, color)?;
-    #[cfg(feature = "backend-vulkan")]
     let attachment_sample_count = crate::runtime::pipeline_resolve::attachment_sample_count(
         state,
         host,
@@ -2674,8 +2475,6 @@ pub fn color_target_request<M: HostMemory + HostOps>(
         pipeline_ref,
     )
     .unwrap_or(rt.sample_count);
-    #[cfg(not(feature = "backend-vulkan"))]
-    let attachment_sample_count = rt.sample_count;
     let c0 = ColorRtRequest {
         slot: 0,
         texture_ref: color_texture_ref,
@@ -2685,8 +2484,8 @@ pub fn color_target_request<M: HostMemory + HostOps>(
         height: rt.height,
         format: rt.format,
         sample_count: attachment_sample_count,
-        load_action: 0,
-        store_action: MTL_STORE_ACTION_STORE,
+        load_action: reims_vgpu_protocol::pass_action::LoadAction::DontCare,
+        store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
         clear_color: [0.0; 4],
         target_seed_rgba: None,
         multisample_source_ref: 0,
@@ -2696,279 +2495,10 @@ pub fn color_target_request<M: HostMemory + HostOps>(
         pipeline_ref,
         vertex_count,
         instance_count,
-        primitive_type,
+        primitive_topology,
         first_vertex,
         base_instance,
         colors: vec![c0],
-        ..Default::default()
-    })
-}
-
-/// Build an MRT draw request from pass color slots (same dimensions required).
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the MRT builder combines explicit pass, pipeline, and draw state"
-)]
-pub fn mrt_draw_request<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    task_id: u32,
-    pipeline_ref: u32,
-    color_slots: &[(u32, crate::runtime::decode::render::ColorAttachment)],
-    clears: &[crate::runtime::decode::render::ColorAttachment],
-    draw: crate::contract::draw::DrawArgs,
-) -> Option<DrawEncodeRequest> {
-    if color_slots.is_empty() {
-        return None;
-    }
-    // Linear allocation dimensions expose mip and array geometry, but do not
-    // repeat a texture's immutable creation sample count. At render time the
-    // bound pipeline supplies the missing contract: every color attachment
-    // must match its raster sample count. Resolve that before LOAD/CLEAR seed
-    // policy and before this request is cloned by either encoder.
-    #[cfg(feature = "backend-vulkan")]
-    let pipeline_sample_count = crate::runtime::pipeline_resolve::attachment_sample_count(
-        state,
-        host,
-        task_id,
-        pipeline_ref,
-    );
-    let mut colors = Vec::new();
-    let mut base_w = 0u32;
-    let mut base_h = 0u32;
-    // Colour0's LOAD seed was skipped in favour of the engine resident. Declared
-    // out here because it belongs to the request, not to the slot that set it.
-    let mut gva_load_source = GvaLoadSource::None;
-    for &(slot, att) in color_slots {
-        if att.texture_ref == 0 {
-            // An empty colour slot is the guest declining to attach one, not a
-            // loss. Counted anyway, because it is the difference between the
-            // slots the pass *has* and the slots it *uses*, and the census
-            // below is unreadable without it.
-            crate::runtime::drain::note_store_route("mrt_slot_empty");
-            continue;
-        }
-        crate::runtime::drain::note_store_route("mrt_slot_attached");
-        // Resolve both sides independently. The source proves the multisample
-        // attachment's shape; the destination becomes the guest-visible target
-        // that the backend stores and reads back.
-        let Some(source_target) = lookup_render_target(state, host, task_id, att) else {
-            crate::runtime::drain::note_store_route("mrt_slot_unresolved");
-            return None;
-        };
-        let (target_ref, multisample_source_ref, target) = if att.resolve_texture_ref != 0 {
-            let resolve_attachment = ColorAttachment {
-                texture_ref: att.resolve_texture_ref,
-                resolve_texture_ref: 0,
-                level: 0,
-                ..att
-            };
-            let Some(resolve_target) =
-                lookup_render_target(state, host, task_id, resolve_attachment)
-            else {
-                crate::runtime::drain::note_store_route("mrt_resolve_target_unresolved");
-                return None;
-            };
-            #[cfg(feature = "backend-vulkan")]
-            if crate::observe::first_sight(
-                "render_resolve_contract",
-                (u64::from(att.texture_ref) << 32) | u64::from(att.resolve_texture_ref),
-            ) {
-                crate::observe::off(format!(
-                    "render_resolve_contract task={task_id} pipe={pipeline_ref} \
-                     source_ref={} source_mid={} source_gva={:#x} source={}x{} \
-                     source_fmt={:#x} resolve_ref={} resolve_mid={} resolve_gva={:#x} \
-                     resolve={}x{} resolve_fmt={:#x} load={} store={} raster_samples={}",
-                    att.texture_ref,
-                    source_target.storage.mapping_id(),
-                    source_target.storage.target_gva(),
-                    source_target.width,
-                    source_target.height,
-                    source_target.format,
-                    att.resolve_texture_ref,
-                    resolve_target.storage.mapping_id(),
-                    resolve_target.storage.target_gva(),
-                    resolve_target.width,
-                    resolve_target.height,
-                    resolve_target.format,
-                    att.load_action,
-                    att.store_action,
-                    pipeline_sample_count.unwrap_or(1),
-                ));
-            }
-            if source_target.width != resolve_target.width
-                || source_target.height != resolve_target.height
-                || source_target.format != resolve_target.format
-            {
-                crate::observe::fail(format!(
-                    "render_resolve_target_mismatch source={} resolve={} source_geom={}x{} \
-                     resolve_geom={}x{} source_fmt={:#x} resolve_fmt={:#x}",
-                    att.texture_ref,
-                    att.resolve_texture_ref,
-                    source_target.width,
-                    source_target.height,
-                    resolve_target.width,
-                    resolve_target.height,
-                    source_target.format,
-                    resolve_target.format
-                ));
-                return None;
-            }
-            (att.resolve_texture_ref, att.texture_ref, resolve_target)
-        } else {
-            (att.texture_ref, 0, source_target)
-        };
-        let ResolvedRenderTarget {
-            storage,
-            width: mw,
-            height: mh,
-            format: mfmt,
-            sample_count: target_sample_count,
-        } = target;
-        let mapping_id = storage.mapping_id();
-        let gva = storage.target_gva();
-        #[cfg(feature = "backend-vulkan")]
-        let bpr = storage.row_stride();
-        #[cfg(feature = "backend-vulkan")]
-        let attachment_sample_count = pipeline_sample_count.unwrap_or(target_sample_count);
-        #[cfg(not(feature = "backend-vulkan"))]
-        let attachment_sample_count = target_sample_count;
-        if base_w == 0 {
-            base_w = mw;
-            base_h = mh;
-        } else if mw != base_w || mh != base_h {
-            // An attachment whose geometry differs from the first one is
-            // dropped, and the draw goes on with the rest. **This is a loss the
-            // guest is not told about**: the shader still writes that
-            // `[[color(n)]]` output, the attachment it was aimed at never
-            // receives it, and a later sample of that texture reads whatever was
-            // there before. It is the same class `secondary_mrt_drop` reports
-            // one stage further on, and it used to be a bare `continue` with a
-            // comment — so a pass whose second attachment was skipped here
-            // arrived at that census as a single-attachment draw and was
-            // counted as `mrt_draw_single`, indistinguishable from a guest that
-            // never asked for MRT at all.
-            //
-            // Reported rather than refused, and reported before it is fixed,
-            // because the fix depends on which way the geometry differs and no
-            // boot has yet produced one: a Metal attachment larger than the
-            // render area is legal and should be rendered into at the pass's
-            // size, while a smaller one is a guest error Metal itself would
-            // reject.
-            crate::runtime::drain::note_store_route("mrt_slot_geometry_dropped");
-            if crate::observe::first_sight("mrt_slot_geometry_dropped", u64::from(slot)) {
-                crate::observe::fail(format!(
-                    "mrt_slot_geometry_dropped slot={slot} ref={} got={mw}x{mh} \
-                     want={base_w}x{base_h} (the attachment is dropped and the \
-                     draw runs without it, so the shader's output for this slot \
-                     goes nowhere and a later sample reads stale content)",
-                    att.texture_ref
-                ));
-            }
-            continue;
-        }
-        let mut load_action = att.load_action;
-        let mut clear_color = att.clear_color;
-        let mut seed = None;
-        if let Some(cl) = clears.iter().find(|a| a.texture_ref == att.texture_ref) {
-            // Clear-only stream record for this attachment: real Metal Clear.
-            load_action = MTL_LOAD_ACTION_CLEAR;
-            clear_color = cl.clear_color;
-            if mapping_id == 0 {
-                seed = Some(solid_rgba8(mw, mh, &cl.clear_color));
-            }
-        } else if att.load_action == MTL_LOAD_ACTION_CLEAR {
-            if mapping_id == 0 {
-                seed = Some(solid_rgba8(mw, mh, &att.clear_color));
-            }
-        } else if att.load_action == MTL_LOAD_ACTION_LOAD && mapping_id == 0 {
-            // A GVA linear target needs a CPU seed when no mapping is available.
-            // IOSurface texture is seeded later instead, at the attachment site in
-            // `encode_draw` — the same place the guest-backed alias used to be
-            // built, and the same seed it already took whenever the alias was
-            // refused. Seeding here would need the mapping read twice.
-            //
-            {
-                // Before the read, not after it: the seed this is about to build
-                // is the one a resident rung would replace, and a probe placed
-                // downstream of here measures an empty population by
-                // construction — see `note_gva_load_seed_probe`.
-                // Before the read, not after it. The engine may still hold
-                // exactly what the render Store published into these pages, in
-                // which case reading them back costs a full-frame CPU walk and a
-                // block on that same Store's writeback — the device's largest
-                // remaining wait. See `draw::vulkan::gva_resident_if_current`;
-                // the encode side honours the flag or re-seeds.
-                // Only colour0. `gva_chain_identity` names the first attachment
-                // and the chain rail carries that one, so a second slot whose
-                // seed was skipped would reach the pass with nothing to load.
-                // `colors.is_empty()` is "this push becomes `colors[0]`", taken
-                // from the vector the identity will read rather than from the
-                // slot number, which is the guest's and need not start at zero.
-                let is_color0 = colors.is_empty();
-                #[cfg(feature = "backend-vulkan")]
-                let resident = is_color0
-                    && vulkan::gva_load_seed_elidable(
-                        state,
-                        host,
-                        task_id,
-                        vulkan::GvaSpan {
-                            texture_ref: att.texture_ref,
-                            gva,
-                            row_stride: bpr,
-                            width: mw,
-                            height: mh,
-                            format: mfmt,
-                        },
-                    );
-                #[cfg(not(feature = "backend-vulkan"))]
-                let resident = false;
-                if is_color0 {
-                    gva_load_source = if resident {
-                        GvaLoadSource::Resident
-                    } else {
-                        GvaLoadSource::GuestPages
-                    };
-                } else {
-                    seed = seed_color_load(state, host, task_id, att.texture_ref, gva, mw, mh);
-                    if seed.is_none() {
-                        crate::observe::fail(format!(
-                            "color LOAD seed miss ref={} {}x{} fmt={:#x} gva={:#x} (archive: still encode)",
-                            att.texture_ref, mw, mh, mfmt, gva
-                        ));
-                    }
-                }
-            }
-        }
-        colors.push(ColorRtRequest {
-            slot,
-            texture_ref: target_ref,
-            resource: objects::resolve_resource(state, host, task_id, target_ref).ok(),
-            storage,
-            width: mw,
-            height: mh,
-            format: mfmt,
-            sample_count: attachment_sample_count,
-            load_action,
-            store_action: att.store_action,
-            clear_color,
-            target_seed_rgba: seed,
-            multisample_source_ref,
-        });
-    }
-    if colors.is_empty() {
-        return None;
-    }
-    Some(DrawEncodeRequest {
-        task_id,
-        pipeline_ref,
-        vertex_count: draw.vertex_count,
-        instance_count: draw.instance_count,
-        primitive_type: draw.primitive_type,
-        first_vertex: draw.first_vertex,
-        base_instance: draw.base_instance,
-        colors,
-        gva_load_source,
         ..Default::default()
     })
 }
@@ -3011,7 +2541,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
     reason = "the archive writer mirrors the target GVA and native row geometry"
 )]
 pub(crate) fn write_gva_rgba8<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     gva: u64,
@@ -3056,13 +2586,13 @@ pub(crate) fn write_gva_rgba8<M: HostMemory + HostOps>(
 /// Stores whenever the capture failed for an unrelated reason. If that counter
 /// stays at zero it can be tightened with evidence.
 pub(crate) fn sync_store_target_pages<M: HostMemory>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     c: &ColorRtRequest,
 ) -> Option<StoreTargetPages> {
     if c.target_gva() == 0
-        || !crate::contract::pass_action::store_action_publishes_single_sample(c.store_action)
+        || !c.store_action.publishes_single_sample()
         || c.width == 0
         || c.height == 0
     {
@@ -3102,7 +2632,6 @@ pub(crate) fn sync_store_target_pages<M: HostMemory>(
 /// the struct: both fields are produced by the one walk either way, and a
 /// conditional shape would make the two arms disagree about what a Store's
 /// authorisation *is*.
-#[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
 pub(crate) struct StoreTargetPages {
     ordered: Vec<u64>,
     set: std::collections::HashSet<u64>,
@@ -3156,7 +2685,6 @@ impl StoreTargetPages {
     /// reads index `i` as page `i` of the window. A copy built from a shifted
     /// list would land the frame's bytes at the wrong guest addresses without
     /// anything noticing — the copy converts nothing and checks nothing.
-    #[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
     pub(crate) fn ordered_complete(&self, gva: u64, page_size: u64) -> Option<&[u64]> {
         let want = reims_vgpu_paging::span::pages_spanned(gva, self.span, page_size);
         (self.ordered.len() as u64 == want).then_some(&self.ordered[..])
@@ -3183,7 +2711,7 @@ impl StoreTargetPages {
     reason = "the archive writer mirrors the target GVA and native row geometry"
 )]
 pub(crate) fn write_gva_rgba8_within<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     gva: u64,
@@ -3226,9 +2754,8 @@ pub(crate) fn write_gva_rgba8_within<M: HostMemory + HostOps>(
     reason = "the same target GVA and native row geometry every GVA writer takes"
 )]
 // The CLEAR seed at the head of a draw chain is the only caller.
-#[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
 pub(crate) fn write_gva_solid8<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     gva: u64,
@@ -3270,7 +2797,6 @@ pub(crate) enum SourceRows {
     /// One row of `width` RGBA8 texels, written to every destination row.
     ///
     /// Constructed only by [`write_gva_solid8`].
-    #[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
     Repeated,
 }
 
@@ -3281,7 +2807,7 @@ pub(crate) enum SourceRows {
     reason = "the archive writer mirrors the target GVA and native row geometry"
 )]
 fn write_gva_rows_within<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     gva: u64,
@@ -3390,8 +2916,8 @@ fn write_gva_rows_within<M: HostMemory + HostOps>(
 /// place is deleted. This used to run only on the alias-reject fallback
 /// (unaligned offset or row stride, span out of range, no device), which is why
 /// it is already a complete path and not a new one.
-fn seed_color_load<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+pub(super) fn seed_color_load<M: HostMemory + HostOps>(
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     texture_ref: u32,
@@ -3409,7 +2935,7 @@ fn seed_color_load<M: HostMemory + HostOps>(
             // stored-once-sampled-forever entry warm.
             crate::runtime::surface_cache::touch_gva(state, target_gva, width, height);
         }
-        // This is the reader that keeps `DeviceState::host_gva_surfaces` alive,
+        // This is the reader that keeps `HostReplicaState::gva_surfaces` alive,
         // and the measurement is unambiguous. One driven x86/Vulkan boot (four
         // Safari pages, each scrolled six times then title-bar dragged;
         // `.agents/repros/gva-seed-serve-census.sh`) served **1 558 colour LOAD
@@ -3612,7 +3138,7 @@ fn seed_color_load<M: HostMemory + HostOps>(
 /// rematerialize through a remapped view (contract: swizzled views fail for RT/blit).
 /// View `pixel_format` still overrides the base format when bpp-compatible.
 fn load_sampled_rgba_static<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     texture_ref: u32,
@@ -3696,7 +3222,6 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
 /// not write it, so it is zeroed here. A recycled buffer must not carry a
 /// previous surface's tail into the memo comparison, where it would manufacture a
 /// miss and cost a full conversion.
-#[cfg(feature = "backend-vulkan")]
 fn prepare_memo_scratch(scratch: &mut Vec<u8>, span: usize, filled: usize) {
     let filled = filled.min(span);
     scratch.resize(span, 0);
@@ -3713,18 +3238,17 @@ fn prepare_memo_scratch(scratch: &mut Vec<u8>, span: usize, filled: usize) {
 /// magnification burst re-binds the same static icons ~1000×, so this collapses
 /// the `iosurface_guest` CPU copies that saturate the serial drain worker (the
 /// dock-hover whole-VM freeze). Returns `(rgba, identity)`.
-#[cfg(feature = "backend-vulkan")]
 fn load_iosurface_texture_rgba_memoized<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     mid: u32,
 ) -> Option<(std::sync::Arc<Vec<u8>>, LinearSampleIdentity)> {
     let (w, h) = {
-        let m = state.mappings.get(&mid)?;
-        if !m.has_geom || m.width == 0 || m.height == 0 {
+        let m = state.surfaces.mappings.get(&mid)?;
+        if !m.has_geometry() || m.width_or_zero() == 0 || m.height_or_zero() == 0 {
             return None;
         }
-        (m.width, m.height)
+        (m.width_or_zero(), m.height_or_zero())
     };
     let sample_fmt = effective_view_sample_format(MTL_FORMAT_BGRA8_UNORM, None)?;
     let stride = w.saturating_mul(RGBA8_BPP);
@@ -3735,7 +3259,7 @@ fn load_iosurface_texture_rgba_memoized<M: HostMemory + HostOps>(
     // Coherence re-read: land any resident-authoritative writeback and read the
     // current native BGRA (read_mapping_bgra8 runs ensure_resolved_for_scanout +
     // flush internally). Reuse the scratch so a memo hit costs no allocation.
-    let mut scratch = std::mem::take(&mut state.iosurface_texture_memo_scratch);
+    let mut scratch = std::mem::take(&mut state.content.sampled.iosurface_texture_memo_scratch);
     prepare_memo_scratch(
         &mut scratch,
         span,
@@ -3744,21 +3268,21 @@ fn load_iosurface_texture_rgba_memoized<M: HostMemory + HostOps>(
     if !{
         crate::runtime::scanout::read_mapping_bgra8(state, host, mid, &mut scratch, stride, w, h)
     } {
-        state.iosurface_texture_memo_scratch = scratch;
+        state.content.sampled.iosurface_texture_memo_scratch = scratch;
         return None;
     }
     // Identity key namespace: bits 63+62 mark IOSurface texture memo content, distinct from
     // raw-GVA keys (bit 63 clear) and IOSurface plane view view keys (bit 63 set, bit 62 clear).
     // Every producer draws its generation from
-    // `DeviceState::next_sampled_content_generation`, so a (key, generation)
+    // `Device::next_sampled_content_generation`, so a (key, generation)
     // pair is unique device-wide and content can never alias on a collision.
     let identity_key = (1u64 << 63) | (1u64 << 62) | mid as u64;
     let key = (mid, w, h);
-    if let Some(m) = state.iosurface_texture_memo.get_touch(&key) {
+    if let Some(m) = state.content.sampled.iosurface_texture_memo.get_touch(&key) {
         if m.native == scratch {
             let rgba = m.rgba.clone();
             let generation = m.generation;
-            state.iosurface_texture_memo_scratch = scratch;
+            state.content.sampled.iosurface_texture_memo_scratch = scratch;
             return Some((
                 rgba,
                 LinearSampleIdentity {
@@ -3780,13 +3304,13 @@ fn load_iosurface_texture_rgba_memoized<M: HostMemory + HostOps>(
         )
     });
     if !converted {
-        state.iosurface_texture_memo_scratch = scratch;
+        state.content.sampled.iosurface_texture_memo_scratch = scratch;
         return None;
     }
     let rgba = std::sync::Arc::new(rgba);
     let generation = state.next_sampled_content_generation();
     let entry_bytes = scratch.len() + rgba.len();
-    state.iosurface_texture_memo.insert(
+    state.content.sampled.iosurface_texture_memo.insert(
         key,
         crate::model::GuestLinearMemo {
             native: scratch,
@@ -3794,7 +3318,7 @@ fn load_iosurface_texture_rgba_memoized<M: HostMemory + HostOps>(
             // This rail converts every format to RGBA8 unconditionally — the
             // loop above is `convert_row_to_rgba8` with no native arm — so the
             // layout is fixed rather than chosen.
-            layout: crate::contract::pixel_format::TexelLayout::Rgba8,
+            layout: reims_vgpu_core::pixel_format::TexelLayout::Rgba8,
             generation,
         },
         entry_bytes,
@@ -3811,20 +3335,19 @@ fn load_iosurface_texture_rgba_memoized<M: HostMemory + HostOps>(
 #[cfg(test)]
 mod tests;
 
-#[cfg(all(test, feature = "backend-vulkan"))]
+#[cfg(test)]
 mod load_action_contract_tests {
     use super::load_action_in_contract;
-    use crate::contract::pass_action::{
+    use reims_vgpu_protocol::pass_action::{
         MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_DONT_CARE, MTL_LOAD_ACTION_LOAD,
     };
 
     /// `MTLLoadAction` has three values, and a fourth is named rather than
     /// swallowed.
     ///
-    /// Both encode arms fall back to DontCare on an out-of-contract value,
-    /// which discards whatever the attachment held — so a pass the guest meant
-    /// arm took the same value into a `_ => {}` and said nothing. One helper
-    /// now, so a third arm cannot reintroduce the silence.
+    /// Request normalization refuses an out-of-contract value before either
+    /// executor sees the pass. One helper names that boundary, so a third arm
+    /// cannot reintroduce a fallback.
     #[test]
     fn a_load_action_outside_mtlloadaction_is_named_not_swallowed() {
         for (name, action) in [
@@ -3903,10 +3426,10 @@ mod load_action_contract_tests {
     }
 }
 
-#[cfg(all(test, feature = "backend-vulkan"))]
+#[cfg(test)]
 mod store_action_contract_tests {
     use super::store_action_in_contract;
-    use crate::contract::pass_action::{
+    use reims_vgpu_protocol::pass_action::{
         MTL_STORE_ACTION_DONT_CARE, MTL_STORE_ACTION_MULTISAMPLE_RESOLVE, MTL_STORE_ACTION_STORE,
         MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
     };
@@ -3956,7 +3479,7 @@ mod store_action_contract_tests {
     }
 }
 
-#[cfg(all(test, feature = "backend-vulkan"))]
+#[cfg(test)]
 mod memo_scratch_tests {
     use super::prepare_memo_scratch;
 
@@ -4019,7 +3542,7 @@ mod memo_scratch_tests {
     fn an_unlandable_chain_writeback_names_itself() {
         use crate::runtime::drain::store_route_count;
         let mut state =
-            crate::model::DeviceState::new(crate::model::DeviceId(1), crate::model::PAGE_SHIFT_X86);
+            crate::runtime::Device::new(crate::model::DeviceId(1), crate::model::PAGE_SHIFT_X86);
         let mut host = crate::runtime::host::FakeHost::new();
 
         // No source at all: the commonest way this rail is reached with nothing
@@ -4067,7 +3590,7 @@ mod memo_scratch_tests {
     #[test]
     fn the_chain_recovery_refusal_says_which_break_abandoned_it() {
         let mut state =
-            crate::model::DeviceState::new(crate::model::DeviceId(1), crate::model::PAGE_SHIFT_X86);
+            crate::runtime::Device::new(crate::model::DeviceId(1), crate::model::PAGE_SHIFT_X86);
         let mut host = crate::runtime::host::FakeHost::new();
 
         let before = std::fs::read_to_string(crate::observe::fail_log_path())

@@ -16,7 +16,7 @@
 //! back head — lives in `runtime/drain/mod.rs`, which does it against live guest
 //! memory and reports each failure as a `PacketFault`.
 
-use crate::contract::endian::{ld32, st16, st32};
+use reims_vgpu_core::endian::{ld32, st16, st32};
 
 // --- child record layout, as the PVG command table numbers them ---
 
@@ -399,7 +399,7 @@ pub fn decode_synchronize_resources(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::endian::st32;
+    use reims_vgpu_core::endian::st32;
 
     /// RE pageBacking: plen=16 = header + one 8-byte record; LE `01 00 00 01`
     /// = clear_host_valid + set_guest_valid (PVG validity-op bytes).

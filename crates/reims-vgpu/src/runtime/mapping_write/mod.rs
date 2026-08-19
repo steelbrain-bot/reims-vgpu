@@ -2,16 +2,17 @@
 //!
 //! Product writes go **only** through a revalidated contiguous HostOps view
 //! (`map_pages`) — never `write_gpa` fragment walks over cached PFNs (freelist
-//! `0xff000000ff000000` class). Always bumps [`DeviceState::mark_mapping_written`]
+//! `0xff000000ff000000` class). Always bumps [`Device::mark_mapping_written`]
 //! on success.
 
-use crate::contract::iosurface_pages::{packed_span_estimate, sample_window_from_device_desc};
-use crate::contract::pixel_format::{
-    self, convert_rgba8_to_row, convert_row_to_rgba8, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP,
-};
-use crate::model::{scanout_extent_ok, DeviceState, MappingEntry, MAX_SCANOUT_DIM};
+use crate::model::{scanout_extent_ok, SurfaceMappingEntry, MAX_SCANOUT_DIM};
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::mapper;
+use crate::runtime::Device;
+use reims_vgpu_core::pixel_format::{
+    self, convert_rgba8_to_row, convert_row_to_rgba8, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP,
+};
+use reims_vgpu_protocol::{packed_span_estimate, sample_window_from_device_desc};
 
 /// Why one render writeback did not land its frame in the guest's pages.
 ///
@@ -207,7 +208,7 @@ fn refuse(mapping_id: u32, why: SurfaceWriteRefusal) -> bool {
 /// is the state before the guest fills one rather than a rung this device leans
 /// on.
 fn sample_window(
-    m: &MappingEntry,
+    m: &SurfaceMappingEntry,
     plane_index: Option<u32>,
     width: u32,
     height: u32,
@@ -229,7 +230,7 @@ fn sample_window(
 /// matching width, height and bytes-per-element, and the plane is taken only
 /// when exactly one matches. See [`sample_window`] for what each outcome means.
 pub fn iosurface_texture_sample_window(
-    m: &MappingEntry,
+    m: &SurfaceMappingEntry,
     width: u32,
     height: u32,
     format: u16,
@@ -248,7 +249,7 @@ pub fn iosurface_texture_sample_window(
 /// drops that index, so a bind the wire said was alpha resolves against
 /// whichever same-geometry plane the scan happens to reach.
 pub fn iosurface_plane_view_sample_window(
-    m: &MappingEntry,
+    m: &SurfaceMappingEntry,
     plane_index: u32,
     width: u32,
     height: u32,
@@ -262,7 +263,7 @@ pub fn iosurface_plane_view_sample_window(
 /// Returns `None` when the mapping is fragmented on Linux (use
 /// [`mapper::write_mapping_bytes`] / [`mapper::read_mapping_bytes`]).
 fn contig_for_span<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut H,
     mapping_id: u32,
     span_end: u64,
@@ -307,7 +308,7 @@ fn contig_for_span<H: HostMemory + HostOps>(
 /// on this one, same workload — so a single boot cannot score it and neither can
 /// a pair.
 fn vouch_for_write<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     mapping_id: u32,
     writer: &'static str,
@@ -360,7 +361,7 @@ fn vouch_for_write<M: HostMemory + HostOps>(
 /// process's bytes, which is a wrong picture and not a corrupted guest, and the
 /// two losses want separate slugs.
 fn contig_for_write<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut H,
     mapping_id: u32,
     span_end: u64,
@@ -431,7 +432,7 @@ fn rect_extent_end(
 /// `src` is row-major BGRA8 with `src_stride` bytes/row. Geometry must match
 /// the latched mapping size (or width/height args when has_geom is set).
 pub fn write_bgra8<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     mapping_id: u32,
     src: &[u8],
@@ -473,7 +474,7 @@ pub fn write_bgra8<M: HostMemory + HostOps>(
 /// Writes the frame whole. Resource ownership is decided before this byte
 /// writer is entered.
 pub fn write_bgra8_owned<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     mapping_id: u32,
     src: &std::sync::Arc<Vec<u8>>,
@@ -515,7 +516,7 @@ pub fn write_bgra8_owned<M: HostMemory + HostOps>(
 /// so the miss costs a slower route to the same pixels and never wrong ones.
 /// Writes the frame whole, for the same reason [`write_bgra8_owned`] does.
 pub fn write_bgra8_uncached<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     mapping_id: u32,
     src: &[u8],
@@ -546,7 +547,6 @@ pub fn write_bgra8_uncached<M: HostMemory + HostOps>(
 /// individually: "the GPU writeback declined" cannot tell a host whose GPU
 /// cannot import guest RAM from a surface whose row pitch is not a whole texel,
 /// and those have different fixes.
-#[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GpuWritebackDecline {
     /// A zero or over-large rect, or a mapping that is gone or unmapped. The
@@ -585,8 +585,8 @@ pub enum GpuWritebackDecline {
     /// so an order comparison would admit a half-float source over an eight-bit
     /// destination and land a frame of the wrong size.
     ResidentFormatMismatch {
-        held: ash::vk::Format,
-        want: ash::vk::Format,
+        held: reims_vgpu_protocol::StorageImageFormat,
+        want: reims_vgpu_protocol::StorageImageFormat,
     },
     /// The guest's row pitch is not a whole number of texels, so it cannot be
     /// expressed as `bufferRowLength`.
@@ -631,11 +631,10 @@ pub enum GpuWritebackDecline {
     },
     /// The engine declined or the copy failed; the inner error names which.
     Engine {
-        inner: crate::backend::vulkan::engine::DrawError,
+        inner: crate::runtime::executor::DrawError,
     },
 }
 
-#[cfg(feature = "backend-vulkan")]
 impl crate::observe::Decline for GpuWritebackDecline {
     fn slug(&self) -> &'static str {
         match self {
@@ -702,7 +701,6 @@ impl crate::observe::Decline for GpuWritebackDecline {
     }
 }
 
-#[cfg(feature = "backend-vulkan")]
 crate::observe::decline::decline_display!(GpuWritebackDecline);
 
 /// Which of a mapping's pages a writeback's texels live in, and where inside
@@ -713,7 +711,6 @@ crate::observe::decline::decline_display!(GpuWritebackDecline);
 /// it. This is the translation between the two, and getting it wrong lands a
 /// frame at the wrong offset in the guest's memory — which is a visibly shifted
 /// surface at best and another allocation's bytes at worst.
-#[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct GuestWindowPlan {
     /// Indices into `page_entries` of the first and last page the frame touches.
@@ -726,7 +723,6 @@ struct GuestWindowPlan {
     row_length_texels: u32,
 }
 
-#[cfg(feature = "backend-vulkan")]
 impl GuestWindowPlan {
     fn pages(&self) -> usize {
         self.last_page - self.first_page + 1
@@ -739,7 +735,6 @@ impl GuestWindowPlan {
 /// produces feeds a `VkBufferImageCopy` whose failure mode is silent — Vulkan
 /// will happily write a frame at the wrong offset — and none of the surrounding
 /// device state is needed to decide any of them.
-#[cfg(feature = "backend-vulkan")]
 fn plan_guest_window(
     page_entries: usize,
     page_size: u64,
@@ -811,7 +806,11 @@ fn plan_guest_window(
 /// to whatever path it was going to take anyway. The rail names *which* check
 /// declined, through [`GpuWritebackDecline`]; this collapses them, because a
 /// pre-question only needs to know that the answer is not "yes".
-pub fn resident_gpu_plane(m: &MappingEntry, width: u32, height: u32) -> Option<(u64, u32, u16)> {
+pub fn resident_gpu_plane(
+    m: &SurfaceMappingEntry,
+    width: u32,
+    height: u32,
+) -> Option<(u64, u32, u16)> {
     let (mw, mh, format) = mapping_write_geometry(m, width, height);
     if mw != width || mh != height {
         return None;
@@ -838,7 +837,7 @@ pub fn resident_gpu_plane(m: &MappingEntry, width: u32, height: u32) -> Option<(
 /// Everything [`write_bgra8_inner`] does *besides* moving bytes, because those
 /// obligations are about the guest's pages having changed and not about who
 /// changed them. In particular the guest-write witness
-/// ([`DeviceState::note_host_wrote_mapping`]) and the page footprint: a rail that
+/// ([`Device::note_host_wrote_mapping`]) and the page footprint: a rail that
 /// lands frames without recording that it did makes
 /// [`crate::runtime::gather_witness`] attribute its own writes to the guest, and
 /// the IOSurface texture resident rung above it then refuses residents and gathers whole
@@ -850,9 +849,8 @@ pub fn resident_gpu_plane(m: &MappingEntry, width: u32, height: u32) -> Option<(
 /// Every decline is a routing answer: the caller still owes the frame and takes
 /// the copying rail. `Ok(())` means the pixels are in the guest's pages and the
 /// GPU has finished writing them.
-#[cfg(feature = "backend-vulkan")]
 pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     mapping_id: u32,
     identity: &crate::model::TargetIdentity,
@@ -868,10 +866,10 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
     if !scanout_extent_ok(width, height) {
         return Err(GpuWritebackDecline::NotWritable);
     }
-    let Some(m) = state.mappings.get(&mapping_id) else {
+    let Some(m) = state.surfaces.mappings.get(&mapping_id) else {
         return Err(GpuWritebackDecline::NotWritable);
     };
-    if !m.mapped || m.page_entries.is_empty() {
+    if !m.lifecycle.active || m.pages.entries.is_empty() {
         return Err(GpuWritebackDecline::NotWritable);
     }
     let (mw, mh, format) = mapping_write_geometry(m, width, height);
@@ -893,7 +891,7 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
     let licence = licence_iosurface_texture_surface(
         state,
         host,
-        crate::backend::vulkan::translate::pixel::vk_texel_layout(identity.resident_layout()),
+        identity.resident_layout().into(),
         &IOSurfaceDestination {
             mapping_id,
             base_off,
@@ -937,7 +935,6 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
 /// `format` is what the guest will read these bytes back as, and must be the
 /// format the window was resolved against; the licence derives the bytes per
 /// texel from it rather than taking one, so there is no second answer to carry.
-#[cfg(feature = "backend-vulkan")]
 pub(crate) struct IOSurfaceDestination {
     pub mapping_id: u32,
     /// Byte offset of the window's first texel within the mapping.
@@ -964,7 +961,6 @@ pub(crate) struct IOSurfaceDestination {
 /// `base_off` and `span_end` are carried because the landing note needs them and
 /// deriving them a second time would be a second answer to a question the
 /// licence already asked. See [`note_iosurface_texture_landed`].
-#[cfg(feature = "backend-vulkan")]
 pub(crate) struct IOSurfaceLicence {
     pub target: reims_vgpu_memory::GuestPageTarget,
     /// The pages walked, in the surface's own order — what the copy is licensed
@@ -1007,11 +1003,10 @@ pub(crate) struct IOSurfaceLicence {
 /// Asking it for both callers rather than for the one that needs it keeps the
 /// rule in the licence, where a third writer of a guest surface would meet it
 /// without knowing to look.
-#[cfg(feature = "backend-vulkan")]
 pub(crate) fn licence_iosurface_texture_surface<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
-    held: ash::vk::Format,
+    held: reims_vgpu_protocol::StorageImageFormat,
     dst: &IOSurfaceDestination,
 ) -> Result<IOSurfaceLicence, GpuWritebackDecline> {
     let &IOSurfaceDestination {
@@ -1025,10 +1020,10 @@ pub(crate) fn licence_iosurface_texture_surface<M: HostMemory + HostOps>(
     } = dst;
     // The mapping still has to be here and still have to be backed — the caller
     // resolved a window against it, and may have done so before this call.
-    let Some(m) = state.mappings.get(&mapping_id) else {
+    let Some(m) = state.surfaces.mappings.get(&mapping_id) else {
         return Err(GpuWritebackDecline::NotWritable);
     };
-    if !m.mapped || m.page_entries.is_empty() {
+    if !m.lifecycle.active || m.pages.entries.is_empty() {
         return Err(GpuWritebackDecline::NotWritable);
     }
     // An image→buffer copy moves bytes and converts nothing, so this rail can
@@ -1040,11 +1035,11 @@ pub(crate) fn licence_iosurface_texture_surface<M: HostMemory + HostOps>(
     // table alone: this licence serves a compute storage output as well as a
     // Store, and a storage image is a thing the guest neither renders into nor
     // samples. See
-    // [`crate::contract::pixel_format::verbatim_storage_format`].
+    // [`reims_vgpu_core::pixel_format::verbatim_storage_format`].
     let Some(semantic_format) = pixel_format::verbatim_storage_format(format) else {
         return Err(GpuWritebackDecline::FormatNeedsConversion { format });
     };
-    let dst_format = crate::backend::vulkan::translate::pixel::vk_storage_image(semantic_format);
+    let dst_format = semantic_format;
     let texel = semantic_format.bytes_per_texel() as u32;
     // And that the source holds exactly it. See this function's doc for why the
     // render caller's own downstream check stays where it is: the two compare
@@ -1098,11 +1093,11 @@ pub(crate) fn licence_iosurface_texture_surface<M: HostMemory + HostOps>(
     let resolve_started = std::time::Instant::now();
     let page_size = state.page_size();
     let page_shift = state.page_shift;
-    let Some(m) = state.mappings.get(&mapping_id) else {
+    let Some(m) = state.surfaces.mappings.get(&mapping_id) else {
         return Err(GpuWritebackDecline::NotWritable);
     };
     let plan = plan_guest_window(
-        m.page_entries.len(),
+        m.pages.entries.len(),
         page_size,
         base_off,
         span_end,
@@ -1111,11 +1106,11 @@ pub(crate) fn licence_iosurface_texture_surface<M: HostMemory + HostOps>(
         texel,
     )?;
     let mut gpas = Vec::with_capacity(plan.pages());
-    for (i, &entry) in m.page_entries[plan.first_page..=plan.last_page]
+    for (i, &entry) in m.pages.entries[plan.first_page..=plan.last_page]
         .iter()
         .enumerate()
     {
-        let Some(gpa) = crate::contract::iosurface_pages::entry_gpa_shift(entry, page_shift) else {
+        let Some(gpa) = reims_vgpu_paging::geometry::mapper_entry_gpa(entry, page_shift) else {
             return Err(GpuWritebackDecline::PageUnbacked {
                 index: plan.first_page + i,
             });
@@ -1200,9 +1195,8 @@ pub(crate) fn licence_iosurface_texture_surface<M: HostMemory + HostOps>(
 /// early costs a re-read of bytes that are about to change anyway, while one
 /// forgotten late hands out a stale frame as fresh. The same argument the
 /// witnesses in [`licence_iosurface_texture_surface`] are armed on.
-#[cfg(feature = "backend-vulkan")]
 pub(crate) fn note_iosurface_texture_landed(
-    state: &mut DeviceState,
+    state: &mut Device,
     mapping_id: u32,
     base_off: u64,
     span_end: u64,
@@ -1222,9 +1216,13 @@ pub(crate) fn note_iosurface_texture_landed(
 /// Factored out because the writeback and the pre-flush above must resolve it
 /// identically — a pre-flush computed at a different extent than the write
 /// would leave exactly the windows the write is about to land on.
-fn mapping_write_geometry(m: &MappingEntry, width: u32, height: u32) -> (u32, u32, u16) {
-    if m.has_geom {
-        (m.width, m.height, mapping_store_format(m))
+fn mapping_write_geometry(m: &SurfaceMappingEntry, width: u32, height: u32) -> (u32, u32, u16) {
+    if m.has_geometry() {
+        (
+            m.width_or_zero(),
+            m.height_or_zero(),
+            mapping_store_format(m),
+        )
     } else {
         (width, height, MTL_FORMAT_BGRA8_UNORM)
     }
@@ -1244,9 +1242,9 @@ fn mapping_write_geometry(m: &MappingEntry, width: u32, height: u32) -> (u32, u3
 /// than deriving a second copy from the same fields. Two derivations agreeing
 /// only because they share an input is precisely how the primary attachment's
 /// format used to be decided, and it did not stay agreed.
-pub fn mapping_store_format(m: &MappingEntry) -> u16 {
-    if m.has_geom && m.format != 0 {
-        m.format
+pub fn mapping_store_format(m: &SurfaceMappingEntry) -> u16 {
+    if m.has_geometry() && m.format_or_zero() != 0 {
+        m.format_or_zero()
     } else {
         MTL_FORMAT_BGRA8_UNORM
     }
@@ -1278,7 +1276,7 @@ struct SourceFrame<'a> {
 }
 
 fn write_bgra8_inner<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     mapping_id: u32,
     frame: SourceFrame<'_>,
@@ -1299,10 +1297,10 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
             SurfaceWriteRefusal::SourceStride { src_stride, width },
         );
     }
-    let Some(m) = state.mappings.get(&mapping_id) else {
+    let Some(m) = state.surfaces.mappings.get(&mapping_id) else {
         return refuse(mapping_id, SurfaceWriteRefusal::MappingAbsent);
     };
-    if !m.mapped || m.page_entries.is_empty() {
+    if !m.lifecycle.active || m.pages.entries.is_empty() {
         return refuse(mapping_id, SurfaceWriteRefusal::MappingNotResident);
     }
     let (mw, mh, format) = mapping_write_geometry(m, width, height);
@@ -1598,7 +1596,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
 /// rewriting multi-MiB of identical bytes on every damage pass. `seed_rgba = None`
 /// always writes every row (Clear / multi-draw final / force-full).
 pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     mapping_id: u32,
     rgba: &[u8],
@@ -1632,10 +1630,10 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
             );
         }
     }
-    let Some(m) = state.mappings.get(&mapping_id) else {
+    let Some(m) = state.surfaces.mappings.get(&mapping_id) else {
         return refuse(mapping_id, SurfaceWriteRefusal::MappingAbsent);
     };
-    if !m.mapped || m.page_entries.is_empty() {
+    if !m.lifecycle.active || m.pages.entries.is_empty() {
         return refuse(mapping_id, SurfaceWriteRefusal::MappingNotResident);
     }
     let (mw, mh, format) = mapping_write_geometry(m, width, height);
@@ -1847,7 +1845,7 @@ fn rgba8_row_to_native(format: u16, rgba_row: &[u8], width: u32, native: &mut [u
     reason = "the mapping API keeps source rows and destination geometry explicit"
 )]
 pub fn write_raw_rows<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     mapping_id: u32,
     src: &[u8],
@@ -1883,18 +1881,18 @@ pub fn write_raw_rows<M: HostMemory + HostOps>(
         mapping_id,
         crate::runtime::render_writeback::SettleSite::MappingRawRowsWrite,
     );
-    let Some(m) = state.mappings.get(&mapping_id) else {
+    let Some(m) = state.surfaces.mappings.get(&mapping_id) else {
         return refuse(mapping_id, SurfaceWriteRefusal::MappingAbsent);
     };
-    if !m.mapped || m.page_entries.is_empty() {
+    if !m.lifecycle.active || m.pages.entries.is_empty() {
         return refuse(mapping_id, SurfaceWriteRefusal::MappingNotResident);
     }
-    if m.has_geom && (m.width != width || m.height != height) {
+    if m.has_geometry() && (m.width_or_zero() != width || m.height_or_zero() != height) {
         return refuse(
             mapping_id,
             SurfaceWriteRefusal::GeometryMoved {
-                latched_width: m.width,
-                latched_height: m.height,
+                latched_width: m.width_or_zero(),
+                latched_height: m.height_or_zero(),
                 frame_width: width,
                 frame_height: height,
             },
@@ -1946,7 +1944,7 @@ pub fn write_raw_rows<M: HostMemory + HostOps>(
     reason = "the mapping API keeps source rows and destination geometry explicit"
 )]
 pub fn read_raw_rows<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     mapping_id: u32,
     dst: &mut [u8],
@@ -1969,13 +1967,13 @@ pub fn read_raw_rows<M: HostMemory + HostOps>(
         mapping_id,
         crate::runtime::render_writeback::SettleSite::MappingRawRowsRead,
     );
-    let Some(m) = state.mappings.get(&mapping_id) else {
+    let Some(m) = state.surfaces.mappings.get(&mapping_id) else {
         return false;
     };
-    if !m.mapped || m.page_entries.is_empty() {
+    if !m.lifecycle.active || m.pages.entries.is_empty() {
         return false;
     }
-    if m.has_geom && (m.width != width || m.height != height) {
+    if m.has_geometry() && (m.width_or_zero() != width || m.height_or_zero() != height) {
         return false;
     }
     let span_end = (row_bytes as u64).saturating_mul(height as u64);
@@ -2049,25 +2047,28 @@ pub struct Rect {
     pub height: u32,
 }
 
-fn mapping_geom_window(state: &DeviceState, mapping_id: u32, rect: Rect) -> Option<SurfaceWindow> {
+fn mapping_geom_window(state: &Device, mapping_id: u32, rect: Rect) -> Option<SurfaceWindow> {
     let Rect {
         origin_x,
         origin_y,
         width,
         height,
     } = rect;
-    let m = state.mappings.get(&mapping_id)?;
-    if !m.has_geom {
+    let m = state.surfaces.mappings.get(&mapping_id)?;
+    if !m.has_geometry() {
         return None;
     }
-    let format = if m.format != 0 {
-        m.format
+    let format = if m.format_or_zero() != 0 {
+        m.format_or_zero()
     } else {
         MTL_FORMAT_BGRA8_UNORM
     };
-    let (base_off, bpr, span_end) = iosurface_texture_sample_window(m, m.width, m.height, format)?;
+    let (base_off, bpr, span_end) =
+        iosurface_texture_sample_window(m, m.width_or_zero(), m.height_or_zero(), format)?;
     let bpp = pixel_format::bytes_per_pixel(format)?;
-    if origin_x.saturating_add(width) > m.width || origin_y.saturating_add(height) > m.height {
+    if origin_x.saturating_add(width) > m.width_or_zero()
+        || origin_y.saturating_add(height) > m.height_or_zero()
+    {
         return None;
     }
     Some(SurfaceWindow {
@@ -2082,7 +2083,7 @@ fn mapping_geom_window(state: &DeviceState, mapping_id: u32, rect: Rect) -> Opti
 /// Contig HostOps view when possible; else multi-import.
 #[cfg(test)]
 pub fn read_rect_raw<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     mapping_id: u32,
     rect: Rect,
@@ -2102,7 +2103,7 @@ pub fn read_rect_raw<M: HostMemory + HostOps>(
     reason = "the explicit-plane API mirrors its sample window and rectangle"
 )]
 pub fn read_rect_raw_at<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     mapping_id: u32,
     window: SurfaceWindow,
@@ -2152,10 +2153,10 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
         "rectrd_settle_us",
         settle_started.elapsed().as_micros() as u64,
     );
-    let Some(m) = state.mappings.get(&mapping_id) else {
+    let Some(m) = state.surfaces.mappings.get(&mapping_id) else {
         return false;
     };
-    if !m.mapped || m.page_entries.is_empty() {
+    if !m.lifecycle.active || m.pages.entries.is_empty() {
         return false;
     }
     let Some(row_bytes) = width.checked_mul(bpp) else {
@@ -2308,7 +2309,7 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
     reason = "the mapping API mirrors the decoded texture rectangle"
 )]
 pub fn write_rect_raw<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     mapping_id: u32,
     rect: Rect,
@@ -2328,7 +2329,7 @@ pub fn write_rect_raw<M: HostMemory + HostOps>(
     reason = "the explicit-plane API mirrors its sample window and rectangle"
 )]
 pub fn write_rect_raw_at<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     mapping_id: u32,
     window: SurfaceWindow,
@@ -2377,7 +2378,7 @@ pub fn write_rect_raw_at<M: HostMemory + HostOps>(
     reason = "the full-plane API mirrors its mapping window and row layout"
 )]
 pub fn write_full_rect_raw_at<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     mapping_id: u32,
     base_off: u64,
@@ -2413,7 +2414,7 @@ pub fn write_full_rect_raw_at<M: HostMemory + HostOps>(
 
 #[allow(clippy::too_many_arguments)]
 fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     mapping_id: u32,
     window: SurfaceWindow,
@@ -2437,10 +2438,10 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
     if !scanout_extent_ok(width, height) || bpp == 0 {
         return false;
     }
-    let Some(m) = state.mappings.get(&mapping_id) else {
+    let Some(m) = state.surfaces.mappings.get(&mapping_id) else {
         return false;
     };
-    if !m.mapped || m.page_entries.is_empty() {
+    if !m.lifecycle.active || m.pages.entries.is_empty() {
         return false;
     }
     let Some(row_bytes) = width.checked_mul(bpp) else {

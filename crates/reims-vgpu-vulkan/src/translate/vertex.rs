@@ -157,62 +157,8 @@ pub const SIGNED_AS_UNSIGNED: &[F] = &[
 
 /// `MTLVertexFormat` (SDK numeric values) → the engine's attribute format.
 pub fn attribute_format(mtl: u32) -> Result<F, TranslateReason> {
-    Ok(match mtl {
-        1 => F::UChar2,
-        2 => F::UChar3,
-        3 => F::UChar4,
-        4 => F::Char2,
-        5 => F::Char3,
-        6 => F::Char4,
-        7 => F::UChar2Normalized,
-        8 => F::UChar3Normalized,
-        9 => F::UChar4Normalized,
-        10 => F::Char2Normalized,
-        11 => F::Char3Normalized,
-        12 => F::Char4Normalized,
-        13 => F::UShort2,
-        14 => F::UShort3,
-        15 => F::UShort4,
-        16 => F::Short2,
-        17 => F::Short3,
-        18 => F::Short4,
-        19 => F::UShort2Normalized,
-        20 => F::UShort3Normalized,
-        21 => F::UShort4Normalized,
-        22 => F::Short2Normalized,
-        23 => F::Short3Normalized,
-        24 => F::Short4Normalized,
-        25 => F::Half2,
-        26 => F::Half3,
-        27 => F::Half4,
-        28 => F::Float,
-        29 => F::Float2,
-        30 => F::Float3,
-        31 => F::Float4,
-        32 => F::Int,
-        33 => F::Int2,
-        34 => F::Int3,
-        35 => F::Int4,
-        36 => F::UInt,
-        37 => F::UInt2,
-        38 => F::UInt3,
-        39 => F::UInt4,
-        40 => F::Int1010102Normalized,
-        41 => F::UInt1010102Normalized,
-        42 => F::UChar4NormalizedBgra,
-        45 => F::UChar,
-        46 => F::Char,
-        47 => F::UCharNormalized,
-        48 => F::CharNormalized,
-        49 => F::UShort,
-        50 => F::Short,
-        51 => F::UShortNormalized,
-        52 => F::ShortNormalized,
-        53 => F::Half,
-        54 => F::FloatRg11B10,
-        55 => F::FloatRgb9E5,
-        other => return Err(TranslateReason::UnknownVertexFormat(other)),
-    })
+    reims_vgpu_protocol::decode_vertex_attribute_format(mtl)
+        .map_err(|_| TranslateReason::UnknownVertexFormat(mtl))
 }
 
 /// A layout entry's declared `MTLVertexStepFunction` → engine step mode.
@@ -226,16 +172,14 @@ pub fn attribute_format(mtl: u32) -> Result<F, TranslateReason> {
 /// unrecognised values. They are recognised; this backend builds no
 /// tessellation pipeline for them to belong to.
 pub fn step_function(declared: Option<u32>) -> Result<VertexStepFunction, TranslateReason> {
-    let Some(mtl) = declared else {
-        return Ok(VertexStepFunction::PerVertex);
-    };
-    match mtl {
-        0 => Ok(VertexStepFunction::Constant),
-        1 => Ok(VertexStepFunction::PerVertex),
-        2 => Ok(VertexStepFunction::PerInstance),
-        3 | 4 => Err(TranslateReason::VertexStepFunctionPerPatch(mtl)),
-        other => Err(TranslateReason::UnknownVertexStepFunction(other)),
-    }
+    reims_vgpu_protocol::decode_vertex_step_function(declared).map_err(|reason| match reason {
+        reims_vgpu_protocol::VertexStepDecodeError::TessellationUnsupported(value) => {
+            TranslateReason::VertexStepFunctionPerPatch(value)
+        }
+        reims_vgpu_protocol::VertexStepDecodeError::Unknown(value) => {
+            TranslateReason::UnknownVertexStepFunction(value)
+        }
+    })
 }
 
 /// `VertexStepFunction` → the Vulkan input rate the binding is created with.
@@ -369,7 +313,7 @@ mod tests {
     ///
     /// [`VertexStepFunction::mtl_ordinal`] exists so a rule stated over the
     /// guest's ordinal can be asked on this side — the step/rate pair in
-    /// `contract::vertex_step` is the one that does — and a rule asked through
+    /// `reims_vgpu_protocol` is the one that does — and a rule asked through
     /// an inverse that is not an inverse is a rule asked about a different
     /// attribute. The three accepted ordinals are named from the contract here
     /// rather than spelled again, so this also pins that the `match` above

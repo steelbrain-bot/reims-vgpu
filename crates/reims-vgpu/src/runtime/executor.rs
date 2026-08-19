@@ -3,23 +3,80 @@
 //! Render and compute commands, surrounding identities, resource lists, and
 //! segment boundaries are backend-independent before they cross this port.
 
-use crate::backend::vulkan::engine::{DrawError, EngineFacadeDecline};
 use crate::model::TargetIdentity;
 use reims_vgpu_protocol::StorageImageFormat;
+pub use reims_vgpu_vulkan::engine::{
+    gather_phase::GatherPhaseWindow, gpu_span::GpuSpanWindow, stage_phase::StagePhaseWindow,
+};
+pub use reims_vgpu_vulkan::engine::{
+    CounterSnapshot, DrawError, DrawPhaseWindow, EngineFacadeDecline,
+};
+pub use reims_vgpu_vulkan::m2v_cache::M2vCacheDecline;
+pub use reims_vgpu_vulkan::spirv_bind::ImageFormatSpecializeError;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 pub use reims_vgpu_core::{
     CapabilityService, ComputeOutput, ComputeRequest, ComputeResidencyService, DrawOutput,
     DrawRequest, ExecutionPort, ExecutorCapabilities, GuestWriteReach, GuestWriteService,
     PresentDecline, PresentationService, ReadbackLease, ReadbackService, ResidentContent,
-    ResidentContentBacking, ResidentService, ResolvedCommand, ResolvedCommandBuffer,
-    ResourceLifetimeRef, SubmissionContext, TargetReadback,
+    ResidentContentBacking, ResidentReadPlan, ResidentService, ResolvedCommand,
+    ResolvedCommandBuffer, ResourceLifetimeRef, SubmissionContext, TargetReadback,
 };
+
+struct DeviceTelemetry;
+
+impl reims_vgpu_vulkan::telemetry::BackendTelemetry for DeviceTelemetry {
+    fn route(&self, name: &'static str) {
+        crate::runtime::drain::note_store_route(name);
+    }
+
+    fn route_n(&self, name: &'static str, count: u64) {
+        crate::runtime::drain::note_store_route_n(name, count);
+    }
+
+    fn route_us(&self, name: &'static str, micros: u64) {
+        crate::runtime::drain::note_store_route_us(name, micros);
+    }
+
+    fn readback_phase(&self, phase: reims_vgpu_vulkan::telemetry::ReadbackPhase, micros: u64) {
+        use crate::runtime::drain::ReadbackPhase as DevicePhase;
+        use reims_vgpu_vulkan::telemetry::ReadbackPhase as BackendPhase;
+        let phase = match phase {
+            BackendPhase::Submit => DevicePhase::Submit,
+            BackendPhase::Fence => DevicePhase::Fence,
+            BackendPhase::Map => DevicePhase::Map,
+            BackendPhase::Write => DevicePhase::Write,
+            BackendPhase::Vouch => DevicePhase::Vouch,
+            BackendPhase::Resolve => DevicePhase::Resolve,
+        };
+        crate::runtime::drain::note_readback_phase(phase, micros);
+    }
+
+    fn readback_gpu_us(&self, barrier: u64, copy: u64) {
+        crate::runtime::drain::note_readback_gpu_us(barrier, copy);
+    }
+
+    fn guest_imports_invalidated(&self) {
+        crate::runtime::guest_ram_map::reset();
+    }
+}
+
+static DEVICE_TELEMETRY: DeviceTelemetry = DeviceTelemetry;
+
+fn install_telemetry() {
+    reims_vgpu_vulkan::telemetry::install(&DEVICE_TELEMETRY);
+}
+
+/// Attribute backend lock observations to the device drain worker before it
+/// acquires the device-state lock.
+pub(crate) fn mark_drain_thread() {
+    reims_vgpu_vulkan::engine::mark_drain_thread();
+}
 
 /// Dynamic executor-session scope for one device operation.
 pub struct ExecutionScope {
-    _engine: Option<crate::backend::vulkan::engine::SessionScope>,
+    _engine: Option<reims_vgpu_vulkan::engine::SessionScope>,
 }
 
 impl ExecutionScope {
@@ -29,11 +86,8 @@ impl ExecutionScope {
 }
 
 /// Snapshot the active protocol context before entering a backend call.
-pub fn context_for(state: &crate::model::DeviceState, task_id: u32) -> SubmissionContext {
-    state
-        .active_submission
-        .clone()
-        .unwrap_or_else(|| SubmissionContext::standalone(task_id))
+pub fn context_for(state: &crate::runtime::Device, task_id: u32) -> SubmissionContext {
+    state.submissions.context_or_standalone(task_id)
 }
 
 pub type ResolvedSubmission =
@@ -45,11 +99,18 @@ pub type StampAnnounce = std::sync::Arc<dyn Fn(u32) + Send + Sync>;
 
 #[cfg(feature = "host-window")]
 #[derive(Clone, Copy, Debug)]
-pub struct WindowCpuFrame<'a> {
-    pub bgra: &'a [u8],
+pub struct WindowPresentationFrame<'a> {
     pub width: u32,
     pub height: u32,
     pub seq: u64,
+    pub payload: WindowPresentationPayload<'a>,
+}
+
+#[cfg(feature = "host-window")]
+#[derive(Clone, Copy, Debug)]
+pub enum WindowPresentationPayload<'a> {
+    CpuBgra(&'a [u8]),
+    Resident(&'a reims_vgpu_core::PreparedPresentation),
 }
 
 #[cfg(feature = "host-window")]
@@ -57,12 +118,119 @@ pub struct WindowCpuFrame<'a> {
 pub enum WindowPresentOutcome {
     Busy,
     Presented {
-        direct: bool,
+        route: reims_vgpu_core::PresentationRoute,
         width: u32,
         height: u32,
         swapchain_images: usize,
         suboptimal: bool,
     },
+}
+
+/// A presentation-port failure with backend diagnostics preserved at the
+/// composition boundary.
+#[cfg(feature = "host-window")]
+#[derive(Debug)]
+pub struct WindowPresentationError {
+    diagnostic: ExecutorDiagnostic,
+    presenter_detached: bool,
+}
+
+/// Exact diagnostic projected across an executor capability boundary without
+/// exporting the implementation's error type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutorDiagnostic {
+    reason: &'static str,
+    fields: Vec<(&'static str, String)>,
+    detail: String,
+}
+
+impl ExecutorDiagnostic {
+    pub(crate) fn from_decline(
+        error: &(impl reims_vgpu_observe::Decline + std::fmt::Display),
+    ) -> Self {
+        Self {
+            reason: error.slug(),
+            fields: error.fields(),
+            detail: error.to_string(),
+        }
+    }
+
+    #[cfg(feature = "host-window")]
+    fn named(reason: &'static str, fields: Vec<(&'static str, String)>, detail: String) -> Self {
+        Self {
+            reason,
+            fields,
+            detail,
+        }
+    }
+}
+
+impl std::fmt::Display for ExecutorDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for ExecutorDiagnostic {}
+
+impl reims_vgpu_observe::Decline for ExecutorDiagnostic {
+    fn slug(&self) -> &'static str {
+        self.reason
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        self.fields.clone()
+    }
+}
+
+#[cfg(feature = "host-window")]
+impl WindowPresentationError {
+    fn service_unavailable(service: &'static str) -> Self {
+        Self {
+            diagnostic: ExecutorDiagnostic::named(
+                "window_presentation_service_unavailable",
+                vec![("service", service.to_string())],
+                format!("window presentation service unavailable: {service}"),
+            ),
+            presenter_detached: false,
+        }
+    }
+
+    fn from_draw(error: DrawError) -> Self {
+        let presenter_detached = matches!(
+            error,
+            DrawError::Facade(EngineFacadeDecline::WindowPresenterNotAttached)
+        );
+        Self {
+            diagnostic: ExecutorDiagnostic::from_decline(&error),
+            presenter_detached,
+        }
+    }
+
+    pub fn presenter_detached(&self) -> bool {
+        self.presenter_detached
+    }
+}
+
+#[cfg(feature = "host-window")]
+impl std::fmt::Display for WindowPresentationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.diagnostic.fmt(f)
+    }
+}
+
+#[cfg(feature = "host-window")]
+impl std::error::Error for WindowPresentationError {}
+
+#[cfg(feature = "host-window")]
+impl reims_vgpu_observe::Decline for WindowPresentationError {
+    fn slug(&self) -> &'static str {
+        self.diagnostic.reason
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        self.diagnostic.fields.clone()
+    }
 }
 
 /// Native-window lifecycle and presentation owned by one executor session.
@@ -74,11 +242,9 @@ pub trait WindowPresentationService: std::fmt::Debug + Send + Sync {
         _window: raw_window_handle::RawWindowHandle,
         _width: u32,
         _height: u32,
-    ) -> Result<(), DrawError> {
-        Err(DrawError::Facade(
-            EngineFacadeDecline::ExecutorServiceUnavailable {
-                service: "window_present_attach",
-            },
+    ) -> Result<(), WindowPresentationError> {
+        Err(WindowPresentationError::service_unavailable(
+            "window_present_attach",
         ))
     }
 
@@ -88,13 +254,10 @@ pub trait WindowPresentationService: std::fmt::Debug + Send + Sync {
     #[cfg(feature = "host-window")]
     fn present_window_frame(
         &self,
-        _source: Option<&reims_vgpu_core::PresentationSource>,
-        _cpu: Option<WindowCpuFrame<'_>>,
-    ) -> Result<WindowPresentOutcome, DrawError> {
-        Err(DrawError::Facade(
-            EngineFacadeDecline::ExecutorServiceUnavailable {
-                service: "window_present_frame",
-            },
+        _frame: Option<WindowPresentationFrame<'_>>,
+    ) -> Result<WindowPresentOutcome, WindowPresentationError> {
+        Err(WindowPresentationError::service_unavailable(
+            "window_present_frame",
         ))
     }
 
@@ -103,23 +266,11 @@ pub trait WindowPresentationService: std::fmt::Debug + Send + Sync {
 }
 
 #[cfg(feature = "host-window")]
-pub const MAX_WINDOW_REATTACHES: u32 = crate::backend::vulkan::engine::MAX_DEVICE_RECREATES;
+pub const MAX_WINDOW_REATTACHES: u32 = reims_vgpu_vulkan::engine::MAX_DEVICE_RECREATES;
+pub const IDLE_MAINTENANCE_START_MS: u64 = reims_vgpu_vulkan::engine::IDLE_MAINTENANCE_START_MS;
 
-pub fn window_presenter_was_detached(error: &DrawError) -> bool {
-    matches!(
-        error,
-        DrawError::Facade(EngineFacadeDecline::WindowPresenterNotAttached)
-    )
-}
-
-/// Compatibility port for transfers and synchronization involving guest RAM.
-///
-/// Its concrete reference types remain runtime-owned during the migration, but
-/// execution, capability, presentation, and readback services cannot grow
-/// guest-memory policy through this boundary.
-pub trait GuestMemoryService: std::fmt::Debug + Send + Sync {
-    fn install_stamp_announce(&self, _hook: StampAnnounce) {}
-
+/// Executor service that lands a semantic resident in bounded guest pages.
+pub trait GuestPageTransferService: std::fmt::Debug + Send + Sync {
     fn copy_target_to_guest_pages(
         &self,
         _identity: &TargetIdentity,
@@ -132,6 +283,11 @@ pub trait GuestMemoryService: std::fmt::Debug + Send + Sync {
             },
         ))
     }
+}
+
+/// Completion-word ordering against outstanding executor access to guest RAM.
+pub trait CompletionService: std::fmt::Debug + Send + Sync {
+    fn install_stamp_announce(&self, _hook: StampAnnounce) {}
 
     fn guest_access_outstanding(&self) -> bool {
         false
@@ -141,13 +297,9 @@ pub trait GuestMemoryService: std::fmt::Debug + Send + Sync {
         false
     }
 
-    fn submit_batch_for_waiting_stamp(&self, _index: u32) -> bool {
-        false
-    }
-
     fn write_completion_stamp(
         &self,
-        _guest_ref: &crate::runtime::guest_ram::GuestRef,
+        _guest_ref: &reims_vgpu_memory::GuestRef,
         _index: u32,
         _value: u32,
     ) -> Result<(), DrawError> {
@@ -161,22 +313,46 @@ pub trait GuestMemoryService: std::fmt::Debug + Send + Sync {
     fn quiesce_completion_stamps(&self, _index: u32) {}
 
     fn quiesce_guest_reads(&self) {}
+}
 
+/// Ownership of the executor session's one deferred submission batch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompletionWaitBatch {
+    /// The awaited completion point was parked in the recording batch, which
+    /// this transition submitted.
+    Submitted,
+    /// No recording batch owned the point; it was already on the GPU rail.
+    AlreadyInFlight,
+}
+
+/// Submission-boundary transitions over the executor's open batch.
+pub trait SubmissionBatchService: std::fmt::Debug + Send + Sync {
+    fn submit_for_completion_wait(&self, _index: u32) -> CompletionWaitBatch {
+        CompletionWaitBatch::AlreadyInFlight
+    }
+
+    fn flush_submission_tail(&self) {}
+}
+
+/// Backend materializations of guest allocation lifetimes.
+pub trait GuestImportService: std::fmt::Debug + Send + Sync {
     fn warm_guest_ram_imports(
         &self,
-        _imports: &[std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>],
+        _imports: &[std::sync::Arc<reims_vgpu_memory::GuestRamImport>],
     ) -> (usize, u64) {
         (0, 0)
     }
 
-    fn retire_guest_import(&self, _import: crate::runtime::guest_ram::ImportId) {}
+    fn retire_guest_import(&self, _import: reims_vgpu_memory::ImportId) {}
 }
 
 /// Backend housekeeping which does not itself execute a guest command.
 pub trait MaintenanceService: std::fmt::Debug + Send + Sync {
-    fn flush_batched_draws(&self) {}
-
     fn maintain_resources(&self, _now_ms: u64) {}
+
+    fn idle_reclaim_start_ms(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Per-vGPU backend-session selection and teardown.
@@ -208,34 +384,234 @@ pub trait ObservationService: std::fmt::Debug + Send + Sync {
         [0; 6]
     }
 
-    fn counter_snapshot(&self) -> crate::backend::vulkan::engine::CounterSnapshot {
+    fn shader_translation_cache_level(&self) -> usize {
+        0
+    }
+
+    fn counter_snapshot(&self) -> CounterSnapshot {
         Default::default()
     }
 
-    fn draw_phase_window(&self) -> Option<crate::backend::vulkan::engine::DrawPhaseWindow> {
+    fn draw_phase_window(&self) -> Option<DrawPhaseWindow> {
         None
     }
 
-    fn gpu_span_window(&self) -> Option<crate::backend::vulkan::engine::gpu_span::GpuSpanWindow> {
+    fn gpu_span_window(&self) -> Option<GpuSpanWindow> {
         None
     }
 
-    fn gather_phase_window(
-        &self,
-    ) -> Option<crate::backend::vulkan::engine::gather_phase::GatherPhaseWindow> {
+    fn gather_phase_window(&self) -> Option<GatherPhaseWindow> {
         None
     }
 
-    fn stage_phase_window(
-        &self,
-    ) -> Option<crate::backend::vulkan::engine::stage_phase::StagePhaseWindow> {
+    fn stage_phase_window(&self) -> Option<StagePhaseWindow> {
         None
     }
 
     fn take_engine_lock_census(&self, _win_ms: u64) -> Option<String> {
         None
     }
+
+    fn note_draw_hang_candidate(&self, _note: DrawHangCandidate) {}
+
+    fn draw_hang_trail(&self) -> Option<String> {
+        None
+    }
+
+    fn draw_hang_outstanding(&self) -> Option<String> {
+        None
+    }
+
+    fn recent_pipeline_firsts(&self) -> Option<String> {
+        None
+    }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DrawHangIndexSource {
+    CpuBytes,
+    GuestRuns,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DrawHangIndexedNote {
+    pub index_count: u32,
+    pub index_width: u8,
+    pub vertex_offset: i32,
+    pub base_instance: u32,
+    pub byte_len: u64,
+    pub source: DrawHangIndexSource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DrawHangSampledNote {
+    pub binding: u32,
+    pub kind: u8,
+    pub format: reims_vgpu_protocol::ImageFormat,
+    pub width: u32,
+    pub height: u32,
+    pub texel0: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DrawHangSamplerNote {
+    pub binding: u32,
+    pub min_filter: u8,
+    pub mag_filter: u8,
+    pub mip_filter: u8,
+    pub address_u: u8,
+    pub address_v: u8,
+    pub provenance: u8,
+    pub unnormalized: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DrawHangCandidate {
+    pub pipeline_ref: u32,
+    pub vert_words: u32,
+    pub frag_words: u32,
+    pub width: u32,
+    pub height: u32,
+    pub vertex_count: u32,
+    pub instance_count: u32,
+    pub indexed: Option<DrawHangIndexedNote>,
+    pub fragment_declared_bindings: Arc<[u32]>,
+    pub fragment_provided_bindings: Vec<u32>,
+    pub sampled: Vec<DrawHangSampledNote>,
+    pub samplers: Vec<DrawHangSamplerNote>,
+}
+
+/// Shader translation and publication owned by the backend session.
+///
+/// Runtime supplies extracted AIR and semantic stage/local-size facts. Native
+/// modules and translator reflection remain behind this port; successful
+/// render preparation returns only the core executable projection.
+pub trait ShaderTranslationService: std::fmt::Debug + Send + Sync {
+    fn ensure_render_translation(
+        &self,
+        _air: &[u8],
+        _stage: reims_vgpu_core::ShaderStage,
+        _pipeline_ref: u32,
+    ) -> bool {
+        true
+    }
+
+    fn prepare_render_translation(
+        &self,
+        _air: &[u8],
+        _stage: reims_vgpu_core::ShaderStage,
+        _pipeline_ref: u32,
+    ) -> Result<reims_vgpu_core::PreparedShaderFamily, M2vCacheDecline> {
+        panic!("executor does not provide shader translation")
+    }
+
+    fn ensure_compute_translation(
+        &self,
+        _air: &[u8],
+        _local_size: [u32; 3],
+        _pipeline_ref: u32,
+    ) -> bool {
+        true
+    }
+
+    fn translate_compute(
+        &self,
+        _air: &[u8],
+        _local_size: [u32; 3],
+        _pipeline_ref: u32,
+    ) -> Result<Arc<dyn ComputeTranslation>, M2vCacheDecline> {
+        panic!("executor does not provide compute translation")
+    }
+}
+
+/// Backend policy for bounding and substituting render buffer arguments.
+///
+/// The semantic shader interface and draw geometry cross this port. Reflection
+/// implementation details, ablation policy, telemetry, and the shared neutral
+/// allocation remain owned by the executor adapter.
+pub trait RenderBufferPlanningService: std::fmt::Debug + Send + Sync {
+    #[allow(clippy::too_many_arguments)]
+    fn render_buffer_extent(
+        &self,
+        _interface: &reims_vgpu_core::ShaderInterface,
+        _metal_index: u32,
+        _feeds_stage_in: bool,
+        _first_vertex: u32,
+        _vertex_count: u32,
+        _base_instance: u32,
+        _instance_count: u32,
+        _indexed: bool,
+    ) -> Option<u64> {
+        None
+    }
+
+    fn may_serve_neutral_buffer(
+        &self,
+        _access: reims_vgpu_core::ReflectedBufferAccess,
+        _feeds_stage_in: bool,
+    ) -> bool {
+        false
+    }
+
+    fn neutral_buffer_content(&self) -> Arc<Vec<u8>> {
+        panic!("executor does not provide neutral render-buffer content")
+    }
+}
+
+/// Backend-owned translated compute module exposed only through semantic facts.
+pub trait ComputeTranslation: std::fmt::Debug + Send + Sync {
+    fn interface(&self) -> &reims_vgpu_core::ShaderInterface;
+
+    fn buffer_extent(
+        &self,
+        metal_index: u32,
+        workgroups: [u32; 3],
+        local_size: [u32; 3],
+    ) -> Option<u64>;
+
+    fn storage_image_access(&self, binding: u32) -> Option<reims_vgpu_core::StorageImageAccess>;
+
+    fn neutral_sampled_image_bindings(&self, bound: &[u32]) -> Vec<u32>;
+
+    fn samplers(&self) -> Arc<[reims_vgpu_core::ReflectedSamplerDescriptor]>;
+
+    fn prepare_program(
+        &self,
+        requests: &[(u32, Option<StorageImageFormat>)],
+    ) -> Result<PreparedComputeProgram, ComputeProgramDecline>;
+}
+
+#[derive(Debug)]
+pub struct PreparedComputeProgram {
+    pub stage: reims_vgpu_core::PreparedShaderStage,
+    _native_lifetime: Box<dyn std::any::Any + Send + Sync>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ComputeProgramDecline {
+    UnsupportedFormat { format: StorageImageFormat },
+    Specialization(ImageFormatSpecializeError),
+}
+
+impl crate::observe::Decline for ComputeProgramDecline {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::UnsupportedFormat { .. } => "compute_program_format_unsupported",
+            Self::Specialization(decline) => crate::observe::Decline::slug(decline),
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::UnsupportedFormat { format } => vec![("format", format!("{format:?}"))],
+            Self::Specialization(decline) => crate::observe::Decline::fields(decline),
+        }
+    }
+}
+
+crate::observe::decline_display!(ComputeProgramDecline);
+
+impl std::error::Error for ComputeProgramDecline {}
 
 /// Backend execution contract implemented per device.
 pub trait Executor:
@@ -249,10 +625,15 @@ pub trait Executor:
     + CapabilityService
     + PresentationService
     + ReadbackService<Error = DrawError>
-    + GuestMemoryService
+    + GuestPageTransferService
+    + CompletionService
+    + SubmissionBatchService
+    + GuestImportService
     + MaintenanceService
     + SessionService
     + ObservationService
+    + ShaderTranslationService
+    + RenderBufferPlanningService
     + WindowPresentationService
 {
 }
@@ -260,9 +641,8 @@ pub trait Executor:
 /// Compatibility adapter over the current Vulkan engine facade.
 #[derive(Debug)]
 pub struct VulkanExecutor {
-    session: crate::backend::vulkan::engine::SessionId,
-    resident_leases:
-        Mutex<ResidentLeaseStore<crate::backend::vulkan::engine::ResidentResourceLease>>,
+    session: reims_vgpu_vulkan::engine::SessionHandle,
+    resident_leases: Mutex<ResidentLeaseStore<reims_vgpu_vulkan::engine::ResidentResourceLease>>,
 }
 
 trait ExecutorResidentLease: std::fmt::Debug + Send {
@@ -270,7 +650,7 @@ trait ExecutorResidentLease: std::fmt::Debug + Send {
     fn backing(&self) -> ResidentContentBacking;
 }
 
-impl ExecutorResidentLease for crate::backend::vulkan::engine::ResidentResourceLease {
+impl ExecutorResidentLease for reims_vgpu_vulkan::engine::ResidentResourceLease {
     fn matches(&self, identity: &TargetIdentity) -> bool {
         self.matches(identity)
     }
@@ -335,9 +715,9 @@ impl<L: ExecutorResidentLease> ResidentLeaseStore<L> {
 
 impl Default for VulkanExecutor {
     fn default() -> Self {
-        crate::backend::vulkan::install_telemetry();
+        install_telemetry();
         Self {
-            session: crate::backend::vulkan::engine::SessionId::allocate(),
+            session: reims_vgpu_vulkan::engine::SessionHandle::allocate(),
             resident_leases: Mutex::new(ResidentLeaseStore::default()),
         }
     }
@@ -349,125 +729,406 @@ impl Drop for VulkanExecutor {
             .get_mut()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
-        crate::backend::vulkan::engine::release_session(self.session);
+        reims_vgpu_vulkan::engine::release_session(&self.session);
     }
 }
 
-impl GuestMemoryService for VulkanExecutor {
-    fn install_stamp_announce(&self, hook: StampAnnounce) {
-        let _scope = crate::backend::vulkan::engine::enter_session(self.session);
-        crate::backend::vulkan::engine::install_stamp_announce(hook);
-    }
-
+impl GuestPageTransferService for VulkanExecutor {
     fn copy_target_to_guest_pages(
         &self,
         identity: &TargetIdentity,
         target: &reims_vgpu_memory::GuestPageTarget,
         pages: &[u64],
     ) -> Result<(), DrawError> {
-        crate::backend::vulkan::engine::copy_target_to_guest_pages(identity, target, pages)
+        reims_vgpu_vulkan::engine::copy_target_to_guest_pages(identity, target, pages)
+    }
+}
+
+impl CompletionService for VulkanExecutor {
+    fn install_stamp_announce(&self, hook: StampAnnounce) {
+        let _scope = reims_vgpu_vulkan::engine::enter_session(&self.session);
+        reims_vgpu_vulkan::engine::install_stamp_announce(hook);
     }
 
     fn guest_access_outstanding(&self) -> bool {
-        crate::backend::vulkan::engine::guest_access_outstanding()
+        reims_vgpu_vulkan::engine::guest_access_outstanding()
     }
 
     fn completion_stamp_pending(&self, index: u32) -> bool {
-        crate::backend::vulkan::engine::completion_stamp_pending(index)
-    }
-
-    fn submit_batch_for_waiting_stamp(&self, index: u32) -> bool {
-        crate::backend::vulkan::engine::submit_batch_for_waiting_stamp(index)
+        reims_vgpu_vulkan::engine::completion_stamp_pending(index)
     }
 
     fn write_completion_stamp(
         &self,
-        guest_ref: &crate::runtime::guest_ram::GuestRef,
+        guest_ref: &reims_vgpu_memory::GuestRef,
         index: u32,
         value: u32,
     ) -> Result<(), DrawError> {
-        crate::backend::vulkan::engine::write_completion_stamp(guest_ref, index, value)
+        reims_vgpu_vulkan::engine::write_completion_stamp(guest_ref, index, value)
     }
 
     fn quiesce_completion_stamps(&self, index: u32) {
-        crate::backend::vulkan::engine::quiesce_completion_stamps(index);
+        reims_vgpu_vulkan::engine::quiesce_completion_stamps(index);
     }
 
     fn quiesce_guest_reads(&self) {
-        crate::backend::vulkan::engine::quiesce_guest_reads();
+        reims_vgpu_vulkan::engine::quiesce_guest_reads();
+    }
+}
+
+impl SubmissionBatchService for VulkanExecutor {
+    fn submit_for_completion_wait(&self, index: u32) -> CompletionWaitBatch {
+        if reims_vgpu_vulkan::engine::submit_batch_for_waiting_stamp(index) {
+            CompletionWaitBatch::Submitted
+        } else {
+            CompletionWaitBatch::AlreadyInFlight
+        }
     }
 
+    fn flush_submission_tail(&self) {
+        reims_vgpu_vulkan::engine::flush_batched_draws();
+    }
+}
+
+impl GuestImportService for VulkanExecutor {
     fn warm_guest_ram_imports(
         &self,
-        imports: &[std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>],
+        imports: &[std::sync::Arc<reims_vgpu_memory::GuestRamImport>],
     ) -> (usize, u64) {
-        crate::backend::vulkan::engine::warm_guest_ram_imports(imports)
+        reims_vgpu_vulkan::engine::warm_guest_ram_imports(imports)
     }
 
-    fn retire_guest_import(&self, import: crate::runtime::guest_ram::ImportId) {
-        crate::backend::vulkan::engine::retire_guest_import(import);
+    fn retire_guest_import(&self, import: reims_vgpu_memory::ImportId) {
+        reims_vgpu_vulkan::engine::retire_guest_import(import);
     }
 }
 
 impl ObservationService for VulkanExecutor {
     fn sampled_working_set_census(&self) -> Option<String> {
-        crate::backend::vulkan::engine::sampled_working_set_census()
+        reims_vgpu_vulkan::engine::sampled_working_set_census()
     }
 
     fn buffer_gather_working_set_census(&self) -> Option<String> {
-        crate::backend::vulkan::engine::buffer_gather_working_set_census()
+        reims_vgpu_vulkan::engine::buffer_gather_working_set_census()
     }
 
     fn guest_import_census(&self) -> (u64, usize, usize) {
-        crate::backend::vulkan::engine::guest_import_census()
+        reims_vgpu_vulkan::engine::guest_import_census()
     }
 
     fn object_cache_levels(&self) -> [usize; 6] {
-        crate::backend::vulkan::engine::object_cache_levels()
+        reims_vgpu_vulkan::engine::object_cache_levels()
     }
 
-    fn counter_snapshot(&self) -> crate::backend::vulkan::engine::CounterSnapshot {
-        crate::backend::vulkan::engine::counter_snapshot()
+    fn shader_translation_cache_level(&self) -> usize {
+        reims_vgpu_vulkan::m2v_cache::stats().2
     }
 
-    fn draw_phase_window(&self) -> Option<crate::backend::vulkan::engine::DrawPhaseWindow> {
-        crate::backend::vulkan::engine::draw_phase_window()
+    fn counter_snapshot(&self) -> CounterSnapshot {
+        reims_vgpu_vulkan::engine::counter_snapshot()
     }
 
-    fn gpu_span_window(&self) -> Option<crate::backend::vulkan::engine::gpu_span::GpuSpanWindow> {
-        crate::backend::vulkan::engine::gpu_span::take_window()
+    fn draw_phase_window(&self) -> Option<DrawPhaseWindow> {
+        reims_vgpu_vulkan::engine::draw_phase_window()
     }
 
-    fn gather_phase_window(
-        &self,
-    ) -> Option<crate::backend::vulkan::engine::gather_phase::GatherPhaseWindow> {
-        crate::backend::vulkan::engine::gather_phase::take_window()
+    fn gpu_span_window(&self) -> Option<GpuSpanWindow> {
+        reims_vgpu_vulkan::engine::gpu_span::take_window()
     }
 
-    fn stage_phase_window(
-        &self,
-    ) -> Option<crate::backend::vulkan::engine::stage_phase::StagePhaseWindow> {
-        crate::backend::vulkan::engine::stage_phase::take_window()
+    fn gather_phase_window(&self) -> Option<GatherPhaseWindow> {
+        reims_vgpu_vulkan::engine::gather_phase::take_window()
+    }
+
+    fn stage_phase_window(&self) -> Option<StagePhaseWindow> {
+        reims_vgpu_vulkan::engine::stage_phase::take_window()
     }
 
     fn take_engine_lock_census(&self, win_ms: u64) -> Option<String> {
-        crate::backend::vulkan::engine::take_engine_lock_census(win_ms)
+        reims_vgpu_vulkan::engine::take_engine_lock_census(win_ms)
+    }
+
+    fn note_draw_hang_candidate(&self, note: DrawHangCandidate) {
+        use reims_vgpu_vulkan::gpu_hang_trail as trail;
+
+        let gap = trail::gap(
+            &note.fragment_declared_bindings,
+            &note.fragment_provided_bindings,
+        );
+        let mut sampled = [trail::SampledNote::default(); trail::SAMPLED_KEPT];
+        for (slot, source) in sampled.iter_mut().zip(note.sampled.iter().copied()) {
+            *slot = trail::SampledNote {
+                binding: source.binding,
+                kind: source.kind,
+                format: reims_vgpu_vulkan::format::vk_image_format(source.format).as_raw() as u32,
+                width: source.width,
+                height: source.height,
+                texel0: source.texel0,
+            };
+        }
+        let mut samplers = [trail::SamplerNote::default(); trail::SAMPLER_KEPT];
+        for (slot, source) in samplers.iter_mut().zip(note.samplers.iter().copied()) {
+            *slot = trail::SamplerNote {
+                binding: source.binding,
+                min_filter: source.min_filter,
+                mag_filter: source.mag_filter,
+                mip_filter: source.mip_filter,
+                address_u: source.address_u,
+                address_v: source.address_v,
+                provenance: source.provenance,
+                unnormalized: source.unnormalized,
+            };
+        }
+        trail::note_draw(trail::DrawNote {
+            pipeline_ref: note.pipeline_ref,
+            vert_words: note.vert_words,
+            frag_words: note.frag_words,
+            width: note.width,
+            height: note.height,
+            vertex_count: note.vertex_count,
+            instance_count: note.instance_count,
+            indexed: note.indexed.map(|indexed| trail::IndexedNote {
+                index_count: indexed.index_count,
+                index_width: indexed.index_width,
+                vertex_offset: indexed.vertex_offset,
+                base_instance: indexed.base_instance,
+                byte_len: indexed.byte_len,
+                source: match indexed.source {
+                    DrawHangIndexSource::CpuBytes => trail::IndexSource::CpuBytes,
+                    DrawHangIndexSource::GuestRuns => trail::IndexSource::GuestRuns,
+                },
+            }),
+            frag_declared: note.fragment_declared_bindings.len() as u32,
+            frag_provided: note.fragment_provided_bindings.len() as u32,
+            frag_gap: gap.0,
+            frag_gap_lo: gap.1,
+            sampled,
+            sampled_count: note.sampled.len() as u32,
+            samplers,
+            sampler_count: note.samplers.len() as u32,
+        });
+    }
+
+    fn draw_hang_trail(&self) -> Option<String> {
+        reims_vgpu_vulkan::gpu_hang_trail::trail()
+    }
+
+    fn draw_hang_outstanding(&self) -> Option<String> {
+        reims_vgpu_vulkan::gpu_hang_trail::outstanding()
+    }
+
+    fn recent_pipeline_firsts(&self) -> Option<String> {
+        reims_vgpu_vulkan::gpu_hang_trail::recent_pipeline_firsts()
     }
 }
 
 impl Executor for VulkanExecutor {}
 
-impl MaintenanceService for VulkanExecutor {
-    fn flush_batched_draws(&self) {
-        crate::backend::vulkan::engine::flush_batched_draws();
+impl RenderBufferPlanningService for VulkanExecutor {
+    fn render_buffer_extent(
+        &self,
+        interface: &reims_vgpu_core::ShaderInterface,
+        metal_index: u32,
+        feeds_stage_in: bool,
+        first_vertex: u32,
+        vertex_count: u32,
+        base_instance: u32,
+        instance_count: u32,
+        indexed: bool,
+    ) -> Option<u64> {
+        let bounds = reims_vgpu_vulkan::spirv_bind::RenderBufferIndexBounds::new(
+            first_vertex,
+            vertex_count,
+            base_instance,
+            instance_count,
+            indexed,
+        );
+        reims_vgpu_vulkan::spirv_bind::vertex_buffer_extent_interface(
+            interface,
+            metal_index,
+            feeds_stage_in,
+            bounds,
+        )
     }
 
+    fn may_serve_neutral_buffer(
+        &self,
+        access: reims_vgpu_core::ReflectedBufferAccess,
+        feeds_stage_in: bool,
+    ) -> bool {
+        reims_vgpu_vulkan::spirv_bind::may_serve_neutral(access, feeds_stage_in)
+    }
+
+    fn neutral_buffer_content(&self) -> Arc<Vec<u8>> {
+        reims_vgpu_vulkan::spirv_bind::neutral_bind_bytes()
+    }
+}
+
+struct VulkanComputeTranslation {
+    shader: Arc<reims_vgpu_vulkan::m2v_cache::CachedShader>,
+}
+
+impl std::fmt::Debug for VulkanComputeTranslation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VulkanComputeTranslation")
+            .field("interface", &self.shader.interface)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ComputeTranslation for VulkanComputeTranslation {
+    fn interface(&self) -> &reims_vgpu_core::ShaderInterface {
+        &self.shader.interface
+    }
+
+    fn buffer_extent(
+        &self,
+        metal_index: u32,
+        workgroups: [u32; 3],
+        local_size: [u32; 3],
+    ) -> Option<u64> {
+        reims_vgpu_vulkan::spirv_bind::reflected_compute_buffer_extent_interface(
+            &self.shader.interface,
+            metal_index,
+            workgroups,
+            local_size,
+        )
+    }
+
+    fn storage_image_access(&self, binding: u32) -> Option<reims_vgpu_core::StorageImageAccess> {
+        self.shader.storage_image_access(binding)
+    }
+
+    fn neutral_sampled_image_bindings(&self, bound: &[u32]) -> Vec<u32> {
+        self.shader.neutral_sampled_image_bindings(bound)
+    }
+
+    fn samplers(&self) -> Arc<[reims_vgpu_core::ReflectedSamplerDescriptor]> {
+        self.shader.kernel_samplers()
+    }
+
+    fn prepare_program(
+        &self,
+        requests: &[(u32, Option<StorageImageFormat>)],
+    ) -> Result<PreparedComputeProgram, ComputeProgramDecline> {
+        use reims_vgpu_vulkan::spirv_bind::ImageFormat as Native;
+        let native = requests
+            .iter()
+            .map(|(binding, format)| {
+                let format = match format {
+                    None => Native::Unknown,
+                    Some(StorageImageFormat::Rgba32Float) => Native::Rgba32Float,
+                    Some(StorageImageFormat::Rgba16Float) => Native::Rgba16Float,
+                    Some(StorageImageFormat::R16Float) => Native::R16Float,
+                    Some(StorageImageFormat::Rgba16Uint) => Native::Rgba16Uint,
+                    Some(StorageImageFormat::Rgba8Uint) => Native::Rgba8Uint,
+                    Some(StorageImageFormat::Rgba8Sint) => Native::Rgba8Sint,
+                    Some(StorageImageFormat::Rgba8Unorm) => Native::Rgba8Unorm,
+                    Some(StorageImageFormat::Rg16Float) => Native::Rg16Float,
+                    Some(StorageImageFormat::R8Unorm) => Native::R8Unorm,
+                    Some(StorageImageFormat::Rg8Unorm) => Native::Rg8Unorm,
+                    Some(StorageImageFormat::Rgba32Uint) => Native::Rgba32Uint,
+                    Some(StorageImageFormat::R32Float) => Native::R32Float,
+                    Some(StorageImageFormat::R32Uint) => Native::R32ui,
+                    Some(format) => {
+                        return Err(ComputeProgramDecline::UnsupportedFormat { format: *format });
+                    }
+                };
+                Ok((*binding, format))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let variant = self
+            .shader
+            .prepare_kernel(&native)
+            .map_err(ComputeProgramDecline::Specialization)?;
+        Ok(PreparedComputeProgram {
+            stage: reims_vgpu_vulkan::m2v_cache::prepared_stage(&variant),
+            _native_lifetime: Box::new(variant),
+        })
+    }
+}
+
+impl ShaderTranslationService for VulkanExecutor {
+    fn ensure_render_translation(
+        &self,
+        air: &[u8],
+        stage: reims_vgpu_core::ShaderStage,
+        pipeline_ref: u32,
+    ) -> bool {
+        let stage = match stage {
+            reims_vgpu_core::ShaderStage::Vertex => {
+                reims_vgpu_vulkan::m2v_cache::RenderTranslationStage::Vertex
+            }
+            reims_vgpu_core::ShaderStage::Fragment => {
+                reims_vgpu_vulkan::m2v_cache::RenderTranslationStage::Fragment
+            }
+            reims_vgpu_core::ShaderStage::Unknown => return true,
+        };
+        reims_vgpu_vulkan::m2v_cache::ensure_render_cached_async(air, stage, pipeline_ref)
+    }
+
+    fn prepare_render_translation(
+        &self,
+        air: &[u8],
+        stage: reims_vgpu_core::ShaderStage,
+        pipeline_ref: u32,
+    ) -> Result<reims_vgpu_core::PreparedShaderFamily, M2vCacheDecline> {
+        let stage = match stage {
+            reims_vgpu_core::ShaderStage::Vertex => {
+                reims_vgpu_vulkan::m2v_cache::RenderTranslationStage::Vertex
+            }
+            reims_vgpu_core::ShaderStage::Fragment => {
+                reims_vgpu_vulkan::m2v_cache::RenderTranslationStage::Fragment
+            }
+            reims_vgpu_core::ShaderStage::Unknown => {
+                unreachable!("render translation requires a concrete stage")
+            }
+        };
+        let shader = reims_vgpu_vulkan::m2v_cache::translate_render_cached_reflected(
+            air,
+            stage,
+            pipeline_ref,
+        )?;
+        Ok(reims_vgpu_vulkan::m2v_cache::prepare_render_shader(
+            &shader, stage,
+        ))
+    }
+
+    fn ensure_compute_translation(
+        &self,
+        air: &[u8],
+        local_size: [u32; 3],
+        pipeline_ref: u32,
+    ) -> bool {
+        reims_vgpu_vulkan::m2v_cache::ensure_cached_kernel_async(air, local_size, pipeline_ref)
+    }
+
+    fn translate_compute(
+        &self,
+        air: &[u8],
+        local_size: [u32; 3],
+        pipeline_ref: u32,
+    ) -> Result<Arc<dyn ComputeTranslation>, M2vCacheDecline> {
+        let shader = reims_vgpu_vulkan::m2v_cache::translate_cached_kernel_reflected(
+            air,
+            local_size,
+            pipeline_ref,
+        )?;
+        Ok(Arc::new(VulkanComputeTranslation { shader }))
+    }
+}
+
+impl MaintenanceService for VulkanExecutor {
     fn maintain_resources(&self, now_ms: u64) {
         self.resident_leases
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .reap_dead();
-        crate::backend::vulkan::engine::maintain_resources(now_ms);
+        reims_vgpu_vulkan::engine::maintain_resources(now_ms);
+    }
+
+    fn idle_reclaim_start_ms(&self) -> Option<u64> {
+        Some(reims_vgpu_vulkan::engine::IDLE_MAINTENANCE_START_MS)
     }
 }
 
@@ -478,12 +1139,12 @@ impl SessionService for VulkanExecutor {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
-        crate::backend::vulkan::engine::reset_guest_state();
+        reims_vgpu_vulkan::engine::reset_guest_state();
     }
 
     fn enter(&self) -> ExecutionScope {
         ExecutionScope {
-            _engine: Some(crate::backend::vulkan::engine::enter_session(self.session)),
+            _engine: Some(reims_vgpu_vulkan::engine::enter_session(&self.session)),
         }
     }
 }
@@ -491,23 +1152,31 @@ impl SessionService for VulkanExecutor {
 impl CapabilityService for VulkanExecutor {
     fn capabilities(&self) -> ExecutorCapabilities {
         let (max_compute_workgroup_invocations, thread_execution_width) =
-            crate::backend::vulkan::engine::compute_threadgroup_limits();
+            reims_vgpu_vulkan::engine::compute_threadgroup_limits();
         ExecutorCapabilities {
-            device_info: crate::backend::vulkan::engine::device_info_limits(),
+            device_info: reims_vgpu_vulkan::engine::device_info_limits(),
             max_compute_workgroup_invocations,
             thread_execution_width,
-            max_render_target_dimension:
-                crate::backend::vulkan::engine::max_render_target_dimension(),
-            deferred_gpu_only_content:
-                crate::backend::vulkan::engine::deferred_gpu_only_content_allowed(),
+            max_render_target_dimension: reims_vgpu_vulkan::engine::max_render_target_dimension(),
+            deferred_gpu_only_content: reims_vgpu_vulkan::engine::deferred_gpu_only_content_allowed(
+            ),
+            storage_image_write_without_format:
+                reims_vgpu_vulkan::engine::supports_storage_image_write_without_format(),
         }
     }
 
     fn render_target_layout_supported(
         &self,
-        layout: crate::contract::pixel_format::TexelLayout,
+        layout: reims_vgpu_core::pixel_format::TexelLayout,
     ) -> bool {
-        crate::backend::vulkan::engine::render_target_layout_supported(layout)
+        reims_vgpu_vulkan::engine::render_target_layout_supported(layout)
+    }
+
+    fn sampled_layout_linear_filter_supported(
+        &self,
+        layout: reims_vgpu_core::pixel_format::TexelLayout,
+    ) -> bool {
+        reims_vgpu_vulkan::engine::supports_sampled_layout_linear_filter(layout)
     }
 }
 
@@ -515,49 +1184,43 @@ impl ReadbackService for VulkanExecutor {
     type Error = DrawError;
 
     fn read_target(&self, identity: &TargetIdentity) -> Result<TargetReadback, Self::Error> {
-        crate::backend::vulkan::engine::read_target(identity)
+        reims_vgpu_vulkan::engine::read_target(identity)
     }
 
     fn read_target_leased(
         &self,
         identity: &TargetIdentity,
     ) -> Result<Option<Box<dyn ReadbackLease>>, Self::Error> {
-        crate::backend::vulkan::engine::read_target_leased(identity)
+        reims_vgpu_vulkan::engine::read_target_leased(identity)
             .map(|lease| lease.map(|lease| Box::new(lease) as Box<dyn ReadbackLease>))
     }
 
     fn read_resident_bgra(&self, identity: &TargetIdentity, need: usize) -> Option<Vec<u8>> {
-        crate::backend::vulkan::engine::read_resident_bgra(identity, need)
+        reims_vgpu_vulkan::engine::read_resident_bgra(identity, need)
     }
 }
 
 impl PresentationService for VulkanExecutor {
     fn resident_presentable(&self, identity: &TargetIdentity, width: u32, height: u32) -> bool {
-        crate::backend::vulkan::engine::resident_presentable(identity, width, height)
+        reims_vgpu_vulkan::engine::resident_presentable(identity, width, height)
     }
 
     fn prepare_window_resident_present(
         &self,
-        identity: &TargetIdentity,
-        width: u32,
-        height: u32,
-    ) -> Result<(), PresentDecline> {
+        source: &reims_vgpu_core::PresentationSource,
+    ) -> Result<reims_vgpu_core::PreparedPresentation, PresentDecline> {
         #[cfg(feature = "host-window")]
-        return crate::backend::vulkan::engine::prepare_window_resident_present(
-            identity, width, height,
-        );
+        return reims_vgpu_vulkan::engine::prepare_window_resident_present(
+            source.identity(),
+            source.width(),
+            source.height(),
+        )
+        .map(|()| reims_vgpu_core::PreparedPresentation::accepted(source.clone()));
         #[cfg(not(feature = "host-window"))]
         {
-            let _ = (identity, width, height);
+            let _ = source;
             Err(PresentDecline::WindowNotAttached)
         }
-    }
-
-    fn window_present_attached(&self) -> bool {
-        #[cfg(feature = "host-window")]
-        return crate::backend::vulkan::engine::window_present_attached();
-        #[cfg(not(feature = "host-window"))]
-        false
     }
 }
 
@@ -569,81 +1232,77 @@ impl WindowPresentationService for VulkanExecutor {
         window: raw_window_handle::RawWindowHandle,
         width: u32,
         height: u32,
-    ) -> Result<(), DrawError> {
-        crate::backend::vulkan::engine::window_present_attach(display, window, width, height)
+    ) -> Result<(), WindowPresentationError> {
+        reims_vgpu_vulkan::engine::window_present_attach(display, window, width, height)
+            .map_err(WindowPresentationError::from_draw)
     }
 
     #[cfg(feature = "host-window")]
     fn resize_window_presenter(&self, width: u32, height: u32) {
-        crate::backend::vulkan::engine::window_present_resize(width, height);
+        reims_vgpu_vulkan::engine::window_present_resize(width, height);
     }
 
     #[cfg(feature = "host-window")]
     fn present_window_frame(
         &self,
-        source: Option<&reims_vgpu_core::PresentationSource>,
-        cpu: Option<WindowCpuFrame<'_>>,
-    ) -> Result<WindowPresentOutcome, DrawError> {
-        let cpu = cpu.map(|cpu| crate::backend::vulkan::engine::WindowCpuFrame {
-            bgra: cpu.bgra,
-            width: cpu.width,
-            height: cpu.height,
-            seq: cpu.seq,
+        frame: Option<WindowPresentationFrame<'_>>,
+    ) -> Result<WindowPresentOutcome, WindowPresentationError> {
+        let source = frame.and_then(|frame| match frame.payload {
+            WindowPresentationPayload::Resident(source) => Some(source),
+            WindowPresentationPayload::CpuBgra(_) => None,
         });
-        crate::backend::vulkan::engine::window_present_frame(source, cpu).map(|outcome| {
-            match outcome {
-                crate::backend::vulkan::engine::WindowPresentOutcome::Busy => {
-                    WindowPresentOutcome::Busy
-                }
-                crate::backend::vulkan::engine::WindowPresentOutcome::Presented {
-                    direct,
+        let cpu = frame.and_then(|frame| match frame.payload {
+            WindowPresentationPayload::CpuBgra(bgra) => {
+                Some(reims_vgpu_vulkan::engine::WindowCpuFrame {
+                    bgra,
+                    width: frame.width,
+                    height: frame.height,
+                    seq: frame.seq,
+                })
+            }
+            WindowPresentationPayload::Resident(_) => None,
+        });
+        reims_vgpu_vulkan::engine::window_present_frame(source, cpu)
+            .map(|outcome| match outcome {
+                reims_vgpu_vulkan::engine::WindowPresentOutcome::Busy => WindowPresentOutcome::Busy,
+                reims_vgpu_vulkan::engine::WindowPresentOutcome::Presented {
+                    route,
                     width,
                     height,
                     swapchain_images,
                     suboptimal,
                 } => WindowPresentOutcome::Presented {
-                    direct,
+                    route,
                     width,
                     height,
                     swapchain_images,
                     suboptimal,
                 },
-            }
-        })
+            })
+            .map_err(WindowPresentationError::from_draw)
     }
 
     #[cfg(feature = "host-window")]
     fn detach_window_presenter(&self) {
-        crate::backend::vulkan::engine::window_present_detach();
+        reims_vgpu_vulkan::engine::window_present_detach();
     }
 }
 
 impl ResidentService for VulkanExecutor {
-    fn resident_content_backing(&self, identity: &TargetIdentity) -> ResidentContentBacking {
-        crate::backend::vulkan::engine::resident_content_backing(identity)
-    }
-
-    fn resident_absent_after_reclaim(
-        &self,
-        identity: &TargetIdentity,
-    ) -> Option<(reims_vgpu_core::ResidentReclaim, u64)> {
-        crate::backend::vulkan::engine::resident_absent_after_reclaim(identity)
-    }
-
-    fn resident_content_epoch(&self, identity: &TargetIdentity) -> Option<u32> {
-        crate::backend::vulkan::engine::resident_content_epoch(identity)
+    fn resident_read_plan(&self, identity: &TargetIdentity) -> ResidentReadPlan {
+        reims_vgpu_vulkan::engine::resident_read_plan(identity)
     }
 
     fn resident_content_state(&self, identity: &TargetIdentity) -> ResidentContent {
-        crate::backend::vulkan::engine::resident_content_state(identity)
+        reims_vgpu_vulkan::engine::resident_content_state(identity)
     }
 
     fn stamp_resident_content_epoch(&self, identity: &TargetIdentity, epoch: u32) -> bool {
-        crate::backend::vulkan::engine::stamp_resident_content_epoch(identity, epoch)
+        reims_vgpu_vulkan::engine::stamp_resident_content_epoch(identity, epoch)
     }
 
     fn note_resident_content_copied_out(&self, identity: &TargetIdentity) -> bool {
-        crate::backend::vulkan::engine::note_resident_content_copied_out(identity)
+        reims_vgpu_vulkan::engine::note_resident_content_copied_out(identity)
     }
 
     fn retain_resident_resource(
@@ -656,7 +1315,7 @@ impl ResidentService for VulkanExecutor {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .retain_with(owner, identity, |identity| {
-                crate::backend::vulkan::engine::retain_resident_resource(identity)
+                reims_vgpu_vulkan::engine::retain_resident_resource(identity)
             });
         crate::runtime::drain::note_store_route(if acquired {
             "resident_resource_acquired"
@@ -671,15 +1330,15 @@ impl ResidentService for VulkanExecutor {
 
 impl GuestWriteService for VulkanExecutor {
     fn guest_writes_outstanding(&self) -> bool {
-        crate::backend::vulkan::engine::guest_writes_outstanding()
+        reims_vgpu_vulkan::engine::guest_writes_outstanding()
     }
 
     fn guest_writes_reaching(&self, pages: &[u64]) -> GuestWriteReach {
-        crate::backend::vulkan::engine::guest_writes_reaching(pages)
+        reims_vgpu_vulkan::engine::guest_writes_reaching(pages)
     }
 
     fn quiesce_guest_writes(&self) {
-        crate::backend::vulkan::engine::quiesce_guest_writes();
+        reims_vgpu_vulkan::engine::quiesce_guest_writes();
     }
 }
 
@@ -688,32 +1347,32 @@ impl ComputeResidencyService for VulkanExecutor {
         &self,
         identity: &reims_vgpu_core::ComputeStorageResidencyKey,
     ) -> Option<u32> {
-        crate::backend::vulkan::engine::compute_resident_storage_generation(identity)
+        reims_vgpu_vulkan::engine::compute_resident_storage_generation(identity)
     }
 
     fn compute_resident_sample_source(
         &self,
         identity: &reims_vgpu_core::ComputeStorageResidencyKey,
     ) -> Option<(u32, StorageImageFormat)> {
-        crate::backend::vulkan::engine::compute_resident_sample_source(identity)
+        reims_vgpu_vulkan::engine::compute_resident_sample_source(identity)
     }
 
     fn unpin_resident_storage(&self, identity: &reims_vgpu_core::ComputeStorageResidencyKey) {
-        crate::backend::vulkan::engine::unpin_resident_storage(identity);
+        reims_vgpu_vulkan::engine::unpin_resident_storage(identity);
     }
 
     fn retire_resident_storage_content(
         &self,
         identity: &reims_vgpu_core::ComputeStorageResidencyKey,
     ) {
-        crate::backend::vulkan::engine::retire_resident_storage_content(identity);
+        reims_vgpu_vulkan::engine::retire_resident_storage_content(identity);
     }
 
     fn note_resident_storage_copied_out(
         &self,
         identity: &reims_vgpu_core::ComputeStorageResidencyKey,
     ) {
-        crate::backend::vulkan::engine::note_resident_storage_copied_out(identity);
+        reims_vgpu_vulkan::engine::note_resident_storage_copied_out(identity);
     }
 }
 
@@ -739,7 +1398,7 @@ impl ExecutionPort for VulkanExecutor {
                     })
                     .filter_map(|image| image.content)
                     .collect::<Vec<_>>();
-                let output = crate::backend::vulkan::engine::execute_draw_request(&request)?;
+                let output = reims_vgpu_vulkan::engine::execute_draw_request(&request)?;
                 Ok(reims_vgpu_core::CommandExecution::new(output, materialized))
             },
             |request| {
@@ -755,7 +1414,7 @@ impl ExecutionPort for VulkanExecutor {
                     })
                     .filter_map(|image| image.content)
                     .collect::<Vec<_>>();
-                let output = crate::backend::vulkan::engine::execute_compute_request(&request)?;
+                let output = reims_vgpu_vulkan::engine::execute_compute_request(&request)?;
                 Ok(reims_vgpu_core::CommandExecution::new(output, materialized))
             },
             |_| {
@@ -863,7 +1522,8 @@ pub fn execute_compute(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{DeviceId, DeviceState};
+    use crate::model::DeviceId;
+    use crate::runtime::Device;
     use reims_vgpu_protocol::{
         ObjectTableRef, ResourceValidity, SegmentBoundary, SegmentKind, SubmissionId,
         SubmissionIdentity, SubmissionResourceUse, TaskId,
@@ -896,13 +1556,37 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "host-window")]
+    #[test]
+    fn presentation_errors_preserve_diagnostics_and_expose_only_recovery_semantics() {
+        let detached = WindowPresentationError::from_draw(DrawError::Facade(
+            EngineFacadeDecline::WindowPresenterNotAttached,
+        ));
+        assert!(detached.presenter_detached());
+        assert_eq!(
+            reims_vgpu_observe::Decline::slug(&detached),
+            "vk_engine_window_presenter_not_attached"
+        );
+
+        let unavailable = WindowPresentationError::from_draw(DrawError::Facade(
+            EngineFacadeDecline::ExecutorServiceUnavailable {
+                service: "test_service",
+            },
+        ));
+        assert!(!unavailable.presenter_detached());
+        assert_eq!(
+            reims_vgpu_observe::Decline::fields(&unavailable),
+            vec![("service", "test_service".to_string())]
+        );
+    }
+
     fn test_target(generation: u64) -> TargetIdentity {
         TargetIdentity::Gva {
             gva: 0x4000,
             width: 64,
             height: 32,
             generation,
-            format: crate::contract::pixel_format::TexelLayout::Bgra8,
+            format: reims_vgpu_core::pixel_format::TexelLayout::Bgra8,
         }
     }
 
@@ -1018,9 +1702,14 @@ mod tests {
 
     impl PresentationService for ScriptedExecutor {}
     impl WindowPresentationService for ScriptedExecutor {}
-    impl GuestMemoryService for ScriptedExecutor {}
+    impl GuestPageTransferService for ScriptedExecutor {}
+    impl CompletionService for ScriptedExecutor {}
+    impl SubmissionBatchService for ScriptedExecutor {}
+    impl GuestImportService for ScriptedExecutor {}
     impl MaintenanceService for ScriptedExecutor {}
     impl ObservationService for ScriptedExecutor {}
+    impl ShaderTranslationService for ScriptedExecutor {}
+    impl RenderBufferPlanningService for ScriptedExecutor {}
 
     impl ReadbackService for ScriptedExecutor {
         type Error = DrawError;
@@ -1127,7 +1816,7 @@ mod tests {
     #[test]
     fn device_injected_executor_receives_the_complete_submission_context() {
         let scripted = Arc::new(ScriptedExecutor::new(ScriptedCompletion::Draw));
-        let state = DeviceState::new_with_executor(DeviceId(1), 12, scripted.clone());
+        let state = Device::new_with_executor(DeviceId(1), 12, scripted.clone());
         let context = context();
 
         execute_draw(
@@ -1146,7 +1835,7 @@ mod tests {
         let scripted = Arc::new(
             ScriptedExecutor::new(ScriptedCompletion::Compute).with_resident_generation(41),
         );
-        let state = DeviceState::new_with_executor(DeviceId(1), 12, scripted);
+        let state = Device::new_with_executor(DeviceId(1), 12, scripted);
         let key = crate::model::ComputeStorageResidencyKey::linear(
             2,
             3,
@@ -1155,7 +1844,7 @@ mod tests {
             4096,
             64,
             16,
-            crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM,
+            reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA8_UNORM,
         );
 
         assert_eq!(
@@ -1166,7 +1855,7 @@ mod tests {
 
     #[test]
     fn an_executor_without_readback_refuses_by_service_name() {
-        let state = DeviceState::new_with_executor(
+        let state = Device::new_with_executor(
             DeviceId(1),
             12,
             Arc::new(ScriptedExecutor::new(ScriptedCompletion::Draw)),
@@ -1176,7 +1865,7 @@ mod tests {
             width: 16,
             height: 16,
             generation: 3,
-            format: crate::contract::pixel_format::TexelLayout::Rgba8,
+            format: reims_vgpu_core::pixel_format::TexelLayout::Rgba8,
         };
 
         assert!(matches!(
@@ -1213,8 +1902,8 @@ mod tests {
             ScriptedExecutor::new(ScriptedCompletion::Draw)
                 .with_max_render_target_dimension(16_384),
         );
-        let first_state = DeviceState::new_with_executor(DeviceId(1), 12, first);
-        let second_state = DeviceState::new_with_executor(DeviceId(2), 12, second);
+        let first_state = Device::new_with_executor(DeviceId(1), 12, first);
+        let second_state = Device::new_with_executor(DeviceId(2), 12, second);
 
         assert_eq!(
             first_state
@@ -1252,9 +1941,14 @@ mod tests {
     impl CapabilityService for WrongIdentityExecutor {}
     impl PresentationService for WrongIdentityExecutor {}
     impl WindowPresentationService for WrongIdentityExecutor {}
-    impl GuestMemoryService for WrongIdentityExecutor {}
+    impl GuestPageTransferService for WrongIdentityExecutor {}
+    impl CompletionService for WrongIdentityExecutor {}
+    impl SubmissionBatchService for WrongIdentityExecutor {}
+    impl GuestImportService for WrongIdentityExecutor {}
     impl MaintenanceService for WrongIdentityExecutor {}
     impl ObservationService for WrongIdentityExecutor {}
+    impl ShaderTranslationService for WrongIdentityExecutor {}
+    impl RenderBufferPlanningService for WrongIdentityExecutor {}
     impl SessionService for WrongIdentityExecutor {}
     impl ReadbackService for WrongIdentityExecutor {
         type Error = DrawError;
@@ -1319,23 +2013,13 @@ mod tests {
         let first_executor = Arc::new(ScriptedExecutor::new(ScriptedCompletion::Draw));
         let second_executor = Arc::new(ScriptedExecutor::new(ScriptedCompletion::Draw));
         let mut first =
-            crate::model::Device::new_with_executor(DeviceId(1), 12, first_executor.clone());
+            crate::runtime::Device::new_with_executor(DeviceId(1), 12, first_executor.clone());
         let mut second =
-            crate::model::Device::new_with_executor(DeviceId(2), 12, second_executor.clone());
+            crate::runtime::Device::new_with_executor(DeviceId(2), 12, second_executor.clone());
 
         first.reset();
-        execute_draw(
-            first.state.executor.as_ref(),
-            context(),
-            DrawRequest::default(),
-        )
-        .unwrap();
-        execute_draw(
-            second.state.executor.as_ref(),
-            context(),
-            DrawRequest::default(),
-        )
-        .unwrap();
+        execute_draw(first.executor.as_ref(), context(), DrawRequest::default()).unwrap();
+        execute_draw(second.executor.as_ref(), context(), DrawRequest::default()).unwrap();
 
         assert_eq!(first_executor.resets.load(Ordering::Relaxed), 1);
         assert_eq!(second_executor.resets.load(Ordering::Relaxed), 0);

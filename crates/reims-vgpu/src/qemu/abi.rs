@@ -10,7 +10,7 @@
 //!
 //! This is the boundary QEMU's threads cross, so it is the only place the map
 //! is true for both shims at once. Nothing here enforces it — it is what the two
-//! shims do, and it is why [`crate::backend::vulkan::engine`]'s lock census
+//! shims do, and it is why [`reims_vgpu_vulkan::engine`]'s lock census
 //! separates `worker` from `device`.
 //!
 //! | Work | x86 / PCI | arm64 / MMIO |
@@ -486,8 +486,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_device_drain(handle: u64) -> c_int {
             // only property that distinguishes the drain thread from a vCPU
             // inside an MMIO store, and telling those apart is what makes a
             // stalled guest attributable — see `EngineLockSite`.
-            #[cfg(feature = "backend-vulkan")]
-            crate::backend::vulkan::engine::mark_drain_thread();
+            crate::runtime::executor::mark_drain_thread();
             if device_drain(handle) {
                 REIMS_VGPU_QEMU_OK
             } else {

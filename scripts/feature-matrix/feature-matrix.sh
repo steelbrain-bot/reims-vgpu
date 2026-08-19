@@ -36,8 +36,7 @@ its binaries do not run on this host.
 
 The two supported pathways use one feature set:
 
-  Vulkan / MoltenVK  --no-default-features
-                       --features backend-vulkan,host-window      Apple
+  Vulkan / MoltenVK  --no-default-features --features host-window Apple
   Vulkan / native    same feature set                             Linux
 
 A third cell checks crates/reims-vgpu-efi, the PCI option ROM every x86 boot
@@ -107,7 +106,7 @@ if [ "$CROSS_TARGET" != "$HOST_TRIPLE" ] &&
 fi
 
 # Feature sets, verbatim from vendor/qemu/hw/display/meson.build.
-FEATURES_VULKAN="--no-default-features --features backend-vulkan,host-window"
+FEATURES_VULKAN="--no-default-features --features host-window"
 
 FAILED=0
 RESULTS=()

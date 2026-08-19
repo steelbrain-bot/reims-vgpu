@@ -48,7 +48,7 @@ struct ThrashState {
 ///
 /// **This used to degrade the draw to single-RT and execute it**, which is why
 /// the class above was reachable. It now refuses the whole draw through
-/// [`crate::backend::vulkan::engine::DrawPreparationDecline::SecondaryTargetUnbuildable`],
+/// [`crate::runtime::draw::DrawPreparationDecline::SecondaryTargetUnbuildable`],
 /// so a guest that asks for N render targets never gets 1 without being told.
 /// entry of the same colour list by its own slot number, so Metal already
 /// rendered what Vulkan was dropping, and the divergence — not a fresh argument
@@ -57,7 +57,7 @@ struct ThrashState {
 /// The reasons are still reported through [`note_secondary_mrt_drop`] as well
 /// as carried in the refusal, because the census answers a question the decline
 /// cannot: which check bails, at what geometry, across a whole boot.
-pub use reims_vgpu_vulkan::preparation::MrtDrop;
+pub use reims_vgpu_core::MrtDrop;
 
 /// Which secondary colour attachment this device could not build, and why.
 ///
@@ -65,7 +65,7 @@ pub use reims_vgpu_vulkan::preparation::MrtDrop;
 /// together from the producer to the refusal that names them, and the slot is
 /// the field a reader needs first: `mrt_drop_geometry_mismatch` says what
 /// failed and `slot=1` says which attachment of the guest's list it was.
-pub use reims_vgpu_vulkan::preparation::SecondaryMrtRefusal;
+pub use reims_vgpu_core::SecondaryMrtRefusal;
 
 impl ThrashState {
     const fn new() -> Self {

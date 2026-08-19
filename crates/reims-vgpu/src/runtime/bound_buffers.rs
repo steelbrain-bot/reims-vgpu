@@ -96,7 +96,6 @@
 //! different extents over one bind; the retirement rules are all keyed on task
 //! and reference and so are indifferent to it.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::runtime::guest_ram_map::GuestWindowRun;
@@ -243,7 +242,7 @@ pub(crate) fn packed_scatter_band(gpas: &[u64], page: u64) -> &'static str {
 pub fn ensure_packed_resource<
     M: crate::runtime::host::HostMemory + crate::runtime::host::HostOps,
 >(
-    state: &mut crate::model::DeviceState,
+    state: &mut crate::runtime::Device,
     host: &mut M,
     task_id: u32,
     resource_ref: u32,
@@ -272,7 +271,7 @@ pub fn ensure_packed_resource<
         let page = state.page_size();
         let page_base = gva & !(page - 1);
         let head = gva - page_base;
-        let map_len = crate::contract::checked::align_up_u64(head.checked_add(size)?, page)?;
+        let map_len = reims_vgpu_protocol::align_up_u64(head.checked_add(size)?, page)?;
         let align = match crate::runtime::guest_ram::host_allocation_import_align(map_len) {
             Ok(align) => align,
             Err(refusal) => {
@@ -390,19 +389,6 @@ pub enum PackedBufferResolution {
     },
 }
 
-impl PackedBufferResolution {
-    fn overlaps(&self, gva: u64, len: u64) -> bool {
-        let (base, span) = match self {
-            Self::Available(buffer) => (buffer.gva, buffer.size),
-            Self::Unavailable { gva, size } => (*gva, *size),
-        };
-        if len == 0 || span == 0 {
-            return false;
-        }
-        base < gva.saturating_add(len) && gva < base.saturating_add(span)
-    }
-}
-
 /// A resolved bind: where this reference's bytes live, as the engine binds them.
 ///
 /// Both lists are `Arc`ed by the producer already, so a lookup hands the draw
@@ -426,27 +412,12 @@ pub struct BoundBuffer {
     pub pages: Option<Arc<Vec<GuestWindowRun>>>,
 }
 
-impl BoundBuffer {
-    /// Whether this resolution's bytes overlap `[gva, gva + len)`.
-    ///
-    /// Half-open on both sides. A zero-length range overlaps nothing, which is
-    /// what a map notify carrying no length means.
-    fn overlaps(&self, gva: u64, len: u64) -> bool {
-        if len == 0 || self.span == 0 {
-            return false;
-        }
-        let a_end = self.gva.saturating_add(self.span);
-        let b_end = gva.saturating_add(len);
-        self.gva < b_end && gva < a_end
-    }
-}
-
 /// `(task, reference, offset, extent cap)` — see the module doc on why the
 /// offset is here.
 ///
 /// The cap is in the key because it is not a property of the bind: it is what
 /// the *shader on this draw* proved about how far it can read
-/// ([`crate::runtime::spirv_bind::reflected_buffer_extent`]). Two shaders may
+/// ([`reims_vgpu_vulkan::spirv_bind::reflected_buffer_extent`]). Two shaders may
 /// bind one allocation at one offset and declare different extents, and a
 /// resolution walked for the narrower one covers fewer bytes than the wider one
 /// needs. Keyed without the cap, that resolution would be handed to the wider
@@ -456,12 +427,31 @@ impl BoundBuffer {
 /// `None` — the uncapped whole-allocation resolution — is a distinct key from
 /// any capped one, which is what keeps the pre-existing behaviour reachable and
 /// unchanged for every bind reflection does not bound.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct Key {
+fn owner(task: u32, object: u32) -> reims_vgpu_core::MaterializationOwner {
+    reims_vgpu_core::MaterializationOwner::new(
+        reims_vgpu_protocol::TaskId::new(task),
+        reims_vgpu_protocol::ObjectTableRef::<reims_vgpu_protocol::ResourceObject>::new(object),
+    )
+}
+
+fn window_key(
     task: u32,
-    buffer_ref: u32,
+    object: u32,
     offset: u64,
     cap: Option<u64>,
+) -> reims_vgpu_core::BoundWindowKey {
+    reims_vgpu_core::BoundWindowKey {
+        owner: owner(task, object),
+        offset: reims_vgpu_protocol::ByteOffset::new(offset),
+        extent_cap: cap.map(reims_vgpu_protocol::ByteLength::new),
+    }
+}
+
+fn address_span(gva: u64, len: u64) -> reims_vgpu_core::GuestAddressSpan {
+    reims_vgpu_core::GuestAddressSpan::new(
+        reims_vgpu_protocol::GuestVirtualAddress::new(gva),
+        reims_vgpu_protocol::ByteLength::new(len),
+    )
 }
 
 /// What [`BoundBuffers::shape`] measures. Levels, not per-interval counts.
@@ -487,7 +477,7 @@ pub struct RegistryShape {
 /// a retired key or a key never seen, and the two together are what decide
 /// whether the 12.8x more fresh resolutions on an importing host are churn in
 /// the retirement rules or churn in the keys.
-pub fn note_registry_levels(state: &crate::model::DeviceState) {
+pub fn note_registry_levels(state: &crate::runtime::Device) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static LAST_MS: AtomicU64 = AtomicU64::new(0);
     static PEAK_ENTRIES: AtomicU64 = AtomicU64::new(0);
@@ -519,8 +509,7 @@ pub fn note_registry_levels(state: &crate::model::DeviceState) {
 /// Every held bind resolution on this device.
 #[derive(Default, Debug)]
 pub struct BoundBuffers {
-    held: HashMap<Key, BoundBuffer>,
-    packed: HashMap<(u32, u32), PackedBufferResolution>,
+    retained: reims_vgpu_core::MaterializationRegistry<BoundBuffer, PackedBufferResolution>,
 }
 
 impl BoundBuffers {
@@ -532,12 +521,8 @@ impl BoundBuffers {
         offset: u64,
         cap: Option<u64>,
     ) -> Option<&BoundBuffer> {
-        self.held.get(&Key {
-            task: task_id,
-            buffer_ref,
-            offset,
-            cap,
-        })
+        self.retained
+            .window(window_key(task_id, buffer_ref, offset, cap))
     }
 
     /// Hold a freshly walked resolution.
@@ -549,19 +534,13 @@ impl BoundBuffers {
         cap: Option<u64>,
         bound: BoundBuffer,
     ) {
-        self.held.insert(
-            Key {
-                task: task_id,
-                buffer_ref,
-                offset,
-                cap,
-            },
-            bound,
-        );
+        let span = address_span(bound.gva, bound.span);
+        self.retained
+            .insert_window(window_key(task_id, buffer_ref, offset, cap), span, bound);
     }
 
     pub fn packed(&self, task_id: u32, buffer_ref: u32) -> Option<&PackedBufferResolution> {
-        self.packed.get(&(task_id, buffer_ref))
+        self.retained.resource(owner(task_id, buffer_ref))
     }
 
     /// Borrow the retained allocation when it still describes exactly this
@@ -594,7 +573,12 @@ impl BoundBuffers {
     }
 
     pub fn insert_packed(&mut self, task_id: u32, buffer_ref: u32, packed: PackedBufferResolution) {
-        self.packed.insert((task_id, buffer_ref), packed);
+        let (gva, size) = match &packed {
+            PackedBufferResolution::Available(buffer) => (buffer.gva, buffer.size),
+            PackedBufferResolution::Unavailable { gva, size } => (*gva, *size),
+        };
+        self.retained
+            .insert_resource(owner(task_id, buffer_ref), address_span(gva, size), packed);
     }
 
     /// Drop everything held for one task.
@@ -602,18 +586,16 @@ impl BoundBuffers {
     /// The answer for a page-table root change, a new object list, or a deleted
     /// task: in each case every reference may now name different bytes.
     pub fn retire_task(&mut self, task_id: u32) -> usize {
-        let before = self.held.len();
-        self.held.retain(|k, _| k.task != task_id);
-        self.packed.retain(|(task, _), _| *task != task_id);
-        before - self.held.len()
+        self.retained
+            .retire_task(reims_vgpu_protocol::TaskId::new(task_id))
     }
 
     /// Drop everything held for one reference, at every offset.
     ///
     /// The `CmdDeleteObject` answer. That packet names the reference —
     /// `delete_object(task_id, ref_)` — and the rest of the device already
-    /// scopes its response to it: `objects`, `invalidate_object_host_copies`
-    /// and `texture_to_mapping` are all keyed `(task, ref)`. This registry
+    /// scopes its response to it: the canonical resource, host copies, and its
+    /// retained IOSurface relation are all keyed `(task, ref)`. This registry
     /// retiring the whole task was the outlier, and a measured expensive one:
     /// one driven boot dropped 54 109 resolutions there, 95% of every bind miss
     /// on the device.
@@ -634,34 +616,27 @@ impl BoundBuffers {
     /// packet — `CmdMapMemory2`, `CmdUnmapMemory` or `CmdReplacePhysical` — and
     /// those rules still retire by range or by task.
     pub fn retire_ref(&mut self, task_id: u32, buffer_ref: u32) -> usize {
-        let before = self.held.len();
-        self.held
-            .retain(|k, _| k.task != task_id || k.buffer_ref != buffer_ref);
-        self.packed.remove(&(task_id, buffer_ref));
-        before - self.held.len()
+        self.retained.retire_object(owner(task_id, buffer_ref))
     }
 
     /// Drop everything held for `task_id` whose bytes overlap `[gva, gva+len)`.
     ///
     /// The map/unmap answer, which carries the exact range that moved.
     pub fn retire_range(&mut self, task_id: u32, gva: u64, len: u64) -> usize {
-        let before = self.held.len();
-        self.held
-            .retain(|k, b| k.task != task_id || !b.overlaps(gva, len));
-        self.packed
-            .retain(|(task, _), b| *task != task_id || !b.overlaps(gva, len));
-        before - self.held.len()
+        self.retained.retire_range(
+            reims_vgpu_protocol::TaskId::new(task_id),
+            address_span(gva, len),
+        )
     }
 
     /// Drop everything. Device reset, where no guest state survives.
     pub fn clear(&mut self) {
-        self.held.clear();
-        self.packed.clear();
+        self.retained.clear();
     }
 
     /// How many resolutions are held, for the census.
     pub fn len(&self) -> usize {
-        self.held.len()
+        self.retained.window_len()
     }
 
     /// The registry's shape: entries, the distinct `(task, reference)` pairs
@@ -682,21 +657,18 @@ impl BoundBuffers {
     /// is a correctness surface bought for a measurement, and the population is
     /// the guest's live working set rather than anything unbounded.
     pub fn shape(&self) -> RegistryShape {
-        let mut per_pair: HashMap<(u32, u32), u32> = HashMap::new();
-        for k in self.held.keys() {
-            *per_pair.entry((k.task, k.buffer_ref)).or_default() += 1;
-        }
+        let shape = self.retained.shape();
         RegistryShape {
-            entries: self.held.len(),
-            pairs: per_pair.len(),
-            multi_offset_pairs: per_pair.values().filter(|n| **n > 1).count(),
-            max_offsets: per_pair.values().copied().max().unwrap_or(0),
+            entries: shape.entries,
+            pairs: shape.owners,
+            multi_offset_pairs: shape.multi_offset_owners,
+            max_offsets: shape.max_offsets,
         }
     }
 
     /// Whether nothing is held.
     pub fn is_empty(&self) -> bool {
-        self.held.is_empty()
+        self.retained.is_empty()
     }
 }
 

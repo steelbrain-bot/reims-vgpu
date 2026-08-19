@@ -1,13 +1,16 @@
 //! Product-path event + encoder fence sync (event / blit / compute / render).
 //!
-//! Uses [`crate::runtime::plan::event_sync`] for planning and
+//! Uses [`reims_vgpu_core::synchronization`] for planning and
 //! device-owned typed event and fence namespaces for storage. Unsatisfied waits are
 //! soft-pending and do not block the drain (unified-memory in-order path).
 //! Event timeouts are fail-closed as unsupported (no deferred timer).
 
-use crate::model::DeviceState;
 use crate::runtime::decode::event::{Command as EventCommand, Kind as EventCmdKind};
-use crate::runtime::plan::event_sync::{self, Decision, Domain, EventKind, FenceAction};
+use crate::runtime::Device;
+use reims_vgpu_core::{
+    plan_event, plan_fence, EventKind, FenceAction, SynchronizationDecision as Decision,
+    SynchronizationDomain as Domain,
+};
 
 /// Outcome of a product-path event or encoder fence operation.
 ///
@@ -73,7 +76,7 @@ fn refused(
 
 /// Execute fence update or wait on the given encoder domain (blit/compute/render).
 pub fn execute_fence(
-    state: &mut DeviceState,
+    state: &mut Device,
     task_id: u32,
     domain: Domain,
     fence_ref: u32,
@@ -104,7 +107,7 @@ pub fn execute_fence(
         );
     }
     let current = state.fence_generation(task_id, fence_ref);
-    let plan = event_sync::plan_fence(action, domain, current);
+    let plan = plan_fence(action, domain, current);
     if plan.updates_state {
         state.set_fence_generation(task_id, fence_ref, plan.update_value);
     }
@@ -137,7 +140,7 @@ pub fn execute_fence(
 /// advance only). Wait is satisfied when the stored value is present and
 /// `>= target`. Wait-with-timeout is unsupported (no host timer). Soft-pending
 /// waits do not block drain.
-pub fn execute_event(state: &mut DeviceState, task_id: u32, cmd: &EventCommand) -> FenceStatus {
+pub fn execute_event(state: &mut Device, task_id: u32, cmd: &EventCommand) -> FenceStatus {
     if cmd.event_ref == 0 {
         return FenceStatus::Missing;
     }
@@ -153,7 +156,7 @@ pub fn execute_event(state: &mut DeviceState, task_id: u32, cmd: &EventCommand) 
         }
     };
     let current = state.event_generation(task_id, cmd.event_ref);
-    let plan = event_sync::plan_event(kind, cmd.value, cmd.has_timeout, current);
+    let plan = plan_event(kind, cmd.value, cmd.has_timeout, current);
     if plan.updates_state {
         state.set_event_generation(task_id, cmd.event_ref, plan.update_value);
     }
@@ -182,12 +185,12 @@ mod tests {
     use reims_vgpu_wire::OP_HEADER_LEN;
 
     use super::*;
-    use crate::contract::endian::{st32, st64};
     use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
     use crate::runtime::decode::event::{
         OP_SIGNAL_EVENT, OP_WAIT_EVENT, OP_WAIT_EVENT_TIMEOUT, SIGNAL_WAIT_PAYLOAD_LEN, TIMEOUT,
         WAIT_TIMEOUT_PAYLOAD_LEN,
     };
+    use reims_vgpu_core::endian::{st32, st64};
 
     fn event_cmd(opcode: u32, event_ref: u32, value: u64, timeout: Option<u32>) -> EventCommand {
         let mut payload = if timeout.is_some() {
@@ -209,7 +212,7 @@ mod tests {
 
     #[test]
     fn blit_compute_and_render_share_one_fence_object() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         // The encoder selects the operation syntax, not a separate allocator.
         assert_eq!(
             execute_fence(&mut state, 1, Domain::BlitFence, 5, FenceAction::Update),
@@ -240,7 +243,7 @@ mod tests {
 
     #[test]
     fn zero_ref_missing() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         assert_eq!(
             execute_fence(&mut state, 1, Domain::RenderFence, 0, FenceAction::Update,),
             FenceStatus::Missing
@@ -251,7 +254,7 @@ mod tests {
 
     #[test]
     fn event_signal_then_wait() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let sig = event_cmd(OP_SIGNAL_EVENT, 7, 100, None);
         assert_eq!(execute_event(&mut state, 1, &sig), FenceStatus::Ok);
         assert_eq!(state.event_generation(1, 7), Some(100));
@@ -272,7 +275,7 @@ mod tests {
 
     #[test]
     fn event_stale_signal_noop_and_independent_of_fence() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         assert_eq!(
             execute_event(&mut state, 1, &event_cmd(OP_SIGNAL_EVENT, 3, 50, None)),
             FenceStatus::Ok
@@ -299,7 +302,7 @@ mod tests {
 
     #[test]
     fn task_teardown_retires_event_and_fence_namespaces() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         state.define_task(1, 0x1000, 2);
         assert_eq!(
             execute_fence(&mut state, 1, Domain::RenderFence, 3, FenceAction::Update),
@@ -309,14 +312,14 @@ mod tests {
             execute_event(&mut state, 1, &event_cmd(OP_SIGNAL_EVENT, 3, 50, None)),
             FenceStatus::Ok
         );
-        assert!(state.delete_task(1));
+        assert!(state.delete_task(1).is_some());
         assert_eq!(state.fence_generation(1, 3), None);
         assert_eq!(state.event_generation(1, 3), None);
     }
 
     #[test]
     fn event_wait_timeout_unsupported() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let wait = event_cmd(OP_WAIT_EVENT_TIMEOUT, 1, 1, Some(42));
         // Asserting the reason, not just the coarse status: this path shares
         // `Unsupported` with six other checks.
@@ -335,7 +338,7 @@ mod tests {
 
     #[test]
     fn event_wait_missing_signal_pending() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let wait = event_cmd(OP_WAIT_EVENT, 99, 1, None);
         assert_eq!(execute_event(&mut state, 1, &wait), FenceStatus::Pending);
     }
@@ -346,7 +349,7 @@ mod tests {
     #[test]
     fn no_two_fence_checks_answer_with_the_same_reason() {
         use crate::observe::Refusal;
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
 
         let mut seen: Vec<&'static str> = Vec::new();
         let mut record = |st: FenceStatus| {
@@ -400,7 +403,7 @@ mod tests {
     #[test]
     fn success_pending_and_unbound_refs_are_never_logged() {
         use crate::observe::Refusal;
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
 
         assert_eq!(
             execute_fence(&mut state, 1, Domain::BlitFence, 5, FenceAction::Update).refusal(),
@@ -425,7 +428,7 @@ mod tests {
     /// check survives the hop.
     #[test]
     fn a_refusal_carries_its_reason_across_the_blit_remap() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let st = execute_fence(&mut state, 1, Domain::Unknown, 7, FenceAction::Update);
         assert_eq!(st, FenceStatus::Unsupported("fence_domain_unknown"));
 

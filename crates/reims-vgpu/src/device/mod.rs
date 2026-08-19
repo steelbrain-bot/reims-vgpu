@@ -46,8 +46,9 @@ use crate::qemu::host_ops::{NullHost, QemuHost, ReimsVgpuHostOps};
 // The four names the two chapter modules below reach through `use super::*`,
 // and this module uses itself. They were the crate root's "convenience
 // re-exports used by qemu ABI and tests" and came with the registry.
-use crate::model::{Device, DeviceId};
+use crate::model::DeviceId;
 use crate::runtime::host::HostControl;
+use crate::runtime::Device;
 use crate::runtime::{HostAction, HostOps};
 
 /// Mutable protocol/backend state. The drain worker may hold this lock across
@@ -84,7 +85,7 @@ struct BoundDevice {
     /// lock. Scanout/glyph actions stay in `DeviceInner::actions`.
     prompt_actions: Mutex<VecDeque<HostAction>>,
     /// Lock-free clones of the read-to-clear interrupt-status registers
-    /// (`state.gfx.interrupt_status_disp` / `_gpu`): the guest ISR read at
+    /// (`state.registers.gfx.interrupt_status_disp` / `_gpu`): the guest ISR read at
     /// 0x1014/0x1018 must observe live bits mid-drain, never a stale cache.
     intr_disp: Arc<AtomicU32>,
     intr_gpu: Arc<AtomicU32>,
@@ -201,9 +202,9 @@ fn lock_for_drain(slot: &BoundDevice) -> parking_lot::MutexGuard<'_, DeviceInner
     // Here rather than only inside `drain_pending`, because this is the one
     // point every entry to the drain passes through. `device_drain` returns
     // before `drain_pending` when the device has no host ops, and
-    // `publish_stranded_fifos` re-publishes from `active_child_mask` — a ring
+    // `publish_stranded_fifos` re-publishes from the active child set — a ring
     // left unfolded would be invisible to both.
-    crate::runtime::drain::fold_rung_child_doorbells(&mut inner.device.state);
+    crate::runtime::drain::fold_rung_child_doorbells(&mut inner.device);
     inner
 }
 
@@ -221,18 +222,16 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
     *id_guard = id.saturating_add(1);
     drop(id_guard);
     let dev = Device::new(DeviceId(id), page_shift);
-    let intr_disp = Arc::clone(&dev.state.gfx.interrupt_status_disp);
-    let intr_gpu = Arc::clone(&dev.state.gfx.interrupt_status_gpu);
-    let child_doorbell_rung = Arc::clone(&dev.state.gfx.child_doorbell_rung);
-    let intr_fault = Arc::clone(&dev.state.gfx.interrupt_fault);
-    let fifo_read_live = Arc::clone(&dev.state.gfx.fifo_read);
+    let intr_disp = Arc::clone(&dev.state.registers.gfx.interrupt_status_disp);
+    let intr_gpu = Arc::clone(&dev.state.registers.gfx.interrupt_status_gpu);
+    let child_doorbell_rung = Arc::clone(&dev.state.registers.gfx.child_doorbell_rung);
+    let intr_fault = Arc::clone(&dev.state.registers.gfx.interrupt_fault);
+    let fifo_read_live = Arc::clone(&dev.state.registers.gfx.fifo_read);
     // The completion thread's way back to the guest. Installed here rather than
     // built into the engine because the engine must not know what a
     // `BoundDevice` is, and looked up by id rather than captured by `Arc` so a
     // stale hook cannot keep a torn-down device alive.
-    #[cfg(feature = "backend-vulkan")]
-    dev.state
-        .executor
+    dev.executor
         .install_stamp_announce(std::sync::Arc::new(move |index: u32| {
             announce_stamp_interrupt(id, index)
         }));
@@ -287,7 +286,6 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
 /// prompt rail call the thread-safe `notify_actions`. The stamp *word* is
 /// already in guest memory by construction: the submission that signalled this
 /// thread's timeline value wrote it.
-#[cfg(feature = "backend-vulkan")]
 fn announce_stamp_interrupt(id: u64, index: u32) {
     let Some(slot) = device_slot(id) else {
         // The device is gone, so there is no interrupt-status register to set
@@ -308,15 +306,12 @@ pub fn device_reset(id: u64) -> bool {
         let mut d = lock_for_drain(&slot);
         let seq = slot.reset_count.fetch_add(1, Ordering::Relaxed) + 1;
         let state = &d.device.state;
-        let mappings = state.mappings.len();
+        let mappings = state.surfaces.mappings.len();
         let tasks = state.tasks.live_count();
-        let host_surfaces = state.host_surfaces.len();
-        let host_textures = state.host_texture_surfaces.len();
-        let host_gvas = state.host_gva_surfaces.len();
-        let host_linear = state.host_linear_textures.len();
-        let frame_valid = state.present.frame_valid;
-        let frame_mapping = state.present.frame_mapping;
-        let boundary = state.present.frame_flush_seen;
+        let (host_surfaces, host_textures, host_gvas, host_linear) = state.host_replicas.counts();
+        let frame_valid = state.presentation.present.frame().is_valid();
+        let frame_mapping = state.presentation.present.frame().mapping();
+        let boundary = state.presentation.present.content_boundary_crossed();
         let views = if let Some(ops) = slot.ops {
             let DeviceInner { device, actions } = &mut *d;
             let mut host = QemuHost::new(&ops, actions, &slot.prompt_actions);
@@ -417,7 +412,7 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
         // It is the one register that can be served this way, because it
         // carries no state the decode depends on — its effect is to say a
         // channel has work. `fold_rung_child_doorbells` turns the bit into
-        // `active_child_mask` / `pending.child_mask`, which is exactly what the
+        // `PendingWork` active/pending transition, which is exactly what the
         // locked handler in `crate::runtime::mmio` does for the same register.
         //
         // The channel-number check mirrors that handler rather than trusting
@@ -430,7 +425,7 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
             || offset == crate::model::GFX_REG_CHILD_REPLAY_DOORBELL
         {
             let channel = data as u32;
-            if crate::model::accept_child_channel(channel, "lock_free_child_doorbell") {
+            if crate::runtime::accept_child_channel(channel, "lock_free_child_doorbell") {
                 slot.child_doorbell_rung
                     .fetch_or(1u32 << channel, Ordering::AcqRel);
                 crate::runtime::drain::note_doorbell_lock_free();
@@ -541,11 +536,15 @@ pub fn device_drain(id: u64) -> bool {
     // (see `enqueue_present_scanout` / the drain tail below).
     #[cfg(feature = "host-window")]
     {
-        device.state.present.window_active = slot.window.lock().is_some();
+        device
+            .state
+            .presentation
+            .present
+            .set_window_active(slot.window.lock().is_some());
     }
     #[cfg(not(feature = "host-window"))]
     {
-        device.state.present.window_active = false;
+        device.state.presentation.present.set_window_active(false);
     }
     // Split the tranche's two phases: guest work, then our host-window export.
     // Both hold the device lock, and which one owns the worker's wall clock is
@@ -566,20 +565,22 @@ pub fn device_drain(id: u64) -> bool {
     // Submit any deferred draw batch before the worker sleeps: consumers
     // inside the tranche flush on their own (engine begin_entry), this bounds
     // only the idle-tail latency of the last same-target run.
-    #[cfg(feature = "backend-vulkan")]
-    device.state.executor.flush_batched_draws();
+    device.executor.flush_submission_tail();
     let tail_us = tail_started.elapsed().as_micros() as u64;
     let boundary_started = std::time::Instant::now();
-    publish_present_boundary(&slot, device.state.present.frame_flush_seen);
+    publish_present_boundary(
+        &slot,
+        device.state.presentation.present.content_boundary_crossed(),
+    );
     crate::runtime::drain::note_drain_tail(tail_us, boundary_started.elapsed().as_micros() as u64);
     let drain_us = tranche_started.elapsed().as_micros() as u64;
     let publish_started = std::time::Instant::now();
     // Push the finished present frame to the host-owned window (if running).
     // Off the QEMU main loop; a small dedicated mutex, never the render lock.
     #[cfg(feature = "host-window")]
-    window_publish::publish_window_frame(&slot, &mut device.state);
+    window_publish::publish_window_frame(&slot, device);
     crate::runtime::drain::note_drain_tranche(
-        device.state.executor.as_ref(),
+        device.executor.as_ref(),
         drain_us,
         publish_started.elapsed().as_micros() as u64,
     );
@@ -591,28 +592,27 @@ pub fn device_drain(id: u64) -> bool {
     // Same one-second cadence, so the cache trend lines up row-for-row with
     // `store_routes` and `drain_duty`. Measure-only; see `note_cache_levels`.
     post_sweep(PostSweep::CacheLevels, || {
-        crate::runtime::surface_cache::note_cache_levels(&device.state, &host)
+        crate::runtime::surface_cache::note_cache_levels(device, &host)
     });
     // Per tranche rather than per census window, unlike the levels above: this
     // measures how long a slot the guest named takes to appear, so the sampling
     // interval is the resolution of the answer. Returns immediately when nothing
     // is watched, which is every tranche on every rail but macos-26.
     post_sweep(PostSweep::SlotRecheck, || {
-        crate::runtime::objects::slot_recheck::sweep(&device.state, &host)
+        crate::runtime::objects::slot_recheck::sweep(device, &host)
     });
     // Beside it and on the same cadence: a page the guest released is judged
     // against the write census, which only moves when this device writes. Also
     // returns immediately when nothing is watched.
     post_sweep(PostSweep::ReleasedPages, || {
-        crate::runtime::released_pages::sweep(&mut device.state);
-        crate::runtime::released_pages::note_levels(&device.state);
+        crate::runtime::released_pages::sweep(device);
+        crate::runtime::released_pages::note_levels(device);
     });
     // The bind registry's own levels, on that same cadence and read against the
     // `bb_retire_*` routes: what the retirements dropped, and what the survivors
     // look like.
-    #[cfg(feature = "backend-vulkan")]
     post_sweep(PostSweep::BindLevels, || {
-        crate::runtime::bound_buffers::note_registry_levels(&device.state)
+        crate::runtime::bound_buffers::note_registry_levels(device)
     });
     // The present-completion ack, re-homed off the QEMU paint — ONLY while the
     // host window is the display. With the window live no per-present
@@ -636,10 +636,10 @@ pub fn device_drain(id: u64) -> bool {
     // acks. Pre-acking here would let `device_scanout_copy`'s nonblocking
     // `try_lock` path swallow the paint as `Unchanged` under worker contention —
     // the frozen-console class this split fixes.
-    if device.state.present.window_active {
-        crate::runtime::drain::note_present_paint_consumed(&mut device.state);
+    if device.state.presentation.present.window_active() {
+        crate::runtime::drain::note_present_paint_consumed(device);
     }
-    if device.state.pending.host_action_yield {
+    if device.state.scheduling.pending.host_action_yielded() {
         slot.present_action_pending.store(true, Ordering::Release);
     }
     crate::runtime::drain::note_drain_exit(busy_end_us, false);
@@ -678,24 +678,29 @@ pub fn device_poll(id: u64) -> bool {
     };
     let DeviceInner { device, actions } = &mut *d;
     let mut host = QemuHost::new(&ops, actions, &slot.prompt_actions);
-    // Before the rescue reads `active_child_mask`, which is the mask a
+    // Before the rescue reads the active child set, which is where a
     // lock-free ring lands in only once folded. Without this the Dekker rescue
     // could not see the very channels the doorbell rail is responsible for.
-    crate::runtime::drain::fold_rung_child_doorbells(&mut device.state);
-    crate::runtime::drain::publish_stranded_fifos(&mut device.state, &mut host);
-    crate::runtime::drain::try_display_online(&mut device.state, &mut host);
+    crate::runtime::drain::fold_rung_child_doorbells(device);
+    crate::runtime::drain::publish_stranded_fifos(device, &mut host);
+    crate::runtime::drain::try_display_online(device, &mut host);
     // After ONLINE, pulse VBL so the guest compositor has a display time base
     //. Missing VBL → clear-only dual-mid present thrash.
-    crate::runtime::drain::signal_display_vbl(&mut device.state, &mut host, &slot.vbl_last_us);
+    crate::runtime::drain::signal_display_vbl(device, &mut host, &slot.vbl_last_us);
     // Republish the lock-free VBL snapshot for the contended fast path above.
     // These change only at online-ack/reinit, but publishing every poll keeps
     // the snapshot fresh with no extra synchronization on the rare-change path.
+    let display_page = device.state.presentation.display.shared_page();
     slot.vbl_shared_gpa
-        .store(device.state.display.shared_gpa, Ordering::Release);
-    slot.vbl_display_index
-        .store(device.state.display.display_index, Ordering::Release);
-    slot.vbl_online
-        .store(device.state.display.online_acked, Ordering::Release);
+        .store(display_page.map_or(0, |page| page.gpa), Ordering::Release);
+    slot.vbl_display_index.store(
+        display_page.map_or(0, |page| page.display_index),
+        Ordering::Release,
+    );
+    slot.vbl_online.store(
+        device.state.presentation.display.is_online(),
+        Ordering::Release,
+    );
     slot.vbl_page_size
         .store(device.state.page_size(), Ordering::Release);
     // Census both source polls and the independently time-gated VBL rate.
@@ -703,10 +708,8 @@ pub fn device_poll(id: u64) -> bool {
     // the guest stops publishing. The wall clock returns already-dead resources
     // and free-pool memory; it has no authority over live residency, which is
     // governed by resource lifetime and allocation pressure.
-    #[cfg(feature = "backend-vulkan")]
     {
         device
-            .state
             .executor
             .maintain_resources(crate::observe::elapsed_ms() as u64);
     }
@@ -716,7 +719,7 @@ pub fn device_poll(id: u64) -> bool {
     #[cfg(feature = "host-window")]
     {
         let now_ns = host.mono_ns();
-        window_publish::publish_window_early_frame(&slot, &device.state, &host, now_ns);
+        window_publish::publish_window_early_frame(&slot, device, &host, now_ns);
     }
     true
 }

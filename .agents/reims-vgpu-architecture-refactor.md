@@ -1,9 +1,12 @@
 # Reims vGPU Architecture Refactor Plan
 
-Status: in progress; sanity-checked against the available static contract set, with the arm mapper
-storage and kernel-lifecycle gap explicitly unresolved
+Status: implementation complete for the established contract; grounded against paired mapper
+producer/consumer analysis, controlled serializer oracles, and a driven arm64 boot. Mapper
+descriptor composition, identity width, ordinary ownership, rollback, and pathway differences are
+established. Four arm teardown races remain explicitly unresolved and are isolated behind the arm
+policy rather than hidden behind a shared lifecycle implementation.
 
-Implementation checkpoint (2026-08-18):
+Implementation checkpoint (2026-08-19):
 
 - `reims-vgpu-protocol`, `reims-vgpu-core`, and `reims-vgpu-vulkan` now exist as real workspace
   boundaries. Semantic identities, texel layouts/image formats, the canonical resource graph,
@@ -25,15 +28,217 @@ Implementation checkpoint (2026-08-18):
   execution as an immutable core command.
 - Task resources receive generational core identities and explicit storage/view relations for task
   addresses, buffer ranges, registered surfaces, mapper storage, and heap placement. Submission
-  context preserves the full ordered segment envelope and resource-participation snapshot.
+  context preserves the full ordered segment envelope and resource-participation snapshot. The
+  registered-surface resolver now publishes successful construction into `TaskResources` and the
+  canonical graph; resource-validity classification asks that registry instead of the legacy
+  live-object membership set. Mapper-backed texture resolution likewise relies on the retained
+  resource lifetime rather than dual-writing that set. The membership set no longer exists in the
+  product build; it is compiled only for synthetic delete-packet tests which intentionally do not
+  construct descriptors. Product deletion derives its effect from the canonical resource,
+  ref-keyed host materializations, and explicit mapper association.
+  The IOSurface texture-to-mapping relation is likewise no longer a product side map: it is stored
+  once on the retained `TaskResource`, and validity, replacement, draw-target resolution, deletion,
+  and task teardown derive the relation from that owner. The former map is test-only support for
+  synthetic fixtures which intentionally do not construct descriptors, matching the treatment of
+  the old live-object membership set. A resource's reference and registered-surface mapping
+  relations are explicit fields rather than a fixed two-slot collection, so a third insertion or
+  ordering-dependent overwrite is no longer representable.
+  The retained `TaskResource` itself is now partitioned into immutable construction input (object
+  entry, descriptor snapshot, and once-decoded semantic descriptor), retryable graph-relation
+  publication state, canonical generational identity, and operational lifetime/use state. Runtime
+  consumers receive construction values through read-only accessors; descriptor bytes, relation
+  publication, mapping association, lifetime retention, and render-target history are no longer
+  peer fields that a new optimization can mutate as though they shared one lifecycle.
+  The generic retained-reference registry used by samplers, functions, render/compute pipelines,
+  and depth/stencil objects has moved into core beside `ReferenceNamespace`. It owns publication,
+  lookup, generational identity, explicit deletion, and task teardown with no capacity eviction;
+  model code supplies only each API's retained semantic value and marker type.
+  Samplers now retain the protocol-owned `SamplerDescriptor` directly in that registry; the
+  one-field model wrapper and its second vocabulary were deleted.
+  Render-pipeline buffer classification moved with the semantic pipeline vocabulary into core as
+  `VertexBindPlan`. Constant-step staging and stage-input participation are derived once from the
+  protocol descriptor; neither model state nor draw orchestration rebuilds those sets. The
+  complete retained render-pipeline value—semantic descriptor, prepared shader families, object
+  lifetime, and derived bind plan—is now core-owned too; the model keeps only its typed task
+  namespace.
+  Submission identity allocation, the complete post-validity resource-participation snapshot,
+  ordered segment envelope, active segment cursor, and single completion boundary are now owned by
+  one core `SubmissionTracker`. Device state no longer carries a context and identity counter as
+  independently mutable peers, and the stream walker cannot replace the participation list while
+  moving between segments. Executors receive immutable context snapshots; focused walkers and
+  direct tools have an explicit standalone context with no invented resource participation.
+  Nested child-FIFO drains likewise have one core-owned ordered stack instead of a mutable current
+  channel beside a separately maintained mask. The current channel and complete active set are
+  projections of that stack; same-channel re-entry and out-of-order exit are typed, fail-visible
+  refusals. An inner rescue drain therefore cannot clear the outer drain's re-entry protection.
+  Surface validity ordering is no longer a peer device counter. Its single monotonic timeline now
+  belongs to `SurfaceMappingRegistry`, and registry transitions issue the order stamp while applying
+  guest invalidation, device publication, or guest-page write currency to the named content state.
+  A topology-specific materialization path cannot advance or bypass that happens-before relation
+  independently of the mapping content it governs.
+  Sampled-source identity and revalidation are also one device-owned `SampledContentState` rather
+  than a raw generation counter beside three memos, two scratch buffers, and a gather witness.
+  Surface, GVA, linear, IOSurface-plane, IOSurface-texture, and zero-copy gather producers all spend
+  the same nonzero, non-reused sampled generation namespace. Compute-resident generations remain
+  separate because they name residency of a storage result rather than sampled byte identity.
+  `PendingWork` remains the single ingress/worker scheduling owner, but its latches and child set
+  are now private. MMIO, drain, device, and test paths use named request, clear, merge, take,
+  yield, and resume transitions. In particular, adding a child request cannot accidentally replace
+  sibling work, and taking a tranche atomically clears exactly the set the worker received.
+  Presentation has begun the same partition by behavior. `PresentBackingEvidence` owns decoded
+  full-frame publication, per-surface last-presented comparison, and lifetime retirement; recycling
+  a surface cannot preserve either half of its predecessor's witness. `PresentBackpressureState`
+  owns accepted-but-unpainted count, held `(channel, head)` episode coalescing, and paint
+  consumption. Entry-gate, starvation diagnostics, console paint, and window acknowledgement now
+  use its semantic transitions rather than independently mutating five fields.
+  Capture policy is separate from retained-frame identity as well.
+  `PresentCapturePolicy` owns whether a resident carries the next display and the full-versus-light
+  capture census; window publication selects that policy and scanout consumes it. Retained CPU
+  pixels and mapping/geometry can no longer be mistaken for the policy that decided whether those
+  pixels needed to be captured.
+  `RetainedPresentFrame` now owns the retained CPU pixels, mapping and geometry, guest-page and
+  semantic-content identities, validity, encode obligation, and the warm replacement buffer.
+  Light publication, full publication, failed-capture scratch return, and successful encode are
+  named transitions. A capture failure therefore cannot publish half a new identity, full capture
+  recycles the prior retain as scratch, and resident-carried publication makes the absence of CPU
+  pixels part of the new frame value rather than leaving stale bytes beside new metadata.
+  Mapping roles are no longer peer integers either. `PresentRoutingState` keeps the mapping named
+  by the display transaction, the mapping carried by the host action, the sticky composited early
+  front, and the content-boundary transition distinct. Beginning a present changes the presented
+  and host roles together; a pre-boundary writeback may change only the candidate or composited
+  role; crossing the boundary is idempotent. Scanout and drain now ask whether a mapping is the
+  current present instead of reconstructing that predicate from two public fields.
+  `PresentConsoleState` closes the other half of presentation routing: console validity, latched
+  dimensions, content generation, successful `(mapping, generation)` paint witness, live window
+  ownership, and the monotonic publication epoch are one private owner. Establishing geometry,
+  recording a real mapping paint, recording an EFI paint without falsely stamping a mapping, and
+  advancing publication cadence are distinct transitions. The owner also makes the previously
+  implicit distinction between latched dimensions and a valid console explicit; the former remains
+  available to dimension fallback while the latter gates established-console behavior.
+- Mapper-backed IOSurface texture views now cross the wire boundary as one protocol-owned semantic
+  value. The decoder retains the complete 64-bit mapper identity, reuses the three checked nested
+  serializer variants, keeps plane and rotation separate, excludes verified unwritten bytes, and
+  refuses unknown or inconsistent variants. The former headerless geometry decoder and its
+  truncated 32-bit shadow identity have been removed. Runtime resolution now installs and follows
+  an explicit `MapperSurfaceRef -> MapperResolvedSurfaceId` relation; it neither narrows the
+  reference nor treats the mapper-service reference, resolved surface, canonical backing, or
+  page-table mapping namespaces as interchangeable. The legacy integer-keyed mapping table is now
+  entered only by projecting the resolved-surface type at its adapter. A high-bit regression fixture
+  proves that a mapper reference cannot alias the low 32-bit object with the same suffix.
+- Raw pipeline state, vertex formats and step functions, sampler state, blend state, stencil state,
+  visibility modes, index types, and pixel-format ordinals now have protocol-owned decoders and
+  typed semantic refusals. Runtime preparation retains those errors instead of converting them to
+  Vulkan `TranslateReason`s. The raw Metal pixel vocabulary and storage-width/aspect rules are
+  authoritative in `reims-vgpu-protocol`; core conversion helpers derive from that authority.
+  Direct and indirect draw primitive topology and the stream's sticky cull, winding, triangle-fill,
+  depth-clip, and visibility-result state now cross the normalization boundary as protocol semantic
+  values as well.
+  Full-width setter ordinals are retained until validation; an invalid sticky field refuses every
+  snapshot that would consume it until that same field is replaced by a valid setter. Independent
+  invalid fields remain independently recoverable. The executor no longer receives raw raster or
+  visibility ordinals, reparses guest state, or silently substitutes Metal defaults for values
+  outside the contract. The obsolete Vulkan visibility-ordinal translator and backend refusal were
+  deleted; Vulkan now maps only the semantic query mode to native flags and capabilities.
+  Render-pass load and store actions now follow the same rule. Protocol owns strict `LoadAction`
+  and `StoreAction` decoders; resolved color, depth, and stencil attachment state carries those
+  enums, not adjacent raw words. Snapshot normalization validates the whole attachment set and
+  later store-action overrides; an invalid field blocks draws until that exact attachment state is
+  replaced. Unknown actions refuse request construction (including clear-only passes) with their
+  exact ordinal instead of being logged and then executed as `DontCare`, a depth clear, or a dropped
+  Store. Load census, alias initialization, resident reuse, multisample validation, and writeback
+  policy consume the same semantic values, so unified and discrete paths cannot assign different
+  fallback meanings.
+  The complete draw-preparation refusal vocabulary is core-owned and generic over the executor's
+  translation failure. Vulkan supplies only `M2vCacheDecline` through a concrete alias; pipeline,
+  function, buffer, texture, reflection-interface, sampler, MRT, and index preparation failures no
+  longer live physically under the Vulkan engine.
+  Immutable render-pipeline, compute-pipeline, shader-function, sampler, and depth/stencil
+  descriptor values are now protocol-owned. Their retained object states live in the model layer;
+  `model` no longer names `runtime::pipeline_resolve`, `runtime::compute_exec`, or
+  `runtime::mtlb` construction types. Runtime byte decoders produce these semantic declarations,
+  and operational modules only construct or consume the retained objects.
+- Resolved draw and compute commands no longer carry SPIR-V or another backend-native shader
+  payload. Core carries a typed `PreparedShaderId` plus the stage's semantic descriptor-use
+  interface. Vulkan assigns that identity to each translated or specialized module, resolves it
+  at the executor boundary, and returns a typed refusal for a missing or retired program. The
+  registry retains only weak references and removes entries with the owning shader variant, so it
+  does not create a second shader lifetime or an invented cache bound. Draw and compute pipeline
+  creation, validation breadcrumbs, and native module caches consume the resolved backend variant
+  only after crossing the executor boundary. Compute's format-less storage-write decision and
+  draw's sampled-layout filter support now enter semantic planning through the executor capability
+  service rather than direct runtime calls into the Vulkan engine.
+  Translation reflection now crosses into preparation as a core-owned `ShaderInterface`, not as
+  the translator's reflection graph. The projection retains stage, descriptor location/count,
+  resource kind and access, texture shape and storage format, conservative buffer extent and
+  invocation footprint, local size, unsupported stage-level interfaces, and typed constexpr
+  sampler state. Draw and compute preparation consume only that projection; the native reflection
+  is private to `reims-vgpu-vulkan`. Render translation stages are requested through a Vulkan-owned
+  `RenderTranslationStage`, and `reims-vgpu` no longer has a production dependency on the
+  translator crate (legacy translator-oracle integration fixtures retain a dev dependency).
+  Texture-array descriptor resolution, sampled shape, compute shape/access, storage format, and
+  buffer-access classification are methods of the core semantic interface; Vulkan keeps only the
+  native-reflection projection and native-module transforms. Compute preparation now consumes the
+  canonical translated word representation instead of reparsing a public SPIR-V byte payload and
+  carrying a second malformed-module path. Storage-use analysis, neutral sampled-binding
+  discovery, format specialization, capability injection, sampler-interface extraction, and
+  prepared-stage publication are operations of the Vulkan-owned translated module; the compute
+  runtime no longer reads or mutates its raw SPIR-V. Retained render-pipeline state likewise no
+  longer owns `CachedShader` or `ShaderVariant`: Vulkan projects every executable numbering into a
+  core `PreparedShaderFamily` containing only prepared IDs, the semantic interface, sampler
+  declarations, descriptor-use facts, declared bindings, and diagnostic size. Native words remain
+  in the Vulkan content cache and resolve only after the executor boundary. This also removes the
+  process-global, address-keyed, capacity-reset declared-binding memo; the binding set is derived
+  once with the prepared variant and dies with that semantic projection.
+  Render translation and publication now cross the device-owned `ShaderTranslationService` on the
+  executor. Runtime supplies extracted AIR plus a core stage and retains only the resulting
+  `PreparedShaderFamily`; asynchronous render and compute preflight use the same port. Prepared
+  render variants also project texture descriptor use by semantic Metal argument index after
+  backend relocation. Draw planning therefore no longer imports Vulkan binding-band constants to
+  detect sampled-stage collisions or decide whether an unbound texture is statically used. Focused
+  fixtures cover all fragment relocation variants and semantic cross-stage collision.
+  Compute translation now crosses the same service as an opaque translated-module contract:
+  runtime asks only for the semantic shader interface, buffer extents, storage access, neutral
+  sampled bindings, sampler declarations, and publication of a prepared program. The executor
+  adapter retains the native translated shader and performs SPIR-V specialization behind that
+  boundary. Storage-image specialization itself is a core semantic decision over
+  `StorageImageFormat`, with typed refusal reasons; backend-native image formats are introduced only
+  by the adapter. Reflected samplers carry their Metal argument index separately from relocated
+  executable bindings, so compute lookup no longer treats Vulkan descriptor numbering as guest
+  identity.
+  Render executable variants now also own the complete buffer, texture, and sampler binding
+  projection for each relocation combination. Draw orchestration supplies Metal indices and
+  reflected descriptor locations without importing Vulkan binding bases or offsets. Reflected
+  buffer extent and neutral-substitution policy cross a dedicated executor service, sampled and
+  colour-attachment classification are core-owned typed decisions, and the Vulkan-specific GPU
+  hang trail is fed through the observation port using semantic formats. The draw planner therefore
+  has no executable dependency on the Vulkan crate; remaining textual references document the
+  adapter implementation rather than selecting guest-visible behavior.
 - The product executor is device/session-owned. Command execution, capability discovery,
   resident-content service, guest-write synchronization, compute residency, readback, and
   presentation are distinct core contracts. Guest-RAM transfer, maintenance, session lifecycle,
   and telemetry are separate compatibility ports; the `Executor` body is now empty and composes
   those narrow services instead of owning their methods.
+  The executor now strongly owns a `SessionHandle` containing its guest-derived Vulkan pools,
+  resource-front indexes, counters, presenter, residency epoch, and completion/publication
+  signals. The process-wide engine retains only the physical context, immutable content caches,
+  and the state temporarily borrowed by the active call. Its live-session registry contains weak
+  handles solely so a physical device loss can invalidate every live session; it cannot keep a
+  deleted vGPU or any of its GPU objects alive. Session activation parks state back in the owning
+  handle, reset and release operate through that handle, and resident leases carry the originating
+  handle rather than recovering ownership from a numeric session ID. `ResourcePools::new` no
+  longer mutates ambient session state; batch closure is published by the reset/device-loss
+  transition that owns it.
 - Unified/discrete policy and the four import/topology cells are isolated in the Vulkan crate. The
-  Vulkan engine and translation implementation now live there physically; the staticlib retains a
-  compatibility re-export and telemetry adapter while callers are moved to the executor boundary.
+  Vulkan engine and translation implementation live there physically; the old staticlib re-export
+  is gone, and the executor adapter owns the device telemetry connection.
+  The four-cell equivalence fixture now drives the canonical `ContentState` through imported and
+  staged guest-to-GPU materialization, a completed GPU store, and GPU-to-guest synchronization. It
+  compares the resulting content versions and replica state, not a preconstructed identical result,
+  while retaining topology-specific placement and batching as internal metrics.
+  `MemoryTopology` is now classification data only; it no longer exposes allocation behavior.
+  `MemoryPlacementPolicy` is the sole interpreter for allocation requests and topology-selected
+  batching, and `HostGpuCaps::memory_policy` is the device-scoped access point. Host-pointer import
+  remains an orthogonal measured capability, so neither topology policy assumes it is present.
 - The PCI and MMIO adapters share console-ownership, cursor-position, cursor-glyph, input, guest-RAM
   span, and host-memory plumbing through the common QEMU shim. Raw console-feed, scanout-verdict,
   and cursor-glyph ABI calls each have one caller; bus files retain only attach, IRQ, surface-update,
@@ -67,22 +272,568 @@ Implementation checkpoint (2026-08-18):
   session cannot consume and discard its return token or make teardown wait on the wrong device.
   Mapping/object mutations
   emit typed host-release effects instead of writing three unrelated retirement vectors, with
-  guest imports retired before aliased host views. The semantic runtime no longer calls Vulkan
+  guest imports retired before aliased host views. Ordinary flush and full device reset both drain
+  that same ordered effect stream; reset can no longer extract raw views first and revoke their
+  imports afterward. A mapping incarnation's packed host pointer, length, exact page footprint,
+  and optional GPU import are now one `MappingHostView` aggregate. Its constructor requires the
+  footprint to cover exactly the view, and replacement/invalidation atomically removes the whole
+  aggregate before emitting import and host-view release effects; the formerly independent
+  `contig_ptr`, `contig_len`, `contig_footprint`, and `contig_import` states no longer exist.
+  Task-GVA aliases now use the same ownership shape: a nonzero pointer and length can only be
+  created as one `HostPageView`, and overlap retirement, stale-view replacement, task teardown,
+  and reset consume that non-cloneable token exactly once into the typed release stream. Replacing
+  a mapping's GPU import retires and emits the prior import identity instead of overwriting its
+  last owner. Raw pointer/length
+  pairs are no longer independently mutable fields of either mapping-view family. The semantic
+  runtime no longer calls Vulkan
   engine operations directly; its remaining Vulkan dependency is the compatibility request/type
   vocabulary used to construct texture-blit and guest-transfer plans.
+  `SurfaceMappingEntry` is no longer one flat record in which logical lifetime, physical page identity,
+  content currency, and topology-selected host aliases are peer fields. Logical mapping activity,
+  incarnation, and mapper-object association now form `SurfaceMappingLifecycle`; the physical plan,
+  generation, condemned fingerprint, page-table source, and surface-walk proof form
+  `SurfacePageState`; and the contiguous host view plus its generation-keyed refusal form
+  `SurfaceMaterialization`. Retiring a materialization consumes its import and host-view ownership
+  without changing the logical mapping or its page plan. Mapping content has one transition object
+  for guest-page generation, semantic surface epoch, and decoded validity ordering. Guest writes,
+  host publications, and host writes into guest pages update that object through distinct methods,
+  eliminating the former split between saturating and nonzero-wrapping generation updates. The
+  unused render-flush witness and its non-reproducible observation history were deleted rather than
+  retained as apparent lifecycle authority. The content transition object and validity
+  happens-before record now live in `reims-vgpu-core::mapping`; the device model embeds that core
+  state instead of defining its own authority vocabulary.
+  Mapping construction facts are no longer five independently mutable peer fields. A private
+  `SurfaceDeclaration` owns an optional complete `SurfaceGeometry { width, height, format }` and
+  the optional device descriptor. Absence therefore cannot retain stale dimensions or format, and
+  map/remap/unmap/new-internal transitions clear geometry and descriptor together. The validated
+  geometry transition is the only production publisher; render, compute, blit, mapper, scanout,
+  writeback, object resolution, and reporting consume read-only projections. A behavioral fixture
+  pins that remap preserves the mapping registration while atomically withdrawing the entire old
+  declaration.
+  The device table itself is now a `SurfaceMappingRegistry` keyed internally by protocol
+  `SurfaceId`. It is no longer a raw `BTreeMap<u32, _>` named `mappings`, which falsely suggested
+  that registered/IOSurface slots were interchangeable with the canonical graph's GPU page-table
+  `MappingId`. The mapper-service edge remains `MapperSurfaceRef -> MapperResolvedSurfaceId` and
+  projects explicitly into this surface namespace; it is not inserted into the page-table mapping
+  graph. Runtime compatibility boundaries still carry the guest's raw `u32`, but the owning table
+  cannot be merged with another integer-keyed identity by accident.
+  Mapper page-plan adoption is now one registry transition: condemned-fingerprint comparison,
+  reprieve classification, logical/page generation advances, old host-view/import retirement,
+  page-table publication, mapper-internal association, and optional descriptor publication cannot
+  be independently reordered by the runtime resolver. The pure decision helper formerly beside
+  the mapper was deleted; tests drive the owned transition itself. Decoded resource-validity
+  statements likewise update guest-write currency and the validity quad together.
+  The registered-surface pathway now crosses a sibling owned transition: fingerprint comparison,
+  generation change, page publication, surface-walk derivation, device descriptor, and retirement
+  of the prior materialization are published as one state change. Thus arm mapper and registered
+  surface construction remain distinct policies over the same typed surface registry instead of
+  being interleaved mutations of a shared raw map.
+  Retained task resources now store their registered IOSurface relation as a typed `SurfaceId`,
+  converting back to the compatibility integer only at legacy runtime boundaries. The canonical
+  resource relation therefore cannot silently become a page-table mapping identity.
+  Mapper-service state is also one private aggregate now: the directed MMIO capture, retained
+  mapper-device identity, and `MapperSurfaceRef -> MapperResolvedSurfaceId` edges are no longer
+  public peer fields. MMIO publishes captures, ring drain consumes or restores them by producer,
+  and MAP/UNMAP own edge publication and retirement through named transitions. A zero capture
+  cannot erase an established mapper-device identity.
+  Presentation's per-surface Clear/Composite classification now belongs to `PresentState` and is
+  keyed by `SurfaceId`. Mapping retirement removes it with the other incarnation evidence, so a
+  later surface reusing the same wire integer cannot inherit its predecessor's keep-prior routing.
+  The semantic generation mirror for compute-resident subresources is now a core-owned
+  `ComputeResidencyLedger`: publication, lookup, and byte-window invalidation are its only mutation
+  operations. Executor resident availability remains an independent service fact, so losing a
+  native resident cannot silently erase or recreate guest-visible content authority.
+- Host copies are no longer eight peer fields in guest device state. Surface-, task-texture-,
+  GVA-, and native-linear replicas plus the GVA replacement bookkeeping have one
+  `HostReplicaState` owner; guest object and mapping identities only name entries in that
+  aggregate. Product builds expose none of its maps for mutation. Surface and texture publication,
+  row-preserving replacement, object/task retirement, and all native-linear store, resident,
+  materialize, lookup, and release transitions now cross the owner. The complete native-linear
+  window identity moved with those transitions, so a reused task/object key cannot update bytes,
+  descriptor identity, and resident authority independently. GVA restore, touch, successful guest
+  landing, eviction, byte accounting, and eviction-witness updates are likewise single owner
+  transitions; focused owner tests pin replacement accounting, recency, eviction, generation
+  supersession, and materialization. Immutable lookup and level snapshots are the only production
+  projections. Existing deletion/repoint/reset behavior crosses the same seam. Observation-only map pairing,
+  page-table node, released-page, and stale-view instruments likewise live in a separate
+  `DeviceObservations` aggregate instead of beside behavior-selecting lifecycle state. Two stale
+  ledgers that had neither producer nor consumer were removed rather than preserved as fictitious
+  authority. The map/unmap pairing, page-table-node write guard, and released-page write guard
+  state machines now live in `reims-vgpu-core`. They consume only typed state and return typed
+  verdicts; runtime retains environment switches, clocks, paging walks, counters, census cadence,
+  and failure-channel emission. The `DeviceObservations` aggregate itself is now core-owned and no
+  longer stores concrete runtime instrument types. Namespace-reach maxima and map-family cadence
+  have joined it as well; semantic `DeviceState` no longer carries observation-only counters as
+  peer fields, and the aggregate exposes only monotonic observation transitions and snapshots.
+- Linear-buffer and texture-view construction values are protocol-owned. Buffer address
+  construction requires an explicit guest page shift, and the texture-view boundary consumes the
+  three serializer opcodes into `TextureViewForm`; downstream code can ask for ranged or swizzled
+  semantics but cannot branch on the raw opcode.
+- The rest of the retained resource-construction vocabulary is protocol-owned as well: linear
+  texture level geometry, complete texture declarations, buffer-texture views, indirect-command
+  layouts and declarations, and the typed resource-decode refusal. `TaskResource` stores those
+  semantic values directly and no model type imports the runtime decoder. The decoder retains only
+  byte offsets, length checks, and conversion into the protocol values. Protocol tests now pin
+  explicit page geometry, level bounds and row spans, and ICB flag classification.
+- Pre-construction write generations, page-exact host-write currency, named GVA Store witnesses,
+  GVA plane/resource lifetime, retained page identities, and unpaid-frame ordering now live in a
+  core `content_tracking` domain. Core transitions have no logging or host transfer dependency;
+  runtime performs page walks and payment and emits observations at the orchestration boundary.
+  `DeviceState` no longer stores these behavior-selecting ledgers under runtime-owned types. Their
+  device-scoped instances—sampled revalidation, GVA Store proof, pre-construction currency,
+  page-exact host writes, compute residency, and pending writeback—now compose through one
+  `ContentAuthorityState`. The distinct typed ledgers remain distinct, while task retirement and
+  reset cross one content boundary instead of coordinating peer fields at call sites.
+  The task-local object families now follow the same ownership rule without collapsing their
+  identities: resources, samplers, compute and render pipelines, functions, depth-stencil states,
+  indirect-command buffers, fences, and events remain nine independent serializer namespaces
+  inside `TaskObjectNamespaces`, while redefine/delete crosses its single task-retirement
+  transition. Their former parallel `DeviceState` fields are gone. Existing lifecycle tests pin
+  exact per-family retirement counts, and the cut passes the complete drain suite plus strict
+  native and Apple Silicon clippy.
+  Task-directory entries and their unbounded full-`u32` table now live in core as well; task
+  definition cannot invent an object-list page, and task iteration remains tied to guest-owned
+  lifetimes. The gfx and IOSurface-command register banks moved into a core `DeviceRegisters`
+  aggregate, including the lock-free interrupt/doorbell identities that reset preserves. FIFO
+  ingress, child-ring page plans, translation ordering, and nested drain ownership now compose as
+  `WorkSchedulingState`. DEFINE/FREE child FIFO are single transitions over admission, pending
+  work, translation holds, and the decoded ring cache rather than three ordered mutations in
+  runtime. Core owner tests pin full-width task identity, sparse-register bounds, and atomic
+  channel retirement.
+  The two shortcuts used by packet fixtures which deliberately omit canonical descriptor
+  construction are isolated in a `#[cfg(test)]` `SyntheticFixtureState`; neither appears as a
+  product `DeviceState` field or resource authority.
+  Presentation now has the same device-level seam. Present routing/backing evidence, cursor
+  publication, and the guest shared-page handshake compose under one `PresentationState` rather
+  than three peer device fields. Cursor glyph publication and the display handshake live in core.
+  The handshake fields are private: shared-page reinitialization atomically withdraws every prior
+  online witness, acknowledgement is one transition, and a poll returns `Idle`, `Exhausted`, or an
+  admitted `Inspect` decision carrying the page, poll count, retry cadence, and first-pulse fact.
+  Runtime can no longer advance poll cadence, spend a retry, or combine an address with a different
+  pipe index independently. Display transaction-shape dedupe remains observation-only in the core
+  `DeviceObservations` owner instead of contaminating lifecycle state.
+  The arm mapper service is now a core state machine as well. Its pending producer capture,
+  mapper-device identity, and `MapperSurfaceRef -> MapperResolvedSurfaceId` edges move together;
+  capture consumption is scoped to the publishing entry, zero cannot erase an established device
+  identity, and surface retirement removes every related mapper edge. A core fixture uses nonzero
+  high bits to pin the 64-bit mapper namespace against accidental narrowing. At device scope,
+  `SurfaceState` composes this arm-only service beside—never into—the canonical surface-mapping
+  registry. Shared declaration/page/content/materialization state is therefore common, while arm
+  mapper lookup and x86 registered-surface construction remain distinct rails.
+  Raw object ordinals are now confined to the protocol/wire boundary in this path. Draw-time
+  sampled-resource diagnostics name `mapper_iosurface_texture_view`, `iosurface_plane_view`,
+  `texture_view`, or `buffer_texture`; they no longer carry `type=11`, `type=5`, or `type=8` as the
+  semantic identity of an already decoded object.
+  Indirect-command-buffer declarations and their independently bound command-memory association
+  likewise moved into a core generational registry, while wire decoding, host reads, fill replay,
+  and refusal emission remain in runtime.
+- Sampled-window identities now carry a typed page-table `MappingId` and `ByteOffset` in core
+  rather than another raw `(u32, u64)` mapping namespace in runtime. Their stable content-key fold
+  is core-owned and shared by derivation instead of restating the hash constants. Completion-stamp
+  records normalize their raw index through a protocol `StampWait`; wrapping satisfaction,
+  coalesced-versus-queued publication state, and the pending drain stamp now live in core. Runtime
+  retains packet decoding, guest-page access, queue submission, IRQ publication, and census
+  emission.
+- Event and encoder-fence semantics now live in core as one pure synchronization state machine.
+  Signal/wait decisions, typed reasons, monotonic generation storage, task-local serializer
+  namespaces, deletion, task teardown, and reference-reuse generations moved together; runtime
+  retains wire-command adaptation and refusal emission only. Equal event and fence integers cannot
+  alias, while render, compute, and blit deliberately share one fence namespace. The historical
+  `runtime::plan` façade is deleted rather than kept around the core owner.
+- The sampled-window witness is now a core state machine rather than a runtime cache with hidden
+  correctness authority. Core owns its unbounded lifecycle, guest/device writer verdict,
+  diagnostic-audit schedule, and the rule that an audit disagreement spends the refuted content
+  generation. Runtime supplies page-exact executor readings, selects the diagnostic density from
+  process configuration, folds the already-resolved host spans, and publishes counters and typed
+  failures. The adapter can no longer change reuse validity by rearranging logging code.
+- Ref-keyed host materializations now use a core-owned, unbounded `MaterializationRegistry` keyed
+  by typed task/object ownership and semantic byte windows. Core owns lookup and task, object,
+  range, and reset retirement; runtime owns only the host import and packed-buffer payloads. A
+  host optimization can no longer redefine when a guest resource or one of its byte windows dies.
+- Registered-surface backings, IOSurface plane views, buffer textures, ordinary texture views, and
+  narrow/wide heap textures now cross the byte boundary as distinct protocol-owned semantic
+  descriptors. The type-5 descriptor preserves its outer surface relation even when the nested
+  operation is absent, unknown, or geometrically invalid, and carries that nested state explicitly
+  rather than converting the whole resource into a miss. The type-8 decoder is total over its
+  supported families; compute no longer peeks at serializer opcodes and reparses an embedded
+  texture body to decide whether it received a heap texture, buffer texture, or view. Blit,
+  compute, mipmap, sampled-load, render-target, and view-chain behavior consume the one retained
+  semantic descriptor for the resource lifetime. Raw construction bytes remain only for boundary
+  diagnostics and the separate first-construction registries for serializer/function objects.
+- Draw encoding now takes an immutable `DrawEncodeRequest`. Allocation generation is resolved once
+  and passed explicitly; a failed resident LOAD returns its recovered CPU seed as a typed
+  resolution instead of writing it back into the request. Visibility output, CPU chain pixels, and
+  the exact resident identity now leave encoding in `DrawChainResult`, so abandonment consumes the
+  identity that execution actually established rather than re-deriving it from mutable mapping
+  state. The generic resolved-command envelope also boxes its large owned blit variant, keeping the
+  command discriminant compact without changing the payload's ownership or lifetime.
+  The formerly monolithic physical draw file is now named for semantic execution rather than its
+  historical backend, and its first ownership block has been extracted: `draw::resident` owns
+  render-target identity, allocation-generation derivation, resident-content currency, readback,
+  and Store publication. Those policies consume the executor's capability and resident services;
+  they do not select a native API or memory topology. Reflected sampled-image dimensionality is a
+  core preparation projection, including the explicit refusal of cube shapes the current executor
+  request cannot represent, rather than a locally reconstructed native-image shape.
+  Sampled-resource resolution is now a separate `draw::sampled_source` module: task-resource
+  lookup, IOSurface seed selection, guest-run gathering, zero-copy eligibility, buffer/index
+  materialization, format-preserving CPU conversion, and sampled-content identities produce a
+  semantic source request consumed by draw execution. The execution module has fallen from roughly
+  9,900 to 5,400 lines and no longer owns or can reach the private intermediate state of that
+  resolution ladder. This is an ownership split, not a backend fork: capability checks enter
+  through the executor, while guest identities and content authority remain common.
+- The deleted `backend-vulkan` compatibility feature has been removed from the repository's actual
+  verification commands as well as Cargo and QEMU. The feature matrix now exercises the shipping
+  unconditional Vulkan dependency with only the optional `host-window` adapter enabled. Argument
+  groups at recursive texture resolution, whole-plane GPU copy, chain abandonment, native scratch
+  conversion, and macOS window construction are typed aggregates rather than growing positional
+  parameter seams.
+- The one-line `runtime::{m2v_cache, spirv_bind, spirv_vertex_input, gpu_hang_trail}` compatibility
+  modules have been deleted. Their APIs are now visibly owned by `reims-vgpu-vulkan`, and
+  backend error, refusal, and observation types used by orchestration are concentrated at the
+  executor compatibility boundary. Outside that adapter, production runtime code no longer calls
+  the Vulkan engine directly. Integration fixtures exercise the sibling backend crate at its own
+  public boundary. Translation and SPIR-V preparation still form the explicitly documented
+  compatibility vocabulary to migrate behind a narrower executor service.
+- The one-line `contract::{draw, endian, extent, fnv, pixel_format, vertex_step, visibility}`
+  façades have also been deleted. Product code and integration fixtures now name the owning core
+  or protocol crate directly, so the composition crate no longer supplies a second path for those
+  semantic values. Render-pass load/store actions and compute/mesh dispatch geometry have moved
+  with their behavioral tests into `reims-vgpu-protocol`, consuming two more substantive
+  `contract` modules. Page-table geometry and explicit PFN conversion have moved into
+  `reims-vgpu-paging`, eliminating the device-local GVA naming façade as well. The remaining
+  checked geometry helpers moved into protocol geometry. The remaining IOSurface catch-all has now
+  been split rather than renamed: mapper ring records and their typed selector live in protocol,
+  IOSurface device-descriptor records/window derivation live in protocol, page-entry interpretation
+  and the host-neutral mapper-internal walk live in paging, and runtime owns capture registers plus
+  failure-channel projection. `MapperCapture` carries `MapperRequestKind` rather than an ordinal.
+  The product `contract` module and directory are deleted; its twelve cross-owner fixtures remain
+  as a test-only module and exercise the new owners directly.
+- Task definition and deletion no longer mutate runtime census state from inside `DeviceState`.
+  The model returns a typed definition kind plus exact per-namespace retirement counts, shares one
+  namespace-retirement transition between redefine and delete, and preserves their distinct
+  replica and address-space cleanup. FIFO orchestration alone maps those semantic effects onto the
+  existing observation routes. A behavioral model test pins first definition, same-root and
+  new-root redefinition, successful deletion, repeated deletion, and exact namespace counts.
+- Child-channel admission is now a pure model predicate with its refusal/census adapter at the
+  runtime boundary. Mapping page-plan invalidation likewise returns a typed effect distinguishing
+  retired page/view state from a dropped host replica; runtime publishes the latter instead of the
+  model mutating census state. Task/object-list and mapping mutators now follow the same rule:
+  `DeviceState` returns a typed `StateMutationDecline`, while the composition-owned runtime device
+  maps that result onto the fail channel. Observation formatting implementations for semantic
+  model events live under `observe`, not beside the state machine. A behavioral test proves that
+  invoking semantic state directly is quiet and that the runtime composition reports the same
+  typed refusal. Production model state and registers contain no executable observation call.
+- `runtime::Device` is now the composition root for one virtual GPU. It owns the semantic
+  `DeviceState`, the injected executor/session, and address-bound host materializations. Runtime,
+  device, scanout, and optional host-window paths consume that aggregate instead of recovering an
+  executor or materialization registry from semantic state. `DeviceState` constructors no longer
+  construct Vulkan objects or read executor policy. Reset returns a typed semantic effect;
+  composition performs executor reset, host release, materialization retirement, and failure
+  publication. Focused tests prove that resetting one device preserves its injected executor and
+  cannot reset another, that diagnostic audit policy survives reset, and that unresolved
+  translation holds are reported only at the composition edge.
+- Diagnostic gather policy is now selected at the composition edge and injected into semantic
+  state. `DeviceState` no longer reads process environment policy through a runtime constructor,
+  and reset preserves the injected policy; a focused lifecycle test pins that behavior.
+- Explicit IOSurface plane selection is fail-closed at the protocol boundary. A non-planar surface
+  accepts explicit plane zero, while a nonzero plane can no longer be discarded and silently
+  aliased to the whole surface. The protocol test covers both outcomes.
+- The obsolete in-crate `backend::vulkan` re-export façade is deleted. Runtime translation and
+  executor adaptation, integration tests, and documentation now name the extracted
+  `reims-vgpu-vulkan` crate directly. The two composition hooks formerly hidden in the façade—
+  telemetry installation and drain-thread attribution—are owned by the executor adapter.
 - The bounded memo audit distinguishes lifecycle state from derived performance data. The three
   byte-bounded CPU memos are byte-exact and revalidated on every lookup, so eviction costs only
   conversion/re-upload. The GVA cache can evict only entries whose bytes are already present in
   guest RAM; sole-copy entries remain admitted over the cap and fail-visible. These are retained
   under the project's explicit recomputation-cache exception, not treated as resource authority.
-- Verification at this checkpoint: `reims-vgpu-core` (79 tests), `reims-vgpu-vulkan` with the
-  supported host-window feature (722),
-  focused executor ownership (11), drain census (7), and 1,317 of the full product library suite's
-  1,318 tests pass serially. One
-  shared guest-import fixture failed only in the full-suite order and passed immediately in
-  isolation; it is not counted as evidence for or against the refactor. The supported Vulkan
-  product configuration compiles. A no-backend build is intentionally rejected by the crate and
-  is not a supported verification arm.
+- Verification at the preceding full-workspace checkpoint: `cargo test --workspace -- --test-threads=1` passed after the
+  core content/ICB, protocol-descriptor, stamp, and gather-witness ownership tranches. It covers
+  1,265 product library tests plus its integration suites, 705 Vulkan tests, 152 wire tests, 99
+  core tests, 36 paging tests, 35 protocol
+  tests, 23 memory tests, the remaining workspace crates, and doc tests. The hardware-independent
+  Vulkan integration fixtures for draw, compute, batching, storage images, topology-equivalent
+  content, reset, and device loss are included. Oracle-backed tests which explicitly require the
+  external serializer harness remain ignored by their existing contract. Product, Vulkan, paging,
+  protocol, and wire crates also pass fresh `aarch64-apple-darwin` checks;
+  native Linux covers the x86 compile boundary. `git diff --check` is clean. Architectural
+  deletion still gates plan completion.
+  The subsequent materialization and total resource-descriptor tranche passes 1,266 product
+  library tests, 37 protocol tests, and its focused core/object/blit/compute/mipmap/view suites;
+  the immutable draw/output tranche also passes the 1,266 product library tests. The corrected
+  feature matrix passes native Linux, cross-compiled Apple Silicon, the option ROM, and both
+  formatting cells; native and `aarch64-apple-darwin` all-target clippy runs pass with `-D warnings`.
+  After the façade deletion and observation-state migration, the full workspace matrix passes
+  again: 1,226 product library tests, 705 Vulkan tests, 152 wire tests, 118 core tests, 43 protocol
+  tests, and the remaining workspace and doc-test suites. The lower product count reflects tests
+  moving with their owners into core and protocol, not deleted coverage. Native and
+  `aarch64-apple-darwin` all-target clippy still pass with `-D warnings`; the feature matrix passes
+  both formatting cells, Linux Vulkan/window, Apple Silicon Vulkan/window, and the option ROM.
+  `git diff --check` is clean. The later task-lifecycle effect tranche passes a fresh full workspace
+  run with 1,222 product library tests plus all integration and doc-test suites; the lower count
+  again reflects moved tests. Its product all-target check and the focused child-channel and
+  mapping-invalidation tests pass. After the IOSurface split, a second full workspace run passes
+  the same 1,222 product tests and all integration/doc suites. Native and Apple Silicon all-target
+  clippy pass with warnings denied; the complete feature matrix passes after this
+  checkpoint. After diagnostic-policy injection, strict plane selection, and deletion of the old
+  Vulkan façade, the full workspace passes again with 1,223 product library tests plus every
+  integration and doc-test suite. Native and Apple Silicon all-target clippy pass with warnings
+  denied, the complete feature matrix passes, and `git diff --check` is clean.
+  After extracting executor/materialization ownership and semantic observation effects, the full
+  workspace passes with 1,224 product library tests plus every integration and doc-test suite.
+  Native and Apple Silicon host-window all-target clippy pass with warnings denied; the complete
+  feature matrix passes Linux Vulkan/window, Apple Silicon Vulkan/window, the option ROM, and both
+  formatting cells. `git diff --check` is clean.
+  After the render/compute translation ports, draw-planning boundary, and observation-instrument
+  relocation, the full workspace again passes 1,224 product tests, 704 Vulkan tests, 119 core tests,
+  37 observation tests, and every integration and doc-test suite. The two tests removed from the
+  Vulkan count moved with the shared sRGB instrument into the observation crate. Native and Apple
+  Silicon host-window all-target clippy pass with warnings denied; the complete compile matrix
+  passes Linux Vulkan/window, Apple Silicon Vulkan/window, the option ROM, and both formatting
+  cells. `git diff --check` is clean.
+  After splitting mapping lifetime, page plans, host materialization, and content currency, all
+  1,227 product library tests plus the product integration and doc-test suites pass serially. The
+  three added content-transition tests pin nonzero wrap, host-only publication, and ordered
+  validity operations. `cargo check -p reims-vgpu --tests`, native all-target host-window clippy
+  with warnings denied, and `git diff --check` are clean. The next full workspace and cross-target
+  matrix follows after the surrounding mapping-registry tranche is complete.
+  After moving synchronization, retained reference namespaces, render-pipeline semantics, and
+  mapping content transitions to core, the product suite passes with 1,220 library tests plus all
+  integration and doc-test suites, and core passes 128 tests. The seven fewer product tests are the
+  mapping and synchronization state-machine tests now run by their core owner. Native and Apple
+  Silicon all-target host-window clippy remain clean with warnings denied, as does
+  `git diff --check`.
+  After the resident-target and sampled-source draw split, the serial product suite passes with
+  1,217 library tests plus every integration and doc-test suite; the product count falls by three
+  because sampled-shape behavior moved to core, whose suite now passes 130 tests. Native and Apple
+  Silicon all-target host-window clippy pass with warnings denied, `cargo fmt --all -- --check`
+  passes after formatting, and `git diff --check` remains clean. A fresh full-workspace serial run
+  also passes all product, Vulkan (704), wire (152), core, protocol, paging, memory, observation,
+  integration, and doc-test suites; oracle-backed tests retain their documented ignored status.
+  After making mapping declaration atomic, the serial product suite passes with 1,218 library
+  tests plus all integration and doc-test suites. Native and Apple Silicon all-target host-window
+  clippy pass with warnings denied, and formatting/diff checks are clean.
+  After separating the `SurfaceId` registry from page-table `MappingId`, owning mapper page-plan
+  adoption, and coupling decoded validity updates, the serial product suite passes with 1,219
+  library tests plus every integration and doc-test suite. Native and Apple Silicon all-target
+  host-window clippy pass with warnings denied; formatting and `git diff --check` are clean.
+  After adding the registered-surface adoption transition and its behavioral fixture, the same
+  gates pass with 1,220 product library tests.
+  After centralizing topology allocation behavior and mapper-service state, a full serial workspace
+  run passes every unit, integration, and doc-test suite. Native and Apple Silicon all-target
+  host-window clippy pass with warnings denied; formatting and `git diff --check` are clean. Two
+  mapper-service state tests raise the product library count to 1,222. A focused lifecycle fixture
+  then pinned retirement of presentation write classification on surface-id reuse, raising it to
+  1,223. After moving primitive topology and sticky raster/visibility state to the semantic
+  normalization boundary, the full serial workspace passes with 1,225 product library tests plus
+  every integration and doc-test suite. Native and Apple Silicon all-target host-window clippy
+  pass with warnings denied. The two added behavioral fixtures pin full-width sticky-state refusal,
+  recovery by field replacement, and refusal of unknown primitive topology without an executor
+  fallback. The adjacent semantic pass-action tranche then passes a fresh full serial workspace
+  with 1,226 product library tests plus all integration and doc-test suites. Native and Apple
+  Silicon all-target host-window clippy remain clean with warnings denied; its regression proves
+  unknown load/store actions cannot construct an executor request. Extending the same state to
+  depth/stencil and override-time validation raises the product suite to 1,227; a fresh full serial
+  workspace and both clippy targets pass again. The added snapshot fixture proves invalid color,
+  depth, and stencil actions remain distinct and recover only when their exact attachment state is
+  replaced. The fixed-function pipeline-state tranche then raises the product suite to 1,228:
+  blend descriptors and nontrivial depth/stencil descriptors normalize once into semantic core
+  state, and unresolved bound state or unknown blend, compare, and enabled-face stencil ordinals
+  are typed draw-preparation refusals rather than log-and-continue degradation. A fresh full serial
+  workspace run passes every unit, integration, and doc-test suite; native and Apple Silicon
+  all-target host-window clippy pass with warnings denied, and formatting plus
+  `git diff --check` are clean. The subsequent prepared-draw boundary raises the product suite to
+  1,230: semantic request construction fixes one completion route before submission, route
+  conflicts are typed preparation refusals rather than branch-order choices, executor completion
+  and materialization accounting live behind the immutable handoff, and pixel diagnostics are an
+  observation-only consumer downstream of execution. A fresh full serial workspace run passes all
+  unit, integration, and doc-test suites; native and Apple Silicon all-target host-window clippy
+  pass with warnings denied, and formatting plus `git diff --check` remain clean. Target planning
+  now lives behind the same boundary: resident-chain, deferred GVA Store, surface Store, and
+  resident LOAD jointly select executor identity, readback policy, and completion ownership in one
+  operation. Focused fixtures pin surface and GVA-load routes plus fail-closed missing resident
+  identity. Fixed-function normalization is also a dedicated module rather than a collection of
+  helpers embedded in orchestration. The resulting full serial workspace passes with 1,231 product
+  library tests and every integration/doc-test suite; native and Apple Silicon host-window
+  all-target clippy, formatting, and `git diff --check` are clean. The adjacent attachment audit
+  found and closed another fail-open seam: an MRT attachment whose geometry differed from color0
+  was logged and omitted while the other slots executed. The builder now refuses the whole pass,
+  and a behavioral fixture proves a two-target pass cannot collapse into a one-target draw. The
+  serial product suite rises to 1,232; both host-target clippy passes and formatting/diff checks
+  remain clean. Attachment construction now has its own module and a total result boundary:
+  expected absence is `Ok(None)`, while invalid load/store actions, unresolved source or resolve
+  identities, incompatible resolve targets, and inconsistent pass geometry are distinct typed
+  refusals. Source and resolve roles are typed rather than stringly identified, and the refusal
+  latch includes class, slot, and subject identity so observation cannot merge different failures
+  merely because they occupied the same slot. Focused core and product fixtures pass; full
+  workspace and dual-target verification follows with the surrounding bind-planning cut. The
+  first such cut now returns one `BoundBufferPlan`: vertex/fragment buffer materialization,
+  reflected extent and access, zero-copy eligibility, dynamic attribute stride, vertex format and
+  step normalization, and stage-in presence are owned together rather than assembled inside
+  execution. The full serial workspace passes with 1,233 product tests, 703 Vulkan tests, 152 wire
+  tests, 131 core tests, and all integration/doc-test suites; native and Apple Silicon host-window
+  all-target clippy pass with warnings denied, and formatting plus `git diff --check` are clean.
+  Sampled texture and sampler planning now have their own complete modules as well. Both stream and
+  reflected sampler collisions refuse before execution, reflected shape gaps no longer fall back
+  to 2D, and a focused fixture proves a colliding reflected declaration cannot produce a partial
+  sampler list. A fresh full serial workspace passes with 1,234 product tests, 703 Vulkan tests,
+  152 wire tests, 131 core tests, and all integration/doc-test suites; both host-target clippy
+  passes remain clean with warnings denied. Final `DrawRequest` assembly is now isolated from
+  execution, Store, and diagnostics: all resolved ingredients cross one request-plan aggregate,
+  which returns the immutable request and its single completion route. Resource/hang diagnostics
+  inspect only the finished request, and MRT route counters no longer live in the semantic planner.
+  The full serial workspace remains green at 1,234 product tests; native and Apple Silicon
+  host-window all-target clippy, formatting, and `git diff --check` remain clean. The first two
+  scheduler ownership cuts now replace loose `DeviceState` fields: completion publication owns
+  debt, ordered-rail handoff, wait classification, visibility progress, and the exact FIFO
+  timelines held for an unmet word; translation scheduling owns defer/ready, sibling holds, present
+  barriers, episode accounting, channel retirement, and reset evidence. The full drain suite
+  passes 116 behavioral tests, and the fresh full serial
+  workspace passes 1,234 product tests, 703 Vulkan tests, 152 wire tests, 135 core tests, and all
+  integration/doc-test suites. Native and Apple Silicon host-window all-target clippy remain clean
+  with warnings denied; formatting and `git diff --check` are clean. The first shared transfer-plan
+  boundary is now concrete: a bounded guest-page destination produces a topology-independent
+  `GuestPageTransferPlan` distinguishing padding-preserving rectangles from dense detile/scatter,
+  and the Vulkan executor materializes that plan. Guest reads now have the matching allocation-free
+  `GuestReadTransferPlan`: checked pages either expose one exact direct stretch and a complete
+  gather iterator, or explicitly remain CPU-only. Buffer, compute-buffer, and sampled-texture
+  execution consume that one classification before applying host import capability and Vulkan
+  alignment rules. The former guest-memory compatibility port is
+  split into guest-page transfer, completion ordering, and guest-import lifetime capabilities, so
+  transfer planning cannot retire imports or publish completion words. A fresh full serial
+  workspace and both host-target clippy passes remain green at the same product/Vulkan/wire counts,
+  135 core tests, and 24 memory tests. Every runtime resident read now consumes one atomic
+  `ResidentReadPlan` for readiness, content epoch, and absent-after-reclaim evidence; semantic
+  lifetime retention and content-state transitions remain separate operations. This prevents one
+  preparation decision from combining mutable registry facts observed across three backend
+  transactions. The draw and blit suites pass with 161 and 60 focused tests respectively, and
+  focused resident-ownership and Vulkan classification tests are green, including the invariant
+  that a live resident never simultaneously carries reclaim history. Direct host-window
+  publication now has the same single-owner shape: one engine transaction verifies presenter
+  ownership, maintains the resident working set, validates identity and geometry, and returns the
+  exact `PresentationSource` that may be published. The device no longer combines that result with
+  a separately published attached bit or reconstructs the checked source. Focused Vulkan
+  presentation and device lifecycle tests are green. Deferred submission ownership now crosses a
+  dedicated `SubmissionBatchService`: completion waits and tranche-tail flushing no longer control
+  one open batch through unrelated completion and maintenance ports, and the waiter result is a
+  typed submitted/already-in-flight transition rather than a boolean. The 116 drain fixtures remain
+  green. The native-window port no longer exposes Vulkan `DrawError`; its boundary error preserves
+  the backend's exact decline slug, fields, and display text while exposing only the semantic
+  presenter-detached recovery fact. Focused error-preservation and all 14 host-window tests pass.
+  The window-to-executor call now carries one immutable frame offer rather than independent
+  resident and CPU options, keeping sequence, geometry, fallback bytes, and the preferred resident
+  in one contract. Four multisample rules evaluated before submission now return core-owned
+  `DrawPreparationDecline` variants instead of constructing Vulkan `DrawReason`; the Vulkan-only
+  capability and execution refusals remain inside the executor. The focused 107-test draw suite
+  and core decline tests are green. The complete buffer, sampled-texture, sampler, and final
+  request planners now return only that core preparation vocabulary; `execution.rs` wraps each
+  completed plan once at the executor boundary. No planner module imports or constructs the
+  backend error type. Draw orchestration now returns a product-owned `DrawAttemptError`: its
+  preparation arm contains the core decline directly and its execution arm contains only a
+  lossless `ExecutorDiagnostic` projection (slug, fields, and display detail). The native
+  `DrawError`, including its translator-fixed payload, terminates inside the executor adapter and
+  no longer inhabits draw orchestration. Focused tests separately pin semantic preparation and
+  native executor-diagnostic preservation. A fresh full serial workspace
+  passes with 1,234 product tests and all integration/doc-test suites; native and Apple Silicon
+  host-window all-target clippy pass with warnings denied, and formatting plus `git diff --check`
+  are clean. After the diagnostic cut, the 107 public draw tests and 24 execution-split tests pass,
+  both host-window and default-feature product checks compile, and `git diff --check` remains
+  clean. Retained pipeline resolution, semantic blend construction, sample/interface admission,
+  and executor-capability geometry validation now terminate in one `PipelinePlan`; downstream bind
+  planning cannot receive peer pipeline values from a partially accepted preflight, and absence of
+  a color target is an explicit no-plan result. The same focused draw suites and core decline tests
+  remain green. The full serial workspace then passes with 1,235 product tests, 704 Vulkan tests,
+  152 wire tests, 135 core tests, and every integration/doc-test suite. Native and Apple Silicon
+  host-window all-target clippy pass with warnings denied; formatting and `git diff --check` are
+  clean. The Apple target reports only the existing third-party `block` future-incompatibility
+  notice.
+  The completed draw-planning and submission-lifecycle tranche then passes a fresh full workspace
+  at 1,236 product tests. Submission identity, post-validity participation, segment movement, and
+  completion are one core tracker; successful draw completion owns target-use publication. The
+  subsequent child-drain, validity-registry, and sampled-content ownership cuts pass the full
+  workspace at 1,237 product tests plus every integration/doc-test suite. Native and Apple Silicon
+  host-window all-target clippy pass with warnings denied, formatting and `git diff --check` are
+  clean, and the only diagnostic remains the third-party `block` future-incompatibility notice.
+  Named pending-work transitions raise the product suite to 1,239; presentation backing and
+  backpressure owner fixtures raise it to 1,241. Fresh full-workspace runs after both tranches pass
+  every unit, integration, and doc-test suite, and native plus Apple Silicon host-window all-target
+  clippy remain clean with warnings denied. The capture-policy split preserves the 28-test scanout
+  suite and passes both default-feature checking and strict host-window clippy. The retained-frame
+  aggregate preserves all 28 scanout and 116 drain tests, adds an owner-level publish/rollback/
+  recycle fixture, and passes the host-window device suite. Its fresh full-workspace checkpoint
+  passes with 1,242 product tests and every integration/doc-test suite; native and Apple Silicon
+  host-window all-target clippy pass with warnings denied, formatting and `git diff --check` are
+  clean, and the only diagnostic is the existing third-party `block` future-incompatibility notice.
+  The mapping-role routing cut then adds one owner-level transition fixture and passes a fresh
+  full-workspace checkpoint at 1,243 product tests. Native and Apple Silicon host-window
+  all-target clippy, formatting, and `git diff --check` remain clean under the same conditions.
+  The console/paint owner adds the second routing fixture and passes the full workspace at 1,244
+  product tests. Both strict host-window clippy targets, formatting, and `git diff --check` remain
+  clean; Apple targeting still reports only the third-party `block` notice.
+  The prepared-presentation boundary keeps the 1,244 product tests green and raises the core suite
+  to 138 with an exact-source fixture. Every workspace integration/doc-test suite, native and Apple
+  Silicon strict host-window clippy, formatting, and `git diff --check` pass; the same third-party
+  notice is the only diagnostic.
+  Total window payload, typed completion route, single-source resident geometry, and private
+  presentation-source construction keep the full workspace green at 1,244 product tests and raise
+  the core suite to 139. Native and Apple Silicon strict host-window clippy, formatting, and
+  `git diff --check` pass with only the same third-party notice.
+  Host-replica, host-materialization, child-work, and observation ownership cuts now pass the full
+  `--workspace --all-targets --features host-window` checkpoint: 1,279 product tests, 140 core
+  tests, 720 Vulkan tests, 152 wire tests, and every workspace integration target pass (with the
+  explicitly ignored oracle/measurement cases unchanged). Native workspace clippy and Apple
+  Silicon product clippy remain warning-clean; the only toolchain notice is still third-party
+  `block`. The current host-window documentation build succeeds after using the feature surface
+  left by deletion of the `backend-vulkan` façade.
+  The subsequent task-directory, register-bank, channel-scheduling, test-fixture, and presentation
+  cuts pass a fresh full-workspace checkpoint at 1,276 product tests, 147 core tests, 720 Vulkan
+  tests, 152 wire tests, and every integration target before the final display-state-machine
+  fixtures were added. The completed display seam raises core to 150 tests; all 116 drain and 28
+  scanout behaviors pass, and native plus Apple Silicon host-window all-target clippy remain clean
+  with warnings denied. Formatting and `git diff --check` pass; the sole notice remains the
+  third-party `block` future-incompatibility warning.
+  The core mapper-service extraction adds two owner fixtures and raises the full checkpoint to 152
+  core tests while preserving all 1,276 product, 720 Vulkan, and 152 wire tests. Workspace clippy,
+  Apple Silicon product clippy, the host-window documentation build, formatting, and
+  `git diff --check` all complete successfully. The documentation build retains its pre-existing
+  unresolved-link warnings; it introduces no build failure.
+  Presentation viewport fitting and pointer projection now live in core as
+  `PresentationViewport`, `aspect_fit_viewport`, and `pointer_to_guest`; both the native-window
+  adapter and Vulkan presenter consume that one semantic rule. The former Vulkan-owned viewport
+  module was deleted. Two core fixtures, all 15 host-window presentation tests, and all 12 Vulkan
+  window-present tests pass.
+  Composition-owned bound-buffer materializations and retained GVA resources now retire in typed
+  task-definition, task-deletion, object-list-replacement, and object-deletion transitions beside
+  the corresponding semantic mutation. `ReplacePhysical` likewise owns its GVA-resource,
+  bound-buffer, host-copy, and mapping-page invalidation effects in one transition. Product
+  lifecycle packets no longer depend on manually ordering those retirements before a
+  `DeviceState` mutation. Preconstruction write currency retires inside semantic task and
+  object-list lifetimes instead of hitching a ride on a host-buffer helper. Three owner-level
+  transition fixtures, all 50 object tests, and all 116 drain tests pass.
+  The final serial `--workspace --all-targets --features host-window` checkpoint passes with 1,278
+  product tests, 154 core tests, 715 Vulkan tests, 152 wire tests, and every integration target;
+  the explicitly ignored measurement/oracle cases remain unchanged. Native workspace clippy and
+  Apple Silicon product clippy pass with warnings denied. The host-window documentation build,
+  formatting, and `git diff --check` pass; rustdoc retains 116 pre-existing unresolved-link
+  warnings, and Apple targeting retains only the third-party `block` future-incompatibility notice.
+
+Completion audit (2026-08-19):
+
+| Phase | Exit-criteria evidence | Verdict |
+|---|---|---|
+| 1. Semantic vocabulary | Protocol owns typed task/object/serializer/resource/storage/mapping identities; mapper fixtures retain 64-bit refs and independent plane/rotation; unknown variants decline by type. | Complete |
+| 2. Executor port | Core owns `ResolvedSubmission`, ordered command buffers, `ExecutionCompletion`, and `ExecutionPort`; product draw/compute execution reaches Vulkan only through `VulkanExecutor`; scripted executors validate identity, kind, and completion count. | Complete |
+| 3. Device-scoped Vulkan | `VulkanExecutor` owns a `SessionHandle`, resident leases, imports, presenter, submission state, and reset; live-session registration is weak and immutable caches remain content-keyed. | Complete |
+| 4. Canonical resource graph | `TaskResources` and the core graph own generational resources, storage/view/backing/mapping relations, participation, deletion, and in-flight retention. Product texture-to-mapping and live-object side maps are gone; mapper and registered-surface policies remain distinct. | Complete within established mapper contract |
+| 5. Content authority | Resource versions, mapping currency, sampled identity, GVA Store witness, pending writeback, host replicas, and executor materialization use typed transitions; delayed-completion and sole-copy fixtures pin ordering. | Complete |
+| 6. Immutable normalization | Core command buffers carry resolved generational endpoints; `PreparedDraw` and compute/blit/resource-state commands are immutable, and operation outputs return only in typed completion facts. | Complete |
+| 7. Topology policy | Structural classification has one owner; sealed unified/discrete policies choose only memory requests and batch defaults. Four-cell tests prove every policy/capability combination retains a valid correctness route. | Complete |
+| 8. Composition reduction | Host capabilities are split into narrow ports; page geometry is explicit; presentation viewport/source/result are core semantics; PCI/MMIO use the shared shim and arm mapper behavior stays in its pathway policy. | Complete |
+| 9. Old architecture deletion | Reset-only backend, backend feature fork, contract façade, direct draw-to-Vulkan module, raw type-7/type-11 semantics, sentinel residency, duplicated product identity maps, mutable output requests, and direct runtime engine calls outside the executor adapter are removed. | Complete |
+
+The four undriven arm experiments—task death with live mapper views, live reset, interrupted queued
+teardown, and display-versus-ordinary retirement—remain validation work, not guessed shared
+behavior. They can refine the arm policy without reopening the cross-crate architecture.
 
 Scope: the Rust device model, protocol boundary, resource lifecycle, Vulkan executor, memory
 topology policy, QEMU composition layer, presentation, observability, and verification architecture.
@@ -117,49 +868,77 @@ guest-visible semantics.
 
 ### Evidence verdict
 
-The available static set has an important coverage boundary. It contains a kernel/device lifecycle
-for the PCI pathway and matching user-space serializer code for both instruction-set slices. It
-therefore supports common serializer semantics and the PCI resource/page-table lifecycle, but it
-does not supply the mapper-capable pathway's kernel object implementation. A method or feature name
-present in both user-space slices is evidence for shared vocabulary, not evidence that the two
-kernel pathways have identical storage or teardown behavior.
+The original static set established the PCI resource/page-table lifecycle and matching serializer
+vocabulary in both instruction-set slices, but left the mapper kernel lifecycle open. A follow-up
+arm64 investigation paired the mapper producer and consumer, perturbed serializer properties one
+at a time, followed rollback paths, and observed the representative mapper form on a driven boot.
+That evidence establishes descriptor composition, identity width, view/backing separation, and the
+ordinary mapper view ownership relation. It does not establish every teardown race.
 
-The sanity check used three evidence grades, and the plan must not silently promote one into
-another:
+Keep five evidence strengths distinct during implementation:
 
-1. Interface and symbol presence establishes that two concepts or operations exist separately. It
-   does not establish ownership, ordering, success behavior, or that every advertised combination
-   is reachable.
-2. A followed call relationship establishes the ordering visible in that implementation. The
-   mapping-release sequence below is in this grade; it is stronger than a method-name inventory
-   and narrower than a cross-pathway rule.
-3. Matching serializer selectors and record producers in both instruction-set slices establish a
-   shared user-space vocabulary for those forms. They do not establish a shared kernel storage
-   model. Mapper object ownership therefore remains unknown even where both slices name the same
-   construction.
+1. Interface and symbol presence establishes that concepts or operations exist separately, not
+   their ownership or ordering.
+2. Paired producer and consumer analysis establishes a field, transition, or interpretation in
+   the followed implementation.
+3. A controlled serializer oracle establishes which source property selects or populates a wire
+   form; correlation without a matching producer or consumer does not earn a semantic name.
+4. A driven pathway boot establishes that the observed form and transition are exercised on that
+   pathway, not that every accepted form is reachable.
+5. A statically followed failure path establishes its intended rollback ordering; timing,
+   interruption, and race behavior still require a driven fault experiment.
 
 Two negative conclusions are architectural inputs too. First, the guest contract evidence does
 not expose a unified-versus-discrete resource lifecycle; that classification is a host capability
-and may only select executor placement and transfer plans. Second, no available mapper-side kernel
-lifecycle establishes that a mapper reference is a page-table mapping, a registered surface, or an
-owned backing. The core must represent the unknown relation without guessing any of those three.
+and may only select executor placement and transfer plans. Second, `MapperSurfaceRef` is a 64-bit
+mapper-service lookup identity, not a page-table `MappingId`, registered backing ID, or storage
+owner. A mapper view retains its mapper-resolved surface/host representation; it does not own the
+mapper mapping or backing storage.
+
+The most dangerous disproven mapper assumption is stronger than a field-width correction:
+`MapperSurfaceRef` cannot be collapsed into the x86 registered-backing model or into a page-table
+mapping. The arm object uses it to resolve a surface for view construction; the resulting view
+holds a surface/host-representation retain. The mapper registry entry, mapper memory, task object,
+host view, IOSurface backing, and any GPU address-space mapping therefore remain separate graph
+nodes with explicit edges. Numeric coincidence between any of their external names has no
+semantic force.
 
 The audit maps contract evidence to architecture as follows:
 
 | Contract distinction | Architectural consequence | Confidence boundary |
 |---|---|---|
-| Task resource heap, resource-heap namespace, object handles, resources, memory maps, and page table are separate interfaces | Separate namespace, resource, storage, mapping, and address-space identities | Established on the PCI lifecycle; mapper kernel ownership remains open |
+| Task resource heap, resource-heap namespace, object handles, resources, memory maps, and page table are separate interfaces | Separate namespace, resource, storage, mapping, and address-space identities | Established on PCI and for ordinary mapper construction; teardown races remain open |
 | Object-table entries expose a resource index while serializer object families expose their own create/get/delete-by-reference APIs | `ObjectTableRef` and `SerializerRef<T>` are different types and never key the same map | Established by static interface shape plus the existing driven-boot collision evidence; static names alone would not prove independence |
 | Mapping commit allocates page-table coverage; mapping release synchronizes for unwire, retires child host resources, submits release work, then deallocates page-table coverage | Mapping release is an ordered core transition with backend release effects, not a cache deletion | Established for the PCI pathway only |
+| Mapper memory has no ordinary GPU virtual address or page-table commit; its release queues synchronize/discard rather than applying the PCI deallocation sequence | Keep mapper paging and teardown behind the arm pathway policy | Normal transition established; interruption remains open |
 | Resource backing replacement is an operation on an existing resource | Preserve resource identity and advance a backing generation/storage edge | Established; exact failure ordering is not |
 | Segment resource lists independently initialize, update in-channel, prepare, and complete; queue processing parses them and writes invalidations | Preserve segment boundaries and the complete resource-participation envelope through execution | Established |
-| IOSurface construction carries descriptor and plane; mapper capability, mapper-reference texture/buffer, and display-mapper capability are distinct interface concepts | Name the object class semantically, but keep mapper reference, IOSurface backing, view, and display use as separate relations | Class established; mapper storage ownership and descriptor tails remain open |
+| The mapper texture object is a 64-bit mapper reference followed by one complete nested IOSurface-texture serializer operation | Decode `MapperIOSurfaceTextureView` as a typed envelope; reuse the nested operation decoder and keep mapper reference, backing, view, and display use as separate relations | All accepted descriptor variants established; private producer fields remain typed opaque values |
+| A mapper view retains the resolved surface/host representation but does not own the mapper mapping or backing storage | Share the semantic IOSurface view relation, not construction, coherency, paging, discard, or teardown policy | Ordinary ownership and rollback established; task-exit, live-reset, interrupted-teardown, and display-retirement races remain open |
+| Mapper textures have no-op prepare/synchronize, mapper buffers materialize lazily and discard only that materialization, while x86 reference textures delegate coherency to a retained registered backing | Put prepare, synchronize, and discard behind capability-returning pathway policy; never infer equivalence from matching method names | Established for ordinary operations and statically followed rollback; race and interruption outcomes remain open |
 | Display begin, validate, submit, completion query/signal, framebuffer resource, and resource-heap operations are distinct | Display is a core transaction completed from presenter/executor facts | Established for the PCI display lifecycle |
 | Object tables, mapper IOSurfaces, display mapper surfaces, heaps, buffer-from-IOSurface, discard, and synchronize/discard are independently advertised features | Guest protocol capabilities are a typed profile independent of host Vulkan capabilities | Established as independently named capabilities; availability combinations still require tests |
 
 This table is deliberately not a wire-layout ledger. Exact offsets, opcode values, and binary
 provenance stay out of the architecture plan; they belong at the decoding boundary and in local
 investigation notes.
+
+### Mapper contract now available to the refactor
+
+The mapper envelope has exactly three accepted semantic variants: legacy narrow,
+rotation-capable narrow, and rotation-capable wide. Each is an eight-byte mapper reference followed
+by one complete nested texture serializer operation. Plane is a two-byte field in every form;
+rotation is a separate two-byte field in the versioned forms. Verified unwritten bytes are not
+semantic fields. Private producer flags and one forwarded descriptor member remain intentionally
+opaque. An unfamiliar tag/length pair is not a fourth guessed form; it is a typed refusal.
+
+The common abstraction justified by this evidence is deliberately small. It may carry the typed
+descriptor, plane, optional rotation, canonical surface relation, view kind, host representation,
+and typed effects such as `ReleaseView`, `ReleaseSurfaceRetain`,
+`DiscardHostMaterialization`, `DeleteHostRepresentation`, and `RetireBacking`. It must not prescribe
+one construction, retention, coherence, paging, discard, or teardown algorithm for both pathways.
+Those remain arm-mapper and x86-registered-surface policies behind the common semantic view
+contract.
 
 ### Conclusions that changed or constrained the design
 
@@ -173,11 +952,11 @@ investigation notes.
 - Mapping teardown is modeled as an ordered transition because the PCI implementation first
   synchronizes affected resources for unwire, then retires child host resources, submits release
   work, and only then deallocates page-table coverage. The mapper pathway does not inherit that
-  sequence until equivalent evidence exists.
-- Numeric object names stop at the decode boundary. The serializer names the tag-11 construction
-  as an IOSurface texture, so that semantic name is established even though the mapper-backed
-  storage relation behind it is not. A known object class and an unknown ownership edge can and
-  should coexist in the type system.
+  sequence: it has no ordinary page-table commit and queues synchronize/discard on release.
+- Numeric object names stop at the decode boundary. Tag 11 is a mapper-backed IOSurface texture
+  view envelope: a 64-bit `MapperSurfaceRef` followed by one complete nested serializer operation.
+  The nested operation supplies the texture declaration, plane, and optional rotation. It is not
+  an opaque mapper-specific tail and it is not a page-table mapping.
 - Object-table and serializer-reference destruction remain separate transitions. Static APIs
   distinguish resource-indexed entries from per-family reference operations, and existing runtime
   evidence demonstrates that equal integers collide without denoting the same object. The core
@@ -213,16 +992,18 @@ first draft. Keep three confidence levels separate during implementation:
   lifecycle. Command-queue processing parses those lists and emits write invalidations.
 - On the PCI lifecycle, mapping release synchronizes affected resources for unwire and retires
   child host resources before page-table coverage is deallocated. This ordering is contractual for
-  that pathway and must not be generalized to the mapper pathway without matching evidence.
+  that pathway and must not be generalized to mapper memory, whose ordinary page-table commit is a
+  no-op and whose release queues synchronize/discard.
 - Command buffers explicitly record resource reads/writes, page-off participation, state
   references, chunks, segments, splits, continuations, and merges.
 - Textures have explicit buffer-backed, parent-texture view, IOSurface-plane, and heap-placement
   construction forms. Buffers and textures retain fields identifying their parent/storage
   relation rather than presenting every view as a fresh allocation.
 - Mapper-capable contract code advertises mapper-backed surfaces and has distinct mapper-reference
-  texture, mapper-reference buffer, and backing-resource classes. This establishes a mapper
-  reference relation; it does not establish the complete lifetime of that backing or equivalence
-  with the registered-surface pathway.
+  texture, mapper-reference buffer, and backing-resource classes. A mapper view retains its
+  resolved surface/host representation, while mapper mapping and backing storage retain separate
+  owners. Construction, coherency, discard, paging, and teardown are not equivalent to the
+  registered-surface pathway.
 - Render, compute, blit, and parallel-render encoders are distinct producers over shared command
   buffer and segment machinery. Resource/heap declarations, barriers, and fences are encoder
   operations in their own right.
@@ -238,11 +1019,13 @@ executor tickets are implementation structures chosen to make the established di
 unrepresentable as accidental aliases. Their exact state enumeration is not claimed to be a wire
 layout.
 
-**Not established by the present static set:** the complete arm mapper object lifecycle, ownership
-of the mapper's backing object, the meaning of undecoded mapper descriptor tails, exact failure
-ordering among every page/resource operation outside the PCI release sequence above, or any host
-unified/discrete placement rule. Those remain gated migrations. Runtime topology equivalence is a
-design invariant to test, not a conclusion obtained from guest code.
+**Not established by the present evidence:** arm task exit while mapper views remain live, reset
+with live mapper mappings, interrupted queued synchronize/discard or host-resource deletion, and
+display retirement relative to ordinary view teardown; exact failure ordering among unrelated
+page/resource operations outside the established pathway sequences; or any host unified/discrete
+placement rule. These are narrow lifecycle gates, not a reason to keep mapper descriptors or
+ordinary view ownership opaque. Runtime topology equivalence remains a design invariant to test,
+not a conclusion obtained from guest code.
 
 The decoded interface is object- and lifecycle-oriented. The target architecture must preserve the
 following contract boundaries rather than replacing them with convenient backend abstractions:
@@ -289,59 +1072,160 @@ draft:
 2. `ExecutionBatch` cannot be only a flat command list plus accessed allocations. It must preserve
    command-buffer and segment boundaries plus the complete submission resource-participation set.
 
-The common serializer implementation is available for both supported architectures, but the
-complete arm-only mapper backing and kernel-side object lifecycle are not established by the
-present static contract set. In particular, do not generalize the x86 resource/backing lifecycle
-into the arm mapper, and do not assign meaning to undecoded tails of mapper-path descriptors. Those
-remain pathway-specific questions requiring arm evidence before the corresponding migration lands.
+The common serializer implementation is available for both supported architectures, and the arm
+mapper envelope and ordinary view ownership have now been established. The nested descriptor is a
+complete serializer operation rather than an opaque mapper tail. Do not generalize the x86
+resource/backing lifecycle into the arm mapper: task-exit, live-reset, interrupted-teardown, and
+display-retirement behavior remain pathway-specific questions.
 
-## Current structural findings
+## Baseline structural findings and remaining seams
 
-The repository's stated layers do not match its actual dependencies.
+The baseline dependency mismatch is now resolved; this section records the resulting boundaries and
+the deliberately retained pathway-specific seams.
 
-- `runtime` says it plans work and makes no GPU API calls, while draw, compute, blit, mapping,
-  writeback, scanout, and presentation call the Vulkan engine directly.
-- `backend::Backend` is effectively a reset hook. `Device<B>` is generic over a backend that does
-  not execute its work.
-- `DeviceState` combines protocol and scheduler state with mappings, host caches, coherency,
-  resident identities, backend imports, retirement ledgers, presentation, and observability.
+- Vulkan execution is concentrated in the executor adapter. Render translation, render executable
+  publication, and render/compute asynchronous translation preflight now cross a device-owned
+  `ShaderTranslationService`; pipeline retention sees only core prepared shader families. Compute
+  reflection, native-module specialization, and executable publication now remain behind that
+  service, while the format-selection rule is core-owned. Draw binding projection, buffer-bound
+  planning, sampled/attachment format classification, and hang diagnostics now cross semantic
+  executor ports. Production runtime calls now reach Vulkan only inside `VulkanExecutor`; drain and
+  census obtain backend diagnostics through the observation service, and the shared sRGB downgrade
+  latch is backend-neutral. Draw execution is split by ownership: resident target
+  identity/currency/Store policy, sampled-source/content resolution, pipeline preflight, shader
+  resource planning, attachment construction, LOAD selection, and executor-request assembly each
+  have a total semantic planner. The remaining orchestration composes those results, executes one
+  immutable prepared draw, and publishes completed Store effects; it imports no Vulkan vocabulary.
+  Fixed-function render state crosses a single
+  semantic normalization seam: primitive, raster, visibility, pass actions, blend, depth compare,
+  and enabled stencil faces either produce typed state or refuse preparation. Semantic request
+  construction now terminates in an immutable `PreparedDraw` carrying exactly one completion
+  route; the executor consumes it, while Store and observation consume only its validated
+  completion. Target identity, resident LOAD, `skip_readback`, and completion ownership now come
+  from one target planner, and fixed-function normalization has its own module. Attachment
+  construction is now a dedicated planner with a total result: expected absence is separate from
+  typed action, source/resolve identity, resolve-compatibility, and pass-geometry refusals, and no
+  partial attachment list can reach execution. Buffer/stage-in, shader relocation, sampled-texture,
+  sampler, and final request construction now have complete planners. Sampler occupancy is shared
+  across stream and reflected declarations; either kind of
+  collision is a typed refusal rather than first-writer-wins execution. Unsupported reflected
+  sampled shapes are no longer coerced to 2D, and an unrepresentable required neutral texture no
+  longer leaves a descriptor hole after merely logging. Final executor-request assembly now also
+  has one owner: `RequestPlanInputs` becomes an immutable core request plus its sole completion
+  route. Pre-submit resource diagnostics consume that finished request from the observation module,
+  and Store routing begins only after execution completion. Preparation and execution failures now
+  meet only in a product-owned attempt envelope: core preparation remains typed, while the executor
+  contributes an opaque but lossless diagnostic. `DrawError` is confined to the executor adapter.
+  Pipeline/interface preflight is now its own total planner, pairing retained pipeline state,
+  semantic blend state, and validated extent before bind planning begins. Shader numbering and
+  directly-bound resource occupancy now have the matching total `ShaderResourcePlan`: buffer
+  loading, fragment relocation, storage binding projection, statically-used descriptor-gap
+  classification, neutral-texture obligation, and framebuffer-fetch admission are decided
+  together. `DrawResourcePlan` composes that internal result with complete sampled-image and sampler
+  planners, so relocation choices and neutral-substitution obligations no longer escape into draw
+  orchestration. LOAD selection now terminates in one `LoadPlan`: guest/host seeds, resident
+  currency, clear state, deferred-content capability, surface target, and GVA load identity are one
+  snapshot consumed by final request assembly. Finally, `PreparedDraw` retains the semantic target
+  resource only when its exact native request has a resident target, and publishes render-target
+  use only after successful executor completion; orchestration no longer combines a completion
+  boolean with a second lookup into the original request. Focused draw, execution-split, and
+  prepared-draw tests and the subsequent full-workspace/dual-target checkpoints pass.
+- The reset-only `Backend` abstraction, generic `Device<B>`, and the later `backend::vulkan`
+  re-export façade have been deleted. `VulkanExecutor` is the concrete product adapter.
+- `runtime::Device` now owns the executor/session and host address materializations. `DeviceState`
+  remains the composition's broad semantic root, but submission lifecycle, translation scheduling,
+  nested child-drain state, mapping validity ordering, sampled-content identity/revalidation,
+  completion publication, mappings, host replicas, retirement effects, presentation, and
+  observations now have distinct owners. `PendingWork`, backing evidence, present backpressure,
+  capture policy, retained-frame state, mapping-role routing, and console/paint state now have
+  transition APIs rather than public peer-field mutation. Completion
+  publication was the first
+  synchronization tranche removed from that field bag: one core-owned state machine now owns
+  coalesced debt, handoff to the ordered publication rail, wait classification, and the progress
+  witness used to retry held FIFO timelines. Drain paths no longer mutate an independent stamp
+  ledger and sequence counter. Translation scheduling likewise owns immutable-translation
+  deferral, sibling FIFO holds, present barriers, episode coalescing, channel retirement, and reset
+  evidence now share one core owner. Runtime scheduling consumes typed hold/barrier results instead
+  of keeping five masks and counters consistent by call ordering.
+  Host alias lifetime is now another owned aggregate: registered task-GVA views and the private
+  release queue move together. Publishing, exact lookup, overlap/task retirement, stale-view
+  replacement, reset drainage, guest-import revocation, view unmapping, and native-resident release
+  cross `HostMaterializationState`; removing a registered view queues its host release in the same
+  transition, and the owner drains imports before aliased views. Runtime no longer mutates the view
+  vector or release-effect list independently.
+  Child-drain publication has also lost its peer active mask. `PendingWork` owns active and pending
+  child sets with atomic activate-and-request and retire transitions; DEFINE, FREE, locked MMIO,
+  lock-free doorbell folding, stranded rescue, and nested sibling draining consume those
+  projections. A channel can no longer be freed from one set while remaining scheduled in the
+  other, or be rung on the lock-free rail without becoming visible to stranded-FIFO rescue.
 - `TaskResource` owns raw descriptor bytes, decoded construction semantics, guest-object lifetime,
-  mapped-surface registration, render-target history, and Vulkan resident leases.
-- `MappingEntry` combines guest mapping lifecycle, page-table state, geometry, content generations,
-  coherency, host views, imports, backend eligibility, and instrumentation.
-- `ComputeStorageResidencyKey` represents mapped surfaces, task-GVA textures, and heap textures by
-  repurposing fields and sentinel zero values instead of carrying a typed variant.
-- The Vulkan engine's guest-derived state is process-global even though QEMU can bind more than one
-  device instance.
-- Topology classification is reasonably centralized, but its consequences are distributed among
-  import, cache, resident, writeback, pinning, batching, and presentation paths.
-- The required `backend-vulkan` feature still shapes hundreds of conditional compilation sites,
-  preserving the source structure of a backend fork that no longer exists.
-- Raw wire names such as `type11` and `type7` persist after decode. Tag 7 has decoded semantic
-  classes; tag 11 is an IOSurface texture construction whose mapper/storage relation still
-  contains arm-specific unknowns. Both need boundary-local names matching only what is
-  established.
-- Draw preparation and Vulkan execution exchange separate wide request structures, both mixing
-  semantic state, resource resolution, transport choices, and mutable output fields.
-
-The missing owner can be summarized as:
-
-```text
-one guest resource
-    |- task resource
-    |- texture-to-mapping association
-    |- mapping entry
-    |- host surface or linear texture
-    |- render-target identity
-    |- compute residency identity
-    |- GVA resource, plane, and store identities
-    |- gather witness
-    |- writeback debt
-    `- Vulkan resident
-```
-
-Deletion, replacement, unmapping, and reset must update several of these representations and queue
-keys for other modules to retire later. No aggregate owns the complete lifetime.
+  mapped-surface registration, and render-target history. Vulkan resident leases have moved to the
+  device executor and are keyed by weak semantic resource lifetimes. Mutable resident read facts
+  now cross separately as one atomic executor snapshot, so querying readiness/currency cannot
+  acquire or release a lifetime lease.
+- `SurfaceMappingEntry` has been split into lifecycle, declaration, page-plan, content, and
+  materialization subobjects, and its registry now owns the `SurfaceId` namespace. Product builds
+  expose no mutable registry lookup outside `DeviceState`; runtime page adoption, revalidation,
+  validity, materialization, import replacement, and owner hints all cross named transitions.
+- `ComputeStorageResidencyKey` now carries a typed `ComputeStorageOrigin` variant for mapped
+  surfaces, task-GVA textures, and heap textures; its former sentinel-zero origin encoding is gone.
+- The Vulkan engine's guest-derived pools, residents, imports, presenter, counters, completion
+  signals, and publication state are device-session owned. Only the physical context and immutable
+  content caches remain process-shared, with weak live-session registration for device loss.
+- Topology classification and placement/batching consequences are centralized. Import availability
+  is separately capability-driven. An end-to-end transfer audit found no second product topology
+  classifier: direct import, GPU gather, CPU staging, scatter, and writeback routes are selected by
+  measured import capability, decoded row/run shape, alignment, aliasing, and destination contract.
+  Those are legitimate plan inputs and should not be forced into unified/discrete modules. The
+  shared transfer-plan vocabulary now sits with bounded guest reads and writes: it separates
+  complete direct/gather/CPU-only read visibility and semantic destination row shape from Vulkan
+  realization. Guest-page transfer, completion ordering, and import lifetime also cross separate
+  executor capabilities. Resident readiness, currency, and reclaim evidence now cross one atomic
+  executor-owned read plan, while semantic lifetime retention remains a distinct capability. The
+  Direct presentation preparation now also returns the exact checked semantic source from one
+  executor transaction; the separately published attached shadow has been deleted. Open-batch
+  transitions share one executor port, and native-window composition receives a presentation
+  boundary error rather than a Vulkan execution error. The presentation request/executor contract
+  now distinguishes unchecked `PresentationSource` intent from `PreparedPresentation`: only the
+  executor's registry/window-policy transition produces the latter, and the device-to-window slot,
+  host-window loop, executor presentation frame, and Vulkan presenter accept only that prepared
+  value. Composition can no longer pass an arbitrary semantic target directly to the native
+  presenter or mistake a request for evidence that the resident rail admitted it. Remaining work
+  in this area is typed presentation completion/lifetime, not another topology branch and not
+  moved lifecycle authority.
+  The device-to-window frame is total as well: `FramePayload` and
+  `WindowPresentationPayload` carry exactly one of prepared resident or CPU BGRA. The former
+  `Vec<u8>` plus `Option<PresentationSource>` shape admitted both sources, neither source, and a CPU
+  fallback whose geometry could disagree with the resident request. Device publication, the
+  host-window slot, the loop-to-executor projection, and executor-to-Vulkan adapter now preserve
+  the one selected payload without reconstructing it from optional peer fields.
+  Successful presentation completion names that same choice as exhaustive
+  `PresentationRoute::{Resident, CpuBgra}` rather than a `direct` boolean. Vulkan may retain a
+  private boolean for its cadence arithmetic, but the executor boundary and host-window consumer
+  cannot invert or silently extend the route meaning.
+  Resident geometry is no longer duplicated outside the prepared value. CPU BGRA carries its own
+  geometry in the CPU payload variant; a resident payload derives geometry from its checked
+  `PresentationSource`. The outer frame owns only publication sequence and payload, so a resident
+  cannot be queued with a second, disagreeing width/height pair.
+  `PresentationSource` construction is atomic and its identity/geometry fields are private after
+  construction. Preparation and native presentation read them through accessors; no intermediate
+  layer can rewrite one term while retaining the other two.
+- The former required `backend-vulkan` feature shaped hundreds of conditional compilation sites,
+  preserving the source structure of a backend fork that no longer existed. Those source forks,
+  the empty compatibility feature, integration-test gates, and QEMU build invocation have now been
+  removed. Vulkan is the product executor; `host-window` is the only optional execution feature.
+- Raw wire names `type11` and `type7` no longer persist after decode. Tag 7 has decoded semantic
+  classes; tag 11 is a `MapperIOSurfaceTextureView` envelope containing a mapper lookup identity
+  and a nested IOSurface-texture operation.
+- Draw preparation now produces an immutable core `PreparedDraw`; Vulkan returns a separate typed
+  completion and cannot mutate the preparation request to publish semantic output. Resource,
+  storage, surface, view, content-version, and native-resident identities remain deliberately
+  distinct, but they are related through the canonical graph and owner-keyed materialization
+  registries rather than reconstructed by duplicated identity maps. Task definition/deletion,
+  object-list replacement, and resource deletion now retire composition-owned bound-buffer
+  materializations in the same typed transition as semantic state. The remaining lifetime work is
+  therefore a transition-by-transition audit of specialized mapper/display teardown—not the
+  absence of a resource aggregate, and not a second topology lifecycle.
 
 ## Target dependency graph
 
@@ -518,6 +1402,9 @@ The graph must express these distinctions directly:
   implementation detail and has its own identity.
 - `MappingId` identifies an address-space mapping. A mapping may expose storage, but is not itself
   the resource or the storage lifetime.
+- `MapperSurfaceRef` is a 64-bit identity in the mapper-service namespace. Resolving it creates an
+  explicit relation to the canonical surface and a retain owned by the materialized host view; it
+  is not an address-space `MappingId` or a storage owner.
 - `SurfaceBackingId` identifies a shared/IOSurface backing independently of any texture view over a
   plane of it.
 - A texture view references a parent resource or storage slice and an exact subresource range.
@@ -565,37 +1452,41 @@ enum TextureStorage {
 }
 ```
 
-The mapper pathway initially carries a typed IOSurface-texture construction record with its
-explicit mapper reference, while the other pathway can resolve a registered surface backing. The
-mapper reference must remain its own pathway-specific identity; do not automatically turn it into
-a page-table `MappingId`, a registered `SurfaceBackingId`, or an owned IOSurface backing merely to
-fit this graph. Normalize those origins only after their shared storage and lifetime semantics are
-established. The actual types may differ, but all identity and lifetime distinctions above must
-remain representable and exhaustive.
+The mapper pathway carries a typed IOSurface-texture view envelope with a 64-bit mapper reference;
+the other pathway resolves a registered surface backing. The mapper reference is a lookup identity
+for a mapper-managed surface relation. It is not a page-table `MappingId`, a registered
+`SurfaceBackingId`, or an owner of IOSurface storage. The view retains the resolved surface/host
+representation, while the mapper mapping and backing storage remain independently owned. The
+actual types may differ, but every identity and lifetime distinction above must remain
+representable and exhaustive.
 
 ### Semantic naming
 
-Raw object tag 11 denotes an IOSurface texture construction on the mapper-capable path. Calling the
-object class `IOSurfaceTexture` is therefore justified; calling it `Type11`, a mapping, or a
-registered surface is not. What remains unresolved is the storage relation and lifetime behind its
-mapper reference. The protocol boundary preserves uninterpreted descriptor-tail variants and
-refuses any operation whose answer depends on them. If arm evidence establishes an owned or shared
-IOSurface-plane backing relation, downstream code should then see the semantic object and that
-relation:
+Raw object tag 11 denotes a mapper-backed IOSurface texture-view envelope. Call the decoded object
+`MapperIOSurfaceTextureView`, not `Type11`, a page-table mapping, or a registered surface. Its first
+field is a 64-bit `MapperSurfaceRef`; the remainder is one complete nested IOSurface-texture
+serializer operation. Decode that nested operation through the same semantic variants used at its
+ordinary boundary: legacy narrow, rotation-capable narrow, and rotation-capable wide. Private
+producer-populated fields remain typed opaque values, verified unwritten bytes are not fields, and
+an unknown tag/length pair is a typed refusal rather than a guessed fourth variant.
+
+Downstream code sees the semantic view and its explicit relation:
 
 ```text
-IOSurfaceTexture {
+MapperIOSurfaceTextureView {
+    mapper_surface: MapperSurfaceRef,
     descriptor: { format, extent, usage, ... },
-    storage: IOSurfacePlane(surface_backing, plane),
+    plane: PlaneIndex,
+    rotation: Option<Rotation>,
 }
 ```
 
-It does not see `type11`, and it does not call the texture itself a mapping. Until the relation is
-fully established, it carries a typed IOSurface-texture descriptor and an explicit
-`MapperSurfaceRef` (or equivalently narrow type) rather than inventing a page-table `MappingId`, a
-registered `SurfaceBackingId`, or an owned IOSurface-plane relation. Raw tag 7 immediately becomes
-`Sampler`, `DepthStencil`, `RenderPipeline`, `ComputePipeline`, or `IndirectCommandBuffer` when its
-decoded discriminator establishes that class; there is no semantic `Type7`.
+It does not see `type11`, and it does not call the texture itself a mapping. Resolution creates an
+explicit edge from the view to the mapper-resolved surface/host representation; it does not turn
+the mapper reference into a page-table `MappingId`, registered `SurfaceBackingId`, or storage
+owner. Raw tag 7 immediately becomes `Sampler`, `DepthStencil`, `RenderPipeline`,
+`ComputePipeline`, or `IndirectCommandBuffer` when its decoded discriminator establishes that
+class; there is no semantic `Type7`.
 
 Raw values may remain on a boundary diagnostic as fields such as `wire_tag=11`. APIs, state fields,
 tests, refusal slugs, and module names use semantic vocabulary.
@@ -610,7 +1501,7 @@ Introduce distinct types for unrelated namespaces:
 - `ObjectTableRef`
 - `SerializerRef<T>`
 - `MappingId`
-- `MapperSurfaceRef`
+- `MapperSurfaceRef` (64-bit wire identity)
 - `SurfaceId`
 - `SurfaceBackingId`
 - `StorageId`
@@ -1123,12 +2014,14 @@ The architecture does not require every field to be known before work begins, bu
 not erase an unknown by folding it into a generic abstraction. These questions gate the named
 families:
 
-- What semantics, if any, live in the undecoded tail variants of the mapper-path IOSurface texture
-  descriptor? Until known, preserve the bytes at the boundary and issue a typed refusal for a case
-  that depends on them.
-- Which parts of mapper-backed IOSurface lifetime and registered-surface/ref-texture lifetime are
-  truly equivalent across pathways? Share the semantic texture/view contract only after this is
-  established; keep pathway construction and teardown distinct meanwhile.
+- For mapper-backed views, what exact retirement behavior applies when (1) a task exits with
+  multiple live views, (2) the device resets with live mapper objects, (3) queued
+  synchronize/discard or child/parent host deletion is interrupted after submission, or (4) a
+  display-bound view retires before or after an ordinary view of the same backing? Keep these
+  teardown transitions in the arm pathway policy until each is driven and expressed as a typed
+  transition. The required experiment must vary prepared/materialized state and both deletion
+  orders, and assert that every surface retain, host representation, task object, and mapper
+  registry entry retires exactly once without a callback through a dead task edge.
 - Beyond the established PCI mapping-release sequence, what are the exact ordering and failure
   rules for resource prepare/complete, page-on/page-off, write invalidation,
   synchronize/discard, and backing deletion around a submitted segment?
@@ -1146,6 +2039,41 @@ to the owning code before migrating behavior that depends on it. Static interfac
 establish shapes and call relationships; pathway-specific behavior still needs verification on the
 pathway that exercises it.
 
+The former mapper descriptor-tail gate is closed. All accepted outer forms contain a 64-bit mapper
+reference followed by a complete nested serializer operation. The shared semantic view relation is
+also established: views and backing storage are separate, and a mapper view retains the resolved
+surface/host representation without owning the mapper mapping or backing. This permits the common
+view interface and resource-graph edges to migrate now. It does not permit shared construction,
+coherency, discard, paging, or teardown policy.
+
+Static analysis has reached its limit on the remaining mapper gate. It establishes intended normal
+ordering and rollback branches, but cannot establish race outcomes involving task death, reset,
+submitted asynchronous work, or display retirement. Those four cases require a driven arm64
+experiment with controlled lifetime and fault boundaries. Until that is available, the correct
+architecture is explicit pathway policy plus typed unresolved transitions—not an inferred common
+lifecycle and not a blocker on the already-established descriptor and ownership migration.
+
+The mapper migration therefore carries this focused verification set:
+
+- semantic fixtures for all three nested variants, including nonzero high mapper-reference bits,
+  separate plane/rotation values, poisoned unwritten bytes, and typed refusal of inconsistent or
+  unfamiliar tag/length pairs;
+- rollback tests at surface lookup, descriptor validation, host texture/buffer creation, wrapper
+  publication, and task-heap insertion, proving that no surface retain or partial host/object edge
+  leaks;
+- two-view deletion tests over one backing, in both orders, proving that each host representation
+  releases once while mapping and backing survive their independent owners;
+- mapper-buffer materialize/discard/rematerialize tests proving that discard removes only the
+  derived host buffer and its surface retain;
+- pathway-dispatch tests proving that mapper texture prepare/synchronize has no transfer effect,
+  x86 reference texture delegates to registered backing, and mapper paging never acquires the PCI
+  page-table transition;
+- nested prepare/complete and child-before-parent deletion tests, including first-wire rollback
+  and missing-child failure;
+- driven arm64 tests for the four unresolved scenarios above. Failure to construct the public
+  graphics device in a controlled guest is an experiment-environment limitation, not permission
+  to infer the missing teardown behavior.
+
 ## Migration sequence
 
 Each phase must have focused tests and keep the affected pathways buildable. Behavior-preserving
@@ -1158,11 +2086,22 @@ Create `reims-vgpu-protocol`.
 
 Move object and command decoding behind semantic types. Introduce separate typed object-table and
 serializer namespaces, resource, storage, surface-backing and mapping IDs plus addresses, lengths,
-formats, actions, and selectors. Replace `type11` with `IOSurfaceTexture` at the decoder boundary
-and eliminate `type7` from decoded values. Carry the mapper reference as its own typed relation; do
-not assign it a page-table mapping identity, registered-surface identity, or owned IOSurface-plane
-storage edge until arm evidence establishes that relation. Preserve mapper and registered-surface
-construction variants until their lifecycle equivalence is established.
+formats, actions, and selectors. Replace `type11` with `MapperIOSurfaceTextureView` at the decoder
+boundary and eliminate `type7` from decoded values. Model the outer object as
+`MapperSurfaceRef(u64)` plus one complete nested IOSurface-texture operation. Reuse the nested
+semantic decoder for its three accepted variants, preserve private producer fields as opaque typed
+values, and refuse unknown tag/length combinations. Carry the mapper reference as its own typed
+relation; do not assign it a page-table mapping identity, registered-surface identity, or owned
+IOSurface-plane storage edge. Preserve mapper and registered-surface construction variants because
+their coherency and teardown policies are demonstrably different.
+
+Two correctness repairs are prerequisites to migrating mapper behavior:
+
+1. widen `MapperSurfaceRef` and the tag-11 decoder from 32 to 64 bits, with a fixture whose high
+   bits are nonzero;
+2. model the rotation-capable narrow and wide tails as a two-byte plane plus two-byte rotation,
+   rather than widening the wide form's complete slot into a four-byte plane. Verify legacy
+   unwritten bytes without interpreting them.
 
 Do not change execution behavior in this phase.
 
@@ -1170,6 +2109,8 @@ Exit criteria:
 
 - protocol fixtures produce the new semantic values;
 - object-table refs and typed serializer refs cannot be interchanged;
+- mapper fixtures retain nonzero high reference bits and decode plane/rotation independently;
+- every accepted nested mapper variant uses the shared semantic operation decoder;
 - unknown tags and ordinals retain typed refusals;
 - new consumers do not branch on raw object tags.
 
@@ -1213,12 +2154,14 @@ Migrate one end-to-end resource family at a time:
 3. buffers and buffer-backed textures;
 4. heaps and heap-placed resources;
 5. pipelines, samplers, depth state, fences, and indirect command buffers;
-6. mapper-backed surface textures, after the arm mapper contract questions above are answered.
+6. mapper-backed surface textures, after the 64-bit reference and plane/rotation wire repairs land.
 
-The mapper family may receive the generic generational identity and minimum-established semantic
-name earlier, but its storage/mapping edges and teardown transitions do not become authoritative
-until their arm-side contract is established. This keeps an evidence gap from becoming a guessed
-cross-pathway abstraction merely because it appeared first in the old implementation.
+The mapper family may now receive its generic generational identity, semantic view relation, and
+explicit edge to the mapper-resolved surface/host representation. Its construction, coherency,
+discard, paging, and teardown behavior remain behind an arm-specific policy. Task-exit, live-reset,
+interrupted-teardown, and display-retirement transitions do not become authoritative core behavior
+until their remaining arm experiments establish them. This keeps a narrow evidence gap from
+becoming a guessed cross-pathway lifecycle merely because the view interface is shared.
 
 During migration, each family has one authoritative representation. A temporary bridge may project
 new state into an old request shape. Do not dual-write old and new lifecycle maps indefinitely, and

@@ -36,18 +36,13 @@
 //! So a `draw_load_mtlb` line is a real event, and the flood this could have
 //! been does not exist on a healthy guest.
 
-use crate::model::DeviceState;
+use crate::model::LoadedFunction;
 use crate::runtime::decode::resource::{decode_function_descriptor, ObjectKind};
 use crate::runtime::draw::host_alloc_len;
 use crate::runtime::host::{HostMemory, HostOps};
+use crate::runtime::Device;
 use crate::runtime::{gva_mem, objects};
 use std::sync::Arc;
-
-/// Immutable function construction state retained for the guest object lifetime.
-#[derive(Debug)]
-pub(crate) struct LoadedFunction {
-    pub mtlb: Arc<[u8]>,
-}
 
 /// LLVM BitcodeWrapperHeader magic `0x0b17c0de` LE.
 ///
@@ -59,7 +54,7 @@ pub const AIR_WRAP_MAGIC: [u8; 4] = [0xde, 0xc0, 0x17, 0x0b];
 const WRAPPER_HEADER_LEN: usize = 0x14;
 
 /// A structural refusal while locating the LLVM BitcodeWrapper inside an MTLB.
-pub use reims_vgpu_vulkan::preparation::MtlbDecline;
+pub use reims_vgpu_core::MtlbDecline;
 
 /// Which rail asked for a function's MTLB container.
 ///
@@ -101,7 +96,7 @@ impl AirLoadRail {
 /// state (a pipeline with no fragment stage, say) that `AGENTS.md` names as a
 /// thing not to log. It stays silent.
 pub fn load_mtlb<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     func_ref: u32,
@@ -111,7 +106,8 @@ pub fn load_mtlb<M: HostMemory + HostOps>(
         return None;
     }
     if let Some(function) = state
-        .task_function_states
+        .task_objects
+        .functions
         .get(task_id, reims_vgpu_protocol::SerializerRef::new(func_ref))
     {
         crate::runtime::drain::note_store_route("function_state_hit");
@@ -177,7 +173,7 @@ pub fn load_mtlb<M: HostMemory + HostOps>(
     let function = Arc::new(LoadedFunction {
         mtlb: Arc::clone(&mtlb),
     });
-    let retained = state.task_function_states.register(
+    let retained = state.task_objects.functions.register(
         task_id,
         reims_vgpu_protocol::SerializerRef::new(func_ref),
         function,
@@ -231,19 +227,14 @@ mod tests {
     use crate::runtime::decode::resource::OBJECT_TYPE_FUNCTION;
 
     use super::*;
-    use crate::contract::endian::{st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
     use crate::runtime::host::FakeHost;
+    use reims_vgpu_core::endian::{st32, st64};
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 
     /// Task 1 with a one-entry object list whose ref 1 holds `object_type`, and
     /// a descriptor blob of `desc` at GVA 0x40.
-    fn task_with_one_object(
-        host: &mut FakeHost,
-        state: &mut DeviceState,
-        object_type: u8,
-        desc: &[u8],
-    ) {
+    fn task_with_one_object(host: &mut FakeHost, state: &mut Device, object_type: u8, desc: &[u8]) {
         let dir_gpa = 2u64 << PAGE_SHIFT_ARM64E;
         let root_gpa = 3u64 << PAGE_SHIFT_ARM64E;
         let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
@@ -280,7 +271,7 @@ mod tests {
     #[test]
     fn both_rails_name_the_rung_that_refused_under_their_own_event() {
         let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         // IOSurface wire tag 11 is not the function tag this loader accepts.
         task_with_one_object(&mut host, &mut state, 11, &[0u8; 0x20]);
 
@@ -310,7 +301,7 @@ mod tests {
     #[test]
     fn an_unbound_function_ref_says_nothing() {
         let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         task_with_one_object(&mut host, &mut state, OBJECT_TYPE_FUNCTION, &[0u8; 0x20]);
 
         for rail in [AirLoadRail::Draw, AirLoadRail::Compute] {

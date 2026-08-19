@@ -6,10 +6,8 @@
 //!
 //! **Serial:** the engine is process-global; all tests take the suite lock.
 
-#![cfg(feature = "backend-vulkan")]
-
 use metal2vulkan::passes::Stage;
-use reims_vgpu::backend::vulkan::engine::{
+use reims_vgpu_vulkan::engine::{
     self, AttachmentInitial, BlendFactor, BlendOp, BlendStateResource, BufferContent, CullMode,
     DepthState, DrawRequest, IndexType, IndexedDrawResource, PrimitiveTopology,
     SampledContentIdentity, SampledImageResource, SampledSource, SamplerCompareFunction,
@@ -24,8 +22,8 @@ use reims_vgpu::backend::vulkan::engine::{
 /// against a resident in guest scanout order — several assert on the byte order
 /// of what they read back. Naming the constant once keeps that premise in one
 /// place and makes a test that wants a different format say so.
-const SURFACE_TEST_FORMAT: reims_vgpu::contract::pixel_format::TexelLayout =
-    reims_vgpu::contract::pixel_format::TexelLayout::Bgra8;
+const SURFACE_TEST_FORMAT: reims_vgpu_core::pixel_format::TexelLayout =
+    reims_vgpu_core::pixel_format::TexelLayout::Bgra8;
 
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -92,7 +90,7 @@ fn translate_words(name: &str, stage: Stage) -> Vec<u32> {
     // helper calls the translator directly, so it has to apply it too — without
     // this the module says binding 96 for a framebuffer-fetch input while the
     // engine binds the input attachment at 192, and the shader reads zero.
-    reims_vgpu::runtime::spirv_bind::widen_sampled_bands(&mut words);
+    reims_vgpu_vulkan::spirv_bind::widen_sampled_bands(&mut words);
     words
 }
 
@@ -110,7 +108,7 @@ fn translate_words(name: &str, stage: Stage) -> Vec<u32> {
 /// The texture band needs no such helper: `TEXTURE_BINDING_BASE` *is*
 /// metal2vulkan's texture base, so widening leaves a texture where it was.
 fn sampler_binding(index: u32) -> u32 {
-    reims_vgpu::runtime::spirv_bind::SAMPLER_BINDING_BASE + index
+    reims_vgpu_vulkan::spirv_bind::SAMPLER_BINDING_BASE + index
 }
 
 fn triangle_spirv() -> (Vec<u32>, Vec<u32>) {
@@ -131,8 +129,10 @@ fn skip_if_no_gpu(err: &str) -> bool {
 
 fn engine_req(vert: &[u32], frag: &[u32], w: u32, h: u32) -> DrawRequest {
     DrawRequest {
-        vert_spirv: std::sync::Arc::new(vert.to_vec()),
-        frag_spirv: std::sync::Arc::new(frag.to_vec()),
+        program: reims_vgpu_core::PreparedRenderProgram {
+            vertex: reims_vgpu_vulkan::m2v_cache::prepare_test_shader(vert.to_vec()),
+            fragment: reims_vgpu_vulkan::m2v_cache::prepare_test_shader(frag.to_vec()),
+        },
         width: w,
         height: h,
         vertex_count: 3,
@@ -449,7 +449,7 @@ fn two_viewports_build_and_bind_a_two_slot_pipeline() {
         },
     ];
     assert_eq!(
-        reims_vgpu::backend::vulkan::engine::viewport_slot_count(&req),
+        reims_vgpu_vulkan::engine::viewport_slot_count(&req),
         2,
         "both lists are two long, so the pipeline must declare two slots"
     );
@@ -488,7 +488,7 @@ fn a_shorter_scissor_list_is_defaulted_rather_than_truncating_the_viewports() {
         height: h,
     }];
     assert_eq!(
-        reims_vgpu::backend::vulkan::engine::viewport_slot_count(&req),
+        reims_vgpu_vulkan::engine::viewport_slot_count(&req),
         2,
         "the longer list decides the count; the single scissor does not truncate it"
     );
@@ -1297,7 +1297,7 @@ fn resident_sample_uses_the_bindings_compatible_format_view() {
         width: 16,
         height: 16,
         generation: 1,
-        format: reims_vgpu::contract::pixel_format::TexelLayout::Bgra8,
+        format: reims_vgpu_core::pixel_format::TexelLayout::Bgra8,
     };
     let mut produce = engine_req(&source_v, &source_f, 16, 16);
     produce.target_identity = Some(source.clone());
@@ -2294,12 +2294,12 @@ fn reflected_static_sampler_descriptor_samples_texture() {
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect::<Vec<_>>();
     assert_eq!(
-        reims_vgpu::runtime::spirv_bind::widen_sampled_bands(&mut frag),
+        reims_vgpu_vulkan::spirv_bind::widen_sampled_bands(&mut frag),
         1,
         "fixture has one sampler in the translator's narrow tail band"
     );
     assert_eq!(
-        reims_vgpu::runtime::spirv_bind::offset_fragment_sampled_resource_bindings(&mut frag),
+        reims_vgpu_vulkan::spirv_bind::offset_fragment_sampled_resource_bindings(&mut frag),
         2,
         "fixture has one sampled image and one constexpr sampler"
     );
@@ -2309,7 +2309,12 @@ fn reflected_static_sampler_descriptor_samples_texture() {
         .find(|binding| binding.kind == ResourceKind::StaticSampler)
         .expect("reflected constexpr sampler");
     reflected.descriptor.expect("static sampler descriptor");
-    let state = reflected.static_sampler.expect("static sampler state");
+    let descriptor =
+        reims_vgpu_vulkan::spirv_bind::reflected_sampler_descriptors(&reflection, true)
+            .into_iter()
+            .find(|descriptor| descriptor.static_state.is_some())
+            .expect("semantic constexpr sampler descriptor");
+    let state = descriptor.static_state.expect("static sampler state");
 
     let (w, h) = (16u32, 16u32);
     let mut req = engine_req(&vert, &frag, w, h);
@@ -2346,7 +2351,7 @@ fn reflected_static_sampler_descriptor_samples_texture() {
     });
     let rgba = [17u8, 91, 203, 255];
     req.sampled_images.push(SampledImageResource {
-        binding: 32 + reims_vgpu::runtime::spirv_bind::FRAG_SAMPLED_RESOURCE_BINDING_OFFSET,
+        binding: 32 + reims_vgpu_vulkan::spirv_bind::FRAG_SAMPLED_RESOURCE_BINDING_OFFSET,
         array_element: 0,
         descriptor_count: 1,
         width: 2,
@@ -2368,8 +2373,7 @@ fn reflected_static_sampler_descriptor_samples_texture() {
     req.samplers.push(
         reims_vgpu::runtime::draw::reflected_static_sampler_resource(
             "fragment",
-            reims_vgpu::runtime::spirv_bind::reflected_sampler_binding(reflected, true)
-                .expect("reflected sampler maps into the executable variant"),
+            descriptor.binding,
             state,
         )
         .expect("map reflected static sampler"),
@@ -2569,7 +2573,7 @@ fn sampled_bgra8_bytes_upload_matches_rgba8_semantic_color() {
 /// is exactly the silent failure this asserts against.
 #[test]
 fn a_view_swizzle_is_performed_by_the_image_view_not_the_cpu() {
-    use reims_vgpu::contract::pixel_format;
+    use reims_vgpu_core::pixel_format;
 
     let _g = engine_test_session();
     let vert = translate_words("textured_quad.air", Stage::Vertex);
@@ -2817,7 +2821,7 @@ fn partial_draw_preserves_a_native_guest_target_seed() {
 /// nothing at all.
 #[test]
 fn an_alpha_only_write_mask_leaves_the_colour_channels_alone() {
-    use reims_vgpu::backend::vulkan::engine::ColorWriteMask;
+    use reims_vgpu_vulkan::engine::ColorWriteMask;
     let _g = engine_test_session();
     let (vert, frag) = triangle_spirv();
     let (w, h) = (16u32, 16u32);
@@ -3265,7 +3269,7 @@ fn gva_chain_resident_single_readback_matches_cpu_seed_chain() {
         width: 16,
         height: 16,
         generation: 0,
-        format: reims_vgpu::contract::pixel_format::TexelLayout::Rgba8,
+        format: reims_vgpu_core::pixel_format::TexelLayout::Rgba8,
     };
     engine::reset_draw_counters();
     let before = engine::counter_snapshot();
@@ -3327,7 +3331,7 @@ fn gva_deferred_store_flush_read_matches_sync_store() {
         width: 16,
         height: 16,
         generation: 0,
-        format: reims_vgpu::contract::pixel_format::TexelLayout::Rgba8,
+        format: reims_vgpu_core::pixel_format::TexelLayout::Rgba8,
     };
     engine::reset_draw_counters();
     let before = engine::counter_snapshot();
@@ -3715,7 +3719,7 @@ fn mrt_rg16float_secondary_builds_and_renders() {
         width: 32,
         height: 32,
         generation: 0,
-        format: reims_vgpu::contract::pixel_format::TexelLayout::Rgba8,
+        format: reims_vgpu_core::pixel_format::TexelLayout::Rgba8,
     };
     let mut mrt = engine_req(&v, &f, 32, 32);
     mrt.target_identity = Some(primary.clone());
@@ -3867,7 +3871,7 @@ fn single_rt_draw_unaffected_by_mrt_path() {
         width: 16,
         height: 16,
         generation: 0,
-        format: reims_vgpu::contract::pixel_format::TexelLayout::Rgba8,
+        format: reims_vgpu_core::pixel_format::TexelLayout::Rgba8,
     };
     assert!(!engine::resident_content_ready(&never));
 }
@@ -3914,7 +3918,7 @@ fn framebuffer_fetch_reads_destination_via_input_attachment() {
 /// changes what the next one sees. Run it on purpose:
 ///
 /// ```sh
-/// cargo test -p reims-vgpu --no-default-features --features backend-vulkan,host-window \
+/// cargo test -p reims-vgpu --no-default-features --features host-window \
 ///   --test vk_engine_parity -- --ignored --nocapture --exact \
 ///   measure_draw_cost_against_pass_size
 /// ```
@@ -4008,7 +4012,7 @@ fn measure_draw_cost_against_pass_size() {
 /// `live=None` with no way to tell which kind they were.
 #[test]
 fn resident_content_state_separates_an_absent_slot_from_an_unstamped_one() {
-    use reims_vgpu::backend::vulkan::engine::ResidentContent;
+    use reims_vgpu_vulkan::engine::ResidentContent;
     let _g = engine_test_session();
     let (v, f) = triangle_spirv();
 

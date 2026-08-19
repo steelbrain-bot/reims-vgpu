@@ -9,142 +9,40 @@ mod state;
 
 pub(crate) use lru_memo::LruBytesMemo;
 pub(crate) use regs::*;
-pub use reims_vgpu_core::{TargetIdentity, TargetKeyDivergence};
+pub use reims_vgpu_core::{
+    ChannelRing, CursorState, DisplayHandshake, DisplayOnlinePoll, DisplaySharedPage,
+    GfxRegisters as GfxRegs, IosfcRegisters as IosfcRegs, MapperCapture, PendingWork,
+    TargetIdentity, TargetKeyDivergence, TaskEntry, TaskTable, GFX_MMIO_SIZE,
+};
 // `GfxRegs` has no in-crate importer and is here for the five doc comments
 // that link `model::GfxRegs::child_doorbell_rung`. `state` is a private
 // `mod`, so this is the only path those links can name — and rustc's
 // unused-import lint cannot see a doc link, so it will call this dead.
+#[cfg(test)]
+pub(crate) use state::SurfaceMappingLifecycle;
 pub use state::{
-    ChannelRing, ComputeStorageOrigin, ComputeStorageResidencyKey, DeviceId, DeviceState,
-    ExecFault, FailEvent, GfxRegs, GuestLinearMemo, GvaBacking, GvaEvictionWitness, GvaHostView,
-    HostLinearTexture, HostSurface, MapperCapture, MappingEntry, PacketFault, PresentBacking,
-    PresentState, RenderFlushWitness, ResourceValidity, SurfaceBackingWalk, SurfaceWriteKind,
-    TaskEntry, TaskResource, TaskResourceLifetimeRef, TaskSamplerState, TaskTable,
-    UnimplementedCommand, GVA_ENCODE_CACHE_BYTE_CAP, GVA_EVICTION_WITNESS_KEYS,
+    ComputeStorageOrigin, ComputeStorageResidencyKey, DeviceId, DeviceResetEffect, DeviceState,
+    ExecFault, FailEvent, GuestLinearMemo, GvaBacking, GvaEvictionWitness, GvaHostView,
+    HostLinearTexture, HostReleaseEffect, HostSurface, LinearMaterializeDecline,
+    LinearReplicaWindow, MappingInvalidationEffect, PacketFault, PresentBacking, PresentState,
+    ResourceValidity, SurfaceBackingWalk, SurfaceMappingEntry, SurfaceWriteKind,
+    TaskDefinitionEffect, TaskDefinitionKind, TaskNamespaceRetirement, TaskResource,
+    TaskResourceLifetimeRef, TranslationHoldAtReset, UnimplementedCommand,
+    GVA_ENCODE_CACHE_BYTE_CAP, GVA_EVICTION_WITNESS_KEYS,
 };
-
-use crate::runtime::{self, host::HostOps};
-
-/// Device instance: protocol state plus its device-owned execution port.
-///
-/// MMIO and drain behavior live in [`crate::runtime`]; this type holds state
-/// and forwards.
-pub struct Device {
-    pub state: DeviceState,
-}
-
-impl Device {
-    /// `page_shift`: [`PAGE_SHIFT_X86`] or [`PAGE_SHIFT_ARM64E`]. Required — no default.
-    pub fn new(id: DeviceId, page_shift: u32) -> Self {
-        Self {
-            state: DeviceState::new(id, page_shift),
-        }
-    }
-
-    #[cfg(feature = "backend-vulkan")]
-    pub fn new_with_executor(
-        id: DeviceId,
-        page_shift: u32,
-        executor: std::sync::Arc<dyn crate::runtime::executor::Executor>,
-    ) -> Self {
-        Self {
-            state: DeviceState::new_with_executor(id, page_shift, executor),
-        }
-    }
-
-    pub fn reset(&mut self) {
-        #[cfg(feature = "backend-vulkan")]
-        {
-            let executor = std::sync::Arc::clone(&self.state.executor);
-            let _scope = executor.enter();
-            executor.reset();
-        }
-        self.state.reset();
-    }
-
-    /// Reset after releasing every HostOps view owned by this guest lifetime.
-    pub fn reset_with_host<H: HostOps>(&mut self, host: &mut H) -> usize {
-        // Backend aliases must die before their contiguous guest-memory views
-        // are unmapped.
-        #[cfg(feature = "backend-vulkan")]
-        let executor = std::sync::Arc::clone(&self.state.executor);
-        #[cfg(feature = "backend-vulkan")]
-        let _scope = executor.enter();
-        #[cfg(feature = "backend-vulkan")]
-        executor.reset();
-        let views = self.state.take_all_host_views();
-        let count = views.len();
-        for (ptr, len) in views {
-            host.unmap_pages(ptr, len);
-        }
-        // Flush detached host views before reset replaces their retirement
-        // ledger.
-        runtime::mapper::flush_retired_views(&mut self.state, host);
-        self.state.reset();
-        count
-    }
-
-    pub fn gfx_read(&mut self, offset: u64, size: u32) -> u64 {
-        #[cfg(feature = "backend-vulkan")]
-        let _scope = self.state.executor.enter();
-        runtime::mmio::gfx_read(&mut self.state, offset, size)
-    }
-
-    pub fn gfx_write<H: runtime::host::HostMemory + HostOps>(
-        &mut self,
-        host: &mut H,
-        offset: u64,
-        data: u64,
-        size: u32,
-    ) {
-        #[cfg(feature = "backend-vulkan")]
-        let _scope = self.state.executor.enter();
-        runtime::mmio::gfx_write(&mut self.state, host, offset, data, size);
-    }
-
-    pub fn iosfc_read(&self, offset: u64, size: u32) -> u64 {
-        #[cfg(feature = "backend-vulkan")]
-        let _scope = self.state.executor.enter();
-        runtime::mmio::iosfc_read(&self.state, offset, size)
-    }
-
-    pub fn iosfc_write<H: runtime::host::HostMemory + HostOps>(
-        &mut self,
-        host: &mut H,
-        offset: u64,
-        data: u64,
-        size: u32,
-    ) {
-        #[cfg(feature = "backend-vulkan")]
-        let _scope = self.state.executor.enter();
-        runtime::mmio::iosfc_write(&mut self.state, host, offset, data, size);
-    }
-
-    /// BH body: drain pending work.
-    ///
-    /// `state.texture_to_mapping` is the authoritative IOSurface texture ref → mapping
-    /// table and is read directly by `runtime/draw`. This used to also
-    /// copy it into the backend on every drain, into a map nothing ever read.
-    pub fn drain<H: runtime::host::HostMemory + HostOps>(&mut self, host: &mut H) {
-        #[cfg(feature = "backend-vulkan")]
-        let _scope = self.state.executor.enter();
-        runtime::drain::drain_pending(&mut self.state, host);
-    }
-
-    #[cfg(test)]
-    pub fn fails(&self) -> &[FailEvent] {
-        &self.state.fails
-    }
-}
+pub(crate) use state::{
+    HostPageView, LoadedComputePipeline, LoadedFunction, StateMutationDecline, SurfaceHostView,
+};
 
 #[cfg(test)]
 mod tests {
     use crate::model::{PAGE_SHIFT_ARM64E, PAGE_SIZE_ARM64E, PAGE_SIZE_X86};
 
     use super::*;
-    use crate::contract::endian::st32;
     use crate::runtime::host::{HostActionKind, HostMemory};
+    use crate::runtime::Device;
     use crate::runtime::FakeHost;
+    use reims_vgpu_core::endian::st32;
 
     #[test]
     fn stamp_slot_offset_respects_guest_page_size() {
@@ -163,34 +61,91 @@ mod tests {
     #[test]
     fn reset_view_collection_detaches_every_guest_alias() {
         let mut d = dev();
-        d.state.pending_host_releases.retire_view((0x1000, 0x2000));
-        d.state.mappings.insert(
+        let import = std::sync::Arc::new(
+            crate::runtime::guest_ram::GuestRamImport::new_host_allocation(0x3000, 0x4000, 0x1000)
+                .expect("aligned test import"),
+        );
+        let import_id = import.id();
+        d.state.host_materializations.retire_view((0x1000, 0x2000));
+        let mut view = SurfaceHostView::new(
+            0x3000,
+            0x4000,
+            reims_vgpu_memory::GuestPageFootprint::new(
+                [0x3000, 0x4000, 0x5000, 0x6000].into(),
+                0x1000,
+            )
+            .expect("test footprint"),
+        )
+        .expect("valid host view");
+        assert!(view.replace_import(import).is_none());
+        let mut materialization = super::state::SurfaceMaterialization::default();
+        materialization.install(view);
+        d.state.surfaces.mappings.insert(
             7,
-            MappingEntry {
-                contig_ptr: 0x3000,
-                contig_len: 0x4000,
+            SurfaceMappingEntry {
+                materialization,
                 ..Default::default()
             },
         );
-        d.state.gva_host_views.push(GvaHostView {
+        d.state.host_materializations.publish_gva_view(GvaHostView {
             task_id: 1,
             gva: 0x8000,
             length: 0x1000,
-            ptr: 0x5000,
-            ptr_len: 0x6000,
+            host_view: HostPageView::new(0x5000, 0x6000),
             ..Default::default()
         });
 
-        let mut views = d.state.take_all_host_views();
+        let effects = d.state.take_all_host_release_effects();
+        assert_eq!(
+            effects.first(),
+            Some(&HostReleaseEffect::RetireGuestImport(import_id)),
+            "an import must be revoked before any aliased view is unmapped"
+        );
+        let mut views: Vec<_> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                HostReleaseEffect::ReleaseView { ptr, len } => Some((*ptr, *len)),
+                HostReleaseEffect::RetireGuestImport(_)
+                | HostReleaseEffect::RetireLinearResident(_) => None,
+            })
+            .collect();
         views.sort_unstable();
         assert_eq!(
             views,
             vec![(0x1000, 0x2000), (0x3000, 0x4000), (0x5000, 0x6000)]
         );
-        assert!(d.state.pending_host_releases.views().is_empty());
-        assert!(d.state.gva_host_views.is_empty());
-        assert_eq!(d.state.mappings[&7].contig_ptr, 0);
-        assert_eq!(d.state.mappings[&7].contig_len, 0);
+        assert!(d.state.host_materializations.queued_views().is_empty());
+        assert!(d.state.host_materializations.views().is_empty());
+        assert!(!d.state.surfaces.mappings[&7].materialization.has_view());
+    }
+
+    #[test]
+    fn a_mapping_host_view_cannot_split_its_pointer_length_and_footprint() {
+        let footprint = reims_vgpu_memory::GuestPageFootprint::new([0x1000, 0x2000].into(), 0x1000)
+            .expect("two-page footprint");
+        assert!(SurfaceHostView::new(0x3000, 0x1000, footprint.clone()).is_none());
+        assert!(SurfaceHostView::new(0, 0x2000, footprint.clone()).is_none());
+        assert!(SurfaceHostView::new(0x3000, 0, footprint).is_none());
+    }
+
+    #[test]
+    fn replacing_a_mapping_import_retires_the_previous_identity() {
+        let footprint = reims_vgpu_memory::GuestPageFootprint::new([0x1000].into(), 0x1000)
+            .expect("one-page footprint");
+        let mut view = SurfaceHostView::new(0x3000, 0x1000, footprint).expect("valid view");
+        let first = std::sync::Arc::new(
+            reims_vgpu_memory::GuestRamImport::new_host_allocation(0x3000, 0x1000, 0x1000)
+                .expect("first import"),
+        );
+        let first_id = first.id();
+        assert!(view.replace_import(std::sync::Arc::clone(&first)).is_none());
+
+        let replacement = std::sync::Arc::new(
+            reims_vgpu_memory::GuestRamImport::new_host_allocation(0x3000, 0x1000, 0x1000)
+                .expect("replacement import"),
+        );
+        assert_eq!(view.replace_import(replacement), Some(first_id));
+        assert!(first.is_retired());
     }
 
     fn setup_boot_regs(d: &mut Device, h: &mut FakeHost) {
@@ -271,6 +226,7 @@ mod tests {
         assert_eq!(d.iosfc_read(IOSFC_REG_RING_BASE, MMIO_U64), 0x7000_0000);
         assert_eq!(d.iosfc_read(IOSFC_REG_CAPACITY, MMIO_U32), 0x400);
         d.state
+            .registers
             .gfx
             .interrupt_status_gpu
             .store(0x5, std::sync::atomic::Ordering::Release);
@@ -309,20 +265,22 @@ mod tests {
         let start = ring_size - 8;
         write_main_packet(&mut h, start, ROOT_OP_DEFINE_FIFO, 0x11, &payload);
         d.state
+            .registers
             .gfx
             .fifo_read
             .store(start, std::sync::atomic::Ordering::Release);
-        d.state.gfx.fifo_written = start.wrapping_add(total);
-        d.state.pending.main_drain = true;
+        d.state.registers.gfx.fifo_written = start.wrapping_add(total);
+        d.state.scheduling.pending.request_main();
         d.drain(&mut h);
         assert_eq!(
             d.state
+                .registers
                 .gfx
                 .fifo_read
                 .load(std::sync::atomic::Ordering::Acquire),
             start.wrapping_add(total)
         );
-        assert!(d.state.active_child_mask & (1 << 1) != 0);
+        assert!(d.state.scheduling.pending.active_child_mask() & (1 << 1) != 0);
         assert_eq!(h.get_u32(pfn_to_gpa(0x10, PAGE_SHIFT_ARM64E)), 0x11);
         assert!(h.action_count(HostActionKind::IrqGfxPulse) >= 1);
     }
@@ -356,11 +314,12 @@ mod tests {
         st32(&mut payload[DEVICE_INFO_TAHOE_REPLY_PFN..], reply_pfn);
         write_main_packet(&mut h, 0, ROOT_OP_DEVICE_INFO_TAHOE, 3, &payload);
         d.state
+            .registers
             .gfx
             .fifo_read
             .store(0, std::sync::atomic::Ordering::Release);
-        d.state.gfx.fifo_written = PACKET_HEADER_LEN + 12;
-        d.state.pending.main_drain = true;
+        d.state.registers.gfx.fifo_written = PACKET_HEADER_LEN + 12;
+        d.state.scheduling.pending.request_main();
         d.drain(&mut h);
         assert_eq!(
             h.get_u32(pfn_to_gpa(reply_pfn, PAGE_SHIFT_ARM64E)),
@@ -413,11 +372,12 @@ mod tests {
         st32(&mut payload[DEVICE_INFO_TAHOE_REPLY_PFN..], reply_pfn);
         write_main_packet(&mut h, 0, ROOT_OP_DEVICE_INFO_TAHOE, 3, &payload);
         d.state
+            .registers
             .gfx
             .fifo_read
             .store(0, std::sync::atomic::Ordering::Release);
-        d.state.gfx.fifo_written = PACKET_HEADER_LEN + 12;
-        d.state.pending.main_drain = true;
+        d.state.registers.gfx.fifo_written = PACKET_HEADER_LEN + 12;
+        d.state.scheduling.pending.request_main();
         d.drain(&mut h);
 
         // Walk the reply the way the guest does: pairs until the zero
@@ -489,11 +449,12 @@ mod tests {
             st32(&mut payload[DEVICE_INFO_TAHOE_REPLY_PFN..], reply_pfn);
             write_main_packet(&mut h, 0, ROOT_OP_DEVICE_INFO_TAHOE, 3, &payload);
             d.state
+                .registers
                 .gfx
                 .fifo_read
                 .store(0, std::sync::atomic::Ordering::Release);
-            d.state.gfx.fifo_written = PACKET_HEADER_LEN + 12;
-            d.state.pending.main_drain = true;
+            d.state.registers.gfx.fifo_written = PACKET_HEADER_LEN + 12;
+            d.state.scheduling.pending.request_main();
             let before = (
                 store_route_count("device_info_key_holes"),
                 store_route_count("device_info_key_tail"),
@@ -598,7 +559,7 @@ mod tests {
         d.gfx_write(&mut h, GFX_REG_VERSION, 0x3e, MMIO_U32);
         d.state.define_task(1, 0x1000, 5);
         d.state.map_surface(7);
-        d.state.record_fail(FailEvent::UnknownRootOpcode {
+        d.record_fail(FailEvent::UnknownRootOpcode {
             opcode: 0xff,
             total_size: 12,
         });
@@ -607,7 +568,7 @@ mod tests {
         // A reset removes the task entirely rather than clearing a slot in
         // place, so the question is liveness and not a flag on a resident entry.
         assert!(!d.state.tasks.is_active(1));
-        assert!(d.state.mappings.is_empty());
+        assert!(d.state.surfaces.mappings.is_empty());
         assert!(d.fails().is_empty());
     }
 
@@ -617,12 +578,12 @@ mod tests {
         d.state.define_task(2, 0x2000, 9);
         assert!(d.state.set_object_list(2, 3, 64));
         assert!(d.state.insert_object(2, 10));
-        assert!(d.state.objects.contains(&(2, 10)));
+        assert!(d.state.fixtures.objects.contains(&(2, 10)));
         assert!(d.state.delete_object(2, 10));
-        assert!(!d.state.objects.contains(&(2, 10)));
+        assert!(!d.state.fixtures.objects.contains(&(2, 10)));
         d.state.insert_object(2, 1);
         d.state.define_task(2, 0x2000, 9);
-        assert!(d.state.objects.is_empty());
+        assert!(d.state.fixtures.objects.is_empty());
     }
 
     #[test]
@@ -639,13 +600,13 @@ mod tests {
         // (pending.iosfc is set then cleared inside iosfc_write).
         d.iosfc_write(&mut h, IOSFC_REG_PRODUCER, 0x10, MMIO_U32);
         assert!(
-            !d.state.pending.iosfc,
+            !d.state.scheduling.pending.iosfc_requested(),
             "iosfc producer path drains before return"
         );
         assert!(
-            d.state.mappings.contains_key(&7)
+            d.state.surfaces.mappings.contains_key(&7)
                 || !d.fails().is_empty()
-                || d.state.iosfc.consumer > 0
+                || d.state.registers.iosfc.consumer > 0
                 || h.bh_scheduled
         );
     }
@@ -653,13 +614,17 @@ mod tests {
     #[test]
     fn present_and_cursor_model() {
         let mut d = dev();
-        d.state.present.width = 1440;
-        d.state.present.height = 900;
-        d.state.cursor.show = true;
-        d.state.cursor.hot_x = 1;
-        d.state.cursor.hot_y = 2;
-        assert_eq!(d.state.present.width, 1440);
-        assert!(d.state.cursor.show);
+        d.state
+            .presentation
+            .present
+            .set_console_geometry_for_test(1440, 900);
+        d.state.presentation.cursor.set_visible(true);
+        d.state
+            .presentation
+            .cursor
+            .publish_glyph(2, 2, 1, 1, vec![0xff00_0000; 4]);
+        assert_eq!(d.state.presentation.present.console_width(), 1440);
+        assert!(d.state.presentation.cursor.position().visible);
     }
 
     #[test]
@@ -669,11 +634,12 @@ mod tests {
         setup_boot_regs(&mut d, &mut h);
         write_main_packet(&mut h, 0, 0xeeee, 1, &[]);
         d.state
+            .registers
             .gfx
             .fifo_read
             .store(0, std::sync::atomic::Ordering::Release);
-        d.state.gfx.fifo_written = PACKET_HEADER_LEN;
-        d.state.pending.main_drain = true;
+        d.state.registers.gfx.fifo_written = PACKET_HEADER_LEN;
+        d.state.scheduling.pending.request_main();
         d.drain(&mut h);
         assert!(!d.fails().is_empty());
     }
@@ -689,13 +655,15 @@ mod tests {
         let _ = h.write_gpa(ring_base + 2, &0u16.to_le_bytes());
         let _ = h.write_gpa(ring_base + 4, &4u32.to_le_bytes());
         d.state
+            .registers
             .gfx
             .fifo_read
             .store(0, std::sync::atomic::Ordering::Release);
-        d.state.gfx.fifo_written = 12;
-        d.state.pending.main_drain = true;
+        d.state.registers.gfx.fifo_written = 12;
+        d.state.scheduling.pending.request_main();
         let before = d
             .state
+            .registers
             .gfx
             .fifo_read
             .load(std::sync::atomic::Ordering::Acquire);
@@ -703,6 +671,7 @@ mod tests {
         // malformed: head must not advance (or fail recorded)
         assert!(
             d.state
+                .registers
                 .gfx
                 .fifo_read
                 .load(std::sync::atomic::Ordering::Acquire)
@@ -717,35 +686,36 @@ mod tests {
         let mut h = FakeHost::new();
         setup_boot_regs(&mut d, &mut h);
         let ch = 1u32;
-        d.state.active_child_mask |= 1 << ch;
+        d.state.scheduling.pending.activate_children(1 << ch);
         // Minimal child ring setup is covered by main DEFINE_FIFO + drain path.
         let payload = ch.to_le_bytes();
         write_main_packet(&mut h, 0, ROOT_OP_DEFINE_FIFO, 2, &payload);
         d.state
+            .registers
             .gfx
             .fifo_read
             .store(0, std::sync::atomic::Ordering::Release);
-        d.state.gfx.fifo_written = PACKET_HEADER_LEN + 4;
-        d.state.pending.main_drain = true;
+        d.state.registers.gfx.fifo_written = PACKET_HEADER_LEN + 4;
+        d.state.scheduling.pending.request_main();
         d.drain(&mut h);
-        assert!(d.state.active_child_mask & (1 << ch) != 0);
+        assert!(d.state.scheduling.pending.active_child_mask() & (1 << ch) != 0);
     }
 
     #[test]
     fn doorbell_sets_pending_child() {
         let mut d = dev();
         let mut h = FakeHost::new();
-        d.state.active_child_mask = 1 << 3;
+        d.state.scheduling.pending.replace_active_children(1 << 3);
         // Child doorbells publish work and schedule the BH; the vCPU MMIO path
         // must not synchronously consume render work.
         d.gfx_write(&mut h, GFX_REG_CHILD_DOORBELL, 3, MMIO_U32);
         assert_eq!(
-            d.state.pending.child_mask,
+            d.state.scheduling.pending.child_mask(),
             1 << 3,
             "doorbell leaves pending work for the BH"
         );
         assert!(
-            d.state.active_child_mask & (1 << 3) != 0,
+            d.state.scheduling.pending.active_child_mask() & (1 << 3) != 0,
             "doorbell keeps channel active"
         );
         assert!(

@@ -2,19 +2,64 @@
 //!
 //! Capture runs on the iosfc producer MMIO path (guest x19/x21/x22 still hold
 //! the directed handoff from `do_host_mapping_gated`). Resolve builds
-//! `MappingEntry.page_entries` and geometry from MappingInternal + device
+//! `SurfaceMappingEntry.pages.entries` and geometry from MappingInternal + device
 //! descriptor via guest KVA reads ([`HostOps::read_kva`]).
 
-use crate::contract::iosurface_pages::{
-    self, build_table_plan, decode_device_surface, decode_mapper_request_entry, guest_kernel_va,
-    mapper_request_published_entry_offset, mapping_span_bound, read_internal_desc_ptr,
-    read_mapper_identity, read_mapper_internal, validate_mapper_internal, PagesMemory,
-    DEVICE_DESC_LEN, MAPPER_CAPTURE_REG_MAPPER_DEVICE, MAPPER_CAPTURE_REG_MAPPING_INTERNAL,
-    MAPPER_CAPTURE_REG_REQUEST_TYPE, MAPPER_REQUEST_ENTRY_LEN, MAPPER_REQUEST_MAP,
-    MAPPER_REQUEST_UNMAP,
-};
-use crate::model::{DeviceState, MapperCapture};
+use crate::model::MapperCapture;
 use crate::runtime::host::{HostMemory, HostOps, MemError};
+use crate::runtime::Device;
+use reims_vgpu_paging::mapper::{
+    self as iosurface_pages, build_table_plan, guest_kernel_va, read_internal_desc_ptr,
+    read_mapper_identity, read_mapper_internal, validate_mapper_internal, PagesMemory,
+};
+use reims_vgpu_protocol::{
+    decode_device_surface, decode_mapper_request_entry, mapper_request_published_entry_offset,
+    mapping_span_bound, MapperRequestKind, DEVICE_DESC_LEN, MAPPER_REQUEST_ENTRY_LEN,
+};
+
+/* Directed mapper handoff registers captured while the producer is live. */
+pub const MAPPER_CAPTURE_REG_MAPPER_DEVICE: u32 = 19;
+pub const MAPPER_CAPTURE_REG_REQUEST_TYPE: u32 = 21;
+pub const MAPPER_CAPTURE_REG_MAPPING_INTERNAL: u32 = 22;
+
+pub(crate) struct MapperStatusRefusal<'a>(pub(crate) &'a iosurface_pages::Status);
+
+impl crate::observe::Refusal for MapperStatusRefusal<'_> {
+    fn refusal(&self) -> Option<&'static str> {
+        match self.0 {
+            iosurface_pages::Status::Ok => None,
+            iosurface_pages::Status::ErrShortDescriptor(reason)
+            | iosurface_pages::Status::ErrNotKernelVa(reason)
+            | iosurface_pages::Status::ErrInternalRead(reason)
+            | iosurface_pages::Status::ErrInternalOwner(reason)
+            | iosurface_pages::Status::ErrInternalMappingId(reason)
+            | iosurface_pages::Status::ErrInternalSize(reason)
+            | iosurface_pages::Status::ErrInternalFields(reason)
+            | iosurface_pages::Status::ErrPageCount(reason)
+            | iosurface_pages::Status::ErrPageTableRead(reason)
+            | iosurface_pages::Status::ErrPageEntry(reason)
+            | iosurface_pages::Status::ErrNoPageTable(reason) => Some(reason),
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        let class = match self.0 {
+            iosurface_pages::Status::Ok => return Vec::new(),
+            iosurface_pages::Status::ErrShortDescriptor(_) => "short_descriptor",
+            iosurface_pages::Status::ErrNotKernelVa(_) => "not_kernel_va",
+            iosurface_pages::Status::ErrInternalRead(_) => "internal_read",
+            iosurface_pages::Status::ErrInternalOwner(_) => "internal_owner",
+            iosurface_pages::Status::ErrInternalMappingId(_) => "internal_mapping_id",
+            iosurface_pages::Status::ErrInternalSize(_) => "internal_size",
+            iosurface_pages::Status::ErrInternalFields(_) => "internal_fields",
+            iosurface_pages::Status::ErrPageCount(_) => "page_count",
+            iosurface_pages::Status::ErrPageTableRead(_) => "page_table_read",
+            iosurface_pages::Status::ErrPageEntry(_) => "page_entry",
+            iosurface_pages::Status::ErrNoPageTable(_) => "no_page_table",
+        };
+        vec![("class", class.to_string())]
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MapperDecline {
@@ -57,7 +102,7 @@ impl crate::observe::Decline for MapperDecline {
 }
 
 fn refusal_reason(status: &iosurface_pages::Status) -> &'static str {
-    crate::observe::Refusal::refusal(status)
+    crate::observe::Refusal::refusal(&MapperStatusRefusal(status))
         .expect("an IOSurface contract error must carry a refusal reason")
 }
 
@@ -190,22 +235,22 @@ impl<H: HostMemory + HostOps> PagesMemory for MapperMem<'_, H> {
 ///
 /// Call from the iosfc producer MMIO write path before scheduling the drain BH.
 pub fn capture_at_producer<H: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &H,
     producer: u32,
 ) -> Option<MapperCapture> {
-    if producer == 0 || state.iosfc.ring_base == 0 {
+    if producer == 0 || state.registers.iosfc.ring_base == 0 {
         return None;
     }
     let entry_off = mapper_request_published_entry_offset(producer)?;
     let mut e = [0u8; MAPPER_REQUEST_ENTRY_LEN];
-    host.read_gpa(state.iosfc.ring_base + entry_off, &mut e)
+    host.read_gpa(state.registers.iosfc.ring_base + entry_off, &mut e)
         .ok()?;
     let request = decode_mapper_request_entry(&e).ok()?;
-    if request.request_type != MAPPER_REQUEST_MAP && request.request_type != MAPPER_REQUEST_UNMAP {
+    if !request.kind.is_known() {
         return None;
     }
-    if !crate::model::is_mapping_id(request.mapping_id) {
+    if !crate::model::is_surface_mapping_id(request.mapping_id) {
         return None;
     }
 
@@ -236,7 +281,7 @@ pub fn capture_at_producer<H: HostMemory + HostOps>(
             return capture_xreg_failed(mid, producer, decline);
         }
     };
-    if rtype != request.request_type {
+    if MapperRequestKind::from_raw(rtype) != request.kind {
         let decline = MapperDecline::CaptureRequestTypeMismatch;
         note_capture_fail(
             mid,
@@ -244,7 +289,7 @@ pub fn capture_at_producer<H: HostMemory + HostOps>(
             crate::observe::Emit::decline("mapper_capture_fail", &decline)
                 .field("mapping", mid)
                 .field("rtype", rtype)
-                .field("request_type", request.request_type)
+                .field("request_type", request.kind.raw())
                 .render(),
         );
         return None;
@@ -293,7 +338,7 @@ pub fn capture_at_producer<H: HostMemory + HostOps>(
             note_capture_fail(
                 mid,
                 reason,
-                crate::observe::Emit::refusal("mapper_capture_fail", &status)
+                crate::observe::Emit::refusal("mapper_capture_fail", &MapperStatusRefusal(&status))
                     .expect("the error arm cannot carry Status::Ok")
                     .field("mapping", mid)
                     .field("internal", format!("{internal:#x}"))
@@ -309,7 +354,7 @@ pub fn capture_at_producer<H: HostMemory + HostOps>(
         note_capture_fail(
             mid,
             reason,
-            crate::observe::Emit::refusal("mapper_capture_fail", &status)
+            crate::observe::Emit::refusal("mapper_capture_fail", &MapperStatusRefusal(&status))
                 .expect("the non-Ok branch must carry a refusal")
                 .field("mapping", mid)
                 .field("internal", format!("{internal:#x}"))
@@ -321,48 +366,46 @@ pub fn capture_at_producer<H: HostMemory + HostOps>(
     Some(MapperCapture {
         producer,
         mapper_device_kva: mapper,
-        request_type: rtype,
+        request_kind: request.kind,
         mapping_internal: internal,
     })
 }
 
 /// Apply a capture to the mapping named by the just-drained ring entry.
-pub fn apply_capture(state: &mut DeviceState, cap: &MapperCapture, mapping_id: u32) -> bool {
+pub fn apply_capture(state: &mut Device, cap: &MapperCapture, mapping_id: u32) -> bool {
     // Neither branch below releases a deferred writeback window. An IOSurface texture
     // render Store writes guest pages on its own path, so an UNMAP (or a MAP
     // that re-backs the slot with a different MappingInternal, orphaning the
     // old identity) leaves no mapping-keyed render obligation behind, because a
     // render Store lands its frame in guest pages before it returns.
-    if cap.request_type == MAPPER_REQUEST_UNMAP {
-        return state.unmap_surface(mapping_id);
+    match cap.request_kind {
+        MapperRequestKind::Unmap => state.unmap_surface(mapping_id),
+        MapperRequestKind::Map => {
+            state.observe_mapper_device(cap.mapper_device_kva);
+            state.attach_mapping_internal(mapping_id, cap.mapping_internal)
+        }
+        MapperRequestKind::Other(_) => false,
     }
-    if cap.request_type != MAPPER_REQUEST_MAP {
-        return false;
-    }
-    if cap.mapper_device_kva != 0 {
-        state.mapper_device_kva = cap.mapper_device_kva;
-    }
-    state.attach_mapping_internal(mapping_id, cap.mapping_internal)
 }
 
 /// Resolve page table + device-descriptor geometry for a mapped slot.
 ///
 /// Safe to call repeatedly; refreshes pages when `mapping_internal` is set.
 pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &H,
     mapping_id: u32,
 ) -> bool {
-    let Some(m) = state.mappings.get(&mapping_id) else {
+    let Some(m) = state.surfaces.mappings.get(&mapping_id) else {
         return false;
     };
-    if !m.mapped || m.mapping_internal == 0 {
+    if !m.lifecycle.active || m.lifecycle.internal_kva == 0 {
         return false;
     }
-    let internal = m.mapping_internal;
-    let mapper = state.mapper_device_kva;
-    let cached_pages = m.page_entries.len();
-    let cached_table = m.page_table_kva;
+    let internal = m.lifecycle.internal_kva;
+    let mapper = state.mapper_device_kva();
+    let cached_pages = m.pages.entries.len();
+    let cached_table = m.pages.table_kva;
     let had_cached_pages = cached_pages != 0;
     let mem = MapperMem::new(host);
 
@@ -391,26 +434,29 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
                 note_resolve_keep_cached(
                     mapping_id,
                     reason,
-                    crate::observe::Emit::refusal("mapper_revalidate_fallback", &status)
-                        .expect("the error arm cannot carry Status::Ok")
-                        .field("mapping", mapping_id)
-                        .field("pages", cached_pages)
-                        .field("table", format!("{cached_table:#x}"))
-                        .field("internal", format!("{internal:#x}"))
-                        .field("mapper_kva", format!("{mapper:#x}"))
-                        .field("host_reason", host_reason)
-                        .render(),
+                    crate::observe::Emit::refusal(
+                        "mapper_revalidate_fallback",
+                        &MapperStatusRefusal(&status),
+                    )
+                    .expect("the error arm cannot carry Status::Ok")
+                    .field("mapping", mapping_id)
+                    .field("pages", cached_pages)
+                    .field("table", format!("{cached_table:#x}"))
+                    .field("internal", format!("{internal:#x}"))
+                    .field("mapper_kva", format!("{mapper:#x}"))
+                    .field("host_reason", host_reason)
+                    .render(),
                 );
                 return true;
             }
-            // A mapped surface (m.mapped, mapping_internal != 0) whose mapper
+            // A mapped surface (m.lifecycle.active, mapping_internal != 0) whose mapper
             // internal KVA is unreadable is a genuine anomaly, not the
             // not-yet-mapped poll — every downstream present/Store for this
             // mapping then paints black with no reason.
             note_resolve_fail(
                 mapping_id,
                 reason,
-                crate::observe::Emit::refusal("mapper_resolve_fail", &status)
+                crate::observe::Emit::refusal("mapper_resolve_fail", &MapperStatusRefusal(&status))
                     .expect("the error arm cannot carry Status::Ok")
                     .field("mapping", mapping_id)
                     .field("internal", format!("{internal:#x}"))
@@ -427,7 +473,7 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         note_resolve_fail(
             mapping_id,
             reason,
-            crate::observe::Emit::refusal("mapper_resolve_fail", &status)
+            crate::observe::Emit::refusal("mapper_resolve_fail", &MapperStatusRefusal(&status))
                 .expect("the non-Ok branch must carry a refusal")
                 .field("mapping", mapping_id)
                 .field("internal", format!("{internal:#x}"))
@@ -493,11 +539,14 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
                 note_resolve_fail(
                     mapping_id,
                     reason,
-                    crate::observe::Emit::refusal("mapper_device_descriptor_fallback", &status)
-                        .expect("the error arm cannot carry Status::Ok")
-                        .field("mapping", mapping_id)
-                        .field("internal", format!("{internal:#x}"))
-                        .render(),
+                    crate::observe::Emit::refusal(
+                        "mapper_device_descriptor_fallback",
+                        &MapperStatusRefusal(&status),
+                    )
+                    .expect("the error arm cannot carry Status::Ok")
+                    .field("mapping", mapping_id)
+                    .field("internal", format!("{internal:#x}"))
+                    .render(),
                 );
             }
         }
@@ -505,11 +554,15 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
 
     // Texture-path geom (IOSurface texture object dims) refines span for single-plane; for
     // multi-plane, prefer alloc_size already latched from the device descriptor.
-    if let Some(m) = state.mappings.get(&mapping_id) {
-        if m.has_geom && m.width > 0 && m.height > 0 {
-            width = m.width;
-            height = m.height;
-            format = if m.format != 0 { m.format } else { format };
+    if let Some(m) = state.surfaces.mappings.get(&mapping_id) {
+        if m.has_geometry() && m.width_or_zero() > 0 && m.height_or_zero() > 0 {
+            width = m.width_or_zero();
+            height = m.height_or_zero();
+            format = if m.format_or_zero() != 0 {
+                m.format_or_zero()
+            } else {
+                format
+            };
             let desc_slice = device_desc.as_deref().or(m.device_desc_complete());
             if let Some(end) = mapping_span_bound(desc_slice, format, width, height) {
                 min_size = min_size.max(end).max(guest_page);
@@ -535,14 +588,17 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
                 note_resolve_fail(
                     mapping_id,
                     reason,
-                    crate::observe::Emit::refusal("mapper_resolve_fail", &status)
-                        .expect("the error arm cannot carry Status::Ok")
-                        .field("mapping", mapping_id)
-                        .field("width", width)
-                        .field("height", height)
-                        .field("format", format!("{format:#x}"))
-                        .field("min_size", min_size)
-                        .render(),
+                    crate::observe::Emit::refusal(
+                        "mapper_resolve_fail",
+                        &MapperStatusRefusal(&status),
+                    )
+                    .expect("the error arm cannot carry Status::Ok")
+                    .field("mapping", mapping_id)
+                    .field("width", width)
+                    .field("height", height)
+                    .field("format", format!("{format:#x}"))
+                    .field("min_size", min_size)
+                    .render(),
                 );
             }
             return false;
@@ -580,121 +636,87 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
 
     // Read before the `get_mut` below takes `state` mutably.
     let page_shift = state.page_shift;
-    let mut retired = None;
-    let mut retired_import = None;
-    let mut incarnation_changed = false;
-    let mut reprieved = false;
-    let mut pages_changed = false;
-    if let Some(m) = state.mappings.get_mut(&mapping_id) {
-        // A condemned slot (trailing DeleteIOSurfaceBacking2, no resolve
-        // since) compares against the stashed fingerprint: the same plan is
-        // the SAME incarnation — the delete was stale, keep the generation so
-        // the resident and deferred windows stay live (black-band class). A
-        // different plan is a genuine new incarnation.
-        let condemned = m.condemned_entries.take();
-        let prev_pages = m.page_entries.len();
-        (pages_changed, incarnation_changed, reprieved) =
-            plan_adoption_decision(condemned.as_deref(), &m.page_entries, &plan.entries);
-        // New page table ⇒ the contiguous view (and any Metal texture aliasing
-        // it) describe the old pages; retire them before adopting the plan.
-        if m.contig_ptr != 0 && pages_changed {
-            retired = Some((m.contig_ptr, m.contig_len));
-            m.contig_ptr = 0;
-            m.contig_len = 0;
-            m.contig_footprint = None;
-            retired_import = m.contig_import.take().map(|import| {
-                import.retire();
-                import.id()
-            });
-        }
-        if pages_changed {
-            DeviceState::bump_map_generation(m);
-            DeviceState::bump_page_generation(m);
-        }
-        // The guest-physical footprint this incarnation authorises us to write.
-        //
-        // A guest kernel panic names a *physical page* (`pmap_page_protect()
-        // ... pn=0x46b53b`), and nothing this device emitted could be compared
-        // against it — so "did we write there?" was unanswerable, and the
-        // random-victim panic class this project has recorded stayed a signature
-        // with no way to confirm or clear this device — see
-        // `observe::footprint`, which carries that account. Every mapping-rail write is bounded
-        // to the page list adopted here, so the union of these spans over a boot
-        // is exactly the set of pages those writes can reach. A `pn` inside it
-        // is evidence; a `pn` outside every one of them exonerates the rail.
-        //
-        // One line per surface incarnation, not per write: the key is
-        // (mapping, generation) and the generation only moves when the PFNs do,
-        // so this is bounded by how often the guest rewires a surface and is
-        // safe to leave on. min/max over the entries is O(pages) once per
-        // incarnation, against an O(pages) table build that just ran.
-        // Keyed on the ADOPTION, not on `pages_changed`. Two earlier cuts of
-        // this line were silent for entire boots, and both were the
-        // branch-versus-arm trap `runtime::draw::vulkan`'s store-route reporter
-        // states, committed by a change that
-        // cites it. The first logged only when a span resolved, so it could not
-        // distinguish "no span" from "never ran". The second moved to
-        // `pages_changed` on the reasoning that `map_gen` climbing past 100
-        // proved that branch ran — but `bump_map_generation` has five other
-        // call sites, so the generation was never evidence about this one.
-        //
-        // `pages_changed` is genuinely false here even on a first population:
-        // the reprieve path (`condemned` holds the fingerprint, the plan
-        // matches it) repopulates an emptied `page_entries` with
-        // `pages_changed == false`. The adoption below is what every write is
-        // then bounded by, so that is what has to be reported.
-        //
-        // Dedup is `first_sight` on the span itself, which keeps it bounded by
-        // *distinct footprints* rather than by resolve rate — a mapping
-        // re-resolved every frame to the same pages logs once.
-        if let Some((lo, hi)) = entry_gpa_span(&plan.entries, page_shift) {
-            let key = span_first_sight_key(mapping_id, lo, hi, page_shift);
-            if crate::observe::first_sight(SPAN_SEEN_MAPPER, key) {
-                // `src=mapper` against the surface backing adoption site's `src=surface_backing`,
-                // which says which path a surface's page list arrived through.
-                //
-                // Read that field with the latch in mind: until the two sites
-                // were given separate `first_sight` namespaces they shared one,
-                // and on identical keys, so the surface backing site claimed every
-                // footprint it reached first and this one was suppressed for
-                // that footprint permanently. Every `mapping_gpa_span` line in
-                // an x86 boot read `src=surface_backing`, which was taken as evidence that
-                // the page list arrives at the surface backing site — but the latch could
-                // not have produced any other reading. Whether this site is
-                // genuinely quiet is now an open question again, and a driven
-                // boot is what answers it.
-                crate::observe::off(format!(
-                    "mapping_gpa_span mid={mapping_id} gen={} pages={} src=mapper \
+    let page_count = plan.entries.len();
+    let span = entry_gpa_span(&plan.entries, page_shift);
+    let adoption = state
+        .adopt_mapper_surface_plan(
+            reims_vgpu_protocol::SurfaceId::new(mapping_id),
+            plan.entries,
+            plan.page_table_kva,
+            internal,
+            device_desc.as_deref(),
+        )
+        .expect("map_surface published the surface slot");
+    let pages_changed = adoption.pages_changed;
+    let reprieved = adoption.reprieved;
+    let prev_pages = adoption.previous_page_count;
+
+    // The guest-physical footprint this incarnation authorises us to write.
+    //
+    // A guest kernel panic names a *physical page* (`pmap_page_protect()
+    // ... pn=0x46b53b`), and nothing this device emitted could be compared
+    // against it — so "did we write there?" was unanswerable, and the
+    // random-victim panic class this project has recorded stayed a signature
+    // with no way to confirm or clear this device — see
+    // `observe::footprint`, which carries that account. Every mapping-rail write is bounded
+    // to the page list adopted here, so the union of these spans over a boot
+    // is exactly the set of pages those writes can reach. A `pn` inside it
+    // is evidence; a `pn` outside every one of them exonerates the rail.
+    //
+    // One line per surface incarnation, not per write: the key is
+    // (mapping, generation) and the generation only moves when the PFNs do,
+    // so this is bounded by how often the guest rewires a surface and is
+    // safe to leave on. min/max over the entries is O(pages) once per
+    // incarnation, against an O(pages) table build that just ran.
+    // Keyed on the ADOPTION, not on `pages_changed`. Two earlier cuts of
+    // this line were silent for entire boots, and both were the
+    // branch-versus-arm trap `runtime::draw::execution`'s store-route reporter
+    // states, committed by a change that
+    // cites it. The first logged only when a span resolved, so it could not
+    // distinguish "no span" from "never ran". The second moved to
+    // `pages_changed` on the reasoning that `map_gen` climbing past 100
+    // proved that branch ran — but `bump_map_generation` has five other
+    // call sites, so the generation was never evidence about this one.
+    //
+    // `pages_changed` is genuinely false here even on a first population:
+    // the reprieve path (`condemned` holds the fingerprint, the plan
+    // matches it) repopulates an emptied `page_entries` with
+    // `pages_changed == false`. The adoption below is what every write is
+    // then bounded by, so that is what has to be reported.
+    //
+    // Dedup is `first_sight` on the span itself, which keeps it bounded by
+    // *distinct footprints* rather than by resolve rate — a mapping
+    // re-resolved every frame to the same pages logs once.
+    if let Some((lo, hi)) = span {
+        let key = span_first_sight_key(mapping_id, lo, hi, page_shift);
+        if crate::observe::first_sight(SPAN_SEEN_MAPPER, key) {
+            // `src=mapper` against the surface backing adoption site's `src=surface_backing`,
+            // which says which path a surface's page list arrived through.
+            //
+            // Read that field with the latch in mind: until the two sites
+            // were given separate `first_sight` namespaces they shared one,
+            // and on identical keys, so the surface backing site claimed every
+            // footprint it reached first and this one was suppressed for
+            // that footprint permanently. Every `mapping_gpa_span` line in
+            // an x86 boot read `src=surface_backing`, which was taken as evidence that
+            // the page list arrives at the surface backing site — but the latch could
+            // not have produced any other reading. Whether this site is
+            // genuinely quiet is now an open question again, and a driven
+            // boot is what answers it.
+            crate::observe::off(format!(
+                "mapping_gpa_span mid={mapping_id} gen={} pages={} src=mapper \
                      prev_pages={prev_pages} \
                      changed={} lo={lo:#x} hi={:#x} pn_lo={:#x} pn_hi={:#x}",
-                    m.map_generation,
-                    plan.entries.len(),
-                    pages_changed as u8,
-                    hi + (1u64 << page_shift),
-                    lo >> page_shift,
-                    hi >> page_shift,
-                ));
-            }
-        }
-        m.page_entries = plan.entries;
-        m.page_table_kva = plan.page_table_kva;
-        m.mapping_internal = internal;
-        m.mapped = true;
-        if let Some(ref d) = device_desc {
-            m.device_desc = d.clone();
+                adoption.lifecycle_generation,
+                page_count,
+                pages_changed as u8,
+                hi + (1u64 << page_shift),
+                lo >> page_shift,
+                hi >> page_shift,
+            ));
         }
     }
-    if let Some(v) = retired {
-        state.pending_host_releases.retire_view(v);
-    }
-    if let Some(import) = retired_import {
-        state.pending_host_releases.retire_guest_import(import);
-    }
-    if incarnation_changed {
-        // The condemned backing really died and the id now carries a new
-        // surface: drop the prior incarnation's deferred windows before any
-        // access could flush old content through the new pages.
-    } else if reprieved {
+    if reprieved {
         // Wrong-PFN guard on the REPRIEVE path — the blind spot the rewire guard
         // above cannot cover. A reprieve keeps this mapping's page plan WITHOUT
         // bumping `map_generation` (the delete looked stale: the plan still
@@ -751,18 +773,15 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
 ///
 /// `site` names which rewire reached here (`reprieve` or `rewire`) so the two
 /// populations stay separable in the log.
-fn surface_pages_are_exclusively_owned(
-    state: &mut DeviceState,
-    mapping_id: u32,
-    site: &str,
-) -> bool {
+fn surface_pages_are_exclusively_owned(state: &mut Device, mapping_id: u32, site: &str) -> bool {
     let Some((gpa, owner)) = first_surface_page_collision(state, mapping_id) else {
         return true;
     };
     let mine_pages = state
+        .surfaces
         .mappings
         .get(&mapping_id)
-        .map(|m| m.page_entries.len())
+        .map(|m| m.pages.entries.len())
         .unwrap_or(0);
     fail_closed_surface_page_collision(state, mapping_id, gpa, owner, mine_pages, site);
     false
@@ -781,29 +800,30 @@ fn surface_pages_are_exclusively_owned(
 /// which is the worse way round for a detector on the guest-corruption rail.
 ///
 /// Cost O(this_pages + Σ other live pages); called only on a rewire.
-fn first_surface_page_collision(state: &DeviceState, mapping_id: u32) -> Option<(u64, u32)> {
+fn first_surface_page_collision(state: &Device, mapping_id: u32) -> Option<(u64, u32)> {
     let page_shift = state.page_shift;
     let page = state.page_size();
     let page_base = |gpa: u64| gpa & !(page - 1);
-    let m = state.mappings.get(&mapping_id)?;
-    if !m.mapped || m.page_entries.is_empty() {
+    let m = state.surfaces.mappings.get(&mapping_id)?;
+    if !m.lifecycle.active || m.pages.entries.is_empty() {
         return None;
     }
     let mine: std::collections::HashSet<u64> = m
-        .page_entries
+        .pages
+        .entries
         .iter()
-        .filter_map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift))
+        .filter_map(|&e| reims_vgpu_paging::geometry::mapper_entry_gpa(e, page_shift))
         .map(page_base)
         .collect();
     if mine.is_empty() {
         return None;
     }
-    for (&other_id, other) in &state.mappings {
-        if other_id == mapping_id || !other.mapped || other.page_entries.is_empty() {
+    for (other_id, other) in state.surfaces.mappings.iter() {
+        if other_id == mapping_id || !other.lifecycle.active || other.pages.entries.is_empty() {
             continue;
         }
-        for &e in &other.page_entries {
-            if let Some(gpa) = crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift) {
+        for &e in &other.pages.entries {
+            if let Some(gpa) = reims_vgpu_paging::geometry::mapper_entry_gpa(e, page_shift) {
                 if mine.contains(&page_base(gpa)) {
                     return Some((page_base(gpa), other_id));
                 }
@@ -846,7 +866,7 @@ fn note_surface_page_collision(
 /// invalidating the adopted page plan so the next writer must re-resolve instead
 /// of writing through known-bad pages.
 fn fail_closed_surface_page_collision(
-    state: &mut DeviceState,
+    state: &mut Device,
     mapping_id: u32,
     gpa: u64,
     owner: u32,
@@ -854,7 +874,8 @@ fn fail_closed_surface_page_collision(
     path: &str,
 ) {
     note_surface_page_collision(mapping_id, gpa, owner, mine_pages, path);
-    let _ = state.invalidate_mapping_pages(mapping_id);
+    let effect = state.invalidate_mapping_pages(mapping_id);
+    crate::runtime::note_mapping_invalidation(effect);
 }
 
 /// Lowest and highest page-aligned GPA a page-entry list resolves to.
@@ -870,7 +891,7 @@ fn fail_closed_surface_page_collision(
 pub(crate) fn entry_gpa_span(entries: &[u32], page_shift: u32) -> Option<(u64, u64)> {
     let (mut lo, mut hi) = (u64::MAX, 0u64);
     for &e in entries {
-        if let Some(gpa) = crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift) {
+        if let Some(gpa) = reims_vgpu_paging::geometry::mapper_entry_gpa(e, page_shift) {
             lo = lo.min(gpa);
             hi = hi.max(gpa);
         }
@@ -909,31 +930,6 @@ pub(crate) fn span_first_sight_key(mapping_id: u32, lo: u64, hi: u64, page_shift
     (u64::from(mapping_id) << 40) ^ (lo >> page_shift) ^ (hi << 20)
 }
 
-/// Incarnation decision when adopting a freshly resolved page plan into a
-/// mapping slot. `condemned` is the fingerprint a trailing
-/// `DeleteIOSurfaceBacking2` stashed (None when the slot is not condemned).
-///
-/// Returns `(pages_changed, incarnation_changed, reprieved)`:
-/// `incarnation_changed` = the condemned backing really died and the id now
-/// carries different pages (drop the old windows); `reprieved` = the delete
-/// was stale — the plan matches the fingerprint, the same incarnation lives
-/// on (keep generation, resident, deferred windows).
-pub(crate) fn plan_adoption_decision(
-    condemned: Option<&[u32]>,
-    current: &[u32],
-    plan: &[u32],
-) -> (bool, bool, bool) {
-    let pages_changed = match condemned {
-        Some(old) => old != plan,
-        None => current != plan,
-    };
-    (
-        pages_changed,
-        condemned.is_some() && pages_changed,
-        condemned.is_some() && !pages_changed,
-    )
-}
-
 /// True when the cached page table covers the IOSurface texture sample/write span for
 /// the latched geom (archive table build uses the same min_size).
 ///
@@ -942,29 +938,33 @@ pub(crate) fn plan_adoption_decision(
 /// makes Store writeback and sample page walks fail-closed on tiles (Favourites
 /// 249² with ~16 pages vs ~63 required) while the Metal attachment still holds
 /// content. Re-resolve when the span no longer fits.
-pub fn pages_cover_geom(state: &DeviceState, mapping_id: u32) -> bool {
-    let Some(m) = state.mappings.get(&mapping_id) else {
+pub fn pages_cover_geom(state: &Device, mapping_id: u32) -> bool {
+    let Some(m) = state.surfaces.mappings.get(&mapping_id) else {
         return false;
     };
-    if m.page_entries.is_empty() {
+    if m.pages.entries.is_empty() {
         return false;
     }
-    if !m.has_geom || m.width == 0 || m.height == 0 {
+    if !m.has_geometry() || m.width_or_zero() == 0 || m.height_or_zero() == 0 {
         // No geom yet — any non-empty table is acceptable until dims latch.
         return true;
     }
-    let format = if m.format != 0 {
-        m.format
+    let format = if m.format_or_zero() != 0 {
+        m.format_or_zero()
     } else {
         // Match scanout/writeback default when format not latched.
-        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM
+        reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM
     };
-    let Some(span_end) = mapping_span_bound(m.device_desc_complete(), format, m.width, m.height)
-    else {
+    let Some(span_end) = mapping_span_bound(
+        m.device_desc_complete(),
+        format,
+        m.width_or_zero(),
+        m.height_or_zero(),
+    ) else {
         return false;
     };
-    let page_size = crate::contract::iosurface_pages::page_size_of(state.page_shift);
-    let covered = (m.page_entries.len() as u64).saturating_mul(page_size);
+    let page_size = reims_vgpu_paging::geometry::page_size(state.page_shift);
+    let covered = (m.pages.entries.len() as u64).saturating_mul(page_size);
     covered >= span_end.max(page_size)
 }
 
@@ -973,19 +973,20 @@ pub fn pages_cover_geom(state: &DeviceState, mapping_id: u32) -> bool {
 /// Re-resolves when the table is empty, geom is missing, **or** the cached page
 /// count cannot cover the latched W×H sample window (stale early resolve).
 pub fn ensure_resolved_for_scanout<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &H,
     mapping_id: u32,
 ) -> bool {
-    let (mapped, has_internal, empty_pages, has_geom) = match state.mappings.get(&mapping_id) {
-        Some(m) => (
-            m.mapped,
-            m.mapping_internal != 0,
-            m.page_entries.is_empty(),
-            m.has_geom,
-        ),
-        None => return false,
-    };
+    let (mapped, has_internal, empty_pages, has_geom) =
+        match state.surfaces.mappings.get(&mapping_id) {
+            Some(m) => (
+                m.lifecycle.active,
+                m.lifecycle.internal_kva != 0,
+                m.pages.entries.is_empty(),
+                m.has_geometry(),
+            ),
+            None => return false,
+        };
     let needs = mapped
         && has_internal
         && (empty_pages || !has_geom || !pages_cover_geom(state, mapping_id));
@@ -1006,7 +1007,7 @@ pub fn ensure_resolved_for_scanout<H: HostMemory + HostOps>(
 /// Manual / unit-test page lists (`page_table_kva == 0`) keep their entries when
 /// resolve is not available — product MAP always re-resolves once KVA is known.
 pub fn revalidate_mapping_pages<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &H,
     mapping_id: u32,
 ) -> bool {
@@ -1050,34 +1051,35 @@ pub fn revalidate_mapping_pages<H: HostMemory + HostOps>(
 ///   mapped on entry and is unmapped or absent after resolve; teardown raced the
 ///   revalidate, which the entry-side `revalidate_unmapped` cannot see.
 pub fn revalidate_mapping_reason<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &H,
     mapping_id: u32,
 ) -> Option<&'static str> {
-    let Some(m) = state.mappings.get(&mapping_id) else {
+    let Some(m) = state.surfaces.mappings.get(&mapping_id) else {
         return Some("revalidate_gone");
     };
-    if !m.mapped {
+    if !m.lifecycle.active {
         return Some("revalidate_unmapped");
     }
-    let has_internal = m.mapping_internal != 0;
-    let had_live_table = m.page_table_kva != 0;
-    let had_pages = !m.page_entries.is_empty();
+    let has_internal = m.lifecycle.internal_kva != 0;
+    let had_live_table = m.pages.table_kva != 0;
+    let had_pages = !m.pages.entries.is_empty();
     // Whether the resolve below ran at all, and whether it reported success —
     // the two facts that separate the empty-page-list outcomes from each other.
     let mut resolve_ran = false;
     let mut resolve_ok = false;
     if has_internal {
-        let generation_before = m.map_generation;
+        let generation_before = m.lifecycle.generation;
         let started = std::time::Instant::now();
         let resolved = resolve_mapping_backing(state, host, mapping_id);
         resolve_ran = true;
         resolve_ok = resolved;
         let elapsed_us = started.elapsed().as_micros() as u64;
         let (pages_after, generation_after) = state
+            .surfaces
             .mappings
             .get(&mapping_id)
-            .map(|entry| (entry.page_entries.len(), entry.map_generation))
+            .map(|entry| (entry.pages.entries.len(), entry.lifecycle.generation))
             .unwrap_or((0, generation_before));
         if revalidate_timing_is_slow(elapsed_us) {
             crate::observe::off(format!(
@@ -1090,7 +1092,8 @@ pub fn revalidate_mapping_reason<H: HostMemory + HostOps>(
         if !resolved && had_live_table {
             // Product: table was live and is now unreadable — drop PFNs.
             if had_pages {
-                let _ = state.invalidate_mapping_pages(mapping_id);
+                let effect = state.invalidate_mapping_pages(mapping_id);
+                crate::runtime::note_mapping_invalidation(effect);
                 crate::observe::fail(format!(
                     "map_revalidate mid={mapping_id} st=invalidate reason=resolve_fail"
                 ));
@@ -1100,10 +1103,10 @@ pub fn revalidate_mapping_reason<H: HostMemory + HostOps>(
         // No prior live KVA (first resolve miss, or test fixture with manual
         // page_entries only) — fall through to accept non-empty manual list.
     }
-    match state.mappings.get(&mapping_id) {
-        Some(m) if m.mapped && !m.page_entries.is_empty() => None,
-        Some(m) if !m.mapped => Some("revalidate_unmapped_late"),
-        Some(m) if m.condemned_entries.is_some() => Some("revalidate_condemned"),
+    match state.surfaces.mappings.get(&mapping_id) {
+        Some(m) if m.lifecycle.active && !m.pages.entries.is_empty() => None,
+        Some(m) if !m.lifecycle.active => Some("revalidate_unmapped_late"),
+        Some(m) if m.pages.condemned.is_some() => Some("revalidate_condemned"),
         Some(_) if !resolve_ran => Some("revalidate_no_internal"),
         Some(_) if !resolve_ok => Some("revalidate_resolve_miss"),
         Some(_) => Some("revalidate_empty_after_resolve"),
@@ -1191,28 +1194,28 @@ pub enum SurfaceBackingWitness {
 ///
 /// Re-walks the cached page list and reports which exit it took.
 pub fn surface_backing_pages_witness<H: HostMemory>(
-    state: &DeviceState,
+    state: &Device,
     host: &H,
     mapping_id: u32,
 ) -> SurfaceBackingWitness {
-    let Some(m) = state.mappings.get(&mapping_id) else {
+    let Some(m) = state.surfaces.mappings.get(&mapping_id) else {
         return SurfaceBackingWitness::Unwitnessed("no_mapping");
     };
-    let Some(walk) = m.surface_backing_walk else {
+    let Some(walk) = m.pages.surface_walk else {
         // No surface backing walk was ever latched for this mapping, so this witness has
         // never had anything to say about it. The IOSurface texture rail lives here.
         return SurfaceBackingWitness::Unwitnessed("no_walk");
     };
-    if walk.page_generation != m.page_generation {
+    if walk.page_generation != m.pages.generation {
         // The list has been replaced since the walk was latched. The new list
         // may be perfectly good — it simply has no witness of its own yet.
         return SurfaceBackingWitness::Unwitnessed("walk_superseded");
     }
-    if m.page_entries.is_empty() {
+    if m.pages.entries.is_empty() {
         return SurfaceBackingWitness::Unwitnessed("no_pages");
     }
     let page_shift = state.page_shift;
-    let page_size = crate::contract::iosurface_pages::page_size_of(page_shift);
+    let page_size = reims_vgpu_paging::geometry::page_size(page_shift);
     // Checked here as well as by the visitor below, which visits nothing for an
     // inactive task: the two answers are the same refusal, and only this one can
     // say *why* without the reader having to know the visitor's early returns.
@@ -1224,7 +1227,7 @@ pub fn surface_backing_pages_witness<H: HostMemory>(
             "mapping_page_drift mid={mapping_id} task={} reason=task_inactive pages={} \
              (the page table these entries were walked from no longer exists)",
             walk.task_id,
-            m.page_entries.len()
+            m.pages.entries.len()
         ));
         return SurfaceBackingWitness::Unavailable;
     }
@@ -1248,7 +1251,7 @@ pub fn surface_backing_pages_witness<H: HostMemory>(
     // with the redundant descents removed, not a weaker check. A short visit is
     // a refusal, because a walk that stops early has proved nothing about the
     // pages it did not reach.
-    let entries = &m.page_entries;
+    let entries = &m.pages.entries;
     let base_gva = (walk.backing_pfn as u64) << page_shift;
     let span = (entries.len() as u64).saturating_mul(page_size);
     let mut i = 0usize;
@@ -1267,7 +1270,7 @@ pub fn surface_backing_pages_witness<H: HostMemory>(
                 return false;
             };
             let gva = base_gva + (i as u64) * page_size;
-            let cached = crate::contract::iosurface_pages::entry_gpa_shift(entry, page_shift);
+            let cached = reims_vgpu_paging::geometry::mapper_entry_gpa(entry, page_shift);
             let Some(live) = walked else {
                 // No translation now. This used to answer the failed walk with
                 // the GVA, to match the identity fallback that produced the
@@ -1304,8 +1307,8 @@ pub fn surface_backing_pages_witness<H: HostMemory>(
                 return false;
             }
             let live_entry = ((pfn as u32)
-                << crate::contract::iosurface_pages::PAGE_ENTRY_PFN_SHIFT)
-                | crate::contract::iosurface_pages::PAGE_ENTRY_VALID;
+                << reims_vgpu_paging::geometry::MAPPER_PAGE_ENTRY_PFN_SHIFT)
+                | reims_vgpu_paging::geometry::MAPPER_PAGE_ENTRY_VALID;
             if cached != Some(live) {
                 moved = true;
             }
@@ -1347,7 +1350,7 @@ pub fn surface_backing_pages_witness<H: HostMemory>(
 ///
 /// [`surface_backing_pages_witness`] existed for a release with exactly one caller — the
 /// render writeback — while every other write
-/// through `MappingEntry::page_entries` went unchecked. That is not an oversight
+/// through the mapping page plan went unchecked. That is not an oversight
 /// that a second call site fixes: the check has to be *reachable only through*
 /// the write, or the next rail added to this crate arrives unguarded too, and
 /// nothing in review distinguishes it from the guarded ones.
@@ -1382,12 +1385,13 @@ impl PagesVouched {
     /// False once anything has cleared or replaced the list since the walk, so a
     /// funnel that takes a token still refuses when the flush it performs first
     /// invalidates the mapping underneath it.
-    pub fn covers(&self, state: &DeviceState, mapping_id: u32) -> bool {
+    pub fn covers(&self, state: &Device, mapping_id: u32) -> bool {
         self.mapping_id == mapping_id
             && state
+                .surfaces
                 .mappings
                 .get(&mapping_id)
-                .is_some_and(|m| m.page_generation == self.page_generation)
+                .is_some_and(|m| m.pages.generation == self.page_generation)
     }
 }
 
@@ -1409,7 +1413,7 @@ impl PagesVouched {
 /// together would make a boot that never armed the guard indistinguishable from
 /// one with no drift — a count that reads as success when it is the opposite.
 pub fn vouch_mapping_pages_verdict<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &H,
     mapping_id: u32,
 ) -> (PagesVerdict, Option<PagesVouched>) {
@@ -1417,10 +1421,14 @@ pub fn vouch_mapping_pages_verdict<H: HostMemory + HostOps>(
     if verdict == PagesVerdict::Drifted {
         return (verdict, None);
     }
-    let token = state.mappings.get(&mapping_id).map(|m| PagesVouched {
-        mapping_id,
-        page_generation: m.page_generation,
-    });
+    let token = state
+        .surfaces
+        .mappings
+        .get(&mapping_id)
+        .map(|m| PagesVouched {
+            mapping_id,
+            page_generation: m.pages.generation,
+        });
     (verdict, token)
 }
 
@@ -1457,7 +1465,7 @@ pub enum PagesVerdict {
 /// half the change — the kind of divergence that makes an A/B report the rig
 /// rather than the code.
 pub fn mapping_pages_verdict<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &H,
     mapping_id: u32,
 ) -> PagesVerdict {
@@ -1468,27 +1476,24 @@ pub fn mapping_pages_verdict<H: HostMemory + HostOps>(
         SurfaceBackingWitness::Unwitnessed(why) => return PagesVerdict::Unwitnessed(why),
         SurfaceBackingWitness::Repointed(entries) => {
             let Some(walk) = state
+                .surfaces
                 .mappings
                 .get(&mapping_id)
-                .and_then(|m| m.surface_backing_walk)
+                .and_then(|m| m.pages.surface_walk)
             else {
                 return PagesVerdict::Unwitnessed("walk_superseded");
             };
-            if !state.refresh_mapping_pages(mapping_id, entries) {
+            let Some(refresh) = state.refresh_surface_walk_pages(
+                reims_vgpu_protocol::SurfaceId::new(mapping_id),
+                entries,
+                walk,
+            ) else {
                 return PagesVerdict::Drifted;
-            }
-            if let Some(m) = state.mappings.get_mut(&mapping_id) {
-                m.surface_backing_walk = Some(crate::model::SurfaceBackingWalk {
-                    task_id: walk.task_id,
-                    backing_pfn: walk.backing_pfn,
-                    page_generation: m.page_generation,
-                });
-                crate::observe::off(format!(
-                    "mapping_backing_refreshed mid={mapping_id} pages={} page_generation={}",
-                    m.page_entries.len(),
-                    m.page_generation
-                ));
-            }
+            };
+            crate::observe::off(format!(
+                "mapping_backing_refreshed mid={mapping_id} pages={} page_generation={}",
+                refresh.page_count, refresh.page_generation
+            ));
             return PagesVerdict::Refreshed;
         }
         SurfaceBackingWitness::Unavailable => {}
@@ -1517,20 +1522,21 @@ fn revalidate_timing_is_slow(elapsed_us: u64) -> bool {
 /// promises the address for the device lifetime; `unmap_pages` is a no-op on
 /// exactly that host. A transient view is never admitted to a backend import,
 /// so its only users are CPU copies that finish inside their own call.
-pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
+pub fn flush_retired_views<H: HostOps>(state: &mut Device, host: &mut H) {
     // The backend allocation aliases the host view, so revoke the GPU parent
     // first. Existing child images and recorded buffers hold it through their
     // fence-safe retirement; the host view is stable on every backend that can
     // import it, making `unmap_pages` a no-op there until device teardown.
-    let imports = state.pending_host_releases.take_guest_imports();
-    #[cfg(feature = "backend-vulkan")]
-    for import in imports {
-        state.executor.retire_guest_import(import);
-    }
-    #[cfg(not(feature = "backend-vulkan"))]
-    let _ = imports;
-    for (ptr, len) in state.pending_host_releases.take_views() {
-        host.unmap_pages(ptr, len);
+    for effect in state.host_materializations.take_host_view_effects() {
+        match effect {
+            crate::model::HostReleaseEffect::RetireGuestImport(import) => {
+                state.executor.retire_guest_import(import);
+            }
+            crate::model::HostReleaseEffect::ReleaseView { ptr, len } => {
+                host.unmap_pages(ptr, len);
+            }
+            crate::model::HostReleaseEffect::RetireLinearResident(_) => unreachable!(),
+        }
     }
 }
 
@@ -1543,24 +1549,25 @@ pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
 /// here makes full-frame surfaces perform thousands of duplicate QEMU address
 /// translations before the exact same validation in `map_pages`.
 pub fn mapping_page_gpas<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut H,
     mapping_id: u32,
 ) -> Option<Vec<u64>> {
     if !{ revalidate_mapping_pages(state, host, mapping_id) } {
         return None;
     }
-    let m = state.mappings.get(&mapping_id)?;
-    if !m.mapped || m.page_entries.is_empty() {
+    let m = state.surfaces.mappings.get(&mapping_id)?;
+    if !m.lifecycle.active || m.pages.entries.is_empty() {
         return None;
     }
     let page_shift = state.page_shift;
     let gpas: Vec<u64> = m
-        .page_entries
+        .pages
+        .entries
         .iter()
-        .filter_map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift))
+        .filter_map(|&e| reims_vgpu_paging::geometry::mapper_entry_gpa(e, page_shift))
         .collect();
-    if gpas.is_empty() || gpas.len() != m.page_entries.len() {
+    if gpas.is_empty() || gpas.len() != m.pages.entries.len() {
         return None;
     }
     if let Some((gpa, owner)) = { first_control_page_collision(state, &gpas) } {
@@ -1602,7 +1609,7 @@ pub fn mapping_page_gpas<H: HostMemory + HostOps>(
 /// object-list span on every call, which is the cost this function's range-query
 /// shape exists to avoid, to enforce a rule the protocol never states and that
 /// no boot has ever seen violated. Do not re-add it without those GPAs in hand.
-fn first_control_page_collision(state: &DeviceState, gpas: &[u64]) -> Option<(u64, &'static str)> {
+fn first_control_page_collision(state: &Device, gpas: &[u64]) -> Option<(u64, &'static str)> {
     let page = state.page_size();
     let page_base = |gpa: u64| gpa & !(page - 1);
     // Probe the SURFACE, not the control structures. A live task can advertise a
@@ -1626,17 +1633,22 @@ fn first_control_page_collision(state: &DeviceState, gpas: &[u64]) -> Option<(u6
         pages.get(i).copied().filter(|&p| p < end)
     };
 
-    if state.gfx.root_page != 0 && holds((state.gfx.root_page as u64) << state.page_shift) {
-        return Some(((state.gfx.root_page as u64) << state.page_shift, "gfx_root"));
+    if state.registers.gfx.root_page != 0
+        && holds((state.registers.gfx.root_page as u64) << state.page_shift)
+    {
+        return Some((
+            (state.registers.gfx.root_page as u64) << state.page_shift,
+            "gfx_root",
+        ));
     }
     // The main FIFO is as long as the guest said it is, not one page. The ring
     // spans `fifo_length` bytes from the base page — `drain_main_fifo` reads it
     // over exactly that extent, `fifo_start` being the header offset *inside*
     // it — and it is routinely more than one page, so probing only the first
     // let a surface alias the rest of the ring undetected.
-    if state.gfx.fifo_base_page != 0 {
-        let base = (state.gfx.fifo_base_page as u64) << state.page_shift;
-        if let Some(gpa) = holds_range(base, state.gfx.fifo_length.max(1) as u64) {
+    if state.registers.gfx.fifo_base_page != 0 {
+        let base = (state.registers.gfx.fifo_base_page as u64) << state.page_shift;
+        if let Some(gpa) = holds_range(base, state.registers.gfx.fifo_length.max(1) as u64) {
             return Some((gpa, "root_fifo"));
         }
     }
@@ -1646,10 +1658,10 @@ fn first_control_page_collision(state: &DeviceState, gpas: &[u64]) -> Option<(u6
     // units are not established, and sizing a rejection window from a field
     // whose meaning is a guess is how a legitimate surface gets refused. Bound
     // it when a consumer settles whether it counts entries or bytes.
-    if state.iosfc.ring_base != 0 && holds(state.iosfc.ring_base) {
-        return Some((page_base(state.iosfc.ring_base), "iosfc_ring"));
+    if state.registers.iosfc.ring_base != 0 && holds(state.registers.iosfc.ring_base) {
+        return Some((page_base(state.registers.iosfc.ring_base), "iosfc_ring"));
     }
-    for ring in &state.child_rings {
+    for ring in &state.scheduling.child_rings {
         for &gpa in &ring.page_gpas {
             if holds(gpa) {
                 return Some((page_base(gpa), "child_fifo"));
@@ -1688,7 +1700,7 @@ static CONTIG_REFUSED_SERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// shared file-backed alias unreachable and force the scatter paths even when
 /// the host can express the exact view.
 pub fn ensure_contig_view<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut H,
     mapping_id: u32,
 ) -> Option<(usize, usize)> {
@@ -1700,7 +1712,7 @@ pub fn ensure_contig_view<H: HostMemory + HostOps>(
 /// The footprint is retained with an imported GPU resource so synchronizing
 /// that resource never has to reconstruct its backing from a mapping id.
 pub fn ensure_contig_view_with_pages<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut H,
     mapping_id: u32,
 ) -> Option<(usize, usize, std::sync::Arc<[u64]>)> {
@@ -1711,31 +1723,28 @@ pub fn ensure_contig_view_with_pages<H: HostMemory + HostOps>(
     }
     flush_retired_views(state, host);
     {
-        let m = state.mappings.get(&mapping_id)?;
-        if m.contig_ptr != 0 {
-            let Some(footprint) = &m.contig_footprint else {
-                return None;
-            };
-            return Some((m.contig_ptr, m.contig_len, footprint.pages_arc()));
+        let m = state.surfaces.mappings.get(&mapping_id)?;
+        if let Some(view) = m.materialization.view() {
+            return Some((view.ptr(), view.len(), view.footprint().pages_arc()));
         }
         // The negative verdict caches on exactly the key that makes the
         // positive one above safe. Re-deriving it per call collected the page
         // GPAs and rescanned them every time, and said so in the always-on sink
         // every time: 471 757 lines in one 2 900 s boot, the sole prefix ever to
         // trip `log_flood_detected`, at up to 1 826 lines in a one-second window.
-        if m.contig_refused_gen == Some(m.page_generation) {
+        if m.materialization.refused_for(m.pages.generation) {
             CONTIG_REFUSED_SERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return None;
         }
     }
     let gpas = mapping_page_gpas(state, host, mapping_id)?;
-    let page_sz = crate::contract::iosurface_pages::page_size_of(state.page_shift) as usize;
+    let page_sz = reims_vgpu_paging::geometry::page_size(state.page_shift) as usize;
     let physical_runs = reims_vgpu_paging::runs::contig_run_count(&gpas, page_sz as u64);
     let Some(ptr) = host.map_pages(&gpas, page_sz) else {
         let served = CONTIG_REFUSED_SERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let m = state.mappings.get_mut(&mapping_id)?;
-        m.contig_refused_gen = Some(m.page_generation);
-        let generation = m.page_generation;
+        let generation = state.note_surface_materialization_refused(
+            reims_vgpu_protocol::SurfaceId::new(mapping_id),
+        )?;
         // One line per (mapping, page list) rather than per call. Physical run
         // count remains diagnosis: it distinguishes a host that declined even
         // a direct run from one that cannot reconstruct a scattered list.
@@ -1751,10 +1760,18 @@ pub fn ensure_contig_view_with_pages<H: HostMemory + HostOps>(
         std::sync::Arc::clone(&gpas),
         page_sz as u64,
     )?;
-    let m = state.mappings.get_mut(&mapping_id)?;
-    m.contig_ptr = ptr;
-    m.contig_len = len;
-    m.contig_footprint = Some(footprint);
+    let Some(view) = crate::model::SurfaceHostView::new(ptr, len, footprint) else {
+        host.unmap_pages(ptr, len);
+        crate::observe::fail(format!(
+            "contig_view_invalid reason=host_view_invariant mid={mapping_id} ptr={ptr:#x} len={len}"
+        ));
+        return None;
+    };
+    if !state.install_surface_materialization(reims_vgpu_protocol::SurfaceId::new(mapping_id), view)
+    {
+        host.unmap_pages(ptr, len);
+        return None;
+    }
     Some((ptr, len, gpas))
 }
 
@@ -1764,9 +1781,8 @@ pub fn ensure_contig_view_with_pages<H: HostMemory + HostOps>(
 /// it. The import therefore follows the mapping lifetime and is reused by all
 /// of those views. Hosts whose page aliases are transient or backends that did
 /// not publish host-pointer import limits retain the copy-backed paths.
-#[cfg(feature = "backend-vulkan")]
 pub fn ensure_contig_import_with_footprint<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut H,
     mapping_id: u32,
 ) -> Option<(
@@ -1777,7 +1793,12 @@ pub fn ensure_contig_import_with_footprint<H: HostMemory + HostOps>(
         return None;
     }
     let (ptr, len, _pages) = ensure_contig_view_with_pages(state, host, mapping_id)?;
-    let footprint = state.mappings.get(&mapping_id)?.contig_footprint.clone()?;
+    let footprint = state
+        .surfaces
+        .mappings
+        .get(&mapping_id)?
+        .materialization
+        .footprint()?;
     let len = u64::try_from(len).ok()?;
     // This mapping is the guest allocation. Admit its stable alias against the
     // host-pointer contract on its own size; the optional whole-RAMBlock map is
@@ -1793,9 +1814,11 @@ pub fn ensure_contig_import_with_footprint<H: HostMemory + HostOps>(
         }
     };
     if let Some(import) = state
+        .surfaces
         .mappings
         .get(&mapping_id)
-        .and_then(|mapping| mapping.contig_import.as_ref())
+        .and_then(|mapping| mapping.materialization.view())
+        .and_then(|view| view.import())
     {
         if import.host_base() == ptr && import.len() == len && import.align() == align {
             return Some((std::sync::Arc::clone(import), footprint));
@@ -1804,7 +1827,12 @@ pub fn ensure_contig_import_with_footprint<H: HostMemory + HostOps>(
     let import = std::sync::Arc::new(
         crate::runtime::guest_ram::GuestRamImport::new_host_allocation(ptr, len, align).ok()?,
     );
-    state.mappings.get_mut(&mapping_id)?.contig_import = Some(std::sync::Arc::clone(&import));
+    if !state.install_surface_import(
+        reims_vgpu_protocol::SurfaceId::new(mapping_id),
+        std::sync::Arc::clone(&import),
+    ) {
+        return None;
+    }
     Some((import, footprint))
 }
 
@@ -1813,9 +1841,8 @@ pub fn ensure_contig_import_with_footprint<H: HostMemory + HostOps>(
 /// The mapping owns the import and its lifetime; callers supply only the plane
 /// coordinates decoded for their view. This is shared by render and compute so
 /// neither reconstructs a second notion of where a mapped texture lives.
-#[cfg(feature = "backend-vulkan")]
 pub fn guest_texel_source<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut H,
     mapping_id: u32,
     plane_offset: u64,
@@ -1860,24 +1887,20 @@ pub fn guest_texel_source<H: HostMemory + HostOps>(
 /// Each page contributes only its intersection with the byte range, so a write
 /// of one row into a 16 KiB arm64 page marks the frame that row is in and not
 /// the other three.
-pub(crate) fn note_mapping_write_footprint(
-    state: &DeviceState,
-    mapping_id: u32,
-    off: u64,
-    len: u64,
-) {
+pub(crate) fn note_mapping_write_footprint(state: &Device, mapping_id: u32, off: u64, len: u64) {
     if len == 0 {
         return;
     }
-    let Some(m) = state.mappings.get(&mapping_id) else {
+    let Some(m) = state.surfaces.mappings.get(&mapping_id) else {
         return;
     };
     let page_size = state.page_size();
     let page_shift = state.page_shift;
     note_page_write_footprint(page_size, off, len, |i| {
-        m.page_entries
+        m.pages
+            .entries
             .get(i)
-            .map(|&entry| crate::contract::iosurface_pages::entry_gpa_shift(entry, page_shift))
+            .map(|&entry| reims_vgpu_paging::geometry::mapper_entry_gpa(entry, page_shift))
     });
 }
 
@@ -2190,7 +2213,7 @@ pub(crate) fn selected_within(
 /// Callers flush deferred writeback over the range first, and the write
 /// direction re-checks its [`PagesVouched`] after that flush.
 fn copy_mapping_runs<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut H,
     mapping_id: u32,
     off: u64,
@@ -2313,7 +2336,7 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
 /// guest memory ([`vouch_mapping_pages_verdict`]); it is a parameter rather than a call
 /// here because two callers write a row at a time and the walk is per page.
 pub fn write_mapping_bytes<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut H,
     mapping_id: u32,
     off: u64,
@@ -2340,7 +2363,7 @@ pub fn write_mapping_bytes<H: HostMemory + HostOps>(
 /// `mark_mapping_written`, and a pending deferred window left unflushed under
 /// them would land afterwards and put an older frame on top.
 pub fn write_mapping_bytes_only<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut H,
     mapping_id: u32,
     off: u64,
@@ -2391,7 +2414,7 @@ pub fn write_mapping_bytes_only<H: HostMemory + HostOps>(
 
 /// Read mapping linear `[off, off+buf.len())` via packed map_pages runs.
 pub fn read_mapping_bytes<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut H,
     mapping_id: u32,
     off: u64,
@@ -2457,7 +2480,7 @@ pub fn read_mapping_bytes<H: HostMemory + HostOps>(
 /// read: the shape is checked at [`RunCopy::read_rect`] before any page is
 /// touched.
 pub(crate) fn read_mapping_rect<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut H,
     mapping_id: u32,
     off: u64,

@@ -1,8 +1,7 @@
 use super::*;
-use crate::contract::endian::{st16, st32, st64};
-use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+use reims_vgpu_core::endian::{st16, st32, st64};
+use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 
-use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
 use crate::runtime::decode::resource::{
     compute_only_icb_layout, encode_icb_command_layout, list_object_entry_offset,
@@ -14,6 +13,7 @@ use crate::runtime::decode::resource::{
     PIPELINE_TAG_FRAGMENT_FUNC, PIPELINE_TAG_VERTEX_FUNC, RESOURCE_PAGE_SHIFT,
     SERIALIZER_RESOURCE_OBJECT_ICB, SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE,
 };
+use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
 use crate::runtime::gva_mem;
 use crate::runtime::host::FakeHost;
@@ -85,7 +85,7 @@ fn an_icb_decline_renders_its_check_and_its_class() {
 /// the one root cause under 40 `PoisonError`s.
 static ICB_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-fn setup_task(host: &mut FakeHost, state: &mut DeviceState) {
+fn setup_task(host: &mut FakeHost, state: &mut Device) {
     let dir_pfn = 2u32;
     let root_pfn = 3u32;
     let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
@@ -135,9 +135,9 @@ fn icb_test_guard() -> std::sync::MutexGuard<'static, ()> {
 
 /// A device with task 1 defined and its page tables walked — what every body
 /// in this file needs before it can put an object anywhere.
-fn icb_device() -> (FakeHost, DeviceState) {
+fn icb_device() -> (FakeHost, Device) {
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     setup_task(&mut host, &mut state);
     (host, state)
 }
@@ -347,26 +347,12 @@ fn make_stagein_render_pipeline_desc(vert_ref: u32, frag_ref: u32) -> Vec<u8> {
 /// call sites and asserted equal to the slice at every one of them across the
 /// whole suite. A test that needs the two to disagree — a short-descriptor
 /// refusal — calls [`put_list_entry`] directly, which still takes both.
-fn put_object(
-    host: &mut FakeHost,
-    state: &DeviceState,
-    ref_: u32,
-    otype: u8,
-    gva: u64,
-    bytes: &[u8],
-) {
+fn put_object(host: &mut FakeHost, state: &Device, ref_: u32, otype: u8, gva: u64, bytes: &[u8]) {
     gva_mem::write_task_gva_arm64e(host, &state.tasks[1], gva, bytes);
     put_list_entry(host, state, ref_, otype, bytes.len() as u32, gva);
 }
 
-fn put_list_entry(
-    host: &mut FakeHost,
-    state: &DeviceState,
-    ref_: u32,
-    otype: u8,
-    len: u32,
-    gva: u64,
-) {
+fn put_list_entry(host: &mut FakeHost, state: &Device, ref_: u32, otype: u8, len: u32, gva: u64) {
     let off = list_object_entry_offset(ref_, 32).unwrap();
     let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (otype as u32) | (len << 8);
@@ -460,7 +446,7 @@ fn a_flag_this_device_does_not_apply_is_counted_when_the_guest_asks_for_it() {
         // The helper ORs the serializer's default word in, so a flag the guest
         // *clears* has to be cleared after the fact.
         let mut desc = make_icb_desc_bytes_tg(8, 4, 0, set);
-        let word = crate::contract::endian::ld16(&desc[ICB_DESC_FLAGS..]);
+        let word = reims_vgpu_core::endian::ld16(&desc[ICB_DESC_FLAGS..]);
         st16(&mut desc[ICB_DESC_FLAGS..], word & !clear);
         let gva = 1u64 << RESOURCE_PAGE_SHIFT;
         put_object(
@@ -1120,7 +1106,11 @@ fn icb_lifetimes_are_device_owned_generational_and_task_scoped() {
 
     resolve_icb_record(&state_a, &host_a, 1, 9).expect("record first device ICB");
     resolve_icb_record(&state_b, &host_b, 1, 9).expect("record second device ICB");
-    let first = state_a.icb_registry.identity(1, 9).expect("first identity");
+    let first = state_a
+        .task_objects
+        .indirect_command_buffers
+        .identity(1, 9)
+        .expect("first identity");
     bind_icb_command_memory(
         &state_a,
         1,
@@ -1133,7 +1123,8 @@ fn icb_lifetimes_are_device_owned_generational_and_task_scoped() {
     .expect("bind only the first device");
     assert!(
         state_b
-            .icb_registry
+            .task_objects
+            .indirect_command_buffers
             .snapshot(1, 9)
             .expect("second record")
             .command_memory
@@ -1142,24 +1133,28 @@ fn icb_lifetimes_are_device_owned_generational_and_task_scoped() {
     );
 
     let mut changed = state_a
-        .icb_registry
+        .task_objects
+        .indirect_command_buffers
         .snapshot(1, 9)
         .expect("first record")
-        .desc;
+        .descriptor;
     changed.max_kernel_buffer_bind_count += 1;
     state_a
-        .icb_registry
+        .task_objects
+        .indirect_command_buffers
         .record(1, 9, changed)
         .expect("replace changed declaration");
     let changed_identity = state_a
-        .icb_registry
+        .task_objects
+        .indirect_command_buffers
         .identity(1, 9)
         .expect("changed identity");
     assert_eq!(first.index(), changed_identity.index());
     assert_ne!(first.generation(), changed_identity.generation());
     assert!(
         state_a
-            .icb_registry
+            .task_objects
+            .indirect_command_buffers
             .snapshot(1, 9)
             .expect("changed record")
             .command_memory
@@ -1167,20 +1162,31 @@ fn icb_lifetimes_are_device_owned_generational_and_task_scoped() {
         "any declaration change invalidates command memory decoded under the old layout"
     );
 
-    assert!(state_a.icb_registry.delete(1, 9));
-    assert_eq!(state_a.icb_registry.identity(1, 9), None);
+    assert!(state_a.task_objects.indirect_command_buffers.delete(1, 9));
+    assert_eq!(
+        state_a.task_objects.indirect_command_buffers.identity(1, 9),
+        None
+    );
     resolve_icb_record(&state_a, &host_a, 1, 9).expect("recreate deleted ICB");
     let replacement = state_a
-        .icb_registry
+        .task_objects
+        .indirect_command_buffers
         .identity(1, 9)
         .expect("replacement identity");
     assert_eq!(changed_identity.index(), replacement.index());
     assert_ne!(changed_identity.generation(), replacement.generation());
 
-    assert!(state_a.delete_task(1));
-    assert_eq!(state_a.icb_registry.identity(1, 9), None);
+    assert!(state_a.delete_task(1).is_some());
+    assert_eq!(
+        state_a.task_objects.indirect_command_buffers.identity(1, 9),
+        None
+    );
     assert!(
-        state_b.icb_registry.identity(1, 9).is_some(),
+        state_b
+            .task_objects
+            .indirect_command_buffers
+            .identity(1, 9)
+            .is_some(),
         "tearing down one device's task must not touch another device"
     );
 }

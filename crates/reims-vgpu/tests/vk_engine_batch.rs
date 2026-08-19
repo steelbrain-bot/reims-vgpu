@@ -8,10 +8,8 @@
 //!
 //! **Serial:** the engine is process-global; all tests take the suite lock.
 
-#![cfg(feature = "backend-vulkan")]
-
 use metal2vulkan::passes::Stage;
-use reims_vgpu::backend::vulkan::engine::{
+use reims_vgpu_vulkan::engine::{
     self, BufferContent, DepthState, DrawRequest, GuestRun, GuestRunSource, IndexType,
     IndexedDrawResource, PrimitiveTopology, SampledImageResource, SampledSource,
     SamplerCompareFunction, SamplerResource, ScissorResource, StorageBufferResource,
@@ -23,8 +21,8 @@ use reims_vgpu::backend::vulkan::engine::{
 /// against a resident in guest scanout order — several assert on the byte order
 /// of what they read back. Naming the constant once keeps that premise in one
 /// place and makes a test that wants a different format say so.
-const SURFACE_TEST_FORMAT: reims_vgpu::contract::pixel_format::TexelLayout =
-    reims_vgpu::contract::pixel_format::TexelLayout::Bgra8;
+const SURFACE_TEST_FORMAT: reims_vgpu_core::pixel_format::TexelLayout =
+    reims_vgpu_core::pixel_format::TexelLayout::Bgra8;
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -101,8 +99,10 @@ fn batch_req(
     scissor: ScissorResource,
 ) -> DrawRequest {
     DrawRequest {
-        vert_spirv: std::sync::Arc::new(vert.to_vec()),
-        frag_spirv: std::sync::Arc::new(frag.to_vec()),
+        program: reims_vgpu_core::PreparedRenderProgram {
+            vertex: reims_vgpu_vulkan::m2v_cache::prepare_test_shader(vert.to_vec()),
+            fragment: reims_vgpu_vulkan::m2v_cache::prepare_test_shader(frag.to_vec()),
+        },
         width: W,
         height: H,
         vertex_count: 3,
@@ -694,8 +694,10 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
     ];
 
     let mut req = DrawRequest {
-        vert_spirv: std::sync::Arc::new(vert),
-        frag_spirv: std::sync::Arc::new(frag),
+        program: reims_vgpu_core::PreparedRenderProgram {
+            vertex: reims_vgpu_vulkan::m2v_cache::prepare_test_shader(vert),
+            fragment: reims_vgpu_vulkan::m2v_cache::prepare_test_shader(frag),
+        },
         width: W,
         height: H,
         vertex_count: 6,

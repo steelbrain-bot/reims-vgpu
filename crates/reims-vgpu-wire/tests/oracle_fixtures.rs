@@ -747,10 +747,8 @@ const PARTIALLY_WRITTEN: &[(&str, &str, usize, UnwrittenBytes)] = &[
     // than by selector. See `ops::texture::WideTextureDescriptorBody`.
     ("PGSerializer", "opcode 0x0034", 52, &[(51, 0x00)]),
     // The same wide descriptor's tail in the three records that embed it, at
-    // whatever offset each one puts it. Note the IOSurface form's is *not* at
-    // the end: its `plane` follows the descriptor, and that plane is four
-    // written bytes here where the narrow form's two-byte one leaves two
-    // unwritten. So the wide record has one hole and the narrow one has three.
+    // whatever offset each one puts it. The IOSurface form then carries a
+    // two-byte plane and a one-byte rotation; its final byte is unwritten.
     ("PGSerializer", "opcode 0x0037", 72, &[(71, 0x00)]),
     (
         "PGSerializer",
@@ -758,7 +756,12 @@ const PARTIALLY_WRITTEN: &[(&str, &str, usize, UnwrittenBytes)] = &[
         68,
         &[(55, 0x00), (56, 0x01), (57, 0x00), (58, 0x00), (59, 0x00)],
     ),
-    ("PGSerializer", "opcode 0x0039", 56, &[(51, 0x00)]),
+    (
+        "PGSerializer",
+        "opcode 0x0039",
+        56,
+        &[(51, 0x00), (55, 0x00)],
+    ),
     // The fifth, and the one where the hole is not near the end: this is a
     // query, so the reply pair follows the descriptor and the unwritten byte
     // lands twelve bytes from the record's tail.
@@ -5409,10 +5412,8 @@ fn every_backed_texture_fixture_reads_back_what_metal_was_asked_for() {
 
         if case["selector"] == "newIOSurfaceTextureWithDescriptor:plane:allocator:" {
             let o = op(&bytes, 0).unwrap_or_else(|e| panic!("{name}: {e}"));
-            // The wide form, whose `plane` is four bytes where the narrow one's
-            // is two. Reading it through the wide view is the assertion: a
-            // `U16le` here would still read the right number, so what this
-            // catches is the *record length* arithmetic that the width feeds.
+            // The wide form carries a two-byte plane followed by rotation. The
+            // final byte is unwritten and must not affect either value.
             if o.opcode() == bt::OPCODE_IOSURFACE_TEXTURE_WIDE {
                 assert_eq!(
                     o.length(),
@@ -5430,11 +5431,40 @@ fn every_backed_texture_fixture_reads_back_what_metal_was_asked_for() {
                     expect_u64(case, "plane"),
                     "{name}: plane"
                 );
+                if let Some(rotation) = case["expect"]["rotation"].as_u64() {
+                    assert_eq!(t.rotation as u64, rotation, "{name}: rotation");
+                }
                 assert_eq!(
                     t.desc.unidentified_u64.get(),
                     0,
                     "{name}: the wide descriptor's trailing u64 moved"
                 );
+                planes.insert(expect_u64(case, "plane"));
+                continue;
+            }
+            if o.opcode() == bt::OPCODE_IOSURFACE_TEXTURE_ROTATED {
+                assert_eq!(
+                    o.length(),
+                    bt::IOSURFACE_TEXTURE_ROTATED_TOTAL_LEN,
+                    "{name}: length"
+                );
+                let t = bt::iosurface_texture_rotated(&o).unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert_eq!(
+                    t.object_ref.get() as u64,
+                    expect_u64(case, "object_ref"),
+                    "{name}: object_ref"
+                );
+                assert_eq!(
+                    t.plane.get() as u64,
+                    expect_u64(case, "plane"),
+                    "{name}: plane"
+                );
+                assert_eq!(
+                    t.rotation as u64,
+                    expect_u64(case, "rotation"),
+                    "{name}: rotation"
+                );
+                assert_desc(case, name, &t.desc);
                 planes.insert(expect_u64(case, "plane"));
                 continue;
             }

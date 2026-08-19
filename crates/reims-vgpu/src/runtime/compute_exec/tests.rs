@@ -4,8 +4,6 @@
 )]
 
 use super::*;
-use crate::contract::endian::{st32, st64};
-use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
 use crate::runtime::decode::compute;
 use crate::runtime::decode::resource::{
@@ -13,7 +11,6 @@ use crate::runtime::decode::resource::{
     OBJECT_TYPE_SERIALIZER_RESOURCE, OBJECT_TYPE_TEXTURE, RESOURCE_PAGE_SHIFT,
 };
 /// Compute-pipeline descriptor constants used by the backend execute test.
-#[cfg(feature = "backend-vulkan")]
 use crate::runtime::decode::resource::{
     OBJECT_TYPE_FUNCTION, PIPELINE_TAG_KERNEL_FUNC, SERIALIZER_RESOURCE_FIRST_TLVS,
     SERIALIZER_RESOURCE_OBJECT_COMPUTE_PIPELINE,
@@ -21,52 +18,12 @@ use crate::runtime::decode::resource::{
 use crate::runtime::gva_mem;
 use crate::runtime::gva_mem::write_task_gva_arm64e;
 use crate::runtime::host::FakeHost;
+use reims_vgpu_core::endian::{st32, st64};
+use reims_vgpu_paging::geometry::{
+    DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN, MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+    MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+};
 use reims_vgpu_wire::device_desc::IOSurfacePlaneViewBuilder;
-
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn spirv_word_parser_splits_short_header_from_misalignment() {
-    assert_eq!(
-        spirv_words_le(&[0; 16]).unwrap_err(),
-        ComputeSpirvDecline::HeaderTooShort {
-            len: 16,
-            minimum: 20
-        }
-    );
-    assert_eq!(
-        spirv_words_le(&[0; 21]).unwrap_err(),
-        ComputeSpirvDecline::LengthMisaligned {
-            len: 21,
-            alignment: 4
-        }
-    );
-    assert_eq!(spirv_words_le(&[0; 20]).unwrap().len(), 5);
-}
-
-#[test]
-fn compute_spirv_declines_are_distinct_and_log_safe() {
-    use crate::observe::Decline as _;
-    let declines = [
-        ComputeSpirvDecline::HeaderTooShort {
-            len: 16,
-            minimum: 20,
-        },
-        ComputeSpirvDecline::LengthMisaligned {
-            len: 21,
-            alignment: 4,
-        },
-    ];
-    assert_ne!(declines[0].slug(), declines[1].slug());
-    for decline in declines {
-        assert!(decline
-            .slug()
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte == b'_'));
-        for (_, value) in decline.fields() {
-            assert!(!value.contains(char::is_whitespace));
-        }
-    }
-}
 
 #[test]
 fn argument_buffer_reflection_decline_carries_the_owner_coordinate() {
@@ -115,21 +72,21 @@ fn argument_buffer_reflection_decline_carries_the_owner_coordinate() {
 /// and plane 2 are both R8 at identical dims, plane 1 is the RG8 chroma.
 #[test]
 fn stage_texture_iosurface_plane_view_plane_index_beats_the_ambiguous_geometry_scan() {
-    use crate::contract::endian::st16;
-    use crate::contract::iosurface_pages::{
+    use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
+    use reims_vgpu_core::endian::st16;
+    use reims_vgpu_core::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_R8_UNORM};
+    use reims_vgpu_protocol::{
         DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_LEN, DEVICE_DESC_PLANES, DEVICE_DESC_PLANE_COUNT,
         DEVICE_PLANE_BPE, DEVICE_PLANE_BPR, DEVICE_PLANE_DESC_LEN, DEVICE_PLANE_DIMS,
-        DEVICE_PLANE_OFFSET, DEVICE_PLANE_SIZE, PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID,
+        DEVICE_PLANE_OFFSET, DEVICE_PLANE_SIZE,
     };
-    use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_R8_UNORM};
-    use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
 
     // elemW@0, width u24@1, elemH@4, height u24@5.
     fn plane_dims(width: u32, height: u32) -> u64 {
         ((width as u64 & 0xff_ffff) << 8) | ((height as u64 & 0xff_ffff) << 40)
     }
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
@@ -141,10 +98,10 @@ fn stage_texture_iosurface_plane_view_plane_index_beats_the_ambiguous_geometry_s
     host.map_range(gpa, 0x4000, 0x5a);
     assert!(state.map_surface(sid));
     {
-        let m = state.mappings.get_mut(&sid).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        let m = state.surfaces.mappings.get_mut(&sid).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
     }
     assert!(state.set_mapping_geom(sid, 4, 4, MTL_FORMAT_BGRA8_UNORM));
 
@@ -465,7 +422,7 @@ fn accum_stage_in_tg_imageblock_and_control_fail_closed() {
     acc.set_imageblock(4, 4);
     assert_eq!(acc.imageblock.as_ref().map(|d| d.width), Some(4));
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let mut seg = crate::runtime::compute_session::ComputeSegment {
         acc,
@@ -502,7 +459,6 @@ fn accum_stage_in_tg_imageblock_and_control_fail_closed() {
     }
 }
 
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn vulkan_ignores_stage_input_regions_without_a_stage_input_descriptor() {
     let mut acc = ComputeAccum::default();
@@ -538,7 +494,7 @@ fn vulkan_ignores_stage_input_regions_without_a_stage_input_descriptor() {
 #[test]
 fn resolve_indirect_threadgroups_from_buffer() {
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
 
@@ -587,7 +543,7 @@ fn resolve_indirect_threadgroups_from_buffer() {
 #[test]
 fn dispatch_threads_indirect_reads_both_extents_from_the_buffer() {
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
 
@@ -651,7 +607,7 @@ fn dispatch_threads_indirect_reads_both_extents_from_the_buffer() {
 /// to be largest.
 #[test]
 fn the_zero_threadgroup_wire_shape_is_refused_by_name() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 8, 8);
     // A bound write target at a plausible full-screen geometry: the deleted
@@ -731,7 +687,7 @@ fn a_compute_refusal_names_its_check_and_ok_names_nothing() {
 fn the_buffer_paths_refuse_under_their_own_names() {
     use crate::observe::Refusal;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
@@ -776,7 +732,7 @@ fn the_buffer_paths_refuse_under_their_own_names() {
 fn a_compute_extent_stages_only_the_proven_prefix_from_the_bound_offset() {
     let mut host = FakeHost::new();
     host.stable_map_pages = true;
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
 
@@ -837,7 +793,7 @@ fn buffer_backing_gva_requires_explicit_page_shift() {
 
 #[test]
 fn dispatch_missing_pipeline() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
@@ -851,7 +807,6 @@ fn dispatch_missing_pipeline() {
     // backend: both arms open with `pipeline_ref == 0`, and before the
     // status carried a reason the two were indistinguishable in the log.
 
-    #[cfg(feature = "backend-vulkan")]
     assert_eq!(
         st,
         ComputeStatus::MissingPipeline("compute_vk_pipeline_ref_zero")
@@ -860,9 +815,8 @@ fn dispatch_missing_pipeline() {
 
 /// A dispatch reaches the Vulkan encoder while nested sessions refuse by name.
 #[test]
-#[cfg(feature = "backend-vulkan")]
 fn dispatch_backend_unavailable_with_texture_binds() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
@@ -908,9 +862,8 @@ fn dispatch_backend_unavailable_with_texture_binds() {
 }
 
 #[test]
-#[cfg(feature = "backend-vulkan")]
 fn dispatch_missing_pipeline_not_backend_unavailable() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
@@ -927,10 +880,9 @@ fn dispatch_missing_pipeline_not_backend_unavailable() {
 }
 
 #[test]
-#[cfg(feature = "backend-vulkan")]
 fn compute_pipeline_state_is_immutable_until_delete_and_reuse() {
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
 
@@ -980,18 +932,21 @@ fn compute_pipeline_state_is_immutable_until_delete_and_reuse() {
 
     let first = load_compute_pipeline(&state, &host, 1, 6).expect("first pipeline");
     let first_identity = state
-        .task_compute_pipeline_states
+        .task_objects
+        .compute_pipelines
         .identity(1, reims_vgpu_protocol::SerializerRef::new(6))
         .expect("first identity");
     let first_function_identity = state
-        .task_function_states
+        .task_objects
+        .functions
         .identity(1, reims_vgpu_protocol::SerializerRef::new(5))
         .expect("first function identity");
     assert_eq!(first.kernel_func_ref, 5);
     assert_eq!(&*first.kernel_mtlb, &[1, 2, 3, 4]);
 
     assert!(state
-        .task_function_states
+        .task_objects
+        .functions
         .delete(1, reims_vgpu_protocol::SerializerRef::new(5)));
     write_task_gva_arm64e(&mut host, &state.tasks[1], blob_gva, &[9, 8, 7, 6]);
     let replacement_function = crate::runtime::mtlb::load_mtlb(
@@ -1003,7 +958,8 @@ fn compute_pipeline_state_is_immutable_until_delete_and_reuse() {
     )
     .expect("replacement function");
     let replacement_function_identity = state
-        .task_function_states
+        .task_objects
+        .functions
         .identity(1, reims_vgpu_protocol::SerializerRef::new(5))
         .expect("replacement function identity");
     assert_eq!(&*replacement_function, &[9, 8, 7, 6]);
@@ -1028,11 +984,13 @@ fn compute_pipeline_state_is_immutable_until_delete_and_reuse() {
     );
 
     assert!(state
-        .task_compute_pipeline_states
+        .task_objects
+        .compute_pipelines
         .delete(1, reims_vgpu_protocol::SerializerRef::new(6)));
     let replacement = load_compute_pipeline(&state, &host, 1, 6).expect("replacement pipeline");
     let replacement_identity = state
-        .task_compute_pipeline_states
+        .task_objects
+        .compute_pipelines
         .identity(1, reims_vgpu_protocol::SerializerRef::new(6))
         .expect("replacement identity");
     assert_eq!(replacement.kernel_func_ref, 9);
@@ -1053,7 +1011,6 @@ fn compute_pipeline_state_is_immutable_until_delete_and_reuse() {
 /// it came from. The assertions below are on the line's shape, so a fourth
 /// spelling has to fail here before it can reach the log.
 #[test]
-#[cfg(feature = "backend-vulkan")]
 fn dispatch_buffer_kernel_mul3add1() {
     use std::path::PathBuf;
     let mtlb_paths = [
@@ -1066,7 +1023,7 @@ fn dispatch_buffer_kernel_mul3add1() {
         .expect("compute_mul3add1.mtlb fixture");
 
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
 
@@ -1121,7 +1078,7 @@ fn dispatch_buffer_kernel_mul3add1() {
         le[4..12].copy_from_slice(&bdesc_gva.to_le_bytes());
         write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
     }
-    let resource = state.task_resources.register(
+    let resource = state.task_objects.resources.register(
         1,
         7,
         std::sync::Arc::new(crate::model::TaskResource::new(
@@ -1135,7 +1092,8 @@ fn dispatch_buffer_kernel_mul3add1() {
     );
     let resource_id = resource.semantic_id().expect("canonical buffer identity");
     let before = state
-        .task_resources
+        .task_objects
+        .resources
         .resource_node(resource_id)
         .expect("canonical buffer")
         .content
@@ -1150,7 +1108,6 @@ fn dispatch_buffer_kernel_mul3add1() {
             attribute_stride: 0,
             has_attribute_stride: false,
         },
-        #[cfg(feature = "backend-vulkan")]
         BufferBinding {
             // The kernel declares no buffer 1. Reflection must discard this
             // extra encoder bind before object resolution; the nonexistent ref
@@ -1194,7 +1151,8 @@ fn dispatch_buffer_kernel_mul3add1() {
             .collect();
         assert_eq!(out, vec![4, 7, 10, 13]);
         let after = state
-            .task_resources
+            .task_objects
+            .resources
             .resource_node(resource_id)
             .expect("canonical buffer")
             .content
@@ -1207,7 +1165,7 @@ fn dispatch_buffer_kernel_mul3add1() {
 
 #[test]
 fn dispatch_missing_texture_fails() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
@@ -1236,11 +1194,14 @@ fn dispatch_missing_texture_fails() {
 /// MissingTexture (`compute_stage_tex … ot=5`).
 #[test]
 fn stage_texture_iosurface_plane_view_ref_resolves_surface_mapping() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
@@ -1254,10 +1215,10 @@ fn stage_texture_iosurface_plane_view_ref_resolves_surface_mapping() {
     let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
     assert!(state.map_surface(sid));
     {
-        let m = state.mappings.get_mut(&sid).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
+        let m = state.surfaces.mappings.get_mut(&sid).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![entry];
     }
     assert!(state.set_mapping_geom(sid, 4, 4, MTL_FORMAT_BGRA8_UNORM));
 
@@ -1301,13 +1262,16 @@ fn stage_texture_iosurface_plane_view_ref_resolves_surface_mapping() {
 /// `uint4` image write stores four packed BGRA pixels.
 #[test]
 fn stage_texture_iosurface_plane_view_record_reshapes_stageable_single_plane_surface() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::{
+    use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
+    use reims_vgpu_core::pixel_format::{
         StorageImageSelector, MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_R32_UINT, MTL_FORMAT_RGBA32_UINT,
     };
-    use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
@@ -1320,10 +1284,10 @@ fn stage_texture_iosurface_plane_view_record_reshapes_stageable_single_plane_sur
     let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
     assert!(state.map_surface(sid));
     {
-        let m = state.mappings.get_mut(&sid).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
+        let m = state.surfaces.mappings.get_mut(&sid).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![entry];
     }
     assert!(state.set_mapping_geom(sid, 4, 4, MTL_FORMAT_BGRA8_UNORM));
 
@@ -1390,6 +1354,10 @@ fn stage_texture_iosurface_plane_view_record_reshapes_stageable_single_plane_sur
         .unknown(0x02)
         .geometry(MTL_FORMAT_R32_UINT, 4, 4, 1)
         .trailer([1, 0, 1, 0, 1, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    // Construction bytes are immutable for a published resource lifetime.
+    // Retire that lifetime before publishing a replacement descriptor at the
+    // same object-table reference.
+    assert!(state.delete_object(1, iosurface_plane_view_ref));
     write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, reshaped.bytes());
     let sampled = stage_texture_raw(
         &mut state,
@@ -1421,18 +1389,18 @@ fn stage_texture_iosurface_plane_view_record_reshapes_stageable_single_plane_sur
 /// (wallpaper '420f', journal 2026-07-14 compute census).
 #[test]
 fn stage_texture_iosurface_plane_view_record_stages_biplanar_y_plane() {
-    use crate::contract::endian::{st16, st64};
-    use crate::contract::iosurface_pages::{
+    use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
+    use reims_vgpu_core::endian::{st16, st64};
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_R8_UNORM;
+    use reims_vgpu_protocol::{
         DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_LEN, DEVICE_DESC_PLANES, DEVICE_DESC_PLANE_COUNT,
         DEVICE_PLANE_BPE, DEVICE_PLANE_BPR, DEVICE_PLANE_DESC_LEN, DEVICE_PLANE_DIMS,
-        DEVICE_PLANE_OFFSET, DEVICE_PLANE_SIZE, PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID,
+        DEVICE_PLANE_OFFSET, DEVICE_PLANE_SIZE,
     };
-    use crate::contract::pixel_format::MTL_FORMAT_R8_UNORM;
-    use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
 
     let pack_dims = |w: u64, h: u64| ((w & 0xffffff) << 8) | ((h & 0xffffff) << 40);
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
@@ -1463,18 +1431,15 @@ fn stage_texture_iosurface_plane_view_record_stages_biplanar_y_plane() {
 
     assert!(state.map_surface(sid));
     {
-        let m = state.mappings.get_mut(&sid).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
-        m.device_desc = dev;
-        m.has_geom = true;
-        m.width = 16;
-        m.height = 8;
-        m.format = 0; // surface-level FourCC has no single MTL format
+        let m = state.surfaces.mappings.get_mut(&sid).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![entry];
+        m.publish_device_desc_for_test(&dev);
+        m.publish_geometry_for_test(16, 8, 0); // surface-level FourCC has no single MTL format
     }
     assert!(objects::mapping_is_multiplanar(
-        state.mappings.get(&sid).unwrap()
+        state.surfaces.mappings.get(&sid).unwrap()
     ));
 
     // IOSurface plane view descriptor: sid + args blob carrying the R8 16×8 plane record.
@@ -1503,7 +1468,7 @@ fn stage_texture_iosurface_plane_view_record_stages_biplanar_y_plane() {
     assert_eq!((staged.width, staged.height), (16, 8));
     assert_eq!(
         staged.storage_selector,
-        Some(crate::contract::pixel_format::StorageImageSelector::R8Unorm)
+        Some(reims_vgpu_core::pixel_format::StorageImageSelector::R8Unorm)
     );
     assert!(match &staged.input {
         VulkanTextureInput::GuestPages(source) => source.total_len == 16 * 8,
@@ -1545,12 +1510,10 @@ fn stage_texture_iosurface_plane_view_record_stages_biplanar_y_plane() {
 /// (no BGRA invent over multi-plane bytes).
 #[test]
 fn stage_texture_iosurface_plane_view_multiplanar_without_record_fails_closed() {
-    use crate::contract::iosurface_pages::{
-        DEVICE_DESC_LEN, DEVICE_DESC_PLANE_COUNT, PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID,
-    };
     use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
+    use reims_vgpu_protocol::{DEVICE_DESC_LEN, DEVICE_DESC_PLANE_COUNT};
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
@@ -1565,15 +1528,12 @@ fn stage_texture_iosurface_plane_view_multiplanar_without_record_fails_closed() 
     dev[DEVICE_DESC_PLANE_COUNT] = 2;
     assert!(state.map_surface(sid));
     {
-        let m = state.mappings.get_mut(&sid).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
-        m.device_desc = dev;
-        m.has_geom = true;
-        m.width = 16;
-        m.height = 8;
-        m.format = 0;
+        let m = state.surfaces.mappings.get_mut(&sid).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![entry];
+        m.publish_device_desc_for_test(&dev);
+        m.publish_geometry_for_test(16, 8, 0);
     }
 
     // IOSurface plane view descriptor with sid but NO args record.
@@ -1608,11 +1568,14 @@ fn stage_texture_iosurface_plane_view_multiplanar_without_record_fails_closed() 
 /// the biplanar wallpaper.
 #[test]
 fn stage_texture_linear_ref_does_not_collide_with_surface_mid() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
@@ -1625,10 +1588,10 @@ fn stage_texture_linear_ref_does_not_collide_with_surface_mid() {
     let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
     assert!(state.map_surface(colliding_mid));
     {
-        let m = state.mappings.get_mut(&colliding_mid).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
+        let m = state.surfaces.mappings.get_mut(&colliding_mid).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![entry];
     }
     assert!(state.set_mapping_geom(colliding_mid, 4, 4, MTL_FORMAT_BGRA8_UNORM));
 
@@ -1652,17 +1615,16 @@ fn stage_texture_linear_ref_does_not_collide_with_surface_mid() {
     }
 }
 
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn stage_heap_texture_uses_host_only_residency_identity() {
-    use crate::contract::pixel_format::{StorageImageSelector, MTL_FORMAT_RGBA32_FLOAT};
     use crate::runtime::decode::resource::{
         list_object_entry_offset, HEAP_TEXTURE_DESCRIPTOR, HEAP_TEXTURE_HEAP_REF, HEAP_TEXTURE_LEN,
         HEAP_TEXTURE_OFFSET, HEAP_TEXTURE_OPCODE, HEAP_TEXTURE_USE_OFFSET, OBJECT_LIST_ENTRY_LEN,
         OBJECT_TYPE_TEXTURE_VIEW,
     };
+    use reims_vgpu_core::pixel_format::{StorageImageSelector, MTL_FORMAT_RGBA32_FLOAT};
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
@@ -1729,17 +1691,16 @@ fn stage_heap_texture_uses_host_only_residency_identity() {
     assert_eq!(residency.seed_generation, 0);
 }
 
-#[cfg(feature = "backend-vulkan")]
 /// UnmapMemory removes the guest page-table alias, not the discrete
 /// type-2/3 texture body. Compute writeback must retain raw output, mirror
 /// normalized color for render sampling, and complete without attempting
 /// a fail-closed write into freed guest pages.
 #[test]
 fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
-    use crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM;
     use crate::runtime::surface_cache;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA8_UNORM;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     let task_id = 6u32;
     let texture_ref = 11u32;
@@ -1748,9 +1709,7 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
     let staged = StagedTexture {
         resource_ref: texture_ref,
         binding: 32,
-        #[cfg(feature = "backend-vulkan")]
         array_element: 0,
-        #[cfg(feature = "backend-vulkan")]
         descriptor_count: 1,
 
         pixel_format: MTL_FORMAT_RGBA8_UNORM,
@@ -1804,8 +1763,8 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
 /// be host-addressable (usize), not rejected by an arbitrary cap.
 #[test]
 fn compute_stage_admits_full_screen_wide_gamut_without_cap() {
-    use crate::contract::pixel_format::{bytes_per_pixel, MTL_FORMAT_RGBA16_FLOAT};
     use crate::runtime::draw::host_alloc_len;
+    use reims_vgpu_core::pixel_format::{bytes_per_pixel, MTL_FORMAT_RGBA16_FLOAT};
     let bpp = bytes_per_pixel(MTL_FORMAT_RGBA16_FLOAT).expect("rgba16f bpp") as u64;
     let need = 1928u64 * 1920 * bpp;
     assert!(
@@ -1820,11 +1779,14 @@ fn compute_stage_admits_full_screen_wide_gamut_without_cap() {
 /// returned the wrong mapping.
 #[test]
 fn stage_texture_iosurface_plane_view_ignores_task_object_list_slot_collision() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
@@ -1837,10 +1799,10 @@ fn stage_texture_iosurface_plane_view_ignores_task_object_list_slot_collision() 
     let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
     assert!(state.map_surface(sid));
     {
-        let m = state.mappings.get_mut(&sid).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
+        let m = state.surfaces.mappings.get_mut(&sid).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![entry];
     }
     assert!(state.set_mapping_geom(sid, 4, 4, MTL_FORMAT_BGRA8_UNORM));
 
@@ -1890,7 +1852,7 @@ fn stage_texture_iosurface_plane_view_ignores_task_object_list_slot_collision() 
 fn stage_texture_iosurface_plane_view_without_surface_is_missing() {
     use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
@@ -1924,7 +1886,6 @@ fn stage_texture_iosurface_plane_view_without_surface_is_missing() {
     assert!(matches!(st, Err(ComputeStatus::MissingTexture(_))));
 }
 
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn incomplete_compute_engine_call_fires_stall_proxy() {
     use reims_vgpu_core::ComputeRequest;
@@ -1932,7 +1893,10 @@ fn incomplete_compute_engine_call_fires_stall_proxy() {
 
     let pipe = 0xf000_0000 | (std::process::id() & 0x0fff_ffff);
     let req = ComputeRequest {
-        spirv: vec![0x0723_0203],
+        program: reims_vgpu_core::PreparedShaderStage {
+            id: reims_vgpu_protocol::PreparedShaderId::new(1),
+            ..Default::default()
+        },
         entry: "main".into(),
         grid: [1, 1, 1],
         ..Default::default()
@@ -1951,7 +1915,6 @@ fn incomplete_compute_engine_call_fires_stall_proxy() {
     let _ = std::fs::remove_file(format!("{base}.txt"));
 }
 
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn storage_access_proxy_names_writeonly_seed_cost() {
     let pipe = 0xd000_0000 | (std::process::id() & 0x0fff_ffff);
@@ -1967,10 +1930,9 @@ fn storage_access_proxy_names_writeonly_seed_cost() {
     }));
 }
 
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn storage_format_specialization_preserves_raw_views_and_runtime_shape() {
-    use crate::runtime::spirv_bind::ImageFormat as S;
+    use pixel_format::StorageImageSpecializationDecline as D;
     use reims_vgpu_protocol::StorageImageFormat as V;
 
     assert_eq!(
@@ -1985,40 +1947,40 @@ fn storage_format_specialization_preserves_raw_views_and_runtime_shape() {
     // A uint shader over a BGRA8Unorm surface is a deliberate raw byte view
     // (byte order preserved) — unaffected by the without-format flag.
     assert_eq!(
-        specialized_storage_image_format(V::Bgra8Unorm, S::Rgba8Uint, true),
-        Ok(S::Rgba8Uint)
+        pixel_format::specialize_storage_image_format(V::Bgra8Unorm, V::Rgba8Uint, true),
+        Ok(Some(V::Rgba8Uint))
     );
     assert_eq!(
-        specialized_storage_image_format(V::Bgra8Unorm, S::Rgba8Uint, false),
-        Ok(S::Rgba8Uint)
+        pixel_format::specialize_storage_image_format(V::Bgra8Unorm, V::Rgba8Uint, false),
+        Ok(Some(V::Rgba8Uint))
     );
     assert_eq!(
-        specialized_storage_image_format(V::Rgba16Float, S::Rgba32Float, true),
-        Ok(S::Rgba16Float)
+        pixel_format::specialize_storage_image_format(V::Rgba16Float, V::Rgba32Float, true),
+        Ok(Some(V::Rgba16Float))
     );
     // BGRA8Unorm normalized color store (the desktop composite): with the
     // device feature it retargets to a format-less `Unknown` storage image
     // (viewed B8G8R8A8_UNORM — no R/B swap); without it, degrades to the
     // swapped Rgba8Unorm view.
     assert_eq!(
-        specialized_storage_image_format(V::Bgra8Unorm, S::Rgba32Float, true),
-        Ok(S::Unknown)
+        pixel_format::specialize_storage_image_format(V::Bgra8Unorm, V::Rgba32Float, true),
+        Ok(None)
     );
     assert_eq!(
-        specialized_storage_image_format(V::Bgra8Unorm, S::Rgba32Float, false),
-        Ok(S::Rgba8Unorm)
+        pixel_format::specialize_storage_image_format(V::Bgra8Unorm, V::Rgba32Float, false),
+        Ok(Some(V::Rgba8Unorm))
     );
     assert_eq!(
-        specialized_storage_image_format(V::Bgra8Unorm, S::Rgba8Unorm, true),
-        Ok(S::Unknown)
+        pixel_format::specialize_storage_image_format(V::Bgra8Unorm, V::Rgba8Unorm, true),
+        Ok(None)
     );
     assert_eq!(
-        specialized_storage_image_format(V::Bgra8Unorm, S::Rgba16Uint, true),
-        Err("spirv_guest_numeric_class_mismatch")
+        pixel_format::specialize_storage_image_format(V::Bgra8Unorm, V::Rgba16Uint, true),
+        Err(D::NumericClassMismatch)
     );
     assert_eq!(
-        specialized_storage_image_format(V::Bgra8Unorm, S::Unsupported(0), true),
-        Err("spirv_storage_format_unsupported")
+        pixel_format::specialize_storage_image_format(V::Bgra8Unorm, V::R32Sint, true),
+        Err(D::ShaderFormatUnsupported)
     );
 
     // R32Uint storage (the captured VTMTS 4K coverage-buffer case): the
@@ -2029,18 +1991,18 @@ fn storage_format_specialization_preserves_raw_views_and_runtime_shape() {
     // specializes the SPIR-V storage image to single-channel `R32ui` so the
     // view is VK_FORMAT_R32_UINT and a written `uint4`.x is the full u32.
     assert_eq!(
-        specialized_storage_image_format(V::R32Uint, S::Rgba8Uint, true),
-        Ok(S::R32ui)
+        pixel_format::specialize_storage_image_format(V::R32Uint, V::Rgba8Uint, true),
+        Ok(Some(V::R32Uint))
     );
     assert_eq!(
-        specialized_storage_image_format(V::R32Uint, S::Rgba16Uint, true),
-        Ok(S::R32ui)
+        pixel_format::specialize_storage_image_format(V::R32Uint, V::Rgba16Uint, true),
+        Ok(Some(V::R32Uint))
     );
     // A float/unorm-class write shader over an R32Uint surface is a genuine
     // numeric-class mismatch, not a raw view — still rejected.
     assert_eq!(
-        specialized_storage_image_format(V::R32Uint, S::Rgba8Unorm, true),
-        Err("spirv_guest_numeric_class_mismatch")
+        pixel_format::specialize_storage_image_format(V::R32Uint, V::Rgba8Unorm, true),
+        Err(D::NumericClassMismatch)
     );
     // The R32-single-channel sint/float and packed Rgb9e5 storage paths
     // stay guarded off (no live capture yet justifies enabling them). The
@@ -2066,10 +2028,6 @@ fn storage_format_specialization_preserves_raw_views_and_runtime_shape() {
         selector_to_engine_storage(pixel_format::StorageImageSelector::R32Uint),
         V::R32Uint
     );
-    assert_eq!(
-        spirv_image_format_to_engine_storage(S::R32ui),
-        Some(V::R32Uint)
-    );
 }
 
 /// `metal2vulkan` lowers a generic `texture2d<float, access::write>` to SPIR-V
@@ -2078,52 +2036,46 @@ fn storage_format_specialization_preserves_raw_views_and_runtime_shape() {
 /// `storage_format_specialize_mismatch` — 142 dropped dispatches in one x86
 /// desktop boot. It specializes exactly like the `R32ui` case: the declared
 /// format is a placeholder, the bound guest surface decides the view.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn r32f_write_images_specialize_to_the_bound_guest_surface() {
-    use crate::runtime::spirv_bind::ImageFormat as S;
+    use pixel_format::StorageImageSpecializationDecline as D;
     use reims_vgpu_protocol::StorageImageFormat as V;
-
-    assert_eq!(
-        spirv_image_format_to_engine_storage(S::R32Float),
-        Some(V::R32Float)
-    );
 
     // Wider float surfaces: the placeholder widens to the guest's own format
     // so all four written lanes are stored, not just `.x`.
     assert_eq!(
-        specialized_storage_image_format(V::Rgba32Float, S::R32Float, true),
-        Ok(S::Rgba32Float)
+        pixel_format::specialize_storage_image_format(V::Rgba32Float, V::R32Float, true),
+        Ok(Some(V::Rgba32Float))
     );
     assert_eq!(
-        specialized_storage_image_format(V::Rgba16Float, S::R32Float, true),
-        Ok(S::Rgba16Float)
+        pixel_format::specialize_storage_image_format(V::Rgba16Float, V::R32Float, true),
+        Ok(Some(V::Rgba16Float))
     );
     // Narrower single-channel float: still class-matched to the guest surface.
     assert_eq!(
-        specialized_storage_image_format(V::R16Float, S::R32Float, true),
-        Ok(S::R16Float)
+        pixel_format::specialize_storage_image_format(V::R16Float, V::R32Float, true),
+        Ok(Some(V::R16Float))
     );
     // An R32Float guest surface is an exact match — the raw view is correct.
     assert_eq!(
-        specialized_storage_image_format(V::R32Float, S::R32Float, true),
-        Ok(S::R32Float)
+        pixel_format::specialize_storage_image_format(V::R32Float, V::R32Float, true),
+        Ok(Some(V::R32Float))
     );
     // BGRA8Unorm is the desktop composite target. Bytes/texel are equal (4 == 4)
     // so the raw-view early return would view a BGRA surface as a single
     // 32-bit float; a normalized color store must retarget instead.
     assert_eq!(
-        specialized_storage_image_format(V::Bgra8Unorm, S::R32Float, true),
-        Ok(S::Unknown)
+        pixel_format::specialize_storage_image_format(V::Bgra8Unorm, V::R32Float, true),
+        Ok(None)
     );
     assert_eq!(
-        specialized_storage_image_format(V::Bgra8Unorm, S::R32Float, false),
-        Ok(S::Rgba8Unorm)
+        pixel_format::specialize_storage_image_format(V::Bgra8Unorm, V::R32Float, false),
+        Ok(Some(V::Rgba8Unorm))
     );
     // A float-class shader over a uint surface stays a class mismatch.
     assert_eq!(
-        specialized_storage_image_format(V::R32Uint, S::R32Float, true),
-        Err("spirv_guest_numeric_class_mismatch")
+        pixel_format::specialize_storage_image_format(V::R32Uint, V::R32Float, true),
+        Err(D::NumericClassMismatch)
     );
 }
 
@@ -2143,39 +2095,37 @@ fn r32f_write_images_specialize_to_the_bound_guest_surface() {
 /// The same trap had already been carved out by name for `R32Uint` under
 /// `Rgba8Uint`. These are one rule, so the rule is asserted here for every
 /// same-class equal-width pair the format table can produce.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn same_class_equal_width_storage_formats_take_the_guest_surface_not_the_placeholder() {
-    use crate::runtime::spirv_bind::ImageFormat as S;
     use reims_vgpu_protocol::StorageImageFormat as V;
 
     // 4 bytes both sides, float class both sides — the measured case.
     assert_eq!(
-        specialized_storage_image_format(V::Rg16Float, S::R32Float, true),
-        Ok(S::Rg16Float)
+        pixel_format::specialize_storage_image_format(V::Rg16Float, V::R32Float, true),
+        Ok(Some(V::Rg16Float))
     );
     // Same width and class again, and a colour store: `.x` as one f32 would be
     // three channels short.
     assert_eq!(
-        specialized_storage_image_format(V::Rgba8Unorm, S::R32Float, true),
-        Ok(S::Rgba8Unorm)
+        pixel_format::specialize_storage_image_format(V::Rgba8Unorm, V::R32Float, true),
+        Ok(Some(V::Rgba8Unorm))
     );
     // 2 bytes both sides.
     assert_eq!(
-        specialized_storage_image_format(V::Rg8Unorm, S::R16Float, true),
-        Ok(S::Rg8Unorm)
+        pixel_format::specialize_storage_image_format(V::Rg8Unorm, V::R16Float, true),
+        Ok(Some(V::Rg8Unorm))
     );
     // The genuine raw view — integer shader over a normalized surface — is not
     // disturbed by narrowing the width test.
     assert_eq!(
-        specialized_storage_image_format(V::Rgba8Unorm, S::Rgba8Uint, true),
-        Ok(S::Rgba8Uint)
+        pixel_format::specialize_storage_image_format(V::Rgba8Unorm, V::Rgba8Uint, true),
+        Ok(Some(V::Rgba8Uint))
     );
 }
 
 /// x86 (12-bit) task page table with depth-1 root; ptes map gva page i →
 /// `pfns[i]`. Mirrors the gva_view multi-import fixture.
-fn setup_linear_task_x86(host: &mut FakeHost, state: &mut DeviceState, pfns: &[u32]) {
+fn setup_linear_task_x86(host: &mut FakeHost, state: &mut Device, pfns: &[u32]) {
     let page = 1u64 << PAGE_SHIFT_X86;
     let dir_gpa = 2u64 << PAGE_SHIFT_X86;
     let root_gpa = 3u64 << PAGE_SHIFT_X86;
@@ -2198,7 +2148,7 @@ fn setup_linear_task_x86(host: &mut FakeHost, state: &mut DeviceState, pfns: &[u
 fn bulk_linear_read_destrides_span_with_one_view() {
     let mut host = FakeHost::new();
     host.strict_linux_map = true;
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     setup_linear_task_x86(&mut host, &mut state, &[4, 5]);
     let (tight, stride, h) = (8usize, 16u64, 3u32);
     let gva = 0x40u64;
@@ -2230,7 +2180,7 @@ fn bulk_linear_read_destrides_span_with_one_view() {
 fn bulk_linear_write_scatters_rows_and_preserves_padding() {
     let mut host = FakeHost::new();
     host.strict_linux_map = true;
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     setup_linear_task_x86(&mut host, &mut state, &[4, 5]);
     let (tight, stride, h) = (8usize, 16u64, 3u32);
     let gva = 0x40u64;
@@ -2274,7 +2224,7 @@ fn bulk_linear_write_scatters_rows_and_preserves_padding() {
 fn a_linear_flush_cannot_write_pages_its_window_was_not_armed_on() {
     let mut host = FakeHost::new();
     host.strict_linux_map = true;
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     setup_linear_task_x86(&mut host, &mut state, &[4, 5]);
     let (tight, stride, h) = (8usize, 16u64, 3u32);
     let gva = 0x40u64;
@@ -2352,7 +2302,7 @@ fn a_linear_flush_cannot_write_pages_its_window_was_not_armed_on() {
 fn bulk_linear_helpers_fall_back_on_fragmented_span() {
     let mut host = FakeHost::new();
     host.strict_linux_map = true;
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     // Non-adjacent leaf PFNs: 4 then 10.
     setup_linear_task_x86(&mut host, &mut state, &[4, 10]);
     let page = 1u64 << PAGE_SHIFT_X86;
@@ -2383,10 +2333,10 @@ fn bulk_linear_helpers_fall_back_on_fragmented_span() {
 /// rail, and the guest can hand the range to something else across it.
 #[test]
 fn a_staged_buffer_carries_the_pages_its_writeback_is_bounded_to() {
-    use crate::contract::endian::st32;
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use reims_vgpu_core::endian::st32;
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let (dir_pfn, root_pfn, pt_base) = (2u32, 3u32, 4u32);
     let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
     let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
@@ -2473,17 +2423,14 @@ fn a_staged_buffer_carries_the_pages_its_writeback_is_bounded_to() {
 /// the GVA licence and put 91 % of the class back on the readback rail.
 ///
 /// Vulkan-only: the direct arm is a `VK_EXT_external_memory_host` import, and
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
-    use crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM;
     use crate::runtime::drain::census::store_route_count;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA8_UNORM;
     use reims_vgpu_core::ComputeImageDestination;
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let held = reims_vgpu_vulkan::format::vk_storage_image(
-        reims_vgpu_protocol::StorageImageFormat::Rgba8Unorm,
-    );
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let held = reims_vgpu_protocol::StorageImageFormat::Rgba8Unorm;
 
     let linear = |pages: crate::runtime::draw::StoreTargetPages| TextureWriteback::Linear {
         pages,
@@ -2498,9 +2445,7 @@ fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
     let staged = |writeback, residency| StagedTexture {
         resource_ref: 44,
         binding: 32,
-        #[cfg(feature = "backend-vulkan")]
         array_element: 0,
-        #[cfg(feature = "backend-vulkan")]
         descriptor_count: 1,
 
         pixel_format: MTL_FORMAT_RGBA8_UNORM,
@@ -2552,16 +2497,16 @@ fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
     };
     let unlicensed = || store_route_count("compute_dst_host_iosurface_texture_unlicensed");
     for mapping_id in [1, 2] {
-        state.mappings.insert(
+        state.surfaces.mappings.insert(
             mapping_id,
-            crate::model::MappingEntry {
-                mapped: true,
-                has_geom: true,
-                width: 2,
-                height: 2,
-                format: MTL_FORMAT_RGBA8_UNORM,
+            crate::model::SurfaceMappingEntry {
+                lifecycle: crate::model::SurfaceMappingLifecycle {
+                    active: true,
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
+            }
+            .with_geometry_for_test(2, 2, MTL_FORMAT_RGBA8_UNORM),
         );
     }
     // Mapping 1 is staged at the texel the dispatch holds, so a raw copy could
@@ -2583,7 +2528,7 @@ fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
     let not_linear = store_route_count("compute_dst_host_not_linear");
     for (mapping_id, format) in [
         (1, MTL_FORMAT_RGBA8_UNORM),
-        (2, crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT),
+        (2, reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA16_FLOAT),
         (3, MTL_FORMAT_RGBA8_UNORM),
     ] {
         assert!(
@@ -2669,10 +2614,10 @@ fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
 /// asked for.
 #[test]
 fn a_staged_window_records_its_pages_in_guest_virtual_order() {
-    use crate::contract::endian::st32;
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use reims_vgpu_core::endian::st32;
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let (dir_pfn, root_pfn, pt_base) = (2u32, 3u32, 4u32);
     let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
     let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
@@ -2785,8 +2730,8 @@ fn a_resident_answer_is_a_seed_or_a_sample_and_never_both() {
 /// that means something.
 #[test]
 fn an_undeclared_dispatch_type_is_named_and_counted_before_it_becomes_serial() {
-    use crate::contract::dispatch::{MTL_DISPATCH_TYPE_CONCURRENT, MTL_DISPATCH_TYPE_SERIAL};
     use crate::runtime::drain::store_route_count;
+    use reims_vgpu_protocol::dispatch::{MTL_DISPATCH_TYPE_CONCURRENT, MTL_DISPATCH_TYPE_SERIAL};
 
     let before = store_route_count("compute_dispatch_type_unknown");
 
@@ -2892,7 +2837,6 @@ fn a_truncated_stage_input_is_not_the_same_as_an_absent_one() {
 /// mapping windows have a fallback, but discarding their current GPU replica
 /// still costs guest work and is not a cache policy.
 #[test]
-#[cfg(feature = "backend-vulkan")]
 fn live_compute_mirrors_are_not_evicted_by_an_invented_capacity() {
     use super::{
         note_storage_residency_writeback, ComputeStorageResidencyCandidate, StagedTexture,
@@ -2900,16 +2844,14 @@ fn live_compute_mirrors_are_not_evicted_by_an_invented_capacity() {
     };
     use crate::model::ComputeStorageResidencyKey;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     const LIVE_WINDOWS: u32 = 32;
     const SURFACE_RESOURCE_REF: u32 = 99;
 
     let staged = |key: ComputeStorageResidencyKey| StagedTexture {
         resource_ref: key.resource_ref().unwrap_or(SURFACE_RESOURCE_REF),
         binding: 33,
-        #[cfg(feature = "backend-vulkan")]
         array_element: 0,
-        #[cfg(feature = "backend-vulkan")]
         descriptor_count: 1,
 
         pixel_format: key.pixel_format,
@@ -2943,14 +2885,14 @@ fn live_compute_mirrors_are_not_evicted_by_an_invented_capacity() {
     }
 
     assert_eq!(
-        state.compute_storage_residency.len(),
+        state.content.compute_residency.len(),
         (2 * LIVE_WINDOWS) as usize,
         "every independently live mirror remains owned"
     );
     for tex in 0..LIVE_WINDOWS {
         let key = ComputeStorageResidencyKey::heap(1, tex, 16, 16, 0x50);
         assert!(
-            state.compute_storage_residency.contains_key(&key),
+            state.content.compute_residency.contains(&key),
             "heap texture {tex} lost its mirror"
         );
     }
@@ -2971,7 +2913,7 @@ fn live_compute_mirrors_are_not_evicted_by_an_invented_capacity() {
 #[test]
 fn a_bind_past_the_argument_table_refuses_the_dispatch() {
     let host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
 
     let mut cmd = ComputeCommand::default();
     cmd.kind = Kind::DispatchThreadgroups;
@@ -3035,22 +2977,27 @@ fn a_bind_past_the_argument_table_refuses_the_dispatch() {
 /// variable is legal but pays a descriptor for nothing, and it would destroy the
 /// census that separated the two populations in the first place — so a pass that
 /// filled both would look identical to this one on a boot and be wrong.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_sampled_image_the_kernel_uses_and_the_guest_left_empty_gets_a_neutral_texture() {
-    let spirv = crate::runtime::spirv_bind::test_module_with_two_sampled_images(33, 34);
+    let spirv = reims_vgpu_vulkan::spirv_bind::test_module_with_two_sampled_images(33, 34);
 
     // Nothing bound: 33 is sampled and needs the neutral texture; 34 is declared
     // and never referenced, so it stays out of the layout.
-    assert_eq!(neutral_sampled_image_bindings(&spirv, &[]), vec![33]);
+    assert_eq!(
+        reims_vgpu_vulkan::spirv_bind::neutral_sampled_image_bindings(&spirv, &[]),
+        vec![33]
+    );
 
     // The guest bound it after all — there is nothing to substitute.
     assert_eq!(
-        neutral_sampled_image_bindings(&spirv, &[33]),
+        reims_vgpu_vulkan::spirv_bind::neutral_sampled_image_bindings(&spirv, &[33]),
         Vec::<u32>::new()
     );
 
     // A binding the guest supplied that the module does not carry is not
     // invented back into the list.
-    assert_eq!(neutral_sampled_image_bindings(&spirv, &[99]), vec![33]);
+    assert_eq!(
+        reims_vgpu_vulkan::spirv_bind::neutral_sampled_image_bindings(&spirv, &[99]),
+        vec![33]
+    );
 }

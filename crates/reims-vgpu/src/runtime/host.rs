@@ -121,7 +121,7 @@ impl crate::observe::Decline for MemError {
             Self::QemuReadXregCallbackFailed(_) => "mem_qemu_read_xreg_callback_failed",
             // Delegates, so the walk's own fifteen slugs stay the reason rather
             // than being flattened into one and reconstructed from a field.
-            Self::Unresolved(status) => match crate::contract::gva_resolve::refusal(*status) {
+            Self::Unresolved(status) => match crate::runtime::gva_refusal::slug(*status) {
                 Some(slug) => slug,
                 // `Unresolved(Ok)` is a construction bug, not a walk failure.
                 // Naming it beats reporting a plausible walk reason for
@@ -561,7 +561,7 @@ impl<T: HostControl + GuestCpuAccess + GuestRamProvider + HostPageViews + ?Sized
 /// Arch-qualified with no portable alias, deliberately. A bare `GUEST_PAGE_SIZE_ARM64E`
 /// reads as "the guest's page size" and is 16 KiB whatever the guest is, which
 /// is the spelling `model::regs` records as the cause of x86 wild writes.
-pub const GUEST_PAGE_SIZE_ARM64E: usize = 1usize << crate::contract::gva::PAGE_SHIFT_ARM64E;
+pub const GUEST_PAGE_SIZE_ARM64E: usize = 1usize << reims_vgpu_paging::geometry::PAGE_SHIFT_ARM64E;
 
 /// mach VM aliasing for FakeHost views — the same mechanism the QEMU shim
 /// uses in production (`mach_vm_remap` of guest RAM), exercised for real in
@@ -1638,7 +1638,7 @@ mod tests {
     /// it, and its two substantive assertions never ran.
     #[test]
     fn a_guest_page_smaller_than_the_hosts_maps_to_its_own_bytes() {
-        const X86_PAGE: usize = 1usize << crate::contract::gva::PAGE_SHIFT_X86;
+        const X86_PAGE: usize = 1usize << reims_vgpu_paging::geometry::PAGE_SHIFT_X86;
         let mut h = FakeHost::new();
         let base = 0x40u64 * X86_PAGE as u64;
         h.map_range(base, 3 * X86_PAGE, 0);

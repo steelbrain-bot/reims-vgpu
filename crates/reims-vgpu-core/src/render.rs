@@ -2,36 +2,12 @@
 
 use crate::{ContentStamp, GatherVouch, ResourceLifetime, ResourceLifetimeRef, SamplerResource};
 use reims_vgpu_memory::{GuestRunSource, GuestTargetSeed};
+pub use reims_vgpu_protocol::{
+    BlendFactor, BlendOp, BlendStateResource, CullMode, DepthClipMode, FillMode, IndexType,
+    PrimitiveTopology, StencilOp, VertexAttributeFormat, VertexStepFunction, VisibilityResultMode,
+};
 use reims_vgpu_protocol::{ColorWriteMask, ImageFormat, SwizzlePlan};
 use std::sync::Arc;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum VisibilityResultMode {
-    Boolean,
-    Counting,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub enum CullMode {
-    #[default]
-    None,
-    Front,
-    Back,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub enum FillMode {
-    #[default]
-    Fill,
-    Lines,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub enum DepthClipMode {
-    #[default]
-    Clip,
-    Clamp,
-}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DepthState {
@@ -42,19 +18,6 @@ pub struct DepthState {
     pub clear_value: f32,
     pub load: bool,
     pub stencil: Option<StencilState>,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum StencilOp {
-    #[default]
-    Keep,
-    Zero,
-    Replace,
-    IncrementClamp,
-    DecrementClamp,
-    Invert,
-    IncrementWrap,
-    DecrementWrap,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -76,6 +39,21 @@ pub struct StencilState {
     pub clear_value: u32,
 }
 
+/// One executor-prepared shader stage and the semantic descriptor interface
+/// the resolved module statically uses.
+#[derive(Clone, Debug, Default)]
+pub struct PreparedShaderStage {
+    pub id: reims_vgpu_protocol::PreparedShaderId,
+    pub used_descriptor_bindings: Arc<[u32]>,
+}
+
+/// The two prepared stages required by one resolved render pipeline.
+#[derive(Clone, Debug, Default)]
+pub struct PreparedRenderProgram {
+    pub vertex: PreparedShaderStage,
+    pub fragment: PreparedShaderStage,
+}
+
 /// Fully resolved inputs for one draw.
 ///
 /// Guest names, wire tags, and host-native handles are absent. Resource
@@ -84,10 +62,7 @@ pub struct StencilState {
 #[derive(Debug, Default)]
 pub struct DrawRequest {
     pub pipeline_lifetime: Option<ResourceLifetime>,
-    pub vert_spirv: Arc<Vec<u32>>,
-    pub frag_spirv: Arc<Vec<u32>>,
-    pub vert_used_descriptor_bindings: Arc<[u32]>,
-    pub frag_used_descriptor_bindings: Arc<[u32]>,
+    pub program: PreparedRenderProgram,
     pub width: u32,
     pub height: u32,
     pub vertex_count: u32,
@@ -217,160 +192,12 @@ pub struct ScissorResource {
     pub height: u32,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub enum PrimitiveTopology {
-    Point,
-    Line,
-    LineStrip,
-    #[default]
-    Triangle,
-    TriangleStrip,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum IndexType {
-    U16,
-    U32,
-}
-
-impl IndexType {
-    pub const fn byte_size(self) -> usize {
-        match self {
-            Self::U16 => 2,
-            Self::U32 => 4,
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct IndexedDrawResource {
     pub index_type: IndexType,
     pub index_count: u32,
     pub vertex_offset: i32,
     pub content: BufferContent,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum VertexAttributeFormat {
-    UChar2,
-    UChar3,
-    UChar4,
-    Char2,
-    Char3,
-    Char4,
-    UChar2Normalized,
-    UChar3Normalized,
-    UChar4Normalized,
-    Char2Normalized,
-    Char3Normalized,
-    Char4Normalized,
-    UShort2,
-    UShort3,
-    UShort4,
-    Short2,
-    Short3,
-    Short4,
-    UShort2Normalized,
-    UShort3Normalized,
-    UShort4Normalized,
-    Short2Normalized,
-    Short3Normalized,
-    Short4Normalized,
-    Half2,
-    Half3,
-    Half4,
-    Float,
-    Float2,
-    Float3,
-    Float4,
-    Int,
-    Int2,
-    Int3,
-    Int4,
-    UInt,
-    UInt2,
-    UInt3,
-    UInt4,
-    Int1010102Normalized,
-    UInt1010102Normalized,
-    UChar4NormalizedBgra,
-    UChar,
-    Char,
-    UCharNormalized,
-    CharNormalized,
-    UShort,
-    Short,
-    UShortNormalized,
-    ShortNormalized,
-    Half,
-    FloatRg11B10,
-    FloatRgb9E5,
-}
-
-impl VertexAttributeFormat {
-    pub const fn byte_size(self) -> u32 {
-        use VertexAttributeFormat as F;
-        match self {
-            F::UChar | F::Char | F::UCharNormalized | F::CharNormalized => 1,
-            F::UChar2
-            | F::Char2
-            | F::UChar2Normalized
-            | F::Char2Normalized
-            | F::UShort
-            | F::Short
-            | F::UShortNormalized
-            | F::ShortNormalized
-            | F::Half => 2,
-            F::UChar3 | F::Char3 | F::UChar3Normalized | F::Char3Normalized => 3,
-            F::UChar4
-            | F::Char4
-            | F::UChar4Normalized
-            | F::Char4Normalized
-            | F::UChar4NormalizedBgra
-            | F::UShort2
-            | F::Short2
-            | F::UShort2Normalized
-            | F::Short2Normalized
-            | F::Half2
-            | F::Float
-            | F::Int
-            | F::UInt
-            | F::Int1010102Normalized
-            | F::UInt1010102Normalized
-            | F::FloatRg11B10
-            | F::FloatRgb9E5 => 4,
-            F::UShort3 | F::Short3 | F::UShort3Normalized | F::Short3Normalized | F::Half3 => 6,
-            F::UShort4
-            | F::Short4
-            | F::UShort4Normalized
-            | F::Short4Normalized
-            | F::Half4
-            | F::Float2
-            | F::Int2
-            | F::UInt2 => 8,
-            F::Float3 | F::Int3 | F::UInt3 => 12,
-            F::Float4 | F::Int4 | F::UInt4 => 16,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub enum VertexStepFunction {
-    Constant,
-    #[default]
-    PerVertex,
-    PerInstance,
-}
-
-impl VertexStepFunction {
-    pub const fn mtl_ordinal(self) -> u32 {
-        use reims_vgpu_protocol::vertex_step as step;
-        match self {
-            Self::Constant => step::MTL_VERTEX_STEP_FUNCTION_CONSTANT,
-            Self::PerVertex => step::MTL_VERTEX_STEP_FUNCTION_PER_VERTEX,
-            Self::PerInstance => step::MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -483,58 +310,6 @@ pub enum SampledByteOrigin {
     LinearTexture,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum BlendFactor {
-    Zero,
-    One,
-    SrcColor,
-    OneMinusSrcColor,
-    SrcAlpha,
-    OneMinusSrcAlpha,
-    DstColor,
-    OneMinusDstColor,
-    DstAlpha,
-    OneMinusDstAlpha,
-    SrcAlphaSaturated,
-    ConstantColor,
-    OneMinusConstantColor,
-    ConstantAlpha,
-    OneMinusConstantAlpha,
-    Src1Color,
-    OneMinusSrc1Color,
-    Src1Alpha,
-    OneMinusSrc1Alpha,
-}
-
-impl BlendFactor {
-    pub const fn is_dual_source(self) -> bool {
-        matches!(
-            self,
-            Self::Src1Color | Self::OneMinusSrc1Color | Self::Src1Alpha | Self::OneMinusSrc1Alpha
-        )
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum BlendOp {
-    Add,
-    Subtract,
-    ReverseSubtract,
-    Min,
-    Max,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct BlendStateResource {
-    pub src_color: BlendFactor,
-    pub dst_color: BlendFactor,
-    pub color_op: BlendOp,
-    pub src_alpha: BlendFactor,
-    pub dst_alpha: BlendFactor,
-    pub alpha_op: BlendOp,
-    pub constants: [f32; 4],
-}
-
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum SeedOrder {
     #[default]
@@ -573,14 +348,16 @@ mod tests {
 
     #[test]
     fn viewport_and_attachment_relations_are_semantic() {
-        let mut request = DrawRequest::default();
-        request.target_identity = Some(crate::TargetIdentity::Gva {
-            gva: 1,
-            width: 4,
-            height: 4,
-            generation: 1,
-            format: TexelLayout::Rgba8,
-        });
+        let request = DrawRequest {
+            target_identity: Some(crate::TargetIdentity::Gva {
+                gva: 1,
+                width: 4,
+                height: 4,
+                generation: 1,
+                format: TexelLayout::Rgba8,
+            }),
+            ..Default::default()
+        };
         assert_eq!(viewport_slot_count(&request), 1);
         assert_eq!(
             request.attachment_slot(request.target_identity.as_ref().unwrap()),

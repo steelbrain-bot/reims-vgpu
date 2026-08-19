@@ -17,14 +17,13 @@ fn linear_target_storage(gva: u64, row_stride: u32, height: u32) -> ColorTargetS
     })
 }
 
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn m2v_draw_boundary_preserves_the_engine_vk_call_slug() {
     let req = DrawEncodeRequest {
         pipeline_ref: 73,
         ..DrawEncodeRequest::default()
     };
-    let err = crate::backend::vulkan::engine::vk_call::exec_submit_device_lost_fixture();
+    let err = reims_vgpu_vulkan::engine::vk_call::exec_submit_device_lost_fixture();
 
     let line = linux_m2v_draw_failure(&err, &req).render();
     assert!(
@@ -62,11 +61,11 @@ fn clear_black_attachment(texture_ref: u32) -> crate::runtime::decode::render::C
 /// Named because it used to be spelled `3, 1, 3, 0, 0` at four call sites — five
 /// positional `u32`s with two `3`s among them, where a transposition compiles and
 /// draws something plausible.
-fn test_triangle() -> crate::contract::draw::DrawArgs {
-    crate::contract::draw::DrawArgs {
+fn test_triangle() -> reims_vgpu_core::draw::DrawArgs {
+    reims_vgpu_core::draw::DrawArgs {
         vertex_count: 3,
         instance_count: 1,
-        primitive_type: 3,
+        primitive_topology: reims_vgpu_protocol::PrimitiveTopology::Triangle,
         first_vertex: 0,
         base_instance: 0,
     }
@@ -76,7 +75,7 @@ fn test_triangle() -> crate::contract::draw::DrawArgs {
 /// targets with: attachment in slot 0, no depth. Five bodies passed those
 /// trailing literals; only `pipeline_ref` and the attachment ever varied.
 fn single_rt_draw_request<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     pipeline_ref: u32,
     att: crate::runtime::decode::render::ColorAttachment,
@@ -90,31 +89,24 @@ fn single_rt_draw_request<M: HostMemory + HostOps>(
         &[],
         test_triangle(),
     )
+    .ok()
+    .flatten()
 }
 
 /// One reflection binding of `kind` at `metal_index` for the
 /// `frag_declared_unbound` guard tests. Only kind + index are load-bearing.
-#[cfg(feature = "backend-vulkan")]
 fn rb(
-    kind: metal2vulkan::reflect::ResourceKind,
+    kind: reims_vgpu_core::ShaderResourceKind,
     metal_index: u32,
-) -> metal2vulkan::reflect::ResourceBinding {
-    metal2vulkan::reflect::ResourceBinding {
+) -> reims_vgpu_core::ShaderResourceBinding {
+    reims_vgpu_core::ShaderResourceBinding {
         kind,
         metal_index,
         descriptor: None,
-        param_index: None,
-        stage_input_location: None,
-        address_space: None,
-        declared_size: None,
         extent: None,
         footprint: None,
-        type_layout: None,
-        type_name: None,
         texture_shape: None,
-        embedded_source: None,
         access: None,
-        static_sampler: None,
     }
 }
 
@@ -125,7 +117,6 @@ fn rb(
 /// A four-page window laid out as one 16 KiB granule is one run and the answer
 /// is one reference; the same four pages shuffled are four. Banding by page
 /// count would report the same number for both and rank the decision wrongly.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn the_packed_scatter_band_counts_runs_and_not_pages() {
     use crate::runtime::bound_buffers::packed_scatter_band;
@@ -179,7 +170,6 @@ fn the_packed_scatter_band_counts_runs_and_not_pages() {
 /// number of texels has no `bufferRowLength` — that field counts texels, not
 /// bytes, so the copy would stride to the wrong place.
 #[test]
-#[cfg(feature = "backend-vulkan")]
 fn strided_window_extent_measures_padded_rows_and_refuses_unrepresentable_strides() {
     // Tight rows: the extent is exactly the image, and no row length is needed.
     assert_eq!(strided_window_extent(64, 32, 4, 256), Some((256 * 32, 0)));
@@ -203,12 +193,14 @@ fn strided_window_extent_measures_padded_rows_and_refuses_unrepresentable_stride
 }
 
 #[test]
-#[cfg(feature = "backend-vulkan")]
 fn iosurface_texture_zero_copy_declines_transient_host_mappings() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     let mid = 7u32;
     let width = 128u32;
@@ -221,8 +213,8 @@ fn iosurface_texture_zero_copy_declines_transient_host_mappings() {
     }
     assert!(state.map_surface(mid));
     {
-        let m = state.mappings.get_mut(&mid).unwrap();
-        m.page_entries = (0..page_count)
+        let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+        m.pages.entries = (0..page_count)
             .map(|i| ((base_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
             .collect();
     }
@@ -239,7 +231,6 @@ fn iosurface_texture_zero_copy_declines_transient_host_mappings() {
 }
 
 #[test]
-#[cfg(feature = "backend-vulkan")]
 fn mapping_sampled_planes_reuse_one_resource_owned_import() {
     // The guest-RAM map resolves once per process and every test in this binary
     // shares it, so a fixture that maps its own RAM has to discard whatever an
@@ -247,11 +238,14 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
     // some other test's host and refuses — which is the right refusal against
     // the wrong host.
     crate::runtime::guest_ram_map::reset();
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
 
     let page = 1u64 << PAGE_SHIFT_X86;
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     host.stable_map_pages = true;
     let mid = 17u32;
@@ -260,8 +254,8 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
     host.map_range(gpa0, (u64::from(pages) * page) as usize, 0);
     assert!(state.map_surface(mid));
     {
-        let mapping = state.mappings.get_mut(&mid).unwrap();
-        mapping.page_entries = (0..pages)
+        let mapping = state.surfaces.mappings.get_mut(&mid).unwrap();
+        mapping.pages.entries = (0..pages)
             .map(|i| {
                 ((((gpa0 >> PAGE_SHIFT_X86) as u32) + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
             })
@@ -271,7 +265,7 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
         mid,
         128,
         128,
-        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB,
+        reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB,
     ));
     crate::runtime::guest_ram::latch_import_limits(page, 1 << 30, 1 << 30);
     let iosurface_texture_witnesses = crate::runtime::drain::store_route_count("gw_rail_iosurface");
@@ -363,16 +357,16 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
         &iosurface_plane_view_import
     ));
     assert_eq!(
-        state.mappings[&mid]
-            .contig_import
-            .as_ref()
+        state.surfaces.mappings[&mid]
+            .materialization
+            .view()
+            .and_then(|view| view.import())
             .map(|import| import.id()),
         Some(iosurface_texture_import.id())
     );
 }
 
 #[test]
-#[cfg(feature = "backend-vulkan")]
 fn small_mapping_sampled_plane_uses_its_imported_copy_source() {
     // The guest-RAM map resolves once per process and every test in this binary
     // shares it, so a fixture that maps its own RAM has to discard whatever an
@@ -380,20 +374,23 @@ fn small_mapping_sampled_plane_uses_its_imported_copy_source() {
     // some other test's host and refuses — which is the right refusal against
     // the wrong host.
     crate::runtime::guest_ram_map::reset();
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
 
     let page = 1u64 << PAGE_SHIFT_X86;
     let (width, height) = (16u32, 16u32);
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     host.stable_map_pages = true;
     let mid = 18u32;
     let gpa = 0x4200_0000u64;
     host.map_range(gpa, page as usize, 0);
     assert!(state.map_surface(mid));
-    state.mappings.get_mut(&mid).unwrap().page_entries =
+    state.surfaces.mappings.get_mut(&mid).unwrap().pages.entries =
         vec![((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT | PAGE_ENTRY_VALID];
     assert!(state.set_mapping_geom(mid, width, height, MTL_FORMAT_BGRA8_UNORM));
     crate::runtime::guest_ram::latch_import_limits(page, 1 << 30, 1 << 30);
@@ -411,7 +408,6 @@ fn small_mapping_sampled_plane_uses_its_imported_copy_source() {
 }
 
 #[test]
-#[cfg(feature = "backend-vulkan")]
 fn linear_volume_gather_carries_every_depth_plane() {
     let (width, height, depth, row_stride) = (64u32, 64u32, 5u32, 256u64);
     let layout = crate::runtime::decode::resource::TextureLevelLayout {
@@ -428,9 +424,8 @@ fn linear_volume_gather_carries_every_depth_plane() {
 }
 
 #[test]
-#[cfg(feature = "backend-vulkan")]
 fn tight_linear_cpu_fallback_reads_every_depth_plane() {
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
     let native = [3u8, 5, 7, 255].repeat(2 * 2 * 3);
     let (bytes, format) = load_tight_linear_rgba_with(
@@ -452,28 +447,29 @@ fn tight_linear_cpu_fallback_reads_every_depth_plane() {
 
 #[test]
 fn cpu_portability_store_publishes_composite() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::model::SurfaceWriteKind;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let (mid, width, height) = (5u32, 64u32, 48u32);
     assert!(state.map_surface(mid));
     {
-        let mapping = state.mappings.get_mut(&mid).unwrap();
-        mapping.mapped = true;
-        mapping.has_geom = true;
-        mapping.width = width;
-        mapping.height = height;
-        mapping.format = MTL_FORMAT_BGRA8_UNORM;
-        mapping.page_entries = vec![(1 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
-        mapping.content_generation = 2;
+        let mapping = state.surfaces.mappings.get_mut(&mid).unwrap();
+        mapping.lifecycle.active = true;
+        mapping.publish_geometry_for_test(width, height, MTL_FORMAT_BGRA8_UNORM);
+        mapping.pages.entries = vec![(1 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        mapping.content.guest_page_generation = 2;
     }
-    state.present.valid = true;
-    state.present.width = width;
-    state.present.height = height;
-    state.present.frame_flush_seen = true;
+    state
+        .presentation
+        .present
+        .establish_console(width, height, 0);
+    state.presentation.present.cross_content_boundary();
 
     publish_surface_store(
         &mut state,
@@ -485,14 +481,13 @@ fn cpu_portability_store_publishes_composite() {
     );
 
     assert_eq!(state.surface_write_kind(mid), SurfaceWriteKind::Composite);
-    assert_eq!(state.present.early_front_mapping, mid);
+    assert_eq!(state.presentation.present.early_composite_mapping(), mid);
 }
 
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn frag_unbound_scan_reports_only_missing_standard_kinds() {
     use crate::runtime::draw::{FragUnbound, FragUnboundClass};
-    use metal2vulkan::reflect::ResourceKind as K;
+    use reims_vgpu_core::ShaderResourceKind as K;
     let gap = |class, metal_index| FragUnbound { class, metal_index };
     let tex = |i| gap(FragUnboundClass::Texture, i);
     let buf = |i| gap(FragUnboundClass::Buffer, i);
@@ -566,16 +561,17 @@ fn frag_unbound_scan_reports_only_missing_standard_kinds() {
     assert_eq!(smp(0).to_string(), "smp0");
 }
 
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn reflected_static_sampler_maps_exact_state_and_rejects_unimplemented_modes() {
-    use metal2vulkan::reflect::{
-        SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerCoordinates,
-        SamplerFilter, SamplerMipFilter, SamplerReduction, StaticSamplerState,
-    };
     use reims_vgpu_core::{
-        SamplerAddressMode as EngineAddress, SamplerFilter as EngineFilter,
-        SamplerMipFilter as EngineMip,
+        ReflectedSamplerAddressMode as SamplerAddressMode,
+        ReflectedSamplerBorderColor as SamplerBorderColor,
+        ReflectedSamplerCompareFunction as SamplerCompareFunction,
+        ReflectedSamplerCoordinates as SamplerCoordinates, ReflectedSamplerFilter as SamplerFilter,
+        ReflectedSamplerMipFilter as SamplerMipFilter,
+        ReflectedSamplerReduction as SamplerReduction,
+        ReflectedStaticSamplerState as StaticSamplerState, SamplerAddressMode as EngineAddress,
+        SamplerFilter as EngineFilter, SamplerMipFilter as EngineMip,
     };
 
     let mut state = StaticSamplerState {
@@ -642,24 +638,23 @@ fn reflected_static_sampler_maps_exact_state_and_rejects_unimplemented_modes() {
     );
 }
 
-#[cfg(feature = "backend-vulkan")]
 #[test]
-fn reflected_sampled_collision_includes_sampler_band_only() {
-    use metal2vulkan::reflect::ShaderStage;
-
-    let vertex = shader_pull_reflection(&[64]);
-    let mut fragment = shader_pull_reflection(&[64]);
-    fragment.stage = ShaderStage::Fragment;
+fn reflected_sampled_collision_uses_semantic_kind_and_metal_index() {
+    let mut vertex = shader_pull_reflection(&[64]);
+    vertex.bindings[0].kind = reims_vgpu_core::ShaderResourceKind::Texture;
+    vertex.bindings[0].metal_index = 32;
+    let mut fragment = vertex.clone();
+    fragment.stage = reims_vgpu_core::ReflectedShaderStage::Fragment;
     assert!(reflected_sampled_binding_collision(&vertex, &fragment));
 
-    fragment.bindings[0].descriptor.as_mut().unwrap().binding = 65;
+    fragment.bindings[0].metal_index = 33;
     assert!(!reflected_sampled_binding_collision(&vertex, &fragment));
 
-    fragment.bindings[0].descriptor.as_mut().unwrap().binding = 96;
+    fragment.bindings[0].metal_index = 32;
+    fragment.bindings[0].kind = reims_vgpu_core::ShaderResourceKind::ColorInput;
     assert!(!reflected_sampled_binding_collision(&vertex, &fragment));
 }
 
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn depth_stencil_triviality_matches_no_op_state() {
     use crate::runtime::decode::resource::DepthStencilDescriptor;
@@ -702,16 +697,66 @@ fn depth_stencil_triviality_matches_no_op_state() {
     ));
 }
 
-#[cfg(feature = "backend-vulkan")]
+#[test]
+fn invalid_fixed_function_pipeline_state_refuses_semantic_preparation() {
+    use crate::runtime::decode::resource::{
+        DepthStencilDescriptor, PipelineColorAttachment, RenderPipelineDescriptor,
+    };
+    use reims_vgpu_protocol::PipelineStateDecodeError;
+
+    let pipeline = RenderPipelineDescriptor {
+        color_attachments: vec![PipelineColorAttachment {
+            slot: 0,
+            blending_enabled: true,
+            src_rgb: 99,
+            ..PipelineColorAttachment::default()
+        }],
+        ..RenderPipelineDescriptor::default()
+    };
+    assert!(matches!(
+        semantic_blend_states(&pipeline, [0.0; 4]),
+        Err(DrawPreparationDecline::BlendState {
+            reason: PipelineStateDecodeError::BlendFactor(99)
+        })
+    ));
+
+    let request = DrawEncodeRequest::default();
+    let invalid_depth = DepthStencilDescriptor {
+        depth_compare_function: 99,
+        depth_write_enabled: true,
+        ..DepthStencilDescriptor::default()
+    };
+    assert!(matches!(
+        semantic_depth_state(&invalid_depth, &request),
+        Err(DrawPreparationDecline::DepthCompare {
+            reason: PipelineStateDecodeError::CompareFunction(99)
+        })
+    ));
+
+    let mut invalid_stencil = DepthStencilDescriptor {
+        depth_compare_function: 7,
+        front_stencil_enabled: true,
+        ..DepthStencilDescriptor::default()
+    };
+    invalid_stencil.front_face.stencil_failure_operation = 99;
+    assert!(matches!(
+        semantic_depth_state(&invalid_stencil, &request),
+        Err(DrawPreparationDecline::StencilState {
+            face: "front",
+            reason: PipelineStateDecodeError::StencilOperation(99)
+        })
+    ));
+}
+
 #[test]
 fn bound_depth_stencil_that_cannot_resolve_returns_named_reason() {
     // A guest that binds a depth-stencil ref (`ds_ref != 0`) whose object-list
     // entry does not resolve must surface a *specific* reason, not `None`: the
     // draw silently disables the depth test otherwise, and every other
-    // depth/stencil degradation on this path is already fail-visible. With an
-    // empty state the lookup misses → the entry-missing reason, which the caller
-    // logs as `shader_state_degraded reason=depth_stencil_no_list_entry`.
-    let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    // depth/stencil error on this path is already fail-visible. With an empty
+    // state the lookup misses at the entry-missing rung; execution maps that
+    // rung to `DrawPreparationDecline::DepthStencilStateMissing` and refuses.
+    let state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let host = FakeHost::new();
     let err = load_depth_stencil_descriptor(&state, &host, /*task*/ 4, /*ds_ref*/ 9)
         .expect_err("unresolvable bound depth-stencil must report a reason");
@@ -732,7 +777,7 @@ fn bound_depth_stencil_that_cannot_resolve_returns_named_reason() {
 /// guard an unbound ref would read entry 0 and report a rung for it.
 #[test]
 fn a_pipeline_that_cannot_load_names_the_rung_and_an_unbound_ref_stays_quiet() {
-    let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let host = FakeHost::new();
 
     let cap = crate::observe::FailCapture::start();
@@ -757,16 +802,17 @@ fn index_load_failures_report_the_specific_reason() {
     // The Vulkan indexed-draw path collapsed eleven distinct load failures into
     // one `index_buffer_miss`; each now names the failing check so a boot log
     // says *which* one fired.
-    let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let host = FakeHost::new();
 
     // Unsupported MTLIndexType (only 0=u16 / 1=u32 exist).
     let bad_type = IndexedDrawInfo {
         base_vertex: 0,
-        index_type: 5,
+        index_type: reims_vgpu_protocol::decode_index_type(5),
         index_count: 3,
         index_buffer_ref: 9,
         index_buffer_offset: 0,
+        index_start: 0,
     };
     assert_eq!(
         load_index_bytes_reason(&state, &host, 4, &bad_type),
@@ -777,14 +823,34 @@ fn index_load_failures_report_the_specific_reason() {
     // an empty state → the entry-missing site, not a generic miss.
     let unresolved = IndexedDrawInfo {
         base_vertex: 0,
-        index_type: 1,
+        index_type: reims_vgpu_protocol::decode_index_type(1),
         index_count: 6,
         index_buffer_ref: 9,
         index_buffer_offset: 0,
+        index_start: 0,
     };
     assert_eq!(
         load_index_bytes_reason(&state, &host, 4, &unresolved),
         Err(IndexLoadReason::EntryMissing)
+    );
+}
+
+#[test]
+fn indirect_index_start_is_scaled_only_after_the_type_decodes() {
+    let info = |raw, index_start| IndexedDrawInfo {
+        base_vertex: 0,
+        index_type: reims_vgpu_protocol::decode_index_type(raw),
+        index_count: 1,
+        index_buffer_ref: 1,
+        index_buffer_offset: 0x100,
+        index_start,
+    };
+
+    assert_eq!(info(0, 3).resolved_byte_offset(), Ok(0x106));
+    assert_eq!(info(1, 3).resolved_byte_offset(), Ok(0x10c));
+    assert_eq!(
+        info(7, 3).resolved_byte_offset(),
+        Err(IndexLoadReason::TypeUnsupported)
     );
 }
 
@@ -864,61 +930,33 @@ fn encode_status_renders_its_check_beside_the_class_it_collapsed_to() {
 
 /// A vertex reflection that trips the shader-pull coverage gate: writes
 /// Position, reads VertexIndex, binds a Buffer at each of `bindings`.
-#[cfg(feature = "backend-vulkan")]
-fn shader_pull_reflection(bindings: &[u32]) -> metal2vulkan::reflect::ShaderReflection {
-    use metal2vulkan::reflect::{
-        BufferExtent, DescriptorLocation, ResourceBinding, ResourceKind, ShaderReflection,
-        ShaderStage, VertexBuiltins, REFLECTION_VERSION,
+fn shader_pull_reflection(bindings: &[u32]) -> reims_vgpu_core::ShaderInterface {
+    use reims_vgpu_core::{
+        ReflectedShaderStage, ShaderBufferExtent, ShaderDescriptorLocation, ShaderInterface,
+        ShaderResourceBinding, ShaderResourceKind,
     };
-    ShaderReflection {
-        reflection_version: REFLECTION_VERSION,
-        stage: ShaderStage::Vertex,
-        entry_point: None,
+    ShaderInterface {
+        stage: ReflectedShaderStage::Vertex,
         bindings: bindings
             .iter()
-            .map(|&binding| ResourceBinding {
-                kind: ResourceKind::Buffer,
+            .map(|&binding| ShaderResourceBinding {
+                kind: ShaderResourceKind::Buffer,
                 metal_index: binding,
-                descriptor: Some(DescriptorLocation {
+                descriptor: Some(ShaderDescriptorLocation {
                     set: 0,
                     binding,
                     count: 1,
                 }),
-                param_index: None,
-                stage_input_location: None,
-                address_space: None,
-                declared_size: None,
                 // What the translator emits for a buffer carrying neither an
                 // object size nor a type name: the class that forbids narrowing.
-                extent: Some(BufferExtent::Unknown),
+                extent: Some(ShaderBufferExtent::Unknown),
                 footprint: None,
-                type_layout: None,
-                type_name: None,
                 texture_shape: None,
-                embedded_source: None,
                 access: None,
-                static_sampler: None,
             })
             .collect(),
-        argument_buffer_fields: vec![],
-        vertex_attributes: vec![],
-        varyings: vec![],
-        render_targets: vec![],
-        depth_members: vec![],
-        depth_qualifier: None,
-        stencil_members: vec![],
         local_size: None,
-        vertex_builtins: Some(VertexBuiltins {
-            uses_vertex_index: true,
-            uses_instance_index: false,
-            writes_position: true,
-        }),
-        tessellation: None,
-        imageblock_layouts: vec![],
-        implicit_imageblock_attachments: vec![],
-        fragment_imageblock: None,
-        datalayout: None,
-        function_constants: vec![],
+        unsupported: None,
     }
 }
 
@@ -928,7 +966,6 @@ fn shader_pull_reflection(bindings: &[u32]) -> metal2vulkan::reflect::ShaderRefl
 /// every stage-in buffer left binding 1 unbound, so glyphs collapsed to
 /// zero-area quads (blank Safari body text). A stage-in buffer whose binding
 /// the vertex SPIR-V declares as a StorageBuffer must still be bound.
-#[cfg(feature = "backend-vulkan")]
 /// `swap_rb_channels` must be byte-identical to the `src.to_vec()` +
 /// in-place `chunks_exact_mut(4)` swizzle it replaces — including the tail
 /// (a non-multiple-of-4 remainder copied through unchanged) — and be its own
@@ -968,7 +1005,6 @@ fn swap_rb_channels_matches_two_pass_and_preserves_tail() {
 /// the call that used to be a 776 us whole-frame pass and is now a compare. A
 /// future edit that made it exchange unconditionally would restore that cost
 /// silently — the pixels would still be right.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn reorder_rb_in_place_is_a_no_op_when_the_orders_already_agree() {
     for len in [0usize, 4, 8, 5, 260, 263] {
@@ -993,7 +1029,6 @@ fn reorder_rb_in_place_is_a_no_op_when_the_orders_already_agree() {
 }
 
 /// Vulkan-arm only: a stage-in buffer can also be a direct shader buffer.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn stage_in_buffer_read_as_ssbo_is_bound_as_storage() {
     let reflection = shader_pull_reflection(&[1]);
@@ -1008,14 +1043,13 @@ fn stage_in_buffer_read_as_ssbo_is_bound_as_storage() {
 /// Resident GVA chain wiring: the identity is built only for GVA color0
 /// (never IOSurface texture), and its extent is color0's declared geometry — the one
 /// place a draw states what it renders into.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn gva_chain_identity_rules() {
     use crate::model::TargetIdentity;
     let executor = crate::runtime::executor::VulkanExecutor::default();
     let mut req = DrawEncodeRequest::default();
     assert_eq!(
-        gva_chain_identity(&executor, &req),
+        gva_chain_identity(&executor, &req, 0),
         None,
         "no colors → no identity"
     );
@@ -1028,43 +1062,42 @@ fn gva_chain_identity_rules() {
         ..Default::default()
     });
     assert_eq!(
-        gva_chain_identity(&executor, &req),
+        gva_chain_identity(&executor, &req, 0),
         Some(TargetIdentity::Gva {
             gva: 0x1234_0000,
             width: 16,
             height: 16,
             generation: 0,
-            format: crate::contract::pixel_format::TexelLayout::Rgba8,
+            format: reims_vgpu_core::pixel_format::TexelLayout::Rgba8,
         }),
         "color0 declares the extent"
     );
     req.colors[0].width = 0;
     assert_eq!(
-        gva_chain_identity(&executor, &req),
+        gva_chain_identity(&executor, &req, 0),
         None,
         "a zero-extent attachment has no identity"
     );
     req.colors[0].width = 16;
     req.colors[0].storage = mapping_target_storage(5);
     assert_eq!(
-        gva_chain_identity(&executor, &req),
+        gva_chain_identity(&executor, &req, 0),
         None,
         "IOSurface texture targets never take the GVA identity"
     );
     req.colors[0].storage = ColorTargetStorage::None;
     assert_eq!(
-        gva_chain_identity(&executor, &req),
+        gva_chain_identity(&executor, &req, 0),
         None,
         "gva=0 → no identity"
     );
 }
 
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn render_chain_identity_covers_iosurface_texture_and_gva_targets() {
     use crate::model::TargetIdentity;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     assert!(state.map_surface(5));
     let mut req = DrawEncodeRequest::default();
     req.colors.push(ColorRtRequest {
@@ -1076,7 +1109,7 @@ fn render_chain_identity_covers_iosurface_texture_and_gva_targets() {
         ..Default::default()
     });
     assert!(matches!(
-        render_chain_identity(&state, &req),
+        render_chain_identity(&state, &req, 0),
         Some(TargetIdentity::Surface {
             id: 5,
             width: 64,
@@ -1087,13 +1120,13 @@ fn render_chain_identity_covers_iosurface_texture_and_gva_targets() {
 
     req.colors[0].storage = linear_target_storage(0x1234_0000, 64 * 4, 32);
     assert_eq!(
-        render_chain_identity(&state, &req),
+        render_chain_identity(&state, &req, 0),
         Some(TargetIdentity::Gva {
             gva: 0x1234_0000,
             width: 64,
             height: 32,
             generation: 0,
-            format: crate::contract::pixel_format::TexelLayout::Rgba8,
+            format: reims_vgpu_core::pixel_format::TexelLayout::Rgba8,
         })
     );
 }
@@ -1109,10 +1142,9 @@ fn render_chain_identity_covers_iosurface_texture_and_gva_targets() {
 /// from one attachment template, so the record that loads from the resident is by
 /// construction the record that renders into it, and a Store naming a different
 /// slot than its own LOAD would pin an image its frame is not in.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_chained_composite_store_names_the_resident_it_loads_from() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     assert!(state.map_surface(7));
     let mut req = DrawEncodeRequest::default();
     req.colors.push(ColorRtRequest {
@@ -1121,8 +1153,8 @@ fn a_chained_composite_store_names_the_resident_it_loads_from() {
         storage: mapping_target_storage(7),
         width: 128,
         height: 64,
-        load_action: MTL_LOAD_ACTION_LOAD,
-        store_action: MTL_STORE_ACTION_STORE,
+        load_action: reims_vgpu_protocol::pass_action::LoadAction::Load,
+        store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
         ..Default::default()
     });
 
@@ -1141,7 +1173,7 @@ fn a_chained_composite_store_names_the_resident_it_loads_from() {
     );
     assert_eq!(
         iosurface_texture_store_identity(&state, &req, true),
-        render_chain_identity(&state, &req),
+        render_chain_identity(&state, &req, 0),
         "the Store identity and the LoadFromTarget identity must be one slot"
     );
 
@@ -1153,13 +1185,13 @@ fn a_chained_composite_store_names_the_resident_it_loads_from() {
         None,
         "an intermediate record stores nothing guest-visible"
     );
-    req.colors[0].store_action = crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE;
+    req.colors[0].store_action = reims_vgpu_protocol::pass_action::StoreAction::DontCare;
     assert_eq!(
         iosurface_texture_store_identity(&state, &req, true),
         None,
         "a record that discards its target has no frame to defer"
     );
-    req.colors[0].store_action = MTL_STORE_ACTION_STORE;
+    req.colors[0].store_action = reims_vgpu_protocol::pass_action::StoreAction::Store;
     req.colors[0].storage = ColorTargetStorage::None;
     assert_eq!(
         iosurface_texture_store_identity(&state, &req, true),
@@ -1180,10 +1212,9 @@ fn a_chained_composite_store_names_the_resident_it_loads_from() {
 /// armed, which advanced the epoch and cost the *next* LOAD its elision too. One
 /// boot measured `surface_flush / surface_resident` at 1369/1373 — one flush per
 /// arm.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn an_intermediate_record_can_still_ask_about_the_resident_it_renders_into() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     assert!(state.map_surface(7));
     let mut req = DrawEncodeRequest::default();
     req.colors.push(ColorRtRequest {
@@ -1192,8 +1223,8 @@ fn an_intermediate_record_can_still_ask_about_the_resident_it_renders_into() {
         storage: mapping_target_storage(7),
         width: 128,
         height: 64,
-        load_action: MTL_LOAD_ACTION_LOAD,
-        store_action: MTL_STORE_ACTION_STORE,
+        load_action: reims_vgpu_protocol::pass_action::LoadAction::Load,
+        store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
         ..Default::default()
     });
 
@@ -1205,7 +1236,7 @@ fn an_intermediate_record_can_still_ask_about_the_resident_it_renders_into() {
     );
     assert_eq!(
         Some(identity.clone()),
-        render_chain_identity(&state, &req),
+        render_chain_identity(&state, &req, 0),
         "the LOAD must ask about the slot the record actually renders into"
     );
     assert_eq!(
@@ -1228,24 +1259,24 @@ fn an_intermediate_record_can_still_ask_about_the_resident_it_renders_into() {
 
     // The refusals. A LOAD the resident cannot serve must not produce a query at
     // all, or the counters below it would divide all draws instead of candidates.
-    req.colors[0].load_action = crate::contract::pass_action::MTL_LOAD_ACTION_CLEAR;
+    req.colors[0].load_action = reims_vgpu_protocol::pass_action::LoadAction::Clear;
     assert!(
         iosurface_texture_load_currency_query(&state, &req).is_none(),
         "a CLEAR has no prior content to be current"
     );
-    req.colors[0].load_action = MTL_LOAD_ACTION_LOAD;
+    req.colors[0].load_action = reims_vgpu_protocol::pass_action::LoadAction::Load;
     req.colors[0].target_seed_rgba = Some(vec![0u8; 128 * 64 * 4]);
     assert!(
         iosurface_texture_load_currency_query(&state, &req).is_none(),
         "an explicit seed was already selected by RT provenance"
     );
     req.colors[0].target_seed_rgba = None;
-    req.colors[0].store_action = crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE;
+    req.colors[0].store_action = reims_vgpu_protocol::pass_action::StoreAction::DontCare;
     assert!(
         iosurface_texture_load_currency_query(&state, &req).is_none(),
         "a record that discards its target renders into no resident worth naming"
     );
-    req.colors[0].store_action = MTL_STORE_ACTION_STORE;
+    req.colors[0].store_action = reims_vgpu_protocol::pass_action::StoreAction::Store;
     req.colors[0].storage = ColorTargetStorage::None;
     assert!(
         iosurface_texture_load_currency_query(&state, &req).is_none(),
@@ -1255,7 +1286,6 @@ fn an_intermediate_record_can_still_ask_about_the_resident_it_renders_into() {
 
 /// Attachment aliasing follows the serialized texture reference and load
 /// action, independent of where its initial contents happen to reside.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn attachment_alias_selection_uses_only_the_texture_contract() {
     use reims_vgpu_core::AttachmentInitial;
@@ -1267,7 +1297,7 @@ fn attachment_alias_selection_uses_only_the_texture_contract() {
         storage: linear_target_storage(0x9000, 8 * 4, 8),
         width: 8,
         height: 8,
-        load_action: MTL_LOAD_ACTION_LOAD,
+        load_action: reims_vgpu_protocol::pass_action::LoadAction::Load,
         ..Default::default()
     });
     assert_eq!(
@@ -1295,8 +1325,7 @@ fn attachment_alias_selection_uses_only_the_texture_contract() {
     );
 }
 
-/// Vulkan-arm only: the attachment alias resolver is a `backend-vulkan` item.
-#[cfg(feature = "backend-vulkan")]
+/// Vulkan-path only: the attachment alias resolver belongs to draw preparation.
 #[test]
 fn attachment_alias_preserves_each_declared_load_action() {
     use reims_vgpu_core::AttachmentInitial;
@@ -1313,7 +1342,7 @@ fn attachment_alias_preserves_each_declared_load_action() {
             storage: linear_target_storage(target_gva, 2 * 4, 1),
             width: 2,
             height: 1,
-            load_action: MTL_LOAD_ACTION_LOAD,
+            load_action: reims_vgpu_protocol::pass_action::LoadAction::Load,
             target_seed_rgba: Some(seed.clone()),
             ..Default::default()
         }],
@@ -1332,12 +1361,12 @@ fn attachment_alias_preserves_each_declared_load_action() {
         fragment_attachment_alias_initial(&req, 0, texture_ref),
         Some((2, 1, AttachmentInitial::Seed))
     );
-    req.colors[0].load_action = MTL_LOAD_ACTION_DONT_CARE;
+    req.colors[0].load_action = reims_vgpu_protocol::pass_action::LoadAction::DontCare;
     assert_eq!(
         fragment_attachment_alias_initial(&req, 0, texture_ref),
         Some((2, 1, AttachmentInitial::DontCare))
     );
-    req.colors[0].load_action = MTL_LOAD_ACTION_CLEAR;
+    req.colors[0].load_action = reims_vgpu_protocol::pass_action::LoadAction::Clear;
     req.colors[0].clear_color = [0.25, 0.5, 0.75, 1.0];
     assert_eq!(
         fragment_attachment_alias_initial(&req, 0, texture_ref),
@@ -1345,7 +1374,6 @@ fn attachment_alias_preserves_each_declared_load_action() {
     );
 }
 
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn attachment_alias_source_keeps_one_texture_identity() {
     use reims_vgpu_core::AttachmentInitial;
@@ -1355,7 +1383,7 @@ fn attachment_alias_source_keeps_one_texture_identity() {
         width: 2,
         height: 1,
         generation: 7,
-        format: crate::contract::pixel_format::TexelLayout::Rgba8,
+        format: reims_vgpu_core::pixel_format::TexelLayout::Rgba8,
     };
     let format = reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8);
     let clear = attachment_alias_source(
@@ -1598,7 +1626,7 @@ fn tight_rgba_linear_load_preserves_native_bytes() {
 /// over a question that has a correct answer for every `u16`.
 #[test]
 fn a_mappings_declared_format_answers_for_every_mapping() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     // A mapping this device holds no entry for has declared nothing, and the
     // store rule's own "nothing declared" answer is what comes back.
     assert_eq!(
@@ -1607,24 +1635,28 @@ fn a_mappings_declared_format_answers_for_every_mapping() {
     );
     // One that declares a format outside every table this crate carries still
     // answers, and answers "not sRGB".
-    state.mappings.insert(
+    state.surfaces.mappings.insert(
         7,
-        crate::model::MappingEntry {
-            mapped: true,
-            has_geom: true,
-            width: 4,
-            height: 4,
-            format: 0xfffe,
+        crate::model::SurfaceMappingEntry {
+            lifecycle: crate::model::SurfaceMappingLifecycle {
+                active: true,
+                ..Default::default()
+            },
             ..Default::default()
-        },
+        }
+        .with_geometry_for_test(4, 4, 0xfffe),
     );
     assert_eq!(mapping_declared_format(&state, 7, None), 0xfffe);
     assert!(!pixel_format::is_srgb(mapping_declared_format(
         &state, 7, None
     )));
     // A declared sRGB surface reaches the bind as sRGB.
-    state.mappings.get_mut(&7).expect("just inserted").format =
-        pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB;
+    state
+        .surfaces
+        .mappings
+        .get_mut(&7)
+        .expect("just inserted")
+        .publish_geometry_for_test(4, 4, pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB);
     assert!(pixel_format::is_srgb(mapping_declared_format(
         &state, 7, None
     )));
@@ -1636,10 +1668,9 @@ fn a_mappings_declared_format_answers_for_every_mapping() {
     );
 }
 
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn the_cpu_upload_rails_carry_the_srgb_transfer_function_to_the_bind() {
-    use crate::backend::vulkan::translate::pixel::{vk_sampled_bytes, vk_texel_layout};
+    use reims_vgpu_vulkan::translate::pixel::{vk_sampled_bytes, vk_texel_layout};
 
     // Native-upload rail: an sRGB format resolves to exactly its linear
     // sibling's layout. That fold is correct and is not what was lost.
@@ -1691,7 +1722,9 @@ fn the_cpu_upload_rails_carry_the_srgb_transfer_function_to_the_bind() {
     // order the swap produced, and sRGB because that is what the guest stored.
     assert_eq!(
         vk_sampled_bytes(fmt),
-        ash::vk::Format::R8G8B8A8_SRGB,
+        reims_vgpu_vulkan::format::vk_image_format(
+            reims_vgpu_protocol::ImageFormat::srgb(TexelLayout::Rgba8).unwrap()
+        ),
         "the CPU rung must bind the same colour space the zero-copy rail does"
     );
 
@@ -1710,7 +1743,12 @@ fn the_cpu_upload_rails_carry_the_srgb_transfer_function_to_the_bind() {
     )
     .expect("native sRGB BGRA sample loads");
     assert_eq!(native_fmt.layout(), TexelLayout::Bgra8);
-    assert_eq!(vk_sampled_bytes(native_fmt), ash::vk::Format::B8G8R8A8_SRGB);
+    assert_eq!(
+        vk_sampled_bytes(native_fmt),
+        reims_vgpu_vulkan::format::vk_image_format(
+            reims_vgpu_protocol::ImageFormat::srgb(TexelLayout::Bgra8).unwrap()
+        )
+    );
 
     // A linear source must reach the linear spelling, or every bind decodes
     // twice and the fix is worse than the bug it replaced.
@@ -1734,7 +1772,6 @@ fn the_cpu_upload_rails_carry_the_srgb_transfer_function_to_the_bind() {
     );
 }
 
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn color_target_diag_names_every_mrt_slot() {
     let colors = vec![
@@ -1745,8 +1782,8 @@ fn color_target_diag_names_every_mrt_slot() {
             width: 1920,
             height: 1080,
             format: MTL_FORMAT_BGRA8_UNORM,
-            load_action: MTL_LOAD_ACTION_LOAD,
-            store_action: MTL_STORE_ACTION_STORE,
+            load_action: reims_vgpu_protocol::pass_action::LoadAction::Load,
+            store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
             ..Default::default()
         },
         ColorRtRequest {
@@ -1756,8 +1793,8 @@ fn color_target_diag_names_every_mrt_slot() {
             width: 960,
             height: 540,
             format: pixel_format::MTL_FORMAT_RGBA16_FLOAT,
-            load_action: MTL_LOAD_ACTION_CLEAR,
-            store_action: MTL_STORE_ACTION_STORE,
+            load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
+            store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
             ..Default::default()
         },
     ];
@@ -1770,7 +1807,7 @@ s2:r17:mid0:gva=0x12345000:960x540:fmt=0x73:l2:s1"
 
 #[test]
 fn missing_pipeline_is_soft() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     state.define_task(1, 0x1000, 2);
     let mut host = FakeHost::new();
     let req = DrawEncodeRequest {
@@ -1778,7 +1815,7 @@ fn missing_pipeline_is_soft() {
         pipeline_ref: 99,
         vertex_count: 3,
         instance_count: 1,
-        primitive_type: 3, // triangle
+        primitive_topology: reims_vgpu_protocol::PrimitiveTopology::Triangle,
         first_vertex: 0,
         colors: vec![ColorRtRequest {
             slot: 0,
@@ -1787,17 +1824,16 @@ fn missing_pipeline_is_soft() {
             width: 4,
             height: 4,
             format: MTL_FORMAT_BGRA8_UNORM,
-            store_action: MTL_STORE_ACTION_STORE,
+            store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
             ..Default::default()
         }],
         ..Default::default()
     };
-    let mut req = req;
     // Spelled here rather than behind a wrapper, because the two arms' wrappers
     // used to pass *different* `force_full_store` values for the same call.
     // These are the arguments `exec` passes for a single-record draw that owns
     // its writeback.
-    let st = encode_draw_chain(&mut state, &mut host, &mut req, true, false).0;
+    let st = encode_draw_chain(&mut state, &mut host, &req, true, false).status;
     assert!(matches!(
         st,
         EncodeStatus::MissingPipeline(_)
@@ -1816,7 +1852,7 @@ fn missing_pipeline_is_soft() {
 /// so the test reads each from where it comes from.
 #[test]
 fn each_bind_slot_bound_equals_its_own_basis() {
-    use crate::runtime::spirv_bind::{
+    use reims_vgpu_vulkan::spirv_bind::{
         COLOR_INPUT_BINDING_BASE, SAMPLER_BINDING_BASE, TEXTURE_BINDING_BASE,
     };
 
@@ -1960,9 +1996,9 @@ fn a_live_bind_past_its_table_is_reported_and_a_cleared_one_is_not() {
             Some(PastTableBind {
                 class,
                 stage: match stage {
-                    Stage::Vertex => reims_vgpu_vulkan::preparation::ShaderStage::Vertex,
-                    Stage::Fragment => reims_vgpu_vulkan::preparation::ShaderStage::Fragment,
-                    Stage::Unknown => reims_vgpu_vulkan::preparation::ShaderStage::Unknown,
+                    Stage::Vertex => reims_vgpu_core::ShaderStage::Vertex,
+                    Stage::Fragment => reims_vgpu_core::ShaderStage::Fragment,
+                    Stage::Unknown => reims_vgpu_core::ShaderStage::Unknown,
                 },
                 index,
                 resource_ref,
@@ -2000,10 +2036,9 @@ fn a_live_bind_past_its_table_is_reported_and_a_cleared_one_is_not() {
     assert_eq!(first_bind_past_table(&cleared), None);
 }
 
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn vulkan_sampler_missing_entry_returns_exact_decline() {
-    let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let host = FakeHost::new();
     let error = load_vulkan_sampler(&state, &host, 7, 11, 64)
         .expect_err("an empty object list cannot resolve sampler 11");
@@ -2017,7 +2052,6 @@ fn vulkan_sampler_missing_entry_returns_exact_decline() {
     );
 }
 
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn vertex_attribute_preparation_returns_exact_declines() {
     use crate::runtime::decode::resource::VertexAttribute;
@@ -2095,7 +2129,6 @@ fn vertex_attribute_preparation_returns_exact_declines() {
     }
 }
 
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn vulkan_sampler_preserves_guest_coordinate_and_filter_state() {
     use crate::runtime::decode::resource::SamplerDescriptor;
@@ -2220,10 +2253,9 @@ fn a8_sample_preserves_alpha_coverage() {
 }
 
 /// Metal blend factors/ops must map into engine blend types (Linux path was silent-None).
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn blend_state_maps_src_alpha_one_minus() {
-    let b = translate::blend::state(
+    let b = reims_vgpu_protocol::blend_state(
         &crate::runtime::decode::resource::PipelineColorAttachment {
             src_rgb: 4,   // SrcAlpha
             dst_rgb: 5,   // OneMinusSrcAlpha
@@ -2240,27 +2272,33 @@ fn blend_state_maps_src_alpha_one_minus() {
     assert_eq!(b.dst_color, reims_vgpu_core::BlendFactor::OneMinusSrcAlpha);
     assert_eq!(b.color_op, reims_vgpu_core::BlendOp::Add);
     assert_eq!(b.src_alpha, reims_vgpu_core::BlendFactor::One);
-    assert!(translate::blend::factor(99).is_err());
-    assert!(translate::blend::operation(9).is_err());
+    assert!(reims_vgpu_protocol::blend_factor(99).is_err());
+    assert!(reims_vgpu_protocol::blend_operation(9).is_err());
 }
 
 /// qemu-shim: guest Load with unresolvable IOSurface texture pages still encodes
 /// (archive NULL seed / Metal Clear invent) — does not drop the pass.
 #[test]
 fn mrt_draw_request_load_seed_miss_still_encodes() {
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::host::FakeHost;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     state.define_task(1, 0x1000, 2);
     // IOSurface texture registered with geom but empty page table → seed read fails.
     assert!(state.map_surface(9));
     assert!(state.set_mapping_geom(9, 8, 8, MTL_FORMAT_BGRA8_UNORM));
     // gen must be non-zero for Load path to attempt a snapshot (archive).
-    state.mappings.get_mut(&9).unwrap().content_generation = 1;
-    state.texture_to_mapping.insert((1, 42), 9);
+    state
+        .surfaces
+        .mappings
+        .get_mut(&9)
+        .unwrap()
+        .content
+        .guest_page_generation = 1;
+    state.fixtures.texture_to_mapping.insert((1, 42), 9);
     let att = ColorAttachment {
         texture_ref: 42,
         resolve_texture_ref: 0,
@@ -2275,26 +2313,112 @@ fn mrt_draw_request_load_seed_miss_still_encodes() {
     let req = mrt_draw_request(&mut state, &mut host, 1, 1, &slots, &[], test_triangle());
     // Archive: seed miss still builds the job (NULL seed). Product must not
     // drop the pass — that freezes lagging dual-mid on stale logo.
-    let req = req.expect("Load seed miss must still encode (archive NULL seed)");
+    let req = req
+        .expect("attachment planning must succeed")
+        .expect("Load seed miss must still encode (archive NULL seed)");
     assert!(
         req.colors[0].target_seed_rgba.is_none(),
         "seed miss leaves seed None (Metal Clear invent, full Store)"
     );
-    assert_eq!(req.colors[0].load_action, MTL_LOAD_ACTION_LOAD);
+    assert_eq!(
+        req.colors[0].load_action,
+        reims_vgpu_protocol::pass_action::LoadAction::Load
+    );
+}
+
+#[test]
+fn mrt_draw_request_refuses_mismatched_attachment_geometry_as_one_pass() {
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    state.define_task(1, 0x1000, 2);
+    assert!(state.map_surface(9));
+    assert!(state.map_surface(10));
+    assert!(state.set_mapping_geom(9, 8, 8, MTL_FORMAT_BGRA8_UNORM));
+    assert!(state.set_mapping_geom(10, 4, 8, MTL_FORMAT_BGRA8_UNORM));
+    state.fixtures.texture_to_mapping.insert((1, 42), 9);
+    state.fixtures.texture_to_mapping.insert((1, 43), 10);
+    let slots = [
+        (0, clear_black_attachment(42)),
+        (1, clear_black_attachment(43)),
+    ];
+
+    assert!(matches!(
+        mrt_draw_request(&mut state, &mut host, 1, 1, &slots, &[], test_triangle()),
+        Err(reims_vgpu_core::AttachmentPlanDecline::GeometryMismatch {
+            slot: 1,
+            texture_ref: 43,
+            width: 4,
+            height: 8,
+            pass_width: 8,
+            pass_height: 8,
+        })
+    ));
+}
+
+#[test]
+fn mrt_draw_request_refuses_unknown_pass_actions_before_execution() {
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    state.define_task(1, 0x1000, 2);
+    assert!(state.map_surface(9));
+    assert!(state.set_mapping_geom(9, 8, 8, MTL_FORMAT_BGRA8_UNORM));
+    state.fixtures.texture_to_mapping.insert((1, 42), 9);
+
+    let mut attachment = clear_black_attachment(42);
+    attachment.load_action = 3;
+    assert!(matches!(
+        mrt_draw_request(
+            &mut state,
+            &mut host,
+            1,
+            7,
+            &[(0, attachment)],
+            &[],
+            test_triangle(),
+        ),
+        Err(reims_vgpu_core::AttachmentPlanDecline::PassAction {
+            slot: 0,
+            reason: reims_vgpu_protocol::PassActionDecodeError::Load(3),
+        })
+    ));
+
+    attachment.load_action = MTL_LOAD_ACTION_CLEAR;
+    attachment.store_action = 4;
+    assert!(matches!(
+        mrt_draw_request(
+            &mut state,
+            &mut host,
+            1,
+            7,
+            &[(0, attachment)],
+            &[],
+            test_triangle(),
+        ),
+        Err(reims_vgpu_core::AttachmentPlanDecline::PassAction {
+            slot: 0,
+            reason: reims_vgpu_protocol::PassActionDecodeError::Store(4),
+        })
+    ));
 }
 
 #[test]
 fn mrt_draw_request_keeps_multisample_source_and_resolve_destination_distinct() {
-    use crate::contract::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     state.define_task(1, 0x1000, 2);
     for (texture_ref, mapping_id) in [(42, 9), (43, 10)] {
         assert!(state.map_surface(mapping_id));
         assert!(state.set_mapping_geom(mapping_id, 64, 64, MTL_FORMAT_BGRA8_UNORM));
         state
+            .state
+            .fixtures
             .texture_to_mapping
             .insert((1, texture_ref), mapping_id);
     }
@@ -2312,28 +2436,29 @@ fn mrt_draw_request_keeps_multisample_source_and_resolve_destination_distinct() 
     );
     assert_eq!(
         req.colors[0].store_action,
-        MTL_STORE_ACTION_MULTISAMPLE_RESOLVE
+        reims_vgpu_protocol::pass_action::StoreAction::MultisampleResolve
     );
 }
 
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn mrt_draw_request_gets_attachment_samples_from_the_bound_pipeline_before_encode() {
-    use crate::contract::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::RenderPipelineDescriptor;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     state.define_task(1, 0x1000, 2);
     for (texture_ref, mapping_id) in [(42, 9), (43, 10)] {
         assert!(state.map_surface(mapping_id));
         assert!(state.set_mapping_geom(mapping_id, 64, 64, MTL_FORMAT_BGRA8_UNORM));
         state
+            .state
+            .fixtures
             .texture_to_mapping
             .insert((1, texture_ref), mapping_id);
     }
-    state.task_render_pipeline_states.register(
+    state.task_objects.render_pipelines.register(
         1,
         reims_vgpu_protocol::SerializerRef::new(7),
         crate::runtime::pipeline_resolve::retained_pipeline_with_desc_for_test(
@@ -2362,30 +2487,89 @@ fn mrt_draw_request_gets_attachment_samples_from_the_bound_pipeline_before_encod
 
 #[test]
 fn mrt_draw_request_refuses_a_resolve_destination_with_different_geometry() {
-    use crate::contract::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     state.define_task(1, 0x1000, 2);
     for (texture_ref, mapping_id, width) in [(42, 9, 64), (43, 10, 32)] {
         assert!(state.map_surface(mapping_id));
         assert!(state.set_mapping_geom(mapping_id, width, 64, MTL_FORMAT_BGRA8_UNORM));
         state
+            .state
+            .fixtures
             .texture_to_mapping
             .insert((1, texture_ref), mapping_id);
     }
     let mut att = clear_black_attachment(42);
     att.resolve_texture_ref = 43;
     att.store_action = MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
-    let cap = crate::observe::FailCapture::start();
+    assert!(matches!(
+        mrt_draw_request(
+            &mut state,
+            &mut host,
+            1,
+            7,
+            &[(0, att)],
+            &[],
+            test_triangle(),
+        ),
+        Err(
+            reims_vgpu_core::AttachmentPlanDecline::ResolveTargetMismatch {
+                slot: 0,
+                source_ref: 42,
+                resolve_ref: 43,
+                source_width: 64,
+                source_height: 64,
+                resolve_width: 32,
+                resolve_height: 64,
+                source_format: MTL_FORMAT_BGRA8_UNORM,
+                resolve_format: MTL_FORMAT_BGRA8_UNORM,
+            }
+        )
+    ));
+}
 
-    assert!(single_rt_draw_request(&mut state, &mut host, 7, att).is_none());
-    assert!(cap.lines().iter().any(|line| {
-        line.contains("render_resolve_target_mismatch")
-            && line.contains("source_geom=64x64")
-            && line.contains("resolve_geom=32x64")
-    }));
+#[test]
+fn mrt_draw_request_distinguishes_missing_resolve_target_from_no_attachment() {
+    use reims_vgpu_core::{
+        pixel_format::MTL_FORMAT_BGRA8_UNORM, AttachmentPlanDecline, AttachmentTargetRole,
+    };
+    use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
+
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    state.define_task(1, 0x1000, 2);
+    assert!(state.map_surface(9));
+    assert!(state.set_mapping_geom(9, 64, 64, MTL_FORMAT_BGRA8_UNORM));
+    state.fixtures.texture_to_mapping.insert((1, 42), 9);
+
+    let mut attached = clear_black_attachment(42);
+    attached.resolve_texture_ref = 43;
+    attached.store_action = MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
+    assert!(matches!(
+        mrt_draw_request(
+            &mut state,
+            &mut host,
+            1,
+            7,
+            &[(0, attached)],
+            &[],
+            test_triangle(),
+        ),
+        Err(AttachmentPlanDecline::TargetUnresolved {
+            slot: 0,
+            texture_ref: 43,
+            role: AttachmentTargetRole::Resolve,
+        })
+    ));
+
+    assert!(
+        mrt_draw_request(&mut state, &mut host, 1, 7, &[], &[], test_triangle(),)
+            .is_ok_and(|request| request.is_none()),
+        "an absent attachment set is expected control flow, not a refusal"
+    );
 }
 
 /// qemu-shim: type-8 view of IOSurface texture is a valid color RT (archive
@@ -2393,8 +2577,6 @@ fn mrt_draw_request_refuses_a_resolve_destination_with_different_geometry() {
 /// that bind a view as color attachment drop the entire MRT pass.
 #[test]
 fn mrt_draw_request_type8_view_of_iosurface_texture_as_color_rt() {
-    use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE_VIEW,
         TEXTURE_VIEW_DESC_BASE_REF, TEXTURE_VIEW_DESC_LEN, TEXTURE_VIEW_DESC_LEVEL_BASE,
@@ -2404,10 +2586,12 @@ fn mrt_draw_request_type8_view_of_iosurface_texture_as_color_rt() {
         TEXTURE_VIEW_OPCODE_RANGED,
     };
     use crate::runtime::host::FakeHost;
+    use reims_vgpu_core::endian::{st16, st32, st64};
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
     // One-level page table: GVA pages 0..7 → data PFNs (blit_exec pattern).
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     // Object list at GVA page 0; count covers live residual slot 211.
@@ -2416,8 +2600,14 @@ fn mrt_draw_request_type8_view_of_iosurface_texture_as_color_rt() {
     // Base IOSurface texture mid 9 latched as texture ref 3.
     assert!(state.map_surface(9));
     assert!(state.set_mapping_geom(9, 64, 64, MTL_FORMAT_BGRA8_UNORM));
-    state.mappings.get_mut(&9).unwrap().content_generation = 1;
-    state.texture_to_mapping.insert((1, 3), 9);
+    state
+        .surfaces
+        .mappings
+        .get_mut(&9)
+        .unwrap()
+        .content
+        .guest_page_generation = 1;
+    state.fixtures.texture_to_mapping.insert((1, 3), 9);
 
     // Type-8 view ref 211 → base 3 (identity, level 0) — live residual slot.
     let view_ref = 211u32;
@@ -2466,8 +2656,6 @@ fn mrt_draw_request_type8_view_of_iosurface_texture_as_color_rt() {
 /// base as type-8 and dropped the MRT pass (`view_base_or_swizzle`).
 #[test]
 fn mrt_draw_request_nested_type8_view_chain_to_iosurface_texture() {
-    use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE_VIEW,
         TEXTURE_VIEW_DESC_BASE_REF, TEXTURE_VIEW_DESC_LEN, TEXTURE_VIEW_DESC_LEVEL_BASE,
@@ -2477,10 +2665,12 @@ fn mrt_draw_request_nested_type8_view_chain_to_iosurface_texture() {
         TEXTURE_VIEW_OPCODE_RANGED,
     };
     use crate::runtime::host::FakeHost;
+    use reims_vgpu_core::endian::{st16, st32, st64};
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
     fn write_type8_view(
         host: &mut FakeHost,
-        state: &DeviceState,
+        state: &Device,
         view_ref: u32,
         base_ref: u32,
         desc_gva: u64,
@@ -2515,7 +2705,7 @@ fn mrt_draw_request_nested_type8_view_chain_to_iosurface_texture() {
         write_task_gva_arm64e(&mut *host, &state.tasks[1], off, &list_entry);
     }
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 256));
@@ -2523,8 +2713,14 @@ fn mrt_draw_request_nested_type8_view_chain_to_iosurface_texture() {
     // IOSurface texture mid 9 as texture ref 3.
     assert!(state.map_surface(9));
     assert!(state.set_mapping_geom(9, 64, 64, MTL_FORMAT_BGRA8_UNORM));
-    state.mappings.get_mut(&9).unwrap().content_generation = 1;
-    state.texture_to_mapping.insert((1, 3), 9);
+    state
+        .surfaces
+        .mappings
+        .get_mut(&9)
+        .unwrap()
+        .content
+        .guest_page_generation = 1;
+    state.fixtures.texture_to_mapping.insert((1, 3), 9);
 
     // Inner view 8 → base 3 (IOSurface texture); outer view 211 → base 8 (type-8).
     write_type8_view(&mut host, &state, 8, 3, 0x280);
@@ -2542,8 +2738,6 @@ fn mrt_draw_request_nested_type8_view_chain_to_iosurface_texture() {
 /// Archive resolve_texture rejects non-identity swizzle for RT resolve.
 #[test]
 fn mrt_draw_request_type8_swizzled_view_rejected_as_color_rt() {
-    use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE_VIEW,
         TEXTURE_VIEW_DESC_BASE_REF, TEXTURE_VIEW_DESC_LEN, TEXTURE_VIEW_DESC_LEVEL_BASE,
@@ -2553,14 +2747,16 @@ fn mrt_draw_request_type8_swizzled_view_rejected_as_color_rt() {
         TEXTURE_VIEW_MTL_TYPE_2D, TEXTURE_VIEW_OPCODE_SWIZZLE,
     };
     use crate::runtime::host::FakeHost;
+    use reims_vgpu_core::endian::{st16, st32, st64};
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
     assert!(state.map_surface(9));
     assert!(state.set_mapping_geom(9, 64, 64, MTL_FORMAT_BGRA8_UNORM));
-    state.texture_to_mapping.insert((1, 3), 9);
+    state.fixtures.texture_to_mapping.insert((1, 3), 9);
 
     let view_ref = 8u32;
     let len = TEXTURE_VIEW_MIN_SWIZZLE;
@@ -2597,16 +2793,22 @@ fn mrt_draw_request_type8_swizzled_view_rejected_as_color_rt() {
 
     let att = clear_black_attachment(view_ref);
     assert!(
-        mrt_draw_request(
-            &mut state,
-            &mut host,
-            1,
-            12,
-            &[(0u32, att)],
-            &[],
-            test_triangle()
-        )
-        .is_none(),
+        matches!(
+            mrt_draw_request(
+                &mut state,
+                &mut host,
+                1,
+                12,
+                &[(0u32, att)],
+                &[],
+                test_triangle()
+            ),
+        Err(reims_vgpu_core::AttachmentPlanDecline::TargetUnresolved {
+            slot: 0,
+            texture_ref,
+            role: reims_vgpu_core::AttachmentTargetRole::Source,
+            }) if texture_ref == view_ref
+        ),
         "swizzled type-8 must not resolve as color RT"
     );
 }
@@ -2616,16 +2818,16 @@ fn mrt_draw_request_type8_swizzled_view_rejected_as_color_rt() {
 /// fail-closed (live residual ref=199 type=2 fmt=0x73).
 #[test]
 fn mrt_draw_request_type2_rgba16f_as_color_rt_despite_stale_iosurface_latch() {
-    use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA16_FLOAT};
     use crate::runtime::decode::resource::{
         list_object_entry_offset, LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_LIST_ENTRY_LEN,
         OBJECT_TYPE_TEXTURE, RESOURCE_PAGE_SHIFT, TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT,
         TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_WIDTH,
     };
     use crate::runtime::host::FakeHost;
+    use reims_vgpu_core::endian::{st16, st32, st64};
+    use reims_vgpu_core::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA16_FLOAT};
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 16);
     assert!(state.set_object_list(1, 0, 256));
@@ -2633,7 +2835,7 @@ fn mrt_draw_request_type2_rgba16f_as_color_rt_despite_stale_iosurface_latch() {
     // Stale IOSurface texture latch at ref 199 (guest recycled the ref to type-2).
     assert!(state.map_surface(99));
     assert!(state.set_mapping_geom(99, 64, 64, MTL_FORMAT_BGRA8_UNORM));
-    state.texture_to_mapping.insert((1, 199), 99);
+    state.fixtures.texture_to_mapping.insert((1, 199), 99);
 
     // Live type-2 RGBA16Float 480×64 bpr=3840 (live residual shape).
     let tex_ref = 199u32;
@@ -2673,7 +2875,10 @@ fn mrt_draw_request_type2_rgba16f_as_color_rt_despite_stale_iosurface_latch() {
         (handle as u64) << RESOURCE_PAGE_SHIFT
     );
     // Stale latch must be dropped.
-    assert!(!state.texture_to_mapping.contains_key(&(1, tex_ref)));
+    assert!(!state
+        .fixtures
+        .texture_to_mapping
+        .contains_key(&(1, tex_ref)));
 }
 
 /// Live IOSurface texture descriptor mapping_id wins over a stale texture_to_mapping
@@ -2681,12 +2886,12 @@ fn mrt_draw_request_type2_rgba16f_as_color_rt_despite_stale_iosurface_latch() {
 /// the mid named by the live descriptor, not a prior latch).
 #[test]
 fn mrt_draw_request_iosurface_texture_live_mapping_overrides_stale_latch() {
-    use crate::contract::endian::{st16, st32};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::host::FakeHost;
+    use reims_vgpu_core::endian::{st16, st32, st64};
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     // 1-level page table: GVA page 0 → data pfn 4.
     let dir_gpa = 2u64 << PAGE_SHIFT_ARM64E;
@@ -2703,16 +2908,23 @@ fn mrt_draw_request_iosurface_texture_live_mapping_overrides_stale_latch() {
     let _ = host.write_gpa(root_gpa, &d[..4]);
     state.define_task(1, 0x1000, 2);
     assert!(state.set_object_list(1, 0, 8));
-    // Live IOSurface texture at ref=1 → mapping_id=4 (descriptor first u32).
+    // Live mapper IOSurface texture at ref=1 resolves mapper identity 4.
     let mut entry = [0u8; 12];
-    st32(&mut entry[0..], 11u32 | (0x20u32 << 8));
+    st32(&mut entry[0..], 11u32 | (0x38u32 << 8));
     entry[4..12].copy_from_slice(&0x40u64.to_le_bytes());
     let _ = host.write_gpa(data_gpa + 12, &entry);
-    let mut desc = [0u8; 0x20];
-    st32(&mut desc[0..], 4); // live mapping_id = 4
+    let mut desc = [0u8; 0x38];
+    st64(&mut desc[0..], 4);
+    st32(&mut desc[0x08..], 0x0c);
+    st32(&mut desc[0x0c..], 0x30);
+    st32(&mut desc[0x10..], 1);
     st16(&mut desc[0x16..], MTL_FORMAT_BGRA8_UNORM);
     st32(&mut desc[0x18..], 64);
     st32(&mut desc[0x1c..], 32);
+    st32(&mut desc[0x20..], 1);
+    st16(&mut desc[0x24..], 1);
+    st16(&mut desc[0x26..], 1);
+    st16(&mut desc[0x28..], 1);
     let _ = host.write_gpa(data_gpa + 0x40, &desc);
 
     // Both mids exist; stale latch points ref 1 at mid 3.
@@ -2720,9 +2932,20 @@ fn mrt_draw_request_iosurface_texture_live_mapping_overrides_stale_latch() {
     assert!(state.set_mapping_geom(3, 64, 32, MTL_FORMAT_BGRA8_UNORM));
     assert!(state.map_surface(4));
     assert!(state.set_mapping_geom(4, 64, 32, MTL_FORMAT_BGRA8_UNORM));
-    state.texture_to_mapping.insert((1, 1), 3);
+    state.fixtures.texture_to_mapping.insert((1, 1), 3);
 
     let att = clear_black_attachment(1);
+    assert!(single_rt_draw_request(&mut state, &mut host, 12, att).is_none());
+    assert_eq!(
+        state.fixtures.texture_to_mapping.get(&(1, 1)).copied(),
+        Some(3)
+    );
+
+    assert!(state.map_mapper_surface(
+        reims_vgpu_protocol::MapperSurfaceRef::new(4),
+        reims_vgpu_protocol::MapperResolvedSurfaceId::new(4)
+    ));
+    assert!(state.set_mapping_geom(4, 64, 32, MTL_FORMAT_BGRA8_UNORM));
     let req = single_rt_draw_request(&mut state, &mut host, 12, att)
         .expect("live IOSurface texture RT must resolve");
     assert_eq!(
@@ -2730,14 +2953,15 @@ fn mrt_draw_request_iosurface_texture_live_mapping_overrides_stale_latch() {
         4,
         "live descriptor mapping_id=4 must beat stale latch mid=3"
     );
-    assert_eq!(state.texture_to_mapping.get(&(1, 1)).copied(), Some(4));
+    assert_eq!(
+        state.fixtures.texture_to_mapping.get(&(1, 1)).copied(),
+        Some(4)
+    );
 }
 
 /// Color RT materialization does not rematerialize non-zero view mips.
 #[test]
 fn mrt_draw_request_type8_nonzero_level_rejected_as_color_rt() {
-    use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE_VIEW,
         TEXTURE_VIEW_DESC_BASE_REF, TEXTURE_VIEW_DESC_LEN, TEXTURE_VIEW_DESC_LEVEL_BASE,
@@ -2747,14 +2971,16 @@ fn mrt_draw_request_type8_nonzero_level_rejected_as_color_rt() {
         TEXTURE_VIEW_OPCODE_RANGED,
     };
     use crate::runtime::host::FakeHost;
+    use reims_vgpu_core::endian::{st16, st32, st64};
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
     assert!(state.map_surface(9));
     assert!(state.set_mapping_geom(9, 64, 64, MTL_FORMAT_BGRA8_UNORM));
-    state.texture_to_mapping.insert((1, 3), 9);
+    state.fixtures.texture_to_mapping.insert((1, 3), 9);
 
     let view_ref = 8u32;
     let len = TEXTURE_VIEW_MIN_RANGED;
@@ -2789,16 +3015,22 @@ fn mrt_draw_request_type8_nonzero_level_rejected_as_color_rt() {
 
     let att = clear_black_attachment(view_ref);
     assert!(
-        mrt_draw_request(
-            &mut state,
-            &mut host,
-            1,
-            12,
-            &[(0u32, att)],
-            &[],
-            test_triangle()
-        )
-        .is_none(),
+        matches!(
+            mrt_draw_request(
+                &mut state,
+                &mut host,
+                1,
+                12,
+                &[(0u32, att)],
+                &[],
+                test_triangle()
+            ),
+        Err(reims_vgpu_core::AttachmentPlanDecline::TargetUnresolved {
+            slot: 0,
+            texture_ref,
+            role: reims_vgpu_core::AttachmentTargetRole::Source,
+            }) if texture_ref == view_ref
+        ),
         "type-8 level_base!=0 must not resolve as color RT"
     );
 }
@@ -2809,8 +3041,6 @@ fn mrt_draw_request_type8_nonzero_level_rejected_as_color_rt() {
 /// compositor blur/backdrop pyramids render into successive mips.
 #[test]
 fn mrt_draw_request_type8_mip_level_view_of_linear_as_color_rt() {
-    use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE,
         OBJECT_TYPE_TEXTURE_VIEW, TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_LEVEL_RECORDS,
@@ -2825,8 +3055,10 @@ fn mrt_draw_request_type8_mip_level_view_of_linear_as_color_rt() {
         TEXTURE_VIEW_OPCODE_RANGED,
     };
     use crate::runtime::host::FakeHost;
+    use reims_vgpu_core::endian::{st16, st32, st64};
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
@@ -2995,14 +3227,14 @@ fn view_format_reinterprets_bgra_storage_as_rgba() {
 /// equivalence, not the speed, that a future edit to `SourceRows` could break.
 #[test]
 fn a_solid_gva_landing_matches_the_full_image_landing_it_replaced() {
-    use crate::contract::endian::st32;
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::contract::pixel_format::{solid_rgba8, MTL_FORMAT_BGRA8_UNORM};
     use crate::runtime::host::FakeHost;
+    use reims_vgpu_core::endian::st32;
+    use reims_vgpu_core::pixel_format::{solid_rgba8, MTL_FORMAT_BGRA8_UNORM};
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 
     // Two identical guests, so the two writers land into two byte-for-byte
     // equal address spaces and the comparison is of the writes alone.
-    fn guest(page_shift: u32) -> (FakeHost, DeviceState) {
+    fn guest(page_shift: u32) -> (FakeHost, Device) {
         let mut host = FakeHost::new();
         let dir_gpa = 2u64 << page_shift;
         let root_gpa = 3u64 << page_shift;
@@ -3020,7 +3252,7 @@ fn a_solid_gva_landing_matches_the_full_image_landing_it_replaced() {
             st32(&mut d[..4], (5 + p) as u32);
             let _ = host.write_gpa(root_gpa + (1 + p) * 4, &d[..4]);
         }
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         state.page_shift = page_shift;
         state.define_task(1, 0x1000, 2);
         (host, state)
@@ -3082,10 +3314,10 @@ fn a_solid_gva_landing_matches_the_full_image_landing_it_replaced() {
 /// on Ventura/Tahoe x86 product boots.
 #[test]
 fn write_gva_rgba8_uses_device_page_shift_x86() {
-    use crate::contract::endian::st32;
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::host::FakeHost;
+    use reims_vgpu_core::endian::st32;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 
     let page_shift = PAGE_SHIFT_X86;
     let mut host = FakeHost::new();
@@ -3104,7 +3336,7 @@ fn write_gva_rgba8_uses_device_page_shift_x86() {
     st32(&mut d[..4], 5);
     let _ = host.write_gpa(root_gpa + 4, &d[..4]);
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     state.page_shift = page_shift;
     state.define_task(1, 0x1000, 2);
 
@@ -3154,10 +3386,9 @@ fn write_gva_rgba8_uses_device_page_shift_x86() {
 /// geometry from whichever cache entry was keyed by the ref rather than from a
 /// decoded descriptor. That rung is gone, so what this test can still assert
 /// about the resolver is that it declines.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn gva_layer_host_cache_roundtrip_for_sample() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let tex_ref = 54u32;
     let gva = 0x2c48000u64;
     let w = 4u32;
@@ -3203,19 +3434,18 @@ fn gva_layer_host_cache_roundtrip_for_sample() {
 /// Guest-CPU-produced tight linear textures: unchanged native bytes must
 /// reuse the memoized RGBA Arc under a stable generation identity; a guest
 /// write must be observed and produce a new generation.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn guest_linear_memo_reuses_arc_and_observes_guest_writes() {
-    use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, TEXTURE_DESC_BASE_LEN,
         TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
         TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH,
     };
+    use reims_vgpu_core::endian::{st16, st32, st64};
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let dir_pfn = 2u32;
     let root_pfn = 3u32;
@@ -3312,19 +3542,18 @@ fn guest_linear_memo_reuses_arc_and_observes_guest_writes() {
 /// == Bgra8`, no CPU channel swap), carries a memo identity so the engine
 /// skips its content hash + upload, and that the row gather takes exactly
 /// the tight texels — skipping the padding — into the tight output.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn padded_bgra8_memoized_uploads_native_without_swizzle() {
-    use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, TEXTURE_DESC_BASE_LEN,
         TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
         TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH,
     };
+    use reims_vgpu_core::endian::{st16, st32, st64};
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let dir_pfn = 2u32;
     let root_pfn = 3u32;
@@ -3441,7 +3670,7 @@ fn padded_bgra8_memoized_uploads_native_without_swizzle() {
 /// byte cap while the uncapped ref entry survived.
 #[test]
 fn color_load_seed_uses_provenance_and_preserves_black() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let task_id = std::process::id();
     let texture_ref = 0xe000_0000u32.wrapping_add(task_id);
@@ -3544,8 +3773,8 @@ fn color_load_seed_uses_provenance_and_preserves_black() {
 /// `None` arm, returning early from it, or letting it count without re-reading
 /// would all keep every boot green and every existing test passing.
 ///
-/// The race it stands in for is real. `gva_alloc_gen` is recomputed after the
-/// request is built, so a page set that moved in between names a different
+/// The race it stands in for is real. The allocation generation is resolved
+/// after the request is built, so a page set that moved in between names a different
 /// target — `gva_chain_identity` then resolves to an identity the registry has no
 /// resident for, exactly as it does here, and the seed is already gone.
 ///
@@ -3555,20 +3784,19 @@ fn color_load_seed_uses_provenance_and_preserves_black() {
 /// the seed back. The guest pages below are real, so `Some` here means
 /// `seed_color_load` actually re-read the attachment rather than the arm merely
 /// counting itself.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_gva_load_from_resident_draw_with_no_resident_puts_the_seed_back() {
-    use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, TEXTURE_DESC_BASE_LEN,
         TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
         TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH,
     };
     use crate::runtime::drain::store_route_count;
+    use reims_vgpu_core::endian::{st16, st32, st64};
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let dir_pfn = 2u32;
     let root_pfn = 3u32;
@@ -3619,7 +3847,7 @@ fn a_gva_load_from_resident_draw_with_no_resident_puts_the_seed_back() {
 
     // The request `mrt_draw_request` produces when it elides: LOAD, no seed, and
     // the flag that says the absence was deliberate.
-    let mut req = DrawEncodeRequest {
+    let req = DrawEncodeRequest {
         task_id: 1,
         gva_load_source: GvaLoadSource::Resident,
         colors: vec![ColorRtRequest {
@@ -3629,15 +3857,15 @@ fn a_gva_load_from_resident_draw_with_no_resident_puts_the_seed_back() {
             width: 4,
             height: 2,
             format: MTL_FORMAT_BGRA8_UNORM,
-            load_action: MTL_LOAD_ACTION_LOAD,
-            store_action: MTL_STORE_ACTION_STORE,
+            load_action: reims_vgpu_protocol::pass_action::LoadAction::Load,
+            store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
             target_seed_rgba: None,
             ..Default::default()
         }],
         ..Default::default()
     };
     assert!(
-        crate::runtime::draw::vulkan::gva_chain_identity(state.executor.as_ref(), &req).is_some(),
+        crate::runtime::draw::gva_chain_identity(state.executor.as_ref(), &req, 0).is_some(),
         "the elided request must still name an identity — the arm under test is \
          the one where that identity has no ready resident, not the one where \
          there is nothing to look up"
@@ -3646,10 +3874,11 @@ fn a_gva_load_from_resident_draw_with_no_resident_puts_the_seed_back() {
     let chained_before = store_route_count("gvaseed_chained");
     let reseeded_before = store_route_count("gvaseed_reseeded");
     let mut chain_load_from_target = false;
-    let resolution = crate::runtime::draw::vulkan::resolve_gva_load_source(
+    let resolution = crate::runtime::draw::execution::resolve_gva_load_source(
         &mut state,
         &mut host,
-        &mut req,
+        &req,
+        0,
         None,
         &mut chain_load_from_target,
     );
@@ -3671,8 +3900,8 @@ fn a_gva_load_from_resident_draw_with_no_resident_puts_the_seed_back() {
 
     // The property, and the reason the counter alone is not enough: the seed is
     // back, and it holds the guest's pixels rather than an empty buffer.
-    let seed = req.colors[0]
-        .target_seed_rgba
+    let seed = resolution
+        .cpu_seed
         .as_ref()
         .expect("a LOAD whose elision was not honoured must have its seed restored");
     assert_eq!(
@@ -3699,11 +3928,10 @@ fn a_gva_load_from_resident_draw_with_no_resident_puts_the_seed_back() {
 /// A GVA LOAD that names authoritative guest pages stays in that representation
 /// until Vulkan preparation. Supplying a stable target allocation must produce
 /// a bounded guest seed without calling the CPU RGBA fallback.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_gva_guest_page_load_becomes_an_importable_seed_without_cpu_bytes() {
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::drain::store_route_count;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
     let import = std::sync::Arc::new(
         crate::runtime::guest_ram::GuestRamImport::new_host_allocation(0x2000_0000, 0x4000, 0x1000)
@@ -3725,9 +3953,8 @@ fn a_gva_guest_page_load_becomes_an_importable_seed_without_cpu_bytes() {
         )
         .expect("footprint"),
     };
-    let mut req = DrawEncodeRequest {
+    let req = DrawEncodeRequest {
         task_id: 1,
-        gva_alloc_gen: 7,
         gva_load_source: GvaLoadSource::GuestPages,
         colors: vec![ColorRtRequest {
             slot: 0,
@@ -3736,27 +3963,29 @@ fn a_gva_guest_page_load_becomes_an_importable_seed_without_cpu_bytes() {
             width: 4,
             height: 2,
             format: MTL_FORMAT_BGRA8_UNORM,
-            load_action: MTL_LOAD_ACTION_LOAD,
-            store_action: MTL_STORE_ACTION_STORE,
+            load_action: reims_vgpu_protocol::pass_action::LoadAction::Load,
+            store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
             ..Default::default()
         }],
         ..Default::default()
     };
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     let guest_before = store_route_count("gvaseed_guest_pages");
     let cpu_before = store_route_count("gvaseed_guest_cpu_fallback");
     let mut chain = false;
 
-    let resolution = crate::runtime::draw::vulkan::resolve_gva_load_source(
+    let resolution = crate::runtime::draw::execution::resolve_gva_load_source(
         &mut state,
         &mut host,
-        &mut req,
+        &req,
+        7,
         Some(&backing),
         &mut chain,
     );
 
     assert!(resolution.identity.is_none() && !chain);
+    assert!(resolution.cpu_seed.is_none());
     let seed = resolution
         .guest_seed
         .expect("the stable allocation supplies the LOAD seed");
@@ -3774,15 +4003,14 @@ fn a_gva_guest_page_load_becomes_an_importable_seed_without_cpu_bytes() {
 /// A IOSurface plane view ref is not itself a surface id. The descriptor's surface_id
 /// remains authoritative even when the numeric ref collides with another
 /// live display mapping (live app-launch ref=2 -> sid=71 class).
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn iosurface_plane_view_sample_uses_descriptor_surface_id_not_ref_collision() {
-    use crate::contract::endian::st32;
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
     use crate::runtime::gva_mem;
+    use reims_vgpu_core::endian::st32;
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
 
     // One-level x86 GVA table: pages 0..2 -> data PFNs 4..6.
@@ -3834,7 +4062,13 @@ fn iosurface_plane_view_sample_uses_descriptor_surface_id_not_ref_collision() {
     // The lower numeric ref intentionally collides with an unrelated map.
     assert!(state.map_surface(texture_ref));
     assert!(state.set_mapping_geom(texture_ref, 8, 8, MTL_FORMAT_BGRA8_UNORM));
-    state.mappings.get_mut(&texture_ref).unwrap().page_entries = vec![1];
+    state
+        .surfaces
+        .mappings
+        .get_mut(&texture_ref)
+        .unwrap()
+        .pages
+        .entries = vec![1];
     crate::runtime::surface_cache::store(
         &mut state,
         texture_ref,
@@ -3845,7 +4079,13 @@ fn iosurface_plane_view_sample_uses_descriptor_surface_id_not_ref_collision() {
 
     assert!(state.map_surface(surface_id));
     assert!(state.set_mapping_geom(surface_id, 4, 3, MTL_FORMAT_BGRA8_UNORM));
-    state.mappings.get_mut(&surface_id).unwrap().page_entries = vec![1];
+    state
+        .surfaces
+        .mappings
+        .get_mut(&surface_id)
+        .unwrap()
+        .pages
+        .entries = vec![1];
     crate::runtime::surface_cache::store(
         &mut state,
         surface_id,
@@ -3915,15 +4155,14 @@ fn iosurface_plane_view_sample_uses_descriptor_surface_id_not_ref_collision() {
 /// than merely "some fresh number", because that equality is the whole
 /// coherence argument — every writer of `host_surfaces` re-takes it from
 /// `next_sampled_content_generation` in the same breath as it changes the bytes.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn iosurface_texture_host_cache_rung_identity_tracks_the_cached_frame() {
-    use crate::contract::endian::st32;
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
     use crate::runtime::gva_mem;
+    use reims_vgpu_core::endian::st32;
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
 
     let dir_pfn = 2u32;
@@ -3973,7 +4212,13 @@ fn iosurface_texture_host_cache_rung_identity_tracks_the_cached_frame() {
 
     assert!(state.map_surface(surface_id));
     assert!(state.set_mapping_geom(surface_id, 4, 3, MTL_FORMAT_BGRA8_UNORM));
-    state.mappings.get_mut(&surface_id).unwrap().page_entries = vec![1];
+    state
+        .surfaces
+        .mappings
+        .get_mut(&surface_id)
+        .unwrap()
+        .pages
+        .entries = vec![1];
 
     // An unrelated surface, stored twice, so the device-global generation
     // counter is past its first value before this one is stored. Without it a
@@ -3993,7 +4238,7 @@ fn iosurface_texture_host_cache_rung_identity_tracks_the_cached_frame() {
         [255u8, 0, 0, 255].repeat(4 * 3),
     );
 
-    let resolve = |state: &mut DeviceState, host: &mut FakeHost| {
+    let resolve = |state: &mut Device, host: &mut FakeHost| {
         let (_, _, _, src) = resolve_sampled_source(state, host, 1, texture_ref, None, true)
             .expect("host-cache rung must serve the stored frame");
         let SampledSourceRequest::Bytes(bytes, identity, layout, _) = src else {
@@ -4081,20 +4326,22 @@ fn iosurface_texture_host_cache_rung_identity_tracks_the_cached_frame() {
 /// 2-byte IOSurface FourCC (`LA08`) while the IOSurface plane view descriptor carries
 /// the exact RG8 Metal view. Defaulting the base to BGRA asks for a
 /// 632-byte row against the wire's 320-byte row and drops the draw.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn iosurface_plane_view_sample_uses_serialized_rg8_view_over_unknown_surface_fourcc() {
-    use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::contract::iosurface_pages::{
-        DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_BPE, DEVICE_DESC_BPR, DEVICE_DESC_DIMS,
-        DEVICE_DESC_LEN, DEVICE_DESC_PIXEL_FORMAT, PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID,
-    };
-    use crate::contract::pixel_format::MTL_FORMAT_RG8_UNORM;
     use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
     use crate::runtime::gva_mem;
+    use reims_vgpu_core::endian::{st16, st32, st64};
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_RG8_UNORM;
+    use reims_vgpu_paging::geometry::{
+        DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN, MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
+    use reims_vgpu_protocol::{
+        DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_BPE, DEVICE_DESC_BPR, DEVICE_DESC_DIMS,
+        DEVICE_DESC_LEN, DEVICE_DESC_PIXEL_FORMAT,
+    };
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
 
     // One-level x86 GVA table for the object list and IOSurface plane view descriptor.
@@ -4168,9 +4415,9 @@ fn iosurface_plane_view_sample_uses_serialized_rg8_view_over_unknown_surface_fou
 
     assert!(state.map_surface(surface_id));
     {
-        let m = state.mappings.get_mut(&surface_id).unwrap();
-        m.mapped = true;
-        m.page_entries = (0..page_count)
+        let m = state.surfaces.mappings.get_mut(&surface_id).unwrap();
+        m.lifecycle.active = true;
+        m.pages.entries = (0..page_count)
             .map(|i| {
                 let pfn = ((gpa0 >> PAGE_SHIFT_X86) as u32) + i;
                 (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
@@ -4219,17 +4466,20 @@ fn iosurface_plane_view_sample_uses_serialized_rg8_view_over_unknown_surface_fou
 /// The IOSurface plane view view memo: unchanged plane bytes reuse the converted Arc and
 /// carry a stable content identity (engine upload skipped); a guest write
 /// to the plane is observed on the next bind and mints a new generation.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn iosurface_plane_view_memo_reuses_unchanged_planes_and_invalidates_on_write() {
-    use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::iosurface_pages::{
-        DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_BPE, DEVICE_DESC_BPR, DEVICE_DESC_DIMS,
-        DEVICE_DESC_LEN, DEVICE_DESC_PIXEL_FORMAT, PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID,
+    use reims_vgpu_core::endian::{st16, st32, st64};
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_RG8_UNORM;
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
     };
-    use crate::contract::pixel_format::MTL_FORMAT_RG8_UNORM;
+    use reims_vgpu_protocol::{
+        DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_BPE, DEVICE_DESC_BPR, DEVICE_DESC_DIMS,
+        DEVICE_DESC_LEN, DEVICE_DESC_PIXEL_FORMAT,
+    };
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     let surface_id = 9u32;
     let width = 158u32;
@@ -4250,9 +4500,9 @@ fn iosurface_plane_view_memo_reuses_unchanged_planes_and_invalidates_on_write() 
     assert!(host.write_gpa(gpa0, &native).is_ok());
     assert!(state.map_surface(surface_id));
     {
-        let m = state.mappings.get_mut(&surface_id).unwrap();
-        m.mapped = true;
-        m.page_entries = (0..page_count)
+        let m = state.surfaces.mappings.get_mut(&surface_id).unwrap();
+        m.lifecycle.active = true;
+        m.pages.entries = (0..page_count)
             .map(|i| {
                 let pfn = ((gpa0 >> PAGE_SHIFT_X86) as u32) + i;
                 (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
@@ -4331,10 +4581,9 @@ fn iosurface_plane_view_memo_reuses_unchanged_planes_and_invalidates_on_write() 
     assert!(!std::sync::Arc::ptr_eq(&rgba1, &rgba3));
 }
 
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn iosurface_plane_view_materializes_only_when_base_identity_differs() {
-    use crate::contract::pixel_format::MTL_FORMAT_RG8_UNORM;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_RG8_UNORM;
 
     let exact = objects::IOSurfacePlaneViewDescriptor {
         pixel_format: MTL_FORMAT_BGRA8_UNORM,
@@ -4468,7 +4717,6 @@ fn texture_view_decline_preserves_decode_leaf_and_chain_identity() {
 /// whitespace-free fields, and is distinct — the same discipline the
 /// capture and import rails took, so `grep reason=iosurface_plane_view_…` stays
 /// answerable against the blit rail's `t5_*` copy vocabulary next door.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn every_iosurface_plane_view_reason_is_namespaced_distinct_and_log_safe() {
     use crate::observe::Decline as _;
@@ -4530,7 +4778,6 @@ fn every_iosurface_plane_view_reason_is_namespaced_distinct_and_log_safe() {
 /// base geometry plus the decoded device descriptor, or `desc=missing` when
 /// the descriptor could not be decoded. Both branches must render exactly
 /// what the old ad-hoc `detail` string did.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn sample_window_renders_the_descriptor_or_its_absence() {
     let present = IOSurfacePlaneViewDecline::SampleWindow {
@@ -4563,11 +4810,10 @@ fn sample_window_renders_the_descriptor_or_its_absence() {
 /// `blend_enable(false)`, justified by a comment claiming the decode side
 /// carried no per-attachment blend state. It carried it all along — the
 /// that asked to blend slot 1 got a raw store instead.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_secondary_mrt_slot_binds_its_own_blend() {
     use crate::runtime::decode::resource::{PipelineColorAttachment, RenderPipelineDescriptor};
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
 
     // Slot 0 blends src-alpha over; slot 1 blends ONE/ONE (additive). Two
     // different blends so borrowing slot 0's would be visible.
@@ -4615,7 +4861,7 @@ fn a_secondary_mrt_slot_binds_its_own_blend() {
             storage: linear_target_storage(0x2000, 64 * 4, 64),
             width: 64,
             height: 64,
-            format: crate::contract::pixel_format::MTL_FORMAT_RG16_FLOAT,
+            format: reims_vgpu_core::pixel_format::MTL_FORMAT_RG16_FLOAT,
             ..ColorRtRequest::default()
         },
     ];
@@ -4624,12 +4870,25 @@ fn a_secondary_mrt_slot_binds_its_own_blend() {
         width: 64,
         height: 64,
         generation: 0,
-        format: crate::contract::pixel_format::TexelLayout::Rgba8,
+        format: reims_vgpu_core::pixel_format::TexelLayout::Rgba8,
     };
 
     let mut host = crate::runtime::host::FakeHost::new();
+    let blend_states = [(
+        1,
+        semantic_blend_state(&pipeline.color_attachments[1], [0.0; 4])
+            .expect("the fixture declares a valid slot-1 blend state"),
+    )];
     let secs = build_secondary_targets(
-        &mut state, &mut host, 1, &colors, &pipeline, &primary, 64, 64, [0.0; 4],
+        &mut state,
+        &mut host,
+        1,
+        &colors,
+        &pipeline,
+        &primary,
+        64,
+        64,
+        &blend_states,
     )
     .expect("a contiguous, geometry-matching, resolvable secondary builds");
     assert_eq!(secs.len(), 1, "one secondary attachment expected");
@@ -4659,7 +4918,15 @@ fn a_secondary_mrt_slot_binds_its_own_blend() {
     };
     let mut host = crate::runtime::host::FakeHost::new();
     let secs = build_secondary_targets(
-        &mut state, &mut host, 1, &colors, &unblended, &primary, 64, 64, [0.0; 4],
+        &mut state,
+        &mut host,
+        1,
+        &colors,
+        &unblended,
+        &primary,
+        64,
+        64,
+        &[],
     )
     .expect("the same secondary builds whether or not its slot blends");
     assert_eq!(secs.len(), 1);
@@ -4683,13 +4950,12 @@ fn a_secondary_mrt_slot_binds_its_own_blend() {
 /// The last case is the one that makes the rest meaningful: a genuine single-RT
 /// draw must still be `Ok(empty)`, or "refuse when you cannot build it" would
 /// have been bought by refusing draws that were never MRT at all.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn an_unbuildable_secondary_refuses_the_draw_rather_than_dropping_to_single_rt() {
     use crate::runtime::census::present_proxy::MrtDrop;
     use crate::runtime::decode::resource::{PipelineColorAttachment, RenderPipelineDescriptor};
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let pipeline = RenderPipelineDescriptor {
         color_attachments: vec![
             PipelineColorAttachment {
@@ -4708,7 +4974,7 @@ fn an_unbuildable_secondary_refuses_the_draw_rather_than_dropping_to_single_rt()
         width: 64,
         height: 64,
         generation: 0,
-        format: crate::contract::pixel_format::TexelLayout::Rgba8,
+        format: reims_vgpu_core::pixel_format::TexelLayout::Rgba8,
     };
     let slot0 = ColorRtRequest {
         slot: 0,
@@ -4727,7 +4993,7 @@ fn an_unbuildable_secondary_refuses_the_draw_rather_than_dropping_to_single_rt()
         storage: linear_target_storage(0x2000, 64 * 4, 64),
         width: 64,
         height: 64,
-        format: crate::contract::pixel_format::MTL_FORMAT_RG16_FLOAT,
+        format: reims_vgpu_core::pixel_format::MTL_FORMAT_RG16_FLOAT,
         ..ColorRtRequest::default()
     };
 
@@ -4742,7 +5008,7 @@ fn an_unbuildable_secondary_refuses_the_draw_rather_than_dropping_to_single_rt()
             &primary,
             64,
             64,
-            [0.0; 4],
+            &[],
         )
     };
 
@@ -4821,7 +5087,7 @@ fn an_unbuildable_secondary_refuses_the_draw_rather_than_dropping_to_single_rt()
         &primary,
         64,
         64,
-        [0.0; 4],
+        &[],
     )
     .expect("a single-attachment draw is not a refusal");
     assert!(
@@ -4837,14 +5103,13 @@ fn an_unbuildable_secondary_refuses_the_draw_rather_than_dropping_to_single_rt()
 /// rendering, which is why the primary case is a refusal rather than a silent
 /// drop. The same is true of two secondaries, and the check used to name
 /// `primary` alone — so slots 1 and 2 over one span were admitted and drawn.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn two_secondaries_over_one_destination_refuse_the_draw_like_a_primary_alias() {
-    use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RG16_FLOAT};
     use crate::runtime::census::present_proxy::MrtDrop;
     use crate::runtime::decode::resource::{PipelineColorAttachment, RenderPipelineDescriptor};
+    use reims_vgpu_core::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RG16_FLOAT};
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let pipeline = RenderPipelineDescriptor {
         color_attachments: (0..3)
             .map(|slot| PipelineColorAttachment {
@@ -4859,7 +5124,7 @@ fn two_secondaries_over_one_destination_refuse_the_draw_like_a_primary_alias() {
         width: 64,
         height: 64,
         generation: 0,
-        format: crate::contract::pixel_format::TexelLayout::Rgba8,
+        format: reims_vgpu_core::pixel_format::TexelLayout::Rgba8,
     };
     let rt = |slot: u32, texture_ref: u32, target_gva: u64, format: u16| ColorRtRequest {
         slot,
@@ -4873,7 +5138,15 @@ fn two_secondaries_over_one_destination_refuse_the_draw_like_a_primary_alias() {
     let mut build = |colors: &[ColorRtRequest]| {
         let mut host = crate::runtime::host::FakeHost::new();
         build_secondary_targets(
-            &mut state, &mut host, 1, colors, &pipeline, &primary, 64, 64, [0.0; 4],
+            &mut state,
+            &mut host,
+            1,
+            colors,
+            &pipeline,
+            &primary,
+            64,
+            64,
+            &[],
         )
     };
 
@@ -4902,9 +5175,8 @@ fn two_secondaries_over_one_destination_refuse_the_draw_like_a_primary_alias() {
     assert_eq!(refusal.reason, MrtDrop::AliasesPrimary);
 }
 
-#[cfg(feature = "backend-vulkan")]
 #[test]
-fn fixed_state_gap_names_every_unrepresented_field() {
+fn fixed_state_gap_names_the_remaining_unrepresented_field() {
     // In-contract cull (Back) + winding (CCW) are HONORED by the Vulkan
     // raster state; the depth test + attachment and the stencil test
     // (op state + reference + clear) are honored via `resources.depth` — so
@@ -4912,39 +5184,24 @@ fn fixed_state_gap_names_every_unrepresented_field() {
     // longer gaps. Only depth bias remains unrepresented.
     // MTLCullModeBack / MTLWindingCounterClockwise, per `translate::raster`,
     // which is now the only place those SDK values are spelled.
-    let mut req = DrawEncodeRequest {
-        cull_mode: Some(2),
-        front_facing: Some(1),
+    let req = DrawEncodeRequest {
+        cull_mode: reims_vgpu_protocol::CullMode::Back,
+        front_face_ccw: true,
         depth_bias: Some([1.25, 2.5, 0.0]),
         depth_stencil_ref: 77,
         stencil_ref: Some((3, 4)),
-        depth_attach: Some(DepthAttachment::default()),
-        stencil_attach: Some(StencilAttachment::default()),
+        depth_attach: Some(DepthAttachmentState::default()),
+        stencil_attach: Some(StencilAttachmentState::default()),
         ..DrawEncodeRequest::default()
     };
-    assert_eq!(vulkan_fixed_state_gap(&req), "bias:1.250/2.500/0.000");
-
-    // An OUT-OF-CONTRACT cull/winding value stays a gap (fail-visible), never
-    // coerced to a face that silently draws or drops geometry.
-    req.depth_bias = None;
-    req.depth_stencil_ref = 0;
-    req.stencil_ref = None;
-    req.depth_attach = None;
-    req.stencil_attach = None;
-    req.cull_mode = Some(9);
-    req.front_facing = Some(7);
-    assert_eq!(vulkan_fixed_state_gap(&req), "cull:9,front:7");
-
-    req.cull_mode = None;
-    req.front_facing = None;
-    assert_eq!(vulkan_fixed_state_gap(&req), "");
+    assert_eq!(fixed_state_gap(&req), "bias:1.250/2.500/0.000");
 }
 
 /// Recycled texture_ref must not serve a prior full-frame encode as a
 /// different-sized linear sample (namespace / geom-match class).
 #[test]
 fn texture_ref_cache_geom_mismatch_does_not_hit_get_texture() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let tex_ref = 53u32;
     let mut full = vec![0u8; 1920 * 1152 * 4];
     full[3] = 255;
@@ -4966,10 +5223,9 @@ fn texture_ref_cache_geom_mismatch_does_not_hit_get_texture() {
 /// the control: without it this would pass on a build that declined every span
 /// for some unrelated reason, which is exactly how a decline test goes hollow.
 #[test]
-#[cfg(feature = "backend-vulkan")]
 fn guest_runs_decline_on_unstable_host_mappings() {
-    use crate::contract::endian::st32;
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use reims_vgpu_core::endian::st32;
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 
     let page_shift = crate::model::PAGE_SHIFT_X86;
     let page = 1u64 << page_shift;
@@ -4977,7 +5233,7 @@ fn guest_runs_decline_on_unstable_host_mappings() {
 
     // A task whose page table really does resolve `[gva, gva+16)` onto `data0`.
     let walkable =
-        |stable: bool| -> Result<Vec<reims_vgpu_memory::GuestRun>, super::vulkan::WindowRefusal> {
+        |stable: bool| -> Result<Vec<reims_vgpu_memory::GuestRun>, super::WindowRefusal> {
             let mut host = FakeHost::new();
             host.strict_linux_map = true;
             host.stable_map_pages = stable;
@@ -4994,7 +5250,7 @@ fn guest_runs_decline_on_unstable_host_mappings() {
             st32(&mut pte, 4);
             host.write_gpa(root_gpa, &pte).unwrap();
 
-            let mut state = DeviceState::new(DeviceId(1), page_shift);
+            let mut state = Device::new(DeviceId(1), page_shift);
             state.define_task(1, page, 2);
             task_gva_guest_run_window(&state, &mut host, 1, gva, 16).map(|(_, runs)| runs)
         };
@@ -5008,7 +5264,7 @@ fn guest_runs_decline_on_unstable_host_mappings() {
     // in one of the two that report a page table the guest wrote.
     assert_eq!(
         walkable(false).err(),
-        Some(super::vulkan::WindowRefusal::NoAlias),
+        Some(super::WindowRefusal::NoAlias),
         "the same span must yield no runs when the host will not promise the \
          alias outlives the submission that gathers from it"
     );
@@ -5019,7 +5275,6 @@ fn guest_runs_decline_on_unstable_host_mappings() {
 /// lifetimes and different sizes; coupling them made unrelated guest RAM a
 /// side channel for whether this resource could be zero-copy.
 #[test]
-#[cfg(feature = "backend-vulkan")]
 fn a_packed_alias_is_independent_of_the_whole_ram_map() {
     let page_shift = PAGE_SHIFT_X86;
     let page = 1u64 << page_shift;
@@ -5049,7 +5304,6 @@ fn a_packed_alias_is_independent_of_the_whole_ram_map() {
 /// offset to the engine beside it. Two offsets of one guest buffer must share
 /// the allocation instead of creating two exact-window resources.
 #[test]
-#[cfg(feature = "backend-vulkan")]
 fn draw_buffers_bind_one_packed_resource_at_each_decoded_offset() {
     // The guest-RAM map resolves once per process and every test in this binary
     // shares it, so a fixture that maps its own RAM has to discard whatever an
@@ -5057,8 +5311,8 @@ fn draw_buffers_bind_one_packed_resource_at_each_decoded_offset() {
     // some other test's host and refuses — which is the right refusal against
     // the wrong host.
     crate::runtime::guest_ram_map::reset();
-    use crate::contract::endian::st32;
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use reims_vgpu_core::endian::st32;
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 
     let page_shift = PAGE_SHIFT_X86;
     let page = 1u64 << page_shift;
@@ -5079,13 +5333,13 @@ fn draw_buffers_bind_one_packed_resource_at_each_decoded_offset() {
     host.write_gpa(root_gpa, &ptes).unwrap();
 
     crate::runtime::guest_ram::latch_import_limits(page, 1 << 30, 1 << 30);
-    let mut state = DeviceState::new(DeviceId(1), page_shift);
+    let mut state = Device::new(DeviceId(1), page_shift);
     state.define_task(1, page, 2);
     let backing = super::BufferBacking {
         gva: 0x800,
         size: 0x800,
     };
-    let first = super::vulkan::load_buffer_content_resolved(
+    let first = super::load_buffer_content_resolved(
         &mut state,
         &mut host,
         1,
@@ -5110,7 +5364,7 @@ fn draw_buffers_bind_one_packed_resource_at_each_decoded_offset() {
         .packed_available(1, 7, backing.gva, backing.size)
         .expect("the first draw bind retained its allocation");
 
-    let content = super::vulkan::load_buffer_content_resolved(
+    let content = super::load_buffer_content_resolved(
         &mut state,
         &mut host,
         1,
@@ -5142,11 +5396,10 @@ fn draw_buffers_bind_one_packed_resource_at_each_decoded_offset() {
 /// allocation; neither its GVA nor its dimensions are used to manufacture a
 /// narrower parent import.
 #[test]
-#[cfg(feature = "backend-vulkan")]
 fn gva_target_backing_retains_the_declared_parent_allocation() {
     crate::runtime::guest_ram_map::reset();
-    use crate::contract::endian::st32;
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use reims_vgpu_core::endian::st32;
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 
     let page = 1u64 << PAGE_SHIFT_X86;
     let mut host = FakeHost::new();
@@ -5165,7 +5418,7 @@ fn gva_target_backing_retains_the_declared_parent_allocation() {
     host.write_gpa(3 * page, &ptes).unwrap();
 
     crate::runtime::guest_ram::latch_import_limits(page, 1 << 30, 1 << 30);
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     state.define_task(1, page, 2);
     let linear = LinearColorTarget {
         allocation_gva: page,
@@ -5180,14 +5433,14 @@ fn gva_target_backing_retains_the_declared_parent_allocation() {
             storage: ColorTargetStorage::Linear(linear),
             width: 64,
             height: 16,
-            format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
-            store_action: MTL_STORE_ACTION_STORE,
+            format: reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+            store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
             ..Default::default()
         }],
         ..Default::default()
     };
 
-    let memory = super::vulkan::gva_guest_target_backing(&mut state, &mut host, &req)
+    let memory = super::gva_guest_target_backing(&mut state, &mut host, &req)
         .expect("the complete declared allocation has a stable packed alias");
     let packed = state
         .bound_buffers
@@ -5219,15 +5472,15 @@ fn gva_target_backing_retains_the_declared_parent_allocation() {
             }),
             width: 64,
             height: 16,
-            format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
-            store_action: MTL_STORE_ACTION_STORE,
+            format: reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+            store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
             ..Default::default()
         }],
         task_id: 1,
         ..Default::default()
     };
     assert!(
-        super::vulkan::gva_guest_target_backing(&mut state, &mut host, &incomplete).is_none(),
+        super::gva_guest_target_backing(&mut state, &mut host, &incomplete).is_none(),
         "an incomplete parent allocation must stay on the copying fallback"
     );
     assert!(matches!(
@@ -5239,7 +5492,6 @@ fn gva_target_backing_retains_the_declared_parent_allocation() {
 }
 
 #[test]
-#[cfg(feature = "backend-vulkan")]
 fn sampled_plane_keeps_its_copy_source_and_checks_the_packed_extent() {
     use crate::runtime::bound_buffers::PackedBuffer;
     use crate::runtime::guest_ram::GuestRamImport;
@@ -5263,19 +5515,19 @@ fn sampled_plane_keeps_its_copy_source_and_checks_the_packed_extent() {
         pages: std::sync::Arc::new(Vec::new()),
     };
     assert!(
-        super::vulkan::linear_sample_from_packed(
+        super::linear_sample_from_packed(
             &packed,
             0x7000,
             0x1001,
             128,
-            crate::contract::pixel_format::TexelLayout::Rgba8,
+            reims_vgpu_core::pixel_format::TexelLayout::Rgba8,
             reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8,),
-            super::vulkan::LinearSampleIdentity {
+            super::LinearSampleIdentity {
                 key: 1,
                 generation: 1,
             },
             crate::runtime::gather_witness::GatherVouch::Fresh,
-            crate::contract::pixel_format::SwizzlePlan::default(),
+            reims_vgpu_core::pixel_format::SwizzlePlan::default(),
         )
         .is_none(),
         "a sampled copy may not extend the retained allocation to fit"
@@ -5285,22 +5537,22 @@ fn sampled_plane_keeps_its_copy_source_and_checks_the_packed_extent() {
     let page_list_owners = std::sync::Arc::strong_count(&packed.gpas);
     let run_owners = std::sync::Arc::strong_count(&packed.runs);
     let guest_ref_owners = std::sync::Arc::strong_count(&packed.pages);
-    let request = super::vulkan::linear_sample_from_packed(
+    let request = super::linear_sample_from_packed(
         &packed,
         0x1000,
         0x2000,
         128,
-        crate::contract::pixel_format::TexelLayout::Rgba8,
+        reims_vgpu_core::pixel_format::TexelLayout::Rgba8,
         reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
-        super::vulkan::LinearSampleIdentity {
+        super::LinearSampleIdentity {
             key: 1,
             generation: 1,
         },
         crate::runtime::gather_witness::GatherVouch::Fresh,
-        crate::contract::pixel_format::SwizzlePlan::default(),
+        reims_vgpu_core::pixel_format::SwizzlePlan::default(),
     )
     .expect("the retained allocation supplies this plane's copy source");
-    let super::vulkan::SampledSourceRequest::GuestRuns(
+    let super::SampledSourceRequest::GuestRuns(
         source,
         _,
         _,
@@ -5347,11 +5599,10 @@ fn sampled_plane_keeps_its_copy_source_and_checks_the_packed_extent() {
 /// merged them would argue for machinery against a population that is not
 /// there — so the discrimination is the measurement, not a tidiness.
 #[test]
-#[cfg(feature = "backend-vulkan")]
 fn a_window_refusal_names_which_check_refused() {
-    use super::vulkan::WindowRefusal;
-    use crate::contract::endian::st32;
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use super::WindowRefusal;
+    use reims_vgpu_core::endian::st32;
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 
     let page_shift = crate::model::PAGE_SHIFT_X86;
     let page = 1u64 << page_shift;
@@ -5376,7 +5627,7 @@ fn a_window_refusal_names_which_check_refused() {
         let mut pte = [0u8; 4];
         st32(&mut pte, leaf_pfn);
         host.write_gpa(root_gpa, &pte).unwrap();
-        let mut state = DeviceState::new(DeviceId(1), page_shift);
+        let mut state = Device::new(DeviceId(1), page_shift);
         state.define_task(1, page, 2);
         (host, state)
     };
@@ -5430,17 +5681,17 @@ const STORE_RIG_PT_BASE: u32 = 4;
 /// exists so the interesting half of each test is the write, not the walk.
 struct StoreRig {
     host: FakeHost,
-    state: DeviceState,
+    state: Device,
     root_gpa: u64,
 }
 
 impl StoreRig {
     /// Task 1, `entries` mapped virtual pages, `page_shift` geometry.
     fn new(entries: u32) -> Self {
-        use crate::contract::endian::st32;
-        use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        use reims_vgpu_core::endian::st32;
+        use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
         let mut host = FakeHost::new();
-        let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let (dir_pfn, root_pfn) = (2u32, 3u32);
         let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
         let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
@@ -5471,7 +5722,7 @@ impl StoreRig {
 
     /// Point virtual page `entry` of the task at guest frame `pfn`.
     fn point(&mut self, entry: u32, pfn: u32) {
-        use crate::contract::endian::st32;
+        use reims_vgpu_core::endian::st32;
         let mut pte = [0u8; 4];
         st32(&mut pte, pfn);
         let _ = self
@@ -5531,7 +5782,6 @@ fn a_short_pre_submit_walk_takes_the_ordered_page_list_away() {
     );
 }
 
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
     let rig = StoreRig::new(8);
@@ -5547,10 +5797,10 @@ fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
         storage: linear_target_storage(page, 64 * 4, 64),
         width: 64,
         height: 64,
-        format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        format: reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM,
         sample_count: 1,
-        load_action: MTL_LOAD_ACTION_LOAD,
-        store_action: MTL_STORE_ACTION_STORE,
+        load_action: reims_vgpu_protocol::pass_action::LoadAction::Load,
+        store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
         clear_color: [0.0; 4],
         target_seed_rgba: None,
         multisample_source_ref: 0,
@@ -5559,7 +5809,7 @@ fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
     let armed = sync_store_allowed_pages(&state, &host, 1, Some(&c0), true)
         .expect("a resolvable GVA target must be bounded");
     let mut resolve = c0.clone();
-    resolve.store_action = crate::contract::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
+    resolve.store_action = reims_vgpu_protocol::pass_action::StoreAction::MultisampleResolve;
     assert!(
         sync_store_allowed_pages(&state, &host, 1, Some(&resolve), true).is_some(),
         "a resolve publishes into the same guest destination and needs the same bound"
@@ -5576,7 +5826,7 @@ fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
     // The guest hands that virtual page to a different allocation while the GPU
     // is working. The write that follows must not reach the new owner.
     let mut pte = [0u8; 4];
-    crate::contract::endian::st32(&mut pte, pt_base + 6);
+    reims_vgpu_core::endian::st32(&mut pte, pt_base + 6);
     let _ = host.write_gpa(root_gpa + 4, &pte);
     let rgba = vec![0xffu8; 64 * 64 * 4];
     let err = write_gva_rgba8_within(
@@ -5647,7 +5897,6 @@ fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
 /// only a magnitude check separates a skipped six-vertex quad from a skipped
 /// fifty-four-vertex pass. The delta form is deliberate: the census map is
 /// process-global and the rest of the suite shares it.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_draw_skipped_after_an_engine_refusal_is_counted_with_the_vertices_it_cost() {
     use crate::runtime::drain::store_route_count;
@@ -5662,7 +5911,7 @@ fn a_draw_skipped_after_an_engine_refusal_is_counted_with_the_vertices_it_cost()
     let rig = StoreRig::new(8);
     let (mut host, mut state) = (rig.host, rig.state);
 
-    let mut req = DrawEncodeRequest {
+    let req = DrawEncodeRequest {
         task_id: 1,
         // No pipeline, so the engine draw is never attempted at all — the
         // cheapest way to the tail, and the arm whose refusal the emitter has
@@ -5670,7 +5919,7 @@ fn a_draw_skipped_after_an_engine_refusal_is_counted_with_the_vertices_it_cost()
         pipeline_ref: 0,
         vertex_count: VERTEX_COUNT,
         instance_count: 1,
-        primitive_type: 3,
+        primitive_topology: reims_vgpu_protocol::PrimitiveTopology::Triangle,
         first_vertex: 0,
         colors: vec![ColorRtRequest {
             slot: 0,
@@ -5681,9 +5930,9 @@ fn a_draw_skipped_after_an_engine_refusal_is_counted_with_the_vertices_it_cost()
             storage: linear_target_storage(StoreRig::gva(1), 64 * 4, 64),
             width: 64,
             height: 64,
-            format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
-            load_action: MTL_LOAD_ACTION_CLEAR,
-            store_action: MTL_STORE_ACTION_STORE,
+            format: reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+            load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
+            store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
             ..Default::default()
         }],
         ..Default::default()
@@ -5693,7 +5942,7 @@ fn a_draw_skipped_after_an_engine_refusal_is_counted_with_the_vertices_it_cost()
     let vertices_before = store_route_count(VERTICES);
 
     let cap = crate::observe::FailCapture::start();
-    let st = encode_draw_chain(&mut state, &mut host, &mut req, true, false).0;
+    let st = encode_draw_chain(&mut state, &mut host, &req, true, false).status;
     let lines = cap.lines();
     drop(cap);
 
@@ -5734,16 +5983,21 @@ fn a_draw_skipped_after_an_engine_refusal_is_counted_with_the_vertices_it_cost()
 /// after the geometry read.
 #[test]
 fn iosurface_texture_sample_resolves_geometry_before_reading_it() {
-    use crate::contract::endian::{st32, st64};
-    use crate::contract::iosurface_pages::{
-        DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_BPR, DEVICE_DESC_DIMS, DEVICE_DESC_LEN,
-        DEVICE_DESC_PIXEL_FORMAT, DEVICE_DESC_PLANE_COUNT, MAPPING_INTERNAL_BACKPTR,
-        MAPPING_INTERNAL_DESC_PTR, MAPPING_INTERNAL_EXPECTED_SIZE, MAPPING_INTERNAL_ID,
-        MAPPING_INTERNAL_PAGE_COUNT, MAPPING_INTERNAL_PAGE_FIELD_48,
-        MAPPING_INTERNAL_PAGE_FIELD_50, MAPPING_INTERNAL_SIZE, MAPPING_PAGE_TABLE_FROM_F48,
-        PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID,
-    };
     use crate::runtime::host::HostMemory;
+    use reims_vgpu_core::endian::{st32, st64};
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
+    use reims_vgpu_paging::mapper::{
+        MAPPING_INTERNAL_BACKPTR, MAPPING_INTERNAL_DESC_PTR, MAPPING_INTERNAL_EXPECTED_SIZE,
+        MAPPING_INTERNAL_ID, MAPPING_INTERNAL_PAGE_COUNT, MAPPING_INTERNAL_PAGE_FIELD_48,
+        MAPPING_INTERNAL_PAGE_FIELD_50, MAPPING_INTERNAL_SIZE, MAPPING_PAGE_TABLE_FROM_F48,
+    };
+    use reims_vgpu_protocol::{
+        DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_BPR, DEVICE_DESC_DIMS, DEVICE_DESC_LEN,
+        DEVICE_DESC_PIXEL_FORMAT, DEVICE_DESC_PLANE_COUNT,
+    };
 
     // Kernel VA base: the mapper walk refuses anything `guest_kernel_va` rejects.
     const KVA: u64 = 0xffff_fe00_1000_0000;
@@ -5763,7 +6017,7 @@ fn iosurface_texture_sample_resolves_geometry_before_reading_it() {
     let bpr = w * RGBA8_BPP;
     let alloc = bpr * h;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let internal = KVA;
     let mapper = KVA + 0x1000;
@@ -5817,13 +6071,13 @@ fn iosurface_texture_sample_resolves_geometry_before_reading_it() {
     host.map_range(desc_kva, DEVICE_DESC_LEN, 0);
     host.write_gpa(desc_kva, &desc).expect("seed descriptor");
 
-    state.mapper_device_kva = mapper;
+    state.observe_mapper_device(mapper);
     assert!(state.attach_mapping_internal(mid, internal));
     {
-        let m = state.mappings.get(&mid).expect("mapping");
-        assert!(m.mapped && m.mapping_internal != 0);
+        let m = state.surfaces.mappings.get(&mid).expect("mapping");
+        assert!(m.lifecycle.active && m.lifecycle.internal_kva != 0);
         assert!(
-            !m.has_geom,
+            !m.has_geometry(),
             "the fixture's whole point is that no geometry is latched yet"
         );
     }
@@ -5840,7 +6094,12 @@ fn iosurface_texture_sample_resolves_geometry_before_reading_it() {
         "guest BGRA page bytes converted to tight RGBA8"
     );
     assert!(
-        state.mappings.get(&mid).expect("mapping").has_geom,
+        state
+            .surfaces
+            .mappings
+            .get(&mid)
+            .expect("mapping")
+            .has_geometry(),
         "the resolve must have latched the descriptor geometry"
     );
 }
@@ -5860,7 +6119,7 @@ fn iosurface_texture_sample_resolves_geometry_before_reading_it() {
 fn a_pass_dropped_for_an_unresolvable_colour_slot_is_counted_every_time() {
     use crate::runtime::drain::store_route_count;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     let before = store_route_count("mrt_slot_unresolved");
 
@@ -5890,7 +6149,6 @@ fn a_pass_dropped_for_an_unresolvable_colour_slot_is_counted_every_time() {
 /// stencil LOAD substitutions sit inside the draw path, so without a first-only
 /// key has to separate slugs as well as pipelines, or one degradation would
 /// hits, since its depth and stencil substitutions can both fire on one pass.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_degradation_reports_once_per_pipeline_and_slug() {
     // Pipeline refs local to this test so a sibling cannot consume the first
@@ -5914,20 +6172,19 @@ fn a_degradation_reports_once_per_pipeline_and_slug() {
 /// A sampled bind accepts only the texture object kinds declared by the object
 /// list, regardless of whether another object's descriptor is long enough to
 /// resemble texture geometry.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_sampled_ref_naming_another_object_kind_is_refused() {
-    use crate::contract::endian::{st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE, TEXTURE_DESC_BASE_LEN,
     };
     use crate::runtime::gva_mem::write_task_gva_arm64e;
     use crate::runtime::objects::OBJECT_TYPE_REF_TEXTURE;
+    use reims_vgpu_core::endian::{st32, st64};
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 
     // One task, one object list, and two refs into it — same descriptor bytes,
     // different object type in the entry.
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let (dir_pfn, root_pfn) = (2u32, 3u32);
     let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
@@ -5966,11 +6223,11 @@ fn a_sampled_ref_naming_another_object_kind_is_refused() {
     put_entry(&mut host, view_ref, OBJECT_TYPE_REF_TEXTURE);
 
     assert!(
-        super::vulkan::sampled_texture_descriptor(&state, &host, 1, texture_ref).is_some(),
+        super::sampled_texture_descriptor(&state, &host, 1, texture_ref).is_some(),
         "a texture ref resolves"
     );
     assert!(
-        super::vulkan::sampled_texture_descriptor(&state, &host, 1, view_ref).is_none(),
+        super::sampled_texture_descriptor(&state, &host, 1, view_ref).is_none(),
         "a non-texture object must not acquire texture meaning from its byte shape"
     );
 }
@@ -6099,15 +6356,14 @@ fn a_bind_stride_overrides_the_pipeline_stride_only_where_it_exists() {
 /// replaced it: the generation is recomputed from the pages as they stand now
 /// rather than read back out of whatever entry the address happens to find, so
 /// a moved page list misses instead of being wrong.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_gva_span_no_store_has_stamped_refuses_the_resident_sample_rung() {
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{TextureDescriptor, TextureLevelLayout};
     use crate::runtime::drain::store_route_count;
     use crate::runtime::gva_store_witness::{note_store, GvaTargetKey};
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     // GVA pages 0..7 → data PFNs 4..11: the one-level table every task-GVA walk
     // in this file uses.
@@ -6132,8 +6388,7 @@ fn a_gva_span_no_store_has_stamped_refuses_the_resident_sample_rung() {
         depth: 1,
         declaration: Some(crate::runtime::heap_query::TextureDescriptor {
             texture_type: 2,
-            framebuffer_only: false,
-            is_drawable: false,
+            unidentified_flags: 0,
             allow_gpu_optimized_contents: false,
             usage: 0,
             pixel_format: MTL_FORMAT_BGRA8_UNORM,
@@ -6144,7 +6399,7 @@ fn a_gva_span_no_store_has_stamped_refuses_the_resident_sample_rung() {
             sample_count: 1,
             array_length: 1,
             resource_options: 0,
-            protection_options: 0,
+            unidentified_u64: 0,
             swizzle: None,
         }),
         levels: vec![TextureLevelLayout {
@@ -6250,12 +6505,10 @@ fn a_gva_span_no_store_has_stamped_refuses_the_resident_sample_rung() {
 ///
 /// Not a GPU test: nothing in this crate can drive `registry_ensure_depth`
 /// without a device, so the gate sits at the key that rail is keyed on.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_depth_attachment_is_keyed_on_the_guest_texture_the_pass_bound() {
     use crate::model::TargetIdentity;
-    use crate::runtime::decode::render::DepthAttachment;
-    use crate::runtime::draw::vulkan::depth_chain_identity;
+    use crate::runtime::draw::execution::depth_chain_identity;
 
     let id = |r: &DrawEncodeRequest, st: bool| depth_chain_identity(r, st);
     let req = |depth_ref: u32, w: u32, h: u32| DrawEncodeRequest {
@@ -6264,7 +6517,7 @@ fn a_depth_attachment_is_keyed_on_the_guest_texture_the_pass_bound() {
             height: h,
             ..Default::default()
         }],
-        depth_attach: Some(DepthAttachment {
+        depth_attach: Some(DepthAttachmentState {
             texture_ref: depth_ref,
             ..Default::default()
         }),
@@ -6344,9 +6597,8 @@ fn a_depth_attachment_is_keyed_on_the_guest_texture_the_pass_bound() {
 /// Mesa's Intel driver divides `(use_count << 7)` by the array size its own
 /// zero-fill gave the binding the layout never declared.
 #[test]
-#[cfg(feature = "backend-vulkan")]
 fn only_a_statically_used_texture_gap_is_given_a_neutral_image() {
-    use crate::runtime::spirv_bind::DescriptorUse;
+    use reims_vgpu_vulkan::spirv_bind::DescriptorUse;
 
     let gap = |class, metal_index| FragUnbound { class, metal_index };
     let uses = vec![
@@ -6385,12 +6637,11 @@ fn only_a_statically_used_texture_gap_is_given_a_neutral_image() {
 /// a descriptor read, an `Arc<[u8]>` allocation and a decode, on every draw that
 /// bound any depth state, for an immutable object the guest publishes once and
 /// deletes explicitly.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_retained_depth_stencil_state_is_served_without_reading_guest_memory() {
     use crate::runtime::decode::resource::DepthStencilDescriptor;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let host = FakeHost::new();
     state.define_task(2, 0x2000, 9);
 
@@ -6406,7 +6657,7 @@ fn a_retained_depth_stencil_state_is_served_without_reading_guest_memory() {
         depth_write_enabled: true,
         ..Default::default()
     };
-    state.task_depth_stencil_states.register(
+    state.task_objects.depth_stencil.register(
         2,
         reims_vgpu_protocol::SerializerRef::new(7),
         std::sync::Arc::new(retained.clone()),
@@ -6419,7 +6670,8 @@ fn a_retained_depth_stencil_state_is_served_without_reading_guest_memory() {
     );
 
     assert!(state
-        .task_depth_stencil_states
+        .task_objects
+        .depth_stencil
         .delete(2, reims_vgpu_protocol::SerializerRef::new(7)));
     assert!(
         super::load_depth_stencil_descriptor(&state, &host, 2, 7).is_err(),

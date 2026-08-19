@@ -79,6 +79,8 @@ fn topology_independent_request(class: MemoryClass) -> Option<MemoryRequest> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reims_vgpu_core::ContentState;
+    use reims_vgpu_protocol::SubmissionId;
     use reims_vgpu_testkit::{assert_four_cell_guest_equivalence, GuestEffects};
 
     #[test]
@@ -110,11 +112,32 @@ mod tests {
             MemoryTopology::Discrete,
             |cell| {
                 let policy = MemoryPlacementPolicy::new(cell.topology);
+                let mut content = ContentState::default();
+                let initial = content.current;
+                if cell.host_pointer_import {
+                    // An imported guest allocation is already a GPU-visible
+                    // materialization of the stamped guest version.
+                    content.gpu_materialized(initial).unwrap();
+                } else {
+                    // The staging rail reaches the same semantic state after
+                    // its guest-to-GPU transfer completes.
+                    content.copy_guest_to_gpu_completed(initial).unwrap();
+                }
+                let submission = SubmissionId::new(7);
+                content.gpu_store_planned(submission).unwrap();
+                let rendered = content.gpu_store_completed(submission).unwrap();
+                content.copy_gpu_to_guest_completed(rendered).unwrap();
+                let state = content.replicas;
                 (
                     GuestEffects {
-                        memory: vec![0x10, 0x20, 0x30, 0x40],
-                        stamps: vec![(3, 9)],
-                        interrupts: vec![1],
+                        memory: vec![
+                            content.current.get() as u8,
+                            state.guest.map_or(0, |version| version.get() as u8),
+                            state.gpu.map_or(0, |version| version.get() as u8),
+                            state.host.map_or(0, |version| version.get() as u8),
+                        ],
+                        stamps: vec![(submission.get() as u32, rendered.get() as u32)],
+                        interrupts: vec![submission.get() as u32],
                         refusals: Vec::new(),
                         presented: vec![0x30, 0x20, 0x10, 0xff],
                     },

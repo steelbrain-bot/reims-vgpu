@@ -53,7 +53,7 @@ pub const fn primitive_type_executable(mtl: u32) -> bool {
 pub struct DrawArgs {
     pub vertex_count: u32,
     pub instance_count: u32,
-    pub primitive_type: u32,
+    pub primitive_topology: reims_vgpu_protocol::PrimitiveTopology,
     pub first_vertex: u32,
     /// Metal `baseInstance` / Vulkan `firstInstance`.
     pub base_instance: u32,
@@ -92,18 +92,21 @@ pub mod indirect {
     /// What an unindexed indirect draw's argument block says, as the same
     /// [`super::DrawArgs`] a direct record decodes to.
     ///
-    /// `primitive_type` is *not* in the block — Metal takes it as an argument
+    /// `primitive_topology` is *not* in the block — Metal takes it as an argument
     /// to the selector — so it comes off the record and is passed in here.
     /// `None` when the window is short, which is the caller's cue to refuse
     /// rather than to draw a zero.
-    pub fn unindexed(block: &[u8], primitive_type: u32) -> Option<super::DrawArgs> {
+    pub fn unindexed(
+        block: &[u8],
+        primitive_topology: reims_vgpu_protocol::PrimitiveTopology,
+    ) -> Option<super::DrawArgs> {
         if block.len() < UNINDEXED_LEN {
             return None;
         }
         Some(super::DrawArgs {
             vertex_count: ld32(block),
             instance_count: ld32(&block[4..]),
-            primitive_type,
+            primitive_topology,
             first_vertex: ld32(&block[8..]),
             base_instance: ld32(&block[12..]),
         })
@@ -116,14 +119,17 @@ pub mod indirect {
     /// `drawIndexedPrimitives` record fills the same field the same way. The
     /// two trailing values are the index-buffer half: `(index_start,
     /// base_vertex)`.
-    pub fn indexed(block: &[u8], primitive_type: u32) -> Option<(super::DrawArgs, u32, i32)> {
+    pub fn indexed(
+        block: &[u8],
+        primitive_topology: reims_vgpu_protocol::PrimitiveTopology,
+    ) -> Option<(super::DrawArgs, u32, i32)> {
         if block.len() < INDEXED_LEN {
             return None;
         }
         let args = super::DrawArgs {
             vertex_count: ld32(block),
             instance_count: ld32(&block[4..]),
-            primitive_type,
+            primitive_topology,
             // `indexStart` indexes the index buffer, not the vertex buffer, so
             // it is *not* `first_vertex`. It is returned beside the args and
             // applied to the index-buffer offset by the caller.
@@ -152,27 +158,31 @@ mod tests {
             block.extend_from_slice(&w.to_le_bytes());
         }
 
-        let un = indirect::unindexed(&block, 3).expect("16 bytes is a full block");
+        let un = indirect::unindexed(&block, reims_vgpu_protocol::PrimitiveTopology::Triangle)
+            .expect("16 bytes is a full block");
         assert_eq!(
             un,
             DrawArgs {
                 vertex_count: 11,
                 instance_count: 22,
-                primitive_type: 3,
+                primitive_topology: reims_vgpu_protocol::PrimitiveTopology::Triangle,
                 first_vertex: 33,
                 base_instance: 44,
             },
             "MTLDrawPrimitivesIndirectArguments order"
         );
 
-        let (args, index_start, base_vertex) =
-            indirect::indexed(&block, 4).expect("20 bytes is a full block");
+        let (args, index_start, base_vertex) = indirect::indexed(
+            &block,
+            reims_vgpu_protocol::PrimitiveTopology::TriangleStrip,
+        )
+        .expect("20 bytes is a full block");
         assert_eq!(
             args,
             DrawArgs {
                 vertex_count: 11,
                 instance_count: 22,
-                primitive_type: 4,
+                primitive_topology: reims_vgpu_protocol::PrimitiveTopology::TriangleStrip,
                 // `indexStart` is returned separately rather than here: it
                 // offsets the index buffer, and putting it in `first_vertex`
                 // would shift the vertex fetch instead.
@@ -189,12 +199,25 @@ mod tests {
         // failing.
         let mut negative = block.clone();
         negative[12..16].copy_from_slice(&(-7i32).to_le_bytes());
-        assert_eq!(indirect::indexed(&negative, 3).unwrap().2, -7);
+        assert_eq!(
+            indirect::indexed(&negative, reims_vgpu_protocol::PrimitiveTopology::Triangle,)
+                .unwrap()
+                .2,
+            -7
+        );
 
         // One byte short of each block refuses. Reading a partial block as
         // zeros is a draw of nothing that reports success.
-        assert!(indirect::unindexed(&block[..indirect::UNINDEXED_LEN - 1], 3).is_none());
-        assert!(indirect::indexed(&block[..indirect::INDEXED_LEN - 1], 3).is_none());
+        assert!(indirect::unindexed(
+            &block[..indirect::UNINDEXED_LEN - 1],
+            reims_vgpu_protocol::PrimitiveTopology::Triangle,
+        )
+        .is_none());
+        assert!(indirect::indexed(
+            &block[..indirect::INDEXED_LEN - 1],
+            reims_vgpu_protocol::PrimitiveTopology::Triangle,
+        )
+        .is_none());
     }
 
     /// The mask names the public `MTLPrimitiveType` enum and nothing above it.

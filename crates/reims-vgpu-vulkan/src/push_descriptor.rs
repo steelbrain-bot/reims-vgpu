@@ -67,6 +67,10 @@ pub unsafe fn query(
 }
 
 /// Query push descriptors with the operator's capability-narrowing switch.
+///
+/// # Safety
+///
+/// `pd` must be a physical device belonging to `instance`.
 pub unsafe fn query_configured(
     instance: &ash::Instance,
     pd: vk::PhysicalDevice,

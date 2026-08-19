@@ -173,7 +173,7 @@ Then run the device against the same fixtures, because a new fixture is a new te
 
 ```sh
 REIMS_WIRE_FIXTURES_REQUIRED=1 cargo test -p reims-vgpu --no-default-features \
-  --features backend-vulkan,host-window --test wire_fixtures_reach_the_decoders \
+  --features host-window --test wire_fixtures_reach_the_decoders \
   -- --nocapture
 ```
 

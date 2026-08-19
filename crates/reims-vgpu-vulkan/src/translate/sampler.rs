@@ -11,44 +11,25 @@ use crate::engine::{SamplerAddressMode, SamplerBorderColor, SamplerFilter, Sampl
 
 /// `MTLSamplerMinMagFilter` (SDK numeric values).
 pub fn filter(mtl: u32) -> Result<SamplerFilter, TranslateReason> {
-    Ok(match mtl {
-        0 => SamplerFilter::Nearest,
-        1 => SamplerFilter::Linear,
-        other => return Err(TranslateReason::UnknownSamplerFilter(other)),
-    })
+    reims_vgpu_protocol::sampler_filter(mtl).map_err(|_| TranslateReason::UnknownSamplerFilter(mtl))
 }
 
 /// `MTLSamplerMipFilter` (SDK numeric values).
 pub fn mip_filter(mtl: u32) -> Result<SamplerMipFilter, TranslateReason> {
-    Ok(match mtl {
-        0 => SamplerMipFilter::NotMipmapped,
-        1 => SamplerMipFilter::Nearest,
-        2 => SamplerMipFilter::Linear,
-        other => return Err(TranslateReason::UnknownSamplerMipFilter(other)),
-    })
+    reims_vgpu_protocol::sampler_mip_filter(mtl)
+        .map_err(|_| TranslateReason::UnknownSamplerMipFilter(mtl))
 }
 
 /// `MTLSamplerAddressMode` (SDK numeric values).
 pub fn address_mode(mtl: u32) -> Result<SamplerAddressMode, TranslateReason> {
-    Ok(match mtl {
-        0 => SamplerAddressMode::ClampToEdge,
-        1 => SamplerAddressMode::MirrorClampToEdge,
-        2 => SamplerAddressMode::Repeat,
-        3 => SamplerAddressMode::MirrorRepeat,
-        4 => SamplerAddressMode::ClampToZero,
-        5 => SamplerAddressMode::ClampToBorderColor,
-        other => return Err(TranslateReason::UnknownSamplerAddressMode(other)),
-    })
+    reims_vgpu_protocol::sampler_address_mode(mtl)
+        .map_err(|_| TranslateReason::UnknownSamplerAddressMode(mtl))
 }
 
 /// `MTLSamplerBorderColor` (SDK numeric values).
 pub fn border_color(mtl: u32) -> Result<SamplerBorderColor, TranslateReason> {
-    Ok(match mtl {
-        0 => SamplerBorderColor::TransparentBlack,
-        1 => SamplerBorderColor::OpaqueBlack,
-        2 => SamplerBorderColor::OpaqueWhite,
-        other => return Err(TranslateReason::UnknownSamplerBorderColor(other)),
-    })
+    reims_vgpu_protocol::sampler_border_color(mtl)
+        .map_err(|_| TranslateReason::UnknownSamplerBorderColor(mtl))
 }
 
 pub fn vk_filter(filter: SamplerFilter) -> vk::Filter {

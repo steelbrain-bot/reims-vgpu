@@ -1,6 +1,6 @@
 //! Compute command decoder (port of `host/utils/reims-vgpu-compute-decode`).
 
-use crate::contract::endian::ld32;
+use reims_vgpu_core::endian::ld32;
 use reims_vgpu_protocol::{HeapObject, ObjectTableRef, ResourceObject};
 use reims_vgpu_wire::ops::compute as wire;
 
@@ -703,7 +703,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::endian::st32;
+    use reims_vgpu_core::endian::st32;
 
     /// Header plus two `Size3`, and taken from the crate that pins it.
     const DISPATCH_DIRECT_LEN: usize = wire::DISPATCH_TOTAL_LEN as usize;
@@ -966,7 +966,7 @@ mod tests {
     /// is refused.
     #[test]
     fn a_resource_barrier_is_the_length_the_serializer_writes() {
-        use crate::contract::endian::st32;
+        use reims_vgpu_core::endian::st32;
 
         const COUNT: u32 = 2;
         let apple_len = COUNT_BASE + (COUNT as usize) * REF_SIZE;
@@ -1008,7 +1008,7 @@ mod tests {
     /// change grew a field into those bytes, this decodes `0xAAAA` into it.
     #[test]
     fn the_scope_barrier_reads_no_byte_the_serializer_left_alone() {
-        use crate::contract::endian::st32;
+        use reims_vgpu_core::endian::st32;
 
         let mut v = vec![0xAAu8; BARRIER_SCOPE_LEN];
         st32(&mut v[0..], wire::OPCODE_MEMORY_BARRIER_SCOPE);

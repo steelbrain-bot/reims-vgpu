@@ -9,7 +9,10 @@ use reims_vgpu_observe::Decline;
 /// A specific malformed or internally inconsistent compute request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ComputeValidationDecline {
-    EmptySpirv,
+    MissingProgram,
+    ProgramUnavailable {
+        id: u64,
+    },
     EmptyEntry,
     EntryInteriorNul,
     ZeroGrid {
@@ -70,7 +73,8 @@ pub enum ComputeValidationDecline {
 impl Decline for ComputeValidationDecline {
     fn slug(&self) -> &'static str {
         match self {
-            Self::EmptySpirv => "vk_compute_validate_empty_spirv",
+            Self::MissingProgram => "vk_compute_validate_missing_program",
+            Self::ProgramUnavailable { .. } => "vk_compute_validate_program_unavailable",
             Self::EmptyEntry => "vk_compute_validate_empty_entry",
             Self::EntryInteriorNul => "vk_compute_validate_entry_interior_nul",
             Self::ZeroGrid { .. } => "vk_compute_validate_zero_grid",
@@ -164,7 +168,8 @@ impl Decline for ComputeValidationDecline {
                 ("lod_min", f32::from_bits(*lod_min_bits).to_string()),
                 ("lod_max", f32::from_bits(*lod_max_bits).to_string()),
             ],
-            Self::EmptySpirv | Self::EmptyEntry | Self::EntryInteriorNul => Vec::new(),
+            Self::ProgramUnavailable { id } => vec![("id", id.to_string())],
+            Self::MissingProgram | Self::EmptyEntry | Self::EntryInteriorNul => Vec::new(),
         }
     }
 }
@@ -177,7 +182,8 @@ mod tests {
 
     fn all() -> Vec<ComputeValidationDecline> {
         vec![
-            ComputeValidationDecline::EmptySpirv,
+            ComputeValidationDecline::MissingProgram,
+            ComputeValidationDecline::ProgramUnavailable { id: 1 },
             ComputeValidationDecline::EmptyEntry,
             ComputeValidationDecline::EntryInteriorNul,
             ComputeValidationDecline::ZeroGrid { grid: [1, 0, 1] },
@@ -242,7 +248,7 @@ mod tests {
         // non-2D image shape. A compute texture binding is one flat plane
         // window or one linear GVA level, so there is no slice or depth axis
         // for a request to get wrong.
-        assert_eq!(before, 16, "the compute validator's reason census moved");
+        assert_eq!(before, 17, "the compute validator's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate compute-validation slug");
     }
 

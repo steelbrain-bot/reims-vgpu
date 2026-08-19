@@ -202,10 +202,10 @@ impl Default for WindowConfig {
 /// lock.
 pub type InputSink = Arc<dyn Fn(HostAction) + Send + Sync>;
 
-/// The latest guest frame to present (BGRA8, tightly packed `width*height*4`).
-/// `None` until the first present capture; the window clears to a flat color
-/// until then. Shared via `Arc`, so the window's per-vblank read is a refcount
-/// bump rather than a deep copy.
+/// The latest guest frame to present. Its payload is either a prepared engine
+/// resident or tightly packed BGRA8, never both. `None` until the first present
+/// capture; the window clears to a flat color until then. Shared via `Arc`, so
+/// the window's per-vblank read is a refcount bump rather than a deep copy.
 pub struct Frame {
     /// Monotonic publish sequence (assigned by the device when it writes a new
     /// frame). A static desktop publishes a new frame only when content changes.
@@ -216,11 +216,29 @@ pub struct Frame {
     /// Wrap-around is harmless: a collision at most skips one prepare (the source
     /// still holds valid content).
     pub seq: u64,
-    pub width: u32,
-    pub height: u32,
-    pub bgra: Vec<u8>,
-    /// Engine-resident source for same-device MoltenVK presentation.
-    pub resident: Option<reims_vgpu_core::PresentationSource>,
+    pub payload: FramePayload,
+}
+
+/// Exactly one source carries a published host-window frame.
+pub enum FramePayload {
+    CpuBgra {
+        bgra: Vec<u8>,
+        width: u32,
+        height: u32,
+    },
+    Resident(reims_vgpu_core::PreparedPresentation),
+}
+
+impl FramePayload {
+    pub fn dimensions(&self) -> (u32, u32) {
+        match self {
+            Self::CpuBgra { width, height, .. } => (*width, *height),
+            Self::Resident(prepared) => {
+                let source = prepared.source();
+                (source.width(), source.height())
+            }
+        }
+    }
 }
 
 /// Shared slot the device writes and the window reads (latest-wins). The frame
@@ -299,19 +317,30 @@ impl WindowWaker {
     }
 }
 
-/// Offer a published frame's CPU bytes to the engine presenter.
+/// Offer one published payload to the engine presenter.
 ///
 /// The presenter prefers the resident and only reads these when none carries the
 /// display — the firmware framebuffer, and any mapping the compositor has not
 /// rendered into. `bgra` is empty on presents the device elided the readback
 /// for, and the presenter rejects a short buffer rather than blitting a torn
 /// frame.
-fn window_cpu_frame(frame: &Frame) -> crate::runtime::executor::WindowCpuFrame<'_> {
-    crate::runtime::executor::WindowCpuFrame {
-        bgra: &frame.bgra,
-        width: frame.width,
-        height: frame.height,
+fn window_presentation_frame(
+    frame: &Frame,
+) -> crate::runtime::executor::WindowPresentationFrame<'_> {
+    let payload = match &frame.payload {
+        FramePayload::CpuBgra { bgra, .. } => {
+            crate::runtime::executor::WindowPresentationPayload::CpuBgra(bgra)
+        }
+        FramePayload::Resident(resident) => {
+            crate::runtime::executor::WindowPresentationPayload::Resident(resident)
+        }
+    };
+    let (width, height) = frame.payload.dimensions();
+    crate::runtime::executor::WindowPresentationFrame {
+        width,
+        height,
         seq: frame.seq,
+        payload,
     }
 }
 
@@ -468,8 +497,10 @@ pub type ExitedFlag = Arc<AtomicBool>;
 /// process window, creating the native window, or attaching the engine
 /// presenter to it. Nothing here describes a swapchain or a blit — those belong
 /// to the engine presenter, which types its own declines
-/// ([`crate::backend::vulkan::engine`]'s `DrawError`), and there is no second
-/// presenter in this file to type declines for.
+/// ([`reims_vgpu_vulkan::engine`]'s `DrawError`), and there is no second
+/// presenter in this file to type declines for. The executor boundary preserves
+/// those decline fields in `WindowPresentationError` without exposing the
+/// backend error type to this loop.
 ///
 /// `#[allow(dead_code)]` because four of the variants (`MainLoopRun`,
 /// `AlreadyOwned`, `NoRegisteredWindow`, `WrongOwner`) are
@@ -629,6 +660,18 @@ thread_local! {
     static MAIN_THREAD_WINDOW: RefCell<Option<MainThreadWindow>> = const { RefCell::new(None) };
 }
 
+#[cfg(target_os = "macos")]
+pub struct MainThreadWindowStart {
+    pub id: u64,
+    pub executor: std::sync::Arc<dyn crate::runtime::executor::Executor>,
+    pub config: WindowConfig,
+    pub on_input: InputSink,
+    pub frames: FrameSlot,
+    pub stop: StopFlag,
+    pub exited: ExitedFlag,
+    pub wake: WindowWakeHandle,
+}
+
 /// Create the macOS host window on the process main thread.
 ///
 /// AppKit requires event-loop creation and dispatch on the process main thread.
@@ -637,16 +680,17 @@ thread_local! {
 /// window may exist in a process; repeated starts for the same device are
 /// idempotent.
 #[cfg(target_os = "macos")]
-pub fn start_main_thread(
-    id: u64,
-    executor: std::sync::Arc<dyn crate::runtime::executor::Executor>,
-    config: WindowConfig,
-    on_input: InputSink,
-    frames: FrameSlot,
-    stop: StopFlag,
-    exited: ExitedFlag,
-    wake: WindowWakeHandle,
-) -> Result<(), WindowError> {
+pub fn start_main_thread(start: MainThreadWindowStart) -> Result<(), WindowError> {
+    let MainThreadWindowStart {
+        id,
+        executor,
+        config,
+        on_input,
+        frames,
+        stop,
+        exited,
+        wake,
+    } = start;
     MAIN_THREAD_WINDOW.with(|cell| {
         let mut slot = cell.borrow_mut();
         if let Some(existing) = slot.as_ref() {
@@ -1279,14 +1323,13 @@ impl App {
             return;
         }
         self.loop_census.draws_fresh += 1;
-        let result = self.executor.present_window_frame(
-            frame.as_ref().and_then(|frame| frame.resident.as_ref()),
-            frame.as_deref().map(window_cpu_frame),
-        );
+        let result = self
+            .executor
+            .present_window_frame(frame.as_deref().map(window_presentation_frame));
         match result {
             Ok(crate::runtime::executor::WindowPresentOutcome::Busy) => {}
             Ok(crate::runtime::executor::WindowPresentOutcome::Presented {
-                direct,
+                route,
                 width,
                 height,
                 swapchain_images,
@@ -1317,7 +1360,10 @@ impl App {
                     );
                     self.first_engine_present_logged = true;
                 }
-                if direct && frame.is_some() && !self.first_engine_guest_logged {
+                if route == reims_vgpu_core::PresentationRoute::Resident
+                    && frame.is_some()
+                    && !self.first_engine_guest_logged
+                {
                     eprintln!(
                         "reims-vgpu-window: first guest frame presented via engine resident \
                          (same-device zero-copy)"
@@ -1330,9 +1376,8 @@ impl App {
             }
             Err(error) => {
                 if !self.engine_error_logged {
-                    // The engine present rail's `DrawError` names its own reason
-                    // — a `VkCall`'s `vk_window_*` slug, a `DrawReason` refusal,
-                    // or `vk_engine_*_untyped` for the not-yet-typed variants.
+                    // The engine present rail names its own reason at the
+                    // executor boundary.
                     // Emitting it typed keeps that slug the primary `reason=`
                     // rather than nesting it inside a coarse
                     // `reason=engine_resident_present error=...` double-reason.
@@ -1344,7 +1389,7 @@ impl App {
                 // presenter's own: it says the presenter is *gone*, which on a
                 // running window means a device loss destroyed it. See
                 // [`Self::reattach_engine`].
-                if crate::runtime::executor::window_presenter_was_detached(&error) {
+                if error.presenter_detached() {
                     self.reattach_engine();
                 }
             }
@@ -1365,7 +1410,8 @@ impl App {
     /// viewport-mapped pointer against a picture drawn to a different rule.
     fn request_guest_geometry(&mut self, frame: Option<&Frame>) {
         let Some(frame) = frame else { return };
-        let incoming = (frame.width.max(1), frame.height.max(1));
+        let (width, height) = frame.payload.dimensions();
+        let incoming = (width.max(1), height.max(1));
         if self.guest_extent == Some(incoming) {
             return;
         }
@@ -1572,6 +1618,40 @@ mod wake_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn published_frame_preserves_exactly_one_payload_through_the_executor_port() {
+        let cpu = Frame {
+            seq: 1,
+            payload: FramePayload::CpuBgra {
+                bgra: vec![0x55; 16],
+                width: 2,
+                height: 2,
+            },
+        };
+        assert!(matches!(
+            window_presentation_frame(&cpu).payload,
+            crate::runtime::executor::WindowPresentationPayload::CpuBgra(bytes)
+                if bytes == [0x55; 16]
+        ));
+
+        let source = reims_vgpu_core::PresentationSource::new(
+            reims_vgpu_core::TargetIdentity::default(),
+            2,
+            2,
+        );
+        let resident = Frame {
+            seq: 2,
+            payload: FramePayload::Resident(reims_vgpu_core::PreparedPresentation::accepted(
+                source.clone(),
+            )),
+        };
+        assert!(matches!(
+            window_presentation_frame(&resident).payload,
+            crate::runtime::executor::WindowPresentationPayload::Resident(prepared)
+                if prepared.source() == &source
+        ));
+    }
 
     /// A run of redraws over one unchanged guest frame presents exactly once.
     ///

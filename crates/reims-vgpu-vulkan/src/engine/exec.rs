@@ -5,6 +5,7 @@
 use ash::vk;
 use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use super::caches::{
     canonicalize_layout_bindings, AttrKey, BindingSig, LayoutKey, ObjectCaches, PassKey,
@@ -719,18 +720,20 @@ unsafe fn stage_buffer_content(
             BoundBuffer::from(slot)
         }
         BufferContent::GuestRuns(src) => {
+            let transfer = src.transfer_plan();
             // A retained packed allocation is already the persistent buffer
             // object the guest bound. When the device accepts that host
             // allocation and every consumer accepts its offset, bind it as-is.
             // Exact-window/scattered sources that cannot form one Vulkan buffer
             // continue through the ordered gather below.
-            if let Some(bound) = unsafe { import_guest_buffer_window(ctx, pools, src, gather_role) }
+            if let Some(bound) =
+                unsafe { import_guest_buffer_window(ctx, pools, &transfer, gather_role) }
             {
                 pools.note_guest_read_recorded();
                 counters.note_buffer_guest_import(src.total_len, gather_role);
                 bound
             } else if let Some((bound, pending)) =
-                unsafe { gather_guest_buffer_window(ctx, pools, counters, src, usage)? }
+                unsafe { gather_guest_buffer_window(ctx, pools, counters, src, &transfer, usage)? }
             {
                 // The copies read guest RAM when the CB executes, exactly as a
                 // direct bind does, so this owes the same quiesce.
@@ -795,13 +798,13 @@ unsafe fn stage_buffer_content(
 unsafe fn import_guest_buffer_window(
     ctx: &super::context::DeviceContext,
     pools: &mut ResourcePools,
-    src: &super::types::GuestRunSource,
+    transfer: &reims_vgpu_memory::GuestReadTransferPlan<'_>,
     role: BufferGatherRole,
 ) -> Option<BoundBuffer> {
     if !ctx.caps.host_pointer.is_available() {
         return None;
     }
-    let stretch = src.single_stretch()?;
+    let stretch = transfer.direct()?;
     let bound = match unsafe { pools.bind_guest_ram(ctx, stretch.guest) } {
         Ok(bound) => bound,
         Err(inner) => {
@@ -842,7 +845,8 @@ pub(super) unsafe fn import_guest_compute_buffer_window(
     if !ctx.caps.host_pointer.is_available() {
         return None;
     }
-    let stretch = src.single_stretch()?;
+    let transfer = src.transfer_plan();
+    let stretch = transfer.direct()?;
     let bound = match unsafe { pools.bind_guest_ram(ctx, stretch.guest) } {
         Ok(bound) => bound,
         Err(inner) => {
@@ -926,12 +930,13 @@ unsafe fn gather_guest_buffer_window(
     pools: &mut ResourcePools,
     counters: &EngineCounters,
     src: &super::types::GuestRunSource,
+    transfer: &reims_vgpu_memory::GuestReadTransferPlan<'_>,
     usage: vk::BufferUsageFlags,
 ) -> Result<Option<(BoundBuffer, PendingGuestGather)>, DrawError> {
     if !ctx.caps.host_pointer.is_available() {
         return Ok(None);
     }
-    let Some(stretches) = src.window_stretches() else {
+    let Some(stretches) = transfer.stretches() else {
         return Ok(None);
     };
     // From here on this window costs something, so from here on it is charged.
@@ -1292,6 +1297,7 @@ pub(super) unsafe fn prepare_guest_texel_window(
     if !ctx.caps.host_pointer.is_available() {
         return Ok(None);
     }
+    let transfer = src.transfer_plan();
     // One stretch binds in place; anything longer is assembled by the GPU, the
     // same two arms the buffer rail has.
     //
@@ -1304,7 +1310,7 @@ pub(super) unsafe fn prepare_guest_texel_window(
     // gathers moving 10.8 GB, while the buffer rail on the same boot imported
     // 322 303 windows and gathered none on the CPU. It is not a small rail; it
     // was a rail whose only zero-copy arm could not be taken.
-    if let Some(stretch) = src.single_stretch() {
+    if let Some(stretch) = transfer.direct() {
         let bound = match unsafe { pools.bind_guest_ram(ctx, stretch.guest) } {
             Ok(bound) => bound,
             Err(inner) => {
@@ -1334,7 +1340,7 @@ pub(super) unsafe fn prepare_guest_texel_window(
     }
     // Plan before acquiring, so a window that turns out not to be gatherable
     // does not take a destination slot out of the pool to abandon it.
-    let Some(stretches) = src.window_stretches() else {
+    let Some(stretches) = transfer.stretches() else {
         return Ok(None);
     };
     let mut sources: Vec<(vk::Buffer, Vec<vk::BufferCopy>)> = Vec::new();
@@ -1478,6 +1484,11 @@ fn validate_buffer_content(
     Ok(())
 }
 
+pub(crate) struct NativeRenderProgram {
+    pub(crate) vertex: Arc<crate::m2v_cache::ShaderVariant>,
+    pub(crate) fragment: Arc<crate::m2v_cache::ShaderVariant>,
+}
+
 pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
     if req.width == 0 || req.height == 0 {
         return Err(DrawError::DrawValidation(
@@ -1487,14 +1498,14 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
             },
         ));
     }
-    if req.vert_spirv.is_empty() {
+    if req.program.vertex.id.get() == 0 {
         return Err(DrawError::DrawValidation(
-            DrawValidationDecline::EmptyVertexSpirv,
+            DrawValidationDecline::MissingVertexProgram,
         ));
     }
-    if req.frag_spirv.is_empty() {
+    if req.program.fragment.id.get() == 0 {
         return Err(DrawError::DrawValidation(
-            DrawValidationDecline::EmptyFragmentSpirv,
+            DrawValidationDecline::MissingFragmentProgram,
         ));
     }
     // Every viewport, not just the first: a NaN in slot 3 reaches
@@ -1715,7 +1726,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
         // zero — that is the spelling Metal requires, the decoder deliberately
         // preserves it, and this binding's divisor is 0 whatever the rate says.
         // Asking `rate == 0` alone declined that guest's draw outright, for a
-        // field nothing downstream reads. `contract::vertex_step` owns the pair.
+        // field nothing downstream reads. `reims_vgpu_protocol` owns the pair.
         if !reims_vgpu_protocol::step_rate_in_contract(
             attribute.step_function.mtl_ordinal(),
             attribute.step_rate,
@@ -1890,7 +1901,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
         let texel = image.format.layout().bytes_per_texel() as usize;
         // Four factors, so the widening the operands already carry is not
         // enough — see the target-seed check above for why two of them exhaust
-        // a u64 on their own. `contract::extent` owns the checked form.
+        // a u64 on their own. `reims_vgpu_protocol` owns the checked form.
         let Some(expected) = reims_vgpu_protocol::tight_layered_image_bytes(
             image.width,
             image.height,
@@ -2591,6 +2602,7 @@ pub(crate) unsafe fn execute_draw_inner(
     pools: &mut ResourcePools,
     counters: &EngineCounters,
     req: &DrawRequest,
+    program: &NativeRenderProgram,
 ) -> Result<DrawOutput, DrawError> {
     // Charges this draw's wall clock to one phase at a time; commits from
     // `Drop`, so the `?` returns below keep their time.
@@ -2920,8 +2932,8 @@ pub(crate) unsafe fn execute_draw_inner(
     // binding the layout above omits and the divide-by-zero is in the driver's
     // shared layout scoring rather than in anything stage-specific.
     if let Some((binding, fragment)) = used_binding_absent_from_layout(
-        &req.vert_used_descriptor_bindings,
-        &req.frag_used_descriptor_bindings,
+        &req.program.vertex.used_descriptor_bindings,
+        &req.program.fragment.used_descriptor_bindings,
         &layout_bindings,
     ) {
         return Err(DrawError::Unsupported(
@@ -3085,10 +3097,20 @@ pub(crate) unsafe fn execute_draw_inner(
         .collect();
 
     phase.enter(super::draw_phase::Phase::PipelineShader);
-    let (vert_digest, vert_module) =
-        caches.get_or_create_shader_memoized(indexes, ctx, &req.vert_spirv, counters, pools)?;
-    let (frag_digest, frag_module) =
-        caches.get_or_create_shader_memoized(indexes, ctx, &req.frag_spirv, counters, pools)?;
+    let (vert_digest, vert_module) = caches.get_or_create_shader_memoized(
+        indexes,
+        ctx,
+        &program.vertex.words,
+        counters,
+        pools,
+    )?;
+    let (frag_digest, frag_module) = caches.get_or_create_shader_memoized(
+        indexes,
+        ctx,
+        &program.fragment.words,
+        counters,
+        pools,
+    )?;
     phase.enter(super::draw_phase::Phase::PipelineLayoutPass);
     let (dsl, pipeline_layout) = caches.get_or_create_layout(ctx, &layout_key, counters, pools)?;
     let render_pass = caches.get_or_create_pass(ctx, pass_key, counters, pools)?;
@@ -3195,9 +3217,9 @@ pub(crate) unsafe fn execute_draw_inner(
         &pipeline_key,
         req.pipeline_lifetime.as_ref(),
         vert_module,
-        &req.vert_spirv,
+        &program.vertex.words,
         frag_module,
-        &req.frag_spirv,
+        &program.fragment.words,
         pipeline_layout,
         render_pass,
         counters,
@@ -6944,12 +6966,24 @@ mod tests {
         }
     }
 
+    fn test_program() -> reims_vgpu_core::PreparedRenderProgram {
+        reims_vgpu_core::PreparedRenderProgram {
+            vertex: reims_vgpu_core::PreparedShaderStage {
+                id: reims_vgpu_protocol::PreparedShaderId::new(1),
+                ..Default::default()
+            },
+            fragment: reims_vgpu_core::PreparedShaderStage {
+                id: reims_vgpu_protocol::PreparedShaderId::new(2),
+                ..Default::default()
+            },
+        }
+    }
+
     fn guest_run_req(w: u32, h: u32, total_len: u64, row_length_texels: u32) -> DrawRequest {
         DrawRequest {
             width: w,
             height: h,
-            vert_spirv: std::sync::Arc::new(vec![0]),
-            frag_spirv: std::sync::Arc::new(vec![0]),
+            program: test_program(),
             sampled_images: vec![SampledImageResource {
                 binding: 32,
                 array_element: 0,
@@ -7002,8 +7036,7 @@ mod tests {
         DrawRequest {
             width: w,
             height: h,
-            vert_spirv: std::sync::Arc::new(vec![0]),
-            frag_spirv: std::sync::Arc::new(vec![0]),
+            program: test_program(),
             target_guest_seed: Some(super::super::types::GuestTargetSeed {
                 source: GuestRunSource {
                     runs: std::sync::Arc::new(vec![GuestRun {
@@ -7629,8 +7662,7 @@ mod tests {
         DrawRequest {
             width: 8,
             height: 8,
-            vert_spirv: std::sync::Arc::new(vec![0]),
-            frag_spirv: std::sync::Arc::new(vec![0]),
+            program: test_program(),
             storage_buffers: vec![super::super::types::StorageBufferResource {
                 binding: 0,
                 content,
@@ -7643,8 +7675,7 @@ mod tests {
         DrawRequest {
             width: 8,
             height: 8,
-            vert_spirv: std::sync::Arc::new(vec![0]),
-            frag_spirv: std::sync::Arc::new(vec![0]),
+            program: test_program(),
             indexed: Some(super::super::types::IndexedDrawResource {
                 index_type: super::super::types::IndexType::U16,
                 index_count: 3,
@@ -7721,8 +7752,7 @@ mod tests {
         let mut req = DrawRequest {
             width: 8,
             height: 8,
-            vert_spirv: std::sync::Arc::new(vec![0]),
-            frag_spirv: std::sync::Arc::new(vec![0]),
+            program: test_program(),
             vertex_count: 3,
             base_instance: 2,
             ..DrawRequest::default()
@@ -7753,8 +7783,7 @@ mod tests {
         let mut req = DrawRequest {
             width: 8,
             height: 8,
-            vert_spirv: std::sync::Arc::new(vec![0]),
-            frag_spirv: std::sync::Arc::new(vec![0]),
+            program: test_program(),
             vertex_count: 3,
             ..DrawRequest::default()
         };
@@ -7797,21 +7826,24 @@ mod tests {
     }
 
     #[test]
-    fn empty_vertex_and_fragment_spirv_have_distinct_reasons() {
+    fn missing_vertex_and_fragment_programs_have_distinct_reasons() {
         let mut req = DrawRequest {
             width: 8,
             height: 8,
-            vert_spirv: std::sync::Arc::new(Vec::new()),
-            frag_spirv: std::sync::Arc::new(vec![0]),
+            program: test_program(),
             ..DrawRequest::default()
         };
-        assert_eq!(validation_slug(&req), "vk_draw_validate_empty_vertex_spirv");
-
-        req.vert_spirv = std::sync::Arc::new(vec![0]);
-        req.frag_spirv = std::sync::Arc::new(Vec::new());
+        req.program.vertex.id = reims_vgpu_protocol::PreparedShaderId::new(0);
         assert_eq!(
             validation_slug(&req),
-            "vk_draw_validate_empty_fragment_spirv"
+            "vk_draw_validate_missing_vertex_program"
+        );
+
+        req.program.vertex.id = reims_vgpu_protocol::PreparedShaderId::new(1);
+        req.program.fragment.id = reims_vgpu_protocol::PreparedShaderId::new(0);
+        assert_eq!(
+            validation_slug(&req),
+            "vk_draw_validate_missing_fragment_program"
         );
     }
 

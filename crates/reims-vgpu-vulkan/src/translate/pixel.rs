@@ -208,45 +208,8 @@ pub fn sampled_pixels(
     mtl: u16,
 ) -> Result<(TexelLayout, Option<TranslateReason>, SwizzlePlan), TranslateReason> {
     let f = translate(mtl)?;
-    // A format whose Metal channels do not sit identically on its Vulkan
-    // channels needs a component mapping on the view to sample correctly.
-    let layout = match f.linear_vk {
-        vk::Format::R8G8B8A8_UNORM => TexelLayout::Rgba8,
-        vk::Format::B8G8R8A8_UNORM => TexelLayout::Bgra8,
-        vk::Format::R8_UNORM => TexelLayout::R8,
-        vk::Format::R8G8_UNORM => TexelLayout::Rg8,
-        // Single-channel float rides its own native rail (color-management
-        // LUTs). `R16_SFLOAT` is a spec-mandatory sampled+linear format, so it
-        // is unconditional. `R32_SFLOAT`'s linear-filter feature is optional
-        // (absent on Apple/MoltenVK): the layout is named here (a decode fact),
-        // but the rail that emits it must confirm the host can filter it — see
-        // `try_linear_sample_zero_copy`'s `supports_sampled_r32f_linear_filter`
-        // gate — or the sample stays fail-visible.
-        vk::Format::R16_SFLOAT => TexelLayout::R16Float,
-        vk::Format::R32_SFLOAT => TexelLayout::R32Float,
-        // The ten-bit biplanar video planes, native for the reason the float
-        // layouts above are native. Both are Vulkan-mandatory sampled formats
-        // with mandatory linear filtering, so neither needs a capability gate.
-        vk::Format::R16_UNORM => TexelLayout::R16Unorm,
-        vk::Format::R16G16_UNORM => TexelLayout::Rg16Unorm,
-        // The half-float colour layouts. A recent macOS window server
-        // composites in `MTLPixelFormatRGBA16Float`, and every such bind used to
-        // land on the CPU re-read rung and be quantized to unorm8 on the way in
-        // — 99 % of this rail's format declines on a driven macos-26 boot. Both
-        // are exact as guest bytes: the Metal and Vulkan spellings are the same
-        // little-endian binary16 channels in the same order.
-        vk::Format::R16G16B16A16_UNORM => TexelLayout::Rgba16Unorm,
-        vk::Format::R16G16B16A16_SFLOAT => TexelLayout::Rgba16Float,
-        vk::Format::R16G16_SFLOAT => TexelLayout::Rg16Float,
-        // The packed 32-bit colour layouts, native for the reason the wide
-        // layouts above are: the word is the guest's, bit for bit, and no
-        // conversion to unorm8 could cut a ten- or eleven-bit channel without
-        // discarding what the guest picked the format for.
-        vk::Format::A2B10G10R10_UNORM_PACK32 => TexelLayout::Rgb10a2Unorm,
-        vk::Format::A2R10G10B10_UNORM_PACK32 => TexelLayout::Bgr10a2Unorm,
-        vk::Format::B10G11R11_UFLOAT_PACK32 => TexelLayout::Rg11b10Float,
-        _ => return Err(TranslateReason::NoSampledLayout(mtl)),
-    };
+    let (layout, components) =
+        pixel_format::sampled_texel(mtl).ok_or(TranslateReason::NoSampledLayout(mtl))?;
     // The format's own channel plan travels with the layout instead of being a
     // reason to refuse. A byte layout says how wide a texel is and in what
     // order its bytes sit; it cannot say that `A8Unorm`'s byte belongs in alpha
@@ -259,7 +222,8 @@ pub fn sampled_pixels(
     // site instead is not available — the plan is a property of the *Metal*
     // format, and a rail holding only a `TexelLayout` or a `VkFormat` has
     // already lost the distinction between `A8Unorm` and `R8Unorm`.
-    Ok((layout, srgb_decline(&f, mtl), f.components))
+    debug_assert_eq!(components, f.components);
+    Ok((layout, srgb_decline(&f, mtl), components))
 }
 
 pub use crate::format::{srgb_texel_layout, vk_image_format, vk_storage_image, vk_texel_layout};
@@ -284,17 +248,11 @@ pub use crate::format::{srgb_texel_layout, vk_image_format, vk_storage_image, vk
 ///
 /// [b]: crate::runtime::draw::vulkan
 pub fn sampled_byte_image_format(format: SampledByteFormat) -> ImageFormat {
-    let linear = ImageFormat::linear(format.layout());
-    let Some(mtl) = format.srgb_source() else {
-        return linear;
-    };
-    match ImageFormat::srgb(format.layout()) {
-        Some(srgb) => srgb,
-        None => {
-            crate::srgb_census::note_downgrade(crate::srgb_census::site::SAMPLED_BYTE_UPLOAD, mtl);
-            linear
-        }
+    let (image, downgrade) = format.image_format();
+    if let Some(mtl) = downgrade {
+        crate::srgb_census::note_downgrade(crate::srgb_census::site::SAMPLED_BYTE_UPLOAD, mtl);
     }
+    image
 }
 
 pub fn vk_sampled_bytes(format: SampledByteFormat) -> vk::Format {
@@ -303,9 +261,8 @@ pub fn vk_sampled_bytes(format: SampledByteFormat) -> vk::Format {
 
 /// Semantic image-view format for a sampled guest declaration.
 pub fn sampled_image_format(mtl: u16) -> Result<ImageFormat, TranslateReason> {
-    let (layout, _, _) = sampled_pixels(mtl)?;
-    let transfer = translate(mtl)?.transfer;
-    ImageFormat::with_transfer(layout, transfer).ok_or(TranslateReason::NoSampledLayout(mtl))
+    translate(mtl)?;
+    pixel_format::sampled_image_format(mtl).ok_or(TranslateReason::NoSampledLayout(mtl))
 }
 
 /// The [`TexelLayout`] a Vulkan format is, or `None` for a format that is not
@@ -516,12 +473,8 @@ pub fn has_bgra_order(format: vk::Format) -> bool {
 pub fn color_attachment(
     mtl: u16,
 ) -> Result<(ImageFormat, Option<TranslateReason>), TranslateReason> {
-    let f = translate(mtl)?;
-    if pixel_format::render_target_bpp(mtl).is_none() {
-        return Err(TranslateReason::NoColorAttachmentFormat(mtl));
-    }
-    let layout = texel_layout_of(f.vk).ok_or(TranslateReason::NoColorAttachmentFormat(mtl))?;
-    let format = ImageFormat::with_transfer(layout, f.transfer)
+    translate(mtl)?;
+    let format = pixel_format::color_attachment_format(mtl)
         .ok_or(TranslateReason::NoColorAttachmentFormat(mtl))?;
     Ok((format, None))
 }

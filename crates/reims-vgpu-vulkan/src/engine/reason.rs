@@ -184,12 +184,6 @@ pub enum DrawReason {
     /// substitute fits. Carries the translation-layer reason so the two log
     /// lines agree on why.
     VertexFormat(TranslateReason),
-    /// The guest's `MTLVisibilityResultMode` is outside the SDK enum.
-    ///
-    /// Delegates its slug for the same reason [`Self::VertexFormat`] does: the
-    /// translation layer already named the exact problem, and a second slug
-    /// here would make one check answer to two names.
-    VisibilityResultMode(TranslateReason),
     /// A constant-rate vertex attribute (`divisor == 0`) on a device without
     /// `vertexAttributeInstanceRateZeroDivisor`.
     ConstantVertexAttribute,
@@ -351,9 +345,7 @@ impl reims_vgpu_observe::Decline for DrawReason {
             // Deliberately delegates: the translation layer already named the
             // exact format problem, and inventing a second slug here would make
             // the two log lines disagree about one event.
-            Self::ColorAttachmentFormat(reason)
-            | Self::VertexFormat(reason)
-            | Self::VisibilityResultMode(reason) => reason.slug(),
+            Self::ColorAttachmentFormat(reason) | Self::VertexFormat(reason) => reason.slug(),
             Self::ConstantVertexAttribute => "constant_vertex_attribute",
             Self::InstanceRateDivisorUnsupported { .. } => "instance_rate_divisor_unsupported",
             Self::InstanceRateDivisorOverLimit { .. } => "instance_rate_divisor_over_limit",
@@ -442,9 +434,7 @@ impl std::fmt::Display for DrawReason {
                 u8::from(*depth),
                 u8::from(*color_input)
             ),
-            Self::ColorAttachmentFormat(reason)
-            | Self::VertexFormat(reason)
-            | Self::VisibilityResultMode(reason) => {
+            Self::ColorAttachmentFormat(reason) | Self::VertexFormat(reason) => {
                 write!(f, " value={}", reason.value())
             }
             Self::InstanceRateDivisorUnsupported { step_rate } => write!(f, " rate={step_rate}"),
@@ -644,7 +634,6 @@ mod tests {
             depth: false,
             color_input: false,
         },
-        DrawReason::VisibilityResultMode(TranslateReason::UnknownVisibilityResultMode(0)),
         DrawReason::SamplerAnisotropyUnsupported,
         DrawReason::SamplerMirrorClampToEdgeUnsupported,
         DrawReason::SamplerUnnormalizedCompare,

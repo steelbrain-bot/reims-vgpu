@@ -24,8 +24,8 @@
 //! `0xe5`) re-fills from registered command memory when present. Host Metal
 //! fill API remains for tests without guest backing.
 
-use crate::contract::endian::{ld32, ld64}; // ld64: 0x1d1 gpu_address + dispatch args
-use crate::model::DeviceState;
+use crate::runtime::Device;
+use reims_vgpu_core::endian::{ld32, ld64}; // ld64: 0x1d1 gpu_address + dispatch args
 
 use crate::runtime::decode::resource::{
     decode_serializer_resource, icb_layout_attribute_stride_slot_count,
@@ -44,9 +44,6 @@ use crate::runtime::decode::resource::{
 }; // slot-encoder fixtures only
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::objects;
-use reims_vgpu_core::ReferenceNamespace;
-use reims_vgpu_protocol::{IndirectCommandBufferObject, ResourceId, SerializerRef, TaskId};
-use std::collections::BTreeMap;
 
 /// A refusal on the indirect-command-buffer rail.
 ///
@@ -346,7 +343,7 @@ impl IcbMeshDraw {
     /// its only caller [`encode_render_command_slot`].
     #[cfg(test)]
     fn encode(&self, slot: &mut [u8], args: usize) {
-        use crate::contract::endian::st64;
+        use reims_vgpu_core::endian::st64;
         for (i, v) in self
             .grid
             .iter()
@@ -372,11 +369,7 @@ pub struct IcbRenderFill {
 }
 
 /// Guest ICB command-memory association (backing buffer for CPU fills).
-#[derive(Clone, Copy, Debug)]
-pub struct IcbCommandMemory {
-    pub gva: u64,
-    pub byte_len: u64,
-}
+pub use reims_vgpu_protocol::IcbCommandMemory;
 
 /// Decode one filled compute command slot from ICB backing bytes.
 ///
@@ -813,7 +806,7 @@ fn write_tessellation_factor(
     if off + ICB_TESSELLATION_FACTOR_LEN > slot.len() {
         return Err(IcbStatus::Args("icb_write_tess_factor_oob"));
     }
-    use crate::contract::endian::{st32, st64};
+    use reims_vgpu_core::endian::{st32, st64};
     st32(&mut slot[off..], tf.buffer_ref);
     let va = if tf.wire_va != 0 { tf.wire_va } else { 0 };
     st64(&mut slot[off + 4..], va);
@@ -833,7 +826,7 @@ pub fn encode_render_command_slot(
     layout: &IcbCommandLayout,
     fill: &IcbRenderFill,
 ) -> Result<Vec<u8>, IcbStatus> {
-    use crate::contract::endian::{st16, st32, st64};
+    use reims_vgpu_core::endian::{st16, st32, st64};
     let size = layout.command_size as usize;
     if size == 0 {
         return Err(IcbStatus::Args("icb_ers_zero_command_size"));
@@ -1014,7 +1007,7 @@ pub fn encode_compute_command_slot(
     layout: &IcbCommandLayout,
     fill: &IcbComputeFill,
 ) -> Result<Vec<u8>, IcbStatus> {
-    use crate::contract::endian::{st32, st64};
+    use reims_vgpu_core::endian::{st32, st64};
     let size = layout.command_size as usize;
     if size == 0 {
         return Err(IcbStatus::Args("icb_ecs_zero_command_size"));
@@ -1112,7 +1105,7 @@ pub fn encode_compute_command_slot(
 
 /// Load and decode an ICB descriptor for `icb_ref` on the task object list.
 pub fn load_icb_descriptor<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     icb_ref: u32,
@@ -1196,148 +1189,6 @@ fn note_unapplied_icb_flags(task_id: u32, icb_ref: u32, desc: &IndirectCommandBu
     }
 }
 
-// ---------------------------------------------------------------------------
-// ICB registry: (task_id, icb_ref) → what the guest declared. Backend-free.
-// ---------------------------------------------------------------------------
-
-/// What the guest said about one ICB, with nothing of the host in it.
-///
-/// The descriptor and the command-memory span are the whole input to
-/// [`decode_icb_command_range`], so this registry remains independent of host
-/// execution support.
-///
-/// Split out because the two halves have different lifetimes as well as
-/// different portability: a descriptor change re-materializes the host object
-/// but does not by itself say the guest re-pointed its command memory.
-#[derive(Clone, Debug)]
-struct IcbRecord {
-    desc: IndirectCommandBufferDescriptor,
-    /// Guest ICB backing buffer (the command slots the guest filled).
-    command_memory: Option<IcbCommandMemory>,
-}
-
-#[derive(Debug)]
-struct IcbEntry {
-    id: ResourceId<IndirectCommandBufferObject>,
-    record: IcbRecord,
-}
-
-#[derive(Debug, Default)]
-struct IcbRegistryInner {
-    namespace: ReferenceNamespace<IndirectCommandBufferObject>,
-    records: BTreeMap<(TaskId, SerializerRef<IndirectCommandBufferObject>), IcbEntry>,
-}
-
-/// Device-owned semantic ICB state.
-///
-/// The guest allocates ICB references per task. Keeping the registry on the
-/// device makes reset and multi-device isolation structural, while the typed
-/// namespace makes delete/reuse a new internal lifetime.
-#[derive(Debug, Default)]
-pub(crate) struct IcbRegistry {
-    inner: parking_lot::Mutex<IcbRegistryInner>,
-}
-
-impl IcbRegistry {
-    fn record(
-        &self,
-        task_id: u32,
-        icb_ref: u32,
-        desc: IndirectCommandBufferDescriptor,
-    ) -> Result<IndirectCommandBufferDescriptor, IcbStatus> {
-        let mut inner = self.inner.lock();
-        let task = TaskId::new(task_id);
-        let object = SerializerRef::new(icb_ref);
-        if let Some(entry) = inner.records.get(&(task, object)) {
-            if entry.record.desc == desc {
-                return Ok(entry.record.desc.clone());
-            }
-        }
-
-        inner.records.remove(&(task, object));
-        inner.namespace.release(task, object);
-        let id = inner
-            .namespace
-            .publish(task, object)
-            .map_err(|_| IcbStatus::Args("icb_identity_space_exhausted"))?;
-        inner.records.insert(
-            (task, object),
-            IcbEntry {
-                id,
-                record: IcbRecord {
-                    desc: desc.clone(),
-                    command_memory: None,
-                },
-            },
-        );
-        Ok(desc)
-    }
-
-    fn bind(&self, task_id: u32, icb_ref: u32, mem: IcbCommandMemory) -> Result<(), IcbStatus> {
-        let mut inner = self.inner.lock();
-        let entry = inner
-            .records
-            .get_mut(&(TaskId::new(task_id), SerializerRef::new(icb_ref)))
-            .ok_or(IcbStatus::Missing("icb_bind_memory_not_cached"))?;
-        entry.record.command_memory = Some(mem);
-        Ok(())
-    }
-
-    fn snapshot(&self, task_id: u32, icb_ref: u32) -> Option<IcbRecord> {
-        let inner = self.inner.lock();
-        let object = SerializerRef::new(icb_ref);
-        let entry = inner.records.get(&(TaskId::new(task_id), object))?;
-        debug_assert_eq!(
-            inner.namespace.resolve(TaskId::new(task_id), object),
-            Some(entry.id)
-        );
-        Some(entry.record.clone())
-    }
-
-    pub(crate) fn delete(&self, task_id: u32, icb_ref: u32) -> bool {
-        let mut inner = self.inner.lock();
-        let object = SerializerRef::new(icb_ref);
-        let removed = inner
-            .records
-            .remove(&(TaskId::new(task_id), object))
-            .is_some();
-        let released = inner.namespace.release(TaskId::new(task_id), object);
-        debug_assert_eq!(removed, released);
-        removed
-    }
-
-    pub(crate) fn delete_task(&self, task_id: u32) -> usize {
-        let mut inner = self.inner.lock();
-        let before = inner.records.len();
-        inner
-            .records
-            .retain(|&(task, _), _| task != TaskId::new(task_id));
-        let removed = before - inner.records.len();
-        let released = inner.namespace.release_task(TaskId::new(task_id));
-        debug_assert_eq!(removed, released);
-        removed
-    }
-
-    #[cfg(test)]
-    pub(crate) fn identity(
-        &self,
-        task_id: u32,
-        icb_ref: u32,
-    ) -> Option<ResourceId<IndirectCommandBufferObject>> {
-        self.inner
-            .lock()
-            .records
-            .get(&(TaskId::new(task_id), SerializerRef::new(icb_ref)))
-            .map(|entry| entry.id)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn insert_for_test(&self, task_id: u32, icb_ref: u32) {
-        self.record(task_id, icb_ref, IndirectCommandBufferDescriptor::default())
-            .expect("test ICB identity");
-    }
-}
-
 /// Load the guest's ICB descriptor and record it, on every pathway.
 ///
 /// Returns the descriptor the caller should build against. When the create body
@@ -1346,13 +1197,17 @@ impl IcbRegistry {
 /// old span held, and decoding the old bytes at the new layout would read
 /// whatever happened to be at those offsets rather than refusing.
 pub fn resolve_icb_record<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     icb_ref: u32,
 ) -> Result<IndirectCommandBufferDescriptor, IcbStatus> {
     let desc = load_icb_descriptor(state, host, task_id, icb_ref)?;
-    state.icb_registry.record(task_id, icb_ref, desc)
+    state
+        .task_objects
+        .indirect_command_buffers
+        .record(task_id, icb_ref, desc)
+        .map_err(|_| IcbStatus::Args("icb_identity_space_exhausted"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1506,7 +1361,7 @@ pub fn icb_fill_outcome(
 /// Fills are not stream opcodes; the guest writes this buffer via
 /// `PGSerializerIndirectComputeCommand`. Product re-decodes it at execute.
 pub fn bind_icb_command_memory(
-    state: &DeviceState,
+    state: &Device,
     task_id: u32,
     icb_ref: u32,
     mem: IcbCommandMemory,
@@ -1514,7 +1369,12 @@ pub fn bind_icb_command_memory(
     if icb_ref == 0 || mem.gva == 0 || mem.byte_len == 0 {
         return Err(IcbStatus::Args("icb_bind_memory_bad_args"));
     }
-    state.icb_registry.bind(task_id, icb_ref, mem)
+    state
+        .task_objects
+        .indirect_command_buffers
+        .bind(task_id, icb_ref, mem)
+        .then_some(())
+        .ok_or(IcbStatus::Missing("icb_bind_memory_not_cached"))
 }
 
 /// Associate ICB command memory from a type-1 buffer object-list ref (sync path).
@@ -1523,7 +1383,7 @@ pub fn bind_icb_command_memory(
 /// Byte length is min(buffer size, command_size × max_command_count) from the
 /// ICB create layout so oversize type-1 allocations are truncated to the ICB.
 pub fn associate_icb_backing_buffer_ref<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     icb_ref: u32,
@@ -1576,7 +1436,7 @@ pub fn associate_icb_backing_buffer_ref<M: HostMemory + HostOps>(
 /// captured fixtures varies them, because in a capture the stream *is* the
 /// oracle. `runtime::heap_query` shows the shape a real reply takes.
 pub fn apply_icb_host_resource_info<M: HostMemory + HostOps>(
-    _state: &DeviceState,
+    _state: &Device,
     _host: &M,
     _task_id: u32,
     _info: &IcbHostResourceInfo,
@@ -1617,7 +1477,7 @@ fn write_attribute_stride(
     index: u32,
     stride: u64,
 ) -> Result<(), IcbStatus> {
-    use crate::contract::endian::st64;
+    use reims_vgpu_core::endian::st64;
     let slots = icb_layout_attribute_stride_slot_count(layout);
     if slots == 0 || index >= slots || layout.attribute_stride_offset == 0 {
         return Err(IcbStatus::Args("icb_attribute_stride_no_slot"));
@@ -1632,7 +1492,7 @@ fn write_attribute_stride(
 }
 
 fn type1_buffer_gva_size<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     buffer_ref: u32,
@@ -1661,7 +1521,7 @@ fn type1_buffer_gva_size<M: HostMemory + HostOps>(
 /// PGSerializer stores `base+offset` in the bind VA field (not a separate offset).
 /// `wire_va == 0` means base (offset 0). Fail-closed if VA is below base or past size.
 fn offset_from_wire_va<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     buffer_ref: u32,
@@ -1683,7 +1543,7 @@ fn offset_from_wire_va<M: HostMemory + HostOps>(
 
 /// Resolve wire VAs on a compute fill into type-1 bind offsets (mutates in place).
 pub fn resolve_compute_fill_offsets<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     fill: &mut IcbComputeFill,
@@ -1698,7 +1558,7 @@ pub fn resolve_compute_fill_offsets<M: HostMemory + HostOps>(
 
 /// Resolve wire VAs on a render fill into type-1 bind / index offsets (mutates in place).
 pub fn resolve_render_fill_offsets<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     fill: &mut IcbRenderFill,
@@ -1810,7 +1670,7 @@ pub enum IcbCommandFill {
 /// same decoder serves both product pathways and gives a future Vulkan executor
 /// typed commands to replay.
 pub fn decode_icb_command_range<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     icb_ref: u32,
@@ -1827,19 +1687,20 @@ pub fn decode_icb_command_range<M: HostMemory + HostOps>(
 
     let (layout, max_kernel, max_vertex, max_fragment, command_types, max_cmds, mem) = {
         let rec = state
-            .icb_registry
+            .task_objects
+            .indirect_command_buffers
             .snapshot(task_id, icb_ref)
             .ok_or(IcbStatus::Missing("icb_fill_not_cached"))?;
         let mem = rec
             .command_memory
             .ok_or(IcbStatus::Missing(ICB_FILL_NO_COMMAND_MEMORY))?;
         (
-            rec.desc.layout,
-            rec.desc.max_kernel_buffer_bind_count,
-            rec.desc.max_vertex_buffer_bind_count,
-            rec.desc.max_fragment_buffer_bind_count,
-            rec.desc.command_types,
-            rec.desc.max_command_count as u64,
+            rec.descriptor.layout,
+            rec.descriptor.max_kernel_buffer_bind_count,
+            rec.descriptor.max_vertex_buffer_bind_count,
+            rec.descriptor.max_fragment_buffer_bind_count,
+            rec.descriptor.command_types,
+            rec.descriptor.max_command_count as u64,
             mem,
         )
     };

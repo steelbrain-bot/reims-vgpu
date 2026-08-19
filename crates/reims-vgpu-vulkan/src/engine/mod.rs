@@ -88,7 +88,7 @@ use pools::ResourcePools;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use types::ComputeError;
 
 /// One vGPU's guest-derived namespace inside the shared physical context.
@@ -96,14 +96,57 @@ use types::ComputeError;
 pub struct SessionId(u64);
 
 impl SessionId {
-    pub fn allocate() -> Self {
+    fn allocate() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let id = NEXT
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .expect("Vulkan session identity space exhausted");
-        let id = Self(id);
-        let _ = session_signals_for(id);
-        id
+        Self(id)
+    }
+}
+
+/// One vGPU's ownership of all guest-derived Vulkan state.
+///
+/// The process-wide engine temporarily borrows these resources while executing
+/// a call for this session. Between calls they remain owned here, and the
+/// process-wide live-session index contains only weak references so it cannot
+/// extend a guest device's lifetime.
+#[derive(Clone)]
+pub struct SessionHandle(Arc<SessionInner>);
+
+impl std::fmt::Debug for SessionHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SessionHandle").field(&self.id()).finish()
+    }
+}
+
+struct SessionInner {
+    id: SessionId,
+    resources: Mutex<SessionResources>,
+    signals: Arc<SessionSignals>,
+}
+
+impl SessionHandle {
+    pub fn allocate() -> Self {
+        Self::new(SessionId::allocate())
+    }
+
+    fn new(id: SessionId) -> Self {
+        let handle = Self(Arc::new(SessionInner {
+            id,
+            resources: Mutex::new(SessionResources::new()),
+            signals: Arc::new(SessionSignals::default()),
+        }));
+        LIVE_SESSIONS.lock().insert(id, Arc::downgrade(&handle.0));
+        handle
+    }
+
+    fn id(&self) -> SessionId {
+        self.0.id
+    }
+
+    fn signals(&self) -> Arc<SessionSignals> {
+        Arc::clone(&self.0.signals)
     }
 }
 
@@ -115,43 +158,40 @@ struct SessionSignals {
     guest_write_debt: std::sync::atomic::AtomicBool,
     guest_write_pages: std::sync::Mutex<GuestWriteFootprint>,
     stamp_completion: Arc<stamp_completion::SessionState>,
-    #[cfg(feature = "host-window")]
-    window_present_attached: std::sync::atomic::AtomicBool,
 }
 
 thread_local! {
     static CURRENT_SESSION: Cell<SessionId> = const { Cell::new(SessionId(0)) };
-    static CURRENT_SESSION_SIGNALS: std::cell::RefCell<Option<Arc<SessionSignals>>> =
+    static CURRENT_SESSION_HANDLE: std::cell::RefCell<Option<SessionHandle>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// Restores the caller's prior session when a nested device operation ends.
 pub struct SessionScope {
     previous: SessionId,
-    previous_signals: Option<Arc<SessionSignals>>,
+    previous_handle: Option<SessionHandle>,
 }
 
 impl Drop for SessionScope {
     fn drop(&mut self) {
         CURRENT_SESSION.set(self.previous);
-        CURRENT_SESSION_SIGNALS.with(|slot| {
-            slot.replace(self.previous_signals.take());
+        CURRENT_SESSION_HANDLE.with(|slot| {
+            slot.replace(self.previous_handle.take());
         });
     }
 }
 
-pub fn enter_session(session: SessionId) -> SessionScope {
-    let signals = session_signals_for(session);
-    let previous = CURRENT_SESSION.replace(session);
-    let previous_signals = CURRENT_SESSION_SIGNALS.with(|slot| slot.replace(Some(signals)));
+pub fn enter_session(session: &SessionHandle) -> SessionScope {
+    let previous = CURRENT_SESSION.replace(session.id());
+    let previous_handle = CURRENT_SESSION_HANDLE.with(|slot| slot.replace(Some(session.clone())));
     SessionScope {
         previous,
-        previous_signals,
+        previous_handle,
     }
 }
 
-pub fn release_session(session: SessionId) {
-    if session == SessionId(0) {
+pub fn release_session(session: &SessionHandle) {
+    if session.id() == SessionId(0) {
         return;
     }
     {
@@ -159,45 +199,49 @@ pub fn release_session(session: SessionId) {
         reset_guest_state();
     }
     let mut engine = lock_engine();
-    engine.activate_session(SessionId(0));
-    if let Some(mut resources) = engine.inactive_sessions.remove(&session) {
-        if let Some(ctx) = engine.owner.ctx.as_ref() {
-            unsafe {
-                #[cfg(feature = "host-window")]
-                if let Some(mut presenter) = resources.window_presenter.take() {
-                    presenter.destroy(ctx, Some(&mut resources.pools));
-                }
-                resources.pools.destroy_all(&ctx.device);
+    engine.activate_session(default_session());
+    let mut resources = session.0.resources.lock();
+    if let Some(ctx) = engine.owner.ctx.as_ref() {
+        unsafe {
+            #[cfg(feature = "host-window")]
+            if let Some(mut presenter) = resources.window_presenter.take() {
+                presenter.destroy(ctx, Some(&mut resources.pools));
             }
+            resources.pools.destroy_all(&ctx.device);
         }
     }
-    SESSION_SIGNALS.lock().remove(&session);
+    LIVE_SESSIONS.lock().remove(&session.id());
 }
 
-static SESSION_SIGNALS: Lazy<Mutex<HashMap<SessionId, Arc<SessionSignals>>>> = Lazy::new(|| {
+static LIVE_SESSIONS: Lazy<Mutex<HashMap<SessionId, Weak<SessionInner>>>> = Lazy::new(|| {
     let mut sessions = HashMap::new();
-    sessions.insert(SessionId(0), Arc::new(SessionSignals::default()));
+    sessions.insert(SessionId(0), Arc::downgrade(&DEFAULT_SESSION.0));
     Mutex::new(sessions)
 });
 
-fn session_signals_for(session: SessionId) -> Arc<SessionSignals> {
-    Arc::clone(
-        SESSION_SIGNALS
-            .lock()
-            .entry(session)
-            .or_insert_with(|| Arc::new(SessionSignals::default())),
-    )
+static DEFAULT_SESSION: Lazy<SessionHandle> = Lazy::new(|| {
+    SessionHandle(Arc::new(SessionInner {
+        id: SessionId(0),
+        resources: Mutex::new(SessionResources::new()),
+        signals: Arc::new(SessionSignals::default()),
+    }))
+});
+
+fn default_session() -> &'static SessionHandle {
+    &DEFAULT_SESSION
+}
+
+fn current_session_handle() -> SessionHandle {
+    CURRENT_SESSION_HANDLE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| default_session().clone())
+    })
 }
 
 fn current_session_signals() -> Arc<SessionSignals> {
-    CURRENT_SESSION_SIGNALS.with(|slot| {
-        if let Some(signals) = slot.borrow().as_ref() {
-            return Arc::clone(signals);
-        }
-        let signals = session_signals_for(CURRENT_SESSION.get());
-        slot.replace(Some(Arc::clone(&signals)));
-        signals
-    })
+    current_session_handle().signals()
 }
 
 /// Bind the active executor session's completion wakeup to its owning device.
@@ -330,7 +374,7 @@ struct EngineState {
     window_presenter: Option<window_present::WindowPresenter>,
     resident_epoch: Arc<AtomicU64>,
     active_session: SessionId,
-    inactive_sessions: HashMap<SessionId, SessionResources>,
+    active_resources: Weak<SessionInner>,
 }
 
 struct SessionResources {
@@ -340,6 +384,28 @@ struct SessionResources {
     #[cfg(feature = "host-window")]
     window_presenter: Option<window_present::WindowPresenter>,
     resident_epoch: Arc<AtomicU64>,
+}
+
+impl SessionResources {
+    fn new() -> Self {
+        Self {
+            pools: ResourcePools::new(),
+            indexes: SessionCacheIndexes::new(),
+            counters: EngineCounters::default(),
+            #[cfg(feature = "host-window")]
+            window_presenter: None,
+            resident_epoch: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    fn swap_with_engine(&mut self, engine: &mut EngineState) {
+        std::mem::swap(&mut self.pools, &mut engine.pools);
+        std::mem::swap(&mut self.indexes, &mut engine.indexes);
+        std::mem::swap(&mut self.counters, &mut engine.counters);
+        #[cfg(feature = "host-window")]
+        std::mem::swap(&mut self.window_presenter, &mut engine.window_presenter);
+        std::mem::swap(&mut self.resident_epoch, &mut engine.resident_epoch);
+    }
 }
 
 impl EngineState {
@@ -354,38 +420,22 @@ impl EngineState {
             window_presenter: None,
             resident_epoch: Arc::new(AtomicU64::new(1)),
             active_session: SessionId(0),
-            inactive_sessions: HashMap::new(),
+            active_resources: Arc::downgrade(&default_session().0),
         }
     }
 
-    fn activate_session(&mut self, session: SessionId) {
-        if self.active_session == session {
+    fn activate_session(&mut self, session: &SessionHandle) {
+        if self.active_session == session.id() {
             return;
         }
-        let incoming =
-            self.inactive_sessions
-                .remove(&session)
-                .unwrap_or_else(|| SessionResources {
-                    pools: ResourcePools::new(),
-                    indexes: SessionCacheIndexes::new(),
-                    counters: EngineCounters::default(),
-                    #[cfg(feature = "host-window")]
-                    window_presenter: None,
-                    resident_epoch: Arc::new(AtomicU64::new(1)),
-                });
-        let outgoing = SessionResources {
-            pools: std::mem::replace(&mut self.pools, incoming.pools),
-            indexes: std::mem::replace(&mut self.indexes, incoming.indexes),
-            counters: std::mem::replace(&mut self.counters, incoming.counters),
-            #[cfg(feature = "host-window")]
-            window_presenter: std::mem::replace(
-                &mut self.window_presenter,
-                incoming.window_presenter,
-            ),
-            resident_epoch: std::mem::replace(&mut self.resident_epoch, incoming.resident_epoch),
-        };
-        self.inactive_sessions.insert(self.active_session, outgoing);
-        self.active_session = session;
+        let outgoing = self
+            .active_resources
+            .upgrade()
+            .expect("active Vulkan session was dropped without release");
+        outgoing.resources.lock().swap_with_engine(self);
+        session.0.resources.lock().swap_with_engine(self);
+        self.active_session = session.id();
+        self.active_resources = Arc::downgrade(&session.0);
     }
 
     /// Everything a `VK_ERROR_DEVICE_LOST` obliges this device to do, in one
@@ -441,36 +491,31 @@ impl EngineState {
     /// `host_window::present::App::reattach_engine` is what builds it again.
     fn flush_device_derived(&mut self) {
         clear_device_capabilities();
+        publish_batch_open(false);
         self.resident_epoch.fetch_add(1, Ordering::Release);
-        for session in self.inactive_sessions.values() {
-            session.resident_epoch.fetch_add(1, Ordering::Release);
+        let inactive_sessions: Vec<Arc<SessionInner>> = LIVE_SESSIONS
+            .lock()
+            .iter()
+            .filter(|(id, _)| **id != self.active_session)
+            .filter_map(|(_, session)| session.upgrade())
+            .collect();
+        for session in &inactive_sessions {
+            session.signals.batch_open.store(false, Ordering::Release);
+            session
+                .resources
+                .lock()
+                .resident_epoch
+                .fetch_add(1, Ordering::Release);
         }
-        let inactive_sessions = std::mem::take(&mut self.inactive_sessions);
         self.indexes.clear();
-        // Taken and published unconditionally, before anything fallible. The
+        // Taken unconditionally, before anything fallible. The
         // presenter's swapchain, surface and semaphores were made against the
         // device that is going away; whether or not there is still a `ctx` to
-        // destroy them through, they are not usable after this and the flag that
-        // says a window rail exists must not outlive them. It did once — the
-        // take lived inside the `ctx` arm and the flag was published from the
-        // window thread, which had no idea this path existed — and the cost was
-        // the whole rest of the boot: `window_publish` kept routing frames at a
-        // presenter that was `None`.
+        // destroy them through, they are not usable after this. Direct-present
+        // preparation now tests this owned field under the engine lock instead
+        // of consulting a separately published shadow bit.
         #[cfg(feature = "host-window")]
         let presenter = self.window_presenter.take();
-        #[cfg(feature = "host-window")]
-        {
-            note_window_present_attached(false);
-            let signals = SESSION_SIGNALS.lock();
-            for session in self.inactive_sessions.keys() {
-                if let Some(signals) = signals.get(session) {
-                    signals
-                        .window_present_attached
-                        .store(false, Ordering::Release);
-                }
-            }
-        }
-        let mut restored_sessions = HashMap::new();
         if let Some(ctx) = self.owner.ctx.as_ref() {
             // A device-loss observer can run while an ended batch is waiting in
             // the submission owner's FIFO. The device is already unusable, so
@@ -482,45 +527,32 @@ impl EngineState {
                 if let Some(mut presenter) = presenter {
                     presenter.destroy(ctx, Some(&mut self.pools));
                 }
-                for (id, mut session) in inactive_sessions {
+                for session in &inactive_sessions {
+                    let mut session = session.resources.lock();
                     session.indexes.clear();
                     #[cfg(feature = "host-window")]
                     if let Some(mut presenter) = session.window_presenter.take() {
                         presenter.destroy(ctx, Some(&mut session.pools));
                     }
                     session.pools.destroy_all(&ctx.device);
-                    restored_sessions.insert(
-                        id,
-                        SessionResources {
-                            pools: ResourcePools::new(),
-                            indexes: SessionCacheIndexes::new(),
-                            counters: session.counters,
-                            #[cfg(feature = "host-window")]
-                            window_presenter: None,
-                            resident_epoch: session.resident_epoch,
-                        },
-                    );
+                    session.pools = ResourcePools::new();
+                    session.indexes = SessionCacheIndexes::new();
                 }
                 self.caches.destroy_all(&ctx.device);
                 self.pools.destroy_all(&ctx.device);
             }
         } else {
             self.caches.clear_logical();
-            for (id, session) in inactive_sessions {
-                restored_sessions.insert(
-                    id,
-                    SessionResources {
-                        pools: ResourcePools::new(),
-                        indexes: SessionCacheIndexes::new(),
-                        counters: session.counters,
-                        #[cfg(feature = "host-window")]
-                        window_presenter: None,
-                        resident_epoch: session.resident_epoch,
-                    },
-                );
+            for session in &inactive_sessions {
+                let mut session = session.resources.lock();
+                session.pools = ResourcePools::new();
+                session.indexes = SessionCacheIndexes::new();
+                #[cfg(feature = "host-window")]
+                {
+                    session.window_presenter = None;
+                }
             }
         }
-        self.inactive_sessions = restored_sessions;
         self.pools = ResourcePools::new();
         self.indexes = SessionCacheIndexes::new();
         self.caches = ObjectCaches::new();
@@ -533,32 +565,37 @@ static ENGINE: Lazy<Mutex<EngineState>> = Lazy::new(|| Mutex::new(EngineState::n
 mod session_slot_tests {
     use super::*;
 
+    fn session(id: u64) -> SessionHandle {
+        SessionHandle::new(SessionId(id))
+    }
+
     #[test]
     fn activating_a_session_parks_every_other_devices_resources() {
         let mut engine = EngineState::new();
-        let first = SessionId(41);
-        let second = SessionId(42);
+        let first = session(41);
+        let second = session(42);
 
-        engine.activate_session(first);
-        assert_eq!(engine.active_session, first);
-        assert!(engine.inactive_sessions.contains_key(&SessionId(0)));
+        engine.activate_session(&first);
+        assert_eq!(engine.active_session, first.id());
+        assert_eq!(Arc::strong_count(&first.0), 1);
 
-        engine.activate_session(second);
-        assert_eq!(engine.active_session, second);
-        assert!(engine.inactive_sessions.contains_key(&first));
+        engine.activate_session(&second);
+        assert_eq!(engine.active_session, second.id());
+        assert_eq!(Arc::strong_count(&first.0), 1);
 
-        engine.activate_session(first);
-        assert_eq!(engine.active_session, first);
-        assert!(engine.inactive_sessions.contains_key(&second));
-        assert!(!engine.inactive_sessions.contains_key(&first));
+        engine.activate_session(&first);
+        assert_eq!(engine.active_session, first.id());
+        assert_eq!(Arc::strong_count(&second.0), 1);
     }
 
     #[test]
     fn nested_session_scopes_restore_the_callers_device() {
-        let first = enter_session(SessionId(51));
+        let first_session = session(51);
+        let second_session = session(52);
+        let first = enter_session(&first_session);
         assert_eq!(CURRENT_SESSION.get(), SessionId(51));
         {
-            let _second = enter_session(SessionId(52));
+            let _second = enter_session(&second_session);
             assert_eq!(CURRENT_SESSION.get(), SessionId(52));
         }
         assert_eq!(CURRENT_SESSION.get(), SessionId(51));
@@ -569,8 +606,10 @@ mod session_slot_tests {
     #[test]
     fn resetting_one_session_does_not_invalidate_another_sessions_lease() {
         let identity = TargetIdentity::default();
+        let first = session(61);
+        let second = session(62);
         let second_lease = {
-            let _second = enter_session(SessionId(62));
+            let _second = enter_session(&second);
             ResidentResourceLease::test_new(
                 identity.clone(),
                 ResidentContentBacking::DeviceAllocation,
@@ -578,44 +617,50 @@ mod session_slot_tests {
         };
 
         {
-            let _first = enter_session(SessionId(61));
+            let _first = enter_session(&first);
             reset_guest_state();
         }
         assert!(second_lease.matches(&identity));
 
         {
-            let _second = enter_session(SessionId(62));
+            let _second = enter_session(&second);
             reset_guest_state();
         }
         assert!(!second_lease.matches(&identity));
+        drop(second_lease);
+        release_session(&first);
+        release_session(&second);
     }
 
     #[test]
     fn open_batch_publication_is_session_scoped() {
+        let first = session(71);
+        let second = session(72);
         {
-            let _first = enter_session(SessionId(71));
+            let _first = enter_session(&first);
             publish_batch_open(true);
             assert!(current_session_signals().batch_open.load(Ordering::Acquire));
         }
         {
-            let _second = enter_session(SessionId(72));
+            let _second = enter_session(&second);
             assert!(!current_session_signals().batch_open.load(Ordering::Acquire));
             publish_batch_open(true);
         }
-        let _first = enter_session(SessionId(71));
+        let _first = enter_session(&first);
         assert!(current_session_signals().batch_open.load(Ordering::Acquire));
     }
 
     #[test]
     fn sessions_share_content_caches_but_not_device_counters() {
         let mut engine = EngineState::new();
+        let session = session(82);
         let cache_address = std::ptr::addr_of!(engine.caches);
         engine
             .counters
             .device_lost
             .store(3, std::sync::atomic::Ordering::Relaxed);
 
-        engine.activate_session(SessionId(82));
+        engine.activate_session(&session);
 
         assert_eq!(std::ptr::addr_of!(engine.caches), cache_address);
         assert_eq!(
@@ -626,7 +671,7 @@ mod session_slot_tests {
             0
         );
 
-        engine.activate_session(SessionId(0));
+        engine.activate_session(default_session());
         assert_eq!(
             engine
                 .counters
@@ -639,22 +684,26 @@ mod session_slot_tests {
     #[test]
     fn deleting_one_session_does_not_invalidate_another_sessions_lease() {
         let identity = TargetIdentity::default();
+        let first = session(91);
+        let second = session(92);
         let survivor = {
-            let _second = enter_session(SessionId(92));
+            let _second = enter_session(&second);
             ResidentResourceLease::test_new(
                 identity.clone(),
                 ResidentContentBacking::DeviceAllocation,
             )
         };
         {
-            let _first = enter_session(SessionId(91));
+            let _first = enter_session(&first);
             let _ = current_session_signals();
         }
 
-        release_session(SessionId(91));
+        release_session(&first);
 
         assert!(survivor.matches(&identity));
-        assert!(!SESSION_SIGNALS.lock().contains_key(&SessionId(91)));
+        assert!(!LIVE_SESSIONS.lock().contains_key(&SessionId(91)));
+        drop(survivor);
+        release_session(&second);
     }
 }
 
@@ -1127,8 +1176,8 @@ fn lock_engine_at(site: EngineLockSite) -> EngineGuard {
             guard
         }
     };
-    let session = CURRENT_SESSION.get();
-    guard.activate_session(session);
+    let session = current_session_handle();
+    guard.activate_session(&session);
     EngineGuard {
         guard,
         site,
@@ -1162,6 +1211,7 @@ pub struct GuestResetStats {
 /// immutable content-keyed shader/pipeline caches.
 pub fn reset_guest_state() -> GuestResetStats {
     let mut guard = lock_engine();
+    publish_batch_open(false);
     current_session_signals()
         .last_tail_batch_flush_us
         .store(0, std::sync::atomic::Ordering::Release);
@@ -1231,44 +1281,7 @@ pub fn window_present_attach(
     *window_presenter = Some(unsafe {
         window_present::WindowPresenter::create(ctx, display, window, width, height)?
     });
-    note_window_present_attached(true);
     Ok(())
-}
-
-/// Whether the host window is presenting from the engine's own device.
-///
-/// Read by the present-capture path on the drain worker, which must decide
-/// whether to read the finished frame back into host memory *before* it does so
-/// — deciding at publish time leaves the readback already paid for. A relaxed
-/// atomic rather than [`lock_engine`] because that call site runs once per
-/// present on the only thread that executes guest work, and taking the engine
-/// lock there to read one bit would serialize it against the window thread's
-/// own present.
-/// Publish the window's rail choice.
-///
-/// Private, and called from exactly the three places that assign or take
-/// [`EngineState::window_presenter`]. It used to be `pub`, published by the
-/// window thread beside its own `window_present_attach` call — and the third
-/// site, [`EngineState::flush_device_derived`], did not know it existed. So a
-/// device loss destroyed the presenter and left this flag reading `true` for the
-/// rest of the boot: `window_publish` kept routing to a rail that was gone,
-/// every present after the loss failed
-/// `EngineFacadeDecline::WindowPresenterNotAttached`, and because the window
-/// thread latches its error log the whole thing was one line. The flag and the
-/// field are one fact now, and no caller outside this module can set one
-/// without the other.
-#[cfg(feature = "host-window")]
-fn note_window_present_attached(attached: bool) {
-    current_session_signals()
-        .window_present_attached
-        .store(attached, Ordering::Release);
-}
-
-#[cfg(feature = "host-window")]
-pub fn window_present_attached() -> bool {
-    current_session_signals()
-        .window_present_attached
-        .load(Ordering::Acquire)
 }
 
 #[cfg(feature = "host-window")]
@@ -1343,7 +1356,6 @@ pub fn window_present_detach() {
     let Some(mut presenter) = guard.window_presenter.take() else {
         return;
     };
-    note_window_present_attached(false);
     let EngineState {
         ref owner,
         ref mut pools,
@@ -1356,6 +1368,24 @@ pub fn window_present_detach() {
 
 /// Execute one draw against the persistent engine.
 pub fn execute_draw_request(req: &DrawRequest) -> Result<DrawOutput, DrawError> {
+    exec::validate_v1(req)?;
+    let vertex =
+        crate::m2v_cache::resolve_prepared_shader(req.program.vertex.id).ok_or_else(|| {
+            DrawError::DrawValidation(
+                draw_validation::DrawValidationDecline::VertexProgramUnavailable {
+                    id: req.program.vertex.id.get(),
+                },
+            )
+        })?;
+    let fragment =
+        crate::m2v_cache::resolve_prepared_shader(req.program.fragment.id).ok_or_else(|| {
+            DrawError::DrawValidation(
+                draw_validation::DrawValidationDecline::FragmentProgramUnavailable {
+                    id: req.program.fragment.id.get(),
+                },
+            )
+        })?;
+    let program = exec::NativeRenderProgram { vertex, fragment };
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
@@ -1365,7 +1395,8 @@ pub fn execute_draw_request(req: &DrawRequest) -> Result<DrawOutput, DrawError> 
         ref counters,
         ..
     } = &mut *guard;
-    let result = unsafe { exec::execute_draw_inner(owner, caches, indexes, pools, counters, req) };
+    let result =
+        unsafe { exec::execute_draw_inner(owner, caches, indexes, pools, counters, req, &program) };
     if result.is_err() {
         // A draw can abandon after staging a gathered window and before the copy
         // that fills it is recorded — `SampledResidentNotReady` and its two
@@ -2024,6 +2055,15 @@ pub fn quiesce_guest_reads() {
 
 /// Execute one compute dispatch against the persistent engine.
 pub fn execute_compute_request(req: &ComputeRequest) -> Result<ComputeOutput, ComputeError> {
+    exec_compute::validate_compute(req)?;
+    let shader = crate::m2v_cache::resolve_prepared_shader(req.program.id).ok_or_else(|| {
+        DrawError::ComputeValidation(
+            compute_validation::ComputeValidationDecline::ProgramUnavailable {
+                id: req.program.id.get(),
+            },
+        )
+    })?;
+    let program = exec_compute::NativeComputeProgram { shader };
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
@@ -2032,8 +2072,9 @@ pub fn execute_compute_request(req: &ComputeRequest) -> Result<ComputeOutput, Co
         ref counters,
         ..
     } = &mut *guard;
-    let result =
-        unsafe { exec_compute::execute_compute_inner(owner, caches, pools, counters, req) };
+    let result = unsafe {
+        exec_compute::execute_compute_inner(owner, caches, pools, counters, req, &program)
+    };
     match result {
         Ok(out) => {
             // Same as the draw arm: a dispatch that ran proves the device.
@@ -2071,6 +2112,7 @@ pub fn resident_presentable(identity: &TargetIdentity, width: u32, height: u32) 
         .is_some_and(|slot| pools::slot_presentable(slot, width, height))
 }
 
+#[cfg(feature = "host-window")]
 fn resident_present_decision(
     pools: &ResourcePools,
     identity: &TargetIdentity,
@@ -2114,20 +2156,31 @@ pub fn prepare_window_resident_present(
     width: u32,
     height: u32,
 ) -> Result<(), reims_vgpu_core::PresentDecline> {
-    let now_ms = reims_vgpu_observe::elapsed_ms() as u64;
-    let mut guard = lock_engine();
-    let EngineState {
-        ref mut owner,
-        ref mut pools,
-        ref counters,
-        ..
-    } = &mut *guard;
-    if let Some(ctx) = owner.ctx.as_ref() {
-        unsafe {
-            pools.advance_registry_maintenance(ctx, counters, now_ms);
-        }
+    #[cfg(not(feature = "host-window"))]
+    {
+        let _ = (identity, width, height);
+        return Err(reims_vgpu_core::PresentDecline::WindowNotAttached);
     }
-    resident_present_decision(pools, identity, width, height)
+    #[cfg(feature = "host-window")]
+    {
+        let now_ms = reims_vgpu_observe::elapsed_ms() as u64;
+        let mut guard = lock_engine();
+        if guard.window_presenter.is_none() {
+            return Err(reims_vgpu_core::PresentDecline::WindowNotAttached);
+        }
+        let EngineState {
+            ref mut owner,
+            ref mut pools,
+            ref counters,
+            ..
+        } = &mut *guard;
+        if let Some(ctx) = owner.ctx.as_ref() {
+            unsafe {
+                pools.advance_registry_maintenance(ctx, counters, now_ms);
+            }
+        }
+        resident_present_decision(pools, identity, width, height)
+    }
 }
 
 pub use reims_vgpu_core::ResidentContentBacking;
@@ -2145,7 +2198,7 @@ pub struct ResidentResourceLease {
     incarnation: Option<pools::ResidentIncarnation>,
     epoch: u64,
     epoch_source: Arc<AtomicU64>,
-    session: SessionId,
+    session: SessionHandle,
 }
 
 impl ResidentResourceLease {
@@ -2166,7 +2219,7 @@ impl ResidentResourceLease {
             incarnation: None,
             epoch: guard.resident_epoch.load(Ordering::Acquire),
             epoch_source: Arc::clone(&guard.resident_epoch),
-            session: guard.active_session,
+            session: current_session_handle(),
         }
     }
 }
@@ -2176,7 +2229,7 @@ impl Drop for ResidentResourceLease {
         let Some(incarnation) = self.incarnation else {
             return;
         };
-        let _scope = enter_session(self.session);
+        let _scope = enter_session(&self.session);
         let mut guard = lock_engine();
         if self.epoch == self.epoch_source.load(Ordering::Acquire) {
             let EngineState {
@@ -2211,7 +2264,7 @@ pub fn retain_resident_resource(identity: &TargetIdentity) -> Option<ResidentRes
         incarnation: Some(incarnation),
         epoch: epoch_source.load(Ordering::Acquire),
         epoch_source,
-        session: guard.active_session,
+        session: current_session_handle(),
     })
 }
 
@@ -2232,6 +2285,41 @@ pub fn resident_content_backing(identity: &TargetIdentity) -> ResidentContentBac
         .unwrap_or(ResidentContentBacking::NotReady)
 }
 
+fn classify_resident_read(
+    resident: Option<(bool, Option<u32>)>,
+    absent_after_reclaim: Option<(reims_vgpu_core::ResidentReclaim, u64)>,
+) -> reims_vgpu_core::ResidentReadPlan {
+    match resident {
+        Some((content_ready, content_epoch)) => reims_vgpu_core::ResidentReadPlan {
+            backing: classify_resident_content(content_ready),
+            content_epoch,
+            absent_after_reclaim: None,
+        },
+        None => reims_vgpu_core::ResidentReadPlan {
+            backing: ResidentContentBacking::NotReady,
+            content_epoch: None,
+            absent_after_reclaim,
+        },
+    }
+}
+
+/// Read readiness, content currency, and reclaim history under one registry
+/// lock. Lifetime retention remains a separate operation.
+pub fn resident_read_plan(identity: &TargetIdentity) -> reims_vgpu_core::ResidentReadPlan {
+    let guard = lock_engine();
+    if let Some(slot) = guard.pools.registry_get(identity) {
+        return classify_resident_read(Some((slot.content_ready, slot.content_epoch)), None);
+    }
+    let now = guard.pools.idle_clock_ms();
+    classify_resident_read(
+        None,
+        guard
+            .pools
+            .prior_reclaim_at(identity)
+            .map(|(why, at)| (why, now.saturating_sub(at))),
+    )
+}
+
 pub fn resident_content_ready(identity: &TargetIdentity) -> bool {
     resident_content_backing(identity) != ResidentContentBacking::NotReady
 }
@@ -2250,6 +2338,20 @@ mod resident_content_backing_tests {
             classify_resident_content(false),
             ResidentContentBacking::NotReady
         );
+    }
+
+    #[test]
+    fn resident_read_plan_never_combines_live_content_with_reclaim_history() {
+        let reclaimed = Some((reims_vgpu_core::ResidentReclaim::AllocationReclaimed, 17));
+        let live = classify_resident_read(Some((true, Some(9))), reclaimed);
+        assert_eq!(live.backing, ResidentContentBacking::DeviceAllocation);
+        assert_eq!(live.content_epoch, Some(9));
+        assert_eq!(live.absent_after_reclaim, None);
+
+        let absent = classify_resident_read(None, reclaimed);
+        assert_eq!(absent.backing, ResidentContentBacking::NotReady);
+        assert_eq!(absent.content_epoch, None);
+        assert_eq!(absent.absent_after_reclaim, reclaimed);
     }
 }
 
@@ -3456,70 +3558,73 @@ unsafe fn plan_guest_copy(
         // Dense rows are the common case and the cheap one; a padded pitch
         // falls to the rectangle path, which is the only form that can leave
         // the padding unwritten. Both land the same guest bytes.
-        let plan = if dst.rows_are_dense() {
-            // The same pool the draw-time gather draws from, and for the same
-            // reason: this buffer is device-local, is written and then read by
-            // transfer commands in one submission, and must not be reused or
-            // freed until that submission's fence retires. A slot from here is
-            // held in `gather_live` and returned by the ring, so both of those
-            // are properties of the pool rather than of a caller's promise.
-            //
-            // Sized by `window_bytes` and not `extent_end`. The detile writes
-            // `extent_end` bytes from offset 0, but the scatter below reads one
-            // range per run and those sum to `window_bytes` — and a caller only
-            // establishes `extent_end <= window_bytes`, so the extent is the
-            // smaller of the two. They are in fact equal wherever this branch is
-            // taken, because dense rows make `extent_end` the same tight frame
-            // `references_for_runs` tiled; that is a coincidence of two
-            // separately-derived numbers, not a stated relation, and sizing by
-            // the one the copies actually read costs nothing and does not depend
-            // on it holding.
-            //
-            // The relation itself is the caller's to check, because it is the
-            // caller that knows what the destination was built from and can name
-            // the refusal — see `GuestWriteDecline::WindowTooSmall`.
-            let scratch = pools.acquire_guest_gather(
-                ctx,
-                dst.window_bytes(),
-                ash::vk::BufferUsageFlags::empty(),
-                counters,
-            )?;
-            // The dispatch first, falling back to the regions it replaces —
-            // which is the only ordering that keeps the transfer form reachable
-            // on every host and for every run shape it still has to serve.
-            let scatter = match compute_scatter_enabled() {
-                true => plan_guest_scatter_dispatches(ctx, pools, counters, dst, &scratch)?
-                    .map(ScatterForm::Dispatches),
-                false => None,
-            };
-            let scatter = match scatter {
-                Some(form) => form,
-                None => ScatterForm::Regions(plan_guest_linear_copies(ctx, pools, dst)?),
-            };
-            counters.guest_write_linear.fetch_add(1, Ordering::Relaxed);
-            GuestCopyPlan::Linear {
-                scratch: scratch.buffer,
-                // `buffer_row_length(0)` is Vulkan's "tightly packed", which is
-                // exactly what dense means. Passing `row_length_texels` would
-                // be the same number whenever it is set and an invalid one
-                // (below `width`) if the guest ever understated it.
-                detile: ash::vk::BufferImageCopy::default()
-                    .buffer_offset(0)
-                    .buffer_row_length(0)
-                    .buffer_image_height(0)
-                    .image_subresource(color_subresource_layers())
-                    .image_offset(ash::vk::Offset3D { x: 0, y: 0, z: 0 })
-                    .image_extent(ash::vk::Extent3D {
-                        width: dst.width,
-                        height: dst.height,
-                        depth: 1,
-                    }),
-                scatter,
+        let plan = match dst.transfer_plan() {
+            reims_vgpu_memory::GuestPageTransferPlan::DenseScatter { window_bytes } => {
+                // The same pool the draw-time gather draws from, and for the same
+                // reason: this buffer is device-local, is written and then read by
+                // transfer commands in one submission, and must not be reused or
+                // freed until that submission's fence retires. A slot from here is
+                // held in `gather_live` and returned by the ring, so both of those
+                // are properties of the pool rather than of a caller's promise.
+                //
+                // Sized by `window_bytes` and not `extent_end`. The detile writes
+                // `extent_end` bytes from offset 0, but the scatter below reads one
+                // range per run and those sum to `window_bytes` — and a caller only
+                // establishes `extent_end <= window_bytes`, so the extent is the
+                // smaller of the two. They are in fact equal wherever this branch is
+                // taken, because dense rows make `extent_end` the same tight frame
+                // `references_for_runs` tiled; that is a coincidence of two
+                // separately-derived numbers, not a stated relation, and sizing by
+                // the one the copies actually read costs nothing and does not depend
+                // on it holding.
+                //
+                // The relation itself is the caller's to check, because it is the
+                // caller that knows what the destination was built from and can name
+                // the refusal — see `GuestWriteDecline::WindowTooSmall`.
+                let scratch = pools.acquire_guest_gather(
+                    ctx,
+                    window_bytes,
+                    ash::vk::BufferUsageFlags::empty(),
+                    counters,
+                )?;
+                // The dispatch first, falling back to the regions it replaces —
+                // which is the only ordering that keeps the transfer form reachable
+                // on every host and for every run shape it still has to serve.
+                let scatter = match compute_scatter_enabled() {
+                    true => plan_guest_scatter_dispatches(ctx, pools, counters, dst, &scratch)?
+                        .map(ScatterForm::Dispatches),
+                    false => None,
+                };
+                let scatter = match scatter {
+                    Some(form) => form,
+                    None => ScatterForm::Regions(plan_guest_linear_copies(ctx, pools, dst)?),
+                };
+                counters.guest_write_linear.fetch_add(1, Ordering::Relaxed);
+                GuestCopyPlan::Linear {
+                    scratch: scratch.buffer,
+                    // `buffer_row_length(0)` is Vulkan's "tightly packed", which is
+                    // exactly what dense means. Passing `row_length_texels` would
+                    // be the same number whenever it is set and an invalid one
+                    // (below `width`) if the guest ever understated it.
+                    detile: ash::vk::BufferImageCopy::default()
+                        .buffer_offset(0)
+                        .buffer_row_length(0)
+                        .buffer_image_height(0)
+                        .image_subresource(color_subresource_layers())
+                        .image_offset(ash::vk::Offset3D { x: 0, y: 0, z: 0 })
+                        .image_extent(ash::vk::Extent3D {
+                            width: dst.width,
+                            height: dst.height,
+                            depth: 1,
+                        }),
+                    scatter,
+                }
             }
-        } else {
-            let plan = GuestCopyPlan::Rectangles(plan_guest_copies(ctx, pools, dst)?);
-            counters.guest_write_rects.fetch_add(1, Ordering::Relaxed);
-            plan
+            reims_vgpu_memory::GuestPageTransferPlan::PitchedRectangles { geometry } => {
+                let plan = GuestCopyPlan::Rectangles(plan_guest_copies(ctx, pools, dst, geometry)?);
+                counters.guest_write_rects.fetch_add(1, Ordering::Relaxed);
+                plan
+            }
         };
         counters
             .guest_write_regions
@@ -4041,9 +4146,9 @@ unsafe fn plan_guest_copies(
     ctx: &context::DeviceContext,
     pools: &mut pools::ResourcePools,
     dst: &GuestPageTarget,
+    geom: reims_vgpu_paging::regions::WindowGeometry,
 ) -> Result<Vec<(ash::vk::Buffer, Vec<ash::vk::BufferImageCopy>)>, DrawError> {
     use host_ram::GuestWriteDecline;
-    let geom = dst.geometry();
     let mut grouped: Vec<(ash::vk::Buffer, Vec<ash::vk::BufferImageCopy>)> = Vec::new();
     for run in &dst.runs {
         let bound = unsafe { pools.bind_guest_ram(ctx, &run.guest) }
@@ -5069,39 +5174,13 @@ mod device_loss_window_rail_tests {
     use super::*;
 
     #[test]
-    fn one_sessions_window_rail_is_invisible_to_another_session() {
-        let first = SessionId(20_001);
-        let second = SessionId(20_002);
-        {
-            let _first = enter_session(first);
-            note_window_present_attached(true);
-            assert!(window_present_attached());
-        }
-        {
-            let _second = enter_session(second);
-            assert!(!window_present_attached());
-        }
-        {
-            let _first = enter_session(first);
-            note_window_present_attached(false);
-        }
-        SESSION_SIGNALS.lock().remove(&first);
-        SESSION_SIGNALS.lock().remove(&second);
+    fn direct_present_preparation_refuses_when_the_owned_presenter_is_absent() {
+        assert_eq!(
+            prepare_window_resident_present(&TargetIdentity::default(), 1, 1),
+            Err(reims_vgpu_core::PresentDecline::WindowNotAttached)
+        );
     }
 
-    /// A device-loss flush must leave the window rail claiming nothing.
-    ///
-    /// This fails on the tree before the flush published the flag. The flag was
-    /// written only by the window thread, so a loss destroyed the presenter and
-    /// left [`window_present_attached`] reading `true` with
-    /// `window_presenter == None` — after which `device::window_publish` kept
-    /// choosing a rail that was gone and every present failed
-    /// [`EngineFacadeDecline::WindowPresenterNotAttached`], once logged and then
-    /// silent, for the rest of the boot.
-    ///
-    /// It runs on any host because it needs no device: `test_poison_and_flush`
-    /// reaches `flush_device_derived` with `owner.ctx` at `None`, which is
-    /// exactly the arm where the take used to be skipped.
     /// A loss seen by a thread that cannot take the engine lock still gets
     /// recovered, because the drain's end-of-tranche flush consumes the latch.
     ///
@@ -5114,41 +5193,18 @@ mod device_loss_window_rail_tests {
     /// completing. `flush_batched_draws` runs about once a second regardless,
     /// which is what makes it the right consumer.
     ///
-    /// The assertion is on the window rail rather than on the context, because
-    /// the flush is the observable half that needs no GPU: it is
-    /// `flush_device_derived` that clears it, and only `on_device_lost` calls
-    /// that from here.
     #[test]
     fn a_loss_latched_off_the_engine_lock_is_recovered_by_the_drain_flush() {
         let _ = device_lost::take_device_lost_seen();
-        note_window_present_attached(true);
         device_lost::note_device_lost_seen();
         flush_batched_draws();
-        assert!(
-            !window_present_attached(),
-            "the end-of-tranche flush must run the recovery for a latched loss"
-        );
         assert!(
             !device_lost::take_device_lost_seen(),
             "and take the latch, so one loss is recovered once"
         );
-    }
-
-    #[test]
-    fn a_device_loss_flush_leaves_no_window_rail_claimed() {
-        note_window_present_attached(true);
-        assert!(
-            window_present_attached(),
-            "precondition: the flag is what a successful attach publishes"
-        );
-        test_poison_and_flush();
-        assert!(
-            !window_present_attached(),
-            "the presenter died with the device, so nothing may still claim it"
-        );
         assert!(
             lock_engine().window_presenter.is_none(),
-            "and the field it shadows agrees"
+            "recovery must leave no presenter made from the lost device"
         );
     }
 }
@@ -5253,10 +5309,10 @@ mod guest_write_footprint_tests {
 
     #[test]
     fn guest_access_signals_belong_to_the_device_session() {
-        let first = SessionId(10_001);
-        let second = SessionId(10_002);
+        let first = SessionHandle::new(SessionId(10_001));
+        let second = SessionHandle::new(SessionId(10_002));
         {
-            let _first = enter_session(first);
+            let _first = enter_session(&first);
             clear_guest_write_pages();
             arm_guest_write_pages(&[0x4000]);
             current_session_signals()
@@ -5266,7 +5322,7 @@ mod guest_write_footprint_tests {
             assert_eq!(guest_writes_reaching(&[0x4000]), GuestWriteReach::Overlap);
         }
         {
-            let _second = enter_session(second);
+            let _second = enter_session(&second);
             assert!(!guest_writes_outstanding());
             assert_eq!(
                 guest_writes_reaching(&[0x4000]),
@@ -5278,7 +5334,7 @@ mod guest_write_footprint_tests {
             publish_guest_read_debt(false);
         }
         {
-            let _first = enter_session(first);
+            let _first = enter_session(&first);
             assert!(guest_writes_outstanding());
             assert!(!current_session_signals()
                 .guest_read_debt
@@ -5288,8 +5344,8 @@ mod guest_write_footprint_tests {
                 .store(false, Ordering::Release);
             clear_guest_write_pages();
         }
-        SESSION_SIGNALS.lock().remove(&first);
-        SESSION_SIGNALS.lock().remove(&second);
+        LIVE_SESSIONS.lock().remove(&first.id());
+        LIVE_SESSIONS.lock().remove(&second.id());
     }
 
     /// The whole point: a reader whose window shares no page with the

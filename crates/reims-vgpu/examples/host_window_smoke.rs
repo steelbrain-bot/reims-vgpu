@@ -84,9 +84,10 @@ fn gradient(w: u32, h: u32, t: u32) -> Frame {
         // window sees a new seq and re-uploads (a static seq would freeze the
         // gradient under the seq-gated upload fast path).
         seq: t as u64,
-        width: w,
-        height: h,
-        bgra,
-        resident: None,
+        payload: reims_vgpu::host_window::present::FramePayload::CpuBgra {
+            bgra,
+            width: w,
+            height: h,
+        },
     }
 }

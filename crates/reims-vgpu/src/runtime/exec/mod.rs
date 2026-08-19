@@ -3,17 +3,6 @@
 //! Clear-only passes write guest mapping pages (archive render_clear).
 //! are still marked dirty for DisplaySwap.
 
-use crate::contract::draw::DrawArgs;
-use crate::contract::endian::{ld32, ld64};
-use crate::contract::pass_action::{
-    store_action_publishes_single_sample, MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_LOAD,
-    MTL_STORE_ACTION_MULTISAMPLE_RESOLVE, MTL_STORE_ACTION_STORE,
-    MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
-};
-use crate::contract::pixel_format::{
-    f64_to_unorm8, solid_rgba8, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP,
-};
-use crate::model::DeviceState;
 use crate::runtime::blit_exec::{self, BlitStatus};
 use crate::runtime::compute_exec::{self, ComputeStatus};
 use crate::runtime::decode::blit::{self, Kind as BlitKind};
@@ -46,12 +35,22 @@ use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::mapping_write;
 use crate::runtime::mipmap::{self, MipmapStatus};
 use crate::runtime::objects;
-use crate::runtime::plan::event_sync::{Domain as FenceDomain, FenceAction};
 use crate::runtime::task_slot::{resolve_task_word, TaskWordSite};
-#[cfg(feature = "backend-vulkan")]
+use crate::runtime::Device;
+use reims_vgpu_core::draw::DrawArgs;
+use reims_vgpu_core::endian::{ld32, ld64};
+use reims_vgpu_core::pixel_format::{
+    f64_to_unorm8, solid_rgba8, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP,
+};
+use reims_vgpu_core::{FenceAction, SynchronizationDomain as FenceDomain};
+use reims_vgpu_protocol::pass_action::{
+    store_action_publishes_single_sample, MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_LOAD,
+    MTL_STORE_ACTION_MULTISAMPLE_RESOLVE, MTL_STORE_ACTION_STORE,
+    MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
+};
 use reims_vgpu_protocol::{
-    ObjectTableRef, ResourceObject, ResourceValidity, SegmentBoundary, SegmentKind, SubmissionId,
-    SubmissionIdentity, SubmissionResourceUse, TaskId,
+    ObjectTableRef, ResourceObject, ResourceValidity, SegmentBoundary, SegmentKind,
+    SubmissionResourceUse, TaskId,
 };
 use reims_vgpu_wire::ops::blit as wire_blit;
 use reims_vgpu_wire::ops::render as wire_render;
@@ -94,23 +93,148 @@ struct PendingDraw {
     /// Every scissor rect this draw was recorded with. See [`Self::viewports`].
     scissors: Vec<ScissorRect>,
     blend_color: Option<[f32; 4]>,
-    cull_mode: Option<u32>,
-    front_facing: Option<u32>,
-    /// `setTriangleFillMode:` — `MTLTriangleFillMode`, `None` where the stream
-    /// bound none and the Metal default (fill) applies.
-    fill_mode: Option<u32>,
-    /// `setDepthClipMode:` — `MTLDepthClipMode`, `None` for the Metal default
-    /// (clip).
-    depth_clip_mode: Option<u32>,
+    cull_mode: reims_vgpu_protocol::CullMode,
+    front_face_ccw: bool,
+    /// `setTriangleFillMode:` — `MTLTriangleFillMode`, initialized to the
+    /// Metal default (`Fill`) until the stream replaces it.
+    fill_mode: reims_vgpu_protocol::FillMode,
+    /// `setDepthClipMode:` — `MTLDepthClipMode`, initialized to the Metal
+    /// default (`Clip`) until the stream replaces it.
+    depth_clip_mode: reims_vgpu_protocol::DepthClipMode,
     depth_bias: Option<[f32; 3]>,
     depth_stencil_ref: u32,
     stencil_ref: Option<(u32, u32)>,
-    depth_attach: Option<DepthAttachment>,
-    stencil_attach: Option<StencilAttachment>,
+    depth_attach: Option<draw::DepthAttachmentState>,
+    stencil_attach: Option<draw::StencilAttachmentState>,
     /// The occlusion query armed when this draw was recorded, snapshotted from
     /// [`StreamAccum::visibility`]. `None` is the Metal default,
     /// `MTLVisibilityResultModeDisabled`.
     visibility: Option<draw::VisibilityArming>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RasterState {
+    cull_mode: Result<reims_vgpu_protocol::CullMode, RasterStateRefusal>,
+    front_face_ccw: Result<bool, RasterStateRefusal>,
+    fill_mode: Result<reims_vgpu_protocol::FillMode, RasterStateRefusal>,
+    depth_clip_mode: Result<reims_vgpu_protocol::DepthClipMode, RasterStateRefusal>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VisibilityState(Result<Option<draw::VisibilityArming>, VisibilityStateRefusal>);
+
+impl Default for VisibilityState {
+    fn default() -> Self {
+        Self(Ok(None))
+    }
+}
+
+impl VisibilityState {
+    fn set(&mut self, raw: u64, offset: u64) {
+        self.0 = u32::try_from(raw)
+            .map_err(|_| VisibilityStateRefusal { raw })
+            .and_then(|raw32| {
+                reims_vgpu_protocol::visibility_result_mode(raw32)
+                    .map_err(|_| VisibilityStateRefusal { raw })
+            })
+            .map(|mode| mode.map(|mode| draw::VisibilityArming { mode, offset }));
+    }
+
+    fn resolved(self) -> Result<Option<draw::VisibilityArming>, VisibilityStateRefusal> {
+        self.0
+    }
+}
+
+fn pass_actions(
+    aspect: &'static str,
+    slot: u32,
+    load_raw: u16,
+    store_raw: u16,
+) -> Result<
+    (
+        reims_vgpu_protocol::pass_action::LoadAction,
+        reims_vgpu_protocol::pass_action::StoreAction,
+    ),
+    PassActionRefusal,
+> {
+    let load_action =
+        reims_vgpu_protocol::pass_action::load_action(load_raw).map_err(|_| PassActionRefusal {
+            aspect,
+            slot,
+            action: PassActionKind::Load,
+            raw: load_raw,
+        })?;
+    let store_action = reims_vgpu_protocol::pass_action::store_action(store_raw).map_err(|_| {
+        PassActionRefusal {
+            aspect,
+            slot,
+            action: PassActionKind::Store,
+            raw: store_raw,
+        }
+    })?;
+    Ok((load_action, store_action))
+}
+
+fn depth_attachment_state(
+    attachment: DepthAttachment,
+) -> Result<draw::DepthAttachmentState, PassActionRefusal> {
+    let (load_action, store_action) =
+        pass_actions("depth", 0, attachment.load_action, attachment.store_action)?;
+    Ok(draw::DepthAttachmentState {
+        texture_ref: attachment.texture_ref,
+        load_action,
+        store_action,
+        clear_depth: attachment.clear_depth,
+    })
+}
+
+fn stencil_attachment_state(
+    attachment: StencilAttachment,
+) -> Result<draw::StencilAttachmentState, PassActionRefusal> {
+    let (load_action, store_action) = pass_actions(
+        "stencil",
+        0,
+        attachment.load_action,
+        attachment.store_action,
+    )?;
+    Ok(draw::StencilAttachmentState {
+        texture_ref: attachment.texture_ref,
+        load_action,
+        store_action,
+        clear_stencil: attachment.clear_stencil,
+    })
+}
+
+impl Default for RasterState {
+    fn default() -> Self {
+        Self {
+            cull_mode: Ok(reims_vgpu_protocol::CullMode::None),
+            front_face_ccw: Ok(false),
+            fill_mode: Ok(reims_vgpu_protocol::FillMode::Fill),
+            depth_clip_mode: Ok(reims_vgpu_protocol::DepthClipMode::Clip),
+        }
+    }
+}
+
+impl RasterState {
+    fn resolved(
+        self,
+    ) -> Result<
+        (
+            reims_vgpu_protocol::CullMode,
+            bool,
+            reims_vgpu_protocol::FillMode,
+            reims_vgpu_protocol::DepthClipMode,
+        ),
+        RasterStateRefusal,
+    > {
+        Ok((
+            self.cull_mode?,
+            self.front_face_ccw?,
+            self.fill_mode?,
+            self.depth_clip_mode?,
+        ))
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -151,14 +275,9 @@ struct StreamAccum {
     scissors: Vec<ScissorRect>,
     indexed: Option<IndexedDrawInfo>,
     blend_color: Option<[f32; 4]>,
-    cull_mode: Option<u32>,
-    front_facing: Option<u32>,
-    /// `setTriangleFillMode:` — `MTLTriangleFillMode`, `None` where the stream
-    /// bound none and the Metal default (fill) applies.
-    fill_mode: Option<u32>,
-    /// `setDepthClipMode:` — `MTLDepthClipMode`, `None` for the Metal default
-    /// (clip).
-    depth_clip_mode: Option<u32>,
+    /// Sticky raster setters, each retaining either the decoded semantic value
+    /// or the exact invalid ordinal until a later setter replaces that field.
+    raster: RasterState,
     depth_bias: Option<[f32; 3]>,
     depth_stencil_ref: u32,
     stencil_ref: Option<(u32, u32)>,
@@ -178,7 +297,7 @@ struct StreamAccum {
     /// Encoder state, so one slot is the contract rather than a bound: a second
     /// record genuinely replaces the first. What *accumulates* across draws is
     /// the count in the guest's buffer, not the arming.
-    visibility: Option<draw::VisibilityArming>,
+    visibility: VisibilityState,
     /// Draw records this stream decoded but did not keep because no pipeline was
     /// latched. See [`StreamDrawDrop`]; reported once per stream by
     /// [`note_stream_draw_drops`].
@@ -354,6 +473,31 @@ impl StreamAccum {
         if let Some(refused) = self.unrepresentable {
             return Err(refused);
         }
+        let (cull_mode, front_face_ccw, fill_mode, depth_clip_mode) =
+            self.raster.resolved().map_err(StreamRefusal::Raster)?;
+        let visibility = self
+            .visibility
+            .resolved()
+            .map_err(StreamRefusal::Visibility)?;
+        for &(slot, attachment) in &self.color_slots {
+            pass_actions(
+                "color",
+                slot,
+                attachment.load_action,
+                attachment.store_action,
+            )
+            .map_err(StreamRefusal::PassAction)?;
+        }
+        let depth_attach = self
+            .depth_attach
+            .map(depth_attachment_state)
+            .transpose()
+            .map_err(StreamRefusal::PassAction)?;
+        let stencil_attach = self
+            .stencil_attach
+            .map(stencil_attachment_state)
+            .transpose()
+            .map_err(StreamRefusal::PassAction)?;
         Ok(PendingDraw {
             indexed: self.indexed.clone(),
             vertex_buffers: self.vertex_buffers.clone(),
@@ -365,16 +509,16 @@ impl StreamAccum {
             viewports: self.viewports.clone(),
             scissors: self.scissors.clone(),
             blend_color: self.blend_color,
-            cull_mode: self.cull_mode,
-            front_facing: self.front_facing,
-            fill_mode: self.fill_mode,
-            depth_clip_mode: self.depth_clip_mode,
+            cull_mode,
+            front_face_ccw,
+            fill_mode,
+            depth_clip_mode,
             depth_bias: self.depth_bias,
             depth_stencil_ref: self.depth_stencil_ref,
             stencil_ref: self.stencil_ref,
-            depth_attach: self.depth_attach,
-            stencil_attach: self.stencil_attach,
-            visibility: self.visibility,
+            depth_attach,
+            stencil_attach,
+            visibility,
             ..Default::default()
         })
     }
@@ -647,7 +791,7 @@ pub struct ExecResult {
 }
 
 pub fn process_exec_indirect2<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     payload: &[u8],
 ) -> ExecResult {
@@ -768,7 +912,6 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     // run without protocol ownership. Keep the packet unconsumed until every
     // referenced render stage is ready, so replay cannot duplicate clears,
     // fences, compute dispatches, or guest writeback.
-    #[cfg(feature = "backend-vulkan")]
     let translation_pending = {
         let preflight_started = std::time::Instant::now();
         let pending = streams.iter().fold(false, |pending, stream| {
@@ -791,20 +934,8 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         return out;
     }
 
-    #[cfg(feature = "backend-vulkan")]
-    {
-        let identity = SubmissionIdentity {
-            id: SubmissionId::new(state.next_submission_id),
-            task: TaskId::new(task_id),
-        };
-        state.next_submission_id = state.next_submission_id.wrapping_add(1).max(1);
-        state.active_submission = Some(crate::runtime::executor::SubmissionContext {
-            identity,
-            resources: std::sync::Arc::from([]),
-            segments: semantic_submission_segments(&streams),
-            segment: None,
-        });
-    }
+    let submission_identity = state.submissions.next_identity(TaskId::new(task_id));
+    let submission_segments = semantic_submission_segments(&streams);
 
     // Validity commands are ordered at the head of this submission. They run
     // under its identity before expected content is snapshotted, because a
@@ -812,43 +943,36 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     // expect.
     consume_resource_table(state, task_id, &resource_descs);
 
-    #[cfg(feature = "backend-vulkan")]
-    {
-        let context = state
-            .active_submission
-            .as_ref()
-            .expect("submission identity was installed before validity");
-        let resolved = state.task_resources.begin_submission(
-            task_id,
-            context.identity.id,
-            resource_descs
-                .iter()
-                .map(|desc| ObjectTableRef::<ResourceObject>::new(desc.object_id)),
-        );
-        let resources: std::sync::Arc<[SubmissionResourceUse]> = resource_descs
+    let resolved = state.task_objects.resources.begin_submission(
+        task_id,
+        submission_identity.id,
+        resource_descs
             .iter()
-            .zip(resolved)
-            .map(
-                |(desc, (object, resource, expected_content))| SubmissionResourceUse {
-                    object,
-                    resource,
-                    expected_content,
-                    validity: ResourceValidity {
-                        clear_host: desc.ops.clear_host_valid != 0,
-                        set_host: desc.ops.set_host_valid != 0,
-                        clear_guest: desc.ops.clear_guest_valid != 0,
-                        set_guest: desc.ops.set_guest_valid != 0,
-                    },
+            .map(|desc| ObjectTableRef::<ResourceObject>::new(desc.object_id)),
+    );
+    let submission_resources: std::sync::Arc<[SubmissionResourceUse]> = resource_descs
+        .iter()
+        .zip(resolved)
+        .map(
+            |(desc, (object, resource, expected_content))| SubmissionResourceUse {
+                object,
+                resource,
+                expected_content,
+                validity: ResourceValidity {
+                    clear_host: desc.ops.clear_host_valid != 0,
+                    set_host: desc.ops.set_host_valid != 0,
+                    clear_guest: desc.ops.clear_guest_valid != 0,
+                    set_guest: desc.ops.set_guest_valid != 0,
                 },
-            )
-            .collect::<Vec<_>>()
-            .into();
-        state
-            .active_submission
-            .as_mut()
-            .expect("submission identity remains active")
-            .resources = resources;
-    }
+            },
+        )
+        .collect::<Vec<_>>()
+        .into();
+    state.submissions.begin(
+        submission_identity,
+        submission_resources,
+        submission_segments,
+    );
 
     let mut open_encoder = None;
     for (stream_index, stream) in (0u32..).zip(streams) {
@@ -878,15 +1002,11 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         .field("task", task_id)
         .fail();
     }
-    #[cfg(feature = "backend-vulkan")]
-    {
-        if let Some(context) = state.active_submission.as_ref() {
-            state.task_resources.complete_submission(
-                context.identity.id,
-                context.resources.iter().filter_map(|use_| use_.resource),
-            );
-        }
-        state.active_submission = None;
+    if let Some(context) = state.submissions.finish() {
+        state.task_objects.resources.complete_submission(
+            context.identity.id,
+            context.resources.iter().filter_map(|use_| use_.resource),
+        );
     }
     note_exec_header(exec_started, measured_ns);
     out.total_us = elapsed_us(exec_started);
@@ -926,8 +1046,8 @@ fn note_exec_header(exec_started: std::time::Instant, measured_ns: u64) {
 ///
 /// The table's ids are the **task's object-ref space**, not the mapping space.
 /// Measured over one boot's 6 823 records: 72 % are live object refs, 20 % are
-/// mappings, 19 % resolve nowhere, and `texture_to_mapping` answered for exactly
-/// none. So most records name resources that have no surface state to apply a
+/// mappings, and 19 % resolve nowhere. The retained IOSurface relation answered
+/// for exactly none. So most records name resources that have no surface state to apply a
 /// validity quad to — buffers, heaps, pipelines — and that is the protocol
 /// working, not a loss.
 ///
@@ -949,13 +1069,13 @@ fn note_exec_header(exec_started: std::time::Instant, measured_ns: u64) {
 /// for ids that later do execute — and nothing measures that yet on either.
 ///
 /// `validity_unknown_object` is **not** by itself a defect either, and a reader
-/// scoring it needs to know why: `DeviceState::objects` is populated lazily, by
-/// `objects::resolve_iosurface_texture_ref` and `resolve_surface_backing_ex` at the moment a
-/// decoded command names a ref. A resource the guest has created in its own
-/// object list but has not yet named in an executed stream is absent from the
-/// set by construction. The table names the submission's whole residency list,
-/// which is a superset of what its command buffers reference. What *would* be
-/// the finding is this count staying high for ids that later do execute.
+/// scoring it needs to know why: the canonical task-resource registry is
+/// populated lazily, when a decoded command first resolves a ref. A resource
+/// the guest has created in its object list but has not yet named in an
+/// executed stream is absent by construction. The table names the submission's
+/// whole residency list, which is a superset of what its command buffers
+/// reference. What *would* be the finding is this count staying high for ids
+/// that later do execute.
 ///
 /// # What `set_host_valid` means, and how that is known
 ///
@@ -969,7 +1089,7 @@ fn note_exec_header(exec_started: std::time::Instant, measured_ns: u64) {
 ///
 /// The census that measured it is gone; a correlation with no counter-examples
 /// over 19 135 trials is a finding, not a thing to keep re-deriving per frame.
-fn consume_resource_table(state: &mut DeviceState, task_id: u32, descs: &[ExecResourceDesc]) {
+fn consume_resource_table(state: &mut Device, task_id: u32, descs: &[ExecResourceDesc]) {
     use crate::runtime::resource_validity::{apply, ValiditySite};
     let mut no_surface = 0u32;
     let mut unknown = 0u32;
@@ -985,7 +1105,12 @@ fn consume_resource_table(state: &mut DeviceState, task_id: u32, descs: &[ExecRe
         if !outcome.missed {
             continue;
         }
-        if state.objects.contains(&(task_id, d.object_id)) {
+        if state
+            .task_objects
+            .resources
+            .get(task_id, d.object_id)
+            .is_some()
+        {
             no_surface = no_surface.saturating_add(1);
         } else {
             unknown = unknown.saturating_add(1);
@@ -1027,9 +1152,8 @@ fn elapsed_us(started: std::time::Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
-#[cfg(feature = "backend-vulkan")]
 fn preflight_render_translations<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     stream: &[u8],
@@ -1074,16 +1198,16 @@ fn preflight_render_translations<M: HostMemory + HostOps>(
             continue;
         };
         let cache_started = std::time::Instant::now();
-        if !crate::runtime::m2v_cache::ensure_cached_async(
+        if !state.executor.ensure_render_translation(
             v_air,
-            metal2vulkan::passes::Stage::Vertex,
+            reims_vgpu_core::ShaderStage::Vertex,
             pipeline_ref,
         ) {
             pending = true;
         }
-        if !crate::runtime::m2v_cache::ensure_cached_async(
+        if !state.executor.ensure_render_translation(
             f_air,
-            metal2vulkan::passes::Stage::Fragment,
+            reims_vgpu_core::ShaderStage::Fragment,
             pipeline_ref,
         ) {
             pending = true;
@@ -1096,7 +1220,6 @@ fn preflight_render_translations<M: HostMemory + HostOps>(
     pending
 }
 
-#[cfg(feature = "backend-vulkan")]
 fn render_pipeline_refs(stream: &[u8]) -> Vec<u32> {
     // Deliberately silent on a framing refusal: this is a speculative pre-scan of
     // the very stream `walk_stream` is about to frame and report on. Logging here
@@ -1131,9 +1254,8 @@ fn render_pipeline_refs(stream: &[u8]) -> Vec<u32> {
     pipelines
 }
 
-#[cfg(feature = "backend-vulkan")]
 fn preflight_compute_translations<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     stream: &[u8],
@@ -1159,8 +1281,9 @@ fn preflight_compute_translations<M: HostMemory + HostOps>(
             continue;
         };
         let cache_started = std::time::Instant::now();
-        let cached =
-            crate::runtime::m2v_cache::ensure_cached_kernel_async(air, local_size, pipeline_ref);
+        let cached = state
+            .executor
+            .ensure_compute_translation(air, local_size, pipeline_ref);
         note_preflight_part(
             PreflightPart::Cache,
             cache_started.elapsed().as_nanos() as u64,
@@ -1175,7 +1298,6 @@ fn preflight_compute_translations<M: HostMemory + HostOps>(
 /// Structurally collect compute pipeline + LocalSize pairs in command order.
 /// Threads-indirect carries LocalSize in guest argument memory rather than the
 /// stream record, so it deliberately remains on the synchronous fallback.
-#[cfg(feature = "backend-vulkan")]
 fn compute_translation_inputs(stream: &[u8]) -> Vec<(u32, [u32; 3])> {
     // Silent for the same reason as `render_pipeline_refs`: a pre-scan whose
     // framing refusal `walk_stream` will report once, with the task attached.
@@ -1303,7 +1425,7 @@ fn walk_segment_records(stream: &[u8], seg: &stream::Segment, mut handle: impl F
 }
 
 fn finish_open_encoder<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     out: &mut ExecResult,
@@ -1332,7 +1454,6 @@ fn finish_open_encoder<M: HostMemory + HostOps>(
     started.elapsed().as_nanos() as u64
 }
 
-#[cfg(feature = "backend-vulkan")]
 fn semantic_segment_boundary(
     stream_index: u32,
     segment: &stream::Segment,
@@ -1354,7 +1475,6 @@ fn semantic_segment_boundary(
     })
 }
 
-#[cfg(feature = "backend-vulkan")]
 fn semantic_submission_segments(streams: &[Vec<u8>]) -> Arc<[SegmentBoundary]> {
     streams
         .iter()
@@ -1381,7 +1501,7 @@ fn semantic_submission_segments(streams: &[Vec<u8>]) -> Arc<[SegmentBoundary]> {
 /// the `Walk` and `Finish` census phases disjoint even when a close occurs in
 /// the middle of a child buffer.
 fn walk_submitted_stream<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     stream_index: u32,
@@ -1416,10 +1536,9 @@ fn walk_submitted_stream<M: HostMemory + HostOps>(
             continue;
         }
 
-        #[cfg(feature = "backend-vulkan")]
-        if let Some(context) = state.active_submission.as_mut() {
-            context.segment = semantic_segment_boundary(stream_index, &seg);
-        }
+        state
+            .submissions
+            .enter_segment_if_active(semantic_segment_boundary(stream_index, &seg));
 
         let mut encoder = if seg.begin_flag != 0 {
             match open.take() {
@@ -1509,7 +1628,7 @@ fn walk_submitted_stream<M: HostMemory + HostOps>(
 
 #[cfg(test)]
 fn walk_stream<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     stream: &[u8],
@@ -1592,7 +1711,7 @@ fn walk_stream<M: HostMemory + HostOps>(
 }
 
 fn handle_info_record<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     opcode: u32,
@@ -1635,7 +1754,7 @@ fn handle_info_record<M: HostMemory + HostOps>(
     }
 }
 
-fn handle_event_record(state: &mut DeviceState, task_id: u32, cmd_bytes: &[u8]) {
+fn handle_event_record(state: &mut Device, task_id: u32, cmd_bytes: &[u8]) {
     let cmd = match event_decode::decode(cmd_bytes) {
         Ok(c) => c,
         Err(status) => {
@@ -1657,7 +1776,7 @@ fn handle_event_record(state: &mut DeviceState, task_id: u32, cmd_bytes: &[u8]) 
 }
 
 fn handle_compute_record<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     opcode: u32,
@@ -1826,7 +1945,7 @@ impl crate::observe::Decline for TextureFillDropped {
 }
 
 fn handle_blit_record<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     opcode: u32,
@@ -2029,7 +2148,7 @@ fn handle_blit_record<M: HostMemory + HostOps>(
 }
 
 fn handle_render_record<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &M,
     task_id: u32,
     opcode: u32,
@@ -2293,10 +2412,22 @@ fn handle_render_record<M: HostMemory + HostOps>(
             acc.blend_color = Some(cmd.blend_color);
         }
         RenderKind::SetCullMode => {
-            acc.cull_mode = Some(cmd.cull_mode);
+            acc.raster.cull_mode = u32::try_from(cmd.cull_mode)
+                .ok()
+                .and_then(|raw| reims_vgpu_protocol::cull_mode(raw).ok())
+                .ok_or(RasterStateRefusal {
+                    field: RasterStateField::CullMode,
+                    raw: cmd.cull_mode,
+                });
         }
         RenderKind::SetFrontFacing => {
-            acc.front_facing = Some(cmd.front_facing);
+            acc.raster.front_face_ccw = u32::try_from(cmd.front_facing)
+                .ok()
+                .and_then(|raw| reims_vgpu_protocol::front_face_ccw(raw).ok())
+                .ok_or(RasterStateRefusal {
+                    field: RasterStateField::FrontFacing,
+                    raw: cmd.front_facing,
+                });
         }
         RenderKind::SetDepthBias => {
             acc.depth_bias = Some(cmd.depth_bias);
@@ -2511,6 +2642,14 @@ fn handle_render_record<M: HostMemory + HostOps>(
             }
             acc.saw_draw = true;
             out.saw_draw = true;
+            let primitive_topology =
+                match reims_vgpu_protocol::primitive_topology(cmd.primitive_type) {
+                    Ok(topology) => topology,
+                    Err(error) => {
+                        note_primitive_topology_refused(task_id, acc.pipeline_ref, error);
+                        return;
+                    }
+                };
             let count = if cmd.index_count != 0 {
                 cmd.index_count
             } else {
@@ -2518,10 +2657,11 @@ fn handle_render_record<M: HostMemory + HostOps>(
             };
             if cmd.index_count != 0 && cmd.index_buffer_ref != 0 {
                 acc.indexed = Some(IndexedDrawInfo {
-                    index_type: cmd.index_type,
+                    index_type: reims_vgpu_protocol::decode_index_type(cmd.index_type),
                     index_count: cmd.index_count,
                     index_buffer_ref: cmd.index_buffer_ref,
                     index_buffer_offset: cmd.index_buffer_offset,
+                    index_start: 0,
                     base_vertex: cmd.base_vertex,
                 });
             } else {
@@ -2557,7 +2697,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                         draw: DrawArgs {
                             vertex_count: count,
                             instance_count: cmd.instance_count,
-                            primitive_type: cmd.primitive_type,
+                            primitive_topology,
                             first_vertex: cmd.vertex_start,
                             base_instance: cmd.base_instance,
                         },
@@ -2664,21 +2804,33 @@ fn handle_render_record<M: HostMemory + HostOps>(
             // asking for Fill, and dropping the second record would leave the
             // rest of the pass wireframed.
             //
-            // The ordinal is carried raw and translated per backend, the way
-            // `cull_mode` and `front_facing` beside it are: only the backend
-            // knows whether the host can spell the answer, so only the backend
-            // can refuse by name.
-            let slot = match cmd.opcode {
-                wire_render::OPCODE_SET_TRIANGLE_FILL_MODE => &mut acc.fill_mode,
-                _ => &mut acc.depth_clip_mode,
-            };
-            // The record's field is 64-bit and the ordinals are small, but a
-            // guest writes what it likes. `u32::MAX` is not a value of either
-            // Metal enum, so a wide word reaches the backend as an
-            // out-of-contract value that says its own name, rather than as its
-            // own low half — which for a multiple of 2^32 would be the
-            // *default*, the one answer that renders with nothing in the log.
-            *slot = Some(u32::try_from(cmd.mode).unwrap_or(u32::MAX));
+            if cmd.opcode == wire_render::OPCODE_SET_TRIANGLE_FILL_MODE {
+                match u32::try_from(cmd.mode)
+                    .ok()
+                    .and_then(|raw| reims_vgpu_protocol::fill_mode(raw).ok())
+                {
+                    Some(mode) => acc.raster.fill_mode = Ok(mode),
+                    None => {
+                        acc.raster.fill_mode = Err(RasterStateRefusal {
+                            field: RasterStateField::FillMode,
+                            raw: cmd.mode,
+                        });
+                    }
+                }
+            } else {
+                match u32::try_from(cmd.mode)
+                    .ok()
+                    .and_then(|raw| reims_vgpu_protocol::depth_clip_mode(raw).ok())
+                {
+                    Some(mode) => acc.raster.depth_clip_mode = Ok(mode),
+                    None => {
+                        acc.raster.depth_clip_mode = Err(RasterStateRefusal {
+                            field: RasterStateField::DepthClipMode,
+                            raw: cmd.mode,
+                        });
+                    }
+                }
+            }
         }
         RenderKind::SetFloatState => {
             // Both default to 1.0. Compared exactly rather than with a
@@ -2789,10 +2941,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
             // the backend as an out-of-contract value that says its own name,
             // the same treatment `fill_mode` gives its ordinal, rather than as
             // its own low half.
-            acc.visibility = (cmd.mode != 0).then(|| draw::VisibilityArming {
-                mode: u32::try_from(cmd.mode).unwrap_or(u32::MAX),
-                offset: cmd.visibility_result_offset,
-            });
+            acc.visibility.set(cmd.mode, cmd.visibility_result_offset);
         }
         RenderKind::DrawIndirect => {
             execute_indirect_draw(state, host, task_id, &cmd, acc);
@@ -3074,7 +3223,7 @@ impl BindClassCensus for BindClass {
     /// against 31, sampler 32 against 16 — so a record reaching past one is a
     /// record Apple's serializer cannot emit, and `over_table` is a healthy
     /// zero rather than headroom being measured. The texture band that closed
-    /// the last of it lives in [`crate::runtime::spirv_bind`] as `[32,160)`,
+    /// the last of it lives in [`reims_vgpu_vulkan::spirv_bind`] as `[32,160)`,
     /// held there by a `const` assertion that
     /// [`crate::runtime::draw::MAX_TEXTURE_BIND_SLOTS`] reads its value from,
     /// so the two cannot part without failing the build.
@@ -3201,10 +3350,57 @@ fn note_draw_refused(refusal: StreamRefusal, pipeline_ref: u32, site: &'static s
         StreamRefusal::Bind(over) => crate::observe::Emit::decline("render_draw", &over),
         StreamRefusal::Pass(drop) => crate::observe::Emit::decline("render_draw", &drop),
         StreamRefusal::BufferOffset(over) => crate::observe::Emit::decline("render_draw", &over),
+        StreamRefusal::Raster(state) => crate::observe::Emit::decline("render_draw", &state),
+        StreamRefusal::Visibility(state) => crate::observe::Emit::decline("render_draw", &state),
+        StreamRefusal::PassAction(action) => crate::observe::Emit::decline("render_draw", &action),
     };
     emit.field("site", site)
         .field("pipeline_ref", pipeline_ref)
         .fail_once(refusal.latch());
+}
+
+fn note_attachment_plan_refused(
+    refusal: &reims_vgpu_core::AttachmentPlanDecline,
+    task_id: u32,
+    pipeline_ref: u32,
+    site: &'static str,
+) {
+    use crate::observe::Decline;
+
+    crate::runtime::drain::note_store_route("render_attachment_plan_refused");
+    let key = refusal.latch() ^ u64::from(pipeline_ref).rotate_left(17);
+    if crate::observe::first_sight(refusal.slug(), key) {
+        crate::observe::Emit::decline("render_attachment_plan", refusal)
+            .field("task_id", task_id)
+            .field("pipeline_ref", pipeline_ref)
+            .field("site", site)
+            .fail();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PrimitiveTopologyRefusal(reims_vgpu_protocol::PipelineStateDecodeError);
+
+impl crate::observe::Decline for PrimitiveTopologyRefusal {
+    fn slug(&self) -> &'static str {
+        self.0.slug()
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![("raw", self.0.raw().to_string())]
+    }
+}
+
+fn note_primitive_topology_refused(
+    task_id: u32,
+    pipeline_ref: u32,
+    error: reims_vgpu_protocol::PipelineStateDecodeError,
+) {
+    crate::runtime::drain::note_store_route("render_draw_refused_primitive_topology");
+    crate::observe::Emit::decline("render_draw", &PrimitiveTopologyRefusal(error))
+        .field("task", task_id)
+        .field("pipeline_ref", pipeline_ref)
+        .fail_once(u64::from(error.raw()));
 }
 
 impl StreamRefusal {
@@ -3221,6 +3417,22 @@ impl StreamRefusal {
             Self::Pass(drop) => 1 << 63 | drop.latch(),
             Self::BufferOffset(over) => {
                 1 << 62 | (u64::from(over.stage as u32) << 32) | u64::from(over.index)
+            }
+            Self::Raster(state) => {
+                (1 << 61) | (u64::from(state.field as u8) << 56) | (state.raw & ((1 << 56) - 1))
+            }
+            Self::Visibility(state) => (1 << 60) | (state.raw & ((1 << 60) - 1)),
+            Self::PassAction(action) => {
+                (1 << 59)
+                    | (match action.aspect {
+                        "color" => 0,
+                        "depth" => 1u64 << 56,
+                        "stencil" => 2u64 << 56,
+                        _ => 3u64 << 56,
+                    })
+                    | (u64::from(action.action as u8) << 58)
+                    | (u64::from(action.slot) << 16)
+                    | u64::from(action.raw)
             }
         }
     }
@@ -3245,21 +3457,6 @@ const _: () = assert!(reims_vgpu_wire::ops::bind_limit::BUFFER == MAX_BUFFER_BIN
 // stream Apple's serializer wrote. A reading is a guest writing its own stream,
 // or a decode that mis-sized the table.
 const _: () = assert!(reims_vgpu_wire::ops::bind_limit::SAMPLER < MAX_SAMPLER_BIND_SLOTS);
-// The two band bounds are the *encoding's*, so they must stay equal to the
-// distance between the bands they name. A texture index at
-// `MAX_TEXTURE_BIND_SLOTS` would carry sampler 0's descriptor binding, and a
-// sampler index at `MAX_SAMPLER_BIND_SLOTS` would carry the first ColorInput's;
-// either collision is silent, because a flat binding number cannot say which
-// class wrote it.
-const _: () = assert!(
-    crate::runtime::spirv_bind::TEXTURE_BINDING_BASE + MAX_TEXTURE_BIND_SLOTS
-        == crate::runtime::spirv_bind::SAMPLER_BINDING_BASE
-);
-const _: () = assert!(
-    crate::runtime::spirv_bind::SAMPLER_BINDING_BASE + MAX_SAMPLER_BIND_SLOTS
-        == crate::runtime::spirv_bind::COLOR_INPUT_BINDING_BASE
-);
-
 /// Which bind table a record names: the stage picks vertex or fragment, the
 /// class picks buffer, texture or sampler.
 ///
@@ -3314,6 +3511,94 @@ enum StreamRefusal {
     /// different records with different counters, and sharing one would put two
     /// checks behind one `reason=` slug and one `fail_once` latch.
     BufferOffset(BufferOffsetSlotPastTable),
+    /// A sticky raster-state setter carried an ordinal outside its Metal enum.
+    /// Every later draw reads that state, so none may substitute the API
+    /// default until another valid setter replaces it.
+    Raster(RasterStateRefusal),
+    /// A sticky visibility-query setter carried an ordinal outside its Metal
+    /// enum. It remains invalid until a later setter replaces it, just like
+    /// the raster fields above.
+    Visibility(VisibilityStateRefusal),
+    /// A pass attachment's load or store action is outside its declared enum.
+    /// This also covers store-action overrides applied after the pass record.
+    PassAction(PassActionRefusal),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum RasterStateField {
+    CullMode,
+    FrontFacing,
+    FillMode,
+    DepthClipMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RasterStateRefusal {
+    field: RasterStateField,
+    raw: u64,
+}
+
+impl crate::observe::Decline for RasterStateRefusal {
+    fn slug(&self) -> &'static str {
+        match self.field {
+            RasterStateField::CullMode => "unknown_cull_mode",
+            RasterStateField::FrontFacing => "unknown_winding",
+            RasterStateField::FillMode => "unknown_fill_mode",
+            RasterStateField::DepthClipMode => "unknown_depth_clip_mode",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![("raw", self.raw.to_string())]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VisibilityStateRefusal {
+    raw: u64,
+}
+
+impl crate::observe::Decline for VisibilityStateRefusal {
+    fn slug(&self) -> &'static str {
+        "unknown_visibility_result_mode"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![("raw", self.raw.to_string())]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum PassActionKind {
+    Load,
+    Store,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PassActionRefusal {
+    aspect: &'static str,
+    slot: u32,
+    action: PassActionKind,
+    raw: u16,
+}
+
+impl crate::observe::Decline for PassActionRefusal {
+    fn slug(&self) -> &'static str {
+        match self.action {
+            PassActionKind::Load => "load_action_unmapped",
+            PassActionKind::Store => "store_action_unmapped",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("aspect", self.aspect.into()),
+            ("slot", self.slot.to_string()),
+            ("raw", self.raw.to_string()),
+        ]
+    }
 }
 
 /// A `SetBufferOffset` record naming a slot the buffer table does not have.
@@ -3498,7 +3783,7 @@ fn apply_binds<T: Copy, B: Clone>(
 }
 
 fn finish_stream<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     out: &mut ExecResult,
@@ -3594,7 +3879,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                     DrawArgs {
                         vertex_count: 1,
                         instance_count: 1,
-                        primitive_type: 3,
+                        primitive_topology: reims_vgpu_protocol::PrimitiveTopology::Triangle,
                         first_vertex: 0,
                         base_instance: 0,
                     },
@@ -3607,7 +3892,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                     DrawArgs {
                         vertex_count: 1,
                         instance_count: 1,
-                        primitive_type: 3,
+                        primitive_topology: reims_vgpu_protocol::PrimitiveTopology::Triangle,
                         first_vertex: 0,
                         base_instance: 0,
                     },
@@ -3624,7 +3909,15 @@ fn finish_stream<M: HostMemory + HostOps>(
                 loading_slots = color_slots_loading(&acc.color_slots);
                 (&loading_slots, &[])
             };
-            let req = draw::mrt_draw_request(state, host, task_id, pipeline, slots, clears, args);
+            let req =
+                match draw::mrt_draw_request(state, host, task_id, pipeline, slots, clears, args) {
+                    Ok(req) => req,
+                    Err(refusal) => {
+                        out.render_icb_fail = out.render_icb_fail.saturating_add(1);
+                        note_attachment_plan_refused(&refusal, task_id, pipeline, "icb_execute");
+                        None
+                    }
+                };
             // ICB execute inherits stream bind state at end of stream, and both
             // branches below inherit the same six tables — the last draw's
             // snapshot is those tables as they stood when it was recorded, and
@@ -3741,12 +4034,13 @@ fn finish_stream<M: HostMemory + HostOps>(
             std::collections::BTreeMap::new();
         // Resident render-pass chain: intermediate records keep their content
         // on the engine target (no CPU chain buffer); records 2+ LoadFromTarget.
-        let mut resident_chain = false;
+        let mut resident_chain_identity: Option<crate::model::TargetIdentity> = None;
         let mut saw_backend_unavailable = false;
         let first_draw = draw_list.first().copied();
+        let mut first_attachment_refusal = None;
         let mut first_req = first_draw.and_then(|pd| {
             out.render_attachment_resolves = out.render_attachment_resolves.saturating_add(1);
-            draw::mrt_draw_request(
+            match draw::mrt_draw_request(
                 state,
                 host,
                 task_id,
@@ -3754,7 +4048,13 @@ fn finish_stream<M: HostMemory + HostOps>(
                 &acc.color_slots,
                 &acc.clears,
                 pd.draw,
-            )
+            ) {
+                Ok(req) => req,
+                Err(refusal) => {
+                    first_attachment_refusal = Some(refusal);
+                    None
+                }
+            }
         });
         // A serialized Metal render stream is one render pass: its attachment
         // descriptors are fixed while pipeline, binds, and draw arguments may
@@ -3763,12 +4063,21 @@ fn finish_stream<M: HostMemory + HostOps>(
         // GVA LOAD seed). The resident target itself preserves record order.
         let attachment_template = first_req.as_ref().map(render_pass_attachment_template);
         if first_draw.is_some() && first_req.is_none() {
-            let refs: Vec<u32> = acc.color_slots.iter().map(|(_, a)| a.texture_ref).collect();
-            crate::observe::fail(format!(
-                "draw mrt_request fail task={task_id} pipe={} slots={refs:?} di=0/{}",
-                first_draw.map(|pd| pd.pipeline_ref).unwrap_or(0),
-                draw_list.len()
-            ));
+            if let Some(refusal) = first_attachment_refusal.as_ref() {
+                note_attachment_plan_refused(
+                    refusal,
+                    task_id,
+                    first_draw.map(|pd| pd.pipeline_ref).unwrap_or(0),
+                    "draw",
+                );
+            } else {
+                let refs: Vec<u32> = acc.color_slots.iter().map(|(_, a)| a.texture_ref).collect();
+                crate::observe::fail(format!(
+                    "draw mrt_request fail task={task_id} pipe={} slots={refs:?} di=0/{}",
+                    first_draw.map(|pd| pd.pipeline_ref).unwrap_or(0),
+                    draw_list.len()
+                ));
+            }
             out.draws_fail = out.draws_fail.saturating_add(1);
             dirty_color_targets(state, host, task_id, &acc.color_targets);
         }
@@ -3807,7 +4116,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                 // mid peak 10.9M native → 2.5M after later records).
                 if di > 0 {
                     for c in &mut req.colors {
-                        c.load_action = MTL_LOAD_ACTION_LOAD;
+                        c.load_action = reims_vgpu_protocol::pass_action::LoadAction::Load;
                     }
                     // Chain from the engine resident when available; otherwise
                     // seed from the prior encode output (archive "thread each
@@ -3816,7 +4125,10 @@ fn finish_stream<M: HostMemory + HostOps>(
                     // that a resident exists; memory topology is not an input
                     // to this semantic choice.
                     // Moved, not cloned (multi-MiB).
-                    match multi_draw_chain_source(resident_chain, chain_rgba.is_some()) {
+                    match multi_draw_chain_source(
+                        resident_chain_identity.is_some(),
+                        chain_rgba.is_some(),
+                    ) {
                         MultiDrawChainSource::Resident => {
                             req.chain_from_resident = true;
                         }
@@ -3843,12 +4155,12 @@ fn finish_stream<M: HostMemory + HostOps>(
                 let draw_started = std::time::Instant::now();
                 fin.enter(crate::runtime::drain::FinishPhase::Encode);
                 let encode =
-                    draw::encode_draw_chain(state, host, &mut req, do_writeback, force_full_store);
+                    draw::encode_draw_chain(state, host, &req, do_writeback, force_full_store);
                 fin.enter(crate::runtime::drain::FinishPhase::Result);
                 // Read before the status is matched: a draw whose Store failed
                 // still ran its query, and the count is the guest's answer
                 // either way.
-                match (req.visibility, req.visibility_samples) {
+                match (req.visibility, encode.visibility_samples) {
                     (Some(arming), Some(samples)) => {
                         let slot = visibility_counts.entry(arming.offset).or_default();
                         *slot = slot.saturating_add(samples);
@@ -3857,9 +4169,8 @@ fn finish_stream<M: HostMemory + HostOps>(
                     // query, so the guest will read its own stale word and cull
                     // on it. Both backends record one now, so what is left here
                     // is the refusal cases — a Vulkan host without
-                    // `occlusionQueryPrecise` asked for a counting query, a mode
-                    // ordinal neither table converts, an encode that failed
-                    // before the pass ran — and any draw form whose encoder does
+                    // `occlusionQueryPrecise` asked for a counting query, an
+                    // encode that failed before the pass ran — and any draw form whose encoder does
                     // not carry the arming at all. Detected here rather than in
                     // each backend because the question is the same on all three
                     // pathways: was the query the guest armed actually run.
@@ -3867,7 +4178,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                         crate::runtime::drain::note_store_route("visibility_query_unanswered");
                         if crate::observe::first_sight(
                             "visibility_query_unanswered",
-                            u64::from(arming.mode),
+                            u64::from(arming.mode.guest_ordinal()),
                         ) {
                             crate::observe::fail(format!(
                                 "visibility_query_unanswered \
@@ -3875,7 +4186,9 @@ fn finish_stream<M: HostMemory + HostOps>(
                                  pipe={} mode={} off={:#x} (the guest armed an \
                                  occlusion query and this backend ran none; it will \
                                  read whatever its buffer already held)",
-                                pd.pipeline_ref, arming.mode, arming.offset
+                                pd.pipeline_ref,
+                                arming.mode.guest_ordinal(),
+                                arming.offset
                             ));
                         }
                     }
@@ -3885,20 +4198,20 @@ fn finish_stream<M: HostMemory + HostOps>(
                     crate::runtime::drain::DrainPhase::Draw,
                     draw_started,
                 );
-                match encode {
-                    (EncodeStatus::Ok, Some(rgba)) => {
+                match (encode.status, encode.chain_rgba, encode.resident_identity) {
+                    (EncodeStatus::Ok, Some(rgba), _) => {
                         out.draws_ok += 1;
-                        if !resident_chain {
+                        if resident_chain_identity.is_none() {
                             chain_rgba = Some(rgba);
                         }
                     }
-                    (EncodeStatus::Ok, None) if req.chain_resident_established => {
+                    (EncodeStatus::Ok, None, Some(identity)) => {
                         // Resident render-pass chain intermediate: content stays
                         // on the engine target; the next record loads it there.
                         out.draws_ok += 1;
-                        resident_chain = true;
+                        resident_chain_identity = Some(identity);
                     }
-                    (EncodeStatus::Ok, None) => {
+                    (EncodeStatus::Ok, None, None) => {
                         // Intermediate must return color0 for chaining; treat as
                         // break so we do not composite later draws on a missing seed.
                         out.draws_ok += 1;
@@ -3925,32 +4238,38 @@ fn finish_stream<M: HostMemory + HostOps>(
                             land_chain_before_abandon(
                                 state,
                                 host,
-                                task_id,
-                                acc,
-                                &req,
                                 &mut chain_rgba,
-                                ChainEnd {
-                                    cause: draw::ChainAbandonCause::NoColor0,
-                                    resident: resident_chain,
+                                ChainAbandonContext {
+                                    task_id,
+                                    acc,
+                                    req: &req,
+                                    resident_identity: resident_chain_identity.as_ref(),
+                                    end: ChainEnd {
+                                        cause: draw::ChainAbandonCause::NoColor0,
+                                        resident: resident_chain_identity.is_some(),
+                                    },
                                 },
                             );
                             break;
                         }
                     }
-                    (st @ EncodeStatus::BackendUnavailable(_), _) => {
+                    (st @ EncodeStatus::BackendUnavailable(_), _, _) => {
                         saw_backend_unavailable = true;
                         out.draws_fail += 1;
                         note_draw_encode_fail(task_id, pd.pipeline_ref, st, di, draw_list.len());
                         land_chain_before_abandon(
                             state,
                             host,
-                            task_id,
-                            acc,
-                            &req,
                             &mut chain_rgba,
-                            ChainEnd {
-                                cause: draw::ChainAbandonCause::BackendUnavailable,
-                                resident: resident_chain,
+                            ChainAbandonContext {
+                                task_id,
+                                acc,
+                                req: &req,
+                                resident_identity: resident_chain_identity.as_ref(),
+                                end: ChainEnd {
+                                    cause: draw::ChainAbandonCause::BackendUnavailable,
+                                    resident: resident_chain_identity.is_some(),
+                                },
                             },
                         );
                         break;
@@ -3958,7 +4277,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                     // `Ok` and the distinct clear-fallback `BackendUnavailable` recovery
                     // are exhausted above. Every remaining status is a typed
                     // terminal refusal.
-                    (st, _) => {
+                    (st, _, _) => {
                         out.draws_fail += 1;
                         note_draw_encode_fail(task_id, pd.pipeline_ref, st, di, draw_list.len());
                         // If earlier GVA draws produced a chain image, land it
@@ -3968,13 +4287,16 @@ fn finish_stream<M: HostMemory + HostOps>(
                         land_chain_before_abandon(
                             state,
                             host,
-                            task_id,
-                            acc,
-                            &req,
                             &mut chain_rgba,
-                            ChainEnd {
-                                cause: draw::ChainAbandonCause::TerminalRefusal,
-                                resident: resident_chain,
+                            ChainAbandonContext {
+                                task_id,
+                                acc,
+                                req: &req,
+                                resident_identity: resident_chain_identity.as_ref(),
+                                end: ChainEnd {
+                                    cause: draw::ChainAbandonCause::TerminalRefusal,
+                                    resident: resident_chain_identity.is_some(),
+                                },
                             },
                         );
                         break;
@@ -4022,7 +4344,7 @@ fn finish_stream<M: HostMemory + HostOps>(
 /// and a vertex bind go through, so a guest naming a non-buffer or an unbacked
 /// object refuses by that rail's own name instead of a literal invented here.
 fn write_visibility_results<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     acc: &StreamAccum,
@@ -4167,7 +4489,7 @@ fn render_pass_attachment_template(first: &draw::DrawEncodeRequest) -> draw::Dra
             height: c.height,
             format: c.format,
             sample_count: c.sample_count,
-            load_action: MTL_LOAD_ACTION_LOAD,
+            load_action: reims_vgpu_protocol::pass_action::LoadAction::Load,
             store_action: c.store_action,
             clear_color: c.clear_color,
             target_seed_rgba: None,
@@ -4189,7 +4511,7 @@ fn retarget_render_pass_draw(
     req.pipeline_ref = draw.pipeline_ref;
     req.vertex_count = draw.draw.vertex_count;
     req.instance_count = draw.draw.instance_count;
-    req.primitive_type = draw.draw.primitive_type;
+    req.primitive_topology = draw.draw.primitive_topology;
     req.first_vertex = draw.draw.first_vertex;
     req.base_instance = draw.draw.base_instance;
     req
@@ -4219,13 +4541,13 @@ fn retarget_render_pass_draw(
 /// of the device rather than of the Metal API, and a design that stopped
 /// completing compute before render would break this silently.
 fn execute_indirect_draw<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     cmd: &render::Command,
     acc: &mut StreamAccum,
 ) {
-    use crate::contract::draw::indirect;
+    use reims_vgpu_core::draw::indirect;
 
     let indexed_form = cmd.opcode == wire_render::OPCODE_DRAW_INDEXED_INDIRECT;
     let block_len = if indexed_form {
@@ -4253,13 +4575,20 @@ fn execute_indirect_draw<M: HostMemory + HostOps>(
         }
     };
 
+    let primitive_topology = match reims_vgpu_protocol::primitive_topology(cmd.primitive_type) {
+        Ok(topology) => topology,
+        Err(error) => {
+            note_primitive_topology_refused(task_id, acc.pipeline_ref, error);
+            return;
+        }
+    };
     let (args, index_start, base_vertex) = if indexed_form {
-        match indirect::indexed(&block, cmd.primitive_type) {
+        match indirect::indexed(&block, primitive_topology) {
             Some(v) => (v.0, v.1, v.2),
             None => return,
         }
     } else {
-        match indirect::unindexed(&block, cmd.primitive_type) {
+        match indirect::unindexed(&block, primitive_topology) {
             Some(args) => (args, 0, 0),
             None => return,
         }
@@ -4267,22 +4596,12 @@ fn execute_indirect_draw<M: HostMemory + HostOps>(
 
     acc.saw_draw = true;
     if indexed_form {
-        // `indexStart` counts indices, not bytes. The loader is given a byte
-        // offset, so it is scaled here by the width the record's own
-        // `index_type` declares — the same two widths `translate::raster::
-        // index_type` accepts, and an unknown one is left to the loader's
-        // typed refusal rather than being guessed at as 2.
-        let stride = match cmd.index_type {
-            1 => 4u64, // MTLIndexTypeUInt32
-            _ => 2,    // MTLIndexTypeUInt16, and Metal's default
-        };
         acc.indexed = Some(IndexedDrawInfo {
-            index_type: cmd.index_type,
+            index_type: reims_vgpu_protocol::decode_index_type(cmd.index_type),
             index_count: args.vertex_count,
             index_buffer_ref: cmd.index_buffer_ref,
-            index_buffer_offset: cmd
-                .index_buffer_offset
-                .saturating_add(u64::from(index_start).saturating_mul(stride)),
+            index_buffer_offset: cmd.index_buffer_offset,
+            index_start,
             base_vertex: i64::from(base_vertex),
         });
     } else {
@@ -4315,7 +4634,7 @@ fn execute_indirect_draw<M: HostMemory + HostOps>(
 }
 
 fn read_icb_exec_range<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     buffer_ref: u32,
@@ -4402,7 +4721,7 @@ fn fill_draw_binds_from_pending(req: &mut draw::DrawEncodeRequest, pd: &PendingD
     req.indexed = pd.indexed.clone();
     req.blend_color = pd.blend_color;
     req.cull_mode = pd.cull_mode;
-    req.front_facing = pd.front_facing;
+    req.front_face_ccw = pd.front_face_ccw;
     req.fill_mode = pd.fill_mode;
     req.depth_clip_mode = pd.depth_clip_mode;
     req.depth_bias = pd.depth_bias;
@@ -4411,15 +4730,10 @@ fn fill_draw_binds_from_pending(req: &mut draw::DrawEncodeRequest, pd: &PendingD
     req.depth_attach = pd.depth_attach;
     req.stencil_attach = pd.stencil_attach;
     req.visibility = pd.visibility;
-    // Cleared with the arming it belongs to. `req` is reused across the draws
-    // of a chain, so a stale count from draw N-1 would otherwise be read as
-    // draw N's — and an occlusion count that is silently the previous draw's is
-    // the exact shape of wrong this rail exists to avoid.
-    req.visibility_samples = None;
 }
 
 fn dirty_color_targets<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &M,
     task_id: u32,
     refs: &[u32],
@@ -4446,6 +4760,14 @@ struct ChainEnd {
     resident: bool,
 }
 
+struct ChainAbandonContext<'a> {
+    task_id: u32,
+    acc: &'a StreamAccum,
+    req: &'a draw::DrawEncodeRequest,
+    resident_identity: Option<&'a crate::model::TargetIdentity>,
+    end: ChainEnd,
+}
+
 /// Land the chain image this packet has produced before abandoning it.
 ///
 /// Three records break a multi-draw chain: a typed terminal refusal, the
@@ -4459,14 +4781,18 @@ struct ChainEnd {
 /// never take the (zero) chain buffer over them; the one caller where that is
 /// possible gates on it. This is a storage/content fact, not host topology.
 fn land_chain_before_abandon<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
-    task_id: u32,
-    acc: &StreamAccum,
-    req: &draw::DrawEncodeRequest,
     chain_rgba: &mut Option<Vec<u8>>,
-    end: ChainEnd,
+    context: ChainAbandonContext<'_>,
 ) {
+    let ChainAbandonContext {
+        task_id,
+        acc,
+        req,
+        resident_identity,
+        end,
+    } = context;
     // The one caller that has no identity to be handed. The chain broke, so no
     // span carries the key its last good record registered, and the abandoning
     // read has to name the resident from the state it can still see. That is a
@@ -4474,14 +4800,11 @@ fn land_chain_before_abandon<M: HostMemory + HostOps>(
     // `read_resident_chain`, because every *other* caller has the draw's own
     // key and a shared re-derivation would silently give them this one's answer
     // — see `draw::M2vDrawSpan::ResidentSurfaceStore` for what that cost.
-    #[cfg(feature = "backend-vulkan")]
     if end.resident && chain_rgba.is_none() {
-        if let Some(identity) = draw::render_chain_identity(state, req) {
-            *chain_rgba = draw::read_resident_chain(state.executor.as_ref(), req, &identity);
+        if let Some(identity) = resident_identity {
+            *chain_rgba = draw::read_resident_chain(state.executor.as_ref(), req, identity);
         }
     }
-    #[cfg(not(feature = "backend-vulkan"))]
-    let _ = (req, end.resident);
     if let Some(rgba) = chain_rgba.take() {
         let _ =
             draw::writeback_chain_rgba(state, host, task_id, &acc.color_slots, &rgba, end.cause);
@@ -4490,11 +4813,16 @@ fn land_chain_before_abandon<M: HostMemory + HostOps>(
 }
 
 fn apply_clear<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     att: &ColorAttachment,
 ) -> bool {
+    if !draw::load_action_in_contract(0, att.load_action)
+        || !draw::store_action_in_contract(0, att.store_action)
+    {
+        return false;
+    }
     if att.texture_ref == 0 || !store_action_publishes_single_sample(att.store_action) {
         return false;
     }
@@ -4528,7 +4856,18 @@ fn apply_clear<M: HostMemory + HostOps>(
     let Some(req) =
         // A clear-only pass: no pipeline and no geometry, so every draw
         // argument including the base instance is zero by construction.
-        draw::color_target_request(state, host, task_id, target, 0, 0, 1, 0, 0, 0)
+        draw::color_target_request(
+            state,
+            host,
+            task_id,
+            target,
+            0,
+            0,
+            1,
+            reims_vgpu_protocol::PrimitiveTopology::Point,
+            0,
+            0,
+        )
     else {
         // A clear whose color target cannot resolve (mapping unresolved, geometry
         // missing) is dropped here with no other trace — the "background didn't

@@ -1,3 +1,3 @@
-//! Compatibility façade for the backend-owned presentation transform.
+//! Compatibility façade for the core-owned presentation transform.
 
-pub use reims_vgpu_vulkan::viewport::*;
+pub use reims_vgpu_core::{aspect_fit_viewport as aspect_fit, pointer_to_guest};

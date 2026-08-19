@@ -10,9 +10,61 @@ use crate::{ResidentContentBacking, ResourceLifetimeRef, TargetIdentity};
 /// and presentable at this geometry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PresentationSource {
-    pub width: u32,
-    pub height: u32,
-    pub identity: TargetIdentity,
+    width: u32,
+    height: u32,
+    identity: TargetIdentity,
+}
+
+impl PresentationSource {
+    pub fn new(identity: TargetIdentity, width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            identity,
+        }
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn identity(&self) -> &TargetIdentity {
+        &self.identity
+    }
+}
+
+/// A presentation source accepted by the executor's resident registry and
+/// window-presenter policy.
+///
+/// This is deliberately distinct from [`PresentationSource`]: composition may
+/// construct a request, but only the executor preparation transition returns a
+/// value the native window can offer for direct presentation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedPresentation {
+    source: PresentationSource,
+}
+
+impl PreparedPresentation {
+    /// Construct the result of a successful executor-side preparation.
+    #[doc(hidden)]
+    pub fn accepted(source: PresentationSource) -> Self {
+        Self { source }
+    }
+
+    pub fn source(&self) -> &PresentationSource {
+        &self.source
+    }
+}
+
+/// Source that actually reached native presentation completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PresentationRoute {
+    Resident,
+    CpuBgra,
 }
 
 /// What an executor can prove about outstanding writes into a page window.
@@ -46,6 +98,29 @@ pub enum ResidentReclaim {
     Recreated,
     /// The owning semantic resource lifetime ended.
     ResourceReleased,
+}
+
+/// One atomic executor reading of mutable resident content state.
+///
+/// Lifetime retention is deliberately absent: a semantic resource acquires its
+/// lease separately, while this snapshot answers readiness, content currency,
+/// and the reason an absent representation disappeared without three registry
+/// transactions observing three different moments.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidentReadPlan {
+    pub backing: ResidentContentBacking,
+    pub content_epoch: Option<u32>,
+    pub absent_after_reclaim: Option<(ResidentReclaim, u64)>,
+}
+
+impl Default for ResidentReadPlan {
+    fn default() -> Self {
+        Self {
+            backing: ResidentContentBacking::NotReady,
+            content_epoch: None,
+            absent_after_reclaim: None,
+        }
+    }
 }
 
 impl ResidentReclaim {
@@ -120,19 +195,8 @@ fn swap_red_blue(pixels: &mut [u8]) {
 
 /// Executor service for semantic resident-content state.
 pub trait ResidentService: std::fmt::Debug + Send + Sync {
-    fn resident_content_backing(&self, _identity: &TargetIdentity) -> ResidentContentBacking {
-        ResidentContentBacking::NotReady
-    }
-
-    fn resident_absent_after_reclaim(
-        &self,
-        _identity: &TargetIdentity,
-    ) -> Option<(ResidentReclaim, u64)> {
-        None
-    }
-
-    fn resident_content_epoch(&self, _identity: &TargetIdentity) -> Option<u32> {
-        None
+    fn resident_read_plan(&self, _identity: &TargetIdentity) -> ResidentReadPlan {
+        ResidentReadPlan::default()
     }
 
     fn resident_content_state(&self, _identity: &TargetIdentity) -> ResidentContent {
@@ -201,21 +265,32 @@ pub trait PresentationService: std::fmt::Debug + Send + Sync {
 
     fn prepare_window_resident_present(
         &self,
-        _identity: &TargetIdentity,
-        _width: u32,
-        _height: u32,
-    ) -> Result<(), PresentDecline> {
+        _source: &PresentationSource,
+    ) -> Result<PreparedPresentation, PresentDecline> {
         Err(PresentDecline::WindowNotAttached)
-    }
-
-    fn window_present_attached(&self) -> bool {
-        false
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PresentDecline, TargetReadback};
+    use super::{
+        PreparedPresentation, PresentDecline, PresentationSource, TargetIdentity, TargetReadback,
+    };
+
+    #[test]
+    fn accepted_presentation_is_a_distinct_value_with_the_exact_checked_source() {
+        let source = PresentationSource::new(TargetIdentity::default(), 1440, 900);
+        let prepared = PreparedPresentation::accepted(source.clone());
+        assert_eq!(prepared.source(), &source);
+    }
+
+    #[test]
+    fn presentation_completion_names_the_two_payload_routes() {
+        assert_ne!(
+            super::PresentationRoute::Resident,
+            super::PresentationRoute::CpuBgra
+        );
+    }
 
     #[test]
     fn readback_converts_only_when_the_requested_order_differs() {

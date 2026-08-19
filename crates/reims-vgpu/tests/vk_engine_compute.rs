@@ -7,14 +7,12 @@
 //!
 //! **Serial:** process-global engine; suite takes a lock.
 
-#![cfg(feature = "backend-vulkan")]
-
-use reims_vgpu::backend::vulkan::engine::{
+use reims_vgpu::model::ComputeStorageResidencyKey;
+use reims_vgpu_vulkan::engine::{
     self, ComputeBufferBacking, ComputeBufferResource, ComputeRequest, ComputeResidentSampleBind,
     ComputeSampledImageResource, ComputeSampledImageSource, ComputeStorageImageResource,
     ComputeStorageImageSeed, ComputeStorageResidency, GuestRun, GuestRunSource, StorageImageFormat,
 };
-use reims_vgpu::model::ComputeStorageResidencyKey;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -50,6 +48,10 @@ fn skip_if_no_gpu(err: &str) -> bool {
         || lower.contains("no graphics")
         || lower.contains("vk_engine_init")
         || lower.contains("no combined")
+}
+
+fn prepare_test_program(words: Vec<u32>) -> reims_vgpu_core::PreparedShaderStage {
+    reims_vgpu_vulkan::m2v_cache::prepare_test_shader(words)
 }
 
 fn inc_comp_spirv() -> Option<Vec<u32>> {
@@ -274,7 +276,7 @@ fn compute_inc_ssbo_known_result() {
     let grid = (n as u32).div_ceil(64);
 
     let req = ComputeRequest {
-        spirv: words,
+        program: prepare_test_program(words),
         entry: "main".into(),
         grid: [grid, 1, 1],
         storage_buffers: vec![ComputeBufferResource {
@@ -319,7 +321,7 @@ fn compute_writable_guest_ssbo_lands_in_place() {
     // machine without a Vulkan device is already a supported test skip, and a
     // device without host import keeps the product on its typed host fallback.
     let warm = ComputeRequest {
-        spirv: words.clone(),
+        program: prepare_test_program(words.clone()),
         entry: "main".into(),
         grid: [1, 1, 1],
         storage_buffers: vec![ComputeBufferResource {
@@ -383,7 +385,7 @@ fn compute_writable_guest_ssbo_lands_in_place() {
         ])),
     };
     let req = ComputeRequest {
-        spirv: words,
+        program: prepare_test_program(words),
         entry: "main".into(),
         grid: [(n as u32).div_ceil(64), 1, 1],
         storage_buffers: vec![ComputeBufferResource {
@@ -446,7 +448,7 @@ fn compute_readonly_ssbo_has_zero_readback() {
         return;
     };
     let req = ComputeRequest {
-        spirv: words,
+        program: prepare_test_program(words),
         entry: "main".into(),
         grid: [1, 1, 1],
         storage_buffers: vec![ComputeBufferResource {
@@ -522,7 +524,7 @@ fn compute_2d_grid_tiles_global_invocation_xy() {
     };
     let zeros = vec![0u8; 64 * 4];
     let req = ComputeRequest {
-        spirv: words.clone(),
+        program: prepare_test_program(words.clone()),
         entry: "main".into(),
         grid: [8, 8, 1],
         storage_buffers: vec![ComputeBufferResource {
@@ -567,7 +569,7 @@ fn compute_storage_image_rgba8unorm_known_result() {
     let identity =
         ComputeStorageResidencyKey::surface(77, 3, 0, w * 4, (w * h * 4) as u64, w, h, 0x46);
     let req = ComputeRequest {
-        spirv: words.clone(),
+        program: prepare_test_program(words.clone()),
         entry: "main".into(),
         grid: [w, h, 1],
         storage_buffers: vec![],
@@ -615,7 +617,7 @@ fn compute_storage_image_rgba8unorm_known_result() {
         .expect("a Host destination reads bytes back")
         .to_vec();
     let hit_req = ComputeRequest {
-        spirv: words.clone(),
+        program: prepare_test_program(words.clone()),
         entry: "main".into(),
         grid: [w, h, 1],
         storage_buffers: vec![],
@@ -653,7 +655,7 @@ fn compute_storage_image_rgba8unorm_known_result() {
     // texel only so untouched texels prove the black seed replaced residency.
     engine::reset_draw_counters();
     let mismatch_req = ComputeRequest {
-        spirv: words,
+        program: prepare_test_program(words),
         entry: "main".into(),
         grid: [1, 1, 1],
         storage_buffers: vec![],
@@ -737,7 +739,7 @@ fn every_admitted_compute_storage_resident_survives_past_the_retired_slot_cap() 
         ComputeStorageResidencyKey::surface(0x900 + i, 3, 0, w * 4, (w * h * 4) as u64, w, h, 0x46)
     };
     let request = |i: u32, seed_generation: u32| ComputeRequest {
-        spirv: words.clone(),
+        program: prepare_test_program(words.clone()),
         entry: "main".into(),
         grid: [w, h, 1],
         storage_buffers: vec![],
@@ -826,7 +828,7 @@ fn compute_storage_image_bgra8unorm_is_not_channel_swapped() {
         0x50,
     );
     let req = ComputeRequest {
-        spirv: words,
+        program: prepare_test_program(words),
         entry: "main".into(),
         grid: [w, h, 1],
         storage_buffers: vec![],
@@ -885,7 +887,7 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
         ComputeStorageResidencyKey::surface(91, 1, 0, w * 4, (w * h * 4) as u64, w, h, 0x46);
     let make = |grid: [u32; 3], seed_generation: u32, output_generation: u32, skipped: bool| {
         ComputeRequest {
-            spirv: words.clone(),
+            program: prepare_test_program(words.clone()),
             entry: "main".into(),
             grid,
             storage_buffers: vec![],
@@ -979,7 +981,7 @@ fn compute_sampled_resident_copy_and_lost_resident() {
         ComputeStorageResidencyKey::surface(93, 1, 0, w * 4, (w * h * 4) as u64, w, h, 0x46);
     // Full red fill establishes the resident at generation 2.
     let fill_req = ComputeRequest {
-        spirv: fill_words,
+        program: prepare_test_program(fill_words),
         entry: "main".into(),
         grid: [w, h, 1],
         storage_buffers: vec![],
@@ -1011,7 +1013,7 @@ fn compute_sampled_resident_copy_and_lost_resident() {
         .all(|p| p[0] >= 254));
 
     let make_fetch = |generation: u32| ComputeRequest {
-        spirv: fetch_words.clone(),
+        program: prepare_test_program(fetch_words.clone()),
         entry: "main".into(),
         grid: [1, 1, 1],
         storage_buffers: vec![ComputeBufferResource {
@@ -1095,7 +1097,7 @@ fn compute_sampled_image_fetch_preserves_float_bits() {
         .flat_map(|value| value.to_le_bytes())
         .collect();
     let mut req = ComputeRequest {
-        spirv: words,
+        program: prepare_test_program(words),
         entry: "main".into(),
         grid: [1, 1, 1],
         storage_buffers: vec![ComputeBufferResource {
@@ -1162,7 +1164,7 @@ fn compute_sampled_image_fetch_preserves_float_bits() {
     let Some(words) = assemble_spvasm(&uint_spvasm, "sampled_r32uint") else {
         return;
     };
-    req.spirv = words;
+    req.program = prepare_test_program(words);
     req.sampled_images[0].format = StorageImageFormat::R32Uint;
     req.sampled_images[0].source =
         ComputeSampledImageSource::Bytes(0x1234_5678u32.to_le_bytes().to_vec());
@@ -1191,7 +1193,7 @@ fn compute_m2v_float_mul4_add3_known_result() {
     let input: Vec<u8> = inp.iter().flat_map(|x| x.to_le_bytes()).collect();
     let grid = 1u32; // LocalSize 64, one group covers ≤64
     let req = ComputeRequest {
-        spirv: words,
+        program: prepare_test_program(words),
         entry: "main".into(),
         grid: [grid, 1, 1],
         storage_buffers: vec![ComputeBufferResource {
@@ -1225,7 +1227,7 @@ fn warm_identical_dispatch_zero_creates_and_allocs() {
     let n = 64usize;
     let input: Vec<u8> = (0..n).flat_map(|_| 1.0f32.to_le_bytes()).collect();
     let make_req = || ComputeRequest {
-        spirv: words.clone(),
+        program: prepare_test_program(words.clone()),
         entry: "main".into(),
         grid: [1, 1, 1],
         storage_buffers: vec![ComputeBufferResource {
@@ -1312,7 +1314,7 @@ fn compute_storage_image_r16float_if_supported() {
     };
     let seed = vec![0u8; 2 * 2 * 2]; // R16 = 2 bytes/texel
     let req = ComputeRequest {
-        spirv: words,
+        program: prepare_test_program(words),
         entry: "main".into(),
         grid: [2, 2, 1],
         storage_buffers: vec![],
@@ -1413,7 +1415,7 @@ fn a_short_bind_cannot_read_the_tail_of_the_slot_it_was_given() {
     };
 
     let dispatch = |bytes: Vec<u8>| ComputeRequest {
-        spirv: words.clone(),
+        program: prepare_test_program(words.clone()),
         entry: "main".into(),
         grid: [1, 1, 1],
         storage_buffers: vec![ComputeBufferResource {

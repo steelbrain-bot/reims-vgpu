@@ -5,8 +5,6 @@
 )]
 
 use super::*;
-use crate::contract::endian::{st16, st32, st64};
-use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA8_UNORM};
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
 use crate::runtime::decode::blit::{self, Point, Size};
 use crate::runtime::decode::resource::{
@@ -16,6 +14,8 @@ use crate::runtime::decode::resource::{
 use crate::runtime::gva_mem::write_task_gva_arm64e;
 use crate::runtime::host::FakeHost;
 use crate::runtime::objects;
+use reims_vgpu_core::endian::{st16, st32, st64};
+use reims_vgpu_core::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA8_UNORM};
 
 /// The channel is the whole diagnostic for this rail: 177 checks collapse
 /// into eight statuses, so a refusal that reaches the dispatch line without a
@@ -70,9 +70,9 @@ fn zero_extent_and_pending_fences_are_control_flow_not_refusals() {
 }
 
 /// A task-1 device with the arm64e page tables every blit fixture walks.
-fn blit_device() -> (FakeHost, DeviceState) {
+fn blit_device() -> (FakeHost, Device) {
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     (host, state)
 }
@@ -91,21 +91,27 @@ fn copy_cmd(copy_kind: CopyKind, source: u32, destination: u32) -> Command {
 /// Back `mapping_id` with one guest data page at `pfn` and mark it mapped.
 /// This is the surface state every IOSurface texture / IOSurface plane view install needs before it
 /// can attach geometry or a descriptor.
-fn map_one_page_surface(host: &mut FakeHost, state: &mut DeviceState, mapping_id: u32, pfn: u32) {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+fn map_one_page_surface(host: &mut FakeHost, state: &mut Device, mapping_id: u32, pfn: u32) {
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
     host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
-    state.map_surface(mapping_id);
-    let m = state.mappings.get_mut(&mapping_id).unwrap();
-    m.mapped = true;
-    m.mapping_internal = 1;
-    m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+    state.map_mapper_surface(
+        reims_vgpu_protocol::MapperSurfaceRef::new(u64::from(mapping_id)),
+        reims_vgpu_protocol::MapperResolvedSurfaceId::new(mapping_id),
+    );
+    let m = state.surfaces.mappings.get_mut(&mapping_id).unwrap();
+    m.lifecycle.active = true;
+    m.lifecycle.internal_kva = 1;
+    m.pages.entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
 }
 
 /// Publish object-list entry `obj_ref`: type and descriptor length packed
 /// into word 0, descriptor GVA in the following eight bytes.
 fn write_list_entry(
     host: &mut FakeHost,
-    state: &DeviceState,
+    state: &Device,
     obj_ref: u32,
     object_type: u32,
     desc_len: u32,
@@ -119,13 +125,7 @@ fn write_list_entry(
 }
 
 /// Install type-1 buffer: object-list at GVA 0, descriptor at GVA 0x100 + ref*0x20.
-fn install_buffer(
-    host: &mut FakeHost,
-    state: &mut DeviceState,
-    obj_ref: u32,
-    handle: u32,
-    size: u64,
-) {
+fn install_buffer(host: &mut FakeHost, state: &mut Device, obj_ref: u32, handle: u32, size: u64) {
     assert!(state.set_object_list(1, 0, 16));
     let mut desc = vec![0u8; LINEAR_DESC_MIN_LEN];
     st64(&mut desc[LINEAR_DESC_SIZE..], size);
@@ -183,7 +183,7 @@ fn a_blit_destination_is_bounded_against_a_guest_that_repoints_it_mid_copy() {
     // `rig` is a whole scenario because the unbounded arm must run against a
     // guest in the same state, not against one the bounded arm already
     // refused half a copy into.
-    let rig = |host: &mut FakeHost, state: &mut DeviceState| {
+    let rig = |host: &mut FakeHost, state: &mut Device| {
         gva_mem::define_task_pages_arm64e(host, state, DATA_BASE, 16);
         install_buffer(host, state, 7, SRC_PAGE as u32, LEN);
         install_buffer(host, state, 8, DST_PAGE as u32, LEN);
@@ -210,7 +210,7 @@ fn a_blit_destination_is_bounded_against_a_guest_that_repoints_it_mid_copy() {
     };
 
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     rig(&mut host, &mut state);
     let mut cmd = copy_cmd(CopyKind::BufferToBuffer, 7, 8);
     cmd.size = LEN;
@@ -234,7 +234,7 @@ fn a_blit_destination_is_bounded_against_a_guest_that_repoints_it_mid_copy() {
 
     // The same loop with no window, on a guest in the same state.
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     rig(&mut host, &mut state);
     assert!(
         copy_bytes_within(
@@ -325,12 +325,14 @@ fn fill_buffer_roundtrip() {
     assert_eq!(out, [0x5a; 8]);
 
     let (_, first_version) = state
-        .task_resources
+        .task_objects
+        .resources
         .content_stamp(1, 7)
         .expect("a resolved blit buffer has canonical content state");
     assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
     let (_, second_version) = state
-        .task_resources
+        .task_objects
+        .resources
         .content_stamp(1, 7)
         .expect("the resolved resource survives completion");
     assert_eq!(
@@ -569,15 +571,24 @@ fn copy_buffer_to_iosurface_texture_roundtrip() {
     assert_eq!(back, pat);
     // Blit again — unified memory: pages are the only content; both the legacy
     // mapping witness and canonical resource authority advance.
-    let gen_before = state.mappings[&mapping_id].content_generation;
+    let gen_before = state.surfaces.mappings[&mapping_id]
+        .content
+        .guest_page_generation;
     let (resource_before, version_before) = state
-        .task_resources
+        .task_objects
+        .resources
         .content_stamp(1, 3)
         .expect("the resolved destination has canonical content state");
     assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
-    assert!(state.mappings[&mapping_id].content_generation > gen_before);
+    assert!(
+        state.surfaces.mappings[&mapping_id]
+            .content
+            .guest_page_generation
+            > gen_before
+    );
     let (resource_after, version_after) = state
-        .task_resources
+        .task_objects
+        .resources
         .content_stamp(1, 3)
         .expect("the destination survives synchronous completion");
     assert_eq!(resource_after, resource_before);
@@ -778,7 +789,7 @@ fn copy_executor_reason_slugs_name_distinct_sites() {
 /// Install IOSurface texture object-list entry + mapping pages (2×2 BGRA).
 fn install_iosurface_texture(
     host: &mut FakeHost,
-    state: &mut DeviceState,
+    state: &mut Device,
     obj_ref: u32,
     mapping_id: u32,
     pfn: u32,
@@ -790,6 +801,7 @@ fn install_iosurface_texture(
         state,
         obj_ref,
         mapping_id,
+        0,
         MTL_FORMAT_BGRA8_UNORM,
         2,
         2,
@@ -797,13 +809,8 @@ fn install_iosurface_texture(
 }
 
 /// Shared biplanar mapping: plane0 Y 4×2 R8 @512 bpr=64; plane1 UV 2×1 RG8 @1024 bpr=64.
-fn install_biplanar_mapping(
-    host: &mut FakeHost,
-    state: &mut DeviceState,
-    mapping_id: u32,
-    pfn: u32,
-) {
-    use crate::contract::iosurface_pages::{
+fn install_biplanar_mapping(host: &mut FakeHost, state: &mut Device, mapping_id: u32, pfn: u32) {
+    use reims_vgpu_protocol::{
         DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_LEN, DEVICE_DESC_PLANES, DEVICE_DESC_PLANE_COUNT,
         DEVICE_PLANE_BPE, DEVICE_PLANE_BPR, DEVICE_PLANE_DESC_LEN, DEVICE_PLANE_DIMS,
         DEVICE_PLANE_OFFSET, DEVICE_PLANE_SIZE,
@@ -831,22 +838,33 @@ fn install_biplanar_mapping(
 
 fn install_iosurface_texture_plane(
     host: &mut FakeHost,
-    state: &mut DeviceState,
+    state: &mut Device,
     obj_ref: u32,
     mapping_id: u32,
+    plane: u16,
     format: u16,
     width: u32,
     height: u32,
 ) {
     use crate::runtime::decode::resource::OBJECT_TYPE_IOSURFACE;
-    // iosurface desc layout: surfaceID @0, format @0x16, width @0x18, height @0x1c.
-    const DESC_LEN: usize = 0x20;
+    use reims_vgpu_wire::ops::backed_texture::{
+        IOSURFACE_TEXTURE_TOTAL_LEN, OPCODE_IOSURFACE_TEXTURE,
+    };
+    const DESC_LEN: usize = 8 + IOSURFACE_TEXTURE_TOTAL_LEN as usize;
     assert!(state.set_object_list(1, 0, 16));
     let mut desc = vec![0u8; DESC_LEN];
-    st32(&mut desc[0..], mapping_id);
+    st64(&mut desc[0..], u64::from(mapping_id));
+    st32(&mut desc[8..], OPCODE_IOSURFACE_TEXTURE);
+    st32(&mut desc[12..], IOSURFACE_TEXTURE_TOTAL_LEN);
+    st32(&mut desc[16..], obj_ref);
     st16(&mut desc[0x16..], format);
     st32(&mut desc[0x18..], width);
     st32(&mut desc[0x1c..], height);
+    st32(&mut desc[0x20..], 1);
+    st16(&mut desc[0x24..], 1);
+    st16(&mut desc[0x26..], 1);
+    st16(&mut desc[0x28..], 1);
+    st16(&mut desc[0x34..], plane);
     let desc_gva = 0x180u64 + (obj_ref as u64) * 0x40;
     write_task_gva_arm64e(host, &state.tasks[1], desc_gva, &desc);
     write_list_entry(
@@ -866,7 +884,7 @@ fn install_iosurface_texture_plane(
 /// Also installs a single-page mapping at `mapping_id` so the resolve lands.
 fn install_iosurface_plane_view(
     host: &mut FakeHost,
-    state: &mut DeviceState,
+    state: &mut Device,
     obj_ref: u32,
     mapping_id: u32,
     pfn: u32,
@@ -920,13 +938,13 @@ fn install_iosurface_plane_view(
 /// assertion on the offset is exactly the assertion that the index was used.
 #[test]
 fn a_iosurface_plane_view_blit_source_reads_the_plane_the_wire_named() {
-    use crate::contract::endian::st64;
-    use crate::contract::iosurface_pages::{
+    use reims_vgpu_core::endian::st64;
+    use reims_vgpu_core::pixel_format::{MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG8_UNORM};
+    use reims_vgpu_protocol::{
         DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_LEN, DEVICE_DESC_PLANES, DEVICE_DESC_PLANE_COUNT,
         DEVICE_PLANE_BPE, DEVICE_PLANE_BPR, DEVICE_PLANE_DESC_LEN, DEVICE_PLANE_DIMS,
         DEVICE_PLANE_OFFSET, DEVICE_PLANE_SIZE,
     };
-    use crate::contract::pixel_format::{MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG8_UNORM};
     // Device-plane dims word: width u24@1, height u24@5 (`decode_device_plane`).
     let pack_plane_dims =
         |w: u32, h: u32| ((w as u64 & 0xffffff) << 8) | ((h as u64 & 0xffffff) << 40);
@@ -969,15 +987,16 @@ fn a_iosurface_plane_view_blit_source_reads_the_plane_the_wire_named() {
         st16(&mut desc[base + DEVICE_PLANE_BPE..], *bpe);
     }
     state
+        .surfaces
         .mappings
         .get_mut(&mapping_id)
         .expect("mapping")
-        .device_desc = desc;
+        .publish_device_desc_for_test(&desc);
 
     // The scan is genuinely ambiguous on this descriptor: without the index
     // it resolves nothing at all, which is what this test exists to exclude.
     let ambiguous = {
-        let m = state.mappings.get(&mapping_id).unwrap();
+        let m = state.surfaces.mappings.get(&mapping_id).unwrap();
         mapping_write::iosurface_texture_sample_window(m, w, h, MTL_FORMAT_R8_UNORM)
     };
     assert!(
@@ -987,7 +1006,7 @@ fn a_iosurface_plane_view_blit_source_reads_the_plane_the_wire_named() {
     // Sanity: plane 1 is a different geometry, so the ambiguity is between
     // planes 0 and 2 specifically and not a descriptor that resolves nothing.
     let uv = {
-        let m = state.mappings.get(&mapping_id).unwrap();
+        let m = state.surfaces.mappings.get(&mapping_id).unwrap();
         mapping_write::iosurface_plane_view_sample_window(m, 1, 4, 2, MTL_FORMAT_RG8_UNORM)
     };
     assert_eq!(uv.map(|(off, _, _)| off), Some(64));
@@ -1010,7 +1029,7 @@ fn a_iosurface_plane_view_blit_source_reads_the_plane_the_wire_named() {
 /// used index from a dropped one.
 fn set_iosurface_plane_view_record_plane(
     host: &mut FakeHost,
-    state: &DeviceState,
+    state: &Device,
     obj_ref: u32,
     plane: u32,
 ) {
@@ -1037,7 +1056,7 @@ fn set_iosurface_plane_view_record_plane(
 /// window backing lands. Mirrors the IOSurface texture install fixtures.
 #[test]
 fn iosurface_plane_view_ref_texture_resolves_as_iosurface_texture_blit_backing() {
-    use crate::contract::pixel_format::bytes_per_pixel;
+    use reims_vgpu_core::pixel_format::bytes_per_pixel;
     let (mut host, mut state) = blit_device();
     let mapping_id = 34u32;
     let obj_ref = 12u32;
@@ -1091,7 +1110,7 @@ fn iosurface_plane_view_unknown_record_tag_fails_closed() {
 
 #[test]
 fn biplanar_iosurface_texture_y_and_uv_planes_distinct() {
-    use crate::contract::pixel_format::{MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG8_UNORM};
+    use reims_vgpu_core::pixel_format::{MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG8_UNORM};
     let (mut host, mut state) = blit_device();
     let mapping_id = 7u32;
     install_biplanar_mapping(&mut host, &mut state, mapping_id, 0x30);
@@ -1101,6 +1120,7 @@ fn biplanar_iosurface_texture_y_and_uv_planes_distinct() {
         &mut state,
         10,
         mapping_id,
+        0,
         MTL_FORMAT_R8_UNORM,
         4,
         2,
@@ -1110,6 +1130,7 @@ fn biplanar_iosurface_texture_y_and_uv_planes_distinct() {
         &mut state,
         11,
         mapping_id,
+        1,
         MTL_FORMAT_RG8_UNORM,
         2,
         1,
@@ -1252,7 +1273,7 @@ fn biplanar_iosurface_texture_y_and_uv_planes_distinct() {
 
 fn install_type8_view(
     host: &mut FakeHost,
-    state: &mut DeviceState,
+    state: &mut Device,
     view_ref: u32,
     base_ref: u32,
     pixel_format: u16,
@@ -1833,7 +1854,7 @@ fn slice_level_zero_counts_are_noop() {
 /// Install a simple type-2 RGBA8 texture (single level, handle → GVA).
 fn install_linear_rgba(
     host: &mut FakeHost,
-    state: &mut DeviceState,
+    state: &mut Device,
     obj_ref: u32,
     handle: u32,
     width: u32,
@@ -1884,7 +1905,7 @@ fn install_linear_rgba(
 /// the pages held before the pass — zeros for a freshly allocated one.
 ///
 /// The ledger is what this can assert on both backend arms: `pay_gva` itself is
-/// `backend-vulkan`-only, but `take_gva` is not, so a resolve that named the debt
+/// Vulkan-executor-only, but `take_gva` is not, so a resolve that named the debt
 /// leaves the ledger empty and a resolve that did not leaves it holding one.
 #[test]
 fn a_blit_endpoint_lands_the_writeback_its_texture_still_owes() {
@@ -1900,7 +1921,7 @@ fn a_blit_endpoint_lands_the_writeback_its_texture_still_owes() {
     };
     let guest_write = state.resource_write_stamp(key.task_id, key.texture_ref);
     assert_eq!(
-        state.pending_writebacks.arm_gva(
+        state.content.pending_writebacks.arm_gva(
             key,
             GvaWritebackDebt {
                 linear: crate::runtime::draw::LinearColorTarget {
@@ -1912,7 +1933,7 @@ fn a_blit_endpoint_lands_the_writeback_its_texture_still_owes() {
                 width: 16,
                 height: 8,
                 format: MTL_FORMAT_RGBA8_UNORM,
-                resident_layout: crate::contract::pixel_format::TexelLayout::Rgba8,
+                resident_layout: reims_vgpu_core::pixel_format::TexelLayout::Rgba8,
                 generation: 3,
                 content: None,
                 guest_write,
@@ -1922,7 +1943,7 @@ fn a_blit_endpoint_lands_the_writeback_its_texture_still_owes() {
         None,
         "the resource owes exactly one frame going in"
     );
-    assert!(state.pending_writebacks.has_gva(key));
+    assert!(state.content.pending_writebacks.has_gva(key));
 
     let backing = resolve_texture_backing(&mut state, &mut host, 1, 2, 0, 0)
         .expect("a linear RGBA8 texture resolves as a blit endpoint");
@@ -1931,11 +1952,11 @@ fn a_blit_endpoint_lands_the_writeback_its_texture_still_owes() {
         "this is the private-texture rung, not a surface"
     );
     assert!(
-        state.task_resources.content_stamp(1, 2).is_some(),
+        state.task_objects.resources.content_stamp(1, 2).is_some(),
         "a resolved texture endpoint must publish a canonical resource identity"
     );
     assert!(
-        !state.pending_writebacks.has_gva(key),
+        !state.content.pending_writebacks.has_gva(key),
         "resolving a blit endpoint must land what the texture owed, not read around it"
     );
 }
@@ -1943,12 +1964,7 @@ fn a_blit_endpoint_lands_the_writeback_its_texture_still_owes() {
 /// Overwrite an installed texture descriptor's `allocation_size` in place.
 /// The `install_linear_*` helpers floor it at 0x1000, and a bounds test
 /// needs an allocation sized to the image and nothing more.
-fn set_installed_allocation_size(
-    host: &mut FakeHost,
-    state: &DeviceState,
-    obj_ref: u32,
-    alloc: u64,
-) {
+fn set_installed_allocation_size(host: &mut FakeHost, state: &Device, obj_ref: u32, alloc: u64) {
     let desc_gva = 0x200u64 + (obj_ref as u64) * 0x80;
     write_task_gva_arm64e(host, &state.tasks[1], desc_gva, &alloc.to_le_bytes());
 }
@@ -1998,7 +2014,7 @@ fn a_last_array_slice_is_not_charged_for_its_trailing_row_padding() {
     // Descriptor bytes belong to the constructed resource lifetime. Retire
     // that lifetime before publishing the deliberately shorter replacement;
     // mutating a retained descriptor in place is not a guest operation.
-    assert!(state.task_resources.delete(1, 2));
+    assert!(state.task_objects.resources.delete(1, 2));
     set_installed_allocation_size(&mut host, &state, 2, EXACT - 1);
     match resolve_texture_backing(&mut state, &mut host, 1, 2, 0, 1) {
         Err(st) => assert_eq!(st, BlitStatus::Bounds),
@@ -2346,7 +2362,7 @@ fn whole_surface_0x13e_two_levels() {
 /// Install type-2 RGBA8 volume (single level, depth>1) at `handle<<14`.
 fn install_linear_rgba_volume(
     host: &mut FakeHost,
-    state: &mut DeviceState,
+    state: &mut Device,
     obj_ref: u32,
     handle: u32,
     width: u32,
@@ -2454,7 +2470,7 @@ fn whole_surface_0x13e_volume_rejects_nonzero_slice() {
 
 #[test]
 fn blit_fence_update_then_wait() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut upd = Command::default();
     upd.kind = Kind::Fence;
     upd.opcode = wire_blit::OPCODE_UPDATE_FENCE;
@@ -2473,7 +2489,7 @@ fn blit_fence_update_then_wait() {
 
 #[test]
 fn blit_fence_wait_pending_without_update() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut wait = Command::default();
     wait.kind = Kind::Fence;
     wait.opcode = wire_blit::OPCODE_WAIT_FOR_FENCE;
@@ -2487,7 +2503,7 @@ fn blit_fence_wait_pending_without_update() {
 
 #[test]
 fn blit_fence_zero_ref_fails() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut upd = Command::default();
     upd.kind = Kind::Fence;
     upd.opcode = wire_blit::OPCODE_UPDATE_FENCE;
@@ -2507,12 +2523,12 @@ fn blit_fence_zero_ref_fails() {
 /// result; this locks the extent/stride/aspect-flag contract directly.
 #[test]
 fn blit_geometry_helpers_clamp_bpp_and_aspect() {
-    use crate::contract::pixel_format::{
-        MTL_FORMAT_A8_UNORM, MTL_FORMAT_DEPTH32_FLOAT_STENCIL8, MTL_FORMAT_RGBA16_FLOAT,
-    };
     use crate::runtime::decode::blit::{
         MTL_BLIT_OPTION_DEPTH_FROM_DEPTH_STENCIL, MTL_BLIT_OPTION_NONE,
         MTL_BLIT_OPTION_STENCIL_FROM_DEPTH_STENCIL,
+    };
+    use reims_vgpu_core::pixel_format::{
+        MTL_FORMAT_A8_UNORM, MTL_FORMAT_DEPTH32_FLOAT_STENCIL8, MTL_FORMAT_RGBA16_FLOAT,
     };
 
     // copy_extent: zero stays a no-op extent; in-range and exactly-max pass
@@ -2997,7 +3013,7 @@ fn the_gpu_whole_plane_arm_refuses_a_plane_the_rail_would_not_write() {
 /// is what the assertions below pin.
 #[test]
 fn the_gpu_whole_plane_arm_compares_stored_texels_and_not_transfer_functions() {
-    use crate::contract::pixel_format::{
+    use reims_vgpu_core::pixel_format::{
         MTL_FORMAT_BGRA8_UNORM_SRGB, MTL_FORMAT_R32_FLOAT, MTL_FORMAT_RGBA8_UNORM_SRGB,
     };
     use GpuPlaneRefusal::*;
@@ -3091,7 +3107,6 @@ fn the_gpu_whole_plane_arm_compares_stored_texels_and_not_transfer_functions() {
 /// settle at all, because the resident is the content — so every term below is
 /// about whether the resident and the destination plane are the two ends of one
 /// byte copy, and never about whether the guest's pages are readable.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_whole_surface_iosurface_texture_source_reaches_the_destinations_own_guest_plane() {
     use T2tGvaRefusal::*;

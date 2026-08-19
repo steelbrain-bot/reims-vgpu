@@ -27,6 +27,7 @@ pub struct ExecutorCapabilities {
     pub thread_execution_width: u32,
     pub max_render_target_dimension: u32,
     pub deferred_gpu_only_content: bool,
+    pub storage_image_write_without_format: bool,
 }
 
 impl Default for ExecutorCapabilities {
@@ -43,6 +44,7 @@ impl Default for ExecutorCapabilities {
             thread_execution_width: 1,
             max_render_target_dimension: 4096,
             deferred_gpu_only_content: false,
+            storage_image_write_without_format: false,
         }
     }
 }
@@ -59,6 +61,10 @@ pub trait CapabilityService: std::fmt::Debug + Send + Sync {
 
     fn render_target_layout_supported(&self, layout: TexelLayout) -> bool {
         matches!(layout, TexelLayout::Rgba8 | TexelLayout::Bgra8)
+    }
+
+    fn sampled_layout_linear_filter_supported(&self, _layout: TexelLayout) -> bool {
+        false
     }
 }
 
@@ -78,6 +84,7 @@ mod tests {
         assert_eq!(caps.device_info.max_sample_count, 1);
         assert!(!caps.device_info.d24_stencil8);
         assert!(!caps.device_info.native_fp16);
+        assert!(!caps.storage_image_write_without_format);
         assert!(!caps.deferred_gpu_only_content);
     }
 

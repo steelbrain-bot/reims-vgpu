@@ -32,6 +32,32 @@ pub struct Extent3 {
     pub z: u32,
 }
 
+#[inline]
+pub fn checked_add_u64(left: u64, right: u64) -> Option<u64> {
+    left.checked_add(right)
+}
+
+#[inline]
+pub fn checked_mul_u64(left: u64, right: u64) -> Option<u64> {
+    left.checked_mul(right)
+}
+
+/// Align a byte geometry to a nonzero power of two.
+#[inline]
+pub fn align_up_u64(value: u64, alignment: u64) -> Option<u64> {
+    if alignment == 0 || !alignment.is_power_of_two() {
+        return None;
+    }
+    value
+        .checked_add(alignment - 1)
+        .map(|rounded| rounded & !(alignment - 1))
+}
+
+#[inline]
+pub fn size_fits_u32(value: usize) -> bool {
+    u32::try_from(value).is_ok()
+}
+
 /// Metal's dimension for mip `level` of an axis whose level-0 size is `base`.
 ///
 /// Each level halves and floors, and the chain stops at 1 rather than reaching
@@ -145,6 +171,18 @@ mod tests {
     const R8_BPP: u32 = 1;
     const RG8_BPP: u32 = 2;
     const RGBA8_BPP: u32 = 4;
+
+    #[test]
+    fn checked_geometry_rejects_invalid_alignment_and_overflow() {
+        assert_eq!(checked_add_u64(20, 22), Some(42));
+        assert_eq!(checked_add_u64(u64::MAX, 1), None);
+        assert_eq!(checked_mul_u64(6, 7), Some(42));
+        assert_eq!(checked_mul_u64(u64::MAX, 2), None);
+        assert_eq!(align_up_u64(9, 8), Some(16));
+        assert_eq!(align_up_u64(9, 3), None);
+        assert_eq!(align_up_u64(u64::MAX, 8), None);
+        assert!(size_fits_u32(u32::MAX as usize));
+    }
 
     /// The length a texel copy is allowed to read is exactly `stride * height`,
     /// and both come from one call, so no caller can pair one format's stride

@@ -266,7 +266,7 @@ pub use reims_vgpu_core::ResidentReclaim;
 
 pub type PresentRect = (u32, u32, u32, u32);
 
-pub use reims_vgpu_core::PresentationSource as WindowPresentSource;
+pub use reims_vgpu_core::PreparedPresentation as WindowPresentSource;
 
 #[cfg(test)]
 mod tests {

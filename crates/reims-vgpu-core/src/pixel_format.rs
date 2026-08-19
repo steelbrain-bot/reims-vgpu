@@ -2,32 +2,32 @@
 
 use crate::endian::{ld16, st16};
 
-pub const COMPONENT_COUNT: usize = 4;
-pub const COMPONENT_R: usize = 0;
-pub const COMPONENT_G: usize = 1;
-pub const COMPONENT_B: usize = 2;
-pub const COMPONENT_A: usize = 3;
+pub const COMPONENT_COUNT: usize = reims_vgpu_protocol::metal_pixel::COMPONENT_COUNT;
+pub const COMPONENT_R: usize = reims_vgpu_protocol::metal_pixel::COMPONENT_R;
+pub const COMPONENT_G: usize = reims_vgpu_protocol::metal_pixel::COMPONENT_G;
+pub const COMPONENT_B: usize = reims_vgpu_protocol::metal_pixel::COMPONENT_B;
+pub const COMPONENT_A: usize = reims_vgpu_protocol::metal_pixel::COMPONENT_A;
 
-pub const R8_BPP: u32 = 1;
-pub const RG8_BPP: u32 = 2;
-pub const RGBA8_BPP: u32 = 4;
+pub const R8_BPP: u32 = reims_vgpu_protocol::metal_pixel::R8_BPP;
+pub const RG8_BPP: u32 = reims_vgpu_protocol::metal_pixel::RG8_BPP;
+pub const RGBA8_BPP: u32 = reims_vgpu_protocol::metal_pixel::RGBA8_BPP;
 pub const BGRA8_BPP: u32 = RGBA8_BPP;
-pub const R16F_BPP: u32 = 2;
+pub const R16F_BPP: u32 = reims_vgpu_protocol::metal_pixel::R16F_BPP;
 /// One sixteen-bit normalized channel — a ten-bit video luma plane.
-pub const R16_BPP: u32 = 2;
+pub const R16_BPP: u32 = reims_vgpu_protocol::metal_pixel::R16_BPP;
 /// Two of them: the matching chroma plane.
-pub const RG16_BPP: u32 = 4;
-pub const R32F_BPP: u32 = 4;
-pub const RG16F_BPP: u32 = 4;
-pub const RGBA16_BPP: u32 = 8;
+pub const RG16_BPP: u32 = reims_vgpu_protocol::metal_pixel::RG16_BPP;
+pub const R32F_BPP: u32 = reims_vgpu_protocol::metal_pixel::R32F_BPP;
+pub const RG16F_BPP: u32 = reims_vgpu_protocol::metal_pixel::RG16F_BPP;
+pub const RGBA16_BPP: u32 = reims_vgpu_protocol::metal_pixel::RGBA16_BPP;
 pub const RGBA16F_BPP: u32 = RGBA16_BPP;
-pub const RGBA32_BPP: u32 = 16;
+pub const RGBA32_BPP: u32 = reims_vgpu_protocol::metal_pixel::RGBA32_BPP;
 pub const RGBA32F_BPP: u32 = RGBA32_BPP;
-pub const R32_BPP: u32 = 4;
+pub const R32_BPP: u32 = reims_vgpu_protocol::metal_pixel::R32_BPP;
 
 // MTLPixelFormat values (Metal.framework Headers/MTLPixelFormat.h).
-pub const MTL_FORMAT_A8_UNORM: u16 = 0x01;
-pub const MTL_FORMAT_R8_UNORM: u16 = 0x0a;
+pub const MTL_FORMAT_A8_UNORM: u16 = reims_vgpu_protocol::metal_pixel::MTL_FORMAT_A8_UNORM;
+pub const MTL_FORMAT_R8_UNORM: u16 = reims_vgpu_protocol::metal_pixel::MTL_FORMAT_R8_UNORM;
 /// `MTLPixelFormatR8Uint`. Metal numbers the R8 family consecutively from
 /// `R8Unorm` at 10 — `R8Unorm_sRGB`, `R8Snorm`, `R8Uint`, `R8Sint` — so the
 /// unsigned-integer member is 13.
@@ -44,13 +44,13 @@ pub const MTL_FORMAT_R8_UNORM: u16 = 0x0a;
 /// Being *declared* is not being *sampled*: an integer texel must not be run
 /// through the unorm converters, so it has no executor texel layout and no
 /// storage selector, and both of those decline it by name.
-pub const MTL_FORMAT_R8_UINT: u16 = 0x0d;
+pub const MTL_FORMAT_R8_UINT: u16 = reims_vgpu_protocol::metal_pixel::MTL_FORMAT_R8_UINT;
 /// `MTLPixelFormatR16Unorm`. The luma plane of a ten-bit biplanar video
 /// surface (`'x420'`), where the eight-bit shape uses
 /// [`MTL_FORMAT_R8_UNORM`].
-pub const MTL_FORMAT_R16_UNORM: u16 = 0x14;
-pub const MTL_FORMAT_R16_FLOAT: u16 = 0x19;
-pub const MTL_FORMAT_RG8_UNORM: u16 = 0x1e;
+pub const MTL_FORMAT_R16_UNORM: u16 = reims_vgpu_protocol::metal_pixel::MTL_FORMAT_R16_UNORM;
+pub const MTL_FORMAT_R16_FLOAT: u16 = reims_vgpu_protocol::metal_pixel::MTL_FORMAT_R16_FLOAT;
+pub const MTL_FORMAT_RG8_UNORM: u16 = reims_vgpu_protocol::metal_pixel::MTL_FORMAT_RG8_UNORM;
 /// `MTLPixelFormatRG8Uint`. The RG8 family runs from `RG8Unorm` at 30 the same
 /// way the R8 family runs from `R8Unorm` at 10, so the unsigned-integer member
 /// is 33.
@@ -67,20 +67,22 @@ pub const MTL_FORMAT_RG8_UNORM: u16 = 0x1e;
 ///
 /// Integer texels, so the same restriction as [`MTL_FORMAT_R8_UINT`]: declared,
 /// and refused by name by every rail that would have to give them a meaning.
-pub const MTL_FORMAT_RG8_UINT: u16 = 0x21;
+pub const MTL_FORMAT_RG8_UINT: u16 = reims_vgpu_protocol::metal_pixel::MTL_FORMAT_RG8_UINT;
 /// `MTLPixelFormatRG16Unorm`. The chroma half of [`MTL_FORMAT_R16_UNORM`],
 /// as [`MTL_FORMAT_RG8_UNORM`] is of [`MTL_FORMAT_R8_UNORM`].
-pub const MTL_FORMAT_RG16_UNORM: u16 = 0x3c;
-pub const MTL_FORMAT_R32_UINT: u16 = 0x35;
-pub const MTL_FORMAT_R32_SINT: u16 = 0x36;
-pub const MTL_FORMAT_R32_FLOAT: u16 = 0x37;
-pub const MTL_FORMAT_RG16_FLOAT: u16 = 0x41;
-pub const MTL_FORMAT_RGBA8_UNORM: u16 = 0x46;
-pub const MTL_FORMAT_RGBA8_UNORM_SRGB: u16 = 0x47;
-pub const MTL_FORMAT_RGBA8_UINT: u16 = 0x49;
-pub const MTL_FORMAT_RGBA8_SINT: u16 = 0x4a;
-pub const MTL_FORMAT_BGRA8_UNORM: u16 = 0x50;
-pub const MTL_FORMAT_BGRA8_UNORM_SRGB: u16 = 0x51;
+pub const MTL_FORMAT_RG16_UNORM: u16 = reims_vgpu_protocol::metal_pixel::MTL_FORMAT_RG16_UNORM;
+pub const MTL_FORMAT_R32_UINT: u16 = reims_vgpu_protocol::metal_pixel::MTL_FORMAT_R32_UINT;
+pub const MTL_FORMAT_R32_SINT: u16 = reims_vgpu_protocol::metal_pixel::MTL_FORMAT_R32_SINT;
+pub const MTL_FORMAT_R32_FLOAT: u16 = reims_vgpu_protocol::metal_pixel::MTL_FORMAT_R32_FLOAT;
+pub const MTL_FORMAT_RG16_FLOAT: u16 = reims_vgpu_protocol::metal_pixel::MTL_FORMAT_RG16_FLOAT;
+pub const MTL_FORMAT_RGBA8_UNORM: u16 = reims_vgpu_protocol::metal_pixel::MTL_FORMAT_RGBA8_UNORM;
+pub const MTL_FORMAT_RGBA8_UNORM_SRGB: u16 =
+    reims_vgpu_protocol::metal_pixel::MTL_FORMAT_RGBA8_UNORM_SRGB;
+pub const MTL_FORMAT_RGBA8_UINT: u16 = reims_vgpu_protocol::metal_pixel::MTL_FORMAT_RGBA8_UINT;
+pub const MTL_FORMAT_RGBA8_SINT: u16 = reims_vgpu_protocol::metal_pixel::MTL_FORMAT_RGBA8_SINT;
+pub const MTL_FORMAT_BGRA8_UNORM: u16 = reims_vgpu_protocol::metal_pixel::MTL_FORMAT_BGRA8_UNORM;
+pub const MTL_FORMAT_BGRA8_UNORM_SRGB: u16 =
+    reims_vgpu_protocol::metal_pixel::MTL_FORMAT_BGRA8_UNORM_SRGB;
 /// `MTLPixelFormatRGB10A2Unorm`. Ten bits per colour channel and two of alpha,
 /// packed into one 32-bit word with red in the low bits.
 ///
@@ -108,41 +110,48 @@ pub const MTL_FORMAT_BGRA8_UNORM_SRGB: u16 = 0x51;
 /// This device advertises `isRGB10A2GammaSupported` to the guest
 /// (`model::regs::DEVICE_INFO_KEY_RGB10A2_GAMMA`), so a guest taking it at its
 /// word and binding one of these was being refused by the device that invited it.
-pub const MTL_FORMAT_RGB10A2_UNORM: u16 = 0x5a;
+pub const MTL_FORMAT_RGB10A2_UNORM: u16 =
+    reims_vgpu_protocol::metal_pixel::MTL_FORMAT_RGB10A2_UNORM;
 /// `MTLPixelFormatRGB10A2Uint`. The integer twin of
 /// [`MTL_FORMAT_RGB10A2_UNORM`], declared for its width and nothing more:
 /// integer texels must not run through the unorm converters, so it has no
 /// [`TexelLayout`] and no storage selector, and both decline it by name. Same
 /// rule as [`MTL_FORMAT_R8_UINT`].
-pub const MTL_FORMAT_RGB10A2_UINT: u16 = 0x5b;
+pub const MTL_FORMAT_RGB10A2_UINT: u16 = reims_vgpu_protocol::metal_pixel::MTL_FORMAT_RGB10A2_UINT;
 /// `MTLPixelFormatRG11B10Float`. Eleven bits of red and green, ten of blue, no
 /// alpha, in one 32-bit word — `VK_FORMAT_B10G11R11_UFLOAT_PACK32` exactly. An
 /// HDR-intermediate colour format; see [`MTL_FORMAT_RGB10A2_UNORM`].
-pub const MTL_FORMAT_RG11B10_FLOAT: u16 = 0x5c;
+pub const MTL_FORMAT_RG11B10_FLOAT: u16 =
+    reims_vgpu_protocol::metal_pixel::MTL_FORMAT_RG11B10_FLOAT;
 /// Packed RGB9E5 shared-exponent float. 32-bit texels.
-pub const MTL_FORMAT_RGB9E5_FLOAT: u16 = 0x5d;
+pub const MTL_FORMAT_RGB9E5_FLOAT: u16 = reims_vgpu_protocol::metal_pixel::MTL_FORMAT_RGB9E5_FLOAT;
 /// `MTLPixelFormatBGR10A2Unorm`. [`MTL_FORMAT_RGB10A2_UNORM`] with the colour
 /// channels the other way round in the word — `VK_FORMAT_A2R10G10B10_UNORM_PACK32`
 /// exactly, as `BGRA8Unorm` is to `RGBA8Unorm` one storage shape up.
-pub const MTL_FORMAT_BGR10A2_UNORM: u16 = 0x5e;
+pub const MTL_FORMAT_BGR10A2_UNORM: u16 =
+    reims_vgpu_protocol::metal_pixel::MTL_FORMAT_BGR10A2_UNORM;
 /// `MTLPixelFormatRGBA16Unorm`. Its ordinal sits between two this table
 /// already carries — `RGBA16Uint` at `0x71` and `RGBA16Float` at `0x73` — and
 /// its absence was a decode gap rather than a rail gap: `bytes_per_pixel`
 /// answered `None`, so every path that asks about a texel width refused it, not
 /// just the sampled one.
-pub const MTL_FORMAT_RGBA16_UNORM: u16 = 0x6e;
-pub const MTL_FORMAT_RGBA16_UINT: u16 = 0x71;
-pub const MTL_FORMAT_RGBA16_FLOAT: u16 = 0x73;
-pub const MTL_FORMAT_RGBA32_UINT: u16 = 0x7b;
-pub const MTL_FORMAT_RGBA32_FLOAT: u16 = 0x7d;
+pub const MTL_FORMAT_RGBA16_UNORM: u16 = reims_vgpu_protocol::metal_pixel::MTL_FORMAT_RGBA16_UNORM;
+pub const MTL_FORMAT_RGBA16_UINT: u16 = reims_vgpu_protocol::metal_pixel::MTL_FORMAT_RGBA16_UINT;
+pub const MTL_FORMAT_RGBA16_FLOAT: u16 = reims_vgpu_protocol::metal_pixel::MTL_FORMAT_RGBA16_FLOAT;
+pub const MTL_FORMAT_RGBA32_UINT: u16 = reims_vgpu_protocol::metal_pixel::MTL_FORMAT_RGBA32_UINT;
+pub const MTL_FORMAT_RGBA32_FLOAT: u16 = reims_vgpu_protocol::metal_pixel::MTL_FORMAT_RGBA32_FLOAT;
 // Depth / stencil (Metal.framework Headers/MTLPixelFormat.h).
-pub const MTL_FORMAT_DEPTH16_UNORM: u16 = 250;
-pub const MTL_FORMAT_DEPTH32_FLOAT: u16 = 252;
-pub const MTL_FORMAT_STENCIL8: u16 = 253;
-pub const MTL_FORMAT_DEPTH24_UNORM_STENCIL8: u16 = 255;
-pub const MTL_FORMAT_DEPTH32_FLOAT_STENCIL8: u16 = 260;
-pub const MTL_FORMAT_X32_STENCIL8: u16 = 261;
-pub const MTL_FORMAT_X24_STENCIL8: u16 = 262;
+pub const MTL_FORMAT_DEPTH16_UNORM: u16 =
+    reims_vgpu_protocol::metal_pixel::MTL_FORMAT_DEPTH16_UNORM;
+pub const MTL_FORMAT_DEPTH32_FLOAT: u16 =
+    reims_vgpu_protocol::metal_pixel::MTL_FORMAT_DEPTH32_FLOAT;
+pub const MTL_FORMAT_STENCIL8: u16 = reims_vgpu_protocol::metal_pixel::MTL_FORMAT_STENCIL8;
+pub const MTL_FORMAT_DEPTH24_UNORM_STENCIL8: u16 =
+    reims_vgpu_protocol::metal_pixel::MTL_FORMAT_DEPTH24_UNORM_STENCIL8;
+pub const MTL_FORMAT_DEPTH32_FLOAT_STENCIL8: u16 =
+    reims_vgpu_protocol::metal_pixel::MTL_FORMAT_DEPTH32_FLOAT_STENCIL8;
+pub const MTL_FORMAT_X32_STENCIL8: u16 = reims_vgpu_protocol::metal_pixel::MTL_FORMAT_X32_STENCIL8;
+pub const MTL_FORMAT_X24_STENCIL8: u16 = reims_vgpu_protocol::metal_pixel::MTL_FORMAT_X24_STENCIL8;
 
 /// The compute rail's own narrowing of `MTLPixelFormat` to the formats a
 /// storage image may be, produced once by [`storage_selector`].
@@ -189,6 +198,154 @@ pub use reims_vgpu_protocol::{
     apply_swizzle_rgba8, swizzle_identity, swizzle_is_identity, swizzle_plan, SwizzlePlan,
     SwizzleSource, TexelLayout,
 };
+
+/// Why a translated storage-image declaration cannot be specialized to the
+/// guest surface's semantic format.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StorageImageSpecializationDecline {
+    ShaderFormatUnsupported,
+    GuestFormatSampledOnly,
+    NumericClassMismatch,
+}
+
+impl reims_vgpu_observe::Decline for StorageImageSpecializationDecline {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::ShaderFormatUnsupported => "spirv_storage_format_unsupported",
+            Self::GuestFormatSampledOnly => "spirv_sampled_only_format_as_storage",
+            Self::NumericClassMismatch => "spirv_guest_numeric_class_mismatch",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        Vec::new()
+    }
+}
+
+reims_vgpu_observe::decline_display!(StorageImageSpecializationDecline);
+
+fn storage_numeric_class(format: reims_vgpu_protocol::StorageImageFormat) -> u8 {
+    use reims_vgpu_protocol::StorageImageFormat as F;
+    match format {
+        F::Rgba32Float
+        | F::Rgba16Float
+        | F::R16Float
+        | F::Rgba8Unorm
+        | F::Bgra8Unorm
+        | F::Rg16Float
+        | F::R8Unorm
+        | F::Rg8Unorm
+        | F::R32Float
+        | F::Rgb9e5Ufloat
+        | F::R16Unorm
+        | F::Rg16Unorm
+        | F::Rgba16Unorm
+        | F::Rgb10a2Unorm
+        | F::Bgr10a2Unorm
+        | F::Rg11b10Float => 0,
+        F::Rgba16Uint | F::Rgba8Uint | F::Rgba32Uint | F::R32Uint => 1,
+        F::Rgba8Sint | F::R32Sint => 2,
+    }
+}
+
+/// Select the semantic storage format a backend must publish for one shader
+/// declaration and bound guest surface. `None` means a format-less image whose
+/// native view takes the guest surface's format.
+pub fn specialize_storage_image_format(
+    guest: reims_vgpu_protocol::StorageImageFormat,
+    shader: reims_vgpu_protocol::StorageImageFormat,
+    write_without_format: bool,
+) -> Result<Option<reims_vgpu_protocol::StorageImageFormat>, StorageImageSpecializationDecline> {
+    use reims_vgpu_protocol::StorageImageFormat as F;
+    use StorageImageSpecializationDecline as D;
+
+    if !matches!(
+        shader,
+        F::Rgba32Float
+            | F::Rgba16Float
+            | F::R16Float
+            | F::Rgba16Uint
+            | F::Rgba8Uint
+            | F::Rgba8Sint
+            | F::Rgba8Unorm
+            | F::Rg16Float
+            | F::R8Unorm
+            | F::Rg8Unorm
+            | F::Rgba32Uint
+            | F::R32Float
+            | F::R32Uint
+    ) {
+        return Err(D::ShaderFormatUnsupported);
+    }
+
+    if guest == F::Bgra8Unorm
+        && matches!(
+            shader,
+            F::Rgba8Unorm
+                | F::Rgba32Float
+                | F::Rgba16Float
+                | F::R16Float
+                | F::R32Float
+                | F::Rg16Float
+                | F::R8Unorm
+                | F::Rg8Unorm
+        )
+    {
+        // SPIR-V has no BGRA storage-image format. A normalized colour store
+        // therefore uses a format-less image when the backend supports it, so
+        // the native BGRA view performs channel conversion. Integer shaders
+        // deliberately fall through: equal-width integer access is a raw byte
+        // view, not a colour conversion.
+        return Ok(if write_without_format {
+            None
+        } else {
+            Some(F::Rgba8Unorm)
+        });
+    }
+    if shader == guest {
+        return Ok(Some(shader));
+    }
+
+    let shader_class = storage_numeric_class(shader);
+    // An integer shader over equal-width normalized storage is a deliberate
+    // raw view. Equal width within the same numeric class is not sufficient:
+    // R32Float and Rg16Float have different channel semantics despite both
+    // occupying four bytes, so those cases specialize to the guest format.
+    if guest.bytes_per_texel() == shader.bytes_per_texel()
+        && shader_class != 0
+        && storage_numeric_class(guest) == 0
+    {
+        return Ok(Some(shader));
+    }
+
+    let (guest_class, specialized) = match guest {
+        F::R32Uint => (1, F::R32Uint),
+        F::R32Sint
+        | F::R32Float
+        | F::Rgb9e5Ufloat
+        | F::R16Unorm
+        | F::Rg16Unorm
+        | F::Rgba16Unorm
+        | F::Rgb10a2Unorm
+        | F::Bgr10a2Unorm
+        | F::Rg11b10Float => return Err(D::GuestFormatSampledOnly),
+        F::Rgba32Float => (0, F::Rgba32Float),
+        F::Rgba16Float => (0, F::Rgba16Float),
+        F::R16Float => (0, F::R16Float),
+        F::Rgba8Unorm | F::Bgra8Unorm => (0, F::Rgba8Unorm),
+        F::Rg16Float => (0, F::Rg16Float),
+        F::R8Unorm => (0, F::R8Unorm),
+        F::Rg8Unorm => (0, F::Rg8Unorm),
+        F::Rgba32Uint => (1, F::Rgba32Uint),
+        F::Rgba16Uint => (1, F::Rgba16Uint),
+        F::Rgba8Uint => (1, F::Rgba8Uint),
+        F::Rgba8Sint => (2, F::Rgba8Sint),
+    };
+    if shader_class != guest_class {
+        return Err(D::NumericClassMismatch);
+    }
+    Ok(Some(specialized))
+}
 
 /// What a CPU loader produced for a sampled bind: the channel layout the bytes
 /// are in, and the guest format whose transfer function they still carry.
@@ -267,6 +424,19 @@ impl SampledByteFormat {
     pub fn srgb_source(self) -> Option<u16> {
         self.source.filter(|&source| is_srgb(source))
     }
+
+    /// Semantic image-view format for these already-loaded bytes, plus the
+    /// source format whose sRGB qualifier could not be represented, if any.
+    pub fn image_format(self) -> (reims_vgpu_protocol::ImageFormat, Option<u16>) {
+        let linear = reims_vgpu_protocol::ImageFormat::linear(self.layout);
+        let Some(source) = self.srgb_source() else {
+            return (linear, None);
+        };
+        match reims_vgpu_protocol::ImageFormat::srgb(self.layout) {
+            Some(srgb) => (srgb, None),
+            None => (linear, Some(source)),
+        }
+    }
 }
 
 const UNORM8_MIN: u8 = 0x00;
@@ -292,68 +462,17 @@ const UNORM8_MAX: u8 = 0xff;
 /// 1 to agree with a vendor table would under-allocate every stencil-aspect
 /// parent.
 pub fn bytes_per_pixel(format: u16) -> Option<u32> {
-    Some(match format {
-        MTL_FORMAT_A8_UNORM | MTL_FORMAT_R8_UNORM | MTL_FORMAT_R8_UINT | MTL_FORMAT_STENCIL8 => {
-            R8_BPP
-        }
-        MTL_FORMAT_R16_FLOAT
-        | MTL_FORMAT_RG8_UNORM
-        | MTL_FORMAT_RG8_UINT
-        | MTL_FORMAT_DEPTH16_UNORM => RG8_BPP,
-        MTL_FORMAT_R16_UNORM => R16_BPP,
-        MTL_FORMAT_RG16_UNORM => RG16_BPP,
-        MTL_FORMAT_RG16_FLOAT => RG16F_BPP,
-        MTL_FORMAT_RGBA8_UNORM
-        | MTL_FORMAT_RGBA8_UNORM_SRGB
-        | MTL_FORMAT_RGBA8_UINT
-        | MTL_FORMAT_RGBA8_SINT
-        | MTL_FORMAT_BGRA8_UNORM
-        | MTL_FORMAT_BGRA8_UNORM_SRGB
-        | MTL_FORMAT_R32_UINT
-        | MTL_FORMAT_R32_SINT
-        | MTL_FORMAT_R32_FLOAT
-        // The packed families are four bytes for the same reason the byte
-        // orders are: one 32-bit word per texel. What differs is where the
-        // channel boundaries fall inside it, which is the format code's answer
-        // and not the width's.
-        | MTL_FORMAT_RGB9E5_FLOAT
-        | MTL_FORMAT_RGB10A2_UNORM
-        | MTL_FORMAT_RGB10A2_UINT
-        | MTL_FORMAT_RG11B10_FLOAT
-        | MTL_FORMAT_BGR10A2_UNORM
-        | MTL_FORMAT_DEPTH32_FLOAT
-        | MTL_FORMAT_DEPTH24_UNORM_STENCIL8
-        | MTL_FORMAT_X24_STENCIL8 => RGBA8_BPP,
-        // Depth32Float_Stencil8 / X32_Stencil8: 64-bit cells on Apple Silicon
-        // (40-bit logical DS + pad; Metal allocates 8 B/texel for this family).
-        MTL_FORMAT_DEPTH32_FLOAT_STENCIL8 | MTL_FORMAT_X32_STENCIL8 => 8,
-        MTL_FORMAT_RGBA16_UNORM | MTL_FORMAT_RGBA16_UINT | MTL_FORMAT_RGBA16_FLOAT => RGBA16_BPP,
-        MTL_FORMAT_RGBA32_UINT | MTL_FORMAT_RGBA32_FLOAT => RGBA32_BPP,
-        _ => return None,
-    })
+    reims_vgpu_protocol::metal_pixel::bytes_per_pixel(format)
 }
 
 /// Whether `format` has a depth plane (for `MTLBlitOptionDepthFromDepthStencil`).
 pub fn format_has_depth_aspect(format: u16) -> bool {
-    matches!(
-        format,
-        MTL_FORMAT_DEPTH16_UNORM
-            | MTL_FORMAT_DEPTH32_FLOAT
-            | MTL_FORMAT_DEPTH24_UNORM_STENCIL8
-            | MTL_FORMAT_DEPTH32_FLOAT_STENCIL8
-    )
+    reims_vgpu_protocol::metal_pixel::has_depth_aspect(format)
 }
 
 /// Whether `format` has a stencil plane (for `MTLBlitOptionStencilFromDepthStencil`).
 pub fn format_has_stencil_aspect(format: u16) -> bool {
-    matches!(
-        format,
-        MTL_FORMAT_STENCIL8
-            | MTL_FORMAT_DEPTH24_UNORM_STENCIL8
-            | MTL_FORMAT_DEPTH32_FLOAT_STENCIL8
-            | MTL_FORMAT_X32_STENCIL8
-            | MTL_FORMAT_X24_STENCIL8
-    )
+    reims_vgpu_protocol::metal_pixel::has_stencil_aspect(format)
 }
 
 /// Linear packing of a combined depth-stencil texel (full cell in guest storage).
@@ -670,10 +789,129 @@ pub fn insert_plane_row(
 /// Without it the loss is indistinguishable from the format never having been
 /// sRGB at all.
 pub fn is_srgb(format: u16) -> bool {
-    matches!(
-        format,
-        MTL_FORMAT_RGBA8_UNORM_SRGB | MTL_FORMAT_BGRA8_UNORM_SRGB
-    )
+    reims_vgpu_protocol::metal_pixel::is_srgb(format)
+}
+
+/// Semantic sampled-view layout and component mapping for a declared guest
+/// pixel format. Native API formats are deliberately absent.
+pub fn sampled_texel(format: u16) -> Option<(TexelLayout, SwizzlePlan)> {
+    let layout = match format {
+        MTL_FORMAT_A8_UNORM | MTL_FORMAT_R8_UNORM => TexelLayout::R8,
+        MTL_FORMAT_RG8_UNORM => TexelLayout::Rg8,
+        MTL_FORMAT_RGBA8_UNORM | MTL_FORMAT_RGBA8_UNORM_SRGB => TexelLayout::Rgba8,
+        MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => TexelLayout::Bgra8,
+        MTL_FORMAT_R16_UNORM => TexelLayout::R16Unorm,
+        MTL_FORMAT_R16_FLOAT => TexelLayout::R16Float,
+        MTL_FORMAT_R32_FLOAT => TexelLayout::R32Float,
+        MTL_FORMAT_RG16_UNORM => TexelLayout::Rg16Unorm,
+        MTL_FORMAT_RG16_FLOAT => TexelLayout::Rg16Float,
+        MTL_FORMAT_RGBA16_UNORM => TexelLayout::Rgba16Unorm,
+        MTL_FORMAT_RGBA16_FLOAT => TexelLayout::Rgba16Float,
+        MTL_FORMAT_RGB10A2_UNORM => TexelLayout::Rgb10a2Unorm,
+        MTL_FORMAT_BGR10A2_UNORM => TexelLayout::Bgr10a2Unorm,
+        MTL_FORMAT_RG11B10_FLOAT => TexelLayout::Rg11b10Float,
+        _ => return None,
+    };
+    let components = if format == MTL_FORMAT_A8_UNORM {
+        SwizzlePlan {
+            source: [
+                SwizzleSource::Zero,
+                SwizzleSource::Zero,
+                SwizzleSource::Zero,
+                SwizzleSource::R,
+            ],
+        }
+    } else {
+        swizzle_identity()
+    };
+    Some((layout, components))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SampledTexelDecline {
+    UnknownPixelFormat { format: u16 },
+    NoSampledLayout { format: u16 },
+}
+
+impl reims_vgpu_observe::Decline for SampledTexelDecline {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::UnknownPixelFormat { .. } => "unknown_pixel_format",
+            Self::NoSampledLayout { .. } => "no_sampled_layout",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        let format = match self {
+            Self::UnknownPixelFormat { format } | Self::NoSampledLayout { format } => format,
+        };
+        vec![("format", format.to_string())]
+    }
+}
+
+reims_vgpu_observe::decline_display!(SampledTexelDecline);
+
+/// Checked semantic sampled layout that keeps an undefined wire ordinal apart
+/// from a defined format this sampled rail cannot represent.
+pub fn sampled_texel_checked(
+    format: u16,
+) -> Result<(TexelLayout, SwizzlePlan), SampledTexelDecline> {
+    if bytes_per_pixel(format).is_none() {
+        return Err(SampledTexelDecline::UnknownPixelFormat { format });
+    }
+    sampled_texel(format).ok_or(SampledTexelDecline::NoSampledLayout { format })
+}
+
+/// Semantic sampled image-view format for a declared guest pixel format.
+pub fn sampled_image_format(format: u16) -> Option<reims_vgpu_protocol::ImageFormat> {
+    let (layout, _) = sampled_texel(format)?;
+    if is_srgb(format) {
+        reims_vgpu_protocol::ImageFormat::srgb(layout)
+    } else {
+        Some(reims_vgpu_protocol::ImageFormat::linear(layout))
+    }
+}
+
+/// Semantic color-attachment format admitted by the guest contract.
+pub fn color_attachment_format(format: u16) -> Option<reims_vgpu_protocol::ImageFormat> {
+    render_target_bpp(format)?;
+    sampled_image_format(format)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ColorAttachmentDecline {
+    UnknownPixelFormat { format: u16 },
+    NoColorAttachmentFormat { format: u16 },
+}
+
+impl reims_vgpu_observe::Decline for ColorAttachmentDecline {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::UnknownPixelFormat { .. } => "unknown_pixel_format",
+            Self::NoColorAttachmentFormat { .. } => "no_color_attachment_format",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        let format = match self {
+            Self::UnknownPixelFormat { format } | Self::NoColorAttachmentFormat { format } => {
+                format
+            }
+        };
+        vec![("format", format.to_string())]
+    }
+}
+
+reims_vgpu_observe::decline_display!(ColorAttachmentDecline);
+
+pub fn color_attachment_format_checked(
+    format: u16,
+) -> Result<reims_vgpu_protocol::ImageFormat, ColorAttachmentDecline> {
+    if bytes_per_pixel(format).is_none() {
+        return Err(ColorAttachmentDecline::UnknownPixelFormat { format });
+    }
+    color_attachment_format(format)
+        .ok_or(ColorAttachmentDecline::NoColorAttachmentFormat { format })
 }
 
 /// Which **CPU-upload fast path** a sampled format's guest bytes qualify for, or
@@ -986,7 +1224,7 @@ pub fn f64_to_unorm8(value: f64) -> u8 {
 /// The fill therefore walks the buffer instead of counting texels. A
 /// `chunks_exact_mut` cannot describe a different image from the one that was
 /// allocated, where a second expression always can — the rule
-/// [`crate::contract::extent::tight_image_layout`] states for a length and its
+/// [`reims_vgpu_protocol::tight_image_layout`] states for a length and its
 /// stride, one level down.
 ///
 /// Here rather than in either caller because it is arithmetic both rails need
@@ -1592,6 +1830,64 @@ pub fn convert_rgba8_to_row(format: u16, src_rgba: &[u8], pixels: u32, dst: &mut
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_specialization_is_semantic_and_returns_typed_refusals() {
+        use reims_vgpu_protocol::StorageImageFormat as F;
+        use StorageImageSpecializationDecline as D;
+
+        assert_eq!(
+            specialize_storage_image_format(F::Bgra8Unorm, F::R32Float, true),
+            Ok(None)
+        );
+        assert_eq!(
+            specialize_storage_image_format(F::Bgra8Unorm, F::R32Float, false),
+            Ok(Some(F::Rgba8Unorm))
+        );
+        assert_eq!(
+            specialize_storage_image_format(F::Bgra8Unorm, F::Rgba8Uint, true),
+            Ok(Some(F::Rgba8Uint))
+        );
+        assert_eq!(
+            specialize_storage_image_format(F::Rg16Float, F::R32Float, true),
+            Ok(Some(F::Rg16Float))
+        );
+        assert_eq!(
+            specialize_storage_image_format(F::R32Uint, F::Rgba8Unorm, true),
+            Err(D::NumericClassMismatch)
+        );
+        assert_eq!(
+            specialize_storage_image_format(F::R32Float, F::Rgba8Unorm, true),
+            Err(D::GuestFormatSampledOnly)
+        );
+        assert_eq!(
+            specialize_storage_image_format(F::Bgra8Unorm, F::R32Sint, true),
+            Err(D::ShaderFormatUnsupported)
+        );
+    }
+
+    #[test]
+    fn semantic_sampled_formats_do_not_depend_on_a_native_format_projection() {
+        assert_eq!(
+            sampled_image_format(MTL_FORMAT_BGRA8_UNORM_SRGB),
+            reims_vgpu_protocol::ImageFormat::srgb(TexelLayout::Bgra8)
+        );
+        let (layout, swizzle) = sampled_texel(MTL_FORMAT_A8_UNORM).unwrap();
+        assert_eq!(layout, TexelLayout::R8);
+        assert_eq!(swizzle.source[3], SwizzleSource::R);
+        assert_eq!(swizzle.source[0], SwizzleSource::Zero);
+        assert!(sampled_image_format(MTL_FORMAT_R8_UINT).is_none());
+        assert_eq!(
+            sampled_texel_checked(MTL_FORMAT_R8_UINT),
+            Err(SampledTexelDecline::NoSampledLayout {
+                format: MTL_FORMAT_R8_UINT,
+            })
+        );
+        assert_eq!(
+            sampled_texel_checked(0xffff),
+            Err(SampledTexelDecline::UnknownPixelFormat { format: 0xffff })
+        );
+    }
 
     /// [`TexelLayout::has_cpu_loader_arm`] answers for the loader it names.
     ///

@@ -253,55 +253,72 @@ fn note_view_slice_range_dropped(
 /// [`resolve_texture_view_reasoned`]'s `?`, and [`resolve_texture_view`] is what
 /// turns the whole walk into an `Option` for the hot path.
 fn decode_texture_view_hop_reasoned<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     texture_ref: u32,
 ) -> Result<(u32, u32, Option<pixel_format::SwizzlePlan>, Option<u16>), TextureViewDecline> {
-    use crate::runtime::decode::resource::{decode_texture_view_descriptor, texture_type8_header};
-    let (_entry, desc) = objects::resolve_descriptor(
-        state,
-        host,
-        task_id,
-        texture_ref,
-        &[ObjectKind::TextureView],
-    )
-    .map_err(|rung| match rung {
-        objects::LadderRung::NoListEntry => TextureViewDecline::HopEntryMissing { texture_ref },
-        objects::LadderRung::WrongType { got } => TextureViewDecline::HopObjectNotView {
-            texture_ref,
-            object_type: got,
-        },
-        objects::LadderRung::DescRead { declared_len } => {
-            TextureViewDecline::HopDescriptorMissing {
+    use crate::runtime::decode::resource::texture_type8_header;
+    let resource = objects::resolve_resource(state, host, task_id, texture_ref).map_err(
+        |rung| match rung {
+            objects::LadderRung::NoListEntry => TextureViewDecline::HopEntryMissing { texture_ref },
+            objects::LadderRung::WrongType { got } => TextureViewDecline::HopObjectNotView {
                 texture_ref,
-                descriptor_length: declared_len,
+                object_type: got,
+            },
+            objects::LadderRung::DescRead { declared_len } => {
+                TextureViewDecline::HopDescriptorMissing {
+                    texture_ref,
+                    descriptor_length: declared_len,
+                }
             }
-        }
-    })?;
-    // Bytes visible before decode, for the len-mismatch / bad-opcode census.
-    let (opcode, declared) = texture_type8_header(&desc).unwrap_or((0, 0));
-    let view = decode_texture_view_descriptor(&desc).map_err(|reason| {
-        // Dump the full wire blob for an unknown texture-view opcode: this is the
-        // only signal that reveals a new serializer variant (off the hot path —
-        // fires only on a genuine decode failure).
-        let hex: String = desc.iter().map(|b| format!("{b:02x}")).collect();
-        TextureViewDecline::HopDecode {
+        },
+    )?;
+    if resource.entry().kind != ObjectKind::TextureView {
+        return Err(TextureViewDecline::HopObjectNotView {
             texture_ref,
-            opcode,
-            declared,
-            descriptor_len: desc.len(),
-            bytes_hex: hex,
-            reason,
+            object_type: resource.entry().kind,
+        });
+    }
+    let desc = resource.descriptor().as_ref();
+    // Bytes visible before decode, for the len-mismatch / bad-opcode census.
+    let (opcode, declared) = texture_type8_header(desc).unwrap_or((0, 0));
+    let view = match objects::decoded_resource(&resource) {
+        Ok(crate::runtime::decode::resource::Descriptor::TextureView(view)) => view,
+        Err(reason) => {
+            // Dump the full wire blob for an unknown texture-view opcode: this is the
+            // only signal that reveals a new serializer variant (off the hot path —
+            // fires only on a genuine decode failure).
+            let hex: String = desc.iter().map(|b| format!("{b:02x}")).collect();
+            return Err(TextureViewDecline::HopDecode {
+                texture_ref,
+                opcode,
+                declared,
+                descriptor_len: desc.len(),
+                bytes_hex: hex,
+                reason: *reason,
+            });
         }
-    })?;
+        Ok(_) => {
+            return Err(TextureViewDecline::HopDecode {
+                texture_ref,
+                opcode,
+                declared,
+                descriptor_len: desc.len(),
+                bytes_hex: String::new(),
+                reason: crate::runtime::decode::resource::DecodeStatus::ErrUnsupported(
+                    "res_texture_view_semantic_kind",
+                ),
+            });
+        }
+    };
     if view.base_texture_ref == 0 {
         return Err(TextureViewDecline::HopZeroBase {
             texture_ref,
             opcode,
         });
     }
-    note_view_slice_range_dropped(texture_ref, opcode, &view);
+    note_view_slice_range_dropped(texture_ref, opcode, view);
     let level = if view.carries_range() {
         // level_base is a mip index (u64 on wire); reject pathological values.
         if view.level_base > u32::MAX as u64 {
@@ -339,7 +356,7 @@ fn decode_texture_view_hop_reasoned<M: HostMemory + HostOps>(
 /// supplies level / format / swizzle (inner hops only extend the base ref),
 /// matching the product RT path which materializes a single selected level.
 pub(crate) fn resolve_texture_view_reasoned<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     texture_ref: u32,
@@ -388,7 +405,7 @@ pub(crate) fn resolve_texture_view_reasoned<M: HostMemory + HostOps>(
 /// or swizzle selectors are malformed. See [`resolve_texture_view_reasoned`] for
 /// the specific reason on the fail path.
 pub(super) fn resolve_texture_view<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     texture_ref: u32,
@@ -401,7 +418,7 @@ pub(super) fn resolve_texture_view<M: HostMemory + HostOps>(
 /// Three different bugs, and only one of them is this crate's:
 ///
 /// * `BaseUndeclared` — a format the guest's own texture is in that
-///   `contract::pixel_format` has no row for. **Ours.** Nothing about the bind
+///   `reims_vgpu_core::pixel_format` has no row for. **Ours.** Nothing about the bind
 ///   is wrong; this table is short.
 /// * `ViewUndeclared` — the guest named an override this table has no row for.
 ///   Also ours, one argument over.
@@ -614,7 +631,7 @@ impl crate::observe::Decline for LinearLoadRefusal {
 // struct would hide which of them a call site varies.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn load_linear_texture_host<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     texture_ref: u32,
@@ -678,7 +695,6 @@ impl NativeUploads {
     ///
     /// Gated because the only rail that opts into a native upload is the
     /// cross-compiled clippy run is what catches.
-    #[cfg(any(feature = "backend-vulkan", test))]
     pub const BGRA8: Self = Self {
         bgra8: true,
         float16: false,
@@ -733,7 +749,7 @@ pub(crate) fn linear_native_upload_format(
 // wrappers above exist to make obvious.
 #[allow(clippy::too_many_arguments)]
 fn load_linear_texture_impl<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     texture_ref: u32,
@@ -743,14 +759,23 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     site: crate::runtime::render_writeback::SettleSite,
 ) -> Result<(Vec<u8>, SampledByteFormat), LinearLoadRefusal> {
     use LinearLoadRefusal as R;
-    let (_entry, desc_bytes) =
-        objects::resolve_descriptor(state, host, task_id, texture_ref, &[ObjectKind::Texture])
-            .map_err(|rung| match rung {
-                objects::LadderRung::NoListEntry => R::ObjectListMiss,
-                objects::LadderRung::WrongType { got } => R::NotATexture { object_type: got },
-                objects::LadderRung::DescRead { .. } => R::DescriptorUnreadable,
-            })?;
-    let tex = decode_texture_descriptor(&desc_bytes).map_err(|_| R::DescriptorUndecodable)?;
+    let resource = objects::resolve_resource(state, host, task_id, texture_ref).map_err(
+        |rung| match rung {
+            objects::LadderRung::NoListEntry => R::ObjectListMiss,
+            objects::LadderRung::WrongType { got } => R::NotATexture { object_type: got },
+            objects::LadderRung::DescRead { .. } => R::DescriptorUnreadable,
+        },
+    )?;
+    if resource.entry().kind != ObjectKind::Texture {
+        return Err(R::NotATexture {
+            object_type: resource.entry().kind,
+        });
+    }
+    let Ok(crate::runtime::decode::resource::Descriptor::Texture(tex)) =
+        objects::decoded_resource(&resource)
+    else {
+        return Err(R::DescriptorUndecodable);
+    };
     let base_fmt = tex.declared_pixel_format().ok_or(R::NoPixelFormat)?;
     let sample_fmt = effective_view_sample_format(base_fmt, format_override).ok_or(
         R::ViewFormatBppMismatch {
@@ -1004,7 +1029,7 @@ mod texture_view_split_tests {
 
     #[test]
     fn view_pixel_format_override_effective() {
-        use crate::contract::pixel_format::{
+        use reims_vgpu_core::pixel_format::{
             MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_R8_UNORM, MTL_FORMAT_RGBA16_FLOAT,
             MTL_FORMAT_RGBA8_UNORM,
         };
@@ -1045,7 +1070,7 @@ mod texture_view_split_tests {
     /// see `an_integer_texel_is_declared_but_has_no_sampled_rail`.
     #[test]
     fn a_declared_format_clears_the_width_gate_whether_or_not_a_rail_takes_it() {
-        use crate::contract::pixel_format::{
+        use reims_vgpu_core::pixel_format::{
             MTL_FORMAT_R8_UINT, MTL_FORMAT_R8_UNORM, MTL_FORMAT_RGBA8_UNORM,
         };
         assert_eq!(
@@ -1074,7 +1099,7 @@ mod texture_view_split_tests {
     /// the success case to say so.
     #[test]
     fn the_view_gate_names_which_of_its_three_terms_refused() {
-        use crate::contract::pixel_format::{
+        use reims_vgpu_core::pixel_format::{
             MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_R8_UNORM, MTL_FORMAT_RGBA8_UNORM,
         };
         // A value Metal does not define and this table therefore has no row for.
@@ -1220,7 +1245,7 @@ mod texture_view_split_tests {
 
     fn ranged_view(slice_base: u64, slice_count: u64) -> TextureViewDescriptor {
         TextureViewDescriptor {
-            view_opcode: crate::runtime::decode::resource::TEXTURE_VIEW_OPCODE_RANGED,
+            form: reims_vgpu_protocol::TextureViewForm::Ranged,
             base_texture_ref: 9,
             slice_base,
             slice_count,
@@ -1271,7 +1296,7 @@ mod texture_view_split_tests {
             // gate must turn on the opcode alone, not on the words being
             // non-zero.
             &TextureViewDescriptor {
-                view_opcode: crate::runtime::decode::resource::TEXTURE_VIEW_OPCODE_SIMPLE,
+                form: reims_vgpu_protocol::TextureViewForm::Simple,
                 base_texture_ref: 9,
                 slice_base: 5,
                 slice_count: 4,

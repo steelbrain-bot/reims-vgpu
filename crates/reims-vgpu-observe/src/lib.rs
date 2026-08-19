@@ -8,6 +8,7 @@ pub mod emit;
 pub mod footprint;
 pub mod phase_clock;
 pub mod sink;
+pub mod srgb_census;
 
 pub use decline::{Decline, Refusal};
 pub use emit::{first_sight, state_changed, Emit};

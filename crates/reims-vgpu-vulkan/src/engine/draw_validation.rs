@@ -42,8 +42,14 @@ pub enum DrawValidationDecline {
         width: u32,
         height: u32,
     },
-    EmptyVertexSpirv,
-    EmptyFragmentSpirv,
+    MissingVertexProgram,
+    MissingFragmentProgram,
+    VertexProgramUnavailable {
+        id: u64,
+    },
+    FragmentProgramUnavailable {
+        id: u64,
+    },
     NonFiniteViewport,
     NonPositiveViewport {
         width_bits: u32,
@@ -216,8 +222,12 @@ impl Decline for DrawValidationDecline {
             Self::VertexGuestRunsCoverage { .. } => "vk_draw_validate_vertex_guest_runs_coverage",
             Self::StorageGuestRunsCoverage { .. } => "vk_draw_validate_storage_guest_runs_coverage",
             Self::ZeroTargetGeometry { .. } => "vk_draw_validate_zero_target_geometry",
-            Self::EmptyVertexSpirv => "vk_draw_validate_empty_vertex_spirv",
-            Self::EmptyFragmentSpirv => "vk_draw_validate_empty_fragment_spirv",
+            Self::MissingVertexProgram => "vk_draw_validate_missing_vertex_program",
+            Self::MissingFragmentProgram => "vk_draw_validate_missing_fragment_program",
+            Self::VertexProgramUnavailable { .. } => "vk_draw_validate_vertex_program_unavailable",
+            Self::FragmentProgramUnavailable { .. } => {
+                "vk_draw_validate_fragment_program_unavailable"
+            }
             Self::NonFiniteViewport => "vk_draw_validate_non_finite_viewport",
             Self::NonPositiveViewport { .. } => "vk_draw_validate_non_positive_viewport",
             Self::NonFiniteBlendConstants => "vk_draw_validate_non_finite_blend_constants",
@@ -496,8 +506,11 @@ impl Decline for DrawValidationDecline {
                 ("lod_min", f32::from_bits(*lod_min_bits).to_string()),
                 ("lod_max", f32::from_bits(*lod_max_bits).to_string()),
             ],
-            Self::EmptyVertexSpirv
-            | Self::EmptyFragmentSpirv
+            Self::VertexProgramUnavailable { id } | Self::FragmentProgramUnavailable { id } => {
+                vec![("id", id.to_string())]
+            }
+            Self::MissingVertexProgram
+            | Self::MissingFragmentProgram
             | Self::NonFiniteViewport
             | Self::NonFiniteBlendConstants
             | Self::SeedConflictsGuestSeed
@@ -547,8 +560,10 @@ mod tests {
                 width: 0,
                 height: 8,
             },
-            DrawValidationDecline::EmptyVertexSpirv,
-            DrawValidationDecline::EmptyFragmentSpirv,
+            DrawValidationDecline::MissingVertexProgram,
+            DrawValidationDecline::MissingFragmentProgram,
+            DrawValidationDecline::VertexProgramUnavailable { id: 1 },
+            DrawValidationDecline::FragmentProgramUnavailable { id: 2 },
             DrawValidationDecline::NonFiniteViewport,
             DrawValidationDecline::NonPositiveViewport {
                 width_bits: 0.0f32.to_bits(),
@@ -690,7 +705,7 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 50, "the validator's reason census moved");
+        assert_eq!(before, 52, "the validator's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate draw-validation slug");
     }
 

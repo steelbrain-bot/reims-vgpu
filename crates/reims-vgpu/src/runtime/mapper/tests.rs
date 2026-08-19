@@ -76,10 +76,13 @@ fn windows_may_be_queried_out_of_order() {
 /// legitimate write in production.
 #[test]
 fn the_page_witness_sees_a_rewire_no_packet_announced() {
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::model::{DeviceId, SurfaceBackingWalk, PAGE_SHIFT_X86};
     use crate::runtime::host::{FakeHost, HostMemory};
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
 
     let page = 1u64 << PAGE_SHIFT_X86;
     let mut host = FakeHost::new();
@@ -100,18 +103,18 @@ fn the_page_witness_sees_a_rewire_no_packet_announced() {
     st32(&mut pte, (data0 >> PAGE_SHIFT_X86) as u32);
     host.write_gpa(root_gpa, &pte).unwrap();
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     state.define_task(1, page, 2);
     state.map_surface(6);
     {
-        let m = state.mappings.get_mut(&6).unwrap();
-        m.mapped = true;
-        m.page_entries =
+        let m = state.surfaces.mappings.get_mut(&6).unwrap();
+        m.lifecycle.active = true;
+        m.pages.entries =
             vec![(((data0 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
-        m.surface_backing_walk = Some(SurfaceBackingWalk {
+        m.pages.surface_walk = Some(SurfaceBackingWalk {
             task_id: 1,
             backing_pfn: 0,
-            page_generation: m.page_generation,
+            page_generation: m.pages.generation,
         });
     }
     assert!(
@@ -122,11 +125,23 @@ fn the_page_witness_sees_a_rewire_no_packet_announced() {
 
     // The guest re-points the backing. Nothing on the wire says so, and
     // `map_generation` is untouched — which is the whole defect.
-    let generation_before = state.mappings.get(&6).unwrap().map_generation;
+    let generation_before = state
+        .surfaces
+        .mappings
+        .get(&6)
+        .unwrap()
+        .lifecycle
+        .generation;
     st32(&mut pte, (data1 >> PAGE_SHIFT_X86) as u32);
     host.write_gpa(root_gpa, &pte).unwrap();
     assert_eq!(
-        state.mappings.get(&6).unwrap().map_generation,
+        state
+            .surfaces
+            .mappings
+            .get(&6)
+            .unwrap()
+            .lifecycle
+            .generation,
         generation_before,
         "no packet arrived, so nothing bumped the incarnation"
     );
@@ -141,10 +156,10 @@ fn the_page_witness_sees_a_rewire_no_packet_announced() {
     // A latch from a superseded incarnation is not evidence about the list
     // in hand, so it must not be read as drift.
     {
-        let m = state.mappings.get_mut(&6).unwrap();
-        let mut walk = m.surface_backing_walk.unwrap();
-        walk.page_generation = m.page_generation.wrapping_sub(1);
-        m.surface_backing_walk = Some(walk);
+        let m = state.surfaces.mappings.get_mut(&6).unwrap();
+        let mut walk = m.pages.surface_walk.unwrap();
+        walk.page_generation = m.pages.generation.wrapping_sub(1);
+        m.pages.surface_walk = Some(walk);
     }
     assert!(
         super::surface_backing_pages_witness(&state, &host, 6)
@@ -157,10 +172,10 @@ fn the_page_witness_sees_a_rewire_no_packet_announced() {
     // the same list is legitimate again. A witness that only ever refuses
     // would pass the assertion above and lose every frame in production.
     {
-        let m = state.mappings.get_mut(&6).unwrap();
-        let mut walk = m.surface_backing_walk.unwrap();
-        walk.page_generation = m.page_generation;
-        m.surface_backing_walk = Some(walk);
+        let m = state.surfaces.mappings.get_mut(&6).unwrap();
+        let mut walk = m.pages.surface_walk.unwrap();
+        walk.page_generation = m.pages.generation;
+        m.pages.surface_walk = Some(walk);
     }
     st32(&mut pte, (data0 >> PAGE_SHIFT_X86) as u32);
     host.write_gpa(root_gpa, &pte).unwrap();
@@ -186,19 +201,22 @@ fn the_page_witness_sees_a_rewire_no_packet_announced() {
 /// proceeds exactly as before.
 #[test]
 fn a_mapping_with_nothing_to_check_is_not_counted_as_verified() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
     use crate::runtime::host::FakeHost;
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
 
     let host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     state.map_surface(6);
     {
-        let m = state.mappings.get_mut(&6).unwrap();
-        m.mapped = true;
-        m.page_entries = vec![(4u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        let m = state.surfaces.mappings.get_mut(&6).unwrap();
+        m.lifecycle.active = true;
+        m.pages.entries = vec![(4u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
         // No `surface_backing_walk`: nothing ever latched a walk for this mapping.
-        m.surface_backing_walk = None;
+        m.pages.surface_walk = None;
     }
     assert_eq!(
         super::surface_backing_pages_witness(&state, &host, 6),
@@ -208,7 +226,14 @@ fn a_mapping_with_nothing_to_check_is_not_counted_as_verified() {
 
     // An empty list and an absent mapping are their own states, because a
     // single slug would make four different gaps look like one.
-    state.mappings.get_mut(&6).unwrap().page_entries.clear();
+    state
+        .surfaces
+        .mappings
+        .get_mut(&6)
+        .unwrap()
+        .pages
+        .entries
+        .clear();
     assert_eq!(
         super::surface_backing_pages_witness(&state, &host, 6),
         super::SurfaceBackingWitness::Unwitnessed("no_walk"),
@@ -245,10 +270,13 @@ fn a_mapping_with_nothing_to_check_is_not_counted_as_verified() {
 /// nothing at all.
 #[test]
 fn a_page_the_task_cannot_translate_is_not_reported_as_a_move() {
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::model::{DeviceId, SurfaceBackingWalk, PAGE_SHIFT_X86};
     use crate::runtime::host::{FakeHost, HostMemory};
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
 
     crate::observe::redirect_logs_for_tests();
     let page = 1u64 << PAGE_SHIFT_X86;
@@ -268,18 +296,18 @@ fn a_page_the_task_cannot_translate_is_not_reported_as_a_move() {
     st32(&mut pte, (data0 >> PAGE_SHIFT_X86) as u32);
     host.write_gpa(root_gpa, &pte).unwrap();
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     state.define_task(1, page, 2);
     state.map_surface(6);
     {
-        let m = state.mappings.get_mut(&6).unwrap();
-        m.mapped = true;
-        m.page_entries =
+        let m = state.surfaces.mappings.get_mut(&6).unwrap();
+        m.lifecycle.active = true;
+        m.pages.entries =
             vec![(((data0 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
-        m.surface_backing_walk = Some(SurfaceBackingWalk {
+        m.pages.surface_walk = Some(SurfaceBackingWalk {
             task_id: 1,
             backing_pfn: 0,
-            page_generation: m.page_generation,
+            page_generation: m.pages.generation,
         });
     }
     assert!(
@@ -329,10 +357,13 @@ fn a_page_the_task_cannot_translate_is_not_reported_as_a_move() {
 /// last. The single-page test above cannot see this class at all.
 #[test]
 fn a_page_moved_in_the_middle_of_a_run_still_refuses_the_write() {
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::model::{DeviceId, SurfaceBackingWalk, PAGE_SHIFT_X86};
     use crate::runtime::host::{FakeHost, HostMemory};
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
 
     crate::observe::redirect_logs_for_tests();
     const PAGES: usize = 5;
@@ -360,19 +391,19 @@ fn a_page_moved_in_the_middle_of_a_run_still_refuses_the_write() {
         write_pte(&mut host, i, data_pfn(i));
     }
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     state.define_task(1, page, 2);
     state.map_surface(6);
     {
-        let m = state.mappings.get_mut(&6).unwrap();
-        m.mapped = true;
-        m.page_entries = (0..PAGES)
+        let m = state.surfaces.mappings.get_mut(&6).unwrap();
+        m.lifecycle.active = true;
+        m.pages.entries = (0..PAGES)
             .map(|i| (data_pfn(i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
             .collect();
-        m.surface_backing_walk = Some(SurfaceBackingWalk {
+        m.pages.surface_walk = Some(SurfaceBackingWalk {
             task_id: 1,
             backing_pfn: 0,
-            page_generation: m.page_generation,
+            page_generation: m.pages.generation,
         });
     }
     assert_eq!(
@@ -390,7 +421,7 @@ fn a_page_moved_in_the_middle_of_a_run_still_refuses_the_write() {
         panic!("a complete walk with a moved middle page must supply the current backing");
     };
     assert_eq!(
-        crate::contract::iosurface_pages::entry_gpa_shift(entries[2], PAGE_SHIFT_X86),
+        reims_vgpu_paging::geometry::mapper_entry_gpa(entries[2], PAGE_SHIFT_X86),
         Some(u64::from(elsewhere_pfn) << PAGE_SHIFT_X86),
         "the replacement list must include the moved middle page"
     );
@@ -406,23 +437,26 @@ fn a_page_moved_in_the_middle_of_a_run_still_refuses_the_write() {
 /// surface the instant a task went away.
 #[test]
 fn a_walk_that_visits_nothing_is_not_agreement() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::model::{DeviceId, SurfaceBackingWalk, PAGE_SHIFT_X86};
     use crate::runtime::host::FakeHost;
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
 
     crate::observe::redirect_logs_for_tests();
     let host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     // A task id that was never defined: no directory, so nothing to walk.
     state.map_surface(6);
     {
-        let m = state.mappings.get_mut(&6).unwrap();
-        m.mapped = true;
-        m.page_entries = vec![(4u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID; 3];
-        m.surface_backing_walk = Some(SurfaceBackingWalk {
+        let m = state.surfaces.mappings.get_mut(&6).unwrap();
+        m.lifecycle.active = true;
+        m.pages.entries = vec![(4u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID; 3];
+        m.pages.surface_walk = Some(SurfaceBackingWalk {
             task_id: 1,
             backing_pfn: 0,
-            page_generation: m.page_generation,
+            page_generation: m.pages.generation,
         });
     }
     assert_eq!(
@@ -433,11 +467,16 @@ fn a_walk_that_visits_nothing_is_not_agreement() {
 }
 
 use super::*;
-use crate::contract::endian::st32;
-use crate::contract::iosurface_pages::{
-    MAPPING_INTERNAL_BACKPTR, MAPPING_INTERNAL_EXPECTED_SIZE, MAPPING_INTERNAL_ID,
-    MAPPING_INTERNAL_SIZE, PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID,
+use reims_vgpu_core::endian::st32;
+use reims_vgpu_paging::geometry::{
+    MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+    MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
 };
+use reims_vgpu_paging::mapper::{
+    MAPPING_INTERNAL_BACKPTR, MAPPING_INTERNAL_EXPECTED_SIZE, MAPPING_INTERNAL_ID,
+    MAPPING_INTERNAL_SIZE,
+};
+use reims_vgpu_protocol::{MAPPER_REQUEST_MAP, MAPPER_REQUEST_UNMAP};
 
 /// The span is a hull over the *resolvable* entries, in PFN order-independent
 /// fashion, and it must not be fooled by an unsorted list or by an invalid
@@ -471,32 +510,64 @@ fn entry_gpa_span_is_a_hull_over_resolvable_entries() {
 
 #[test]
 fn plan_adoption_decision_incarnation_semantics() {
-    // No condemn: plain pages-changed compare against the live entries.
-    assert_eq!(
-        plan_adoption_decision(None, &[1, 2], &[1, 2]),
-        (false, false, false)
-    );
-    assert_eq!(
-        plan_adoption_decision(None, &[1, 2], &[1, 3]),
-        (true, false, false)
-    );
+    let mut state =
+        crate::model::DeviceState::new(crate::model::DeviceId(1), crate::model::PAGE_SHIFT_X86);
+    state.map_surface(3);
+    state.surfaces.mappings.get_mut(&3).unwrap().pages.entries = vec![1, 2];
+    let unchanged = state
+        .adopt_mapper_surface_plan(
+            reims_vgpu_protocol::SurfaceId::new(3),
+            vec![1, 2],
+            0,
+            0,
+            None,
+        )
+        .unwrap();
+    assert!(!unchanged.pages_changed);
+    assert!(!unchanged.reprieved);
+
+    let changed = state
+        .adopt_mapper_surface_plan(
+            reims_vgpu_protocol::SurfaceId::new(3),
+            vec![1, 3],
+            0,
+            0,
+            None,
+        )
+        .unwrap();
+    assert!(changed.pages_changed);
+    assert!(!changed.reprieved);
+
     // Condemned + identical plan = stale delete reprieve: the SAME
     // incarnation lives on — no bump, no drop (black-band class).
-    assert_eq!(
-        plan_adoption_decision(Some(&[1, 2]), &[], &[1, 2]),
-        (false, false, true)
-    );
+    state.surfaces.mappings.get_mut(&3).unwrap().pages.entries = vec![1, 2];
+    assert!(state.condemn_surface_backing(3));
+    let reprieved = state
+        .adopt_mapper_surface_plan(
+            reims_vgpu_protocol::SurfaceId::new(3),
+            vec![1, 2],
+            0,
+            0,
+            None,
+        )
+        .unwrap();
+    assert!(!reprieved.pages_changed);
+    assert!(reprieved.reprieved);
+
     // Condemned + different plan = the backing really died and the id
     // was re-used: bump + drop the old incarnation's windows.
-    assert_eq!(
-        plan_adoption_decision(Some(&[1, 2]), &[], &[7, 8]),
-        (true, true, false)
-    );
-    // The live (cleared) entries never mask the fingerprint compare.
-    assert_eq!(
-        plan_adoption_decision(Some(&[1, 2]), &[7, 8], &[1, 2]),
-        (false, false, true)
-    );
+    assert!(state.condemn_surface_backing(3));
+    let replaced = state
+        .adopt_mapper_surface_plan(
+            reims_vgpu_protocol::SurfaceId::new(3),
+            vec![7, 8],
+            0,
+            0,
+            None,
+        )
+        .unwrap();
+    assert!(replaced.pages_changed);
+    assert!(!replaced.reprieved);
 }
 
 #[test]
@@ -576,7 +647,7 @@ fn mapper_boundary_preserves_the_iosurface_check_reason() {
         "iosurface_mapper_internal_mapping_id_read"
     );
     assert_eq!(
-        crate::observe::Emit::refusal("mapper_resolve_fail", &status)
+        crate::observe::Emit::refusal("mapper_resolve_fail", &MapperStatusRefusal(&status))
             .unwrap()
             .field("mapping", 4)
             .render(),
@@ -602,10 +673,10 @@ fn put_u64(h: &mut FakeHost, gpa: u64, v: u64) {
 
 #[test]
 fn capture_validates_identity_and_ring() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let ring = 0x7000_0000u64;
-    state.iosfc.ring_base = ring;
+    state.registers.iosfc.ring_base = ring;
 
     // producer=1 → entry 0: MAP mapping_id=7
     let mut entry = [0u8; 16];
@@ -633,7 +704,16 @@ fn capture_validates_identity_and_ring() {
     assert_eq!(cap.producer, 1);
     assert_eq!(cap.mapping_internal, internal);
     assert!(apply_capture(&mut state, &cap, 7));
-    assert_eq!(state.mappings.get(&7).unwrap().mapping_internal, internal);
+    assert_eq!(
+        state
+            .surfaces
+            .mappings
+            .get(&7)
+            .unwrap()
+            .lifecycle
+            .internal_kva,
+        internal
+    );
 }
 
 #[test]
@@ -642,10 +722,10 @@ fn capture_handoff_mismatch_is_fail_visible_and_latched() {
     // the ring (wrong request-type in the xreg) is a genuine capture miss:
     // the mapping never attaches → downstream black. It must return None,
     // latch its reason once (no per-publish flood), and re-arm on clear.
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let ring = 0x7100_0000u64;
-    state.iosfc.ring_base = ring;
+    state.registers.iosfc.ring_base = ring;
 
     // producer=1 → entry 0: MAP mapping_id=9
     let mut entry = [0u8; 16];
@@ -690,8 +770,8 @@ fn capture_handoff_mismatch_is_fail_visible_and_latched() {
 /// test's latch its own whatever the run order.
 ///
 /// Returns `(state, host, page_gpa)`.
-fn span_fixture(pfn: u32) -> (DeviceState, FakeHost, u64) {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+fn span_fixture(pfn: u32) -> (Device, FakeHost, u64) {
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let internal = KVA;
     let mapper = KVA + 0x1000;
@@ -732,7 +812,7 @@ fn span_fixture(pfn: u32) -> (DeviceState, FakeHost, u64) {
     // one page of guest RAM for the surface
     host.map_range(page_gpa, PAGE_SIZE_ARM64E as usize, 0x55);
 
-    state.mapper_device_kva = mapper;
+    state.observe_mapper_device(mapper);
     assert!(state.attach_mapping_internal(3, internal));
     (state, host, page_gpa)
 }
@@ -750,9 +830,9 @@ fn resolve_builds_page_entries() {
     // suite instead of only in a log nobody diffed.
     let cap = crate::observe::sink::FailCapture::start();
     assert!(resolve_mapping_backing(&mut state, &host, 3));
-    let m = state.mappings.get(&3).unwrap();
-    assert_eq!(m.page_entries.len(), 1);
-    assert_eq!(m.page_entries[0], entry);
+    let m = state.surfaces.mappings.get(&3).unwrap();
+    assert_eq!(m.pages.entries.len(), 1);
+    assert_eq!(m.pages.entries[0], entry);
     let span = cap.one("OFF");
     assert!(
         span.contains("mapping_gpa_span mid=3") && span.contains("pages=1"),
@@ -860,20 +940,20 @@ impl crate::runtime::host::HostPageViews for FailingKvaHost {
 }
 
 fn assert_revalidate_error_preserves_cached_page_plan(err: MemError) {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let entry = (0x444u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
     assert!(state.attach_mapping_internal(3, KVA));
     assert!(state.set_mapping_geom(
         3,
         64,
         64,
-        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM
+        reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM
     ));
     {
-        let m = state.mappings.get_mut(&3).unwrap();
-        m.mapped = true;
-        m.page_entries = vec![entry];
-        m.page_table_kva = KVA + 0x3000;
+        let m = state.surfaces.mappings.get_mut(&3).unwrap();
+        m.lifecycle.active = true;
+        m.pages.entries = vec![entry];
+        m.pages.table_kva = KVA + 0x3000;
     }
 
     let host = FailingKvaHost {
@@ -885,9 +965,9 @@ fn assert_revalidate_error_preserves_cached_page_plan(err: MemError) {
         .unwrap_or_default()
         .len();
     assert_eq!(revalidate_mapping_reason(&mut state, &host, 3), None);
-    let m = state.mappings.get(&3).unwrap();
-    assert_eq!(m.page_entries, vec![entry]);
-    assert_eq!(m.page_table_kva, KVA + 0x3000);
+    let m = state.surfaces.mappings.get(&3).unwrap();
+    assert_eq!(m.pages.entries, vec![entry]);
+    assert_eq!(m.pages.table_kva, KVA + 0x3000);
     let log_after = std::fs::read_to_string(crate::observe::fail_log_path()).unwrap_or_default();
     assert!(
         !log_after[log_before..].contains("mapper_revalidate_fallback"),
@@ -912,19 +992,19 @@ fn revalidate_unmapped_read_preserves_cached_page_plan() {
 /// table must not cover (dual-mid Store after mode switch).
 #[test]
 fn pages_cover_geom_false_when_table_shorter_than_span() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     assert!(state.attach_mapping_internal(8, KVA));
     {
-        let m = state.mappings.get_mut(&8).unwrap();
-        m.mapped = true;
+        let m = state.surfaces.mappings.get_mut(&8).unwrap();
+        m.lifecycle.active = true;
         // Stale early resolve: single PAGE_SIZE before geom latched.
-        m.page_entries = vec![0x11; 1];
+        m.pages.entries = vec![0x11; 1];
     }
     assert!(state.set_mapping_geom(
         8,
         1440,
         1080,
-        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM
+        reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM
     ));
     assert!(
         !pages_cover_geom(&state, 8),
@@ -937,19 +1017,19 @@ fn pages_cover_geom_false_when_table_shorter_than_span() {
 
 #[test]
 fn pages_cover_geom_true_for_full_table() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     assert!(state.attach_mapping_internal(3, KVA));
     assert!(state.set_mapping_geom(
         3,
         64,
         64,
-        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM
+        reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM
     ));
     // 64×64 BGRA packed bpr 256 → 16 KiB → 1×16KiB page covers.
     {
-        let m = state.mappings.get_mut(&3).unwrap();
-        m.mapped = true;
-        m.page_entries = vec![0x22; 1];
+        let m = state.surfaces.mappings.get_mut(&3).unwrap();
+        m.lifecycle.active = true;
+        m.pages.entries = vec![0x22; 1];
     }
     assert!(pages_cover_geom(&state, 3));
 }
@@ -968,8 +1048,8 @@ fn pages_cover_geom_true_for_full_table() {
 /// a third of that size.
 #[test]
 fn a_generous_table_cannot_cover_a_window_past_the_wire_allocation() {
-    use crate::contract::endian::{st32, st64};
-    use crate::contract::iosurface_pages::{
+    use reims_vgpu_core::endian::{st32, st64};
+    use reims_vgpu_protocol::{
         DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_BPR, DEVICE_DESC_DIMS, DEVICE_DESC_LEN,
         DEVICE_DESC_PLANE_COUNT,
     };
@@ -985,22 +1065,22 @@ fn a_generous_table_cannot_cover_a_window_past_the_wire_allocation() {
     st32(&mut desc[DEVICE_DESC_BPR..], 64);
     desc[DEVICE_DESC_PLANE_COUNT] = 0;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     assert!(state.attach_mapping_internal(9, KVA));
     assert!(state.set_mapping_device_desc(9, &desc));
     assert!(state.set_mapping_geom(
         9,
         1024,
         1024,
-        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM
+        reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM
     ));
     {
-        let m = state.mappings.get_mut(&9).unwrap();
-        m.mapped = true;
+        let m = state.surfaces.mappings.get_mut(&9).unwrap();
+        m.lifecycle.active = true;
         // 256 × 16 KiB = 4 MiB, exactly the packed 1024² BGRA span, so a
         // fallback to `sample_window` would compare 4 MiB against 4 MiB and
         // pass.
-        m.page_entries = vec![0x33; 256];
+        m.pages.entries = vec![0x33; 256];
     }
     assert!(
         !pages_cover_geom(&state, 9),
@@ -1012,18 +1092,18 @@ fn a_generous_table_cannot_cover_a_window_past_the_wire_allocation() {
 /// desktop dual-mid, not tile size alone.
 #[test]
 fn pages_cover_geom_249_tile_fits_in_sixteen_16k_pages() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     assert!(state.attach_mapping_internal(8, KVA));
     {
-        let m = state.mappings.get_mut(&8).unwrap();
-        m.mapped = true;
-        m.page_entries = vec![0x11; 16];
+        let m = state.surfaces.mappings.get_mut(&8).unwrap();
+        m.lifecycle.active = true;
+        m.pages.entries = vec![0x11; 16];
     }
     assert!(state.set_mapping_geom(
         8,
         249,
         249,
-        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM
+        reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM
     ));
     assert!(
         pages_cover_geom(&state, 8),
@@ -1033,9 +1113,9 @@ fn pages_cover_geom_249_tile_fits_in_sixteen_16k_pages() {
 
 #[test]
 fn render_pages_reject_known_device_and_task_control_pages() {
-    let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
-    state.gfx.root_page = 0x120;
-    state.child_rings[2].page_gpas = vec![0x330_000];
+    let mut state = Device::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
+    state.registers.gfx.root_page = 0x120;
+    state.scheduling.child_rings[2].page_gpas = vec![0x330_000];
     state.define_task(1, 0x4000_0000, 0x440);
     assert!(state.set_object_list(1, 0x550, 1024));
 
@@ -1064,11 +1144,11 @@ fn render_pages_reject_known_device_and_task_control_pages() {
 /// the bound is the guest's own number rather than a chosen one.
 #[test]
 fn the_main_fifo_is_probed_over_every_page_the_guest_declared() {
-    let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
     let page = 1u64 << crate::model::PAGE_SHIFT_X86;
-    state.gfx.fifo_base_page = 0x220;
+    state.registers.gfx.fifo_base_page = 0x220;
     // Four pages of ring, which is what the guest's own length says.
-    state.gfx.fifo_length = (4 * page) as u32;
+    state.registers.gfx.fifo_length = (4 * page) as u32;
     let base = 0x220u64 << crate::model::PAGE_SHIFT_X86;
 
     for i in 0..4u64 {
@@ -1092,7 +1172,7 @@ fn the_main_fifo_is_probed_over_every_page_the_guest_declared() {
     );
     // A declared length of zero still guards the base page itself, so a
     // ring the guest has based but not yet sized is not a hole.
-    state.gfx.fifo_length = 0;
+    state.registers.gfx.fifo_length = 0;
     assert_eq!(
         first_control_page_collision(&state, &[base]),
         Some((base, "root_fifo"))
@@ -1111,7 +1191,7 @@ fn the_main_fifo_is_probed_over_every_page_the_guest_declared() {
 /// compare are guest-physical by construction; this one is not.
 #[test]
 fn an_object_list_gva_is_not_compared_against_surface_physical_pages() {
-    let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
     state.define_task(1, 0x4000_0000, 0x440);
     assert!(state.set_object_list(1, 0x550, 1024));
 
@@ -1140,11 +1220,11 @@ fn an_object_list_gva_is_not_compared_against_surface_physical_pages() {
 /// flat "collect every control page then sort" would silently lose.
 #[test]
 fn a_surface_colliding_with_several_control_structures_names_the_first() {
-    let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
-    state.gfx.root_page = 0x120;
-    state.gfx.fifo_base_page = 0x220;
-    state.iosfc.ring_base = 0x300_000;
-    state.child_rings[2].page_gpas = vec![0x330_000];
+    let mut state = Device::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
+    state.registers.gfx.root_page = 0x120;
+    state.registers.gfx.fifo_base_page = 0x220;
+    state.registers.iosfc.ring_base = 0x300_000;
+    state.scheduling.child_rings[2].page_gpas = vec![0x330_000];
     state.define_task(1, 0x4000_0000, 0x440);
     state.define_task(2, 0x4000_0000, 0x660);
 
@@ -1155,22 +1235,22 @@ fn a_surface_colliding_with_several_control_structures_names_the_first() {
         first_control_page_collision(&state, &all),
         Some((0x120_000, "gfx_root"))
     );
-    state.gfx.root_page = 0;
+    state.registers.gfx.root_page = 0;
     assert_eq!(
         first_control_page_collision(&state, &all),
         Some((0x220_000, "root_fifo"))
     );
-    state.gfx.fifo_base_page = 0;
+    state.registers.gfx.fifo_base_page = 0;
     assert_eq!(
         first_control_page_collision(&state, &all),
         Some((0x300_000, "iosfc_ring"))
     );
-    state.iosfc.ring_base = 0;
+    state.registers.iosfc.ring_base = 0;
     assert_eq!(
         first_control_page_collision(&state, &all),
         Some((0x330_000, "child_fifo"))
     );
-    state.child_rings[2].page_gpas.clear();
+    state.scheduling.child_rings[2].page_gpas.clear();
     assert_eq!(
         first_control_page_collision(&state, &all),
         Some((0x440_000, "task_directory"))

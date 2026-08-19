@@ -4,7 +4,7 @@
 //! latches the first typed refusal so later dispatches cannot escape a failed
 //! sequencing region.
 
-use crate::model::DeviceState;
+use crate::runtime::Device;
 
 use crate::runtime::compute_exec::{ComputeAccum, ComputeStatus};
 use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
@@ -17,14 +17,12 @@ pub enum SequencingBlock {
     IndirectCommandBuffer,
 }
 
-#[cfg(feature = "backend-vulkan")]
 pub struct ComputeSession {
     pub control_depth: i32,
 }
 
 impl ComputeSession {
     pub fn open(dispatch_type: u32) -> Result<Self, ComputeStatus> {
-        #[cfg(feature = "backend-vulkan")]
         {
             let _ = dispatch_type;
             Err(ComputeStatus::Unsupported("compute_session_unimplemented"))
@@ -33,12 +31,11 @@ impl ComputeSession {
 
     pub fn encode_control<M: HostMemory + HostOps>(
         &mut self,
-        state: &DeviceState,
+        state: &Device,
         host: &M,
         task_id: u32,
         cmd: &ComputeCommand,
     ) -> ComputeStatus {
-        #[cfg(feature = "backend-vulkan")]
         {
             let _ = (state, host, task_id, cmd);
             ComputeStatus::Unsupported("compute_control_flow_unimplemented")
@@ -47,7 +44,7 @@ impl ComputeSession {
 
     pub fn encode_icb<M: HostMemory + HostOps>(
         &mut self,
-        state: &mut DeviceState,
+        state: &mut Device,
         host: &mut M,
         task_id: u32,
         cmd: &ComputeCommand,
@@ -56,7 +53,6 @@ impl ComputeSession {
         if cmd.indirect_command_buffer_ref == 0 {
             return ComputeStatus::MissingBuffer("compute_icb_ref_zero");
         }
-        #[cfg(feature = "backend-vulkan")]
         {
             let _ = (state, host, task_id, cmd, acc);
             ComputeStatus::Unsupported("compute_icb_execute_unimplemented")
@@ -68,10 +64,9 @@ impl ComputeSession {
     pub fn finish<M: HostMemory + HostOps>(
         self,
         host: &mut M,
-        state: &mut DeviceState,
+        state: &mut Device,
         task_id: u32,
     ) -> ComputeStatus {
-        #[cfg(feature = "backend-vulkan")]
         {
             let _ = (host, state, task_id);
             ComputeStatus::Ok
@@ -107,7 +102,7 @@ pub fn ensure_session(
 }
 
 pub fn apply_sequencing<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     cmd: &ComputeCommand,
@@ -160,7 +155,7 @@ pub fn apply_sequencing<M: HostMemory + HostOps>(
 /// Finish an open session at compute-segment end (no-op if none).
 pub fn finish_session<M: HostMemory + HostOps>(
     session: &mut Option<ComputeSession>,
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
 ) -> Option<ComputeStatus> {
@@ -179,7 +174,7 @@ mod tests {
     #[test]
     fn icb_latches_sequencing_block() {
         let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let mut seg = ComputeSegment::default();
         let cmd = ComputeCommand {
             kind: Kind::ExecuteCommandsInBuffer,

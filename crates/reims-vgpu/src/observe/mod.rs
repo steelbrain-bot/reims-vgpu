@@ -63,6 +63,7 @@
 //! poll, a genuinely-unbound `ref==0`). Those flood the log.
 
 pub mod ladder;
+pub(crate) mod model;
 pub mod panic;
 pub use reims_vgpu_observe::{decline, driver_watch, emit, footprint, phase_clock, sink};
 

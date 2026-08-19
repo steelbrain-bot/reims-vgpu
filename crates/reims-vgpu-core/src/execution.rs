@@ -15,7 +15,7 @@ use reims_vgpu_protocol::SubmissionIdentity;
 pub enum ResolvedCommand<Draw, Compute> {
     Draw(Draw),
     Compute(Compute),
-    Blit(ResolvedBlit),
+    Blit(Box<ResolvedBlit>),
     ResourceState(ResolvedResourceState),
 }
 
@@ -218,7 +218,7 @@ pub fn execute_resolved_submission<Draw, Compute, DrawOutput, ComputeOutput, Err
                 )
             }
             ResolvedCommand::Blit(command) => {
-                let execution = blit(command)?;
+                let execution = blit(*command)?;
                 CommandExecution::new(
                     ExecutionOutput::Blit(execution.output),
                     execution.gpu_materialized,
@@ -267,10 +267,10 @@ mod tests {
             context: context.clone(),
             command_buffer: ResolvedCommandBuffer::new(vec![
                 ResolvedCommand::Draw(41),
-                ResolvedCommand::Blit(ResolvedBlit::Copy {
+                ResolvedCommand::Blit(Box::new(ResolvedBlit::Copy {
                     source: range(1),
                     destination: range(2),
-                }),
+                })),
                 ResolvedCommand::Compute(43),
             ]),
         };

@@ -1091,7 +1091,6 @@ dependencies = [
 name = "reims-vgpu"
 version = "0.1.0"
 dependencies = [
- "ash",
  "ash-window",
  "cc",
  "libc",
@@ -1120,6 +1119,7 @@ name = "reims-vgpu-core"
 version = "0.1.0"
 dependencies = [
  "reims-vgpu-memory",
+ "reims-vgpu-observe",
  "reims-vgpu-paging",
  "reims-vgpu-protocol",
 ]

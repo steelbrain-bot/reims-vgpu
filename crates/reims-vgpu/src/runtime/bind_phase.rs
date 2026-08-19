@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use crate::observe::phase_clock::{charge_ns, to_us};
-use crate::runtime::spirv_bind::ReflectedBufferAccess;
+use reims_vgpu_core::ReflectedBufferAccess;
 
 /// The parts of the bind phase that are worth telling apart.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

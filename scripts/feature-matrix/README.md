@@ -8,7 +8,7 @@ The same feature set uses MoltenVK on macOS and a native Vulkan ICD on Linux:
 
 | Pathway | Feature set | Host |
 |---|---|---|
-| Vulkan / MoltenVK | `--no-default-features --features backend-vulkan,host-window` | macOS |
+| Vulkan / MoltenVK | `--no-default-features --features host-window` | macOS |
 | Vulkan / native | same | Linux |
 
 `vendor/qemu/hw/display/meson.build` always builds that feature set. The matrix checks all targets,

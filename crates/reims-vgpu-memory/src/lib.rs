@@ -192,6 +192,22 @@ pub struct GuestPageTarget {
     pub format: reims_vgpu_protocol::StorageImageFormat,
 }
 
+/// Topology-independent shape of a GPU landing into guest pages.
+///
+/// Padded rows require texel rectangles so padding remains untouched. Dense
+/// rows may be detiled once and scattered as bytes. Both variants describe the
+/// same guest-visible write; host topology and import capability may choose how
+/// the executor materializes the declared operation, never which bytes exist.
+#[derive(Clone, Copy, Debug)]
+pub enum GuestPageTransferPlan {
+    PitchedRectangles {
+        geometry: reims_vgpu_paging::regions::WindowGeometry,
+    },
+    DenseScatter {
+        window_bytes: u64,
+    },
+}
+
 impl GuestPageTarget {
     pub fn extent_end(&self) -> u64 {
         let rows_before = u64::from(self.height.saturating_sub(1));
@@ -221,15 +237,89 @@ impl GuestPageTarget {
     pub fn rows_are_dense(&self) -> bool {
         self.pitch_bytes() == u64::from(self.width) * self.format.bytes_per_texel() as u64
     }
+
+    pub fn transfer_plan(&self) -> GuestPageTransferPlan {
+        if self.rows_are_dense() {
+            GuestPageTransferPlan::DenseScatter {
+                window_bytes: self.window_bytes(),
+            }
+        } else {
+            GuestPageTransferPlan::PitchedRectangles {
+                geometry: self.geometry(),
+            }
+        }
+    }
 }
 
 /// One stretch of a [`GuestRunSource`]'s requested window, clipped to it.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct WindowStretch<'a> {
     pub guest: &'a GuestRef,
     pub skip: u64,
     pub window_offset: u64,
     pub len: u64,
+}
+
+/// Allocation-free iterator over the checked stretches of one source window.
+#[derive(Clone, Debug)]
+pub struct WindowStretches<'a> {
+    runs: std::slice::Iter<'a, GuestWindowRun>,
+    source_offset: u64,
+    wanted_end: u64,
+}
+
+impl<'a> Iterator for WindowStretches<'a> {
+    type Item = WindowStretch<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for run in self.runs.by_ref() {
+            let run_end = run.window_offset.checked_add(run.guest.requested())?;
+            let start = run.window_offset.max(self.source_offset);
+            let end = run_end.min(self.wanted_end);
+            if start >= end {
+                continue;
+            }
+            return Some(WindowStretch {
+                guest: &run.guest,
+                skip: start - run.window_offset,
+                window_offset: start - self.source_offset,
+                len: end - start,
+            });
+        }
+        None
+    }
+}
+
+/// Topology-independent read shape for one bounded guest window.
+///
+/// `GpuVisible` means checked guest references tile the complete logical
+/// window. A capable executor may bind the exact direct stretch or gather the
+/// complete iterator. `CpuOnly` preserves the stable host-run path when no
+/// checked import view exists; it is a transport distinction, not a content or
+/// lifecycle decision.
+#[derive(Clone, Debug)]
+pub enum GuestReadTransferPlan<'a> {
+    CpuOnly,
+    GpuVisible {
+        direct: Option<WindowStretch<'a>>,
+        stretches: WindowStretches<'a>,
+    },
+}
+
+impl<'a> GuestReadTransferPlan<'a> {
+    pub fn direct(&self) -> Option<WindowStretch<'a>> {
+        match self {
+            Self::GpuVisible { direct, .. } => *direct,
+            Self::CpuOnly => None,
+        }
+    }
+
+    pub fn stretches(&self) -> Option<WindowStretches<'a>> {
+        match self {
+            Self::GpuVisible { stretches, .. } => Some(stretches.clone()),
+            Self::CpuOnly => None,
+        }
+    }
 }
 
 impl GuestRunSource {
@@ -256,23 +346,38 @@ impl GuestRunSource {
 
     /// Every checked guest stretch touched by this source window, in window
     /// order. Returned lengths tile `total_len` when the source is valid.
-    pub fn window_stretches(&self) -> Option<impl Iterator<Item = WindowStretch<'_>> + '_> {
+    pub fn window_stretches(&self) -> Option<WindowStretches<'_>> {
         let pages = self.pages.as_ref()?;
         let wanted_end = self.source_offset.checked_add(self.total_len)?;
-        Some(pages.iter().filter_map(move |run| {
-            let run_end = run.window_offset.checked_add(run.guest.requested())?;
-            let start = run.window_offset.max(self.source_offset);
-            let end = run_end.min(wanted_end);
-            if start >= end {
-                return None;
+        Some(WindowStretches {
+            runs: pages.iter(),
+            source_offset: self.source_offset,
+            wanted_end,
+        })
+    }
+
+    /// Classify the complete window once for every executor consumer.
+    pub fn transfer_plan(&self) -> GuestReadTransferPlan<'_> {
+        let Some(stretches) = self.window_stretches() else {
+            return GuestReadTransferPlan::CpuOnly;
+        };
+        let mut expected = 0u64;
+        for stretch in stretches.clone() {
+            if stretch.window_offset != expected {
+                return GuestReadTransferPlan::CpuOnly;
             }
-            Some(WindowStretch {
-                guest: &run.guest,
-                skip: start - run.window_offset,
-                window_offset: start - self.source_offset,
-                len: end - start,
-            })
-        }))
+            let Some(next) = expected.checked_add(stretch.len) else {
+                return GuestReadTransferPlan::CpuOnly;
+            };
+            expected = next;
+        }
+        if expected != self.total_len {
+            return GuestReadTransferPlan::CpuOnly;
+        }
+        GuestReadTransferPlan::GpuVisible {
+            direct: self.single_stretch(),
+            stretches,
+        }
     }
 }
 
@@ -1315,6 +1420,35 @@ mod tests {
             .map(|stretch| (stretch.skip, stretch.window_offset, stretch.len))
             .collect();
         assert_eq!(stretches, vec![(0x800, 0, 0x800), (0, 0x800, 0x1000)]);
+        let plan = source.transfer_plan();
+        assert!(plan.direct().is_none());
+        assert_eq!(
+            plan.stretches()
+                .expect("the checked pages tile the window")
+                .map(|stretch| stretch.len)
+                .sum::<u64>(),
+            source.total_len
+        );
+    }
+
+    #[test]
+    fn a_read_transfer_plan_refuses_partial_checked_coverage_to_the_gpu() {
+        let import = std::sync::Arc::new(import(0x4000, 0x1000));
+        let source = GuestRunSource {
+            runs: std::sync::Arc::new(vec![GuestRun {
+                host_ptr: 0x7f00_0000_0000,
+                len: 0x1800,
+            }]),
+            source_offset: 0,
+            total_len: 0x1800,
+            row_length_texels: 0,
+            pages: Some(std::sync::Arc::new(vec![window_run(&import, 0, 0, 0x1000)])),
+        };
+
+        assert!(matches!(
+            source.transfer_plan(),
+            GuestReadTransferPlan::CpuOnly
+        ));
     }
 
     #[test]
@@ -1333,6 +1467,20 @@ mod tests {
         assert_eq!(target.window_bytes(), 0x40);
         assert!(!target.rows_are_dense());
         assert_eq!(target.geometry().pitch_bytes, 32);
+        assert!(matches!(
+            target.transfer_plan(),
+            GuestPageTransferPlan::PitchedRectangles { geometry }
+                if geometry.pitch_bytes == 32
+        ));
+
+        let dense = GuestPageTarget {
+            row_length_texels: 4,
+            ..target
+        };
+        assert!(matches!(
+            dense.transfer_plan(),
+            GuestPageTransferPlan::DenseScatter { window_bytes: 0x40 }
+        ));
     }
 
     #[test]

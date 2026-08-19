@@ -4,8 +4,10 @@
 //! Apple host routine reconstructs an `MTLTextureDescriptor` and returns the
 //! device's `MTLSizeAndAlign` as two little-endian `u64`s.
 
-use crate::contract::endian::{ld32, ld64, st64};
+use reims_vgpu_core::endian::{ld32, ld64, st64};
 use reims_vgpu_wire::ops::texture as wire;
+
+pub use reims_vgpu_protocol::TextureDeclaration as TextureDescriptor;
 
 pub const REQUEST_HEADER_LEN: usize = 24;
 pub const REPLY_LEN: usize = 16;
@@ -25,37 +27,6 @@ pub const TEXTURE_BODY_LEN: usize = wire::TEXTURE_DESCRIPTOR_LEN;
 /// body has an opcode of its own; see
 /// [`crate::runtime::decode::resource::decode_heap_texture`].
 pub const WIDE_TEXTURE_BODY_LEN: usize = wire::WIDE_TEXTURE_DESCRIPTOR_LEN;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TextureDescriptor {
-    pub texture_type: u8,
-    pub framebuffer_only: bool,
-    pub is_drawable: bool,
-    pub allow_gpu_optimized_contents: bool,
-    /// `MTLTextureUsage` mask. Eight bits of the packed word on the narrow
-    /// body and a field of its own on the wide one, so it is held at the wider
-    /// of the two — narrowing it here would drop any bit above 7 that a wide
-    /// descriptor sets.
-    pub usage: u32,
-    pub pixel_format: u16,
-    pub width: u32,
-    pub height: u32,
-    pub depth: u32,
-    pub mipmap_level_count: u16,
-    pub sample_count: u16,
-    pub array_length: u16,
-    pub resource_options: u16,
-    pub protection_options: u64,
-    /// `MTLTextureSwizzleChannels` as four raw `MTLTextureSwizzle` ordinals in
-    /// red, green, blue, alpha order — the same encoding the type-8 swizzle
-    /// view carries, so [`crate::contract::pixel_format::swizzle_plan`] reads
-    /// both.
-    ///
-    /// `None` on the narrow body, which has no such field at all. That is not
-    /// the same as the identity: a reader must not turn an absent swizzle into
-    /// a present one.
-    pub swizzle: Option<[u8; 4]>,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Request {
@@ -91,7 +62,6 @@ pub enum QueryError {
     UnknownPixelFormat,
     UnknownUsage,
     UnknownResourceOptions,
-    UnsupportedProtectionOptions,
     HostRequirementsUnavailable,
     ZeroRequirement,
     /// The request names a task id that resolves to no active task, so there is
@@ -123,7 +93,6 @@ impl crate::observe::Decline for QueryError {
             Self::UnknownPixelFormat => "heap_query_unknown_pixel_format",
             Self::UnknownUsage => "heap_query_unknown_usage",
             Self::UnknownResourceOptions => "heap_query_unknown_resource_options",
-            Self::UnsupportedProtectionOptions => "heap_query_unsupported_protection_options",
             Self::HostRequirementsUnavailable => "heap_query_host_requirements_unavailable",
             Self::ZeroRequirement => "heap_query_zero_requirement",
             Self::BadTask => "heap_query_bad_task",
@@ -173,40 +142,16 @@ pub fn decode_request(payload: &[u8]) -> Result<Request, QueryError> {
 /// paths from drifting.
 ///
 /// Read through `reims_vgpu_wire`'s view rather than at offsets restated here,
-/// so a field this device names is the field Apple's bytes derived. Two of the
-/// names below are this device's reading and not the wire crate's:
-/// `framebuffer_only` and `is_drawable` are `packed[5:4]`, which that crate
-/// carries as `unidentified_flags` because neither is an `MTLTextureDescriptor`
-/// property and no perturbation has moved either. They read 0 on every fixture.
+/// so a field this device names is the field Apple's bytes derived. The two
+/// private flag bits and trailing 64-bit member stay unidentified because no
+/// controlled property perturbation established their public meaning.
 pub fn decode_serialized_texture_descriptor(body: &[u8]) -> Result<TextureDescriptor, QueryError> {
     if body.len() != TEXTURE_BODY_LEN {
         return Err(QueryError::BadDescriptorLength);
     }
     let d: &wire::TextureDescriptorBody =
         reims_vgpu_wire::view(body).map_err(|_| QueryError::BadDescriptorLength)?;
-    let packed = d.packed.get();
-    Ok(TextureDescriptor {
-        texture_type: d.texture_type(),
-        framebuffer_only: packed & (1 << 4) != 0,
-        is_drawable: packed & (1 << 5) != 0,
-        allow_gpu_optimized_contents: d.allow_gpu_optimized_contents(),
-        usage: d.usage() as u32,
-        pixel_format: d.pixel_format(),
-        width: d.width.get(),
-        height: d.height.get(),
-        depth: d.depth.get(),
-        mipmap_level_count: d.mipmap_level_count.get(),
-        sample_count: d.sample_count.get(),
-        array_length: d.array_length.get(),
-        resource_options: d.resource_options.get(),
-        // The wire crate calls this word `unidentified_u64` and has moved it in
-        // no capture. `protection_options` is this device's ported reading of
-        // it; `query_size_and_align` refuses a non-zero one rather than acting
-        // on the name, which is the only safe thing to do with a field whose
-        // meaning nothing has confirmed.
-        protection_options: d.unidentified_u64.get(),
-        swizzle: None,
-    })
+    Ok(reims_vgpu_protocol::texture_declaration_from_narrow(d))
 }
 
 /// Decode the 40-byte wide `PGSerializedTextureDescriptor` body.
@@ -226,31 +171,7 @@ pub fn decode_wide_serialized_texture_descriptor(
     }
     let d: &wire::WideTextureDescriptorBody =
         reims_vgpu_wire::view(body).map_err(|_| QueryError::BadDescriptorLength)?;
-    Ok(TextureDescriptor {
-        texture_type: d.texture_type(),
-        // The same two bits the narrow form carries. Bit 7 is a third flag that
-        // exists only here — the narrow serializer never writes it — and it is
-        // unnamed in both crates, so it is not read.
-        framebuffer_only: d.type_and_flags & (1 << 4) != 0,
-        is_drawable: d.type_and_flags & (1 << 5) != 0,
-        allow_gpu_optimized_contents: d.allow_gpu_optimized_contents(),
-        usage: d.usage.get(),
-        pixel_format: d.pixel_format.get(),
-        width: d.width.get(),
-        height: d.height.get(),
-        depth: d.depth.get(),
-        mipmap_level_count: d.mipmap_level_count.get(),
-        sample_count: d.sample_count.get(),
-        array_length: d.array_length.get(),
-        resource_options: d.resource_options.get(),
-        protection_options: d.unidentified_u64.get(),
-        swizzle: Some([
-            d.swizzle_red,
-            d.swizzle_green,
-            d.swizzle_blue,
-            d.swizzle_alpha,
-        ]),
-    })
+    Ok(reims_vgpu_protocol::texture_declaration_from_wide(d))
 }
 
 pub fn query_size_and_align(_desc: &TextureDescriptor) -> Result<SizeAndAlign, QueryError> {
@@ -281,8 +202,7 @@ mod tests {
             request.descriptor,
             TextureDescriptor {
                 texture_type: 2,
-                framebuffer_only: false,
-                is_drawable: false,
+                unidentified_flags: 0,
                 allow_gpu_optimized_contents: true,
                 usage: 3,
                 pixel_format: 125,
@@ -293,7 +213,7 @@ mod tests {
                 sample_count: 1,
                 array_length: 1,
                 resource_options: 0x20,
-                protection_options: 0,
+                unidentified_u64: 0,
                 // The narrow body has no swizzle field at all. `None` rather
                 // than the identity: see [`TextureDescriptor::swizzle`].
                 swizzle: None,

@@ -6,9 +6,12 @@
 //! harder half to find.
 
 use super::*;
-use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
 use crate::runtime::host::FakeHost;
+use reims_vgpu_paging::geometry::{
+    MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+    MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+};
 
 /// `mapping_geom_window` puts each measurement in the field of its own name.
 ///
@@ -24,19 +27,16 @@ use crate::runtime::host::FakeHost;
 /// field holds what.
 #[test]
 fn the_surface_window_names_which_measurement_is_which() {
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mid = 30u32;
     state.map_surface(mid);
     {
-        let m = state.mappings.get_mut(&mid).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.map_generation = 1;
-        m.has_geom = true;
-        m.width = 4;
-        m.height = 4;
-        m.format = MTL_FORMAT_BGRA8_UNORM;
+        let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.lifecycle.generation = 1;
+        m.publish_geometry_for_test(4, 4, MTL_FORMAT_BGRA8_UNORM);
     }
     let rect = Rect {
         origin_x: 0,
@@ -80,7 +80,6 @@ fn the_surface_window_names_which_measurement_is_which() {
 /// `bpr * height`. A plan that rounded up to the row pitch would hand the GPU
 /// write access to a page past the surface on every flush of a padded layout,
 /// and the guest owns whatever is in it.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_tight_window_names_the_pages_its_texels_occupy() {
     // 1920x1080 BGRA8, tight, starting at offset 0 of a 4 KiB-page guest.
@@ -105,7 +104,6 @@ fn a_tight_window_names_the_pages_its_texels_occupy() {
 /// mapping offset as its `bufferOffset` would land the frame `first_page *
 /// page_size` bytes early — off the front of the reference entirely for any
 /// surface past the first page.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_window_starting_inside_a_page_carries_the_offset_and_not_the_mapping_one() {
     let (page, bpr) = (4096u64, 256 * 4u32);
@@ -121,7 +119,6 @@ fn a_window_starting_inside_a_page_carries_the_offset_and_not_the_mapping_one() 
 /// Page shift is explicit, so the same window plans differently on the two
 /// guests. A helper that assumed 4 KiB would name four times too many pages
 /// on arm64 and expose three quarters of a surface it was never asked for.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn the_same_window_spans_fewer_pages_on_a_sixteen_kilobyte_guest() {
     let bpr = 1024 * 4u32;
@@ -137,7 +134,6 @@ fn the_same_window_spans_fewer_pages_on_a_sixteen_kilobyte_guest() {
 /// `bufferRowLength` is. The inter-row bytes are never named, so the guest's
 /// own content in the padding survives the flush — matching the copying
 /// rail, which writes row by row and skips it too.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_padded_pitch_becomes_a_row_length_in_texels() {
     let bpr = 2048 * 4u32;
@@ -165,10 +161,9 @@ fn a_padded_pitch_becomes_a_row_length_in_texels() {
 /// with no refusal anywhere. Both spellings are asserted from one byte pitch,
 /// because the defect is the *relation* between them and either one alone reads
 /// as correct.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_pitch_resolves_to_the_destinations_own_texels() {
-    use crate::contract::pixel_format::RGBA16F_BPP;
+    use reims_vgpu_core::pixel_format::RGBA16F_BPP;
     // One tightly-packed row of 256 half-float RGBA texels.
     let bpr = 256 * RGBA16F_BPP;
     let span = u64::from(bpr) * 4;
@@ -202,7 +197,6 @@ fn a_pitch_resolves_to_the_destinations_own_texels() {
 /// `bufferRowLength` is counted in texels; a copy submitted with either one
 /// wrong is undefined behaviour, not a misplaced frame, so neither may be
 /// silently repaired.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_geometry_the_copy_cannot_express_declines_by_name() {
     // A row pitch that is not a whole number of texels.
@@ -261,7 +255,6 @@ fn a_geometry_the_copy_cannot_express_declines_by_name() {
 /// The `assert_ne!`s are the regression. What must never come back is two
 /// records that a `reason=` ranking cannot tell apart — whichever field
 /// carries the difference.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_refused_page_list_does_not_report_itself_as_a_host_without_the_import() {
     use crate::observe::Decline;
@@ -339,7 +332,7 @@ fn a_rect_taller_than_its_window_is_refused_on_both_storage_shapes() {
     const BPR: u32 = W * 4;
 
     for packed in [true, false] {
-        let mut state = DeviceState::new(DeviceId(3), PAGE_SHIFT_X86);
+        let mut state = Device::new(DeviceId(3), PAGE_SHIFT_X86);
         let mut host = FakeHost::new();
         host.strict_linux_map = !packed;
         let base_pfn = 0x60u32;
@@ -355,9 +348,9 @@ fn a_rect_taller_than_its_window_is_refused_on_both_storage_shapes() {
             .collect();
         state.map_surface(5);
         state.attach_mapping_internal(5, 0);
-        let m = state.mappings.get_mut(&5).unwrap();
-        m.mapping_internal = 1;
-        m.page_entries = entries;
+        let m = state.surfaces.mappings.get_mut(&5).unwrap();
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = entries;
 
         // The window is one page: 64 rows of 64 bytes. The rect asks for 80.
         let span_end = PAGE;
@@ -421,7 +414,7 @@ fn a_writeback_lands_every_row_at_its_own_offset() {
 
     for packed in [true, false] {
         for format in [MTL_FORMAT_BGRA8_UNORM, pixel_format::MTL_FORMAT_RGBA8_UNORM] {
-            let mut state = DeviceState::new(DeviceId(2), PAGE_SHIFT_X86);
+            let mut state = Device::new(DeviceId(2), PAGE_SHIFT_X86);
             let mut host = FakeHost::new();
             host.strict_linux_map = !packed;
             let base_pfn = 0x40u32;
@@ -437,9 +430,9 @@ fn a_writeback_lands_every_row_at_its_own_offset() {
                 .collect();
             state.map_surface(4);
             state.attach_mapping_internal(4, 0);
-            let m = state.mappings.get_mut(&4).unwrap();
-            m.mapping_internal = 1;
-            m.page_entries = entries;
+            let m = state.surfaces.mappings.get_mut(&4).unwrap();
+            m.lifecycle.internal_kva = 1;
+            m.pages.entries = entries;
             assert!(state.set_mapping_geom(4, W, H, format));
 
             // Row y is filled with the byte y in every channel, so a row
@@ -495,15 +488,15 @@ fn a_writeback_refused_because_the_geometry_moved_says_so_by_name() {
     use crate::model::PAGE_SHIFT_X86;
     const PAGE: u64 = 1 << PAGE_SHIFT_X86;
 
-    let mut state = DeviceState::new(DeviceId(3), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(3), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     let base_pfn = 0x40u32;
     host.map_range((base_pfn as u64) << PAGE_SHIFT_X86, 8 * PAGE as usize, 0x55);
     state.map_surface(4);
     state.attach_mapping_internal(4, 0);
-    let m = state.mappings.get_mut(&4).unwrap();
-    m.mapping_internal = 1;
-    m.page_entries = (0..4)
+    let m = state.surfaces.mappings.get_mut(&4).unwrap();
+    m.lifecycle.internal_kva = 1;
+    m.pages.entries = (0..4)
         .map(|i| ((base_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
         .collect();
     // Latched at 64x64; the frame below is armed at 32x32, as a window armed
@@ -560,16 +553,15 @@ fn a_writeback_refused_because_the_geometry_moved_says_so_by_name() {
 /// and it must not be `GeometryMoved`. `FakeHost` publishes no guest-RAM import,
 /// so both stop at the reference gate — which is downstream of every rule the
 /// licence still owns, and therefore says both got through all of them.
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_iosurface_texture_licence_judges_the_callers_window_and_not_the_surfaces_extent() {
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::model::PAGE_SHIFT_X86;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     const PAGE: u64 = 1 << PAGE_SHIFT_X86;
 
     crate::runtime::guest_ram_map::reset();
     crate::runtime::guest_ram::forget_import_limits();
-    let mut state = DeviceState::new(DeviceId(9), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(9), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     let base_pfn = 0x40u32;
     host.map_range(
@@ -579,16 +571,17 @@ fn a_iosurface_texture_licence_judges_the_callers_window_and_not_the_surfaces_ex
     );
     state.map_surface(7);
     state.attach_mapping_internal(7, 0);
-    let m = state.mappings.get_mut(&7).unwrap();
-    m.mapping_internal = 1;
-    m.page_entries = (0..16)
+    let m = state.surfaces.mappings.get_mut(&7).unwrap();
+    m.lifecycle.internal_kva = 1;
+    m.pages.entries = (0..16)
         .map(|i| ((base_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
         .collect();
     assert!(state.set_mapping_geom(7, 64, 64, MTL_FORMAT_BGRA8_UNORM));
 
-    let held = crate::backend::vulkan::translate::pixel::vk_texel_layout(
-        pixel_format::store_texel_order(MTL_FORMAT_BGRA8_UNORM).expect("BGRA8 has a linear texel"),
-    );
+    let held: reims_vgpu_protocol::StorageImageFormat =
+        pixel_format::store_texel_order(MTL_FORMAT_BGRA8_UNORM)
+            .expect("BGRA8 has a linear texel")
+            .into();
     let dest = |width, height| IOSurfaceDestination {
         mapping_id: 7,
         base_off: 0,
@@ -618,8 +611,8 @@ fn a_iosurface_texture_licence_judges_the_callers_window_and_not_the_surfaces_ex
 /// imported while still admitting this exact resource-sized allocation.
 #[test]
 fn a_iosurface_texture_resource_import_survives_a_whole_ram_map_refusal() {
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::model::PAGE_SHIFT_X86;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     const PAGE: u64 = 1 << PAGE_SHIFT_X86;
     const MAPPING_PAGES: u64 = 16;
 
@@ -646,19 +639,20 @@ fn a_iosurface_texture_resource_import_survives_a_whole_ram_map_refusal() {
         Some(crate::runtime::guest_ram_map::MapRefusal::ImportExceedsHeap { .. })
     ));
 
-    let mut state = DeviceState::new(DeviceId(9), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(9), PAGE_SHIFT_X86);
     state.map_surface(7);
     state.attach_mapping_internal(7, 0);
-    let mapping = state.mappings.get_mut(&7).unwrap();
-    mapping.mapping_internal = 1;
-    mapping.page_entries = (0..MAPPING_PAGES as u32)
+    let mapping = state.surfaces.mappings.get_mut(&7).unwrap();
+    mapping.lifecycle.internal_kva = 1;
+    mapping.pages.entries = (0..MAPPING_PAGES as u32)
         .map(|i| ((base_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
         .collect();
     assert!(state.set_mapping_geom(7, 64, 64, MTL_FORMAT_BGRA8_UNORM));
 
-    let held = crate::backend::vulkan::translate::pixel::vk_texel_layout(
-        pixel_format::store_texel_order(MTL_FORMAT_BGRA8_UNORM).expect("BGRA8 has a linear texel"),
-    );
+    let held: reims_vgpu_protocol::StorageImageFormat =
+        pixel_format::store_texel_order(MTL_FORMAT_BGRA8_UNORM)
+            .expect("BGRA8 has a linear texel")
+            .into();
     let licence = licence_iosurface_texture_surface(
         &mut state,
         &mut host,
@@ -688,7 +682,7 @@ fn writing_guest_pages_moves_the_host_write_record_and_reading_them_does_not() {
     const W: u32 = 64;
     const H: u32 = 64;
 
-    let mut state = DeviceState::new(DeviceId(3), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(3), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     let base_pfn = 0x40u32;
     host.map_range((base_pfn as u64) << PAGE_SHIFT_X86, 8 * PAGE as usize, 0x55);
@@ -697,27 +691,27 @@ fn writing_guest_pages_moves_the_host_write_record_and_reading_them_does_not() {
         .collect();
     state.map_surface(4);
     state.attach_mapping_internal(4, 0);
-    let m = state.mappings.get_mut(&4).unwrap();
-    m.mapping_internal = 1;
-    m.page_entries = entries;
+    let m = state.surfaces.mappings.get_mut(&4).unwrap();
+    m.lifecycle.internal_kva = 1;
+    m.pages.entries = entries;
     assert!(state.set_mapping_geom(4, W, H, MTL_FORMAT_BGRA8_UNORM));
 
-    let before = state.host_writes.epoch();
+    let before = state.content.host_writes.epoch();
     let frame = vec![0xAAu8; (W * H * 4) as usize];
     assert!(write_bgra8(&mut state, &mut host, 4, &frame, W * 4, W, H));
     assert_ne!(
-        state.host_writes.epoch(),
+        state.content.host_writes.epoch(),
         before,
         "a write into the guest's pages went unannounced"
     );
 
-    let after_write = state.host_writes.epoch();
+    let after_write = state.content.host_writes.epoch();
     let mut out = vec![0u8; (W * H * 4) as usize];
     assert!(crate::runtime::mapper::read_mapping_bytes(
         &mut state, &mut host, 4, 0, &mut out
     ));
     assert_eq!(
-        state.host_writes.epoch(),
+        state.content.host_writes.epoch(),
         after_write,
         "a read moved the write record, so every reader now invalidates every reader"
     );
@@ -725,7 +719,7 @@ fn writing_guest_pages_moves_the_host_write_record_and_reading_them_does_not() {
 
 #[test]
 fn write_bumps_generation() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let pfn = 0x10u32;
     let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
@@ -733,14 +727,23 @@ fn write_bumps_generation() {
     let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
     state.map_surface(3);
     state.attach_mapping_internal(3, 0); // leave internal 0; set pages manually
-    let m = state.mappings.get_mut(&3).unwrap();
-    m.mapping_internal = 1;
-    m.page_entries = vec![entry];
+    let m = state.surfaces.mappings.get_mut(&3).unwrap();
+    m.lifecycle.internal_kva = 1;
+    m.pages.entries = vec![entry];
     assert!(state.set_mapping_geom(3, 2, 2, MTL_FORMAT_BGRA8_UNORM));
     let src = [0x11u8, 0x22, 0x33, 0x44, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     // 2x2 BGRA, stride 8
     assert!(write_bgra8(&mut state, &mut host, 3, &src, 8, 2, 2));
-    assert_eq!(state.mappings.get(&3).unwrap().content_generation, 1);
+    assert_eq!(
+        state
+            .surfaces
+            .mappings
+            .get(&3)
+            .unwrap()
+            .content
+            .guest_page_generation,
+        1
+    );
 }
 
 /// A guest write drops only the storage-residency mirror windows it
@@ -749,7 +752,7 @@ fn write_bumps_generation() {
 fn mapping_write_invalidates_intersecting_residency_windows_only() {
     use crate::model::ComputeStorageResidencyKey;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let pfn = 0x20u32;
     let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
@@ -757,13 +760,13 @@ fn mapping_write_invalidates_intersecting_residency_windows_only() {
     let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
     state.map_surface(7);
     state.attach_mapping_internal(7, 0);
-    let m = state.mappings.get_mut(&7).unwrap();
-    m.mapping_internal = 1;
-    m.page_entries = vec![entry];
+    let m = state.surfaces.mappings.get_mut(&7).unwrap();
+    m.lifecycle.internal_kva = 1;
+    m.pages.entries = vec![entry];
     let window = |surface_offset: u64, span_end: u64| {
         ComputeStorageResidencyKey::surface(
             7,
-            state.mappings[&7].map_generation,
+            state.surfaces.mappings[&7].lifecycle.generation,
             surface_offset,
             32,
             span_end,
@@ -774,16 +777,16 @@ fn mapping_write_invalidates_intersecting_residency_windows_only() {
     };
     let hit = window(0, 64);
     let survivor = window(1024, 1088);
-    state.compute_storage_residency.insert(hit, 5);
-    state.compute_storage_residency.insert(survivor, 5);
+    state.content.compute_residency.publish(hit, 5);
+    state.content.compute_residency.publish(survivor, 5);
     let vouched = mapper::vouch_mapping_pages_verdict(&mut state, &host, 7)
         .1
         .expect("no walk to contradict");
     assert!(mapper::write_mapping_bytes(
         &mut state, &mut host, 7, 16, &[0u8; 32], &vouched
     ));
-    assert!(!state.compute_storage_residency.contains_key(&hit));
-    assert!(state.compute_storage_residency.contains_key(&survivor));
+    assert!(!state.content.compute_residency.contains(&hit));
+    assert!(state.content.compute_residency.contains(&survivor));
 }
 
 /// A direct IOSurface texture writeback must not land in a page the guest re-pointed
@@ -792,7 +795,7 @@ fn mapping_write_invalidates_intersecting_residency_windows_only() {
 ///
 /// The page-drift witness shipped with exactly one caller — the deferred
 /// render flush — so this rail, which writes a full frame of pixels through
-/// `MappingEntry::page_entries`, was unguarded. The crash reports are the
+/// the mapping's page plan, was unguarded. The crash reports are the
 /// receipt: WindowServer aborting in `small_free_list_remove_ptr_no_clear`,
 /// and guest-kernel kalloc poison finding whole freed elements filled with
 /// `0xff` from offset 0 — opaque white BGRA in memory already handed to
@@ -805,8 +808,8 @@ fn mapping_write_invalidates_intersecting_residency_windows_only() {
 /// advances only the page-list generation.
 #[test]
 fn a_repointed_surface_writes_its_current_backing_and_leaves_the_old_owner_alone() {
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::model::{SurfaceBackingWalk, PAGE_SHIFT_X86};
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 
     let page = 1u64 << PAGE_SHIFT_X86;
     let mut host = FakeHost::new();
@@ -828,19 +831,19 @@ fn a_repointed_surface_writes_its_current_backing_and_leaves_the_old_owner_alone
     st32(&mut pte, (data0 >> PAGE_SHIFT_X86) as u32);
     host.write_gpa(root_gpa, &pte).unwrap();
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     state.define_task(1, page, 2);
     let mid = 6;
     state.map_surface(mid);
     {
-        let m = state.mappings.get_mut(&mid).unwrap();
-        m.mapped = true;
-        m.page_entries =
+        let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+        m.lifecycle.active = true;
+        m.pages.entries =
             vec![(((data0 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
-        m.surface_backing_walk = Some(SurfaceBackingWalk {
+        m.pages.surface_walk = Some(SurfaceBackingWalk {
             task_id: 1,
             backing_pfn: 0,
-            page_generation: m.page_generation,
+            page_generation: m.pages.generation,
         });
     }
 
@@ -869,16 +872,28 @@ fn a_repointed_surface_writes_its_current_backing_and_leaves_the_old_owner_alone
     // And the surface is re-pointed. No MapMemory2, no UnmapMemory, no
     // ReplacePhysical — nothing on the wire, so nothing bumps the
     // incarnation.
-    let generation_before = state.mappings.get(&mid).unwrap().map_generation;
+    let generation_before = state
+        .surfaces
+        .mappings
+        .get(&mid)
+        .unwrap()
+        .lifecycle
+        .generation;
     st32(&mut pte, (data1 >> PAGE_SHIFT_X86) as u32);
     host.write_gpa(root_gpa, &pte).unwrap();
     assert_eq!(
-        state.mappings.get(&mid).unwrap().map_generation,
+        state
+            .surfaces
+            .mappings
+            .get(&mid)
+            .unwrap()
+            .lifecycle
+            .generation,
         generation_before,
         "no packet arrived, so nothing bumped the incarnation"
     );
 
-    let page_generation_before = state.mappings.get(&mid).unwrap().page_generation;
+    let page_generation_before = state.surfaces.mappings.get(&mid).unwrap().pages.generation;
     assert!(
         write_bgra8(&mut state, &mut host, mid, &frame, stride, w, h),
         "a complete current-backing walk must refresh and land the frame"
@@ -901,17 +916,17 @@ fn a_repointed_surface_writes_its_current_backing_and_leaves_the_old_owner_alone
         current, [0xffu8; 16],
         "the frame reached the current backing"
     );
-    let mapping = state.mappings.get(&mid).unwrap();
+    let mapping = state.surfaces.mappings.get(&mid).unwrap();
     assert_eq!(
-        mapping.map_generation, generation_before,
+        mapping.lifecycle.generation, generation_before,
         "physical migration does not create a new logical resource"
     );
     assert_ne!(
-        mapping.page_generation, page_generation_before,
+        mapping.pages.generation, page_generation_before,
         "page-bound proofs and aliases must move to a new backing generation"
     );
     assert_eq!(
-        crate::contract::iosurface_pages::entry_gpa_shift(mapping.page_entries[0], PAGE_SHIFT_X86),
+        reims_vgpu_paging::geometry::mapper_entry_gpa(mapping.pages.entries[0], PAGE_SHIFT_X86),
         Some(data1),
         "the cached page list now names the current backing"
     );
@@ -923,7 +938,7 @@ fn a_repointed_surface_writes_its_current_backing_and_leaves_the_old_owner_alone
 fn fragmented_raw_rect_bulk_imports_runs_not_rows() {
     use crate::model::PAGE_SHIFT_X86;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     host.strict_linux_map = true;
     let page = 1usize << PAGE_SHIFT_X86;
@@ -934,8 +949,8 @@ fn fragmented_raw_rect_bulk_imports_runs_not_rows() {
     let mid = 19;
     state.map_surface(mid);
     {
-        let m = state.mappings.get_mut(&mid).unwrap();
-        m.page_entries = vec![
+        let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+        m.pages.entries = vec![
             (((gpa0 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
             (((gpa1 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
         ];
@@ -980,7 +995,7 @@ fn a_bgra_row_write_marks_the_footprint_through_its_contig_view() {
     use crate::observe::footprint;
 
     let _fp = footprint::exclusive_for_tests();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     let page = 1u64 << PAGE_SHIFT_X86;
     // Adjacent so the contig view packs — this is the path production takes.
@@ -989,10 +1004,10 @@ fn a_bgra_row_write_marks_the_footprint_through_its_contig_view() {
     let mid = 12u32;
     state.map_surface(mid);
     {
-        let m = state.mappings.get_mut(&mid).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![
+        let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![
             (((gpa0 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
             ((((gpa0 + page) >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
         ];
@@ -1019,7 +1034,7 @@ fn a_bgra_row_write_marks_the_footprint_through_its_contig_view() {
 #[test]
 fn write_bgra8_fragmented_pages_multi_import() {
     use crate::model::PAGE_SHIFT_X86;
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     host.strict_linux_map = true;
     let page = 1u64 << PAGE_SHIFT_X86;
@@ -1034,10 +1049,10 @@ fn write_bgra8_fragmented_pages_multi_import() {
     let mid = 11u32;
     state.map_surface(mid);
     {
-        let m = state.mappings.get_mut(&mid).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![
+        let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![
             (pfn0 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
             (pfn1 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
         ];
@@ -1081,7 +1096,7 @@ fn write_bgra8_fragmented_pages_multi_import() {
 fn write_full_rect_raw_staged_leaves_inter_row_padding_alone() {
     use crate::model::PAGE_SHIFT_X86;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     host.strict_linux_map = true;
     let page = 1u64 << PAGE_SHIFT_X86;
@@ -1094,10 +1109,10 @@ fn write_full_rect_raw_staged_leaves_inter_row_padding_alone() {
     let mid = 14u32;
     state.map_surface(mid);
     {
-        let m = state.mappings.get_mut(&mid).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![
+        let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![
             (pfn0 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
             (pfn1 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
         ];
@@ -1148,7 +1163,7 @@ fn write_full_rect_raw_staged_leaves_inter_row_padding_alone() {
 fn write_bgra8_fragmented_skips_final_row_padding() {
     use crate::model::PAGE_SHIFT_X86;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     host.strict_linux_map = true;
     let page = 1u64 << PAGE_SHIFT_X86;
@@ -1161,10 +1176,10 @@ fn write_bgra8_fragmented_skips_final_row_padding() {
     let mid = 13u32;
     state.map_surface(mid);
     {
-        let m = state.mappings.get_mut(&mid).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![
+        let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![
             (pfn0 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
             (pfn1 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
         ];
@@ -1211,7 +1226,7 @@ fn write_bgra8_fragmented_skips_final_row_padding() {
 fn write_bgra8_contig_writes_only_inside_the_sample_window() {
     use crate::model::PAGE_SHIFT_X86;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     host.strict_linux_map = true;
     let page = 1u64 << PAGE_SHIFT_X86;
@@ -1221,10 +1236,10 @@ fn write_bgra8_contig_writes_only_inside_the_sample_window() {
     let mid = 21u32;
     state.map_surface(mid);
     {
-        let m = state.mappings.get_mut(&mid).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
     }
     assert!(state.set_mapping_geom(mid, 2, 2, MTL_FORMAT_BGRA8_UNORM));
     // No device descriptor, so the invented window applies: tight = 2 × 4,
@@ -1256,7 +1271,7 @@ fn write_bgra8_contig_writes_only_inside_the_sample_window() {
 fn read_rect_raw_fragmented_pages_with_padded_rows() {
     use crate::model::PAGE_SHIFT_X86;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     host.strict_linux_map = true;
     let page = 1u64 << PAGE_SHIFT_X86;
@@ -1274,10 +1289,10 @@ fn read_rect_raw_fragmented_pages_with_padded_rows() {
     let mid = 12u32;
     state.map_surface(mid);
     {
-        let m = state.mappings.get_mut(&mid).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![
+        let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![
             (pfn0 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
             (pfn1 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
         ];
@@ -1321,7 +1336,7 @@ fn a_packed_sub_rectangle_of_a_scattered_plane_reads_through_one_walk() {
     use crate::model::PAGE_SHIFT_X86;
     use crate::runtime::drain::store_route_count;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     host.strict_linux_map = true;
     let page = 1u64 << PAGE_SHIFT_X86;
@@ -1343,10 +1358,10 @@ fn a_packed_sub_rectangle_of_a_scattered_plane_reads_through_one_walk() {
     let mid = 21u32;
     state.map_surface(mid);
     {
-        let m = state.mappings.get_mut(&mid).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = gpas
+        let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = gpas
             .iter()
             .map(|gpa| {
                 (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
@@ -1414,7 +1429,7 @@ fn a_rect_past_the_sample_window_is_named_on_both_read_arms() {
     use crate::model::PAGE_SHIFT_X86;
 
     for scattered in [false, true] {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
         let mut host = FakeHost::new();
         host.strict_linux_map = true;
         let page = 1u64 << PAGE_SHIFT_X86;
@@ -1427,11 +1442,11 @@ fn a_rect_past_the_sample_window_is_named_on_both_read_arms() {
         let mid = 12u32;
         state.map_surface(mid);
         {
-            let m = state.mappings.get_mut(&mid).unwrap();
-            m.mapped = true;
-            m.mapping_internal = 1;
+            let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+            m.lifecycle.active = true;
+            m.lifecycle.internal_kva = 1;
             // One page is a packed view; two distant ones cannot be.
-            m.page_entries = if scattered {
+            m.pages.entries = if scattered {
                 vec![
                     (pfn0 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
                     (pfn1 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
@@ -1498,7 +1513,7 @@ fn fragmented_full_tight_rect_uses_direct_mapping_window() {
     use crate::model::PAGE_SHIFT_X86;
     use crate::runtime::drain::store_route_count;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     host.strict_linux_map = true;
     let page = 1u64 << PAGE_SHIFT_X86;
@@ -1509,10 +1524,10 @@ fn fragmented_full_tight_rect_uses_direct_mapping_window() {
     let mid = 29;
     assert!(state.map_surface(mid));
     {
-        let m = state.mappings.get_mut(&mid).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![
+        let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![
             (((gpa0 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
             (((gpa1 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
         ];
@@ -1586,20 +1601,20 @@ fn fragmented_full_tight_rect_uses_direct_mapping_window() {
 /// the wire meant for alpha, silently.
 #[test]
 fn an_ambiguous_descriptor_declines_where_an_absent_one_still_sizes_a_window() {
-    use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::iosurface_pages::{
+    use reims_vgpu_core::endian::{st16, st32, st64};
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_R8_UNORM;
+    use reims_vgpu_protocol::{
         DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_PLANES, DEVICE_DESC_PLANE_COUNT, DEVICE_PLANE_BPE,
         DEVICE_PLANE_BPR, DEVICE_PLANE_DESC_LEN, DEVICE_PLANE_DIMS, DEVICE_PLANE_OFFSET,
         DEVICE_PLANE_SIZE,
     };
-    use crate::contract::pixel_format::MTL_FORMAT_R8_UNORM;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     state.map_surface(8);
 
     // No descriptor yet: geometry came from the IOSurface texture object and
     // the aligned row stands in for the pitch. 4 R8 texels align to 128.
-    let m = state.mappings.get(&8).expect("mapping");
+    let m = state.surfaces.mappings.get(&8).expect("mapping");
     assert_eq!(
         iosurface_texture_sample_window(m, 4, 2, MTL_FORMAT_R8_UNORM),
         Some((0, 128, 256)),
@@ -1607,7 +1622,7 @@ fn an_ambiguous_descriptor_declines_where_an_absent_one_still_sizes_a_window() {
     );
 
     // Publish a v0a8-shaped descriptor: planes 0 and 2 are both R8 4x2.
-    let mut desc = vec![0u8; crate::contract::iosurface_pages::DEVICE_DESC_LEN];
+    let mut desc = vec![0u8; reims_vgpu_protocol::DEVICE_DESC_LEN];
     st32(&mut desc[DEVICE_DESC_ALLOC_SIZE..], 0x2000);
     desc[DEVICE_DESC_PLANE_COUNT] = 3;
     let pack = |w: u32, h: u32| ((w as u64 & 0xffffff) << 8) | ((h as u64 & 0xffffff) << 40);
@@ -1624,7 +1639,7 @@ fn an_ambiguous_descriptor_declines_where_an_absent_one_still_sizes_a_window() {
     }
     assert!(state.set_mapping_device_desc(8, &desc));
 
-    let m = state.mappings.get(&8).expect("mapping");
+    let m = state.surfaces.mappings.get(&8).expect("mapping");
     assert_eq!(
         iosurface_texture_sample_window(m, 4, 2, MTL_FORMAT_R8_UNORM),
         None,
@@ -1652,7 +1667,7 @@ fn an_ambiguous_descriptor_declines_where_an_absent_one_still_sizes_a_window() {
 /// bytes land in pages and the generation advances; nothing else exists.
 #[test]
 fn write_bgra8_lands_in_pages_and_bumps_gen() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let pfn = 0x18u32;
     let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
@@ -1660,17 +1675,17 @@ fn write_bgra8_lands_in_pages_and_bumps_gen() {
     let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
     state.map_surface(8);
     {
-        let m = state.mappings.get_mut(&8).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
+        let m = state.surfaces.mappings.get_mut(&8).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![entry];
     }
     assert!(state.set_mapping_geom(8, 2, 2, MTL_FORMAT_BGRA8_UNORM));
     // BGRA red pixel + zeros
     let src = [0x00u8, 0x00, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     assert!(write_bgra8(&mut state, &mut host, 8, &src, 8, 2, 2));
-    let m = state.mappings.get(&8).unwrap();
-    assert_eq!(m.content_generation, 1);
+    let m = state.surfaces.mappings.get(&8).unwrap();
+    assert_eq!(m.content.guest_page_generation, 1);
     let mut first_px = [0u8; 4];
     assert!(host.read_gpa(gpa, &mut first_px).is_ok());
     assert_eq!(&first_px, &[0x00, 0x00, 0xFF, 0xFF], "pages hold the write");
@@ -1678,17 +1693,17 @@ fn write_bgra8_lands_in_pages_and_bumps_gen() {
 
 #[test]
 fn raw_rows_roundtrip() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let pfn = 0x11u32;
     let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
     host.map_range(gpa, 0x4000, 0);
     let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
     state.map_surface(4);
-    let m = state.mappings.get_mut(&4).unwrap();
-    m.mapped = true;
-    m.mapping_internal = 1;
-    m.page_entries = vec![entry];
+    let m = state.surfaces.mappings.get_mut(&4).unwrap();
+    m.lifecycle.active = true;
+    m.lifecycle.internal_kva = 1;
+    m.pages.entries = vec![entry];
     assert!(state.set_mapping_geom(4, 2, 2, 0));
     // 2x2 depth32 floats: 1.0, 0.5 / 0.25, 0.0
     let mut src = Vec::new();
@@ -1696,7 +1711,13 @@ fn raw_rows_roundtrip() {
         src.extend_from_slice(&f.to_bits().to_le_bytes());
     }
     assert!(write_raw_rows(&mut state, &mut host, 4, &src, 8, 8, 2, 2));
-    let gen = state.mappings.get(&4).unwrap().content_generation;
+    let gen = state
+        .surfaces
+        .mappings
+        .get(&4)
+        .unwrap()
+        .content
+        .guest_page_generation;
     assert!(gen >= 1);
     let mut dst = vec![0u8; 16];
     assert!(read_raw_rows(
@@ -1704,7 +1725,16 @@ fn raw_rows_roundtrip() {
     ));
     assert_eq!(dst, src);
     // Read does not bump generation.
-    assert_eq!(state.mappings.get(&4).unwrap().content_generation, gen);
+    assert_eq!(
+        state
+            .surfaces
+            .mappings
+            .get(&4)
+            .unwrap()
+            .content
+            .guest_page_generation,
+        gen
+    );
 }
 
 /// The read side of the same bound. A rect read whose geometry exceeds what
@@ -1720,7 +1750,7 @@ fn raw_rows_roundtrip() {
 /// A correctly-sized read (read_end == span_end) still succeeds.
 #[test]
 fn oversized_height_rect_read_is_rejected_not_overrun() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let pfn = 0x23u32;
     let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
@@ -1730,10 +1760,10 @@ fn oversized_height_rect_read_is_rejected_not_overrun() {
     let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
     state.map_surface(11);
     {
-        let m = state.mappings.get_mut(&11).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
+        let m = state.surfaces.mappings.get_mut(&11).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![entry];
     }
     // The source allows exactly 2 rows of bpr=8.
     let bpr = 8u32;
@@ -1808,7 +1838,7 @@ fn oversized_height_rect_read_is_rejected_not_overrun() {
 /// A correctly-sized write (write_end == span_end) still succeeds.
 #[test]
 fn oversized_height_writeback_is_rejected_not_overrun() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let pfn = 0x21u32;
     let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
@@ -1818,10 +1848,10 @@ fn oversized_height_writeback_is_rejected_not_overrun() {
     let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
     state.map_surface(9);
     {
-        let m = state.mappings.get_mut(&9).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
+        let m = state.surfaces.mappings.get_mut(&9).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![entry];
     }
     // Destination allows exactly 2 rows of bpr=8 (span_end = 2*8 = 16).
     let bpr = 8u32;
@@ -1858,17 +1888,17 @@ fn oversized_height_writeback_is_rejected_not_overrun() {
 /// content outside the scissor — logo-mid residual when seed=clear skipped.
 #[test]
 fn clear_store_full_write_overwrites_prior_guest_outside_scissor() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let pfn = 0x14u32;
     let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
     host.map_range(gpa, 0x4000, 0);
     let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
     state.map_surface(7);
-    let m = state.mappings.get_mut(&7).unwrap();
-    m.mapped = true;
-    m.mapping_internal = 1;
-    m.page_entries = vec![entry];
+    let m = state.surfaces.mappings.get_mut(&7).unwrap();
+    m.lifecycle.active = true;
+    m.lifecycle.internal_kva = 1;
+    m.pages.entries = vec![entry];
     // 4x2 BGRA
     assert!(state.set_mapping_geom(7, 4, 2, MTL_FORMAT_BGRA8_UNORM));
     // Prior guest content: "logo" non-zero all pixels.
@@ -1925,17 +1955,17 @@ fn clear_store_full_write_overwrites_prior_guest_outside_scissor() {
 #[test]
 fn every_raw_rows_refusal_names_itself() {
     use crate::runtime::drain::store_route_count;
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let pfn = 0x14u32;
     let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
     host.map_range(gpa, 0x4000, 0);
     let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
     state.map_surface(7);
-    let m = state.mappings.get_mut(&7).unwrap();
-    m.mapped = true;
-    m.mapping_internal = 1;
-    m.page_entries = vec![entry];
+    let m = state.surfaces.mappings.get_mut(&7).unwrap();
+    m.lifecycle.active = true;
+    m.lifecycle.internal_kva = 1;
+    m.pages.entries = vec![entry];
     assert!(state.set_mapping_geom(7, 4, 2, MTL_FORMAT_BGRA8_UNORM));
     let rows = vec![0u8; 4 * 2 * 4];
 
@@ -1984,7 +2014,13 @@ fn every_raw_rows_refusal_names_itself() {
 
     // Unmapped: there is nowhere to write.
     let n = store_route_count("surface_write_mapping_not_resident");
-    state.mappings.get_mut(&7).unwrap().mapped = false;
+    state
+        .surfaces
+        .mappings
+        .get_mut(&7)
+        .unwrap()
+        .lifecycle
+        .active = false;
     assert!(!write_raw_rows(
         &mut state, &mut host, 7, &rows, 16, 16, 4, 2
     ));
@@ -2010,17 +2046,17 @@ fn every_raw_rows_refusal_names_itself() {
 #[test]
 fn every_rgba8_image_changed_refusal_names_itself() {
     use crate::runtime::drain::store_route_count;
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let pfn = 0x14u32;
     let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
     host.map_range(gpa, 0x4000, 0);
     let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
     state.map_surface(7);
-    let m = state.mappings.get_mut(&7).unwrap();
-    m.mapped = true;
-    m.mapping_internal = 1;
-    m.page_entries = vec![entry];
+    let m = state.surfaces.mappings.get_mut(&7).unwrap();
+    m.lifecycle.active = true;
+    m.lifecycle.internal_kva = 1;
+    m.pages.entries = vec![entry];
     assert!(state.set_mapping_geom(7, 4, 2, MTL_FORMAT_BGRA8_UNORM));
     let frame = vec![0u8; 4 * 2 * 4];
 
@@ -2081,7 +2117,13 @@ fn every_rgba8_image_changed_refusal_names_itself() {
 
     // Unmapped: there is nowhere to write.
     let n = before("surface_write_mapping_not_resident");
-    state.mappings.get_mut(&7).unwrap().mapped = false;
+    state
+        .surfaces
+        .mappings
+        .get_mut(&7)
+        .unwrap()
+        .lifecycle
+        .active = false;
     assert!(!write_rgba8_image_changed(
         &mut state, &mut host, 7, &frame, None, 4, 2
     ));
@@ -2093,7 +2135,7 @@ fn every_rgba8_image_changed_refusal_names_itself() {
 
 #[test]
 fn rgba8_image_changed_writes_only_diff_spans() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     // 4x2 BGRA: invent bpr 128 → one page.
     let pfn = 0x13u32;
@@ -2101,10 +2143,10 @@ fn rgba8_image_changed_writes_only_diff_spans() {
     host.map_range(gpa, 0x4000, 0);
     let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
     state.map_surface(6);
-    let m = state.mappings.get_mut(&6).unwrap();
-    m.mapped = true;
-    m.mapping_internal = 1;
-    m.page_entries = vec![entry];
+    let m = state.surfaces.mappings.get_mut(&6).unwrap();
+    m.lifecycle.active = true;
+    m.lifecycle.internal_kva = 1;
+    m.pages.entries = vec![entry];
     assert!(state.set_mapping_geom(6, 4, 2, MTL_FORMAT_BGRA8_UNORM));
     // Seed: all zeros.
     let seed = vec![0u8; 4 * 2 * 4];
@@ -2143,7 +2185,7 @@ fn rgba8_image_changed_writes_only_diff_spans() {
 
 #[test]
 fn rect_raw_roundtrip_subregion() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     // 4x2 BGRA needs 4*4=16 tight, aligned bpr = 128 (ROW_BYTES_ALIGN).
     // One page is enough for 2 rows of 128.
@@ -2152,10 +2194,10 @@ fn rect_raw_roundtrip_subregion() {
     host.map_range(gpa, 0x4000, 0);
     let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
     state.map_surface(5);
-    let m = state.mappings.get_mut(&5).unwrap();
-    m.mapped = true;
-    m.mapping_internal = 1;
-    m.page_entries = vec![entry];
+    let m = state.surfaces.mappings.get_mut(&5).unwrap();
+    m.lifecycle.active = true;
+    m.lifecycle.internal_kva = 1;
+    m.pages.entries = vec![entry];
     assert!(state.set_mapping_geom(5, 4, 2, MTL_FORMAT_BGRA8_UNORM));
     // Write a 2x1 rect at (1,1): two BGRA pixels.
     let src = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];

@@ -23,4 +23,3 @@ pub mod spirv_vertex_input;
 pub mod srgb_census;
 pub mod telemetry;
 pub mod translate;
-pub mod viewport;

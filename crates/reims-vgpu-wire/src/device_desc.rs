@@ -1,5 +1,6 @@
-//! Device-side descriptors reached by GVA: the wire tag 4 surface backing record
-//! and the wire tag 5 reference-texture handle.
+//! Device-side descriptors reached by GVA: the wire tag 4 surface backing record,
+//! wire tag 5 reference-texture handle, and wire tag 11 mapper IOSurface texture
+//! view.
 //!
 //! # Provenance
 //!
@@ -79,6 +80,8 @@
 //! own accessor rather than a field on the minimum view.
 
 use crate::le::{U16le, U32le, U64le};
+use crate::op::op;
+use crate::ops::backed_texture;
 use crate::view::{view, view_at, Wire, WireError};
 
 /// Wire object type for surface / IOSurface backing.
@@ -307,6 +310,13 @@ pub fn iosurface_plane_view_header(desc: &[u8]) -> Result<&IOSurfacePlaneViewHea
     view::<IOSurfacePlaneViewHeader>(desc)
 }
 
+/// View the nested serializer-operation header of a wire tag 5 descriptor.
+pub fn iosurface_plane_view_args_header(
+    desc: &[u8],
+) -> Result<&IOSurfacePlaneViewArgsHeader, WireError> {
+    view_at::<IOSurfacePlaneViewArgsHeader>(desc, IOSURFACE_PLANE_VIEW_ARGS)
+}
+
 /// View the serialized texture record of a wire tag 5 descriptor.
 pub fn iosurface_plane_view_texture_record(
     desc: &[u8],
@@ -325,6 +335,103 @@ pub fn iosurface_plane_view_record_plane_index(desc: &[u8]) -> Option<u32> {
     )
     .ok()
     .map(|w| w.get())
+}
+
+/// Bytes before the complete nested serializer operation in a wire tag 11
+/// mapper IOSurface texture view.
+pub const MAPPER_IOSURFACE_TEXTURE_OPERATION: usize = core::mem::size_of::<U64le>();
+
+/// Which accepted serializer operation a mapper IOSurface texture embeds.
+#[derive(Debug)]
+pub enum MapperIOSurfaceTextureOperation<'a> {
+    Legacy(&'a backed_texture::IOSurfaceTextureBody),
+    Rotated(&'a backed_texture::IOSurfaceTextureRotatedBody),
+    Wide(&'a backed_texture::IOSurfaceTextureWideBody),
+}
+
+/// Zero-copy view of a wire tag 11 mapper IOSurface texture object.
+#[derive(Debug)]
+pub struct MapperIOSurfaceTextureView<'a> {
+    /// Mapper-service lookup identity. This is not an object-table ref or a GPU
+    /// page-table mapping identity.
+    pub mapper_ref: &'a U64le,
+    pub operation: MapperIOSurfaceTextureOperation<'a>,
+}
+
+/// Why a mapper IOSurface texture object could not be viewed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapperIOSurfaceTextureError {
+    Wire(WireError),
+    /// The nested operation did not consume the complete outer descriptor.
+    OuterLength {
+        nested: usize,
+        outer: usize,
+    },
+    /// A complete nested operation whose tag/length pair is not an accepted
+    /// IOSurface texture form.
+    UnknownVariant {
+        opcode: u32,
+        length: u32,
+    },
+}
+
+impl From<WireError> for MapperIOSurfaceTextureError {
+    fn from(error: WireError) -> Self {
+        Self::Wire(error)
+    }
+}
+
+/// View the mapper reference and complete nested IOSurface texture operation
+/// carried by a wire tag 11 object.
+///
+/// The outer descriptor has no independent tail: after the eight-byte mapper
+/// reference, exactly one nested serializer operation must consume every
+/// remaining byte. Unknown opcode/length pairs are refused rather than treated
+/// as a longer instance of a known descriptor.
+pub fn mapper_iosurface_texture(
+    desc: &[u8],
+) -> Result<MapperIOSurfaceTextureView<'_>, MapperIOSurfaceTextureError> {
+    let mapper_ref = view::<U64le>(desc)?;
+    let nested_bytes =
+        desc.get(MAPPER_IOSURFACE_TEXTURE_OPERATION..)
+            .ok_or(WireError::OutOfRange {
+                offset: MAPPER_IOSURFACE_TEXTURE_OPERATION,
+                len: desc.len(),
+            })?;
+    let nested = op(nested_bytes, MAPPER_IOSURFACE_TEXTURE_OPERATION)?;
+    let consumed = MAPPER_IOSURFACE_TEXTURE_OPERATION + nested.length() as usize;
+    if consumed != desc.len() {
+        return Err(MapperIOSurfaceTextureError::OuterLength {
+            nested: consumed,
+            outer: desc.len(),
+        });
+    }
+
+    let operation = match (nested.opcode(), nested.length()) {
+        (backed_texture::OPCODE_IOSURFACE_TEXTURE, backed_texture::IOSURFACE_TEXTURE_TOTAL_LEN) => {
+            MapperIOSurfaceTextureOperation::Legacy(backed_texture::iosurface_texture(&nested)?)
+        }
+        (
+            backed_texture::OPCODE_IOSURFACE_TEXTURE_ROTATED,
+            backed_texture::IOSURFACE_TEXTURE_ROTATED_TOTAL_LEN,
+        ) => MapperIOSurfaceTextureOperation::Rotated(backed_texture::iosurface_texture_rotated(
+            &nested,
+        )?),
+        (
+            backed_texture::OPCODE_IOSURFACE_TEXTURE_WIDE,
+            backed_texture::IOSURFACE_TEXTURE_WIDE_TOTAL_LEN,
+        ) => {
+            MapperIOSurfaceTextureOperation::Wide(backed_texture::iosurface_texture_wide(&nested)?)
+        }
+        (opcode, length) => {
+            return Err(MapperIOSurfaceTextureError::UnknownVariant { opcode, length });
+        }
+    };
+
+    Ok(MapperIOSurfaceTextureView {
+        mapper_ref,
+        operation,
+    })
 }
 
 /// Assemble a wire tag 4 descriptor by the format's own rules, for tests.
@@ -502,6 +609,89 @@ impl IOSurfacePlaneViewBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mapper_texture<const N: usize>(mapper_ref: u64, opcode: u32, nested_len: u32) -> [u8; N] {
+        let mut bytes = [0u8; N];
+        bytes[..8].copy_from_slice(&mapper_ref.to_le_bytes());
+        bytes[8..12].copy_from_slice(&opcode.to_le_bytes());
+        bytes[12..16].copy_from_slice(&nested_len.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn mapper_texture_keeps_the_complete_64_bit_identity_and_nested_variant() {
+        let mapper_ref = 0x1122_3344_5566_7788;
+
+        let mut legacy = mapper_texture::<56>(
+            mapper_ref,
+            backed_texture::OPCODE_IOSURFACE_TEXTURE,
+            backed_texture::IOSURFACE_TEXTURE_TOTAL_LEN,
+        );
+        legacy[52..54].copy_from_slice(&3u16.to_le_bytes());
+        legacy[54] = 0x55;
+        legacy[55] = 0xaa;
+        let view = mapper_iosurface_texture(&legacy).expect("legacy mapper texture");
+        assert_eq!(view.mapper_ref.get(), mapper_ref);
+        let MapperIOSurfaceTextureOperation::Legacy(body) = view.operation else {
+            panic!("legacy tag selected another variant");
+        };
+        assert_eq!(body.plane.get(), 3);
+
+        let mut rotated = mapper_texture::<56>(
+            mapper_ref,
+            backed_texture::OPCODE_IOSURFACE_TEXTURE_ROTATED,
+            backed_texture::IOSURFACE_TEXTURE_ROTATED_TOTAL_LEN,
+        );
+        rotated[52..54].copy_from_slice(&5u16.to_le_bytes());
+        rotated[54] = 7;
+        rotated[55] = 0xff;
+        let view = mapper_iosurface_texture(&rotated).expect("rotated mapper texture");
+        let MapperIOSurfaceTextureOperation::Rotated(body) = view.operation else {
+            panic!("rotated tag selected another variant");
+        };
+        assert_eq!(body.plane.get(), 5);
+        assert_eq!(body.rotation, 7);
+
+        let mut wide = mapper_texture::<64>(
+            mapper_ref,
+            backed_texture::OPCODE_IOSURFACE_TEXTURE_WIDE,
+            backed_texture::IOSURFACE_TEXTURE_WIDE_TOTAL_LEN,
+        );
+        wide[60..62].copy_from_slice(&9u16.to_le_bytes());
+        wide[62] = 11;
+        wide[63] = 0xff;
+        let view = mapper_iosurface_texture(&wide).expect("wide mapper texture");
+        let MapperIOSurfaceTextureOperation::Wide(body) = view.operation else {
+            panic!("wide tag selected another variant");
+        };
+        assert_eq!(body.plane.get(), 9);
+        assert_eq!(body.rotation, 11);
+    }
+
+    #[test]
+    fn mapper_texture_refuses_unknown_or_non_exhaustive_nested_records() {
+        let unknown = mapper_texture::<56>(0x1_0000_0001, 0x58, 48);
+        assert!(matches!(
+            mapper_iosurface_texture(&unknown),
+            Err(MapperIOSurfaceTextureError::UnknownVariant {
+                opcode: 0x58,
+                length: 48,
+            })
+        ));
+
+        let trailing = mapper_texture::<57>(
+            7,
+            backed_texture::OPCODE_IOSURFACE_TEXTURE,
+            backed_texture::IOSURFACE_TEXTURE_TOTAL_LEN,
+        );
+        assert!(matches!(
+            mapper_iosurface_texture(&trailing),
+            Err(MapperIOSurfaceTextureError::OuterLength {
+                nested: 56,
+                outer: 57,
+            })
+        ));
+    }
 
     #[test]
     fn what_the_iosurface_plane_view_builder_writes_is_what_the_views_read() {

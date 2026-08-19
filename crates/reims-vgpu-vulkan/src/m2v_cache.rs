@@ -16,12 +16,32 @@
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use metal2vulkan::passes::Stage;
 use metal2vulkan::reflect::ShaderReflection;
 
 use reims_vgpu_observe::Decline;
+
+/// Render-stage translation requested by semantic pipeline preparation.
+///
+/// The translator's native stage enum remains an implementation detail of this
+/// crate; composition code names only the two render stages it can request.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum RenderTranslationStage {
+    Vertex,
+    Fragment,
+}
+
+impl From<RenderTranslationStage> for Stage {
+    fn from(stage: RenderTranslationStage) -> Self {
+        match stage {
+            RenderTranslationStage::Vertex => Self::Vertex,
+            RenderTranslationStage::Fragment => Self::Fragment,
+        }
+    }
+}
 
 type FragmentRelocationCache = HashMap<(bool, bool), Arc<ShaderVariant>>;
 type M2vResult<T> = Result<T, M2vCacheDecline>;
@@ -266,8 +286,10 @@ impl std::error::Error for M2vCacheDecline {}
 /// consumer never re-parses AIR or re-walks the emitted SPIR-V. `spirv` is the
 /// post-`repair_layout` module (byte-identical to what the plain cache returned).
 pub struct CachedShader {
-    pub spirv: Vec<u8>,
-    pub reflection: Arc<ShaderReflection>,
+    pub(crate) spirv: Vec<u8>,
+    reflection: Arc<ShaderReflection>,
+    /// Backend-neutral resource interface consumed by device preparation.
+    pub interface: Arc<reims_vgpu_core::ShaderInterface>,
     /// The same module as u32 words, materialized once — draw paths clone the
     /// `Arc`, never re-collect per draw (was a full-module copy ×2 per draw).
     pub words: Arc<Vec<u32>>,
@@ -290,6 +312,13 @@ pub struct CachedShader {
 /// interface is transformed by the same variant key and stored here, so a
 /// caller cannot pair words from one numbering with resources from another.
 pub struct ShaderVariant {
+    /// Process-local identity used by semantic execution requests.
+    ///
+    /// The registry behind this identity retains only a weak reference: the
+    /// translated shader cache remains the owner, so prepared modules die with
+    /// the shader content that produced them rather than with an invented
+    /// executor cache bound.
+    pub id: reims_vgpu_protocol::PreparedShaderId,
     /// The module, in this variant's numbering.
     pub words: Arc<Vec<u32>>,
     /// The typed sampler descriptors reflection declares, transformed into
@@ -357,15 +386,470 @@ impl ShaderVariant {
             })
             .collect::<Vec<_>>()
             .into();
-        Arc::new(Self {
+        let variant = Arc::new(Self {
+            id: allocate_prepared_shader_id(),
             words,
             samplers,
             used_descriptor_bindings,
+        });
+        prepared_shader_registry()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(variant.id, Arc::downgrade(&variant));
+        variant
+    }
+}
+
+static NEXT_PREPARED_SHADER_ID: AtomicU64 = AtomicU64::new(1);
+static PREPARED_SHADER_REGISTRY: OnceLock<
+    Mutex<HashMap<reims_vgpu_protocol::PreparedShaderId, Weak<ShaderVariant>>>,
+> = OnceLock::new();
+
+fn prepared_shader_registry(
+) -> &'static Mutex<HashMap<reims_vgpu_protocol::PreparedShaderId, Weak<ShaderVariant>>> {
+    PREPARED_SHADER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn allocate_prepared_shader_id() -> reims_vgpu_protocol::PreparedShaderId {
+    let id = NEXT_PREPARED_SHADER_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .expect("prepared shader identity space exhausted");
+    reims_vgpu_protocol::PreparedShaderId::new(id)
+}
+
+/// Convert a backend-owned translated module into the semantic stage carried
+/// by a resolved command. Native words stay behind the prepared identity.
+pub fn prepared_stage(variant: &Arc<ShaderVariant>) -> reims_vgpu_core::PreparedShaderStage {
+    reims_vgpu_core::PreparedShaderStage {
+        id: variant.id,
+        used_descriptor_bindings: variant.used_descriptor_bindings.clone(),
+    }
+}
+
+fn project_prepared_variant(
+    variant: Arc<ShaderVariant>,
+    interface: &reims_vgpu_core::ShaderInterface,
+    fragment_sampled_relocated: bool,
+    fragment_buffer_relocated: bool,
+) -> reims_vgpu_core::PreparedShaderVariant {
+    let declared_bindings: Arc<[u32]> =
+        crate::spirv_bind::declared_binding_numbers(&variant.words).into();
+    let descriptor_uses: Arc<[(u32, reims_vgpu_core::DescriptorUse)]> = declared_bindings
+        .iter()
+        .filter_map(|binding| {
+            let use_ = crate::spirv_bind::descriptor_static_use(&variant.words, *binding);
+            (use_ != reims_vgpu_core::DescriptorUse::NotDeclared).then_some((*binding, use_))
         })
+        .collect::<Vec<_>>()
+        .into();
+    let mut texture_uses = interface
+        .bindings
+        .iter()
+        .filter(|binding| {
+            matches!(
+                binding.kind,
+                reims_vgpu_core::ShaderResourceKind::Texture
+                    | reims_vgpu_core::ShaderResourceKind::TextureArray
+            )
+        })
+        .map(|binding| {
+            let executable_binding = crate::spirv_bind::TEXTURE_BINDING_BASE
+                + binding.metal_index
+                + if fragment_sampled_relocated {
+                    crate::spirv_bind::FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
+                } else {
+                    0
+                };
+            (
+                binding.metal_index,
+                crate::spirv_bind::descriptor_static_use(&variant.words, executable_binding),
+            )
+        })
+        .collect::<Vec<_>>();
+    texture_uses.sort_unstable_by_key(|(metal_index, _)| *metal_index);
+    texture_uses.dedup_by_key(|(metal_index, _)| *metal_index);
+    let texture_uses = texture_uses.into();
+    reims_vgpu_core::PreparedShaderVariant {
+        program: prepared_stage(&variant),
+        samplers: variant.samplers.clone(),
+        declared_bindings,
+        descriptor_uses,
+        texture_uses,
+        buffer_binding_offset: if fragment_buffer_relocated {
+            crate::spirv_bind::FRAG_BUFFER_BINDING_OFFSET
+        } else {
+            0
+        },
+        sampled_binding_offset: if fragment_sampled_relocated {
+            crate::spirv_bind::FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
+        } else {
+            0
+        },
+        texture_binding_base: crate::spirv_bind::TEXTURE_BINDING_BASE,
+        sampler_binding_base: crate::spirv_bind::SAMPLER_BINDING_BASE,
+        word_count: u32::try_from(variant.words.len()).expect("SPIR-V module length fits u32"),
+    }
+}
+
+/// Project a translated render shader into backend-neutral executable facts.
+/// Native words remain owned by this crate's content cache and prepared-ID
+/// registry; retained guest pipeline state stores only this projection.
+pub fn prepare_render_shader(
+    shader: &Arc<CachedShader>,
+    stage: RenderTranslationStage,
+) -> reims_vgpu_core::PreparedShaderFamily {
+    let base = project_prepared_variant(
+        shader.variant(false, false),
+        &shader.interface,
+        false,
+        false,
+    );
+    let relocations = matches!(stage, RenderTranslationStage::Fragment).then(|| {
+        [
+            project_prepared_variant(shader.variant(true, false), &shader.interface, true, false),
+            project_prepared_variant(shader.variant(false, true), &shader.interface, false, true),
+            project_prepared_variant(shader.variant(true, true), &shader.interface, true, true),
+        ]
+    });
+    reims_vgpu_core::PreparedShaderFamily::new(shader.interface.clone(), base, relocations)
+}
+
+/// Prepare an executor-native module produced by a backend specialization
+/// pass. The returned variant owns the native words; callers keep it alive
+/// until the semantic request carrying [`ShaderVariant::id`] has executed.
+pub fn prepare_shader_words(words: Vec<u32>) -> Arc<ShaderVariant> {
+    ShaderVariant::of(Arc::new(words), Arc::from([]))
+}
+
+pub(crate) fn resolve_prepared_shader(
+    id: reims_vgpu_protocol::PreparedShaderId,
+) -> Option<Arc<ShaderVariant>> {
+    prepared_shader_registry()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&id)
+        .and_then(Weak::upgrade)
+}
+
+/// Register native test words with the same prepared-program boundary used by
+/// product execution. Test ownership is process-long because integration tests
+/// do not have a translated-shader cache whose lifetime can own the variant.
+#[cfg(feature = "test-fixtures")]
+pub fn prepare_test_shader(words: Vec<u32>) -> reims_vgpu_core::PreparedShaderStage {
+    static OWNERS: OnceLock<Mutex<HashMap<Vec<u32>, Arc<ShaderVariant>>>> = OnceLock::new();
+    let mut owners = OWNERS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let variant = owners
+        .entry(words.clone())
+        .or_insert_with(|| prepare_shader_words(words));
+    prepared_stage(variant)
+}
+
+/// Empty translated render shader for product-crate lifecycle fixtures.
+#[cfg(feature = "test-fixtures")]
+pub fn empty_test_shader(stage: RenderTranslationStage) -> Arc<CachedShader> {
+    use metal2vulkan::reflect::{ShaderReflection, ShaderStage, REFLECTION_VERSION};
+    let stage = match stage {
+        RenderTranslationStage::Vertex => ShaderStage::Vertex,
+        RenderTranslationStage::Fragment => ShaderStage::Fragment,
+    };
+    Arc::new(CachedShader::new(
+        Vec::new(),
+        Arc::new(ShaderReflection {
+            reflection_version: REFLECTION_VERSION,
+            stage,
+            entry_point: None,
+            bindings: vec![],
+            argument_buffer_fields: vec![],
+            vertex_attributes: vec![],
+            varyings: vec![],
+            render_targets: vec![],
+            depth_members: vec![],
+            depth_qualifier: None,
+            stencil_members: vec![],
+            local_size: None,
+            vertex_builtins: None,
+            tessellation: None,
+            imageblock_layouts: vec![],
+            implicit_imageblock_attachments: vec![],
+            fragment_imageblock: None,
+            datalayout: None,
+            function_constants: vec![],
+        }),
+    ))
+}
+
+impl Drop for ShaderVariant {
+    fn drop(&mut self) {
+        prepared_shader_registry()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.id);
+    }
+}
+
+pub(crate) fn project_shader_interface(
+    reflection: &ShaderReflection,
+) -> reims_vgpu_core::ShaderInterface {
+    use metal2vulkan::meta::{TextureComponent, TextureDimension, TextureFormat};
+    use metal2vulkan::reflect::{
+        BufferExtent, BufferIndexSource, ResourceAccess, ResourceKind, ShaderStage,
+    };
+    use reims_vgpu_core::{
+        ReflectedShaderStage, ShaderBufferByteRange, ShaderBufferExtent, ShaderBufferFootprint,
+        ShaderBufferIndexSource, ShaderBufferStrideTerm, ShaderBufferStridedAccess,
+        ShaderDescriptorLocation, ShaderInterface, ShaderResourceAccess, ShaderResourceBinding,
+        ShaderResourceKind, ShaderTextureComponent, ShaderTextureDimension, ShaderTextureShape,
+        UnsupportedShaderInterface,
+    };
+    use reims_vgpu_protocol::StorageImageFormat;
+
+    let stage = match reflection.stage {
+        ShaderStage::Vertex => ReflectedShaderStage::Vertex,
+        ShaderStage::TessellationEvaluation => ReflectedShaderStage::TessellationEvaluation,
+        ShaderStage::Fragment => ReflectedShaderStage::Fragment,
+        ShaderStage::Kernel => ReflectedShaderStage::Kernel,
+    };
+    let unsupported = if reflection.tessellation.is_some() {
+        Some(UnsupportedShaderInterface {
+            feature: "tessellation",
+            count: 1,
+        })
+    } else if !reflection.imageblock_layouts.is_empty() {
+        Some(UnsupportedShaderInterface {
+            feature: "kernel_imageblock",
+            count: reflection.imageblock_layouts.len(),
+        })
+    } else if !reflection.implicit_imageblock_attachments.is_empty() {
+        Some(UnsupportedShaderInterface {
+            feature: "implicit_imageblock_attachments",
+            count: reflection.implicit_imageblock_attachments.len(),
+        })
+    } else {
+        reflection
+            .fragment_imageblock
+            .as_ref()
+            .map(|imageblock| UnsupportedShaderInterface {
+                feature: "fragment_imageblock",
+                count: imageblock.members.len(),
+            })
+    };
+    let bindings = reflection
+        .bindings
+        .iter()
+        .map(|binding| {
+            let kind = match binding.kind {
+                ResourceKind::Buffer => ShaderResourceKind::Buffer,
+                ResourceKind::ThreadgroupBuffer => ShaderResourceKind::ThreadgroupBuffer,
+                ResourceKind::KernelStageInput => ShaderResourceKind::KernelStageInput,
+                ResourceKind::Texture => ShaderResourceKind::Texture,
+                ResourceKind::TextureArray => ShaderResourceKind::TextureArray,
+                ResourceKind::StorageImage => ShaderResourceKind::StorageImage,
+                ResourceKind::Sampler => ShaderResourceKind::Sampler,
+                ResourceKind::StaticSampler => ShaderResourceKind::StaticSampler,
+                ResourceKind::ColorInput => ShaderResourceKind::ColorInput,
+                ResourceKind::AccelerationStructureShadow => {
+                    ShaderResourceKind::AccelerationStructureShadow
+                }
+                ResourceKind::PrimitiveAccelerationStructure => {
+                    ShaderResourceKind::PrimitiveAccelerationStructure
+                }
+                ResourceKind::VisibleFunctionTable => ShaderResourceKind::VisibleFunctionTable,
+                ResourceKind::IntersectionFunctionTable => {
+                    ShaderResourceKind::IntersectionFunctionTable
+                }
+                ResourceKind::EmbeddedArgBufferTexture => {
+                    ShaderResourceKind::EmbeddedArgBufferTexture
+                }
+                ResourceKind::EmbeddedArgBufferBuffer => {
+                    ShaderResourceKind::EmbeddedArgBufferBuffer
+                }
+                ResourceKind::BufferAddressTable => ShaderResourceKind::BufferAddressTable,
+            };
+            let descriptor = binding
+                .descriptor
+                .map(|descriptor| ShaderDescriptorLocation {
+                    set: descriptor.set,
+                    binding: descriptor.binding,
+                    count: descriptor.count,
+                });
+            let extent = binding.extent.map(|extent| match extent {
+                BufferExtent::Object { bytes } => ShaderBufferExtent::Object { bytes },
+                BufferExtent::Unbounded => ShaderBufferExtent::Unbounded,
+                BufferExtent::Unknown => ShaderBufferExtent::Unknown,
+            });
+            let footprint = binding
+                .footprint
+                .as_ref()
+                .map(|footprint| ShaderBufferFootprint {
+                    static_ranges: footprint
+                        .static_ranges
+                        .iter()
+                        .map(|range| ShaderBufferByteRange {
+                            offset: range.offset,
+                            size: range.size,
+                        })
+                        .collect(),
+                    strided_accesses: footprint
+                        .strided_accesses
+                        .iter()
+                        .map(|access| ShaderBufferStridedAccess {
+                            base_offset: access.base_offset,
+                            access_size: access.access_size,
+                            terms: access
+                                .terms
+                                .iter()
+                                .map(|term| ShaderBufferStrideTerm {
+                                    source: match term.source {
+                                        BufferIndexSource::VertexIndex => {
+                                            ShaderBufferIndexSource::VertexIndex
+                                        }
+                                        BufferIndexSource::InstanceIndex => {
+                                            ShaderBufferIndexSource::InstanceIndex
+                                        }
+                                        BufferIndexSource::GlobalInvocationIdX => {
+                                            ShaderBufferIndexSource::GlobalInvocationIdX
+                                        }
+                                        BufferIndexSource::GlobalInvocationIdY => {
+                                            ShaderBufferIndexSource::GlobalInvocationIdY
+                                        }
+                                        BufferIndexSource::GlobalInvocationIdZ => {
+                                            ShaderBufferIndexSource::GlobalInvocationIdZ
+                                        }
+                                        BufferIndexSource::LocalInvocationIdX => {
+                                            ShaderBufferIndexSource::LocalInvocationIdX
+                                        }
+                                        BufferIndexSource::LocalInvocationIdY => {
+                                            ShaderBufferIndexSource::LocalInvocationIdY
+                                        }
+                                        BufferIndexSource::LocalInvocationIdZ => {
+                                            ShaderBufferIndexSource::LocalInvocationIdZ
+                                        }
+                                        BufferIndexSource::WorkgroupIdX => {
+                                            ShaderBufferIndexSource::WorkgroupIdX
+                                        }
+                                        BufferIndexSource::WorkgroupIdY => {
+                                            ShaderBufferIndexSource::WorkgroupIdY
+                                        }
+                                        BufferIndexSource::WorkgroupIdZ => {
+                                            ShaderBufferIndexSource::WorkgroupIdZ
+                                        }
+                                        BufferIndexSource::LocalInvocationIndex => {
+                                            ShaderBufferIndexSource::LocalInvocationIndex
+                                        }
+                                    },
+                                    stride: term.stride,
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                    has_unbounded_access: footprint.has_unbounded_access,
+                });
+            let texture_shape = binding.texture_shape.map(|shape| ShaderTextureShape {
+                dimension: match shape.dimension {
+                    TextureDimension::D1 => ShaderTextureDimension::D1,
+                    TextureDimension::D2 => ShaderTextureDimension::D2,
+                    TextureDimension::D3 => ShaderTextureDimension::D3,
+                    TextureDimension::Cube => ShaderTextureDimension::Cube,
+                    TextureDimension::Buffer => ShaderTextureDimension::Buffer,
+                },
+                arrayed: shape.arrayed,
+                multisampled: shape.multisampled,
+                component: match shape.component {
+                    TextureComponent::Float => ShaderTextureComponent::Float,
+                    TextureComponent::Sint => ShaderTextureComponent::Sint,
+                    TextureComponent::Uint => ShaderTextureComponent::Uint,
+                },
+                writable: shape.writable,
+                array_ref: shape.array_ref,
+                array_length: shape.array_length,
+                storage_format: shape.storage_format.map(|format| match format {
+                    TextureFormat::R16f => StorageImageFormat::R16Float,
+                    TextureFormat::Rg16f => StorageImageFormat::Rg16Float,
+                    TextureFormat::R32f => StorageImageFormat::R32Float,
+                    TextureFormat::R32ui => StorageImageFormat::R32Uint,
+                    TextureFormat::Rgba32f => StorageImageFormat::Rgba32Float,
+                    TextureFormat::Rgba16f => StorageImageFormat::Rgba16Float,
+                    TextureFormat::Rgba8ui => StorageImageFormat::Rgba8Uint,
+                    TextureFormat::Rgba16ui => StorageImageFormat::Rgba16Uint,
+                    TextureFormat::Rgba8i => StorageImageFormat::Rgba8Sint,
+                }),
+            });
+            let access = binding.access.map(|access| match access {
+                ResourceAccess::Unused => ShaderResourceAccess::Unused,
+                ResourceAccess::ReadOnly => ShaderResourceAccess::ReadOnly,
+                ResourceAccess::WriteOnly => ShaderResourceAccess::WriteOnly,
+                ResourceAccess::ReadWrite => ShaderResourceAccess::ReadWrite,
+                ResourceAccess::Sampled => ShaderResourceAccess::Sampled,
+                ResourceAccess::Storage => ShaderResourceAccess::Storage,
+            });
+            ShaderResourceBinding {
+                kind,
+                metal_index: binding.metal_index,
+                descriptor,
+                extent,
+                footprint,
+                texture_shape,
+                access,
+            }
+        })
+        .collect();
+    ShaderInterface {
+        stage,
+        bindings,
+        local_size: reflection.local_size,
+        unsupported,
     }
 }
 
 impl CachedShader {
+    /// Size of the translated executable module for diagnostics.
+    pub fn module_byte_len(&self) -> usize {
+        self.spirv.len()
+    }
+
+    /// Analyze one storage binding in the canonical translated module.
+    pub fn storage_image_access(
+        &self,
+        binding: u32,
+    ) -> Option<reims_vgpu_core::StorageImageAccess> {
+        crate::spirv_bind::storage_image_access(&self.words, binding)
+    }
+
+    /// Statically-used sampled bindings absent from `bound`.
+    pub fn neutral_sampled_image_bindings(&self, bound: &[u32]) -> Vec<u32> {
+        crate::spirv_bind::neutral_sampled_image_bindings(&self.words, bound)
+    }
+
+    /// Sampler interface of an unrelocated kernel module.
+    pub fn kernel_samplers(&self) -> Arc<[reims_vgpu_core::ReflectedSamplerDescriptor]> {
+        self.variant(false, false).samplers.clone()
+    }
+
+    /// Apply executor-native storage-format specialization and publish the
+    /// resulting module behind its semantic prepared-stage identity.
+    pub fn prepare_kernel(
+        &self,
+        requests: &[(u32, crate::spirv_bind::ImageFormat)],
+    ) -> Result<Arc<ShaderVariant>, crate::spirv_bind::ImageFormatSpecializeError> {
+        let mut words = self.words.as_ref().clone();
+        crate::spirv_bind::specialize_image_formats(&mut words, requests)?;
+        if requests
+            .iter()
+            .any(|(_, format)| matches!(format, crate::spirv_bind::ImageFormat::Unknown))
+        {
+            crate::spirv_bind::ensure_storage_write_without_format_capability(&mut words);
+        }
+        Ok(prepare_shader_words(words))
+    }
+
+    /// Whether translation retained the source module's data-layout contract.
+    pub fn source_datalayout_present(&self) -> bool {
+        self.reflection.datalayout.is_some()
+    }
+
     /// Materialize a freshly translated module, in the device's binding
     /// numbering rather than the translator's.
     ///
@@ -382,6 +866,7 @@ impl CachedShader {
     /// byte-identical to what the translator returned, and the bytes and the
     /// words must not be allowed to drift apart.
     pub fn new(spirv: Vec<u8>, reflection: Arc<ShaderReflection>) -> Self {
+        let interface = Arc::new(project_shader_interface(&reflection));
         let mut words: Vec<u32> = spirv
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -396,6 +881,7 @@ impl CachedShader {
         Self {
             spirv,
             reflection,
+            interface,
             words: Arc::new(words),
             base: OnceLock::new(),
             frag_reloc: Mutex::new(HashMap::new()),
@@ -848,6 +1334,16 @@ pub fn ensure_cached_async(air: &[u8], stage: Stage, pipeline_ref: u32) -> bool 
     ensure_cached_async_keyed(ShaderId::render(stage, air), stage, None, pipeline_ref)
 }
 
+/// Start translating a render stage without exposing translator-native types
+/// to the device composition layer.
+pub fn ensure_render_cached_async(
+    air: &[u8],
+    stage: RenderTranslationStage,
+    pipeline_ref: u32,
+) -> bool {
+    ensure_cached_async(air, stage.into(), pipeline_ref)
+}
+
 /// Kernel counterpart to [`ensure_cached_async`]. LocalSize is part of both
 /// the translation options and cache key, so two dispatch geometries can never
 /// alias one another.
@@ -1099,6 +1595,15 @@ pub fn translate_cached_reflected(
     Ok(shader)
 }
 
+/// Resolve a translated render shader through the backend-owned stage type.
+pub fn translate_render_cached_reflected(
+    air: &[u8],
+    stage: RenderTranslationStage,
+    pipeline_ref: u32,
+) -> M2vResult<Arc<CachedShader>> {
+    translate_cached_reflected(air, stage.into(), pipeline_ref)
+}
+
 /// Translate a **compute** AIR kernel with explicit LocalSize (threadgroup dims),
 /// returning the whole [`CachedShader`] (SPIR-V + reflection). See
 /// [`translate_cached_reflected`].
@@ -1255,6 +1760,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn prepared_identity_resolves_only_for_the_variant_lifetime() {
+        let shader = synth_shader(Stage::Vertex, Vec::new());
+        let variant = shader.variant(false, false);
+        let stage = prepared_stage(&variant);
+
+        let resolved = resolve_prepared_shader(stage.id).expect("live variant must resolve");
+        assert!(Arc::ptr_eq(&variant, &resolved));
+        assert_eq!(
+            stage.used_descriptor_bindings,
+            variant.used_descriptor_bindings
+        );
+
+        drop(resolved);
+        drop(variant);
+        drop(shader);
+        assert!(
+            resolve_prepared_shader(stage.id).is_none(),
+            "prepared identity must not extend native module ownership"
+        );
+    }
+
     /// Static use belongs to the executable variant, not to each draw that
     /// binds it. A declaration alone is legal to omit from a Vulkan layout;
     /// only an instruction reference enters the retained guard set.
@@ -1283,6 +1810,30 @@ mod tests {
                 .as_ref(),
             &[34]
         );
+    }
+
+    #[test]
+    fn retained_pipeline_projection_keeps_semantics_and_hides_native_words() {
+        let words = crate::spirv_bind::test_support::module_with_descriptor(34, true);
+        let shader = synth_shader(
+            Stage::Fragment,
+            words.iter().flat_map(|word| word.to_le_bytes()).collect(),
+        );
+        let family = prepare_render_shader(&shader, RenderTranslationStage::Fragment);
+
+        for (separate_sampled, buffer_collision) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let variant = family.variant(separate_sampled, buffer_collision);
+            assert_eq!(variant.word_count as usize, words.len());
+            assert_eq!(variant.declared_bindings.len(), 1);
+            let binding = variant.declared_bindings[0];
+            assert_eq!(
+                variant.descriptor_use(binding),
+                reims_vgpu_core::DescriptorUse::Used
+            );
+            assert!(resolve_prepared_shader(variant.program.id).is_some());
+        }
     }
 
     /// A minimal `CachedShader` wrapping raw bytes with an empty reflection —
@@ -1325,9 +1876,25 @@ mod tests {
         spirv: Vec<u8>,
         metal_indices: &[u32],
     ) -> Arc<CachedShader> {
+        synth_shader_with_resources(
+            stage,
+            spirv,
+            metal_indices,
+            metal2vulkan::reflect::ResourceKind::Sampler,
+            metal2vulkan::reflect::SAMPLER_BINDING_BASE,
+        )
+    }
+
+    fn synth_shader_with_resources(
+        stage: Stage,
+        spirv: Vec<u8>,
+        metal_indices: &[u32],
+        resource_kind: metal2vulkan::reflect::ResourceKind,
+        binding_base: u32,
+    ) -> Arc<CachedShader> {
         use metal2vulkan::reflect::{
-            DescriptorLocation, ResourceBinding, ResourceKind, ShaderReflection, ShaderStage,
-            REFLECTION_VERSION, RESOURCE_DESCRIPTOR_SET, SAMPLER_BINDING_BASE,
+            DescriptorLocation, ResourceBinding, ShaderReflection, ShaderStage, REFLECTION_VERSION,
+            RESOURCE_DESCRIPTOR_SET,
         };
         let reflected_stage = match stage {
             Stage::Vertex => ShaderStage::Vertex,
@@ -1338,11 +1905,11 @@ mod tests {
             .iter()
             .copied()
             .map(|metal_index| ResourceBinding {
-                kind: ResourceKind::Sampler,
+                kind: resource_kind,
                 metal_index,
                 descriptor: Some(DescriptorLocation {
                     set: RESOURCE_DESCRIPTOR_SET,
-                    binding: SAMPLER_BINDING_BASE + metal_index,
+                    binding: binding_base + metal_index,
                     count: 1,
                 }),
                 param_index: None,
@@ -1383,6 +1950,57 @@ mod tests {
                 function_constants: vec![],
             }),
         ))
+    }
+
+    #[test]
+    fn prepared_texture_use_is_keyed_by_metal_index_across_relocations() {
+        const METAL_INDEX: u32 = 2;
+        let binding = crate::spirv_bind::TEXTURE_BINDING_BASE + METAL_INDEX;
+        let words = crate::spirv_bind::test_support::module_with_descriptor(binding, true);
+        let shader = synth_shader_with_resources(
+            Stage::Fragment,
+            words.iter().flat_map(|word| word.to_le_bytes()).collect(),
+            &[METAL_INDEX],
+            metal2vulkan::reflect::ResourceKind::Texture,
+            crate::spirv_bind::TEXTURE_BINDING_BASE,
+        );
+        let family = prepare_render_shader(&shader, RenderTranslationStage::Fragment);
+
+        for (separate_sampled, buffer_collision) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let variant = family.variant(separate_sampled, buffer_collision);
+            assert_eq!(
+                variant.texture_use(METAL_INDEX),
+                reims_vgpu_core::DescriptorUse::Used
+            );
+            assert_eq!(
+                variant.texture_use(METAL_INDEX + 1),
+                reims_vgpu_core::DescriptorUse::NotDeclared
+            );
+            let sampled_offset = if separate_sampled {
+                crate::spirv_bind::FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
+            } else {
+                0
+            };
+            assert_eq!(
+                variant.texture_binding(METAL_INDEX, Some(binding)),
+                binding + sampled_offset
+            );
+            assert_eq!(
+                variant.sampler_binding(METAL_INDEX),
+                crate::spirv_bind::SAMPLER_BINDING_BASE + METAL_INDEX + sampled_offset
+            );
+            assert_eq!(
+                variant.buffer_binding(METAL_INDEX),
+                METAL_INDEX
+                    + if buffer_collision {
+                        crate::spirv_bind::FRAG_BUFFER_BINDING_OFFSET
+                    } else {
+                        0
+                    }
+            );
+        }
     }
 
     #[test]

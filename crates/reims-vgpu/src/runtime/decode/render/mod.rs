@@ -68,7 +68,7 @@ fn narrow_count(value: u64) -> Result<u32, DecodeStatus> {
 ///
 /// Because this is the single site, the count it guarantees is what let the
 /// four further `.max(1)`s downstream of it go: two in `runtime::exec`, one in
-/// `runtime::draw` and one in `runtime::draw::vulkan`, each re-applying a rule
+/// `runtime::draw` and one in `runtime::draw::execution`, each re-applying a rule
 /// already applied here. The last of those outlived the sweep that claimed all
 /// of them, which is the failure mode a restatement has: it changes nothing
 /// until the rule it copies changes, and then it changes one arm.
@@ -788,9 +788,9 @@ pub struct Command {
     /// setBlendColor RGBA floats (when kind is SetBlendColor).
     pub blend_color: [f32; 4],
     /// setCullMode
-    pub cull_mode: u32,
+    pub cull_mode: u64,
     /// setFrontFacingWinding
-    pub front_facing: u32,
+    pub front_facing: u64,
     /// setDepthBias (depthBias, slopeScale, clamp) as f32.
     pub depth_bias: [f32; 3],
     /// setDepthStencilState object ref
@@ -835,8 +835,8 @@ pub(crate) fn unclaimed_accepted_opcode() -> u32 {
     (0..=wire::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE)
         .find(|&op| {
             let mut v = vec![0u8; OP_HEADER_LEN];
-            crate::contract::endian::st32(&mut v[0..4], op);
-            crate::contract::endian::st32(&mut v[4..8], OP_HEADER_LEN as u32);
+            reims_vgpu_core::endian::st32(&mut v[0..4], op);
+            reims_vgpu_core::endian::st32(&mut v[4..8], OP_HEADER_LEN as u32);
             matches!(decode(&v), Ok(c) if c.kind == Kind::OtherAccepted)
         })
         .expect("every opcode in the window is decoded; the catch-all is unreachable")
@@ -1401,13 +1401,13 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
         wire::OPCODE_SET_CULL_MODE => {
             let m = wire::set_cull_mode(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::SetCullMode;
-            out.cull_mode = m.mode.get() as u32;
+            out.cull_mode = m.mode.get();
             Ok(out)
         }
         wire::OPCODE_SET_FRONT_FACING => {
             let m = wire::set_front_facing(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::SetFrontFacing;
-            out.front_facing = m.mode.get() as u32;
+            out.front_facing = m.mode.get();
             Ok(out)
         }
         wire::OPCODE_SET_DEPTH_BIAS => {
