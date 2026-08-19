@@ -1,17 +1,17 @@
 //! Resource-resolved state transitions carried outside the wire decoder.
 
-use reims_vgpu_protocol::{ObjectTableRef, ResourceId, ResourceObject, ResourceValidityOps};
+use reims_vgpu_protocol::{ResourceId, ResourceObject, ResourceValidityOps, SurfaceId};
 
 /// One decoded validity statement paired with the resource lifetime it names.
 ///
-/// `resource` is absent when the submission declares an object which has not
-/// been constructed in this device yet. The typed serializer reference remains
-/// available for mapping participation and deferred construction; numeric
-/// equality never substitutes for a resource identity.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// `resource` is absent when the statement names only resolved surface
+/// mappings and no constructed task resource. Deferred pre-construction
+/// currency is recorded before this resolved command is formed; no task-local
+/// object reference crosses the execution boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedResourceState {
-    pub object: ObjectTableRef<ResourceObject>,
     pub resource: Option<ResourceId<ResourceObject>>,
+    pub mappings: Box<[SurfaceId]>,
     pub ops: ResourceValidityOps,
 }
 
@@ -20,13 +20,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_unconstructed_reference_is_not_invented_as_a_resource_identity() {
+    fn resolved_state_carries_only_generational_and_surface_identities() {
         let update = ResolvedResourceState {
-            object: ObjectTableRef::new(7),
             resource: None,
+            mappings: vec![SurfaceId::new(7)].into_boxed_slice(),
             ops: ResourceValidityOps::PAGE_ON,
         };
-        assert_eq!(update.object.get(), 7);
         assert_eq!(update.resource, None);
+        assert_eq!(update.mappings.as_ref(), [SurfaceId::new(7)]);
     }
 }

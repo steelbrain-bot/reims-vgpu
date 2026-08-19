@@ -3,7 +3,7 @@
 //! A named GVA target is a task-local resource. Its `clear_host_valid` validity
 //! operation is the guest's notification that CPU writes superseded a host
 //! copy, and the core write-generation ledger retains that notification in
-//! the resource's native `(task, object)` namespace. Device writes are tracked
+//! the resource's canonical generational namespace. Device writes are tracked
 //! separately by [`reims_vgpu_core::HostWrites`] because different resource
 //! names may alias the same guest pages.
 //!
@@ -17,7 +17,9 @@ pub use reims_vgpu_core::{GvaStoreWitness, GvaTargetKey, GvaWriteReach, HostWrit
 
 /// Stamp a Store after its own page writes have been recorded.
 pub fn note_store(state: &mut Device, key: GvaTargetKey, gpas: &[u64]) {
-    let guest_write = state.resource_write_stamp(key.task_id, key.texture_ref);
+    let Some(guest_write) = state.resource_write_stamp_for(key.resource) else {
+        return;
+    };
     let host_epoch = state.content.host_writes.epoch();
     if !state
         .content
@@ -41,7 +43,9 @@ pub fn retire_pages(state: &mut Device, gone: &[u64]) {
 /// Compare the Store stamp with the guest's decoded validity statements and
 /// this device's exact page writes.
 pub fn reach(state: &Device, key: GvaTargetKey) -> GvaWriteReach {
-    let now = state.resource_write_stamp(key.task_id, key.texture_ref);
+    let Some(now) = state.resource_write_stamp_for(key.resource) else {
+        return GvaWriteReach::NoEntry;
+    };
     state
         .content
         .gva_stores
@@ -78,10 +82,10 @@ mod tests {
         Device::new(DeviceId::default(), PAGE_SHIFT_X86)
     }
 
-    fn key(task_id: u32, texture_ref: u32) -> GvaTargetKey {
+    fn key(state: &Device, task_id: u32, texture_ref: u32) -> GvaTargetKey {
         GvaTargetKey {
             task_id,
-            texture_ref,
+            resource: state.register_test_resource(task_id, texture_ref),
             gva: PAGE,
             generation: 9,
             width: 16,
@@ -93,11 +97,14 @@ mod tests {
     #[test]
     fn decoded_guest_write_invalidates_only_its_resource() {
         let mut state = state();
-        let a = key(1, 7);
-        let b = key(1, 8);
+        let a = key(&state, 1, 7);
+        let b = key(&state, 1, 8);
         note_store(&mut state, a, &[PAGE]);
         note_store(&mut state, b, &[2 * PAGE]);
-        state.content.preconstruction_writes.note_write(1, 7);
+        state
+            .task_objects
+            .resources
+            .note_guest_write_by_id(a.resource);
         assert_eq!(reach(&state, a), GvaWriteReach::GuestWrote);
         assert_eq!(reach(&state, b), GvaWriteReach::Quiet);
     }
@@ -105,8 +112,8 @@ mod tests {
     #[test]
     fn device_write_invalidates_every_alias_of_its_page() {
         let mut state = state();
-        let a = key(1, 7);
-        let b = key(2, 8);
+        let a = key(&state, 1, 7);
+        let b = key(&state, 2, 8);
         note_store(&mut state, a, &[PAGE]);
         note_store(&mut state, b, &[PAGE]);
         state.note_host_wrote_pages(vec![PAGE]);
@@ -123,16 +130,24 @@ mod tests {
     #[test]
     fn anonymous_or_unstamped_target_never_reads_quiet() {
         let mut state = state();
-        let anonymous = key(1, 0);
-        note_store(&mut state, anonymous, &[PAGE]);
+        let unnamed = GvaTargetKey {
+            task_id: 1,
+            resource: reims_vgpu_protocol::ResourceId::new(99, 1),
+            gva: PAGE,
+            generation: 9,
+            width: 16,
+            height: 16,
+            bgra: true,
+        };
+        note_store(&mut state, unnamed, &[PAGE]);
         assert_eq!(state.content.gva_stores.len(), 0);
-        assert_eq!(reach(&state, anonymous), GvaWriteReach::NoEntry);
+        assert_eq!(reach(&state, unnamed), GvaWriteReach::NoEntry);
     }
 
     #[test]
     fn task_retirement_ends_witness_lifetime() {
         let mut state = state();
-        let target = key(4, 12);
+        let target = key(&state, 4, 12);
         note_store(&mut state, target, &[PAGE]);
         state.content.gva_stores.retire_task(4);
         assert_eq!(reach(&state, target), GvaWriteReach::NoEntry);

@@ -1,6 +1,6 @@
 //! Opaque ownership contracts for executor-local residents.
 
-use reims_vgpu_protocol::StorageImageFormat;
+use reims_vgpu_protocol::{ResourceId, ResourceObject, StorageImageFormat};
 use std::collections::BTreeMap;
 
 /// Whether a retained guest-memory gather is licensed for identity reuse.
@@ -29,15 +29,13 @@ pub enum ComputeStorageOrigin {
         span_end: u64,
     },
     Linear {
-        task_id: u32,
-        texture_ref: u32,
+        resource: ResourceId<ResourceObject>,
         gva: u64,
         row_stride: u32,
         span_end: u64,
     },
     Heap {
-        task_id: u32,
-        texture_ref: u32,
+        resource: ResourceId<ResourceObject>,
     },
 }
 
@@ -84,8 +82,7 @@ impl ComputeStorageResidencyKey {
         reason = "the key constructor names every contract identity component"
     )]
     pub fn linear(
-        task_id: u32,
-        texture_ref: u32,
+        resource: ResourceId<ResourceObject>,
         gva: u64,
         row_stride: u32,
         span_end: u64,
@@ -95,8 +92,7 @@ impl ComputeStorageResidencyKey {
     ) -> Self {
         Self {
             origin: ComputeStorageOrigin::Linear {
-                task_id,
-                texture_ref,
+                resource,
                 gva,
                 row_stride,
                 span_end,
@@ -108,17 +104,13 @@ impl ComputeStorageResidencyKey {
     }
 
     pub fn heap(
-        task_id: u32,
-        texture_ref: u32,
+        resource: ResourceId<ResourceObject>,
         width: u32,
         height: u32,
         pixel_format: u16,
     ) -> Self {
         Self {
-            origin: ComputeStorageOrigin::Heap {
-                task_id,
-                texture_ref,
-            },
+            origin: ComputeStorageOrigin::Heap { resource },
             width,
             height,
             pixel_format,
@@ -145,23 +137,22 @@ impl ComputeStorageResidencyKey {
         }
     }
 
-    pub fn linear_window(&self) -> Option<(u32, u32, u64, u32, u64)> {
+    pub fn linear_window(&self) -> Option<(ResourceId<ResourceObject>, u64, u32, u64)> {
         match self.origin {
             ComputeStorageOrigin::Linear {
-                task_id,
-                texture_ref,
+                resource,
                 gva,
                 row_stride,
                 span_end,
-            } => Some((task_id, texture_ref, gva, row_stride, span_end)),
+            } => Some((resource, gva, row_stride, span_end)),
             ComputeStorageOrigin::Surface { .. } | ComputeStorageOrigin::Heap { .. } => None,
         }
     }
 
-    pub fn resource_ref(&self) -> Option<u32> {
+    pub fn resource(&self) -> Option<ResourceId<ResourceObject>> {
         match self.origin {
-            ComputeStorageOrigin::Linear { texture_ref, .. }
-            | ComputeStorageOrigin::Heap { texture_ref, .. } => Some(texture_ref),
+            ComputeStorageOrigin::Linear { resource, .. }
+            | ComputeStorageOrigin::Heap { resource, .. } => Some(resource),
             ComputeStorageOrigin::Surface { .. } => None,
         }
     }
@@ -246,8 +237,9 @@ mod tests {
     #[test]
     fn compute_residency_origins_are_disjoint_typed_identities() {
         let surface = ComputeStorageResidencyKey::surface(7, 2, 0, 64, 4096, 16, 16, 0x50);
-        let linear = ComputeStorageResidencyKey::linear(7, 2, 0, 64, 4096, 16, 16, 0x50);
-        let heap = ComputeStorageResidencyKey::heap(7, 2, 16, 16, 0x50);
+        let resource = reims_vgpu_protocol::ResourceId::new(2, 7);
+        let linear = ComputeStorageResidencyKey::linear(resource, 0, 64, 4096, 16, 16, 0x50);
+        let heap = ComputeStorageResidencyKey::heap(resource, 16, 16, 0x50);
 
         assert_ne!(surface, linear);
         assert_ne!(linear, heap);
@@ -256,7 +248,7 @@ mod tests {
             ComputeStorageOrigin::Surface { .. }
         ));
         assert_eq!(surface.surface_window(), Some((7, 0, 4096)));
-        assert_eq!(linear.resource_ref(), Some(2));
+        assert_eq!(linear.resource(), Some(resource));
         assert!(heap.is_heap());
     }
 
@@ -264,7 +256,12 @@ mod tests {
     fn residency_invalidation_retires_only_intersecting_surface_windows() {
         let hit = ComputeStorageResidencyKey::surface(7, 1, 0, 16, 64, 4, 4, 0x50);
         let sibling = ComputeStorageResidencyKey::surface(7, 1, 128, 16, 192, 4, 4, 0x50);
-        let heap = ComputeStorageResidencyKey::heap(1, 2, 4, 4, 0x50);
+        let heap = ComputeStorageResidencyKey::heap(
+            reims_vgpu_protocol::ResourceId::new(2, 1),
+            4,
+            4,
+            0x50,
+        );
         let mut ledger = ComputeResidencyLedger::default();
         ledger.publish(hit, 3);
         ledger.publish(sibling, 4);
@@ -275,5 +272,26 @@ mod tests {
         assert_eq!(ledger.generation(&hit), None);
         assert_eq!(ledger.generation(&sibling), Some(4));
         assert_eq!(ledger.generation(&heap), Some(5));
+    }
+
+    #[test]
+    fn reused_object_index_does_not_inherit_compute_residency() {
+        let old = ComputeStorageResidencyKey::heap(
+            reims_vgpu_protocol::ResourceId::new(9, 1),
+            4,
+            4,
+            0x50,
+        );
+        let replacement = ComputeStorageResidencyKey::heap(
+            reims_vgpu_protocol::ResourceId::new(9, 2),
+            4,
+            4,
+            0x50,
+        );
+        let mut ledger = ComputeResidencyLedger::default();
+        ledger.publish(old, 7);
+
+        assert_eq!(ledger.generation(&old), Some(7));
+        assert_eq!(ledger.generation(&replacement), None);
     }
 }

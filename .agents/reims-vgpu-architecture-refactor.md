@@ -816,6 +816,24 @@ Implementation checkpoint (2026-08-19):
   Apple Silicon product clippy pass with warnings denied. The host-window documentation build,
   formatting, and `git diff --check` pass; rustdoc retains 116 pre-existing unresolved-link
   warnings, and Apple targeting retains only the third-party `block` future-incompatibility notice.
+  A post-completion lifetime audit then found one remaining class of reusable wire names in durable
+  execution state. GVA writeback debt, Store and gather witnesses, compute residency, resolved blit
+  commands, and resource-state commands now carry the canonical generational `ResourceId` instead
+  of `(task, object-table reference)`. Compatibility APIs recover a wire reference from the graph
+  only at the final legacy host boundary; it is no longer an executor identity. Resource deletion
+  also retires native linear residents before removing the graph edge needed to name their owner.
+  Focused fixtures prove that deleting and recreating the same object-table slot cannot inherit
+  writeback debt, a gather witness, or compute residency from the retired generation. The audit
+  also removed the last test that parsed a QEMU source file to assert a call shape. The cursor
+  allocator bound and shim call ownership remain documented review invariants; actual ABI constants
+  continue to be checked at the Rust/C header boundary. The resulting serial full-workspace
+  checkpoint passes 1,277 product tests, 156 core
+  tests, 715 Vulkan tests, 152 wire tests, and all integration and documentation targets; only the
+  existing explicitly ignored measurement/oracle cases remain. Native workspace and Apple Silicon
+  product clippy pass with warnings denied. The complete feature matrix passes Linux
+  Vulkan/window, Apple Silicon Vulkan/window, the option ROM, and both formatting cells; the
+  host-window documentation build and `git diff --check` also pass with the same 116 pre-existing
+  unresolved-link warnings.
 
 Completion audit (2026-08-19):
 
@@ -824,12 +842,12 @@ Completion audit (2026-08-19):
 | 1. Semantic vocabulary | Protocol owns typed task/object/serializer/resource/storage/mapping identities; mapper fixtures retain 64-bit refs and independent plane/rotation; unknown variants decline by type. | Complete |
 | 2. Executor port | Core owns `ResolvedSubmission`, ordered command buffers, `ExecutionCompletion`, and `ExecutionPort`; product draw/compute execution reaches Vulkan only through `VulkanExecutor`; scripted executors validate identity, kind, and completion count. | Complete |
 | 3. Device-scoped Vulkan | `VulkanExecutor` owns a `SessionHandle`, resident leases, imports, presenter, submission state, and reset; live-session registration is weak and immutable caches remain content-keyed. | Complete |
-| 4. Canonical resource graph | `TaskResources` and the core graph own generational resources, storage/view/backing/mapping relations, participation, deletion, and in-flight retention. Product texture-to-mapping and live-object side maps are gone; mapper and registered-surface policies remain distinct. | Complete within established mapper contract |
-| 5. Content authority | Resource versions, mapping currency, sampled identity, GVA Store witness, pending writeback, host replicas, and executor materialization use typed transitions; delayed-completion and sole-copy fixtures pin ordering. | Complete |
-| 6. Immutable normalization | Core command buffers carry resolved generational endpoints; `PreparedDraw` and compute/blit/resource-state commands are immutable, and operation outputs return only in typed completion facts. | Complete |
+| 4. Canonical resource graph | `TaskResources` and the core graph own generational resources, storage/view/backing/mapping relations, participation, deletion, and in-flight retention. Durable GVA debt/witness, gather, and compute-residency keys carry `ResourceId`, so a reused object-table slot cannot inherit the retired generation. Product texture-to-mapping and live-object side maps are gone; mapper and registered-surface policies remain distinct. | Complete within established mapper contract |
+| 5. Content authority | Resource versions, mapping currency, sampled identity, GVA Store witness, pending writeback, host replicas, and executor materialization use typed transitions; delayed-completion, sole-copy, and stale-slot fixtures pin ordering and generation isolation. | Complete |
+| 6. Immutable normalization | Core command buffers carry resolved generational endpoints; `PreparedDraw` and compute/blit/resource-state commands are immutable, carry no unresolved task-local object reference, and return operation outputs only in typed completion facts. | Complete |
 | 7. Topology policy | Structural classification has one owner; sealed unified/discrete policies choose only memory requests and batch defaults. Four-cell tests prove every policy/capability combination retains a valid correctness route. | Complete |
 | 8. Composition reduction | Host capabilities are split into narrow ports; page geometry is explicit; presentation viewport/source/result are core semantics; PCI/MMIO use the shared shim and arm mapper behavior stays in its pathway policy. | Complete |
-| 9. Old architecture deletion | Reset-only backend, backend feature fork, contract façade, direct draw-to-Vulkan module, raw type-7/type-11 semantics, sentinel residency, duplicated product identity maps, mutable output requests, and direct runtime engine calls outside the executor adapter are removed. | Complete |
+| 9. Old architecture deletion | Reset-only backend, backend feature fork, contract façade, direct draw-to-Vulkan module, raw type-7/type-11 semantics, sentinel and task/ref residency identities, duplicated product identity maps, mutable output requests, direct runtime engine calls outside the executor adapter, and the source-text call-shape test are removed. | Complete |
 
 The four undriven arm experiments—task death with live mapper views, live reset, interrupted queued
 teardown, and display-versus-ordinary retirement—remain validation work, not guessed shared

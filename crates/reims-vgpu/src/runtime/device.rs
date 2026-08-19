@@ -230,6 +230,27 @@ impl Device {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn register_test_resource(
+        &self,
+        task_id: u32,
+        object_ref: u32,
+    ) -> reims_vgpu_protocol::ResourceId<reims_vgpu_protocol::ResourceObject> {
+        let resource = std::sync::Arc::new(crate::model::TaskResource::new(
+            reims_vgpu_protocol::ObjectListEntry::new(
+                reims_vgpu_protocol::ObjectKind::Buffer,
+                0,
+                0,
+            ),
+            std::sync::Arc::from([]),
+        ));
+        self.task_objects
+            .resources
+            .register(task_id, object_ref, resource)
+            .semantic_id()
+            .expect("test resource was published")
+    }
+
     pub fn map_surface(&mut self, mapping_id: u32) -> bool {
         match self.state.try_map_surface(mapping_id) {
             Ok(()) => true,
@@ -430,6 +451,7 @@ mod tests {
         let mut device = Device::new(DeviceId(3), crate::model::PAGE_SHIFT_X86);
         device.state.define_task(7, 0x4000, 1);
         assert!(device.insert_object(7, 11));
+        let resource = device.register_test_resource(7, 11);
         device.bound_buffers.insert(7, 11, 0, None, held(0x1000));
         device
             .state
@@ -439,7 +461,7 @@ mod tests {
         device.state.content.pending_writebacks.ensure_gva_resource(
             reims_vgpu_core::GvaResourceKey {
                 task_id: 7,
-                texture_ref: 11,
+                resource,
             },
             0x1000,
             0x1000,
@@ -472,12 +494,13 @@ mod tests {
         device.state.define_task(8, 0x4000, 1);
         assert!(device.insert_object(8, 20));
         assert!(device.insert_object(8, 21));
+        let resource = device.register_test_resource(8, 20);
         device.bound_buffers.insert(8, 20, 0, None, held(0x1000));
         device.bound_buffers.insert(8, 21, 0, None, held(0x3000));
         device.state.content.pending_writebacks.ensure_gva_resource(
             reims_vgpu_core::GvaResourceKey {
                 task_id: 8,
-                texture_ref: 20,
+                resource,
             },
             0x1000,
             0x1000,

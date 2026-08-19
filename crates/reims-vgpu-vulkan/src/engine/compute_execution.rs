@@ -266,26 +266,28 @@ pub(super) fn residency_fields(
             ("residency_span_end", span_end.to_string()),
         ]),
         reims_vgpu_core::ComputeStorageOrigin::Linear {
-            task_id,
-            texture_ref,
+            resource,
             gva,
             row_stride,
             span_end,
         } => fields.extend([
             ("residency_kind", "linear".to_string()),
-            ("residency_task", task_id.to_string()),
-            ("residency_texture_ref", texture_ref.to_string()),
+            ("residency_resource", resource.index().to_string()),
+            (
+                "residency_resource_generation",
+                resource.generation().to_string(),
+            ),
             ("residency_gva", format!("{gva:#x}")),
             ("residency_row_stride", row_stride.to_string()),
             ("residency_span_end", span_end.to_string()),
         ]),
-        reims_vgpu_core::ComputeStorageOrigin::Heap {
-            task_id,
-            texture_ref,
-        } => fields.extend([
+        reims_vgpu_core::ComputeStorageOrigin::Heap { resource } => fields.extend([
             ("residency_kind", "heap".to_string()),
-            ("residency_task", task_id.to_string()),
-            ("residency_texture_ref", texture_ref.to_string()),
+            ("residency_resource", resource.index().to_string()),
+            (
+                "residency_resource_generation",
+                resource.generation().to_string(),
+            ),
         ]),
     }
     fields
@@ -406,29 +408,40 @@ mod tests {
         );
         assert_eq!(
             residency_fields(&ComputeStorageResidencyKey::linear(
-                4, 11, 0xa000, 512, 8192, 32, 16, 70,
+                reims_vgpu_protocol::ResourceId::new(11, 4),
+                0xa000,
+                512,
+                8192,
+                32,
+                16,
+                70,
             )),
             vec![
                 ("residency_width", "32".into()),
                 ("residency_height", "16".into()),
                 ("residency_pixel_format", "70".into()),
                 ("residency_kind", "linear".into()),
-                ("residency_task", "4".into()),
-                ("residency_texture_ref", "11".into()),
+                ("residency_resource", "11".into()),
+                ("residency_resource_generation", "4".into()),
                 ("residency_gva", "0xa000".into()),
                 ("residency_row_stride", "512".into()),
                 ("residency_span_end", "8192".into()),
             ]
         );
         assert_eq!(
-            residency_fields(&ComputeStorageResidencyKey::heap(4, 12, 8, 4, 60)),
+            residency_fields(&ComputeStorageResidencyKey::heap(
+                reims_vgpu_protocol::ResourceId::new(12, 4),
+                8,
+                4,
+                60,
+            )),
             vec![
                 ("residency_width", "8".into()),
                 ("residency_height", "4".into()),
                 ("residency_pixel_format", "60".into()),
                 ("residency_kind", "heap".into()),
-                ("residency_task", "4".into()),
-                ("residency_texture_ref", "12".into()),
+                ("residency_resource", "12".into()),
+                ("residency_resource_generation", "4".into()),
             ]
         );
     }

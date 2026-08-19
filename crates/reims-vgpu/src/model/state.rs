@@ -421,6 +421,23 @@ impl TaskResources {
         self.get(task_id, ref_)?.semantic_id()
     }
 
+    /// Recover composition routing metadata from a canonical resource lifetime.
+    ///
+    /// Resolved command envelopes carry only `ResourceId`; task-local object
+    /// names remain inside the graph and are projected here only for legacy
+    /// host materializations which have not yet adopted generational keys.
+    pub(crate) fn owner(
+        &self,
+        id: ResourceId<ResourceObject>,
+    ) -> Option<(TaskId, ObjectTableRef<ResourceObject>)> {
+        let registry = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let node = registry.graph.resource(id)?;
+        Some((node.task, node.object))
+    }
+
     /// Publish a newly constructed object unless another lookup won the race.
     pub fn register(
         &self,
@@ -531,6 +548,15 @@ impl TaskResources {
             .graph
             .resolve(TaskId::new(task_id), ObjectTableRef::new(ref_))?;
         Some((id, registry.graph.resource(id)?.content.current()))
+    }
+
+    pub fn content_version_for(&self, id: ResourceId<ResourceObject>) -> Option<ContentVersion> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .graph
+            .resource(id)
+            .map(|node| node.content.current())
     }
 
     /// Snapshot content through an already resolved task resource.
@@ -4152,6 +4178,17 @@ impl DeviceState {
             })
     }
 
+    /// Content currency for an already resolved resource lifetime.
+    pub fn resource_write_stamp_for(
+        &self,
+        resource: ResourceId<ResourceObject>,
+    ) -> Option<reims_vgpu_core::ResourceWriteStamp> {
+        self.task_objects
+            .resources
+            .content_version_for(resource)
+            .map(|version| reims_vgpu_core::ResourceWriteStamp::Resolved { resource, version })
+    }
+
     /// GPA for a guest PFN under this device's page size.
     #[inline]
     pub fn pfn_gpa(&self, pfn: u32) -> u64 {
@@ -4437,10 +4474,12 @@ impl DeviceState {
         if e.resident_gen == 0 || e.row_stride > u32::MAX as u64 {
             return;
         }
+        let Some(resource) = self.task_objects.resources.identity(task_id, texture_ref) else {
+            return;
+        };
         self.host_materializations
             .retire_linear_resident(ComputeStorageResidencyKey::linear(
-                task_id,
-                texture_ref,
+                resource,
                 e.gva,
                 e.row_stride as u32,
                 e.row_stride.saturating_mul(e.height as u64),
@@ -4495,6 +4534,7 @@ impl DeviceState {
         // Drop objects for this task on redefine.
         #[cfg(test)]
         self.fixtures.objects.retain(|&(t, _)| t != task_id);
+        self.retire_task_linear_residents(task_id);
         let retired = self.retire_task_namespaces(task_id);
         // A deleted task's whole address space goes with it, so its live
         // mappings are not leaks and a reused id must not inherit them.
@@ -4503,7 +4543,6 @@ impl DeviceState {
         // this id is losing, and after a redefine they describe whatever the
         // guest has since done with them.
         self.observations.node_guard.remove(&task_id);
-        self.retire_task_linear_residents(task_id);
         // New directory ⇒ old GVA HostOps views alias the wrong PT — retire.
         self.retire_task_gva_views(task_id);
         self.content.retire_task(task_id);
@@ -4535,8 +4574,8 @@ impl DeviceState {
         }
         #[cfg(test)]
         self.fixtures.objects.retain(|&(t, _)| t != task_id);
-        let retired = self.retire_task_namespaces(task_id);
         self.retire_task_linear_residents(task_id);
+        let retired = self.retire_task_namespaces(task_id);
         self.host_replicas.forget_task_textures(task_id);
         // Clear texture→mapping latches for this task.
         #[cfg(test)]
@@ -4687,8 +4726,8 @@ impl DeviceState {
         let removed = self.fixtures.objects.remove(&(task_id, ref_));
         #[cfg(not(test))]
         let removed = false;
-        let resource_removed = self.task_objects.resources.delete(task_id, ref_);
         let (texture_removed, linear_removed) = self.invalidate_object_host_copies(task_id, ref_);
+        let resource_removed = self.task_objects.resources.delete(task_id, ref_);
         #[cfg(test)]
         let mapping_removed = self
             .fixtures

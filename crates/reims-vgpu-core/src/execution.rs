@@ -105,7 +105,7 @@ pub struct BlitCompletion {
 }
 
 /// A resource-state command accepted at its ordered point in the submission.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResourceStateCompletion {
     pub update: ResolvedResourceState,
 }
@@ -309,8 +309,8 @@ mod tests {
     #[test]
     fn resource_state_is_a_command_not_mutable_submission_metadata() {
         let update = ResolvedResourceState {
-            object: reims_vgpu_protocol::ObjectTableRef::new(5),
             resource: None,
+            mappings: vec![reims_vgpu_protocol::SurfaceId::new(5)].into_boxed_slice(),
             ops: reims_vgpu_protocol::ResourceValidityOps::PAGE_ON,
         };
         let buffer: ResolvedCommandBuffer<(), ()> =

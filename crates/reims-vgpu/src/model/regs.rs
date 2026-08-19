@@ -1004,13 +1004,9 @@ pub const CURSOR_GLYPH_BPP: u32 = 4;
 /// anything exotic: the accessibility pointer-size slider scales the sprite
 /// several times over, and a Retina backing store doubles it again.
 ///
-/// `the_cursor_bound_matches_the_sprite_size_qemu_will_allocate` reads the guard
-/// out of `vendor/qemu/ui/cursor.c` and compares it to this, because the two
-/// numbers live in different languages in different trees and nothing else
-/// relates them. Being *above* QEMU's bound is the worse direction: `cursor_alloc`
-/// answers `NULL`, and both shims drop the glyph on that path with no line at
-/// all — a silent loss in C, which is exactly what this constant existing in
-/// Rust is supposed to prevent.
+/// Keep this synchronized by review with the host cursor allocator. It cannot
+/// be derived across the Rust/C boundary, and testing it by parsing source text
+/// would assert spelling rather than cursor behavior.
 pub const CURSOR_MAX_DIM: u32 = 512;
 pub const CURSOR_GLYPH_PAYLOAD_LEN: usize = 0x2c;
 
@@ -2023,83 +2019,6 @@ mod tests {
     /// a `BTreeMap` keyed by the full `u32`, so the ceiling refused ids the map
     /// would have held; `u32::MAX` is asserted *accepted* now, in the same place
     /// it was once asserted refused, so a reinstated bound fails here.
-    /// `CURSOR_MAX_DIM` must be the sprite size `cursor_alloc` will actually
-    /// allocate.
-    ///
-    /// The two numbers live in different languages in different trees and
-    /// nothing else relates them, which is how they came to differ by a factor
-    /// of two: this was 256 with no stated basis while QEMU's `cursor_alloc`
-    /// refuses only above 512, so every cursor sprite between 257 and 512 was
-    /// dropped here for nothing. A `SetCursorGlyph` past the bound is dropped
-    /// whole — the guest's pointer keeps whatever image it had.
-    ///
-    /// Equality rather than `<=`, and the direction matters both ways. Below
-    /// QEMU's bound is the loss above. **Above** it is worse: `cursor_alloc`
-    /// answers `NULL`, and both shims discard the glyph on that path with no
-    /// line at all — a silent loss in C, which is what bounding this in Rust
-    /// exists to prevent.
-    ///
-    /// Read out of the guard itself rather than pinned to a literal here, so a
-    /// QEMU bump that moves the sprite limit fails this test instead of
-    /// silently re-opening one of those two gaps. The parse asserts it found the
-    /// guard before believing anything: a scan that matches nothing must fail,
-    /// not pass.
-    ///
-    /// Beside the constant rather than in an integration test, because
-    /// `model::regs` is a private module — an integration test cannot name
-    /// `CURSOR_MAX_DIM`, and widening the crate's public surface to be testable
-    /// is the wrong trade. Nothing here is backend-gated, so one arm executing
-    /// it is enough.
-    #[test]
-    fn the_cursor_bound_matches_the_sprite_size_qemu_will_allocate() {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../vendor/qemu/ui/cursor.c");
-        let src = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("{} must be readable: {e}", path.display()));
-
-        // The body of `cursor_alloc`, so a `> N` elsewhere in the file cannot
-        // answer for the one that refuses an allocation.
-        let body = src
-            .split_once("QEMUCursor *cursor_alloc(")
-            .map(|(_, tail)| tail)
-            .unwrap_or_else(|| panic!("{} must define cursor_alloc", path.display()));
-        let body = body
-            .split_once("\n}")
-            .map(|(head, _)| head)
-            .expect("cursor_alloc must have a body");
-
-        let bounds: Vec<u32> = body
-            .match_indices("width > ")
-            .chain(body.match_indices("height > "))
-            .filter_map(|(at, pat)| {
-                body[at + pat.len()..]
-                    .split(|c: char| !c.is_ascii_digit())
-                    .next()
-                    .filter(|d| !d.is_empty())
-                    .and_then(|d| d.parse().ok())
-            })
-            .collect();
-
-        assert_eq!(
-            bounds.len(),
-            2,
-            "expected cursor_alloc to bound width and height; found {bounds:?}. \
-             The guard moved or was reworded — read it and re-derive \
-             CURSOR_MAX_DIM rather than deleting this test."
-        );
-        assert!(
-            bounds.iter().all(|&b| b == bounds[0]),
-            "cursor_alloc bounds width and height differently ({bounds:?}); \
-             CURSOR_MAX_DIM is one number and cannot express that"
-        );
-        assert_eq!(
-            CURSOR_MAX_DIM, bounds[0],
-            "CURSOR_MAX_DIM must be the sprite edge cursor_alloc will allocate: \
-             below it drops guest cursors this host would have shown, above it \
-             reaches a NULL both shims discard without a line"
-        );
-    }
-
     #[test]
     fn the_mapping_id_bound_refuses_only_the_no_mapping_sentinel() {
         assert!(

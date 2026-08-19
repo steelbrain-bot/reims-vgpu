@@ -62,7 +62,7 @@ use reims_vgpu_core::{
     TextureExtent, TextureOrigin,
 };
 use reims_vgpu_core::{FenceAction, SynchronizationDomain as FenceDomain};
-use reims_vgpu_protocol::{ByteLength, GuestVirtualAddress, MappingId, ObjectTableRef};
+use reims_vgpu_protocol::{ByteLength, GuestVirtualAddress, MappingId};
 use reims_vgpu_wire::ops::blit as wire_blit;
 
 /// Chunk size for fill/copy host staging (bounded guest IO).
@@ -520,8 +520,6 @@ fn resolve_texture_copy_batch<M: HostMemory + HostOps>(
     }
     let first_level = levels.remove(0);
     Ok(ResolvedBlit::TextureCopyBatch(ResolvedTextureCopyBatch {
-        source_object: ObjectTableRef::new(cmd.source),
-        destination_object: ObjectTableRef::new(cmd.destination),
         source_base_slice: cmd.source_slice,
         destination_base_slice: cmd.destination_slice,
         first_level,
@@ -660,9 +658,6 @@ fn resolve_texture_to_texture_blit<M: HostMemory + HostOps>(
                 depth: cmd.source_size.depth,
             },
             aspect,
-            destination_object: ObjectTableRef::<reims_vgpu_protocol::ResourceObject>::new(
-                cmd.destination,
-            ),
         },
     ))
 }
@@ -1688,13 +1683,8 @@ fn note_blit_endpoint_debt(state: &Device, task_id: u32, texture_ref: u32) {
     if state.content.pending_writebacks.is_empty() {
         return;
     }
-    if state
-        .content
-        .pending_writebacks
-        .has_gva(crate::runtime::writeback_debt::GvaResourceKey {
-            task_id,
-            texture_ref,
-        })
+    if crate::runtime::writeback_debt::resource_key(state, task_id, texture_ref)
+        .is_some_and(|key| state.content.pending_writebacks.has_gva(key))
     {
         crate::runtime::drain::note_store_route("blit_endpoint_owed_gva");
     }
@@ -3238,6 +3228,23 @@ fn execute_resolved_texture_to_buffer<M: HostMemory + HostOps>(
     Ok(())
 }
 
+fn resolved_object(
+    state: &Device,
+    task_id: u32,
+    resource: reims_vgpu_protocol::ResourceId<reims_vgpu_protocol::ResourceObject>,
+) -> Result<u32, BlitStatus> {
+    let Some((owner_task, object)) = state.task_objects.resources.owner(resource) else {
+        return Err(br(BlitStatus::MissingResource, "resolved_resource_retired"));
+    };
+    if owner_task.get() != task_id {
+        return Err(br(
+            BlitStatus::MissingResource,
+            "resolved_resource_task_mismatch",
+        ));
+    }
+    Ok(object.get())
+}
+
 fn execute_resolved_texture_to_texture<M: HostMemory + HostOps>(
     state: &mut Device,
     host: &mut M,
@@ -3257,8 +3264,12 @@ fn execute_resolved_texture_to_texture<M: HostMemory + HostOps>(
         destination_origin,
         extent,
         aspect,
-        destination_object,
     } = operation;
+    let destination_resource = destination.content.resource;
+    let destination_object = match resolved_object(state, task_id, destination_resource) {
+        Ok(object) => object,
+        Err(status) => return status,
+    };
     let src = source.backing;
     let dst = destination.backing;
     // Options apply to both ends; plane bpp must agree under the selected aspect.
@@ -3712,7 +3723,7 @@ fn execute_resolved_texture_to_texture<M: HostMemory + HostOps>(
                     state,
                     host,
                     task_id,
-                    destination_object.get(),
+                    destination_object,
                     s,
                     d,
                 ) {
@@ -3981,8 +3992,8 @@ fn gpu_whole_plane_destination(
 /// caller then runs the host path unchanged, so nothing here can lose a frame —
 /// only spend one.
 struct WholePlaneGpuCopy<'a> {
-    source_object: ObjectTableRef<reims_vgpu_protocol::ResourceObject>,
-    destination_object: ObjectTableRef<reims_vgpu_protocol::ResourceObject>,
+    source_object: u32,
+    destination_object: u32,
     level_count: u16,
     slice_count: u16,
     destination: &'a TextureBacking,
@@ -4002,16 +4013,13 @@ fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
         slice_count,
         destination,
     } = copy;
-    let key = crate::runtime::writeback_debt::GvaResourceKey {
-        task_id,
-        texture_ref: source_object.get(),
-    };
+    let key = crate::runtime::writeback_debt::resource_key(state, task_id, source_object)?;
     let debt = state.content.pending_writebacks.get_gva(key);
     if let Err(refusal) = gpu_whole_plane_admissible(
         level_count,
         slice_count,
-        source_object.get(),
-        destination_object.get(),
+        source_object,
+        destination_object,
         debt.is_some(),
     ) {
         note_store_route(refusal.route());
@@ -4321,13 +4329,21 @@ fn execute_resolved_texture_copy_batch<M: HostMemory + HostOps>(
     operation: ResolvedTextureCopyBatch,
 ) -> BlitStatus {
     let ResolvedTextureCopyBatch {
-        source_object,
-        destination_object,
         source_base_slice,
         destination_base_slice,
         first_level,
         remaining_levels,
     } = operation;
+    let source_resource = first_level.first_slice.0.content.resource;
+    let destination_resource = first_level.first_slice.1.content.resource;
+    let source_object = match resolved_object(state, task_id, source_resource) {
+        Ok(object) => object,
+        Err(status) => return status,
+    };
+    let destination_object = match resolved_object(state, task_id, destination_resource) {
+        Ok(object) => object,
+        Err(status) => return status,
+    };
     let level_count = u16::try_from(1usize.saturating_add(remaining_levels.len()))
         .expect("wire level count fits u16");
     let slice_count = u16::try_from(1usize.saturating_add(first_level.remaining_slices.len()))
@@ -4335,8 +4351,8 @@ fn execute_resolved_texture_copy_batch<M: HostMemory + HostOps>(
 
     // A partial destination overwrite must preserve bytes outside the copied
     // region before either execution policy runs.
-    note_blit_endpoint_debt(state, task_id, destination_object.get());
-    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, destination_object.get());
+    note_blit_endpoint_debt(state, task_id, destination_object);
+    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, destination_object);
     if let Some(status) = try_copy_whole_plane_on_gpu(
         state,
         host,
@@ -4351,8 +4367,8 @@ fn execute_resolved_texture_copy_batch<M: HostMemory + HostOps>(
     ) {
         return status;
     }
-    note_blit_endpoint_debt(state, task_id, source_object.get());
-    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, source_object.get());
+    note_blit_endpoint_debt(state, task_id, source_object);
+    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, source_object);
     for level in std::iter::once(&first_level).chain(remaining_levels.iter()) {
         // `blit_kind_t2t_sl_us` charges this function 28.8 s of a 29.1 s rail
         // while `blit_rows_us` — its linear arm's whole copy — reads 0.275 s.

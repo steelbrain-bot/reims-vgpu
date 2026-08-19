@@ -6430,10 +6430,11 @@ fn a_gva_span_no_store_has_stamped_refuses_the_resident_sample_rung() {
     let no_entry = store_route_count("gvaw_no_entry");
     let absent = store_route_count("gvarung_resident_absent");
     let served = store_route_count("gvarung_resident");
-    let resource = crate::model::TaskResource::new(
+    let resource = std::sync::Arc::new(crate::model::TaskResource::new(
         reims_vgpu_protocol::ObjectListEntry::new(ObjectKind::Buffer, 0, 0),
         std::sync::Arc::from([]),
-    );
+    ));
+    let resource = state.task_objects.resources.register(1, 7, resource);
     let sampled_only = store_route_count("gvarung_sampled_only");
     assert!(
         super::try_gva_resident_sample(&mut state, &mut host, 1, 7, &resource, &tex).is_none(),
@@ -6468,7 +6469,7 @@ fn a_gva_span_no_store_has_stamped_refuses_the_resident_sample_rung() {
     // makes it unreachable rather than merely out-voted.
     let orphan = GvaTargetKey {
         task_id: 1,
-        texture_ref: 7,
+        resource: resource.semantic_id().unwrap(),
         gva,
         generation: 0xdead_beef,
         width,

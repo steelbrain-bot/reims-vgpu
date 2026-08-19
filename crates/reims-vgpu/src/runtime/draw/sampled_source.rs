@@ -2523,16 +2523,13 @@ pub(super) fn gva_resident_if_current<M: HostMemory + HostOps>(
     }
     let span_bytes = u64::from(row_stride).saturating_mul(u64::from(h));
     let generation = if texture_ref != 0 {
-        crate::runtime::writeback_debt::gva_resource_generation(
-            state,
-            host,
-            crate::runtime::writeback_debt::GvaResourceKey {
-                task_id,
-                texture_ref,
-            },
-            gva,
-            span_bytes,
-        )
+        crate::runtime::writeback_debt::resource_key(state, task_id, texture_ref)
+            .map(|key| {
+                crate::runtime::writeback_debt::gva_resource_generation(
+                    state, host, key, gva, span_bytes,
+                )
+            })
+            .unwrap_or(0)
     } else {
         gva_span_alloc_generation(state, host, task_id, gva, row_stride, h)
     };
@@ -2557,11 +2554,13 @@ pub(super) fn gva_resident_if_current<M: HostMemory + HostOps>(
             .then_some(identity)
             .ok_or(GvaResidentRefusal::NoResident);
     }
+    let key = crate::runtime::writeback_debt::resource_key(state, task_id, texture_ref)
+        .ok_or(GvaResidentRefusal::NoGeneration)?;
     let verdict = reach(
         state,
         GvaTargetKey {
             task_id,
-            texture_ref,
+            resource: key.resource,
             gva,
             generation,
             width: w,
@@ -2933,6 +2932,10 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // lightweight retained-allocation handles across that call. This applies to
     // a direct-image candidate too: exact image admission belongs to the
     // backend, and if it declines the copied fallback needs the same identity
+    let resource = state
+        .task_objects
+        .resources
+        .identity(task_id, texture_ref)?;
     // every other packed source uses or it would upload on every bind.
     let packed = if available {
         allocation.as_ref().and_then(|backing| {
@@ -2953,14 +2956,14 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
             len: span,
         }];
         let stated = crate::runtime::gather_witness::StatedGeneration::TaskResource(
-            state.resource_write_stamp(task_id, texture_ref),
+            state.resource_write_stamp_for(resource)?,
         );
         let seen = crate::runtime::gather_witness::note_gather(
             state,
             crate::runtime::gather_witness::GatherRail::Linear,
             crate::runtime::gather_witness::GatherKey::TaskGva {
                 task_id,
-                resource_ref: texture_ref,
+                resource,
                 gva,
             },
             stated,
@@ -3020,14 +3023,14 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     };
     let page = state.page_size() as usize;
     let stated = crate::runtime::gather_witness::StatedGeneration::TaskResource(
-        state.resource_write_stamp(task_id, texture_ref),
+        state.resource_write_stamp_for(resource)?,
     );
     let seen = crate::runtime::gather_witness::note_gather(
         state,
         crate::runtime::gather_witness::GatherRail::Linear,
         crate::runtime::gather_witness::GatherKey::TaskGva {
             task_id,
-            resource_ref: texture_ref,
+            resource,
             gva,
         },
         stated,

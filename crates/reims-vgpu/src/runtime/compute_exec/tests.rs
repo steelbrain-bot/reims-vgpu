@@ -1684,8 +1684,11 @@ fn stage_heap_texture_uses_host_only_residency_identity() {
     assert_eq!(
         residency.key.origin,
         crate::model::ComputeStorageOrigin::Heap {
-            task_id: 1,
-            texture_ref,
+            resource: state
+                .task_objects
+                .resources
+                .identity(1, texture_ref)
+                .unwrap(),
         }
     );
     assert_eq!(residency.seed_generation, 0);
@@ -2571,8 +2574,7 @@ fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
                 linear(crate::runtime::draw::StoreTargetPages::empty()),
                 Some(ComputeStorageResidencyCandidate {
                     key: crate::model::ComputeStorageResidencyKey::linear(
-                        1,
-                        44,
+                        reims_vgpu_protocol::ResourceId::new(44, 1),
                         0x101000,
                         8,
                         0x101010,
@@ -2849,7 +2851,10 @@ fn live_compute_mirrors_are_not_evicted_by_an_invented_capacity() {
     const SURFACE_RESOURCE_REF: u32 = 99;
 
     let staged = |key: ComputeStorageResidencyKey| StagedTexture {
-        resource_ref: key.resource_ref().unwrap_or(SURFACE_RESOURCE_REF),
+        resource_ref: key
+            .resource()
+            .map(|resource| resource.index())
+            .unwrap_or(SURFACE_RESOURCE_REF),
         binding: 33,
         array_element: 0,
         descriptor_count: 1,
@@ -2871,7 +2876,12 @@ fn live_compute_mirrors_are_not_evicted_by_an_invented_capacity() {
     };
 
     for tex in 0..LIVE_WINDOWS {
-        let key = ComputeStorageResidencyKey::heap(1, tex, 16, 16, 0x50);
+        let key = ComputeStorageResidencyKey::heap(
+            reims_vgpu_protocol::ResourceId::new(tex, 1),
+            16,
+            16,
+            0x50,
+        );
         assert!(matches!(
             key.origin,
             crate::model::ComputeStorageOrigin::Heap { .. }
@@ -2890,7 +2900,12 @@ fn live_compute_mirrors_are_not_evicted_by_an_invented_capacity() {
         "every independently live mirror remains owned"
     );
     for tex in 0..LIVE_WINDOWS {
-        let key = ComputeStorageResidencyKey::heap(1, tex, 16, 16, 0x50);
+        let key = ComputeStorageResidencyKey::heap(
+            reims_vgpu_protocol::ResourceId::new(tex, 1),
+            16,
+            16,
+            0x50,
+        );
         assert!(
             state.content.compute_residency.contains(&key),
             "heap texture {tex} lost its mirror"

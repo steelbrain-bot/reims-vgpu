@@ -53,16 +53,17 @@ pub(super) fn color_target_identity<M: HostMemory + HostOps>(
     }
     let generation = known_gva_generation.unwrap_or_else(|| {
         if color.texture_ref != 0 {
-            crate::runtime::writeback_debt::gva_resource_generation(
-                state,
-                host,
-                crate::runtime::writeback_debt::GvaResourceKey {
-                    task_id,
-                    texture_ref: color.texture_ref,
-                },
-                color.target_gva(),
-                u64::from(color.row_stride()).saturating_mul(u64::from(color.height)),
-            )
+            crate::runtime::writeback_debt::resource_key(state, task_id, color.texture_ref)
+                .map(|key| {
+                    crate::runtime::writeback_debt::gva_resource_generation(
+                        state,
+                        host,
+                        key,
+                        color.target_gva(),
+                        u64::from(color.row_stride()).saturating_mul(u64::from(color.height)),
+                    )
+                })
+                .unwrap_or(0)
         } else {
             gva_span_alloc_generation(
                 state,
@@ -353,16 +354,17 @@ pub(super) fn gva_alloc_generation<M: HostMemory + HostOps>(
     // Same span as the deferred arm walks (`arm_gva_deferred_store`) so the two
     // describe one region: the guest bytes a Store into this target writes.
     if c0.texture_ref != 0 {
-        crate::runtime::writeback_debt::gva_resource_generation(
-            state,
-            host,
-            crate::runtime::writeback_debt::GvaResourceKey {
-                task_id: req.task_id,
-                texture_ref: c0.texture_ref,
-            },
-            c0.target_gva(),
-            u64::from(c0.row_stride()).saturating_mul(u64::from(c0.height)),
-        )
+        crate::runtime::writeback_debt::resource_key(state, req.task_id, c0.texture_ref)
+            .map(|key| {
+                crate::runtime::writeback_debt::gva_resource_generation(
+                    state,
+                    host,
+                    key,
+                    c0.target_gva(),
+                    u64::from(c0.row_stride()).saturating_mul(u64::from(c0.height)),
+                )
+            })
+            .unwrap_or(0)
     } else {
         gva_span_alloc_generation(
             state,

@@ -626,9 +626,11 @@ fn replace_physical_retires_only_the_named_resource() {
 
     let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    let key = |texture_ref| GvaResourceKey {
+    let a = state.register_test_resource(3, 12);
+    let b = state.register_test_resource(3, 13);
+    let key = |resource| GvaResourceKey {
         task_id: 3,
-        texture_ref,
+        resource,
     };
     let debt = |gva, generation| GvaWritebackDebt {
         linear: crate::runtime::draw::LinearColorTarget {
@@ -650,14 +652,14 @@ fn replace_physical_retires_only_the_named_resource() {
         state
             .content
             .pending_writebacks
-            .arm_gva(key(12), debt(0x4000, 1)),
+            .arm_gva(key(a), debt(0x4000, 1)),
         None
     );
     assert_eq!(
         state
             .content
             .pending_writebacks
-            .arm_gva(key(13), debt(0x8000, 2)),
+            .arm_gva(key(b), debt(0x8000, 2)),
         None
     );
 
@@ -678,12 +680,12 @@ fn replace_physical_retires_only_the_named_resource() {
         },
     );
 
-    assert!(state.content.pending_writebacks.get_gva(key(12)).is_none());
+    assert!(state.content.pending_writebacks.get_gva(key(a)).is_none());
     assert_eq!(
         state
             .content
             .pending_writebacks
-            .get_gva(key(13))
+            .get_gva(key(b))
             .map(|debt| debt.generation),
         Some(2),
         "an unrelated resource on the task keeps its authoritative frame"

@@ -1943,13 +1943,13 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             ));
             return Err(ComputeStatus::Unsupported("compute_heap_host_len"));
         };
-        let key = crate::model::ComputeStorageResidencyKey::heap(
-            task_id,
-            texture_ref,
-            width,
-            height,
-            format,
-        );
+        let Some(resource_id) = state.task_objects.resources.identity(task_id, texture_ref) else {
+            return Err(ComputeStatus::MissingTexture(
+                "compute_heap_resource_identity",
+            ));
+        };
+        let key =
+            crate::model::ComputeStorageResidencyKey::heap(resource_id, width, height, format);
         let serve = match state.content.compute_residency.generation(&key) {
             None => None,
             Some(generation) => {
@@ -2581,18 +2581,20 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     // entry exactly. Absent when the stride overflows the key field (no live
     // class; such a window simply stays on the bytes path).
     let span = layout.row_stride.saturating_mul(h as u64);
-    let linear_key = (layout.row_stride <= u32::MAX as u64).then(|| {
-        crate::model::ComputeStorageResidencyKey::linear(
-            task_id,
-            stage_ref,
-            gva,
-            layout.row_stride as u32,
-            span,
-            w,
-            h,
-            stage_format,
-        )
-    });
+    let linear_key = (layout.row_stride <= u32::MAX as u64)
+        .then(|| state.task_objects.resources.identity(task_id, stage_ref))
+        .flatten()
+        .map(|resource| {
+            crate::model::ComputeStorageResidencyKey::linear(
+                resource,
+                gva,
+                layout.row_stride as u32,
+                span,
+                w,
+                h,
+                stage_format,
+            )
+        });
     let serve = match (
         linear_key,
         crate::runtime::surface_cache::linear_texture_resident_gen(state, &window),

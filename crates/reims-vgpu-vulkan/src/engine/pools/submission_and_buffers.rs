@@ -4429,7 +4429,15 @@ mod recycle_tests {
     fn maintenance_does_not_reclaim_compute_storage_by_age() {
         let mut pools = ResourcePools::new();
         let admit = |pools: &mut ResourcePools, tex: u32, touch: u64, pinned: bool| {
-            let id = ComputeStorageResidencyKey::linear(0, tex, 0, 0, 0, 8, 8, 0);
+            let id = ComputeStorageResidencyKey::linear(
+                reims_vgpu_protocol::ResourceId::new(tex, 1),
+                0,
+                0,
+                0,
+                8,
+                8,
+                0,
+            );
             pools.compute_storage_registry.insert(
                 id,
                 ResidentStorageImageSlot {
@@ -4598,7 +4606,15 @@ mod recycle_tests {
         touch: u64,
         pinned: bool,
     ) -> ComputeStorageResidencyKey {
-        let id = ComputeStorageResidencyKey::linear(0, tex, 0, 0, 0, 8, 8, 0);
+        let id = ComputeStorageResidencyKey::linear(
+            reims_vgpu_protocol::ResourceId::new(tex, 1),
+            0,
+            0,
+            0,
+            8,
+            8,
+            0,
+        );
         pools.compute_storage_registry.insert(
             id,
             ResidentStorageImageSlot {
@@ -5261,7 +5277,15 @@ mod recycle_tests {
     #[test]
     fn a_compute_writeback_against_an_unregistered_identity_records_no_pin() {
         let mut pools = ResourcePools::new();
-        let absent = ComputeStorageResidencyKey::linear(0, 77, 0, 0, 0, 8, 8, 0);
+        let absent = ComputeStorageResidencyKey::linear(
+            reims_vgpu_protocol::ResourceId::new(77, 1),
+            0,
+            0,
+            0,
+            8,
+            8,
+            0,
+        );
 
         pools.note_guest_write_recorded(GuestWriteSource::ResidentStorage(&absent));
 

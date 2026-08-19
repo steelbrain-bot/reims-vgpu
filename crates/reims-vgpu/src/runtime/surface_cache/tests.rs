@@ -438,6 +438,7 @@ fn linear_resident_retires_on_task_and_object_delete() {
     use reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA16_FLOAT;
     let mut st = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     st.define_task(6, 0x1000, 1);
+    let first_resource = st.register_test_resource(6, 21);
     let win = LinearWindow {
         task_id: 6,
         texture_ref: 21,
@@ -454,7 +455,10 @@ fn linear_resident_retires_on_task_and_object_delete() {
     assert_eq!(st.host_materializations.queued_linear_residents().len(), 1);
     let key = st.host_materializations.queued_linear_residents()[0];
     assert!(key.is_linear());
-    assert_eq!(key.linear_window(), Some((6, 21, 0x30_2000, 32, 64)));
+    assert_eq!(
+        key.linear_window(),
+        Some((first_resource, 0x30_2000, 32, 64))
+    );
     crate::runtime::render_writeback::retire_linear_residents(&mut st);
     assert!(st
         .host_materializations
@@ -463,12 +467,13 @@ fn linear_resident_retires_on_task_and_object_delete() {
 
     st.define_task(6, 0x1000, 1);
     st.insert_object(6, 21);
+    let second_resource = st.register_test_resource(6, 21);
     assert!(note_linear_texture_resident(&mut st, &win, 5));
     assert!(st.delete_object(6, 21));
     assert_eq!(st.host_materializations.queued_linear_residents().len(), 1);
     assert_eq!(
-        st.host_materializations.queued_linear_residents()[0].resource_ref(),
-        Some(21)
+        st.host_materializations.queued_linear_residents()[0].resource(),
+        Some(second_resource)
     );
     // Non-resident entries retire nothing.
     let _ = st.host_materializations.take_linear_residents();

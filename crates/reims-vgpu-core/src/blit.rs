@@ -1,9 +1,7 @@
 //! Immutable, resource-resolved blit operations.
 
 use crate::{pixel_format::BlitAspect, ContentStamp};
-use reims_vgpu_protocol::{
-    ByteLength, GuestVirtualAddress, MappingId, ObjectTableRef, ResourceId, ResourceObject,
-};
+use reims_vgpu_protocol::{ByteLength, GuestVirtualAddress, MappingId, ResourceId, ResourceObject};
 
 /// One resolved mip level in a task-address texture allocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -133,10 +131,6 @@ pub struct ResolvedTextureToTextureBlit {
     pub destination_origin: TextureOrigin,
     pub extent: TextureExtent,
     pub aspect: BlitAspect,
-    /// Typed object name retained only for compatibility cache invalidation on
-    /// the direct resident-to-guest optimization. The destination's authority
-    /// and completion identity are `destination.content`.
-    pub destination_object: ObjectTableRef<ResourceObject>,
 }
 
 /// All slice pairs at one mip level of a whole-texture copy.
@@ -151,8 +145,6 @@ pub struct ResolvedTextureLevelCopy {
 /// its guest-byte fallback explicitly settles the named resources first.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedTextureCopyBatch {
-    pub source_object: ObjectTableRef<ResourceObject>,
-    pub destination_object: ObjectTableRef<ResourceObject>,
     pub source_base_slice: u16,
     pub destination_base_slice: u16,
     pub first_level: ResolvedTextureLevelCopy,
@@ -424,8 +416,6 @@ mod tests {
     fn a_texture_copy_batch_is_non_empty_by_construction() {
         let destination = linear_endpoint(22);
         let operation = ResolvedBlit::TextureCopyBatch(ResolvedTextureCopyBatch {
-            source_object: ObjectTableRef::new(7),
-            destination_object: ObjectTableRef::new(9),
             source_base_slice: 0,
             destination_base_slice: 0,
             first_level: ResolvedTextureLevelCopy {

@@ -107,9 +107,13 @@ fn gather_key_log_token(key: GatherKey) -> String {
     match key {
         GatherKey::TaskGva {
             task_id,
-            resource_ref,
+            resource,
             gva,
-        } => format!("gva:{task_id}:{resource_ref}:{gva:#x}"),
+        } => format!(
+            "gva:{task_id}:{}:{}:{gva:#x}",
+            resource.index(),
+            resource.generation()
+        ),
         GatherKey::Mapping {
             mapping,
             base_offset,
@@ -1044,12 +1048,12 @@ mod tests {
         let keys = [
             GatherKey::TaskGva {
                 task_id: 7,
-                resource_ref: 3,
+                resource: reims_vgpu_protocol::ResourceId::new(3, 1),
                 gva: 0x1000,
             },
             GatherKey::TaskGva {
                 task_id: 8,
-                resource_ref: 4,
+                resource: reims_vgpu_protocol::ResourceId::new(4, 1),
                 gva: 0x1000,
             },
             GatherKey::Mapping {

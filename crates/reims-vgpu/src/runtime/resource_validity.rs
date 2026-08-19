@@ -53,7 +53,6 @@ use reims_vgpu_core::{
     CommandExecution, ExecutionOutput, ResolvedCommand, ResolvedResourceState, ResolvedSubmission,
     ResourceStateCompletion,
 };
-use reims_vgpu_protocol::{ObjectTableRef, ResourceObject};
 
 /// Which producer delivered a quad. Only used to name the counters, so an arm
 /// can tell an exec-table statement from an invalidate-command one.
@@ -96,11 +95,38 @@ pub fn apply(
     ops: InvalidateValidityOps,
     site: ValiditySite,
 ) -> ValidityOutcome {
+    if object_id == 0 {
+        // Null resources name no state and are not failed resolutions.
+        return ValidityOutcome::default();
+    }
+    let resource = state.task_objects.resources.identity(task_id, object_id);
+    let mappings = state
+        .mappings_named_by(task_id, object_id)
+        .iter()
+        .map(reims_vgpu_protocol::SurfaceId::new)
+        .filter(|surface| state.surfaces.mappings.contains_key(&surface.get()))
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    // Pre-construction currency is a normalization-side effect: it preserves a
+    // guest write when no canonical resource exists yet, but the unresolved
+    // object name itself does not cross the execution boundary.
+    if ops.clear_host_valid != 0 {
+        state
+            .content
+            .preconstruction_writes
+            .note_write(task_id, object_id);
+        crate::runtime::drain::note_store_route("buffer_write_gen_bump");
+        crate::runtime::drain::note_store_route(site.clear_host_route());
+    }
+    if ops.clear_guest_valid != 0 {
+        note_owed_guest_read(state, task_id, object_id);
+    }
     let update = ResolvedResourceState {
-        object: ObjectTableRef::<ResourceObject>::new(object_id),
-        resource: state.task_objects.resources.identity(task_id, object_id),
+        resource,
+        mappings,
         ops,
     };
+    let expected = update.clone();
     let context = crate::runtime::executor::context_for(state, task_id);
     let submission =
         ResolvedSubmission::<(), ()>::single(context, ResolvedCommand::ResourceState(update));
@@ -111,7 +137,7 @@ pub fn apply(
         |()| -> Result<CommandExecution<()>, std::convert::Infallible> { unreachable!() },
         |_| -> Result<CommandExecution<_>, std::convert::Infallible> { unreachable!() },
         |update| {
-            outcome.set(Some(apply_resolved(state, task_id, update, site)));
+            outcome.set(Some(apply_resolved(state, update.clone())));
             Ok(CommandExecution::without_gpu_materialization(
                 ResourceStateCompletion { update },
             ))
@@ -122,31 +148,16 @@ pub fn apply(
         completion.output.as_ref(),
         [ExecutionOutput::ResourceState(ResourceStateCompletion {
             update: completed
-        })] if *completed == update
+        })] if *completed == expected
     ));
     outcome
         .get()
         .expect("the single resource-state command was executed")
 }
 
-fn apply_resolved(
-    state: &mut Device,
-    task_id: u32,
-    update: ResolvedResourceState,
-    site: ValiditySite,
-) -> ValidityOutcome {
+fn apply_resolved(state: &mut Device, update: ResolvedResourceState) -> ValidityOutcome {
     let mut out = ValidityOutcome::default();
-    let object_id = update.object.get();
     let ops = update.ops;
-    if object_id == 0 {
-        // `writeInvalidates` skips null resources and id 0; `pageBacking` never
-        // emits one. A zero id names nothing to apply to — and is not a *miss*
-        // either, so it returns before the accounting below rather than through
-        // it. The resolver answers "nothing named" for it too; this is the
-        // difference between a record that named nothing and a record that was
-        // not a record.
-        return out;
-    }
     if ops.clear_host_valid != 0 {
         // The object graph owns content authority for every constructed
         // resource, including buffers and textures without a SurfaceMappingEntry.
@@ -159,13 +170,13 @@ fn apply_resolved(
                 .note_guest_write_by_id(resource);
         }
     }
-    let targets = state.mappings_named_by(task_id, object_id);
-    let mut hit = false;
-    for id in targets.iter() {
-        if !state.apply_surface_validity(reims_vgpu_protocol::SurfaceId::new(id), ops) {
-            continue;
-        }
-        hit = true;
+    for surface in &update.mappings {
+        let id = surface.get();
+        let applied = state.apply_surface_validity(*surface, ops);
+        debug_assert!(
+            applied,
+            "resolved live surface disappeared during transition"
+        );
         if ops.clear_host_valid != 0 {
             // The guest wrote these pages after our last render into them, so
             // our copy is stale by the guest's own statement and the next read
@@ -178,58 +189,41 @@ fn apply_resolved(
             crate::runtime::drain::note_store_route("validity_gen_bump");
         }
     }
-    out.missed = !hit;
-    if ops.clear_host_valid != 0 {
-        // Preserve the statement if it preceded object construction. Once the
-        // object exists, consumers use the canonical content version updated
-        // above; this fallback can no longer decide its currency.
-        state
-            .content
-            .preconstruction_writes
-            .note_write(task_id, object_id);
-        crate::runtime::drain::note_store_route("buffer_write_gen_bump");
-        crate::runtime::drain::note_store_route(site.clear_host_route());
-    }
-    if ops.clear_guest_valid != 0 {
-        // Byte +6 of the exec-table record, and the one op in the quad this
-        // device stores without anything reading it.
-        //
-        // Its name here is not settled. Under this crate's reading the guest is
-        // declaring its own copy stale; under the emitting driver's it is the
-        // page-off / synchronize-requested flag, the guest explicitly asking for
-        // host->guest visibility. The alarm below is deliberately built to be
-        // correct under *both*, because the two readings agree about what
-        // happens next: the guest is about to look at these guest pages. A frame
-        // this device still owes them is unserved guest work either way.
-        //
-        // Expected to stay at zero, and a firing is the bug — the shape
-        // `AGENTS.md` calls a healthy-zero alarm. It matters because the blit
-        // rail stopped manufacturing host visibility for every
-        // `copyFromTexture:toTexture:`, on the grounds that the command does not
-        // carry it; this is the counterpart check that the guest's *explicit*
-        // request is not being dropped on the floor at the same time.
-        let owed_gva = state.content.pending_writebacks.has_gva(
-            crate::runtime::writeback_debt::GvaResourceKey {
-                task_id,
-                texture_ref: object_id,
-            },
-        );
-        if owed_gva {
-            crate::observe::Emit::decline(
-                "validity_guest_read",
-                &GuestReadDecline::GvaFrameStillOwed,
-            )
+    out.missed = update.mappings.is_empty();
+    out
+}
+
+fn note_owed_guest_read(state: &Device, task_id: u32, object_id: u32) {
+    // Byte +6 of the exec-table record, and the one op in the quad this
+    // device stores without anything reading it.
+    //
+    // Its name here is not settled. Under this crate's reading the guest is
+    // declaring its own copy stale; under the emitting driver's it is the
+    // page-off / synchronize-requested flag, the guest explicitly asking for
+    // host->guest visibility. The alarm below is deliberately built to be
+    // correct under *both*, because the two readings agree about what
+    // happens next: the guest is about to look at these guest pages. A frame
+    // this device still owes them is unserved guest work either way.
+    //
+    // Expected to stay at zero, and a firing is the bug — the shape
+    // `AGENTS.md` calls a healthy-zero alarm. It matters because the blit
+    // rail stopped manufacturing host visibility for every
+    // `copyFromTexture:toTexture:`, on the grounds that the command does not
+    // carry it; this is the counterpart check that the guest's *explicit*
+    // request is not being dropped on the floor at the same time.
+    let owed_gva = crate::runtime::writeback_debt::resource_key(state, task_id, object_id)
+        .is_some_and(|key| state.content.pending_writebacks.has_gva(key));
+    if owed_gva {
+        crate::observe::Emit::decline("validity_guest_read", &GuestReadDecline::GvaFrameStillOwed)
             .field("task", task_id)
             .field("object", object_id)
             .fail_once(u64::from(object_id));
-            // Both, not either: the decline dedupes per object so a standing
-            // problem reads as one line, and the counter is what says whether
-            // that line stood for one occurrence or a million.
-            crate::runtime::drain::note_store_route("validity_guest_read_frame_owed");
-        }
-        crate::runtime::drain::note_store_route("validity_clr_guest");
+        // Both, not either: the decline dedupes per object so a standing
+        // problem reads as one line, and the counter is what says whether
+        // that line stood for one occurrence or a million.
+        crate::runtime::drain::note_store_route("validity_guest_read_frame_owed");
     }
-    out
+    crate::runtime::drain::note_store_route("validity_clr_guest");
 }
 
 /// The guest signalled on byte +6 for a resource this device has not finished
@@ -361,6 +355,17 @@ mod tests {
     use super::*;
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
 
+    fn resource_key(
+        state: &Device,
+        task_id: u32,
+        texture_ref: u32,
+    ) -> crate::runtime::writeback_debt::GvaResourceKey {
+        crate::runtime::writeback_debt::GvaResourceKey {
+            task_id,
+            resource: state.register_test_resource(task_id, texture_ref),
+        }
+    }
+
     fn quad(clr_h: u8, set_h: u8, clr_g: u8, set_g: u8) -> InvalidateValidityOps {
         InvalidateValidityOps {
             clear_host_valid: clr_h,
@@ -460,12 +465,9 @@ mod tests {
     fn byte_six_against_an_owed_frame_is_an_alarm_and_is_otherwise_quiet() {
         let task_id = 4;
         let texture_ref = 12;
-        let key = crate::runtime::writeback_debt::GvaResourceKey {
-            task_id,
-            texture_ref,
-        };
         let debt = |state: &mut Device| {
-            let before = state.resource_write_stamp(task_id, texture_ref);
+            let key = resource_key(state, task_id, texture_ref);
+            let before = state.resource_write_stamp_for(key.resource).unwrap();
             let _ = state.content.pending_writebacks.arm_gva(
                 key,
                 crate::runtime::writeback_debt::GvaWritebackDebt {
@@ -551,11 +553,8 @@ mod tests {
             .or_default()
             .lifecycle
             .active = true;
-        let key = crate::runtime::writeback_debt::GvaResourceKey {
-            task_id,
-            texture_ref,
-        };
-        let before = state.resource_write_stamp(task_id, texture_ref);
+        let key = resource_key(&state, task_id, texture_ref);
+        let before = state.resource_write_stamp_for(key.resource).unwrap();
         let _ = state.content.pending_writebacks.arm_gva(
             key,
             crate::runtime::writeback_debt::GvaWritebackDebt {

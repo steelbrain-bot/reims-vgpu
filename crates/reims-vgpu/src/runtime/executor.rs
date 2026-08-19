@@ -1837,8 +1837,7 @@ mod tests {
         );
         let state = Device::new_with_executor(DeviceId(1), 12, scripted);
         let key = crate::model::ComputeStorageResidencyKey::linear(
-            2,
-            3,
+            reims_vgpu_protocol::ResourceId::new(3, 1),
             0x4000,
             256,
             4096,

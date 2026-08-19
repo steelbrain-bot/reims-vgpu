@@ -1909,17 +1909,17 @@ fn install_linear_rgba(
 /// leaves the ledger empty and a resolve that did not leaves it holding one.
 #[test]
 fn a_blit_endpoint_lands_the_writeback_its_texture_still_owes() {
-    use crate::runtime::writeback_debt::{GvaResourceKey, GvaWritebackDebt};
+    use crate::runtime::writeback_debt::GvaWritebackDebt;
 
     const STRIDE: u32 = 64;
     let (mut host, mut state) = blit_device();
     install_linear_rgba(&mut host, &mut state, 2, 2, 16, 8, STRIDE);
+    crate::runtime::objects::resolve_resource(&state, &host, 1, 2)
+        .expect("installed texture resolves");
 
-    let key = GvaResourceKey {
-        task_id: 1,
-        texture_ref: 2,
-    };
-    let guest_write = state.resource_write_stamp(key.task_id, key.texture_ref);
+    let key = crate::runtime::writeback_debt::resource_key(&state, 1, 2)
+        .expect("installed texture has a canonical identity");
+    let guest_write = state.resource_write_stamp_for(key.resource).unwrap();
     assert_eq!(
         state.content.pending_writebacks.arm_gva(
             key,

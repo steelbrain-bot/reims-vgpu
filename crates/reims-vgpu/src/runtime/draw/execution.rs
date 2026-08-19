@@ -2644,6 +2644,7 @@ mod execution_split_tests {
         let mut host = FakeHost::new();
         map_one_gva_page(&mut host, 4);
         state.define_task(1, 0x1_0000, 2);
+        state.register_test_resource(1, 7);
 
         let req = one_page_gva_request();
         let gen_a = super::gva_alloc_generation(&mut state, &mut host, &req);
@@ -3272,6 +3273,7 @@ mod execution_split_tests {
         let mut host = FakeHost::new();
         map_one_gva_page(&mut host, 4);
         state.define_task(1, 0x1_0000, 2);
+        state.register_test_resource(1, 11);
 
         let pipeline = RenderPipelineDescriptor {
             color_attachments: vec![

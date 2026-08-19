@@ -795,21 +795,20 @@ pub fn retire_linear_residents(state: &mut Device) {
     for key in &retired {
         state.executor.unpin_resident_storage(key);
         state.executor.retire_resident_storage_content(key);
-        let crate::model::ComputeStorageOrigin::Linear {
-            task_id,
-            texture_ref,
-            gva,
-            ..
-        } = key.origin
-        else {
+        let crate::model::ComputeStorageOrigin::Linear { resource, gva, .. } = key.origin else {
             crate::observe::fail(format!(
                 "linear_resident_retired reason=non_linear_identity identity={key:?}"
             ));
             continue;
         };
         crate::observe::off(format!(
-            "linear_resident_retired task={} ref={} gva={:#x} {}x{} fmt={:#x}",
-            task_id, texture_ref, gva, key.width, key.height, key.pixel_format
+            "linear_resident_retired resource={} resource_generation={} gva={:#x} {}x{} fmt={:#x}",
+            resource.index(),
+            resource.generation(),
+            gva,
+            key.width,
+            key.height,
+            key.pixel_format
         ));
     }
 }
@@ -1586,8 +1585,10 @@ pub(crate) fn copy_resident_into_gva_plane<M: HostMemory + HostOps>(
     // Stamp the decoded resource generation after the copy and after recording
     // this device's own page write. Those two contract-owned records are the
     // complete currency test for a named target.
-    if let Some(key) =
-        crate::runtime::gva_store_witness::GvaTargetKey::of(task_id, c0.texture_ref, identity)
+    if let Some(key) = crate::runtime::writeback_debt::resource_key(state, task_id, c0.texture_ref)
+        .and_then(|resource| {
+            crate::runtime::gva_store_witness::GvaTargetKey::of(resource, identity)
+        })
     {
         crate::runtime::gva_store_witness::note_store(state, key, gpas);
     }

@@ -9,7 +9,7 @@
 //!
 //! # A resource owns its transfer backing
 //!
-//! Debts carry the task-local texture reference, GVA declaration, geometry,
+//! Debts carry the generational resource identity, GVA declaration, geometry,
 //! format, and resource generation. The live GVA resource separately retains the
 //! ordered physical pages of its transfer backing. Ordinary task unmap changes
 //! virtual-address bookkeeping but does not retarget that resource. Explicit
@@ -25,8 +25,8 @@
 //!
 //! A GPU Store makes the host image authoritative. A later guest write makes
 //! the transfer backing newer; payment then abandons the host image rather than
-//! overwriting the guest's work. Task-GVA resources use the validity generation
-//! keyed by `(task, texture_ref)`.
+//! overwriting the guest's work. Task-GVA resources use canonical resource
+//! identity and content generations.
 //!
 //! A named synchronize pays only its object list through
 //! [`submit_for_resources`]. Readers that know a texture call
@@ -42,6 +42,25 @@ use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::Device;
 
 pub use reims_vgpu_core::{GvaPlaneKey, GvaResourceKey, GvaWritebackDebt, PendingWritebacks};
+
+pub(crate) fn resource_key(
+    state: &Device,
+    task_id: u32,
+    texture_ref: u32,
+) -> Option<GvaResourceKey> {
+    Some(GvaResourceKey {
+        task_id,
+        resource: state
+            .task_objects
+            .resources
+            .identity(task_id, texture_ref)?,
+    })
+}
+
+fn resource_owner(state: &Device, key: GvaResourceKey) -> Option<(u32, u32)> {
+    let (task, object) = state.task_objects.resources.owner(key.resource)?;
+    (task.get() == key.task_id).then_some((task.get(), object.get()))
+}
 
 /// Pay every owed GVA resource frame.
 pub fn pay_all<M: HostMemory + HostOps>(state: &mut Device, host: &mut M) {
@@ -66,9 +85,8 @@ pub fn pay_for_texture<M: HostMemory + HostOps>(
     if state.content.pending_writebacks.is_empty() {
         return;
     }
-    let gva_key = GvaResourceKey {
-        task_id,
-        texture_ref,
+    let Some(gva_key) = resource_key(state, task_id, texture_ref) else {
+        return;
     };
     // Every plane the reference owes, not the one that sorts first: a sampled
     // read names the resource, and a mip pyramid's levels are separate debts.
@@ -144,9 +162,10 @@ pub fn gva_resource_generation<M: HostMemory>(
                 },
             )
             .field("task", key.task_id)
-            .field("texture", key.texture_ref)
+            .field("resource", key.resource.index())
+            .field("resource_generation", key.resource.generation())
             .fail();
-            retire_gva_resource(state, key.task_id, key.texture_ref);
+            retire_gva_resource_by_key(state, key);
         }
     }
     let page_size = state.page_size();
@@ -263,12 +282,19 @@ pub fn arm_gva<M: HostMemory + HostOps>(
     // the frame that preceded this Store indefinitely.
     state.invalidate_object_host_copies(task_id, c0.texture_ref);
     crate::runtime::surface_cache::evict_gva(state, c0.target_gva());
-    let key = GvaResourceKey {
-        task_id,
-        texture_ref: c0.texture_ref,
-    };
     let Some(linear) = c0.linear_target().copied() else {
         return false;
+    };
+    let Some(content) = state.task_objects.resources.record_completed_gpu_store(
+        task_id,
+        c0.texture_ref,
+        submission,
+    ) else {
+        return false;
+    };
+    let key = GvaResourceKey {
+        task_id,
+        resource: content.0,
     };
     let debt = GvaWritebackDebt {
         linear,
@@ -277,11 +303,7 @@ pub fn arm_gva<M: HostMemory + HostOps>(
         format: c0.format,
         resident_layout,
         generation,
-        content: state.task_objects.resources.record_completed_gpu_store(
-            task_id,
-            c0.texture_ref,
-            submission,
-        ),
+        content: Some(content),
         guest_write: state.resource_write_stamp(task_id, c0.texture_ref),
         seq: 0,
     };
@@ -303,8 +325,8 @@ pub fn gva_resident_authoritative(state: &Device, identity: &crate::model::Targe
         return false;
     };
     state
-        .resource_write_stamp(plane.resource.task_id, plane.resource.texture_ref)
-        .quiet_since(debt.guest_write)
+        .resource_write_stamp_for(plane.resource.resource)
+        .is_some_and(|stamp| stamp.quiet_since(debt.guest_write))
 }
 
 /// Retire host-authoritative resources whose task-local references are about to
@@ -328,10 +350,13 @@ pub fn retire_gva_for_task(state: &mut Device, task_id: u32) -> usize {
 
 /// Retire one resource at its explicit lifetime boundary.
 pub fn retire_gva_resource(state: &mut Device, task_id: u32, texture_ref: u32) -> bool {
-    let key = GvaResourceKey {
-        task_id,
-        texture_ref,
+    let Some(key) = resource_key(state, task_id, texture_ref) else {
+        return false;
     };
+    retire_gva_resource_by_key(state, key)
+}
+
+fn retire_gva_resource_by_key(state: &mut Device, key: GvaResourceKey) -> bool {
     let (existed, debts) = state.content.pending_writebacks.retire_gva_resource(key);
     let owed = !debts.is_empty();
     for debt in debts {
@@ -342,10 +367,14 @@ pub fn retire_gva_resource(state: &mut Device, task_id: u32, texture_ref: u32) -
 
 /// Release named resources' retained transfer backings.
 pub fn discard_gva_resources(state: &mut Device, task_id: u32, object_ids: &[u32]) -> usize {
+    let resources: Vec<_> = object_ids
+        .iter()
+        .filter_map(|&object_id| resource_key(state, task_id, object_id))
+        .collect();
     state
         .content
         .pending_writebacks
-        .discard_gva_resources(task_id, object_ids)
+        .discard_gva_resources(resources)
 }
 
 fn same_gva_identity(a: GvaWritebackDebt, b: GvaWritebackDebt) -> bool {
@@ -486,7 +515,16 @@ fn pay_gva<M: HostMemory + HostOps>(
 ) -> bool {
     let key = plane.resource;
     let identity = gva_identity(debt);
-    let now = state.resource_write_stamp(key.task_id, key.texture_ref);
+    let Some((task_id, texture_ref)) = resource_owner(state, key) else {
+        crate::runtime::drain::note_store_route("gvadebt_resource_retired");
+        release_gva(state.executor.as_ref(), debt);
+        return true;
+    };
+    let Some(now) = state.resource_write_stamp_for(key.resource) else {
+        crate::runtime::drain::note_store_route("gvadebt_resource_retired");
+        release_gva(state.executor.as_ref(), debt);
+        return true;
+    };
     if !now.quiet_since(debt.guest_write) {
         crate::runtime::drain::note_store_route("gvadebt_abandoned_guest_wrote");
         release_gva(state.executor.as_ref(), debt);
@@ -495,7 +533,7 @@ fn pay_gva<M: HostMemory + HostOps>(
     let Some(span) = u64::from(debt.linear.row_stride).checked_mul(u64::from(debt.height)) else {
         crate::observe::fail(format!(
             "gvadebt_pay_lost task={} texture={} reason=span_overflow",
-            key.task_id, key.texture_ref
+            task_id, texture_ref
         ));
         release_gva(state.executor.as_ref(), debt);
         return true;
@@ -521,7 +559,7 @@ fn pay_gva<M: HostMemory + HostOps>(
         if site == GvaPaySite::Named {
             crate::observe::fail(format!(
                 "gvadebt_pay_blocked task={} texture={} reason=span_unresolved",
-                key.task_id, key.texture_ref
+                task_id, texture_ref
             ));
         }
         return false;
@@ -535,7 +573,7 @@ fn pay_gva<M: HostMemory + HostOps>(
     }
     let pages = crate::runtime::draw::StoreTargetPages::from_ordered(&ordered, span);
     let request = crate::runtime::draw::ColorRtRequest {
-        texture_ref: key.texture_ref,
+        texture_ref,
         storage: crate::runtime::draw::ColorTargetStorage::Linear(debt.linear),
         width: debt.width,
         height: debt.height,
@@ -547,10 +585,10 @@ fn pay_gva<M: HostMemory + HostOps>(
     if let Err(reason) = crate::runtime::render_writeback::store_gva_frame(
         state,
         host,
-        key.task_id,
+        task_id,
         &identity,
         &request,
-        key.texture_ref,
+        texture_ref,
         Some(&pages),
     ) {
         // Through the builder rather than by interpolating the decline, which
@@ -559,8 +597,8 @@ fn pay_gva<M: HostMemory + HostOps>(
         // decline's own fields, so the `via=` that says which check inside the
         // store refused now reaches the log instead of being formatted away.
         crate::observe::Emit::decline("gvadebt_pay_lost", &reason)
-            .field("task", key.task_id)
-            .field("texture", key.texture_ref)
+            .field("task", task_id)
+            .field("texture", texture_ref)
             .fail();
         release_gva(state.executor.as_ref(), debt);
     } else if let Some((resource, version)) = debt.content {
@@ -571,7 +609,7 @@ fn pay_gva<M: HostMemory + HostOps>(
         {
             crate::observe::fail(format!(
                 "gvadebt_content_transition task={} texture={} reason=stale_content_version",
-                key.task_id, key.texture_ref
+                task_id, texture_ref
             ));
         }
     }
@@ -582,6 +620,32 @@ fn pay_gva<M: HostMemory + HostOps>(
 mod tests {
 
     use super::*;
+
+    fn key(task_id: u32, reference: u32) -> GvaResourceKey {
+        GvaResourceKey {
+            task_id,
+            resource: reims_vgpu_protocol::ResourceId::new(reference, 1),
+        }
+    }
+
+    fn register_key(state: &mut Device, task_id: u32, reference: u32) -> GvaResourceKey {
+        let resource = std::sync::Arc::new(crate::model::TaskResource::new(
+            reims_vgpu_protocol::ObjectListEntry::new(
+                reims_vgpu_protocol::ObjectKind::Buffer,
+                0,
+                0,
+            ),
+            std::sync::Arc::from([]),
+        ));
+        let resource = state
+            .task_objects
+            .resources
+            .register(task_id, reference, resource);
+        GvaResourceKey {
+            task_id,
+            resource: resource.semantic_id().unwrap(),
+        }
+    }
 
     fn gva_debt(generation: u64) -> GvaWritebackDebt {
         GvaWritebackDebt {
@@ -608,10 +672,7 @@ mod tests {
     #[test]
     fn a_second_gva_store_on_one_resource_replaces_the_first() {
         let mut pending = PendingWritebacks::default();
-        let key = GvaResourceKey {
-            task_id: 3,
-            texture_ref: 19,
-        };
+        let key = key(3, 19);
         assert_eq!(pending.arm_gva(key, gva_debt(7)), None);
         let previous = pending.arm_gva(key, gva_debt(8));
         assert_eq!(previous.map(|debt| debt.generation), Some(7));
@@ -625,10 +686,7 @@ mod tests {
         let mut pending = PendingWritebacks::default();
         const DISTINCT_RESOURCES: u32 = 64;
         for texture_ref in 1..=DISTINCT_RESOURCES {
-            let key = GvaResourceKey {
-                task_id: 2,
-                texture_ref,
-            };
+            let key = key(2, texture_ref);
             pending.ensure_gva_resource(
                 key,
                 u64::from(texture_ref) << 16,
@@ -647,10 +705,7 @@ mod tests {
     #[test]
     fn a_live_resource_retains_its_backing_until_discard() {
         let mut pending = PendingWritebacks::default();
-        let key = GvaResourceKey {
-            task_id: 3,
-            texture_ref: 19,
-        };
+        let key = key(3, 19);
         let generation = pending.ensure_gva_resource(key, 0x4000, 4096, Some(vec![0x9000]));
         assert_eq!(
             pending.ensure_gva_resource(key, 0x4000, 4096, Some(vec![0xa000])),
@@ -661,7 +716,7 @@ mod tests {
             &[0x9000]
         );
 
-        assert_eq!(pending.discard_gva_resources(3, &[19]), 1);
+        assert_eq!(pending.discard_gva_resources([key]), 1);
         assert!(pending.gva_resource_backing(key.plane(0x4000)).is_none());
         assert_eq!(
             pending.ensure_gva_resource(key, 0x4000, 4096, Some(vec![0xa000])),
@@ -679,10 +734,7 @@ mod tests {
     #[test]
     fn deleting_and_recreating_a_resource_changes_its_generation() {
         let mut pending = PendingWritebacks::default();
-        let key = GvaResourceKey {
-            task_id: 3,
-            texture_ref: 19,
-        };
+        let key = key(3, 19);
         let first = pending.ensure_gva_resource(key, 0x4000, 4096, Some(vec![0x9000]));
         assert!(pending.retire_gva_resource(key).0);
         let second = pending.ensure_gva_resource(key, 0x4000, 4096, Some(vec![0xa000]));
@@ -699,10 +751,7 @@ mod tests {
     #[test]
     fn one_plane_redeclared_at_a_new_length_is_a_new_resource() {
         let mut pending = PendingWritebacks::default();
-        let key = GvaResourceKey {
-            task_id: 3,
-            texture_ref: 19,
-        };
+        let key = key(3, 19);
         let first = pending.ensure_gva_resource(key, 0x4000, 4096, Some(vec![0x9000]));
         let second = pending.ensure_gva_resource(key, 0x4000, 8192, Some(vec![0xa000, 0xb000]));
         assert_ne!(first, second, "a new length is a new host texture");
@@ -731,10 +780,7 @@ mod tests {
     #[test]
     fn the_levels_of_one_pyramid_are_separate_planes_of_one_resource() {
         let mut pending = PendingWritebacks::default();
-        let key = GvaResourceKey {
-            task_id: 1,
-            texture_ref: 135,
-        };
+        let key = key(1, 135);
         let levels = [
             (0x11af000_u64, 196_608_u64),
             (0x11df000, 49_152),
@@ -781,18 +827,16 @@ mod tests {
     #[test]
     fn a_guest_write_revokes_gva_resident_authority() {
         let mut state = Device::new(crate::model::DeviceId::default(), 12);
-        let key = GvaResourceKey {
-            task_id: 4,
-            texture_ref: 12,
-        };
-        let debt = gva_debt(99);
+        let key = register_key(&mut state, 4, 12);
+        let mut debt = gva_debt(99);
+        debt.guest_write = state.resource_write_stamp_for(key.resource).unwrap();
         let _ = state.content.pending_writebacks.arm_gva(key, debt);
         let identity = gva_identity(debt);
         assert!(gva_resident_authoritative(&state, &identity));
         state
-            .content
-            .preconstruction_writes
-            .note_write(key.task_id, key.texture_ref);
+            .task_objects
+            .resources
+            .note_guest_write_by_id(key.resource);
         assert!(!gva_resident_authoritative(&state, &identity));
         assert!(state.content.pending_writebacks.get_gva(key).is_some());
     }

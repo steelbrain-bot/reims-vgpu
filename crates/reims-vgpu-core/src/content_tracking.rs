@@ -15,7 +15,7 @@ use reims_vgpu_protocol::{ContentVersion, ResourceId, ResourceObject};
 pub enum GatherKey {
     TaskGva {
         task_id: u32,
-        resource_ref: u32,
+        resource: ResourceId<ResourceObject>,
         gva: u64,
     },
     Mapping {
@@ -32,12 +32,13 @@ impl GatherKey {
         match self {
             Self::TaskGva {
                 task_id,
-                resource_ref,
+                resource,
                 gva,
             } => {
                 fold(1);
                 fold(u64::from(task_id));
-                fold(u64::from(resource_ref));
+                fold(u64::from(resource.index()));
+                fold(u64::from(resource.generation()));
                 fold(gva);
             }
             Self::Mapping {
@@ -358,11 +359,11 @@ impl LinearColorTarget {
     }
 }
 
-/// The task-local resource that owns one GVA attachment.
+/// The generational resource lifetime that owns one GVA attachment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct GvaResourceKey {
     pub task_id: u32,
-    pub texture_ref: u32,
+    pub resource: ResourceId<ResourceObject>,
 }
 
 /// One render plane of a GVA resource.
@@ -416,10 +417,10 @@ pub struct PendingWritebacks {
 }
 
 /// The resource and executor-resident identity a GVA Store published.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct GvaTargetKey {
     pub task_id: u32,
-    pub texture_ref: u32,
+    pub resource: ResourceId<ResourceObject>,
     pub gva: u64,
     pub generation: u64,
     pub width: u32,
@@ -428,7 +429,7 @@ pub struct GvaTargetKey {
 }
 
 impl GvaTargetKey {
-    pub fn of(task_id: u32, texture_ref: u32, identity: &crate::TargetIdentity) -> Option<Self> {
+    pub fn of(resource: GvaResourceKey, identity: &crate::TargetIdentity) -> Option<Self> {
         match *identity {
             crate::TargetIdentity::Gva {
                 gva,
@@ -436,9 +437,9 @@ impl GvaTargetKey {
                 height,
                 generation,
                 ..
-            } if texture_ref != 0 && generation != 0 && gva != 0 => Some(Self {
-                task_id,
-                texture_ref,
+            } if generation != 0 && gva != 0 => Some(Self {
+                task_id: resource.task_id,
+                resource: resource.resource,
                 gva,
                 generation,
                 width,
@@ -510,7 +511,7 @@ impl GvaStoreWitness {
         guest_write: ResourceWriteStamp,
         host_epoch: u64,
     ) -> bool {
-        if key.texture_ref == 0 || key.generation == 0 || pages.is_empty() {
+        if key.generation == 0 || pages.is_empty() {
             return false;
         }
         self.entries.insert(
@@ -632,13 +633,12 @@ impl PendingWritebacks {
             .map(|resource| (resource.generation, resource.span, resource.pages.is_some()))
     }
 
-    pub fn discard_gva_resources(&mut self, task_id: u32, object_ids: &[u32]) -> usize {
+    pub fn discard_gva_resources(
+        &mut self,
+        resources: impl IntoIterator<Item = GvaResourceKey>,
+    ) -> usize {
         let mut discarded = 0;
-        for &texture_ref in object_ids {
-            let key = GvaResourceKey {
-                task_id,
-                texture_ref,
-            };
+        for key in resources {
             for (_, resource) in self.resources.range_mut(key.planes()) {
                 discarded += usize::from(resource.pages.take().is_some());
             }
@@ -785,7 +785,7 @@ mod tests {
     fn gva_store_witness_checks_both_writer_namespaces() {
         let key = GvaTargetKey {
             task_id: 1,
-            texture_ref: 7,
+            resource: ResourceId::new(7, 1),
             gva: 0x1000,
             generation: 2,
             width: 16,
@@ -832,7 +832,7 @@ mod tests {
         let mut pending = PendingWritebacks::default();
         let key = GvaResourceKey {
             task_id: 3,
-            texture_ref: 19,
+            resource: ResourceId::new(19, 1),
         };
         let generation = pending.ensure_gva_resource(key, 0x4000, 4096, Some(vec![0x9000]));
         assert_eq!(
@@ -843,7 +843,7 @@ mod tests {
             &*pending.gva_resource_backing(key.plane(0x4000)).unwrap().2,
             &[0x9000]
         );
-        assert_eq!(pending.discard_gva_resources(3, &[19]), 1);
+        assert_eq!(pending.discard_gva_resources([key]), 1);
         assert!(pending.gva_resource_backing(key.plane(0x4000)).is_none());
     }
 
@@ -852,10 +852,43 @@ mod tests {
         let mut pending = PendingWritebacks::default();
         let key = GvaResourceKey {
             task_id: 3,
-            texture_ref: 19,
+            resource: ResourceId::new(19, 1),
         };
         let first = pending.ensure_gva_resource(key, 0x4000, 4096, None);
         let second = pending.ensure_gva_resource(key, 0x4000, 8192, None);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn a_reused_object_slot_cannot_inherit_the_retired_resources_debt() {
+        let mut pending = PendingWritebacks::default();
+        let retired = GvaResourceKey {
+            task_id: 3,
+            resource: ResourceId::new(19, 1),
+        };
+        let replacement = GvaResourceKey {
+            task_id: 3,
+            resource: ResourceId::new(19, 2),
+        };
+        let mut debt = GvaWritebackDebt {
+            linear: LinearColorTarget::whole(0x4000, 256, 64),
+            width: 64,
+            height: 64,
+            format: 0,
+            resident_layout: crate::pixel_format::TexelLayout::Rgba8,
+            generation: 7,
+            content: None,
+            guest_write: ResourceWriteStamp::default(),
+            seq: 0,
+        };
+        let _ = pending.arm_gva(retired, debt);
+        debt.generation = 8;
+        let _ = pending.arm_gva(replacement, debt);
+
+        assert_eq!(pending.get_gva(retired).unwrap().generation, 7);
+        assert_eq!(pending.get_gva(replacement).unwrap().generation, 8);
+        pending.retire_gva_resource(retired);
+        assert!(pending.get_gva(retired).is_none());
+        assert_eq!(pending.get_gva(replacement).unwrap().generation, 8);
     }
 }
