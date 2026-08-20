@@ -12,7 +12,6 @@ pub use reims_vgpu_vulkan::engine::{
     CounterSnapshot, DrawError, DrawPhaseWindow, EngineFacadeDecline,
 };
 pub use reims_vgpu_vulkan::m2v_cache::M2vCacheDecline;
-pub use reims_vgpu_vulkan::spirv_bind::ImageFormatSpecializeError;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -303,7 +302,9 @@ pub trait GuestPageTransferService: std::fmt::Debug + Send + Sync {
 pub trait CompletionService: std::fmt::Debug + Send + Sync {
     fn install_stamp_announce(&self, _hook: StampAnnounce) {}
 
-    fn guest_access_outstanding(&self) -> bool {
+    /// Whether accepted executor work preceding a completion word still needs
+    /// a GPU ordering point.
+    fn completion_work_outstanding(&self) -> bool {
         false
     }
 
@@ -369,6 +370,17 @@ pub trait GuestImportService: std::fmt::Debug + Send + Sync {
     }
 }
 
+/// Backend image-layout planning performed before a resource-shaped page alias
+/// is finalized.
+pub trait GuestImagePlanningService: std::fmt::Debug + Send + Sync {
+    fn sampled_image_binding_requirement(
+        &self,
+        _request: reims_vgpu_memory::GuestImageBindingRequest,
+    ) -> Option<reims_vgpu_memory::GuestImageBindingDisposition> {
+        None
+    }
+}
+
 /// Backend housekeeping which does not itself execute a guest command.
 pub trait MaintenanceService: std::fmt::Debug + Send + Sync {
     fn maintain_resources(&self, _now_ms: u64) {}
@@ -399,8 +411,8 @@ pub trait ObservationService: std::fmt::Debug + Send + Sync {
         None
     }
 
-    fn guest_import_census(&self) -> (u64, usize, usize) {
-        (0, 0, 0)
+    fn guest_import_census(&self) -> (u64, usize, usize, usize, usize, usize) {
+        (0, 0, 0, 0, 0, 0)
     }
 
     fn object_cache_levels(&self) -> [usize; 6] {
@@ -486,6 +498,8 @@ pub struct DrawHangSamplerNote {
     pub address_v: u8,
     pub provenance: u8,
     pub unnormalized: bool,
+    pub lod_min: u32,
+    pub lod_max: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -514,6 +528,7 @@ pub trait ShaderTranslationService: std::fmt::Debug + Send + Sync {
         &self,
         _air: &[u8],
         _stage: reims_vgpu_core::ShaderStage,
+        _raster_sample_count: u32,
         _pipeline_ref: u32,
     ) -> bool {
         true
@@ -523,9 +538,18 @@ pub trait ShaderTranslationService: std::fmt::Debug + Send + Sync {
         &self,
         _air: &[u8],
         _stage: reims_vgpu_core::ShaderStage,
+        _raster_sample_count: u32,
         _pipeline_ref: u32,
     ) -> Result<reims_vgpu_core::PreparedShaderFamily, M2vCacheDecline> {
         panic!("executor does not provide shader translation")
+    }
+
+    fn specialize_render_samplers(
+        &self,
+        variant: &reims_vgpu_core::PreparedShaderVariant,
+        _samplers: &[reims_vgpu_core::SamplerResource],
+    ) -> Result<reims_vgpu_core::PreparedShaderVariant, M2vCacheDecline> {
+        Ok(variant.clone())
     }
 
     fn ensure_compute_translation(
@@ -547,11 +571,10 @@ pub trait ShaderTranslationService: std::fmt::Debug + Send + Sync {
     }
 }
 
-/// Backend policy for bounding and substituting render buffer arguments.
+/// Backend policy for bounding render buffer arguments.
 ///
 /// The semantic shader interface and draw geometry cross this port. Reflection
-/// implementation details, ablation policy, telemetry, and the shared neutral
-/// allocation remain owned by the executor adapter.
+/// implementation details remain owned by the executor adapter.
 pub trait RenderBufferPlanningService: std::fmt::Debug + Send + Sync {
     #[allow(clippy::too_many_arguments)]
     fn render_buffer_extent(
@@ -566,18 +589,6 @@ pub trait RenderBufferPlanningService: std::fmt::Debug + Send + Sync {
         _indexed: bool,
     ) -> Option<u64> {
         None
-    }
-
-    fn may_serve_neutral_buffer(
-        &self,
-        _access: reims_vgpu_core::ReflectedBufferAccess,
-        _feeds_stage_in: bool,
-    ) -> bool {
-        false
-    }
-
-    fn neutral_buffer_content(&self) -> Arc<Vec<u8>> {
-        panic!("executor does not provide neutral render-buffer content")
     }
 }
 
@@ -594,39 +605,37 @@ pub trait ComputeTranslation: std::fmt::Debug + Send + Sync {
 
     fn storage_image_access(&self, binding: u32) -> Option<reims_vgpu_core::StorageImageAccess>;
 
-    fn neutral_sampled_image_bindings(&self, bound: &[u32]) -> Vec<u32>;
+    fn null_sampled_image_bindings(&self, bound: &[u32]) -> Vec<u32>;
 
     fn samplers(&self) -> Arc<[reims_vgpu_core::ReflectedSamplerDescriptor]>;
 
     fn prepare_program(
         &self,
-        requests: &[(u32, Option<StorageImageFormat>)],
+        requests: &[(u32, StorageImageFormat)],
     ) -> Result<PreparedComputeProgram, ComputeProgramDecline>;
 }
 
 #[derive(Debug)]
 pub struct PreparedComputeProgram {
     pub stage: reims_vgpu_core::PreparedShaderStage,
+    pub storage_image_formats: Vec<(u32, Option<StorageImageFormat>)>,
     _native_lifetime: Box<dyn std::any::Any + Send + Sync>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ComputeProgramDecline {
-    UnsupportedFormat { format: StorageImageFormat },
-    Specialization(ImageFormatSpecializeError),
+    Specialization(M2vCacheDecline),
 }
 
 impl crate::observe::Decline for ComputeProgramDecline {
     fn slug(&self) -> &'static str {
         match self {
-            Self::UnsupportedFormat { .. } => "compute_program_format_unsupported",
             Self::Specialization(decline) => crate::observe::Decline::slug(decline),
         }
     }
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
-            Self::UnsupportedFormat { format } => vec![("format", format!("{format:?}"))],
             Self::Specialization(decline) => crate::observe::Decline::fields(decline),
         }
     }
@@ -652,6 +661,7 @@ pub trait Executor:
     + CompletionService
     + SubmissionBatchService
     + GuestImportService
+    + GuestImagePlanningService
     + MaintenanceService
     + SessionService
     + ObservationService
@@ -773,8 +783,8 @@ impl CompletionService for VulkanExecutor {
         reims_vgpu_vulkan::engine::install_stamp_announce(hook);
     }
 
-    fn guest_access_outstanding(&self) -> bool {
-        reims_vgpu_vulkan::engine::guest_access_outstanding()
+    fn completion_work_outstanding(&self) -> bool {
+        reims_vgpu_vulkan::engine::completion_work_outstanding()
     }
 
     fn completion_stamp_pending(&self, index: u32) -> bool {
@@ -839,7 +849,7 @@ impl ObservationService for VulkanExecutor {
         reims_vgpu_vulkan::engine::buffer_gather_working_set_census()
     }
 
-    fn guest_import_census(&self) -> (u64, usize, usize) {
+    fn guest_import_census(&self) -> (u64, usize, usize, usize, usize, usize) {
         reims_vgpu_vulkan::engine::guest_import_census()
     }
 
@@ -904,6 +914,8 @@ impl ObservationService for VulkanExecutor {
                 address_v: source.address_v,
                 provenance: source.provenance,
                 unnormalized: source.unnormalized,
+                lod_min: source.lod_min,
+                lod_max: source.lod_max,
             };
         }
         trail::note_draw(trail::DrawNote {
@@ -951,6 +963,16 @@ impl ObservationService for VulkanExecutor {
 
 impl Executor for VulkanExecutor {}
 
+impl GuestImagePlanningService for VulkanExecutor {
+    fn sampled_image_binding_requirement(
+        &self,
+        request: reims_vgpu_memory::GuestImageBindingRequest,
+    ) -> Option<reims_vgpu_memory::GuestImageBindingDisposition> {
+        let _scope = self.enter();
+        reims_vgpu_vulkan::engine::sampled_guest_image_binding_requirement(request)
+    }
+}
+
 impl RenderBufferPlanningService for VulkanExecutor {
     fn render_buffer_extent(
         &self,
@@ -976,18 +998,6 @@ impl RenderBufferPlanningService for VulkanExecutor {
             feeds_stage_in,
             bounds,
         )
-    }
-
-    fn may_serve_neutral_buffer(
-        &self,
-        access: reims_vgpu_core::ReflectedBufferAccess,
-        feeds_stage_in: bool,
-    ) -> bool {
-        reims_vgpu_vulkan::spirv_bind::may_serve_neutral(access, feeds_stage_in)
-    }
-
-    fn neutral_buffer_content(&self) -> Arc<Vec<u8>> {
-        reims_vgpu_vulkan::spirv_bind::neutral_bind_bytes()
     }
 }
 
@@ -1026,8 +1036,8 @@ impl ComputeTranslation for VulkanComputeTranslation {
         self.shader.storage_image_access(binding)
     }
 
-    fn neutral_sampled_image_bindings(&self, bound: &[u32]) -> Vec<u32> {
-        self.shader.neutral_sampled_image_bindings(bound)
+    fn null_sampled_image_bindings(&self, bound: &[u32]) -> Vec<u32> {
+        self.shader.null_sampled_image_bindings(bound)
     }
 
     fn samplers(&self) -> Arc<[reims_vgpu_core::ReflectedSamplerDescriptor]> {
@@ -1036,41 +1046,55 @@ impl ComputeTranslation for VulkanComputeTranslation {
 
     fn prepare_program(
         &self,
-        requests: &[(u32, Option<StorageImageFormat>)],
+        requests: &[(u32, StorageImageFormat)],
     ) -> Result<PreparedComputeProgram, ComputeProgramDecline> {
-        use reims_vgpu_vulkan::spirv_bind::ImageFormat as Native;
         let native = requests
             .iter()
             .map(|(binding, format)| {
-                let format = match format {
-                    None => Native::Unknown,
-                    Some(StorageImageFormat::Rgba32Float) => Native::Rgba32Float,
-                    Some(StorageImageFormat::Rgba16Float) => Native::Rgba16Float,
-                    Some(StorageImageFormat::R16Float) => Native::R16Float,
-                    Some(StorageImageFormat::Rgba16Uint) => Native::Rgba16Uint,
-                    Some(StorageImageFormat::Rgba8Uint) => Native::Rgba8Uint,
-                    Some(StorageImageFormat::Rgba8Sint) => Native::Rgba8Sint,
-                    Some(StorageImageFormat::Rgba8Unorm) => Native::Rgba8Unorm,
-                    Some(StorageImageFormat::Rg16Float) => Native::Rg16Float,
-                    Some(StorageImageFormat::R8Unorm) => Native::R8Unorm,
-                    Some(StorageImageFormat::Rg8Unorm) => Native::Rg8Unorm,
-                    Some(StorageImageFormat::Rgba32Uint) => Native::Rgba32Uint,
-                    Some(StorageImageFormat::R32Float) => Native::R32Float,
-                    Some(StorageImageFormat::R32Uint) => Native::R32ui,
-                    Some(format) => {
-                        return Err(ComputeProgramDecline::UnsupportedFormat { format: *format });
-                    }
-                };
-                Ok((*binding, format))
+                let metal_index = self
+                    .shader
+                    .interface
+                    .bindings
+                    .iter()
+                    .find(|resource| {
+                        resource.descriptor.map(|descriptor| descriptor.binding) == Some(*binding)
+                            && matches!(
+                                resource.kind,
+                                reims_vgpu_core::ShaderResourceKind::StorageImage
+                                    | reims_vgpu_core::ShaderResourceKind::TextureArray
+                                    | reims_vgpu_core::ShaderResourceKind::EmbeddedArgBufferTexture
+                            )
+                    })
+                    .map(|resource| resource.metal_index)
+                    .ok_or_else(|| {
+                        ComputeProgramDecline::Specialization(
+                            M2vCacheDecline::RuntimeStorageImageSpecialize {
+                                detail: format!(
+                                    "no reflected storage image at descriptor binding {binding}"
+                                ),
+                            },
+                        )
+                    })?;
+                let caps = reims_vgpu_vulkan::engine::runtime_storage_image_capabilities(*format);
+                Ok(reims_vgpu_vulkan::m2v_cache::RuntimeStorageImageRequest {
+                    binding: *binding,
+                    metal_index,
+                    format: *format,
+                    storage_image: caps.storage_image,
+                    storage_image_atomic: caps.storage_image_atomic,
+                    read_without_format: caps.read_without_format,
+                    write_without_format: caps.write_without_format,
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let variant = self
+        let prepared = self
             .shader
             .prepare_kernel(&native)
             .map_err(ComputeProgramDecline::Specialization)?;
         Ok(PreparedComputeProgram {
-            stage: reims_vgpu_vulkan::m2v_cache::prepared_stage(&variant),
-            _native_lifetime: Box::new(variant),
+            stage: reims_vgpu_vulkan::m2v_cache::prepared_stage(&prepared.variant),
+            storage_image_formats: prepared.storage_formats.clone(),
+            _native_lifetime: Box::new(prepared),
         })
     }
 }
@@ -1080,6 +1104,7 @@ impl ShaderTranslationService for VulkanExecutor {
         &self,
         air: &[u8],
         stage: reims_vgpu_core::ShaderStage,
+        raster_sample_count: u32,
         pipeline_ref: u32,
     ) -> bool {
         let stage = match stage {
@@ -1091,13 +1116,19 @@ impl ShaderTranslationService for VulkanExecutor {
             }
             reims_vgpu_core::ShaderStage::Unknown => return true,
         };
-        reims_vgpu_vulkan::m2v_cache::ensure_render_cached_async(air, stage, pipeline_ref)
+        reims_vgpu_vulkan::m2v_cache::ensure_render_cached_async(
+            air,
+            stage,
+            raster_sample_count,
+            pipeline_ref,
+        )
     }
 
     fn prepare_render_translation(
         &self,
         air: &[u8],
         stage: reims_vgpu_core::ShaderStage,
+        raster_sample_count: u32,
         pipeline_ref: u32,
     ) -> Result<reims_vgpu_core::PreparedShaderFamily, M2vCacheDecline> {
         let stage = match stage {
@@ -1114,11 +1145,20 @@ impl ShaderTranslationService for VulkanExecutor {
         let shader = reims_vgpu_vulkan::m2v_cache::translate_render_cached_reflected(
             air,
             stage,
+            raster_sample_count,
             pipeline_ref,
         )?;
         Ok(reims_vgpu_vulkan::m2v_cache::prepare_render_shader(
             &shader, stage,
         ))
+    }
+
+    fn specialize_render_samplers(
+        &self,
+        variant: &reims_vgpu_core::PreparedShaderVariant,
+        samplers: &[reims_vgpu_core::SamplerResource],
+    ) -> Result<reims_vgpu_core::PreparedShaderVariant, M2vCacheDecline> {
+        reims_vgpu_vulkan::m2v_cache::specialize_render_samplers(variant, samplers)
     }
 
     fn ensure_compute_translation(
@@ -1291,7 +1331,7 @@ impl WindowPresentationService for VulkanExecutor {
             }
             WindowPresentationPayload::Resident(_) => None,
         });
-        reims_vgpu_vulkan::engine::window_present_frame(source, cpu)
+        reims_vgpu_vulkan::engine::window_present_frame(frame.map(|frame| frame.seq), source, cpu)
             .map(|outcome| match outcome {
                 reims_vgpu_vulkan::engine::WindowPresentOutcome::Busy => WindowPresentOutcome::Busy,
                 reims_vgpu_vulkan::engine::WindowPresentOutcome::Presented {
@@ -1328,6 +1368,10 @@ impl ResidentService for VulkanExecutor {
 
     fn stamp_resident_content_epoch(&self, identity: &TargetIdentity, epoch: u32) -> bool {
         reims_vgpu_vulkan::engine::stamp_resident_content_epoch(identity, epoch)
+    }
+
+    fn note_resident_guest_write(&self, identity: &TargetIdentity, epoch: u32) -> bool {
+        reims_vgpu_vulkan::engine::note_resident_guest_write(identity, epoch)
     }
 
     fn note_resident_content_copied_out(&self, identity: &TargetIdentity) -> bool {
@@ -1414,7 +1458,7 @@ impl ExecutionPort for VulkanExecutor {
         let _scope = self.enter();
         reims_vgpu_core::execute_resolved_submission(
             submission,
-            |request| {
+            |context, request| {
                 let materialized = request
                     .sampled_images
                     .iter()
@@ -1427,10 +1471,12 @@ impl ExecutionPort for VulkanExecutor {
                     })
                     .filter_map(|image| image.content)
                     .collect::<Vec<_>>();
-                let output = reims_vgpu_vulkan::engine::execute_draw_request(&request)?;
+                let output = reims_vgpu_vulkan::engine::execute_draw_request_in_submission(
+                    context, &request,
+                )?;
                 Ok(reims_vgpu_core::CommandExecution::new(output, materialized))
             },
-            |request| {
+            |_, request| {
                 let materialized = request
                     .sampled_images
                     .iter()
@@ -1446,14 +1492,14 @@ impl ExecutionPort for VulkanExecutor {
                 let output = reims_vgpu_vulkan::engine::execute_compute_request(&request)?;
                 Ok(reims_vgpu_core::CommandExecution::new(output, materialized))
             },
-            |_| {
+            |_, _| {
                 Err(DrawError::Facade(
                     EngineFacadeDecline::ExecutorServiceUnavailable {
                         service: "host_memory_blit",
                     },
                 ))
             },
-            |_| {
+            |_, _| {
                 Err(DrawError::Facade(
                     EngineFacadeDecline::ExecutorServiceUnavailable {
                         service: "core_resource_state",
@@ -1735,6 +1781,7 @@ mod tests {
     impl CompletionService for ScriptedExecutor {}
     impl SubmissionBatchService for ScriptedExecutor {}
     impl GuestImportService for ScriptedExecutor {}
+    impl GuestImagePlanningService for ScriptedExecutor {}
     impl MaintenanceService for ScriptedExecutor {}
     impl ObservationService for ScriptedExecutor {}
     impl ShaderTranslationService for ScriptedExecutor {}
@@ -1973,6 +2020,7 @@ mod tests {
     impl CompletionService for WrongIdentityExecutor {}
     impl SubmissionBatchService for WrongIdentityExecutor {}
     impl GuestImportService for WrongIdentityExecutor {}
+    impl GuestImagePlanningService for WrongIdentityExecutor {}
     impl MaintenanceService for WrongIdentityExecutor {}
     impl ObservationService for WrongIdentityExecutor {}
     impl ShaderTranslationService for WrongIdentityExecutor {}

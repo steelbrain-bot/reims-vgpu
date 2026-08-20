@@ -801,6 +801,7 @@ mod tests {
     impl crate::runtime::executor::ObservationService for NoopExecutor {}
     impl crate::runtime::executor::ShaderTranslationService for NoopExecutor {}
     impl crate::runtime::executor::RenderBufferPlanningService for NoopExecutor {}
+    impl crate::runtime::executor::GuestImagePlanningService for NoopExecutor {}
     impl crate::runtime::executor::SessionService for NoopExecutor {}
     impl crate::runtime::executor::ReadbackService for NoopExecutor {
         type Error = crate::runtime::executor::DrawError;
@@ -855,6 +856,7 @@ mod tests {
     impl crate::runtime::executor::ObservationService for RecordingWarmExecutor {}
     impl crate::runtime::executor::ShaderTranslationService for RecordingWarmExecutor {}
     impl crate::runtime::executor::RenderBufferPlanningService for RecordingWarmExecutor {}
+    impl crate::runtime::executor::GuestImagePlanningService for RecordingWarmExecutor {}
     impl crate::runtime::executor::SessionService for RecordingWarmExecutor {}
     impl crate::runtime::executor::ResidentService for RecordingWarmExecutor {}
     impl crate::runtime::executor::GuestWriteService for RecordingWarmExecutor {}

@@ -3091,8 +3091,8 @@ fn a_sampler_above_apples_table_but_inside_ours_still_binds() {
 /// 32 up was refused because `metal2vulkan` numbers its bands 32 apart, so
 /// texture 68 and sampler 36 would have been one descriptor binding. Nothing
 /// about the *information* forced that — the SPIR-V type says which class a
-/// variable is — so `spirv_bind::widen_sampled_bands` moves the sampler band out
-/// of the way and the whole 128-entry table becomes reachable.
+/// variable is — so metal2vulkan assigns non-overlapping texture and sampler
+/// ranges and the whole 128-entry table becomes reachable.
 ///
 /// Asserted three ways, because each alone could pass while the slot is still
 /// lost: the accumulator keeps the bind, nothing is counted against the table,

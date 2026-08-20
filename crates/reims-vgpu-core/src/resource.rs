@@ -440,6 +440,81 @@ impl Default for ResourceGraph {
 }
 
 impl ResourceGraph {
+    /// Record bytes changing through one resource and every declared alias of
+    /// those bytes.
+    ///
+    /// Task-address storage is range-shaped: a buffer may describe an entire
+    /// allocation while a texture describes only an overlapping view. Exact
+    /// `(address, length)` interning therefore cannot be the content boundary.
+    /// Parent/view edges and overlapping task-address ranges together define
+    /// the alias set whose content authorities must advance.
+    pub fn guest_wrote_aliases(&self, id: AnyResourceId) -> Option<ContentVersion> {
+        let source = self.resources.get(&id)?.content.clone();
+        let mut pending = vec![id];
+        let mut visited = BTreeSet::new();
+        let mut ranges = Vec::<(TaskId, u64, u64)>::new();
+        let mut authorities = Vec::<ContentAuthority>::new();
+
+        while let Some(resource_id) = pending.pop() {
+            if !visited.insert(resource_id) {
+                continue;
+            }
+            let Some(resource) = self.resources.get(&resource_id) else {
+                continue;
+            };
+            pending.extend(resource.parents.iter().copied());
+            pending.extend(resource.children.iter().copied());
+            if !authorities
+                .iter()
+                .any(|known| known.same_authority(&resource.content))
+            {
+                authorities.push(resource.content.clone());
+            }
+            let Some(storage_id) = resource.storage else {
+                continue;
+            };
+            let Some(storage) = self.storage.get(&storage_id) else {
+                continue;
+            };
+            pending.extend(storage.owners.iter().copied());
+            if let StorageBacking::TaskAddress {
+                task,
+                address,
+                length,
+            } = storage.backing
+            {
+                let start = address.get();
+                let end = start.saturating_add(length.get());
+                if start < end && !ranges.contains(&(task, start, end)) {
+                    ranges.push((task, start, end));
+                    for candidate in self.storage.values() {
+                        let StorageBacking::TaskAddress {
+                            task: other_task,
+                            address: other_address,
+                            length: other_length,
+                        } = candidate.backing
+                        else {
+                            continue;
+                        };
+                        let other_start = other_address.get();
+                        let other_end = other_start.saturating_add(other_length.get());
+                        if task == other_task && start < other_end && other_start < end {
+                            pending.extend(candidate.owners.iter().copied());
+                        }
+                    }
+                }
+            }
+        }
+
+        let version = source.guest_wrote().ok()?;
+        for authority in authorities {
+            if !authority.same_authority(&source) {
+                authority.guest_wrote().ok()?;
+            }
+        }
+        Some(version)
+    }
+
     fn parent_edge_would_cycle(&self, parent: AnyResourceId, child: AnyResourceId) -> bool {
         if parent == child {
             return true;
@@ -1148,6 +1223,93 @@ mod tests {
 
         assert_eq!(first, second);
         assert_ne!(first, other_task);
+    }
+
+    #[test]
+    fn a_write_advances_every_overlapping_task_address_view() {
+        let mut graph = ResourceGraph::default();
+        let buffer_storage = graph
+            .task_address_storage(
+                task(),
+                GuestVirtualAddress::new(0x4000),
+                ByteLength::new(0x4000),
+            )
+            .unwrap();
+        let texture_storage = graph
+            .task_address_storage(
+                task(),
+                GuestVirtualAddress::new(0x5000),
+                ByteLength::new(0x1000),
+            )
+            .unwrap();
+        let disjoint_storage = graph
+            .task_address_storage(
+                task(),
+                GuestVirtualAddress::new(0x9000),
+                ByteLength::new(0x1000),
+            )
+            .unwrap();
+        let other_task_storage = graph
+            .task_address_storage(
+                TaskId::new(8),
+                GuestVirtualAddress::new(0x5000),
+                ByteLength::new(0x1000),
+            )
+            .unwrap();
+        let buffer = graph
+            .create_resource(
+                task(),
+                object(1),
+                ObjectKind::Buffer,
+                Some(buffer_storage),
+                [],
+            )
+            .unwrap();
+        let texture = graph
+            .create_resource(
+                task(),
+                object(2),
+                ObjectKind::Texture,
+                Some(texture_storage),
+                [],
+            )
+            .unwrap();
+        let disjoint = graph
+            .create_resource(
+                task(),
+                object(3),
+                ObjectKind::Texture,
+                Some(disjoint_storage),
+                [],
+            )
+            .unwrap();
+        let other_task = graph
+            .create_resource(
+                TaskId::new(8),
+                object(1),
+                ObjectKind::Texture,
+                Some(other_task_storage),
+                [],
+            )
+            .unwrap();
+        let texture_before = graph.resource(texture).unwrap().content.current();
+        let disjoint_before = graph.resource(disjoint).unwrap().content.current();
+        let other_task_before = graph.resource(other_task).unwrap().content.current();
+
+        graph.guest_wrote_aliases(buffer).unwrap();
+
+        assert_ne!(
+            graph.resource(texture).unwrap().content.current(),
+            texture_before
+        );
+        assert_eq!(
+            graph.resource(disjoint).unwrap().content.current(),
+            disjoint_before
+        );
+        assert_eq!(
+            graph.resource(other_task).unwrap().content.current(),
+            other_task_before
+        );
     }
 
     #[test]

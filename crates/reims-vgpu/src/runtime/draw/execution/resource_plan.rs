@@ -1,8 +1,8 @@
 //! Complete executor resource planning for one validated pipeline.
 //!
-//! Direct buffers, shader numbering, sampled images, and samplers cross back
-//! into orchestration only as one complete set. Internal neutral-substitution
-//! obligations and relocation choices cannot be consumed independently.
+//! Direct buffers, reflected shader layouts, sampled images, and samplers cross
+//! back into orchestration only as one complete set. Internal null-descriptor
+//! obligations cannot be consumed independently.
 
 use super::*;
 
@@ -29,9 +29,9 @@ pub(super) fn plan_draw_resources<M: HostMemory + HostOps>(
     let shader_resource_plan::ShaderResourcePlan {
         attributes,
         storage_buffers,
-        vertex_variant,
-        fragment_variant,
-        fragment_neutral_textures,
+        mut vertex_variant,
+        mut fragment_variant,
+        fragment_null_textures,
         fragment_color_input,
     } = shader_resource_plan::plan_shader_resources(state, host, request, resolved, width, height)?;
     let sampled_images = texture_plan::plan_sampled_textures(
@@ -42,13 +42,27 @@ pub(super) fn plan_draw_resources<M: HostMemory + HostOps>(
         &resolved.fragment,
         &vertex_variant,
         &fragment_variant,
-        &fragment_neutral_textures,
+        &fragment_null_textures,
         gva_allocation_generation,
     )?;
     let sampler_plan::SamplerPlan {
         resources: samplers,
         provenance: sampler_provenance,
     } = sampler_plan::plan_samplers(state, host, request, &vertex_variant, &fragment_variant)?;
+    vertex_variant = state
+        .executor
+        .specialize_render_samplers(&vertex_variant, &samplers)
+        .map_err(|reason| DrawPreparationDecline::VertexTranslate {
+            pipeline_ref: request.pipeline_ref,
+            reason,
+        })?;
+    fragment_variant = state
+        .executor
+        .specialize_render_samplers(&fragment_variant, &samplers)
+        .map_err(|reason| DrawPreparationDecline::FragmentTranslate {
+            pipeline_ref: request.pipeline_ref,
+            reason,
+        })?;
 
     Ok(DrawResourcePlan {
         attributes,

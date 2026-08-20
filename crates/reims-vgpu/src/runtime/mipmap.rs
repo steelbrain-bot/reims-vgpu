@@ -260,7 +260,13 @@ fn load_level_tight_native<M: HostMemory + HostOps>(
     // Row-by-row of `tight_row` bytes below, so the bound is the extent read
     // rather than `bpr * h` — see `TextureLevelLayout::read_span`.
     let span = layout.read_span(tight_row).ok_or(MipmapStatus::Capacity)?;
-    if tex.allocation_size != 0 && layout.offset.saturating_add(span) > tex.allocation_size {
+    if tex.allocation_size != 0
+        && tex
+            .base_offset
+            .checked_add(layout.offset)
+            .and_then(|offset| offset.checked_add(span))
+            .is_none_or(|end| end > tex.allocation_size)
+    {
         return Err(MipmapStatus::IncompleteLayout);
     }
     let mut out = vec![0u8; need];
@@ -321,7 +327,13 @@ fn store_level_tight_native<M: HostMemory + HostOps>(
     // Same rule on the write side: each row writes `tight_row` bytes at
     // `gva + y * bpr`, so a trailing stride is never touched.
     let span = layout.read_span(tight_row).ok_or(MipmapStatus::Capacity)?;
-    if tex.allocation_size != 0 && layout.offset.saturating_add(span) > tex.allocation_size {
+    if tex.allocation_size != 0
+        && tex
+            .base_offset
+            .checked_add(layout.offset)
+            .and_then(|offset| offset.checked_add(span))
+            .is_none_or(|end| end > tex.allocation_size)
+    {
         return Err(MipmapStatus::IncompleteLayout);
     }
     // The same bound every other multi-row guest writer takes, for the reason

@@ -171,13 +171,47 @@ pub(super) fn gva_guest_target_backing<H: HostMemory + HostOps>(
     host: &mut H,
     req: &DrawEncodeRequest,
 ) -> Option<reims_vgpu_memory::GuestTargetMemory> {
-    if !host.map_pages_stable() {
+    let c0 = req.colors.first()?;
+    if c0.target_gva() == 0 {
         return None;
     }
-    let c0 = req.colors.first()?;
-    let linear = c0.linear_target()?;
-    if c0.texture_ref == 0 {
-        return None;
+    color_target_guest_backing(state, host, req.task_id, c0, None)
+}
+
+/// Resolve the canonical guest allocation of any declared colour attachment.
+///
+/// This is deliberately attachment-generic: MRT slot number does not alter the
+/// allocation contract. The caller supplies the already-decoded resident
+/// layout for IOSurface records; linear records carry their own declaration.
+pub(super) fn color_target_guest_backing<H: HostMemory + HostOps>(
+    state: &mut Device,
+    host: &mut H,
+    task_id: u32,
+    color: &ColorRtRequest,
+    surface_layout: Option<reims_vgpu_core::pixel_format::TexelLayout>,
+) -> Option<reims_vgpu_memory::GuestTargetMemory> {
+    if color.target_gva() == 0 {
+        return try_iosurface_texture_target_guest_memory(
+            state,
+            host,
+            color.mapping_id(),
+            color.width,
+            color.height,
+            surface_layout?,
+        );
+    }
+    let decline = |route| {
+        crate::runtime::drain::note_store_route(route);
+        None
+    };
+    if !host.map_pages_stable() {
+        return decline("gvatarget_alias_unstable");
+    }
+    let Some(linear) = color.linear_target() else {
+        return decline("gvatarget_declaration_missing");
+    };
+    if color.texture_ref == 0 {
+        return decline("gvatarget_resource_missing");
     }
     let allocation = BufferBacking {
         gva: linear.allocation_gva,
@@ -186,23 +220,27 @@ pub(super) fn gva_guest_target_backing<H: HostMemory + HostOps>(
     if !crate::runtime::bound_buffers::ensure_packed_resource(
         state,
         host,
-        req.task_id,
-        c0.texture_ref,
+        task_id,
+        color.texture_ref,
         allocation.gva,
         allocation.size,
         crate::runtime::bound_buffers::PackedResourceUse::LinearTarget,
     ) {
-        return None;
+        return decline("gvatarget_pack_declined");
     }
-    let packed = state.bound_buffers.packed_available(
-        req.task_id,
-        c0.texture_ref,
+    let Some(packed) = state.bound_buffers.packed_available(
+        task_id,
+        color.texture_ref,
         allocation.gva,
         allocation.size,
-    )?;
-    let plane_offset = packed.head.checked_add(linear.plane_offset)?;
+    ) else {
+        return decline("gvatarget_pack_unavailable");
+    };
+    let Some(plane_offset) = packed.head.checked_add(linear.plane_offset) else {
+        return decline("gvatarget_plane_overflow");
+    };
     if plane_offset >= packed.import.len() {
-        return None;
+        return decline("gvatarget_plane_outside_import");
     }
     Some(reims_vgpu_memory::GuestTargetMemory {
         backing: reims_vgpu_memory::GuestTargetBacking {

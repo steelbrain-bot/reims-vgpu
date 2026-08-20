@@ -186,22 +186,16 @@ pub fn capture_present_frame(
         .unwrap_or(0);
     state.advance_present_epoch();
     // --- Capture readback elision ---
-    // When the previous present's window publish handed the window an engine
-    // resident (`display_from_resident` — the macOS engine-swapchain handoff), the
-    // display reads that resident directly and does NOT consume this CPU capture.
+    // When preparation selected an engine resident for this present, the
+    // display reads that resident directly and does not consume a CPU capture.
     // The ~8-12 ms guest-page gather + full-frame proxy scan below is then pure
     // present-hot-path overhead that serializes the guest behind the drain lock
     // (the fullscreen-video slowdown class). Skip it on those presents; the cheap
     // protocol-structural a/b guard still runs on every light present.
     //
-    // This is the steady state on the x86/Vulkan host too, not a macOS-only
-    // handoff: `publish_window_frame` hands the window the resident whenever the
-    // engine's own device can present to the surface, and the host window then
-    // reads it directly instead of uploading CPU pixels. A driven boot of that
-    // pathway reads `capture_sampling full=1 light=1023` — one full capture for
-    // the whole boot, every present after it resident-carried. Only a present no
-    // resident carries (firmware framebuffer, a mapping cleared but never
-    // rendered into, the frames after a device reset) falls back to the readback
+    // This is the same handoff on every host-window pathway: the engine's own
+    // presenter consumes the resident when it can present to the surface. Only
+    // a present with no prepared resident carrier falls back to the readback
     // below.
     //
     // The full-frame readback has EXACTLY ONE reason to exist: the DISPLAY needs
@@ -210,29 +204,19 @@ pub fn capture_present_frame(
     //
     // Consequence: with a resident carrying, `frame_bgra` holds no frame for this
     // present, and the branch below drops it so that stays literally true.
-    let display_needs_cpu_frame = !state.presentation.present.display_from_resident();
+    let display_needs_cpu_frame = !state
+        .presentation
+        .present
+        .current_present_resident_carried();
     if !display_needs_cpu_frame {
         // Publish the new resident and leave `frame_bgra` empty: the window
         // ignores CPU pixels while the resident carries the display. A publish
         // miss costs one dropped frame (the window holds its last good frame and
-        // publish logs the drop), then `display_from_resident=false` forces the
-        // next capture to read back for fallback.
+        // publish logs the drop). The next present prepares its own route afresh.
         //
-        // Dropping it is what makes "no CPU pixels for this present" a fact
-        // rather than an inference. Skipping the readback only leaves the buffer
-        // empty if it was already empty, and it is not: the first present of a
-        // boot runs the full path — before the guest has painted anything, so it
-        // captures black — and every light present after it retained those bytes.
-        // Everything downstream that asks "were there pixels" asks
-        // `frame_bgra.is_empty()`, so all of them read that one stale frame as
-        // the current one. `present_content_verdict` judged it Black on 481 of
-        // 481 presents of a boot whose screen was correct throughout (0
-        // `present_content`, 0 `present_content_unsampled`), sending
-        // `present_black_retain` to the always-on failure sink 481 times with no
-        // guest work lost — the wolf-cry the `Unsampled` verdict exists to
-        // prevent, reintroduced through a buffer it could not see was stale. The
-        // console blit is gated on the same emptiness and would have painted
-        // those bytes as the live frame.
+        // Dropping it makes "no CPU pixels for this present" explicit to both
+        // the content verdict and the console blit; neither may consume bytes
+        // retained from an earlier CPU-backed present.
         state.presentation.present.publish_light_frame(
             mapping_id,
             width,

@@ -309,6 +309,10 @@ pub struct DeviceFeatures {
     /// Hosts without this optional Vulkan 1.2 feature decline those shaders by
     /// name rather than allocating invented textures or leaving invalid slots.
     pub descriptor_binding_partially_bound: bool,
+    /// `VK_EXT_robustness2::nullDescriptor`. The serialized API permits a
+    /// texture slot to contain no object; this capability represents that
+    /// state without manufacturing an image.
+    pub null_descriptor: bool,
     pub mirror_clamp_to_edge: MirrorClampToEdge,
     /// How this host can promise that an out-of-bounds texture read is defined,
     /// which every Metal shader is entitled to assume. See [`ImageRobustness`].
@@ -392,17 +396,19 @@ impl DeviceFeatures {
     /// Whether this device can bind a Metal sampled-texture handle array.
     /// Both halves are required: the shader indexes an array, and Metal permits
     /// the guest to leave array elements nil.
-    pub fn sampled_descriptor_arrays(&self, required_descriptors: u32) -> bool {
-        self.descriptor_binding_partially_bound
-            && self.sampled_image_array_dynamic_indexing
+    pub fn sampled_descriptor_arrays(&self, required_descriptors: u32, unpopulated: u32) -> bool {
+        self.sampled_image_array_dynamic_indexing
             && required_descriptors <= self.sampled_image_descriptor_limit
+            && (unpopulated == 0
+                || (self.descriptor_binding_partially_bound && self.null_descriptor))
     }
 
     /// Storage-image counterpart of [`Self::sampled_descriptor_arrays`].
-    pub fn storage_descriptor_arrays(&self, required_descriptors: u32) -> bool {
-        self.descriptor_binding_partially_bound
-            && self.storage_image_array_dynamic_indexing
+    pub fn storage_descriptor_arrays(&self, required_descriptors: u32, unpopulated: u32) -> bool {
+        self.storage_image_array_dynamic_indexing
             && required_descriptors <= self.storage_image_descriptor_limit
+            && (unpopulated == 0
+                || (self.descriptor_binding_partially_bound && self.null_descriptor))
     }
 
     /// The BGRA-storage composite path needs the format-less write feature and
@@ -506,6 +512,10 @@ impl DeviceFeatures {
             .robust_image_access(self.image_robustness.is_available())
     }
 
+    pub fn enabled_null_descriptor(&self) -> vk::PhysicalDeviceRobustness2FeaturesEXT<'static> {
+        vk::PhysicalDeviceRobustness2FeaturesEXT::default().null_descriptor(self.null_descriptor)
+    }
+
     pub fn enabled_attachment_feedback_loop_layout(
         &self,
     ) -> vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT<'static> {
@@ -574,6 +584,7 @@ impl DeviceFeatures {
             shader_output_viewport_index,
             timeline_semaphore,
             descriptor_binding_partially_bound,
+            null_descriptor,
             mirror_clamp_to_edge,
             image_robustness,
             attachment_feedback_loop_layout,
@@ -626,6 +637,7 @@ impl DeviceFeatures {
              shader_output_viewport_index={shader_output_viewport_index} \
              timeline_semaphore={timeline_semaphore} \
              descriptor_binding_partially_bound={descriptor_binding_partially_bound} \
+             null_descriptor={null_descriptor} \
              mirror_clamp_to_edge={mirror_clamp_to_edge:?} \
              dual_src_blend={dual_src_blend} fill_mode_non_solid={fill_mode_non_solid} \
              depth_clamp={depth_clamp} multi_viewport={multi_viewport} max_viewports={max_viewports} \
@@ -644,6 +656,9 @@ impl DeviceFeatures {
         }
         if self.image_robustness == ImageRobustness::ExtImageRobustness {
             out.push(vk::EXT_IMAGE_ROBUSTNESS_NAME.as_ptr());
+        }
+        if self.null_descriptor {
+            out.push(vk::EXT_ROBUSTNESS2_NAME.as_ptr());
         }
         if self.attachment_feedback_loop_layout {
             out.push(vk::EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_NAME.as_ptr());
@@ -791,6 +806,18 @@ pub unsafe fn query(
         } else {
             false
         };
+    // This structure is extension-only on the Vulkan 1.2 baseline. Query it
+    // only after the device advertises the extension, then enable exactly the
+    // nullable-descriptor bit the backend binds.
+    let null_descriptor = if has_extension(vk::EXT_ROBUSTNESS2_NAME) {
+        let mut robustness2 = vk::PhysicalDeviceRobustness2FeaturesEXT::default();
+        let mut robustness2_features =
+            vk::PhysicalDeviceFeatures2::default().push_next(&mut robustness2);
+        unsafe { instance.get_physical_device_features2(pd, &mut robustness2_features) };
+        robustness2.null_descriptor == vk::TRUE
+    } else {
+        false
+    };
     let linear_color_attachment = if has_extension(vk::NV_LINEAR_COLOR_ATTACHMENT_NAME) {
         let mut linear = vk::PhysicalDeviceLinearColorAttachmentFeaturesNV::default();
         let mut linear_features = vk::PhysicalDeviceFeatures2::default().push_next(&mut linear);
@@ -873,6 +900,7 @@ pub unsafe fn query(
         timeline_semaphore: supported_vulkan12.timeline_semaphore == vk::TRUE,
         descriptor_binding_partially_bound: supported_vulkan12.descriptor_binding_partially_bound
             == vk::TRUE,
+        null_descriptor,
         mirror_clamp_to_edge,
     }
 }
@@ -915,6 +943,7 @@ mod tests {
             shader_output_viewport_index: true,
             timeline_semaphore: true,
             descriptor_binding_partially_bound: true,
+            null_descriptor: true,
             mirror_clamp_to_edge: MirrorClampToEdge::Core12,
             image_robustness: ImageRobustness::Core13,
             attachment_feedback_loop_layout: true,
@@ -944,6 +973,7 @@ mod tests {
             attachment_feedback_loop_layout: false,
             linear_color_attachment: LinearColorAttachment::Unsupported,
             image_drm_format_modifier: false,
+            null_descriptor: false,
             ..all_supported()
         };
         assert_eq!(without.enabled_features().dual_src_blend, vk::FALSE);
@@ -986,6 +1016,7 @@ mod tests {
             attachment_feedback_loop_layout: false,
             linear_color_attachment: LinearColorAttachment::Unsupported,
             image_drm_format_modifier: false,
+            null_descriptor: false,
             ..all_supported()
         };
         assert_eq!(
@@ -1006,6 +1037,7 @@ mod tests {
             attachment_feedback_loop_layout: false,
             linear_color_attachment: LinearColorAttachment::Unsupported,
             image_drm_format_modifier: false,
+            null_descriptor: false,
             ..all_supported()
         };
         assert_eq!(
@@ -1025,6 +1057,7 @@ mod tests {
             attachment_feedback_loop_layout: false,
             linear_color_attachment: LinearColorAttachment::Unsupported,
             image_drm_format_modifier: false,
+            null_descriptor: false,
             ..all_supported()
         };
         assert_eq!(
@@ -1077,6 +1110,21 @@ mod tests {
         );
         assert!(!none.required_extensions().contains(&ext_name));
         assert!(!none.image_robustness.is_available());
+    }
+
+    #[test]
+    fn null_descriptor_feature_and_extension_move_together() {
+        let name = vk::EXT_ROBUSTNESS2_NAME.as_ptr();
+        let on = DeviceFeatures {
+            null_descriptor: true,
+            ..Default::default()
+        };
+        assert_eq!(on.enabled_null_descriptor().null_descriptor, vk::TRUE);
+        assert!(on.required_extensions().contains(&name));
+
+        let off = DeviceFeatures::default();
+        assert_eq!(off.enabled_null_descriptor().null_descriptor, vk::FALSE);
+        assert!(!off.required_extensions().contains(&name));
     }
 
     /// This extension has one indivisible contract: the queried feature, the
@@ -1376,36 +1424,54 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_arrays_require_indexing_and_partially_bound_support() {
+    fn descriptor_arrays_require_indexing_partially_bound_and_null_support() {
         let all = all_supported();
-        assert!(all.sampled_descriptor_arrays(128));
-        assert!(all.storage_descriptor_arrays(128));
+        assert!(all.sampled_descriptor_arrays(128, 1));
+        assert!(all.storage_descriptor_arrays(128, 1));
 
         assert!(!DeviceFeatures {
             descriptor_binding_partially_bound: false,
             ..all
         }
-        .sampled_descriptor_arrays(128));
+        .sampled_descriptor_arrays(128, 1));
+        assert!(!DeviceFeatures {
+            null_descriptor: false,
+            ..all
+        }
+        .sampled_descriptor_arrays(128, 1));
+        assert!(!DeviceFeatures {
+            null_descriptor: false,
+            ..all
+        }
+        .storage_descriptor_arrays(128, 1));
         assert!(!DeviceFeatures {
             sampled_image_array_dynamic_indexing: false,
             ..all
         }
-        .sampled_descriptor_arrays(128));
+        .sampled_descriptor_arrays(128, 1));
         assert!(!DeviceFeatures {
             storage_image_array_dynamic_indexing: false,
             ..all
         }
-        .storage_descriptor_arrays(128));
+        .storage_descriptor_arrays(128, 1));
         assert!(!DeviceFeatures {
             sampled_image_descriptor_limit: 127,
             ..all
         }
-        .sampled_descriptor_arrays(128));
+        .sampled_descriptor_arrays(128, 1));
         assert!(!DeviceFeatures {
             storage_image_descriptor_limit: 127,
             ..all
         }
-        .storage_descriptor_arrays(128));
+        .storage_descriptor_arrays(128, 1));
+
+        let no_sparse_support = DeviceFeatures {
+            descriptor_binding_partially_bound: false,
+            null_descriptor: false,
+            ..all
+        };
+        assert!(no_sparse_support.sampled_descriptor_arrays(128, 0));
+        assert!(no_sparse_support.storage_descriptor_arrays(128, 0));
     }
 
     /// `VUID-VkDeviceCreateInfo-pNext-02830`: a promoted feature struct may not

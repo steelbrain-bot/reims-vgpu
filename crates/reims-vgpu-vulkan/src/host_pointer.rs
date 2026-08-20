@@ -159,6 +159,9 @@ impl HostPointerImport {
 pub struct HostPointerCaps {
     /// Which check answered.
     pub rung: HostPointerImport,
+    /// External-memory handle type the device accepted for QEMU's mapped guest
+    /// RAM. Empty on every refused rung.
+    pub handle_type: vk::ExternalMemoryHandleTypeFlags,
     /// `minImportedHostPointerAlignment` as the device reported it. Both the
     /// imported pointer and the imported length must be multiples of it.
     ///
@@ -209,6 +212,7 @@ impl HostPointerCaps {
     fn refused(rung: HostPointerImport) -> Self {
         Self {
             rung,
+            handle_type: vk::ExternalMemoryHandleTypeFlags::empty(),
             min_alignment: 0,
             heap_budget: 0,
             span_max: 0,
@@ -218,6 +222,25 @@ impl HostPointerCaps {
     /// Whether the import path may run.
     pub fn is_available(self) -> bool {
         self.rung.is_available()
+    }
+
+    /// Stable diagnostic name for the capability-selected external-memory
+    /// handle. The handle remains the behavior-bearing value; this is only its
+    /// representation on the observability channel.
+    pub const fn handle_slug(self) -> &'static str {
+        if self
+            .handle_type
+            .contains(vk::ExternalMemoryHandleTypeFlags::HOST_MAPPED_FOREIGN_MEMORY_EXT)
+        {
+            "host_mapped_foreign_memory"
+        } else if self
+            .handle_type
+            .contains(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT)
+        {
+            "host_allocation"
+        } else {
+            "none"
+        }
     }
 }
 
@@ -275,18 +298,29 @@ pub unsafe fn query(
     // `vkGetPhysicalDeviceExternalBufferProperties` is Vulkan 1.1 core and the
     // baseline is 1.2, so this is always answerable once the handle type itself
     // is spelled by an advertised extension.
-    let info = vk::PhysicalDeviceExternalBufferInfo::default()
-        .usage(GUEST_IMPORT_USAGE)
-        .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
-    let mut props = vk::ExternalBufferProperties::default();
-    unsafe { instance.get_physical_device_external_buffer_properties(pd, &info, &mut props) };
-    if !props
-        .external_memory_properties
-        .external_memory_features
-        .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
-    {
+    // QEMU RAM and packed page views are mappings created outside Vulkan, so
+    // the foreign-mapping handle is their exact origin. Some portability
+    // implementations expose only HOST_ALLOCATION; retain it only when the
+    // device explicitly reports that fallback importable.
+    let handle_type = [
+        vk::ExternalMemoryHandleTypeFlags::HOST_MAPPED_FOREIGN_MEMORY_EXT,
+        vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT,
+    ]
+    .into_iter()
+    .find(|handle_type| {
+        let info = vk::PhysicalDeviceExternalBufferInfo::default()
+            .usage(GUEST_IMPORT_USAGE)
+            .handle_type(*handle_type);
+        let mut props = vk::ExternalBufferProperties::default();
+        unsafe { instance.get_physical_device_external_buffer_properties(pd, &info, &mut props) };
+        props
+            .external_memory_properties
+            .external_memory_features
+            .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+    });
+    let Some(handle_type) = handle_type else {
         return HostPointerCaps::refused(HostPointerImport::NotImportable);
-    }
+    };
 
     // The granularity is the device's, not ours, and it is not 4096 everywhere:
     // MoltenVK reports Apple's page size and a Linux driver may report more.
@@ -341,6 +375,7 @@ pub unsafe fn query(
 
     HostPointerCaps {
         rung: HostPointerImport::Supported,
+        handle_type,
         min_alignment,
         heap_budget,
         span_max,
@@ -426,6 +461,7 @@ pub unsafe fn import_memory_type(
     ext: &ash::ext::external_memory_host::Device,
     memory_props: &vk::PhysicalDeviceMemoryProperties,
     host_ptr: *const std::ffi::c_void,
+    handle_type: vk::ExternalMemoryHandleTypeFlags,
     req: &crate::memory::MemoryRequest,
     bytes: u64,
     max_allocation: u64,
@@ -440,7 +476,7 @@ pub unsafe fn import_memory_type(
     let rc = unsafe {
         (ext.fp().get_memory_host_pointer_properties_ext)(
             ext.device(),
-            vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT,
+            handle_type,
             host_ptr,
             &mut ptr_props,
         )
@@ -497,6 +533,21 @@ mod tests {
         assert_eq!(HostPointerImport::default().slug(), "unqueried");
         assert_eq!(HostPointerCaps::default().min_alignment, 0);
         assert!(!HostPointerCaps::default().is_available());
+        assert_eq!(HostPointerCaps::default().handle_slug(), "none");
+    }
+
+    #[test]
+    fn external_memory_handle_diagnostic_names_are_stable() {
+        let foreign = HostPointerCaps {
+            handle_type: vk::ExternalMemoryHandleTypeFlags::HOST_MAPPED_FOREIGN_MEMORY_EXT,
+            ..HostPointerCaps::default()
+        };
+        assert_eq!(foreign.handle_slug(), "host_mapped_foreign_memory");
+        let allocation = HostPointerCaps {
+            handle_type: vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT,
+            ..HostPointerCaps::default()
+        };
+        assert_eq!(allocation.handle_slug(), "host_allocation");
     }
 
     /// One slug per rung: two rungs sharing one would mean watching the slug

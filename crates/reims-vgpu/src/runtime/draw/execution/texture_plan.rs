@@ -1,10 +1,41 @@
 //! Complete sampled-texture planning for one resolved draw.
 //!
 //! Texture resolution, semantic shape/access checks, binding projection, byte
-//! provenance, view swizzles, and required neutral substitutions are owned here.
+//! provenance, view swizzles, and required null descriptors are owned here.
 //! The executor receives a complete image list or one typed preparation refusal.
 
 use super::*;
+
+fn reflected_sampled_binding(
+    interface: &reims_vgpu_core::ShaderInterface,
+    metal_index: u32,
+) -> Result<
+    Option<(
+        reims_vgpu_core::ReflectedTextureDescriptor,
+        reims_vgpu_core::SampledImageKind,
+    )>,
+    reims_vgpu_core::ReflectedSampledKind,
+> {
+    let Some(descriptor) = interface.texture_descriptor(metal_index) else {
+        return Ok(None);
+    };
+    match interface.sampled_kind(descriptor.binding) {
+        reims_vgpu_core::ReflectedSampledKind::Kind(kind) => Ok(Some((descriptor, kind))),
+        other => Err(other),
+    }
+}
+
+fn guest_image_plane_count(layout: reims_vgpu_memory::GuestImageLayout) -> u32 {
+    if layout.is_volume() {
+        layout.depth()
+    } else {
+        layout.array_layers()
+    }
+}
+
+fn sampled_extent(one_dimensional: bool, width: u32, height: u32) -> Option<(u32, u32)> {
+    (!one_dimensional || (width != 0 && height == 1)).then_some((width, height))
+}
 
 #[allow(
     clippy::too_many_arguments,
@@ -33,12 +64,11 @@ pub(super) fn plan_sampled_textures<M: HostMemory + HostOps>(
     // where a span opens, so a draw that samples nothing is still in the
     // denominator.
     crate::runtime::sampled_phase::note_sampled();
-    // Sampled textures + samplers (metal2vulkan bands: textures 32+N, samplers 64+M).
-    // Texture and sampler **indices are independent** (live logo SPIR-V: image
-    // binding 35 = texture(3), sampler binding 64 = sampler(0)). Pairing
-    // sampler to texture index left sampler 67 empty → black samples.
-    // Fragment sampled resources use +FRAG_SAMPLED when either both stages
-    // sample or fragment buffers moved into the sampled/static-sampler band.
+    // Sampled textures and samplers occupy independent reflected ranges.
+    // Texture and sampler **indices are independent**. Their exact executable
+    // bindings come from disjoint reflected descriptor classes; pairing a
+    // sampler to the texture index can therefore leave the sampler descriptor
+    // the shader actually names empty.
     let mut images: Vec<reims_vgpu_core::SampledImageResource> = Vec::new();
     {
         let mut push_tex = |index: u32,
@@ -54,29 +84,61 @@ pub(super) fn plan_sampled_textures<M: HostMemory + HostOps>(
             } else {
                 &v_shader.interface
             };
-            let reflected_descriptor = interface.texture_descriptor(index);
             let variant = if frag_stage { f_variant } else { v_variant };
-            let img_bind = variant.texture_binding(
-                index,
-                reflected_descriptor.map(|descriptor| descriptor.binding),
-            );
-            if let Some(descriptor) = reflected_descriptor {
-                use reims_vgpu_core::ReflectedTextureAccess;
-                let unsupported = match descriptor.access {
-                    ReflectedTextureAccess::Sampled => None,
-                    ReflectedTextureAccess::Storage => Some("storage"),
-                    ReflectedTextureAccess::Unknown => Some("unknown"),
-                };
-                if let Some(access) = unsupported {
-                    return Err(DrawPreparationDecline::TextureAccessUnsupported {
+            // A guest encoder may bind more texture slots than this shader
+            // statically uses. Such a slot has no descriptor in the translated
+            // interface and therefore contributes no Vulkan resource. Treating
+            // absence as a 2D texture manufactures both a shader type and GPU
+            // work that the contract never requested.
+            let Some((reflected_descriptor, image_kind)) =
+                reflected_sampled_binding(interface, index).map_err(|reason| {
+                    DrawPreparationDecline::TextureDimensionUnsupported {
                         stage: if frag_stage { "fragment" } else { "vertex" },
                         index,
                         texture_ref,
-                        binding: img_bind,
-                        access,
-                    });
-                }
+                        binding: variant.texture_binding(index, None),
+                        kind: match reason {
+                            reims_vgpu_core::ReflectedSampledKind::Absent => "reflected_absent",
+                            reims_vgpu_core::ReflectedSampledKind::Unsupported => {
+                                "reflected_unsupported"
+                            }
+                            reims_vgpu_core::ReflectedSampledKind::Kind(_) => unreachable!(),
+                        }
+                        .into(),
+                    }
+                })?
+            else {
+                return Ok(());
+            };
+            let img_bind = variant.texture_binding(index, Some(reflected_descriptor.binding));
+            use reims_vgpu_core::ReflectedTextureAccess;
+            let unsupported = match reflected_descriptor.access {
+                ReflectedTextureAccess::Sampled => None,
+                ReflectedTextureAccess::Storage => Some("storage"),
+                ReflectedTextureAccess::Unknown => Some("unknown"),
+            };
+            if let Some(access) = unsupported {
+                return Err(DrawPreparationDecline::TextureAccessUnsupported {
+                    stage: if frag_stage { "fragment" } else { "vertex" },
+                    index,
+                    texture_ref,
+                    binding: img_bind,
+                    access,
+                });
             }
+            // Texture dimensionality comes solely from the translator's
+            // reflection. Resolve it before the content source so a backing is
+            // offered to the direct-image rail only with the descriptor's real
+            // shader-visible shape.
+            let Some(shape) = sampled_image_shape(image_kind) else {
+                return Err(DrawPreparationDecline::TextureDimensionUnsupported {
+                    stage: if frag_stage { "fragment" } else { "vertex" },
+                    index,
+                    texture_ref,
+                    binding: img_bind,
+                    kind: format!("{image_kind:?}"),
+                });
+            };
             // The two guest reads this bind needs before anything can decide
             // where its texels come from. `sampled_phase::Part::Lookup` is
             // this pair and nothing else, so the object-list walk is priced
@@ -166,6 +228,7 @@ pub(super) fn plan_sampled_textures<M: HostMemory + HostOps>(
                         texture_ref,
                         texture_resource.clone(),
                         view_swizzle.is_none(),
+                        shape,
                     ) else {
                         let detail = texture_resource
                             .as_deref()
@@ -228,7 +291,7 @@ pub(super) fn plan_sampled_textures<M: HostMemory + HostOps>(
                     // This arm used to `return Ok(())` — no resource pushed
                     // at all. That was not a decline: the unbound scan had
                     // already counted `texture_ref != 0` as provided, so no
-                    // neutral image was substituted either, and the binding
+                    // null image descriptor was inserted either, and the binding
                     // went missing from a layout the fragment module
                     // statically uses. The engine's
                     // `used_binding_absent_from_layout` then refused the
@@ -254,45 +317,19 @@ pub(super) fn plan_sampled_textures<M: HostMemory + HostOps>(
                     bytes_identity = identity;
                     reims_vgpu_core::SampledSource::GuestRuns(src, vouch)
                 }
-            };
-            let array_element = reflected_descriptor
-                .map(|descriptor| descriptor.array_element)
-                .unwrap_or(0);
-            let descriptor_count = reflected_descriptor
-                .map(|descriptor| descriptor.descriptor_count)
-                .unwrap_or(1);
-            // Texture dimensionality comes solely from the translator's reflection,
-            // keyed on the UN-relocated descriptor binding. The always-on
-            // `census_reflection_wellformed` guard proves the reflection is
-            // internally consistent per translation. `Absent` is an unused
-            // argument and its shape is immaterial. A present but unsupported
-            // shape refuses the draw; treating it as 2D changes shader semantics.
-            use reims_vgpu_core::{ReflectedSampledKind, SampledImageKind};
-            let image_kind = match interface.sampled_kind(variant.texture_declared_binding(
-                index,
-                reflected_descriptor.map(|descriptor| descriptor.binding),
-            )) {
-                ReflectedSampledKind::Kind(k) => k,
-                ReflectedSampledKind::Absent => SampledImageKind::D2,
-                ReflectedSampledKind::Unsupported => {
-                    return Err(DrawPreparationDecline::TextureDimensionUnsupported {
-                        stage: if frag_stage { "fragment" } else { "vertex" },
-                        index,
-                        texture_ref,
-                        binding: img_bind,
-                        kind: "reflected_unsupported".into(),
-                    });
+                SampledSourceRequest::GuestImage(source, format, identity, vouch, components) => {
+                    sampled_format = format;
+                    sampled_components = components;
+                    source_planes = source
+                        .viewed_base_layout()
+                        .map(guest_image_plane_count)
+                        .unwrap_or(0);
+                    bytes_identity = identity;
+                    reims_vgpu_core::SampledSource::GuestImage(source, vouch)
                 }
             };
-            let Some(shape) = sampled_image_shape(image_kind) else {
-                return Err(DrawPreparationDecline::TextureDimensionUnsupported {
-                    stage: if frag_stage { "fragment" } else { "vertex" },
-                    index,
-                    texture_ref,
-                    binding: img_bind,
-                    kind: format!("{image_kind:?}"),
-                });
-            };
+            let array_element = reflected_descriptor.array_element;
+            let descriptor_count = reflected_descriptor.descriptor_count;
             let SampledImageShape {
                 arrayed,
                 volume,
@@ -322,15 +359,32 @@ pub(super) fn plan_sampled_textures<M: HostMemory + HostOps>(
                         }
                     })
                     .unwrap_or(source_planes);
+            } else if arrayed {
+                layers = texture_resource
+                    .as_ref()
+                    .and_then(|resource| {
+                        match crate::runtime::objects::decoded_resource(resource) {
+                            Ok(crate::runtime::decode::resource::Descriptor::Texture(tex)) => tex
+                                .declaration
+                                .map(|declaration| u32::from(declaration.array_length))
+                                .filter(|layers| *layers != 0),
+                            _ => None,
+                        }
+                    })
+                    .unwrap_or(source_planes);
             }
-            // A Vulkan 1D image is defined to have height 1; the descriptor
-            // may report the LUT's texel count in either axis, so collapse
-            // to a single row and fold the other axis into the width the
-            // sampled bytes are validated against.
-            let (tw, th) = if one_dim {
-                (tw.saturating_mul(th).max(1), 1)
-            } else {
-                (tw, th)
+            // A one-dimensional image has one row. Width and height are
+            // independent decoded descriptor fields; multiplying them because
+            // a particular payload happened to fit would manufacture geometry
+            // the API never declared.
+            let Some((tw, th)) = sampled_extent(one_dim, tw, th) else {
+                return Err(DrawPreparationDecline::TextureDimensionUnsupported {
+                    stage: if frag_stage { "fragment" } else { "vertex" },
+                    index,
+                    texture_ref,
+                    binding: img_bind,
+                    kind: format!("one_dim_extent_{tw}x{th}"),
+                });
             };
             images.push(reims_vgpu_core::SampledImageResource {
                 binding: img_bind,
@@ -377,7 +431,7 @@ pub(super) fn plan_sampled_textures<M: HostMemory + HostOps>(
             push_tex(t.index, t.texture_ref, t.resource.as_ref(), true)?;
         }
     }
-    // Repair the gaps the guard found. A fragment texture the module
+    // Provision the null bindings the guard found. A fragment texture the module
     // statically uses and this draw did not bind is absent from the
     // descriptor set layout *entirely* — `engine/exec.rs` builds the layout
     // from provided resources alone, so it is not an unwritten slot in a
@@ -399,9 +453,8 @@ pub(super) fn plan_sampled_textures<M: HostMemory + HostOps>(
         }
         // The shape has to be the one the module declared: a plain 2D view
         // bound where the shader samples an array is a different violation,
-        // not a repair. The reflection is asked in the translator's
-        // numbering, which is what `reflected_sampled_kind` takes — the
-        // relocation above applies to the SPIR-V, not to the signature.
+        // not a repair. The semantic interface and executable variant carry the
+        // same translator-selected descriptor layout.
         let kind = match f_shader.interface.sampled_kind(
             f_variant.texture_declared_binding(
                 index,
@@ -454,30 +507,23 @@ pub(super) fn plan_sampled_textures<M: HostMemory + HostOps>(
                 kind: format!("{kind:?}"),
             });
         }
-        // A repair that succeeded, not a success: the shader samples a
-        // texture whose contents this device invented, so it stays on the
-        // fail channel and the reliance stays measurable.
-        crate::observe::fail(format!(
-            "shader_resource_declared_unbound \
-         reason=frag_neutral_texture_substituted \
-         pipe={} idx={index} binding={img_bind} kind={kind:?} 1x1",
-            req.pipeline_ref
-        ));
+        // The serialized argument table permits a null texture reference. Keep
+        // that semantic state through planning; the backend either binds a
+        // native null descriptor or refuses by capability.
+        crate::runtime::drain::note_store_route("frag_null_texture");
         images.push(reims_vgpu_core::SampledImageResource {
             binding: img_bind,
             array_element: 0,
             descriptor_count: 1,
-            width: 1,
-            height: 1,
+            width: 0,
+            height: 0,
             layers: shape.layers,
             arrayed: shape.arrayed,
             volume: shape.volume,
             cube: shape.cube,
             one_dim: shape.one_dim,
             multisampled: false,
-            source: reims_vgpu_core::SampledSource::Bytes(std::sync::Arc::new(
-                reims_vgpu_core::pixel_format::solid_rgba8(1, 1, &[0.0; 4]),
-            )),
+            source: reims_vgpu_core::SampledSource::Null,
             content: None,
             byte_origin: reims_vgpu_core::SampledByteOrigin::Synthetic,
             format: reims_vgpu_protocol::ImageFormat::linear(
@@ -490,4 +536,107 @@ pub(super) fn plan_sampled_textures<M: HostMemory + HostOps>(
     }
 
     Ok(images)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{guest_image_plane_count, reflected_sampled_binding, sampled_extent};
+    use reims_vgpu_core::{
+        ReflectedSampledKind, ReflectedShaderStage, ReflectedTextureAccess, SampledImageKind,
+        ShaderDescriptorLocation, ShaderInterface, ShaderResourceAccess, ShaderResourceBinding,
+        ShaderResourceKind, ShaderTextureComponent, ShaderTextureDimension, ShaderTextureShape,
+    };
+
+    fn interface(binding: Option<ShaderResourceBinding>) -> ShaderInterface {
+        ShaderInterface {
+            stage: ReflectedShaderStage::Fragment,
+            bindings: binding.into_iter().collect(),
+            local_size: None,
+            unsupported: None,
+        }
+    }
+
+    fn texture(shape: Option<ShaderTextureShape>) -> ShaderResourceBinding {
+        ShaderResourceBinding {
+            kind: ShaderResourceKind::Texture,
+            metal_index: 7,
+            descriptor: Some(ShaderDescriptorLocation {
+                set: 0,
+                binding: 39,
+                count: 1,
+            }),
+            extent: None,
+            footprint: None,
+            texture_shape: shape,
+            access: Some(ShaderResourceAccess::Sampled),
+        }
+    }
+
+    #[test]
+    fn an_encoder_binding_absent_from_the_shader_is_not_invented_as_2d() {
+        assert_eq!(reflected_sampled_binding(&interface(None), 7), Ok(None));
+    }
+
+    #[test]
+    fn a_reflected_binding_keeps_its_real_dimension() {
+        let shape = ShaderTextureShape {
+            dimension: ShaderTextureDimension::D3,
+            arrayed: false,
+            multisampled: false,
+            component: ShaderTextureComponent::Float,
+            writable: false,
+            array_ref: false,
+            array_length: None,
+            storage_format: None,
+        };
+        assert_eq!(
+            reflected_sampled_binding(&interface(Some(texture(Some(shape)))), 7),
+            Ok(Some((
+                reims_vgpu_core::ReflectedTextureDescriptor {
+                    binding: 39,
+                    array_element: 0,
+                    descriptor_count: 1,
+                    access: ReflectedTextureAccess::Sampled,
+                },
+                SampledImageKind::D3,
+            )))
+        );
+    }
+
+    #[test]
+    fn a_declared_descriptor_without_shape_is_malformed_not_2d() {
+        assert_eq!(
+            reflected_sampled_binding(&interface(Some(texture(None))), 7),
+            Err(ReflectedSampledKind::Absent)
+        );
+    }
+
+    #[test]
+    fn direct_images_keep_array_layers_and_volume_depth() {
+        assert_eq!(
+            guest_image_plane_count(reims_vgpu_memory::GuestImageLayout::D1Array {
+                width: 8,
+                layers: 5,
+                array_pitch: 64,
+            }),
+            5
+        );
+        assert_eq!(
+            guest_image_plane_count(reims_vgpu_memory::GuestImageLayout::D3 {
+                width: 8,
+                height: 4,
+                depth: 7,
+                depth_pitch: 128,
+            }),
+            7
+        );
+    }
+
+    #[test]
+    fn one_dimensional_extent_is_not_reconstructed_from_a_second_axis() {
+        assert_eq!(sampled_extent(true, 17, 1), Some((17, 1)));
+        assert_eq!(sampled_extent(true, 17, 3), None);
+        assert_eq!(sampled_extent(true, 0, 1), None);
+        assert_eq!(sampled_extent(false, 17, 3), Some((17, 3)));
+    }
 }

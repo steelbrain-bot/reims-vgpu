@@ -984,11 +984,11 @@ fn finish(
     started: std::time::Instant,
 ) {
     // A copied resident needs two pieces of registry state handed back: the
-    // mapping epoch says its mirror is current, and clearing sole-copy permits
-    // reclaim now that the guest pages hold the pixels. An imported resident is
-    // the guest allocation itself. It has no mirror epoch to stamp, and draw
-    // completion already leaves it non-sole-copy, so neither registry mutation
-    // applies.
+    // mapping epoch says its representation is current, and clearing sole-copy
+    // permits reclaim now that the guest pages hold the pixels. Imported
+    // residents are normally completed by the direct Store route; stamping is
+    // still valid here because currency describes content equality, not the
+    // allocation topology.
     if let Some(epoch) = state
         .surfaces
         .mappings

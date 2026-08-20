@@ -165,6 +165,20 @@ impl<Window, Resource> MaterializationRegistry<Window, Resource> {
         self.resources.get(&owner).map(|entry| &entry.value)
     }
 
+    pub fn resource_mut(&mut self, owner: MaterializationOwner) -> Option<&mut Resource> {
+        self.resources.get_mut(&owner).map(|entry| &mut entry.value)
+    }
+
+    /// Borrow every resource-shaped materialization for read-only census work.
+    ///
+    /// The iterator exposes neither keys nor mutation: ownership and retirement
+    /// remain operations of this registry, while an adapter can still measure
+    /// properties of its concrete resource payloads without maintaining a
+    /// second index that could drift from this one.
+    pub fn resource_values(&self) -> impl Iterator<Item = &Resource> {
+        self.resources.values().map(|entry| &entry.value)
+    }
+
     pub fn insert_resource(
         &mut self,
         owner: MaterializationOwner,
@@ -291,5 +305,14 @@ mod tests {
         }
         assert_eq!(registry.window_len(), 2048);
         assert_eq!(registry.shape().max_offsets, 2048);
+    }
+
+    #[test]
+    fn resource_census_borrows_the_registrys_owned_values() {
+        let mut registry = MaterializationRegistry::<(), u32>::default();
+        registry.insert_resource(owner(1, 2), span(0x1000, 0x1000), 7);
+        registry.insert_resource(owner(1, 3), span(0x2000, 0x1000), 11);
+
+        assert_eq!(registry.resource_values().copied().sum::<u32>(), 18);
     }
 }

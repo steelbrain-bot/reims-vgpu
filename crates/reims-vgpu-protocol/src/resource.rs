@@ -311,12 +311,27 @@ impl TextureLevelLayout {
 }
 
 /// Semantic construction descriptor for a page-backed linear texture.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LinearTextureDescriptor {
     pub allocation_size: u64,
     pub handle: u32,
     pub mipmap_level_count: u32,
-    pub data_offset: u32,
+    /// Allocation-relative start of the first texture slice.
+    pub base_offset: u64,
+    /// Distance between adjacent physical slices (array layers or cube
+    /// faces), spanning every mip level belonging to one slice.
+    ///
+    /// This is an inter-slice advance, not a mandatory size field. A
+    /// single-slice client-backed texture may carry zero; its occupied span is
+    /// then described entirely by the level records and allocation size.
+    pub bytes_per_slice: u64,
+    /// Number of declared array slices before cube faces are expanded.
+    pub slice_count: u32,
+    /// The dimension record says its slices are six-face cube slices.
+    pub cube_faces: bool,
+    /// The dimension records describe compressed blocks rather than ordinary
+    /// texels.
+    pub compressed_layout: bool,
     pub bytes_per_element: u8,
     pub used_size: u32,
     pub row_stride: u32,
@@ -325,6 +340,29 @@ pub struct LinearTextureDescriptor {
     pub depth: u32,
     pub declaration: Option<crate::TextureDeclaration>,
     pub levels: Vec<TextureLevelLayout>,
+}
+
+impl Default for LinearTextureDescriptor {
+    fn default() -> Self {
+        Self {
+            allocation_size: 0,
+            handle: 0,
+            mipmap_level_count: 0,
+            base_offset: 0,
+            bytes_per_slice: 0,
+            slice_count: 1,
+            cube_faces: false,
+            compressed_layout: false,
+            bytes_per_element: 0,
+            used_size: 0,
+            row_stride: 0,
+            width: 0,
+            height: 0,
+            depth: 0,
+            declaration: None,
+            levels: Vec::new(),
+        }
+    }
 }
 
 impl LinearTextureDescriptor {
@@ -354,14 +392,89 @@ impl LinearTextureDescriptor {
     }
 
     pub fn backing_gva_size(&self, page_shift: u32) -> Option<(u64, u64)> {
-        if self.allocation_size == 0 || self.handle == 0 {
+        if self.allocation_size == 0 || self.handle == 0 || self.base_offset >= self.allocation_size
+        {
             return None;
         }
         let base = self.allocation_base_gva(page_shift)?;
         Some((
-            base.checked_add(u64::from(self.data_offset))?,
-            self.allocation_size,
+            base.checked_add(self.base_offset)?,
+            self.allocation_size.checked_sub(self.base_offset)?,
         ))
+    }
+
+    /// Number of physical slices represented by the allocation. Cube and
+    /// cube-array textures store six consecutive faces per declared slice.
+    pub fn physical_slice_count(&self) -> Option<u32> {
+        self.slice_count
+            .checked_mul(if self.cube_faces { 6 } else { 1 })
+    }
+
+    /// Span occupied by one physical slice's mip records.
+    ///
+    /// Multi-slice storage requires the declared inter-slice advance. For one
+    /// physical slice, zero means there is no next-slice advance; the level
+    /// records still provide a complete occupied span.
+    pub fn physical_slice_span(&self) -> Option<u64> {
+        let physical_slices = self.physical_slice_count()?;
+        if physical_slices == 0 {
+            return None;
+        }
+        if self.bytes_per_slice != 0 {
+            return Some(self.bytes_per_slice);
+        }
+        if physical_slices != 1 {
+            return None;
+        }
+        let mut level_end = None;
+        for level in &self.levels {
+            if level.size == 0 {
+                return None;
+            }
+            let end = level.offset.checked_add(level.size)?;
+            level_end = Some(level_end.map_or(end, |current: u64| current.max(end)));
+        }
+        let level_end = level_end?;
+        Some(level_end)
+    }
+
+    /// Allocation-relative end of the declared slice-major mip packing.
+    pub fn packed_allocation_end(&self) -> Option<u64> {
+        let physical_slices = self.physical_slice_count()?;
+        let slice_span = self.physical_slice_span()?;
+        self.base_offset
+            .checked_add(slice_span.checked_mul(u64::from(physical_slices))?)
+    }
+
+    pub fn declared_packing_fits_allocation(&self) -> bool {
+        self.packed_allocation_end()
+            .is_some_and(|end| end <= self.allocation_size)
+    }
+
+    pub fn level_fits_slice(&self, level: &TextureLevelLayout) -> bool {
+        level.size != 0
+            && level
+                .offset
+                .checked_add(level.size)
+                .zip(self.physical_slice_span())
+                .is_some_and(|(end, span)| end <= span)
+    }
+
+    /// Allocation-relative start of one `(slice, mip)` subresource.
+    pub fn subresource_offset(&self, slice: u32, level: u32) -> Option<u64> {
+        let physical_slices = self.physical_slice_count()?;
+        if slice >= physical_slices {
+            return None;
+        }
+        let slice_stride = if physical_slices == 1 {
+            0
+        } else {
+            (self.bytes_per_slice != 0).then_some(self.bytes_per_slice)?
+        };
+        u64::from(slice)
+            .checked_mul(slice_stride)?
+            .checked_add(self.base_offset)?
+            .checked_add(self.level(level)?.offset)
     }
 
     pub fn level(&self, level: u32) -> Option<&TextureLevelLayout> {
@@ -374,13 +487,33 @@ impl LinearTextureDescriptor {
         if layout.width == 0 || layout.height == 0 || layout.row_stride == 0 {
             return None;
         }
+        let offset = self.subresource_offset(0, level)?;
         if self.allocation_size != 0
-            && (layout.offset >= self.allocation_size
-                || self.allocation_size - layout.offset < layout.row_stride)
+            && (offset >= self.allocation_size || self.allocation_size - offset < layout.row_stride)
         {
             return None;
         }
-        Some((base.checked_add(layout.offset)?, layout))
+        Some((base.checked_add(offset)?, layout))
+    }
+
+    pub fn subresource_gva(
+        &self,
+        slice: u32,
+        level: u32,
+        page_shift: u32,
+    ) -> Option<(u64, &TextureLevelLayout)> {
+        let base = self.allocation_base_gva(page_shift)?;
+        let layout = self.level(level)?;
+        if layout.width == 0 || layout.height == 0 || layout.row_stride == 0 {
+            return None;
+        }
+        let offset = self.subresource_offset(slice, level)?;
+        if self.allocation_size != 0
+            && (offset >= self.allocation_size || self.allocation_size - offset < layout.row_stride)
+        {
+            return None;
+        }
+        Some((base.checked_add(offset)?, layout))
     }
 }
 
@@ -965,12 +1098,14 @@ mod tests {
         let descriptor = LinearTextureDescriptor {
             allocation_size: 0x8000,
             handle: 0x20,
-            data_offset: 0x100,
+            base_offset: 0x100,
+            bytes_per_slice: 0x1000,
+            slice_count: 1,
             width: 16,
             height: 8,
             row_stride: 128,
             levels: vec![TextureLevelLayout {
-                offset: 0x400,
+                offset: 0x300,
                 size: 0x1000,
                 row_stride: 128,
                 width: 16,
@@ -979,12 +1114,107 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert_eq!(descriptor.backing_gva_size(12), Some((0x20_100, 0x8000)));
+        assert_eq!(descriptor.backing_gva_size(12), Some((0x20_100, 0x7f00)));
+        assert_eq!(descriptor.physical_slice_count(), Some(1));
+        assert_eq!(descriptor.packed_allocation_end(), Some(0x1100));
+        assert!(descriptor.declared_packing_fits_allocation());
         let (gva, level) = descriptor.level_gva(0, 12).unwrap();
         assert_eq!(gva, 0x20_400);
         assert_eq!(level.read_span(64), Some(7 * 128 + 64));
         assert_eq!(level.slice_read_span(64), level.read_span(64));
         assert_eq!(descriptor.level_gva(1, 12), None);
+    }
+
+    #[test]
+    fn cube_texture_packing_expands_faces_and_keeps_mip_offsets_slice_relative() {
+        let descriptor = LinearTextureDescriptor {
+            allocation_size: 0x40_000,
+            handle: 3,
+            base_offset: 0x100,
+            bytes_per_slice: 0x3000,
+            slice_count: 3,
+            cube_faces: true,
+            levels: vec![
+                TextureLevelLayout {
+                    offset: 0x200,
+                    row_stride: 0x100,
+                    width: 32,
+                    height: 16,
+                    depth: 1,
+                    ..Default::default()
+                },
+                TextureLevelLayout {
+                    offset: 0x2400,
+                    row_stride: 0x80,
+                    width: 16,
+                    height: 8,
+                    depth: 1,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(descriptor.physical_slice_count(), Some(18));
+        assert_eq!(descriptor.subresource_offset(2, 1), Some(0x8500));
+        assert_eq!(descriptor.packed_allocation_end(), Some(0x36_100));
+        assert!(descriptor.declared_packing_fits_allocation());
+
+        let short = LinearTextureDescriptor {
+            allocation_size: 0x36_0ff,
+            ..descriptor
+        };
+        assert!(!short.declared_packing_fits_allocation());
+    }
+
+    #[test]
+    fn a_single_physical_slice_does_not_require_an_inter_slice_advance() {
+        let descriptor = LinearTextureDescriptor {
+            allocation_size: 0x4100,
+            handle: 9,
+            mipmap_level_count: 2,
+            base_offset: 0x100,
+            bytes_per_slice: 0,
+            slice_count: 1,
+            levels: vec![
+                TextureLevelLayout {
+                    offset: 0,
+                    size: 0x4000,
+                    row_stride: 0x100,
+                    width: 64,
+                    height: 64,
+                    depth: 1,
+                },
+                TextureLevelLayout {
+                    offset: 0,
+                    size: 0x1000,
+                    row_stride: 0x80,
+                    width: 32,
+                    height: 32,
+                    depth: 1,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(descriptor.physical_slice_span(), Some(0x4000));
+        assert_eq!(descriptor.packed_allocation_end(), Some(0x4100));
+        assert!(descriptor.declared_packing_fits_allocation());
+        assert_eq!(descriptor.subresource_offset(0, 1), Some(0x100));
+
+        let short = LinearTextureDescriptor {
+            allocation_size: 0x40ff,
+            ..descriptor.clone()
+        };
+        assert!(!short.declared_packing_fits_allocation());
+
+        let array = LinearTextureDescriptor {
+            allocation_size: 0x8100,
+            slice_count: 2,
+            ..descriptor
+        };
+        assert_eq!(array.physical_slice_span(), None);
+        assert_eq!(array.subresource_offset(1, 0), None);
+        assert!(!array.declared_packing_fits_allocation());
     }
 
     #[test]

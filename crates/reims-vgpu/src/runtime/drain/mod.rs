@@ -1485,8 +1485,8 @@ fn note_stamp_direction<H: HostMemory + HostOps>(host: &H, gpa: u64, index: u32,
     }
 }
 
-/// Queue this stamp behind the FIFO completion point of the guest-memory work
-/// it follows, so the drain worker never blocks on that work.
+/// Queue this stamp behind the FIFO completion point of the executor work it
+/// follows, so the drain worker never blocks on that work.
 ///
 /// [`StampOrder::CpuReady`] means the caller may publish immediately;
 /// [`StampOrder::Declined`] means it must settle through the blocking fallback.
@@ -1507,8 +1507,8 @@ enum StampOrder {
 }
 
 impl StampOrder {
-    fn from_debt(guest_access: bool, fifo_pending: bool) -> Self {
-        if guest_access || fifo_pending {
+    fn from_preceding_work(executor_work: bool, fifo_pending: bool) -> Self {
+        if executor_work || fifo_pending {
             Self::Queued
         } else {
             Self::CpuReady
@@ -1546,11 +1546,13 @@ fn stamp_word_order_on_fifo<H: HostMemory + HostOps>(
     // A CPU-only packet normally has nothing queued behind it. It must still
     // join an older pending completion on this same FIFO: publishing it now
     // would let the older completion overwrite the slot with a prior value.
-    // Reads count just as much as writes: once this stamp moves, the guest may
-    // repaint or free pages a preceding command buffer still sources.
-    let guest_access = state.executor.guest_access_outstanding();
+    // Recorded-but-unsubmitted draws count independently of guest-page debt:
+    // once this stamp moves, the guest may retire every resource named by the
+    // preceding command buffer. Reads likewise count as much as writes because
+    // the guest may repaint or free pages that command buffer still sources.
+    let preceding_work = state.executor.completion_work_outstanding();
     let fifo_pending = state.executor.completion_stamp_pending(index);
-    if StampOrder::from_debt(guest_access, fifo_pending) == StampOrder::CpuReady {
+    if StampOrder::from_preceding_work(preceding_work, fifo_pending) == StampOrder::CpuReady {
         return StampOrder::CpuReady;
     }
     let page_size = state.page_size();
@@ -1587,7 +1589,7 @@ fn stamp_word_order_on_fifo<H: HostMemory + HostOps>(
             false
         }
     };
-    if queued && !guest_access {
+    if queued && !preceding_work {
         note_store_route("stamp_pending_fifo_chained");
     }
     if queued {
@@ -3178,6 +3180,21 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         // rotation step behind the one the guest asked for — residue when a
         // window closed in between, a stale region when one moved, thrash as
         // the choice oscillates.
+        // Decide the current present's carrier before capture. Preparation is
+        // the presentation service's capability/lifetime answer; no host or
+        // guest identity is inferred here.
+        let present_identity =
+            crate::runtime::present_identity::surface_identity(state, mapping, w, h);
+        let source = reims_vgpu_core::PresentationSource::new(present_identity, w, h);
+        let carried = state.presentation.present.window_active()
+            && state
+                .executor
+                .prepare_window_resident_present(&source)
+                .is_ok();
+        state
+            .presentation
+            .present
+            .set_current_present_resident_carried(carried);
         let encoded = crate::runtime::scanout::capture_present_frame(state, mapping, w, h, gen);
         if !encoded {
             // Retry encode at first host paint. Do **not** clear

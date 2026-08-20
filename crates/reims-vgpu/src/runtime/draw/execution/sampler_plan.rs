@@ -32,67 +32,63 @@ pub(super) fn plan_samplers<M: HostMemory + HostOps>(
 ) -> Result<SamplerPlan, DrawPreparationDecline> {
     let mut resources = Vec::new();
     let mut occupied = std::collections::BTreeMap::new();
-    // A translated guest sampler and a synthesized sampler can have identical
-    // semantic state, so provenance remains separate observation metadata.
+    // Guest, constexpr, and null descriptors are distinct contract states, so
+    // provenance remains separate observation metadata.
     let mut provenance = std::collections::BTreeMap::new();
 
     {
-        let mut push_stream =
-            |index: u32,
-             sampler_ref: u32,
-             lod_clamp: Option<(u32, u32)>,
-             stage: reims_vgpu_core::ShaderStage|
-             -> Result<(), DrawPreparationDecline> {
-                let variant = match stage {
-                    reims_vgpu_core::ShaderStage::Vertex => vertex,
-                    reims_vgpu_core::ShaderStage::Fragment => fragment,
-                    reims_vgpu_core::ShaderStage::Unknown => unreachable!("draw stage is known"),
-                };
-                let binding = variant.sampler_binding(index);
-                // A constexpr sampler is part of the executable shader, not an
-                // argument at this Metal index. Encoder argument tables are sticky,
-                // so a sampler left bound by an earlier draw can still be present
-                // when the next shader owns this descriptor location immutably.
-                // The executable descriptor is authoritative: do not turn
-                // irrelevant encoder state into a collision or let it replace the
-                // shader's sampler state.
-                if variant.samplers.iter().any(|reflected| {
-                    reflected.binding == binding && reflected.static_state.is_some()
-                }) {
-                    return Ok(());
-                }
-                if occupied
-                    .insert(
-                        binding,
-                        SamplerSlotOwner::Stream {
-                            stage,
-                            metal_index: index,
-                        },
-                    )
-                    .is_some()
-                {
-                    crate::runtime::drain::note_store_route("sampler_bind_collided");
-                    return Err(DrawPreparationDecline::SamplerBindingCollision {
-                        stage,
-                        index,
-                        binding,
-                        source: reims_vgpu_core::SamplerBindingSource::Stream,
-                    });
-                }
-                let mut sampler = if sampler_ref != 0 {
-                    provenance.insert(binding, b'g');
-                    load_vulkan_sampler(state, host, req.task_id, sampler_ref, binding)?
-                } else {
-                    provenance.insert(binding, b'd');
-                    reims_vgpu_core::SamplerResource::normalized_default(binding)
-                };
-                if let Some((min_bits, max_bits)) = lod_clamp {
-                    sampler.lod_min = min_bits;
-                    sampler.lod_max = max_bits;
-                }
-                resources.push(sampler);
-                Ok(())
+        let mut push_stream = |index: u32,
+                               sampler_ref: u32,
+                               lod_clamp: Option<(u32, u32)>,
+                               stage: reims_vgpu_core::ShaderStage|
+         -> Result<(), DrawPreparationDecline> {
+            let variant = match stage {
+                reims_vgpu_core::ShaderStage::Vertex => vertex,
+                reims_vgpu_core::ShaderStage::Fragment => fragment,
+                reims_vgpu_core::ShaderStage::Unknown => unreachable!("draw stage is known"),
             };
+            let binding = variant.sampler_binding(index);
+            // A constexpr sampler is part of the executable shader, not an
+            // argument at this Metal index. Encoder argument tables are sticky,
+            // so a sampler left bound by an earlier draw can still be present
+            // when the next shader owns this descriptor location immutably.
+            // The executable descriptor is authoritative: do not turn
+            // irrelevant encoder state into a collision or let it replace the
+            // shader's sampler state.
+            if variant
+                .samplers
+                .iter()
+                .any(|reflected| reflected.binding == binding && reflected.static_state.is_some())
+            {
+                return Ok(());
+            }
+            if occupied
+                .insert(
+                    binding,
+                    SamplerSlotOwner::Stream {
+                        stage,
+                        metal_index: index,
+                    },
+                )
+                .is_some()
+            {
+                crate::runtime::drain::note_store_route("sampler_bind_collided");
+                return Err(DrawPreparationDecline::SamplerBindingCollision {
+                    stage,
+                    index,
+                    binding,
+                    source: reims_vgpu_core::SamplerBindingSource::Stream,
+                });
+            }
+            provenance.insert(binding, b'g');
+            let mut sampler = load_vulkan_sampler(state, host, req.task_id, sampler_ref, binding)?;
+            if let Some((min_bits, max_bits)) = lod_clamp {
+                sampler.lod_min = min_bits;
+                sampler.lod_max = max_bits;
+            }
+            resources.push(sampler);
+            Ok(())
+        };
 
         let _span = crate::runtime::sampled_phase::Span::open(
             crate::runtime::sampled_phase::Part::Samplers,
@@ -166,10 +162,8 @@ pub(super) fn plan_samplers<M: HostMemory + HostOps>(
                     static_state,
                 )?);
             } else {
-                provenance.insert(binding, b'd');
-                resources.push(reims_vgpu_core::SamplerResource::normalized_default(
-                    binding,
-                ));
+                provenance.insert(binding, b'n');
+                resources.push(reims_vgpu_core::SamplerResource::null(binding));
             }
         }
     }
@@ -196,8 +190,7 @@ mod tests {
             declared_bindings: Arc::from([]),
             descriptor_uses: Arc::from([]),
             texture_uses: Arc::from([]),
-            buffer_binding_offset: 0,
-            sampled_binding_offset: 0,
+            buffer_binding_base: 0,
             texture_binding_base: 32,
             sampler_binding_base: 64,
             word_count: 0,
@@ -229,6 +222,36 @@ mod tests {
                 source: reims_vgpu_core::SamplerBindingSource::Reflected,
             })
         ));
+    }
+
+    #[test]
+    fn an_unbound_dynamic_sampler_remains_null() {
+        let mut state = Device::new(
+            crate::model::DeviceId(1),
+            reims_vgpu_paging::geometry::PAGE_SHIFT_ARM64E,
+        );
+        let mut host = crate::runtime::host::FakeHost::new();
+        let empty = reims_vgpu_core::PreparedShaderVariant {
+            samplers: Arc::default(),
+            ..variant(0, 64)
+        };
+
+        let plan = plan_samplers(
+            &mut state,
+            &mut host,
+            &DrawEncodeRequest::default(),
+            &empty,
+            &variant(3, 67),
+        )
+        .expect("a null serialized sampler is representable semantically");
+
+        assert_eq!(plan.resources.len(), 1);
+        assert_eq!(plan.resources[0].binding, 67);
+        assert_eq!(
+            plan.resources[0].source,
+            reims_vgpu_core::SamplerSource::Null
+        );
+        assert_eq!(plan.provenance.get(&67), Some(&b'n'));
     }
 
     #[test]

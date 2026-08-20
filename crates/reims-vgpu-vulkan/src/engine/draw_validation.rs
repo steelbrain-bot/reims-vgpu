@@ -192,10 +192,41 @@ pub enum DrawValidationDecline {
         stride: usize,
         tight_row: usize,
     },
+    GuestSampleLayoutMismatch {
+        binding: u32,
+        layout: reims_vgpu_memory::GuestImageLayout,
+        width: u32,
+        height: u32,
+        layers: u32,
+        arrayed: bool,
+        volume: bool,
+        one_dim: bool,
+        multisampled: bool,
+    },
+    GuestSampleViewRangeInvalid {
+        binding: u32,
+        view: reims_vgpu_memory::GuestImageViewRange,
+        mip_levels: usize,
+    },
+    GuestSampleAllocationInvalid {
+        binding: u32,
+        mip_levels: usize,
+        bytes_per_texel: u64,
+    },
+    GuestSampleLayoutInvalid {
+        binding: u32,
+        layout: reims_vgpu_memory::GuestImageLayout,
+        row_pitch: u64,
+        bytes_per_texel: u64,
+    },
     GuestSampleLength {
         binding: u32,
         actual: u64,
-        expected: usize,
+        expected: u64,
+    },
+    GuestSampleCoverageOverflow {
+        binding: u32,
+        runs: usize,
     },
     GuestSampleCoverage {
         binding: u32,
@@ -282,7 +313,20 @@ impl Decline for DrawValidationDecline {
             }
             Self::ResidentSampleGeometry { .. } => "vk_draw_validate_resident_sample_geometry",
             Self::GuestSampleRowStride { .. } => "vk_draw_validate_guest_sample_row_stride",
+            Self::GuestSampleLayoutMismatch { .. } => {
+                "vk_draw_validate_guest_sample_layout_mismatch"
+            }
+            Self::GuestSampleViewRangeInvalid { .. } => {
+                "vk_draw_validate_guest_sample_view_range_invalid"
+            }
+            Self::GuestSampleAllocationInvalid { .. } => {
+                "vk_draw_validate_guest_sample_allocation_invalid"
+            }
+            Self::GuestSampleLayoutInvalid { .. } => "vk_draw_validate_guest_sample_layout_invalid",
             Self::GuestSampleLength { .. } => "vk_draw_validate_guest_sample_length",
+            Self::GuestSampleCoverageOverflow { .. } => {
+                "vk_draw_validate_guest_sample_coverage_overflow"
+            }
             Self::GuestSampleCoverage { .. } => "vk_draw_validate_guest_sample_coverage",
             Self::InvalidSamplerLod { .. } => "vk_draw_validate_invalid_sampler_lod",
         }
@@ -477,6 +521,56 @@ impl Decline for DrawValidationDecline {
                 ("stride", stride.to_string()),
                 ("tight_row", tight_row.to_string()),
             ],
+            Self::GuestSampleLayoutMismatch {
+                binding,
+                layout,
+                width,
+                height,
+                layers,
+                arrayed,
+                volume,
+                one_dim,
+                multisampled,
+            } => vec![
+                ("binding", binding.to_string()),
+                ("layout", format!("{layout:?}")),
+                ("width", width.to_string()),
+                ("height", height.to_string()),
+                ("layers", layers.to_string()),
+                ("arrayed", arrayed.to_string()),
+                ("volume", volume.to_string()),
+                ("one_dim", one_dim.to_string()),
+                ("multisampled", multisampled.to_string()),
+            ],
+            Self::GuestSampleViewRangeInvalid {
+                binding,
+                view,
+                mip_levels,
+            } => vec![
+                ("binding", binding.to_string()),
+                ("view", format!("{view:?}")),
+                ("mip_levels", mip_levels.to_string()),
+            ],
+            Self::GuestSampleAllocationInvalid {
+                binding,
+                mip_levels,
+                bytes_per_texel,
+            } => vec![
+                ("binding", binding.to_string()),
+                ("mip_levels", mip_levels.to_string()),
+                ("bytes_per_texel", bytes_per_texel.to_string()),
+            ],
+            Self::GuestSampleLayoutInvalid {
+                binding,
+                layout,
+                row_pitch,
+                bytes_per_texel,
+            } => vec![
+                ("binding", binding.to_string()),
+                ("layout", format!("{layout:?}")),
+                ("row_pitch", row_pitch.to_string()),
+                ("bytes_per_texel", bytes_per_texel.to_string()),
+            ],
             Self::GuestSampleLength {
                 binding,
                 actual,
@@ -486,6 +580,9 @@ impl Decline for DrawValidationDecline {
                 ("actual", actual.to_string()),
                 ("expected", expected.to_string()),
             ],
+            Self::GuestSampleCoverageOverflow { binding, runs } => {
+                vec![("binding", binding.to_string()), ("runs", runs.to_string())]
+            }
             Self::GuestSampleCoverage {
                 binding,
                 covered,
@@ -672,10 +769,44 @@ mod tests {
                 stride: 4,
                 tight_row: 8,
             },
+            DrawValidationDecline::GuestSampleLayoutMismatch {
+                binding: 32,
+                layout: reims_vgpu_memory::GuestImageLayout::D3 {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                    depth_pitch: 4,
+                },
+                width: 1,
+                height: 1,
+                layers: 1,
+                arrayed: false,
+                volume: false,
+                one_dim: false,
+                multisampled: false,
+            },
+            DrawValidationDecline::GuestSampleLayoutInvalid {
+                binding: 32,
+                layout: reims_vgpu_memory::GuestImageLayout::D2 {
+                    width: 8,
+                    height: 8,
+                },
+                row_pitch: 4,
+                bytes_per_texel: 4,
+            },
+            DrawValidationDecline::GuestSampleAllocationInvalid {
+                binding: 32,
+                mip_levels: 2,
+                bytes_per_texel: 4,
+            },
             DrawValidationDecline::GuestSampleLength {
                 binding: 32,
                 actual: 3,
                 expected: 4,
+            },
+            DrawValidationDecline::GuestSampleCoverageOverflow {
+                binding: 32,
+                runs: 2,
             },
             DrawValidationDecline::GuestSampleCoverage {
                 binding: 32,
@@ -705,7 +836,9 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 52, "the validator's reason census moved");
+        // Typed guest-image checks preserve allocation, view, layout, pitch,
+        // and run coverage as distinct failures.
+        assert_eq!(before, 56, "the validator's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate draw-validation slug");
     }
 

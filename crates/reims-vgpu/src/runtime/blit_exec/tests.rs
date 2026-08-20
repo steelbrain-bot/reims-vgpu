@@ -17,6 +17,34 @@ use crate::runtime::objects;
 use reims_vgpu_core::endian::{st16, st32, st64};
 use reims_vgpu_core::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA8_UNORM};
 
+fn write_linear_texture_packing(
+    desc: &mut [u8],
+    levels: u16,
+    slices: u16,
+    bytes_per_slice: u64,
+    texture_type: u8,
+) {
+    use crate::runtime::decode::resource::{
+        TEXTURE_DESC_BASE_OFFSET, TEXTURE_DESC_BYTES_PER_SLICE, TEXTURE_DESC_DECLARATION,
+        TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_MIP_LEVEL_RECORD_LEN,
+        TEXTURE_DESC_SLICE_COUNT,
+    };
+
+    st16(&mut desc[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], levels);
+    st16(&mut desc[TEXTURE_DESC_SLICE_COUNT..], slices);
+    st64(&mut desc[TEXTURE_DESC_BASE_OFFSET..], 0);
+    st64(&mut desc[TEXTURE_DESC_BYTES_PER_SLICE..], bytes_per_slice);
+    let declaration = TEXTURE_DESC_DECLARATION
+        + usize::from(levels.saturating_sub(1)) * TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+    desc[declaration] = texture_type;
+    let array_length = declaration
+        + core::mem::offset_of!(
+            reims_vgpu_wire::ops::texture::TextureDescriptorBody,
+            array_length
+        );
+    st16(&mut desc[array_length..], slices);
+}
+
 /// The channel is the whole diagnostic for this rail: 177 checks collapse
 /// into eight statuses, so a refusal that reaches the dispatch line without a
 /// reason says almost nothing. An uninstrumented site used to render a bare
@@ -1678,8 +1706,7 @@ fn derived_slice_stride_2d() {
 fn copy_buffer_to_multilevel_view_l1() {
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE, RESOURCE_PAGE_SHIFT,
-        TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_DATA_OFFSET, TEXTURE_DESC_HEIGHT,
-        TEXTURE_DESC_LEVEL_RECORDS, TEXTURE_DESC_MIPMAP_LEVEL_COUNT,
+        TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT, TEXTURE_DESC_LEVEL_RECORDS,
         TEXTURE_DESC_MIP_LEVEL_RECORD_LEN, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
         TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH, TEXTURE_LEVEL_DEPTH, TEXTURE_LEVEL_HEIGHT,
         TEXTURE_LEVEL_OFFSET, TEXTURE_LEVEL_ROW_STRIDE, TEXTURE_LEVEL_SIZE, TEXTURE_LEVEL_WIDTH,
@@ -1694,8 +1721,13 @@ fn copy_buffer_to_multilevel_view_l1() {
     let mut desc = vec![0u8; body];
     st64(&mut desc[0..], 0x4000); // allocation
     st32(&mut desc[8..], handle);
-    st16(&mut desc[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], levels as u16);
-    st32(&mut desc[TEXTURE_DESC_DATA_OFFSET..], 0);
+    write_linear_texture_packing(
+        &mut desc,
+        levels as u16,
+        1,
+        40,
+        crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_2D as u8,
+    );
     st32(&mut desc[TEXTURE_DESC_USED_SIZE..], 4 * 2 * 4); // L0
     st32(&mut desc[TEXTURE_DESC_ROW_STRIDE..], 16);
     st32(&mut desc[TEXTURE_DESC_WIDTH..], 4);
@@ -1788,6 +1820,52 @@ fn multilevel_view_relative_level_oob() {
 }
 
 #[test]
+fn empty_texture_view_ranges_are_not_invented_as_one() {
+    use crate::runtime::decode::resource::{
+        TEXTURE_VIEW_DESC_LEVEL_COUNT, TEXTURE_VIEW_DESC_SLICE_COUNT, TEXTURE_VIEW_MIN_RANGED,
+    };
+
+    let run = |level_count: u64, slice_count: u64| {
+        let (mut host, mut state) = blit_device();
+        install_buffer(&mut host, &mut state, 1, 1, 64);
+        install_iosurface_texture(&mut host, &mut state, 3, 9, 0x20);
+        install_type8_view(&mut host, &mut state, 8, 3, MTL_FORMAT_BGRA8_UNORM, 0, None);
+
+        let view_gva = 0x280u64 + 8 * 0x40;
+        let mut descriptor = vec![0u8; TEXTURE_VIEW_MIN_RANGED];
+        assert!(gva_mem::read_task_gva(
+            &host,
+            &state.tasks[1],
+            view_gva,
+            &mut descriptor,
+            PAGE_SHIFT_ARM64E,
+        )
+        .is_ok());
+        st64(
+            &mut descriptor[TEXTURE_VIEW_DESC_LEVEL_COUNT..],
+            level_count,
+        );
+        st64(
+            &mut descriptor[TEXTURE_VIEW_DESC_SLICE_COUNT..],
+            slice_count,
+        );
+        write_task_gva_arm64e(&mut host, &state.tasks[1], view_gva, &descriptor);
+
+        let mut command = copy_cmd(CopyKind::BufferToTexture, 1, 8);
+        command.source_bytes_per_row = 4;
+        command.source_size = Size {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+        execute_blit(&mut state, &mut host, 1, &command)
+    };
+
+    assert_eq!(run(0, 1), BlitStatus::Bounds);
+    assert_eq!(run(1, 0), BlitStatus::Bounds);
+}
+
+#[test]
 fn texture_view_type_helpers() {
     use crate::runtime::decode::resource::{
         texture_view_type_is_3d, texture_view_type_supported, texture_view_type_uses_slices,
@@ -1861,19 +1939,45 @@ fn install_linear_rgba(
     height: u32,
     row_stride: u32,
 ) {
+    install_linear_rgba_with_shape(
+        host,
+        state,
+        obj_ref,
+        handle,
+        width,
+        height,
+        row_stride,
+        crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_2D as u8,
+        1,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_linear_rgba_with_shape(
+    host: &mut FakeHost,
+    state: &mut Device,
+    obj_ref: u32,
+    handle: u32,
+    width: u32,
+    height: u32,
+    row_stride: u32,
+    texture_type: u8,
+    slices: u16,
+) {
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE, RESOURCE_PAGE_SHIFT,
-        TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_DATA_OFFSET, TEXTURE_DESC_HEIGHT,
-        TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
-        TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH,
+        TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT, TEXTURE_DESC_PIXEL_FORMAT,
+        TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH,
     };
     let _ = RESOURCE_PAGE_SHIFT;
     let mut desc = vec![0u8; TEXTURE_DESC_BASE_LEN];
     let size = (row_stride as u64) * (height as u64);
-    st64(&mut desc[0..], size.max(0x1000));
+    st64(
+        &mut desc[0..],
+        size.saturating_mul(u64::from(slices)).max(0x1000),
+    );
     st32(&mut desc[8..], handle);
-    st16(&mut desc[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], 1);
-    st32(&mut desc[TEXTURE_DESC_DATA_OFFSET..], 0);
+    write_linear_texture_packing(&mut desc, 1, slices, size, texture_type);
     st32(&mut desc[TEXTURE_DESC_USED_SIZE..], size as u32);
     st32(&mut desc[TEXTURE_DESC_ROW_STRIDE..], row_stride);
     st32(&mut desc[TEXTURE_DESC_WIDTH..], width);
@@ -1969,26 +2073,32 @@ fn set_installed_allocation_size(host: &mut FakeHost, state: &Device, obj_ref: u
     write_task_gva_arm64e(host, &state.tasks[1], desc_gva, &alloc.to_le_bytes());
 }
 
-/// The array-slice form of the corner-mask bounds defect: the selected
-/// slice was charged a whole `row_stride * height` stride, so an allocation
-/// the guest sized for exactly two padded slices was refused for trailing
-/// padding that `texel_offset` never reaches.
+/// An array endpoint takes its slice spacing from the allocation descriptor,
+/// while the selected slice's read remains bounded to the texels it touches.
 #[test]
-fn a_last_array_slice_is_not_charged_for_its_trailing_row_padding() {
+fn an_array_slice_uses_the_declared_full_chain_pitch() {
     // 4x2 RGBA8: tight rows are 16 B, the guest pads to 24, so one slice
     // spans 48 B and the bytes read of a slice end at 24 + 16 = 40.
     const STRIDE: u32 = 24;
-    const TIGHT: u64 = 4 * 4;
     const ONE_SLICE: u64 = STRIDE as u64 * 2;
-    const READ: u64 = STRIDE as u64 + TIGHT;
-    const EXACT: u64 = ONE_SLICE + READ;
+    const EXACT: u64 = ONE_SLICE * 2;
 
     let (mut host, mut state) = blit_device();
-    install_linear_rgba(&mut host, &mut state, 2, 2, 4, 2, STRIDE);
+    install_linear_rgba_with_shape(
+        &mut host,
+        &mut state,
+        2,
+        2,
+        4,
+        2,
+        STRIDE,
+        crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_2D_ARRAY as u8,
+        2,
+    );
     set_installed_allocation_size(&mut host, &state, 2, EXACT);
 
     let backing = resolve_texture_backing(&mut state, &mut host, 1, 2, 0, 1)
-        .expect("slice 1 fits an allocation sized for exactly two slices");
+        .expect("slice 1 fits the explicitly declared two-slice allocation");
     let stride = match backing {
         TextureBacking::Linear(t) => {
             assert_eq!(t.slice_stride, ONE_SLICE, "slices stay a full stride apart");
@@ -2004,21 +2114,15 @@ fn a_last_array_slice_is_not_charged_for_its_trailing_row_padding() {
         TextureBacking::Surface(_) => panic!("linear texture resolved as IOSurface texture"),
     };
 
-    // The bound this replaced charged a second whole stride and refused this
-    // allocation, so the regression is visible here rather than only on a
-    // live guest.
-    assert!(
-        ONE_SLICE + stride > EXACT,
-        "the stride form must overcount, or this case proves nothing"
-    );
+    assert_eq!(ONE_SLICE + stride, EXACT);
     // Descriptor bytes belong to the constructed resource lifetime. Retire
     // that lifetime before publishing the deliberately shorter replacement;
     // mutating a retained descriptor in place is not a guest operation.
     assert!(state.task_objects.resources.delete(1, 2));
     set_installed_allocation_size(&mut host, &state, 2, EXACT - 1);
     match resolve_texture_backing(&mut state, &mut host, 1, 2, 0, 1) {
-        Err(st) => assert_eq!(st, BlitStatus::Bounds),
-        Ok(_) => panic!("one byte short of the read extent must still be refused"),
+        Err(st) => assert_eq!(st, BlitStatus::Unsupported),
+        Ok(_) => panic!("an allocation shorter than its declared packing must be refused"),
     }
 }
 
@@ -2283,8 +2387,7 @@ fn t2t_vertical_overlap_reads_every_source_row_before_writing() {
 fn whole_surface_0x13e_two_levels() {
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE, RESOURCE_PAGE_SHIFT,
-        TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_DATA_OFFSET, TEXTURE_DESC_HEIGHT,
-        TEXTURE_DESC_LEVEL_RECORDS, TEXTURE_DESC_MIPMAP_LEVEL_COUNT,
+        TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT, TEXTURE_DESC_LEVEL_RECORDS,
         TEXTURE_DESC_MIP_LEVEL_RECORD_LEN, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
         TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH, TEXTURE_LEVEL_DEPTH, TEXTURE_LEVEL_HEIGHT,
         TEXTURE_LEVEL_OFFSET, TEXTURE_LEVEL_ROW_STRIDE, TEXTURE_LEVEL_SIZE, TEXTURE_LEVEL_WIDTH,
@@ -2297,8 +2400,13 @@ fn whole_surface_0x13e_two_levels() {
         let mut desc = vec![0u8; body];
         st64(&mut desc[0..], 0x4000);
         st32(&mut desc[8..], handle);
-        st16(&mut desc[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], 2);
-        st32(&mut desc[TEXTURE_DESC_DATA_OFFSET..], 0);
+        write_linear_texture_packing(
+            &mut desc,
+            2,
+            1,
+            40,
+            crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_2D as u8,
+        );
         st32(&mut desc[TEXTURE_DESC_USED_SIZE..], 32);
         st32(&mut desc[TEXTURE_DESC_ROW_STRIDE..], 16);
         st32(&mut desc[TEXTURE_DESC_WIDTH..], 4);
@@ -2372,9 +2480,8 @@ fn install_linear_rgba_volume(
 ) {
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE, RESOURCE_PAGE_SHIFT,
-        TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_DATA_OFFSET, TEXTURE_DESC_DEPTH, TEXTURE_DESC_HEIGHT,
-        TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
-        TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH,
+        TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_DEPTH, TEXTURE_DESC_HEIGHT, TEXTURE_DESC_PIXEL_FORMAT,
+        TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH,
     };
     let _ = RESOURCE_PAGE_SHIFT;
     let mut desc = vec![0u8; TEXTURE_DESC_BASE_LEN];
@@ -2382,8 +2489,13 @@ fn install_linear_rgba_volume(
     let size = plane * (depth as u64);
     st64(&mut desc[0..], size.max(0x1000));
     st32(&mut desc[8..], handle);
-    st16(&mut desc[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], 1);
-    st32(&mut desc[TEXTURE_DESC_DATA_OFFSET..], 0);
+    write_linear_texture_packing(
+        &mut desc,
+        1,
+        1,
+        size,
+        crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_3D as u8,
+    );
     st32(&mut desc[TEXTURE_DESC_USED_SIZE..], size as u32);
     st32(&mut desc[TEXTURE_DESC_ROW_STRIDE..], row_stride);
     st32(&mut desc[TEXTURE_DESC_WIDTH..], width);
@@ -2789,6 +2901,77 @@ fn a_copy_follows_a_view_chain_as_deep_as_a_sample_does() {
     assert_eq!(
         back, pat,
         "the copy resolved to a base, but not the one holding the pixels"
+    );
+}
+
+/// Nested native views are constructed on their immediate base view, so the
+/// resolver must preserve the inner mip offset, format, and channel mapping.
+#[test]
+fn nested_sample_views_compose_instead_of_skipping_inner_descriptors() {
+    use crate::runtime::draw::resolve_texture_view_reasoned;
+
+    let (mut host, mut state) = blit_device();
+    install_buffer(&mut host, &mut state, 1, 1, 256);
+    install_iosurface_texture(&mut host, &mut state, 3, 9, 0x20);
+
+    let inner_raw = [4, 3, 2, 5];
+    let outer_raw = [5, 2, 3, 4];
+    install_type8_view(
+        &mut host,
+        &mut state,
+        4,
+        3,
+        MTL_FORMAT_BGRA8_UNORM,
+        2,
+        Some(inner_raw),
+    );
+    install_type8_view(&mut host, &mut state, 5, 4, 0, 0, Some(outer_raw));
+
+    let resolved = resolve_texture_view_reasoned(&state, &host, 1, 5)
+        .expect("the nested one-level view contract is exactly representable");
+    assert_eq!(resolved.base_texture_ref, 3);
+    assert_eq!(
+        resolved.range,
+        Some(crate::runtime::draw::TextureViewRange {
+            level_base: 2,
+            level_count: 1,
+            slice_base: 0,
+            slice_count: 1,
+        }),
+        "the inner mip range was discarded"
+    );
+    assert_eq!(
+        resolved.texture_type,
+        Some(crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_2D),
+        "the resolved view must retain its declared output type"
+    );
+    assert_eq!(resolved.pixel_format, Some(MTL_FORMAT_BGRA8_UNORM));
+    let inner = pixel_format::swizzle_plan(&inner_raw).unwrap();
+    let outer = pixel_format::swizzle_plan(&outer_raw).unwrap();
+    assert_eq!(resolved.swizzle, Some(outer.after(&inner)));
+}
+
+/// A one-level inner view cannot be viewed at relative level one. Flattening
+/// both bases by addition would turn a native construction failure into a
+/// different, apparently valid base mip.
+#[test]
+fn nested_sample_view_refuses_a_level_outside_the_inner_view() {
+    use crate::runtime::draw::{resolve_texture_view_reasoned, TextureViewDecline};
+
+    let (mut host, mut state) = blit_device();
+    install_buffer(&mut host, &mut state, 1, 1, 256);
+    install_iosurface_texture(&mut host, &mut state, 3, 9, 0x20);
+    install_type8_view(&mut host, &mut state, 4, 3, MTL_FORMAT_BGRA8_UNORM, 2, None);
+    install_type8_view(&mut host, &mut state, 5, 4, 0, 1, None);
+
+    assert_eq!(
+        resolve_texture_view_reasoned(&state, &host, 1, 5),
+        Err(TextureViewDecline::ChainLevelOutOfRange {
+            texture_ref: 4,
+            outer_base: 1,
+            outer_count: 1,
+            inner_count: 1,
+        })
     );
 }
 

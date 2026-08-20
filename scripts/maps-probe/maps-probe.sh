@@ -33,18 +33,22 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 export QMP_SOCK="${QMP_SOCK:-$REPO/vm/disks/run/qmp.sock}"
 Q="$REPO/scripts/qmp/qmp.py"
 SHOT="$REPO/scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh"
+VISUAL_GATE="$REPO/scripts/maps-probe/maps-visual-gate.sh"
 FAILLOG=/tmp/reims-vgpu-fail.log
 mkdir -p "$OUT"
 
-# Maps needs Apple's tile servers to draw anything but the empty graticule, and
-# the rails reach the internet only through QEMU's user-net NAT. Record the
-# verdict rather than failing on it: a tileless Maps still exercises the same
-# client pipelines and is still a valid perf population, but a correctness
-# reading taken from one would be wrong, so the answer has to be in the outdir.
+# Maps needs its tile servers to draw the workload, and the rails reach them
+# only through QEMU's user-net NAT. An HTTP response proves the route even when
+# the root resource itself is absent; curl's 000 means there was no response.
+# A tileless run is not a performance population because it did not render the
+# scene whose cost the probe claims to measure.
 timeout 30 ssh -o BatchMode=yes macos-vm \
   "curl -s -o /dev/null -w '%{http_code}' --max-time 10 https://gspe21-ssl.ls.apple.com/ 2>&1" \
   >"$OUT/tiles-reachable.txt" 2>&1
-echo "tile server probe: $(cat "$OUT/tiles-reachable.txt" 2>/dev/null)"
+tile_status=$(tail -c 3 "$OUT/tiles-reachable.txt" 2>/dev/null)
+echo "tile server probe: $tile_status"
+[ -n "$tile_status" ] && [ "$tile_status" != 000 ] || {
+  echo "Maps tile service did not respond"; exit 3; }
 
 # `open -a` at setup, never at drive time, so a rail with flaky ssh still
 # produces a measurable window.
@@ -70,6 +74,16 @@ sleep 2
 # Dismissing the sheets starts Maps' own first layout and tile fetch. Keep that
 # work out of the scored window; a still-blank map draws nothing.
 sleep 10
+
+# Select a declared, label-dense geographic workload after first-run handling.
+# A fixed map link is probe setup, not device policy: it makes separate boots
+# render the same class of scene and gives the visual gate a meaningful promise
+# to check. Re-opening it also prevents snapshot-restored location history from
+# choosing an ocean or a different zoom level for one arm.
+timeout 60 ssh -o BatchMode=yes macos-vm \
+  "open 'http://maps.apple.com/?ll=40.7128,-74.0060&z=12'" 2>/dev/null \
+  || { echo "could not select the Maps workload"; exit 3; }
+sleep 15
 
 # Preserve the windowed state before the probe enters macOS full screen. The
 # full-screen captures below cannot tell a missing system menu bar from the OS
@@ -98,61 +112,90 @@ sleep 6
 CX=$((W / 2)); CY=$((H / 2))
 # Keep the whole path well inside the map view. A drag that leaves the window
 # ends the gesture, and one that reaches an edge hits Maps' own chrome.
-R=$((H / 5))
+R=$((H / 12))
 
 # Park the pointer at the centre before the mark, so the first phase starts from
 # a known position and the settle is not inside the measured window.
 "$Q" move "$CX" "$CY" >/dev/null 2>&1
 sleep 2
 
-"$SHOT" -o "$OUT/before.png" >/dev/null 2>&1 || echo "pre-window screenshot failed"
+# Do not start the scored input stream until the declared scene exists. Tile
+# geometry and labels arrive independently, so a fixed sleep can catch one
+# without the other. Each attempt is retained as evidence; the final successful
+# frame becomes `before.png`.
+ready=no
+for attempt in 1 2 3 4 5 6; do
+  candidate="$OUT/before-$attempt.png"
+  "$SHOT" -o "$candidate" >/dev/null 2>&1 || true
+  if "$VISUAL_GATE" --before "$candidate" --after "$candidate" \
+      --settled "$candidate" >"$OUT/before-$attempt-verdict.txt" 2>&1; then
+    cp "$candidate" "$OUT/before.png"
+    ready=yes
+    break
+  fi
+  sleep 10
+done
+[ "$ready" = yes ] || {
+  echo "Maps did not render the declared geographic scene before measurement"
+  cat "$OUT/before-"*-verdict.txt
+  exit 1
+}
 
 # Everything above is setup; the scored window starts here.
 OFFSET=$(stat -c %s "$FAILLOG")
 END=$(( $(date +%s) + SECS ))
 
-# One drag invocation walks the whole path in interpolated sub-moves, so a pan
-# phase is one process and one QMP connection for several seconds of continuous
-# motion. Repeating the invocation per segment instead would put a process
-# spawn between every pair of points and turn a sustained pan into a bursty one.
-export QMP_DRAG_STEPS=6 QMP_DRAG_HOLD_S=0.012
+# Each pan uses two completed opposite gestures. A single held-button out-and-
+# back path supplies equal host coordinates but Maps may coalesce a different
+# number of events on each leg; driven runs walked the declared New York scene
+# as far as Atlantic City. Releasing at the end of each leg makes the inverse a
+# second semantic pan operation and bounds drift without changing device policy.
+# The endpoint hold makes the release a zero-velocity end rather than a kinetic
+# pan that continues changing the workload during the ten-second settled frame.
+export QMP_DRAG_STEPS=6 QMP_DRAG_HOLD_S=0.012 QMP_DRAG_RELEASE_HOLD_S=0.15
 # Fixed, not tunable per run: two boots whose phase mix differs are not two
 # measurements of the same workload. Change it deliberately, and re-baseline.
-ZOOM_TICKS=12
+# One tick is one semantic zoom step. Twelve-tick phases could outrun Maps'
+# zoom animation: on a driven 20 s run the nominally inverse phases moved the
+# scale bar from 2.5 km to 375 km. Letting one step settle keeps input cadence
+# behind the application rather than making the requested viewport depend on
+# which direction happened to be coalesced.
+ZOOM_TICKS=1
+ZOOM_SETTLE_S=0.4
 
-pan_box() {  # a closed rectangular circuit, so the map returns to where it began
-  "$Q" drag $((CX - R)) $((CY - R)) $((CX + R)) $((CY - R)) \
-            $((CX + R)) $((CY + R)) $((CX - R)) $((CY + R)) \
-            $((CX - R)) $((CY - R)) >/dev/null 2>&1
+pan_box() {  # opposite short strokes keep the declared city in the viewport
+  "$Q" drag $((CX - R)) "$CY" $((CX + R)) "$CY" >/dev/null 2>&1 &&
+    "$Q" drag $((CX + R)) "$CY" $((CX - R)) "$CY" >/dev/null 2>&1
 }
-pan_diag() {  # a zigzag, which changes direction more often than the circuit
-  "$Q" drag $((CX - R)) $((CY - R)) $((CX + R)) $((CY + R)) \
-            $((CX + R)) $((CY - R)) $((CX - R)) $((CY + R)) \
-            $((CX - R)) $((CY - R)) >/dev/null 2>&1
+pan_diag() {
+  "$Q" drag $((CX - R)) $((CY - R)) $((CX + R)) $((CY + R)) >/dev/null 2>&1 &&
+    "$Q" drag $((CX + R)) $((CY + R)) $((CX - R)) $((CY - R)) >/dev/null 2>&1
 }
 
 phase=0
 while [ "$(date +%s)" -lt "$END" ]; do
   case $((phase % 4)) in
-    0) pan_box ;;
+    0) pan_box || break ;;
     # `wheel` sends its ticks over one connection, dt apart, which is the only
     # sustained zoom available -- a keyboard zoom is one discrete step per
     # invocation and would spend the phase in process spawns.
-    1) "$Q" wheel up "$ZOOM_TICKS" 0.05 >/dev/null 2>&1 ;;
-    2) pan_diag ;;
-    # Equal and opposite, which bounds the drift but does NOT cancel it: Maps
-    # clamps at the world view long before it clamps at street level, so from a
-    # regional start the out-ticks hit the clamp and are discarded while the
-    # in-ticks all land, and every circuit nets a little further in. A 45 s run
-    # of nine circuits at 40 ticks was measured walking the scale bar from
-    # 37,5 km to 10 m -- i.e. to the far clamp, where the back half of the
-    # window measured a map that could not zoom any further. `ZOOM_TICKS` is
-    # sized to keep the excursion inside both clamps for a window of this
-    # length; a much longer run still needs a mid-zoom start.
-    3) "$Q" wheel down "$ZOOM_TICKS" 0.05 >/dev/null 2>&1 ;;
+    1)
+      "$Q" wheel up "$ZOOM_TICKS" 0.05 >/dev/null 2>&1 || break
+      sleep "$ZOOM_SETTLE_S"
+      ;;
+    2) pan_diag || break ;;
+    3)
+      "$Q" wheel down "$ZOOM_TICKS" 0.05 >/dev/null 2>&1 || break
+      sleep "$ZOOM_SETTLE_S"
+      ;;
   esac
   phase=$((phase + 1))
 done
+
+"$Q" size >/dev/null 2>&1 || {
+  echo "guest display disappeared during Maps interaction"
+  exit 3
+}
 
 tail -c "+$(( OFFSET + 1 ))" "$FAILLOG" >"$OUT/window.log"
 echo "drove $phase phases over ${SECS}s"
@@ -164,6 +207,16 @@ echo "drove $phase phases over ${SECS}s"
 # visible at all. Neither delay nor capture contributes to the scored window.
 sleep 10
 "$SHOT" -o "$OUT/settled.png" >/dev/null 2>&1 || echo "settled screenshot failed"
+
+# A nonzero verdict makes the whole run invalid. The caller must not rank an
+# empty canvas, a label-free partial render, or a run that lost its declared
+# geography merely because those frames were cheap.
+if ! "$VISUAL_GATE" --before "$OUT/before.png" --after "$OUT/after.png" \
+     --settled "$OUT/settled.png" >"$OUT/visual-verdict.txt" 2>&1; then
+  cat "$OUT/visual-verdict.txt"
+  exit 1
+fi
+cat "$OUT/visual-verdict.txt"
 
 # Reading a captured window is not specific to this probe, so the analysis is
 # not carried here; `MAPS_ANALYZE` names it, and absent one the window is still

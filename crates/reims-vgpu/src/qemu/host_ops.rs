@@ -89,6 +89,15 @@ pub struct ReimsVgpuHostOps {
     /// imports do read it, because retaining such an import requires the
     /// `map_pages` alias itself to outlive submitted GPU work.
     pub map_pages_stable: c_int,
+    pub map_pages_with_padding: Option<
+        unsafe extern "C" fn(
+            ctx: *mut c_void,
+            gpas: *const u64,
+            count: usize,
+            total_len: usize,
+            out_ptr: *mut *mut c_void,
+        ) -> i32,
+    >,
 }
 
 // SAFETY: QEMU keeps the table valid for the device lifetime; callbacks only
@@ -123,6 +132,7 @@ impl ReimsVgpuHostOps {
             is_ram_gpa: None,
             guest_ram_regions: None,
             notify_actions: None,
+            map_pages_with_padding: None,
         }
     }
 }
@@ -154,6 +164,17 @@ enum QemuHostDecline {
         page_count: usize,
         page_size: usize,
     },
+    MapPagesWithPaddingFailed {
+        rc: i32,
+        first_gpa: u64,
+        page_count: usize,
+        total_len: usize,
+    },
+    MapPagesWithPaddingNullPointer {
+        first_gpa: u64,
+        page_count: usize,
+        total_len: usize,
+    },
     UnmapPagesCallbackMissing {
         ptr: usize,
         len: usize,
@@ -168,6 +189,10 @@ impl crate::observe::Decline for QemuHostDecline {
             Self::MapPagesCallbackMissing { .. } => "qemu_map_pages_callback_missing",
             Self::MapPagesCallbackFailed { .. } => "qemu_map_pages_callback_failed",
             Self::MapPagesNullPointer { .. } => "qemu_map_pages_null_pointer",
+            Self::MapPagesWithPaddingFailed { .. } => "qemu_map_pages_with_padding_callback_failed",
+            Self::MapPagesWithPaddingNullPointer { .. } => {
+                "qemu_map_pages_with_padding_null_pointer"
+            }
             Self::UnmapPagesCallbackMissing { .. } => "qemu_unmap_pages_callback_missing",
         }
     }
@@ -203,6 +228,26 @@ impl crate::observe::Decline for QemuHostDecline {
             Self::UnmapPagesCallbackMissing { ptr, len } => {
                 vec![("ptr", format!("{ptr:#x}")), ("len", len.to_string())]
             }
+            Self::MapPagesWithPaddingFailed {
+                rc,
+                first_gpa,
+                page_count,
+                total_len,
+            } => vec![
+                ("rc", rc.to_string()),
+                ("first_gpa", format!("{first_gpa:#x}")),
+                ("page_count", page_count.to_string()),
+                ("total_len", total_len.to_string()),
+            ],
+            Self::MapPagesWithPaddingNullPointer {
+                first_gpa,
+                page_count,
+                total_len,
+            } => vec![
+                ("first_gpa", format!("{first_gpa:#x}")),
+                ("page_count", page_count.to_string()),
+                ("total_len", total_len.to_string()),
+            ],
         }
     }
 }
@@ -520,6 +565,39 @@ impl crate::runtime::host::HostPageViews for QemuHost<'_> {
         self.ops.map_pages_stable != 0
     }
 
+    fn map_pages_with_padding(
+        &mut self,
+        gpas: &[u64],
+        _page_size: usize,
+        total_len: usize,
+    ) -> Option<usize> {
+        let first_gpa = *gpas.first()?;
+        let f = self.ops.map_pages_with_padding?;
+        let mut out: *mut c_void = std::ptr::null_mut();
+        // SAFETY: QEMU owns ctx; gpas valid for count; out is stack local.
+        let rc = unsafe { f(self.ops.ctx, gpas.as_ptr(), gpas.len(), total_len, &mut out) };
+        if rc != 0 {
+            QemuHostDecline::MapPagesWithPaddingFailed {
+                rc,
+                first_gpa,
+                page_count: gpas.len(),
+                total_len,
+            }
+            .emit(first_gpa);
+            return None;
+        }
+        if out.is_null() {
+            QemuHostDecline::MapPagesWithPaddingNullPointer {
+                first_gpa,
+                page_count: gpas.len(),
+                total_len,
+            }
+            .emit(first_gpa);
+            return None;
+        }
+        Some(out as usize)
+    }
+
     fn unmap_pages(&mut self, ptr: usize, len: usize) {
         if ptr == 0 || len == 0 {
             return;
@@ -663,6 +741,31 @@ mod tests {
         unsafe {
             *out = std::ptr::null_mut();
         }
+        0
+    }
+
+    static PADDED_FIRST_GPA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static PADDED_PAGE_COUNT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static PADDED_TOTAL_LEN: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe extern "C" fn record_padded_map(
+        _ctx: *mut c_void,
+        gpas: *const u64,
+        count: usize,
+        total_len: usize,
+        out: *mut *mut c_void,
+    ) -> i32 {
+        use std::sync::atomic::Ordering::Relaxed;
+        // SAFETY: this fixture is called with one non-empty GPA array and one
+        // writable output slot by `QemuHost::map_pages_with_padding`.
+        unsafe {
+            PADDED_FIRST_GPA.store(*gpas, Relaxed);
+            *out = 0x1_0000usize as *mut c_void;
+        }
+        PADDED_PAGE_COUNT.store(count, Relaxed);
+        PADDED_TOTAL_LEN.store(total_len, Relaxed);
         0
     }
 
@@ -932,6 +1035,17 @@ mod tests {
                 page_count: 2,
                 page_size: 0x4000,
             },
+            QemuHostDecline::MapPagesWithPaddingFailed {
+                rc: -12,
+                first_gpa: 0x4000,
+                page_count: 2,
+                total_len: 0xc000,
+            },
+            QemuHostDecline::MapPagesWithPaddingNullPointer {
+                first_gpa: 0x4000,
+                page_count: 2,
+                total_len: 0xc000,
+            },
             QemuHostDecline::UnmapPagesCallbackMissing {
                 ptr: 0x10000,
                 len: 0x8000,
@@ -943,6 +1057,8 @@ mod tests {
             "qemu_map_pages_callback_missing",
             "qemu_map_pages_callback_failed",
             "qemu_map_pages_null_pointer",
+            "qemu_map_pages_with_padding_callback_failed",
+            "qemu_map_pages_with_padding_null_pointer",
             "qemu_unmap_pages_callback_missing",
         ];
         assert_eq!(declines.len(), expected.len());
@@ -976,5 +1092,23 @@ mod tests {
         let prompt = parking_lot::Mutex::new(VecDeque::new());
         let mut host = QemuHost::new(&ops, &mut actions, &prompt);
         assert_eq!(host.map_pages(&[0xc000], 0x4000), None);
+    }
+
+    #[test]
+    fn padded_page_mapping_forwards_the_exact_host_extent() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut ops = ReimsVgpuHostOps::null();
+        ops.map_pages_with_padding = Some(record_padded_map);
+        let mut actions = VecDeque::new();
+        let prompt = parking_lot::Mutex::new(VecDeque::new());
+        let mut host = QemuHost::new(&ops, &mut actions, &prompt);
+
+        assert_eq!(
+            host.map_pages_with_padding(&[0x4000, 0x9000], 0x1000, 0x5000),
+            Some(0x1_0000)
+        );
+        assert_eq!(PADDED_FIRST_GPA.load(Relaxed), 0x4000);
+        assert_eq!(PADDED_PAGE_COUNT.load(Relaxed), 2);
+        assert_eq!(PADDED_TOTAL_LEN.load(Relaxed), 0x5000);
     }
 }

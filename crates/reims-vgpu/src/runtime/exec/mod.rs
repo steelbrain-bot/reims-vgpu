@@ -1197,10 +1197,14 @@ fn preflight_render_translations<M: HostMemory + HostOps>(
         ) else {
             continue;
         };
+        let raster_sample_count = draw::load_render_pipeline(state, host, task_id, pipeline_ref)
+            .map(|descriptor| descriptor.raster_sample_count.max(1))
+            .unwrap_or(1);
         let cache_started = std::time::Instant::now();
         if !state.executor.ensure_render_translation(
             v_air,
             reims_vgpu_core::ShaderStage::Vertex,
+            raster_sample_count,
             pipeline_ref,
         ) {
             pending = true;
@@ -1208,6 +1212,7 @@ fn preflight_render_translations<M: HostMemory + HostOps>(
         if !state.executor.ensure_render_translation(
             f_air,
             reims_vgpu_core::ShaderStage::Fragment,
+            raster_sample_count,
             pipeline_ref,
         ) {
             pending = true;
@@ -3132,9 +3137,8 @@ use crate::runtime::draw::BindTableClass as BindClass;
 /// dropped here cannot come from a conforming Apple stream in any class — but
 /// what a reading would *mean* still differs by class:
 ///
-/// * **Texture** — the bound is Apple's whole 128-entry table. It was 32, the
-///   width of a descriptor binding band, and slots 32..127 were guest work with
-///   nowhere to go until `spirv_bind::widen_sampled_bands` closed the gap.
+/// * **Texture** — the bound is Apple's whole 128-entry table. metal2vulkan's
+///   reflected descriptor layout has a matching 128-entry texture range.
 /// * **Buffer** — 31 is exactly the serializer's own buffer bound, with no
 ///   margin at all, so a non-zero reading is either a guest writing its own
 ///   stream or a decode that mis-sized the table.
@@ -3445,11 +3449,9 @@ impl StreamRefusal {
 // re-point what the census means, so this is a build gate rather than a test —
 // the same reason `reims_vgpu_wire::Wire::ASSERT_ALIGN_1` is one.
 //
-// Textures: the bound IS Apple's table now, so no texture bind an Apple guest
-// can emit is refused. This used to be `>`, and the gap it recorded — slots
-// 32..127, dropped because the descriptor binding band was 32 wide — is what
-// `spirv_bind::widen_sampled_bands` closed. A `<` here would mean this device
-// accepts a slot it cannot name; a `>` would mean the gap is back.
+// Textures: the bound is Apple's table, so no texture bind an Apple guest can
+// emit is refused. A mismatch would desynchronize guest argument slots from the
+// translator's reflected 128-entry texture range.
 const _: () = assert!(reims_vgpu_wire::ops::bind_limit::TEXTURE == MAX_TEXTURE_BIND_SLOTS);
 // Buffers: the bound is Apple's serializer table size.
 const _: () = assert!(reims_vgpu_wire::ops::bind_limit::BUFFER == MAX_BUFFER_BIND_SLOTS);

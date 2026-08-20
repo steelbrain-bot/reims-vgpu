@@ -693,7 +693,7 @@ fn capture_forces_paint_even_when_painted_mid_gen_already_match() {
 /// The full-frame readback exists for exactly one reason: the DISPLAY needs
 /// CPU pixels. Two halves:
 ///
-/// - a resident carrying (`display_from_resident`) → NO readback, ever, however
+/// - a resident carrying the current present → NO readback, ever, however
 ///   long since the last one.
 ///   The proxies are fed by the GPU reduction instead, so there is no
 ///   sampling floor forcing a copy any more. `frame_bgra` is dropped rather
@@ -746,7 +746,10 @@ fn readback_runs_only_for_the_display_never_for_the_proxies() {
     assert_eq!(state.presentation.present.capture_counts(), (1, 0));
 
     // A resident carrying: there must be no readback.
-    state.presentation.present.set_display_from_resident(true);
+    state
+        .presentation
+        .present
+        .set_current_present_resident_carried(true);
     let frame_b = [0x44u8, 0x55, 0x66, 0xFF].repeat(4);
     assert!(write_bgra8(&mut state, &mut host, mid, &frame_b, 8, 2, 2));
     let gen_b = state
@@ -1294,19 +1297,14 @@ fn capture_reads_only_the_named_surface_never_a_same_geometry_peer() {
 /// downstream reads "is there a frame for this present" off
 /// `frame_bgra.is_empty()`.
 ///
-/// Skipping the readback only leaves the buffer empty if it was empty going
-/// in, and on a real boot it is not: the first present runs the full path
-/// before the guest has painted anything, capturing black, and direct
-/// present then carries every frame after it. Boot 86 on the x86/Vulkan rail
-/// judged that one frame `Black` on 481 of 481 presents — 0 `present_content`
-/// and 0 `present_content_unsampled` — while the host window rendered
-/// correctly from settle through an 11-minute idle.
+/// A prior CPU-backed present may have populated the buffer. The direct path
+/// must clear it so downstream consumers cannot mistake stale bytes for the
+/// current resident-carried present.
 #[test]
 fn a_light_capture_leaves_no_stale_frame_behind() {
     let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let (w, h) = (64u32, 64u32);
-    // The frame a full capture leaves: opaque, RGB black — the first present
-    // of a boot, before anything has been composited.
+    // The frame a prior CPU capture leaves: opaque RGB black.
     let stale: Vec<u8> = (0..(w * h) as usize).flat_map(|_| [0, 0, 0, 255]).collect();
     state
         .presentation
@@ -1319,7 +1317,10 @@ fn a_light_capture_leaves_no_stale_frame_behind() {
 
     // Direct present is carrying the display, so this capture takes the
     // light path and reads back nothing.
-    state.presentation.present.set_display_from_resident(true);
+    state
+        .presentation
+        .present
+        .set_current_present_resident_carried(true);
     let before = state.presentation.present.capture_counts().1;
     assert!(capture_present_frame(&mut state, 1, w, h, 1));
     assert_eq!(

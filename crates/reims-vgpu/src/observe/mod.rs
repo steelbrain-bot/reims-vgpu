@@ -75,7 +75,7 @@ pub(crate) use ladder::{ladder_slug, ladder_slugs};
 /// Re-exported so call sites write `crate::observe::decline_display!(..)`
 /// next to the trait it implements, rather than reaching into the submodule.
 pub(crate) use reims_vgpu_observe::decline_display;
-pub(crate) use reims_vgpu_observe::{first_sight, state_changed, Emit};
+pub(crate) use reims_vgpu_observe::{first_sight, Emit};
 pub use reims_vgpu_observe::{Decline, Refusal};
 
 // The sink's surface is re-exported flat so call sites read `observe::fail(…)`

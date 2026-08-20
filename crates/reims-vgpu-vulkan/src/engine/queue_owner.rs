@@ -14,6 +14,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use super::stamp_completion::SubmissionNote;
 
 type Reply = mpsc::SyncSender<Result<QueueOutcome, vk::Result>>;
+type AsyncSubmitReply = mpsc::SyncSender<Result<(), vk::Result>>;
 #[cfg(feature = "host-window")]
 type PresentReply = mpsc::SyncSender<Result<bool, vk::Result>>;
 
@@ -43,6 +44,38 @@ pub(crate) struct PendingPresent {
     receiver: mpsc::Receiver<Result<bool, vk::Result>>,
 }
 
+/// Receipt for the end of the host driver's `vkQueueSubmit` call.
+///
+/// Enqueueing transfers host ownership of the fence to the queue thread.  The
+/// fence may be polled or waited only after this receipt completes; Vulkan's
+/// external-synchronization rule covers the submit call itself, not merely the
+/// GPU work it starts.
+pub(crate) struct PendingQueueSubmit {
+    receiver: mpsc::Receiver<Result<(), vk::Result>>,
+}
+
+impl PendingQueueSubmit {
+    pub(crate) fn try_complete(&self) -> Option<Result<(), vk::Result>> {
+        match self.receiver.try_recv() {
+            Ok(result) => Some(result),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => Some(Err(vk::Result::ERROR_DEVICE_LOST)),
+        }
+    }
+
+    pub(crate) fn wait(self) -> Result<(), vk::Result> {
+        self.receiver
+            .recv()
+            .unwrap_or(Err(vk::Result::ERROR_DEVICE_LOST))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pair() -> (Self, mpsc::SyncSender<Result<(), vk::Result>>) {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        (Self { receiver }, sender)
+    }
+}
+
 #[cfg(feature = "host-window")]
 impl PendingPresent {
     pub(crate) fn wait(self) -> Result<bool, vk::Result> {
@@ -56,6 +89,7 @@ enum Request {
     Submit {
         submit: OwnedSubmit,
         reply: Option<Reply>,
+        async_reply: Option<AsyncSubmitReply>,
     },
     #[cfg(feature = "host-window")]
     PresentTransaction {
@@ -188,6 +222,7 @@ impl QueueOwner {
         self.send_sync(|reply| Request::Submit {
             submit,
             reply: Some(reply),
+            async_reply: None,
         })
         .map(|_| ())
     }
@@ -197,13 +232,14 @@ impl QueueOwner {
         command_buffers: &[vk::CommandBuffer],
         fence: vk::Fence,
         timeline: Option<(vk::Semaphore, u64, SubmissionNote)>,
-    ) -> Result<(), vk::Result> {
+    ) -> Result<PendingQueueSubmit, vk::Result> {
         if let Some(result) = self.failure.get() {
             return Err(result);
         }
         let queued_point = timeline
             .as_ref()
             .map(|(_, value, note)| (*value, note.clone()));
+        let (async_reply, receiver) = mpsc::sync_channel(1);
         self.sender
             .send(Request::Submit {
                 submit: OwnedSubmit {
@@ -216,12 +252,13 @@ impl QueueOwner {
                     async_queued_at: Some(std::time::Instant::now()),
                 },
                 reply: None,
+                async_reply: Some(async_reply),
             })
             .map_err(|_| vk::Result::ERROR_DEVICE_LOST)?;
         if let Some((value, note)) = queued_point {
             note.queued(value);
         }
-        Ok(())
+        Ok(PendingQueueSubmit { receiver })
     }
 
     pub(crate) fn submit_sync_ordered(
@@ -244,6 +281,7 @@ impl QueueOwner {
         self.send_sync(|reply| Request::Submit {
             submit,
             reply: Some(reply),
+            async_reply: None,
         })
         .map(|_| ())
     }
@@ -342,7 +380,11 @@ fn run(
 ) {
     while let Ok(request) = receiver.recv() {
         match request {
-            Request::Submit { submit, reply } => {
+            Request::Submit {
+                submit,
+                reply,
+                async_reply,
+            } => {
                 let async_queued_at = submit.async_queued_at;
                 let driver_started = std::time::Instant::now();
                 let result = failure
@@ -363,6 +405,9 @@ fn run(
                     if let Err(result) = result {
                         failure.set(result);
                     }
+                }
+                if let Some(async_reply) = async_reply {
+                    let _ = async_reply.send(result);
                 }
                 if let Some(reply) = reply {
                     let _ = reply.send(result.map(|_| QueueOutcome::Unit));
@@ -504,12 +549,12 @@ mod tests {
     }
 
     #[test]
-    fn async_handoff_publishes_its_point_before_driver_submission() {
+    fn async_handoff_separates_queue_acceptance_from_driver_return() {
         let (sender, receiver) = mpsc::channel();
         let owner = owner_with_sender(sender);
         let probe = super::super::stamp_completion::SubmissionProbe::new();
 
-        owner
+        let pending = owner
             .submit_async(
                 &[vk::CommandBuffer::from_raw(1)],
                 vk::Fence::from_raw(2),
@@ -521,14 +566,23 @@ mod tests {
         let request = receiver
             .try_recv()
             .expect("submission remains in host FIFO");
-        let Request::Submit { submit, reply } = request else {
+        let Request::Submit {
+            submit,
+            reply,
+            async_reply,
+        } = request
+        else {
             panic!("async handoff queued a non-submit request");
         };
         assert!(reply.is_none());
+        let async_reply = async_reply.expect("async submit carries its return receipt");
         assert_eq!(
             submit.timeline.as_ref().map(|(_, value, _)| *value),
             Some(7)
         );
+        assert!(pending.try_complete().is_none());
+        async_reply.send(Ok(())).unwrap();
+        assert_eq!(pending.try_complete(), Some(Ok(())));
     }
 
     #[test]
@@ -538,14 +592,14 @@ mod tests {
         let owner = owner_with_sender(sender);
         let probe = super::super::stamp_completion::SubmissionProbe::new();
 
-        assert_eq!(
+        assert!(matches!(
             owner.submit_async(
                 &[vk::CommandBuffer::from_raw(1)],
                 vk::Fence::from_raw(2),
                 Some((vk::Semaphore::from_raw(3), 7, probe.note())),
             ),
             Err(vk::Result::ERROR_DEVICE_LOST)
-        );
+        ));
         assert_eq!(probe.latest_queued(), None);
     }
 

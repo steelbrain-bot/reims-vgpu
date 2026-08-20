@@ -13,6 +13,27 @@ use reims_vgpu_paging::geometry::{
     MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
 };
 
+#[test]
+fn a_landed_surface_write_returns_the_epoch_it_published() {
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mapping_id = 30;
+    state.map_surface(mapping_id);
+    let before = state
+        .surfaces
+        .mappings
+        .get(&mapping_id)
+        .unwrap()
+        .content
+        .surface_epoch;
+
+    let published = note_iosurface_texture_landed(&mut state, mapping_id, 0, 4096)
+        .expect("a registered mapping publishes an epoch");
+    let mapping = state.surfaces.mappings.get(&mapping_id).unwrap();
+
+    assert_ne!(published, before);
+    assert_eq!(published, mapping.content.surface_epoch);
+}
+
 /// `mapping_geom_window` puts each measurement in the field of its own name.
 ///
 /// `SurfaceWindow`'s four fields are two `u64`s and two `u32`s, so

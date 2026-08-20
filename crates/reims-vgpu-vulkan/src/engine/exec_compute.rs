@@ -38,17 +38,27 @@ struct PreparedStorageImage {
     residency: Option<ComputeStorageResidency>,
 }
 
-/// One prepared sampled input: a transient sampled-only image seeded either
-/// from a host staging upload or from a device-local resident copy.
+/// One prepared sampled input. A resident keeps the same image identity the
+/// guest bound; only non-resident bytes need a transient upload image.
 struct PreparedSampledImage {
     binding: u32,
     array_element: u32,
-    img: StorageImageSlot,
+    image: vk::Image,
+    view: vk::ImageView,
     upload: Option<PreparedTexelSource>,
-    /// Copy-on-sample source `(resident image, what last touched it)`.
-    resident_src: Option<(vk::Image, super::pools::ResidentAccess)>,
+    resident: Option<PreparedResidentSample>,
     width: u32,
     height: u32,
+    null: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PreparedResidentSample {
+    identity: reims_vgpu_core::ComputeStorageResidencyKey,
+    initial_access: super::pools::ResidentAccess,
+    /// The same semantic image is also a writable storage binding in this
+    /// dispatch. Its storage preparation owns the one transition to GENERAL.
+    also_storage: bool,
 }
 
 struct PreparedTexelSource {
@@ -139,7 +149,9 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
                 },
             ));
         }
-        if img.width == 0 || img.height == 0 {
+        if !matches!(img.source, super::types::ComputeSampledImageSource::Null)
+            && (img.width == 0 || img.height == 0)
+        {
             return Err(DrawError::ComputeValidation(
                 ComputeValidationDecline::SampledZeroGeometry {
                     binding: img.binding,
@@ -152,6 +164,7 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
             .saturating_mul(img.height as usize)
             .saturating_mul(img.format.bytes_per_texel());
         let valid = match &img.source {
+            super::types::ComputeSampledImageSource::Null => true,
             super::types::ComputeSampledImageSource::Bytes(bytes) => bytes.len() == tight,
             super::types::ComputeSampledImageSource::Resident(_) => true,
             super::types::ComputeSampledImageSource::GuestPages(source) => {
@@ -168,6 +181,7 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
                 ComputeValidationDecline::SampledBytesLength {
                     binding: img.binding,
                     actual: match &img.source {
+                        super::types::ComputeSampledImageSource::Null => 0,
                         super::types::ComputeSampledImageSource::Bytes(bytes) => bytes.len(),
                         super::types::ComputeSampledImageSource::GuestPages(source) => {
                             source.total_len as usize
@@ -180,6 +194,16 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
         }
     }
     for sampler in &req.samplers {
+        if sampler.source == reims_vgpu_core::SamplerSource::Null {
+            if !bindings.insert((sampler.binding, 0)) {
+                return Err(DrawError::ComputeValidation(
+                    ComputeValidationDecline::DuplicateSamplerBinding {
+                        binding: sampler.binding,
+                    },
+                ));
+            }
+            continue;
+        }
         let lod_min = sampler.lod_min_f32();
         let lod_max = sampler.lod_max_f32();
         if !lod_min.is_finite() || !lod_max.is_finite() || lod_min > lod_max {
@@ -348,7 +372,7 @@ unsafe fn prepare_compute_guest_texels(
     })
 }
 
-/// A copy-on-sample bind must name a resident whose image is byte-for-byte the
+/// A resident sampled bind must name an image that is byte-for-byte the
 /// image the view will sample: same vk format, same width, same height. The
 /// runtime only ever binds the key it looked the mirror up under, so an
 /// inexact source means the registry and the mirror disagree — refuse by name
@@ -399,10 +423,10 @@ fn resident_sample_exact(
 /// this tree and no status to inspect, so refusing the dispatch here is the only
 /// outcome left that keeps the device alive and says why.
 ///
-/// **Expected to return `None` always.** The two repairable classes are filled
-/// before the request is built — `runtime::compute_exec` provisions a neutral
-/// sampler and a neutral sampled image for every binding of those classes the
-/// guest left empty — so this is the backstop for a class those passes do not
+/// **Expected to return `None` always.** The two nullable classes are filled
+/// before the request is built — `runtime::compute_exec` preserves an explicit
+/// null descriptor for every binding of those classes the guest left empty —
+/// so this is the backstop for a class those passes do not
 /// cover, and a firing names a real gap rather than noise.
 ///
 /// [`crate::spirv_bind::descriptor_static_use`] answers `NotDeclared`
@@ -480,6 +504,20 @@ pub(crate) unsafe fn execute_compute_inner(
     let layout_bindings = canonicalize_layout_bindings(layout_bindings)?;
     for binding in layout_bindings.iter().filter(|binding| binding.count > 1) {
         let descriptor_type = vk::DescriptorType::from_raw(binding.ty as i32);
+        let populated = match descriptor_type {
+            vk::DescriptorType::SAMPLED_IMAGE => req
+                .sampled_images
+                .iter()
+                .filter(|image| image.binding == binding.binding)
+                .count() as u32,
+            vk::DescriptorType::STORAGE_IMAGE => req
+                .storage_images
+                .iter()
+                .filter(|image| image.binding == binding.binding)
+                .count() as u32,
+            _ => binding.count,
+        };
+        let unpopulated = binding.count.saturating_sub(populated);
         let dynamic_indexing = match descriptor_type {
             vk::DescriptorType::SAMPLED_IMAGE => ctx.features.sampled_image_array_dynamic_indexing,
             vk::DescriptorType::STORAGE_IMAGE => ctx.features.storage_image_array_dynamic_indexing,
@@ -494,12 +532,12 @@ pub(crate) unsafe fn execute_compute_inner(
                 total.saturating_add(candidate.count)
             });
         let arrays_supported = match descriptor_type {
-            vk::DescriptorType::SAMPLED_IMAGE => {
-                ctx.features.sampled_descriptor_arrays(required_descriptors)
-            }
-            vk::DescriptorType::STORAGE_IMAGE => {
-                ctx.features.storage_descriptor_arrays(required_descriptors)
-            }
+            vk::DescriptorType::SAMPLED_IMAGE => ctx
+                .features
+                .sampled_descriptor_arrays(required_descriptors, unpopulated),
+            vk::DescriptorType::STORAGE_IMAGE => ctx
+                .features
+                .storage_descriptor_arrays(required_descriptors, unpopulated),
             _ => true,
         };
         let descriptor_limit = match descriptor_type {
@@ -512,9 +550,11 @@ pub(crate) unsafe fn execute_compute_inner(
                 super::reason::DrawReason::DescriptorArrayUnsupported {
                     binding: binding.binding,
                     count: binding.count,
+                    unpopulated,
                     required_descriptors,
                     descriptor_limit,
                     partially_bound: ctx.features.descriptor_binding_partially_bound,
+                    null_descriptor: ctx.features.null_descriptor,
                     dynamic_indexing,
                 },
             ));
@@ -609,22 +649,45 @@ pub(crate) unsafe fn execute_compute_inner(
         });
     }
 
-    // Sampled images: device-local + staging seed upload — or a device-local
-    // copy from a resident storage image (copy-on-sample: the transient never
-    // aliases the live resident, so the same dispatch may storage-write it).
+    // Sampled images: non-resident bytes use a transient upload. A resident is
+    // the texture object the guest named, so sampling binds that same image;
+    // resource binding never implies an unrequested snapshot copy.
     let mut guest_gathers = Vec::new();
     let mut sampled_slots = Vec::new();
     for resource in &req.sampled_images {
+        if matches!(
+            resource.source,
+            super::types::ComputeSampledImageSource::Null
+        ) {
+            if !ctx.features.null_descriptor {
+                return Err(DrawError::ComputeExecution(
+                    ComputeExecutionDecline::NullSampledImageUnsupported {
+                        binding: resource.binding,
+                    },
+                ));
+            }
+            sampled_slots.push(PreparedSampledImage {
+                binding: resource.binding,
+                array_element: resource.array_element,
+                image: vk::Image::null(),
+                view: vk::ImageView::null(),
+                upload: None,
+                resident: None,
+                width: 0,
+                height: 0,
+                null: true,
+            });
+            continue;
+        }
         let key = StorageImageKey {
             width: resource.width,
             height: resource.height,
             format: resource.format,
             sampled_only: true,
         };
-        let img = pools.acquire_storage_image(ctx, key, counters)?;
-        let (upload, resident_src) =
+        let (image, view, upload, resident) =
             if let super::types::ComputeSampledImageSource::Resident(bind) = &resource.source {
-                let Some((src_image, src_key, generation, src_access)) =
+                let Some((src_image, src_view, src_key, generation, src_access)) =
                     pools.compute_resident_snapshot(&bind.identity)
                 else {
                     return Err(DrawError::ComputeExecution(
@@ -652,9 +715,24 @@ pub(crate) unsafe fn execute_compute_inner(
                 let bytes = resource.width as u64
                     * resource.height as u64
                     * resource.format.bytes_per_texel() as u64;
-                counters.note_compute_sampled_resident_copy(bytes);
-                (None, Some((src_image, src_access)))
+                counters.note_compute_sampled_resident_bind(bytes);
+                let also_storage = req.storage_images.iter().any(|storage| {
+                    storage
+                        .residency
+                        .is_some_and(|residency| residency.identity == bind.identity)
+                });
+                (
+                    src_image,
+                    src_view,
+                    None,
+                    Some(PreparedResidentSample {
+                        identity: bind.identity,
+                        initial_access: src_access,
+                        also_storage,
+                    }),
+                )
             } else {
+                let img = pools.acquire_storage_image(ctx, key, counters)?;
                 let prepared = match &resource.source {
                     super::types::ComputeSampledImageSource::Bytes(bytes) => {
                         let st = pools.acquire_staging(
@@ -681,28 +759,42 @@ pub(crate) unsafe fn execute_compute_inner(
                         )?
                     },
                     super::types::ComputeSampledImageSource::Resident(_) => unreachable!(),
+                    super::types::ComputeSampledImageSource::Null => unreachable!(),
                 };
-                (Some(prepared), None)
+                (img.image, img.view, Some(prepared), None)
             };
         sampled_slots.push(PreparedSampledImage {
             binding: resource.binding,
             array_element: resource.array_element,
-            img,
+            image,
+            view,
             upload,
-            resident_src,
+            resident,
             width: resource.width,
             height: resource.height,
+            null: false,
         });
     }
 
     let mut sampler_handles = Vec::new();
     for sampler in &req.samplers {
-        let handle = caches.get_or_create_sampler(
-            ctx,
-            &super::types::sampler_state_key(sampler),
-            counters,
-            pools,
-        )?;
+        let handle = if sampler.source == reims_vgpu_core::SamplerSource::Null {
+            if !ctx.features.null_descriptor {
+                return Err(DrawError::ComputeExecution(
+                    ComputeExecutionDecline::NullSamplerUnsupported {
+                        binding: sampler.binding,
+                    },
+                ));
+            }
+            vk::Sampler::null()
+        } else {
+            caches.get_or_create_sampler(
+                ctx,
+                &super::types::sampler_state_key(sampler),
+                counters,
+                pools,
+            )?
+        };
         sampler_handles.push((sampler.binding, handle));
     }
 
@@ -855,8 +947,12 @@ pub(crate) unsafe fn execute_compute_inner(
         .iter()
         .map(|prepared| {
             vk::DescriptorImageInfo::default()
-                .image_view(prepared.img.view)
-                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image_view(prepared.view)
+                .image_layout(if prepared.resident.is_some() {
+                    vk::ImageLayout::GENERAL
+                } else {
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                })
         })
         .collect();
     let sampler_infos: Vec<_> = sampler_handles
@@ -930,6 +1026,63 @@ pub(crate) unsafe fn execute_compute_inner(
         )?
     };
 
+    let reads_imported_guest = storage_slots
+        .iter()
+        .any(|prepared| prepared.bound.guest_import)
+        || !guest_gathers.is_empty()
+        || sampled_slots.iter().any(|prepared| {
+            prepared
+                .upload
+                .as_ref()
+                .is_some_and(|source| source.texels.is_imported())
+        })
+        || simg_slots.iter().any(|prepared| {
+            prepared
+                .seed
+                .as_ref()
+                .is_some_and(|source| source.texels.is_imported())
+        });
+    if reads_imported_guest {
+        let mut read_pages: Vec<Option<reims_vgpu_memory::GuestPageSet>> = Vec::new();
+        for storage in &req.storage_buffers {
+            if let super::types::ComputeBufferBacking::GuestPages { source, .. } = &storage.backing
+            {
+                read_pages.push(source.physical_pages.clone());
+            }
+        }
+        for sampled in &req.sampled_images {
+            if let super::types::ComputeSampledImageSource::GuestPages(source) = &sampled.source {
+                read_pages.push(source.physical_pages.clone());
+            }
+        }
+        for storage in &req.storage_images {
+            if let super::types::ComputeStorageImageSeed::GuestPages(source) = &storage.seed {
+                read_pages.push(source.physical_pages.clone());
+            }
+        }
+        if let Some(visibility) = pools.imported_guest_barrier(cb, || {
+            let visibility = super::exec::imported_guest_visibility(&read_pages);
+            super::exec::note_imported_guest_visibility(counters, visibility);
+            visibility
+        }) {
+            let barrier = [super::exec::imported_guest_read_barrier(
+                vk::AccessFlags::TRANSFER_READ
+                    | vk::AccessFlags::SHADER_READ
+                    | vk::AccessFlags::SHADER_WRITE,
+                visibility,
+            )];
+            ctx.device.cmd_pipeline_barrier(
+                cb,
+                super::exec::imported_guest_read_stage(visibility),
+                vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &barrier,
+                &[],
+                &[],
+            );
+        }
+    }
+
     // Scattered guest windows are assembled inside this dispatch's command
     // buffer, before any image seed reads them. The barrier is the one relation
     // both sampled and storage seeds need: transfer writes to the gathered
@@ -954,17 +1107,43 @@ pub(crate) unsafe fn execute_compute_inner(
         );
     }
 
-    // Seed sampled images (staging upload or resident device copy)
-    // → SHADER_READ_ONLY_OPTIMAL.
+    // Seed transient sampled images → SHADER_READ_ONLY_OPTIMAL. Resident
+    // samples keep their identity and enter GENERAL directly; when the same
+    // image is also storage-bound, the storage loop owns that one transition.
     for prepared in &sampled_slots {
-        let img = &prepared.img;
+        if prepared.null {
+            continue;
+        }
         let range = super::color_subresource_range();
+        if let Some(resident) = prepared.resident {
+            if resident.also_storage {
+                continue;
+            }
+            let (src_stage, src_access) = resident.initial_access.source_scope();
+            let barrier = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(src_access)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .old_layout(resident.initial_access.layout())
+                .new_layout(vk::ImageLayout::GENERAL)
+                .image(prepared.image)
+                .subresource_range(range)];
+            ctx.device.cmd_pipeline_barrier(
+                cb,
+                src_stage,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &barrier,
+            );
+            continue;
+        }
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::empty())
             .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
             .old_layout(vk::ImageLayout::UNDEFINED)
             .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .image(img.image)
+            .image(prepared.image)
             .subresource_range(range)];
         ctx.device.cmd_pipeline_barrier(
             cb,
@@ -988,73 +1167,17 @@ pub(crate) unsafe fn execute_compute_inner(
             ctx.device.cmd_copy_buffer_to_image(
                 cb,
                 source.texels.buffer(),
-                img.image,
+                prepared.image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &copy,
             );
-        } else if let Some((src_image, src_access)) = prepared.resident_src {
-            // Copy-on-sample. The resident stays in its registry layout on
-            // exit so the storage-acquire's captured initial_access (and the
-            // storage pre-dispatch barrier, which syncs on TRANSFER when that
-            // layout is TRANSFER_SRC_OPTIMAL) remains truthful.
-            // Both halves — that the barrier is unconditional and that its scope
-            // names what last *touched* the image rather than where it sits —
-            // are `barrier_resident_for_transfer_read`'s to answer, and this
-            // site had each of them wrong once.
-            let next_access = super::pools::ResidentAccess::transfer_read();
-            super::exec::barrier_resident_for_transfer_read(
-                &ctx.device,
-                cb,
-                src_image,
-                src_access,
-                next_access,
-            );
-            let copy = [vk::ImageCopy::default()
-                .src_subresource(super::color_subresource_layers())
-                .dst_subresource(super::color_subresource_layers())
-                .extent(vk::Extent3D {
-                    width: prepared.width,
-                    height: prepared.height,
-                    depth: 1,
-                })];
-            ctx.device.cmd_copy_image(
-                cb,
-                src_image,
-                next_access.layout(),
-                img.image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &copy,
-            );
-            if src_access.layout() != vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
-                let restore = [vk::ImageMemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::TRANSFER_READ)
-                    .dst_access_mask(
-                        vk::AccessFlags::SHADER_READ
-                            | vk::AccessFlags::SHADER_WRITE
-                            | vk::AccessFlags::TRANSFER_READ
-                            | vk::AccessFlags::TRANSFER_WRITE,
-                    )
-                    .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                    .new_layout(src_access.layout())
-                    .image(src_image)
-                    .subresource_range(range)];
-                ctx.device.cmd_pipeline_barrier(
-                    cb,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &restore,
-                );
-            }
         }
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
             .dst_access_mask(vk::AccessFlags::SHADER_READ)
             .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .image(img.image)
+            .image(prepared.image)
             .subresource_range(range)];
         ctx.device.cmd_pipeline_barrier(
             cb,
@@ -1146,7 +1269,7 @@ pub(crate) unsafe fn execute_compute_inner(
             .iter()
             .map(|prepared| {
                 vk::BufferMemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::HOST_WRITE)
+                    .src_access_mask(super::exec::imported_guest_write_access())
                     .dst_access_mask(if prepared.writable {
                         vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE
                     } else {
@@ -1159,7 +1282,7 @@ pub(crate) unsafe fn execute_compute_inner(
             .collect();
         ctx.device.cmd_pipeline_barrier(
             cb,
-            vk::PipelineStageFlags::HOST,
+            super::exec::imported_guest_write_stage(),
             vk::PipelineStageFlags::COMPUTE_SHADER,
             vk::DependencyFlags::empty(),
             &[],
@@ -1355,12 +1478,20 @@ pub(crate) unsafe fn execute_compute_inner(
                 Some(residency) => super::GuestWriteSource::ResidentStorage(&residency.identity),
                 None => super::GuestWriteSource::RingEntry,
             };
-            super::record_guest_write_debt(pools, source, pages);
+            if let Some(pages) = reims_vgpu_memory::GuestWritePages::new(pages) {
+                super::record_guest_write_debt(pools, source, &pages);
+            }
         }
     }
     for prepared in &storage_slots {
         if let Some(pages) = &prepared.direct_write_pages {
-            super::record_guest_write_debt(pools, super::GuestWriteSource::ImportedBuffer, pages);
+            if let Some(pages) = reims_vgpu_memory::GuestWritePages::new(pages) {
+                super::record_guest_write_debt(
+                    pools,
+                    super::GuestWriteSource::ImportedBuffer,
+                    &pages,
+                );
+            }
         }
     }
 
@@ -1389,7 +1520,7 @@ pub(crate) unsafe fn execute_compute_inner(
     // unretired fence. The readback maps below stay valid: the BufferSlot
     // handles are held by value and nothing else runs under the engine lock.
     let sealed = pools.seal_entry(dset.zip(dset_pool).into_iter().collect(), Vec::new());
-    pools.finish_entry_async(sealed, submitted_timeline);
+    pools.finish_entry_async(sealed, submitted_timeline, None);
 
     if all_writeback_deferred {
         counters
@@ -1402,6 +1533,11 @@ pub(crate) unsafe fn execute_compute_inner(
     for prepared in &simg_slots {
         if let Some(residency) = prepared.residency {
             pools.mark_resident_storage_image(&residency.identity, residency.output_generation);
+        }
+    }
+    for prepared in &sampled_slots {
+        if let Some(resident) = prepared.resident.filter(|resident| !resident.also_storage) {
+            pools.mark_compute_resident_sampled(&resident.identity);
         }
     }
 
@@ -1538,6 +1674,22 @@ mod tests {
             id: reims_vgpu_protocol::PreparedShaderId::new(1),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_null_sampler_is_not_validated_as_invented_sampler_state() {
+        let mut sampler = SamplerResource::null(64);
+        sampler.lod_min = f32::NAN.to_bits();
+        sampler.lod_max = f32::NEG_INFINITY.to_bits();
+        let req = ComputeRequest {
+            program: test_program(),
+            entry: "main".into(),
+            grid: [1, 1, 1],
+            samplers: vec![sampler],
+            ..Default::default()
+        };
+
+        assert!(validate_compute(&req).is_ok());
     }
 
     fn residency_identity() -> ComputeStorageResidencyKey {

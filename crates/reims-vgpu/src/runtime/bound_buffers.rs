@@ -124,10 +124,34 @@ pub struct PackedBuffer {
     /// Persistent whole-buffer sources shared by every offset bind.
     pub runs: Arc<Vec<GuestRun>>,
     pub pages: Arc<Vec<GuestWindowRun>>,
+    /// Backend-reported allocation extents for the sampled image views of this
+    /// resource. Entries share the resource lifetime; distinct dimensions,
+    /// formats, levels, and pitches remain distinct construction answers.
+    pub sampled_image_requirements: std::collections::HashMap<
+        reims_vgpu_memory::GuestImageBindingKey,
+        reims_vgpu_memory::GuestImageBindingDisposition,
+    >,
     /// Allocation owned by `map_pages` when this resource required a packed
     /// alias. RAMBlock-backed resources borrow the VM-wide import and carry no
     /// per-resource retirement.
     pub(crate) owned_alias: Option<PackedAliasRetirement>,
+}
+
+/// Immutable execution payload borrowed from one retained packed resource.
+///
+/// Admission results and alias-retirement ownership stay in [`PackedBuffer`].
+/// A warm bind needs only these shared handles and scalar coordinates, so
+/// taking a payload does not clone the resource's image-admission map.
+#[derive(Clone, Debug)]
+pub struct PackedBufferAccess {
+    pub gva: u64,
+    pub size: u64,
+    pub head: u64,
+    pub import: Arc<crate::runtime::guest_ram::GuestRamImport>,
+    pub gpas: Arc<Vec<u64>>,
+    pub footprint: crate::runtime::guest_ram::GuestPageFootprint,
+    pub runs: Arc<Vec<GuestRun>>,
+    pub pages: Arc<Vec<GuestWindowRun>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,6 +174,19 @@ pub struct PackedWitnessWindow<'a> {
 }
 
 impl PackedBuffer {
+    pub fn access(&self) -> PackedBufferAccess {
+        PackedBufferAccess {
+            gva: self.gva,
+            size: self.size,
+            head: self.head,
+            import: Arc::clone(&self.import),
+            gpas: Arc::clone(&self.gpas),
+            footprint: self.footprint.clone(),
+            runs: Arc::clone(&self.runs),
+            pages: Arc::clone(&self.pages),
+        }
+    }
+
     /// Resolve one allocation-relative byte window for content witnessing.
     pub fn witness_window(&self, offset: u64, span: u64) -> Option<PackedWitnessWindow<'_>> {
         if span == 0 || offset.checked_add(span)? > self.size {
@@ -203,12 +240,56 @@ impl PackedBuffer {
         row_length_texels: u32,
     ) -> Option<reims_vgpu_memory::GuestRunSource> {
         offset.checked_add(span).filter(|&end| end <= self.size)?;
+        let physical_pages =
+            reims_vgpu_memory::GuestPageSet::new(self.witness_window(offset, span)?.gpas);
         Some(reims_vgpu_memory::GuestRunSource {
             runs: Arc::clone(&self.runs),
             source_offset: offset,
             total_len: span,
             row_length_texels,
             pages: Some(Arc::clone(&self.pages)),
+            physical_pages,
+        })
+    }
+}
+
+impl PackedBufferAccess {
+    /// Resolve one allocation-relative byte window for content witnessing.
+    pub fn witness_window(&self, offset: u64, span: u64) -> Option<PackedWitnessWindow<'_>> {
+        if span == 0 || offset.checked_add(span)? > self.size {
+            return None;
+        }
+        let page = self.footprint.page_size();
+        let guest_start = (self.gva % page).checked_add(offset)?;
+        let guest_end = guest_start.checked_add(span)?;
+        let first = usize::try_from(guest_start / page).ok()?;
+        let last = usize::try_from((guest_end - 1) / page).ok()?;
+        let import_offset = self.head.checked_add(offset)?;
+        Some(PackedWitnessWindow {
+            host_ptr: self
+                .import
+                .host_base()
+                .checked_add(usize::try_from(import_offset).ok()?)?,
+            gpas: self.gpas.get(first..=last)?,
+        })
+    }
+
+    pub fn texel_source(
+        &self,
+        offset: u64,
+        span: u64,
+        row_length_texels: u32,
+    ) -> Option<reims_vgpu_memory::GuestRunSource> {
+        offset.checked_add(span).filter(|&end| end <= self.size)?;
+        let physical_pages =
+            reims_vgpu_memory::GuestPageSet::new(self.witness_window(offset, span)?.gpas);
+        Some(reims_vgpu_memory::GuestRunSource {
+            runs: Arc::clone(&self.runs),
+            source_offset: offset,
+            total_len: span,
+            row_length_texels,
+            pages: Some(Arc::clone(&self.pages)),
+            physical_pages,
         })
     }
 }
@@ -263,75 +344,152 @@ pub fn ensure_packed_resource<
     size: u64,
     usage: PackedResourceUse,
 ) -> bool {
+    ensure_packed_resource_with_extent(state, host, task_id, resource_ref, gva, size, usage, None)
+}
+
+/// Resolve a resource-shaped alias whose host allocation reaches an exact
+/// backend-reported image binding extent.
+pub struct PackedImageBinding {
+    pub task_id: u32,
+    pub resource_ref: u32,
+    pub gva: u64,
+    pub size: u64,
+    pub required_import_len: u64,
+    pub usage: PackedResourceUse,
+}
+
+pub fn ensure_packed_resource_for_image<
+    M: crate::runtime::host::HostMemory + crate::runtime::host::HostOps,
+>(
+    state: &mut crate::runtime::Device,
+    host: &mut M,
+    request: PackedImageBinding,
+) -> bool {
+    ensure_packed_resource_with_extent(
+        state,
+        host,
+        request.task_id,
+        request.resource_ref,
+        request.gva,
+        request.size,
+        request.usage,
+        Some(request.required_import_len),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ensure_packed_resource_with_extent<
+    M: crate::runtime::host::HostMemory + crate::runtime::host::HostOps,
+>(
+    state: &mut crate::runtime::Device,
+    host: &mut M,
+    task_id: u32,
+    resource_ref: u32,
+    gva: u64,
+    size: u64,
+    usage: PackedResourceUse,
+    requested_import_len: Option<u64>,
+) -> bool {
+    let page = state.page_size();
+    let page_base = gva & !(page - 1);
+    let Some(head) = gva.checked_sub(page_base) else {
+        return false;
+    };
+    let Some(map_len) = head
+        .checked_add(size)
+        .and_then(|len| reims_vgpu_protocol::align_up_u64(len, page))
+    else {
+        return false;
+    };
+    let required_import_len = requested_import_len.unwrap_or(map_len).max(map_len);
+    let mut force_padded_alias = false;
+    let mut previous_available = None;
     if let Some(held) = state.bound_buffers.packed(task_id, resource_ref) {
         let matches = match held {
-            PackedBufferResolution::Available(buffer) => buffer.gva == gva && buffer.size == size,
+            PackedBufferResolution::Available(buffer) => {
+                let same = buffer.gva == gva && buffer.size == size;
+                force_padded_alias = same && buffer.import.len() < required_import_len;
+                if force_padded_alias {
+                    previous_available = Some(buffer.clone());
+                }
+                same && !force_padded_alias
+            }
             PackedBufferResolution::Unavailable {
                 gva: held_gva,
                 size: held_size,
-            } => *held_gva == gva && *held_size == size,
+                required_import_len: held_requirement,
+            } => *held_gva == gva && *held_size == size && *held_requirement >= required_import_len,
         };
         if matches {
-            return matches!(held, PackedBufferResolution::Available(_));
+            let available = matches!(held, PackedBufferResolution::Available(_));
+            return available;
         }
     }
 
-    let unavailable = || PackedBufferResolution::Unavailable { gva, size };
+    let unavailable = || PackedBufferResolution::Unavailable {
+        gva,
+        size,
+        required_import_len,
+    };
     let made = (|| {
         if !stable_guest_alias_available(host) {
             return None;
         }
-        let page = state.page_size();
-        let page_base = gva & !(page - 1);
-        let head = gva - page_base;
-        let map_len = reims_vgpu_protocol::align_up_u64(head.checked_add(size)?, page)?;
-        if let Some((import, import_offset, mapping_page_base, mapping_pages)) =
-            crate::runtime::gva_view::mapping_import_for_span(state, task_id, gva, size)
-        {
-            let first = usize::try_from(page_base.checked_sub(mapping_page_base)? / page).ok()?;
-            let count = usize::try_from(map_len / page).ok()?;
-            let gpas: Vec<u64> = mapping_pages
-                .get(first..first.checked_add(count)?)?
-                .to_vec();
-            let whole = import.slice(import_offset, size).ok()?;
-            let guest =
-                crate::runtime::guest_ram::GuestRef::new(Arc::clone(&import), whole).ok()?;
-            let footprint = crate::runtime::guest_ram::GuestPageFootprint::new(
-                Arc::<[u64]>::from(gpas.clone()),
-                page,
-            )?;
-            let host_ptr = import
-                .host_base()
-                .checked_add(usize::try_from(import_offset).ok()?)?;
-            crate::runtime::drain::note_store_route("zc_packed_mapping_import");
-            return Some(PackedBufferResolution::Available(PackedBuffer {
-                gva,
-                size,
-                head: import_offset,
-                import,
-                gpas: Arc::new(gpas),
-                footprint,
-                runs: Arc::new(vec![GuestRun {
-                    host_ptr,
-                    len: size,
-                }]),
-                pages: Arc::new(vec![GuestWindowRun {
-                    window_offset: 0,
-                    guest,
-                }]),
-                owned_alias: None,
-            }));
-        }
-        let align = match crate::runtime::guest_ram::host_allocation_import_align(map_len) {
-            Ok(align) => align,
-            Err(refusal) => {
-                crate::runtime::guest_ram::report_host_allocation_import_refusal(
-                    "task_buffer_alias_import",
-                    &refusal,
-                );
-                return None;
+        if !force_padded_alias {
+            if let Some((import, import_offset, mapping_page_base, mapping_pages)) =
+                crate::runtime::gva_view::mapping_import_for_span(state, task_id, gva, size)
+            {
+                if import.len() >= required_import_len {
+                    let first =
+                        usize::try_from(page_base.checked_sub(mapping_page_base)? / page).ok()?;
+                    let count = usize::try_from(map_len / page).ok()?;
+                    let gpas: Vec<u64> = mapping_pages
+                        .get(first..first.checked_add(count)?)?
+                        .to_vec();
+                    let whole = import.slice(import_offset, size).ok()?;
+                    let guest =
+                        crate::runtime::guest_ram::GuestRef::new(Arc::clone(&import), whole)
+                            .ok()?;
+                    let footprint = crate::runtime::guest_ram::GuestPageFootprint::new(
+                        Arc::<[u64]>::from(gpas.clone()),
+                        page,
+                    )?;
+                    let host_ptr = import
+                        .host_base()
+                        .checked_add(usize::try_from(import_offset).ok()?)?;
+                    crate::runtime::drain::note_store_route("zc_packed_mapping_import");
+                    return Some(PackedBufferResolution::Available(PackedBuffer {
+                        gva,
+                        size,
+                        head: import_offset,
+                        import,
+                        gpas: Arc::new(gpas),
+                        footprint,
+                        runs: Arc::new(vec![GuestRun {
+                            host_ptr,
+                            len: size,
+                        }]),
+                        pages: Arc::new(vec![GuestWindowRun {
+                            window_offset: 0,
+                            guest,
+                        }]),
+                        sampled_image_requirements: std::collections::HashMap::new(),
+                        owned_alias: None,
+                    }));
+                }
             }
-        };
+        }
+        let align =
+            match crate::runtime::guest_ram::host_allocation_import_align(required_import_len) {
+                Ok(align) => align,
+                Err(refusal) => {
+                    crate::runtime::guest_ram::report_host_allocation_import_refusal(
+                        "task_buffer_alias_import",
+                        &refusal,
+                    );
+                    return None;
+                }
+            };
         let gpas = crate::runtime::gva_mem::task_gva_page_gpas(
             host,
             &state.tasks,
@@ -347,46 +505,60 @@ pub fn ensure_packed_resource<
             Arc::<[u64]>::from(gpas.clone()),
             page,
         )?;
-        if let Some((import, retained_head, guest)) =
-            crate::runtime::guest_ram_map::reference_for_pages(host, &gpas, page, head, size)
-                .ok()
-                .and_then(|guest| {
-                    let base = guest.import().gpa_base()?;
-                    let head_in_import = gpas.first()?.checked_add(head)?.checked_sub(base)?;
-                    Some((Arc::clone(guest.import()), head_in_import, guest))
-                })
-        {
-            let host_ptr = import
-                .host_base()
-                .checked_add(usize::try_from(retained_head).ok()?)?;
-            crate::runtime::drain::note_store_route("zc_packed_ramblock");
-            return Some(PackedBufferResolution::Available(PackedBuffer {
-                gva,
-                size,
-                head: retained_head,
-                import,
-                gpas: Arc::new(gpas),
-                footprint,
-                runs: Arc::new(vec![GuestRun {
-                    host_ptr,
-                    len: size,
-                }]),
-                pages: Arc::new(vec![GuestWindowRun {
-                    window_offset: 0,
-                    guest,
-                }]),
-                owned_alias: None,
-            }));
+        if !force_padded_alias {
+            let retained =
+                crate::runtime::guest_ram_map::reference_for_pages(host, &gpas, page, head, size)
+                    .ok()
+                    .and_then(|guest| {
+                        let base = guest.import().gpa_base()?;
+                        let head_in_import = gpas.first()?.checked_add(head)?.checked_sub(base)?;
+                        Some((Arc::clone(guest.import()), head_in_import, guest))
+                    });
+            if let Some((import, retained_head, guest)) = retained {
+                if import.len() >= required_import_len {
+                    let host_ptr = import
+                        .host_base()
+                        .checked_add(usize::try_from(retained_head).ok()?)?;
+                    crate::runtime::drain::note_store_route("zc_packed_ramblock");
+                    return Some(PackedBufferResolution::Available(PackedBuffer {
+                        gva,
+                        size,
+                        head: retained_head,
+                        import,
+                        gpas: Arc::new(gpas),
+                        footprint,
+                        runs: Arc::new(vec![GuestRun {
+                            host_ptr,
+                            len: size,
+                        }]),
+                        pages: Arc::new(vec![GuestWindowRun {
+                            window_offset: 0,
+                            guest,
+                        }]),
+                        sampled_image_requirements: std::collections::HashMap::new(),
+                        owned_alias: None,
+                    }));
+                }
+            }
         }
 
-        let alias_len = usize::try_from(map_len).ok()?;
-        let host_base = host.map_pages(&gpas, page as usize)?;
+        let allocation_align = align.max(page);
+        let alias_len_u64 =
+            reims_vgpu_protocol::align_up_u64(required_import_len, allocation_align)?;
+        let alias_len = usize::try_from(alias_len_u64).ok()?;
+        let host_base = if alias_len_u64 > map_len {
+            host.map_pages_with_padding(&gpas, page as usize, alias_len)?
+        } else {
+            host.map_pages(&gpas, page as usize)?
+        };
         let Some(host_ptr) = host_base.checked_add(head as usize) else {
             host.unmap_pages(host_base, alias_len);
             return None;
         };
         let import = match crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
-            host_base, map_len, align,
+            host_base,
+            alias_len_u64,
+            align,
         ) {
             Ok(import) => Arc::new(import),
             Err(_) => {
@@ -422,6 +594,10 @@ pub fn ensure_packed_resource<
                 window_offset: 0,
                 guest,
             }]),
+            sampled_image_requirements: previous_available
+                .as_ref()
+                .map(|previous| previous.sampled_image_requirements.clone())
+                .unwrap_or_default(),
             owned_alias: Some(PackedAliasRetirement {
                 import: import.id(),
                 ptr: host_base,
@@ -458,6 +634,12 @@ pub fn ensure_packed_resource<
         }
     });
     let available = matches!(made, PackedBufferResolution::Available(_));
+    if !available && previous_available.is_some() {
+        // A backend-specific extent upgrade must not destroy the exact guest
+        // allocation that remains a valid copied fallback. The failed larger
+        // view has no lifetime to publish; the existing resource does.
+        return false;
+    }
     if let Some(retired) = state
         .bound_buffers
         .insert_packed(task_id, resource_ref, made)
@@ -477,6 +659,7 @@ pub enum PackedBufferResolution {
     Unavailable {
         gva: u64,
         size: u64,
+        required_import_len: u64,
     },
 }
 
@@ -530,6 +713,8 @@ pub struct BoundBuffer {
     /// the host can import guest RAM at all. `None` keeps the caller on the
     /// gathering arm exactly as a fresh resolution would.
     pub pages: Option<Arc<Vec<GuestWindowRun>>>,
+    /// Canonical guest-physical identity of this exact bind window.
+    pub physical_pages: Option<reims_vgpu_memory::GuestPageSet>,
 }
 
 /// `(task, reference, offset, extent cap)` — see the module doc on why the
@@ -589,6 +774,22 @@ pub struct RegistryShape {
     pub max_offsets: u32,
 }
 
+/// Live physical-alias shape behind resource-owned packed allocations.
+///
+/// Mapping-owned and RAMBlock imports are excluded: those already have a
+/// canonical allocation identity. This measures only the fallback aliases for
+/// which sharing would change an ownership boundary.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PackedAliasShape {
+    pub resources: usize,
+    pub distinct_page_plans: usize,
+    pub duplicate_resources: usize,
+    pub max_resources_per_plan: u32,
+    pub physical_pages: usize,
+    pub multiply_aliased_pages: usize,
+    pub max_aliases_per_page: u32,
+}
+
 /// Report the registry's shape once per census interval, on the same one-second
 /// cadence as `store_routes` so the two line up row for row.
 ///
@@ -602,11 +803,6 @@ pub fn note_registry_levels(state: &crate::runtime::Device) {
     static LAST_MS: AtomicU64 = AtomicU64::new(0);
     static PEAK_ENTRIES: AtomicU64 = AtomicU64::new(0);
 
-    let shape = state.bound_buffers.shape();
-    let peak = PEAK_ENTRIES
-        .fetch_max(shape.entries as u64, Ordering::Relaxed)
-        .max(shape.entries as u64);
-
     let now = crate::observe::elapsed_ms() as u64;
     let last = LAST_MS.load(Ordering::Relaxed);
     if now.saturating_sub(last) < 1000 {
@@ -619,10 +815,28 @@ pub fn note_registry_levels(state: &crate::runtime::Device) {
     {
         return;
     }
+    let shape = state.bound_buffers.shape();
+    let peak = PEAK_ENTRIES
+        .fetch_max(shape.entries as u64, Ordering::Relaxed)
+        .max(shape.entries as u64);
+    let aliases = state.bound_buffers.packed_alias_shape();
     crate::observe::off(format!(
         "bound_buffers (levels, not per-interval) entries={} peak={} pairs={} \
-         multi_offset_pairs={} max_offsets={}",
-        shape.entries, peak, shape.pairs, shape.multi_offset_pairs, shape.max_offsets
+         multi_offset_pairs={} max_offsets={} aliases={} alias_plans={} \
+         alias_duplicates={} alias_plan_max={} alias_pages={} alias_shared_pages={} \
+         alias_page_max={}",
+        shape.entries,
+        peak,
+        shape.pairs,
+        shape.multi_offset_pairs,
+        shape.max_offsets,
+        aliases.resources,
+        aliases.distinct_page_plans,
+        aliases.duplicate_resources,
+        aliases.max_resources_per_plan,
+        aliases.physical_pages,
+        aliases.multiply_aliased_pages,
+        aliases.max_aliases_per_page,
     ));
 }
 
@@ -692,6 +906,24 @@ impl BoundBuffers {
         }
     }
 
+    pub fn note_sampled_image_requirement(
+        &mut self,
+        task_id: u32,
+        resource_ref: u32,
+        gva: u64,
+        size: u64,
+        key: reims_vgpu_memory::GuestImageBindingKey,
+        requirement: reims_vgpu_memory::GuestImageBindingDisposition,
+    ) {
+        if let Some(PackedBufferResolution::Available(packed)) =
+            self.retained.resource_mut(owner(task_id, resource_ref))
+        {
+            if packed.gva == gva && packed.size == size {
+                packed.sampled_image_requirements.insert(key, requirement);
+            }
+        }
+    }
+
     pub(crate) fn insert_packed(
         &mut self,
         task_id: u32,
@@ -700,7 +932,7 @@ impl BoundBuffers {
     ) -> Option<PackedAliasRetirement> {
         let (gva, size) = match &packed {
             PackedBufferResolution::Available(buffer) => (buffer.gva, buffer.size),
-            PackedBufferResolution::Unavailable { gva, size } => (*gva, *size),
+            PackedBufferResolution::Unavailable { gva, size, .. } => (*gva, *size),
         };
         self.retained
             .insert_resource(owner(task_id, buffer_ref), address_span(gva, size), packed)
@@ -809,6 +1041,46 @@ impl BoundBuffers {
         }
     }
 
+    /// Measure whether resource-owned aliases actually duplicate one another.
+    ///
+    /// This deliberately derives from the owning registry when sampled. A
+    /// continuously maintained reverse index would become a second lifetime
+    /// graph whose retirements could disagree with the resource graph it is
+    /// supposed to describe.
+    pub fn packed_alias_shape(&self) -> PackedAliasShape {
+        let aliases: Vec<&PackedBuffer> = self
+            .retained
+            .resource_values()
+            .filter_map(|resolution| match resolution {
+                PackedBufferResolution::Available(buffer) if buffer.owned_alias.is_some() => {
+                    Some(buffer)
+                }
+                PackedBufferResolution::Available(_)
+                | PackedBufferResolution::Unavailable { .. } => None,
+            })
+            .collect();
+        let mut plans = std::collections::HashMap::<&[u64], u32>::new();
+        let mut pages = std::collections::HashMap::<u64, u32>::new();
+        for alias in &aliases {
+            *plans.entry(alias.gpas.as_slice()).or_default() += 1;
+            for &page in alias.gpas.iter() {
+                *pages.entry(page).or_default() += 1;
+            }
+        }
+        PackedAliasShape {
+            resources: aliases.len(),
+            distinct_page_plans: plans.len(),
+            duplicate_resources: plans
+                .values()
+                .map(|count| count.saturating_sub(1) as usize)
+                .sum(),
+            max_resources_per_plan: plans.values().copied().max().unwrap_or(0),
+            physical_pages: pages.len(),
+            multiply_aliased_pages: pages.values().filter(|count| **count > 1).count(),
+            max_aliases_per_page: pages.values().copied().max().unwrap_or(0),
+        }
+    }
+
     /// Whether nothing is held.
     pub fn is_empty(&self) -> bool {
         self.retained.is_empty()
@@ -826,7 +1098,62 @@ mod tests {
             source_offset: 0,
             runs: Arc::new(Vec::new()),
             pages: None,
+            physical_pages: None,
         }
+    }
+
+    fn packed(gva: u64, pages: &[u64], allocation: usize) -> PackedBufferResolution {
+        let page_size = 0x1000;
+        let import = Arc::new(
+            crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
+                0x10_0000 + allocation * 0x10_0000,
+                pages.len() as u64 * page_size,
+                page_size,
+            )
+            .unwrap(),
+        );
+        let import_id = import.id();
+        PackedBufferResolution::Available(PackedBuffer {
+            gva,
+            size: pages.len() as u64 * page_size,
+            head: 0,
+            import,
+            gpas: Arc::new(pages.to_vec()),
+            footprint: crate::runtime::guest_ram::GuestPageFootprint::new(
+                Arc::from(pages),
+                page_size,
+            )
+            .unwrap(),
+            runs: Arc::new(Vec::new()),
+            pages: Arc::new(Vec::new()),
+            sampled_image_requirements: std::collections::HashMap::new(),
+            owned_alias: Some(PackedAliasRetirement {
+                import: import_id,
+                ptr: 0x10_0000 + allocation * 0x10_0000,
+                len: pages.len() * page_size as usize,
+            }),
+        })
+    }
+
+    #[test]
+    fn packed_alias_shape_distinguishes_equal_plans_from_page_overlap() {
+        let mut buffers = BoundBuffers::default();
+        buffers.insert_packed(1, 1, packed(0x1000, &[0x10_000, 0x20_000], 1));
+        buffers.insert_packed(1, 2, packed(0x3000, &[0x10_000, 0x20_000], 2));
+        buffers.insert_packed(1, 3, packed(0x5000, &[0x20_000, 0x30_000], 3));
+
+        assert_eq!(
+            buffers.packed_alias_shape(),
+            PackedAliasShape {
+                resources: 3,
+                distinct_page_plans: 2,
+                duplicate_resources: 1,
+                max_resources_per_plan: 2,
+                physical_pages: 3,
+                multiply_aliased_pages: 2,
+                max_aliases_per_page: 3,
+            }
+        );
     }
 
     /// The lookup is keyed by all three of task, reference and offset, so no
@@ -903,6 +1230,7 @@ mod tests {
             PackedBufferResolution::Unavailable {
                 gva: 0x4000,
                 size: 0x3000,
+                required_import_len: 0x3000,
             },
         );
         b.insert_packed(
@@ -911,6 +1239,7 @@ mod tests {
             PackedBufferResolution::Unavailable {
                 gva: 0x9000,
                 size: 0x1000,
+                required_import_len: 0x1000,
             },
         );
         assert!(b.packed(1, 7).is_some());
@@ -949,6 +1278,7 @@ mod tests {
                 .unwrap(),
                 runs: Arc::new(Vec::new()),
                 pages: Arc::new(Vec::new()),
+                sampled_image_requirements: std::collections::HashMap::new(),
                 owned_alias: None,
             }),
         );
@@ -1015,6 +1345,7 @@ mod tests {
                 .unwrap(),
                 runs: Arc::new(Vec::new()),
                 pages: Arc::new(Vec::new()),
+                sampled_image_requirements: std::collections::HashMap::new(),
                 owned_alias: Some(expected),
             }),
         );
@@ -1050,6 +1381,7 @@ mod tests {
             .unwrap(),
             runs: Arc::new(Vec::new()),
             pages: Arc::new(Vec::new()),
+            sampled_image_requirements: std::collections::HashMap::new(),
             owned_alias: None,
         };
 
@@ -1058,6 +1390,12 @@ mod tests {
             .expect("the first four resource bytes are in its first guest page");
         assert_eq!(window.gpas, &[0x220_000]);
         assert_eq!(window.host_ptr, import.host_base() + 0x12_000);
+        let access = packed.access();
+        let access_window = access
+            .witness_window(0, 4)
+            .expect("an execution payload preserves the same witness coordinates");
+        assert_eq!(access_window.gpas, window.gpas);
+        assert_eq!(access_window.host_ptr, window.host_ptr);
         assert_eq!(
             packed.window_pages(0, 4).unwrap(),
             std::collections::HashSet::from([0x220_000])

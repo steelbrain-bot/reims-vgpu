@@ -123,7 +123,7 @@ impl HostGpuCaps {
     /// something the device reported.
     pub fn selection_line(&self, device_name: &str) -> String {
         format!(
-            "vk_caps api={} baseline={} memory={} memory_signal={} device_local_mb={} host_visible_device_local_mb={} host_pointer_import={} host_pointer_align={} host_pointer_heap_mb={} max_alloc_mb={} push_descriptors={} portability_subset={} type={:?} name={device_name:?}",
+            "vk_caps api={} baseline={} memory={} memory_signal={} device_local_mb={} host_visible_device_local_mb={} host_pointer_import={} host_pointer_handle={} host_pointer_align={} host_pointer_heap_mb={} max_alloc_mb={} push_descriptors={} portability_subset={} type={:?} name={device_name:?}",
             crate::api_floor::version_str(self.device_api_version),
             crate::api_floor::version_str(crate::api_floor::MIN_SUPPORTED_API),
             self.memory.topology.slug(),
@@ -131,6 +131,7 @@ impl HostGpuCaps {
             self.memory.device_local_bytes >> 20,
             self.memory.host_visible_device_local_bytes >> 20,
             self.host_pointer.rung.slug(),
+            self.host_pointer.handle_slug(),
             self.host_pointer.min_alignment,
             self.host_pointer.heap_budget >> 20,
             self.max_allocation_size >> 20,
@@ -156,6 +157,7 @@ mod tests {
             quirks: DriverQuirk::default(),
             host_pointer: HostPointerCaps {
                 rung: HostPointerImport::Supported,
+                handle_type: vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT,
                 min_alignment: 4096,
                 heap_budget: 8 << 30,
                 span_max: 4 << 30,
@@ -191,6 +193,10 @@ mod tests {
     fn the_selection_line_carries_the_host_pointer_rung_and_its_granularity() {
         let line = caps(vk::API_VERSION_1_2, &fixtures::apple_m3_max()).selection_line("Apple");
         assert!(line.contains("host_pointer_import=supported"), "{line}");
+        assert!(
+            line.contains("host_pointer_handle=host_allocation"),
+            "{line}"
+        );
         assert!(line.contains("host_pointer_align=4096"), "{line}");
         // The heap ceiling is on the line because it is half of the reported
         // `radv`/`amdgpu` failure: an operator whose guest is larger than this
@@ -205,6 +211,7 @@ mod tests {
         refused.host_pointer = HostPointerCaps::default();
         let line = refused.selection_line("Apple");
         assert!(line.contains("host_pointer_import=unqueried"), "{line}");
+        assert!(line.contains("host_pointer_handle=none"), "{line}");
         // A refused rung carries no granularity, so the line cannot suggest one
         // an import site could act on.
         assert!(line.contains("host_pointer_align=0"), "{line}");
@@ -220,6 +227,7 @@ mod tests {
         let mut c = caps(vk::API_VERSION_1_2, &fixtures::apple_m3_max());
         c.host_pointer = HostPointerCaps {
             rung: HostPointerImport::NoHostPointerExtension,
+            handle_type: vk::ExternalMemoryHandleTypeFlags::empty(),
             min_alignment: 0,
             heap_budget: 0,
             span_max: 0,

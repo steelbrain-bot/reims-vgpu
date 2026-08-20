@@ -6,6 +6,78 @@
 
 use super::*;
 
+fn sampled_source_note(image: &reims_vgpu_core::SampledImageResource) -> String {
+    use reims_vgpu_core::SampledSource;
+    let source = match &image.source {
+        SampledSource::Null => "null".to_string(),
+        SampledSource::Bytes(bytes) => format!("bytes:{}", bytes.len()),
+        SampledSource::Target(identity) => format!("target:{identity:?}"),
+        SampledSource::Attachment { identity, initial } => {
+            format!("attachment:{identity:?}:{initial:?}")
+        }
+        SampledSource::GuestImage(source, _) => format!(
+            "guest_image:direct={}:mips={}:view={:?}",
+            u8::from(source.direct.is_some()),
+            source.allocation.mips.len(),
+            source.view
+        ),
+        SampledSource::GuestRuns(source, _) => format!(
+            "guest_runs:off={}:len={}:row={}",
+            source.source_offset, source.total_len, source.row_length_texels
+        ),
+    };
+    format!(
+        "b{}[{}]:{}x{}:{:?}:swizzle={:?}:{source}",
+        image.binding, image.array_element, image.width, image.height, image.format, image.swizzle
+    )
+}
+
+fn screen_resource_join_line(
+    pipeline_ref: u32,
+    resources: &reims_vgpu_core::DrawRequest,
+) -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let scissors = resources
+        .scissors
+        .iter()
+        .map(|s| format!("{}x{}+{}+{}", s.width, s.height, s.x, s.y))
+        .collect::<Vec<_>>()
+        .join(",");
+    let viewports = resources
+        .viewports
+        .iter()
+        .map(|v| {
+            format!(
+                "{:.1}x{:.1}+{:.1}+{:.1}@{:.3}..{:.3}",
+                v.width, v.height, v.x, v.y, v.min_depth, v.max_depth
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let sampled = resources
+        .sampled_images
+        .iter()
+        .map(sampled_source_note)
+        .collect::<Vec<_>>()
+        .join(";");
+    format!(
+        "screen_resource_join seq={seq} pipe={pipeline_ref} target={:?} extent={}x{} \
+         viewport=[{viewports}] scissor=[{scissors}] load={:?} clear={:?} continues={}/{} \
+         from_target={} blend={:?} mask={:?} sampled=[{sampled}]",
+        resources.target_identity,
+        resources.width,
+        resources.height,
+        resources.color_load_action,
+        resources.target_clear,
+        u8::from(resources.continues_render_pass),
+        u8::from(resources.render_pass_continues),
+        u8::from(resources.load_from_target),
+        resources.blend,
+        resources.color_write_mask,
+    )
+}
+
 pub(super) fn fixed_state_gap(request: &DrawEncodeRequest) -> String {
     request
         .depth_bias
@@ -94,6 +166,7 @@ pub(super) fn observe_prepared_resources(
     // targets. It is verbose-gated (REIMS_VGPU_DRAW_LOG →
     // /tmp/reims-vgpu-draw.log) because it costs a `format!` per binding.
     if census_verbose {
+        crate::observe::line(screen_resource_join_line(req.pipeline_ref, resources));
         let attr_meta: String = resources
             .vertex_attributes
             .iter()
@@ -122,12 +195,14 @@ pub(super) fn observe_prepared_resources(
             .iter()
             .map(|s| {
                 format!(
-                    "b{}:un={}:min={:?}:mag={:?}:mip={:?}:uvw={:?}/{:?}/{:?}",
+                    "b{}:un={}:min={:?}:mag={:?}:mip={:?}:lod={}/{}:uvw={:?}/{:?}/{:?}",
                     s.binding,
                     s.unnormalized_coordinates as u8,
                     s.min_filter,
                     s.mag_filter,
                     s.mip_filter,
+                    s.lod_min_f32(),
+                    s.lod_max_f32(),
                     s.address_mode_u,
                     s.address_mode_v,
                     s.address_mode_w
@@ -148,7 +223,11 @@ pub(super) fn observe_prepared_resources(
         req.colors.len(),
         color_target_diag(&req.colors),
         fixed_state_gap,
-        (resources.target_rgba8.is_some() || resources.target_guest_seed.is_some()) as u8,
+        (resources.target_rgba8.is_some()
+            || resources
+                .target_guest
+                .as_ref()
+                .is_some_and(|target| target.seed().is_some())) as u8,
         resources.indexed.is_some() as u8,
         resources.indexed.as_ref().map(|i| i.index_count).unwrap_or(0),
         attr_meta,
@@ -198,10 +277,12 @@ pub(super) fn observe_prepared_resources(
         sampled_notes.push(crate::runtime::executor::DrawHangSampledNote {
             binding: image.binding,
             kind: match &image.source {
+                reims_vgpu_core::SampledSource::Null => 0,
                 reims_vgpu_core::SampledSource::Bytes(_) => 1,
                 reims_vgpu_core::SampledSource::Target(_)
                 | reims_vgpu_core::SampledSource::Attachment { .. } => 2,
                 reims_vgpu_core::SampledSource::GuestRuns(..) => 3,
+                reims_vgpu_core::SampledSource::GuestImage(..) => 6,
             },
             format: image.format,
             width: image.width,
@@ -211,6 +292,7 @@ pub(super) fn observe_prepared_resources(
             // the GPU; reading either one would be a device-memory access
             // taken to write a log line, which is not a trade this makes.
             texel0: match &image.source {
+                reims_vgpu_core::SampledSource::Null => 0,
                 reims_vgpu_core::SampledSource::Bytes(b) => b
                     .get(..4)
                     .map(|t| u32::from_le_bytes([t[0], t[1], t[2], t[3]]))
@@ -259,6 +341,8 @@ pub(super) fn observe_prepared_resources(
             // than concluding anything about the three.
             provenance: sampler_origin.get(&smp.binding).copied().unwrap_or(b'?'),
             unnormalized: smp.unnormalized_coordinates,
+            lod_min: smp.lod_min,
+            lod_max: smp.lod_max,
         });
     }
     state
@@ -352,5 +436,67 @@ mod tests {
             }
         );
         assert_eq!(pixels, before, "observation cannot rewrite Store output");
+    }
+
+    #[test]
+    fn screen_join_names_target_scissor_load_and_sample_source() {
+        let request = reims_vgpu_core::DrawRequest {
+            width: 1920,
+            height: 1080,
+            target_identity: Some(crate::model::TargetIdentity::Gva {
+                gva: 0x1000,
+                width: 1920,
+                height: 1080,
+                generation: 7,
+                format: reims_vgpu_protocol::TexelLayout::Bgra8,
+            }),
+            scissors: vec![reims_vgpu_core::ScissorResource {
+                x: 900,
+                y: 400,
+                width: 160,
+                height: 48,
+            }],
+            viewports: vec![reims_vgpu_core::ViewportResource {
+                x: 640.0,
+                y: 180.0,
+                width: 768.0,
+                height: 64.0,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            }],
+            color_load_action: reims_vgpu_core::ColorLoadAction::Load,
+            load_from_target: true,
+            sampled_images: vec![reims_vgpu_core::SampledImageResource {
+                binding: 3,
+                array_element: 0,
+                descriptor_count: 1,
+                width: 16,
+                height: 16,
+                layers: 1,
+                arrayed: false,
+                volume: false,
+                cube: false,
+                one_dim: false,
+                multisampled: false,
+                source: reims_vgpu_core::SampledSource::Bytes(std::sync::Arc::new(vec![1; 16])),
+                content: None,
+                byte_origin: Default::default(),
+                format: reims_vgpu_protocol::ImageFormat::linear(
+                    reims_vgpu_protocol::TexelLayout::Rgba8,
+                ),
+                identity: None,
+                resource_lifetime: None,
+                swizzle: reims_vgpu_protocol::SwizzlePlan::default(),
+            }],
+            ..Default::default()
+        };
+        let line = screen_resource_join_line(42, &request);
+        assert!(line.contains("pipe=42"));
+        assert!(line.contains("160x48+900+400"));
+        assert!(line.contains("768.0x64.0+640.0+180.0@0.000..1.000"));
+        assert!(line.contains("load=Load"));
+        assert!(line.contains("clear=[0.0, 0.0, 0.0, 0.0]"));
+        assert!(line.contains("b3[0]:16x16"));
+        assert!(line.contains("bytes:16"));
     }
 }

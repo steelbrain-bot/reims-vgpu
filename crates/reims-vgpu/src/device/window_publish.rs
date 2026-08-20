@@ -271,10 +271,6 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::runtim
     use crate::runtime::drain::{note_window_publish, WindowPublish};
     let mut guard = slot.window.lock();
     let Some(link) = guard.as_mut() else {
-        // No window consumes the capture: revert the next capture to the full
-        // readback path (a torn-down window must not leave `frame_bgra` stale
-        // behind an unreset `display_from_resident`).
-        state.presentation.present.set_display_from_resident(false);
         note_window_publish(WindowPublish::NoWindow);
         return;
     };
@@ -314,9 +310,10 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::runtim
         .executor
         .prepare_window_resident_present(&resident_source);
     // The window presenting from the engine's own device can take the resident
-    // as it stands, so the frame never crosses host memory. `display_from_resident`
-    // is what tells the NEXT capture not to read it back, and it is only set
-    // when a resident actually carried this one.
+    // as it stands, so the frame never crosses host memory. Capture already
+    // prepared this exact source and selected the current present's route;
+    // this second preparation is idempotent and keeps publication independently
+    // fail-closed if the presenter disappeared between the two operations.
     if let Ok(resident_source) = resident_present {
         let published = window_write_frame(
             link,
@@ -325,7 +322,6 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::runtim
         crate::runtime::census::present_proxy::window_publish::note(published);
         if published {
             link.last = key;
-            state.presentation.present.set_display_from_resident(true);
         }
         return;
     }
@@ -339,9 +335,8 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::runtim
     // No resident carries this present (firmware framebuffer, a mapping the
     // compositor cleared but never rendered into, the frames after a device
     // reset), or the window is driving its own device because the engine's
-    // cannot present to this surface. Either way the window needs CPU pixels,
-    // and the next capture must read them back.
-    state.presentation.present.set_display_from_resident(false);
+    // cannot present to this surface. Either way this present requires the CPU
+    // frame captured for it.
     if state.presentation.present.frame().pixels().len() < need {
         // No usable CPU frame: nothing to publish. Reachable via keep-prior
         // when a capture FAILS at a new/larger geometry (dims advanced, the

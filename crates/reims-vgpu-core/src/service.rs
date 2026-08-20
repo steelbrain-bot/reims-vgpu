@@ -207,6 +207,13 @@ pub trait ResidentService: std::fmt::Debug + Send + Sync {
         false
     }
 
+    /// Publish a guest CPU write to a resident that directly imports the
+    /// guest's canonical allocation. This updates both content currency and
+    /// the synchronization state for its next GPU consumer.
+    fn note_resident_guest_write(&self, _identity: &TargetIdentity, _epoch: u32) -> bool {
+        false
+    }
+
     fn note_resident_content_copied_out(&self, _identity: &TargetIdentity) -> bool {
         false
     }

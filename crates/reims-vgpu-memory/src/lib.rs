@@ -83,7 +83,10 @@ pub struct GuestRun {
 ///
 /// `runs` lets a CPU fallback gather from stable host aliases. `pages` names
 /// the same bytes as checked RAMBlock references so a capable executor can bind
-/// or copy them without re-deriving their bounds.
+/// or copy them without re-deriving their bounds. `physical_pages` is the
+/// canonical identity shared with in-flight guest writes; it is deliberately
+/// independent of either host representation because distinct Vulkan objects
+/// may alias the same guest pages.
 #[derive(Clone, Debug)]
 pub struct GuestRunSource {
     pub runs: std::sync::Arc<Vec<GuestRun>>,
@@ -92,6 +95,7 @@ pub struct GuestRunSource {
     /// Guest row stride in texels; zero means tightly packed rows.
     pub row_length_texels: u32,
     pub pages: Option<std::sync::Arc<Vec<GuestWindowRun>>>,
+    pub physical_pages: Option<GuestPageSet>,
 }
 
 /// One guest surface plane within a stable shared host allocation.
@@ -105,6 +109,48 @@ pub struct GuestTargetBacking {
     pub row_pitch: u64,
 }
 
+impl GuestTargetBacking {
+    /// Allocation-relative byte window occupied by a 2D image in this layout.
+    pub fn visible_window(
+        self,
+        width: u32,
+        height: u32,
+        bytes_per_texel: u64,
+    ) -> Option<std::ops::Range<u64>> {
+        if width == 0 || height == 0 || bytes_per_texel == 0 {
+            return None;
+        }
+        let tight_row = u64::from(width).checked_mul(bytes_per_texel)?;
+        if self.row_pitch < tight_row {
+            return None;
+        }
+        let end = u64::from(height - 1)
+            .checked_mul(self.row_pitch)?
+            .checked_add(self.plane_offset)?
+            .checked_add(tight_row)?;
+        let resource_end = self.resource_offset.checked_add(self.resource_len)?;
+        (self.plane_offset >= self.resource_offset
+            && end <= resource_end
+            && resource_end <= self.allocation_len)
+            .then_some(self.plane_offset..end)
+    }
+
+    /// Allocation-relative byte window occupied by a typed image layout.
+    pub fn visible_image_window(
+        self,
+        layout: GuestImageLayout,
+        bytes_per_texel: u64,
+    ) -> Option<std::ops::Range<u64>> {
+        let span = layout.visible_span(self.row_pitch, bytes_per_texel)?;
+        let end = self.plane_offset.checked_add(span)?;
+        let resource_end = self.resource_offset.checked_add(self.resource_len)?;
+        (self.plane_offset >= self.resource_offset
+            && end <= resource_end
+            && resource_end <= self.allocation_len)
+            .then_some(self.plane_offset..end)
+    }
+}
+
 /// An importable guest allocation and the exact physical pages it owns.
 #[derive(Clone, Debug)]
 pub struct GuestTargetMemory {
@@ -113,12 +159,500 @@ pub struct GuestTargetMemory {
     pub footprint: GuestPageFootprint,
 }
 
+/// One image whose authoritative texels live in a guest allocation, together
+/// with its complete transfer representation and optional direct import.
+///
+/// These are two materializations of one backing, not two content sources.
+/// A backend whose image-layout equation agrees may bind `direct` directly;
+/// otherwise it consumes `transfer` through its ordinary upload path. Keeping
+/// both behind one semantic object prevents a draw-time capability decision
+/// from replacing the resource's identity with page runs.
+#[derive(Clone, Debug)]
+pub struct GuestImageSource {
+    /// Directly importable materialization of this allocation, when the host
+    /// transport can provide one. Absence changes placement, not image
+    /// semantics; `transfer` still carries the same allocation.
+    pub direct: Option<GuestTargetMemory>,
+    pub allocation: GuestImageAllocationLayout,
+    pub view: GuestImageViewRange,
+    pub transfer: GuestRunSource,
+}
+
+impl GuestImageSource {
+    /// Construct the exact one-mip allocation used by the existing direct
+    /// image rails. Keeping this constructor beside the general allocation
+    /// model makes the current subset explicit without baking it into the
+    /// backend image type.
+    pub fn single_mip(
+        memory: GuestTargetMemory,
+        layout: GuestImageLayout,
+        transfer: GuestRunSource,
+    ) -> Option<Self> {
+        let mip = GuestImageMipLayout {
+            offset: memory
+                .backing
+                .plane_offset
+                .checked_sub(memory.backing.resource_offset)?,
+            row_pitch: memory.backing.row_pitch,
+            layout,
+        };
+        Some(Self {
+            direct: Some(memory),
+            allocation: GuestImageAllocationLayout {
+                mips: std::sync::Arc::from([mip]),
+            },
+            view: GuestImageViewRange {
+                base_mip_level: 0,
+                mip_level_count: 1,
+                base_array_layer: 0,
+                array_layer_count: layout.array_layers(),
+            },
+            transfer,
+        })
+    }
+
+    pub fn viewed_base_layout(&self) -> Option<GuestImageLayout> {
+        let layout = self
+            .allocation
+            .mips
+            .get(self.view.base_mip_level as usize)
+            .map(|mip| mip.layout)?;
+        match layout {
+            GuestImageLayout::D1Array {
+                width, array_pitch, ..
+            } => Some(GuestImageLayout::D1Array {
+                width,
+                layers: self.view.array_layer_count,
+                array_pitch,
+            }),
+            GuestImageLayout::D2Array {
+                width,
+                height,
+                array_pitch,
+                ..
+            } => Some(GuestImageLayout::D2Array {
+                width,
+                height,
+                layers: self.view.array_layer_count,
+                array_pitch,
+            }),
+            other => (self.view.base_array_layer == 0 && self.view.array_layer_count == 1)
+                .then_some(other),
+        }
+    }
+}
+
+/// One mip subresource's guest-resource-relative placement and geometry.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct GuestImageMipLayout {
+    pub offset: u64,
+    pub row_pitch: u64,
+    pub layout: GuestImageLayout,
+}
+
+/// Complete mip layout of one Vulkan-compatible guest image allocation.
+///
+/// Array layers remain inside each mip's [`GuestImageLayout`], where their
+/// full-chain pitch is explicit. Mip offsets are relative to the guest
+/// resource, independent of host import padding, and are translated and
+/// validated against every Vulkan subresource layout at materialization.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct GuestImageAllocationLayout {
+    pub mips: std::sync::Arc<[GuestImageMipLayout]>,
+}
+
+impl GuestImageAllocationLayout {
+    pub fn single(offset: u64, row_pitch: u64, layout: GuestImageLayout) -> Self {
+        Self {
+            mips: std::sync::Arc::from([GuestImageMipLayout {
+                offset,
+                row_pitch,
+                layout,
+            }]),
+        }
+    }
+
+    pub fn base(&self) -> Option<GuestImageMipLayout> {
+        self.mips.first().copied()
+    }
+
+    pub fn mip_level_count(&self) -> Option<u32> {
+        u32::try_from(self.mips.len())
+            .ok()
+            .filter(|count| *count != 0)
+    }
+
+    /// Translate guest-resource-relative mip offsets into a concrete parent
+    /// allocation. Import padding is placement state and enters only here.
+    pub fn translated(&self, resource_offset: u64) -> Option<Self> {
+        let mips = self
+            .mips
+            .iter()
+            .map(|mip| {
+                Some(GuestImageMipLayout {
+                    offset: resource_offset.checked_add(mip.offset)?,
+                    ..*mip
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self {
+            mips: std::sync::Arc::from(mips),
+        })
+    }
+
+    /// Whether this declaration can be one Vulkan image mip chain.
+    ///
+    /// The guest supplies every level independently. Vulkan derives later
+    /// extents from level zero, so accepting two individually valid levels is
+    /// insufficient: their dimensional family, layer domain, and halving
+    /// sequence must also agree.
+    pub fn is_vulkan_mip_chain(&self, bytes_per_texel: u64) -> bool {
+        let Some(base) = self.base() else {
+            return false;
+        };
+        if bytes_per_texel == 0 || base.layout.width() == 0 || base.layout.height() == 0 {
+            return false;
+        }
+        self.mips.iter().enumerate().all(|(index, mip)| {
+            let Ok(level) = u32::try_from(index) else {
+                return false;
+            };
+            let reduced = |extent: u32| extent.checked_shr(level).unwrap_or(0).max(1);
+            let geometry_matches = mip.layout.width() == reduced(base.layout.width())
+                && mip.layout.height() == reduced(base.layout.height())
+                && mip.layout.depth() == reduced(base.layout.depth());
+            let family_matches = match (base.layout, mip.layout) {
+                (GuestImageLayout::D1 { .. }, GuestImageLayout::D1 { .. })
+                | (GuestImageLayout::D2 { .. }, GuestImageLayout::D2 { .. }) => true,
+                (
+                    GuestImageLayout::D1Array {
+                        layers,
+                        array_pitch,
+                        ..
+                    },
+                    GuestImageLayout::D1Array {
+                        layers: next_layers,
+                        array_pitch: next_pitch,
+                        ..
+                    },
+                )
+                | (
+                    GuestImageLayout::D2Array {
+                        layers,
+                        array_pitch,
+                        ..
+                    },
+                    GuestImageLayout::D2Array {
+                        layers: next_layers,
+                        array_pitch: next_pitch,
+                        ..
+                    },
+                ) => layers == next_layers && array_pitch == next_pitch,
+                (GuestImageLayout::D3 { .. }, GuestImageLayout::D3 { .. }) => true,
+                _ => false,
+            };
+            geometry_matches
+                && family_matches
+                && mip.row_pitch.is_multiple_of(bytes_per_texel)
+                && mip
+                    .layout
+                    .visible_span(mip.row_pitch, bytes_per_texel)
+                    .is_some()
+        })
+    }
+}
+
+/// Texture-view subresource range over a [`GuestImageAllocationLayout`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct GuestImageViewRange {
+    pub base_mip_level: u32,
+    pub mip_level_count: u32,
+    pub base_array_layer: u32,
+    pub array_layer_count: u32,
+}
+
+impl GuestImageViewRange {
+    pub fn fits(self, allocation: &GuestImageAllocationLayout) -> bool {
+        let Some(mip_count) = allocation.mip_level_count() else {
+            return false;
+        };
+        let Some(mip_end) = self.base_mip_level.checked_add(self.mip_level_count) else {
+            return false;
+        };
+        let Some(base) = allocation.base() else {
+            return false;
+        };
+        let Some(layer_end) = self.base_array_layer.checked_add(self.array_layer_count) else {
+            return false;
+        };
+        self.mip_level_count != 0
+            && self.array_layer_count != 0
+            && mip_end <= mip_count
+            && layer_end <= base.layout.array_layers()
+    }
+}
+
+/// Complete dimensional and inter-subresource layout of one guest image.
+///
+/// The enum keeps array layers and volume slices distinct. Both are a third
+/// coordinate to a shader, but Vulkan represents the former with
+/// `arrayLayers`/`arrayPitch` and the latter with `extent.depth`/`depthPitch`.
+/// Collapsing either to a generic layer count loses the equation required for
+/// a direct image binding.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum GuestImageLayout {
+    D1 {
+        width: u32,
+    },
+    D1Array {
+        width: u32,
+        layers: u32,
+        array_pitch: u64,
+    },
+    D2 {
+        width: u32,
+        height: u32,
+    },
+    D2Array {
+        width: u32,
+        height: u32,
+        layers: u32,
+        array_pitch: u64,
+    },
+    D3 {
+        width: u32,
+        height: u32,
+        depth: u32,
+        depth_pitch: u64,
+    },
+}
+
+impl GuestImageLayout {
+    pub const fn width(self) -> u32 {
+        match self {
+            Self::D1 { width }
+            | Self::D1Array { width, .. }
+            | Self::D2 { width, .. }
+            | Self::D2Array { width, .. }
+            | Self::D3 { width, .. } => width,
+        }
+    }
+
+    pub const fn height(self) -> u32 {
+        match self {
+            Self::D1 { .. } | Self::D1Array { .. } => 1,
+            Self::D2 { height, .. } | Self::D2Array { height, .. } | Self::D3 { height, .. } => {
+                height
+            }
+        }
+    }
+
+    pub const fn depth(self) -> u32 {
+        match self {
+            Self::D3 { depth, .. } => depth,
+            _ => 1,
+        }
+    }
+
+    pub const fn array_layers(self) -> u32 {
+        match self {
+            Self::D1Array { layers, .. } | Self::D2Array { layers, .. } => layers,
+            _ => 1,
+        }
+    }
+
+    pub const fn is_arrayed(self) -> bool {
+        matches!(self, Self::D1Array { .. } | Self::D2Array { .. })
+    }
+
+    pub const fn is_volume(self) -> bool {
+        matches!(self, Self::D3 { .. })
+    }
+
+    pub const fn is_one_dimensional(self) -> bool {
+        matches!(self, Self::D1 { .. } | Self::D1Array { .. })
+    }
+
+    /// Final visible byte relative to the image plane's first byte.
+    pub fn visible_span(self, row_pitch: u64, bytes_per_texel: u64) -> Option<u64> {
+        if bytes_per_texel == 0 {
+            return None;
+        }
+        let tight_row = u64::from(self.width()).checked_mul(bytes_per_texel)?;
+        if self.width() == 0 || row_pitch < tight_row {
+            return None;
+        }
+        let rows = u64::from(self.height().checked_sub(1)?).checked_mul(row_pitch)?;
+        let slice = rows.checked_add(tight_row)?;
+        match self {
+            Self::D1 { .. } | Self::D2 { .. } => Some(slice),
+            Self::D1Array {
+                layers,
+                array_pitch,
+                ..
+            }
+            | Self::D2Array {
+                layers,
+                array_pitch,
+                ..
+            } => {
+                if layers == 0 || array_pitch < slice {
+                    return None;
+                }
+                u64::from(layers - 1)
+                    .checked_mul(array_pitch)?
+                    .checked_add(slice)
+            }
+            Self::D3 {
+                depth, depth_pitch, ..
+            } => {
+                if depth == 0 || depth_pitch < slice {
+                    return None;
+                }
+                u64::from(depth - 1)
+                    .checked_mul(depth_pitch)?
+                    .checked_add(slice)
+            }
+        }
+    }
+}
+
+/// Backend-neutral declaration used to size a host image materialization
+/// before its guest-page alias is created.
+///
+/// `allocation` remains guest-resource-relative while `backing` names that
+/// resource's placement in a candidate host import. The backend may require
+/// trailing host-only bytes, but it may not change either coordinate to make
+/// its own layout fit.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct GuestImageBindingRequest {
+    pub backing: GuestTargetBacking,
+    pub allocation: GuestImageAllocationLayout,
+    pub format: reims_vgpu_protocol::ImageFormat,
+}
+
+/// Stable resource-owned key for one backend image-layout query.
+///
+/// The host pointer and allocation extent are deliberately absent: adding
+/// host-only binding padding may replace both without changing the image whose
+/// requirement was queried. The remaining fields are every guest-layout term
+/// that can affect either the Vulkan image requirements or its allocation-
+/// relative binding offset.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct GuestImageBindingKey {
+    pub resource_offset: u64,
+    pub resource_len: u64,
+    pub plane_offset: u64,
+    pub row_pitch: u64,
+    pub allocation: GuestImageAllocationLayout,
+    pub format: reims_vgpu_protocol::ImageFormat,
+}
+
+impl GuestImageBindingRequest {
+    pub fn key(&self) -> GuestImageBindingKey {
+        GuestImageBindingKey {
+            resource_offset: self.backing.resource_offset,
+            resource_len: self.backing.resource_len,
+            plane_offset: self.backing.plane_offset,
+            row_pitch: self.backing.row_pitch,
+            allocation: self.allocation.clone(),
+            format: self.format,
+        }
+    }
+}
+
+/// Exact host allocation extent required to bind one declared image.
+///
+/// Bytes beyond the guest resource are host-only binding padding. They never
+/// enter a [`GuestPageFootprint`] and cannot be published as guest content.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuestImageBindingRequirement {
+    pub allocation_len: u64,
+}
+
+/// Stable backend admission for one resource-owned image layout.
+///
+/// A refusal means the declared guest layout cannot be represented directly
+/// and the caller must use its copying rail. Transient backend failures are
+/// not values of this type and therefore cannot be retained as resource state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuestImageBindingDisposition {
+    Direct(GuestImageBindingRequirement),
+    Refused,
+}
+
+impl GuestTargetMemory {
+    /// Physical pages touched by the visible image, translating the image's
+    /// parent-import coordinates into this resource footprint's coordinates.
+    pub fn visible_footprint(
+        &self,
+        width: u32,
+        height: u32,
+        bytes_per_texel: u64,
+    ) -> Option<GuestPageFootprint> {
+        let window = self
+            .backing
+            .visible_window(width, height, bytes_per_texel)?;
+        let resource_head = self.backing.resource_offset % self.footprint.page_size();
+        let start = window
+            .start
+            .checked_sub(self.backing.resource_offset)?
+            .checked_add(resource_head)?;
+        let end = window
+            .end
+            .checked_sub(self.backing.resource_offset)?
+            .checked_add(resource_head)?;
+        self.footprint.window(start..end)
+    }
+
+    /// Canonical page set written by this declared image window.
+    pub fn visible_write_pages(
+        &self,
+        width: u32,
+        height: u32,
+        bytes_per_texel: u64,
+    ) -> Option<GuestWritePages> {
+        let footprint = self.visible_footprint(width, height, bytes_per_texel)?;
+        GuestWritePages::new(footprint.pages())
+    }
+}
+
 /// A render attachment's prior contents in its bounded guest-memory form.
 #[derive(Clone, Debug)]
 pub struct GuestTargetSeed {
     pub source: GuestRunSource,
     /// Physical texel layout of the guest bytes.
     pub format: reims_vgpu_protocol::TexelLayout,
+}
+
+/// The guest-memory side of one render attachment.
+///
+/// A seed is content only. A backing is the allocation the executor may bind
+/// as the attachment when its native layout agrees exactly; its optional seed
+/// says whether this pass must observe the guest's current bytes on LOAD.
+#[derive(Clone, Debug)]
+pub enum GuestTargetPlan {
+    Seed(GuestTargetSeed),
+    Backing {
+        memory: GuestTargetMemory,
+        seed: Option<GuestTargetSeed>,
+    },
+}
+
+impl GuestTargetPlan {
+    pub fn seed(&self) -> Option<&GuestTargetSeed> {
+        match self {
+            Self::Seed(seed) => Some(seed),
+            Self::Backing { seed, .. } => seed.as_ref(),
+        }
+    }
+
+    pub fn memory(&self) -> Option<&GuestTargetMemory> {
+        match self {
+            Self::Seed(_) => None,
+            Self::Backing { memory, .. } => Some(memory),
+        }
+    }
 }
 
 /// Describe the exact guest-memory window needed to seed an attachment LOAD.
@@ -162,6 +696,7 @@ pub fn guest_target_seed(
     } else {
         u32::try_from(row_pitch / texel).ok()?
     };
+    let physical_pages = memory.visible_write_pages(width, height, texel);
     Some(GuestTargetSeed {
         source: GuestRunSource {
             runs: std::sync::Arc::new(vec![GuestRun {
@@ -175,6 +710,7 @@ pub fn guest_target_seed(
                 window_offset: 0,
                 guest,
             }])),
+            physical_pages,
         },
         format,
     })
@@ -404,6 +940,79 @@ pub struct GuestPageFootprint {
     page_size: u64,
 }
 
+/// Canonical physical-page identity shared by guest-memory readers and writers.
+///
+/// Construction canonicalizes the set once. Read-side alias checks and
+/// submission visibility ledgers then compare the immutable result instead of
+/// inferring identity from distinct host or Vulkan objects over the same bytes.
+#[derive(Clone, Debug)]
+pub struct GuestPageSet {
+    pages: std::sync::Arc<[u64]>,
+    fingerprint: u64,
+}
+
+impl PartialEq for GuestPageSet {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.pages, &other.pages)
+            || (self.fingerprint == other.fingerprint && self.pages == other.pages)
+    }
+}
+
+impl Eq for GuestPageSet {}
+
+impl std::hash::Hash for GuestPageSet {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(self.fingerprint);
+    }
+}
+
+/// Submitted-write spelling retained at ownership sites. Reads and writes use
+/// the same canonical physical identity when deciding whether aliases overlap.
+pub type GuestWritePages = GuestPageSet;
+
+impl GuestPageSet {
+    pub fn new(pages: &[u64]) -> Option<Self> {
+        if pages.is_empty() {
+            return None;
+        }
+        let mut pages = pages.to_vec();
+        pages.sort_unstable();
+        pages.dedup();
+        let mut fingerprint = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&pages, &mut fingerprint);
+        Some(Self {
+            pages: pages.into(),
+            fingerprint: std::hash::Hasher::finish(&fingerprint),
+        })
+    }
+
+    pub fn pages(&self) -> &[u64] {
+        &self.pages
+    }
+
+    /// Whether two canonical physical footprints share at least one page.
+    ///
+    /// Both inputs are sorted and deduplicated at construction, so this is a
+    /// linear merge rather than a per-call set allocation. It is the exact
+    /// invalidation question for derived GPU copies of guest storage.
+    pub fn overlaps(&self, other: &Self) -> bool {
+        let mut left = self.pages().iter().copied().peekable();
+        let mut right = other.pages().iter().copied().peekable();
+        while let (Some(&a), Some(&b)) = (left.peek(), right.peek()) {
+            match a.cmp(&b) {
+                std::cmp::Ordering::Less => {
+                    left.next();
+                }
+                std::cmp::Ordering::Greater => {
+                    right.next();
+                }
+                std::cmp::Ordering::Equal => return true,
+            }
+        }
+        false
+    }
+}
+
 impl GuestPageFootprint {
     pub fn new(pages: std::sync::Arc<[u64]>, page_size: u64) -> Option<Self> {
         if pages.is_empty() || !page_size.is_power_of_two() {
@@ -431,6 +1040,20 @@ impl GuestPageFootprint {
 
     pub fn pages_arc(&self) -> std::sync::Arc<[u64]> {
         std::sync::Arc::clone(&self.pages)
+    }
+
+    /// Physical pages intersecting one allocation-relative byte window.
+    pub fn window(&self, bytes: std::ops::Range<u64>) -> Option<Self> {
+        if bytes.start >= bytes.end {
+            return None;
+        }
+        let allocation_len = (self.pages.len() as u64).checked_mul(self.page_size)?;
+        if bytes.end > allocation_len {
+            return None;
+        }
+        let first = usize::try_from(bytes.start / self.page_size).ok()?;
+        let last = usize::try_from((bytes.end - 1) / self.page_size).ok()?;
+        Self::new(self.pages[first..=last].into(), self.page_size)
     }
 
     /// Visit the exact physical byte runs reached by an allocation-relative
@@ -1349,6 +1972,293 @@ pub struct BoundRange {
 mod tests {
     use super::*;
 
+    #[test]
+    fn canonical_page_sets_answer_exact_overlap() {
+        let a = GuestPageSet::new(&[9, 3, 9, 5]).unwrap();
+        let same = GuestPageSet::new(&[5, 9, 3]).unwrap();
+        let b = GuestPageSet::new(&[7, 5]).unwrap();
+        let c = GuestPageSet::new(&[2, 4, 8]).unwrap();
+
+        assert_eq!(a.pages(), &[3, 5, 9]);
+        assert_eq!(a, same);
+        assert_eq!(
+            std::collections::HashSet::from([a.clone(), same]).len(),
+            1,
+            "canonical equality and the cached hash must remain one map identity"
+        );
+        assert!(a.overlaps(&b));
+        assert!(b.overlaps(&a));
+        assert!(!a.overlaps(&c));
+    }
+
+    #[test]
+    fn target_visible_window_is_the_declared_strided_plane() {
+        let backing = GuestTargetBacking {
+            allocation_host_ptr: 0x1000,
+            allocation_len: 0x8000,
+            resource_offset: 0x1000,
+            resource_len: 0x4000,
+            plane_offset: 0x1200,
+            row_pitch: 0x100,
+        };
+        assert_eq!(backing.visible_window(16, 3, 4), Some(0x1200..0x1440));
+    }
+
+    #[test]
+    fn image_window_preserves_array_and_volume_pitch() {
+        let backing = GuestTargetBacking {
+            allocation_host_ptr: 0x1000,
+            allocation_len: 0x8000,
+            resource_offset: 0x1000,
+            resource_len: 0x4000,
+            plane_offset: 0x1200,
+            row_pitch: 0x100,
+        };
+        let array = GuestImageLayout::D1Array {
+            width: 16,
+            layers: 3,
+            array_pitch: 0x100,
+        };
+        assert_eq!(array.visible_span(backing.row_pitch, 4), Some(0x240));
+        assert_eq!(backing.visible_image_window(array, 4), Some(0x1200..0x1440));
+
+        let volume = GuestImageLayout::D3 {
+            width: 16,
+            height: 2,
+            depth: 3,
+            depth_pitch: 0x200,
+        };
+        assert_eq!(volume.visible_span(backing.row_pitch, 4), Some(0x540));
+        assert_eq!(
+            backing.visible_image_window(volume, 4),
+            Some(0x1200..0x1740)
+        );
+    }
+
+    #[test]
+    fn a_vulkan_mip_chain_has_one_family_and_the_derived_extent_sequence() {
+        let chain = GuestImageAllocationLayout {
+            mips: std::sync::Arc::from([
+                GuestImageMipLayout {
+                    offset: 0x100,
+                    row_pitch: 64,
+                    layout: GuestImageLayout::D3 {
+                        width: 16,
+                        height: 8,
+                        depth: 4,
+                        depth_pitch: 512,
+                    },
+                },
+                GuestImageMipLayout {
+                    offset: 0x900,
+                    row_pitch: 32,
+                    layout: GuestImageLayout::D3 {
+                        width: 8,
+                        height: 4,
+                        depth: 2,
+                        depth_pitch: 128,
+                    },
+                },
+            ]),
+        };
+        assert!(chain.is_vulkan_mip_chain(4));
+
+        let mut wrong_extent = chain.clone();
+        std::sync::Arc::make_mut(&mut wrong_extent.mips)[1].layout = GuestImageLayout::D3 {
+            width: 8,
+            height: 4,
+            depth: 3,
+            depth_pitch: 128,
+        };
+        assert!(!wrong_extent.is_vulkan_mip_chain(4));
+
+        let mut wrong_family = chain;
+        std::sync::Arc::make_mut(&mut wrong_family.mips)[1].layout = GuestImageLayout::D2 {
+            width: 8,
+            height: 4,
+        };
+        assert!(!wrong_family.is_vulkan_mip_chain(4));
+    }
+
+    #[test]
+    fn image_requirement_key_survives_host_only_padding_but_not_layout_changes() {
+        let request = GuestImageBindingRequest {
+            backing: GuestTargetBacking {
+                allocation_host_ptr: 0x1000,
+                allocation_len: 0x4000,
+                resource_offset: 0x100,
+                resource_len: 0x2000,
+                plane_offset: 0x300,
+                row_pitch: 0x100,
+            },
+            allocation: GuestImageAllocationLayout::single(
+                0x200,
+                0x100,
+                GuestImageLayout::D2 {
+                    width: 16,
+                    height: 16,
+                },
+            ),
+            format: reims_vgpu_protocol::ImageFormat::linear(
+                reims_vgpu_protocol::TexelLayout::Bgra8,
+            ),
+        };
+        let padded = GuestImageBindingRequest {
+            backing: GuestTargetBacking {
+                allocation_host_ptr: 0x9000,
+                allocation_len: 0x8000,
+                ..request.backing
+            },
+            ..request.clone()
+        };
+        assert_eq!(request.key(), padded.key());
+
+        let array = GuestImageBindingRequest {
+            allocation: GuestImageAllocationLayout::single(
+                0x200,
+                0x100,
+                GuestImageLayout::D2Array {
+                    width: 16,
+                    height: 16,
+                    layers: 2,
+                    array_pitch: 0x1000,
+                },
+            ),
+            ..request.clone()
+        };
+        assert_ne!(request.key(), array.key());
+    }
+
+    #[test]
+    fn target_visible_window_refuses_every_out_of_resource_shape() {
+        let backing = GuestTargetBacking {
+            allocation_host_ptr: 0x1000,
+            allocation_len: 0x4000,
+            resource_offset: 0x1000,
+            resource_len: 0x1000,
+            plane_offset: 0x1800,
+            row_pitch: 0x100,
+        };
+        assert_eq!(backing.visible_window(0, 1, 4), None);
+        assert_eq!(backing.visible_window(0x41, 1, 4), None);
+        assert_eq!(backing.visible_window(0x40, 9, 4), None);
+        assert_eq!(
+            GuestTargetBacking {
+                plane_offset: 0x800,
+                ..backing
+            }
+            .visible_window(1, 1, 4),
+            None
+        );
+    }
+
+    #[test]
+    fn a_page_footprint_can_name_only_the_pages_an_image_window_reaches() {
+        let footprint = GuestPageFootprint::new(
+            std::sync::Arc::from([0x1000, 0x9000, 0x3000, 0x4000]),
+            0x1000,
+        )
+        .expect("footprint");
+        assert_eq!(
+            footprint.window(0x800..0x2800).expect("window").pages(),
+            &[0x1000, 0x9000, 0x3000]
+        );
+        assert!(footprint.window(0x4000..0x4001).is_none());
+        assert!(footprint.window(7..7).is_none());
+    }
+
+    #[test]
+    fn target_footprint_translates_from_parent_import_to_resource_coordinates() {
+        let import = std::sync::Arc::new(
+            GuestRamImport::new_host_allocation(0x1000_0000, 0x8000, 0x1000)
+                .expect("aligned import"),
+        );
+        let memory = GuestTargetMemory {
+            backing: GuestTargetBacking {
+                allocation_host_ptr: import.host_base(),
+                allocation_len: import.len(),
+                resource_offset: 0x3000,
+                resource_len: 0x3000,
+                plane_offset: 0x3800,
+                row_pitch: 0x800,
+            },
+            import,
+            footprint: GuestPageFootprint::new(
+                std::sync::Arc::from([0xa000, 0xb000, 0xc000]),
+                0x1000,
+            )
+            .expect("resource footprint"),
+        };
+        assert_eq!(
+            memory
+                .visible_footprint(64, 2, 4)
+                .expect("the visible window lies in resource pages")
+                .pages(),
+            &[0xa000, 0xb000],
+            "the 0x3000 parent-import head must not index three pages past the resource"
+        );
+    }
+
+    #[test]
+    fn target_footprint_retains_the_resources_offset_inside_its_first_page() {
+        let import = std::sync::Arc::new(
+            GuestRamImport::new_host_allocation(0x1000_0000, 0x8000, 0x1000)
+                .expect("aligned import"),
+        );
+        let memory = GuestTargetMemory {
+            backing: GuestTargetBacking {
+                allocation_host_ptr: import.host_base(),
+                allocation_len: import.len(),
+                resource_offset: 0x3800,
+                resource_len: 0x1800,
+                plane_offset: 0x3800,
+                row_pitch: 0x900,
+            },
+            import,
+            footprint: GuestPageFootprint::new(std::sync::Arc::from([0xa000, 0xb000]), 0x1000)
+                .expect("resource footprint"),
+        };
+        assert_eq!(
+            memory
+                .visible_footprint(64, 2, 4)
+                .expect("the second row crosses into the resource's second page")
+                .pages(),
+            &[0xa000, 0xb000]
+        );
+    }
+
+    #[test]
+    fn a_target_write_page_set_is_canonicalized_once_for_submission_ownership() {
+        let import = std::sync::Arc::new(
+            GuestRamImport::new_host_allocation(0x1000_0000, 0x4000, 0x1000)
+                .expect("aligned import"),
+        );
+        let memory = GuestTargetMemory {
+            backing: GuestTargetBacking {
+                allocation_host_ptr: import.host_base(),
+                allocation_len: import.len(),
+                resource_offset: 0,
+                resource_len: 0x3000,
+                plane_offset: 0,
+                row_pitch: 0x1000,
+            },
+            import,
+            footprint: GuestPageFootprint::new(
+                std::sync::Arc::from([0xc000, 0xa000, 0xc000]),
+                0x1000,
+            )
+            .expect("footprint"),
+        };
+        assert_eq!(
+            memory
+                .visible_write_pages(1, 3, 4)
+                .expect("visible pages")
+                .pages(),
+            &[0xa000, 0xc000],
+            "the immutable ledger value is sorted and deduplicated"
+        );
+    }
+
     /// A 4 KiB-granular import over 64 KiB at a plausible host address. The host
     /// address is only ever compared, never dereferenced.
     fn import(len: u64, align: u64) -> GuestRamImport {
@@ -1391,6 +2301,7 @@ mod tests {
             total_len: 0x800,
             row_length_texels: 0,
             pages: Some(std::sync::Arc::new(vec![window_run(&import, 0, 0, 0x2000)])),
+            physical_pages: None,
         };
 
         let stretch = source.single_stretch().expect("one checked stretch");
@@ -1413,6 +2324,7 @@ mod tests {
                 window_run(&import, 0x1000, 0x2000, 0x1000),
                 window_run(&import, 0x2000, 0x3000, 0x1000),
             ])),
+            physical_pages: None,
         };
 
         assert!(source.single_stretch().is_none());
@@ -1445,6 +2357,7 @@ mod tests {
             total_len: 0x1800,
             row_length_texels: 0,
             pages: Some(std::sync::Arc::new(vec![window_run(&import, 0, 0, 0x1000)])),
+            physical_pages: None,
         };
 
         assert!(matches!(

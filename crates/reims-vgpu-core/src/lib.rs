@@ -54,7 +54,7 @@ pub use compute::{
     ComputeResidentSampleBind, ComputeSampledImageResource, ComputeSampledImageSource,
     ComputeStorageImageResource, ComputeStorageImageSeed, ComputeStorageResidency,
     SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter,
-    SamplerMipFilter, SamplerResource,
+    SamplerMipFilter, SamplerResource, SamplerSource,
 };
 pub use content_tracking::{
     BufferWriteGens, BufferWriteStamp, GatherKey, GvaPlaneKey, GvaResourceKey, GvaStoreWitness,
@@ -77,7 +77,7 @@ pub use execution::{
 pub use gather::{
     fold_runs, AuditDensity, ContentAudit, GatherObservation, GatherOutcome, GatherReadings,
     GatherVerdict, GatherWindow, GatherWitness, GatheredIdentity, StatedGuestWrite,
-    AUDIT_REBASELINE_LIMIT, AUDIT_STRIDE,
+    AUDIT_REBASELINE_LIMIT,
 };
 pub use icb::{IcbRecord, IcbRegistry};
 pub use map_audit::{MapAudit, MapIntervals, PageSize};
@@ -99,8 +99,8 @@ pub use registers::{DeviceRegisters, GfxRegisters, IosfcRegisters, GFX_MMIO_SIZE
 pub use released_pages::{ReleasedPages, ReleasedVerdict, RELEASED_PAGE_WATCH_CAP};
 pub use render::{
     viewport_slot_count, AttachmentInitial, AttachmentSlot, BlendFactor, BlendOp,
-    BlendStateResource, BufferContent, CullMode, DepthClipMode, DepthState, DrawOutput,
-    DrawRequest, FillMode, IndexType, IndexedDrawResource, PreparedRenderProgram,
+    BlendStateResource, BufferContent, ColorLoadAction, CullMode, DepthClipMode, DepthState,
+    DrawOutput, DrawRequest, FillMode, IndexType, IndexedDrawResource, PreparedRenderProgram,
     PreparedShaderStage, PrimitiveTopology, SampledByteOrigin, SampledContentIdentity,
     SampledImageResource, SampledSource, ScissorResource, SecondaryColorTarget, SeedOrder,
     StencilFaceOps, StencilOp, StencilState, StorageBufferResource, VertexAttributeFormat,

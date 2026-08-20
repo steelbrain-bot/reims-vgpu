@@ -227,6 +227,9 @@ pub trait ComputeResidencyService: std::fmt::Debug + Send + Sync {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResidentContentBacking {
     NotReady,
+    /// The resident image is a view over the guest's canonical allocation.
+    GuestAllocation,
+    /// The resident image owns storage distinct from the guest allocation.
     DeviceAllocation,
 }
 

@@ -310,6 +310,8 @@ pub enum VkOp {
     WindowSurfaceCaps,
     /// `vkGetPhysicalDeviceSurfaceFormatsKHR` choosing the swapchain format.
     WindowSurfaceFormats,
+    /// `vkGetPhysicalDeviceSurfacePresentModesKHR` choosing delivery semantics.
+    WindowSurfacePresentModes,
     /// `vkCreateSwapchainKHR` for the host-window swapchain.
     WindowCreateSwapchain,
     /// `vkGetSwapchainImagesKHR` for the swapchain's images.
@@ -490,6 +492,7 @@ impl Decline for VkCall {
             VkOp::WindowQueueWaitIdle => "vk_window_queue_wait_idle",
             VkOp::WindowSurfaceCaps => "vk_window_surface_caps",
             VkOp::WindowSurfaceFormats => "vk_window_surface_formats",
+            VkOp::WindowSurfacePresentModes => "vk_window_surface_present_modes",
             VkOp::WindowCreateSwapchain => "vk_window_create_swapchain",
             VkOp::WindowGetSwapchainImages => "vk_window_get_swapchain_images",
             VkOp::WindowAcquireImage => "vk_window_acquire_image",
@@ -656,6 +659,7 @@ mod tests {
         VkOp::WindowQueueWaitIdle,
         VkOp::WindowSurfaceCaps,
         VkOp::WindowSurfaceFormats,
+        VkOp::WindowSurfacePresentModes,
         VkOp::WindowCreateSwapchain,
         VkOp::WindowGetSwapchainImages,
         VkOp::WindowAcquireImage,

@@ -198,6 +198,7 @@ pub enum StorageImageFormat {
     Rgba32Float,
     Rgba16Float,
     R16Float,
+    R16Uint,
     Rgba16Uint,
     Rgba8Uint,
     Rgba8Sint,
@@ -207,6 +208,7 @@ pub enum StorageImageFormat {
     R8Unorm,
     Rg8Unorm,
     Rgba32Uint,
+    Rgba32Sint,
     R32Uint,
     R32Sint,
     R32Float,
@@ -223,10 +225,10 @@ impl StorageImageFormat {
     /// Bytes occupied by one stored texel.
     pub const fn bytes_per_texel(self) -> usize {
         match self {
-            Self::Rgba32Float | Self::Rgba32Uint => 16,
+            Self::Rgba32Float | Self::Rgba32Uint | Self::Rgba32Sint => 16,
             Self::Rgba16Float | Self::Rgba16Uint | Self::Rgba16Unorm => 8,
             Self::Rg16Float | Self::Rg16Unorm => 4,
-            Self::R16Float | Self::Rg8Unorm | Self::R16Unorm => 2,
+            Self::R16Float | Self::R16Uint | Self::Rg8Unorm | Self::R16Unorm => 2,
             Self::R8Unorm => 1,
             Self::Rgba8Uint
             | Self::Rgba8Sint

@@ -25,6 +25,8 @@ use reims_vgpu_paging::runs::{contig_page_runs, contig_run_count};
 use reims_vgpu_paging::span::span_page_bases;
 use std::sync::Arc;
 
+pub(crate) type MappingImportSpan = (Arc<reims_vgpu_memory::GuestRamImport>, u64, u64, Arc<[u64]>);
+
 /// True if half-open ranges `[a, a+la)` and `[b, b+lb)` overlap.
 #[inline]
 fn ranges_overlap(a: u64, la: u64, b: u64, lb: u64) -> bool {
@@ -338,7 +340,7 @@ pub(crate) fn mapping_import_for_span(
     task_id: u32,
     gva: u64,
     length: u64,
-) -> Option<(Arc<reims_vgpu_memory::GuestRamImport>, u64, u64, Arc<[u64]>)> {
+) -> Option<MappingImportSpan> {
     let view = find_covering_view(state, task_id, gva, length)?;
     let page_base = view.gva & !(state.page_size() - 1);
     let in_view = gva.checked_sub(page_base)?;

@@ -16,16 +16,34 @@ impl ResourcePools {
         // to cmd_pool (destroyed below) and its dsets to desc_pool; the
         // accumulated transients are already in the live lists.
         self.discard_open_batch();
+        self.abort_recorded_guest_work();
         // No command from this CB will be submitted now. Destroying its command
         // pool discards the unfinished recording, including an open pass, so
         // there is neither a legal nor a useful cmd_end_render_pass to emit.
         self.open_pass = None;
         self.forget_pass_echo();
+        // A batched submit transfers host ownership of its fence to the queue
+        // thread until the driver's submit call returns. Teardown can be
+        // reached through session release without a queue-wide barrier, so
+        // reclaim each exact fence before the waits below touch it.
+        for slot in &mut self.slots {
+            let state = std::mem::replace(&mut slot.submission, SlotSubmission::HostOwned);
+            let result = match state {
+                SlotSubmission::HostOwned => Ok(()),
+                SlotSubmission::QueueOwned(receipt) => receipt.wait(),
+                SlotSubmission::Failed(result) => Err(result),
+            };
+            if let Err(result) = result {
+                slot.submission = SlotSubmission::Failed(result);
+                let decline = DrawError::VkCall(VkCall::new(VkOp::PoolsWaitFencesDestroy, result));
+                reims_vgpu_observe::Emit::decline("vk_pools_destroy", &decline).fail_once(0);
+            }
+        }
         // Best-effort quiesce: wait every in-flight fence so no CB references
         // what we are about to destroy. On device loss the waits fail — the
         // teardown proceeds regardless, matching the recreate path.
         for slot in &self.slots {
-            if slot.pending.is_some() {
+            if slot.pending.is_some() && !matches!(slot.submission, SlotSubmission::Failed(_)) {
                 if let Err(result) = device.wait_for_fences(&[slot.fence], true, FENCE_TIMEOUT_NS) {
                     let decline =
                         DrawError::VkCall(VkCall::new(VkOp::PoolsWaitFencesDestroy, result));
@@ -35,6 +53,7 @@ impl ResourcePools {
         }
         for slot in &mut self.slots {
             if let Some(pending) = slot.pending.take() {
+                super::super::retire_guest_write_pages(&pending.guest_write_tokens);
                 // The descriptor pool is destroyed below (frees every set);
                 // move the owed transients into the live lists so the drains
                 // below destroy them.
@@ -187,6 +206,7 @@ impl ResourcePools {
             device.destroy_image_view(t.view, None);
             device.destroy_image(t.image, None);
         }
+        self.guest_resident_authority.clear();
         self.registry_order.clear();
         // Every fence above was waited, so nothing can still be reading or
         // writing an imported RAMBlock. Freeing the memory is what ends the

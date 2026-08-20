@@ -122,9 +122,8 @@ fn reflection_is_wellformed_and_complete_for_every_texture_binding() {
     );
 }
 
-/// The reflected translate populates the datalayout (the single source of truth
-/// the layout repair now consumes) and the stage — proving the toolchain path
-/// reims-vgpu's m2v_cache now relies on is live on this host.
+/// The reflected translate retains the source datalayout and stage beside the
+/// translator-validated module, proving the reflection path is live on this host.
 #[test]
 fn reflected_translate_populates_datalayout_and_stage() {
     if !have_llvm_dis() {
@@ -209,6 +208,7 @@ fn m2v_cache_reflects_on_the_cold_call_and_hits_on_the_warm_one() {
         &air,
         m2v_cache::RenderTranslationStage::Fragment,
         1,
+        1,
     )
     .unwrap();
     assert_eq!(
@@ -220,6 +220,7 @@ fn m2v_cache_reflects_on_the_cold_call_and_hits_on_the_warm_one() {
     let warm = m2v_cache::translate_render_cached_reflected(
         &air,
         m2v_cache::RenderTranslationStage::Fragment,
+        1,
         1,
     )
     .unwrap();

@@ -41,8 +41,7 @@ use reims_vgpu_core::pixel_format;
 pub const MAX_COMPUTE_BUFFER_SLOTS: u32 = 31;
 /// Cap on compute texture stream indices (Metal bind = `TEXTURE_BINDING_BASE +
 /// index`). Metal's compute texture argument table, and Apple's serializer's:
-/// this rail refused indices 31..127 only because the descriptor binding band
-/// was that narrow, which `spirv_bind::widen_sampled_bands` fixed.
+/// metal2vulkan's reflected descriptor layout carries the complete range.
 pub const MAX_COMPUTE_TEXTURE_SLOTS: u32 = 128;
 /// Cap on compute sampler stream indices (Metal bind = `SAMPLER_BINDING_BASE +
 /// index`). Metal's sampler argument table, which is genuinely 16.
@@ -151,7 +150,7 @@ impl crate::observe::Decline for ComputeBindOverflow {
     }
 }
 
-/// The sampled-image bindings that need a neutral texture: those the module
+/// The sampled-image bindings that must remain explicitly null: those the module
 /// statically uses and `bound` does not cover.
 ///
 /// Vulkan requires the pipeline layout to contain a descriptor for every
@@ -169,47 +168,6 @@ impl crate::observe::Decline for ComputeBindOverflow {
 /// must stay omitted, or the census that separated those two populations cannot
 /// tell them apart any more. `Ambiguous` — two variables on one binding — is its
 /// own defect and is not repaired by picking one of them.
-/// Side length of the texture substituted for a sampled image the kernel
-/// samples and the guest never bound.
-///
-/// One texel, because there is nothing to derive a size from: the guest supplied
-/// no texture, and any larger extent would be a number chosen to look plausible.
-/// A kernel that asks this image its size gets 1×1 and that is reported, rather
-/// than a guess that reads as data.
-const NEUTRAL_SAMPLED_IMAGE_EXTENT: u32 = 1;
-
-/// A sampled image the kernel statically uses and the guest never bound, given a
-/// neutral transparent texture so the pipeline layout can describe it.
-///
-/// **A repair that succeeded, not a success**, which is why it goes to the fail
-/// channel: the kernel samples a texture whose contents this device invented, and
-/// the reliance has to stay measurable so a later session can find out whether
-/// the guest ever depended on what was in it. Nothing here claims the read did
-/// not matter.
-///
-/// Omitting the binding instead is not the cheaper option. It is a specification
-/// violation, and on Mesa's Intel driver it is a `SIGFPE` that kills the host
-/// process — see [`crate::runtime::executor::ComputeTranslation::neutral_sampled_image_bindings`].
-struct NeutralSampledImage {
-    binding: u32,
-    width: u32,
-    height: u32,
-}
-
-impl crate::observe::Decline for NeutralSampledImage {
-    fn slug(&self) -> &'static str {
-        "compute_neutral_sampled_image_unbound"
-    }
-
-    fn fields(&self) -> Vec<(&'static str, String)> {
-        vec![
-            ("binding", self.binding.to_string()),
-            ("width", self.width.to_string()),
-            ("height", self.height.to_string()),
-        ]
-    }
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct ComputeBufferBind {
     pub index: u32,
@@ -1607,15 +1565,10 @@ pub(crate) struct StagedTexture {
 
     /// Raw Metal pixel format from the exact texture/view descriptor.
     pub pixel_format: u16,
-    /// Product storage-selector ABI when this Metal format is storage-capable.
-    /// Sample-only formats such as RGB9E5Float intentionally have no selector.
-    /// The contract's storage-image selector for this texture's format, or
-    /// `None` for a format that is not a storage image.
-    ///
-    /// Carried as the enum rather than as its `u32` ordinal. It used to be
-    /// narrowed to `u32` at staging sites, which pushed the coverage question
-    /// past the compiler's exhaustiveness checks.
-    pub storage_selector: Option<pixel_format::StorageImageSelector>,
+    /// Semantic storage-image format for this texture, or `None` when the Metal
+    /// format is sampled-only. This exact value is supplied to metal2vulkan's
+    /// runtime specialization API.
+    pub storage_format: Option<reims_vgpu_protocol::StorageImageFormat>,
     pub width: u32,
     pub height: u32,
     /// post-dispatch host result only; the pre-dispatch source is the typed
@@ -1697,7 +1650,7 @@ fn log_storage_image_access(pipe: u32, binding: u32, access: &str, bytes: u64) {
     ));
 }
 
-/// What an engine-resident copy of a window can serve one staged binding.
+/// What the engine-resident image of a window can serve one staged binding.
 ///
 /// `Seed` means a storage binding's output is already GPU-resident at this
 /// generation, so the guest read that would seed it is unnecessary. `Sample`
@@ -1876,7 +1829,16 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                         ));
                     }
                     stage_ref = view.base_texture_ref;
-                    view_level = view.level;
+                    let Some(level) = view.single_non_array_level() else {
+                        crate::observe::fail(format!(
+                            "compute_stage_tex view_fail reason=subresource_range_unsupported ref={texture_ref} base={} range={:?} storage={}",
+                            view.base_texture_ref, view.range, is_storage as u8
+                        ));
+                        return Err(ComputeStatus::Unsupported(
+                            "compute_view_subresource_range_unsupported",
+                        ));
+                    };
+                    view_level = level;
                     view_pixel_format = view.pixel_format;
                 }
                 Err(error) => {
@@ -1927,8 +1889,8 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             ));
             return Err(ComputeStatus::Unsupported("compute_heap_fmt_bytes"));
         };
-        let storage_selector = pixel_format::storage_selector(format);
-        if is_storage && storage_selector.is_none() {
+        let storage_format = pixel_format::storage_image_format(format);
+        if is_storage && storage_format.is_none() {
             crate::observe::fail(format!(
                 "compute_stage_tex heap_fail reason=fmt_storage ref={texture_ref} heap={heap_ref} fmt={format:#x} {width}x{height}"
             ));
@@ -1986,7 +1948,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             descriptor_count: 1,
 
             pixel_format: format,
-            storage_selector,
+            storage_format,
             width,
             height,
             bytes: Vec::new(),
@@ -2214,8 +2176,8 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                 return Err(ComputeStatus::Unsupported("stage_tex_fmt_bytes"));
             }
         };
-        let storage_selector = pixel_format::storage_selector(stage_fmt);
-        if is_storage && storage_selector.is_none() {
+        let storage_format = pixel_format::storage_image_format(stage_fmt);
+        if is_storage && storage_format.is_none() {
             crate::observe::fail(format!(
                 "compute_stage_tex iosurface_texture_fail reason=fmt_storage mapping={mapping_id} {width}x{height} fmt={format:#x}"
             ));
@@ -2436,7 +2398,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             descriptor_count: 1,
 
             pixel_format: stage_fmt,
-            storage_selector,
+            storage_format,
             width,
             height,
             bytes,
@@ -2519,8 +2481,8 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             format!("fmt={stage_format:#x}"),
         );
     };
-    let storage_selector = pixel_format::storage_selector(stage_format);
-    if is_storage && storage_selector.is_none() {
+    let storage_format = pixel_format::storage_image_format(stage_format);
+    if is_storage && storage_format.is_none() {
         return linear_fail(
             ComputeStatus::Unsupported("linear_tex_fmt_storage"),
             format!("fmt={stage_format:#x}"),
@@ -2530,11 +2492,11 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         return linear_fail(
             ComputeStatus::MissingTexture("compute_linear_tex_no_level"),
             format!(
-                "base={stage_ref} level={view_level} handle={:#x} alloc={} levels={} data_off={} page_shift={}",
+                "base={stage_ref} level={view_level} handle={:#x} alloc={} levels={} base_off={} page_shift={}",
                 tex.handle,
                 tex.allocation_size,
                 tex.levels.len(),
-                tex.data_offset,
+                tex.base_offset,
                 state.page_shift
             ),
         );
@@ -2737,7 +2699,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         descriptor_count: 1,
 
         pixel_format: stage_format,
-        storage_selector,
+        storage_format,
         width: w,
         height: h,
         bytes,
@@ -3812,54 +3774,17 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     let mut sampled_images = Vec::with_capacity(sampled_count);
     let mut storage_images = Vec::with_capacity(storage_count);
     let mut storage_formats = Vec::with_capacity(storage_count);
-    // Device support for format-less storage writes decides whether a guest
-    // BGRA8Unorm storage surface can composite into a B8G8R8A8_UNORM view (no
-    // R/B swap) or must degrade to the swapped Rgba8Unorm view.
-    let write_without_format = state
-        .executor
-        .capabilities()
-        .storage_image_write_without_format;
     for t in staged_tex.iter().filter(|texture| texture.is_storage) {
-        let Some(selector) = t.storage_selector else {
+        let Some(guest_fmt) = t.storage_format else {
             crate::observe::fail(format!(
-                "compute_linux unsupported storage_format reason=no_storage_selector pipe={} bind={} fmt={:#x}",
+                "compute_linux unsupported storage_format reason=no_storage_format pipe={} bind={} fmt={:#x}",
                 acc.pipeline_ref, t.binding, t.pixel_format
             ));
-            return ComputeStatus::Unsupported("storage_no_selector_specialize");
+            return ComputeStatus::Unsupported("storage_no_format_specialize");
         };
-        let guest_fmt = selector_to_engine_storage(selector);
-        let Some(shader_decl) = kernel_shader.interface().storage_image_format(t.binding) else {
-            crate::observe::fail(format!(
-                "compute_linux storage_format fail reason=reflection_format_missing pipe={} bind={} guest={guest_fmt:?} simg={}",
-                acc.pipeline_ref, t.binding, selector as u32
-            ));
-            return ComputeStatus::Unsupported("storage_reflection_format_missing");
-        };
-        let specialized = match pixel_format::specialize_storage_image_format(
-            guest_fmt,
-            shader_decl,
-            write_without_format,
-        ) {
-            Ok(format) => format,
-            Err(reason) => {
-                crate::observe::fail(format!(
-                        "compute_linux storage_format fail reason={reason} pipe={} bind={} spirv={shader_decl:?} guest={guest_fmt:?} simg={} guest_bpp={} shader_bpp={}",
-                        acc.pipeline_ref,
-                        t.binding,
-                        selector as u32,
-                        guest_fmt.bytes_per_texel(),
-                        shader_decl.bytes_per_texel()
-                    ));
-                return ComputeStatus::Unsupported("storage_format_specialize_mismatch");
-            }
-        };
-        storage_formats.push((t.binding, guest_fmt, shader_decl, specialized));
+        storage_formats.push((t.binding, guest_fmt));
     }
-    let specialization_requests: Vec<_> = storage_formats
-        .iter()
-        .map(|(binding, _, _, specialized)| (*binding, *specialized))
-        .collect();
-    let prepared_program = match kernel_shader.prepare_program(&specialization_requests) {
+    let prepared_program = match kernel_shader.prepare_program(&storage_formats) {
         Ok(program) => program,
         Err(error) => {
             crate::observe::Emit::decline("compute_linux_storage_format", &error)
@@ -3876,65 +3801,43 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     // synchronously in this call).
     for t in &mut staged_tex {
         if t.is_storage {
-            let Some(selector) = t.storage_selector else {
+            let Some(guest_fmt) = t.storage_format else {
                 crate::observe::fail(format!(
-                    "compute_linux unsupported storage_format reason=no_storage_selector pipe={} bind={} fmt={:#x}",
+                "compute_linux unsupported storage_format reason=no_storage_format pipe={} bind={} fmt={:#x}",
                     acc.pipeline_ref, t.binding, t.pixel_format
                 ));
-                return ComputeStatus::Unsupported("storage_no_selector_writeback");
+                return ComputeStatus::Unsupported("storage_no_format_writeback");
             };
-            let guest_fmt = selector_to_engine_storage(selector);
-            let Some((_, _, shader_decl, specialized)) = storage_formats
+            let Some((_, specialized)) = prepared_program
+                .storage_image_formats
                 .iter()
-                .find(|(binding, _, _, _)| *binding == t.binding)
+                .find(|(binding, _)| *binding == t.binding)
             else {
                 crate::observe::fail(format!(
-                    "compute_linux storage_format fail reason=spirv_format_specialize_internal pipe={} bind={} simg={}",
-                    acc.pipeline_ref, t.binding, selector as u32
+                    "compute_linux storage_format fail reason=spirv_format_specialize_internal pipe={} bind={} guest={guest_fmt:?}",
+                    acc.pipeline_ref, t.binding
                 ));
                 return ComputeStatus::Unsupported("storage_format_specialize_internal");
             };
-            // An `Unknown`-format storage image carries no SPIR-V texel format;
-            // its engine format (and thus VkImageView) is the guest surface's
-            // own format — here BGRA8Unorm → B8G8R8A8_UNORM — so the composite
-            // write lands in guest channel order (the R/B-swap fix). Every other
-            // format takes its engine format from the specialized SPIR-V format.
+            // `None` is metal2vulkan's reflected `ImageFormat::Unknown`; the
+            // view then uses the guest format whose exact read/write capability
+            // facts were supplied to translation.
             let shader_fmt = if specialized.is_none() {
-                // Always-on proxy for the BGRA-storage-composite R/B class: this
-                // line fires only on the corrected (without_format) path. Its
-                // absence together with a `degraded_rb_swap` line below is the
-                // regression signal that a swap is being emitted.
                 crate::observe::off(format!(
                     "compute_linux bgra_storage_composite pipe={} bind={} mode=without_format guest={guest_fmt:?} view=B8G8R8A8_UNORM {}x{}",
                     acc.pipeline_ref, t.binding, t.width, t.height
                 ));
                 guest_fmt
             } else {
-                let fmt = specialized.expect("concrete specialization checked above");
-                // Degraded path: a BGRA8Unorm guest fell back to a Rgba8Unorm
-                // view because `shaderStorageImageWriteWithoutFormat` is absent —
-                // the composite output is R/B-swapped. Fail-visible so the class
-                // is never silent on an unsupported device.
-                if matches!(
-                    guest_fmt,
-                    reims_vgpu_protocol::StorageImageFormat::Bgra8Unorm
-                ) && matches!(fmt, reims_vgpu_protocol::StorageImageFormat::Rgba8Unorm)
-                {
-                    crate::observe::fail(format!(
-                        "compute_linux bgra_storage_composite pipe={} bind={} mode=degraded_rb_swap reason=no_storage_image_write_without_format {}x{}",
-                        acc.pipeline_ref, t.binding, t.width, t.height
-                    ));
-                }
-                fmt
+                specialized.expect("concrete specialization checked above")
             };
-            if *specialized != Some(*shader_decl) {
+            let shader_decl = kernel_shader.interface().storage_image_format(t.binding);
+            if *specialized != shader_decl {
                 crate::observe::off(format!(
-                    "compute_linux storage_format_specialize pipe={} bind={} spirv={shader_decl:?} specialized={specialized:?} engine={shader_fmt:?} guest={guest_fmt:?} simg={} guest_bpp={} shader_bpp={}",
+                    "compute_linux storage_format_specialize pipe={} bind={} spirv={shader_decl:?} specialized={specialized:?} engine={shader_fmt:?} guest={guest_fmt:?} guest_bpp={}",
                     acc.pipeline_ref,
                     t.binding,
-                    selector as u32,
-                    guest_fmt.bytes_per_texel(),
-                    shader_decl.bytes_per_texel()
+                    guest_fmt.bytes_per_texel()
                 ));
             }
             let seed =
@@ -4048,29 +3951,16 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     // cannot tell them apart any more; `Ambiguous` is two variables on one
     // binding, which is its own defect and is not repaired by picking one.
     let bound: Vec<u32> = sampled_images.iter().map(|img| img.binding).collect();
-    for binding in kernel_shader.neutral_sampled_image_bindings(&bound) {
-        crate::observe::Emit::decline(
-            "compute_linux_sampled",
-            &NeutralSampledImage {
-                binding,
-                width: NEUTRAL_SAMPLED_IMAGE_EXTENT,
-                height: NEUTRAL_SAMPLED_IMAGE_EXTENT,
-            },
-        )
-        .field("pipe", acc.pipeline_ref)
-        .fail_once((u64::from(acc.pipeline_ref) << 32) | u64::from(binding));
+    for binding in kernel_shader.null_sampled_image_bindings(&bound) {
+        crate::runtime::drain::note_store_route("compute_null_texture");
         sampled_images.push(ComputeSampledImageResource {
             binding,
             array_element: 0,
             descriptor_count: 1,
             format: reims_vgpu_protocol::StorageImageFormat::Rgba8Unorm,
-            width: NEUTRAL_SAMPLED_IMAGE_EXTENT,
-            height: NEUTRAL_SAMPLED_IMAGE_EXTENT,
-            source: reims_vgpu_core::ComputeSampledImageSource::Bytes(pixel_format::solid_rgba8(
-                NEUTRAL_SAMPLED_IMAGE_EXTENT,
-                NEUTRAL_SAMPLED_IMAGE_EXTENT,
-                &[0.0; 4],
-            )),
+            width: 0,
+            height: 0,
+            source: reims_vgpu_core::ComputeSampledImageSource::Null,
             content: None,
         });
     }
@@ -4132,9 +4022,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 };
                 samplers.push(sampler);
             } else {
-                samplers.push(reims_vgpu_core::SamplerResource::normalized_default(
-                    reflected.binding,
-                ));
+                samplers.push(reims_vgpu_core::SamplerResource::null(reflected.binding));
             }
         }
     }
@@ -4320,12 +4208,14 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                         surface_offset,
                         span_end,
                         ..
-                    } => crate::runtime::mapping_write::note_iosurface_texture_landed(
-                        state,
-                        *mapping_id,
-                        *surface_offset,
-                        *span_end,
-                    ),
+                    } => {
+                        let _ = crate::runtime::mapping_write::note_iosurface_texture_landed(
+                            state,
+                            *mapping_id,
+                            *surface_offset,
+                            *span_end,
+                        );
+                    }
                     TextureWriteback::None => {}
                 }
                 true
@@ -4438,20 +4328,6 @@ fn spawn_compute_engine_stall_watchdog(
 /// against the pixel table they had to agree with. The call sites below are all
 /// `if let Some(..)` / `let Some(..) else`, so the adapters keep that shape; the
 /// decision itself now happens in exactly one place.
-/// The engine's storage format for a contract selector.
-///
-/// Total, because the translate layer's map is. It used to take the selector's
-/// `u32` ordinal and hand back an `Option`, and both of its call sites carried a
-/// `reason=selector_unknown` refusal for the `None` — a decline that could only
-/// have fired if two enums in this crate had drifted, which is not a thing the
-/// guest can cause and not a thing a run-time check should be watching for.
-/// Those two refusals are gone with the `Option`.
-fn selector_to_engine_storage(
-    selector: pixel_format::StorageImageSelector,
-) -> reims_vgpu_protocol::StorageImageFormat {
-    pixel_format::storage_image_format_from_selector(selector)
-}
-
 fn mtl_to_engine_sampled(format: u16) -> Option<reims_vgpu_protocol::StorageImageFormat> {
     // The *sampled* admission, not the storage one. Asking `storage_image` here
     // cost macOS 14 and macOS 15 a whole `DispatchThreadgroups` a boot on

@@ -13,8 +13,9 @@ pub(super) struct RequestPlanInputs {
     pub(super) sampled_images: Vec<reims_vgpu_core::SampledImageResource>,
     pub(super) samplers: Vec<reims_vgpu_core::SamplerResource>,
     pub(super) target_rgba8: Option<std::sync::Arc<Vec<u8>>>,
-    pub(super) target_guest_seed: Option<reims_vgpu_memory::GuestTargetSeed>,
+    pub(super) target_guest: Option<reims_vgpu_memory::GuestTargetPlan>,
     pub(super) target_clear: [f32; 4],
+    pub(super) color_load_action: reims_vgpu_core::ColorLoadAction,
     pub(super) target_seed_order: reims_vgpu_core::SeedOrder,
     pub(super) color_input: bool,
     pub(super) gva_alloc_generation: u64,
@@ -50,8 +51,9 @@ pub(super) fn plan_executor_request<M: HostMemory + HostOps>(
         sampled_images: images,
         samplers,
         target_rgba8,
-        target_guest_seed,
+        target_guest,
         target_clear,
+        color_load_action,
         target_seed_order: seed_order,
         color_input: frag_color_input,
         gva_alloc_generation,
@@ -210,17 +212,13 @@ pub(super) fn plan_executor_request<M: HostMemory + HostOps>(
         .map(|c| c.store_action.publishes_single_sample())
         .unwrap_or(true);
     resources.target_rgba8 = target_rgba8;
-    resources.target_guest_seed = target_guest_seed;
+    resources.target_guest = target_guest;
     resources.target_clear = target_clear;
+    resources.color_load_action = color_load_action;
     resources.target_seed_order = seed_order;
-    // A Store reads back; anything else skips it.
-    //
-    // A Store used to have a second option: when the host's page aliases
-    // were stable *and* the device could import a host pointer over them,
-    // it rendered into a BGRA resident with `skip_readback` and the
-    // import-present rail DMA'd that resident into the guest's pages. The
-    // import is gone, so the only way a Store's pixels reach the guest is
-    // the CPU writeback, and that needs them read back.
+    // Start from the portable Store answer. Target planning may turn readback
+    // off only while assigning the matching resident completion route; the
+    // executor then reports whether that resident was guest-backed or copied.
     resources.skip_readback = !store_is_store;
     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::AssembleTarget);
     let completion_route = plan_target_completion(
@@ -237,13 +235,9 @@ pub(super) fn plan_executor_request<M: HostMemory + HostOps>(
         w,
         h,
     )?;
-    // IOSurface texture Load used to have a GPU rail here — ~170 lines of front-frame
-    // retention policy resolving which resident image held the frame the
-    // guest computes its damage against. It was reachable only under
-    // `try_import`. A shared resident now keeps the guest allocation as
-    // its own backing, while a copied resident is always landed before its
-    // guest pages become a later seed, so neither needs a separate
-    // front-frame retention policy.
+    // The target plan already couples guest backing, LOAD content, resident
+    // identity, and completion. No parallel front-frame policy is assembled
+    // here.
     // The engine previously left `resources.blend = None`, selecting opaque replace for every
     // draw, so Load seeds (gray/wallpaper/logo bases) were wiped by sparse
     // dock/chrome layers that Metal would alpha-blend over the attachment.

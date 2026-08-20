@@ -260,14 +260,11 @@ pub(crate) struct ResourcePools {
     ///
     /// # What ends an entry's life
     ///
-    /// The slots named here live in `staging_live` / `gather_live`, so the map
-    /// is cleared wherever those are handed away or recycled —
-    /// [`ResourcePools::seal_entry`] and [`ResourcePools::recycle_staging`] —
-    /// and additionally whenever this device records a write **into guest
-    /// pages** ([`ResourcePools::note_guest_write_recorded`]). That last one is
-    /// the correctness edge: a bind after a Store into the same pages must see
-    /// what the Store wrote, and reusing a copy taken before it would not.
-    cb_bound_buffers: HashMap<(usize, u64, u64), (super::exec::BoundBuffer, CbBindOwner)>,
+    /// Every entry ends when its Vulkan command buffer seals or recycles.
+    /// Copied staging/gather entries additionally end at a Store; direct aliases
+    /// name the guest backing itself, so the Store changes their bytes without
+    /// changing their binding.
+    cb_bound_buffers: CbBufferMemo,
     /// Keys in `cb_bound_buffers` whose slot is **not yet filled**: a GPU gather
     /// was planned for them and the copy or dispatch that lands it has not been
     /// recorded into the command buffer.
@@ -286,10 +283,18 @@ pub(crate) struct ResourcePools {
     /// Tracked rather than solved by clearing the whole memo, because the entries
     /// published by draws that did complete are still correct and this rail is
     /// ~4.8 binds a draw.
-    cb_gather_owed: Vec<(usize, u64, u64)>,
+    cb_gather_owed: Vec<CbBindKey>,
+    /// Sampled images filled from guest pages in the command buffer now being
+    /// recorded. The owning slots remain in `sampled_live`; this map only names
+    /// them so a repeated binding in the same execution unit does not record a
+    /// second buffer-to-image copy.
+    cb_sampled_guest: HashMap<CbSampledGuestKey, (SampledSlot, CbSampledGuestOwner)>,
     /// Graphics state the command buffer now recording already carries — see
     /// [`CbGraphicsState`].
     cb_graphics: CbGraphicsState,
+    /// Imported-memory visibility already established in the command buffer
+    /// now recording.
+    cb_guest_visibility: CbGuestVisibility,
     /// Staging free-list hits / misses and the miss bucket histogram; see
     /// `note_staging_miss`. Measure-only.
     staging_hits: u64,
@@ -369,6 +374,9 @@ pub(crate) struct ResourcePools {
     compute_storage_order: VecDeque<ComputeStorageResidencyKey>,
     /// Identity-keyed resident target registry (workstream D).
     registry: HashMap<TargetIdentity, ResidentTargetSlot>,
+    /// Latest ordered writer for each imported backing represented by one or
+    /// more protocol view identities in `registry`.
+    guest_resident_authority: HashMap<GuestResidentBackingKey, TargetIdentity>,
     /// Insertion order for [`Self::registry`], oldest *created* at the front. A
     /// `VecDeque` because the retired cap-eviction sweep popped and rotated at
     /// the front; pressure recovery and released-resource maintenance only walk
@@ -532,7 +540,8 @@ pub(crate) struct ResourcePools {
     /// (generation bump / geometry change / LRU), held by (geometry, format) for
     /// reuse instead of destroyed. Kills the per-frame `vkCreateImage`+
     /// `vkAllocateMemory` storm a per-frame-generation target (video) would
-    /// otherwise pay (see [`TargetRecycleKey`]). Bounded per key.
+    /// otherwise pay (see [`TargetRecycleKey`]). The guest's live working set,
+    /// not an implementation capacity, bounds this pool.
     target_free: FreePool<TargetRecycleKey, FreeTargetImage>,
     /// Open draw batch: a ring slot whose CB is still recording deferred
     /// same-target draws (submit pending). While `Some`, that CB references
@@ -587,28 +596,17 @@ pub(crate) struct ResourcePools {
     /// because the answer the stamp needs is "is there any", and a quiesce
     /// retires the whole ring regardless.
     guest_reads_in_flight: bool,
-    /// Whether any command buffer submitted since the last quiesce **writes**
-    /// guest RAM when it executes.
-    ///
-    /// The mirror of `guest_reads_in_flight`, and it exists for the same
-    /// sentence read the other way round. `copy_target_to_guest_pages` used to
-    /// wait its own fence before returning, which made the writeback rail one
-    /// blocking GPU round trip per landed window: 369 fences a second at
-    /// 1 360 us each, of which the device's own timestamps priced only 636 us as
-    /// the copy executing. The remaining 724 us was submit-to-start plus
-    /// signal-to-wake, paid once per window, and it was 267 ms of every second.
-    ///
-    /// Deferring the wait does not weaken the ordering the stamp needs, because
-    /// that ordering was never "each copy has landed by the time its own
-    /// function returns" — it is "every copy has landed before the guest is told
-    /// anything". Recording the debt here and settling it at the same choke
-    /// points [`ResourcePools::quiesce_guest_reads`] is settled at collapses N
-    /// waits into one and lets the copies pipeline against each other on the
-    /// GPU instead of stopping the queue between them.
-    guest_writes_in_flight: bool,
-    /// Residents pinned by guest-page copies in the command buffer currently
-    /// being recorded. [`ResourcePools::seal_entry`] transfers them to that
-    /// submission's [`PendingGpuCleanup`].
+    /// Guest-write ledger tokens recorded into the command buffer currently
+    /// being built. `seal_entry` transfers them to its ring cleanup, which
+    /// retires each token with the fence that owns the write.
+    /// One visibility token per exact page set written by the command buffer
+    /// currently being recorded. Repeated draws into the same imported target
+    /// share the submission and therefore share its one retirement point.
+    guest_write_tokens_live: HashMap<reims_vgpu_memory::GuestWritePages, super::GuestWriteToken>,
+    /// Residents used by the command buffer currently being recorded.
+    /// [`ResourcePools::seal_entry`] transfers their pins to that submission's
+    /// [`PendingGpuCleanup`]. This includes both images read directly as sampled
+    /// guest storage and images copied into guest pages.
     ///
     /// A window's flush used to unpin its resident as soon as the copy returned,
     /// which was safe only because the copy had already executed by then. With
@@ -619,8 +617,8 @@ pub(crate) struct ResourcePools {
     ///
     /// Cannot strand a pin: every entry that can submit passes through
     /// `seal_entry`, and every sealed cleanup belongs to one retiring slot.
-    guest_write_pins_live: Vec<TargetIdentity>,
-    /// The compute-storage half of `guest_write_pins_live`, keyed in the other
+    resident_pins_live: Vec<TargetIdentity>,
+    /// The compute-storage half of `resident_pins_live`, keyed in the other
     /// registry. Separate because the release has to reach the registry that
     /// holds the image; identical in discipline, and it travels to the same ring
     /// slot in the same `seal_entry`.
@@ -951,13 +949,33 @@ pub(crate) struct OpenBatch {
     // The absence of the field is what stops one being accumulated again.
 }
 
+#[derive(Clone, Debug, Default)]
+struct CbGuestVisibility {
+    cb: Option<vk::CommandBuffer>,
+    host_visible: bool,
+    gpu_write_since_barrier: bool,
+}
+
 /// One in-flight ring slot: a primary CB, its fence (created unsignaled;
 /// reset immediately after every successful wait), and — while the CB is in
 /// flight — the cleanup its entry owes.
+enum SlotSubmission {
+    /// No host driver call currently owns the fence. `pending` separately says
+    /// whether submitted GPU work still owns the command buffer.
+    HostOwned,
+    /// The queue thread has accepted the submit and owns the fence until this
+    /// receipt returns.
+    QueueOwned(super::queue_owner::PendingQueueSubmit),
+    /// The driver rejected the submit, so this fence can never signal and must
+    /// not be waited or reset.
+    Failed(vk::Result),
+}
+
 struct CmdSlot {
     cmd_buf: vk::CommandBuffer,
     fence: vk::Fence,
     pending: Option<PendingGpuCleanup>,
+    submission: SlotSubmission,
     /// Whether this slot's GPU timestamp pair has been written, and how far.
     /// Read and cleared when the slot retires, which is the first moment the
     /// fence makes the queries readable. See [`super::gpu_span`].
@@ -1020,15 +1038,26 @@ pub(crate) enum DeferredHandle {
         view: vk::ImageView,
         memory: vk::DeviceMemory,
     },
+    /// An image alias-bound into a guest allocation. The parent memory belongs
+    /// to `HostRamImports`; destroying this child releases only its view/image
+    /// and one parent-child lifetime edge.
+    GuestImage {
+        image: vk::Image,
+        view: vk::ImageView,
+        import: std::sync::Arc<reims_vgpu_memory::GuestRamImport>,
+    },
     /// An imported guest allocation and its whole-span buffer.
     GuestAllocation(host_ram::ImportedHostRam),
+    /// Fence barrier captured when the guest ends a parent allocation while a
+    /// child image remains. Parent and child may finish in either order.
+    GuestAllocationBarrier(reims_vgpu_memory::ImportId),
     /// A sampled-cache slot released at resource deletion or cache discard.
     /// The drain returns it to `sampled_free` for reuse only after in-flight
     /// submissions are done with it.
     RecycleSampled(SampledSlot),
     /// A resident render-target image displaced from the registry (generation
     /// bump / geometry change / LRU). Instead of destroying it, the drain
-    /// returns it to `target_free` for reuse (bounded per key) so a per-frame
+    /// returns it to `target_free` for reuse so a per-frame
     /// content-changing target (video output) re-renders into a recycled image
     /// instead of paying a fresh `vkCreateImage`+`vkAllocateMemory` every
     /// frame. Same in-flight-safe deferral as destroys: an in-flight CB may
@@ -1055,11 +1084,12 @@ impl DeferredHandle {
     /// one, which is the only thing that makes this total.
     fn destroyed_view(&self) -> Option<vk::ImageView> {
         match self {
-            Self::Image { view, .. } => Some(*view),
+            Self::Image { view, .. } | Self::GuestImage { view, .. } => Some(*view),
             Self::RecycleSampled(slot) => Some(slot.view),
             Self::RecycleTarget(img) => Some(img.view),
             Self::ImageView(view) => Some(*view),
             Self::GuestAllocation(_)
+            | Self::GuestAllocationBarrier(_)
             | Self::Framebuffer(_)
             | Self::Pipeline(_)
             | Self::PipelineLayout(_)
@@ -1100,9 +1130,29 @@ impl ResourcePools {
                     device.free_memory(memory, None);
                 }
             }
+            DeferredHandle::GuestImage {
+                image,
+                view,
+                import,
+            } => {
+                device.destroy_image_view(view, None);
+                device.destroy_image(image, None);
+                if let Some(parent) = self.host_ram_imports.release_child(&import) {
+                    crate::telemetry::note_route("guest_import_parent_released");
+                    let completed = parent.destroy(device);
+                    self.completed_guest_imports.push(completed);
+                }
+            }
             DeferredHandle::GuestAllocation(parent) => {
                 let import = parent.destroy(device);
                 self.completed_guest_imports.push(import);
+            }
+            DeferredHandle::GuestAllocationBarrier(import_id) => {
+                if let Some(parent) = self.host_ram_imports.retirement_fences_cleared(import_id) {
+                    crate::telemetry::note_route("guest_import_parent_released");
+                    let completed = parent.destroy(device);
+                    self.completed_guest_imports.push(completed);
+                }
             }
             DeferredHandle::RecycleSampled(slot) => {
                 device.destroy_image_view(slot.view, None);
@@ -1153,11 +1203,13 @@ pub(crate) struct PendingGpuCleanup {
     sampled: Vec<SampledSlot>,
     attachment_snapshots: Vec<SampledSlot>,
     storage_images: Vec<StorageImageSlot>,
-    /// Resident pins held by guest-page copies in this submission. The slot's
-    /// fence is their lifetime boundary.
+    /// Resident pins held by sampled aliases and guest-page copies in this
+    /// submission. The slot's fence is their lifetime boundary.
     unpin_residents: Vec<TargetIdentity>,
     /// The same, in the compute-storage registry.
     unpin_compute_residents: Vec<reims_vgpu_core::ComputeStorageResidencyKey>,
+    /// Visibility ledger entries owned by this submission.
+    guest_write_tokens: Vec<super::GuestWriteToken>,
 }
 
 /// What one sealed entry hands back: the cleanup its ring slot owes once the
@@ -1180,6 +1232,7 @@ pub(crate) struct SampledSlot {
     pub view: vk::ImageView,
     pub width: u32,
     pub height: u32,
+    pub mip_levels: u32,
     pub layers: u32,
     pub volume: bool,
     pub cube: bool,
@@ -1197,6 +1250,33 @@ pub(crate) struct SampledSlot {
     /// channels. Identity is the overwhelmingly common case and keeps its own
     /// free list, so a rare swizzled bind cannot fragment the hot one.
     pub swizzle: reims_vgpu_protocol::SwizzlePlan,
+}
+
+/// Canonical identity of one directly imported resident allocation.
+///
+/// Protocol target identities name views and may multiply while an older view
+/// remains pinned by an in-flight submission. This key names the storage those
+/// views share, including the image creation fields required for compatible
+/// interpretation. The authority map beside the registry records which view's
+/// ordered write most recently defined that storage's contents.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct GuestResidentBackingKey {
+    import: reims_vgpu_memory::ImportId,
+    backing: reims_vgpu_memory::GuestTargetBacking,
+    width: u32,
+    height: u32,
+    sample_count: u32,
+    format: vk::Format,
+}
+
+#[derive(Clone)]
+pub(crate) enum GuestSampledUse {
+    Resident {
+        identity: TargetIdentity,
+        image: vk::Image,
+        view: vk::ImageView,
+        access: ResidentAccess,
+    },
 }
 
 /// Which lifetime owns a newly acquired sampled image. Upload images may enter
@@ -1220,6 +1300,7 @@ enum SampledTransientUse {
 pub(crate) struct SampledKey {
     pub(crate) width: u32,
     pub(crate) height: u32,
+    pub(crate) mip_levels: u32,
     pub(crate) layers: u32,
     pub(crate) volume: bool,
     pub(crate) cube: bool,
@@ -1241,6 +1322,7 @@ impl SampledKey {
         Self {
             width: r.width,
             height: r.height,
+            mip_levels: 1,
             layers: r.layers,
             volume: r.volume,
             cube: r.cube,
@@ -1271,6 +1353,7 @@ impl SampledSlot {
         SampledKey {
             width: self.width,
             height: self.height,
+            mip_levels: self.mip_levels,
             layers: self.layers,
             volume: self.volume,
             cube: self.cube,
@@ -1293,6 +1376,7 @@ impl SampledSlot {
             view: self.view,
             width: self.width,
             height: self.height,
+            mip_levels: self.mip_levels,
             layers: self.layers,
             volume: self.volume,
             cube: self.cube,
@@ -1557,6 +1641,9 @@ pub(crate) struct NonPinnedTotals {
 pub(crate) enum ResidentAccess {
     /// Created or recycled; nothing has touched the image.
     Untouched,
+    /// Guest/CPU bytes are the current contents of a directly imported image.
+    /// The first GPU consumer must make host writes available.
+    HostWrite(vk::ImageLayout),
     /// A render pass wrote it as a colour attachment and left it in that pass's
     /// `final_layout` — `TRANSFER_SRC_OPTIMAL` for a primary target,
     /// `COLOR_ATTACHMENT_OPTIMAL` for an MRT secondary.
@@ -1622,6 +1709,7 @@ impl ResidentAccess {
     pub(crate) fn covered_by_pass_entry(self) -> bool {
         match self {
             Self::Untouched => false,
+            Self::HostWrite(_) => false,
             Self::ColorWrite(_)
             | Self::ColorFeedback(_)
             | Self::ShaderRead(_)
@@ -1638,6 +1726,7 @@ impl ResidentAccess {
     pub(crate) fn layout(self) -> vk::ImageLayout {
         match self {
             Self::Untouched => vk::ImageLayout::UNDEFINED,
+            Self::HostWrite(layout) => layout,
             Self::ColorWrite(layout) => layout,
             Self::ColorFeedback(layout) | Self::ShaderRead(layout) | Self::TransferRead(layout) => {
                 layout
@@ -1668,6 +1757,7 @@ impl ResidentAccess {
                 vk::PipelineStageFlags::TOP_OF_PIPE,
                 vk::AccessFlags::empty(),
             ),
+            Self::HostWrite(_) => (vk::PipelineStageFlags::HOST, vk::AccessFlags::HOST_WRITE),
             Self::ColorWrite(_) => (
                 vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                 vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
@@ -1694,11 +1784,31 @@ impl ResidentAccess {
 
 /// Ownership route for a resident image's memory.
 ///
-/// Render targets are engine-owned optimally tiled images. Guest memory is
-/// transport for seed and Store data, never the attachment allocation itself.
-#[derive(Clone, Copy, Debug)]
+/// A resident is either an engine allocation or a child image over the guest's
+/// canonical imported allocation. The variant owns the destruction route.
+#[derive(Clone, Debug)]
 pub(crate) enum ResidentMemory {
     Recyclable(vk::DeviceMemory),
+    GuestImported {
+        memory: reims_vgpu_memory::GuestTargetMemory,
+        write_pages: reims_vgpu_memory::GuestWritePages,
+    },
+}
+
+impl ResidentMemory {
+    pub(crate) fn guest_memory(&self) -> Option<&reims_vgpu_memory::GuestTargetMemory> {
+        match self {
+            Self::Recyclable(_) => None,
+            Self::GuestImported { memory, .. } => Some(memory),
+        }
+    }
+
+    pub(crate) fn guest_write_pages(&self) -> Option<&reims_vgpu_memory::GuestWritePages> {
+        match self {
+            Self::Recyclable(_) => None,
+            Self::GuestImported { write_pages, .. } => Some(write_pages),
+        }
+    }
 }
 
 /// Process-unique identity of one concrete registry allocation.
@@ -1721,6 +1831,10 @@ pub(crate) struct ResidentTargetSlot {
     pub incarnation: ResidentIncarnation,
     pub image: vk::Image,
     pub memory: ResidentMemory,
+    /// The guest backing this slot attempted to materialize, whether admission
+    /// succeeded or structurally declined. Equality prevents retry/recreate
+    /// loops while still allowing a replacement allocation to be considered.
+    pub guest_backing: Option<reims_vgpu_memory::GuestTargetBacking>,
     pub view: vk::ImageView,
     /// Additional compatible-format views over `image`, retained for the
     /// resident's lifetime. A texture view changes interpretation, not storage;
@@ -2014,6 +2128,7 @@ impl ResidentTargetSlot {
     /// stays 0, and the desktop composites. This workload never made the
     /// crossing this refuses, which is why it had never surfaced as a
     /// validation error.
+    #[cfg(test)]
     pub(crate) fn reusable_for(
         &self,
         width: u32,
@@ -2022,11 +2137,50 @@ impl ResidentTargetSlot {
         generation: u64,
         format: translate::pixel::ResidentFormat,
     ) -> bool {
+        self.reusable_for_materialization(
+            width,
+            height,
+            sample_count,
+            generation,
+            format,
+            RequestedMaterialization::new(None, false),
+        )
+    }
+
+    pub(crate) fn reusable_for_materialization(
+        &self,
+        width: u32,
+        height: u32,
+        sample_count: u32,
+        generation: u64,
+        format: translate::pixel::ResidentFormat,
+        requested: RequestedMaterialization,
+    ) -> bool {
         self.width == width
             && self.height == height
             && self.sample_count == sample_count
             && self.generation == generation
             && self.format.allocation() == format.allocation()
+            && (self.guest_backing == requested.guest_backing
+                || requested.preserve_existing_content)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RequestedMaterialization {
+    guest_backing: Option<reims_vgpu_memory::GuestTargetBacking>,
+    preserve_existing_content: bool,
+}
+
+impl RequestedMaterialization {
+    pub(crate) fn new(
+        guest_backing: Option<reims_vgpu_memory::GuestTargetBacking>,
+        preserve_existing_content: bool,
+    ) -> Self {
+        Self {
+            guest_backing,
+            preserve_existing_content,
+        }
     }
 }
 
@@ -2050,7 +2204,7 @@ struct TargetRecycleKey {
 /// bump / geometry change / LRU eviction) and held for reuse instead of
 /// destroyed. The framebuffer is NOT retained — it binds one specific
 /// `render_pass`, is disposed separately, and a reused image builds a fresh
-/// one. Carries its own geometry so [`ResourcePools::try_recycle_target`] can
+/// one. Carries its own geometry so [`ResourcePools::admit_target`] can
 /// bucket it without a separate key argument (mirrors [`SampledSlot`]).
 pub(crate) struct FreeTargetImage {
     image: vk::Image,
@@ -2087,49 +2241,6 @@ const MAINTENANCE_INTERVAL_MS: u64 = 100;
 /// there when the next draw samples one of them, without becoming a second
 /// registry. Diagnostic memory only: a `TargetIdentity` and a discriminant.
 const RECLAIM_HISTORY: usize = 256;
-/// Max recycled sampled slots retained per geometry key in `sampled_free`. A
-/// content-changing input only needs a few live at once (the CB ring is 3-deep
-/// plus the one being acquired); beyond that a recycled slot is destroyed so a
-/// one-off geometry cannot pin memory for the whole guest lifetime. Bounds total
-/// retained memory to ~(distinct geometries × cap × slot size).
-const SAMPLED_FREE_CAP_PER_KEY: usize = 4;
-/// **Global** cap on `sampled_free` across all keys. The per-key cap alone does
-/// not bound a *diverse* burst: a YouTube page-load evicts hundreds of distinct
-/// sampled geometries (thumbnails), each ≤ the per-key cap, so the pool grew to
-/// ~593 images, each pinning a slab sub-allocation so no block could ever empty
-/// (`block_frees=0`) — the VRAM-return stall. The 593 came off a `vram sfree=`
-/// census line that no longer exists in the tree, so it is history rather than a
-/// number a boot can be asked for; `block_frees` is still live. This
-/// global cap keeps the recycle pool from exceeding the working set; evictions
-/// past it are destroyed (freeing their slab range) instead of cached.
-const SAMPLED_FREE_CAP_TOTAL: usize = 64;
-/// A draw can feed back through at most the plain 2D identity views of the
-/// attachments its render pass carries: the decoded color table plus its one
-/// depth attachment. The producer shares duplicate binds of one attachment and
-/// routes every other view shape through the general sampled pool, making the
-/// largest dedicated snapshot population `draws × attachments` rather than
-/// `draws × texture-table width`.
-const fn attachment_snapshot_batch_cap(draws: u64) -> usize {
-    draws as usize * (reims_vgpu_protocol::MAX_COLOR_ATTACHMENTS + 1)
-}
-
-const ATTACHMENT_SNAPSHOT_BATCH_CAP: usize = attachment_snapshot_batch_cap(BATCH_MAX_DRAWS);
-/// Every attachment may have the same geometry and view key, so the per-key
-/// bound is the whole batch population rather than only its draw count.
-const ATTACHMENT_SNAPSHOT_FREE_CAP_PER_KEY: usize = ATTACHMENT_SNAPSHOT_BATCH_CAP;
-/// A retired command buffer cannot return more snapshots than the batch bound,
-/// regardless of how many keys divide them.
-const ATTACHMENT_SNAPSHOT_FREE_CAP_TOTAL: usize = ATTACHMENT_SNAPSHOT_BATCH_CAP;
-/// Max recycled resident-target images retained per (geometry, format) key in
-/// `target_free`. A per-frame content-changing target only needs a few live at
-/// once (the CB ring is 3-deep plus the frame being acquired); beyond that a
-/// recycled image is destroyed so a one-off geometry cannot pin VRAM for the
-/// guest lifetime. Bounds retained memory to ~(distinct geometries × cap ×
-/// image size).
-const TARGET_FREE_CAP_PER_KEY: usize = 4;
-/// **Global** cap on `target_free` across all keys — same diverse-burst reasoning
-/// as `SAMPLED_FREE_CAP_TOTAL`.
-const TARGET_FREE_CAP_TOTAL: usize = 32;
 /// Live entries in the scratch target pool `targets`, past which
 /// `acquire_target` evicts the oldest and destroys its image, view and
 /// framebuffer.
@@ -2182,77 +2293,29 @@ const TARGET_FREE_CAP_TOTAL: usize = 32;
 /// That is a thrash rather than a cache, and it is a policy question the bands
 /// above are what decide is worth answering.
 const TARGET_POOL_MAX_ENTRIES: usize = 32;
-/// Max recycled transient compute-storage images retained per geometry key in
-/// `storage_image_free`. Same reuse logic as the render recycle pools: a
-/// same-geometry compute dispatch reuses a pooled image instead of a fresh
-/// `vkAllocateMemory`, but a diverse workload cannot hoard more than this per
-/// geometry.
-const STORAGE_IMAGE_FREE_CAP_PER_KEY: usize = 4;
-/// **Global** cap on `storage_image_free` across all keys. Lower than the render
-/// pools (`SAMPLED_FREE_CAP_TOTAL=64` / `TARGET_FREE_CAP_TOTAL=32`) because
-/// compute-storage residency churns far less than per-frame render targets — and,
-/// crucially, unlike the slab-backed render pools each storage slot is a
-/// standalone `vkAllocateMemory` (not a slab sub-range), so an *uncapped* pool
-/// leaks whole device allocations, not just slab fragmentation. Before this cap
-/// the per-dispatch retire path (`drain_cleanup`) pushed unconditionally, so an
-/// all-new-geometry compute workload (a diff-heavy / CoreImage / blur burst) grew
-/// the pool without bound. Past the cap the displaced slot is destroyed, freeing
-/// its VkDeviceMemory.
-const STORAGE_IMAGE_FREE_CAP_TOTAL: usize = 16;
-/// A bounded per-key free list of reusable GPU objects, with the census that
-/// says whether its own caps are what is limiting reuse.
+/// A geometry-keyed free list of reusable GPU objects.
 ///
-/// # One discipline, several pools
-///
-/// Resident targets, sampled images, attachment snapshots and transient
-/// compute storage all want the same thing: hand a retired object back keyed by
-/// the geometry that makes it reusable, take one back on the next create of
-/// that geometry, and bound the hoard two ways. That policy used to be written
-/// out repeatedly, once per pool, each with its own four counters — a shape
-/// whose own doc comments said "mirrors `try_recycle_sampled`". It is written
-/// once here, and the pools differ only in their key type and their two caps.
-///
-/// Transient depth joins the same discipline too. `create_transient_depth` is
-/// the one render target in this engine that never recycles, and it allocates
-/// the most by two orders of magnitude; its doc asks for exactly this — one
-/// discipline the depth path also uses, not another bespoke pool beside the
-/// others.
-///
-/// # The two caps
-///
-/// `total` is tested first and it is the one that matters. The per-key cap
-/// alone does not bound a *diverse* burst: hundreds of distinct keys, each on
-/// its own well under `per_key`, filled `sampled_free` to ~593 images, every one
-/// pinning a slab sub-allocation so no block could ever empty. The 593 is
-/// history — see `SAMPLED_FREE_CAP_TOTAL` for which half of that reading a boot
-/// can still produce. `per_key` is the second bound, for one geometry churning.
-///
-/// A high `cap_drops` beside a high `allocs` is the reading that says a cap,
-/// rather than the workload, is what stopped the reuse.
+/// Entries have no numeric eviction bound: a reusable object is retained until
+/// idle maintenance trims it or device teardown drains the pool. That makes
+/// active-workload reuse follow the guest's actual object churn rather than an
+/// unrelated capacity that turns a larger workload into an allocation storm.
 struct FreePool<K, V> {
     free: HashMap<K, Vec<V>>,
-    per_key: usize,
-    total: usize,
     /// A take that found an entry to reuse.
     hits: u64,
     /// A take that found none, so the caller had to create.
     allocs: u64,
     /// Entries admitted for reuse.
     admits: u64,
-    /// Entries handed back for destruction because a cap was full.
-    cap_drops: u64,
 }
 
 impl<K: std::hash::Hash + Eq, V> FreePool<K, V> {
-    fn new(per_key: usize, total: usize) -> Self {
+    fn new() -> Self {
         Self {
             free: HashMap::new(),
-            per_key,
-            total,
             hits: 0,
             allocs: 0,
             admits: 0,
-            cap_drops: 0,
         }
     }
 
@@ -2261,23 +2324,10 @@ impl<K: std::hash::Hash + Eq, V> FreePool<K, V> {
         self.free.values().map(Vec::len).sum()
     }
 
-    /// Offer a retired entry for reuse. `None` means it was admitted; `Some(v)`
-    /// hands it back because a cap was full and the caller must destroy it.
-    /// Device-free, so the routing is unit-testable without a GPU.
-    fn admit(&mut self, key: K, entry: V) -> Option<V> {
-        if self.len() >= self.total {
-            self.cap_drops += 1;
-            return Some(entry);
-        }
-        let list = self.free.entry(key).or_default();
-        if list.len() < self.per_key {
-            list.push(entry);
-            self.admits += 1;
-            None
-        } else {
-            self.cap_drops += 1;
-            Some(entry)
-        }
+    /// Offer a retired entry for reuse.
+    fn admit(&mut self, key: K, entry: V) {
+        self.free.entry(key).or_default().push(entry);
+        self.admits += 1;
     }
 
     /// Return an entry with **no cap check**.
@@ -2328,9 +2378,10 @@ impl<K: std::hash::Hash + Eq, V> FreePool<K, V> {
         self.free.get(key).map_or(0, Vec::len)
     }
 
-    /// `(hits, allocs, admits, cap_drops)` for the counter snapshot.
+    /// `(hits, allocs, admits, cap_drops)` for the counter snapshot. The final
+    /// field remains zero for log-schema compatibility with older captures.
     fn stats(&self) -> (u64, u64, u64, u64) {
-        (self.hits, self.allocs, self.admits, self.cap_drops)
+        (self.hits, self.allocs, self.admits, 0)
     }
 }
 
@@ -2665,9 +2716,39 @@ fn batch_max_draws(topology: crate::memory::MemoryTopology) -> u64 {
     dead_code,
     reason = "held for its Drop, never read — the strong reference is the whole contribution"
 )]
-pub(crate) enum CbBindOwner {
+pub(crate) enum CbBindAllocation {
     Bytes(std::sync::Arc<Vec<u8>>),
     Runs(std::sync::Arc<Vec<super::types::GuestRun>>),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CbBindOwner {
+    #[allow(
+        dead_code,
+        reason = "held for Drop; the allocation address is part of the memo key"
+    )]
+    allocation: CbBindAllocation,
+    #[allow(
+        dead_code,
+        reason = "held for Drop; checked imports must outlive a command-buffer memo entry"
+    )]
+    imports: Option<std::sync::Arc<Vec<reims_vgpu_memory::GuestWindowRun>>>,
+}
+
+type CbBindKey = (usize, u64, u64);
+
+/// Buffer bindings addressable by the command buffer now being recorded.
+///
+/// Direct aliases, immutable copies, and guest-mutable snapshots have different
+/// invalidation contracts, so the owner stores them in separate maps. A guest
+/// operation boundary keeps the first two and invalidates the third without
+/// scanning retained entries. Seal and recycle end every command-buffer-local
+/// lifetime.
+#[derive(Default)]
+struct CbBufferMemo {
+    aliases: HashMap<CbBindKey, (super::exec::BoundBuffer, CbBindOwner)>,
+    immutable: HashMap<CbBindKey, (super::exec::BoundBuffer, CbBindOwner)>,
+    guest_snapshots: HashMap<CbBindKey, (super::exec::BoundBuffer, CbBindOwner)>,
 }
 
 /// One bind's identity, inseparable from the allocation that identity names.
@@ -2683,8 +2764,127 @@ pub(crate) enum CbBindOwner {
 /// it buys an invariant a reviewer would otherwise have to re-derive.
 #[derive(Clone, Debug)]
 pub(crate) struct CbBind {
-    key: (usize, u64, u64),
+    key: CbBindKey,
     owner: CbBindOwner,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct CbSampledGuestKey {
+    storage: CbSampledGuestStorageKey,
+    source_offset: u64,
+    total_len: u64,
+    row_length_texels: u32,
+    sampled: SampledKey,
+    allocation: Option<reims_vgpu_memory::GuestImageAllocationLayout>,
+    view: Option<reims_vgpu_memory::GuestImageViewRange>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum CbSampledGuestStorageKey {
+    Imported(Vec<(u64, reims_vgpu_memory::ImportId, u64, u64, u64, u64)>),
+    HostRuns(Vec<(usize, u64)>),
+}
+
+/// One live guest sampled source and the exact image view built from it.
+///
+/// The strong source owners are part of the value so every host alias and
+/// imported RAM window named by the key remains live while it is answerable.
+#[derive(Clone, Debug)]
+pub(crate) struct CbSampledGuest {
+    key: CbSampledGuestKey,
+    owner: CbSampledGuestOwner,
+}
+
+#[derive(Clone, Debug)]
+#[allow(
+    dead_code,
+    reason = "held for Drop; the source aliases and imports must outlive the command-buffer memo"
+)]
+struct CbSampledGuestOwner {
+    runs: std::sync::Arc<Vec<super::types::GuestRun>>,
+    imports: Option<CbSampledGuestImports>,
+    physical_pages: Option<reims_vgpu_memory::GuestPageSet>,
+}
+
+#[derive(Clone, Debug)]
+#[allow(
+    dead_code,
+    reason = "held for Drop; the checked imports must outlive the command-buffer memo"
+)]
+struct CbSampledGuestImports(std::sync::Arc<Vec<reims_vgpu_memory::GuestWindowRun>>);
+
+impl CbSampledGuest {
+    pub(crate) fn runs(sampled: SampledKey, source: &super::types::GuestRunSource) -> Self {
+        Self::new(sampled, source, None, None)
+    }
+
+    pub(crate) fn image(sampled: SampledKey, source: &reims_vgpu_memory::GuestImageSource) -> Self {
+        Self::new(
+            sampled,
+            &source.transfer,
+            Some(source.allocation.clone()),
+            Some(source.view),
+        )
+    }
+
+    fn new(
+        sampled: SampledKey,
+        source: &super::types::GuestRunSource,
+        allocation: Option<reims_vgpu_memory::GuestImageAllocationLayout>,
+        view: Option<reims_vgpu_memory::GuestImageViewRange>,
+    ) -> Self {
+        let (storage, imports) = match source.pages.as_ref() {
+            Some(pages) => {
+                let key = pages
+                    .iter()
+                    .map(|run| {
+                        let bound = run
+                            .guest
+                            .bound()
+                            .expect("GuestRef retains the import that checked its slice");
+                        (
+                            run.window_offset,
+                            run.guest.import().id(),
+                            bound.offset,
+                            bound.len,
+                            run.guest.head(),
+                            run.guest.requested(),
+                        )
+                    })
+                    .collect();
+                (
+                    CbSampledGuestStorageKey::Imported(key),
+                    Some(CbSampledGuestImports(std::sync::Arc::clone(pages))),
+                )
+            }
+            None => (
+                CbSampledGuestStorageKey::HostRuns(
+                    source
+                        .runs
+                        .iter()
+                        .map(|run| (run.host_ptr, run.len))
+                        .collect(),
+                ),
+                None,
+            ),
+        };
+        Self {
+            key: CbSampledGuestKey {
+                storage,
+                source_offset: source.source_offset,
+                total_len: source.total_len,
+                row_length_texels: source.row_length_texels,
+                sampled,
+                allocation,
+                view,
+            },
+            owner: CbSampledGuestOwner {
+                runs: std::sync::Arc::clone(&source.runs),
+                imports,
+                physical_pages: source.physical_pages.clone(),
+            },
+        }
+    }
 }
 
 impl CbBind {
@@ -2694,11 +2894,17 @@ impl CbBind {
         match content {
             super::types::BufferContent::Bytes(b) => Self {
                 key: Self::key_of(content),
-                owner: CbBindOwner::Bytes(std::sync::Arc::clone(b)),
+                owner: CbBindOwner {
+                    allocation: CbBindAllocation::Bytes(std::sync::Arc::clone(b)),
+                    imports: None,
+                },
             },
             super::types::BufferContent::GuestRuns(src) => Self {
                 key: Self::key_of(content),
-                owner: CbBindOwner::Runs(std::sync::Arc::clone(&src.runs)),
+                owner: CbBindOwner {
+                    allocation: CbBindAllocation::Runs(std::sync::Arc::clone(&src.runs)),
+                    imports: src.pages.clone(),
+                },
             },
         }
     }
@@ -2717,7 +2923,7 @@ impl CbBind {
     /// is that a raw key never reaches *that* map's API, and it is enforced by
     /// [`ResourcePools::note_cb_bound_buffer`] taking a [`CbBind`] by value —
     /// which this cannot produce.
-    pub(crate) fn key_of(content: &super::types::BufferContent) -> (usize, u64, u64) {
+    pub(crate) fn key_of(content: &super::types::BufferContent) -> CbBindKey {
         match content {
             super::types::BufferContent::Bytes(b) => {
                 (std::sync::Arc::as_ptr(b) as usize, 0, b.len() as u64)
@@ -2733,12 +2939,12 @@ impl CbBind {
     /// The `(allocation address, source offset, length)` identity. The working
     /// set census consumes the allocation and length fields for gathered
     /// exact-window sources; command-buffer reuse consumes all three.
-    pub(crate) fn key(&self) -> (usize, u64, u64) {
+    pub(crate) fn key(&self) -> CbBindKey {
         self.key
     }
 
     /// Split into what the map stores under it.
-    fn into_parts(self) -> ((usize, u64, u64), CbBindOwner) {
+    fn into_parts(self) -> (CbBindKey, CbBindOwner) {
         (self.key, self.owner)
     }
 }
@@ -3798,7 +4004,10 @@ mod staging_mapping_tests {
 
 #[cfg(test)]
 mod resident_reuse_tests {
-    use super::{ResidentAccess, ResidentIncarnation, ResidentMemory, ResidentTargetSlot};
+    use super::{
+        RequestedMaterialization, ResidentAccess, ResidentIncarnation, ResidentMemory,
+        ResidentTargetSlot,
+    };
     use crate::translate;
     use ash::vk;
 
@@ -3808,6 +4017,7 @@ mod resident_reuse_tests {
             incarnation: ResidentIncarnation::allocate(),
             image: vk::Image::null(),
             memory: ResidentMemory::Recyclable(vk::DeviceMemory::null()),
+            guest_backing: None,
             view: vk::ImageView::null(),
             alternate_views: Vec::new(),
             framebuffer: vk::Framebuffer::null(),
@@ -3827,6 +4037,49 @@ mod resident_reuse_tests {
             gpu_only_content: false,
             last_touch_ms: 0,
         }
+    }
+
+    fn backing(host: usize) -> reims_vgpu_memory::GuestTargetBacking {
+        reims_vgpu_memory::GuestTargetBacking {
+            allocation_host_ptr: host,
+            allocation_len: 0x4000,
+            resource_offset: 0,
+            resource_len: 0x4000,
+            plane_offset: 0,
+            row_pitch: 256,
+        }
+    }
+
+    #[test]
+    fn materialization_changes_only_replace_content_when_the_draw_can_discard_it() {
+        let format = translate::pixel::ResidentFormat::of(translate::pixel::SCANOUT_FORMAT);
+        let mut resident = slot(64, 32, 7, translate::pixel::SCANOUT_FORMAT);
+        resident.guest_backing = Some(backing(0x1000));
+
+        assert!(resident.reusable_for_materialization(
+            64,
+            32,
+            1,
+            7,
+            format,
+            RequestedMaterialization::new(Some(backing(0x1000)), false),
+        ));
+        assert!(!resident.reusable_for_materialization(
+            64,
+            32,
+            1,
+            7,
+            format,
+            RequestedMaterialization::new(Some(backing(0x5000)), false),
+        ));
+        assert!(resident.reusable_for_materialization(
+            64,
+            32,
+            1,
+            7,
+            format,
+            RequestedMaterialization::new(Some(backing(0x5000)), true),
+        ));
     }
 
     /// The MRT secondary path's slot is not re-usable as a primary attachment,
@@ -3855,17 +4108,32 @@ mod resident_reuse_tests {
              is what made the one-bit test match"
         );
         assert!(
-            !secondary.reusable_for(64, 32, 1, 7, translate::pixel::ResidentFormat::of(rgba)),
-            "an RG16Float image must not be handed to an RGBA8 attachment"
-        );
-        assert!(!secondary.reusable_for(64, 32, 1, 7, translate::pixel::ResidentFormat::of(bgra)));
-        assert!(
-            secondary.reusable_for(
+            !secondary.reusable_for_materialization(
                 64,
                 32,
                 1,
                 7,
-                translate::pixel::ResidentFormat::of(vk::Format::R16G16_SFLOAT)
+                translate::pixel::ResidentFormat::of(rgba),
+                RequestedMaterialization::new(None, false),
+            ),
+            "an RG16Float image must not be handed to an RGBA8 attachment"
+        );
+        assert!(!secondary.reusable_for_materialization(
+            64,
+            32,
+            1,
+            7,
+            translate::pixel::ResidentFormat::of(bgra),
+            RequestedMaterialization::new(None, false),
+        ));
+        assert!(
+            secondary.reusable_for_materialization(
+                64,
+                32,
+                1,
+                7,
+                translate::pixel::ResidentFormat::of(vk::Format::R16G16_SFLOAT),
+                RequestedMaterialization::new(None, false),
             ),
             "the secondary path must still get its own slot back"
         );

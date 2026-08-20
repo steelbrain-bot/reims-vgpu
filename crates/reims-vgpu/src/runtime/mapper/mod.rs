@@ -1569,13 +1569,16 @@ pub fn guest_texel_source<H: HostMemory + HostOps>(
     use crate::runtime::guest_ram::GuestRef;
     use reims_vgpu_memory::{GuestRun, GuestRunSource};
 
-    let (import, _footprint) = ensure_contig_import_with_footprint(state, host, mapping_id)?;
+    let (import, footprint) = ensure_contig_import_with_footprint(state, host, mapping_id)?;
     let end = plane_offset.checked_add(span)?;
     if end > import.len() {
         return None;
     }
     let whole = import.slice(0, import.len()).ok()?;
     let guest = GuestRef::new(std::sync::Arc::clone(&import), whole).ok()?;
+    let physical_pages = footprint
+        .window(plane_offset..end)
+        .and_then(|window| reims_vgpu_memory::GuestPageSet::new(window.pages()));
     Some(GuestRunSource {
         runs: std::sync::Arc::new(vec![GuestRun {
             host_ptr: import.host_base(),
@@ -1590,6 +1593,7 @@ pub fn guest_texel_source<H: HostMemory + HostOps>(
                 guest,
             },
         ])),
+        physical_pages,
     })
 }
 

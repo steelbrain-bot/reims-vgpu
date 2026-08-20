@@ -109,9 +109,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             if !c.store_action.publishes_single_sample() {
                 continue;
             }
-            if c.load_action != reims_vgpu_protocol::pass_action::LoadAction::Clear
-                && c.load_action != reims_vgpu_protocol::pass_action::LoadAction::DontCare
-            {
+            if !load_action_has_clear_seed(c.load_action) {
                 // Load/composite needs real encode (metal2vulkan) — skip Store.
                 continue;
             }
@@ -286,45 +284,80 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             Ok(M2vDrawSpan::ResidentGvaStore {
                 submission,
                 identity,
+                guest_store_pages,
                 visibility_samples: samples,
             }) => {
                 completed_submission = Some(submission);
                 visibility_samples = samples;
                 let _store_span = StoreCostSpan::new("gva_store_us");
                 note_iosurface_texture_store_route("gva_flush");
-                let landed = req.colors.first().is_some_and(|c0| {
-                    crate::runtime::writeback_debt::arm_gva(
-                        state,
-                        host,
-                        req.task_id,
-                        c0,
-                        &identity,
-                        submission,
-                    )
+                let directly_landed = req.colors.first().is_some_and(|c0| {
+                    guest_store_pages.as_ref().is_some_and(|pages| {
+                        state.note_host_wrote_pages(pages.pages().to_vec());
+                        crate::runtime::render_writeback::forget_gva_host_copies(
+                            state,
+                            req.task_id,
+                            c0.target_gva(),
+                            c0.texture_ref,
+                        );
+                        if let Some(key) = crate::runtime::writeback_debt::resource_key(
+                            state,
+                            req.task_id,
+                            c0.texture_ref,
+                        )
+                        .and_then(|resource| {
+                            crate::runtime::gva_store_witness::GvaTargetKey::of(resource, &identity)
+                        }) {
+                            crate::runtime::gva_store_witness::note_store(
+                                state,
+                                key,
+                                pages.pages(),
+                            );
+                        }
+                        record_materialized_store(state, req.task_id, c0.texture_ref, submission);
+                        true
+                    })
                 });
-                if landed {
-                    note_iosurface_texture_store_route("gva_resident_authoritative");
+                if directly_landed {
+                    note_iosurface_texture_store_route("gva_guest_backed");
                     gva_store_armed = true;
                 } else {
-                    // The copying rail: read the resident the draw just
-                    // rendered into and let the synchronous Store block below
-                    // run exactly as it does for a Store that never skipped its
-                    // readback. `read_resident_chain` fail-logs a lost resident.
-                    note_iosurface_texture_store_route("gva_store_sync");
-                    draw_rgba = read_resident_chain(state.executor.as_ref(), req, &identity);
-                    crate::observe::line(format!(
-                        "linux_m2v_draw ok resident_gva_store pipe={} {}x{} gva={:#x} rgba={}",
-                        req.pipeline_ref,
-                        pass_w,
-                        pass_h,
-                        req.colors.first().map(|c| c.target_gva()).unwrap_or(0),
-                        draw_rgba.is_some() as u8
-                    ));
+                    let landed = req.colors.first().is_some_and(|c0| {
+                        crate::runtime::writeback_debt::arm_gva(
+                            state,
+                            host,
+                            req.task_id,
+                            c0,
+                            &identity,
+                            submission,
+                        )
+                    });
+                    if landed {
+                        note_iosurface_texture_store_route("gva_resident_authoritative");
+                        gva_store_armed = true;
+                    } else {
+                        // The copying rail: read the resident the draw just
+                        // rendered into and let the synchronous Store block below
+                        // run exactly as it does for a Store that never skipped its
+                        // readback. `read_resident_chain` fail-logs a lost resident.
+                        note_iosurface_texture_store_route("gva_store_sync");
+                        draw_rgba = read_resident_chain(state.executor.as_ref(), req, &identity);
+                        crate::observe::line(format!(
+                            "linux_m2v_draw ok resident_gva_store pipe={} {}x{} gva={:#x} rgba={}",
+                            req.pipeline_ref,
+                            pass_w,
+                            pass_h,
+                            req.colors.first().map(|c| c.target_gva()).unwrap_or(0),
+                            draw_rgba.is_some() as u8
+                        ));
+                    }
                 }
             }
             Ok(M2vDrawSpan::ResidentSurfaceStore {
                 submission,
                 identity,
+                guest_store_pages,
+                guest_store_window,
                 visibility_samples: samples,
             }) => {
                 completed_submission = Some(submission);
@@ -345,40 +378,80 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         c0.texture_ref,
                     )
                 });
-                let stored = c0_store
-                    .map(|(mid, cw, ch, _, _)| {
-                        store_surface_resident(state, host, &identity, mid, cw, ch)
-                    })
-                    .unwrap_or(false);
-                match (stored, c0_store) {
-                    (true, Some((mid, cw, ch, fmt, texture_ref))) => {
-                        note_iosurface_texture_store_route("surface_resident");
-                        // The same two publishes the `Owned` rail performs at arm
-                        // time, for the same reason: full-frame backing evidence gates
-                        // `present_unbacked`, and a route that skipped it would
-                        // make that gate structurally dead.
-                        {
-                            let _span = StoreCostSpan::new("iosurface_publish_us");
-                            publish_surface_store(state, host, mid, cw, ch, fmt);
-                        }
-                        record_materialized_store(state, req.task_id, texture_ref, submission);
-                        surface_store_armed = true;
-                        crate::observe::line(format!(
-                            "linux_m2v_draw ok resident_surface_store pipe={} {}x{} mid={mid}",
-                            req.pipeline_ref, pass_w, pass_h
+                let directly_landed = c0_store.and_then(|(mid, cw, ch, fmt, texture_ref)| {
+                    let pages = guest_store_pages.as_ref()?;
+                    let window = guest_store_window.as_ref()?;
+                    state.note_host_wrote_pages(pages.pages().to_vec());
+                    let epoch = crate::runtime::mapping_write::note_iosurface_texture_landed(
+                        state,
+                        mid,
+                        window.start,
+                        window.end,
+                    )?;
+                    // This resident is the imported guest allocation that just
+                    // received the Store. Publishing those same bytes advances
+                    // the mapping epoch; hand that exact currency back to the
+                    // exact identity carried by draw completion so the next
+                    // sample does not replace it with a second alias.
+                    if !state
+                        .executor
+                        .stamp_resident_content_epoch(&identity, epoch)
+                    {
+                        crate::observe::fail(format!(
+                            "resident_surface_store_fail reason=epoch_stamp_refused mapping={mid} epoch={epoch}"
                         ));
                     }
-                    _ => {
-                        // The arm refused (its typed decline says which gate), so
-                        // the frame has to be materialized after all: read the
-                        // resident the draw just rendered into and let the
-                        // synchronous Store block below run exactly as it does for
-                        // a Store that never skipped its readback. This pays the
-                        // readback the rail exists to avoid, which is the point —
-                        // the fallback is a cost, never a lost frame.
-                        note_iosurface_texture_store_route("surface_resident_sync");
-                        draw_rgba = read_resident_chain(state.executor.as_ref(), req, &identity);
-                        crate::observe::line(format!(
+                    publish_surface_store(state, host, mid, cw, ch, fmt);
+                    record_materialized_store(state, req.task_id, texture_ref, submission);
+                    Some(())
+                });
+                if directly_landed.is_some() {
+                    note_pass_scissor_union(pass_w, pass_h);
+                    note_iosurface_texture_store_route("surface_guest_backed");
+                    surface_store_armed = true;
+                    crate::observe::line(format!(
+                        "linux_m2v_draw ok resident_surface_guest_backed pipe={} {}x{} mid={}",
+                        req.pipeline_ref,
+                        pass_w,
+                        pass_h,
+                        req.colors.first().map(|c| c.mapping_id()).unwrap_or(0)
+                    ));
+                } else {
+                    let stored = c0_store
+                        .map(|(mid, cw, ch, _, _)| {
+                            store_surface_resident(state, host, &identity, mid, cw, ch)
+                        })
+                        .unwrap_or(false);
+                    match (stored, c0_store) {
+                        (true, Some((mid, cw, ch, fmt, texture_ref))) => {
+                            note_iosurface_texture_store_route("surface_resident");
+                            // The same two publishes the `Owned` rail performs at arm
+                            // time, for the same reason: full-frame backing evidence gates
+                            // `present_unbacked`, and a route that skipped it would
+                            // make that gate structurally dead.
+                            {
+                                let _span = StoreCostSpan::new("iosurface_publish_us");
+                                publish_surface_store(state, host, mid, cw, ch, fmt);
+                            }
+                            record_materialized_store(state, req.task_id, texture_ref, submission);
+                            surface_store_armed = true;
+                            crate::observe::line(format!(
+                                "linux_m2v_draw ok resident_surface_store pipe={} {}x{} mid={mid}",
+                                req.pipeline_ref, pass_w, pass_h
+                            ));
+                        }
+                        _ => {
+                            // The arm refused (its typed decline says which gate), so
+                            // the frame has to be materialized after all: read the
+                            // resident the draw just rendered into and let the
+                            // synchronous Store block below run exactly as it does for
+                            // a Store that never skipped its readback. This pays the
+                            // readback the rail exists to avoid, which is the point —
+                            // the fallback is a cost, never a lost frame.
+                            note_iosurface_texture_store_route("surface_resident_sync");
+                            draw_rgba =
+                                read_resident_chain(state.executor.as_ref(), req, &identity);
+                            crate::observe::line(format!(
                             "linux_m2v_draw ok resident_surface_store_sync_fallback pipe={} {}x{} mid={} rgba={}",
                             req.pipeline_ref,
                             pass_w,
@@ -386,6 +459,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                             req.colors.first().map(|c| c.mapping_id()).unwrap_or(0),
                             draw_rgba.is_some() as u8
                         ));
+                        }
                     }
                 }
             }
@@ -452,12 +526,6 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
         return DrawChainResult::new(EncodeStatus::Ok, None, visibility_samples, None);
     }
 
-    // An IOSurface texture composite Store reaches the guest only through the CPU writeback
-    // below. The DMA rail that used to short-circuit it here — a resident BGRA
-    // target landed straight in the mapping's guest pages through an imported
-    // host pointer — is gone, because a pointer the GPU can read is one it can
-    // write and those pages are guest RAM.
-    //
     // Taken, not borrowed. Every exit from this block returns the frame, and
     // borrowing forced each of them to `rgba.clone()` a whole framebuffer — 8 MB
     // at 1080p, at the 28-111 Stores/s `store_routes` measures, on the drain
@@ -1415,12 +1483,15 @@ enum M2vDrawSpan {
     ResidentGvaStore {
         submission: reims_vgpu_protocol::SubmissionId,
         identity: crate::model::TargetIdentity,
+        guest_store_pages: Option<reims_vgpu_memory::GuestWritePages>,
         visibility_samples: Option<u64>,
     },
     /// IOSurface texture composite Store executed into its registry resident with
-    /// `skip_readback`: the caller copies that image into the mapping's guest
-    /// pages through [`crate::runtime::render_writeback`], which never brings
-    /// the frame across host memory.
+    /// `skip_readback`. When the resident is the mapping's exact imported
+    /// allocation, the Store is already in guest pages; otherwise the caller
+    /// copies the device-local image there through
+    /// [`crate::runtime::render_writeback`] without bringing the frame across
+    /// host memory.
     ///
     /// Distinct from [`Self::ResidentGvaStore`] because the destination is a
     /// mapping rather than a raw task GVA, and the two reach guest memory by
@@ -1445,6 +1516,8 @@ enum M2vDrawSpan {
     ResidentSurfaceStore {
         submission: reims_vgpu_protocol::SubmissionId,
         identity: crate::model::TargetIdentity,
+        guest_store_pages: Option<reims_vgpu_memory::GuestWritePages>,
+        guest_store_window: Option<std::ops::Range<u64>>,
         visibility_samples: Option<u64>,
     },
 }
@@ -1744,13 +1817,17 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
                 reason: crate::runtime::census::present_proxy::MrtDrop::AliasesPrimary,
             });
         }
-        // Same three-into-two collapse as the primary slot below: a secondary
-        // attachment's DontCare reaches the engine as "no seed", which its pass
-        // key spells as CLEAR.
-        if c.load_action == reims_vgpu_protocol::pass_action::LoadAction::DontCare {
-            super::note_load_action_dont_care(pipeline.object_id, c.width, c.height);
-        }
-        let load = c.load_action == reims_vgpu_protocol::pass_action::LoadAction::Load;
+        let load_action = match c.load_action {
+            reims_vgpu_protocol::pass_action::LoadAction::Load => {
+                reims_vgpu_core::ColorLoadAction::Load
+            }
+            reims_vgpu_protocol::pass_action::LoadAction::Clear => {
+                reims_vgpu_core::ColorLoadAction::Clear
+            }
+            reims_vgpu_protocol::pass_action::LoadAction::DontCare => {
+                reims_vgpu_core::ColorLoadAction::DontCare
+            }
+        };
         let clear = [
             c.clear_color[0] as f32,
             c.clear_color[1] as f32,
@@ -1773,13 +1850,16 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
             .iter()
             .find(|(slot, _)| *slot == c.slot)
             .map(|(_, state)| *state);
+        let target_guest =
+            color_target_guest_backing(state, host, task_id, c, Some(identity.resident_layout()));
         out.push(SecondaryColorTarget {
             identity,
+            target_guest,
             width: c.width,
             height: c.height,
             format,
             clear,
-            load,
+            load_action,
             blend,
             color_write_mask,
         });
@@ -1969,8 +2049,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         let f_variant = &fragment_variant;
         let load_plan::LoadPlan {
             target_rgba8,
-            target_guest_seed,
+            target_guest,
             target_clear,
+            color_load_action,
             target_seed_order: seed_order,
             gpu_only_content_allowed,
             surface_target: iosurface_texture_resident_target,
@@ -2003,8 +2084,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 sampled_images: images,
                 samplers,
                 target_rgba8,
-                target_guest_seed,
+                target_guest,
                 target_clear,
+                color_load_action,
                 target_seed_order: seed_order,
                 color_input: frag_color_input,
                 gva_alloc_generation,
@@ -2082,10 +2164,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // Engine pixels are authoritative (empty when skip_readback; the Store
         // path materializes bytes for surface_cache and the guest writeback).
         //
-        // A Store used to be able to return `M2vDrawSpan::ResidentBgra`
-        // instead — no pixels at all, the resident staying authoritative until
-        // the import-present rail DMA'd it into the mapping's guest pages.
-        // That span is unreachable without the import and its variant is gone.
+        // A resident completion carries its materialization outcome separately:
+        // direct guest pages need publication, copied residents retain debt.
         let submission = completed.submission;
         match completed.route {
             DrawCompletionRoute::Pixels => Ok(M2vDrawSpan::Pixels {
@@ -2102,12 +2182,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             DrawCompletionRoute::ResidentGvaStore(identity) => Ok(M2vDrawSpan::ResidentGvaStore {
                 submission,
                 identity,
+                guest_store_pages: completed.output.guest_store_pages,
                 visibility_samples,
             }),
             DrawCompletionRoute::ResidentSurfaceStore(identity) => {
                 Ok(M2vDrawSpan::ResidentSurfaceStore {
                     submission,
                     identity,
+                    guest_store_pages: completed.output.guest_store_pages,
+                    guest_store_window: completed.output.guest_store_window,
                     visibility_samples,
                 })
             }
@@ -2208,11 +2291,29 @@ fn clear_seed_enabled() -> bool {
     })
 }
 
+/// Whether a render-pass load action supplies a defined solid seed.
+///
+/// `DontCare` explicitly leaves the prior attachment contents undefined. It
+/// must reach the backend as discard semantics; manufacturing the clear value
+/// here changes the guest contract even when that happens to look preferable.
+fn load_action_has_clear_seed(action: reims_vgpu_protocol::pass_action::LoadAction) -> bool {
+    action == reims_vgpu_protocol::pass_action::LoadAction::Clear
+}
+
 #[cfg(test)]
 mod execution_split_tests {
     use super::*;
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
     use crate::runtime::host::FakeHost;
+
+    #[test]
+    fn only_clear_has_a_defined_solid_seed() {
+        use reims_vgpu_protocol::pass_action::LoadAction;
+
+        assert!(load_action_has_clear_seed(LoadAction::Clear));
+        assert!(!load_action_has_clear_seed(LoadAction::Load));
+        assert!(!load_action_has_clear_seed(LoadAction::DontCare));
+    }
 
     /// The blank-with-host-entry loss must be reported as a subset of a
     /// population, not as a bare count.
@@ -2879,45 +2980,6 @@ mod execution_split_tests {
         assert!(!iosurface_texture_load_is_a_seed_candidate(&c0));
     }
 
-    /// A stage that binds a sampler and no texture is still in the sampled band,
-    /// so it still triggers the band's relocation.
-    ///
-    /// Asking only about textures is what stood here, and Metal argument tables
-    /// are sticky across draws in an encoder: a vertex sampler survives a re-bind
-    /// that zeroed the vertex textures. Unseparated, both stages' sampler at
-    /// index 0 resolves to `SAMPLER_BINDING_BASE`, `push_smp` takes the first
-    /// writer, and the fragment module goes on sampling through the vertex
-    /// stage's filter, address mode and LOD clamp with nothing refused.
-    #[test]
-    fn a_stage_that_binds_only_a_sampler_is_still_in_the_sampled_band() {
-        let tex = |texture_ref| TextureBind {
-            index: 0,
-            texture_ref,
-            ..Default::default()
-        };
-        let smp = |sampler_ref| SamplerBind {
-            index: 0,
-            sampler_ref,
-            ..Default::default()
-        };
-
-        assert!(
-            stage_uses_sampled_band(&[], &[smp(7)]),
-            "a sampler with no texture occupies a binding number all the same"
-        );
-        assert!(stage_uses_sampled_band(&[tex(3)], &[]));
-        assert!(stage_uses_sampled_band(&[tex(3)], &[smp(7)]));
-        assert!(
-            !stage_uses_sampled_band(&[], &[]),
-            "a stage that binds nothing is not in the band"
-        );
-        assert!(
-            !stage_uses_sampled_band(&[tex(0)], &[smp(0)]),
-            "a zero ref is the guest leaving a slot empty, not a bind — the same \
-             reading `push_smp`'s callers take"
-        );
-    }
-
     #[test]
     fn a_iosurface_texture_load_seed_falls_back_to_the_surfaces_own_guest_pages() {
         use crate::runtime::mapping_write::write_bgra8;
@@ -2943,6 +3005,7 @@ mod execution_split_tests {
         }
         let (w, h) = (4u32, 2u32);
         assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
+        crate::runtime::guest_ram::latch_import_limits(0x1000, 1 << 30, 1 << 30);
 
         // Guest-side content the compositor expects a LOAD to preserve. BGRA on
         // the wire; distinct per channel so a swizzle error cannot pass.
@@ -2967,6 +3030,28 @@ mod execution_split_tests {
         // declines by name, and the panic message is where that is worth reading.
         let cap = crate::observe::sink::FailCapture::start();
         let resident_format = gva_resident_format(state.executor.as_ref(), MTL_FORMAT_BGRA8_UNORM);
+        let target = try_iosurface_texture_target_guest_memory(
+            &mut state,
+            &mut host,
+            mid,
+            w,
+            h,
+            resident_format,
+        )
+        .expect("the stable surface allocation is an importable target");
+        assert_eq!(target.backing.allocation_len, 0x1000);
+        assert_eq!(target.backing.resource_offset, 0);
+        assert_eq!(target.backing.resource_len, 0x1000);
+        assert_eq!(target.backing.plane_offset, 0);
+        let (_, bpr, _) = crate::runtime::mapping_write::iosurface_texture_sample_window(
+            &state.surfaces.mappings[&mid],
+            w,
+            h,
+            MTL_FORMAT_BGRA8_UNORM,
+        )
+        .expect("the target used this mapping window");
+        assert_eq!(target.backing.row_pitch, u64::from(bpr));
+        assert_eq!(target.footprint.pages(), &[gpa]);
         let served =
             resolve_iosurface_texture_load_seed(&mut state, &mut host, mid, w, h, resident_format);
         let seed = served.unwrap_or_else(|| {
@@ -2980,13 +3065,6 @@ mod execution_split_tests {
             panic!("a cold cache should preserve the native guest-page source");
         };
         assert_eq!(seed.format, reims_vgpu_protocol::TexelLayout::Bgra8);
-        let (_, bpr, _) = crate::runtime::mapping_write::iosurface_texture_sample_window(
-            &state.surfaces.mappings[&mid],
-            w,
-            h,
-            MTL_FORMAT_BGRA8_UNORM,
-        )
-        .expect("the seed used this mapping window");
         let (span, row_length_texels) = strided_window_extent(w, h, 4, u64::from(bpr))
             .expect("the native row pitch describes this image");
         assert_eq!(seed.source.total_len, span);

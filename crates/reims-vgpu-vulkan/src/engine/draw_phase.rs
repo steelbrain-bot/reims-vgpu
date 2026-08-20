@@ -169,20 +169,18 @@
 //!
 //! ## Guest-page gathers are not retained copies
 //!
-//! The paragraph this replaces said the gather path had no content cache at all
-//! and that it was *not* established whether the IOSurface texture seed witness could
-//! cover these run lists, "the first thing to check before building on this".
-//! `reims-vgpu::runtime::gather_witness` observes page-write evidence, but that is
-//! not the decoded per-subresource coherence contract. A guest-page gather has
-//! no retained CPU bytes to compare, so its copied image is transient and every
-//! later bind gathers again. A durable reuse path must represent the guest's
-//! live resource or decode the real subresource synchronization boundary; it
-//! cannot infer content from a producer-assigned key and generation.
+//! A producer name is not proof that live guest bytes still match a copied
+//! image. Neither is the resource-validity transition: the guest consumes its
+//! dirty bit when producing a submission table, but unified-memory CPU writes
+//! can change the shared storage without emitting a new transition for every
+//! change. The full-content audit has observed bytes move while the diagnostic
+//! witness reported `Vouched`.
 //!
-//! The witness counters now report `fresh` versus `vouched` only as telemetry;
-//! neither verdict changes this read. The remaining contract work is to carry a
-//! real resident resource into `SampledSource::Target` or decode the guest's
-//! subresource synchronization boundary.
+//! Apple samples that storage live. A host whose reported linear image layout
+//! matches the guest can do the same through `GuestImage`; where the layouts
+//! disagree, this backend must gather every bind until it has another live
+//! representation. Retaining the copied image by validity generation is stale
+//! content, not a cache.
 //!
 //! # And none of it holds when the guest is quiet
 //!

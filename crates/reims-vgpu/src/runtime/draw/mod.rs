@@ -320,9 +320,9 @@ fn vertex_buffer_needs_storage_binding(
 /// Which directly-bound Metal resource class a [`FragUnbound`] names.
 ///
 /// Carried as a type rather than as the `buf`/`tex`/`smp` prefix this used to be
-/// formatted into, because the class decides the SPIR-V binding relocation and a
-/// consumer that wants it back out of a string has to parse one. `Display` is the
-/// only place the prefix exists now.
+/// formatted into, because consumers need the class as a semantic value and
+/// must not parse it back out of a string. `Display` is the only place the
+/// prefix exists now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FragUnboundClass {
     Buffer,
@@ -345,7 +345,7 @@ impl std::fmt::Display for FragUnboundClass {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FragUnbound {
     pub class: FragUnboundClass,
-    /// The Metal argument index, before any SPIR-V binding relocation.
+    /// The Metal argument index used to resolve the reflected descriptor.
     pub metal_index: u32,
 }
 
@@ -355,8 +355,8 @@ impl std::fmt::Display for FragUnbound {
     }
 }
 
-/// The fragment textures a draw must substitute a neutral image for: the gaps
-/// the scan flagged that are textures and that the module *statically uses*.
+/// The fragment texture slots that must remain explicitly null: gaps the scan
+/// flagged as textures that the module *statically uses*.
 ///
 /// Vulkan requires the pipeline layout to contain a descriptor for every
 /// statically-used resource, and `engine/exec.rs` builds that layout from
@@ -369,15 +369,15 @@ impl std::fmt::Display for FragUnbound {
 ///
 /// Three narrowings, each load-bearing:
 ///
-/// - **Textures only.** The sampler class provisions its own default where it
-///   binds, and a storage buffer has no neutral this device can invent; both are
-///   still reported by the caller.
+/// - **Textures only.** Samplers have their own null-descriptor rail, while a
+///   storage buffer has no contract-defined replacement; the latter is still
+///   reported by the caller.
 /// - **[`DescriptorUse::Used`] only.** A declared-and-never-referenced variable
 ///   is legal to omit and must stay omitted, or the census that separated those
 ///   two populations cannot tell them apart any more.
 /// - **Not `Ambiguous`.** Two variables on one binding is its own defect and is
 ///   not repaired by picking one of them; `is_violation` already excludes it.
-fn frag_unbound_textures_to_neutralize(
+fn frag_unbound_textures_to_bind_null(
     uses: &[(FragUnbound, reims_vgpu_core::DescriptorUse)],
 ) -> Vec<u32> {
     uses.iter()
@@ -426,7 +426,7 @@ fn frag_unbound_scan(
         // carry — nothing references the binding, so nothing is unbound.
         //
         // Asked of textures only, because that is the class observed firing and
-        // the binding relocation for it is the one this caller can compute. A
+        // its reflected binding is the one this caller can compute. A
         // buffer or sampler reported here is still worth reading as before.
         if matches!(
             rb.kind,
@@ -455,8 +455,8 @@ fn frag_unbound_scan(
 /// population it cannot tell apart.
 ///
 /// Textures only, and the reason is the same one the declaration check gives:
-/// the caller can compute the SPIR-V binding for a texture, and the relocation
-/// for the other two classes is not this function's to guess. A buffer or a
+/// the caller can compute the reflected SPIR-V binding for a texture, while the
+/// other two classes require their own resource-kind handling. A buffer or a
 /// sampler gap answers [`spirv_bind::DescriptorUse::Used`] unexamined, which
 /// keeps them reported exactly as loudly as before rather than quietly
 /// downgrading a class nobody has measured.
@@ -469,39 +469,6 @@ fn frag_unbound_static_use(
         return DescriptorUse::Used;
     }
     variant.texture_use(gap.metal_index)
-}
-
-fn reflected_sampled_binding_collision(
-    vertex: &reims_vgpu_core::ShaderInterface,
-    fragment: &reims_vgpu_core::ShaderInterface,
-) -> bool {
-    #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
-    enum SampledClass {
-        Texture,
-        Sampler,
-    }
-
-    let sampled_key = |binding: &reims_vgpu_core::ShaderResourceBinding| match binding.kind {
-        reims_vgpu_core::ShaderResourceKind::Texture
-        | reims_vgpu_core::ShaderResourceKind::TextureArray => {
-            Some((SampledClass::Texture, binding.metal_index))
-        }
-        reims_vgpu_core::ShaderResourceKind::Sampler
-        | reims_vgpu_core::ShaderResourceKind::StaticSampler => {
-            Some((SampledClass::Sampler, binding.metal_index))
-        }
-        _ => None,
-    };
-    let vertex_bindings = vertex
-        .bindings
-        .iter()
-        .filter_map(sampled_key)
-        .collect::<std::collections::BTreeSet<_>>();
-    fragment
-        .bindings
-        .iter()
-        .filter_map(sampled_key)
-        .any(|binding| vertex_bindings.contains(&binding))
 }
 
 /// Decode the depth-stencil descriptor a draw bound, on the Linux path
@@ -1701,46 +1668,6 @@ pub(crate) fn load_action_in_contract(pipeline_ref: u32, load_action: u16) -> bo
     false
 }
 
-/// Report an *in-contract* `MTLLoadActionDontCare`, which the Vulkan arm cannot
-/// spell and raises to a clear.
-///
-/// [`load_action_in_contract`] only speaks for the fourth value and above. The
-/// three inside the set are where the two encode arms part:
-///
-///   passes it through, so Metal gets the attachment the guest asked for and
-///   skips the load entirely.
-/// - The Vulkan engine's render-pass key carries `load_seed: bool`, derived from
-///   whether a seed was *resolved* rather than from the guest's ordinal, so
-///   DontCare and Clear reach `caches.rs` as the same key and both become
-///   a native clear against the record's clear colour. The native discard-load
-///   operation is unreachable for a colour or depth attachment on that arm.
-///
-/// Clearing satisfies DontCare — the contract permits any contents — so this is
-/// not lost guest work and the line is on the OFF channel. What it is not is
-/// free: the substitution costs a full-surface clear per pass, and it replaces
-/// Metal's undefined contents with one specific value, which a guest that only
-/// partly covers the attachment would see.
-///
-/// Nothing is changed here, deliberately. Plumbing the ordinal through to the
-/// pass key is a behaviour change on the pathway that renders, and the first
-/// thing needed is a reading of whether a guest sends DontCare at all — the same
-/// answer [`store_action_in_contract`]'s doc asks for on the adjacent wire word.
-/// A non-zero count here is the argument for widening the key; a zero says the
-/// bool was always enough.
-///
-/// Latched on `(pipeline, slug)` like its siblings: a guest that means DontCare
-/// means it every frame, and repetition would carry nothing the first line did
-/// not.
-pub(crate) fn note_load_action_dont_care(pipeline_ref: u32, width: u32, height: u32) {
-    if degrade_log_first(pipeline_ref, "load_action_dont_care_cleared") {
-        crate::observe::off(format!(
-            "pass_load_action reason=load_action_dont_care_cleared \
-             pipe={pipeline_ref} geom={width}x{height} \
-             (MTLLoadActionDontCare has no PassKey spelling; raised to CLEAR)"
-        ));
-    }
-}
-
 /// Whether a decoded store action is one of the named values this wire form
 /// carries, reporting an unknown value.
 ///
@@ -1861,9 +1788,9 @@ fn sample_miss_detail<M: HostMemory + HostOps>(
                     )
                 }
                 Ok(view) => format!(
-                    "kind=texture_view desc_len={desc_len} base={} level={} fmt_ov={:?} reason=view_base_or_swizzle",
+                    "kind=texture_view desc_len={desc_len} base={} range={:?} fmt_ov={:?} reason=view_base_or_swizzle",
                     view.base_texture_ref,
-                    view.level,
+                    view.range,
                     view.pixel_format
                 )}
         }
@@ -1916,14 +1843,14 @@ fn retained_linear_sample_miss_detail(resource: &crate::model::TaskResource) -> 
             let l0 = tex.level(0);
             Some(format!(
                 "kind={kind} desc_len={desc_len} retained=1 has_fmt={} fmt={:#x} \
-                 mips={} handle={:#x} alloc={} data_off={} used={} L0={}x{} \
+                 mips={} handle={:#x} alloc={} base_off={} used={} L0={}x{} \
                  L0_off={} bpr={} reason=linear_sample",
                 u8::from(tex.declared_pixel_format().is_some()),
                 tex.declared_pixel_format().unwrap_or(0),
                 tex.mipmap_level_count,
                 tex.handle,
                 tex.allocation_size,
-                tex.data_offset,
+                tex.base_offset,
                 tex.used_size,
                 l0.map(|level| level.width).unwrap_or(0),
                 l0.map(|level| level.height).unwrap_or(0),
@@ -2030,6 +1957,7 @@ fn vulkan_sampler_resource(
 
     Ok(SamplerResource {
         binding,
+        source: reims_vgpu_core::SamplerSource::State,
         min_filter: reims_vgpu_protocol::sampler_filter(sampler.min_filter).map_err(|reason| {
             DrawPreparationDecline::SamplerMinFilterTranslation {
                 sampler_ref,
@@ -2167,6 +2095,7 @@ pub fn reflected_static_sampler_resource(
 
     Ok(SamplerResource {
         binding,
+        source: reims_vgpu_core::SamplerSource::State,
         min_filter: filter(sampler.min_filter, true)?,
         mag_filter: filter(sampler.mag_filter, false)?,
         mip_filter,
@@ -3178,7 +3107,11 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
     // to do, silently) dropped the texture from the draw entirely.
     let (tex_ref, level, fmt_override) =
         if let Some(view) = resolve_texture_view(state, host, task_id, texture_ref) {
-            (view.base_texture_ref, view.level, view.pixel_format)
+            (
+                view.base_texture_ref,
+                view.single_non_array_level()?,
+                view.pixel_format,
+            )
         } else {
             (texture_ref, 0, None)
         };
@@ -3378,54 +3311,6 @@ mod load_action_contract_tests {
         assert!(
             line.starts_with("pass_state_degraded ") && line.contains("load_action=65535"),
             "the line must carry the value that was refused: {line}"
-        );
-    }
-
-    /// The third in-contract value gets its own reading, on the OFF channel.
-    ///
-    /// `load_action_in_contract` above answers only for the fourth value and up,
-    /// so the substitution the Vulkan arm makes *inside* the set — DontCare
-    /// reaching `caches.rs` as the same pass key as Clear, and resolving to
-    /// `AttachmentLoadOp::CLEAR` — had no reading at all while its out-of-set
-    /// sibling had one. The channel is the claim: clearing satisfies DontCare,
-    /// so this is a report and not a loss.
-    #[test]
-    fn an_in_contract_dont_care_reports_that_it_became_a_clear() {
-        let path = crate::observe::fail_log_path();
-        let count = || {
-            std::fs::read_to_string(path)
-                .unwrap_or_default()
-                .matches("reason=load_action_dont_care_cleared")
-                .count()
-        };
-        let before = count();
-
-        super::note_load_action_dont_care(0xD0C1, 1920, 1080);
-        assert_eq!(count(), before + 1, "the first sighting reports");
-        // Latched per (pipeline, slug): a guest that means DontCare means it
-        // every frame, so repetition must carry nothing the first line did not.
-        super::note_load_action_dont_care(0xD0C1, 1920, 1080);
-        super::note_load_action_dont_care(0xD0C1, 640, 480);
-        assert_eq!(count(), before + 1, "the same pipeline does not re-report");
-        // A different pipeline is a different episode.
-        super::note_load_action_dont_care(0xD0C2, 1920, 1080);
-        assert_eq!(count(), before + 2);
-
-        let log = std::fs::read_to_string(path).expect("fail log");
-        let line = log
-            .lines()
-            .rev()
-            .find(|l| {
-                l.contains("reason=load_action_dont_care_cleared") && l.contains("pipe=53442")
-            })
-            .expect("the substitution must name itself");
-        assert!(
-            line.starts_with("OFF pass_load_action "),
-            "a contract-conformant substitution belongs on the OFF channel: {line}"
-        );
-        assert!(
-            line.contains("geom=1920x1080"),
-            "the line must carry the geometry the clear was paid for: {line}"
         );
     }
 }

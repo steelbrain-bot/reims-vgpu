@@ -1264,7 +1264,7 @@ fn stage_texture_iosurface_plane_view_ref_resolves_surface_mapping() {
 fn stage_texture_iosurface_plane_view_record_reshapes_stageable_single_plane_surface() {
     use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
     use reims_vgpu_core::pixel_format::{
-        StorageImageSelector, MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_R32_UINT, MTL_FORMAT_RGBA32_UINT,
+        MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_R32_UINT, MTL_FORMAT_RGBA32_UINT,
     };
     use reims_vgpu_paging::geometry::{
         MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
@@ -1316,8 +1316,8 @@ fn stage_texture_iosurface_plane_view_record_reshapes_stageable_single_plane_sur
         .expect("serialized IOSurface plane view view must override base surface geometry");
     assert_eq!((staged.width, staged.height), (1, 4));
     assert_eq!(
-        staged.storage_selector,
-        Some(StorageImageSelector::Rgba32Uint)
+        staged.storage_format,
+        Some(reims_vgpu_protocol::StorageImageFormat::Rgba32Uint)
     );
     assert!(match &staged.input {
         VulkanTextureInput::GuestPages(source) => source.total_len == 4 * 16,
@@ -1347,7 +1347,7 @@ fn stage_texture_iosurface_plane_view_record_reshapes_stageable_single_plane_sur
 
     // A sampled R32Uint view retains its exact format/geometry. R32Uint is
     // now a storage-capable format (its selector maps to the R32ui storage
-    // path), so `storage_selector` is populated — but it is inert here: this
+    // path), so `storage_format` is populated — but it is inert here: this
     // view is staged sampled (`is_storage=false`, binding 32), and the
     // selector is only consulted on the storage-bind path.
     let reshaped = IOSurfacePlaneViewBuilder::new(sid, 0, 10, 0x42)
@@ -1371,8 +1371,8 @@ fn stage_texture_iosurface_plane_view_record_reshapes_stageable_single_plane_sur
     assert_eq!((sampled.width, sampled.height), (4, 4));
     assert_eq!(sampled.pixel_format, MTL_FORMAT_R32_UINT);
     assert_eq!(
-        sampled.storage_selector,
-        Some(StorageImageSelector::R32Uint)
+        sampled.storage_format,
+        Some(reims_vgpu_protocol::StorageImageFormat::R32Uint)
     );
     assert!(match &sampled.input {
         VulkanTextureInput::GuestPages(source) => source.total_len == 4 * 4 * 4,
@@ -1467,8 +1467,8 @@ fn stage_texture_iosurface_plane_view_record_stages_biplanar_y_plane() {
         .expect("plane record must stage the Y plane of a biplanar surface");
     assert_eq!((staged.width, staged.height), (16, 8));
     assert_eq!(
-        staged.storage_selector,
-        Some(reims_vgpu_core::pixel_format::StorageImageSelector::R8Unorm)
+        staged.storage_format,
+        Some(reims_vgpu_protocol::StorageImageFormat::R8Unorm)
     );
     assert!(match &staged.input {
         VulkanTextureInput::GuestPages(source) => source.total_len == 16 * 8,
@@ -1622,7 +1622,7 @@ fn stage_heap_texture_uses_host_only_residency_identity() {
         HEAP_TEXTURE_OFFSET, HEAP_TEXTURE_OPCODE, HEAP_TEXTURE_USE_OFFSET, OBJECT_LIST_ENTRY_LEN,
         OBJECT_TYPE_TEXTURE_VIEW,
     };
-    use reims_vgpu_core::pixel_format::{StorageImageSelector, MTL_FORMAT_RGBA32_FLOAT};
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA32_FLOAT;
 
     let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
@@ -1670,8 +1670,8 @@ fn stage_heap_texture_uses_host_only_residency_identity() {
     assert_eq!((staged.width, staged.height), (180, 135));
     assert_eq!(staged.pixel_format, MTL_FORMAT_RGBA32_FLOAT);
     assert_eq!(
-        staged.storage_selector,
-        Some(StorageImageSelector::Rgba32Float)
+        staged.storage_format,
+        Some(reims_vgpu_protocol::StorageImageFormat::Rgba32Float)
     );
     assert!(matches!(
         &staged.input,
@@ -1716,7 +1716,7 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
         descriptor_count: 1,
 
         pixel_format: MTL_FORMAT_RGBA8_UNORM,
-        storage_selector: Some(pixel_format::StorageImageSelector::Rgba8Unorm),
+        storage_format: Some(reims_vgpu_protocol::StorageImageFormat::Rgba8Unorm),
         width: 2,
         height: 2,
         bytes: rgba.clone(),
@@ -1932,202 +1932,6 @@ fn storage_access_proxy_names_writeonly_seed_cost() {
             && line.contains("bytes=29614080")
     }));
 }
-
-#[test]
-fn storage_format_specialization_preserves_raw_views_and_runtime_shape() {
-    use pixel_format::StorageImageSpecializationDecline as D;
-    use reims_vgpu_protocol::StorageImageFormat as V;
-
-    assert_eq!(
-        mtl_to_engine_sampled(pixel_format::MTL_FORMAT_R32_UINT),
-        Some(V::R32Uint)
-    );
-    assert_eq!(
-        mtl_to_engine_sampled(pixel_format::MTL_FORMAT_RGB9E5_FLOAT),
-        Some(V::Rgb9e5Ufloat)
-    );
-
-    // A uint shader over a BGRA8Unorm surface is a deliberate raw byte view
-    // (byte order preserved) — unaffected by the without-format flag.
-    assert_eq!(
-        pixel_format::specialize_storage_image_format(V::Bgra8Unorm, V::Rgba8Uint, true),
-        Ok(Some(V::Rgba8Uint))
-    );
-    assert_eq!(
-        pixel_format::specialize_storage_image_format(V::Bgra8Unorm, V::Rgba8Uint, false),
-        Ok(Some(V::Rgba8Uint))
-    );
-    assert_eq!(
-        pixel_format::specialize_storage_image_format(V::Rgba16Float, V::Rgba32Float, true),
-        Ok(Some(V::Rgba16Float))
-    );
-    // BGRA8Unorm normalized color store (the desktop composite): with the
-    // device feature it retargets to a format-less `Unknown` storage image
-    // (viewed B8G8R8A8_UNORM — no R/B swap); without it, degrades to the
-    // swapped Rgba8Unorm view.
-    assert_eq!(
-        pixel_format::specialize_storage_image_format(V::Bgra8Unorm, V::Rgba32Float, true),
-        Ok(None)
-    );
-    assert_eq!(
-        pixel_format::specialize_storage_image_format(V::Bgra8Unorm, V::Rgba32Float, false),
-        Ok(Some(V::Rgba8Unorm))
-    );
-    assert_eq!(
-        pixel_format::specialize_storage_image_format(V::Bgra8Unorm, V::Rgba8Unorm, true),
-        Ok(None)
-    );
-    assert_eq!(
-        pixel_format::specialize_storage_image_format(V::Bgra8Unorm, V::Rgba16Uint, true),
-        Err(D::NumericClassMismatch)
-    );
-    assert_eq!(
-        pixel_format::specialize_storage_image_format(V::Bgra8Unorm, V::R32Sint, true),
-        Err(D::ShaderFormatUnsupported)
-    );
-
-    // R32Uint storage (the captured VTMTS 4K coverage-buffer case): the
-    // guest surface is a single 32-bit uint channel but the translator
-    // declares a 4x8-bit `Rgba8ui` write image. Despite equal bytes/texel
-    // (4 == 4) this must NOT take the raw-view early return (which would
-    // adopt Rgba8ui and keep only the low byte of each written lane) — it
-    // specializes the SPIR-V storage image to single-channel `R32ui` so the
-    // view is VK_FORMAT_R32_UINT and a written `uint4`.x is the full u32.
-    assert_eq!(
-        pixel_format::specialize_storage_image_format(V::R32Uint, V::Rgba8Uint, true),
-        Ok(Some(V::R32Uint))
-    );
-    assert_eq!(
-        pixel_format::specialize_storage_image_format(V::R32Uint, V::Rgba16Uint, true),
-        Ok(Some(V::R32Uint))
-    );
-    // A float/unorm-class write shader over an R32Uint surface is a genuine
-    // numeric-class mismatch, not a raw view — still rejected.
-    assert_eq!(
-        pixel_format::specialize_storage_image_format(V::R32Uint, V::Rgba8Unorm, true),
-        Err(D::NumericClassMismatch)
-    );
-    // The R32-single-channel sint/float and packed Rgb9e5 storage paths
-    // stay guarded off (no live capture yet justifies enabling them). The
-    // guard is UPSTREAM: `storage_selector` returns None for them, so they
-    // are rejected at stage time (`stage_tex_fmt_storage`) and never reach
-    // the specializer at all — unlike R32Uint, which is now mapped.
-    assert_eq!(
-        pixel_format::storage_selector(pixel_format::MTL_FORMAT_R32_SINT),
-        None
-    );
-    assert_eq!(
-        pixel_format::storage_selector(pixel_format::MTL_FORMAT_R32_FLOAT),
-        None
-    );
-
-    // The selector/engine plumbing that lets R32Uint reach the specializer:
-    // storage_selector now maps 0x35, and both format bridges round-trip it.
-    assert_eq!(
-        pixel_format::storage_selector(pixel_format::MTL_FORMAT_R32_UINT),
-        Some(pixel_format::StorageImageSelector::R32Uint)
-    );
-    assert_eq!(
-        selector_to_engine_storage(pixel_format::StorageImageSelector::R32Uint),
-        V::R32Uint
-    );
-}
-
-/// `metal2vulkan` lowers a generic `texture2d<float, access::write>` to SPIR-V
-/// `R32f` (enum value 3). Decoding that as `Unsupported(3)` made the format
-/// unspecializable, so every dispatch binding such an image died as
-/// `storage_format_specialize_mismatch` — 142 dropped dispatches in one x86
-/// desktop boot. It specializes exactly like the `R32ui` case: the declared
-/// format is a placeholder, the bound guest surface decides the view.
-#[test]
-fn r32f_write_images_specialize_to_the_bound_guest_surface() {
-    use pixel_format::StorageImageSpecializationDecline as D;
-    use reims_vgpu_protocol::StorageImageFormat as V;
-
-    // Wider float surfaces: the placeholder widens to the guest's own format
-    // so all four written lanes are stored, not just `.x`.
-    assert_eq!(
-        pixel_format::specialize_storage_image_format(V::Rgba32Float, V::R32Float, true),
-        Ok(Some(V::Rgba32Float))
-    );
-    assert_eq!(
-        pixel_format::specialize_storage_image_format(V::Rgba16Float, V::R32Float, true),
-        Ok(Some(V::Rgba16Float))
-    );
-    // Narrower single-channel float: still class-matched to the guest surface.
-    assert_eq!(
-        pixel_format::specialize_storage_image_format(V::R16Float, V::R32Float, true),
-        Ok(Some(V::R16Float))
-    );
-    // An R32Float guest surface is an exact match — the raw view is correct.
-    assert_eq!(
-        pixel_format::specialize_storage_image_format(V::R32Float, V::R32Float, true),
-        Ok(Some(V::R32Float))
-    );
-    // BGRA8Unorm is the desktop composite target. Bytes/texel are equal (4 == 4)
-    // so the raw-view early return would view a BGRA surface as a single
-    // 32-bit float; a normalized color store must retarget instead.
-    assert_eq!(
-        pixel_format::specialize_storage_image_format(V::Bgra8Unorm, V::R32Float, true),
-        Ok(None)
-    );
-    assert_eq!(
-        pixel_format::specialize_storage_image_format(V::Bgra8Unorm, V::R32Float, false),
-        Ok(Some(V::Rgba8Unorm))
-    );
-    // A float-class shader over a uint surface stays a class mismatch.
-    assert_eq!(
-        pixel_format::specialize_storage_image_format(V::R32Uint, V::R32Float, true),
-        Err(D::NumericClassMismatch)
-    );
-}
-
-/// Equal bytes per texel inside one numeric class is a coincidence, not a raw
-/// view, and adopting the shader's placeholder there silently drops channels.
-///
-/// The guest's decode-time HEIC downsample writes chroma as
-/// `OpVectorShuffle … 1 2 1 2` — two live lanes — into an `Rg16Float` surface
-/// that `metal2vulkan` declared `R32f`. Both are four float bytes, so a
-/// width-only raw-view test kept `R32f`, `OpImageWrite` stored lane `.x` as one
-/// f32, and the guest read those four bytes back as two halves: the second
-/// chroma channel was never written and the first was destroyed. On screen that
-/// is the wallpaper speckle class; measured off-screen it is
-/// `.agents/repros/heic-decode-isolation.sh` going from dB 0.23 to dB 7.11
-/// between a 1921-wide source and a 1984-wide one.
-///
-/// The same trap had already been carved out by name for `R32Uint` under
-/// `Rgba8Uint`. These are one rule, so the rule is asserted here for every
-/// same-class equal-width pair the format table can produce.
-#[test]
-fn same_class_equal_width_storage_formats_take_the_guest_surface_not_the_placeholder() {
-    use reims_vgpu_protocol::StorageImageFormat as V;
-
-    // 4 bytes both sides, float class both sides — the measured case.
-    assert_eq!(
-        pixel_format::specialize_storage_image_format(V::Rg16Float, V::R32Float, true),
-        Ok(Some(V::Rg16Float))
-    );
-    // Same width and class again, and a colour store: `.x` as one f32 would be
-    // three channels short.
-    assert_eq!(
-        pixel_format::specialize_storage_image_format(V::Rgba8Unorm, V::R32Float, true),
-        Ok(Some(V::Rgba8Unorm))
-    );
-    // 2 bytes both sides.
-    assert_eq!(
-        pixel_format::specialize_storage_image_format(V::Rg8Unorm, V::R16Float, true),
-        Ok(Some(V::Rg8Unorm))
-    );
-    // The genuine raw view — integer shader over a normalized surface — is not
-    // disturbed by narrowing the width test.
-    assert_eq!(
-        pixel_format::specialize_storage_image_format(V::Rgba8Unorm, V::Rgba8Uint, true),
-        Ok(Some(V::Rgba8Uint))
-    );
-}
-
-/// x86 (12-bit) task page table with depth-1 root; ptes map gva page i →
-/// `pfns[i]`. Mirrors the gva_view multi-import fixture.
 fn setup_linear_task_x86(host: &mut FakeHost, state: &mut Device, pfns: &[u32]) {
     let page = 1u64 << PAGE_SHIFT_X86;
     let dir_gpa = 2u64 << PAGE_SHIFT_X86;
@@ -2452,7 +2256,7 @@ fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
         descriptor_count: 1,
 
         pixel_format: MTL_FORMAT_RGBA8_UNORM,
-        storage_selector: Some(pixel_format::StorageImageSelector::Rgba8Unorm),
+        storage_format: Some(reims_vgpu_protocol::StorageImageFormat::Rgba8Unorm),
         width: 2,
         height: 2,
         bytes: vec![0u8; 16],
@@ -2688,7 +2492,7 @@ fn a_staged_window_records_its_pages_in_guest_virtual_order() {
 /// side, rebuilt independently by all three staging rails. Nothing then stopped
 /// a rail from setting both — and the two consumers read one field each, so a
 /// binding claiming to be seeded *and* sampled would have been dispatched as
-/// both a storage seed skip and a copy-on-sample, seeding one image from a
+/// both a storage seed skip and a resident sampled bind, seeding one image from a
 /// placeholder. The state is unrepresentable now; this pins the accessors that
 /// replaced the two fields so a later variant cannot answer to both consumers
 /// or to neither.
@@ -2860,7 +2664,7 @@ fn live_compute_mirrors_are_not_evicted_by_an_invented_capacity() {
         descriptor_count: 1,
 
         pixel_format: key.pixel_format,
-        storage_selector: Some(pixel_format::StorageImageSelector::Rgba8Uint),
+        storage_format: Some(reims_vgpu_protocol::StorageImageFormat::Rgba8Uint),
         width: key.width,
         height: key.height,
         bytes: Vec::new(),
@@ -2977,7 +2781,7 @@ fn a_bind_past_the_argument_table_refuses_the_dispatch() {
     );
 }
 
-/// A texture the kernel samples and the guest never bound gets a neutral image,
+/// A texture the kernel samples and the guest never bound stays explicitly null,
 /// and one the kernel merely declares does not.
 ///
 /// This is the repair for the hole that killed a host. The descriptor set layout
@@ -2993,26 +2797,41 @@ fn a_bind_past_the_argument_table_refuses_the_dispatch() {
 /// census that separated the two populations in the first place — so a pass that
 /// filled both would look identical to this one on a boot and be wrong.
 #[test]
-fn a_sampled_image_the_kernel_uses_and_the_guest_left_empty_gets_a_neutral_texture() {
+fn a_sampled_image_the_kernel_uses_and_the_guest_left_empty_stays_null() {
     let spirv = reims_vgpu_vulkan::spirv_bind::test_module_with_two_sampled_images(33, 34);
+    // In production this candidate population comes from the translator's
+    // sampled-resource reflection.
+    let reflected_sampled = [33, 34];
 
-    // Nothing bound: 33 is sampled and needs the neutral texture; 34 is declared
+    // Nothing bound: 33 is sampled and needs a null descriptor; 34 is declared
     // and never referenced, so it stays out of the layout.
     assert_eq!(
-        reims_vgpu_vulkan::spirv_bind::neutral_sampled_image_bindings(&spirv, &[]),
+        reims_vgpu_vulkan::spirv_bind::null_statically_used_bindings(
+            &spirv,
+            &reflected_sampled,
+            &[],
+        ),
         vec![33]
     );
 
     // The guest bound it after all — there is nothing to substitute.
     assert_eq!(
-        reims_vgpu_vulkan::spirv_bind::neutral_sampled_image_bindings(&spirv, &[33]),
+        reims_vgpu_vulkan::spirv_bind::null_statically_used_bindings(
+            &spirv,
+            &reflected_sampled,
+            &[33],
+        ),
         Vec::<u32>::new()
     );
 
     // A binding the guest supplied that the module does not carry is not
     // invented back into the list.
     assert_eq!(
-        reims_vgpu_vulkan::spirv_bind::neutral_sampled_image_bindings(&spirv, &[99]),
+        reims_vgpu_vulkan::spirv_bind::null_statically_used_bindings(
+            &spirv,
+            &reflected_sampled,
+            &[99],
+        ),
         vec![33]
     );
 }

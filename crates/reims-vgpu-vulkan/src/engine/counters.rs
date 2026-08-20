@@ -204,6 +204,21 @@ engine_counters! {
     windowed {
         creates,
         allocs,
+        /// Imported reads ordered only after guest CPU writes because every
+        /// outstanding GPU write was proven physically disjoint.
+        guest_visibility_host_only,
+        /// Imported reads whose exact pages overlap an outstanding GPU write.
+        guest_visibility_gpu_overlap,
+        /// Imported reads kept behind all GPU writers because either side
+        /// lacked a comparable physical-page identity.
+        guest_visibility_gpu_unknown,
+        /// Guest-backed descriptor/attachment page sets presented to the
+        /// imported-memory visibility query.
+        guest_visibility_read_sets,
+        /// Named physical pages in those sets. Read with
+        /// `guest_visibility_read_sets`: an unknown set contributes one set
+        /// and zero pages, preserving the distinction from an empty query.
+        guest_visibility_read_pages,
         shader_hits,
         shader_misses,
         /// SPIR-V words walked by the shader cache's create-or-lookup transition
@@ -259,10 +274,10 @@ engine_counters! {
         /// Compute storage-image seed bytes staged for host→device upload.
         compute_storage_seed_uploads,
         compute_storage_seed_upload_bytes,
-        /// Sampled inputs seeded by a device-local copy of a resident storage
-        /// image (copy-on-sample) — bytes are the elided host upload size.
-        compute_sampled_resident_copies,
-        compute_sampled_resident_copy_bytes,
+        /// Sampled inputs bound directly to their resident storage image;
+        /// bytes are the elided host upload size.
+        compute_sampled_resident_binds,
+        compute_sampled_resident_bind_bytes,
         /// Compute storage images whose post-dispatch readback was deferred —
         /// the pinned resident stays authoritative; bytes are the elided
         /// device→host readback size (the CPU writeback of the same size is
@@ -311,8 +326,9 @@ engine_counters! {
         /// what this counter exists for.
         readback_compute_image,
         readback_compute_image_bytes,
-        /// Full-frame reads of a pinned resident through `read_target`: the present
-        /// capture and the deferred render window's on-access flush.
+        /// Full-frame reads of a pinned resident through `read_target`: present
+        /// capture and a Store/recovery path whose direct materialization was
+        /// unavailable.
         ///
         /// These are the copies a deferred rail *keeps*, paid once when a consumer
         /// asks instead of once per Store. `target_reads / readbacks` is what
@@ -377,6 +393,11 @@ engine_counters! {
         /// Bytes are what the copy names, which is what the CPU no longer moves.
         sampled_guest_imports,
         sampled_guest_import_bytes,
+        /// Sampled binds whose Vulkan image aliases the authoritative guest
+        /// allocation directly. Unlike `sampled_guest_imports`, these execute
+        /// no buffer-to-image copy; bytes are the transfer avoided.
+        sampled_guest_direct_binds,
+        sampled_guest_direct_bytes,
         /// Guest-run sampled binds whose write witness was not current when the
         /// required read was prepared.
         ///
@@ -467,6 +488,10 @@ engine_counters! {
         buffer_bind_reuses,
         /// Reuses above whose consumer is the indexed-draw input.
         buffer_index_bind_reuses,
+        /// Storage-buffer descriptor slots requested by draws.
+        storage_buffer_bind_slots,
+        /// Reused buffer bindings whose consumer includes a storage slot.
+        buffer_storage_bind_reuses,
         /// Graphics state a draw did **not** record because the command buffer
         /// it joined was already carrying exactly it — see
         /// `ResourcePools::CbGraphicsState`.
@@ -976,6 +1001,10 @@ impl EngineCounters {
             self.buffer_index_bind_reuses
                 .fetch_add(1, Ordering::Relaxed);
         }
+        if role.includes_storage() {
+            self.buffer_storage_bind_reuses
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub(super) fn note_compute_buffer_guest_import(&self, bytes: u64) {
@@ -1059,6 +1088,13 @@ impl EngineCounters {
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
+    pub fn note_sampled_guest_direct(&self, bytes: u64) {
+        self.sampled_guest_direct_binds
+            .fetch_add(1, Ordering::Relaxed);
+        self.sampled_guest_direct_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
     /// Record the write-witness state attached to one required guest-run read.
     /// This is diagnostic only: both verdicts still read the live guest pages.
     ///
@@ -1088,10 +1124,10 @@ impl EngineCounters {
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub fn note_compute_sampled_resident_copy(&self, bytes: u64) {
-        self.compute_sampled_resident_copies
+    pub fn note_compute_sampled_resident_bind(&self, bytes: u64) {
+        self.compute_sampled_resident_binds
             .fetch_add(1, Ordering::Relaxed);
-        self.compute_sampled_resident_copy_bytes
+        self.compute_sampled_resident_bind_bytes
             .fetch_add(bytes, Ordering::Relaxed);
     }
 }

@@ -16,8 +16,9 @@ fn print_reflection() {
         Ok("vertex") => reims_vgpu_vulkan::m2v_cache::RenderTranslationStage::Vertex,
         _ => reims_vgpu_vulkan::m2v_cache::RenderTranslationStage::Fragment,
     };
-    let shader = reims_vgpu_vulkan::m2v_cache::translate_render_cached_reflected(&air, stage, 9999)
-        .expect("translate");
+    let shader =
+        reims_vgpu_vulkan::m2v_cache::translate_render_cached_reflected(&air, stage, 1, 9999)
+            .expect("translate");
     println!(
         "stage={:?} entry bindings={}",
         stage,

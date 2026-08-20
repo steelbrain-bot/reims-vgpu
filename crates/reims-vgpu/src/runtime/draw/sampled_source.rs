@@ -67,6 +67,16 @@ pub(super) enum SampledSourceRequest {
         crate::runtime::gather_witness::GatherVouch,
         pixel_format::SwizzlePlan,
     ),
+    /// One mapped image backing with both its direct-image and transfer
+    /// materializations. The backend selects between them from its image-layout
+    /// contract; the runtime does not turn storage identity into page runs.
+    GuestImage(
+        reims_vgpu_memory::GuestImageSource,
+        reims_vgpu_protocol::ImageFormat,
+        Option<LinearSampleIdentity>,
+        crate::runtime::gather_witness::GatherVouch,
+        pixel_format::SwizzlePlan,
+    ),
 }
 
 /// Producer identity + generation for CPU-sourced sampled bytes, so that equal
@@ -255,8 +265,9 @@ pub(super) fn sampled_texture_descriptor<M: HostMemory>(
 ///   uncorrected stale binds on a repainted surface is the "renders correctly
 ///   for a few frames, then stays corrupted" report.
 ///
-/// Render attachments are engine-owned on every host, so every resident takes
-/// the same currency ladder and guest-write witness below.
+/// The currency ladder distinguishes an engine allocation from a resident over
+/// the guest allocation. A guest write stales the former; it updates the same
+/// bytes in the latter and changes the next Vulkan dependency to `HOST_WRITE`.
 pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     state: &mut Device,
     host: &mut M,
@@ -264,10 +275,17 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     texture_ref: u32,
     resource: Option<std::sync::Arc<crate::model::TaskResource>>,
     may_bind_resident: bool,
+    sampled_shape: reims_vgpu_core::SampledImageShape,
 ) -> Option<(u32, u32, u32, SampledSourceRequest)> {
     if texture_ref == 0 {
         return None;
     }
+    let direct_image_2d = sampled_shape.layers == 1
+        && !sampled_shape.arrayed
+        && !sampled_shape.volume
+        && !sampled_shape.cube
+        && !sampled_shape.one_dim
+        && !sampled_shape.multisampled;
 
     // Opcode-9 buffer-backed texture (type-8): the sampled bytes are an MTLBuffer's
     // guest storage, not a view over another texture. Resolve it directly before
@@ -316,6 +334,66 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     let mut surface: Option<u32> = None;
     let resolved_resource =
         resource.or_else(|| objects::resolve_resource(state, host, task_id, texture_ref).ok());
+
+    // A texture view is a semantic image over its retained base, not a byte
+    // loader that happens to know how to find that base. Resolve the chain once
+    // and offer the selected mip to the same exact-layout import rail as a base
+    // texture. The view object remains the draw's lifetime owner in the caller;
+    // the packed allocation and content witness are owned by the final base.
+    if resolved_resource.as_ref().is_some_and(|resource| {
+        resource.entry().kind == ObjectKind::TextureView
+            && matches!(
+                objects::decoded_resource(resource),
+                Ok(crate::runtime::decode::resource::Descriptor::TextureView(_))
+            )
+    }) {
+        if let Ok(view) = resolve_texture_view_reasoned(state, host, task_id, texture_ref) {
+            let view_level = view
+                .range
+                .map_or(Some(0), |range| u32::try_from(range.level_base).ok())?;
+            if let Ok(base_resource) =
+                objects::resolve_resource(state, host, task_id, view.base_texture_ref)
+            {
+                if let Ok(crate::runtime::decode::resource::Descriptor::Texture(base)) =
+                    objects::decoded_resource(&base_resource)
+                {
+                    let selection = LinearSampleSelection {
+                        level: view_level,
+                        pixel_format: view.pixel_format,
+                        texture_type: view.texture_type,
+                        range: view.range,
+                    };
+                    let exact_shape = base.level(view_level).is_some_and(|level| {
+                        declared_guest_image_selection(
+                            sampled_shape,
+                            base,
+                            level,
+                            view.texture_type,
+                            view.range,
+                        )
+                        .is_some()
+                    });
+                    if exact_shape {
+                        if let Some((w, h, source)) = try_linear_sample_zero_copy(
+                            state,
+                            host,
+                            task_id,
+                            view.base_texture_ref,
+                            base,
+                            sampled_shape,
+                            selection,
+                        ) {
+                            crate::runtime::drain::note_store_route("zc_lin_texture_view");
+                            return Some((w, h, 0, source));
+                        }
+                    }
+                    if refuse_unmaterialized_mip_range(texture_ref, base, selection) {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
     if let Some(resource) = resolved_resource.as_ref() {
         let entry = resource.entry();
         if entry.kind == ObjectKind::IOSurfacePlaneView {
@@ -380,10 +458,15 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // it samples byte-identically (video NV12 R8/RG8, BGRA8/
                 // RGBA8). This bypasses the ~1.5 MB/plane/frame CPU read +
                 // upload the CPU loader below would pay every decoded frame.
-                if let Some(src) = resolved_resource
-                    .as_ref()
-                    .and_then(|_| try_iosurface_plane_view_sample_zero_copy(state, host, mid, view))
-                {
+                if let Some(src) = resolved_resource.as_ref().and_then(|_| {
+                    try_iosurface_plane_view_sample_zero_copy(
+                        state,
+                        host,
+                        mid,
+                        view,
+                        direct_image_2d,
+                    )
+                }) {
                     // Success path: a healthy video decodes ~2 planes/frame,
                     // so this fires per-bind (~99k lines/boot). The aggregate
                     // lives in `sampled_branch_census` (`t5_zc=count:bytes`),
@@ -450,6 +533,9 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     resident_backing != reims_vgpu_core::ResidentContentBacking::NotReady;
                 if resident_ready {
                     crate::runtime::drain::note_store_route(match resident_backing {
+                        reims_vgpu_core::ResidentContentBacking::GuestAllocation => {
+                            "iosurfacesample_ready_guest_allocation"
+                        }
                         reims_vgpu_core::ResidentContentBacking::DeviceAllocation => {
                             "iosurfacesample_ready_device_allocation"
                         }
@@ -466,9 +552,33 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     .mappings
                     .get(&mid)
                     .map(|mapping| mapping.content.surface_epoch);
-                let resident_epoch = resident_ready
+                let mut resident_epoch = resident_ready
                     .then_some(resident_read.content_epoch)
                     .flatten();
+                // A guest write does not stale an image that *is* the guest
+                // allocation. It changes those same bytes. Publish the new
+                // epoch to that representation and change its synchronization
+                // source to HOST_WRITE so the next sampled bind emits the
+                // required availability dependency instead of importing a
+                // second alias over the same memory.
+                if let Some(epoch) = mapping_epoch.filter(|epoch| {
+                    resident_backing == reims_vgpu_core::ResidentContentBacking::GuestAllocation
+                        && Some(*epoch) != resident_epoch
+                }) {
+                    if state
+                        .executor
+                        .note_resident_guest_write(&resident_id, epoch)
+                    {
+                        resident_epoch = Some(epoch);
+                        note_iosurface_texture_sample_rung(
+                            "iosurfacerung_guest_allocation_resynced",
+                        );
+                    } else {
+                        crate::observe::fail(format!(
+                            "iosurface_sample_fail reason=guest_allocation_resync_refused mapping={mid} epoch={epoch}"
+                        ));
+                    }
+                }
                 let resident_current = resident_ready
                     && iosurface_texture_resident_is_current(mapping_epoch, resident_epoch);
 
@@ -646,10 +756,9 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // guest bytes are taken unconditionally. Declining the gather is
                 // expected control flow — the CPU byte loader below serves the
                 // same pixels — so it stays quiet, like the type-2/3 rail's.
-                if let Some(src) = resolved_resource
-                    .as_ref()
-                    .and_then(|_| try_iosurface_texture_sample_zero_copy(state, host, mid, w, h))
-                {
+                if let Some(src) = resolved_resource.as_ref().and_then(|_| {
+                    try_iosurface_texture_sample_zero_copy(state, host, mid, w, h, direct_image_2d)
+                }) {
                     note_iosurface_texture_sample_rung("iosurfacerung_zero_copy");
                     return Some((w, h, mid, src));
                 }
@@ -712,21 +821,32 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 _ => None,
             }
         }) {
+            let selection = LinearSampleSelection::default();
+            let (_, requested_mip_count) = requested_linear_mip_range(tex, selection);
             // Above the gather: a span whose pages a render Store published and
             // nothing has written since is already an engine image, so there is
             // nothing to gather and — the point of the rung — no writeback to
             // wait for. See [`try_gva_resident_sample`].
-            if may_bind_resident {
+            if may_bind_resident && requested_mip_count == 1 {
                 if let Some((w, h, src)) =
                     try_gva_resident_sample(state, host, task_id, texture_ref, resource, tex)
                 {
                     return Some((w, h, 0, src));
                 }
             }
-            if let Some((w, h, src)) =
-                try_linear_sample_zero_copy(state, host, task_id, texture_ref, tex)
-            {
+            if let Some((w, h, src)) = try_linear_sample_zero_copy(
+                state,
+                host,
+                task_id,
+                texture_ref,
+                tex,
+                sampled_shape,
+                selection,
+            ) {
                 return Some((w, h, 0, src));
+            }
+            if refuse_unmaterialized_mip_range(texture_ref, tex, selection) {
+                return None;
             }
             if let Some((w, h, rgba, identity, byte_format)) =
                 load_linear_from_host_caches(state, host, task_id, texture_ref, tex)
@@ -1225,26 +1345,6 @@ fn reclaimed_resample_band(since_ms: u64, cutoff: Option<u64>) -> &'static str {
     }
 }
 
-/// Whether one shader stage occupies any binding number in the **sampled band**,
-/// which holds textures and samplers together.
-///
-/// The band's relocation — `separate_sampled` — is what stops one stage's
-/// binding number landing on the other's, so the question it has to be triggered
-/// from is about the whole band and not about half of it. Asking only about
-/// textures leaves a stage that binds a sampler and no texture invisible to the
-/// trigger, and Metal argument tables are sticky across draws in an encoder, so
-/// a vertex sampler routinely survives a re-bind that zeroed the vertex
-/// textures. With the two stages unseparated their sampler at index 0 resolves
-/// to one binding, `push_smp` is first-writer-wins, and the loser's filter,
-/// address mode and LOD clamp are dropped while the layout's
-/// `VERTEX | FRAGMENT` stage flags let it go on sampling through the winner's.
-///
-/// A ref of zero is not a bind: it is the guest leaving a slot empty, which is
-/// the same reading `push_smp`'s own callers take.
-pub(super) fn stage_uses_sampled_band(textures: &[TextureBind], samplers: &[SamplerBind]) -> bool {
-    textures.iter().any(|t| t.texture_ref != 0) || samplers.iter().any(|s| s.sampler_ref != 0)
-}
-
 fn try_iosurface_texture_target_guest_seed<M: HostMemory + HostOps>(
     state: &mut Device,
     host: &mut M,
@@ -1287,6 +1387,7 @@ fn try_iosurface_texture_target_guest_seed<M: HostMemory + HostOps>(
 
     let (gpas, runs) = mapping_window_guest_runs(state, host, mapping_id, base_off, span)?;
     let page = state.page_size();
+    let physical_pages = reims_vgpu_memory::GuestPageSet::new(&gpas);
     Some(GuestTargetSeed {
         source: GuestRunSource {
             runs: std::sync::Arc::new(runs),
@@ -1294,8 +1395,67 @@ fn try_iosurface_texture_target_guest_seed<M: HostMemory + HostOps>(
             total_len: span,
             row_length_texels,
             pages: guest_page_window(host, gpas, page, base_off % page, span),
+            physical_pages,
         },
         format: layout,
+    })
+}
+
+/// Stable mapping allocation behind an IOSurface texture attachment.
+///
+/// The mapping is the allocation and the decoded surface geometry names the
+/// plane inside it. Vulkan may bind that allocation directly only if its own
+/// image-layout query later agrees with these exact offsets and pitch; a
+/// missing stable alias or any disagreement leaves the ordinary copied
+/// resident as the complete fallback.
+pub(super) fn try_iosurface_texture_target_guest_memory<M: HostMemory + HostOps>(
+    state: &mut Device,
+    host: &mut M,
+    mapping_id: u32,
+    w: u32,
+    h: u32,
+    target_format: reims_vgpu_core::pixel_format::TexelLayout,
+) -> Option<reims_vgpu_memory::GuestTargetMemory> {
+    use crate::runtime::mapping_write::iosurface_texture_sample_window;
+
+    if w == 0 || h == 0 || !mapper::ensure_resolved_for_scanout(state, host, mapping_id) {
+        return None;
+    }
+    let (base_off, bpr) = {
+        let mapping = state.surfaces.mappings.get(&mapping_id)?;
+        if !mapping.lifecycle.active
+            || mapping.pages.entries.is_empty()
+            || !mapping.has_geometry()
+            || mapping.width_or_zero() != w
+            || mapping.height_or_zero() != h
+        {
+            return None;
+        }
+        let format = if mapping.format_or_zero() == 0 {
+            pixel_format::MTL_FORMAT_BGRA8_UNORM
+        } else {
+            mapping.format_or_zero()
+        };
+        if pixel_format::store_texel_order(format)? != target_format {
+            return None;
+        }
+        let (base_off, bpr, _) = iosurface_texture_sample_window(mapping, w, h, format)?;
+        (base_off, u64::from(bpr))
+    };
+    let (import, footprint) = mapper::ensure_contig_import_with_footprint(state, host, mapping_id)?;
+    let backing = reims_vgpu_memory::GuestTargetBacking {
+        allocation_host_ptr: import.host_base(),
+        allocation_len: import.len(),
+        resource_offset: 0,
+        resource_len: import.len(),
+        plane_offset: base_off,
+        row_pitch: bpr,
+    };
+    backing.visible_window(w, h, u64::from(target_format.bytes_per_texel()))?;
+    Some(reims_vgpu_memory::GuestTargetMemory {
+        backing,
+        import,
+        footprint,
     })
 }
 
@@ -1888,28 +2048,73 @@ fn coalesce_pages_to_runs<M: HostOps>(
     Some(runs)
 }
 
-/// Build the single-plane sampled copy from a borrowed retained allocation.
-/// Only the execution run/reference payloads take new strong references; the
-/// allocation geometry and physical construction list stay with the resource.
-// Each argument is an independently decoded piece of the guest's sampled-source
-// contract; grouping them into a struct would only move the same fields.
+fn linear_guest_image_allocation_memory(
+    packed: &crate::runtime::bound_buffers::PackedBufferAccess,
+    allocation: &reims_vgpu_memory::GuestImageAllocationLayout,
+    bytes_per_texel: u64,
+) -> Option<reims_vgpu_memory::GuestTargetMemory> {
+    let base = allocation.base()?;
+    let backing = reims_vgpu_memory::GuestTargetBacking {
+        allocation_host_ptr: packed.import.host_base(),
+        allocation_len: packed.import.len(),
+        resource_offset: packed.head,
+        resource_len: packed.size,
+        plane_offset: packed.head.checked_add(base.offset)?,
+        row_pitch: base.row_pitch,
+    };
+    let resource_end = backing.resource_offset.checked_add(backing.resource_len)?;
+    for mip in allocation.mips.iter() {
+        let offset = packed.head.checked_add(mip.offset)?;
+        let end = offset.checked_add(mip.layout.visible_span(mip.row_pitch, bytes_per_texel)?)?;
+        if offset < backing.resource_offset || end > resource_end {
+            return None;
+        }
+    }
+    Some(reims_vgpu_memory::GuestTargetMemory {
+        backing,
+        import: packed.import.clone(),
+        footprint: packed.footprint.clone(),
+    })
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn linear_sample_from_packed(
     packed: &crate::runtime::bound_buffers::PackedBuffer,
     level_offset: u64,
     span: u64,
     row_length_texels: u32,
+    layout: reims_vgpu_memory::GuestImageLayout,
     native: TexelLayout,
     format: reims_vgpu_protocol::ImageFormat,
     identity: LinearSampleIdentity,
     vouch: crate::runtime::gather_witness::GatherVouch,
     native_components: pixel_format::SwizzlePlan,
 ) -> Option<SampledSourceRequest> {
-    Some(SampledSourceRequest::GuestRuns(
-        packed.texel_source(level_offset, span, row_length_texels)?,
-        native,
+    let transfer = packed.texel_source(level_offset, span, row_length_texels)?;
+    let bytes_per_texel = u64::from(native.bytes_per_texel());
+    let row_pitch = if row_length_texels == 0 {
+        u64::from(layout.width()).checked_mul(bytes_per_texel)?
+    } else {
+        u64::from(row_length_texels).checked_mul(bytes_per_texel)?
+    };
+    let backing = reims_vgpu_memory::GuestTargetBacking {
+        allocation_host_ptr: packed.import.host_base(),
+        allocation_len: packed.import.len(),
+        resource_offset: packed.head,
+        resource_len: packed.size,
+        plane_offset: packed.head.checked_add(level_offset)?,
+        row_pitch,
+    };
+    backing.visible_image_window(layout, bytes_per_texel)?;
+    let memory = reims_vgpu_memory::GuestTargetMemory {
+        backing,
+        import: packed.import.clone(),
+        footprint: packed.footprint.clone(),
+    };
+    Some(SampledSourceRequest::GuestImage(
+        reims_vgpu_memory::GuestImageSource::single_mip(memory, layout, transfer)?,
         format,
-        1,
         Some(identity),
         vouch,
         native_components,
@@ -1987,6 +2192,7 @@ fn witnessed_mapping_sampled_source<M: HostMemory + HostOps>(
             page_size: page,
         },
     );
+    let physical_pages = reims_vgpu_memory::GuestPageSet::new(&gpas);
     let source = retained.unwrap_or_else(|| reims_vgpu_memory::GuestRunSource {
         runs: std::sync::Arc::new(runs),
         source_offset: 0,
@@ -1999,12 +2205,45 @@ fn witnessed_mapping_sampled_source<M: HostMemory + HostOps>(
             plane.base_off % page as u64,
             plane.span,
         ),
+        physical_pages,
     });
     Some((
         source,
         LinearSampleIdentity::from(seen.identity),
         seen.vouch,
     ))
+}
+
+/// Resolve the stable allocation that owns one mapped image plane.
+///
+/// The plane offset and pitch are decoded resource geometry. Vulkan still has
+/// to prove its subresource layout agrees before it may bind this allocation as
+/// an image; this function only preserves the resource's backing identity up to
+/// that admission point.
+fn mapped_guest_image_memory<M: HostMemory + HostOps>(
+    state: &mut Device,
+    host: &mut M,
+    plane: MappedSamplePlane,
+    row_pitch: u64,
+    extent: (u32, u32),
+    bytes_per_texel: u64,
+) -> Option<reims_vgpu_memory::GuestTargetMemory> {
+    let (import, footprint) =
+        mapper::ensure_contig_import_with_footprint(state, host, plane.mapping_id)?;
+    let backing = reims_vgpu_memory::GuestTargetBacking {
+        allocation_host_ptr: import.host_base(),
+        allocation_len: import.len(),
+        resource_offset: 0,
+        resource_len: import.len(),
+        plane_offset: plane.base_off,
+        row_pitch,
+    };
+    backing.visible_window(extent.0, extent.1, bytes_per_texel)?;
+    Some(reims_vgpu_memory::GuestTargetMemory {
+        backing,
+        import,
+        footprint,
+    })
 }
 
 /// The byte extent of a `w × h` image at `bpr` bytes per row and `bpp` bytes per
@@ -2045,6 +2284,305 @@ pub(super) fn strided_level_extent(
         .checked_mul(layout.row_stride)?
         .checked_mul(u64::from(layout.height))?;
     Some((preceding_planes.checked_add(last_plane)?, row_length_texels))
+}
+
+/// Project the decoded resource layout and reflected shader dimension into one
+/// complete image-layout contract.
+///
+/// Array count comes from the texture declaration, while 3D depth comes from
+/// the level record. They are deliberately not interchangeable: Vulkan uses
+/// different create fields and different subresource pitches for each.
+#[cfg(test)]
+pub(super) fn declared_guest_image_layout(
+    shape: reims_vgpu_core::SampledImageShape,
+    texture: &TextureDescriptor,
+    level: &crate::runtime::decode::resource::TextureLevelLayout,
+    view_texture_type: Option<u16>,
+) -> Option<reims_vgpu_memory::GuestImageLayout> {
+    declared_guest_image_selection(shape, texture, level, view_texture_type, None)
+        .map(|selection| selection.0)
+}
+
+/// Exact image shape and byte displacement selected by a texture view.
+///
+/// An array view may expose a layer subrange or one layer as a non-array
+/// image. Geometry and allocation displacement are one answer here so no
+/// caller can update one while continuing to sample the old layer.
+pub(super) fn declared_guest_image_selection(
+    shape: reims_vgpu_core::SampledImageShape,
+    texture: &TextureDescriptor,
+    level: &crate::runtime::decode::resource::TextureLevelLayout,
+    view_texture_type: Option<u16>,
+    view_range: Option<TextureViewRange>,
+) -> Option<(reims_vgpu_memory::GuestImageLayout, u64)> {
+    use crate::runtime::decode::resource::{
+        TEXTURE_VIEW_MTL_TYPE_1D, TEXTURE_VIEW_MTL_TYPE_1D_ARRAY, TEXTURE_VIEW_MTL_TYPE_2D,
+        TEXTURE_VIEW_MTL_TYPE_2D_ARRAY, TEXTURE_VIEW_MTL_TYPE_3D,
+    };
+    if shape.cube || shape.multisampled {
+        return None;
+    }
+    let declaration = texture.declaration?;
+    let storage_type = u16::from(declaration.texture_type);
+    let storage_is_cube = matches!(
+        storage_type,
+        crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_CUBE
+            | crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_CUBE_ARRAY
+    );
+    if texture.slice_count != u32::from(declaration.array_length)
+        || texture.cube_faces != storage_is_cube
+        || !texture.declared_packing_fits_allocation()
+        || !texture.level_fits_slice(level)
+    {
+        return None;
+    }
+    let declared_type = view_texture_type.unwrap_or(storage_type);
+    let (slice_base, slice_count) = view_range
+        .map(|range| (range.slice_base, range.slice_count))
+        .unwrap_or_else(|| match storage_type {
+            TEXTURE_VIEW_MTL_TYPE_1D_ARRAY | TEXTURE_VIEW_MTL_TYPE_2D_ARRAY => {
+                (0, u64::from(declaration.array_length))
+            }
+            _ => (0, 1),
+        });
+    let storage_layers = match storage_type {
+        TEXTURE_VIEW_MTL_TYPE_1D_ARRAY | TEXTURE_VIEW_MTL_TYPE_2D_ARRAY => {
+            u64::from(declaration.array_length)
+        }
+        _ => 1,
+    };
+    if slice_count == 0 || slice_base.checked_add(slice_count)? > storage_layers {
+        return None;
+    }
+    let layer_offset = match storage_type {
+        TEXTURE_VIEW_MTL_TYPE_1D_ARRAY | TEXTURE_VIEW_MTL_TYPE_2D_ARRAY => {
+            texture.bytes_per_slice.checked_mul(slice_base)?
+        }
+        _ if slice_base == 0 && slice_count == 1 => 0,
+        _ => return None,
+    };
+    if shape.one_dim {
+        if level.height != 1 {
+            return None;
+        }
+        if shape.arrayed {
+            if declared_type != TEXTURE_VIEW_MTL_TYPE_1D_ARRAY
+                || storage_type != TEXTURE_VIEW_MTL_TYPE_1D_ARRAY
+            {
+                return None;
+            }
+            let layers = u32::try_from(slice_count).ok()?;
+            return (layers != 0).then_some((
+                reims_vgpu_memory::GuestImageLayout::D1Array {
+                    width: level.width,
+                    layers,
+                    array_pitch: texture.bytes_per_slice,
+                },
+                layer_offset,
+            ));
+        }
+        return (declared_type == TEXTURE_VIEW_MTL_TYPE_1D
+            && matches!(
+                storage_type,
+                TEXTURE_VIEW_MTL_TYPE_1D | TEXTURE_VIEW_MTL_TYPE_1D_ARRAY
+            )
+            && slice_count == 1)
+            .then_some((
+                reims_vgpu_memory::GuestImageLayout::D1 { width: level.width },
+                layer_offset,
+            ));
+    }
+    if shape.volume {
+        if declared_type != TEXTURE_VIEW_MTL_TYPE_3D
+            || storage_type != TEXTURE_VIEW_MTL_TYPE_3D
+            || slice_base != 0
+            || slice_count != 1
+        {
+            return None;
+        }
+        let depth = level.planes();
+        let depth_pitch = level.row_stride.checked_mul(u64::from(level.height))?;
+        return Some((
+            reims_vgpu_memory::GuestImageLayout::D3 {
+                width: level.width,
+                height: level.height,
+                depth,
+                depth_pitch,
+            },
+            0,
+        ));
+    }
+    if shape.arrayed {
+        if declared_type != TEXTURE_VIEW_MTL_TYPE_2D_ARRAY
+            || storage_type != TEXTURE_VIEW_MTL_TYPE_2D_ARRAY
+        {
+            return None;
+        }
+        let layers = u32::try_from(slice_count).ok()?;
+        return (layers != 0).then_some((
+            reims_vgpu_memory::GuestImageLayout::D2Array {
+                width: level.width,
+                height: level.height,
+                layers,
+                array_pitch: texture.bytes_per_slice,
+            },
+            layer_offset,
+        ));
+    }
+    (declared_type == TEXTURE_VIEW_MTL_TYPE_2D
+        && matches!(
+            storage_type,
+            TEXTURE_VIEW_MTL_TYPE_2D | TEXTURE_VIEW_MTL_TYPE_2D_ARRAY
+        )
+        && slice_count == 1)
+        .then_some((
+            reims_vgpu_memory::GuestImageLayout::D2 {
+                width: level.width,
+                height: level.height,
+            },
+            layer_offset,
+        ))
+}
+
+/// Complete Vulkan-compatible allocation layout and the view selected from it.
+///
+/// Linear texture storage is slice-major: every array slice owns one complete
+/// mip chain and `bytes_per_slice` advances between equal mip levels in
+/// adjacent slices. Vulkan expresses that same relation as `arrayPitch` on
+/// each mip. A volume is different: its shrinking depth remains inside the
+/// mip and is represented by `depthPitch`, never by array layers.
+pub(super) fn declared_guest_image_allocation(
+    shape: reims_vgpu_core::SampledImageShape,
+    texture: &TextureDescriptor,
+    view_texture_type: Option<u16>,
+    view_range: Option<TextureViewRange>,
+    bytes_per_texel: u64,
+) -> Option<(
+    reims_vgpu_memory::GuestImageAllocationLayout,
+    reims_vgpu_memory::GuestImageViewRange,
+)> {
+    use crate::runtime::decode::resource::{
+        TEXTURE_VIEW_MTL_TYPE_1D, TEXTURE_VIEW_MTL_TYPE_1D_ARRAY, TEXTURE_VIEW_MTL_TYPE_2D,
+        TEXTURE_VIEW_MTL_TYPE_2D_ARRAY, TEXTURE_VIEW_MTL_TYPE_3D,
+    };
+
+    if shape.cube
+        || shape.multisampled
+        || texture.cube_faces
+        || texture.compressed_layout
+        || bytes_per_texel == 0
+        || !texture.declared_packing_fits_allocation()
+    {
+        return None;
+    }
+    let declaration = texture.declaration?;
+    let storage_type = u16::from(declaration.texture_type);
+    let declared_mips = texture.mipmap_level_count.max(1);
+    if texture.levels.len() != usize::try_from(declared_mips).ok()?
+        || texture.slice_count != u32::from(declaration.array_length)
+    {
+        return None;
+    }
+
+    let storage_layers = match storage_type {
+        TEXTURE_VIEW_MTL_TYPE_1D_ARRAY | TEXTURE_VIEW_MTL_TYPE_2D_ARRAY => {
+            u32::from(declaration.array_length)
+        }
+        TEXTURE_VIEW_MTL_TYPE_1D | TEXTURE_VIEW_MTL_TYPE_2D | TEXTURE_VIEW_MTL_TYPE_3D => 1,
+        _ => return None,
+    };
+    if storage_layers == 0 {
+        return None;
+    }
+
+    let (base_mip_level, mip_level_count, base_array_layer, array_layer_count) = match view_range {
+        Some(range) => (
+            u32::try_from(range.level_base).ok()?,
+            u32::try_from(range.level_count).ok()?,
+            u32::try_from(range.slice_base).ok()?,
+            u32::try_from(range.slice_count).ok()?,
+        ),
+        None => (0, declared_mips, 0, storage_layers),
+    };
+    let view = reims_vgpu_memory::GuestImageViewRange {
+        base_mip_level,
+        mip_level_count,
+        base_array_layer,
+        array_layer_count,
+    };
+
+    let base_level = texture.level(base_mip_level)?;
+    declared_guest_image_selection(shape, texture, base_level, view_texture_type, view_range)?;
+
+    let first = texture.level(0)?;
+    let mut mips = Vec::with_capacity(texture.levels.len());
+    for (index, level) in texture.levels.iter().enumerate() {
+        let mip = u32::try_from(index).ok()?;
+        let reduced = |base: u32| base.checked_shr(mip).unwrap_or(0).max(1);
+        let expected_width = reduced(first.width);
+        let expected_height = reduced(first.height);
+        let expected_depth = reduced(first.planes());
+        if !texture.level_fits_slice(level)
+            || level.width != expected_width
+            || level.row_stride < u64::from(level.width).checked_mul(bytes_per_texel)?
+            || !level.row_stride.is_multiple_of(bytes_per_texel)
+        {
+            return None;
+        }
+
+        let layout = match storage_type {
+            TEXTURE_VIEW_MTL_TYPE_1D if level.height == 1 && level.planes() == 1 => {
+                reims_vgpu_memory::GuestImageLayout::D1 { width: level.width }
+            }
+            TEXTURE_VIEW_MTL_TYPE_1D_ARRAY if level.height == 1 && level.planes() == 1 => {
+                reims_vgpu_memory::GuestImageLayout::D1Array {
+                    width: level.width,
+                    layers: storage_layers,
+                    array_pitch: texture.bytes_per_slice,
+                }
+            }
+            TEXTURE_VIEW_MTL_TYPE_2D if level.height == expected_height && level.planes() == 1 => {
+                reims_vgpu_memory::GuestImageLayout::D2 {
+                    width: level.width,
+                    height: level.height,
+                }
+            }
+            TEXTURE_VIEW_MTL_TYPE_2D_ARRAY
+                if level.height == expected_height && level.planes() == 1 =>
+            {
+                reims_vgpu_memory::GuestImageLayout::D2Array {
+                    width: level.width,
+                    height: level.height,
+                    layers: storage_layers,
+                    array_pitch: texture.bytes_per_slice,
+                }
+            }
+            TEXTURE_VIEW_MTL_TYPE_3D
+                if level.height == expected_height && level.planes() == expected_depth =>
+            {
+                reims_vgpu_memory::GuestImageLayout::D3 {
+                    width: level.width,
+                    height: level.height,
+                    depth: level.planes(),
+                    depth_pitch: level.row_stride.checked_mul(u64::from(level.height))?,
+                }
+            }
+            _ => return None,
+        };
+        let tight_row = u32::try_from(u64::from(level.width).checked_mul(bytes_per_texel)?).ok()?;
+        if level.slice_read_span(tight_row)? > level.size {
+            return None;
+        }
+        mips.push(reims_vgpu_memory::GuestImageMipLayout {
+            offset: texture.base_offset.checked_add(level.offset)?,
+            row_pitch: level.row_stride,
+            layout,
+        });
+    }
+    let allocation = reims_vgpu_memory::GuestImageAllocationLayout {
+        mips: std::sync::Arc::from(mips),
+    };
+    view.fits(&allocation).then_some((allocation, view))
 }
 
 /// Gather `span` bytes from `base_off` into mapping `mid`'s guest pages as host
@@ -2170,6 +2708,7 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
         }
     };
     let page = state.page_size();
+    let physical_pages = reims_vgpu_memory::GuestPageSet::new(&gpas);
     let pages = guest_page_window(host, gpas, page, (gva + offset) % page, span);
     crate::runtime::drain::note_store_route(if pages.is_some() {
         "zc_buffer_imported"
@@ -2182,6 +2721,7 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
         source_offset: 0,
         runs: std::sync::Arc::new(runs),
         pages,
+        physical_pages,
     })
 }
 
@@ -2198,6 +2738,7 @@ fn bound_buffer_content(
         total_len: bound.span,
         row_length_texels: 0,
         pages: bound.pages.clone(),
+        physical_pages: bound.physical_pages.clone(),
     })
 }
 
@@ -2450,6 +2991,7 @@ fn retained_resident_is_ready(
     use reims_vgpu_core::ResidentContentBacking;
 
     match backing {
+        Some(ResidentContentBacking::GuestAllocation) => true,
         Some(ResidentContentBacking::DeviceAllocation) => true,
         Some(ResidentContentBacking::NotReady) => false,
         None => registry_query(),
@@ -2589,6 +3131,10 @@ mod gva_resident_ownership_tests {
 
     #[test]
     fn a_retained_texture_answers_readiness_without_a_registry_query() {
+        assert!(retained_resident_is_ready(
+            Some(ResidentContentBacking::GuestAllocation),
+            || panic!("a retained guest allocation must not query the registry")
+        ));
         assert!(retained_resident_is_ready(
             Some(ResidentContentBacking::DeviceAllocation),
             || panic!("a retained allocation must not query the registry")
@@ -2759,20 +3305,121 @@ fn zc_lin_no_layout_route(reason: pixel_format::SampledTexelDecline) -> &'static
     }
 }
 
-pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct LinearSampleSelection {
+    pub(super) level: u32,
+    pub(super) pixel_format: Option<u16>,
+    pub(super) texture_type: Option<u16>,
+    pub(super) range: Option<TextureViewRange>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinearMipRangeDecline {
+    /// The requested view needs a mip chain, but no materialization preserving
+    /// that complete chain was available. A one-level byte upload or resident
+    /// render target is not an equivalent representation.
+    CompleteAllocationUnavailable {
+        texture_ref: u32,
+        base_mip_level: u64,
+        mip_level_count: u64,
+    },
+}
+
+impl crate::observe::Decline for LinearMipRangeDecline {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::CompleteAllocationUnavailable { .. } => {
+                "linear_mip_complete_allocation_unavailable"
+            }
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::CompleteAllocationUnavailable {
+                texture_ref,
+                base_mip_level,
+                mip_level_count,
+            } => vec![
+                ("ref", texture_ref.to_string()),
+                ("base_mip", base_mip_level.to_string()),
+                ("mip_count", mip_level_count.to_string()),
+            ],
+        }
+    }
+}
+
+reims_vgpu_observe::decline_display!(LinearMipRangeDecline);
+
+pub(super) fn requested_linear_mip_range(
+    tex: &TextureDescriptor,
+    selection: LinearSampleSelection,
+) -> (u64, u64) {
+    selection.range.map_or_else(
+        || (0, u64::from(tex.mipmap_level_count.max(1))),
+        |range| (range.level_base, range.level_count),
+    )
+}
+
+pub(super) fn direct_binding_requirement(
+    disposition: Option<reims_vgpu_memory::GuestImageBindingDisposition>,
+) -> Option<reims_vgpu_memory::GuestImageBindingRequirement> {
+    match disposition {
+        Some(reims_vgpu_memory::GuestImageBindingDisposition::Direct(requirement)) => {
+            Some(requirement)
+        }
+        Some(reims_vgpu_memory::GuestImageBindingDisposition::Refused) | None => None,
+    }
+}
+
+fn refuse_unmaterialized_mip_range(
+    texture_ref: u32,
+    tex: &TextureDescriptor,
+    selection: LinearSampleSelection,
+) -> bool {
+    let (base_mip_level, mip_level_count) = requested_linear_mip_range(tex, selection);
+    if mip_level_count == 1 {
+        return false;
+    }
+    crate::runtime::drain::note_store_route("lin_mip_complete_allocation_unavailable");
+    crate::observe::Emit::decline(
+        "linear_sample",
+        &LinearMipRangeDecline::CompleteAllocationUnavailable {
+            texture_ref,
+            base_mip_level,
+            mip_level_count,
+        },
+    )
+    .fail_once(u64::from(texture_ref));
+    true
+}
+
+fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     state: &mut Device,
     host: &mut M,
     task_id: u32,
     texture_ref: u32,
     tex: &TextureDescriptor,
+    sampled_shape: reims_vgpu_core::SampledImageShape,
+    selection: LinearSampleSelection,
 ) -> Option<(u32, u32, SampledSourceRequest)> {
     // The object-list entry + descriptor are resolved+decoded once by the caller
     // (`resolve_sampled_source`'s linear branch) and threaded in as `tex`; the
     // cache fallback shares the same decode.
-    let Some(declared_format) = tex.declared_pixel_format() else {
+    let Some(base_format) = tex.declared_pixel_format() else {
         crate::runtime::drain::note_store_route("zc_lin_no_declared_format");
         return None;
     };
+    let declared_format =
+        match effective_view_sample_format_reasoned(base_format, selection.pixel_format) {
+            Ok(format) => format,
+            Err(reason) => {
+                crate::observe::Emit::decline("zc_lin_view_format", &reason)
+                    .field("ref", texture_ref)
+                    .fail_once(u64::from(texture_ref) << 32 | u64::from(selection.level));
+                return None;
+            }
+        };
     // sRGB variants ride the same rail as their linear siblings: the layout is
     // identical and the CPU loaders never decoded either. The qualifier is
     // still lost, so the census records it rather than letting the fold be
@@ -2859,7 +3506,17 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
             }
         };
     let bpp = native.bytes_per_texel();
-    let Some((gva, layout)) = tex.level_gva(0, state.page_shift) else {
+    // Derive the allocation/view contract once. The same answer governs the
+    // direct binding query, direct materialization and transfer fallback; none
+    // of those layers may independently reinterpret the texture descriptor.
+    let image_contract = declared_guest_image_allocation(
+        sampled_shape,
+        tex,
+        selection.texture_type,
+        selection.range,
+        u64::from(bpp),
+    );
+    let Some((level_gva, layout)) = tex.level_gva(selection.level, state.page_shift) else {
         crate::runtime::drain::note_store_route("zc_lin_no_level_gva");
         return None;
     };
@@ -2868,12 +3525,40 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route("zc_lin_no_extent");
         return None;
     }
-    let Some((span, row_length_texels)) = strided_level_extent(layout, bpp as u64) else {
+    let guest_selection = declared_guest_image_selection(
+        sampled_shape,
+        tex,
+        layout,
+        selection.texture_type,
+        selection.range,
+    );
+    let guest_layout = guest_selection.map(|selection| selection.0);
+    let subresource_offset = guest_selection.map_or(0, |selection| selection.1);
+    let plane_offset = tex
+        .base_offset
+        .checked_add(layout.offset)?
+        .checked_add(subresource_offset)?;
+    let gva = level_gva.checked_add(subresource_offset)?;
+    let row_length_texels = if layout.row_stride == u64::from(w).checked_mul(u64::from(bpp))? {
+        0
+    } else {
+        u32::try_from(layout.row_stride.checked_div(u64::from(bpp))?).ok()?
+    };
+    if !layout.row_stride.is_multiple_of(u64::from(bpp)) {
         crate::runtime::drain::note_store_route("zc_lin_unstrideable");
         return None;
+    }
+    let span = match guest_layout {
+        Some(image) => image.visible_span(layout.row_stride, u64::from(bpp)),
+        None => strided_level_extent(layout, u64::from(bpp)).map(|(span, _)| span),
+    }?;
+    let planes = match guest_layout {
+        Some(reims_vgpu_memory::GuestImageLayout::D1Array { layers, .. })
+        | Some(reims_vgpu_memory::GuestImageLayout::D2Array { layers, .. }) => layers,
+        Some(reims_vgpu_memory::GuestImageLayout::D3 { depth, .. }) => depth,
+        _ => layout.planes(),
     };
-    let planes = layout.planes();
-    if tex.allocation_size != 0 && layout.offset.saturating_add(span) > tex.allocation_size {
+    if tex.allocation_size != 0 && plane_offset.saturating_add(span) > tex.allocation_size {
         crate::runtime::drain::note_store_route("zc_lin_past_allocation");
         return None;
     }
@@ -2916,18 +3601,6 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
             size: tex.allocation_size,
         });
 
-    let available = allocation.as_ref().is_some_and(|backing| {
-        crate::runtime::bound_buffers::ensure_packed_resource(
-            state,
-            host,
-            task_id,
-            texture_ref,
-            backing.gva,
-            backing.size,
-            crate::runtime::bound_buffers::PackedResourceUse::LinearSample,
-        )
-    });
-
     // The witness recorder mutably borrows `state`, so the request owns its
     // lightweight retained-allocation handles across that call. This applies to
     // a direct-image candidate too: exact image admission belongs to the
@@ -2937,20 +3610,161 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
         .resources
         .identity(task_id, texture_ref)?;
     // every other packed source uses or it would upload on every bind.
-    let packed = if available {
-        allocation.as_ref().and_then(|backing| {
+    let packed_span = crate::runtime::sampled_phase::Span::open(
+        crate::runtime::sampled_phase::Part::LinearPacked,
+    );
+    let mut packed = allocation.as_ref().and_then(|backing| {
+        state
+            .bound_buffers
+            .packed_available(task_id, texture_ref, backing.gva, backing.size)
+            .map(crate::runtime::bound_buffers::PackedBuffer::access)
+    });
+    if packed.is_none() {
+        packed = allocation.as_ref().and_then(|backing| {
+            crate::runtime::bound_buffers::ensure_packed_resource(
+                state,
+                host,
+                task_id,
+                texture_ref,
+                backing.gva,
+                backing.size,
+                crate::runtime::bound_buffers::PackedResourceUse::LinearSample,
+            )
+            .then(|| {
+                state
+                    .bound_buffers
+                    .packed_available(task_id, texture_ref, backing.gva, backing.size)
+                    .map(crate::runtime::bound_buffers::PackedBuffer::access)
+            })
+            .flatten()
+        });
+    }
+    drop(packed_span);
+
+    // Vulkan's image memory requirement may extend beyond the guest's final
+    // visible byte. Ask the backend for that exact extent before publishing
+    // the direct image. The resource owner may then replace its host view with
+    // guest pages followed by host-only padding; its footprint and writeback
+    // remain bounded by the guest allocation.
+    let mut direct_admitted = false;
+    if guest_layout.is_some() {
+        let _admission_span = crate::runtime::sampled_phase::Span::open(
+            crate::runtime::sampled_phase::Part::LinearAdmission,
+        );
+        let binding_request = packed.as_ref().and_then(|current| {
+            let (image_allocation, _) = image_contract.as_ref()?;
+            let memory =
+                linear_guest_image_allocation_memory(current, image_allocation, u64::from(bpp))?;
+            Some(reims_vgpu_memory::GuestImageBindingRequest {
+                backing: memory.backing,
+                allocation: image_allocation.clone(),
+                format: sampled_format,
+            })
+        });
+        let binding_key = binding_request.as_ref().map(|request| request.key());
+        let known_disposition = binding_key.as_ref().and_then(|key| {
+            let backing = allocation.as_ref()?;
             state
                 .bound_buffers
-                .packed_available(task_id, texture_ref, backing.gva, backing.size)
-                .cloned()
-        })
-    } else {
-        None
-    };
+                .packed_available(task_id, texture_ref, backing.gva, backing.size)?
+                .sampled_image_requirements
+                .get(key)
+                .copied()
+        });
+        let disposition = known_disposition.or_else(|| {
+            state
+                .executor
+                .sampled_image_binding_requirement(binding_request.clone()?)
+        });
+        if known_disposition.is_none() {
+            if let (Some(key), Some(disposition), Some(backing)) =
+                (binding_key, disposition, allocation.as_ref())
+            {
+                state.bound_buffers.note_sampled_image_requirement(
+                    task_id,
+                    texture_ref,
+                    backing.gva,
+                    backing.size,
+                    key.clone(),
+                    disposition,
+                );
+            }
+        }
+        let requirement = direct_binding_requirement(disposition);
+        direct_admitted = requirement.is_some();
+        if let (Some(requirement), Some(current), Some(backing)) =
+            (requirement, packed.as_ref(), allocation.as_ref())
+        {
+            if requirement.allocation_len > current.import.len()
+                && crate::runtime::bound_buffers::ensure_packed_resource_for_image(
+                    state,
+                    host,
+                    crate::runtime::bound_buffers::PackedImageBinding {
+                        task_id,
+                        resource_ref: texture_ref,
+                        gva: backing.gva,
+                        size: backing.size,
+                        required_import_len: requirement.allocation_len,
+                        usage: crate::runtime::bound_buffers::PackedResourceUse::LinearSample,
+                    },
+                )
+            {
+                packed = state
+                    .bound_buffers
+                    .packed_available(task_id, texture_ref, backing.gva, backing.size)
+                    .map(crate::runtime::bound_buffers::PackedBuffer::access);
+            }
+        }
+    }
 
     if let Some(packed) = packed {
+        if let Some((image_allocation, view)) = image_contract.as_ref() {
+            let page = state.page_size();
+            let witness = packed.witness_window(0, packed.size)?;
+            let witness_runs = [reims_vgpu_memory::GuestRun {
+                host_ptr: witness.host_ptr,
+                len: packed.size,
+            }];
+            let stated = crate::runtime::gather_witness::StatedGeneration::TaskResource(
+                state.resource_write_stamp_for(resource)?,
+            );
+            let allocation_gva = allocation.as_ref()?.gva;
+            let seen = crate::runtime::gather_witness::note_gather(
+                state,
+                crate::runtime::gather_witness::GatherRail::Linear,
+                crate::runtime::gather_witness::GatherKey::TaskGva {
+                    task_id,
+                    resource,
+                    gva: allocation_gva,
+                },
+                stated,
+                crate::runtime::gather_witness::GatherWindow {
+                    gpas: witness.gpas,
+                    runs: &witness_runs,
+                    span: packed.size,
+                    page_size: page as usize,
+                },
+            );
+            let memory =
+                linear_guest_image_allocation_memory(&packed, image_allocation, u64::from(bpp))?;
+            let transfer = packed.texel_source(0, packed.size, 0)?;
+            let request = SampledSourceRequest::GuestImage(
+                reims_vgpu_memory::GuestImageSource {
+                    direct: direct_admitted.then_some(memory),
+                    allocation: image_allocation.clone(),
+                    view: *view,
+                    transfer,
+                },
+                sampled_format,
+                Some(LinearSampleIdentity::from(seen.identity)),
+                seen.vouch,
+                native_components,
+            );
+            return Some((w, h, request));
+        }
+
         let page = state.page_size();
-        let witness = packed.witness_window(layout.offset, span)?;
+        let witness = packed.witness_window(plane_offset, span)?;
         let witness_runs = [reims_vgpu_memory::GuestRun {
             host_ptr: witness.host_ptr,
             len: span,
@@ -2974,34 +3788,94 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                 page_size: page as usize,
             },
         );
-        if planes == 1 {
-            let request = linear_sample_from_packed(
-                &packed,
-                layout.offset,
-                span,
-                row_length_texels,
-                native,
-                sampled_format,
-                LinearSampleIdentity::from(seen.identity),
-                seen.vouch,
-                native_components,
-            )?;
-            return Some((w, h, request));
-        }
+        let source = reims_vgpu_memory::GuestRunSource {
+            runs: std::sync::Arc::clone(&packed.runs),
+            source_offset: plane_offset,
+            total_len: span,
+            row_length_texels,
+            pages: Some(std::sync::Arc::clone(&packed.pages)),
+            physical_pages: reims_vgpu_memory::GuestPageSet::new(witness.gpas),
+        };
         return Some((
             w,
             h,
             SampledSourceRequest::GuestRuns(
-                reims_vgpu_memory::GuestRunSource {
-                    runs: std::sync::Arc::clone(&packed.runs),
-                    source_offset: layout.offset,
-                    total_len: span,
-                    row_length_texels,
-                    pages: Some(std::sync::Arc::clone(&packed.pages)),
-                },
+                source,
                 native,
                 sampled_format,
                 planes,
+                Some(LinearSampleIdentity::from(seen.identity)),
+                seen.vouch,
+                native_components,
+            ),
+        ));
+    }
+
+    // A complete image contract does not depend on host-pointer import. When
+    // no stable parent alias exists, retain the same allocation/view shape and
+    // expose its full resource as runs; the executor's ordinary gather path
+    // materializes every selected mip from that description.
+    if let (Some(backing), Some((image_allocation, view))) =
+        (allocation.as_ref(), image_contract.as_ref())
+    {
+        let (gpas, runs) =
+            match task_gva_guest_run_window(state, host, task_id, backing.gva, backing.size) {
+                Ok(window) => window,
+                Err(refusal) => {
+                    crate::runtime::drain::note_store_route(match refusal {
+                        WindowRefusal::NoAlias => "zc_lin_no_alias",
+                        WindowRefusal::SpanUnmapped => "zc_lin_span_unmapped",
+                        WindowRefusal::Untileable => "zc_lin_untileable",
+                    });
+                    return None;
+                }
+            };
+        let page = state.page_size() as usize;
+        let stated = crate::runtime::gather_witness::StatedGeneration::TaskResource(
+            state.resource_write_stamp_for(resource)?,
+        );
+        let seen = crate::runtime::gather_witness::note_gather(
+            state,
+            crate::runtime::gather_witness::GatherRail::Linear,
+            crate::runtime::gather_witness::GatherKey::TaskGva {
+                task_id,
+                resource,
+                gva: backing.gva,
+            },
+            stated,
+            crate::runtime::gather_witness::GatherWindow {
+                gpas: &gpas,
+                runs: &runs,
+                span: backing.size,
+                page_size: page,
+            },
+        );
+        let physical_pages = reims_vgpu_memory::GuestPageSet::new(&gpas);
+        let transfer = reims_vgpu_memory::GuestRunSource {
+            runs: std::sync::Arc::new(runs),
+            source_offset: 0,
+            total_len: backing.size,
+            row_length_texels: 0,
+            pages: guest_page_window(
+                host,
+                gpas,
+                page as u64,
+                backing.gva % page as u64,
+                backing.size,
+            ),
+            physical_pages,
+        };
+        return Some((
+            w,
+            h,
+            SampledSourceRequest::GuestImage(
+                reims_vgpu_memory::GuestImageSource {
+                    direct: None,
+                    allocation: image_allocation.clone(),
+                    view: *view,
+                    transfer,
+                },
+                sampled_format,
                 Some(LinearSampleIdentity::from(seen.identity)),
                 seen.vouch,
                 native_components,
@@ -3041,17 +3915,20 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
             page_size: page,
         },
     );
+    let physical_pages = reims_vgpu_memory::GuestPageSet::new(&gpas);
+    let source = reims_vgpu_memory::GuestRunSource {
+        runs: std::sync::Arc::new(runs),
+        source_offset: 0,
+        total_len: span,
+        row_length_texels,
+        pages: guest_page_window(host, gpas, page as u64, gva % page as u64, span),
+        physical_pages,
+    };
     Some((
         w,
         h,
         SampledSourceRequest::GuestRuns(
-            reims_vgpu_memory::GuestRunSource {
-                runs: std::sync::Arc::new(runs),
-                source_offset: 0,
-                total_len: span,
-                row_length_texels,
-                pages: guest_page_window(host, gpas, page as u64, gva % page as u64, span),
-            },
+            source,
             native,
             sampled_format,
             planes,
@@ -3075,6 +3952,7 @@ pub(super) fn try_iosurface_texture_sample_zero_copy<M: HostMemory + HostOps>(
     mid: u32,
     w: u32,
     h: u32,
+    direct_image_2d: bool,
 ) -> Option<SampledSourceRequest> {
     use crate::runtime::mapping_write::iosurface_texture_sample_window;
     if w == 0 || h == 0 {
@@ -3114,28 +3992,55 @@ pub(super) fn try_iosurface_texture_sample_zero_copy<M: HostMemory + HostOps>(
     // `is_four_byte_color` gate above already fixes it at four.
     let (span, row_length_texels) =
         strided_window_extent(w, h, native.bytes_per_texel() as u64, bpr)?;
+    let plane = MappedSamplePlane {
+        mapping_id: mid,
+        base_off,
+        span,
+        row_length_texels,
+    };
     let (source, identity, vouch) = witnessed_mapping_sampled_source(
         state,
         host,
         crate::runtime::gather_witness::GatherRail::IOSurface,
-        MappedSamplePlane {
-            mapping_id: mid,
-            base_off,
-            span,
-            row_length_texels,
-        },
+        plane,
     )?;
-    Some(SampledSourceRequest::GuestRuns(
-        source,
-        native,
-        sampled_format,
-        1,
-        Some(identity),
-        vouch,
-        // Identity: this rail admitted the format only after checking its plan
-        // was identity, so there is nothing to fold in.
-        pixel_format::swizzle_identity(),
-    ))
+    let memory = direct_image_2d
+        .then(|| {
+            mapped_guest_image_memory(
+                state,
+                host,
+                plane,
+                bpr,
+                (w, h),
+                u64::from(native.bytes_per_texel()),
+            )
+        })
+        .flatten();
+    Some(match memory {
+        Some(memory) => SampledSourceRequest::GuestImage(
+            reims_vgpu_memory::GuestImageSource::single_mip(
+                memory,
+                reims_vgpu_memory::GuestImageLayout::D2 {
+                    width: w,
+                    height: h,
+                },
+                source,
+            )?,
+            sampled_format,
+            Some(identity),
+            vouch,
+            pixel_format::swizzle_identity(),
+        ),
+        None => SampledSourceRequest::GuestRuns(
+            source,
+            native,
+            sampled_format,
+            1,
+            Some(identity),
+            vouch,
+            pixel_format::swizzle_identity(),
+        ),
+    })
 }
 
 /// Zero-copy rail for a IOSurface plane view serialized IOSurface plane view — the video
@@ -3152,6 +4057,7 @@ pub(super) fn try_iosurface_plane_view_sample_zero_copy<M: HostMemory + HostOps>
     host: &mut M,
     mid: u32,
     view: objects::IOSurfacePlaneViewDescriptor,
+    direct_image_2d: bool,
 ) -> Option<SampledSourceRequest> {
     use crate::runtime::mapping_write::iosurface_plane_view_sample_window;
     let (w, h) = (view.width, view.height);
@@ -3191,28 +4097,55 @@ pub(super) fn try_iosurface_plane_view_sample_zero_copy<M: HostMemory + HostOps>
         (native, sampled_format, bpp, base_off, bpr_u32 as u64)
     };
     let (span, row_length_texels) = strided_window_extent(w, h, bpp as u64, bpr)?;
+    let plane = MappedSamplePlane {
+        mapping_id: mid,
+        base_off,
+        span,
+        row_length_texels,
+    };
     let (source, identity, vouch) = witnessed_mapping_sampled_source(
         state,
         host,
         crate::runtime::gather_witness::GatherRail::IOSurfacePlaneView,
-        MappedSamplePlane {
-            mapping_id: mid,
-            base_off,
-            span,
-            row_length_texels,
-        },
+        plane,
     )?;
-    Some(SampledSourceRequest::GuestRuns(
-        source,
-        native,
-        sampled_format,
-        1,
-        Some(identity),
-        vouch,
-        // Identity: this rail admitted the format only after checking its plan
-        // was identity, so there is nothing to fold in.
-        pixel_format::swizzle_identity(),
-    ))
+    let memory = direct_image_2d
+        .then(|| {
+            mapped_guest_image_memory(
+                state,
+                host,
+                plane,
+                bpr,
+                (w, h),
+                u64::from(native.bytes_per_texel()),
+            )
+        })
+        .flatten();
+    Some(match memory {
+        Some(memory) => SampledSourceRequest::GuestImage(
+            reims_vgpu_memory::GuestImageSource::single_mip(
+                memory,
+                reims_vgpu_memory::GuestImageLayout::D2 {
+                    width: w,
+                    height: h,
+                },
+                source,
+            )?,
+            sampled_format,
+            Some(identity),
+            vouch,
+            pixel_format::swizzle_identity(),
+        ),
+        None => SampledSourceRequest::GuestRuns(
+            source,
+            native,
+            sampled_format,
+            1,
+            Some(identity),
+            vouch,
+            pixel_format::swizzle_identity(),
+        ),
+    })
 }
 
 /// Serve a guest-CPU-produced linear texture (tight OR padded row stride)
@@ -3420,7 +4353,13 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
     // is a slower path, not lost work.
     let span = bpr.checked_mul(h as u64)?.checked_mul(u64::from(planes))?;
     let native_len = host_alloc_len(span)?;
-    if tex.allocation_size != 0 && layout.offset.saturating_add(span) > tex.allocation_size {
+    if tex.allocation_size != 0
+        && tex
+            .base_offset
+            .checked_add(layout.offset)
+            .and_then(|offset| offset.checked_add(span))
+            .is_none_or(|end| end > tex.allocation_size)
+    {
         return None;
     }
     // Same coherence rule as the general loader: land any resident-authoritative

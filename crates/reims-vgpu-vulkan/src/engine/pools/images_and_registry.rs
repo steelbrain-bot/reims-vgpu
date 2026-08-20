@@ -25,6 +25,79 @@ fn resident_resample_band(idle_ms: u64) -> &'static str {
     }
 }
 
+/// Whether a sampled declaration names the exact imported allocation already
+/// owned by a target resident.
+///
+/// Reusing the resident is correctness, not a cache hit. Two Vulkan images
+/// bound over the same external bytes have independent layout state, and image
+/// aliasing only preserves a common interpretation under stricter identical-
+/// creation rules. One backing therefore has one image whenever the semantic
+/// view fits it; format interpretation remains an image-view concern.
+fn guest_sampled_matches_resident(
+    slot: &ResidentTargetSlot,
+    memory: &reims_vgpu_memory::GuestTargetMemory,
+    sampled: SampledKey,
+) -> bool {
+    let Some(held) = slot.memory.guest_memory() else {
+        return false;
+    };
+    held.import.id() == memory.import.id()
+        && held.backing == memory.backing
+        && slot.width == sampled.width
+        && slot.height == sampled.height
+        && slot.sample_count == 1
+        && slot.format.allocation() == translate::pixel::storage_format(sampled.format)
+        && slot.content_ready
+}
+
+fn guest_resident_backing_key(slot: &ResidentTargetSlot) -> Option<GuestResidentBackingKey> {
+    let memory = slot.memory.guest_memory()?;
+    Some(GuestResidentBackingKey {
+        import: memory.import.id(),
+        backing: memory.backing,
+        width: slot.width,
+        height: slot.height,
+        sample_count: slot.sample_count,
+        format: slot.format.allocation(),
+    })
+}
+
+fn guest_sampled_resident_match(
+    registry: &HashMap<TargetIdentity, ResidentTargetSlot>,
+    authority: &HashMap<GuestResidentBackingKey, TargetIdentity>,
+    memory: &reims_vgpu_memory::GuestTargetMemory,
+    sampled: SampledKey,
+    excludes: impl Fn(&TargetIdentity) -> bool,
+) -> Result<Option<TargetIdentity>, usize> {
+    let key = GuestResidentBackingKey {
+        import: memory.import.id(),
+        backing: memory.backing,
+        width: sampled.width,
+        height: sampled.height,
+        sample_count: 1,
+        format: translate::pixel::storage_format(sampled.format),
+    };
+    if let Some(identity) = authority.get(&key) {
+        crate::telemetry::note_route("sampled_guest_uses_backing_authority");
+        return Ok((!excludes(identity)
+            && registry
+                .get(identity)
+                .is_some_and(|slot| guest_sampled_matches_resident(slot, memory, sampled)))
+        .then(|| identity.clone()));
+    }
+    let mut matches = registry.iter().filter_map(|(identity, slot)| {
+        (!excludes(identity) && guest_sampled_matches_resident(slot, memory, sampled))
+            .then_some(identity.clone())
+    });
+    let first = matches.next();
+    let Some(second) = matches.next() else {
+        return Ok(first);
+    };
+    let count = 2 + matches.count();
+    let _ = second;
+    Err(count)
+}
+
 /// Everything a creation site knows about a resident it has just built.
 ///
 /// The stored [`ResidentTargetSlot`] is this plus what the registry owns and a
@@ -35,6 +108,7 @@ fn resident_resample_band(idle_ms: u64) -> &'static str {
 struct NewResident {
     image: vk::Image,
     memory: ResidentMemory,
+    guest_backing: Option<reims_vgpu_memory::GuestTargetBacking>,
     view: vk::ImageView,
     /// `vk::Framebuffer::null()` for a resident that is never bound as a
     /// standalone single-RT target — see
@@ -60,6 +134,206 @@ struct NewResident {
 }
 
 impl ResourcePools {
+    /// Resolve a sampled declaration to a Vulkan-initialized target resident.
+    ///
+    /// A pre-populated guest allocation cannot itself become a sampled Vulkan
+    /// image: external images must be created `UNDEFINED`, which discards any
+    /// claim that the prior bytes are image contents. Exact target residents
+    /// may converge here because Vulkan work initialized their images. Every
+    /// other declaration returns `SampledContentRequiresCopy` to the imported
+    /// buffer-to-image rail.
+    pub(crate) unsafe fn acquire_guest_sampled(
+        &mut self,
+        ctx: &DeviceContext,
+        source: &reims_vgpu_memory::GuestImageSource,
+        resource: &super::super::types::SampledImageResource,
+        counters: &EngineCounters,
+        excludes: impl Fn(&TargetIdentity) -> bool,
+    ) -> Result<GuestSampledUse, super::super::linear_image_import::WindowRefusal> {
+        use super::super::linear_image_import::WindowRefusal;
+
+        let memory = source
+            .direct
+            .as_ref()
+            .ok_or(WindowRefusal::HostImportUnavailable)?;
+        let sampled = SampledKey {
+            mip_levels: source.view.mip_level_count,
+            ..SampledKey::of(resource)
+        };
+        if !source.view.fits(&source.allocation) {
+            return Err(WindowRefusal::UnsupportedImageShape {
+                layers: sampled.layers,
+                volume: sampled.volume,
+                cube: sampled.cube,
+                arrayed: sampled.arrayed,
+                one_dim: sampled.one_dim,
+            });
+        }
+        let layout = source.allocation.mips[source.view.base_mip_level as usize].layout;
+        let allocation_is_array = layout.is_arrayed();
+        let shape_matches = match layout {
+            reims_vgpu_memory::GuestImageLayout::D1 { .. }
+            | reims_vgpu_memory::GuestImageLayout::D1Array { .. } => {
+                sampled.one_dim
+                    && !sampled.volume
+                    && if sampled.arrayed {
+                        allocation_is_array
+                    } else {
+                        source.view.array_layer_count == 1
+                    }
+                    && sampled.layers == source.view.array_layer_count
+            }
+            reims_vgpu_memory::GuestImageLayout::D2 { .. }
+            | reims_vgpu_memory::GuestImageLayout::D2Array { .. } => {
+                !sampled.one_dim
+                    && !sampled.volume
+                    && if sampled.arrayed {
+                        allocation_is_array
+                    } else {
+                        source.view.array_layer_count == 1
+                    }
+                    && sampled.layers == source.view.array_layer_count
+            }
+            reims_vgpu_memory::GuestImageLayout::D3 { depth, .. } => {
+                !sampled.one_dim && !sampled.arrayed && sampled.volume && sampled.layers == depth
+            }
+        };
+        if sampled.cube || !shape_matches {
+            return Err(WindowRefusal::UnsupportedImageShape {
+                layers: sampled.layers,
+                volume: sampled.volume,
+                cube: sampled.cube,
+                arrayed: sampled.arrayed,
+                one_dim: sampled.one_dim,
+            });
+        }
+        // Only the target registry's exact allocation shape may converge here.
+        // A subresource, swizzled, array, mip-chain, or volume declaration is a
+        // different view contract and stays on the general guest-image rail.
+        // Current attachments are excluded by the caller because sampling an
+        // image while writing it requires the snapshot/feedback machinery that
+        // is selected from a typed Target source, not an opportunistic match.
+        let exact_2d = source.allocation.mips.len() == 1
+            && matches!(layout, reims_vgpu_memory::GuestImageLayout::D2 { .. })
+            && source.view.base_mip_level == 0
+            && source.view.mip_level_count == 1
+            && source.view.base_array_layer == 0
+            && source.view.array_layer_count == 1
+            && resource.swizzle.is_identity();
+        if exact_2d {
+            match guest_sampled_resident_match(
+                &self.registry,
+                &self.guest_resident_authority,
+                memory,
+                sampled,
+                excludes,
+            ) {
+                Ok(Some(identity)) => {
+                    let (image, access) = self
+                        .registry
+                        .get(&identity)
+                        .map(|slot| (slot.image, slot.access))
+                        .expect("matched resident remains registered");
+                    let view = unsafe {
+                        self.registry_sample_view_raw(ctx, &identity, sampled.format, counters)
+                    }
+                    .map_err(WindowRefusal::CreateView)?
+                    .expect("matched resident remains registered");
+                    if self.pin_resident_for_entry(&identity) {
+                        self.registry_note_sampled_use(&identity);
+                        crate::telemetry::note_route("sampled_guest_reuses_target_resident");
+                        return Ok(GuestSampledUse::Resident {
+                            identity,
+                            image,
+                            view,
+                            access,
+                        });
+                    }
+                }
+                Ok(None) => {}
+                Err(matches) => {
+                    return Err(WindowRefusal::AmbiguousResidentBacking { matches });
+                }
+            }
+        }
+        // `VK_EXT_external_memory_host` requires an external image to be born
+        // in UNDEFINED. A transition out of UNDEFINED does not import the bytes
+        // already present in the bound allocation, so a pre-populated sampled
+        // resource cannot use a child image as a zero-copy view. The buffer
+        // import remains zero-copy for guest RAM and feeds the ordinary sampled
+        // image with one GPU-side copy. A target resident can still converge
+        // above because its content was initialized by Vulkan work.
+        Err(WindowRefusal::SampledContentRequiresCopy)
+    }
+
+    /// Apply the one exact-layout admission rule used by every colour
+    /// attachment. Slot number and framebuffer ownership are intentionally not
+    /// inputs: they do not change whether a Vulkan image aliases these bytes.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the admission equation needs the declared image shape and Vulkan usage"
+    )]
+    unsafe fn try_import_guest_target(
+        &mut self,
+        ctx: &DeviceContext,
+        target: Option<&reims_vgpu_memory::GuestTargetMemory>,
+        width: u32,
+        height: u32,
+        sample_count: u32,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+    ) -> Option<(
+        vk::Image,
+        reims_vgpu_memory::GuestTargetMemory,
+        reims_vgpu_memory::GuestWritePages,
+    )> {
+        if sample_count != 1 {
+            return None;
+        }
+        let target = target?;
+        let bytes_per_texel = crate::translate::pixel::texel_layout_of(format)
+            .map(|layout| u64::from(layout.bytes_per_texel()))?;
+        let write_pages = target.visible_write_pages(width, height, bytes_per_texel)?;
+        match unsafe {
+            super::super::linear_image_import::create(
+                ctx,
+                &mut self.host_ram_imports,
+                &target.import,
+                target.backing,
+                reims_vgpu_memory::GuestImageLayout::D2 { width, height },
+                format,
+                usage,
+            )
+        } {
+            Ok(imported) => {
+                crate::telemetry::note_route("target_guest_imported");
+                Some((imported.image, target.clone(), write_pages))
+            }
+            Err(decline) => {
+                reims_vgpu_observe::Emit::decline("target_guest_import_declined", &decline).off();
+                None
+            }
+        }
+    }
+
+    unsafe fn abandon_new_resident_image(
+        &mut self,
+        ctx: &DeviceContext,
+        image: vk::Image,
+        memory: &ResidentMemory,
+    ) {
+        ctx.device.destroy_image(image, None);
+        match memory {
+            ResidentMemory::Recyclable(_) => self.free_image_slab(&ctx.device, image),
+            ResidentMemory::GuestImported { memory, .. } => {
+                if let Some(parent) = self.host_ram_imports.release_child(&memory.import) {
+                    let completed = parent.destroy(&ctx.device);
+                    self.completed_guest_imports.push(completed);
+                }
+            }
+        }
+    }
+
     pub(crate) unsafe fn acquire_storage_image(
         &mut self,
         ctx: &DeviceContext,
@@ -95,6 +369,7 @@ impl ResourcePools {
                         vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST
                     } else {
                         vk::ImageUsageFlags::STORAGE
+                            | vk::ImageUsageFlags::SAMPLED
                             | vk::ImageUsageFlags::TRANSFER_DST
                             | vk::ImageUsageFlags::TRANSFER_SRC
                     })
@@ -467,7 +742,7 @@ impl ResourcePools {
     ///
     /// Reading a resident is using it. The three read-only accessors below all
     /// mean "a guest chain is about to consume this image" — the stage-time
-    /// guest-read skip, the copy-on-sample gate, and the flush/sample snapshot —
+    /// guest-read skip, the resident-sample gate, and the flush/sample snapshot —
     /// so a produce-once/sample-many resident that is never dispatched into
     /// again remains observable even when it is never dispatched into. No
     /// reclaim decision reads this timestamp.
@@ -615,7 +890,7 @@ impl ResourcePools {
 
     /// Generation + engine format of a resident compute storage image, if one
     /// is registered. Read-only — used by the runtime to decide a stage-time
-    /// copy-on-sample skip (the format must match what the sampled view will
+    /// resident-sample skip (the format must match what the sampled view will
     /// bind, or the engine's resident-bind shape guard would fail every run).
     pub(crate) fn compute_resident_sample_source(
         &mut self,
@@ -627,21 +902,36 @@ impl ResourcePools {
             .map(|resident| (resident.generation, resident.slot.key.format))
     }
 
-    /// Snapshot of a resident storage image for a copy-on-sample source:
-    /// `(image, key, generation, what last touched it)`.
+    /// Snapshot of a resident storage image for a sampled bind. Creation
+    /// declared both storage and sampled use, so the view names this same image
+    /// rather than a copied surrogate.
     pub(crate) fn compute_resident_snapshot(
         &mut self,
         identity: &ComputeStorageResidencyKey,
-    ) -> Option<(vk::Image, StorageImageKey, u32, ResidentAccess)> {
+    ) -> Option<(
+        vk::Image,
+        vk::ImageView,
+        StorageImageKey,
+        u32,
+        ResidentAccess,
+    )> {
         self.note_compute_resident_use(identity);
         self.compute_storage_registry.get(identity).map(|resident| {
             (
                 resident.slot.image,
+                resident.slot.view,
                 resident.slot.key,
                 resident.generation,
                 resident.access,
             )
         })
+    }
+
+    /// Record the resting state of a resident that this dispatch only sampled.
+    pub(crate) fn mark_compute_resident_sampled(&mut self, identity: &ComputeStorageResidencyKey) {
+        if let Some(resident) = self.compute_storage_registry.get_mut(identity) {
+            resident.access = ResidentAccess::ShaderRead(vk::ImageLayout::GENERAL);
+        }
     }
 
     // --- Target registry (workstream D) ------------------------------------
@@ -716,11 +1006,22 @@ impl ResourcePools {
         format: vk::Format,
         counters: &EngineCounters,
     ) -> Result<Option<vk::ImageView>, DrawError> {
+        unsafe { self.registry_sample_view_raw(ctx, identity, format, counters) }
+            .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateRegistryView, error)))
+    }
+
+    unsafe fn registry_sample_view_raw(
+        &mut self,
+        ctx: &DeviceContext,
+        identity: &TargetIdentity,
+        format: vk::Format,
+        counters: &EngineCounters,
+    ) -> Result<Option<vk::ImageView>, vk::Result> {
         let Some(slot) = self.registry.get(identity) else {
             return Ok(None);
         };
         let format = translate::pixel::sample_view_format(format, slot.format.declared());
-        unsafe { self.registry_view(ctx, identity, format, counters) }
+        unsafe { self.registry_view_raw(ctx, identity, format, counters) }
     }
 
     /// The view over this resident's allocation in exactly `format`, created and
@@ -745,6 +1046,17 @@ impl ResourcePools {
         format: vk::Format,
         counters: &EngineCounters,
     ) -> Result<Option<vk::ImageView>, DrawError> {
+        unsafe { self.registry_view_raw(ctx, identity, format, counters) }
+            .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateRegistryView, error)))
+    }
+
+    unsafe fn registry_view_raw(
+        &mut self,
+        ctx: &DeviceContext,
+        identity: &TargetIdentity,
+        format: vk::Format,
+        counters: &EngineCounters,
+    ) -> Result<Option<vk::ImageView>, vk::Result> {
         let Some(slot) = self.registry.get_mut(identity) else {
             return Ok(None);
         };
@@ -767,8 +1079,7 @@ impl ResourcePools {
                     .subresource_range(super::super::registry_subresource_range(format)),
                 None,
             )
-        }
-        .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateRegistryView, error)))?;
+        }?;
         counters.note_create(CreateSite::RegistryImageView);
         slot.alternate_views.push((format, view));
         Ok(Some(view))
@@ -800,6 +1111,11 @@ impl ResourcePools {
         let old = self.registry.remove(identity);
         self.registry_order.retain(|k| k != identity);
         let old = old?;
+        if let Some(key) = guest_resident_backing_key(&old) {
+            if self.guest_resident_authority.get(&key) == Some(identity) {
+                self.guest_resident_authority.remove(&key);
+            }
+        }
         if old.pin_count == 0 {
             self.registry_non_pinned_adjust(Self::slot_attachment_bytes(&old), false);
         }
@@ -861,6 +1177,7 @@ impl ResourcePools {
                 incarnation: super::ResidentIncarnation::allocate(),
                 image: new.image,
                 memory: new.memory,
+                guest_backing: new.guest_backing,
                 view: new.view,
                 // Seeded rather than left empty: the declaration's view is one
                 // more interpretation of this allocation, and `alternate_views`
@@ -879,9 +1196,6 @@ impl ResourcePools {
                 height: new.height,
                 sample_count: new.sample_count,
                 generation: new.generation,
-                // External-memory images must be born UNDEFINED. Their guest
-                // payload is initialized by the same seed upload as an
-                // ordinary resident before a LOAD may read it.
                 content_ready: false,
                 content_epoch: None,
                 access: ResidentAccess::Untouched,
@@ -936,16 +1250,22 @@ impl ResourcePools {
         for (_, view) in &old.alternate_views {
             self.dispose(&ctx.device, DeferredHandle::ImageView(*view));
         }
-        let ResidentMemory::Recyclable(memory) = old.memory;
-        let retired = DeferredHandle::RecycleTarget(FreeTargetImage {
-            image: old.image,
-            memory,
-            view: old.view,
-            width: old.width,
-            height: old.height,
-            sample_count: old.sample_count,
-            format: old.format.allocation(),
-        });
+        let retired = match &old.memory {
+            ResidentMemory::Recyclable(memory) => DeferredHandle::RecycleTarget(FreeTargetImage {
+                image: old.image,
+                memory: *memory,
+                view: old.view,
+                width: old.width,
+                height: old.height,
+                sample_count: old.sample_count,
+                format: old.format.allocation(),
+            }),
+            ResidentMemory::GuestImported { memory, .. } => DeferredHandle::GuestImage {
+                image: old.image,
+                view: old.view,
+                import: std::sync::Arc::clone(&memory.import),
+            },
+        };
         self.dispose(&ctx.device, retired);
         if why != ResidentReclaim::ResourceReleased {
             counters
@@ -979,6 +1299,8 @@ impl ResourcePools {
         framebuffer_compatibility: FramebufferCompatibilityKey,
         generation: u64,
         format: vk::Format,
+        guest_target: Option<&reims_vgpu_memory::GuestTargetMemory>,
+        preserve_existing_content: bool,
         counters: &EngineCounters,
     ) -> Result<(&ResidentTargetSlot, vk::ImageView), DrawError> {
         // The format arrives resolved rather than as a channel-order flag, and
@@ -992,12 +1314,21 @@ impl ResourcePools {
         // recycle bucket stay in the allocation format. See
         // [`translate::pixel::ResidentFormat`].
         let format = translate::pixel::ResidentFormat::of(format);
+        let guest_backing = guest_target.map(|target| target.backing);
         // Compatible geometry + gen + allocation: reuse image; rebuild the FB
         // only if Vulkan render-pass compatibility changed. A change of
         // allocation must recreate the image, not just the framebuffer — an RGBA
         // image under a BGRA pass is invalid.
         if let Some(slot) = self.registry.get(&identity) {
-            if slot.reusable_for(width, height, sample_count, generation, format) {
+            let reusable = slot.reusable_for_materialization(
+                width,
+                height,
+                sample_count,
+                generation,
+                format,
+                super::RequestedMaterialization::new(guest_backing, preserve_existing_content),
+            );
+            if reusable {
                 // Resolved before the fast path rather than inside the rebuild,
                 // because a declaration that changed while the allocation did
                 // not is exactly the case the fast path must *not* take: the
@@ -1081,7 +1412,50 @@ impl ResourcePools {
         // The recycled contents are stale — the slot is inserted with
         // layout=UNDEFINED / content_ready=false, and a fresh framebuffer is
         // always built below (it binds this specific render_pass).
-        let (image, memory, view) = if let Some(free) =
+        let imported = unsafe {
+            self.try_import_guest_target(
+                ctx,
+                guest_target,
+                width,
+                height,
+                sample_count,
+                format.allocation(),
+                usage,
+            )
+        };
+        let (image, memory, view) = if let Some((image, target, write_pages)) = imported {
+            let view = match ctx.device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format.allocation())
+                    .subresource_range(color_subresource_range()),
+                None,
+            ) {
+                Ok(view) => view,
+                Err(result) => {
+                    ctx.device.destroy_image(image, None);
+                    if let Some(parent) = self.host_ram_imports.release_child(&target.import) {
+                        let completed = parent.destroy(&ctx.device);
+                        self.completed_guest_imports.push(completed);
+                    }
+                    return Err(DrawError::VkCall(VkCall::new(
+                        VkOp::PoolsCreateRegistryView,
+                        result,
+                    )));
+                }
+            };
+            counters.note_create(CreateSite::RegistryImage);
+            counters.note_create(CreateSite::RegistryImageView);
+            (
+                image,
+                ResidentMemory::GuestImported {
+                    memory: target,
+                    write_pages,
+                },
+                view,
+            )
+        } else if let Some(free) =
             self.take_free_target(width, height, sample_count, format.allocation())
         {
             (
@@ -1170,8 +1544,8 @@ impl ResourcePools {
             ) {
                 Ok(v) => v,
                 Err(e) => {
-                    self.free_image_slab(&ctx.device, image);
                     ctx.device.destroy_image(image, None);
+                    self.free_image_slab(&ctx.device, image);
                     return Err(DrawError::VkCall(VkCall::new(
                         VkOp::PoolsCreateRegistryView,
                         e,
@@ -1200,8 +1574,7 @@ impl ResourcePools {
                 }
                 Err(e) => {
                     ctx.device.destroy_image_view(view, None);
-                    self.free_image_slab(&ctx.device, image);
-                    ctx.device.destroy_image(image, None);
+                    self.abandon_new_resident_image(ctx, image, &memory);
                     return Err(DrawError::VkCall(VkCall::new(
                         VkOp::PoolsCreateRegistryView,
                         e,
@@ -1227,8 +1600,7 @@ impl ResourcePools {
                 if let Some(extra) = attachment_view {
                     ctx.device.destroy_image_view(extra, None);
                 }
-                ctx.device.destroy_image(image, None);
-                self.free_image_slab(&ctx.device, image);
+                self.abandon_new_resident_image(ctx, image, &memory);
                 return Err(DrawError::VkCall(VkCall::new(
                     VkOp::PoolsCreateRegistryFramebuffer,
                     e,
@@ -1241,6 +1613,7 @@ impl ResourcePools {
             NewResident {
                 image,
                 memory,
+                guest_backing,
                 view,
                 framebuffer,
                 render_pass,
@@ -1297,14 +1670,25 @@ impl ResourcePools {
         sample_count: u32,
         generation: u64,
         format: vk::Format,
+        guest_target: Option<&reims_vgpu_memory::GuestTargetMemory>,
+        preserve_existing_content: bool,
         counters: &EngineCounters,
     ) -> Result<(vk::Image, vk::ImageView), DrawError> {
         // The guest's declaration; `format.allocation()` is the family it
         // belongs to and is what the image, the reuse test and the recycle
         // bucket are keyed on.
         let format = translate::pixel::ResidentFormat::of(format);
+        let guest_backing = guest_target.map(|target| target.backing);
         if let Some(slot) = self.registry.get(&identity) {
-            if slot.reusable_for(width, height, sample_count, generation, format) {
+            let reusable = slot.reusable_for_materialization(
+                width,
+                height,
+                sample_count,
+                generation,
+                format,
+                super::RequestedMaterialization::new(guest_backing, preserve_existing_content),
+            );
+            if reusable {
                 counters
                     .gpu_load_hits
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1328,10 +1712,60 @@ impl ResourcePools {
         // create/alloc/bind/view + their note_create/note_alloc; recycled
         // contents are stale, so the slot below is inserted layout=UNDEFINED /
         // content_ready=false.
-        let (image, memory, view) = if let Some(free) =
+        let imported = if super::super::format_is_depth(format.allocation()) {
+            None
+        } else {
+            unsafe {
+                self.try_import_guest_target(
+                    ctx,
+                    guest_target,
+                    width,
+                    height,
+                    sample_count,
+                    format.allocation(),
+                    usage,
+                )
+            }
+        };
+        let (image, memory, view) = if let Some((image, target, write_pages)) = imported {
+            let view = ctx
+                .device
+                .create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(image)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(format.allocation())
+                        .subresource_range(super::super::registry_subresource_range(
+                            format.allocation(),
+                        )),
+                    None,
+                )
+                .map_err(|e| {
+                    ctx.device.destroy_image(image, None);
+                    if let Some(parent) = self.host_ram_imports.release_child(&target.import) {
+                        let completed = parent.destroy(&ctx.device);
+                        self.completed_guest_imports.push(completed);
+                    }
+                    DrawError::VkCall(VkCall::new(VkOp::PoolsCreateMrtSecondaryView, e))
+                })?;
+            counters.note_create(CreateSite::MrtImage);
+            counters.note_create(CreateSite::MrtImageView);
+            (
+                image,
+                ResidentMemory::GuestImported {
+                    memory: target,
+                    write_pages,
+                },
+                view,
+            )
+        } else if let Some(free) =
             self.take_free_target(width, height, sample_count, format.allocation())
         {
-            (free.image, free.memory, free.view)
+            (
+                free.image,
+                ResidentMemory::Recyclable(free.memory),
+                free.view,
+            )
         } else {
             let image = ctx
                 .device
@@ -1407,13 +1841,17 @@ impl ResourcePools {
                     DrawError::VkCall(VkCall::new(VkOp::PoolsCreateMrtSecondaryView, e))
                 })?;
             counters.note_create(CreateSite::MrtImageView);
-            (image, memory, view)
+            (image, ResidentMemory::Recyclable(memory), view)
         };
         self.register_resident(
             &identity,
             NewResident {
                 image,
-                memory: ResidentMemory::Recyclable(memory),
+                // Record the requested allocation even when Vulkan declined
+                // the import. The materialization decision is stable for this
+                // declaration and must not become a recreate/retry loop.
+                guest_backing,
+                memory,
                 view,
                 // No per-slot framebuffer and so no pass it was built against:
                 // this arm's residents are bound as attachment N of an ad-hoc
@@ -1518,6 +1956,8 @@ impl ResourcePools {
             sample_count,
             0,
             format,
+            None,
+            false,
             counters,
         )
     }
@@ -1770,12 +2210,19 @@ impl ResourcePools {
         identity: &TargetIdentity,
         access: ResidentAccess,
     ) {
+        let mut guest_backed = false;
+        let mut authority = None;
         if let Some(slot) = self.registry.get_mut(identity) {
             slot.content_ready = true;
             slot.content_epoch = None;
             slot.access = access;
+            guest_backed = slot.memory.guest_memory().is_some();
+            authority = guest_resident_backing_key(slot);
         }
-        self.set_sole_copy(identity, true);
+        if let Some(key) = authority {
+            self.guest_resident_authority.insert(key, identity.clone());
+        }
+        self.set_sole_copy(identity, !guest_backed);
     }
 
     /// Mark a depth resident as holding rendered contents, after a pass that
@@ -2016,6 +2463,34 @@ impl ResourcePools {
             }
             _ => false,
         }
+    }
+
+    /// Record a guest CPU write into the canonical allocation imported by this
+    /// resident.
+    ///
+    /// Host access changes neither the image identity nor its Vulkan layout.
+    /// It does change the source scope for the next GPU access, so the access
+    /// tracker must name `HOST_WRITE` while retaining the layout established by
+    /// the preceding GPU transition. Refuse device-local residents: their guest
+    /// pages are a different allocation and need a copy, not this transition.
+    pub(crate) fn registry_note_guest_write(
+        &mut self,
+        identity: &TargetIdentity,
+        epoch: u32,
+    ) -> bool {
+        let Some(slot) = self.registry.get_mut(identity) else {
+            return false;
+        };
+        if !slot.content_ready || slot.memory.guest_memory().is_none() {
+            return false;
+        }
+        slot.content_epoch = Some(epoch);
+        slot.access = ResidentAccess::HostWrite(slot.access.layout());
+        let authority = guest_resident_backing_key(slot);
+        if let Some(key) = authority {
+            self.guest_resident_authority.insert(key, identity.clone());
+        }
+        true
     }
 
     /// Record a non-writing touch of a resident: a draw sampled it, or a
@@ -2573,6 +3048,7 @@ pub(super) mod pin_count_tests {
             incarnation: super::ResidentIncarnation::allocate(),
             image: vk::Image::null(),
             memory: ResidentMemory::Recyclable(vk::DeviceMemory::null()),
+            guest_backing: None,
             view: vk::ImageView::null(),
             alternate_views: Vec::new(),
             framebuffer: vk::Framebuffer::null(),
@@ -2609,6 +3085,107 @@ pub(super) mod pin_count_tests {
             generation: 0,
             format: reims_vgpu_protocol::TexelLayout::Bgra8,
         }
+    }
+
+    #[test]
+    fn guest_sampling_reuses_only_the_same_ready_imported_allocation() {
+        let import = std::sync::Arc::new(
+            reims_vgpu_memory::GuestRamImport::new_host_allocation(0x1000, 0x4000, 0x1000).unwrap(),
+        );
+        let backing = reims_vgpu_memory::GuestTargetBacking {
+            allocation_host_ptr: 0x1000,
+            allocation_len: 0x4000,
+            resource_offset: 0,
+            resource_len: 0x4000,
+            plane_offset: 0,
+            row_pitch: 64,
+        };
+        let footprint =
+            reims_vgpu_memory::GuestPageFootprint::new(std::sync::Arc::from([0x1000]), 0x1000)
+                .unwrap();
+        let memory = reims_vgpu_memory::GuestTargetMemory {
+            backing,
+            import: import.clone(),
+            footprint,
+        };
+        let imported_slot = || {
+            let mut slot = dummy_slot(true);
+            slot.memory = ResidentMemory::GuestImported {
+                memory: memory.clone(),
+                write_pages: reims_vgpu_memory::GuestWritePages::new(&[0x1000]).unwrap(),
+            };
+            slot
+        };
+        let mut slot = imported_slot();
+        let sampled = SampledKey {
+            width: 16,
+            height: 16,
+            mip_levels: 1,
+            layers: 1,
+            volume: false,
+            cube: false,
+            arrayed: false,
+            one_dim: false,
+            format: slot.format.allocation(),
+            swizzle: Default::default(),
+        };
+        assert!(guest_sampled_matches_resident(&slot, &memory, sampled));
+
+        let mut other = memory.clone();
+        other.backing.plane_offset = 0x1000;
+        assert!(!guest_sampled_matches_resident(&slot, &other, sampled));
+
+        slot.content_ready = false;
+        assert!(!guest_sampled_matches_resident(&slot, &memory, sampled));
+
+        let first = pinned_identity();
+        let second = TargetIdentity::Gva {
+            gva: 0x8000,
+            width: 16,
+            height: 16,
+            generation: 1,
+            format: reims_vgpu_core::pixel_format::TexelLayout::Bgra8,
+        };
+        let mut registry = HashMap::new();
+        let mut authority = HashMap::new();
+        registry.insert(first.clone(), imported_slot());
+        assert_eq!(
+            guest_sampled_resident_match(&registry, &authority, &memory, sampled, |_| false),
+            Ok(Some(first.clone()))
+        );
+        assert_eq!(
+            guest_sampled_resident_match(&registry, &authority, &memory, sampled, |id| {
+                id == &first
+            }),
+            Ok(None),
+            "an attachment the draw writes cannot be selected opportunistically"
+        );
+        registry.insert(second.clone(), imported_slot());
+        assert_eq!(
+            guest_sampled_resident_match(&registry, &authority, &memory, sampled, |_| false),
+            Err(2),
+            "two image identities over one backing must not be selected by map order"
+        );
+        let key = guest_resident_backing_key(&registry[&second]).unwrap();
+        authority.insert(key, second.clone());
+        assert_eq!(
+            guest_sampled_resident_match(&registry, &authority, &memory, sampled, |_| false),
+            Ok(Some(second)),
+            "the backing's last ordered writer is its content authority"
+        );
+    }
+
+    #[test]
+    fn a_sampled_resident_pin_moves_into_the_submission_cleanup() {
+        let mut pools = ResourcePools::new();
+        let identity = pinned_identity();
+        pools.registry.insert(identity.clone(), dummy_slot(true));
+
+        assert!(pools.pin_resident_for_entry(&identity));
+        assert_eq!(pools.registry.get(&identity).unwrap().pin_count, 1);
+        let sealed = pools.seal_entry(Vec::new(), Vec::new());
+        assert!(pools.resident_pins_live.is_empty());
+        assert_eq!(sealed.cleanup.unpin_residents, vec![identity]);
     }
 
     /// The window presenter blits a resident with no format conversion and no
@@ -2679,6 +3256,56 @@ pub(super) mod pin_count_tests {
             None,
             "the MRT-secondary ready arm must invalidate identically"
         );
+    }
+
+    #[test]
+    fn a_guest_write_updates_only_a_resident_over_the_guest_allocation() {
+        let mut pools = ResourcePools::new();
+        let imported_id = pinned_identity();
+        let device_id = TargetIdentity::Gva {
+            gva: 0x8000,
+            width: 16,
+            height: 16,
+            generation: 2,
+            format: reims_vgpu_core::pixel_format::TexelLayout::Bgra8,
+        };
+        let mut imported = dummy_slot(true);
+        let import = std::sync::Arc::new(
+            reims_vgpu_memory::GuestRamImport::new_host_allocation(0x1000, 0x4000, 0x1000).unwrap(),
+        );
+        let footprint =
+            reims_vgpu_memory::GuestPageFootprint::new(std::sync::Arc::from([0x1000]), 0x1000)
+                .unwrap();
+        imported.memory = ResidentMemory::GuestImported {
+            memory: reims_vgpu_memory::GuestTargetMemory {
+                backing: reims_vgpu_memory::GuestTargetBacking {
+                    allocation_host_ptr: 0x1000,
+                    allocation_len: 0x4000,
+                    resource_offset: 0,
+                    resource_len: 0x4000,
+                    plane_offset: 0,
+                    row_pitch: 64,
+                },
+                import,
+                footprint,
+            },
+            write_pages: reims_vgpu_memory::GuestWritePages::new(&[0x1000]).unwrap(),
+        };
+        imported.access = ResidentAccess::ColorWrite(vk::ImageLayout::GENERAL);
+        pools.registry.insert(imported_id.clone(), imported);
+        pools.registry.insert(device_id.clone(), dummy_slot(true));
+
+        assert!(pools.registry_note_guest_write(&imported_id, 11));
+        let imported = &pools.registry[&imported_id];
+        assert_eq!(imported.content_epoch, Some(11));
+        assert_eq!(
+            imported.access,
+            ResidentAccess::HostWrite(vk::ImageLayout::GENERAL),
+            "host access keeps the established layout and changes the source scope"
+        );
+
+        assert!(!pools.registry_note_guest_write(&device_id, 12));
+        assert_eq!(pools.registry[&device_id].content_epoch, None);
     }
 
     /// Stamping an image no draw has stored into would vouch for undefined
@@ -2901,12 +3528,16 @@ pub(super) mod pin_count_tests {
     /// was built against, `registry_ensure_attachment` passes neither.
     fn new_resident(framebuffer: vk::Framebuffer, render_pass: vk::RenderPass) -> NewResident {
         let framebuffer_compatibility = (framebuffer != vk::Framebuffer::null()).then(|| {
-            crate::engine::caches::PassKey::single(false, translate::pixel::SCANOUT_FORMAT)
-                .framebuffer_compatibility()
+            crate::engine::caches::PassKey::single(
+                crate::engine::caches::ColorLoadKey::Clear,
+                translate::pixel::SCANOUT_FORMAT,
+            )
+            .framebuffer_compatibility()
         });
         NewResident {
             image: vk::Image::null(),
             memory: ResidentMemory::Recyclable(vk::DeviceMemory::null()),
+            guest_backing: None,
             view: vk::ImageView::null(),
             framebuffer,
             render_pass,

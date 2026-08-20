@@ -1,8 +1,8 @@
 //! Content identity state for sampled guest-resource windows.
 //!
 //! The witness combines the guest's resource generation with page-exact device
-//! writes. Its optional byte fold audits that semantic claim; a disagreement
-//! spends the generation as well as reporting a fault to the adapter.
+//! writes. Its optional byte fold audits that semantic claim without becoming
+//! a second input to the guest-visible decision.
 
 use std::collections::HashMap;
 
@@ -10,24 +10,16 @@ use reims_vgpu_memory::GuestRun;
 
 use crate::{GatherKey, GatherVouch, GuestWriteReach, HostWriteVerdict, StatedGeneration};
 
-pub const AUDIT_STRIDE: u32 = 64;
 pub const AUDIT_REBASELINE_LIMIT: u8 = 8;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum AuditDensity {
     #[default]
-    Strided,
+    Disabled,
     EveryBind,
 }
 
 impl AuditDensity {
-    fn stride(self) -> u32 {
-        match self {
-            Self::Strided => AUDIT_STRIDE,
-            Self::EveryBind => 1,
-        }
-    }
-
     fn stays_armed(self) -> bool {
         matches!(self, Self::EveryBind)
     }
@@ -170,7 +162,9 @@ impl GatherWitness {
         };
         let vouched = matches!(verdict, GatherVerdict::Vouched);
 
-        let audit = if !matches!(pending, GuestWriteReach::Disjoint) {
+        let audit = if density == AuditDensity::Disabled {
+            ContentAudit::Skipped
+        } else if !matches!(pending, GuestWriteReach::Disjoint) {
             entry.audit_armed = false;
             entry.fold_valid = false;
             entry.rebaselines = 0;
@@ -203,7 +197,7 @@ impl GatherWitness {
                 entry.binds_since_fold = 0;
                 ContentAudit::Restarted
             }
-        } else if entry.binds_since_fold >= density.stride() {
+        } else if entry.binds_since_fold >= 1 {
             entry.fold = unsafe { fold_runs(runs, span) };
             entry.fold_seeded = true;
             entry.fold_valid = true;
@@ -217,7 +211,10 @@ impl GatherWitness {
             ContentAudit::Skipped
         };
 
-        let kept = vouched && !matches!(audit, ContentAudit::Disagreed);
+        // The fold is an instrument over the decoded contract, not another
+        // source of device behavior. A disagreement is reported by the adapter
+        // but cannot silently replace the identity the contract vouched for.
+        let kept = vouched;
         if !kept {
             entry.generation = fresh_generation;
         }

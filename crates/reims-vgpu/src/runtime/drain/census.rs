@@ -2948,7 +2948,8 @@ pub fn note_drain_tranche(
 /// `mib` is the same level and is not a rate: it is guest RAM the device can
 /// currently reach, against what the machine reported.
 fn emit_guest_import_levels(executor: &dyn crate::runtime::executor::Executor) {
-    let (bytes, count, aliases) = executor.guest_import_census();
+    let (bytes, count, aliases, guest_images, live_guest_images, recycled_images) =
+        executor.guest_import_census();
     let (spans, span_bytes) = crate::runtime::guest_ram_map::span_census();
     // An engine that never imported emits nothing, so a host on a negative
     // `host_pointer` rung — or a boot before the first guest window — costs no
@@ -2958,6 +2959,7 @@ fn emit_guest_import_levels(executor: &dyn crate::runtime::executor::Executor) {
     }
     crate::observe::off(format!(
         "guest_import_levels (levels, not per-interval) ramblocks={count}/{spans} aliases={aliases} \
+         guest_images={guest_images}/{live_guest_images}_live recycled_images={recycled_images} \
          imported_mib={} ramblock_reported_mib={} (RAMBlock spans import lazily; \
          packed aliases add to imported_mib without changing the reported RAM size)",
         bytes / (1024 * 1024),
@@ -3104,7 +3106,7 @@ fn emit_bind_phase() {
     };
     crate::observe::off(format!(
         "bind_phase binds={} vertex_us={} fragment_us={} attrs_us={} \
-         acc_unused={} acc_deref={} acc_undecl={} acc_n={} acc_unused_staged={} neutral={}",
+         acc_unused={} acc_deref={} acc_undecl={} acc_n={} acc_unused_staged={}",
         w.binds,
         w.vertex_us,
         w.fragment_us,
@@ -3116,10 +3118,7 @@ fn emit_bind_phase() {
         // so this is their sum and not a separately-counted total: a reader who
         // divides gets an identity that holds or a bug that shows.
         w.access_total(),
-        // These two partition `acc_unused` in turn, so the second identity on
-        // the line is `acc_unused_staged + neutral == acc_unused`.
         w.access_unused_staged,
-        w.neutral_served,
     ));
 }
 
@@ -3172,8 +3171,16 @@ fn emit_sampled_phase() {
     };
     crate::observe::off(format!(
         "sampled_phase sampled={} lookup_us={} alias_us={} resolve_us={} samplers_us={} \
-         reflect_us={}",
-        w.sampled, w.lookup_us, w.alias_us, w.resolve_us, w.samplers_us, w.reflect_us,
+         reflect_us={} linear_packed_us={} linear_admission_us={} gather_witness_us={}",
+        w.sampled,
+        w.lookup_us,
+        w.alias_us,
+        w.resolve_us,
+        w.samplers_us,
+        w.reflect_us,
+        w.linear_packed_us,
+        w.linear_admission_us,
+        w.gather_witness_us,
     ));
 }
 

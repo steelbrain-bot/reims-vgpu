@@ -2,9 +2,19 @@ use super::*;
 
 #[test]
 fn a_cpu_only_stamp_publishes_now_unless_its_fifo_has_an_older_completion() {
-    assert_eq!(StampOrder::from_debt(false, false), StampOrder::CpuReady);
-    assert_eq!(StampOrder::from_debt(true, false), StampOrder::Queued);
-    assert_eq!(StampOrder::from_debt(false, true), StampOrder::Queued);
+    assert_eq!(
+        StampOrder::from_preceding_work(false, false),
+        StampOrder::CpuReady
+    );
+    assert_eq!(
+        StampOrder::from_preceding_work(true, false),
+        StampOrder::Queued,
+        "accepted executor work must complete before its guest stamp"
+    );
+    assert_eq!(
+        StampOrder::from_preceding_work(false, true),
+        StampOrder::Queued
+    );
     assert!(!StampOrder::CpuReady.needs_blocking_fallback());
     assert!(StampOrder::Declined.needs_blocking_fallback());
 }

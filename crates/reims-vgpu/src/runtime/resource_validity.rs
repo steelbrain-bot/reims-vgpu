@@ -133,10 +133,10 @@ pub fn apply(
     let outcome = std::cell::Cell::new(None);
     let completion = reims_vgpu_core::execute_resolved_submission(
         submission,
-        |()| -> Result<CommandExecution<()>, std::convert::Infallible> { unreachable!() },
-        |()| -> Result<CommandExecution<()>, std::convert::Infallible> { unreachable!() },
-        |_| -> Result<CommandExecution<_>, std::convert::Infallible> { unreachable!() },
-        |update| {
+        |_, ()| -> Result<CommandExecution<()>, std::convert::Infallible> { unreachable!() },
+        |_, ()| -> Result<CommandExecution<()>, std::convert::Infallible> { unreachable!() },
+        |_, _| -> Result<CommandExecution<_>, std::convert::Infallible> { unreachable!() },
+        |_, update| {
             outcome.set(Some(apply_resolved(state, update.clone())));
             Ok(CommandExecution::without_gpu_materialization(
                 ResourceStateCompletion { update },

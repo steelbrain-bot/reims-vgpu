@@ -1564,7 +1564,9 @@ fn multi_mip_level_layouts() {
     st64(&mut b[0..], 0x20000);
     st32(&mut b[8..], 0x20);
     st16(&mut b[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], levels as u16);
-    st32(&mut b[TEXTURE_DESC_DATA_OFFSET..], 0);
+    st16(&mut b[TEXTURE_DESC_SLICE_COUNT..], 1);
+    st64(&mut b[TEXTURE_DESC_BASE_OFFSET..], 0);
+    st64(&mut b[TEXTURE_DESC_BYTES_PER_SLICE..], 0x2800);
     st32(&mut b[TEXTURE_DESC_USED_SIZE..], 64 * 32 * 4);
     st32(&mut b[TEXTURE_DESC_ROW_STRIDE..], 256);
     st32(&mut b[TEXTURE_DESC_WIDTH..], 64);
@@ -1598,6 +1600,56 @@ fn multi_mip_level_layouts() {
     assert_eq!(gva1, ((0x20u64) << RESOURCE_PAGE_SHIFT) + 0x2000);
     assert_eq!(lay1.width, 32);
     assert!(d.level_gva(2, PAGE_SHIFT_ARM64E).is_none());
+}
+
+#[test]
+fn texture_dimension_flags_and_slice_major_offsets_decode_independently() {
+    use reims_vgpu_core::endian::{st16, st32, st64};
+
+    let body = TEXTURE_DESC_BASE_LEN + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+    let mut b = vec![0u8; body];
+    st64(&mut b[LINEAR_DESC_SIZE..], 0x40_000);
+    st32(&mut b[LINEAR_DESC_HANDLE..], 3);
+    st16(&mut b[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], 2 | 0xc000);
+    st16(&mut b[TEXTURE_DESC_SLICE_COUNT..], 3);
+    st64(&mut b[TEXTURE_DESC_BASE_OFFSET..], 0x100);
+    st64(&mut b[TEXTURE_DESC_BYTES_PER_SLICE..], 0x3000);
+    st64(&mut b[TEXTURE_DESC_LEVEL_ZERO..], 0x200);
+    st32(&mut b[TEXTURE_DESC_USED_SIZE..], 0x1000);
+    st32(&mut b[TEXTURE_DESC_ROW_STRIDE..], 0x100);
+    st32(&mut b[TEXTURE_DESC_WIDTH..], 32);
+    st32(&mut b[TEXTURE_DESC_HEIGHT..], 16);
+    st32(&mut b[TEXTURE_DESC_DEPTH..], 1);
+
+    let rec = TEXTURE_DESC_LEVEL_RECORDS;
+    st64(&mut b[rec + TEXTURE_LEVEL_OFFSET..], 0x2400);
+    st64(&mut b[rec + TEXTURE_LEVEL_SIZE..], 0x400);
+    st64(&mut b[rec + TEXTURE_LEVEL_ROW_STRIDE..], 0x80);
+    st32(&mut b[rec + TEXTURE_LEVEL_WIDTH..], 16);
+    st32(&mut b[rec + TEXTURE_LEVEL_HEIGHT..], 8);
+    st32(&mut b[rec + TEXTURE_LEVEL_DEPTH..], 1);
+
+    let declaration = TEXTURE_DESC_DECLARATION + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+    b[declaration] = TEXTURE_VIEW_MTL_TYPE_CUBE as u8;
+    let array_length = declaration
+        + core::mem::offset_of!(
+            reims_vgpu_wire::ops::texture::TextureDescriptorBody,
+            array_length
+        );
+    st16(&mut b[array_length..], 3);
+
+    let d = decode_texture_descriptor(&b).unwrap();
+    assert_eq!(d.mipmap_level_count, 2);
+    assert!(d.cube_faces);
+    assert!(d.compressed_layout);
+    assert_eq!(d.slice_count, 3);
+    assert_eq!(d.base_offset, 0x100);
+    assert_eq!(d.bytes_per_slice, 0x3000);
+    assert_eq!(d.level(0).unwrap().offset, 0x200);
+    assert_eq!(d.level(1).unwrap().offset, 0x2400);
+    assert_eq!(d.subresource_offset(2, 1), Some(0x8500));
+    assert_eq!(d.physical_slice_count(), Some(18));
+    assert_eq!(d.packed_allocation_end(), Some(0x36_100));
 }
 
 /// A mip level the descriptor named but the body does not reach is a drop,

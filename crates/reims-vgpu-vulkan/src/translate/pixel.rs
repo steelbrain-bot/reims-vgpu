@@ -23,8 +23,8 @@ use ash::vk;
 
 use super::reason::TranslateReason;
 use reims_vgpu_core::pixel_format::{
-    self, SampledByteFormat, StorageImageSelector, SwizzlePlan, SwizzleSource, TexelLayout,
-    COMPONENT_A, COMPONENT_B, COMPONENT_G, COMPONENT_R,
+    self, SampledByteFormat, SwizzlePlan, SwizzleSource, TexelLayout, COMPONENT_A, COMPONENT_B,
+    COMPONENT_G, COMPONENT_R,
 };
 use reims_vgpu_protocol::{ImageFormat, StorageImageFormat};
 
@@ -111,7 +111,7 @@ fn srgb(vk: vk::Format, linear_vk: vk::Format, bytes_per_texel: u32) -> PixelFor
 /// value declines by name rather than reaching a default. Depth/stencil arms
 /// are included because the same enum carries them on the wire — whether a
 /// given role (colour attachment, storage image, sampled) admits a format is a
-/// *contract* question answered by `render_target_bpp` / `storage_selector` /
+/// *contract* question answered by `render_target_bpp` / `storage_image_format` /
 /// `sampled_class`, and a *device* question answered by the capability layer;
 /// neither is this function's job.
 pub fn translate(mtl: u16) -> Result<PixelFormat, TranslateReason> {
@@ -511,8 +511,8 @@ pub fn color_attachment(
 ///
 /// Neither half is written here. A render target's answer is
 /// `store_texel_order` composed with [`vk_texel_layout`]; a storage image's is
-/// `storage_selector` composed with [`storage_image_from_selector`] and
-/// `StorageImageFormat::vk_format`. Both already existed, both are already the
+/// [`pixel_format::storage_image_format`] composed with the backend format
+/// projection. Both already existed, both are already the
 /// authority for their own rail, and a format either admits is a format that
 /// rail creates images at — so nothing new is claimed about any format, and a
 /// new arm in either table reaches this without being added twice.
@@ -528,32 +528,10 @@ pub fn verbatim_texel(mtl: u16) -> Option<(vk::Format, u32)> {
     ))
 }
 
-/// The engine's storage-image format for a contract [`StorageImageSelector`].
-///
-/// The selector is the compute rail's own narrowing of `MTLPixelFormat`, so
-/// this is a vocabulary-to-vocabulary step rather than a Metal decision — but
-/// it lives here for the same reason everything else does: it was previously
-/// spelled in `runtime/compute_exec/mod.rs`, where nothing could see that the two
-/// enums had to stay in step.
-///
-/// It is **total**, and that is the point. It used to take the selector's `u32`
-/// ordinal and match it with thirteen `s if s == S::X as u32` guard arms, which
-/// the compiler cannot check for coverage — so a new selector variant compiled
-/// fine here and declined at run time as a drift between two vocabularies that
-/// had not actually drifted. Taking the enum makes the arms exhaustive and the
-/// decline unnecessary: every selector the contract can produce has an engine
-/// format, and a new one cannot be added without this answering for it.
-pub fn storage_image_from_selector(selector: StorageImageSelector) -> StorageImageFormat {
-    reims_vgpu_core::pixel_format::storage_image_format_from_selector(selector)
-}
-
 /// The engine's storage-image format for a Metal pixel format.
 ///
 /// Used by the compute rails for both storage bindings and sampled textures
-/// staged through the storage selector. The four single-channel-wide formats
-/// below never had a storage selector — the contract's selector enum has no
-/// ordinal for them — so they are answered directly rather than being declined
-/// by a narrowing they were never in.
+/// staged through the same semantic storage-format table.
 ///
 /// # Why this rail keeps an enum where the others took a `VkFormat`
 ///
@@ -561,7 +539,7 @@ pub fn storage_image_from_selector(selector: StorageImageSelector) -> StorageIma
 /// sRGB format is expressible on them. This one does not, and the reason is not
 /// inertia:
 ///
-/// * **No sRGB format reaches it.** `pixel_format::storage_selector` has no
+/// * **No sRGB format reaches it.** `pixel_format::storage_image_format` has no
 ///   sRGB arm, so an sRGB format declines here with
 ///   [`TranslateReason::NoStorageImageFormat`] rather than downgrading — which
 ///   is why `srgb_census` names six rails and none of them is this one. Widening
@@ -569,8 +547,8 @@ pub fn storage_image_from_selector(selector: StorageImageSelector) -> StorageIma
 /// * **The shader side cannot name one either.** A storage image's view format
 ///   must be class-compatible with the format the SPIR-V module declares, and
 ///   the SPIR-V image-format operand has no sRGB member at all
-///   (`runtime::spirv_bind::ImageFormat`). Vulkan likewise does not apply the
-///   transfer function on an image store.
+///   (the translator reports that format through shader reflection). Vulkan
+///   likewise does not apply the transfer function on an image store.
 /// * **Its consumer reasons about the enum by name.** The compute path picks a
 ///   view format by comparing the guest surface's format class against the
 ///   shader's declared one; expressed over `VkFormat` that reasoning would have
@@ -822,13 +800,12 @@ mod tests {
     fn the_two_verbatim_texel_tables_never_disagree() {
         let mut overlap = 0usize;
         for mtl in 0..=u16::MAX {
-            let (Some(layout), Some(selector)) =
-                (p::store_texel_order(mtl), p::storage_selector(mtl))
+            let (Some(layout), Some(storage)) =
+                (p::store_texel_order(mtl), p::storage_image_format(mtl))
             else {
                 continue;
             };
             overlap += 1;
-            let storage = storage_image_from_selector(selector);
             assert_eq!(
                 vk_texel_layout(layout),
                 crate::format::vk_storage_image(storage),
@@ -1981,7 +1958,7 @@ mod tests {
             );
             assert!(color_attachment(mtl).is_err());
             assert_eq!(p::render_target_bpp(mtl), None);
-            assert_eq!(p::storage_selector(mtl), None);
+            assert_eq!(p::storage_image_format(mtl), None);
 
             // And it never reaches a unorm converter: no texel layout means no
             // conversion arm can silently claim it.

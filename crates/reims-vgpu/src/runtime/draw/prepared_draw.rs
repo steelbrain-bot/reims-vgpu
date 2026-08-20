@@ -84,7 +84,11 @@ pub(super) fn plan_target_completion(
 
     // A final GVA Store may leave its exact generational resident authoritative
     // until synchronization or a guest reader requires page bytes.
-    if gpu_only_content_allowed && store_publishes && writeback_guest {
+    let guest_backing_available = executor_request
+        .target_guest
+        .as_ref()
+        .is_some_and(|target| target.memory().is_some());
+    if (guest_backing_available || gpu_only_content_allowed) && store_publishes && writeback_guest {
         if let Some(identity) =
             super::gva_chain_identity(state.executor.as_ref(), request, gva_allocation_generation)
         {

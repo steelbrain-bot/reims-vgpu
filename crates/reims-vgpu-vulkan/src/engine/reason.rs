@@ -55,6 +55,17 @@ pub enum DrawReason {
     ResidentSampledNot2d {
         binding: u32,
     },
+    /// The guest left a texture slot null and the host cannot bind Vulkan null
+    /// descriptors. No ordinary image is substituted because its dimensions
+    /// and query behavior would be invented.
+    NullSampledImageUnsupported {
+        binding: u32,
+    },
+    /// The guest left a sampler slot null and the host cannot bind a Vulkan
+    /// null descriptor. No sampler state is fabricated for the missing object.
+    NullSamplerUnsupported {
+        binding: u32,
+    },
     /// The draw rasterizes into more viewport/scissor slots than the host can
     /// declare in a pipeline.
     ///
@@ -134,20 +145,28 @@ pub enum DrawReason {
     /// for. That is undefined behaviour a validation layer catches on someone
     /// else's GPU; declining by name is the honest answer.
     SamplerMirrorClampToEdgeUnsupported,
+    /// A pixel-coordinate sampler names different minification and
+    /// magnification filters. Metal does not define that combination, and the
+    /// shader translator cannot choose between them without derivative state.
+    SamplerPixelMixedFilters,
+    /// A pixel-coordinate sampler asks for mip filtering. Pixel coordinates
+    /// address the base level directly, so this is not a state Vulkan can
+    /// represent as an unnormalized sampler.
+    SamplerPixelMipmapped,
+    /// A pixel-coordinate sampler asks for a U/V address mode outside the
+    /// clamping modes admitted by the sampler contract.
+    SamplerPixelAddressMode,
+    /// A pixel-coordinate sampler asks for anisotropic filtering, whose
+    /// derivative-dependent result cannot be reconstructed exactly.
+    SamplerPixelAnisotropy,
     /// The guest sampler asks for pixel (unnormalized) coordinates **and** a
     /// depth-compare function, and Vulkan forbids the pair outright
     /// (`VUID-VkSamplerCreateInfo-unnormalizedCoordinates-01077`: `compareEnable`
     /// must be `VK_FALSE`).
     ///
-    /// Every other constraint an unnormalized sampler carries is conformed
-    /// silently by [`super::caches::ObjectCaches::get_or_create_sampler`],
-    /// because under Vulkan's own rules such a sampler may only be reached by an
-    /// explicit-LOD, non-minifying sample — so forcing `minFilter = magFilter`,
-    /// `mipmapMode = NEAREST`, `minLod = maxLod = 0` and anisotropy off changes
-    /// no result the guest can observe. A compare function is not in that class:
-    /// dropping it returns the sampled value instead of the comparison, which is
-    /// a different picture. So this one is a refusal by name rather than a
-    /// repair.
+    /// The common sampler projection refuses every state it cannot preserve.
+    /// This variant names comparison separately because dropping it would
+    /// return the sampled value instead of the comparison result.
     SamplerUnnormalizedCompare,
     /// The guest pipeline names one of `MTLBlendFactor`'s four dual-source
     /// factors (`Source1Color` .. `OneMinusSource1Alpha`, 15-18) and this device
@@ -205,9 +224,11 @@ pub enum DrawReason {
     DescriptorArrayUnsupported {
         binding: u32,
         count: u32,
+        unpopulated: u32,
         required_descriptors: u32,
         descriptor_limit: u32,
         partially_bound: bool,
+        null_descriptor: bool,
         dynamic_indexing: bool,
     },
     /// Two resources claim one Vulkan binding with incompatible descriptor
@@ -287,16 +308,16 @@ pub enum DrawReason {
     ///
     /// The compute path has carried this backstop since `25051457` and the draw
     /// path did not, which is the `## Before A Broad Sweep` rule about two arms
-    /// consuming one wire form: the neutralizing pass was ported and the refusal
-    /// that catches what it cannot neutralize was not.
+    /// consuming one wire form: the null-binding pass was ported and the refusal
+    /// that catches classes it cannot represent was not.
     ///
     /// **Expected to stay at zero.** `runtime::draw`'s
-    /// `frag_unbound_textures_to_neutralize` fills the one repairable class
+    /// `frag_unbound_textures_to_bind_null` fills the contract-defined class
     /// before the request is built, and
     /// [`crate::spirv_bind::descriptor_static_use`] answers
     /// `NotDeclared` for anything that is not a `UniformConstant`, so a storage
     /// buffer — whose root that walk cannot resolve — is never refused on a
-    /// guess. A firing therefore names a class the neutralizing pass does not
+    /// guess. A firing therefore names a class the null-binding pass does not
     /// cover, and costs one draw rather than the VM.
     UsedBindingAbsentFromLayout {
         binding: u32,
@@ -315,6 +336,8 @@ impl reims_vgpu_observe::Decline for DrawReason {
             Self::UsedBindingAbsentFromLayout { .. } => "draw_used_binding_absent_from_layout",
             Self::DriverCallQuarantined => "driver_call_quarantined",
             Self::ResidentSampledNot2d { .. } => "resident_sampled_not_2d",
+            Self::NullSampledImageUnsupported { .. } => "null_sampled_image_unsupported",
+            Self::NullSamplerUnsupported { .. } => "null_sampler_unsupported",
             Self::GuestRunSampledNot2d { .. } => "guest_run_sampled_not_2d",
             Self::SecondaryAttachmentCap { .. } => "secondary_attachment_cap",
             Self::ViewportSlotsUnsupported { .. } => "viewport_slots_unsupported",
@@ -338,6 +361,10 @@ impl reims_vgpu_observe::Decline for DrawReason {
             }
             Self::SamplerAnisotropyUnsupported => "sampler_anisotropy_unsupported",
             Self::SamplerMirrorClampToEdgeUnsupported => "sampler_mirror_clamp_to_edge_unsupported",
+            Self::SamplerPixelMixedFilters => "sampler_pixel_mixed_filters",
+            Self::SamplerPixelMipmapped => "sampler_pixel_mipmapped",
+            Self::SamplerPixelAddressMode => "sampler_pixel_address_mode",
+            Self::SamplerPixelAnisotropy => "sampler_pixel_anisotropy",
             Self::SamplerUnnormalizedCompare => "sampler_unnormalized_compare",
             Self::DualSourceBlendUnsupported => "dual_source_blend_unsupported",
             Self::FillModeNonSolidUnsupported => "fill_mode_non_solid_unsupported",
@@ -386,7 +413,10 @@ impl std::fmt::Display for DrawReason {
                 let stage = if *fragment { "fragment" } else { "vertex" };
                 write!(f, " binding={binding} stage={stage}")
             }
-            Self::ResidentSampledNot2d { binding } | Self::GuestRunSampledNot2d { binding } => {
+            Self::ResidentSampledNot2d { binding }
+            | Self::GuestRunSampledNot2d { binding }
+            | Self::NullSampledImageUnsupported { binding }
+            | Self::NullSamplerUnsupported { binding } => {
                 write!(f, " binding={binding}")
             }
             Self::SecondaryAttachmentCap { requested, cap } => {
@@ -455,16 +485,20 @@ impl std::fmt::Display for DrawReason {
             Self::DescriptorArrayUnsupported {
                 binding,
                 count,
+                unpopulated,
                 required_descriptors,
                 descriptor_limit,
                 partially_bound,
+                null_descriptor,
                 dynamic_indexing,
             } => {
                 write!(
                     f,
-                    " binding={binding} count={count} required_descriptors={required_descriptors} \
-                     descriptor_limit={descriptor_limit} partially_bound={} dynamic_indexing={}",
+                    " binding={binding} count={count} unpopulated={unpopulated} \
+                     required_descriptors={required_descriptors} descriptor_limit={descriptor_limit} \
+                     partially_bound={} null_descriptor={} dynamic_indexing={}",
                     u8::from(*partially_bound),
+                    u8::from(*null_descriptor),
                     u8::from(*dynamic_indexing)
                 )
             }
@@ -636,6 +670,10 @@ mod tests {
         },
         DrawReason::SamplerAnisotropyUnsupported,
         DrawReason::SamplerMirrorClampToEdgeUnsupported,
+        DrawReason::SamplerPixelMixedFilters,
+        DrawReason::SamplerPixelMipmapped,
+        DrawReason::SamplerPixelAddressMode,
+        DrawReason::SamplerPixelAnisotropy,
         DrawReason::SamplerUnnormalizedCompare,
         DrawReason::ConstantVertexAttribute,
         DrawReason::InstanceRateDivisorUnsupported { step_rate: 0 },
@@ -647,9 +685,11 @@ mod tests {
         DrawReason::DescriptorArrayUnsupported {
             binding: 0,
             count: 2,
+            unpopulated: 1,
             required_descriptors: 2,
             descriptor_limit: 1,
             partially_bound: false,
+            null_descriptor: false,
             dynamic_indexing: false,
         },
         DrawReason::DescriptorBindingConflict {

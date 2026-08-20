@@ -153,36 +153,6 @@ pub const MTL_FORMAT_DEPTH32_FLOAT_STENCIL8: u16 =
 pub const MTL_FORMAT_X32_STENCIL8: u16 = reims_vgpu_protocol::metal_pixel::MTL_FORMAT_X32_STENCIL8;
 pub const MTL_FORMAT_X24_STENCIL8: u16 = reims_vgpu_protocol::metal_pixel::MTL_FORMAT_X24_STENCIL8;
 
-/// The compute rail's own narrowing of `MTLPixelFormat` to the formats a
-/// storage image may be, produced once by [`storage_selector`].
-///
-/// # The backend owes an answer for every member
-///
-/// This travels as the enum, never as its ordinal, and that is load-bearing
-/// rather than tidiness. Narrowing it to `u32` would make every consumer match
-/// integers, which has no exhaustiveness check. Keeping the type means adding a
-/// variant here fails the build until the Vulkan mapping names it.
-///
-/// The discriminants are explicit because they are logged as `simg=` and read
-/// back from boots; nothing else depends on their values.
-#[repr(u32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StorageImageSelector {
-    Rgba8Uint = 0,
-    Rgba8Sint = 1,
-    Rgba16Uint = 2,
-    Rgba16Float = 3,
-    Rgba32Float = 4,
-    Rgba8Unorm = 5,
-    Bgra8Unorm = 6,
-    R16Float = 7,
-    Rg16Float = 8,
-    R8Unorm = 9,
-    Rg8Unorm = 10,
-    Rgba32Uint = 11,
-    R32Uint = 12,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SampledClass {
     A8Unorm,
@@ -198,154 +168,6 @@ pub use reims_vgpu_protocol::{
     apply_swizzle_rgba8, swizzle_identity, swizzle_is_identity, swizzle_plan, SwizzlePlan,
     SwizzleSource, TexelLayout,
 };
-
-/// Why a translated storage-image declaration cannot be specialized to the
-/// guest surface's semantic format.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StorageImageSpecializationDecline {
-    ShaderFormatUnsupported,
-    GuestFormatSampledOnly,
-    NumericClassMismatch,
-}
-
-impl reims_vgpu_observe::Decline for StorageImageSpecializationDecline {
-    fn slug(&self) -> &'static str {
-        match self {
-            Self::ShaderFormatUnsupported => "spirv_storage_format_unsupported",
-            Self::GuestFormatSampledOnly => "spirv_sampled_only_format_as_storage",
-            Self::NumericClassMismatch => "spirv_guest_numeric_class_mismatch",
-        }
-    }
-
-    fn fields(&self) -> Vec<(&'static str, String)> {
-        Vec::new()
-    }
-}
-
-reims_vgpu_observe::decline_display!(StorageImageSpecializationDecline);
-
-fn storage_numeric_class(format: reims_vgpu_protocol::StorageImageFormat) -> u8 {
-    use reims_vgpu_protocol::StorageImageFormat as F;
-    match format {
-        F::Rgba32Float
-        | F::Rgba16Float
-        | F::R16Float
-        | F::Rgba8Unorm
-        | F::Bgra8Unorm
-        | F::Rg16Float
-        | F::R8Unorm
-        | F::Rg8Unorm
-        | F::R32Float
-        | F::Rgb9e5Ufloat
-        | F::R16Unorm
-        | F::Rg16Unorm
-        | F::Rgba16Unorm
-        | F::Rgb10a2Unorm
-        | F::Bgr10a2Unorm
-        | F::Rg11b10Float => 0,
-        F::Rgba16Uint | F::Rgba8Uint | F::Rgba32Uint | F::R32Uint => 1,
-        F::Rgba8Sint | F::R32Sint => 2,
-    }
-}
-
-/// Select the semantic storage format a backend must publish for one shader
-/// declaration and bound guest surface. `None` means a format-less image whose
-/// native view takes the guest surface's format.
-pub fn specialize_storage_image_format(
-    guest: reims_vgpu_protocol::StorageImageFormat,
-    shader: reims_vgpu_protocol::StorageImageFormat,
-    write_without_format: bool,
-) -> Result<Option<reims_vgpu_protocol::StorageImageFormat>, StorageImageSpecializationDecline> {
-    use reims_vgpu_protocol::StorageImageFormat as F;
-    use StorageImageSpecializationDecline as D;
-
-    if !matches!(
-        shader,
-        F::Rgba32Float
-            | F::Rgba16Float
-            | F::R16Float
-            | F::Rgba16Uint
-            | F::Rgba8Uint
-            | F::Rgba8Sint
-            | F::Rgba8Unorm
-            | F::Rg16Float
-            | F::R8Unorm
-            | F::Rg8Unorm
-            | F::Rgba32Uint
-            | F::R32Float
-            | F::R32Uint
-    ) {
-        return Err(D::ShaderFormatUnsupported);
-    }
-
-    if guest == F::Bgra8Unorm
-        && matches!(
-            shader,
-            F::Rgba8Unorm
-                | F::Rgba32Float
-                | F::Rgba16Float
-                | F::R16Float
-                | F::R32Float
-                | F::Rg16Float
-                | F::R8Unorm
-                | F::Rg8Unorm
-        )
-    {
-        // SPIR-V has no BGRA storage-image format. A normalized colour store
-        // therefore uses a format-less image when the backend supports it, so
-        // the native BGRA view performs channel conversion. Integer shaders
-        // deliberately fall through: equal-width integer access is a raw byte
-        // view, not a colour conversion.
-        return Ok(if write_without_format {
-            None
-        } else {
-            Some(F::Rgba8Unorm)
-        });
-    }
-    if shader == guest {
-        return Ok(Some(shader));
-    }
-
-    let shader_class = storage_numeric_class(shader);
-    // An integer shader over equal-width normalized storage is a deliberate
-    // raw view. Equal width within the same numeric class is not sufficient:
-    // R32Float and Rg16Float have different channel semantics despite both
-    // occupying four bytes, so those cases specialize to the guest format.
-    if guest.bytes_per_texel() == shader.bytes_per_texel()
-        && shader_class != 0
-        && storage_numeric_class(guest) == 0
-    {
-        return Ok(Some(shader));
-    }
-
-    let (guest_class, specialized) = match guest {
-        F::R32Uint => (1, F::R32Uint),
-        F::R32Sint
-        | F::R32Float
-        | F::Rgb9e5Ufloat
-        | F::R16Unorm
-        | F::Rg16Unorm
-        | F::Rgba16Unorm
-        | F::Rgb10a2Unorm
-        | F::Bgr10a2Unorm
-        | F::Rg11b10Float => return Err(D::GuestFormatSampledOnly),
-        F::Rgba32Float => (0, F::Rgba32Float),
-        F::Rgba16Float => (0, F::Rgba16Float),
-        F::R16Float => (0, F::R16Float),
-        F::Rgba8Unorm | F::Bgra8Unorm => (0, F::Rgba8Unorm),
-        F::Rg16Float => (0, F::Rg16Float),
-        F::R8Unorm => (0, F::R8Unorm),
-        F::Rg8Unorm => (0, F::Rg8Unorm),
-        F::Rgba32Uint => (1, F::Rgba32Uint),
-        F::Rgba16Uint => (1, F::Rgba16Uint),
-        F::Rgba8Uint => (1, F::Rgba8Uint),
-        F::Rgba8Sint => (2, F::Rgba8Sint),
-    };
-    if shader_class != guest_class {
-        return Err(D::NumericClassMismatch);
-    }
-    Ok(Some(specialized))
-}
 
 /// What a CPU loader produced for a sampled bind: the channel layout the bytes
 /// are in, and the guest format whose transfer function they still carry.
@@ -958,61 +780,6 @@ pub fn sampled_class(format: u16) -> Option<SampledClass> {
     })
 }
 
-/// Which storage-image selector a Metal format maps to, or `None` for a format
-/// this host will not expose as a storage image.
-///
-/// The texel width is **not** returned. It used to be, as a second column
-/// beside each selector, and the only thing that column was ever used for was a
-/// `debug_assert_eq!` against [`bytes_per_pixel`] at three of the four call
-/// sites — the fourth discarded it. A number stated twice that nothing reads is
-/// a number that can disagree with itself in a release build, where a
-/// `debug_assert` is not compiled at all. `storage_texel_width_matches_the_pixel_table`
-/// now holds the same invariant for every `u16`, at test time, exhaustively.
-pub fn storage_selector(format: u16) -> Option<StorageImageSelector> {
-    Some(match format {
-        MTL_FORMAT_R8_UNORM => StorageImageSelector::R8Unorm,
-        MTL_FORMAT_R32_UINT => StorageImageSelector::R32Uint,
-        MTL_FORMAT_RG8_UNORM => StorageImageSelector::Rg8Unorm,
-        MTL_FORMAT_R16_FLOAT => StorageImageSelector::R16Float,
-        MTL_FORMAT_RG16_FLOAT => StorageImageSelector::Rg16Float,
-        MTL_FORMAT_RGBA8_UNORM => StorageImageSelector::Rgba8Unorm,
-        MTL_FORMAT_BGRA8_UNORM => StorageImageSelector::Bgra8Unorm,
-        MTL_FORMAT_RGBA8_UINT => StorageImageSelector::Rgba8Uint,
-        MTL_FORMAT_RGBA8_SINT => StorageImageSelector::Rgba8Sint,
-        MTL_FORMAT_RGBA16_UINT => StorageImageSelector::Rgba16Uint,
-        MTL_FORMAT_RGBA16_FLOAT => StorageImageSelector::Rgba16Float,
-        MTL_FORMAT_RGBA32_UINT => StorageImageSelector::Rgba32Uint,
-        MTL_FORMAT_RGBA32_FLOAT => StorageImageSelector::Rgba32Float,
-        _ => return None,
-    })
-}
-
-/// Backend-independent storage-image format selected by the contract table.
-///
-/// This is total over [`StorageImageSelector`]. Backends translate the result
-/// into a native image format only when they create a view.
-pub const fn storage_image_format_from_selector(
-    selector: StorageImageSelector,
-) -> reims_vgpu_protocol::StorageImageFormat {
-    use reims_vgpu_protocol::StorageImageFormat as F;
-    use StorageImageSelector as S;
-    match selector {
-        S::Rgba8Uint => F::Rgba8Uint,
-        S::Rgba8Sint => F::Rgba8Sint,
-        S::Rgba16Uint => F::Rgba16Uint,
-        S::Rgba16Float => F::Rgba16Float,
-        S::Rgba32Float => F::Rgba32Float,
-        S::Rgba8Unorm => F::Rgba8Unorm,
-        S::Bgra8Unorm => F::Bgra8Unorm,
-        S::R16Float => F::R16Float,
-        S::Rg16Float => F::Rg16Float,
-        S::R8Unorm => F::R8Unorm,
-        S::Rg8Unorm => F::Rg8Unorm,
-        S::Rgba32Uint => F::Rgba32Uint,
-        S::R32Uint => F::R32Uint,
-    }
-}
-
 /// Storage-image interpretation of one declared Metal pixel format.
 pub fn storage_image_format(format: u16) -> Option<reims_vgpu_protocol::StorageImageFormat> {
     use reims_vgpu_protocol::StorageImageFormat as F;
@@ -1020,8 +787,19 @@ pub fn storage_image_format(format: u16) -> Option<reims_vgpu_protocol::StorageI
         MTL_FORMAT_R32_UINT => F::R32Uint,
         MTL_FORMAT_R32_SINT => F::R32Sint,
         MTL_FORMAT_R32_FLOAT => F::R32Float,
-        MTL_FORMAT_RGB9E5_FLOAT => F::Rgb9e5Ufloat,
-        _ => storage_image_format_from_selector(storage_selector(format)?),
+        MTL_FORMAT_R8_UNORM => F::R8Unorm,
+        MTL_FORMAT_RG8_UNORM => F::Rg8Unorm,
+        MTL_FORMAT_R16_FLOAT => F::R16Float,
+        MTL_FORMAT_RG16_FLOAT => F::Rg16Float,
+        MTL_FORMAT_RGBA8_UNORM => F::Rgba8Unorm,
+        MTL_FORMAT_BGRA8_UNORM => F::Bgra8Unorm,
+        MTL_FORMAT_RGBA8_UINT => F::Rgba8Uint,
+        MTL_FORMAT_RGBA8_SINT => F::Rgba8Sint,
+        MTL_FORMAT_RGBA16_UINT => F::Rgba16Uint,
+        MTL_FORMAT_RGBA16_FLOAT => F::Rgba16Float,
+        MTL_FORMAT_RGBA32_UINT => F::Rgba32Uint,
+        MTL_FORMAT_RGBA32_FLOAT => F::Rgba32Float,
+        _ => return None,
     })
 }
 
@@ -1041,6 +819,7 @@ pub fn compute_sampled_image_format(
         MTL_FORMAT_RGB10A2_UNORM => F::Rgb10a2Unorm,
         MTL_FORMAT_BGR10A2_UNORM => F::Bgr10a2Unorm,
         MTL_FORMAT_RG11B10_FLOAT => F::Rg11b10Float,
+        MTL_FORMAT_RGB9E5_FLOAT => F::Rgb9e5Ufloat,
         _ => storage_image_format(format)?,
     })
 }
@@ -1832,41 +1611,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn storage_specialization_is_semantic_and_returns_typed_refusals() {
-        use reims_vgpu_protocol::StorageImageFormat as F;
-        use StorageImageSpecializationDecline as D;
-
-        assert_eq!(
-            specialize_storage_image_format(F::Bgra8Unorm, F::R32Float, true),
-            Ok(None)
-        );
-        assert_eq!(
-            specialize_storage_image_format(F::Bgra8Unorm, F::R32Float, false),
-            Ok(Some(F::Rgba8Unorm))
-        );
-        assert_eq!(
-            specialize_storage_image_format(F::Bgra8Unorm, F::Rgba8Uint, true),
-            Ok(Some(F::Rgba8Uint))
-        );
-        assert_eq!(
-            specialize_storage_image_format(F::Rg16Float, F::R32Float, true),
-            Ok(Some(F::Rg16Float))
-        );
-        assert_eq!(
-            specialize_storage_image_format(F::R32Uint, F::Rgba8Unorm, true),
-            Err(D::NumericClassMismatch)
-        );
-        assert_eq!(
-            specialize_storage_image_format(F::R32Float, F::Rgba8Unorm, true),
-            Err(D::GuestFormatSampledOnly)
-        );
-        assert_eq!(
-            specialize_storage_image_format(F::Bgra8Unorm, F::R32Sint, true),
-            Err(D::ShaderFormatUnsupported)
-        );
-    }
-
-    #[test]
     fn semantic_sampled_formats_do_not_depend_on_a_native_format_projection() {
         assert_eq!(
             sampled_image_format(MTL_FORMAT_BGRA8_UNORM_SRGB),
@@ -2172,18 +1916,22 @@ mod tests {
         );
         assert_eq!(sampled_class(MTL_FORMAT_R16_FLOAT), None);
         assert_eq!(
-            storage_selector(MTL_FORMAT_R8_UNORM),
-            Some(StorageImageSelector::R8Unorm)
+            storage_image_format(MTL_FORMAT_R8_UNORM),
+            Some(reims_vgpu_protocol::StorageImageFormat::R8Unorm)
         );
-        assert_eq!(storage_selector(MTL_FORMAT_A8_UNORM), None);
-        // R32Uint is storage-capable (specialized to the R32ui storage path);
-        // its single-channel sint/float siblings are not.
+        assert_eq!(storage_image_format(MTL_FORMAT_A8_UNORM), None);
         assert_eq!(
-            storage_selector(MTL_FORMAT_R32_UINT),
-            Some(StorageImageSelector::R32Uint)
+            storage_image_format(MTL_FORMAT_R32_UINT),
+            Some(reims_vgpu_protocol::StorageImageFormat::R32Uint)
         );
-        assert_eq!(storage_selector(MTL_FORMAT_R32_SINT), None);
-        assert_eq!(storage_selector(MTL_FORMAT_R32_FLOAT), None);
+        assert_eq!(
+            storage_image_format(MTL_FORMAT_R32_SINT),
+            Some(reims_vgpu_protocol::StorageImageFormat::R32Sint)
+        );
+        assert_eq!(
+            storage_image_format(MTL_FORMAT_R32_FLOAT),
+            Some(reims_vgpu_protocol::StorageImageFormat::R32Float)
+        );
         assert_eq!(render_target_bpp(MTL_FORMAT_BGRA8_UNORM), Some(4));
         assert_eq!(render_target_bpp(MTL_FORMAT_RGBA8_UNORM), Some(4));
         assert_eq!(render_target_bpp(MTL_FORMAT_RGBA8_UNORM_SRGB), Some(4));
@@ -2486,6 +2234,8 @@ mod tests {
         let expected: &[(u16, u32)] = &[
             (MTL_FORMAT_R8_UNORM, R8_BPP),
             (MTL_FORMAT_R32_UINT, R32_BPP),
+            (MTL_FORMAT_R32_SINT, R32_BPP),
+            (MTL_FORMAT_R32_FLOAT, R32_BPP),
             (MTL_FORMAT_RG8_UNORM, RG8_BPP),
             (MTL_FORMAT_R16_FLOAT, R16F_BPP),
             (MTL_FORMAT_RG16_FLOAT, RG16F_BPP),
@@ -2500,8 +2250,8 @@ mod tests {
         ];
         for (fmt, bpp) in expected {
             assert!(
-                storage_selector(*fmt).is_some(),
-                "format {fmt:#x} lost its storage selector"
+                storage_image_format(*fmt).is_some(),
+                "format {fmt:#x} lost its storage interpretation"
             );
             assert_eq!(
                 bytes_per_pixel(*fmt),
@@ -2513,7 +2263,7 @@ mod tests {
         // And no arm was added to one table without the other. Exhaustive, so
         // the two lists cannot drift apart in either direction.
         for fmt in 0u16..=u16::MAX {
-            if storage_selector(fmt).is_some() {
+            if storage_image_format(fmt).is_some() {
                 assert!(
                     bytes_per_pixel(fmt).is_some(),
                     "storage-capable {fmt:#x} has no texel width"
@@ -2530,18 +2280,6 @@ mod tests {
     fn compute_format_selection_is_backend_independent_and_role_specific() {
         use reims_vgpu_protocol::StorageImageFormat as F;
 
-        for raw in 0..=u16::MAX {
-            assert_eq!(
-                storage_selector(raw).map(storage_image_format_from_selector),
-                storage_image_format(raw).filter(|_| {
-                    !matches!(
-                        raw,
-                        MTL_FORMAT_R32_SINT | MTL_FORMAT_R32_FLOAT | MTL_FORMAT_RGB9E5_FLOAT
-                    )
-                }),
-                "selector and semantic storage format diverged at {raw:#x}"
-            );
-        }
         assert_eq!(
             compute_sampled_image_format(MTL_FORMAT_R16_UNORM),
             Some(F::R16Unorm)
@@ -2551,6 +2289,11 @@ mod tests {
             storage_image_format(MTL_FORMAT_R32_FLOAT),
             Some(F::R32Float)
         );
+        assert_eq!(
+            compute_sampled_image_format(MTL_FORMAT_RGB9E5_FLOAT),
+            Some(F::Rgb9e5Ufloat)
+        );
+        assert_eq!(storage_image_format(MTL_FORMAT_RGB9E5_FLOAT), None);
         assert_eq!(compute_sampled_image_format(0xffff), None);
     }
 
@@ -3001,7 +2744,7 @@ mod tests {
         for fmt in [0xffffu16, 130, 204] {
             assert!(bytes_per_pixel(fmt).is_none());
             assert!(sampled_class(fmt).is_none());
-            assert!(storage_selector(fmt).is_none());
+            assert!(storage_image_format(fmt).is_none());
             assert!(render_target_bpp(fmt).is_none());
             assert!(texel_to_rgba8(fmt, &[0; 16]).is_none());
         }
@@ -3013,7 +2756,7 @@ mod tests {
         ] {
             assert!(bytes_per_pixel(fmt).is_some());
             assert!(sampled_class(fmt).is_none());
-            assert!(storage_selector(fmt).is_none());
+            assert!(storage_image_format(fmt).is_none());
             assert!(render_target_bpp(fmt).is_none());
             assert!(texel_to_rgba8(fmt, &[0; 16]).is_none());
         }

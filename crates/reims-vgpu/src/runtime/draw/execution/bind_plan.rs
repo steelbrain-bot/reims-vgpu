@@ -72,31 +72,22 @@ pub(super) fn plan_bound_buffers<M: HostMemory + HostOps>(
         );
         let access = v_shader.interface.buffer_access(b.index);
         crate::runtime::bind_phase::note_access(access);
-        let content = if state
-            .executor
-            .may_serve_neutral_buffer(access, feeds_stage_in)
-        {
-            crate::runtime::bind_phase::note_neutral_served();
-            reims_vgpu_core::BufferContent::Bytes(state.executor.neutral_buffer_content())
-        } else {
-            crate::runtime::bind_phase::note_unused_staged(access);
-            let Some(content) = load_buffer_content(
-                state,
-                host,
-                req.task_id,
-                b.buffer_ref,
-                b.resource.as_deref(),
-                b.offset,
-                allow_zc,
-                cap,
-            ) else {
-                return Err(DrawPreparationDecline::VertexBufferMissing {
-                    index: b.index,
-                    buffer_ref: b.buffer_ref,
-                    offset: b.offset,
-                });
-            };
-            content
+        crate::runtime::bind_phase::note_unused_staged(access);
+        let Some(content) = load_buffer_content(
+            state,
+            host,
+            req.task_id,
+            b.buffer_ref,
+            b.resource.as_deref(),
+            b.offset,
+            allow_zc,
+            cap,
+        ) else {
+            return Err(DrawPreparationDecline::VertexBufferMissing {
+                index: b.index,
+                buffer_ref: b.buffer_ref,
+                offset: b.offset,
+            });
         };
         vtx_storage.push((b.index, content));
     }
@@ -115,7 +106,7 @@ pub(super) fn plan_bound_buffers<M: HostMemory + HostOps>(
         let cap = state.executor.render_buffer_extent(
             &f_shader.interface,
             b.index,
-            false,
+            true,
             req.first_vertex,
             req.vertex_count,
             req.base_instance,
@@ -127,28 +118,22 @@ pub(super) fn plan_bound_buffers<M: HostMemory + HostOps>(
         // No stage-in exclusion here: `[[stage_in]]` is a vertex-stage
         // concept and `pd.vertex_attributes` names vertex buffer indices,
         // which are a different index space from the fragment stage's.
-        let content = if state.executor.may_serve_neutral_buffer(access, false) {
-            crate::runtime::bind_phase::note_neutral_served();
-            reims_vgpu_core::BufferContent::Bytes(state.executor.neutral_buffer_content())
-        } else {
-            crate::runtime::bind_phase::note_unused_staged(access);
-            let Some(content) = load_buffer_content(
-                state,
-                host,
-                req.task_id,
-                b.buffer_ref,
-                b.resource.as_deref(),
-                b.offset,
-                true,
-                cap,
-            ) else {
-                return Err(DrawPreparationDecline::FragmentBufferMissing {
-                    index: b.index,
-                    buffer_ref: b.buffer_ref,
-                    offset: b.offset,
-                });
-            };
-            content
+        crate::runtime::bind_phase::note_unused_staged(access);
+        let Some(content) = load_buffer_content(
+            state,
+            host,
+            req.task_id,
+            b.buffer_ref,
+            b.resource.as_deref(),
+            b.offset,
+            false,
+            cap,
+        ) else {
+            return Err(DrawPreparationDecline::FragmentBufferMissing {
+                index: b.index,
+                buffer_ref: b.buffer_ref,
+                offset: b.offset,
+            });
         };
         frag_storage.push((b.index, content));
     }

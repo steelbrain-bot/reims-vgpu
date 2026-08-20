@@ -455,6 +455,10 @@ pub(crate) struct DeviceContext {
     /// `None` is the answer on every host without the extension, and the import
     /// site declines by name when it sees one.
     pub external_memory_host: Option<ash::ext::external_memory_host::Device>,
+    /// Structural support answers for an explicit linear modifier, keyed by
+    /// the complete format/usage contract. This only avoids repeating Vulkan
+    /// capability queries; it never remembers workload-shaped admission.
+    pub explicit_linear_support: std::sync::Mutex<std::collections::HashMap<(i32, u32, i32), bool>>,
     /// `VK_KHR_push_descriptor` entry points, present only when the extension
     /// was advertised, queried, and enabled for this device.
     pub push_descriptor: Option<ash::khr::push_descriptor::Device>,
@@ -567,6 +571,15 @@ pub(crate) struct DeviceContext {
     /// `VK_KHR_swapchain` was enabled for the engine-owned host window.
     #[cfg(feature = "host-window")]
     pub swapchain: bool,
+}
+
+/// Result of handing one guest submission to the queue owner.
+///
+/// `timeline` names GPU completion. `driver_return` names the earlier CPU-side
+/// ownership boundary after which another thread may access the submit fence.
+pub(crate) struct AsyncGuestSubmission {
+    pub(crate) timeline: Option<u64>,
+    pub(crate) driver_return: Option<super::queue_owner::PendingQueueSubmit>,
 }
 
 /// Whether a display transaction completed inline on the raw-queue fallback or
@@ -989,6 +1002,7 @@ impl DeviceContext {
         // this is enabled. Chained only when the host advertised it, because
         // asking for a feature a device declined fails `vkCreateDevice`.
         let mut en_image_robustness = features.enabled_image_robustness();
+        let mut en_null_descriptor = features.enabled_null_descriptor();
         let mut en_attachment_feedback = features.enabled_attachment_feedback_loop_layout();
         let mut en_linear_color_attachment = features.enabled_linear_color_attachment();
         let mut dci = vk::DeviceCreateInfo::default()
@@ -1004,6 +1018,9 @@ impl DeviceContext {
         }
         if features.image_robustness.is_available() {
             dci = dci.push_next(&mut en_image_robustness);
+        }
+        if features.null_descriptor {
+            dci = dci.push_next(&mut en_null_descriptor);
         }
         if features.attachment_feedback_loop_layout {
             dci = dci.push_next(&mut en_attachment_feedback);
@@ -1205,6 +1222,7 @@ impl DeviceContext {
             caps,
             memory_properties,
             external_memory_host,
+            explicit_linear_support: std::sync::Mutex::new(std::collections::HashMap::new()),
             push_descriptor,
             gq,
             compute_capable,
@@ -1483,18 +1501,25 @@ impl DeviceContext {
         &self,
         command_buffers: &[vk::CommandBuffer],
         fence: vk::Fence,
-    ) -> Result<Option<u64>, vk::Result> {
+    ) -> Result<AsyncGuestSubmission, vk::Result> {
         let timeline = self
             .stamp_completion
             .as_ref()
             .map(|completion| completion.reserve_submission());
         let timeline_value = timeline.as_ref().map(|(_, value, _)| *value);
         let Some(owner) = self.queue_owner.as_ref() else {
-            return unsafe { self.submit_guest_work_reserved(command_buffers, fence, timeline) };
+            return unsafe { self.submit_guest_work_reserved(command_buffers, fence, timeline) }
+                .map(|timeline| AsyncGuestSubmission {
+                    timeline,
+                    driver_return: None,
+                });
         };
         owner
             .submit_async(command_buffers, fence, timeline)
-            .map(|()| timeline_value)
+            .map(|driver_return| AsyncGuestSubmission {
+                timeline: timeline_value,
+                driver_return: Some(driver_return),
+            })
     }
 
     unsafe fn submit_guest_work_reserved(

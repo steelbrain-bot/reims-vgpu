@@ -447,14 +447,24 @@ pub(crate) struct SwapchainPlan {
     pub image_count: u32,
 }
 
-/// The guaranteed FIFO mode and an image count inside the surface's bounds.
-pub(crate) fn swapchain_plan(caps_min: u32, caps_max: u32) -> SwapchainPlan {
+/// The presentation mode that implements the window's latest-frame contract,
+/// and an image count inside the surface's bounds.
+pub(crate) fn swapchain_plan(
+    caps_min: u32,
+    caps_max: u32,
+    present_modes: &[vk::PresentModeKHR],
+) -> SwapchainPlan {
     SwapchainPlan {
-        // FIFO is the only mode every Vulkan surface must provide.  The host
-        // window retains a submitted image until a newer guest frame arrives;
-        // it does not need MAILBOX's replace-pending semantics to implement
-        // that contract.
-        present_mode: vk::PresentModeKHR::FIFO,
+        // The window exposes the newest published guest frame. MAILBOX gives
+        // that same meaning to frames already queued at the presentation
+        // engine: a newer image replaces an older one that has not reached the
+        // display yet. FIFO remains the required fallback when the surface
+        // does not advertise MAILBOX.
+        present_mode: if present_modes.contains(&vk::PresentModeKHR::MAILBOX) {
+            vk::PresentModeKHR::MAILBOX
+        } else {
+            vk::PresentModeKHR::FIFO
+        },
         image_count: swapchain_image_count(caps_min, caps_max),
     }
 }
@@ -920,6 +930,12 @@ impl WindowPresenter {
             .ok_or(DrawError::Unsupported(
                 super::reason::DrawReason::SwapchainNoSurfaceFormat,
             ))?;
+        let present_modes = self
+            .surface_loader
+            .get_physical_device_surface_present_modes(ctx.pd, self.surface)
+            .map_err(|error| {
+                DrawError::VkCall(VkCall::new(VkOp::WindowSurfacePresentModes, error))
+            })?;
         let extent = if caps.current_extent.width != u32::MAX {
             caps.current_extent
         } else {
@@ -934,7 +950,7 @@ impl WindowPresenter {
                     .clamp(caps.min_image_extent.height, caps.max_image_extent.height),
             }
         };
-        let plan = swapchain_plan(caps.min_image_count, caps.max_image_count);
+        let plan = swapchain_plan(caps.min_image_count, caps.max_image_count, &present_modes);
         let composite_alpha = [
             vk::CompositeAlphaFlagsKHR::OPAQUE,
             vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED,
@@ -1067,10 +1083,11 @@ impl WindowPresenter {
         ctx: &DeviceContext,
         pools: &mut ResourcePools,
         counters: &EngineCounters,
+        offered_seq: Option<u64>,
         source: Option<&WindowPresentSource>,
         cpu: Option<WindowCpuFrame<'_>>,
     ) -> Result<WindowPresentDispatch, DrawError> {
-        if let Some(seq) = cpu.map(|frame| frame.seq) {
+        if let Some(seq) = offered_seq {
             if self.cadence_last_offered != Some(seq) {
                 self.cadence_last_offered = Some(seq);
                 self.cadence_offered = self.cadence_offered.saturating_add(1);
@@ -2179,17 +2196,20 @@ mod tests {
         );
     }
 
-    /// The plan uses Vulkan's guaranteed presentation mode and keeps one image
-    /// spare inside the surface's declared bounds.
+    /// The plan selects latest-frame delivery when the surface advertises it,
+    /// falls back to Vulkan's guaranteed mode, and keeps one spare image inside
+    /// the surface's declared bounds.
     #[test]
-    fn the_swapchain_plan_is_fifo_with_one_spare_image() {
+    fn the_swapchain_plan_prefers_mailbox_and_keeps_one_spare_image() {
         use super::swapchain_plan;
         let fifo = vk::PresentModeKHR::FIFO;
-        assert_eq!(swapchain_plan(2, 0).present_mode, fifo);
-        assert_eq!(swapchain_plan(2, 0).image_count, 3);
-        assert_eq!(swapchain_plan(1, 0).image_count, 2);
-        assert_eq!(swapchain_plan(3, 0).image_count, 4);
-        assert_eq!(swapchain_plan(1, 2).image_count, 2);
-        assert_eq!(swapchain_plan(2, 3).image_count, 3);
+        let mailbox = vk::PresentModeKHR::MAILBOX;
+        assert_eq!(swapchain_plan(2, 0, &[fifo]).present_mode, fifo);
+        assert_eq!(swapchain_plan(2, 0, &[fifo, mailbox]).present_mode, mailbox);
+        assert_eq!(swapchain_plan(2, 0, &[fifo]).image_count, 3);
+        assert_eq!(swapchain_plan(1, 0, &[fifo]).image_count, 2);
+        assert_eq!(swapchain_plan(3, 0, &[fifo]).image_count, 4);
+        assert_eq!(swapchain_plan(1, 2, &[fifo]).image_count, 2);
+        assert_eq!(swapchain_plan(2, 3, &[fifo]).image_count, 3);
     }
 }

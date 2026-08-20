@@ -10,9 +10,9 @@
 //!
 //! # The rungs, in the order the archive tries them
 //!
-//! 1. **Type-8 view → base.** A view resolves to the texture it wraps, and
-//!    carries a format override and a mip level forward with it. A swizzled view
-//!    is refused rather than resolved.
+//! 1. **Type-8 view → base.** The shared view resolver composes the exact
+//!    mip/layer range into the final base namespace and carries the format
+//!    override with it. A swizzled view is refused rather than resolved.
 //! 2. **IOSurface.** Geometry comes from the live mapping, never from a
 //!    sticky latch — the latch exists only for the window where the object-list
 //!    entry is transiently missing, and preferring it has twice routed a
@@ -394,6 +394,32 @@ pub(super) enum RenderTargetCause {
     ViewSwizzled,
     /// The type-8 view chain ended at ref 0 — the view names no base texture.
     ViewBaseUnbound,
+    /// The pass selected a level or slice outside the view's declared range.
+    ViewSubresourceOutOfRange {
+        level: u32,
+        slice: u32,
+    },
+    ArraySliceOutOfRange {
+        slice: u64,
+        layers: u32,
+    },
+    DepthPlaneOutOfRange {
+        depth_plane: u32,
+        depth: u32,
+    },
+    SubresourceShapeUnsupported {
+        texture_type: u16,
+        slice: u64,
+        depth_plane: u32,
+    },
+    SubresourceOffsetOverflow,
+    LinearPackingMismatch {
+        texture_type: u16,
+        declared_slices: u32,
+        dimension_slices: u32,
+        bytes_per_slice: u64,
+        cube_faces: bool,
+    },
 
     /// The view's own level base plus the level the pass named does not fit a
     /// `u32`. A healthy zero: both are mip indices and a real texture has at
@@ -406,11 +432,15 @@ pub(super) enum RenderTargetCause {
     },
     /// A mip>0 view of an IOSurface. IOSurface texture sample windows carry planes, not
     /// mip levels, so this geometry has no contract behind it.
-    IOSurfaceMipView { level: u32 },
+    IOSurfaceMipView {
+        level: u32,
+    },
     /// Neither the live descriptor nor the latch produced a mapping id.
     IOSurfaceUnresolved,
     /// The mapping id resolved and names no live mapping.
-    IOSurfaceNoMapping { mapping_id: u32 },
+    IOSurfaceNoMapping {
+        mapping_id: u32,
+    },
     /// The mapping has no latched geometry, or a zero dimension.
     IOSurfaceGeometry {
         mapping_id: u32,
@@ -419,25 +449,35 @@ pub(super) enum RenderTargetCause {
         height: u32,
     },
     /// The mapping's format is not one Metal can render into.
-    IOSurfaceFormat { mapping_id: u32, fmt: u16 },
+    IOSurfaceFormat {
+        mapping_id: u32,
+        fmt: u16,
+    },
 
     /// The IOSurface plane view entry's descriptor bytes could not be read.
     IOSurfacePlaneViewDescRead,
     /// The bytes were read and are not a IOSurface plane view header.
-    IOSurfacePlaneViewDescDecode { len: usize },
+    IOSurfacePlaneViewDescDecode {
+        len: usize,
+    },
     /// The IOSurface plane view header names surface 0, so it wraps nothing.
     IOSurfacePlaneViewSurfaceZero,
 
     /// A mip>0 view of a surface backing surface. Colour RT materialization is level 0
     /// only.
-    SurfaceBackingMipView { surface_id: u32, level: u32 },
+    SurfaceBackingMipView {
+        surface_id: u32,
+        level: u32,
+    },
     /// The surface's backing could not be resolved.
     SurfaceBackingUnresolved {
         surface_id: u32,
         live_type: Option<ObjectKind>,
     },
     /// The surface resolved and left no mapping under its id.
-    SurfaceBackingNoMapping { surface_id: u32 },
+    SurfaceBackingNoMapping {
+        surface_id: u32,
+    },
     /// The surface's mapping has no geometry, a zero dimension, or no pages.
     SurfaceBackingGeometry {
         surface_id: u32,
@@ -450,21 +490,31 @@ pub(super) enum RenderTargetCause {
     /// FourCC it has no contract for. [`rt_surface_backing_base_format`] carries the
     /// argument for why no format is invented here; this is the ladder
     /// recording that it stopped there.
-    SurfaceBackingBaseFormat { surface_id: u32, raw_fmt: u16 },
+    SurfaceBackingBaseFormat {
+        surface_id: u32,
+        raw_fmt: u16,
+    },
     /// The surface's format is not one Metal can render into.
-    SurfaceBackingFormat { surface_id: u32, fmt: u16 },
+    SurfaceBackingFormat {
+        surface_id: u32,
+        fmt: u16,
+    },
 
     /// The guest has put nothing under this ref. Expected while a task's object
     /// list is still being populated, which is why it is reported and not
     /// treated as a decode error.
     NoListEntry,
     /// Something is under the ref and it is not a texture.
-    WrongType { object_type: ObjectKind },
+    WrongType {
+        object_type: ObjectKind,
+    },
     /// The texture entry's descriptor bytes could not be read.
     LinearDescRead,
     /// The bytes were read and are not a texture descriptor. Carries the
     /// resource decoder's own slug, so the specific malformation survives.
-    LinearDescDecode { decode: &'static str },
+    LinearDescDecode {
+        decode: &'static str,
+    },
     /// The descriptor decoded and left one of format, extent or row stride
     /// undeclared.
     LinearDescIncomplete {
@@ -474,14 +524,23 @@ pub(super) enum RenderTargetCause {
         row_stride: u32,
     },
     /// The declared format is not one Metal can render into.
-    LinearFormat { fmt: u16 },
+    LinearFormat {
+        fmt: u16,
+    },
     /// The view's mip level has no layout in the declared allocation.
-    LinearLevelGva { level: u32 },
+    LinearLevelGva {
+        level: u32,
+    },
     /// The level's row stride does not fit a `u32`, so the bind is
     /// unrepresentable.
-    LinearLevelStride { row_stride: u64 },
+    LinearLevelStride {
+        row_stride: u64,
+    },
     /// `row_stride * height` overflowed for the level.
-    LinearLevelSpan { row_stride: u64, height: u32 },
+    LinearLevelSpan {
+        row_stride: u64,
+        height: u32,
+    },
     /// The level's rows end past the allocation the guest declared. Rendering
     /// it would write over whatever guest memory follows.
     LinearLevelPastAllocation {
@@ -491,24 +550,46 @@ pub(super) enum RenderTargetCause {
     },
     /// The descriptor names no backing: a zero allocation, a zero handle, or a
     /// page shift outside the geometry this device supports.
-    LinearBackingGva { allocation_size: u64, handle: u32 },
+    LinearBackingGva {
+        allocation_size: u64,
+        handle: u32,
+    },
     /// `row_stride * height` overflowed for the base level.
-    LinearSpan { row_stride: u32, height: u32 },
+    LinearSpan {
+        row_stride: u32,
+        height: u32,
+    },
     /// The declared width and format have no tight row length — a zero width,
     /// or a format with no bytes-per-texel.
-    LinearTightRow { width: u32, fmt: u16 },
+    LinearTightRow {
+        width: u32,
+        fmt: u16,
+    },
     /// The rows end past the allocation under both the padded and the
     /// exclusive-last-row measure.
-    LinearPastAllocation { span: u64, alloc: u64, alt: u64 },
+    LinearPastAllocation {
+        span: u64,
+        alloc: u64,
+        alt: u64,
+    },
 
     /// The resolved target's width and format have no tight row length. Reached
     /// for a mip level, whose width is the level's rather than the declared one.
-    RowTight { width: u32, fmt: u16 },
+    RowTight {
+        width: u32,
+        fmt: u16,
+    },
     /// The target's row stride is narrower than one tight row of its own
     /// format, so consecutive rows would overlap.
-    RowStride { bpr: u32, tight: u32 },
+    RowStride {
+        bpr: u32,
+        tight: u32,
+    },
     /// The resolved target has a zero dimension.
-    ZeroExtent { width: u32, height: u32 },
+    ZeroExtent {
+        width: u32,
+        height: u32,
+    },
 }
 
 impl RenderTargetCause {
@@ -527,6 +608,12 @@ impl crate::observe::Decline for RenderTargetRefusal {
         match self.cause {
             C::ViewSwizzled => "rt_view_swizzled",
             C::ViewBaseUnbound => "rt_view_base_unbound",
+            C::ViewSubresourceOutOfRange { .. } => "rt_view_subresource_out_of_range",
+            C::ArraySliceOutOfRange { .. } => "rt_array_slice_out_of_range",
+            C::DepthPlaneOutOfRange { .. } => "rt_depth_plane_out_of_range",
+            C::SubresourceShapeUnsupported { .. } => "rt_subresource_shape_unsupported",
+            C::SubresourceOffsetOverflow => "rt_subresource_offset_overflow",
+            C::LinearPackingMismatch { .. } => "rt_linear_packing_mismatch",
             C::LevelOverflow { .. } => "rt_level_overflow",
             C::IOSurfaceMipView { .. } => "rt_iosurface_texture_mip_view",
             C::IOSurfaceUnresolved => "rt_iosurface_texture_unresolved",
@@ -570,6 +657,40 @@ impl crate::observe::Decline for RenderTargetRefusal {
         use RenderTargetCause as C;
         let mut v = vec![("base", self.base_ref.to_string())];
         match self.cause {
+            C::ViewSubresourceOutOfRange { level, slice } => {
+                v.push(("level", level.to_string()));
+                v.push(("slice", slice.to_string()));
+            }
+            C::ArraySliceOutOfRange { slice, layers } => {
+                v.push(("slice", slice.to_string()));
+                v.push(("layers", layers.to_string()));
+            }
+            C::DepthPlaneOutOfRange { depth_plane, depth } => {
+                v.push(("depth_plane", depth_plane.to_string()));
+                v.push(("depth", depth.to_string()));
+            }
+            C::SubresourceShapeUnsupported {
+                texture_type,
+                slice,
+                depth_plane,
+            } => {
+                v.push(("texture_type", texture_type.to_string()));
+                v.push(("slice", slice.to_string()));
+                v.push(("depth_plane", depth_plane.to_string()));
+            }
+            C::LinearPackingMismatch {
+                texture_type,
+                declared_slices,
+                dimension_slices,
+                bytes_per_slice,
+                cube_faces,
+            } => {
+                v.push(("texture_type", texture_type.to_string()));
+                v.push(("declared_slices", declared_slices.to_string()));
+                v.push(("dimension_slices", dimension_slices.to_string()));
+                v.push(("bytes_per_slice", bytes_per_slice.to_string()));
+                v.push(("cube_faces", u8::from(cube_faces).to_string()));
+            }
             C::IOSurfaceMipView { level } | C::LinearLevelGva { level } => {
                 v.push(("level", level.to_string()))
             }
@@ -688,6 +809,7 @@ impl crate::observe::Decline for RenderTargetRefusal {
             C::ZeroExtent { width, height } => v.push(("dims", format!("{width}x{height}"))),
             C::ViewSwizzled
             | C::ViewBaseUnbound
+            | C::SubresourceOffsetOverflow
             | C::IOSurfaceUnresolved
             | C::IOSurfacePlaneViewDescRead
             | C::IOSurfacePlaneViewSurfaceZero
@@ -743,6 +865,99 @@ pub(super) fn lookup_render_target<M: HostMemory + HostOps>(
     }
 }
 
+/// Byte displacement of one colour-attachment slice/depth plane inside a
+/// decoded mip record.
+///
+/// The texture declaration decides whether the third coordinate is an array
+/// slice or a depth plane. Keeping this projection beside view-range
+/// resolution prevents the render path from silently treating both as zero.
+fn linear_attachment_subresource_offset(
+    storage_type: u16,
+    physical_slices: u32,
+    bytes_per_slice: u64,
+    level: u32,
+    layout: Option<&crate::runtime::decode::resource::TextureLevelLayout>,
+    slice: u64,
+    depth_plane: u32,
+) -> Result<u64, RenderTargetCause> {
+    use crate::runtime::decode::resource::{
+        TEXTURE_VIEW_MTL_TYPE_1D, TEXTURE_VIEW_MTL_TYPE_1D_ARRAY, TEXTURE_VIEW_MTL_TYPE_2D,
+        TEXTURE_VIEW_MTL_TYPE_2D_ARRAY, TEXTURE_VIEW_MTL_TYPE_2D_MULTISAMPLE,
+        TEXTURE_VIEW_MTL_TYPE_3D, TEXTURE_VIEW_MTL_TYPE_CUBE, TEXTURE_VIEW_MTL_TYPE_CUBE_ARRAY,
+    };
+    use RenderTargetCause as C;
+    match storage_type {
+        TEXTURE_VIEW_MTL_TYPE_1D_ARRAY | TEXTURE_VIEW_MTL_TYPE_2D_ARRAY => {
+            if depth_plane != 0 {
+                return Err(C::SubresourceShapeUnsupported {
+                    texture_type: storage_type,
+                    slice,
+                    depth_plane,
+                });
+            }
+            let layers = physical_slices;
+            if slice >= u64::from(layers) {
+                return Err(C::ArraySliceOutOfRange { slice, layers });
+            }
+            bytes_per_slice
+                .checked_mul(slice)
+                .ok_or(C::SubresourceOffsetOverflow)
+        }
+        TEXTURE_VIEW_MTL_TYPE_CUBE | TEXTURE_VIEW_MTL_TYPE_CUBE_ARRAY => {
+            if depth_plane != 0 {
+                return Err(C::SubresourceShapeUnsupported {
+                    texture_type: storage_type,
+                    slice,
+                    depth_plane,
+                });
+            }
+            let layers = physical_slices;
+            if slice >= u64::from(layers) {
+                return Err(C::ArraySliceOutOfRange { slice, layers });
+            }
+            bytes_per_slice
+                .checked_mul(slice)
+                .ok_or(C::SubresourceOffsetOverflow)
+        }
+        TEXTURE_VIEW_MTL_TYPE_3D => {
+            if slice != 0 {
+                return Err(C::SubresourceShapeUnsupported {
+                    texture_type: storage_type,
+                    slice,
+                    depth_plane,
+                });
+            }
+            let layout = layout.ok_or(C::LinearLevelGva { level })?;
+            let depth = layout.planes();
+            if depth_plane >= depth {
+                return Err(C::DepthPlaneOutOfRange { depth_plane, depth });
+            }
+            layout
+                .row_stride
+                .checked_mul(u64::from(layout.height))
+                .and_then(|pitch| pitch.checked_mul(u64::from(depth_plane)))
+                .ok_or(C::SubresourceOffsetOverflow)
+        }
+        TEXTURE_VIEW_MTL_TYPE_1D
+        | TEXTURE_VIEW_MTL_TYPE_2D
+        | TEXTURE_VIEW_MTL_TYPE_2D_MULTISAMPLE => {
+            if slice != 0 || depth_plane != 0 {
+                return Err(C::SubresourceShapeUnsupported {
+                    texture_type: storage_type,
+                    slice,
+                    depth_plane,
+                });
+            }
+            Ok(0)
+        }
+        _ => Err(C::SubresourceShapeUnsupported {
+            texture_type: storage_type,
+            slice,
+            depth_plane,
+        }),
+    }
+}
+
 /// The ladder itself: four rungs, and a named refusal at every exit.
 ///
 /// Returning `Result` rather than `Option` is what holds that open. A bare
@@ -761,7 +976,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     use RenderTargetCause as C;
     let texture_ref = att.texture_ref;
     // Type-8 view → base (archive resource_resolve_texture view chain).
-    let (resolved_ref, view_fmt_override, view_level) =
+    let (resolved_ref, view_fmt_override, level, slice) =
         if let Some(view) = resolve_texture_view(state, host, task_id, texture_ref) {
             // Archive resolve_texture rejects swizzled views for linear resolve.
             if let Some(plan) = view.swizzle.as_ref() {
@@ -769,9 +984,23 @@ fn resolve_render_target<M: HostMemory + HostOps>(
                     return Err(C::ViewSwizzled.at(view.base_texture_ref));
                 }
             }
-            (view.base_texture_ref, view.pixel_format, view.level)
+            let (level, slice) = view
+                .select(u64::from(att.level), u64::from(att.slice))
+                .ok_or(
+                    C::ViewSubresourceOutOfRange {
+                        level: att.level,
+                        slice: att.slice,
+                    }
+                    .at(view.base_texture_ref),
+                )?;
+            (view.base_texture_ref, view.pixel_format, level, slice)
         } else {
-            (texture_ref, None, 0)
+            (
+                texture_ref,
+                None,
+                u64::from(att.level),
+                u64::from(att.slice),
+            )
         };
     // The level the pass names is relative to the texture it names, so a pass
     // rendering into level 1 of a view whose own range starts at level 2 lands
@@ -779,13 +1008,13 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     // number, which is what keeps the IOSurface texture and surface backing rungs — neither of
     // which has a mip layout — refusing an attachment level as loudly as they
     // already refuse a view level.
-    let level = view_level.checked_add(att.level).ok_or(
+    let level = u32::try_from(level).map_err(|_| {
         C::LevelOverflow {
-            view_level,
+            view_level: u32::MAX,
             attachment_level: att.level,
         }
-        .at(resolved_ref),
-    )?;
+        .at(resolved_ref)
+    })?;
     if resolved_ref == 0 {
         return Err(C::ViewBaseUnbound.at(resolved_ref));
     }
@@ -823,6 +1052,14 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         // of an IOSurface has no contract-backed layout; fail visibly.
         if level != 0 {
             return Err(C::IOSurfaceMipView { level }.at(resolved_ref));
+        }
+        if slice != 0 || att.depth_plane != 0 {
+            return Err(C::SubresourceShapeUnsupported {
+                texture_type: crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_2D,
+                slice,
+                depth_plane: att.depth_plane,
+            }
+            .at(resolved_ref));
         }
         // Live list is source of truth for mapping_id when the entry is IOSurface texture.
         // Latch is only a fallback when the list entry is transiently missing
@@ -917,6 +1154,14 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     if let Some(surface_id) = surface_backing_sid {
         if level != 0 {
             return Err(C::SurfaceBackingMipView { surface_id, level }.at(resolved_ref));
+        }
+        if slice != 0 || att.depth_plane != 0 {
+            return Err(C::SubresourceShapeUnsupported {
+                texture_type: crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_2D,
+                slice,
+                depth_plane: att.depth_plane,
+            }
+            .at(resolved_ref));
         }
         if !objects::resolve_surface_backing(state, host, surface_id) {
             return Err(C::SurfaceBackingUnresolved {
@@ -1023,10 +1268,53 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     if pixel_format::render_target_bpp(fmt).is_none() {
         return Err(C::LinearFormat { fmt }.at(resolved_ref));
     }
+    let declaration = tex.declaration.ok_or(
+        C::LinearDescIncomplete {
+            format: tex.declared_pixel_format().unwrap_or(0),
+            width: tex.width,
+            height: tex.height,
+            row_stride: tex.row_stride,
+        }
+        .at(resolved_ref),
+    )?;
+    let storage_type = u16::from(declaration.texture_type);
+    let storage_is_cube = matches!(
+        storage_type,
+        crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_CUBE
+            | crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_CUBE_ARRAY
+    );
+    let level_layout = tex.level(level);
+    if tex.slice_count != u32::from(declaration.array_length)
+        || tex.cube_faces != storage_is_cube
+        || !tex.declared_packing_fits_allocation()
+        || !level_layout.is_some_and(|layout| tex.level_fits_slice(layout))
+    {
+        return Err(C::LinearPackingMismatch {
+            texture_type: storage_type,
+            declared_slices: u32::from(declaration.array_length),
+            dimension_slices: tex.slice_count,
+            bytes_per_slice: tex.bytes_per_slice,
+            cube_faces: tex.cube_faces,
+        }
+        .at(resolved_ref));
+    }
+    let physical_slices = tex
+        .physical_slice_count()
+        .ok_or(C::SubresourceOffsetOverflow.at(resolved_ref))?;
+    let subresource_offset = linear_attachment_subresource_offset(
+        storage_type,
+        physical_slices,
+        tex.bytes_per_slice,
+        level,
+        level_layout,
+        slice,
+        att.depth_plane,
+    )
+    .map_err(|cause| cause.at(resolved_ref))?;
     // Mip>0 view of a linear texture: the RT is that level's plane inside the
     // base allocation (archive collapses view mip into linear geometry —
     // compositor blur/backdrop pyramids render into successive levels).
-    let (gva, w, h, bpr) = if level != 0 {
+    let (gva, w, h, bpr) = if level != 0 || subresource_offset != 0 {
         let (level_gva, layout) = tex
             .level_gva(level, state.page_shift)
             .ok_or(C::LinearLevelGva { level }.at(resolved_ref))?;
@@ -1053,16 +1341,23 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             }
             .at(resolved_ref),
         )?;
-        if tex.allocation_size != 0 && layout.offset.saturating_add(span) > tex.allocation_size {
+        let offset = tex
+            .base_offset
+            .checked_add(layout.offset)
+            .and_then(|offset| offset.checked_add(subresource_offset))
+            .ok_or(C::SubresourceOffsetOverflow.at(resolved_ref))?;
+        if tex.allocation_size != 0 && offset.saturating_add(span) > tex.allocation_size {
             return Err(C::LinearLevelPastAllocation {
-                offset: layout.offset,
+                offset,
                 span,
                 allocation_size: tex.allocation_size,
             }
             .at(resolved_ref));
         }
         (
-            level_gva,
+            level_gva
+                .checked_add(subresource_offset)
+                .ok_or(C::SubresourceOffsetOverflow.at(resolved_ref))?,
             layout.width,
             layout.height,
             layout.row_stride as u32,
@@ -1156,6 +1451,126 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         format: fmt,
         sample_count: 1,
     })
+}
+
+#[cfg(test)]
+mod subresource_tests {
+    use super::*;
+    use crate::runtime::decode::resource::{
+        TextureLevelLayout, TEXTURE_VIEW_MTL_TYPE_2D_ARRAY, TEXTURE_VIEW_MTL_TYPE_2D_MULTISAMPLE,
+        TEXTURE_VIEW_MTL_TYPE_3D,
+    };
+
+    #[test]
+    fn array_attachments_use_the_declared_full_chain_slice_pitch() {
+        let layout = TextureLevelLayout {
+            size: 0x4000,
+            row_stride: 0x100,
+            width: 64,
+            height: 64,
+            depth: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            linear_attachment_subresource_offset(
+                TEXTURE_VIEW_MTL_TYPE_2D_ARRAY,
+                4,
+                0x4000,
+                0,
+                Some(&layout),
+                3,
+                0,
+            ),
+            Ok(0xc000)
+        );
+        assert_eq!(
+            linear_attachment_subresource_offset(
+                TEXTURE_VIEW_MTL_TYPE_2D_ARRAY,
+                4,
+                0x4000,
+                0,
+                Some(&layout),
+                4,
+                0,
+            ),
+            Err(RenderTargetCause::ArraySliceOutOfRange {
+                slice: 4,
+                layers: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn multisample_source_is_a_single_2d_attachment_subresource() {
+        assert_eq!(
+            linear_attachment_subresource_offset(
+                TEXTURE_VIEW_MTL_TYPE_2D_MULTISAMPLE,
+                1,
+                0x4000,
+                0,
+                None,
+                0,
+                0,
+            ),
+            Ok(0)
+        );
+        assert_eq!(
+            linear_attachment_subresource_offset(
+                TEXTURE_VIEW_MTL_TYPE_2D_MULTISAMPLE,
+                1,
+                0x4000,
+                0,
+                None,
+                1,
+                0,
+            ),
+            Err(RenderTargetCause::SubresourceShapeUnsupported {
+                texture_type: TEXTURE_VIEW_MTL_TYPE_2D_MULTISAMPLE,
+                slice: 1,
+                depth_plane: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn volume_attachments_use_depth_planes_not_array_slices() {
+        let layout = TextureLevelLayout {
+            size: 0x6000,
+            row_stride: 0x100,
+            width: 64,
+            height: 32,
+            depth: 3,
+            ..Default::default()
+        };
+        assert_eq!(
+            linear_attachment_subresource_offset(
+                TEXTURE_VIEW_MTL_TYPE_3D,
+                1,
+                0x6000,
+                0,
+                Some(&layout),
+                0,
+                2,
+            ),
+            Ok(0x4000)
+        );
+        assert_eq!(
+            linear_attachment_subresource_offset(
+                TEXTURE_VIEW_MTL_TYPE_3D,
+                1,
+                0x6000,
+                0,
+                Some(&layout),
+                1,
+                0,
+            ),
+            Err(RenderTargetCause::SubresourceShapeUnsupported {
+                texture_type: TEXTURE_VIEW_MTL_TYPE_3D,
+                slice: 1,
+                depth_plane: 0,
+            })
+        );
+    }
 }
 
 /// The two report helpers above, tested where they live.
@@ -1512,9 +1927,10 @@ mod tests {
         use crate::model::PAGE_SHIFT_ARM64E;
         use crate::runtime::decode::resource::{
             list_object_entry_offset, LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_LIST_ENTRY_LEN,
-            TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_DECLARATION, TEXTURE_DESC_HEIGHT,
-            TEXTURE_DESC_LEVEL_RECORDS, TEXTURE_DESC_MIPMAP_LEVEL_COUNT,
-            TEXTURE_DESC_MIP_LEVEL_RECORD_LEN, TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_WIDTH,
+            TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_BASE_OFFSET, TEXTURE_DESC_BYTES_PER_SLICE,
+            TEXTURE_DESC_DECLARATION, TEXTURE_DESC_HEIGHT, TEXTURE_DESC_LEVEL_RECORDS,
+            TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_MIP_LEVEL_RECORD_LEN,
+            TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_SLICE_COUNT, TEXTURE_DESC_WIDTH,
             TEXTURE_LEVEL_HEIGHT, TEXTURE_LEVEL_OFFSET, TEXTURE_LEVEL_ROW_STRIDE,
             TEXTURE_LEVEL_SIZE, TEXTURE_LEVEL_WIDTH,
         };
@@ -1546,6 +1962,9 @@ mod tests {
         st32(&mut desc[TEXTURE_DESC_WIDTH..], w0);
         st32(&mut desc[TEXTURE_DESC_HEIGHT..], h0);
         st16(&mut desc[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], 2);
+        st16(&mut desc[TEXTURE_DESC_SLICE_COUNT..], 1);
+        st64(&mut desc[TEXTURE_DESC_BASE_OFFSET..], 0);
+        st64(&mut desc[TEXTURE_DESC_BYTES_PER_SLICE..], alloc);
         let rec = TEXTURE_DESC_LEVEL_RECORDS;
         st64(&mut desc[rec + TEXTURE_LEVEL_OFFSET..], l1_offset);
         st64(
@@ -1556,6 +1975,12 @@ mod tests {
         st32(&mut desc[rec + TEXTURE_LEVEL_WIDTH..], w1);
         st32(&mut desc[rec + TEXTURE_LEVEL_HEIGHT..], h1);
         let declaration = TEXTURE_DESC_DECLARATION + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+        let array_length = declaration
+            + core::mem::offset_of!(
+                reims_vgpu_wire::ops::texture::TextureDescriptorBody,
+                array_length
+            );
+        st16(&mut desc[array_length..], 1);
         st32(
             &mut desc[declaration..],
             2 | (4 << 8) | (u32::from(MTL_FORMAT_BGRA8_UNORM) << 16),
@@ -1626,8 +2051,10 @@ mod tests {
         use crate::model::PAGE_SHIFT_ARM64E;
         use crate::runtime::decode::resource::{
             list_object_entry_offset, LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_LIST_ENTRY_LEN,
-            TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT, TEXTURE_DESC_PIXEL_FORMAT,
-            TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_WIDTH,
+            TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_BASE_OFFSET, TEXTURE_DESC_BYTES_PER_SLICE,
+            TEXTURE_DESC_DECLARATION, TEXTURE_DESC_HEIGHT, TEXTURE_DESC_MIPMAP_LEVEL_COUNT,
+            TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_SLICE_COUNT,
+            TEXTURE_DESC_WIDTH,
         };
         use crate::runtime::gva_mem::{self, write_task_gva_arm64e};
         use reims_vgpu_core::endian::{st16, st32, st64};
@@ -1646,6 +2073,19 @@ mod tests {
         st32(&mut desc[TEXTURE_DESC_ROW_STRIDE..], bpr);
         st32(&mut desc[TEXTURE_DESC_WIDTH..], w);
         st32(&mut desc[TEXTURE_DESC_HEIGHT..], h);
+        st16(&mut desc[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], 1);
+        st16(&mut desc[TEXTURE_DESC_SLICE_COUNT..], 1);
+        st64(&mut desc[TEXTURE_DESC_BASE_OFFSET..], 0);
+        st64(
+            &mut desc[TEXTURE_DESC_BYTES_PER_SLICE..],
+            u64::from(bpr) * u64::from(h),
+        );
+        let array_length = TEXTURE_DESC_DECLARATION
+            + core::mem::offset_of!(
+                reims_vgpu_wire::ops::texture::TextureDescriptorBody,
+                array_length
+            );
+        st16(&mut desc[array_length..], 1);
         st16(
             &mut desc[TEXTURE_DESC_PIXEL_FORMAT..],
             MTL_FORMAT_RGBA16_FLOAT,

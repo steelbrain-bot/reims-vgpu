@@ -242,48 +242,6 @@ pub const BATCH_MIXED_TARGETS: &str = "REIMS_VGPU_BATCH_MIXED_TARGETS";
 /// Off is a refusal (`nojoin_depth`) and never a permission.
 pub const BATCH_DEPTH: &str = "REIMS_VGPU_BATCH_DEPTH";
 
-/// `off` stages the guest bytes of a `[[buffer(n)]]` bind even when the stage's
-/// own reflection says the shader never dereferences it.
-///
-/// The wider arm — the default — binds a neutral page for such a bind instead of
-/// gathering the guest's, because
-/// `reims-vgpu-core::ReflectedBufferAccess::Unused` means no shader
-/// invocation reads through the descriptor. The descriptor is still written, so
-/// the pipeline layout is byte-for-byte what it was; only the contents change,
-/// and only for binds nothing reads.
-///
-/// It exists as a switch for the same reason [`BUFFER_EXTENT`] does, and with
-/// more at stake. This is the one rail here whose failure mode is **silent wrong
-/// pixels**: if the translator ever says `Unused` about a buffer a shader does
-/// dereference, the shader reads the neutral page and nothing anywhere reports
-/// it. So the arm that copies has to stay reachable in one process, both to A/B
-/// the saving and to answer "is this rail why that surface is wrong" without a
-/// rebuild.
-///
-/// Off is a refusal and never a permission: it makes this device read *more* of
-/// the guest's memory, never less, and there is no spelling that grants a
-/// capability.
-///
-/// # It buys frames now, and did not when it was written
-///
-/// The twelve-boot A/B that landed this rail established the saving —
-/// `kib_per_draw` −6.27 %, disjoint at 45x — and explicitly established **no
-/// frame gain**, correctly, because the host window presenter was then a hard
-/// ~41 Hz ceiling and no device-side saving could appear past it.
-///
-/// Re-run on the multi-flight presenter, eight driven macos-13 boots, n=3 vs
-/// n=2 after regime exclusion: `kib_per_draw` **−6.31 %** — the same number to
-/// within a twentieth of a percent, disjoint at 44x, which is what says the two
-/// runs measured one rail — and now `frames_s` **+3.73 %, disjoint**, with
-/// `draws_s` +2.93 % also disjoint.
-///
-/// So the saving was real all along and was being spent into a ceiling. Two
-/// readings follow, and the second is the one worth carrying: a per-draw saving
-/// measured before that presenter fix is owed a re-run rather than believed
-/// worthless, and `frames_s` is the metric that reports it — not `presents_s`,
-/// which still overlapped here at this sample size.
-pub const UNUSED_BINDS: &str = "REIMS_VGPU_UNUSED_BINDS";
-
 /// `off` returns the host window presenter to one present in flight at a time.
 ///
 /// The wider arm — the default — lets several of the presenter's blits be in
@@ -384,24 +342,18 @@ pub const COMPUTE_SCATTER: &str = "REIMS_VGPU_COMPUTE_SCATTER";
 /// one binary on one guest.
 pub const SLAB_RETAIN: &str = "REIMS_VGPU_SLAB_RETAIN";
 
-/// `on` audits **every** vouched gather bind instead of one in
-/// `reims-vgpu::runtime::gather_witness::AUDIT_STRIDE`.
+/// `on` audits every vouched gather bind; the audit is disabled otherwise.
 ///
-/// It narrows in the sense this module requires, and it is the only switch here
-/// that narrows by doing *more* work: the fold is a read of the window, and a
-/// fold that disagrees spends the generation, so this arm can only turn
-/// elisions into re-gathers. It reaches no image the default arm does not also
-/// reach.
+/// This is an instrument rather than a product rail. The fold reads the window
+/// and reports disagreement with the decoded generation/write contract, but it
+/// does not change the resource identity or the work the guest receives.
 ///
 /// A stale bind's failure mode is content, and no counter reports it. The
-/// content audit *is* that counter, and at a stride of sixty-four it samples
-/// about 1.6 % of the binds it could judge: a four-rail sweep of this host read
-/// 122 comparisons against some fourteen thousand vouches. A zero over 1.6 % of
-/// a population is evidence about 1.6 % of it. With this on the sweep judges
-/// every bind, which is the difference between believing the zero-copy sampled
-/// cache is sound and having measured it.
+/// content audit is the instrument that can expose it. When enabled it judges
+/// every eligible bind, so its coverage is explicit rather than inferred from
+/// a fixed sampling stride.
 ///
-/// Not a shipping arm: at a stride of one the audit re-reads every window the
+/// Not a shipping arm: the audit re-reads every window the
 /// cache exists to avoid reading, which is the whole 842 MB/s rail arriving
 /// through the alarm. Use it for a soundness sweep, never for a timing.
 pub const GATHER_AUDIT_ALL: &str = "REIMS_VGPU_GATHER_AUDIT_ALL";
@@ -1066,7 +1018,7 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 24] = [
+pub const ALL: [&str; 23] = [
     COLOR_GENERAL,
     SLAB_RETAIN,
     GATHER_AUDIT_ALL,
@@ -1081,7 +1033,6 @@ pub const ALL: [&str; 24] = [
     BUFFER_EXTENT,
     BATCH_MIXED_TARGETS,
     BATCH_DEPTH,
-    UNUSED_BINDS,
     PRESENT_DEPTH,
     STAMP_COALESCE,
     SCATTER_SPLIT,

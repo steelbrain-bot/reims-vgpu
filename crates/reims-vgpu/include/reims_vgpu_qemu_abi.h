@@ -21,7 +21,11 @@
 extern "C" {
 #endif
 
-/* v19: remove guest dirty-page callbacks. Resource validity records are the
+/* v20: ReimsVgpuHostOps.map_pages_with_padding — build a resource-shaped
+ *      guest-page alias whose exact trailing extent is host-only binding
+ *      padding. The padding is not guest RAM and never enters a guest page
+ *      footprint.
+ * v19: remove guest dirty-page callbacks. Resource validity records are the
  *      ownership contract; memory observations do not select guest content.
  * v18: ReimsVgpuHostOps.dmabuf_for_pages and every REIMS_VGPU_DMABUF_* removed.
  *      v17's spans replaced the mechanism outright: guest pages reach the host
@@ -84,7 +88,7 @@ extern "C" {
  *     thread so IRQ pulses reach the guest mid-drain — ack fast).
  * v6: ReimsVgpuHostOps.is_ram_gpa (reject non-RAM PFNs on mapper / map_pages paths).
  * v5: ReimsVgpuQemuCreateInfo.guest_page_shift (12 = x86 Tahoe, 14 = arm64e). */
-#define REIMS_VGPU_QEMU_ABI_VERSION 19u
+#define REIMS_VGPU_QEMU_ABI_VERSION 20u
 
 #define REIMS_VGPU_QEMU_OK 0
 #define REIMS_VGPU_QEMU_ERR_ARGS 1
@@ -304,6 +308,18 @@ typedef struct ReimsVgpuHostOps {
      * older shim) must be treated as 0.
      */
     int map_pages_stable;
+    /*
+     * Build a stable packed alias over `count` guest pages and extend the host
+     * allocation to exactly `total_len` bytes with anonymous read/write
+     * padding. `total_len` must be at least count * guest page size and aligned
+     * to the host allocation granularity. The extra bytes are not guest RAM.
+     *
+     * Optional. A NULL callback means this host cannot materialize image
+     * binding padding and the backend keeps the transfer representation.
+     */
+    int (*map_pages_with_padding)(void *ctx, const uint64_t *gpas,
+                                  size_t count, size_t total_len,
+                                  void **out_ptr);
 } ReimsVgpuHostOps;
 
 /*

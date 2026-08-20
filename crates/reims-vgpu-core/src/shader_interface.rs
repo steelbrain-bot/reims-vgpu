@@ -370,13 +370,10 @@ pub struct PreparedShaderVariant {
     /// The backend projects this after applying its executable binding
     /// numbering, so command preparation never needs that private numbering.
     pub texture_uses: Arc<[(u32, DescriptorUse)]>,
-    /// Backend executable-numbering projection for this exact variant.
-    ///
-    /// Runtime supplies guest Metal indices and optional reflected descriptor
-    /// locations; it never reconstructs backend binding bands or relocation
-    /// offsets itself.
-    pub buffer_binding_offset: u32,
-    pub sampled_binding_offset: u32,
+    /// Effective descriptor-band bases reported by the translator for this
+    /// exact module. Runtime supplies Metal indices and never reconstructs the
+    /// selected descriptor layout.
+    pub buffer_binding_base: u32,
     pub texture_binding_base: u32,
     pub sampler_binding_base: u32,
     pub word_count: u32,
@@ -398,11 +395,11 @@ impl PreparedShaderVariant {
     }
 
     pub fn buffer_binding(&self, metal_index: u32) -> u32 {
-        metal_index + self.buffer_binding_offset
+        self.buffer_binding_base + metal_index
     }
 
     pub fn texture_binding(&self, metal_index: u32, declared_binding: Option<u32>) -> u32 {
-        self.texture_declared_binding(metal_index, declared_binding) + self.sampled_binding_offset
+        self.texture_declared_binding(metal_index, declared_binding)
     }
 
     pub fn texture_declared_binding(&self, metal_index: u32, declared_binding: Option<u32>) -> u32 {
@@ -410,11 +407,7 @@ impl PreparedShaderVariant {
     }
 
     pub fn sampler_binding(&self, metal_index: u32) -> u32 {
-        self.sampler_binding_base + metal_index + self.sampled_binding_offset
-    }
-
-    pub fn relocated_sampled_binding(&self, declared_binding: u32) -> u32 {
-        declared_binding + self.sampled_binding_offset
+        self.sampler_binding_base + metal_index
     }
 
     pub fn texture_use(&self, metal_index: u32) -> DescriptorUse {
@@ -426,47 +419,21 @@ impl PreparedShaderVariant {
     }
 }
 
-/// All executable numbering variants of one translated render stage.
+/// One translated render stage and the effective descriptor layout baked into
+/// its executable module.
 #[derive(Clone, Debug)]
 pub struct PreparedShaderFamily {
     pub interface: Arc<ShaderInterface>,
-    base: PreparedShaderVariant,
-    fragment_relocations: Option<[PreparedShaderVariant; 3]>,
+    variant: PreparedShaderVariant,
 }
 
 impl PreparedShaderFamily {
-    pub fn new(
-        interface: Arc<ShaderInterface>,
-        base: PreparedShaderVariant,
-        fragment_relocations: Option<[PreparedShaderVariant; 3]>,
-    ) -> Self {
-        Self {
-            interface,
-            base,
-            fragment_relocations,
-        }
+    pub fn new(interface: Arc<ShaderInterface>, variant: PreparedShaderVariant) -> Self {
+        Self { interface, variant }
     }
 
-    pub fn variant(
-        &self,
-        separate_sampled: bool,
-        buffer_collision: bool,
-    ) -> &PreparedShaderVariant {
-        match (separate_sampled, buffer_collision) {
-            (false, false) => &self.base,
-            (true, false) => &self
-                .fragment_relocations
-                .as_ref()
-                .expect("only fragment shaders request relocated numbering")[0],
-            (false, true) => &self
-                .fragment_relocations
-                .as_ref()
-                .expect("only fragment shaders request relocated numbering")[1],
-            (true, true) => &self
-                .fragment_relocations
-                .as_ref()
-                .expect("only fragment shaders request relocated numbering")[2],
-        }
+    pub fn variant(&self) -> &PreparedShaderVariant {
+        &self.variant
     }
 }
 

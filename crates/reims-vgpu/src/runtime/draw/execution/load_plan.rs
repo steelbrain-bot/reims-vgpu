@@ -11,8 +11,9 @@ use super::*;
 
 pub(super) struct LoadPlan {
     pub target_rgba8: Option<Arc<Vec<u8>>>,
-    pub target_guest_seed: Option<reims_vgpu_memory::GuestTargetSeed>,
+    pub target_guest: Option<reims_vgpu_memory::GuestTargetPlan>,
     pub target_clear: [f32; 4],
+    pub color_load_action: reims_vgpu_core::ColorLoadAction,
     pub target_seed_order: reims_vgpu_core::SeedOrder,
     pub gpu_only_content_allowed: bool,
     pub surface_target: Option<crate::model::TargetIdentity>,
@@ -32,11 +33,26 @@ pub(super) fn plan_load<M: HostMemory + HostOps>(
     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Seed);
     let mut target_rgba8 = None;
     let mut target_clear = [0.0; 4];
+    let mut color_load_action = reims_vgpu_core::ColorLoadAction::Clear;
     let mut target_seed_order = reims_vgpu_core::SeedOrder::Rgba8;
     let gpu_only_content_allowed = state.executor.capabilities().deferred_gpu_only_content;
 
+    let surface_render_target = iosurface_texture_render_identity(state, request);
+    let surface_target = writeback_guest
+        .then(|| surface_render_target.clone())
+        .flatten();
     let gva_guest_backing = gva_guest_target_backing(state, host, request);
-    let surface_target = iosurface_texture_store_identity(state, request, writeback_guest);
+    let surface_guest_backing = surface_render_target.as_ref().and_then(|identity| {
+        let color = request.colors.first()?;
+        try_iosurface_texture_target_guest_memory(
+            state,
+            host,
+            color.mapping_id(),
+            width,
+            height,
+            identity.resident_layout(),
+        )
+    });
     let mut load_from_target = request.chain_from_resident
         && render_chain_identity(state, request, gva_allocation_generation).is_some();
     let gva_load = resolve_gva_load_source(
@@ -119,8 +135,11 @@ pub(super) fn plan_load<M: HostMemory + HostOps>(
                 );
             }
             reims_vgpu_protocol::pass_action::LoadAction::DontCare => {
-                super::super::note_load_action_dont_care(request.pipeline_ref, width, height);
+                color_load_action = reims_vgpu_core::ColorLoadAction::DontCare;
             }
+        }
+        if color.load_action == reims_vgpu_protocol::pass_action::LoadAction::Load {
+            color_load_action = reims_vgpu_core::ColorLoadAction::Load;
         }
     }
 
@@ -135,10 +154,20 @@ pub(super) fn plan_load<M: HostMemory + HostOps>(
         );
     }
 
+    let target_guest = if let Some(memory) = gva_guest_backing.or(surface_guest_backing) {
+        Some(reims_vgpu_memory::GuestTargetPlan::Backing {
+            memory,
+            seed: target_guest_seed,
+        })
+    } else {
+        target_guest_seed.map(reims_vgpu_memory::GuestTargetPlan::Seed)
+    };
+
     LoadPlan {
         target_rgba8,
-        target_guest_seed,
+        target_guest,
         target_clear,
+        color_load_action,
         target_seed_order,
         gpu_only_content_allowed,
         surface_target,

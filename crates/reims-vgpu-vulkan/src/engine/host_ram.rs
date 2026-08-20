@@ -45,6 +45,9 @@ pub(crate) struct ImportedHostRam {
     pub import_id: reims_vgpu_memory::ImportId,
     pub buffer: vk::Buffer,
     pub memory: vk::DeviceMemory,
+    /// The single memory type selected for the imported pointer. Child images
+    /// may alias this allocation only when their requirements include it.
+    pub memory_type_index: u32,
     /// Bytes the import covers. The buffer spans all of it, so every
     /// [`reims_vgpu_memory::BoundRange`] inside the import is a valid
     /// offset into this one buffer.
@@ -214,6 +217,15 @@ pub(crate) struct BoundGuestRam {
 #[derive(Clone, Copy)]
 struct LiveImport {
     allocation: ImportedHostRam,
+    child_images: usize,
+    retired: bool,
+    retirement_fences_cleared: bool,
+}
+
+pub(crate) enum ParentRetire {
+    NotImported,
+    WaitingForChildren,
+    Ready(ImportedHostRam),
 }
 
 #[derive(Default)]
@@ -281,15 +293,70 @@ impl HostRamImports {
         unsafe { self.ensure(ctx, import) }.map(|(_, made)| made)
     }
 
+    /// Return the canonical imported allocation without inventing a second
+    /// import identity for a child image.
+    pub(crate) unsafe fn allocation(
+        &mut self,
+        ctx: &super::context::DeviceContext,
+        import: &GuestRamImport,
+    ) -> Result<ImportedHostRam, HostRamDecline> {
+        unsafe { self.ensure(ctx, import) }.map(|(allocation, _)| allocation)
+    }
+
+    pub(crate) fn retain_child(&mut self, import: &GuestRamImport) {
+        let entry = self
+            .live
+            .get_mut(&import.id().get())
+            .expect("a child can only retain the parent allocation it aliases");
+        entry.child_images = entry
+            .child_images
+            .checked_add(1)
+            .expect("guest import child count overflow");
+    }
+
+    pub(crate) fn release_child(&mut self, import: &GuestRamImport) -> Option<ImportedHostRam> {
+        let key = import.id().get();
+        let entry = self.live.get_mut(&key)?;
+        entry.child_images = entry
+            .child_images
+            .checked_sub(1)
+            .expect("every guest image release has a matching retain");
+        if entry.retired && entry.child_images == 0 && entry.retirement_fences_cleared {
+            return self.remove_live(key);
+        }
+        None
+    }
+
+    pub(crate) fn retirement_fences_cleared(
+        &mut self,
+        import_id: reims_vgpu_memory::ImportId,
+    ) -> Option<ImportedHostRam> {
+        let key = import_id.get();
+        let entry = self.live.get_mut(&key)?;
+        entry.retirement_fences_cleared = true;
+        if entry.retired && entry.child_images == 0 {
+            return self.remove_live(key);
+        }
+        None
+    }
+
     /// End a guest allocation's backend lifetime.
     ///
     /// The caller parks the returned handle against every open submission
     /// before destruction, so no GPU buffer reference can outlive the import.
-    pub(crate) fn retire(
-        &mut self,
-        import_id: reims_vgpu_memory::ImportId,
-    ) -> Option<ImportedHostRam> {
-        self.remove_live(import_id.get())
+    pub(crate) fn retire(&mut self, import_id: reims_vgpu_memory::ImportId) -> ParentRetire {
+        let key = import_id.get();
+        let Some(entry) = self.live.get_mut(&key) else {
+            return ParentRetire::NotImported;
+        };
+        entry.retired = true;
+        if entry.child_images == 0 {
+            return ParentRetire::Ready(
+                self.remove_live(key)
+                    .expect("the live entry was found above"),
+            );
+        }
+        ParentRetire::WaitingForChildren
     }
 
     /// The one place a host allocation becomes a backend import, so an identity
@@ -320,7 +387,15 @@ impl HostRamImports {
                 return Err(decline);
             }
         };
-        self.live.insert(key, LiveImport { allocation: made });
+        self.live.insert(
+            key,
+            LiveImport {
+                allocation: made,
+                child_images: 0,
+                retired: false,
+                retirement_fences_cleared: false,
+            },
+        );
         self.kinds.insert(key, import.gpa_base().is_some());
         Ok((made, true))
     }
@@ -388,8 +463,7 @@ unsafe fn import_host_allocation(
             rung: ctx.caps.host_pointer.rung,
         });
     };
-    const HANDLE_TYPE: vk::ExternalMemoryHandleTypeFlags =
-        vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
+    let handle_type = ctx.caps.host_pointer.handle_type;
 
     let host_base = import.host_base();
     let size = import.len();
@@ -420,6 +494,7 @@ unsafe fn import_host_allocation(
             loader,
             &ctx.memory_properties,
             host_base as *const std::ffi::c_void,
+            handle_type,
             &req,
             size,
             ctx.caps.max_allocation_size,
@@ -436,7 +511,7 @@ unsafe fn import_host_allocation(
     let memory_type_index = pick.index;
     let alloc_started = Instant::now();
 
-    let mut external = vk::ExternalMemoryBufferCreateInfo::default().handle_types(HANDLE_TYPE);
+    let mut external = vk::ExternalMemoryBufferCreateInfo::default().handle_types(handle_type);
     let create = vk::BufferCreateInfo::default()
         .size(size)
         .usage(GUEST_IMPORT_USAGE)
@@ -467,7 +542,7 @@ unsafe fn import_host_allocation(
         }
 
         let mut host_import = vk::ImportMemoryHostPointerInfoEXT::default()
-            .handle_type(HANDLE_TYPE)
+            .handle_type(handle_type)
             .host_pointer(host_base as *mut std::ffi::c_void);
         let allocate = vk::MemoryAllocateInfo::default()
             .allocation_size(size)
@@ -481,6 +556,7 @@ unsafe fn import_host_allocation(
                 import_id: import.id(),
                 buffer,
                 memory,
+                memory_type_index,
                 size,
             }),
             Err(result) => {
@@ -618,6 +694,69 @@ mod tests {
     use super::*;
     use crate::host_pointer::HostPointerImport;
     use crate::memory::MemoryTypeRefusal;
+
+    fn imported_parent(import: &GuestRamImport) -> ImportedHostRam {
+        ImportedHostRam {
+            import_id: import.id(),
+            buffer: vk::Buffer::null(),
+            memory: vk::DeviceMemory::null(),
+            memory_type_index: 0,
+            size: import.len(),
+        }
+    }
+
+    fn imports_with_parent(import: &GuestRamImport) -> HostRamImports {
+        let mut imports = HostRamImports::default();
+        imports.live.insert(
+            import.id().get(),
+            LiveImport {
+                allocation: imported_parent(import),
+                child_images: 0,
+                retired: false,
+                retirement_fences_cleared: false,
+            },
+        );
+        imports
+    }
+
+    #[test]
+    fn parent_retirement_waits_for_fence_and_last_child_in_either_order() {
+        let import =
+            GuestRamImport::new_host_allocation(0x1000, 0x4000, 0x1000).expect("synthetic import");
+        let mut children_last = imports_with_parent(&import);
+        children_last.retain_child(&import);
+        children_last.retain_child(&import);
+        assert!(matches!(
+            children_last.retire(import.id()),
+            ParentRetire::WaitingForChildren
+        ));
+        assert!(children_last
+            .retirement_fences_cleared(import.id())
+            .is_none());
+        assert!(children_last.release_child(&import).is_none());
+        assert_eq!(
+            children_last
+                .release_child(&import)
+                .map(|parent| parent.size),
+            Some(0x4000)
+        );
+
+        let import =
+            GuestRamImport::new_host_allocation(0x5000, 0x4000, 0x1000).expect("synthetic import");
+        let mut fence_last = imports_with_parent(&import);
+        fence_last.retain_child(&import);
+        assert!(matches!(
+            fence_last.retire(import.id()),
+            ParentRetire::WaitingForChildren
+        ));
+        assert!(fence_last.release_child(&import).is_none());
+        assert_eq!(
+            fence_last
+                .retirement_fences_cleared(import.id())
+                .map(|parent| parent.size),
+            Some(0x4000)
+        );
+    }
 
     /// One slug per check. Two sharing one would mean watching a slug fire and
     /// still not knowing whether the driver refused the pointer or the memory

@@ -9,6 +9,7 @@ pub use reims_vgpu_protocol::{
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct SamplerResource {
     pub binding: u32,
+    pub source: SamplerSource,
     pub min_filter: SamplerFilter,
     pub mag_filter: SamplerFilter,
     pub mip_filter: SamplerMipFilter,
@@ -24,10 +25,17 @@ pub struct SamplerResource {
     pub unnormalized_coordinates: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum SamplerSource {
+    State,
+    Null,
+}
+
 impl SamplerResource {
     pub fn normalized_default(binding: u32) -> Self {
         Self {
             binding,
+            source: SamplerSource::State,
             min_filter: SamplerFilter::Linear,
             mag_filter: SamplerFilter::Linear,
             mip_filter: SamplerMipFilter::NotMipmapped,
@@ -41,6 +49,12 @@ impl SamplerResource {
             max_anisotropy: 1,
             unnormalized_coordinates: false,
         }
+    }
+
+    pub fn null(binding: u32) -> Self {
+        let mut sampler = Self::normalized_default(binding);
+        sampler.source = SamplerSource::Null;
+        sampler
     }
 
     pub fn lod_min_f32(&self) -> f32 {
@@ -244,6 +258,8 @@ pub struct ComputeSampledImageResource {
 
 #[derive(Debug)]
 pub enum ComputeSampledImageSource {
+    /// A serialized texture slot containing no object.
+    Null,
     /// Tight host bytes.
     Bytes(Vec<u8>),
     /// Exact bounded guest allocation/window.

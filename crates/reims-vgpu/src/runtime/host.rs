@@ -454,6 +454,17 @@ pub trait HostPageViews {
         None
     }
 
+    /// Build a packed guest-page alias whose exact trailing extent is
+    /// anonymous host memory rather than guest RAM.
+    fn map_pages_with_padding(
+        &mut self,
+        _gpas: &[u64],
+        _page_size: usize,
+        _total_len: usize,
+    ) -> Option<usize> {
+        None
+    }
+
     /// Release a view obtained from [`HostPageViews::map_pages`].
     fn unmap_pages(&mut self, _ptr: usize, _len: usize) {}
 
@@ -1014,7 +1025,20 @@ impl FakeHost {
     /// returns a view of the wrong bytes.
     fn bounce_view(&mut self, gpas: &[u64], page_size: usize) -> Option<usize> {
         let total = gpas.len().checked_mul(page_size)?;
-        let mut buf = vec![0u8; total].into_boxed_slice();
+        self.bounce_view_with_len(gpas, page_size, total)
+    }
+
+    fn bounce_view_with_len(
+        &mut self,
+        gpas: &[u64],
+        page_size: usize,
+        total_len: usize,
+    ) -> Option<usize> {
+        let guest_len = gpas.len().checked_mul(page_size)?;
+        if total_len < guest_len {
+            return None;
+        }
+        let mut buf = vec![0u8; total_len].into_boxed_slice();
         for (i, &gpa) in gpas.iter().enumerate() {
             let off = i * page_size;
             let _ = self.read_gpa(gpa, &mut buf[off..off + page_size]);
@@ -1022,11 +1046,11 @@ impl FakeHost {
         let ptr = Box::into_raw(buf) as *mut u8 as usize;
         self.bounce.push(BounceView {
             ptr,
-            len: total,
+            len: total_len,
             gpas: gpas.to_vec(),
             page_sz: page_size,
         });
-        self.views.push((ptr, total));
+        self.views.push((ptr, total_len));
         Some(ptr)
     }
 
@@ -1238,6 +1262,23 @@ impl HostPageViews for FakeHost {
 
     fn map_pages_stable(&self) -> bool {
         self.stable_map_pages
+    }
+
+    fn map_pages_with_padding(
+        &mut self,
+        gpas: &[u64],
+        page_size: usize,
+        total_len: usize,
+    ) -> Option<usize> {
+        if !self.stable_map_pages
+            || page_size == 0
+            || !page_size.is_power_of_two()
+            || !total_len.is_multiple_of(page_size)
+        {
+            return None;
+        }
+        self.map_pages_calls = self.map_pages_calls.saturating_add(1);
+        self.bounce_view_with_len(gpas, page_size, total_len)
     }
 
     /// Contiguous host view; `page_size` is the guest page size from the device.
@@ -1620,6 +1661,33 @@ mod tests {
         unsafe { *((view + 4) as *mut u32) = 0x1122_3344 };
         assert_eq!(h.get_u32(0x10 * p + 4), 0x1122_3344);
         h.unmap_pages(view, 2 * GUEST_PAGE_SIZE_ARM64E);
+    }
+
+    #[test]
+    fn padded_page_view_writes_back_only_the_guest_prefix() {
+        const PAGE: usize = 1usize << reims_vgpu_paging::geometry::PAGE_SHIFT_X86;
+        let mut h = FakeHost::new();
+        h.stable_map_pages = true;
+        let gpa = 0x71u64 * PAGE as u64;
+        h.map_range(gpa, 2 * PAGE, 0);
+        h.put_u32(gpa, 0x1122_3344);
+        h.put_u32(gpa + PAGE as u64, 0x5566_7788);
+
+        let view = h
+            .map_pages_with_padding(&[gpa], PAGE, 2 * PAGE)
+            .expect("one guest page plus one host-only page");
+        unsafe {
+            *(view as *mut u32) = 0xaabb_ccdd;
+            *((view + PAGE) as *mut u32) = 0xfeed_face;
+        }
+        h.unmap_pages(view, 2 * PAGE);
+
+        assert_eq!(h.get_u32(gpa), 0xaabb_ccdd);
+        assert_eq!(
+            h.get_u32(gpa + PAGE as u64),
+            0x5566_7788,
+            "host padding must not create guest-owned memory"
+        );
     }
 
     /// A guest page smaller than the host's must still map to its own bytes.

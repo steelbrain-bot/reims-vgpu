@@ -300,6 +300,18 @@ impl BufferWriteGens {
         }
     }
 
+    pub fn has_write(&self, task_id: u32, object_id: u32) -> bool {
+        self.generations
+            .get(&(task_id, object_id))
+            .is_some_and(|generation| *generation != 0)
+    }
+
+    pub fn retire_object(&mut self, task_id: u32, object_id: u32) {
+        if self.generations.remove(&(task_id, object_id)).is_some() {
+            self.epoch = self.epoch.wrapping_add(1);
+        }
+    }
+
     pub fn retire_task(&mut self, task_id: u32) {
         let before = self.generations.len();
         self.generations.retain(|&(task, _), _| task != task_id);
@@ -751,6 +763,18 @@ mod tests {
         writes.retire_task(5);
         writes.note_write(5, 7);
         assert!(!writes.stamp(5, 7).quiet_since(before));
+    }
+
+    #[test]
+    fn preconstruction_writes_retire_with_the_object_name() {
+        let mut writes = BufferWriteGens::default();
+        writes.note_write(5, 7);
+        assert!(writes.has_write(5, 7));
+
+        writes.retire_object(5, 7);
+
+        assert!(!writes.has_write(5, 7));
+        assert!(!writes.has_write(5, 8));
     }
 
     #[test]

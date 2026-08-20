@@ -906,7 +906,7 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
         .executor
         .copy_target_to_guest_pages(identity, &licence.target, &licence.gpas)
         .map_err(|inner| GpuWritebackDecline::Engine { inner })?;
-    note_iosurface_texture_landed(state, mapping_id, licence.base_off, licence.span_end);
+    let _ = note_iosurface_texture_landed(state, mapping_id, licence.base_off, licence.span_end);
     Ok(licence.span_end - licence.base_off)
 }
 
@@ -1200,13 +1200,20 @@ pub(crate) fn note_iosurface_texture_landed(
     mapping_id: u32,
     base_off: u64,
     span_end: u64,
-) {
+) -> Option<u32> {
     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
     let _ = state.mark_mapping_written(mapping_id);
-    // The guest's pages are now the only place this frame exists, and the
-    // surface cache's entry, if any, is a previous flush's bytes. Same reason
-    // `write_bgra8_uncached` invalidates rather than publishes.
+    // The guest's pages now hold the authoritative frame, and the surface
+    // cache's entry, if any, is a previous flush's bytes. Same reason
+    // `write_bgra8_uncached` invalidates rather than publishes. A caller whose
+    // resident is the imported guest allocation uses the returned epoch to
+    // keep that exact representation current.
     crate::runtime::surface_cache::forget(state, mapping_id);
+    state
+        .surfaces
+        .mappings
+        .get(&mapping_id)
+        .map(|mapping| mapping.content.surface_epoch)
 }
 
 /// The geometry and pixel format a writeback to this mapping must land in.

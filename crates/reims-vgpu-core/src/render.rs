@@ -1,7 +1,7 @@
 //! Backend-independent resolved render commands and typed results.
 
 use crate::{ContentStamp, GatherVouch, ResourceLifetime, ResourceLifetimeRef, SamplerResource};
-use reims_vgpu_memory::{GuestRunSource, GuestTargetSeed};
+use reims_vgpu_memory::{GuestRunSource, GuestTargetPlan};
 pub use reims_vgpu_protocol::{
     BlendFactor, BlendOp, BlendStateResource, CullMode, DepthClipMode, FillMode, IndexType,
     PrimitiveTopology, StencilOp, VertexAttributeFormat, VertexStepFunction, VisibilityResultMode,
@@ -82,12 +82,15 @@ pub struct DrawRequest {
     pub sampled_images: Vec<SampledImageResource>,
     pub samplers: Vec<SamplerResource>,
     pub target_rgba8: Option<Arc<Vec<u8>>>,
-    pub target_guest_seed: Option<GuestTargetSeed>,
+    pub target_guest: Option<GuestTargetPlan>,
     pub target_seed_order: SeedOrder,
     pub blend: Option<BlendStateResource>,
     pub color_write_mask: ColorWriteMask,
     pub target_identity: Option<crate::TargetIdentity>,
     pub color_attachment_format: Option<ImageFormat>,
+    /// Decoded color-attachment load operation. Content placement and seed
+    /// availability do not change this contract term.
+    pub color_load_action: ColorLoadAction,
     pub load_from_target: bool,
     pub target_clear: [f32; 4],
     pub skip_readback: bool,
@@ -158,13 +161,28 @@ pub fn viewport_slot_count(req: &DrawRequest) -> usize {
 #[derive(Debug, Clone)]
 pub struct SecondaryColorTarget {
     pub identity: crate::TargetIdentity,
+    /// Canonical guest allocation for this attachment when its declared
+    /// layout is directly representable by the backend.
+    pub target_guest: Option<reims_vgpu_memory::GuestTargetMemory>,
     pub width: u32,
     pub height: u32,
     pub format: ImageFormat,
     pub clear: [f32; 4],
-    pub load: bool,
+    pub load_action: ColorLoadAction,
     pub blend: Option<BlendStateResource>,
     pub color_write_mask: ColorWriteMask,
+}
+
+/// Backend-independent color-attachment load operation.
+///
+/// This stays distinct from whether a LOAD source has already been
+/// materialized. In particular, `DontCare` is not a black clear.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum ColorLoadAction {
+    Load,
+    #[default]
+    Clear,
+    DontCare,
 }
 
 #[derive(Debug, Default)]
@@ -172,6 +190,14 @@ pub struct DrawOutput {
     pub pixels: Vec<u8>,
     pub pixels_bgra: bool,
     pub occlusion_samples: Option<u64>,
+    /// Exact guest pages whose directly bound attachment Store completed before
+    /// this result was returned. `None` means this draw published no direct
+    /// guest Store; the resident may still require its ordinary materialization.
+    pub guest_store_pages: Option<reims_vgpu_memory::GuestWritePages>,
+    /// Allocation-relative byte window occupied by that completed direct Store.
+    /// Carried with the completion so surface publication never re-derives a
+    /// possibly newer mapping layout after execution.
+    pub guest_store_window: Option<std::ops::Range<u64>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -319,12 +345,17 @@ pub enum SeedOrder {
 
 #[derive(Debug)]
 pub enum SampledSource {
+    /// A serialized texture slot containing no object.
+    Null,
     Bytes(Arc<Vec<u8>>),
     Target(crate::TargetIdentity),
     Attachment {
         identity: crate::TargetIdentity,
         initial: AttachmentInitial,
     },
+    /// An image view over authoritative guest storage, with an exact transfer
+    /// representation for backends whose image layout cannot alias it.
+    GuestImage(reims_vgpu_memory::GuestImageSource, GatherVouch),
     GuestRuns(GuestRunSource, GatherVouch),
 }
 

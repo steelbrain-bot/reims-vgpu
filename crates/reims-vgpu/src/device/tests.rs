@@ -163,6 +163,7 @@ fn drain_tail_remains_in_the_device_executor_session() {
     impl ObservationService for ScopeProbe {}
     impl ShaderTranslationService for ScopeProbe {}
     impl RenderBufferPlanningService for ScopeProbe {}
+    impl crate::runtime::executor::GuestImagePlanningService for ScopeProbe {}
     impl WindowPresentationService for ScopeProbe {}
     impl Executor for ScopeProbe {}
 

@@ -503,6 +503,7 @@ mod tests {
             source_offset: 0,
             runs: Arc::new(Vec::new()),
             pages: None,
+            physical_pages: None,
         }
     }
 

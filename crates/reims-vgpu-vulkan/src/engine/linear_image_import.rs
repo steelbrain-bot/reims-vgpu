@@ -1,0 +1,1295 @@
+//! Exact admission of a guest surface allocation as a Vulkan image.
+//!
+//! This is a binding equation, not topology policy. The child image aliases
+//! the canonical host-pointer import only when Vulkan reports the same offset,
+//! row pitch, and array/depth pitch for every declared mip, the image fits the
+//! parent, and the parent's selected memory type satisfies the image
+//! requirements.
+
+use ash::vk;
+use reims_vgpu_memory::{GuestImageLayout, GuestRamImport, GuestTargetBacking};
+use reims_vgpu_observe::Decline;
+
+use super::{context::DeviceContext, host_ram};
+
+const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+
+fn mutable_view_formats(format: vk::Format) -> Vec<vk::Format> {
+    match format {
+        vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB => {
+            vec![vk::Format::R8G8B8A8_UNORM, vk::Format::R8G8B8A8_SRGB]
+        }
+        vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB => {
+            vec![vk::Format::B8G8R8A8_UNORM, vk::Format::B8G8R8A8_SRGB]
+        }
+        other => vec![other],
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WindowPlan {
+    bind_offset: u64,
+    required_allocation_len: u64,
+}
+
+#[derive(Clone, Copy)]
+struct WindowAdmission {
+    layout: vk::SubresourceLayout,
+    requirements: vk::MemoryRequirements,
+    backing: GuestTargetBacking,
+    guest_layout: GuestImageLayout,
+    parent_memory_type: Option<u32>,
+    requires_dedicated: bool,
+    require_allocation_fit: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LayoutMode {
+    DriverLinear,
+    ExplicitLinear,
+}
+
+impl LayoutMode {
+    fn slug(self) -> &'static str {
+        match self {
+            Self::DriverLinear => "driver_linear",
+            Self::ExplicitLinear => "explicit_linear",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WindowRefusal {
+    HostImportUnavailable,
+    UnsupportedImageShape {
+        layers: u32,
+        volume: bool,
+        cube: bool,
+        arrayed: bool,
+        one_dim: bool,
+    },
+    /// A sampled declaration reads bytes that existed before Vulkan image
+    /// creation. External images must start `UNDEFINED`, so aliasing the memory
+    /// cannot preserve those bytes; the imported-buffer copy rail owns this
+    /// case.
+    SampledContentRequiresCopy,
+    AmbiguousResidentBacking {
+        matches: usize,
+    },
+    ParentAllocationMismatch,
+    ParentImport(host_ram::HostRamDecline),
+    HostPointerMisaligned,
+    ResourceWindowTooShort,
+    SubresourceAfterPlane,
+    BindOffsetMisaligned,
+    RowPitchMismatch {
+        guest: u64,
+        host: u64,
+    },
+    ArrayPitchMismatch,
+    DepthPitchMismatch,
+    MipOffsetMismatch {
+        mip_level: u32,
+        guest_offset: u64,
+        host_offset: u64,
+    },
+    BindingRangeOverflow,
+    AllocationTooShort {
+        required_end: u64,
+        allocation_len: u64,
+    },
+    NoMemoryType,
+    DedicatedBindingRequired,
+    ModifierQuery(vk::Result),
+    CreateImage {
+        result: vk::Result,
+        mode: LayoutMode,
+        format: vk::Format,
+        image_type: vk::ImageType,
+        width: u32,
+        height: u32,
+        depth: u32,
+        mip_levels: u32,
+        array_layers: u32,
+        plane_offset: u64,
+        row_pitch: u64,
+    },
+    CreateView(vk::Result),
+    BindImage(vk::Result),
+}
+
+impl Decline for WindowRefusal {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::HostImportUnavailable => "no_host_import",
+            Self::UnsupportedImageShape { .. } => "unsupported_image_shape",
+            Self::SampledContentRequiresCopy => "sampled_content_requires_copy",
+            Self::AmbiguousResidentBacking { .. } => "ambiguous_resident_backing",
+            Self::ParentAllocationMismatch => "parent_allocation_mismatch",
+            Self::ParentImport(inner) => inner.slug(),
+            Self::HostPointerMisaligned => "host_pointer_misaligned",
+            Self::ResourceWindowTooShort => "resource_window_too_short",
+            Self::SubresourceAfterPlane => "subresource_after_plane",
+            Self::BindOffsetMisaligned => "bind_offset_misaligned",
+            Self::RowPitchMismatch { .. } => "row_pitch_mismatch",
+            Self::ArrayPitchMismatch => "array_pitch_mismatch",
+            Self::DepthPitchMismatch => "depth_pitch_mismatch",
+            Self::MipOffsetMismatch { .. } => "mip_offset_mismatch",
+            Self::BindingRangeOverflow => "binding_range_overflow",
+            Self::AllocationTooShort { .. } => "allocation_too_short",
+            Self::NoMemoryType => "no_memory_type",
+            Self::DedicatedBindingRequired => "dedicated_binding_required",
+            Self::ModifierQuery(_) => "modifier_query_failed",
+            Self::CreateImage { .. } => "create_failed",
+            Self::CreateView(_) => "view_create_failed",
+            Self::BindImage(_) => "bind_failed",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::UnsupportedImageShape {
+                layers,
+                volume,
+                cube,
+                arrayed,
+                one_dim,
+            } => vec![
+                ("layers", layers.to_string()),
+                ("volume", u8::from(*volume).to_string()),
+                ("cube", u8::from(*cube).to_string()),
+                ("arrayed", u8::from(*arrayed).to_string()),
+                ("one_dim", u8::from(*one_dim).to_string()),
+            ],
+            Self::AllocationTooShort {
+                required_end,
+                allocation_len,
+            } => vec![
+                ("required_end", required_end.to_string()),
+                ("allocation_len", allocation_len.to_string()),
+            ],
+            Self::MipOffsetMismatch {
+                mip_level,
+                guest_offset,
+                host_offset,
+            } => vec![
+                ("mip", mip_level.to_string()),
+                ("guest_offset", guest_offset.to_string()),
+                ("host_offset", host_offset.to_string()),
+            ],
+            Self::RowPitchMismatch { guest, host } => vec![
+                ("guest_pitch", guest.to_string()),
+                ("host_pitch", host.to_string()),
+            ],
+            Self::AmbiguousResidentBacking { matches } => {
+                vec![("matches", matches.to_string())]
+            }
+            Self::ParentImport(inner) => inner.fields(),
+            Self::CreateImage {
+                result,
+                mode,
+                format,
+                image_type,
+                width,
+                height,
+                depth,
+                mip_levels,
+                array_layers,
+                plane_offset,
+                row_pitch,
+            } => vec![
+                ("result", format!("{result:?}")),
+                ("mode", mode.slug().to_string()),
+                ("format", format.as_raw().to_string()),
+                ("image_type", image_type.as_raw().to_string()),
+                ("width", width.to_string()),
+                ("height", height.to_string()),
+                ("depth", depth.to_string()),
+                ("mips", mip_levels.to_string()),
+                ("layers", array_layers.to_string()),
+                ("plane_offset", plane_offset.to_string()),
+                ("row_pitch", row_pitch.to_string()),
+            ],
+            Self::ModifierQuery(result) | Self::CreateView(result) | Self::BindImage(result) => {
+                vec![("result", format!("{result:?}"))]
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+reims_vgpu_observe::decline_display!(WindowRefusal);
+
+fn plan_driver_window(
+    layout: vk::SubresourceLayout,
+    requirements: vk::MemoryRequirements,
+    backing: GuestTargetBacking,
+    guest_layout: GuestImageLayout,
+    parent_memory_type: Option<u32>,
+    requires_dedicated: bool,
+    require_allocation_fit: bool,
+) -> Result<WindowPlan, WindowRefusal> {
+    let bind_offset = backing
+        .plane_offset
+        .checked_sub(layout.offset)
+        .ok_or(WindowRefusal::SubresourceAfterPlane)?;
+    if requirements.alignment == 0 || !bind_offset.is_multiple_of(requirements.alignment) {
+        return Err(WindowRefusal::BindOffsetMisaligned);
+    }
+    validate_common(
+        WindowAdmission {
+            layout,
+            requirements,
+            backing,
+            guest_layout,
+            parent_memory_type,
+            requires_dedicated,
+            require_allocation_fit,
+        },
+        bind_offset,
+    )
+}
+
+fn plan_explicit_window(
+    layout: vk::SubresourceLayout,
+    requirements: vk::MemoryRequirements,
+    backing: GuestTargetBacking,
+    guest_layout: GuestImageLayout,
+    parent_memory_type: Option<u32>,
+    requires_dedicated: bool,
+    require_allocation_fit: bool,
+) -> Result<WindowPlan, WindowRefusal> {
+    if layout.offset != backing.plane_offset {
+        return Err(WindowRefusal::SubresourceAfterPlane);
+    }
+    validate_common(
+        WindowAdmission {
+            layout,
+            requirements,
+            backing,
+            guest_layout,
+            parent_memory_type,
+            requires_dedicated,
+            require_allocation_fit,
+        },
+        0,
+    )
+}
+
+fn validate_common(
+    admission: WindowAdmission,
+    bind_offset: u64,
+) -> Result<WindowPlan, WindowRefusal> {
+    let WindowAdmission {
+        layout,
+        requirements,
+        backing,
+        guest_layout,
+        parent_memory_type,
+        requires_dedicated,
+        require_allocation_fit,
+    } = admission;
+    if layout.row_pitch != backing.row_pitch {
+        return Err(WindowRefusal::RowPitchMismatch {
+            guest: backing.row_pitch,
+            host: layout.row_pitch,
+        });
+    }
+    match guest_layout {
+        GuestImageLayout::D1Array {
+            layers,
+            array_pitch,
+            ..
+        }
+        | GuestImageLayout::D2Array {
+            layers,
+            array_pitch,
+            ..
+        } if layers > 1 && layout.array_pitch != array_pitch => {
+            return Err(WindowRefusal::ArrayPitchMismatch);
+        }
+        GuestImageLayout::D3 {
+            depth, depth_pitch, ..
+        } if depth > 1 && layout.depth_pitch != depth_pitch => {
+            return Err(WindowRefusal::DepthPitchMismatch);
+        }
+        _ => {}
+    }
+    let required_end = bind_offset
+        .checked_add(requirements.size)
+        .ok_or(WindowRefusal::BindingRangeOverflow)?;
+    if requirements.alignment == 0
+        || (require_allocation_fit && required_end > backing.allocation_len)
+    {
+        return Err(WindowRefusal::AllocationTooShort {
+            required_end,
+            allocation_len: backing.allocation_len,
+        });
+    }
+    if let Some(parent_memory_type) = parent_memory_type {
+        let parent_bit = 1_u32
+            .checked_shl(parent_memory_type)
+            .ok_or(WindowRefusal::NoMemoryType)?;
+        if requirements.memory_type_bits & parent_bit == 0 {
+            return Err(WindowRefusal::NoMemoryType);
+        }
+    }
+    if requires_dedicated {
+        return Err(WindowRefusal::DedicatedBindingRequired);
+    }
+    Ok(WindowPlan {
+        bind_offset,
+        required_allocation_len: required_end,
+    })
+}
+
+fn validate_mip_subresource(
+    mip_level: u32,
+    host: vk::SubresourceLayout,
+    guest: reims_vgpu_memory::GuestImageMipLayout,
+    bind_offset: u64,
+) -> Result<(), WindowRefusal> {
+    let host_offset = bind_offset
+        .checked_add(host.offset)
+        .ok_or(WindowRefusal::BindingRangeOverflow)?;
+    if host_offset != guest.offset {
+        return Err(WindowRefusal::MipOffsetMismatch {
+            mip_level,
+            guest_offset: guest.offset,
+            host_offset,
+        });
+    }
+    if host.row_pitch != guest.row_pitch {
+        return Err(WindowRefusal::RowPitchMismatch {
+            guest: guest.row_pitch,
+            host: host.row_pitch,
+        });
+    }
+    match guest.layout {
+        GuestImageLayout::D1Array {
+            layers,
+            array_pitch,
+            ..
+        }
+        | GuestImageLayout::D2Array {
+            layers,
+            array_pitch,
+            ..
+        } if layers > 1 && host.array_pitch != array_pitch => {
+            Err(WindowRefusal::ArrayPitchMismatch)
+        }
+        GuestImageLayout::D3 {
+            depth, depth_pitch, ..
+        } if depth > 1 && host.depth_pitch != depth_pitch => Err(WindowRefusal::DepthPitchMismatch),
+        _ => Ok(()),
+    }
+}
+
+fn required_features(usage: vk::ImageUsageFlags) -> vk::FormatFeatureFlags {
+    let mut required = vk::FormatFeatureFlags::empty();
+    if usage.contains(vk::ImageUsageFlags::SAMPLED) {
+        required |= vk::FormatFeatureFlags::SAMPLED_IMAGE;
+    }
+    if usage
+        .intersects(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::INPUT_ATTACHMENT)
+    {
+        required |= vk::FormatFeatureFlags::COLOR_ATTACHMENT
+            | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND;
+    }
+    if usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) {
+        required |= vk::FormatFeatureFlags::TRANSFER_SRC;
+    }
+    if usage.contains(vk::ImageUsageFlags::TRANSFER_DST) {
+        required |= vk::FormatFeatureFlags::TRANSFER_DST;
+    }
+    required
+}
+
+unsafe fn explicit_linear_supported(
+    ctx: &DeviceContext,
+    format: vk::Format,
+    usage: vk::ImageUsageFlags,
+    image_type: vk::ImageType,
+) -> Result<bool, WindowRefusal> {
+    if !ctx.features.image_drm_format_modifier {
+        return Ok(false);
+    }
+    let key = (format.as_raw(), usage.as_raw(), image_type.as_raw());
+    if let Some(answer) = ctx
+        .explicit_linear_support
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .get(&key)
+        .copied()
+    {
+        return Ok(answer);
+    }
+    let answer = unsafe { query_explicit_linear_support(ctx, format, usage, image_type) }?;
+    ctx.explicit_linear_support
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(key, answer);
+    Ok(answer)
+}
+
+unsafe fn query_explicit_linear_support(
+    ctx: &DeviceContext,
+    format: vk::Format,
+    usage: vk::ImageUsageFlags,
+    image_type: vk::ImageType,
+) -> Result<bool, WindowRefusal> {
+    let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
+    let mut properties = vk::FormatProperties2::default().push_next(&mut list);
+    unsafe {
+        ctx.instance
+            .get_physical_device_format_properties2(ctx.pd, format, &mut properties)
+    };
+    let mut modifiers = vec![
+        vk::DrmFormatModifierPropertiesEXT::default();
+        list.drm_format_modifier_count as usize
+    ];
+    let mut list = vk::DrmFormatModifierPropertiesListEXT::default()
+        .drm_format_modifier_properties(&mut modifiers);
+    let mut properties = vk::FormatProperties2::default().push_next(&mut list);
+    unsafe {
+        ctx.instance
+            .get_physical_device_format_properties2(ctx.pd, format, &mut properties)
+    };
+    let required = required_features(usage);
+    if !modifiers.iter().any(|modifier| {
+        modifier.drm_format_modifier == DRM_FORMAT_MOD_LINEAR
+            && modifier.drm_format_modifier_plane_count == 1
+            && modifier
+                .drm_format_modifier_tiling_features
+                .contains(required)
+    }) {
+        return Ok(false);
+    }
+
+    let handle = ctx.caps.host_pointer.handle_type;
+    let mut modifier = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+        .drm_format_modifier(DRM_FORMAT_MOD_LINEAR)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let mut external = vk::PhysicalDeviceExternalImageFormatInfo::default().handle_type(handle);
+    let view_formats = mutable_view_formats(format);
+    let mut format_list = vk::ImageFormatListCreateInfo::default().view_formats(&view_formats);
+    let info = vk::PhysicalDeviceImageFormatInfo2::default()
+        .format(format)
+        .ty(image_type)
+        .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+        .usage(usage)
+        .flags(vk::ImageCreateFlags::ALIAS | vk::ImageCreateFlags::MUTABLE_FORMAT)
+        .push_next(&mut modifier)
+        .push_next(&mut format_list)
+        .push_next(&mut external);
+    let mut external_properties = vk::ExternalImageFormatProperties::default();
+    let mut properties = vk::ImageFormatProperties2::default().push_next(&mut external_properties);
+    let query = unsafe {
+        ctx.instance
+            .get_physical_device_image_format_properties2(ctx.pd, &info, &mut properties)
+    };
+    if query == Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED) {
+        return Ok(false);
+    }
+    query.map_err(WindowRefusal::ModifierQuery)?;
+    let features = external_properties
+        .external_memory_properties
+        .external_memory_features;
+    Ok(
+        features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+            && !features.contains(vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY),
+    )
+}
+
+pub(crate) struct ImportedImage {
+    pub image: vk::Image,
+}
+
+#[derive(Clone, Copy)]
+struct ImageGeometry {
+    image_type: vk::ImageType,
+    extent: vk::Extent3D,
+    array_layers: u32,
+}
+
+fn image_geometry(layout: GuestImageLayout) -> ImageGeometry {
+    ImageGeometry {
+        image_type: match layout {
+            GuestImageLayout::D1 { .. } | GuestImageLayout::D1Array { .. } => {
+                vk::ImageType::TYPE_1D
+            }
+            GuestImageLayout::D2 { .. } | GuestImageLayout::D2Array { .. } => {
+                vk::ImageType::TYPE_2D
+            }
+            GuestImageLayout::D3 { .. } => vk::ImageType::TYPE_3D,
+        },
+        extent: vk::Extent3D {
+            width: layout.width(),
+            height: layout.height(),
+            depth: layout.depth(),
+        },
+        array_layers: layout.array_layers(),
+    }
+}
+
+fn note_explicit_linear_declined(
+    decline: &WindowRefusal,
+    backing: GuestTargetBacking,
+    allocation_layout: &reims_vgpu_memory::GuestImageAllocationLayout,
+    format: vk::Format,
+    image_type: vk::ImageType,
+    usage: vk::ImageUsageFlags,
+) {
+    let key = explicit_linear_decline_key(
+        decline,
+        backing,
+        allocation_layout,
+        format,
+        image_type,
+        usage,
+    );
+    if reims_vgpu_observe::first_sight("sampled_guest_image_explicit_declined", key) {
+        reims_vgpu_observe::Emit::decline("sampled_guest_image_explicit_declined", decline).off();
+    }
+}
+
+fn explicit_linear_decline_key(
+    decline: &WindowRefusal,
+    backing: GuestTargetBacking,
+    allocation_layout: &reims_vgpu_memory::GuestImageAllocationLayout,
+    format: vk::Format,
+    image_type: vk::ImageType,
+    usage: vk::ImageUsageFlags,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut key = std::collections::hash_map::DefaultHasher::new();
+    (
+        decline.slug(),
+        backing.resource_offset,
+        backing.resource_len,
+        backing.plane_offset,
+        backing.row_pitch,
+        allocation_layout,
+        format.as_raw(),
+        image_type.as_raw(),
+        usage.as_raw(),
+    )
+        .hash(&mut key);
+    key.finish()
+}
+
+fn note_explicit_linear_unavailable(
+    format: vk::Format,
+    image_type: vk::ImageType,
+    usage: vk::ImageUsageFlags,
+) {
+    use std::hash::{Hash, Hasher};
+    let mut key = std::collections::hash_map::DefaultHasher::new();
+    (format.as_raw(), image_type.as_raw(), usage.as_raw()).hash(&mut key);
+    let key = key.finish();
+    if reims_vgpu_observe::first_sight("sampled_guest_image_explicit_unavailable", key) {
+        reims_vgpu_observe::off(format!(
+            "sampled_guest_image_explicit_unavailable format={} image_type={} usage={:#x}",
+            format.as_raw(),
+            image_type.as_raw(),
+            usage.as_raw(),
+        ));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn create(
+    ctx: &DeviceContext,
+    imports: &mut host_ram::HostRamImports,
+    import: &GuestRamImport,
+    backing: GuestTargetBacking,
+    layout: GuestImageLayout,
+    format: vk::Format,
+    usage: vk::ImageUsageFlags,
+) -> Result<ImportedImage, WindowRefusal> {
+    let allocation_layout = reims_vgpu_memory::GuestImageAllocationLayout::single(
+        backing.plane_offset,
+        backing.row_pitch,
+        layout,
+    );
+    unsafe {
+        create_allocation(
+            ctx,
+            imports,
+            import,
+            backing,
+            &allocation_layout,
+            format,
+            usage,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn create_allocation(
+    ctx: &DeviceContext,
+    imports: &mut host_ram::HostRamImports,
+    import: &GuestRamImport,
+    backing: GuestTargetBacking,
+    allocation_layout: &reims_vgpu_memory::GuestImageAllocationLayout,
+    format: vk::Format,
+    mut usage: vk::ImageUsageFlags,
+) -> Result<ImportedImage, WindowRefusal> {
+    if ctx.external_memory_host.is_none() {
+        return Err(WindowRefusal::HostImportUnavailable);
+    }
+    if import.host_base() != backing.allocation_host_ptr || import.len() != backing.allocation_len {
+        return Err(WindowRefusal::ParentAllocationMismatch);
+    }
+    let alignment = ctx.caps.host_pointer.min_alignment;
+    if alignment == 0
+        || !(backing.allocation_host_ptr as u64).is_multiple_of(alignment)
+        || !backing.allocation_len.is_multiple_of(alignment)
+    {
+        return Err(WindowRefusal::HostPointerMisaligned);
+    }
+    let bytes_per_texel = crate::translate::pixel::texel_layout_of(format)
+        .map(|layout| u64::from(layout.bytes_per_texel()))
+        .ok_or(WindowRefusal::ResourceWindowTooShort)?;
+    if !allocation_layout.is_vulkan_mip_chain(bytes_per_texel) {
+        return Err(WindowRefusal::ResourceWindowTooShort);
+    }
+    for mip in allocation_layout.mips.iter() {
+        let mip_backing = GuestTargetBacking {
+            plane_offset: mip.offset,
+            row_pitch: mip.row_pitch,
+            ..backing
+        };
+        if mip_backing
+            .visible_image_window(mip.layout, bytes_per_texel)
+            .is_none()
+        {
+            return Err(WindowRefusal::ResourceWindowTooShort);
+        }
+    }
+    let allocation =
+        unsafe { imports.allocation(ctx, import) }.map_err(WindowRefusal::ParentImport)?;
+    if ctx.features.attachment_feedback_loop_layout
+        && usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+    {
+        usage |= vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT;
+    }
+
+    let geometry = image_geometry(
+        allocation_layout
+            .base()
+            .ok_or(WindowRefusal::ResourceWindowTooShort)?
+            .layout,
+    );
+    let explicit = unsafe { explicit_linear_supported(ctx, format, usage, geometry.image_type) }?;
+    let result = if explicit {
+        let first = unsafe {
+            create_with_layout(
+                ctx,
+                allocation,
+                backing,
+                allocation_layout,
+                format,
+                usage,
+                LayoutMode::ExplicitLinear,
+            )
+        };
+        match first {
+            Ok(image) => Ok(image),
+            Err(decline) => {
+                note_explicit_linear_declined(
+                    &decline,
+                    backing,
+                    allocation_layout,
+                    format,
+                    geometry.image_type,
+                    usage,
+                );
+                unsafe {
+                    create_with_layout(
+                        ctx,
+                        allocation,
+                        backing,
+                        allocation_layout,
+                        format,
+                        usage,
+                        LayoutMode::DriverLinear,
+                    )
+                }
+            }
+        }
+    } else {
+        note_explicit_linear_unavailable(format, geometry.image_type, usage);
+        unsafe {
+            create_with_layout(
+                ctx,
+                allocation,
+                backing,
+                allocation_layout,
+                format,
+                usage,
+                LayoutMode::DriverLinear,
+            )
+        }
+    };
+    if result.is_ok() {
+        imports.retain_child(import);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn plan_image_with_layout(
+    ctx: &DeviceContext,
+    backing: GuestTargetBacking,
+    allocation_layout: &reims_vgpu_memory::GuestImageAllocationLayout,
+    format: vk::Format,
+    usage: vk::ImageUsageFlags,
+    mode: LayoutMode,
+    parent_memory_type: Option<u32>,
+    require_allocation_fit: bool,
+) -> Result<(vk::Image, WindowPlan), WindowRefusal> {
+    let handle = ctx.caps.host_pointer.handle_type;
+    let mut external = vk::ExternalMemoryImageCreateInfo::default().handle_types(handle);
+    let base_mip = allocation_layout
+        .base()
+        .ok_or(WindowRefusal::ResourceWindowTooShort)?;
+    let mip_levels = allocation_layout
+        .mip_level_count()
+        .ok_or(WindowRefusal::ResourceWindowTooShort)?;
+    let guest_layout = base_mip.layout;
+    let geometry = image_geometry(guest_layout);
+    let base = vk::ImageCreateInfo::default()
+        .flags(vk::ImageCreateFlags::ALIAS | vk::ImageCreateFlags::MUTABLE_FORMAT)
+        .image_type(geometry.image_type)
+        .format(format)
+        .extent(geometry.extent)
+        .mip_levels(mip_levels)
+        .array_layers(geometry.array_layers)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .usage(usage)
+        // External-memory images are born without Vulkan-visible contents.
+        // Guest bytes are materialized through the buffer transfer rail before
+        // the first LOAD; later attachment writes keep this image authoritative.
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+    let view_formats = mutable_view_formats(format);
+    let mut format_list = vk::ImageFormatListCreateInfo::default().view_formats(&view_formats);
+    let image = match mode {
+        LayoutMode::DriverLinear => unsafe {
+            ctx.device.create_image(
+                &base
+                    .tiling(vk::ImageTiling::LINEAR)
+                    .push_next(&mut format_list)
+                    .push_next(&mut external),
+                None,
+            )
+        },
+        LayoutMode::ExplicitLinear => {
+            let layouts = [vk::SubresourceLayout {
+                offset: base_mip.offset,
+                size: 0,
+                row_pitch: base_mip.row_pitch,
+                array_pitch: match guest_layout {
+                    GuestImageLayout::D1Array { array_pitch, .. }
+                    | GuestImageLayout::D2Array { array_pitch, .. } => array_pitch,
+                    _ => 0,
+                },
+                depth_pitch: match guest_layout {
+                    GuestImageLayout::D3 { depth_pitch, .. } => depth_pitch,
+                    _ => 0,
+                },
+            }];
+            let mut explicit = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+                .drm_format_modifier(DRM_FORMAT_MOD_LINEAR)
+                .plane_layouts(&layouts);
+            unsafe {
+                ctx.device.create_image(
+                    &base
+                        .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+                        .push_next(&mut format_list)
+                        .push_next(&mut external)
+                        .push_next(&mut explicit),
+                    None,
+                )
+            }
+        }
+    }
+    .map_err(|result| WindowRefusal::CreateImage {
+        result,
+        mode,
+        format,
+        image_type: geometry.image_type,
+        width: geometry.extent.width,
+        height: geometry.extent.height,
+        depth: geometry.extent.depth,
+        mip_levels,
+        array_layers: geometry.array_layers,
+        plane_offset: base_mip.offset,
+        row_pitch: base_mip.row_pitch,
+    })?;
+
+    let result = (|| {
+        let mut dedicated = vk::MemoryDedicatedRequirements::default();
+        let mut requirements = vk::MemoryRequirements2::default().push_next(&mut dedicated);
+        unsafe {
+            ctx.device.get_image_memory_requirements2(
+                &vk::ImageMemoryRequirementsInfo2::default().image(image),
+                &mut requirements,
+            )
+        };
+        let aspect_mask = match mode {
+            LayoutMode::DriverLinear => vk::ImageAspectFlags::COLOR,
+            LayoutMode::ExplicitLinear => vk::ImageAspectFlags::MEMORY_PLANE_0_EXT,
+        };
+        let layout = unsafe {
+            ctx.device.get_image_subresource_layout(
+                image,
+                vk::ImageSubresource {
+                    aspect_mask,
+                    mip_level: 0,
+                    array_layer: 0,
+                },
+            )
+        };
+        let plan = match mode {
+            LayoutMode::DriverLinear => plan_driver_window(
+                layout,
+                requirements.memory_requirements,
+                backing,
+                guest_layout,
+                parent_memory_type,
+                dedicated.requires_dedicated_allocation != 0,
+                require_allocation_fit,
+            ),
+            LayoutMode::ExplicitLinear => plan_explicit_window(
+                layout,
+                requirements.memory_requirements,
+                backing,
+                guest_layout,
+                parent_memory_type,
+                dedicated.requires_dedicated_allocation != 0,
+                require_allocation_fit,
+            ),
+        }?;
+        for (mip_level, guest) in allocation_layout.mips.iter().copied().enumerate() {
+            let mip_level =
+                u32::try_from(mip_level).map_err(|_| WindowRefusal::BindingRangeOverflow)?;
+            let host = unsafe {
+                ctx.device.get_image_subresource_layout(
+                    image,
+                    vk::ImageSubresource {
+                        aspect_mask,
+                        mip_level,
+                        array_layer: 0,
+                    },
+                )
+            };
+            validate_mip_subresource(mip_level, host, guest, plan.bind_offset)?;
+        }
+        Ok((image, plan))
+    })();
+    if result.is_err() {
+        unsafe { ctx.device.destroy_image(image, None) };
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn create_with_layout(
+    ctx: &DeviceContext,
+    allocation: host_ram::ImportedHostRam,
+    backing: GuestTargetBacking,
+    allocation_layout: &reims_vgpu_memory::GuestImageAllocationLayout,
+    format: vk::Format,
+    usage: vk::ImageUsageFlags,
+    mode: LayoutMode,
+) -> Result<ImportedImage, WindowRefusal> {
+    let (image, plan) = unsafe {
+        plan_image_with_layout(
+            ctx,
+            backing,
+            allocation_layout,
+            format,
+            usage,
+            mode,
+            Some(allocation.memory_type_index),
+            true,
+        )
+    }?;
+    match unsafe {
+        ctx.device
+            .bind_image_memory(image, allocation.memory, plan.bind_offset)
+    } {
+        Ok(()) => Ok(ImportedImage { image }),
+        Err(result) => {
+            unsafe { ctx.device.destroy_image(image, None) };
+            Err(WindowRefusal::BindImage(result))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mutable_image_format_list_contains_exactly_the_compatible_view_family() {
+        assert_eq!(
+            mutable_view_formats(vk::Format::B8G8R8A8_UNORM),
+            vec![vk::Format::B8G8R8A8_UNORM, vk::Format::B8G8R8A8_SRGB]
+        );
+        assert_eq!(
+            mutable_view_formats(vk::Format::R8G8B8A8_SRGB),
+            vec![vk::Format::R8G8B8A8_UNORM, vk::Format::R8G8B8A8_SRGB]
+        );
+        assert_eq!(
+            mutable_view_formats(vk::Format::R16G16B16A16_SFLOAT),
+            vec![vk::Format::R16G16B16A16_SFLOAT]
+        );
+    }
+
+    fn backing() -> GuestTargetBacking {
+        GuestTargetBacking {
+            allocation_host_ptr: 0x1000,
+            allocation_len: 0x4000,
+            resource_offset: 0x1000,
+            resource_len: 0x3000,
+            plane_offset: 0x1000,
+            row_pitch: 256,
+        }
+    }
+
+    #[test]
+    fn explicit_decline_dedupes_equal_layout_contracts_across_allocations() {
+        let first = backing();
+        let second = GuestTargetBacking {
+            allocation_host_ptr: 0x9000,
+            allocation_len: 0x8000,
+            ..first
+        };
+        let layout = reims_vgpu_memory::GuestImageAllocationLayout::single(
+            first.plane_offset,
+            first.row_pitch,
+            d2(),
+        );
+        let key = |backing| {
+            explicit_linear_decline_key(
+                &WindowRefusal::RowPitchMismatch {
+                    guest: 256,
+                    host: 512,
+                },
+                backing,
+                &layout,
+                vk::Format::R8_UNORM,
+                vk::ImageType::TYPE_2D,
+                vk::ImageUsageFlags::SAMPLED,
+            )
+        };
+        assert_eq!(key(first), key(second));
+
+        let different_pitch = GuestTargetBacking {
+            row_pitch: 512,
+            ..first
+        };
+        assert_ne!(key(first), key(different_pitch));
+    }
+
+    fn requirements() -> vk::MemoryRequirements {
+        vk::MemoryRequirements {
+            size: 0x2000,
+            alignment: 0x1000,
+            memory_type_bits: 0b10,
+        }
+    }
+
+    fn d2() -> GuestImageLayout {
+        GuestImageLayout::D2 {
+            width: 16,
+            height: 16,
+        }
+    }
+
+    #[test]
+    fn exact_driver_layout_derives_the_parent_binding_offset() {
+        assert_eq!(
+            plan_driver_window(
+                vk::SubresourceLayout {
+                    offset: 0,
+                    row_pitch: 256,
+                    ..Default::default()
+                },
+                requirements(),
+                backing(),
+                d2(),
+                Some(1),
+                false,
+                true,
+            ),
+            Ok(WindowPlan {
+                bind_offset: 0x1000,
+                required_allocation_len: 0x3000,
+            })
+        );
+    }
+
+    #[test]
+    fn every_binding_term_can_refuse() {
+        let mut b = backing();
+        let req = requirements();
+        assert_eq!(
+            plan_driver_window(
+                vk::SubresourceLayout {
+                    offset: 0x2000,
+                    row_pitch: 256,
+                    ..Default::default()
+                },
+                req,
+                b,
+                d2(),
+                Some(1),
+                false,
+                true,
+            ),
+            Err(WindowRefusal::SubresourceAfterPlane)
+        );
+        b.plane_offset = 0x800;
+        assert_eq!(
+            plan_driver_window(
+                vk::SubresourceLayout {
+                    row_pitch: 256,
+                    ..Default::default()
+                },
+                req,
+                b,
+                d2(),
+                Some(1),
+                false,
+                true,
+            ),
+            Err(WindowRefusal::BindOffsetMisaligned)
+        );
+        b = backing();
+        assert_eq!(
+            plan_driver_window(
+                vk::SubresourceLayout {
+                    row_pitch: 512,
+                    ..Default::default()
+                },
+                req,
+                b,
+                d2(),
+                Some(1),
+                false,
+                true,
+            ),
+            Err(WindowRefusal::RowPitchMismatch {
+                guest: 256,
+                host: 512,
+            })
+        );
+        b.allocation_len = 0x2000;
+        assert_eq!(
+            plan_driver_window(
+                vk::SubresourceLayout {
+                    row_pitch: 256,
+                    ..Default::default()
+                },
+                req,
+                b,
+                d2(),
+                Some(1),
+                false,
+                true,
+            ),
+            Err(WindowRefusal::AllocationTooShort {
+                required_end: 0x3000,
+                allocation_len: 0x2000,
+            })
+        );
+        b = backing();
+        assert_eq!(
+            plan_driver_window(
+                vk::SubresourceLayout {
+                    row_pitch: 256,
+                    ..Default::default()
+                },
+                req,
+                b,
+                d2(),
+                Some(2),
+                false,
+                true,
+            ),
+            Err(WindowRefusal::NoMemoryType)
+        );
+        assert_eq!(
+            plan_driver_window(
+                vk::SubresourceLayout {
+                    row_pitch: 256,
+                    ..Default::default()
+                },
+                req,
+                b,
+                d2(),
+                Some(1),
+                true,
+                true,
+            ),
+            Err(WindowRefusal::DedicatedBindingRequired)
+        );
+    }
+
+    #[test]
+    fn planning_reports_the_required_tail_without_claiming_guest_bytes() {
+        let mut b = backing();
+        b.allocation_len = 0x2000;
+        assert_eq!(
+            plan_driver_window(
+                vk::SubresourceLayout {
+                    row_pitch: 256,
+                    ..Default::default()
+                },
+                requirements(),
+                b,
+                d2(),
+                None,
+                false,
+                false,
+            ),
+            Ok(WindowPlan {
+                bind_offset: 0x1000,
+                required_allocation_len: 0x3000,
+            })
+        );
+        assert_eq!(
+            b.allocation_len, 0x2000,
+            "the guest allocation is unchanged"
+        );
+    }
+
+    #[test]
+    fn explicit_layout_binds_the_parent_at_zero() {
+        assert_eq!(
+            plan_explicit_window(
+                vk::SubresourceLayout {
+                    offset: 0x1000,
+                    row_pitch: 256,
+                    ..Default::default()
+                },
+                requirements(),
+                backing(),
+                d2(),
+                Some(1),
+                false,
+                true,
+            ),
+            Ok(WindowPlan {
+                bind_offset: 0,
+                required_allocation_len: 0x2000,
+            })
+        );
+    }
+
+    #[test]
+    fn array_and_volume_pitch_are_independent_binding_terms() {
+        let array = GuestImageLayout::D1Array {
+            width: 16,
+            layers: 3,
+            array_pitch: 256,
+        };
+        assert_eq!(
+            plan_driver_window(
+                vk::SubresourceLayout {
+                    row_pitch: 256,
+                    array_pitch: 512,
+                    ..Default::default()
+                },
+                requirements(),
+                backing(),
+                array,
+                Some(1),
+                false,
+                true,
+            ),
+            Err(WindowRefusal::ArrayPitchMismatch)
+        );
+
+        let volume = GuestImageLayout::D3 {
+            width: 16,
+            height: 2,
+            depth: 3,
+            depth_pitch: 512,
+        };
+        assert_eq!(
+            plan_driver_window(
+                vk::SubresourceLayout {
+                    row_pitch: 256,
+                    depth_pitch: 768,
+                    ..Default::default()
+                },
+                requirements(),
+                backing(),
+                volume,
+                Some(1),
+                false,
+                true,
+            ),
+            Err(WindowRefusal::DepthPitchMismatch)
+        );
+    }
+
+    #[test]
+    fn image_geometry_preserves_one_and_three_dimensional_types() {
+        let d1 = image_geometry(GuestImageLayout::D1 { width: 17 });
+        assert_eq!(d1.image_type, vk::ImageType::TYPE_1D);
+        assert_eq!(
+            d1.extent,
+            vk::Extent3D::default().width(17).height(1).depth(1)
+        );
+        assert_eq!(d1.array_layers, 1);
+
+        let d3 = image_geometry(GuestImageLayout::D3 {
+            width: 7,
+            height: 5,
+            depth: 3,
+            depth_pitch: 256,
+        });
+        assert_eq!(d3.image_type, vk::ImageType::TYPE_3D);
+        assert_eq!(
+            d3.extent,
+            vk::Extent3D::default().width(7).height(5).depth(3)
+        );
+        assert_eq!(d3.array_layers, 1);
+    }
+
+    #[test]
+    fn every_mip_offset_is_checked_in_the_parent_allocation_namespace() {
+        let guest = reims_vgpu_memory::GuestImageMipLayout {
+            offset: 0x1240,
+            row_pitch: 64,
+            layout: GuestImageLayout::D1 { width: 16 },
+        };
+        let host = vk::SubresourceLayout {
+            offset: 0x240,
+            row_pitch: 64,
+            ..Default::default()
+        };
+        assert_eq!(validate_mip_subresource(1, host, guest, 0x1000), Ok(()));
+        assert_eq!(
+            validate_mip_subresource(
+                1,
+                host,
+                reims_vgpu_memory::GuestImageMipLayout {
+                    offset: 0x1280,
+                    ..guest
+                },
+                0x1000,
+            ),
+            Err(WindowRefusal::MipOffsetMismatch {
+                mip_level: 1,
+                guest_offset: 0x1280,
+                host_offset: 0x1240,
+            })
+        );
+    }
+}

@@ -4,6 +4,66 @@ use crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE;
 use crate::runtime::gva_mem::write_task_gva_arm64e;
 use crate::runtime::host::FakeHost;
 
+fn sampled_d2_shape() -> reims_vgpu_core::SampledImageShape {
+    reims_vgpu_core::sampled_image_shape(reims_vgpu_core::SampledImageKind::D2).unwrap()
+}
+
+#[test]
+fn a_retained_direct_image_refusal_selects_the_copying_rail() {
+    use reims_vgpu_memory::{
+        GuestImageBindingDisposition as Disposition, GuestImageBindingRequirement as Requirement,
+    };
+
+    assert_eq!(
+        sampled_source::direct_binding_requirement(Some(Disposition::Direct(Requirement {
+            allocation_len: 0x4000,
+        }))),
+        Some(Requirement {
+            allocation_len: 0x4000,
+        })
+    );
+    assert_eq!(
+        sampled_source::direct_binding_requirement(Some(Disposition::Refused)),
+        None
+    );
+    assert_eq!(sampled_source::direct_binding_requirement(None), None);
+}
+
+/// Complete the allocation-level half of a synthetic linear texture record.
+///
+/// The declaration describes a view-compatible texture shape; these fields
+/// independently describe how the complete mip chain is packed in its backing.
+/// Keeping both halves in one fixture helper prevents a test from constructing
+/// a record that the producer never emits.
+fn write_linear_texture_packing(
+    desc: &mut [u8],
+    levels: u16,
+    slices: u16,
+    base_offset: u64,
+    bytes_per_slice: u64,
+) {
+    use crate::runtime::decode::resource::{
+        TEXTURE_DESC_BASE_OFFSET, TEXTURE_DESC_BYTES_PER_SLICE, TEXTURE_DESC_DECLARATION,
+        TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_MIP_LEVEL_RECORD_LEN,
+        TEXTURE_DESC_SLICE_COUNT,
+    };
+    use reims_vgpu_core::endian::{st16, st64};
+
+    st16(&mut desc[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], levels);
+    st16(&mut desc[TEXTURE_DESC_SLICE_COUNT..], slices);
+    st64(&mut desc[TEXTURE_DESC_BASE_OFFSET..], base_offset);
+    st64(&mut desc[TEXTURE_DESC_BYTES_PER_SLICE..], bytes_per_slice);
+
+    let declaration = TEXTURE_DESC_DECLARATION
+        + usize::from(levels.saturating_sub(1)) * TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+    let array_length = declaration
+        + core::mem::offset_of!(
+            reims_vgpu_wire::ops::texture::TextureDescriptorBody,
+            array_length
+        );
+    st16(&mut desc[array_length..], slices);
+}
+
 fn mapping_target_storage(mapping_id: u32) -> ColorTargetStorage {
     ColorTargetStorage::Mapping(mapping_id)
 }
@@ -220,10 +280,10 @@ fn iosurface_texture_zero_copy_declines_transient_host_mappings() {
     }
     assert!(state.set_mapping_geom(mid, width, height, MTL_FORMAT_BGRA8_UNORM));
 
-    assert!(
-        try_iosurface_texture_sample_zero_copy(&mut state, &mut host, mid, width, height,)
-            .is_none()
-    );
+    assert!(try_iosurface_texture_sample_zero_copy(
+        &mut state, &mut host, mid, width, height, true
+    )
+    .is_none());
     assert_eq!(
         host.map_pages_calls, 0,
         "transient hosts must decline before creating an importable view"
@@ -271,13 +331,11 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
     let iosurface_texture_witnesses = crate::runtime::drain::store_route_count("gw_rail_iosurface");
     let iosurface_plane_view_witnesses = crate::runtime::drain::store_route_count("gw_rail_t5");
     let iosurface_texture =
-        try_iosurface_texture_sample_zero_copy(&mut state, &mut host, mid, 128, 128)
+        try_iosurface_texture_sample_zero_copy(&mut state, &mut host, mid, 128, 128, true)
             .expect("the mapping's color plane is sampleable");
-    let SampledSourceRequest::GuestRuns(
+    let SampledSourceRequest::GuestImage(
         iosurface_texture,
-        _,
         iosurface_texture_format,
-        _,
         iosurface_texture_identity,
         ..,
     ) = iosurface_texture
@@ -294,14 +352,13 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
         iosurface_texture_witnesses + 1,
         "the imported source and its copied fallback share one witness"
     );
-    let iosurface_texture_import = std::sync::Arc::clone(
-        iosurface_texture
-            .pages
-            .as_ref()
-            .expect("stable allocation is GPU-addressable")[0]
-            .guest
-            .import(),
-    );
+    let iosurface_texture_import = iosurface_texture
+        .direct
+        .as_ref()
+        .expect("mapping image has direct memory")
+        .import
+        .clone();
+    assert!(iosurface_texture.transfer.pages.is_some());
 
     let iosurface_plane_view = try_iosurface_plane_view_sample_zero_copy(
         &mut state,
@@ -314,13 +371,12 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
             depth: 1,
             plane_index: 0,
         },
+        true,
     )
     .expect("the serialized plane view is sampleable");
-    let SampledSourceRequest::GuestRuns(
+    let SampledSourceRequest::GuestImage(
         iosurface_plane_view,
-        _,
         iosurface_plane_view_format,
-        _,
         iosurface_plane_view_identity,
         ..,
     ) = iosurface_plane_view
@@ -337,14 +393,13 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
         iosurface_plane_view_witnesses + 1,
         "the imported plane and its copied fallback share one witness"
     );
-    let iosurface_plane_view_import = std::sync::Arc::clone(
-        iosurface_plane_view
-            .pages
-            .as_ref()
-            .expect("stable allocation is GPU-addressable")[0]
-            .guest
-            .import(),
-    );
+    let iosurface_plane_view_import = iosurface_plane_view
+        .direct
+        .as_ref()
+        .expect("plane view has direct memory")
+        .import
+        .clone();
+    assert!(iosurface_plane_view.transfer.pages.is_some());
     crate::runtime::guest_ram::forget_import_limits();
 
     assert_eq!(
@@ -394,16 +449,32 @@ fn small_mapping_sampled_plane_uses_its_imported_copy_source() {
         vec![((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT | PAGE_ENTRY_VALID];
     assert!(state.set_mapping_geom(mid, width, height, MTL_FORMAT_BGRA8_UNORM));
     crate::runtime::guest_ram::latch_import_limits(page, 1 << 30, 1 << 30);
-    let sampled = try_iosurface_texture_sample_zero_copy(&mut state, &mut host, mid, width, height)
-        .expect("a directly-backed sampled resource has no size crossover");
-    let SampledSourceRequest::GuestRuns(source, ..) = sampled else {
+    let sampled =
+        try_iosurface_texture_sample_zero_copy(&mut state, &mut host, mid, width, height, true)
+            .expect("a directly-backed sampled resource has no size crossover");
+    let SampledSourceRequest::GuestImage(source, ..) = sampled else {
         panic!("the mapping stays guest-backed")
     };
     crate::runtime::guest_ram::forget_import_limits();
 
     assert!(
-        source.pages.is_some(),
-        "an imported copy is not CPU-gathered"
+        source.transfer.pages.is_some(),
+        "the transfer fallback remains GPU-addressable"
+    );
+    assert_eq!(
+        source.direct.as_ref().expect("direct source").import.id(),
+        source.transfer.pages.as_ref().unwrap()[0]
+            .guest
+            .import()
+            .id()
+    );
+
+    let sampled =
+        try_iosurface_texture_sample_zero_copy(&mut state, &mut host, mid, width, height, false)
+            .expect("the same mapped bytes retain their transfer representation");
+    assert!(
+        matches!(sampled, SampledSourceRequest::GuestRuns(..)),
+        "a non-2D descriptor must not be offered as a 2D direct image"
     );
 }
 
@@ -421,6 +492,551 @@ fn linear_volume_gather_carries_every_depth_plane() {
     let (span, row_length) = strided_level_extent(&layout, 4).unwrap();
     assert_eq!(span, row_stride * u64::from(height) * u64::from(depth));
     assert_eq!(row_length, 0);
+}
+
+#[test]
+fn reflected_array_shape_uses_the_declared_array_length_and_level_pitch() {
+    let level = crate::runtime::decode::resource::TextureLevelLayout {
+        offset: 0,
+        size: 0x1_0000,
+        row_stride: 0x1_0000,
+        width: 0x4000,
+        height: 1,
+        depth: 1,
+    };
+    let texture = TextureDescriptor {
+        allocation_size: level.size * 3,
+        declaration: Some(reims_vgpu_protocol::TextureDeclaration {
+            texture_type: crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_1D_ARRAY as u8,
+            unidentified_flags: 0,
+            allow_gpu_optimized_contents: false,
+            usage: 0,
+            pixel_format: reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+            width: level.width,
+            height: level.height,
+            depth: level.depth,
+            mipmap_level_count: 1,
+            sample_count: 1,
+            array_length: 3,
+            resource_options: 0,
+            unidentified_u64: 0,
+            swizzle: None,
+        }),
+        bytes_per_slice: level.size,
+        slice_count: 3,
+        levels: vec![level],
+        ..Default::default()
+    };
+    let shape =
+        reims_vgpu_core::sampled_image_shape(reims_vgpu_core::SampledImageKind::D1Array).unwrap();
+    let image = declared_guest_image_layout(shape, &texture, &level, None).unwrap();
+    assert_eq!(
+        image,
+        reims_vgpu_memory::GuestImageLayout::D1Array {
+            width: level.width,
+            layers: 3,
+            array_pitch: texture.bytes_per_slice,
+        }
+    );
+    assert_eq!(
+        image.visible_span(level.row_stride, 4),
+        Some(level.size * 3)
+    );
+}
+
+#[test]
+fn array_view_selection_moves_geometry_and_backing_offset_together() {
+    use crate::runtime::decode::resource::{
+        TEXTURE_VIEW_MTL_TYPE_2D, TEXTURE_VIEW_MTL_TYPE_2D_ARRAY,
+    };
+
+    let level = crate::runtime::decode::resource::TextureLevelLayout {
+        offset: 0,
+        size: 0x4000,
+        row_stride: 0x100,
+        width: 64,
+        height: 64,
+        depth: 1,
+    };
+    let texture = TextureDescriptor {
+        allocation_size: 0x4000 * 4,
+        declaration: Some(reims_vgpu_protocol::TextureDeclaration {
+            texture_type: TEXTURE_VIEW_MTL_TYPE_2D_ARRAY as u8,
+            unidentified_flags: 0,
+            allow_gpu_optimized_contents: false,
+            usage: 0,
+            pixel_format: reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+            width: level.width,
+            height: level.height,
+            depth: 1,
+            mipmap_level_count: 1,
+            sample_count: 1,
+            array_length: 4,
+            resource_options: 0,
+            unidentified_u64: 0,
+            swizzle: None,
+        }),
+        bytes_per_slice: 0x4000,
+        slice_count: 4,
+        levels: vec![level],
+        ..Default::default()
+    };
+    let array_shape =
+        reims_vgpu_core::sampled_image_shape(reims_vgpu_core::SampledImageKind::D2Array).unwrap();
+    let range = TextureViewRange {
+        level_base: 0,
+        level_count: 1,
+        slice_base: 1,
+        slice_count: 2,
+    };
+    assert_eq!(
+        declared_guest_image_selection(
+            array_shape,
+            &texture,
+            &level,
+            Some(TEXTURE_VIEW_MTL_TYPE_2D_ARRAY),
+            Some(range),
+        ),
+        Some((
+            reims_vgpu_memory::GuestImageLayout::D2Array {
+                width: 64,
+                height: 64,
+                layers: 2,
+                array_pitch: 0x4000,
+            },
+            0x4000,
+        ))
+    );
+
+    let d2_shape =
+        reims_vgpu_core::sampled_image_shape(reims_vgpu_core::SampledImageKind::D2).unwrap();
+    assert_eq!(
+        declared_guest_image_selection(
+            d2_shape,
+            &texture,
+            &level,
+            Some(TEXTURE_VIEW_MTL_TYPE_2D),
+            Some(TextureViewRange {
+                slice_base: 2,
+                slice_count: 1,
+                ..range
+            }),
+        ),
+        Some((
+            reims_vgpu_memory::GuestImageLayout::D2 {
+                width: 64,
+                height: 64,
+            },
+            0x8000,
+        ))
+    );
+
+    assert!(declared_guest_image_selection(
+        array_shape,
+        &texture,
+        &level,
+        Some(TEXTURE_VIEW_MTL_TYPE_2D_ARRAY),
+        Some(TextureViewRange {
+            slice_base: 3,
+            slice_count: 2,
+            ..range
+        }),
+    )
+    .is_none());
+}
+
+#[test]
+fn one_and_three_dimensional_views_keep_native_zero_copy_geometry() {
+    let declaration = |texture_type: u8, width: u32, height: u32, depth: u32| {
+        reims_vgpu_protocol::TextureDeclaration {
+            texture_type,
+            unidentified_flags: 0,
+            allow_gpu_optimized_contents: false,
+            usage: 0,
+            pixel_format: reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+            width,
+            height,
+            depth,
+            mipmap_level_count: 1,
+            sample_count: 1,
+            array_length: 1,
+            resource_options: 0,
+            unidentified_u64: 0,
+            swizzle: None,
+        }
+    };
+
+    let d1_level = crate::runtime::decode::resource::TextureLevelLayout {
+        size: 64,
+        row_stride: 64,
+        width: 16,
+        height: 1,
+        depth: 1,
+        ..Default::default()
+    };
+    let d1 = TextureDescriptor {
+        allocation_size: d1_level.size,
+        declaration: Some(declaration(
+            crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_1D as u8,
+            16,
+            1,
+            1,
+        )),
+        bytes_per_slice: 0,
+        slice_count: 1,
+        levels: vec![d1_level],
+        ..Default::default()
+    };
+    let d1_shape =
+        reims_vgpu_core::sampled_image_shape(reims_vgpu_core::SampledImageKind::D1).unwrap();
+    assert_eq!(
+        declared_guest_image_layout(
+            d1_shape,
+            &d1,
+            &d1_level,
+            Some(crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_1D),
+        ),
+        Some(reims_vgpu_memory::GuestImageLayout::D1 { width: 16 })
+    );
+    let mut d1_mipped = d1.clone();
+    d1_mipped.mipmap_level_count = 2;
+    assert!(
+        declared_guest_image_allocation(
+            d1_shape,
+            &d1_mipped,
+            Some(crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_1D),
+            None,
+            4,
+        )
+        .is_none(),
+        "an incomplete mip declaration must not become an image"
+    );
+
+    let d3_level = crate::runtime::decode::resource::TextureLevelLayout {
+        size: 384,
+        row_stride: 32,
+        width: 8,
+        height: 4,
+        depth: 3,
+        ..Default::default()
+    };
+    let d3 = TextureDescriptor {
+        allocation_size: d3_level.size,
+        declaration: Some(declaration(
+            crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_3D as u8,
+            8,
+            4,
+            3,
+        )),
+        bytes_per_slice: 0,
+        slice_count: 1,
+        levels: vec![d3_level],
+        ..Default::default()
+    };
+    let d3_shape =
+        reims_vgpu_core::sampled_image_shape(reims_vgpu_core::SampledImageKind::D3).unwrap();
+    assert_eq!(
+        declared_guest_image_layout(
+            d3_shape,
+            &d3,
+            &d3_level,
+            Some(crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_3D),
+        ),
+        Some(reims_vgpu_memory::GuestImageLayout::D3 {
+            width: 8,
+            height: 4,
+            depth: 3,
+            depth_pitch: 128,
+        })
+    );
+
+    assert_eq!(
+        declared_guest_image_layout(
+            d3_shape,
+            &d3,
+            &d3_level,
+            Some(crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_2D),
+        ),
+        None,
+        "cross-type views need an explicit reinterpretation contract"
+    );
+}
+
+#[test]
+fn one_and_three_dimensional_mip_chains_preserve_every_declared_offset() {
+    use crate::runtime::decode::resource::{TEXTURE_VIEW_MTL_TYPE_1D, TEXTURE_VIEW_MTL_TYPE_3D};
+
+    let declaration = |texture_type: u8, width, height, depth, mipmap_level_count| {
+        reims_vgpu_protocol::TextureDeclaration {
+            texture_type,
+            unidentified_flags: 0,
+            allow_gpu_optimized_contents: false,
+            usage: 0,
+            pixel_format: reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+            width,
+            height,
+            depth,
+            mipmap_level_count,
+            sample_count: 1,
+            array_length: 1,
+            resource_options: 0,
+            unidentified_u64: 0,
+            swizzle: None,
+        }
+    };
+    let d1_levels = vec![
+        crate::runtime::decode::resource::TextureLevelLayout {
+            offset: 0,
+            size: 64,
+            row_stride: 64,
+            width: 16,
+            height: 1,
+            depth: 1,
+        },
+        crate::runtime::decode::resource::TextureLevelLayout {
+            offset: 64,
+            size: 32,
+            row_stride: 32,
+            width: 8,
+            height: 1,
+            depth: 1,
+        },
+    ];
+    let d1 = TextureDescriptor {
+        allocation_size: 0x160,
+        mipmap_level_count: 2,
+        base_offset: 0x100,
+        bytes_per_slice: 0,
+        slice_count: 1,
+        declaration: Some(declaration(TEXTURE_VIEW_MTL_TYPE_1D as u8, 16, 1, 1, 2)),
+        levels: d1_levels,
+        ..Default::default()
+    };
+    let d1_shape =
+        reims_vgpu_core::sampled_image_shape(reims_vgpu_core::SampledImageKind::D1).unwrap();
+    let (allocation, view) =
+        declared_guest_image_allocation(d1_shape, &d1, Some(TEXTURE_VIEW_MTL_TYPE_1D), None, 4)
+            .expect("the complete 1D chain is representable");
+    assert_eq!(view.mip_level_count, 2);
+    assert_eq!(
+        allocation
+            .mips
+            .iter()
+            .map(|mip| (mip.offset, mip.layout.width()))
+            .collect::<Vec<_>>(),
+        [(0x100, 16), (0x140, 8)]
+    );
+
+    let d3_levels = vec![
+        crate::runtime::decode::resource::TextureLevelLayout {
+            offset: 0,
+            size: 512,
+            row_stride: 32,
+            width: 8,
+            height: 4,
+            depth: 4,
+        },
+        crate::runtime::decode::resource::TextureLevelLayout {
+            offset: 512,
+            size: 64,
+            row_stride: 16,
+            width: 4,
+            height: 2,
+            depth: 2,
+        },
+    ];
+    let d3 = TextureDescriptor {
+        allocation_size: 576,
+        mipmap_level_count: 2,
+        bytes_per_slice: 0,
+        slice_count: 1,
+        declaration: Some(declaration(TEXTURE_VIEW_MTL_TYPE_3D as u8, 8, 4, 4, 2)),
+        levels: d3_levels,
+        ..Default::default()
+    };
+    let d3_shape =
+        reims_vgpu_core::sampled_image_shape(reims_vgpu_core::SampledImageKind::D3).unwrap();
+    let (allocation, _) =
+        declared_guest_image_allocation(d3_shape, &d3, Some(TEXTURE_VIEW_MTL_TYPE_3D), None, 4)
+            .expect("the complete 3D chain is representable");
+    assert_eq!(
+        allocation.mips[1].layout,
+        reims_vgpu_memory::GuestImageLayout::D3 {
+            width: 4,
+            height: 2,
+            depth: 2,
+            depth_pitch: 32,
+        }
+    );
+}
+
+#[test]
+fn multi_mip_requests_are_not_representable_by_the_single_level_fallback() {
+    let texture = TextureDescriptor {
+        mipmap_level_count: 4,
+        ..Default::default()
+    };
+    assert_eq!(
+        requested_linear_mip_range(&texture, LinearSampleSelection::default()),
+        (0, 4)
+    );
+    assert_eq!(
+        requested_linear_mip_range(
+            &texture,
+            LinearSampleSelection {
+                level: 2,
+                range: Some(TextureViewRange {
+                    level_base: 2,
+                    level_count: 1,
+                    slice_base: 0,
+                    slice_count: 1,
+                }),
+                ..Default::default()
+            }
+        ),
+        (2, 1),
+        "a one-level view may still use the level-local fallback"
+    );
+}
+
+#[test]
+fn a_three_dimensional_view_reaches_the_direct_guest_image_rail() {
+    use crate::runtime::decode::resource::{
+        list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE,
+        OBJECT_TYPE_TEXTURE_VIEW, TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_DECLARATION,
+        TEXTURE_DESC_DEPTH, TEXTURE_DESC_HEIGHT, TEXTURE_DESC_PIXEL_FORMAT,
+        TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH,
+        TEXTURE_VIEW_DESC_BASE_REF, TEXTURE_VIEW_DESC_LEN, TEXTURE_VIEW_DESC_LEVEL_BASE,
+        TEXTURE_VIEW_DESC_LEVEL_COUNT, TEXTURE_VIEW_DESC_OPCODE, TEXTURE_VIEW_DESC_PIXEL_FORMAT,
+        TEXTURE_VIEW_DESC_SLICE_BASE, TEXTURE_VIEW_DESC_SLICE_COUNT, TEXTURE_VIEW_DESC_TEXTURE_REF,
+        TEXTURE_VIEW_DESC_TEXTURE_TYPE, TEXTURE_VIEW_MIN_RANGED, TEXTURE_VIEW_MTL_TYPE_3D,
+        TEXTURE_VIEW_OPCODE_RANGED,
+    };
+    use reims_vgpu_core::endian::{st16, st32, st64};
+
+    crate::runtime::guest_ram_map::reset();
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    host.stable_map_pages = true;
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 16);
+    assert!(state.set_object_list(1, 0, 32));
+    crate::runtime::guest_ram::latch_import_limits(1 << PAGE_SHIFT_ARM64E, 1 << 30, 1 << 30);
+
+    let (base_ref, view_ref, handle) = (5u32, 8u32, 4u32);
+    let (width, height, depth, row_stride) = (8u32, 4u32, 3u32, 32u32);
+    let allocation_size = 1u64 << PAGE_SHIFT_ARM64E;
+    let mut base = vec![0u8; TEXTURE_DESC_BASE_LEN];
+    st64(&mut base[0..], allocation_size);
+    st32(&mut base[8..], handle);
+    write_linear_texture_packing(
+        &mut base,
+        1,
+        1,
+        0,
+        u64::from(row_stride) * u64::from(height) * u64::from(depth),
+    );
+    st32(
+        &mut base[TEXTURE_DESC_USED_SIZE..],
+        row_stride * height * depth,
+    );
+    st32(&mut base[TEXTURE_DESC_ROW_STRIDE..], row_stride);
+    st32(&mut base[TEXTURE_DESC_WIDTH..], width);
+    st32(&mut base[TEXTURE_DESC_HEIGHT..], height);
+    st32(&mut base[TEXTURE_DESC_DEPTH..], depth);
+    base[TEXTURE_DESC_DECLARATION] = TEXTURE_VIEW_MTL_TYPE_3D as u8;
+    st16(
+        &mut base[TEXTURE_DESC_PIXEL_FORMAT..],
+        reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+    );
+    let base_gva = 0x800;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], base_gva, &base);
+    let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(
+        &mut entry[0..],
+        (OBJECT_TYPE_TEXTURE as u32) | ((base.len() as u32) << 8),
+    );
+    entry[4..12].copy_from_slice(&base_gva.to_le_bytes());
+    write_task_gva_arm64e(
+        &mut host,
+        &state.tasks[1],
+        list_object_entry_offset(base_ref, 32).unwrap(),
+        &entry,
+    );
+
+    let mut view = vec![0u8; TEXTURE_VIEW_MIN_RANGED];
+    let view_len = view.len() as u32;
+    st32(
+        &mut view[TEXTURE_VIEW_DESC_OPCODE..],
+        TEXTURE_VIEW_OPCODE_RANGED,
+    );
+    st32(&mut view[TEXTURE_VIEW_DESC_LEN..], view_len);
+    st32(&mut view[TEXTURE_VIEW_DESC_TEXTURE_REF..], view_ref);
+    st32(&mut view[TEXTURE_VIEW_DESC_BASE_REF..], base_ref);
+    st16(
+        &mut view[TEXTURE_VIEW_DESC_PIXEL_FORMAT..],
+        reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+    );
+    st16(
+        &mut view[TEXTURE_VIEW_DESC_TEXTURE_TYPE..],
+        TEXTURE_VIEW_MTL_TYPE_3D,
+    );
+    st64(&mut view[TEXTURE_VIEW_DESC_LEVEL_BASE..], 0);
+    st64(&mut view[TEXTURE_VIEW_DESC_LEVEL_COUNT..], 1);
+    st64(&mut view[TEXTURE_VIEW_DESC_SLICE_BASE..], 0);
+    st64(&mut view[TEXTURE_VIEW_DESC_SLICE_COUNT..], 1);
+    let view_gva = 0x400;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], view_gva, &view);
+    let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(
+        &mut entry[0..],
+        (OBJECT_TYPE_TEXTURE_VIEW as u32) | ((view.len() as u32) << 8),
+    );
+    entry[4..12].copy_from_slice(&view_gva.to_le_bytes());
+    write_task_gva_arm64e(
+        &mut host,
+        &state.tasks[1],
+        list_object_entry_offset(view_ref, 32).unwrap(),
+        &entry,
+    );
+
+    let shape =
+        reims_vgpu_core::sampled_image_shape(reims_vgpu_core::SampledImageKind::D3).unwrap();
+    let (_, _, _, source) =
+        resolve_sampled_source(&mut state, &mut host, 1, view_ref, None, true, shape)
+            .expect("the exact D3 view resolves");
+    let SampledSourceRequest::GuestImage(source, ..) = source else {
+        panic!("a D3 view over an importable allocation must remain an image")
+    };
+    assert_eq!(
+        source
+            .allocation
+            .base()
+            .expect("one decoded base mip")
+            .layout,
+        reims_vgpu_memory::GuestImageLayout::D3 {
+            width,
+            height,
+            depth,
+            depth_pitch: u64::from(row_stride) * u64::from(height),
+        }
+    );
+    assert_eq!(
+        source
+            .direct
+            .as_ref()
+            .expect("direct source")
+            .backing
+            .plane_offset,
+        source
+            .direct
+            .as_ref()
+            .expect("direct source")
+            .backing
+            .resource_offset
+    );
+
+    crate::runtime::guest_ram::forget_import_limits();
+    crate::runtime::guest_ram_map::reset();
 }
 
 #[test]
@@ -554,7 +1170,7 @@ fn frag_unbound_scan_reports_only_missing_standard_kinds() {
     assert_eq!(unbound, vec![buf(2), smp(0)]);
 
     // The class survives the scan as a type, so a consumer that needs the SPIR-V
-    // binding relocation does not have to parse it back out of a formatted
+    // binding planner does not have to parse it back out of a formatted
     // string. `Display` is the only place the prefix exists.
     assert_eq!(tex(3).to_string(), "tex3");
     assert_eq!(buf(2).to_string(), "buf2");
@@ -635,35 +1251,6 @@ fn reflected_static_sampler_maps_exact_state_and_rejects_unimplemented_modes() {
             .unwrap_err()
             .slug(),
         "draw_prepare_static_sampler_lod_bias_unsupported"
-    );
-}
-
-#[test]
-fn reflected_sampled_collision_uses_semantic_kind_and_metal_index() {
-    let mut vertex = shader_pull_reflection(&[64]);
-    vertex.bindings[0].kind = reims_vgpu_core::ShaderResourceKind::Texture;
-    vertex.bindings[0].metal_index = 32;
-    let mut fragment = vertex.clone();
-    fragment.stage = reims_vgpu_core::ReflectedShaderStage::Fragment;
-    assert!(reflected_sampled_binding_collision(&vertex, &fragment));
-
-    fragment.bindings[0].metal_index = 33;
-    assert!(!reflected_sampled_binding_collision(&vertex, &fragment));
-
-    fragment.bindings[0].metal_index = 32;
-    fragment.bindings[0].kind = reims_vgpu_core::ShaderResourceKind::ColorInput;
-    assert!(!reflected_sampled_binding_collision(&vertex, &fragment));
-
-    vertex.bindings[0].kind = reims_vgpu_core::ShaderResourceKind::Sampler;
-    vertex.bindings[0].metal_index = 0;
-    fragment.bindings[0].kind = reims_vgpu_core::ShaderResourceKind::StaticSampler;
-    fragment.bindings[0].metal_index = 0;
-    assert!(reflected_sampled_binding_collision(&vertex, &fragment));
-
-    vertex.bindings[0].kind = reims_vgpu_core::ShaderResourceKind::Texture;
-    assert!(
-        !reflected_sampled_binding_collision(&vertex, &fragment),
-        "texture and sampler indices live in distinct executable bands"
     );
 }
 
@@ -2862,6 +3449,7 @@ fn mrt_draw_request_type2_rgba16f_as_color_rt_despite_stale_iosurface_latch() {
     st32(&mut desc[TEXTURE_DESC_ROW_STRIDE..], bpr);
     st32(&mut desc[TEXTURE_DESC_WIDTH..], w);
     st32(&mut desc[TEXTURE_DESC_HEIGHT..], h);
+    write_linear_texture_packing(&mut desc, 1, 1, 0, alloc);
     st16(
         &mut desc[TEXTURE_DESC_PIXEL_FORMAT..],
         MTL_FORMAT_RGBA16_FLOAT,
@@ -3056,13 +3644,12 @@ fn mrt_draw_request_type8_mip_level_view_of_linear_as_color_rt() {
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE,
         OBJECT_TYPE_TEXTURE_VIEW, TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_LEVEL_RECORDS,
-        TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_MIP_LEVEL_RECORD_LEN,
-        TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_USED_SIZE,
-        TEXTURE_DESC_WIDTH, TEXTURE_LEVEL_HEIGHT, TEXTURE_LEVEL_OFFSET, TEXTURE_LEVEL_ROW_STRIDE,
-        TEXTURE_LEVEL_SIZE, TEXTURE_LEVEL_WIDTH, TEXTURE_VIEW_DESC_BASE_REF, TEXTURE_VIEW_DESC_LEN,
-        TEXTURE_VIEW_DESC_LEVEL_BASE, TEXTURE_VIEW_DESC_LEVEL_COUNT, TEXTURE_VIEW_DESC_OPCODE,
-        TEXTURE_VIEW_DESC_PIXEL_FORMAT, TEXTURE_VIEW_DESC_SLICE_BASE,
-        TEXTURE_VIEW_DESC_SLICE_COUNT, TEXTURE_VIEW_DESC_TEXTURE_REF,
+        TEXTURE_DESC_MIP_LEVEL_RECORD_LEN, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
+        TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH, TEXTURE_LEVEL_HEIGHT, TEXTURE_LEVEL_OFFSET,
+        TEXTURE_LEVEL_ROW_STRIDE, TEXTURE_LEVEL_SIZE, TEXTURE_LEVEL_WIDTH,
+        TEXTURE_VIEW_DESC_BASE_REF, TEXTURE_VIEW_DESC_LEN, TEXTURE_VIEW_DESC_LEVEL_BASE,
+        TEXTURE_VIEW_DESC_LEVEL_COUNT, TEXTURE_VIEW_DESC_OPCODE, TEXTURE_VIEW_DESC_PIXEL_FORMAT,
+        TEXTURE_VIEW_DESC_SLICE_BASE, TEXTURE_VIEW_DESC_SLICE_COUNT, TEXTURE_VIEW_DESC_TEXTURE_REF,
         TEXTURE_VIEW_DESC_TEXTURE_TYPE, TEXTURE_VIEW_MIN_RANGED, TEXTURE_VIEW_MTL_TYPE_2D,
         TEXTURE_VIEW_OPCODE_RANGED,
     };
@@ -3081,7 +3668,7 @@ fn mrt_draw_request_type8_mip_level_view_of_linear_as_color_rt() {
     let mut b = vec![0u8; body];
     st64(&mut b[0..], 0x20000); // allocation_size
     st32(&mut b[8..], 0x20); // handle
-    st16(&mut b[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], 2);
+    write_linear_texture_packing(&mut b, 2, 1, 0, 0x2800);
     st32(&mut b[TEXTURE_DESC_USED_SIZE..], 64 * 32 * 4);
     st32(&mut b[TEXTURE_DESC_ROW_STRIDE..], 256);
     st32(&mut b[TEXTURE_DESC_WIDTH..], 64);
@@ -3439,7 +4026,16 @@ fn gva_layer_host_cache_roundtrip_for_sample() {
     // from a cache entry is what used to happen.
     let mut host = crate::runtime::host::FakeHost::new();
     assert!(
-        resolve_sampled_source(&mut state, &mut host, 0, tex_ref, None, true).is_none(),
+        resolve_sampled_source(
+            &mut state,
+            &mut host,
+            0,
+            tex_ref,
+            None,
+            true,
+            sampled_d2_shape(),
+        )
+        .is_none(),
         "a ref with no object-list entry must resolve to no sampled source"
     );
 }
@@ -3450,8 +4046,8 @@ fn gva_layer_host_cache_roundtrip_for_sample() {
 fn guest_linear_memo_reuses_arc_and_observes_guest_writes() {
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, TEXTURE_DESC_BASE_LEN,
-        TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
-        TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH,
+        TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_USED_SIZE,
+        TEXTURE_DESC_WIDTH,
     };
     use reims_vgpu_core::endian::{st16, st32, st64};
     use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
@@ -3485,7 +4081,7 @@ fn guest_linear_memo_reuses_arc_and_observes_guest_writes() {
     let mut b = vec![0u8; body];
     st64(&mut b[0..], 0x1000); // allocation_size
     st32(&mut b[8..], 1); // handle -> base gva 1 << page_shift
-    st16(&mut b[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], 1);
+    write_linear_texture_packing(&mut b, 1, 1, 0, 16 * 2);
     st32(&mut b[TEXTURE_DESC_USED_SIZE..], 16 * 2);
     st32(&mut b[TEXTURE_DESC_ROW_STRIDE..], 16);
     st32(&mut b[TEXTURE_DESC_WIDTH..], 4);
@@ -3558,8 +4154,8 @@ fn guest_linear_memo_reuses_arc_and_observes_guest_writes() {
 fn padded_bgra8_memoized_uploads_native_without_swizzle() {
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, TEXTURE_DESC_BASE_LEN,
-        TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
-        TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH,
+        TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_USED_SIZE,
+        TEXTURE_DESC_WIDTH,
     };
     use reims_vgpu_core::endian::{st16, st32, st64};
     use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
@@ -3597,7 +4193,7 @@ fn padded_bgra8_memoized_uploads_native_without_swizzle() {
     let mut b = vec![0u8; body];
     st64(&mut b[0..], 0x1000); // allocation_size
     st32(&mut b[8..], 1); // handle -> base gva 1 << page_shift
-    st16(&mut b[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], 1);
+    write_linear_texture_packing(&mut b, 1, 1, 0, u64::from(bpr * h));
     st32(&mut b[TEXTURE_DESC_USED_SIZE..], bpr * h);
     st32(&mut b[TEXTURE_DESC_ROW_STRIDE..], bpr);
     st32(&mut b[TEXTURE_DESC_WIDTH..], w);
@@ -3800,8 +4396,8 @@ fn color_load_seed_uses_provenance_and_preserves_black() {
 fn a_gva_load_from_resident_draw_with_no_resident_puts_the_seed_back() {
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, TEXTURE_DESC_BASE_LEN,
-        TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
-        TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH,
+        TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_USED_SIZE,
+        TEXTURE_DESC_WIDTH,
     };
     use crate::runtime::drain::store_route_count;
     use reims_vgpu_core::endian::{st16, st32, st64};
@@ -3837,7 +4433,7 @@ fn a_gva_load_from_resident_draw_with_no_resident_puts_the_seed_back() {
     let mut b = vec![0u8; body];
     st64(&mut b[0..], 0x1000);
     st32(&mut b[8..], 1); // handle -> base gva 1 << page_shift
-    st16(&mut b[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], 1);
+    write_linear_texture_packing(&mut b, 1, 1, 0, 16 * 2);
     st32(&mut b[TEXTURE_DESC_USED_SIZE..], 16 * 2);
     st32(&mut b[TEXTURE_DESC_ROW_STRIDE..], 16);
     st32(&mut b[TEXTURE_DESC_WIDTH..], 4);
@@ -4106,9 +4702,16 @@ fn iosurface_plane_view_sample_uses_descriptor_surface_id_not_ref_collision() {
         [255u8, 0, 0, 255].repeat(4 * 3),
     );
 
-    let (width, height, sampled_mid, sampled) =
-        resolve_sampled_source(&mut state, &mut host, 1, texture_ref, None, true)
-            .expect("IOSurface plane view descriptor surface must sample");
+    let (width, height, sampled_mid, sampled) = resolve_sampled_source(
+        &mut state,
+        &mut host,
+        1,
+        texture_ref,
+        None,
+        true,
+        sampled_d2_shape(),
+    )
+    .expect("IOSurface plane view descriptor surface must sample");
     assert_eq!((width, height, sampled_mid), (4, 3, surface_id));
     let SampledSourceRequest::Bytes(sampled, _, layout, _) = sampled else {
         panic!("cache-backed fixture unexpectedly resolved a resident target");
@@ -4136,6 +4739,7 @@ fn iosurface_plane_view_sample_uses_descriptor_surface_id_not_ref_collision() {
         texture_ref,
         threaded_resource,
         true,
+        sampled_d2_shape(),
     )
     .expect("threaded-resource sample must resolve");
     assert_eq!(
@@ -4251,8 +4855,9 @@ fn iosurface_texture_host_cache_rung_identity_tracks_the_cached_frame() {
     );
 
     let resolve = |state: &mut Device, host: &mut FakeHost| {
-        let (_, _, _, src) = resolve_sampled_source(state, host, 1, texture_ref, None, true)
-            .expect("host-cache rung must serve the stored frame");
+        let (_, _, _, src) =
+            resolve_sampled_source(state, host, 1, texture_ref, None, true, sampled_d2_shape())
+                .expect("host-cache rung must serve the stored frame");
         let SampledSourceRequest::Bytes(bytes, identity, layout, _) = src else {
             panic!("cache-backed fixture unexpectedly resolved a resident target");
         };
@@ -4451,9 +5056,16 @@ fn iosurface_plane_view_sample_uses_serialized_rg8_view_over_unknown_surface_fou
     st16(&mut device_desc[DEVICE_DESC_BPE..], 2);
     assert!(state.set_mapping_device_desc(surface_id, &device_desc));
 
-    let (sample_w, sample_h, sample_mid, sampled) =
-        resolve_sampled_source(&mut state, &mut host, 1, texture_ref, None, true)
-            .expect("serialized RG8 view must sample the 2-byte surface");
+    let (sample_w, sample_h, sample_mid, sampled) = resolve_sampled_source(
+        &mut state,
+        &mut host,
+        1,
+        texture_ref,
+        None,
+        true,
+        sampled_d2_shape(),
+    )
+    .expect("serialized RG8 view must sample the 2-byte surface");
     assert_eq!(
         (sample_w, sample_h, sample_mid),
         (width, height, surface_id)
@@ -4670,9 +5282,23 @@ fn texture_view_declines_are_specific_and_log_safe() {
             texture_ref: 1,
             opcode: 9,
         },
-        TextureViewDecline::HopLevelOverflow {
+        TextureViewDecline::ChainLevelOverflow { texture_ref: 1 },
+        TextureViewDecline::ChainSliceOverflow { texture_ref: 1 },
+        TextureViewDecline::ChainLevelOutOfRange {
             texture_ref: 1,
-            level_base: u64::MAX,
+            outer_base: 2,
+            outer_count: 3,
+            inner_count: 4,
+        },
+        TextureViewDecline::ChainSliceOutOfRange {
+            texture_ref: 1,
+            outer_base: 2,
+            outer_count: 3,
+            inner_count: 4,
+        },
+        TextureViewDecline::HopTextureTypeUnsupported {
+            texture_ref: 1,
+            texture_type: u16::MAX,
         },
         TextureViewDecline::HopSwizzleInvalid {
             texture_ref: 1,
@@ -4692,7 +5318,7 @@ fn texture_view_declines_are_specific_and_log_safe() {
             assert!(!value.contains(char::is_whitespace));
         }
     }
-    assert_eq!(slugs.len(), 9);
+    assert_eq!(slugs.len(), 13);
 }
 
 #[test]
@@ -5473,6 +6099,38 @@ fn gva_target_backing_retains_the_declared_parent_allocation() {
     );
     assert_eq!(memory.backing.resource_len, linear.allocation_size);
 
+    let mut secondary = req.colors[0].clone();
+    secondary.slot = 1;
+    let colors = [ColorRtRequest::default(), secondary];
+    let primary = crate::model::TargetIdentity::Gva {
+        gva: 0xdead_0000,
+        width: 64,
+        height: 16,
+        generation: 0,
+        format: reims_vgpu_core::pixel_format::TexelLayout::Bgra8,
+    };
+    let secondaries = super::build_secondary_targets(
+        &mut state,
+        &mut host,
+        1,
+        &colors,
+        &crate::runtime::decode::resource::RenderPipelineDescriptor::default(),
+        &primary,
+        64,
+        16,
+        &[],
+    )
+    .expect("the same allocation contract applies to MRT slot 1");
+    let secondary_memory = secondaries[0]
+        .target_guest
+        .as_ref()
+        .expect("a secondary carries its canonical guest allocation to the backend");
+    assert!(std::sync::Arc::ptr_eq(
+        &secondary_memory.import,
+        &memory.import
+    ));
+    assert_eq!(secondary_memory.backing, memory.backing);
+
     let incomplete = DrawEncodeRequest {
         colors: vec![ColorRtRequest {
             texture_ref: 8,
@@ -5525,6 +6183,7 @@ fn sampled_plane_keeps_its_copy_source_and_checks_the_packed_extent() {
         .unwrap(),
         runs: std::sync::Arc::new(Vec::new()),
         pages: std::sync::Arc::new(Vec::new()),
+        sampled_image_requirements: std::collections::HashMap::new(),
         owned_alias: None,
     };
     assert!(
@@ -5533,6 +6192,10 @@ fn sampled_plane_keeps_its_copy_source_and_checks_the_packed_extent() {
             0x7000,
             0x1001,
             128,
+            reims_vgpu_memory::GuestImageLayout::D2 {
+                width: 128,
+                height: 16,
+            },
             reims_vgpu_core::pixel_format::TexelLayout::Rgba8,
             reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8,),
             super::LinearSampleIdentity {
@@ -5555,6 +6218,10 @@ fn sampled_plane_keeps_its_copy_source_and_checks_the_packed_extent() {
         0x1000,
         0x2000,
         128,
+        reims_vgpu_memory::GuestImageLayout::D2 {
+            width: 128,
+            height: 16,
+        },
         reims_vgpu_core::pixel_format::TexelLayout::Rgba8,
         reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
         super::LinearSampleIdentity {
@@ -5565,11 +6232,9 @@ fn sampled_plane_keeps_its_copy_source_and_checks_the_packed_extent() {
         reims_vgpu_core::pixel_format::SwizzlePlan::default(),
     )
     .expect("the retained allocation supplies this plane's copy source");
-    let super::SampledSourceRequest::GuestRuns(
+    let super::SampledSourceRequest::GuestImage(
         source,
         _,
-        _,
-        1,
         Some(identity),
         crate::runtime::gather_witness::GatherVouch::Fresh,
         _,
@@ -5580,8 +6245,8 @@ fn sampled_plane_keeps_its_copy_source_and_checks_the_packed_extent() {
     assert_eq!((identity.key, identity.generation), (1, 1));
     assert_eq!(
         std::sync::Arc::strong_count(&packed.import),
-        import_owners,
-        "the execution source retains bounded references rather than the whole allocation"
+        import_owners + 1,
+        "the image materialization retains its backing allocation"
     );
     assert_eq!(
         std::sync::Arc::strong_count(&packed.gpas),
@@ -5598,8 +6263,17 @@ fn sampled_plane_keeps_its_copy_source_and_checks_the_packed_extent() {
         guest_ref_owners + 1,
         "execution retains the bounded guest reference it consumes"
     );
-    assert_eq!(source.source_offset, 0x1000);
-    assert_eq!(source.total_len, 0x2000);
+    assert_eq!(source.transfer.source_offset, 0x1000);
+    assert_eq!(source.transfer.total_len, 0x2000);
+    assert_eq!(
+        source
+            .direct
+            .as_ref()
+            .expect("direct source")
+            .backing
+            .plane_offset,
+        packed.head + 0x1000
+    );
 }
 
 /// The window refusals name **which** check refused, because the census that
@@ -6392,7 +7066,11 @@ fn a_gva_span_no_store_has_stamped_refuses_the_resident_sample_rung() {
         allocation_size: page,
         handle: 2,
         mipmap_level_count: 1,
-        data_offset: 0,
+        base_offset: 0,
+        bytes_per_slice: span,
+        slice_count: 1,
+        cube_faces: false,
+        compressed_layout: false,
         bytes_per_element: 4,
         used_size: width * height * 4,
         row_stride: row_stride as u32,
@@ -6611,7 +7289,7 @@ fn a_depth_attachment_is_keyed_on_the_guest_texture_the_pass_bound() {
 /// Mesa's Intel driver divides `(use_count << 7)` by the array size its own
 /// zero-fill gave the binding the layout never declared.
 #[test]
-fn only_a_statically_used_texture_gap_is_given_a_neutral_image() {
+fn only_a_statically_used_texture_gap_is_bound_as_null() {
     use reims_vgpu_vulkan::spirv_bind::DescriptorUse;
 
     let gap = |class, metal_index| FragUnbound { class, metal_index };
@@ -6633,9 +7311,9 @@ fn only_a_statically_used_texture_gap_is_given_a_neutral_image() {
         (gap(FragUnboundClass::Sampler, 8), DescriptorUse::Used),
     ];
 
-    assert_eq!(frag_unbound_textures_to_neutralize(&uses), vec![3]);
+    assert_eq!(frag_unbound_textures_to_bind_null(&uses), vec![3]);
     // Nothing flagged, nothing substituted — the hot path.
-    assert!(frag_unbound_textures_to_neutralize(&[]).is_empty());
+    assert!(frag_unbound_textures_to_bind_null(&[]).is_empty());
 }
 
 /// A retained depth-stencil state is served without consulting guest memory,

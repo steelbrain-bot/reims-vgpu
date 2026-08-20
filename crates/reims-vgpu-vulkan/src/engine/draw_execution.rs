@@ -111,6 +111,14 @@ pub enum DrawExecutionDecline {
         resident_samples: u32,
         shader_multisampled: bool,
     },
+    /// A validated inter-subresource pitch could not be translated from the
+    /// source window's relative coordinates into its Vulkan buffer offset.
+    SampledCopyOffsetOverflow {
+        binding: u32,
+        source_offset: u64,
+        pitch: u64,
+        subresource: u32,
+    },
     /// A staging write asked for more bytes than the slot it is writing into
     /// holds.
     ///
@@ -187,6 +195,7 @@ impl Decline for DrawExecutionDecline {
             Self::SampledResidentSampleCountMismatch { .. } => {
                 "vk_draw_exec_sampled_resident_sample_count_mismatch"
             }
+            Self::SampledCopyOffsetOverflow { .. } => "vk_draw_exec_sampled_copy_offset_overflow",
             Self::StagingWriteBeyondSlot { .. } => "vk_draw_exec_staging_write_beyond_slot",
             Self::ReadBackBeyondSlot { .. } => "vk_draw_exec_read_back_beyond_slot",
             Self::LeaseBeyondSlot { .. } => "vk_draw_exec_lease_beyond_slot",
@@ -294,6 +303,17 @@ impl Decline for DrawExecutionDecline {
                 ]);
                 fields
             }
+            Self::SampledCopyOffsetOverflow {
+                binding,
+                source_offset,
+                pitch,
+                subresource,
+            } => vec![
+                ("binding", binding.to_string()),
+                ("source_offset", source_offset.to_string()),
+                ("pitch", pitch.to_string()),
+                ("subresource", subresource.to_string()),
+            ],
             Self::StagingWriteBeyondSlot { size, slot_size } => vec![
                 ("size", size.to_string()),
                 ("slot_size", slot_size.to_string()),
@@ -438,6 +458,12 @@ mod tests {
                 resource_width: 64,
                 resource_height: 32,
             },
+            DrawExecutionDecline::SampledCopyOffsetOverflow {
+                binding: 32,
+                source_offset: u64::MAX,
+                pitch: 4,
+                subresource: 1,
+            },
         ]
     }
 
@@ -470,7 +496,9 @@ mod tests {
         // Back up to 12: `*_load_secondary_content_not_ready` is the primary's
         // readiness guard given to the MRT secondary slot, which had gone
         // without one for as long as MRT has existed.
-        assert_eq!(before, 12, "the draw executor's reason census moved");
+        // Thirteen includes the checked translation from a typed guest image's
+        // relative array/depth pitch into its imported buffer offset.
+        assert_eq!(before, 13, "the draw executor's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate draw-execution slug");
     }
 

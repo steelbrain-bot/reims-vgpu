@@ -259,14 +259,24 @@ fn resolve_uncached<M: HostMemory + HostOps>(
     enter(Phase::PipelineXlate);
     let vertex = state
         .executor
-        .prepare_render_translation(v_air, reims_vgpu_core::ShaderStage::Vertex, pipeline_ref)
+        .prepare_render_translation(
+            v_air,
+            reims_vgpu_core::ShaderStage::Vertex,
+            desc.raster_sample_count.max(1),
+            pipeline_ref,
+        )
         .map_err(|reason| DrawPreparationDecline::VertexTranslate {
             pipeline_ref,
             reason,
         })?;
     let fragment = state
         .executor
-        .prepare_render_translation(f_air, reims_vgpu_core::ShaderStage::Fragment, pipeline_ref)
+        .prepare_render_translation(
+            f_air,
+            reims_vgpu_core::ShaderStage::Fragment,
+            desc.raster_sample_count.max(1),
+            pipeline_ref,
+        )
         .map_err(|reason| DrawPreparationDecline::FragmentTranslate {
             pipeline_ref,
             reason,

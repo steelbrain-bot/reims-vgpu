@@ -259,8 +259,11 @@ pub use reims_vgpu_protocol::{LinearTextureDescriptor as TextureDescriptor, Text
 /// Texture descriptor field offsets (geometry prefix + format trailer).
 pub const TEXTURE_DESC_GEOMETRY_LEN: usize = 68;
 pub const TEXTURE_DESC_MIPMAP_LEVEL_COUNT: usize = 12;
-pub const TEXTURE_DESC_DATA_OFFSET: usize = 16;
+pub const TEXTURE_DESC_SLICE_COUNT: usize = 14;
+pub const TEXTURE_DESC_BASE_OFFSET: usize = 16;
+pub const TEXTURE_DESC_BYTES_PER_SLICE: usize = 24;
 pub const TEXTURE_DESC_BYTES_PER_ELEMENT: usize = 35;
+pub const TEXTURE_DESC_LEVEL_ZERO: usize = 36;
 pub const TEXTURE_DESC_USED_SIZE: usize = 44;
 pub const TEXTURE_DESC_ROW_STRIDE: usize = 52;
 pub const TEXTURE_DESC_WIDTH: usize = 60;
@@ -555,8 +558,7 @@ pub const TEXTURE_VIEW_MTL_TYPE_1D: u16 = 0;
 pub const TEXTURE_VIEW_MTL_TYPE_1D_ARRAY: u16 = 1;
 pub const TEXTURE_VIEW_MTL_TYPE_2D: u16 = 2;
 pub const TEXTURE_VIEW_MTL_TYPE_2D_ARRAY: u16 = 3;
-#[cfg(test)]
-pub(crate) const TEXTURE_VIEW_MTL_TYPE_2D_MULTISAMPLE: u16 = 4;
+pub const TEXTURE_VIEW_MTL_TYPE_2D_MULTISAMPLE: u16 = 4;
 pub const TEXTURE_VIEW_MTL_TYPE_CUBE: u16 = 5;
 pub const TEXTURE_VIEW_MTL_TYPE_CUBE_ARRAY: u16 = 6;
 pub const TEXTURE_VIEW_MTL_TYPE_3D: u16 = 7;
@@ -946,10 +948,19 @@ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Deco
         ..Default::default()
     };
     if bytes.len() >= TEXTURE_DESC_MIPMAP_LEVEL_COUNT + 2 {
-        out.mipmap_level_count = ld16(&bytes[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..]) as u32;
+        let dimension = ld16(&bytes[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..]);
+        out.mipmap_level_count = u32::from(dimension & 0x3fff);
+        out.cube_faces = dimension & 0x4000 != 0;
+        out.compressed_layout = dimension & 0x8000 != 0;
     }
-    if bytes.len() >= TEXTURE_DESC_DATA_OFFSET + 4 {
-        out.data_offset = ld32(&bytes[TEXTURE_DESC_DATA_OFFSET..]);
+    if bytes.len() >= TEXTURE_DESC_SLICE_COUNT + 2 {
+        out.slice_count = u32::from(ld16(&bytes[TEXTURE_DESC_SLICE_COUNT..]));
+    }
+    if bytes.len() >= TEXTURE_DESC_BASE_OFFSET + 8 {
+        out.base_offset = ld64(&bytes[TEXTURE_DESC_BASE_OFFSET..]);
+    }
+    if bytes.len() >= TEXTURE_DESC_BYTES_PER_SLICE + 8 {
+        out.bytes_per_slice = ld64(&bytes[TEXTURE_DESC_BYTES_PER_SLICE..]);
     }
     if bytes.len() > TEXTURE_DESC_BYTES_PER_ELEMENT {
         out.bytes_per_element = bytes[TEXTURE_DESC_BYTES_PER_ELEMENT];
@@ -992,6 +1003,11 @@ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Deco
         // the padded form as a bound refuses allocations the guest sized
         // correctly. Do not "fix" this to `read_span`; levels 1.. take `size`
         // from the wire at `TEXTURE_LEVEL_SIZE` and mean the same padded span.
+        let l0_offset = if bytes.len() >= TEXTURE_DESC_LEVEL_ZERO + 8 {
+            ld64(&bytes[TEXTURE_DESC_LEVEL_ZERO..])
+        } else {
+            0
+        };
         let l0_size = if out.used_size != 0 {
             out.used_size as u64
         } else if out.declared_row_stride().is_some() && out.height > 0 {
@@ -1000,7 +1016,7 @@ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Deco
             0
         };
         out.levels.push(TextureLevelLayout {
-            offset: out.data_offset as u64,
+            offset: l0_offset,
             size: l0_size,
             row_stride: out.row_stride as u64,
             width: out.width,

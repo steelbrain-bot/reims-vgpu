@@ -68,12 +68,37 @@ resources, but not their construction, coherency, paging, discard, or teardown i
 Task death with live mapper views, live reset, interrupted queued teardown, and display-versus-
 ordinary retirement remain arm-specific validation questions; shared code must not guess them.
 
+A texture view is constructed over its immediate base view. Nested mip offsets and swizzles compose;
+pixel format inherits only when the outer view leaves it unspecified. A sampled source carries the
+complete allocation mip chain separately from its view range. The same representation covers 1D,
+1D-array, 2D, 2D-array, and 3D base textures and multi-level views. Array storage remains
+slice-major, using the declared full-chain slice pitch between equal mips; volume depth remains
+inside each mip with its own depth pitch. Direct import checks every mip. If it declines, the
+copy-backed image is built with the view's complete mip count and copies each declared mip and
+array layer or depth plane from the same allocation description. Cube ranges remain outside this
+rail until their face/slice view contract is represented; ranges are never replaced with mip or
+slice zero, and empty ranges are never widened to one.
+
 ## Commands, execution, and completion
 
 Decoded operations are normalized into immutable core commands. A resolved command contains
 generational resources, typed surfaces/mappings, semantic descriptors, byte windows, and declared
 access—not raw object tags, unresolved task-local references, Vulkan handles, or SPIR-V/native
 payloads.
+
+`metal2vulkan` owns shader ABI construction. Reims selects the complete per-stage descriptor layout,
+fragment raster-sample count, runtime pixel-coordinate sampler state, and runtime storage-image
+format/capabilities before translation, then consumes the effective layout and specialization
+results, resource access and byte footprints, and vertex stage-in declarations from the returned
+reflection. It does not renumber descriptors, repair aggregate layout, retype storage images, or
+inject capabilities into the emitted SPIR-V. The remaining SPIR-V reads answer executable-module
+questions reflection does not claim to answer, such as static descriptor use, required Vulkan
+capabilities, validator acceptance, and the exact storage-image operations that determine
+read/write access.
+
+Null texture and sampler entries remain explicit semantic resources. A capable Vulkan executor
+binds null descriptors; an executor without that capability refuses by type. Neither decode nor
+execution may replace a null entry with fabricated image dimensions, texels, or sampler state.
 
 `ResolvedSubmission` preserves command-buffer segmentation and resource participation. The
 executor returns typed completion values; it does not mutate request fields to publish success.
@@ -111,6 +136,62 @@ semantic trace:
 Topology may change placement, transfer scheduling, and metrics. It must not change resource
 lifetime, correctness, refusal meaning, or guest-visible output. Vendor and driver names are not
 policy inputs.
+
+Direct image binding is a layout contract, not a topology shortcut. The semantic request carries
+the canonical guest allocation, every mip's resource/plane offset, row pitch and typed extent, the
+separate view range, array layers or volume depth, inter-subresource pitch, and physical footprint.
+The Vulkan executor admits it only when the imported parent allocation, memory type, image
+requirements, and every subresource offset, row pitch, and—where applicable—array or depth pitch
+agree exactly. This permits exact 1D,
+1D-array, 2D, 2D-array, and 3D imports without treating a layer and a depth slice as the same
+thing. A mismatch keeps the typed GPU buffer-to-image transfer path; it never invents a pitch or
+falls back to a CPU layout repair. The imported image is a child of that allocation and delays
+parent retirement until its submission fence and image lifetime have both ended. Image windows
+remain parent-import-relative while physical footprints are resource-relative;
+`GuestTargetMemory` owns that coordinate conversion. Attachments publish the written footprint.
+Before any imported buffer or image read, the executor records one global guest-memory dependency
+covering host, transfer, shader, colour, and depth/stencil writes. This scope is allocation-wide by
+design: a RAMBlock import, a packed mapping import, and child images may be different Vulkan objects
+over the same physical pages, so a resource-specific barrier cannot name every producer.
+The dependency is re-armed at every decoded guest-operation boundary even when several operations
+share one Vulkan command buffer: guest CPU writes occur outside the backend and therefore cannot be
+memoized as visible across operations. Direct aliases remain reusable because they still name the
+live allocation. Gathered buffers and uploaded images are snapshots and expire at that same
+boundary; immutable owned byte buffers retain their command-buffer lifetime.
+Encoder texture state and the shader interface remain separate inputs: a guest may leave an object
+bound in a slot the current shader does not use. Such a slot has no reflected descriptor and creates
+no Vulkan image or transfer. A reflected descriptor must carry its real dimension; absence is never
+defaulted to 2D.
+When Vulkan requires a larger binding extent than the guest allocation, the executor reports that
+exact extent before materialization and the host view appends anonymous padding. Those bytes belong
+only to the host binding: they never enter the guest footprint, content identity, or writeback.
+A mapped sampled image retains its imported image/view with the serialized resource lifetime and
+keeps an exact typed buffer-transfer representation beside it. Stable backend admission results—
+either a binding requirement or a typed layout refusal—are cached by the complete image-layout
+request under that same resource lifetime; different formats, dimensions, levels, and pitches
+cannot reuse one answer, while transient driver failures are never retained. A refused direct
+layout dispatches straight to the transfer representation instead of probing an incompatible
+backend object on every bind. Page runs remain mapping/transport state, not content identity. Any
+exact-layout admission disagreement selects the same transfer representation without changing the
+resource, coherence, or lifecycle result.
+
+Compute residency preserves the same texture identity across storage and sampled bindings. A
+resident image is created with both Vulkan usages and is bound directly when the guest later names
+it as sampled input; resource binding does not invent a snapshot copy or a second texture lifetime.
+
+Presentation prepares the current present's resident carrier before deciding whether capture needs
+CPU pixels. A prepared engine resident goes directly to the host presenter; CPU readback exists only
+for a present whose capability/lifetime check cannot supply that carrier.
+
+Direct GPU writes into imported guest pages are owned by the submission that records them. Their
+canonical page set moves into that ring entry at seal and retires when its fence signals; visibility
+tracking has no independent capacity, eviction, overflow merge, or global lifetime approximation.
+
+Guest RAM host-pointer imports carry the external-memory handle selected by the physical device's
+importability query. Mappings created outside Vulkan prefer the mapped-foreign handle when it is
+reported importable; hosts exposing only host-allocation import retain that reported handle. The
+same selected value is used for the pointer query, buffer/image creation, and memory import, and is
+published in `vk_caps`; no host or driver name chooses it.
 
 Guest-derived GPU state is owned by a device/session handle: pools, residents, imports, submissions,
 presenter, counters, and completion signals. Only the physical context and immutable content-keyed

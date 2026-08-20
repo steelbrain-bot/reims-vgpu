@@ -138,12 +138,41 @@ pub(crate) const MAX_SECONDARY_ATTACH: usize = 7;
 const _: () = assert!(1 + MAX_SECONDARY_ATTACH == reims_vgpu_protocol::MAX_COLOR_ATTACHMENTS);
 const _: () = assert!(MAX_SECONDARY_ATTACH < u8::BITS as usize);
 
+/// Vulkan color-attachment load operation selected from the semantic request.
+/// Keeping all three values in the pass key prevents `DontCare` from being
+/// silently converted into a clear.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub(crate) enum ColorLoadKey {
+    Load,
+    #[default]
+    Clear,
+    DontCare,
+}
+
+impl ColorLoadKey {
+    fn vulkan(
+        self,
+        final_layout: ash::vk::ImageLayout,
+    ) -> (ash::vk::AttachmentLoadOp, ash::vk::ImageLayout) {
+        match self {
+            Self::Load => (ash::vk::AttachmentLoadOp::LOAD, final_layout),
+            Self::Clear => (
+                ash::vk::AttachmentLoadOp::CLEAR,
+                ash::vk::ImageLayout::UNDEFINED,
+            ),
+            Self::DontCare => (
+                ash::vk::AttachmentLoadOp::DONT_CARE,
+                ash::vk::ImageLayout::UNDEFINED,
+            ),
+        }
+    }
+}
+
 /// A secondary MRT attachment's contribution to the render-pass / pipeline key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Default)]
 pub(crate) struct SecondaryAttachKey {
     pub format: ash::vk::Format,
-    /// true = LOAD existing content, false = CLEAR.
-    pub load: bool,
+    pub load: ColorLoadKey,
 }
 
 /// A depth attachment's contribution to the render-pass key. `None` on `PassKey`
@@ -161,7 +190,7 @@ pub(crate) struct DepthAttachKey {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct PassKey {
-    pub load_seed: bool, // LOAD vs CLEAR (slot 0)
+    pub color0_load: ColorLoadKey,
     /// Slot-0 attachment format, as a format rather than a channel-order flag.
     ///
     /// This used to be `bgra: bool`, meaning `B8G8R8A8_UNORM` or
@@ -204,9 +233,9 @@ pub(crate) struct PassKey {
 
 impl PassKey {
     /// Single-color-attachment pass (the pre-MRT constructor).
-    pub(crate) fn single(load_seed: bool, color0_format: ash::vk::Format) -> Self {
+    pub(crate) fn single(color0_load: ColorLoadKey, color0_format: ash::vk::Format) -> Self {
         Self {
-            load_seed,
+            color0_load,
             color0_format,
             secondary: [SecondaryAttachKey::default(); MAX_SECONDARY_ATTACH],
             secondary_count: 0,
@@ -216,6 +245,20 @@ impl PassKey {
             sample_count: 1,
             multisample_resolve: false,
         }
+    }
+
+    /// Project a compound pass onto the cached framebuffer owned by its
+    /// primary attachment.
+    ///
+    /// The framebuffer contains only attachment zero, but that attachment is
+    /// still the multisampled image used by the compound pass. Starting again
+    /// from [`Self::single`] would silently reset its sample count to one and
+    /// create a framebuffer incompatible with the image it names.
+    pub(crate) fn primary_attachment_only(self) -> Self {
+        let mut primary = Self::single(self.color0_load, self.color0_format);
+        primary.feedback_colors = self.feedback_colors & 1;
+        primary.sample_count = self.sample_count;
+        primary
     }
 
     pub(crate) fn color_feedback(self, index: usize) -> bool {
@@ -248,9 +291,9 @@ impl PassKey {
     /// image is not in.
     pub(crate) fn compatibility(self) -> PassCompatibilityKey {
         let mut key = self;
-        key.load_seed = false;
+        key.color0_load = ColorLoadKey::Clear;
         for secondary in &mut key.secondary {
-            secondary.load = false;
+            secondary.load = ColorLoadKey::Clear;
         }
         if let Some(depth) = &mut key.depth {
             depth.load = false;
@@ -396,7 +439,7 @@ impl PassCompatibilityKey {
         let PassKey {
             // Load actions are erased by `PassKey::compatibility`, so they are
             // equal here by construction and cannot be a difference.
-            load_seed: _,
+            color0_load: _,
             color0_format,
             secondary,
             secondary_count,
@@ -802,12 +845,9 @@ const SHADER_DIGEST_ENTRIES: usize = 4096;
 ///
 /// # What it skips, and why that is safe
 ///
-/// [`ObjectCaches::get_or_create_shader`] walks the module three times before it
-/// can look anything up: `required_image_capabilities`, the digest, and (on the
-/// patch path) a rebuild. All three are pure functions of the words, and the
-/// words behind an `Arc<Vec<u32>>` cannot change. So the digest recorded here is
-/// the *final* one — after any capability patch — and a hit is the same answer
-/// those three walks would have produced.
+/// [`ObjectCaches::get_or_create_shader`] walks the module to verify its image
+/// capability requirements and compute the digest. Both are pure functions of
+/// the words, and the words behind an `Arc<Vec<u32>>` cannot change.
 ///
 /// A hit still consults [`ObjectCaches::shaders`], positive and negative. That
 /// keeps this index from depending on `ObjectCache` never evicting, which is a
@@ -1262,70 +1302,6 @@ fn pass_exit_scope_narrow() -> bool {
     })
 }
 
-/// The guest's sampler request, made legal for `vkCreateSampler`.
-///
-/// # Why this exists
-///
-/// Metal lets `coord::pixel` sit beside any filter, any address mode, any
-/// anisotropy and any compare function. Vulkan makes six of those combinations
-/// **invalid usage** — undefined behaviour inside the driver, not an error code
-/// this device gets to see. Only the LOD pair was honoured here, so a guest
-/// sampler with pixel coordinates and, say, `address::repeat` or a linear mip
-/// filter built an invalid `VkSampler` on every host and every rail.
-///
-/// # Why conforming is correct for five of the six, and not a silent degradation
-///
-/// Vulkan also forbids an unnormalized sampler being reached by any
-/// implicit-LOD, `Proj` or `Dref` instruction
-/// (`VUID-vkCmdDispatch-None-08610`). What is left can only sample at an
-/// explicit level 0 with no derivatives, so each of these five changes nothing
-/// the guest can observe:
-///
-/// - `-01072` `minFilter == magFilter` — no minification path exists, so
-///   `magFilter` is the filter that ever applies;
-/// - `-01073` `mipmapMode == NEAREST` and `-01074` `minLod == maxLod == 0` —
-///   only level 0 is reachable (the LOD pair is forced by the caller);
-/// - `-01076` `anisotropyEnable == VK_FALSE` — anisotropy is computed from
-///   derivatives such a sample cannot carry;
-/// - `-01075` `addressModeU`/`V` must clamp — Metal restricts `coord::pixel` to
-///   `clamp_to_edge`/`clamp_to_zero` itself, so any other mode is a descriptor
-///   Metal would not have honoured either.
-///
-/// `addressModeW` is left alone on purpose: `-01075` names U and V only, because
-/// an unnormalized sampler may only read a 2D view.
-///
-/// The sixth is `compareEnable`, and it is **not** in that class — dropping the
-/// compare returns the sampled value instead of the comparison, which is a
-/// different picture. That one is returned as a typed refusal.
-///
-/// A normalized sampler is returned unchanged; every branch here is gated on
-/// `unnormalized_coordinates`.
-fn vulkan_conformed_sampler(
-    key: &SamplerStateKey,
-) -> Result<SamplerStateKey, super::reason::DrawReason> {
-    use super::types::{SamplerAddressMode as A, SamplerCompareFunction, SamplerMipFilter};
-    if !key.unnormalized_coordinates {
-        return Ok(*key);
-    }
-    if key.compare_function != SamplerCompareFunction::Never {
-        return Err(super::reason::DrawReason::SamplerUnnormalizedCompare);
-    }
-    let clamped = |mode: A| match mode {
-        A::ClampToEdge | A::ClampToZero | A::ClampToBorderColor => mode,
-        _ => A::ClampToEdge,
-    };
-    Ok(SamplerStateKey {
-        min_filter: key.mag_filter,
-        mip_filter: SamplerMipFilter::Nearest,
-        address_mode_u: clamped(key.address_mode_u),
-        address_mode_v: clamped(key.address_mode_v),
-        max_anisotropy: 1,
-        lod_min: 0.0f32.to_bits(),
-        lod_max: 0.0f32.to_bits(),
-        ..*key
-    })
-}
-
 impl ObjectCaches {
     pub(crate) fn new() -> Self {
         Self {
@@ -1468,31 +1444,15 @@ impl ObjectCaches {
         counters: &EngineCounters,
         pools: &mut ResourcePools,
     ) -> Result<(Digest128, vk::ShaderModule), DrawError> {
-        // Declare the storage-image capabilities this module's own contents
-        // require, before it is keyed or validated.
-        //
-        // This is the only place every module from every path passes through, so
-        // it is the only place the question can be asked once. It used to be
-        // asked at one producer instead, and phrased as provenance — "did *this
-        // device* retarget a binding to `Unknown`?" — which is a claim about how
-        // a module came to need the capability rather than whether it does. The
-        // translator emits `Unknown`-format storage images and extended formats
-        // of its own accord; those modules arrived here undeclared and were
-        // rejected, losing the dispatch. Both x86 rails lose compute work to it.
-        //
-        // A capability whose Vulkan feature was not enabled at device creation
-        // cannot be declared — that is invalid usage, and an invalid module is
-        // undefined behaviour inside a driver rather than an error it returns —
-        // so an unsupported requirement is a named decline instead.
-        // Both passes below walk the whole module, and so does the digest, so the
-        // charge is levied once here on the words the caller handed over rather
-        // than at each walk.
+        // Verify that the host features enabled at device creation cover the
+        // final module. metal2vulkan owns capability declaration; mutating its
+        // output here would create a second translator with a weaker view of
+        // the source contract.
         counters
             .shader_hash_words
             .fetch_add(words.len() as u64, Ordering::Relaxed);
         let need = crate::spirv_bind::required_image_capabilities(words);
-        let mut patched;
-        let words: &[u32] = if need.any() {
+        if need.any() {
             let missing = (need.extended_formats && !ctx.spirv_storage_extended_formats)
                 || (need.write_without_format && !ctx.spirv_storage_write_without_format)
                 || (need.read_without_format && !ctx.spirv_storage_read_without_format);
@@ -1514,21 +1474,7 @@ impl ObjectCaches {
                 self.shaders.insert_negative(key, err.clone());
                 return Err(err);
             }
-            patched = words.to_vec();
-            let added = crate::spirv_bind::ensure_image_capabilities(&mut patched, &need);
-            if added.any() {
-                reims_vgpu_observe::off(format!(
-                    "spirv_capability added extended={} write={} read={} words={}",
-                    added.extended_formats,
-                    added.write_without_format,
-                    added.read_without_format,
-                    patched.len()
-                ));
-            }
-            &patched
-        } else {
-            words
-        };
+        }
         let key = Digest128::of_u32_words(words);
         if let Some(err) = self.shaders.get_negative(&key) {
             counters.shader_misses.fetch_add(1, Ordering::Relaxed);
@@ -1713,11 +1659,7 @@ impl ObjectCaches {
         // second spelling here would make that skip a missing transition the
         // first time somebody changed one of them.
         let color0_final = key.color_final_layout(0);
-        let (load_op, initial) = if key.load_seed {
-            (vk::AttachmentLoadOp::LOAD, color0_final)
-        } else {
-            (vk::AttachmentLoadOp::CLEAR, vk::ImageLayout::UNDEFINED)
-        };
+        let (load_op, initial) = key.color0_load.vulkan(color0_final);
         // Slot 0 (primary) and the secondary attachments (slot 1..) now exit the
         // same way, at [`color0_pass_exit_layout`], and for the same reason: a
         // consumer's barrier is what establishes the dependency, so leaving the
@@ -1750,11 +1692,7 @@ impl ObjectCaches {
         {
             let attachment_index = i + 1;
             let final_layout = key.color_final_layout(attachment_index);
-            let (sload, sinitial) = if sec.load {
-                (vk::AttachmentLoadOp::LOAD, final_layout)
-            } else {
-                (vk::AttachmentLoadOp::CLEAR, vk::ImageLayout::UNDEFINED)
-            };
+            let (sload, sinitial) = sec.load.vulkan(final_layout);
             attachments.push(
                 vk::AttachmentDescription::default()
                     .format(sec.format)
@@ -1912,7 +1850,7 @@ impl ObjectCaches {
         // Everything below is built from the *conformed* key, never from `key`
         // itself; `key` stays the guest's request so the cache and the negative
         // cache still index what was asked for.
-        let conformed = match vulkan_conformed_sampler(key) {
+        let conformed = match super::types::effective_sampler_state_key(*key) {
             Ok(k) => k,
             Err(reason) => {
                 reims_vgpu_observe::Emit::decline("vk_engine_sampler", &reason)
@@ -2100,9 +2038,9 @@ impl ObjectCaches {
         key: &PipelineKey,
         pipeline_lifetime: Option<&reims_vgpu_core::ResourceLifetime>,
         vert_module: vk::ShaderModule,
-        // The post-relocation words `vert_module` was built from. Read only to
-        // answer how wide this shader's stage-in reads are, and only on a host
-        // that substitutes a vertex format; see the resolution loop below.
+        vert_inputs: &VertexInputWidths,
+        // The reflected-layout words `vert_module` was built from. Retained for
+        // the driver breadcrumb around graphics pipeline creation.
         vert_spirv: &[u32],
         frag_module: vk::ShaderModule,
         // Read only by the driver breadcrumb: a graphics compile consumes both
@@ -2203,16 +2141,13 @@ impl ObjectCaches {
         // pipeline miss and only when some attribute really needs substituting:
         // on a host that accepts every format — every host this project has run
         // on — `vert_spirv` is never read at all.
-        let mut shader_inputs: Option<VertexInputWidths> = None;
         let mut attribute_formats = Vec::with_capacity(key.attrs.len());
         for attr in &key.attrs {
             let binding =
                 match ctx
                     .vertex_formats
                     .resolve(attr.format, attr.offset, attr.stride, || {
-                        shader_inputs
-                            .get_or_insert_with(|| VertexInputWidths::from_spirv(vert_spirv))
-                            .at(attr.location)
+                        vert_inputs.at(attr.location)
                     }) {
                     Ok(binding) => binding,
                     Err(translate_reason) => {
@@ -2662,11 +2597,11 @@ mod object_cache_tests {
     /// attachment formats and subpass shape.
     #[test]
     fn pass_compatibility_ignores_only_load_actions() {
-        let mut clear = PassKey::single(false, vk::Format::B8G8R8A8_UNORM);
+        let mut clear = PassKey::single(ColorLoadKey::Clear, vk::Format::B8G8R8A8_UNORM);
         clear.secondary_count = 1;
         clear.secondary[0] = SecondaryAttachKey {
             format: vk::Format::R16G16_SFLOAT,
-            load: false,
+            load: ColorLoadKey::Clear,
         };
         clear.depth = Some(DepthAttachKey {
             load: false,
@@ -2674,8 +2609,8 @@ mod object_cache_tests {
         });
 
         let mut load = clear;
-        load.load_seed = true;
-        load.secondary[0].load = true;
+        load.color0_load = ColorLoadKey::Load;
+        load.secondary[0].load = ColorLoadKey::Load;
         load.depth.as_mut().unwrap().load = true;
         assert_eq!(clear.compatibility(), load.compatibility());
 
@@ -2692,6 +2627,45 @@ mod object_cache_tests {
         assert_ne!(clear.compatibility(), different_depth.compatibility());
     }
 
+    #[test]
+    fn color_dont_care_reaches_the_native_discard_load_operation() {
+        let final_layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+        assert_eq!(
+            ColorLoadKey::DontCare.vulkan(final_layout),
+            (vk::AttachmentLoadOp::DONT_CARE, vk::ImageLayout::UNDEFINED,)
+        );
+        assert_eq!(
+            ColorLoadKey::Clear.vulkan(final_layout).0,
+            vk::AttachmentLoadOp::CLEAR
+        );
+        assert_eq!(
+            ColorLoadKey::Load.vulkan(final_layout),
+            (vk::AttachmentLoadOp::LOAD, final_layout)
+        );
+    }
+
+    #[test]
+    fn primary_attachment_projection_preserves_its_sample_count() {
+        let mut compound = PassKey::single(ColorLoadKey::Load, vk::Format::B8G8R8A8_UNORM);
+        compound.sample_count = 4;
+        compound.multisample_resolve = true;
+        compound.color_input = true;
+        compound.depth = Some(DepthAttachKey {
+            load: true,
+            stencil: true,
+        });
+        compound.secondary_count = 1;
+
+        let primary = compound.primary_attachment_only();
+        assert_eq!(primary.sample_count, 4);
+        assert_eq!(primary.color0_load, ColorLoadKey::Load);
+        assert_eq!(primary.color0_format, vk::Format::B8G8R8A8_UNORM);
+        assert_eq!(primary.secondary_count, 0);
+        assert_eq!(primary.depth, None);
+        assert!(!primary.color_input);
+        assert!(!primary.multisample_resolve);
+    }
+
     /// `first_difference` answers `None` on exactly the pairs that compare
     /// equal, which is what makes `passcompat_*` a partition of
     /// `passdiff_compat` rather than a second opinion about it.
@@ -2704,11 +2678,11 @@ mod object_cache_tests {
     /// per field, and it is made in both directions.
     #[test]
     fn every_compatibility_difference_is_named_and_equal_keys_name_none() {
-        let mut base = PassKey::single(false, vk::Format::B8G8R8A8_UNORM);
+        let mut base = PassKey::single(ColorLoadKey::Clear, vk::Format::B8G8R8A8_UNORM);
         base.secondary_count = 1;
         base.secondary[0] = SecondaryAttachKey {
             format: vk::Format::R16G16_SFLOAT,
-            load: false,
+            load: ColorLoadKey::Clear,
         };
         base.depth = Some(DepthAttachKey {
             load: false,
@@ -2730,8 +2704,8 @@ mod object_cache_tests {
             (
                 "load actions",
                 |k| {
-                    k.load_seed = true;
-                    k.secondary[0].load = true;
+                    k.color0_load = ColorLoadKey::Load;
+                    k.secondary[0].load = ColorLoadKey::Load;
                     k.depth.as_mut().unwrap().load = true;
                 },
                 None,
@@ -2800,9 +2774,9 @@ mod object_cache_tests {
     /// Framebuffers bind attachment views, not load actions or dependencies.
     #[test]
     fn framebuffer_compatibility_ignores_load_and_dependency_state() {
-        let plain = PassKey::single(false, vk::Format::B8G8R8A8_UNORM);
+        let plain = PassKey::single(ColorLoadKey::Clear, vk::Format::B8G8R8A8_UNORM);
         let mut transported = plain;
-        transported.load_seed = true;
+        transported.color0_load = ColorLoadKey::Load;
         transported.feedback_colors = 1;
 
         assert_eq!(
@@ -2840,89 +2814,6 @@ mod object_cache_tests {
                 }
             ))
         ));
-    }
-
-    fn unnormalized_key() -> SamplerStateKey {
-        use super::super::types::{
-            SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter,
-            SamplerMipFilter,
-        };
-        SamplerStateKey {
-            min_filter: SamplerFilter::Nearest,
-            mag_filter: SamplerFilter::Linear,
-            mip_filter: SamplerMipFilter::Linear,
-            address_mode_u: SamplerAddressMode::Repeat,
-            address_mode_v: SamplerAddressMode::MirrorRepeat,
-            address_mode_w: SamplerAddressMode::Repeat,
-            border_color: SamplerBorderColor::TransparentBlack,
-            compare_function: SamplerCompareFunction::Never,
-            lod_min: 1.0f32.to_bits(),
-            lod_max: 8.0f32.to_bits(),
-            max_anisotropy: 16,
-            unnormalized_coordinates: true,
-        }
-    }
-
-    /// Every constraint `vkCreateSampler` puts on `unnormalizedCoordinates`, on a
-    /// key that violates all of them at once. Without the conform this builds a
-    /// sampler whose behaviour is undefined rather than wrong, so there is no
-    /// error code and no log line to notice it by.
-    #[test]
-    fn an_unnormalized_sampler_is_conformed_on_every_constraint_vulkan_states() {
-        use super::super::types::{SamplerAddressMode, SamplerFilter, SamplerMipFilter};
-        let got = vulkan_conformed_sampler(&unnormalized_key()).expect("no compare function");
-        // -01072: minFilter == magFilter, and it is magFilter that survives.
-        assert_eq!(got.min_filter, SamplerFilter::Linear);
-        assert_eq!(got.mag_filter, SamplerFilter::Linear);
-        // -01073
-        assert_eq!(got.mip_filter, SamplerMipFilter::Nearest);
-        // -01074
-        assert_eq!(f32::from_bits(got.lod_min), 0.0);
-        assert_eq!(f32::from_bits(got.lod_max), 0.0);
-        // -01075, U and V only.
-        assert_eq!(got.address_mode_u, SamplerAddressMode::ClampToEdge);
-        assert_eq!(got.address_mode_v, SamplerAddressMode::ClampToEdge);
-        assert_eq!(got.address_mode_w, SamplerAddressMode::Repeat);
-        // -01076
-        assert_eq!(got.max_anisotropy, 1);
-        assert!(got.unnormalized_coordinates);
-    }
-
-    /// A clamping mode the guest chose deliberately is kept, so the conform
-    /// cannot be read as "unnormalized means clamp-to-edge".
-    #[test]
-    fn a_conformed_unnormalized_sampler_keeps_a_clamp_mode_that_was_already_legal() {
-        use super::super::types::SamplerAddressMode;
-        let mut key = unnormalized_key();
-        key.address_mode_u = SamplerAddressMode::ClampToZero;
-        key.address_mode_v = SamplerAddressMode::ClampToBorderColor;
-        let got = vulkan_conformed_sampler(&key).expect("no compare function");
-        assert_eq!(got.address_mode_u, SamplerAddressMode::ClampToZero);
-        assert_eq!(got.address_mode_v, SamplerAddressMode::ClampToBorderColor);
-    }
-
-    /// `-01077` is the one constraint that is not observationally neutral, so it
-    /// is a named refusal and not a repair.
-    #[test]
-    fn an_unnormalized_sampler_with_a_compare_function_is_refused_by_name() {
-        use super::super::types::SamplerCompareFunction;
-        use reims_vgpu_observe::Decline as _;
-        let mut key = unnormalized_key();
-        key.compare_function = SamplerCompareFunction::LessEqual;
-        let reason = vulkan_conformed_sampler(&key).expect_err("compare is refused");
-        assert_eq!(reason.slug(), "sampler_unnormalized_compare");
-    }
-
-    /// The conform is gated on the unnormalized bit and touches nothing else — a
-    /// normalized sampler with mips, anisotropy, repeat addressing and a compare
-    /// function is what the great majority of guest binds are.
-    #[test]
-    fn a_normalized_sampler_passes_through_the_conform_untouched() {
-        use super::super::types::SamplerCompareFunction;
-        let mut key = unnormalized_key();
-        key.unnormalized_coordinates = false;
-        key.compare_function = SamplerCompareFunction::Less;
-        assert_eq!(vulkan_conformed_sampler(&key).expect("normalized"), key);
     }
 
     #[test]
@@ -3442,7 +3333,7 @@ mod object_cache_tests {
     /// which is undefined behaviour reported nowhere.
     #[test]
     fn feedback_attachment_layout_is_derived_consistently_from_the_mask() {
-        let mut key = PassKey::single(true, vk::Format::R8G8B8A8_UNORM);
+        let mut key = PassKey::single(ColorLoadKey::Load, vk::Format::R8G8B8A8_UNORM);
         key.color_input = true;
         key.feedback_colors = (1 << 0) | (1 << 3);
 
@@ -3497,7 +3388,7 @@ mod object_cache_tests {
     /// `VUID-VkRenderPassBeginInfo-renderPass-00904` on a driven Maps boot.
     #[test]
     fn the_dependency_count_does_not_move_with_anything_the_framebuffer_key_erases() {
-        let base = PassKey::single(true, vk::Format::R8G8B8A8_UNORM);
+        let base = PassKey::single(ColorLoadKey::Load, vk::Format::R8G8B8A8_UNORM);
         for feedback in [0u8, 1, (1 << 0) | (1 << 3)] {
             let mut key = base;
             key.feedback_colors = feedback;
@@ -3543,7 +3434,7 @@ mod object_cache_tests {
     /// sampled read of an attachment it is writing with no feedback loop enabled.
     #[test]
     fn feedback_leaves_pass_compatibility_without_leaving_the_pipeline() {
-        let plain = PassKey::single(true, vk::Format::R8G8B8A8_UNORM);
+        let plain = PassKey::single(ColorLoadKey::Load, vk::Format::R8G8B8A8_UNORM);
         let mut feeds = plain;
         feeds.feedback_colors = 1;
 
@@ -3600,7 +3491,7 @@ mod object_cache_tests {
     /// `COLOR_ATTACHMENT_OPTIMAL` beside a feedback arm that derived.
     #[test]
     fn an_ordinary_colour_slot_enters_and_leaves_a_pass_at_one_layout() {
-        let key = PassKey::single(true, vk::Format::B8G8R8A8_UNORM);
+        let key = PassKey::single(ColorLoadKey::Load, vk::Format::B8G8R8A8_UNORM);
         for index in 0..=MAX_SECONDARY_ATTACH {
             assert_eq!(
                 key.color_layout(index),

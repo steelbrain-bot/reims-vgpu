@@ -39,8 +39,8 @@
 use crate::observe::Decline;
 use crate::runtime::decode::blit::{self, BlitAspect, Command, CopyKind, Kind, Point};
 use crate::runtime::decode::resource::{
-    texture_view_type_is_3d, texture_view_type_supported, texture_view_type_uses_slices,
-    Descriptor as ResourceDescriptor, ObjectKind, TEXTURE_VIEW_MTL_TYPE_2D,
+    texture_view_type_is_3d, texture_view_type_uses_slices, Descriptor as ResourceDescriptor,
+    ObjectKind,
 };
 use crate::runtime::draw::{self, host_alloc_len};
 use crate::runtime::fence_exec::{self, FenceStatus};
@@ -489,24 +489,29 @@ fn resolve_texture_copy_batch<M: HostMemory + HostOps>(
                 .destination_slice
                 .checked_add(slice_delta)
                 .ok_or_else(|| br(BlitStatus::Bounds, "sl_dst_slice_overflow"))?;
-            slices.push((
-                resolve_texture_endpoint_unsettled(
-                    state,
-                    host,
-                    task_id,
-                    cmd.source,
-                    source_level,
-                    source_slice,
-                )?,
-                resolve_texture_endpoint_unsettled(
-                    state,
-                    host,
-                    task_id,
-                    cmd.destination,
-                    destination_level,
-                    destination_slice,
-                )?,
-            ));
+            let source = resolve_texture_endpoint_unsettled(
+                state,
+                host,
+                task_id,
+                cmd.source,
+                source_level,
+                source_slice,
+            )?;
+            let destination = resolve_texture_endpoint_unsettled(
+                state,
+                host,
+                task_id,
+                cmd.destination,
+                destination_level,
+                destination_slice,
+            )?;
+            if slice_delta == 0
+                && (source.backing.depth() > 1 || destination.backing.depth() > 1)
+                && (cmd.slice_count != 1 || cmd.source_slice != 0 || cmd.destination_slice != 0)
+            {
+                return Err(br(BlitStatus::Unsupported, "sl_volume_slice_constraint"));
+            }
+            slices.push((source, destination));
         }
         let first_slice = slices.remove(0);
         levels.push(ResolvedTextureLevelCopy {
@@ -752,90 +757,47 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
 
     // Type-8 view → base texture (unswizzled; multi-level / array / non-2D allowed).
     if entry.kind == ObjectKind::TextureView {
-        let Ok(ResourceDescriptor::TextureView(view)) = objects::decoded_resource(&resource) else {
-            return Err(br(
-                BlitStatus::MissingResource,
-                crate::observe::ladder_slug!("view", desc_decode),
-            ));
-        };
-        if view.base_texture_ref == 0 {
-            return Err(br(BlitStatus::MissingResource, "view_base_ref_zero"));
-        }
+        let view = draw::resolve_texture_view_reasoned(state, host, task_id, texture_ref).map_err(
+            |reason| {
+                crate::observe::Emit::decline("blit_tex_view_resolve", &reason)
+                    .field("task", task_id)
+                    .field("ref", texture_ref)
+                    .fail_once(u64::from(task_id) << 32 | u64::from(texture_ref));
+                br(BlitStatus::Unsupported, "view_resolve")
+            },
+        )?;
         // Blit rejects swizzled materialization (contract).
-        if view.carries_swizzle() {
-            let plan = pixel_format::swizzle_plan(&view.swizzle)
-                .ok_or_else(|| br(BlitStatus::Unsupported, "view_swizzle_plan"))?;
-            if !pixel_format::swizzle_is_identity(&plan) {
-                return Err(br(BlitStatus::Unsupported, "view_swizzle_nonident"));
-            }
+        if view
+            .swizzle
+            .as_ref()
+            .is_some_and(|plan| !pixel_format::swizzle_is_identity(plan))
+        {
+            return Err(br(BlitStatus::Unsupported, "view_swizzle_nonident"));
         }
-        let view_type = if view.carries_range() {
-            if !texture_view_type_supported(view.texture_type) {
-                return Err(br(BlitStatus::Unsupported, "view_type_unsupported"));
-            }
-            view.texture_type
-        } else {
-            TEXTURE_VIEW_MTL_TYPE_2D
-        };
-        // Relative command level → absolute on the base (multi-level ranges ok).
-        let rel_level = level as u64;
-        let level_count = if view.carries_range() {
-            if view.level_count == 0 {
-                1
-            } else {
-                view.level_count
-            }
-        } else {
-            // Simple form: no level range; command level is absolute on base.
-            u64::MAX
-        };
-        if view.carries_range() && rel_level >= level_count {
-            return Err(br(BlitStatus::Bounds, "view_level_oob"));
-        }
-        let abs_level = if view.carries_range() {
-            view.level_base
-                .checked_add(rel_level)
-                .ok_or_else(|| br(BlitStatus::Bounds, "view_level_overflow"))?
-        } else {
-            rel_level
-        };
+        // The command's level/slice are relative to the outermost view. The
+        // shared resolver has already composed every nested range into the
+        // final base namespace.
+        let (abs_level, abs_slice) = view
+            .select(u64::from(level), u64::from(slice))
+            .ok_or_else(|| br(BlitStatus::Bounds, "view_subresource_oob"))?;
         if abs_level > u16::MAX as u64 {
             return Err(br(BlitStatus::Bounds, "view_level_u16"));
         }
-        // Relative command slice → absolute (array / cube faces).
-        let rel_slice = slice as u64;
-        let slice_count = if view.carries_range() {
-            if view.slice_count == 0 {
-                1
-            } else {
-                view.slice_count
-            }
-        } else {
-            u64::MAX
-        };
-        if view.carries_range() && rel_slice >= slice_count {
-            return Err(br(BlitStatus::Bounds, "view_slice_oob"));
-        }
-        let abs_slice = if view.carries_range() {
-            view.slice_base
-                .checked_add(rel_slice)
-                .ok_or_else(|| br(BlitStatus::Bounds, "view_slice_overflow"))?
-        } else {
-            rel_slice
-        };
         if abs_slice > u16::MAX as u64 {
             return Err(br(BlitStatus::Bounds, "view_slice_u16"));
         }
         // 3D views use depth planes, not array slices.
-        if texture_view_type_is_3d(view_type) && abs_slice != 0 {
-            return Err(br(BlitStatus::Unsupported, "view_3d_slice"));
-        }
-        // Non-array 2D/1D: only slice 0.
-        if !texture_view_type_uses_slices(view_type)
-            && !texture_view_type_is_3d(view_type)
-            && abs_slice != 0
-        {
-            return Err(br(BlitStatus::Unsupported, "view_2d_slice"));
+        if let Some(view_type) = view.texture_type {
+            if texture_view_type_is_3d(view_type) && abs_slice != 0 {
+                return Err(br(BlitStatus::Unsupported, "view_3d_slice"));
+            }
+            // Non-array 2D/1D: only slice 0.
+            if !texture_view_type_uses_slices(view_type)
+                && !texture_view_type_is_3d(view_type)
+                && abs_slice != 0
+            {
+                return Err(br(BlitStatus::Unsupported, "view_nonarray_slice"));
+            }
         }
         let mut backing = resolve_texture_backing_depth(
             state,
@@ -850,8 +812,8 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
             },
         )?;
         // Geometry constraints for non-2D types.
-        match &backing {
-            TextureBacking::Linear(t) => {
+        match (&backing, view.texture_type) {
+            (TextureBacking::Linear(t), Some(view_type)) => {
                 if matches!(
                     view_type,
                     crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_1D
@@ -861,7 +823,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
                     return Err(br(BlitStatus::Unsupported, "view_1d_height"));
                 }
             }
-            TextureBacking::Surface(_) => {
+            (TextureBacking::Surface(_), Some(view_type)) => {
                 // Metal forbids mipmapped / multi-slice IOSurface textures; see
                 // IOSurfaceTextureBacking. Fail closed rather than inventing layout.
                 if abs_level != 0 || abs_slice != 0 {
@@ -871,9 +833,10 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
                     return Err(br(BlitStatus::Unsupported, "view_iosurface_type"));
                 }
             }
+            _ => {}
         }
         // View pixel_format overrides base when bpp-compatible.
-        if let Some(declared) = view.declared_pixel_format() {
+        if let Some(declared) = view.pixel_format {
             let base_fmt = backing.pixel_format();
             let eff = draw::effective_view_sample_format(base_fmt, Some(declared))
                 .ok_or_else(|| br(BlitStatus::Unsupported, "view_fmt_incompat"))?;
@@ -1104,54 +1067,56 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         ));
         return Err(br(BlitStatus::Bounds, "tex_zero_geom"));
     }
-    // Array-slice packing: contiguous images at this mip
-    // (row_stride × height × planes). `TextureLevelLayout` owns both the packing
-    // and the "depth 0 means one plane" encoding; this used to normalize the
-    // depth here and hand it to a helper that normalized it again.
-    // Prefer level.size when it is an exact multiple of one-slice bytes (multi-slice alloc).
-    let one_slice = layout
-        .slice_stride()
-        .ok_or_else(|| br(BlitStatus::Capacity, "tex_slice_stride"))?;
-    if slice != 0 {
-        // Bounds: selected slice must fit in allocation when known.
-        // Live x86 buffer→texture (opcode 0x12c) uses slice=1,2 with
-        // size=16384x1x1 at off=64K/128K — array packing into one allocation
-        // even when the L0 level record's `size` equals one_slice. Prefer
-        // allocation_size over the level-size single-slice reject.
-        //
-        // The selected slice is charged the bytes it is *read* through, not a
-        // whole `one_slice` stride: `texel_offset` walks rows and planes and
-        // the trailing padding after the final row is never touched. Charging
-        // it refuses allocations sized exactly for the array — see
-        // `TextureLevelLayout::slice_read_span`.
-        let tight_row = pixel_format::tight_row_bytes(layout.width, declared_format)
-            .ok_or_else(|| br(BlitStatus::Unsupported, "tex_slice_tight_row"))?;
-        let slice_read = layout
-            .slice_read_span(tight_row)
-            .ok_or_else(|| br(BlitStatus::Bounds, "tex_slice_read_span"))?;
-        let slice_end = (slice as u64)
-            .checked_mul(one_slice)
-            .and_then(|o| o.checked_add(level_offset))
-            .and_then(|o| o.checked_add(slice_read))
-            .ok_or_else(|| br(BlitStatus::Bounds, "tex_slice_overflow"))?;
-        if tex.allocation_size != 0 && slice_end > tex.allocation_size {
-            crate::observe::fail(format!(
-                "blit tex slice Bounds slice={slice} end={slice_end} alloc={} one_slice={one_slice} lvl_off={level_offset}",
-                tex.allocation_size
-            ));
-            return Err(br(BlitStatus::Bounds, "tex_slice_bounds"));
-        }
-        if tex.allocation_size == 0 && layout.size != 0 && layout.size == one_slice && slice != 0 {
-            // Unknown alloc and level size covers a single slice only.
-            return Err(br(BlitStatus::Bounds, "tex_slice_single"));
-        }
+    let declaration = tex
+        .declaration
+        .ok_or_else(|| br(BlitStatus::Unsupported, "tex_no_declaration"))?;
+    let storage_type = u16::from(declaration.texture_type);
+    let is_cube = matches!(
+        storage_type,
+        crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_CUBE
+            | crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_CUBE_ARRAY
+    );
+    if tex.slice_count != u32::from(declaration.array_length)
+        || tex.cube_faces != is_cube
+        || !tex.declared_packing_fits_allocation()
+        || !tex.level_fits_slice(layout)
+    {
+        return Err(br(BlitStatus::Unsupported, "tex_packing_mismatch"));
+    }
+    let arrayed = matches!(
+        storage_type,
+        crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_1D_ARRAY
+            | crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_2D_ARRAY
+            | crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_CUBE
+            | crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_CUBE_ARRAY
+    );
+    let physical_slices = tex
+        .physical_slice_count()
+        .ok_or_else(|| br(BlitStatus::Bounds, "tex_slice_count_overflow"))?;
+    if (!arrayed && slice != 0) || u32::from(slice) >= physical_slices {
+        return Err(br(BlitStatus::Bounds, "tex_slice_bounds"));
+    }
+    let slice_stride = if arrayed { tex.bytes_per_slice } else { 0 };
+    let tight_row = pixel_format::tight_row_bytes(layout.width, declared_format)
+        .ok_or_else(|| br(BlitStatus::Unsupported, "tex_slice_tight_row"))?;
+    let slice_read = layout
+        .slice_read_span(tight_row)
+        .ok_or_else(|| br(BlitStatus::Bounds, "tex_slice_read_span"))?;
+    let slice_start = tex
+        .subresource_offset(u32::from(slice), u32::from(level))
+        .ok_or_else(|| br(BlitStatus::Bounds, "tex_slice_offset"))?;
+    let slice_end = slice_start
+        .checked_add(slice_read)
+        .ok_or_else(|| br(BlitStatus::Bounds, "tex_slice_overflow"))?;
+    if slice_end > tex.allocation_size {
+        return Err(br(BlitStatus::Bounds, "tex_slice_bounds"));
     }
     Ok(TextureBacking::Linear(LinearTextureLevel {
         base_gva,
         alloc_size: tex.allocation_size,
         level_offset,
         row_stride: layout.row_stride,
-        slice_stride: one_slice,
+        slice_stride,
         slice_index: slice as u32,
         width: layout.width,
         height: layout.height,
@@ -1929,9 +1894,9 @@ fn execute_resolved_blit<M: HostMemory + HostOps>(
         ResolvedSubmission::<(), ()>::single(context, ResolvedCommand::Blit(Box::new(operation)));
     let completion = reims_vgpu_core::execute_resolved_submission(
         submission,
-        |()| -> Result<CommandExecution<()>, BlitStatus> { unreachable!() },
-        |()| -> Result<CommandExecution<()>, BlitStatus> { unreachable!() },
-        |operation| {
+        |_, ()| -> Result<CommandExecution<()>, BlitStatus> { unreachable!() },
+        |_, ()| -> Result<CommandExecution<()>, BlitStatus> { unreachable!() },
+        |_, operation| {
             match operation {
                 ResolvedBlit::Fill {
                     destination,
@@ -1993,7 +1958,7 @@ fn execute_resolved_blit<M: HostMemory + HostOps>(
                 },
             ))
         },
-        |_| -> Result<CommandExecution<_>, BlitStatus> { unreachable!() },
+        |_, _| -> Result<CommandExecution<_>, BlitStatus> { unreachable!() },
     );
     match completion {
         Ok(completion)

@@ -84,7 +84,7 @@ use std::slice;
 /// [[host-window]]). The symbol is always present; when the staticlib was built
 /// without the `host-window` feature it returns `REIMS_VGPU_QEMU_ERR_STATE` so the C
 /// shim falls back to QEMU's own display.
-pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 19;
+pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 20;
 
 #[repr(C)]
 pub struct ReimsVgpuQemuCreateInfo {

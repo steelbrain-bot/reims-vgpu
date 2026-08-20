@@ -79,34 +79,16 @@ fn translate_words(name: &str, stage: Stage) -> Vec<u32> {
     assert!(path.exists(), "missing reims-vgpu AIR fixture: {name}");
     let spv = metal2vulkan::translate(path.to_str().unwrap(), stage, &tmp)
         .unwrap_or_else(|e| panic!("translate {name}: {e}"));
-    let mut words: Vec<u32> = spv
+    let words: Vec<u32> = spv
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
-    // The translator emits its own narrow bands; the device uses wider ones so
-    // the texture band can hold Metal's whole 128-entry argument table. In the
-    // product every translation reaches the engine through
-    // `m2v_cache::CachedShader::new`, which applies this once per shader. This
-    // helper calls the translator directly, so it has to apply it too — without
-    // this the module says binding 96 for a framebuffer-fetch input while the
-    // engine binds the input attachment at 192, and the shader reads zero.
-    reims_vgpu_vulkan::spirv_bind::widen_sampled_bands(&mut words);
     words
 }
 
 /// The device binding number for sampler `index`.
 ///
-/// `translate_words` widens the translator's bands, which moves a sampler out of
-/// metal2vulkan's `[64,96)` into this device's `[160,192)`. A request that keeps
-/// naming the pre-widen number provides a sampler at a binding the widened
-/// module does not use, and leaves the binding it *does* use absent from the
-/// descriptor set layout — so the fragment shader sampled through a descriptor
-/// nothing wrote. That was silent until `exec::used_binding_absent_from_layout`
-/// landed and started refusing the draw by name.
-///
-/// Derived from the constant rather than spelled, so the two cannot drift again.
-/// The texture band needs no such helper: `TEXTURE_BINDING_BASE` *is*
-/// metal2vulkan's texture base, so widening leaves a texture where it was.
+/// Derived from metal2vulkan's selected default layout rather than spelled.
 fn sampler_binding(index: u32) -> u32 {
     reims_vgpu_vulkan::spirv_bind::SAMPLER_BINDING_BASE + index
 }
@@ -1459,10 +1441,9 @@ fn resident_sample_alias_uses_native_feedback_or_snapshot_fallback() {
         delta.sampled_gpu_binds, 2,
         "GPU resident-bind proxy: {delta:?}"
     );
-    let expected_snapshot_allocs = u64::from(!engine::attachment_feedback_loop_active());
     assert_eq!(
-        delta.sampled_free_allocs, expected_snapshot_allocs,
-        "two bindings share one snapshot only on a host without feedback-loop support: {delta:?}"
+        delta.sampled_free_allocs, 1,
+        "two bindings share one stable pre-draw snapshot: {delta:?}"
     );
     assert_eq!(delta.sampled_reuploads, 0, "no host reupload: {delta:?}");
     assert_eq!(
@@ -2289,31 +2270,20 @@ fn reflected_static_sampler_descriptor_samples_texture() {
     let (frag, reflection) =
         metal2vulkan::translate_reflected(air.to_str().unwrap(), Stage::Fragment, &tmp)
             .expect("translate static sampler fixture");
-    let mut frag = frag
+    let frag = frag
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect::<Vec<_>>();
-    assert_eq!(
-        reims_vgpu_vulkan::spirv_bind::widen_sampled_bands(&mut frag),
-        1,
-        "fixture has one sampler in the translator's narrow tail band"
-    );
-    assert_eq!(
-        reims_vgpu_vulkan::spirv_bind::offset_fragment_sampled_resource_bindings(&mut frag),
-        2,
-        "fixture has one sampled image and one constexpr sampler"
-    );
     let reflected = reflection
         .bindings
         .iter()
         .find(|binding| binding.kind == ResourceKind::StaticSampler)
         .expect("reflected constexpr sampler");
     reflected.descriptor.expect("static sampler descriptor");
-    let descriptor =
-        reims_vgpu_vulkan::spirv_bind::reflected_sampler_descriptors(&reflection, true)
-            .into_iter()
-            .find(|descriptor| descriptor.static_state.is_some())
-            .expect("semantic constexpr sampler descriptor");
+    let descriptor = reims_vgpu_vulkan::spirv_bind::reflected_sampler_descriptors(&reflection)
+        .into_iter()
+        .find(|descriptor| descriptor.static_state.is_some())
+        .expect("semantic constexpr sampler descriptor");
     let state = descriptor.static_state.expect("static sampler state");
 
     let (w, h) = (16u32, 16u32);
@@ -2350,8 +2320,15 @@ fn reflected_static_sampler_descriptor_samples_texture() {
         content: encode_f32(&uvs.into_iter().flatten().collect::<Vec<_>>()).into(),
     });
     let rgba = [17u8, 91, 203, 255];
+    let texture_binding = reflection
+        .bindings
+        .iter()
+        .find(|binding| binding.kind == ResourceKind::Texture)
+        .and_then(|binding| binding.descriptor)
+        .expect("reflected sampled texture")
+        .binding;
     req.sampled_images.push(SampledImageResource {
-        binding: 32 + reims_vgpu_vulkan::spirv_bind::FRAG_SAMPLED_RESOURCE_BINDING_OFFSET,
+        binding: texture_binding,
         array_element: 0,
         descriptor_count: 1,
         width: 2,
@@ -2766,7 +2743,7 @@ fn partial_draw_preserves_a_native_guest_target_seed() {
     let mut req = engine_req(&vert, &frag, w, h);
     req.target_identity = Some(identity.clone());
     req.skip_readback = true;
-    req.target_guest_seed = Some(engine::GuestTargetSeed {
+    req.target_guest = Some(engine::GuestTargetPlan::Seed(engine::GuestTargetSeed {
         source: engine::GuestRunSource {
             runs: std::sync::Arc::new(vec![engine::GuestRun {
                 host_ptr: backing.as_ptr() as usize,
@@ -2776,9 +2753,10 @@ fn partial_draw_preserves_a_native_guest_target_seed() {
             total_len: backing.len() as u64,
             row_length_texels: 0,
             pages: None,
+            physical_pages: None,
         },
         format: reims_vgpu_protocol::TexelLayout::Bgra8,
-    });
+    }));
     req.scissors = vec![ScissorResource {
         x: 0,
         y: 0,
@@ -3631,12 +3609,13 @@ fn mrt_secondary_attachment_becomes_sampleable_resident() {
     let mut mrt = engine_req(&v, &f, 16, 16);
     mrt.target_identity = Some(primary.clone());
     mrt.secondary_targets.push(SecondaryColorTarget {
+        target_guest: None,
         identity: secondary.clone(),
         width: 16,
         height: 16,
         format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
         clear: [0.0, 0.0, 1.0, 1.0],
-        load: false,
+        load_action: reims_vgpu_core::ColorLoadAction::Clear,
         // Unblended: this parity case checks the attachment is written at
         // all, not how it composites.
         blend: None,
@@ -3724,6 +3703,7 @@ fn mrt_rg16float_secondary_builds_and_renders() {
     let mut mrt = engine_req(&v, &f, 32, 32);
     mrt.target_identity = Some(primary.clone());
     mrt.secondary_targets.push(SecondaryColorTarget {
+        target_guest: None,
         identity: mask.clone(),
         width: 32,
         height: 32,
@@ -3731,7 +3711,7 @@ fn mrt_rg16float_secondary_builds_and_renders() {
             reims_vgpu_protocol::TexelLayout::Rg16Float,
         ),
         clear: [1.0, 0.5, 0.0, 0.0],
-        load: false,
+        load_action: reims_vgpu_core::ColorLoadAction::Clear,
         // Unblended: this is the vibrancy coverage-mask shape, and a mask is a
         // raw store. Which is exactly why every secondary used to be forced
         // unblended — one real case generalized into a rule for all of them.
@@ -3793,6 +3773,7 @@ fn depth_and_mrt_secondary_render_in_one_pass() {
         let mut req = engine_req(&v, &f, w, h);
         req.target_identity = Some(primary);
         req.secondary_targets.push(SecondaryColorTarget {
+            target_guest: None,
             identity: secondary.clone(),
             width: w,
             height: h,
@@ -3800,7 +3781,7 @@ fn depth_and_mrt_secondary_render_in_one_pass() {
                 reims_vgpu_protocol::TexelLayout::Rgba8,
             ),
             clear: [0.0, 0.0, 1.0, 1.0],
-            load: false,
+            load_action: reims_vgpu_core::ColorLoadAction::Clear,
             blend: None,
             color_write_mask: Default::default(),
         });

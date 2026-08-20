@@ -583,6 +583,7 @@ fn batched_guest_runs_buffer_snapshots_at_record() {
             total_len: backing.len() as u64,
             row_length_texels: 0,
             pages: None,
+            physical_pages: None,
         }),
     });
     match engine::execute_draw_request(&opener) {
@@ -744,6 +745,7 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
                 total_len: 16,
                 row_length_texels: 0,
                 pages: None,
+                physical_pages: None,
             },
             // A fixture over a host `Vec` went through no witness, so the gather is
             // the only disposition available to it.
@@ -756,7 +758,9 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
         resource_lifetime: None,
         swizzle: Default::default(),
     });
-    req.samplers.push(SamplerResource::normalized_default(64));
+    req.samplers.push(SamplerResource::normalized_default(
+        reims_vgpu_vulkan::spirv_bind::SAMPLER_BINDING_BASE,
+    ));
 
     let outcome = engine::execute_draw_request(&req);
     if let Err(e) = &outcome {
@@ -905,6 +909,7 @@ fn a_scattered_guest_buffer_window_is_gathered_by_the_gpu_in_one_region_per_stre
             total_len: STRETCH * 3,
             row_length_texels: 0,
             pages: Some(std::sync::Arc::new(pages)),
+            physical_pages: None,
         }),
     });
     engine::execute_draw_request(&req).expect("the gathered draw");
@@ -1130,6 +1135,7 @@ void main() {{
             total_len: STRETCH * 3,
             row_length_texels: 0,
             pages: Some(std::sync::Arc::new(pages)),
+            physical_pages: None,
         }),
     });
     engine::execute_draw_request(&req).expect("the gathered draw");
@@ -1309,6 +1315,7 @@ void main() {{
             total_len: STRETCH * RUNS,
             row_length_texels: 0,
             pages: Some(std::sync::Arc::new(pages)),
+            physical_pages: None,
         }),
     });
     engine::execute_draw_request(&req).expect("the fallback draw");
@@ -1454,6 +1461,7 @@ void main() {{
             total_len: WINDOW,
             row_length_texels: 0,
             pages: Some(std::sync::Arc::new(pages)),
+            physical_pages: None,
         }),
     });
     engine::execute_draw_request(&req).expect("the directly bound draw");
@@ -1560,6 +1568,7 @@ fn an_index_window_binds_its_retained_guest_import() {
         total_len: INDEX_BYTES,
         row_length_texels: 0,
         pages: Some(std::sync::Arc::new(pages)),
+        physical_pages: None,
     };
 
     let before = engine::counter_snapshot();

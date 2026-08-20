@@ -27,6 +27,7 @@ mod facade_decline;
 mod guest_scatter;
 mod host_ram;
 pub mod init_decline;
+mod linear_image_import;
 mod pools;
 mod queue_owner;
 mod scatter_shader;
@@ -66,15 +67,15 @@ pub use types::{
     ComputeImageResult, ComputeOutput, ComputeRequest, ComputeResidentSampleBind,
     ComputeSampledImageResource, ComputeSampledImageSource, ComputeStorageImageResource,
     ComputeStorageImageSeed, ComputeStorageResidency, CullMode, DepthClipMode, DepthState,
-    DrawError, DrawOutput, DrawRequest, FillMode, GuestRun, GuestRunSource, GuestTargetBacking,
-    GuestTargetMemory, GuestTargetSeed, IndexType, IndexedDrawResource, PrimitiveTopology,
-    SampledByteOrigin, SampledContentIdentity, SampledImageResource, SampledSource,
-    SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter,
-    SamplerMipFilter, SamplerResource, ScissorResource, SecondaryColorTarget, SeedOrder,
-    StencilFaceOps, StencilOp, StencilState, StorageBufferResource, StorageImageFormat,
-    TargetIdentity, TargetKeyDivergence, VertexAttributeFormat, VertexAttributeResource,
-    VertexStepFunction, ViewportResource, VisibilityResultMode, WindowPresentSource,
-    COLOR_INPUT_BINDING,
+    DrawError, DrawOutput, DrawRequest, FillMode, GuestImageSource, GuestRun, GuestRunSource,
+    GuestTargetBacking, GuestTargetMemory, GuestTargetPlan, GuestTargetSeed, IndexType,
+    IndexedDrawResource, PrimitiveTopology, SampledByteOrigin, SampledContentIdentity,
+    SampledImageResource, SampledSource, SamplerAddressMode, SamplerBorderColor,
+    SamplerCompareFunction, SamplerFilter, SamplerMipFilter, SamplerResource, ScissorResource,
+    SecondaryColorTarget, SeedOrder, StencilFaceOps, StencilOp, StencilState,
+    StorageBufferResource, StorageImageFormat, TargetIdentity, TargetKeyDivergence,
+    VertexAttributeFormat, VertexAttributeResource, VertexStepFunction, ViewportResource,
+    VisibilityResultMode, WindowPresentSource, COLOR_INPUT_BINDING,
 };
 pub(crate) use vk_call::{VkCall, VkOp};
 #[cfg(feature = "host-window")]
@@ -92,7 +93,7 @@ use std::sync::{Arc, Weak};
 use types::ComputeError;
 
 /// One vGPU's guest-derived namespace inside the shared physical context.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SessionId(u64);
 
 impl SessionId {
@@ -552,6 +553,9 @@ impl EngineState {
                     session.window_presenter = None;
                 }
             }
+            for session in &inactive_sessions {
+                clear_guest_write_pages_for(&session.signals);
+            }
         }
         self.pools = ResourcePools::new();
         self.indexes = SessionCacheIndexes::new();
@@ -640,10 +644,15 @@ mod session_slot_tests {
             let _first = enter_session(&first);
             publish_batch_open(true);
             assert!(current_session_signals().batch_open.load(Ordering::Acquire));
+            assert!(
+                completion_work_outstanding(),
+                "an accepted but unsubmitted draw must keep its completion word behind Vulkan"
+            );
         }
         {
             let _second = enter_session(&second);
             assert!(!current_session_signals().batch_open.load(Ordering::Acquire));
+            assert!(!completion_work_outstanding());
             publish_batch_open(true);
         }
         let _first = enter_session(&first);
@@ -1247,6 +1256,7 @@ pub fn reset_guest_state() -> GuestResetStats {
         }
     }
     *pools = ResourcePools::new();
+    clear_guest_write_pages();
     reims_vgpu_observe::off(format!(
         "vulkan_guest_reset resident={} pooled_targets={} sampled={} storage={} context={}",
         stats.resident_targets,
@@ -1297,6 +1307,7 @@ pub fn window_present_resize(width: u32, height: u32) {
 /// nonblocking, so a vblank wait never holds `ENGINE`.
 #[cfg(feature = "host-window")]
 pub fn window_present_frame(
+    offered_seq: Option<u64>,
     source: Option<&WindowPresentSource>,
     cpu: Option<WindowCpuFrame<'_>>,
 ) -> Result<WindowPresentOutcome, DrawError> {
@@ -1313,7 +1324,7 @@ pub fn window_present_frame(
         let presenter = window_presenter.as_mut().ok_or(DrawError::Facade(
             EngineFacadeDecline::WindowPresenterNotAttached,
         ))?;
-        unsafe { presenter.begin_present(ctx, pools, counters, source, cpu) }?
+        unsafe { presenter.begin_present(ctx, pools, counters, offered_seq, source, cpu) }?
     };
     let out = match dispatch {
         window_present::WindowPresentDispatch::Complete(out) => Ok(out),
@@ -1368,6 +1379,19 @@ pub fn window_present_detach() {
 
 /// Execute one draw against the persistent engine.
 pub fn execute_draw_request(req: &DrawRequest) -> Result<DrawOutput, DrawError> {
+    execute_draw_request_in_submission(&reims_vgpu_core::SubmissionContext::standalone(0), req)
+}
+
+/// Execute one draw with the decoded command-stream envelope that owns it.
+///
+/// The submission is execution state rather than a property of the draw. It
+/// therefore crosses this facade separately instead of being copied into
+/// [`DrawRequest`] and becoming another identity callers can accidentally
+/// omit or disagree about.
+pub fn execute_draw_request_in_submission(
+    _submission: &reims_vgpu_core::SubmissionContext,
+    req: &DrawRequest,
+) -> Result<DrawOutput, DrawError> {
     exec::validate_v1(req)?;
     let vertex =
         crate::m2v_cache::resolve_prepared_shader(req.program.vertex.id).ok_or_else(|| {
@@ -1567,102 +1591,125 @@ mod end_of_tranche_gate_tests {
 ///
 /// [`GuestRef`]: reims-vgpu::runtime::guest_ram_map::GuestRef
 ///
-/// # How many writebacks are named, and what happens past that
-///
-/// One destination's page list per armed-and-unsettled writeback, up to
-/// `pools::RING_DEPTH` of them. The bound is the submission ring's, because that is
-/// what bounds writebacks in flight: a ninth submission blocks in `begin_entry`
-/// on the oldest fence rather than being recorded.
-///
-/// **The two drift, and overflow is routine.** The outstanding-write signal is cleared
-/// only by an actual settle, never by the ring retiring a fence on its own, so
-/// an entry outlives the copy it names for as long as nothing blocks. A single
-/// entry measured `gwdebt_unnamed` 14 125 against 16 626 arms; the ring's worth
-/// still measured **3 499** overflows on a driven Safari-drag boot, and each one
-/// made every subsequent reader settle globally until the next clear —
-/// `settle_linear_memo_read_unnamed` 3 402 of that boot's 4 036 memo waits, at
-/// ~200 ms of blocking per second of drag.
-///
-/// So overflow is a **merge**, not a surrender: the ninth arm folds into the
-/// oldest entry and the ledger keeps naming every page it holds. A union of two
-/// destination page lists is exactly the set of pages both copies land in, so
-/// nothing is lost but the ability to retire one of them individually — and
-/// nothing retires individually, because [`clear_guest_write_pages`] clears all
-/// of them at once.
-///
-/// **Never by dropping an entry**: a footprint missing a page it holds would
-/// answer "disjoint" for a page a copy is landing in, which is a stale frame
-/// served as fresh. Merging is the opposite direction — it can only turn a
-/// `Disjoint` into an `Overlap`, never the reverse.
+/// There is one entry per exact page set in a recording command buffer. Writes
+/// to the same set in one batch share the same submission and retirement point,
+/// so duplicating the entry would add reference counts without expressing
+/// another lifetime. `seal_entry` transfers each token into the ring slot and
+/// `drain_cleanup` removes it after that slot's fence signals. An open batch
+/// owns its tokens before submission, so a completion request sees the debt and
+/// flushes the batch before waiting.
 ///
 /// # Ordering
 ///
-/// Armed under the engine lock immediately before the outstanding-write signal is
-/// published, and cleared under the same lock immediately after it is cleared,
-/// so a reader that observes the flag set observes a footprint that already
-/// names the write, and a reader that observes it clear needs nothing. Readers
-/// take only this mutex and never the engine lock — taking that at every guest
-/// read is the cost the flag exists to avoid.
-/// The page lists behind one session's guest-write signal.
+/// Armed under the engine lock before the outstanding-write signal is
+/// published. Retirement removes the token before clearing the signal for the
+/// last entry, so a reader that observes `false` needs nothing. Readers take
+/// only this mutex and never the engine lock.
+/// Identity of one recorded guest-memory write. Its submission's ring cleanup
+/// retires the token after the corresponding fence signals.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(super) struct GuestWriteToken {
+    session: SessionId,
+    serial: u64,
+}
+
+/// The page sets behind one session's guest-write signal.
 #[derive(Default)]
 struct GuestWriteFootprint {
-    /// One entry per outstanding writeback, each ascending and deduplicated.
-    /// Sorted at arm time — armed thousands of times a boot and asked tens of
-    /// thousands, so the ordering is paid on the rarer side and every ask is a
-    /// binary search.
-    ///
-    /// Kept as separate lists rather than merged into one, so a settle could
-    /// retire them individually later without re-deriving which page belonged to
-    /// which copy. Never longer than `pools::RING_DEPTH`; past that, an arm folds
-    /// into entry zero, which gives up exactly that future retirement and
-    /// nothing else.
-    ///
-    /// There is no "gave up naming" flag beside this any more. It existed for
-    /// the overflow that is now a merge, and the only other way to lose the
-    /// ledger — a poisoned mutex — already answers `Unnamed` at every ask
-    /// without one.
-    armed: Vec<Vec<u64>>,
+    next: u64,
+    unnamed: bool,
+    /// One immutable, canonical page set per recorded write. Entries live for
+    /// the command buffer's real fence lifetime, so there is no capacity policy
+    /// and no overflow merge standing in for submission ownership.
+    armed: std::collections::BTreeMap<GuestWriteToken, reims_vgpu_memory::GuestWritePages>,
+    /// Exact membership of every page named by `armed`, with a reference count
+    /// because independent in-flight writes may target the same page.
+    page_counts: std::collections::HashMap<u64, usize>,
 }
 
 pub use reims_vgpu_core::GuestWriteReach;
 
-/// Record the guest pages a writeback about to be submitted will land in.
+/// Record the guest pages a command buffer will write and return the ownership
+/// token its ring entry must retire.
 ///
 /// Called under the engine lock, beside the outstanding-write publish.
-fn arm_guest_write_pages(pages: &[u64]) {
-    let signals = current_session_signals();
+fn arm_guest_write_pages(pages: reims_vgpu_memory::GuestWritePages) -> Option<GuestWriteToken> {
+    let session = current_session_handle();
+    let signals = session.signals();
     let Ok(mut f) = signals.guest_write_pages.lock() else {
-        // A poisoned lock means nothing is recorded, and it stays poisoned, so
-        // `guest_writes_reaching` answers `Unnamed` for the rest of the boot.
-        // That is the safe direction and needs no flag here.
+        signals.guest_write_debt.store(true, Ordering::Release);
+        return None;
+    };
+    let Some(next) = f.next.checked_add(1) else {
+        f.unnamed = true;
+        signals.guest_write_debt.store(true, Ordering::Release);
+        return None;
+    };
+    f.next = next;
+    let token = GuestWriteToken {
+        session: session.id(),
+        serial: f.next,
+    };
+    for &page in pages.pages() {
+        *f.page_counts.entry(page).or_default() += 1;
+    }
+    f.armed.insert(token, pages);
+    signals.guest_write_debt.store(true, Ordering::Release);
+    Some(token)
+}
+
+/// Retire exactly the writes owned by one signalled ring entry.
+fn retire_guest_write_pages(tokens: &[GuestWriteToken]) {
+    let Some(first) = tokens.first() else {
         return;
     };
-    let mut sorted = pages.to_vec();
-    sorted.sort_unstable();
-    sorted.dedup();
-    // At the entry cap, fold into the oldest rather than give up naming. The
-    // `first_mut` cannot be `None` there — `RING_DEPTH` is non-zero — but the
-    // fallthrough is a push rather than an `expect`, because the only thing a
-    // panic here would protect is a bound this function does not own.
-    if f.armed.len() >= pools::RING_DEPTH {
-        if let Some(oldest) = f.armed.first_mut() {
-            oldest.extend_from_slice(&sorted);
-            oldest.sort_unstable();
-            oldest.dedup();
-            crate::telemetry::note_route("gwdebt_merged");
-            return;
+    let session = LIVE_SESSIONS
+        .lock()
+        .get(&first.session)
+        .and_then(Weak::upgrade);
+    let Some(session) = session else {
+        return;
+    };
+    let signals = Arc::clone(&session.signals);
+    let Ok(mut f) = signals.guest_write_pages.lock() else {
+        return;
+    };
+    for token in tokens {
+        debug_assert_eq!(token.session, first.session);
+        if token.session != first.session {
+            continue;
+        }
+        if let Some(pages) = f.armed.remove(token) {
+            for &page in pages.pages() {
+                let remove = f.page_counts.get_mut(&page).is_some_and(|count| {
+                    *count -= 1;
+                    *count == 0
+                });
+                if remove {
+                    f.page_counts.remove(&page);
+                }
+            }
         }
     }
-    f.armed.push(sorted);
+    signals
+        .guest_write_debt
+        .store(f.unnamed || !f.armed.is_empty(), Ordering::Release);
 }
 
 /// Forget the outstanding writebacks' pages. Called under the engine lock, after
 /// the wait has landed and the outstanding-write signal is cleared.
 fn clear_guest_write_pages() {
     let signals = current_session_signals();
+    clear_guest_write_pages_for(&signals);
+}
+
+fn clear_guest_write_pages_for(signals: &SessionSignals) {
     if let Ok(mut f) = signals.guest_write_pages.lock() {
         f.armed.clear();
+        f.page_counts.clear();
+        f.unnamed = false;
     };
+    signals.guest_write_debt.store(false, Ordering::Release);
 }
 
 /// What the ledger can say about `pages` — see [`GuestWriteReach`].
@@ -1674,6 +1721,17 @@ fn clear_guest_write_pages() {
 /// `pages` need not be sorted; it is the reader's window and is usually a
 /// handful of entries against a whole frame's worth here.
 pub fn guest_writes_reaching(pages: &[u64]) -> GuestWriteReach {
+    guest_writes_reaching_sets(std::iter::once(pages))
+}
+
+/// Compare several read windows with the write ledger under one lock.
+///
+/// A draw commonly reads many guest-backed descriptors. Treating them as one
+/// question avoids both a per-descriptor lock and an allocated union while
+/// preserving exact physical-page membership.
+pub fn guest_writes_reaching_sets<'a>(
+    sets: impl IntoIterator<Item = &'a [u64]>,
+) -> GuestWriteReach {
     let signals = current_session_signals();
     let Ok(f) = signals.guest_write_pages.lock() else {
         return GuestWriteReach::Unnamed;
@@ -1684,33 +1742,14 @@ pub fn guest_writes_reaching(pages: &[u64]) -> GuestWriteReach {
         // against, so nothing may be ruled out.
         return GuestWriteReach::Unnamed;
     }
-    // Span first, and the loop nesting is inverted for it. Asking "does any
-    // ledger entry hold page p" per page cannot short-circuit when the answer is
-    // `Disjoint`, so the verdict this test exists to produce is the one that
-    // pays the full product of both sides. Asking each entry "do you reach any
-    // of these pages" lets an entry whose span misses the reader's leave on two
-    // comparisons, and on this workload almost every entry does: a reader names
-    // one surface and the ledger holds unrelated ones.
-    //
-    // The span test is a narrowing of work and never of the verdict. Two spans
-    // that do not overlap cannot share a page, so a rejection here is exact; two
-    // that do overlap prove nothing and fall through to the per-page search.
-    let Some(lo) = pages.iter().min().copied() else {
-        // A reader naming no pages reads nothing, so nothing can reach it.
-        return GuestWriteReach::Disjoint;
-    };
-    let hi = pages.iter().max().copied().unwrap_or(lo);
-    let disjoint_span = |(a_lo, a_hi): (u64, u64)| a_hi < lo || a_lo > hi;
-    let hit = f.armed.iter().any(|a| {
-        // Ascending and deduplicated at arm time, so the span is the ends.
-        match (a.first(), a.last()) {
-            (Some(&a_lo), Some(&a_hi)) if !disjoint_span((a_lo, a_hi)) => {
-                pages.iter().any(|p| a.binary_search(p).is_ok())
-            }
-            _ => false,
-        }
-    });
-    if hit {
+    if f.unnamed {
+        return GuestWriteReach::Unnamed;
+    }
+    if sets
+        .into_iter()
+        .flatten()
+        .any(|page| f.page_counts.contains_key(page))
+    {
         GuestWriteReach::Overlap
     } else {
         GuestWriteReach::Disjoint
@@ -1756,15 +1795,14 @@ pub fn quiesce_guest_writes() {
             device_lost::note_device_lost_seen();
         }
         reims_vgpu_observe::Emit::decline("vk_guest_write_quiesce", &e).fail_once(0);
+        // The fence did not prove visibility, so the ledger remains armed. A
+        // later reader must not observe `false` and touch bytes the GPU may
+        // still own; reset/device teardown is the boundary that may abandon it.
+        return;
     }
-    // Cleared whether the wait succeeded or failed, for the reason
-    // `ResourcePools::quiesce_guest_writes` takes its own debt before waiting:
-    // the slot stays pending either way and the next claimant re-waits, so the
-    // ordering survives without every later settle re-running a failing wait.
-    signals.guest_write_debt.store(false, Ordering::Release);
-    // Under the same lock as the flag it accompanies, so no reader can see the
-    // flag set beside a footprint that has already been forgotten.
-    clear_guest_write_pages();
+    // Successful ring retirement drained every owning cleanup and therefore
+    // every token. The last retirement clears the lock-free summary.
+    debug_assert!(!signals.guest_write_debt.load(Ordering::Acquire));
     // Reported as `ReadbackPhase::Fence` because it *is* that phase — the same
     // block on the same fences, moved. Its count is now settles rather than
     // windows, which is the whole of what this change did to the rail, so
@@ -1798,6 +1836,21 @@ pub fn guest_access_outstanding() -> bool {
         .guest_read_debt
         .load(std::sync::atomic::Ordering::Acquire)
         || guest_writes_outstanding()
+}
+
+/// Whether a completion stamp has preceding executor work that still needs an
+/// ordering point.
+///
+/// Guest-memory debt covers submitted and recorded accesses whose bytes must
+/// remain live. An open draw batch is independently significant even when it
+/// touches only device-local resources: its commands have been accepted but
+/// have not been submitted, so publishing the guest's completion word would
+/// let the guest retire their resources before Vulkan has executed them.
+pub fn completion_work_outstanding() -> bool {
+    current_session_signals()
+        .batch_open
+        .load(std::sync::atomic::Ordering::Acquire)
+        || guest_access_outstanding()
 }
 
 /// Where one FIFO completion stamp obtained its ordering point.
@@ -1946,7 +1999,7 @@ pub fn write_completion_stamp(
     // The queued stamp now carries the ordering for every guest read recorded
     // before this submission. A later read records a fresh debt; retaining this
     // one would submit an otherwise empty stamp for every later CPU-only packet.
-    pools.take_guest_read_debt();
+    pools.settle_guest_read_debt();
     counters.gpu_stamps.fetch_add(1, Ordering::Relaxed);
     StampPointSource::from_route(had_batch, deferred).count(counters);
     Ok(())
@@ -2159,7 +2212,7 @@ pub fn prepare_window_resident_present(
     #[cfg(not(feature = "host-window"))]
     {
         let _ = (identity, width, height);
-        return Err(reims_vgpu_core::PresentDecline::WindowNotAttached);
+        Err(reims_vgpu_core::PresentDecline::WindowNotAttached)
     }
     #[cfg(feature = "host-window")]
     {
@@ -2257,10 +2310,17 @@ impl Drop for ResidentResourceLease {
 pub fn retain_resident_resource(identity: &TargetIdentity) -> Option<ResidentResourceLease> {
     let mut guard = lock_engine();
     let incarnation = guard.pools.retain_resident_target(identity)?;
+    let backing = guard
+        .pools
+        .registry_get(identity)
+        .map(|slot| {
+            classify_resident_content(slot.content_ready, slot.memory.guest_memory().is_some())
+        })
+        .unwrap_or(ResidentContentBacking::NotReady);
     let epoch_source = Arc::clone(&guard.resident_epoch);
     Some(ResidentResourceLease {
         identity: identity.clone(),
-        backing: ResidentContentBacking::DeviceAllocation,
+        backing,
         incarnation: Some(incarnation),
         epoch: epoch_source.load(Ordering::Acquire),
         epoch_source,
@@ -2268,11 +2328,16 @@ pub fn retain_resident_resource(identity: &TargetIdentity) -> Option<ResidentRes
     })
 }
 
-fn classify_resident_content(content_ready: bool) -> ResidentContentBacking {
-    if content_ready {
-        ResidentContentBacking::DeviceAllocation
-    } else {
+fn classify_resident_content(
+    content_ready: bool,
+    guest_allocation: bool,
+) -> ResidentContentBacking {
+    if !content_ready {
         ResidentContentBacking::NotReady
+    } else if guest_allocation {
+        ResidentContentBacking::GuestAllocation
+    } else {
+        ResidentContentBacking::DeviceAllocation
     }
 }
 
@@ -2281,20 +2346,24 @@ pub fn resident_content_backing(identity: &TargetIdentity) -> ResidentContentBac
     guard
         .pools
         .registry_get(identity)
-        .map(|slot| classify_resident_content(slot.content_ready))
+        .map(|slot| {
+            classify_resident_content(slot.content_ready, slot.memory.guest_memory().is_some())
+        })
         .unwrap_or(ResidentContentBacking::NotReady)
 }
 
 fn classify_resident_read(
-    resident: Option<(bool, Option<u32>)>,
+    resident: Option<(bool, bool, Option<u32>)>,
     absent_after_reclaim: Option<(reims_vgpu_core::ResidentReclaim, u64)>,
 ) -> reims_vgpu_core::ResidentReadPlan {
     match resident {
-        Some((content_ready, content_epoch)) => reims_vgpu_core::ResidentReadPlan {
-            backing: classify_resident_content(content_ready),
-            content_epoch,
-            absent_after_reclaim: None,
-        },
+        Some((content_ready, guest_allocation, content_epoch)) => {
+            reims_vgpu_core::ResidentReadPlan {
+                backing: classify_resident_content(content_ready, guest_allocation),
+                content_epoch,
+                absent_after_reclaim: None,
+            }
+        }
         None => reims_vgpu_core::ResidentReadPlan {
             backing: ResidentContentBacking::NotReady,
             content_epoch: None,
@@ -2308,7 +2377,14 @@ fn classify_resident_read(
 pub fn resident_read_plan(identity: &TargetIdentity) -> reims_vgpu_core::ResidentReadPlan {
     let guard = lock_engine();
     if let Some(slot) = guard.pools.registry_get(identity) {
-        return classify_resident_read(Some((slot.content_ready, slot.content_epoch)), None);
+        return classify_resident_read(
+            Some((
+                slot.content_ready,
+                slot.memory.guest_memory().is_some(),
+                slot.content_epoch,
+            )),
+            None,
+        );
     }
     let now = guard.pools.idle_clock_ms();
     classify_resident_read(
@@ -2329,13 +2405,17 @@ mod resident_content_backing_tests {
     use super::*;
 
     #[test]
-    fn ready_content_is_engine_owned() {
+    fn ready_content_names_its_allocation_owner() {
         assert_eq!(
-            classify_resident_content(true),
+            classify_resident_content(true, false),
             ResidentContentBacking::DeviceAllocation
         );
         assert_eq!(
-            classify_resident_content(false),
+            classify_resident_content(true, true),
+            ResidentContentBacking::GuestAllocation
+        );
+        assert_eq!(
+            classify_resident_content(false, true),
             ResidentContentBacking::NotReady
         );
     }
@@ -2343,7 +2423,7 @@ mod resident_content_backing_tests {
     #[test]
     fn resident_read_plan_never_combines_live_content_with_reclaim_history() {
         let reclaimed = Some((reims_vgpu_core::ResidentReclaim::AllocationReclaimed, 17));
-        let live = classify_resident_read(Some((true, Some(9))), reclaimed);
+        let live = classify_resident_read(Some((true, false, Some(9))), reclaimed);
         assert_eq!(live.backing, ResidentContentBacking::DeviceAllocation);
         assert_eq!(live.content_epoch, Some(9));
         assert_eq!(live.absent_after_reclaim, None);
@@ -2353,6 +2433,13 @@ mod resident_content_backing_tests {
         assert_eq!(absent.content_epoch, None);
         assert_eq!(absent.absent_after_reclaim, reclaimed);
     }
+}
+
+/// Record that the guest CPU wrote the canonical allocation imported by this
+/// resident, and arm the next GPU use with a host-write source dependency.
+pub fn note_resident_guest_write(identity: &TargetIdentity, epoch: u32) -> bool {
+    let mut guard = lock_engine();
+    guard.pools.registry_note_guest_write(identity, epoch)
 }
 
 /// Why this identity has no resident, when the reason is that this device
@@ -2487,6 +2574,18 @@ pub fn render_target_layout_supported(layout: reims_vgpu_protocol::TexelLayout) 
         return true;
     }
     device_capabilities().render_target_layout_supported(layout)
+}
+
+/// Stable backend admission for a pre-populated sampled image declaration.
+///
+/// Vulkan external images must start `UNDEFINED`, so binding an image directly
+/// over guest RAM cannot preserve texels written before image creation. The
+/// runtime therefore keeps the ordinary guest-page transfer description and
+/// the backend imports those pages as a buffer for the GPU-side image copy.
+pub fn sampled_guest_image_binding_requirement(
+    _request: reims_vgpu_memory::GuestImageBindingRequest,
+) -> Option<reims_vgpu_memory::GuestImageBindingDisposition> {
+    Some(reims_vgpu_memory::GuestImageBindingDisposition::Refused)
 }
 
 pub fn deferred_gpu_only_content_allowed() -> bool {
@@ -2629,7 +2728,7 @@ pub fn compute_resident_storage_generation(
 /// Generation + engine format of a resident compute storage image, if the
 /// engine holds one.
 ///
-/// Skip aid for the runtime's copy-on-sample gate: a sampled guest read is
+/// Skip aid for the runtime's resident-sample gate: a sampled guest read is
 /// skipped only when the generation matches the runtime's residency mirror
 /// AND the resident's vk format equals what the sampled view will bind (the
 /// engine's resident-bind path guards format equality and would fail the
@@ -2733,6 +2832,33 @@ pub fn supports_storage_image_write_without_format() -> bool {
                 .fail_once(EngineProbe::StorageWriteWithoutFormat.discriminant());
             false
         }
+    }
+}
+
+/// Exact Vulkan format and enabled feature facts consumed by metal2vulkan's
+/// runtime storage-image specialization.
+pub fn runtime_storage_image_capabilities(
+    format: reims_vgpu_protocol::StorageImageFormat,
+) -> metal2vulkan::reflect::RuntimeStorageImageCapabilities {
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref counters,
+        ..
+    } = &mut *guard;
+    let Ok(ctx) = owner.ensure(counters) else {
+        return metal2vulkan::reflect::RuntimeStorageImageCapabilities::default();
+    };
+    let features = unsafe {
+        ctx.instance
+            .get_physical_device_format_properties(ctx.pd, crate::format::vk_storage_image(format))
+    }
+    .optimal_tiling_features;
+    metal2vulkan::reflect::RuntimeStorageImageCapabilities {
+        storage_image: features.contains(ash::vk::FormatFeatureFlags::STORAGE_IMAGE),
+        storage_image_atomic: features.contains(ash::vk::FormatFeatureFlags::STORAGE_IMAGE_ATOMIC),
+        read_without_format: ctx.spirv_storage_read_without_format,
+        write_without_format: ctx.spirv_storage_write_without_format,
     }
 }
 
@@ -3164,7 +3290,7 @@ unsafe fn copy_image_level0_to_host_delivered(
         ctx.submit_queue_work(&cbs, &[], &[], &[], fence)
             .map_err(|e| DrawError::VkCall(VkCall::new(ops.submit, e)))?;
         let sealed = pools.seal_entry(Vec::new(), Vec::new());
-        pools.finish_entry_async(sealed, None);
+        pools.finish_entry_async(sealed, None, None);
     }
     // Split three ways rather than timed as a whole: the submit and the copy
     // scale with the surface, the fence does not scale with anything we control,
@@ -3529,7 +3655,9 @@ pub fn copy_target_to_guest_pages(
     // than guarding every early return above, because the whole body runs under
     // the engine lock and a reclaim needs the same lock: nothing can take the
     // image while this function is running, only after it returns.
-    record_guest_write_debt(pools, GuestWriteSource::ResidentTarget(identity), pages);
+    if let Some(pages) = reims_vgpu_memory::GuestWritePages::new(pages) {
+        record_guest_write_debt(pools, GuestWriteSource::ResidentTarget(identity), &pages);
+    }
     Ok(())
 }
 
@@ -3695,18 +3823,9 @@ pub(super) enum GuestWriteSource<'a> {
 pub(super) fn record_guest_write_debt(
     pools: &mut pools::ResourcePools,
     source: GuestWriteSource<'_>,
-    pages: &[u64],
+    pages: &reims_vgpu_memory::GuestWritePages,
 ) {
-    pools.note_guest_write_recorded(source);
-    // Before the flag and under the same lock: a reader that observes the flag
-    // set must observe a footprint that already names this write, or it would be
-    // told "disjoint" about pages this write is landing in.
-    arm_guest_write_pages(pages);
-    // Published after the ledger entry and while the engine lock is still held,
-    // so no thread can observe the flag clear while a write is outstanding.
-    current_session_signals()
-        .guest_write_debt
-        .store(true, std::sync::atomic::Ordering::Release);
+    pools.note_guest_write_pages_recorded(source, pages);
 }
 
 /// How one frame gets from a resident image into the guest's stretches.
@@ -4300,7 +4419,7 @@ unsafe fn copy_image_level0_to_buffer(
             .submit_guest_work(&cbs, fence)
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteSubmit, e)))?;
         let sealed = pools.seal_entry(Vec::new(), Vec::new());
-        pools.finish_entry_async(sealed, timeline);
+        pools.finish_entry_async(sealed, timeline, None);
     }
     note_readback_phase(
         ReadbackPhase::Submit,
@@ -4562,10 +4681,18 @@ pub fn warm_guest_ram_imports(
 /// level, flat is healthy, and a rise is the alarm. It is read every window
 /// rather than once at import time precisely because one line at import time
 /// cannot tell "imported once" from "imported once per window".
-pub fn guest_import_census() -> (u64, usize, usize) {
+pub fn guest_import_census() -> (u64, usize, usize, usize, usize, usize) {
     let guard = lock_engine();
-    let (ramblocks, aliases, bytes) = guard.pools.host_ram_import_census();
-    (bytes, ramblocks, aliases)
+    let (ramblocks, aliases, bytes, guest_images, live_guest_images, recycled_images) =
+        guard.pools.host_ram_import_census();
+    (
+        bytes,
+        ramblocks,
+        aliases,
+        guest_images,
+        live_guest_images,
+        recycled_images,
+    )
 }
 
 /// Ensure a device exists and report whether its host-pointer import rail can
@@ -5021,17 +5148,6 @@ pub fn batch_max_draws() -> u64 {
     lock_engine().pools.batch_capacity()
 }
 
-/// Whether the live Vulkan device can execute colour-attachment self-sampling
-/// through the attachment-feedback-loop contract. Tests use the answer to
-/// distinguish the native rail from its required snapshot fallback.
-pub fn attachment_feedback_loop_active() -> bool {
-    lock_engine()
-        .owner
-        .ctx
-        .as_ref()
-        .is_some_and(|ctx| ctx.features.attachment_feedback_loop_layout)
-}
-
 pub fn counter_snapshot() -> CounterSnapshot {
     let eng = lock_engine();
     let mut snap = eng.counters.snapshot();
@@ -5313,6 +5429,36 @@ mod group_by_buffer_tests {
 mod guest_write_footprint_tests {
     use super::*;
 
+    fn arm(pages: &[u64]) -> GuestWriteToken {
+        arm_guest_write_pages(
+            reims_vgpu_memory::GuestWritePages::new(pages).expect("non-empty page set"),
+        )
+        .expect("test ledger lock")
+    }
+
+    #[test]
+    fn imported_read_visibility_uses_exact_page_overlap() {
+        let session = SessionHandle::new(SessionId(10_003));
+        let _entered = enter_session(&session);
+        clear_guest_write_pages();
+        let token = arm(&[0x4000, 0x5000]);
+        let disjoint = reims_vgpu_memory::GuestPageSet::new(&[0x8000]).unwrap();
+        let overlap = reims_vgpu_memory::GuestPageSet::new(&[0x5000]).unwrap();
+        assert_eq!(
+            exec::imported_guest_visibility(&[Some(disjoint)]),
+            exec::ImportedGuestVisibility::HostOnly,
+        );
+        assert_eq!(
+            exec::imported_guest_visibility(&[Some(overlap)]),
+            exec::ImportedGuestVisibility::GpuOverlap,
+        );
+        assert_eq!(
+            exec::imported_guest_visibility(&[None]),
+            exec::ImportedGuestVisibility::GpuUnknown,
+        );
+        retire_guest_write_pages(&[token]);
+    }
+
     #[test]
     fn guest_access_signals_belong_to_the_device_session() {
         let first = SessionHandle::new(SessionId(10_001));
@@ -5320,10 +5466,7 @@ mod guest_write_footprint_tests {
         {
             let _first = enter_session(&first);
             clear_guest_write_pages();
-            arm_guest_write_pages(&[0x4000]);
-            current_session_signals()
-                .guest_write_debt
-                .store(true, Ordering::Release);
+            arm(&[0x4000]);
             assert!(guest_writes_outstanding());
             assert_eq!(guest_writes_reaching(&[0x4000]), GuestWriteReach::Overlap);
         }
@@ -5345,9 +5488,6 @@ mod guest_write_footprint_tests {
             assert!(!current_session_signals()
                 .guest_read_debt
                 .load(Ordering::Acquire));
-            current_session_signals()
-                .guest_write_debt
-                .store(false, Ordering::Release);
             clear_guest_write_pages();
         }
         LIVE_SESSIONS.lock().remove(&first.id());
@@ -5365,7 +5505,7 @@ mod guest_write_footprint_tests {
     #[test]
     fn a_disjoint_reader_is_let_through_and_a_touching_one_is_not() {
         clear_guest_write_pages();
-        arm_guest_write_pages(&[0x4000, 0x9000, 0x2000]);
+        arm(&[0x4000, 0x9000, 0x2000]);
         let reach = guest_writes_reaching;
         assert_eq!(reach(&[0x1000, 0x3000, 0xa000]), GuestWriteReach::Disjoint);
         assert_eq!(reach(&[0x1000, 0x9000]), GuestWriteReach::Overlap);
@@ -5382,7 +5522,7 @@ mod guest_write_footprint_tests {
     fn every_writeback_up_to_the_ring_is_named() {
         clear_guest_write_pages();
         for i in 0..pools::RING_DEPTH as u64 {
-            arm_guest_write_pages(&[0x1000 * (i + 1)]);
+            arm(&[0x1000 * (i + 1)]);
         }
         assert_eq!(guest_writes_reaching(&[0x1000]), GuestWriteReach::Overlap);
         assert_eq!(
@@ -5396,53 +5536,51 @@ mod guest_write_footprint_tests {
         clear_guest_write_pages();
     }
 
-    /// Past the entry cap the ledger keeps naming: the overflowing writeback
-    /// folds into the oldest entry instead of disabling the rail.
-    ///
-    /// Three assertions and each catches a different way to get this wrong.
-    /// **The overflowing page is named** — dropping the entry instead would
-    /// answer `Disjoint` for a page a copy is landing in, which is a stale frame
-    /// served as fresh. **The absorbing entry's own page is still named** — a
-    /// merge that overwrote rather than unioned would lose it just as quietly.
-    /// **A page nobody named is still `Disjoint`** — that is the whole point,
-    /// and it is what the old surrender got wrong 3 499 times on a driven boot,
-    /// each one making every later reader block globally.
+    /// Entries follow their real submission lifetime rather than a numeric cap.
+    /// Retiring one fence removes only its pages and leaves every other
+    /// outstanding write named.
     #[test]
-    fn an_arm_past_the_ring_merges_and_still_names_every_page() {
+    fn each_write_retires_with_its_own_token() {
         clear_guest_write_pages();
+        let mut tokens = Vec::new();
         for i in 0..pools::RING_DEPTH as u64 {
-            arm_guest_write_pages(&[0x1000 * (i + 1)]);
+            tokens.push(arm(&[0x1000 * (i + 1)]));
         }
-        arm_guest_write_pages(&[0xdead_0000]);
+        let extra = arm(&[0xdead_0000]);
         assert_eq!(
             guest_writes_reaching(&[0xdead_0000]),
             GuestWriteReach::Overlap,
-            "the writeback that overflowed the cap must still be named"
+            "a recorded write has no artificial ring-sized admission cap"
+        );
+        retire_guest_write_pages(&[extra]);
+        assert_eq!(
+            guest_writes_reaching(&[0xdead_0000]),
+            GuestWriteReach::Disjoint,
+            "the signalled write no longer blocks readers of its pages"
         );
         assert_eq!(
             guest_writes_reaching(&[0x1000]),
             GuestWriteReach::Overlap,
-            "the entry it merged into must keep its own pages"
+            "another unsignalled submission remains named"
         );
-        assert_eq!(
-            guest_writes_reaching(&[0x8000_0000]),
-            GuestWriteReach::Disjoint,
-            "a page no outstanding writeback names must still be let through"
-        );
-        // And it keeps holding past many more, since nothing retires an entry
-        // until a settle clears them all.
-        for i in 0..4 * pools::RING_DEPTH as u64 {
-            arm_guest_write_pages(&[0xbeef_0000 + 0x1000 * i]);
-        }
-        assert_eq!(
-            guest_writes_reaching(&[0xbeef_0000]),
-            GuestWriteReach::Overlap
-        );
-        assert_eq!(guest_writes_reaching(&[0x1000]), GuestWriteReach::Overlap);
-        assert_eq!(
-            guest_writes_reaching(&[0x8000_0000]),
-            GuestWriteReach::Disjoint
-        );
+        retire_guest_write_pages(&tokens);
+        assert!(!guest_writes_outstanding());
+        clear_guest_write_pages();
+    }
+
+    #[test]
+    fn a_shared_page_remains_armed_until_its_last_write_retires() {
+        clear_guest_write_pages();
+        let first = arm(&[0x4000, 0x5000]);
+        let second = arm(&[0x4000, 0x9000]);
+
+        retire_guest_write_pages(&[first]);
+        assert_eq!(guest_writes_reaching(&[0x4000]), GuestWriteReach::Overlap);
+        assert_eq!(guest_writes_reaching(&[0x5000]), GuestWriteReach::Disjoint);
+        assert_eq!(guest_writes_reaching(&[0x9000]), GuestWriteReach::Overlap);
+
+        retire_guest_write_pages(&[second]);
+        assert!(!guest_writes_outstanding());
         clear_guest_write_pages();
     }
 
@@ -5453,11 +5591,11 @@ mod guest_write_footprint_tests {
     fn a_settle_forgets_every_page_the_ledger_was_holding() {
         clear_guest_write_pages();
         for i in 0..=pools::RING_DEPTH as u64 {
-            arm_guest_write_pages(&[0x1000 * (i + 1)]);
+            arm(&[0x1000 * (i + 1)]);
         }
         assert_eq!(guest_writes_reaching(&[0x1000]), GuestWriteReach::Overlap);
         clear_guest_write_pages();
-        arm_guest_write_pages(&[0x4000]);
+        arm(&[0x4000]);
         assert_eq!(guest_writes_reaching(&[0x8000]), GuestWriteReach::Disjoint);
         assert_eq!(
             guest_writes_reaching(&[0x1000]),
@@ -5487,7 +5625,7 @@ mod guest_write_footprint_tests {
     fn overlapping_spans_are_decided_page_by_page() {
         clear_guest_write_pages();
         let armed: Vec<u64> = (0..64).map(|i| 0x1000 + i * 0x2000).collect();
-        arm_guest_write_pages(&armed);
+        arm(&armed);
 
         let interleaved: Vec<u64> = (0..64).map(|i| 0x2000 + i * 0x2000).collect();
         assert_eq!(
@@ -5513,7 +5651,7 @@ mod guest_write_footprint_tests {
     #[test]
     fn a_reader_clear_of_the_armed_span_is_disjoint_from_either_side() {
         clear_guest_write_pages();
-        arm_guest_write_pages(&[0x8000, 0x9000, 0xa000]);
+        arm(&[0x8000, 0x9000, 0xa000]);
         assert_eq!(
             guest_writes_reaching(&[0x6000, 0x7000]),
             GuestWriteReach::Disjoint

@@ -155,6 +155,50 @@ const SAMPLED_IMAGE_FETCH_KERNEL: &str = r#"
                OpFunctionEnd
 "#;
 
+/// Read texel zero through a sampled binding and write it to texel one through
+/// a storage binding. The two descriptors may name the same texture object;
+/// that alias is part of the guest binding contract, not a request for a
+/// snapshot.
+const RESIDENT_SAMPLED_STORAGE_ALIAS_KERNEL: &str = r#"
+               OpCapability Shader
+               OpCapability StorageImageWriteWithoutFormat
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %sampled %storage
+               OpExecutionMode %main LocalSize 1 1 1
+               OpDecorate %sampled DescriptorSet 0
+               OpDecorate %sampled Binding 32
+               OpDecorate %storage DescriptorSet 0
+               OpDecorate %storage Binding 1
+               OpDecorate %storage NonReadable
+       %void = OpTypeVoid
+       %uint = OpTypeInt 32 0
+        %int = OpTypeInt 32 1
+      %float = OpTypeFloat 32
+     %v2uint = OpTypeVector %uint 2
+      %v2int = OpTypeVector %int 2
+    %v4float = OpTypeVector %float 4
+     %uint_0 = OpConstant %uint 0
+       %int_0 = OpConstant %int 0
+       %int_1 = OpConstant %int 1
+      %sampled_image = OpTypeImage %float 2D 0 0 0 1 Unknown
+%_ptr_UniformConstant_sampled = OpTypePointer UniformConstant %sampled_image
+    %sampled = OpVariable %_ptr_UniformConstant_sampled UniformConstant
+      %storage_image = OpTypeImage %float 2D 0 0 0 2 Rgba8
+%_ptr_UniformConstant_storage = OpTypePointer UniformConstant %storage_image
+    %storage = OpVariable %_ptr_UniformConstant_storage UniformConstant
+    %fn_type = OpTypeFunction %void
+       %main = OpFunction %void None %fn_type
+      %entry = OpLabel
+         %src = OpLoad %sampled_image %sampled
+    %src_coord = OpCompositeConstruct %v2uint %uint_0 %uint_0
+       %texel = OpImageFetch %v4float %src %src_coord Lod %uint_0
+         %dst = OpLoad %storage_image %storage
+    %dst_coord = OpCompositeConstruct %v2int %int_1 %int_0
+               OpImageWrite %dst %dst_coord %texel
+               OpReturn
+               OpFunctionEnd
+"#;
+
 fn storage_image_write_red_kernel(spirv_image_format: &str) -> String {
     KERNEL_TEMPLATE.replace("{FMT}", spirv_image_format)
 }
@@ -383,6 +427,7 @@ fn compute_writable_guest_ssbo_lands_in_place() {
                 guest,
             },
         ])),
+        physical_pages: None,
     };
     let req = ComputeRequest {
         program: prepare_test_program(words),
@@ -955,13 +1000,12 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
     );
 }
 
-/// Copy-on-sample contract: a sampled input bound to a generation-matching
-/// resident storage image is seeded by a device-local copy (zero-placeholder
-/// `bytes` never uploaded, `compute_sampled_uploads == 0`) and fetches the
-/// resident content; a stale generation or evicted resident fails with
+/// Resident-sample contract: a sampled input bound to a generation-matching
+/// resident storage image binds that image directly (`compute_sampled_uploads
+/// == 0`) and fetches the resident content; a stale generation or evicted resident fails with
 /// `vk_compute_exec_resident_sample_*` — never a silent zero seed.
 #[test]
-fn compute_sampled_resident_copy_and_lost_resident() {
+fn compute_sampled_resident_direct_bind_and_lost_resident() {
     let _g = engine_test_session();
     // Same red-fill kernel as compute_storage_image_seed_skip_and_lost_resident.
     let fill_spvasm = &storage_image_write_red_kernel("Rgba8");
@@ -1038,8 +1082,8 @@ fn compute_sampled_resident_copy_and_lost_resident() {
         storage_images: vec![],
     };
 
-    // Resident hit: the sampled image is seeded device-locally from the red
-    // resident; the zero placeholder never uploads.
+    // Resident hit: the sampled descriptor binds the red resident itself; the
+    // zero placeholder never uploads and no image copy is needed.
     engine::reset_draw_counters();
     let hit = engine::execute_compute_request(&make_fetch(2)).expect("resident sample hit");
     let got: Vec<u32> = hit.buffers[0]
@@ -1061,8 +1105,8 @@ fn compute_sampled_resident_copy_and_lost_resident() {
     let snap = engine::counter_snapshot();
     assert_eq!(snap.compute_sampled_uploads, 0);
     assert_eq!(snap.compute_sampled_upload_bytes, 0);
-    assert_eq!(snap.compute_sampled_resident_copies, 1);
-    assert_eq!(snap.compute_sampled_resident_copy_bytes, (w * h * 4) as u64);
+    assert_eq!(snap.compute_sampled_resident_binds, 1);
+    assert_eq!(snap.compute_sampled_resident_bind_bytes, (w * h * 4) as u64);
 
     // Stale generation must fail visibly, never seed the placeholder.
     let err =
@@ -1081,6 +1125,99 @@ fn compute_sampled_resident_copy_and_lost_resident() {
             .contains("vk_compute_exec_resident_sample_absent"),
         "unexpected error: {err}"
     );
+}
+
+#[test]
+fn compute_sampled_and_storage_bindings_preserve_one_resident_identity() {
+    let _g = engine_test_session();
+    let Some(fill_words) = assemble_spvasm(
+        &storage_image_write_red_kernel("Rgba8"),
+        "resident_alias_fill",
+    ) else {
+        return;
+    };
+    let Some(alias_words) = assemble_spvasm(
+        RESIDENT_SAMPLED_STORAGE_ALIAS_KERNEL,
+        "resident_alias_dispatch",
+    ) else {
+        return;
+    };
+    let (w, h) = (4u32, 1u32);
+    let identity =
+        ComputeStorageResidencyKey::surface(94, 1, 0, w * 4, (w * h * 4) as u64, w, h, 0x46);
+
+    let fill = ComputeRequest {
+        program: prepare_test_program(fill_words),
+        entry: "main".into(),
+        grid: [1, 1, 1],
+        storage_buffers: vec![],
+        sampled_images: vec![],
+        samplers: vec![],
+        storage_images: vec![ComputeStorageImageResource {
+            destination: Default::default(),
+            binding: 0,
+            array_element: 0,
+            descriptor_count: 1,
+            format: StorageImageFormat::Rgba8Unorm,
+            width: w,
+            height: h,
+            seed: ComputeStorageImageSeed::Bytes(vec![0; (w * h * 4) as usize]),
+            residency: Some(ComputeStorageResidency {
+                identity,
+                seed_generation: 1,
+                output_generation: 2,
+            }),
+        }],
+    };
+    let Some(_) = engine_or_skip("resident_alias_fill", &fill) else {
+        return;
+    };
+
+    engine::reset_draw_counters();
+    let alias = ComputeRequest {
+        program: prepare_test_program(alias_words),
+        entry: "main".into(),
+        grid: [1, 1, 1],
+        storage_buffers: vec![],
+        sampled_images: vec![ComputeSampledImageResource {
+            binding: 32,
+            array_element: 0,
+            descriptor_count: 1,
+            format: StorageImageFormat::Rgba8Unorm,
+            width: w,
+            height: h,
+            source: ComputeSampledImageSource::Resident(ComputeResidentSampleBind {
+                identity,
+                generation: 2,
+            }),
+            content: None,
+        }],
+        samplers: vec![],
+        storage_images: vec![ComputeStorageImageResource {
+            destination: Default::default(),
+            binding: 1,
+            array_element: 0,
+            descriptor_count: 1,
+            format: StorageImageFormat::Rgba8Unorm,
+            width: w,
+            height: h,
+            seed: ComputeStorageImageSeed::Resident,
+            residency: Some(ComputeStorageResidency {
+                identity,
+                seed_generation: 2,
+                output_generation: 3,
+            }),
+        }],
+    };
+    let output = engine::execute_compute_request(&alias).expect("aliased resident dispatch");
+    let bytes = output.images[0]
+        .bytes()
+        .expect("host destination returns the resident result");
+    assert_eq!(&bytes[4..8], &[255, 0, 0, 255]);
+    let counters = engine::counter_snapshot();
+    assert_eq!(counters.compute_sampled_resident_binds, 1);
+    assert_eq!(counters.compute_sampled_uploads, 0);
+    assert_eq!(counters.compute_storage_seed_uploads, 0);
 }
 
 /// Sampled inputs must use SAMPLED_IMAGE descriptors and remain input-only.

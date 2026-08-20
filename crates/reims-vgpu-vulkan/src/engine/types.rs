@@ -7,7 +7,7 @@
 use crate::translate;
 pub use reims_vgpu_core::{
     viewport_slot_count, AttachmentInitial, AttachmentSlot, BlendFactor, BlendOp,
-    BlendStateResource, BufferContent, ComputeBufferBacking, ComputeBufferOutput,
+    BlendStateResource, BufferContent, ColorLoadAction, ComputeBufferBacking, ComputeBufferOutput,
     ComputeBufferResource, ComputeBufferResult, ComputeImageDestination, ComputeImageResult,
     ComputeOutput, ComputeRequest, ComputeResidentSampleBind, ComputeSampledImageResource,
     ComputeSampledImageSource, ComputeStorageImageResource, ComputeStorageImageSeed,
@@ -20,7 +20,8 @@ pub use reims_vgpu_core::{
     ViewportResource, VisibilityResultMode,
 };
 pub use reims_vgpu_memory::{
-    GuestRun, GuestRunSource, GuestTargetBacking, GuestTargetMemory, GuestTargetSeed, WindowStretch,
+    GuestImageSource, GuestRun, GuestRunSource, GuestTargetBacking, GuestTargetMemory,
+    GuestTargetPlan, GuestTargetSeed, WindowStretch,
 };
 pub use reims_vgpu_protocol::ColorWriteMask;
 pub use reims_vgpu_protocol::StorageImageFormat;
@@ -184,14 +185,10 @@ impl From<DrawError> for String {
 
 /// Descriptor binding of the attachment-0 framebuffer-fetch input attachment.
 ///
-/// This is the *device's* ColorInput band base, not the translator's: the band
-/// moved up when the texture band was widened to Metal's 128 entries
-/// (`runtime::spirv_bind::widen_sampled_bands` rewrites `dest_N` from the
-/// translator's `96+N` to `192+N`). Only `dest_0` is supported. Kept equal to
-/// `runtime::spirv_bind::COLOR_INPUT_BINDING_BASE` by a unit test there, because
-/// the two constants live on opposite sides of the runtime/engine layering.
-/// Both fragment relocations preserve it.
-pub const COLOR_INPUT_BINDING: u32 = crate::spirv_bind::COLOR_INPUT_BINDING_BASE;
+/// Attachment-0 framebuffer-fetch binding in metal2vulkan's selected render
+/// descriptor layout. Color inputs are fragment-only, so the stage-separation
+/// layout deliberately retains the translator's default range.
+pub const COLOR_INPUT_BINDING: u32 = metal2vulkan::reflect::COLOR_INPUT_BINDING_BASE;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct SamplerStateKey {
@@ -224,6 +221,58 @@ pub(crate) fn sampler_state_key(sampler: &SamplerResource) -> SamplerStateKey {
         max_anisotropy: sampler.max_anisotropy,
         unnormalized_coordinates: sampler.unnormalized_coordinates,
     }
+}
+
+/// Resolve the sampler state whose semantics both shader translation and the
+/// Vulkan descriptor must implement.
+///
+/// Pixel-coordinate sampling has no mip selection, so its LOD clamps do not
+/// participate in the result even though they remain part of the serialized
+/// sampler descriptor. Vulkan requires both clamps to be zero for an
+/// unnormalized sampler. The other Vulkan restrictions are also restrictions
+/// of the pixel-sampler contract; refusing violations preserves the requested
+/// state instead of silently replacing filters, addressing, or anisotropy.
+pub(crate) fn effective_sampler_state(
+    sampler: &SamplerResource,
+) -> Result<SamplerStateKey, super::reason::DrawReason> {
+    effective_sampler_state_key(sampler_state_key(sampler))
+}
+
+pub(crate) fn effective_sampler_state_key(
+    mut key: SamplerStateKey,
+) -> Result<SamplerStateKey, super::reason::DrawReason> {
+    use super::reason::DrawReason;
+    if !key.unnormalized_coordinates {
+        return Ok(key);
+    }
+    if key.min_filter != key.mag_filter {
+        return Err(DrawReason::SamplerPixelMixedFilters);
+    }
+    if key.mip_filter != SamplerMipFilter::NotMipmapped {
+        return Err(DrawReason::SamplerPixelMipmapped);
+    }
+    if !matches!(
+        key.address_mode_u,
+        SamplerAddressMode::ClampToEdge
+            | SamplerAddressMode::ClampToZero
+            | SamplerAddressMode::ClampToBorderColor
+    ) || !matches!(
+        key.address_mode_v,
+        SamplerAddressMode::ClampToEdge
+            | SamplerAddressMode::ClampToZero
+            | SamplerAddressMode::ClampToBorderColor
+    ) {
+        return Err(DrawReason::SamplerPixelAddressMode);
+    }
+    if key.max_anisotropy != 1 {
+        return Err(DrawReason::SamplerPixelAnisotropy);
+    }
+    if key.compare_function != SamplerCompareFunction::Never {
+        return Err(DrawReason::SamplerUnnormalizedCompare);
+    }
+    key.lod_min = 0.0f32.to_bits();
+    key.lod_max = 0.0f32.to_bits();
+    Ok(key)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -301,13 +350,14 @@ mod tests {
 
         req.secondary_targets.push(SecondaryColorTarget {
             identity: surface(2),
+            target_guest: None,
             width: 64,
             height: 64,
             format: reims_vgpu_protocol::ImageFormat::linear(
                 reims_vgpu_protocol::TexelLayout::Bgra8,
             ),
             clear: [0.0; 4],
-            load: false,
+            load_action: ColorLoadAction::Clear,
             blend: None,
             color_write_mask: ColorWriteMask::default(),
         });
@@ -382,6 +432,64 @@ mod tests {
 
         rebound.address_mode_v = SamplerAddressMode::Repeat;
         assert_ne!(sampler_state_key(&first), sampler_state_key(&rebound));
+    }
+
+    fn valid_pixel_sampler() -> SamplerResource {
+        let mut sampler = SamplerResource::normalized_default(0);
+        sampler.unnormalized_coordinates = true;
+        sampler.lod_min = 1.0f32.to_bits();
+        sampler.lod_max = 8.0f32.to_bits();
+        sampler
+    }
+
+    #[test]
+    fn pixel_sampler_projection_changes_only_semantically_inactive_lod_clamps() {
+        let sampler = valid_pixel_sampler();
+        let raw = sampler_state_key(&sampler);
+        let effective = effective_sampler_state(&sampler).expect("valid pixel sampler");
+        assert_eq!(f32::from_bits(effective.lod_min), 0.0);
+        assert_eq!(f32::from_bits(effective.lod_max), 0.0);
+        assert_eq!(
+            SamplerStateKey {
+                lod_min: raw.lod_min,
+                lod_max: raw.lod_max,
+                ..effective
+            },
+            raw
+        );
+    }
+
+    #[test]
+    fn pixel_sampler_projection_refuses_state_it_cannot_preserve() {
+        use reims_vgpu_observe::Decline as _;
+
+        let mut sampler = valid_pixel_sampler();
+        sampler.min_filter = SamplerFilter::Nearest;
+        assert_eq!(
+            effective_sampler_state(&sampler).unwrap_err().slug(),
+            "sampler_pixel_mixed_filters"
+        );
+
+        let mut sampler = valid_pixel_sampler();
+        sampler.mip_filter = SamplerMipFilter::Linear;
+        assert_eq!(
+            effective_sampler_state(&sampler).unwrap_err().slug(),
+            "sampler_pixel_mipmapped"
+        );
+
+        let mut sampler = valid_pixel_sampler();
+        sampler.address_mode_u = SamplerAddressMode::Repeat;
+        assert_eq!(
+            effective_sampler_state(&sampler).unwrap_err().slug(),
+            "sampler_pixel_address_mode"
+        );
+
+        let mut sampler = valid_pixel_sampler();
+        sampler.max_anisotropy = 2;
+        assert_eq!(
+            effective_sampler_state(&sampler).unwrap_err().slug(),
+            "sampler_pixel_anisotropy"
+        );
     }
 
     #[test]

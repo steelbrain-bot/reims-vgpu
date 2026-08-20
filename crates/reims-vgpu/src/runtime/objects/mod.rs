@@ -1609,12 +1609,27 @@ pub fn resolve_resource<M: HostMemory>(
         declared_len: entry.descriptor_length,
     })?;
     let descriptor: Arc<[u8]> = Arc::from(bytes);
-    let resource = Arc::new(TaskResource::new(entry, descriptor));
+    let candidate = Arc::new(TaskResource::new(entry, descriptor));
     let resource = state
         .task_objects
         .resources
-        .register(task_id, obj_ref, resource);
+        .register(task_id, obj_ref, Arc::clone(&candidate));
     ensure_resource_relations(state, host, task_id, obj_ref, &resource);
+    // A validity record may precede this lazy construction. Normalize that
+    // statement only after descriptor relations have attached the resource to
+    // its storage authority; doing it before attachment would advance the
+    // temporary private authority that attachment replaces.
+    if Arc::ptr_eq(&resource, &candidate)
+        && state
+            .content
+            .preconstruction_writes
+            .has_write(task_id, obj_ref)
+    {
+        let id = resource
+            .semantic_id()
+            .expect("a published task resource has a semantic identity");
+        state.task_objects.resources.note_guest_write_by_id(id);
+    }
     Ok(resource)
 }
 

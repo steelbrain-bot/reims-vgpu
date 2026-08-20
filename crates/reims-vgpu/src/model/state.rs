@@ -530,7 +530,7 @@ impl TaskResources {
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        registry.graph.resource(id)?.content.guest_wrote().ok()
+        registry.graph.guest_wrote_aliases(id)
     }
 
     /// Snapshot the canonical identity and content version of a constructed
@@ -1853,10 +1853,10 @@ struct PresentBackpressureState {
     episodes: u64,
 }
 
-/// Whether the next capture needs CPU pixels and how often each rail ran.
+/// Whether the current present needs CPU pixels and how often each rail ran.
 #[derive(Clone, Debug, Default)]
 struct PresentCapturePolicy {
-    resident_carried: bool,
+    current_present_resident_carried: bool,
     full_captures: u64,
     light_captures: u64,
 }
@@ -2022,13 +2022,12 @@ impl PresentRoutingState {
 }
 
 impl PresentCapturePolicy {
-    #[cfg(any(test, feature = "host-window"))]
-    fn set_resident_carried(&mut self, carried: bool) {
-        self.resident_carried = carried;
+    fn set_current_present_resident_carried(&mut self, carried: bool) {
+        self.current_present_resident_carried = carried;
     }
 
-    fn resident_carried(&self) -> bool {
-        self.resident_carried
+    fn current_present_resident_carried(&self) -> bool {
+        self.current_present_resident_carried
     }
 
     fn note_full(&mut self) {
@@ -2633,16 +2632,10 @@ pub struct PresentState {
     frame: RetainedPresentFrame,
     /// Accepted-but-unpainted count and held-head episode coalescing.
     backpressure: PresentBackpressureState,
-    /// True when the previous present's window publish handed the window a GPU
-    /// resident rather than CPU pixels — the macOS engine-swapchain handoff, which
-    /// presents the compositor's resident through the engine's own MoltenVK
-    /// swapchain and never reads `frame_bgra`. Set by `publish_window_frame` each
-    /// present (same drain worker, one present after the capture reads it; the
-    /// handoff is stable across steady-state presents). When true,
-    /// `capture_present_frame` skips the expensive guest-page readback.
-    ///
-    /// Always false where the window owns its own swapchain and uploads CPU pixels
-    /// — every non-macOS host — so those keep the per-present readback unchanged.
+    /// True when the current present's resident and attached engine presenter
+    /// were prepared successfully before capture. When true,
+    /// `capture_present_frame` skips the GPU→host readback because the window
+    /// consumes that same resident directly.
     capture_policy: PresentCapturePolicy,
 }
 
@@ -2879,13 +2872,13 @@ impl PresentState {
         self.backpressure.episodes()
     }
 
-    #[cfg(any(test, feature = "host-window"))]
-    pub(crate) fn set_display_from_resident(&mut self, carried: bool) {
-        self.capture_policy.set_resident_carried(carried);
+    pub(crate) fn set_current_present_resident_carried(&mut self, carried: bool) {
+        self.capture_policy
+            .set_current_present_resident_carried(carried);
     }
 
-    pub(crate) fn display_from_resident(&self) -> bool {
-        self.capture_policy.resident_carried()
+    pub(crate) fn current_present_resident_carried(&self) -> bool {
+        self.capture_policy.current_present_resident_carried()
     }
 
     pub(crate) fn note_full_capture(&mut self) {
@@ -4795,6 +4788,9 @@ impl DeviceState {
         let removed = false;
         let (texture_removed, linear_removed) = self.invalidate_object_host_copies(task_id, ref_);
         let resource_removed = self.task_objects.resources.delete(task_id, ref_);
+        self.content
+            .preconstruction_writes
+            .retire_object(task_id, ref_);
         #[cfg(test)]
         let mapping_removed = self
             .fixtures

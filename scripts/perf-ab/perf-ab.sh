@@ -191,6 +191,17 @@ for arm in $ARMS; do
   fi
   pkill -f 'qemu-system-x86_6[4].*reims-vgpu'; sleep 6
 
+  # Probe failure invalidates the population. In particular, Maps returns
+  # nonzero when the captured frames do not contain the declared geographic
+  # scene. Keeping its backend counters would reward an empty canvas for being
+  # cheap, so publish an explicitly unrankable row instead.
+  if [ "$probe_exit" -ne 0 ]; then
+    printf '%s\t%s\tINVALID-PROBE\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t%s\n' \
+      "$round" "$arm" "$PROBE_NAME" >>"$RESULTS"
+    say "$tag: invalid probe (exit=$probe_exit); see $OUT/$tag-probe.log and $OUT/$tag-work"
+    continue
+  fi
+
   present=$(grep -ho 'present_hz=[0-9.]*' "$SLICE" | cut -d= -f2 | median)
   offered=$(grep -ho 'offered_hz=[0-9.]*' "$SLICE" | cut -d= -f2 | median)
   # A guest kernel panic outranks every number below it, and it can land after

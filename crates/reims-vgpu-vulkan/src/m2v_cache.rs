@@ -43,10 +43,9 @@ impl From<RenderTranslationStage> for Stage {
     }
 }
 
-type FragmentRelocationCache = HashMap<(bool, bool), Arc<ShaderVariant>>;
 type M2vResult<T> = Result<T, M2vCacheDecline>;
 
-/// A specific failure while caching, translating, or post-processing AIR.
+/// A specific failure while caching, translating, or reconciling AIR layout.
 ///
 /// Raw tool/IO/layout text stays payload; the reason itself is stable and
 /// registered so render, compute, and the async worker name the same check.
@@ -70,16 +69,9 @@ pub enum M2vCacheDecline {
     KernelTranslate {
         detail: String,
     },
-    ReflectionDatalayoutMissing {
-        stage: &'static str,
-    },
     ReflectionMalformed {
         stage: &'static str,
         violations: usize,
-    },
-    LayoutRepair {
-        stage: &'static str,
-        reason: crate::spirv_layout::SpirvLayoutDecline,
     },
     TranslationPending {
         stage: &'static str,
@@ -91,16 +83,23 @@ pub enum M2vCacheDecline {
         requested: [u32; 3],
         reflected: Option<[u32; 3]>,
     },
+    RuntimeSamplerSpecialize {
+        stage: &'static str,
+        detail: String,
+    },
+    RuntimeStorageImageSpecialize {
+        detail: String,
+    },
 }
 
 impl M2vCacheDecline {
     /// Whether a second attempt at the same AIR could answer differently.
     ///
     /// Every entry in this cache is keyed by the AIR blob's content, so a
-    /// refusal that is *about the AIR* is reached again by every later ask and
-    /// is worth remembering: a module whose datalayout is missing, whose layout
-    /// repair fails, or whose requested threadgroup is degenerate refuses the
-    /// same way forever.
+    /// refusal that is *about the AIR and its complete translation options* is
+    /// reached again by every later ask and is worth remembering: malformed
+    /// reflection or a degenerate requested threadgroup refuses the same way
+    /// forever.
     ///
     /// The scratch writes are not about the AIR. `translate_air` and
     /// `translate_kernel_air` each begin by writing the blob to a fixed path
@@ -128,12 +127,12 @@ impl M2vCacheDecline {
             Self::VertexTranslate { .. }
             | Self::FragmentTranslate { .. }
             | Self::KernelTranslate { .. }
-            | Self::ReflectionDatalayoutMissing { .. }
             | Self::ReflectionMalformed { .. }
-            | Self::LayoutRepair { .. }
             | Self::TranslationPending { .. }
             | Self::KernelLocalSizeZero { .. }
-            | Self::KernelLocalSizeMismatch { .. } => false,
+            | Self::KernelLocalSizeMismatch { .. }
+            | Self::RuntimeSamplerSpecialize { .. }
+            | Self::RuntimeStorageImageSpecialize { .. } => false,
         }
     }
 }
@@ -200,12 +199,12 @@ impl Decline for M2vCacheDecline {
             Self::VertexTranslate { .. } => "m2v_vertex_translate",
             Self::FragmentTranslate { .. } => "m2v_fragment_translate",
             Self::KernelTranslate { .. } => "m2v_kernel_translate",
-            Self::ReflectionDatalayoutMissing { .. } => "m2v_reflection_datalayout_missing",
             Self::ReflectionMalformed { .. } => "m2v_reflection_malformed",
-            Self::LayoutRepair { reason, .. } => reason.slug(),
             Self::TranslationPending { .. } => "m2v_translation_pending_at_sync_boundary",
             Self::KernelLocalSizeZero { .. } => "m2v_kernel_local_size_zero",
             Self::KernelLocalSizeMismatch { .. } => "m2v_kernel_local_size_mismatch",
+            Self::RuntimeSamplerSpecialize { .. } => "m2v_runtime_sampler_specialize",
+            Self::RuntimeStorageImageSpecialize { .. } => "m2v_runtime_storage_image_specialize",
         }
     }
 
@@ -238,12 +237,7 @@ impl Decline for M2vCacheDecline {
                 ("stage", "kernel".to_string()),
                 ("detail", log_token(detail)),
             ],
-            Self::LayoutRepair { stage, reason } => {
-                let mut fields = vec![("stage", (*stage).to_string())];
-                fields.extend(reason.fields());
-                fields
-            }
-            Self::ReflectionDatalayoutMissing { stage } | Self::TranslationPending { stage } => {
+            Self::TranslationPending { stage } => {
                 vec![("stage", (*stage).to_string())]
             }
             Self::ReflectionMalformed { stage, violations } => vec![
@@ -271,6 +265,13 @@ impl Decline for M2vCacheDecline {
                     ),
                 ),
             ],
+            Self::RuntimeSamplerSpecialize { stage, detail } => vec![
+                ("stage", (*stage).to_string()),
+                ("detail", log_token(detail)),
+            ],
+            Self::RuntimeStorageImageSpecialize { detail } => {
+                vec![("detail", log_token(detail))]
+            }
         }
     }
 }
@@ -280,11 +281,14 @@ reims_vgpu_observe::decline_display!(M2vCacheDecline);
 impl std::error::Error for M2vCacheDecline {}
 
 /// A translated shader: the SPIR-V bytes we hand to the Vulkan engine, plus the
-/// `metal2vulkan` reflection facade derived from the SAME parsed AIR metadata
+/// `metal2vulkan` reflection facade derived from the same parsed AIR metadata
 /// (descriptor bindings, texture shapes, vertex builtins, datalayout, …). The
 /// reflection is the single source of truth for stage-interface facts so the
-/// consumer never re-parses AIR or re-walks the emitted SPIR-V. `spirv` is the
-/// post-`repair_layout` module (byte-identical to what the plain cache returned).
+/// consumer never re-parses AIR. `spirv` is the translator-validated module
+/// that Vulkan executes.
+type RuntimeSamplerKey = Vec<(u32, reims_vgpu_core::SamplerResource)>;
+type RenderSpecializationCache = Mutex<HashMap<RuntimeSamplerKey, Arc<CachedShader>>>;
+
 pub struct CachedShader {
     pub(crate) spirv: Vec<u8>,
     reflection: Arc<ShaderReflection>,
@@ -293,24 +297,45 @@ pub struct CachedShader {
     /// The same module as u32 words, materialized once — draw paths clone the
     /// `Arc`, never re-collect per draw (was a full-module copy ×2 per draw).
     pub words: Arc<Vec<u32>>,
-    /// The module in the translator's own binding numbering, and what a walk of
-    /// it answers. Separate from `words` only because `words` predates
-    /// [`ShaderVariant`] and half the crate reads it.
+    /// The module in the reflected effective descriptor layout.
     base: OnceLock<Arc<ShaderVariant>>,
-    /// Fragment binding-relocation variants keyed by
-    /// `(separate_sampled, buf_collide)` — the relocation is a pure function of
-    /// the module and those two flags, so each variant is computed once per
-    /// shader lifetime instead of mutating a fresh copy per draw.
-    frag_reloc: Mutex<FragmentRelocationCache>,
+    render_source: Option<RenderTranslationSource>,
+    render_specializations: RenderSpecializationCache,
+    kernel_source: Option<KernelTranslationSource>,
+    kernel_specializations: Mutex<HashMap<Vec<RuntimeStorageImageRequest>, Arc<CachedShader>>>,
+}
+
+#[derive(Clone)]
+struct RenderTranslationSource {
+    air: Arc<[u8]>,
+    stage: Stage,
+    raster_sample_count: u32,
+}
+
+#[derive(Clone)]
+struct KernelTranslationSource {
+    air: Arc<[u8]>,
+    local_size: [u32; 3],
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RuntimeStorageImageRequest {
+    pub binding: u32,
+    pub metal_index: u32,
+    pub format: reims_vgpu_protocol::StorageImageFormat,
+    pub storage_image: bool,
+    pub storage_image_atomic: bool,
+    pub read_without_format: bool,
+    pub write_without_format: bool,
 }
 
 /// One binding numbering of a translated module, beside the reflected
 /// interface transformed into *that* numbering.
 ///
 /// The pair is one struct because the second is only true of the first.
-/// Relocation renumbers a module's descriptor bindings. The reflected sampler
-/// interface is transformed by the same variant key and stored here, so a
-/// caller cannot pair words from one numbering with resources from another.
+/// The translator selects descriptor bindings before emission. Keeping the
+/// executable and projected interface together prevents a caller from pairing
+/// words from one reflected layout with resources from another.
 pub struct ShaderVariant {
     /// Process-local identity used by semantic execution requests.
     ///
@@ -325,7 +350,7 @@ pub struct ShaderVariant {
     /// this variant's numbering. Constexpr state stays attached to its binding.
     ///
     /// Derived here rather than at the draw because the answer depends only on
-    /// the shader and its relocation key. Reflection is the authority; the
+    /// the translated shader. Reflection is the authority; the
     /// former implementation rediscovered the same interface by walking every
     /// SPIR-V instruction, twice per draw before this value was cached.
     ///
@@ -361,6 +386,10 @@ pub struct ShaderVariant {
     /// with nothing in the log to say so. Interleaving is not optional for a pin
     /// comparison on this host.
     pub samplers: Arc<[crate::spirv_bind::ReflectedSamplerDescriptor]>,
+    /// Complete reflected descriptor population for these exact executable
+    /// words. Reflection owns descriptor identity; SPIR-V is consulted only to
+    /// distinguish executable static use within this population.
+    pub declared_bindings: Arc<[u32]>,
     /// Uniform-constant descriptor bindings the executable module statically
     /// uses, in this variant's binding numbering.
     ///
@@ -369,18 +398,24 @@ pub struct ShaderVariant {
     /// crash a host driver during pipeline creation, but the left-hand set is
     /// immutable shader state: deriving it from the full module at every draw
     /// reconstructed state already retained here. Keeping it beside `words`
-    /// also makes relocation agreement structural rather than a call-site
-    /// convention.
+    /// also keeps executable use and reflected descriptor locations together.
     pub used_descriptor_bindings: Arc<[u32]>,
+    /// Vertex stage-in widths projected from the translator's reflection.
+    /// Unknown reflected types remain unreadable and cannot authorize a Vulkan
+    /// vertex-format widening.
+    pub vertex_inputs: crate::spirv_vertex_input::VertexInputWidths,
 }
 
 impl ShaderVariant {
     fn of(
         words: Arc<Vec<u32>>,
         samplers: Arc<[crate::spirv_bind::ReflectedSamplerDescriptor]>,
+        vertex_inputs: crate::spirv_vertex_input::VertexInputWidths,
+        declared_bindings: Arc<[u32]>,
     ) -> Arc<Self> {
-        let used_descriptor_bindings = crate::spirv_bind::declared_binding_numbers(&words)
-            .into_iter()
+        let used_descriptor_bindings = declared_bindings
+            .iter()
+            .copied()
             .filter(|binding| {
                 crate::spirv_bind::descriptor_static_use(&words, *binding).is_violation()
             })
@@ -390,7 +425,9 @@ impl ShaderVariant {
             id: allocate_prepared_shader_id(),
             words,
             samplers,
+            declared_bindings,
             used_descriptor_bindings,
+            vertex_inputs,
         });
         prepared_shader_registry()
             .lock()
@@ -404,10 +441,18 @@ static NEXT_PREPARED_SHADER_ID: AtomicU64 = AtomicU64::new(1);
 static PREPARED_SHADER_REGISTRY: OnceLock<
     Mutex<HashMap<reims_vgpu_protocol::PreparedShaderId, Weak<ShaderVariant>>>,
 > = OnceLock::new();
+static PREPARED_RENDER_SOURCE_REGISTRY: OnceLock<
+    Mutex<HashMap<reims_vgpu_protocol::PreparedShaderId, Weak<CachedShader>>>,
+> = OnceLock::new();
 
 fn prepared_shader_registry(
 ) -> &'static Mutex<HashMap<reims_vgpu_protocol::PreparedShaderId, Weak<ShaderVariant>>> {
     PREPARED_SHADER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn prepared_render_source_registry(
+) -> &'static Mutex<HashMap<reims_vgpu_protocol::PreparedShaderId, Weak<CachedShader>>> {
+    PREPARED_RENDER_SOURCE_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn allocate_prepared_shader_id() -> reims_vgpu_protocol::PreparedShaderId {
@@ -429,11 +474,9 @@ pub fn prepared_stage(variant: &Arc<ShaderVariant>) -> reims_vgpu_core::Prepared
 fn project_prepared_variant(
     variant: Arc<ShaderVariant>,
     interface: &reims_vgpu_core::ShaderInterface,
-    fragment_sampled_relocated: bool,
-    fragment_buffer_relocated: bool,
+    layout: metal2vulkan::reflect::DescriptorLayout,
 ) -> reims_vgpu_core::PreparedShaderVariant {
-    let declared_bindings: Arc<[u32]> =
-        crate::spirv_bind::declared_binding_numbers(&variant.words).into();
+    let declared_bindings = variant.declared_bindings.clone();
     let descriptor_uses: Arc<[(u32, reims_vgpu_core::DescriptorUse)]> = declared_bindings
         .iter()
         .filter_map(|binding| {
@@ -453,13 +496,10 @@ fn project_prepared_variant(
             )
         })
         .map(|binding| {
-            let executable_binding = crate::spirv_bind::TEXTURE_BINDING_BASE
-                + binding.metal_index
-                + if fragment_sampled_relocated {
-                    crate::spirv_bind::FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
-                } else {
-                    0
-                };
+            let executable_binding = binding
+                .descriptor
+                .map(|descriptor| descriptor.binding)
+                .unwrap_or(layout.sampled_textures.start + binding.metal_index);
             (
                 binding.metal_index,
                 crate::spirv_bind::descriptor_static_use(&variant.words, executable_binding),
@@ -475,18 +515,9 @@ fn project_prepared_variant(
         declared_bindings,
         descriptor_uses,
         texture_uses,
-        buffer_binding_offset: if fragment_buffer_relocated {
-            crate::spirv_bind::FRAG_BUFFER_BINDING_OFFSET
-        } else {
-            0
-        },
-        sampled_binding_offset: if fragment_sampled_relocated {
-            crate::spirv_bind::FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
-        } else {
-            0
-        },
-        texture_binding_base: crate::spirv_bind::TEXTURE_BINDING_BASE,
-        sampler_binding_base: crate::spirv_bind::SAMPLER_BINDING_BASE,
+        buffer_binding_base: layout.buffers.start,
+        texture_binding_base: layout.sampled_textures.start,
+        sampler_binding_base: layout.samplers.start,
         word_count: u32::try_from(variant.words.len()).expect("SPIR-V module length fits u32"),
     }
 }
@@ -496,29 +527,273 @@ fn project_prepared_variant(
 /// registry; retained guest pipeline state stores only this projection.
 pub fn prepare_render_shader(
     shader: &Arc<CachedShader>,
-    stage: RenderTranslationStage,
+    _stage: RenderTranslationStage,
 ) -> reims_vgpu_core::PreparedShaderFamily {
-    let base = project_prepared_variant(
-        shader.variant(false, false),
+    let variant = project_prepared_variant(
+        shader.variant(),
         &shader.interface,
-        false,
-        false,
+        shader.reflection.descriptor_layout,
     );
-    let relocations = matches!(stage, RenderTranslationStage::Fragment).then(|| {
-        [
-            project_prepared_variant(shader.variant(true, false), &shader.interface, true, false),
-            project_prepared_variant(shader.variant(false, true), &shader.interface, false, true),
-            project_prepared_variant(shader.variant(true, true), &shader.interface, true, true),
-        ]
-    });
-    reims_vgpu_core::PreparedShaderFamily::new(shader.interface.clone(), base, relocations)
+    prepared_render_source_registry()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(variant.program.id, Arc::downgrade(shader));
+    reims_vgpu_core::PreparedShaderFamily::new(shader.interface.clone(), variant)
+}
+
+fn runtime_sampler_state(
+    sampler: &reims_vgpu_core::SamplerResource,
+) -> Result<metal2vulkan::reflect::RuntimeSamplerState, String> {
+    use metal2vulkan::reflect as native;
+    use reims_vgpu_core::{
+        SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter,
+        SamplerMipFilter,
+    };
+
+    let sampler = crate::engine::types::effective_sampler_state(sampler)
+        .map_err(|reason| reason.to_string())?;
+    let filter = |value| match value {
+        SamplerFilter::Nearest => native::SamplerFilter::Nearest,
+        SamplerFilter::Linear => native::SamplerFilter::Linear,
+    };
+    let address = |value| match value {
+        SamplerAddressMode::ClampToEdge => Ok(native::SamplerAddressMode::ClampToEdge),
+        SamplerAddressMode::Repeat => Ok(native::SamplerAddressMode::Repeat),
+        SamplerAddressMode::MirrorRepeat => Ok(native::SamplerAddressMode::MirroredRepeat),
+        SamplerAddressMode::ClampToZero => Ok(native::SamplerAddressMode::ClampToZero),
+        SamplerAddressMode::ClampToBorderColor => Ok(native::SamplerAddressMode::ClampToBorder),
+        SamplerAddressMode::MirrorClampToEdge => {
+            Err("pixel-coordinate mirror-clamp-to-edge is not representable".to_string())
+        }
+    };
+    let compare_function = match sampler.compare_function {
+        // Core uses `Never` as the no-comparison sentinel and Vulkan creates
+        // these samplers with compareEnable=false. Preserve that descriptor
+        // state in the translator contract instead of asking it to model an
+        // enabled comparison which always fails.
+        SamplerCompareFunction::Never => native::SamplerCompareFunction::None,
+        SamplerCompareFunction::Less => native::SamplerCompareFunction::Less,
+        SamplerCompareFunction::Equal => native::SamplerCompareFunction::Equal,
+        SamplerCompareFunction::LessEqual => native::SamplerCompareFunction::LessEqual,
+        SamplerCompareFunction::Greater => native::SamplerCompareFunction::Greater,
+        SamplerCompareFunction::NotEqual => native::SamplerCompareFunction::NotEqual,
+        SamplerCompareFunction::GreaterEqual => native::SamplerCompareFunction::GreaterEqual,
+        SamplerCompareFunction::Always => native::SamplerCompareFunction::Always,
+    };
+    Ok(native::RuntimeSamplerState {
+        min_filter: filter(sampler.min_filter),
+        mag_filter: filter(sampler.mag_filter),
+        mip_filter: match sampler.mip_filter {
+            SamplerMipFilter::NotMipmapped => native::SamplerMipFilter::None,
+            SamplerMipFilter::Nearest => native::SamplerMipFilter::Nearest,
+            SamplerMipFilter::Linear => native::SamplerMipFilter::Linear,
+        },
+        address_mode_s: address(sampler.address_mode_u)?,
+        address_mode_t: address(sampler.address_mode_v)?,
+        address_mode_r: address(sampler.address_mode_w)?,
+        coordinates: if sampler.unnormalized_coordinates {
+            native::SamplerCoordinates::Pixel
+        } else {
+            native::SamplerCoordinates::Normalized
+        },
+        compare_function,
+        max_anisotropy: sampler.max_anisotropy,
+        lod_min_clamp: f32::from_bits(sampler.lod_min),
+        lod_max_clamp: f32::from_bits(sampler.lod_max),
+        border_color: match sampler.border_color {
+            SamplerBorderColor::TransparentBlack => native::SamplerBorderColor::TransparentBlack,
+            SamplerBorderColor::OpaqueBlack => native::SamplerBorderColor::OpaqueBlack,
+            SamplerBorderColor::OpaqueWhite => native::SamplerBorderColor::OpaqueWhite,
+        },
+        reduction: native::SamplerReduction::WeightedAverage,
+        lod_bias: 0.0,
+    })
+}
+
+fn translate_render_with_samplers(
+    source: &RenderTranslationSource,
+    states: &[(u32, reims_vgpu_core::SamplerResource)],
+) -> M2vResult<CachedShader> {
+    let _guard = translation_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let tmp = tmp_dir();
+    let name = match source.stage {
+        Stage::Vertex => "v.air",
+        Stage::Fragment => "f.air",
+        Stage::Kernel => unreachable!("render specialization cannot be a kernel"),
+    };
+    let path = tmp.join(name);
+    std::fs::write(&path, source.air.as_ref())
+        .map_err(|error| scratch_write_decline(source.stage, error.to_string()))?;
+    let mut options = metal2vulkan::passes::TransformOptions::default()
+        .with_descriptor_layout(render_descriptor_layout(source.stage))
+        .map_err(|error| M2vCacheDecline::RuntimeSamplerSpecialize {
+            stage: stage_name(source.stage),
+            detail: error.to_string(),
+        })?;
+    if source.stage == Stage::Fragment {
+        options.raster_sample_count = Some(source.raster_sample_count);
+    }
+    for (metal_index, sampler) in states {
+        options = options
+            .with_runtime_sampler(
+                *metal_index,
+                runtime_sampler_state(sampler).map_err(|detail| {
+                    M2vCacheDecline::RuntimeSamplerSpecialize {
+                        stage: stage_name(source.stage),
+                        detail,
+                    }
+                })?,
+            )
+            .map_err(|detail| M2vCacheDecline::RuntimeSamplerSpecialize {
+                stage: stage_name(source.stage),
+                detail,
+            })?;
+    }
+    let (spirv, reflection) = metal2vulkan::translate_reflected_with_options(
+        path.to_str().unwrap_or(name),
+        source.stage,
+        &tmp,
+        options,
+    )
+    .map_err(|detail| M2vCacheDecline::RuntimeSamplerSpecialize {
+        stage: stage_name(source.stage),
+        detail,
+    })?;
+    if reflection.runtime_sampler_specializations.len() != states.len() {
+        return Err(M2vCacheDecline::RuntimeSamplerSpecialize {
+            stage: stage_name(source.stage),
+            detail: format!(
+                "translator applied {} of {} runtime sampler states",
+                reflection.runtime_sampler_specializations.len(),
+                states.len()
+            ),
+        });
+    }
+    for (metal_index, sampler) in states {
+        let expected = runtime_sampler_state(sampler).map_err(|detail| {
+            M2vCacheDecline::RuntimeSamplerSpecialize {
+                stage: stage_name(source.stage),
+                detail,
+            }
+        })?;
+        let reflected = reflection
+            .runtime_sampler_specializations
+            .iter()
+            .find(|specialization| specialization.metal_index == *metal_index);
+        if reflected.map(|specialization| specialization.state) != Some(expected) {
+            return Err(M2vCacheDecline::RuntimeSamplerSpecialize {
+                stage: stage_name(source.stage),
+                detail: format!(
+                    "translator reflected a different runtime state for Metal sampler {metal_index}"
+                ),
+            });
+        }
+    }
+    finish_translated(spirv, reflection, source.stage, None, None)
+}
+
+/// Specialize pixel-coordinate sampler operations through metal2vulkan and
+/// return a prepared module in the same reflected descriptor layout.
+pub fn specialize_render_samplers(
+    base: &reims_vgpu_core::PreparedShaderVariant,
+    samplers: &[reims_vgpu_core::SamplerResource],
+) -> M2vResult<reims_vgpu_core::PreparedShaderVariant> {
+    let shader = prepared_render_source_registry()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&base.program.id)
+        .and_then(Weak::upgrade)
+        .ok_or_else(|| M2vCacheDecline::RuntimeSamplerSpecialize {
+            stage: "render",
+            detail: "prepared shader source lifetime ended".to_string(),
+        })?;
+    let Some(source) = shader.render_source.as_ref() else {
+        return Ok(base.clone());
+    };
+    let mut states = base
+        .samplers
+        .iter()
+        .filter(|reflected| reflected.static_state.is_none())
+        .filter_map(|reflected| {
+            samplers
+                .iter()
+                .find(|sampler| {
+                    sampler.binding == reflected.binding
+                        && sampler.source == reims_vgpu_core::SamplerSource::State
+                        && sampler.unnormalized_coordinates
+                })
+                .cloned()
+                .map(|sampler| (reflected.metal_index, sampler))
+        })
+        .collect::<Vec<_>>();
+    states.sort_by_key(|(metal_index, _)| *metal_index);
+    let mut canonical = Vec::with_capacity(states.len());
+    for (metal_index, mut sampler) in states {
+        // Multiple AIR parameters may intentionally alias one Metal sampler
+        // index. The translator accepts one runtime state per Metal index, so
+        // aliases must agree on that state; the Vulkan binding is not part of
+        // the Metal sampler contract supplied to translation.
+        sampler.binding = 0;
+        if let Some((previous_index, previous)) = canonical.last() {
+            if *previous_index == metal_index {
+                if *previous != sampler {
+                    return Err(M2vCacheDecline::RuntimeSamplerSpecialize {
+                        stage: stage_name(source.stage),
+                        detail: format!(
+                            "aliased Metal sampler {metal_index} has conflicting runtime states"
+                        ),
+                    });
+                }
+                continue;
+            }
+        }
+        canonical.push((metal_index, sampler));
+    }
+    let states = canonical;
+    if states.is_empty() {
+        return Ok(base.clone());
+    }
+    if let Some(cached) = shader
+        .render_specializations
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&states)
+        .cloned()
+    {
+        return Ok(project_prepared_variant(
+            cached.variant(),
+            &cached.interface,
+            cached.reflection.descriptor_layout,
+        ));
+    }
+    let specialized = Arc::new(translate_render_with_samplers(source, &states)?);
+    let projected = project_prepared_variant(
+        specialized.variant(),
+        &specialized.interface,
+        specialized.reflection.descriptor_layout,
+    );
+    shader
+        .render_specializations
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(states, specialized);
+    Ok(projected)
 }
 
 /// Prepare an executor-native module produced by a backend specialization
 /// pass. The returned variant owns the native words; callers keep it alive
 /// until the semantic request carrying [`ShaderVariant::id`] has executed.
+#[cfg(any(test, feature = "test-fixtures"))]
 pub fn prepare_shader_words(words: Vec<u32>) -> Arc<ShaderVariant> {
-    ShaderVariant::of(Arc::new(words), Arc::from([]))
+    let declared_bindings = crate::spirv_bind::declared_binding_numbers(&words).into();
+    ShaderVariant::of(
+        Arc::new(words),
+        Arc::from([]),
+        crate::spirv_vertex_input::VertexInputWidths::unknown(),
+        declared_bindings,
+    )
 }
 
 pub(crate) fn resolve_prepared_shader(
@@ -559,6 +834,7 @@ pub fn empty_test_shader(stage: RenderTranslationStage) -> Arc<CachedShader> {
         Vec::new(),
         Arc::new(ShaderReflection {
             reflection_version: REFLECTION_VERSION,
+            descriptor_layout: Default::default(),
             stage,
             entry_point: None,
             bindings: vec![],
@@ -576,6 +852,8 @@ pub fn empty_test_shader(stage: RenderTranslationStage) -> Arc<CachedShader> {
             implicit_imageblock_attachments: vec![],
             fragment_imageblock: None,
             datalayout: None,
+            runtime_sampler_specializations: vec![],
+            runtime_storage_image_specializations: vec![],
             function_constants: vec![],
         }),
     ))
@@ -584,6 +862,10 @@ pub fn empty_test_shader(stage: RenderTranslationStage) -> Arc<CachedShader> {
 impl Drop for ShaderVariant {
     fn drop(&mut self) {
         prepared_shader_registry()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.id);
+        prepared_render_source_registry()
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .remove(&self.id);
@@ -766,10 +1048,16 @@ pub(crate) fn project_shader_interface(
                 array_ref: shape.array_ref,
                 array_length: shape.array_length,
                 storage_format: shape.storage_format.map(|format| match format {
+                    TextureFormat::R8 => StorageImageFormat::R8Unorm,
+                    TextureFormat::Rgba8 => StorageImageFormat::Rgba8Unorm,
                     TextureFormat::R16f => StorageImageFormat::R16Float,
+                    TextureFormat::R16ui => StorageImageFormat::R16Uint,
                     TextureFormat::Rg16f => StorageImageFormat::Rg16Float,
                     TextureFormat::R32f => StorageImageFormat::R32Float,
+                    TextureFormat::R32i => StorageImageFormat::R32Sint,
                     TextureFormat::R32ui => StorageImageFormat::R32Uint,
+                    TextureFormat::Rgba32i => StorageImageFormat::Rgba32Sint,
+                    TextureFormat::Rgba32ui => StorageImageFormat::Rgba32Uint,
                     TextureFormat::Rgba32f => StorageImageFormat::Rgba32Float,
                     TextureFormat::Rgba16f => StorageImageFormat::Rgba16Float,
                     TextureFormat::Rgba8ui => StorageImageFormat::Rgba8Uint,
@@ -804,6 +1092,170 @@ pub(crate) fn project_shader_interface(
     }
 }
 
+pub struct PreparedKernelVariant {
+    pub variant: Arc<ShaderVariant>,
+    pub storage_formats: Vec<(u32, Option<reims_vgpu_protocol::StorageImageFormat>)>,
+    _owner: Arc<CachedShader>,
+}
+
+fn runtime_storage_format(
+    format: reims_vgpu_protocol::StorageImageFormat,
+) -> Result<metal2vulkan::reflect::RuntimeStorageImageFormat, String> {
+    use metal2vulkan::reflect::RuntimeStorageImageFormat as Native;
+    use reims_vgpu_protocol::StorageImageFormat as Semantic;
+    Ok(match format {
+        Semantic::R8Unorm => Native::R8Unorm,
+        Semantic::Rgba8Unorm => Native::Rgba8Unorm,
+        Semantic::Bgra8Unorm => Native::Bgra8Unorm,
+        Semantic::R16Float => Native::R16Float,
+        Semantic::Rg16Float => Native::Rg16Float,
+        Semantic::Rgba16Float => Native::Rgba16Float,
+        Semantic::R32Float => Native::R32Float,
+        Semantic::Rgba32Float => Native::Rgba32Float,
+        Semantic::R16Uint => Native::R16Uint,
+        Semantic::R32Uint => Native::R32Uint,
+        Semantic::Rgba8Uint => Native::Rgba8Uint,
+        Semantic::Rgba16Uint => Native::Rgba16Uint,
+        Semantic::Rgba32Uint => Native::Rgba32Uint,
+        Semantic::R32Sint => Native::R32Sint,
+        Semantic::Rgba8Sint => Native::Rgba8Sint,
+        Semantic::Rgba32Sint => Native::Rgba32Sint,
+        unsupported => {
+            return Err(format!(
+                "runtime storage format {unsupported:?} unsupported"
+            ))
+        }
+    })
+}
+
+fn reflected_storage_format(
+    format: metal2vulkan::meta::TextureFormat,
+) -> reims_vgpu_protocol::StorageImageFormat {
+    use metal2vulkan::meta::TextureFormat as Native;
+    use reims_vgpu_protocol::StorageImageFormat as Semantic;
+    match format {
+        Native::R8 => Semantic::R8Unorm,
+        Native::Rgba8 => Semantic::Rgba8Unorm,
+        Native::R16f => Semantic::R16Float,
+        Native::R16ui => Semantic::R16Uint,
+        Native::Rg16f => Semantic::Rg16Float,
+        Native::R32f => Semantic::R32Float,
+        Native::R32i => Semantic::R32Sint,
+        Native::R32ui => Semantic::R32Uint,
+        Native::Rgba32i => Semantic::Rgba32Sint,
+        Native::Rgba32ui => Semantic::Rgba32Uint,
+        Native::Rgba32f => Semantic::Rgba32Float,
+        Native::Rgba16f => Semantic::Rgba16Float,
+        Native::Rgba8ui => Semantic::Rgba8Uint,
+        Native::Rgba16ui => Semantic::Rgba16Uint,
+        Native::Rgba8i => Semantic::Rgba8Sint,
+    }
+}
+
+fn translate_kernel_with_storage(
+    source: &KernelTranslationSource,
+    requests: &[RuntimeStorageImageRequest],
+) -> M2vResult<CachedShader> {
+    let _guard = translation_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let tmp = tmp_dir();
+    let path = tmp.join("k.air");
+    std::fs::write(&path, source.air.as_ref()).map_err(|error| {
+        M2vCacheDecline::KernelScratchWrite {
+            detail: error.to_string(),
+        }
+    })?;
+    let mut canonical = requests.to_vec();
+    canonical.sort_by_key(|request| request.metal_index);
+    for request in &mut canonical {
+        request.binding = 0;
+    }
+    let mut unique: Vec<RuntimeStorageImageRequest> = Vec::with_capacity(canonical.len());
+    for request in canonical {
+        if let Some(previous) = unique.last() {
+            if previous.metal_index == request.metal_index {
+                if *previous != request {
+                    return Err(M2vCacheDecline::RuntimeStorageImageSpecialize {
+                        detail: format!(
+                            "aliased Metal storage image {} has conflicting runtime states",
+                            request.metal_index
+                        ),
+                    });
+                }
+                continue;
+            }
+        }
+        unique.push(request);
+    }
+    let mut options = metal2vulkan::passes::TransformOptions {
+        kernel_local_size: source.local_size,
+        ..Default::default()
+    };
+    for request in &unique {
+        options = options
+            .with_runtime_storage_image(
+                request.metal_index,
+                metal2vulkan::reflect::RuntimeStorageImageState {
+                    format: runtime_storage_format(request.format).map_err(|detail| {
+                        M2vCacheDecline::RuntimeStorageImageSpecialize { detail }
+                    })?,
+                    capabilities: metal2vulkan::reflect::RuntimeStorageImageCapabilities {
+                        storage_image: request.storage_image,
+                        storage_image_atomic: request.storage_image_atomic,
+                        read_without_format: request.read_without_format,
+                        write_without_format: request.write_without_format,
+                    },
+                },
+            )
+            .map_err(|detail| M2vCacheDecline::RuntimeStorageImageSpecialize { detail })?;
+    }
+    let (spirv, reflection) = metal2vulkan::translate_reflected_with_options(
+        path.to_str().unwrap_or("k.air"),
+        Stage::Kernel,
+        &tmp,
+        options,
+    )
+    .map_err(|detail| M2vCacheDecline::RuntimeStorageImageSpecialize { detail })?;
+    if reflection.local_size != Some(source.local_size)
+        || reflection.runtime_storage_image_specializations.len() != unique.len()
+    {
+        return Err(M2vCacheDecline::RuntimeStorageImageSpecialize {
+            detail: format!(
+                "translator reflected local_size={:?} and {} of {} storage states",
+                reflection.local_size,
+                reflection.runtime_storage_image_specializations.len(),
+                unique.len()
+            ),
+        });
+    }
+    for request in &unique {
+        let expected = metal2vulkan::reflect::RuntimeStorageImageState {
+            format: runtime_storage_format(request.format)
+                .map_err(|detail| M2vCacheDecline::RuntimeStorageImageSpecialize { detail })?,
+            capabilities: metal2vulkan::reflect::RuntimeStorageImageCapabilities {
+                storage_image: request.storage_image,
+                storage_image_atomic: request.storage_image_atomic,
+                read_without_format: request.read_without_format,
+                write_without_format: request.write_without_format,
+            },
+        };
+        let reflected = reflection
+            .runtime_storage_image_specializations
+            .iter()
+            .find(|specialization| specialization.metal_index == request.metal_index);
+        if reflected.map(|specialization| specialization.state) != Some(expected) {
+            return Err(M2vCacheDecline::RuntimeStorageImageSpecialize {
+                detail: format!(
+                    "translator reflected a different runtime state for Metal texture {}",
+                    request.metal_index
+                ),
+            });
+        }
+    }
+    finish_translated(spirv, reflection, Stage::Kernel, None, None)
+}
+
 impl CachedShader {
     /// Size of the translated executable module for diagnostics.
     pub fn module_byte_len(&self) -> usize {
@@ -819,30 +1271,72 @@ impl CachedShader {
     }
 
     /// Statically-used sampled bindings absent from `bound`.
-    pub fn neutral_sampled_image_bindings(&self, bound: &[u32]) -> Vec<u32> {
-        crate::spirv_bind::neutral_sampled_image_bindings(&self.words, bound)
+    pub fn null_sampled_image_bindings(&self, bound: &[u32]) -> Vec<u32> {
+        crate::spirv_bind::reflected_null_sampled_image_bindings(
+            &self.reflection,
+            &self.words,
+            bound,
+        )
     }
 
-    /// Sampler interface of an unrelocated kernel module.
+    /// Sampler interface of a kernel module in its reflected layout.
     pub fn kernel_samplers(&self) -> Arc<[reims_vgpu_core::ReflectedSamplerDescriptor]> {
-        self.variant(false, false).samplers.clone()
+        self.variant().samplers.clone()
     }
 
-    /// Apply executor-native storage-format specialization and publish the
-    /// resulting module behind its semantic prepared-stage identity.
+    /// Translate runtime storage-image state through metal2vulkan and publish
+    /// the exact reflected module behind its semantic prepared identity.
     pub fn prepare_kernel(
-        &self,
-        requests: &[(u32, crate::spirv_bind::ImageFormat)],
-    ) -> Result<Arc<ShaderVariant>, crate::spirv_bind::ImageFormatSpecializeError> {
-        let mut words = self.words.as_ref().clone();
-        crate::spirv_bind::specialize_image_formats(&mut words, requests)?;
-        if requests
+        self: &Arc<Self>,
+        requests: &[RuntimeStorageImageRequest],
+    ) -> M2vResult<PreparedKernelVariant> {
+        let cached = (!requests.is_empty())
+            .then(|| {
+                self.kernel_specializations
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .get(requests)
+                    .cloned()
+            })
+            .flatten();
+        let owner = if requests.is_empty() {
+            Arc::clone(self)
+        } else if let Some(cached) = cached {
+            cached
+        } else {
+            let source = self.kernel_source.as_ref().ok_or_else(|| {
+                M2vCacheDecline::RuntimeStorageImageSpecialize {
+                    detail: "kernel translation source lifetime ended".to_string(),
+                }
+            })?;
+            let specialized = Arc::new(translate_kernel_with_storage(source, requests)?);
+            self.kernel_specializations
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(requests.to_vec(), Arc::clone(&specialized));
+            specialized
+        };
+        let storage_formats = requests
             .iter()
-            .any(|(_, format)| matches!(format, crate::spirv_bind::ImageFormat::Unknown))
-        {
-            crate::spirv_bind::ensure_storage_write_without_format_capability(&mut words);
-        }
-        Ok(prepare_shader_words(words))
+            .map(|request| {
+                let specialization = owner
+                    .reflection
+                    .runtime_storage_image_specializations
+                    .iter()
+                    .find(|state| state.metal_index == request.metal_index);
+                (
+                    request.binding,
+                    specialization
+                        .and_then(|state| state.spirv_format)
+                        .map(reflected_storage_format),
+                )
+            })
+            .collect();
+        Ok(PreparedKernelVariant {
+            variant: owner.variant(),
+            storage_formats,
+            _owner: owner,
+        })
     }
 
     /// Whether translation retained the source module's data-layout contract.
@@ -850,86 +1344,48 @@ impl CachedShader {
         self.reflection.datalayout.is_some()
     }
 
-    /// Materialize a freshly translated module, in the device's binding
-    /// numbering rather than the translator's.
-    ///
-    /// [`crate::spirv_bind::widen_sampled_bands`] runs exactly here,
-    /// once per shader on the translate miss path, because this is the one point
-    /// every consumer of a module goes through — both `spirv` and `words`, and
-    /// therefore every fragment relocation variant derived from `words`. Doing it
-    /// per draw would be a module rewrite on the hot path; doing it in only one
-    /// of the two representations would let the compute rail (which reads
-    /// `spirv`) and the render rail (which reads `words`) disagree about what
-    /// binding a texture has.
-    ///
-    /// `spirv` is rebuilt from the widened words for that reason: it is no longer
-    /// byte-identical to what the translator returned, and the bytes and the
-    /// words must not be allowed to drift apart.
+    /// Materialize the translator-validated module and its reflection without
+    /// changing either. Descriptor numbering is selected before translation
+    /// and the effective layout is carried by the reflection.
     pub fn new(spirv: Vec<u8>, reflection: Arc<ShaderReflection>) -> Self {
-        let interface = Arc::new(project_shader_interface(&reflection));
-        let mut words: Vec<u32> = spirv
+        Self::new_with_source(spirv, reflection, None, None)
+    }
+
+    fn new_with_source(
+        spirv: Vec<u8>,
+        reflection: Arc<ShaderReflection>,
+        render_source: Option<RenderTranslationSource>,
+        kernel_source: Option<KernelTranslationSource>,
+    ) -> Self {
+        let words: Vec<u32> = spirv
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-        let widened = crate::spirv_bind::widen_sampled_bands(&mut words);
-        let spirv = if widened == 0 {
-            // Nothing moved, so the translator's bytes already are the device's.
-            spirv
-        } else {
-            words.iter().flat_map(|w| w.to_le_bytes()).collect()
-        };
+        let interface = Arc::new(project_shader_interface(&reflection));
         Self {
             spirv,
             reflection,
             interface,
             words: Arc::new(words),
             base: OnceLock::new(),
-            frag_reloc: Mutex::new(HashMap::new()),
+            render_source,
+            render_specializations: Mutex::new(HashMap::new()),
+            kernel_source,
+            kernel_specializations: Mutex::new(HashMap::new()),
         }
     }
 
-    /// This module in the binding numbering the two stage-collision flags name,
-    /// with the walks of that numbering beside it — see [`ShaderVariant`].
-    ///
-    /// `separate_sampled` relocates sampled-resource bindings first (archive
-    /// order), then `buf_collide` relocates the buffer band — matching the
-    /// historical per-draw mutation order exactly. Cached per variant, and
-    /// `(false, false)` is a variant like any other rather than a short-circuit,
-    /// because it is the one a vertex shader always takes and its walk is worth
-    /// caching for exactly the same reason.
-    pub fn variant(&self, separate_sampled: bool, buf_collide: bool) -> Arc<ShaderVariant> {
-        if !separate_sampled && !buf_collide {
-            return self
-                .base
-                .get_or_init(|| {
-                    ShaderVariant::of(
-                        self.words.clone(),
-                        crate::spirv_bind::reflected_sampler_descriptors(&self.reflection, false)
-                            .into(),
-                    )
-                })
-                .clone();
-        }
-        let mut cache = self.frag_reloc.lock().unwrap_or_else(|e| e.into_inner());
-        cache
-            .entry((separate_sampled, buf_collide))
-            .or_insert_with(|| {
-                let mut w: Vec<u32> = (*self.words).clone();
-                if separate_sampled {
-                    let n = crate::spirv_bind::offset_fragment_sampled_resource_bindings(&mut w);
-                    reims_vgpu_observe::line(format!("linux_m2v frag_sampled_reloc n={n}"));
-                }
-                if buf_collide {
-                    let n = crate::spirv_bind::offset_fragment_buffer_bindings(&mut w);
-                    reims_vgpu_observe::line(format!("linux_m2v frag_buf_reloc n={n}"));
-                }
+    /// Executable module and reflected resources in the selected layout.
+    pub fn variant(&self) -> Arc<ShaderVariant> {
+        self.base
+            .get_or_init(|| {
                 ShaderVariant::of(
-                    Arc::new(w),
-                    crate::spirv_bind::reflected_sampler_descriptors(
-                        &self.reflection,
-                        separate_sampled,
-                    )
-                    .into(),
+                    self.words.clone(),
+                    crate::spirv_bind::reflected_sampler_descriptors(&self.reflection).into(),
+                    crate::spirv_vertex_input::VertexInputWidths::from_reflection(
+                        &self.reflection.vertex_attributes,
+                    ),
+                    crate::spirv_bind::reflected_descriptor_bindings(&self.reflection).into(),
                 )
             })
             .clone()
@@ -980,14 +1436,15 @@ enum Entry {
 /// The AIR is retained. That is the whole cost of the identity compare, and it
 /// is a good deal smaller than [`Cache`]'s own doc once implied: a
 /// [`CachedShader`] already holds the module as `spirv` bytes *and* as `words`,
-/// plus a relocated word copy per fragment variant, so one copy of the AIR that
-/// produced them is a fraction of the entry rather than a doubling of it.
+/// so one copy of the AIR that produced them is a fraction of the entry rather
+/// than a doubling of it.
 struct Slot {
     stage: u8,
     /// `Some` for a kernel, whose LocalSize is baked into the SPIR-V, so one
     /// AIR blob dispatched at two geometries is two shaders. `None` for a render
     /// stage, which has no such parameter.
     local_size: Option<[u32; 3]>,
+    raster_sample_count: Option<u32>,
     air: Arc<[u8]>,
     entry: Entry,
 }
@@ -995,7 +1452,10 @@ struct Slot {
 impl Slot {
     /// The full identity compare. This alone decides a hit.
     fn is(&self, id: ShaderId<'_>) -> bool {
-        self.stage == id.stage && self.local_size == id.local_size && *self.air == *id.air
+        self.stage == id.stage
+            && self.local_size == id.local_size
+            && self.raster_sample_count == id.raster_sample_count
+            && *self.air == *id.air
     }
 }
 
@@ -1040,15 +1500,18 @@ struct ShaderId<'a> {
     digest: u64,
     stage: u8,
     local_size: Option<[u32; 3]>,
+    raster_sample_count: Option<u32>,
     air: &'a [u8],
 }
 
 impl<'a> ShaderId<'a> {
-    fn render(stage: Stage, air: &'a [u8]) -> Self {
+    fn render(stage: Stage, air: &'a [u8], raster_sample_count: u32) -> Self {
+        let raster_sample_count = effective_raster_sample_count(stage, raster_sample_count);
         Self {
-            digest: air_key(stage, air),
+            digest: air_key(stage, air, raster_sample_count),
             stage: stage_tag(stage),
             local_size: None,
+            raster_sample_count: Some(raster_sample_count),
             air,
         }
     }
@@ -1058,6 +1521,7 @@ impl<'a> ShaderId<'a> {
             digest: air_key_kernel(air, local_size),
             stage: stage_tag(Stage::Kernel),
             local_size: Some(local_size),
+            raster_sample_count: None,
             air,
         }
     }
@@ -1088,6 +1552,7 @@ impl Cache {
             None => bucket.push(Slot {
                 stage: id.stage,
                 local_size: id.local_size,
+                raster_sample_count: id.raster_sample_count,
                 air: Arc::clone(air),
                 entry,
             }),
@@ -1120,6 +1585,7 @@ impl Cache {
 struct TranslationTask {
     stage: Stage,
     kernel_local_size: Option<[u32; 3]>,
+    raster_sample_count: Option<u32>,
     /// Shared with the [`Slot`] the admission filed, so the identity the worker
     /// completes under is the same bytes the admission was asked about and not a
     /// second copy that could differ.
@@ -1131,7 +1597,12 @@ impl TranslationTask {
     fn id(&self) -> ShaderId<'_> {
         match self.kernel_local_size {
             Some(local_size) => ShaderId::kernel(&self.air, local_size),
-            None => ShaderId::render(self.stage, &self.air),
+            None => ShaderId::render(
+                self.stage,
+                &self.air,
+                self.raster_sample_count
+                    .expect("render translation has sample count"),
+            ),
         }
     }
 }
@@ -1146,6 +1617,14 @@ fn stage_tag(stage: Stage) -> u8 {
         Stage::Vertex => 1,
         Stage::Fragment => 2,
         Stage::Kernel => 3,
+    }
+}
+
+fn effective_raster_sample_count(stage: Stage, raster_sample_count: u32) -> u32 {
+    if stage == Stage::Fragment {
+        raster_sample_count
+    } else {
+        1
     }
 }
 
@@ -1170,10 +1649,11 @@ fn stage_tag(stage: Stage) -> u8 {
 /// two blobs of different lengths are not merely unlikely to share a bucket —
 /// the length is in the digest too. That is now a statement about walk length
 /// rather than about correctness.
-fn air_key(stage: Stage, air: &[u8]) -> u64 {
+fn air_key(stage: Stage, air: &[u8], raster_sample_count: u32) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     stage_tag(stage).hash(&mut h);
     air.hash(&mut h);
+    effective_raster_sample_count(stage, raster_sample_count).hash(&mut h);
     h.finish()
 }
 
@@ -1210,7 +1690,65 @@ fn translation_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-fn translate_air(air: &[u8], stage: Stage) -> M2vResult<CachedShader> {
+/// Independently translated graphics stages share set zero, but never share a
+/// binding range. The translator validates this complete layout and reflects
+/// the exact result beside the module.
+fn render_descriptor_layout(stage: Stage) -> metal2vulkan::reflect::DescriptorLayout {
+    use metal2vulkan::reflect::{DescriptorBindingRange, DescriptorLayout};
+
+    let layout = DescriptorLayout::default();
+    if stage != Stage::Fragment {
+        return layout;
+    }
+    let fragment_base = [
+        layout.buffers.end,
+        layout.sampled_textures.end,
+        layout.samplers.end,
+        layout.color_inputs.end,
+        layout.imageblocks.end,
+        layout.fragment_imageblocks.end,
+        layout.storage_textures.end,
+        layout.synthetic.end,
+    ]
+    .into_iter()
+    .max()
+    .expect("descriptor layout has fixed resource classes");
+    let shifted = |range: DescriptorBindingRange| DescriptorBindingRange {
+        start: range
+            .start
+            .checked_add(fragment_base)
+            .expect("validated default descriptor layout fits a second stage"),
+        end: range
+            .end
+            .checked_add(fragment_base)
+            .expect("validated default descriptor layout fits a second stage"),
+    };
+    DescriptorLayout {
+        buffers: shifted(layout.buffers),
+        sampled_textures: shifted(layout.sampled_textures),
+        samplers: shifted(layout.samplers),
+        // Color inputs exist only in fragment shaders, so they cannot collide
+        // with the independently translated vertex stage. Keeping their
+        // default range also keeps the engine's attachment write at the exact
+        // translator-owned ABI binding.
+        color_inputs: layout.color_inputs,
+        imageblocks: shifted(layout.imageblocks),
+        fragment_imageblocks: shifted(layout.fragment_imageblocks),
+        storage_textures: shifted(layout.storage_textures),
+        synthetic: shifted(layout.synthetic),
+        ..layout
+    }
+}
+
+/// Complete translator-owned descriptor layout for one independently
+/// translated graphics stage.
+pub fn descriptor_layout_for_render_stage(
+    stage: RenderTranslationStage,
+) -> metal2vulkan::reflect::DescriptorLayout {
+    render_descriptor_layout(stage.into())
+}
+
+fn translate_air(air: &[u8], stage: Stage, raster_sample_count: u32) -> M2vResult<CachedShader> {
     // metal2vulkan's tool boundary uses fixed scratch names inside `tmp_dir`.
     // Serialize sync and background calls so their AIR/LLVM/SPIR-V files never
     // alias one another.
@@ -1223,13 +1761,32 @@ fn translate_air(air: &[u8], stage: Stage) -> M2vResult<CachedShader> {
     };
     let path = tmp.join(name);
     std::fs::write(&path, air).map_err(|e| scratch_write_decline(stage, e.to_string()))?;
-    // Reflected translate: byte-identical SPIR-V PLUS the stage-interface facade.
-    // `reflection.datalayout` carries the source `target datalayout` the sanitizer
-    // strips, so the post-emit ABI reconciliation below no longer re-reads `k.ll`.
-    let (spirv, reflection) =
-        metal2vulkan::translate_reflected(path.to_str().unwrap_or(name), stage, &tmp)
-            .map_err(|e| translate_decline(stage, e.to_string()))?;
-    finish_translated(spirv, reflection, stage)
+    // Reflected translate: translator-validated SPIR-V plus the stage-interface
+    // facade derived from the same AIR parse.
+    let mut options = metal2vulkan::passes::TransformOptions::default()
+        .with_descriptor_layout(render_descriptor_layout(stage))
+        .map_err(|error| translate_decline(stage, error.to_string()))?;
+    if stage == Stage::Fragment {
+        options.raster_sample_count = Some(raster_sample_count);
+    }
+    let (spirv, reflection) = metal2vulkan::translate_reflected_with_options(
+        path.to_str().unwrap_or(name),
+        stage,
+        &tmp,
+        options,
+    )
+    .map_err(|e| translate_decline(stage, e.to_string()))?;
+    finish_translated(
+        spirv,
+        reflection,
+        stage,
+        Some(RenderTranslationSource {
+            air: Arc::from(air),
+            stage,
+            raster_sample_count,
+        }),
+        None,
+    )
 }
 
 fn translate_kernel_air(air: &[u8], local_size: [u32; 3]) -> M2vResult<CachedShader> {
@@ -1258,24 +1815,39 @@ fn translate_kernel_air(air: &[u8], local_size: [u32; 3]) -> M2vResult<CachedSha
             reflected: reflection.local_size,
         });
     }
-    finish_translated(spirv, reflection, Stage::Kernel)
+    finish_translated(
+        spirv,
+        reflection,
+        Stage::Kernel,
+        None,
+        Some(KernelTranslationSource {
+            air: Arc::from(air),
+            local_size,
+        }),
+    )
 }
 
-/// Post-emit ABI reconciliation + package the translated shader with its reflection.
+/// Package the translator-validated module with reflection produced by the
+/// same translation and options.
 fn finish_translated(
     spirv: Vec<u8>,
     reflection: ShaderReflection,
     stage: Stage,
+    render_source: Option<RenderTranslationSource>,
+    kernel_source: Option<KernelTranslationSource>,
 ) -> M2vResult<CachedShader> {
     validate_reflection(&reflection, stage)?;
-    let spirv = repair_layout(&reflection, spirv, stage)?;
-    // Once-per-translate: surface any runtime function constants this shader
-    // declares. metal2vulkan folds them to their disabled default and the paravirt
-    // stream carries no MTLFunctionConstantValues, so the FC-disabled variant is
-    // what we run; this makes that reliance measurable (which shaders use FCs)
-    // without touching translation or rendering. Silent for FC-free shaders.
-    crate::spirv_bind::log_folded_function_constants(&reflection);
-    Ok(CachedShader::new(spirv, Arc::new(reflection)))
+    // Once per translate, surface runtime function constants for which the
+    // paravirt stream supplied no values. The translator exposes exact byte
+    // specialization, but inventing those bytes here would violate the guest
+    // contract. Silent for shaders without function constants.
+    crate::spirv_bind::log_unavailable_function_constants(&reflection);
+    Ok(CachedShader::new_with_source(
+        spirv,
+        Arc::new(reflection),
+        render_source,
+        kernel_source,
+    ))
 }
 
 /// Once-per-translate (miss path) well-formedness guard on the AIR-derived
@@ -1296,42 +1868,23 @@ fn validate_reflection(reflection: &ShaderReflection, stage: Stage) -> M2vResult
     Ok(())
 }
 
-fn repair_layout(
-    reflection: &ShaderReflection,
-    spirv: Vec<u8>,
-    stage: Stage,
-) -> M2vResult<Vec<u8>> {
-    // The datalayout is the reflection's — single source of truth, no `k.ll` re-read.
-    // A reflected translate from unsanitized AIR always populates it; its absence
-    // is a genuine gap (fail-visible), matching the prior `air_datalayout_missing`.
-    let datalayout =
-        reflection
-            .datalayout
-            .as_deref()
-            .ok_or(M2vCacheDecline::ReflectionDatalayoutMissing {
-                stage: stage_name(stage),
-            })?;
-    let (spirv, stats) =
-        crate::spirv_layout::repair_llvm_vector_alloc_offsets_from_datalayout(datalayout, &spirv)
-            .map_err(|reason| M2vCacheDecline::LayoutRepair {
-            stage: stage_name(stage),
-            reason,
-        })?;
-    if stats.members != 0 {
-        reims_vgpu_observe::fail(format!(
-            "linux_m2v_layout_repair stage={stage:?} reason=llvm_vector_alloc_stride structs={} members={}",
-            stats.structs, stats.members
-        ));
-    }
-    Ok(spirv)
-}
-
 /// Start translating a render stage without holding protocol state or the
 /// sole FIFO scheduler. Returns true when the content is already resolved
 /// (success or deterministic failure), false while the background worker owns
 /// it. Callers keep the guest packet at the channel head and retry on poll.
-pub fn ensure_cached_async(air: &[u8], stage: Stage, pipeline_ref: u32) -> bool {
-    ensure_cached_async_keyed(ShaderId::render(stage, air), stage, None, pipeline_ref)
+pub fn ensure_cached_async(
+    air: &[u8],
+    stage: Stage,
+    raster_sample_count: u32,
+    pipeline_ref: u32,
+) -> bool {
+    ensure_cached_async_keyed(
+        ShaderId::render(stage, air, raster_sample_count),
+        stage,
+        None,
+        Some(raster_sample_count),
+        pipeline_ref,
+    )
 }
 
 /// Start translating a render stage without exposing translator-native types
@@ -1339,9 +1892,10 @@ pub fn ensure_cached_async(air: &[u8], stage: Stage, pipeline_ref: u32) -> bool 
 pub fn ensure_render_cached_async(
     air: &[u8],
     stage: RenderTranslationStage,
+    raster_sample_count: u32,
     pipeline_ref: u32,
 ) -> bool {
-    ensure_cached_async(air, stage.into(), pipeline_ref)
+    ensure_cached_async(air, stage.into(), raster_sample_count, pipeline_ref)
 }
 
 /// Kernel counterpart to [`ensure_cached_async`]. LocalSize is part of both
@@ -1355,6 +1909,7 @@ pub fn ensure_cached_kernel_async(air: &[u8], local_size: [u32; 3], pipeline_ref
         ShaderId::kernel(air, local_size),
         Stage::Kernel,
         Some(local_size),
+        None,
         pipeline_ref,
     )
 }
@@ -1363,6 +1918,7 @@ fn ensure_cached_async_keyed(
     id: ShaderId<'_>,
     stage: Stage,
     kernel_local_size: Option<[u32; 3]>,
+    raster_sample_count: Option<u32>,
     pipeline_ref: u32,
 ) -> bool {
     let mut start_worker = false;
@@ -1386,6 +1942,7 @@ fn ensure_cached_async_keyed(
         c.async_queue.push_back(TranslationTask {
             stage,
             kernel_local_size,
+            raster_sample_count,
             air,
             pipeline_ref,
         });
@@ -1424,7 +1981,12 @@ fn async_worker() {
         };
         let result = match task.kernel_local_size {
             Some(local_size) => translate_kernel_air(&task.air, local_size),
-            None => translate_air(&task.air, task.stage),
+            None => translate_air(
+                &task.air,
+                task.stage,
+                task.raster_sample_count
+                    .expect("render translation has sample count"),
+            ),
         };
         let (hits, misses, detail, failure) = {
             let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
@@ -1440,22 +2002,6 @@ fn async_worker() {
                     // roles the emitter decorated from — single source of truth.
                     if task.stage == Stage::Vertex {
                         let vb = shader.reflection.vertex_builtins.unwrap_or_default();
-                        // Cross-check the AIR-derived reflection against the emitted
-                        // SPIR-V decorations, once per translate (miss path only), so a
-                        // translator regression that drops a builtin between AIR meta and
-                        // emit is fail-visible instead of silent. Quiet on a healthy boot.
-                        let emit_instance = spirv_uses_builtin(&shader.spirv, 43);
-                        let emit_vertex = spirv_uses_builtin(&shader.spirv, 42);
-                        if emit_instance != vb.uses_instance_index
-                            || emit_vertex != vb.uses_vertex_index
-                        {
-                            reims_vgpu_observe::fail(format!(
-                                "m2v_reflect_divergence pipe={} stage=Vertex kind=vertex_builtins reflect_instance={} emit_instance={} reflect_vertex={} emit_vertex={}",
-                                task.pipeline_ref,
-                                vb.uses_instance_index as u8, emit_instance as u8,
-                                vb.uses_vertex_index as u8, emit_vertex as u8
-                            ));
-                        }
                         // Decoded vertex-builtin usage census (not an error);
                         // route off() so it leaves the curated real-error view.
                         // The genuine reflect-vs-emit divergence above stays
@@ -1505,34 +2051,6 @@ fn async_worker() {
 /// Translate `air` for `stage`, returning cached SPIR-V when AIR matches a prior
 /// translate. Logs `linux_m2v_translate` on miss and `linux_m2v_translate_hit`
 /// on hit (pipe id is telemetry only).
-/// Does the SPIR-V module decorate any id with `BuiltIn <builtin>`? Scans
-/// `OpDecorate` (opcode 71) instructions for a `BuiltIn` (decoration 11) whose
-/// value equals `builtin` (e.g. 42 = VertexIndex, 43 = InstanceIndex).
-/// Bounds-checked word walk over the little-endian SPIR-V stream (header skipped).
-fn spirv_uses_builtin(spv: &[u8], builtin: u32) -> bool {
-    if spv.len() < 20 || !spv.len().is_multiple_of(4) {
-        return false;
-    }
-    let words: Vec<u32> = spv
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
-    let mut i = 5; // skip header
-    while i < words.len() {
-        let word_count = (words[i] >> 16) as usize;
-        let opcode = words[i] & 0xffff;
-        if word_count == 0 || i + word_count > words.len() {
-            break;
-        }
-        // OpDecorate = 71: [target, decoration, operands...]; BuiltIn = 11.
-        if opcode == 71 && word_count >= 4 && words[i + 2] == 11 && words[i + 3] == builtin {
-            return true;
-        }
-        i += word_count;
-    }
-    false
-}
-
 /// Translate `air` for `stage`, returning the whole [`CachedShader`] (SPIR-V +
 /// reflection) as a shared handle, so a consumer reads stage-interface facts
 /// (texture shapes, vertex builtins, descriptor bindings) from the reflection
@@ -1541,9 +2059,10 @@ fn spirv_uses_builtin(spv: &[u8], builtin: u32) -> bool {
 pub fn translate_cached_reflected(
     air: &[u8],
     stage: Stage,
+    raster_sample_count: u32,
     pipeline_ref: u32,
 ) -> M2vResult<Arc<CachedShader>> {
-    let id = ShaderId::render(stage, air);
+    let id = ShaderId::render(stage, air, raster_sample_count);
     {
         let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
         match c.find(id).cloned() {
@@ -1578,7 +2097,7 @@ pub fn translate_cached_reflected(
         }
     }
 
-    let shader = Arc::new(translate_air(air, stage)?);
+    let shader = Arc::new(translate_air(air, stage, raster_sample_count)?);
 
     {
         let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
@@ -1599,9 +2118,10 @@ pub fn translate_cached_reflected(
 pub fn translate_render_cached_reflected(
     air: &[u8],
     stage: RenderTranslationStage,
+    raster_sample_count: u32,
     pipeline_ref: u32,
 ) -> M2vResult<Arc<CachedShader>> {
-    translate_cached_reflected(air, stage.into(), pipeline_ref)
+    translate_cached_reflected(air, stage.into(), raster_sample_count, pipeline_ref)
 }
 
 /// Translate a **compute** AIR kernel with explicit LocalSize (threadgroup dims),
@@ -1696,18 +2216,39 @@ mod tests {
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// A variant's reflected sampler interface must agree with the executable
-    /// module in *that variant's* numbering.
-    ///
-    /// This is the invariant [`ShaderVariant`] exists to make unrepresentable,
-    /// and it is worth a test because the failure it replaces was silent: the
-    /// draw path used to walk `f_words` at one point in the function and take
-    /// the relocation flags at another, so a variant's answer and its numbering
-    /// only agreed because two call sites happened to be passed the same pair.
-    /// A relocated module renumbers its descriptor bindings, so an answer taken
-    /// for the wrong variant is a real sampler bound at the wrong number.
+    fn empty_reflection(
+        stage: metal2vulkan::reflect::ShaderStage,
+        datalayout: Option<&str>,
+    ) -> metal2vulkan::reflect::ShaderReflection {
+        use metal2vulkan::reflect::{ShaderReflection, REFLECTION_VERSION};
+        ShaderReflection {
+            reflection_version: REFLECTION_VERSION,
+            stage,
+            entry_point: None,
+            bindings: vec![],
+            argument_buffer_fields: vec![],
+            vertex_attributes: vec![],
+            varyings: vec![],
+            render_targets: vec![],
+            depth_members: vec![],
+            depth_qualifier: None,
+            stencil_members: vec![],
+            local_size: (stage == metal2vulkan::reflect::ShaderStage::Kernel).then_some([1, 1, 1]),
+            vertex_builtins: None,
+            tessellation: None,
+            imageblock_layouts: vec![],
+            implicit_imageblock_attachments: vec![],
+            fragment_imageblock: None,
+            descriptor_layout: metal2vulkan::reflect::DescriptorLayout::default(),
+            datalayout: datalayout.map(str::to_owned),
+            runtime_sampler_specializations: vec![],
+            runtime_storage_image_specializations: vec![],
+            function_constants: vec![],
+        }
+    }
+
     #[test]
-    fn every_variants_reflected_sampler_bindings_match_the_executable_module() {
+    fn reflected_sampler_bindings_are_the_executable_interface() {
         let translator_base = metal2vulkan::reflect::SAMPLER_BINDING_BASE;
         let words = crate::spirv_bind::test_module_with_samplers(&[
             translator_base + 3,
@@ -1717,30 +2258,20 @@ mod tests {
         let spirv: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let shader = synth_shader_with_samplers(Stage::Fragment, spirv, &[3, 7, 11]);
 
-        // The fixture is only useful if the walk finds something in it. Not
-        // asserted against the numbers the fixture was built with:
-        // `CachedShader::new` runs `widen_sampled_bands` over every module, so
-        // the base variant is already in the device's numbering rather than the
-        // translator's, and that is the numbering every consumer sees.
+        let variant = shader.variant();
+        assert_eq!(variant.samplers.len(), 3);
         assert_eq!(
-            shader.variant(false, false).samplers.len(),
-            3,
-            "the fixture's three samplers survive band widening"
+            variant
+                .samplers
+                .iter()
+                .map(|sampler| sampler.binding)
+                .collect::<Vec<_>>(),
+            vec![
+                translator_base + 3,
+                translator_base + 7,
+                translator_base + 11
+            ]
         );
-
-        for (separate_sampled, buf_collide) in
-            [(false, false), (true, false), (false, true), (true, true)]
-        {
-            let v = shader.variant(separate_sampled, buf_collide);
-            assert_eq!(
-                v.samplers
-                    .iter()
-                    .map(|sampler| sampler.binding)
-                    .collect::<Vec<_>>(),
-                crate::spirv_bind::sampler_bindings(&v.words),
-                "variant({separate_sampled}, {buf_collide})"
-            );
-        }
     }
 
     /// A variant is computed once and handed out by pointer after that, which is
@@ -1750,20 +2281,15 @@ mod tests {
         let words = crate::spirv_bind::test_module_with_samplers(&[5]);
         let spirv: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let shader = synth_shader(Stage::Fragment, spirv);
-        for (separate_sampled, buf_collide) in [(false, false), (true, true)] {
-            let first = shader.variant(separate_sampled, buf_collide);
-            let again = shader.variant(separate_sampled, buf_collide);
-            assert!(
-                Arc::ptr_eq(&first, &again),
-                "variant({separate_sampled}, {buf_collide}) was rebuilt"
-            );
-        }
+        let first = shader.variant();
+        let again = shader.variant();
+        assert!(Arc::ptr_eq(&first, &again));
     }
 
     #[test]
     fn prepared_identity_resolves_only_for_the_variant_lifetime() {
         let shader = synth_shader(Stage::Vertex, Vec::new());
-        let variant = shader.variant(false, false);
+        let variant = shader.variant();
         let stage = prepared_stage(&variant);
 
         let resolved = resolve_prepared_shader(stage.id).expect("live variant must resolve");
@@ -1790,56 +2316,70 @@ mod tests {
         let unused = crate::spirv_bind::test_support::module_with_descriptor(33, false);
         let used = crate::spirv_bind::test_support::module_with_descriptor(34, true);
 
-        let unused_shader = synth_shader(
+        let unused_shader = synth_shader_with_resources(
             Stage::Fragment,
             unused.iter().flat_map(|word| word.to_le_bytes()).collect(),
+            &[1],
+            metal2vulkan::reflect::ResourceKind::Texture,
+            metal2vulkan::reflect::TEXTURE_BINDING_BASE,
         );
-        let used_shader = synth_shader(
+        let used_shader = synth_shader_with_resources(
             Stage::Fragment,
             used.iter().flat_map(|word| word.to_le_bytes()).collect(),
+            &[2],
+            metal2vulkan::reflect::ResourceKind::Texture,
+            metal2vulkan::reflect::TEXTURE_BINDING_BASE,
         );
 
-        assert!(unused_shader
-            .variant(false, false)
-            .used_descriptor_bindings
-            .is_empty());
+        assert!(unused_shader.variant().used_descriptor_bindings.is_empty());
         assert_eq!(
-            used_shader
-                .variant(false, false)
-                .used_descriptor_bindings
-                .as_ref(),
+            used_shader.variant().used_descriptor_bindings.as_ref(),
             &[34]
         );
     }
 
     #[test]
+    fn a_missing_sampled_descriptor_uses_reflected_class_and_executable_use() {
+        let words = crate::spirv_bind::test_module_with_two_sampled_images(33, 34);
+        let shader = synth_shader_with_resources(
+            Stage::Kernel,
+            words.iter().flat_map(|word| word.to_le_bytes()).collect(),
+            &[1, 2],
+            metal2vulkan::reflect::ResourceKind::Texture,
+            metal2vulkan::reflect::TEXTURE_BINDING_BASE,
+        );
+
+        assert_eq!(shader.null_sampled_image_bindings(&[]), vec![33]);
+        assert!(shader.null_sampled_image_bindings(&[33]).is_empty());
+    }
+
+    #[test]
     fn retained_pipeline_projection_keeps_semantics_and_hides_native_words() {
         let words = crate::spirv_bind::test_support::module_with_descriptor(34, true);
-        let shader = synth_shader(
+        let shader = synth_shader_with_resources(
             Stage::Fragment,
             words.iter().flat_map(|word| word.to_le_bytes()).collect(),
+            &[2],
+            metal2vulkan::reflect::ResourceKind::Texture,
+            metal2vulkan::reflect::TEXTURE_BINDING_BASE,
         );
         let family = prepare_render_shader(&shader, RenderTranslationStage::Fragment);
 
-        for (separate_sampled, buffer_collision) in
-            [(false, false), (true, false), (false, true), (true, true)]
-        {
-            let variant = family.variant(separate_sampled, buffer_collision);
-            assert_eq!(variant.word_count as usize, words.len());
-            assert_eq!(variant.declared_bindings.len(), 1);
-            let binding = variant.declared_bindings[0];
-            assert_eq!(
-                variant.descriptor_use(binding),
-                reims_vgpu_core::DescriptorUse::Used
-            );
-            assert!(resolve_prepared_shader(variant.program.id).is_some());
-        }
+        let variant = family.variant();
+        assert_eq!(variant.word_count as usize, words.len());
+        assert_eq!(variant.declared_bindings.len(), 1);
+        let binding = variant.declared_bindings[0];
+        assert_eq!(
+            variant.descriptor_use(binding),
+            reims_vgpu_core::DescriptorUse::Used
+        );
+        assert!(resolve_prepared_shader(variant.program.id).is_some());
     }
 
     /// A minimal `CachedShader` wrapping raw bytes with an empty reflection —
     /// enough to prime the cache in unit tests that never call metal2vulkan.
     fn synth_shader(stage: Stage, spirv: Vec<u8>) -> Arc<CachedShader> {
-        use metal2vulkan::reflect::{ShaderReflection, ShaderStage, REFLECTION_VERSION};
+        use metal2vulkan::reflect::ShaderStage;
         let stage = match stage {
             Stage::Vertex => ShaderStage::Vertex,
             Stage::Fragment => ShaderStage::Fragment,
@@ -1847,27 +2387,7 @@ mod tests {
         };
         Arc::new(CachedShader::new(
             spirv,
-            Arc::new(ShaderReflection {
-                reflection_version: REFLECTION_VERSION,
-                stage,
-                entry_point: None,
-                bindings: vec![],
-                argument_buffer_fields: vec![],
-                vertex_attributes: vec![],
-                varyings: vec![],
-                render_targets: vec![],
-                depth_members: vec![],
-                depth_qualifier: None,
-                stencil_members: vec![],
-                local_size: (stage == ShaderStage::Kernel).then_some([1, 1, 1]),
-                vertex_builtins: None,
-                tessellation: None,
-                imageblock_layouts: vec![],
-                implicit_imageblock_attachments: vec![],
-                fragment_imageblock: None,
-                datalayout: None,
-                function_constants: vec![],
-            }),
+            Arc::new(empty_reflection(stage, None)),
         ))
     }
 
@@ -1946,14 +2466,17 @@ mod tests {
                 imageblock_layouts: vec![],
                 implicit_imageblock_attachments: vec![],
                 fragment_imageblock: None,
+                descriptor_layout: metal2vulkan::reflect::DescriptorLayout::default(),
                 datalayout: None,
+                runtime_sampler_specializations: vec![],
+                runtime_storage_image_specializations: vec![],
                 function_constants: vec![],
             }),
         ))
     }
 
     #[test]
-    fn prepared_texture_use_is_keyed_by_metal_index_across_relocations() {
+    fn prepared_texture_use_is_keyed_by_metal_index() {
         const METAL_INDEX: u32 = 2;
         let binding = crate::spirv_bind::TEXTURE_BINDING_BASE + METAL_INDEX;
         let words = crate::spirv_bind::test_support::module_with_descriptor(binding, true);
@@ -1966,41 +2489,21 @@ mod tests {
         );
         let family = prepare_render_shader(&shader, RenderTranslationStage::Fragment);
 
-        for (separate_sampled, buffer_collision) in
-            [(false, false), (true, false), (false, true), (true, true)]
-        {
-            let variant = family.variant(separate_sampled, buffer_collision);
-            assert_eq!(
-                variant.texture_use(METAL_INDEX),
-                reims_vgpu_core::DescriptorUse::Used
-            );
-            assert_eq!(
-                variant.texture_use(METAL_INDEX + 1),
-                reims_vgpu_core::DescriptorUse::NotDeclared
-            );
-            let sampled_offset = if separate_sampled {
-                crate::spirv_bind::FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
-            } else {
-                0
-            };
-            assert_eq!(
-                variant.texture_binding(METAL_INDEX, Some(binding)),
-                binding + sampled_offset
-            );
-            assert_eq!(
-                variant.sampler_binding(METAL_INDEX),
-                crate::spirv_bind::SAMPLER_BINDING_BASE + METAL_INDEX + sampled_offset
-            );
-            assert_eq!(
-                variant.buffer_binding(METAL_INDEX),
-                METAL_INDEX
-                    + if buffer_collision {
-                        crate::spirv_bind::FRAG_BUFFER_BINDING_OFFSET
-                    } else {
-                        0
-                    }
-            );
-        }
+        let variant = family.variant();
+        assert_eq!(
+            variant.texture_use(METAL_INDEX),
+            reims_vgpu_core::DescriptorUse::Used
+        );
+        assert_eq!(
+            variant.texture_use(METAL_INDEX + 1),
+            reims_vgpu_core::DescriptorUse::NotDeclared
+        );
+        assert_eq!(variant.texture_binding(METAL_INDEX, Some(binding)), binding);
+        assert_eq!(
+            variant.sampler_binding(METAL_INDEX),
+            metal2vulkan::reflect::SAMPLER_BINDING_BASE + METAL_INDEX
+        );
+        assert_eq!(variant.buffer_binding(METAL_INDEX), METAL_INDEX);
     }
 
     #[test]
@@ -2017,85 +2520,118 @@ mod tests {
         ));
     }
 
-    /// `CachedShader::new` widens the translator's bands, and `variant`
-    /// relocates on top of that — in that order, for every representation.
-    #[test]
-    fn variant_words_match_direct_relocation_and_cache() {
-        use crate::spirv_bind::{
-            FRAG_BUFFER_BINDING_OFFSET, FRAG_SAMPLED_RESOURCE_BINDING_OFFSET,
-            M2V_SAMPLER_BINDING_BASE, M2V_TEXTURE_BINDING_BASE, SAMPLED_TAIL_WIDEN_OFFSET,
-        };
-
-        // Minimal module: 5-word header + three OpDecorate Binding instructions
-        // in the TRANSLATOR's numbering, which is what a fresh translate hands
-        // over. One buffer, one texture, and the top of the translator's sampler
-        // band — the maximum source the widen has to carry.
-        const TOP_SAMPLER: u32 = M2V_SAMPLER_BINDING_BASE + 31;
-        let decorate = |id: u32, binding: u32| vec![(4u32 << 16) | 71, id, 33, binding];
-        let mut words: Vec<u32> = vec![0x0723_0203, 0x0001_0000, 0, 100, 0];
-        words.extend(decorate(7, 3));
-        words.extend(decorate(8, M2V_TEXTURE_BINDING_BASE + 8));
-        words.extend(decorate(9, TOP_SAMPLER));
-        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let shader = synth_shader(Stage::Fragment, bytes);
-
-        // The stored module is the widened one: the sampler moved out of the
-        // texture band's way, the buffer and texture did not move at all.
-        let mut widened = words.clone();
-        let moved = crate::spirv_bind::widen_sampled_bands(&mut widened);
-        assert_eq!(moved, 1, "only the sampler band moves");
-        assert_eq!(*shader.words, widened);
-        assert_eq!(shader.words[8], 3);
-        assert_eq!(shader.words[12], M2V_TEXTURE_BINDING_BASE + 8);
-        assert_eq!(shader.words[16], TOP_SAMPLER + SAMPLED_TAIL_WIDEN_OFFSET);
-        // The bytes must not be allowed to disagree with the words.
-        let from_bytes: Vec<u32> = shader
-            .spirv
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        assert_eq!(from_bytes, widened);
-
-        // No flags → the base Arc, un-relocated.
-        let base = shader.variant(false, false).words.clone();
-        assert!(Arc::ptr_eq(&base, &shader.words));
-
-        // Both flags → sampled reloc first, then buffer band, matching the
-        // historical per-draw mutation order.
-        let mut expect = widened.clone();
-        let n = crate::spirv_bind::offset_fragment_sampled_resource_bindings(&mut expect);
-        assert_eq!(n, 2);
-        let n = crate::spirv_bind::offset_fragment_buffer_bindings(&mut expect);
-        assert_eq!(n, 1);
-        let both = shader.variant(true, true).words.clone();
-        assert_eq!(*both, expect);
-        assert_eq!(both[8], 3 + FRAG_BUFFER_BINDING_OFFSET);
-        assert_eq!(
-            both[12],
-            M2V_TEXTURE_BINDING_BASE + 8 + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
-        );
-        assert_eq!(
-            both[16],
-            TOP_SAMPLER + SAMPLED_TAIL_WIDEN_OFFSET + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
-        );
-        // Every relocated band stays clear of every un-relocated one.
-        assert!(both[8] > crate::spirv_bind::COLOR_INPUT_BINDING_BASE);
-        assert!(both[12] > both[8] && both[16] > both[12]);
-
-        // Second call returns the cached variant (same allocation), and the
-        // stored (widened) module is never mutated by a relocation.
-        let again = shader.variant(true, true).words.clone();
-        assert!(Arc::ptr_eq(&both, &again));
-        assert_eq!(*shader.words, widened);
-    }
-
     #[test]
     fn air_key_differs_by_stage_and_bytes() {
         let a = b"same-air-bytes";
-        assert_ne!(air_key(Stage::Vertex, a), air_key(Stage::Fragment, a));
-        assert_ne!(air_key(Stage::Vertex, a), air_key(Stage::Vertex, b"other"));
-        assert_eq!(air_key(Stage::Vertex, a), air_key(Stage::Vertex, a));
+        assert_ne!(air_key(Stage::Vertex, a, 1), air_key(Stage::Fragment, a, 1));
+        assert_ne!(
+            air_key(Stage::Vertex, a, 1),
+            air_key(Stage::Vertex, b"other", 1)
+        );
+        assert_eq!(air_key(Stage::Vertex, a, 1), air_key(Stage::Vertex, a, 1));
+        assert_eq!(
+            air_key(Stage::Vertex, a, 1),
+            air_key(Stage::Vertex, a, 8),
+            "raster sample count is not a vertex translation option"
+        );
+        assert_ne!(
+            air_key(Stage::Fragment, a, 1),
+            air_key(Stage::Fragment, a, 8),
+            "fragment sample count changes the translated interface"
+        );
         assert_ne!(air_key_kernel(a, [16, 16, 1]), air_key_kernel(a, [8, 8, 1]));
+    }
+
+    #[test]
+    fn render_stage_layouts_are_disjoint_and_self_describing() {
+        let vertex = descriptor_layout_for_render_stage(RenderTranslationStage::Vertex);
+        let fragment = descriptor_layout_for_render_stage(RenderTranslationStage::Fragment);
+        assert_eq!(vertex, metal2vulkan::reflect::DescriptorLayout::default());
+        assert_eq!(fragment.set, vertex.set);
+        assert_eq!(fragment.color_inputs, vertex.color_inputs);
+        for fragment_range in [
+            fragment.buffers,
+            fragment.sampled_textures,
+            fragment.samplers,
+            fragment.storage_textures,
+            fragment.synthetic,
+        ] {
+            for vertex_range in [
+                vertex.buffers,
+                vertex.sampled_textures,
+                vertex.samplers,
+                vertex.storage_textures,
+                vertex.synthetic,
+            ] {
+                assert!(
+                    fragment_range.start >= vertex_range.end
+                        || vertex_range.start >= fragment_range.end,
+                    "fragment {fragment_range:?} overlaps vertex {vertex_range:?}"
+                );
+            }
+        }
+        fragment
+            .validate()
+            .expect("fragment layout is translator-valid");
+    }
+
+    #[test]
+    fn runtime_sampler_state_matches_the_descriptor_contract() {
+        use metal2vulkan::reflect::{SamplerCompareFunction, SamplerCoordinates};
+
+        let mut sampler = reims_vgpu_core::SamplerResource::normalized_default(17);
+        let normalized = runtime_sampler_state(&sampler).expect("default sampler is representable");
+        assert_eq!(normalized.coordinates, SamplerCoordinates::Normalized);
+        assert_eq!(normalized.compare_function, SamplerCompareFunction::None);
+
+        sampler.unnormalized_coordinates = true;
+        let pixel = runtime_sampler_state(&sampler).expect("pixel sampler is representable");
+        assert_eq!(pixel.coordinates, SamplerCoordinates::Pixel);
+        assert_eq!(pixel.compare_function, SamplerCompareFunction::None);
+        assert_eq!(pixel.lod_min_clamp, 0.0);
+        assert_eq!(pixel.lod_max_clamp, 0.0);
+    }
+
+    #[test]
+    fn runtime_storage_format_covers_the_upstream_specialization_contract() {
+        use reims_vgpu_protocol::StorageImageFormat as F;
+
+        for format in [
+            F::R8Unorm,
+            F::Rgba8Unorm,
+            F::Bgra8Unorm,
+            F::R16Float,
+            F::Rg16Float,
+            F::Rgba16Float,
+            F::R32Float,
+            F::Rgba32Float,
+            F::R16Uint,
+            F::R32Uint,
+            F::Rgba8Uint,
+            F::Rgba16Uint,
+            F::Rgba32Uint,
+            F::R32Sint,
+            F::Rgba8Sint,
+            F::Rgba32Sint,
+        ] {
+            runtime_storage_format(format)
+                .unwrap_or_else(|error| panic!("{format:?} lost upstream specialization: {error}"));
+        }
+        for sampled_only in [
+            F::Rg8Unorm,
+            F::Rgb9e5Ufloat,
+            F::R16Unorm,
+            F::Rg16Unorm,
+            F::Rgba16Unorm,
+            F::Rgb10a2Unorm,
+            F::Bgr10a2Unorm,
+            F::Rg11b10Float,
+        ] {
+            assert!(
+                runtime_storage_format(sampled_only).is_err(),
+                "{sampled_only:?} is sampled-only"
+            );
+        }
     }
 
     /// Each `local_size` component alone changes the kernel key.
@@ -2144,7 +2680,6 @@ mod tests {
             M2vCacheDecline::VertexTranslate { detail: detail() },
             M2vCacheDecline::FragmentTranslate { detail: detail() },
             M2vCacheDecline::KernelTranslate { detail: detail() },
-            M2vCacheDecline::ReflectionDatalayoutMissing { stage: "vertex" },
             M2vCacheDecline::ReflectionMalformed {
                 stage: "vertex",
                 violations: 1,
@@ -2153,6 +2688,11 @@ mod tests {
             M2vCacheDecline::KernelLocalSizeZero {
                 local_size: [0, 1, 1],
             },
+            M2vCacheDecline::RuntimeSamplerSpecialize {
+                stage: "fragment",
+                detail: detail(),
+            },
+            M2vCacheDecline::RuntimeStorageImageSpecialize { detail: detail() },
         ] {
             assert!(!permanent.is_transient(), "{permanent:?} is about the AIR");
         }
@@ -2168,7 +2708,7 @@ mod tests {
         let _guard = test_lock();
         reset_for_test();
         let air = b"air-whose-scratch-write-failed";
-        let id = ShaderId::render(Stage::Vertex, air);
+        let id = ShaderId::render(Stage::Vertex, air, 1);
         let stored = M2vCacheDecline::VertexScratchWrite {
             detail: "No space left on device".to_string(),
         };
@@ -2180,12 +2720,12 @@ mod tests {
         // The admission still resolves, so the guest packet advances rather
         // than re-polling a translation that keeps failing.
         assert!(
-            ensure_cached_async(air, Stage::Vertex, 7),
+            ensure_cached_async(air, Stage::Vertex, 1, 7),
             "a stored failure must resolve the ask, or the packet never advances"
         );
 
         // This draw gets the real reason, unchanged.
-        let Err(err) = translate_cached_reflected(air, Stage::Vertex, 7) else {
+        let Err(err) = translate_cached_reflected(air, Stage::Vertex, 1, 7) else {
             panic!("a stored failure still fails its draw");
         };
         assert_eq!(err, stored);
@@ -2218,15 +2758,15 @@ mod tests {
 
         let first = b"the-air-that-got-there-first";
         let second = b"a-different-shader-entirely";
-        let id = ShaderId::render(Stage::Vertex, first);
+        let id = ShaderId::render(Stage::Vertex, first, 1);
         // The second identity, forced into the first one's bucket. Everything
         // but `digest` is the second shader's own.
         let collided = ShaderId {
             digest: id.digest,
-            ..ShaderId::render(Stage::Vertex, second)
+            ..ShaderId::render(Stage::Vertex, second, 1)
         };
         assert_ne!(
-            ShaderId::render(Stage::Vertex, second).digest,
+            ShaderId::render(Stage::Vertex, second, 1).digest,
             id.digest,
             "the two blobs do not collide naturally; the bucket below is forced"
         );
@@ -2279,7 +2819,7 @@ mod tests {
         let _guard = test_lock();
         reset_for_test();
         let air = b"air-that-cannot-be-translated";
-        let id = ShaderId::render(Stage::Vertex, air);
+        let id = ShaderId::render(Stage::Vertex, air, 1);
         let stored = M2vCacheDecline::VertexTranslate {
             detail: "unsupported instruction".to_string(),
         };
@@ -2288,7 +2828,7 @@ mod tests {
             .unwrap()
             .put(id, &Arc::from(&air[..]), Entry::Failed(stored.clone()));
 
-        let Err(err) = translate_cached_reflected(air, Stage::Vertex, 7) else {
+        let Err(err) = translate_cached_reflected(air, Stage::Vertex, 1, 7) else {
             panic!("an untranslatable module still fails its draw");
         };
         assert_eq!(err, stored);
@@ -2338,13 +2878,13 @@ mod tests {
             let mut c = global().lock().unwrap();
             // fake SPIR-V magic-ish
             c.put(
-                ShaderId::render(Stage::Vertex, air),
+                ShaderId::render(Stage::Vertex, air, 1),
                 &Arc::from(&air[..]),
                 Entry::Ready(synth_shader(Stage::Vertex, vec![0x03, 0x02, 0x23, 0x07])),
             );
         }
         // One hit total, carrying the bytes plus the (empty) reflection.
-        let shader = translate_cached_reflected(air, Stage::Vertex, 99).expect("hit");
+        let shader = translate_cached_reflected(air, Stage::Vertex, 1, 99).expect("hit");
         assert_eq!(shader.spirv, vec![0x03, 0x02, 0x23, 0x07]);
         assert!(shader.reflection.vertex_builtins.is_none());
         let (hits, misses, n) = stats();
@@ -2355,30 +2895,16 @@ mod tests {
     }
 
     #[test]
-    fn spirv_builtin_scan_finds_instance_index() {
-        // Minimal module: 5-word header, then OpDecorate(71) %id BuiltIn(11) InstanceIndex(43).
-        // word0 = (wordCount<<16)|opcode = (4<<16)|71.
-        let words: [u32; 9] = [0x07230203, 0x00010000, 0, 1, 0, (4 << 16) | 71, 5, 11, 43];
-        let mut spv = Vec::new();
-        for w in words {
-            spv.extend_from_slice(&w.to_le_bytes());
-        }
-        assert!(spirv_uses_builtin(&spv, 43)); // InstanceIndex present
-        assert!(!spirv_uses_builtin(&spv, 42)); // VertexIndex absent
-        assert!(!spirv_uses_builtin(&[], 43)); // empty is safe
-    }
-
-    #[test]
     fn async_cache_state_distinguishes_pending_from_resolved_failure() {
         let _guard = test_lock();
         reset_for_test();
         let air = b"synthetic-async-cache-state";
-        let id = ShaderId::render(Stage::Fragment, air);
+        let id = ShaderId::render(Stage::Fragment, air, 1);
         {
             let mut c = global().lock().unwrap();
             c.put(id, &Arc::from(&air[..]), Entry::Loading);
         }
-        assert!(!ensure_cached_async(air, Stage::Fragment, 7));
+        assert!(!ensure_cached_async(air, Stage::Fragment, 1, 7));
         assert!(global().lock().unwrap().async_queue.is_empty());
 
         global().lock().unwrap().put(
@@ -2388,11 +2914,11 @@ mod tests {
                 detail: "synthetic failure".into(),
             }),
         );
-        assert!(ensure_cached_async(air, Stage::Fragment, 7));
+        assert!(ensure_cached_async(air, Stage::Fragment, 1, 7));
         assert_eq!(
             // `.err()` rather than `unwrap_err()`: the success arm is an
             // `Arc<CachedShader>`, which carries no `Debug`.
-            translate_cached_reflected(air, Stage::Fragment, 7)
+            translate_cached_reflected(air, Stage::Fragment, 1, 7)
                 .err()
                 .expect("a Failed entry translates to its decline"),
             M2vCacheDecline::FragmentTranslate {
@@ -2416,7 +2942,7 @@ mod tests {
         {
             let mut c = global().lock().unwrap();
             c.put(
-                ShaderId::render(Stage::Fragment, &hot),
+                ShaderId::render(Stage::Fragment, &hot, 1),
                 &Arc::from(&hot[..]),
                 Entry::Ready(synth_shader(Stage::Fragment, vec![1, 2, 3, 4])),
             );
@@ -2427,13 +2953,13 @@ mod tests {
             let air = format!("cold-shader-{i}").into_bytes();
             let mut c = global().lock().unwrap();
             c.put(
-                ShaderId::render(Stage::Fragment, &air),
+                ShaderId::render(Stage::Fragment, &air, 1),
                 &Arc::from(&air[..]),
                 Entry::Ready(synth_shader(Stage::Fragment, vec![0, 0, 0, 0])),
             );
         }
         assert!(
-            ensure_cached_async(&hot, Stage::Fragment, 1),
+            ensure_cached_async(&hot, Stage::Fragment, 1, 1),
             "the first-compiled shader is still resolved after 1024 later ones"
         );
         assert_eq!(
@@ -2484,14 +3010,9 @@ mod tests {
             M2vCacheDecline::KernelTranslate {
                 detail: "tool failed".into(),
             },
-            M2vCacheDecline::ReflectionDatalayoutMissing { stage: "fragment" },
             M2vCacheDecline::ReflectionMalformed {
                 stage: "fragment",
                 violations: 1,
-            },
-            M2vCacheDecline::LayoutRepair {
-                stage: "kernel",
-                reason: crate::spirv_layout::SpirvLayoutDecline::DataLayoutVectorAlignmentMissing,
             },
             M2vCacheDecline::TranslationPending { stage: "vertex" },
             M2vCacheDecline::KernelLocalSizeZero {
@@ -2500,6 +3021,13 @@ mod tests {
             M2vCacheDecline::KernelLocalSizeMismatch {
                 requested: [16, 16, 1],
                 reflected: Some([8, 8, 1]),
+            },
+            M2vCacheDecline::RuntimeSamplerSpecialize {
+                stage: "fragment",
+                detail: "unsupported state".into(),
+            },
+            M2vCacheDecline::RuntimeStorageImageSpecialize {
+                detail: "unsupported format".into(),
             },
         ];
         let mut slugs = Vec::new();

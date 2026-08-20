@@ -1,7 +1,7 @@
 //! Shader numbering and directly-bound resource occupancy for one draw.
 //!
-//! Buffer loading, fragment relocation, storage binding projection, descriptor
-//! gap classification, and framebuffer-fetch admission are one decision. A
+//! Buffer loading, reflected storage binding projection, descriptor gap
+//! classification, and framebuffer-fetch admission are one decision. A
 //! consumer receives variants and resources which were validated together.
 
 use super::*;
@@ -11,7 +11,7 @@ pub(super) struct ShaderResourcePlan {
     pub storage_buffers: Vec<reims_vgpu_core::StorageBufferResource>,
     pub vertex_variant: reims_vgpu_core::PreparedShaderVariant,
     pub fragment_variant: reims_vgpu_core::PreparedShaderVariant,
-    pub fragment_neutral_textures: Vec<u32>,
+    pub fragment_null_textures: Vec<u32>,
     pub fragment_color_input: bool,
 }
 
@@ -32,31 +32,8 @@ pub(super) fn plan_shader_resources<M: HostMemory + HostOps>(
         stage_in_buffers,
     } = bind_plan::plan_bound_buffers(state, host, request, resolved)?;
 
-    let vertex_indices = vertex
-        .iter()
-        .map(|(index, _)| *index)
-        .collect::<std::collections::BTreeSet<_>>();
-    let buffer_collision = fragment
-        .iter()
-        .any(|(index, _)| vertex_indices.contains(index));
-    // Textures and samplers occupy one sampled band. Relocation therefore
-    // follows either kind of live bind, plus reflected collisions and the
-    // fragment-buffer relocation coupling used by executable numbering.
-    let vertex_sampled =
-        stage_uses_sampled_band(&request.vertex_textures, &request.vertex_samplers);
-    let fragment_sampled =
-        stage_uses_sampled_band(&request.fragment_textures, &request.fragment_samplers);
-    let reflected_collision = reflected_sampled_binding_collision(
-        &resolved.vertex.interface,
-        &resolved.fragment.interface,
-    );
-    let separate_sampled =
-        (vertex_sampled && fragment_sampled) || buffer_collision || reflected_collision;
-    let vertex_variant = resolved.vertex.variant(false, false).clone();
-    let fragment_variant = resolved
-        .fragment
-        .variant(separate_sampled, buffer_collision)
-        .clone();
+    let vertex_variant = resolved.vertex.variant().clone();
+    let fragment_variant = resolved.fragment.variant().clone();
 
     let mut storage_buffers = Vec::new();
     for (index, content) in &vertex {
@@ -103,10 +80,15 @@ pub(super) fn plan_shader_resources<M: HostMemory + HostOps>(
     for (_, use_) in &uses {
         crate::runtime::drain::note_store_route(use_.slug());
     }
-    if !unbound.is_empty() {
-        report_fragment_gaps(request, &fragment, &uses, width, height);
+    let reportable = uses
+        .iter()
+        .copied()
+        .filter(|(gap, use_)| !(gap.class == FragUnboundClass::Texture && use_.is_violation()))
+        .collect::<Vec<_>>();
+    if !reportable.is_empty() {
+        report_fragment_gaps(request, &fragment, &reportable, width, height);
     }
-    let fragment_neutral_textures = frag_unbound_textures_to_neutralize(&uses);
+    let fragment_null_textures = frag_unbound_textures_to_bind_null(&uses);
 
     let mut fragment_color_input = false;
     for binding in &resolved.fragment.interface.bindings {
@@ -126,7 +108,7 @@ pub(super) fn plan_shader_resources<M: HostMemory + HostOps>(
         storage_buffers,
         vertex_variant,
         fragment_variant,
-        fragment_neutral_textures,
+        fragment_null_textures,
         fragment_color_input,
     })
 }

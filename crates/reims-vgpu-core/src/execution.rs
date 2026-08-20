@@ -191,10 +191,17 @@ pub trait ExecutionPort: std::fmt::Debug + Send + Sync {
 /// guest-memory blits and core state transitions.
 pub fn execute_resolved_submission<Draw, Compute, DrawOutput, ComputeOutput, Error>(
     submission: ResolvedSubmission<Draw, Compute>,
-    mut draw: impl FnMut(Draw) -> Result<CommandExecution<DrawOutput>, Error>,
-    mut compute: impl FnMut(Compute) -> Result<CommandExecution<ComputeOutput>, Error>,
-    mut blit: impl FnMut(ResolvedBlit) -> Result<CommandExecution<BlitCompletion>, Error>,
+    mut draw: impl FnMut(&SubmissionContext, Draw) -> Result<CommandExecution<DrawOutput>, Error>,
+    mut compute: impl FnMut(
+        &SubmissionContext,
+        Compute,
+    ) -> Result<CommandExecution<ComputeOutput>, Error>,
+    mut blit: impl FnMut(
+        &SubmissionContext,
+        ResolvedBlit,
+    ) -> Result<CommandExecution<BlitCompletion>, Error>,
     mut resource_state: impl FnMut(
+        &SubmissionContext,
         ResolvedResourceState,
     ) -> Result<CommandExecution<ResourceStateCompletion>, Error>,
 ) -> Result<ResolvedExecutionCompletion<DrawOutput, ComputeOutput>, Error> {
@@ -204,28 +211,28 @@ pub fn execute_resolved_submission<Draw, Compute, DrawOutput, ComputeOutput, Err
     for command in submission.command_buffer.into_commands().into_vec() {
         let execution = match command {
             ResolvedCommand::Draw(command) => {
-                let execution = draw(command)?;
+                let execution = draw(&submission.context, command)?;
                 CommandExecution::new(
                     ExecutionOutput::Draw(execution.output),
                     execution.gpu_materialized,
                 )
             }
             ResolvedCommand::Compute(command) => {
-                let execution = compute(command)?;
+                let execution = compute(&submission.context, command)?;
                 CommandExecution::new(
                     ExecutionOutput::Compute(execution.output),
                     execution.gpu_materialized,
                 )
             }
             ResolvedCommand::Blit(command) => {
-                let execution = blit(*command)?;
+                let execution = blit(&submission.context, *command)?;
                 CommandExecution::new(
                     ExecutionOutput::Blit(execution.output),
                     execution.gpu_materialized,
                 )
             }
             ResolvedCommand::ResourceState(command) => {
-                let execution = resource_state(command)?;
+                let execution = resource_state(&submission.context, command)?;
                 CommandExecution::new(
                     ExecutionOutput::ResourceState(execution.output),
                     execution.gpu_materialized,
@@ -336,16 +343,18 @@ mod tests {
         let order = RefCell::new(Vec::new());
         let completion = execute_resolved_submission(
             submission,
-            |draw| {
+            |seen, draw| {
+                assert_eq!(seen, &context);
                 order.borrow_mut().push(draw);
                 Ok::<_, ()>(CommandExecution::new(draw * 10, vec![first]))
             },
-            |compute| {
+            |seen, compute| {
+                assert_eq!(seen, &context);
                 order.borrow_mut().push(compute);
                 Ok::<_, ()>(CommandExecution::new(compute * 10, vec![first, second]))
             },
-            |_| unreachable!(),
-            |_| unreachable!(),
+            |_, _| unreachable!(),
+            |_, _| unreachable!(),
         )
         .unwrap();
 

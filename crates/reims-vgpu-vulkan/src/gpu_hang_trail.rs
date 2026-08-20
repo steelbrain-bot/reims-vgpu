@@ -278,13 +278,17 @@ pub struct SamplerNote {
     /// Unnormalized texel coordinates, which changes what a UV in `[0, 1]`
     /// addresses and would move a chain walk off its cells on its own.
     pub unnormalized: bool,
+    /// Exact decoded Metal LOD clamps, retained as bits so this record remains
+    /// equality-comparable even when a malformed descriptor carries a NaN.
+    pub lod_min: u32,
+    pub lod_max: u32,
 }
 
 impl std::fmt::Display for SamplerNote {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "s{}:{}{}{}{}{}{}{}",
+            "s{}:{}{}{}{}{}{}{}/{}:{}",
             self.binding,
             self.provenance as char,
             self.min_filter as char,
@@ -292,7 +296,9 @@ impl std::fmt::Display for SamplerNote {
             self.mip_filter as char,
             self.address_u as char,
             self.address_v as char,
-            if self.unnormalized { "!" } else { "" }
+            if self.unnormalized { "!" } else { "" },
+            f32::from_bits(self.lod_min),
+            f32::from_bits(self.lod_max)
         )
     }
 }
@@ -307,9 +313,9 @@ pub const SAMPLER_KEPT: usize = 8;
 
 /// Gap binding numbers carried per entry.
 ///
-/// Counts, not a bitmask: this device relocates a fragment stage's buffers to
-/// 256+ and its sampled resources to 288+, so the numbers reach past 320 and a
-/// mask wide enough to hold them would be four words per entry to answer a
+/// Counts, not a bitmask: independently translated fragment stages use a
+/// disjoint reflected descriptor layout whose bindings reach beyond one word,
+/// so a mask wide enough to hold them would cost several words per entry for a
 /// question whose interesting answer is "which one". Four is what fits the log
 /// line beside everything else, and `frag_gap` says when it is a truncation.
 ///

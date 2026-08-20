@@ -1,23 +1,18 @@
-//! Content identity for sampled guest-resource windows.
+//! Diagnostic stability witness for sampled guest-resource windows.
 //!
-//! A retained sampled image may be reused only while neither writer of its
-//! source resource has changed the bytes:
+//! This combines the decoded resource-validity transition with exact device
+//! writes and reports whether both accounts stayed quiet. It is telemetry, not
+//! a content-identity contract: the validity transition is a synchronization
+//! statement consumed at submission construction, not a version emitted for
+//! every CPU write to unified shared storage. The full-content audit has
+//! observed bytes move while both accounts reported `Vouched`.
 //!
-//! - the guest writer is named by the decoded resource-validity statement;
-//! - device writes are named by the page-exact HostWrites record.
-//!
-//! The guest statement is carried in its owning namespace: mapping-backed
-//! windows use SurfaceMappingEntry::content_generation, while task-local resources
-//! use `ResourceWriteStamp`. An unchanged version and a quiet device-write
-//! verdict preserve the sampled identity. A changed generation, a device write,
-//! or an unaddressed statement spends the identity and forces a gather.
-//! Hypervisor dirty-page observations are not an input: the decoded resource
-//! table already states the answer per resource.
-//!
-//! The content fold is a diagnostic audit, never an input to the shipping
-//! decision. AuditDensity::Strided samples it; EveryBind is the driven
-//! soundness arm. A disagreement is fail-visible and spends the identity that
-//! was just disproved.
+//! The content fold is the check that exposes that missing writer. It is
+//! disabled normally and runs on every bind when explicitly enabled. A
+//! disagreement is fail-visible without changing shipping behavior. In
+//! particular, neither `GatherVouch` nor `GatheredIdentity` may select a
+//! retained copied image; direct images are safe because they sample the live
+//! storage rather than relying on the witness.
 //!
 //! Entries are unbounded while their owners are live. Task entries retire with
 //! the task and mapping entries with the mapping; device reset clears both.
@@ -26,7 +21,7 @@ pub use reims_vgpu_core::{
     fold_runs, AuditDensity, ContentAudit, GatherKey, GatherObservation, GatherOutcome,
     GatherReadings as WitnessReadings, GatherVerdict, GatherVouch, GatherWindow, GatherWitness,
     GatheredIdentity, GuestWriteReach as PendingWrites, StatedGeneration, StatedGuestWrite,
-    AUDIT_REBASELINE_LIMIT, AUDIT_STRIDE,
+    AUDIT_REBASELINE_LIMIT,
 };
 
 /// Resolve this process's diagnostic sampling policy at the composition edge.
@@ -184,6 +179,9 @@ pub fn note_gather(
     window: GatherWindow<'_>,
 ) -> GatherOutcome {
     use crate::runtime::drain::{note_store_route, note_store_route_n};
+    let _phase = crate::runtime::sampled_phase::Span::open(
+        crate::runtime::sampled_phase::Part::GatherWitness,
+    );
 
     let span = window.span;
     let (rail_count, rail_kb) = rail.names();
@@ -286,15 +284,28 @@ pub fn note_gather(
             // Once per window: a writer escaping both halves escapes them on
             // every bind, and the second line says nothing the first did not.
             // The count above carries the magnitude.
-            crate::observe::emit::Emit::decline(
+            let mut emission = crate::observe::emit::Emit::decline(
                 "gather_witness",
                 &GatherWitnessFault::VouchedBytesMoved {
                     key,
                     span,
-                    binds: AUDIT_STRIDE,
+                    binds: 1,
                 },
-            )
-            .fail_once(key.content_key());
+            );
+            if let GatherKey::TaskGva { resource, .. } = key {
+                if let Some((task, object)) = state.task_objects.resources.owner(resource) {
+                    emission = emission
+                        .field("object", object.get())
+                        .field("owner_task", task.get());
+                }
+                if let StatedGeneration::TaskResource(
+                    reims_vgpu_core::ResourceWriteStamp::Resolved { version, .. },
+                ) = stated_gen
+                {
+                    emission = emission.field("content_version", version.get());
+                }
+            }
+            emission.fail_once(key.content_key());
         }
     }
     GatherOutcome {
@@ -363,11 +374,7 @@ mod tests {
         last.expect("bind_quietly is never called with n == 0")
     }
 
-    /// Bind quietly until the audit next runs, and return that bind.
-    ///
-    /// Spelled as "until it fires" rather than as a bind count so the tests say
-    /// what they mean and do not encode the stride's off-by-ones — the exact
-    /// bind an audit lands on is [`AUDIT_STRIDE`]'s business, not theirs.
+    /// Bind quietly until an explicitly enabled every-bind audit next runs.
     fn bind_to_next_audit(
         w: &mut GatherWitness,
         gpas: &[u64],
@@ -382,13 +389,16 @@ mod tests {
         runs: &[GuestRun],
         counts: WitnessReadings,
     ) -> GatherObservation {
-        for _ in 0..=2 * AUDIT_STRIDE {
+        // First sight rearms, the next bind advances the audit arm, and the
+        // third seeds it. Those are states of the witness, not a product-side
+        // sampling interval.
+        for _ in 0..3 {
             let seen = observe(w, KEY, one_page(gpas, runs), counts, next_gen());
             if seen.audit != ContentAudit::Skipped {
                 return seen;
             }
         }
-        panic!("no audit within two strides, so the fold is never reached at all");
+        panic!("an enabled every-bind audit did not reach its next audit state");
     }
 
     /// A generation that has never been issued before, as the device's own
@@ -554,18 +564,18 @@ mod tests {
         GatherWitness::with_audit_density(density)
     }
 
-    /// [`AuditDensity::EveryBind`] judges every bind it can, and the shipping
-    /// stride judges none of the same population.
+    /// [`AuditDensity::EveryBind`] judges every bind it can, while the normal
+    /// shipping witness performs no byte audit.
     ///
     /// Both arms are asserted because only the pair says the switch does
     /// anything: the dense arm alone would pass against a witness that always
-    /// audited, and the strided arm alone against one that never did.
+    /// audited, and the disabled arm alone against one that never did.
     ///
     /// Six binds rather than a computed count, and the dense arm is allowed its
     /// first three — a comparison needs a baseline bind and a bind to spend it
     /// on, and the first sight of a window is a rearm that has neither.
     #[test]
-    fn every_bind_compares_where_the_shipping_stride_has_not_yet_looked() {
+    fn every_bind_compares_while_the_shipping_witness_does_not_read_bytes() {
         let buf = vec![0xa5u8; PAGE];
         let runs = [run_over(&buf)];
         let compares = |density| {
@@ -576,9 +586,9 @@ mod tests {
                 .count()
         };
         assert_eq!(
-            compares(AuditDensity::Strided),
+            compares(AuditDensity::Disabled),
             0,
-            "the shipping stride is {AUDIT_STRIDE} binds, so six cannot reach a comparison"
+            "the shipping witness must not turn a byte fold into render-thread work"
         );
         assert_eq!(
             compares(AuditDensity::EveryBind),
@@ -596,11 +606,10 @@ mod tests {
     /// The bytes here move with no guest store and no recorded host write, which
     /// is exactly the shape of an unrecorded writer.
     ///
-    /// The vouch is asserted too, and it is the half that matters at a bind: a
-    /// `Disagreed` must also spend the generation so no future contract-backed
-    /// consumer can mistake the old witness for current content.
+    /// The vouch is asserted too: the audit observes the contract without
+    /// becoming a second input to it.
     #[test]
-    fn an_unrecorded_write_is_convicted_on_the_next_bind_and_spends_the_generation() {
+    fn an_unrecorded_write_is_reported_without_overriding_the_contract_vouch() {
         let mut w = witness_auditing(AuditDensity::EveryBind);
         let mut buf = vec![0xa5u8; PAGE];
         let runs = [run_over(&buf)];
@@ -623,8 +632,8 @@ mod tests {
         );
         assert_eq!(
             (caught.generation, caught.vouch),
-            (77, GatherVouch::Fresh),
-            "a convicted vouch must not be handed on, or the next bind serves the stale image"
+            (settled.generation, GatherVouch::Vouched),
+            "an instrument must not replace the decoded contract's identity"
         );
     }
 
@@ -729,53 +738,34 @@ mod tests {
         );
     }
 
-    /// The whole point of moving the fold onto a stride: a vouched bind reads no
-    /// byte of the window at all.
+    /// The normal shipping witness reads no byte of the window at all.
     ///
     /// [`ContentAudit::Skipped`] *is* that statement — it is returned only where
     /// `fold_runs` was not called — so this is the test that would fail if the
     /// fold went back on the per-bind path, and the reason the audit's outcome is
     /// reported rather than kept inside the function.
     #[test]
-    fn a_vouched_bind_before_the_stride_reads_none_of_the_window() {
+    fn a_shipping_vouched_bind_never_folds_the_window() {
         let mut w = GatherWitness::default();
         let buf = vec![0xa5u8; PAGE];
         let runs = [run_over(&buf)];
-        // The rearm, then every bind up to but not including the audit.
-        let last = bind_quietly(&mut w, &GPAS, &runs, AUDIT_STRIDE + 1);
+        let last = bind_quietly(&mut w, &GPAS, &runs, 8);
         assert_eq!(last.verdict, GatherVerdict::Vouched);
         assert_eq!(
             last.audit,
             ContentAudit::Skipped,
-            "a bind inside the stride folded the window anyway"
+            "the disabled audit folded the window anyway"
         );
-        // And the one that lands on the stride does fold, with nothing to compare
-        // against yet.
-        let due = bind_to_next_audit(&mut w, &GPAS, &runs);
-        assert_eq!(due.audit, ContentAudit::Seeded);
-        // Which then gives the next audit something to check.
-        let checked = bind_to_next_audit(&mut w, &GPAS, &runs);
-        assert_eq!(checked.audit, ContentAudit::Agreed);
     }
 
-    /// A refusal inside a stride no longer disarms the alarm: the next arm takes
+    /// A refusal inside an enabled audit no longer disarms the alarm: the next arm takes
     /// a fresh baseline and the comparison still happens.
     ///
-    /// This is the repair, and the reason it was needed. Refusals are roughly
-    /// two binds in five, and the audit used to take its baseline and compare on
-    /// the *same* stride bind — so reaching a comparison needed `AUDIT_STRIDE`
-    /// consecutive vouched binds of one window, which this workload does not
-    /// produce. Three consecutive driven boots read `gw_audit_ok` **0** against
-    /// `gw_audit_seed` in the hundreds, so `gw_audit_unsound`'s zero was a check
-    /// that never ran while reading exactly like one that ran and agreed. A real
-    /// writer escaping both halves hid behind it.
-    ///
     /// The test drives one refusal into an otherwise quiet run, which is the
-    /// smallest thing that put the old audit into the state the whole workload
-    /// was permanently in.
+    /// smallest state transition that can invalidate an armed baseline.
     #[test]
-    fn a_refusal_inside_a_stride_still_leaves_the_alarm_able_to_compare() {
-        let mut w = GatherWitness::default();
+    fn a_refusal_inside_an_audit_still_leaves_the_alarm_able_to_compare() {
+        let mut w = witness_auditing(AuditDensity::EveryBind);
         let buf = vec![0x5au8; PAGE];
         let runs = [run_over(&buf)];
         bind_quietly(&mut w, &GPAS, &runs, 1);
@@ -814,12 +804,12 @@ mod tests {
             "the fixture must actually refuse, or the rest proves nothing"
         );
 
-        // The old design answered `Restarted` here and never compared again
-        // until sixty-four consecutive vouches, which never came.
+        // The refused bind rebaselined the instrument from the bytes the gather
+        // was about to consume, so the next quiet bind can compare immediately.
         assert_eq!(
             bind_to_next_audit(&mut w, &GPAS, &runs).audit,
-            ContentAudit::Seeded,
-            "the arm after a refusal takes a fresh baseline rather than giving up"
+            ContentAudit::Agreed,
+            "the arm after a refusal did not compare against its fresh baseline"
         );
         assert_eq!(
             bind_to_next_audit(&mut w, &GPAS, &runs).audit,
@@ -838,7 +828,7 @@ mod tests {
     /// across a vouched bind only.
     #[test]
     fn a_refused_bind_between_audits_does_not_leave_a_false_alarm_behind() {
-        let mut w = GatherWitness::default();
+        let mut w = witness_auditing(AuditDensity::EveryBind);
         let mut buf = vec![0xa5u8; PAGE];
         let runs = [run_over(&buf)];
         bind_quietly(&mut w, &GPAS, &runs, 1);
@@ -875,11 +865,10 @@ mod tests {
     ///
     /// The arm costs one fold per refused bind, and the rail it audits moves
     /// 842 MB/s — so a window the witness never vouches for would pull the whole
-    /// of it back through the audit. `AUDIT_REBASELINE_LIMIT` bounds that, and
-    /// the stride is what brings the window back.
+    /// of it back through the audit. `AUDIT_REBASELINE_LIMIT` bounds that cost.
     #[test]
     fn an_armed_window_that_is_never_vouched_gives_up_instead_of_folding_forever() {
-        let mut w = GatherWitness::default();
+        let mut w = witness_auditing(AuditDensity::EveryBind);
         let buf = vec![0x11u8; PAGE];
         let runs = [run_over(&buf)];
         bind_quietly(&mut w, &GPAS, &runs, 1);
@@ -923,11 +912,11 @@ mod tests {
     /// guest RAM makes, and it is what the audit exists to catch — so if a driven
     /// boot ever reports `gw_audit_unsound`, this test says what that means.
     ///
-    /// The audit is a repair as well as an alarm: the generation it refutes is
-    /// live, so it must not survive the bind that caught it.
+    /// The audit is an alarm, not a repair: the decoded contract remains the
+    /// sole source of the generation and vouch.
     #[test]
-    fn bytes_moving_under_a_vouch_are_caught_by_the_audit_and_cost_the_generation() {
-        let mut w = GatherWitness::default();
+    fn bytes_moving_under_a_vouch_are_caught_without_costing_the_generation() {
+        let mut w = witness_auditing(AuditDensity::EveryBind);
         let mut buf = vec![0xa5u8; PAGE];
         let runs = [run_over(&buf)];
         // Rearm, then seed a fold the next audit can compare against.
@@ -946,21 +935,14 @@ mod tests {
             "the witness is what is being caught out, so it must still be vouching"
         );
         assert_eq!(caught.audit, ContentAudit::Disagreed);
-        assert_ne!(
+        assert_eq!(
             caught.generation, vouched_gen,
-            "the refuted generation survived the audit that refuted it, so the \
-             next bind serves the stale image again"
+            "the audit replaced the generation supplied by the decoded contract"
         );
-        // The one bind where the verdict and the vouch disagree, and the reason
-        // the engine is told the vouch rather than the verdict: this bind
-        // vouches and still spends its generation, so an engine deriving
-        // "vouched" from the verdict would count a guaranteed miss as a
-        // retention failure.
         assert_eq!(
             caught.vouch,
-            GatherVouch::Fresh,
-            "a generation the audit just spent was reported as one the cache \
-             could still be holding an image under"
+            GatherVouch::Vouched,
+            "the audit overrode a contract-backed vouch"
         );
     }
 

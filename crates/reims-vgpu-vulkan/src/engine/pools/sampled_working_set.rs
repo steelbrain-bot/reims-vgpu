@@ -111,6 +111,7 @@ mod tests {
         SampledKey {
             width: 64,
             height: 64,
+            mip_levels: 1,
             layers: 1,
             volume: false,
             cube: false,
