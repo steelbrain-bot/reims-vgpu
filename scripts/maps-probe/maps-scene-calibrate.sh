@@ -105,4 +105,14 @@ done
 cat "$OUT/calibration.txt"
 pkill -f 'qemu-system-x86_6[4].*reims-vgpu' 2>/dev/null
 wait "$BOOT_PID" 2>/dev/null
+
+# Keep this boot's fail log beside its captures. The device appends to one
+# well-known path and the next sweep here truncates it, so a log read after the
+# fact belongs to whichever sweep ran last -- which is how a capability gate
+# (`host_pointer_import=`) or an audit counter ends up quoted from a different
+# boot than the frames it is being used to explain. Copying makes the pair
+# self-contained, and the `vk_caps` count printed here is what proves the copy
+# holds exactly one boot.
+cp -f /tmp/reims-vgpu-fail.log "$OUT/fail.log" 2>/dev/null &&
+  say "fail log -> $OUT/fail.log (boots=$(grep -c vk_caps "$OUT/fail.log"))"
 say "done -> $OUT/calibration.txt"
