@@ -450,6 +450,21 @@ pub(crate) enum Phase {
     /// So `record` as a whole is close to irreducible, and a per-draw CPU win has
     /// to come from somewhere else — `sg_storage_us` (1.137 µs/draw) is now the
     /// largest genuinely reducible item this device has.
+    ///
+    /// # That reading no longer holds, and the seven fields below are why
+    ///
+    /// A driven macos-13 Maps boot reads `rec_barrier_us` at **4.28 µs/draw**,
+    /// 29 % of `engine_us` and 3.7x what `rec_draw_us` costs beside it. That is
+    /// 41x the 0.104 above. The paragraph above is kept rather than deleted
+    /// because it is still the correct account of the boot it was taken on, and
+    /// because it is the reason this span is now divided instead of guessed at
+    /// a second time: one number spanning eleven hundred lines told two
+    /// sessions two different stories and neither could name a line.
+    ///
+    /// So the same division the pipeline, staging and recording groups already
+    /// got. Seven regions, carved out of this phase rather than added beside
+    /// it, appended after the existing ordinals so none of them moved, and
+    /// summing back to what `rec_barrier_us` was alone.
     RecordBarrier = 29,
     /// Deciding whether the predecessor's render pass can be continued, and
     /// beginning one when it cannot. The pass-merge census is charged here, so
@@ -463,6 +478,40 @@ pub(crate) enum Phase {
     /// This is the floor. Whatever else this device stops doing, it still issues
     /// one draw call per guest draw, exactly as Apple's driver does.
     RecordDraw = 32,
+    /// Publishing writes made through every other Vulkan alias of guest memory
+    /// before this draw reads an imported buffer or image: assembling the read
+    /// set from the draw's own bindings, asking what outstanding guest writes
+    /// reach it, and the one global memory dependency that answer buys.
+    ///
+    /// Charged on every draw that touches imported guest memory, including the
+    /// draws whose answer is that nothing reaches them —
+    /// `guest_visibility_host_only` is 97 % of the verdicts on a Maps boot, so
+    /// most of what lands here bought no barrier at all.
+    RecBarrierVisibility = 33,
+    /// The attachment-feedback fallback: copying a resident's prior content
+    /// into a same-format image before the attachment changes, for the loops
+    /// the optional native feedback contract cannot represent. Both the
+    /// before-the-pass and after-the-primary-seed halves.
+    RecBarrierSnapshot = 34,
+    /// Seeding the draw target with what the pass will LOAD — the CPU import,
+    /// the GPU present-boundary copy, and the colour-write wait a Clear pass
+    /// owes whoever last read the target.
+    RecBarrierSeed = 35,
+    /// The birth copy an image aliasing guest pages owes, laundered through
+    /// staging because the import buffer and the image are two aliases of one
+    /// allocation.
+    RecBarrierMaterialize = 36,
+    /// Transitioning sampled residents in place. The loop is per bound sampled
+    /// image and most iterations skip, so this is a walk over the draw's
+    /// bindings more than it is a barrier cost.
+    RecBarrierResident = 37,
+    /// Sampled uploads: the CPU-origin copies, the guest gathers, and the
+    /// buffer-to-image copy each one records.
+    RecBarrierUpload = 38,
+    /// Attachment loads Vulkan's render-pass clear cannot express because Metal
+    /// applies a load action to the whole image, plus the MRT secondaries that
+    /// must transition back to colour-attachment use.
+    RecBarrierAttachment = 39,
 }
 
 impl Phase {
@@ -473,7 +522,7 @@ impl Phase {
     /// the ordinals that existed when they were added, rather than inserted next
     /// to the phase they divide, so that every existing ordinal kept its value
     /// and this stayed the only place the count is written.
-    const LAST: Phase = Phase::RecordDraw;
+    const LAST: Phase = Phase::RecBarrierAttachment;
 }
 
 const PHASES: usize = Phase::LAST as usize + 1;
@@ -542,7 +591,16 @@ pub struct DrawPhaseWindow {
     pub descriptors_us: u64,
     pub record_us: u64,
     pub rec_begin_us: u64,
+    /// The residue of the barrier span; the seven below are carved out of it and
+    /// the eight together are what `rec_barrier_us` used to be alone.
     pub rec_barrier_us: u64,
+    pub rb_visibility_us: u64,
+    pub rb_snapshot_us: u64,
+    pub rb_seed_us: u64,
+    pub rb_materialize_us: u64,
+    pub rb_resident_us: u64,
+    pub rb_upload_us: u64,
+    pub rb_attachment_us: u64,
     pub rec_pass_us: u64,
     pub rec_state_us: u64,
     pub rec_draw_us: u64,
@@ -588,6 +646,19 @@ pub fn take_window() -> Option<DrawPhaseWindow> {
         record_us: to_us(ACC[Phase::Record as usize].swap(0, Ordering::Relaxed)),
         rec_begin_us: to_us(ACC[Phase::RecordBegin as usize].swap(0, Ordering::Relaxed)),
         rec_barrier_us: to_us(ACC[Phase::RecordBarrier as usize].swap(0, Ordering::Relaxed)),
+        rb_visibility_us: to_us(
+            ACC[Phase::RecBarrierVisibility as usize].swap(0, Ordering::Relaxed),
+        ),
+        rb_snapshot_us: to_us(ACC[Phase::RecBarrierSnapshot as usize].swap(0, Ordering::Relaxed)),
+        rb_seed_us: to_us(ACC[Phase::RecBarrierSeed as usize].swap(0, Ordering::Relaxed)),
+        rb_materialize_us: to_us(
+            ACC[Phase::RecBarrierMaterialize as usize].swap(0, Ordering::Relaxed),
+        ),
+        rb_resident_us: to_us(ACC[Phase::RecBarrierResident as usize].swap(0, Ordering::Relaxed)),
+        rb_upload_us: to_us(ACC[Phase::RecBarrierUpload as usize].swap(0, Ordering::Relaxed)),
+        rb_attachment_us: to_us(
+            ACC[Phase::RecBarrierAttachment as usize].swap(0, Ordering::Relaxed),
+        ),
         rec_pass_us: to_us(ACC[Phase::RecordPass as usize].swap(0, Ordering::Relaxed)),
         rec_state_us: to_us(ACC[Phase::RecordState as usize].swap(0, Ordering::Relaxed)),
         rec_draw_us: to_us(ACC[Phase::RecordDraw as usize].swap(0, Ordering::Relaxed)),
@@ -801,6 +872,15 @@ mod tests {
             Phase::RecordPass,
             Phase::RecordState,
             Phase::RecordDraw,
+            // The barrier split, appended for the same reason all three above
+            // were.
+            Phase::RecBarrierVisibility,
+            Phase::RecBarrierSnapshot,
+            Phase::RecBarrierSeed,
+            Phase::RecBarrierMaterialize,
+            Phase::RecBarrierResident,
+            Phase::RecBarrierUpload,
+            Phase::RecBarrierAttachment,
         ];
         assert_eq!(all.len(), PHASES);
         for (want, phase) in all.iter().enumerate() {
@@ -872,6 +952,64 @@ mod tests {
         assert_eq!(w.descriptors_us, 0);
         assert_eq!(w.record_us, 0);
         assert_eq!(w.readback_us, 0);
+    }
+
+    /// The seven barrier sub-phases are **carved out of** `rec_barrier_us`, not
+    /// added beside it.
+    ///
+    /// This is the invariant that makes the division readable at all. A reader
+    /// sums the eight to get what `rec_barrier_us` alone used to be, and ranks
+    /// them against each other to find where the 4.28 µs a draw goes. A
+    /// sub-phase that also charged the residue would double its own time and
+    /// read as the largest bar on the line — which is precisely the shape of the
+    /// wrong answer this division exists to stop being possible.
+    #[test]
+    fn a_barrier_sub_phase_is_carved_out_of_the_residue() {
+        const REGION_SLEEP: std::time::Duration = std::time::Duration::from_millis(4);
+        let _ = take_window();
+        {
+            let mut t = DrawTimer::start();
+            t.enter(Phase::RecordBarrier);
+            t.enter(Phase::RecBarrierResident);
+            std::thread::sleep(REGION_SLEEP);
+            t.enter(Phase::RecordPass);
+        }
+        let w = take_window().expect("one draw ran");
+        assert_eq!(w.draws, 1);
+        // The sleep landed where it was spent.
+        assert!(
+            w.rb_resident_us >= 2_000,
+            "the resident region lost its own time: {w:?}"
+        );
+        // And the residue did not also charge it. Same bound and same reasoning
+        // as `the_sampled_loop_is_charged_apart_from_the_target`: a ceiling
+        // rather than zero, because `RecordBarrier` was legitimately open across
+        // one `enter` call.
+        let absorbed_the_sleep = (REGION_SLEEP.as_micros() / 2) as u64;
+        assert!(
+            w.rec_barrier_us < absorbed_the_sleep,
+            "the barrier residue charged time a sub-phase spent: {w:?}"
+        );
+        // Nor did any sibling. A slot collision between two of the seven is the
+        // failure this catches that reading the enum cannot.
+        for (name, value) in [
+            ("rb_visibility_us", w.rb_visibility_us),
+            ("rb_snapshot_us", w.rb_snapshot_us),
+            ("rb_seed_us", w.rb_seed_us),
+            ("rb_materialize_us", w.rb_materialize_us),
+            ("rb_upload_us", w.rb_upload_us),
+            ("rb_attachment_us", w.rb_attachment_us),
+        ] {
+            assert_eq!(value, 0, "{name} shares a slot with the resident region");
+        }
+        // And the phase that follows the span did not absorb the sleep either,
+        // so the tail did not simply spill past the division. A ceiling rather
+        // than zero for the same reason as the residue: `RecordPass` was open
+        // when the timer dropped and legitimately carries that instant.
+        assert!(
+            w.rec_pass_us < absorbed_the_sleep,
+            "the pass phase charged time a sub-phase spent: {w:?}"
+        );
     }
 
     /// Store publication must not be charged to the driver submit bar. The

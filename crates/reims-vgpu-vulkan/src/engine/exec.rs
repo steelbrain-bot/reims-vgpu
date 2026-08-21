@@ -5369,6 +5369,7 @@ pub(crate) unsafe fn execute_draw_inner(
         vk::DependencyFlags::empty()
     };
 
+    phase.enter(super::draw_phase::Phase::RecBarrierVisibility);
     // Publish writes made through any other Vulkan alias of guest memory before
     // this draw consumes an imported buffer or image. This is deliberately one
     // memory dependency for the draw: the physical payload may be shared by a
@@ -5505,6 +5506,7 @@ pub(crate) unsafe fn execute_draw_inner(
         }
     }
 
+    phase.enter(super::draw_phase::Phase::RecBarrierSnapshot);
     // Fallback for attachment feedback loops the optional native contract
     // cannot represent (unsupported host, depth, or a non-identity view):
     // capture the prior resident content into a same-format GPU image before
@@ -5622,6 +5624,7 @@ pub(crate) unsafe fn execute_draw_inner(
         );
     }
 
+    phase.enter(super::draw_phase::Phase::RecBarrierSeed);
     // Seed upload (CPU import).
     if let Some(seed) = &seed_slot {
         unsafe { outside_pass.before_record(PassObstacle::Seed, pools, &ctx.device, cb) };
@@ -5815,6 +5818,7 @@ pub(crate) unsafe fn execute_draw_inner(
         );
     }
 
+    phase.enter(super::draw_phase::Phase::RecBarrierMaterialize);
     // The birth copy an image aliasing guest pages owes. `VK_EXT_external_
     // memory_host` forces such an image to be born `UNDEFINED`, and the first
     // transition out of that layout is free to discard the memory it aliases —
@@ -5911,6 +5915,7 @@ pub(crate) unsafe fn execute_draw_inner(
         pools.registry_note_materialized(identity, *next_access);
     }
 
+    phase.enter(super::draw_phase::Phase::RecBarrierResident);
     // Resident samples: transition the persistent target in place. Duplicate
     // bindings of one target share the same image and therefore one barrier.
     let mut transitioned_resident = std::collections::HashSet::new();
@@ -5970,6 +5975,7 @@ pub(crate) unsafe fn execute_draw_inner(
         );
     }
 
+    phase.enter(super::draw_phase::Phase::RecBarrierUpload);
     // CPU-origin sampled uploads.
     for image in &sampled {
         let PreparedSampled::Upload {
@@ -6156,6 +6162,7 @@ pub(crate) unsafe fn execute_draw_inner(
         );
     }
 
+    phase.enter(super::draw_phase::Phase::RecBarrierSnapshot);
     // An attachment sampled during the draw names the attachment itself, not a
     // second CPU image. Native feedback binds it directly. The capability
     // fallback below prepares the descriptor snapshot after the attachment's
@@ -6283,6 +6290,7 @@ pub(crate) unsafe fn execute_draw_inner(
         );
     }
 
+    phase.enter(super::draw_phase::Phase::RecBarrierUpload);
     // Guest-sourced sampled uploads: one buffer→image copy over either the
     // guest's imported pages or the scratch the CPU packed them into, differing
     // from the CPU-origin loop above only in `row_length_texels` striding over
@@ -6349,6 +6357,7 @@ pub(crate) unsafe fn execute_draw_inner(
         pools.note_cb_sampled_guest(source, &image);
     }
 
+    phase.enter(super::draw_phase::Phase::RecBarrierAttachment);
     // A Vulkan render-pass clear covers only its render area. Metal instead
     // applies each attachment's load action to that attachment's full image,
     // then rasterizes against the minimum attachment extent. When one MRT
