@@ -99,7 +99,17 @@ pub(crate) enum WindowRefusal {
     ParentImport(host_ram::HostRamDecline),
     HostPointerMisaligned,
     ResourceWindowTooShort,
-    SubresourceAfterPlane,
+    /// Vulkan places the base subresource somewhere the plane does not start.
+    ///
+    /// The two numbers are in different coordinate systems by declaration —
+    /// `plane_offset` is allocation-relative and a subresource layout's offset
+    /// is image-relative — so the pair is what says whether an arm placed the
+    /// image with the bind offset or with the declaration, and which of the two
+    /// the guest's plane actually needs.
+    SubresourceAfterPlane {
+        plane_offset: u64,
+        subresource_offset: u64,
+    },
     BindOffsetMisaligned,
     RowPitchMismatch {
         guest: u64,
@@ -154,7 +164,7 @@ impl Decline for WindowRefusal {
             Self::ParentImport(inner) => inner.slug(),
             Self::HostPointerMisaligned => "host_pointer_misaligned",
             Self::ResourceWindowTooShort => "resource_window_too_short",
-            Self::SubresourceAfterPlane => "subresource_after_plane",
+            Self::SubresourceAfterPlane { .. } => "subresource_after_plane",
             Self::BindOffsetMisaligned => "bind_offset_misaligned",
             Self::RowPitchMismatch { .. } => "row_pitch_mismatch",
             Self::ArrayPitchMismatch => "array_pitch_mismatch",
@@ -201,6 +211,13 @@ impl Decline for WindowRefusal {
                 ("mip", mip_level.to_string()),
                 ("guest_offset", guest_offset.to_string()),
                 ("host_offset", host_offset.to_string()),
+            ],
+            Self::SubresourceAfterPlane {
+                plane_offset,
+                subresource_offset,
+            } => vec![
+                ("plane_offset", plane_offset.to_string()),
+                ("subresource_offset", subresource_offset.to_string()),
             ],
             Self::RowPitchMismatch { guest, host } => vec![
                 ("guest_pitch", guest.to_string()),
@@ -264,10 +281,12 @@ fn plan_driver_window(
     requires_dedicated: bool,
     require_allocation_fit: bool,
 ) -> Result<WindowPlan, WindowRefusal> {
-    let bind_offset = backing
-        .plane_offset
-        .checked_sub(layout.offset)
-        .ok_or(WindowRefusal::SubresourceAfterPlane)?;
+    let bind_offset = backing.plane_offset.checked_sub(layout.offset).ok_or(
+        WindowRefusal::SubresourceAfterPlane {
+            plane_offset: backing.plane_offset,
+            subresource_offset: layout.offset,
+        },
+    )?;
     if requirements.alignment == 0 || !bind_offset.is_multiple_of(requirements.alignment) {
         return Err(WindowRefusal::BindOffsetMisaligned);
     }
@@ -295,7 +314,10 @@ fn plan_explicit_window(
     require_allocation_fit: bool,
 ) -> Result<WindowPlan, WindowRefusal> {
     if layout.offset != backing.plane_offset {
-        return Err(WindowRefusal::SubresourceAfterPlane);
+        return Err(WindowRefusal::SubresourceAfterPlane {
+            plane_offset: backing.plane_offset,
+            subresource_offset: layout.offset,
+        });
     }
     validate_common(
         WindowAdmission {
