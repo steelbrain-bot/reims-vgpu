@@ -68,11 +68,30 @@ pub(crate) enum WindowRefusal {
         arrayed: bool,
         one_dim: bool,
     },
-    /// A sampled declaration reads bytes that existed before Vulkan image
-    /// creation. External images must start `UNDEFINED`, so aliasing the memory
-    /// cannot preserve those bytes; the imported-buffer copy rail owns this
-    /// case.
+    /// A sampled declaration the aliasing rail does not admit: a mip chain, a
+    /// subresource, an array, a volume, a cube, or a swizzled view. Aliasing
+    /// binds one image over one allocation shape, so anything that reinterprets
+    /// the allocation goes to the imported-buffer copy rail instead.
     SampledContentRequiresCopy,
+    /// The imported memory type carries no `HOST_COHERENT`, so a guest CPU
+    /// write into the aliased pages is not guaranteed visible to the device.
+    ///
+    /// The repair a non-coherent mapping needs is `vkFlushMappedMemoryRanges`
+    /// over the writer's mapping, and the writer here is the guest, whose
+    /// mapping this device does not own and cannot flush. There is nothing to
+    /// arrange, so the alias is refused and the copy rail — which reads the
+    /// bytes through a buffer whose own visibility this device does control —
+    /// serves the bind.
+    SampledAliasHostWritesNotCoherent {
+        memory_type_index: u32,
+    },
+    /// The guest row pitch is not a whole number of texels, so no
+    /// `bufferRowLength` describes it and the materialization copy cannot name
+    /// the rows it has to land.
+    SampledAliasRowPitchNotTexelMultiple {
+        row_pitch: u64,
+        bytes_per_texel: u64,
+    },
     AmbiguousResidentBacking {
         matches: usize,
     },
@@ -124,6 +143,12 @@ impl Decline for WindowRefusal {
             Self::HostImportUnavailable => "no_host_import",
             Self::UnsupportedImageShape { .. } => "unsupported_image_shape",
             Self::SampledContentRequiresCopy => "sampled_content_requires_copy",
+            Self::SampledAliasHostWritesNotCoherent { .. } => {
+                "sampled_alias_host_writes_not_coherent"
+            }
+            Self::SampledAliasRowPitchNotTexelMultiple { .. } => {
+                "sampled_alias_row_pitch_not_texel_multiple"
+            }
             Self::AmbiguousResidentBacking { .. } => "ambiguous_resident_backing",
             Self::ParentAllocationMismatch => "parent_allocation_mismatch",
             Self::ParentImport(inner) => inner.slug(),
@@ -184,6 +209,16 @@ impl Decline for WindowRefusal {
             Self::AmbiguousResidentBacking { matches } => {
                 vec![("matches", matches.to_string())]
             }
+            Self::SampledAliasHostWritesNotCoherent { memory_type_index } => {
+                vec![("memory_type", memory_type_index.to_string())]
+            }
+            Self::SampledAliasRowPitchNotTexelMultiple {
+                row_pitch,
+                bytes_per_texel,
+            } => vec![
+                ("row_pitch", row_pitch.to_string()),
+                ("bytes_per_texel", bytes_per_texel.to_string()),
+            ],
             Self::ParentImport(inner) => inner.fields(),
             Self::CreateImage {
                 result,
@@ -946,12 +981,24 @@ pub(crate) unsafe fn binding_allocation_len(
     if !allocation_layout.is_vulkan_mip_chain(bytes_per_texel) {
         return Err(WindowRefusal::ResourceWindowTooShort);
     }
-    let geometry = image_geometry(
-        allocation_layout
-            .base()
-            .ok_or(WindowRefusal::ResourceWindowTooShort)?
-            .layout,
-    );
+    let base = allocation_layout
+        .base()
+        .ok_or(WindowRefusal::ResourceWindowTooShort)?;
+    // Admission must be exactly the shape the aliasing rail can build, and that
+    // rail builds one `TYPE_2D` view over one mip. A volume, an array, a 1D
+    // texture or a mip chain plans as a Vulkan image perfectly well and would be
+    // admitted here on its own merits, but no `TYPE_2D` view describes it — so
+    // admitting one hands the guest a declaration this device would then have to
+    // reinterpret, which is the copying rail's work and not this rail's.
+    //
+    // This is not a capability statement: the copying rail serves every one of
+    // these shapes, and is the only rail at all on a host without the import.
+    if !matches!(base.layout, reims_vgpu_memory::GuestImageLayout::D2 { .. })
+        || allocation_layout.mips.len() != 1
+    {
+        return Err(WindowRefusal::SampledContentRequiresCopy);
+    }
+    let geometry = image_geometry(base.layout);
     // Mode selection mirrors `create_allocation` because a length planned in a
     // mode creation would not choose is not the length creation will need.
     let explicit = unsafe { explicit_linear_supported(ctx, format, usage, geometry.image_type) }?;

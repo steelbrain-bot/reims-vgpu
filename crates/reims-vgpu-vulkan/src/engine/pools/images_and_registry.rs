@@ -109,6 +109,10 @@ struct NewResident {
     image: vk::Image,
     memory: ResidentMemory,
     guest_backing: Option<reims_vgpu_memory::GuestTargetBacking>,
+    /// Set only by a creation site that aliased already-populated guest pages,
+    /// which is the one case where a resident is registered over bytes no
+    /// Vulkan operation has yet written into its image.
+    guest_materialization: Option<AliasMaterialization>,
     view: vk::ImageView,
     /// `vk::Framebuffer::null()` for a resident that is never bound as a
     /// standalone single-RT target — see
@@ -134,14 +138,29 @@ struct NewResident {
 }
 
 impl ResourcePools {
-    /// Resolve a sampled declaration to a Vulkan-initialized target resident.
+    /// Resolve a sampled declaration to a resident whose image *is* the guest's
+    /// allocation, so the GPU samples the pages the guest CPU writes.
     ///
-    /// A pre-populated guest allocation cannot itself become a sampled Vulkan
-    /// image: external images must be created `UNDEFINED`, which discards any
-    /// claim that the prior bytes are image contents. Exact target residents
-    /// may converge here because Vulkan work initialized their images. Every
-    /// other declaration returns `SampledContentRequiresCopy` to the imported
-    /// buffer-to-image rail.
+    /// Three outcomes, and only the shape of the declaration chooses between
+    /// them:
+    ///
+    /// - a resident already aliases these exact bytes — the registry's own
+    ///   backing authority answers, and the bind costs nothing;
+    /// - nothing does, and the declaration is the exact allocation shape — one
+    ///   image is created over the guest pages and registered, so every later
+    ///   bind takes the first arm;
+    /// - anything else — a mip chain, a subresource, an array, a volume, a
+    ///   cube, a swizzled view — returns a named refusal to the imported
+    ///   buffer-to-image copy rail, which is also the only rail on a host with
+    ///   no host-pointer import at all.
+    ///
+    /// A newly created alias owes exactly one copy before anything reads it:
+    /// an external image is born `UNDEFINED` and the first transition out of
+    /// that layout may discard what the aliased memory holds, so the guest's
+    /// existing bytes have to be written back into the image. That copy is
+    /// described by [`AliasMaterialization`] and is the caller's to record; the
+    /// resident keeps owing it until the caller says it went into a command
+    /// buffer.
     pub(crate) unsafe fn acquire_guest_sampled(
         &mut self,
         ctx: &DeviceContext,
@@ -229,41 +248,258 @@ impl ResourcePools {
                 excludes,
             ) {
                 Ok(Some(identity)) => {
-                    let (image, access) = self
-                        .registry
-                        .get(&identity)
-                        .map(|slot| (slot.image, slot.access))
-                        .expect("matched resident remains registered");
-                    let view = unsafe {
-                        self.registry_sample_view_raw(ctx, &identity, sampled.format, counters)
-                    }
-                    .map_err(WindowRefusal::CreateView)?
-                    .expect("matched resident remains registered");
-                    if self.pin_resident_for_entry(&identity) {
-                        self.registry_note_sampled_use(&identity);
+                    if let Some(use_) = unsafe {
+                        self.bind_guest_sampled_resident(ctx, &identity, sampled, counters)
+                    }? {
                         crate::telemetry::note_route("sampled_guest_reuses_target_resident");
-                        return Ok(GuestSampledUse::Resident {
-                            identity,
-                            image,
-                            view,
-                            access,
-                        });
+                        return Ok(use_);
                     }
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    let identity = unsafe {
+                        self.create_guest_sampled_alias(ctx, memory, source, sampled, counters)
+                    }?;
+                    if let Some(use_) = unsafe {
+                        self.bind_guest_sampled_resident(ctx, &identity, sampled, counters)
+                    }? {
+                        crate::telemetry::note_route("sampled_guest_alias_created");
+                        return Ok(use_);
+                    }
+                }
                 Err(matches) => {
                     return Err(WindowRefusal::AmbiguousResidentBacking { matches });
                 }
             }
         }
-        // `VK_EXT_external_memory_host` requires an external image to be born
-        // in UNDEFINED. A transition out of UNDEFINED does not import the bytes
-        // already present in the bound allocation, so a pre-populated sampled
-        // resource cannot use a child image as a zero-copy view. The buffer
-        // import remains zero-copy for guest RAM and feeds the ordinary sampled
-        // image with one GPU-side copy. A target resident can still converge
-        // above because its content was initialized by Vulkan work.
+        // Everything the aliasing rail above does not admit. The imported
+        // buffer stays zero-copy for guest RAM and feeds an ordinary sampled
+        // image with one GPU-side copy, which is also the only rail a host
+        // without `VK_EXT_external_memory_host` has.
         Err(WindowRefusal::SampledContentRequiresCopy)
+    }
+
+    /// Take a sampled bind on a resident that already aliases the guest bytes.
+    ///
+    /// `Ok(None)` means the pin was refused, which is the registry saying this
+    /// resident is not one a draw may hold — the caller falls through to the
+    /// copy rail rather than binding it anyway.
+    unsafe fn bind_guest_sampled_resident(
+        &mut self,
+        ctx: &DeviceContext,
+        identity: &TargetIdentity,
+        sampled: SampledKey,
+        counters: &EngineCounters,
+    ) -> Result<Option<GuestSampledUse>, super::super::linear_image_import::WindowRefusal> {
+        use super::super::linear_image_import::WindowRefusal;
+
+        let (image, slot_access, materialize) = self
+            .registry
+            .get(identity)
+            .map(|slot| (slot.image, slot.access, slot.guest_materialization))
+            .expect("matched resident remains registered");
+        let view =
+            unsafe { self.registry_sample_view_raw(ctx, identity, sampled.format, counters) }
+                .map_err(WindowRefusal::CreateView)?
+                .expect("matched resident remains registered");
+        if !self.pin_resident_for_entry(identity) {
+            return Ok(None);
+        }
+        self.registry_note_sampled_use(identity);
+        // An owed materialization ends in the layout a sampled read wants, so
+        // the access reported here is the one the caller's own recording will
+        // leave behind. Reporting the image's current `Untouched` state instead
+        // would make the caller place a second, discarding transition over the
+        // copy it is about to record.
+        let access = if materialize.is_some() {
+            ResidentAccess::shader_read()
+        } else {
+            slot_access
+        };
+        Ok(Some(GuestSampledUse::Resident {
+            identity: identity.clone(),
+            image,
+            view,
+            access,
+            materialize,
+        }))
+    }
+
+    /// Create one Vulkan image over the guest's own texel bytes and register it.
+    ///
+    /// The image is the guest allocation: no copy happens here, and none
+    /// happens on any later bind. What the registration owes is the single
+    /// birth copy described by [`AliasMaterialization`], recorded on the
+    /// resident so that an abandoned draw leaves it owed rather than lost.
+    ///
+    /// Lifetime is the registry's, exactly as for an imported colour target: a
+    /// guest-backed resident is not sole-copy, so ordinary allocation pressure
+    /// may reclaim it and the next bind rebuilds it. Nothing here holds a
+    /// second table keyed by anything else.
+    unsafe fn create_guest_sampled_alias(
+        &mut self,
+        ctx: &DeviceContext,
+        memory: &reims_vgpu_memory::GuestTargetMemory,
+        source: &reims_vgpu_memory::GuestImageSource,
+        sampled: SampledKey,
+        counters: &EngineCounters,
+    ) -> Result<TargetIdentity, super::super::linear_image_import::WindowRefusal> {
+        use super::super::linear_image_import::WindowRefusal;
+
+        let format =
+            translate::pixel::ResidentFormat::of(translate::pixel::storage_format(sampled.format));
+        let bytes_per_texel = translate::pixel::texel_layout_of(format.allocation())
+            .map(|layout| u64::from(layout.bytes_per_texel()))
+            .ok_or(WindowRefusal::ResourceWindowTooShort)?;
+        let layout = source.allocation.mips[0].layout;
+        let window = memory
+            .backing
+            .visible_image_window(layout, bytes_per_texel)
+            .ok_or(WindowRefusal::ResourceWindowTooShort)?;
+        // `bufferRowLength` is a texel count, so a pitch that is not a whole
+        // number of texels cannot be named in a copy region at all.
+        if !memory.backing.row_pitch.is_multiple_of(bytes_per_texel) {
+            return Err(WindowRefusal::SampledAliasRowPitchNotTexelMultiple {
+                row_pitch: memory.backing.row_pitch,
+                bytes_per_texel,
+            });
+        }
+        let row_length_texels = u32::try_from(memory.backing.row_pitch / bytes_per_texel)
+            .map_err(|_| WindowRefusal::ResourceWindowTooShort)?;
+        // The exact guest pages a host write into this image may land on. Page
+        // ownership is asked before any Vulkan object exists, so a declaration
+        // whose window this device may not write to never becomes an image.
+        let write_pages = memory
+            .visible_write_pages(sampled.width, sampled.height, bytes_per_texel)
+            .ok_or(WindowRefusal::ResourceWindowTooShort)?;
+
+        // The guest writes these pages with its own CPU and this device does
+        // not own the mapping, so the only thing that can make those writes
+        // visible to the device is the memory type carrying HOST_COHERENT.
+        // Without it there is no flush anyone here could issue.
+        let allocation = unsafe { self.host_ram_imports.allocation(ctx, &memory.import) }
+            .map_err(WindowRefusal::ParentImport)?;
+        if !ctx
+            .mapped_memory_kind(allocation.memory_type_index)
+            .coherent
+        {
+            return Err(WindowRefusal::SampledAliasHostWritesNotCoherent {
+                memory_type_index: allocation.memory_type_index,
+            });
+        }
+
+        let imported = unsafe {
+            super::super::linear_image_import::create_allocation(
+                ctx,
+                &mut self.host_ram_imports,
+                &memory.import,
+                memory.backing,
+                &source.allocation,
+                format.allocation(),
+                vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+            )
+        }?;
+        counters.note_create(CreateSite::RegistryImage);
+        let resident_memory = ResidentMemory::GuestImported {
+            memory: memory.clone(),
+            write_pages,
+        };
+        let view = match unsafe {
+            ctx.device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(imported.image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format.allocation())
+                    .subresource_range(color_subresource_range()),
+                None,
+            )
+        } {
+            Ok(view) => view,
+            Err(result) => {
+                unsafe {
+                    self.abandon_new_resident_image(ctx, imported.image, &resident_memory);
+                }
+                return Err(WindowRefusal::CreateView(result));
+            }
+        };
+        counters.note_create(CreateSite::RegistryImageView);
+
+        let identity = TargetIdentity::Anonymous {
+            slot: Self::allocate_alias_slot(),
+        };
+        self.register_resident(
+            &identity,
+            NewResident {
+                image: imported.image,
+                memory: resident_memory,
+                guest_backing: Some(memory.backing),
+                guest_materialization: Some(AliasMaterialization {
+                    source: allocation.buffer,
+                    source_offset: window.start,
+                    bytes: window.end - window.start,
+                    width: sampled.width,
+                    height: sampled.height,
+                    row_length_texels,
+                }),
+                view,
+                // Never a standalone colour target: this resident is reached
+                // through the sampled rail and has no pass of its own.
+                framebuffer: vk::Framebuffer::null(),
+                render_pass: vk::RenderPass::null(),
+                framebuffer_compatibility: None,
+                width: sampled.width,
+                height: sampled.height,
+                sample_count: 1,
+                generation: 0,
+                format,
+                attachment_view: None,
+            },
+        );
+        // The guest's bytes are this image's contents from the moment it exists
+        // — that is what aliasing means — so the slot is ready and may be
+        // pinned. `Untouched` is the truth about the *image*: no Vulkan
+        // operation has placed a layout on it, which is what the owed
+        // materialization exists to fix. Publishing also enters the backing
+        // authority, so every later bind of these bytes finds this one image.
+        self.registry_mark_ready_with_access(&identity, ResidentAccess::Untouched);
+        Ok(identity)
+    }
+
+    /// A fresh anonymous slot number for one aliasing resident.
+    ///
+    /// The guest never names this storage — it names the allocation, and the
+    /// registry's backing authority is what turns an allocation back into this
+    /// identity. So the identity itself only has to be unique and never reused,
+    /// which is what a monotonic counter is.
+    fn allocate_alias_slot() -> u64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Report that the copy [`GuestSampledUse::Resident`] handed back is in a
+    /// command buffer, and that it left the image in `access`.
+    ///
+    /// Called only once the recording exists. Until then the resident keeps
+    /// owing the copy, so a draw abandoned part-way through leaves the next
+    /// bind to record it again rather than sampling an image whose layout was
+    /// placed but whose texels were never written.
+    pub(crate) fn registry_note_materialized(
+        &mut self,
+        identity: &TargetIdentity,
+        access: ResidentAccess,
+    ) {
+        if let Some(slot) = self.registry.get_mut(identity) {
+            slot.guest_materialization = None;
+            slot.access = access;
+        }
+    }
+
+    /// Whether this resident's image aliases imported guest memory, so a draw
+    /// binding it reads bytes another Vulkan alias — or the guest's own CPU —
+    /// may have written.
+    pub(crate) fn resident_reads_imported_guest(&self, identity: &TargetIdentity) -> bool {
+        self.registry
+            .get(identity)
+            .is_some_and(|slot| slot.memory.guest_memory().is_some())
     }
 
     /// Apply the one exact-layout admission rule used by every colour
@@ -1178,6 +1414,7 @@ impl ResourcePools {
                 image: new.image,
                 memory: new.memory,
                 guest_backing: new.guest_backing,
+                guest_materialization: new.guest_materialization,
                 view: new.view,
                 // Seeded rather than left empty: the declaration's view is one
                 // more interpretation of this allocation, and `alternate_views`
@@ -1617,6 +1854,7 @@ impl ResourcePools {
                 image,
                 memory,
                 guest_backing,
+                guest_materialization: None,
                 view,
                 framebuffer,
                 render_pass,
@@ -1858,6 +2096,7 @@ impl ResourcePools {
                 // the import. The materialization decision is stable for this
                 // declaration and must not become a recreate/retry loop.
                 guest_backing,
+                guest_materialization: None,
                 memory,
                 view,
                 // No per-slot framebuffer and so no pass it was built against:
@@ -3063,6 +3302,7 @@ pub(super) mod pin_count_tests {
             image: vk::Image::null(),
             memory: ResidentMemory::Recyclable(vk::DeviceMemory::null()),
             guest_backing: None,
+            guest_materialization: None,
             view: vk::ImageView::null(),
             alternate_views: Vec::new(),
             framebuffer: vk::Framebuffer::null(),
@@ -3552,6 +3792,7 @@ pub(super) mod pin_count_tests {
             image: vk::Image::null(),
             memory: ResidentMemory::Recyclable(vk::DeviceMemory::null()),
             guest_backing: None,
+            guest_materialization: None,
             view: vk::ImageView::null(),
             framebuffer,
             render_pass,

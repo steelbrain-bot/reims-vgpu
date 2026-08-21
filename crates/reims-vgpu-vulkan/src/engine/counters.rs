@@ -398,6 +398,18 @@ engine_counters! {
         /// no buffer-to-image copy; bytes are the transfer avoided.
         sampled_guest_direct_binds,
         sampled_guest_direct_bytes,
+        /// The one copy each aliasing image owes at birth. An external image is
+        /// born `UNDEFINED` and the first transition out of that layout is free
+        /// to discard the memory it aliases, so the guest bytes already in
+        /// those pages are laundered through a staging buffer back into the
+        /// image before its first read.
+        ///
+        /// Counted apart from `sampled_guest_direct_binds` because this is paid
+        /// once per aliasing image and that one is paid per bind: the ratio
+        /// between them is what says whether aliases are being reused across
+        /// draws or rebuilt on every one.
+        sampled_guest_materializations,
+        sampled_guest_materialized_bytes,
         /// Guest-run sampled binds whose write witness was not current when the
         /// required read was prepared.
         ///
@@ -1092,6 +1104,13 @@ impl EngineCounters {
         self.sampled_guest_direct_binds
             .fetch_add(1, Ordering::Relaxed);
         self.sampled_guest_direct_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn note_sampled_guest_materialized(&self, bytes: u64) {
+        self.sampled_guest_materializations
+            .fetch_add(1, Ordering::Relaxed);
+        self.sampled_guest_materialized_bytes
             .fetch_add(bytes, Ordering::Relaxed);
     }
 

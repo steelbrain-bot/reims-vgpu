@@ -1478,6 +1478,12 @@ enum PreparedSampled {
         view: vk::ImageView,
         access: super::pools::ResidentAccess,
         next_access: super::pools::ResidentAccess,
+        /// The birth copy an image aliasing guest pages owes before anything
+        /// reads it, present only on the bind that finds one owed. `access`
+        /// then describes what recording that copy leaves behind rather than
+        /// where the image is now — see
+        /// [`super::pools::AliasMaterialization`].
+        materialize: Option<super::pools::AliasMaterialization>,
     },
     /// Stable pre-draw contents for a sampled attachment. Binding the live
     /// attachment for both sampling and rendering only makes the image-layout
@@ -2847,6 +2853,11 @@ unsafe fn upload_buffer_to_sampled_image(
     row_length_texels: u32,
     guest_layout: Option<reims_vgpu_memory::GuestImageLayout>,
     binding: u32,
+    // Where the copy leaves the image. Every caller's next reader is a shader,
+    // but a resident registered in the registry rests in the one colour layout
+    // its access tracker names rather than the dedicated read-only one, so the
+    // layout is the caller's to state.
+    final_layout: vk::ImageLayout,
 ) -> Result<(), DrawError> {
     let range = vk::ImageSubresourceRange {
         aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -2893,7 +2904,7 @@ unsafe fn upload_buffer_to_sampled_image(
         .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
         .dst_access_mask(vk::AccessFlags::SHADER_READ)
         .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        .new_layout(final_layout)
         .image(image)
         .subresource_range(range)];
     ctx.device.cmd_pipeline_barrier(
@@ -5040,6 +5051,7 @@ pub(crate) unsafe fn execute_draw_inner(
                         view: source_view,
                         access: source_layout,
                         next_access: super::pools::ResidentAccess::shader_read(),
+                        materialize: None,
                     });
                 }
                 counters
@@ -5075,6 +5087,7 @@ pub(crate) unsafe fn execute_draw_inner(
                         image,
                         view,
                         access,
+                        materialize,
                     })) => {
                         counters.note_sampled_gather_witness(*vouch);
                         pools.note_guest_read_recorded();
@@ -5087,6 +5100,7 @@ pub(crate) unsafe fn execute_draw_inner(
                             view,
                             access,
                             next_access: super::pools::ResidentAccess::shader_read(),
+                            materialize,
                         });
                     }
                     Some(Err(decline)) => {
@@ -5376,14 +5390,19 @@ pub(crate) unsafe fn execute_draw_inner(
         || mrt_secondaries
             .iter()
             .any(|(_, _, _, guest)| guest.is_some())
-        || sampled.iter().any(|prepared| {
-            matches!(
-                prepared,
-                PreparedSampled::GuestGather {
-                    source: GuestTexels::Imported { .. },
-                    ..
-                }
-            )
+        || sampled.iter().any(|prepared| match prepared {
+            PreparedSampled::GuestGather {
+                source: GuestTexels::Imported { .. },
+                ..
+            } => true,
+            // A resident whose image *is* the guest allocation reads bytes the
+            // guest CPU and every other alias of those pages may have written.
+            // The registry owns whether that is so, which is why this asks it
+            // rather than carrying a second flag out of the sampled loop.
+            PreparedSampled::Resident { identity, .. } => {
+                pools.resident_reads_imported_guest(identity)
+            }
+            _ => false,
         });
     if reads_imported_guest {
         let mut read_pages: Vec<Option<reims_vgpu_memory::GuestPageSet>> = Vec::new();
@@ -5801,6 +5820,102 @@ pub(crate) unsafe fn execute_draw_inner(
         );
     }
 
+    // The birth copy an image aliasing guest pages owes. `VK_EXT_external_
+    // memory_host` forces such an image to be born `UNDEFINED`, and the first
+    // transition out of that layout is free to discard the memory it aliases —
+    // so the guest's own texels, which were in those pages before the image
+    // existed, have to be written back through an operation Vulkan counts as a
+    // write to the image.
+    //
+    // The bytes are laundered through staging rather than copied straight from
+    // the import buffer, because that buffer and this image are two aliases of
+    // one allocation and a transfer whose regions overlap is undefined. The
+    // launder reads the same bytes it writes, so the copy is byte-for-byte an
+    // identity: what it buys is a defined layout over contents Vulkan agrees
+    // are the image's.
+    //
+    // Recorded before the transition loop below, and reported to the registry
+    // as leaving the image in the layout a sampled read wants, so that loop
+    // finds nothing to place. The imported-memory dependency above already
+    // made the guest's host writes available to this TRANSFER read.
+    let mut materialized_alias = std::collections::HashSet::new();
+    for image in &sampled {
+        let PreparedSampled::Resident {
+            binding,
+            identity,
+            image,
+            next_access,
+            materialize: Some(seed),
+            ..
+        } = image
+        else {
+            continue;
+        };
+        // Two bindings of one texture are two descriptors over one image, and
+        // the copy is owed by the image.
+        if !materialized_alias.insert(identity.clone()) {
+            continue;
+        }
+        unsafe { outside_pass.before_record(PassObstacle::SampledUpload, pools, &ctx.device, cb) };
+        let staging = unsafe {
+            pools.acquire_staging(
+                ctx,
+                seed.bytes,
+                vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+                counters,
+            )
+        }?;
+        unsafe {
+            ctx.device.cmd_copy_buffer(
+                cb,
+                seed.source,
+                staging.buffer,
+                &[vk::BufferCopy {
+                    src_offset: seed.source_offset,
+                    dst_offset: 0,
+                    size: seed.bytes,
+                }],
+            );
+            let landed = [vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(staging.buffer)
+                .offset(0)
+                .size(seed.bytes)];
+            ctx.device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &landed,
+                &[],
+            );
+            upload_buffer_to_sampled_image(
+                ctx,
+                cb,
+                staging.buffer,
+                0,
+                *image,
+                seed.width,
+                seed.height,
+                1,
+                1,
+                seed.row_length_texels,
+                None,
+                *binding,
+                next_access.layout(),
+            )?;
+        }
+        counters.note_sampled_guest_materialized(seed.bytes);
+        // Only now: until the copy is in the command buffer the resident keeps
+        // owing it, so a draw abandoned above leaves the next bind to record it
+        // again rather than sampling an image nothing ever wrote.
+        pools.registry_note_materialized(identity, *next_access);
+    }
+
     // Resident samples: transition the persistent target in place. Duplicate
     // bindings of one target share the same image and therefore one barrier.
     let mut transitioned_resident = std::collections::HashSet::new();
@@ -5887,6 +6002,7 @@ pub(crate) unsafe fn execute_draw_inner(
             0,
             None,
             *binding,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         )?;
     }
 
@@ -6226,6 +6342,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 *row_length_texels,
                 *layout,
                 *binding,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             )?;
         }
         recorded_sampled_guest.push(((**reuse).clone(), img.handles()));

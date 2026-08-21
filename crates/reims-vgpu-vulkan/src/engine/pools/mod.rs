@@ -1269,6 +1269,44 @@ struct GuestResidentBackingKey {
     format: vk::Format,
 }
 
+/// The one copy an image aliasing already-populated guest pages owes before
+/// anything may read it.
+///
+/// `VK_EXT_external_memory_host` forces `initialLayout = UNDEFINED` — a
+/// valid-usage rule composed from VUID-vkBindImageMemory-memory-02989 and
+/// VUID-VkImageCreateInfo-pNext-01443, so no host can report otherwise — and
+/// the first transition out of `UNDEFINED` is permitted to discard the memory's
+/// contents. The guest wrote those pages before this image existed and is
+/// entitled to sample what it wrote, so the bytes have to be put back through
+/// an operation Vulkan counts as a write to the image.
+///
+/// The copy cannot come from the imported buffer directly: that buffer and this
+/// image are two aliases of the same bytes, and a transfer whose source and
+/// destination regions overlap is undefined. The bytes are laundered through a
+/// staging buffer instead, which is why this record names a source buffer and a
+/// span rather than only an image.
+///
+/// The record lives on the resident and is cleared once the copy has been
+/// recorded into a command buffer, so a draw abandoned before that point leaves
+/// the next bind owing the same copy rather than sampling an image nothing ever
+/// wrote.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AliasMaterialization {
+    /// The whole-import buffer over the guest allocation this image aliases.
+    pub source: vk::Buffer,
+    /// Allocation-relative byte offset of the image's first texel, which is
+    /// also its offset into `source`: the import buffer spans the whole
+    /// allocation.
+    pub source_offset: u64,
+    /// Bytes from the first texel to the last, guest row padding included.
+    pub bytes: u64,
+    pub width: u32,
+    pub height: u32,
+    /// `bufferRowLength` for the buffer→image copy: the guest row pitch
+    /// expressed in texels.
+    pub row_length_texels: u32,
+}
+
 #[derive(Clone)]
 pub(crate) enum GuestSampledUse {
     Resident {
@@ -1276,6 +1314,15 @@ pub(crate) enum GuestSampledUse {
         image: vk::Image,
         view: vk::ImageView,
         access: ResidentAccess,
+        /// Set exactly while this resident's image aliases guest bytes it has
+        /// never had landed into it. The caller must record the copy this
+        /// describes before the draw reads the image, and report it back
+        /// through [`ResourcePools::registry_note_materialized`].
+        ///
+        /// `access` is then the access the recorded copy *leaves behind*, not
+        /// the one the image is in now — the two are the same statement,
+        /// because the copy is owed and the caller has to make it true.
+        materialize: Option<AliasMaterialization>,
     },
 }
 
@@ -1835,6 +1882,11 @@ pub(crate) struct ResidentTargetSlot {
     /// succeeded or structurally declined. Equality prevents retry/recreate
     /// loops while still allowing a replacement allocation to be considered.
     pub guest_backing: Option<reims_vgpu_memory::GuestTargetBacking>,
+    /// The birth copy this slot's image still owes, for an image created by
+    /// aliasing guest pages that already held the guest's texels. `None` on
+    /// every other resident, and on an alias whose copy has been recorded — see
+    /// [`AliasMaterialization`], which says why the copy exists at all.
+    pub guest_materialization: Option<AliasMaterialization>,
     pub view: vk::ImageView,
     /// Additional compatible-format views over `image`, retained for the
     /// resident's lifetime. A texture view changes interpretation, not storage;
@@ -4018,6 +4070,7 @@ mod resident_reuse_tests {
             image: vk::Image::null(),
             memory: ResidentMemory::Recyclable(vk::DeviceMemory::null()),
             guest_backing: None,
+            guest_materialization: None,
             view: vk::ImageView::null(),
             alternate_views: Vec::new(),
             framebuffer: vk::Framebuffer::null(),

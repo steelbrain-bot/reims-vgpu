@@ -4495,3 +4495,351 @@ fn a_tight_two_dimensional_declaration_is_admitted_for_direct_binding() {
         }
     }
 }
+
+/// One 2D RGBA8 image sitting in host storage that stands in for a RAMBlock,
+/// described exactly as the aliasing rail admits it: one mip, one layer,
+/// tightly packed rows, identity swizzle.
+///
+/// `storage` is what the import points into, so the fixture owns it and every
+/// draw that binds the alias has to outlive nothing else. Writing through
+/// [`Self::fill`] is the guest's CPU write: it goes to the same bytes the
+/// device samples, which is the whole property these tests exist to check.
+struct GuestAliasFixture {
+    storage: Vec<u8>,
+    texels: std::ops::Range<usize>,
+    width: u32,
+    height: u32,
+    memory: reims_vgpu_memory::GuestTargetMemory,
+    transfer: reims_vgpu_memory::GuestRunSource,
+}
+
+impl GuestAliasFixture {
+    /// Build the fixture, or answer `None` on a host that publishes no import
+    /// granularity — there is no guest RAM to alias there, and the copy rail is
+    /// the only rail such a host has.
+    ///
+    /// Must be called after at least one successful draw: the granularity is
+    /// what the backend measured from the device, so it does not exist until a
+    /// device does.
+    fn new(width: u32, height: u32) -> Option<Self> {
+        use reims_vgpu_memory::{
+            granularity, GuestImageLayout, GuestPageFootprint, GuestPageSet, GuestRamImport,
+            GuestRamRegion, GuestRun, GuestRunSource, GuestTargetBacking, GuestTargetMemory,
+        };
+
+        let align = granularity()?;
+        let bytes_per_texel = 4u64;
+        let row_pitch = u64::from(width) * bytes_per_texel;
+        let resource_len = row_pitch * u64::from(height);
+        let block_len = resource_len.next_multiple_of(align);
+        // One granule of slack so the covered span can start on an aligned
+        // address inside an allocation this test does not control the base of.
+        let storage = vec![0u8; (block_len + align) as usize];
+        let pad = (storage.as_ptr() as u64).next_multiple_of(align) - storage.as_ptr() as u64;
+        let base = storage.as_ptr() as u64 + pad;
+        let gpa_base = 0x3_0000_0000u64;
+        let import = std::sync::Arc::new(
+            GuestRamImport::new(
+                GuestRamRegion {
+                    gpa_base,
+                    host_va: base,
+                    len: block_len,
+                },
+                align,
+            )
+            .expect("an aligned, non-empty region"),
+        );
+        let pages = (0..block_len / align)
+            .map(|page| gpa_base + page * align)
+            .collect::<Vec<_>>();
+        let backing = GuestTargetBacking {
+            allocation_host_ptr: base as usize,
+            allocation_len: block_len,
+            resource_offset: 0,
+            resource_len,
+            plane_offset: 0,
+            row_pitch,
+        };
+        let memory = GuestTargetMemory {
+            backing,
+            import,
+            footprint: GuestPageFootprint::new(pages.as_slice().into(), align)
+                .expect("a non-empty page list at a power-of-two page size"),
+        };
+        let transfer = GuestRunSource {
+            runs: std::sync::Arc::new(vec![GuestRun {
+                host_ptr: base as usize,
+                len: resource_len,
+            }]),
+            source_offset: 0,
+            total_len: resource_len,
+            row_length_texels: width,
+            pages: None,
+            physical_pages: GuestPageSet::new(&pages),
+        };
+        // Ask the device whether it can plan this shape as a linear image
+        // before asserting anything about aliasing. A host that answers
+        // `Refused` keeps every sampled bind on the copy rail by design.
+        let request = reims_vgpu_memory::GuestImageBindingRequest {
+            backing,
+            allocation: reims_vgpu_memory::GuestImageAllocationLayout::single(
+                0,
+                row_pitch,
+                GuestImageLayout::D2 { width, height },
+            ),
+            format: reims_vgpu_protocol::ImageFormat::linear(
+                reims_vgpu_protocol::TexelLayout::Rgba8,
+            ),
+        };
+        match engine::sampled_guest_image_binding_requirement(request)? {
+            reims_vgpu_memory::GuestImageBindingDisposition::Direct(_) => {}
+            reims_vgpu_memory::GuestImageBindingDisposition::Refused => return None,
+        }
+        let texels = pad as usize..(pad + resource_len) as usize;
+        Some(Self {
+            storage,
+            texels,
+            width,
+            height,
+            memory,
+            transfer,
+        })
+    }
+
+    /// Write one colour over every texel, the way the guest's own CPU would.
+    fn fill(&mut self, rgba: [u8; 4]) {
+        let range = self.texels.clone();
+        for texel in self.storage[range].chunks_exact_mut(4) {
+            texel.copy_from_slice(&rgba);
+        }
+    }
+
+    fn source(&self) -> SampledSource {
+        let source = reims_vgpu_memory::GuestImageSource::single_mip(
+            self.memory.clone(),
+            reims_vgpu_memory::GuestImageLayout::D2 {
+                width: self.width,
+                height: self.height,
+            },
+            self.transfer.clone(),
+        )
+        .expect("a single-mip allocation whose plane starts at its resource");
+        SampledSource::GuestImage(source, reims_vgpu_core::GatherVouch::Fresh)
+    }
+}
+
+/// A fullscreen textured quad sampling `fixture` into a BGRA surface resident.
+fn guest_alias_req(
+    vert: &[u32],
+    frag: &[u32],
+    identity: &TargetIdentity,
+    fixture: &GuestAliasFixture,
+    w: u32,
+    h: u32,
+) -> DrawRequest {
+    let positions: [[f32; 4]; 6] = [
+        [-1.0, -1.0, 0.0, 1.0],
+        [1.0, -1.0, 0.0, 1.0],
+        [-1.0, 1.0, 0.0, 1.0],
+        [-1.0, 1.0, 0.0, 1.0],
+        [1.0, -1.0, 0.0, 1.0],
+        [1.0, 1.0, 0.0, 1.0],
+    ];
+    let uvs: [[f32; 2]; 6] = [
+        [0.0, 1.0],
+        [1.0, 1.0],
+        [0.0, 0.0],
+        [0.0, 0.0],
+        [1.0, 1.0],
+        [1.0, 0.0],
+    ];
+    let encode_f32 = |values: &[f32]| {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>()
+    };
+    let mut req = engine_req(vert, frag, w, h);
+    req.vertex_count = 6;
+    req.target_identity = Some(identity.clone());
+    req.skip_readback = true;
+    req.storage_buffers.push(StorageBufferResource {
+        binding: 0,
+        content: encode_f32(&positions.into_iter().flatten().collect::<Vec<_>>()).into(),
+    });
+    req.storage_buffers.push(StorageBufferResource {
+        binding: 1,
+        content: encode_f32(&uvs.into_iter().flatten().collect::<Vec<_>>()).into(),
+    });
+    req.sampled_images.push(SampledImageResource {
+        binding: 32,
+        array_element: 0,
+        descriptor_count: 1,
+        width: fixture.width,
+        height: fixture.height,
+        layers: 1,
+        arrayed: false,
+        volume: false,
+        cube: false,
+        one_dim: false,
+        multisampled: false,
+        source: fixture.source(),
+        byte_origin: Default::default(),
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
+        identity: None,
+        content: None,
+        resource_lifetime: None,
+        swizzle: Default::default(),
+    });
+    req.samplers
+        .push(SamplerResource::normalized_default(sampler_binding(0)));
+    req
+}
+
+/// The centre texel of a BGRA resident, in the guest's own byte order.
+fn bgra_center(pixels: &[u8], w: u32, h: u32) -> [u8; 4] {
+    let center = ((h / 2) * w + w / 2) as usize * 4;
+    pixels[center..center + 4]
+        .try_into()
+        .expect("four channels")
+}
+
+/// An alias inherits the bytes the guest wrote before the image existed.
+///
+/// A Vulkan image over imported host memory is born `UNDEFINED`, and the first
+/// transition out of that layout is permitted to discard everything the memory
+/// holds. The guest is nonetheless entitled to those texels: it wrote them into
+/// its own allocation and declared the allocation as a texture, and the native
+/// oracle this device emulates makes them visible. So an alias owes one copy at
+/// birth, laundered through a staging buffer because an imported buffer and the
+/// image alias the same bytes and Vulkan forbids a copy whose regions overlap.
+///
+/// This test writes the texels *before* the first bind and reads the result
+/// back. Note what it cannot prove: a driver that happens not to discard on the
+/// `UNDEFINED` transition would return the right pixels with the copy removed.
+/// The counter assertion is what pins the copy itself to having been recorded.
+#[test]
+fn a_new_guest_alias_samples_the_bytes_written_before_it_existed() {
+    let _g = engine_test_session();
+    let vert = translate_words("textured_quad.air", Stage::Vertex);
+    let frag = translate_words("textured_quad.air", Stage::Fragment);
+    let (w, h) = (16u32, 16u32);
+    let identity = TargetIdentity::Surface {
+        id: 0x9A1,
+        width: w,
+        height: h,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    // One ordinary draw first: the import granularity is measured from the
+    // device, so there is nothing to build a guest allocation against until a
+    // device has been resolved.
+    let (warm_vert, warm_frag) = triangle_spirv();
+    if draw_or_skip(
+        "guest alias warm-up",
+        &engine_req(&warm_vert, &warm_frag, w, h),
+    )
+    .is_none()
+    {
+        return;
+    }
+    let Some(mut fixture) = GuestAliasFixture::new(16, 16) else {
+        eprintln!("skipping: this host cannot alias guest pages as a sampled image");
+        return;
+    };
+    let rgba = [17u8, 91, 203, 255];
+    fixture.fill(rgba);
+
+    let req = guest_alias_req(&vert, &frag, &identity, &fixture, w, h);
+    let before = engine::counter_snapshot();
+    engine::execute_draw_request(&req).expect("a draw sampling an aliased guest allocation");
+    let delta = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(
+        delta.sampled_guest_direct_binds, 1,
+        "the sampled bind did not take the aliasing rail: {delta:?}"
+    );
+    assert_eq!(
+        delta.sampled_guest_materializations, 1,
+        "a newly created alias must record exactly one birth copy: {delta:?}"
+    );
+    let pixels = engine::read_target(&identity)
+        .expect("read the resident the alias was sampled into")
+        .pixels;
+    assert_eq!(
+        bgra_center(&pixels, w, h),
+        [rgba[2], rgba[1], rgba[0], rgba[3]],
+        "the alias lost the texels the guest wrote before the image existed"
+    );
+}
+
+/// A guest CPU write after the alias exists reaches the next sampled read.
+///
+/// This is the property the whole rail is for: the image *is* the guest's
+/// pages, so a store the guest makes is visible without this device copying
+/// anything. The second draw must therefore reuse the same resident — a rebuilt
+/// alias would carry the new bytes through its birth copy instead and prove
+/// nothing — which is why the materialization count is asserted to stay put
+/// while the pixels change.
+#[test]
+fn a_guest_write_after_the_alias_exists_reaches_the_next_sampled_read() {
+    let _g = engine_test_session();
+    let vert = translate_words("textured_quad.air", Stage::Vertex);
+    let frag = translate_words("textured_quad.air", Stage::Fragment);
+    let (w, h) = (16u32, 16u32);
+    let identity = TargetIdentity::Surface {
+        id: 0x9A2,
+        width: w,
+        height: h,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let (warm_vert, warm_frag) = triangle_spirv();
+    if draw_or_skip(
+        "guest alias warm-up",
+        &engine_req(&warm_vert, &warm_frag, w, h),
+    )
+    .is_none()
+    {
+        return;
+    }
+    let Some(mut fixture) = GuestAliasFixture::new(16, 16) else {
+        eprintln!("skipping: this host cannot alias guest pages as a sampled image");
+        return;
+    };
+    let first = [17u8, 91, 203, 255];
+    fixture.fill(first);
+    let req = guest_alias_req(&vert, &frag, &identity, &fixture, w, h);
+    engine::execute_draw_request(&req).expect("the draw that creates the alias");
+    let pixels = engine::read_target(&identity)
+        .expect("read the first result")
+        .pixels;
+    assert_eq!(
+        bgra_center(&pixels, w, h),
+        [first[2], first[1], first[0], first[3]],
+        "the alias did not carry the guest's initial texels"
+    );
+
+    // The guest stores into its own allocation. Nothing tells this device.
+    let second = [201u8, 77, 31, 255];
+    fixture.fill(second);
+    let before = engine::counter_snapshot();
+    engine::execute_draw_request(&req).expect("the draw that samples the guest's new bytes");
+    let delta = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(
+        delta.sampled_guest_direct_binds, 1,
+        "the second bind left the aliasing rail: {delta:?}"
+    );
+    assert_eq!(
+        delta.sampled_guest_materializations, 0,
+        "the second bind rebuilt the alias instead of reusing it, so this measures a copy \
+         rather than a guest write: {delta:?}"
+    );
+    let pixels = engine::read_target(&identity)
+        .expect("read the second result")
+        .pixels;
+    assert_eq!(
+        bgra_center(&pixels, w, h),
+        [second[2], second[1], second[0], second[3]],
+        "a guest CPU write into the aliased pages was not visible to the device"
+    );
+}
