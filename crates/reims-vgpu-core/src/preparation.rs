@@ -59,7 +59,7 @@ pub fn sampled_image_shape(kind: crate::SampledImageKind) -> Option<SampledImage
         // `slice_count` by exactly this factor.
         SampledImageKind::Cube => SampledImageShape {
             cube: true,
-            layers: 6,
+            layers: reims_vgpu_protocol::CUBE_FACES,
             ..d2
         },
         // Still refused, and by name rather than by approximation. The executor

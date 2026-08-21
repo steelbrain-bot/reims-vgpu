@@ -67,9 +67,9 @@ pub use resource::{
     ObjectListEntry, RenderPipelineDescriptor, RenderPipelineObject, ResourceDecodeError,
     ResourceDescriptor, SamplerDescriptor, SamplerObject, SurfaceBackingDescriptor,
     SurfaceBackingPlane, TextureLevelLayout, TextureViewDescriptor, TextureViewForm,
-    VertexAttribute, MAX_COLOR_ATTACHMENTS, MTL_COLOR_WRITE_MASK_ALL, MTL_COLOR_WRITE_MASK_ALPHA,
-    MTL_COLOR_WRITE_MASK_BLUE, MTL_COLOR_WRITE_MASK_GREEN, MTL_COLOR_WRITE_MASK_NONE,
-    MTL_COLOR_WRITE_MASK_RED, OBJECT_LIST_ENTRY_LEN,
+    VertexAttribute, CUBE_FACES, MAX_COLOR_ATTACHMENTS, MTL_COLOR_WRITE_MASK_ALL,
+    MTL_COLOR_WRITE_MASK_ALPHA, MTL_COLOR_WRITE_MASK_BLUE, MTL_COLOR_WRITE_MASK_GREEN,
+    MTL_COLOR_WRITE_MASK_NONE, MTL_COLOR_WRITE_MASK_RED, OBJECT_LIST_ENTRY_LEN,
 };
 pub use resource_state::ResourceValidityOps;
 pub use stamp::{StampWait, STAMP_INDEX_MASK, STAMP_SLOT_LEN};
