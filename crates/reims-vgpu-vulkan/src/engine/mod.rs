@@ -2580,14 +2580,55 @@ pub fn render_target_layout_supported(layout: reims_vgpu_protocol::TexelLayout) 
 
 /// Stable backend admission for a pre-populated sampled image declaration.
 ///
-/// Vulkan external images must start `UNDEFINED`, so binding an image directly
-/// over guest RAM cannot preserve texels written before image creation. The
-/// runtime therefore keeps the ordinary guest-page transfer description and
-/// the backend imports those pages as a buffer for the GPU-side image copy.
+/// The answer is whether an image aliasing these guest pages is *representable*
+/// on this device — the shape plans, the format has a linear mode, and the
+/// device reports a length the allocation can be grown to. It is deliberately
+/// not the question of whether the alias may carry the guest's existing bytes:
+/// external images are born `UNDEFINED` (see the valid-usage chain quoted in
+/// [`linear_image_import`]), so prior texels are a materialization problem for
+/// the acquiring path and not an admission one. Answering them together is what
+/// kept this a constant `Refused`, and it conflated a permanent spec rule with a
+/// per-declaration capability question.
+///
+/// `Refused` still means every sampled bind of this declaration takes the
+/// imported-buffer copy rail, which is where a refusal must land: the copy rail
+/// is correct on every device and is the only rail on a host with no import.
+///
+/// The probe costs one `vkCreateImage`/`vkDestroyImage`. The runtime caches the
+/// answer per binding key, so it is paid once per distinct declaration shape
+/// rather than once per bind.
 pub fn sampled_guest_image_binding_requirement(
-    _request: reims_vgpu_memory::GuestImageBindingRequest,
+    request: reims_vgpu_memory::GuestImageBindingRequest,
 ) -> Option<reims_vgpu_memory::GuestImageBindingDisposition> {
-    Some(reims_vgpu_memory::GuestImageBindingDisposition::Refused)
+    use reims_vgpu_memory::{GuestImageBindingDisposition, GuestImageBindingRequirement};
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref counters,
+        ..
+    } = &mut *guard;
+    // No device yet resolved is not an answer, and must not be cached as one.
+    let ctx = owner.ensure(counters).ok()?;
+    match unsafe {
+        linear_image_import::binding_allocation_len(
+            ctx,
+            request.backing,
+            &request.allocation,
+            crate::format::vk_image_format(request.format),
+            ash::vk::ImageUsageFlags::SAMPLED | ash::vk::ImageUsageFlags::TRANSFER_DST,
+        )
+    } {
+        Ok(allocation_len) => {
+            crate::telemetry::note_route("sampled_guest_alias_eligible");
+            Some(GuestImageBindingDisposition::Direct(
+                GuestImageBindingRequirement { allocation_len },
+            ))
+        }
+        Err(refusal) => {
+            reims_vgpu_observe::Emit::decline("sampled_guest_alias_ineligible", &refusal).off();
+            Some(GuestImageBindingDisposition::Refused)
+        }
+    }
 }
 
 pub fn deferred_gpu_only_content_allowed() -> bool {

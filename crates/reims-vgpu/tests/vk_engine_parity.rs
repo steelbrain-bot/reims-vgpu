@@ -4436,3 +4436,62 @@ fn resident_content_state_separates_an_absent_slot_from_an_unstamped_one() {
         "a draw since the stamp clears it — the slot is still there"
     );
 }
+
+/// A tightly-packed 2D declaration must be admitted for direct binding.
+///
+/// The backend's admission answer is a device-capability question — does this
+/// shape, format and pitch plan as a linear image here — and not the separate
+/// question of whether such an image may inherit the bytes already in the
+/// allocation. External images are born `UNDEFINED`, which bounds what an alias
+/// can *inherit*; it does not bound whether one can exist. Answering both with
+/// one constant `Refused` is what kept every sampled bind on the copy rail, so
+/// this test pins the two apart: a shape the device can plan answers `Direct`
+/// and names the length the caller must grow its allocation to.
+///
+/// `None` is not a failure here. It is the documented "no device yet resolved"
+/// answer, which is what a checkout with no Vulkan ICD returns, and the suite
+/// skips rather than reporting a device fact it could not measure.
+#[test]
+fn a_tight_two_dimensional_declaration_is_admitted_for_direct_binding() {
+    let _guard = engine_test_session();
+    let (width, height) = (256u32, 128u32);
+    let bytes_per_texel = 4u64;
+    let row_pitch = u64::from(width) * bytes_per_texel;
+    let resource_len = row_pitch * u64::from(height);
+    let request = reims_vgpu_memory::GuestImageBindingRequest {
+        backing: reims_vgpu_memory::GuestTargetBacking {
+            allocation_host_ptr: 0,
+            allocation_len: resource_len,
+            resource_offset: 0,
+            resource_len,
+            plane_offset: 0,
+            row_pitch,
+        },
+        allocation: reims_vgpu_memory::GuestImageAllocationLayout::single(
+            0,
+            row_pitch,
+            reims_vgpu_memory::GuestImageLayout::D2 { width, height },
+        ),
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Bgra8),
+    };
+    let Some(disposition) = engine::sampled_guest_image_binding_requirement(request) else {
+        eprintln!("skipping: no Vulkan device resolved, so there is no admission to assert");
+        return;
+    };
+    match disposition {
+        reims_vgpu_memory::GuestImageBindingDisposition::Direct(requirement) => {
+            assert!(
+                requirement.allocation_len >= resource_len,
+                "an alias may need trailing host-only padding, but never fewer bytes than the \
+                 guest resource it covers: {} < {resource_len}",
+                requirement.allocation_len
+            );
+        }
+        reims_vgpu_memory::GuestImageBindingDisposition::Refused => {
+            panic!(
+                "a tightly-packed {width}x{height} BGRA8 declaration is the simplest linear image \
+                 there is; a device that refuses it cannot alias guest pages at all"
+            );
+        }
+    }
+}

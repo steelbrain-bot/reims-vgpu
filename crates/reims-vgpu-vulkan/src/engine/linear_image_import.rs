@@ -915,6 +915,75 @@ unsafe fn plan_image_with_layout(
     result
 }
 
+/// The allocation length an aliasing image over this guest layout would need,
+/// or the refusal that says no such image is representable on this device.
+///
+/// This is the same question [`create_allocation`] answers, asked without any
+/// memory to bind: it plans an image in whichever linear mode the device
+/// supports, reads the length that plan requires, and destroys the probe.
+/// Nothing is retained, so a caller may ask before it owns an import.
+///
+/// Two arguments differ from the creating path and both are forced by having no
+/// allocation yet. `require_allocation_fit` is `false` because discovering the
+/// length the caller must grow to is the entire point — checking the length it
+/// currently has would refuse every allocation that is merely short, which is
+/// all of them before the growth this answer triggers. `parent_memory_type` is
+/// `None` for the same reason: the memory whose type would be compared does not
+/// exist yet, so that check belongs to creation and is made there.
+pub(crate) unsafe fn binding_allocation_len(
+    ctx: &DeviceContext,
+    backing: GuestTargetBacking,
+    allocation_layout: &reims_vgpu_memory::GuestImageAllocationLayout,
+    format: vk::Format,
+    usage: vk::ImageUsageFlags,
+) -> Result<u64, WindowRefusal> {
+    if ctx.external_memory_host.is_none() {
+        return Err(WindowRefusal::HostImportUnavailable);
+    }
+    let bytes_per_texel = crate::translate::pixel::texel_layout_of(format)
+        .map(|layout| u64::from(layout.bytes_per_texel()))
+        .ok_or(WindowRefusal::ResourceWindowTooShort)?;
+    if !allocation_layout.is_vulkan_mip_chain(bytes_per_texel) {
+        return Err(WindowRefusal::ResourceWindowTooShort);
+    }
+    let geometry = image_geometry(
+        allocation_layout
+            .base()
+            .ok_or(WindowRefusal::ResourceWindowTooShort)?
+            .layout,
+    );
+    // Mode selection mirrors `create_allocation` because a length planned in a
+    // mode creation would not choose is not the length creation will need.
+    let explicit = unsafe { explicit_linear_supported(ctx, format, usage, geometry.image_type) }?;
+    let modes: &[LayoutMode] = if explicit {
+        &[LayoutMode::ExplicitLinear, LayoutMode::DriverLinear]
+    } else {
+        &[LayoutMode::DriverLinear]
+    };
+    let mut last = WindowRefusal::ResourceWindowTooShort;
+    for mode in modes {
+        match unsafe {
+            plan_image_with_layout(
+                ctx,
+                backing,
+                allocation_layout,
+                format,
+                usage,
+                *mode,
+                None,
+                false,
+            )
+        } {
+            Ok((image, plan)) => {
+                unsafe { ctx.device.destroy_image(image, None) };
+                return Ok(plan.required_allocation_len);
+            }
+            Err(refusal) => last = refusal,
+        }
+    }
+    Err(last)
+}
+
 #[allow(clippy::too_many_arguments)]
 unsafe fn create_with_layout(
     ctx: &DeviceContext,
