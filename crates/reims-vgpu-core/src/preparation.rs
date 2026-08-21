@@ -226,7 +226,6 @@ impl Decline for IndexLoadReason {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MrtDrop {
     NonContiguousSlot,
-    GeometryMismatch,
     UnknownFormat,
     NoIdentity,
     AliasesPrimary,
@@ -236,7 +235,6 @@ impl Decline for MrtDrop {
     fn slug(&self) -> &'static str {
         match self {
             Self::NonContiguousSlot => "mrt_drop_non_contiguous_slot",
-            Self::GeometryMismatch => "mrt_drop_geometry_mismatch",
             Self::UnknownFormat => "mrt_drop_unknown_format",
             Self::NoIdentity => "mrt_drop_no_identity",
             Self::AliasesPrimary => "mrt_drop_aliases_primary",
@@ -248,7 +246,6 @@ impl MrtDrop {
     pub const fn code(self) -> u8 {
         match self {
             Self::NonContiguousSlot => 1,
-            Self::GeometryMismatch => 2,
             Self::UnknownFormat => 3,
             Self::NoIdentity => 4,
             Self::AliasesPrimary => 5,

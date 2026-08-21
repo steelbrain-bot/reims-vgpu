@@ -42,6 +42,11 @@ pub enum DrawValidationDecline {
         width: u32,
         height: u32,
     },
+    RenderTargetExtentExceedsAttachment {
+        axis: &'static str,
+        requested: u32,
+        limit: u32,
+    },
     MissingVertexProgram,
     MissingFragmentProgram,
     VertexProgramUnavailable {
@@ -253,6 +258,9 @@ impl Decline for DrawValidationDecline {
             Self::VertexGuestRunsCoverage { .. } => "vk_draw_validate_vertex_guest_runs_coverage",
             Self::StorageGuestRunsCoverage { .. } => "vk_draw_validate_storage_guest_runs_coverage",
             Self::ZeroTargetGeometry { .. } => "vk_draw_validate_zero_target_geometry",
+            Self::RenderTargetExtentExceedsAttachment { .. } => {
+                "vk_draw_validate_render_target_extent_exceeds_attachment"
+            }
             Self::MissingVertexProgram => "vk_draw_validate_missing_vertex_program",
             Self::MissingFragmentProgram => "vk_draw_validate_missing_fragment_program",
             Self::VertexProgramUnavailable { .. } => "vk_draw_validate_vertex_program_unavailable",
@@ -376,6 +384,15 @@ impl Decline for DrawValidationDecline {
             Self::ZeroTargetGeometry { width, height } => {
                 vec![("width", width.to_string()), ("height", height.to_string())]
             }
+            Self::RenderTargetExtentExceedsAttachment {
+                axis,
+                requested,
+                limit,
+            } => vec![
+                ("axis", (*axis).into()),
+                ("requested", requested.to_string()),
+                ("limit", limit.to_string()),
+            ],
             Self::NonPositiveViewport {
                 width_bits,
                 height_bits,

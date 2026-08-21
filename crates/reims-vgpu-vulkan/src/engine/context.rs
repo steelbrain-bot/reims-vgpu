@@ -523,10 +523,16 @@ pub(crate) struct DeviceContext {
     /// this rather than re-querying: a feature asked about in two places is a
     /// feature that will eventually be enabled in one of them.
     pub features: crate::device_features::DeviceFeatures,
-    /// Combined depth-stencil format supported for DEPTH_STENCIL_ATTACHMENT on
-    /// this device (D32_SFLOAT_S8_UINT preferred, D24_UNORM_S8_UINT fallback).
-    /// Used only by the stencil-test path; depth-only uses D32_SFLOAT.
+    /// Combined depth-stencil format supported for attachment use on this
+    /// device (D32_SFLOAT_S8_UINT preferred, D24_UNORM_S8_UINT fallback). Used
+    /// only by the stencil-test path; depth-only uses D32_SFLOAT. Transfer-clear
+    /// support is recorded separately below because it is not mandatory.
     pub depth_stencil_format: vk::Format,
+    /// Whether the depth-only and selected combined formats can be used as
+    /// transfer destinations. A larger depth attachment needs this to express
+    /// Metal's attachment-wide load clear before the minimum-sized framebuffer.
+    pub depth_transfer_dst: bool,
+    pub depth_stencil_transfer_dst: bool,
     /// A two-slot timestamp query pool for the composite readback, and the tick
     /// length that turns its delta into wall clock. `None` when this queue
     /// family reports `timestampValidBits == 0` or the device reports a
@@ -642,6 +648,17 @@ mod storage_buffer_alignment_tests {
 unsafe impl Send for DeviceContext {}
 
 impl DeviceContext {
+    pub(crate) fn depth_format_transfer_dst(&self, format: vk::Format) -> bool {
+        if !super::format_is_depth(format) {
+            false
+        } else if format == self.depth_stencil_format {
+            self.depth_stencil_transfer_dst
+        } else {
+            debug_assert_eq!(format, crate::translate::pixel::TRANSIENT_DEPTH_FORMAT);
+            self.depth_transfer_dst
+        }
+    }
+
     pub(crate) unsafe fn create() -> Result<Self, DrawError> {
         let entry = ash::Entry::load().map_err(|e| {
             DrawError::Init(InitDecline::LoadVulkanLoader {
@@ -927,14 +944,18 @@ impl DeviceContext {
         // spec guarantees at least ONE of D32_SFLOAT_S8_UINT / D24_UNORM_S8_UINT
         // supports DEPTH_STENCIL_ATTACHMENT (required-format table) — but NOT
         // which one, so hardcoding D32_S8 is unportable (RADV/ANV may prefer
-        // D24_S8). Query and prefer D32_S8 (matches the depth-only D32_SFLOAT
-        // path's 32-bit float depth), else fall back to D24_S8. Depth-only stays
-        // D32_SFLOAT, which IS spec-mandatory — no query needed there.
-        let supports_depth_stencil = |f: vk::Format| {
+        // D24_S8). The images also carry TRANSFER_DST because a Metal clear is
+        // attachment-wide even when another attachment constrains the Vulkan
+        // framebuffer. Prefer D32_S8 for attachment use (matching the
+        // depth-only D32_SFLOAT path), else fall back to D24_S8, then record
+        // transfer-clear support independently for the selected format.
+        let format_features = |f: vk::Format| {
             instance
                 .get_physical_device_format_properties(pd, f)
                 .optimal_tiling_features
-                .contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
+        };
+        let supports_depth_stencil = |f: vk::Format| {
+            format_features(f).contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
         };
         let depth_stencil_format = if supports_depth_stencil(vk::Format::D32_SFLOAT_S8_UINT) {
             vk::Format::D32_SFLOAT_S8_UINT
@@ -946,6 +967,10 @@ impl DeviceContext {
             // silently guessing an unsupported format.
             vk::Format::D32_SFLOAT_S8_UINT
         };
+        let depth_transfer_dst =
+            format_features(vk::Format::D32_SFLOAT).contains(vk::FormatFeatureFlags::TRANSFER_DST);
+        let depth_stencil_transfer_dst =
+            format_features(depth_stencil_format).contains(vk::FormatFeatureFlags::TRANSFER_DST);
         let mut divisor_features = vk::PhysicalDeviceVertexAttributeDivisorFeaturesKHR::default();
         let mut divisor_properties =
             vk::PhysicalDeviceVertexAttributeDivisorPropertiesKHR::default();
@@ -1240,6 +1265,8 @@ impl DeviceContext {
             sampler_anisotropy: features.sampler_anisotropy,
             features,
             depth_stencil_format,
+            depth_transfer_dst,
+            depth_stencil_transfer_dst,
             timestamps,
             draw_spans,
             stamp_completion,

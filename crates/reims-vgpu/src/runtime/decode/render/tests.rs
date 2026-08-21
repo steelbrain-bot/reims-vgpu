@@ -20,7 +20,7 @@ fn every_render_decode_failure_names_its_own_check() {
     assert_eq!(slugs.len(), n, "two render decode checks share a slug");
 }
 use super::*;
-use reims_vgpu_core::endian::st32;
+use reims_vgpu_core::endian::{st16, st32};
 
 fn hdr(op: u32, len: usize) -> Vec<u8> {
     let mut v = vec![0u8; len];
@@ -917,9 +917,70 @@ fn each_unapplied_state_decodes_at_its_own_width() {
         assert_eq!(c.first, 0, "op {op:#x} invented an attachment index");
     }
 
-    // `textureBarrier` is the header alone and joins the barrier kind.
+    // `textureBarrier` is the header alone and keeps its distinct semantics.
     let c = decode(&hdr(wire::OPCODE_TEXTURE_BARRIER, OP_HEADER_LEN)).expect("texture barrier");
-    assert_eq!(c.kind, Kind::Barrier);
+    assert_eq!(c.kind, Kind::TextureBarrier);
+    assert_eq!(
+        decode(&hdr(wire::OPCODE_TEXTURE_BARRIER, OP_HEADER_LEN + 1)).unwrap_err(),
+        DecodeStatus::ErrBadLength,
+        "textureBarrier has no payload"
+    );
+
+    // The resource form is an eight-byte head followed by exactly `count`
+    // four-byte refs. A barrier orders work, so accepting a truncated or slack
+    // record would apply an ordering point the guest did not actually encode.
+    let resource_head = core::mem::size_of::<wire::MemoryBarrierResources>();
+    let resource_ref = core::mem::size_of::<wire::RefBind>();
+    let mut resources = hdr(
+        wire::OPCODE_MEMORY_BARRIER_RESOURCES,
+        OP_HEADER_LEN + resource_head + resource_ref,
+    );
+    st32(&mut resources[OP_HEADER_LEN..], 1);
+    st16(&mut resources[OP_HEADER_LEN + 4..], 1);
+    st16(&mut resources[OP_HEADER_LEN + 6..], 2);
+    st32(&mut resources[OP_HEADER_LEN + resource_head..], 0x5151);
+    let decoded = decode(&resources).expect("resource barrier");
+    assert_eq!(decoded.kind, Kind::BarrierResources);
+    assert_eq!(decoded.barrier_after_stages, 1);
+    assert_eq!(decoded.barrier_before_stages, 2);
+    assert_eq!(
+        decoded.barrier_resources,
+        [reims_vgpu_protocol::ObjectTableRef::new(0x5151)]
+    );
+    let mut truncated = hdr(
+        wire::OPCODE_MEMORY_BARRIER_RESOURCES,
+        OP_HEADER_LEN + resource_head,
+    );
+    st32(&mut truncated[OP_HEADER_LEN..], 1);
+    assert_eq!(decode(&truncated).unwrap_err(), DecodeStatus::ErrShort);
+    let mut slack = hdr(
+        wire::OPCODE_MEMORY_BARRIER_RESOURCES,
+        OP_HEADER_LEN + resource_head + resource_ref,
+    );
+    st32(&mut slack[OP_HEADER_LEN..], 0);
+    assert_eq!(decode(&slack).unwrap_err(), DecodeStatus::ErrBadLength);
+
+    let mut scope = hdr(
+        wire::OPCODE_MEMORY_BARRIER_SCOPE,
+        wire::MEMORY_BARRIER_SCOPE_TOTAL_LEN as usize,
+    );
+    scope[OP_HEADER_LEN] = 4;
+    scope[OP_HEADER_LEN + 2] = 1;
+    scope[OP_HEADER_LEN + 3] = 2;
+    let decoded = decode(&scope).expect("scope barrier");
+    assert_eq!(decoded.kind, Kind::BarrierScope);
+    assert_eq!(decoded.barrier_scope, 4);
+    assert_eq!(decoded.barrier_unidentified_u8, 0);
+    assert_eq!(decoded.barrier_after_stages, 1);
+    assert_eq!(decoded.barrier_before_stages, 2);
+    assert_eq!(
+        decode(&hdr(
+            wire::OPCODE_MEMORY_BARRIER_SCOPE,
+            wire::MEMORY_BARRIER_SCOPE_TOTAL_LEN as usize + 1,
+        ))
+        .unwrap_err(),
+        DecodeStatus::ErrBadLength,
+    );
 }
 
 /// A vertex bind carrying an attribute stride binds the buffer.
@@ -1256,7 +1317,7 @@ fn a_colour_attachments_level_does_not_swallow_its_slice() {
     }
 }
 
-/// The pass's tail is four fields this device decodes and does not apply.
+/// The pass's tail is four independent fields execution consumes.
 ///
 /// A record short of the tail must leave all four at zero rather than
 /// reading past its own payload — the decoder accepts a payload as small as

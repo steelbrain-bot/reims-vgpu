@@ -800,11 +800,17 @@ pub struct DrawEncodeRequest {
     pub visibility: Option<VisibilityArming>,
     pub indexed: Option<IndexedDrawInfo>,
     pub blend_color: Option<[f32; 4]>,
+    /// Pass-owned raster bounds; unlike attachment geometry, these do not
+    /// narrow load or store operations.
+    pub render_target_extent: reims_vgpu_core::RenderTargetExtent,
     pub cull_mode: reims_vgpu_protocol::CullMode,
     pub front_face_ccw: bool,
     /// `MTLTriangleFillMode` from `setTriangleFillMode:`, initialized to the
     /// Metal default (`Fill`) until the stream replaces it.
     pub fill_mode: reims_vgpu_protocol::FillMode,
+    /// Encoder line width, bit-preserving so backend capability projection can
+    /// distinguish every guest value.
+    pub line_width: reims_vgpu_core::LineWidth,
     /// `MTLDepthClipMode` from `setDepthClipMode:`, initialized to the Metal
     /// default (`Clip`) until the stream replaces it.
     pub depth_clip_mode: reims_vgpu_protocol::DepthClipMode,
@@ -2357,29 +2363,6 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
         publish_surface_store(state, host, mapping_id, w, h, fmt);
     }
     wrote
-}
-
-///
-/// **Every `executeCommandsInBuffer:` lands here and is lost.** This is a gap
-/// in the Vulkan rail rather than a portability footnote — it is fail-visible (the
-/// caller turns `BackendUnavailable` into a `render_icb` refusal, latched per ICB ref)
-/// and it is still the guest's draws not running.
-///
-/// It has never been measured firing: `icb_exec_seen` reads zero on every
-/// driven x86 boot taken so far, most recently a 25-second Safari window drag.
-/// So the argument for building it is contract, not a reading.
-///
-/// Closing it requires replaying [`crate::runtime::icb::decode_icb_command_range`]
-/// results as draws through the Vulkan engine rather than adding a second decoder.
-pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
-    _state: &mut Device,
-    _host: &mut M,
-    _req: &DrawEncodeRequest,
-    _icb_ref: u32,
-    _range_location: u64,
-    _range_length: u64,
-) -> EncodeStatus {
-    EncodeStatus::Unsupported("render_icb_execute_unimplemented")
 }
 
 /// Resolve color texture ref → mapping geometry for a draw request.

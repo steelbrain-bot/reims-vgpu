@@ -158,10 +158,10 @@ pub const PASS_MAX_COLOR_ATTACHMENTS: usize = reims_vgpu_protocol::MAX_COLOR_ATT
 
 /// Offset of the pass-level tail, past the last colour slot.
 ///
-/// Four fields this device decodes and does not apply. They are the guest's
-/// explicit statement about the pass's extent and its occlusion query buffer,
-/// and none of them can be recovered from the attachments: a guest may bind a
-/// 4096-wide texture and ask for a 640-wide pass.
+/// Four pass-level fields consumed independently by execution: the visibility
+/// result buffer, array length, and the two raster-extent axes. None can be
+/// recovered from the attachments: a guest may bind a 4096-wide texture and
+/// ask for a 640-wide pass.
 #[cfg(test)]
 pub(crate) const PASS_TAIL_OFF: usize =
     PASS_COLOR_ATTACH_OFF + PASS_MAX_COLOR_ATTACHMENTS * PASS_COLOR_ATTACH_STRIDE;
@@ -321,7 +321,9 @@ pub enum Kind {
     SetDepthBias,
     SetStencilReference,
     Fence,
-    Barrier,
+    BarrierResources,
+    BarrierScope,
+    TextureBarrier,
     /// `setTriangleFillMode:` / `setDepthClipMode:`. The value is in
     /// [`Command::mode`]; which state it sets is [`Command::opcode`], as on the
     /// wire.
@@ -397,7 +399,7 @@ pub enum Kind {
     /// rasterization rate map, `0x22`/`0x23` the imageblock and threadgroup
     /// memory lengths, `0x24` the tile size. Which one is [`Command::opcode`],
     /// as on the wire; the scalar is [`Command::mode`] and the rate map's ref is
-    /// [`Command::object_ref`].
+    /// [`Command::texture_ref`].
     ///
     /// Decoded and counted rather than applied. Each of the six is behind a
     /// capability that defaults off, so a non-zero count is the first evidence
@@ -687,6 +689,16 @@ pub struct Command {
     /// Heap declarations carried by [`Kind::UseHeap`]. Heap refs inhabit the
     /// serializer's heap namespace, not the task object-list namespace.
     pub residency_heaps: Vec<ObjectTableRef<HeapObject>>,
+    /// Resource declarations carried by [`Kind::BarrierResources`].
+    pub barrier_resources: Vec<ObjectTableRef<ResourceObject>>,
+    /// Render stages whose accesses must complete before a barrier.
+    pub barrier_after_stages: u16,
+    /// Render stages whose accesses wait behind a barrier.
+    pub barrier_before_stages: u16,
+    /// `MTLBarrierScope` carried by [`Kind::BarrierScope`].
+    pub barrier_scope: u8,
+    /// Written byte adjacent to `barrier_scope` whose meaning is not established.
+    pub barrier_unidentified_u8: u8,
     pub buffer_ref: u32,
     pub buffer_offset: u64,
     /// Multi-entry buffer binds for slots `first..first+count`.
@@ -768,11 +780,11 @@ pub struct Command {
     /// [`DecodedBufferBind::attribute_stride`], because the record does.
     pub attribute_stride: Option<u64>,
     pub raw_payload_len: usize,
-    /// Color attachment[0] when kind is RenderPass (boot clear path).
+    /// Color attachment zero when kind is RenderPass (boot clear path).
     pub color0: ColorAttachment,
     pub depth: DepthAttachment,
     pub stencil: StencilAttachment,
-    /// The pass's own tail, on [`Kind::RenderPass`]. Decoded, not applied.
+    /// The pass's own tail, on [`Kind::RenderPass`].
     ///
     /// `visibility_result_buffer_ref` is the buffer
     /// `setVisibilityResultMode:offset:` indexes — that record carries the mode
@@ -1501,10 +1513,44 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             );
             Ok(out)
         }
-        wire::OPCODE_MEMORY_BARRIER_RESOURCES
-        | wire::OPCODE_MEMORY_BARRIER_SCOPE
-        | wire::OPCODE_TEXTURE_BARRIER => {
-            out.kind = Kind::Barrier;
+        wire::OPCODE_MEMORY_BARRIER_RESOURCES => {
+            let (head, refs) =
+                wire::memory_barrier_resources(&op).map_err(|_| DecodeStatus::ErrShort)?;
+            let expected = (head.count.get() as usize)
+                .checked_mul(core::mem::size_of::<wire::RefBind>())
+                .and_then(|refs| {
+                    refs.checked_add(core::mem::size_of::<wire::MemoryBarrierResources>())
+                })
+                .ok_or(DecodeStatus::ErrBadLength)?;
+            if payload.len() != expected {
+                return Err(DecodeStatus::ErrBadLength);
+            }
+            out.kind = Kind::BarrierResources;
+            out.barrier_after_stages = head.after_stages.get();
+            out.barrier_before_stages = head.before_stages.get();
+            out.barrier_resources.extend(
+                refs.iter()
+                    .map(|resource| ObjectTableRef::new(resource.object_ref.get())),
+            );
+            Ok(out)
+        }
+        wire::OPCODE_MEMORY_BARRIER_SCOPE => {
+            if command_length != wire::MEMORY_BARRIER_SCOPE_TOTAL_LEN as usize {
+                return Err(DecodeStatus::ErrBadLength);
+            }
+            let scope = wire::memory_barrier_scope(&op).map_err(|_| DecodeStatus::ErrShort)?;
+            out.kind = Kind::BarrierScope;
+            out.barrier_scope = scope.scope;
+            out.barrier_unidentified_u8 = scope.unidentified_u8;
+            out.barrier_after_stages = u16::from(scope.after_stages);
+            out.barrier_before_stages = u16::from(scope.before_stages);
+            Ok(out)
+        }
+        wire::OPCODE_TEXTURE_BARRIER => {
+            if !wire::texture_barrier_has_no_payload(&op) {
+                return Err(DecodeStatus::ErrBadLength);
+            }
+            out.kind = Kind::TextureBarrier;
             Ok(out)
         }
         wire::OPCODE_SET_DEPTH_CLIP_MODE | wire::OPCODE_SET_TRIANGLE_FILL_MODE => {

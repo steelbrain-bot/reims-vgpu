@@ -193,6 +193,70 @@ fn plain_triangle_known_color() {
     }
 }
 
+/// A render-pass extent constrains rasterization, not attachment load-clear.
+/// The whole 8x8 attachment must become red before the full-screen draw is
+/// clipped to the upper-left 4x4 raster bound.
+#[test]
+fn render_target_extent_clips_fragments_without_narrowing_clear() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let mut req = engine_req(&v, &f, 8, 8);
+    req.target_clear = [1.0, 0.0, 0.0, 1.0];
+    req.render_target_extent = reims_vgpu_core::RenderTargetExtent {
+        width: std::num::NonZeroU32::new(4),
+        height: std::num::NonZeroU32::new(4),
+    };
+    let Some(px) = draw_or_skip("render_target_extent", &req) else {
+        return;
+    };
+
+    for y in 0..8usize {
+        for x in 0..8usize {
+            let pixel = &px[(y * 8 + x) * 4..][..4];
+            if x < 4 && y < 4 {
+                assert!(
+                    near(pixel[0], 64)
+                        && near(pixel[1], 128)
+                        && near(pixel[2], 191)
+                        && near(pixel[3], 255),
+                    "fragment at ({x},{y}) was not drawn: {pixel:?}"
+                );
+            } else {
+                assert_eq!(pixel, [255, 0, 0, 255], "clear lost at ({x},{y})");
+            }
+        }
+    }
+}
+
+/// Sub-unit line width is not sent to Vulkan as an invalid dynamic value. The
+/// semantic projection suppresses line fragments while leaving filled
+/// triangles untouched, matching the render-encoder contract.
+#[test]
+fn zero_line_width_discards_lines_but_not_filled_triangles() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let (w, h) = (16u32, 16u32);
+
+    let mut filled = engine_req(&v, &f, w, h);
+    filled.line_width = reims_vgpu_core::LineWidth::from_f32(0.0);
+    let Some(filled_pixels) = draw_or_skip("zero_width_filled_triangle", &filled) else {
+        return;
+    };
+    assert_fullscreen_fragment_color("zero_width_filled_triangle", &filled_pixels, w, h);
+
+    let mut line = engine_req(&v, &f, w, h);
+    line.primitive_topology = PrimitiveTopology::Line;
+    line.vertex_count = 2;
+    line.line_width = reims_vgpu_core::LineWidth::from_f32(0.0);
+    let line_pixels = draw_or_skip("zero_width_line", &line).expect("same GPU context");
+    assert!(
+        line_pixels
+            .chunks_exact(4)
+            .all(|pixel| pixel[0..3] == [0, 0, 0]),
+        "zero-width line produced a fragment"
+    );
+}
+
 /// Four-sample rasterization with a matching resident depth attachment resolves
 /// coverage into the single-sample target.
 ///
@@ -583,7 +647,10 @@ fn depth_test_honored_compare_and_clear_wired() {
     let rgba = [17u8, 140, 203, 255];
 
     // Returns Some(covered) for a fragment at z=0.5 with the given depth state.
-    let variant = |compare: SamplerCompareFunction, clear: f32| -> Option<bool> {
+    let variant = |compare: SamplerCompareFunction,
+                   clear: f32,
+                   depth_bias: Option<[f32; 3]>|
+     -> Option<bool> {
         let mut req = engine_req(&vert, &frag, w, h);
         req.vertex_count = 6;
         req.storage_buffers.push(StorageBufferResource {
@@ -629,25 +696,26 @@ fn depth_test_honored_compare_and_clear_wired() {
             load: false,
             stencil: None,
         });
+        req.depth_bias = depth_bias;
         draw_or_skip("depth", &req).map(|px| triangle_covered(&px, w, h))
     };
 
     // Absolute anchors (convention-independent): Never never draws, Always always
     // draws. If depth state were ignored, Never would still cover.
-    let Some(never) = variant(SamplerCompareFunction::Never, 1.0) else {
+    let Some(never) = variant(SamplerCompareFunction::Never, 1.0, None) else {
         return; // no GPU
     };
     assert!(!never, "compare=Never must discard every fragment");
     assert!(
-        variant(SamplerCompareFunction::Always, 1.0).unwrap(),
+        variant(SamplerCompareFunction::Always, 1.0, None).unwrap(),
         "compare=Always must keep every fragment"
     );
 
     // Relationships (convention-independent): with fragment z=0.5,
-    let less_hi = variant(SamplerCompareFunction::Less, 1.0).unwrap();
-    let less_lo = variant(SamplerCompareFunction::Less, 0.0).unwrap();
-    let greater_lo = variant(SamplerCompareFunction::Greater, 0.0).unwrap();
-    let greater_hi = variant(SamplerCompareFunction::Greater, 1.0).unwrap();
+    let less_hi = variant(SamplerCompareFunction::Less, 1.0, None).unwrap();
+    let less_lo = variant(SamplerCompareFunction::Less, 0.0, None).unwrap();
+    let greater_lo = variant(SamplerCompareFunction::Greater, 0.0, None).unwrap();
+    let greater_hi = variant(SamplerCompareFunction::Greater, 1.0, None).unwrap();
     // The compare op matters: Less vs Greater against the same reference differ.
     assert_ne!(
         less_hi, greater_hi,
@@ -664,6 +732,131 @@ fn depth_test_honored_compare_and_clear_wired() {
         "Less@1.0 and Greater@0.0 must agree (depth compare wired consistently)"
     );
     assert_eq!(less_lo, greater_hi, "Less@0.0 and Greater@1.0 must agree");
+
+    // Equal fragment and clear depths fail `Less`; a negative constant bias
+    // moves the fragment toward the viewer and makes the same comparison pass.
+    // This catches both a dropped state and an accidental sign reversal.
+    assert!(
+        !variant(SamplerCompareFunction::Less, 0.5, None).unwrap(),
+        "equal depth must fail Less without bias"
+    );
+    assert!(
+        variant(SamplerCompareFunction::Less, 0.5, Some([-1.0, 0.0, 0.0]),).unwrap(),
+        "negative constant bias must move the fragment toward Less"
+    );
+}
+
+#[test]
+fn mismatched_depth_attachment_clear_covers_its_full_image() {
+    let _g = engine_test_session();
+    let (simple_v, simple_f) = triangle_spirv();
+    let depth_identity = TargetIdentity::Texture {
+        ref_: 0xd8,
+        width: 8,
+        height: 8,
+        generation: 1,
+        stencil: false,
+    };
+    let depth = |clear_value: f32, load: bool, compare| DepthState {
+        identity: Some(depth_identity.clone()),
+        test_enable: true,
+        write_enable: true,
+        compare,
+        clear_value,
+        load,
+        stencil: None,
+    };
+
+    // Establish known depth=1 over the complete resident.
+    let mut establish = engine_req(&simple_v, &simple_f, 8, 8);
+    establish.vertex_count = 0;
+    establish.skip_readback = true;
+    establish.target_identity = Some(TargetIdentity::Anonymous { slot: 0xd80 });
+    establish.depth = Some(depth(1.0, false, SamplerCompareFunction::Always));
+    match engine::execute_draw_request(&establish) {
+        Ok(_) => {}
+        Err(error) if skip_if_no_gpu(&error.to_string()) => {
+            eprintln!("SKIP mismatched depth: {error}");
+            return;
+        }
+        Err(error) => panic!("establish depth: {error}"),
+    }
+
+    // A smaller color attachment constrains rasterization to 4x4, but Metal's
+    // depth load clear still replaces all 8x8 depth texels with 0.25.
+    let mut narrow = engine_req(&simple_v, &simple_f, 4, 4);
+    narrow.vertex_count = 0;
+    narrow.skip_readback = true;
+    narrow.target_identity = Some(TargetIdentity::Anonymous { slot: 0xd81 });
+    narrow.depth = Some(depth(0.25, false, SamplerCompareFunction::Always));
+    engine::execute_draw_request(&narrow).expect("narrow depth clear");
+
+    // Load the complete depth resident and draw z=0.5 with Less. A complete
+    // 0.25 clear rejects every fragment; stale depth=1 outside 4x4 would show
+    // the sampled green output there.
+    let vert = translate_words("textured_quad.air", Stage::Vertex);
+    let frag = translate_words("textured_quad.air", Stage::Fragment);
+    let encode_f32 = |values: &[f32]| {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>()
+    };
+    let positions: [[f32; 4]; 6] = [
+        [-1.0, -1.0, 0.5, 1.0],
+        [1.0, -1.0, 0.5, 1.0],
+        [-1.0, 1.0, 0.5, 1.0],
+        [-1.0, 1.0, 0.5, 1.0],
+        [1.0, -1.0, 0.5, 1.0],
+        [1.0, 1.0, 0.5, 1.0],
+    ];
+    let uvs: [[f32; 2]; 6] = [
+        [0.0, 1.0],
+        [1.0, 1.0],
+        [0.0, 0.0],
+        [0.0, 0.0],
+        [1.0, 1.0],
+        [1.0, 0.0],
+    ];
+    let mut verify = engine_req(&vert, &frag, 8, 8);
+    verify.vertex_count = 6;
+    verify.depth = Some(depth(0.0, true, SamplerCompareFunction::Less));
+    verify.storage_buffers.push(StorageBufferResource {
+        binding: 0,
+        content: encode_f32(&positions.into_iter().flatten().collect::<Vec<_>>()).into(),
+    });
+    verify.storage_buffers.push(StorageBufferResource {
+        binding: 1,
+        content: encode_f32(&uvs.into_iter().flatten().collect::<Vec<_>>()).into(),
+    });
+    verify.sampled_images.push(SampledImageResource {
+        binding: 32,
+        array_element: 0,
+        descriptor_count: 1,
+        width: 1,
+        height: 1,
+        layers: 1,
+        arrayed: false,
+        volume: false,
+        cube: false,
+        one_dim: false,
+        multisampled: false,
+        source: SampledSource::Bytes(std::sync::Arc::new(vec![0, 255, 0, 255])),
+        byte_origin: Default::default(),
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
+        identity: None,
+        content: None,
+        resource_lifetime: None,
+        swizzle: Default::default(),
+    });
+    verify
+        .samplers
+        .push(SamplerResource::normalized_default(sampler_binding(0)));
+    let pixels = draw_or_skip("mismatched depth verify", &verify).expect("same GPU context");
+    assert!(
+        pixels.chunks_exact(4).all(|pixel| pixel[1] == 0),
+        "stale depth outside the smaller color attachment admitted green fragments"
+    );
 }
 
 /// Same depth wiring proof as `depth_test_honored_compare_and_clear_wired`, but
@@ -973,11 +1166,37 @@ fn blend_src_alpha_known_color() {
         src_alpha: BlendFactor::One,
         dst_alpha: BlendFactor::OneMinusSrcAlpha,
         alpha_op: BlendOp::Add,
-        constants: [0.0; 4],
     });
     if let Some(px) = draw_or_skip("blend_src_alpha", &req) {
         // Fragment alpha=1 → same as replace over black seed.
         assert_fullscreen_fragment_color("blend_src_alpha", &px, 8, 8);
+    }
+}
+
+#[test]
+fn blend_color_is_dynamic_encoder_state() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let mut req = engine_req(&v, &f, 8, 8);
+    req.target_rgba8 = Some(std::sync::Arc::new([0, 0, 0, 0].repeat(8 * 8)));
+    req.blend_constants = [0.2, 0.4, 0.6, 0.8];
+    req.blend = Some(BlendStateResource {
+        src_color: BlendFactor::ConstantColor,
+        dst_color: BlendFactor::Zero,
+        color_op: BlendOp::Add,
+        src_alpha: BlendFactor::ConstantAlpha,
+        dst_alpha: BlendFactor::Zero,
+        alpha_op: BlendOp::Add,
+    });
+    if let Some(px) = draw_or_skip("blend_color", &req) {
+        let center = ((8 / 2) * 8 + 8 / 2) * 4;
+        let got = &px[center..center + 4];
+        // Fixture output is approximately (0.25, 0.5, 0.75, 1.0).
+        let expected = [13, 51, 115, 204];
+        assert!(
+            got.iter().zip(expected).all(|(&a, b)| near(a, b)),
+            "blend constants did not reach the draw: got={got:?} expected={expected:?}"
+        );
     }
 }
 
@@ -2955,7 +3174,6 @@ fn premult_one_omsa_gpu_blend_matches_software_oracle() {
         src_alpha: BlendFactor::One,
         dst_alpha: BlendFactor::OneMinusSrcAlpha,
         alpha_op: BlendOp::Add,
-        constants: [0.0; 4],
     });
     let gpu_px = match engine::execute_draw_request(&gpu) {
         Ok(o) => o.pixels,
@@ -3677,6 +3895,169 @@ fn mrt_secondary_attachment_becomes_sampleable_resident() {
         "secondary must bind directly with no CPU reupload: {delta:?}"
     );
     assert_eq!(delta.sampled_reuploads, 0, "no host reupload: {delta:?}");
+}
+
+/// Metal applies each attachment's load action over that attachment's full
+/// image, then rasterizes MRT work over the minimum common extent. Exercise
+/// both directions so neither slot-zero nor secondary handling can accidentally
+/// define the rule for the other.
+#[test]
+fn mismatched_mrt_extents_clear_full_images_and_rasterize_to_the_minimum() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+
+    // Complement the clear cases with the native LOAD result: pixels in the
+    // larger attachment but outside the common raster extent retain their
+    // previous contents.
+    let loaded_primary = TargetIdentity::Surface {
+        id: 0x69,
+        width: 8,
+        height: 8,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let mut establish_load = engine_req(&v, &f, 8, 8);
+    establish_load.vertex_count = 0;
+    establish_load.skip_readback = true;
+    establish_load.target_identity = Some(loaded_primary.clone());
+    establish_load.target_clear = [0.0, 0.0, 1.0, 1.0];
+    match engine::execute_draw_request(&establish_load) {
+        Ok(_) => {}
+        Err(error) if skip_if_no_gpu(&error.to_string()) => {
+            eprintln!("SKIP mismatched MRT: {error}");
+            return;
+        }
+        Err(error) => panic!("establish large MRT LOAD target: {error}"),
+    }
+    let mut load = engine_req(&v, &f, 8, 8);
+    load.target_identity = Some(loaded_primary);
+    load.color_load_action = reims_vgpu_core::ColorLoadAction::Load;
+    load.load_from_target = true;
+    load.secondary_targets.push(SecondaryColorTarget {
+        target_guest: None,
+        identity: TargetIdentity::Surface {
+            id: 0x6e,
+            width: 4,
+            height: 4,
+            generation: 1,
+            format: SURFACE_TEST_FORMAT,
+        },
+        width: 4,
+        height: 4,
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
+        clear: [1.0, 0.0, 0.0, 1.0],
+        load_action: reims_vgpu_core::ColorLoadAction::Clear,
+        blend: None,
+        color_write_mask: Default::default(),
+    });
+    let loaded_pixels =
+        semantic_rgba(&engine::execute_draw_request(&load).expect("large-primary MRT LOAD"));
+    for y in 0..8usize {
+        for x in 0..8usize {
+            if x < 4 && y < 4 {
+                continue;
+            }
+            assert_eq!(
+                &loaded_pixels[(y * 8 + x) * 4..][..4],
+                [0, 0, 255, 255],
+                "large primary LOAD did not preserve ({x},{y})"
+            );
+        }
+    }
+
+    let large_primary = TargetIdentity::Surface {
+        id: 0x6a,
+        width: 8,
+        height: 8,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let small_secondary = TargetIdentity::Surface {
+        id: 0x6b,
+        width: 4,
+        height: 4,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let mut first = engine_req(&v, &f, 8, 8);
+    first.target_identity = Some(large_primary);
+    first.target_clear = [1.0, 0.0, 0.0, 1.0];
+    first.secondary_targets.push(SecondaryColorTarget {
+        target_guest: None,
+        identity: small_secondary,
+        width: 4,
+        height: 4,
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
+        clear: [0.0, 0.0, 1.0, 1.0],
+        load_action: reims_vgpu_core::ColorLoadAction::Clear,
+        blend: None,
+        color_write_mask: Default::default(),
+    });
+    let first_pixels = match engine::execute_draw_request(&first) {
+        Ok(output) => semantic_rgba(&output),
+        Err(error) if skip_if_no_gpu(&error.to_string()) => {
+            eprintln!("SKIP mismatched MRT: {error}");
+            return;
+        }
+        Err(error) => panic!("large-primary MRT: {error}"),
+    };
+    for y in 0..8usize {
+        for x in 0..8usize {
+            if x < 4 && y < 4 {
+                continue;
+            }
+            assert_eq!(
+                &first_pixels[(y * 8 + x) * 4..][..4],
+                [255, 0, 0, 255],
+                "large primary lost its full-image clear at ({x},{y})"
+            );
+        }
+    }
+
+    let small_primary = TargetIdentity::Surface {
+        id: 0x6c,
+        width: 4,
+        height: 4,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let large_secondary = TargetIdentity::Surface {
+        id: 0x6d,
+        width: 8,
+        height: 8,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let mut second = engine_req(&v, &f, 4, 4);
+    second.target_identity = Some(small_primary);
+    second.skip_readback = true;
+    second.secondary_targets.push(SecondaryColorTarget {
+        target_guest: None,
+        identity: large_secondary.clone(),
+        width: 8,
+        height: 8,
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
+        clear: [0.0, 0.0, 1.0, 1.0],
+        load_action: reims_vgpu_core::ColorLoadAction::Clear,
+        blend: None,
+        color_write_mask: Default::default(),
+    });
+    engine::execute_draw_request(&second).expect("large-secondary MRT");
+    let secondary_pixels = engine::read_target(&large_secondary)
+        .expect("read large secondary")
+        .pixels;
+    for y in 0..8usize {
+        for x in 0..8usize {
+            if x < 4 && y < 4 {
+                continue;
+            }
+            assert_eq!(
+                &secondary_pixels[(y * 8 + x) * 4..][..4],
+                [0, 0, 255, 255],
+                "large secondary lost its full-image blue clear at ({x},{y})"
+            );
+        }
+    }
 }
 
 /// The vibrancy coverage mask is Metal RG16Float (0x41). Exercise the real

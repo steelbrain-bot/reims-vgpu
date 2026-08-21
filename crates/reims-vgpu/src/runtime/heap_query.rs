@@ -143,8 +143,8 @@ pub fn decode_request(payload: &[u8]) -> Result<Request, QueryError> {
 ///
 /// Read through `reims_vgpu_wire`'s view rather than at offsets restated here,
 /// so a field this device names is the field Apple's bytes derived. The two
-/// private flag bits and trailing 64-bit member stay unidentified because no
-/// controlled property perturbation established their public meaning.
+/// `framebufferOnly`, `isDrawable`, and `protectionOptions` were independently
+/// attributed by controlled serializer perturbations.
 pub fn decode_serialized_texture_descriptor(body: &[u8]) -> Result<TextureDescriptor, QueryError> {
     if body.len() != TEXTURE_BODY_LEN {
         return Err(QueryError::BadDescriptorLength);
@@ -202,7 +202,9 @@ mod tests {
             request.descriptor,
             TextureDescriptor {
                 texture_type: 2,
-                unidentified_flags: 0,
+                framebuffer_only: false,
+                is_drawable: false,
+                write_swizzle_enabled: None,
                 allow_gpu_optimized_contents: true,
                 usage: 3,
                 pixel_format: 125,
@@ -213,7 +215,7 @@ mod tests {
                 sample_count: 1,
                 array_length: 1,
                 resource_options: 0x20,
-                unidentified_u64: 0,
+                protection_options: 0,
                 // The narrow body has no swizzle field at all. `None` rather
                 // than the identity: see [`TextureDescriptor::swizzle`].
                 swizzle: None,

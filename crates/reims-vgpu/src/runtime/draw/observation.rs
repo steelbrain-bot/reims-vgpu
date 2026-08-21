@@ -78,14 +78,6 @@ fn screen_resource_join_line(
     )
 }
 
-pub(super) fn fixed_state_gap(request: &DrawEncodeRequest) -> String {
-    request
-        .depth_bias
-        .map_or_else(String::new, |[bias, slope, clamp]| {
-            format!("bias:{bias:.3}/{slope:.3}/{clamp:.3}")
-        })
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PixelSummary {
     rgb_nonzero: usize,
@@ -127,40 +119,6 @@ pub(super) fn observe_prepared_resources(
     vertex_count: u32,
 ) -> bool {
     let census_verbose = crate::observe::draw_log_enabled();
-    let fixed_state_gap = fixed_state_gap(req);
-    let fixed_gap_first = !fixed_state_gap.is_empty() && {
-        use std::collections::HashSet;
-        use std::sync::Mutex;
-        type FixedStateGapKey = (u32, u32, u32, String);
-        static SEEN: Mutex<Option<HashSet<FixedStateGapKey>>> = Mutex::new(None);
-        let mut seen = SEEN.lock().unwrap_or_else(|error| error.into_inner());
-        seen.get_or_insert_with(HashSet::new).insert((
-            req.pipeline_ref,
-            w,
-            h,
-            fixed_state_gap.clone(),
-        ))
-    };
-
-    // The `fixed_gap` anomaly — decoded fixed-function state the Vulkan
-    // request cannot represent — is the one thing here the always-on log
-    // wants. It is deduped per (pipe, w, h, gap) so recurring depth/stencil
-    // shadow draws cannot flood: an active compositor emitted 80k+ of these
-    // per interaction before the dedup.
-    if fixed_gap_first {
-        crate::observe::off(format!(
-        "linux_m2v_resources pipe={} {}x{} fixed_gap=[{}] attrs={} ssbo={} img={} smp={} rt_n={}",
-        req.pipeline_ref,
-        w,
-        h,
-        fixed_state_gap,
-        resources.vertex_attributes.len(),
-        resources.storage_buffers.len(),
-        resources.sampled_images.len(),
-        resources.samplers.len(),
-        req.colors.len(),
-    ));
-    }
     // The per-draw resource census describes the *decoded* request — vertex
     // attribute declarations, storage-buffer bindings, sampler state, colour
     // targets. It is verbose-gated (REIMS_VGPU_DRAW_LOG →
@@ -211,7 +169,7 @@ pub(super) fn observe_prepared_resources(
             .collect::<Vec<_>>()
             .join(";");
         crate::observe::line(format!(
-        "linux_m2v_resources pipe={} {}x{} vtx={} attrs={} ssbo={} img={} smp={} rt_n={} rt=[{}] fixed_gap=[{}] seed={} idx={} idx_n={} meta=[{}] ssbo=[{}] sampler=[{}]",
+            "linux_m2v_resources pipe={} {}x{} vtx={} attrs={} ssbo={} img={} smp={} rt_n={} rt=[{}] seed={} idx={} idx_n={} meta=[{}] ssbo=[{}] sampler=[{}]",
         req.pipeline_ref,
         w,
         h,
@@ -222,8 +180,7 @@ pub(super) fn observe_prepared_resources(
         resources.samplers.len(),
         req.colors.len(),
         color_target_diag(&req.colors),
-        fixed_state_gap,
-        (resources.target_rgba8.is_some()
+            (resources.target_rgba8.is_some()
             || resources
                 .target_guest
                 .as_ref()

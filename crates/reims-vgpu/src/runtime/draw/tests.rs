@@ -508,7 +508,9 @@ fn reflected_array_shape_uses_the_declared_array_length_and_level_pitch() {
         allocation_size: level.size * 3,
         declaration: Some(reims_vgpu_protocol::TextureDeclaration {
             texture_type: crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_1D_ARRAY as u8,
-            unidentified_flags: 0,
+            framebuffer_only: false,
+            is_drawable: false,
+            write_swizzle_enabled: None,
             allow_gpu_optimized_contents: false,
             usage: 0,
             pixel_format: reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM,
@@ -519,7 +521,7 @@ fn reflected_array_shape_uses_the_declared_array_length_and_level_pitch() {
             sample_count: 1,
             array_length: 3,
             resource_options: 0,
-            unidentified_u64: 0,
+            protection_options: 0,
             swizzle: None,
         }),
         bytes_per_slice: level.size,
@@ -562,7 +564,9 @@ fn array_view_selection_moves_geometry_and_backing_offset_together() {
         allocation_size: 0x4000 * 4,
         declaration: Some(reims_vgpu_protocol::TextureDeclaration {
             texture_type: TEXTURE_VIEW_MTL_TYPE_2D_ARRAY as u8,
-            unidentified_flags: 0,
+            framebuffer_only: false,
+            is_drawable: false,
+            write_swizzle_enabled: None,
             allow_gpu_optimized_contents: false,
             usage: 0,
             pixel_format: reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM,
@@ -573,7 +577,7 @@ fn array_view_selection_moves_geometry_and_backing_offset_together() {
             sample_count: 1,
             array_length: 4,
             resource_options: 0,
-            unidentified_u64: 0,
+            protection_options: 0,
             swizzle: None,
         }),
         bytes_per_slice: 0x4000,
@@ -650,7 +654,9 @@ fn one_and_three_dimensional_views_keep_native_zero_copy_geometry() {
     let declaration = |texture_type: u8, width: u32, height: u32, depth: u32| {
         reims_vgpu_protocol::TextureDeclaration {
             texture_type,
-            unidentified_flags: 0,
+            framebuffer_only: false,
+            is_drawable: false,
+            write_swizzle_enabled: None,
             allow_gpu_optimized_contents: false,
             usage: 0,
             pixel_format: reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM,
@@ -661,7 +667,7 @@ fn one_and_three_dimensional_views_keep_native_zero_copy_geometry() {
             sample_count: 1,
             array_length: 1,
             resource_options: 0,
-            unidentified_u64: 0,
+            protection_options: 0,
             swizzle: None,
         }
     };
@@ -769,7 +775,9 @@ fn one_and_three_dimensional_mip_chains_preserve_every_declared_offset() {
     let declaration = |texture_type: u8, width, height, depth, mipmap_level_count| {
         reims_vgpu_protocol::TextureDeclaration {
             texture_type,
-            unidentified_flags: 0,
+            framebuffer_only: false,
+            is_drawable: false,
+            write_swizzle_enabled: None,
             allow_gpu_optimized_contents: false,
             usage: 0,
             pixel_format: reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM,
@@ -780,7 +788,7 @@ fn one_and_three_dimensional_mip_chains_preserve_every_declared_offset() {
             sample_count: 1,
             array_length: 1,
             resource_options: 0,
-            unidentified_u64: 0,
+            protection_options: 0,
             swizzle: None,
         }
     };
@@ -900,7 +908,7 @@ fn multi_mip_requests_are_not_representable_by_the_single_level_fallback() {
 }
 
 #[test]
-fn a_three_dimensional_view_reaches_the_direct_guest_image_rail() {
+fn a_three_dimensional_view_preserves_its_shape_on_the_guest_image_transfer_rail() {
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE,
         OBJECT_TYPE_TEXTURE_VIEW, TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_DECLARATION,
@@ -1020,20 +1028,11 @@ fn a_three_dimensional_view_reaches_the_direct_guest_image_rail() {
             depth_pitch: u64::from(row_stride) * u64::from(height),
         }
     );
-    assert_eq!(
-        source
-            .direct
-            .as_ref()
-            .expect("direct source")
-            .backing
-            .plane_offset,
-        source
-            .direct
-            .as_ref()
-            .expect("direct source")
-            .backing
-            .resource_offset
+    assert!(
+        source.direct.is_none(),
+        "pre-populated guest bytes must be copied into a newly created image"
     );
+    assert_eq!(source.transfer.total_len, allocation_size);
 
     crate::runtime::guest_ram::forget_import_limits();
     crate::runtime::guest_ram_map::reset();
@@ -1256,16 +1255,33 @@ fn reflected_static_sampler_maps_exact_state_and_rejects_unimplemented_modes() {
 
 #[test]
 fn depth_stencil_triviality_matches_no_op_state() {
-    use crate::runtime::decode::resource::DepthStencilDescriptor;
+    use crate::runtime::decode::resource::{DepthStencilDescriptor, DepthStencilFace};
     // compare Always (7), no write, no stencil → equivalent to no depth test.
     let trivial = DepthStencilDescriptor {
         depth_compare_function: 7,
         depth_write_enabled: false,
-        front_stencil_enabled: false,
-        back_stencil_enabled: false,
+        front_stencil_present: false,
+        back_stencil_present: false,
         ..Default::default()
     };
     assert!(depth_stencil_descriptor_is_trivial(&trivial));
+
+    // Metal's default face objects are present but do no stencil work. Native
+    // state creation reports neither reads nor writes for this pair.
+    let default_face = DepthStencilFace {
+        compare_function: 7,
+        read_mask: u32::MAX,
+        write_mask: u32::MAX,
+        ..Default::default()
+    };
+    let present_defaults = DepthStencilDescriptor {
+        front_stencil_present: true,
+        back_stencil_present: true,
+        front_face: default_face,
+        back_face: default_face,
+        ..trivial.clone()
+    };
+    assert!(depth_stencil_descriptor_is_trivial(&present_defaults));
 
     // A real compare function (Less=1) occludes → non-trivial.
     assert!(!depth_stencil_descriptor_is_trivial(
@@ -1274,24 +1290,32 @@ fn depth_stencil_triviality_matches_no_op_state() {
             ..trivial.clone()
         }
     ));
+
+    // A nontrivial masked comparison reads stencil. A zero read mask makes the
+    // same comparison inert.
+    let mut compares = present_defaults.clone();
+    compares.front_face.compare_function = 1;
+    assert!(!depth_stencil_descriptor_is_trivial(&compares));
+    compares.front_face.read_mask = 0;
+    assert!(depth_stencil_descriptor_is_trivial(&compares));
+
+    // Any non-Keep operation writes when the write mask is nonzero. Masking the
+    // write out makes it inert, irrespective of which outcome owns the op.
+    let mut writes = present_defaults.clone();
+    writes.front_face.depth_stencil_pass_operation = 2;
+    assert!(!depth_stencil_descriptor_is_trivial(&writes));
+    writes.front_face.write_mask = 0;
+    assert!(depth_stencil_descriptor_is_trivial(&writes));
+
+    // An absent face's body is not semantic input.
+    writes.front_stencil_present = false;
+    writes.front_face.write_mask = u32::MAX;
+    assert!(depth_stencil_descriptor_is_trivial(&writes));
     // Depth write on → non-trivial even with compare Always.
     assert!(!depth_stencil_descriptor_is_trivial(
         &DepthStencilDescriptor {
             depth_write_enabled: true,
             ..trivial.clone()
-        }
-    ));
-    // Either stencil face enabled → non-trivial.
-    assert!(!depth_stencil_descriptor_is_trivial(
-        &DepthStencilDescriptor {
-            front_stencil_enabled: true,
-            ..trivial.clone()
-        }
-    ));
-    assert!(!depth_stencil_descriptor_is_trivial(
-        &DepthStencilDescriptor {
-            back_stencil_enabled: true,
-            ..trivial
         }
     ));
 }
@@ -1313,7 +1337,7 @@ fn invalid_fixed_function_pipeline_state_refuses_semantic_preparation() {
         ..RenderPipelineDescriptor::default()
     };
     assert!(matches!(
-        semantic_blend_states(&pipeline, [0.0; 4]),
+        semantic_blend_states(&pipeline),
         Err(DrawPreparationDecline::BlendState {
             reason: PipelineStateDecodeError::BlendFactor(99)
         })
@@ -1334,7 +1358,7 @@ fn invalid_fixed_function_pipeline_state_refuses_semantic_preparation() {
 
     let mut invalid_stencil = DepthStencilDescriptor {
         depth_compare_function: 7,
-        front_stencil_enabled: true,
+        front_stencil_present: true,
         ..DepthStencilDescriptor::default()
     };
     invalid_stencil.front_face.stencil_failure_operation = 99;
@@ -2864,7 +2888,6 @@ fn blend_state_maps_src_alpha_one_minus() {
             op_alpha: 0,  // Add
             ..Default::default()
         },
-        [0.0; 4],
     )
     .expect("map");
     assert_eq!(b.src_color, reims_vgpu_core::BlendFactor::SrcAlpha);
@@ -2926,7 +2949,7 @@ fn mrt_draw_request_load_seed_miss_still_encodes() {
 }
 
 #[test]
-fn mrt_draw_request_refuses_mismatched_attachment_geometry_as_one_pass() {
+fn mrt_draw_request_preserves_each_mismatched_attachment_geometry() {
     use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
     let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -2943,17 +2966,12 @@ fn mrt_draw_request_refuses_mismatched_attachment_geometry_as_one_pass() {
         (1, clear_black_attachment(43)),
     ];
 
-    assert!(matches!(
-        mrt_draw_request(&mut state, &mut host, 1, 1, &slots, &[], test_triangle()),
-        Err(reims_vgpu_core::AttachmentPlanDecline::GeometryMismatch {
-            slot: 1,
-            texture_ref: 43,
-            width: 4,
-            height: 8,
-            pass_width: 8,
-            pass_height: 8,
-        })
-    ));
+    let request = mrt_draw_request(&mut state, &mut host, 1, 1, &slots, &[], test_triangle())
+        .expect("different attachment geometries are one valid Metal pass")
+        .expect("two bound attachments produce a draw request");
+    assert_eq!(request.colors.len(), 2);
+    assert_eq!((request.colors[0].width, request.colors[0].height), (8, 8));
+    assert_eq!((request.colors[1].width, request.colors[1].height), (4, 8));
 }
 
 #[test]
@@ -5514,7 +5532,7 @@ fn a_secondary_mrt_slot_binds_its_own_blend() {
     let mut host = crate::runtime::host::FakeHost::new();
     let blend_states = [(
         1,
-        semantic_blend_state(&pipeline.color_attachments[1], [0.0; 4])
+        semantic_blend_state(&pipeline.color_attachments[1])
             .expect("the fixture declares a valid slot-1 blend state"),
     )];
     let secs = build_secondary_targets(
@@ -5524,11 +5542,9 @@ fn a_secondary_mrt_slot_binds_its_own_blend() {
         &colors,
         &pipeline,
         &primary,
-        64,
-        64,
         &blend_states,
     )
-    .expect("a contiguous, geometry-matching, resolvable secondary builds");
+    .expect("a contiguous, resolvable secondary builds");
     assert_eq!(secs.len(), 1, "one secondary attachment expected");
     let blend = secs[0].blend.expect(
         "slot 1 declares blending_enabled — before this fix every secondary \
@@ -5555,18 +5571,9 @@ fn a_secondary_mrt_slot_binds_its_own_blend() {
         ..RenderPipelineDescriptor::default()
     };
     let mut host = crate::runtime::host::FakeHost::new();
-    let secs = build_secondary_targets(
-        &mut state,
-        &mut host,
-        1,
-        &colors,
-        &unblended,
-        &primary,
-        64,
-        64,
-        &[],
-    )
-    .expect("the same secondary builds whether or not its slot blends");
+    let secs =
+        build_secondary_targets(&mut state, &mut host, 1, &colors, &unblended, &primary, &[])
+            .expect("the same secondary builds whether or not its slot blends");
     assert_eq!(secs.len(), 1);
     assert!(
         secs[0].blend.is_none(),
@@ -5644,8 +5651,6 @@ fn an_unbuildable_secondary_refuses_the_draw_rather_than_dropping_to_single_rt()
             &[slot0.clone(), slot1.clone()],
             &pipeline,
             &primary,
-            64,
-            64,
             &[],
         )
     };
@@ -5656,6 +5661,13 @@ fn an_unbuildable_secondary_refuses_the_draw_rather_than_dropping_to_single_rt()
         build(&good_slot1).is_ok(),
         "the unmodified fixture must build, or the cases below prove nothing"
     );
+    let mismatched = build(&ColorRtRequest {
+        width: 32,
+        ..good_slot1.clone()
+    })
+    .expect("Metal permits attachments with different geometry");
+    assert_eq!(mismatched.len(), 1);
+    assert_eq!((mismatched[0].width, mismatched[0].height), (32, 64));
 
     for (reason, slot1) in [
         (
@@ -5663,13 +5675,6 @@ fn an_unbuildable_secondary_refuses_the_draw_rather_than_dropping_to_single_rt()
             MrtDrop::NonContiguousSlot,
             ColorRtRequest {
                 slot: 2,
-                ..good_slot1.clone()
-            },
-        ),
-        (
-            MrtDrop::GeometryMismatch,
-            ColorRtRequest {
-                width: 32,
                 ..good_slot1.clone()
             },
         ),
@@ -5723,8 +5728,6 @@ fn an_unbuildable_secondary_refuses_the_draw_rather_than_dropping_to_single_rt()
         std::slice::from_ref(&slot0),
         &pipeline,
         &primary,
-        64,
-        64,
         &[],
     )
     .expect("a single-attachment draw is not a refusal");
@@ -5775,17 +5778,7 @@ fn two_secondaries_over_one_destination_refuse_the_draw_like_a_primary_alias() {
     };
     let mut build = |colors: &[ColorRtRequest]| {
         let mut host = crate::runtime::host::FakeHost::new();
-        build_secondary_targets(
-            &mut state,
-            &mut host,
-            1,
-            colors,
-            &pipeline,
-            &primary,
-            64,
-            64,
-            &[],
-        )
+        build_secondary_targets(&mut state, &mut host, 1, colors, &pipeline, &primary, &[])
     };
 
     // The control: three distinct destinations build, so the refusal below is
@@ -5811,28 +5804,6 @@ fn two_secondaries_over_one_destination_refuse_the_draw_like_a_primary_alias() {
     let refusal = build(&aliased).expect_err("two secondaries over one span is not renderable");
     assert_eq!(refusal.slot, 2, "the second of the pair is the one refused");
     assert_eq!(refusal.reason, MrtDrop::AliasesPrimary);
-}
-
-#[test]
-fn fixed_state_gap_names_the_remaining_unrepresented_field() {
-    // In-contract cull (Back) + winding (CCW) are HONORED by the Vulkan
-    // raster state; the depth test + attachment and the stencil test
-    // (op state + reference + clear) are honored via `resources.depth` — so
-    // cull/front/depth_stencil/depth_attach/stencil_ref/stencil_attach are no
-    // longer gaps. Only depth bias remains unrepresented.
-    // MTLCullModeBack / MTLWindingCounterClockwise, per `translate::raster`,
-    // which is now the only place those SDK values are spelled.
-    let req = DrawEncodeRequest {
-        cull_mode: reims_vgpu_protocol::CullMode::Back,
-        front_face_ccw: true,
-        depth_bias: Some([1.25, 2.5, 0.0]),
-        depth_stencil_ref: 77,
-        stencil_ref: Some((3, 4)),
-        depth_attach: Some(DepthAttachmentState::default()),
-        stencil_attach: Some(StencilAttachmentState::default()),
-        ..DrawEncodeRequest::default()
-    };
-    assert_eq!(fixed_state_gap(&req), "bias:1.250/2.500/0.000");
 }
 
 /// Recycled texture_ref must not serve a prior full-frame encode as a
@@ -6116,8 +6087,6 @@ fn gva_target_backing_retains_the_declared_parent_allocation() {
         &colors,
         &crate::runtime::decode::resource::RenderPipelineDescriptor::default(),
         &primary,
-        64,
-        16,
         &[],
     )
     .expect("the same allocation contract applies to MRT slot 1");
@@ -7079,7 +7048,9 @@ fn a_gva_span_no_store_has_stamped_refuses_the_resident_sample_rung() {
         depth: 1,
         declaration: Some(crate::runtime::heap_query::TextureDescriptor {
             texture_type: 2,
-            unidentified_flags: 0,
+            framebuffer_only: false,
+            is_drawable: false,
+            write_swizzle_enabled: None,
             allow_gpu_optimized_contents: false,
             usage: 0,
             pixel_format: MTL_FORMAT_BGRA8_UNORM,
@@ -7090,7 +7061,7 @@ fn a_gva_span_no_store_has_stamped_refuses_the_resident_sample_rung() {
             sample_count: 1,
             array_length: 1,
             resource_options: 0,
-            unidentified_u64: 0,
+            protection_options: 0,
             swizzle: None,
         }),
         levels: vec![TextureLevelLayout {

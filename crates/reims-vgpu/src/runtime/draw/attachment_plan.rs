@@ -6,7 +6,7 @@
 
 use super::*;
 
-/// Build an MRT draw request from pass color slots (same dimensions required).
+/// Build an MRT draw request from the pass's color slots.
 #[allow(
     clippy::too_many_arguments,
     reason = "the MRT builder combines explicit pass, pipeline, and draw state"
@@ -36,8 +36,6 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
         pipeline_ref,
     );
     let mut colors = Vec::new();
-    let mut base_w = 0u32;
-    let mut base_h = 0u32;
     // Colour0's LOAD seed was skipped in favour of the engine resident. Declared
     // out here because it belongs to the request, not to the slot that set it.
     let mut gva_load_source = GvaLoadSource::None;
@@ -140,24 +138,6 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
         let gva = storage.target_gva();
         let bpr = storage.row_stride();
         let attachment_sample_count = pipeline_sample_count.unwrap_or(target_sample_count);
-        if base_w == 0 {
-            base_w = mw;
-            base_h = mh;
-        } else if mw != base_w || mh != base_h {
-            // Refuse the whole request. Rendering only the compatible slots would
-            // publish wrong attachment contents; clipping a larger target or
-            // rejecting a smaller one requires the pass's explicit render area,
-            // and this builder must not infer that policy from relative size.
-            crate::runtime::drain::note_store_route("mrt_slot_geometry_dropped");
-            return Err(AttachmentPlanDecline::GeometryMismatch {
-                slot,
-                texture_ref: att.texture_ref,
-                width: mw,
-                height: mh,
-                pass_width: base_w,
-                pass_height: base_h,
-            });
-        }
         let mut load_action = load_action;
         let mut clear_color = att.clear_color;
         let mut seed = None;

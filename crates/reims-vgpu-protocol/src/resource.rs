@@ -196,8 +196,8 @@ pub struct DepthStencilDescriptor {
     pub depth_stencil_id: u32,
     pub depth_compare_function: u32,
     pub depth_write_enabled: bool,
-    pub front_stencil_enabled: bool,
-    pub back_stencil_enabled: bool,
+    pub front_stencil_present: bool,
+    pub back_stencil_present: bool,
     pub front_face: DepthStencilFace,
     pub back_face: DepthStencilFace,
 }

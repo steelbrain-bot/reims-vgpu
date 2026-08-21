@@ -1684,9 +1684,10 @@ fn note_iosurface_texture_store_route(route: &'static str) {
 ///
 /// Strict by construction — any ambiguity is an `Err` and the caller refuses the
 /// draw, rather than a guessed attachment: requires a resident primary,
-/// contiguous slots (0,1,2,… matching the shader's `location`s), matching
-/// framebuffer geometry, a known color-renderable format, and a resolvable
-/// identity.
+/// contiguous slots (0,1,2,… matching the shader's `location`s), a known
+/// color-renderable format, and a resolvable identity. Attachment geometry is
+/// carried independently; the render extent is the per-axis minimum while
+/// load/store operations retain each attachment's full-image scope.
 ///
 /// # Why `Err` and not an empty vector
 ///
@@ -1712,8 +1713,6 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
     colors: &[ColorRtRequest],
     pipeline: &crate::runtime::decode::resource::RenderPipelineDescriptor,
     primary: &crate::model::TargetIdentity,
-    fb_w: u32,
-    fb_h: u32,
     blend_states: &[(u32, reims_vgpu_protocol::BlendStateResource)],
 ) -> Result<
     Vec<reims_vgpu_core::SecondaryColorTarget>,
@@ -1737,18 +1736,6 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
             return Err(SecondaryMrtRefusal {
                 slot: c.slot,
                 reason: crate::runtime::census::present_proxy::MrtDrop::NonContiguousSlot,
-            });
-        }
-        // MRT requires every attachment to share the framebuffer geometry.
-        if c.width != fb_w || c.height != fb_h {
-            crate::runtime::census::present_proxy::note_secondary_mrt_drop(
-                crate::runtime::census::present_proxy::MrtDrop::GeometryMismatch,
-                c.width,
-                c.height,
-            );
-            return Err(SecondaryMrtRefusal {
-                slot: c.slot,
-                reason: crate::runtime::census::present_proxy::MrtDrop::GeometryMismatch,
             });
         }
         // Unknown wire format stays unknown — never guess a secondary layout —
@@ -3406,8 +3393,6 @@ mod execution_split_tests {
                 &colors,
                 &pipeline,
                 &primary,
-                8,
-                8,
                 &[],
             )
             .expect("slot 1 is a resolvable secondary");

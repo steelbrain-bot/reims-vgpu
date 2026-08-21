@@ -298,7 +298,7 @@ pub(super) fn note_pass_extent_for_slot(
     }
     // Named whether or not the mapping resolves. The extent score below cannot
     // run without the attachment's geometry, and on a driven boot that is most
-    // passes — `render_pass_target_extent_unapplied` counted 9 762 where the
+    // passes — `render_pass_target_extent_stated` counted 9 762 where the
     // bands scored 2 952 — so a census that shared the scorer's guard would
     // report a handful of tiny surfaces and read as if that were the whole
     // population. The pass names its target either way; the geometry is the part
@@ -448,8 +448,7 @@ pub(super) fn pass_extent_band(pct: u64) -> usize {
     }
 }
 
-/// Count a pass that stated an explicit render target extent, which this device
-/// does not apply.
+/// Count a pass that stated an explicit render target extent.
 ///
 /// This is the **denominator** for [`note_pass_extent_coverage`]'s bands and
 /// nothing more. It used to also put the extent's raw values on the fail
@@ -458,8 +457,9 @@ pub(super) fn pass_extent_band(pct: u64) -> usize {
 /// `note_pass_extent_coverage`, it has the geometry, and it has answered:
 /// `pass_extent_full` takes 11 826 of 11 827 scored passes on arm64/Vulkan and
 /// 10 537 of 10 540 on x86/Vulkan. The extent is the attachment restated, for
-/// all but a handful of passes a boot — see that function for what the handful
-/// costs and why it is not fixed by the obvious mapping.
+/// all but a handful of passes a boot. The executor now carries and applies
+/// both dimensions; this count remains the population denominator for the
+/// geometry bands rather than a claim that the state was dropped.
 ///
 /// The line is gone because it was reporting a non-loss on the channel reserved
 /// for lost guest work, and doing so at 85 % of that channel's whole volume —
@@ -470,8 +470,8 @@ pub(super) fn pass_extent_band(pct: u64) -> usize {
 /// Keep the gap between this count and the bands' sum in view: a pass counted
 /// here and not scored there is one whose attachment had no geometry yet, and
 /// the two numbers are only comparable when that gap is understood.
-pub(super) fn note_pass_target_extent() {
-    crate::runtime::drain::note_store_route("render_pass_target_extent_unapplied");
+pub(super) fn note_pass_target_extent_stated() {
+    crate::runtime::drain::note_store_route("render_pass_target_extent_stated");
 }
 
 /// A pass declaring more render-target array layers than this device draws.
@@ -557,8 +557,7 @@ pub(super) fn note_color_subresource_unsupported(
 /// 400-draw compositor stream among thousands of 2-draw ones is exactly the case
 /// that matters and is exactly what a mean hides. The two buckets above the old
 /// ceiling are what say whether removing it changed which streams complete.
-pub(super) fn note_stream_draw_drops(task_id: u32, acc: &StreamAccum) {
-    let kept = acc.draws.len();
+pub(super) fn note_stream_draw_drops(task_id: u32, acc: &StreamAccum, kept: usize) {
     if kept == 0 && acc.dropped_no_pipeline == 0 && acc.dropped_zero_count == 0 {
         return;
     }

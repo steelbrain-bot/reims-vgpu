@@ -283,7 +283,19 @@ pub(crate) struct BlendKey {
     pub src_alpha: BlendFactor,
     pub dst_alpha: BlendFactor,
     pub alpha_op: BlendOp,
-    pub constants: [u32; 4],
+}
+
+impl BlendKey {
+    pub(crate) fn uses_constants(self) -> bool {
+        [
+            self.src_color,
+            self.dst_color,
+            self.src_alpha,
+            self.dst_alpha,
+        ]
+        .into_iter()
+        .any(BlendFactor::uses_blend_constant)
+    }
 }
 
 pub(crate) fn blend_key(blend: &BlendStateResource) -> BlendKey {
@@ -294,7 +306,6 @@ pub(crate) fn blend_key(blend: &BlendStateResource) -> BlendKey {
         src_alpha: blend.src_alpha,
         dst_alpha: blend.dst_alpha,
         alpha_op: blend.alpha_op,
-        constants: blend.constants.map(f32::to_bits),
     }
 }
 

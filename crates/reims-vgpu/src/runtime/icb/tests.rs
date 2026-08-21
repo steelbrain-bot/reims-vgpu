@@ -711,6 +711,142 @@ fn unknown_icb_command_types_fail_closed() {
     );
 }
 
+#[test]
+fn an_inherited_render_pipeline_needs_no_per_command_pipeline_ref() {
+    let layout = render_icb_layout(0, 0, MTL_INDIRECT_CMD_DRAW);
+    let mut slot = vec![0u8; layout.command_size as usize];
+    st32(
+        &mut slot[layout.command_type_offset as usize..],
+        ICB_CMD_TYPE_DRAW,
+    );
+    let args = layout.command_arguments_offset as usize;
+    st16(&mut slot[args..], 3);
+    st64(&mut slot[args + 0xa..], 3);
+    st64(&mut slot[args + 0x12..], 1);
+
+    let strict = decode_render_command_slot(&layout, &slot, 0, 0).unwrap_err();
+    assert_eq!(
+        crate::observe::Decline::slug(&strict),
+        "icb_drs_pipeline_ref_zero"
+    );
+    let inherited = decode_render_command_slot_with_inheritance(
+        &layout,
+        &slot,
+        0,
+        0,
+        IcbInheritance {
+            pipeline_state: true,
+            buffers: false,
+        },
+    )
+    .expect("an inherited pipeline makes the slot complete")
+    .expect("the draw slot is populated");
+    assert_eq!(inherited.pipeline_ref, 0);
+
+    st32(&mut slot[layout.pipeline_state_offset as usize..], 7);
+    let conflicting = decode_render_command_slot_with_inheritance(
+        &layout,
+        &slot,
+        0,
+        0,
+        IcbInheritance {
+            pipeline_state: true,
+            buffers: false,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        crate::observe::Decline::slug(&conflicting),
+        "icb_drs_inherited_pipeline_ref_nonzero"
+    );
+}
+
+#[test]
+fn inherited_render_buffers_are_absent_from_the_command_fill() {
+    let layout = render_icb_layout(1, 0, MTL_INDIRECT_CMD_DRAW);
+    let slot = encode_render_command_slot(
+        &layout,
+        &IcbRenderFill {
+            command_index: 0,
+            pipeline_ref: 0,
+            buffers: vec![render_bind(0, 999, false)],
+            object_threadgroup_memory: vec![],
+            draw: IcbRenderDraw::Primitives {
+                primitive_type: 3,
+                vertex_start: 0,
+                vertex_count: 3,
+                instance_count: 1,
+                base_instance: 0,
+            },
+        },
+    )
+    .expect("encode ignored command-local buffer");
+    let fill = decode_render_command_slot_with_inheritance(
+        &layout,
+        &slot,
+        1,
+        0,
+        IcbInheritance {
+            pipeline_state: true,
+            buffers: true,
+        },
+    )
+    .expect("decode inherited render slot")
+    .expect("populated draw slot");
+    assert!(fill.buffers.is_empty());
+}
+
+#[test]
+fn an_inherited_compute_pipeline_needs_no_per_command_pipeline_ref() {
+    let layout = compute_only_icb_layout(0);
+    let mut slot = encode_compute_command_slot(
+        &layout,
+        &IcbComputeFill {
+            command_index: 0,
+            pipeline_ref: 7,
+            buffers: vec![],
+            threadgroup_memory: vec![],
+            barrier: false,
+            dispatch: unit_grid_dispatch(1, 1, 1),
+        },
+    )
+    .expect("encode compute slot");
+
+    let conflicting = decode_compute_command_slot_with_inheritance(
+        &layout,
+        &slot,
+        0,
+        IcbInheritance {
+            pipeline_state: true,
+            buffers: false,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        crate::observe::Decline::slug(&conflicting),
+        "icb_dcs_inherited_pipeline_ref_nonzero"
+    );
+
+    st32(&mut slot[layout.pipeline_state_offset as usize..], 0);
+    let strict = decode_compute_command_slot(&layout, &slot, 0).unwrap_err();
+    assert_eq!(
+        crate::observe::Decline::slug(&strict),
+        "icb_dcs_pipeline_ref_zero"
+    );
+    let inherited = decode_compute_command_slot_with_inheritance(
+        &layout,
+        &slot,
+        0,
+        IcbInheritance {
+            pipeline_state: true,
+            buffers: false,
+        },
+    )
+    .expect("an inherited pipeline makes the slot complete")
+    .expect("the dispatch slot is populated");
+    assert_eq!(inherited.pipeline_ref, 0);
+}
+
 /// Mesh/object buffer binds share the 0x14 ref/va/gpuva pack at layout
 /// objectBufferBindOffset / meshBufferBindOffset.
 #[test]
@@ -1080,6 +1216,278 @@ fn a_0x1d1_query_is_refused_and_binds_nothing() {
     assert_eq!(after, IcbStatus::Missing("icb_fill_no_command_memory"));
 }
 
+/// An empty execute range does not touch command memory. The range location is
+/// still checked against the ICB declaration, but no backing association is
+/// required merely to execute zero commands.
+#[test]
+fn an_empty_icb_range_is_a_noop_without_command_memory() {
+    let _guard = icb_test_guard();
+    let (mut host, state) = icb_device();
+    let desc = make_icb_desc_bytes(2, 1, false);
+    let gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_RESOURCE,
+        gva,
+        &desc,
+    );
+    resolve_icb_record(&state, &host, 1, 9).expect("record ICB declaration");
+
+    assert!(decode_icb_command_range(&state, &host, 1, 9, 1, 0)
+        .expect("empty range")
+        .is_empty());
+    assert_eq!(
+        decode_icb_command_range(&state, &host, 1, 9, 3, 0)
+            .expect_err("empty range still has to be within the declaration"),
+        IcbStatus::Args("icb_fill_range_past_capacity")
+    );
+}
+
+#[test]
+fn inherited_compute_buffers_do_not_resolve_command_local_bindings() {
+    let _guard = icb_test_guard();
+    let (mut host, state) = icb_device();
+    let layout = compute_only_icb_layout(1);
+    let desc = make_icb_desc_bytes(1, 1, true);
+    let descriptor_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_RESOURCE,
+        descriptor_gva,
+        &desc,
+    );
+    resolve_icb_record(&state, &host, 1, 9).expect("record inherited-buffer ICB");
+
+    let slot = encode_compute_command_slot(
+        &layout,
+        &IcbComputeFill {
+            command_index: 0,
+            pipeline_ref: 7,
+            buffers: vec![IcbKernelBufferBind {
+                index: 0,
+                buffer_ref: 999,
+                offset: 0,
+                wire_va: 0xdead,
+                attribute_stride: 0,
+                has_attribute_stride: false,
+            }],
+            threadgroup_memory: vec![],
+            barrier: false,
+            dispatch: unit_grid_dispatch(1, 1, 1),
+        },
+    )
+    .expect("encode command-local bind that inherited mode ignores");
+    let command_gva = 5u64 << RESOURCE_PAGE_SHIFT;
+    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], command_gva, &slot);
+    bind_icb_command_memory(
+        &state,
+        1,
+        9,
+        IcbCommandMemory {
+            gva: command_gva,
+            byte_len: slot.len() as u64,
+        },
+    )
+    .expect("bind command memory");
+
+    let fills = decode_icb_command_range(&state, &host, 1, 9, 0, 1)
+        .expect("ignored command-local ref must not be resolved");
+    let [IcbCommandFill::Compute(fill)] = fills.as_slice() else {
+        panic!("expected one compute fill");
+    };
+    assert!(fill.buffers.is_empty());
+}
+
+#[test]
+fn icb_ranges_select_slots_in_order_and_skip_reset_slots() {
+    let _guard = icb_test_guard();
+    let (mut host, state) = icb_device();
+    let layout = compute_only_icb_layout(1);
+    let desc = make_icb_desc_bytes(2, 1, false);
+    let descriptor_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_RESOURCE,
+        descriptor_gva,
+        &desc,
+    );
+    resolve_icb_record(&state, &host, 1, 9).expect("record ICB declaration");
+
+    let slot = |pipeline_ref| {
+        encode_compute_command_slot(
+            &layout,
+            &IcbComputeFill {
+                command_index: 0,
+                pipeline_ref,
+                buffers: vec![],
+                threadgroup_memory: vec![],
+                barrier: false,
+                dispatch: unit_grid_dispatch(1, 1, 1),
+            },
+        )
+        .expect("encode command slot")
+    };
+    let mut bytes = slot(6);
+    bytes.extend_from_slice(&slot(7));
+    // Put slot zero at the end of one guest page and slot one at the start of
+    // the next, so the final assertion can make the out-of-range prefix
+    // unreadable without affecting the selected slot.
+    let command_gva = (1u64 << RESOURCE_PAGE_SHIFT) - u64::from(layout.command_size);
+    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], command_gva, &bytes);
+    bind_icb_command_memory(
+        &state,
+        1,
+        9,
+        IcbCommandMemory {
+            gva: command_gva,
+            byte_len: bytes.len() as u64,
+        },
+    )
+    .expect("bind command memory");
+
+    let pipelines = |fills: Vec<IcbCommandFill>| {
+        fills
+            .into_iter()
+            .map(|fill| match fill {
+                IcbCommandFill::Compute(fill) => fill.pipeline_ref,
+                IcbCommandFill::Render(_) => panic!("expected compute fill"),
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        pipelines(decode_icb_command_range(&state, &host, 1, 9, 0, 1).unwrap()),
+        [6]
+    );
+    assert_eq!(
+        pipelines(decode_icb_command_range(&state, &host, 1, 9, 1, 1).unwrap()),
+        [7]
+    );
+    assert_eq!(
+        pipelines(decode_icb_command_range(&state, &host, 1, 9, 0, 2).unwrap()),
+        [6, 7]
+    );
+
+    let reset_slot = vec![0u8; layout.command_size as usize];
+    gva_mem::write_task_gva_arm64e(
+        &mut host,
+        &state.tasks[1],
+        command_gva + u64::from(layout.command_size),
+        &reset_slot,
+    );
+    assert_eq!(
+        pipelines(decode_icb_command_range(&state, &host, 1, 9, 0, 2).unwrap()),
+        [6]
+    );
+
+    let second = slot(7);
+    gva_mem::write_task_gva_arm64e(
+        &mut host,
+        &state.tasks[1],
+        command_gva + u64::from(layout.command_size),
+        &second,
+    );
+    let slot0_gpa =
+        gva_mem::translate_task_gva(&host, &state.tasks[1], command_gva, state.page_shift)
+            .expect("translate slot zero");
+    host.mark_non_ram(slot0_gpa, u64::from(layout.command_size));
+    assert_eq!(
+        pipelines(decode_icb_command_range(&state, &host, 1, 9, 1, 1).unwrap()),
+        [7],
+        "a subrange must not read an earlier command slot"
+    );
+}
+
+#[test]
+fn dispatch_bits_select_a_compute_command_domain_even_with_render_bits_set() {
+    let _guard = icb_test_guard();
+    let (mut host, state) = icb_device();
+    let command_types = MTL_INDIRECT_CMD_DRAW | MTL_INDIRECT_CMD_CONCURRENT_DISPATCH;
+    let mut layout = render_icb_layout(0, 0, command_types);
+    layout.command_size = layout.command_arguments_offset + ICB_CONCURRENT_DISPATCH_ARGS_LEN as u32;
+    let mut desc = make_icb_desc_bytes(2, 0, false);
+    st32(&mut desc[8..], command_types);
+    desc[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
+        .copy_from_slice(&encode_icb_command_layout(&layout));
+    let descriptor_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_RESOURCE,
+        descriptor_gva,
+        &desc,
+    );
+    resolve_icb_record(&state, &host, 1, 9).expect("record mixed ICB declaration");
+
+    let mut bytes = encode_render_command_slot(
+        &layout,
+        &IcbRenderFill {
+            command_index: 0,
+            pipeline_ref: 6,
+            buffers: vec![],
+            object_threadgroup_memory: vec![],
+            draw: IcbRenderDraw::Primitives {
+                primitive_type: 3,
+                vertex_start: 0,
+                vertex_count: 3,
+                instance_count: 1,
+                base_instance: 0,
+            },
+        },
+    )
+    .expect("encode render slot");
+    bytes.extend_from_slice(
+        &encode_compute_command_slot(
+            &layout,
+            &IcbComputeFill {
+                command_index: 1,
+                pipeline_ref: 7,
+                buffers: vec![],
+                threadgroup_memory: vec![],
+                barrier: false,
+                dispatch: unit_grid_dispatch(1, 1, 1),
+            },
+        )
+        .expect("encode compute slot"),
+    );
+    let command_gva = 5u64 << RESOURCE_PAGE_SHIFT;
+    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], command_gva, &bytes);
+    bind_icb_command_memory(
+        &state,
+        1,
+        9,
+        IcbCommandMemory {
+            gva: command_gva,
+            byte_len: bytes.len() as u64,
+        },
+    )
+    .expect("bind mixed command memory");
+
+    let refused = decode_icb_command_range(&state, &host, 1, 9, 0, 2)
+        .expect_err("a render slot cannot be filled in the compute command domain");
+    assert_eq!(
+        crate::observe::Decline::slug(&refused),
+        "icb_fill_render_command_in_compute_domain"
+    );
+
+    let fills = decode_icb_command_range(&state, &host, 1, 9, 1, 1)
+        .expect("the compute slot remains valid despite the extra render bit");
+    assert!(matches!(
+        fills.as_slice(),
+        [IcbCommandFill::Compute(IcbComputeFill {
+            pipeline_ref: 7,
+            command_index: 1,
+            ..
+        })]
+    ));
+}
+
 #[test]
 fn icb_lifetimes_are_device_owned_generational_and_task_scoped() {
     let _guard = icb_test_guard();
@@ -1383,62 +1791,4 @@ fn decode_encode_barrier_and_threadgroup_memory() {
     assert_eq!(decoded.threadgroup_memory[0].length, 64);
     assert_eq!(decoded.threadgroup_memory[1].index, 1);
     assert_eq!(decoded.threadgroup_memory[1].length, 128);
-}
-
-/// Buffer-backed fill: wire VA = type-1 base+offset → resolve → execute.
-/// An execute that filled no slots says so, and one that met a different
-/// refusal still forwards it.
-///
-/// The rule this pins used to be a wildcard — `Err(IcbStatus::Missing(_)) => {}`
-/// — copied into the render arm and the compute arm. It swallowed both slugs
-/// `decode_icb_command_range` raises under `Missing`, and only one of them had
-/// been argued for. The four cases below are the whole vocabulary that reaches
-/// this function: filled, unfilled, the other `Missing`, and everything else.
-#[test]
-fn an_icb_execute_that_filled_no_slots_is_counted_and_not_swallowed() {
-    use crate::runtime::drain::store_route_count;
-    const ROUTE: &str = "icb_executed_without_command_memory";
-
-    let quiet = store_route_count(ROUTE);
-    assert_eq!(
-        icb_fill_outcome(Ok(()), 1, 9),
-        Ok(()),
-        "a filled ICB is carried on from"
-    );
-    assert_eq!(
-        store_route_count(ROUTE),
-        quiet,
-        "a filled ICB costs the guest nothing and must not count"
-    );
-
-    // The unfilled case: control flow is unchanged so the caller still does its
-    // writeback, but the lost commands are now counted.
-    assert_eq!(
-        icb_fill_outcome(Err(IcbStatus::Missing(ICB_FILL_NO_COMMAND_MEMORY)), 1, 9),
-        Ok(()),
-        "an empty execute is a no-op, not a reason to skip the writeback"
-    );
-    assert_eq!(
-        store_route_count(ROUTE),
-        quiet + 1,
-        "the commands the guest encoded into this ICB were lost, and it says so"
-    );
-
-    // The other `Missing` slug, and a variant from another class. Both forward,
-    // so the caller declines by the name of the check that actually refused.
-    for other in [
-        IcbStatus::Missing("icb_fill_not_cached"),
-        IcbStatus::Args("icb_fill_zero_command_size"),
-    ] {
-        assert_eq!(
-            icb_fill_outcome(Err(other), 1, 9),
-            Err(other),
-            "{other:?} names a different loss and must not be swallowed"
-        );
-    }
-    assert_eq!(
-        store_route_count(ROUTE),
-        quiet + 1,
-        "a forwarded refusal is not an empty execute"
-    );
 }

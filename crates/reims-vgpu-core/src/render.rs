@@ -54,6 +54,59 @@ pub struct PreparedRenderProgram {
     pub fragment: PreparedShaderStage,
 }
 
+/// The render encoder's line width, retained bit-for-bit from the guest.
+///
+/// A bitwise value keeps NaNs distinguishable until the backend decides
+/// whether it can represent the requested rasterization. The default is
+/// Metal's `1.0`, not `f32::default()`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct LineWidth(u32);
+
+impl LineWidth {
+    pub const ONE: Self = Self(1.0f32.to_bits());
+
+    pub const fn from_f32(value: f32) -> Self {
+        Self(value.to_bits())
+    }
+
+    pub const fn value(self) -> f32 {
+        f32::from_bits(self.0)
+    }
+
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+}
+
+impl Default for LineWidth {
+    fn default() -> Self {
+        Self::ONE
+    }
+}
+
+/// Per-axis raster bounds declared by a Metal render pass.
+///
+/// These are not attachment extents and do not narrow load/store operations.
+/// A missing axis is the API default and inherits the minimum attachment
+/// dimension; a present axis clips fragments to `[0, value)` independently.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RenderTargetExtent {
+    pub width: Option<std::num::NonZeroU32>,
+    pub height: Option<std::num::NonZeroU32>,
+}
+
+impl RenderTargetExtent {
+    pub fn raster_width(self, attachment_width: u32) -> u32 {
+        self.width
+            .map_or(attachment_width, std::num::NonZeroU32::get)
+    }
+
+    pub fn raster_height(self, attachment_height: u32) -> u32 {
+        self.height
+            .map_or(attachment_height, std::num::NonZeroU32::get)
+    }
+}
+
 /// Fully resolved inputs for one draw.
 ///
 /// Guest names, wire tags, and host-native handles are absent. Resource
@@ -65,6 +118,9 @@ pub struct DrawRequest {
     pub program: PreparedRenderProgram,
     pub width: u32,
     pub height: u32,
+    /// Pass-owned raster constraint. Attachment load/store still covers the
+    /// attachment dimensions above.
+    pub render_target_extent: RenderTargetExtent,
     pub vertex_count: u32,
     pub first_vertex: u32,
     pub instance_count: Option<u32>,
@@ -85,6 +141,10 @@ pub struct DrawRequest {
     pub target_guest: Option<GuestTargetPlan>,
     pub target_seed_order: SeedOrder,
     pub blend: Option<BlendStateResource>,
+    /// Encoder-global blend constant set by `setBlendColor…`. This is not an
+    /// attachment property: every attachment using a constant factor reads the
+    /// same four values.
+    pub blend_constants: [f32; 4],
     pub color_write_mask: ColorWriteMask,
     pub target_identity: Option<crate::TargetIdentity>,
     pub color_attachment_format: Option<ImageFormat>,
@@ -99,6 +159,9 @@ pub struct DrawRequest {
     pub cull_mode: CullMode,
     pub front_face_ccw: bool,
     pub fill_mode: FillMode,
+    pub line_width: LineWidth,
+    /// `setDepthBias:slopeScale:clamp:` in that source order.
+    pub depth_bias: Option<[f32; 3]>,
     pub depth_clip: DepthClipMode,
     pub depth: Option<DepthState>,
     pub color_input: bool,
@@ -107,6 +170,40 @@ pub struct DrawRequest {
 }
 
 impl DrawRequest {
+    pub fn depth_attachment_extent(&self) -> Option<(u32, u32)> {
+        self.depth.as_ref().map(|depth| {
+            depth
+                .identity
+                .as_ref()
+                .and_then(crate::TargetIdentity::geometry)
+                .unwrap_or((self.width, self.height))
+        })
+    }
+
+    pub fn minimum_attachment_extent(&self) -> (u32, u32) {
+        let color_minimum = self
+            .secondary_targets
+            .iter()
+            .fold((self.width, self.height), |(width, height), target| {
+                (width.min(target.width), height.min(target.height))
+            });
+        self.depth_attachment_extent()
+            .map_or(color_minimum, |(depth_width, depth_height)| {
+                (
+                    color_minimum.0.min(depth_width),
+                    color_minimum.1.min(depth_height),
+                )
+            })
+    }
+
+    pub fn raster_extent(&self) -> (u32, u32) {
+        let (width, height) = self.minimum_attachment_extent();
+        (
+            self.render_target_extent.raster_width(width),
+            self.render_target_extent.raster_height(height),
+        )
+    }
+
     pub fn writes_attachment(&self, identity: &crate::TargetIdentity) -> bool {
         self.attachment_slot(identity).is_some()
     }
@@ -377,6 +474,18 @@ mod tests {
     use super::*;
     use reims_vgpu_protocol::TexelLayout;
 
+    fn depth(identity: crate::TargetIdentity) -> DepthState {
+        DepthState {
+            identity: Some(identity),
+            test_enable: false,
+            write_enable: false,
+            compare: crate::SamplerCompareFunction::Always,
+            clear_value: 1.0,
+            load: false,
+            stencil: None,
+        }
+    }
+
     #[test]
     fn viewport_and_attachment_relations_are_semantic() {
         let request = DrawRequest {
@@ -394,5 +503,70 @@ mod tests {
             request.attachment_slot(request.target_identity.as_ref().unwrap()),
             Some(AttachmentSlot::Primary)
         );
+    }
+
+    #[test]
+    fn raster_extent_is_the_explicit_bound_over_every_attachment() {
+        let mut request = DrawRequest {
+            width: 8,
+            height: 8,
+            render_target_extent: RenderTargetExtent {
+                width: std::num::NonZeroU32::new(2),
+                height: None,
+            },
+            depth: Some(depth(crate::TargetIdentity::Texture {
+                ref_: 3,
+                width: 5,
+                height: 3,
+                generation: 1,
+                stencil: false,
+            })),
+            ..Default::default()
+        };
+        request.secondary_targets.push(SecondaryColorTarget {
+            identity: crate::TargetIdentity::Texture {
+                ref_: 2,
+                width: 4,
+                height: 6,
+                generation: 1,
+                stencil: false,
+            },
+            target_guest: None,
+            width: 4,
+            height: 6,
+            format: reims_vgpu_protocol::ImageFormat::linear(TexelLayout::Rgba8),
+            clear: [0.0; 4],
+            load_action: ColorLoadAction::Clear,
+            blend: None,
+            color_write_mask: ColorWriteMask::default(),
+        });
+        assert_eq!(request.minimum_attachment_extent(), (4, 3));
+        assert_eq!(request.raster_extent(), (2, 3));
+    }
+
+    #[test]
+    fn anonymous_depth_uses_request_geometry_but_explicit_zero_geometry_stays_zero() {
+        let anonymous = DrawRequest {
+            width: 8,
+            height: 6,
+            depth: Some(depth(crate::TargetIdentity::Anonymous { slot: 1 })),
+            ..Default::default()
+        };
+        assert_eq!(anonymous.depth_attachment_extent(), Some((8, 6)));
+
+        let explicit = DrawRequest {
+            width: 8,
+            height: 6,
+            depth: Some(depth(crate::TargetIdentity::Texture {
+                ref_: 1,
+                width: 0,
+                height: 6,
+                generation: 1,
+                stencil: false,
+            })),
+            ..Default::default()
+        };
+        assert_eq!(explicit.depth_attachment_extent(), Some((0, 6)));
+        assert_eq!(explicit.minimum_attachment_extent(), (0, 6));
     }
 }

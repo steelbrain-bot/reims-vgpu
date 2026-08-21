@@ -305,8 +305,7 @@ pub(crate) fn format_has_stencil(format: ash::vk::Format) -> bool {
 }
 
 /// The subresource range a registry resident's view is created with, derived
-/// from its format. See [`registry_target_usage`] for why these are functions of
-/// the format rather than parameters beside it.
+/// from its format.
 pub(crate) fn registry_subresource_range(
     format: ash::vk::Format,
 ) -> ash::vk::ImageSubresourceRange {
@@ -327,24 +326,27 @@ pub(crate) fn registry_subresource_range(
 }
 
 /// The usage set a registry resident's image is created with, derived from its
-/// format.
+/// format and the selected device's capability for that format.
 ///
-/// **A function of the format, deliberately, and not a parameter.** The recycle
-/// free-list buckets displaced images by `(geometry, format)` and hands one back
-/// to the next resident of that bucket, so a bucket whose members disagree about
-/// usage would eventually bind an image to an attachment it was not created for
-/// — invalid, and invalid in the quiet way, because the image is real and the
-/// geometry matches. Deriving usage here makes "same bucket implies same usage"
-/// true by construction, so a fourth creation site cannot get it wrong and
-/// nothing has to scan for one that did.
-pub(crate) fn registry_target_usage(format: ash::vk::Format) -> ash::vk::ImageUsageFlags {
+/// `depth_transfer_dst` is not caller policy: it is the queried feature bit for
+/// `format` on this device. The recycle free-list and all callers live inside
+/// that same device context, so `(geometry, format)` still implies one usage set.
+/// Keeping the derivation here prevents one creation path from adding a usage
+/// that another path omits while both feed the same recycle bucket.
+pub(crate) fn registry_target_usage(
+    format: ash::vk::Format,
+    depth_transfer_dst: bool,
+) -> ash::vk::ImageUsageFlags {
     if format_is_depth(format) {
-        // A depth resident is only ever attachment N of an ad-hoc framebuffer.
-        // No SAMPLED and no TRANSFER: nothing in this device reads a depth
-        // buffer back or copies one, and asking for usage the host need not
-        // support for a depth format would refuse the image on hosts that
-        // support the attachment alone.
+        // A depth resident is attachment N of an ad-hoc framebuffer. Transfer
+        // destination is also required to materialize an attachment-wide Metal
+        // load clear before an MRT framebuffer whose minimum extent is smaller.
         ash::vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+            | if depth_transfer_dst {
+                ash::vk::ImageUsageFlags::TRANSFER_DST
+            } else {
+                ash::vk::ImageUsageFlags::empty()
+            }
     } else {
         ash::vk::ImageUsageFlags::COLOR_ATTACHMENT
             | ash::vk::ImageUsageFlags::INPUT_ATTACHMENT

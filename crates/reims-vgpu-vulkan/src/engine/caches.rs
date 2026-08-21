@@ -561,6 +561,12 @@ pub(crate) struct PipelineKey {
     /// `VK_EXT_extended_dynamic_state3`: a wireframe draw and a filled draw
     /// sharing shaders need different pipelines.
     pub fill_mode: FillMode,
+    /// Effective Vulkan line width. For Metal widths that suppress all line
+    /// fragments this remains 1.0 and [`Self::rasterizer_discard`] carries the
+    /// semantic result without binding a Vulkan-invalid sub-unit width.
+    pub line_width_bits: u32,
+    pub rasterizer_discard: bool,
+    pub depth_bias_enable: bool,
     /// Metal `MTLDepthClipMode`, mapped to `depthClampEnable`. In the key for
     /// the same reason as [`Self::fill_mode`].
     pub depth_clip: DepthClipMode,
@@ -2121,6 +2127,33 @@ impl ObjectCaches {
             self.pipelines.insert_negative(key.clone(), err.clone());
             return Err(err);
         }
+        let line_width = f32::from_bits(key.line_width_bits);
+        let [line_width_min, line_width_max] = ctx.features.line_width_range;
+        if !key.rasterizer_discard && line_width != 1.0 && !ctx.features.wide_lines {
+            let reason = super::reason::DrawReason::WideLinesUnsupported {
+                requested_bits: key.line_width_bits,
+            };
+            reims_vgpu_observe::Emit::decline("vk_engine_pipeline", &reason).fail();
+            let err = DrawError::Unsupported(reason);
+            self.pipelines.insert_negative(key.clone(), err.clone());
+            return Err(err);
+        }
+        if !key.rasterizer_discard
+            && line_width != 1.0
+            && (!line_width.is_finite()
+                || line_width < line_width_min
+                || line_width > line_width_max)
+        {
+            let reason = super::reason::DrawReason::LineWidthOutOfRange {
+                requested_bits: key.line_width_bits,
+                min_bits: line_width_min.to_bits(),
+                max_bits: line_width_max.to_bits(),
+            };
+            reims_vgpu_observe::Emit::decline("vk_engine_pipeline", &reason).fail();
+            let err = DrawError::Unsupported(reason);
+            self.pipelines.insert_negative(key.clone(), err.clone());
+            return Err(err);
+        }
         if key.depth_clip != DepthClipMode::default() && !ctx.features.depth_clamp {
             let reason = super::reason::DrawReason::DepthClampUnsupported;
             reims_vgpu_observe::Emit::decline("vk_engine_pipeline", &reason).fail();
@@ -2289,6 +2322,17 @@ impl ObjectCaches {
         if key.stencil.is_some() {
             dynamic_states.push(vk::DynamicState::STENCIL_REFERENCE);
         }
+        if key.depth_bias_enable {
+            dynamic_states.push(vk::DynamicState::DEPTH_BIAS);
+        }
+        if key
+            .blend
+            .into_iter()
+            .chain(key.secondary_blend.iter().copied().flatten())
+            .any(BlendKey::uses_constants)
+        {
+            dynamic_states.push(vk::DynamicState::BLEND_CONSTANTS);
+        }
         let dynamic_state =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
         // Both counts are the key's one number: the viewports and scissors
@@ -2305,7 +2349,9 @@ impl ObjectCaches {
             .depth_clamp_enable(translate::raster::vk_depth_clamp_enable(key.depth_clip))
             .cull_mode(translate::raster::vk_cull_mode(key.cull_mode))
             .front_face(translate::raster::vk_front_face(key.front_face_ccw))
-            .line_width(1.0);
+            .rasterizer_discard_enable(key.rasterizer_discard)
+            .depth_bias_enable(key.depth_bias_enable)
+            .line_width(line_width);
         // `rasterSampleCount` is a property of `MTLRenderPipelineDescriptor`,
         // so it reaches this device inside the render pipeline's own
         // compact-TLV block. The pass key carries that decoded count, and the
@@ -2354,13 +2400,9 @@ impl ObjectCaches {
                 key.color_write_mask[slot + 1],
             ));
         }
-        let blend_constants = key
-            .blend
-            .map(|b| b.constants.map(f32::from_bits))
-            .unwrap_or([0.0; 4]);
         let blend = vk::PipelineColorBlendStateCreateInfo::default()
             .attachments(&blend_att)
-            .blend_constants(blend_constants);
+            .blend_constants([0.0; 4]);
         // Depth-stencil state: attached ONLY when the pass carries a depth
         // attachment (Vulkan requires the pipeline's depth-stencil state to be
         // consistent with the subpass). Without it the color-only pipeline is

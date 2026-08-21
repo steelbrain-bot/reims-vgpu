@@ -86,7 +86,11 @@ pub(super) fn plan_executor_request<M: HostMemory + HostOps>(
         // after this maps cleanly: the mapping says what the guest asked
         // for, the capability check says whether the host can spell it.
         fill_mode: req.fill_mode,
+        line_width: req.line_width,
+        depth_bias: req.depth_bias,
         depth_clip: req.depth_clip_mode,
+        blend_constants: req.blend_color.unwrap_or([0.0; 4]),
+        render_target_extent: req.render_target_extent,
         first_vertex: req.first_vertex,
         // Passed through. `decode::render`'s `wire_instance_count` is where
         // a zero instance count is decided, and it is decided once — a
@@ -299,8 +303,6 @@ pub(super) fn plan_executor_request<M: HostMemory + HostOps>(
             &req.colors,
             pd,
             &primary_id,
-            w,
-            h,
             &blend_states,
         );
         // A secondary attachment this device cannot build refuses the draw.

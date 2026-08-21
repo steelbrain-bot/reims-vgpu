@@ -2248,11 +2248,8 @@ fn depth_stencil_object_decode() {
     st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_DEPTH_STENCIL);
     st32(&mut b[4..], DEPTH_STENCIL_DESC_LEN as u32);
     st32(&mut b[DEPTH_STENCIL_DESC_ID..], 5);
-    // compare Less=1, write enabled, both stencil enabled
-    let bits = 1u32
-        | DEPTH_STENCIL_DEPTH_WRITE
-        | DEPTH_STENCIL_FRONT_STENCIL_ENABLED
-        | DEPTH_STENCIL_BACK_STENCIL_ENABLED;
+    // compare Less=1, write enabled, both stencil faces present
+    let bits = 1u32 | DEPTH_STENCIL_DEPTH_WRITE | (1 << 4) | (1 << 5);
     st32(&mut b[DEPTH_STENCIL_DESC_STATE_BITS..], bits);
     st32(&mut b[DEPTH_STENCIL_DESC_FRONT_FACE + 4..], 0xff);
     st32(&mut b[DEPTH_STENCIL_DESC_FRONT_FACE + 8..], 0xff);
@@ -2260,7 +2257,8 @@ fn depth_stencil_object_decode() {
     assert_eq!(d.depth_stencil_id, 5);
     assert_eq!(d.depth_compare_function, 1);
     assert!(d.depth_write_enabled);
-    assert!(d.front_stencil_enabled);
+    assert!(d.front_stencil_present);
+    assert!(d.back_stencil_present);
     assert_eq!(d.front_face.read_mask, 0xff);
 }
 
@@ -3090,9 +3088,11 @@ fn decodes_opcode9_buffer_texture_live_blobs() {
     // every buffer-backed texture.
     assert_eq!(d1.desc.usage, 0x11);
     assert_eq!(d1.desc.resource_options, 0x0010);
-    assert_eq!(d1.desc.unidentified_u64, 0);
+    assert_eq!(d1.desc.protection_options, 0);
     assert!(d1.desc.allow_gpu_optimized_contents);
-    assert_eq!(d1.desc.unidentified_flags, 0);
+    assert!(!d1.desc.framebuffer_only);
+    assert!(!d1.desc.is_drawable);
+    assert_eq!(d1.desc.write_swizzle_enabled, None);
 
     let b2 = hex_to_bytes(
         "09000000400000004c0000004b000000000000000000000000010000000000004\

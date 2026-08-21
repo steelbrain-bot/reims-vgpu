@@ -71,14 +71,6 @@ pub enum AttachmentPlanDecline {
         source_format: u16,
         resolve_format: u16,
     },
-    GeometryMismatch {
-        slot: u32,
-        texture_ref: u32,
-        width: u32,
-        height: u32,
-        pass_width: u32,
-        pass_height: u32,
-    },
 }
 
 impl AttachmentPlanDecline {
@@ -86,8 +78,7 @@ impl AttachmentPlanDecline {
         match self {
             Self::PassAction { slot, .. }
             | Self::TargetUnresolved { slot, .. }
-            | Self::ResolveTargetMismatch { slot, .. }
-            | Self::GeometryMismatch { slot, .. } => slot,
+            | Self::ResolveTargetMismatch { slot, .. } => slot,
         }
     }
 
@@ -115,7 +106,6 @@ impl AttachmentPlanDecline {
                 (class, u64::from(texture_ref))
             }
             Self::ResolveTargetMismatch { resolve_ref, .. } => (5, u64::from(resolve_ref)),
-            Self::GeometryMismatch { texture_ref, .. } => (6, u64::from(texture_ref)),
         };
         let hash = crate::fnv::fold_u64(crate::fnv::FNV_OFFSET_BASIS, class);
         let hash = crate::fnv::fold_u64(hash, u64::from(self.slot()));
@@ -136,7 +126,6 @@ impl Decline for AttachmentPlanDecline {
             } => "draw_prepare_attachment_store_action",
             Self::TargetUnresolved { .. } => "draw_prepare_attachment_target_unresolved",
             Self::ResolveTargetMismatch { .. } => "draw_prepare_attachment_resolve_target_mismatch",
-            Self::GeometryMismatch { .. } => "draw_prepare_attachment_geometry_mismatch",
         }
     }
 
@@ -176,21 +165,6 @@ impl Decline for AttachmentPlanDecline {
                 ("resolve_height", resolve_height.to_string()),
                 ("source_format", format!("{source_format:#x}")),
                 ("resolve_format", format!("{resolve_format:#x}")),
-            ],
-            Self::GeometryMismatch {
-                slot,
-                texture_ref,
-                width,
-                height,
-                pass_width,
-                pass_height,
-            } => vec![
-                ("slot", slot.to_string()),
-                ("texture_ref", texture_ref.to_string()),
-                ("width", width.to_string()),
-                ("height", height.to_string()),
-                ("pass_width", pass_width.to_string()),
-                ("pass_height", pass_height.to_string()),
             ],
         }
     }
@@ -1092,7 +1066,7 @@ mod tests {
                 pipeline_ref: 2,
                 refusal: crate::preparation::SecondaryMrtRefusal {
                     slot: 1,
-                    reason: crate::preparation::MrtDrop::GeometryMismatch,
+                    reason: crate::preparation::MrtDrop::UnknownFormat,
                 },
             },
             DrawPreparationDecline::VertexBufferMissing {
@@ -1370,14 +1344,6 @@ mod tests {
                 resolve_height: 8,
                 source_format: 0x50,
                 resolve_format: 0x51,
-            },
-            AttachmentPlanDecline::GeometryMismatch {
-                slot: 1,
-                texture_ref: 7,
-                width: 4,
-                height: 8,
-                pass_width: 8,
-                pass_height: 8,
             },
         ];
         let mut slugs: Vec<_> = declines.iter().map(Decline::slug).collect();

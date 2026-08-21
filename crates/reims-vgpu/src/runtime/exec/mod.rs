@@ -44,7 +44,7 @@ use reims_vgpu_core::pixel_format::{
 };
 use reims_vgpu_core::{FenceAction, SynchronizationDomain as FenceDomain};
 use reims_vgpu_protocol::pass_action::{
-    store_action_publishes_single_sample, MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_LOAD,
+    store_action_publishes_single_sample, MTL_LOAD_ACTION_CLEAR,
     MTL_STORE_ACTION_MULTISAMPLE_RESOLVE, MTL_STORE_ACTION_STORE,
     MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
 };
@@ -59,7 +59,7 @@ use reims_vgpu_wire::ops::tile as wire_tile;
 use std::sync::Arc;
 
 /// Pending render-pass ICB execute (range form or indirect range buffer).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct RenderIcbExecute {
     icb_ref: u32,
     is_range: bool,
@@ -67,6 +67,15 @@ struct RenderIcbExecute {
     range_length: u64,
     args_buffer_ref: u32,
     args_buffer_offset: u64,
+    /// Encoder state inherited at the exact execute record, not at stream end.
+    inherited: PendingDraw,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenderWork {
+    Draw(usize),
+    ExecuteIcb(usize),
+    Barrier,
 }
 
 /// One draw recorded with the bind state at that point (archive DrawRec / multi-draw job).
@@ -93,11 +102,14 @@ struct PendingDraw {
     /// Every scissor rect this draw was recorded with. See [`Self::viewports`].
     scissors: Vec<ScissorRect>,
     blend_color: Option<[f32; 4]>,
+    render_target_extent: reims_vgpu_core::RenderTargetExtent,
     cull_mode: reims_vgpu_protocol::CullMode,
     front_face_ccw: bool,
     /// `setTriangleFillMode:` — `MTLTriangleFillMode`, initialized to the
     /// Metal default (`Fill`) until the stream replaces it.
     fill_mode: reims_vgpu_protocol::FillMode,
+    /// `setLineWidth:` state, initialized to Metal's `1.0` default.
+    line_width: reims_vgpu_core::LineWidth,
     /// `setDepthClipMode:` — `MTLDepthClipMode`, initialized to the Metal
     /// default (`Clip`) until the stream replaces it.
     depth_clip_mode: reims_vgpu_protocol::DepthClipMode,
@@ -110,6 +122,8 @@ struct PendingDraw {
     /// [`StreamAccum::visibility`]. `None` is the Metal default,
     /// `MTLVisibilityResultModeDisabled`.
     visibility: Option<draw::VisibilityArming>,
+    /// ICB object that produced this draw, or `None` for a direct encoder draw.
+    icb_ref: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -117,6 +131,7 @@ struct RasterState {
     cull_mode: Result<reims_vgpu_protocol::CullMode, RasterStateRefusal>,
     front_face_ccw: Result<bool, RasterStateRefusal>,
     fill_mode: Result<reims_vgpu_protocol::FillMode, RasterStateRefusal>,
+    line_width: reims_vgpu_core::LineWidth,
     depth_clip_mode: Result<reims_vgpu_protocol::DepthClipMode, RasterStateRefusal>,
 }
 
@@ -211,6 +226,7 @@ impl Default for RasterState {
             cull_mode: Ok(reims_vgpu_protocol::CullMode::None),
             front_face_ccw: Ok(false),
             fill_mode: Ok(reims_vgpu_protocol::FillMode::Fill),
+            line_width: reims_vgpu_core::LineWidth::default(),
             depth_clip_mode: Ok(reims_vgpu_protocol::DepthClipMode::Clip),
         }
     }
@@ -224,6 +240,7 @@ impl RasterState {
             reims_vgpu_protocol::CullMode,
             bool,
             reims_vgpu_protocol::FillMode,
+            reims_vgpu_core::LineWidth,
             reims_vgpu_protocol::DepthClipMode,
         ),
         RasterStateRefusal,
@@ -232,6 +249,7 @@ impl RasterState {
             self.cull_mode?,
             self.front_face_ccw?,
             self.fill_mode?,
+            self.line_width,
             self.depth_clip_mode?,
         ))
     }
@@ -253,14 +271,18 @@ struct StreamAccum {
     color_targets: Vec<u32>,
     /// All draws in stream order (archive multi-draw job).
     draws: Vec<PendingDraw>,
+    /// Every work-producing record in encoder order. Draw and ICB payloads live
+    /// in their typed stores above/below; this sequence is the sole ordering
+    /// authority and barriers occupy their own positions in it.
+    render_work: Vec<RenderWork>,
     saw_draw: bool,
     /// Every render ICB execute (`0x14`/`0x15`) in this stream, in stream
     /// order.
     ///
     /// A list rather than a latch because `executeCommandsInBuffer:` is work,
     /// not state: a second record does not replace the first, it asks for a
-    /// second execution. See the loop that drains this in [`finish_stream`] for
-    /// what a capacity of one used to cost.
+    /// second execution. [`Self::render_work`] places each entry among direct
+    /// draws and barriers before [`finish_stream`] expands its commands.
     execute_icb: Vec<RenderIcbExecute>,
     vertex_buffers: BindTable<BufferBind>,
     fragment_buffers: BindTable<BufferBind>,
@@ -275,6 +297,9 @@ struct StreamAccum {
     scissors: Vec<ScissorRect>,
     indexed: Option<IndexedDrawInfo>,
     blend_color: Option<[f32; 4]>,
+    /// Pass-owned raster bounds. Zero on either wire axis independently means
+    /// that axis inherits the minimum attachment dimension.
+    render_target_extent: reims_vgpu_core::RenderTargetExtent,
     /// Sticky raster setters, each retaining either the decoded semantic value
     /// or the exact invalid ordinal until a later setter replaces that field.
     raster: RasterState,
@@ -323,8 +348,8 @@ struct StreamAccum {
     ///
     /// Recording it lets [`StreamAccum::bind_snapshot`] refuse. That is the
     /// funnel both consumers of the stream's state pass through — a decoded draw
-    /// and an end-of-stream ICB execute — which is why the refusal lives there
-    /// and not in the backend encoder.
+    /// and an ICB execute at its exact record position — which is why the
+    /// refusal lives there and not in the backend encoder.
     ///
     /// **Sticky, and it cannot go stale.** There is no retirement path and none
     /// is needed: this field describes the accumulator beside it. A
@@ -435,6 +460,22 @@ impl crate::observe::Decline for EncoderLifetimeRefusal {
 }
 
 impl StreamAccum {
+    fn push_draw(&mut self, draw: PendingDraw) {
+        let index = self.draws.len();
+        self.draws.push(draw);
+        self.render_work.push(RenderWork::Draw(index));
+    }
+
+    fn push_icb(&mut self, execute: RenderIcbExecute) {
+        let index = self.execute_icb.len();
+        self.execute_icb.push(execute);
+        self.render_work.push(RenderWork::ExecuteIcb(index));
+    }
+
+    fn push_barrier(&mut self) {
+        self.render_work.push(RenderWork::Barrier);
+    }
+
     /// The subset of [`Self::clears`] whose colour the guest may read back, so
     /// writing it into the guest's pages is publishing the pass's result rather
     /// than inventing one.
@@ -458,13 +499,12 @@ impl StreamAccum {
     /// The stream's bind state as a `PendingDraw`, or what makes it
     /// unrepresentable.
     ///
-    /// Two things need it and must not disagree: a decoded draw, which fills
-    /// in `pipeline_ref` and `draw` on top, and an ICB execute, which inherits
-    /// the state as it stands at end of stream and supplies neither. Both must
-    /// also refuse on the same terms, which is why the check is here rather than
-    /// at either of them: a snapshot of state that is missing something the
-    /// guest asked for is not this stream's state, and a draw encoded from it
-    /// computes the wrong pixels with nothing to say so.
+    /// Two things need it and must not disagree: a decoded draw, which fills in
+    /// `pipeline_ref` and `draw` on top, and an ICB execute, which inherits the
+    /// state at that operation's encoder position. Both must also refuse on the
+    /// same terms, which is why the check is here rather than at either of them:
+    /// a snapshot missing something the guest asked for is not this stream's
+    /// state, and a draw encoded from it computes the wrong pixels silently.
     ///
     /// Draws recorded *before* the refusal are untouched. They snapshotted state
     /// that was still complete, so they are the guest's own work and they stand;
@@ -473,7 +513,7 @@ impl StreamAccum {
         if let Some(refused) = self.unrepresentable {
             return Err(refused);
         }
-        let (cull_mode, front_face_ccw, fill_mode, depth_clip_mode) =
+        let (cull_mode, front_face_ccw, fill_mode, line_width, depth_clip_mode) =
             self.raster.resolved().map_err(StreamRefusal::Raster)?;
         let visibility = self
             .visibility
@@ -509,9 +549,11 @@ impl StreamAccum {
             viewports: self.viewports.clone(),
             scissors: self.scissors.clone(),
             blend_color: self.blend_color,
+            render_target_extent: self.render_target_extent,
             cull_mode,
             front_face_ccw,
             fill_mode,
+            line_width,
             depth_clip_mode,
             depth_bias: self.depth_bias,
             depth_stencil_ref: self.depth_stencil_ref,
@@ -781,8 +823,11 @@ pub struct ExecResult {
     pub compute_control_fail: u32,
     /// ICB materialize+execute failures (`0xe4`/`0xe5`).
     pub compute_icb_fail: u32,
-    /// Render ICB execute ok / fail (`0x14`/`0x15`).
+    /// Successfully encoded render-ICB commands. One execute range can contain
+    /// zero or more commands, so this is not an execute-record count.
     pub render_icb_ok: u32,
+    /// Render-ICB refusals and command encode failures. A refusal before range
+    /// expansion counts once; failures after expansion count per command.
     pub render_icb_fail: u32,
     /// Wall-clock for the whole synchronous packet body. A packet holding the
     /// device lock past `SYNC_EXEC_STALL_US` starves the guest's read-to-clear
@@ -1475,8 +1520,8 @@ fn semantic_segment_boundary(
         stream_index,
         index: segment.index,
         kind,
-        continues_previous: segment.begin_flag != 0,
-        continues_next: segment.unidentified_u8 != 0,
+        continues_previous: segment.continues_previous,
+        continues_next: segment.continues_next,
     })
 }
 
@@ -1545,7 +1590,7 @@ fn walk_submitted_stream<M: HostMemory + HostOps>(
             .submissions
             .enter_segment_if_active(semantic_segment_boundary(stream_index, &seg));
 
-        let mut encoder = if seg.begin_flag != 0 {
+        let mut encoder = if seg.continues_previous {
             match open.take() {
                 Some(encoder) if encoder.type_() == seg.type_ => encoder,
                 Some(previous) => {
@@ -1616,7 +1661,7 @@ fn walk_submitted_stream<M: HostMemory + HostOps>(
             }
         }
 
-        if seg.unidentified_u8 != 0 {
+        if seg.continues_next {
             *open = Some(encoder);
         } else {
             finish_ns = finish_ns.saturating_add(finish_open_encoder(
@@ -2444,34 +2489,34 @@ fn handle_render_record<M: HostMemory + HostOps>(
             acc.stencil_ref = Some((cmd.stencil_ref_front, cmd.stencil_ref_back));
         }
         RenderKind::RenderPass => {
-            // The pass's own tail, decoded and not applied. Four counters
-            // rather than one, because they name four different losses and one
-            // of them is not a loss at all when it is zero.
+            // The pass's own tail. Four counters distinguish the independent
+            // contract terms rather than collapsing them into one reading.
             //
-            // `render_target_width`/`height` are the guest's explicit extent
-            // and this device renders at the attachment's instead, which is a
-            // silent over-render whenever the two differ. `array_length` is
-            // layered rendering. The visibility buffer is the other half of
+            // `render_target_width`/`height` are the guest's explicit raster
+            // bounds and now travel with every draw. `array_length` is layered
+            // rendering. The visibility buffer is the other half of
             // `setVisibilityResultMode:offset:` — that record already counts
             // its own drop, and this counts the buffer it would have written
             // to, so the two should track and a divergence means one of the
             // arms is wrong. All four report only a non-default value: a pass
             // that asks for the API default is asking for what already happens.
             //
-            // The extent one is **not** a healthy zero and the others are. On a
-            // driven arm64/Vulkan boot it reads 1 575 over 127 one-second
-            // windows while the visibility buffer, the array length and the
-            // colour subresource all read 0 — so the macOS window server states
-            // an explicit pass extent on essentially every pass, and this
-            // device renders at the attachment's instead. Whether that is a
-            // loss is settled by `note_pass_extent_coverage`'s bands and not by
-            // this count: the two agree, so this is the denominator of a
-            // measurement rather than an alarm.
+            // The extent count remains the denominator for
+            // `note_pass_extent_coverage`'s bands; it is an instrument, not a
+            // second implementation rule.
             // Kept, not counted: this is where the pass says which guest buffer
             // its occlusion counts land in, and `finish_stream` writes them
             // there. `0` is a pass that named none, which leaves the arming
             // below with nowhere to write.
             acc.visibility_buffer_ref = cmd.pass_visibility_result_buffer_ref;
+            match render_target_extent(cmd.pass_render_target_width, cmd.pass_render_target_height)
+            {
+                Ok(extent) => acc.render_target_extent = extent,
+                Err(extent) => {
+                    acc.unrepresentable
+                        .get_or_insert(StreamRefusal::PassExtent(extent));
+                }
+            }
             // Refused rather than drawn into layer 0, the decision the colour
             // subresource arm below already made for the same shape of loss:
             // the layer a draw selects is a coordinate the pass did not name,
@@ -2485,7 +2530,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 acc.unrepresentable.get_or_insert(StreamRefusal::Pass(drop));
             }
             if cmd.pass_render_target_width != 0 || cmd.pass_render_target_height != 0 {
-                note_pass_target_extent();
+                note_pass_target_extent_stated();
             }
             // Full multi-attachment: re-decode all color slots from payload.
             if cmd_bytes.len() >= 8 {
@@ -2697,7 +2742,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 acc.dropped_zero_count = acc.dropped_zero_count.saturating_add(1);
             } else {
                 match acc.bind_snapshot() {
-                    Ok(snapshot) => acc.draws.push(PendingDraw {
+                    Ok(snapshot) => acc.push_draw(PendingDraw {
                         pipeline_ref: acc.pipeline_ref,
                         draw: DrawArgs {
                             vertex_count: count,
@@ -2717,13 +2762,22 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 note_unnamed_icb_execute(task_id, &cmd);
                 return;
             }
-            acc.execute_icb.push(RenderIcbExecute {
+            let inherited = match acc.bind_snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(over) => {
+                    out.render_icb_fail = out.render_icb_fail.saturating_add(1);
+                    note_draw_refused(over, acc.pipeline_ref, "icb_execute");
+                    return;
+                }
+            };
+            acc.push_icb(RenderIcbExecute {
                 icb_ref: cmd.indirect_command_buffer_ref,
                 is_range: cmd.icb_is_range,
                 range_location: cmd.icb_range_location,
                 range_length: cmd.icb_range_length,
                 args_buffer_ref: cmd.icb_args_buffer_ref,
                 args_buffer_offset: cmd.icb_args_buffer_offset,
+                inherited,
             });
         }
         RenderKind::Fence => {
@@ -2770,24 +2824,12 @@ fn handle_render_record<M: HostMemory + HostOps>(
             // we never invent semantics for it.
             note_unimplemented_render_opcode(cmd.opcode, cmd_bytes, task_id, acc);
         }
-        // Two kinds the product answers by doing nothing, counted separately.
-        // They used to fall into the catch-all below, which made them
-        // indistinguishable from a record that was handled — and unlike a
-        // `SetBuffer` these carry ordering and lifetime the guest expects us to
-        // honour, so silence was the wrong answer even though doing nothing is
-        // the right one.
-        //
-        // The arguments are the compute rail's, which reached the same two
-        // conclusions first (`compute_noop_residency_hint`,
-        // `compute_noop_barrier`). Residency: `useResource:`/`useHeap:` are
-        // hints for a driver that pages resources, and this product resolves
-        // every binding per draw, so there is nothing for them to keep
-        // resident. Barriers: the render rail submits and waits at pass
-        // granularity, so a barrier inside the pass is implied by the boundary.
-        //
-        // These counters exist to price those arguments rather than to doubt
-        // them. A large residency count is the cost of resolving per draw; a
-        // large barrier count is what the pass-granularity submit is buying.
+        // Residency declarations are the one kind the product answers by doing
+        // nothing. They used to fall into the catch-all below, which made them
+        // indistinguishable from a record that was handled. `useResource:` and
+        // `useHeap:` are hints for a driver that pages resources, while this
+        // product resolves every binding per draw, so there is nothing for the
+        // records to keep resident. The counter prices that repeated resolving.
         // The render states this rail decodes and does not apply. Each reports
         // only when the guest asked for something *other* than the API default,
         // because asking for the default is asking for what we already do — so
@@ -2838,14 +2880,12 @@ fn handle_render_record<M: HostMemory + HostOps>(
             }
         }
         RenderKind::SetFloatState => {
-            // Both default to 1.0. Compared exactly rather than with a
-            // tolerance: the guest wrote a literal and the question is whether
-            // it wrote *the* literal, not whether it is close to it.
-            if cmd.float_value != 1.0 {
-                crate::runtime::drain::note_store_route(match cmd.opcode {
-                    wire_render::OPCODE_SET_LINE_WIDTH => "render_line_width_dropped",
-                    _ => "render_tessellation_scale_dropped",
-                });
+            if cmd.opcode == wire_render::OPCODE_SET_LINE_WIDTH {
+                acc.raster.line_width = reims_vgpu_core::LineWidth::from_f32(cmd.float_value);
+            } else if cmd.float_value != 1.0 {
+                // Tessellation scale remains outside the implemented primitive
+                // domain. Keep the loss named until tessellation itself exists.
+                crate::runtime::drain::note_store_route("render_tessellation_scale_dropped");
             }
         }
         RenderKind::SetStoreAction => {
@@ -2954,8 +2994,19 @@ fn handle_render_record<M: HostMemory + HostOps>(
         RenderKind::UseResource | RenderKind::UseHeap => {
             crate::runtime::drain::note_store_route("render_noop_residency_hint");
         }
-        RenderKind::Barrier => {
-            crate::runtime::drain::note_store_route("render_noop_barrier");
+        RenderKind::BarrierResources | RenderKind::BarrierScope | RenderKind::TextureBarrier => {
+            // A render barrier orders following fragment reads after preceding
+            // draw writes, including reads of a render target. Draws can remain
+            // in one deferred backend batch, so the tranche tail is not a
+            // boundary here. Retain the exact draw position so finish_stream
+            // submits the batch there; the backend queue orders the next draw
+            // after it and reopening the continued pass LOADs the content it
+            // produced.
+            // This is deliberately stronger than a resource/scope-qualified
+            // barrier, but it preserves the guest-visible ordering without
+            // reconstructing a narrower answer from unrelated state.
+            acc.push_barrier();
+            crate::runtime::drain::note_store_route("render_barrier_submission_boundary");
         }
         // The tile-shader family. Nine opcodes that used to reach
         // `OtherAccepted` together, split here into the three different things
@@ -3357,6 +3408,7 @@ fn note_draw_refused(refusal: StreamRefusal, pipeline_ref: u32, site: &'static s
         StreamRefusal::Raster(state) => crate::observe::Emit::decline("render_draw", &state),
         StreamRefusal::Visibility(state) => crate::observe::Emit::decline("render_draw", &state),
         StreamRefusal::PassAction(action) => crate::observe::Emit::decline("render_draw", &action),
+        StreamRefusal::PassExtent(extent) => crate::observe::Emit::decline("render_draw", &extent),
     };
     emit.field("site", site)
         .field("pipeline_ref", pipeline_ref)
@@ -3437,6 +3489,11 @@ impl StreamRefusal {
                     | (u64::from(action.action as u8) << 58)
                     | (u64::from(action.slot) << 16)
                     | u64::from(action.raw)
+            }
+            Self::PassExtent(extent) => {
+                (1 << 55)
+                    | (u64::from(extent.axis == "height") << 54)
+                    | (extent.raw & ((1 << 54) - 1))
             }
         }
     }
@@ -3524,6 +3581,49 @@ enum StreamRefusal {
     /// A pass attachment's load or store action is outside its declared enum.
     /// This also covers store-action overrides applied after the pass record.
     PassAction(PassActionRefusal),
+    /// A non-zero pass raster dimension that cannot be represented by the
+    /// backend-independent image geometry.
+    PassExtent(PassExtentRefusal),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PassExtentRefusal {
+    axis: &'static str,
+    raw: u64,
+}
+
+impl crate::observe::Decline for PassExtentRefusal {
+    fn slug(&self) -> &'static str {
+        "render_target_extent_unrepresentable"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![("axis", self.axis.into()), ("raw", self.raw.to_string())]
+    }
+}
+
+fn render_target_extent(
+    width: u64,
+    height: u64,
+) -> Result<reims_vgpu_core::RenderTargetExtent, PassExtentRefusal> {
+    fn axis(
+        name: &'static str,
+        raw: u64,
+    ) -> Result<Option<std::num::NonZeroU32>, PassExtentRefusal> {
+        if raw == 0 {
+            return Ok(None);
+        }
+        u32::try_from(raw)
+            .ok()
+            .and_then(std::num::NonZeroU32::new)
+            .map(Some)
+            .ok_or(PassExtentRefusal { axis: name, raw })
+    }
+
+    Ok(reims_vgpu_core::RenderTargetExtent {
+        width: axis("width", width)?,
+        height: axis("height", height)?,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3784,6 +3884,283 @@ fn apply_binds<T: Copy, B: Clone>(
     cleared
 }
 
+#[derive(Debug, Default)]
+struct ExpandedRenderWork {
+    draws: Vec<PendingDraw>,
+    barriers_after_draw: Vec<usize>,
+}
+
+fn render_icb_refusal(
+    out: &mut ExecResult,
+    icb_ref: u32,
+    command_index: Option<u32>,
+    refusal: crate::runtime::icb::IcbStatus,
+) {
+    out.render_icb_fail = out.render_icb_fail.saturating_add(1);
+    let key = (u64::from(icb_ref) << 32) | u64::from(command_index.unwrap_or(u32::MAX));
+    let mut emit = crate::observe::Emit::decline("render_icb", &refusal).field("icb_ref", icb_ref);
+    if let Some(index) = command_index {
+        emit = emit.field("command_index", index);
+    }
+    emit.fail_once(key);
+}
+
+fn icb_u32(value: u64, slug: &'static str) -> Result<u32, crate::runtime::icb::IcbStatus> {
+    u32::try_from(value).map_err(|_| crate::runtime::icb::IcbStatus::Args(slug))
+}
+
+fn pending_draw_from_icb<M: HostMemory + HostOps>(
+    state: &Device,
+    host: &M,
+    task_id: u32,
+    execute: &RenderIcbExecute,
+    descriptor: &reims_vgpu_protocol::IndirectCommandBufferDescriptor,
+    fill: crate::runtime::icb::IcbRenderFill,
+) -> Result<Option<PendingDraw>, crate::runtime::icb::IcbStatus> {
+    use crate::runtime::icb::{IcbRenderBindStage, IcbRenderDraw, IcbStatus};
+
+    if !fill.object_threadgroup_memory.is_empty() {
+        return Err(IcbStatus::Unsupported(
+            "render_icb_object_threadgroup_memory_unimplemented",
+        ));
+    }
+    let mut draw = execute.inherited.clone();
+    draw.icb_ref = Some(execute.icb_ref);
+    if descriptor.inherit_pipeline_state() && fill.pipeline_ref != 0 {
+        return Err(IcbStatus::Args("render_icb_inherited_pipeline_ref_nonzero"));
+    }
+    draw.pipeline_ref = if descriptor.inherit_pipeline_state() {
+        execute.inherited.pipeline_ref
+    } else {
+        fill.pipeline_ref
+    };
+    if draw.pipeline_ref == 0 {
+        return Err(IcbStatus::Missing("render_icb_pipeline_ref_zero"));
+    }
+
+    if !descriptor.inherit_buffers() {
+        let mut vertex = Vec::new();
+        let mut fragment = Vec::new();
+        for bind in fill.buffers {
+            let table = match bind.effective_stage() {
+                IcbRenderBindStage::Vertex => &mut vertex,
+                IcbRenderBindStage::Fragment => &mut fragment,
+                IcbRenderBindStage::Object | IcbRenderBindStage::Mesh => {
+                    return Err(IcbStatus::Unsupported(
+                        "render_icb_object_mesh_buffer_unimplemented",
+                    ));
+                }
+            };
+            table.push(BufferBind {
+                index: bind.index,
+                buffer_ref: bind.buffer_ref,
+                resource: objects::resolve_resource(state, host, task_id, bind.buffer_ref).ok(),
+                offset: bind.offset,
+                attribute_stride: bind.has_attribute_stride.then_some(bind.attribute_stride),
+            });
+        }
+        draw.vertex_buffers = Arc::new(vertex);
+        draw.fragment_buffers = Arc::new(fragment);
+    }
+
+    match fill.draw {
+        IcbRenderDraw::Primitives {
+            primitive_type,
+            vertex_start,
+            vertex_count,
+            instance_count,
+            base_instance,
+        } => {
+            if vertex_count == 0 || instance_count == 0 {
+                return Ok(None);
+            }
+            draw.draw = DrawArgs {
+                vertex_count: icb_u32(vertex_count, "render_icb_vertex_count_too_wide")?,
+                instance_count: icb_u32(instance_count, "render_icb_instance_count_too_wide")?,
+                primitive_topology: reims_vgpu_protocol::primitive_topology(u32::from(
+                    primitive_type,
+                ))
+                .map_err(|_| IcbStatus::Args("render_icb_primitive_type_invalid"))?,
+                first_vertex: icb_u32(vertex_start, "render_icb_vertex_start_too_wide")?,
+                base_instance: icb_u32(base_instance, "render_icb_base_instance_too_wide")?,
+            };
+            draw.indexed = None;
+        }
+        IcbRenderDraw::Indexed {
+            primitive_type,
+            index_type,
+            index_buffer_ref,
+            index_count,
+            index_buffer_offset,
+            instance_count,
+            base_vertex,
+            base_instance,
+            ..
+        } => {
+            if index_count == 0 || instance_count == 0 {
+                return Ok(None);
+            }
+            let count = icb_u32(index_count, "render_icb_index_count_too_wide")?;
+            draw.draw = DrawArgs {
+                vertex_count: count,
+                instance_count: icb_u32(instance_count, "render_icb_instance_count_too_wide")?,
+                primitive_topology: reims_vgpu_protocol::primitive_topology(u32::from(
+                    primitive_type,
+                ))
+                .map_err(|_| IcbStatus::Args("render_icb_primitive_type_invalid"))?,
+                first_vertex: 0,
+                base_instance: icb_u32(base_instance, "render_icb_base_instance_too_wide")?,
+            };
+            draw.indexed = Some(IndexedDrawInfo {
+                index_type: reims_vgpu_protocol::decode_index_type(u32::from(index_type)),
+                index_count: count,
+                index_buffer_ref,
+                index_buffer_offset,
+                index_start: 0,
+                base_vertex,
+            });
+        }
+        IcbRenderDraw::Patches { .. } | IcbRenderDraw::IndexedPatches { .. } => {
+            return Err(IcbStatus::Unsupported(
+                "render_icb_tessellation_draw_unimplemented",
+            ));
+        }
+        IcbRenderDraw::MeshThreads(_) | IcbRenderDraw::MeshThreadgroups(_) => {
+            return Err(IcbStatus::Unsupported("render_icb_mesh_draw_unimplemented"));
+        }
+    }
+    Ok(Some(draw))
+}
+
+fn expand_render_work<M: HostMemory + HostOps>(
+    state: &Device,
+    host: &M,
+    task_id: u32,
+    out: &mut ExecResult,
+    acc: &StreamAccum,
+) -> ExpandedRenderWork {
+    use crate::runtime::icb::IcbCommandFill;
+
+    let mut expanded = ExpandedRenderWork::default();
+    for work in &acc.render_work {
+        match *work {
+            RenderWork::Draw(index) => {
+                if let Some(draw) = acc.draws.get(index) {
+                    expanded.draws.push(draw.clone());
+                }
+            }
+            RenderWork::Barrier => expanded.barriers_after_draw.push(expanded.draws.len()),
+            RenderWork::ExecuteIcb(index) => {
+                let Some(execute) = acc.execute_icb.get(index) else {
+                    continue;
+                };
+                crate::runtime::drain::note_store_route("icb_exec_seen");
+                let (location, length) = if execute.is_range {
+                    (execute.range_location, execute.range_length)
+                } else {
+                    let Some(range) = read_icb_exec_range(
+                        state,
+                        host,
+                        task_id,
+                        execute.args_buffer_ref,
+                        execute.args_buffer_offset,
+                    ) else {
+                        render_icb_refusal(
+                            out,
+                            execute.icb_ref,
+                            None,
+                            crate::runtime::icb::IcbStatus::Missing("render_icb_exec_range_read"),
+                        );
+                        continue;
+                    };
+                    range
+                };
+                let Some(record) = state
+                    .task_objects
+                    .indirect_command_buffers
+                    .snapshot(task_id, execute.icb_ref)
+                else {
+                    render_icb_refusal(
+                        out,
+                        execute.icb_ref,
+                        None,
+                        crate::runtime::icb::IcbStatus::Missing("render_icb_not_registered"),
+                    );
+                    continue;
+                };
+                let fills = match crate::runtime::icb::decode_icb_command_range(
+                    state,
+                    host,
+                    task_id,
+                    execute.icb_ref,
+                    location,
+                    length,
+                ) {
+                    Ok(fills) => fills,
+                    Err(refusal) => {
+                        render_icb_refusal(out, execute.icb_ref, None, refusal);
+                        continue;
+                    }
+                };
+                for fill in fills {
+                    match fill {
+                        IcbCommandFill::Render(fill) => {
+                            let command_index = fill.command_index;
+                            match pending_draw_from_icb(
+                                state,
+                                host,
+                                task_id,
+                                execute,
+                                &record.descriptor,
+                                fill,
+                            ) {
+                                Ok(Some(draw)) => expanded.draws.push(draw),
+                                Ok(None) => {}
+                                Err(refusal) => render_icb_refusal(
+                                    out,
+                                    execute.icb_ref,
+                                    Some(command_index),
+                                    refusal,
+                                ),
+                            }
+                        }
+                        IcbCommandFill::Compute(fill) => render_icb_refusal(
+                            out,
+                            execute.icb_ref,
+                            Some(fill.command_index),
+                            crate::runtime::icb::IcbStatus::Unsupported(
+                                "render_icb_compute_command_in_render_encoder",
+                            ),
+                        ),
+                    }
+                }
+            }
+        }
+    }
+    expanded
+}
+
+/// Submit every recorded render barrier at or before one draw position.
+///
+/// Positions are appended while the wire is walked, so they are sorted. The
+/// cursor makes each command effective exactly once, including consecutive and
+/// trailing barriers. `<=` also preserves ordering after an earlier draw
+/// refusal skips directly to the chain tail.
+fn flush_render_barriers_at(
+    state: &Device,
+    positions: &[usize],
+    cursor: &mut usize,
+    draw_position: usize,
+) {
+    while positions
+        .get(*cursor)
+        .is_some_and(|position| *position <= draw_position)
+    {
+        state.executor.flush_submission_tail();
+        *cursor += 1;
+    }
+}
+
 fn finish_stream<M: HostMemory + HostOps>(
     state: &mut Device,
     host: &mut M,
@@ -3795,13 +4172,14 @@ fn finish_stream<M: HostMemory + HostOps>(
     // drops, so the six tile this function rather than sampling it. See
     // [`finish_phase`] for what the split is for.
     let mut fin = finish_phase::FinishTimer::open();
-    note_stream_draw_drops(task_id, acc);
     // Archive ApplePVGPUDrawJob: clear/load seed is private initial_rgba for the
     // async job; guest pages are written once at completion. Apply clear-to-guest
     // only for clear-only streams (no draws). When draws run, CLEAR is the Metal
     // pass seed inside encode (mrt_draw_request solid seed) — not a pre-draw
     // guest store that would expose intermediate pixels to DisplaySwap.
-    let will_draw = acc.saw_draw && !acc.color_slots.is_empty() && !acc.draws.is_empty();
+    let expanded = expand_render_work(state, host, task_id, out, acc);
+    note_stream_draw_drops(task_id, acc, expanded.draws.len());
+    let will_draw = !acc.color_slots.is_empty() && !expanded.draws.is_empty();
     if !will_draw {
         for att in acc.clears_reaching_guest_pages() {
             if apply_clear(state, host, task_id, att) {
@@ -3810,209 +4188,7 @@ fn finish_stream<M: HostMemory + HostOps>(
         }
     }
 
-    // Render ICB execute (`0x14`/`0x15`) — open pass over color slots and run ICB.
-    // Counted in FRONT of every gate below, because the only always-on report
-    // of this rail (`exec_summary`'s `icb_ok`/`icb_fail`) is emitted solely for
-    // packets that already failed, so an ICB that succeeds is invisible there
-    // and the whole rail reads as "never runs". This says how often the decoded
-    // stream asks for one at all, which is the denominator `runtime/icb`
-    // (2818 product lines) has never had.
-    //
-    // # Measured absent on three driven x86 / Vulkan boots
-    //
-    // The third is the one that carries the weight, because the first two were
-    // compositing-only and could not tell "the guest does not use ICB" from
-    // "this workload never reaches Metal":
-    //
-    //   1. Wikipedia + apple.com + System Settings, three title-bar drags.
-    //   2. apple.com, four page-downs.
-    //   3. Chess (SceneKit 3D) + Maps + the WebGL aquarium rendering live —
-    //      **66 512 draws** and 74.9 ms of `compute_us` across the boot.
-    //
-    // `icb_exec_seen`, `compute_icb_seen` and `compute_ctrl_seen` are all absent
-    // from every one. Across the whole accumulated fail log the subsystem has
-    // never emitted a line of its own either (every "icb" string in it is a
-    // field *name* on an `exec_summary` line).
-    //
-    // **This is still not a licence to delete `runtime/icb`, and the precedent
-    // that settles it is `ffe31d4`**: `mrt_draw_multi` also measured zero, and
-    // that session kept MRT *rendering* because it is decoded contract, cutting
-    // only the speculative sampling side-map built around it.
-    // `ExecuteCommandsInBuffer` is likewise a real Metal opcode in the decoded
-    // stream — a guest that issues one against a decoder we deleted loses work
-    // silently, which is the one outcome the ground rules forbid outright. What
-    // the reading does license is scrutiny of any layer built *around* the
-    // decode on speculation rather than on decoded fields.
-    //
-    // arm64 is unmeasured; these are x86 / Vulkan readings only.
-    //
-    // # A stream may ask for several, and every one of them runs
-    //
-    // `executeCommandsInBuffer:` is not a state a later record replaces — it is
-    // work, and Metal's ordinary ICB shape is one buffer per object batch, so
-    // several in one encoder is the expected case rather than the odd one.
-    // This used to be an `Option` assigned with `=`, which made the stream's
-    // capacity for them **one**: a second record overwrote the first and the
-    // first's commands never ran, with no counter and no line. That is a bound
-    // with no constant to name it, which is why none of the five bound scans
-    // could see it.
-    //
-    // The list is bounded by the stream the way [`StreamDrawDrop`] describes
-    // for `draws`: a record has a minimum encoded length, so the count cannot
-    // exceed the stream bytes already in memory.
-    //
-    // Records 2+ open their pass with `MTL_LOAD_ACTION_LOAD` and no clears.
-    // Each execute writes back before the next builds its request, so the LOAD
-    // seed is the previous execute's output — the clear belongs to the pass,
-    // which began at the first one, and re-running it would wipe what the ICB
-    // before it drew.
-    for (icb_index, exec) in acc.execute_icb.iter().enumerate() {
-        crate::runtime::drain::note_store_route("icb_exec_seen");
-        if !acc.color_slots.is_empty() {
-            // `mrt_draw_request` gates on a non-zero pipeline ref, and an
-            // ICB-only execute has none in the stream — its PSO lives inside
-            // the filled slots — so 1 stands in and only the colour list is
-            // taken. That case also takes the default single-triangle geometry
-            // rather than the stream's last draw, because the ICB carries its
-            // own. Otherwise the last pass's geometry describes the pass this
-            // ICB runs inside.
-            let (pipeline, args) = if acc.pipeline_ref != 0 {
-                let args = acc.draws.last().map_or(
-                    DrawArgs {
-                        vertex_count: 1,
-                        instance_count: 1,
-                        primitive_topology: reims_vgpu_protocol::PrimitiveTopology::Triangle,
-                        first_vertex: 0,
-                        base_instance: 0,
-                    },
-                    |pd| pd.draw,
-                );
-                (acc.pipeline_ref, args)
-            } else {
-                (
-                    1,
-                    DrawArgs {
-                        vertex_count: 1,
-                        instance_count: 1,
-                        primitive_topology: reims_vgpu_protocol::PrimitiveTopology::Triangle,
-                        first_vertex: 0,
-                        base_instance: 0,
-                    },
-                )
-            };
-            // The first execute opens the pass, so it takes the stream's load
-            // actions and its clears. Every later one composites onto what the
-            // pass already holds.
-            let loading_slots;
-            let (slots, clears): (&[(u32, ColorAttachment)], &[ColorAttachment]) = if icb_index == 0
-            {
-                (&acc.color_slots, &acc.clears)
-            } else {
-                loading_slots = color_slots_loading(&acc.color_slots);
-                (&loading_slots, &[])
-            };
-            let req =
-                match draw::mrt_draw_request(state, host, task_id, pipeline, slots, clears, args) {
-                    Ok(req) => req,
-                    Err(refusal) => {
-                        out.render_icb_fail = out.render_icb_fail.saturating_add(1);
-                        note_attachment_plan_refused(&refusal, task_id, pipeline, "icb_execute");
-                        None
-                    }
-                };
-            // ICB execute inherits stream bind state at end of stream, and both
-            // branches below inherit the same six tables — the last draw's
-            // snapshot is those tables as they stood when it was recorded, and
-            // nothing between then and here can have refilled a slot the walk
-            // refused. So a bind the tables could not hold is asked about once,
-            // ahead of both, rather than only on the second branch.
-            let inherited = acc.bind_snapshot();
-            if let Err(over) = inherited {
-                out.render_icb_fail += 1;
-                note_draw_refused(over, pipeline, "icb_execute");
-            } else if let (Some(mut req), Ok(snapshot)) = (req, inherited) {
-                if let Some(pd) = acc.draws.last() {
-                    fill_draw_binds_from_pending(&mut req, pd);
-                } else {
-                    fill_draw_binds_from_pending(&mut req, &snapshot);
-                }
-                let (loc, len) = if exec.is_range {
-                    (exec.range_location, exec.range_length)
-                } else {
-                    // Indirect: stage 8-byte range from guest buffer.
-                    match read_icb_exec_range(
-                        state,
-                        host,
-                        task_id,
-                        exec.args_buffer_ref,
-                        exec.args_buffer_offset,
-                    ) {
-                        Some(v) => v,
-                        None => {
-                            // Sibling ICB arms all log; this one only bumped the
-                            // counter (ICB audit) — name the reason.
-                            crate::observe::fail(format!(
-                                "render_icb fail reason=exec_range_read args_ref={} args_off={}",
-                                exec.args_buffer_ref, exec.args_buffer_offset
-                            ));
-                            out.render_icb_fail += 1;
-                            dirty_color_targets(state, host, task_id, &acc.color_targets);
-                            // `continue`, not `return`. One execute whose range
-                            // could not be read is one execute lost; it says
-                            // nothing about the next one's args buffer, and it
-                            // used to abandon the whole packet — including the
-                            // stream's own draws below — because there could
-                            // only ever be one of these.
-                            continue;
-                        }
-                    }
-                };
-                match draw::encode_icb_execute_and_writeback(
-                    state,
-                    host,
-                    &req,
-                    exec.icb_ref,
-                    loc,
-                    len,
-                ) {
-                    EncodeStatus::Ok => {
-                        crate::runtime::drain::note_store_route("icb_exec_ok");
-                        out.render_icb_ok += 1;
-                    }
-                    st => {
-                        out.render_icb_fail += 1;
-                        // Was `st={st:?}` — the variant, Debug-rendered, with no
-                        // `reason=` at all, so ten distinct checks in
-                        // `encode_icb_execute_and_writeback` (plus every ICB
-                        // refusal forwarded into it) shared four names and none
-                        // of them was greppable. Latched per ICB: the guest
-                        // re-executes the same one every frame.
-                        if let Some(e) = crate::observe::Emit::refusal("render_icb", &st) {
-                            e.field("icb_ref", exec.icb_ref)
-                                .field("loc", loc)
-                                .field("len", len)
-                                .field("colors", acc.color_slots.len())
-                                .fail_once(exec.icb_ref as u64);
-                        }
-                        dirty_color_targets(state, host, task_id, &acc.color_targets);
-                    }
-                }
-            } else {
-                out.render_icb_fail += 1;
-                crate::observe::fail(format!(
-                    "render_icb fail reason=mrt_request icb_ref={} colors={}",
-                    exec.icb_ref,
-                    acc.color_slots.len()
-                ));
-            }
-        } else {
-            out.render_icb_fail += 1;
-            crate::observe::fail("render_icb fail reason=no_color_slots");
-        }
-        // ICB execute is the primary work; still allow a co-recorded draw below if present.
-    }
-
-    if acc.saw_draw && !acc.color_slots.is_empty() && !acc.draws.is_empty() {
+    if !acc.color_slots.is_empty() && !expanded.draws.is_empty() {
         // Archive multi-draw (apple-pv-gpu-exec DrawJob): every honorable draw of
         // one exec packet targets one surface in decode order; the worker threads
         // each record's RGBA output as the next record's initial content; guest
@@ -4020,11 +4196,16 @@ fn finish_stream<M: HostMemory + HostOps>(
         //
         // Chain in-process color0 RGBA8 between encodes (no float16 guest round-
         // trip between draws). Only the last successful encode stores to guest.
-        let draw_list: Vec<&PendingDraw> = acc
-            .draws
-            .iter()
-            .filter(|pd| pd.pipeline_ref != 0 && pd.draw.vertex_count > 0)
-            .collect();
+        // Direct and expanded ICB draws are already in encoder order, with
+        // barrier positions measured against this exact list.
+        let draw_list: Vec<&PendingDraw> = expanded.draws.iter().collect();
+        let mut render_barrier_cursor = 0;
+        flush_render_barriers_at(
+            state,
+            &expanded.barriers_after_draw,
+            &mut render_barrier_cursor,
+            0,
+        );
         let mut chain_rgba: Option<Vec<u8>> = None;
         // Occlusion counts, keyed by the guest byte offset each lands at.
         //
@@ -4084,6 +4265,12 @@ fn finish_stream<M: HostMemory + HostOps>(
             dirty_color_targets(state, host, task_id, &acc.color_targets);
         }
         for (di, pd) in draw_list.iter().enumerate() {
+            flush_render_barriers_at(
+                state,
+                &expanded.barriers_after_draw,
+                &mut render_barrier_cursor,
+                di,
+            );
             fin.enter(crate::runtime::drain::FinishPhase::Retarget);
             let mut req = if di == 0 {
                 let Some(req) = first_req.take() else {
@@ -4200,6 +4387,14 @@ fn finish_stream<M: HostMemory + HostOps>(
                     crate::runtime::drain::DrainPhase::Draw,
                     draw_started,
                 );
+                if pd.icb_ref.is_some() {
+                    if matches!(&encode.status, EncodeStatus::Ok) {
+                        out.render_icb_ok = out.render_icb_ok.saturating_add(1);
+                        crate::runtime::drain::note_store_route("icb_exec_ok");
+                    } else {
+                        out.render_icb_fail = out.render_icb_fail.saturating_add(1);
+                    }
+                }
                 match (encode.status, encode.chain_rgba, encode.resident_identity) {
                     (EncodeStatus::Ok, Some(rgba), _) => {
                         out.draws_ok += 1;
@@ -4306,6 +4501,12 @@ fn finish_stream<M: HostMemory + HostOps>(
                 }
             }
         }
+        flush_render_barriers_at(
+            state,
+            &expanded.barriers_after_draw,
+            &mut render_barrier_cursor,
+            draw_list.len(),
+        );
         fin.enter(crate::runtime::drain::FinishPhase::Tail);
         write_visibility_results(state, host, task_id, acc, &visibility_counts);
         // Encode never landed Stores (unavailable operations, missing MTLB/pipeline, or
@@ -4326,6 +4527,15 @@ fn finish_stream<M: HostMemory + HostOps>(
                     out.clears_applied, out.draws_fail, saw_backend_unavailable as u8
                 ));
             }
+        }
+    }
+
+    // A barrier-only stream, or a render stream whose draws were all refused
+    // before entering the backend, can still order an open batch left by a
+    // preceding stream. No draw loop exists to consume its positions.
+    if !will_draw && !expanded.barriers_after_draw.is_empty() {
+        for _ in &expanded.barriers_after_draw {
+            state.executor.flush_submission_tail();
         }
     }
 }
@@ -4626,7 +4836,7 @@ fn execute_indirect_draw<M: HostMemory + HostOps>(
         return;
     }
     match acc.bind_snapshot() {
-        Ok(snapshot) => acc.draws.push(PendingDraw {
+        Ok(snapshot) => acc.push_draw(PendingDraw {
             pipeline_ref: acc.pipeline_ref,
             draw: args,
             ..snapshot
@@ -4672,35 +4882,6 @@ enum MultiDrawChainSource {
     Missing,
 }
 
-/// The same colour slots, opening with `LOAD` instead of whatever the stream
-/// asked for.
-///
-/// One render pass has one load action per attachment, taken when the pass
-/// begins. This device opens a fresh host pass per ICB execute, so the second
-/// and later ones have to be told that their pass is a continuation — the
-/// alternative is a `CLEAR` re-running mid-pass and wiping what the execute
-/// before it drew, which is the same failure the multi-draw chain describes at
-/// `di > 0`.
-///
-/// The clear colour is carried through untouched. It is not read on the `LOAD`
-/// path, and blanking it here would put an invented value in the record that a
-/// later reader of the request would have no way to distinguish from a decoded
-/// one.
-fn color_slots_loading(slots: &[(u32, ColorAttachment)]) -> Vec<(u32, ColorAttachment)> {
-    slots
-        .iter()
-        .map(|&(slot, att)| {
-            (
-                slot,
-                ColorAttachment {
-                    load_action: MTL_LOAD_ACTION_LOAD,
-                    ..att
-                },
-            )
-        })
-        .collect()
-}
-
 fn multi_draw_chain_source(resident_chain: bool, cpu_chain_ready: bool) -> MultiDrawChainSource {
     if resident_chain {
         MultiDrawChainSource::Resident
@@ -4722,9 +4903,11 @@ fn fill_draw_binds_from_pending(req: &mut draw::DrawEncodeRequest, pd: &PendingD
     req.scissors.clone_from(&pd.scissors);
     req.indexed = pd.indexed.clone();
     req.blend_color = pd.blend_color;
+    req.render_target_extent = pd.render_target_extent;
     req.cull_mode = pd.cull_mode;
     req.front_face_ccw = pd.front_face_ccw;
     req.fill_mode = pd.fill_mode;
+    req.line_width = pd.line_width;
     req.depth_clip_mode = pd.depth_clip_mode;
     req.depth_bias = pd.depth_bias;
     req.depth_stencil_ref = pd.depth_stencil_ref;
@@ -4930,7 +5113,7 @@ use report::{
     note_compute_refusal, note_depth_stencil_unsupported, note_draw_encode_fail,
     note_empty_scissor, note_indexed_draw_without_buffer, note_indirect_draw_refused,
     note_pass_array_length_unsupported, note_pass_extent_for_slot,
-    note_pass_raster_sample_count_unsupported, note_pass_target_extent,
+    note_pass_raster_sample_count_unsupported, note_pass_target_extent_stated,
     note_store_action_no_attachment, note_stream_draw_drops, note_unimplemented_render_opcode,
     note_unnamed_icb_execute,
 };

@@ -291,7 +291,7 @@ A field or bit you could not make move gets:
 - a doc comment stating **what has already been tried** and what it read;
 - a doc comment stating **the specific experiment** that would settle it.
 
-`NewTextureBody::unidentified_flags` and `unidentified_u64` are the templates. This is not a
+`SamplerBody::unidentified_flag_bits` is the template. This is not a
 placeholder to tidy up later — it is the honest encoding of what is known, and it is what stops the
 next reader from re-running an experiment that already failed.
 

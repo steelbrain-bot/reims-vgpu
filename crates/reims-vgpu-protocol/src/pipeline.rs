@@ -187,6 +187,16 @@ impl BlendFactor {
             Self::Src1Color | Self::OneMinusSrc1Color | Self::Src1Alpha | Self::OneMinusSrc1Alpha
         )
     }
+
+    pub const fn uses_blend_constant(self) -> bool {
+        matches!(
+            self,
+            Self::ConstantColor
+                | Self::OneMinusConstantColor
+                | Self::ConstantAlpha
+                | Self::OneMinusConstantAlpha
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -206,7 +216,6 @@ pub struct BlendStateResource {
     pub src_alpha: BlendFactor,
     pub dst_alpha: BlendFactor,
     pub alpha_op: BlendOp,
-    pub constants: [f32; 4],
 }
 
 /// An ordinal outside the corresponding guest API enum.
@@ -445,7 +454,6 @@ pub const fn blend_operation(raw: u32) -> Result<BlendOp, PipelineStateDecodeErr
 
 pub fn blend_state(
     attachment: &crate::resource::PipelineColorAttachment,
-    constants: [f32; 4],
 ) -> Result<BlendStateResource, PipelineStateDecodeError> {
     Ok(BlendStateResource {
         src_color: blend_factor(attachment.src_rgb)?,
@@ -454,7 +462,6 @@ pub fn blend_state(
         src_alpha: blend_factor(attachment.src_alpha)?,
         dst_alpha: blend_factor(attachment.dst_alpha)?,
         alpha_op: blend_operation(attachment.op_alpha)?,
-        constants,
     })
 }
 

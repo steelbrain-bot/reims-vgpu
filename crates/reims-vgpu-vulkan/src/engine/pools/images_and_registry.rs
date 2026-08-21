@@ -1399,7 +1399,10 @@ impl ResourcePools {
         // reclaims and retries on out-of-memory rather than trimming ahead of
         // one. See `recoverable_residents`.
         self.note_registry_reach();
-        let mut usage = super::super::registry_target_usage(format.allocation());
+        let mut usage = super::super::registry_target_usage(
+            format.allocation(),
+            ctx.depth_format_transfer_dst(format.allocation()),
+        );
         if ctx.features.attachment_feedback_loop_layout {
             usage |= vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT;
         }
@@ -1703,12 +1706,16 @@ impl ResourcePools {
         }
         // Census only, as in the primary `registry_ensure`.
         self.note_registry_reach();
-        let usage = super::super::registry_target_usage(format.allocation());
+        let usage = super::super::registry_target_usage(
+            format.allocation(),
+            ctx.depth_format_transfer_dst(format.allocation()),
+        );
         // Reuse a recycled image+memory+view of identical (geometry, format)
         // before allocating — same recycle discipline as the primary
         // `registry_ensure`. Usage is a function of the format
         // (`registry_target_usage`), so images cross-flow between these paths by
-        // geometry+format without a bucket ever mixing usages. Skips the
+        // geometry+format within this device without a bucket ever mixing
+        // usages. Skips the
         // create/alloc/bind/view + their note_create/note_alloc; recycled
         // contents are stale, so the slot below is inserted layout=UNDEFINED /
         // content_ready=false.
@@ -2023,7 +2030,14 @@ impl ResourcePools {
                     .array_layers(1)
                     .samples(super::super::caches::vk_sample_count(sample_count))
                     .tiling(vk::ImageTiling::OPTIMAL)
-                    .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+                    .usage(
+                        vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+                            | if ctx.depth_format_transfer_dst(format) {
+                                vk::ImageUsageFlags::TRANSFER_DST
+                            } else {
+                                vk::ImageUsageFlags::empty()
+                            },
+                    )
                     .initial_layout(vk::ImageLayout::UNDEFINED),
                 None,
             )

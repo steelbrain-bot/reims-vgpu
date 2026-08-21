@@ -45,15 +45,9 @@
 //! unwritten byte is stale ring content. A decoder that loads the final four
 //! bytes as one plane therefore folds rotation and stale data into the plane.
 //!
-//! # What this settles about the descriptor's trailing `u64`
-//!
-//! [`crate::ops::texture::TextureDescriptorBody::unidentified_u64`] has stood
-//! at zero in every capture, and its doc named the IOSurface form as the last
-//! plausible way to move it: a plane index has to live somewhere, and the
-//! descriptor had a spare 64-bit word. It does not live there. Both plane
-//! captures read that word as zero and carry the plane in a field of their own
-//! after the descriptor. The word stays unidentified and the experiment is now
-//! spent rather than pending.
+//! The plane and the descriptor's `protectionOptions` are independent fields.
+//! Plane perturbations move only the two-byte field after the descriptor;
+//! `setProtectionOptions:` moves only the descriptor's trailing `u64`.
 
 use crate::le::{U16le, U32le, U64le};
 use crate::op::Op;
@@ -353,7 +347,7 @@ mod tests {
             assert_eq!(t.desc.texture_type(), 2);
             assert_eq!(t.desc.pixel_format(), 80);
             // The word the plane was hypothesised to live in, and does not.
-            assert_eq!(t.desc.unidentified_u64.get(), 0);
+            assert_eq!(t.desc.protection_options.get(), 0);
         }
     }
 

@@ -100,11 +100,12 @@ pub use released_pages::{ReleasedPages, ReleasedVerdict, RELEASED_PAGE_WATCH_CAP
 pub use render::{
     viewport_slot_count, AttachmentInitial, AttachmentSlot, BlendFactor, BlendOp,
     BlendStateResource, BufferContent, ColorLoadAction, CullMode, DepthClipMode, DepthState,
-    DrawOutput, DrawRequest, FillMode, IndexType, IndexedDrawResource, PreparedRenderProgram,
-    PreparedShaderStage, PrimitiveTopology, SampledByteOrigin, SampledContentIdentity,
-    SampledImageResource, SampledSource, ScissorResource, SecondaryColorTarget, SeedOrder,
-    StencilFaceOps, StencilOp, StencilState, StorageBufferResource, VertexAttributeFormat,
-    VertexAttributeResource, VertexStepFunction, ViewportResource, VisibilityResultMode,
+    DrawOutput, DrawRequest, FillMode, IndexType, IndexedDrawResource, LineWidth,
+    PreparedRenderProgram, PreparedShaderStage, PrimitiveTopology, RenderTargetExtent,
+    SampledByteOrigin, SampledContentIdentity, SampledImageResource, SampledSource,
+    ScissorResource, SecondaryColorTarget, SeedOrder, StencilFaceOps, StencilOp, StencilState,
+    StorageBufferResource, VertexAttributeFormat, VertexAttributeResource, VertexStepFunction,
+    ViewportResource, VisibilityResultMode,
 };
 pub use residency::{
     ComputeResidencyLedger, ComputeResidencyService, ComputeStorageOrigin,

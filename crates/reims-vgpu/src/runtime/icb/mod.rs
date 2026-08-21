@@ -20,9 +20,10 @@
 //! - kernel binds at `kernelBufferBindOffset` (0x14 B: ref@0, va@4, gpuva@0xc)
 //! - dispatch args at `commandArgumentsOffset` (3×u64 grid + 3×u64 tptg)
 //!
-//! Product decode of that buffer → [`fill_compute_command`]. Execute (`0xe4`/
-//! `0xe5`) re-fills from registered command memory when present. Host Metal
-//! fill API remains for tests without guest backing.
+//! [`decode_icb_command_range`] decodes registered command memory into typed
+//! compute or render fills. The render executor replays render fills through
+//! Vulkan. Compute ICB execution remains a typed unsupported operation; the
+//! decoder does not imply that a backend executes every returned command kind.
 
 use crate::runtime::Device;
 use reims_vgpu_core::endian::{ld32, ld64}; // ld64: 0x1d1 gpu_address + dispatch args
@@ -186,6 +187,14 @@ pub struct IcbComputeFill {
     /// `setBarrier` when true, `clearBarrier` when false (wire: u32 at barrierOffset).
     pub barrier: bool,
     pub dispatch: IcbFillDispatch,
+}
+
+/// Which encoder state an indirect command inherits instead of declaring in
+/// its own slot. Inherited and command-local state are exclusive sources.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct IcbInheritance {
+    pipeline_state: bool,
+    buffers: bool,
 }
 
 /// Stage for a render ICB buffer bind (layout table + Metal set*Buffer API).
@@ -379,6 +388,20 @@ pub fn decode_compute_command_slot(
     slot: &[u8],
     max_kernel_binds: u16,
 ) -> Result<Option<IcbComputeFill>, IcbStatus> {
+    decode_compute_command_slot_with_inheritance(
+        layout,
+        slot,
+        max_kernel_binds,
+        IcbInheritance::default(),
+    )
+}
+
+fn decode_compute_command_slot_with_inheritance(
+    layout: &IcbCommandLayout,
+    slot: &[u8],
+    max_kernel_binds: u16,
+    inheritance: IcbInheritance,
+) -> Result<Option<IcbComputeFill>, IcbStatus> {
     let cmd_size = layout.command_size as usize;
     if cmd_size == 0 || slot.len() < cmd_size {
         return Err(IcbStatus::Args("icb_dcs_slot_short"));
@@ -440,9 +463,15 @@ pub fn decode_compute_command_slot(
         }
         pipeline_ref = ld32(&slot[off..]);
     }
+    if pipeline_ref == 0 && !inheritance.pipeline_state {
+        return Err(IcbStatus::Missing("icb_dcs_pipeline_ref_zero"));
+    }
+    if pipeline_ref != 0 && inheritance.pipeline_state {
+        return Err(IcbStatus::Args("icb_dcs_inherited_pipeline_ref_nonzero"));
+    }
 
     let mut buffers = Vec::new();
-    if layout.kernel_buffer_bind_offset != 0 && max_kernel_binds > 0 {
+    if !inheritance.buffers && layout.kernel_buffer_bind_offset != 0 && max_kernel_binds > 0 {
         let base = layout.kernel_buffer_bind_offset as usize;
         for i in 0..max_kernel_binds as usize {
             let off = base + i * ICB_BUFFER_BIND_STRIDE;
@@ -522,6 +551,22 @@ pub fn decode_render_command_slot(
     max_vertex_binds: u16,
     max_fragment_binds: u16,
 ) -> Result<Option<IcbRenderFill>, IcbStatus> {
+    decode_render_command_slot_with_inheritance(
+        layout,
+        slot,
+        max_vertex_binds,
+        max_fragment_binds,
+        IcbInheritance::default(),
+    )
+}
+
+fn decode_render_command_slot_with_inheritance(
+    layout: &IcbCommandLayout,
+    slot: &[u8],
+    max_vertex_binds: u16,
+    max_fragment_binds: u16,
+    inheritance: IcbInheritance,
+) -> Result<Option<IcbRenderFill>, IcbStatus> {
     let cmd_size = layout.command_size as usize;
     if cmd_size == 0 || slot.len() < cmd_size {
         return Err(IcbStatus::Args("icb_drs_slot_short"));
@@ -543,8 +588,11 @@ pub fn decode_render_command_slot(
         }
         pipeline_ref = ld32(&slot[off..]);
     }
-    if pipeline_ref == 0 {
+    if pipeline_ref == 0 && !inheritance.pipeline_state {
         return Err(IcbStatus::Missing("icb_drs_pipeline_ref_zero"));
+    }
+    if pipeline_ref != 0 && inheritance.pipeline_state {
+        return Err(IcbStatus::Args("icb_drs_inherited_pipeline_ref_nonzero"));
     }
 
     let tessellation_factor = read_tessellation_factor(layout, slot);
@@ -589,39 +637,41 @@ pub fn decode_render_command_slot(
             });
         }
     };
-    push_binds(
-        &mut buffers,
-        layout.vertex_buffer_bind_offset,
-        u32::from(max_vertex_binds),
-        IcbRenderBindStage::Vertex,
-    );
-    push_binds(
-        &mut buffers,
-        layout.fragment_buffer_bind_offset,
-        u32::from(max_fragment_binds),
-        IcbRenderBindStage::Fragment,
-    );
-    // Object/mesh bind table sizes from layout offsets (setupCommandLayout order).
-    let max_object = icb_layout_stage_bind_count(
-        layout.object_buffer_bind_offset,
-        layout.mesh_buffer_bind_offset,
-    );
-    let max_mesh = icb_layout_stage_bind_count(
-        layout.mesh_buffer_bind_offset,
-        layout.kernel_buffer_bind_offset,
-    );
-    push_binds(
-        &mut buffers,
-        layout.object_buffer_bind_offset,
-        max_object,
-        IcbRenderBindStage::Object,
-    );
-    push_binds(
-        &mut buffers,
-        layout.mesh_buffer_bind_offset,
-        max_mesh,
-        IcbRenderBindStage::Mesh,
-    );
+    if !inheritance.buffers {
+        push_binds(
+            &mut buffers,
+            layout.vertex_buffer_bind_offset,
+            u32::from(max_vertex_binds),
+            IcbRenderBindStage::Vertex,
+        );
+        push_binds(
+            &mut buffers,
+            layout.fragment_buffer_bind_offset,
+            u32::from(max_fragment_binds),
+            IcbRenderBindStage::Fragment,
+        );
+        // Object/mesh bind table sizes from layout offsets (setupCommandLayout order).
+        let max_object = icb_layout_stage_bind_count(
+            layout.object_buffer_bind_offset,
+            layout.mesh_buffer_bind_offset,
+        );
+        let max_mesh = icb_layout_stage_bind_count(
+            layout.mesh_buffer_bind_offset,
+            layout.kernel_buffer_bind_offset,
+        );
+        push_binds(
+            &mut buffers,
+            layout.object_buffer_bind_offset,
+            max_object,
+            IcbRenderBindStage::Object,
+        );
+        push_binds(
+            &mut buffers,
+            layout.mesh_buffer_bind_offset,
+            max_mesh,
+            IcbRenderBindStage::Mesh,
+        );
+    }
 
     let args = layout.command_arguments_offset as usize;
     let draw = match cmd_type {
@@ -1298,63 +1348,8 @@ pub fn decode_icb_host_resource_info(bytes: &[u8]) -> Result<IcbHostResourceInfo
 }
 
 /// The check [`decode_icb_command_range`] fails when an ICB has no command
-/// memory bound, named here because [`icb_fill_outcome`] compares against it.
-///
-/// Spelled once so the raise site and the arm that classifies it cannot drift:
-/// a literal in both places reads as two independent facts, and a rename of one
-/// silently turns the classification into a forward.
+/// memory bound.
 pub const ICB_FILL_NO_COMMAND_MEMORY: &str = "icb_fill_no_command_memory";
-
-/// What an ICB execute does with the outcome of filling its slots from the
-/// guest's command memory, decided once for every pathway.
-///
-/// # Why this is not spelled at the call sites
-///
-/// A wildcard over `IcbStatus::Missing` is incorrect because
-/// [`decode_icb_command_range`] raises that class under two different slugs and
-/// only the missing-command-memory case is recoverable.
-///
-/// # What each outcome means
-///
-/// - `Ok(())` — slots were filled from guest memory and the execute replays
-///   the guest's own commands.
-/// - [`ICB_FILL_NO_COMMAND_MEMORY`] — the ICB is registered but nothing bound
-///   the buffer holding its command slots, so the execute runs an ICB with no
-///   commands in it and **every command the guest encoded into it is lost**.
-///   Control flow is unchanged — an empty execute is a no-op, and refusing here
-///   would additionally skip the attachment writeback the caller does after —
-///   but the loss is now counted and fail-visible instead of being swallowed as
-///   an "empty shell" case. That phrase came from a reading in which opcode
-///   `0x1d1` bound command memory; it is an info query, and since it stopped
-///   being treated as a bind **no decode path binds command memory at all**
-///   ([`bind_icb_command_memory`]'s only caller is
-///   [`associate_icb_backing_buffer_ref`], which nothing outside tests calls).
-///   So this is not a rare shape — it is what every ICB execute meets today,
-///   and a counter reading zero here means no guest reached the rail rather
-///   than that the rail worked.
-/// - anything else — forwarded to the caller, which declines by the slug of the
-///   check that refused. `icb_fill_not_cached` reaches this arm and is
-///   unreachable in practice: both call sites run [`resolve_icb_record`] first,
-///   and [`resolve_icb_record`] inserts a record for every ref it is asked
-///   about. It forwards rather than being swallowed because a fill against an
-///   ICB the registry has never seen is a different loss from an empty one.
-pub fn icb_fill_outcome(
-    outcome: Result<(), IcbStatus>,
-    task_id: u32,
-    icb_ref: u32,
-) -> Result<(), IcbStatus> {
-    match outcome {
-        Err(IcbStatus::Missing(slug)) if slug == ICB_FILL_NO_COMMAND_MEMORY => {
-            crate::runtime::drain::note_store_route("icb_executed_without_command_memory");
-            crate::observe::Emit::decline("icb_execute_empty", &IcbStatus::Missing(slug))
-                .field("task", task_id)
-                .field("icb", icb_ref)
-                .fail_once(u64::from(icb_ref));
-            Ok(())
-        }
-        other => other,
-    }
-}
 
 /// Register guest command-memory GVA for an ICB (backing buffer for CPU fills).
 ///
@@ -1377,64 +1372,14 @@ pub fn bind_icb_command_memory(
         .ok_or(IcbStatus::Missing("icb_bind_memory_not_cached"))
 }
 
-/// Associate ICB command memory from a type-1 buffer object-list ref (sync path).
-///
-/// Resolves buffer GVA/size via the type-1 descriptor (`handle << PAGE_SHIFT`).
-/// Byte length is min(buffer size, command_size × max_command_count) from the
-/// ICB create layout so oversize type-1 allocations are truncated to the ICB.
-pub fn associate_icb_backing_buffer_ref<M: HostMemory + HostOps>(
-    state: &Device,
-    host: &M,
-    task_id: u32,
-    icb_ref: u32,
-    buffer_ref: u32,
-) -> Result<IcbCommandMemory, IcbStatus> {
-    if icb_ref == 0 || buffer_ref == 0 {
-        return Err(IcbStatus::Args("icb_associate_ref_zero"));
-    }
-    // Record the ICB create layout if it is not already recorded. This used
-    // to materialize the host `MTLIndirectCommandBuffer` as a side effect, which
-    // is why associating a backing buffer refused outright on the Vulkan arm —
-    // the association is guest bookkeeping and needs no host object at all.
-    let desc = resolve_icb_record(state, host, task_id, icb_ref)?;
-    let (gva, buf_size) = type1_buffer_gva_size(state, host, task_id, buffer_ref)?;
-    let need = (desc.layout.command_size as u64).saturating_mul(desc.max_command_count as u64);
-    if need == 0 {
-        return Err(IcbStatus::Args("icb_associate_zero_layout_span"));
-    }
-    if buf_size < need {
-        return Err(IcbStatus::Args("icb_associate_buffer_too_small"));
-    }
-    let mem = IcbCommandMemory {
-        gva,
-        byte_len: need,
-    };
-    bind_icb_command_memory(state, task_id, icb_ref, mem)?;
-    Ok(mem)
-}
-
 /// Refuse info-segment `0x1d1` (`icbHostResourceInfo:info:`) by name.
 ///
-/// **This record is a question, and this device has no answer for it.** The
-/// selector's type encoding is `v32@0:8@16^{?=QQ}24`, so `info:` is a pointer to
-/// two `u64` out-parameters: the guest names an ICB and a place to write two
-/// words, and waits. Nothing here writes them — see
-/// [`INFO_OP_ICB_HOST_RESOURCE`] for the full derivation and
-/// [`reims_vgpu_wire::ops::info`] for the fixtures that settle it.
-///
-/// It used to read the reply pair as an answer instead of a question, and that
-/// was worse than refusing. `reply_buffer_ref` went to
-/// [`associate_icb_backing_buffer_ref`] as the ICB's command backing and
-/// `reply_offset` became a command-memory GVA — so a guest whose scratch
-/// allocator happened to return a resolvable type-1 ref would have had *its own
-/// reply staging area* bound as an ICB's command slots, and the next
-/// `executeCommandsInBuffer:` would decode whatever sat there and run it as
-/// draws. A refusal loses the guest's query; that lost the query and then
-/// executed guest scratch as geometry.
-///
-/// What it would take to answer: the two words are unattributed. Nothing in the
-/// captured fixtures varies them, because in a capture the stream *is* the
-/// oracle. `runtime::heap_query` shows the shape a real reply takes.
+/// This record is a query, not a backing association. It names an ICB, a reply
+/// buffer, and a byte offset at which the host must write two `u64` result
+/// words. Their semantics are not yet established, so manufacturing an answer
+/// or treating the reply destination as command memory would violate the wire
+/// contract. `runtime::heap_query` shows the shape a real reply takes once the
+/// two result words are known.
 pub fn apply_icb_host_resource_info<M: HostMemory + HostOps>(
     _state: &Device,
     _host: &M,
@@ -1685,80 +1630,131 @@ pub fn decode_icb_command_range<M: HostMemory + HostOps>(
     };
     use crate::runtime::gva_mem;
 
-    let (layout, max_kernel, max_vertex, max_fragment, command_types, max_cmds, mem) = {
+    let (layout, max_kernel, max_vertex, max_fragment, inheritance, command_types, max_cmds, mem) = {
         let rec = state
             .task_objects
             .indirect_command_buffers
             .snapshot(task_id, icb_ref)
             .ok_or(IcbStatus::Missing("icb_fill_not_cached"))?;
-        let mem = rec
-            .command_memory
-            .ok_or(IcbStatus::Missing(ICB_FILL_NO_COMMAND_MEMORY))?;
         (
             rec.descriptor.layout,
             rec.descriptor.max_kernel_buffer_bind_count,
             rec.descriptor.max_vertex_buffer_bind_count,
             rec.descriptor.max_fragment_buffer_bind_count,
+            IcbInheritance {
+                pipeline_state: rec.descriptor.inherit_pipeline_state(),
+                buffers: rec.descriptor.inherit_buffers(),
+            },
             rec.descriptor.command_types,
             rec.descriptor.max_command_count as u64,
-            mem,
+            rec.command_memory,
         )
     };
     if layout.command_size == 0 {
         return Err(IcbStatus::Args("icb_fill_zero_command_size"));
     }
-    let end = range_location.saturating_add(range_length);
+    let end = range_location
+        .checked_add(range_length)
+        .ok_or(IcbStatus::Args("icb_fill_range_overflow"))?;
     if end > max_cmds {
         return Err(IcbStatus::Args("icb_fill_range_past_capacity"));
     }
-    let need = end.saturating_mul(layout.command_size as u64);
-    if need > mem.byte_len {
+    // An empty execute range is a true no-op. It neither resolves nor reads
+    // command backing, but its location still belongs to the declared ICB
+    // range and was validated above.
+    if range_length == 0 {
+        return Ok(Vec::new());
+    }
+    let mem = mem.ok_or(IcbStatus::Missing(ICB_FILL_NO_COMMAND_MEMORY))?;
+    let command_size = u64::from(layout.command_size);
+    let byte_start = range_location
+        .checked_mul(command_size)
+        .ok_or(IcbStatus::Args("icb_fill_range_byte_start_overflow"))?;
+    let byte_end = end
+        .checked_mul(command_size)
+        .ok_or(IcbStatus::Args("icb_fill_range_byte_end_overflow"))?;
+    if byte_end > mem.byte_len {
         return Err(IcbStatus::Args("icb_fill_range_past_memory"));
     }
-    let mut bytes = vec![0u8; need as usize];
+    let byte_len = byte_end - byte_start;
+    let host_len = usize::try_from(byte_len)
+        .map_err(|_| IcbStatus::Args("icb_fill_range_host_size_overflow"))?;
+    let read_gva = mem
+        .gva
+        .checked_add(byte_start)
+        .ok_or(IcbStatus::Args("icb_fill_range_gva_overflow"))?;
+    let mut bytes = vec![0u8; host_len];
     gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,
         task_id,
-        mem.gva,
+        read_gva,
         &mut bytes,
         state.page_shift,
     )
     .map_err(|_| IcbStatus::BackendFailed("icb_fill_command_memory_read"))?;
 
-    let is_compute = command_types
+    let mut out = Vec::new();
+    // Concurrent-dispatch capability selects the compute command domain. A
+    // descriptor may retain render bits and still construct, but its render
+    // command setters are not valid; the extra bits do not make the backing
+    // heterogeneous.
+    let compute_command_domain = command_types
         & (MTL_INDIRECT_CMD_CONCURRENT_DISPATCH | MTL_INDIRECT_CMD_CONCURRENT_DISPATCH_THREADS)
         != 0;
-    let is_render = command_types
-        & (MTL_INDIRECT_CMD_DRAW
+    for (local_index, i) in (range_location..end).enumerate() {
+        let off = local_index * (layout.command_size as usize);
+        let slot = &bytes[off..off + layout.command_size as usize];
+        let type_offset = layout.command_type_offset as usize;
+        if type_offset + 4 > slot.len() {
+            return Err(IcbStatus::Args("icb_fill_command_type_offset_oob"));
+        }
+        let command_type = ld32(&slot[type_offset..]);
+        if command_type == 0 {
+            continue;
+        }
+        if command_types & command_type == 0 {
+            return Err(IcbStatus::Args("icb_fill_command_type_not_declared"));
+        }
+        match command_type {
+            MTL_INDIRECT_CMD_CONCURRENT_DISPATCH | MTL_INDIRECT_CMD_CONCURRENT_DISPATCH_THREADS => {
+                let Some(mut fill) = decode_compute_command_slot_with_inheritance(
+                    &layout,
+                    slot,
+                    max_kernel,
+                    inheritance,
+                )?
+                else {
+                    continue;
+                };
+                fill.command_index = i as u32;
+                resolve_compute_fill_offsets(state, host, task_id, &mut fill)?;
+                out.push(IcbCommandFill::Compute(fill));
+            }
+            MTL_INDIRECT_CMD_DRAW
             | MTL_INDIRECT_CMD_DRAW_INDEXED
             | MTL_INDIRECT_CMD_DRAW_PATCHES
             | MTL_INDIRECT_CMD_DRAW_INDEXED_PATCHES
             | MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS
-            | MTL_INDIRECT_CMD_DRAW_MESH_THREADS)
-        != 0;
-
-    let mut out = Vec::new();
-    for i in range_location..end {
-        let off = (i as usize) * (layout.command_size as usize);
-        let slot = &bytes[off..off + layout.command_size as usize];
-        if is_compute || !is_render {
-            // Prefer compute when ConcurrentDispatch bits are set; empty slots skip.
-            if let Some(mut fill) = decode_compute_command_slot(&layout, slot, max_kernel)? {
-                fill.command_index = i as u32;
-                resolve_compute_fill_offsets(state, host, task_id, &mut fill)?;
-                out.push(IcbCommandFill::Compute(fill));
-                continue;
-            }
-        }
-        if is_render {
-            if let Some(mut fill) =
-                decode_render_command_slot(&layout, slot, max_vertex, max_fragment)?
-            {
+            | MTL_INDIRECT_CMD_DRAW_MESH_THREADS => {
+                if compute_command_domain {
+                    return Err(IcbStatus::Args("icb_fill_render_command_in_compute_domain"));
+                }
+                let Some(mut fill) = decode_render_command_slot_with_inheritance(
+                    &layout,
+                    slot,
+                    max_vertex,
+                    max_fragment,
+                    inheritance,
+                )?
+                else {
+                    continue;
+                };
                 fill.command_index = i as u32;
                 resolve_render_fill_offsets(state, host, task_id, &mut fill)?;
                 out.push(IcbCommandFill::Render(fill));
             }
+            _ => return Err(IcbStatus::Args("icb_fill_unknown_command_type")),
         }
     }
     Ok(out)

@@ -356,6 +356,17 @@ pub struct DeviceFeatures {
     /// pipeline invalid. Same shape as [`Self::dual_src_blend`] — optional
     /// core, asked rather than assumed, declined by name where absent.
     pub fill_mode_non_solid: bool,
+    /// `VkPhysicalDeviceFeatures::wideLines`, needed whenever line-rasterized
+    /// geometry asks for a width other than 1.0.
+    pub wide_lines: bool,
+    /// Inclusive `VkPhysicalDeviceLimits::lineWidthRange`.
+    pub line_width_range: [f32; 2],
+    /// `VkPhysicalDeviceLimits::lineWidthGranularity`, retained for capability
+    /// reporting and diagnostics.
+    pub line_width_granularity: f32,
+    /// `VkPhysicalDeviceFeatures::depthBiasClamp`, required only when the
+    /// guest supplies a nonzero clamp term.
+    pub depth_bias_clamp: bool,
     /// `VkPhysicalDeviceFeatures::depthClamp` — whether a pipeline may set
     /// `depthClampEnable`.
     ///
@@ -452,6 +463,8 @@ impl DeviceFeatures {
             .shader_storage_image_read_without_format(self.storage_image_read_without_format)
             .dual_src_blend(self.dual_src_blend)
             .fill_mode_non_solid(self.fill_mode_non_solid)
+            .wide_lines(self.wide_lines)
+            .depth_bias_clamp(self.depth_bias_clamp)
             .depth_clamp(self.depth_clamp)
             .multi_viewport(self.multi_viewport)
             .occlusion_query_precise(self.occlusion_query_precise)
@@ -592,6 +605,10 @@ impl DeviceFeatures {
             image_drm_format_modifier,
             dual_src_blend,
             fill_mode_non_solid,
+            wide_lines,
+            line_width_range,
+            line_width_granularity,
+            depth_bias_clamp,
             depth_clamp,
             multi_viewport,
             max_viewports,
@@ -640,6 +657,9 @@ impl DeviceFeatures {
              null_descriptor={null_descriptor} \
              mirror_clamp_to_edge={mirror_clamp_to_edge:?} \
              dual_src_blend={dual_src_blend} fill_mode_non_solid={fill_mode_non_solid} \
+             wide_lines={wide_lines} line_width_range={line_width_range:?} \
+             line_width_granularity={line_width_granularity} \
+             depth_bias_clamp={depth_bias_clamp} \
              depth_clamp={depth_clamp} multi_viewport={multi_viewport} max_viewports={max_viewports} \
              occlusion_query_precise={occlusion_query_precise}",
             missing(sampled_linear_filter),
@@ -845,6 +865,10 @@ pub unsafe fn query(
         sampler_anisotropy: supported.sampler_anisotropy == vk::TRUE,
         dual_src_blend: supported.dual_src_blend == vk::TRUE,
         fill_mode_non_solid: supported.fill_mode_non_solid == vk::TRUE,
+        wide_lines: supported.wide_lines == vk::TRUE,
+        line_width_range: props.limits.line_width_range,
+        line_width_granularity: props.limits.line_width_granularity,
+        depth_bias_clamp: supported.depth_bias_clamp == vk::TRUE,
         depth_clamp: supported.depth_clamp == vk::TRUE,
         multi_viewport: supported.multi_viewport == vk::TRUE,
         occlusion_query_precise: supported.occlusion_query_precise == vk::TRUE,
@@ -951,6 +975,10 @@ mod tests {
             image_drm_format_modifier: true,
             dual_src_blend: true,
             fill_mode_non_solid: true,
+            wide_lines: true,
+            line_width_range: [1.0, 64.0],
+            line_width_granularity: 1.0,
+            depth_bias_clamp: true,
             depth_clamp: true,
             multi_viewport: true,
             max_viewports: 16,
@@ -995,17 +1023,25 @@ mod tests {
     fn the_raster_features_are_enabled_only_where_the_device_advertises_them() {
         let all = all_supported().enabled_features();
         assert_eq!(all.fill_mode_non_solid, vk::TRUE);
+        assert_eq!(all.wide_lines, vk::TRUE);
+        assert_eq!(all.depth_bias_clamp, vk::TRUE);
         assert_eq!(all.depth_clamp, vk::TRUE);
         let without = DeviceFeatures {
             fill_mode_non_solid: false,
+            wide_lines: false,
+            depth_bias_clamp: false,
             depth_clamp: false,
             ..all_supported()
         }
         .enabled_features();
         assert_eq!(without.fill_mode_non_solid, vk::FALSE);
+        assert_eq!(without.wide_lines, vk::FALSE);
+        assert_eq!(without.depth_bias_clamp, vk::FALSE);
         assert_eq!(without.depth_clamp, vk::FALSE);
         // Never claimed without a query, the same way `dual_src_blend` is not.
         assert!(!DeviceFeatures::default().fill_mode_non_solid);
+        assert!(!DeviceFeatures::default().wide_lines);
+        assert!(!DeviceFeatures::default().depth_bias_clamp);
         assert!(!DeviceFeatures::default().depth_clamp);
     }
 

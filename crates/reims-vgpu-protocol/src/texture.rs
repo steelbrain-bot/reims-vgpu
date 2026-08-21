@@ -12,13 +12,17 @@ use reims_vgpu_wire::WireError;
 
 /// Complete texture declaration after wire-format decoding.
 ///
-/// Narrow and wide serializer forms converge here. Fields whose public source
-/// property is not established stay explicitly unidentified; downstream code
-/// must not assign behavior to them from a plausible value.
+/// Narrow and wide serializer forms converge here. Optional fields preserve
+/// whether a form actually encoded the value; downstream code must not turn an
+/// absent field into a false declaration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TextureDeclaration {
     pub texture_type: u8,
-    pub unidentified_flags: u8,
+    pub framebuffer_only: bool,
+    pub is_drawable: bool,
+    /// Present only in the wide declaration. The narrow form leaves the same
+    /// bit unwritten, so it cannot be projected as `false` there.
+    pub write_swizzle_enabled: Option<bool>,
     pub allow_gpu_optimized_contents: bool,
     pub usage: u32,
     pub pixel_format: u16,
@@ -29,7 +33,7 @@ pub struct TextureDeclaration {
     pub sample_count: u16,
     pub array_length: u16,
     pub resource_options: u16,
-    pub unidentified_u64: u64,
+    pub protection_options: u64,
     /// Absent from the narrow declaration; present even when the wide form
     /// carries the identity swizzle.
     pub swizzle: Option<[u8; 4]>,
@@ -118,7 +122,9 @@ pub enum MapperIOSurfaceTextureDecodeError {
 pub fn texture_declaration_from_narrow(d: &TextureDescriptorBody) -> TextureDeclaration {
     TextureDeclaration {
         texture_type: d.texture_type(),
-        unidentified_flags: d.unidentified_flags(),
+        framebuffer_only: d.framebuffer_only(),
+        is_drawable: d.is_drawable(),
+        write_swizzle_enabled: None,
         allow_gpu_optimized_contents: d.allow_gpu_optimized_contents(),
         usage: u32::from(d.usage()),
         pixel_format: d.pixel_format(),
@@ -129,7 +135,7 @@ pub fn texture_declaration_from_narrow(d: &TextureDescriptorBody) -> TextureDecl
         sample_count: d.sample_count.get(),
         array_length: d.array_length.get(),
         resource_options: d.resource_options.get(),
-        unidentified_u64: d.unidentified_u64.get(),
+        protection_options: d.protection_options.get(),
         swizzle: None,
     }
 }
@@ -138,7 +144,9 @@ pub fn texture_declaration_from_narrow(d: &TextureDescriptorBody) -> TextureDecl
 pub fn texture_declaration_from_wide(d: &WideTextureDescriptorBody) -> TextureDeclaration {
     TextureDeclaration {
         texture_type: d.texture_type(),
-        unidentified_flags: d.unidentified_flags(),
+        framebuffer_only: d.framebuffer_only(),
+        is_drawable: d.is_drawable(),
+        write_swizzle_enabled: Some(d.write_swizzle_enabled()),
         allow_gpu_optimized_contents: d.allow_gpu_optimized_contents(),
         usage: d.usage.get(),
         pixel_format: d.pixel_format.get(),
@@ -149,7 +157,7 @@ pub fn texture_declaration_from_wide(d: &WideTextureDescriptorBody) -> TextureDe
         sample_count: d.sample_count.get(),
         array_length: d.array_length.get(),
         resource_options: d.resource_options.get(),
-        unidentified_u64: d.unidentified_u64.get(),
+        protection_options: d.protection_options.get(),
         swizzle: Some([
             d.swizzle_red,
             d.swizzle_green,
@@ -261,7 +269,8 @@ mod tests {
             (legacy.declaration.width, legacy.declaration.height),
             (640, 480)
         );
-        assert_eq!(legacy.declaration.unidentified_u64, 0x8877_6655_4433_2211);
+        assert_eq!(legacy.declaration.write_swizzle_enabled, None);
+        assert_eq!(legacy.declaration.protection_options, 0x8877_6655_4433_2211);
 
         let rotated = decode_mapper_iosurface_texture_view(&narrow(0x2f, 3, 0xee)).unwrap();
         assert_eq!(rotated.rotation, Some(TextureRotation::new(3)));
@@ -275,7 +284,7 @@ mod tests {
         put_u32(&mut bytes, 8, 0x39);
         put_u32(&mut bytes, 12, 0x38);
         put_u32(&mut bytes, 16, 19);
-        bytes[20] = 0x42;
+        bytes[20] = 0xc2;
         put_u16(&mut bytes, 21, 0x73);
         put_u32(&mut bytes, 23, 0x102);
         put_u32(&mut bytes, 27, 1920);
@@ -297,6 +306,8 @@ mod tests {
         assert_eq!(view.plane.get(), 0x1234);
         assert_eq!(view.rotation, Some(TextureRotation::new(5)));
         assert_eq!(view.declaration.swizzle, Some([1, 2, 3, 4]));
+        assert_eq!(view.declaration.write_swizzle_enabled, Some(true));
+        assert_eq!(view.declaration.protection_options, 0x1234_5678_9abc_def0);
     }
 
     #[test]

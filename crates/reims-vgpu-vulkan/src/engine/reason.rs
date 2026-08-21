@@ -123,6 +123,12 @@ pub enum DrawReason {
         depth: bool,
         color_input: bool,
     },
+    /// Metal clears a depth attachment over its complete image even when a
+    /// smaller attachment constrains rasterization, but this Vulkan format
+    /// cannot be a transfer destination for the required pre-pass clear.
+    AttachmentWideDepthClearUnsupported {
+        format: i32,
+    },
     /// Same for a zero-copy guest-run sampled bind.
     GuestRunSampledNot2d {
         binding: u32,
@@ -188,6 +194,29 @@ pub enum DrawReason {
     /// [`Self::DualSourceBlendUnsupported`]: optional core feature, asked for
     /// at device creation, declined by name where the host says no.
     FillModeNonSolidUnsupported,
+    /// Line-rasterized geometry asks for a width other than 1.0 on a device
+    /// that does not advertise `wideLines`.
+    WideLinesUnsupported {
+        requested_bits: u32,
+    },
+    /// A finite or positive-infinite line width lies outside the inclusive
+    /// range reported by the physical device.
+    LineWidthOutOfRange {
+        requested_bits: u32,
+        min_bits: u32,
+        max_bits: u32,
+    },
+    /// A depth-bias component is non-finite and cannot be passed to Vulkan
+    /// without undefined rasterization.
+    DepthBiasNonFinite {
+        component: u8,
+        value_bits: u32,
+    },
+    /// The guest supplied a nonzero clamp but the device did not advertise
+    /// `depthBiasClamp`.
+    DepthBiasClampUnsupported {
+        clamp_bits: u32,
+    },
     /// The guest asked for `MTLDepthClipModeClamp` and this device does not
     /// advertise `VkPhysicalDeviceFeatures::depthClamp`, so no pipeline on it
     /// can set `depthClampEnable`.
@@ -359,6 +388,9 @@ impl reims_vgpu_observe::Decline for DrawReason {
             Self::MultisampleResolveShapeUnsupported { .. } => {
                 "multisample_resolve_shape_unsupported"
             }
+            Self::AttachmentWideDepthClearUnsupported { .. } => {
+                "attachment_wide_depth_clear_unsupported"
+            }
             Self::SamplerAnisotropyUnsupported => "sampler_anisotropy_unsupported",
             Self::SamplerMirrorClampToEdgeUnsupported => "sampler_mirror_clamp_to_edge_unsupported",
             Self::SamplerPixelMixedFilters => "sampler_pixel_mixed_filters",
@@ -368,6 +400,10 @@ impl reims_vgpu_observe::Decline for DrawReason {
             Self::SamplerUnnormalizedCompare => "sampler_unnormalized_compare",
             Self::DualSourceBlendUnsupported => "dual_source_blend_unsupported",
             Self::FillModeNonSolidUnsupported => "fill_mode_non_solid_unsupported",
+            Self::WideLinesUnsupported { .. } => "wide_lines_unsupported",
+            Self::LineWidthOutOfRange { .. } => "line_width_out_of_range",
+            Self::DepthBiasNonFinite { .. } => "depth_bias_non_finite",
+            Self::DepthBiasClampUnsupported { .. } => "depth_bias_clamp_unsupported",
             Self::DepthClampUnsupported => "depth_clamp_unsupported",
             // Deliberately delegates: the translation layer already named the
             // exact format problem, and inventing a second slug here would make
@@ -464,12 +500,40 @@ impl std::fmt::Display for DrawReason {
                 u8::from(*depth),
                 u8::from(*color_input)
             ),
+            Self::AttachmentWideDepthClearUnsupported { format } => {
+                write!(f, " format={format}")
+            }
             Self::ColorAttachmentFormat(reason) | Self::VertexFormat(reason) => {
                 write!(f, " value={}", reason.value())
             }
             Self::InstanceRateDivisorUnsupported { step_rate } => write!(f, " rate={step_rate}"),
             Self::InstanceRateDivisorOverLimit { step_rate, limit } => {
                 write!(f, " rate={step_rate} limit={limit}")
+            }
+            Self::WideLinesUnsupported { requested_bits } => {
+                write!(f, " requested={}", f32::from_bits(*requested_bits))
+            }
+            Self::LineWidthOutOfRange {
+                requested_bits,
+                min_bits,
+                max_bits,
+            } => write!(
+                f,
+                " requested={} min={} max={}",
+                f32::from_bits(*requested_bits),
+                f32::from_bits(*min_bits),
+                f32::from_bits(*max_bits)
+            ),
+            Self::DepthBiasNonFinite {
+                component,
+                value_bits,
+            } => write!(
+                f,
+                " component={component} value={}",
+                f32::from_bits(*value_bits)
+            ),
+            Self::DepthBiasClampUnsupported { clamp_bits } => {
+                write!(f, " clamp={}", f32::from_bits(*clamp_bits))
             }
             Self::NoHostVisibleMemoryForStaging { memory_type_bits }
             | Self::NoHostVisibleMemoryForReadback { memory_type_bits }
@@ -699,6 +763,7 @@ mod tests {
             second_type: 1,
             second_count: 2,
         },
+        DrawReason::AttachmentWideDepthClearUnsupported { format: 126 },
         DrawReason::NoHostVisibleMemoryForStaging {
             memory_type_bits: 0,
         },
@@ -727,6 +792,21 @@ mod tests {
         DrawReason::SwapchainNoCompositeAlpha,
         DrawReason::DualSourceBlendUnsupported,
         DrawReason::FillModeNonSolidUnsupported,
+        DrawReason::WideLinesUnsupported {
+            requested_bits: 2.0f32.to_bits(),
+        },
+        DrawReason::LineWidthOutOfRange {
+            requested_bits: 65.0f32.to_bits(),
+            min_bits: 1.0f32.to_bits(),
+            max_bits: 64.0f32.to_bits(),
+        },
+        DrawReason::DepthBiasNonFinite {
+            component: 0,
+            value_bits: f32::NAN.to_bits(),
+        },
+        DrawReason::DepthBiasClampUnsupported {
+            clamp_bits: 1.0f32.to_bits(),
+        },
         DrawReason::DepthClampUnsupported,
     ];
 

@@ -1214,8 +1214,8 @@ fn the_pass_extent_census_scores_a_fraction_and_clamps_it() {
         "960x540 of 1920x1080 is 25%"
     );
 
-    // A pass stating more than the attachment holds. Metal permits it and
-    // the rasteriser clips, so this reads full rather than over 100%.
+    // The instrument clamps a malformed over-attachment reading to its top
+    // band. Product execution refuses this shape before it reaches a backend.
     let before = store_route_count("pass_extent_full");
     note_pass_extent_coverage(4096, 4096, 1920, 1080);
     assert_eq!(store_route_count("pass_extent_full"), before + 1);
@@ -1232,6 +1232,22 @@ fn the_pass_extent_census_scores_a_fraction_and_clamps_it() {
             .map(|s| store_route_count(s))
             .sum::<u64>(),
         before
+    );
+}
+
+#[test]
+fn pass_extent_zero_is_per_axis_default_and_large_values_refuse() {
+    let extent = render_target_extent(0, 4).expect("representable extent");
+    assert_eq!(extent.width, None);
+    assert_eq!(extent.height.map(std::num::NonZeroU32::get), Some(4));
+
+    let error = render_target_extent(u64::from(u32::MAX) + 1, 0)
+        .expect_err("the semantic image geometry is u32");
+    assert_eq!(error.axis, "width");
+    assert_eq!(error.raw, u64::from(u32::MAX) + 1);
+    assert_eq!(
+        crate::observe::Decline::slug(&error),
+        "render_target_extent_unrepresentable"
     );
 }
 
@@ -2228,7 +2244,8 @@ fn finish_stream_with_draws_skips_guest_clear_prelude() {
     acc.clears.push(att);
     acc.saw_draw = true;
     acc.color_slots.push((0, att));
-    acc.draws.push(PendingDraw {
+    acc.push_draw(PendingDraw {
+        icb_ref: None,
         visibility: None,
         pipeline_ref: 1,
         draw: DrawArgs {
@@ -2254,9 +2271,11 @@ fn finish_stream_with_draws_skips_guest_clear_prelude() {
         viewports: Vec::new(),
         scissors: Vec::new(),
         blend_color: None,
+        render_target_extent: Default::default(),
         cull_mode: reims_vgpu_protocol::CullMode::None,
         front_face_ccw: false,
         fill_mode: reims_vgpu_protocol::FillMode::Fill,
+        line_width: reims_vgpu_core::LineWidth::ONE,
         depth_clip_mode: reims_vgpu_protocol::DepthClipMode::Clip,
         depth_bias: None,
         depth_stencil_ref: 0,
@@ -2336,7 +2355,8 @@ fn backend_unavailable_draw_falls_back_to_surface_backing_clear() {
     acc.clears.push(att);
     acc.saw_draw = true;
     acc.color_slots.push((0, att));
-    acc.draws.push(PendingDraw {
+    acc.push_draw(PendingDraw {
+        icb_ref: None,
         visibility: None,
         pipeline_ref: 7,
         draw: DrawArgs {
@@ -2362,9 +2382,11 @@ fn backend_unavailable_draw_falls_back_to_surface_backing_clear() {
         viewports: Vec::new(),
         scissors: Vec::new(),
         blend_color: None,
+        render_target_extent: Default::default(),
         cull_mode: reims_vgpu_protocol::CullMode::None,
         front_face_ccw: false,
         fill_mode: reims_vgpu_protocol::FillMode::Fill,
+        line_width: reims_vgpu_core::LineWidth::ONE,
         depth_clip_mode: reims_vgpu_protocol::DepthClipMode::Clip,
         depth_bias: None,
         depth_stencil_ref: 0,
@@ -2374,7 +2396,7 @@ fn backend_unavailable_draw_falls_back_to_surface_backing_clear() {
     });
     let mut second = acc.draws[0].clone();
     second.pipeline_ref = 8;
-    acc.draws.push(second);
+    acc.push_draw(second);
     finish_stream(&mut state, &mut host, 1, &mut out, &acc);
     assert_eq!(
         out.render_attachment_resolves, 1,
@@ -3739,61 +3761,218 @@ fn every_icb_execute_in_a_stream_is_kept_in_order() {
     );
     assert_eq!(acc.execute_icb[2].range_location, 0x1100);
     assert_eq!(acc.execute_icb[2].range_length, 0x2200);
+    assert_eq!(
+        acc.render_work,
+        [
+            RenderWork::ExecuteIcb(0),
+            RenderWork::ExecuteIcb(1),
+            RenderWork::ExecuteIcb(2),
+        ],
+        "the typed payload store must not become a second ordering authority"
+    );
 }
 
-/// The pass opens once, so only the first execute in it may clear.
-///
-/// Each ICB execute opens its own host pass over the same attachments. Leaving
-/// the stream's `CLEAR` on the later ones re-runs the clear inside what Metal
-/// treats as one pass, wiping whatever the execute before it drew — the same
-/// failure the multi-draw chain describes at `di > 0` and forces `LOAD` for.
 #[test]
-fn a_later_icb_execute_opens_its_pass_with_load() {
-    let slots = vec![
-        (
-            0u32,
-            ColorAttachment {
-                texture_ref: 11,
-                load_action: MTL_LOAD_ACTION_CLEAR,
-                store_action: MTL_STORE_ACTION_STORE,
-                clear_color: [0.25, 0.5, 0.75, 1.0],
-                ..Default::default()
+fn icb_replay_uses_the_declared_inheritance_and_keeps_draw_arguments() {
+    use crate::runtime::icb::{
+        IcbRenderBindStage, IcbRenderBufferBind, IcbRenderDraw, IcbRenderFill,
+    };
+
+    let state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let inherited = PendingDraw {
+        pipeline_ref: 0x51,
+        fragment_textures: Arc::new(vec![TextureBind {
+            index: 2,
+            texture_ref: 0x77,
+            ..Default::default()
+        }]),
+        vertex_buffers: Arc::new(vec![BufferBind {
+            index: 0,
+            buffer_ref: 0x88,
+            ..Default::default()
+        }]),
+        ..Default::default()
+    };
+    let execute = RenderIcbExecute {
+        icb_ref: 0x91,
+        is_range: true,
+        range_location: 0,
+        range_length: 1,
+        args_buffer_ref: 0,
+        args_buffer_offset: 0,
+        inherited,
+    };
+    let descriptor = reims_vgpu_protocol::IndirectCommandBufferDescriptor {
+        flags: 0b11,
+        ..Default::default()
+    };
+    let fill = IcbRenderFill {
+        command_index: 0,
+        pipeline_ref: 0,
+        buffers: vec![IcbRenderBufferBind {
+            index: 0,
+            buffer_ref: 0x99,
+            stage: IcbRenderBindStage::Vertex,
+            ..Default::default()
+        }],
+        object_threadgroup_memory: Vec::new(),
+        draw: IcbRenderDraw::Primitives {
+            primitive_type: 3,
+            vertex_start: 4,
+            vertex_count: 6,
+            instance_count: 2,
+            base_instance: 9,
+        },
+    };
+    let draw = pending_draw_from_icb(&state, &host, 1, &execute, &descriptor, fill)
+        .expect("the inherited command is representable")
+        .expect("the command is not an empty draw");
+    assert_eq!(draw.pipeline_ref, 0x51);
+    assert_eq!(draw.icb_ref, Some(0x91));
+    assert_eq!(draw.draw.vertex_count, 6);
+    assert_eq!(draw.draw.instance_count, 2);
+    assert_eq!(draw.draw.first_vertex, 4);
+    assert_eq!(draw.draw.base_instance, 9);
+    assert_eq!(draw.fragment_textures[0].texture_ref, 0x77);
+    assert_eq!(
+        draw.vertex_buffers[0].buffer_ref, 0x88,
+        "inherited encoder buffers remain authoritative over per-command slots"
+    );
+}
+
+#[test]
+fn icb_replay_refuses_a_per_command_pipeline_when_pipeline_state_is_inherited() {
+    use crate::runtime::icb::{IcbRenderDraw, IcbRenderFill};
+
+    let state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let execute = RenderIcbExecute {
+        icb_ref: 0x91,
+        is_range: true,
+        range_location: 0,
+        range_length: 1,
+        args_buffer_ref: 0,
+        args_buffer_offset: 0,
+        inherited: PendingDraw {
+            pipeline_ref: 0x51,
+            ..Default::default()
+        },
+    };
+    let descriptor = reims_vgpu_protocol::IndirectCommandBufferDescriptor {
+        flags: 1,
+        ..Default::default()
+    };
+    let fill = IcbRenderFill {
+        command_index: 0,
+        pipeline_ref: 0x61,
+        buffers: Vec::new(),
+        object_threadgroup_memory: Vec::new(),
+        draw: IcbRenderDraw::Primitives {
+            primitive_type: 3,
+            vertex_start: 0,
+            vertex_count: 3,
+            instance_count: 1,
+            base_instance: 0,
+        },
+    };
+
+    let refusal = pending_draw_from_icb(&state, &host, 1, &execute, &descriptor, fill).unwrap_err();
+    assert_eq!(
+        crate::observe::Decline::slug(&refusal),
+        "render_icb_inherited_pipeline_ref_nonzero"
+    );
+}
+
+#[test]
+fn direct_icb_barrier_and_direct_expand_in_encoder_order() {
+    use crate::runtime::decode::resource::{render_icb_layout, MTL_INDIRECT_CMD_DRAW};
+    use crate::runtime::gva_mem;
+    use crate::runtime::icb::{encode_render_command_slot, IcbRenderDraw, IcbRenderFill};
+
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    let layout = render_icb_layout(0, 0, MTL_INDIRECT_CMD_DRAW);
+    let descriptor = reims_vgpu_protocol::IndirectCommandBufferDescriptor {
+        command_types: MTL_INDIRECT_CMD_DRAW,
+        max_command_count: 1,
+        flags: 0b11,
+        layout,
+        ..Default::default()
+    };
+    state
+        .task_objects
+        .indirect_command_buffers
+        .record(1, 0x91, descriptor)
+        .unwrap();
+    let slot = encode_render_command_slot(
+        &layout,
+        &IcbRenderFill {
+            command_index: 0,
+            pipeline_ref: 0,
+            buffers: Vec::new(),
+            object_threadgroup_memory: Vec::new(),
+            draw: IcbRenderDraw::Primitives {
+                primitive_type: 3,
+                vertex_start: 0,
+                vertex_count: 3,
+                instance_count: 1,
+                base_instance: 5,
             },
-        ),
-        (
-            1u32,
-            ColorAttachment {
-                texture_ref: 12,
-                load_action: reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_DONT_CARE,
-                store_action: MTL_STORE_ACTION_STORE,
-                clear_color: [0.0; 4],
-                // A second attachment whose action is *not* CLEAR, so the
-                // helper is shown rewriting every slot rather than only the
-                // one that would have re-cleared.
-                slice: 3,
-                ..Default::default()
-            },
-        ),
-    ];
-    let loading = color_slots_loading(&slots);
-    assert_eq!(loading.len(), slots.len(), "no attachment is dropped");
-    for ((slot, att), (orig_slot, orig)) in loading.iter().zip(slots.iter()) {
-        assert_eq!(
-            slot, orig_slot,
-            "the slot index is the pass's, not an index"
-        );
-        assert_eq!(att.load_action, MTL_LOAD_ACTION_LOAD);
-        // Everything else is the stream's own. The clear colour in particular
-        // is carried rather than blanked: it is unread on this path, and a
-        // zero here would be an invented value in a decoded record.
-        assert_eq!(att.texture_ref, orig.texture_ref);
-        assert_eq!(att.store_action, orig.store_action);
-        assert_eq!(att.clear_color, orig.clear_color);
-        assert_eq!(att.slice, orig.slice);
-        assert_eq!(att.level, orig.level);
-        assert_eq!(att.depth_plane, orig.depth_plane);
-        assert_eq!(att.resolve_texture_ref, orig.resolve_texture_ref);
-    }
+        },
+    )
+    .unwrap();
+    let command_gva = 5u64 << crate::runtime::decode::resource::RESOURCE_PAGE_SHIFT;
+    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], command_gva, &slot);
+    assert!(state.task_objects.indirect_command_buffers.bind(
+        1,
+        0x91,
+        reims_vgpu_protocol::IcbCommandMemory {
+            gva: command_gva,
+            byte_len: slot.len() as u64,
+        },
+    ));
+
+    let direct = |pipeline_ref| PendingDraw {
+        pipeline_ref,
+        draw: DrawArgs {
+            vertex_count: 3,
+            instance_count: 1,
+            primitive_topology: reims_vgpu_protocol::PrimitiveTopology::Triangle,
+            first_vertex: 0,
+            base_instance: 0,
+        },
+        ..Default::default()
+    };
+    let mut acc = StreamAccum::default();
+    acc.push_draw(direct(0x41));
+    acc.push_icb(RenderIcbExecute {
+        icb_ref: 0x91,
+        is_range: true,
+        range_location: 0,
+        range_length: 1,
+        args_buffer_ref: 0,
+        args_buffer_offset: 0,
+        inherited: direct(0x51),
+    });
+    acc.push_barrier();
+    acc.push_draw(direct(0x61));
+
+    let mut out = ExecResult::default();
+    let expanded = expand_render_work(&state, &host, 1, &mut out, &acc);
+    assert_eq!(
+        expanded
+            .draws
+            .iter()
+            .map(|draw| draw.pipeline_ref)
+            .collect::<Vec<_>>(),
+        [0x41, 0x51, 0x61]
+    );
+    assert_eq!(expanded.draws[1].icb_ref, Some(0x91));
+    assert_eq!(expanded.draws[1].draw.base_instance, 5);
+    assert_eq!(expanded.barriers_after_draw, [2]);
+    assert_eq!(out.render_icb_fail, 0);
 }
 
 /// A buffer-offset record that lands on nothing says so, both ways.
@@ -3858,42 +4037,105 @@ fn a_buffer_offset_that_lands_on_nothing_reports_which_way_it_missed() {
     );
 }
 
-/// The records this rail answers by doing nothing still say they arrived.
+/// Residency hints remain measurable no-ops, while barriers submit preceding
+/// draws at their exact position in the stream.
 ///
-/// `UseResource`, `UseHeap` and `Barrier` all reached the dispatch's
-/// catch-all, so a guest's residency declaration and its barriers were
-/// indistinguishable from a record that had been executed — the arm they
-/// fell into was shared with `Kind::Unknown` and with every guarded arm's
-/// else-case. Doing nothing is still the answer; being silent about it is
-/// not, and a counter nobody reads back cannot show it is wired up.
+/// The barrier used to share the residency answer on the claim that every draw
+/// already had a pass boundary. Deferred same-target batches invalidate that
+/// claim: without this transition a later draw can run in the same open batch
+/// as the writes the guest explicitly ordered before it.
 #[test]
-fn a_residency_or_barrier_record_is_counted_rather_than_dropped_in_silence() {
+fn a_render_barrier_submits_preceding_draws_while_residency_stays_a_noop() {
     use crate::runtime::drain::store_route_count;
+    use crate::runtime::executor::*;
+    use reims_vgpu_core::{
+        CapabilityService, ComputeResidencyService, ExecutionPort, GuestWriteService,
+        PresentationService, ReadbackService, ResidentService,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    for (op, route, payload_len) in [
+    #[derive(Debug, Default)]
+    struct BarrierProbe {
+        flushes: AtomicUsize,
+    }
+
+    impl ExecutionPort for BarrierProbe {
+        type Submission = ResolvedSubmission;
+        type Completion = ExecutionCompletion;
+        type Error = DrawError;
+
+        fn execute(&self, _submission: Self::Submission) -> Result<Self::Completion, Self::Error> {
+            unreachable!("this test submits no draw")
+        }
+    }
+    impl ResidentService for BarrierProbe {}
+    impl GuestWriteService for BarrierProbe {}
+    impl ComputeResidencyService for BarrierProbe {}
+    impl CapabilityService for BarrierProbe {}
+    impl PresentationService for BarrierProbe {}
+    impl ReadbackService for BarrierProbe {
+        type Error = DrawError;
+
+        fn read_target(
+            &self,
+            _identity: &crate::model::TargetIdentity,
+        ) -> Result<reims_vgpu_core::TargetReadback, Self::Error> {
+            unreachable!("this test reads no target")
+        }
+    }
+    impl GuestPageTransferService for BarrierProbe {}
+    impl CompletionService for BarrierProbe {}
+    impl SubmissionBatchService for BarrierProbe {
+        fn flush_submission_tail(&self) {
+            self.flushes.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    impl GuestImportService for BarrierProbe {}
+    impl GuestImagePlanningService for BarrierProbe {}
+    impl MaintenanceService for BarrierProbe {}
+    impl SessionService for BarrierProbe {}
+    impl ObservationService for BarrierProbe {}
+    impl ShaderTranslationService for BarrierProbe {}
+    impl RenderBufferPlanningService for BarrierProbe {}
+    impl WindowPresentationService for BarrierProbe {}
+    impl Executor for BarrierProbe {}
+
+    for (op, route, payload_len, expected_flushes) in [
         (
             wire_render::OPCODE_USE_RESOURCE,
             "render_noop_residency_hint",
             render::USE_RESOURCE_REFS + 4,
+            0,
         ),
         (
             wire_render::OPCODE_USE_HEAP,
             "render_noop_residency_hint",
             render::USE_HEAP_REFS + 4,
+            0,
         ),
         (
             wire_render::OPCODE_MEMORY_BARRIER_RESOURCES,
-            "render_noop_barrier",
-            0,
+            "render_barrier_submission_boundary",
+            core::mem::size_of::<wire_render::MemoryBarrierResources>()
+                + core::mem::size_of::<wire_render::RefBind>(),
+            1,
         ),
         (
             wire_render::OPCODE_MEMORY_BARRIER_SCOPE,
-            "render_noop_barrier",
+            "render_barrier_submission_boundary",
+            core::mem::size_of::<wire_render::MemoryBarrierScope>(),
+            1,
+        ),
+        (
+            wire_render::OPCODE_TEXTURE_BARRIER,
+            "render_barrier_submission_boundary",
             0,
+            1,
         ),
     ] {
-        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let host = FakeHost::new();
+        let probe = Arc::new(BarrierProbe::default());
+        let mut state = Device::new_with_executor(DeviceId(1), PAGE_SHIFT_ARM64E, probe.clone());
+        let mut host = FakeHost::new();
         let mut out = ExecResult::default();
         let mut acc = StreamAccum::default();
 
@@ -3913,7 +4155,39 @@ fn a_residency_or_barrier_record_is_counted_rather_than_dropped_in_silence() {
             before + 1,
             "op {op:#x} did not reach {route}"
         );
+        assert_eq!(
+            probe.flushes.load(Ordering::Relaxed),
+            0,
+            "record walking cannot submit draws that finish_stream has not executed"
+        );
+        if expected_flushes != 0 {
+            assert_eq!(
+                acc.render_work,
+                [RenderWork::Barrier],
+                "the barrier must retain its exact position before execution"
+            );
+        }
+        finish_stream(&mut state, &mut host, 1, &mut out, &acc);
+        assert_eq!(
+            probe.flushes.load(Ordering::Relaxed),
+            expected_flushes,
+            "op {op:#x} applied the wrong submission boundary"
+        );
     }
+
+    let probe = Arc::new(BarrierProbe::default());
+    let state = Device::new_with_executor(DeviceId(1), PAGE_SHIFT_ARM64E, probe.clone());
+    let mut cursor = 0;
+    let positions = [1, 1, 3];
+    flush_render_barriers_at(&state, &positions, &mut cursor, 0);
+    assert_eq!(probe.flushes.load(Ordering::Relaxed), 0);
+    flush_render_barriers_at(&state, &positions, &mut cursor, 1);
+    assert_eq!(probe.flushes.load(Ordering::Relaxed), 2);
+    flush_render_barriers_at(&state, &positions, &mut cursor, 2);
+    assert_eq!(probe.flushes.load(Ordering::Relaxed), 2);
+    flush_render_barriers_at(&state, &positions, &mut cursor, 3);
+    assert_eq!(probe.flushes.load(Ordering::Relaxed), 3);
+    assert_eq!(cursor, positions.len());
 }
 
 /// The three ICB blit records are told apart rather than refused as one.
@@ -4258,10 +4532,9 @@ fn a_strided_vertex_bind_lands_in_the_table_carrying_its_stride() {
 /// draw list, which is what
 /// [`an_indirect_draw_takes_its_counts_from_the_guest_buffer`] holds.
 ///
-/// `setTriangleFillMode:` and `setDepthClipMode:` used to be the first two
-/// rows here and are not any more: both now reach a backend, and
-/// [`a_fill_mode_and_a_depth_clip_mode_reach_the_stream_state`] is what
-/// replaced their rows.
+/// `setTriangleFillMode:`, `setLineWidth:`, and `setDepthClipMode:` used to be
+/// rows here and are not any more: all now reach a backend. Their state tests
+/// replace the old dropped counters.
 #[test]
 fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
     use crate::runtime::drain::store_route_count;
@@ -4278,13 +4551,6 @@ fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
     let float_at_default: Writer = |p| st32(p, 1.0f32.to_bits());
 
     let cases: &[(u32, usize, Writer, Option<Writer>, &str)] = &[
-        (
-            wire_render::OPCODE_SET_LINE_WIDTH,
-            12,
-            float_non_default,
-            Some(float_at_default),
-            "render_line_width_dropped",
-        ),
         (
             wire_render::OPCODE_SET_TESSELLATION_FACTOR_SCALE,
             12,
@@ -4660,6 +4926,46 @@ fn a_fill_mode_and_a_depth_clip_mode_reach_the_stream_state() {
 }
 
 #[test]
+fn line_width_latches_every_bit_pattern_and_reaches_the_draw() {
+    use reims_vgpu_core::endian::st32;
+
+    let drive = |bits: u32| {
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+        let mut command = vec![0u8; 12];
+        st32(&mut command[0..], wire_render::OPCODE_SET_LINE_WIDTH);
+        st32(&mut command[4..], 12);
+        st32(&mut command[reims_vgpu_wire::OP_HEADER_LEN..], bits);
+        handle_render_record(
+            &mut state,
+            &host,
+            1,
+            wire_render::OPCODE_SET_LINE_WIDTH,
+            &command,
+            &mut out,
+            &mut acc,
+        );
+        acc
+    };
+
+    assert_eq!(
+        StreamAccum::default().raster.line_width,
+        reims_vgpu_core::LineWidth::ONE
+    );
+    for bits in [0.0f32.to_bits(), 4.0f32.to_bits(), f32::NAN.to_bits()] {
+        let acc = drive(bits);
+        assert_eq!(acc.raster.line_width.bits(), bits);
+        let pd = acc.bind_snapshot().expect("line width is semantic state");
+        assert_eq!(pd.line_width.bits(), bits);
+        let mut req = crate::runtime::draw::DrawEncodeRequest::default();
+        fill_draw_binds_from_pending(&mut req, &pd);
+        assert_eq!(req.line_width.bits(), bits);
+    }
+}
+
+#[test]
 fn invalid_sticky_raster_state_refuses_until_that_field_is_replaced() {
     use reims_vgpu_core::endian::st64;
 
@@ -4726,7 +5032,8 @@ fn attachment_actions_refuse_snapshots_until_the_exact_attachment_is_replaced() 
         }))
     ));
 
-    acc.depth_attach.as_mut().unwrap().load_action = MTL_LOAD_ACTION_LOAD;
+    acc.depth_attach.as_mut().unwrap().load_action =
+        reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_LOAD;
     acc.stencil_attach = Some(StencilAttachment {
         texture_ref: 12,
         load_action: MTL_LOAD_ACTION_CLEAR,

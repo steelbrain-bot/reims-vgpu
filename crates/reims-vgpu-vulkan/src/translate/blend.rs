@@ -69,11 +69,8 @@ pub fn operation(mtl: u32) -> Result<BlendOp, TranslateReason> {
 /// and alpha halves are three-for-three interchangeable — a swap between them
 /// produces a valid blend state that blends the wrong channel set, which no
 /// decline can report because nothing was out of contract.
-pub fn state(
-    a: &PipelineColorAttachment,
-    constants: [f32; 4],
-) -> Result<BlendStateResource, TranslateReason> {
-    reims_vgpu_protocol::blend_state(a, constants).map_err(|reason| match reason {
+pub fn state(a: &PipelineColorAttachment) -> Result<BlendStateResource, TranslateReason> {
+    reims_vgpu_protocol::blend_state(a).map_err(|reason| match reason {
         reims_vgpu_protocol::PipelineStateDecodeError::BlendFactor(value) => {
             TranslateReason::UnknownBlendFactor(value)
         }
@@ -337,16 +334,16 @@ mod tests {
                 op_alpha,
                 ..Default::default()
             };
-        let ok = state(&attach(1, 5, 0, 1, 5, 0), [0.0; 4]).unwrap();
+        let ok = state(&attach(1, 5, 0, 1, 5, 0)).unwrap();
         assert_eq!(ok.src_color, BlendFactor::One);
         assert_eq!(ok.dst_color, BlendFactor::OneMinusSrcAlpha);
         assert_eq!(ok.color_op, BlendOp::Add);
         assert_eq!(
-            state(&attach(1, 99, 0, 1, 5, 0), [0.0; 4]).unwrap_err(),
+            state(&attach(1, 99, 0, 1, 5, 0)).unwrap_err(),
             TranslateReason::UnknownBlendFactor(99)
         );
         assert_eq!(
-            state(&attach(1, 5, 0, 1, 5, 77), [0.0; 4]).unwrap_err(),
+            state(&attach(1, 5, 0, 1, 5, 77)).unwrap_err(),
             TranslateReason::UnknownBlendOperation(77)
         );
     }
@@ -359,18 +356,15 @@ mod tests {
     /// half is the only arrangement that can see it.
     #[test]
     fn the_rgb_and_alpha_halves_do_not_cross() {
-        let b = state(
-            &PipelineColorAttachment {
-                src_rgb: 1,   // One
-                dst_rgb: 5,   // OneMinusSrcAlpha
-                op_rgb: 0,    // Add
-                src_alpha: 4, // SrcAlpha
-                dst_alpha: 0, // Zero
-                op_alpha: 1,  // Subtract
-                ..Default::default()
-            },
-            [0.0; 4],
-        )
+        let b = state(&PipelineColorAttachment {
+            src_rgb: 1,   // One
+            dst_rgb: 5,   // OneMinusSrcAlpha
+            op_rgb: 0,    // Add
+            src_alpha: 4, // SrcAlpha
+            dst_alpha: 0, // Zero
+            op_alpha: 1,  // Subtract
+            ..Default::default()
+        })
         .unwrap();
         assert_eq!(b.src_color, BlendFactor::One);
         assert_eq!(b.dst_color, BlendFactor::OneMinusSrcAlpha);

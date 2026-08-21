@@ -60,21 +60,23 @@ impl TargetKeyDivergence {
 }
 
 impl TargetIdentity {
-    pub fn width(&self) -> u32 {
+    /// Geometry carried by identities that name guest-visible storage.
+    /// Anonymous identities key backend-private storage whose geometry is
+    /// supplied by the request that creates it.
+    pub fn geometry(&self) -> Option<(u32, u32)> {
         match self {
-            Self::Surface { width, .. } | Self::Texture { width, .. } | Self::Gva { width, .. } => {
-                *width
-            }
-            Self::Anonymous { .. } => 0,
+            Self::Surface { width, height, .. }
+            | Self::Texture { width, height, .. }
+            | Self::Gva { width, height, .. } => Some((*width, *height)),
+            Self::Anonymous { .. } => None,
         }
     }
+
+    pub fn width(&self) -> u32 {
+        self.geometry().map_or(0, |(width, _)| width)
+    }
     pub fn height(&self) -> u32 {
-        match self {
-            Self::Surface { height, .. }
-            | Self::Texture { height, .. }
-            | Self::Gva { height, .. } => *height,
-            Self::Anonymous { .. } => 0,
-        }
+        self.geometry().map_or(0, |(_, height)| height)
     }
     pub fn generation(&self) -> u64 {
         match self {

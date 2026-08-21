@@ -3922,14 +3922,15 @@ enum ChildPacketDisposition {
 /// or an ICB — which is why the accumulated log shows `draws_ok=0 draws_fail=1`
 /// on all 414 of them. That ratio is the filter, not the draw path.
 ///
-/// The same trap hides the ICB rail. `icb_ok=0` across those lines does **not**
-/// mean the guest never runs indirect command buffers; a packet whose ICBs all
-/// succeeded is exactly a packet that did not fail, so it never reached this
-/// sink. Answering "does ICB run at all?" needs `REIMS_VGPU_DRAW_LOG`, or a
-/// `note_store_route` counter that is not conditioned on failure.
+/// The same trap hides the ICB rail. `icb_cmds_ok=0` across those lines does
+/// **not** mean the guest never runs indirect command buffers; a packet whose
+/// ICB commands all succeeded is exactly a packet that did not fail, so it
+/// never reached this sink. Answering "does ICB run at all?" needs
+/// `REIMS_VGPU_DRAW_LOG`, or a `note_store_route` counter that is not
+/// conditioned on failure.
 fn exec_summary(channel_id: u32, result: &crate::runtime::exec::ExecResult, plen: usize) -> String {
     format!(
-        "exec_indirect2 ch={channel_id} task={} streams={} saw_draw={} clears={} draws_ok={} draws_fail={} rt_resolves={} guest_stores={} icb_ok={} icb_fail={} compute_ctrl_fail={} compute_icb_fail={} render_unbinds={}/{}/{} total_us={} plen={plen}",
+        "exec_indirect2 ch={channel_id} task={} streams={} saw_draw={} clears={} draws_ok={} draws_fail={} rt_resolves={} guest_stores={} icb_cmds_ok={} icb_failures={} compute_ctrl_fail={} compute_icb_fail={} render_unbinds={}/{}/{} total_us={} plen={plen}",
         result.task_id,
         result.streams_loaded,
         result.saw_draw as u8,

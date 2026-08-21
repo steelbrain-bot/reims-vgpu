@@ -30,8 +30,7 @@ pub(super) fn plan_pipeline<M: HostMemory + HostOps>(
         request.task_id,
         request.pipeline_ref,
     )?;
-    let blend_states =
-        super::semantic_blend_states(&resolved.desc, request.blend_color.unwrap_or([0.0; 4]))?;
+    let blend_states = super::semantic_blend_states(&resolved.desc)?;
 
     let pipeline_sample_count = resolved.desc.raster_sample_count.max(1);
     observe_multisample_contract(request, pipeline_sample_count);

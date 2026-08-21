@@ -895,8 +895,6 @@ const DEPTH_STENCIL_DESC_ID: usize = OP_HDR + offset_of!(w_ds::DepthStencilBody,
 const DEPTH_STENCIL_DESC_FRONT_FACE: usize = OP_HDR + offset_of!(w_ds::DepthStencilBody, front);
 #[cfg(test)]
 pub(crate) const DEPTH_STENCIL_DEPTH_WRITE: u32 = 1 << 3;
-pub const DEPTH_STENCIL_FRONT_STENCIL_ENABLED: u32 = 1 << 4;
-pub const DEPTH_STENCIL_BACK_STENCIL_ENABLED: u32 = 1 << 5;
 
 pub use reims_vgpu_protocol::{
     IcbCommandLayout, IcbUnappliedFlag, IndirectCommandBufferDescriptor,
@@ -1363,18 +1361,14 @@ pub fn decode_depth_stencil_descriptor(
     }
     let body = w_ds::new_depth_stencil(&op)
         .map_err(|_| DecodeStatus::ErrShort("res_depth_stencil_short"))?;
-    // Product still names bits [5:4] as face-enabled; wire records them as
-    // unidentified (Metal substitutes default faces before serialize). Keep the
-    // product field names; source the bit from the same byte the view exposes.
-    let state = body.depth_state;
     Ok(DepthStencilDescriptor {
         depth_stencil_id: body.object_ref.get(),
         depth_compare_function: body.depth_compare_function() as u32,
         depth_write_enabled: body.depth_write_enabled(),
-        front_stencil_enabled: (state & DEPTH_STENCIL_FRONT_STENCIL_ENABLED as u8) != 0,
-        back_stencil_enabled: (state & DEPTH_STENCIL_BACK_STENCIL_ENABLED as u8) != 0,
-        front_face: face_from_wire(&body.front),
-        back_face: face_from_wire(&body.back),
+        front_stencil_present: body.front_stencil_present(),
+        back_stencil_present: body.back_stencil_present(),
+        front_face: body.front_stencil().map(face_from_wire).unwrap_or_default(),
+        back_face: body.back_stencil().map(face_from_wire).unwrap_or_default(),
     })
 }
 

@@ -27,6 +27,125 @@ use super::types::{
 };
 use super::vk_call::{VkCall, VkOp};
 
+fn effective_line_raster_state(
+    topology: reims_vgpu_core::PrimitiveTopology,
+    fill_mode: reims_vgpu_core::FillMode,
+    requested: reims_vgpu_core::LineWidth,
+) -> (u32, bool) {
+    let rasterizes_lines = matches!(
+        topology,
+        reims_vgpu_core::PrimitiveTopology::Line | reims_vgpu_core::PrimitiveTopology::LineStrip
+    ) || fill_mode == reims_vgpu_core::FillMode::Lines;
+    if !rasterizes_lines {
+        return (reims_vgpu_core::LineWidth::ONE.bits(), false);
+    }
+    let width = requested.value();
+    if width.is_nan() || width < 1.0 {
+        (reims_vgpu_core::LineWidth::ONE.bits(), true)
+    } else {
+        (requested.bits(), false)
+    }
+}
+
+fn populate_dynamic_viewport_scissors(
+    req: &DrawRequest,
+    viewports: &mut Vec<vk::Viewport>,
+    scissors: &mut Vec<vk::Rect2D>,
+) {
+    let (raster_width, raster_height) = req.raster_extent();
+    let default_viewport = ViewportResource {
+        x: 0.0,
+        y: 0.0,
+        width: raster_width as f32,
+        height: raster_height as f32,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    };
+    let default_scissor = ScissorResource {
+        x: 0,
+        y: 0,
+        width: raster_width,
+        height: raster_height,
+    };
+    let slots = crate::engine::viewport_slot_count(req);
+    viewports.extend((0..slots).map(|index| {
+        let viewport = req
+            .viewports
+            .get(index)
+            .copied()
+            .unwrap_or(default_viewport);
+        vk::Viewport {
+            x: viewport.x,
+            y: viewport.y + viewport.height,
+            width: viewport.width,
+            height: -viewport.height,
+            min_depth: viewport.min_depth,
+            max_depth: viewport.max_depth,
+        }
+    }));
+    scissors.extend((0..slots).map(|index| {
+        let scissor = req.scissors.get(index).copied().unwrap_or(default_scissor);
+        let x = scissor.x.min(raster_width);
+        let y = scissor.y.min(raster_height);
+        vk::Rect2D {
+            offset: vk::Offset2D {
+                x: x as i32,
+                y: y as i32,
+            },
+            extent: vk::Extent2D {
+                width: scissor.width.min(raster_width - x),
+                height: scissor.height.min(raster_height - y),
+            },
+        }
+    }));
+}
+
+fn effective_depth_bias(
+    requested: Option<[f32; 3]>,
+    depth_bias_clamp: bool,
+) -> Result<Option<[f32; 3]>, super::reason::DrawReason> {
+    let Some(values) = requested else {
+        return Ok(None);
+    };
+    for (component, value) in values.into_iter().enumerate() {
+        if !value.is_finite() {
+            return Err(super::reason::DrawReason::DepthBiasNonFinite {
+                component: component as u8,
+                value_bits: value.to_bits(),
+            });
+        }
+    }
+    if values == [0.0; 3] {
+        return Ok(None);
+    }
+    if values[2] != 0.0 && !depth_bias_clamp {
+        return Err(super::reason::DrawReason::DepthBiasClampUnsupported {
+            clamp_bits: values[2].to_bits(),
+        });
+    }
+    Ok(Some(values))
+}
+
+fn draw_uses_blend_constants(req: &DrawRequest) -> bool {
+    req.blend
+        .iter()
+        .chain(
+            req.secondary_targets
+                .iter()
+                .filter_map(|target| target.blend.as_ref()),
+        )
+        .any(|blend| {
+            [
+                blend.src_color,
+                blend.dst_color,
+                blend.src_alpha,
+                blend.dst_alpha,
+            ]
+            .into_iter()
+            .any(reims_vgpu_core::BlendFactor::uses_blend_constant)
+        })
+}
+
 /// A buffer a draw binds, and where in it the bytes start.
 ///
 /// Two origins, and the offset is what distinguishes them. A pooled staging slot
@@ -331,6 +450,8 @@ enum PassObstacle {
     Snapshot,
     /// The seed copy that gives a `LOAD` pass its prior content.
     Seed,
+    /// A full-image attachment load materialized before a smaller MRT pass.
+    AttachmentLoad,
     /// The colour target transitioned back into attachment use.
     TargetLayout,
     /// A `CLEAR` pass's colour writes waiting for whoever last read the target.
@@ -374,6 +495,7 @@ impl PassObstacle {
         match self {
             Self::Snapshot => "passmerge_outside_snapshot",
             Self::Seed => "passmerge_outside_seed",
+            Self::AttachmentLoad => "passmerge_outside_attachment_load",
             Self::TargetLayout => "passmerge_outside_target_layout",
             Self::ClearWait => "passmerge_outside_clear_wait",
             Self::ResidentLayout => "passmerge_outside_resident_layout",
@@ -391,6 +513,7 @@ impl PassObstacle {
         match self {
             Self::Snapshot => "passheld_outside_snapshot",
             Self::Seed => "passheld_outside_seed",
+            Self::AttachmentLoad => "passheld_outside_attachment_load",
             Self::TargetLayout | Self::MrtLayout => {
                 unreachable!("an attachment-layout obstacle is not recorded on the held ladder")
             }
@@ -1894,6 +2017,37 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
             },
         ));
     }
+    let (minimum_width, minimum_height) = req.minimum_attachment_extent();
+    if minimum_width == 0 || minimum_height == 0 {
+        return Err(DrawError::DrawValidation(
+            DrawValidationDecline::ZeroTargetGeometry {
+                width: minimum_width,
+                height: minimum_height,
+            },
+        ));
+    }
+    if let Some(width) = req.render_target_extent.width {
+        if width.get() > minimum_width {
+            return Err(DrawError::DrawValidation(
+                DrawValidationDecline::RenderTargetExtentExceedsAttachment {
+                    axis: "width",
+                    requested: width.get(),
+                    limit: minimum_width,
+                },
+            ));
+        }
+    }
+    if let Some(height) = req.render_target_extent.height {
+        if height.get() > minimum_height {
+            return Err(DrawError::DrawValidation(
+                DrawValidationDecline::RenderTargetExtentExceedsAttachment {
+                    axis: "height",
+                    requested: height.get(),
+                    limit: minimum_height,
+                },
+            ));
+        }
+    }
     if req.program.vertex.id.get() == 0 {
         return Err(DrawError::DrawValidation(
             DrawValidationDecline::MissingVertexProgram,
@@ -1928,12 +2082,10 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
             ));
         }
     }
-    if let Some(blend) = req.blend {
-        if blend.constants.iter().any(|c| !c.is_finite()) {
-            return Err(DrawError::DrawValidation(
-                DrawValidationDecline::NonFiniteBlendConstants,
-            ));
-        }
+    if draw_uses_blend_constants(req) && req.blend_constants.iter().any(|c| !c.is_finite()) {
+        return Err(DrawError::DrawValidation(
+            DrawValidationDecline::NonFiniteBlendConstants,
+        ));
     }
     if let Some(target) = &req.target_rgba8 {
         // The seed is one tightly-packed RGBA8 slice of the target, and the
@@ -3143,6 +3295,8 @@ type OwnedDepthImage = (vk::Image, vk::DeviceMemory, vk::ImageView);
 /// it binds one specific `render_pass` alongside the colour view, and only the
 /// caller knows which.
 struct AcquiredDepth {
+    image: vk::Image,
+    access: super::pools::ResidentAccess,
     view: vk::ImageView,
     /// Set only on the transient rail — the resident rail's image belongs to the
     /// registry and must not be disposed with the draw.
@@ -3184,17 +3338,20 @@ unsafe fn acquire_depth_view(
 ) -> Result<AcquiredDepth, DrawError> {
     let with_stencil = req.depth.as_ref().and_then(|d| d.stencil).is_some();
     let sample_count = req.raster_sample_count.max(1);
+    let (depth_width, depth_height) = req
+        .depth_attachment_extent()
+        .expect("depth acquisition requires depth state");
     if let Some(identity) = req.depth.as_ref().and_then(|d| d.identity.clone()) {
         // Asked before `registry_ensure_depth`, because that call creates the
         // slot when it is absent and a fresh slot is `content_ready == false`.
         // Asking after would answer about the image this draw just made rather
         // than about the one the guest expects to load.
         let content_ready = pools.registry_content_ready(&identity);
-        let (_image, view) = pools.registry_ensure_depth(
+        let (image, view) = pools.registry_ensure_depth(
             ctx,
             identity.clone(),
-            req.width,
-            req.height,
+            depth_width,
+            depth_height,
             sample_count,
             with_stencil,
             counters,
@@ -3202,7 +3359,13 @@ unsafe fn acquire_depth_view(
         // A geometry or aspect change recreates the image inside that call, and
         // the recreated one holds nothing. Re-asking is what keeps this honest.
         let content_ready = content_ready && pools.registry_content_ready(&identity);
+        let access = pools
+            .registry_get(&identity)
+            .expect("the depth resident was just ensured")
+            .access;
         return Ok(AcquiredDepth {
+            image,
+            access,
             view,
             owned: None,
             identity: Some(identity),
@@ -3211,13 +3374,15 @@ unsafe fn acquire_depth_view(
     }
     let (dimg, dmem, dview) = pools.create_transient_depth(
         ctx,
-        req.width,
-        req.height,
+        depth_width,
+        depth_height,
         sample_count,
         with_stencil,
         counters,
     )?;
     Ok(AcquiredDepth {
+        image: dimg,
+        access: super::pools::ResidentAccess::Untouched,
         view: dview,
         owned: Some((dimg, dmem, dview)),
         identity: None,
@@ -3785,12 +3950,19 @@ pub(crate) unsafe fn execute_draw_inner(
         || seed_bytes.is_some()
         || segment_load.guest.is_some()
         || segment_load.resident.is_some();
-    let color0_load = color_load_for_segment(
+    let (framebuffer_width, framebuffer_height) = req.minimum_attachment_extent();
+    let mut color0_load = color_load_for_segment(
         req.color_load_action,
         req.continues_render_pass,
         has_load_source,
     );
+    let preclear_primary = color0_load == ColorLoadKey::Clear
+        && (req.width > framebuffer_width || req.height > framebuffer_height);
+    if preclear_primary {
+        color0_load = ColorLoadKey::Load;
+    }
     let mut pass_key = PassKey::single(color0_load, color0_format);
+    let mut preclear_secondaries = [false; MAX_SECONDARY_ATTACH];
     for (i, sec) in req.secondary_targets.iter().enumerate() {
         if i >= MAX_SECONDARY_ATTACH {
             return Err(DrawError::Unsupported(
@@ -3800,13 +3972,19 @@ pub(crate) unsafe fn execute_draw_inner(
                 },
             ));
         }
+        let mut load = color_load_for_segment(
+            sec.load_action,
+            req.continues_render_pass,
+            matches!(sec.load_action, super::types::ColorLoadAction::Load),
+        );
+        preclear_secondaries[i] = load == ColorLoadKey::Clear
+            && (sec.width > framebuffer_width || sec.height > framebuffer_height);
+        if preclear_secondaries[i] {
+            load = ColorLoadKey::Load;
+        }
         pass_key.secondary[i] = SecondaryAttachKey {
             format: crate::format::vk_image_format(sec.format),
-            load: color_load_for_segment(
-                sec.load_action,
-                req.continues_render_pass,
-                matches!(sec.load_action, super::types::ColorLoadAction::Load),
-            ),
+            load,
         };
     }
     pass_key.secondary_count = req.secondary_targets.len() as u8;
@@ -3834,12 +4012,33 @@ pub(crate) unsafe fn execute_draw_inner(
         .map(|_| acquire_depth_view(ctx, pools, req, counters))
         .transpose()?;
     phase.enter(super::draw_phase::Phase::Pipeline);
+    let mut preclear_depth = false;
     if let Some(d) = &req.depth {
-        let load = depth_attachment
+        let mut load = depth_attachment
             .as_ref()
             .is_some_and(|a: &AcquiredDepth| a.honours_load(d.load));
         if d.load && !load {
             note_depth_load_without_content(req.width, req.height, d.stencil.is_some());
+        }
+        let (depth_width, depth_height) = req
+            .depth_attachment_extent()
+            .expect("depth state has an attachment extent");
+        preclear_depth =
+            !load && (depth_width > framebuffer_width || depth_height > framebuffer_height);
+        if preclear_depth {
+            let format = if d.stencil.is_some() {
+                ctx.depth_stencil_format
+            } else {
+                crate::translate::pixel::TRANSIENT_DEPTH_FORMAT
+            };
+            if !ctx.depth_format_transfer_dst(format) {
+                return Err(DrawError::Unsupported(
+                    super::reason::DrawReason::AttachmentWideDepthClearUnsupported {
+                        format: format.as_raw(),
+                    },
+                ));
+            }
+            load = true;
         }
         pass_key.depth = Some(super::caches::DepthAttachKey {
             load,
@@ -3973,6 +4172,10 @@ pub(crate) unsafe fn execute_draw_inner(
         }
         Some(mode) => Some(crate::translate::raster::vk_query_control_flags(mode)),
     };
+    let (line_width_bits, rasterizer_discard) =
+        effective_line_raster_state(req.primitive_topology, req.fill_mode, req.line_width);
+    let depth_bias = effective_depth_bias(req.depth_bias, ctx.features.depth_bias_clamp)
+        .map_err(DrawError::Unsupported)?;
     let pipeline_key =
         PipelineKey {
             vert: vert_digest,
@@ -4012,6 +4215,9 @@ pub(crate) unsafe fn execute_draw_inner(
             cull_mode: req.cull_mode,
             front_face_ccw: req.front_face_ccw,
             fill_mode: req.fill_mode,
+            line_width_bits,
+            rasterizer_discard,
+            depth_bias_enable: depth_bias.is_some(),
             depth_clip: req.depth_clip,
             depth_test: req.depth.as_ref().map(|d| d.test_enable).unwrap_or(false),
             depth_write: req.depth.as_ref().map(|d| d.write_enable).unwrap_or(false),
@@ -4406,8 +4612,8 @@ pub(crate) unsafe fn execute_draw_inner(
                 ctx,
                 render_pass,
                 &views,
-                req.width,
-                req.height,
+                framebuffer_width,
+                framebuffer_height,
                 counters,
             )?;
             if let Some(d) = depth_attachment.as_ref() {
@@ -4458,8 +4664,8 @@ pub(crate) unsafe fn execute_draw_inner(
                 ctx,
                 render_pass,
                 &views,
-                req.width,
-                req.height,
+                framebuffer_width,
+                framebuffer_height,
                 counters,
             )?;
             if let Some(d) = depth_attachment.as_ref() {
@@ -5156,7 +5362,7 @@ pub(crate) unsafe fn execute_draw_inner(
         // it. It is here so the census can tell a target switch apart from one
         // target described two ways; see `ResourcePools::pass_echo_delta`.
         target_image,
-        area: (req.width, req.height),
+        area: (framebuffer_width, framebuffer_height),
     };
     let target_feedback = pass_key.color_feedback(0);
     let target_pass_layout = pass_key.color_layout(0);
@@ -6056,11 +6262,94 @@ pub(crate) unsafe fn execute_draw_inner(
         pools.note_cb_sampled_guest(source, &image);
     }
 
+    // A Vulkan render-pass clear covers only its render area. Metal instead
+    // applies each attachment's load action to that attachment's full image,
+    // then rasterizes against the minimum attachment extent. When one MRT
+    // image is larger than that common framebuffer, materialize its clear over
+    // the whole image and make the render pass LOAD the result.
+    if preclear_primary {
+        unsafe {
+            outside_pass.before_record(PassObstacle::AttachmentLoad, pools, &ctx.device, cb);
+            record_attachment_wide_clear(
+                &ctx.device,
+                cb,
+                target_image,
+                AttachmentWideColorClear {
+                    prior: target_prior_access(target_snapshotted, target_access),
+                    pass_layout: target_pass_layout,
+                    pass_stage: target_dst_stage,
+                    pass_access: target_dst_access,
+                    dependency: target_dependency,
+                    clear: req.target_clear,
+                },
+            );
+        }
+    }
+    for (secondary_index, (_id, image, access, _guest)) in mrt_secondaries.iter().enumerate() {
+        if !preclear_secondaries[secondary_index] {
+            continue;
+        }
+        let attachment_index = secondary_index + 1;
+        let feedback = pass_key.color_feedback(attachment_index);
+        let pass_stage = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+            | if feedback {
+                vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER
+            } else {
+                vk::PipelineStageFlags::empty()
+            };
+        let pass_access = vk::AccessFlags::COLOR_ATTACHMENT_READ
+            | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+            | if feedback {
+                vk::AccessFlags::SHADER_READ
+            } else {
+                vk::AccessFlags::empty()
+            };
+        unsafe {
+            outside_pass.before_record(PassObstacle::AttachmentLoad, pools, &ctx.device, cb);
+            record_attachment_wide_clear(
+                &ctx.device,
+                cb,
+                *image,
+                AttachmentWideColorClear {
+                    prior: *access,
+                    pass_layout: pass_key.color_layout(attachment_index),
+                    pass_stage,
+                    pass_access,
+                    dependency: if feedback {
+                        vk::DependencyFlags::FEEDBACK_LOOP_EXT
+                    } else {
+                        vk::DependencyFlags::empty()
+                    },
+                    clear: req.secondary_targets[secondary_index].clear,
+                },
+            );
+        }
+    }
+    if preclear_depth {
+        let depth = req.depth.as_ref().expect("preclear implies depth state");
+        let attachment = depth_attachment
+            .as_ref()
+            .expect("preclear implies an acquired depth attachment");
+        unsafe {
+            outside_pass.before_record(PassObstacle::AttachmentLoad, pools, &ctx.device, cb);
+            record_attachment_wide_depth_clear(
+                &ctx.device,
+                cb,
+                attachment,
+                depth.clear_value,
+                depth.stencil.map(|stencil| stencil.clear_value),
+            );
+        }
+    }
+
     // MRT secondary attachments that were left shader-readable (sampled by a
     // prior draw) must transition back to color-attachment use, and the write
     // must wait for that prior read (WAR). A freshly-created secondary tracks
     // UNDEFINED and needs no barrier — the render pass discards on CLEAR.
     for (secondary_index, (_id, image, access, _guest)) in mrt_secondaries.iter().enumerate() {
+        if preclear_secondaries[secondary_index] {
+            continue;
+        }
         if *access == super::pools::ResidentAccess::Untouched {
             continue;
         }
@@ -6114,8 +6403,8 @@ pub(crate) unsafe fn execute_draw_inner(
         .render_area(vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: vk::Extent2D {
-                width: req.width,
-                height: req.height,
+                width: framebuffer_width,
+                height: framebuffer_height,
             },
         })
         .clear_values(&clear);
@@ -6225,7 +6514,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 super::types::ColorLoadAction::DontCare => "passreopen_from_dontcare",
             });
         }
-        crate::telemetry::note_route(pass_begin_area_band(req.width, req.height));
+        crate::telemetry::note_route(pass_begin_area_band(framebuffer_width, framebuffer_height));
         crate::telemetry::note_route(match pass_key.color0_load {
             ColorLoadKey::Load => "passbegin_load",
             ColorLoadKey::Clear => "passbegin_clear",
@@ -6274,57 +6563,28 @@ pub(crate) unsafe fn execute_draw_inner(
     // Dynamic viewport/scissor. Metal NDC is Y-up and Vulkan's is Y-down, so
     // every viewport is emitted flipped: origin at the bottom edge, negative
     // height. This is a property of the two APIs, not of any guest state.
-    let default_vp = ViewportResource {
-        x: 0.0,
-        y: 0.0,
-        width: req.width as f32,
-        height: req.height as f32,
-        min_depth: 0.0,
-        max_depth: 1.0,
-    };
-    let default_sc = ScissorResource {
-        x: 0,
-        y: 0,
-        width: req.width,
-        height: req.height,
-    };
     // One count for both, because a Vulkan pipeline declares one and the
     // dynamic arrays must match it. The pipeline was built from
     // `viewport_slot_count`, so this must be the same function of the same
     // request or `vkCmdSetViewport` binds a different count than the pipeline
     // declared.
-    let slots = crate::engine::viewport_slot_count(req);
     // Built into the pools' scratch rather than into two fresh `Vec`s: these are
     // rebuilt every draw, and the comparison that decides whether the driver
     // already has them needs a buffer it can swap rather than copy.
     let (vp_scratch, sc_scratch) = pools.dynamic_scratch();
-    vp_scratch.extend((0..slots).map(|i| {
-        let vp = req.viewports.get(i).copied().unwrap_or(default_vp);
-        vk::Viewport {
-            x: vp.x,
-            y: vp.y + vp.height,
-            width: vp.width,
-            height: -vp.height,
-            min_depth: vp.min_depth,
-            max_depth: vp.max_depth,
-        }
-    }));
-    sc_scratch.extend((0..slots).map(|i| {
-        let sc = req.scissors.get(i).copied().unwrap_or(default_sc);
-        let x = sc.x.min(req.width);
-        let y = sc.y.min(req.height);
-        vk::Rect2D {
-            offset: vk::Offset2D {
-                x: x as i32,
-                y: y as i32,
-            },
-            extent: vk::Extent2D {
-                width: sc.width.min(req.width - x),
-                height: sc.height.min(req.height - y),
-            },
-        }
-    }));
+    populate_dynamic_viewport_scissors(req, vp_scratch, sc_scratch);
     unsafe { pools.set_dynamic_viewport_scissor(&ctx.device, cb, counters) };
+    if let Some([constant_factor, slope_factor, clamp]) = depth_bias {
+        unsafe {
+            ctx.device
+                .cmd_set_depth_bias(cb, constant_factor, clamp, slope_factor)
+        };
+    }
+    if draw_uses_blend_constants(req) {
+        unsafe {
+            ctx.device.cmd_set_blend_constants(cb, &req.blend_constants);
+        }
+    }
     // Dynamic stencil reference (Metal `setStencilFrontReferenceValue:back…`)
     // — only bound for stencil pipelines, which list STENCIL_REFERENCE as a
     // dynamic state; front/back set together because Metal's split refs are one
@@ -7186,6 +7446,145 @@ fn clear_values(req: &DrawRequest) -> Vec<vk::ClearValue> {
     clear
 }
 
+/// Materialize one Metal attachment-wide `LoadActionClear` before a Vulkan
+/// render pass whose framebuffer is smaller than this image.
+///
+/// Vulkan scopes a render-pass clear to `renderArea`; Metal scopes the load to
+/// the whole attachment and only constrains subsequent rasterization. The two
+/// transitions make the full-image transfer clear the content consumed by a
+/// `LOAD` attachment in the smaller pass.
+struct AttachmentWideColorClear {
+    prior: super::pools::ResidentAccess,
+    pass_layout: vk::ImageLayout,
+    pass_stage: vk::PipelineStageFlags,
+    pass_access: vk::AccessFlags,
+    dependency: vk::DependencyFlags,
+    clear: [f32; 4],
+}
+
+unsafe fn record_attachment_wide_clear(
+    device: &ash::Device,
+    cb: vk::CommandBuffer,
+    image: vk::Image,
+    operation: AttachmentWideColorClear,
+) {
+    let AttachmentWideColorClear {
+        prior,
+        pass_layout,
+        pass_stage,
+        pass_access,
+        dependency,
+        clear,
+    } = operation;
+    let (src_stage, src_access) = prior.source_scope();
+    let to_clear = [vk::ImageMemoryBarrier::default()
+        .src_access_mask(src_access)
+        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .old_layout(prior.layout())
+        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .image(image)
+        .subresource_range(super::color_subresource_range())];
+    device.cmd_pipeline_barrier(
+        cb,
+        src_stage,
+        vk::PipelineStageFlags::TRANSFER,
+        vk::DependencyFlags::empty(),
+        &[],
+        &[],
+        &to_clear,
+    );
+    device.cmd_clear_color_image(
+        cb,
+        image,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        &vk::ClearColorValue { float32: clear },
+        &[super::color_subresource_range()],
+    );
+    let to_pass = [vk::ImageMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(pass_access)
+        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .new_layout(pass_layout)
+        .image(image)
+        .subresource_range(super::color_subresource_range())];
+    device.cmd_pipeline_barrier(
+        cb,
+        vk::PipelineStageFlags::TRANSFER,
+        pass_stage,
+        dependency,
+        &[],
+        &[],
+        &to_pass,
+    );
+}
+
+unsafe fn record_attachment_wide_depth_clear(
+    device: &ash::Device,
+    cb: vk::CommandBuffer,
+    attachment: &AcquiredDepth,
+    clear_depth: f32,
+    clear_stencil: Option<u32>,
+) {
+    let aspect = vk::ImageAspectFlags::DEPTH
+        | if clear_stencil.is_some() {
+            vk::ImageAspectFlags::STENCIL
+        } else {
+            vk::ImageAspectFlags::empty()
+        };
+    let range = vk::ImageSubresourceRange::default()
+        .aspect_mask(aspect)
+        .base_mip_level(0)
+        .level_count(1)
+        .base_array_layer(0)
+        .layer_count(1);
+    let (src_stage, src_access) = attachment.access.source_scope();
+    let to_clear = [vk::ImageMemoryBarrier::default()
+        .src_access_mask(src_access)
+        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .old_layout(attachment.access.layout())
+        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .image(attachment.image)
+        .subresource_range(range)];
+    device.cmd_pipeline_barrier(
+        cb,
+        src_stage,
+        vk::PipelineStageFlags::TRANSFER,
+        vk::DependencyFlags::empty(),
+        &[],
+        &[],
+        &to_clear,
+    );
+    device.cmd_clear_depth_stencil_image(
+        cb,
+        attachment.image,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        &vk::ClearDepthStencilValue {
+            depth: clear_depth,
+            stencil: clear_stencil.unwrap_or(0),
+        },
+        &[range],
+    );
+    let to_pass = [vk::ImageMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(
+            vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
+                | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        )
+        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .new_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+        .image(attachment.image)
+        .subresource_range(range)];
+    device.cmd_pipeline_barrier(
+        cb,
+        vk::PipelineStageFlags::TRANSFER,
+        vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+        vk::DependencyFlags::empty(),
+        &[],
+        &[],
+        &to_pass,
+    );
+}
+
 /// The access a barrier over *this draw's own colour target* must name as its
 /// source, given what the registry last recorded and what this draw has already
 /// done to it.
@@ -7360,6 +7759,115 @@ pub(super) unsafe fn barrier_resident_for_transfer_read(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn line_width_only_changes_line_rasterized_geometry() {
+        let zero = reims_vgpu_core::LineWidth::from_f32(0.0);
+        let four = reims_vgpu_core::LineWidth::from_f32(4.0);
+        assert_eq!(
+            effective_line_raster_state(
+                reims_vgpu_core::PrimitiveTopology::Triangle,
+                reims_vgpu_core::FillMode::Fill,
+                zero,
+            ),
+            (reims_vgpu_core::LineWidth::ONE.bits(), false)
+        );
+        assert_eq!(
+            effective_line_raster_state(
+                reims_vgpu_core::PrimitiveTopology::Line,
+                reims_vgpu_core::FillMode::Fill,
+                zero,
+            ),
+            (reims_vgpu_core::LineWidth::ONE.bits(), true)
+        );
+        assert_eq!(
+            effective_line_raster_state(
+                reims_vgpu_core::PrimitiveTopology::Triangle,
+                reims_vgpu_core::FillMode::Lines,
+                four,
+            ),
+            (four.bits(), false)
+        );
+    }
+
+    #[test]
+    fn nonpositive_and_nan_line_widths_discard_line_fragments() {
+        for value in [0.99, 0.0, -1.0, f32::NEG_INFINITY, f32::NAN] {
+            assert_eq!(
+                effective_line_raster_state(
+                    reims_vgpu_core::PrimitiveTopology::LineStrip,
+                    reims_vgpu_core::FillMode::Fill,
+                    reims_vgpu_core::LineWidth::from_f32(value),
+                ),
+                (reims_vgpu_core::LineWidth::ONE.bits(), true),
+                "value={value}"
+            );
+        }
+        let positive_infinity = reims_vgpu_core::LineWidth::from_f32(f32::INFINITY);
+        assert_eq!(
+            effective_line_raster_state(
+                reims_vgpu_core::PrimitiveTopology::Line,
+                reims_vgpu_core::FillMode::Fill,
+                positive_infinity,
+            ),
+            (positive_infinity.bits(), false),
+            "positive infinity must reach the typed host-range refusal"
+        );
+    }
+
+    #[test]
+    fn depth_bias_preserves_source_order_and_refuses_only_unrepresentable_state() {
+        assert_eq!(effective_depth_bias(None, false), Ok(None));
+        assert_eq!(effective_depth_bias(Some([0.0; 3]), false), Ok(None));
+        assert_eq!(
+            effective_depth_bias(Some([1.25, 2.5, 0.0]), false),
+            Ok(Some([1.25, 2.5, 0.0]))
+        );
+        assert!(matches!(
+            effective_depth_bias(Some([1.0, 2.0, 3.0]), false),
+            Err(crate::engine::reason::DrawReason::DepthBiasClampUnsupported { .. })
+        ));
+        assert!(matches!(
+            effective_depth_bias(Some([f32::NAN, 0.0, 0.0]), true),
+            Err(crate::engine::reason::DrawReason::DepthBiasNonFinite { component: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn a_secondary_attachment_alone_can_require_encoder_blend_constants() {
+        let constant_blend = reims_vgpu_core::BlendStateResource {
+            src_color: reims_vgpu_core::BlendFactor::ConstantColor,
+            dst_color: reims_vgpu_core::BlendFactor::Zero,
+            color_op: reims_vgpu_core::BlendOp::Add,
+            src_alpha: reims_vgpu_core::BlendFactor::ConstantAlpha,
+            dst_alpha: reims_vgpu_core::BlendFactor::Zero,
+            alpha_op: reims_vgpu_core::BlendOp::Add,
+        };
+        let req = DrawRequest {
+            blend: None,
+            secondary_targets: vec![reims_vgpu_core::SecondaryColorTarget {
+                identity: reims_vgpu_core::TargetIdentity::Gva {
+                    gva: 1,
+                    width: 1,
+                    height: 1,
+                    generation: 0,
+                    format: reims_vgpu_core::pixel_format::TexelLayout::Rgba8,
+                },
+                target_guest: None,
+                width: 1,
+                height: 1,
+                format: reims_vgpu_protocol::ImageFormat::linear(
+                    reims_vgpu_protocol::TexelLayout::Rgba8,
+                ),
+                clear: [0.0; 4],
+                load_action: reims_vgpu_core::ColorLoadAction::Clear,
+                blend: Some(constant_blend),
+                color_write_mask: Default::default(),
+            }],
+            ..Default::default()
+        };
+        assert!(draw_uses_blend_constants(&req));
+    }
 
     #[test]
     fn a_non_indexed_zero_vertex_count_has_no_invocations() {
@@ -8247,6 +8755,87 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    #[test]
+    fn pass_raster_extent_must_fit_the_attachment() {
+        let req = DrawRequest {
+            program: test_program(),
+            width: 8,
+            height: 8,
+            render_target_extent: reims_vgpu_core::RenderTargetExtent {
+                width: std::num::NonZeroU32::new(9),
+                height: None,
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            validation_slug(&req),
+            "vk_draw_validate_render_target_extent_exceeds_attachment"
+        );
+    }
+
+    #[test]
+    fn zero_geometry_on_any_attachment_is_rejected_before_vulkan() {
+        let mut req = DrawRequest {
+            program: test_program(),
+            width: 8,
+            height: 8,
+            ..Default::default()
+        };
+        req.secondary_targets
+            .push(reims_vgpu_core::SecondaryColorTarget {
+                identity: reims_vgpu_core::TargetIdentity::Texture {
+                    ref_: 1,
+                    width: 0,
+                    height: 8,
+                    generation: 1,
+                    stencil: false,
+                },
+                target_guest: None,
+                width: 0,
+                height: 8,
+                format: reims_vgpu_protocol::ImageFormat::linear(
+                    reims_vgpu_protocol::TexelLayout::Rgba8,
+                ),
+                clear: [0.0; 4],
+                load_action: reims_vgpu_core::ColorLoadAction::Clear,
+                blend: None,
+                color_write_mask: Default::default(),
+            });
+        assert_eq!(
+            validation_slug(&req),
+            "vk_draw_validate_zero_target_geometry"
+        );
+    }
+
+    #[test]
+    fn pass_extent_defines_the_implicit_viewport_and_scissor() {
+        let req = DrawRequest {
+            width: 8,
+            height: 8,
+            render_target_extent: reims_vgpu_core::RenderTargetExtent {
+                width: std::num::NonZeroU32::new(4),
+                height: std::num::NonZeroU32::new(3),
+            },
+            ..Default::default()
+        };
+        let mut viewports = Vec::new();
+        let mut scissors = Vec::new();
+        populate_dynamic_viewport_scissors(&req, &mut viewports, &mut scissors);
+        assert_eq!(viewports.len(), 1);
+        assert_eq!(viewports[0].x, 0.0);
+        assert_eq!(viewports[0].y, 3.0);
+        assert_eq!(viewports[0].width, 4.0);
+        assert_eq!(viewports[0].height, -3.0);
+        assert_eq!(scissors[0].offset, vk::Offset2D { x: 0, y: 0 });
+        assert_eq!(
+            scissors[0].extent,
+            vk::Extent2D {
+                width: 4,
+                height: 3
+            }
+        );
     }
 
     fn guest_run_req(w: u32, h: u32, total_len: u64, row_length_texels: u32) -> DrawRequest {
@@ -9515,8 +10104,10 @@ mod depth_load_tests {
     fn acquired(content_ready: bool) -> AcquiredDepth {
         AcquiredDepth {
             view: vk::ImageView::null(),
+            image: vk::Image::null(),
             owned: None,
             identity: None,
+            access: crate::engine::pools::ResidentAccess::Untouched,
             content_ready,
         }
     }
@@ -9559,12 +10150,14 @@ mod depth_load_tests {
     fn the_transient_depth_rail_never_honours_a_load() {
         let transient = AcquiredDepth {
             view: vk::ImageView::null(),
+            image: vk::Image::null(),
             owned: Some((
                 vk::Image::null(),
                 vk::DeviceMemory::null(),
                 vk::ImageView::null(),
             )),
             identity: None,
+            access: crate::engine::pools::ResidentAccess::Untouched,
             content_ready: false,
         };
         assert!(!transient.honours_load(true));
