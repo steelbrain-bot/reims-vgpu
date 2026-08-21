@@ -2354,12 +2354,9 @@ pub(super) fn declared_guest_image_selection(
 ) -> Option<(reims_vgpu_memory::GuestImageLayout, u64)> {
     use crate::runtime::decode::resource::{
         TEXTURE_VIEW_MTL_TYPE_1D, TEXTURE_VIEW_MTL_TYPE_1D_ARRAY, TEXTURE_VIEW_MTL_TYPE_2D,
-        TEXTURE_VIEW_MTL_TYPE_2D_ARRAY, TEXTURE_VIEW_MTL_TYPE_3D, TEXTURE_VIEW_MTL_TYPE_CUBE,
+        TEXTURE_VIEW_MTL_TYPE_2D_ARRAY, TEXTURE_VIEW_MTL_TYPE_3D,
     };
-    // Face counts are compared against `slice_base`/`slice_count`, which the
-    // decoded view range carries as `u64`.
-    const CUBE_FACES: u64 = reims_vgpu_protocol::CUBE_FACES as u64;
-    if shape.multisampled {
+    if shape.cube || shape.multisampled {
         return None;
     }
     let declaration = texture.declaration?;
@@ -2383,55 +2380,24 @@ pub(super) fn declared_guest_image_selection(
             TEXTURE_VIEW_MTL_TYPE_1D_ARRAY | TEXTURE_VIEW_MTL_TYPE_2D_ARRAY => {
                 (0, u64::from(declaration.array_length))
             }
-            // Six, by the definition of the type the guest declared: a cube
-            // texture always has six slices, one per face. That is the same
-            // count [`physical_slice_count`] expands `slice_count` by, and it
-            // is why nothing here needs a cube layout of its own.
-            //
-            // [`physical_slice_count`]: reims_vgpu_protocol::LinearTextureDescriptor::physical_slice_count
-            TEXTURE_VIEW_MTL_TYPE_CUBE => (0, CUBE_FACES),
             _ => (0, 1),
         });
     let storage_layers = match storage_type {
         TEXTURE_VIEW_MTL_TYPE_1D_ARRAY | TEXTURE_VIEW_MTL_TYPE_2D_ARRAY => {
             u64::from(declaration.array_length)
         }
-        TEXTURE_VIEW_MTL_TYPE_CUBE => CUBE_FACES,
         _ => 1,
     };
     if slice_count == 0 || slice_base.checked_add(slice_count)? > storage_layers {
         return None;
     }
     let layer_offset = match storage_type {
-        TEXTURE_VIEW_MTL_TYPE_1D_ARRAY
-        | TEXTURE_VIEW_MTL_TYPE_2D_ARRAY
-        | TEXTURE_VIEW_MTL_TYPE_CUBE => texture.bytes_per_slice.checked_mul(slice_base)?,
+        TEXTURE_VIEW_MTL_TYPE_1D_ARRAY | TEXTURE_VIEW_MTL_TYPE_2D_ARRAY => {
+            texture.bytes_per_slice.checked_mul(slice_base)?
+        }
         _ if slice_base == 0 && slice_count == 1 => 0,
         _ => return None,
     };
-    if shape.cube {
-        // Only a cube storage, never a cube array: `sampled_image_shape`
-        // refuses `CubeArray` outright, so a `shape.cube` over cube-array
-        // storage could only be the first six faces of a longer array, chosen
-        // silently. And only the whole cube -- a face subrange is a shape the
-        // reflected declaration cannot be, so it is a refusal rather than a
-        // clamp.
-        if declared_type != TEXTURE_VIEW_MTL_TYPE_CUBE
-            || storage_type != TEXTURE_VIEW_MTL_TYPE_CUBE
-            || slice_count != CUBE_FACES
-        {
-            return None;
-        }
-        return Some((
-            reims_vgpu_memory::GuestImageLayout::D2Array {
-                width: level.width,
-                height: level.height,
-                layers: u32::try_from(CUBE_FACES).ok()?,
-                array_pitch: texture.bytes_per_slice,
-            },
-            layer_offset,
-        ));
-    }
     if shape.one_dim {
         if level.height != 1 {
             return None;
@@ -2534,10 +2500,12 @@ pub(super) fn declared_guest_image_allocation(
 )> {
     use crate::runtime::decode::resource::{
         TEXTURE_VIEW_MTL_TYPE_1D, TEXTURE_VIEW_MTL_TYPE_1D_ARRAY, TEXTURE_VIEW_MTL_TYPE_2D,
-        TEXTURE_VIEW_MTL_TYPE_2D_ARRAY, TEXTURE_VIEW_MTL_TYPE_3D, TEXTURE_VIEW_MTL_TYPE_CUBE,
+        TEXTURE_VIEW_MTL_TYPE_2D_ARRAY, TEXTURE_VIEW_MTL_TYPE_3D,
     };
 
-    if shape.multisampled
+    if shape.cube
+        || shape.multisampled
+        || texture.cube_faces
         || texture.compressed_layout
         || bytes_per_texel == 0
         || !texture.declared_packing_fits_allocation()
@@ -2557,11 +2525,6 @@ pub(super) fn declared_guest_image_allocation(
         TEXTURE_VIEW_MTL_TYPE_1D_ARRAY | TEXTURE_VIEW_MTL_TYPE_2D_ARRAY => {
             u32::from(declaration.array_length)
         }
-        // A cube's faces are its physical slices, which is exactly what
-        // `physical_slice_count` reports for the same descriptor -- this is
-        // that count, restricted to the one declared array element a
-        // `shape.cube` bind can name.
-        TEXTURE_VIEW_MTL_TYPE_CUBE => reims_vgpu_protocol::CUBE_FACES,
         TEXTURE_VIEW_MTL_TYPE_1D | TEXTURE_VIEW_MTL_TYPE_2D | TEXTURE_VIEW_MTL_TYPE_3D => 1,
         _ => return None,
     };
@@ -2621,11 +2584,7 @@ pub(super) fn declared_guest_image_allocation(
                     height: level.height,
                 }
             }
-            // A cube joins the 2-D array arm rather than getting one of its
-            // own: its six faces are six slices of the same slice-major
-            // packing, at the same `bytes_per_slice` advance, in the order
-            // both APIs define. See [`reims_vgpu_protocol::CUBE_FACES`].
-            TEXTURE_VIEW_MTL_TYPE_2D_ARRAY | TEXTURE_VIEW_MTL_TYPE_CUBE
+            TEXTURE_VIEW_MTL_TYPE_2D_ARRAY
                 if level.height == expected_height && level.planes() == 1 =>
             {
                 reims_vgpu_memory::GuestImageLayout::D2Array {

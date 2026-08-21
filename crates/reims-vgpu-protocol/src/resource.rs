@@ -310,18 +310,6 @@ impl TextureLevelLayout {
     }
 }
 
-/// Faces in a cube texture, which is a property of the type rather than a
-/// count anything reports.
-///
-/// A cube always has exactly six slices, one per face, and a cube array holds
-/// consecutive groups of six. Both APIs meeting in this device agree on the
-/// order those six sit in — `+X, -X, +Y, -Y, +Z, -Z` — so a face needs no
-/// permutation and a cube needs no layout distinct from a six-slice array.
-///
-/// Every place that would otherwise spell `6` refers here, because a second
-/// spelling is the only way the two can disagree.
-pub const CUBE_FACES: u32 = 6;
-
 /// Semantic construction descriptor for a page-backed linear texture.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LinearTextureDescriptor {
@@ -432,7 +420,7 @@ impl LinearTextureDescriptor {
     /// cube-array textures store six consecutive faces per declared slice.
     pub fn physical_slice_count(&self) -> Option<u32> {
         self.slice_count
-            .checked_mul(if self.cube_faces { CUBE_FACES } else { 1 })
+            .checked_mul(if self.cube_faces { 6 } else { 1 })
     }
 
     /// Span occupied by one physical slice's mip records.
