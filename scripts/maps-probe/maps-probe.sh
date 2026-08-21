@@ -80,8 +80,9 @@ sleep 10
 # render the same class of scene and gives the visual gate a meaningful promise
 # to check. Re-opening it also prevents snapshot-restored location history from
 # choosing an ocean or a different zoom level for one arm.
+MAP_URL='http://maps.apple.com/?ll=40.7128,-74.0060&z=12'
 timeout 60 ssh -o BatchMode=yes macos-vm \
-  "open 'http://maps.apple.com/?ll=40.7128,-74.0060&z=12'" 2>/dev/null \
+  "open -a Maps '$MAP_URL'" 2>/dev/null \
   || { echo "could not select the Maps workload"; exit 3; }
 sleep 15
 
@@ -137,21 +138,24 @@ for attempt in 1 2 3 4 5 6; do
 done
 [ "$ready" = yes ] || {
   echo "Maps did not render the declared geographic scene before measurement"
+  cp "$FAILLOG" "$OUT/setup.log" 2>/dev/null || true
   cat "$OUT/before-"*-verdict.txt
   exit 1
 }
+# Preserve the exact pre-interaction interval for A/B diagnosis. The device log
+# is append-only, so a later full-boot copy cannot recover this boundary.
+cp "$FAILLOG" "$OUT/setup-ready.log" 2>/dev/null || true
 
 # Everything above is setup; the scored window starts here.
 OFFSET=$(stat -c %s "$FAILLOG")
 END=$(( $(date +%s) + SECS ))
 
-# Each pan uses two completed opposite gestures. A single held-button out-and-
-# back path supplies equal host coordinates but Maps may coalesce a different
-# number of events on each leg; driven runs walked the declared New York scene
-# as far as Atlantic City. Releasing at the end of each leg makes the inverse a
-# second semantic pan operation and bounds drift without changing device policy.
-# The endpoint hold makes the release a zero-velocity end rather than a kinetic
-# pan that continues changing the workload during the ten-second settled frame.
+# Each pan is one closed gesture whose pointer returns to its starting point
+# before release. Two separately released opposite gestures are not inverses:
+# Maps applies kinetic motion to each release independently, and driven runs
+# eventually reached open water while the visual gate misreported the valid sea
+# canvas as lost rendering. A closed gesture names zero net displacement in the
+# input contract; the endpoint hold makes its one release zero-velocity.
 export QMP_DRAG_STEPS=6 QMP_DRAG_HOLD_S=0.012 QMP_DRAG_RELEASE_HOLD_S=0.15
 # Fixed, not tunable per run: two boots whose phase mix differs are not two
 # measurements of the same workload. Change it deliberately, and re-baseline.
@@ -163,13 +167,13 @@ export QMP_DRAG_STEPS=6 QMP_DRAG_HOLD_S=0.012 QMP_DRAG_RELEASE_HOLD_S=0.15
 ZOOM_TICKS=1
 ZOOM_SETTLE_S=0.4
 
-pan_box() {  # opposite short strokes keep the declared city in the viewport
-  "$Q" drag $((CX - R)) "$CY" $((CX + R)) "$CY" >/dev/null 2>&1 &&
-    "$Q" drag $((CX + R)) "$CY" $((CX - R)) "$CY" >/dev/null 2>&1
+pan_box() {
+  "$Q" drag "$CX" "$CY" $((CX - R)) "$CY" $((CX + R)) "$CY" "$CX" "$CY" \
+    >/dev/null 2>&1
 }
 pan_diag() {
-  "$Q" drag $((CX - R)) $((CY - R)) $((CX + R)) $((CY + R)) >/dev/null 2>&1 &&
-    "$Q" drag $((CX + R)) $((CY + R)) $((CX - R)) $((CY - R)) >/dev/null 2>&1
+  "$Q" drag "$CX" "$CY" $((CX - R)) $((CY - R)) \
+    $((CX + R)) $((CY + R)) "$CX" "$CY" >/dev/null 2>&1
 }
 
 phase=0
@@ -200,11 +204,46 @@ done
 tail -c "+$(( OFFSET + 1 ))" "$FAILLOG" >"$OUT/window.log"
 echo "drove $phase phases over ${SECS}s"
 
-"$SHOT" -o "$OUT/after.png" >/dev/null 2>&1 || echo "post-window screenshot failed"
-# Keep an out-of-window settled image beside the immediate one. The immediate
-# capture says what continuous interaction actually displayed; the settled one
-# separates a tile fetch still in flight from texture content that never became
-# visible at all. Neither delay nor capture contributes to the scored window.
+# Preserve the free-running endpoint, but do not use its content to judge the
+# renderer: navigation is valid guest state, and an ocean legitimately has no
+# roads or labels. Restore the declared location outside the scored window so
+# the correctness gate compares a scene whose expected content is known.
+"$SHOT" -o "$OUT/motion-end.png" >/dev/null 2>&1 || echo "motion-end screenshot failed"
+timeout 60 ssh -o BatchMode=yes macos-vm "open -a Maps '$MAP_URL'" 2>/dev/null \
+  || { echo "could not restore the Maps workload"; exit 3; }
+
+# A successful `open` means Maps accepted the URL, not that its asynchronous
+# tile and label layers have arrived. Apply the same content gate as setup so a
+# slow restore cannot be mistaken for a rendering regression.
+restored=no
+for attempt in 1 2 3 4 5 6; do
+  candidate="$OUT/restored-$attempt.png"
+  sleep 10
+  "$SHOT" -o "$candidate" >/dev/null 2>&1 || true
+  if "$VISUAL_GATE" --before "$candidate" --after "$candidate" \
+      --settled "$candidate" >"$OUT/restored-$attempt-verdict.txt" 2>&1; then
+    restored=yes
+    break
+  fi
+done
+[ "$restored" = yes ] || {
+  echo "Maps did not restore the declared geographic scene after measurement"
+  cp "$FAILLOG" "$OUT/full-boot.log" 2>/dev/null || true
+  cat "$OUT/restored-"*-verdict.txt
+  exit 1
+}
+
+# Exercise movement after the restore rather than judging a static reload. One
+# bounded pan cannot leave the declared metropolitan scene; unlike the scored
+# closed gestures it deliberately ends displaced, so the captured result proves
+# a real viewport update rendered.
+"$Q" move "$CX" "$CY" >/dev/null 2>&1
+"$Q" drag "$CX" "$CY" $((CX + R)) "$CY" >/dev/null 2>&1 \
+  || { echo "could not drive the bounded visual pan"; exit 3; }
+sleep 5
+"$SHOT" -o "$OUT/after.png" >/dev/null 2>&1 || echo "post-restore screenshot failed"
+# Keep an out-of-window settled image beside the immediate one. Neither delay
+# nor capture contributes to the scored performance window.
 sleep 10
 "$SHOT" -o "$OUT/settled.png" >/dev/null 2>&1 || echo "settled screenshot failed"
 
@@ -217,6 +256,7 @@ if ! "$VISUAL_GATE" --before "$OUT/before.png" --after "$OUT/after.png" \
   exit 1
 fi
 cat "$OUT/visual-verdict.txt"
+cp "$FAILLOG" "$OUT/full-boot.log" 2>/dev/null || true
 
 # Reading a captured window is not specific to this probe, so the analysis is
 # not carried here; `MAPS_ANALYZE` names it, and absent one the window is still
