@@ -2087,16 +2087,12 @@ fn linear_guest_image_allocation_memory(
         allocation_len: packed.import.len(),
         resource_offset: packed.head,
         resource_len: packed.size,
-        plane_offset: packed.head.checked_add(base.offset)?,
+        plane_offset: packed.head.checked_add(base.resource_relative_offset)?,
         row_pitch: base.row_pitch,
     };
-    let resource_end = backing.resource_offset.checked_add(backing.resource_len)?;
     for mip in allocation.mips.iter() {
-        let offset = packed.head.checked_add(mip.offset)?;
-        let end = offset.checked_add(mip.layout.visible_span(mip.row_pitch, bytes_per_texel)?)?;
-        if offset < backing.resource_offset || end > resource_end {
-            return None;
-        }
+        mip.plane_in(backing)?
+            .visible_image_window(mip.layout, bytes_per_texel)?;
     }
     Some(reims_vgpu_memory::GuestTargetMemory {
         backing,
@@ -2652,7 +2648,7 @@ pub(super) fn declared_guest_image_allocation(
             return None;
         }
         mips.push(reims_vgpu_memory::GuestImageMipLayout {
-            offset: texture.base_offset.checked_add(level.offset)?,
+            resource_relative_offset: texture.base_offset.checked_add(level.offset)?,
             row_pitch: level.row_stride,
             layout,
         });

@@ -448,10 +448,10 @@ fn validate_mip_subresource(
     let host_offset = placement
         .resource_relative(host.offset)
         .ok_or(WindowRefusal::BindingRangeOverflow)?;
-    if host_offset != guest.offset {
+    if host_offset != guest.resource_relative_offset {
         return Err(WindowRefusal::MipOffsetMismatch {
             mip_level,
-            guest_offset: guest.offset,
+            guest_offset: guest.resource_relative_offset,
             host_offset,
             image_base: placement.image_base,
             resource_base: placement.resource_base,
@@ -707,8 +707,16 @@ pub(crate) unsafe fn create(
     format: vk::Format,
     usage: vk::ImageUsageFlags,
 ) -> Result<ImportedImage, WindowRefusal> {
+    // The chain is resource-relative and `plane_offset` is allocation-relative,
+    // so the sole mip's offset is the distance between the plane and the
+    // resource that holds it -- not the plane itself. Handing the plane over
+    // directly declared every image's base subresource to be hundreds of
+    // megabytes into its own memory.
     let allocation_layout = reims_vgpu_memory::GuestImageAllocationLayout::single(
-        backing.plane_offset,
+        backing
+            .plane_offset
+            .checked_sub(backing.resource_offset)
+            .ok_or(WindowRefusal::ResourceWindowTooShort)?,
         backing.row_pitch,
         layout,
     );
@@ -755,11 +763,9 @@ pub(crate) unsafe fn create_allocation(
         return Err(WindowRefusal::ResourceWindowTooShort);
     }
     for mip in allocation_layout.mips.iter() {
-        let mip_backing = GuestTargetBacking {
-            plane_offset: mip.offset,
-            row_pitch: mip.row_pitch,
-            ..backing
-        };
+        let mip_backing = mip
+            .plane_in(backing)
+            .ok_or(WindowRefusal::ResourceWindowTooShort)?;
         if mip_backing
             .visible_image_window(mip.layout, bytes_per_texel)
             .is_none()
@@ -854,6 +860,13 @@ unsafe fn plan_image_with_layout(
     let base_mip = allocation_layout
         .base()
         .ok_or(WindowRefusal::ResourceWindowTooShort)?;
+    // The explicit plane layout below declares where plane zero sits inside the
+    // image's *memory*, and that memory is the whole parent allocation -- so the
+    // number it wants is allocation-relative, which the mip chain is not.
+    let base_plane = base_mip
+        .plane_in(backing)
+        .ok_or(WindowRefusal::ResourceWindowTooShort)?
+        .plane_offset;
     let mip_levels = allocation_layout
         .mip_level_count()
         .ok_or(WindowRefusal::ResourceWindowTooShort)?;
@@ -907,7 +920,7 @@ unsafe fn plan_image_with_layout(
         },
         LayoutMode::ExplicitLinear => {
             let layouts = [vk::SubresourceLayout {
-                offset: base_mip.offset,
+                offset: base_plane,
                 size: 0,
                 row_pitch: base_mip.row_pitch,
                 array_pitch: match guest_layout {
@@ -945,7 +958,7 @@ unsafe fn plan_image_with_layout(
         depth: geometry.extent.depth,
         mip_levels,
         array_layers: geometry.array_layers,
-        plane_offset: base_mip.offset,
+        plane_offset: base_plane,
         row_pitch: base_mip.row_pitch,
     })?;
 
@@ -1183,7 +1196,7 @@ mod tests {
             ..first
         };
         let layout = reims_vgpu_memory::GuestImageAllocationLayout::single(
-            first.plane_offset,
+            first.plane_offset - first.resource_offset,
             first.row_pitch,
             d2(),
         );
@@ -1483,7 +1496,7 @@ mod tests {
     #[test]
     fn every_mip_offset_is_checked_in_the_guest_resource_namespace() {
         let guest = reims_vgpu_memory::GuestImageMipLayout {
-            offset: 0x240,
+            resource_relative_offset: 0x240,
             row_pitch: 64,
             layout: GuestImageLayout::D1 { width: 16 },
         };
@@ -1507,7 +1520,7 @@ mod tests {
                 1,
                 host,
                 reims_vgpu_memory::GuestImageMipLayout {
-                    offset: 0x280,
+                    resource_relative_offset: 0x280,
                     ..guest
                 },
                 at_allocation_base,
@@ -1540,7 +1553,7 @@ mod tests {
         let plane_offset = resource_base + 0x1000;
         let guest = reims_vgpu_memory::GuestImageMipLayout {
             // What `GuestImageSource::single_mip` builds: plane, less resource.
-            offset: plane_offset - resource_base,
+            resource_relative_offset: plane_offset - resource_base,
             row_pitch: 64,
             layout: GuestImageLayout::D1 { width: 16 },
         };

@@ -189,7 +189,7 @@ impl GuestImageSource {
         transfer: GuestRunSource,
     ) -> Option<Self> {
         let mip = GuestImageMipLayout {
-            offset: memory
+            resource_relative_offset: memory
                 .backing
                 .plane_offset
                 .checked_sub(memory.backing.resource_offset)?,
@@ -245,9 +245,38 @@ impl GuestImageSource {
 /// One mip subresource's guest-resource-relative placement and geometry.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct GuestImageMipLayout {
-    pub offset: u64,
+    /// Bytes from the start of the **guest resource** to this subresource.
+    ///
+    /// Spelled out because the other offset in play — [`GuestTargetBacking`]'s
+    /// `plane_offset` — counts from the start of the parent **allocation**, and
+    /// on this device an allocation is a whole RAMBlock. The two therefore
+    /// differ by hundreds of megabytes on a live boot while both being small
+    /// non-negative integers in a test, which is exactly the shape a basis
+    /// confusion hides in. Cross between them with [`Self::plane_in`].
+    pub resource_relative_offset: u64,
     pub row_pitch: u64,
     pub layout: GuestImageLayout,
+}
+
+impl GuestImageMipLayout {
+    /// This subresource's own backing inside the allocation holding its
+    /// resource.
+    ///
+    /// This is the only correct route from a mip chain to a
+    /// [`GuestTargetBacking`], and being the only route is the point. Reading
+    /// `resource_relative_offset` straight into `plane_offset` names a byte
+    /// short of the resource by `resource_offset`, and every bound the backing
+    /// then checks — `visible_image_window`'s `plane_offset >= resource_offset`
+    /// first — refuses a placement that is in fact perfectly valid.
+    pub fn plane_in(self, backing: GuestTargetBacking) -> Option<GuestTargetBacking> {
+        Some(GuestTargetBacking {
+            plane_offset: backing
+                .resource_offset
+                .checked_add(self.resource_relative_offset)?,
+            row_pitch: self.row_pitch,
+            ..backing
+        })
+    }
 }
 
 /// Complete mip layout of one Vulkan-compatible guest image allocation.
@@ -262,10 +291,14 @@ pub struct GuestImageAllocationLayout {
 }
 
 impl GuestImageAllocationLayout {
-    pub fn single(offset: u64, row_pitch: u64, layout: GuestImageLayout) -> Self {
+    /// A one-level chain whose sole subresource sits `resource_relative_offset`
+    /// bytes into the guest resource — **not** into the parent allocation. A
+    /// caller holding a `GuestTargetBacking` reaches this by subtracting that
+    /// backing's `resource_offset` from its `plane_offset`.
+    pub fn single(resource_relative_offset: u64, row_pitch: u64, layout: GuestImageLayout) -> Self {
         Self {
             mips: std::sync::Arc::from([GuestImageMipLayout {
-                offset,
+                resource_relative_offset,
                 row_pitch,
                 layout,
             }]),
@@ -280,24 +313,6 @@ impl GuestImageAllocationLayout {
         u32::try_from(self.mips.len())
             .ok()
             .filter(|count| *count != 0)
-    }
-
-    /// Translate guest-resource-relative mip offsets into a concrete parent
-    /// allocation. Import padding is placement state and enters only here.
-    pub fn translated(&self, resource_offset: u64) -> Option<Self> {
-        let mips = self
-            .mips
-            .iter()
-            .map(|mip| {
-                Some(GuestImageMipLayout {
-                    offset: resource_offset.checked_add(mip.offset)?,
-                    ..*mip
-                })
-            })
-            .collect::<Option<Vec<_>>>()?;
-        Some(Self {
-            mips: std::sync::Arc::from(mips),
-        })
     }
 
     /// Whether this declaration can be one Vulkan image mip chain.
@@ -2040,7 +2055,7 @@ mod tests {
         let chain = GuestImageAllocationLayout {
             mips: std::sync::Arc::from([
                 GuestImageMipLayout {
-                    offset: 0x100,
+                    resource_relative_offset: 0x100,
                     row_pitch: 64,
                     layout: GuestImageLayout::D3 {
                         width: 16,
@@ -2050,7 +2065,7 @@ mod tests {
                     },
                 },
                 GuestImageMipLayout {
-                    offset: 0x900,
+                    resource_relative_offset: 0x900,
                     row_pitch: 32,
                     layout: GuestImageLayout::D3 {
                         width: 8,
@@ -2150,6 +2165,69 @@ mod tests {
             .visible_window(1, 1, 4),
             None
         );
+    }
+
+    /// A mip chain declares where its subresources sit inside the guest
+    /// *resource*, and on this device the parent allocation is a whole
+    /// RAMBlock — so on a live boot the resource starts hundreds of megabytes
+    /// in. Every mip of such a resource must still be admissible.
+    ///
+    /// The regression this pins is what happens when the resource-relative
+    /// offset is read straight into `plane_offset`: `visible_image_window`'s
+    /// first term is `plane_offset >= resource_offset`, so a perfectly valid
+    /// chain fails it for every mip whose offset is smaller than the distance
+    /// to its own resource — which, at a RAMBlock's scale, is all of them. The
+    /// second half of this test is that raw read, and it must stay `None`.
+    #[test]
+    fn a_mip_is_placed_against_its_resource_not_against_the_allocation() {
+        let backing = GuestTargetBacking {
+            allocation_host_ptr: 0x1000,
+            allocation_len: 0x4000_0000,
+            resource_offset: 0x3612_0000,
+            resource_len: 0x2000,
+            plane_offset: 0x3612_0000,
+            row_pitch: 0x100,
+        };
+        let mips = [
+            GuestImageMipLayout {
+                resource_relative_offset: 0,
+                row_pitch: 0x100,
+                layout: GuestImageLayout::D2 {
+                    width: 64,
+                    height: 16,
+                },
+            },
+            GuestImageMipLayout {
+                resource_relative_offset: 0x1000,
+                row_pitch: 0x80,
+                layout: GuestImageLayout::D2 {
+                    width: 32,
+                    height: 8,
+                },
+            },
+        ];
+
+        for mip in mips {
+            let placed = mip.plane_in(backing).expect("mip places in its resource");
+            assert_eq!(
+                placed.plane_offset,
+                backing.resource_offset + mip.resource_relative_offset
+            );
+            assert!(
+                placed.visible_image_window(mip.layout, 4).is_some(),
+                "a declared mip of a resource deep in its allocation must be admissible"
+            );
+        }
+
+        // The raw read, kept as the thing that must not come back.
+        for mip in mips {
+            let unplaced = GuestTargetBacking {
+                plane_offset: mip.resource_relative_offset,
+                row_pitch: mip.row_pitch,
+                ..backing
+            };
+            assert_eq!(unplaced.visible_image_window(mip.layout, 4), None);
+        }
     }
 
     #[test]

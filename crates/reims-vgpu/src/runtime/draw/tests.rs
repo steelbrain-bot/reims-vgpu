@@ -1063,7 +1063,7 @@ fn one_and_three_dimensional_mip_chains_preserve_every_declared_offset() {
         allocation
             .mips
             .iter()
-            .map(|mip| (mip.offset, mip.layout.width()))
+            .map(|mip| (mip.resource_relative_offset, mip.layout.width()))
             .collect::<Vec<_>>(),
         [(0x100, 16), (0x140, 8)]
     );

@@ -1505,7 +1505,6 @@ enum PreparedSampled {
 struct GuestAllocationCopy {
     allocation: reims_vgpu_memory::GuestImageAllocationLayout,
     view: reims_vgpu_memory::GuestImageViewRange,
-    resource_offset: u64,
     transfer_source_offset: u64,
     bytes_per_texel: u64,
 }
@@ -1902,13 +1901,8 @@ fn validate_guest_sampled_source(
     for mip_level in source.view.base_mip_level..view_end {
         let mip = source.allocation.mips[mip_level as usize];
         if let Some(memory) = source.direct.as_ref() {
-            let Some(plane_offset) = memory.backing.resource_offset.checked_add(mip.offset) else {
+            let Some(mip_backing) = mip.plane_in(memory.backing) else {
                 return Err(invalid_view());
-            };
-            let mip_backing = reims_vgpu_memory::GuestTargetBacking {
-                plane_offset,
-                row_pitch: mip.row_pitch,
-                ..memory.backing
             };
             if mip_backing
                 .visible_image_window(mip.layout, texel)
@@ -1955,8 +1949,11 @@ fn validate_guest_sampled_source(
             ),
             other => (0, other),
         };
+        // `src.source_offset` below counts from the same guest resource the mip
+        // chain does, so this comparison stays in resource coordinates and never
+        // reaches the allocation.
         let relative = mip
-            .offset
+            .resource_relative_offset
             .checked_add(layer_displacement)
             .ok_or_else(invalid_view)?;
         let end = relative
@@ -2747,9 +2744,8 @@ fn sampled_allocation_copy_regions(
         let local_mip = guest_mip_level - copy.view.base_mip_level;
         let mip = copy.allocation.mips[guest_mip_level as usize];
         let relative = mip
-            .offset
-            .checked_sub(copy.resource_offset)
-            .and_then(|offset| offset.checked_sub(copy.transfer_source_offset))
+            .resource_relative_offset
+            .checked_sub(copy.transfer_source_offset)
             .and_then(|offset| source_buffer_offset.checked_add(offset))
             .ok_or(DrawExecutionDecline::SampledCopyOffsetOverflow {
                 binding,
@@ -3532,7 +3528,6 @@ unsafe fn prepare_guest_sampled_transfer(
         allocation_copy: Some(GuestAllocationCopy {
             allocation: image_source.allocation.clone(),
             view: image_source.view,
-            resource_offset: 0,
             transfer_source_offset: src.source_offset,
             bytes_per_texel: u64::from(resource.format.layout().bytes_per_texel()),
         }),
@@ -9117,12 +9112,12 @@ mod tests {
         source.allocation = reims_vgpu_memory::GuestImageAllocationLayout {
             mips: std::sync::Arc::from([
                 reims_vgpu_memory::GuestImageMipLayout {
-                    offset: 0,
+                    resource_relative_offset: 0,
                     row_pitch: 64,
                     layout: reims_vgpu_memory::GuestImageLayout::D1 { width: 16 },
                 },
                 reims_vgpu_memory::GuestImageMipLayout {
-                    offset: 64,
+                    resource_relative_offset: 64,
                     row_pitch: 32,
                     layout: reims_vgpu_memory::GuestImageLayout::D1 { width: 8 },
                 },
@@ -9195,7 +9190,10 @@ mod tests {
             allocation: reims_vgpu_memory::GuestImageAllocationLayout {
                 mips: std::sync::Arc::from([
                     reims_vgpu_memory::GuestImageMipLayout {
-                        offset: 0x900,
+                        // Resource-relative, as the chain's own type says. The
+                        // resource itself sits wherever the allocation puts it;
+                        // nothing in this copy path may see that.
+                        resource_relative_offset: 0x100,
                         row_pitch: 64,
                         layout: reims_vgpu_memory::GuestImageLayout::D1Array {
                             width: 16,
@@ -9204,7 +9202,7 @@ mod tests {
                         },
                     },
                     reims_vgpu_memory::GuestImageMipLayout {
-                        offset: 0x940,
+                        resource_relative_offset: 0x140,
                         row_pitch: 32,
                         layout: reims_vgpu_memory::GuestImageLayout::D1Array {
                             width: 8,
@@ -9220,7 +9218,6 @@ mod tests {
                 base_array_layer: 1,
                 array_layer_count: 2,
             },
-            resource_offset: 0x800,
             transfer_source_offset: 0,
             bytes_per_texel: 4,
         };
@@ -9241,7 +9238,7 @@ mod tests {
             allocation: reims_vgpu_memory::GuestImageAllocationLayout {
                 mips: std::sync::Arc::from([
                     reims_vgpu_memory::GuestImageMipLayout {
-                        offset: 0x80,
+                        resource_relative_offset: 0x80,
                         row_pitch: 32,
                         layout: reims_vgpu_memory::GuestImageLayout::D3 {
                             width: 8,
@@ -9251,7 +9248,7 @@ mod tests {
                         },
                     },
                     reims_vgpu_memory::GuestImageMipLayout {
-                        offset: 0x180,
+                        resource_relative_offset: 0x180,
                         row_pitch: 16,
                         layout: reims_vgpu_memory::GuestImageLayout::D3 {
                             width: 4,
@@ -9268,7 +9265,6 @@ mod tests {
                 base_array_layer: 0,
                 array_layer_count: 1,
             },
-            resource_offset: 0,
             transfer_source_offset: 0,
             bytes_per_texel: 4,
         };
