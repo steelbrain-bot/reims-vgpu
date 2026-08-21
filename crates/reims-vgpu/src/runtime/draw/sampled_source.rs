@@ -3435,14 +3435,72 @@ pub(super) fn requested_linear_mip_range(
     )
 }
 
+/// What a linear sampled bind learned when it asked whether its guest
+/// allocation can be bound directly.
+///
+/// This is the largest routing decision in the sampled path. A bind admitted
+/// here aliases the guest allocation and reads the live storage; one that is not
+/// copies the whole texture every time it is bound, and then relies on a gather
+/// vouch — which `runtime/gather_witness.rs` says in its own first paragraph is
+/// not a statement about bytes.
+///
+/// It is an enum rather than an `Option` because three unrelated things used to
+/// collapse into one absence: the backend answering that it cannot represent the
+/// layout, the backend answering nothing at all, and there being no packed
+/// allocation to form a question about. None of the three was counted, so the
+/// copy rail's dominant cause was invisible — a boot could report zero refusals
+/// from every named term and still run 71 % of its sampled binds through a copy.
+/// Naming them separately is what makes the next reading say *which*.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum LinearDirectAdmission {
+    /// The backend will bind this allocation directly, subject to `requirement`.
+    Admitted(reims_vgpu_memory::GuestImageBindingRequirement),
+    /// The backend was asked and answered that it cannot represent this layout.
+    BackendRefused,
+    /// The backend was asked and returned no disposition at all.
+    BackendSilent,
+    /// There was no question to ask: this bind has no packed guest allocation or
+    /// no image contract, so no binding request could be formed.
+    NoBindingRequest,
+}
+
+impl LinearDirectAdmission {
+    /// The census route this outcome is counted under.
+    ///
+    /// The three refusing arms sum with `lin_direct_admitted` to the number of
+    /// binds that reached the admission question at all, which is what makes a
+    /// missing term visible rather than absorbed.
+    pub(super) fn route(&self) -> &'static str {
+        match self {
+            Self::Admitted(_) => "lin_direct_admitted",
+            Self::BackendRefused => "lin_direct_backend_refused",
+            Self::BackendSilent => "lin_direct_backend_silent",
+            Self::NoBindingRequest => "lin_direct_no_binding_request",
+        }
+    }
+
+    /// The requirement to satisfy, when this bind was admitted.
+    pub(super) fn requirement(self) -> Option<reims_vgpu_memory::GuestImageBindingRequirement> {
+        match self {
+            Self::Admitted(requirement) => Some(requirement),
+            Self::BackendRefused | Self::BackendSilent | Self::NoBindingRequest => None,
+        }
+    }
+}
+
 pub(super) fn direct_binding_requirement(
     disposition: Option<reims_vgpu_memory::GuestImageBindingDisposition>,
-) -> Option<reims_vgpu_memory::GuestImageBindingRequirement> {
+    asked: bool,
+) -> LinearDirectAdmission {
     match disposition {
         Some(reims_vgpu_memory::GuestImageBindingDisposition::Direct(requirement)) => {
-            Some(requirement)
+            LinearDirectAdmission::Admitted(requirement)
         }
-        Some(reims_vgpu_memory::GuestImageBindingDisposition::Refused) | None => None,
+        Some(reims_vgpu_memory::GuestImageBindingDisposition::Refused) => {
+            LinearDirectAdmission::BackendRefused
+        }
+        None if asked => LinearDirectAdmission::BackendSilent,
+        None => LinearDirectAdmission::NoBindingRequest,
     }
 }
 
@@ -3755,6 +3813,13 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // guest pages followed by host-only padding; its footprint and writeback
     // remain bounded by the guest allocation.
     let mut direct_admitted = false;
+    if guest_layout.is_none() {
+        // No decoded guest image layout, so there is nothing to offer the direct
+        // rail and the admission question below is never asked. Counted beside
+        // the three admission outcomes so the four sum to every linear sampled
+        // bind: a term missing from that sum is a route nobody is watching.
+        crate::runtime::drain::note_store_route("lin_direct_no_guest_layout");
+    }
     if guest_layout.is_some() {
         let _admission_span = crate::runtime::sampled_phase::Span::open(
             crate::runtime::sampled_phase::Part::LinearAdmission,
@@ -3798,7 +3863,9 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                 );
             }
         }
-        let requirement = direct_binding_requirement(disposition);
+        let admission = direct_binding_requirement(disposition, binding_request.is_some());
+        crate::runtime::drain::note_store_route(admission.route());
+        let requirement = admission.requirement();
         direct_admitted = requirement.is_some();
         if let (Some(requirement), Some(current), Some(backing)) =
             (requirement, packed.as_ref(), allocation.as_ref())

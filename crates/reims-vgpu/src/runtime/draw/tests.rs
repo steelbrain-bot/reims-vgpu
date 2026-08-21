@@ -14,19 +14,51 @@ fn a_retained_direct_image_refusal_selects_the_copying_rail() {
         GuestImageBindingDisposition as Disposition, GuestImageBindingRequirement as Requirement,
     };
 
-    assert_eq!(
-        sampled_source::direct_binding_requirement(Some(Disposition::Direct(Requirement {
+    use crate::runtime::draw::sampled_source::LinearDirectAdmission as Admission;
+
+    let admitted = sampled_source::direct_binding_requirement(
+        Some(Disposition::Direct(Requirement {
             allocation_len: 0x4000,
-        }))),
+        })),
+        true,
+    );
+    assert_eq!(
+        admitted.clone().requirement(),
         Some(Requirement {
             allocation_len: 0x4000,
         })
     );
-    assert_eq!(
-        sampled_source::direct_binding_requirement(Some(Disposition::Refused)),
-        None
-    );
-    assert_eq!(sampled_source::direct_binding_requirement(None), None);
+    assert_eq!(admitted.route(), "lin_direct_admitted");
+
+    // The three refusing outcomes all select the copying rail, and the point of
+    // the enum is that they no longer say so in the same words: a backend that
+    // refused a layout, a backend that answered nothing, and a bind with no
+    // allocation to ask about are three different repairs.
+    for (disposition, asked, expected, route) in [
+        (
+            Some(Disposition::Refused),
+            true,
+            Admission::BackendRefused,
+            "lin_direct_backend_refused",
+        ),
+        (
+            None,
+            true,
+            Admission::BackendSilent,
+            "lin_direct_backend_silent",
+        ),
+        (
+            None,
+            false,
+            Admission::NoBindingRequest,
+            "lin_direct_no_binding_request",
+        ),
+    ] {
+        let outcome = sampled_source::direct_binding_requirement(disposition, asked);
+        assert_eq!(outcome, expected);
+        assert_eq!(outcome.route(), route);
+        assert_eq!(outcome.requirement(), None);
+    }
 }
 
 /// Complete the allocation-level half of a synthetic linear texture record.
