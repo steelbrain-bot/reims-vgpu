@@ -377,6 +377,133 @@ pub fn ensure_packed_resource_for_image<
     )
 }
 
+/// Ways a declared mapping view's recorded page GPAs can disagree with what the
+/// task's page table resolves the same span to *now*.
+enum ViewGpaDisagreement {
+    /// The view names a different physical page than the page table does. The
+    /// alias built from the view therefore reads and writes memory the guest
+    /// does not believe is behind this address.
+    Differs {
+        index: usize,
+        view_gpa: u64,
+        table_gpa: u64,
+    },
+    /// The page table resolves fewer pages of the span than the view claims to
+    /// cover. The tail of the alias has no guest backing at all.
+    Short {
+        view_pages: usize,
+        table_pages: usize,
+    },
+}
+
+impl ViewGpaDisagreement {
+    /// Judge a view's recorded page GPAs against what the page table resolves.
+    ///
+    /// `table` may legitimately be *longer* than `view_gpas`: the walk covers
+    /// the whole aligned span while the view covers the resource. Only a short
+    /// table, or a page the two name differently, is a disagreement. The first
+    /// differing page is the one reported — a later one adds no information a
+    /// reader of the first does not already have.
+    fn judge(view_gpas: &[u64], table: &[u64]) -> Option<Self> {
+        if table.len() < view_gpas.len() {
+            return Some(Self::Short {
+                view_pages: view_gpas.len(),
+                table_pages: table.len(),
+            });
+        }
+        view_gpas
+            .iter()
+            .zip(table.iter())
+            .enumerate()
+            .find(|(_, (view, table))| view != table)
+            .map(|(index, (view, table))| Self::Differs {
+                index,
+                view_gpa: *view,
+                table_gpa: *table,
+            })
+    }
+}
+
+impl reims_vgpu_observe::Decline for ViewGpaDisagreement {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::Differs { .. } => "zc_packed_view_gpa_differs",
+            Self::Short { .. } => "zc_packed_view_gpa_short",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::Differs {
+                index,
+                view_gpa,
+                table_gpa,
+            } => vec![
+                ("page", index.to_string()),
+                ("view_gpa", format!("{view_gpa:#x}")),
+                ("table_gpa", format!("{table_gpa:#x}")),
+            ],
+            Self::Short {
+                view_pages,
+                table_pages,
+            } => vec![
+                ("view_pages", view_pages.to_string()),
+                ("table_pages", table_pages.to_string()),
+            ],
+        }
+    }
+}
+
+/// Judge a declared mapping view's page GPAs against the task page table.
+///
+/// This device resolves the physical pages behind a packed span two different
+/// ways, and which one runs is decided by whether the host-pointer import is
+/// available. With the import, a zero-copy alias takes the GPAs the guest
+/// recorded when it *declared* the mapping view. Without it, the copying rail
+/// walks the task's page table at bind time. Both are contract answers — the
+/// view is the guest's own declaration and the page table is the guest's own
+/// translation — so they are required to agree, and nothing until now compared
+/// them.
+///
+/// A disagreement is a genuine loss of guest work rather than a policy choice:
+/// the alias is bound over pages the guest does not currently place at that
+/// address, so the GPU samples or overwrites unrelated memory while every
+/// counter in the tree reads healthy. That is why this is on the fail channel
+/// and not only in the census.
+///
+/// It runs at construction and not on reuse, which is what makes it free: the
+/// packed resolution is cached, so this walks the page table about once per
+/// distinct resource rather than once per bind. It therefore cannot see a page
+/// table edited *after* an alias was built — a reuse-time audit would be needed
+/// for that, and would need a stride to pay for itself.
+fn audit_view_gpas_against_page_table<M: crate::runtime::host::HostMemory>(
+    host: &M,
+    state: &crate::runtime::Device,
+    task_id: u32,
+    page_base: u64,
+    map_len: u64,
+    view_gpas: &[u64],
+) {
+    let table = crate::runtime::gva_mem::task_gva_page_gpas(
+        host,
+        &state.tasks,
+        task_id,
+        page_base,
+        map_len,
+        state.page_shift,
+    );
+    match ViewGpaDisagreement::judge(view_gpas, &table) {
+        Some(disagreement) => {
+            use reims_vgpu_observe::Decline as _;
+            crate::runtime::drain::note_store_route(disagreement.slug());
+            reims_vgpu_observe::Emit::decline("zc_packed_view", &disagreement)
+                .field("gva", format!("{page_base:#x}"))
+                .fail_once(page_base);
+        }
+        None => crate::runtime::drain::note_store_route("zc_packed_view_gpa_agree"),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn ensure_packed_resource_with_extent<
     M: crate::runtime::host::HostMemory + crate::runtime::host::HostOps,
@@ -446,6 +573,9 @@ fn ensure_packed_resource_with_extent<
                     let gpas: Vec<u64> = mapping_pages
                         .get(first..first.checked_add(count)?)?
                         .to_vec();
+                    audit_view_gpas_against_page_table(
+                        host, state, task_id, page_base, map_len, &gpas,
+                    );
                     let whole = import.slice(import_offset, size).ok()?;
                     let guest =
                         crate::runtime::guest_ram::GuestRef::new(Arc::clone(&import), whole)
@@ -1133,6 +1263,77 @@ mod tests {
                 len: pages.len() * page_size as usize,
             }),
         })
+    }
+
+    /// The two rails that resolve a packed span must agree, and this is the
+    /// only place they are compared.
+    ///
+    /// The zero-copy alias takes the page GPAs the guest recorded when it
+    /// declared the mapping view; the copying rail walks the task page table at
+    /// bind time. A boot with the host-pointer import runs only the first, so
+    /// nothing else in the tree can notice the two diverging — and the way it
+    /// fails is content, which no counter reports.
+    #[test]
+    fn a_view_page_that_the_page_table_places_elsewhere_is_a_disagreement() {
+        let view = [0x10_000, 0x20_000, 0x30_000];
+
+        assert!(
+            ViewGpaDisagreement::judge(&view, &view).is_none(),
+            "identical resolutions are the healthy case"
+        );
+
+        // The walk covers the whole aligned span, so trailing pages beyond the
+        // resource are expected and must not read as a disagreement.
+        assert!(
+            ViewGpaDisagreement::judge(&view, &[0x10_000, 0x20_000, 0x30_000, 0x40_000]).is_none(),
+            "a longer page-table walk is not a disagreement"
+        );
+
+        match ViewGpaDisagreement::judge(&view, &[0x10_000, 0x99_000, 0x30_000]) {
+            Some(ViewGpaDisagreement::Differs {
+                index,
+                view_gpa,
+                table_gpa,
+            }) => {
+                assert_eq!((index, view_gpa, table_gpa), (1, 0x20_000, 0x99_000));
+            }
+            other => panic!(
+                "a relocated page must be reported, got {:?}",
+                other.is_none()
+            ),
+        }
+
+        match ViewGpaDisagreement::judge(&view, &[0x10_000]) {
+            Some(ViewGpaDisagreement::Short {
+                view_pages,
+                table_pages,
+            }) => assert_eq!((view_pages, table_pages), (3, 1)),
+            other => panic!(
+                "an unbacked tail must be reported, got {:?}",
+                other.is_none()
+            ),
+        }
+    }
+
+    /// Every arm names itself, because a shared slug is the one defect the
+    /// decline vocabulary exists to prevent.
+    #[test]
+    fn each_view_disagreement_names_its_own_check() {
+        use reims_vgpu_observe::Decline as _;
+        let differs = ViewGpaDisagreement::Differs {
+            index: 1,
+            view_gpa: 0x20_000,
+            table_gpa: 0x99_000,
+        };
+        let short = ViewGpaDisagreement::Short {
+            view_pages: 3,
+            table_pages: 1,
+        };
+        assert_ne!(differs.slug(), short.slug());
+        assert_eq!(
+            differs.fields().iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            ["page", "view_gpa", "table_gpa"]
+        );
     }
 
     #[test]
