@@ -122,6 +122,11 @@ pub(crate) enum WindowRefusal {
         mip_level: u32,
         guest_offset: u64,
         host_offset: u64,
+        /// The two bases the host offset was translated through, reported
+        /// because their difference is what a mismatch is actually made of and
+        /// a reader cannot recover either one from the difference alone.
+        image_base: u64,
+        resource_base: u64,
     },
     BindingRangeOverflow,
     AllocationTooShort {
@@ -208,10 +213,14 @@ impl Decline for WindowRefusal {
                 mip_level,
                 guest_offset,
                 host_offset,
+                image_base,
+                resource_base,
             } => vec![
                 ("mip", mip_level.to_string()),
                 ("guest_offset", guest_offset.to_string()),
                 ("host_offset", host_offset.to_string()),
+                ("image_base", image_base.to_string()),
+                ("resource_base", resource_base.to_string()),
             ],
             Self::SubresourceAfterPlane {
                 plane_offset,
@@ -427,6 +436,8 @@ fn validate_mip_subresource(
             mip_level,
             guest_offset: guest.offset,
             host_offset,
+            image_base: placement.image_base,
+            resource_base: placement.resource_base,
         });
     }
     if host.row_pitch != guest.row_pitch {
@@ -1482,6 +1493,8 @@ mod tests {
                 mip_level: 1,
                 guest_offset: 0x280,
                 host_offset: 0x240,
+                image_base: 0,
+                resource_base: 0,
             })
         );
     }
