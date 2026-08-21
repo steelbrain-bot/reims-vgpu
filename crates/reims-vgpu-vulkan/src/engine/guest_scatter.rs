@@ -881,4 +881,169 @@ mod tests {
             assert!(end <= t.bind_range, "run {i} lands inside the bound window");
         }
     }
+
+    // Byte-exact execution of the plan, rather than the shape of it.
+    //
+    // Every test above asserts on indices, which is the plan's vocabulary. None
+    // of them says the bytes that arrive are the bytes the guest holds, and an
+    // index that is wrong by a whole window is still a perfectly well-formed
+    // index -- it reads the wrong RAM and reports success, which is the failure
+    // this rail cannot see from any counter. What follows runs the kernel over
+    // the plan and diffs the result against a plain copy.
+
+    /// Guest RAM as a total function, so a run may sit at a 16 GiB offset
+    /// without anything allocating 16 GiB. Any injective-enough mixing does;
+    /// this one is a cheap integer hash with no fixed points near zero, so a
+    /// window mis-based by any amount produces different bytes.
+    fn guest_byte(offset: u64) -> u8 {
+        let mut x = offset.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        x ^= x >> 29;
+        x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        (x >> 56) as u8
+    }
+
+    /// What the copy means: every run moves its bytes, and nothing else moves.
+    fn reference(runs: &[ScatterRun], slot_len: usize) -> Vec<u8> {
+        let mut slot = vec![0u8; slot_len];
+        for r in runs {
+            for i in 0..r.len {
+                slot[(r.dst + i) as usize] = guest_byte(r.src + i);
+            }
+        }
+        slot
+    }
+
+    /// `guest_scatter.comp`, executed on the host over a planned table set.
+    ///
+    /// This is the shader's whole body: `dst[run.y + i] = src[run.x + i]` in
+    /// 4-byte words, with `src` bound at `bind_offset` and `dst` bound at zero.
+    /// The one thing it adds is the bound check the GPU would not give us --
+    /// a read past `bind_range` is a Vulkan out-of-bounds, so it fails here.
+    fn simulate(tables: &[RunTable], slot_len: usize) -> Vec<u8> {
+        let mut slot = vec![0u8; slot_len];
+        for table in tables {
+            for run in table.words.chunks_exact(WORDS_PER_RUN) {
+                let (x, y, z) = (u64::from(run[0]), u64::from(run[1]), u64::from(run[2]));
+                for i in 0..z {
+                    let src_rel = (x + i) * SCATTER_WORD;
+                    assert!(
+                        src_rel + SCATTER_WORD <= table.bind_range,
+                        "word {i} of a run reads past the bound window \
+                         ({src_rel} + 4 > {})",
+                        table.bind_range
+                    );
+                    for b in 0..SCATTER_WORD {
+                        let at = ((y + i) * SCATTER_WORD + b) as usize;
+                        slot[at] = guest_byte(table.bind_offset + src_rel + b);
+                    }
+                }
+            }
+        }
+        slot
+    }
+
+    fn gathers_the_guest_bytes(runs: &[ScatterRun], max_range: u64) {
+        let slot_len = runs
+            .iter()
+            .map(|r| r.dst + r.len)
+            .max()
+            .expect("a non-empty plan") as usize;
+        let tables = build_gather_run_tables(runs, ALIGN, max_range, slot_len as u64)
+            .expect("aligned runs plan");
+        assert_eq!(
+            simulate(&tables, slot_len),
+            reference(runs, slot_len),
+            "gathered bytes differ from the guest's own, max_range={max_range}, \
+             {} table(s) for {} run(s)",
+            tables.len(),
+            runs.len()
+        );
+    }
+
+    /// The ordinary case, and the shape a sampled window actually has: one row
+    /// run per guest page, scattered across RAM, landing contiguously in the
+    /// device-local slot.
+    #[test]
+    fn a_scattered_gather_delivers_exactly_the_guest_bytes() {
+        let base = 12 * 1024 * 1024 * 1024u64;
+        let runs: Vec<ScatterRun> = (0..64)
+            .map(|i| ScatterRun {
+                // Deliberately not monotonic in `dst` order: the guest hands its
+                // runs over in window order and the planner sorts.
+                src: base + ((i * 7919) % 64) * 4096,
+                dst: i * 4096,
+                len: 4096,
+            })
+            .collect();
+        gathers_the_guest_bytes(&runs, MAX);
+    }
+
+    /// The same runs, forced to partition. `max_range` is the only thing that
+    /// changes, so any difference is the split path and nothing else.
+    ///
+    /// This is the arm that a driven boot took on 6 % of its writebacks, and the
+    /// arm where a mis-based window is invisible: each table re-bases its own
+    /// runs, so getting the base wrong still yields indices inside the bound.
+    #[test]
+    fn a_gather_that_partitions_delivers_the_same_bytes_as_one_that_does_not() {
+        let base = 1 << 30;
+        let runs: Vec<ScatterRun> = (0..32)
+            .map(|i| ScatterRun {
+                // Spread over 2 MiB so a small `max_range` must cut it up.
+                src: base + i * 65536,
+                dst: i * 4096,
+                len: 4096,
+            })
+            .collect();
+        let whole = build_gather_run_tables(&runs, ALIGN, MAX, 32 * 4096).expect("plans");
+        assert_eq!(whole.len(), 1, "the control arm is a single window");
+        for max_range in [1 << 20, 1 << 18, 1 << 17, 262_144, 131_072] {
+            gathers_the_guest_bytes(&runs, max_range);
+        }
+        // And the partitioning actually happened, so the assertions above were
+        // not all quietly testing the single-window path.
+        let split = build_gather_run_tables(&runs, ALIGN, 131_072, 32 * 4096).expect("plans");
+        assert!(split.len() > 1, "this max_range must force a partition");
+    }
+
+    /// Runs whose guest offsets are not a multiple of the bind alignment, so
+    /// every window carries the rounding-down slack in its indices. A planner
+    /// that rounded the *base* without paying for it in `x` reads short.
+    #[test]
+    fn a_gather_based_on_an_unaligned_guest_offset_still_delivers_its_bytes() {
+        for skew in [4u64, 8, 12, 20, 36, 60] {
+            let base = (3 << 30) + skew;
+            let runs: Vec<ScatterRun> = (0..16)
+                .map(|i| ScatterRun {
+                    src: base + i * 8192,
+                    dst: i * 256,
+                    len: 256,
+                })
+                .collect();
+            gathers_the_guest_bytes(&runs, MAX);
+            gathers_the_guest_bytes(&runs, 65536);
+        }
+    }
+
+    /// Run lengths that are a whole number of words but not of pages, mixed
+    /// widths in one plan, and a destination that is not filled in order --
+    /// a CPU-rasterized glyph atlas is one byte a texel, so its rows are word
+    /// multiples far more often than they are page multiples.
+    #[test]
+    fn a_gather_of_mixed_narrow_runs_delivers_its_bytes() {
+        let base = 7 << 30;
+        let widths = [4u64, 8, 12, 36, 68, 132, 260, 1028];
+        let mut runs = Vec::new();
+        let mut dst = 0u64;
+        for (i, w) in widths.iter().cycle().take(48).enumerate() {
+            runs.push(ScatterRun {
+                src: base + (i as u64 * 4099) * 4,
+                dst,
+                len: *w,
+            });
+            dst += *w;
+        }
+        gathers_the_guest_bytes(&runs, MAX);
+        gathers_the_guest_bytes(&runs, 32768);
+    }
 }
