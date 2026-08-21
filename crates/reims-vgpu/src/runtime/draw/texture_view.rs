@@ -720,7 +720,7 @@ pub(crate) enum LinearLoadRefusal {
     /// which would reinterpret the allocation rather than re-read it.
     ViewFormatBppMismatch { base: u16, view: u16 },
     /// The requested mip level has no address/layout in the descriptor.
-    NoLevelGva { level: u32 },
+    NoLevelGva { slice: u32, level: u32 },
     /// This format has no bytes-per-pixel in the contract table, so no row
     /// length can be computed for it.
     FormatBppUnknown { format: u16 },
@@ -771,7 +771,9 @@ impl crate::observe::Decline for LinearLoadRefusal {
                 ("base_fmt", format!("{base:#x}")),
                 ("view_fmt", format!("{view:#x}")),
             ],
-            Self::NoLevelGva { level } => vec![("level", level.to_string())],
+            Self::NoLevelGva { slice, level } => {
+                vec![("slice", slice.to_string()), ("level", level.to_string())]
+            }
             Self::FormatBppUnknown { format } | Self::RowConvertUnsupported { format } => {
                 vec![("fmt", format!("{format:#x}"))]
             }
@@ -788,8 +790,15 @@ impl crate::observe::Decline for LinearLoadRefusal {
     }
 }
 
-/// Load a linear (buffer-backed) texture for sampling, keeping the layout its
-/// bytes are in.
+/// Load one `(slice, level)` subresource of a linear (buffer-backed) texture for
+/// sampling, keeping the layout its bytes are in.
+///
+/// One subresource, never a whole texture: a caller that needs every array layer
+/// or every cube face calls this once per physical slice and concatenates, which
+/// is the only order the engine's tightly-packed layered expectation accepts.
+/// The slice count belongs to the caller because it is the *bind* that says how
+/// many layers it declared, and `LinearTextureDescriptor::physical_slice_count`
+/// is what answers it.
 ///
 /// A caller that passes anything but [`NativeUploads::NONE`] must carry the
 /// returned layout all the way to the bind: the bytes are then the guest's own
@@ -805,6 +814,7 @@ pub(crate) fn load_linear_texture_host<M: HostMemory + HostOps>(
     host: &mut M,
     task_id: u32,
     texture_ref: u32,
+    slice: u32,
     level: u32,
     format_override: Option<u16>,
     native: NativeUploads,
@@ -815,6 +825,7 @@ pub(crate) fn load_linear_texture_host<M: HostMemory + HostOps>(
         host,
         task_id,
         texture_ref,
+        slice,
         level,
         format_override,
         native,
@@ -923,6 +934,7 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     host: &mut M,
     task_id: u32,
     texture_ref: u32,
+    slice: u32,
     level: u32,
     format_override: Option<u16>,
     native: NativeUploads,
@@ -954,8 +966,8 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
         },
     )?;
     let (gva, layout) = tex
-        .level_gva(level, state.page_shift)
-        .ok_or(R::NoLevelGva { level })?;
+        .subresource_gva(slice, level, state.page_shift)
+        .ok_or(R::NoLevelGva { slice, level })?;
     let w = layout.width;
     let h = layout.height;
     let planes = layout.planes();
@@ -984,9 +996,12 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     // Every depth plane belongs to the level; only the final plane's final-row
     // padding lies outside the bytes this loader reads.
     let span = layout.slice_read_span(tight).ok_or(R::SizeOverflow)?;
+    // Bounded against the subresource this call actually reads. `base_offset +
+    // layout.offset` is the same arithmetic only for slice 0; for any later
+    // face or array layer it omits the inter-slice advance and would bound a
+    // read of the last slice against the extent of the first.
     let end = tex
-        .base_offset
-        .checked_add(layout.offset)
+        .subresource_offset(slice, level)
         .and_then(|offset| offset.checked_add(span))
         .ok_or(R::SizeOverflow)?;
     if tex.allocation_size != 0 && end > tex.allocation_size {
@@ -1348,7 +1363,7 @@ mod texture_view_split_tests {
             LinearLoadRefusal::DescriptorUndecodable,
             LinearLoadRefusal::NoPixelFormat,
             LinearLoadRefusal::ViewFormatBppMismatch { base: 1, view: 2 },
-            LinearLoadRefusal::NoLevelGva { level: 3 },
+            LinearLoadRefusal::NoLevelGva { slice: 0, level: 3 },
             LinearLoadRefusal::FormatBppUnknown { format: 4 },
             LinearLoadRefusal::RowStrideBelowTight {
                 stride: 5,

@@ -881,20 +881,48 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     // the rung a `RGBA16Float` display-profile LUT actually lands on, because
     // the three rungs above are reached only for a resource the draw already
     // knows is a linear texture.
-    let (mut bytes, layout) = load_sampled_rgba_static(
-        state,
-        host,
-        task_id,
-        texture_ref,
-        native_uploads_asking_host(state.executor.as_ref()),
-        crate::runtime::render_writeback::SettleSite::LinearTextureSampled,
-    )?;
+    // Every physical slice the descriptor declares, concatenated in slice order.
+    // A cube is six faces and a texture array is its declared length, both of
+    // them at `bytes_per_slice` advances rather than tightly packed, which is
+    // why this loops instead of scaling one read up: a six-times-longer read
+    // from face 0's offset returns five faces of whatever the allocation holds
+    // next. The engine expects `width * height * layers * texel` with the slices
+    // packed end to end, so the concatenation here is the layout it validates
+    // against.
+    //
+    // `physical_slice_count` is the contract term — `slice_count` expanded by
+    // the six faces a cube dimension record declares — and it is 1 for an
+    // ordinary 2D texture, which is what every caller of this rung used to get
+    // by reading slice 0 alone.
     let (_entry, tex) = sampled_texture_descriptor(state, host, task_id, texture_ref)?;
     let (w, h) = tex.extent()?;
     let planes = tex.levels.first()?.planes();
+    let slices = tex.physical_slice_count()?;
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut layout = None;
+    for slice in 0..slices {
+        let (face, face_layout) = load_sampled_rgba_static(
+            state,
+            host,
+            task_id,
+            texture_ref,
+            slice,
+            native_uploads_asking_host(state.executor.as_ref()),
+            crate::runtime::render_writeback::SettleSite::LinearTextureSampled,
+        )?;
+        // Every slice of one texture shares its format; a rung that answered a
+        // different layout for a later face would silently splice two texel
+        // sizes into one buffer.
+        if *layout.get_or_insert(face_layout) != face_layout {
+            return None;
+        }
+        bytes.extend_from_slice(&face);
+    }
+    let layout = layout?;
     let need = (w as usize)
         .saturating_mul(h as usize)
         .saturating_mul(planes as usize)
+        .saturating_mul(slices as usize)
         .saturating_mul(layout.layout().bytes_per_texel() as usize);
     if bytes.len() < need {
         return None;

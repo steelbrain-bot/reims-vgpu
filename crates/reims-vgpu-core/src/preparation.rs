@@ -20,8 +20,8 @@ pub struct SampledImageShape {
 }
 
 /// Project reflected texture dimensionality into the semantic shape consumed
-/// by draw execution. `None` is a typed inability to express cube images, not
-/// a backend-capability result.
+/// by draw execution. `None` is a typed inability to express a cube-array
+/// image, not a backend-capability result.
 pub fn sampled_image_shape(kind: crate::SampledImageKind) -> Option<SampledImageShape> {
     use crate::SampledImageKind;
     let d2 = SampledImageShape {
@@ -52,7 +52,23 @@ pub fn sampled_image_shape(kind: crate::SampledImageKind) -> Option<SampledImage
             ..d2
         },
         SampledImageKind::D3 => SampledImageShape { volume: true, ..d2 },
-        SampledImageKind::Cube | SampledImageKind::CubeArray => return None,
+        // A cube is six faces, always, by the definition of the type the shader
+        // declared -- not a count read back from a resource. The six are also
+        // what the guest's own dimension record means when it marks its slices
+        // as cube slices, which is why `LinearTextureDescriptor` expands
+        // `slice_count` by exactly this factor.
+        SampledImageKind::Cube => SampledImageShape {
+            cube: true,
+            layers: 6,
+            ..d2
+        },
+        // Still refused, and by name rather than by approximation. The executor
+        // treats `arrayed`, `volume` and `cube` as mutually exclusive, and its
+        // view-type selection tests `cube` before `arrayed`, so a cube-array
+        // admitted here would be bound as a plain cube -- the first six faces
+        // of a longer array, silently. Widening this needs a `CUBE_ARRAY` view
+        // type in the backend first.
+        SampledImageKind::CubeArray => return None,
     })
 }
 
@@ -347,11 +363,39 @@ mod tests {
         }
     }
 
+    /// A cube's six faces come from the declared type, so the shape states them
+    /// without consulting any resource. The executor validates
+    /// `layers == 6 && width == height` against this, and would decline a cube
+    /// carrying any other layer count — so a shape that left `layers` at 1
+    /// would trade one refusal for another rather than binding anything.
     #[test]
-    fn sampled_shape_refuses_unrepresentable_cube_images() {
+    fn sampled_shape_gives_a_cube_its_six_faces() {
         use crate::SampledImageKind;
 
-        assert!(sampled_image_shape(SampledImageKind::Cube).is_none());
+        let shape = sampled_image_shape(SampledImageKind::Cube).expect("cube is expressible");
+        assert_eq!(
+            (
+                shape.cube,
+                shape.layers,
+                shape.arrayed,
+                shape.volume,
+                shape.one_dim,
+                shape.multisampled,
+            ),
+            (true, 6, false, false, false, false),
+        );
+    }
+
+    /// The one shape still refused, and deliberately: the executor treats
+    /// `arrayed`/`volume`/`cube` as mutually exclusive and picks its view type
+    /// by testing `cube` first, so admitting a cube-array would bind the first
+    /// six faces of a longer array as though they were the whole texture.
+    /// A typed refusal costs the guest that draw and says so; the alternative
+    /// costs it silently.
+    #[test]
+    fn sampled_shape_refuses_cube_arrays_by_name() {
+        use crate::SampledImageKind;
+
         assert!(sampled_image_shape(SampledImageKind::CubeArray).is_none());
     }
 }

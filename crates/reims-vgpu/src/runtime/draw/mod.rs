@@ -3037,11 +3037,15 @@ pub(super) fn seed_color_load<M: HostMemory + HostOps>(
     // A colour LOAD seed is copied into a render target through the RGBA8-shaped
     // seed path, so this arm takes no native layout — the bytes must be what
     // that path reads them as.
+    // A colour LOAD seed fills one 2D render target, so it names one
+    // subresource. A layered source seeds from its first slice here and always
+    // has; the target it seeds has no second layer to receive the rest.
     let (rgba, _layout) = load_sampled_rgba_static(
         state,
         host,
         task_id,
         texture_ref,
+        0,
         NativeUploads::NONE,
         crate::runtime::render_writeback::SettleSite::LinearTextureSeed,
     )?;
@@ -3058,9 +3062,22 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
     host: &mut M,
     task_id: u32,
     texture_ref: u32,
+    slice: u32,
     native: NativeUploads,
     site: crate::runtime::render_writeback::SettleSite,
 ) -> Option<(Vec<u8>, SampledByteFormat)> {
+    // The three rungs below are single-subresource construction forms: a
+    // buffer-backed texture views one buffer range and an IOSurface texture one
+    // plane, so neither carries a second array layer or cube face to advance
+    // to. Answering a later slice with slice 0's bytes would bind five copies
+    // of one face and look like a working cube, so the request is refused
+    // instead — only the linear rung below can honour it.
+    if slice != 0
+        && (buffer_texture_descriptor(state, host, task_id, texture_ref, None).is_some()
+            || objects::resolve_iosurface_texture_ref(state, host, task_id, texture_ref).is_some())
+    {
+        return None;
+    }
     // Opcode-9 buffer-backed texture (type-8): sample the source buffer directly.
     if let Some(bt) = buffer_texture_descriptor(state, host, task_id, texture_ref, None) {
         let source = bt.desc.pixel_format;
@@ -3122,6 +3139,7 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
         host,
         task_id,
         tex_ref,
+        slice,
         level,
         fmt_override,
         native,

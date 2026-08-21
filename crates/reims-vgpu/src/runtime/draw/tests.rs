@@ -7341,3 +7341,116 @@ fn a_retained_depth_stencil_state_is_served_without_reading_guest_memory() {
         "and the delete is a real invalidation, not a counter"
     );
 }
+
+/// Every physical slice is read from its own offset, an inter-slice advance
+/// apart.
+///
+/// A cube's six faces and a texture array's layers are the same packing:
+/// `base_offset` names slice 0 and each later slice sits one `bytes_per_slice`
+/// further on. The loader used to name only a level, resolving it against
+/// slice 0 unconditionally, so every layer of a multi-slice texture served the
+/// first layer's bytes — six identical faces that read as a working cube. The
+/// two slices below carry deliberately different content, so a loader that
+/// ignores the slice returns the same bytes twice and fails here.
+///
+/// This is also why the arithmetic bounding the read moved onto
+/// `subresource_offset`: `base_offset + level.offset` is the true end of the
+/// allocation only for slice 0, and would bound a read of the last slice
+/// against the extent of the first.
+#[test]
+fn a_later_slice_is_read_at_its_own_inter_slice_advance() {
+    use crate::runtime::decode::resource::{
+        list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, TEXTURE_DESC_BASE_LEN,
+        TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_USED_SIZE,
+        TEXTURE_DESC_WIDTH,
+    };
+    use reims_vgpu_core::endian::{st16, st32, st64};
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let page = 1u64 << PAGE_SHIFT_ARM64E;
+    let dir_pfn = 2u32;
+    let root_pfn = 3u32;
+    let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
+    let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x4000, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    assert!(host.write_gpa(dir_gpa, &d).is_ok());
+    for i in 0..4u32 {
+        let pfn = 4 + i;
+        host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
+        let mut pte = [0u8; 4];
+        st32(&mut pte, pfn);
+        assert!(host.write_gpa(root_gpa + (i as u64) * 4, &pte).is_ok());
+    }
+    state.define_task(1, 0x1000, dir_pfn);
+    assert!(state.set_object_list(1, 0, 32));
+
+    // Two slices of a tight 4x2 BGRA8 level, one whole page apart. The advance
+    // is deliberately far larger than the 32 bytes a slice occupies: the
+    // contract says slices are separated by `bytes_per_slice`, not packed.
+    let tex_ref = 6u32;
+    let slices = 2u16;
+    let bytes_per_slice = page;
+    let mut b = vec![0u8; TEXTURE_DESC_BASE_LEN];
+    st64(&mut b[0..], 4 * page); // allocation_size
+    st32(&mut b[8..], 1); // handle -> slice 0 at gva 1 << page_shift
+    write_linear_texture_packing(&mut b, 1, slices, 0, bytes_per_slice);
+    st32(&mut b[TEXTURE_DESC_USED_SIZE..], 16 * 2);
+    st32(&mut b[TEXTURE_DESC_ROW_STRIDE..], 16);
+    st32(&mut b[TEXTURE_DESC_WIDTH..], 4);
+    st32(&mut b[TEXTURE_DESC_WIDTH + 4..], 2); // height
+    st16(&mut b[TEXTURE_DESC_PIXEL_FORMAT..], MTL_FORMAT_BGRA8_UNORM);
+    let desc_gva = 0x200u64;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &b);
+    let off = list_object_entry_offset(tex_ref, 32).unwrap();
+    let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(
+        &mut le[0..],
+        (OBJECT_TYPE_TEXTURE as u32) | ((TEXTURE_DESC_BASE_LEN as u32) << 8),
+    );
+    le[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+    write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
+
+    let slice0 = [7u8, 5, 3, 255].repeat(8);
+    let slice1 = [90u8, 60, 30, 255].repeat(8);
+    write_task_gva_arm64e(&mut host, &state.tasks[1], page, &slice0);
+    write_task_gva_arm64e(&mut host, &state.tasks[1], page + bytes_per_slice, &slice1);
+
+    let load = |state: &mut Device, host: &mut FakeHost, slice: u32| {
+        texture_view::load_linear_texture_host(
+            state,
+            host,
+            1,
+            tex_ref,
+            slice,
+            0,
+            None,
+            NativeUploads::NONE,
+            crate::runtime::render_writeback::SettleSite::LinearTextureSampled,
+        )
+        .expect("both slices are inside the declared allocation")
+        .0
+    };
+
+    // `NativeUploads::NONE` says the executor accepts no native BGRA8, so the
+    // loader converts each row on the way out. The two patterns arrive
+    // channel-swapped and still distinct, which is all this test reads them for.
+    let got0 = load(&mut state, &mut host, 0);
+    let got1 = load(&mut state, &mut host, 1);
+    assert_eq!(
+        &got0[..4],
+        &[3, 5, 7, 255],
+        "slice 0 still reads from base_offset"
+    );
+    assert_eq!(
+        &got1[..4],
+        &[30, 60, 90, 255],
+        "slice 1 must read one bytes_per_slice on, not repeat slice 0"
+    );
+}
