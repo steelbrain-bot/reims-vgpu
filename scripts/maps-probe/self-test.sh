@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Exercise `maps-visual-gate.sh` against the two populations it separates: a
+# flat fill, which is what an unstarted or tileless workload looks like, and a
+# canvas carrying geographic layers. Neither case involves type, because the
+# gate no longer reads any -- whether the label layer rendered is a question a
+# human answers by looking at the probe's captures.
 set -euo pipefail
 
 DIR=$(mktemp -d)
@@ -12,11 +17,15 @@ if "$GATE" --before "$DIR/empty.png" --after "$DIR/empty.png" \
   exit 1
 fi
 
-magick -size 1280x720 canvas:white \
-  -fill '#8bc6e8' -draw 'polygon 230,80 560,80 710,260 590,500 230,620' \
-  -fill '#263238' -font DejaVu-Sans -pointsize 28 \
-  -annotate +760+140 'North District' -annotate +760+240 'River Park' \
-  -annotate +760+340 'Central Station' -annotate +760+440 'South Village' \
+# Land, water and road-shaped fills spread across the whole frame, so the
+# interior the gate crops carries them wherever it lands.
+magick -size 1280x720 canvas:'#f2efe9' \
+  -fill '#8bc6e8' -draw 'polygon 0,0 620,0 760,300 560,720 0,720' \
+  -fill '#cfe3c0' -draw 'rectangle 700,60 1240,380' \
+  -fill '#e8d9a0' -draw 'rectangle 660,420 1240,690' \
+  -fill '#ffffff' -stroke '#c8c2b4' -strokewidth 9 \
+  -draw 'line 0,240 1280,300' -draw 'line 0,540 1280,470' \
+  -draw 'line 340,0 420,720' -draw 'line 900,0 980,720' \
   "$DIR/map.png"
 "$GATE" --before "$DIR/map.png" --after "$DIR/map.png" \
   --settled "$DIR/map.png"

@@ -34,17 +34,12 @@ export QMP_SOCK="${QMP_SOCK:-$REPO/vm/disks/run/qmp.sock}"
 Q="$REPO/scripts/qmp/qmp.py"
 SHOT="$REPO/scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh"
 VISUAL_GATE="$REPO/scripts/maps-probe/maps-visual-gate.sh"
-# Every frame this probe captures is read by the gate, not by a human, and the
-# gate's label test is an OCR of type whose on-screen size is set by the guest's
-# zoom rather than by anything here. The capture helper's default 720p cap
-# exists to bound the token cost of an agent reading a screenshot; applied to a
-# machine reader it destroys the label layer before the gate can judge it. A
-# 1920x1080 scanout downscaled to 1280x719 leaves Maps' road and place labels as
-# text-shaped blobs that OCR returns as garbage -- a correctly rendered New York
-# scored one label word against a threshold of four and failed a run whose
-# geography was complete and whose fill fraction passed with room to spare.
-# Sampling the instrument at the resolution the thing being measured exists at
-# is the fix; nothing about the contract the gate enforces changes.
+# Capture at the scanout's own resolution. The helper's default 720p cap exists
+# to bound the token cost of an agent reading a screenshot, and Maps' map labels
+# are the smallest thing in the frame: a 1920x1080 scanout downscaled to
+# 1280x719 leaves them as text-shaped blobs. Every capture this probe keeps is
+# there to be read by a human -- that is the only thing that scores a frame --
+# so it is kept at the resolution the thing being judged exists at.
 export REIMS_SHOT_NATIVE=1
 FAILLOG=/tmp/reims-vgpu-fail.log
 mkdir -p "$OUT"
@@ -89,16 +84,16 @@ sleep 10
 
 # Select a declared, label-dense geographic workload after first-run handling.
 # A fixed map link is probe setup, not device policy: it makes separate boots
-# render the same class of scene and gives the visual gate a meaningful promise
-# to check. Re-opening it also prevents snapshot-restored location history from
-# choosing an ocean or a different zoom level for one arm.
+# render the same class of scene, and it gives whoever reads the captures a
+# known expectation to read them against. Re-opening it also prevents
+# snapshot-restored location history from choosing an ocean or a different zoom
+# level for one arm.
 #
-# z=14, not z=12. The zoom is part of what makes the scene checkable: walking
-# z12/z14/z16/z18 over one boot, only z14 put legible type on screen — 57 words
-# above the gate's confidence floor, against 0 at all three other zooms on the
-# same boot of the same binary. At z12 the labels render too small to survive
-# OCR, so a gate pointed there scores a correct frame the same as a frame with
-# no label layer at all, which is what it did.
+# z=14 is a dense metropolitan viewport: roads, water, park and building fills
+# at a scale where a whole layer going missing is obvious to a reader, and where
+# the place and street labels are drawn large enough to be legible in the
+# capture. Walking z12/z14/z16/z18 over one boot, z14 was the zoom whose type
+# was readable at the captured resolution.
 MAP_URL='http://maps.apple.com/?ll=40.7128,-74.0060&z=14'
 timeout 60 ssh -o BatchMode=yes macos-vm \
   "open -a Maps '$MAP_URL'" 2>/dev/null \
@@ -160,10 +155,11 @@ R=$((H / 12))
 "$Q" move "$CX" "$CY" >/dev/null 2>&1
 sleep 2
 
-# Do not start the scored input stream until the declared scene exists. Tile
-# geometry and labels arrive independently, so a fixed sleep can catch one
-# without the other. Each attempt is retained as evidence; the final successful
-# frame becomes `before.png`.
+# Do not start the scored input stream until there is a scene to measure. Tiles
+# arrive asynchronously, so a fixed sleep can start the window over a blank map
+# and report the frame rate of a workload that never began. Each attempt is
+# retained as evidence; the final one becomes `before.png` and is read by a
+# human against the declared scene.
 ready=no
 for attempt in 1 2 3 4 5 6; do
   candidate="$OUT/before-$attempt.png"
@@ -274,8 +270,9 @@ timeout 60 ssh -o BatchMode=yes macos-vm "open -a Maps '$MAP_URL'" 2>/dev/null \
   || { echo "could not restore the Maps workload"; exit 3; }
 
 # A successful `open` means Maps accepted the URL, not that its asynchronous
-# tile and label layers have arrived. Apply the same content gate as setup so a
-# slow restore cannot be mistaken for a rendering regression.
+# tile layers have arrived. Apply the same canvas check as setup, so the frames
+# kept for reading are of the restored scene rather than of a blank map that had
+# not caught up yet.
 restored=no
 for attempt in 1 2 3 4 5 6; do
   candidate="$OUT/restored-$attempt.png"
@@ -308,9 +305,10 @@ sleep 5
 sleep 10
 "$SHOT" -o "$OUT/settled.png" >/dev/null 2>&1 || echo "settled screenshot failed"
 
-# A nonzero verdict makes the whole run invalid. The caller must not rank an
-# empty canvas, a label-free partial render, or a run that lost its declared
-# geography merely because those frames were cheap.
+# A nonzero verdict makes the whole run invalid: an empty canvas is cheap to
+# draw, so its frame rate outranks every real one and must not be reported.
+# Whether the scene that IS present is correct is not decided here -- the three
+# frames named below are the ones to open and look at.
 if ! "$VISUAL_GATE" --before "$OUT/before.png" --after "$OUT/after.png" \
      --settled "$OUT/settled.png" >"$OUT/visual-verdict.txt" 2>&1; then
   cat "$OUT/visual-verdict.txt"
