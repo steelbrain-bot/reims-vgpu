@@ -3061,13 +3061,6 @@ struct JoinTerms {
     has_query: bool,
     no_identity: bool,
     no_open_batch: bool,
-    /// This draw may resolve its color attachment directly over guest pages.
-    /// It cannot join a command buffer an earlier draw left recording because
-    /// the actual placement decision happens when the target is acquired. A
-    /// failed import may still open a new batch after that decision; a
-    /// successful import must submit and complete before its Store is
-    /// published to the runtime.
-    guest_target_candidate: bool,
     batch_full: bool,
     target_switch: bool,
 }
@@ -3215,7 +3208,7 @@ impl JoinTerms {
     /// one question and miss the other, and cannot be mis-scoped by landing at
     /// the wrong index — its scope is written beside it, not inferred from
     /// where it sits.
-    const LADDER: [JoinRefusal; 11] = [
+    const LADDER: [JoinRefusal; 10] = [
         (|t| t.force_loss, JoinScope::Draw, "nojoin_force_loss"),
         (|t| t.quirk, JoinScope::Draw, "nojoin_quirk"),
         (|t| t.is_mrt, JoinScope::Draw, "nojoin_mrt"),
@@ -3224,11 +3217,6 @@ impl JoinTerms {
         (|t| t.has_query, JoinScope::Draw, "nojoin_query"),
         (|t| t.no_identity, JoinScope::Draw, "nojoin_no_identity"),
         (|t| t.no_open_batch, JoinScope::Fit, "nojoin_no_open_batch"),
-        (
-            |t| t.guest_target_candidate,
-            JoinScope::Fit,
-            "nojoin_guest_target_candidate",
-        ),
         (|t| t.batch_full, JoinScope::Fit, "nojoin_batch_full"),
         (|t| t.target_switch, JoinScope::Fit, "nojoin_target_switch"),
     ];
@@ -3762,11 +3750,6 @@ pub(crate) unsafe fn execute_draw_inner(
         has_query: req.occlusion_query.is_some(),
         no_identity: req.target_identity.is_none(),
         no_open_batch: matches!(fit, BatchFit::None),
-        guest_target_candidate: req
-            .target_guest
-            .as_ref()
-            .and_then(|target| target.memory())
-            .is_some(),
         batch_full: matches!(fit, BatchFit::Full),
         target_switch: matches!(fit, BatchFit::OtherTarget),
     };
@@ -3827,7 +3810,7 @@ pub(crate) unsafe fn execute_draw_inner(
         // been submitted, so nothing may free one out from under it.
         _ => pools.begin_entry(ctx, counters)?,
     };
-    pools.begin_guest_operation(cb);
+    pools.enter_render_encoder_record(cb, req.continues_render_pass);
     phase.enter(super::draw_phase::Phase::Pipeline);
 
     // Build layout key from storage / sampled / sampler bindings. Sized up
@@ -6704,13 +6687,12 @@ pub(crate) unsafe fn execute_draw_inner(
     if let Some((pool, _)) = occlusion {
         ctx.device.cmd_end_query(cb, pool, 0);
     }
-    // A direct guest-backed attachment makes the Store visible outside Vulkan.
-    // The runtime's materialized-Store result means those bytes have landed,
-    // so this command buffer cannot remain merely recorded. Candidate targets
-    // were kept out of an older open batch above; after acquisition the memory
-    // variant is the exact placement answer and only a successful import bars
-    // this new command buffer from deferring.
-    let defer_submit = batch_eligible && target_guest_write_pages.is_none();
+    // Direct attachment writes use the same deferred submission rail as every
+    // other guest-memory write. `record_guest_write_debt` below arms their exact
+    // pages before this result is returned; the batch fence retires that debt,
+    // and completion stamps are queued behind the batch. Waiting here would
+    // turn every Metal encoder Store into a command-buffer completion point.
+    let defer_submit = batch_eligible;
     let keep_pass_open = req.render_pass_continues
         && defer_submit
         && !pass_churn_probe_enabled()
@@ -6890,7 +6872,7 @@ pub(crate) unsafe fn execute_draw_inner(
             &back_to_exit,
         );
     }
-    if target_guest_write_pages.is_some() {
+    if target_guest_write_pages.is_some() && !req.render_pass_continues {
         // The attachment image aliases guest RAM, so its Store is a write to
         // memory the guest vCPU and host presentation path read directly. A
         // fence orders execution but does not make the color write visible to
@@ -7199,18 +7181,6 @@ pub(crate) unsafe fn execute_draw_inner(
     // Store loses its frame silently, which is the one outcome the ground rules
     // forbid outright. What the equality licenses is not re-measuring it.
     let Some(ref rb) = readback else {
-        // A guest-backed attachment aliases the bytes the runtime publishes as
-        // a completed Store. Queue submission is insufficient: unlike an
-        // ordinary resident, guest code and the host presentation path can
-        // observe these bytes without recording a later Vulkan consumer. Wait
-        // this draw's fence before returning that completion fact.
-        let imported_store_completed = if target_guest_write_pages.is_some() {
-            phase.enter(super::draw_phase::Phase::Wait);
-            pools.wait_entry_fence(ctx, counters, fence)?;
-            true
-        } else {
-            false
-        };
         // A queried draw has no pixels to read back and still cannot take this
         // return: the sample count *is* its result, and it is not readable
         // until the command buffer completes. So the wait the comment above
@@ -7218,10 +7188,8 @@ pub(crate) unsafe fn execute_draw_inner(
         // for queried draws only, which on every workload measured so far is
         // none of them.
         if occlusion.is_some() {
-            if !imported_store_completed {
-                phase.enter(super::draw_phase::Phase::Wait);
-                pools.wait_entry_fence(ctx, counters, fence)?;
-            }
+            phase.enter(super::draw_phase::Phase::Wait);
+            pools.wait_entry_fence(ctx, counters, fence)?;
             return Ok(DrawOutput {
                 pixels: Vec::new(),
                 pixels_bgra: output_bgra,
@@ -8028,9 +7996,8 @@ mod tests {
             has_query: b(5),
             no_identity: b(6),
             no_open_batch: b(7),
-            guest_target_candidate: b(8),
-            batch_full: b(9),
-            target_switch: b(10),
+            batch_full: b(8),
+            target_switch: b(9),
         }
     }
 
@@ -8052,19 +8019,6 @@ mod tests {
             assert!(seen.insert(*name), "two rungs share the census name {name}");
         }
         assert_eq!(join_terms(0).refusal(), None, "no term set is a join");
-    }
-
-    #[test]
-    fn a_guest_target_candidate_starts_its_own_submission_decision() {
-        let candidate = JoinTerms {
-            guest_target_candidate: true,
-            ..join_terms(0)
-        };
-        assert_eq!(candidate.refusal(), Some("nojoin_guest_target_candidate"));
-        assert!(
-            candidate.batch_eligible(),
-            "a declined import may still open a new batch after placement resolves"
-        );
     }
 
     /// A depth attachment on its own must not stop a draw deferring its submit.

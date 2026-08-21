@@ -1859,6 +1859,23 @@ impl ResourcePools {
         self.forget_cb_guest_cpu_snapshots();
     }
 
+    /// Enter one draw record of a decoded render encoder.
+    ///
+    /// The first record establishes host-write visibility for the resources the
+    /// encoder will reference. Continuation records in the same command buffer
+    /// do not invent a CPU publication point between Metal draw calls. If an
+    /// explicit guest barrier or another consumer split the encoder across
+    /// Vulkan command buffers, the new handle still starts a fresh dependency.
+    pub(in crate::engine) fn enter_render_encoder_record(
+        &mut self,
+        cb: vk::CommandBuffer,
+        continues_render_encoder: bool,
+    ) {
+        if !continues_render_encoder || self.cb_guest_visibility.cb != Some(cb) {
+            self.begin_guest_operation(cb);
+        }
+    }
+
     fn note_cb_guest_write(&mut self) {
         self.cb_guest_visibility.gpu_write_since_barrier = true;
     }
@@ -6242,5 +6259,33 @@ mod imported_guest_visibility_tests {
         assert!(pools
             .imported_guest_barrier(second, || ImportedGuestVisibility::HostOnly)
             .is_some());
+    }
+
+    #[test]
+    fn render_encoder_continuations_share_visibility_only_in_one_command_buffer() {
+        let mut pools = ResourcePools::new();
+        let first = vk::CommandBuffer::from_raw(1);
+        let second = vk::CommandBuffer::from_raw(2);
+
+        pools.enter_render_encoder_record(first, false);
+        assert_eq!(
+            pools.imported_guest_barrier(first, || ImportedGuestVisibility::HostOnly),
+            Some(ImportedGuestVisibility::HostOnly)
+        );
+
+        pools.enter_render_encoder_record(first, true);
+        assert_eq!(
+            pools.imported_guest_barrier(first, || {
+                panic!("a draw call is not a host publication boundary")
+            }),
+            None
+        );
+
+        pools.enter_render_encoder_record(second, true);
+        assert_eq!(
+            pools.imported_guest_barrier(second, || ImportedGuestVisibility::HostOnly),
+            Some(ImportedGuestVisibility::HostOnly),
+            "a continuation moved by an explicit boundary owes visibility in its new CB"
+        );
     }
 }

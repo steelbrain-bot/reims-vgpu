@@ -917,11 +917,12 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     }
 }
 
-/// Publish the one semantic outcome shared by synchronous Store rails.
+/// Publish the one semantic outcome shared by ordered Store rails.
 ///
 /// Vulkan may reach this through a resident surface, a host readback, or a
 /// direct guest write. Those choices affect transfer cost only; all have a
-/// completed GPU result and the same bytes in the guest replica.
+/// same bytes in the guest replica. A direct imported write may still be owned
+/// by the executor's fence ledger; all access to those bytes settles that debt.
 fn record_materialized_store(
     state: &mut Device,
     task_id: u32,
@@ -931,7 +932,7 @@ fn record_materialized_store(
     let _ = state
         .task_objects
         .resources
-        .record_completed_materialized_store(task_id, texture_ref, submission);
+        .record_ordered_materialized_store(task_id, texture_ref, submission);
 }
 
 /// Guest pages the Vulkan draw's eager GVA fallback may write.

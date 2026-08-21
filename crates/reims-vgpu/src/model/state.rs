@@ -635,9 +635,13 @@ impl TaskResources {
             .is_some_and(|node| node.content.copy_gpu_to_guest_completed(version).is_ok())
     }
 
-    /// Apply the synchronous Store outcome where GPU execution and its
-    /// guest-memory materialization have both completed.
-    pub fn record_completed_materialized_store(
+    /// Apply an ordered Store whose guest-memory destination is protected by
+    /// the executor's write ledger until its submission fence retires.
+    ///
+    /// Resource currency advances when the command is accepted in submission
+    /// order. Physical access to the guest replica is separately gated by that
+    /// ledger, so no observer can consume the new version before it lands.
+    pub fn record_ordered_materialized_store(
         &self,
         task_id: u32,
         ref_: u32,

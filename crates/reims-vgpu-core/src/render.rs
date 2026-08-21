@@ -287,12 +287,14 @@ pub struct DrawOutput {
     pub pixels: Vec<u8>,
     pub pixels_bgra: bool,
     pub occlusion_samples: Option<u64>,
-    /// Exact guest pages whose directly bound attachment Store completed before
-    /// this result was returned. `None` means this draw published no direct
-    /// guest Store; the resident may still require its ordinary materialization.
+    /// Exact guest pages a directly bound attachment Store was recorded to
+    /// write. The executor's guest-write ledger owns physical completion until
+    /// its submission fence retires; overlapping host access and the guest's
+    /// completion stamp settle that ledger before observing these bytes.
+    /// `None` means this draw recorded no direct guest Store.
     pub guest_store_pages: Option<reims_vgpu_memory::GuestWritePages>,
-    /// Allocation-relative byte window occupied by that completed direct Store.
-    /// Carried with the completion so surface publication never re-derives a
+    /// Allocation-relative byte window occupied by that ordered direct Store.
+    /// Carried with the result so surface publication never re-derives a
     /// possibly newer mapping layout after execution.
     pub guest_store_window: Option<std::ops::Range<u64>>,
 }
