@@ -384,6 +384,19 @@ impl LinearTextureDescriptor {
         self.declaration.map(|declaration| declaration.usage)
     }
 
+    /// Whether the guest is obliged to announce its CPU writes to this texture.
+    ///
+    /// Fails closed: a descriptor whose declaration this device never decoded
+    /// carries no obligation it can rely on, so an absent declaration is
+    /// [`crate::GuestWriteAnnouncement::Silent`] rather than an assumed mode.
+    /// See [`crate::StorageMode`] for why only `Managed` announces.
+    pub fn guest_write_announcement(&self) -> crate::GuestWriteAnnouncement {
+        self.declaration
+            .map_or(crate::GuestWriteAnnouncement::Silent, |declaration| {
+                declaration.announcement()
+            })
+    }
+
     pub fn allocation_base_gva(&self, page_shift: u32) -> Option<u64> {
         if self.handle == 0 || page_shift == 0 || page_shift > 30 {
             return None;
@@ -980,6 +993,60 @@ mod tests {
         bytes[0..4].copy_from_slice(&(u32::from(tag) | (len << 8)).to_le_bytes());
         bytes[4..12].copy_from_slice(&gva.to_le_bytes());
         bytes
+    }
+
+    /// A texture this device never decoded a declaration for announces nothing.
+    ///
+    /// The absent declaration is the case that must not be filled in. Assuming
+    /// a mode there would hand the gather witness a statement the guest never
+    /// made, on exactly the resources this device understands least — so the
+    /// answer is `Silent`, which costs the re-read and keeps the content.
+    #[test]
+    fn a_texture_with_no_declaration_promises_no_announcement() {
+        let mut descriptor = LinearTextureDescriptor::default();
+        assert_eq!(descriptor.declaration, None);
+        assert_eq!(
+            descriptor.guest_write_announcement(),
+            crate::GuestWriteAnnouncement::Silent
+        );
+
+        // A declared `Managed` texture is the one mode that does announce, so
+        // the fail-closed answer above is the absence and not a constant.
+        let mut declaration = crate::TextureDeclaration {
+            texture_type: 0,
+            framebuffer_only: false,
+            is_drawable: false,
+            write_swizzle_enabled: None,
+            allow_gpu_optimized_contents: false,
+            usage: 0,
+            pixel_format: 0,
+            width: 1,
+            height: 1,
+            depth: 1,
+            mipmap_level_count: 1,
+            sample_count: 1,
+            array_length: 1,
+            // `MTLResourceOptions` carries the mode ordinal shifted left by
+            // four, so `Managed` (ordinal 1) is `0x0010`.
+            resource_options: 0x0010,
+            protection_options: 0,
+            swizzle: None,
+        };
+        descriptor.declaration = Some(declaration);
+        assert_eq!(declaration.storage_mode(), crate::StorageMode::Managed);
+        assert_eq!(
+            descriptor.guest_write_announcement(),
+            crate::GuestWriteAnnouncement::Announced
+        );
+
+        declaration.resource_options = 0x0000;
+        descriptor.declaration = Some(declaration);
+        assert_eq!(declaration.storage_mode(), crate::StorageMode::Shared);
+        assert_eq!(
+            descriptor.guest_write_announcement(),
+            crate::GuestWriteAnnouncement::Silent,
+            "a Shared texture is CPU-written without ever announcing it"
+        );
     }
 
     #[test]

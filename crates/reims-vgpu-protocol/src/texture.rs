@@ -10,6 +10,82 @@ use reims_vgpu_wire::device_desc::{
 use reims_vgpu_wire::ops::texture::{TextureDescriptorBody, WideTextureDescriptorBody};
 use reims_vgpu_wire::WireError;
 
+/// `MTLStorageMode`, decoded once from `resource_options[7:4]`.
+///
+/// # This is an announcement contract, not an access contract
+///
+/// Every mode gets page-rounded guest backing, and the guest CPU-touches every
+/// mode: create-with-contents, region-replace and get-bytes each memcpy through
+/// that mapping with no storage-mode check on the path. What the mode gates is
+/// whether the guest is obliged to *tell* this device that it wrote — the
+/// modified-range notification is emitted only for [`Self::Managed`].
+///
+/// So [`Self::Private`] means "I will not tell you when I write this", not "I
+/// will not write this", and this type must never be read as a licence to skip
+/// coherence work. It is admitted here for the opposite purpose: see
+/// [`GuestWriteAnnouncement`], whose only consumer withholds a claim rather
+/// than skipping one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StorageMode {
+    Shared,
+    Managed,
+    Private,
+    Memoryless,
+    /// A nibble outside the four the contract declares. Distinct from the four
+    /// so a consumer cannot mistake an unrecognised guest value for a mode the
+    /// contract defines.
+    Undeclared,
+}
+
+/// Whether the guest is contractually obliged to announce its CPU writes to a
+/// resource before the GPU reads it.
+///
+/// This is what makes an unmoved content generation *mean* something. Where the
+/// guest announces, a generation that has not moved is a positive statement
+/// that no write happened. Where it never announces, the same unmoved
+/// generation is the **absence** of a statement, and reading it as silence
+/// converts "I was never told" into "nothing happened" — which is the one
+/// reading the contract does not support, and whose failure mode is content,
+/// so no counter reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestWriteAnnouncement {
+    Announced,
+    Silent,
+}
+
+impl StorageMode {
+    /// Project the `resource_options[7:4]` nibble the wire accessor extracts.
+    ///
+    /// Total over the nibble: every value outside the declared four is
+    /// [`Self::Undeclared`] rather than a guess at the nearest mode.
+    #[must_use]
+    pub fn from_nibble(nibble: u8) -> Self {
+        match nibble {
+            0 => Self::Shared,
+            1 => Self::Managed,
+            2 => Self::Private,
+            3 => Self::Memoryless,
+            _ => Self::Undeclared,
+        }
+    }
+
+    /// Whether this mode obliges the guest to announce its CPU writes.
+    ///
+    /// Only `Managed` emits the modified-range notification, so only `Managed`
+    /// is [`GuestWriteAnnouncement::Announced`]. An unrecognised nibble is
+    /// `Silent`, because a mode this device cannot name carries no obligation
+    /// it can rely on.
+    #[must_use]
+    pub fn announcement(self) -> GuestWriteAnnouncement {
+        match self {
+            Self::Managed => GuestWriteAnnouncement::Announced,
+            Self::Shared | Self::Private | Self::Memoryless | Self::Undeclared => {
+                GuestWriteAnnouncement::Silent
+            }
+        }
+    }
+}
+
 /// Complete texture declaration after wire-format decoding.
 ///
 /// Narrow and wide serializer forms converge here. Optional fields preserve
@@ -37,6 +113,26 @@ pub struct TextureDeclaration {
     /// Absent from the narrow declaration; present even when the wide form
     /// carries the identity swizzle.
     pub swizzle: Option<[u8; 4]>,
+}
+
+impl TextureDeclaration {
+    /// [`StorageMode`] projected from this declaration's `resource_options`.
+    ///
+    /// Derived rather than stored, so there is no second spelling of the mode
+    /// that could disagree with the word it comes from, and the nibble shift
+    /// itself lives once in the wire crate that owns the layout.
+    #[must_use]
+    pub fn storage_mode(&self) -> StorageMode {
+        StorageMode::from_nibble(reims_vgpu_wire::ops::texture::storage_mode_nibble(
+            self.resource_options,
+        ))
+    }
+
+    /// Whether the guest is obliged to announce its CPU writes to this texture.
+    #[must_use]
+    pub fn announcement(&self) -> GuestWriteAnnouncement {
+        self.storage_mode().announcement()
+    }
 }
 
 /// Mapper-backed IOSurface texture view decoded from object-list wire tag 11.
@@ -217,6 +313,61 @@ pub fn decode_mapper_iosurface_texture_view(
         plane: PlaneIndex::new(u32::from(plane)),
         rotation,
     })
+}
+
+#[cfg(test)]
+mod storage_mode_tests {
+    use super::*;
+
+    /// The four modes the contract declares, and the total answer for the rest.
+    ///
+    /// The nibble values are `MTLStorageMode`'s ordinals, confirmed against a
+    /// native Metal device: `shared`/`managed`/`private`/`memoryless` report
+    /// `storageMode` 0/1/2/3, and the matching `MTLResourceOptions` words are
+    /// those ordinals shifted left by four.
+    #[test]
+    fn the_nibble_names_the_declared_modes_and_nothing_else() {
+        assert_eq!(StorageMode::from_nibble(0), StorageMode::Shared);
+        assert_eq!(StorageMode::from_nibble(1), StorageMode::Managed);
+        assert_eq!(StorageMode::from_nibble(2), StorageMode::Private);
+        assert_eq!(StorageMode::from_nibble(3), StorageMode::Memoryless);
+        for undeclared in 4u8..=15 {
+            assert_eq!(
+                StorageMode::from_nibble(undeclared),
+                StorageMode::Undeclared,
+                "nibble {undeclared} is not a mode this contract declares"
+            );
+        }
+    }
+
+    /// Only `Managed` obliges the guest to announce a CPU write.
+    ///
+    /// This is the whole basis for reading an unmoved content generation as
+    /// "no write happened". `Shared` and `Private` textures are CPU-written
+    /// just as `Managed` ones are — the mode is an announcement contract, not
+    /// an access contract — so a quiet generation on either says only that
+    /// nobody told this device, and vouching on it freezes the sampled copy.
+    /// An undeclared nibble is silent for the same reason: no obligation this
+    /// device can name.
+    #[test]
+    fn only_the_managed_mode_promises_to_announce_a_guest_write() {
+        assert_eq!(
+            StorageMode::Managed.announcement(),
+            GuestWriteAnnouncement::Announced
+        );
+        for silent in [
+            StorageMode::Shared,
+            StorageMode::Private,
+            StorageMode::Memoryless,
+            StorageMode::Undeclared,
+        ] {
+            assert_eq!(
+                silent.announcement(),
+                GuestWriteAnnouncement::Silent,
+                "{silent:?} never emits a modified-range notification"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

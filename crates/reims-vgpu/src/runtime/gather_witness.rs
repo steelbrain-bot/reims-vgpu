@@ -160,6 +160,21 @@ impl crate::observe::decline::Decline for GatherWitnessFault {
 /// Called from the producers with the window already resolved and with the
 /// decoded resource generation captured in that resource's identity space.
 ///
+/// # `stated_gen` is `Option` because the guest does not always make a statement
+///
+/// `None` means this device is not *told* about writes to the resource, which
+/// is a different fact from being told there were none. Only
+/// [`reims_vgpu_protocol::StorageMode::Managed`] obliges the guest to announce
+/// a CPU write, so on every other mode the resource's generation sits still
+/// while the guest rasterizes into it, and a `Some` built from that generation
+/// would be a statement of silence the guest never made. The witness already
+/// fails closed on `None` — it reports [`StatedGuestWrite::Unaddressed`], which
+/// never vouches — so passing the absence through is all that is required.
+///
+/// Passing `Some` where the guest is silent is the defect this signature
+/// exists to prevent: it costs the guest content, not throughput, and its only
+/// instrument is the sampled content audit.
+///
 /// # Why this does not return an `Option`
 ///
 /// It used to, and the `Option` was `Some` on every path: the identity was read
@@ -175,7 +190,7 @@ pub fn note_gather(
     state: &mut crate::runtime::Device,
     rail: GatherRail,
     key: GatherKey,
-    stated_gen: StatedGeneration,
+    stated_gen: Option<StatedGeneration>,
     window: GatherWindow<'_>,
 ) -> GatherOutcome {
     use crate::runtime::drain::{note_store_route, note_store_route_n};
@@ -206,8 +221,9 @@ pub fn note_gather(
                     .wrote_any_since(since, window.gpas)
             }),
         // The guest's own statement about this resource, captured by the caller
-        // in the identity space that owns it.
-        stated_gen: Some(stated_gen),
+        // in the identity space that owns it, and absent where the guest makes
+        // no statement at all.
+        stated_gen,
         pending: pending_writes_over(state.executor.as_ref(), window.gpas),
     };
     // Every bind, vouched or not, so the route is a denominator rather than a
@@ -298,9 +314,9 @@ pub fn note_gather(
                         .field("object", object.get())
                         .field("owner_task", task.get());
                 }
-                if let StatedGeneration::TaskResource(
+                if let Some(StatedGeneration::TaskResource(
                     reims_vgpu_core::ResourceWriteStamp::Resolved { version, .. },
-                ) = stated_gen
+                )) = stated_gen
                 {
                     emission = emission.field("content_version", version.get());
                 }
@@ -556,6 +572,59 @@ mod tests {
         assert_eq!(gone.stated, StatedGuestWrite::Unaddressed);
         let still_gone = observe(&mut w, KEY, one_page(&GPAS, &runs), stated(None), 15);
         assert_eq!(still_gone.stated, StatedGuestWrite::Unaddressed);
+    }
+
+    /// A resource whose guest never announces cannot freeze its sampled copy.
+    ///
+    /// This is the consequence the storage-mode gate exists to produce, stated
+    /// where it is enforced. A texture in a silent `MTLStorageMode` reaches the
+    /// witness with **no** stated generation, however many times it is bound,
+    /// because the producer has nothing to state. Every one of those binds must
+    /// come back `Fresh` at the generation it was offered — never `Vouched`,
+    /// and never at a generation an earlier bind already used.
+    ///
+    /// A repeated identity is what the defect looked like: the engine memoizes
+    /// on `(key, generation)`, so a vouch that holds the generation still makes
+    /// the next bind reuse the previous copy. On a CPU-rasterized glyph atlas
+    /// that froze the sampled bytes at whatever the atlas held when it was
+    /// first gathered, which on the Maps workload was before any type had been
+    /// drawn into it.
+    #[test]
+    fn a_silent_resource_is_never_vouched_and_never_repeats_a_generation() {
+        let mut w = GatherWitness::default();
+        let buf = vec![0x5au8; PAGE];
+        let runs = [run_over(&buf)];
+        let silent = WitnessReadings {
+            stated_gen: None,
+            ..QUIET
+        };
+
+        let mut issued = Vec::new();
+        for generation in 20..40u64 {
+            let seen = observe(&mut w, KEY, one_page(&GPAS, &runs), silent, generation);
+            assert_eq!(
+                seen.stated,
+                StatedGuestWrite::Unaddressed,
+                "an absent statement is not a statement of silence"
+            );
+            assert_eq!(
+                seen.vouch,
+                GatherVouch::Fresh,
+                "a silent resource must re-read its bytes every bind"
+            );
+            assert_eq!(
+                seen.generation, generation,
+                "the offered generation must be spent, so the memo cannot hit"
+            );
+            issued.push(seen.generation);
+        }
+
+        let distinct: std::collections::BTreeSet<u64> = issued.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            issued.len(),
+            "a repeated identity is what let the frozen atlas survive"
+        );
     }
 
     /// A witness at a stated audit density, for the two tests that are about the

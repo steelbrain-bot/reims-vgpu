@@ -79,8 +79,9 @@ pub use submission::{
 };
 pub use texture::{
     decode_heap_texture_descriptor, decode_mapper_iosurface_texture_view,
-    texture_declaration_from_narrow, texture_declaration_from_wide, HeapTextureDescriptor,
-    MapperIOSurfaceTextureDecodeError, MapperIOSurfaceTextureView, TextureDeclaration,
+    texture_declaration_from_narrow, texture_declaration_from_wide, GuestWriteAnnouncement,
+    HeapTextureDescriptor, MapperIOSurfaceTextureDecodeError, MapperIOSurfaceTextureView,
+    StorageMode, TextureDeclaration,
 };
 pub use vertex::{decode_vertex_attribute_format, VertexAttributeFormat, VertexFormatDecodeError};
 pub use vertex_step::{

@@ -2197,14 +2197,23 @@ fn witnessed_mapping_sampled_source<M: HostMemory + HostOps>(
     let (gpas, runs) =
         mapping_window_guest_runs(state, host, plane.mapping_id, plane.base_off, plane.span)?;
     let page = state.page_size() as usize;
-    let stated = crate::runtime::gather_witness::StatedGeneration::Mapping(
+    // A mapping's page generation, not a texture's content version, and the two
+    // do not have the same grounds. The storage-mode gate the linear rail
+    // applies is unreachable here: a mapping is named by many textures and this
+    // device keeps no reverse lookup, so there is no single declaration to ask.
+    // What stands in for it is the surface's own flush-on-access rule
+    // (`iosurface_texture_sample_window`), under which a guest CPU write to the
+    // surface reaches this generation. If that ever stops holding, this is the
+    // site that loses content, and the sampled content audit is its only
+    // instrument.
+    let stated = Some(crate::runtime::gather_witness::StatedGeneration::Mapping(
         state
             .surfaces
             .mappings
             .get(&plane.mapping_id)?
             .content
             .guest_page_generation,
-    );
+    ));
     let seen = crate::runtime::gather_witness::note_gather(
         state,
         rail,
@@ -3422,6 +3431,40 @@ fn refuse_unmaterialized_mip_range(
     true
 }
 
+/// The guest's own statement about a linear texture's content, or `None` where
+/// the guest never makes one.
+///
+/// The resource's content version advances on a decoded validity transition —
+/// the guest telling this device it wrote. That statement exists only where
+/// `MTLStorageMode` obliges the guest to make it, which is `Managed` alone. On
+/// every other mode the guest still CPU-writes the texture (the mode is an
+/// announcement contract, not an access contract) and the version sits still
+/// while it does, so handing that version to the witness would let an unmoved
+/// number be read as "no write happened" when it only ever meant "nobody told
+/// me". The witness fails closed on `None`, so the silent modes lose the
+/// memoization and re-read their bytes.
+///
+/// This is what a CPU-rasterized glyph atlas needs: it is written by the guest
+/// between draws with no announcement, and a vouch taken over it freezes the
+/// sampled copy at whatever the atlas held when it was first gathered.
+fn stated_task_resource_generation(
+    state: &Device,
+    tex: &TextureDescriptor,
+    resource: reims_vgpu_protocol::ResourceId<reims_vgpu_protocol::ResourceObject>,
+) -> Option<crate::runtime::gather_witness::StatedGeneration> {
+    match tex.guest_write_announcement() {
+        reims_vgpu_protocol::GuestWriteAnnouncement::Announced => Some(
+            crate::runtime::gather_witness::StatedGeneration::TaskResource(
+                state.resource_write_stamp_for(resource)?,
+            ),
+        ),
+        reims_vgpu_protocol::GuestWriteAnnouncement::Silent => {
+            crate::runtime::drain::note_store_route("gw_stated_silent_mode");
+            None
+        }
+    }
+}
+
 fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     state: &mut Device,
     host: &mut M,
@@ -3753,9 +3796,7 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                 host_ptr: witness.host_ptr,
                 len: packed.size,
             }];
-            let stated = crate::runtime::gather_witness::StatedGeneration::TaskResource(
-                state.resource_write_stamp_for(resource)?,
-            );
+            let stated = stated_task_resource_generation(state, tex, resource);
             let allocation_gva = allocation.as_ref()?.gva;
             let seen = crate::runtime::gather_witness::note_gather(
                 state,
@@ -3797,9 +3838,7 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
             host_ptr: witness.host_ptr,
             len: span,
         }];
-        let stated = crate::runtime::gather_witness::StatedGeneration::TaskResource(
-            state.resource_write_stamp_for(resource)?,
-        );
+        let stated = stated_task_resource_generation(state, tex, resource);
         let seen = crate::runtime::gather_witness::note_gather(
             state,
             crate::runtime::gather_witness::GatherRail::Linear,
@@ -3859,9 +3898,7 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                 }
             };
         let page = state.page_size() as usize;
-        let stated = crate::runtime::gather_witness::StatedGeneration::TaskResource(
-            state.resource_write_stamp_for(resource)?,
-        );
+        let stated = stated_task_resource_generation(state, tex, resource);
         let seen = crate::runtime::gather_witness::note_gather(
             state,
             crate::runtime::gather_witness::GatherRail::Linear,
@@ -3924,9 +3961,7 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
         }
     };
     let page = state.page_size() as usize;
-    let stated = crate::runtime::gather_witness::StatedGeneration::TaskResource(
-        state.resource_write_stamp_for(resource)?,
-    );
+    let stated = stated_task_resource_generation(state, tex, resource);
     let seen = crate::runtime::gather_witness::note_gather(
         state,
         crate::runtime::gather_witness::GatherRail::Linear,

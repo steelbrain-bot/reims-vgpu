@@ -83,6 +83,19 @@ pub const NEW_TEXTURE_TOTAL_LEN: u32 = 44;
 /// Bytes of [`TextureDescriptorBody`], the half two records share.
 pub const TEXTURE_DESCRIPTOR_LEN: usize = 32;
 
+/// `MTLStorageMode`, `resource_options[7:4]`, from the raw options word.
+///
+/// The narrow and wide descriptor bodies both carry that word, and a semantic
+/// consumer holding only the word needs the same answer they do — so the shift
+/// is written once here and the two accessors call it. See
+/// [`TextureDescriptorBody::storage_mode`] for what the field means and for the
+/// misreading it invites.
+#[inline]
+#[must_use]
+pub const fn storage_mode_nibble(resource_options: u16) -> u8 {
+    ((resource_options >> 4) & 0xf) as u8
+}
+
 /// The 32-byte texture descriptor, without the new object's ref.
 ///
 /// Declared apart from [`NewTextureBody`] because it is not only that record's
@@ -209,8 +222,8 @@ impl TextureDescriptorBody {
     ///
     /// It reads like a licence to skip coherence work for `Private` — the
     /// device would not have to keep guest pages current for a resource the
-    /// guest has declared GPU-only. It is not one, and the device deliberately
-    /// consumes this field nowhere. Reading the emitting serializer says why:
+    /// guest has declared GPU-only. It is not one. Reading the emitting
+    /// serializer says why:
     ///
     /// - Backing is **mode-blind**. A `Private` texture still gets page-rounded
     ///   guest backing allocated unconditionally, exactly as `Shared` does.
@@ -230,9 +243,21 @@ impl TextureDescriptorBody {
     /// the *host* deserializer for a mode-dependent branch on the backing or
     /// the coherence path. Absence of one on the emitting side is what is
     /// established above; the receiving side has not been read.
+    ///
+    /// # The one consumer, and why it runs the other way
+    ///
+    /// This field is read exactly once outside this crate, by
+    /// `reims_vgpu_protocol::StorageMode::from_nibble`, and every decision
+    /// downstream of it *withholds* a claim rather than skipping work. The
+    /// gather witness may call a resource's content quiet only where the guest
+    /// is obliged to announce a write to it, which is `Managed` alone; the
+    /// silent modes lose the memoization and re-read their bytes. That is the
+    /// safe direction, and it is the exact inverse of the misreading this doc
+    /// warns about above — a bug in it costs throughput, not content. Adding a
+    /// consumer that reads the mode to *avoid* work reopens the hazard.
     #[inline]
     pub fn storage_mode(&self) -> u8 {
-        ((self.resource_options.get() >> 4) & 0xf) as u8
+        storage_mode_nibble(self.resource_options.get())
     }
 
     /// `MTLCPUCacheMode`, `resource_options[3:0]`.
@@ -451,7 +476,7 @@ impl WideTextureDescriptorBody {
     /// it is not a licence to skip coherence work for `Private`.
     #[inline]
     pub fn storage_mode(&self) -> u8 {
-        ((self.resource_options.get() >> 4) & 0xf) as u8
+        storage_mode_nibble(self.resource_options.get())
     }
 
     /// `MTLCPUCacheMode`, `resource_options[3:0]`.
