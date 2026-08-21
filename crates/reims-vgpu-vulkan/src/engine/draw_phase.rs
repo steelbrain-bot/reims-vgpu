@@ -478,15 +478,20 @@ pub(crate) enum Phase {
     /// This is the floor. Whatever else this device stops doing, it still issues
     /// one draw call per guest draw, exactly as Apple's driver does.
     RecordDraw = 32,
-    /// Publishing writes made through every other Vulkan alias of guest memory
-    /// before this draw reads an imported buffer or image: assembling the read
-    /// set from the draw's own bindings, asking what outstanding guest writes
-    /// reach it, and the one global memory dependency that answer buys.
+    /// Deciding whether this draw reads imported guest memory, asking what
+    /// outstanding guest writes reach the pages it names, and recording the one
+    /// global memory dependency that answer buys.
     ///
     /// Charged on every draw that touches imported guest memory, including the
     /// draws whose answer is that nothing reaches them —
-    /// `guest_visibility_host_only` is 97 % of the verdicts on a Maps boot, so
+    /// `guest_visibility_host_only` is 96 % of the verdicts on a Maps boot, so
     /// most of what lands here bought no barrier at all.
+    ///
+    /// **This is where the barrier span's time is.** A driven fullscreen Maps
+    /// boot on the macos-13 rail charges it 3.51 µs/draw against a 4.00 µs
+    /// barrier span — 88 % of it, and an order of magnitude clear of every
+    /// sibling below. [`Phase::RecBarrierReadSet`] is carved out of it to say
+    /// which half.
     RecBarrierVisibility = 33,
     /// The attachment-feedback fallback: copying a resident's prior content
     /// into a same-format image before the attachment changes, for the loops
@@ -512,6 +517,17 @@ pub(crate) enum Phase {
     /// applies a load action to the whole image, plus the MRT secondaries that
     /// must transition back to colour-attachment use.
     RecBarrierAttachment = 39,
+    /// Assembling the guest-visibility read set: one entry per guest-backed
+    /// vertex attribute, index buffer, storage buffer, sampled source, target
+    /// seed, imported target and MRT secondary the draw names.
+    ///
+    /// Carved out of [`Phase::RecBarrierVisibility`] because the two halves have
+    /// opposite fixes and the parent could not choose between them. This half is
+    /// a `Vec` and a refcount bump per binding — about 8.5 of them per draw on a
+    /// Maps boot — and is attacked by not materializing the set. The residue is
+    /// the ledger question that consumes it, ~334 pages per draw under one
+    /// mutex, and is attacked by asking it a cheaper way.
+    RecBarrierReadSet = 40,
 }
 
 impl Phase {
@@ -522,7 +538,7 @@ impl Phase {
     /// the ordinals that existed when they were added, rather than inserted next
     /// to the phase they divide, so that every existing ordinal kept its value
     /// and this stayed the only place the count is written.
-    const LAST: Phase = Phase::RecBarrierAttachment;
+    const LAST: Phase = Phase::RecBarrierReadSet;
 }
 
 const PHASES: usize = Phase::LAST as usize + 1;
@@ -601,6 +617,8 @@ pub struct DrawPhaseWindow {
     pub rb_resident_us: u64,
     pub rb_upload_us: u64,
     pub rb_attachment_us: u64,
+    /// See [`Phase::RecBarrierReadSet`].
+    pub rb_read_set_us: u64,
     pub rec_pass_us: u64,
     pub rec_state_us: u64,
     pub rec_draw_us: u64,
@@ -659,6 +677,7 @@ pub fn take_window() -> Option<DrawPhaseWindow> {
         rb_attachment_us: to_us(
             ACC[Phase::RecBarrierAttachment as usize].swap(0, Ordering::Relaxed),
         ),
+        rb_read_set_us: to_us(ACC[Phase::RecBarrierReadSet as usize].swap(0, Ordering::Relaxed)),
         rec_pass_us: to_us(ACC[Phase::RecordPass as usize].swap(0, Ordering::Relaxed)),
         rec_state_us: to_us(ACC[Phase::RecordState as usize].swap(0, Ordering::Relaxed)),
         rec_draw_us: to_us(ACC[Phase::RecordDraw as usize].swap(0, Ordering::Relaxed)),
@@ -881,6 +900,7 @@ mod tests {
             Phase::RecBarrierResident,
             Phase::RecBarrierUpload,
             Phase::RecBarrierAttachment,
+            Phase::RecBarrierReadSet,
         ];
         assert_eq!(all.len(), PHASES);
         for (want, phase) in all.iter().enumerate() {
@@ -999,6 +1019,7 @@ mod tests {
             ("rb_materialize_us", w.rb_materialize_us),
             ("rb_upload_us", w.rb_upload_us),
             ("rb_attachment_us", w.rb_attachment_us),
+            ("rb_read_set_us", w.rb_read_set_us),
         ] {
             assert_eq!(value, 0, "{name} shares a slot with the resident region");
         }

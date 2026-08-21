@@ -3205,7 +3205,7 @@ fn emit_draw_phase(executor: &dyn crate::runtime::executor::Executor) {
          acquire_us={} acquire_sampled_us={} sampled_upload_us={} acquire_readback_us={} \
          descriptors_us={} \
          record_us={} rec_begin_us={} rec_barrier_us={} \
-         rb_visibility_us={} rb_snapshot_us={} rb_seed_us={} rb_materialize_us={} \
+         rb_read_set_us={} rb_visibility_us={} rb_snapshot_us={} rb_seed_us={} rb_materialize_us={} \
          rb_resident_us={} rb_upload_us={} rb_attachment_us={} \
          rec_pass_us={} rec_state_us={} \
          rec_draw_us={} submit_us={} post_target_us={} post_store_us={} post_sampled_us={} \
@@ -3234,6 +3234,7 @@ fn emit_draw_phase(executor: &dyn crate::runtime::executor::Executor) {
         w.record_us,
         w.rec_begin_us,
         w.rec_barrier_us,
+        w.rb_read_set_us,
         w.rb_visibility_us,
         w.rb_snapshot_us,
         w.rb_seed_us,

@@ -5401,6 +5401,7 @@ pub(crate) unsafe fn execute_draw_inner(
             _ => false,
         });
     if reads_imported_guest {
+        phase.enter(super::draw_phase::Phase::RecBarrierReadSet);
         let mut read_pages: Vec<Option<reims_vgpu_memory::GuestPageSet>> = Vec::new();
         for attr in &req.vertex_attributes {
             read_pages
@@ -5448,6 +5449,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 .filter_map(|(_, _, _, pages)| pages.as_ref())
                 .map(|pages| Some(pages.clone())),
         );
+        phase.enter(super::draw_phase::Phase::RecBarrierVisibility);
         if read_pages.is_empty() {
             // The only imported object was the attachment of the render pass
             // that is still open. No cross-object read remains to publish.
