@@ -122,12 +122,33 @@ timeout 30 ssh -o BatchMode=yes macos-vm '
 read -r W H < <("$Q" size) || { echo "no display size"; exit 2; }
 echo "display ${W}x${H}"
 
-# Full-screen so the map drives the whole scanout rather than a window inset in
-# a static desktop. ctrl+cmd+f is the system-wide Enter Full Screen binding, so
-# no window chrome geometry has to be guessed; `meta_l` is Command in QEMU's
-# qcode names, which is not free choice.
-"$Q" key ctrl+meta_l+f >/dev/null 2>&1
-sleep 6
+# Presentation is a scored parameter, because the two are different device
+# workloads and not two views of one. Full screen gives Maps the whole scanout,
+# so the frame this device publishes is the application's own output. Windowed
+# leaves it inset in a desktop the window server composites around it every
+# frame, which is a different mix of draws, a different scanout owner, and the
+# regime a user is in most of the time.
+#
+# Default is `fullscreen`, which is what this probe has always scored -- every
+# number recorded before this parameter existed is a full-screen number, and the
+# default must keep them comparable. The mode is written to the output directory
+# so a captured run always says which regime produced it; two arms differing in
+# presentation are not two boots of one measurement.
+PRESENTATION="${MAPS_PRESENTATION:-fullscreen}"
+case "$PRESENTATION" in
+  fullscreen|windowed) ;;
+  *) echo "MAPS_PRESENTATION must be 'fullscreen' or 'windowed', got '$PRESENTATION'"; exit 2 ;;
+esac
+echo "$PRESENTATION" >"$OUT/presentation.txt"
+echo "presentation $PRESENTATION"
+
+if [ "$PRESENTATION" = fullscreen ]; then
+  # ctrl+cmd+f is the system-wide Enter Full Screen binding, so no window chrome
+  # geometry has to be guessed; `meta_l` is Command in QEMU's qcode names, which
+  # is not free choice.
+  "$Q" key ctrl+meta_l+f >/dev/null 2>&1
+  sleep 6
+fi
 
 CX=$((W / 2)); CY=$((H / 2))
 # Keep the whole path well inside the map view. A drag that leaves the window
@@ -222,6 +243,27 @@ done
 
 tail -c "+$(( OFFSET + 1 ))" "$FAILLOG" >"$OUT/window.log"
 echo "drove $phase phases over ${SECS}s"
+
+# Refuse a window in which the device drew nothing, rather than reporting its
+# frame rate. A probe that drove input the application never received produces a
+# well-formed capture full of compositor heartbeats and near-zero draws, and
+# that reads as a slow device instead of an unstarted workload -- the failure
+# `window-drag-probe` already refuses a verdict for.
+#
+# This is not analysis, which stays with the caller: it is the same validity
+# class as the display check above, and it is the device's own record of whether
+# the scored input produced any work. The bound is presence, not a rate. It
+# matters most in the windowed regime, where the pointer path is only inside the
+# map if the guest placed its window where the drags go, so an empty window is
+# the expected shape of that failure rather than a device result.
+scored_draws=$(grep -o 'draws=[0-9]*' "$OUT/window.log" 2>/dev/null \
+  | cut -d= -f2 | awk '{s += $1} END {print s + 0}')
+echo "scored window drew $scored_draws"
+if [ "$scored_draws" -eq 0 ]; then
+  echo "no draws in the scored window: the driven input did not reach the map"
+  echo "presentation=$PRESENTATION"
+  exit 3
+fi
 
 # Preserve the free-running endpoint, but do not use its content to judge the
 # renderer: navigation is valid guest state, and an ocean legitimately has no

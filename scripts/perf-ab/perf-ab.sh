@@ -41,6 +41,11 @@
 # slow-regime draw, which is exactly what the interleaving rule above exists to
 # prevent.
 #
+# A pair whose name begins with `MAPS_` is likewise exported verbatim, which is
+# how a *presentation regime* gets priced instead of a switch:
+# `--probe scripts/maps-probe/maps-probe.sh --arms "MAPS_PRESENTATION=fullscreen
+# MAPS_PRESENTATION=windowed"` interleaves the two regimes the Maps goal names.
+#
 # Values use `+` where the variable wants a comma, because the arm string is
 # already comma-separated: `INTEL_DEBUG=no16+no32` exports `INTEL_DEBUG=no16,no32`.
 set -uo pipefail
@@ -129,10 +134,11 @@ for arm in $ARMS; do
   say "=== round $round arm $arm ==="
   "$REPO/scripts/app-sweep-probe/stop-previous-vm.sh" || say "$tag: previous VM still holds :2222"
   rm -f /tmp/reims-vgpu-fail.log
-  # Both namespaces are swept, or an `INTEL_*` arm would leak into every later
-  # round and quietly make the whole run one arm.
+  # Every namespace is swept, or an `INTEL_*` or `MAPS_*` arm would leak into
+  # every later round and quietly make the whole run one arm.
   for stale in $(env | sed -n 's/^\(REIMS_VGPU_[A-Z0-9_]*\)=.*/\1/p'); do unset "$stale"; done
   for stale in $(env | sed -n 's/^\(INTEL_[A-Z0-9_]*\)=.*/\1/p'); do unset "$stale"; done
+  for stale in $(env | sed -n 's/^\(MAPS_[A-Z0-9_]*\)=.*/\1/p'); do unset "$stale"; done
   if [ "$arm" != shipping ]; then
     old_ifs=$IFS; IFS=,
     for pair in $arm; do
@@ -141,6 +147,15 @@ for arm in $ARMS; do
         # A driver variable is exported under its own name; `+` becomes the
         # comma the arm string could not carry.
         INTEL_*) export "$name=${value//+/,}" ;;
+        # A probe parameter is likewise its own name. This is how a *regime*
+        # gets priced rather than a device switch: `MAPS_PRESENTATION=windowed`
+        # against `MAPS_PRESENTATION=fullscreen` are two different workloads --
+        # a composited window inset in a desktop, and an application owning the
+        # scanout -- and the goal for this device names both. Running them as
+        # separate blocks would score each against a different base rate of the
+        # slow-regime draw, which is the thing the interleaving above exists to
+        # cancel.
+        MAPS_*)  export "$name=${value//+/,}" ;;
         *)       export "REIMS_VGPU_$name=$value" ;;
       esac
     done
