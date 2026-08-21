@@ -589,8 +589,11 @@ Two matter for verification rather than for ablation:
 - `REIMS_VGPU_GUEST_IMPORT=off` takes a capable host down to the `disabled_by_env` rung, which is
   how the copying rails get exercised without hunting for hardware that lacks the extension.
 - `REIMS_VGPU_GATHER_AUDIT_ALL=on` makes the zero-copy sampled cache's content audit judge **every**
-  vouched bind instead of one in sixty-four. The stride is the alarm's sampling rate and nothing the
-  guest observes depends on it. **The vouch itself is not a statement about bytes, and this file used
+  vouched bind. Without it the audit does not run at all — `AuditDensity::default()` is `Disabled`,
+  not a stride, so a shipping boot judges **zero** binds and emits no `gw_audit_*` counter of any
+  kind. This file used to describe a one-in-sixty-four sampling rate; there is none, and a boot
+  without the switch cannot answer a content question however long it runs. Nothing the guest
+  observes depends on the switch either way. **The vouch itself is not a statement about bytes, and this file used
   to say it was.** Its two accounts — the decoded resource-validity transition and this device's own
   page-exact write record — do not cover disjoint writers: a guest CPU store into unified shared
   storage bumps neither, because the validity transition is a synchronization statement consumed at
@@ -601,9 +604,11 @@ Two matter for verification rather than for ablation:
   about content.
   That cache is the only place in this device where an
   image is bound with nothing read and nothing compared, and a stale bind's failure mode is content,
-  which no counter reports — the audit is the sole instrument, and at the shipping stride it samples
-  about 1.6 % of the binds it could judge. Run a rail sweep under it and read `gw_audit_unsound`
-  against `gw_audit_ok` beside it; a zero is only evidence when the `ok` is large. **Never quote a
+  which no counter reports — the audit is the sole instrument, and it is off unless you turn it on.
+  Run a rail sweep under it and read `gw_audit_unsound` against `gw_audit_ok` beside it; a zero is
+  only evidence when the `ok` is large, and **an absent counter is not a zero** — eight driven Maps
+  boots carried 1.8 M vouched binds each and no `gw_audit_*` line between them, which says the alarm
+  never ran and says nothing whatever about the bytes. **Never quote a
   timing from such a boot** — the fold re-reads the very windows the cache exists to avoid reading.
 
 ## Verification
