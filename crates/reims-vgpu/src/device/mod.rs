@@ -403,11 +403,26 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
             slot.intr_gpu.fetch_and(!(data as u32), Ordering::AcqRel);
             return true;
         }
-        // The child doorbell, which measurement says is the *entire* queueing
-        // stall on this pathway: `gfx_doorbell_delay` reads `offsets=1` on
-        // every window that queued anything, ~100 rings a second applied up to
-        // 45 ms late, and that delay is the drain tranche the write could not
-        // take the lock through.
+        // The child doorbell, which measurement once said was the *entire*
+        // queueing stall on this pathway: `gfx_doorbell_delay` read `offsets=1`
+        // on every window that queued anything, ~100 rings a second applied up
+        // to 45 ms late, and that delay was the drain tranche the write could
+        // not take the lock through.
+        //
+        // Serving it here fixed that population, and the residual moved rather
+        // than vanishing. A driven fullscreen boot still reads `offsets=1` on
+        // every window — but the offset is now `GFX_REG_EFI_DISPLAY_IRQ`, aged
+        // a mean of 58 ms and late for its frame on ~90% of rings, while this
+        // register accounts for the whole `lockfree` column and queues nothing.
+        // So `offsets=1` is not evidence that *this* is the register still
+        // waiting; read the `off_*` breakdown, which names it.
+        //
+        // That register cannot simply join this arm. Its handler in
+        // `crate::runtime::mmio` is dual-use: the IRQ bit and the interrupt it
+        // raises are a publish and would be safe here, but the cursor sample
+        // reads the display shared page and writes `state.presentation`, which
+        // the drain owns. Splitting one write's effects across the two sites
+        // would be a seam, not a fix.
         //
         // It is the one register that can be served this way, because it
         // carries no state the decode depends on — its effect is to say a
