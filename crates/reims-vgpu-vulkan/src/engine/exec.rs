@@ -4962,29 +4962,26 @@ pub(crate) unsafe fn execute_draw_inner(
                         ctx,
                         identity,
                         crate::format::vk_image_format(resource.format),
+                        resource.swizzle,
                         counters,
                     )?
                     .expect("validated resident is held");
-                // Two reasons a resident cannot be bound through its own view.
+                // One reason a resident cannot be bound through its own view:
+                // the draw is sampling an attachment it also renders into, which
+                // needs a copy taken before the pass writes it.
                 //
-                // The first is the draw sampling an attachment it also renders
-                // into, which needs a copy taken before the pass writes it.
-                //
-                // The second is a **view swizzle**. The registry creates one
-                // image view per target and cannot re-decorate it per bind, so a
-                // bind asking for non-identity channels has nowhere to put them
-                // on the direct arm — but the snapshot's own view is created
-                // from `SampledKey::of(resource)`, whose `swizzle` field
-                // `acquire_sampled` hands to `vk_component_mapping`. So the copy
-                // is exactly where the swizzle becomes expressible, and taking
-                // it is what turns this bind from a dropped one into a correct
-                // one. The producer used to return before pushing any resource
-                // for such a bind, which left the binding absent from a layout
-                // its own module statically uses — refused downstream by
-                // `used_binding_absent_from_layout`, so the whole draw was lost.
-                let self_slot = sampled_attachment_slot(req, resource);
-                let swizzled = !resource.swizzle.is_identity();
-                if self_slot.is_some() || swizzled {
+                // A **view swizzle** used to be a second reason, because the
+                // registry held one image view per target and had nowhere to put
+                // non-identity channels. It now holds a view per
+                // format-and-mapping pair, so the mapping is expressible on the
+                // direct arm and the hardware performs it at sample time. Note
+                // what the copy was buying when it was needed: not correctness of
+                // the channels alone but the binding's *presence*, because the
+                // producer before it returned without pushing any resource, and
+                // a binding absent from a layout its own module statically uses
+                // is refused downstream by `used_binding_absent_from_layout` —
+                // losing the whole draw.
+                if let Some(self_slot) = sampled_attachment_slot(req, resource) {
                     let snapshot_timing = match attachment_initial {
                         Some(super::types::AttachmentInitial::Clear(clear)) => {
                             SnapshotTiming::Clear(clear)
@@ -4997,20 +4994,14 @@ pub(crate) unsafe fn execute_draw_inner(
                         }
                         _ => SnapshotTiming::Prior,
                     };
-                    match self_slot {
-                        // Which attachment this draw is sampling of its own. The
-                        // primary is the case this arm has always taken; the
-                        // other two are the ones a primary-only test let past
-                        // it, so they are alarms and a zero on them is the
-                        // healthy reading.
-                        Some(slot) => {
-                            crate::telemetry::note_route(slot.sampled_self_route());
-                            crate::telemetry::note_route(snapshot_timing.route());
-                        }
-                        None => crate::telemetry::note_route("sampled_resident_swizzle_snapshot"),
-                    }
+                    // Which attachment this draw is sampling of its own. The
+                    // primary is the case this arm has always taken; the other
+                    // two are the ones a primary-only test let past it, so they
+                    // are alarms and a zero on them is the healthy reading.
+                    crate::telemetry::note_route(self_slot.sampled_self_route());
+                    crate::telemetry::note_route(snapshot_timing.route());
                     let snapshot_key = SampledKey::of(resource);
-                    let image = if self_slot.is_some() && snapshot_key.is_plain_2d_identity_view() {
+                    let image = if snapshot_key.is_plain_2d_identity_view() {
                         let name = (identity.clone(), snapshot_key);
                         if let Some(existing) = attachment_snapshots.get(&name) {
                             existing.handles()
@@ -5023,8 +5014,8 @@ pub(crate) unsafe fn execute_draw_inner(
                     } else {
                         // Swizzled/arrayed/volume attachment views can give one
                         // source several incompatible keys, so an attachment-
-                        // count bound does not apply to them. Like a swizzled
-                        // non-attachment resident, they keep the general pool.
+                        // count bound does not apply to them: they keep the
+                        // general pool.
                         pools.acquire_sampled(ctx, snapshot_key, counters)?
                     };
                     sampled.push(PreparedSampled::Snapshot {
@@ -5369,7 +5360,7 @@ pub(crate) unsafe fn execute_draw_inner(
         vk::DependencyFlags::empty()
     };
 
-    phase.enter(super::draw_phase::Phase::RecBarrierVisibility);
+    phase.enter(super::draw_phase::Phase::RecBarrierImportedTest);
     // Publish writes made through any other Vulkan alias of guest memory before
     // this draw consumes an imported buffer or image. This is deliberately one
     // memory dependency for the draw: the physical payload may be shared by a
@@ -5474,6 +5465,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 note_imported_guest_visibility(counters, visibility);
                 visibility
             }) {
+                phase.enter(super::draw_phase::Phase::RecBarrierPassBreak);
                 unsafe {
                     outside_pass.before_record(
                         PassObstacle::GuestMemoryVisibility,

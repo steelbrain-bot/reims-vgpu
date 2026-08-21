@@ -85,10 +85,6 @@ pub(crate) enum SampledCopyCause {
     ViewMip { base: u32, count: u32 },
     /// The bind names a layer other than a whole single layer 0.
     ViewLayer { base: u32, count: u32 },
-    /// The bind reinterprets components. An alias hands the guest its own
-    /// bytes, so a swizzle would have to be expressed as a Vulkan component
-    /// mapping on the view rather than applied to the memory.
-    Swizzled,
     /// The declaration is admissible and the rail still could not serve it:
     /// no resident aliasing these guest bytes was available to pin.
     ///
@@ -116,13 +112,21 @@ impl SampledCopyCause {
     }
 
     /// The view half: which subresource of an admissible allocation the bind
-    /// names, and whether it reinterprets components.
+    /// names.
+    ///
+    /// A component swizzle is deliberately **not** a term here. It used to be,
+    /// and on a driven Maps boot it was 99.3 % of every refusal this rule
+    /// produced — every single-channel glyph coverage texture the guest samples
+    /// through a channel other than its own. A swizzle is a property of the
+    /// *view*, not of the memory: the alias carries it as a
+    /// `VkComponentMapping` the hardware applies at sample time, so admitting
+    /// one costs nothing and refusing one bought a whole texture copy to move
+    /// bytes the GPU would have moved for free.
     pub(crate) fn of_view(
         base_mip: u32,
         mip_count: u32,
         base_layer: u32,
         layer_count: u32,
-        identity_swizzle: bool,
     ) -> Option<Self> {
         if base_mip != 0 || mip_count != 1 {
             return Some(Self::ViewMip {
@@ -136,7 +140,7 @@ impl SampledCopyCause {
                 count: layer_count,
             });
         }
-        (!identity_swizzle).then_some(Self::Swizzled)
+        None
     }
 
     fn slug(self) -> &'static str {
@@ -151,7 +155,6 @@ impl SampledCopyCause {
             Self::MipChain { .. } => "sampled_copy_mip_chain",
             Self::ViewMip { .. } => "sampled_copy_view_mip",
             Self::ViewLayer { .. } => "sampled_copy_view_layer",
-            Self::Swizzled => "sampled_copy_swizzled",
             Self::ResidentUnavailable => "sampled_copy_resident_unavailable",
         }
     }
@@ -1324,27 +1327,23 @@ mod tests {
     }
 
     #[test]
-    fn the_view_half_admits_only_a_whole_unswizzled_level_zero_layer_zero() {
-        assert_eq!(SampledCopyCause::of_view(0, 1, 0, 1, true), None);
+    fn the_view_half_admits_only_a_whole_level_zero_layer_zero() {
+        assert_eq!(SampledCopyCause::of_view(0, 1, 0, 1), None);
         assert_eq!(
-            SampledCopyCause::of_view(2, 1, 0, 1, true),
+            SampledCopyCause::of_view(2, 1, 0, 1),
             Some(SampledCopyCause::ViewMip { base: 2, count: 1 })
         );
         assert_eq!(
-            SampledCopyCause::of_view(0, 3, 0, 1, true),
+            SampledCopyCause::of_view(0, 3, 0, 1),
             Some(SampledCopyCause::ViewMip { base: 0, count: 3 })
         );
         assert_eq!(
-            SampledCopyCause::of_view(0, 1, 5, 1, true),
+            SampledCopyCause::of_view(0, 1, 5, 1),
             Some(SampledCopyCause::ViewLayer { base: 5, count: 1 })
         );
         assert_eq!(
-            SampledCopyCause::of_view(0, 1, 0, 6, true),
+            SampledCopyCause::of_view(0, 1, 0, 6),
             Some(SampledCopyCause::ViewLayer { base: 0, count: 6 })
-        );
-        assert_eq!(
-            SampledCopyCause::of_view(0, 1, 0, 1, false),
-            Some(SampledCopyCause::Swizzled)
         );
     }
 
@@ -1362,7 +1361,6 @@ mod tests {
             SampledCopyCause::MipChain { mips: 2 },
             SampledCopyCause::ViewMip { base: 1, count: 1 },
             SampledCopyCause::ViewLayer { base: 1, count: 1 },
-            SampledCopyCause::Swizzled,
             SampledCopyCause::ResidentUnavailable,
         ];
         let mut slugs: Vec<&str> = causes.iter().map(|cause| cause.slug()).collect();
@@ -1376,10 +1374,6 @@ mod tests {
     fn the_refusal_reports_the_cause_it_carries() {
         // The cause has to survive the trip through `Decline`, or the census
         // still reads one undifferentiated reason.
-        assert_eq!(
-            WindowRefusal::SampledContentRequiresCopy(SampledCopyCause::Swizzled).slug(),
-            "sampled_copy_swizzled"
-        );
         assert_eq!(
             WindowRefusal::SampledContentRequiresCopy(SampledCopyCause::ResidentUnavailable).slug(),
             "sampled_copy_resident_unavailable"

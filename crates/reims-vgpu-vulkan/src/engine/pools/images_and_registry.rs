@@ -7,6 +7,7 @@
 
 use super::*;
 use crate::engine::types::TargetKeyDivergence;
+use reims_vgpu_core::pixel_format::SwizzlePlan;
 
 /// Band observed intervals between sampled uses. This is a reuse-distance
 /// diagnostic only; no residency decision reads it.
@@ -227,8 +228,9 @@ impl ResourcePools {
             });
         }
         // Only the target registry's exact allocation shape may converge here.
-        // A subresource, swizzled, array, mip-chain, or volume declaration is a
-        // different view contract and stays on the general guest-image rail.
+        // A subresource, array, mip-chain, or volume declaration is a different
+        // view contract and stays on the general guest-image rail. A component
+        // swizzle is not one of them: it rides on the view this rail creates.
         // Current attachments are excluded by the caller because sampling an
         // image while writing it requires the snapshot/feedback machinery that
         // is selected from a typed Target source, not an opportunistic match.
@@ -244,7 +246,6 @@ impl ResourcePools {
                     source.view.mip_level_count,
                     source.view.base_array_layer,
                     source.view.array_layer_count,
-                    resource.swizzle.is_identity(),
                 )
             });
         if requires_copy.is_none() {
@@ -311,10 +312,11 @@ impl ResourcePools {
             .get(identity)
             .map(|slot| (slot.image, slot.access, slot.guest_materialization))
             .expect("matched resident remains registered");
-        let view =
-            unsafe { self.registry_sample_view_raw(ctx, identity, sampled.format, counters) }
-                .map_err(WindowRefusal::CreateView)?
-                .expect("matched resident remains registered");
+        let view = unsafe {
+            self.registry_sample_view_raw(ctx, identity, sampled.format, sampled.swizzle, counters)
+        }
+        .map_err(WindowRefusal::CreateView)?
+        .expect("matched resident remains registered");
         if !self.pin_resident_for_entry(identity) {
             return Ok(None);
         }
@@ -1249,14 +1251,24 @@ impl ResourcePools {
     /// qualifier off every resident that has one. This is the single place that
     /// decides which view a bind gets, so it is the single place the fold
     /// belongs; a caller doing it for itself would be the second spelling.
+    /// **The channel mapping comes from the bind too**, and for the same reason
+    /// the channel order does: a Metal texture view carries a swizzle, and
+    /// Vulkan applies a component mapping at sample time, so the two express one
+    /// concept and the mapping belongs in the view rather than in the bytes.
+    /// Baking it here is what keeps a swizzled sampled declaration on the
+    /// aliasing rail — rewriting texels to move a single channel into place
+    /// would force the whole resource onto the CPU upload path and cost it the
+    /// zero-copy property, which is the trade
+    /// [`translate::pixel::vk_component_mapping`] exists to avoid.
     pub(crate) unsafe fn registry_sample_view(
         &mut self,
         ctx: &DeviceContext,
         identity: &TargetIdentity,
         format: vk::Format,
+        swizzle: SwizzlePlan,
         counters: &EngineCounters,
     ) -> Result<Option<vk::ImageView>, DrawError> {
-        unsafe { self.registry_sample_view_raw(ctx, identity, format, counters) }
+        unsafe { self.registry_sample_view_raw(ctx, identity, format, swizzle, counters) }
             .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateRegistryView, error)))
     }
 
@@ -1265,13 +1277,16 @@ impl ResourcePools {
         ctx: &DeviceContext,
         identity: &TargetIdentity,
         format: vk::Format,
+        swizzle: SwizzlePlan,
         counters: &EngineCounters,
     ) -> Result<Option<vk::ImageView>, vk::Result> {
         let Some(slot) = self.registry.get(identity) else {
             return Ok(None);
         };
         let format = translate::pixel::sample_view_format(format, slot.format.declared());
-        unsafe { self.registry_view_raw(ctx, identity, format, counters) }
+        unsafe {
+            self.registry_view_raw(ctx, identity, ResidentViewKey { format, swizzle }, counters)
+        }
     }
 
     /// The view over this resident's allocation in exactly `format`, created and
@@ -1296,7 +1311,7 @@ impl ResourcePools {
         format: vk::Format,
         counters: &EngineCounters,
     ) -> Result<Option<vk::ImageView>, DrawError> {
-        unsafe { self.registry_view_raw(ctx, identity, format, counters) }
+        unsafe { self.registry_view_raw(ctx, identity, ResidentViewKey::plain(format), counters) }
             .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateRegistryView, error)))
     }
 
@@ -1304,34 +1319,28 @@ impl ResourcePools {
         &mut self,
         ctx: &DeviceContext,
         identity: &TargetIdentity,
-        format: vk::Format,
+        key: ResidentViewKey,
         counters: &EngineCounters,
     ) -> Result<Option<vk::ImageView>, vk::Result> {
         let Some(slot) = self.registry.get_mut(identity) else {
             return Ok(None);
         };
-        if slot.format.allocation() == format {
-            return Ok(Some(slot.view));
-        }
-        if let Some((_, view)) = slot
-            .alternate_views
-            .iter()
-            .find(|(held, _)| *held == format)
-        {
-            return Ok(Some(*view));
+        if let Some(view) = slot.held_view(key) {
+            return Ok(Some(view));
         }
         let view = unsafe {
             ctx.device.create_image_view(
                 &vk::ImageViewCreateInfo::default()
                     .image(slot.image)
                     .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(format)
-                    .subresource_range(super::super::registry_subresource_range(format)),
+                    .format(key.format)
+                    .components(translate::pixel::vk_component_mapping(&key.swizzle))
+                    .subresource_range(super::super::registry_subresource_range(key.format)),
                 None,
             )
         }?;
         counters.note_create(CreateSite::RegistryImageView);
-        slot.alternate_views.push((format, view));
+        slot.alternate_views.push((key, view));
         Ok(Some(view))
     }
 
@@ -1438,7 +1447,7 @@ impl ResourcePools {
                 // dispose.
                 alternate_views: new
                     .attachment_view
-                    .map(|v| vec![(new.format.declared(), v)])
+                    .map(|v| vec![(ResidentViewKey::plain(new.format.declared()), v)])
                     .unwrap_or_default(),
                 framebuffer: new.framebuffer,
                 render_pass: new.render_pass,
@@ -3353,6 +3362,75 @@ pub(super) mod pin_count_tests {
             generation: 0,
             format: reims_vgpu_protocol::TexelLayout::Bgra8,
         }
+    }
+
+    /// A swizzled ask never reaches the allocation's own view, and two
+    /// differently-swizzled asks are two views.
+    ///
+    /// This is the whole safety argument for keying a retained view on the
+    /// format *and* the mapping. The alias rail used to refuse a non-identity
+    /// mapping outright and copy the texture instead — 99.3 % of every refusal
+    /// it produced on a driven Maps boot, one per single-channel glyph coverage
+    /// texture. Admitting it means the cache key has to be able to tell the
+    /// mappings apart, and a key that could not would hand a `.rrrr` bind the
+    /// unmapped view: correct-looking, silently wrong channels, and counted
+    /// nowhere.
+    #[test]
+    fn a_retained_view_is_keyed_on_the_mapping_as_well_as_the_format() {
+        let alpha_in_red = reims_vgpu_protocol::SwizzlePlan {
+            source: [reims_vgpu_protocol::SwizzleSource::A; 4],
+        };
+        let red_everywhere = reims_vgpu_protocol::SwizzlePlan {
+            source: [reims_vgpu_protocol::SwizzleSource::R; 4],
+        };
+        let mut slot = dummy_slot(true);
+        slot.view = vk::ImageView::from_raw(0x11);
+        let allocation = slot.format.allocation();
+
+        // The allocation's own view answers only the unmapped ask.
+        assert_eq!(
+            slot.held_view(ResidentViewKey::plain(allocation)),
+            Some(vk::ImageView::from_raw(0x11))
+        );
+        for plan in [alpha_in_red, red_everywhere] {
+            assert_eq!(
+                slot.held_view(ResidentViewKey {
+                    format: allocation,
+                    swizzle: plan,
+                }),
+                None,
+                "a mapped ask was served the allocation's unmapped view"
+            );
+        }
+
+        // Each mapping retains its own, and neither answers for the other.
+        slot.alternate_views.push((
+            ResidentViewKey {
+                format: allocation,
+                swizzle: alpha_in_red,
+            },
+            vk::ImageView::from_raw(0x22),
+        ));
+        assert_eq!(
+            slot.held_view(ResidentViewKey {
+                format: allocation,
+                swizzle: alpha_in_red,
+            }),
+            Some(vk::ImageView::from_raw(0x22))
+        );
+        assert_eq!(
+            slot.held_view(ResidentViewKey {
+                format: allocation,
+                swizzle: red_everywhere,
+            }),
+            None,
+            "one mapping's view answered for another's"
+        );
+        assert_eq!(
+            slot.held_view(ResidentViewKey::plain(allocation)),
+            Some(vk::ImageView::from_raw(0x11)),
+            "a mapped view displaced the allocation's own"
+        );
     }
 
     #[test]

@@ -1874,6 +1874,34 @@ impl ResidentIncarnation {
     }
 }
 
+/// What distinguishes one interpretation of a resident's allocation from
+/// another.
+///
+/// Format alone was the key until a swizzled sampled bind needed one: Vulkan
+/// performs a component mapping at sample time, so two views differing only in
+/// their mapping are two views over identical storage. Keying on the pair is
+/// what lets a swizzled declaration — `A8Unorm` and every other single-channel
+/// glyph coverage format — stay on the aliasing rail instead of being copied to
+/// get its channels moved. Before this, the guest-alias rail refused a
+/// non-identity mapping outright, and on a driven Maps boot that one term was
+/// 99.3 % of all its refusals.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ResidentViewKey {
+    pub format: vk::Format,
+    pub swizzle: reims_vgpu_core::pixel_format::SwizzlePlan,
+}
+
+impl ResidentViewKey {
+    /// The interpretation that reads the allocation's own channels back
+    /// unchanged.
+    pub fn plain(format: vk::Format) -> Self {
+        Self {
+            format,
+            swizzle: reims_vgpu_core::pixel_format::SwizzlePlan::default(),
+        }
+    }
+}
+
 pub(crate) struct ResidentTargetSlot {
     pub incarnation: ResidentIncarnation,
     pub image: vk::Image,
@@ -1888,11 +1916,11 @@ pub(crate) struct ResidentTargetSlot {
     /// [`AliasMaterialization`], which says why the copy exists at all.
     pub guest_materialization: Option<AliasMaterialization>,
     pub view: vk::ImageView,
-    /// Additional compatible-format views over `image`, retained for the
+    /// Additional compatible interpretations of `image`, retained for the
     /// resident's lifetime. A texture view changes interpretation, not storage;
     /// keeping these beside the allocation avoids copying pixels or rebuilding
     /// a view on every draw.
-    pub alternate_views: Vec<(vk::Format, vk::ImageView)>,
+    pub alternate_views: Vec<(ResidentViewKey, vk::ImageView)>,
     pub framebuffer: vk::Framebuffer,
     pub render_pass: vk::RenderPass,
     pub framebuffer_compatibility: Option<FramebufferCompatibilityKey>,
@@ -2061,6 +2089,24 @@ pub(crate) struct ResidentTargetSlot {
 }
 
 impl ResidentTargetSlot {
+    /// The view over this allocation that already reads it as `key` asks, if
+    /// this slot holds one.
+    ///
+    /// `view` is the allocation-format view and carries the identity mapping, so
+    /// it can only answer a request for exactly that. The swizzle half of that
+    /// condition is what stops a mapped bind being served an unmapped view — the
+    /// failure it prevents is silently wrong channels, which nothing in this
+    /// tree counts, so the invariant lives here rather than at the caller.
+    pub(crate) fn held_view(&self, key: ResidentViewKey) -> Option<vk::ImageView> {
+        if self.format.allocation() == key.format && key.swizzle.is_identity() {
+            return Some(self.view);
+        }
+        self.alternate_views
+            .iter()
+            .find(|(held, _)| *held == key)
+            .map(|(_, view)| *view)
+    }
+
     /// Whether this image's texels are already in the byte order the guest
     /// scanout and the host window blit both read.
     ///
