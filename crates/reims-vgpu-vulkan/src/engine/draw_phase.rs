@@ -478,20 +478,26 @@ pub(crate) enum Phase {
     /// This is the floor. Whatever else this device stops doing, it still issues
     /// one draw call per guest draw, exactly as Apple's driver does.
     RecordDraw = 32,
-    /// Deciding whether this draw reads imported guest memory, asking what
-    /// outstanding guest writes reach the pages it names, and recording the one
-    /// global memory dependency that answer buys.
+    /// Asking the write ledger what outstanding guest writes reach the pages
+    /// this draw reads, once the read set is built and the draw is known to read
+    /// imported guest memory.
     ///
-    /// Charged on every draw that touches imported guest memory, including the
-    /// draws whose answer is that nothing reaches them —
-    /// `guest_visibility_host_only` is 96 % of the verdicts on a Maps boot, so
-    /// most of what lands here bought no barrier at all.
+    /// **This is the largest single cost in the device.** A driven fullscreen
+    /// Maps boot on the macos-13 rail charges the region 3.59 µs/draw, 2.3x the
+    /// next phase and 16 % of the whole 22.6 µs draw. Three candidates sat
+    /// inside it and each has a different fix, so each is now its own ordinal
+    /// and this is the residue: [`Phase::RecBarrierReadSet`] is the set build,
+    /// [`Phase::RecBarrierImportedTest`] is the predicate that decides whether
+    /// to ask at all, and [`Phase::RecBarrierPassBreak`] is what a positive
+    /// answer costs.
     ///
-    /// **This is where the barrier span's time is.** A driven fullscreen Maps
-    /// boot on the macos-13 rail charges it 3.51 µs/draw against a 4.00 µs
-    /// barrier span — 88 % of it, and an order of magnitude clear of every
-    /// sibling below. [`Phase::RecBarrierReadSet`] is carved out of it to say
-    /// which half.
+    /// What remains here is the ledger question itself — the short-circuit on
+    /// the outstanding-write flag, and, when that flag is set, an exact
+    /// page-membership walk of every page the read set names under one mutex.
+    /// The Maps boot puts that at ~513 pages per draw across 8.2 sets, against
+    /// verdicts that are 97.1 % `host_only`: almost every draw pays the ask and
+    /// buys nothing. It is attacked by asking a cheaper way, not by asking less
+    /// often.
     RecBarrierVisibility = 33,
     /// The attachment-feedback fallback: copying a resident's prior content
     /// into a same-format image before the attachment changes, for the loops
@@ -527,7 +533,36 @@ pub(crate) enum Phase {
     /// Maps boot — and is attacked by not materializing the set. The residue is
     /// the ledger question that consumes it, ~334 pages per draw under one
     /// mutex, and is attacked by asking it a cheaper way.
+    ///
+    /// Measured at 0.163 µs/draw on the Maps boot — 4.5 % of the region. The
+    /// set build is not where the cost is, so "do not materialize the set" is
+    /// the fix this measurement retired.
     RecBarrierReadSet = 40,
+    /// The predicate that decides whether this draw reads imported guest memory
+    /// at all: a scan of the draw's vertex buffers, index slot, storage slots,
+    /// gathers, target, MRT secondaries and sampled bindings, the last of which
+    /// asks the registry per binding whether the resident it names aliases guest
+    /// pages.
+    ///
+    /// Carved out of [`Phase::RecBarrierVisibility`] because it is charged on
+    /// **every** draw, including the ones that read no guest memory and ask the
+    /// ledger nothing, while the rest of the region is charged only on the draws
+    /// that get past it. A cost that scales with bindings-per-draw and a cost
+    /// that scales with pages-per-draw need different repairs, and averaged
+    /// together neither is legible.
+    RecBarrierImportedTest = 41,
+    /// What a positive visibility answer costs: closing the open render pass so
+    /// the global memory dependency can be recorded outside it, the
+    /// `cmd_pipeline_barrier` itself, and the reopen the next draw then pays.
+    ///
+    /// Carved out of [`Phase::RecBarrierVisibility`] because it is the one part
+    /// of the region whose cost is not paid per draw but per *overlap*, and the
+    /// Maps boot has 46 471 overlaps against 1 550 927 `host_only` verdicts —
+    /// 2.9 %. A small rate against a large per-event cost produces the same
+    /// per-draw average as a large rate against a small one, and only the split
+    /// says which this is. If it is this half, the fix is to stop breaking the
+    /// pass; if it is the residue, the fix is in how the ledger is asked.
+    RecBarrierPassBreak = 42,
 }
 
 impl Phase {
@@ -538,7 +573,7 @@ impl Phase {
     /// the ordinals that existed when they were added, rather than inserted next
     /// to the phase they divide, so that every existing ordinal kept its value
     /// and this stayed the only place the count is written.
-    const LAST: Phase = Phase::RecBarrierReadSet;
+    const LAST: Phase = Phase::RecBarrierPassBreak;
 }
 
 const PHASES: usize = Phase::LAST as usize + 1;
@@ -607,8 +642,8 @@ pub struct DrawPhaseWindow {
     pub descriptors_us: u64,
     pub record_us: u64,
     pub rec_begin_us: u64,
-    /// The residue of the barrier span; the seven below are carved out of it and
-    /// the eight together are what `rec_barrier_us` used to be alone.
+    /// The residue of the barrier span; the nine below are carved out of it and
+    /// the ten together are what `rec_barrier_us` used to be alone.
     pub rec_barrier_us: u64,
     pub rb_visibility_us: u64,
     pub rb_snapshot_us: u64,
@@ -619,6 +654,10 @@ pub struct DrawPhaseWindow {
     pub rb_attachment_us: u64,
     /// See [`Phase::RecBarrierReadSet`].
     pub rb_read_set_us: u64,
+    /// See [`Phase::RecBarrierImportedTest`].
+    pub rb_imported_test_us: u64,
+    /// See [`Phase::RecBarrierPassBreak`].
+    pub rb_pass_break_us: u64,
     pub rec_pass_us: u64,
     pub rec_state_us: u64,
     pub rec_draw_us: u64,
@@ -678,6 +717,12 @@ pub fn take_window() -> Option<DrawPhaseWindow> {
             ACC[Phase::RecBarrierAttachment as usize].swap(0, Ordering::Relaxed),
         ),
         rb_read_set_us: to_us(ACC[Phase::RecBarrierReadSet as usize].swap(0, Ordering::Relaxed)),
+        rb_imported_test_us: to_us(
+            ACC[Phase::RecBarrierImportedTest as usize].swap(0, Ordering::Relaxed),
+        ),
+        rb_pass_break_us: to_us(
+            ACC[Phase::RecBarrierPassBreak as usize].swap(0, Ordering::Relaxed),
+        ),
         rec_pass_us: to_us(ACC[Phase::RecordPass as usize].swap(0, Ordering::Relaxed)),
         rec_state_us: to_us(ACC[Phase::RecordState as usize].swap(0, Ordering::Relaxed)),
         rec_draw_us: to_us(ACC[Phase::RecordDraw as usize].swap(0, Ordering::Relaxed)),
@@ -901,6 +946,8 @@ mod tests {
             Phase::RecBarrierUpload,
             Phase::RecBarrierAttachment,
             Phase::RecBarrierReadSet,
+            Phase::RecBarrierImportedTest,
+            Phase::RecBarrierPassBreak,
         ];
         assert_eq!(all.len(), PHASES);
         for (want, phase) in all.iter().enumerate() {
@@ -1010,7 +1057,7 @@ mod tests {
             w.rec_barrier_us < absorbed_the_sleep,
             "the barrier residue charged time a sub-phase spent: {w:?}"
         );
-        // Nor did any sibling. A slot collision between two of the seven is the
+        // Nor did any sibling. A slot collision between two of the nine is the
         // failure this catches that reading the enum cannot.
         for (name, value) in [
             ("rb_visibility_us", w.rb_visibility_us),
@@ -1020,6 +1067,8 @@ mod tests {
             ("rb_upload_us", w.rb_upload_us),
             ("rb_attachment_us", w.rb_attachment_us),
             ("rb_read_set_us", w.rb_read_set_us),
+            ("rb_imported_test_us", w.rb_imported_test_us),
+            ("rb_pass_break_us", w.rb_pass_break_us),
         ] {
             assert_eq!(value, 0, "{name} shares a slot with the resident region");
         }
@@ -1031,6 +1080,50 @@ mod tests {
             w.rec_pass_us < absorbed_the_sleep,
             "the pass phase charged time a sub-phase spent: {w:?}"
         );
+    }
+
+    /// The three costs inside the visibility region must land in three
+    /// different accumulators.
+    ///
+    /// They are charged at different rates — the predicate on every draw, the
+    /// ledger question on the draws that read guest memory, the pass break on
+    /// the 2.9 % of those that overlap — so averaging any two together hides
+    /// which of a large per-event cost and a large event rate is present. That
+    /// ambiguity is the reason for the carve, and a slot collision between two
+    /// of them would reintroduce it while still reading as a plausible profile.
+    #[test]
+    fn the_visibility_region_charges_its_three_costs_apart() {
+        const REGION_SLEEP: std::time::Duration = std::time::Duration::from_millis(4);
+        let absorbed = (REGION_SLEEP.as_micros() / 2) as u64;
+        for (name, sleep_in) in [
+            ("rb_imported_test_us", Phase::RecBarrierImportedTest),
+            ("rb_read_set_us", Phase::RecBarrierReadSet),
+            ("rb_visibility_us", Phase::RecBarrierVisibility),
+            ("rb_pass_break_us", Phase::RecBarrierPassBreak),
+        ] {
+            let _ = take_window();
+            {
+                let mut t = DrawTimer::start();
+                t.enter(Phase::RecordBarrier);
+                t.enter(sleep_in);
+                std::thread::sleep(REGION_SLEEP);
+                t.enter(Phase::RecordPass);
+            }
+            let w = take_window().expect("one draw ran");
+            let charged = [
+                ("rb_imported_test_us", w.rb_imported_test_us),
+                ("rb_read_set_us", w.rb_read_set_us),
+                ("rb_visibility_us", w.rb_visibility_us),
+                ("rb_pass_break_us", w.rb_pass_break_us),
+            ];
+            for (field, value) in charged {
+                if field == name {
+                    assert!(value >= 2_000, "{field} lost the time it was given: {w:?}");
+                } else {
+                    assert!(value < absorbed, "{field} shares a slot with {name}: {w:?}");
+                }
+            }
+        }
     }
 
     /// Store publication must not be charged to the driver submit bar. The
