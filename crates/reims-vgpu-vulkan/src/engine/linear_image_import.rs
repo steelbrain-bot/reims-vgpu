@@ -248,6 +248,15 @@ pub(crate) enum WindowRefusal {
     },
     BindOffsetMisaligned,
     RowPitchMismatch {
+        /// Which level disagreed. Two sites raise this — the plane's own check
+        /// and the per-level chain walk — and without the level their lines
+        /// read identically, so a reader cannot tell a chain this host lays out
+        /// its own way from a plane it would never have accepted.
+        mip_level: u32,
+        /// That level's texel width. A reader divides each pitch by it to get
+        /// the bytes per texel each side believes in, which is what separates a
+        /// host alignment choice from a disagreement about the format.
+        width: u32,
         guest: u64,
         host: u64,
     },
@@ -375,7 +384,14 @@ impl Decline for WindowRefusal {
                 ("plane_offset", plane_offset.to_string()),
                 ("subresource_offset", subresource_offset.to_string()),
             ],
-            Self::RowPitchMismatch { guest, host } => vec![
+            Self::RowPitchMismatch {
+                mip_level,
+                width,
+                guest,
+                host,
+            } => vec![
+                ("mip", mip_level.to_string()),
+                ("width", width.to_string()),
                 ("guest_pitch", guest.to_string()),
                 ("host_pitch", host.to_string()),
             ],
@@ -484,6 +500,11 @@ fn validate_common(
     } = admission;
     if layout.row_pitch != backing.row_pitch {
         return Err(WindowRefusal::RowPitchMismatch {
+            // The plane is the chain's own level zero: this check runs against
+            // the layout Vulkan reported for mip zero, so naming any other
+            // level here would be a second, wrong spelling of the same thing.
+            mip_level: 0,
+            width: guest_layout.width(),
             guest: backing.row_pitch,
             host: layout.row_pitch,
         });
@@ -596,6 +617,8 @@ fn validate_mip_subresource(
     }
     if host.row_pitch != guest.row_pitch {
         return Err(WindowRefusal::RowPitchMismatch {
+            mip_level,
+            width: guest.layout.width(),
             guest: guest.row_pitch,
             host: host.row_pitch,
         });
@@ -1448,6 +1471,8 @@ mod tests {
         let key = |backing| {
             explicit_linear_decline_key(
                 &WindowRefusal::RowPitchMismatch {
+                    mip_level: 0,
+                    width: 64,
                     guest: 256,
                     host: 512,
                 },
@@ -1559,6 +1584,8 @@ mod tests {
                 true,
             ),
             Err(WindowRefusal::RowPitchMismatch {
+                mip_level: 0,
+                width: 16,
                 guest: 256,
                 host: 512,
             })
