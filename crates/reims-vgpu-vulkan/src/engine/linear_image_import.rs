@@ -1002,33 +1002,51 @@ pub(crate) unsafe fn binding_allocation_len(
     // Mode selection mirrors `create_allocation` because a length planned in a
     // mode creation would not choose is not the length creation will need.
     let explicit = unsafe { explicit_linear_supported(ctx, format, usage, geometry.image_type) }?;
-    let modes: &[LayoutMode] = if explicit {
-        &[LayoutMode::ExplicitLinear, LayoutMode::DriverLinear]
-    } else {
-        &[LayoutMode::DriverLinear]
+    let plan_in = |mode: LayoutMode| unsafe {
+        plan_image_with_layout(
+            ctx,
+            backing,
+            allocation_layout,
+            format,
+            usage,
+            mode,
+            None,
+            false,
+        )
+        .map(|(image, plan)| {
+            ctx.device.destroy_image(image, None);
+            plan.required_allocation_len
+        })
     };
-    let mut last = WindowRefusal::ResourceWindowTooShort;
-    for mode in modes {
-        match unsafe {
-            plan_image_with_layout(
-                ctx,
+    if !explicit {
+        note_explicit_linear_unavailable(format, geometry.image_type, usage);
+        return plan_in(LayoutMode::DriverLinear);
+    }
+    // Both modes are planned because either can carry the alias, but only the
+    // explicit one declares the guest's own row pitch — the driver's linear
+    // tiling reports whatever pitch it prefers, and a guest that padded its rows
+    // disagrees with it by construction. So the explicit mode's refusal is the
+    // one that says why the aliasing rail was not taken, and the fallback's is a
+    // consequence of having fallen back.
+    //
+    // Only one refusal can return, so the explicit mode's is reported twice
+    // over: through the same decline helper the creating path uses, which names
+    // it against the declaration that produced it, and as the returned refusal
+    // when the fallback refuses too.
+    match plan_in(LayoutMode::ExplicitLinear) {
+        Ok(len) => Ok(len),
+        Err(explicit_refusal) => {
+            note_explicit_linear_declined(
+                &explicit_refusal,
                 backing,
                 allocation_layout,
                 format,
+                geometry.image_type,
                 usage,
-                *mode,
-                None,
-                false,
-            )
-        } {
-            Ok((image, plan)) => {
-                unsafe { ctx.device.destroy_image(image, None) };
-                return Ok(plan.required_allocation_len);
-            }
-            Err(refusal) => last = refusal,
+            );
+            plan_in(LayoutMode::DriverLinear).map_err(|_| explicit_refusal)
         }
     }
-    Err(last)
 }
 
 #[allow(clippy::too_many_arguments)]
