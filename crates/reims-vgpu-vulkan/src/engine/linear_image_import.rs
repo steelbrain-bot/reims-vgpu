@@ -771,6 +771,27 @@ unsafe fn plan_image_with_layout(
         // External-memory images are born without Vulkan-visible contents.
         // Guest bytes are materialized through the buffer transfer rail before
         // the first LOAD; later attachment writes keep this image authoritative.
+        //
+        // `UNDEFINED` is forced by the specification here, not chosen, and
+        // `PREINITIALIZED` is not an available alternative for carrying the
+        // guest's existing bytes across image creation. Two valid-usage
+        // statements compose to close that door:
+        //
+        // - VUID-vkBindImageMemory-memory-02989 requires memory created by
+        //   *any* import operation other than a non-NULL
+        //   `VkImportAndroidHardwareBufferInfoANDROID` to be bound to an image
+        //   whose `VkExternalMemoryImageCreateInfo::handleTypes` names that
+        //   handle type. Host-pointer import is not in that exclusion list, so
+        //   the `external` chain pushed below is mandatory rather than an
+        //   optimization.
+        // - VUID-VkImageCreateInfo-pNext-01443 then requires `initialLayout` to
+        //   be `UNDEFINED` whenever such a chain is present with non-zero
+        //   `handleTypes`.
+        //
+        // That is a valid-usage rule and not a capability, so no host can
+        // report otherwise and there is nothing here to measure. An aliasing
+        // rail needing the guest's prior bytes must materialize them after
+        // creation; it cannot inherit them through the initial layout.
         .initial_layout(vk::ImageLayout::UNDEFINED);
     let view_formats = mutable_view_formats(format);
     let mut format_list = vk::ImageFormatListCreateInfo::default().view_formats(&view_formats);
