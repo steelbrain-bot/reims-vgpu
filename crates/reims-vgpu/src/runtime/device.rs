@@ -88,10 +88,13 @@ impl Device {
 
     pub fn new_with_executor(id: DeviceId, page_shift: u32, executor: Arc<dyn Executor>) -> Self {
         Self {
-            state: crate::model::DeviceState::new_with_audit_density(
+            state: crate::model::DeviceState::new_with_gather_policies(
                 id,
                 page_shift,
-                crate::runtime::gather_witness::audit_density(),
+                reims_vgpu_core::GatherPolicies {
+                    audit: crate::runtime::gather_witness::audit_density(),
+                    vouch: crate::runtime::gather_witness::vouch_policy(),
+                },
             ),
             executor,
             bound_buffers: Default::default(),

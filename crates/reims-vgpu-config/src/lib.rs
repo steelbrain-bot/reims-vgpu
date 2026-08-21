@@ -358,6 +358,27 @@ pub const SLAB_RETAIN: &str = "REIMS_VGPU_SLAB_RETAIN";
 /// through the alarm. Use it for a soundness sweep, never for a timing.
 pub const GATHER_AUDIT_ALL: &str = "REIMS_VGPU_GATHER_AUDIT_ALL";
 
+/// `off` withholds every gather vouch, so each bind re-reads its window.
+///
+/// Narrowing only, in the strictest sense available here: it cannot make a bind
+/// happen that would not, cannot widen a window, and cannot reach a resource the
+/// witness would have refused anyway. It removes an *optimization* and nothing
+/// else, which is why it is a safe arm to leave in the shipping binary.
+///
+/// It exists because `REIMS_VGPU_GUEST_IMPORT=off` conflates two questions. That
+/// switch takes away the host-pointer import *and* the memoized re-read in one
+/// step, so a content difference between its two arms says only "somewhere in
+/// the zero-copy path", which is most of this device. This switch moves exactly
+/// one of the two: both arms import, both arms bind the guest pages directly,
+/// and they differ only in whether a bind may reuse the bytes the previous one
+/// read. A frame that is wrong with the vouch and right without it is a stale
+/// vouch and nothing else; a frame wrong under both has a defect the witness
+/// does not own, and the search moves elsewhere.
+///
+/// Not a shipping arm and not a timing arm — withholding every vouch reinstates
+/// the whole per-draw copy the cache exists to remove.
+pub const GATHER_VOUCH: &str = "REIMS_VGPU_GATHER_VOUCH";
+
 /// `off` narrows the CLEAR-seed Store at the head of a draw chain out of
 /// existence: the solid colour is not written into the guest's pages before the
 /// encode, and only what the draw's own Store lands reaches them.
@@ -1018,10 +1039,11 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 23] = [
+pub const ALL: [&str; 24] = [
     COLOR_GENERAL,
     SLAB_RETAIN,
     GATHER_AUDIT_ALL,
+    GATHER_VOUCH,
     PIPELINE_MEMO,
     CLEAR_SEED,
     GUEST_IMPORT,

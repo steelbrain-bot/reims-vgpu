@@ -75,9 +75,9 @@ pub use execution::{
     ResourceStateCompletion,
 };
 pub use gather::{
-    fold_runs, AuditDensity, ContentAudit, GatherObservation, GatherOutcome, GatherReadings,
-    GatherVerdict, GatherWindow, GatherWitness, GatheredIdentity, StatedGuestWrite,
-    AUDIT_REBASELINE_LIMIT,
+    fold_runs, AuditDensity, ContentAudit, GatherObservation, GatherOutcome, GatherPolicies,
+    GatherReadings, GatherVerdict, GatherWindow, GatherWitness, GatheredIdentity, StatedGuestWrite,
+    VouchPolicy, AUDIT_REBASELINE_LIMIT,
 };
 pub use icb::{IcbRecord, IcbRegistry};
 pub use map_audit::{MapAudit, MapIntervals, PageSize};

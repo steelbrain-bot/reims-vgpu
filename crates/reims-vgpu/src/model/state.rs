@@ -3614,7 +3614,7 @@ pub(crate) struct SampledContentState {
 }
 
 impl SampledContentState {
-    fn new(audit_density: reims_vgpu_core::AuditDensity) -> Self {
+    fn new(policies: reims_vgpu_core::GatherPolicies) -> Self {
         Self {
             generation: 0,
             guest_linear_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
@@ -3622,7 +3622,7 @@ impl SampledContentState {
             iosurface_plane_view_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             iosurface_texture_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             iosurface_texture_memo_scratch: Vec::new(),
-            gather_witness: reims_vgpu_core::GatherWitness::with_audit_density(audit_density),
+            gather_witness: reims_vgpu_core::GatherWitness::with_policies(policies),
         }
     }
 
@@ -4069,9 +4069,9 @@ pub(crate) struct ContentAuthorityState {
 }
 
 impl ContentAuthorityState {
-    fn new(page_shift: u32, audit_density: reims_vgpu_core::AuditDensity) -> Self {
+    fn new(page_shift: u32, policies: reims_vgpu_core::GatherPolicies) -> Self {
         Self {
-            sampled: SampledContentState::new(audit_density),
+            sampled: SampledContentState::new(policies),
             gva_stores: Default::default(),
             preconstruction_writes: Default::default(),
             host_writes: reims_vgpu_core::HostWrites::new(page_shift),
@@ -4273,13 +4273,13 @@ impl DeviceState {
     /// `page_shift` must be **12** (x86_64 / Tahoe) or **14** (arm64e). There
     /// is no default — product create and tests must choose explicitly.
     pub fn new(id: DeviceId, page_shift: u32) -> Self {
-        Self::new_with_audit_density(id, page_shift, reims_vgpu_core::AuditDensity::default())
+        Self::new_with_gather_policies(id, page_shift, reims_vgpu_core::GatherPolicies::default())
     }
 
-    pub(crate) fn new_with_audit_density(
+    pub(crate) fn new_with_gather_policies(
         id: DeviceId,
         page_shift: u32,
-        audit_density: reims_vgpu_core::AuditDensity,
+        policies: reims_vgpu_core::GatherPolicies,
     ) -> Self {
         Self {
             id,
@@ -4294,7 +4294,7 @@ impl DeviceState {
             task_objects: TaskObjectNamespaces::default(),
             surfaces: SurfaceState::default(),
             host_replicas: HostReplicaState::default(),
-            content: ContentAuthorityState::new(page_shift, audit_density),
+            content: ContentAuthorityState::new(page_shift, policies),
             presentation: PresentationState::default(),
             #[cfg(test)]
             fails: Vec::new(),
@@ -4508,7 +4508,7 @@ impl DeviceState {
         };
         let id = self.id;
         let page_shift = self.page_shift;
-        let audit_density = self.content.sampled.gather_witness.audit_density();
+        let policies = self.content.sampled.gather_witness.policies();
         // Keep the interrupt-status Arcs wired to the registry slot: the
         // lock-free ISR read rail clones them once at device create.
         let intr_disp = Arc::clone(&self.registers.gfx.interrupt_status_disp);
@@ -4523,7 +4523,7 @@ impl DeviceState {
         // Cleared as well as kept: a reset drops every channel, so a bit rung
         // before it names a channel that no longer exists.
         child_rung.store(0, Ordering::Release);
-        *self = Self::new_with_audit_density(id, page_shift, audit_density);
+        *self = Self::new_with_gather_policies(id, page_shift, policies);
         self.registers.gfx.interrupt_status_disp = intr_disp;
         self.registers.gfx.interrupt_status_gpu = intr_gpu;
         self.registers.gfx.interrupt_fault = intr_fault;
@@ -6294,18 +6294,21 @@ mod task_lifecycle_effect_tests {
 
     #[test]
     fn reset_preserves_the_injected_diagnostic_audit_policy() {
-        let mut state = DeviceState::new_with_audit_density(
-            DeviceId(1),
-            PAGE_SHIFT_X86,
-            reims_vgpu_core::AuditDensity::EveryBind,
-        );
+        // Both policies are asserted, and both are set to their non-default arm,
+        // because a reset that rebuilt the witness from `Default` would still
+        // pass this test if either one happened to be the default.
+        let injected = reims_vgpu_core::GatherPolicies {
+            audit: reims_vgpu_core::AuditDensity::EveryBind,
+            vouch: reims_vgpu_core::VouchPolicy::Withheld,
+        };
+        assert_ne!(injected, reims_vgpu_core::GatherPolicies::default());
+
+        let mut state =
+            DeviceState::new_with_gather_policies(DeviceId(1), PAGE_SHIFT_X86, injected);
 
         let _ = state.reset();
 
-        assert_eq!(
-            state.content.sampled.gather_witness.audit_density(),
-            reims_vgpu_core::AuditDensity::EveryBind
-        );
+        assert_eq!(state.content.sampled.gather_witness.policies(), injected);
     }
 
     #[test]

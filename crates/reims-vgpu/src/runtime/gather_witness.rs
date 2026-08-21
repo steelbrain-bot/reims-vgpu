@@ -21,7 +21,7 @@ pub use reims_vgpu_core::{
     fold_runs, AuditDensity, ContentAudit, GatherKey, GatherObservation, GatherOutcome,
     GatherReadings as WitnessReadings, GatherVerdict, GatherVouch, GatherWindow, GatherWitness,
     GatheredIdentity, GuestWriteReach as PendingWrites, StatedGeneration, StatedGuestWrite,
-    AUDIT_REBASELINE_LIMIT,
+    VouchPolicy, AUDIT_REBASELINE_LIMIT,
 };
 
 /// Resolve this process's diagnostic sampling policy at the composition edge.
@@ -29,6 +29,18 @@ pub fn audit_density() -> AuditDensity {
     match crate::env::switch(crate::env::GATHER_AUDIT_ALL) {
         crate::env::Switch::On => AuditDensity::EveryBind,
         _ => AuditDensity::default(),
+    }
+}
+
+/// Resolve whether this process may act on the vouches the contract grants.
+///
+/// Only `off` withholds. An unset or misspelled value keeps the contract arm,
+/// so a typo cannot quietly put a boot on the slow rail and have its timings
+/// read as the shipping ones.
+pub fn vouch_policy() -> VouchPolicy {
+    match crate::env::switch(crate::env::GATHER_VOUCH) {
+        crate::env::Switch::Off => VouchPolicy::Withheld,
+        _ => VouchPolicy::default(),
     }
 }
 
@@ -273,6 +285,7 @@ pub fn note_gather(
                 note_store_route("gw_refused_host_write");
             }
         }
+        GatherVerdict::Withheld => note_store_route("gw_withheld"),
     }
     // `gw_audit_kb` is every byte the fold still reads, so the cost of keeping
     // the alarm is reported in the same units as the gathers it saves.
@@ -627,10 +640,82 @@ mod tests {
         );
     }
 
+    /// [`VouchPolicy::Withheld`] takes away vouches and takes away nothing else.
+    ///
+    /// Both halves matter, and only the second is easy to get wrong. If the
+    /// ablation reached any other verdict it would stop being a one-variable
+    /// arm, and a content difference between the two boots would no longer
+    /// isolate the memo — which is the entire reason the switch exists.
+    ///
+    /// The two witnesses are fed byte-identical readings in the same order, so
+    /// any divergence below is the policy and nothing else.
+    #[test]
+    fn withholding_removes_the_vouch_and_leaves_every_other_verdict_alone() {
+        let buf = vec![0x3cu8; PAGE];
+        let runs = [run_over(&buf)];
+        let withheld = |vouch| {
+            GatherWitness::with_policies(reims_vgpu_core::GatherPolicies {
+                vouch,
+                ..Default::default()
+            })
+        };
+
+        // A resource that states a generation and holds it still: the contract
+        // grants a vouch here, so this is the one bind the policy may change.
+        let mut contract = withheld(VouchPolicy::Contract);
+        let mut ablated = withheld(VouchPolicy::Withheld);
+        for w in [&mut contract, &mut ablated] {
+            let _ = observe(w, KEY, one_page(&GPAS, &runs), QUIET, 1);
+        }
+        let granted = observe(&mut contract, KEY, one_page(&GPAS, &runs), QUIET, 2);
+        let declined = observe(&mut ablated, KEY, one_page(&GPAS, &runs), QUIET, 2);
+
+        assert_eq!(granted.verdict, GatherVerdict::Vouched);
+        assert_eq!(granted.vouch, GatherVouch::Vouched);
+        assert_eq!(
+            granted.generation, 1,
+            "a vouch holds the identity, which is what lets the memo hit"
+        );
+
+        assert_eq!(declined.verdict, GatherVerdict::Withheld);
+        assert_eq!(declined.vouch, GatherVouch::Fresh);
+        assert_eq!(
+            declined.generation, 2,
+            "a withheld vouch must spend the offered generation, or the memo hits anyway"
+        );
+        assert_eq!(
+            declined.stated, granted.stated,
+            "the contract's own reading of the guest is not the policy's to change"
+        );
+
+        // A resource the contract already refuses: both arms must agree
+        // exactly, verdict included, or the ablation is masking refusals.
+        let silent = WitnessReadings {
+            stated_gen: None,
+            ..QUIET
+        };
+        let mut contract = withheld(VouchPolicy::Contract);
+        let mut ablated = withheld(VouchPolicy::Withheld);
+        for w in [&mut contract, &mut ablated] {
+            let _ = observe(w, KEY, one_page(&GPAS, &runs), silent, 1);
+        }
+        let a = observe(&mut contract, KEY, one_page(&GPAS, &runs), silent, 2);
+        let b = observe(&mut ablated, KEY, one_page(&GPAS, &runs), silent, 2);
+
+        assert_eq!(a.verdict, GatherVerdict::Unarmed);
+        assert_eq!(b.verdict, a.verdict, "the policy invented a refusal");
+        assert_eq!(b.vouch, a.vouch);
+        assert_eq!(b.generation, a.generation);
+        assert_eq!(b.stated, a.stated);
+    }
+
     /// A witness at a stated audit density, for the two tests that are about the
     /// density rather than about the witness.
     fn witness_auditing(density: AuditDensity) -> GatherWitness {
-        GatherWitness::with_audit_density(density)
+        GatherWitness::with_policies(reims_vgpu_core::GatherPolicies {
+            audit: density,
+            ..Default::default()
+        })
     }
 
     /// [`AuditDensity::EveryBind`] judges every bind it can, while the normal

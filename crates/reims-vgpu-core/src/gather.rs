@@ -25,6 +25,35 @@ impl AuditDensity {
     }
 }
 
+/// Whether this witness is permitted to vouch at all.
+///
+/// [`Self::Withheld`] is a diagnostic arm, not a second contract: it can only
+/// turn a vouch the contract already granted into a re-read, which costs
+/// throughput and can never cost the guest work. Every other verdict is
+/// untouched, so a resource the contract refuses is refused identically on both
+/// arms and the difference between them isolates exactly one thing — whether a
+/// bind reused the bytes the previous one read.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum VouchPolicy {
+    #[default]
+    Contract,
+    Withheld,
+}
+
+/// The witness's two diagnostic policies, resolved once at the composition edge.
+///
+/// They travel as one value because they have identical lifetimes — both are
+/// read from the environment at device creation and both must survive a device
+/// reset — and because a function taking two of them positionally is a pair of
+/// same-shaped enums that a caller can silently swap. Neither reaches a decision
+/// the guest's correctness depends on: one adds a read-back check, the other
+/// declines an optimization.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GatherPolicies {
+    pub audit: AuditDensity,
+    pub vouch: VouchPolicy,
+}
+
 #[derive(Clone, Debug)]
 struct Entry {
     gpas: Vec<u64>,
@@ -44,19 +73,24 @@ struct Entry {
 pub struct GatherWitness {
     entries: HashMap<GatherKey, Entry>,
     audit: AuditDensity,
+    vouch: VouchPolicy,
 }
 
 impl GatherWitness {
-    pub fn with_audit_density(audit: AuditDensity) -> Self {
+    pub fn with_policies(policies: GatherPolicies) -> Self {
         Self {
             entries: HashMap::new(),
-            audit,
+            audit: policies.audit,
+            vouch: policies.vouch,
         }
     }
 
-    /// Diagnostic sampling policy retained across a device reset.
-    pub fn audit_density(&self) -> AuditDensity {
-        self.audit
+    /// Diagnostic policies retained across a device reset.
+    pub fn policies(&self) -> GatherPolicies {
+        GatherPolicies {
+            audit: self.audit,
+            vouch: self.vouch,
+        }
     }
 
     pub fn clear(&mut self) {
@@ -160,6 +194,12 @@ impl GatherWitness {
                 host_wrote_pages: !host_quiet,
             },
         };
+        // Withholding is applied after the contract has spoken, never instead of
+        // it, so the two arms differ only where a vouch was actually granted.
+        let verdict = match (self.vouch, verdict) {
+            (VouchPolicy::Withheld, GatherVerdict::Vouched) => GatherVerdict::Withheld,
+            (_, granted) => granted,
+        };
         let vouched = matches!(verdict, GatherVerdict::Vouched);
 
         let audit = if density == AuditDensity::Disabled {
@@ -257,6 +297,12 @@ pub enum GatherVerdict {
         guest_wrote: bool,
         host_wrote_pages: bool,
     },
+    /// The contract granted a vouch and [`VouchPolicy::Withheld`] declined to
+    /// take it. Its own variant rather than a `Refused`, because a refusal names
+    /// a writer this device observed and this names an operator's diagnostic
+    /// choice — folding the two would put the ablation's own binds into the
+    /// counter a soundness sweep reads.
+    Withheld,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
