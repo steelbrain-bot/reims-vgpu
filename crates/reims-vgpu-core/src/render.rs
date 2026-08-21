@@ -424,6 +424,31 @@ pub struct SampledImageResource {
     pub swizzle: SwizzlePlan,
 }
 
+impl SampledImageResource {
+    /// Whether this resource's image planes occupy consecutive *array slices*
+    /// of its guest allocation, as opposed to being a single plane or the depth
+    /// slices of one 3-D image.
+    ///
+    /// A cube answers yes. Both APIs that meet here define a cube as six
+    /// ordinary array slices in the same order — `+X, -X, +Y, -Y, +Z, -Z` — and
+    /// a cube array as consecutive groups of six. So a cube needs no face
+    /// permutation and no guest layout of its own: it is a `D2Array` of
+    /// `6 * elements` slices that happens to be sampled by direction, which is
+    /// why there is no cube variant in `GuestImageLayout` and why none is
+    /// wanted.
+    ///
+    /// The question is answered here rather than at each consumer because
+    /// `arrayed` alone is the spelling that reads correct and silently excludes
+    /// cubes. That spelling cost this device every cube-sampled draw on the
+    /// guest-run arm while the copying arm drew them — a topology difference the
+    /// guest could see, which is the one thing placement policy may never
+    /// produce.
+    #[must_use]
+    pub const fn planes_are_array_slices(&self) -> bool {
+        self.arrayed || self.cube
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SampledByteOrigin {
     #[default]
@@ -475,6 +500,39 @@ pub struct SampledContentIdentity {
 mod tests {
     use super::*;
     use reims_vgpu_protocol::TexelLayout;
+
+    fn shaped(arrayed: bool, volume: bool, cube: bool) -> SampledImageResource {
+        SampledImageResource {
+            binding: 0,
+            array_element: 0,
+            descriptor_count: 1,
+            width: 4,
+            height: 4,
+            layers: if cube { 6 } else { 1 },
+            arrayed,
+            volume,
+            cube,
+            one_dim: false,
+            multisampled: false,
+            source: SampledSource::Null,
+            content: None,
+            byte_origin: Default::default(),
+            format: ImageFormat::linear(TexelLayout::Bgra8),
+            identity: None,
+            resource_lifetime: None,
+            swizzle: Default::default(),
+        }
+    }
+
+    /// The four shapes a sampled resource can declare, and which of them lay
+    /// their planes out as consecutive array slices of the guest allocation.
+    #[test]
+    fn a_cube_lays_its_planes_out_as_array_slices_and_a_volume_does_not() {
+        assert!(!shaped(false, false, false).planes_are_array_slices());
+        assert!(shaped(true, false, false).planes_are_array_slices());
+        assert!(!shaped(false, true, false).planes_are_array_slices());
+        assert!(shaped(false, false, true).planes_are_array_slices());
+    }
 
     fn depth(identity: crate::TargetIdentity) -> DepthState {
         DepthState {

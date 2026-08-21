@@ -1838,15 +1838,11 @@ fn validate_guest_sampled_source(
             mip_levels: source.allocation.mips.len(),
         })
     };
-    if image.cube {
-        return Err(DrawError::Unsupported(
-            super::reason::DrawReason::GuestRunSampledNot2d {
-                binding: image.binding,
-            },
-        ));
-    }
     let allocation_is_array = layout.is_arrayed();
-    let array_shape_matches = if image.arrayed {
+    // A cube's six faces are array slices in the same order on both sides, so
+    // it matches an arrayed allocation exactly as a 2-D array does. See
+    // [`SampledImageResource::planes_are_array_slices`].
+    let array_shape_matches = if image.planes_are_array_slices() {
         allocation_is_array && image.layers == source.view.array_layer_count
     } else {
         source.view.array_layer_count == 1 && image.layers == 1
@@ -2527,16 +2523,12 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 validate_guest_sampled_source(image, source, texel)?;
             }
             SampledSource::GuestRuns(src, _) => {
-                // A cube's face ordering is not carried by this source. Arrays
-                // and volumes are ordinary consecutive image planes and the
-                // copy below consumes all of them.
-                if image.cube {
-                    return Err(DrawError::Unsupported(
-                        super::reason::DrawReason::GuestRunSampledNot2d {
-                            binding: image.binding,
-                        },
-                    ));
-                }
+                // Cubes, arrays and volumes are all ordinary consecutive image
+                // planes here and the copy below consumes all of them. A cube
+                // carries no ordering this source would have to describe: its
+                // six faces are array slices in the same order on both sides,
+                // so `layers` counts them and nothing is permuted. See
+                // [`SampledImageResource::planes_are_array_slices`].
                 let planes = image.layers as usize;
                 let run_expected = if src.row_length_texels == 0 {
                     expected
@@ -8945,6 +8937,54 @@ mod tests {
         assert!(validate_v1(&typed_guest_image_req(layout, 88, 4)).is_ok());
         assert_eq!(
             validation_slug(&typed_guest_image_req(layout, 72, 4)),
+            "vk_draw_validate_guest_sample_length"
+        );
+    }
+
+    /// A cube declares six faces and no array, and the six faces are the six
+    /// array slices of an arrayed guest allocation in the same order on both
+    /// sides. So the shape check must accept it exactly as it accepts a 2-D
+    /// array; refusing it fails the whole draw, which the copying arm — where
+    /// the source is `Bytes` and no such check exists — happily encodes.
+    #[test]
+    fn a_cube_guest_image_matches_an_arrayed_allocation() {
+        let layout = reims_vgpu_memory::GuestImageLayout::D2Array {
+            width: 4,
+            height: 4,
+            layers: 6,
+            array_pitch: 64,
+        };
+        let mut req = typed_guest_image_req(layout, 384, 0);
+        req.sampled_images[0].arrayed = false;
+        req.sampled_images[0].cube = true;
+        assert!(validate_v1(&req).is_ok());
+
+        // The relaxation is the cube's alone: a cube that does not cover its
+        // allocation's slices is still refused on length like any array.
+        let mut short = typed_guest_image_req(layout, 320, 0);
+        short.sampled_images[0].arrayed = false;
+        short.sampled_images[0].cube = true;
+        assert_eq!(
+            validation_slug(&short),
+            "vk_draw_validate_guest_sample_length"
+        );
+    }
+
+    /// The untyped run source counts planes and nothing else, so a cube is six
+    /// of them. This is the arm a Maps overlay batch actually took, and the
+    /// refusal it used to meet was fatal to the whole draw.
+    #[test]
+    fn a_cube_run_source_is_six_consecutive_planes() {
+        let mut req = guest_run_req(4, 4, 384, 0);
+        req.sampled_images[0].layers = 6;
+        req.sampled_images[0].cube = true;
+        assert!(validate_v1(&req).is_ok());
+
+        let mut short = guest_run_req(4, 4, 320, 0);
+        short.sampled_images[0].layers = 6;
+        short.sampled_images[0].cube = true;
+        assert_eq!(
+            validation_slug(&short),
             "vk_draw_validate_guest_sample_length"
         );
     }

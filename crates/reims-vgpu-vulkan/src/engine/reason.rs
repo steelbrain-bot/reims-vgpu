@@ -129,10 +129,6 @@ pub enum DrawReason {
     AttachmentWideDepthClearUnsupported {
         format: i32,
     },
-    /// Same for a zero-copy guest-run sampled bind.
-    GuestRunSampledNot2d {
-        binding: u32,
-    },
     /// More MRT secondary attachments than the render pass can carry.
     SecondaryAttachmentCap {
         requested: usize,
@@ -367,7 +363,6 @@ impl reims_vgpu_observe::Decline for DrawReason {
             Self::ResidentSampledNot2d { .. } => "resident_sampled_not_2d",
             Self::NullSampledImageUnsupported { .. } => "null_sampled_image_unsupported",
             Self::NullSamplerUnsupported { .. } => "null_sampler_unsupported",
-            Self::GuestRunSampledNot2d { .. } => "guest_run_sampled_not_2d",
             Self::SecondaryAttachmentCap { .. } => "secondary_attachment_cap",
             Self::ViewportSlotsUnsupported { .. } => "viewport_slots_unsupported",
             Self::VisibilityCountingUnsupported { .. } => "visibility_counting_unsupported",
@@ -450,7 +445,6 @@ impl std::fmt::Display for DrawReason {
                 write!(f, " binding={binding} stage={stage}")
             }
             Self::ResidentSampledNot2d { binding }
-            | Self::GuestRunSampledNot2d { binding }
             | Self::NullSampledImageUnsupported { binding }
             | Self::NullSamplerUnsupported { binding } => {
                 write!(f, " binding={binding}")
@@ -702,7 +696,6 @@ mod tests {
 
     const ALL: &[DrawReason] = &[
         DrawReason::ResidentSampledNot2d { binding: 0 },
-        DrawReason::GuestRunSampledNot2d { binding: 0 },
         DrawReason::SecondaryAttachmentCap {
             requested: 0,
             cap: 0,
