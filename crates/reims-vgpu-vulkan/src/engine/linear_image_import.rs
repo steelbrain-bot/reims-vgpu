@@ -127,6 +127,13 @@ pub(crate) enum WindowRefusal {
         /// a reader cannot recover either one from the difference alone.
         image_base: u64,
         resource_base: u64,
+        /// The backing's own plane, and the layout mode whose subresource query
+        /// produced the host side. The bind offset is `plane_offset` less the
+        /// host subresource offset, so without both a reader cannot tell a
+        /// backing that names a different plane from a driver that reports a
+        /// different subresource base.
+        plane_offset: u64,
+        mode: LayoutMode,
     },
     BindingRangeOverflow,
     AllocationTooShort {
@@ -215,12 +222,16 @@ impl Decline for WindowRefusal {
                 host_offset,
                 image_base,
                 resource_base,
+                plane_offset,
+                mode,
             } => vec![
                 ("mip", mip_level.to_string()),
                 ("guest_offset", guest_offset.to_string()),
                 ("host_offset", host_offset.to_string()),
                 ("image_base", image_base.to_string()),
                 ("resource_base", resource_base.to_string()),
+                ("plane_offset", plane_offset.to_string()),
+                ("mode", mode.slug().to_string()),
             ],
             Self::SubresourceAfterPlane {
                 plane_offset,
@@ -411,6 +422,12 @@ struct MipPlacement {
     image_base: u64,
     /// Allocation-relative byte at which the guest resource begins.
     resource_base: u64,
+    /// The backing's own plane, carried for the refusal rather than the
+    /// comparison: `image_base` is already this less the host subresource
+    /// offset, and a reader given only the difference cannot separate the two.
+    plane_offset: u64,
+    /// Which layout mode's subresource query produced the host side.
+    mode: LayoutMode,
 }
 
 impl MipPlacement {
@@ -438,6 +455,8 @@ fn validate_mip_subresource(
             host_offset,
             image_base: placement.image_base,
             resource_base: placement.resource_base,
+            plane_offset: placement.plane_offset,
+            mode: placement.mode,
         });
     }
     if host.row_pitch != guest.row_pitch {
@@ -965,6 +984,8 @@ unsafe fn plan_image_with_layout(
         let placement = MipPlacement {
             image_base: plan.bind_offset,
             resource_base: backing.resource_offset,
+            plane_offset: backing.plane_offset,
+            mode,
         };
         for (mip_level, guest) in allocation_layout.mips.iter().copied().enumerate() {
             let mip_level =
@@ -1474,6 +1495,8 @@ mod tests {
         let at_allocation_base = MipPlacement {
             image_base: 0,
             resource_base: 0,
+            plane_offset: 0,
+            mode: LayoutMode::DriverLinear,
         };
         assert_eq!(
             validate_mip_subresource(1, host, guest, at_allocation_base),
@@ -1495,6 +1518,8 @@ mod tests {
                 host_offset: 0x240,
                 image_base: 0,
                 resource_base: 0,
+                plane_offset: 0,
+                mode: LayoutMode::DriverLinear,
             })
         );
     }
@@ -1534,6 +1559,8 @@ mod tests {
                 MipPlacement {
                     image_base: plane_offset,
                     resource_base,
+                    plane_offset,
+                    mode: LayoutMode::ExplicitLinear,
                 },
             ),
             Ok(()),
