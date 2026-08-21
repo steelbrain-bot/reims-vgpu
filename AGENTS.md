@@ -590,9 +590,15 @@ Two matter for verification rather than for ablation:
   how the copying rails get exercised without hunting for hardware that lacks the extension.
 - `REIMS_VGPU_GATHER_AUDIT_ALL=on` makes the zero-copy sampled cache's content audit judge **every**
   vouched bind instead of one in sixty-four. The stride is the alarm's sampling rate and nothing the
-  guest observes depends on it — the bind itself is vouched by two witnesses covering disjoint
-  writers, the hypervisor dirty bitmap and this device's own page-exact write record, which is why
-  it is a contract rail and not a guess; read `runtime/gather_witness.rs` before touching either.
+  guest observes depends on it. **The vouch itself is not a statement about bytes, and this file used
+  to say it was.** Its two accounts — the decoded resource-validity transition and this device's own
+  page-exact write record — do not cover disjoint writers: a guest CPU store into unified shared
+  storage bumps neither, because the validity transition is a synchronization statement consumed at
+  submission construction and not a version emitted per write. `runtime/gather_witness.rs` says so in
+  its own first paragraph, and a macos-13 sweep measured the consequence — 876 `gw_audit_unsound`
+  against 254 600 `gw_audit_ok` in one boot, costing Maps its CPU-rasterized type and POI icons while
+  GPU-drawn geometry rendered correctly. Read that module doc before treating a vouch as evidence
+  about content.
   That cache is the only place in this device where an
   image is bound with nothing read and nothing compared, and a stale bind's failure mode is content,
   which no counter reports — the audit is the sole instrument, and at the shipping stride it samples
