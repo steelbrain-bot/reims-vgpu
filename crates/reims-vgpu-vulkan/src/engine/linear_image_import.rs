@@ -99,13 +99,14 @@ pub(crate) enum WindowRefusal {
     ParentImport(host_ram::HostRamDecline),
     HostPointerMisaligned,
     ResourceWindowTooShort,
-    /// Vulkan places the base subresource somewhere the plane does not start.
+    /// Vulkan puts the base subresource further into the image than the guest
+    /// plane is into the allocation, so no bind offset places one on the other.
     ///
-    /// The two numbers are in different coordinate systems by declaration —
-    /// `plane_offset` is allocation-relative and a subresource layout's offset
-    /// is image-relative — so the pair is what says whether an arm placed the
-    /// image with the bind offset or with the declaration, and which of the two
-    /// the guest's plane actually needs.
+    /// The two numbers are counted from different bases — `plane_offset` from
+    /// the allocation, `subresource_offset` from the image — and the refusal is
+    /// that the subtraction between them underflows. That is a real
+    /// impossibility rather than a mismatch: an image cannot be bound at a
+    /// negative offset.
     SubresourceAfterPlane {
         plane_offset: u64,
         subresource_offset: u64,
@@ -272,7 +273,16 @@ impl Decline for WindowRefusal {
 
 reims_vgpu_observe::decline_display!(WindowRefusal);
 
-fn plan_driver_window(
+/// Place an aliasing image so that its base subresource lands on the guest plane.
+///
+/// Both linear modes use this. They differ in *who* chooses the base
+/// subresource's image-relative offset — the driver picks one under
+/// `VK_IMAGE_TILING_LINEAR`, and the explicit mode declares the guest's own —
+/// but the placement question is the same either way and the bind offset is the
+/// answer to it. An arm that instead required the reported offset to equal the
+/// allocation-relative plane offset was comparing two different bases and could
+/// only admit a plane sitting at byte zero of guest RAM.
+fn plan_linear_window(
     layout: vk::SubresourceLayout,
     requirements: vk::MemoryRequirements,
     backing: GuestTargetBacking,
@@ -301,35 +311,6 @@ fn plan_driver_window(
             require_allocation_fit,
         },
         bind_offset,
-    )
-}
-
-fn plan_explicit_window(
-    layout: vk::SubresourceLayout,
-    requirements: vk::MemoryRequirements,
-    backing: GuestTargetBacking,
-    guest_layout: GuestImageLayout,
-    parent_memory_type: Option<u32>,
-    requires_dedicated: bool,
-    require_allocation_fit: bool,
-) -> Result<WindowPlan, WindowRefusal> {
-    if layout.offset != backing.plane_offset {
-        return Err(WindowRefusal::SubresourceAfterPlane {
-            plane_offset: backing.plane_offset,
-            subresource_offset: layout.offset,
-        });
-    }
-    validate_common(
-        WindowAdmission {
-            layout,
-            requirements,
-            backing,
-            guest_layout,
-            parent_memory_type,
-            requires_dedicated,
-            require_allocation_fit,
-        },
-        0,
     )
 }
 
@@ -400,14 +381,46 @@ fn validate_common(
     })
 }
 
+/// Where an image's subresource offsets and a guest resource's mip offsets meet.
+///
+/// Three bases converge on this comparison and no two of them are counted from
+/// the same place. A `VkSubresourceLayout::offset` is image-relative. The bind
+/// offset places that image inside the imported allocation, which for this
+/// device is a whole RAMBlock. A [`reims_vgpu_memory::GuestImageMipLayout`]
+/// offset is relative to the guest *resource*, whose own start in the allocation
+/// is `GuestTargetBacking::resource_offset` — the producer builds a base mip's
+/// offset as `plane_offset - resource_offset` and says so.
+///
+/// Comparing the first two against the third without the resource base is a
+/// subtraction short a term, and it does not read as one: both sides are byte
+/// offsets of the right order for a small texture and only disagree once the
+/// resource sits deep in guest RAM, which is every resource. The translation
+/// therefore lives here rather than at each comparison.
+#[derive(Clone, Copy)]
+struct MipPlacement {
+    /// Allocation-relative byte at which the image's memory begins.
+    image_base: u64,
+    /// Allocation-relative byte at which the guest resource begins.
+    resource_base: u64,
+}
+
+impl MipPlacement {
+    /// The guest-resource-relative offset a host subresource layout lands on.
+    fn resource_relative(self, host_offset: u64) -> Option<u64> {
+        self.image_base
+            .checked_add(host_offset)?
+            .checked_sub(self.resource_base)
+    }
+}
+
 fn validate_mip_subresource(
     mip_level: u32,
     host: vk::SubresourceLayout,
     guest: reims_vgpu_memory::GuestImageMipLayout,
-    bind_offset: u64,
+    placement: MipPlacement,
 ) -> Result<(), WindowRefusal> {
-    let host_offset = bind_offset
-        .checked_add(host.offset)
+    let host_offset = placement
+        .resource_relative(host.offset)
         .ok_or(WindowRefusal::BindingRangeOverflow)?;
     if host_offset != guest.offset {
         return Err(WindowRefusal::MipOffsetMismatch {
@@ -929,26 +942,19 @@ unsafe fn plan_image_with_layout(
                 },
             )
         };
-        let plan = match mode {
-            LayoutMode::DriverLinear => plan_driver_window(
-                layout,
-                requirements.memory_requirements,
-                backing,
-                guest_layout,
-                parent_memory_type,
-                dedicated.requires_dedicated_allocation != 0,
-                require_allocation_fit,
-            ),
-            LayoutMode::ExplicitLinear => plan_explicit_window(
-                layout,
-                requirements.memory_requirements,
-                backing,
-                guest_layout,
-                parent_memory_type,
-                dedicated.requires_dedicated_allocation != 0,
-                require_allocation_fit,
-            ),
-        }?;
+        let plan = plan_linear_window(
+            layout,
+            requirements.memory_requirements,
+            backing,
+            guest_layout,
+            parent_memory_type,
+            dedicated.requires_dedicated_allocation != 0,
+            require_allocation_fit,
+        )?;
+        let placement = MipPlacement {
+            image_base: plan.bind_offset,
+            resource_base: backing.resource_offset,
+        };
         for (mip_level, guest) in allocation_layout.mips.iter().copied().enumerate() {
             let mip_level =
                 u32::try_from(mip_level).map_err(|_| WindowRefusal::BindingRangeOverflow)?;
@@ -962,7 +968,7 @@ unsafe fn plan_image_with_layout(
                     },
                 )
             };
-            validate_mip_subresource(mip_level, host, guest, plan.bind_offset)?;
+            validate_mip_subresource(mip_level, host, guest, placement)?;
         }
         Ok((image, plan))
     })();
@@ -1189,7 +1195,7 @@ mod tests {
     #[test]
     fn exact_driver_layout_derives_the_parent_binding_offset() {
         assert_eq!(
-            plan_driver_window(
+            plan_linear_window(
                 vk::SubresourceLayout {
                     offset: 0,
                     row_pitch: 256,
@@ -1214,7 +1220,7 @@ mod tests {
         let mut b = backing();
         let req = requirements();
         assert_eq!(
-            plan_driver_window(
+            plan_linear_window(
                 vk::SubresourceLayout {
                     offset: 0x2000,
                     row_pitch: 256,
@@ -1227,11 +1233,14 @@ mod tests {
                 false,
                 true,
             ),
-            Err(WindowRefusal::SubresourceAfterPlane)
+            Err(WindowRefusal::SubresourceAfterPlane {
+                plane_offset: 0x1000,
+                subresource_offset: 0x2000,
+            })
         );
         b.plane_offset = 0x800;
         assert_eq!(
-            plan_driver_window(
+            plan_linear_window(
                 vk::SubresourceLayout {
                     row_pitch: 256,
                     ..Default::default()
@@ -1247,7 +1256,7 @@ mod tests {
         );
         b = backing();
         assert_eq!(
-            plan_driver_window(
+            plan_linear_window(
                 vk::SubresourceLayout {
                     row_pitch: 512,
                     ..Default::default()
@@ -1266,7 +1275,7 @@ mod tests {
         );
         b.allocation_len = 0x2000;
         assert_eq!(
-            plan_driver_window(
+            plan_linear_window(
                 vk::SubresourceLayout {
                     row_pitch: 256,
                     ..Default::default()
@@ -1285,7 +1294,7 @@ mod tests {
         );
         b = backing();
         assert_eq!(
-            plan_driver_window(
+            plan_linear_window(
                 vk::SubresourceLayout {
                     row_pitch: 256,
                     ..Default::default()
@@ -1300,7 +1309,7 @@ mod tests {
             Err(WindowRefusal::NoMemoryType)
         );
         assert_eq!(
-            plan_driver_window(
+            plan_linear_window(
                 vk::SubresourceLayout {
                     row_pitch: 256,
                     ..Default::default()
@@ -1321,7 +1330,7 @@ mod tests {
         let mut b = backing();
         b.allocation_len = 0x2000;
         assert_eq!(
-            plan_driver_window(
+            plan_linear_window(
                 vk::SubresourceLayout {
                     row_pitch: 256,
                     ..Default::default()
@@ -1345,9 +1354,9 @@ mod tests {
     }
 
     #[test]
-    fn explicit_layout_binds_the_parent_at_zero() {
+    fn a_declared_base_subresource_offset_absorbs_the_whole_plane_offset() {
         assert_eq!(
-            plan_explicit_window(
+            plan_linear_window(
                 vk::SubresourceLayout {
                     offset: 0x1000,
                     row_pitch: 256,
@@ -1375,7 +1384,7 @@ mod tests {
             array_pitch: 256,
         };
         assert_eq!(
-            plan_driver_window(
+            plan_linear_window(
                 vk::SubresourceLayout {
                     row_pitch: 256,
                     array_pitch: 512,
@@ -1398,7 +1407,7 @@ mod tests {
             depth_pitch: 512,
         };
         assert_eq!(
-            plan_driver_window(
+            plan_linear_window(
                 vk::SubresourceLayout {
                     row_pitch: 256,
                     depth_pitch: 768,
@@ -1440,9 +1449,9 @@ mod tests {
     }
 
     #[test]
-    fn every_mip_offset_is_checked_in_the_parent_allocation_namespace() {
+    fn every_mip_offset_is_checked_in_the_guest_resource_namespace() {
         let guest = reims_vgpu_memory::GuestImageMipLayout {
-            offset: 0x1240,
+            offset: 0x240,
             row_pitch: 64,
             layout: GuestImageLayout::D1 { width: 16 },
         };
@@ -1451,22 +1460,71 @@ mod tests {
             row_pitch: 64,
             ..Default::default()
         };
-        assert_eq!(validate_mip_subresource(1, host, guest, 0x1000), Ok(()));
+        let at_allocation_base = MipPlacement {
+            image_base: 0,
+            resource_base: 0,
+        };
+        assert_eq!(
+            validate_mip_subresource(1, host, guest, at_allocation_base),
+            Ok(())
+        );
         assert_eq!(
             validate_mip_subresource(
                 1,
                 host,
                 reims_vgpu_memory::GuestImageMipLayout {
-                    offset: 0x1280,
+                    offset: 0x280,
                     ..guest
                 },
-                0x1000,
+                at_allocation_base,
             ),
             Err(WindowRefusal::MipOffsetMismatch {
                 mip_level: 1,
-                guest_offset: 0x1280,
-                host_offset: 0x1240,
+                guest_offset: 0x280,
+                host_offset: 0x240,
             })
+        );
+    }
+
+    /// A guest resource does not begin at byte zero of the imported allocation,
+    /// and its mip offsets are not counted from there.
+    ///
+    /// The allocation is a whole RAMBlock, so a resource's start runs to
+    /// hundreds of megabytes while the mip offsets inside it stay small. An
+    /// equation that reaches the guest offset by adding the bind offset to the
+    /// host offset and stopping is short the resource base, and it fails in the
+    /// direction that hides: on a fixture whose resource happens to start at
+    /// zero the two agree, and on every real one the comparison is a small
+    /// number against a large one.
+    #[test]
+    fn a_mip_offset_is_read_past_the_resource_base_not_the_allocation_base() {
+        let resource_base = 0x2000_0000;
+        let plane_offset = resource_base + 0x1000;
+        let guest = reims_vgpu_memory::GuestImageMipLayout {
+            // What `GuestImageSource::single_mip` builds: plane, less resource.
+            offset: plane_offset - resource_base,
+            row_pitch: 64,
+            layout: GuestImageLayout::D1 { width: 16 },
+        };
+        // The driver places the base subresource at the start of the image, so
+        // the bind offset carries the plane's whole distance into the RAMBlock.
+        let host = vk::SubresourceLayout {
+            offset: 0,
+            row_pitch: 64,
+            ..Default::default()
+        };
+        assert_eq!(
+            validate_mip_subresource(
+                0,
+                host,
+                guest,
+                MipPlacement {
+                    image_base: plane_offset,
+                    resource_base,
+                },
+            ),
+            Ok(()),
+            "the plane the guest named is where the image's base subresource lands"
         );
     }
 }
