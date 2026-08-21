@@ -485,7 +485,18 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 // makes the skipped-draw line unreadable on its own: this fires
                 // once per (reason, pipeline) and the tail fires once per
                 // packet, so a hundred skipped draws sit behind one decline.
-                engine_refusal = Some(crate::observe::Decline::slug(&e));
+                let slug = crate::observe::Decline::slug(&e);
+                // The latch below fires once per (reason, pipeline), which is
+                // what keeps a persistent reject from flooding — and it is also
+                // why the fail log can say *which* draws were refused and never
+                // *how many*. A counter does not dedupe, so this is the only
+                // reading that sizes a refusal: one increment per lost draw,
+                // under the decline's own name, banded per census window like
+                // every other `store_routes` field. Without it a refusal that
+                // costs the guest one draw and one that costs it an entire
+                // layer every frame are the same two log lines.
+                crate::runtime::drain::note_store_route(slug);
+                engine_refusal = Some(slug);
                 linux_m2v_draw_failure(&e, req).fail_once(req.pipeline_ref as u64);
             }
         }
