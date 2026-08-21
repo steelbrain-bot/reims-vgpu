@@ -58,6 +58,105 @@ impl LayoutMode {
     }
 }
 
+/// Which term of the sampled aliasing rail's admission rule refused a
+/// declaration.
+///
+/// The rail builds exactly **one `TYPE_2D` view over one mip of one layer with
+/// no swizzle**, and every clause of that sentence is a way to be refused. Each
+/// names a different thing for a reader to go and fix — a mip chain wants a
+/// view over a chosen level, a `D2Array` wants a layered view, a swizzle wants
+/// a component mapping — so the rule lives here once and the arms that admit
+/// onto the rail ask it rather than restating it.
+///
+/// Restating it is not hypothetical. This rule was written by hand twice, seven
+/// terms in the binding arm and two in the length arm, and the shorter copy is
+/// the one a reader meets first.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SampledCopyCause {
+    /// The base plane is not a 2-D image, so no `TYPE_2D` view describes it.
+    /// A volume, a 1-D texture and either array kind all land here, and the
+    /// layout is carried because which one it is decides what the rail would
+    /// have to learn to build.
+    Layout(GuestImageLayout),
+    /// The allocation declares a mip chain. The rail binds one image over one
+    /// mip, so a chain would need the bind to name which level.
+    MipChain { mips: usize },
+    /// The bind names a mip other than a whole single level 0.
+    ViewMip { base: u32, count: u32 },
+    /// The bind names a layer other than a whole single layer 0.
+    ViewLayer { base: u32, count: u32 },
+    /// The bind reinterprets components. An alias hands the guest its own
+    /// bytes, so a swizzle would have to be expressed as a Vulkan component
+    /// mapping on the view rather than applied to the memory.
+    Swizzled,
+    /// The declaration is admissible and the rail still could not serve it:
+    /// no resident aliasing these guest bytes was available to pin.
+    ///
+    /// This is the one cause that is not about shape, and it is separate
+    /// precisely so it cannot be reported as one. A shape cause tells a reader
+    /// to go and teach the rail a new view; this one tells them the rail
+    /// already fits and the registry declined, which is a different
+    /// investigation entirely.
+    ResidentUnavailable,
+}
+
+impl SampledCopyCause {
+    /// The allocation half of the rule: whether the rail can plan an image over
+    /// this shape at all. Both arms that admit onto the rail ask this, which is
+    /// what makes them agree by construction rather than by inspection.
+    ///
+    /// `None` means the allocation is admissible, not that the bind is — the
+    /// view half is [`Self::of_view`] and only the binding arm holds its inputs.
+    pub(crate) fn of_allocation(base: GuestImageLayout, mips: usize) -> Option<Self> {
+        match base {
+            GuestImageLayout::D2 { .. } if mips == 1 => None,
+            GuestImageLayout::D2 { .. } => Some(Self::MipChain { mips }),
+            other => Some(Self::Layout(other)),
+        }
+    }
+
+    /// The view half: which subresource of an admissible allocation the bind
+    /// names, and whether it reinterprets components.
+    pub(crate) fn of_view(
+        base_mip: u32,
+        mip_count: u32,
+        base_layer: u32,
+        layer_count: u32,
+        identity_swizzle: bool,
+    ) -> Option<Self> {
+        if base_mip != 0 || mip_count != 1 {
+            return Some(Self::ViewMip {
+                base: base_mip,
+                count: mip_count,
+            });
+        }
+        if base_layer != 0 || layer_count != 1 {
+            return Some(Self::ViewLayer {
+                base: base_layer,
+                count: layer_count,
+            });
+        }
+        (!identity_swizzle).then_some(Self::Swizzled)
+    }
+
+    fn slug(self) -> &'static str {
+        match self {
+            Self::Layout(GuestImageLayout::D1 { .. }) => "sampled_copy_layout_1d",
+            Self::Layout(GuestImageLayout::D1Array { .. }) => "sampled_copy_layout_1d_array",
+            // Reachable only through a caller that built the cause itself; the
+            // constructors above never pair `D2` with this variant.
+            Self::Layout(GuestImageLayout::D2 { .. }) => "sampled_copy_layout_2d",
+            Self::Layout(GuestImageLayout::D2Array { .. }) => "sampled_copy_layout_2d_array",
+            Self::Layout(GuestImageLayout::D3 { .. }) => "sampled_copy_layout_3d",
+            Self::MipChain { .. } => "sampled_copy_mip_chain",
+            Self::ViewMip { .. } => "sampled_copy_view_mip",
+            Self::ViewLayer { .. } => "sampled_copy_view_layer",
+            Self::Swizzled => "sampled_copy_swizzled",
+            Self::ResidentUnavailable => "sampled_copy_resident_unavailable",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WindowRefusal {
     HostImportUnavailable,
@@ -68,11 +167,15 @@ pub(crate) enum WindowRefusal {
         arrayed: bool,
         one_dim: bool,
     },
-    /// A sampled declaration the aliasing rail does not admit: a mip chain, a
-    /// subresource, an array, a volume, a cube, or a swizzled view. Aliasing
-    /// binds one image over one allocation shape, so anything that reinterprets
-    /// the allocation goes to the imported-buffer copy rail instead.
-    SampledContentRequiresCopy,
+    /// A sampled declaration the aliasing rail does not admit. Aliasing binds
+    /// one image over one allocation shape, so anything that reinterprets the
+    /// allocation goes to the imported-buffer copy rail instead.
+    ///
+    /// The cause is carried because the ways to be refused have different
+    /// fixes and one `reason=` could not tell them apart: a boot
+    /// refusing ten thousand binds said only that a copy was required, which
+    /// is the thing a reader already knew.
+    SampledContentRequiresCopy(SampledCopyCause),
     /// The imported memory type carries no `HOST_COHERENT`, so a guest CPU
     /// write into the aliased pages is not guaranteed visible to the device.
     ///
@@ -165,7 +268,7 @@ impl Decline for WindowRefusal {
         match self {
             Self::HostImportUnavailable => "no_host_import",
             Self::UnsupportedImageShape { .. } => "unsupported_image_shape",
-            Self::SampledContentRequiresCopy => "sampled_content_requires_copy",
+            Self::SampledContentRequiresCopy(cause) => cause.slug(),
             Self::SampledAliasHostWritesNotCoherent { .. } => {
                 "sampled_alias_host_writes_not_coherent"
             }
@@ -1066,10 +1169,9 @@ pub(crate) unsafe fn binding_allocation_len(
     //
     // This is not a capability statement: the copying rail serves every one of
     // these shapes, and is the only rail at all on a host without the import.
-    if !matches!(base.layout, reims_vgpu_memory::GuestImageLayout::D2 { .. })
-        || allocation_layout.mips.len() != 1
+    if let Some(cause) = SampledCopyCause::of_allocation(base.layout, allocation_layout.mips.len())
     {
-        return Err(WindowRefusal::SampledContentRequiresCopy);
+        return Err(WindowRefusal::SampledContentRequiresCopy(cause));
     }
     let geometry = image_geometry(base.layout);
     // Mode selection mirrors `create_allocation` because a length planned in a
@@ -1159,6 +1261,130 @@ unsafe fn create_with_layout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every layout the guest can declare, so the table below is total rather
+    /// than a sample of the ones a boot happened to send.
+    const EVERY_LAYOUT: [GuestImageLayout; 5] = [
+        GuestImageLayout::D1 { width: 8 },
+        GuestImageLayout::D1Array {
+            width: 8,
+            layers: 2,
+            array_pitch: 32,
+        },
+        GuestImageLayout::D2 {
+            width: 8,
+            height: 8,
+        },
+        GuestImageLayout::D2Array {
+            width: 8,
+            height: 8,
+            layers: 2,
+            array_pitch: 256,
+        },
+        GuestImageLayout::D3 {
+            width: 8,
+            height: 8,
+            depth: 2,
+            depth_pitch: 256,
+        },
+    ];
+
+    #[test]
+    fn the_alias_rail_admits_exactly_one_two_d_mip() {
+        for layout in EVERY_LAYOUT {
+            for mips in [1usize, 2, 9] {
+                let admitted = SampledCopyCause::of_allocation(layout, mips).is_none();
+                let is_two_d = matches!(layout, GuestImageLayout::D2 { .. });
+                assert_eq!(
+                    admitted,
+                    is_two_d && mips == 1,
+                    "{layout:?} with {mips} mip(s) was admitted={admitted}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_mip_chain_refuses_by_its_chain_and_not_by_its_layout() {
+        // The two terms are independent and a reader has to be able to tell
+        // "teach the rail a level" from "teach the rail a view type".
+        let two_d = GuestImageLayout::D2 {
+            width: 8,
+            height: 8,
+        };
+        assert_eq!(
+            SampledCopyCause::of_allocation(two_d, 4),
+            Some(SampledCopyCause::MipChain { mips: 4 })
+        );
+        assert_eq!(
+            SampledCopyCause::of_allocation(EVERY_LAYOUT[4], 4),
+            Some(SampledCopyCause::Layout(EVERY_LAYOUT[4])),
+            "a volume with a chain names the shape it cannot build a view for"
+        );
+    }
+
+    #[test]
+    fn the_view_half_admits_only_a_whole_unswizzled_level_zero_layer_zero() {
+        assert_eq!(SampledCopyCause::of_view(0, 1, 0, 1, true), None);
+        assert_eq!(
+            SampledCopyCause::of_view(2, 1, 0, 1, true),
+            Some(SampledCopyCause::ViewMip { base: 2, count: 1 })
+        );
+        assert_eq!(
+            SampledCopyCause::of_view(0, 3, 0, 1, true),
+            Some(SampledCopyCause::ViewMip { base: 0, count: 3 })
+        );
+        assert_eq!(
+            SampledCopyCause::of_view(0, 1, 5, 1, true),
+            Some(SampledCopyCause::ViewLayer { base: 5, count: 1 })
+        );
+        assert_eq!(
+            SampledCopyCause::of_view(0, 1, 0, 6, true),
+            Some(SampledCopyCause::ViewLayer { base: 0, count: 6 })
+        );
+        assert_eq!(
+            SampledCopyCause::of_view(0, 1, 0, 1, false),
+            Some(SampledCopyCause::Swizzled)
+        );
+    }
+
+    #[test]
+    fn no_two_admission_terms_share_a_reason() {
+        // The whole point of carrying a cause is that a census can rank the
+        // terms against each other. Two terms sharing a slug would silently
+        // merge two populations, which is the reading this replaced.
+        let causes = [
+            SampledCopyCause::Layout(EVERY_LAYOUT[0]),
+            SampledCopyCause::Layout(EVERY_LAYOUT[1]),
+            SampledCopyCause::Layout(EVERY_LAYOUT[2]),
+            SampledCopyCause::Layout(EVERY_LAYOUT[3]),
+            SampledCopyCause::Layout(EVERY_LAYOUT[4]),
+            SampledCopyCause::MipChain { mips: 2 },
+            SampledCopyCause::ViewMip { base: 1, count: 1 },
+            SampledCopyCause::ViewLayer { base: 1, count: 1 },
+            SampledCopyCause::Swizzled,
+            SampledCopyCause::ResidentUnavailable,
+        ];
+        let mut slugs: Vec<&str> = causes.iter().map(|cause| cause.slug()).collect();
+        slugs.sort_unstable();
+        let before = slugs.len();
+        slugs.dedup();
+        assert_eq!(before, slugs.len(), "two causes share a reason: {slugs:?}");
+    }
+
+    #[test]
+    fn the_refusal_reports_the_cause_it_carries() {
+        // The cause has to survive the trip through `Decline`, or the census
+        // still reads one undifferentiated reason.
+        assert_eq!(
+            WindowRefusal::SampledContentRequiresCopy(SampledCopyCause::Swizzled).slug(),
+            "sampled_copy_swizzled"
+        );
+        assert_eq!(
+            WindowRefusal::SampledContentRequiresCopy(SampledCopyCause::ResidentUnavailable).slug(),
+            "sampled_copy_resident_unavailable"
+        );
+    }
 
     #[test]
     fn mutable_image_format_list_contains_exactly_the_compatible_view_family() {

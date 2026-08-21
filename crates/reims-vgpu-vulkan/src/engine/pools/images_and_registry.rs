@@ -169,7 +169,7 @@ impl ResourcePools {
         counters: &EngineCounters,
         excludes: impl Fn(&TargetIdentity) -> bool,
     ) -> Result<GuestSampledUse, super::super::linear_image_import::WindowRefusal> {
-        use super::super::linear_image_import::WindowRefusal;
+        use super::super::linear_image_import::{SampledCopyCause, WindowRefusal};
 
         let memory = source
             .direct
@@ -232,14 +232,22 @@ impl ResourcePools {
         // Current attachments are excluded by the caller because sampling an
         // image while writing it requires the snapshot/feedback machinery that
         // is selected from a typed Target source, not an opportunistic match.
-        let exact_2d = source.allocation.mips.len() == 1
-            && matches!(layout, reims_vgpu_memory::GuestImageLayout::D2 { .. })
-            && source.view.base_mip_level == 0
-            && source.view.mip_level_count == 1
-            && source.view.base_array_layer == 0
-            && source.view.array_layer_count == 1
-            && resource.swizzle.is_identity();
-        if exact_2d {
+        //
+        // The rule itself belongs to `SampledCopyCause` and is asked here rather
+        // than restated, so this arm and the length arm in `linear_image_import`
+        // cannot drift apart, and so the fall-through below can say which term
+        // refused instead of only that a copy is required.
+        let requires_copy = SampledCopyCause::of_allocation(layout, source.allocation.mips.len())
+            .or_else(|| {
+                SampledCopyCause::of_view(
+                    source.view.base_mip_level,
+                    source.view.mip_level_count,
+                    source.view.base_array_layer,
+                    source.view.array_layer_count,
+                    resource.swizzle.is_identity(),
+                )
+            });
+        if requires_copy.is_none() {
             match guest_sampled_resident_match(
                 &self.registry,
                 &self.guest_resident_authority,
@@ -275,7 +283,13 @@ impl ResourcePools {
         // buffer stays zero-copy for guest RAM and feeds an ordinary sampled
         // image with one GPU-side copy, which is also the only rail a host
         // without `VK_EXT_external_memory_host` has.
-        Err(WindowRefusal::SampledContentRequiresCopy)
+        Err(WindowRefusal::SampledContentRequiresCopy(
+            // Either the declaration was inadmissible above, or it was
+            // admissible and the registry declined to pin a resident for it.
+            // The second is not a shape refusal, and reporting it as the shape
+            // this bind happens to have would be a false cause.
+            requires_copy.unwrap_or(SampledCopyCause::ResidentUnavailable),
+        ))
     }
 
     /// Take a sampled bind on a resident that already aliases the guest bytes.
