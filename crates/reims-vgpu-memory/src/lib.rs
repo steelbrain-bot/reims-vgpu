@@ -309,6 +309,35 @@ impl GuestImageAllocationLayout {
         self.mips.first().copied()
     }
 
+    /// Allocation-relative byte window covering every level of this chain.
+    ///
+    /// The guest places each level independently, so the chain's extent is the
+    /// union of the levels' own windows rather than level zero's window scaled
+    /// by anything. `None` if any level's placement is not expressible against
+    /// `backing`, which is the same refusal
+    /// [`GuestTargetBacking::visible_image_window`] makes for one level.
+    ///
+    /// Levels are not assumed to be in address order: a chain the guest laid
+    /// out smallest-first has level zero at the far end, and taking
+    /// `first.start..last.end` would name a window running backwards.
+    pub fn visible_chain_window(
+        &self,
+        backing: GuestTargetBacking,
+        bytes_per_texel: u64,
+    ) -> Option<std::ops::Range<u64>> {
+        let mut chain: Option<std::ops::Range<u64>> = None;
+        for mip in self.mips.iter() {
+            let level = mip
+                .plane_in(backing)?
+                .visible_image_window(mip.layout, bytes_per_texel)?;
+            chain = Some(match chain {
+                None => level,
+                Some(so_far) => so_far.start.min(level.start)..so_far.end.max(level.end),
+            });
+        }
+        chain
+    }
+
     pub fn mip_level_count(&self) -> Option<u32> {
         u32::try_from(self.mips.len())
             .ok()
@@ -605,9 +634,20 @@ impl GuestTargetMemory {
         height: u32,
         bytes_per_texel: u64,
     ) -> Option<GuestPageFootprint> {
-        let window = self
-            .backing
-            .visible_window(width, height, bytes_per_texel)?;
+        self.window_footprint(
+            self.backing
+                .visible_window(width, height, bytes_per_texel)?,
+        )
+    }
+
+    /// Physical pages touched by an allocation-relative byte window, in this
+    /// resource footprint's coordinates.
+    ///
+    /// The two window-shaped questions below both land here so the coordinate
+    /// translation — allocation-relative in, resource-footprint-relative out —
+    /// is written once. Getting it wrong names pages hundreds of megabytes from
+    /// the ones the image occupies, and both bases are small integers in a test.
+    pub fn window_footprint(&self, window: std::ops::Range<u64>) -> Option<GuestPageFootprint> {
         let resource_head = self.backing.resource_offset % self.footprint.page_size();
         let start = window
             .start
@@ -629,6 +669,21 @@ impl GuestTargetMemory {
     ) -> Option<GuestWritePages> {
         let footprint = self.visible_footprint(width, height, bytes_per_texel)?;
         GuestWritePages::new(footprint.pages())
+    }
+
+    /// Canonical page set written by every level of a declared mip chain.
+    ///
+    /// The whole-chain counterpart of [`Self::visible_write_pages`], and the
+    /// one an aliasing image owes: such an image's birth copy writes each
+    /// level, so page ownership has to be asked about each level before the
+    /// image exists. For a one-level chain the two agree.
+    pub fn chain_write_pages(
+        &self,
+        allocation: &GuestImageAllocationLayout,
+        bytes_per_texel: u64,
+    ) -> Option<GuestWritePages> {
+        let window = allocation.visible_chain_window(self.backing, bytes_per_texel)?;
+        GuestWritePages::new(self.window_footprint(window)?.pages())
     }
 }
 
@@ -2334,6 +2389,130 @@ mod tests {
                 .pages(),
             &[0xa000, 0xc000],
             "the immutable ledger value is sorted and deduplicated"
+        );
+    }
+
+    /// A three-level chain the guest laid out smallest-first, so level zero —
+    /// the first entry of `mips` — sits at the *far* end of the allocation.
+    fn smallest_first_chain() -> GuestImageAllocationLayout {
+        GuestImageAllocationLayout {
+            mips: std::sync::Arc::from([
+                GuestImageMipLayout {
+                    resource_relative_offset: 0x1000,
+                    row_pitch: 0x40,
+                    layout: GuestImageLayout::D2 {
+                        width: 16,
+                        height: 16,
+                    },
+                },
+                GuestImageMipLayout {
+                    resource_relative_offset: 0x100,
+                    row_pitch: 0x20,
+                    layout: GuestImageLayout::D2 {
+                        width: 8,
+                        height: 8,
+                    },
+                },
+                GuestImageMipLayout {
+                    resource_relative_offset: 0,
+                    row_pitch: 0x10,
+                    layout: GuestImageLayout::D2 {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+            ]),
+        }
+    }
+
+    #[test]
+    fn a_chain_window_unions_every_level_whatever_order_the_guest_placed_them_in() {
+        let backing = GuestTargetBacking {
+            allocation_host_ptr: 0x1000_0000,
+            allocation_len: 0x4000,
+            resource_offset: 0,
+            resource_len: 0x4000,
+            plane_offset: 0,
+            row_pitch: 0x40,
+        };
+        let chain = smallest_first_chain();
+
+        assert_eq!(
+            chain
+                .visible_chain_window(backing, 4)
+                .expect("chain window"),
+            0..0x1400,
+            "the union runs from the smallest level's start to level zero's end"
+        );
+
+        // The trap the union exists to avoid: level zero alone names only the
+        // far end, and first.start..last.end would run backwards.
+        let base = chain.base().expect("a chain has a level zero");
+        assert_eq!(
+            base.plane_in(backing)
+                .expect("level zero is placed")
+                .visible_image_window(base.layout, 4)
+                .expect("level zero window"),
+            0x1000..0x1400
+        );
+    }
+
+    #[test]
+    fn a_level_that_escapes_the_resource_refuses_the_whole_chain() {
+        let backing = GuestTargetBacking {
+            allocation_host_ptr: 0x1000_0000,
+            allocation_len: 0x4000,
+            resource_offset: 0,
+            // Level zero ends at 0x1400, one byte past this resource.
+            resource_len: 0x13ff,
+            plane_offset: 0,
+            row_pitch: 0x40,
+        };
+        assert_eq!(
+            smallest_first_chain().visible_chain_window(backing, 4),
+            None
+        );
+    }
+
+    #[test]
+    fn chain_write_pages_owns_every_page_any_level_touches() {
+        let import = std::sync::Arc::new(
+            GuestRamImport::new_host_allocation(0x1000_0000, 0x4000, 0x1000)
+                .expect("aligned import"),
+        );
+        let memory = GuestTargetMemory {
+            backing: GuestTargetBacking {
+                allocation_host_ptr: import.host_base(),
+                allocation_len: import.len(),
+                resource_offset: 0,
+                resource_len: 0x4000,
+                plane_offset: 0,
+                row_pitch: 0x40,
+            },
+            import,
+            footprint: GuestPageFootprint::new(
+                std::sync::Arc::from([0xa000, 0xb000, 0xc000, 0xd000]),
+                0x1000,
+            )
+            .expect("resource footprint"),
+        };
+        let chain = smallest_first_chain();
+
+        assert_eq!(
+            memory
+                .chain_write_pages(&chain, 4)
+                .expect("chain pages")
+                .pages(),
+            &[0xa000, 0xb000],
+            "the smaller levels' page must be owned alongside level zero's"
+        );
+        assert_eq!(
+            memory
+                .visible_write_pages(16, 16, 4)
+                .expect("level-zero-shaped pages")
+                .pages(),
+            &[0xa000],
+            "level zero read against the backing's own plane_offset misses the tail levels"
         );
     }
 

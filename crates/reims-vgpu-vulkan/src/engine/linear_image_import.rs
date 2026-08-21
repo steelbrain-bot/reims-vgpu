@@ -61,12 +61,12 @@ impl LayoutMode {
 /// Which term of the sampled aliasing rail's admission rule refused a
 /// declaration.
 ///
-/// The rail builds exactly **one `TYPE_2D` view over one mip of one layer with
-/// no swizzle**, and every clause of that sentence is a way to be refused. Each
-/// names a different thing for a reader to go and fix — a mip chain wants a
-/// view over a chosen level, a `D2Array` wants a layered view, a swizzle wants
-/// a component mapping — so the rule lives here once and the arms that admit
-/// onto the rail ask it rather than restating it.
+/// The rail builds exactly **one `TYPE_2D` view over the whole mip chain of one
+/// layer**, and every clause of that sentence is a way to be refused. Each names
+/// a different thing for a reader to go and fix — a `D2Array` wants a layered
+/// view, a partial mip range wants the view range carried in the resident's
+/// identity — so the rule lives here once and the arms that admit onto the rail
+/// ask it rather than restating it.
 ///
 /// Restating it is not hypothetical. This rule was written by hand twice, seven
 /// terms in the binding arm and two in the length arm, and the shorter copy is
@@ -78,10 +78,23 @@ pub(crate) enum SampledCopyCause {
     /// layout is carried because which one it is decides what the rail would
     /// have to learn to build.
     Layout(GuestImageLayout),
-    /// The allocation declares a mip chain. The rail binds one image over one
-    /// mip, so a chain would need the bind to name which level.
-    MipChain { mips: usize },
-    /// The bind names a mip other than a whole single level 0.
+    /// The allocation declares levels that are not one Vulkan mip chain.
+    ///
+    /// Vulkan derives every level's extent from level zero, so a chain is
+    /// representable only when the guest's own levels halve in step, share a
+    /// dimensional family and layer domain, and each name a pitch that is a
+    /// whole number of texels — which is
+    /// [`reims_vgpu_memory::GuestImageAllocationLayout::is_vulkan_mip_chain`].
+    /// A chain that passes that is admitted; this is the one that does not.
+    IrregularMipChain { mips: usize },
+    /// The bind names part of the allocation's chain rather than all of it.
+    ///
+    /// A `TYPE_2D` view can name any contiguous run of levels, so this is not a
+    /// view-type limit: it is that the resident's identity records how many
+    /// levels its image carries and not which sub-run a bind asked for, so two
+    /// binds naming different sub-runs of one allocation would be served one
+    /// view. Teaching the rail a partial range means carrying the range in
+    /// [`super::pools::ResidentViewKey`], not relaxing this term.
     ViewMip { base: u32, count: u32 },
     /// The bind names a layer other than a whole single layer 0.
     ViewLayer { base: u32, count: u32 },
@@ -103,10 +116,20 @@ impl SampledCopyCause {
     ///
     /// `None` means the allocation is admissible, not that the bind is — the
     /// view half is [`Self::of_view`] and only the binding arm holds its inputs.
-    pub(crate) fn of_allocation(base: GuestImageLayout, mips: usize) -> Option<Self> {
+    /// A mip count is deliberately **not** a term here. It used to be, and on a
+    /// driven Maps boot it refused 949 008 binds of fifty-three textures — every
+    /// mipmapped texture the guest samples. The stated reason was that no
+    /// `TYPE_2D` view describes a chain, which is untrue: a view type chooses
+    /// the dimensionality, and `subresourceRange` chooses the levels, so one
+    /// `TYPE_2D` view over N levels is exactly what a mipmapped 2D texture
+    /// wants. Whether the *guest's* levels form one Vulkan chain is a separate
+    /// question and belongs to
+    /// [`reims_vgpu_memory::GuestImageAllocationLayout::is_vulkan_mip_chain`],
+    /// which the length arm asks and reports as
+    /// [`Self::IrregularMipChain`].
+    pub(crate) fn of_allocation(base: GuestImageLayout) -> Option<Self> {
         match base {
-            GuestImageLayout::D2 { .. } if mips == 1 => None,
-            GuestImageLayout::D2 { .. } => Some(Self::MipChain { mips }),
+            GuestImageLayout::D2 { .. } => None,
             other => Some(Self::Layout(other)),
         }
     }
@@ -122,13 +145,19 @@ impl SampledCopyCause {
     /// `VkComponentMapping` the hardware applies at sample time, so admitting
     /// one costs nothing and refusing one bought a whole texture copy to move
     /// bytes the GPU would have moved for free.
+    ///
+    /// `allocation_mips` is what the bind's mip range is measured against: the
+    /// rail's image carries the allocation's whole chain, so the admissible
+    /// view is the one naming all of it. Comparing against a literal `1` here
+    /// is what refused every mipmapped texture the guest owns.
     pub(crate) fn of_view(
         base_mip: u32,
         mip_count: u32,
+        allocation_mips: u32,
         base_layer: u32,
         layer_count: u32,
     ) -> Option<Self> {
-        if base_mip != 0 || mip_count != 1 {
+        if base_mip != 0 || mip_count != allocation_mips {
             return Some(Self::ViewMip {
                 base: base_mip,
                 count: mip_count,
@@ -152,7 +181,7 @@ impl SampledCopyCause {
             Self::Layout(GuestImageLayout::D2 { .. }) => "sampled_copy_layout_2d",
             Self::Layout(GuestImageLayout::D2Array { .. }) => "sampled_copy_layout_2d_array",
             Self::Layout(GuestImageLayout::D3 { .. }) => "sampled_copy_layout_3d",
-            Self::MipChain { .. } => "sampled_copy_mip_chain",
+            Self::IrregularMipChain { .. } => "sampled_copy_irregular_mip_chain",
             Self::ViewMip { .. } => "sampled_copy_view_mip",
             Self::ViewLayer { .. } => "sampled_copy_view_layer",
             Self::ResidentUnavailable => "sampled_copy_resident_unavailable",
@@ -1158,22 +1187,26 @@ pub(crate) unsafe fn binding_allocation_len(
         .map(|layout| u64::from(layout.bytes_per_texel()))
         .ok_or(WindowRefusal::ResourceWindowTooShort)?;
     if !allocation_layout.is_vulkan_mip_chain(bytes_per_texel) {
-        return Err(WindowRefusal::ResourceWindowTooShort);
+        return Err(WindowRefusal::SampledContentRequiresCopy(
+            SampledCopyCause::IrregularMipChain {
+                mips: allocation_layout.mips.len(),
+            },
+        ));
     }
     let base = allocation_layout
         .base()
         .ok_or(WindowRefusal::ResourceWindowTooShort)?;
     // Admission must be exactly the shape the aliasing rail can build, and that
-    // rail builds one `TYPE_2D` view over one mip. A volume, an array, a 1D
-    // texture or a mip chain plans as a Vulkan image perfectly well and would be
-    // admitted here on its own merits, but no `TYPE_2D` view describes it — so
-    // admitting one hands the guest a declaration this device would then have to
-    // reinterpret, which is the copying rail's work and not this rail's.
+    // rail builds one `TYPE_2D` view. A volume, an array or a 1D texture plans
+    // as a Vulkan image perfectly well and would be admitted here on its own
+    // merits, but no `TYPE_2D` view describes it — so admitting one hands the
+    // guest a declaration this device would then have to reinterpret, which is
+    // the copying rail's work and not this rail's. A mip chain is not on that
+    // list: `subresourceRange` names the levels and the view type does not.
     //
     // This is not a capability statement: the copying rail serves every one of
     // these shapes, and is the only rail at all on a host without the import.
-    if let Some(cause) = SampledCopyCause::of_allocation(base.layout, allocation_layout.mips.len())
-    {
+    if let Some(cause) = SampledCopyCause::of_allocation(base.layout) {
         return Err(WindowRefusal::SampledContentRequiresCopy(cause));
     }
     let geometry = image_geometry(base.layout);
@@ -1293,56 +1326,48 @@ mod tests {
     ];
 
     #[test]
-    fn the_alias_rail_admits_exactly_one_two_d_mip() {
+    fn the_alias_rail_admits_a_two_d_allocation_at_any_mip_count() {
+        // A mip count is not an allocation term. It was, and refusing on it
+        // cost every mipmapped texture the guest owns its zero-copy bind.
         for layout in EVERY_LAYOUT {
-            for mips in [1usize, 2, 9] {
-                let admitted = SampledCopyCause::of_allocation(layout, mips).is_none();
-                let is_two_d = matches!(layout, GuestImageLayout::D2 { .. });
-                assert_eq!(
-                    admitted,
-                    is_two_d && mips == 1,
-                    "{layout:?} with {mips} mip(s) was admitted={admitted}"
-                );
-            }
+            let admitted = SampledCopyCause::of_allocation(layout).is_none();
+            assert_eq!(
+                admitted,
+                matches!(layout, GuestImageLayout::D2 { .. }),
+                "{layout:?} was admitted={admitted}"
+            );
         }
     }
 
     #[test]
-    fn a_mip_chain_refuses_by_its_chain_and_not_by_its_layout() {
-        // The two terms are independent and a reader has to be able to tell
-        // "teach the rail a level" from "teach the rail a view type".
-        let two_d = GuestImageLayout::D2 {
-            width: 8,
-            height: 8,
-        };
+    fn the_view_half_admits_exactly_the_allocation_s_whole_chain() {
+        for mips in [1u32, 2, 9] {
+            assert_eq!(
+                SampledCopyCause::of_view(0, mips, mips, 0, 1),
+                None,
+                "a view naming all {mips} level(s) is the rail's own shape"
+            );
+        }
         assert_eq!(
-            SampledCopyCause::of_allocation(two_d, 4),
-            Some(SampledCopyCause::MipChain { mips: 4 })
-        );
-        assert_eq!(
-            SampledCopyCause::of_allocation(EVERY_LAYOUT[4], 4),
-            Some(SampledCopyCause::Layout(EVERY_LAYOUT[4])),
-            "a volume with a chain names the shape it cannot build a view for"
-        );
-    }
-
-    #[test]
-    fn the_view_half_admits_only_a_whole_level_zero_layer_zero() {
-        assert_eq!(SampledCopyCause::of_view(0, 1, 0, 1), None);
-        assert_eq!(
-            SampledCopyCause::of_view(2, 1, 0, 1),
+            SampledCopyCause::of_view(2, 1, 4, 0, 1),
             Some(SampledCopyCause::ViewMip { base: 2, count: 1 })
         );
         assert_eq!(
-            SampledCopyCause::of_view(0, 3, 0, 1),
-            Some(SampledCopyCause::ViewMip { base: 0, count: 3 })
+            SampledCopyCause::of_view(0, 3, 4, 0, 1),
+            Some(SampledCopyCause::ViewMip { base: 0, count: 3 }),
+            "a prefix of the chain is still not the chain"
         );
         assert_eq!(
-            SampledCopyCause::of_view(0, 1, 5, 1),
+            SampledCopyCause::of_view(0, 1, 4, 5, 1),
+            Some(SampledCopyCause::ViewMip { base: 0, count: 1 }),
+            "level zero of a four-level allocation is a partial view, not a whole one"
+        );
+        assert_eq!(
+            SampledCopyCause::of_view(0, 1, 1, 5, 1),
             Some(SampledCopyCause::ViewLayer { base: 5, count: 1 })
         );
         assert_eq!(
-            SampledCopyCause::of_view(0, 1, 0, 6),
+            SampledCopyCause::of_view(0, 1, 1, 0, 6),
             Some(SampledCopyCause::ViewLayer { base: 0, count: 6 })
         );
     }
@@ -1358,7 +1383,7 @@ mod tests {
             SampledCopyCause::Layout(EVERY_LAYOUT[2]),
             SampledCopyCause::Layout(EVERY_LAYOUT[3]),
             SampledCopyCause::Layout(EVERY_LAYOUT[4]),
-            SampledCopyCause::MipChain { mips: 2 },
+            SampledCopyCause::IrregularMipChain { mips: 2 },
             SampledCopyCause::ViewMip { base: 1, count: 1 },
             SampledCopyCause::ViewLayer { base: 1, count: 1 },
             SampledCopyCause::ResidentUnavailable,

@@ -47,6 +47,7 @@ fn guest_sampled_matches_resident(
         && slot.width == sampled.width
         && slot.height == sampled.height
         && slot.sample_count == 1
+        && slot.mip_levels == sampled.mip_levels
         && slot.format.allocation() == translate::pixel::storage_format(sampled.format)
         && slot.content_ready
 }
@@ -59,6 +60,7 @@ fn guest_resident_backing_key(slot: &ResidentTargetSlot) -> Option<GuestResident
         width: slot.width,
         height: slot.height,
         sample_count: slot.sample_count,
+        mip_levels: slot.mip_levels,
         format: slot.format.allocation(),
     })
 }
@@ -76,6 +78,7 @@ fn guest_sampled_resident_match(
         width: sampled.width,
         height: sampled.height,
         sample_count: 1,
+        mip_levels: sampled.mip_levels,
         format: translate::pixel::storage_format(sampled.format),
     };
     if let Some(identity) = authority.get(&key) {
@@ -130,6 +133,9 @@ struct NewResident {
     width: u32,
     height: u32,
     sample_count: u32,
+    /// Levels the created image carries. One on every creation site but the
+    /// guest-alias rail, where the guest's own declaration decides.
+    mip_levels: u32,
     generation: u64,
     format: translate::pixel::ResidentFormat,
     /// The view in `format.declared()`, when the declaration needs one of its
@@ -239,15 +245,18 @@ impl ResourcePools {
         // than restated, so this arm and the length arm in `linear_image_import`
         // cannot drift apart, and so the fall-through below can say which term
         // refused instead of only that a copy is required.
-        let requires_copy = SampledCopyCause::of_allocation(layout, source.allocation.mips.len())
-            .or_else(|| {
-                SampledCopyCause::of_view(
-                    source.view.base_mip_level,
-                    source.view.mip_level_count,
-                    source.view.base_array_layer,
-                    source.view.array_layer_count,
-                )
-            });
+        let Some(allocation_mips) = source.allocation.mip_level_count() else {
+            return Err(WindowRefusal::ResourceWindowTooShort);
+        };
+        let requires_copy = SampledCopyCause::of_allocation(layout).or_else(|| {
+            SampledCopyCause::of_view(
+                source.view.base_mip_level,
+                source.view.mip_level_count,
+                allocation_mips,
+                source.view.base_array_layer,
+                source.view.array_layer_count,
+            )
+        });
         if requires_copy.is_none() {
             match guest_sampled_resident_match(
                 &self.registry,
@@ -307,10 +316,17 @@ impl ResourcePools {
     ) -> Result<Option<GuestSampledUse>, super::super::linear_image_import::WindowRefusal> {
         use super::super::linear_image_import::WindowRefusal;
 
-        let (image, slot_access, materialize) = self
+        let (image, slot_access, levels, materialize) = self
             .registry
             .get(identity)
-            .map(|slot| (slot.image, slot.access, slot.guest_materialization))
+            .map(|slot| {
+                (
+                    slot.image,
+                    slot.access,
+                    slot.mip_levels,
+                    slot.guest_materialization.clone(),
+                )
+            })
             .expect("matched resident remains registered");
         let view = unsafe {
             self.registry_sample_view_raw(ctx, identity, sampled.format, sampled.swizzle, counters)
@@ -336,6 +352,7 @@ impl ResourcePools {
             image,
             view,
             access,
+            levels,
             materialize,
         }))
     }
@@ -366,26 +383,25 @@ impl ResourcePools {
         let bytes_per_texel = translate::pixel::texel_layout_of(format.allocation())
             .map(|layout| u64::from(layout.bytes_per_texel()))
             .ok_or(WindowRefusal::ResourceWindowTooShort)?;
-        let layout = source.allocation.mips[0].layout;
-        let window = memory
-            .backing
-            .visible_image_window(layout, bytes_per_texel)
+        // The image is the guest's whole allocation, so the chain it carries is
+        // the one the guest declared — not the range this bind's view named,
+        // which admission has already required to be all of it.
+        let mip_levels = source
+            .allocation
+            .mip_level_count()
             .ok_or(WindowRefusal::ResourceWindowTooShort)?;
-        // `bufferRowLength` is a texel count, so a pitch that is not a whole
-        // number of texels cannot be named in a copy region at all.
-        if !memory.backing.row_pitch.is_multiple_of(bytes_per_texel) {
-            return Err(WindowRefusal::SampledAliasRowPitchNotTexelMultiple {
-                row_pitch: memory.backing.row_pitch,
-                bytes_per_texel,
-            });
-        }
-        let row_length_texels = u32::try_from(memory.backing.row_pitch / bytes_per_texel)
-            .map_err(|_| WindowRefusal::ResourceWindowTooShort)?;
+        // The window every level of the chain occupies, and each level's copy
+        // into it. One launder covers the whole window, so it is both the
+        // staging span and the origin the per-level offsets count from.
+        let (window, levels) =
+            AliasMipCopy::chain(&source.allocation, memory.backing, bytes_per_texel)?;
         // The exact guest pages a host write into this image may land on. Page
         // ownership is asked before any Vulkan object exists, so a declaration
-        // whose window this device may not write to never becomes an image.
+        // whose window this device may not write to never becomes an image, and
+        // it is asked of the whole chain because the birth copy writes every
+        // level of it.
         let write_pages = memory
-            .visible_write_pages(sampled.width, sampled.height, bytes_per_texel)
+            .chain_write_pages(&source.allocation, bytes_per_texel)
             .ok_or(WindowRefusal::ResourceWindowTooShort)?;
 
         // The guest writes these pages with its own CPU and this device does
@@ -425,7 +441,14 @@ impl ResourcePools {
                     .image(imported.image)
                     .view_type(vk::ImageViewType::TYPE_2D)
                     .format(format.allocation())
-                    .subresource_range(color_subresource_range()),
+                    // The whole chain: a `TYPE_2D` view chooses the
+                    // dimensionality and `subresourceRange` chooses the levels,
+                    // so naming only level zero here would leave a mipmapped
+                    // texture sampling nothing above it.
+                    .subresource_range(vk::ImageSubresourceRange {
+                        level_count: mip_levels,
+                        ..color_subresource_range()
+                    }),
                 None,
             )
         } {
@@ -452,9 +475,7 @@ impl ResourcePools {
                     source: allocation.buffer,
                     source_offset: window.start,
                     bytes: window.end - window.start,
-                    width: sampled.width,
-                    height: sampled.height,
-                    row_length_texels,
+                    levels: std::sync::Arc::from(levels),
                 }),
                 view,
                 // Never a standalone colour target: this resident is reached
@@ -465,6 +486,7 @@ impl ResourcePools {
                 width: sampled.width,
                 height: sampled.height,
                 sample_count: 1,
+                mip_levels,
                 generation: 0,
                 format,
                 attachment_view: None,
@@ -489,6 +511,16 @@ impl ResourcePools {
     fn allocate_alias_slot() -> u64 {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many mip levels the resident registered under `identity` carries,
+    /// or `None` if nothing is registered there.
+    ///
+    /// Asked by a caller placing a barrier over the image, which has to name
+    /// every level the image has. The slot is the authority because it is where
+    /// the creating site recorded what it built.
+    pub(crate) fn resident_mip_levels(&self, identity: &TargetIdentity) -> Option<u32> {
+        self.registry.get(identity).map(|slot| slot.mip_levels)
     }
 
     /// Report that the copy [`GuestSampledUse::Resident`] handed back is in a
@@ -1335,7 +1367,7 @@ impl ResourcePools {
                     .view_type(vk::ImageViewType::TYPE_2D)
                     .format(key.format)
                     .components(translate::pixel::vk_component_mapping(&key.swizzle))
-                    .subresource_range(super::super::registry_subresource_range(key.format)),
+                    .subresource_range(slot.subresource_range(key.format)),
                 None,
             )
         }?;
@@ -1455,6 +1487,7 @@ impl ResourcePools {
                 width: new.width,
                 height: new.height,
                 sample_count: new.sample_count,
+                mip_levels: new.mip_levels,
                 generation: new.generation,
                 content_ready: false,
                 content_epoch: None,
@@ -1885,6 +1918,10 @@ impl ResourcePools {
                 width,
                 height,
                 sample_count,
+                // A colour or depth attachment, whichever arm above built it:
+                // both create the image with one level, and an imported one
+                // imports a single `D2` layout.
+                mip_levels: 1,
                 generation,
                 format,
                 attachment_view,
@@ -2131,6 +2168,9 @@ impl ResourcePools {
                 width,
                 height,
                 sample_count,
+                // An MRT secondary attachment: created, recycled or imported,
+                // all three arms above are one level.
+                mip_levels: 1,
                 generation,
                 format,
                 // Nothing here needs the declaration's view yet — this arm owns
@@ -3334,6 +3374,7 @@ pub(super) mod pin_count_tests {
             width: 16,
             height: 16,
             sample_count: 1,
+            mip_levels: 1,
             generation: 1,
             content_ready,
             content_epoch: None,
@@ -3892,6 +3933,7 @@ pub(super) mod pin_count_tests {
             width: 16,
             height: 16,
             sample_count: 1,
+            mip_levels: 1,
             generation: 1,
             format: translate::pixel::ResidentFormat::of(translate::pixel::SCANOUT_FORMAT),
             attachment_view: None,

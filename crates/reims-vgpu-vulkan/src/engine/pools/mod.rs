@@ -1266,6 +1266,12 @@ struct GuestResidentBackingKey {
     width: u32,
     height: u32,
     sample_count: u32,
+    /// Levels the resident's image carries. Part of the identity because a mip
+    /// chain and its own level zero start at the same address in the same
+    /// allocation and differ only here — without this term a single-level
+    /// declaration would match an aliasing chain over those bytes and be bound
+    /// as it.
+    mip_levels: u32,
     format: vk::Format,
 }
 
@@ -1290,21 +1296,94 @@ struct GuestResidentBackingKey {
 /// recorded into a command buffer, so a draw abandoned before that point leaves
 /// the next bind owing the same copy rather than sampling an image nothing ever
 /// wrote.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct AliasMaterialization {
     /// The whole-import buffer over the guest allocation this image aliases.
     pub source: vk::Buffer,
-    /// Allocation-relative byte offset of the image's first texel, which is
-    /// also its offset into `source`: the import buffer spans the whole
-    /// allocation.
+    /// Allocation-relative byte offset of the first texel of the lowest-placed
+    /// level, which is also its offset into `source`: the import buffer spans
+    /// the whole allocation.
     pub source_offset: u64,
-    /// Bytes from the first texel to the last, guest row padding included.
+    /// Bytes from `source_offset` to the last texel of the highest-placed
+    /// level, guest row padding included. One launder covers the whole chain,
+    /// so this is the span the staging buffer has to hold; for a one-level
+    /// image it is exactly that level's visible window.
     pub bytes: u64,
+    /// Every mip level the aliased image carries, in level order, never empty.
+    ///
+    /// A chain rather than one window because the guest declares each level's
+    /// offset and pitch independently and Vulkan places them independently
+    /// too. `linear_image_import::validate_mip_subresource` has already proved
+    /// the two agree level by level before any image is registered; this is
+    /// that agreement spelled as the copy which lands the guest's bytes.
+    pub levels: std::sync::Arc<[AliasMipCopy]>,
+}
+
+/// One mip level of an [`AliasMaterialization`], at its position in the list.
+///
+/// The level number is the position and is not a field: the list is the whole
+/// chain in level order, so carrying the number too is a second spelling of the
+/// index that could disagree with it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AliasMipCopy {
+    /// This level's first texel counted from the materialization's
+    /// `source_offset`, so it indexes the staging buffer the launder fills
+    /// rather than the import buffer.
+    pub relative_offset: u64,
     pub width: u32,
     pub height: u32,
-    /// `bufferRowLength` for the buffer→image copy: the guest row pitch
-    /// expressed in texels.
+    /// `bufferRowLength` for this level's buffer→image copy: the guest row
+    /// pitch of *this* level expressed in texels. Levels of one chain do not
+    /// share a pitch, which is why it sits here and not beside `source`.
     pub row_length_texels: u32,
+}
+
+impl AliasMipCopy {
+    /// The allocation-relative window a whole declared chain occupies, and one
+    /// copy region per level counted from that window's start.
+    ///
+    /// The two are returned together because neither is usable alone: the
+    /// window is what the launder stages and the origin every level's
+    /// `relative_offset` counts from, so deriving them apart is two chances to
+    /// disagree about where byte zero is.
+    pub(crate) fn chain(
+        allocation: &reims_vgpu_memory::GuestImageAllocationLayout,
+        backing: reims_vgpu_memory::GuestTargetBacking,
+        bytes_per_texel: u64,
+    ) -> Result<(std::ops::Range<u64>, Vec<Self>), super::linear_image_import::WindowRefusal> {
+        use super::linear_image_import::WindowRefusal;
+
+        let window = allocation
+            .visible_chain_window(backing, bytes_per_texel)
+            .ok_or(WindowRefusal::ResourceWindowTooShort)?;
+        let mut levels = Vec::with_capacity(allocation.mips.len());
+        for mip in allocation.mips.iter() {
+            // `bufferRowLength` is a texel count, so a pitch that is not a whole
+            // number of texels cannot be named in a copy region at all. Levels
+            // of one chain carry their own pitches, so this is asked of each.
+            if !mip.row_pitch.is_multiple_of(bytes_per_texel) {
+                return Err(WindowRefusal::SampledAliasRowPitchNotTexelMultiple {
+                    row_pitch: mip.row_pitch,
+                    bytes_per_texel,
+                });
+            }
+            let level_window = mip
+                .plane_in(backing)
+                .and_then(|plane| plane.visible_image_window(mip.layout, bytes_per_texel))
+                .ok_or(WindowRefusal::ResourceWindowTooShort)?;
+            levels.push(Self {
+                relative_offset: level_window
+                    .start
+                    .checked_sub(window.start)
+                    .ok_or(WindowRefusal::ResourceWindowTooShort)?,
+                width: mip.layout.width(),
+                height: mip.layout.height(),
+                row_length_texels: u32::try_from(mip.row_pitch / bytes_per_texel)
+                    .map_err(|_| WindowRefusal::ResourceWindowTooShort)?,
+            });
+        }
+        Ok((window, levels))
+    }
 }
 
 #[derive(Clone)]
@@ -1314,6 +1393,9 @@ pub(crate) enum GuestSampledUse {
         image: vk::Image,
         view: vk::ImageView,
         access: ResidentAccess,
+        /// Levels `image` carries, which is the range every barrier the caller
+        /// places over it must name.
+        levels: u32,
         /// Set exactly while this resident's image aliases guest bytes it has
         /// never had landed into it. The caller must record the copy this
         /// describes before the draw reads the image, and report it back
@@ -1927,6 +2009,14 @@ pub(crate) struct ResidentTargetSlot {
     pub width: u32,
     pub height: u32,
     pub sample_count: u32,
+    /// Mip levels this slot's image carries, never zero.
+    ///
+    /// One on every resident this device creates for itself; more only on the
+    /// guest-alias rail, where the image *is* a guest allocation and the guest
+    /// declared the chain. Held on the slot rather than recomputed because
+    /// every view and every barrier over the image has to name the same range,
+    /// and the slot is the one thing all of them already have.
+    pub mip_levels: u32,
     pub generation: u64,
     pub content_ready: bool,
     /// The mapping-level `surface_content_epoch` this image's pixels were last
@@ -2105,6 +2195,21 @@ impl ResidentTargetSlot {
             .iter()
             .find(|(held, _)| *held == key)
             .map(|(_, view)| *view)
+    }
+
+    /// Every subresource of this slot's image, in the aspect `format` names.
+    ///
+    /// [`super::registry_subresource_range`] widened by the one thing a free
+    /// function cannot know and the slot does: how many levels the image
+    /// carries. A view or a barrier that named a narrower range than the image
+    /// has would leave the tail levels untransitioned and unreadable, and no
+    /// counter in this tree reports that — the guest would simply sample
+    /// undefined texels above level zero.
+    pub(crate) fn subresource_range(&self, format: vk::Format) -> vk::ImageSubresourceRange {
+        vk::ImageSubresourceRange {
+            level_count: self.mip_levels,
+            ..super::registry_subresource_range(format)
+        }
     }
 
     /// Whether this image's texels are already in the byte order the guest
@@ -4125,6 +4230,7 @@ mod resident_reuse_tests {
             width,
             height,
             sample_count: 1,
+            mip_levels: 1,
             generation,
             content_ready: false,
             content_epoch: None,
@@ -4147,6 +4253,78 @@ mod resident_reuse_tests {
             plane_offset: 0,
             row_pitch: 256,
         }
+    }
+
+    /// A three-level chain the guest laid out smallest-first, so level zero —
+    /// the first entry, and the one Vulkan calls mip 0 — sits last in address
+    /// order. Pitches differ per level, as a guest's own chain's do.
+    fn smallest_first_chain() -> reims_vgpu_memory::GuestImageAllocationLayout {
+        use reims_vgpu_memory::{GuestImageLayout, GuestImageMipLayout};
+        let level = |resource_relative_offset, row_pitch, width, height| GuestImageMipLayout {
+            resource_relative_offset,
+            row_pitch,
+            layout: GuestImageLayout::D2 { width, height },
+        };
+        reims_vgpu_memory::GuestImageAllocationLayout {
+            mips: std::sync::Arc::from([
+                level(0x1000, 0x40, 16, 16),
+                level(0x100, 0x20, 8, 8),
+                level(0, 0x10, 4, 4),
+            ]),
+        }
+    }
+
+    #[test]
+    fn a_chain_copy_list_is_indexed_from_the_chains_own_start_not_level_zeros() {
+        let (window, levels) =
+            crate::engine::pools::AliasMipCopy::chain(&smallest_first_chain(), backing(0x1000), 4)
+                .expect("chain");
+
+        assert_eq!(window, 0..0x1400, "the staging span is the levels' union");
+        let placed: Vec<_> = levels
+            .iter()
+            .map(|copy| (copy.relative_offset, copy.width, copy.row_length_texels))
+            .collect();
+        assert_eq!(
+            placed,
+            vec![(0x1000, 16, 16), (0x100, 8, 8), (0, 4, 4)],
+            "level zero's offset is its distance from the chain's start, which \
+             is a smaller level's address, and each level carries its own pitch"
+        );
+    }
+
+    #[test]
+    fn a_chain_level_whose_pitch_is_not_whole_texels_refuses_by_name() {
+        use reims_vgpu_memory::{GuestImageLayout, GuestImageMipLayout};
+        let chain = reims_vgpu_memory::GuestImageAllocationLayout {
+            mips: std::sync::Arc::from([
+                GuestImageMipLayout {
+                    resource_relative_offset: 0,
+                    row_pitch: 0x40,
+                    layout: GuestImageLayout::D2 {
+                        width: 16,
+                        height: 16,
+                    },
+                },
+                // Level one's pitch is not a multiple of four bytes, so no
+                // `bufferRowLength` names it.
+                GuestImageMipLayout {
+                    resource_relative_offset: 0x400,
+                    row_pitch: 0x22,
+                    layout: GuestImageLayout::D2 {
+                        width: 8,
+                        height: 8,
+                    },
+                },
+            ]),
+        };
+        assert!(matches!(
+            crate::engine::pools::AliasMipCopy::chain(&chain, backing(0x1000), 4),
+            Err(crate::engine::linear_image_import::WindowRefusal::SampledAliasRowPitchNotTexelMultiple {
+                row_pitch: 0x22,
+                bytes_per_texel: 4,
+            })
+        ));
     }
 
     #[test]

@@ -1478,6 +1478,11 @@ enum PreparedSampled {
         view: vk::ImageView,
         access: super::pools::ResidentAccess,
         next_access: super::pools::ResidentAccess,
+        /// Levels `image` carries, and therefore the range this draw's own
+        /// transition has to name. One on every resident but a guest-alias
+        /// image over a mipmapped guest allocation, where a level-zero-only
+        /// barrier would leave the tail levels in `UNDEFINED`.
+        levels: u32,
         /// The birth copy an image aliasing guest pages owes before anything
         /// reads it, present only on the bind that finds one owed. `access`
         /// then describes what recording that copy leaves behind rather than
@@ -2913,6 +2918,110 @@ unsafe fn upload_buffer_to_sampled_image(
         &to_shader,
     );
     Ok(())
+}
+
+/// Land an aliasing image's birth copy, every level of it, from the staging
+/// buffer the launder has already filled with the guest's own bytes.
+///
+/// Separate from the two upload helpers around it because nothing here is a
+/// choice: the geometry comes from [`super::pools::AliasMaterialization`], which
+/// was built from the guest's declared chain and has already been proved to
+/// agree with the Vulkan image's own per-level placement. There is no format
+/// reinterpretation and no layout equation to solve — only a barrier out of
+/// `UNDEFINED` covering every level, one region per level, and a barrier into
+/// the layout the caller says the image rests in.
+///
+/// The two barriers must name the whole chain and not level zero. An image born
+/// `UNDEFINED` has every level in that layout, and a level left there is one the
+/// guest samples as undefined texels — which no counter in this tree reports,
+/// because from the device's side nothing failed.
+unsafe fn materialize_alias_levels(
+    ctx: &super::context::DeviceContext,
+    cb: vk::CommandBuffer,
+    staging: vk::Buffer,
+    image: vk::Image,
+    seed: &super::pools::AliasMaterialization,
+    final_layout: vk::ImageLayout,
+) {
+    let range = vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: seed.levels.len() as u32,
+        base_array_layer: 0,
+        layer_count: 1,
+    };
+    let to_transfer = [vk::ImageMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::empty())
+        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .old_layout(vk::ImageLayout::UNDEFINED)
+        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .image(image)
+        .subresource_range(range)];
+    let regions: Vec<_> = seed
+        .levels
+        .iter()
+        .enumerate()
+        .map(|(level, copy)| {
+            vk::BufferImageCopy::default()
+                .buffer_offset(copy.relative_offset)
+                // Zero means "tightly packed", which is what a row pitch equal
+                // to the level's own width already says. Spelling the texel
+                // count instead is equally correct; passing zero keeps the
+                // padded and unpadded cases spelled the same way as the other
+                // copy builders in this module.
+                .buffer_row_length(if copy.row_length_texels == copy.width {
+                    0
+                } else {
+                    copy.row_length_texels
+                })
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: level as u32,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                .image_extent(vk::Extent3D {
+                    width: copy.width,
+                    height: copy.height,
+                    depth: 1,
+                })
+        })
+        .collect();
+    let to_shader = [vk::ImageMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .new_layout(final_layout)
+        .image(image)
+        .subresource_range(range)];
+    unsafe {
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &to_transfer,
+        );
+        ctx.device.cmd_copy_buffer_to_image(
+            cb,
+            staging,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &regions,
+        );
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &to_shader,
+        );
+    }
 }
 
 struct SampledAllocationUpload<'a> {
@@ -5037,6 +5146,9 @@ pub(crate) unsafe fn execute_draw_inner(
                         view: source_view,
                         access: source_layout,
                         next_access: super::pools::ResidentAccess::shader_read(),
+                        levels: pools
+                            .resident_mip_levels(identity)
+                            .expect("validated resident is held"),
                         materialize: None,
                     });
                 }
@@ -5073,6 +5185,7 @@ pub(crate) unsafe fn execute_draw_inner(
                         image,
                         view,
                         access,
+                        levels,
                         materialize,
                     })) => {
                         counters.note_sampled_gather_witness(*vouch);
@@ -5086,6 +5199,7 @@ pub(crate) unsafe fn execute_draw_inner(
                             view,
                             access,
                             next_access: super::pools::ResidentAccess::shader_read(),
+                            levels,
                             materialize,
                         });
                     }
@@ -5834,7 +5948,6 @@ pub(crate) unsafe fn execute_draw_inner(
     let mut materialized_alias = std::collections::HashSet::new();
     for image in &sampled {
         let PreparedSampled::Resident {
-            binding,
             identity,
             image,
             next_access,
@@ -5886,21 +5999,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 &landed,
                 &[],
             );
-            upload_buffer_to_sampled_image(
-                ctx,
-                cb,
-                staging.buffer,
-                0,
-                *image,
-                seed.width,
-                seed.height,
-                1,
-                1,
-                seed.row_length_texels,
-                None,
-                *binding,
-                next_access.layout(),
-            )?;
+            materialize_alias_levels(ctx, cb, staging.buffer, *image, seed, next_access.layout());
         }
         counters.note_sampled_guest_materialized(seed.bytes);
         // Only now: until the copy is in the command buffer the resident keeps
@@ -5919,6 +6018,7 @@ pub(crate) unsafe fn execute_draw_inner(
             image,
             access,
             next_access,
+            levels,
             ..
         } = image
         else {
@@ -5957,7 +6057,12 @@ pub(crate) unsafe fn execute_draw_inner(
             .old_layout(access.layout())
             .new_layout(next_access.layout())
             .image(*image)
-            .subresource_range(super::color_subresource_range())];
+            // Every level, because a mipmapped guest alias is one image whose
+            // tail levels are read by the same sample as level zero.
+            .subresource_range(vk::ImageSubresourceRange {
+                level_count: *levels,
+                ..super::color_subresource_range()
+            })];
         ctx.device.cmd_pipeline_barrier(
             cb,
             src_stage,
