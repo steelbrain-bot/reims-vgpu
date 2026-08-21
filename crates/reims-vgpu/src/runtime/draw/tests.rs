@@ -649,6 +649,239 @@ fn array_view_selection_moves_geometry_and_backing_offset_together() {
     .is_none());
 }
 
+/// A cube reaches the zero-copy rail as the six-slice array it is.
+///
+/// Before this was expressed here the selector answered `None` for every cube,
+/// the caller fell back to a single-plane span, and the backend then refused
+/// the whole draw for describing one face where six were declared. The span is
+/// the reading that says the layout is right: six faces at `bytes_per_slice`.
+#[test]
+fn a_cube_view_selects_its_six_faces_as_consecutive_array_slices() {
+    use crate::runtime::decode::resource::{
+        TEXTURE_VIEW_MTL_TYPE_CUBE, TEXTURE_VIEW_MTL_TYPE_CUBE_ARRAY,
+    };
+
+    let level = crate::runtime::decode::resource::TextureLevelLayout {
+        offset: 0,
+        size: 0x4000,
+        row_stride: 0x100,
+        width: 64,
+        height: 64,
+        depth: 1,
+    };
+    let cube = TextureDescriptor {
+        allocation_size: 0x4000 * 6,
+        declaration: Some(reims_vgpu_protocol::TextureDeclaration {
+            texture_type: TEXTURE_VIEW_MTL_TYPE_CUBE as u8,
+            framebuffer_only: false,
+            is_drawable: false,
+            write_swizzle_enabled: None,
+            allow_gpu_optimized_contents: false,
+            usage: 0,
+            pixel_format: reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+            width: level.width,
+            height: level.height,
+            depth: 1,
+            mipmap_level_count: 1,
+            sample_count: 1,
+            array_length: 1,
+            resource_options: 0,
+            protection_options: 0,
+            swizzle: None,
+        }),
+        bytes_per_slice: 0x4000,
+        slice_count: 1,
+        cube_faces: true,
+        levels: vec![level],
+        ..Default::default()
+    };
+    // One declared slice, six physical ones. The two counts are the same fact
+    // the selector has to agree with.
+    assert_eq!(
+        cube.physical_slice_count(),
+        Some(reims_vgpu_protocol::CUBE_FACES)
+    );
+
+    let cube_shape =
+        reims_vgpu_core::sampled_image_shape(reims_vgpu_core::SampledImageKind::Cube).unwrap();
+    let selected = declared_guest_image_selection(
+        cube_shape,
+        &cube,
+        &level,
+        Some(TEXTURE_VIEW_MTL_TYPE_CUBE),
+        None,
+    );
+    assert_eq!(
+        selected,
+        Some((
+            reims_vgpu_memory::GuestImageLayout::D2Array {
+                width: 64,
+                height: 64,
+                layers: 6,
+                array_pitch: 0x4000,
+            },
+            0,
+        ))
+    );
+    // The whole point of the layout: the span the caller derives from it now
+    // covers all six faces rather than the first one.
+    assert_eq!(
+        selected.unwrap().0.visible_span(level.row_stride, 4),
+        Some(level.size * 6)
+    );
+
+    // Cube-array storage under a plain-cube bind is a refusal, not the first
+    // six faces of a longer array. `sampled_image_shape` refuses `CubeArray`
+    // itself, so nothing downstream could tell the two apart.
+    let mut cube_array = cube.clone();
+    cube_array.declaration = cube_array.declaration.map(|mut d| {
+        d.texture_type = TEXTURE_VIEW_MTL_TYPE_CUBE_ARRAY as u8;
+        d.array_length = 2;
+        d
+    });
+    cube_array.slice_count = 2;
+    cube_array.allocation_size = 0x4000 * 12;
+    assert!(declared_guest_image_selection(
+        cube_shape,
+        &cube_array,
+        &level,
+        Some(TEXTURE_VIEW_MTL_TYPE_CUBE_ARRAY),
+        None,
+    )
+    .is_none());
+}
+
+/// The allocation selector admits a cube only when both sides say cube.
+///
+/// Its bail used to read `shape.cube || texture.cube_faces`, refusing a cube
+/// named on either side, and admitting cubes meant dropping both terms.
+/// Dropping the second is not obviously additive: it also stops refusing a
+/// *non-cube* view over cube storage, a shape the six-face reasoning never
+/// covered and which the `shape.cube` arm of the selection path does not reach.
+/// That was recorded as the leading suspect for why admitting cubes might cost
+/// more than it bought.
+///
+/// It is not admitted, and this test is the evidence. Both disagreeing cells
+/// are still refused, by the layer-agreement checks further down rather than by
+/// the bail: `storage_layers` becomes six for cube storage, so a flat bind's
+/// single layer no longer matches, and a cube bind over storage declaring no
+/// faces fails the same comparison from the other side.
+///
+/// That is worth a test even though no single line here enforces it. An
+/// explicit `shape.cube != texture.cube_faces` guard was written first and then
+/// removed: with it in place this test passed, and with it deleted this test
+/// still passed, so it was refusing nothing and would have been a second rule
+/// sitting beside the one that already works. What follows pins the behaviour
+/// -- all four cells of bind-cube against storage-cube -- rather than any one
+/// line's spelling, so it keeps holding whichever layer does the refusing.
+#[test]
+fn a_cube_allocation_is_admitted_only_when_bind_and_storage_agree() {
+    use crate::runtime::decode::resource::{TEXTURE_VIEW_MTL_TYPE_2D, TEXTURE_VIEW_MTL_TYPE_CUBE};
+
+    let level = crate::runtime::decode::resource::TextureLevelLayout {
+        offset: 0,
+        size: 0x4000,
+        row_stride: 0x100,
+        width: 64,
+        height: 64,
+        depth: 1,
+    };
+    let declaration = |texture_type: u16| reims_vgpu_protocol::TextureDeclaration {
+        texture_type: texture_type as u8,
+        framebuffer_only: false,
+        is_drawable: false,
+        write_swizzle_enabled: None,
+        allow_gpu_optimized_contents: false,
+        usage: 0,
+        pixel_format: reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        width: level.width,
+        height: level.height,
+        depth: 1,
+        mipmap_level_count: 1,
+        sample_count: 1,
+        array_length: 1,
+        resource_options: 0,
+        protection_options: 0,
+        swizzle: None,
+    };
+    let descriptor = |texture_type: u16, cube_faces: bool| TextureDescriptor {
+        allocation_size: 0x4000 * if cube_faces { 6 } else { 1 },
+        declaration: Some(declaration(texture_type)),
+        bytes_per_slice: 0x4000,
+        slice_count: 1,
+        cube_faces,
+        levels: vec![level],
+        ..Default::default()
+    };
+
+    let cube_shape =
+        reims_vgpu_core::sampled_image_shape(reims_vgpu_core::SampledImageKind::Cube).unwrap();
+    let flat_shape =
+        reims_vgpu_core::sampled_image_shape(reims_vgpu_core::SampledImageKind::D2).unwrap();
+
+    // Agreeing, cube on both sides: the one newly-admitted cell. Six faces of
+    // the ordinary slice-major packing.
+    let (layout, ..) = declared_guest_image_allocation(
+        cube_shape,
+        &descriptor(TEXTURE_VIEW_MTL_TYPE_CUBE, true),
+        Some(TEXTURE_VIEW_MTL_TYPE_CUBE),
+        None,
+        4,
+    )
+    .expect("a cube view of cube storage is the shape this rail now describes");
+    assert!(
+        matches!(
+            layout.base().map(|base| base.layout),
+            Some(reims_vgpu_memory::GuestImageLayout::D2Array { layers: 6, .. })
+        ),
+        "a cube's six faces are six slices, not one plane: {layout:?}",
+    );
+
+    // Agreeing, cube on neither side: admitted before the relaxation and still
+    // admitted. This is what makes the change additive rather than a trade.
+    assert!(
+        declared_guest_image_allocation(
+            flat_shape,
+            &descriptor(TEXTURE_VIEW_MTL_TYPE_2D, false),
+            Some(TEXTURE_VIEW_MTL_TYPE_2D),
+            None,
+            4,
+        )
+        .is_some(),
+        "relaxing the cube bail must not disturb the plain 2-D case",
+    );
+
+    // Disagreeing: a non-cube view over cube storage. Refused before the
+    // relaxation, and dropping `texture.cube_faces` from the bail would have
+    // admitted it silently. This assertion is the reason the bail is an
+    // inequality rather than two dropped terms.
+    assert!(
+        declared_guest_image_allocation(
+            flat_shape,
+            &descriptor(TEXTURE_VIEW_MTL_TYPE_CUBE, true),
+            Some(TEXTURE_VIEW_MTL_TYPE_CUBE),
+            None,
+            4,
+        )
+        .is_none(),
+        "a non-cube view over cube storage is not a shape the cube rule reaches",
+    );
+
+    // Disagreeing, the mirror: a cube bind whose storage declares no faces, so
+    // there is nothing to divide into six.
+    assert!(
+        declared_guest_image_allocation(
+            cube_shape,
+            &descriptor(TEXTURE_VIEW_MTL_TYPE_2D, false),
+            Some(TEXTURE_VIEW_MTL_TYPE_2D),
+            None,
+            4,
+        )
+        .is_none(),
+        "a cube bind over storage that declares no faces has no six slices to take",
+    );
+}
+
 #[test]
 fn one_and_three_dimensional_views_keep_native_zero_copy_geometry() {
     let declaration = |texture_type: u8, width: u32, height: u32, depth: u32| {
