@@ -32,6 +32,23 @@ command -v magick >/dev/null || {
 command -v tesseract >/dev/null || {
   echo "maps-visual-gate: tesseract is required" >&2; exit 2; }
 
+# The label test's two constants, both measured by
+# `maps-scene-calibrate.sh` walking candidate scenes on one boot.
+#
+# The floor is what separates type from antialiasing. On a scene rendering
+# correctly at the declared zoom, 86 words came back and 57 of them cleared
+# 60 %; on a scene whose label layer was absent, every word returned scored
+# below 45 %. Nothing on record lands between those, so 60 has margin in both
+# directions.
+#
+# The minimum is then set against the confident population, not the raw one:
+# 57 confident words when the layer renders, 0 when it does not. 12 sits well
+# below the passing count and far above the noise floor, which is 0 once the
+# confidence floor is applied. It is deliberately not 4 — that was a threshold
+# against unfiltered counts, and it made the gate a coin flip.
+LABEL_CONF_FLOOR="${LABEL_CONF_FLOOR:-60}"
+LABEL_MIN="${LABEL_MIN:-12}"
+
 WORK=$(mktemp -d)
 trap 'find "$WORK" -type f -delete; rmdir "$WORK"' EXIT
 failed=0
@@ -63,8 +80,14 @@ for image in "$BEFORE" "$AFTER" "$SETTLED"; do
   # absent. Scaling the already-isolated viewport changes only the instrument.
   ocr="$WORK/ocr-$index.png"
   magick "$crop" -resize 200% "$ocr"
+  # Count only words Tesseract is confident about. Without a floor this counts
+  # antialiasing garbage: a scene with no legible type at all returned 4 and 7
+  # "words" on two captures of the same frame, every one of them below 45 %
+  # confidence, so the same render passed and failed at random. Column 11 of
+  # the TSV is the per-word confidence and column 12 the text.
   labels=$(tesseract "$ocr" stdout --psm 11 tsv 2>/dev/null |
-    awk -F '\t' 'NR > 1 && $12 ~ /[[:alpha:]][[:alpha:]][[:alpha:]]/ {
+    awk -F '\t' -v floor="$LABEL_CONF_FLOOR" \
+      'NR > 1 && $11 + 0 >= floor && $12 ~ /[[:alpha:]][[:alpha:]][[:alpha:]]/ {
       count++
     } END { print count + 0 }')
 
@@ -75,13 +98,12 @@ for image in "$BEFORE" "$AFTER" "$SETTLED"; do
   # an antialiasing/noise test. In the controlled empty-grid capture the fill
   # owns 0.8721 of the interior; in the widest valid driven capture it owns
   # 0.5915. The 0.80 boundary sits between those measured populations with
-  # room on both sides. Three OCR words is below the ordinary toolbar-free
-  # label population but above a fully label-free geography frame.
+  # room on both sides.
   if awk -v fraction="$dominant_fraction" 'BEGIN { exit !(fraction >= 0.80) }'; then
     echo "maps-visual-gate: INVALID — geographic layers do not cover the map interior"
     failed=1
   fi
-  if [ "$labels" -lt 4 ]; then
+  if [ "$labels" -lt "$LABEL_MIN" ]; then
     echo "maps-visual-gate: INVALID — the map interior does not contain its label layer"
     failed=1
   fi

@@ -92,7 +92,14 @@ sleep 10
 # render the same class of scene and gives the visual gate a meaningful promise
 # to check. Re-opening it also prevents snapshot-restored location history from
 # choosing an ocean or a different zoom level for one arm.
-MAP_URL='http://maps.apple.com/?ll=40.7128,-74.0060&z=12'
+#
+# z=14, not z=12. The zoom is part of what makes the scene checkable: walking
+# z12/z14/z16/z18 over one boot, only z14 put legible type on screen — 57 words
+# above the gate's confidence floor, against 0 at all three other zooms on the
+# same boot of the same binary. At z12 the labels render too small to survive
+# OCR, so a gate pointed there scores a correct frame the same as a frame with
+# no label layer at all, which is what it did.
+MAP_URL='http://maps.apple.com/?ll=40.7128,-74.0060&z=14'
 timeout 60 ssh -o BatchMode=yes macos-vm \
   "open -a Maps '$MAP_URL'" 2>/dev/null \
   || { echo "could not select the Maps workload"; exit 3; }
