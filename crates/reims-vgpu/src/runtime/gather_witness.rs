@@ -7,6 +7,25 @@
 //! every CPU write to unified shared storage. The full-content audit has
 //! observed bytes move while both accounts reported `Vouched`.
 //!
+//! That gap is a property of the API rather than a shortfall in these two
+//! accounts, so widening them cannot close it. The contract is that a CPU store
+//! into shared storage is visible to a later GPU read through a texture
+//! aliasing that storage, with no API call announcing the write: no flush, no
+//! synchronization, no revalidation. `scripts/metal-oracle/linear-alias.swift`
+//! states that as a runnable question, and a native Metal host answers
+//! `visible` three times over -- including for stores landing after the
+//! resource has already been sampled once.
+//!
+//! The consequence for this module is worth being blunt about. A guest that
+//! rasterizes into its own shared storage is entitled to say nothing, so there
+//! is no announcement for any witness to observe, and no pair of accounts
+//! assembled from decoded traffic can be sound over that writer. This is
+//! therefore an alarm permanently: do not promote it into a correctness gate,
+//! and do not add a third account hoping to reach soundness. A rail that
+//! samples the guest's live storage has no such question to answer, which is
+//! the structural fix; the witness exists to keep the copying rails' exposure
+//! measurable until such a rail carries them.
+//!
 //! The content fold is the check that exposes that missing writer. It is
 //! disabled normally and runs on every bind when explicitly enabled. A
 //! disagreement is fail-visible without changing shipping behavior. In
