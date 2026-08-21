@@ -623,6 +623,33 @@ do not generalize from one rail to another.
 - x86: `vm/boot-x86.sh --device reims-vgpu-pci --testing`, then
   `scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh -o /tmp/screen.png`
 
+### Never score a frame by OCR. Look at it.
+
+**OCR may not decide anything about a frame.** Not a pass, not a fail, not a ranking between two
+arms. A capture is scored by opening it and looking at it, every time, and a result reported from a
+frame nobody looked at is not a result.
+
+This is not a preference about rigour, it is what OCR measured wrong here, twice, in the direction
+that reads as a finding:
+
+- **It invented type that was not there.** A word count with a confidence floor read a Maps scene as
+  carrying legible labels. The frame carries none at all — the "words" were road casings and
+  antialiasing, and a whole investigation into *which* labels were wrong was built on a layer that
+  was simply absent. The right question, missing labels, was never asked, because the instrument
+  answered a different one.
+- **It cannot see a defect that is not text.** The same scene renders as hundreds of full-width
+  horizontal stripes of correct colour interleaved with background. OCR scores a torn frame exactly
+  as it scores a clean one, so that defect sat unreported across every sweep that used this scoring.
+
+The general form is the trap `## Before A Broad Sweep` already names: a zero that is an artifact of
+where it was sampled. A word count samples one channel of one layer, and reports the same number for
+"rendered correctly and has no text", "rendered nothing" and "rendered garbage". Three states, one
+reading.
+
+So a probe may still *capture*, crop, and lay frames side by side — that is an instrument doing what
+instruments do. What it may not do is emit a verdict column. Save the frames, name them by scene, and
+read them.
+
 ### Run `vm/guest-authorize.sh` after an x86 boot, before any probe
 
 Every probe under `scripts/` reaches the guest as `ssh -o BatchMode=yes macos-vm`, which is key auth
