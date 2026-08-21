@@ -34,6 +34,18 @@ export QMP_SOCK="${QMP_SOCK:-$REPO/vm/disks/run/qmp.sock}"
 Q="$REPO/scripts/qmp/qmp.py"
 SHOT="$REPO/scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh"
 VISUAL_GATE="$REPO/scripts/maps-probe/maps-visual-gate.sh"
+# Every frame this probe captures is read by the gate, not by a human, and the
+# gate's label test is an OCR of type whose on-screen size is set by the guest's
+# zoom rather than by anything here. The capture helper's default 720p cap
+# exists to bound the token cost of an agent reading a screenshot; applied to a
+# machine reader it destroys the label layer before the gate can judge it. A
+# 1920x1080 scanout downscaled to 1280x719 leaves Maps' road and place labels as
+# text-shaped blobs that OCR returns as garbage -- a correctly rendered New York
+# scored one label word against a threshold of four and failed a run whose
+# geography was complete and whose fill fraction passed with room to spare.
+# Sampling the instrument at the resolution the thing being measured exists at
+# is the fix; nothing about the contract the gate enforces changes.
+export REIMS_SHOT_NATIVE=1
 FAILLOG=/tmp/reims-vgpu-fail.log
 mkdir -p "$OUT"
 
