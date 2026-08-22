@@ -980,13 +980,28 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     }
 
     let submission_identity = state.submissions.next_identity(TaskId::new(task_id));
+    let segments_started = std::time::Instant::now();
     let submission_segments = semantic_submission_segments(&streams);
+    let segments_ns = segments_started.elapsed().as_nanos() as u64;
+    measured_ns += segments_ns;
+    crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Segments, segments_ns);
 
+    let open_started = std::time::Instant::now();
+    let descs = resource_descs.len() as u64;
     // Validity commands are ordered at the head of this submission. They run
     // under its identity before expected content is snapshotted, because a
     // guest-write declaration creates the version the following commands must
-    // expect.
+    // expect. That ordering is why this is a separate pass from the resolve
+    // below and not one fused loop over `resource_descs`.
+    let table_started = std::time::Instant::now();
     consume_resource_table(state, task_id, &resource_descs);
+    crate::runtime::drain::note_open_part(
+        crate::runtime::drain::OpenPart::Table,
+        table_started.elapsed().as_nanos() as u64,
+        descs,
+    );
+
+    let begin_started = std::time::Instant::now();
 
     let resolved = state.task_objects.resources.begin_submission(
         task_id,
@@ -995,6 +1010,13 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
             .iter()
             .map(|desc| ObjectTableRef::<ResourceObject>::new(desc.object_id)),
     );
+    crate::runtime::drain::note_open_part(
+        crate::runtime::drain::OpenPart::Begin,
+        begin_started.elapsed().as_nanos() as u64,
+        descs,
+    );
+
+    let use_started = std::time::Instant::now();
     let submission_resources: std::sync::Arc<[SubmissionResourceUse]> = resource_descs
         .iter()
         .zip(resolved)
@@ -1018,6 +1040,14 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         submission_resources,
         submission_segments,
     );
+    crate::runtime::drain::note_open_part(
+        crate::runtime::drain::OpenPart::Use,
+        use_started.elapsed().as_nanos() as u64,
+        descs,
+    );
+    let open_ns = open_started.elapsed().as_nanos() as u64;
+    measured_ns += open_ns;
+    crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Open, open_ns);
 
     let mut open_encoder = None;
     for (stream_index, stream) in (0u32..).zip(streams) {
@@ -1047,12 +1077,16 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         .field("task", task_id)
         .fail();
     }
+    let close_started = std::time::Instant::now();
     if let Some(context) = state.submissions.finish() {
         state.task_objects.resources.complete_submission(
             context.identity.id,
             context.resources.iter().filter_map(|use_| use_.resource),
         );
     }
+    let close_ns = close_started.elapsed().as_nanos() as u64;
+    measured_ns += close_ns;
+    crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Close, close_ns);
     note_exec_header(exec_started, measured_ns);
     out.total_us = elapsed_us(exec_started);
     out
@@ -1062,7 +1096,7 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
 /// return points.
 ///
 /// [`ExecPhase::Header`] is the **leftover**, not a span: it is the function's
-/// own elapsed time minus the four that measured themselves, so the five sum to
+/// own elapsed time minus the ones that measured themselves, so they all sum to
 /// the opcode's `op0x37_us` whatever path the call took. Deriving it rather than
 /// wrapping the header parse is what makes the tiling closed — a cost in a
 /// corner nobody thought to list still lands here instead of vanishing, which is

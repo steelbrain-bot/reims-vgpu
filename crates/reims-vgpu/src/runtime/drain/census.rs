@@ -765,7 +765,7 @@ impl ReadbackPhase {
 /// inside the per-draw loop. **The remaining ~197 ms/s is the whole of the drain
 /// residue that is left**, and no span reaches it.
 ///
-/// These five tile the function rather than nominate a part of it, which is the
+/// These tile the function rather than nominate a part of it, which is the
 /// method that worked on the child-FIFO loop after nominating one twice did not.
 /// [`Self::Header`] is deliberately the leftover: it is timed as the function's
 /// total minus the other four, so a cost in a corner nobody listed still lands
@@ -816,10 +816,38 @@ pub enum ExecPhase {
     /// loop. **Contains `draw_us`**, which names itself, so `Finish` minus
     /// `draw_us` is the per-draw setup and result handling around the encode.
     Finish,
+    /// `semantic_submission_segments`: a second pass over every loaded stream,
+    /// before the walk that decodes them, to cut the submission into segments.
+    ///
+    /// Carved out of [`Self::Header`] because it is a whole extra traversal of
+    /// the same bytes [`Self::Walk`] then traverses, and an aggregate that
+    /// merely says "the leftover is large" cannot say whether the cost is a
+    /// traversal or the bookkeeping beside it. Those want opposite repairs.
+    Segments,
+    /// Opening the submission: `consume_resource_table`, `begin_submission`,
+    /// materializing one `SubmissionResourceUse` per resource descriptor, and
+    /// `submissions.begin`.
+    ///
+    /// Scales with the resource table's length rather than with the stream's,
+    /// which is why it is separated from [`Self::Segments`] beside it — one is
+    /// paid per byte of command stream and the other per resource the guest
+    /// named, and a boot cannot tell them apart while they share a field.
+    Open,
+    /// Closing it: `submissions.finish` and `complete_submission`.
+    Close,
     /// Everything else the function does — header and payload validation, the
-    /// resource-table decode, `consume_resource_table`, and any path that
-    /// returns early. Derived rather than measured directly, so the five sum to
-    /// the function's own total by construction.
+    /// resource-table decode, and any path that returns early. Derived rather
+    /// than measured directly, so the phases sum to the function's own total by
+    /// construction.
+    ///
+    /// **A large reading here is a finding about this census, not about the
+    /// device**: it means real cost is sitting in a corner no span names, and
+    /// the response is to tile that corner rather than to reason about what
+    /// might be in it. That has now happened twice — the first time this was
+    /// documented at 6.7 ms/s with the note that "Header being small is the
+    /// reassuring reading", and a later driven Maps boot read it at 176 ms/s,
+    /// second only to the encode. [`Self::Segments`], [`Self::Open`] and
+    /// [`Self::Close`] are what that reading was carved into.
     Header,
 }
 
@@ -827,13 +855,16 @@ impl ExecPhase {
     /// How many phases there are. The census arrays are sized from this, so a
     /// new variant that forgets to bump it fails to build [`Self::ALL`] rather
     /// than overflowing an array at report time.
-    pub(crate) const COUNT: usize = 5;
+    pub(crate) const COUNT: usize = 8;
 
     const ALL: [ExecPhase; Self::COUNT] = [
         ExecPhase::Load,
         ExecPhase::Preflight,
         ExecPhase::Walk,
         ExecPhase::Finish,
+        ExecPhase::Segments,
+        ExecPhase::Open,
+        ExecPhase::Close,
         ExecPhase::Header,
     ];
 
@@ -843,7 +874,10 @@ impl ExecPhase {
             ExecPhase::Preflight => 1,
             ExecPhase::Walk => 2,
             ExecPhase::Finish => 3,
-            ExecPhase::Header => 4,
+            ExecPhase::Segments => 4,
+            ExecPhase::Open => 5,
+            ExecPhase::Close => 6,
+            ExecPhase::Header => 7,
         }
     }
 
@@ -853,6 +887,9 @@ impl ExecPhase {
             ExecPhase::Preflight => "preflight",
             ExecPhase::Walk => "walk",
             ExecPhase::Finish => "finish",
+            ExecPhase::Segments => "segments",
+            ExecPhase::Open => "open",
+            ExecPhase::Close => "close",
             ExecPhase::Header => "header",
         }
     }
@@ -944,6 +981,69 @@ impl PreflightPart {
             PreflightPart::Refs => "refs",
             PreflightPart::Air => "air",
             PreflightPart::Cache => "cache",
+        }
+    }
+}
+
+/// Which part of opening a submission a span was spent in.
+///
+/// [`ExecPhase::Open`] is **147 ms/s of a drain worker at 0.95 duty** on driven
+/// fullscreen Maps — 260 us of CPU to open one submission, and the second
+/// largest cost in this device after the draw encode. Three unlike things
+/// happen in there over the same descriptor slice, and the aggregate cannot say
+/// which one costs.
+///
+/// It has already misdirected one repair. `begin_submission` took four
+/// `BTreeMap` descents per descriptor where two would do, which is real
+/// duplicated work and looked like the answer; collapsing it to two moved
+/// `open_us` by nothing measurable (4.158/4.225 against 4.182 us a draw). So
+/// the map descents are not where the time is, and the next guess would have
+/// been another guess. These three tile it instead.
+///
+/// `descs` is here because the per-packet figure alone cannot be reasoned
+/// about: 260 us is a hundred entries at 2.6 us each or ten thousand at 26 ns,
+/// and those are opposite problems. The count is the denominator every other
+/// field in this line needs.
+///
+/// The two passes are **not** redundant and must not be merged. Every validity
+/// record has to be applied before any expected content is snapshotted, because
+/// a guest-write declaration creates the version the following commands expect
+/// — one fused loop would snapshot descriptor `i` before descriptor `j`'s
+/// declaration had landed.
+#[derive(Clone, Copy)]
+pub enum OpenPart {
+    /// `consume_resource_table`: the guest's own statement of who owns each
+    /// resource's authoritative bytes, applied one descriptor at a time.
+    Table,
+    /// `begin_submission`: resolving each descriptor and entering the resource
+    /// it names into this submission.
+    Begin,
+    /// Materializing one `SubmissionResourceUse` per descriptor and handing the
+    /// slice to `submissions.begin`.
+    Use,
+}
+
+impl OpenPart {
+    /// How many parts there are. The census arrays are sized from this, so a new
+    /// variant that forgets to bump it fails to build [`Self::ALL`] rather than
+    /// overflowing an array at report time.
+    pub(crate) const COUNT: usize = 3;
+
+    const ALL: [OpenPart; Self::COUNT] = [OpenPart::Table, OpenPart::Begin, OpenPart::Use];
+
+    const fn index(self) -> usize {
+        match self {
+            OpenPart::Table => 0,
+            OpenPart::Begin => 1,
+            OpenPart::Use => 2,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            OpenPart::Table => "table",
+            OpenPart::Begin => "begin",
+            OpenPart::Use => "use",
         }
     }
 }
@@ -1722,6 +1822,9 @@ pub(crate) struct DrainDutyCensus {
     /// [`PreflightPart::index`]. Sums to `preflight_us` on the `exec_phase`
     /// line. `pre_pipes` is the distinct pipeline refs the scan resolved, which
     /// is the denominator every per-pipeline figure needs.
+    open_ns: [std::sync::atomic::AtomicU64; OpenPart::COUNT],
+    open_count: [std::sync::atomic::AtomicU64; OpenPart::COUNT],
+    open_descs: std::sync::atomic::AtomicU64,
     pre_ns: [std::sync::atomic::AtomicU64; PreflightPart::COUNT],
     pre_count: [std::sync::atomic::AtomicU64; PreflightPart::COUNT],
     pre_pipes: std::sync::atomic::AtomicU64,
@@ -2024,6 +2127,38 @@ impl DrainDutyCensus {
     }
 
     /// One span inside the translation preflight, in nanoseconds.
+    /// One span inside opening a submission, in nanoseconds, plus how many
+    /// resource descriptors that submission carried.
+    pub(crate) fn note_open(&self, part: OpenPart, ns: u64, descs: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let i = part.index();
+        self.open_ns[i].fetch_add(ns, Relaxed);
+        self.open_count[i].fetch_add(1, Relaxed);
+        if matches!(part, OpenPart::Table) {
+            self.open_descs.fetch_add(descs, Relaxed);
+        }
+    }
+
+    /// The inside of [`ExecPhase::Open`] over the window just reported, or
+    /// `None` when no submission opened in it. The `_us` fields sum to
+    /// `exec_phase`'s `open_us`, so the identity is checkable on the line.
+    pub(crate) fn take_open_parts(&self) -> Option<String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let win_ms = self.last_win_ms.load(Relaxed);
+        let mut body = String::new();
+        let mut any = false;
+        for part in OpenPart::ALL {
+            let i = part.index();
+            let us = self.open_ns[i].swap(0, Relaxed) / 1000;
+            let n = self.open_count[i].swap(0, Relaxed);
+            any |= n != 0;
+            let label = part.label();
+            body.push_str(&format!(" {label}_us={us} {label}_n={n}"));
+        }
+        let descs = self.open_descs.swap(0, Relaxed);
+        any.then(|| format!("open_split win_ms={win_ms} descs={descs}{body}"))
+    }
+
     pub(crate) fn note_preflight(&self, part: PreflightPart, ns: u64) {
         use std::sync::atomic::Ordering::Relaxed;
         let i = part.index();
@@ -2071,7 +2206,7 @@ impl DrainDutyCensus {
     /// The inside of `CHILD_OP_EXEC_INDIRECT2` over the window [`Self::note`]
     /// just reported, or `None` when no exec packet ran in it.
     ///
-    /// Read against `drain_ops`: these five sum to its `op0x37_us`. `finish_us`
+    /// Read against `drain_ops`: these sum to its `op0x37_us`. `finish_us`
     /// contains `drain_duty`'s `draw_us`, so `finish_us - draw_us` is the
     /// per-draw setup and result handling that sits around the encode and is
     /// named by nothing else.
@@ -2762,6 +2897,14 @@ pub fn note_finish_phase(phase: FinishPhase, ns: u64, entries: u64) {
     DRAIN_DUTY.note_finish(phase, ns, entries);
 }
 
+/// Attribute one span inside opening a submission, in nanoseconds.
+///
+/// `descs` is the submission's resource-descriptor count and is banked once,
+/// from [`OpenPart::Table`], so the three parts do not triple it.
+pub fn note_open_part(part: OpenPart, ns: u64, descs: u64) {
+    DRAIN_DUTY.note_open(part, ns, descs);
+}
+
 /// Attribute one span inside the translation preflight, in nanoseconds.
 pub fn note_preflight_part(part: PreflightPart, ns: u64) {
     DRAIN_DUTY.note_preflight(part, ns);
@@ -2807,6 +2950,9 @@ pub fn note_drain_tranche(
             crate::observe::off(exec);
         }
         // Under `exec_phase`, dividing its `preflight_us`.
+        if let Some(open) = DRAIN_DUTY.take_open_parts() {
+            crate::observe::off(open);
+        }
         if let Some(pre) = DRAIN_DUTY.take_preflight_parts() {
             crate::observe::off(pre);
         }
