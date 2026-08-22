@@ -324,24 +324,51 @@ The former Vulkan pipeline caches and host-copy caches are the worked examples: 
 unbounded and keyed by contract-owned content or guest lifetimes. Their owning module docs carry
 the reasoning; read one before adding a bound anywhere.
 
-### Do Not Answer A Slow Path With A Memo
+### A Cache Is Admissible Only If It Cannot Miss On Something Live
 
-**Removing the bound does not make a cache honest, and this section used to imply that it did.** An
-unbounded memo keyed by a contract-owned lifetime is still a cache, and it still makes throughput a
-function of *hit rate* — which is a property of the workload, not of this device. That is the same
-unpredictability the section above objects to, arriving through a different door, and the door is
-wider: a capacity bound at least has a number you could print, while a hit rate has nothing at all.
+**This section used to ban every cache outright, and that was too strict — it contradicted the
+section above it.** `## A Bounded Cache Is Fake Performance` says a cache keyed by a contract-owned
+lifetime "is not bounded by a number — it is bounded by the guest's own lifetimes, which is the
+correct bound and the only one that is always right." This section then said not to write one. Both
+could not be true, and the ban is the half that was wrong.
 
-Two boots of one binary can then differ by more than any change ever measured here, with nothing in
-the census saying which one happened. Every ranking rule in `## Verification` assumes the two arms
-did the same work. An arm whose memo ran cold did not, and the number that comes out looks like a
-result.
+The objection that produced the ban is still the right objection, but it is narrower than it was
+stated. It was: a memo makes throughput a function of *hit rate*, hit rate is a property of the
+workload rather than of this device, and two boots of one binary can then differ by more than any
+change ever measured here with nothing in the census saying which one happened. Every ranking rule
+in `## Verification` assumes the two arms did the same work, and an arm whose memo ran cold did not.
 
-So: **do not add a cache, a memo, a `HashMap` of prior answers, a "remember what we computed last
-time" field, or a fast path that exists because the general path is slow.** Not bounded, not
-unbounded, not keyed by a generation, not invalidated on every edit. If you are reaching for one,
-the honest sentence is "this work should not need doing", and that sentence is a question about the
-contract:
+That argument depends entirely on the memo being able to **miss on something that is still live**.
+A cache that never evicts a valid entry cannot: ask it twice about a thing the guest has not
+changed and the second ask hits, with certainty, on every host and every rail. The hit rate stops
+being a free variable and becomes a statement about how often the guest reuses its own live
+objects — which is the workload we are paid to make fast, not noise contaminating the measurement.
+And the miss path is the general path unchanged, so the floor is "no worse than today".
+
+So a cache is admissible when **all five** of these hold. They are conditions, not preferences; a
+cache that meets four of them is one of the caches this section still bans.
+
+1. **Keyed by a contract-owned identity.** A generational `ResourceId`, a mapping, a pipeline, a
+   content version the contract itself moves. Not an address, not an argument hash, not a name
+   string, not an ordinal you assigned.
+2. **No valid entry is ever dropped.** No capacity, no LRU, no TTL, no sampling stride, no
+   "clear it under pressure". If the guest holds a million live objects then a million entries is
+   what correctness costs, and that memory is a real reading about a real workload.
+3. **Entries die with the thing they describe, through the contract's own lifetime event.** The
+   guest drops the resource, the entry goes; the contract moves the version, the entry is
+   superseded. If finding stale entries needs a sweep, a scan, or an invalidation pass you wrote,
+   the key is wrong — fix the key, do not add the pass.
+4. **A hit and a miss are indistinguishable to the guest.** The value is a pure function of
+   contract-owned inputs. If a stale entry could change a pixel, this is a correctness bug wearing
+   a performance hat, and note which way that fails: the failure mode is *content*, which no counter
+   in this tree reports. `runtime/gather_witness.rs` is the standing example of how expensive that
+   class is to find after the fact.
+5. **It is on the census.** Live entries, hits, and misses. Without those three a degenerate hit
+   rate is invisible, and the "arms did the same work" assumption goes back to being unverifiable.
+
+**A cache is still the last answer, not the first**, and the three questions below are still the
+work. Reach for one only after all three have been answered and the recomputation is genuinely
+required and genuinely repeated over a live, unchanged thing:
 
 - **What does the guest tell us changed between these two draws?** If it hands us a delta and we
   re-resolve the world, the fix is to consume the delta. If it does not, that is a contract fact
@@ -349,21 +376,24 @@ contract:
 - **Why is the answer being recomputed at all?** State that genuinely cannot change between two
   asks does not need remembering — it needs *owning*, by the type whose lifetime it shares, computed
   once at the point the contract says it becomes true. That is not a cache; it is where the value
-  lives. The test is whether a reader could ask "when is this stale?" and get an answer from the
-  type's lifetime alone, with no invalidation logic anywhere.
+  lives, it needs no invalidation logic at all, and it is strictly better than a cache that meets
+  every condition above. Prefer it whenever it is reachable.
 - **Is the general path slow because it is doing work the contract does not ask for?** That is the
   usual answer, and it is the only one that makes the device faster on *every* workload rather than
   on the ones that hit.
 
-A memo's measurement is still worth having as a **diagnosis** — it prices the work it skipped, which
-tells you what removing that work is worth. Take the number, revert the memo, then go and remove the
-work. `vulkan: let the write ledger remember what it already answered` is the worked example: it
-measured −79.8 % on the phase and −10.6 % CPU, disjoint at n=3 an arm, and was reverted the same day
-for exactly this reason. Its numbers are the reason we know the visibility walk is worth ~2.2 µs a
-draw; they are not a reason to keep the memo.
+What stays banned, unchanged: a bound that evicts a valid entry; a memo whose key is not a
+contract-owned lifetime; a "remember what we computed last time" field whose staleness question has
+no answer from the type's lifetime alone; and a fast path bolted beside a general path, which is a
+seam under `## It Fits Or It Does Not Belong` whether or not it caches anything.
 
-This rule outranks a measured win. A change that makes the device faster on the boots you ran and
-unpredictable everywhere else is not a performance fix.
+**Score it on the whole drain, never on its own phase.** A cache reports its own win honestly and
+hides what it cost everywhere else. `vulkan: let the write ledger remember what it already answered`
+measured −79.8 % on its phase and −10.6 % CPU, disjoint at n=3 an arm; the `BTreeMap` page-counts
+arm measured −82 % on the rebuild it targeted and **+1.33 µs/draw on the drain**, also disjoint, and
+was reverted for it. A phase number is a diagnosis — it prices the work that was skipped. Only
+`drain_duty proc_us` per draw at n≥3, within one boot population, decides whether the change is a
+win.
 
 ### No Magic Numbers
 
