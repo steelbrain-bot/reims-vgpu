@@ -3055,6 +3055,13 @@ pub fn note_drain_tranche(
         if let Some(routes) = take_store_routes() {
             crate::observe::off(routes);
         }
+        // What canonical page-set construction costs on the draw path. Joined
+        // by `t=` like the rest, so `builds` divides by this window's draws.
+        if let Some(sets) =
+            reims_vgpu_memory::page_set_census::take(crate::observe::elapsed_ms() as u64)
+        {
+            crate::observe::off(sets);
+        }
         // Beside `store_routes` deliberately: the two are read against each
         // other. `surface_backing_fail` lines equal `surface_backing_recovered +
         // surface_backing_superseded` from that line plus this one's `n`, and a

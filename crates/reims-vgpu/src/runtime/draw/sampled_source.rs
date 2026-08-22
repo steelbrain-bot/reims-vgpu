@@ -3102,6 +3102,40 @@ fn packed_buffer_content(
 ///
 /// Answer a retained zero-copy resolution without touching the object table or
 /// walking the task page table.
+///
+/// # The packed rail answers first, and it re-derives what the registry holds
+///
+/// The two rungs are not equivalent. [`bound_buffer_content`] hands back a
+/// `BoundBuffer`'s prebuilt fields — including its `physical_pages`, already
+/// canonicalised — as a few `Arc` clones. [`packed_buffer_content`] derives
+/// the window from the retained packed allocation on every call, and that
+/// derivation ends in `GuestPageSet::new`, which copies, sorts, deduplicates
+/// and hashes the window's guest-physical page list and then copies it again
+/// into an `Arc<[u64]>`.
+///
+/// Because the packed rung is tried first and succeeds, the registry rung
+/// never runs on this workload. One driven fullscreen Maps boot,
+/// rail=macos-13, x86/Vulkan, banded:
+///
+/// ```text
+/// zc_buffer_held_packed   14 456 050      6.36 a draw
+/// zc_buffer_held                   0
+/// ```
+///
+/// and the whole device built canonical page sets **6.65 times a draw over
+/// 20.4 pages a build**, peaking at 2 136 pages — a whole 1920x1080 target.
+/// Against a same-boot `proc_us` of 23.35 that measured 1.004 µs a draw with
+/// the measuring pair included, so on the order of 3 % of the drain worker's
+/// per-draw budget is spent re-deriving page identity that did not change.
+///
+/// This is recorded rather than repaired because 3 % is not the shape of this
+/// rail's gap — see `crate::runtime::exec`'s `encoder_class_state` for the
+/// larger sibling of the same observation. When it is repaired, the mechanism
+/// is already here and is not a new cache: `BoundBuffers::insert` retains a
+/// window under exactly the `(task, reference, offset, cap)` key this function
+/// looks up, in an unbounded registry whose entries are retired by the guest's
+/// own address-span lifetime events. The packed rung retaining its derived
+/// window is what would make `zc_buffer_held` non-zero.
 fn held_buffer_content(
     state: &mut Device,
     task_id: u32,

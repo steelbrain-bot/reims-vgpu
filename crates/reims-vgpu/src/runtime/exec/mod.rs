@@ -4392,13 +4392,36 @@ fn finish_stream<M: HostMemory + HostOps>(
                     crate::runtime::drain::note_store_route("dirty_state_scissor_moved");
                 }
             }
+            // The same question per bind class. A draw that rebinds one vertex
+            // buffer leaves its textures exactly where they were, and Metal's
+            // encoder re-emits only the class the guest touched — so the
+            // all-or-nothing reading above is a floor on what a dirty-flag
+            // model reaches, not its size.
+            if let Some(prev) = previous {
+                for (route, same) in encoder_class_state(prev, pd) {
+                    if same {
+                        crate::runtime::drain::note_store_route(route);
+                    }
+                }
+            }
             previous = Some(pd);
+            let barrier_cursor_before = render_barrier_cursor;
             flush_render_barriers_at(
                 state,
                 &expanded.barriers_after_draw,
                 &mut render_barrier_cursor,
                 di,
             );
+            // A barrier seals the command buffer, so it is a reset point for
+            // any dirty-flag skip: the per-command-buffer staging memo goes
+            // with the seal, and "one command buffer reads guest RAM at one
+            // instant" stops covering the pair. Counted so the fractions above
+            // are not read as reachable in full — they are measured across
+            // seals and this says how often one intervenes.
+            if render_barrier_cursor != barrier_cursor_before {
+                crate::runtime::drain::note_store_route("dirty_state_barrier_seal");
+                previous = None;
+            }
             fin.enter(crate::runtime::drain::FinishPhase::Retarget);
             let mut req = if di == 0 {
                 let Some(req) = first_req.take() else {
@@ -5029,6 +5052,10 @@ fn multi_draw_chain_source(resident_chain: bool, cpu_chain_ready: bool) -> Multi
 /// no intervening `set*` reads identical state, and a driver re-emits nothing
 /// for it.
 ///
+/// Derived from [`encoder_class_state`] so the two cannot drift: "the encoder
+/// state is unchanged" is exactly "every class is unchanged", and adding a
+/// class there adds it here with nothing to keep in sync.
+///
 /// It is answered here by **pointer identity and nothing else**.
 /// [`draw::BindTable`] is `Arc<Vec<_>>` and the decode accumulator clones the
 /// handle rather than the vector, so two records whose tables are the same
@@ -5042,14 +5069,57 @@ fn multi_draw_chain_source(resident_chain: bool, cpu_chain_ready: bool) -> Multi
 /// makes it safe to ignore here is already recorded against
 /// `BATCH_MAX_DRAWS`: a command buffer executes as one unit, so two draws in
 /// one have always read guest RAM at the same instant.
+/// Per-class dirty flags between two consecutive draws, as
+/// `(census route, unchanged)`.
+///
+/// [`encoder_state_unchanged`] answers the same question for all classes at
+/// once, which is the fraction of draws that could be skipped **whole**. This
+/// is the fraction each class could be skipped *individually*, which is the
+/// number a per-class dirty-flag model — the one a `MTLRenderCommandEncoder`
+/// actually implements — would convert. It is necessarily the larger of the
+/// two, and the gap between them is the reason to measure both: a workload
+/// that rebinds one vertex buffer every draw reads 0 % whole and can still be
+/// 80 % skippable per class.
+///
+/// Identity is decided exactly as it is there, by allocation and not by
+/// content, for exactly the reason given there.
+fn encoder_class_state(previous: &PendingDraw, next: &PendingDraw) -> [(&'static str, bool); 7] {
+    [
+        (
+            "dirty_class_pipeline",
+            previous.pipeline_ref == next.pipeline_ref,
+        ),
+        (
+            "dirty_class_vertex_buffers",
+            std::sync::Arc::ptr_eq(&previous.vertex_buffers, &next.vertex_buffers),
+        ),
+        (
+            "dirty_class_fragment_buffers",
+            std::sync::Arc::ptr_eq(&previous.fragment_buffers, &next.fragment_buffers),
+        ),
+        (
+            "dirty_class_vertex_textures",
+            std::sync::Arc::ptr_eq(&previous.vertex_textures, &next.vertex_textures),
+        ),
+        (
+            "dirty_class_fragment_textures",
+            std::sync::Arc::ptr_eq(&previous.fragment_textures, &next.fragment_textures),
+        ),
+        (
+            "dirty_class_vertex_samplers",
+            std::sync::Arc::ptr_eq(&previous.vertex_samplers, &next.vertex_samplers),
+        ),
+        (
+            "dirty_class_fragment_samplers",
+            std::sync::Arc::ptr_eq(&previous.fragment_samplers, &next.fragment_samplers),
+        ),
+    ]
+}
+
 fn encoder_state_unchanged(previous: &PendingDraw, next: &PendingDraw) -> bool {
-    previous.pipeline_ref == next.pipeline_ref
-        && std::sync::Arc::ptr_eq(&previous.vertex_buffers, &next.vertex_buffers)
-        && std::sync::Arc::ptr_eq(&previous.fragment_buffers, &next.fragment_buffers)
-        && std::sync::Arc::ptr_eq(&previous.vertex_textures, &next.vertex_textures)
-        && std::sync::Arc::ptr_eq(&previous.fragment_textures, &next.fragment_textures)
-        && std::sync::Arc::ptr_eq(&previous.vertex_samplers, &next.vertex_samplers)
-        && std::sync::Arc::ptr_eq(&previous.fragment_samplers, &next.fragment_samplers)
+    encoder_class_state(previous, next)
+        .into_iter()
+        .all(|(_, same)| same)
 }
 
 fn fill_draw_binds_from_pending(req: &mut draw::DrawEncodeRequest, pd: &PendingDraw) {

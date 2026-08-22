@@ -1040,20 +1040,74 @@ impl std::hash::Hash for GuestPageSet {
 /// the same canonical physical identity when deciding whether aliases overlap.
 pub type GuestWritePages = GuestPageSet;
 
+/// What building canonical page sets costs, over one census window.
+///
+/// [`GuestPageSet::new`] copies, sorts, deduplicates and hashes its input and
+/// then copies again into an `Arc<[u64]>`. That is cheap for a handful of
+/// pages and is not cheap at the sizes this device asks for: a 1920x1080
+/// target is 2 025 pages, and a sampled texture is hundreds. It sits on the
+/// draw path at both the buffer-bind and sampled-image sites, so a boot cannot
+/// tell how much of `binds_us` and `sampled_us` is this from the phase columns
+/// alone.
+///
+/// Counts and pages only. It reported nanoseconds once, from an
+/// `Instant::now()` pair per call, and that pair cost about a fifth of what it
+/// measured — so the timing is gone and the cost is read off the size instead.
+/// Measured on the x86 host, one build of n pages, release:
+///
+/// ```text
+///    4 pages     31 ns        64 pages     275 ns
+///    8 pages     40 ns      2025 pages  11 090 ns   (a 1920x1080 target)
+///   16 pages     62 ns
+///   32 pages    132 ns
+/// ```
+///
+/// So `builds` x the cost at `pages / builds` is the per-draw charge, and a
+/// rising `max_pages` is the thing to watch: the curve is superlinear and one
+/// whole-target set costs more than three hundred small ones.
+pub mod page_set_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub(super) static BUILDS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static PAGES: AtomicU64 = AtomicU64::new(0);
+    pub(super) static MAX_PAGES: AtomicU64 = AtomicU64::new(0);
+
+    /// One window's totals, taken and reset. `None` when nothing built.
+    pub fn take(t_ms: u64) -> Option<String> {
+        let builds = BUILDS.swap(0, Ordering::Relaxed);
+        if builds == 0 {
+            return None;
+        }
+        let pages = PAGES.swap(0, Ordering::Relaxed);
+        let max = MAX_PAGES.swap(0, Ordering::Relaxed);
+        Some(format!(
+            "page_set_build t={t_ms} builds={builds} pages={pages} max_pages={max}"
+        ))
+    }
+}
+
 impl GuestPageSet {
     pub fn new(pages: &[u64]) -> Option<Self> {
         if pages.is_empty() {
             return None;
         }
+        let counted = pages.len() as u64;
         let mut pages = pages.to_vec();
         pages.sort_unstable();
         pages.dedup();
         let mut fingerprint = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(&pages, &mut fingerprint);
-        Some(Self {
+        let built = Self {
             pages: pages.into(),
             fingerprint: std::hash::Hasher::finish(&fingerprint),
-        })
+        };
+        {
+            use std::sync::atomic::Ordering;
+            page_set_census::BUILDS.fetch_add(1, Ordering::Relaxed);
+            page_set_census::PAGES.fetch_add(counted, Ordering::Relaxed);
+            page_set_census::MAX_PAGES.fetch_max(counted, Ordering::Relaxed);
+        }
+        Some(built)
     }
 
     pub fn pages(&self) -> &[u64] {
@@ -3268,5 +3322,48 @@ mod page_set_overlap {
         assert!(!straddling.overlaps(&inside));
         assert!(!inside.overlaps(&straddling));
         assert!(straddling.overlaps(&GuestPageSet::new(&[50, 100]).expect("non-empty")));
+    }
+}
+
+#[cfg(test)]
+mod page_set_census_tests {
+    use super::*;
+
+    /// The census counts constructions and the pages they were asked for, and
+    /// a take resets it.
+    ///
+    /// Worth a test because the count is the whole reading: the per-build cost
+    /// is read off a size curve in the module doc rather than measured at
+    /// runtime, so a `builds` that drifted from the real number of
+    /// constructions would misprice the class by exactly that factor and
+    /// nothing else in the tree would disagree. The empty input is here for
+    /// the same reason — it returns before the counter, so an empty page list
+    /// must not read as a build.
+    #[test]
+    fn the_census_counts_one_build_per_construction_and_resets_on_take() {
+        // Drain whatever other tests in this binary have built.
+        let _ = page_set_census::take(0);
+
+        assert!(GuestPageSet::new(&[]).is_none());
+        let line = page_set_census::take(1);
+        assert!(
+            line.is_none(),
+            "an empty page list returns before constructing, so it is not a build: {line:?}"
+        );
+
+        assert!(GuestPageSet::new(&[0x3000, 0x1000, 0x2000]).is_some());
+        assert!(GuestPageSet::new(&[0x9000]).is_some());
+        let line = page_set_census::take(7).expect("two builds must report");
+        assert!(line.contains("t=7"), "{line}");
+        assert!(line.contains("builds=2"), "{line}");
+        // Pages counted as asked for, before the dedup — the cost is paid on
+        // the input length, which is what the size curve is indexed by.
+        assert!(line.contains("pages=4"), "{line}");
+        assert!(line.contains("max_pages=3"), "{line}");
+
+        assert!(
+            page_set_census::take(8).is_none(),
+            "the take must have reset every counter"
+        );
     }
 }
