@@ -2969,6 +2969,19 @@ pub fn note_drain_tranche(
                 ));
             }
         }
+        // What the guest's own stream looks like: decoded render records
+        // against the draws among them. The stream is a delta and the draw path
+        // resolves the whole accumulated state per draw, so this ratio is the
+        // size of what a resolve-on-write design would stop redoing.
+        {
+            let (records, draws) = crate::runtime::exec::stream_shape_census::take();
+            if draws != 0 {
+                crate::observe::off(format!(
+                    "stream_shape records={records} draws={draws} records_per_draw={:.2}",
+                    records as f64 / draws as f64,
+                ));
+            }
+        }
         // The per-draw visibility merge's own totals, owned by the Vulkan crate
         // because the ledger is its. The reading that matters is
         // `skipped_per_ask` against `walked_per_ask`: the merge is linear in

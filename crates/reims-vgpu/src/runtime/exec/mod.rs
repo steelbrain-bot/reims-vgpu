@@ -2231,6 +2231,40 @@ fn handle_blit_record<M: HostMemory + HostOps>(
     });
 }
 
+/// How many decoded render records the guest sends per draw.
+///
+/// The wire stream is a delta: `setVertexBuffer:offset:atIndex:` writes one
+/// slot, `setRenderPipelineState:` writes one, and a draw record carries almost
+/// nothing. [`StreamAccum`] latches those writes, and the draw arm then resolves
+/// the whole accumulated state into a `DrawRequest` -- every slot, whether the
+/// guest touched it since the last draw or not.
+///
+/// `records_per_draw` is what says how much of that is redundant. A guest
+/// writing three slots between draws while the draw path resolves two dozen is
+/// the difference between what the contract asked for and what this device
+/// does; a guest re-writing every slot every draw would mean there is no
+/// redundancy to remove and the resolution has to stay where it is.
+///
+/// It is a count and not a timing, so it survives host contention.
+pub mod stream_shape_census {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    static RECORDS: AtomicU64 = AtomicU64::new(0);
+    static DRAWS: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn note(is_draw: bool) {
+        RECORDS.fetch_add(1, Relaxed);
+        if is_draw {
+            DRAWS.fetch_add(1, Relaxed);
+        }
+    }
+
+    /// Read and reset `(records, draws)`.
+    pub fn take() -> (u64, u64) {
+        (RECORDS.swap(0, Relaxed), DRAWS.swap(0, Relaxed))
+    }
+}
+
 fn handle_render_record<M: HostMemory + HostOps>(
     state: &mut Device,
     host: &M,
@@ -2257,6 +2291,10 @@ fn handle_render_record<M: HostMemory + HostOps>(
             return;
         }
     };
+    stream_shape_census::note(matches!(
+        cmd.kind,
+        RenderKind::Draw | RenderKind::DrawIndirect | RenderKind::DrawPatches
+    ));
     match cmd.kind {
         RenderKind::SetPipeline => {
             // Apply what the record decoded, ref 0 included. This used to be
