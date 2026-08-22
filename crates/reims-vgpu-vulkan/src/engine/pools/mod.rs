@@ -1004,11 +1004,35 @@ struct CmdSlot {
 /// every staleness counter of the day reading zero — those three counters have
 /// since been removed with the caches they measured, so do not go looking for
 /// them). It was submit/fence-bubble-bound,
-/// not GPU-compute-bound. Cost is 8 command buffers + fences + up to 8 slots'
-/// pooled staging live at once — bounded, pooled. `retire_wait` still ~17 µs, so
-/// a deeper ring or render-pass batching (only ~37 % of draws join a shared pass)
-/// may reclaim more.
-pub(crate) const RING_DEPTH: usize = 8;
+/// not GPU-compute-bound. Cost is one command buffer + fence + one slot's pooled
+/// staging per slot, live at once — bounded, pooled.
+///
+/// Depth 16 (2026-08-22): the deeper ring that doc predicted, measured on the
+/// workload that needed it. Driven fullscreen Maps on macos-13 x86/Vulkan is
+/// **drain-CPU bound, not GPU bound** — drain duty 0.97 against 38 % GPU
+/// occupancy — so the drain worker blocking on a fence is time the device
+/// cannot get back, and it was blocking while the GPU sat idle nearly two
+/// thirds of the time. Six interleaved boots, three an arm, quiesced host:
+///
+/// ```text
+///                       depth 8                depth 16
+/// slot_us per draw      2.644 2.678 2.766      1.692 1.695 1.817   -35.6 %
+/// drain us per draw    26.98 27.18 27.53      26.45 24.63 25.63     -6.1 %
+/// gpu occupancy        36.7 38.3 38.1 %       37.8 40.0 40.9 %
+/// ```
+///
+/// Both the bubble and the drain total are **disjoint** across the arms — the
+/// worst depth-16 boot beats the best depth-8 one on each — and GPU cost per
+/// draw did not move, which is the sign that says the ring was the constraint
+/// and not the work. Frames are *not* claimed: `present_hz` interleaved and
+/// draws-per-frame differed between boots by more than the effect.
+///
+/// **16 is the ceiling the types already allow**, not a round number: the two
+/// assertions below pin the ring to [`SlotMask`]'s width and to
+/// [`crate::gpu_hang_trail::SUBMIT_SLOTS`], and the latter is 16. Going deeper
+/// is a change to the hang trail first, and would want its own measurement —
+/// this arm says the bubble is real, not that it is exhausted.
+pub(crate) const RING_DEPTH: usize = 16;
 
 /// One bit per ring slot: the set of slots a deferred handle is still waiting
 /// on. Sized so the whole ring fits, which is what bounds the graveyard — a
