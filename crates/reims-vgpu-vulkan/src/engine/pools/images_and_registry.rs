@@ -259,8 +259,8 @@ impl ResourcePools {
         });
         if requires_copy.is_none() {
             match guest_sampled_resident_match(
-                &self.registry,
-                &self.guest_resident_authority,
+                &self.shared.registry,
+                &self.shared.guest_resident_authority,
                 memory,
                 sampled,
                 excludes,
@@ -317,6 +317,7 @@ impl ResourcePools {
         use super::super::linear_image_import::WindowRefusal;
 
         let (image, slot_access, levels, materialize) = self
+            .shared
             .registry
             .get(identity)
             .map(|slot| {
@@ -408,7 +409,7 @@ impl ResourcePools {
         // not own the mapping, so the only thing that can make those writes
         // visible to the device is the memory type carrying HOST_COHERENT.
         // Without it there is no flush anyone here could issue.
-        let allocation = unsafe { self.host_ram_imports.allocation(ctx, &memory.import) }
+        let allocation = unsafe { self.shared.host_ram_imports.allocation(ctx, &memory.import) }
             .map_err(WindowRefusal::ParentImport)?;
         if !ctx
             .mapped_memory_kind(allocation.memory_type_index)
@@ -422,7 +423,7 @@ impl ResourcePools {
         let imported = unsafe {
             super::super::linear_image_import::create_allocation(
                 ctx,
-                &mut self.host_ram_imports,
+                &mut self.shared.host_ram_imports,
                 &memory.import,
                 memory.backing,
                 &source.allocation,
@@ -520,7 +521,10 @@ impl ResourcePools {
     /// every level the image has. The slot is the authority because it is where
     /// the creating site recorded what it built.
     pub(crate) fn resident_mip_levels(&self, identity: &TargetIdentity) -> Option<u32> {
-        self.registry.get(identity).map(|slot| slot.mip_levels)
+        self.shared
+            .registry
+            .get(identity)
+            .map(|slot| slot.mip_levels)
     }
 
     /// Report that the copy [`GuestSampledUse::Resident`] handed back is in a
@@ -535,7 +539,7 @@ impl ResourcePools {
         identity: &TargetIdentity,
         access: ResidentAccess,
     ) {
-        if let Some(slot) = self.registry.get_mut(identity) {
+        if let Some(slot) = self.shared.registry.get_mut(identity) {
             slot.guest_materialization = None;
             slot.access = access;
         }
@@ -545,7 +549,8 @@ impl ResourcePools {
     /// binding it reads bytes another Vulkan alias — or the guest's own CPU —
     /// may have written.
     pub(crate) fn resident_reads_imported_guest(&self, identity: &TargetIdentity) -> bool {
-        self.registry
+        self.shared
+            .registry
             .get(identity)
             .is_some_and(|slot| slot.memory.guest_memory().is_some())
     }
@@ -592,7 +597,7 @@ impl ResourcePools {
         match unsafe {
             super::super::linear_image_import::create(
                 ctx,
-                &mut self.host_ram_imports,
+                &mut self.shared.host_ram_imports,
                 &target.import,
                 target.backing,
                 reims_vgpu_memory::GuestImageLayout::D2 { width, height },
@@ -621,9 +626,9 @@ impl ResourcePools {
         match memory {
             ResidentMemory::Recyclable(_) => self.free_image_slab(&ctx.device, image),
             ResidentMemory::GuestImported { memory, .. } => {
-                if let Some(parent) = self.host_ram_imports.release_child(&memory.import) {
+                if let Some(parent) = self.shared.host_ram_imports.release_child(&memory.import) {
                     let completed = parent.destroy(&ctx.device);
-                    self.completed_guest_imports.push(completed);
+                    self.shared.completed_guest_imports.push(completed);
                 }
             }
         }
@@ -635,8 +640,8 @@ impl ResourcePools {
         key: StorageImageKey,
         counters: &EngineCounters,
     ) -> Result<StorageImageSlot, DrawError> {
-        if let Some(slot) = self.storage_image_free.take(&key) {
-            self.storage_image_live.push(StorageImageSlot {
+        if let Some(slot) = self.shared.storage_image_free.take(&key) {
+            self.shared.storage_image_live.push(StorageImageSlot {
                 image: slot.image,
                 memory: slot.memory,
                 view: slot.view,
@@ -746,13 +751,13 @@ impl ResourcePools {
             view,
             key,
         };
-        self.storage_image_live.push(slot);
+        self.shared.storage_image_live.push(slot);
         Ok(slot)
     }
 
     pub(crate) fn recycle_storage_images(&mut self) {
-        for slot in self.storage_image_live.drain(..) {
-            self.storage_image_free.push_uncapped(slot.key, slot);
+        for slot in self.shared.storage_image_live.drain(..) {
+            self.shared.storage_image_free.push_uncapped(slot.key, slot);
         }
     }
 
@@ -777,6 +782,7 @@ impl ResourcePools {
             return Err(DrawError::ComputeExecution(decline));
         }
         if self
+            .shared
             .compute_storage_registry
             .get(&identity)
             .is_some_and(|resident| resident.slot.key != key)
@@ -792,8 +798,8 @@ impl ResourcePools {
                 );
             }
         }
-        let now = self.idle_clock_ms;
-        if let Some(resident) = self.compute_storage_registry.get_mut(&identity) {
+        let now = self.shared.idle_clock_ms;
+        if let Some(resident) = self.shared.compute_storage_registry.get_mut(&identity) {
             resident.last_touch_ms = now;
             return Ok(ResidentStorageImageUse {
                 slot: resident.slot,
@@ -826,7 +832,7 @@ impl ResourcePools {
             }
             Err(error) => return Err(error),
         };
-        let live = self.storage_image_live.pop().ok_or({
+        let live = self.shared.storage_image_live.pop().ok_or({
             DrawError::ComputeExecution(ComputeExecutionDecline::ResidentAllocatorLiveSlotMissing {
                 identity,
                 width: key.width,
@@ -835,7 +841,7 @@ impl ResourcePools {
             })
         })?;
         debug_assert_eq!(live.image, slot.image);
-        self.compute_storage_registry.insert(
+        self.shared.compute_storage_registry.insert(
             identity,
             ResidentStorageImageSlot {
                 slot,
@@ -847,7 +853,7 @@ impl ResourcePools {
                 last_touch_ms: now,
             },
         );
-        self.compute_storage_order.push_back(identity);
+        self.shared.compute_storage_order.push_back(identity);
         Ok(ResidentStorageImageUse {
             slot,
             access: ResidentAccess::Untouched,
@@ -867,6 +873,7 @@ impl ResourcePools {
         key: StorageImageKey,
     ) -> Option<ComputeExecutionDecline> {
         let held = self
+            .shared
             .compute_storage_registry
             .get(identity)
             .filter(|resident| resident.pinned && resident.slot.key != key)?;
@@ -911,10 +918,12 @@ impl ResourcePools {
     /// reclaim takes the whole set at once, because by the time it runs the
     /// question is whether the dispatch survives at all.
     pub(super) fn recoverable_compute_storage_residents(&self) -> Vec<ComputeStorageResidencyKey> {
-        self.compute_storage_order
+        self.shared
+            .compute_storage_order
             .iter()
             .filter(|identity| {
-                self.compute_storage_registry
+                self.shared
+                    .compute_storage_registry
                     .get(*identity)
                     .is_some_and(|resident| !resident.pinned && !resident.gpu_only_content)
             })
@@ -991,9 +1000,9 @@ impl ResourcePools {
             "vram_compute_storage_reclaim_retry residents={freed} recycled={trimmed} \
              held_bytes={} sole_copy={} live={} (an allocation was refused; gave \
              back everything that is neither pinned nor the only copy of its contents)",
-            self.slab.held_bytes().0,
-            self.compute_storage_sole_copy.count,
-            self.compute_storage_registry.len(),
+            self.shared.slab.held_bytes().0,
+            self.shared.compute_storage_sole_copy.count,
+            self.shared.compute_storage_registry.len(),
         ));
         freed + trimmed
     }
@@ -1013,12 +1022,14 @@ impl ResourcePools {
         &mut self,
         identity: &ComputeStorageResidencyKey,
     ) -> Option<ResidentStorageImageSlot> {
-        let old = self.compute_storage_registry.remove(identity);
-        self.compute_storage_order.retain(|entry| entry != identity);
+        let old = self.shared.compute_storage_registry.remove(identity);
+        self.shared
+            .compute_storage_order
+            .retain(|entry| entry != identity);
         let old = old?;
         if old.gpu_only_content {
             let bytes = Self::storage_slot_bytes(&old);
-            Self::fold_totals(&mut self.compute_storage_sole_copy, bytes, false);
+            Self::fold_totals(&mut self.shared.compute_storage_sole_copy, bytes, false);
         }
         Some(old)
     }
@@ -1027,9 +1038,9 @@ impl ResourcePools {
     /// band. Called at the top of the capacity walk — the one point every
     /// admission passes — for the reason [`Self::note_registry_reach`] is.
     fn note_compute_storage_reach(&mut self) {
-        self.compute_storage_sole_copy_peak = Self::high_water(
-            self.compute_storage_sole_copy_peak,
-            self.compute_storage_sole_copy,
+        self.shared.compute_storage_sole_copy_peak = Self::high_water(
+            self.shared.compute_storage_sole_copy_peak,
+            self.shared.compute_storage_sole_copy,
         );
     }
 
@@ -1042,8 +1053,8 @@ impl ResourcePools {
     /// again remains observable even when it is never dispatched into. No
     /// reclaim decision reads this timestamp.
     fn note_compute_resident_use(&mut self, identity: &ComputeStorageResidencyKey) {
-        let touch = self.idle_clock_ms;
-        if let Some(resident) = self.compute_storage_registry.get_mut(identity) {
+        let touch = self.shared.idle_clock_ms;
+        if let Some(resident) = self.shared.compute_storage_registry.get_mut(identity) {
             resident.last_touch_ms = touch;
         }
     }
@@ -1061,7 +1072,7 @@ impl ResourcePools {
         identity: &ComputeStorageResidencyKey,
         generation: u32,
     ) {
-        if let Some(resident) = self.compute_storage_registry.get_mut(identity) {
+        if let Some(resident) = self.shared.compute_storage_registry.get_mut(identity) {
             resident.generation = generation;
             resident.access = ResidentAccess::transfer_read();
         }
@@ -1075,7 +1086,7 @@ impl ResourcePools {
     /// totals in step. The single writer of that field on a live slot, for the
     /// reason [`Self::set_sole_copy`] is on the sibling registry.
     fn set_compute_sole_copy(&mut self, identity: &ComputeStorageResidencyKey, sole: bool) -> bool {
-        let Some(resident) = self.compute_storage_registry.get_mut(identity) else {
+        let Some(resident) = self.shared.compute_storage_registry.get_mut(identity) else {
             return false;
         };
         if resident.gpu_only_content == sole {
@@ -1083,14 +1094,14 @@ impl ResourcePools {
         }
         resident.gpu_only_content = sole;
         let bytes = Self::storage_slot_bytes(resident);
-        Self::fold_totals(&mut self.compute_storage_sole_copy, bytes, sole);
+        Self::fold_totals(&mut self.shared.compute_storage_sole_copy, bytes, sole);
         // Same reason as the sibling's: this population grows on
         // `mark_resident_storage_image` and the capacity walk that also folds it
         // runs on admission, so sampling only there lags by a dispatch.
         if sole {
-            self.compute_storage_sole_copy_peak = Self::high_water(
-                self.compute_storage_sole_copy_peak,
-                self.compute_storage_sole_copy,
+            self.shared.compute_storage_sole_copy_peak = Self::high_water(
+                self.shared.compute_storage_sole_copy_peak,
+                self.shared.compute_storage_sole_copy,
             );
         }
         true
@@ -1159,7 +1170,7 @@ impl ResourcePools {
         identity: &ComputeStorageResidencyKey,
         pinned: bool,
     ) -> bool {
-        if let Some(resident) = self.compute_storage_registry.get_mut(identity) {
+        if let Some(resident) = self.shared.compute_storage_registry.get_mut(identity) {
             resident.pinned = pinned;
             return true;
         }
@@ -1178,7 +1189,8 @@ impl ResourcePools {
         identity: &ComputeStorageResidencyKey,
     ) -> Option<u32> {
         self.note_compute_resident_use(identity);
-        self.compute_storage_registry
+        self.shared
+            .compute_storage_registry
             .get(identity)
             .map(|resident| resident.generation)
     }
@@ -1192,7 +1204,8 @@ impl ResourcePools {
         identity: &ComputeStorageResidencyKey,
     ) -> Option<(u32, StorageImageFormat)> {
         self.note_compute_resident_use(identity);
-        self.compute_storage_registry
+        self.shared
+            .compute_storage_registry
             .get(identity)
             .map(|resident| (resident.generation, resident.slot.key.format))
     }
@@ -1211,20 +1224,23 @@ impl ResourcePools {
         ResidentAccess,
     )> {
         self.note_compute_resident_use(identity);
-        self.compute_storage_registry.get(identity).map(|resident| {
-            (
-                resident.slot.image,
-                resident.slot.view,
-                resident.slot.key,
-                resident.generation,
-                resident.access,
-            )
-        })
+        self.shared
+            .compute_storage_registry
+            .get(identity)
+            .map(|resident| {
+                (
+                    resident.slot.image,
+                    resident.slot.view,
+                    resident.slot.key,
+                    resident.generation,
+                    resident.access,
+                )
+            })
     }
 
     /// Record the resting state of a resident that this dispatch only sampled.
     pub(crate) fn mark_compute_resident_sampled(&mut self, identity: &ComputeStorageResidencyKey) {
-        if let Some(resident) = self.compute_storage_registry.get_mut(identity) {
+        if let Some(resident) = self.shared.compute_storage_registry.get_mut(identity) {
             resident.access = ResidentAccess::ShaderRead(vk::ImageLayout::GENERAL);
         }
     }
@@ -1232,7 +1248,7 @@ impl ResourcePools {
     // --- Target registry (workstream D) ------------------------------------
 
     pub(crate) fn registry_get(&self, identity: &TargetIdentity) -> Option<&ResidentTargetSlot> {
-        self.registry.get(identity)
+        self.shared.registry.get(identity)
     }
 
     /// The generation the registry holds for the *same target* as `identity`,
@@ -1268,7 +1284,8 @@ impl ResourcePools {
             TargetKeyDivergence::Namespace => 3,
             TargetKeyDivergence::Absent => 4,
         };
-        self.registry
+        self.shared
+            .registry
             .keys()
             .map(|held| (identity.diverges_from(held), Some(held.generation())))
             // A key in another namespace is not about this object at all, so it
@@ -1323,7 +1340,7 @@ impl ResourcePools {
         swizzle: SwizzlePlan,
         counters: &EngineCounters,
     ) -> Result<Option<vk::ImageView>, vk::Result> {
-        let Some(slot) = self.registry.get(identity) else {
+        let Some(slot) = self.shared.registry.get(identity) else {
             return Ok(None);
         };
         let format = translate::pixel::sample_view_format(format, slot.format.declared());
@@ -1365,7 +1382,7 @@ impl ResourcePools {
         key: ResidentViewKey,
         counters: &EngineCounters,
     ) -> Result<Option<vk::ImageView>, vk::Result> {
-        let Some(slot) = self.registry.get_mut(identity) else {
+        let Some(slot) = self.shared.registry.get_mut(identity) else {
             return Ok(None);
         };
         if let Some(view) = slot.held_view(key) {
@@ -1410,12 +1427,12 @@ impl ResourcePools {
         identity: &TargetIdentity,
         why: ResidentReclaim,
     ) -> Option<ResidentTargetSlot> {
-        let old = self.registry.remove(identity);
-        self.registry_order.retain(|k| k != identity);
+        let old = self.shared.registry.remove(identity);
+        self.shared.registry_order.retain(|k| k != identity);
         let old = old?;
         if let Some(key) = guest_resident_backing_key(&old) {
-            if self.guest_resident_authority.get(&key) == Some(identity) {
-                self.guest_resident_authority.remove(&key);
+            if self.shared.guest_resident_authority.get(&key) == Some(identity) {
+                self.shared.guest_resident_authority.remove(&key);
             }
         }
         if old.pin_count == 0 {
@@ -1472,8 +1489,8 @@ impl ResourcePools {
     ///   the order is a resident no sweep can ever choose; one in the order but
     ///   not the map is a victim that frees nothing.
     fn register_resident(&mut self, identity: &TargetIdentity, new: NewResident) {
-        let last_touch_ms = self.idle_clock_ms;
-        self.registry.insert(
+        let last_touch_ms = self.shared.idle_clock_ms;
+        self.shared.registry.insert(
             identity.clone(),
             ResidentTargetSlot {
                 incarnation: super::ResidentIncarnation::allocate(),
@@ -1514,10 +1531,11 @@ impl ResourcePools {
                 last_touch_ms,
             },
         );
-        self.registry_order.push_back(identity.clone());
+        self.shared.registry_order.push_back(identity.clone());
         // Born unpinned (see the birth-state rule above), so it joins the
         // non-pinned totals unconditionally.
         let bytes = self
+            .shared
             .registry
             .get(identity)
             .map(Self::slot_attachment_bytes)
@@ -1623,7 +1641,7 @@ impl ResourcePools {
         // only if Vulkan render-pass compatibility changed. A change of
         // allocation must recreate the image, not just the framebuffer — an RGBA
         // image under a BGRA pass is invalid.
-        if let Some(slot) = self.registry.get(&identity) {
+        if let Some(slot) = self.shared.registry.get(&identity) {
             let reusable = slot.reusable_for_materialization(
                 width,
                 height,
@@ -1641,15 +1659,15 @@ impl ResourcePools {
                 let attachment =
                     unsafe { self.registry_view(ctx, &identity, format.declared(), counters)? }
                         .expect("the slot reused on the line above is still registered");
-                let slot = self.registry.get(&identity).unwrap();
+                let slot = self.shared.registry.get(&identity).unwrap();
                 if slot.framebuffer_compatibility == Some(framebuffer_compatibility)
                     && slot.format == format
                 {
                     counters
                         .gpu_load_hits
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let touch = self.idle_clock_ms;
-                    let slot = self.registry.get_mut(&identity).unwrap();
+                    let touch = self.shared.idle_clock_ms;
+                    let slot = self.shared.registry.get_mut(&identity).unwrap();
                     slot.last_touch_ms = touch;
                     return Ok((slot, attachment));
                 }
@@ -1674,7 +1692,7 @@ impl ResourcePools {
                     })?;
                 counters.note_create(CreateSite::RegistryFramebuffer);
                 self.dispose_owed_framebuffer(&ctx.device, old_fb);
-                let slot = self.registry.get_mut(&identity).unwrap();
+                let slot = self.shared.registry.get_mut(&identity).unwrap();
                 slot.framebuffer = framebuffer;
                 slot.render_pass = render_pass;
                 slot.framebuffer_compatibility = Some(framebuffer_compatibility);
@@ -1686,7 +1704,7 @@ impl ResourcePools {
                 counters
                     .gpu_load_hits
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Ok((self.registry.get(&identity).unwrap(), attachment));
+                return Ok((self.shared.registry.get(&identity).unwrap(), attachment));
             }
             // Geometry/gen/allocation mismatch → destroy and recreate.
             if let Some(old) =
@@ -1742,9 +1760,10 @@ impl ResourcePools {
                 Ok(view) => view,
                 Err(result) => {
                     ctx.device.destroy_image(image, None);
-                    if let Some(parent) = self.host_ram_imports.release_child(&target.import) {
+                    if let Some(parent) = self.shared.host_ram_imports.release_child(&target.import)
+                    {
                         let completed = parent.destroy(&ctx.device);
-                        self.completed_guest_imports.push(completed);
+                        self.shared.completed_guest_imports.push(completed);
                     }
                     return Err(DrawError::VkCall(VkCall::new(
                         VkOp::PoolsCreateRegistryView,
@@ -1939,7 +1958,7 @@ impl ResourcePools {
             },
         );
         Ok((
-            self.registry.get(&identity).unwrap(),
+            self.shared.registry.get(&identity).unwrap(),
             attachment_view.unwrap_or(view),
         ))
     }
@@ -1991,7 +2010,7 @@ impl ResourcePools {
         // bucket are keyed on.
         let format = translate::pixel::ResidentFormat::of(format);
         let guest_backing = guest_target.map(|target| target.backing);
-        if let Some(slot) = self.registry.get(&identity) {
+        if let Some(slot) = self.shared.registry.get(&identity) {
             let reusable = slot.reusable_for_materialization(
                 width,
                 height,
@@ -2058,9 +2077,10 @@ impl ResourcePools {
                 )
                 .map_err(|e| {
                     ctx.device.destroy_image(image, None);
-                    if let Some(parent) = self.host_ram_imports.release_child(&target.import) {
+                    if let Some(parent) = self.shared.host_ram_imports.release_child(&target.import)
+                    {
                         let completed = parent.destroy(&ctx.device);
-                        self.completed_guest_imports.push(completed);
+                        self.shared.completed_guest_imports.push(completed);
                     }
                     DrawError::VkCall(VkCall::new(VkOp::PoolsCreateMrtSecondaryView, e))
                 })?;
@@ -2441,7 +2461,7 @@ impl ResourcePools {
             width,
             height,
         };
-        if let Some(fb) = self.ad_hoc_framebuffers.get(&key) {
+        if let Some(fb) = self.shared.ad_hoc_framebuffers.get(&key) {
             crate::telemetry::note_route("adhoc_fb_hit");
             return Ok(*fb);
         }
@@ -2449,7 +2469,7 @@ impl ResourcePools {
             self.create_mrt_framebuffer(ctx, render_pass, views, width, height, counters)
         }?;
         crate::telemetry::note_route("adhoc_fb_miss");
-        self.ad_hoc_framebuffers.insert(key, fb);
+        self.shared.ad_hoc_framebuffers.insert(key, fb);
         Ok(fb)
     }
 
@@ -2467,13 +2487,14 @@ impl ResourcePools {
         use ash::vk::Handle;
         let raw = view.as_raw();
         let doomed: Vec<super::AdHocFramebufferKey> = self
+            .shared
             .ad_hoc_framebuffers
             .keys()
             .filter(|k| k.views.contains(&raw))
             .cloned()
             .collect();
         for key in doomed {
-            if let Some(fb) = self.ad_hoc_framebuffers.remove(&key) {
+            if let Some(fb) = self.shared.ad_hoc_framebuffers.remove(&key) {
                 unsafe { device.destroy_framebuffer(fb, None) };
                 crate::telemetry::note_route("adhoc_fb_purged");
             }
@@ -2539,7 +2560,7 @@ impl ResourcePools {
     ) {
         let mut guest_backed = false;
         let mut authority = None;
-        if let Some(slot) = self.registry.get_mut(identity) {
+        if let Some(slot) = self.shared.registry.get_mut(identity) {
             slot.content_ready = true;
             slot.content_epoch = None;
             slot.access = access;
@@ -2547,7 +2568,9 @@ impl ResourcePools {
             authority = guest_resident_backing_key(slot);
         }
         if let Some(key) = authority {
-            self.guest_resident_authority.insert(key, identity.clone());
+            self.shared
+                .guest_resident_authority
+                .insert(key, identity.clone());
         }
         self.set_sole_copy(identity, !guest_backed);
     }
@@ -2573,7 +2596,7 @@ impl ResourcePools {
     /// bounded by the idle age, and it is visible. Read that counter before
     /// deciding depth needs its own age.
     pub(crate) fn registry_mark_depth_ready(&mut self, identity: &TargetIdentity) {
-        if let Some(slot) = self.registry.get_mut(identity) {
+        if let Some(slot) = self.shared.registry.get_mut(identity) {
             slot.content_ready = true;
             // The depth pass declares `final_layout` DEPTH_STENCIL_ATTACHMENT_
             // OPTIMAL unconditionally, so this is where the image is left and it
@@ -2587,7 +2610,8 @@ impl ResourcePools {
     /// Whether this resident already holds rendered contents — the question a
     /// depth LOAD has to ask before it can be honoured.
     pub(crate) fn registry_content_ready(&self, identity: &TargetIdentity) -> bool {
-        self.registry
+        self.shared
+            .registry
             .get(identity)
             .is_some_and(|slot| slot.content_ready)
     }
@@ -2609,7 +2633,7 @@ impl ResourcePools {
     /// one holder's pin on another's behalf. Silent saturation is what would let
     /// that land as a rare wrong frame instead of a log line.
     pub(crate) fn pin_resident_target(&mut self, identity: &TargetIdentity, pinned: bool) -> bool {
-        let Some(slot) = self.registry.get_mut(identity) else {
+        let Some(slot) = self.shared.registry.get_mut(identity) else {
             return false;
         };
         if pinned && (!slot.content_ready || slot.resource_released) {
@@ -2646,6 +2670,7 @@ impl ResourcePools {
         identity: &TargetIdentity,
     ) -> Option<super::ResidentIncarnation> {
         let incarnation = self
+            .shared
             .registry
             .get(identity)
             .filter(|slot| slot.content_ready)
@@ -2654,11 +2679,11 @@ impl ResourcePools {
         // holder is finishing the previous owner's use of the same allocation.
         // Revive the ownership before pinning; maintenance cannot retire the
         // slot while this engine transaction holds the registry lock.
-        self.registry.get_mut(identity)?.resource_released = false;
+        self.shared.registry.get_mut(identity)?.resource_released = false;
         if !self.pin_resident_target(identity, true) {
             return None;
         }
-        let slot = self.registry.get_mut(identity)?;
+        let slot = self.shared.registry.get_mut(identity)?;
         let Some(next) = slot.resource_owner_count.checked_add(1) else {
             reims_vgpu_observe::fail(format!(
                 "resident_resource_owner_overflow identity={identity:?}"
@@ -2701,7 +2726,7 @@ impl ResourcePools {
         identity: &TargetIdentity,
         incarnation: super::ResidentIncarnation,
     ) -> Option<bool> {
-        if self.registry.get(identity)?.incarnation != incarnation {
+        if self.shared.registry.get(identity)?.incarnation != incarnation {
             crate::telemetry::note_route("resident_resource_release_stale_incarnation");
             return None;
         }
@@ -2712,7 +2737,7 @@ impl ResourcePools {
     /// whether the ownership pin was the last pin and the resident may retire
     /// immediately, or `None` when the identity was already absent.
     fn release_resident_ownership(&mut self, identity: &TargetIdentity) -> Option<bool> {
-        let slot = self.registry.get_mut(identity)?;
+        let slot = self.shared.registry.get_mut(identity)?;
         if slot.resource_owner_count == 0 {
             reims_vgpu_observe::fail(format!(
                 "resident_resource_release_unbalanced identity={identity:?}"
@@ -2723,17 +2748,20 @@ impl ResourcePools {
         slot.resource_released = slot.resource_owner_count == 0;
         self.pin_resident_target(identity, false);
         Some(
-            self.registry
+            self.shared
+                .registry
                 .get(identity)
                 .is_some_and(ResidentTargetSlot::released_and_collectable),
         )
     }
 
     fn released_resident_keys(&self, max: usize) -> Vec<TargetIdentity> {
-        self.registry_order
+        self.shared
+            .registry_order
             .iter()
             .filter(|identity| {
-                self.registry
+                self.shared
+                    .registry
                     .get(*identity)
                     .is_some_and(ResidentTargetSlot::released_and_collectable)
             })
@@ -2783,7 +2811,7 @@ impl ResourcePools {
         identity: &TargetIdentity,
         epoch: u32,
     ) -> bool {
-        match self.registry.get_mut(identity) {
+        match self.shared.registry.get_mut(identity) {
             Some(slot) if slot.content_ready => {
                 slot.content_epoch = Some(epoch);
                 true
@@ -2805,7 +2833,7 @@ impl ResourcePools {
         identity: &TargetIdentity,
         epoch: u32,
     ) -> bool {
-        let Some(slot) = self.registry.get_mut(identity) else {
+        let Some(slot) = self.shared.registry.get_mut(identity) else {
             return false;
         };
         if !slot.content_ready || slot.memory.guest_memory().is_none() {
@@ -2815,7 +2843,9 @@ impl ResourcePools {
         slot.access = ResidentAccess::HostWrite(slot.access.layout());
         let authority = guest_resident_backing_key(slot);
         if let Some(key) = authority {
-            self.guest_resident_authority.insert(key, identity.clone());
+            self.shared
+                .guest_resident_authority
+                .insert(key, identity.clone());
         }
         true
     }
@@ -2833,7 +2863,7 @@ impl ResourcePools {
         identity: &TargetIdentity,
         access: ResidentAccess,
     ) {
-        if let Some(slot) = self.registry.get_mut(identity) {
+        if let Some(slot) = self.shared.registry.get_mut(identity) {
             slot.access = access;
         }
     }
@@ -2851,12 +2881,12 @@ impl ResourcePools {
     /// `non_pinned_registry_totals_by_walk` is the walk kept as the thing to
     /// check it against (test-only, so not linkable from here).
     pub(super) fn non_pinned_registry_len(&self) -> usize {
-        self.registry_non_pinned.count
+        self.shared.registry_non_pinned.count
     }
 
     /// The drain's wall clock, for a caller measuring an age against it.
     pub(crate) fn idle_clock_ms(&self) -> u64 {
-        self.idle_clock_ms
+        self.shared.idle_clock_ms
     }
 
     /// Attachment bytes the same non-pinned set occupies: `w x h x texel` summed
@@ -2869,7 +2899,7 @@ impl ResourcePools {
     /// until this counter there was nothing in the device that could say what a
     /// count of 320 costs. 320 slots is 5 MiB of 16x16 scratch or 10 GiB of 4K.
     fn non_pinned_registry_bytes(&self) -> u64 {
-        self.registry_non_pinned.bytes
+        self.shared.registry_non_pinned.bytes
     }
 
     /// One slot's contribution to [`Self::non_pinned_registry_bytes`].
@@ -2902,7 +2932,12 @@ impl ResourcePools {
     /// against.
     #[cfg(test)]
     fn non_pinned_registry_totals_by_walk(&self) -> NonPinnedTotals {
-        let non_pinned = || self.registry.values().filter(|slot| slot.pin_count == 0);
+        let non_pinned = || {
+            self.shared
+                .registry
+                .values()
+                .filter(|slot| slot.pin_count == 0)
+        };
         NonPinnedTotals {
             count: non_pinned().count(),
             bytes: non_pinned().map(Self::slot_attachment_bytes).sum(),
@@ -2915,7 +2950,7 @@ impl ResourcePools {
     /// and the bytes cannot move apart from each other, or be updated at two
     /// sites and forgotten at a third.
     fn registry_non_pinned_adjust(&mut self, slot_bytes: u64, joined: bool) {
-        Self::fold_totals(&mut self.registry_non_pinned, slot_bytes, joined);
+        Self::fold_totals(&mut self.shared.registry_non_pinned, slot_bytes, joined);
     }
 
     /// Fold one slot into or out of the maintained sole-copy totals.
@@ -2925,7 +2960,7 @@ impl ResourcePools {
     /// its own call rather than a flag on that one so a site cannot update the
     /// wrong population by passing a bool.
     fn registry_sole_copy_adjust(&mut self, slot_bytes: u64, joined: bool) {
-        Self::fold_totals(&mut self.registry_sole_copy, slot_bytes, joined);
+        Self::fold_totals(&mut self.shared.registry_sole_copy, slot_bytes, joined);
     }
 
     /// The arithmetic both maintained populations share: a count and its bytes
@@ -2950,7 +2985,7 @@ impl ResourcePools {
     /// is no slot to read yet, and it sets it to the default that counts for
     /// nothing.
     fn set_sole_copy(&mut self, identity: &TargetIdentity, sole: bool) -> bool {
-        let Some(slot) = self.registry.get_mut(identity) else {
+        let Some(slot) = self.shared.registry.get_mut(identity) else {
             return false;
         };
         // Returning early on a no-op is what keeps the totals a population
@@ -2967,8 +3002,10 @@ impl ResourcePools {
         // a peak sampled only at the other event lags by a draw, and can miss
         // one entirely for a burst that marks more than it admits.
         if sole {
-            self.registry_sole_copy_peak =
-                Self::high_water(self.registry_sole_copy_peak, self.registry_sole_copy);
+            self.shared.registry_sole_copy_peak = Self::high_water(
+                self.shared.registry_sole_copy_peak,
+                self.shared.registry_sole_copy,
+            );
         }
         true
     }
@@ -3065,10 +3102,12 @@ impl ResourcePools {
     /// count's absence: a walk that never removed anything cannot have been
     /// holding the population down.
     fn recoverable_residents(&self) -> Vec<TargetIdentity> {
-        self.registry_order
+        self.shared
+            .registry_order
             .iter()
             .filter(|k| {
-                self.registry
+                self.shared
+                    .registry
                     .get(*k)
                     .is_some_and(|slot| slot.pin_count == 0 && !slot.gpu_only_content)
             })
@@ -3132,7 +3171,7 @@ impl ResourcePools {
         // could not be told from never having been needed.
         reims_vgpu_observe::fail(format!(
             "vram_pool_reclaim_retry released={released} held_bytes={}              (an allocation was refused; emptied the recycle pools, which hold              nothing any command buffer references, and retried)",
-            self.slab.held_bytes().0,
+            self.shared.slab.held_bytes().0,
         ));
         released
     }
@@ -3238,9 +3277,9 @@ impl ResourcePools {
             "vram_reclaim_retry residents={freed} recycled={trimmed} held_bytes={} \
              sole_copy={} live={} (an allocation was refused; gave back everything \
              that is neither pinned nor the only copy of its pixels)",
-            self.slab.held_bytes().0,
-            self.registry_sole_copy.count,
-            self.registry.len(),
+            self.shared.slab.held_bytes().0,
+            self.shared.registry_sole_copy.count,
+            self.shared.registry.len(),
         ));
         freed + trimmed
     }
@@ -3261,27 +3300,31 @@ impl ResourcePools {
     /// what said that a slot count was never a sane proxy for VRAM, which is the
     /// reading that retired the count. See [`Self::recoverable_residents`].
     fn note_registry_reach(&mut self) {
-        self.registry_non_pinned_peak = self
+        self.shared.registry_non_pinned_peak = self
+            .shared
             .registry_non_pinned_peak
             .max(self.non_pinned_registry_len() as u64);
-        self.registry_non_pinned_peak_bytes = self
+        self.shared.registry_non_pinned_peak_bytes = self
+            .shared
             .registry_non_pinned_peak_bytes
             .max(self.non_pinned_registry_bytes());
         // Sampled from the same instant as the two above, so the ratio between
         // them describes one population and not two moments.
-        self.registry_sole_copy_peak =
-            Self::high_water(self.registry_sole_copy_peak, self.registry_sole_copy);
+        self.shared.registry_sole_copy_peak = Self::high_water(
+            self.shared.registry_sole_copy_peak,
+            self.shared.registry_sole_copy,
+        );
     }
 
     /// Test seam for advancing one resident's idle age without running the
     /// device-touching reclaim operation.
     #[cfg(test)]
     pub(crate) fn registry_touch_at(&mut self, identity: &TargetIdentity, now_ms: u64) {
-        if now_ms > self.idle_clock_ms {
-            self.idle_clock_ms = now_ms;
+        if now_ms > self.shared.idle_clock_ms {
+            self.shared.idle_clock_ms = now_ms;
         }
-        let touch = self.idle_clock_ms;
-        if let Some(slot) = self.registry.get_mut(identity) {
+        let touch = self.shared.idle_clock_ms;
+        if let Some(slot) = self.shared.registry.get_mut(identity) {
             slot.last_touch_ms = touch;
         }
     }
@@ -3297,11 +3340,13 @@ impl ResourcePools {
         identity: &TargetIdentity,
         why: ResidentReclaim,
     ) {
-        if self.reclaimed_recent.len() >= RECLAIM_HISTORY {
-            self.reclaimed_recent.pop_front();
+        if self.shared.reclaimed_recent.len() >= RECLAIM_HISTORY {
+            self.shared.reclaimed_recent.pop_front();
         }
-        let at = self.idle_clock_ms;
-        self.reclaimed_recent.push_back((identity.clone(), why, at));
+        let at = self.shared.idle_clock_ms;
+        self.shared
+            .reclaimed_recent
+            .push_back((identity.clone(), why, at));
     }
 
     /// [`ResourcePools::prior_reclaim`] with the idle-clock time the reclaim
@@ -3316,7 +3361,8 @@ impl ResourcePools {
         &self,
         identity: &TargetIdentity,
     ) -> Option<(ResidentReclaim, u64)> {
-        self.reclaimed_recent
+        self.shared
+            .reclaimed_recent
             .iter()
             .rev()
             .find(|(k, _, _)| k == identity)
@@ -3328,7 +3374,8 @@ impl ResourcePools {
     /// both "never held one" and "reclaimed longer ago than the window reaches",
     /// two cases this deliberately does not guess between.
     pub(crate) fn prior_reclaim(&self, identity: &TargetIdentity) -> Option<ResidentReclaim> {
-        self.reclaimed_recent
+        self.shared
+            .reclaimed_recent
             .iter()
             .rev()
             .find(|(k, _, _)| k == identity)
@@ -3347,15 +3394,16 @@ impl ResourcePools {
     /// timestamp: live targets end through resource lifetime or, when safe,
     /// allocation-pressure recovery.
     pub(crate) fn registry_note_sampled_use(&mut self, identity: &TargetIdentity) {
-        let touch = self.idle_clock_ms;
-        if let Some(slot) = self.registry.get_mut(identity) {
+        let touch = self.shared.idle_clock_ms;
+        if let Some(slot) = self.shared.registry.get_mut(identity) {
             let idle_ms = touch.saturating_sub(slot.last_touch_ms);
             slot.last_touch_ms = touch;
             crate::telemetry::note_route(resident_resample_band(idle_ms));
             // The bands give the distribution; this gives the margin. They
             // answer different questions: the peak preserves the longest exact
             // reuse interval while the bands keep a cheap distribution.
-            self.resident_resample_peak_ms = self.resident_resample_peak_ms.max(idle_ms);
+            self.shared.resident_resample_peak_ms =
+                self.shared.resident_resample_peak_ms.max(idle_ms);
         }
     }
 }
@@ -3577,12 +3625,15 @@ pub(super) mod pin_count_tests {
     fn a_sampled_resident_pin_moves_into_the_submission_cleanup() {
         let mut pools = ResourcePools::new();
         let identity = pinned_identity();
-        pools.registry.insert(identity.clone(), dummy_slot(true));
+        pools
+            .shared
+            .registry
+            .insert(identity.clone(), dummy_slot(true));
 
         assert!(pools.pin_resident_for_entry(&identity));
-        assert_eq!(pools.registry.get(&identity).unwrap().pin_count, 1);
+        assert_eq!(pools.shared.registry.get(&identity).unwrap().pin_count, 1);
         let sealed = pools.seal_entry(Vec::new(), Vec::new());
-        assert!(pools.resident_pins_live.is_empty());
+        assert!(pools.encoder.resident_pins_live.is_empty());
         assert_eq!(sealed.cleanup.unpin_residents, vec![identity]);
     }
 
@@ -3635,14 +3686,17 @@ pub(super) mod pin_count_tests {
     fn a_draw_into_a_resident_clears_its_content_stamp() {
         let mut pools = ResourcePools::new();
         let id = pinned_identity();
-        pools.registry.insert(id.clone(), dummy_slot(true));
+        pools.shared.registry.insert(id.clone(), dummy_slot(true));
 
         assert!(pools.registry_stamp_content_epoch(&id, 9));
-        assert_eq!(pools.registry.get(&id).unwrap().content_epoch, Some(9));
+        assert_eq!(
+            pools.shared.registry.get(&id).unwrap().content_epoch,
+            Some(9)
+        );
 
         pools.registry_mark_ready(&id);
         assert_eq!(
-            pools.registry.get(&id).unwrap().content_epoch,
+            pools.shared.registry.get(&id).unwrap().content_epoch,
             None,
             "a draw stored new pixels; the old stamp cannot vouch for them"
         );
@@ -3650,7 +3704,7 @@ pub(super) mod pin_count_tests {
         assert!(pools.registry_stamp_content_epoch(&id, 10));
         pools.registry_mark_ready_at(&id, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
         assert_eq!(
-            pools.registry.get(&id).unwrap().content_epoch,
+            pools.shared.registry.get(&id).unwrap().content_epoch,
             None,
             "the MRT-secondary ready arm must invalidate identically"
         );
@@ -3690,11 +3744,14 @@ pub(super) mod pin_count_tests {
             write_pages: reims_vgpu_memory::GuestWritePages::new(&[0x1000]).unwrap(),
         };
         imported.access = ResidentAccess::ColorWrite(vk::ImageLayout::GENERAL);
-        pools.registry.insert(imported_id.clone(), imported);
-        pools.registry.insert(device_id.clone(), dummy_slot(true));
+        pools.shared.registry.insert(imported_id.clone(), imported);
+        pools
+            .shared
+            .registry
+            .insert(device_id.clone(), dummy_slot(true));
 
         assert!(pools.registry_note_guest_write(&imported_id, 11));
-        let imported = &pools.registry[&imported_id];
+        let imported = &pools.shared.registry[&imported_id];
         assert_eq!(imported.content_epoch, Some(11));
         assert_eq!(
             imported.access,
@@ -3703,7 +3760,7 @@ pub(super) mod pin_count_tests {
         );
 
         assert!(!pools.registry_note_guest_write(&device_id, 12));
-        assert_eq!(pools.registry[&device_id].content_epoch, None);
+        assert_eq!(pools.shared.registry[&device_id].content_epoch, None);
     }
 
     /// Stamping an image no draw has stored into would vouch for undefined
@@ -3719,12 +3776,12 @@ pub(super) mod pin_count_tests {
             "an absent identity cannot be stamped"
         );
 
-        pools.registry.insert(id.clone(), dummy_slot(false));
+        pools.shared.registry.insert(id.clone(), dummy_slot(false));
         assert!(
             !pools.registry_stamp_content_epoch(&id, 1),
             "a resident that is not content_ready holds undefined pixels"
         );
-        assert_eq!(pools.registry.get(&id).unwrap().content_epoch, None);
+        assert_eq!(pools.shared.registry.get(&id).unwrap().content_epoch, None);
     }
 
     /// Two deferred windows on one surface pin the SAME identity; the first
@@ -3734,23 +3791,23 @@ pub(super) mod pin_count_tests {
     fn shared_identity_pin_is_counted_not_boolean() {
         let mut pools = ResourcePools::new();
         let id = pinned_identity();
-        pools.registry.insert(id.clone(), dummy_slot(true));
+        pools.shared.registry.insert(id.clone(), dummy_slot(true));
 
         assert!(pools.pin_resident_target(&id, true), "window A pin");
         assert!(pools.pin_resident_target(&id, true), "window B pin");
-        assert_eq!(pools.registry.get(&id).unwrap().pin_count, 2);
+        assert_eq!(pools.shared.registry.get(&id).unwrap().pin_count, 2);
 
         // Window A flushes: one unpin — the slot must stay sweep-protected.
         assert!(pools.pin_resident_target(&id, false));
         assert_eq!(
-            pools.registry.get(&id).unwrap().pin_count,
+            pools.shared.registry.get(&id).unwrap().pin_count,
             1,
             "the second window is still armed: slot must remain pinned"
         );
 
         // Window B flushes: fully released.
         assert!(pools.pin_resident_target(&id, false));
-        assert_eq!(pools.registry.get(&id).unwrap().pin_count, 0);
+        assert_eq!(pools.shared.registry.get(&id).unwrap().pin_count, 0);
     }
 
     /// A spurious unpin (double-release) saturates at zero instead of
@@ -3759,11 +3816,11 @@ pub(super) mod pin_count_tests {
     fn unpin_saturates_at_zero() {
         let mut pools = ResourcePools::new();
         let id = pinned_identity();
-        pools.registry.insert(id.clone(), dummy_slot(true));
+        pools.shared.registry.insert(id.clone(), dummy_slot(true));
         assert!(pools.pin_resident_target(&id, false));
-        assert_eq!(pools.registry.get(&id).unwrap().pin_count, 0);
+        assert_eq!(pools.shared.registry.get(&id).unwrap().pin_count, 0);
         assert!(pools.pin_resident_target(&id, true));
-        assert_eq!(pools.registry.get(&id).unwrap().pin_count, 1);
+        assert_eq!(pools.shared.registry.get(&id).unwrap().pin_count, 1);
     }
 
     /// Pin still refuses a not-ready slot (callers fall back to the sync
@@ -3773,9 +3830,9 @@ pub(super) mod pin_count_tests {
         let mut pools = ResourcePools::new();
         let id = pinned_identity();
         assert!(!pools.pin_resident_target(&id, true), "absent identity");
-        pools.registry.insert(id.clone(), dummy_slot(false));
+        pools.shared.registry.insert(id.clone(), dummy_slot(false));
         assert!(!pools.pin_resident_target(&id, true), "not-ready slot");
-        assert_eq!(pools.registry.get(&id).unwrap().pin_count, 0);
+        assert_eq!(pools.shared.registry.get(&id).unwrap().pin_count, 0);
     }
 
     #[test]
@@ -3783,18 +3840,19 @@ pub(super) mod pin_count_tests {
         let mut pools = ResourcePools::new();
         let recyclable_id = pinned_identity();
         pools
+            .shared
             .registry
             .insert(recyclable_id.clone(), dummy_slot(true));
         assert!(retain(&mut pools, &recyclable_id));
-        assert_eq!(pools.registry[&recyclable_id].pin_count, 1);
+        assert_eq!(pools.shared.registry[&recyclable_id].pin_count, 1);
     }
 
     #[test]
     fn ending_the_last_resource_ownership_makes_the_slot_retirable() {
         let mut pools = ResourcePools::new();
         let id = pinned_identity();
-        pools.registry.insert(id.clone(), dummy_slot(true));
-        pools.registry_order.push_back(id.clone());
+        pools.shared.registry.insert(id.clone(), dummy_slot(true));
+        pools.shared.registry_order.push_back(id.clone());
 
         assert!(retain(&mut pools, &id));
         assert_eq!(pools.release_resident_ownership(&id), Some(true));
@@ -3805,13 +3863,13 @@ pub(super) mod pin_count_tests {
     fn an_old_lease_cannot_release_the_replacement_under_the_same_identity() {
         let mut pools = ResourcePools::new();
         let id = pinned_identity();
-        pools.registry.insert(id.clone(), dummy_slot(true));
+        pools.shared.registry.insert(id.clone(), dummy_slot(true));
         let old_incarnation = pools
             .retain_resident_target(&id)
             .expect("the old allocation is retained");
 
-        pools.registry.insert(id.clone(), dummy_slot(true));
-        let replacement = pools.registry[&id].incarnation;
+        pools.shared.registry.insert(id.clone(), dummy_slot(true));
+        let replacement = pools.shared.registry[&id].incarnation;
         assert_ne!(replacement, old_incarnation);
         assert_eq!(
             pools.release_resident_ownership_for(&id, old_incarnation),
@@ -3819,25 +3877,25 @@ pub(super) mod pin_count_tests {
             "the old lease names an allocation no longer in the registry"
         );
         assert_eq!(
-            pools.registry[&id].resource_owner_count, 0,
+            pools.shared.registry[&id].resource_owner_count, 0,
             "the replacement acquired no owner and must not lose one"
         );
-        assert_eq!(pools.registry[&id].pin_count, 0);
+        assert_eq!(pools.shared.registry[&id].pin_count, 0);
     }
 
     #[test]
     fn one_alias_release_does_not_end_another_resources_ownership() {
         let mut pools = ResourcePools::new();
         let id = pinned_identity();
-        pools.registry.insert(id.clone(), dummy_slot(true));
-        pools.registry_order.push_back(id.clone());
+        pools.shared.registry.insert(id.clone(), dummy_slot(true));
+        pools.shared.registry_order.push_back(id.clone());
 
         assert!(retain(&mut pools, &id));
         assert!(retain(&mut pools, &id));
-        assert_eq!(pools.registry[&id].resource_owner_count, 2);
+        assert_eq!(pools.shared.registry[&id].resource_owner_count, 2);
         assert_eq!(pools.release_resident_ownership(&id), Some(false));
-        assert_eq!(pools.registry[&id].resource_owner_count, 1);
-        assert!(!pools.registry[&id].resource_released);
+        assert_eq!(pools.shared.registry[&id].resource_owner_count, 1);
+        assert!(!pools.shared.registry[&id].resource_released);
         assert!(pools.released_resident_keys(1).is_empty());
 
         assert!(
@@ -3850,8 +3908,8 @@ pub(super) mod pin_count_tests {
     fn released_resource_waits_for_existing_holders_but_not_for_time() {
         let mut pools = ResourcePools::new();
         let id = pinned_identity();
-        pools.registry.insert(id.clone(), dummy_slot(true));
-        pools.registry_order.push_back(id.clone());
+        pools.shared.registry.insert(id.clone(), dummy_slot(true));
+        pools.shared.registry_order.push_back(id.clone());
 
         assert!(retain(&mut pools, &id));
         assert!(pools.pin_resident_target(&id, true), "in-flight holder");
@@ -3880,13 +3938,13 @@ pub(super) mod pin_count_tests {
     fn a_released_resource_holding_the_only_copy_of_a_frame_waits_for_the_copy_out() {
         let mut pools = ResourcePools::new();
         let id = pinned_identity();
-        pools.registry.insert(id.clone(), dummy_slot(true));
-        pools.registry_order.push_back(id.clone());
+        pools.shared.registry.insert(id.clone(), dummy_slot(true));
+        pools.shared.registry_order.push_back(id.clone());
 
         assert!(retain(&mut pools, &id));
         pools.registry_mark_ready(&id);
         assert!(
-            pools.registry[&id].gpu_only_content,
+            pools.shared.registry[&id].gpu_only_content,
             "a Store with no copy-out leaves the resident sole-copy"
         );
 
@@ -3897,7 +3955,7 @@ pub(super) mod pin_count_tests {
         );
         assert!(pools.released_resident_keys(1).is_empty());
         assert!(
-            pools.registry.contains_key(&id),
+            pools.shared.registry.contains_key(&id),
             "the resident the owed writeback names is still findable"
         );
 
@@ -3967,7 +4025,7 @@ pub(super) mod pin_count_tests {
             &id,
             new_resident(some_framebuffer(), vk::RenderPass::null()),
         );
-        let slot = pools.registry.get_mut(&id).expect("just registered");
+        let slot = pools.shared.registry.get_mut(&id).expect("just registered");
         slot.content_ready = true;
         slot.last_touch_ms = last_touch_ms;
         // Through the product path, not `slot.pin_count = pin`: pinning is what
@@ -3995,7 +4053,7 @@ pub(super) mod pin_count_tests {
         resident.width = width;
         resident.height = height;
         pools.register_resident(&id, resident);
-        let slot = pools.registry.get_mut(&id).expect("just registered");
+        let slot = pools.shared.registry.get_mut(&id).expect("just registered");
         slot.content_ready = true;
         slot.last_touch_ms = last_touch_ms;
         for _ in 0..pin {
@@ -4025,12 +4083,22 @@ pub(super) mod pin_count_tests {
         );
 
         assert_eq!(
-            pools.registry.get(&surf(1)).unwrap().owed_framebuffer(),
+            pools
+                .shared
+                .registry
+                .get(&surf(1))
+                .unwrap()
+                .owed_framebuffer(),
             None,
             "an MRT-secondary resident has no framebuffer to destroy"
         );
         assert_eq!(
-            pools.registry.get(&surf(2)).unwrap().owed_framebuffer(),
+            pools
+                .shared
+                .registry
+                .get(&surf(2))
+                .unwrap()
+                .owed_framebuffer(),
             Some(some_framebuffer()),
             "a single-RT resident owes the one it was built with"
         );
@@ -4051,7 +4119,7 @@ pub(super) mod pin_count_tests {
             new_resident(some_framebuffer(), vk::RenderPass::null()),
         );
 
-        let slot = pools.registry.get(&surf(1)).expect("registered");
+        let slot = pools.shared.registry.get(&surf(1)).expect("registered");
         assert!(!slot.content_ready, "nothing has drawn into it yet");
         assert_eq!(
             slot.content_epoch, None,
@@ -4083,12 +4151,18 @@ pub(super) mod pin_count_tests {
         );
 
         assert_eq!(
-            pools.registry_order.iter().cloned().collect::<Vec<_>>(),
+            pools
+                .shared
+                .registry_order
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
             vec![surf(1), surf(2)],
             "the order holds both, in registration order"
         );
         assert!(
-            pools.registry.contains_key(&surf(1)) && pools.registry.contains_key(&surf(2)),
+            pools.shared.registry.contains_key(&surf(1))
+                && pools.shared.registry.contains_key(&surf(2)),
             "the map holds both"
         );
     }
@@ -4118,13 +4192,13 @@ pub(super) mod pin_count_tests {
 
         let now = 10 + IDLE_MAINTENANCE_START_MS + 1;
         assert!(pools.plan_idle_maintenance(now));
-        assert!(pools.registry.contains_key(&surf(1)));
+        assert!(pools.shared.registry.contains_key(&surf(1)));
 
         // Ten more cutoffs' worth of idleness changes nothing: this is not a
         // longer timer, it is a different question.
         let much_later = now + IDLE_MAINTENANCE_START_MS * 10;
         assert!(pools.plan_idle_maintenance(much_later));
-        assert!(pools.registry.contains_key(&surf(1)));
+        assert!(pools.shared.registry.contains_key(&surf(1)));
 
         // Something copies the pixels out — a landed flush, a writeback Store —
         // and the same resident is now exactly as reclaimable as any other.
@@ -4135,7 +4209,7 @@ pub(super) mod pin_count_tests {
         let later_still = much_later + MAINTENANCE_INTERVAL_MS + 1;
         assert!(pools.plan_idle_maintenance(later_still));
         assert!(
-            pools.registry.contains_key(&surf(1)),
+            pools.shared.registry.contains_key(&surf(1)),
             "a current guest copy makes pressure reclaim safe, not time authoritative"
         );
     }
@@ -4216,6 +4290,7 @@ pub(super) mod pin_count_tests {
                 // cause — the guest asking for a different target is.
                 ResidentReclaim::Recreated | ResidentReclaim::ResourceReleased => assert!(
                     pools
+                        .shared
                         .registry
                         .get(&surf(1))
                         .is_some_and(|s| s.gpu_only_content),
@@ -4239,14 +4314,20 @@ pub(super) mod pin_count_tests {
         let mut pools = ResourcePools::new();
         let check = |pools: &ResourcePools, what: &str| {
             let walk = {
-                let sole = || pools.registry.values().filter(|s| s.gpu_only_content);
+                let sole = || {
+                    pools
+                        .shared
+                        .registry
+                        .values()
+                        .filter(|s| s.gpu_only_content)
+                };
                 NonPinnedTotals {
                     count: sole().count(),
                     bytes: sole().map(ResourcePools::slot_attachment_bytes).sum(),
                 }
             };
             assert_eq!(
-                pools.registry_sole_copy, walk,
+                pools.shared.registry_sole_copy, walk,
                 "maintained sole-copy totals disagree with the walk after {what}"
             );
         };
@@ -4256,30 +4337,30 @@ pub(super) mod pin_count_tests {
         admit_sized(&mut pools, surf(2), 0, 0, (64, 32));
         check(&pools, "two admits");
         assert_eq!(
-            pools.registry_sole_copy,
+            pools.shared.registry_sole_copy,
             NonPinnedTotals::default(),
             "a registered slot nothing has drawn into holds no guest work"
         );
 
         pools.registry_mark_ready(&surf(1));
         check(&pools, "a draw stored into the first");
-        assert_eq!(pools.registry_sole_copy.count, 1);
+        assert_eq!(pools.shared.registry_sole_copy.count, 1);
         // A second store into the same slot is still one slot.
         pools.registry_mark_ready(&surf(1));
         check(&pools, "a second store into the same slot");
-        assert_eq!(pools.registry_sole_copy.count, 1);
+        assert_eq!(pools.shared.registry_sole_copy.count, 1);
 
         pools.registry_mark_ready_at(&surf(2), vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
         check(&pools, "the MRT-secondary arm on the second");
-        assert_eq!(pools.registry_sole_copy.count, 2);
+        assert_eq!(pools.shared.registry_sole_copy.count, 2);
 
         assert!(pools.registry_note_content_copied_out(&surf(1)));
         check(&pools, "a copy-out");
-        assert_eq!(pools.registry_sole_copy.count, 1);
+        assert_eq!(pools.shared.registry_sole_copy.count, 1);
         // A second copy-out of an already-copied slot must not double-subtract.
         assert!(pools.registry_note_content_copied_out(&surf(1)));
         check(&pools, "a redundant copy-out");
-        assert_eq!(pools.registry_sole_copy.count, 1);
+        assert_eq!(pools.shared.registry_sole_copy.count, 1);
 
         // Death of a sole-copy slot and of a copied-out one. Only the first was
         // ever in the totals, and the guest replacing a resource is the one way
@@ -4288,7 +4369,7 @@ pub(super) mod pin_count_tests {
         check(&pools, "unregistering the sole-copy slot");
         pools.unregister_resident(&surf(1), ResidentReclaim::AllocationReclaimed);
         check(&pools, "unregistering the copied-out slot");
-        assert_eq!(pools.registry_sole_copy, NonPinnedTotals::default());
+        assert_eq!(pools.shared.registry_sole_copy, NonPinnedTotals::default());
 
         // A copy-out against an identity holding no resident reports the miss
         // rather than inventing a subtraction.
@@ -4312,14 +4393,17 @@ pub(super) mod pin_count_tests {
         let mut pools = ResourcePools::new();
         admit_sized(&mut pools, surf(1), 0, 0, (64, 64));
         admit_sized(&mut pools, surf(2), 0, 0, (64, 64));
-        assert_eq!(pools.registry_sole_copy_peak, NonPinnedTotals::default());
+        assert_eq!(
+            pools.shared.registry_sole_copy_peak,
+            NonPinnedTotals::default()
+        );
 
         pools.registry_mark_ready(&surf(1));
         pools.registry_mark_ready(&surf(2));
-        let at_peak = pools.registry_sole_copy;
+        let at_peak = pools.shared.registry_sole_copy;
         assert_eq!(at_peak.count, 2);
         assert_eq!(
-            pools.registry_sole_copy_peak, at_peak,
+            pools.shared.registry_sole_copy_peak, at_peak,
             "the high-water saw the population at its maximum"
         );
 
@@ -4327,9 +4411,9 @@ pub(super) mod pin_count_tests {
         // the shape a walk-sampled peak misses.
         assert!(pools.registry_note_content_copied_out(&surf(1)));
         assert!(pools.registry_note_content_copied_out(&surf(2)));
-        assert_eq!(pools.registry_sole_copy, NonPinnedTotals::default());
+        assert_eq!(pools.shared.registry_sole_copy, NonPinnedTotals::default());
         assert_eq!(
-            pools.registry_sole_copy_peak, at_peak,
+            pools.shared.registry_sole_copy_peak, at_peak,
             "a high-water does not fall back with the population"
         );
     }
@@ -4349,7 +4433,7 @@ pub(super) mod pin_count_tests {
     fn the_allocation_retry_may_reclaim_everything_that_is_not_a_sole_copy_or_pinned() {
         let mut pools = ResourcePools::new();
         let now = 10_000;
-        pools.idle_clock_ms = now;
+        pools.shared.idle_clock_ms = now;
         admit(&mut pools, surf(1), now, 0); // fresh, recoverable -> yes
         admit(&mut pools, surf(2), now, 1); // pinned             -> no
         admit(&mut pools, surf(3), now, 0); // sole copy          -> no
@@ -4406,8 +4490,15 @@ pub(super) mod pin_count_tests {
         let now = 10 + IDLE_MAINTENANCE_START_MS + 1;
         admit(&mut pools, surf(3), now, 0); // fresh            -> kept
         assert!(pools.plan_idle_maintenance(now), "maintenance pass is due");
-        assert_eq!(pools.registry.len(), 3, "time changes no live residency");
-        assert_eq!(pools.idle_clock_ms, now, "clock advanced to wall time");
+        assert_eq!(
+            pools.shared.registry.len(),
+            3,
+            "time changes no live residency"
+        );
+        assert_eq!(
+            pools.shared.idle_clock_ms, now,
+            "clock advanced to wall time"
+        );
     }
 
     /// A reclaim records *when*, so the gap the drain censored can be recovered.
@@ -4418,7 +4509,7 @@ pub(super) mod pin_count_tests {
     fn a_reclaim_records_when_so_the_censored_gap_can_be_recovered() {
         let mut pools = ResourcePools::new();
         admit(&mut pools, surf(1), 0, 0);
-        pools.idle_clock_ms = 5_000;
+        pools.shared.idle_clock_ms = 5_000;
         pools.unregister_resident(&surf(1), ResidentReclaim::AllocationReclaimed);
 
         let (why, at) = pools
@@ -4428,7 +4519,7 @@ pub(super) mod pin_count_tests {
         assert_eq!(at, 5_000, "stamped with the maintenance clock");
 
         // The guest comes back 3 s after the destroy.
-        pools.idle_clock_ms = 8_000;
+        pools.shared.idle_clock_ms = 8_000;
         assert_eq!(
             pools.idle_clock_ms().saturating_sub(at),
             3_000,
@@ -4487,14 +4578,14 @@ pub(super) mod pin_count_tests {
 
         // Never held: no record, and nothing to mistake for one.
         assert_eq!(pools.prior_reclaim(&surf(2)), None);
-        assert!(!pools.registry.contains_key(&surf(2)));
+        assert!(!pools.shared.registry.contains_key(&surf(2)));
 
         // Held: present, so the facade short-circuits before prior_reclaim.
-        assert!(pools.registry.contains_key(&surf(1)));
+        assert!(pools.shared.registry.contains_key(&surf(1)));
 
         // Destroyed: absent, and the cause survives.
         pools.unregister_resident(&surf(1), ResidentReclaim::AllocationReclaimed);
-        assert!(!pools.registry.contains_key(&surf(1)));
+        assert!(!pools.shared.registry.contains_key(&surf(1)));
         assert_eq!(
             pools.prior_reclaim(&surf(1)),
             Some(ResidentReclaim::AllocationReclaimed)
@@ -4504,7 +4595,7 @@ pub(super) mod pin_count_tests {
         // check keeps this from reading as destroyed.
         admit(&mut pools, surf(1), 0, 0);
         assert!(
-            pools.registry.contains_key(&surf(1)),
+            pools.shared.registry.contains_key(&surf(1)),
             "the presence check is the only thing separating this from the case above"
         );
         assert_eq!(
@@ -4531,10 +4622,10 @@ pub(super) mod pin_count_tests {
         assert_eq!(pools.resident_resample_peak_ms(), 0);
 
         // A 900 ms gap, then a 100 ms one. The peak must keep the 900.
-        pools.idle_clock_ms = 900;
+        pools.shared.idle_clock_ms = 900;
         pools.registry_note_sampled_use(&surf(1));
         assert_eq!(pools.resident_resample_peak_ms(), 900);
-        pools.idle_clock_ms = 1_000;
+        pools.shared.idle_clock_ms = 1_000;
         pools.registry_note_sampled_use(&surf(1));
         assert_eq!(
             pools.resident_resample_peak_ms(),
@@ -4543,14 +4634,14 @@ pub(super) mod pin_count_tests {
         );
 
         // And a larger one does raise it.
-        pools.idle_clock_ms = 1_000 + IDLE_MAINTENANCE_START_MS;
+        pools.shared.idle_clock_ms = 1_000 + IDLE_MAINTENANCE_START_MS;
         pools.registry_note_sampled_use(&surf(1));
         assert_eq!(pools.resident_resample_peak_ms(), IDLE_MAINTENANCE_START_MS);
 
         // A read of an identity the registry does not hold records nothing —
         // there is no gap to measure, and counting it as one would report a
         // margin that no resident ever spent.
-        pools.idle_clock_ms = u64::MAX;
+        pools.shared.idle_clock_ms = u64::MAX;
         pools.registry_note_sampled_use(&surf(99));
         assert_eq!(pools.resident_resample_peak_ms(), IDLE_MAINTENANCE_START_MS);
     }
@@ -4572,8 +4663,8 @@ pub(super) mod pin_count_tests {
         // A second pass, far enough after the first to clear the throttle.
         let later = now + MAINTENANCE_INTERVAL_MS + 1;
         assert!(pools.plan_idle_maintenance(later), "second pass is due");
-        assert!(pools.registry.contains_key(&surf(1)));
-        assert!(pools.registry.contains_key(&surf(2)));
+        assert!(pools.shared.registry.contains_key(&surf(1)));
+        assert!(pools.shared.registry.contains_key(&surf(2)));
     }
 
     /// A pinned resident is never offered to the allocation-failure reclaim, and
@@ -4620,13 +4711,13 @@ pub(super) mod pin_count_tests {
             Some(ResidentReclaim::Recreated),
             "a removed resident must say which path took it"
         );
-        assert!(!pools.registry.contains_key(&surf(1)));
+        assert!(!pools.shared.registry.contains_key(&surf(1)));
         assert!(
-            !pools.registry_order.contains(&surf(1)),
+            !pools.shared.registry_order.contains(&surf(1)),
             "the order list must not keep a key the map no longer holds"
         );
         assert!(
-            pools.registry_order.contains(&surf(2)),
+            pools.shared.registry_order.contains(&surf(2)),
             "an untouched resident keeps its place"
         );
 
@@ -4676,7 +4767,7 @@ pub(super) mod pin_count_tests {
         for i in 0..RECLAIM_HISTORY as u32 {
             pools.note_resident_reclaimed(&surf(1000 + i), ResidentReclaim::AllocationReclaimed);
         }
-        assert!(pools.reclaimed_recent.len() <= RECLAIM_HISTORY);
+        assert!(pools.shared.reclaimed_recent.len() <= RECLAIM_HISTORY);
         assert_eq!(
             pools.prior_reclaim(&surf(2)),
             None,
@@ -4697,13 +4788,13 @@ pub(super) mod pin_count_tests {
         admit(&mut pools, surf(2), 0, 0);
         assert!(!pools.plan_idle_maintenance(t0 + 1), "throttled: no pass");
         assert_eq!(
-            pools.idle_clock_ms,
+            pools.shared.idle_clock_ms,
             t0 + 1,
             "clock still advances when throttled"
         );
         assert!(pools.plan_idle_maintenance(t0 + MAINTENANCE_INTERVAL_MS));
         assert_eq!(
-            pools.registry.len(),
+            pools.shared.registry.len(),
             2,
             "maintenance owns no live residents"
         );
@@ -4718,7 +4809,7 @@ pub(super) mod pin_count_tests {
             admit(&mut pools, surf(100 + i), 0, 0);
         }
         assert!(pools.plan_idle_maintenance(IDLE_MAINTENANCE_START_MS + 1));
-        assert_eq!(pools.registry.len(), LIVE_RESIDENTS);
+        assert_eq!(pools.shared.registry.len(), LIVE_RESIDENTS);
     }
 
     /// A pass with no registry victim but live staging traffic is NOT settled.
@@ -4743,7 +4834,7 @@ pub(super) mod pin_count_tests {
         );
 
         // One staging acquire between passes — no victim, still not settled.
-        pools.staging_hits += 1;
+        pools.encoder.staging_hits += 1;
         assert!(
             !pools.note_maintenance_settled(),
             "uploads ran between passes; the buffer pools must not be trimmed"
@@ -4751,7 +4842,7 @@ pub(super) mod pin_count_tests {
         // …and the gate stays shut while uploads keep flowing, however many
         // zero-victim passes go by.
         for _ in 0..(SETTLED_PASSES_FOR_BUFFER_TRIM * 3) {
-            pools.staging_misses += 1;
+            pools.encoder.staging_misses += 1;
             assert!(!pools.note_maintenance_settled(), "still uploading");
         }
         // Uploads stop: the gate reopens after the usual consecutive passes.
@@ -4785,7 +4876,7 @@ pub(super) mod pin_count_tests {
         // A subsequent quiet pass stays allowed.
         assert!(pools.note_maintenance_settled(), "stays settled");
         // Upload activity resets the counter.
-        pools.staging_hits += 1;
+        pools.encoder.staging_hits += 1;
         assert!(
             !pools.note_maintenance_settled(),
             "uploads reset settled state"
@@ -4812,7 +4903,7 @@ pub(super) mod pin_count_tests {
         let now = IDLE_MAINTENANCE_START_MS + 500;
         // ...but it is the presented target this frame.
         assert!(pools.plan_idle_maintenance(now));
-        assert!(pools.registry.contains_key(&surf(1)));
+        assert!(pools.shared.registry.contains_key(&surf(1)));
     }
 
     /// Touching changes diagnostics, not lifetime: both touched and untouched
@@ -4826,10 +4917,10 @@ pub(super) mod pin_count_tests {
 
         pools.registry_touch_at(&surf(4), now);
         assert!(pools.plan_idle_maintenance(now));
-        assert!(pools.registry.contains_key(&surf(1)));
-        assert!(pools.registry.contains_key(&surf(4)));
+        assert!(pools.shared.registry.contains_key(&surf(1)));
+        assert!(pools.shared.registry.contains_key(&surf(4)));
         assert_eq!(
-            pools.registry.get(&surf(4)).unwrap().last_touch_ms,
+            pools.shared.registry.get(&surf(4)).unwrap().last_touch_ms,
             now,
             "the touched target is stamped at the touch time"
         );
@@ -4907,7 +4998,7 @@ pub(super) mod pin_count_tests {
         let mut pools = ResourcePools::new();
         let check = |pools: &ResourcePools, what: &str| {
             assert_eq!(
-                pools.registry_non_pinned,
+                pools.shared.registry_non_pinned,
                 pools.non_pinned_registry_totals_by_walk(),
                 "maintained totals disagree with the walk after {what}"
             );
@@ -4917,34 +5008,34 @@ pub(super) mod pin_count_tests {
         admit_sized(&mut pools, surf(1), 0, 0, (16, 16));
         admit_sized(&mut pools, surf(2), 0, 0, (64, 32));
         check(&pools, "two admits");
-        assert_eq!(pools.registry_non_pinned.count, 2);
+        assert_eq!(pools.shared.registry_non_pinned.count, 2);
 
         // First pin removes it; the second must not remove it twice.
         assert!(pools.pin_resident_target(&surf(1), true));
         check(&pools, "first pin");
-        assert_eq!(pools.registry_non_pinned.count, 1);
+        assert_eq!(pools.shared.registry_non_pinned.count, 1);
         assert!(pools.pin_resident_target(&surf(1), true));
         check(&pools, "second pin");
         assert_eq!(
-            pools.registry_non_pinned.count, 1,
+            pools.shared.registry_non_pinned.count, 1,
             "a second pin moves nothing"
         );
 
         // First unpin leaves a holder, so it stays out; the second returns it.
         assert!(pools.pin_resident_target(&surf(1), false));
         check(&pools, "first unpin");
-        assert_eq!(pools.registry_non_pinned.count, 1);
+        assert_eq!(pools.shared.registry_non_pinned.count, 1);
         assert!(pools.pin_resident_target(&surf(1), false));
         check(&pools, "second unpin");
         assert_eq!(
-            pools.registry_non_pinned.count, 2,
+            pools.shared.registry_non_pinned.count, 2,
             "the last unpin returns it"
         );
 
         // A spurious unpin saturates at zero and must not add it again.
         assert!(pools.pin_resident_target(&surf(1), false));
         check(&pools, "unpin below zero");
-        assert_eq!(pools.registry_non_pinned.count, 2);
+        assert_eq!(pools.shared.registry_non_pinned.count, 2);
 
         // Death, of a pinned slot and an unpinned one — only the unpinned one
         // was ever in the totals.
@@ -4954,7 +5045,7 @@ pub(super) mod pin_count_tests {
         check(&pools, "unregistering a pinned resident");
         pools.unregister_resident(&surf(1), ResidentReclaim::AllocationReclaimed);
         check(&pools, "unregistering an unpinned resident");
-        assert_eq!(pools.registry_non_pinned, NonPinnedTotals::default());
+        assert_eq!(pools.shared.registry_non_pinned, NonPinnedTotals::default());
 
         // And an unregister of something that was never there.
         pools.unregister_resident(&surf(7), ResidentReclaim::AllocationReclaimed);

@@ -107,7 +107,7 @@ impl ResourcePools {
         device: &ash::Device,
         import_id: reims_vgpu_memory::ImportId,
     ) {
-        match self.host_ram_imports.retire(import_id) {
+        match self.shared.host_ram_imports.retire(import_id) {
             host_ram::ParentRetire::Ready(parent) => {
                 crate::telemetry::note_route("guest_import_retired_now");
                 self.dispose(device, DeferredHandle::GuestAllocation(parent));
@@ -118,26 +118,31 @@ impl ResourcePools {
             }
             host_ram::ParentRetire::NotImported => {
                 crate::telemetry::note_route("guest_import_retired_unimported");
-                self.completed_guest_imports.push(import_id);
+                self.shared.completed_guest_imports.push(import_id);
             }
         }
     }
 
     /// Take allocation identities whose backend access has ended.
     pub(crate) fn take_completed_guest_imports(&mut self) -> Vec<reims_vgpu_memory::ImportId> {
-        std::mem::take(&mut self.completed_guest_imports)
+        std::mem::take(&mut self.shared.completed_guest_imports)
     }
 
     pub(crate) fn guest_reset_counts(&self) -> (usize, usize, usize, usize) {
-        let sampled = self.sampled_live.len()
-            + self.sampled_free.len()
-            + self.sampled_cache.len()
-            + self.attachment_snapshot_live.len()
-            + self.attachment_snapshot_free.len();
-        let storage = self.storage_image_live.len()
-            + self.storage_image_free.len()
-            + self.compute_storage_registry.len();
-        (self.registry.len(), self.targets.len(), sampled, storage)
+        let sampled = self.shared.sampled_live.len()
+            + self.shared.sampled_free.len()
+            + self.shared.sampled_cache.len()
+            + self.shared.attachment_snapshot_live.len()
+            + self.shared.attachment_snapshot_free.len();
+        let storage = self.shared.storage_image_live.len()
+            + self.shared.storage_image_free.len()
+            + self.shared.compute_storage_registry.len();
+        (
+            self.shared.registry.len(),
+            self.shared.targets.len(),
+            sampled,
+            storage,
+        )
     }
 
     /// The bindable range `guest_ref` names, importing its RAMBlock if this is
@@ -155,7 +160,7 @@ impl ResourcePools {
         ctx: &DeviceContext,
         guest_ref: &reims_vgpu_memory::GuestRef,
     ) -> Result<host_ram::BoundGuestRam, host_ram::HostRamDecline> {
-        unsafe { self.host_ram_imports.bind(ctx, guest_ref) }
+        unsafe { self.shared.host_ram_imports.bind(ctx, guest_ref) }
     }
 
     /// Import a RAMBlock ahead of any reference into it.
@@ -168,7 +173,7 @@ impl ResourcePools {
         ctx: &DeviceContext,
         import: &reims_vgpu_memory::GuestRamImport,
     ) -> Result<bool, host_ram::HostRamDecline> {
-        unsafe { self.host_ram_imports.warm(ctx, import) }
+        unsafe { self.shared.host_ram_imports.warm(ctx, import) }
     }
 
     /// How many RAMBlocks are imported, and how many bytes they cover.
@@ -178,15 +183,15 @@ impl ResourcePools {
     /// import, which the extension does not guarantee works and which pays the
     /// driver's page pinning for an answer that never changes.
     pub(crate) fn host_ram_import_census(&self) -> (usize, usize, u64, usize, usize, usize) {
-        let (ramblocks, aliases) = self.host_ram_imports.counts();
-        let recycled_images = self.sampled_free.len()
-            + self.attachment_snapshot_free.len()
-            + self.target_free.len()
-            + self.storage_image_free.len();
+        let (ramblocks, aliases) = self.shared.host_ram_imports.counts();
+        let recycled_images = self.shared.sampled_free.len()
+            + self.shared.attachment_snapshot_free.len()
+            + self.shared.target_free.len()
+            + self.shared.storage_image_free.len();
         (
             ramblocks,
             aliases,
-            self.host_ram_imports.imported_bytes(),
+            self.shared.host_ram_imports.imported_bytes(),
             0,
             0,
             recycled_images,
@@ -195,78 +200,82 @@ impl ResourcePools {
 
     pub(crate) fn new() -> Self {
         Self {
-            readback_lease_returns: Arc::new(ReadbackLeaseReturns::default()),
-            staging_free: HashMap::new(),
-            staging_live: Vec::new(),
-            gather_free: HashMap::new(),
-            gather_live: Vec::new(),
-            cb_bound_buffers: super::CbBufferMemo::default(),
-            cb_gather_owed: Vec::new(),
-            cb_sampled_guest: std::collections::HashMap::new(),
-            cb_graphics: super::CbGraphicsState::default(),
-            cb_guest_visibility: super::CbGuestVisibility::default(),
-            staging_hits: 0,
-            staging_misses: 0,
-            staging_miss_bins: [0; STAGING_BUCKET_BINS],
-            staging_miss_us_bins: [0; STAGING_BUCKET_BINS],
-            settled_staging_mark: 0,
-            targets: HashMap::new(),
-            target_order: Vec::new(),
-            multisample_target: None,
-            ad_hoc_framebuffers: HashMap::new(),
-            readback_free: HashMap::new(),
-            readback_live: None,
-            readback_multi_live: Vec::new(),
-            readback_leased: Vec::new(),
-            sampled_free: FreePool::new(),
-            sampled_live: Vec::new(),
-            attachment_snapshot_free: FreePool::new(),
-            attachment_snapshot_live: Vec::new(),
-            sampled_cache: Vec::new(),
-            sampled_cache_bytes: 0,
-            storage_image_free: FreePool::new(),
-            storage_image_live: Vec::new(),
-            compute_storage_registry: HashMap::new(),
-            compute_storage_order: VecDeque::new(),
-            registry: HashMap::new(),
-            guest_resident_authority: HashMap::new(),
-            registry_order: VecDeque::new(),
-            reclaimed_recent: VecDeque::new(),
-            registry_non_pinned_peak: 0,
-            registry_non_pinned: NonPinnedTotals::default(),
-            registry_non_pinned_peak_bytes: 0,
-            registry_sole_copy: NonPinnedTotals::default(),
-            registry_sole_copy_peak: NonPinnedTotals::default(),
-            resident_resample_peak_ms: 0,
-            compute_storage_sole_copy: NonPinnedTotals::default(),
-            compute_storage_sole_copy_peak: NonPinnedTotals::default(),
-            idle_clock_ms: 0,
-            last_maintenance_ms: 0,
-            settled_maintenance_passes: 0,
-            cmd_pool: vk::CommandPool::null(),
-            desc_arena: DescriptorArena::empty(),
-            scatter: None,
-            scatter_refused: false,
-            scatter_dsets: Vec::new(),
-            scatter_dset_free: Vec::new(),
-            slots: Vec::new(),
-            cur: 0,
-            in_flight: 0,
-            graveyard: Vec::new(),
-            completed_guest_imports: Vec::new(),
-            target_free: FreePool::new(),
-            open_batch: None,
-            batch_max_draws: BATCH_MAX_DRAWS,
-            last_pass: None,
-            open_pass: None,
-            slab: slab::SlabPool::new(),
-            slabs: buffer_slab::BufferSlabs::new(),
-            host_ram_imports: host_ram::HostRamImports::default(),
-            guest_reads_in_flight: false,
-            guest_write_tokens_live: std::collections::HashMap::new(),
-            resident_pins_live: Vec::new(),
-            compute_write_pins_live: Vec::new(),
-            initialized: false,
+            encoder: super::EncoderPools {
+                readback_lease_returns: Arc::new(ReadbackLeaseReturns::default()),
+                staging_free: HashMap::new(),
+                staging_live: Vec::new(),
+                gather_free: HashMap::new(),
+                gather_live: Vec::new(),
+                cb_bound_buffers: super::CbBufferMemo::default(),
+                cb_gather_owed: Vec::new(),
+                cb_sampled_guest: std::collections::HashMap::new(),
+                cb_graphics: super::CbGraphicsState::default(),
+                cb_guest_visibility: super::CbGuestVisibility::default(),
+                staging_hits: 0,
+                staging_misses: 0,
+                staging_miss_bins: [0; STAGING_BUCKET_BINS],
+                staging_miss_us_bins: [0; STAGING_BUCKET_BINS],
+                settled_staging_mark: 0,
+                readback_free: HashMap::new(),
+                readback_live: None,
+                readback_multi_live: Vec::new(),
+                readback_leased: Vec::new(),
+                cmd_pool: vk::CommandPool::null(),
+                desc_arena: DescriptorArena::empty(),
+                scatter_dsets: Vec::new(),
+                scatter_dset_free: Vec::new(),
+                slots: Vec::new(),
+                cur: 0,
+                in_flight: 0,
+                graveyard: Vec::new(),
+                open_batch: None,
+                batch_max_draws: BATCH_MAX_DRAWS,
+                last_pass: None,
+                open_pass: None,
+                guest_reads_in_flight: false,
+                guest_write_tokens_live: std::collections::HashMap::new(),
+                resident_pins_live: Vec::new(),
+                compute_write_pins_live: Vec::new(),
+            },
+            shared: super::SharedPools {
+                targets: HashMap::new(),
+                target_order: Vec::new(),
+                multisample_target: None,
+                ad_hoc_framebuffers: HashMap::new(),
+                sampled_free: FreePool::new(),
+                sampled_live: Vec::new(),
+                attachment_snapshot_free: FreePool::new(),
+                attachment_snapshot_live: Vec::new(),
+                sampled_cache: Vec::new(),
+                sampled_cache_bytes: 0,
+                storage_image_free: FreePool::new(),
+                storage_image_live: Vec::new(),
+                compute_storage_registry: HashMap::new(),
+                compute_storage_order: VecDeque::new(),
+                registry: HashMap::new(),
+                guest_resident_authority: HashMap::new(),
+                registry_order: VecDeque::new(),
+                reclaimed_recent: VecDeque::new(),
+                registry_non_pinned_peak: 0,
+                registry_non_pinned: NonPinnedTotals::default(),
+                registry_non_pinned_peak_bytes: 0,
+                registry_sole_copy: NonPinnedTotals::default(),
+                registry_sole_copy_peak: NonPinnedTotals::default(),
+                resident_resample_peak_ms: 0,
+                compute_storage_sole_copy: NonPinnedTotals::default(),
+                compute_storage_sole_copy_peak: NonPinnedTotals::default(),
+                idle_clock_ms: 0,
+                last_maintenance_ms: 0,
+                settled_maintenance_passes: 0,
+                scatter: None,
+                scatter_refused: false,
+                completed_guest_imports: Vec::new(),
+                target_free: FreePool::new(),
+                slab: slab::SlabPool::new(),
+                slabs: buffer_slab::BufferSlabs::new(),
+                host_ram_imports: host_ram::HostRamImports::default(),
+                initialized: false,
+            },
         }
     }
     /// Advance the registry clock and report whether a bounded maintenance pass
@@ -274,16 +283,16 @@ impl ResourcePools {
     /// (dead direct images and free-pool entries), but elapsed time is never an
     /// authority to destroy a live resident.
     pub(super) fn plan_idle_maintenance(&mut self, now_ms: u64) -> bool {
-        if now_ms > self.idle_clock_ms {
-            self.idle_clock_ms = now_ms;
+        if now_ms > self.shared.idle_clock_ms {
+            self.shared.idle_clock_ms = now_ms;
         }
-        let now = self.idle_clock_ms;
+        let now = self.shared.idle_clock_ms;
         if now < IDLE_MAINTENANCE_START_MS
-            || now.saturating_sub(self.last_maintenance_ms) < MAINTENANCE_INTERVAL_MS
+            || now.saturating_sub(self.shared.last_maintenance_ms) < MAINTENANCE_INTERVAL_MS
         {
             return false;
         }
-        self.last_maintenance_ms = now;
+        self.shared.last_maintenance_ms = now;
         true
     }
 
@@ -314,21 +323,21 @@ impl ResourcePools {
     ) -> usize {
         let mut trimmed = 0;
         while trimmed < max {
-            let Some(slot) = self.attachment_snapshot_free.pop_any() else {
+            let Some(slot) = self.shared.attachment_snapshot_free.pop_any() else {
                 break;
             };
             self.destroy_deferred_handle(device, DeferredHandle::RecycleSampled(slot));
             trimmed += 1;
         }
         while trimmed < max {
-            let Some(slot) = self.sampled_free.pop_any() else {
+            let Some(slot) = self.shared.sampled_free.pop_any() else {
                 break;
             };
             self.destroy_deferred_handle(device, DeferredHandle::RecycleSampled(slot));
             trimmed += 1;
         }
         while trimmed < max {
-            let Some(img) = self.target_free.pop_any() else {
+            let Some(img) = self.shared.target_free.pop_any() else {
                 break;
             };
             self.destroy_deferred_handle(
@@ -347,17 +356,17 @@ impl ResourcePools {
         let mut buf_trimmed = 0;
         if trim_buffers {
             while buf_trimmed < max {
-                let Some(slot) = pop_largest_pool_entry(&mut self.staging_free) else {
+                let Some(slot) = pop_largest_pool_entry(&mut self.encoder.staging_free) else {
                     break;
                 };
-                release_buffer_slot(device, &mut self.slabs, slot);
+                release_buffer_slot(device, &mut self.shared.slabs, slot);
                 buf_trimmed += 1;
             }
             while buf_trimmed < max {
-                let Some(slot) = pop_largest_pool_entry(&mut self.readback_free) else {
+                let Some(slot) = pop_largest_pool_entry(&mut self.encoder.readback_free) else {
                     break;
                 };
-                release_buffer_slot(device, &mut self.slabs, slot);
+                release_buffer_slot(device, &mut self.shared.slabs, slot);
                 buf_trimmed += 1;
             }
             // The gather pool is under the same budget and the same settled-idle
@@ -366,10 +375,10 @@ impl ResourcePools {
             // trimming it mid-workload would buy back VRAM at the price of that
             // block allocation under the engine lock.
             while buf_trimmed < max {
-                let Some(slot) = pop_largest_pool_entry(&mut self.gather_free) else {
+                let Some(slot) = pop_largest_pool_entry(&mut self.encoder.gather_free) else {
                     break;
                 };
-                release_buffer_slot(device, &mut self.slabs, slot);
+                release_buffer_slot(device, &mut self.shared.slabs, slot);
                 buf_trimmed += 1;
             }
             // Returning the carves above is what lets an upload block empty;
@@ -382,7 +391,8 @@ impl ResourcePools {
             // working set, and what a quiet desktop keeps is one spare block per
             // size class — tens of MiB against the ~177 MiB of frozen staging
             // this trim was written for.
-            self.slabs
+            self.shared
+                .slabs
                 .trim_empty_blocks(device, BUFFER_SLAB_IDLE_KEEP_EMPTY);
             // The standalone (non-slab) compute-storage recycle pool re-allocs via
             // a full `vkAllocateMemory` on the next dispatch — like the buffer
@@ -393,7 +403,7 @@ impl ResourcePools {
             // budget so it never starves the buffer trim.
             let mut storage_trimmed = 0;
             while storage_trimmed < max {
-                let Some(slot) = self.storage_image_free.pop_any() else {
+                let Some(slot) = self.shared.storage_image_free.pop_any() else {
                     break;
                 };
                 self.destroy_deferred_handle(
@@ -421,20 +431,23 @@ impl ResourcePools {
         // behaviour has to be able to reach this on an unsettled pass; the
         // policy is [`idle_slab_trim_keep`] and this is its only caller.
         if let Some(keep) = idle_slab_trim_keep(trim_buffers) {
-            self.slab.trim_empty_blocks(device, keep);
+            self.shared.slab.trim_empty_blocks(device, keep);
         }
         trimmed + buf_trimmed
     }
 
     /// Take entry `index` out of the sampled cache and update its byte gauge.
     fn remove_sampled_entry(&mut self, index: usize) -> SampledSlot {
-        let evicted = self.sampled_cache.swap_remove(index);
-        self.sampled_cache_bytes = self.sampled_cache_bytes.saturating_sub(evicted.content_len);
+        let evicted = self.shared.sampled_cache.swap_remove(index);
+        self.shared.sampled_cache_bytes = self
+            .shared
+            .sampled_cache_bytes
+            .saturating_sub(evicted.content_len);
         evicted.slot
     }
 
     fn push_sampled_entry(&mut self, entry: ResidentSampledSlot) {
-        self.sampled_cache.push(entry);
+        self.shared.sampled_cache.push(entry);
     }
 
     /// Remove entries whose serialized texture owners are all gone. The
@@ -443,6 +456,7 @@ impl ResourcePools {
     fn take_released_sampled_entries(&mut self) -> Vec<SampledSlot> {
         let mut released = Vec::new();
         while let Some(index) = self
+            .shared
             .sampled_cache
             .iter()
             .position(|entry| !entry.has_live_owner())
@@ -476,15 +490,19 @@ impl ResourcePools {
     /// draw acquires staging, and the trim still fires and still returns the
     /// memory.
     pub(super) fn note_maintenance_settled(&mut self) -> bool {
-        let acquires = self.staging_hits.wrapping_add(self.staging_misses);
-        let uploads_ran = acquires != self.settled_staging_mark;
-        self.settled_staging_mark = acquires;
+        let acquires = self
+            .encoder
+            .staging_hits
+            .wrapping_add(self.encoder.staging_misses);
+        let uploads_ran = acquires != self.encoder.settled_staging_mark;
+        self.encoder.settled_staging_mark = acquires;
         if !uploads_ran {
-            self.settled_maintenance_passes = self.settled_maintenance_passes.saturating_add(1);
+            self.shared.settled_maintenance_passes =
+                self.shared.settled_maintenance_passes.saturating_add(1);
         } else {
-            self.settled_maintenance_passes = 0;
+            self.shared.settled_maintenance_passes = 0;
         }
-        self.settled_maintenance_passes >= SETTLED_PASSES_FOR_BUFFER_TRIM
+        self.shared.settled_maintenance_passes >= SETTLED_PASSES_FOR_BUFFER_TRIM
     }
 
     /// Run periodic maintenance for objects that are already outside live
@@ -512,8 +530,8 @@ impl ResourcePools {
     /// `(free_hits, free_allocs, recycle_admits, recycle_cap_drops)`.
     /// Merged into `CounterSnapshot` by `engine::counter_snapshot`.
     pub(crate) fn recycle_stats(&self) -> (u64, u64, u64, u64) {
-        let sampled = self.sampled_free.stats();
-        let snapshots = self.attachment_snapshot_free.stats();
+        let sampled = self.shared.sampled_free.stats();
+        let snapshots = self.shared.attachment_snapshot_free.stats();
         (
             sampled.0 + snapshots.0,
             sampled.1 + snapshots.1,
@@ -527,7 +545,7 @@ impl ResourcePools {
         ctx: &DeviceContext,
         counters: &EngineCounters,
     ) -> Result<(), DrawError> {
-        if self.initialized {
+        if self.shared.initialized {
             return Ok(());
         }
         self.configure_batch_capacity(super::batch_max_draws(ctx.caps.memory.topology));
@@ -590,12 +608,12 @@ impl ResourcePools {
                 }
             }
         }
-        self.cmd_pool = cmd_pool;
-        self.desc_arena = desc_arena;
-        self.slots = slots;
-        self.cur = 0;
-        self.in_flight = 0;
-        self.initialized = true;
+        self.encoder.cmd_pool = cmd_pool;
+        self.encoder.desc_arena = desc_arena;
+        self.encoder.slots = slots;
+        self.encoder.cur = 0;
+        self.encoder.in_flight = 0;
+        self.shared.initialized = true;
         Ok(())
     }
 
@@ -604,15 +622,15 @@ impl ResourcePools {
     /// lifetime, so their recycle budget is derived here rather than retaining
     /// the largest topology's population on every host.
     fn configure_batch_capacity(&mut self, draws: u64) {
-        debug_assert!(self.attachment_snapshot_live.is_empty());
-        debug_assert_eq!(self.attachment_snapshot_free.len(), 0);
-        self.batch_max_draws = draws;
-        self.attachment_snapshot_free = FreePool::new();
+        debug_assert!(self.shared.attachment_snapshot_live.is_empty());
+        debug_assert_eq!(self.shared.attachment_snapshot_free.len(), 0);
+        self.encoder.batch_max_draws = draws;
+        self.shared.attachment_snapshot_free = FreePool::new();
     }
 
     /// The capacity installed for this pool's physical device.
     pub(crate) fn batch_capacity(&self) -> u64 {
-        self.batch_max_draws
+        self.encoder.batch_max_draws
     }
 
     /// Allocate one descriptor set for `dsl` from the arena, growing a new pool
@@ -626,12 +644,12 @@ impl ResourcePools {
         dsl: vk::DescriptorSetLayout,
         counters: &EngineCounters,
     ) -> Result<(vk::DescriptorSet, vk::DescriptorPool), DrawError> {
-        let (set, pool, grew) = self.desc_arena.allocate(device, dsl)?;
+        let (set, pool, grew) = self.encoder.desc_arena.allocate(device, dsl)?;
         if grew {
             counters.desc_pool_grow.fetch_add(1, Ordering::Relaxed);
             reims_vgpu_observe::off(format!(
                 "desc_arena_grow blocks={} block_max_sets={DESC_BLOCK_MAX_SETS} cause=pool_exhausted",
-                self.desc_arena.block_count()
+                self.encoder.desc_arena.block_count()
             ));
         }
         Ok((set, pool))
@@ -653,19 +671,19 @@ impl ResourcePools {
         &mut self,
         ctx: &DeviceContext,
     ) -> Option<super::super::guest_scatter::ScatterPipeline> {
-        if let Some(p) = self.scatter {
+        if let Some(p) = self.shared.scatter {
             return Some(p);
         }
-        if self.scatter_refused {
+        if self.shared.scatter_refused {
             return None;
         }
         match unsafe { super::super::guest_scatter::ScatterPipeline::create(ctx) } {
             Ok(p) => {
-                self.scatter = Some(p);
+                self.shared.scatter = Some(p);
                 Some(p)
             }
             Err(e) => {
-                self.scatter_refused = true;
+                self.shared.scatter_refused = true;
                 reims_vgpu_observe::Emit::decline("scatter_pipeline", &e).fail();
                 None
             }
@@ -696,7 +714,7 @@ impl ResourcePools {
             Some(recycled) => recycled,
             None => unsafe { self.alloc_descriptor_set(device, dsl, counters) }?,
         };
-        self.scatter_dsets.push((set, pool));
+        self.encoder.scatter_dsets.push((set, pool));
         Ok(set)
     }
 
@@ -712,7 +730,7 @@ impl ResourcePools {
     /// command buffer cannot be handed one set and have the second's
     /// `write_set` overwrite the first's bindings.
     fn take_free_scatter_dset(&mut self) -> Option<(vk::DescriptorSet, vk::DescriptorPool)> {
-        self.scatter_dset_free.pop()
+        self.encoder.scatter_dset_free.pop()
     }
 
     /// Return a retired entry's guest-scatter sets to the free list.
@@ -722,7 +740,7 @@ impl ResourcePools {
     /// caller that has one. `drain_cleanup` is the only call site and it runs
     /// after the wait.
     fn recycle_scatter_dsets(&mut self, sets: &mut Vec<(vk::DescriptorSet, vk::DescriptorPool)>) {
-        self.scatter_dset_free.append(sets);
+        self.encoder.scatter_dset_free.append(sets);
     }
 
     /// Free `(set, owning_pool)` pairs back to their allocating blocks.
@@ -731,7 +749,7 @@ impl ResourcePools {
         device: &ash::Device,
         sets: &[(vk::DescriptorSet, vk::DescriptorPool)],
     ) {
-        self.desc_arena.free(device, sets);
+        self.encoder.desc_arena.free(device, sets);
     }
 
     /// The ring slots whose recorded GPU work may still reference pool objects:
@@ -763,16 +781,16 @@ impl ResourcePools {
     /// covers it: it covers the two states above, and this is a third.
     fn open_slot_mask(&self) -> SlotMask {
         let mut mask: SlotMask = 0;
-        for (index, slot) in self.slots.iter().enumerate() {
+        for (index, slot) in self.encoder.slots.iter().enumerate() {
             if slot.pending.is_some() {
                 mask |= 1 << index;
             }
         }
-        if self.open_batch.is_some() {
+        if self.encoder.open_batch.is_some() {
             // The batch records into `cur` and seals onto that same slot at
             // flush, and every path that retires a slot flushes the batch
             // first, so this bit cannot clear before the batch's work retires.
-            mask |= 1 << self.cur;
+            mask |= 1 << self.encoder.cur;
         }
         mask
     }
@@ -784,7 +802,7 @@ impl ResourcePools {
         if waiting == 0 {
             self.destroy_or_recycle(device, handle);
         } else {
-            self.graveyard.push((waiting, handle));
+            self.encoder.graveyard.push((waiting, handle));
         }
     }
 
@@ -834,20 +852,21 @@ impl ResourcePools {
         bind_op: VkOp,
         counters: &EngineCounters,
     ) -> Result<vk::DeviceMemory, DrawError> {
-        self.slab
+        self.shared
+            .slab
             .ensure_image_unregistered(image)
             .map_err(DrawError::Slab)?;
-        let token = self.slab.acquire(ctx, ireq, counters)?;
+        let token = self.shared.slab.acquire(ctx, ireq, counters)?;
         match ctx
             .device
             .bind_image_memory(image, token.memory, token.offset())
         {
             Ok(()) => {
-                self.slab.register(image, token);
+                self.shared.slab.register(image, token);
                 Ok(token.memory)
             }
             Err(e) => {
-                self.slab.release_token(&ctx.device, token);
+                self.shared.slab.release_token(&ctx.device, token);
                 Err(DrawError::VkCall(VkCall::new(bind_op, e)))
             }
         }
@@ -858,7 +877,7 @@ impl ResourcePools {
     /// `vkFreeMemory` at every DEVICE_LOCAL-image free site: the memory belongs
     /// to a shared block, not the image.
     pub(super) unsafe fn free_image_slab(&mut self, device: &ash::Device, image: vk::Image) {
-        self.slab.free_image(device, image);
+        self.shared.slab.free_image(device, image);
     }
 
     /// Terminal handling for a deferred handle once it is safe (in_flight == 0):
@@ -879,20 +898,20 @@ impl ResourcePools {
     /// Return an evicted sampled slot to `sampled_free` for reuse by a later
     /// same-geometry `acquire_sampled`.
     fn admit_sampled(&mut self, slot: SampledSlot) {
-        self.sampled_free.admit(slot.key(), slot)
+        self.shared.sampled_free.admit(slot.key(), slot)
     }
 
     /// Return a displaced resident-target image to `target_free` for reuse by a
     /// later same-(geometry, format) `registry_ensure`/`registry_ensure_attachment`
     /// create.
     fn admit_target(&mut self, img: FreeTargetImage) {
-        self.target_free.admit(img.key(), img)
+        self.shared.target_free.admit(img.key(), img)
     }
 
     /// Return a retired transient compute-storage image to `storage_image_free`
     /// for reuse by a later same-geometry `acquire_storage_image`.
     fn admit_storage_image(&mut self, slot: StorageImageSlot) {
-        self.storage_image_free.admit(slot.key, slot)
+        self.shared.storage_image_free.admit(slot.key, slot)
     }
 
     /// Pop a recycled resident-target image for `(width, height, format)` if one
@@ -912,13 +931,13 @@ impl ResourcePools {
             sample_count,
             format,
         };
-        self.target_free.take(&key)
+        self.shared.target_free.take(&key)
     }
 
     /// Cumulative resident-target recycle diagnostics:
     /// `(free_hits, free_allocs, recycle_admits, recycle_cap_drops)`.
     pub(crate) fn target_recycle_stats(&self) -> (u64, u64, u64, u64) {
-        self.target_free.stats()
+        self.shared.target_free.stats()
     }
 
     /// `(non_pinned_peak, non_pinned_peak_bytes)` for the resident registry —
@@ -931,8 +950,8 @@ impl ResourcePools {
     /// [`ResourcePools::recoverable_residents`].
     pub(crate) fn registry_pressure_stats(&self) -> (u64, u64) {
         (
-            self.registry_non_pinned_peak,
-            self.registry_non_pinned_peak_bytes,
+            self.shared.registry_non_pinned_peak,
+            self.shared.registry_non_pinned_peak_bytes,
         )
     }
 
@@ -946,8 +965,8 @@ impl ResourcePools {
     /// [`ResourcePools::registry_sole_copy`].
     pub(crate) fn registry_sole_copy_stats(&self) -> (u64, u64) {
         (
-            self.registry_sole_copy_peak.count as u64,
-            self.registry_sole_copy_peak.bytes,
+            self.shared.registry_sole_copy_peak.count as u64,
+            self.shared.registry_sole_copy_peak.bytes,
         )
     }
 
@@ -956,15 +975,15 @@ impl ResourcePools {
     /// other population.
     pub(crate) fn compute_storage_sole_copy_stats(&self) -> (u64, u64) {
         (
-            self.compute_storage_sole_copy_peak.count as u64,
-            self.compute_storage_sole_copy_peak.bytes,
+            self.shared.compute_storage_sole_copy_peak.count as u64,
+            self.shared.compute_storage_sole_copy_peak.bytes,
         )
     }
 
     /// `VkDeviceMemory` the image slab holds right now, and the carved half of
     /// it, in bytes. See [`slab::SlabPool::held_bytes`] for what it covers.
     pub(crate) fn slab_held_bytes(&self) -> (u64, u64) {
-        self.slab.held_bytes()
+        self.shared.slab.held_bytes()
     }
 
     /// The worst gap between a resident being touched and being read again, for
@@ -972,7 +991,7 @@ impl ResourcePools {
     /// [`ResourcePools::resident_resample_peak_ms`] for what it is the margin
     /// against.
     pub(crate) fn resident_resample_peak_ms(&self) -> u64 {
-        self.resident_resample_peak_ms
+        self.shared.resident_resample_peak_ms
     }
 
     /// Clear `retired` from every parked handle's wait mask and take out the
@@ -980,15 +999,15 @@ impl ResourcePools {
     /// just retired; teardown passes every bit.
     ///
     /// Taking rather than destroying in place is what lets `destroy_or_recycle`
-    /// borrow `self.sampled_free`/`self.target_free` while the graveyard is
+    /// borrow `self.shared.sampled_free`/`self.shared.target_free` while the graveyard is
     /// being walked, and it is the whole decision the mask exists to make, so
     /// it is also the seam the tests drive without a device.
     fn take_released_graveyard(&mut self, retired: SlotMask) -> Vec<DeferredHandle> {
-        let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.graveyard)
+        let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.encoder.graveyard)
             .into_iter()
             .map(|(mask, handle)| (mask & !retired, handle))
             .partition(|(mask, _)| *mask == 0);
-        self.graveyard = waiting;
+        self.encoder.graveyard = waiting;
         ready.into_iter().map(|(_, handle)| handle).collect()
     }
 
@@ -1075,12 +1094,12 @@ impl ResourcePools {
         let Some(probe) = ctx.draw_spans.as_ref() else {
             return;
         };
-        let slot = self.cur;
+        let slot = self.encoder.cur;
         // A slot armed twice without a read between means the ring reused it
         // without retiring it, which would also mean its cleanup was never
         // drained. Report rather than silently overwrite: the sample is lost
         // either way and only the counter says so.
-        if self.slots[slot].span != gpu_span::SlotSpan::Idle {
+        if self.encoder.slots[slot].span != gpu_span::SlotSpan::Idle {
             gpu_span::note_unread();
         }
         let base = DrawSpanProbe::base(slot);
@@ -1088,14 +1107,14 @@ impl ResourcePools {
             .cmd_reset_query_pool(cb, probe.pool, base, DrawSpanProbe::PER_SLOT);
         ctx.device
             .cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, probe.pool, base);
-        self.slots[slot].span = gpu_span::SlotSpan::Armed(kind);
+        self.encoder.slots[slot].span = gpu_span::SlotSpan::Armed(kind);
         gpu_span::note_armed();
     }
 
     /// Write the bottom timestamp of the slot's command buffer, immediately
     /// before it ends.
     ///
-    /// `slot` is passed rather than read from `self.cur` because the batch flush
+    /// `slot` is passed rather than read from `self.encoder.cur` because the batch flush
     /// path seals the slot the batch was opened on, and a caller that guessed
     /// would attribute one submission's span to another slot's queries.
     ///
@@ -1107,7 +1126,7 @@ impl ResourcePools {
         let Some(probe) = ctx.draw_spans.as_ref() else {
             return;
         };
-        let gpu_span::SlotSpan::Armed(kind) = self.slots[slot].span else {
+        let gpu_span::SlotSpan::Armed(kind) = self.encoder.slots[slot].span else {
             return;
         };
         ctx.device.cmd_write_timestamp(
@@ -1116,7 +1135,7 @@ impl ResourcePools {
             probe.pool,
             DrawSpanProbe::base(slot) + 1,
         );
-        self.slots[slot].span = gpu_span::SlotSpan::Sealed(kind);
+        self.encoder.slots[slot].span = gpu_span::SlotSpan::Sealed(kind);
         gpu_span::note_sealed();
     }
 
@@ -1131,7 +1150,7 @@ impl ResourcePools {
         ctx: &DeviceContext,
         cb: vk::CommandBuffer,
     ) {
-        unsafe { self.gpu_span_seal(ctx, cb, self.cur) };
+        unsafe { self.gpu_span_seal(ctx, cb, self.encoder.cur) };
     }
 
     /// Reset this slot's readback timestamp region and write its start stamp.
@@ -1154,13 +1173,13 @@ impl ResourcePools {
         let Some(probe) = ctx.timestamps.as_ref() else {
             return;
         };
-        let slot = self.cur;
+        let slot = self.encoder.cur;
         let base = TimestampProbe::base(slot);
         ctx.device
             .cmd_reset_query_pool(cb, probe.pool, base, TimestampProbe::PER_SLOT);
         ctx.device
             .cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, probe.pool, base);
-        self.slots[slot].readback_span_armed = true;
+        self.encoder.slots[slot].readback_span_armed = true;
     }
 
     /// Write one of the two later stamps of the current slot's readback region.
@@ -1184,14 +1203,14 @@ impl ResourcePools {
         let Some(probe) = ctx.timestamps.as_ref() else {
             return;
         };
-        if !self.slots[self.cur].readback_span_armed {
+        if !self.encoder.slots[self.encoder.cur].readback_span_armed {
             return;
         }
         ctx.device.cmd_write_timestamp(
             cb,
             stage,
             probe.pool,
-            TimestampProbe::base(self.cur) + mark,
+            TimestampProbe::base(self.encoder.cur) + mark,
         );
     }
 
@@ -1207,7 +1226,7 @@ impl ResourcePools {
         let Some(probe) = ctx.timestamps.as_ref() else {
             return;
         };
-        if !std::mem::replace(&mut self.slots[slot].readback_span_armed, false) {
+        if !std::mem::replace(&mut self.encoder.slots[slot].readback_span_armed, false) {
             return;
         }
         let mut ticks = [0u64; TimestampProbe::PER_SLOT as usize];
@@ -1240,7 +1259,7 @@ impl ResourcePools {
             return;
         };
         let gpu_span::SlotSpan::Sealed(kind) =
-            std::mem::replace(&mut self.slots[slot].span, gpu_span::SlotSpan::Idle)
+            std::mem::replace(&mut self.encoder.slots[slot].span, gpu_span::SlotSpan::Idle)
         else {
             return;
         };
@@ -1267,7 +1286,7 @@ impl ResourcePools {
         counters: &EngineCounters,
         index: usize,
     ) -> Result<(), DrawError> {
-        if self.slots[index].pending.is_none() {
+        if self.encoder.slots[index].pending.is_none() {
             return Ok(());
         }
         self.await_submit_return(counters, index, DeviceLostOp::PoolsWaitFencesRetire)?;
@@ -1278,7 +1297,7 @@ impl ResourcePools {
                 DeviceLostOp::PoolsWaitFencesRetire,
             ));
         }
-        let fence = self.slots[index].fence;
+        let fence = self.encoder.slots[index].fence;
         ctx.device
             .wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS)
             .map_err(|e| {
@@ -1311,8 +1330,11 @@ impl ResourcePools {
         // The same argument, for the other probe: this slot's three readback
         // queries are readable exactly now and never before.
         unsafe { self.readback_span_read(ctx, index) };
-        let pending = self.slots[index].pending.take().expect("checked above");
-        self.in_flight = self.in_flight.saturating_sub(1);
+        let pending = self.encoder.slots[index]
+            .pending
+            .take()
+            .expect("checked above");
+        self.encoder.in_flight = self.encoder.in_flight.saturating_sub(1);
         // Its fence has signalled, so this submission is no longer a candidate
         // for a wedge. Paired with the `note_submit` in `finish_entry_async`.
         crate::gpu_hang_trail::note_retired(index);
@@ -1330,14 +1352,17 @@ impl ResourcePools {
         index: usize,
         op: DeviceLostOp,
     ) -> Result<(), DrawError> {
-        let state = std::mem::replace(&mut self.slots[index].submission, SlotSubmission::HostOwned);
+        let state = std::mem::replace(
+            &mut self.encoder.slots[index].submission,
+            SlotSubmission::HostOwned,
+        );
         let result = match state {
             SlotSubmission::HostOwned => Ok(()),
             SlotSubmission::QueueOwned(receipt) => receipt.wait(),
             SlotSubmission::Failed(error) => Err(error),
         };
         if let Err(error) = result {
-            self.slots[index].submission = SlotSubmission::Failed(error);
+            self.encoder.slots[index].submission = SlotSubmission::Failed(error);
         }
         result.map_err(|error| Self::wait_error(counters, error, op))
     }
@@ -1350,7 +1375,7 @@ impl ResourcePools {
         counters: &EngineCounters,
         index: usize,
     ) -> Result<bool, DrawError> {
-        let result = match &self.slots[index].submission {
+        let result = match &self.encoder.slots[index].submission {
             SlotSubmission::HostOwned => return Ok(true),
             SlotSubmission::QueueOwned(receipt) => {
                 let Some(result) = receipt.try_complete() else {
@@ -1360,7 +1385,7 @@ impl ResourcePools {
             }
             SlotSubmission::Failed(error) => Err(*error),
         };
-        self.slots[index].submission = match result {
+        self.encoder.slots[index].submission = match result {
             Ok(()) => SlotSubmission::HostOwned,
             Err(error) => SlotSubmission::Failed(error),
         };
@@ -1380,7 +1405,7 @@ impl ResourcePools {
     /// after `batch_flush` without having to reach back into a batch that no
     /// longer exists by then.
     pub(crate) fn batch_open_recording(&self) -> Option<(vk::CommandBuffer, vk::Fence)> {
-        self.open_batch.as_ref().map(|b| (b.cb, b.fence))
+        self.encoder.open_batch.as_ref().map(|b| (b.cb, b.fence))
     }
 
     /// Start a new entry (draw / dispatch / sync helper): advance to the next
@@ -1419,10 +1444,10 @@ impl ResourcePools {
         // `break` on the first unsignaled slot is load-bearing: reaping out of
         // order can drop `in_flight` to 0 while later slots still run, which
         // would let `gpu_work_open()` admit a graveyard drain under live work.
-        let n = self.slots.len();
+        let n = self.encoder.slots.len();
         for step in 1..=n {
-            let index = (self.cur + step) % n;
-            if self.slots[index].pending.is_none() {
+            let index = (self.encoder.cur + step) % n;
+            if self.encoder.slots[index].pending.is_none() {
                 continue;
             }
             if !self.try_take_submit_return(counters, index)? {
@@ -1430,7 +1455,7 @@ impl ResourcePools {
             }
             let signaled = ctx
                 .device
-                .get_fence_status(self.slots[index].fence)
+                .get_fence_status(self.encoder.slots[index].fence)
                 .map_err(|e| {
                     Self::wait_error(counters, e, DeviceLostOp::PoolsFenceStatusBeginEntry)
                 })?;
@@ -1439,15 +1464,15 @@ impl ResourcePools {
             }
             self.retire_slot(ctx, counters, index)?;
         }
-        let next = (self.cur + 1) % self.slots.len();
-        if self.slots[next].pending.is_some() {
+        let next = (self.encoder.cur + 1) % self.encoder.slots.len();
+        if self.encoder.slots[next].pending.is_some() {
             self.await_submit_return(counters, next, DeviceLostOp::PoolsWaitFencesRetire)?;
             // Count as a "block" only when the fence is genuinely unsignaled
             // (the GPU still owns the slot); reclaiming a finished slot on
             // advance is bookkeeping, not a stall.
             let still_running = !ctx
                 .device
-                .get_fence_status(self.slots[next].fence)
+                .get_fence_status(self.encoder.slots[next].fence)
                 .map_err(|e| {
                     Self::wait_error(counters, e, DeviceLostOp::PoolsFenceStatusBeginEntry)
                 })?;
@@ -1456,8 +1481,11 @@ impl ResourcePools {
                 counters.ring_retire_blocks.fetch_add(1, Ordering::Relaxed);
             }
         }
-        self.cur = next;
-        Ok((self.slots[next].cmd_buf, self.slots[next].fence))
+        self.encoder.cur = next;
+        Ok((
+            self.encoder.slots[next].cmd_buf,
+            self.encoder.slots[next].fence,
+        ))
     }
 
     /// Seal the current entry's transient resources: move every live pool slot
@@ -1477,9 +1505,9 @@ impl ResourcePools {
         // nothing recorded after this may bind one.
         self.forget_cb_bound_buffers("bindmap_clear_seal", "bindmap_clear_seal_entries");
         self.forget_cb_sampled_guest();
-        let mut readback: Vec<BufferSlot> = self.readback_live.take().into_iter().collect();
-        readback.append(&mut self.readback_multi_live);
-        let mut sampled = std::mem::take(&mut self.sampled_live);
+        let mut readback: Vec<BufferSlot> = self.encoder.readback_live.take().into_iter().collect();
+        readback.append(&mut self.encoder.readback_multi_live);
+        let mut sampled = std::mem::take(&mut self.shared.sampled_live);
         let admissions = take_retained_slots(&mut sampled, sampled_retains);
         // Both seal points reach here, which is the whole reason the scatter's
         // sets are parked on `self` instead of travelling with its plan. They
@@ -1488,19 +1516,20 @@ impl ResourcePools {
         SealedEntry {
             cleanup: PendingGpuCleanup {
                 dsets,
-                scatter_dsets: std::mem::take(&mut self.scatter_dsets),
-                staging: std::mem::take(&mut self.staging_live),
-                gather: std::mem::take(&mut self.gather_live),
+                scatter_dsets: std::mem::take(&mut self.encoder.scatter_dsets),
+                staging: std::mem::take(&mut self.encoder.staging_live),
+                gather: std::mem::take(&mut self.encoder.gather_live),
                 readback,
                 sampled,
-                attachment_snapshots: std::mem::take(&mut self.attachment_snapshot_live),
-                storage_images: std::mem::take(&mut self.storage_image_live),
-                unpin_residents: std::mem::take(&mut self.resident_pins_live),
-                unpin_compute_residents: std::mem::take(&mut self.compute_write_pins_live),
+                attachment_snapshots: std::mem::take(&mut self.shared.attachment_snapshot_live),
+                storage_images: std::mem::take(&mut self.shared.storage_image_live),
+                unpin_residents: std::mem::take(&mut self.encoder.resident_pins_live),
+                unpin_compute_residents: std::mem::take(&mut self.encoder.compute_write_pins_live),
                 guest_write_tokens: {
-                    let mut tokens: Vec<_> = std::mem::take(&mut self.guest_write_tokens_live)
-                        .into_values()
-                        .collect();
+                    let mut tokens: Vec<_> =
+                        std::mem::take(&mut self.encoder.guest_write_tokens_live)
+                            .into_values()
+                            .collect();
                     tokens.sort_unstable();
                     tokens
                 },
@@ -1546,19 +1575,19 @@ impl ResourcePools {
             admissions,
         } = sealed;
         debug_assert!(
-            self.slots[self.cur].pending.is_none(),
+            self.encoder.slots[self.encoder.cur].pending.is_none(),
             "current slot already owes cleanup"
         );
-        self.slots[self.cur].pending = Some(cleanup);
-        self.slots[self.cur].submission = submit_return
+        self.encoder.slots[self.encoder.cur].pending = Some(cleanup);
+        self.encoder.slots[self.encoder.cur].submission = submit_return
             .map(SlotSubmission::QueueOwned)
             .unwrap_or(SlotSubmission::HostOwned);
-        self.in_flight += 1;
+        self.encoder.in_flight += 1;
         // The submission is now outstanding, and this is the one point both
         // submit paths reach — a batch flush and a lone draw's own submit. The
         // trail's per-slot record is cleared again in `retire_slot`, so a slot
         // holding one is a submission whose fence has not signalled.
-        crate::gpu_hang_trail::note_submit(self.cur, timeline);
+        crate::gpu_hang_trail::note_submit(self.encoder.cur, timeline);
         self.admit_recorded_sampled(admissions);
     }
 
@@ -1580,7 +1609,7 @@ impl ResourcePools {
     /// parked. The assertion keeps a third caller from admitting too early.
     unsafe fn admit_recorded_sampled(&mut self, admissions: Vec<(SampledSlot, SampledRetain)>) {
         debug_assert!(
-            admissions.is_empty() || self.open_slot_mask() & (1 << self.cur) != 0,
+            admissions.is_empty() || self.open_slot_mask() & (1 << self.encoder.cur) != 0,
             "admitting while the filling command buffer's slot is invisible to dispose()"
         );
         for (slot, retain) in admissions {
@@ -1611,12 +1640,12 @@ impl ResourcePools {
     ///
     /// Split out so the accounting is testable without a device.
     fn take_whole_sampled_cache(&mut self) -> Vec<SampledSlot> {
-        if self.sampled_cache.is_empty() {
+        if self.shared.sampled_cache.is_empty() {
             return Vec::new();
         }
         crate::telemetry::note_route("sampled_cache_discarded");
-        let mut taken = Vec::with_capacity(self.sampled_cache.len());
-        while !self.sampled_cache.is_empty() {
+        let mut taken = Vec::with_capacity(self.shared.sampled_cache.len());
+        while !self.shared.sampled_cache.is_empty() {
             taken.push(self.remove_sampled_entry(0));
         }
         taken
@@ -1645,10 +1674,10 @@ impl ResourcePools {
     /// parameter rather than reading the environment here keeps this function
     /// pure and testable.
     pub(crate) fn batch_fit(&self, target: &BatchTarget, narrow_to_target: bool) -> BatchFit {
-        let Some(b) = self.open_batch.as_ref() else {
+        let Some(b) = self.encoder.open_batch.as_ref() else {
             return BatchFit::None;
         };
-        if b.draws >= self.batch_max_draws {
+        if b.draws >= self.encoder.batch_max_draws {
             return BatchFit::Full;
         }
         if narrow_to_target && b.target != *target {
@@ -1667,7 +1696,10 @@ impl ResourcePools {
     /// `batch_fit` because that function is deliberately pure and testable
     /// without a device, and a counter in it would not be.
     pub(crate) fn batch_target_is(&self, target: &BatchTarget) -> Option<bool> {
-        self.open_batch.as_ref().map(|b| b.target == *target)
+        self.encoder
+            .open_batch
+            .as_ref()
+            .map(|b| b.target == *target)
     }
 
     /// Whether the pass a draw is about to open is the one already standing in
@@ -1677,7 +1709,7 @@ impl ResourcePools {
     /// answers "no" without a special case, which is correct: it has no
     /// predecessor to continue.
     pub(crate) fn pass_echoes(&self, echo: &PassEcho) -> bool {
-        self.last_pass.as_ref() == Some(echo)
+        self.encoder.last_pass.as_ref() == Some(echo)
     }
 
     /// Which field of the echo stopped this draw continuing, or `None` when it
@@ -1722,7 +1754,7 @@ impl ResourcePools {
     /// belong to is therefore the ranking question, and each one names a
     /// different repair.
     pub(crate) fn pass_echo_delta(&self, echo: &PassEcho) -> Option<PassEchoField> {
-        let Some(last) = self.last_pass.as_ref() else {
+        let Some(last) = self.encoder.last_pass.as_ref() else {
             return Some(PassEchoField::Nothing);
         };
         if last.cb != echo.cb {
@@ -1746,20 +1778,20 @@ impl ResourcePools {
     /// Record the pass a draw just opened. Called at the `vkCmdBeginRenderPass`
     /// and nowhere else, so the echo always names a pass that is standing.
     pub(crate) fn note_pass_opened(&mut self, echo: PassEcho) {
-        self.last_pass = Some(echo);
-        self.open_pass = Some(echo);
+        self.encoder.last_pass = Some(echo);
+        self.encoder.open_pass = Some(echo);
     }
 
     /// Whether `echo` is the render pass that is actually still open.
     pub(crate) fn open_pass_echoes(&self, echo: &PassEcho) -> bool {
-        self.open_pass.as_ref() == Some(echo)
+        self.encoder.open_pass.as_ref() == Some(echo)
     }
 
     /// End the pass in `cb` before recording a command that cannot live inside
     /// it or ending the command buffer. No-op when the preceding draw ended its
     /// pass normally.
     pub(crate) unsafe fn close_open_pass(&mut self, device: &ash::Device, cb: vk::CommandBuffer) {
-        let Some(open) = self.open_pass.take() else {
+        let Some(open) = self.encoder.open_pass.take() else {
             return;
         };
         debug_assert_eq!(
@@ -1787,17 +1819,20 @@ impl ResourcePools {
     /// The handle comparison inside that struct is the second lock on the same
     /// door, not the first.
     pub(crate) fn forget_pass_echo(&mut self) {
-        debug_assert!(self.open_pass.is_none(), "forgetting an open render pass");
-        self.last_pass = None;
-        self.cb_graphics.cb = None;
-        self.cb_graphics.pipeline = None;
-        self.cb_graphics.pipeline_layout = None;
-        self.cb_graphics.viewports.clear();
-        self.cb_graphics.scissors.clear();
-        self.cb_graphics.stencil = None;
-        self.cb_graphics.push_layout = None;
-        self.cb_graphics.push_bindings.clear();
-        self.cb_guest_visibility = super::CbGuestVisibility::default();
+        debug_assert!(
+            self.encoder.open_pass.is_none(),
+            "forgetting an open render pass"
+        );
+        self.encoder.last_pass = None;
+        self.encoder.cb_graphics.cb = None;
+        self.encoder.cb_graphics.pipeline = None;
+        self.encoder.cb_graphics.pipeline_layout = None;
+        self.encoder.cb_graphics.viewports.clear();
+        self.encoder.cb_graphics.scissors.clear();
+        self.encoder.cb_graphics.stencil = None;
+        self.encoder.cb_graphics.push_layout = None;
+        self.encoder.cb_graphics.push_bindings.clear();
+        self.encoder.cb_guest_visibility = super::CbGuestVisibility::default();
     }
 
     /// Classify and return the imported-memory dependency `cb` still owes.
@@ -1812,26 +1847,26 @@ impl ResourcePools {
         cb: vk::CommandBuffer,
         classify: impl FnOnce() -> super::super::exec::ImportedGuestVisibility,
     ) -> Option<super::super::exec::ImportedGuestVisibility> {
-        if self.cb_guest_visibility.cb != Some(cb) {
-            self.cb_guest_visibility = super::CbGuestVisibility {
+        if self.encoder.cb_guest_visibility.cb != Some(cb) {
+            self.encoder.cb_guest_visibility = super::CbGuestVisibility {
                 cb: Some(cb),
                 host_visible: false,
                 gpu_write_since_barrier: false,
             };
         }
-        if self.cb_guest_visibility.host_visible
-            && !self.cb_guest_visibility.gpu_write_since_barrier
+        if self.encoder.cb_guest_visibility.host_visible
+            && !self.encoder.cb_guest_visibility.gpu_write_since_barrier
         {
             return None;
         }
         let visibility = classify();
         let includes_gpu_writes = visibility.includes_gpu_writes();
-        let needed = !self.cb_guest_visibility.host_visible
-            || (includes_gpu_writes && self.cb_guest_visibility.gpu_write_since_barrier);
+        let needed = !self.encoder.cb_guest_visibility.host_visible
+            || (includes_gpu_writes && self.encoder.cb_guest_visibility.gpu_write_since_barrier);
         if needed {
-            self.cb_guest_visibility.host_visible = true;
+            self.encoder.cb_guest_visibility.host_visible = true;
             if includes_gpu_writes {
-                self.cb_guest_visibility.gpu_write_since_barrier = false;
+                self.encoder.cb_guest_visibility.gpu_write_since_barrier = false;
             }
         }
         needed.then_some(visibility)
@@ -1847,14 +1882,14 @@ impl ResourcePools {
     /// command buffer; [`Self::imported_guest_barrier`] may still deduplicate
     /// multiple imported-memory consumers inside the operation.
     pub(in crate::engine) fn begin_guest_operation(&mut self, cb: vk::CommandBuffer) {
-        if self.cb_guest_visibility.cb != Some(cb) {
-            self.cb_guest_visibility = super::CbGuestVisibility {
+        if self.encoder.cb_guest_visibility.cb != Some(cb) {
+            self.encoder.cb_guest_visibility = super::CbGuestVisibility {
                 cb: Some(cb),
                 host_visible: false,
                 gpu_write_since_barrier: false,
             };
         } else {
-            self.cb_guest_visibility.host_visible = false;
+            self.encoder.cb_guest_visibility.host_visible = false;
         }
         self.forget_cb_guest_cpu_snapshots();
     }
@@ -1871,13 +1906,13 @@ impl ResourcePools {
         cb: vk::CommandBuffer,
         continues_render_encoder: bool,
     ) {
-        if !continues_render_encoder || self.cb_guest_visibility.cb != Some(cb) {
+        if !continues_render_encoder || self.encoder.cb_guest_visibility.cb != Some(cb) {
             self.begin_guest_operation(cb);
         }
     }
 
     fn note_cb_guest_write(&mut self) {
-        self.cb_guest_visibility.gpu_write_since_barrier = true;
+        self.encoder.cb_guest_visibility.gpu_write_since_barrier = true;
     }
 
     /// Retain one target resident through the fence of the command buffer now
@@ -1888,24 +1923,24 @@ impl ResourcePools {
         if !self.pin_resident_target(identity, true) {
             return false;
         }
-        self.resident_pins_live.push(identity.clone());
+        self.encoder.resident_pins_live.push(identity.clone());
         true
     }
 
     fn install_open_batch(&mut self, batch: OpenBatch) {
-        debug_assert!(self.open_batch.is_none(), "replacing an open batch");
-        self.open_batch = Some(batch);
+        debug_assert!(self.encoder.open_batch.is_none(), "replacing an open batch");
+        self.encoder.open_batch = Some(batch);
         super::super::publish_batch_open(true);
     }
 
     fn take_open_batch(&mut self) -> Option<OpenBatch> {
-        let batch = self.open_batch.take();
+        let batch = self.encoder.open_batch.take();
         super::super::publish_batch_open(false);
         batch
     }
 
     pub(super) fn discard_open_batch(&mut self) {
-        self.open_batch = None;
+        self.encoder.open_batch = None;
         super::super::publish_batch_open(false);
     }
 
@@ -1945,7 +1980,7 @@ impl ResourcePools {
         counters: &EngineCounters,
     ) {
         let (cb, fence) = slot;
-        match self.open_batch.as_mut() {
+        match self.encoder.open_batch.as_mut() {
             Some(b) => {
                 debug_assert!(b.cb == cb, "joiner recorded into a foreign CB");
                 b.draws += 1;
@@ -1955,7 +1990,7 @@ impl ResourcePools {
             None => {
                 super::super::note_batch_open_after_tail(counters);
                 debug_assert!(
-                    self.slots[self.cur].pending.is_none(),
+                    self.encoder.slots[self.encoder.cur].pending.is_none(),
                     "batch opener's slot already owes cleanup"
                 );
                 self.install_open_batch(OpenBatch {
@@ -1968,7 +2003,7 @@ impl ResourcePools {
                 counters.batch_opens.fetch_add(1, Ordering::Relaxed);
             }
         }
-        let admissions = take_retained_slots(&mut self.sampled_live, sampled_retains);
+        let admissions = take_retained_slots(&mut self.shared.sampled_live, sampled_retains);
         self.admit_recorded_sampled(admissions);
     }
 
@@ -2002,12 +2037,12 @@ impl ResourcePools {
         counters
             .batch_flush_draws
             .fetch_add(batch.draws, Ordering::Relaxed);
-        // `self.cur` is still the slot the batch was opened on: `begin_entry`
+        // `self.encoder.cur` is still the slot the batch was opened on: `begin_entry`
         // flushes the open batch *before* it advances, and every other flush
         // caller reaches here without claiming a slot of its own. Sealing against
         // any other index would charge this submission's GPU span to a slot whose
         // queries a different command buffer wrote.
-        let slot = self.cur;
+        let slot = self.encoder.cur;
         unsafe { self.gpu_span_seal(ctx, batch.cb, slot) };
         counters.batch_flush_close_us.fetch_add(
             close_started.elapsed().as_micros() as u64,
@@ -2050,7 +2085,7 @@ impl ResourcePools {
                 Ok(())
             }
             Err(e) => {
-                self.desc_arena.free(&ctx.device, &batch.dsets);
+                self.encoder.desc_arena.free(&ctx.device, &batch.dsets);
                 self.abort_recorded_guest_work();
                 // This batch's draws published sampled images to the content
                 // cache on the promise that this command buffer would fill
@@ -2086,6 +2121,7 @@ impl ResourcePools {
         fence: vk::Fence,
     ) -> Result<(), DrawError> {
         if let Some(index) = self
+            .encoder
             .slots
             .iter()
             .position(|slot| slot.fence == fence && slot.pending.is_some())
@@ -2107,7 +2143,7 @@ impl ResourcePools {
     /// Record that the command buffer being built reads guest RAM when it
     /// executes, so the next completion stamp waits for it.
     pub(crate) fn note_guest_read_recorded(&mut self) {
-        self.guest_reads_in_flight = true;
+        self.encoder.guest_reads_in_flight = true;
         super::super::publish_guest_read_debt(true);
     }
 
@@ -2128,11 +2164,12 @@ impl ResourcePools {
         &self,
         key: (usize, u64, u64),
     ) -> Option<super::super::exec::BoundBuffer> {
-        self.cb_bound_buffers
+        self.encoder
+            .cb_bound_buffers
             .aliases
             .get(&key)
-            .or_else(|| self.cb_bound_buffers.immutable.get(&key))
-            .or_else(|| self.cb_bound_buffers.guest_snapshots.get(&key))
+            .or_else(|| self.encoder.cb_bound_buffers.immutable.get(&key))
+            .or_else(|| self.encoder.cb_bound_buffers.guest_snapshots.get(&key))
             .map(|(b, _)| *b)
     }
 
@@ -2150,15 +2187,22 @@ impl ResourcePools {
         bound: super::super::exec::BoundBuffer,
     ) {
         let (key, owner) = bind.into_parts();
-        self.cb_bound_buffers.aliases.remove(&key);
-        self.cb_bound_buffers.immutable.remove(&key);
-        self.cb_bound_buffers.guest_snapshots.remove(&key);
+        self.encoder.cb_bound_buffers.aliases.remove(&key);
+        self.encoder.cb_bound_buffers.immutable.remove(&key);
+        self.encoder.cb_bound_buffers.guest_snapshots.remove(&key);
         if bound.guest_import {
-            self.cb_bound_buffers.aliases.insert(key, (bound, owner));
+            self.encoder
+                .cb_bound_buffers
+                .aliases
+                .insert(key, (bound, owner));
         } else if matches!(&owner.allocation, super::CbBindAllocation::Bytes(_)) {
-            self.cb_bound_buffers.immutable.insert(key, (bound, owner));
+            self.encoder
+                .cb_bound_buffers
+                .immutable
+                .insert(key, (bound, owner));
         } else {
-            self.cb_bound_buffers
+            self.encoder
+                .cb_bound_buffers
                 .guest_snapshots
                 .insert(key, (bound, owner));
         }
@@ -2169,6 +2213,7 @@ impl ResourcePools {
         source: &super::CbSampledGuest,
     ) -> Option<super::SampledSlot> {
         let found = self
+            .encoder
             .cb_sampled_guest
             .get(&source.key)
             .map(|(slot, _)| slot.handles());
@@ -2183,7 +2228,8 @@ impl ResourcePools {
         source: super::CbSampledGuest,
         image: &super::SampledSlot,
     ) {
-        self.cb_sampled_guest
+        self.encoder
+            .cb_sampled_guest
             .insert(source.key, (image.handles(), source.owner));
     }
 
@@ -2194,7 +2240,7 @@ impl ResourcePools {
     /// it has not filled. Everything published without this call is answerable
     /// the moment it is published.
     pub(crate) fn note_cb_bind_owes_gather(&mut self, key: (usize, u64, u64)) {
-        self.cb_gather_owed.push(key);
+        self.encoder.cb_gather_owed.push(key);
     }
 
     /// The owed gathers have been recorded into the command buffer, so every
@@ -2204,7 +2250,7 @@ impl ResourcePools {
     /// after both forms — the compute dispatches and the transfer copies — and
     /// after the barrier that orders them before the draw.
     pub(crate) fn note_cb_gathers_recorded(&mut self) {
-        self.cb_gather_owed.clear();
+        self.encoder.cb_gather_owed.clear();
     }
 
     /// A draw abandoned before its gathers were recorded: forget exactly the
@@ -2215,12 +2261,12 @@ impl ResourcePools {
     /// Returns how many were forgotten so a boot can say whether the window this
     /// closes was ever open.
     pub(crate) fn discard_cb_binds_owed_a_gather(&mut self) -> usize {
-        let n = self.cb_gather_owed.len();
-        let keys = std::mem::take(&mut self.cb_gather_owed);
+        let n = self.encoder.cb_gather_owed.len();
+        let keys = std::mem::take(&mut self.encoder.cb_gather_owed);
         for key in keys {
-            self.cb_bound_buffers.aliases.remove(&key);
-            self.cb_bound_buffers.immutable.remove(&key);
-            self.cb_bound_buffers.guest_snapshots.remove(&key);
+            self.encoder.cb_bound_buffers.aliases.remove(&key);
+            self.encoder.cb_bound_buffers.immutable.remove(&key);
+            self.encoder.cb_bound_buffers.guest_snapshots.remove(&key);
         }
         n
     }
@@ -2233,9 +2279,9 @@ impl ResourcePools {
     /// buffer and offset name those bytes. Staging and gather entries instead
     /// name copies taken before the Store and are all invalid after it.
     fn forget_cb_bound_buffer_copies(&mut self) {
-        let invalidated = self.cb_bound_buffers.guest_snapshots.len() as u64;
-        let retained = self.cb_bound_buffers.aliases.len() as u64;
-        self.cb_bound_buffers.guest_snapshots.clear();
+        let invalidated = self.encoder.cb_bound_buffers.guest_snapshots.len() as u64;
+        let retained = self.encoder.cb_bound_buffers.aliases.len() as u64;
+        self.encoder.cb_bound_buffers.guest_snapshots.clear();
         crate::telemetry::note_route_n("bindmap_write_invalidated", invalidated);
         crate::telemetry::note_route_n("bindmap_write_alias_retained", retained);
     }
@@ -2260,24 +2306,24 @@ impl ResourcePools {
     /// nothing recorded after them may name one. Guest writes instead clear
     /// only copied snapshots and retain direct aliases.
     fn forget_cb_bound_buffers(&mut self, why: &'static str, entries_slug: &'static str) {
-        let n = (self.cb_bound_buffers.aliases.len()
-            + self.cb_bound_buffers.immutable.len()
-            + self.cb_bound_buffers.guest_snapshots.len()) as u64;
+        let n = (self.encoder.cb_bound_buffers.aliases.len()
+            + self.encoder.cb_bound_buffers.immutable.len()
+            + self.encoder.cb_bound_buffers.guest_snapshots.len()) as u64;
         crate::telemetry::note_route(why);
         crate::telemetry::note_route_n(entries_slug, n);
-        self.cb_bound_buffers = super::CbBufferMemo::default();
+        self.encoder.cb_bound_buffers = super::CbBufferMemo::default();
         // The owed list names keys in the map that just went, so it cannot
         // outlive it — a surviving key would later remove whatever unrelated
         // bind the next command buffer published under the same address.
-        self.cb_gather_owed.clear();
+        self.encoder.cb_gather_owed.clear();
     }
 
     fn forget_cb_sampled_guest(&mut self) {
         crate::telemetry::note_route_n(
             "sampled_bindmap_clear_entries",
-            self.cb_sampled_guest.len() as u64,
+            self.encoder.cb_sampled_guest.len() as u64,
         );
-        self.cb_sampled_guest.clear();
+        self.encoder.cb_sampled_guest.clear();
     }
 
     /// Invalidate only sampled copies whose source overlaps the pages a Store
@@ -2287,7 +2333,8 @@ impl ResourcePools {
         let mut overlap = 0u64;
         let mut unknown = 0u64;
         let mut disjoint = 0u64;
-        self.cb_sampled_guest
+        self.encoder
+            .cb_sampled_guest
             .retain(|_, (_, owner)| match owner.physical_pages.as_ref() {
                 Some(held) if held.overlaps(written) => {
                     overlap += 1;
@@ -2326,7 +2373,7 @@ impl ResourcePools {
         pipeline: vk::Pipeline,
         pipeline_layout: vk::PipelineLayout,
     ) {
-        let g = &mut self.cb_graphics;
+        let g = &mut self.encoder.cb_graphics;
         if g.cb != Some(cb) {
             // A recycled handle: everything the previous user of it bound was
             // made undefined by the `vkBeginCommandBuffer` in between.
@@ -2367,7 +2414,7 @@ impl ResourcePools {
     /// comparison in [`Self::set_dynamic_viewport_scissor`] needs them in a
     /// buffer it can swap rather than copy.
     pub(crate) fn dynamic_scratch(&mut self) -> (&mut Vec<vk::Viewport>, &mut Vec<vk::Rect2D>) {
-        let g = &mut self.cb_graphics;
+        let g = &mut self.encoder.cb_graphics;
         g.vp_scratch.clear();
         g.sc_scratch.clear();
         (&mut g.vp_scratch, &mut g.sc_scratch)
@@ -2387,7 +2434,7 @@ impl ResourcePools {
         cb: vk::CommandBuffer,
         counters: &EngineCounters,
     ) {
-        let g = &mut self.cb_graphics;
+        let g = &mut self.encoder.cb_graphics;
         if super::viewports_match(&g.vp_scratch, &g.viewports) {
             counters
                 .dynstate_viewport_held
@@ -2414,7 +2461,7 @@ impl ResourcePools {
     /// array already there is bit-for-bit what it would have sent. A consumer
     /// that kept its own copy would be a second spelling of the same rects.
     pub(crate) fn bound_scissors(&self) -> &[vk::Rect2D] {
-        &self.cb_graphics.scissors
+        &self.encoder.cb_graphics.scissors
     }
 
     /// Record the draw's vertex buffers as maximal consecutive binding runs,
@@ -2438,7 +2485,7 @@ impl ResourcePools {
         counters: &EngineCounters,
         requested: &[(u32, super::super::exec::BoundBuffer)],
     ) {
-        let g = &mut self.cb_graphics;
+        let g = &mut self.encoder.cb_graphics;
         counters
             .vertex_buffer_bind_slots
             .fetch_add(requested.len() as u64, Ordering::Relaxed);
@@ -2486,8 +2533,8 @@ impl ResourcePools {
 
     /// Scratch in which the next draw normalizes its push-descriptor state.
     pub(crate) fn push_descriptor_scratch(&mut self) -> &mut Vec<super::PushDescriptorBinding> {
-        self.cb_graphics.push_scratch.clear();
-        &mut self.cb_graphics.push_scratch
+        self.encoder.cb_graphics.push_scratch.clear();
+        &mut self.encoder.cb_graphics.push_scratch
     }
 
     /// Return whether this draw must record its push descriptors, retaining a
@@ -2497,7 +2544,7 @@ impl ResourcePools {
         layout: vk::PipelineLayout,
         counters: &EngineCounters,
     ) -> bool {
-        let g = &mut self.cb_graphics;
+        let g = &mut self.encoder.cb_graphics;
         if super::push_descriptors_match(g.push_layout, &g.push_bindings, layout, &g.push_scratch) {
             counters
                 .descriptor_push_held
@@ -2524,7 +2571,7 @@ impl ResourcePools {
         front: u32,
         back: u32,
     ) {
-        let g = &mut self.cb_graphics;
+        let g = &mut self.encoder.cb_graphics;
         if g.stencil == Some((front, back)) {
             counters
                 .dynstate_stencil_held
@@ -2541,7 +2588,7 @@ impl ResourcePools {
     /// Whether a recorded command buffer still owes an ordering point for its
     /// guest-memory reads.
     pub(crate) fn has_guest_read_debt(&self) -> bool {
-        self.guest_reads_in_flight
+        self.encoder.guest_reads_in_flight
     }
 
     /// Mark every guest read before the caller's established ordering point as
@@ -2551,7 +2598,7 @@ impl ResourcePools {
     /// wait establishes no ordering point. Clearing before that wait would let
     /// the next completion treat still-running GPU reads as finished.
     pub(crate) fn settle_guest_read_debt(&mut self) {
-        self.guest_reads_in_flight = false;
+        self.encoder.guest_reads_in_flight = false;
         super::super::publish_guest_read_debt(false);
     }
 
@@ -2597,9 +2644,11 @@ impl ResourcePools {
         // command buffer's imported-memory visibility dependency.
         self.forget_cb_bound_buffer_copies();
         self.forget_cb_sampled_guest_pages(pages);
-        if !self.guest_write_tokens_live.contains_key(pages) {
+        if !self.encoder.guest_write_tokens_live.contains_key(pages) {
             if let Some(token) = super::super::arm_guest_write_pages(pages.clone()) {
-                self.guest_write_tokens_live.insert(pages.clone(), token);
+                self.encoder
+                    .guest_write_tokens_live
+                    .insert(pages.clone(), token);
             }
         }
         self.note_guest_write_source(source);
@@ -2615,7 +2664,7 @@ impl ResourcePools {
             // the registry that holds the image.
             super::super::GuestWriteSource::ResidentStorage(identity) => {
                 if self.pin_resident_storage(identity, true) {
-                    self.compute_write_pins_live.push(*identity);
+                    self.encoder.compute_write_pins_live.push(*identity);
                 }
             }
             // The parent import is device-owned and its retirement is deferred
@@ -2642,7 +2691,7 @@ impl ResourcePools {
         if let Some(token) = token {
             let pages = reims_vgpu_memory::GuestWritePages::new(&[token.serial])
                 .expect("the synthetic page set is non-empty");
-            self.guest_write_tokens_live.insert(pages, token);
+            self.encoder.guest_write_tokens_live.insert(pages, token);
         }
         self.forget_cb_bound_buffers(
             "bindmap_clear_guestwrite",
@@ -2657,13 +2706,18 @@ impl ResourcePools {
     /// carrying them into the next entry would invent a lifetime the GPU never
     /// began.
     pub(crate) fn abort_recorded_guest_work(&mut self) {
-        let tokens: Vec<_> = self.guest_write_tokens_live.values().copied().collect();
+        let tokens: Vec<_> = self
+            .encoder
+            .guest_write_tokens_live
+            .values()
+            .copied()
+            .collect();
         super::super::retire_guest_write_pages(&tokens);
-        self.guest_write_tokens_live.clear();
-        for identity in std::mem::take(&mut self.resident_pins_live) {
+        self.encoder.guest_write_tokens_live.clear();
+        for identity in std::mem::take(&mut self.encoder.resident_pins_live) {
             self.pin_resident_target(&identity, false);
         }
-        for identity in std::mem::take(&mut self.compute_write_pins_live) {
+        for identity in std::mem::take(&mut self.encoder.compute_write_pins_live) {
             self.pin_resident_storage(&identity, false);
         }
     }
@@ -2736,7 +2790,7 @@ impl ResourcePools {
         // Quiesce includes deferred batched work: submit it so the retire
         // below actually waits it out.
         self.batch_flush(ctx, counters)?;
-        for index in 0..self.slots.len() {
+        for index in 0..self.encoder.slots.len() {
             self.retire_slot(ctx, counters, index)?;
         }
         // A slot that owed nothing retires without clearing its bit, and a
@@ -2760,7 +2814,7 @@ impl ResourcePools {
         for identity in pending.unpin_compute_residents.drain(..) {
             self.pin_resident_storage(&identity, false);
         }
-        self.desc_arena.free(device, &pending.dsets);
+        self.encoder.desc_arena.free(device, &pending.dsets);
         // The fence this entry waited on is exactly what makes a rewrite of
         // these safe, so the free list is fed from here and nowhere else.
         self.recycle_scatter_dsets(&mut pending.scatter_dsets);
@@ -2769,21 +2823,33 @@ impl ResourcePools {
         // `pending.sampled` is every slot nothing retained, which recycles.
         for slot in pending.staging.drain(..) {
             let bucket = Self::bucket(slot.size);
-            self.staging_free.entry(bucket).or_default().push(slot);
+            self.encoder
+                .staging_free
+                .entry(bucket)
+                .or_default()
+                .push(slot);
         }
         for slot in pending.gather.drain(..) {
             let bucket = Self::bucket(slot.size);
-            self.gather_free.entry(bucket).or_default().push(slot);
+            self.encoder
+                .gather_free
+                .entry(bucket)
+                .or_default()
+                .push(slot);
         }
         for slot in pending.readback.drain(..) {
             let bucket = Self::bucket(slot.size);
-            self.readback_free.entry(bucket).or_default().push(slot);
+            self.encoder
+                .readback_free
+                .entry(bucket)
+                .or_default()
+                .push(slot);
         }
         for slot in pending.sampled.drain(..) {
             self.admit_sampled(slot);
         }
         for slot in pending.attachment_snapshots.drain(..) {
-            self.attachment_snapshot_free.admit(slot.key(), slot);
+            self.shared.attachment_snapshot_free.admit(slot.key(), slot);
         }
         for slot in pending.storage_images.drain(..) {
             self.admit_storage_image(slot);
@@ -2803,7 +2869,7 @@ impl ResourcePools {
     }
 
     fn note_staging_hit(&mut self) {
-        self.staging_hits = self.staging_hits.saturating_add(1);
+        self.encoder.staging_hits = self.encoder.staging_hits.saturating_add(1);
     }
 
     /// A staging acquire that found no free slot in its bucket and must pay a
@@ -2818,18 +2884,24 @@ impl ResourcePools {
     /// tell those apart. The miss's own bucket plus the free pool's bucket
     /// histogram at the moment of the miss can.
     fn note_staging_miss(&mut self, bucket: u64, us: u64) {
-        self.staging_misses = self.staging_misses.saturating_add(1);
+        self.encoder.staging_misses = self.encoder.staging_misses.saturating_add(1);
         let log2 = bucket.trailing_zeros().min(STAGING_BUCKET_BINS as u32 - 1) as usize;
-        self.staging_miss_bins[log2] = self.staging_miss_bins[log2].saturating_add(1);
-        self.staging_miss_us_bins[log2] = self.staging_miss_us_bins[log2].saturating_add(us);
-        if !self.staging_misses.is_multiple_of(STAGING_MISS_EMIT_EVERY) {
+        self.encoder.staging_miss_bins[log2] =
+            self.encoder.staging_miss_bins[log2].saturating_add(1);
+        self.encoder.staging_miss_us_bins[log2] =
+            self.encoder.staging_miss_us_bins[log2].saturating_add(us);
+        if !self
+            .encoder
+            .staging_misses
+            .is_multiple_of(STAGING_MISS_EMIT_EVERY)
+        {
             return;
         }
         use std::fmt::Write as _;
         let mut free_slots = 0usize;
         let mut free_bytes = 0u64;
         let mut free_bins = [0usize; STAGING_BUCKET_BINS];
-        for (&b, list) in &self.staging_free {
+        for (&b, list) in &self.encoder.staging_free {
             free_slots += list.len();
             free_bytes += b.saturating_mul(list.len() as u64);
             let i = (b.trailing_zeros() as usize).min(STAGING_BUCKET_BINS - 1);
@@ -2858,24 +2930,24 @@ impl ResourcePools {
         // 64-byte staging miss costs the same as a 4 MiB one decides whether the
         // fix is fewer misses or fewer VkDeviceMemory objects.
         let mut us_bins = String::new();
-        for (i, n) in self.staging_miss_bins.iter().enumerate() {
+        for (i, n) in self.encoder.staging_miss_bins.iter().enumerate() {
             if *n != 0 {
                 let _ = write!(
                     us_bins,
                     "{}{}:{}",
                     if us_bins.is_empty() { "" } else { "," },
                     1u64 << i,
-                    self.staging_miss_us_bins[i] / *n as u64
+                    self.encoder.staging_miss_us_bins[i] / *n as u64
                 );
             }
         }
         reims_vgpu_observe::off(format!(
             "staging_pool hits={} misses={} live={} free_slots={free_slots} free_mb={} miss_bins={} miss_us_bins={us_bins} free_bins={}",
-            self.staging_hits,
-            self.staging_misses,
-            self.staging_live.len(),
+            self.encoder.staging_hits,
+            self.encoder.staging_misses,
+            self.encoder.staging_live.len(),
             free_bytes >> 20,
-            bins(&self.staging_miss_bins),
+            bins(&self.encoder.staging_miss_bins),
             bins(&free_bins),
         ));
     }
@@ -2890,10 +2962,10 @@ impl ResourcePools {
         let need = size.max(4);
         let bucket = Self::bucket(need);
         // Prefer exact-usage free slots in this bucket; usage is OR'd broadly so reuse is fine.
-        if let Some(list) = self.staging_free.get_mut(&bucket) {
+        if let Some(list) = self.encoder.staging_free.get_mut(&bucket) {
             if let Some(slot) = list.pop() {
                 self.note_staging_hit();
-                self.staging_live.push(slot);
+                self.encoder.staging_live.push(slot);
                 return Ok(slot);
             }
         }
@@ -2934,6 +3006,7 @@ impl ResourcePools {
         // lands in a block this bind can legally use; `mt` stays here because
         // the slot still has to report that type's caching.
         let token = self
+            .shared
             .slabs
             .upload()
             .acquire(ctx, &req, counters)
@@ -2941,7 +3014,7 @@ impl ResourcePools {
         ctx.device
             .bind_buffer_memory(buffer, token.memory, token.offset())
             .map_err(|e| {
-                self.slabs.release(&ctx.device, token);
+                self.shared.slabs.release(&ctx.device, token);
                 ctx.device.destroy_buffer(buffer, None);
                 DrawError::VkCall(VkCall::new(VkOp::PoolsBindStaging, e))
             })?;
@@ -2963,7 +3036,7 @@ impl ResourcePools {
             // it is the readback slots that decide anything on it.
             cached: ctx.mapped_memory_kind(mt).cached,
         };
-        self.staging_live.push(slot);
+        self.encoder.staging_live.push(slot);
         self.note_staging_miss(bucket, miss_started.elapsed().as_micros() as u64);
         Ok(slot)
     }
@@ -2985,8 +3058,8 @@ impl ResourcePools {
     /// to record the obligation instead. A grow then freed the buffer while a
     /// submitted copy was still reading it.
     fn take_free_gather(&mut self, bucket: u64) -> Option<BufferSlot> {
-        let slot = self.gather_free.get_mut(&bucket)?.pop()?;
-        self.gather_live.push(slot);
+        let slot = self.encoder.gather_free.get_mut(&bucket)?.pop()?;
+        self.encoder.gather_live.push(slot);
         Some(slot)
     }
 
@@ -3044,6 +3117,7 @@ impl ResourcePools {
         counters.note_create(CreateSite::GatherBuffer);
         let req = ctx.device.get_buffer_memory_requirements(buffer);
         let token = self
+            .shared
             .slabs
             .gather()
             .acquire(ctx, &req, counters)
@@ -3051,7 +3125,7 @@ impl ResourcePools {
         ctx.device
             .bind_buffer_memory(buffer, token.memory, token.offset())
             .map_err(|e| {
-                self.slabs.release(&ctx.device, token);
+                self.shared.slabs.release(&ctx.device, token);
                 ctx.device.destroy_buffer(buffer, None);
                 DrawError::VkCall(VkCall::new(VkOp::PoolsBindGuestGather, e))
             })?;
@@ -3069,7 +3143,7 @@ impl ResourcePools {
             coherent: false,
             cached: false,
         };
-        self.gather_live.push(slot);
+        self.encoder.gather_live.push(slot);
         Ok(slot)
     }
 
@@ -3238,9 +3312,13 @@ impl ResourcePools {
 
     pub(crate) fn recycle_staging(&mut self) {
         self.forget_cb_bound_buffers("bindmap_clear_recycle", "bindmap_clear_recycle_entries");
-        for slot in self.staging_live.drain(..) {
+        for slot in self.encoder.staging_live.drain(..) {
             let bucket = Self::bucket(slot.size);
-            self.staging_free.entry(bucket).or_default().push(slot);
+            self.encoder
+                .staging_free
+                .entry(bucket)
+                .or_default()
+                .push(slot);
         }
     }
 
@@ -3369,9 +3447,9 @@ impl ResourcePools {
         // engine-locked point the return path can rely on running.
         self.reclaim_returned_readback_leases();
         let bucket = Self::bucket(size.max(4));
-        if let Some(list) = self.readback_free.get_mut(&bucket) {
+        if let Some(list) = self.encoder.readback_free.get_mut(&bucket) {
             if let Some(slot) = list.pop() {
-                self.readback_live = Some(slot);
+                self.encoder.readback_live = Some(slot);
                 return Ok(slot);
             }
         }
@@ -3385,7 +3463,7 @@ impl ResourcePools {
             VkOp::PoolsBindReadback,
             VkOp::PoolsMapReadback,
         )?;
-        self.readback_live = Some(slot);
+        self.encoder.readback_live = Some(slot);
         Ok(slot)
     }
 
@@ -3402,7 +3480,7 @@ impl ResourcePools {
     /// Must be called before [`Self::seal_entry`], which is what would
     /// otherwise move the slot into the submitted entry's cleanup.
     pub(crate) fn lease_readback(&mut self) -> Option<ReadbackLease> {
-        let slot = self.readback_live.take()?;
+        let slot = self.encoder.readback_live.take()?;
         // Two refusals, and both send the caller to the copying path rather
         // than to a failure.
         //
@@ -3418,23 +3496,26 @@ impl ResourcePools {
         // of a scattered walk, so where the cached type was unavailable the
         // copy is genuinely the faster shape and the lease declines.
         if slot.mapped == 0 || !slot.cached {
-            self.readback_live = Some(slot);
+            self.encoder.readback_live = Some(slot);
             return None;
         }
         let token = NEXT_READBACK_LEASE_TOKEN.fetch_add(1, Ordering::Relaxed);
         // Before the slot leaves the pool: the counter is what a teardown reads
         // to decide whether a borrow is live, and it must never see the slot
         // gone while the count still says nobody has it.
-        self.readback_lease_returns
+        self.encoder
+            .readback_lease_returns
             .outstanding
             .fetch_add(1, Ordering::AcqRel);
         let lease = ReadbackLease {
             token,
             ptr: slot.mapped,
             slot_size: slot.size,
-            returns: Arc::clone(&self.readback_lease_returns),
+            returns: Arc::clone(&self.encoder.readback_lease_returns),
         };
-        self.readback_leased.push(LeasedReadback { token, slot });
+        self.encoder
+            .readback_leased
+            .push(LeasedReadback { token, slot });
         Some(lease)
     }
 
@@ -3445,28 +3526,45 @@ impl ResourcePools {
     /// the calls that follow a lease, and a lease that is still out is simply
     /// not in the drained set.
     pub(crate) fn reclaim_returned_readback_leases(&mut self) {
-        let returned = std::mem::take(&mut *self.readback_lease_returns.returned.lock());
+        let returned = std::mem::take(&mut *self.encoder.readback_lease_returns.returned.lock());
         for token in returned {
-            let Some(index) = self.readback_leased.iter().position(|l| l.token == token) else {
+            let Some(index) = self
+                .encoder
+                .readback_leased
+                .iter()
+                .position(|l| l.token == token)
+            else {
                 // A teardown collected the leases while this token was in
                 // flight, so there is no slot left to give back. The handles
                 // died with the device; dropping the token is the whole of it.
                 continue;
             };
-            let slot = self.readback_leased.remove(index).slot;
+            let slot = self.encoder.readback_leased.remove(index).slot;
             let bucket = Self::bucket(slot.size);
-            self.readback_free.entry(bucket).or_default().push(slot);
+            self.encoder
+                .readback_free
+                .entry(bucket)
+                .or_default()
+                .push(slot);
         }
     }
 
     pub(crate) fn recycle_readback(&mut self) {
-        if let Some(slot) = self.readback_live.take() {
+        if let Some(slot) = self.encoder.readback_live.take() {
             let bucket = Self::bucket(slot.size);
-            self.readback_free.entry(bucket).or_default().push(slot);
+            self.encoder
+                .readback_free
+                .entry(bucket)
+                .or_default()
+                .push(slot);
         }
-        for slot in self.readback_multi_live.drain(..) {
+        for slot in self.encoder.readback_multi_live.drain(..) {
             let bucket = Self::bucket(slot.size);
-            self.readback_free.entry(bucket).or_default().push(slot);
+            self.encoder
+                .readback_free
+                .entry(bucket)
+                .or_default()
+                .push(slot);
         }
     }
 
@@ -3478,9 +3576,9 @@ impl ResourcePools {
         counters: &EngineCounters,
     ) -> Result<BufferSlot, DrawError> {
         let bucket = Self::bucket(size.max(4));
-        if let Some(list) = self.readback_free.get_mut(&bucket) {
+        if let Some(list) = self.encoder.readback_free.get_mut(&bucket) {
             if let Some(slot) = list.pop() {
-                self.readback_multi_live.push(slot);
+                self.encoder.readback_multi_live.push(slot);
                 return Ok(slot);
             }
         }
@@ -3494,7 +3592,7 @@ impl ResourcePools {
             VkOp::PoolsBindReadbackExtra,
             VkOp::PoolsMapReadbackExtra,
         )?;
-        self.readback_multi_live.push(slot);
+        self.encoder.readback_multi_live.push(slot);
         Ok(slot)
     }
 
@@ -3511,10 +3609,10 @@ impl ResourcePools {
         // from it then means either "never called" or "always hit" — two states
         // a reader cannot separate, which is the sampling-point trap this exists
         // to escape. Taken here, a zero means the function did not run.
-        crate::telemetry::note_route(target_pool_depth_band(self.target_order.len()));
+        crate::telemetry::note_route(target_pool_depth_band(self.shared.target_order.len()));
         let map_key = (key, render_pass.as_raw());
-        if self.targets.contains_key(&map_key) {
-            return Ok(self.targets.get(&map_key).unwrap());
+        if self.shared.targets.contains_key(&map_key) {
+            return Ok(self.shared.targets.get(&map_key).unwrap());
         }
         let usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
             | vk::ImageUsageFlags::INPUT_ATTACHMENT
@@ -3595,9 +3693,9 @@ impl ResourcePools {
             }
         };
         counters.note_create(CreateSite::TargetFramebuffer);
-        if self.target_order.len() >= TARGET_POOL_MAX_ENTRIES {
-            if let Some(old_k) = self.target_order.first().cloned() {
-                if let Some(old) = self.targets.remove(&old_k) {
+        if self.shared.target_order.len() >= TARGET_POOL_MAX_ENTRIES {
+            if let Some(old_k) = self.shared.target_order.first().cloned() {
+                if let Some(old) = self.shared.targets.remove(&old_k) {
                     // Counted, not logged. The eviction costs a re-create and
                     // nothing else — the key is geometry plus render pass, so
                     // this slot is scratch and holds no guest resource's content
@@ -3614,10 +3712,10 @@ impl ResourcePools {
                         },
                     );
                 }
-                self.target_order.remove(0);
+                self.shared.target_order.remove(0);
             }
         }
-        self.targets.insert(
+        self.shared.targets.insert(
             map_key,
             TargetSlot {
                 image,
@@ -3626,8 +3724,8 @@ impl ResourcePools {
                 framebuffer,
             },
         );
-        self.target_order.push(map_key);
-        Ok(self.targets.get(&map_key).unwrap())
+        self.shared.target_order.push(map_key);
+        Ok(self.shared.targets.get(&map_key).unwrap())
     }
 
     /// Acquire the discard-only source of a multisample resolve pass.
@@ -3643,12 +3741,12 @@ impl ResourcePools {
         render_pass: vk::RenderPass,
         counters: &EngineCounters,
     ) -> Result<(vk::Image, vk::ImageView, vk::Framebuffer), DrawError> {
-        if let Some(slot) = self.multisample_target.as_ref() {
+        if let Some(slot) = self.shared.multisample_target.as_ref() {
             if slot.key == key && !key.transient_depth {
                 return Ok((slot.image, slot.view, slot.framebuffer));
             }
         }
-        if let Some(old) = self.multisample_target.take() {
+        if let Some(old) = self.shared.multisample_target.take() {
             self.dispose(&ctx.device, DeferredHandle::Framebuffer(old.framebuffer));
             self.dispose(
                 &ctx.device,
@@ -3730,7 +3828,7 @@ impl ResourcePools {
                 DrawError::VkCall(VkCall::new(VkOp::PoolsCreateFramebuffer, e))
             })?;
         counters.note_create(CreateSite::TargetFramebuffer);
-        self.multisample_target = Some(MultisampleTargetSlot {
+        self.shared.multisample_target = Some(MultisampleTargetSlot {
             image,
             memory,
             view,
@@ -3784,14 +3882,18 @@ impl ResourcePools {
         // succeeds: the census question is whether the pool had one, not whether
         // the fallback worked.
         let recycled = match use_ {
-            SampledTransientUse::Upload => self.sampled_free.take(&sk),
-            SampledTransientUse::AttachmentSnapshot => self.attachment_snapshot_free.take(&sk),
+            SampledTransientUse::Upload => self.shared.sampled_free.take(&sk),
+            SampledTransientUse::AttachmentSnapshot => {
+                self.shared.attachment_snapshot_free.take(&sk)
+            }
         };
         if let Some(slot) = recycled {
             let handles = slot.handles();
             match use_ {
-                SampledTransientUse::Upload => self.sampled_live.push(slot),
-                SampledTransientUse::AttachmentSnapshot => self.attachment_snapshot_live.push(slot),
+                SampledTransientUse::Upload => self.shared.sampled_live.push(slot),
+                SampledTransientUse::AttachmentSnapshot => {
+                    self.shared.attachment_snapshot_live.push(slot)
+                }
             }
             return Ok(handles);
         }
@@ -3903,8 +4005,10 @@ impl ResourcePools {
         };
         let handles = slot.handles();
         match use_ {
-            SampledTransientUse::Upload => self.sampled_live.push(slot),
-            SampledTransientUse::AttachmentSnapshot => self.attachment_snapshot_live.push(slot),
+            SampledTransientUse::Upload => self.shared.sampled_live.push(slot),
+            SampledTransientUse::AttachmentSnapshot => {
+                self.shared.attachment_snapshot_live.push(slot)
+            }
         }
         Ok(handles)
     }
@@ -3927,7 +4031,7 @@ impl ResourcePools {
         // The digest narrows the walk to one candidate; the retained bytes are
         // what decide the hit. `ResidentSampledSlot::content` carries why the
         // digest is not allowed to answer on its own.
-        let found = self.sampled_cache.iter().position(|entry| {
+        let found = self.shared.sampled_cache.iter().position(|entry| {
             entry.has_live_owner()
                 && entry.slot.key() == key
                 && entry.fingerprint == SampledFingerprint::Content(content_hash)
@@ -3945,9 +4049,9 @@ impl ResourcePools {
                 .fetch_add(1, Ordering::Relaxed);
             return None;
         };
-        let entry = &mut self.sampled_cache[index];
+        let entry = &mut self.shared.sampled_cache[index];
         entry.retain_owner(owner);
-        entry.last_touch_ms = self.idle_clock_ms;
+        entry.last_touch_ms = self.shared.idle_clock_ms;
         let handles = entry.slot.handles();
         counters.sampled_cache_hits.fetch_add(1, Ordering::Relaxed);
         counters
@@ -3989,7 +4093,7 @@ impl ResourcePools {
     ) {
         let Some(owner) = resource_lifetime.filter(|owner| owner.is_live()) else {
             crate::telemetry::note_route("sampled_admit_no_lifetime");
-            self.sampled_live.push(slot);
+            self.shared.sampled_live.push(slot);
             return;
         };
         let (fingerprint, retained, content_len) = match content {
@@ -4007,7 +4111,7 @@ impl ResourcePools {
         // something else confirms it. Collapsing two entries here is exactly as
         // wrong as returning the wrong one from `find_cached_sampled` — the
         // survivor then answers for content it was not built from.
-        let duplicate = self.sampled_cache.iter().position(|entry| {
+        let duplicate = self.shared.sampled_cache.iter().position(|entry| {
             entry.has_live_owner()
                 && entry.slot.key() == slot.key()
                 && entry.fingerprint == fingerprint
@@ -4015,14 +4119,15 @@ impl ResourcePools {
         });
         if let Some(index) = duplicate {
             crate::telemetry::note_route("sampled_admit_duplicate");
-            let existing = &mut self.sampled_cache[index];
+            let existing = &mut self.shared.sampled_cache[index];
             existing.retain_owner(owner);
-            self.sampled_live.push(slot);
+            self.shared.sampled_live.push(slot);
             return;
         }
         crate::telemetry::note_route("sampled_admit_kept");
-        self.sampled_cache_bytes = self.sampled_cache_bytes.saturating_add(content_len);
-        let touch = self.idle_clock_ms;
+        self.shared.sampled_cache_bytes =
+            self.shared.sampled_cache_bytes.saturating_add(content_len);
+        let touch = self.shared.idle_clock_ms;
         self.push_sampled_entry(ResidentSampledSlot {
             slot,
             fingerprint,
@@ -4038,13 +4143,13 @@ impl ResourcePools {
         // does not also recycle staging. No memo may survive the slots it
         // names entering the free pool.
         self.forget_cb_sampled_guest();
-        for slot in self.sampled_live.drain(..) {
+        for slot in self.shared.sampled_live.drain(..) {
             let sk = slot.key();
-            self.sampled_free.push_uncapped(sk, slot);
+            self.shared.sampled_free.push_uncapped(sk, slot);
         }
-        for slot in self.attachment_snapshot_live.drain(..) {
+        for slot in self.shared.attachment_snapshot_live.drain(..) {
             let sk = slot.key();
-            self.attachment_snapshot_free.push_uncapped(sk, slot);
+            self.shared.attachment_snapshot_free.push_uncapped(sk, slot);
         }
     }
 }
@@ -4434,14 +4539,14 @@ mod recycle_tests {
                 owners: vec![owner.clone()],
                 last_touch_ms: 0,
             });
-            pools.sampled_cache_bytes += 4096;
+            pools.shared.sampled_cache_bytes += 4096;
         }
 
         let taken = pools.take_whole_sampled_cache();
 
         assert_eq!(taken.len(), 3, "every entry is handed back for disposal");
         assert_eq!(
-            pools.sampled_cache_bytes, 0,
+            pools.shared.sampled_cache_bytes, 0,
             "the byte accounting follows the entries out"
         );
         assert_eq!(
@@ -4547,7 +4652,7 @@ mod recycle_tests {
         let owner = resource.reference();
         // File the retained blob under the *incoming* blob's digest. This is the
         // collision, forced rather than found.
-        pools.sampled_cache.push(ResidentSampledSlot {
+        pools.shared.sampled_cache.push(ResidentSampledSlot {
             slot,
             fingerprint: SampledFingerprint::Content(sampled_content_hash(&incoming)),
             content: Some(std::sync::Arc::new(retained.clone())),
@@ -4584,7 +4689,7 @@ mod recycle_tests {
         let key = slot.key();
         let resource = reims_vgpu_core::ResourceLifetime::new();
         let owner = resource.reference();
-        pools.sampled_cache.push(ResidentSampledSlot {
+        pools.shared.sampled_cache.push(ResidentSampledSlot {
             slot,
             fingerprint: SampledFingerprint::Content(sampled_content_hash(&content)),
             content: Some(std::sync::Arc::new(content.clone())),
@@ -4624,9 +4729,9 @@ mod recycle_tests {
             pools.admit_target(null_target(16, 16 + i, translate::pixel::SCANOUT_FORMAT));
             pools.admit_storage_image(null_storage_slot(16, 16 + i));
         }
-        assert_eq!(pools.sampled_free.len(), 104);
-        assert_eq!(pools.target_free.len(), 104);
-        assert_eq!(pools.storage_image_free.len(), 104);
+        assert_eq!(pools.shared.sampled_free.len(), 104);
+        assert_eq!(pools.shared.target_free.len(), 104);
+        assert_eq!(pools.shared.storage_image_free.len(), 104);
     }
 
     /// `pop_any_pool_entry` drains a keyed pool one entry at a time across all
@@ -4654,12 +4759,12 @@ mod recycle_tests {
         let hd = null_slot(1920, 1080).key();
         for i in 0..100 {
             pools.admit_sampled(null_slot(1920, 1080));
-            assert_eq!(pools.sampled_free.count_for(&hd), i + 1);
+            assert_eq!(pools.shared.sampled_free.count_for(&hd), i + 1);
         }
-        assert_eq!(pools.sampled_free.count_for(&hd), 100);
+        assert_eq!(pools.shared.sampled_free.count_for(&hd), 100);
         let small = null_slot(64, 64).key();
         pools.admit_sampled(null_slot(64, 64));
-        assert_eq!(pools.sampled_free.count_for(&small), 1);
+        assert_eq!(pools.shared.sampled_free.count_for(&small), 1);
     }
 
     /// Elapsed time leaves live sampled entries alone, while deleting their
@@ -4670,8 +4775,8 @@ mod recycle_tests {
         let resource = reims_vgpu_core::ResourceLifetime::new();
         let owner = resource.reference();
         let push = |pools: &mut ResourcePools, w: u32, h: u32, touch: u64, len: usize| {
-            pools.sampled_cache_bytes = pools.sampled_cache_bytes.saturating_add(len);
-            pools.sampled_cache.push(ResidentSampledSlot {
+            pools.shared.sampled_cache_bytes = pools.shared.sampled_cache_bytes.saturating_add(len);
+            pools.shared.sampled_cache.push(ResidentSampledSlot {
                 slot: null_slot(w, h),
                 fingerprint: SampledFingerprint::Content(((w as u128) << 64) | h as u128),
                 // This test only ages entries out; nothing here looks one up by
@@ -4686,12 +4791,12 @@ mod recycle_tests {
         push(&mut pools, 1920, 1080, 1_000, 8_000_000);
         push(&mut pools, 1280, 720, 1_500, 4_000_000);
         push(&mut pools, 640, 480, 9_000, 1_000_000);
-        assert_eq!(pools.sampled_cache.len(), 3);
-        assert_eq!(pools.sampled_cache_bytes, 13_000_000);
+        assert_eq!(pools.shared.sampled_cache.len(), 3);
+        assert_eq!(pools.shared.sampled_cache_bytes, 13_000_000);
 
         assert!(pools.plan_idle_maintenance(10_000));
-        assert_eq!(pools.sampled_cache.len(), 3);
-        assert_eq!(pools.sampled_cache_bytes, 13_000_000);
+        assert_eq!(pools.shared.sampled_cache.len(), 3);
+        assert_eq!(pools.shared.sampled_cache_bytes, 13_000_000);
 
         drop(resource);
         assert_eq!(
@@ -4699,8 +4804,8 @@ mod recycle_tests {
             3,
             "resource deletion, not age or a chosen capacity, ends retention"
         );
-        assert!(pools.sampled_cache.is_empty());
-        assert_eq!(pools.sampled_cache_bytes, 0);
+        assert!(pools.shared.sampled_cache.is_empty());
+        assert_eq!(pools.shared.sampled_cache_bytes, 0);
     }
 
     /// Compute-storage residents are standalone allocations, but elapsed time
@@ -4718,7 +4823,7 @@ mod recycle_tests {
                 8,
                 0,
             );
-            pools.compute_storage_registry.insert(
+            pools.shared.compute_storage_registry.insert(
                 id,
                 ResidentStorageImageSlot {
                     slot: null_storage_slot(8, 8),
@@ -4729,17 +4834,17 @@ mod recycle_tests {
                     last_touch_ms: touch,
                 },
             );
-            pools.compute_storage_order.push_back(id);
+            pools.shared.compute_storage_order.push_back(id);
         };
         admit(&mut pools, 1, 1_000, false); // aged, evictable
         admit(&mut pools, 2, 1_500, false); // aged, evictable
         admit(&mut pools, 3, 1_500, true); // aged but PINNED — must survive
         admit(&mut pools, 4, 9_000, false); // freshly touched — must survive
-        assert_eq!(pools.compute_storage_registry.len(), 4);
+        assert_eq!(pools.shared.compute_storage_registry.len(), 4);
 
         assert!(pools.plan_idle_maintenance(10_000));
-        assert_eq!(pools.compute_storage_registry.len(), 4);
-        assert_eq!(pools.compute_storage_order.len(), 4);
+        assert_eq!(pools.shared.compute_storage_registry.len(), 4);
+        assert_eq!(pools.shared.compute_storage_order.len(), 4);
     }
 
     /// A compute-storage resident holding dispatch output nothing has copied out
@@ -4761,13 +4866,13 @@ mod recycle_tests {
         pools.mark_resident_storage_image(&id, 7);
 
         assert!(pools.plan_idle_maintenance(10_000));
-        assert!(pools.compute_storage_registry.contains_key(&id));
+        assert!(pools.shared.compute_storage_registry.contains_key(&id));
 
         // A readback lands and the same resident is reclaimable like any other.
         assert!(pools.note_compute_storage_copied_out(&id));
         assert!(pools.plan_idle_maintenance(100_000));
         assert!(
-            pools.compute_storage_registry.contains_key(&id),
+            pools.shared.compute_storage_registry.contains_key(&id),
             "a current backing permits pressure reclaim, not time-based removal"
         );
     }
@@ -4816,6 +4921,7 @@ mod recycle_tests {
             let walk = {
                 let sole = || {
                     pools
+                        .shared
                         .compute_storage_registry
                         .values()
                         .filter(|r| r.gpu_only_content)
@@ -4826,7 +4932,7 @@ mod recycle_tests {
                 }
             };
             assert_eq!(
-                pools.compute_storage_sole_copy, walk,
+                pools.shared.compute_storage_sole_copy, walk,
                 "maintained compute sole-copy totals disagree with the walk after {what}"
             );
         };
@@ -4836,42 +4942,45 @@ mod recycle_tests {
         let b = admit_compute_resident(&mut pools, 2, 0, false);
         check(&pools, "two admits");
         assert_eq!(
-            pools.compute_storage_sole_copy.count, 0,
+            pools.shared.compute_storage_sole_copy.count, 0,
             "a resident no dispatch has written holds no guest work"
         );
 
         pools.mark_resident_storage_image(&a, 1);
         check(&pools, "a dispatch wrote the first");
-        assert_eq!(pools.compute_storage_sole_copy.count, 1);
+        assert_eq!(pools.shared.compute_storage_sole_copy.count, 1);
         // A second dispatch into the same resident is still one resident.
         pools.mark_resident_storage_image(&a, 2);
         check(&pools, "a second dispatch into the same resident");
-        assert_eq!(pools.compute_storage_sole_copy.count, 1);
+        assert_eq!(pools.shared.compute_storage_sole_copy.count, 1);
 
         pools.mark_resident_storage_image(&b, 1);
         check(&pools, "a dispatch wrote the second");
-        assert_eq!(pools.compute_storage_sole_copy.count, 2);
+        assert_eq!(pools.shared.compute_storage_sole_copy.count, 2);
 
         assert!(pools.note_compute_storage_copied_out(&a));
         check(&pools, "a landed readback");
-        assert_eq!(pools.compute_storage_sole_copy.count, 1);
+        assert_eq!(pools.shared.compute_storage_sole_copy.count, 1);
         assert!(pools.note_compute_storage_copied_out(&a));
         check(&pools, "a redundant copy-out");
-        assert_eq!(pools.compute_storage_sole_copy.count, 1);
+        assert_eq!(pools.shared.compute_storage_sole_copy.count, 1);
 
         // The guest deleting the object is the other way the flag clears, and
         // without it `retire_linear_residents` would strand the image.
         assert!(pools.note_compute_storage_content_retired(&b));
         check(&pools, "the guest retiring the object");
-        assert_eq!(pools.compute_storage_sole_copy.count, 0);
+        assert_eq!(pools.shared.compute_storage_sole_copy.count, 0);
 
         // Removal folds a still-sole-copy resident out — the re-key path.
         pools.mark_resident_storage_image(&b, 3);
         check(&pools, "the second written again");
-        assert_eq!(pools.compute_storage_sole_copy.count, 1);
+        assert_eq!(pools.shared.compute_storage_sole_copy.count, 1);
         assert!(pools.remove_compute_storage_resident(&b).is_some());
         check(&pools, "removing a sole-copy resident");
-        assert_eq!(pools.compute_storage_sole_copy, NonPinnedTotals::default());
+        assert_eq!(
+            pools.shared.compute_storage_sole_copy,
+            NonPinnedTotals::default()
+        );
 
         assert!(
             !pools.note_compute_storage_copied_out(&b),
@@ -4895,7 +5004,7 @@ mod recycle_tests {
             8,
             0,
         );
-        pools.compute_storage_registry.insert(
+        pools.shared.compute_storage_registry.insert(
             id,
             ResidentStorageImageSlot {
                 slot: null_storage_slot(8, 8),
@@ -4906,7 +5015,7 @@ mod recycle_tests {
                 last_touch_ms: touch,
             },
         );
-        pools.compute_storage_order.push_back(id);
+        pools.shared.compute_storage_order.push_back(id);
         id
     }
 
@@ -4926,7 +5035,7 @@ mod recycle_tests {
         let mut pools = ResourcePools::new();
         let read = admit_compute_resident(&mut pools, 1, 1_000, false);
         let untouched = admit_compute_resident(&mut pools, 2, 1_000, false);
-        pools.idle_clock_ms = 10_000;
+        pools.shared.idle_clock_ms = 10_000;
         // A read through the product accessor, which is how a resident sample
         // consumer touches a resident it never dispatches into again.
         assert!(pools.compute_resident_snapshot(&read).is_some());
@@ -4934,11 +5043,14 @@ mod recycle_tests {
         pools.plan_idle_maintenance(20_000);
 
         assert!(
-            pools.compute_storage_registry.contains_key(&read),
+            pools.shared.compute_storage_registry.contains_key(&read),
             "a resident a chain is reading is in use and must not be destroyed"
         );
         assert!(
-            pools.compute_storage_registry.contains_key(&untouched),
+            pools
+                .shared
+                .compute_storage_registry
+                .contains_key(&untouched),
             "elapsed time does not end the untouched resource's lifetime"
         );
     }
@@ -4960,17 +5072,20 @@ mod recycle_tests {
         let untouched = admit_compute_resident(&mut pools, 2, 1_000, false);
         // The drain's clock has to be current before a read can be recorded
         // against it; the real caller advances it from the poll heartbeat.
-        pools.idle_clock_ms = 10_000;
+        pools.shared.idle_clock_ms = 10_000;
         assert!(pools.compute_resident_sample_source(&read).is_some());
 
         pools.plan_idle_maintenance(20_000);
 
         assert!(
-            pools.compute_storage_registry.contains_key(&read),
+            pools.shared.compute_storage_registry.contains_key(&read),
             "a resident a chain is reading is in use and must not be destroyed"
         );
         assert!(
-            pools.compute_storage_registry.contains_key(&untouched),
+            pools
+                .shared
+                .compute_storage_registry
+                .contains_key(&untouched),
             "elapsed time does not end the untouched resource's lifetime"
         );
     }
@@ -5031,7 +5146,7 @@ mod recycle_tests {
             "the refusal names both shapes, so a reader can tell which side moved"
         );
         assert!(
-            pools.compute_storage_registry.contains_key(&pinned),
+            pools.shared.compute_storage_registry.contains_key(&pinned),
             "the refusal must leave the unflushed content in place"
         );
     }
@@ -5098,9 +5213,9 @@ mod recycle_tests {
 
         for i in 0..100 {
             pools.admit_target(null_target(1920, 1080, fmt));
-            assert_eq!(pools.target_free.count_for(&key), i + 1);
+            assert_eq!(pools.shared.target_free.count_for(&key), i + 1);
         }
-        assert_eq!(pools.target_free.count_for(&key), 100);
+        assert_eq!(pools.shared.target_free.count_for(&key), 100);
 
         // A different format is an independent bucket (an RGBA image cannot back
         // a BGRA attachment).
@@ -5110,7 +5225,7 @@ mod recycle_tests {
             1080,
             translate::pixel::RESIDENT_RGBA_FORMAT,
         ));
-        assert_eq!(pools.target_free.count_for(&rgba), 1);
+        assert_eq!(pools.shared.target_free.count_for(&rgba), 1);
     }
 
     /// The exact video regression this pool fixes: a per-frame *generation* bump
@@ -5188,18 +5303,18 @@ mod recycle_tests {
         let mut pools = ResourcePools::new();
         let mut slot = pending_slot();
         slot.submission = SlotSubmission::QueueOwned(receipt);
-        pools.slots.push(slot);
+        pools.encoder.slots.push(slot);
 
         assert!(!pools.try_take_submit_return(&counters, 0).unwrap());
         assert!(matches!(
-            pools.slots[0].submission,
+            pools.encoder.slots[0].submission,
             SlotSubmission::QueueOwned(_)
         ));
 
         returned.send(Ok(())).unwrap();
         assert!(pools.try_take_submit_return(&counters, 0).unwrap());
         assert!(matches!(
-            pools.slots[0].submission,
+            pools.encoder.slots[0].submission,
             SlotSubmission::HostOwned
         ));
     }
@@ -5211,14 +5326,14 @@ mod recycle_tests {
         let mut pools = ResourcePools::new();
         let mut slot = pending_slot();
         slot.submission = SlotSubmission::QueueOwned(receipt);
-        pools.slots.push(slot);
+        pools.encoder.slots.push(slot);
 
         returned
             .send(Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY))
             .unwrap();
         assert!(pools.try_take_submit_return(&counters, 0).is_err());
         assert!(matches!(
-            pools.slots[0].submission,
+            pools.encoder.slots[0].submission,
             SlotSubmission::Failed(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
         ));
     }
@@ -5376,7 +5491,7 @@ mod recycle_tests {
             Some(write_token(12)),
         );
         let cleanup = pools.seal_entry(Vec::new(), Vec::new()).cleanup;
-        assert!(pools.guest_write_tokens_live.is_empty());
+        assert!(pools.encoder.guest_write_tokens_live.is_empty());
         assert_eq!(
             cleanup.guest_write_tokens,
             vec![write_token(11), write_token(12)]
@@ -5396,7 +5511,7 @@ mod recycle_tests {
         pools.note_guest_write_pages_recorded(GuestWriteSource::ImportedBuffer, &pages);
 
         assert_eq!(
-            pools.guest_write_tokens_live.len(),
+            pools.encoder.guest_write_tokens_live.len(),
             1,
             "one command buffer has one fence and therefore one lifetime for this page set"
         );
@@ -5429,32 +5544,35 @@ mod recycle_tests {
             generation: 3,
             format: reims_vgpu_protocol::TexelLayout::Bgra8,
         };
-        pools.registry.insert(
+        pools.shared.registry.insert(
             identity.clone(),
             crate::engine::pools::images_and_registry::pin_count_tests::ready_slot(),
         );
-        assert_eq!(pools.registry[&identity].pin_count, 0, "nobody has pinned");
+        assert_eq!(
+            pools.shared.registry[&identity].pin_count, 0,
+            "nobody has pinned"
+        );
 
         // Recording the copy is what pins: the caller holds nothing.
         pools.note_guest_write_recorded(GuestWriteSource::ResidentTarget(&identity), None);
         assert_eq!(
-            pools.registry[&identity].pin_count, 1,
+            pools.shared.registry[&identity].pin_count, 1,
             "the submitted copy must hold the image against reclaim"
         );
 
         // A second window on the same resident inside one pass takes its own.
         pools.note_guest_write_recorded(GuestWriteSource::ResidentTarget(&identity), None);
-        assert_eq!(pools.registry[&identity].pin_count, 2);
+        assert_eq!(pools.shared.registry[&identity].pin_count, 2);
 
         // Sealing transfers the pins to the exact submission that references
         // them. Model that slot's fence retirement without a Vulkan device.
         let mut cleanup = pools.seal_entry(Vec::new(), Vec::new()).cleanup;
-        assert!(pools.resident_pins_live.is_empty());
+        assert!(pools.encoder.resident_pins_live.is_empty());
         for held in cleanup.unpin_residents.drain(..) {
             pools.pin_resident_target(&held, false);
         }
         assert_eq!(
-            pools.registry[&identity].pin_count, 0,
+            pools.shared.registry[&identity].pin_count, 0,
             "every pin the ledger took is released exactly once"
         );
         assert!(
@@ -5487,18 +5605,18 @@ mod recycle_tests {
             generation: 1,
             format: reims_vgpu_protocol::TexelLayout::Bgra8,
         };
-        pools.registry.insert(
+        pools.shared.registry.insert(
             identity.clone(),
             crate::engine::pools::images_and_registry::pin_count_tests::ready_slot(),
         );
 
         pools.note_guest_write_recorded(GuestWriteSource::RingEntry, Some(write_token(21)));
         assert_eq!(
-            pools.registry[&identity].pin_count, 0,
+            pools.shared.registry[&identity].pin_count, 0,
             "a ring-owned source pins no resident"
         );
         assert!(
-            pools.resident_pins_live.is_empty(),
+            pools.encoder.resident_pins_live.is_empty(),
             "and leaves the ledger nothing to release"
         );
         let cleanup = pools.seal_entry(Vec::new(), Vec::new()).cleanup;
@@ -5540,18 +5658,18 @@ mod recycle_tests {
 
         pools.note_guest_write_recorded(GuestWriteSource::ResidentStorage(&id), None);
         assert!(
-            pools.compute_storage_registry[&id].pinned,
+            pools.shared.compute_storage_registry[&id].pinned,
             "the copy is submitted and not waited, so the image must be held"
         );
         assert_eq!(
-            pools.compute_write_pins_live,
+            pools.encoder.compute_write_pins_live,
             vec![id],
             "and the ledger records the pin it actually took"
         );
 
         let mut cleanup = pools.seal_entry(Vec::new(), Vec::new()).cleanup;
         assert!(
-            pools.compute_write_pins_live.is_empty(),
+            pools.encoder.compute_write_pins_live.is_empty(),
             "sealing hands the pin to the slot rather than copying it"
         );
         assert_eq!(cleanup.unpin_compute_residents, vec![id]);
@@ -5561,7 +5679,7 @@ mod recycle_tests {
             pools.pin_resident_storage(&identity, false);
         }
         assert!(
-            !pools.compute_storage_registry[&id].pinned,
+            !pools.shared.compute_storage_registry[&id].pinned,
             "and the fence is what ends the hold"
         );
     }
@@ -5586,7 +5704,7 @@ mod recycle_tests {
         );
 
         pools.note_guest_write_recorded(GuestWriteSource::ResidentStorage(&absent), None);
-        assert!(pools.compute_write_pins_live.is_empty());
+        assert!(pools.encoder.compute_write_pins_live.is_empty());
         assert!(pools
             .seal_entry(Vec::new(), Vec::new())
             .cleanup
@@ -5610,7 +5728,7 @@ mod recycle_tests {
             generation: 1,
             format: reims_vgpu_protocol::TexelLayout::Bgra8,
         };
-        pools.registry.insert(
+        pools.shared.registry.insert(
             identity.clone(),
             crate::engine::pools::images_and_registry::pin_count_tests::ready_slot(),
         );
@@ -5621,14 +5739,14 @@ mod recycle_tests {
         );
 
         pools.note_guest_write_recorded(GuestWriteSource::ResidentTarget(&identity), None);
-        assert_eq!(pools.registry[&identity].pin_count, 2);
+        assert_eq!(pools.shared.registry[&identity].pin_count, 2);
 
         let mut cleanup = pools.seal_entry(Vec::new(), Vec::new()).cleanup;
         for held in cleanup.unpin_residents.drain(..) {
             pools.pin_resident_target(&held, false);
         }
         assert_eq!(
-            pools.registry[&identity].pin_count, 1,
+            pools.shared.registry[&identity].pin_count, 1,
             "the window is still reading this image and must still hold it"
         );
     }
@@ -5653,10 +5771,10 @@ mod recycle_tests {
             Some(write_token(31)),
         );
         assert!(
-            pools.resident_pins_live.is_empty(),
+            pools.encoder.resident_pins_live.is_empty(),
             "no pin was taken, so none may be released"
         );
-        assert_eq!(pools.guest_write_tokens_live.len(), 1);
+        assert_eq!(pools.encoder.guest_write_tokens_live.len(), 1);
     }
 
     /// A dispose site has already unlinked the handle, so only the entries
@@ -5666,13 +5784,13 @@ mod recycle_tests {
     #[test]
     fn a_disposed_handle_waits_on_the_slots_open_when_it_was_disposed_and_no_others() {
         let mut pools = ResourcePools::new();
-        pools.slots = (0..4).map(|_| idle_slot()).collect();
-        pools.slots[0] = pending_slot();
-        pools.slots[1] = pending_slot();
+        pools.encoder.slots = (0..4).map(|_| idle_slot()).collect();
+        pools.encoder.slots[0] = pending_slot();
+        pools.encoder.slots[1] = pending_slot();
 
         let waiting = pools.open_slot_mask();
         assert_eq!(waiting, 0b0011, "slots 0 and 1 are in flight");
-        pools.graveyard.push((
+        pools.encoder.graveyard.push((
             waiting,
             DeferredHandle::Framebuffer(vk::Framebuffer::null()),
         ));
@@ -5680,7 +5798,7 @@ mod recycle_tests {
         // A later entry claims slot 2. It began after the dispose, so it cannot
         // have recorded a reference to the handle, and the handle must not
         // start waiting on it.
-        pools.slots[2] = pending_slot();
+        pools.encoder.slots[2] = pending_slot();
         assert!(
             pools.take_released_graveyard(1 << 2).is_empty(),
             "slot 2 retiring says nothing about a handle disposed before it began"
@@ -5694,7 +5812,7 @@ mod recycle_tests {
             1,
             "both witnesses retired: the handle is free"
         );
-        assert!(pools.graveyard.is_empty());
+        assert!(pools.encoder.graveyard.is_empty());
     }
 
     /// Installing and taking the owned batch publish the exact state the drain
@@ -5726,11 +5844,11 @@ mod recycle_tests {
     #[test]
     fn the_open_batch_slot_counts_as_open_even_though_it_owes_no_cleanup() {
         let mut pools = ResourcePools::new();
-        pools.slots = (0..4).map(|_| idle_slot()).collect();
-        pools.cur = 3;
+        pools.encoder.slots = (0..4).map(|_| idle_slot()).collect();
+        pools.encoder.cur = 3;
         assert_eq!(pools.open_slot_mask(), 0, "idle ring, no batch");
 
-        pools.open_batch = Some(OpenBatch {
+        pools.encoder.open_batch = Some(OpenBatch {
             cb: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
             target: BatchTarget {
@@ -5762,14 +5880,14 @@ mod recycle_tests {
             bgra: false,
         };
         let mut pools = ResourcePools::new();
-        pools.slots = (0..4).map(|_| idle_slot()).collect();
+        pools.encoder.slots = (0..4).map(|_| idle_slot()).collect();
 
         assert!(
             matches!(pools.batch_fit(&target(0), false), BatchFit::None),
             "nothing recording"
         );
 
-        pools.open_batch = Some(OpenBatch {
+        pools.encoder.open_batch = Some(OpenBatch {
             cb: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
             target: target(0),
@@ -5791,7 +5909,7 @@ mod recycle_tests {
 
         // Fullness outranks the target on both arms: the cap is what keeps the
         // GPU fed, and a full batch has to be flushed whoever asks.
-        pools.open_batch.as_mut().expect("open").draws = BATCH_MAX_DRAWS;
+        pools.encoder.open_batch.as_mut().expect("open").draws = BATCH_MAX_DRAWS;
         for narrow in [false, true] {
             assert!(
                 matches!(pools.batch_fit(&target(0), narrow), BatchFit::Full),
@@ -5809,7 +5927,7 @@ mod recycle_tests {
     fn a_ring_that_never_goes_idle_still_drains_the_graveyard() {
         let mut pools = ResourcePools::new();
         let depth = 4;
-        pools.slots = (0..depth).map(|_| pending_slot()).collect();
+        pools.encoder.slots = (0..depth).map(|_| pending_slot()).collect();
 
         let mut released = 0;
         let mut peak = 0;
@@ -5818,16 +5936,16 @@ mod recycle_tests {
             // ring is never idle and `open_slot_mask()` is never zero.
             let waiting = pools.open_slot_mask();
             assert_ne!(waiting, 0, "step {step}: ring must stay busy");
-            pools.graveyard.push((
+            pools.encoder.graveyard.push((
                 waiting,
                 DeferredHandle::Framebuffer(vk::Framebuffer::null()),
             ));
-            peak = peak.max(pools.graveyard.len());
+            peak = peak.max(pools.encoder.graveyard.len());
 
             let index = step % depth;
-            pools.slots[index].pending = None;
+            pools.encoder.slots[index].pending = None;
             released += pools.take_released_graveyard(1 << index).len();
-            pools.slots[index] = pending_slot();
+            pools.encoder.slots[index] = pending_slot();
         }
 
         // A handle disposed at step `s` waits on all `depth` slots and the
@@ -5971,6 +6089,7 @@ mod gather_slots_do_not_alias {
         let mut pools = ResourcePools::new();
         let bucket = ResourcePools::bucket(4096);
         pools
+            .encoder
             .gather_free
             .insert(bucket, vec![slot(1, bucket), slot(2, bucket)]);
 
@@ -5981,7 +6100,11 @@ mod gather_slots_do_not_alias {
             first.buffer, second.buffer,
             "two live gather slots must not be one buffer"
         );
-        assert_eq!(pools.gather_live.len(), 2, "both must be recorded live");
+        assert_eq!(
+            pools.encoder.gather_live.len(),
+            2,
+            "both must be recorded live"
+        );
     }
 
     /// A slot that has been handed out is gone from the free list, so it cannot
@@ -5994,7 +6117,10 @@ mod gather_slots_do_not_alias {
     fn an_acquired_slot_is_no_longer_free() {
         let mut pools = ResourcePools::new();
         let bucket = ResourcePools::bucket(4096);
-        pools.gather_free.insert(bucket, vec![slot(7, bucket)]);
+        pools
+            .encoder
+            .gather_free
+            .insert(bucket, vec![slot(7, bucket)]);
 
         let taken = pools.take_free_gather(bucket).expect("a free slot");
         assert_eq!(taken.buffer, vk::Buffer::from_raw(7));
@@ -6003,7 +6129,7 @@ mod gather_slots_do_not_alias {
             "the only slot was handed out; the list must be empty"
         );
         assert!(
-            !pools.gather_live.is_empty(),
+            !pools.encoder.gather_live.is_empty(),
             "and the live list is what keeps it alive until its fence retires"
         );
     }
@@ -6119,8 +6245,8 @@ mod scatter_descriptor_sets_do_not_alias {
     fn a_batch_fills_at_the_pools_cap_and_not_at_the_compiled_constant() {
         let target = batch_target();
         let mut pools = ResourcePools::new();
-        pools.batch_max_draws = 4;
-        pools.open_batch = Some(super::OpenBatch {
+        pools.encoder.batch_max_draws = 4;
+        pools.encoder.open_batch = Some(super::OpenBatch {
             cb: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
             target: target.clone(),
@@ -6131,7 +6257,7 @@ mod scatter_descriptor_sets_do_not_alias {
             pools.batch_fit(&target, false),
             super::BatchFit::Open(..)
         ));
-        if let Some(b) = pools.open_batch.as_mut() {
+        if let Some(b) = pools.encoder.open_batch.as_mut() {
             b.draws = 4;
         }
         assert!(matches!(
@@ -6145,7 +6271,7 @@ mod scatter_descriptor_sets_do_not_alias {
     #[test]
     fn a_pool_that_was_told_nothing_carries_the_compiled_cap() {
         assert_eq!(
-            ResourcePools::new().batch_max_draws,
+            ResourcePools::new().encoder.batch_max_draws,
             super::BATCH_MAX_DRAWS,
             "a device-free pool carries enough capacity for either topology"
         );
@@ -6179,8 +6305,11 @@ mod scatter_descriptor_sets_do_not_alias {
         let mut pools = ResourcePools::new();
         pools.configure_batch_capacity(super::DISCRETE_BATCH_MAX_DRAWS);
 
-        assert_eq!(pools.batch_max_draws, super::DISCRETE_BATCH_MAX_DRAWS);
-        assert_eq!(pools.attachment_snapshot_free.len(), 0);
+        assert_eq!(
+            pools.encoder.batch_max_draws,
+            super::DISCRETE_BATCH_MAX_DRAWS
+        );
+        assert_eq!(pools.shared.attachment_snapshot_free.len(), 0);
     }
 }
 

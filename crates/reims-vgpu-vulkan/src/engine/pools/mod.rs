@@ -185,7 +185,31 @@ pub(crate) fn return_readback_lease(lease: ReadbackLease) {
     lease.returns.outstanding.fetch_sub(1, Ordering::AcqRel);
 }
 
-pub(crate) struct ResourcePools {
+/// Everything one recording context owns on its own, and nothing another
+/// recording context could observe.
+///
+/// # Why this is a type and not a comment
+///
+/// The x86/Vulkan rail is drain-CPU bound, and the route to 60 fps is encoding
+/// command buffers on more than one core — `super::EngineLockSite`'s doc
+/// carries the ceiling that motivates it and the measured packet width that
+/// says it can be fed. What stands in the way is that one `ENGINE` mutex wraps
+/// the whole draw, because [`ResourcePools`] was one flat structure and no
+/// caller could say which half of it a given operation needed.
+///
+/// Splitting the fields does not by itself make anything concurrent. What it
+/// does is make the boundary checkable: a method that reaches into both halves
+/// now says so in its body, and the ones that do are the seam a parallel
+/// encoder has to answer for. There are ten of them out of 456, and six are
+/// construction, teardown or counters.
+///
+/// The rule that keeps this true: **nothing in here may be reachable from
+/// another encoder.** A ring slot, its command pool, its descriptor arena, the
+/// staging and gather buffers it fills, and the per-command-buffer memos are
+/// all private to whoever is recording. Adding a field here that a second
+/// recorder could see reintroduces exactly the coupling this split exists to
+/// remove, and nothing outside review will catch it.
+pub(crate) struct EncoderPools {
     readback_lease_returns: Arc<ReadbackLeaseReturns>,
     /// Size-bucketed free host-visible buffers (TRANSFER_SRC | VERTEX | INDEX | STORAGE).
     staging_free: HashMap<u64, Vec<BufferSlot>>,
@@ -304,6 +328,150 @@ pub(crate) struct ResourcePools {
     /// `staging_hits + staging_misses` at the previous maintenance pass; see
     /// `note_maintenance_settled`.
     settled_staging_mark: u64,
+    /// Readback buffers by size.
+    readback_free: HashMap<u64, Vec<BufferSlot>>,
+    readback_live: Option<BufferSlot>,
+    /// Extra live readbacks (compute multi-image / multi-buffer).
+    readback_multi_live: Vec<BufferSlot>,
+    /// Readback slots handed to a reader that is consuming their mapping with
+    /// the engine unlocked; see [`ResourcePools::lease_readback`].
+    ///
+    /// Deliberately in none of the three lists above. A leased slot must not
+    /// reach a ring entry's `PendingGpuCleanup` (which would return it to
+    /// `readback_free` when that entry retires) and must not be handed to a
+    /// second acquire, because either one lets a GPU copy overwrite bytes a
+    /// live borrow is still reading.
+    readback_leased: Vec<LeasedReadback>,
+    /// Persistent command pool; each ring slot owns one primary CB.
+    cmd_pool: vk::CommandPool,
+    /// Growable descriptor-pool arena (FREE_DESCRIPTOR_SET blocks). Grows a new
+    /// block on exhaustion instead of hard-failing the draw; sets are freed
+    /// per entry, paired with their owning block. See [`DescriptorArena`].
+    desc_arena: DescriptorArena,
+    /// Descriptor sets a guest-scatter dispatch has allocated and not yet
+    /// handed to a fence.
+    ///
+    /// Held here rather than returned to the writeback because the writeback has
+    /// two seal points — its own [`ResourcePools::seal_entry`] and the
+    /// [`ResourcePools::batch_flush`] it takes when it joined an open batch —
+    /// and threading the sets through both is how one of them ends up double
+    /// -freeing or leaking. [`ResourcePools::seal_entry`] drains this, and both
+    /// paths reach it. A writeback that allocated a set and then failed before
+    /// submitting anything leaves it here for the next seal, which is correct:
+    /// no submitted command buffer ever named it, so any later fence will do.
+    scatter_dsets: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
+    /// Guest-scatter descriptor sets whose fence has retired, ready to be
+    /// rewritten and handed out again.
+    ///
+    /// Every set here was allocated against the one [`guest_scatter`] layout, so
+    /// unlike a draw's — which are keyed by a per-pipeline binding signature —
+    /// they are interchangeable, and a `vkAllocateDescriptorSets` per use buys
+    /// nothing. The draw-time gather issues ~40 000 dispatches a second on a
+    /// driven macos-13 boot and an allocate plus its matching free is two driver
+    /// calls apiece, which is the larger half of the per-dispatch cost that kept
+    /// the compute gather switched off. Recycling makes the steady state zero of
+    /// both.
+    ///
+    /// A set returns here only from `drain_cleanup`, which runs after the fence
+    /// of the submission that named it — the same rule the staging and gather
+    /// free lists keep, and the reason a rewrite cannot race a dispatch still
+    /// reading the old bindings.
+    ///
+    /// Bounded by construction rather than by a cap: nothing enters that was not
+    /// already allocated and retired, so the high-water is the peak number of
+    /// dispatches in flight at once and never more.
+    ///
+    /// [`guest_scatter`]: crate::engine::guest_scatter
+    scatter_dset_free: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
+    /// N-deep in-flight ring: each slot is one CB + fence + the cleanup it
+    /// owes. Entries rotate through slots; a slot is reused only after its
+    /// fence retires (begin_entry blocks on the oldest when the ring is full).
+    slots: Vec<CmdSlot>,
+    /// Slot the current (or most recently begun) entry records into.
+    cur: usize,
+    /// Submitted-but-unretired slot count. While nonzero, destroying any GPU
+    /// object a prior CB may reference is unsafe — dispose() defers those
+    /// handles to `graveyard` until the slots that could reference them retire.
+    in_flight: usize,
+    /// Handles displaced (cache eviction, registry replace) while GPU work was
+    /// open, each paired with the [`SlotMask`] of the ring slots that were open
+    /// at dispose time. A dispose site has already made the handle unreachable
+    /// (it was taken out of the cache/registry that named it), so no *later*
+    /// entry can bind it; only the entries recording or in flight at that
+    /// instant can still reference it. Clearing a slot's bit as it retires
+    /// therefore frees the handle on the last fence that could be reading it,
+    /// not on the whole ring going idle.
+    graveyard: Vec<(SlotMask, DeferredHandle)>,
+    /// Open draw batch: a ring slot whose CB is still recording deferred
+    /// same-target draws (submit pending). While `Some`, that CB references
+    /// live GPU objects exactly like an in-flight CB, so dispose/graveyard
+    /// treat it as in flight; every path that claims a slot or quiesces the
+    /// ring flushes it first ([`Self::batch_flush`]).
+    open_batch: Option<OpenBatch>,
+    /// How many draws one command buffer may carry: the topology policy from
+    /// [`batch_default_draws`] unless [`reims_vgpu_config::BATCH_DRAWS`] narrowed it.
+    ///
+    /// A field rather than a read inside [`Self::batch_fit`], because that
+    /// function's doc promises it is pure and testable without a device and a
+    /// process-global environment read is neither.
+    batch_max_draws: u64,
+    /// The render pass the last recorded draw opened — see [`PassEcho`].
+    ///
+    /// Observation only: nothing branches on it. It exists because "could this
+    /// draw have continued the previous one's pass" is not answerable from any
+    /// counter this device had, and the answer is the size of the merge.
+    last_pass: Option<PassEcho>,
+    /// Render pass currently open in the deferred batch command buffer.
+    /// Unlike `last_pass`, this is executable state: every outside-pass command
+    /// and every command-buffer end must close it first.
+    open_pass: Option<PassEcho>,
+    /// Whether any command buffer recorded or submitted since the last quiesce
+    /// **reads** guest RAM when it executes.
+    ///
+    /// The whole reason [`ResourcePools::quiesce_guest_reads`] exists: this
+    /// device tells the guest a packet is finished before the GPU has run it, so
+    /// a read that happens at execute time can land after the guest has already
+    /// repainted or freed the pages. One flag rather than a per-slot mask
+    /// because the answer the stamp needs is "is there any", and a quiesce
+    /// retires the whole ring regardless.
+    guest_reads_in_flight: bool,
+    /// Guest-write ledger tokens recorded into the command buffer currently
+    /// being built. `seal_entry` transfers them to its ring cleanup, which
+    /// retires each token with the fence that owns the write.
+    /// One visibility token per exact page set written by the command buffer
+    /// currently being recorded. Repeated draws into the same imported target
+    /// share the submission and therefore share its one retirement point.
+    guest_write_tokens_live: HashMap<reims_vgpu_memory::GuestWritePages, super::GuestWriteToken>,
+    /// Residents used by the command buffer currently being recorded.
+    /// [`ResourcePools::seal_entry`] transfers their pins to that submission's
+    /// [`PendingGpuCleanup`]. This includes both images read directly as sampled
+    /// guest storage and images copied into guest pages.
+    ///
+    /// A window's flush used to unpin its resident as soon as the copy returned,
+    /// which was safe only because the copy had already executed by then. With
+    /// the wait deferred, unpinning at that point would let the
+    /// allocation-pressure reclaim take an image the GPU has not read yet. The
+    /// pin is transferred here instead and then to the ring slot, which
+    /// releases it when that slot's fence retires.
+    ///
+    /// Cannot strand a pin: every entry that can submit passes through
+    /// `seal_entry`, and every sealed cleanup belongs to one retiring slot.
+    resident_pins_live: Vec<TargetIdentity>,
+    /// The compute-storage half of `resident_pins_live`, keyed in the other
+    /// registry. Separate because the release has to reach the registry that
+    /// holds the image; identical in discipline, and it travels to the same ring
+    /// slot in the same `seal_entry`.
+    compute_write_pins_live: Vec<reims_vgpu_core::ComputeStorageResidencyKey>,
+}
+
+/// Everything every recording context shares: the resident registry, the image
+/// and target pools they draw from, and the device-wide allocators.
+///
+/// This is the half that must stay behind a lock when [`EncoderPools`] no
+/// longer does, and its size is the Amdahl term — see `super::EngineLockSite`.
+/// A field belongs here when two encoders asking the same question must get
+/// the same answer.
+pub(crate) struct SharedPools {
     /// Target images + framebuffers keyed by geometry + render_pass identity.
     targets: HashMap<(TargetKey, u64), TargetSlot>, // u64 = render_pass as u64
     target_order: Vec<(TargetKey, u64)>,
@@ -329,20 +497,6 @@ pub(crate) struct ResourcePools {
     /// view they name is destroyed — see `destroy_deferred_handle`, which is the
     /// single terminal destroy for every view this device frees at runtime.
     ad_hoc_framebuffers: HashMap<AdHocFramebufferKey, vk::Framebuffer>,
-    /// Readback buffers by size.
-    readback_free: HashMap<u64, Vec<BufferSlot>>,
-    readback_live: Option<BufferSlot>,
-    /// Extra live readbacks (compute multi-image / multi-buffer).
-    readback_multi_live: Vec<BufferSlot>,
-    /// Readback slots handed to a reader that is consuming their mapping with
-    /// the engine unlocked; see [`ResourcePools::lease_readback`].
-    ///
-    /// Deliberately in none of the three lists above. A leased slot must not
-    /// reach a ring entry's `PendingGpuCleanup` (which would return it to
-    /// `readback_free` when that entry retires) and must not be handed to a
-    /// second acquire, because either one lets a GPU copy overwrite bytes a
-    /// live borrow is still reading.
-    readback_leased: Vec<LeasedReadback>,
     /// Transient sampled-image pool, keyed by exact image and view geometry.
     sampled_free: FreePool<SampledKey, SampledSlot>,
     sampled_live: Vec<SampledSlot>,
@@ -462,12 +616,6 @@ pub(crate) struct ResourcePools {
     /// steal a 64 MiB staging buffer and spike the next upload's latency. The
     /// image/slab trims stay ungated — they refill via cheap slab suballocation.
     settled_maintenance_passes: u32,
-    /// Persistent command pool; each ring slot owns one primary CB.
-    cmd_pool: vk::CommandPool,
-    /// Growable descriptor-pool arena (FREE_DESCRIPTOR_SET blocks). Grows a new
-    /// block on exhaustion instead of hard-failing the draw; sets are freed
-    /// per entry, paired with their owning block. See [`DescriptorArena`].
-    desc_arena: DescriptorArena,
     /// The device's own guest-scatter pipeline, built on first use.
     ///
     /// Lazy rather than part of [`ResourcePools::ensure_init`] so a driver that
@@ -479,60 +627,6 @@ pub(crate) struct ResourcePools {
     /// fallback costs one flag rather than a `vkCreateComputePipelines` per
     /// writeback on a host that will never serve one.
     scatter_refused: bool,
-    /// Descriptor sets a guest-scatter dispatch has allocated and not yet
-    /// handed to a fence.
-    ///
-    /// Held here rather than returned to the writeback because the writeback has
-    /// two seal points — its own [`ResourcePools::seal_entry`] and the
-    /// [`ResourcePools::batch_flush`] it takes when it joined an open batch —
-    /// and threading the sets through both is how one of them ends up double
-    /// -freeing or leaking. [`ResourcePools::seal_entry`] drains this, and both
-    /// paths reach it. A writeback that allocated a set and then failed before
-    /// submitting anything leaves it here for the next seal, which is correct:
-    /// no submitted command buffer ever named it, so any later fence will do.
-    scatter_dsets: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
-    /// Guest-scatter descriptor sets whose fence has retired, ready to be
-    /// rewritten and handed out again.
-    ///
-    /// Every set here was allocated against the one [`guest_scatter`] layout, so
-    /// unlike a draw's — which are keyed by a per-pipeline binding signature —
-    /// they are interchangeable, and a `vkAllocateDescriptorSets` per use buys
-    /// nothing. The draw-time gather issues ~40 000 dispatches a second on a
-    /// driven macos-13 boot and an allocate plus its matching free is two driver
-    /// calls apiece, which is the larger half of the per-dispatch cost that kept
-    /// the compute gather switched off. Recycling makes the steady state zero of
-    /// both.
-    ///
-    /// A set returns here only from `drain_cleanup`, which runs after the fence
-    /// of the submission that named it — the same rule the staging and gather
-    /// free lists keep, and the reason a rewrite cannot race a dispatch still
-    /// reading the old bindings.
-    ///
-    /// Bounded by construction rather than by a cap: nothing enters that was not
-    /// already allocated and retired, so the high-water is the peak number of
-    /// dispatches in flight at once and never more.
-    ///
-    /// [`guest_scatter`]: crate::engine::guest_scatter
-    scatter_dset_free: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
-    /// N-deep in-flight ring: each slot is one CB + fence + the cleanup it
-    /// owes. Entries rotate through slots; a slot is reused only after its
-    /// fence retires (begin_entry blocks on the oldest when the ring is full).
-    slots: Vec<CmdSlot>,
-    /// Slot the current (or most recently begun) entry records into.
-    cur: usize,
-    /// Submitted-but-unretired slot count. While nonzero, destroying any GPU
-    /// object a prior CB may reference is unsafe — dispose() defers those
-    /// handles to `graveyard` until the slots that could reference them retire.
-    in_flight: usize,
-    /// Handles displaced (cache eviction, registry replace) while GPU work was
-    /// open, each paired with the [`SlotMask`] of the ring slots that were open
-    /// at dispose time. A dispose site has already made the handle unreachable
-    /// (it was taken out of the cache/registry that named it), so no *later*
-    /// entry can bind it; only the entries recording or in flight at that
-    /// instant can still reference it. Clearing a slot's bit as it retires
-    /// therefore frees the handle on the last fence that could be reading it,
-    /// not on the whole ring going idle.
-    graveyard: Vec<(SlotMask, DeferredHandle)>,
     /// Guest allocation identities whose imported memory has passed its final
     /// fence and can no longer access the corresponding host allocation.
     completed_guest_imports: Vec<reims_vgpu_memory::ImportId>,
@@ -543,29 +637,6 @@ pub(crate) struct ResourcePools {
     /// otherwise pay (see [`TargetRecycleKey`]). The guest's live working set,
     /// not an implementation capacity, bounds this pool.
     target_free: FreePool<TargetRecycleKey, FreeTargetImage>,
-    /// Open draw batch: a ring slot whose CB is still recording deferred
-    /// same-target draws (submit pending). While `Some`, that CB references
-    /// live GPU objects exactly like an in-flight CB, so dispose/graveyard
-    /// treat it as in flight; every path that claims a slot or quiesces the
-    /// ring flushes it first ([`Self::batch_flush`]).
-    open_batch: Option<OpenBatch>,
-    /// How many draws one command buffer may carry: the topology policy from
-    /// [`batch_default_draws`] unless [`reims_vgpu_config::BATCH_DRAWS`] narrowed it.
-    ///
-    /// A field rather than a read inside [`Self::batch_fit`], because that
-    /// function's doc promises it is pure and testable without a device and a
-    /// process-global environment read is neither.
-    batch_max_draws: u64,
-    /// The render pass the last recorded draw opened — see [`PassEcho`].
-    ///
-    /// Observation only: nothing branches on it. It exists because "could this
-    /// draw have continued the previous one's pass" is not answerable from any
-    /// counter this device had, and the answer is the size of the merge.
-    last_pass: Option<PassEcho>,
-    /// Render pass currently open in the deferred batch command buffer.
-    /// Unlike `last_pass`, this is executable state: every outside-pass command
-    /// and every command-buffer end must close it first.
-    open_pass: Option<PassEcho>,
     /// Offset suballocator for DEVICE_LOCAL optimal images (targets, sampled,
     /// storage, resident registry). Sub-allocates many image binds from a few
     /// large `VkDeviceMemory` blocks to collapse the per-image
@@ -586,44 +657,12 @@ pub(crate) struct ResourcePools {
     /// Lives here rather than beside its one consumer so it is destroyed by the
     /// same teardown that destroys every other device object.
     host_ram_imports: host_ram::HostRamImports,
-    /// Whether any command buffer recorded or submitted since the last quiesce
-    /// **reads** guest RAM when it executes.
-    ///
-    /// The whole reason [`ResourcePools::quiesce_guest_reads`] exists: this
-    /// device tells the guest a packet is finished before the GPU has run it, so
-    /// a read that happens at execute time can land after the guest has already
-    /// repainted or freed the pages. One flag rather than a per-slot mask
-    /// because the answer the stamp needs is "is there any", and a quiesce
-    /// retires the whole ring regardless.
-    guest_reads_in_flight: bool,
-    /// Guest-write ledger tokens recorded into the command buffer currently
-    /// being built. `seal_entry` transfers them to its ring cleanup, which
-    /// retires each token with the fence that owns the write.
-    /// One visibility token per exact page set written by the command buffer
-    /// currently being recorded. Repeated draws into the same imported target
-    /// share the submission and therefore share its one retirement point.
-    guest_write_tokens_live: HashMap<reims_vgpu_memory::GuestWritePages, super::GuestWriteToken>,
-    /// Residents used by the command buffer currently being recorded.
-    /// [`ResourcePools::seal_entry`] transfers their pins to that submission's
-    /// [`PendingGpuCleanup`]. This includes both images read directly as sampled
-    /// guest storage and images copied into guest pages.
-    ///
-    /// A window's flush used to unpin its resident as soon as the copy returned,
-    /// which was safe only because the copy had already executed by then. With
-    /// the wait deferred, unpinning at that point would let the
-    /// allocation-pressure reclaim take an image the GPU has not read yet. The
-    /// pin is transferred here instead and then to the ring slot, which
-    /// releases it when that slot's fence retires.
-    ///
-    /// Cannot strand a pin: every entry that can submit passes through
-    /// `seal_entry`, and every sealed cleanup belongs to one retiring slot.
-    resident_pins_live: Vec<TargetIdentity>,
-    /// The compute-storage half of `resident_pins_live`, keyed in the other
-    /// registry. Separate because the release has to reach the registry that
-    /// holds the image; identical in discipline, and it travels to the same ring
-    /// slot in the same `seal_entry`.
-    compute_write_pins_live: Vec<reims_vgpu_core::ComputeStorageResidencyKey>,
     initialized: bool,
+}
+
+pub(crate) struct ResourcePools {
+    encoder: EncoderPools,
+    shared: SharedPools,
 }
 
 /// State of the deferred-submit draw batch (draw-batching increment 1): the
@@ -1183,7 +1222,7 @@ impl ResourcePools {
                 // sub-allocation, and freeing memory under a live image is UB.
                 device.destroy_image_view(view, None);
                 device.destroy_image(image, None);
-                if !self.slab.free_image(device, image) {
+                if !self.shared.slab.free_image(device, image) {
                     device.free_memory(memory, None);
                 }
             }
@@ -1194,34 +1233,38 @@ impl ResourcePools {
             } => {
                 device.destroy_image_view(view, None);
                 device.destroy_image(image, None);
-                if let Some(parent) = self.host_ram_imports.release_child(&import) {
+                if let Some(parent) = self.shared.host_ram_imports.release_child(&import) {
                     crate::telemetry::note_route("guest_import_parent_released");
                     let completed = parent.destroy(device);
-                    self.completed_guest_imports.push(completed);
+                    self.shared.completed_guest_imports.push(completed);
                 }
             }
             DeferredHandle::GuestAllocation(parent) => {
                 let import = parent.destroy(device);
-                self.completed_guest_imports.push(import);
+                self.shared.completed_guest_imports.push(import);
             }
             DeferredHandle::GuestAllocationBarrier(import_id) => {
-                if let Some(parent) = self.host_ram_imports.retirement_fences_cleared(import_id) {
+                if let Some(parent) = self
+                    .shared
+                    .host_ram_imports
+                    .retirement_fences_cleared(import_id)
+                {
                     crate::telemetry::note_route("guest_import_parent_released");
                     let completed = parent.destroy(device);
-                    self.completed_guest_imports.push(completed);
+                    self.shared.completed_guest_imports.push(completed);
                 }
             }
             DeferredHandle::RecycleSampled(slot) => {
                 device.destroy_image_view(slot.view, None);
                 device.destroy_image(slot.image, None);
-                if !self.slab.free_image(device, slot.image) {
+                if !self.shared.slab.free_image(device, slot.image) {
                     device.free_memory(slot.memory, None);
                 }
             }
             DeferredHandle::RecycleTarget(img) => {
                 device.destroy_image_view(img.view, None);
                 device.destroy_image(img.image, None);
-                if !self.slab.free_image(device, img.image) {
+                if !self.shared.slab.free_image(device, img.image) {
                     device.free_memory(img.memory, None);
                 }
             }
@@ -3995,6 +4038,7 @@ mod staging_mapping_tests {
         let first = ResourcePools::new();
         let second = ResourcePools::new();
         first
+            .encoder
             .readback_lease_returns
             .outstanding
             .store(1, std::sync::atomic::Ordering::Release);
@@ -4002,15 +4046,21 @@ mod staging_mapping_tests {
             token: 7,
             ptr: 0,
             slot_size: 0,
-            returns: Arc::clone(&first.readback_lease_returns),
+            returns: Arc::clone(&first.encoder.readback_lease_returns),
         };
 
         return_readback_lease(lease);
 
-        assert_eq!(&*first.readback_lease_returns.returned.lock(), &[7]);
-        assert!(second.readback_lease_returns.returned.lock().is_empty());
+        assert_eq!(&*first.encoder.readback_lease_returns.returned.lock(), &[7]);
+        assert!(second
+            .encoder
+            .readback_lease_returns
+            .returned
+            .lock()
+            .is_empty());
         assert_eq!(
             first
+                .encoder
                 .readback_lease_returns
                 .outstanding
                 .load(std::sync::atomic::Ordering::Acquire),
@@ -4252,6 +4302,7 @@ mod staging_mapping_tests {
         );
         assert_eq!(
             pools
+                .encoder
                 .readback_lease_returns
                 .outstanding
                 .load(std::sync::atomic::Ordering::Acquire),
@@ -4270,6 +4321,7 @@ mod staging_mapping_tests {
         return_readback_lease(lease);
         assert_eq!(
             pools
+                .encoder
                 .readback_lease_returns
                 .outstanding
                 .load(std::sync::atomic::Ordering::Acquire),

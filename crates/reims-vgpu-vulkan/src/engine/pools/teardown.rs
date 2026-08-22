@@ -20,13 +20,13 @@ impl ResourcePools {
         // No command from this CB will be submitted now. Destroying its command
         // pool discards the unfinished recording, including an open pass, so
         // there is neither a legal nor a useful cmd_end_render_pass to emit.
-        self.open_pass = None;
+        self.encoder.open_pass = None;
         self.forget_pass_echo();
         // A batched submit transfers host ownership of its fence to the queue
         // thread until the driver's submit call returns. Teardown can be
         // reached through session release without a queue-wide barrier, so
         // reclaim each exact fence before the waits below touch it.
-        for slot in &mut self.slots {
+        for slot in &mut self.encoder.slots {
             let state = std::mem::replace(&mut slot.submission, SlotSubmission::HostOwned);
             let result = match state {
                 SlotSubmission::HostOwned => Ok(()),
@@ -42,7 +42,7 @@ impl ResourcePools {
         // Best-effort quiesce: wait every in-flight fence so no CB references
         // what we are about to destroy. On device loss the waits fail — the
         // teardown proceeds regardless, matching the recreate path.
-        for slot in &self.slots {
+        for slot in &self.encoder.slots {
             if slot.pending.is_some() && !matches!(slot.submission, SlotSubmission::Failed(_)) {
                 if let Err(result) = device.wait_for_fences(&[slot.fence], true, FENCE_TIMEOUT_NS) {
                     let decline =
@@ -51,52 +51,55 @@ impl ResourcePools {
                 }
             }
         }
-        for slot in &mut self.slots {
+        for slot in &mut self.encoder.slots {
             if let Some(pending) = slot.pending.take() {
                 super::super::retire_guest_write_pages(&pending.guest_write_tokens);
                 // The descriptor pool is destroyed below (frees every set);
                 // move the owed transients into the live lists so the drains
                 // below destroy them.
-                self.staging_live.extend(pending.staging);
-                self.gather_live.extend(pending.gather);
-                self.readback_multi_live.extend(pending.readback);
-                self.sampled_live.extend(pending.sampled);
-                self.attachment_snapshot_live
+                self.encoder.staging_live.extend(pending.staging);
+                self.encoder.gather_live.extend(pending.gather);
+                self.encoder.readback_multi_live.extend(pending.readback);
+                self.shared.sampled_live.extend(pending.sampled);
+                self.shared
+                    .attachment_snapshot_live
                     .extend(pending.attachment_snapshots);
-                self.storage_image_live.extend(pending.storage_images);
+                self.shared
+                    .storage_image_live
+                    .extend(pending.storage_images);
             }
         }
-        self.in_flight = 0;
+        self.encoder.in_flight = 0;
         // Every fence above was waited (or failed on a lost device, where the
         // handles die with the device anyway), so no slot can still be reading:
         // release the whole graveyard regardless of what each handle waits on.
         self.release_graveyard(device, SlotMask::MAX);
-        for list in self.staging_free.values_mut() {
+        for list in self.encoder.staging_free.values_mut() {
             for s in list.drain(..) {
-                release_buffer_slot(device, &mut self.slabs, s);
+                release_buffer_slot(device, &mut self.shared.slabs, s);
             }
         }
-        for s in self.staging_live.drain(..) {
-            release_buffer_slot(device, &mut self.slabs, s);
+        for s in self.encoder.staging_live.drain(..) {
+            release_buffer_slot(device, &mut self.shared.slabs, s);
         }
-        for list in self.gather_free.values_mut() {
+        for list in self.encoder.gather_free.values_mut() {
             for s in list.drain(..) {
-                release_buffer_slot(device, &mut self.slabs, s);
+                release_buffer_slot(device, &mut self.shared.slabs, s);
             }
         }
-        for s in self.gather_live.drain(..) {
-            release_buffer_slot(device, &mut self.slabs, s);
+        for s in self.encoder.gather_live.drain(..) {
+            release_buffer_slot(device, &mut self.shared.slabs, s);
         }
-        for list in self.readback_free.values_mut() {
+        for list in self.encoder.readback_free.values_mut() {
             for s in list.drain(..) {
-                release_buffer_slot(device, &mut self.slabs, s);
+                release_buffer_slot(device, &mut self.shared.slabs, s);
             }
         }
-        if let Some(s) = self.readback_live.take() {
-            release_buffer_slot(device, &mut self.slabs, s);
+        if let Some(s) = self.encoder.readback_live.take() {
+            release_buffer_slot(device, &mut self.shared.slabs, s);
         }
-        for s in self.readback_multi_live.drain(..) {
-            release_buffer_slot(device, &mut self.slabs, s);
+        for s in self.encoder.readback_multi_live.drain(..) {
+            release_buffer_slot(device, &mut self.shared.slabs, s);
         }
         // Leased slots are the one class here whose memory a live borrow may
         // still be reading, and freeing it unmaps that borrow's pointer — a
@@ -111,6 +114,7 @@ impl ResourcePools {
         // is reported rather than assumed away.
         let lease_deadline = std::time::Instant::now() + LEASE_QUIESCE;
         while self
+            .encoder
             .readback_lease_returns
             .outstanding
             .load(std::sync::atomic::Ordering::Acquire)
@@ -121,6 +125,7 @@ impl ResourcePools {
                     "vk_pools_destroy",
                     &ReadbackLeaseQuiesceExpired {
                         outstanding: self
+                            .encoder
                             .readback_lease_returns
                             .outstanding
                             .load(std::sync::atomic::Ordering::Acquire),
@@ -133,72 +138,72 @@ impl ResourcePools {
             std::thread::yield_now();
         }
         self.reclaim_returned_readback_leases();
-        for l in self.readback_leased.drain(..) {
-            release_buffer_slot(device, &mut self.slabs, l.slot);
+        for l in self.encoder.readback_leased.drain(..) {
+            release_buffer_slot(device, &mut self.shared.slabs, l.slot);
         }
         // Ad-hoc framebuffers name views owned by the targets and residents
         // destroyed below, and a framebuffer may not outlive its attachments —
         // so they go first, before anything drains a view out from under one.
-        for (_, fb) in self.ad_hoc_framebuffers.drain() {
+        for (_, fb) in self.shared.ad_hoc_framebuffers.drain() {
             device.destroy_framebuffer(fb, None);
         }
         // Sampled / target / registry images are slab-backed: destroy the image
         // + view handles here, but their memory belongs to shared blocks freed
-        // once by `self.slab.destroy_all(device)` at the end — never a per-image
+        // once by `self.shared.slab.destroy_all(device)` at the end — never a per-image
         // `vkFreeMemory` (that would double-free a block many images share).
-        for s in self.sampled_free.drain() {
+        for s in self.shared.sampled_free.drain() {
             device.destroy_image_view(s.view, None);
             device.destroy_image(s.image, None);
         }
-        for s in self.attachment_snapshot_free.drain() {
+        for s in self.shared.attachment_snapshot_free.drain() {
             device.destroy_image_view(s.view, None);
             device.destroy_image(s.image, None);
         }
-        for img in self.target_free.drain() {
+        for img in self.shared.target_free.drain() {
             device.destroy_image_view(img.view, None);
             device.destroy_image(img.image, None);
         }
-        for s in self.sampled_live.drain(..) {
+        for s in self.shared.sampled_live.drain(..) {
             device.destroy_image_view(s.view, None);
             device.destroy_image(s.image, None);
         }
-        for s in self.attachment_snapshot_live.drain(..) {
+        for s in self.shared.attachment_snapshot_live.drain(..) {
             device.destroy_image_view(s.view, None);
             device.destroy_image(s.image, None);
         }
-        for s in self.sampled_cache.drain(..) {
+        for s in self.shared.sampled_cache.drain(..) {
             device.destroy_image_view(s.slot.view, None);
             device.destroy_image(s.slot.image, None);
         }
-        self.sampled_cache_bytes = 0;
-        for s in self.storage_image_free.drain() {
+        self.shared.sampled_cache_bytes = 0;
+        for s in self.shared.storage_image_free.drain() {
             device.destroy_image_view(s.view, None);
             device.destroy_image(s.image, None);
             device.free_memory(s.memory, None);
         }
-        for s in self.storage_image_live.drain(..) {
+        for s in self.shared.storage_image_live.drain(..) {
             device.destroy_image_view(s.view, None);
             device.destroy_image(s.image, None);
             device.free_memory(s.memory, None);
         }
-        for (_, resident) in self.compute_storage_registry.drain() {
+        for (_, resident) in self.shared.compute_storage_registry.drain() {
             device.destroy_image_view(resident.slot.view, None);
             device.destroy_image(resident.slot.image, None);
             device.free_memory(resident.slot.memory, None);
         }
-        self.compute_storage_order.clear();
-        for (_, t) in self.targets.drain() {
+        self.shared.compute_storage_order.clear();
+        for (_, t) in self.shared.targets.drain() {
             device.destroy_framebuffer(t.framebuffer, None);
             device.destroy_image_view(t.view, None);
             device.destroy_image(t.image, None);
         }
-        self.target_order.clear();
-        if let Some(t) = self.multisample_target.take() {
+        self.shared.target_order.clear();
+        if let Some(t) = self.shared.multisample_target.take() {
             device.destroy_framebuffer(t.framebuffer, None);
             device.destroy_image_view(t.view, None);
             device.destroy_image(t.image, None);
         }
-        for (_, t) in self.registry.drain() {
+        for (_, t) in self.shared.registry.drain() {
             device.destroy_framebuffer(t.framebuffer, None);
             for (_, view) in t.alternate_views {
                 device.destroy_image_view(view, None);
@@ -206,42 +211,42 @@ impl ResourcePools {
             device.destroy_image_view(t.view, None);
             device.destroy_image(t.image, None);
         }
-        self.guest_resident_authority.clear();
-        self.registry_order.clear();
+        self.shared.guest_resident_authority.clear();
+        self.shared.registry_order.clear();
         // Every fence above was waited, so nothing can still be reading or
         // writing an imported RAMBlock. Freeing the memory is what ends the
         // GPU's access to guest RAM, so it runs on every teardown path
         // including the ones that are otherwise giving up.
-        self.host_ram_imports.destroy_all(device);
+        self.shared.host_ram_imports.destroy_all(device);
         // Free every slab block now that all slab-backed images are destroyed.
-        self.slab.destroy_all(device);
+        self.shared.slab.destroy_all(device);
         // Same for the HOST_VISIBLE upload blocks: every staging buffer bound
         // into one was destroyed above, so nothing can still reference the
         // block mappings this drops.
-        self.slabs.destroy_all(device);
-        for slot in self.slots.drain(..) {
+        self.shared.slabs.destroy_all(device);
+        for slot in self.encoder.slots.drain(..) {
             device.destroy_fence(slot.fence, None);
         }
-        self.cur = 0;
+        self.encoder.cur = 0;
         // After the fences above, so nothing submitted can still name it, and
         // before the arena because its sets were allocated against this layout.
         // Freed before the arena that owns their blocks. Anything still here was
         // never submitted, or its fence has already retired above.
-        let mut owed = std::mem::take(&mut self.scatter_dsets);
+        let mut owed = std::mem::take(&mut self.encoder.scatter_dsets);
         // The recycle list holds only sets from entries whose fence retired,
         // which is the same "nothing can still name it" state this relies on.
-        owed.append(&mut self.scatter_dset_free);
-        self.desc_arena.free(device, &owed);
-        if let Some(scatter) = self.scatter.take() {
+        owed.append(&mut self.encoder.scatter_dset_free);
+        self.encoder.desc_arena.free(device, &owed);
+        if let Some(scatter) = self.shared.scatter.take() {
             scatter.destroy(device);
         }
-        self.scatter_refused = false;
-        self.desc_arena.destroy(device);
-        if self.cmd_pool != vk::CommandPool::null() {
-            device.destroy_command_pool(self.cmd_pool, None);
-            self.cmd_pool = vk::CommandPool::null();
+        self.shared.scatter_refused = false;
+        self.encoder.desc_arena.destroy(device);
+        if self.encoder.cmd_pool != vk::CommandPool::null() {
+            device.destroy_command_pool(self.encoder.cmd_pool, None);
+            self.encoder.cmd_pool = vk::CommandPool::null();
         }
-        self.initialized = false;
+        self.shared.initialized = false;
     }
 }
 
