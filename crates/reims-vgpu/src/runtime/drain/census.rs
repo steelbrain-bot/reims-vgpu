@@ -3060,6 +3060,13 @@ pub fn note_drain_tranche(
         for tranche in take_drain_tranche(crate::observe::elapsed_ms() as u64) {
             crate::observe::off(tranche);
         }
+        // The one genuine per-draw write on the resolve side, and therefore
+        // where a packet-parallel encoder's threads would meet.
+        if let Some(ledger) = reims_vgpu_core::content_tracking::host_write_census::take(
+            crate::observe::elapsed_ms() as u64,
+        ) {
+            crate::observe::off(ledger);
+        }
         // What canonical page-set construction costs on the draw path. Joined
         // by `t=` like the rest, so `builds` divides by this window's draws.
         if let Some(sets) =

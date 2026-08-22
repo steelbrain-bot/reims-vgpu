@@ -1112,14 +1112,32 @@ mod device_capability_snapshot_tests {
 /// matters more than it looks — a read that quietly mutates an LRU position
 /// would turn all 14.8 M of those into writers and take this property away.
 ///
-/// That is one registry and it is not the whole of `Device`. What has *not*
-/// been measured is the content-tracking side, where a draw records the guest
-/// pages it wrote, and which is a genuine per-draw write rather than a lookup.
-/// Whether those writes are naturally per-packet — a packet writing its own
-/// targets — or contend across packets is the next thing to establish, and it
-/// is what remains between here and sizing the fan-out honestly. `Device` is
-/// four fields and `DeviceState` sixteen, so the same separability question
-/// that `pools::EncoderPools` answered for this crate is tractable there.
+/// The other half of `Device` is the content-tracking ledger, where a draw
+/// records the guest pages it wrote. That one really is a *write* and not a
+/// lookup, so it was the remaining candidate for capping the fan-out. It has
+/// now been measured too — `reims_vgpu_core::content_tracking`'s
+/// `host_write_census`, same rail, same banding:
+///
+/// ```text
+/// notes  91 919   0.0396 a draw -- one mutation per 25 draws
+/// pages  355.5 a note, one contiguous range, max 2 160
+/// ```
+///
+/// **Once per target store, not once per draw**, about 1 900 times a second.
+/// A mutex around that holds for a few milliseconds a second, which is noise
+/// against a 21 us draw.
+///
+/// So both halves of the resolve side answer the same way: overwhelmingly
+/// reads, with the one real writer firing two orders of magnitude below the
+/// draw rate. Nothing measured so far caps a packet fan-out, and the ceiling
+/// this mutex sets is the one that governs.
+///
+/// What remains before building it is engineering rather than measurement:
+/// per-encoder instances of [`pools::EncoderPools`], `SharedPools` behind its
+/// own lock, submission kept in the guest's order at commit, and cross-ring
+/// object lifetime — `graveyard`'s `SlotMask` is per-ring today, and a shared
+/// image can be referenced by any ring, so disposal has to wait on all of them
+/// rather than on one.
 ///
 /// One thing already ruled out, and cheaply: the window thread is **not**
 /// losing frames to this mutex. Over 47 driven seconds, `window_wait_us` is

@@ -157,6 +157,87 @@ impl PageEpochs {
     }
 }
 
+/// What the host-write ledger costs, and how often it is mutated.
+///
+/// # The question this answers
+///
+/// [`HostWrites`] is the one piece of per-draw state on the resolve side that
+/// is a genuine **write** rather than a lookup: every device write into guest
+/// RAM bumps one global `epoch` and marks pages in one shared map. The
+/// registries around it are read thousands of times per write and shard
+/// trivially; this does not, so if a packet-parallel encoder is ever built,
+/// this is where the packets meet.
+///
+/// Whether that matters is a rate question and nothing measured it. A ledger
+/// mutated once a draw is a mutex held for a few hundred nanoseconds at 47 000
+/// draws a second, which is a few percent of one core and shards fine. One
+/// mutated dozens of times a draw over long page ranges is a different object
+/// and would cap the fan-out on its own.
+///
+/// Counts and pages, no timings — the same discipline as
+/// `reims_vgpu_memory::page_set_census`, and for the same reason: an
+/// `Instant::now()` pair on a path this hot costs a meaningful fraction of what
+/// it measures.
+///
+/// # What it said, and what that settles
+///
+/// Driven fullscreen Maps, rail=macos-13, x86/Vulkan, banded, one clean boot:
+///
+/// ```text
+/// notes    91 919      0.0396 a draw   -- one mutation per 25 draws
+/// pages    355.5 a note, max 2 160     -- a full 1920x1080 target
+/// ranges   1.00 a note
+/// unknown  0
+/// ```
+///
+/// **This is not a per-draw write.** It fires about 1 900 times a second, once
+/// per target store rather than once per draw, and each firing marks one
+/// contiguous page range. A mutex around that is a few milliseconds of held
+/// time a second — noise against a 21 us draw — so the ledger does not cap a
+/// packet-parallel encoder, which is what it was measured to find out.
+///
+/// `unknown` being zero is the healthy reading and worth keeping an eye on: a
+/// note with no page list poisons every later verdict to
+/// [`HostWriteVerdict::Unnamed`] until the epoch moves past it, so a non-zero
+/// count here is a correctness signal and not a performance one.
+pub mod host_write_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub(super) static NOTES: AtomicU64 = AtomicU64::new(0);
+    pub(super) static PAGES: AtomicU64 = AtomicU64::new(0);
+    pub(super) static RANGES: AtomicU64 = AtomicU64::new(0);
+    pub(super) static UNKNOWN: AtomicU64 = AtomicU64::new(0);
+    pub(super) static MAX_PAGES: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn note(pages: u64, ranges: u64) {
+        NOTES.fetch_add(1, Ordering::Relaxed);
+        PAGES.fetch_add(pages, Ordering::Relaxed);
+        RANGES.fetch_add(ranges, Ordering::Relaxed);
+        MAX_PAGES.fetch_max(pages, Ordering::Relaxed);
+    }
+
+    pub(super) fn note_unknown() {
+        NOTES.fetch_add(1, Ordering::Relaxed);
+        UNKNOWN.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One window's totals, taken and reset. `None` when the ledger was not
+    /// touched, which is itself the reading on an idle device.
+    pub fn take(t_ms: u64) -> Option<String> {
+        let notes = NOTES.swap(0, Ordering::Relaxed);
+        if notes == 0 {
+            return None;
+        }
+        let pages = PAGES.swap(0, Ordering::Relaxed);
+        let ranges = RANGES.swap(0, Ordering::Relaxed);
+        let unknown = UNKNOWN.swap(0, Ordering::Relaxed);
+        let max = MAX_PAGES.swap(0, Ordering::Relaxed);
+        Some(format!(
+            "host_write_ledger t={t_ms} notes={notes} pages={pages} ranges={ranges} unknown={unknown} max_pages={max}"
+        ))
+    }
+}
+
 /// Exact page generations for writes the device makes into guest RAM.
 #[derive(Debug)]
 pub struct HostWrites {
@@ -188,10 +269,14 @@ impl HostWrites {
         self.epoch = self.epoch.wrapping_add(1);
         match pages {
             Some(pages) => {
+                host_write_census::note(pages.len() as u64, 1);
                 self.pages
                     .note_pages(pages.iter().copied(), self.epoch, self.page_shift)
             }
-            None => self.pages.unnamed_at = self.epoch,
+            None => {
+                host_write_census::note_unknown();
+                self.pages.unnamed_at = self.epoch
+            }
         }
     }
 
@@ -204,7 +289,13 @@ impl HostWrites {
         I: IntoIterator<Item = u64>,
     {
         self.epoch = self.epoch.wrapping_add(1);
-        self.pages.note_pages(pages, self.epoch, self.page_shift);
+        let mut counted = 0u64;
+        self.pages.note_pages(
+            pages.into_iter().inspect(|_| counted += 1),
+            self.epoch,
+            self.page_shift,
+        );
+        host_write_census::note(counted, 1);
     }
 
     /// Record page-number runs under this ledger's declared geometry.
@@ -213,13 +304,19 @@ impl HostWrites {
         I: IntoIterator<Item = (u64, usize)>,
     {
         self.epoch = self.epoch.wrapping_add(1);
+        let mut pages = 0u64;
+        let mut spans = 0u64;
         for (first_page, count) in ranges {
+            pages += count as u64;
+            spans += 1;
             self.pages.note_page_range(first_page, count, self.epoch);
         }
+        host_write_census::note(pages, spans);
     }
 
     pub fn note_unknown(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
+        host_write_census::note_unknown();
         self.pages.unnamed_at = self.epoch;
     }
 
@@ -914,5 +1011,49 @@ mod tests {
         pending.retire_gva_resource(retired);
         assert!(pending.get_gva(retired).is_none());
         assert_eq!(pending.get_gva(replacement).unwrap().generation, 8);
+    }
+}
+
+#[cfg(test)]
+mod host_write_census_tests {
+    use super::*;
+
+    /// The ledger census counts one note per mutation and the pages each
+    /// covers, and a take resets it.
+    ///
+    /// The note *count* is the whole reading — it is what says this path is
+    /// entered once per target store rather than once per draw, which is the
+    /// difference between a ledger that caps a parallel encoder and one that
+    /// does not. A miscount by the factor between those two would not look
+    /// wrong in the log.
+    #[test]
+    fn the_ledger_census_counts_one_note_per_mutation_and_its_pages() {
+        let _ = host_write_census::take(0);
+
+        let mut writes = HostWrites::new(12);
+        writes.note_page_ranges([(0x10u64, 3usize), (0x40, 5)]);
+        writes.note_page_iter([0x80u64, 0x81]);
+        writes.note_unknown();
+
+        let line = host_write_census::take(4).expect("three mutations must report");
+        assert!(line.contains("t=4"), "{line}");
+        assert!(line.contains("notes=3"), "{line}");
+        // 3 + 5 from the ranges, 2 from the iterator; the unknown names no
+        // pages at all and must not inflate the page count.
+        assert!(line.contains("pages=10"), "{line}");
+        assert!(
+            line.contains("ranges=3"),
+            "two spans plus the iterator: {line}"
+        );
+        assert!(line.contains("unknown=1"), "{line}");
+        assert!(
+            line.contains("max_pages=8"),
+            "the widest single note: {line}"
+        );
+
+        assert!(
+            host_write_census::take(5).is_none(),
+            "the take must have reset every counter"
+        );
     }
 }
