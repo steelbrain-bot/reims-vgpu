@@ -962,7 +962,7 @@ impl ResourcePools {
     /// This is the population the allocation-failure retry cannot give back, so
     /// its peak against `registry_non_pinned_peak` is what says whether the
     /// retry still has anything to work with. See
-    /// [`ResourcePools::registry_sole_copy`].
+    /// [`super::SharedPools::registry_sole_copy`].
     pub(crate) fn registry_sole_copy_stats(&self) -> (u64, u64) {
         (
             self.shared.registry_sole_copy_peak.count as u64,
@@ -2234,7 +2234,7 @@ impl ResourcePools {
     }
 
     /// Record that the bind just published is backed by a **recycled slot whose
-    /// gather has not been recorded yet** — see [`super::ResourcePools::cb_gather_owed`].
+    /// gather has not been recorded yet** — see [`super::EncoderPools::cb_gather_owed`].
     ///
     /// Called from the one arm of `stage_buffer_content` that hands back a slot
     /// it has not filled. Everything published without this call is answerable

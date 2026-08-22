@@ -2876,7 +2876,7 @@ impl ResourcePools {
     /// O(1). This and [`Self::non_pinned_registry_bytes`] each walked the whole
     /// registry, on every admit — affordable only while something held the
     /// population near a few hundred, which nothing does now that the slot count
-    /// is gone. [`Self::registry_non_pinned`] is maintained instead at the sites
+    /// is gone. [`SharedPools::registry_non_pinned`] is maintained instead at the sites
     /// that can change either total, and
     /// `non_pinned_registry_totals_by_walk` is the walk kept as the thing to
     /// check it against (test-only, so not linkable from here).

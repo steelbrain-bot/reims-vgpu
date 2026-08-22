@@ -1073,6 +1073,40 @@ mod device_capability_snapshot_tests {
 /// rather than theoretical. 52 605 packets over 2 405 367 banded draws is 45.7
 /// draws a packet, which agrees with the 52.5 measured independently above.
 ///
+/// # This ceiling is about this mutex, and this mutex is a third of a draw
+///
+/// Read the 2.72x and the 6x for what they are: statements about the fraction
+/// of a draw that is serialised **here**. They are not statements that the
+/// rest of a draw is already parallel, and taking them that way would size the
+/// work wrongly.
+///
+/// On the same rail and the same build as the numbers above, `engine_lock`
+/// says the worker holds this mutex **7.51 us** a draw against a `proc_us` of
+/// **21.40** — so roughly **14 us a draw is spent outside this crate
+/// altogether**, on the composition crate's side, resolving the draw against
+/// `Device` and `DeviceState`. That side is single-threaded today for a reason
+/// that has nothing to do with this mutex: every path through it takes
+/// `&mut Device`.
+///
+/// A packet fan-out has to carry that 14 us too, because
+/// `reims_vgpu_core::render`'s `thread_seam` doc rules out cutting between
+/// resolve and record — the two share the resident registry and a cut there
+/// was measured 3.2x slower. So the unit that moves to another thread is a
+/// whole packet, resolve included, and the achievable ceiling is set by
+/// whatever fraction of *both* halves must stay under a shared lock.
+///
+/// That runtime-side fraction has not been measured. It is the next thing to
+/// measure and it gates the whole design: if most of those 14 us touch state
+/// shared across packets, the 6x this mutex could allow is not reachable
+/// whatever is done here. `Device` is four fields and `DeviceState` sixteen,
+/// so the same separability question that `pools::EncoderPools` answered for
+/// this crate is a tractable one to ask there.
+///
+/// One thing already ruled out, and cheaply: the window thread is **not**
+/// losing frames to this mutex. Over 47 driven seconds, `window_wait_us` is
+/// 3 043 us in total and 15 of 1 334 window acquisitions blocked at all. A
+/// worker holding the lock for a whole tranche is not delaying present.
+///
 /// One design is already excluded by measurement and must not be retried: a
 /// two-stage pipeline that keeps one recorder thread and lets the resolver run
 /// ahead. It was built, and it is 3.2x **slower**, because the resolver must

@@ -406,12 +406,12 @@ pub(crate) struct EncoderPools {
     /// same-target draws (submit pending). While `Some`, that CB references
     /// live GPU objects exactly like an in-flight CB, so dispose/graveyard
     /// treat it as in flight; every path that claims a slot or quiesces the
-    /// ring flushes it first ([`Self::batch_flush`]).
+    /// ring flushes it first ([`ResourcePools::batch_flush`]).
     open_batch: Option<OpenBatch>,
     /// How many draws one command buffer may carry: the topology policy from
     /// [`batch_default_draws`] unless [`reims_vgpu_config::BATCH_DRAWS`] narrowed it.
     ///
-    /// A field rather than a read inside [`Self::batch_fit`], because that
+    /// A field rather than a read inside [`ResourcePools::batch_fit`], because that
     /// function's doc promises it is pure and testable without a device and a
     /// process-global environment read is neither.
     batch_max_draws: u64,
@@ -1295,7 +1295,7 @@ impl ResourcePools {
 pub(crate) struct PendingGpuCleanup {
     dsets: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
     /// The guest-scatter sets, kept apart from `dsets` because they recycle
-    /// rather than free — see [`ResourcePools::scatter_dset_free`].
+    /// rather than free — see [`EncoderPools::scatter_dset_free`].
     scatter_dsets: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
     staging: Vec<BufferSlot>,
     gather: Vec<BufferSlot>,
@@ -2538,7 +2538,7 @@ pub const IDLE_MAINTENANCE_START_MS: u64 = 2000;
 /// runs far more often; throttling avoids repeated free-pool work under the
 /// engine lock.
 const MAINTENANCE_INTERVAL_MS: u64 = 100;
-/// Reclaimed identities remembered for [`ResourcePools::reclaimed_recent`].
+/// Reclaimed identities remembered for [`SharedPools::reclaimed_recent`].
 ///
 /// Sized to comfortably span one burst's reclamations so the answer is still
 /// there when the next draw samples one of them, without becoming a second
@@ -3252,7 +3252,7 @@ impl CbBind {
     /// `DrawRequest` and therefore the allocations for the whole comparison, so
     /// it needs no reference of its own and should not pay for one.
     ///
-    /// This reaches no map. The invariant on [`ResourcePools::cb_bound_buffers`]
+    /// This reaches no map. The invariant on [`EncoderPools::cb_bound_buffers`]
     /// is that a raw key never reaches *that* map's API, and it is enforced by
     /// [`ResourcePools::note_cb_bound_buffer`] taking a [`CbBind`] by value —
     /// which this cannot produce.
