@@ -66,3 +66,7 @@ Vulkan-Headers/
 # what a stray instrumented `cargo test` drops in the tree).
 *.profraw
 *.profdata
+
+# Built on a native Apple host by scripts/metal-conformance; regenerate, do not commit.
+scripts/metal-conformance/conformance-x86_64
+scripts/metal-conformance/conf-native
