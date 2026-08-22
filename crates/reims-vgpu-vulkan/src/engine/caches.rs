@@ -2641,6 +2641,7 @@ mod object_cache_tests {
             max_descriptors: 32,
         };
         let layout = |counts: &[u32]| LayoutKey {
+            kernel_grid: None,
             bindings: counts
                 .iter()
                 .enumerate()

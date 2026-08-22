@@ -685,7 +685,8 @@ mod tests {
         assert!(!draw.color_input);
 
         let compute = ComputeRequest::default();
-        assert_eq!(compute.grid, [0, 0, 0]);
+        assert_eq!(compute.dispatch.counts, [0, 0, 0]);
+        assert_eq!(compute.dispatch.threads_per_grid, [0, 0, 0]);
         assert!(compute.storage_buffers.is_empty());
         assert!(compute.storage_images.is_empty());
     }

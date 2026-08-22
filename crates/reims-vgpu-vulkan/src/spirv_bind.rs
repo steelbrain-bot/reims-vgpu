@@ -2620,6 +2620,7 @@ mod more_tests {
             reflection_version: REFLECTION_VERSION,
             stage,
             entry_point: None,
+            kernel_dispatch: None,
             bindings: vec![],
             argument_buffer_fields: vec![],
             vertex_attributes: vec![],

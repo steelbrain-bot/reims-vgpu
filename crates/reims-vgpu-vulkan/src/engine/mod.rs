@@ -1626,7 +1626,95 @@ struct GuestWriteFootprint {
     armed: std::collections::BTreeMap<GuestWriteToken, reims_vgpu_memory::GuestWritePages>,
     /// Exact membership of every page named by `armed`, with a reference count
     /// because independent in-flight writes may target the same page.
+    ///
+    /// The authority on membership, and the arming side's only structure. The
+    /// asking side reads [`Self::runs`] instead — see there for why.
     page_counts: std::collections::HashMap<u64, usize>,
+    /// `page_counts`' keys as sorted, coalesced, inclusive page runs.
+    ///
+    /// **The same membership question, asked in a shape the answer can be found
+    /// in.** A visibility ask compares a draw's read set against this ledger,
+    /// and both sides are canonical `GuestPageSet`s, which are sorted and
+    /// deduped by construction. Asking `page_counts` instead spends one random
+    /// hash probe per read page — a driven fullscreen Maps boot names ~513
+    /// pages per draw, so that is ~513 probes into a map far larger than any
+    /// cache, and it measured 4.54 us/draw: 30 % of the whole engine phase and
+    /// the largest single cost in the device, for an answer that was
+    /// `Disjoint` on all but 265 of 1 374 851 draws.
+    ///
+    /// Runs answer it without scattering. A written region is physically
+    /// contiguous far more often than not, so the ledger collapses to a handful
+    /// of entries: a page outside their overall span is retired by two
+    /// comparisons, and one inside it costs a binary search over a vector small
+    /// enough to stay in cache.
+    ///
+    /// Coalescing is exact: two page numbers merge only when they are adjacent,
+    /// so every page in a run is a page in `page_counts` and the merge answers
+    /// precisely what the probes answered.
+    ///
+    /// Rebuilt from `page_counts` when it next matters rather than on every
+    /// edit, because arming and retiring happen per submission while asking
+    /// happens per draw.
+    runs: Vec<(u64, u64)>,
+    /// Whether `runs` still describes `page_counts`.
+    runs_stale: bool,
+}
+
+impl GuestWriteFootprint {
+    /// The armed pages as sorted, coalesced, inclusive runs.
+    fn runs(&mut self) -> &[(u64, u64)] {
+        if self.runs_stale {
+            self.runs.clear();
+            let mut pages: Vec<u64> = self.page_counts.keys().copied().collect();
+            pages.sort_unstable();
+            for page in pages {
+                match self.runs.last_mut() {
+                    Some((_, end)) if *end + 1 == page => *end = page,
+                    _ => self.runs.push((page, page)),
+                }
+            }
+            self.runs_stale = false;
+        }
+        &self.runs
+    }
+}
+
+/// Whether a read set names any page in `runs`.
+///
+/// **Order-independent on the read side, deliberately.** The draw path asks with
+/// canonical `GuestPageSet`s, which are sorted, and a forward merge would be
+/// cheaper still for them — but the host-read settle path asks with guest page
+/// numbers in allocation order, and this function is the only thing standing
+/// between the two. A merge that quietly required sorted input would answer
+/// wrongly for that caller and would do it silently, on the path whose whole
+/// job is to decide that a read may skip a wait.
+///
+/// So each page is tested independently. The span check is what makes that
+/// cheap: `runs` is ascending and disjoint, so a page below the first run or
+/// above the last cannot be in any of them, and two comparisons retire it. Only
+/// a page inside the ledger's overall span pays the binary search, over a run
+/// vector small enough to stay in cache.
+fn read_set_meets_runs(runs: &[(u64, u64)], pages: &[u64]) -> bool {
+    let (Some(&(lo, _)), Some(&(_, hi))) = (runs.first(), runs.last()) else {
+        return false;
+    };
+    pages
+        .iter()
+        .any(|&page| page >= lo && page <= hi && run_holds(runs, page))
+}
+
+/// Whether one of `runs` covers `page`. `runs` is ascending and disjoint.
+fn run_holds(runs: &[(u64, u64)], page: u64) -> bool {
+    runs.binary_search_by(|&(start, end)| {
+        if end < page {
+            std::cmp::Ordering::Less
+        } else if start > page {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    })
+    .is_ok()
 }
 
 pub use reims_vgpu_core::GuestWriteReach;
@@ -1655,6 +1743,7 @@ fn arm_guest_write_pages(pages: reims_vgpu_memory::GuestWritePages) -> Option<Gu
     for &page in pages.pages() {
         *f.page_counts.entry(page).or_default() += 1;
     }
+    f.runs_stale = true;
     f.armed.insert(token, pages);
     signals.guest_write_debt.store(true, Ordering::Release);
     Some(token)
@@ -1689,6 +1778,7 @@ fn retire_guest_write_pages(tokens: &[GuestWriteToken]) {
                 });
                 if remove {
                     f.page_counts.remove(&page);
+                    f.runs_stale = true;
                 }
             }
         }
@@ -1709,6 +1799,8 @@ fn clear_guest_write_pages_for(signals: &SessionSignals) {
     if let Ok(mut f) = signals.guest_write_pages.lock() {
         f.armed.clear();
         f.page_counts.clear();
+        f.runs.clear();
+        f.runs_stale = false;
         f.unnamed = false;
     };
     signals.guest_write_debt.store(false, Ordering::Release);
@@ -1735,7 +1827,7 @@ pub fn guest_writes_reaching_sets<'a>(
     sets: impl IntoIterator<Item = &'a [u64]>,
 ) -> GuestWriteReach {
     let signals = current_session_signals();
-    let Ok(f) = signals.guest_write_pages.lock() else {
+    let Ok(mut f) = signals.guest_write_pages.lock() else {
         return GuestWriteReach::Unnamed;
     };
     if f.armed.is_empty() {
@@ -1747,10 +1839,10 @@ pub fn guest_writes_reaching_sets<'a>(
     if f.unnamed {
         return GuestWriteReach::Unnamed;
     }
+    let runs = f.runs();
     if sets
         .into_iter()
-        .flatten()
-        .any(|page| f.page_counts.contains_key(page))
+        .any(|pages| read_set_meets_runs(runs, pages))
     {
         GuestWriteReach::Overlap
     } else {
@@ -5622,6 +5714,99 @@ mod guest_write_footprint_tests {
         );
         retire_guest_write_pages(&tokens);
         assert!(!guest_writes_outstanding());
+        clear_guest_write_pages();
+    }
+
+    /// The runs form and exact page membership are the same question, so they
+    /// must not be able to give different answers.
+    ///
+    /// Every page of a spread-out ledger is asked for, one at a time, along with
+    /// every page between the armed ones and the two just outside the whole
+    /// span. A run that over-reached by one page would answer `Overlap` for a
+    /// page nothing wrote, which is a wait the guest pays for nothing; a run
+    /// that under-reached would answer `Disjoint` for a page a submitted write
+    /// is still landing on, which is the unordered-read defect the settle path
+    /// exists to prevent. Only one of those is loud, so both are checked here.
+    #[test]
+    fn the_runs_form_answers_exactly_what_page_membership_answers() {
+        clear_guest_write_pages();
+        // Adjacent pages that must coalesce, a lone page, and a second cluster,
+        // so the ledger is neither one run nor all singletons.
+        let armed = [0x1000, 0x2000, 0x3000, 0x9000, 0xf000, 0x1_0000];
+        let token = arm(&armed);
+        let armed_pages: std::collections::HashSet<u64> = armed.iter().copied().collect();
+        for page in (0u64..0x12).map(|i| i * 0x1000) {
+            let want = if armed_pages.contains(&page) {
+                GuestWriteReach::Overlap
+            } else {
+                GuestWriteReach::Disjoint
+            };
+            assert_eq!(
+                guest_writes_reaching(&[page]),
+                want,
+                "page {page:#x} against ledger {armed:#x?}"
+            );
+        }
+        retire_guest_write_pages(&[token]);
+        clear_guest_write_pages();
+    }
+
+    /// The read side is not required to be sorted, and the settle path is why.
+    ///
+    /// A draw asks with a canonical `GuestPageSet`, which is sorted by
+    /// construction, and a merge over two sorted sequences would be cheaper than
+    /// what runs; the host-read settle path asks with guest page numbers in
+    /// allocation order. A ledger that assumed sortedness would answer
+    /// `Disjoint` for a set whose overlapping page happened to arrive after a
+    /// larger one — silently, on the path whose whole job is deciding that a
+    /// read may skip a wait.
+    #[test]
+    fn an_unsorted_read_set_finds_the_page_it_overlaps() {
+        clear_guest_write_pages();
+        let token = arm(&[0x8000]);
+        assert_eq!(
+            guest_writes_reaching(&[0x9000, 0x8000]),
+            GuestWriteReach::Overlap,
+            "the overlapping page arrived after a higher one"
+        );
+        assert_eq!(
+            guest_writes_reaching(&[0x9000, 0x7000, 0x8000, 0x1000]),
+            GuestWriteReach::Overlap
+        );
+        assert_eq!(
+            guest_writes_reaching(&[0x9000, 0x7000, 0x1000]),
+            GuestWriteReach::Disjoint,
+            "an unsorted set that misses is still a miss"
+        );
+        retire_guest_write_pages(&[token]);
+        clear_guest_write_pages();
+    }
+
+    /// Retiring one write must shrink the runs, not just the counts.
+    ///
+    /// The runs are rebuilt from `page_counts` when they are next asked for, so
+    /// a retirement that forgot to mark them stale would keep answering
+    /// `Overlap` for pages nothing is writing any more — a wait per draw, for
+    /// the rest of the boot, with every counter reading healthy.
+    #[test]
+    fn retiring_a_write_shrinks_the_runs_it_named() {
+        clear_guest_write_pages();
+        let first = arm(&[0x4000, 0x5000, 0x6000]);
+        let second = arm(&[0x6000]);
+        assert_eq!(guest_writes_reaching(&[0x5000]), GuestWriteReach::Overlap);
+
+        retire_guest_write_pages(&[first]);
+        assert_eq!(
+            guest_writes_reaching(&[0x5000]),
+            GuestWriteReach::Disjoint,
+            "the run was rebuilt after the retirement"
+        );
+        assert_eq!(
+            guest_writes_reaching(&[0x6000]),
+            GuestWriteReach::Overlap,
+            "the page the second write still names"
+        );
+        retire_guest_write_pages(&[second]);
         clear_guest_write_pages();
     }
 
