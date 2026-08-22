@@ -599,9 +599,13 @@ Two matter for verification rather than for ablation:
   storage bumps neither, because the validity transition is a synchronization statement consumed at
   submission construction and not a version emitted per write. `runtime/gather_witness.rs` says so in
   its own first paragraph, and a macos-13 sweep measured the consequence — 876 `gw_audit_unsound`
-  against 254 600 `gw_audit_ok` in one boot, costing Maps its CPU-rasterized type and POI icons while
-  GPU-drawn geometry rendered correctly. Read that module doc before treating a vouch as evidence
-  about content.
+  against 254 600 `gw_audit_ok` in one boot. Read that module doc before treating a vouch as evidence
+  about content. **The unsoundness is real; the symptom this file used to attribute to it is not
+  its.** Maps losing its CPU-rasterized type and POI icons while GPU-drawn geometry renders
+  correctly was named here as the consequence, and that attribution is refuted: a gate-verified
+  boot with `REIMS_VGPU_GATHER_VOUCH=off` re-gathered **every** bind (`gw_vouched` 0 against
+  `gw_withheld` 1 618 985) and the type layer was still entirely absent. Do not spend boots on the
+  witness for that defect; `kb/` carries where it actually points.
   That cache is the only place in this device where an
   image is bound with nothing read and nothing compared, and a stale bind's failure mode is content,
   which no counter reports — the audit is the sole instrument, and it is off unless you turn it on.
