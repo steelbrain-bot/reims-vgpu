@@ -1032,6 +1032,39 @@ struct CmdSlot {
 /// [`crate::gpu_hang_trail::SUBMIT_SLOTS`], and the latter is 16. Going deeper
 /// is a change to the hang trail first, and would want its own measurement —
 /// this arm says the bubble is real, not that it is exhausted.
+/// # Depth 32 was measured and does not convert. Do not try it again.
+///
+/// The measurement the paragraph above asked for, run 2026-08-22:
+/// `SUBMIT_SLOTS` raised to 32 alongside, both `const _` assertions still
+/// holding because [`SlotMask`] is a `u32` and 32 bits is exactly its width.
+/// Twelve interleaved boots, driven fullscreen Maps on macos-13, banded to the
+/// driven windows; one depth-32 boot excluded on its own measurement rather
+/// than on its result -- 799 531 draws against 2.16-2.32 M everywhere else and
+/// 42.7 GPU us/draw against 9.2-10.6, so it did not do the same work.
+///
+/// ```text
+///                       depth 16 (n=6)         depth 32 (n=5)
+/// slot_us per draw      1.253 - 1.585          0.708 - 0.751     -48.4 % DISJOINT
+/// proc_us per draw     21.27  - 23.36         21.58  - 23.19      -0.3 % overlapping
+/// draws/driven-sec     43 128 - 46 867        42 968 - 46 004     -0.2 % overlapping
+/// ```
+///
+/// **The bubble halves and buys nothing.** Removing 0.69 us/draw of pure
+/// waiting from a worker at duty 0.92-0.95 returned zero draws, which is the
+/// result that matters: a phase number prices the work that was skipped, and
+/// only the drain total decides whether a change is a win.
+///
+/// Where the time goes is visible, and it is exactly the trade the depth-8 note
+/// above predicted -- burst headroom against cleanup latency. Averaged over the
+/// arms, `draw_us` falls 0.428 us/draw and `busy_us` 0.215 while `proc_us`
+/// falls 0.035, so the gap between `proc_us` and `busy_us` *grows* by 0.18. The
+/// encode really does get cheaper and the saving reappears in retire and
+/// cleanup outside the drain span. No other `draw_phase` bar moved
+/// (`rec_draw` +0.05, `rb_visibility` -0.08).
+///
+/// So the ring bubble at depth 16 is **not on the critical path** and
+/// deepening it further is not a lever on this rail: the remaining `slot_us`
+/// is overlapped, not blocking.
 pub(crate) const RING_DEPTH: usize = 16;
 
 /// One bit per ring slot: the set of slots a deferred handle is still waiting
