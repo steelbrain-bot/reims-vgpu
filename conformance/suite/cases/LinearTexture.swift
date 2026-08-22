@@ -10,11 +10,10 @@ let formats: [Fmt] = [
     Fmt(name: "bgra8Unorm", mtl: .bgra8Unorm, bpp: 4) { b in pack(b[2], b[1], b[0], b[3]) },
 ]
 
-func linearAliasCase(_ f: Fmt, _ w: Int, _ h: Int, padTo: Int?, sampler: Bool) {
+func linearAliasCase(_ f: Fmt, _ w: Int, _ h: Int, pitch: Pitch, sampler: Bool) {
     let align = dev.minimumLinearTextureAlignment(for: f.mtl)
-    let tight = alignUp(w * f.bpp, align)
-    let bpr = padTo ?? tight
-    let label = "linear_\(f.name)_\(w)x\(h)_pitch\(bpr)\(sampler ? "_sampled" : "")"
+    let bpr = pitch.bytes(width: w, bpp: f.bpp, align: align)
+    let label = "linear_\(f.name)_\(w)x\(h)_pitch_\(pitch.tag)\(sampler ? "_sampled" : "")"
     if bpr % align != 0 || bpr < w * f.bpp {
         skip(label, "pitch \(bpr) is not a multiple of this device's minimumLinearTextureAlignment=\(align)")
         return

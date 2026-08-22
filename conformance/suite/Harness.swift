@@ -67,6 +67,33 @@ func skip(_ name: String, _ why: String) {
     fflush(stdout)
 }
 
+/// The device rails a case claims to move, named by the counters this device
+/// reports them under.
+///
+/// A passing case that never reached the rail it was written for is the worst
+/// reading this battery produces, because it is indistinguishable from coverage.
+/// Three attempts at the regression case for the unordered host read passed on
+/// the *broken* build, each for that reason: a `.bgra8Unorm` pair at 512x512 is
+/// staged through a buffer by the guest driver, so the case exercised a rail
+/// that was never in question and reported green. It took a temporary probe
+/// inside the device to find out.
+///
+/// `verdict.py` reads these against the device's own fail log and says
+/// NOT-COVERED where a claimed counter never moved. The check is per *run* and
+/// not per case -- nothing carries a case name across into the device -- so it
+/// answers "did anything in this run reach that rail", which is the question
+/// that was being got wrong.
+///
+/// A case that claims nothing is unclaimed, not covered. Claiming a counter
+/// nobody verified moves would make this table read as coverage while measuring
+/// spelling, so claim one when it has been watched, and not before.
+func claims(_ name: String, _ counters: String...) {
+    for counter in counters {
+        print("ROUTE \(name) \(counter)")
+    }
+    fflush(stdout)
+}
+
 func report(_ name: String, _ ok: Bool, _ detail: String) {
     ran += 1
     if !ok { failures += 1 }

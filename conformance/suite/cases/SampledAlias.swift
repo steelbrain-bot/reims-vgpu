@@ -2,16 +2,26 @@ import Metal
 import Foundation
 import IOSurface
 
-func fragmentAliasCase(_ f: Fmt, _ w: Int, _ h: Int, padTo: Int?) {
+func fragmentAliasCase(_ f: Fmt, _ w: Int, _ h: Int, pitch: Pitch) {
     let align = dev.minimumLinearTextureAlignment(for: f.mtl)
-    let bpr = padTo ?? alignUp(w * f.bpp, align)
-    let label = "fragsample_\(f.name)_\(w)x\(h)_pitch\(bpr)"
+    let bpr = pitch.bytes(width: w, bpp: f.bpp, align: align)
+    let label = "fragsample_\(f.name)_\(w)x\(h)_pitch_\(pitch.tag)"
+    // This case reports under two names, so every exit from it has to report
+    // under both. A skip that names only `label` emits one line where a host
+    // that runs the case emits two, and the two runs then pair up on neither.
+    let arms = ["first_draw", "after_cpu_rewrite"]
+    func bailAll(skipping: Bool, _ why: String) {
+        for arm in arms {
+            if skipping { skip("\(label)_\(arm)", why) }
+            else { report("\(label)_\(arm)", false, why) }
+        }
+    }
     if bpr % align != 0 || bpr < w * f.bpp {
-        skip(label, "pitch \(bpr) is not a multiple of this device's minimumLinearTextureAlignment=\(align)")
+        bailAll(skipping: true, "pitch \(bpr) is not a multiple of this device's minimumLinearTextureAlignment=\(align)")
         return
     }
     guard let buf = dev.makeBuffer(length: bpr * h, options: .storageModeShared) else {
-        report(label, false, "buffer allocation failed"); return
+        bailAll(skipping: false, "buffer allocation failed"); return
     }
     let base = buf.contents().bindMemory(to: UInt8.self, capacity: bpr * h)
     for y in 0..<h { for x in 0..<bpr { base[y * bpr + x] = UInt8((x &* 5 &+ y &* 17 &+ 3) & 0xFF) } }
@@ -20,7 +30,7 @@ func fragmentAliasCase(_ f: Fmt, _ w: Int, _ h: Int, padTo: Int?) {
     d.width = w; d.height = h; d.mipmapLevelCount = 1
     d.storageMode = .shared; d.usage = [.shaderRead]
     guard let tex = buf.makeTexture(descriptor: d, offset: 0, bytesPerRow: bpr) else {
-        report(label, false, "makeTexture nil"); return
+        bailAll(skipping: false, "makeTexture nil"); return
     }
 
     func check(_ tag: String, _ expectByte: (Int, Int) -> [UInt8]) {
@@ -71,11 +81,11 @@ let texPipeline = makeRenderPipeline("tex_fs", .rgba8Unorm)
 // device returned a byte nothing in this buffer ever held.
 // ---------------------------------------------------------------------------
 
-func offsetOracleCase(_ w: Int, _ h: Int, padTo: Int?, viaFragment: Bool) {
+func offsetOracleCase(_ w: Int, _ h: Int, pitch: Pitch, viaFragment: Bool) {
     let f = formats[1]  // a8Unorm: one byte per texel, so a texel *is* an offset
     let align = dev.minimumLinearTextureAlignment(for: f.mtl)
-    let bpr = padTo ?? alignUp(w, align)
-    let label = "offset_oracle_\(w)x\(h)_pitch\(bpr)\(viaFragment ? "_fragment" : "_compute")"
+    let bpr = pitch.bytes(width: w, bpp: f.bpp, align: align)
+    let label = "offset_oracle_\(w)x\(h)_pitch_\(pitch.tag)\(viaFragment ? "_fragment" : "_compute")"
     if bpr % align != 0 || bpr < w {
         skip(label, "pitch \(bpr) is not a multiple of this device's minimumLinearTextureAlignment=\(align)")
         return

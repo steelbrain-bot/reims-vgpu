@@ -1,30 +1,30 @@
 CASE shader_compile PASS runtime library built
-CASE linear_r8Unorm_64x16_pitch64 PASS 1024 texels exact
-CASE linear_r8Unorm_64x16_pitch64_sampled PASS 1024 texels exact
-CASE linear_a8Unorm_64x16_pitch64 PASS 1024 texels exact
-CASE linear_a8Unorm_64x16_pitch64_sampled PASS 1024 texels exact
-CASE linear_rg8Unorm_64x16_pitch128 PASS 1024 texels exact
-CASE linear_rg8Unorm_64x16_pitch128_sampled PASS 1024 texels exact
-CASE linear_rgba8Unorm_64x16_pitch256 PASS 1024 texels exact
-CASE linear_rgba8Unorm_64x16_pitch256_sampled PASS 1024 texels exact
-CASE linear_bgra8Unorm_64x16_pitch256 PASS 1024 texels exact
-CASE linear_bgra8Unorm_64x16_pitch256_sampled PASS 1024 texels exact
-CASE linear_a8Unorm_54x16_pitch64 PASS 864 texels exact
-CASE linear_a8Unorm_54x16_pitch64_sampled PASS 864 texels exact
-CASE linear_a8Unorm_218x16_pitch256 PASS 3488 texels exact
-CASE linear_a8Unorm_85x85_pitch128 PASS 7225 texels exact
-CASE linear_r8Unorm_128x16_pitch128 PASS 2048 texels exact
-CASE linear_bgra8Unorm_60x8_pitch256 PASS 480 texels exact
-CASE linear_r8Unorm_54x16_pitch80 PASS 864 texels exact
-CASE linear_r8Unorm_54x16_pitch96 PASS 864 texels exact
-CASE linear_a8Unorm_54x16_pitch80 PASS 864 texels exact
-CASE linear_a8Unorm_54x16_pitch96 PASS 864 texels exact
-CASE linear_rg8Unorm_54x16_pitch128 PASS 864 texels exact
-CASE linear_rg8Unorm_54x16_pitch144 PASS 864 texels exact
-CASE linear_rgba8Unorm_54x16_pitch240 PASS 864 texels exact
-CASE linear_rgba8Unorm_54x16_pitch256 PASS 864 texels exact
-CASE linear_bgra8Unorm_54x16_pitch240 PASS 864 texels exact
-CASE linear_bgra8Unorm_54x16_pitch256 PASS 864 texels exact
+CASE linear_r8Unorm_64x16_pitch_tight PASS 1024 texels exact
+CASE linear_r8Unorm_64x16_pitch_tight_sampled PASS 1024 texels exact
+CASE linear_a8Unorm_64x16_pitch_tight PASS 1024 texels exact
+CASE linear_a8Unorm_64x16_pitch_tight_sampled PASS 1024 texels exact
+CASE linear_rg8Unorm_64x16_pitch_tight PASS 1024 texels exact
+CASE linear_rg8Unorm_64x16_pitch_tight_sampled PASS 1024 texels exact
+CASE linear_rgba8Unorm_64x16_pitch_tight PASS 1024 texels exact
+CASE linear_rgba8Unorm_64x16_pitch_tight_sampled PASS 1024 texels exact
+CASE linear_bgra8Unorm_64x16_pitch_tight PASS 1024 texels exact
+CASE linear_bgra8Unorm_64x16_pitch_tight_sampled PASS 1024 texels exact
+CASE linear_a8Unorm_54x16_pitch_64 PASS 864 texels exact
+CASE linear_a8Unorm_54x16_pitch_64_sampled PASS 864 texels exact
+CASE linear_a8Unorm_218x16_pitch_256 PASS 3488 texels exact
+CASE linear_a8Unorm_85x85_pitch_128 PASS 7225 texels exact
+CASE linear_r8Unorm_128x16_pitch_128 PASS 2048 texels exact
+CASE linear_bgra8Unorm_60x8_pitch_256 PASS 480 texels exact
+CASE linear_r8Unorm_54x16_pitch_tight_plus1 PASS 864 texels exact
+CASE linear_r8Unorm_54x16_pitch_tight_plus2 PASS 864 texels exact
+CASE linear_a8Unorm_54x16_pitch_tight_plus1 PASS 864 texels exact
+CASE linear_a8Unorm_54x16_pitch_tight_plus2 PASS 864 texels exact
+CASE linear_rg8Unorm_54x16_pitch_tight_plus1 PASS 864 texels exact
+CASE linear_rg8Unorm_54x16_pitch_tight_plus2 PASS 864 texels exact
+CASE linear_rgba8Unorm_54x16_pitch_tight_plus1 PASS 864 texels exact
+CASE linear_rgba8Unorm_54x16_pitch_tight_plus2 PASS 864 texels exact
+CASE linear_bgra8Unorm_54x16_pitch_tight_plus1 PASS 864 texels exact
+CASE linear_bgra8Unorm_54x16_pitch_tight_plus2 PASS 864 texels exact
 CASE incremental_r8Unorm_compute_first_read PASS region A present, region B still zero
 CASE incremental_r8Unorm_compute_append_visible PASS post-read append visible
 CASE incremental_r8Unorm_compute_untouched_stable PASS region A unchanged
@@ -73,20 +73,20 @@ CASE mip_blit_level_6_size1 PASS 1 texels are level 6's marker
 CASE vb_first_submission_left PASS geometry landed in the left half
 CASE vb_second_submission_right PASS geometry landed in the right half
 CASE vb_third_submission_left_again PASS geometry landed in the left half
-CASE fragsample_a8Unorm_54x16_pitch64_first_draw PASS 864 texels exact through the rasterizer
-CASE fragsample_a8Unorm_54x16_pitch64_after_cpu_rewrite PASS 864 texels exact through the rasterizer
-CASE fragsample_a8Unorm_218x16_pitch256_first_draw PASS 3488 texels exact through the rasterizer
-CASE fragsample_a8Unorm_218x16_pitch256_after_cpu_rewrite PASS 3488 texels exact through the rasterizer
-CASE fragsample_a8Unorm_85x85_pitch128_first_draw PASS 7225 texels exact through the rasterizer
-CASE fragsample_a8Unorm_85x85_pitch128_after_cpu_rewrite PASS 7225 texels exact through the rasterizer
-CASE fragsample_rgba8Unorm_64x16_pitch256_first_draw PASS 1024 texels exact through the rasterizer
-CASE fragsample_rgba8Unorm_64x16_pitch256_after_cpu_rewrite PASS 1024 texels exact through the rasterizer
-CASE fragsample_bgra8Unorm_60x8_pitch256_first_draw PASS 480 texels exact through the rasterizer
-CASE fragsample_bgra8Unorm_60x8_pitch256_after_cpu_rewrite PASS 480 texels exact through the rasterizer
-CASE fragsample_a8Unorm_54x16_pitch80_first_draw PASS 864 texels exact through the rasterizer
-CASE fragsample_a8Unorm_54x16_pitch80_after_cpu_rewrite PASS 864 texels exact through the rasterizer
-CASE fragsample_bgra8Unorm_54x16_pitch240_first_draw PASS 864 texels exact through the rasterizer
-CASE fragsample_bgra8Unorm_54x16_pitch240_after_cpu_rewrite PASS 864 texels exact through the rasterizer
+CASE fragsample_a8Unorm_54x16_pitch_64_first_draw PASS 864 texels exact through the rasterizer
+CASE fragsample_a8Unorm_54x16_pitch_64_after_cpu_rewrite PASS 864 texels exact through the rasterizer
+CASE fragsample_a8Unorm_218x16_pitch_256_first_draw PASS 3488 texels exact through the rasterizer
+CASE fragsample_a8Unorm_218x16_pitch_256_after_cpu_rewrite PASS 3488 texels exact through the rasterizer
+CASE fragsample_a8Unorm_85x85_pitch_128_first_draw PASS 7225 texels exact through the rasterizer
+CASE fragsample_a8Unorm_85x85_pitch_128_after_cpu_rewrite PASS 7225 texels exact through the rasterizer
+CASE fragsample_rgba8Unorm_64x16_pitch_tight_first_draw PASS 1024 texels exact through the rasterizer
+CASE fragsample_rgba8Unorm_64x16_pitch_tight_after_cpu_rewrite PASS 1024 texels exact through the rasterizer
+CASE fragsample_bgra8Unorm_60x8_pitch_256_first_draw PASS 480 texels exact through the rasterizer
+CASE fragsample_bgra8Unorm_60x8_pitch_256_after_cpu_rewrite PASS 480 texels exact through the rasterizer
+CASE fragsample_a8Unorm_54x16_pitch_tight_plus1_first_draw PASS 864 texels exact through the rasterizer
+CASE fragsample_a8Unorm_54x16_pitch_tight_plus1_after_cpu_rewrite PASS 864 texels exact through the rasterizer
+CASE fragsample_bgra8Unorm_54x16_pitch_tight_plus1_first_draw PASS 864 texels exact through the rasterizer
+CASE fragsample_bgra8Unorm_54x16_pitch_tight_plus1_after_cpu_rewrite PASS 864 texels exact through the rasterizer
 CASE incremental_r8Unorm_fragment_first_read PASS region A present, region B still zero
 CASE incremental_r8Unorm_fragment_append_visible PASS post-read append visible
 CASE incremental_r8Unorm_fragment_untouched_stable PASS region A unchanged
@@ -127,14 +127,14 @@ CASE replace_bgra8Unorm_fragment_first_read PASS the replaced strip is present a
 CASE replace_bgra8Unorm_fragment_append_visible PASS a strip replaced after a read is visible
 CASE replace_bgra8Unorm_fragment_untouched_stable PASS the glyphs already in the atlas are untouched
 CASE replace_bgra8Unorm_fragment_rewrite_visible PASS a strip rewritten in place is visible
-CASE offset_oracle_16x16_pitch16_compute PASS 256 texels at the offsets the contract names
-CASE offset_oracle_10x16_pitch16_compute PASS 160 texels at the offsets the contract names
-CASE offset_oracle_218x16_pitch224_compute PASS 3488 texels at the offsets the contract names
-CASE offset_oracle_54x16_pitch80_compute PASS 864 texels at the offsets the contract names
-CASE offset_oracle_16x16_pitch16_fragment PASS 256 texels at the offsets the contract names
-CASE offset_oracle_10x16_pitch16_fragment PASS 160 texels at the offsets the contract names
-CASE offset_oracle_218x16_pitch224_fragment PASS 3488 texels at the offsets the contract names
-CASE offset_oracle_54x16_pitch80_fragment PASS 864 texels at the offsets the contract names
+CASE offset_oracle_256x16_pitch_tight_compute PASS 4096 texels at the offsets the contract names
+CASE offset_oracle_250x16_pitch_tight_compute PASS 4000 texels at the offsets the contract names
+CASE offset_oracle_218x16_pitch_tight_compute PASS 3488 texels at the offsets the contract names
+CASE offset_oracle_54x16_pitch_tight_plus1_compute PASS 864 texels at the offsets the contract names
+CASE offset_oracle_256x16_pitch_tight_fragment PASS 4096 texels at the offsets the contract names
+CASE offset_oracle_250x16_pitch_tight_fragment PASS 4000 texels at the offsets the contract names
+CASE offset_oracle_218x16_pitch_tight_fragment PASS 3488 texels at the offsets the contract names
+CASE offset_oracle_54x16_pitch_tight_plus1_fragment PASS 864 texels at the offsets the contract names
 CASE rt_width_256 PASS 4096 texels are the drawn colour
 CASE rt_width_250 PASS 4000 texels are the drawn colour
 CASE rt_width_218 PASS 3488 texels are the drawn colour
@@ -210,8 +210,12 @@ CASE srt_cpu_write_then_sample_256x64 PASS a sampled bind saw the texels the CPU
 CASE iosrt_cpu_write_then_sample_256x64 PASS a sampled bind saw the texels the CPU wrote after the GPU rendered
 CASE srt_cpu_write_then_sample_1000x40 PASS a sampled bind saw the texels the CPU wrote after the GPU rendered
 CASE iosrt_cpu_write_then_sample_1000x40 PASS a sampled bind saw the texels the CPU wrote after the GPU rendered
+ROUTE srt_blit_after_render_1024x768 settle_gva_rect_read
 CASE srt_blit_after_render_1024x768 PASS the copy moved what the render ahead of it had written
+ROUTE srt_blit_after_render_1920x1080 settle_gva_rect_read
 CASE srt_blit_after_render_1920x1080 PASS the copy moved what the render ahead of it had written
+ROUTE srt_blit_pipelined_1024x768_x8 settle_gva_rect_read
+ROUTE srt_blit_pipelined_1024x768_x8 settle_gva_rect_read_overlap
 CASE srt_blit_pipelined_1024x768_x8 PASS every frame's copy moved that frame's own pixels
 CASE srt_blit_buffer_backed_512x512 PASS the copy out of a buffer-backed source moved what the render had written
 SUMMARY cases=216 failures=0 skipped=0

@@ -75,7 +75,26 @@ echo "conformance rc=$rc"
 cp /tmp/reims-vgpu-fail.log "$OUT/device.log" 2>/dev/null
 
 grep -q 'guest kernel panic' "$OUT/boot-stdout.log" && echo "PANIC" || echo "no panic"
-echo "--- results ---"
-cat "$OUT/conformance.txt"
+
+# Score it against the oracle rather than printing 216 lines for a reader to
+# diff by eye. The baseline is the native arm when no fresher one is given;
+# `NATIVE=<file>` points at a run from the same session, which is what to use
+# when the suite has cases the baseline predates.
+NATIVE="${NATIVE:-$HERE/baselines/native-apple-m4-macos15.txt}"
+
+# A narrowing switch can close the rail a case claims, so its claim not moving
+# is then the switch working rather than a case that missed its rail. Report it
+# without failing the run.
+ADVISORY=()
+env | grep -q '^REIMS_VGPU_' && ADVISORY=(--claims-advisory)
+
+echo "--- verdict ---"
+python3 "$HERE/verdict.py" --native "$NATIVE" --guest "$OUT/conformance.txt" \
+  --expect "$HERE/expectations/known-failures.txt" --device "$OUT/device.log" \
+  "${ADVISORY[@]}" --quiet | tee "$OUT/verdict.txt"
+vrc="${PIPESTATUS[0]}"
 pkill -f 'qemu-system-x86_6[4].*reims-vgpu' 2>/dev/null
+# The battery's own exit code says a case failed; the verdict's says one failed
+# that nobody had written down. The second is the one a sweep should gate on.
+[ "$vrc" -eq 0 ] || exit "$vrc"
 exit $rc

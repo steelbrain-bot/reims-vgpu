@@ -17,6 +17,22 @@ SUMMARY cases=N failures=N skipped=N
 
 ## Reading a result
 
+`verdict.py` applies the table below to a pair of runs and exits non-zero when
+something in it is unexplained. `run-guest.sh` calls it, so a sweep reads a
+verdict rather than diffing 216 lines by eye:
+
+```sh
+conformance/verdict.py --native baselines/native-apple-m4-macos15.txt \
+  --guest /tmp/conf-out/conformance.txt --expect expectations/known-failures.txt
+```
+
+It is stricter than the eye in two directions the eye is bad at. A case that
+**stopped being reported** reads as nothing at all in a summary line -- the
+totals simply shrink -- and it says `NOT-RUN`. And a case listed in
+`expectations/known-failures.txt` that now **passes** is a failure too: an
+expectations file nobody prunes stops being a list of defects and becomes a list
+of cases nobody looks at.
+
 The comparison between the two hosts is the whole instrument:
 
 | native | guest | meaning |
@@ -29,6 +45,41 @@ The comparison between the two hosts is the whole instrument:
 `baselines/` holds the native runs, one file per oracle host. Re-record whenever
 a case is added, and never treat a guest failure as a finding until the same case
 is green natively.
+
+## `expectations/known-failures.txt` is a list of defects, not a mute button
+
+One case name a line, `#` starts a comment, and the comment is where the defect
+goes — what the guest loses, and where it was diagnosed to. A name with no
+comment is a case somebody silenced.
+
+The file is checked in both directions. A listed case that starts passing fails
+the run as loudly as an unlisted one that starts failing, because an
+expectations file nobody prunes stops being a list of defects and becomes a list
+of cases nobody looks at.
+
+It is not a place to put a case that fails on the oracle too. That is
+`SUITE-BUG`, the expectation is wrong, and listing it hides a bug in the battery
+rather than one in the device.
+
+## A case name must mean the same thing on both hosts
+
+`minimumLinearTextureAlignment` is 16 on an M-series device and 256 on Apple's
+paravirtual one, so a pitch derived from it lands on a different integer per
+host. A case named after that integer -- `linear_a8Unorm_54x16_pitch80` on one
+host, `pitch512` on the other -- has no counterpart on the other side to be
+scored against, and the whole native/guest instrument is gone for it. Sixty-two
+of 216 cases were in that state, silently: they ran everywhere, tested the same
+thing everywhere, and could not be paired.
+
+So the label carries the **derivation** and the detail carries the number.
+`Pitch` is `.tight`, `.padded(rows:)` or `.exact()`, and it computes the byte
+count as well as naming it, which also took the alignment arithmetic out of the
+call sites where it was written by hand five times. A case whose *width* is
+derived gets the same treatment -- `offsetOracleCase(256, …)` and `(250, …)`
+mean "tight" and "six bytes of padding" on a device aligning to 16 and on one
+aligning to 256 alike, which `align` and `align - 6` did not.
+
+When adding a parameterized case, ask what its name would be on the other host.
 
 A `SKIP` is not a soft failure. `minimumLinearTextureAlignment` is 16 on an
 M-series device and 256 on Apple's paravirtual one, so a literal pitch from a
@@ -48,6 +99,7 @@ conformance/
     cases/*.swift     the case bodies, one file per rail or family
   baselines/          native runs, one per oracle host
   expectations/       failures the guest is known to have
+  verdict.py          scores a guest run against the native one
   run-native.sh       build and run on the oracle
   run-guest.sh        boot a rail and run the same source in the guest
   build/              binaries; gitignored
@@ -171,6 +223,27 @@ exists to fix, one level up — there the case vanished from the totals mid-run,
 here it never entered them. When adding a parameterized case, count the
 invocations against the parameter grid before trusting a green summary.
 
+
+## A case may claim the device rail it was written to move
+
+`claims(label, "settle_gva_rect_read_overlap")` in a case body prints a `ROUTE`
+line, and `verdict.py` reads those against the device's own fail log. A case
+that passes without its claimed counter ever moving is `NOT-COVERED`, which is
+the worst reading this battery produces: it is indistinguishable from coverage,
+and it is what three attempts at the case below did on the *broken* build.
+
+Two limits, both deliberate:
+
+- **The check is per run, not per case.** Nothing carries a case name across
+  into the device, so the question it answers is "did anything in this run reach
+  that rail". That is the question that was being got wrong.
+- **A claim nobody watched is worse than no claim.** Claiming a counter because
+  the name sounds right makes the table read as coverage while measuring
+  spelling. Watch the counter move, then claim it. An unclaimed case is
+  unclaimed, not covered.
+
+A narrowing `REIMS_VGPU_*` switch can legitimately close a claimed rail, so
+`run-guest.sh` passes `--claims-advisory` when any is set.
 
 ## A race is only a test if the broken arm loses it
 

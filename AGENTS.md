@@ -649,7 +649,11 @@ compares, so a failure names the case, the bytes wanted and the bytes returned.
 
 So a guest failure is not reportable until the same case is green natively, and a case added to the
 battery is not finished until it has been run on both. `conformance/run-native.sh` is the oracle arm
-and `conformance/run-guest.sh` boots a rail and runs the same source against this device.
+and `conformance/run-guest.sh` boots a rail and runs the same source against this device — the
+latter scores itself with `conformance/verdict.py` and exits non-zero on any guest failure that is
+not written down in `conformance/expectations/known-failures.txt`, **and on any listed failure that
+has started passing**. Prune that file when you fix something; a list nobody prunes is a list of
+cases nobody looks at.
 
 Reach for it before a boot when the question is *what the API does*: a contract question, a format,
 a stride, an ordering rule, a rail with one case on it. Reach for a driven boot when the question is

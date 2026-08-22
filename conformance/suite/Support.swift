@@ -33,6 +33,48 @@ let fetchLevelPipe = pipeline("fetch_level")
 
 func alignUp(_ v: Int, _ a: Int) -> Int { (v + a - 1) / a * a }
 
+/// How a linear case arrived at its bytes-per-row.
+///
+/// **The name has to be the derivation and not the number it came to.**
+/// `minimumLinearTextureAlignment` is 16 on an M-series device and 256 on
+/// Apple's paravirtual one, so a pitch derived from it lands on a different
+/// integer per host -- and a case named after that integer has no counterpart
+/// on the other host to be scored against. Sixty-two cases here were in that
+/// state: they ran on both, tested the same thing on both, and the native/guest
+/// comparison that makes a guest failure a finding could not pair a single one
+/// of them.
+///
+/// Carrying the derivation also puts the alignment arithmetic in one place. It
+/// used to be written out at each call site, which is the same value spelled
+/// twice with nothing checking that the two agree.
+enum Pitch {
+    /// The smallest pitch this device will accept for the format.
+    case tight
+    /// That many whole alignment units above tight.
+    case padded(rows: Int)
+    /// A literal, from a guest census. Not every device can express one, and
+    /// the case skips where Metal would reject the descriptor.
+    case exact(Int)
+
+    /// The label component. `.exact` keeps the bare number because a literal
+    /// pitch means the same thing on every host.
+    var tag: String {
+        switch self {
+        case .tight: return "tight"
+        case .padded(let rows): return "tight_plus\(rows)"
+        case .exact(let value): return "\(value)"
+        }
+    }
+
+    func bytes(width: Int, bpp: Int, align: Int) -> Int {
+        switch self {
+        case .tight: return alignUp(width * bpp, align)
+        case .padded(let rows): return alignUp(width * bpp, align) + rows * align
+        case .exact(let value): return value
+        }
+    }
+}
+
 /// Run one of the texel-reading kernels over a texture and return the packed
 /// RGBA of every texel, in row-major order.
 /// `nil` means the dispatch produced nothing: the kernel never ran.

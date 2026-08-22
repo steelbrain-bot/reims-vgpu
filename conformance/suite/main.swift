@@ -15,8 +15,8 @@ _ = library
 report("shader_compile", true, "runtime library built")
 
 for f in formats {
-    linearAliasCase(f, 64, 16, padTo: nil, sampler: false)
-    linearAliasCase(f, 64, 16, padTo: nil, sampler: true)
+    linearAliasCase(f, 64, 16, pitch: .tight, sampler: false)
+    linearAliasCase(f, 64, 16, pitch: .tight, sampler: true)
 }
 
 // The label-layer geometries, from a driven boot's own census. Their pitches
@@ -25,26 +25,24 @@ for f in formats {
 // alignment differs by device (16 on an M-series host, 256 on Apple's
 // paravirtual one), so a literal pitch is not portable and must not be a
 // failure where it is simply not expressible.
-linearAliasCase(formats[1], 54, 16, padTo: 64, sampler: false)
+linearAliasCase(formats[1], 54, 16, pitch: .exact(64), sampler: false)
 
-linearAliasCase(formats[1], 54, 16, padTo: 64, sampler: true)
+linearAliasCase(formats[1], 54, 16, pitch: .exact(64), sampler: true)
 
-linearAliasCase(formats[1], 218, 16, padTo: 256, sampler: false)
+linearAliasCase(formats[1], 218, 16, pitch: .exact(256), sampler: false)
 
-linearAliasCase(formats[1], 85, 85, padTo: 128, sampler: false)
+linearAliasCase(formats[1], 85, 85, pitch: .exact(128), sampler: false)
 
-linearAliasCase(formats[0], 128, 16, padTo: 128, sampler: false)
+linearAliasCase(formats[0], 128, 16, pitch: .exact(128), sampler: false)
 
-linearAliasCase(formats[4], 60, 8, padTo: 256, sampler: false)
+linearAliasCase(formats[4], 60, 8, pitch: .exact(256), sampler: false)
 
 // The same shapes with the padding expressed against whatever this device's
 // alignment actually is, so every host runs a padded-pitch case whatever its
 // limit. One alignment unit of padding beyond tight, and then two.
 for f in formats {
-    let align = dev.minimumLinearTextureAlignment(for: f.mtl)
-    let tight = alignUp(54 * f.bpp, align)
-    for mult in 1...2 {
-        linearAliasCase(f, 54, 16, padTo: tight + mult * align, sampler: false)
+    for rows in 1...2 {
+        linearAliasCase(f, 54, 16, pitch: .padded(rows: rows), sampler: false)
     }
 }
 
@@ -63,17 +61,16 @@ vertexBufferCase()
 if texPipeline == nil {
     report("fragsample_pipeline", false, "tex_fs pipeline would not build")
 } else {
-    fragmentAliasCase(formats[1], 54, 16, padTo: 64)      // the label geometry
-    fragmentAliasCase(formats[1], 218, 16, padTo: 256)
-    fragmentAliasCase(formats[1], 85, 85, padTo: 128)
-    fragmentAliasCase(formats[3], 64, 16, padTo: nil)     // rgba8, tight
-    fragmentAliasCase(formats[4], 60, 8, padTo: 256)      // bgra8, padded
+    fragmentAliasCase(formats[1], 54, 16, pitch: .exact(64))    // the label geometry
+    fragmentAliasCase(formats[1], 218, 16, pitch: .exact(256))
+    fragmentAliasCase(formats[1], 85, 85, pitch: .exact(128))
+    fragmentAliasCase(formats[3], 64, 16, pitch: .tight)        // rgba8, tight
+    fragmentAliasCase(formats[4], 60, 8, pitch: .exact(256))    // bgra8, padded
     // And once more with the padding derived from this device's own limit, so
     // a host whose alignment skipped the literal pitches above still runs a
     // padded fragment-sampled alias.
     for f in [formats[1], formats[4]] {
-        let a = dev.minimumLinearTextureAlignment(for: f.mtl)
-        fragmentAliasCase(f, 54, 16, padTo: alignUp(54 * f.bpp, a) + a)
+        fragmentAliasCase(f, 54, 16, pitch: .padded(rows: 1))
     }
 }
 
@@ -93,12 +90,15 @@ for f in formats {
 
 // Tight and padded, read both ways, so the pitch is the only thing that varies
 // between a passing case and a failing one.
+// 256 and 250 rather than the device's alignment and six under it: at one byte
+// per texel both round up to a tight pitch of 256 on a device that aligns to 16
+// and on one that aligns to 256, so the pair means "no padding" and "six bytes
+// of padding" on either host and the two runs pair up by name.
 for viaFragment in [false, true] {
-    let a = dev.minimumLinearTextureAlignment(for: formats[1].mtl)
-    offsetOracleCase(a, 16, padTo: a, viaFragment: viaFragment)          // tight for this device
-    offsetOracleCase(a - 6, 16, padTo: a, viaFragment: viaFragment)      // padded by 6
-    offsetOracleCase(218, 16, padTo: alignUp(218, a), viaFragment: viaFragment)
-    offsetOracleCase(54, 16, padTo: alignUp(54, a) + a, viaFragment: viaFragment)
+    offsetOracleCase(256, 16, pitch: .tight, viaFragment: viaFragment)
+    offsetOracleCase(250, 16, pitch: .tight, viaFragment: viaFragment)
+    offsetOracleCase(218, 16, pitch: .tight, viaFragment: viaFragment)
+    offsetOracleCase(54, 16, pitch: .padded(rows: 1), viaFragment: viaFragment)
 }
 
 for w in [256, 250, 218, 64, 60, 54, 63, 57] { targetWidthCase(w, 16) }
