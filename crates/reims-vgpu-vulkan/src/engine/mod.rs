@@ -1717,24 +1717,146 @@ fn read_set_meets_runs(runs: &[(u64, u64)], pages: &[u64]) -> bool {
 /// A merge that quietly required sorted input would answer wrongly for that
 /// caller and would do it silently, so the requirement is carried by the
 /// signature of what asks rather than by a comment asking callers to be careful.
+/// What the per-draw visibility merge actually walks.
+///
+/// [`guest_writes_reaching_sets`] is asked once per draw and presents every
+/// guest page every guest-backed descriptor of that draw reads — around 526 of
+/// them per draw on a driven fullscreen Maps boot, which is the largest single
+/// span left in `draw_phase`. The merge that consumes them is already linear in
+/// `pages + runs`, so the only thing left to ask is whether it is being handed
+/// work that a comparison of two endpoints could have retired: both sides are
+/// sorted, so a set lying wholly below the first run or wholly above the last
+/// cannot meet any of them.
+///
+/// Whether that is worth writing is a count, not an argument, and the counts
+/// this bank are exactly the ones that decide it: how many pages the merge
+/// stepped over against how many it was given, and how many runs it was
+/// comparing them with.
+pub mod vis_walk_census {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    static ASKS: AtomicU64 = AtomicU64::new(0);
+    static SETS: AtomicU64 = AtomicU64::new(0);
+    static PAGES_GIVEN: AtomicU64 = AtomicU64::new(0);
+    static PAGES_WALKED: AtomicU64 = AtomicU64::new(0);
+    static RUNS: AtomicU64 = AtomicU64::new(0);
+    static SPAN_MISSES: AtomicU64 = AtomicU64::new(0);
+    static RUNS_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+    /// One ask's totals, banked once rather than per set.
+    ///
+    /// A draw presents around nine sets, so per-set atomics would be nine
+    /// read-modify-writes on shared lines inside the span being measured — an
+    /// instrument that changes the number it reports. These are plain adds on
+    /// the stack until the ask ends.
+    #[derive(Default)]
+    pub(super) struct Ask {
+        pub(super) sets: u64,
+        pub(super) given: u64,
+        pub(super) walked: u64,
+        pub(super) runs_skipped: u64,
+        pub(super) span_misses: u64,
+    }
+
+    pub(super) fn bank(ask: &Ask, runs: u64) {
+        ASKS.fetch_add(1, Relaxed);
+        RUNS.fetch_add(runs, Relaxed);
+        SETS.fetch_add(ask.sets, Relaxed);
+        PAGES_GIVEN.fetch_add(ask.given, Relaxed);
+        PAGES_WALKED.fetch_add(ask.walked, Relaxed);
+        RUNS_SKIPPED.fetch_add(ask.runs_skipped, Relaxed);
+        SPAN_MISSES.fetch_add(ask.span_misses, Relaxed);
+    }
+
+    /// Read and reset: `(asks, sets, given, walked, runs, span_misses, runs_skipped)`.
+    ///
+    /// `runs_skipped` is a **distance, not a cost**: the number of ledger runs
+    /// the cursor moved past, which the merge covers in a bisection and so pays
+    /// about its logarithm for. It is the right thing to watch because it says
+    /// how far the seek has to reach, and the day it is being stepped again the
+    /// same distance becomes the same number of comparisons.
+    #[allow(clippy::type_complexity)]
+    pub fn take() -> (u64, u64, u64, u64, u64, u64, u64) {
+        (
+            ASKS.swap(0, Relaxed),
+            SETS.swap(0, Relaxed),
+            PAGES_GIVEN.swap(0, Relaxed),
+            PAGES_WALKED.swap(0, Relaxed),
+            RUNS.swap(0, Relaxed),
+            SPAN_MISSES.swap(0, Relaxed),
+            RUNS_SKIPPED.swap(0, Relaxed),
+        )
+    }
+}
+
+/// The merge without an ask to bank into, which only the tests need: every
+/// caller in the device asks about several sets at once and shares one.
+#[cfg(test)]
 fn sorted_read_set_meets_runs(runs: &[(u64, u64)], pages: &[u64]) -> bool {
+    let mut ask = vis_walk_census::Ask::default();
+    let meets = sorted_read_set_meets_runs_counted(runs, pages, &mut ask);
+    vis_walk_census::bank(&ask, runs.len() as u64);
+    meets
+}
+
+fn sorted_read_set_meets_runs_counted(
+    runs: &[(u64, u64)],
+    pages: &[u64],
+    ask: &mut vis_walk_census::Ask,
+) -> bool {
+    ask.sets += 1;
+    ask.given += pages.len() as u64;
+    let (Some(&(lo, _)), Some(&(_, hi))) = (runs.first(), runs.last()) else {
+        return false;
+    };
+    let (Some(&first), Some(&last)) = (pages.first(), pages.last()) else {
+        return false;
+    };
+    // Both sides ascend, so a set lying wholly below the ledger's first run or
+    // wholly above its last cannot meet any of them, and two comparisons say
+    // so without touching either interior. This is not a fast path bolted onto
+    // the merge: it is the same predicate the merge computes, evaluated at the
+    // only granularity where it costs nothing.
+    if last < lo || first > hi {
+        ask.span_misses += 1;
+        return false;
+    }
     let mut cursor = 0usize;
     for &page in pages {
-        // Retire every run ending below this page. Pages ascend, so a run
-        // dropped here cannot hold any later page either.
-        while runs.get(cursor).is_some_and(|&(_, end)| end < page) {
-            cursor += 1;
-        }
+        ask.walked += 1;
+        // The cursor names the first run that might still hold a page. When it
+        // is already at or past `page` — which is the common case once the set
+        // has been entered — one comparison settles it.
+        //
+        // When it is behind, the distance can be the whole ledger: a read set
+        // typically opens far above the first armed page, and every set starts
+        // its cursor at zero. Runs ascend and are disjoint, so the run to
+        // resume at is found by bisecting what is left rather than by stepping
+        // through it. Stepping is what made this span the largest in the draw:
+        // it cost 5 622 steps a draw against 486 pages actually examined, on a
+        // ledger holding around 2 600 disjoint runs.
         let Some(&(start, end)) = runs.get(cursor) else {
             // Past the last run, and every remaining page is larger still.
             return false;
         };
-        if page >= start && page <= end {
+        if end < page {
+            let skipped = runs[cursor..].partition_point(|&(_, run_end)| run_end < page);
+            cursor += skipped;
+            ask.runs_skipped += skipped as u64;
+            let Some(&(start, end)) = runs.get(cursor) else {
+                return false;
+            };
+            if page >= start && page <= end {
+                return true;
+            }
+            // `page < start`: the page sits in the gap below the run the cursor
+            // now names, and the next page may land inside that same run.
+            continue;
+        }
+        if page >= start {
             return true;
         }
-        // `page < start`: this page sits in the gap below the run the cursor
-        // now names. Leave the cursor where it is — the next page may land in
-        // that same run.
+        // `page < start`: same gap case, cursor already correct.
     }
     false
 }
@@ -1892,8 +2014,12 @@ pub fn guest_writes_reaching_sets<'a>(
     sets: impl IntoIterator<Item = &'a reims_vgpu_memory::GuestPageSet>,
 ) -> GuestWriteReach {
     write_ledger_reach(|runs| {
-        sets.into_iter()
-            .any(|set| sorted_read_set_meets_runs(runs, set.pages()))
+        let mut ask = vis_walk_census::Ask::default();
+        let meets = sets
+            .into_iter()
+            .any(|set| sorted_read_set_meets_runs_counted(runs, set.pages(), &mut ask));
+        vis_walk_census::bank(&ask, runs.len() as u64);
+        meets
     })
 }
 
@@ -2051,12 +2177,17 @@ mod write_ledger_walk_tests {
             state
         };
 
+        let mut seeking = 0usize;
+        let mut meeting = 0usize;
         for case in 0..2000u32 {
             // Runs must be ascending, disjoint and non-adjacent, which is what
             // the ledger's own coalescing guarantees.
             let mut runs: Vec<(u64, u64)> = Vec::new();
             let mut at = next() % 8;
-            let run_count = next() % 6;
+            // Wide enough that a set commonly opens above many runs, which is
+            // the shape the cursor seek exists for and the shape a handful of
+            // runs never produces.
+            let run_count = next() % 64;
             for _ in 0..run_count {
                 let start = at + 1 + next() % 5;
                 let end = start + next() % 4;
@@ -2065,17 +2196,30 @@ mod write_ledger_walk_tests {
             }
 
             // Read pages: sorted and deduped, as a `GuestPageSet` is.
-            let mut pages: Vec<u64> = (0..next() % 10).map(|_| next() % 40).collect();
+            let mut pages: Vec<u64> = (0..next() % 24).map(|_| next() % 400).collect();
             pages.sort_unstable();
             pages.dedup();
 
+            // The shape the cursor seek exists for: a set whose first page
+            // sits above several runs, so the merge must skip them. Counted
+            // because a generator that stopped producing it would leave the
+            // seek untested while every case still passed.
+            if let (Some(&first), true) = (pages.first(), runs.len() >= 8) {
+                if runs[7].1 < first {
+                    seeking += 1;
+                }
+            }
             let merged = sorted_read_set_meets_runs(&runs, &pages);
             let probed = read_set_meets_runs(&runs, &pages);
+            meeting += usize::from(merged);
             assert_eq!(
                 merged, probed,
                 "case {case}: runs={runs:?} pages={pages:?} merge={merged} probe={probed}"
             );
         }
+        assert!(seeking > 200, "too few seeking cases: {seeking}");
+        assert!(meeting > 200, "too few overlapping cases: {meeting}");
+        assert!(meeting < 1800, "too few disjoint cases: {meeting}");
     }
 
     /// The two edges the generator above reaches only by luck.

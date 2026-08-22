@@ -2969,6 +2969,33 @@ pub fn note_drain_tranche(
                 ));
             }
         }
+        // The per-draw visibility merge's own totals, owned by the Vulkan crate
+        // because the ledger is its. The reading that matters is
+        // `skipped_per_ask` against `walked_per_ask`: the merge is linear in
+        // pages *plus* the ledger runs its cursor has to reach past, and every
+        // set restarts that cursor, so the second term grows with what the
+        // guest has outstanding rather than with what this draw reads. It is a
+        // distance and not a cost — the seek bisects it — but it is the number
+        // that says how much reach the seek needs, and a merge that went back
+        // to stepping would pay all of it.
+        {
+            let (asks, sets, given, walked, runs, span_misses, runs_skipped) =
+                reims_vgpu_vulkan::engine::vis_walk_census::take();
+            if asks != 0 && sets != 0 {
+                crate::observe::off(format!(
+                    "vis_walk asks={asks} sets={sets} given={given} walked={walked} \
+                     runs_skipped={runs_skipped} runs_per_ask={:.1} sets_per_ask={:.2} \
+                     given_per_set={:.1} walked_per_ask={:.1} skipped_per_ask={:.1} \
+                     span_miss_frac={:.3}",
+                    runs as f64 / asks as f64,
+                    sets as f64 / asks as f64,
+                    given as f64 / sets as f64,
+                    walked as f64 / asks as f64,
+                    runs_skipped as f64 / asks as f64,
+                    span_misses as f64 / sets as f64,
+                ));
+            }
+        }
         if let Some(pre) = DRAIN_DUTY.take_preflight_parts() {
             crate::observe::off(pre);
         }
