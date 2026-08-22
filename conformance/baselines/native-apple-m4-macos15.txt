@@ -73,6 +73,10 @@ CASE mip_blit_level_6_size1 PASS 1 texels are level 6's marker
 CASE vb_first_submission_left PASS geometry landed in the left half
 CASE vb_second_submission_right PASS geometry landed in the right half
 CASE vb_third_submission_left_again PASS geometry landed in the left half
+CASE fb_offset_0 PASS slot 0 at offset 0 reached the fragment stage
+CASE fb_offset_256 PASS slot 1 at offset 256 reached the fragment stage
+CASE fb_offset_512 PASS slot 2 at offset 512 reached the fragment stage
+CASE fb_rebound_between_draws PASS each draw read the offset bound before it
 CASE fragsample_a8Unorm_54x16_pitch_64_first_draw PASS 864 texels exact through the rasterizer
 CASE fragsample_a8Unorm_54x16_pitch_64_after_cpu_rewrite PASS 864 texels exact through the rasterizer
 CASE fragsample_a8Unorm_218x16_pitch_256_first_draw PASS 3488 texels exact through the rasterizer
@@ -218,5 +222,5 @@ ROUTE srt_blit_pipelined_1024x768_x8 settle_gva_rect_read
 ROUTE srt_blit_pipelined_1024x768_x8 settle_gva_rect_read_overlap
 CASE srt_blit_pipelined_1024x768_x8 PASS every frame's copy moved that frame's own pixels
 CASE srt_blit_buffer_backed_512x512 PASS the copy out of a buffer-backed source moved what the render had written
-SUMMARY cases=216 failures=0 skipped=0
+SUMMARY cases=220 failures=0 skipped=0
 DEVICE name=Apple M4 unified=true

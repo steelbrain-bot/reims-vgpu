@@ -119,6 +119,18 @@ pub(super) fn plan_bound_buffers<M: HostMemory + HostOps>(
         // concept and `pd.vertex_attributes` names vertex buffer indices,
         // which are a different index space from the fragment stage's.
         crate::runtime::bind_phase::note_unused_staged(access);
+        // Zero-copy, for the same reason the vertex loop above allows it and
+        // with none of that loop's one exclusion. A fragment bind is the
+        // guest's buffer as the guest bound it: nothing on this path prepends
+        // a prefix to the bytes or otherwise needs to own a mutable copy, and
+        // `is_constant_step` — the only reason a vertex index is held back —
+        // is a stage-in concept the fragment index space does not have. Both
+        // stages' binds land in the same `storage_buffers` vector, so the
+        // descriptor side already consumes imported content.
+        //
+        // The call is a ladder: an import that cannot be formed falls to the
+        // CPU read that used to be unconditional here, so this widens which
+        // rung a bind reaches and cannot change what the shader sees.
         let Some(content) = load_buffer_content(
             state,
             host,
@@ -126,7 +138,7 @@ pub(super) fn plan_bound_buffers<M: HostMemory + HostOps>(
             b.buffer_ref,
             b.resource.as_deref(),
             b.offset,
-            false,
+            true,
             cap,
         ) else {
             return Err(DrawPreparationDecline::FragmentBufferMissing {
