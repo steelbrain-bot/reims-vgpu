@@ -35,7 +35,7 @@ pub(super) fn plan_load<M: HostMemory + HostOps>(
     let mut target_clear = [0.0; 4];
     let mut color_load_action = reims_vgpu_core::ColorLoadAction::Clear;
     let mut target_seed_order = reims_vgpu_core::SeedOrder::Rgba8;
-    let gpu_only_content_allowed = state.executor.capabilities().deferred_gpu_only_content;
+    let gpu_only_content_allowed = state.executor.deferred_gpu_only_content();
 
     let surface_render_target = iosurface_texture_render_identity(state, request);
     let surface_target = writeback_guest

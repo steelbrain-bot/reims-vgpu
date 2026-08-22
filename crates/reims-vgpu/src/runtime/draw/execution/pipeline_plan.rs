@@ -112,7 +112,7 @@ pub(super) fn plan_pipeline<M: HostMemory + HostOps>(
     else {
         return Ok(None);
     };
-    let max_dimension = state.executor.capabilities().max_render_target_dimension;
+    let max_dimension = state.executor.max_render_target_dimension();
     if width == 0 || height == 0 || width > max_dimension || height > max_dimension {
         return Err(DrawPreparationDecline::GeometryUnsupported { width, height });
     }

@@ -999,13 +999,36 @@ mod device_capability_snapshot_tests {
 /// serial fraction is **36.8 %** and Amdahl caps any parallel encoder at
 /// **2.72x** -- about 40 frames, not 60, however many threads it is given.
 ///
+/// **That hold is one acquisition, and knowing which one changes the reading.**
+/// A `#[track_caller]` probe over a driven boot attributed every acquisition to
+/// its source line, and the distribution is not the flat spread the aggregate
+/// suggests:
+///
+/// | site | acq/draw | us/draw held |
+/// |---|---|---|
+/// | `execute_draw_request_in_submission` | 1.04 | **7.42** |
+/// | three capability queries (since removed) | 6.22 | 0.11 |
+/// | `quiesce_guest_writes` | 0.0004 | 0.74 |
+///
+/// So the serial region is not a scatter of small shared-state lookups that
+/// could be picked off one at a time -- it is one coarse lock wrapped around
+/// the *whole* draw. `Phase::Slot` sits inside it, which means a worker holds
+/// this mutex while **blocking on the GPU ring**, and in any parallel design
+/// that would stall every other encoder behind one encoder's wait.
+///
+/// That is why the 2.72x above is a ceiling on the *current granularity* and
+/// not a statement about how much of a draw is genuinely shared. By the
+/// `draw_phase` decomposition below, roughly 3.4 us of the 7.42 is
+/// resident-registry traffic and the rest is per-encoder work holding a global
+/// lock for no reason the contract states.
+///
 /// The unit that could go wide is the packet, and there are enough of them:
 /// 45 125 packets over 50 driven seconds, **52.5 draws each**, each costing
 /// **823 us** of `exec_phase finish_us`. Metal command buffers are encoded
 /// independently with their order fixed at commit, so the contract grants the
 /// concurrency; this mutex is what would take it back.
 ///
-/// What is actually inside the 8.088 us, from `draw_phase` on the same boot,
+/// What is actually inside that 7.42 us, from `draw_phase` on the same boot,
 /// decides whether the cap can move:
 ///
 /// * ~1.3 us a draw is real command recording (`rec_*`), which needs nothing

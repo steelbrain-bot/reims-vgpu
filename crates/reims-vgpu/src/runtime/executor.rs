@@ -1220,6 +1220,15 @@ impl SessionService for VulkanExecutor {
 
 impl CapabilityService for VulkanExecutor {
     fn capabilities(&self) -> ExecutorCapabilities {
+        // Asked first, and deliberately not in field order. Two of the answers
+        // below come from the published device snapshot, which holds the
+        // conservative Vulkan-1.2 floor until a device exists -- and this is
+        // the only query here that brings one up. Read in field order, the
+        // first `capabilities()` of a process reports `max_render_target_
+        // dimension` 4096 against a host that answers 16 384, because the
+        // device it would have learned that from is created two fields later.
+        let storage_image_write_without_format =
+            reims_vgpu_vulkan::engine::supports_storage_image_write_without_format();
         let (max_compute_workgroup_invocations, thread_execution_width) =
             reims_vgpu_vulkan::engine::compute_threadgroup_limits();
         ExecutorCapabilities {
@@ -1229,9 +1238,19 @@ impl CapabilityService for VulkanExecutor {
             max_render_target_dimension: reims_vgpu_vulkan::engine::max_render_target_dimension(),
             deferred_gpu_only_content: reims_vgpu_vulkan::engine::deferred_gpu_only_content_allowed(
             ),
-            storage_image_write_without_format:
-                reims_vgpu_vulkan::engine::supports_storage_image_write_without_format(),
+            storage_image_write_without_format,
         }
+    }
+
+    /// From the published capability snapshot, so a draw's target planning
+    /// takes no engine lock to learn a device constant.
+    fn max_render_target_dimension(&self) -> u32 {
+        reims_vgpu_vulkan::engine::max_render_target_dimension()
+    }
+
+    /// From the published capability snapshot, for the same reason.
+    fn deferred_gpu_only_content(&self) -> bool {
+        reims_vgpu_vulkan::engine::deferred_gpu_only_content_allowed()
     }
 
     fn render_target_layout_supported(
@@ -1607,6 +1626,34 @@ mod tests {
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     };
+
+    /// The narrow capability queries must answer what the whole reply says.
+    ///
+    /// They exist because assembling [`ExecutorCapabilities`] takes the global
+    /// engine mutex three times, and two per-draw planners were paying that to
+    /// read one field each -- 6.2 of the 7.06 engine acquisitions a draw. The
+    /// cheap answers come from the published device snapshot and the expensive
+    /// one from the live engine, so they are two code paths over one fact and
+    /// nothing but this makes them agree.
+    ///
+    /// No `conformance/` case can gate it: a divergence here changes a device
+    /// limit the planner reads, and with no device present both paths report
+    /// the same conservative contract, which is what this asserts. A case
+    /// would need a host whose real limits differ from the floor *and* a guest
+    /// workload that straddles them.
+    #[test]
+    fn the_narrow_capability_queries_agree_with_the_whole_reply() {
+        let executor = VulkanExecutor::default();
+        let whole = executor.capabilities();
+        assert_eq!(
+            executor.max_render_target_dimension(),
+            whole.max_render_target_dimension
+        );
+        assert_eq!(
+            executor.deferred_gpu_only_content(),
+            whole.deferred_gpu_only_content
+        );
+    }
 
     #[derive(Debug)]
     struct TestResidentLease {

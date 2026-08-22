@@ -55,8 +55,36 @@ impl Default for ExecutorCapabilities {
 /// neither advertises guest protocol features nor owns execution, lifecycle,
 /// presentation, or observation services.
 pub trait CapabilityService: std::fmt::Debug + Send + Sync {
+    /// Every host capability at once, for the guest's device-info reply.
+    ///
+    /// This is the shape the *guest* asks for and it is not the shape planning
+    /// asks for. A planner wanting one field pays for all of them, and on the
+    /// Vulkan backend assembling this answer takes the global engine mutex
+    /// three times -- so two per-draw planners reading one field each were
+    /// **6.2 of the 7.06 engine acquisitions a draw** on a driven fullscreen
+    /// Maps boot. Reach for one of the narrow queries below unless the whole
+    /// reply is genuinely what is wanted.
     fn capabilities(&self) -> ExecutorCapabilities {
         ExecutorCapabilities::default()
+    }
+
+    /// The largest render-target edge this host can create.
+    ///
+    /// Narrow on purpose: it is asked once per draw by target planning, and a
+    /// backend can answer it from a published snapshot without taking any
+    /// lock. The default delegates so a backend that has nothing cheaper is
+    /// still correct.
+    fn max_render_target_dimension(&self) -> u32 {
+        self.capabilities().max_render_target_dimension
+    }
+
+    /// Whether a resident may hold guest-visible content the guest has not
+    /// been handed bytes for yet.
+    ///
+    /// Narrow for the same reason as [`Self::max_render_target_dimension`]:
+    /// load planning asks it once per draw.
+    fn deferred_gpu_only_content(&self) -> bool {
+        self.capabilities().deferred_gpu_only_content
     }
 
     fn render_target_layout_supported(&self, layout: TexelLayout) -> bool {
