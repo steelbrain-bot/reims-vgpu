@@ -649,6 +649,47 @@ mod tests {
 /// This is not a claim that the encoder exists. It is the one property the
 /// encoder cannot be built without, asserted where the type is defined so it
 /// cannot regress unnoticed.
+///
+/// # A two-stage pipeline cut here was built and measured, and it loses
+///
+/// `Send` is necessary and it is a long way from sufficient. A recording
+/// thread that took resolved draws from an in-order queue while the resolver
+/// ran ahead was built against this seam and driven on fullscreen Maps
+/// (macos-13, x86/Vulkan). It classified correctly -- every draw of the driven
+/// window was accepted for deferral -- and it was **3.2x slower**:
+///
+/// | arm | `proc_us`/draw | draws/driven-sec |
+/// |---|---|---|
+/// | serial | 22.01 | 44 826 |
+/// | two-stage pipeline | 70.75 | 12 307 |
+///
+/// The cause is not the queue and not lock contention (`gap_lock_us` was
+/// 0.25 us a draw). It is that the resolving side must **synchronise with the
+/// recorder 6.4 times per draw**, measured directly: 6 491 deferred draws
+/// against 44 730 forced drains in one census window. The resolver takes the
+/// engine about seven times a draw for its own work -- resident-registry
+/// reads, content-epoch stamps, read plans -- and every one of those reads
+/// state the recorder mutates while recording (`registry_mark_ready_at`,
+/// `registry_note_sampled_use`, the guest-write debt). Answering one of them
+/// from a queue that has not drained is a stale answer, and a stale answer
+/// here is a **content** defect. So the synchronisation is a real data
+/// dependency at draw granularity, not a conservative guard that could be
+/// relaxed.
+///
+/// The second number is the one that generalises past this design: each
+/// synchronisation cost **7.6 us** (48.7 us a draw of added `proc_us` over 6.4
+/// of them) -- an mpsc send plus a futex sleep and wake on a saturated
+/// machine. Against a 22 us budget, *one* handoff a draw would eat a third of
+/// it. No design in which the resolver waits for a recorder once per draw can
+/// pay here, however cheap the queue is made.
+///
+/// What that leaves. Resolve and record share the engine's resident registry,
+/// so cutting between them does not cut the state, and the seam is not where
+/// the type boundary suggests. The parallelism the contract actually grants is
+/// one level up: Metal command buffers are encoded independently with order
+/// fixed at commit, and a driven frame carries about forty of them. Taking it
+/// needs per-encoder command pools and per-command-buffer registry isolation --
+/// a change to what the engine owns, not another consumer of this type.
 #[cfg(test)]
 mod thread_seam {
     /// See the module doc: the resolved-draw seam is only a seam if a resolved
