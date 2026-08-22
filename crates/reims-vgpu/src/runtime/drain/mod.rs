@@ -2278,6 +2278,8 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut Device, host: &mut H
     let base =
         state.pfn_gpa(state.registers.gfx.fifo_base_page) + state.registers.gfx.fifo_start as u64;
     let mut completed = false;
+    // See `census::note_tranche_width`.
+    let mut tranche_packets = 0u64;
 
     while state
         .registers
@@ -2364,6 +2366,7 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut Device, host: &mut H
                     break;
                 }
                 process_root_packet(state, host, &packet);
+                tranche_packets += 1;
                 state
                     .registers
                     .gfx
@@ -2443,6 +2446,8 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut Device, host: &mut H
             }
         }
     }
+
+    census::note_tranche_width(census::TrancheRing::Root, tranche_packets);
 
     if completed {
         state
@@ -4613,6 +4618,10 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
     // pending value will be written to.
     let stamp_index_slot = stamp_slot_index(stamp_index);
 
+    // Packets this wake consumes before the ring runs dry — the width any
+    // packet-level fan-out could use. See `census::note_tranche_width`.
+    let mut tranche_packets = 0u64;
+
     loop {
         let regs_started = std::time::Instant::now();
         let tail_read = crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_TAIL);
@@ -4734,6 +4743,7 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                     break;
                 }
                 head = packet.next_head;
+                tranche_packets += 1;
                 let head_started = std::time::Instant::now();
                 let head_write = gpa_map::write_u32(
                     host,
@@ -4809,6 +4819,8 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
             }
         }
     }
+
+    census::note_tranche_width(census::TrancheRing::Child, tranche_packets);
 
     // Every `break` above lands here, which is what makes one site enough: a
     // drain that stops on a held stamp, a deferred translation, a decode fault

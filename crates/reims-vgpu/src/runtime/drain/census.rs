@@ -3055,6 +3055,11 @@ pub fn note_drain_tranche(
         if let Some(routes) = take_store_routes() {
             crate::observe::off(routes);
         }
+        // The width any packet-level fan-out could use. Joined by `t=` so it
+        // is read against the same window's draws and duty.
+        for tranche in take_drain_tranche(crate::observe::elapsed_ms() as u64) {
+            crate::observe::off(tranche);
+        }
         // What canonical page-set construction costs on the draw path. Joined
         // by `t=` like the rest, so `builds` divides by this window's draws.
         if let Some(sets) =
@@ -4105,4 +4110,115 @@ mod lookup_age_tests {
             );
         }
     }
+}
+
+/// How many packets one drain wake finds already published.
+///
+/// # The question this answers
+///
+/// The x86/Vulkan rail is drain-CPU bound and the route to 60 fps is encoding
+/// command buffers concurrently — `reims_vgpu_core::render`'s `thread_seam`
+/// doc establishes that the seam is the *packet* and not the draw, because a
+/// resolver and a recorder cut apart at draw granularity must synchronise 6.4
+/// times a draw at 7.6 µs a time.
+///
+/// A packet seam only pays if packets are *available* at once. The guest
+/// publishes into a head/tail ring and this device drains it until empty, so
+/// the number of packets standing in the ring when a wake begins is exactly the
+/// width any fan-out could use. One is no width at all, whatever the refactor
+/// costs.
+///
+/// This is a count and a distribution, not a timing: it is read to size a
+/// design, and it must survive both host contention and the perturbation of
+/// measuring it.
+///
+/// The buckets are powers of two because the reading wanted is an order of
+/// magnitude — "usually one", "usually a handful", "usually dozens" — and a
+/// mean would hide a bimodal ring behind a comfortable-looking average.
+#[derive(Default)]
+struct TrancheCensus {
+    wakes: std::sync::atomic::AtomicU64,
+    packets: std::sync::atomic::AtomicU64,
+    max: std::sync::atomic::AtomicU64,
+    /// `[1, 2-3, 4-7, 8-15, 16-31, 32-63, 64+]`.
+    buckets: [std::sync::atomic::AtomicU64; 7],
+}
+
+/// Which ring a wake drained. They are two populations and blending them
+/// would hide the one that matters: the render command stream arrives on the
+/// child FIFOs, and the root ring carries control traffic whose width says
+/// nothing about encoder fan-out.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TrancheRing {
+    Root = 0,
+    Child = 1,
+}
+
+static TRANCHE: [TrancheCensus; 2] = [
+    TrancheCensus {
+        wakes: std::sync::atomic::AtomicU64::new(0),
+        packets: std::sync::atomic::AtomicU64::new(0),
+        max: std::sync::atomic::AtomicU64::new(0),
+        buckets: [const { std::sync::atomic::AtomicU64::new(0) }; 7],
+    },
+    TrancheCensus {
+        wakes: std::sync::atomic::AtomicU64::new(0),
+        packets: std::sync::atomic::AtomicU64::new(0),
+        max: std::sync::atomic::AtomicU64::new(0),
+        buckets: [const { std::sync::atomic::AtomicU64::new(0) }; 7],
+    },
+];
+
+/// Record that one drain wake consumed `packets` packets before the ring ran
+/// dry. A wake that found nothing is not a wake for this purpose — it says
+/// nothing about available width — so zero is dropped.
+pub fn note_tranche_width(ring: TrancheRing, packets: u64) {
+    use std::sync::atomic::Ordering;
+    if packets == 0 {
+        return;
+    }
+    let c = &TRANCHE[ring as usize];
+    c.wakes.fetch_add(1, Ordering::Relaxed);
+    c.packets.fetch_add(packets, Ordering::Relaxed);
+    c.max.fetch_max(packets, Ordering::Relaxed);
+    let bucket = match packets {
+        1 => 0,
+        2..=3 => 1,
+        4..=7 => 2,
+        8..=15 => 3,
+        16..=31 => 4,
+        32..=63 => 5,
+        _ => 6,
+    };
+    c.buckets[bucket].fetch_add(1, Ordering::Relaxed);
+}
+
+/// [`take_drain_tranche`] for the census's own test.
+#[cfg(test)]
+pub(super) fn take_drain_tranche_for_test(t_ms: u64) -> Vec<String> {
+    take_drain_tranche(t_ms)
+}
+
+/// One window of [`note_tranche_width`], taken and reset, one line per ring.
+fn take_drain_tranche(t_ms: u64) -> Vec<String> {
+    use std::sync::atomic::Ordering;
+    let mut lines = Vec::new();
+    for (ring, c) in [("root", &TRANCHE[0]), ("child", &TRANCHE[1])] {
+        let wakes = c.wakes.swap(0, Ordering::Relaxed);
+        if wakes == 0 {
+            continue;
+        }
+        let packets = c.packets.swap(0, Ordering::Relaxed);
+        let max = c.max.swap(0, Ordering::Relaxed);
+        let b: Vec<String> = c
+            .buckets
+            .iter()
+            .map(|x| x.swap(0, Ordering::Relaxed).to_string())
+            .collect();
+        lines.push(format!(
+            "drain_tranche t={t_ms} ring={ring} wakes={wakes} packets={packets} max={max} b1={} b2={} b4={} b8={} b16={} b32={} b64={}",
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6]
+        ));
+    }
+    lines
 }

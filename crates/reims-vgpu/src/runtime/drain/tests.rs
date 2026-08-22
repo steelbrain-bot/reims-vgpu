@@ -6703,3 +6703,67 @@ fn a_pending_stamp_discharges_a_wait_on_its_own_slot_and_no_other() {
         "a drain that has latched nothing discharges nothing"
     );
 }
+
+/// The tranche census buckets by width and keeps the two rings apart.
+///
+/// The bucket boundaries are the whole reading. This distribution is bimodal
+/// on the rail it was built for — half the wakes find one packet and most of
+/// the *packets* arrive in wide tranches — so a census that collapsed the two
+/// rings, or that reported only a mean, would answer the fan-out question
+/// wrongly in the direction that reads as "there is no width here".
+#[test]
+fn the_tranche_census_buckets_by_width_and_separates_the_rings() {
+    use super::census::{note_tranche_width, TrancheRing};
+
+    // Drain anything another test in this binary left behind.
+    let _ = super::census::take_drain_tranche_for_test(0);
+
+    // A wake that found nothing says nothing about available width.
+    note_tranche_width(TrancheRing::Child, 0);
+    assert!(
+        super::census::take_drain_tranche_for_test(1).is_empty(),
+        "an empty wake must not register as a wake"
+    );
+
+    for width in [1u64, 1, 2, 3, 7, 8, 20, 40, 120] {
+        note_tranche_width(TrancheRing::Child, width);
+    }
+    note_tranche_width(TrancheRing::Root, 5);
+
+    let lines = super::census::take_drain_tranche_for_test(9);
+    assert_eq!(
+        lines.len(),
+        2,
+        "one line per ring that saw a wake: {lines:?}"
+    );
+
+    let root = lines
+        .iter()
+        .find(|l| l.contains("ring=root"))
+        .expect("root ring reports separately");
+    assert!(root.contains("wakes=1"), "{root}");
+    assert!(root.contains("packets=5"), "{root}");
+    assert!(root.contains("b4=1"), "5 lands in the 4-7 bucket: {root}");
+
+    let child = lines
+        .iter()
+        .find(|l| l.contains("ring=child"))
+        .expect("child ring reports separately");
+    assert!(child.contains("wakes=9"), "{child}");
+    assert!(child.contains("packets=202"), "{child}");
+    assert!(child.contains("max=120"), "{child}");
+    // Each boundary walked, so a widened or narrowed bucket fails here rather
+    // than silently re-banding a published distribution.
+    assert!(child.contains("b1=2"), "{child}");
+    assert!(child.contains("b2=2"), "2 and 3: {child}");
+    assert!(child.contains("b4=1"), "7: {child}");
+    assert!(child.contains("b8=1"), "8: {child}");
+    assert!(child.contains("b16=1"), "20: {child}");
+    assert!(child.contains("b32=1"), "40: {child}");
+    assert!(child.contains("b64=1"), "120: {child}");
+
+    assert!(
+        super::census::take_drain_tranche_for_test(10).is_empty(),
+        "the take must have reset every counter"
+    );
+}

@@ -1046,6 +1046,33 @@ mod device_capability_snapshot_tests {
 /// That is a change to what `EngineState` owns, and it is a prerequisite for
 /// the packet fan-out rather than a consequence of it.
 ///
+/// # The width is there, and reading it by wakes says the opposite
+///
+/// The paragraph above says the unit that could go wide is the packet. Whether
+/// enough packets are *available at once* to feed a fan-out is a separate
+/// question, and it is the one that decides whether any of this pays. It has
+/// now been measured — `runtime::drain::census`'s `drain_tranche`, one driven
+/// fullscreen Maps boot, rail=macos-13, banded:
+///
+/// ```text
+/// ring=child  wakes=2678  packets=52605  mean=19.64  max=120
+///   width      1   2-3   4-7  8-15  16-31  32-63   64+
+///   wakes   1373   315   117    65    322    189    297
+/// ```
+///
+/// **Weight that by packets and not by wakes.** By wakes it reads as a rail
+/// with no width at all: 51 % of them find exactly one packet. By packets —
+/// which is where the work is — about **89 % arrive in tranches of 16 or
+/// more** and roughly 62 % in tranches of 64 or more, because the 1 373
+/// single-packet wakes carry 1 373 packets between them and the 297 widest
+/// carry over thirty thousand. The two readings disagree by more than an order
+/// of magnitude and only one of them is about throughput.
+///
+/// So an encoder pool of eight would be fed for the overwhelming majority of
+/// the work this rail does, and the 6x the split above is worth is reachable
+/// rather than theoretical. 52 605 packets over 2 405 367 banded draws is 45.7
+/// draws a packet, which agrees with the 52.5 measured independently above.
+///
 /// One design is already excluded by measurement and must not be retried: a
 /// two-stage pipeline that keeps one recorder thread and lets the resolver run
 /// ahead. It was built, and it is 3.2x **slower**, because the resolver must
