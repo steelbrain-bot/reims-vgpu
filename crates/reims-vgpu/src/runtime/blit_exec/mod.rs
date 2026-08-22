@@ -3806,10 +3806,9 @@ enum GpuPlaneRefusal {
     /// Source and destination are the same reference, so resolving the
     /// destination would pay away the very debt holding the source's content.
     SelfCopy,
-    /// Neither account of the source names a GPU resident: it owes no writeback
-    /// debt *and* it is not an IOSurface-backed texture with a live resident
-    /// under its surface identity. There is nothing for a GPU-side copy to read
-    /// from, and the host staging loop is the only arm.
+    /// The source owes no writeback debt and is not IOSurface-backed, so there
+    /// is no surface identity to ask about either. Nothing on the GPU names it
+    /// and the host staging loop is the only arm.
     ///
     /// **Both accounts are needed, and asking only the first is what this
     /// variant used to mean.** A writeback debt says the GPU holds newer
@@ -3829,6 +3828,17 @@ enum GpuPlaneRefusal {
     /// overlapped. The variant is still a fall-through and still not a loss;
     /// the ordering that makes that true lives in the read.
     SrcNotResident,
+    /// The source *is* IOSurface-backed and owes no debt, and no GPU resident
+    /// stands under its surface identity.
+    ///
+    /// Split from [`GpuPlaneRefusal::SrcNotResident`] because the two have
+    /// different answers and one counter could not tell them apart. This one
+    /// says the rail was reachable and the resident was simply not there, which
+    /// points at where residents are published; the other says the source was
+    /// never a surface to begin with, which points at the endpoint's backing.
+    /// A boot that reads only one of them has been told which half to go and
+    /// look at.
+    SrcSurfaceNotResident,
     /// The destination is a linear guest allocation, which has no mapping for a
     /// GPU-side copy to name.
     DstNotIOSurface,
@@ -3853,6 +3863,7 @@ impl GpuPlaneRefusal {
             Self::MultiLevel => "sl_gpu_multi_level",
             Self::SelfCopy => "sl_gpu_self_copy",
             Self::SrcNotResident => "sl_gpu_src_not_resident",
+            Self::SrcSurfaceNotResident => "sl_gpu_src_surface_no_resident",
             Self::DstNotIOSurface => "sl_gpu_dst_not_iosurface",
             Self::DstWindowUnresolved => "sl_gpu_dst_window",
             Self::PlaneOffset => "sl_gpu_plane_offset",
@@ -3860,6 +3871,27 @@ impl GpuPlaneRefusal {
             Self::FormatDiffers => "sl_gpu_format_differs",
         }
     }
+}
+
+/// Which account, if any, names a GPU resident holding this source's content.
+///
+/// The two rails answer differently and both are real, so this is a type rather
+/// than a `bool`: a `bool` collapsed the two *failures* into one counter, and a
+/// driven Maps boot that read `sl_gpu_src_not_resident` on every record could
+/// not say whether its sources were never surfaces or were surfaces with no
+/// resident published under them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GpuSourceAccount {
+    /// A writeback debt: the GPU holds newer content than the guest pages do.
+    Debt,
+    /// An IOSurface-backed texture with a live resident under its surface
+    /// identity, which is how the target-import rail names a source.
+    Surface,
+    /// No debt, and the source is not IOSurface-backed.
+    NoSurface,
+    /// No debt, the source is IOSurface-backed, and no resident stands under
+    /// its surface identity.
+    SurfaceWithoutResident,
 }
 
 /// Everything the GPU arm can decide before resolving anything.
@@ -3872,7 +3904,7 @@ fn gpu_whole_plane_admissible(
     slice_count: u16,
     source_ref: u32,
     destination_ref: u32,
-    source_is_resident: bool,
+    source: GpuSourceAccount,
 ) -> Result<(), GpuPlaneRefusal> {
     if level_count != 1 || slice_count != 1 {
         return Err(GpuPlaneRefusal::MultiLevel);
@@ -3880,10 +3912,11 @@ fn gpu_whole_plane_admissible(
     if source_ref == destination_ref {
         return Err(GpuPlaneRefusal::SelfCopy);
     }
-    if !source_is_resident {
-        return Err(GpuPlaneRefusal::SrcNotResident);
+    match source {
+        GpuSourceAccount::Debt | GpuSourceAccount::Surface => Ok(()),
+        GpuSourceAccount::NoSurface => Err(GpuPlaneRefusal::SrcNotResident),
+        GpuSourceAccount::SurfaceWithoutResident => Err(GpuPlaneRefusal::SrcSurfaceNotResident),
     }
-    Ok(())
 }
 
 /// Whether the resolved destination is the plane the GPU rail will actually
@@ -4020,6 +4053,7 @@ fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
         TextureBacking::Surface(t) => Some(t),
         _ => None,
     };
+    let source_is_surface = source_surface.is_some();
     let surface_source = source_surface.and_then(|t| {
         let identity = crate::runtime::present_identity::surface_identity(
             state,
@@ -4042,12 +4076,18 @@ fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
             },
         ))
     });
+    let account = match (debt.is_some(), surface_source.is_some(), source_is_surface) {
+        (true, _, _) => GpuSourceAccount::Debt,
+        (false, true, _) => GpuSourceAccount::Surface,
+        (false, false, true) => GpuSourceAccount::SurfaceWithoutResident,
+        (false, false, false) => GpuSourceAccount::NoSurface,
+    };
     if let Err(refusal) = gpu_whole_plane_admissible(
         level_count,
         slice_count,
         source_object,
         destination_object,
-        debt.is_some() || surface_source.is_some(),
+        account,
     ) {
         note_store_route(refusal.route());
         return None;

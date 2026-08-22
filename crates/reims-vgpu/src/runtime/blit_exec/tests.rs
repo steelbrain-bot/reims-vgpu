@@ -3046,29 +3046,44 @@ fn a_copy_refuses_a_view_chain_the_sample_arm_also_refuses() {
 fn the_gpu_whole_plane_arm_refuses_before_it_resolves_anything() {
     use GpuPlaneRefusal::*;
 
-    assert_eq!(gpu_whole_plane_admissible(1, 1, 4, 5, true), Ok(()));
     assert_eq!(
-        gpu_whole_plane_admissible(2, 1, 4, 5, true),
+        gpu_whole_plane_admissible(1, 1, 4, 5, GpuSourceAccount::Debt),
+        Ok(())
+    );
+    assert_eq!(
+        gpu_whole_plane_admissible(2, 1, 4, 5, GpuSourceAccount::Debt),
         Err(MultiLevel),
         "the arm copies one plane, not a mip chain"
     );
     assert_eq!(
-        gpu_whole_plane_admissible(1, 3, 4, 5, true),
+        gpu_whole_plane_admissible(1, 3, 4, 5, GpuSourceAccount::Debt),
         Err(MultiLevel),
         "nor an array slice run"
     );
     assert_eq!(
-        gpu_whole_plane_admissible(1, 1, 4, 4, true),
+        gpu_whole_plane_admissible(1, 1, 4, 4, GpuSourceAccount::Debt),
         Err(SelfCopy),
         "resolving the destination would pay away the source's own resident"
     );
     assert_eq!(
-        gpu_whole_plane_admissible(1, 1, 4, 5, false),
-        Err(SrcNotResident),
-        "with nothing owed the source's guest pages already hold its content"
+        gpu_whole_plane_admissible(1, 1, 4, 5, GpuSourceAccount::Surface),
+        Ok(()),
+        "an IOSurface source with a live resident needs no debt"
     );
     assert_eq!(
-        gpu_whole_plane_admissible(1, 1, 4, 4, false),
+        gpu_whole_plane_admissible(1, 1, 4, 5, GpuSourceAccount::NoSurface),
+        Err(SrcNotResident),
+        "with nothing owed and no surface the source's guest pages already hold \
+         its content"
+    );
+    assert_eq!(
+        gpu_whole_plane_admissible(1, 1, 4, 5, GpuSourceAccount::SurfaceWithoutResident),
+        Err(SrcSurfaceNotResident),
+        "a surface with no resident is a different answer from no surface, and \
+         the two must not share a counter"
+    );
+    assert_eq!(
+        gpu_whole_plane_admissible(1, 1, 4, 4, GpuSourceAccount::NoSurface),
         Err(SelfCopy),
         "the cheapest refusal that applies is the one reported, so the counters \
          partition rather than overlap"
@@ -3484,9 +3499,13 @@ fn a_whole_plane_copy_names_an_iosurface_source_by_its_surface_identity() {
     // `present: false` is the control. The source owes no writeback debt on
     // either arm, so the only thing that differs is the executor's answer, and
     // therefore the only thing the counters can be reading.
+    // The refused arm's route is the *surface* one: this source is
+    // IOSurface-backed, so "no resident stands under its identity" is a
+    // different answer from "it was never a surface", and the two must not
+    // share a counter.
     for (present, expected_route) in [
         (true, "sl_gpu_src_via_surface"),
-        (false, "sl_gpu_src_not_resident"),
+        (false, "sl_gpu_src_surface_no_resident"),
     ] {
         let (mut host, mut state) = blit_device();
         install_iosurface_texture(&mut host, &mut state, 2, 20, 0x40);
@@ -3517,7 +3536,7 @@ fn a_whole_plane_copy_names_an_iosurface_source_by_its_surface_identity() {
 
         let before = store_route_count(expected_route);
         let other = store_route_count(if present {
-            "sl_gpu_src_not_resident"
+            "sl_gpu_src_surface_no_resident"
         } else {
             "sl_gpu_src_via_surface"
         });
@@ -3543,7 +3562,7 @@ fn a_whole_plane_copy_names_an_iosurface_source_by_its_surface_identity() {
         );
         assert_eq!(
             store_route_count(if present {
-                "sl_gpu_src_not_resident"
+                "sl_gpu_src_surface_no_resident"
             } else {
                 "sl_gpu_src_via_surface"
             }),
