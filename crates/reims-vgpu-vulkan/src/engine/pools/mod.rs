@@ -2833,6 +2833,36 @@ const STAGING_MISS_EMIT_EVERY: u64 = 512;
 /// without changing what a stamp promises — not a number to tune this constant
 /// against.
 ///
+/// # That is no longer true on the unified pathway, and the counter says so
+///
+/// One driven fullscreen Maps boot, macos-13, x86/Vulkan Intel iGPU, banded to
+/// the driven windows:
+///
+/// ```text
+/// batch_flushes            42 101
+/// batch_readback_joins          0     (was 90.9 % of flushes)
+/// batch_flush_draws     2 551 497        60.6 draws per batch
+/// nojoin_batch_full        18 185     0.7 % of 2.55 M draws
+/// batch_tail_flushes       22 035     52 % of flushes
+/// ```
+///
+/// **`batch_readback_joins` is zero**, so the readback account above describes
+/// a rail this workload does not take at all — read it as history, not as the
+/// current cause. The ratio this doc tells you to check is 60.6 against a
+/// unified ceiling of 128, so the constant is still not what binds, and
+/// `nojoin_batch_full` at 0.7 % of draws says raising it would buy almost
+/// nothing. What ends a batch here is the drain tranche running out of work
+/// (`batch_tail_flushes`, about half of them).
+///
+/// Why that matters beyond this constant: `passmerge_no_join` equals
+/// `batch_flushes` exactly, 42 101 against 42 101, because a Vulkan render pass
+/// cannot span two command buffers. The guest opened 57 662 render encoders
+/// (`op0x37_n`) and this device opened about 98 900 passes, so the excess is
+/// the command-buffer boundaries and nothing else. A pass boundary is measured
+/// causally at roughly 100 µs of GPU on this host — `REIMS_VGPU_PASS_CHURN` on
+/// moved GPU per draw from 9.25 to 67.64 — which prices those 42 101 splits at
+/// about a fifth of the boot's whole GPU second.
+///
 /// Before changing this constant, read `batch_flush_draws / batch_flushes`
 /// against it — while the ratio sits far below, the ceiling is not the bound.
 /// # The bursty probe could not see this constant, and a sustained one can
