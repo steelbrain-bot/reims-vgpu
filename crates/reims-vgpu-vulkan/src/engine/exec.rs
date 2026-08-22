@@ -6723,6 +6723,7 @@ pub(crate) unsafe fn execute_draw_inner(
         ctx.device
             .cmd_begin_render_pass(cb, &rp_begin, vk::SubpassContents::INLINE);
         pools.note_pass_opened(echo);
+        unsafe { pools.gpu_span_pass_begin(ctx, cb) };
     }
     if pass_key.feedback_colors != 0 {
         // Order each feedback draw's reads after the preceding colour writes.

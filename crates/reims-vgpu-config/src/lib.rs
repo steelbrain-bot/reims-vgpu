@@ -801,6 +801,34 @@ pub const LAYOUT_CHURN: &str = "REIMS_VGPU_LAYOUT_CHURN";
 /// us/draw — excluded as slow, and a single such boot says nothing either.
 pub const PASS_CHURN: &str = "REIMS_VGPU_PASS_CHURN";
 
+/// **Probe, default off.** On, every render pass instance is stamped just inside
+/// its begin and just inside its end, so `gpu_span` can report `pass_us` — the
+/// GPU time spent *inside* pass instances — beside `busy_us`.
+///
+/// # What it is asking
+///
+/// The per-kind `gpu_span` columns tile `busy_us`, but they stop at the
+/// submission, and a draw submission on this rail carries tens of draws across
+/// several pass instances. A driven Maps boot reads as 100 % `draw_us`, which
+/// says nothing about whether the GPU second goes on drawing or on beginning and
+/// ending passes. `busy_us - pass_us` is that split, and it is the number that
+/// decides whether fewer pass boundaries is a lever worth building.
+///
+/// # Why it is a probe and not the default
+///
+/// The stamps are `BOTTOM_OF_PIPE`, which on some drivers is itself a pipeline
+/// marker that can serialise — the same class of cost the boundary is suspected
+/// of. Left on the shipping path it would add roughly two writes per pass
+/// instance to every submission and perturb `busy_us`, which is the headline
+/// number every ranking here is made on. An instrument that moves the column it
+/// is measuring is worse than no instrument, so this one is opt-in and a boot
+/// that turns it on should not have its `busy_us` quoted against a boot that did
+/// not.
+///
+/// Nothing the guest observes depends on it either way: it writes queries and
+/// reads them back, and no decision is taken on the result.
+pub const PASS_SPANS: &str = "REIMS_VGPU_PASS_SPANS";
+
 /// **Probe, default off.** On, every render pass's outgoing `VK_SUBPASS_EXTERNAL`
 /// dependency names only the attachment stages, instead of also naming
 /// `TRANSFER | FRAGMENT_SHADER` with `TRANSFER_READ | SHADER_READ`.
@@ -1086,7 +1114,7 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 24] = [
+pub const ALL: [&str; 25] = [
     COLOR_GENERAL,
     SLAB_RETAIN,
     GATHER_AUDIT_ALL,
@@ -1115,6 +1143,7 @@ pub const ALL: [&str; 24] = [
     GPU_SPANS,
     LAYOUT_CHURN,
     PASS_CHURN,
+    PASS_SPANS,
     FULLSCREEN,
 ];
 

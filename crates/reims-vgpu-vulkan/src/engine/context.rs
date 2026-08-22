@@ -414,12 +414,31 @@ pub(crate) struct DrawSpanProbe {
 }
 
 impl DrawSpanProbe {
-    /// Queries per ring slot: the top stamp and the bottom stamp.
-    pub const PER_SLOT: u32 = 2;
+    /// Render pass instances one slot command buffer can time.
+    ///
+    /// A pass instance cannot begin without a draw to record into it, and a
+    /// batch retains at most [`crate::policy::MAX_BATCH_DRAWS`] draws before it
+    /// flushes, so a slot command buffer cannot open more passes than this. The
+    /// region is therefore sized so the count cannot be exceeded rather than
+    /// bounded by a number, and there is no overflow to drop and no counter
+    /// owed for one.
+    pub const PASS_SPANS: u32 = crate::policy::MAX_BATCH_DRAWS as u32;
+
+    /// Queries per ring slot: the command buffer's own top and bottom stamp,
+    /// then one begin/end pair for each render pass instance it may open.
+    pub const PER_SLOT: u32 = 2 + 2 * Self::PASS_SPANS;
 
     /// First query index belonging to ring slot `slot`.
     pub const fn base(slot: usize) -> u32 {
         slot as u32 * Self::PER_SLOT
+    }
+
+    /// First query of the `i`th render pass instance's begin/end pair in `slot`.
+    ///
+    /// The pair sits after the command buffer's own two stamps, which is why
+    /// this is not `base(slot) + 2 * i`.
+    pub const fn pass_base(slot: usize, i: u32) -> u32 {
+        Self::base(slot) + 2 + 2 * i
     }
 }
 
@@ -2581,6 +2600,54 @@ mod draw_span_probe_tests {
             last + DrawSpanProbe::PER_SLOT,
             DrawSpanProbe::PER_SLOT * super::super::pools::RING_DEPTH as u32,
             "the pool is exactly as large as the ring needs"
+        );
+    }
+
+    /// Every pass pair a slot can write lands inside that slot's own region.
+    ///
+    /// This is the whole safety argument for widening the region: a slot's
+    /// queries are readable because *its* fence signalled, so a stamp written
+    /// past the end of the region would land in a slot whose fence says nothing
+    /// about it — the exact defect [`TimestampProbe`]'s doc records, arriving by
+    /// arithmetic instead of by sharing. `pass_base` is `base + 2 + 2i` rather
+    /// than `base + 2i`, and an off-by-one in either term fails here.
+    #[test]
+    fn every_pass_pair_lands_inside_its_own_slot_region() {
+        for slot in 0..super::super::pools::RING_DEPTH {
+            let region =
+                DrawSpanProbe::base(slot)..DrawSpanProbe::base(slot) + DrawSpanProbe::PER_SLOT;
+            for i in 0..DrawSpanProbe::PASS_SPANS {
+                let begin = DrawSpanProbe::pass_base(slot, i);
+                assert!(
+                    region.contains(&begin) && region.contains(&(begin + 1)),
+                    "slot {slot} pass {i} pair {begin}..={} escapes {region:?}",
+                    begin + 1
+                );
+                assert!(
+                    begin > DrawSpanProbe::base(slot) + 1,
+                    "pass pair {begin} overwrites slot {slot}'s own top or bottom stamp"
+                );
+            }
+        }
+    }
+
+    /// The region holds exactly as many pairs as a command buffer can open, so
+    /// the count cannot be exceeded rather than being bounded by a number.
+    ///
+    /// A pass instance needs a draw to record into it and a batch flushes at
+    /// [`crate::policy::MAX_BATCH_DRAWS`], so a slot command buffer cannot open
+    /// more than that many. Raising the batch ceiling without the region
+    /// following it would start dropping records; this is what says so.
+    #[test]
+    fn the_pass_region_holds_every_pass_a_command_buffer_can_open() {
+        assert_eq!(
+            u64::from(DrawSpanProbe::PASS_SPANS),
+            crate::policy::MAX_BATCH_DRAWS,
+        );
+        assert_eq!(
+            DrawSpanProbe::PER_SLOT,
+            2 + 2 * DrawSpanProbe::PASS_SPANS,
+            "the region is the two command-buffer stamps plus one pair per pass"
         );
     }
 

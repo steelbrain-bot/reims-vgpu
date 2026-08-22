@@ -425,6 +425,20 @@ pub(crate) struct EncoderPools {
     /// Unlike `last_pass`, this is executable state: every outside-pass command
     /// and every command-buffer end must close it first.
     open_pass: Option<PassEcho>,
+    /// The GPU-span query pool, remembered from the arm so the pass stamps can
+    /// be written from sites that hold only an `ash::Device`.
+    ///
+    /// Set by `gpu_span_arm`, which runs once immediately after
+    /// `vkBeginCommandBuffer` and therefore before any pass in that command
+    /// buffer can open. `None` on a host that writes no timestamps, which is
+    /// what makes every pass stamp a no-op there.
+    pass_probe: Option<vk::QueryPool>,
+    /// Index of the pass region pair whose begin stamp is written and whose end
+    /// stamp is not, i.e. the open pass instance's own pair.
+    ///
+    /// Paired with `open_pass` and cleared with it: a `Some` here without an
+    /// open pass would write an end stamp into a pair no begin belongs to.
+    pass_open_index: Option<u32>,
     /// Whether any command buffer recorded or submitted since the last quiesce
     /// **reads** guest RAM when it executes.
     ///
@@ -1027,6 +1041,14 @@ struct CmdSlot {
     /// probes are armed by different callers and a slot can carry either, both
     /// or neither. Set by `readback_span_arm`, cleared by the read at retire.
     readback_span_armed: bool,
+    /// Render pass instances this slot's command buffer both opened and closed,
+    /// and so the number of begin/end query pairs the retire may read.
+    ///
+    /// Only the written prefix of the slot's pass region is read: a pair the
+    /// command buffer never wrote was reset and never signalled, and asking for
+    /// it makes `vkGetQueryPoolResults` refuse the whole call rather than the
+    /// one query, which would drop the submission's own span with it.
+    pass_spans: u32,
 }
 
 /// In-flight ring depth: the next draw/dispatch records + submits while

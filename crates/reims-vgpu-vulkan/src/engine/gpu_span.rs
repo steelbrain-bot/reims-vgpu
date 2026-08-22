@@ -274,6 +274,10 @@ static UNREAD: AtomicU64 = AtomicU64::new(0);
 /// [`READ`], and `the_kinds_tile_the_total` is what keeps that true.
 static KIND_NS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
 static KIND_N: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+/// GPU nanoseconds spent *inside* render pass instances, and the number of
+/// instances that contributed. See [`GpuSpanWindow::pass_us`].
+static PASS_NS: AtomicU64 = AtomicU64::new(0);
+static PASS_N: AtomicU64 = AtomicU64::new(0);
 
 /// One census window of GPU-side submission timing.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -296,6 +300,22 @@ pub struct GpuSpanWindow {
     /// Submissions per [`Kind`], in [`Kind::ALL`] order. Sums to [`Self::read`]
     /// exactly.
     pub kind_n: [u64; KINDS],
+    /// GPU microseconds measured between the inside of a render pass instance's
+    /// begin and the inside of its end, summed over every instance read back
+    /// this window.
+    ///
+    /// This is a *part* of [`Self::busy_us`] and not another tiling of it: the
+    /// remainder, `busy_us - pass_us`, is everything a draw submission does
+    /// outside a pass instance, which is where a pass boundary's cost lands.
+    /// That split is the whole reason the column exists -- the per-[`Kind`]
+    /// tiling ends at the submission, and a draw submission carries tens of
+    /// draws across several passes, so it cannot say whether the GPU second
+    /// goes on drawing or on beginning and ending passes.
+    pub pass_us: u64,
+    /// Render pass instances whose pair was read back. Not comparable to
+    /// `passbegin_*`, which counts every instance begun; this counts only those
+    /// whose slot retired with both stamps readable.
+    pub pass_n: u64,
 }
 
 impl GpuSpanWindow {
@@ -329,6 +349,8 @@ pub fn take_window() -> Option<GpuSpanWindow> {
         unread: UNREAD.swap(0, Ordering::Relaxed),
         kind_us,
         kind_n,
+        pass_us: reims_vgpu_observe::phase_clock::to_us(PASS_NS.swap(0, Ordering::Relaxed)),
+        pass_n: PASS_N.swap(0, Ordering::Relaxed),
     };
     (armed > 0).then_some(w)
 }
@@ -356,6 +378,17 @@ pub(crate) fn note_busy_ns(kind: Kind, ns: u64) {
     MAX_NS.fetch_max(ns, Ordering::Relaxed);
     KIND_NS[kind as usize].fetch_add(ns, Ordering::Relaxed);
     KIND_N[kind as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// One render pass instance's GPU execution time, from the delta between the
+/// stamps written just inside its begin and just inside its end.
+///
+/// Charged separately from [`note_busy_ns`] because it is a part of that total
+/// rather than a peer of it: summing the two would double-count every
+/// microsecond a draw spends inside a pass.
+pub(crate) fn note_pass_ns(ns: u64) {
+    PASS_NS.fetch_add(ns, Ordering::Relaxed);
+    PASS_N.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Where a ring slot's arming stands, so a read cannot invent a sample out of a
@@ -457,6 +490,50 @@ mod tests {
             w.kind_us[Kind::Stamp as usize] > w.kind_us[Kind::Draw as usize],
             "{w:?}"
         );
+    }
+
+    /// Pass time is a part of `busy_us`, not a peer of it, so charging it must
+    /// leave the per-kind tiling exactly as it was.
+    ///
+    /// This is the invariant that stops `pass_us` being read as a sixth kind. If
+    /// it ever became one, `unattributed` would go non-zero and the column that
+    /// says the tiling closed would be reporting a bug in this module rather
+    /// than the workload — which is the failure `the_kinds_tile_the_total`
+    /// exists to catch and would then catch for the wrong reason.
+    #[test]
+    fn pass_time_is_part_of_busy_and_not_another_kind() {
+        let _ = take_window();
+        note_armed();
+        note_busy_ns(Kind::Draw, 10_000_000);
+        note_pass_ns(3_000_000);
+        note_pass_ns(1_000_000);
+        let w = take_window().expect("armed");
+        assert_eq!(w.unattributed(), 0, "{w:?}");
+        assert_eq!(w.kind_us.iter().sum::<u64>(), w.busy_us, "{w:?}");
+        assert_eq!(w.pass_n, 2, "{w:?}");
+        assert_eq!(
+            w.pass_us,
+            reims_vgpu_observe::phase_clock::to_us(4_000_000),
+            "{w:?}"
+        );
+        assert!(
+            w.pass_us < w.busy_us,
+            "pass time is spent inside the submission it is part of: {w:?}"
+        );
+    }
+
+    /// A window with no pass pairs reports zero rather than nothing, because the
+    /// difference between "no pass was timed" and "the passes took no time" is
+    /// the difference between an instrument that did not run and a device that
+    /// did no work — and `armed` already says which.
+    #[test]
+    fn a_window_without_pass_pairs_reports_zero_pass_time() {
+        let _ = take_window();
+        note_armed();
+        note_busy_ns(Kind::Draw, 5_000_000);
+        let w = take_window().expect("armed");
+        assert_eq!((w.pass_us, w.pass_n), (0, 0), "{w:?}");
+        assert!(w.busy_us > 0, "{w:?}");
     }
 
     /// `Kind::ALL` is the census's column order and the array index in one, so a

@@ -100,6 +100,19 @@ mod pass_echo_delta_order {
     }
 }
 
+/// Whether the pass-span probe is on. **Default off** — see
+/// [`reims_vgpu_config::PASS_SPANS`] for why an instrument that can serialise
+/// the pipeline it measures is not left on the shipping path.
+fn pass_spans_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            reims_vgpu_config::read(reims_vgpu_config::PASS_SPANS).0,
+            reims_vgpu_config::Switch::On
+        )
+    })
+}
+
 impl ResourcePools {
     /// End one guest allocation's backend lifetime after open submissions.
     pub(crate) unsafe fn retire_guest_import(
@@ -232,6 +245,8 @@ impl ResourcePools {
                 batch_max_draws: BATCH_MAX_DRAWS,
                 last_pass: None,
                 open_pass: None,
+                pass_probe: None,
+                pass_open_index: None,
                 guest_reads_in_flight: false,
                 guest_write_tokens_live: std::collections::HashMap::new(),
                 resident_pins_live: Vec::new(),
@@ -596,6 +611,7 @@ impl ResourcePools {
                         submission: SlotSubmission::HostOwned,
                         span: super::gpu_span::SlotSpan::Idle,
                         readback_span_armed: false,
+                        pass_spans: 0,
                     });
                 }
                 Err(e) => {
@@ -1103,11 +1119,18 @@ impl ResourcePools {
             gpu_span::note_unread();
         }
         let base = DrawSpanProbe::base(slot);
+        // The whole region, pass pairs included: a query's results are undefined
+        // until it is reset, and this is the one point in a slot command buffer
+        // that is guaranteed to be outside a render pass instance, which
+        // `vkCmdResetQueryPool` requires and `vkCmdWriteTimestamp` does not.
         ctx.device
             .cmd_reset_query_pool(cb, probe.pool, base, DrawSpanProbe::PER_SLOT);
         ctx.device
             .cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, probe.pool, base);
         self.encoder.slots[slot].span = gpu_span::SlotSpan::Armed(kind);
+        self.encoder.slots[slot].pass_spans = 0;
+        self.encoder.pass_open_index = None;
+        self.encoder.pass_probe = Some(probe.pool);
         gpu_span::note_armed();
     }
 
@@ -1137,6 +1160,56 @@ impl ResourcePools {
         );
         self.encoder.slots[slot].span = gpu_span::SlotSpan::Sealed(kind);
         gpu_span::note_sealed();
+    }
+
+    /// Stamp the inside of a render pass instance that has just begun, so the
+    /// GPU time it spends drawing can be told apart from the time the device
+    /// spends beginning and ending passes.
+    ///
+    /// Called immediately after `vkCmdBeginRenderPass`, so the stamp sits inside
+    /// the instance and the pass's own load operations fall before it. The
+    /// matching end stamp is written just inside `vkCmdEndRenderPass` by
+    /// [`Self::close_open_pass`]; `busy_us` less the sum of these pairs is what
+    /// the submission spent outside any pass.
+    ///
+    /// A no-op on a host that writes no timestamps, and on a command buffer that
+    /// was never armed -- in both cases there is no pair to complete, and
+    /// `pass_open_index` stays `None` so the close writes nothing either.
+    ///
+    /// # Safety
+    ///
+    /// `cb` must be the current slot's command buffer and recording.
+    pub(in crate::engine) unsafe fn gpu_span_pass_begin(
+        &mut self,
+        ctx: &DeviceContext,
+        cb: vk::CommandBuffer,
+    ) {
+        if !pass_spans_probe_enabled() {
+            return;
+        }
+        let Some(probe) = ctx.draw_spans.as_ref() else {
+            return;
+        };
+        let slot = self.encoder.cur;
+        if !matches!(self.encoder.slots[slot].span, gpu_span::SlotSpan::Armed(_)) {
+            return;
+        }
+        let index = self.encoder.slots[slot].pass_spans;
+        // Sized so this cannot be exceeded -- see `DrawSpanProbe::PASS_SPANS`.
+        // The guard is what keeps that true if the batch ceiling ever rises
+        // without the region following it, and it drops a record rather than
+        // writing outside the slot's own region into another slot's queries.
+        if index >= DrawSpanProbe::PASS_SPANS {
+            crate::telemetry::note_route("gpu_span_pass_region_full");
+            return;
+        }
+        ctx.device.cmd_write_timestamp(
+            cb,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            probe.pool,
+            DrawSpanProbe::pass_base(slot, index),
+        );
+        self.encoder.pass_open_index = Some(index);
     }
 
     /// [`Self::gpu_span_seal`] for the slot the caller is about to submit on its
@@ -1263,7 +1336,12 @@ impl ResourcePools {
         else {
             return;
         };
-        let mut ticks = [0u64; DrawSpanProbe::PER_SLOT as usize];
+        // Only the prefix the command buffer actually wrote. A pair it never
+        // opened was reset and never signalled, and `vkGetQueryPoolResults`
+        // refuses the whole call for one unavailable query, which would drop
+        // this submission's own span along with the pass pairs.
+        let spans = std::mem::take(&mut self.encoder.slots[slot].pass_spans);
+        let mut ticks = vec![0u64; 2 + 2 * spans as usize];
         if ctx
             .device
             .get_query_pool_results(
@@ -1275,6 +1353,9 @@ impl ResourcePools {
             .is_ok()
         {
             gpu_span::note_busy_ns(kind, probe.scale.elapsed_ns(ticks[0], ticks[1]));
+            for pair in ticks[2..].chunks_exact(2) {
+                gpu_span::note_pass_ns(probe.scale.elapsed_ns(pair[0], pair[1]));
+            }
         }
     }
 
@@ -1798,6 +1879,22 @@ impl ResourcePools {
             open.cb, cb,
             "open render pass belongs to another command buffer"
         );
+        // Inside the instance, matching the begin stamp, so the delta is the
+        // pass's own execution and not the boundary either side of it.
+        if let (Some(pool), Some(index)) =
+            (self.encoder.pass_probe, self.encoder.pass_open_index.take())
+        {
+            let slot = self.encoder.cur;
+            unsafe {
+                device.cmd_write_timestamp(
+                    open.cb,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    pool,
+                    DrawSpanProbe::pass_base(slot, index) + 1,
+                )
+            };
+            self.encoder.slots[slot].pass_spans = index + 1;
+        }
         unsafe { device.cmd_end_render_pass(open.cb) };
     }
 
@@ -1822,6 +1919,13 @@ impl ResourcePools {
         debug_assert!(
             self.encoder.open_pass.is_none(),
             "forgetting an open render pass"
+        );
+        // The pass span pair is opened and closed with `open_pass` itself, so
+        // this must already hold. Asserted rather than cleared: clearing here
+        // would hide a begin stamp that never got its end.
+        debug_assert!(
+            self.encoder.pass_open_index.is_none(),
+            "forgetting a render pass whose span pair was never closed"
         );
         self.encoder.last_pass = None;
         self.encoder.cb_graphics.cb = None;
@@ -5282,6 +5386,7 @@ mod recycle_tests {
             submission: SlotSubmission::HostOwned,
             span: super::gpu_span::SlotSpan::Idle,
             readback_span_armed: false,
+            pass_spans: 0,
         }
     }
 
@@ -5293,6 +5398,7 @@ mod recycle_tests {
             submission: SlotSubmission::HostOwned,
             span: super::gpu_span::SlotSpan::Idle,
             readback_span_armed: false,
+            pass_spans: 0,
         }
     }
 

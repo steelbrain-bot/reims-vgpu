@@ -3522,6 +3522,26 @@ fn emit_draw_phase(executor: &dyn crate::runtime::executor::Executor) {
 /// by `draw_phase draws` or by the kind's own `*_n` before comparing two arms —
 /// the writeback's own positive control halved the frame rate and lowered
 /// `busy_us` by 48 % while per-submission GPU cost moved 1.5 %.
+/// # `pass_us` splits the GPU second where the kinds cannot
+///
+/// The per-[`Kind`] columns tile `busy_us`, but they stop at the submission, and
+/// a draw submission on this rail carries tens of draws across several render
+/// pass instances. So the tiling can say the GPU second is all `draw_us` — it
+/// reads exactly that on a driven Maps boot — while saying nothing about
+/// whether that second goes on drawing or on beginning and ending passes.
+///
+/// `pass_us` is the time stamped *inside* pass instances, so it is a part of
+/// `busy_us` and not a peer of it. Read the remainder:
+///
+/// ```text
+/// pass_us              inside pass instances: the draws themselves
+/// busy_us - pass_us    outside them: pass boundaries and non-pass work
+/// ```
+///
+/// That remainder is the number that says whether fewer pass boundaries is a
+/// lever worth building. `pass_n` is its denominator, and it counts instances
+/// whose slot retired with both stamps readable — not `passbegin_*`, which
+/// counts every instance begun.
 fn emit_gpu_span(executor: &dyn crate::runtime::executor::Executor) {
     let Some(w) = executor.gpu_span_window() else {
         return;
@@ -3529,7 +3549,8 @@ fn emit_gpu_span(executor: &dyn crate::runtime::executor::Executor) {
     crate::observe::off(format!(
         "gpu_span busy_us={} busy_max_us={} read={} armed={} sealed={} unread={} \
          unattributed={} draw_us={} draw_n={} store_us={} store_n={} \
-         readback_us={} readback_n={} compute_us={} compute_n={} stamp_us={} stamp_n={}",
+         readback_us={} readback_n={} compute_us={} compute_n={} stamp_us={} stamp_n={} \
+         pass_us={} pass_n={}",
         w.busy_us,
         w.busy_max_us,
         w.read,
@@ -3547,6 +3568,8 @@ fn emit_gpu_span(executor: &dyn crate::runtime::executor::Executor) {
         w.kind_n[3],
         w.kind_us[4],
         w.kind_n[4],
+        w.pass_us,
+        w.pass_n,
     ));
 }
 
