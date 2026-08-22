@@ -300,21 +300,52 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                             c0.target_gva(),
                             c0.texture_ref,
                         );
-                        if let Some(key) = crate::runtime::writeback_debt::resource_key(
+                        // The Store is recorded first because recording it is
+                        // what advances the resource's content version, and the
+                        // witness has to be stamped with the version this Store
+                        // leaves behind rather than the one it replaced. Stamped
+                        // the other way round the entry is stale the moment it is
+                        // written and `reach` answers `GuestWrote` forever.
+                        let stored = record_materialized_store(
                             state,
                             req.task_id,
                             c0.texture_ref,
-                        )
-                        .and_then(|resource| {
-                            crate::runtime::gva_store_witness::GvaTargetKey::of(resource, &identity)
-                        }) {
-                            crate::runtime::gva_store_witness::note_store(
-                                state,
-                                key,
-                                pages.pages(),
-                            );
+                            submission,
+                        );
+                        match stored {
+                            Some(version) => {
+                                if let Some(key) = crate::runtime::writeback_debt::resource_key(
+                                    state,
+                                    req.task_id,
+                                    c0.texture_ref,
+                                )
+                                .and_then(|resource| {
+                                    crate::runtime::gva_store_witness::GvaTargetKey::of(
+                                        resource, &identity,
+                                    )
+                                }) {
+                                    let guest_write =
+                                        reims_vgpu_core::ResourceWriteStamp::Resolved {
+                                            resource: key.resource,
+                                            version,
+                                        };
+                                    crate::runtime::gva_store_witness::note_store(
+                                        state,
+                                        key,
+                                        pages.pages(),
+                                        guest_write,
+                                    );
+                                }
+                            }
+                            // No version means no Store was recorded against the
+                            // resource, so there is nothing for a witness entry to
+                            // vouch for. Named rather than dropped, because a rail
+                            // that stops stamping stops eliding and that reads as a
+                            // slowdown with no cause.
+                            None => {
+                                crate::runtime::drain::note_store_route("gvaw_no_store_version")
+                            }
                         }
-                        record_materialized_store(state, req.task_id, c0.texture_ref, submission);
                         true
                     })
                 });
@@ -934,16 +965,23 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
 /// direct guest write. Those choices affect transfer cost only; all have a
 /// same bytes in the guest replica. A direct imported write may still be owned
 /// by the executor's fence ledger; all access to those bytes settles that debt.
+///
+/// The content version this Store produced is returned rather than discarded,
+/// because [`crate::runtime::gva_store_witness::note_store`] has to stamp its
+/// entry with the version the Store leaves behind and this is the only place
+/// that knows it. Recording the Store is what advances that version, so a
+/// caller that stamps the witness first captures the version this replaced.
 fn record_materialized_store(
     state: &mut Device,
     task_id: u32,
     texture_ref: u32,
     submission: reims_vgpu_protocol::SubmissionId,
-) {
-    let _ = state
+) -> Option<reims_vgpu_protocol::ContentVersion> {
+    state
         .task_objects
         .resources
-        .record_ordered_materialized_store(task_id, texture_ref, submission);
+        .record_ordered_materialized_store(task_id, texture_ref, submission)
+        .map(|(_resource, version)| version)
 }
 
 /// Guest pages the Vulkan draw's eager GVA fallback may write.

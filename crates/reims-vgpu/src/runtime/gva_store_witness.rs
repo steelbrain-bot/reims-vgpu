@@ -16,10 +16,28 @@ use crate::runtime::Device;
 pub use reims_vgpu_core::{GvaStoreWitness, GvaTargetKey, GvaWriteReach, HostWriteVerdict};
 
 /// Stamp a Store after its own page writes have been recorded.
-pub fn note_store(state: &mut Device, key: GvaTargetKey, gpas: &[u64]) {
-    let Some(guest_write) = state.resource_write_stamp_for(key.resource) else {
-        return;
-    };
+///
+/// `guest_write` is the resource content version this Store leaves behind, and
+/// it is a parameter rather than a read of the current stamp because the two
+/// are not the same value at every call site. `resource_write_stamp_for`
+/// answers the resource's *current* content version, and a GPU Store advances
+/// that version itself — `record_completed_gpu_store` returns the new one — so
+/// a rail that stamps the witness before recording its Store captures the
+/// version from before it and every later [`reach`] compares a bumped current
+/// against it and answers `GuestWrote`. Such an entry can never answer `Quiet`,
+/// which retires the resident and chained-seed shortcuts for that rail
+/// entirely while looking exactly like a guest that keeps rewriting its own
+/// target.
+///
+/// So each caller passes the version that belongs to the Store it is recording:
+/// the direct-landing rail passes the one its own Store returned, and the
+/// copy-out rail passes the current stamp, which nothing advances after it.
+pub fn note_store(
+    state: &mut Device,
+    key: GvaTargetKey,
+    gpas: &[u64],
+    guest_write: reims_vgpu_core::ResourceWriteStamp,
+) {
     let host_epoch = state.content.host_writes.epoch();
     if !state
         .content
@@ -82,6 +100,18 @@ mod tests {
         Device::new(DeviceId::default(), PAGE_SHIFT_X86)
     }
 
+    /// Stamp with the resource's current content version.
+    ///
+    /// What every caller did before the version became a parameter, and what
+    /// the copy-out rail still does. Returning early on an unnamed resource is
+    /// the old behaviour these tests were written against.
+    fn note_store_now(state: &mut Device, key: GvaTargetKey, gpas: &[u64]) {
+        let Some(guest_write) = state.resource_write_stamp_for(key.resource) else {
+            return;
+        };
+        note_store(state, key, gpas, guest_write);
+    }
+
     fn key(state: &Device, task_id: u32, texture_ref: u32) -> GvaTargetKey {
         GvaTargetKey {
             task_id,
@@ -94,13 +124,57 @@ mod tests {
         }
     }
 
+    /// The witness must be stamped with the version its Store *produced*, not
+    /// the one that Store replaced.
+    ///
+    /// A GPU Store advances the resource's content version itself, so a rail
+    /// that stamps before recording its Store captures the earlier version and
+    /// every later `reach` compares a bumped current against it. Such an entry
+    /// can never read `Quiet`, which silently retires the resident and
+    /// chained-seed shortcuts for that whole rail. Both halves are asserted
+    /// here so the ordering cannot regress to reading the same either way.
+    #[test]
+    fn a_store_stamped_with_the_version_it_replaced_can_never_read_quiet() {
+        let mut state = state();
+        let target = key(&state, 1, 7);
+        let replaced = state
+            .resource_write_stamp_for(target.resource)
+            .expect("a named resource has a content version");
+        state
+            .task_objects
+            .resources
+            .note_guest_write_by_id(target.resource);
+        let produced = state
+            .resource_write_stamp_for(target.resource)
+            .expect("a named resource has a content version");
+        assert_ne!(
+            replaced, produced,
+            "the bump this test is about did not happen"
+        );
+
+        note_store_now(&mut state, target, &[PAGE]);
+        assert_eq!(
+            reach(&state, target),
+            GvaWriteReach::Quiet,
+            "the version the Store leaves behind is the one that reads quiet"
+        );
+
+        note_store(&mut state, target, &[PAGE], replaced);
+        assert_eq!(
+            reach(&state, target),
+            GvaWriteReach::GuestWrote,
+            "stamping with the superseded version is the defect, and it reads \
+             exactly like a guest that rewrote its own target"
+        );
+    }
+
     #[test]
     fn decoded_guest_write_invalidates_only_its_resource() {
         let mut state = state();
         let a = key(&state, 1, 7);
         let b = key(&state, 1, 8);
-        note_store(&mut state, a, &[PAGE]);
-        note_store(&mut state, b, &[2 * PAGE]);
+        note_store_now(&mut state, a, &[PAGE]);
+        note_store_now(&mut state, b, &[2 * PAGE]);
         state
             .task_objects
             .resources
@@ -114,8 +188,8 @@ mod tests {
         let mut state = state();
         let a = key(&state, 1, 7);
         let b = key(&state, 2, 8);
-        note_store(&mut state, a, &[PAGE]);
-        note_store(&mut state, b, &[PAGE]);
+        note_store_now(&mut state, a, &[PAGE]);
+        note_store_now(&mut state, b, &[PAGE]);
         state.note_host_wrote_pages(vec![PAGE]);
         assert_eq!(
             reach(&state, a),
@@ -139,7 +213,7 @@ mod tests {
             height: 16,
             bgra: true,
         };
-        note_store(&mut state, unnamed, &[PAGE]);
+        note_store_now(&mut state, unnamed, &[PAGE]);
         assert_eq!(state.content.gva_stores.len(), 0);
         assert_eq!(reach(&state, unnamed), GvaWriteReach::NoEntry);
     }
@@ -148,7 +222,7 @@ mod tests {
     fn task_retirement_ends_witness_lifetime() {
         let mut state = state();
         let target = key(&state, 4, 12);
-        note_store(&mut state, target, &[PAGE]);
+        note_store_now(&mut state, target, &[PAGE]);
         state.content.gva_stores.retire_task(4);
         assert_eq!(reach(&state, target), GvaWriteReach::NoEntry);
     }

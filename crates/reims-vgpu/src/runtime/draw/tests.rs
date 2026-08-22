@@ -7405,7 +7405,10 @@ fn a_gva_span_no_store_has_stamped_refuses_the_resident_sample_rung() {
         // in the generation alone.
         bgra: true,
     };
-    note_store(&mut state, orphan, &gpas);
+    let orphan_write = state
+        .resource_write_stamp_for(orphan.resource)
+        .expect("the orphan names a live resource");
+    note_store(&mut state, orphan, &gpas, orphan_write);
     assert!(
         super::try_gva_resident_sample(&mut state, &mut host, 1, 7, &resource, &tex).is_none(),
         "a stale page set stamped at this address must not answer for the one that replaced it"

@@ -1590,7 +1590,11 @@ pub(crate) fn copy_resident_into_gva_plane<M: HostMemory + HostOps>(
             crate::runtime::gva_store_witness::GvaTargetKey::of(resource, identity)
         })
     {
-        crate::runtime::gva_store_witness::note_store(state, key, gpas);
+        // The copy-out rail: nothing advances the resource's content version
+        // after this point, so the current stamp is the one this Store leaves.
+        if let Some(guest_write) = state.resource_write_stamp_for(key.resource) {
+            crate::runtime::gva_store_witness::note_store(state, key, gpas, guest_write);
+        }
     }
     Ok(extent)
 }
