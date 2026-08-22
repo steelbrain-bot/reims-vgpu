@@ -326,6 +326,30 @@ pub(crate) enum Phase {
     /// pacer**, and the five CPU wins that bought no frames were not absorbed by
     /// `slot_us` — there was nothing to absorb them, because the guest sets the
     /// rate.
+    ///
+    /// # "The guest sets the rate" is true of that workload and not of this one
+    ///
+    /// The paragraph above is the correct account of the boots it was taken on,
+    /// and it does not generalize. Driven **fullscreen** Maps on the x86 iGPU
+    /// runs the drain worker at `busy_us/win` **0.94-0.95** with `gap_idle`
+    /// 0.05, against a GPU busy 0.37-0.41. There the worker *is* the pacer,
+    /// every microsecond taken out of a draw converts, and a CPU win that buys
+    /// no frames means something else is wrong.
+    ///
+    /// Two readings that follow, because both have misled a session here:
+    ///
+    /// - **Duty is `busy_us / win_ms`, not `draw_us / win_ms`.** The second is
+    ///   the encode span alone and reads about 0.7 on the same boots that are
+    ///   at 0.95.
+    /// - **GPU `us/draw` on this host is a price, not a cost.** It tracks the
+    ///   draw rate at r = -0.956 over thirteen boots while `gpu busy` stays
+    ///   flat — the governor clocks up when fed harder. Multiplying it by a
+    ///   target draw rate to derive a frame ceiling produces a number that
+    ///   assumes today's clocks survive a five-fold higher feed, and nothing
+    ///   has measured that.
+    ///
+    /// So read the workload before reading either paragraph: these are two
+    /// populations, and the pacer is not the same one in both.
     Slot = 1,
     /// What is left of the pipeline span once the five below are taken out of
     /// it: building the layout, pass and attribute keys, and resolving the load
