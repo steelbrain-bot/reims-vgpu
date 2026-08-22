@@ -1,23 +1,26 @@
 #!/usr/bin/env bash
 # Boot one x86 rail and run the Metal conformance battery inside the guest.
 #
-#   conformance-run.sh <outdir>
+#   run-guest.sh <outdir>
 #
-# The binary is built on a native Apple host (see the header of
-# conformance.swift) and cross-compiled for x86_64, so the guest needs no
+# The same source the oracle runs, on the paravirtual device. `run-native.sh`
+# builds the x86_64 fallback into conformance/build for the rails with no
 # developer tools -- `AGENTS.md` records that a guest-side build does not
 # degrade gracefully, it simply fails, and reports a build error that reads like
 # noise.
 #
-# Environment passes through, so an arm is `REIMS_VGPU_X=y conformance-run.sh ...`.
+# Environment passes through, so an arm is `REIMS_VGPU_X=y run-guest.sh ...`.
 set -uo pipefail
 export LC_ALL=C
-OUT="${1:?usage: conformance-run.sh <outdir>}"
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+OUT="${1:?usage: run-guest.sh <outdir>}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/.." && pwd)"
 RAIL="${RAIL:-macos-13}"
-BIN="$REPO/scripts/metal-conformance/conformance-x86_64"
+BIN="$HERE/build/conformance-x86_64"
 mkdir -p "$OUT"
-[ -x "$BIN" ] || { echo "no cross-built binary at $BIN"; exit 2; }
+# Not fatal: a rail with `swiftc` builds the suite itself, and only a rail
+# without one needs the cross-built fallback.
+[ -x "$BIN" ] || echo "conformance: no cross-built fallback at $BIN (run-native.sh makes it)"
 
 pkill -f 'qemu-system-x86_6[4].*reims-vgpu' 2>/dev/null
 for _ in $(seq 1 30); do
@@ -52,13 +55,14 @@ done
 # cross-build round trip from that loop. Where the rail has no compiler -- which
 # `AGENTS.md` records is the normal case, not the exception -- the cross-built
 # binary is what runs, and it is what makes the two hosts comparable.
-timeout 60 scp -o BatchMode=yes -q "$REPO/scripts/metal-conformance/conformance.swift" \
-  macos-vm:/tmp/conformance.swift
+timeout 120 ssh -o BatchMode=yes macos-vm 'rm -rf /tmp/conformance-src && mkdir -p /tmp/conformance-src'
+tar cf - -C "$HERE" suite | timeout 120 ssh -o BatchMode=yes macos-vm \
+  'cd /tmp/conformance-src && tar xf -'
 if timeout 120 ssh -o BatchMode=yes macos-vm 'command -v swiftc >/dev/null' 2>/dev/null; then
   echo "conformance: building in the guest"
-  timeout 600 ssh -o BatchMode=yes macos-vm \
-    'cd /tmp && swiftc -O conformance.swift -o conformance' >"$OUT/build.log" 2>&1 || {
-      echo "guest build failed; see $OUT/build.log"; }
+  timeout 900 ssh -o BatchMode=yes macos-vm \
+    'cd /tmp/conformance-src && swiftc -O suite/*.swift suite/cases/*.swift -o /tmp/conformance' \
+    >"$OUT/build.log" 2>&1 || { echo "guest build failed; see $OUT/build.log"; }
 fi
 timeout 120 ssh -o BatchMode=yes macos-vm 'test -x /tmp/conformance' 2>/dev/null || {
   timeout 60 scp -o BatchMode=yes -q "$BIN" macos-vm:/tmp/conformance || {

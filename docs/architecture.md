@@ -221,3 +221,12 @@ cargo clippy -p reims-vgpu --target aarch64-apple-darwin \
 
 Use types, constructors, dependency direction, and behavioral fixtures to preserve the seam. Do not
 add tests that parse repository source to police architecture by spelling.
+
+### The Metal conformance battery
+
+`conformance/` is a Swift battery that runs the **same source** on a native macOS host and inside
+the guest. Each case computes a value the CPU can predict exactly, asks the GPU for it, and
+compares, so a failure names the case and the bytes rather than "the screenshot looks wrong". The
+comparison between the two hosts is what makes a result usable: a case that fails in the guest and
+passes natively is a named device defect, and one that fails on both is a wrong expectation in the
+suite. `conformance/README.md` owns the details.

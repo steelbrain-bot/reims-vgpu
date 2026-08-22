@@ -192,5 +192,27 @@ CASE srt_cpu_seed_then_load_1000x40 PASS three loaded passes kept every texel th
 CASE srt_glyph_blend_60x32 PASS coverage type blended into a guest-backed layer, and the second pass kept the first
 CASE srt_glyph_blend_256x64 PASS coverage type blended into a guest-backed layer, and the second pass kept the first
 CASE srt_glyph_blend_1000x40 PASS coverage type blended into a guest-backed layer, and the second pass kept the first
-SUMMARY cases=194 failures=0 skipped=0
+CASE iosrt_draw_60x32 PASS the whole IOSurface-backed target is the drawn colour
+CASE iosrt_load_preserves_60x32 PASS the second pass added to what the first pass left
+CASE iosrt_scissor_keeps_rest_60x32 PASS the scissored write landed on exactly its own rows
+CASE iosrt_glyph_blend_60x32 PASS coverage type blended into an IOSurface layer, and the second pass kept the first
+CASE iosrt_draw_256x64 PASS the whole IOSurface-backed target is the drawn colour
+CASE iosrt_load_preserves_256x64 PASS the second pass added to what the first pass left
+CASE iosrt_scissor_keeps_rest_256x64 PASS the scissored write landed on exactly its own rows
+CASE iosrt_glyph_blend_256x64 PASS coverage type blended into an IOSurface layer, and the second pass kept the first
+CASE iosrt_draw_1000x40 PASS the whole IOSurface-backed target is the drawn colour
+CASE iosrt_load_preserves_1000x40 PASS the second pass added to what the first pass left
+CASE iosrt_scissor_keeps_rest_1000x40 PASS the scissored write landed on exactly its own rows
+CASE iosrt_glyph_blend_1000x40 PASS coverage type blended into an IOSurface layer, and the second pass kept the first
+CASE srt_cpu_write_then_sample_60x32 PASS a sampled bind saw the texels the CPU wrote after the GPU rendered
+CASE iosrt_cpu_write_then_sample_60x32 PASS a sampled bind saw the texels the CPU wrote after the GPU rendered
+CASE srt_cpu_write_then_sample_256x64 PASS a sampled bind saw the texels the CPU wrote after the GPU rendered
+CASE iosrt_cpu_write_then_sample_256x64 PASS a sampled bind saw the texels the CPU wrote after the GPU rendered
+CASE srt_cpu_write_then_sample_1000x40 PASS a sampled bind saw the texels the CPU wrote after the GPU rendered
+CASE iosrt_cpu_write_then_sample_1000x40 PASS a sampled bind saw the texels the CPU wrote after the GPU rendered
+CASE srt_blit_after_render_1024x768 PASS the copy moved what the render ahead of it had written
+CASE srt_blit_after_render_1920x1080 PASS the copy moved what the render ahead of it had written
+CASE srt_blit_pipelined_1024x768_x8 PASS every frame's copy moved that frame's own pixels
+CASE srt_blit_buffer_backed_512x512 PASS the copy out of a buffer-backed source moved what the render had written
+SUMMARY cases=216 failures=0 skipped=0
 DEVICE name=Apple M4 unified=true

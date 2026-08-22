@@ -632,6 +632,35 @@ do not generalize from one rail to another.
 - x86: `vm/boot-x86.sh --device reims-vgpu-pci --testing`, then
   `scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh -o /tmp/screen.png`
 
+### Ask the API before you photograph the screen
+
+`conformance/` is a Swift battery that runs the **same source** on a native macOS host and inside
+the guest. A rendering question answered by a screenshot names no seam — "labels absent" is what a
+wrong pitch, a wrong swizzle, a dropped dispatch, a lost mip level and an unordered host read all
+look like. A case here computes a value the CPU can predict exactly, asks the GPU for it, and
+compares, so a failure names the case, the bytes wanted and the bytes returned.
+
+**The native arm is what makes a guest failure a finding**, and neither arm means anything alone:
+
+| native | guest | meaning |
+|---|---|---|
+| PASS | FAIL | a named device defect |
+| FAIL | — | a wrong expectation in the suite, not a finding |
+
+So a guest failure is not reportable until the same case is green natively, and a case added to the
+battery is not finished until it has been run on both. `conformance/run-native.sh` is the oracle arm
+and `conformance/run-guest.sh` boots a rail and runs the same source against this device.
+
+Reach for it before a boot when the question is *what the API does*: a contract question, a format,
+a stride, an ordering rule, a rail with one case on it. Reach for a driven boot when the question is
+throughput, cadence or a whole compositor. The battery cannot see a frame and a frame cannot name a
+seam.
+
+**A case is a gate only if the broken arm loses it.** Three attempts at the regression case for the
+unordered host read passed on the broken build, which reads as evidence the defect is not real.
+Revert the fix and watch the new case fail before believing it gates anything —
+`conformance/README.md` carries what that one needed.
+
 ### Never score a frame by OCR. Look at it.
 
 **OCR may not decide anything about a frame.** Not a pass, not a fail, not a ranking between two

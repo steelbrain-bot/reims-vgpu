@@ -1,4 +1,4 @@
-# metal-conformance
+# conformance
 
 A self-verifying Metal battery that runs the same source on a native macOS host
 and inside the guest, and names the seam when the two disagree.
@@ -23,12 +23,12 @@ The comparison between the two hosts is the whole instrument:
 |---|---|---|
 | PASS | PASS | nothing to see |
 | PASS | FAIL | a named device defect |
-| FAIL | — | a wrong expectation in `conformance.swift`, not a finding |
+| FAIL | — | a wrong expectation in the suite, not a finding |
 | — | SKIP | the device's own reported limits make the case inexpressible |
 
-`baseline-native.txt` is the native run. Re-record it whenever a case is added,
-on an Apple host, and never treat a guest failure as a finding until the same
-case is green there.
+`baselines/` holds the native runs, one file per oracle host. Re-record whenever
+a case is added, and never treat a guest failure as a finding until the same case
+is green natively.
 
 A `SKIP` is not a soft failure. `minimumLinearTextureAlignment` is 16 on an
 M-series device and 256 on Apple's paravirtual one, so a literal pitch from a
@@ -36,28 +36,61 @@ guest census is not expressible on every host — Metal itself rejects the
 descriptor. The battery also derives padded pitches from whatever the running
 device reports, so every host runs padded-pitch cases whatever its limit.
 
-## Running it
+## Where things live
 
-Native, on a macOS host:
-
-```sh
-swiftc -O conformance.swift -o conf && ./conf
+```
+conformance/
+  suite/
+    main.swift        every case invocation, and nothing else
+    Harness.swift     report/counters, the device and queue
+    Shaders.swift     the one Metal source string
+    Support.swift     the library, pipelines, readback, helpers
+    cases/*.swift     the case bodies, one file per rail or family
+  baselines/          native runs, one per oracle host
+  expectations/       failures the guest is known to have
+  run-native.sh       build and run on the oracle
+  run-guest.sh        boot a rail and run the same source in the guest
+  build/              binaries; gitignored
 ```
 
-In the guest, from the repository root — this boots a rail, runs the battery and
-collects the device's own fail log beside the results:
+**Swift permits top-level statements in `main.swift` alone**, which is what makes
+the split worth having: a case body physically cannot invoke itself, so the
+invocation list is one file a reader can count against the parameter grid. The
+"a case nobody called reports nothing" trap below is closed by construction.
+`dev`, `queue` and `library` are globals initialised by a closure for the same
+reason — they were top-level `guard`s and a top-level `do`/`catch` when this was
+one file, and neither form is legal outside `main.swift`.
+
+Declaration order across files does not matter in Swift, so a case file may use
+anything in `Support.swift` and vice versa. Adding a case is: a function in the
+right `cases/` file, and a call in `main.swift`.
+
+## Running it
+
+Native, on the oracle — this also cross-builds the x86_64 fallback:
 
 ```sh
-scripts/metal-conformance/conformance-run.sh /tmp/conf-out
+conformance/run-native.sh
+```
+
+`ORACLE=<ssh-host>` names the machine; it needs Xcode's command line tools and
+nothing else.
+
+In the guest — this boots a rail, runs the battery and collects the device's own
+fail log beside the results:
+
+```sh
+conformance/run-guest.sh /tmp/conf-out
 ```
 
 Environment passes through, so an arm is
-`REIMS_VGPU_GUEST_IMPORT=off scripts/metal-conformance/conformance-run.sh /tmp/conf-off`.
+`REIMS_VGPU_GUEST_IMPORT=off conformance/run-guest.sh /tmp/conf-off`.
 `RAIL=macos-11 …` picks a rail.
 
 The runner builds in the guest where the rail has `swiftc` and otherwise ships
-`conformance-x86_64`, a Mach-O built on an Apple host. Rails without developer
-tools are the normal case, so keep that binary current when a case is added.
+`build/conformance-x86_64`, a Mach-O built on an Apple host. Rails without
+developer tools are the normal case, so re-run `run-native.sh` when a case is
+added.
 
 ## A refusal is not a mismatch, and the kernel is what says which
 
@@ -94,7 +127,7 @@ Two consequences when adding a case:
 
 ## Reading it beside the device log
 
-`conformance-run.sh` copies `/tmp/reims-vgpu-fail.log` to `device.log` in the
+`run-guest.sh` copies `/tmp/reims-vgpu-fail.log` to `device.log` in the
 output directory. A case that fails with a refusal in that log is an
 unimplemented rail refusing by name; a case that fails with *nothing* in the log
 is silent loss, which is the worse of the two and the one worth chasing first.

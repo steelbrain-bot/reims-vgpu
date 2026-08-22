@@ -67,6 +67,5 @@ Vulkan-Headers/
 *.profraw
 *.profdata
 
-# Built on a native Apple host by scripts/metal-conformance; regenerate, do not commit.
-scripts/metal-conformance/conformance-x86_64
-scripts/metal-conformance/conf-native
+# Conformance binaries, built from conformance/suite; regenerate, do not commit.
+conformance/build/
