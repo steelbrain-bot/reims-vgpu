@@ -24,6 +24,30 @@
 #      after the probe reports success, so `probe exit=0` is not a clean boot
 #      and this verdict outranks it.
 #
+# This probe produces TWO workload populations and does not say which one a
+# boot landed in. Classify before comparing any two boots, the same way a
+# macos-13 boot must be classified by present rate first -- this is a second,
+# unrelated split, by scene rather than by VBL latch:
+#
+#   dense   ~62 pages per visibility read set, ~4000-5200 draws/frame, ~6-7 fps
+#   sparse  ~39 pages per visibility read set, ~1800 draws/frame,     ~15 fps
+#
+# Every per-draw number differs about twofold between them -- `rb_visibility`
+# in particular tracks pages-per-set almost exactly, because that phase IS the
+# page walk. Six interleaved boots of two arms put one sparse boot in the base
+# arm, and reading it beside the dense ones makes the base arm look 2x better
+# on a phase neither arm changed.
+#
+# The discriminator is pages-per-set, summed over the census windows (these
+# counters are in the `windowed` group and reset each window, so they must be
+# summed and not sampled):
+#
+#   guest_visibility_read_pages / guest_visibility_read_sets
+#
+# draws/frame works too and needs no counter knowledge. Do not use present_hz:
+# it separates the populations here only because they draw different amounts,
+# and AGENTS.md already forbids ranking frames without draws/frame beside them.
+#
 # Environment passes through, so an arm is `REIMS_VGPU_X=y maps-run.sh ...`.
 set -uo pipefail
 export LC_ALL=C
