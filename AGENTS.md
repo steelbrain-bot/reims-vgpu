@@ -1151,6 +1151,37 @@ Only a live device creates `/tmp/reims-vgpu-fail.log`, so waiting on it catches 
 killing any surviving QEMU first avoids the race. Confirm afterwards that the log is a boot's and
 not the test suite's, by the presence of `store_routes`/`present_page_identity`.
 
+### Band to the driven windows before computing anything per draw
+
+A boot's log holds the ramp, the driven band and the post-probe idle, and a
+whole-boot total mixes all three. Keep only `drain_duty` windows with
+`draws > 0` **and** `duty >= 0.5`, and join every other census to them by `t=`.
+
+The error is not small and it does not look like an error. On one driven
+fullscreen Maps boot the whole-boot arithmetic read `gap_idle_us` at **41.8
+us/draw** -- idle windows contribute idle time and no draws -- which says the
+drain worker is idle two thirds of the time on a rail where the banded duty is
+0.92. It also moved `proc_us` from a banded 22.14 to 23.98. Both readings are
+self-consistent and both are wrong in the direction that reads as a device
+result. The duty distribution over windows with draws is min 0.005, p25 0.099,
+median 0.818, p75 0.966: the low quartile is the boot ramp, not the device
+idling under load.
+
+**Rank throughput on draws per driven second, not on `present_hz`.** Draws per
+frame is the workload and it drifts between boots of one binary by more than the
+effects measured here -- 2 456 to 3 804 across six boots of two arms -- so a
+frame count is comparable only with draws-per-frame quoted beside it, and
+`fps = draws_per_sec / draws_per_frame` is the identity that says why. Summing
+`host_window_cadence` over a *wall-clock range* spanning the band is not a fix:
+the range includes the undriven windows between driven ones.
+
+This is the rule that hid a real +6.4 % arm. Six interleaved boots were scored
+on whole-boot `present_hz`, came back overlapping, and were written off as
+buying no frames; rebanded, the same boots are **disjoint** on both
+`draws/driven-sec` and `proc_us`. `scripts/`-adjacent harnesses should band, and
+a number quoted without saying it was banded should be re-derived before it is
+believed.
+
 ### A boot measured next to your own subagents measures the contention
 
 Every `us=` number this device reports is wall clock on a shared machine, so a driven boot taken
