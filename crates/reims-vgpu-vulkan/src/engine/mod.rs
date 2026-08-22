@@ -1658,9 +1658,38 @@ struct GuestWriteFootprint {
     runs: Vec<(u64, u64)>,
     /// Whether `runs` still describes `page_counts`.
     runs_stale: bool,
+    /// What this ledger last answered for a read footprint, while the ledger
+    /// has not changed.
+    ///
+    /// The answer for one footprint is a pure function of that footprint and
+    /// the armed set, so it stays true for exactly as long as the armed set
+    /// does. **The invalidation is the clear**: every edit that makes `runs`
+    /// stale empties this in the same breath, so there is no version number
+    /// here that could drift out of step with the thing it versions. A stale
+    /// entry would answer `Disjoint` for a reader that overlaps and drop a
+    /// barrier silently, which is the failure class this device has paid the
+    /// most for.
+    ///
+    /// Keyed by the footprint itself rather than by a hash of it.
+    /// `GuestPageSet`'s equality is pointer identity *or* a full comparison, so
+    /// a fingerprint collision resolves to the exact answer instead of a wrong
+    /// one, and holding the key alive means no freed allocation's address can
+    /// return as a different set.
+    ///
+    /// Unbounded by policy, and bounded in fact by how often the guest submits:
+    /// entries live from one ledger edit to the next, which a driven fullscreen
+    /// Maps boot measures at ~19 000 edits against ~1.36 M draws.
+    reach_memo: std::collections::HashMap<reims_vgpu_memory::GuestPageSet, bool>,
 }
 
 impl GuestWriteFootprint {
+    /// Every edit that invalidates a derived view goes through here, so a new
+    /// edit site cannot update one and forget the other.
+    fn invalidate_derived(&mut self) {
+        self.runs_stale = true;
+        self.reach_memo.clear();
+    }
+
     /// The armed pages as sorted, coalesced, inclusive runs.
     fn runs(&mut self) -> &[(u64, u64)] {
         if self.runs_stale {
@@ -1732,6 +1761,7 @@ fn arm_guest_write_pages(pages: reims_vgpu_memory::GuestWritePages) -> Option<Gu
     };
     let Some(next) = f.next.checked_add(1) else {
         f.unnamed = true;
+        f.invalidate_derived();
         signals.guest_write_debt.store(true, Ordering::Release);
         return None;
     };
@@ -1743,7 +1773,7 @@ fn arm_guest_write_pages(pages: reims_vgpu_memory::GuestWritePages) -> Option<Gu
     for &page in pages.pages() {
         *f.page_counts.entry(page).or_default() += 1;
     }
-    f.runs_stale = true;
+    f.invalidate_derived();
     f.armed.insert(token, pages);
     signals.guest_write_debt.store(true, Ordering::Release);
     Some(token)
@@ -1778,7 +1808,7 @@ fn retire_guest_write_pages(tokens: &[GuestWriteToken]) {
                 });
                 if remove {
                     f.page_counts.remove(&page);
-                    f.runs_stale = true;
+                    f.invalidate_derived();
                 }
             }
         }
@@ -1800,6 +1830,12 @@ fn clear_guest_write_pages_for(signals: &SessionSignals) {
         f.armed.clear();
         f.page_counts.clear();
         f.runs.clear();
+        // Defensive rather than load-bearing, and deliberately kept: an ask
+        // against an empty ledger returns `Unnamed` before reaching the memo,
+        // and the next arm invalidates it, so no stale entry is reachable
+        // through here. Removing this line does not fail the memo's own test
+        // for that reason -- which is why the line says so instead of the test.
+        f.reach_memo.clear();
         f.runs_stale = false;
         f.unnamed = false;
     };
@@ -1823,6 +1859,46 @@ pub fn guest_writes_reaching(pages: &[u64]) -> GuestWriteReach {
 /// A draw commonly reads many guest-backed descriptors. Treating them as one
 /// question avoids both a per-descriptor lock and an allocated union while
 /// preserving exact physical-page membership.
+/// Compare several canonical read footprints with the write ledger under one
+/// lock, remembering each footprint's answer until the ledger changes.
+///
+/// The same question as [`guest_writes_reaching_sets`], asked by the draw path,
+/// which holds `GuestPageSet`s rather than loose page numbers and asks about the
+/// same handful of descriptors thousands of times between two ledger edits.
+/// Walking a read set costs a pass over one page number per page -- ~518 pages
+/// a draw on a driven fullscreen Maps boot, or ~4 KiB of mostly-cold memory to
+/// answer `Disjoint` almost every time. The walk is unavoidable once; repeating
+/// it for an unchanged question against an unchanged ledger is not.
+pub fn guest_writes_reaching_footprints<'a>(
+    sets: impl IntoIterator<Item = &'a reims_vgpu_memory::GuestPageSet>,
+) -> GuestWriteReach {
+    let signals = current_session_signals();
+    let Ok(mut f) = signals.guest_write_pages.lock() else {
+        return GuestWriteReach::Unnamed;
+    };
+    if f.armed.is_empty() || f.unnamed {
+        return GuestWriteReach::Unnamed;
+    }
+    f.runs();
+    let GuestWriteFootprint {
+        runs, reach_memo, ..
+    } = &mut *f;
+    for set in sets {
+        let meets = match reach_memo.get(set) {
+            Some(&answer) => answer,
+            None => {
+                let answer = read_set_meets_runs(runs, set.pages());
+                reach_memo.insert(set.clone(), answer);
+                answer
+            }
+        };
+        if meets {
+            return GuestWriteReach::Overlap;
+        }
+    }
+    GuestWriteReach::Disjoint
+}
+
 pub fn guest_writes_reaching_sets<'a>(
     sets: impl IntoIterator<Item = &'a [u64]>,
 ) -> GuestWriteReach {
@@ -5748,6 +5824,66 @@ mod guest_write_footprint_tests {
             );
         }
         retire_guest_write_pages(&[token]);
+        clear_guest_write_pages();
+    }
+
+    /// The memoized arm must agree with the unmemoized one after *every* ledger
+    /// edit, which is the only property that can catch a missed invalidation.
+    ///
+    /// A memo entry that outlives the armed set it was computed against answers
+    /// `Disjoint` for a reader that overlaps, and the caller then drops a
+    /// barrier -- silently, with no counter moving. So this does not check the
+    /// answer at one point in time; it drives a sequence of arms, retires and
+    /// clears and re-asks the same footprints after each step, comparing
+    /// against `guest_writes_reaching`, which never consults the memo.
+    #[test]
+    fn the_memoized_answer_tracks_every_ledger_edit() {
+        clear_guest_write_pages();
+
+        let windows: Vec<Vec<u64>> = vec![
+            vec![0x1000],
+            vec![0x2000, 0x3000],
+            vec![0x5000],
+            vec![0x8000, 0x9000, 0xa000],
+            vec![0xf000],
+        ];
+        let sets: Vec<reims_vgpu_memory::GuestPageSet> = windows
+            .iter()
+            .map(|pages| reims_vgpu_memory::GuestPageSet::new(pages).expect("non-empty"))
+            .collect();
+
+        let check = |step: &str| {
+            for (set, pages) in sets.iter().zip(windows.iter()) {
+                assert_eq!(
+                    guest_writes_reaching_footprints(std::iter::once(set)),
+                    guest_writes_reaching(pages),
+                    "memo disagrees with a fresh walk for {pages:#x?} after {step}"
+                );
+            }
+        };
+
+        // Warm every entry against an armed ledger, then edit underneath it.
+        let a = arm(&[0x2000]);
+        check("arm a");
+
+        // A second arm must invalidate: 0x5000 was answered Disjoint above and
+        // is about to become armed.
+        let b = arm(&[0x5000, 0x8000]);
+        check("arm b");
+
+        // A retire must invalidate in the other direction: a footprint that
+        // answered Overlap has to go back to Disjoint.
+        retire_guest_write_pages(&[b]);
+        check("retire b");
+
+        clear_guest_write_pages();
+        check("clear");
+
+        // And once more from empty, to prove the clear did not leave a memo
+        // that survives into the next armed generation.
+        let c = arm(&[0x1000, 0xf000]);
+        check("arm c after clear");
+        retire_guest_write_pages(&[a, c]);
         clear_guest_write_pages();
     }
 

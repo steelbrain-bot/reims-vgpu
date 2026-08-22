@@ -1290,12 +1290,7 @@ pub(super) fn imported_guest_visibility(
     if pages.is_empty() || pages.iter().any(|pages| pages.is_none()) {
         return ImportedGuestVisibility::GpuUnknown;
     }
-    let reach = super::guest_writes_reaching_sets(
-        pages
-            .iter()
-            .filter_map(Option::as_ref)
-            .map(reims_vgpu_memory::GuestPageSet::pages),
-    );
+    let reach = super::guest_writes_reaching_footprints(pages.iter().filter_map(Option::as_ref));
     match reach {
         reims_vgpu_core::GuestWriteReach::Overlap => ImportedGuestVisibility::GpuOverlap,
         reims_vgpu_core::GuestWriteReach::Disjoint => ImportedGuestVisibility::HostOnly,
