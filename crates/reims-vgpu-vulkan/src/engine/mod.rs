@@ -1703,6 +1703,42 @@ fn read_set_meets_runs(runs: &[(u64, u64)], pages: &[u64]) -> bool {
         .any(|&page| page >= lo && page <= hi && run_holds(runs, page))
 }
 
+/// Whether a **sorted, deduped** read set names any page in `runs`.
+///
+/// The same question as [`read_set_meets_runs`], answered in one forward walk
+/// because both sides ascend. Each cursor only moves forward, so the whole ask
+/// costs `pages + runs` steps of sequential memory instead of one binary search
+/// per page into a vector the page order jumps around in.
+///
+/// **The caller's type is what makes this legal.** A `GuestPageSet` is sorted
+/// and deduped by construction and a `&[u64]` is not, which is why the draw
+/// path — whose sets are always the former — reaches this and the host-read
+/// settle path, whose pages arrive in allocation order, keeps the twin above.
+/// A merge that quietly required sorted input would answer wrongly for that
+/// caller and would do it silently, so the requirement is carried by the
+/// signature of what asks rather than by a comment asking callers to be careful.
+fn sorted_read_set_meets_runs(runs: &[(u64, u64)], pages: &[u64]) -> bool {
+    let mut cursor = 0usize;
+    for &page in pages {
+        // Retire every run ending below this page. Pages ascend, so a run
+        // dropped here cannot hold any later page either.
+        while runs.get(cursor).is_some_and(|&(_, end)| end < page) {
+            cursor += 1;
+        }
+        let Some(&(start, end)) = runs.get(cursor) else {
+            // Past the last run, and every remaining page is larger still.
+            return false;
+        };
+        if page >= start && page <= end {
+            return true;
+        }
+        // `page < start`: this page sits in the gap below the run the cursor
+        // now names. Leave the cursor where it is — the next page may land in
+        // that same run.
+    }
+    false
+}
+
 /// Whether one of `runs` covers `page`. `runs` is ascending and disjoint.
 fn run_holds(runs: &[(u64, u64)], page: u64) -> bool {
     runs.binary_search_by(|&(start, end)| {
@@ -1815,17 +1851,18 @@ fn clear_guest_write_pages_for(signals: &SessionSignals) {
 /// `pages` need not be sorted; it is the reader's window and is usually a
 /// handful of entries against a whole frame's worth here.
 pub fn guest_writes_reaching(pages: &[u64]) -> GuestWriteReach {
-    guest_writes_reaching_sets(std::iter::once(pages))
+    // The per-page walk, because these pages arrive in allocation order.
+    write_ledger_reach(|runs| read_set_meets_runs(runs, pages))
 }
 
-/// Compare several read windows with the write ledger under one lock.
+/// Put one membership question to the write ledger under its lock.
 ///
-/// A draw commonly reads many guest-backed descriptors. Treating them as one
-/// question avoids both a per-descriptor lock and an allocated union while
-/// preserving exact physical-page membership.
-pub fn guest_writes_reaching_sets<'a>(
-    sets: impl IntoIterator<Item = &'a [u64]>,
-) -> GuestWriteReach {
+/// Both entry points ask the same three things before any walk happens — is the
+/// ledger readable, does it name anything, and does it name something it cannot
+/// describe — and the walk is the only part that differs between them. Sharing
+/// the approach rather than copying it is what keeps a later edit to the
+/// early-outs from reaching one caller and not the other.
+fn write_ledger_reach(meets: impl FnOnce(&[(u64, u64)]) -> bool) -> GuestWriteReach {
     let signals = current_session_signals();
     let Ok(mut f) = signals.guest_write_pages.lock() else {
         return GuestWriteReach::Unnamed;
@@ -1839,15 +1876,25 @@ pub fn guest_writes_reaching_sets<'a>(
     if f.unnamed {
         return GuestWriteReach::Unnamed;
     }
-    let runs = f.runs();
-    if sets
-        .into_iter()
-        .any(|pages| read_set_meets_runs(runs, pages))
-    {
+    if meets(f.runs()) {
         GuestWriteReach::Overlap
     } else {
         GuestWriteReach::Disjoint
     }
+}
+
+/// Compare several read windows with the write ledger under one lock.
+///
+/// A draw commonly reads many guest-backed descriptors. Treating them as one
+/// question avoids both a per-descriptor lock and an allocated union while
+/// preserving exact physical-page membership.
+pub fn guest_writes_reaching_sets<'a>(
+    sets: impl IntoIterator<Item = &'a reims_vgpu_memory::GuestPageSet>,
+) -> GuestWriteReach {
+    write_ledger_reach(|runs| {
+        sets.into_iter()
+            .any(|set| sorted_read_set_meets_runs(runs, set.pages()))
+    })
 }
 
 /// Wait until every guest-page writeback this device has recorded has landed in
@@ -1976,6 +2023,87 @@ impl StampPointSource {
             Self::Reused => &counters.gpu_stamp_reused_points,
         };
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod write_ledger_walk_tests {
+    use super::{read_set_meets_runs, sorted_read_set_meets_runs};
+
+    /// The two walks answer the same question and only one of them may assume
+    /// its input ascends, so the property worth testing is that they agree.
+    ///
+    /// Generated rather than enumerated because the merge's bugs live in its
+    /// cursor: a run retired one page too early, a page in the gap below a run
+    /// advancing the cursor past a run a later page needed, an exhausted run
+    /// list answering the wrong way. None of those is visible in a handful of
+    /// hand-written shapes, and all of them change an answer on some shape.
+    #[test]
+    fn the_merge_agrees_with_the_per_page_walk() {
+        // A deterministic LCG: this has to fail the same way on every machine
+        // and on a bisect, and a seeded generator is what makes a disagreement
+        // reproducible from the printed seed alone.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for case in 0..2000u32 {
+            // Runs must be ascending, disjoint and non-adjacent, which is what
+            // the ledger's own coalescing guarantees.
+            let mut runs: Vec<(u64, u64)> = Vec::new();
+            let mut at = next() % 8;
+            let run_count = next() % 6;
+            for _ in 0..run_count {
+                let start = at + 1 + next() % 5;
+                let end = start + next() % 4;
+                runs.push((start, end));
+                at = end + 1;
+            }
+
+            // Read pages: sorted and deduped, as a `GuestPageSet` is.
+            let mut pages: Vec<u64> = (0..next() % 10).map(|_| next() % 40).collect();
+            pages.sort_unstable();
+            pages.dedup();
+
+            let merged = sorted_read_set_meets_runs(&runs, &pages);
+            let probed = read_set_meets_runs(&runs, &pages);
+            assert_eq!(
+                merged, probed,
+                "case {case}: runs={runs:?} pages={pages:?} merge={merged} probe={probed}"
+            );
+        }
+    }
+
+    /// The two edges the generator above reaches only by luck.
+    #[test]
+    fn an_empty_ledger_and_an_empty_read_set_are_both_disjoint() {
+        assert!(!sorted_read_set_meets_runs(&[], &[1, 2, 3]));
+        assert!(!sorted_read_set_meets_runs(&[(1, 3)], &[]));
+        assert!(!read_set_meets_runs(&[], &[1, 2, 3]));
+        assert!(!read_set_meets_runs(&[(1, 3)], &[]));
+    }
+
+    /// Every page above the last run: the merge must exhaust its cursor and
+    /// answer, not walk off the end.
+    #[test]
+    fn a_read_set_entirely_above_the_ledger_is_disjoint() {
+        let runs = [(2u64, 4u64), (9, 11)];
+        assert!(!sorted_read_set_meets_runs(&runs, &[20, 21, 22]));
+        // The last page inside a run, reached after the cursor has walked the
+        // whole list: the answer is still yes.
+        assert!(sorted_read_set_meets_runs(&runs, &[1, 8, 11]));
+    }
+
+    /// A page in the gap below a run must not retire that run: the page after
+    /// it may be inside it.
+    #[test]
+    fn a_page_in_a_gap_leaves_the_run_for_the_next_page() {
+        let runs = [(5u64, 7u64)];
+        assert!(sorted_read_set_meets_runs(&runs, &[4, 6]));
     }
 }
 
