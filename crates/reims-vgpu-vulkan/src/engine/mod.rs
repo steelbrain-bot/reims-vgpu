@@ -1095,12 +1095,31 @@ mod device_capability_snapshot_tests {
 /// whole packet, resolve included, and the achievable ceiling is set by
 /// whatever fraction of *both* halves must stay under a shared lock.
 ///
-/// That runtime-side fraction has not been measured. It is the next thing to
-/// measure and it gates the whole design: if most of those 14 us touch state
-/// shared across packets, the 6x this mutex could allow is not reachable
-/// whatever is done here. `Device` is four fields and `DeviceState` sixteen,
-/// so the same separability question that `pools::EncoderPools` answered for
-/// this crate is a tractable one to ask there.
+/// The first cut of that runtime-side question has now been taken, and it says
+/// go rather than stop. Nearly all of the resolve half is *reading* state the
+/// guest changes rarely, not mutating state every packet contends for. On the
+/// same boot, the hottest runtime-side lookup — the packed buffer resolution,
+/// entered 6.36 times a draw — splits like this:
+///
+/// ```text
+/// zc_buffer_held_packed      14 876 167   read, answered from the registry
+/// zc_buffer_imported_packed       3 482   resolved and inserted
+/// ```
+///
+/// **4 272 reads for every write.** State with that ratio shards: concurrent
+/// readers scale, and writers that rare make their own synchronisation noise
+/// against a 21 us draw. It is also why the ban on eviction in `AGENTS.md`
+/// matters more than it looks — a read that quietly mutates an LRU position
+/// would turn all 14.8 M of those into writers and take this property away.
+///
+/// That is one registry and it is not the whole of `Device`. What has *not*
+/// been measured is the content-tracking side, where a draw records the guest
+/// pages it wrote, and which is a genuine per-draw write rather than a lookup.
+/// Whether those writes are naturally per-packet — a packet writing its own
+/// targets — or contend across packets is the next thing to establish, and it
+/// is what remains between here and sizing the fan-out honestly. `Device` is
+/// four fields and `DeviceState` sixteen, so the same separability question
+/// that `pools::EncoderPools` answered for this crate is tractable there.
 ///
 /// One thing already ruled out, and cheaply: the window thread is **not**
 /// losing frames to this mutex. Over 47 driven seconds, `window_wait_us` is
