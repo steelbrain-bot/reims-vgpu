@@ -157,6 +157,13 @@ Behavior changes need tests that fail without the change. Bug fixes need a focus
 or proxy test for the bug class. Run Rust tests serially with `-- --test-threads=1`; GPU-touching
 tests are not safe to run in parallel.
 
+**A Rust test is necessary and it is not sufficient, because it cannot disagree with you.** Every
+one in this tree feeds the decoder bytes we wrote, drives ports we wrote, and asserts an expectation
+we wrote. That proves the code does what we believe the contract says. It cannot tell us the belief
+is wrong, and a belief that is wrong gets locked in by the very test that was supposed to protect
+it. Nothing in `cargo test` has an oracle. `conformance/` does, and the rule that follows from that
+is in `## Verification` under **A fix is not done until a case in `conformance/` fails without it**.
+
 ### Do Not Validate By Grepping Source
 
 **No test, script, or gate may read this repository's own Rust source as text and assert on what it
@@ -652,18 +659,59 @@ battery is not finished until it has been run on both. `conformance/run-native.s
 and `conformance/run-guest.sh` boots a rail and runs the same source against this device — the
 latter scores itself with `conformance/verdict.py` and exits non-zero on any guest failure that is
 not written down in `conformance/expectations/known-failures.txt`, **and on any listed failure that
-has started passing**. Prune that file when you fix something; a list nobody prunes is a list of
-cases nobody looks at.
+has started passing**.
 
 Reach for it before a boot when the question is *what the API does*: a contract question, a format,
 a stride, an ordering rule, a rail with one case on it. Reach for a driven boot when the question is
 throughput, cadence or a whole compositor. The battery cannot see a frame and a frame cannot name a
 seam.
 
-**A case is a gate only if the broken arm loses it.** Three attempts at the regression case for the
-unordered host read passed on the broken build, which reads as evidence the defect is not real.
-Revert the fix and watch the new case fail before believing it gates anything —
-`conformance/README.md` carries what that one needed.
+### A fix is not done until a case in `conformance/` fails without it
+
+This is the rule this project has paid the most to learn, so it is stated as an obligation and not
+as advice. **Every fix to something the guest can observe adds a case to the battery, and the case
+is verified by reverting the fix and watching it fail.** A fix without one is not finished, however
+green `cargo test` is and however good the screenshot looks.
+
+The reason is not thoroughness. It is that the battery is the only instrument here that can tell us
+we are wrong about the contract:
+
+- **A Rust test cannot disagree with you.** It consumes wire bytes we authored against ports we
+  wrote, and asserts what we believe Metal does. If the belief is wrong the test passes and locks
+  the error in — the test becomes the thing defending the bug. The battery's *native* arm is the
+  only place in this tree where Apple's own implementation answers the question, which is why a case
+  that fails on the oracle is a bug in the suite and never a finding about this device.
+- **A Rust test drives a guest we imagined.** The battery makes Apple's real driver produce the
+  command stream, on the real rail, through the real Vulkan path, on a real host GPU. Whole classes
+  live only there: what the driver chooses to stage through a buffer, what it emits as a
+  whole-surface copy, how many frames it leaves in flight, which rail a descriptor actually lands
+  on. No amount of unit testing reaches any of them, because every one of them is a decision made
+  by software we do not ship and cannot fake.
+- **A screenshot cannot name a seam, as the section above says, and a driven boot proves one
+  workload on one rail.** A case names the bytes and keeps naming them on every later run.
+
+The worked example is the host read that was not ordered against this device's own submitted GPU
+writes. It cost three days. Its Rust regression test is real and it gates the mechanism — and it
+was written *from the diagnosis*, after the fact, and could not have found the defect or found the
+next one of its class, because it asserts that one function settles and knows nothing about which
+rail a compositor's copies take. `srt_blit_pipelined_1024x768_x8` fails on the broken build and
+passes on the fixed one, through the guest's own driver. That is the difference between a test that
+records what we learned and a test that would have caught it.
+
+**A case is a gate only if the broken arm loses it.** Three attempts at that same case passed on the
+broken build — each of which reads as evidence the defect is not real, and one of which nearly ended
+the investigation. Revert the fix, watch the case fail, then restore it; `conformance/README.md`
+carries the three things that one needed before it reproduced. A case that has never been seen
+failing is decoration.
+
+Where the battery genuinely cannot reach — a host-side cadence, a counter, a lifetime with no
+guest-visible value — say so in the commit body and name what does gate it instead. That is a
+narrow exemption and it is not the usual answer: if the guest can see the difference, the battery
+can express it.
+
+**Prune `expectations/known-failures.txt` in the same commit.** A fix that makes a listed case pass
+must remove its line, and `verdict.py` fails the run until it does. A list nobody prunes stops being
+a list of defects and becomes a list of cases nobody reads.
 
 ### Never score a frame by OCR. Look at it.
 
@@ -1085,6 +1133,9 @@ Each commit should have a detailed message body that states:
 - Which component or pathway it touches.
 - What behavior changed and why.
 - What tests, clippy runs, feature-matrix checks, or live-VM verification were performed.
+- **Which `conformance/` case gates it**, for anything the guest can observe — by name, with the
+  result of running the battery on the broken build and on the fixed one. "No case, because the
+  battery cannot reach this" is an acceptable answer exactly once it says what does gate it instead.
 - What was not verified, if anything.
 
 Rust commits should be warning-free under clippy with `-D warnings` for both supported targets:
