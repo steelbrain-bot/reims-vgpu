@@ -193,6 +193,28 @@ fragment float4 solid_fs(VOut in [[stage_in]],
     return colour;
 }
 
+// The same flat colour, made expensive on purpose.
+//
+// A race is only a test if the arm under test loses it. A solid fill of a
+// window-sized target finishes before a host-side reader can decode a copy and
+// memcpy three megabytes, so a device that reads those pixels unordered still
+// happens to read the right ones and the case passes for a reason that has
+// nothing to do with correctness. This shader gives the GPU real per-pixel work
+// so the render is still running when the copy behind it is serviced.
+//
+// The accumulator has to survive the optimizer: `acc` is compared against a
+// bound it cannot reach, so the compiler cannot fold the loop away, and the
+// colour returned is exactly `colour` on every pixel.
+fragment float4 heavy_fs(VOut in [[stage_in]],
+                         constant float4 &colour [[buffer(0)]]) {
+    float acc = 0.0;
+    for (int i = 0; i < 2048; ++i) {
+        acc += fract(sin(float(i) * 12.9898 + in.pos.x * 0.017 + in.pos.y * 0.031) * 43758.5453);
+    }
+    float poison = (acc > 1.0e30) ? 1.0 : 0.0;
+    return float4(colour.rgb + poison, colour.a);
+}
+
 fragment float4 tex_fs(VOut in [[stage_in]],
                        texture2d<float, access::sample> tex [[texture(0)]]) {
     constexpr sampler s(filter::nearest, address::clamp_to_edge);
@@ -2218,6 +2240,257 @@ for (cw, ch) in [(60, 32), (256, 64), (1000, 40)] {
     cpuWriteThenSampleCase(cw, ch, iosurface: false)
     cpuWriteThenSampleCase(cw, ch, iosurface: true)
 }
+
+
+// L. A whole-surface blit of a target the GPU has only just rendered into.
+//
+// The guest never reads the layer here — it hands both endpoints to a blit and
+// asks the device to move the pixels. Metal orders that copy against the render
+// before it: two command buffers on one queue execute in the order they were
+// committed, so the copy sees everything the render wrote.
+//
+// A device that decomposes the pair does not get that ordering for free. If the
+// render is submitted to the GPU and the copy is then serviced by reading the
+// source's bytes on the CPU, the two are racing, and the reader wins whenever
+// the GPU has not finished — which is most of the time, because submission is
+// asynchronous and the copy is decoded immediately behind it.
+//
+// # The shape is measured, not chosen
+//
+// Which copies the guest driver emits as a whole-surface texture-to-texture
+// copy, rather than staging through a buffer, is the driver's decision and not
+// something this file can assume. Earlier attempts at this case used a
+// `.bgra8Unorm` pair at 512x512 and never produced one: the driver staged every
+// one of them, so the case exercised a different rail and passed for the wrong
+// reason.
+//
+// The shape below is what a driven compositor actually emits — a linear source,
+// an IOSurface-backed destination, `BGRA8Unorm_sRGB`, one level and one slice,
+// at window and screen size. That is the pair a compositor produces when it
+// draws a layer and then copies it into the surface the window server owns.
+//
+// # Why two passes
+//
+// The first pass lands red and is waited on, so the source's bytes are known
+// and are *not* the answer. The second lands green and is not waited on before
+// the copy. A correct device puts green in the destination; one that reads the
+// source without ordering puts **red** there — the previous frame, whole and
+// undamaged, which is why this class reads as a layer showing stale content
+// rather than as corruption. `stale_previous_frame` in the failure counts
+// exactly those texels, so the report distinguishes this defect from a copy
+// that simply moved nothing.
+//
+// Full-intensity red and green round-trip an 8-bit sRGB encode exactly (0 and 1
+// are both fixed points), so the expectation is unaffected by the transfer
+// function on the attachment.
+func makeSrgbIOSurfaceTarget(_ w: Int, _ h: Int, _ label: String) -> MTLTexture? {
+    let bgra: UInt32 = 0x4247_5241   // 'BGRA' as an OSType
+    let props: [IOSurfacePropertyKey: Any] = [
+        .width: w, .height: h, .bytesPerElement: 4, .pixelFormat: bgra,
+    ]
+    guard let surface = IOSurface(properties: props) else {
+        report(label, false, "IOSurface(properties:) nil for \(w)x\(h)"); return nil
+    }
+    let td = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: .bgra8Unorm_srgb, width: w, height: h, mipmapped: false)
+    td.usage = [.renderTarget, .shaderRead]
+    td.storageMode = .shared
+    guard let tex = dev.makeTexture(descriptor: td, iosurface: surface, plane: 0) else {
+        report(label, false, "makeTexture(iosurface:) nil for \(w)x\(h)"); return nil
+    }
+    return tex
+}
+
+func blitAfterRenderCase(_ w: Int, _ h: Int) {
+    let label = "srt_blit_after_render_\(w)x\(h)"
+    guard let pipe = makeRenderPipeline("heavy_fs", .bgra8Unorm_srgb) else {
+        report(label, false, "heavy pipeline unavailable for bgra8Unorm_srgb"); return
+    }
+    let sd = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: .bgra8Unorm_srgb, width: w, height: h, mipmapped: false)
+    sd.usage = [.renderTarget, .shaderRead]
+    sd.storageMode = .shared
+    guard let source = dev.makeTexture(descriptor: sd) else {
+        report(label, false, "makeTexture nil for the shared \(w)x\(h) source"); return
+    }
+    guard let dst = makeSrgbIOSurfaceTarget(w, h, label) else { return }
+    let verts = dev.makeBuffer(bytes: quadVerts, length: quadVerts.count * 4,
+                               options: .storageModeShared)!
+
+    func encodeFill(_ cb: MTLCommandBuffer, _ colour: SIMD4<Float>, draws: Int) {
+        let d = MTLRenderPassDescriptor()
+        d.colorAttachments[0].texture = source
+        d.colorAttachments[0].loadAction = .clear
+        d.colorAttachments[0].clearColor = MTLClearColor(red: 1, green: 0, blue: 1, alpha: 1)
+        d.colorAttachments[0].storeAction = .store
+        let enc = cb.makeRenderCommandEncoder(descriptor: d)!
+        enc.setRenderPipelineState(pipe)
+        enc.setVertexBuffer(verts, offset: 0, index: 0)
+        var c = colour
+        enc.setFragmentBytes(&c, length: 16, index: 0)
+        // Repeated whole-target draws, so the GPU is still working when the copy
+        // behind them is decoded. One draw would leave the race to scheduling
+        // luck and make the case flaky in the direction that reads as a pass.
+        for _ in 0..<draws {
+            enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        }
+        enc.endEncoding()
+    }
+
+    // 1. Red, landed. After this the source's bytes are red and nothing else.
+    let first = queue.makeCommandBuffer()!
+    encodeFill(first, SIMD4<Float>(1, 0, 0, 1), draws: 1)
+    first.commit()
+    first.waitUntilCompleted()
+
+    // 2. Green, committed and not waited on, then the copy in its own command
+    //    buffer. Queue order is what orders them; nothing else has to.
+    let second = queue.makeCommandBuffer()!
+    encodeFill(second, SIMD4<Float>(0, 1, 0, 1), draws: 256)
+    second.commit()
+
+    let copyCb = queue.makeCommandBuffer()!
+    let blit = copyCb.makeBlitCommandEncoder()!
+    blit.copy(from: source, sourceSlice: 0, sourceLevel: 0,
+              to: dst, destinationSlice: 0, destinationLevel: 0,
+              sliceCount: 1, levelCount: 1)
+    blit.endEncoding()
+    copyCb.commit()
+    copyCb.waitUntilCompleted()
+
+    guard let got = readBack(readPipe, dst, w, h) else { refused(label); return }
+    let green = pack(0, 255, 0, 255)
+    let red = pack(255, 0, 0, 255)
+    var wrong: [(Int, Int)] = []
+    var stale = 0
+    for y in 0..<h {
+        for x in 0..<w where got[y * w + x] != green {
+            wrong.append((x, y))
+            if got[y * w + x] == red { stale += 1 }
+        }
+    }
+    let firstBad = wrong.first.map {
+        "at=(\($0.0),\($0.1)) got=\(hex(got[$0.1 * w + $0.0]))"
+    } ?? ""
+    report(label, wrong.isEmpty,
+           wrong.isEmpty
+             ? "the copy moved what the render ahead of it had written"
+             : "wrong=\(wrong.count)/\(w * h) stale_previous_frame=\(stale) "
+               + "want=\(hex(green)) \(firstBad)" + badMap(wrong, w, h))
+}
+
+blitAfterRenderCase(1024, 768)
+blitAfterRenderCase(1920, 1080)
+
+// The same copy, run the way a compositor runs it: many frames in flight.
+//
+// The single-shot case above reaches the rail and does not fail, because one
+// render is not enough to keep the GPU busy past the point where the copy
+// behind it is serviced. A compositor never has one frame outstanding — it
+// renders a layer, copies it out, and starts the next without waiting for
+// either, so a copy is decoded while earlier frames are still executing and the
+// queue is never drained.
+//
+// Each frame gets its own colour and its own destination, so a stale read is not
+// merely "wrong" — it is identifiably *an earlier frame*, which is what the
+// report names. Nothing is waited on until every frame has been committed.
+func blitPipelinedCase(_ w: Int, _ h: Int, frames: Int) {
+    let label = "srt_blit_pipelined_\(w)x\(h)_x\(frames)"
+    guard let pipe = makeRenderPipeline("heavy_fs", .bgra8Unorm_srgb) else {
+        report(label, false, "heavy pipeline unavailable for bgra8Unorm_srgb"); return
+    }
+    let verts = dev.makeBuffer(bytes: quadVerts, length: quadVerts.count * 4,
+                               options: .storageModeShared)!
+
+    // One colour per frame, all full-intensity so the sRGB encode round-trips
+    // exactly, and all distinguishable from one another.
+    let palette: [(SIMD4<Float>, UInt32)] = [
+        (SIMD4(1, 0, 0, 1), pack(255, 0, 0, 255)),
+        (SIMD4(0, 1, 0, 1), pack(0, 255, 0, 255)),
+        (SIMD4(0, 0, 1, 1), pack(0, 0, 255, 255)),
+        (SIMD4(1, 1, 0, 1), pack(255, 255, 0, 255)),
+        (SIMD4(1, 0, 1, 1), pack(255, 0, 255, 255)),
+        (SIMD4(0, 1, 1, 1), pack(0, 255, 255, 255)),
+        (SIMD4(1, 1, 1, 1), pack(255, 255, 255, 255)),
+        (SIMD4(0, 0, 0, 1), pack(0, 0, 0, 255)),
+    ]
+
+    var sources: [MTLTexture] = []
+    var dests: [MTLTexture] = []
+    for i in 0..<frames {
+        let sd = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm_srgb, width: w, height: h, mipmapped: false)
+        sd.usage = [.renderTarget, .shaderRead]
+        sd.storageMode = .shared
+        guard let src = dev.makeTexture(descriptor: sd) else {
+            report(label, false, "makeTexture nil for frame \(i)'s source"); return
+        }
+        guard let dst = makeSrgbIOSurfaceTarget(w, h, label) else { return }
+        sources.append(src)
+        dests.append(dst)
+    }
+
+    var last: MTLCommandBuffer?
+    for i in 0..<frames {
+        let (colour, _) = palette[i % palette.count]
+        let render = queue.makeCommandBuffer()!
+        let d = MTLRenderPassDescriptor()
+        d.colorAttachments[0].texture = sources[i]
+        d.colorAttachments[0].loadAction = .clear
+        d.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+        d.colorAttachments[0].storeAction = .store
+        let enc = render.makeRenderCommandEncoder(descriptor: d)!
+        enc.setRenderPipelineState(pipe)
+        enc.setVertexBuffer(verts, offset: 0, index: 0)
+        var c = colour
+        enc.setFragmentBytes(&c, length: 16, index: 0)
+        for _ in 0..<96 {
+            enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        }
+        enc.endEncoding()
+        render.commit()
+
+        let copyCb = queue.makeCommandBuffer()!
+        let blit = copyCb.makeBlitCommandEncoder()!
+        blit.copy(from: sources[i], sourceSlice: 0, sourceLevel: 0,
+                  to: dests[i], destinationSlice: 0, destinationLevel: 0,
+                  sliceCount: 1, levelCount: 1)
+        blit.endEncoding()
+        copyCb.commit()
+        last = copyCb
+    }
+    last?.waitUntilCompleted()
+
+    var badFrames: [Int] = []
+    var detail = ""
+    for i in 0..<frames {
+        guard let got = readBack(readPipe, dests[i], w, h) else { refused(label); return }
+        let want = palette[i % palette.count].1
+        var wrong = 0
+        var sawOtherFrame = -1
+        for t in 0..<(w * h) where got[t] != want {
+            wrong += 1
+            if sawOtherFrame < 0 {
+                for (j, p) in palette.enumerated() where p.1 == got[t] { sawOtherFrame = j }
+            }
+        }
+        if wrong > 0 {
+            badFrames.append(i)
+            if detail.isEmpty {
+                detail = "frame=\(i) wrong=\(wrong)/\(w * h) want=\(hex(want)) "
+                    + (sawOtherFrame >= 0
+                        ? "got=another frame's colour (palette \(sawOtherFrame))"
+                        : "got=\(hex(got[0]))")
+            }
+        }
+    }
+    report(label, badFrames.isEmpty,
+           badFrames.isEmpty
+             ? "every frame's copy moved that frame's own pixels"
+             : "stale_frames=\(badFrames.count)/\(frames) \(detail)")
+}
+
+blitPipelinedCase(1024, 768, frames: 8)
 
 print("SUMMARY cases=\(ran) failures=\(failures) skipped=\(skipped)")
 print("DEVICE name=\(dev.name) unified=\(dev.hasUnifiedMemory)")

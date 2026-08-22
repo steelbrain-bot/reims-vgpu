@@ -137,3 +137,41 @@ That is the same failure mode as the `refused(); return` bug that `skipDependent
 exists to fix, one level up — there the case vanished from the totals mid-run,
 here it never entered them. When adding a parameterized case, count the
 invocations against the parameter grid before trusting a green summary.
+
+
+## A race is only a test if the broken arm loses it
+
+`srt_blit_pipelined_*` is the regression gate for a host read of guest pages
+that was not ordered against this device's own submitted GPU writes. Getting it
+to reproduce took six guest boots and three wrong shapes, and each wrong shape
+failed in a way that read as a pass.
+
+Three things it turns out to need, none of which is negotiable:
+
+- **The copy has to be one the guest driver actually emits as a whole-surface
+  texture-to-texture copy.** A `.bgra8Unorm` pair at 512x512 is not: the driver
+  stages it through a buffer, and the case then exercises a different device rail
+  and passes. The shape that works was *measured* off a driven compositor with a
+  temporary device probe rather than chosen — a linear source, an IOSurface
+  destination, `BGRA8Unorm_sRGB`, one level and one slice, at window and screen
+  size.
+- **The render and the copy have to be in separate command buffers.** In one
+  command buffer the driver resolves the read-after-write hazard itself and
+  stages the copy, which again lands on another rail.
+- **One frame in flight is not enough.** The single-shot `srt_blit_after_render_*`
+  cases reach the rail — confirmed by probe — and still pass on the broken arm,
+  because one render finishes before a host reader can decode a copy and memcpy
+  three megabytes. Only the pipelined form fails: eight frames, each rendering
+  and copying without waiting, so a copy is serviced while earlier renders are
+  still executing. That is what a compositor does and it is why the defect was
+  a compositor defect.
+
+The single-shot cases are kept even though they gate nothing. They record the
+shape that reaches the rail without losing the race, which is the thing that
+made three earlier attempts look like they had disproved a real bug.
+
+**Distinct colours per frame are load-bearing.** Each frame renders its own
+colour into its own source and copies to its own destination, so a stale read is
+identifiable as *which* earlier state was read rather than merely "wrong". The
+report separates the two: a previous frame's colour names a stale copy, and zero
+names a copy that ran before anything was written at all.
