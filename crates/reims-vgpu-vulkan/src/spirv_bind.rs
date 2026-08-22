@@ -90,6 +90,39 @@ const STORAGE_CLASS_UNIFORM_CONSTANT: u32 = 0;
 const STORAGE_CLASS_UNIFORM: u32 = 2;
 const STORAGE_CLASS_STORAGE_BUFFER: u32 = 12;
 
+/// SPIR-V `StorageClass PushConstant`.
+const STORAGE_CLASS_PUSH_CONSTANT: u32 = 9;
+
+/// Whether this module declares a push-constant variable.
+///
+/// The one thing a consumer must know without consulting reflection: a module
+/// that reads push constants cannot execute correctly under a pipeline layout
+/// that exposes none. Reflection remains the authority on *where* the kernel
+/// grid sits — this answers only whether something is there to satisfy, so a
+/// prepared module that lost its range can be refused by name instead of
+/// reading whatever the driver leaves in that storage.
+///
+/// A guard reading undefined push constants is not a subtle failure: zeros cull
+/// every invocation, the dispatch writes nothing, and no counter moves.
+#[must_use]
+pub fn declares_push_constants(words: &[u32]) -> bool {
+    let mut i = HEADER_WORDS;
+    while i < words.len() {
+        let word0 = words[i];
+        let word_count = (word0 >> 16) as usize;
+        let opcode = (word0 & 0xffff) as u16;
+        if word_count == 0 || i + word_count > words.len() {
+            break;
+        }
+        // OpVariable: result type, result id, storage class.
+        if opcode == OP_VARIABLE && word_count >= 4 && words[i + 3] == STORAGE_CLASS_PUSH_CONSTANT {
+            return true;
+        }
+        i += word_count;
+    }
+    false
+}
+
 // Descriptor numbering is selected through metal2vulkan transform options before
 // SPIR-V is emitted. These defaults remain public for tests and fixed engine
 // facilities; executable resource locations come from ShaderReflection and

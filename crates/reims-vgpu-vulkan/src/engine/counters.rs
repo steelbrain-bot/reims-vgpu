@@ -543,6 +543,14 @@ engine_counters! {
         descriptor_set_updates,
         /// Updated descriptor sets subsequently bound for execution.
         descriptor_set_binds,
+        /// Dispatches that pushed Metal's exact thread grid for the translated
+        /// entry point to cull its surplus invocations against.
+        ///
+        /// A healthy-zero alarm read the other way round: this should equal the
+        /// dispatch count on any tree whose translator emits the cull, and a
+        /// gap means some dispatch bound a layout carrying no range and ran the
+        /// rounded-up grid unculled.
+        kernel_grid_pushes,
         sampled_cache_hits,
         sampled_cache_hit_bytes,
         sampled_cache_misses,

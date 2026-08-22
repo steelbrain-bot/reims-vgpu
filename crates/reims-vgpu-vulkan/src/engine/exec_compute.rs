@@ -114,9 +114,11 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
             ComputeValidationDecline::EntryInteriorNul,
         ));
     }
-    if req.grid.contains(&0) {
+    if req.dispatch.counts.contains(&0) {
         return Err(DrawError::ComputeValidation(
-            ComputeValidationDecline::ZeroGrid { grid: req.grid },
+            ComputeValidationDecline::ZeroGrid {
+                grid: req.dispatch.counts,
+            },
         ));
     }
     let mut bindings = BTreeSet::new();
@@ -569,8 +571,21 @@ pub(crate) unsafe fn execute_compute_inner(
         ));
     }
 
+    // A module that reads push constants under a layout exposing none culls
+    // every invocation and reports nothing. Reflection is the authority on
+    // where the grid sits; this only refuses the case where the module wants
+    // one and the prepared variant carries none.
+    if program.shader.kernel_grid.is_none()
+        && crate::spirv_bind::declares_push_constants(&program.shader.words)
+    {
+        return Err(DrawError::ComputeExecution(
+            ComputeExecutionDecline::KernelGridRangeAbsent,
+        ));
+    }
+
     let layout_key = LayoutKey {
         bindings: layout_bindings,
+        kernel_grid: program.shader.kernel_grid,
     };
 
     let (spirv_digest, module) =
@@ -1318,8 +1333,27 @@ pub(crate) unsafe fn execute_compute_inner(
             .descriptor_set_binds
             .fetch_add(1, Ordering::Relaxed);
     }
-    ctx.device
-        .cmd_dispatch(cb, req.grid[0], req.grid[1], req.grid[2]);
+    // Metal's exact thread grid, for the cull in the translated entry point.
+    //
+    // `vkCmdDispatch` takes whole workgroups, so a `dispatchThreads` grid that
+    // does not divide its threadgroup is rounded up and the excess invocations
+    // launch. The translated kernel returns early for any invocation outside
+    // the grid, and this is where it reads that grid — one push of three `u32`
+    // immediately before the dispatch it describes, so the two cannot be
+    // separated by a later binding. A kernel whose reflection declares no range
+    // needs no cull and gets no push.
+    if let Some(range) = program.shader.kernel_grid {
+        ctx.device.cmd_push_constants(
+            cb,
+            pipeline_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            range.offset,
+            &crate::m2v_cache::KernelGridRange::bytes(req.dispatch.threads_per_grid),
+        );
+        counters.kernel_grid_pushes.fetch_add(1, Ordering::Relaxed);
+    }
+    let counts = req.dispatch.counts;
+    ctx.device.cmd_dispatch(cb, counts[0], counts[1], counts[2]);
 
     // Writable SSBOs become host-visible. For a direct import this releases the
     // shader's writes to the guest allocation itself; a staging slot is mapped
@@ -1684,7 +1718,8 @@ mod tests {
         let req = ComputeRequest {
             program: test_program(),
             entry: "main".into(),
-            grid: [1, 1, 1],
+            dispatch: reims_vgpu_protocol::dispatch::workgroup_counts([1, 1, 1], [1, 1, 1], false)
+                .expect("a one-by-one dispatch is a valid grid"),
             samplers: vec![sampler],
             ..Default::default()
         };
@@ -1748,7 +1783,8 @@ mod tests {
         let req = ComputeRequest {
             program: test_program(),
             entry: "ma\0in".into(),
-            grid: [1, 1, 1],
+            dispatch: reims_vgpu_protocol::dispatch::workgroup_counts([1, 1, 1], [1, 1, 1], false)
+                .expect("a one-by-one dispatch is a valid grid"),
             ..Default::default()
         };
         let decline = match validate_compute(&req) {
@@ -1769,7 +1805,8 @@ mod tests {
         let request = ComputeRequest {
             program: test_program(),
             entry: "main".into(),
-            grid: [1, 1, 1],
+            dispatch: reims_vgpu_protocol::dispatch::workgroup_counts([1, 1, 1], [1, 1, 1], false)
+                .expect("a one-by-one dispatch is a valid grid"),
             sampled_images: vec![first, second],
             ..Default::default()
         };
@@ -1829,7 +1866,8 @@ mod tests {
         let mut req = ComputeRequest {
             program: test_program(),
             entry: "main".into(),
-            grid: [1, 1, 1],
+            dispatch: reims_vgpu_protocol::dispatch::workgroup_counts([1, 1, 1], [1, 1, 1], false)
+                .expect("a one-by-one dispatch is a valid grid"),
             sampled_images: vec![ComputeSampledImageResource {
                 binding: 32,
                 array_element: 0,

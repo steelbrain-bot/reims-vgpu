@@ -98,6 +98,16 @@ pub enum ComputeExecutionDecline {
     UsedBindingAbsentFromLayout {
         binding: u32,
     },
+    /// The module reads push constants and the prepared variant names no
+    /// kernel-grid range for the layout to expose.
+    ///
+    /// The translated entry point culls every invocation whose id falls outside
+    /// the grid it reads from push-constant storage. With no range declared,
+    /// that storage is undefined: it reads zero on the drivers seen here, which
+    /// culls **every** invocation, so the dispatch writes nothing and no
+    /// counter moves. Refusing by name is the difference between one visibly
+    /// declined dispatch and a kernel that silently does nothing forever.
+    KernelGridRangeAbsent,
 }
 
 impl Decline for ComputeExecutionDecline {
@@ -126,6 +136,7 @@ impl Decline for ComputeExecutionDecline {
             Self::ResidentRekeyWouldDropPinned { .. } => {
                 "vk_compute_exec_resident_rekey_would_drop_pinned"
             }
+            Self::KernelGridRangeAbsent => "vk_compute_exec_kernel_grid_range_absent",
             Self::UsedBindingAbsentFromLayout { .. } => {
                 "vk_compute_exec_used_binding_absent_from_layout"
             }
@@ -244,6 +255,7 @@ impl Decline for ComputeExecutionDecline {
             Self::UsedBindingAbsentFromLayout { binding } => {
                 vec![("binding", binding.to_string())]
             }
+            Self::KernelGridRangeAbsent => Vec::new(),
         }
     }
 }

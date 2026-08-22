@@ -17,6 +17,21 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
+/// A whole-workgroup dispatch of `counts` groups of `local` threads.
+///
+/// Fixtures here name workgroup counts, because that is what they dispatch.
+/// The plan also carries the exact thread grid a translated kernel would cull
+/// against, and for whole workgroups that is every thread of every group — so
+/// the local size has to be named rather than assumed, and a fixture whose
+/// SPIR-V declares `LocalSize 64 1 1` says so here too.
+fn whole_workgroups(
+    counts: [u32; 3],
+    local: [u32; 3],
+) -> reims_vgpu_protocol::dispatch::WorkgroupPlan {
+    reims_vgpu_protocol::dispatch::workgroup_counts(counts, local, false)
+        .expect("fixture dispatch dimensions are non-zero")
+}
+
 /// Acquire the process-global engine lock **and** reset the engine, in that
 /// order. Every engine-touching test must start from a fresh context:
 /// `device_loss_named_and_recreate_bounded` deliberately drives the
@@ -322,7 +337,7 @@ fn compute_inc_ssbo_known_result() {
     let req = ComputeRequest {
         program: prepare_test_program(words),
         entry: "main".into(),
-        grid: [grid, 1, 1],
+        dispatch: whole_workgroups([grid, 1, 1], [64, 1, 1]),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             backing: ComputeBufferBacking::Bytes(input),
@@ -367,7 +382,7 @@ fn compute_writable_guest_ssbo_lands_in_place() {
     let warm = ComputeRequest {
         program: prepare_test_program(words.clone()),
         entry: "main".into(),
-        grid: [1, 1, 1],
+        dispatch: whole_workgroups([1, 1, 1], [1, 1, 1]),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             backing: ComputeBufferBacking::Bytes(10.0f32.to_le_bytes().to_vec()),
@@ -432,7 +447,7 @@ fn compute_writable_guest_ssbo_lands_in_place() {
     let req = ComputeRequest {
         program: prepare_test_program(words),
         entry: "main".into(),
-        grid: [(n as u32).div_ceil(64), 1, 1],
+        dispatch: whole_workgroups([(n as u32).div_ceil(64), 1, 1], [64, 1, 1]),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             backing: ComputeBufferBacking::GuestPages {
@@ -495,7 +510,7 @@ fn compute_readonly_ssbo_has_zero_readback() {
     let req = ComputeRequest {
         program: prepare_test_program(words),
         entry: "main".into(),
-        grid: [1, 1, 1],
+        dispatch: whole_workgroups([1, 1, 1], [1, 1, 1]),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             backing: ComputeBufferBacking::Bytes(0x1234_5678u32.to_le_bytes().to_vec()),
@@ -571,7 +586,7 @@ fn compute_2d_grid_tiles_global_invocation_xy() {
     let req = ComputeRequest {
         program: prepare_test_program(words.clone()),
         entry: "main".into(),
-        grid: [8, 8, 1],
+        dispatch: whole_workgroups([8, 8, 1], [1, 1, 1]),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             backing: ComputeBufferBacking::Bytes(zeros.clone()),
@@ -616,7 +631,7 @@ fn compute_storage_image_rgba8unorm_known_result() {
     let req = ComputeRequest {
         program: prepare_test_program(words.clone()),
         entry: "main".into(),
-        grid: [w, h, 1],
+        dispatch: whole_workgroups([w, h, 1], [1, 1, 1]),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
@@ -664,7 +679,7 @@ fn compute_storage_image_rgba8unorm_known_result() {
     let hit_req = ComputeRequest {
         program: prepare_test_program(words.clone()),
         entry: "main".into(),
-        grid: [w, h, 1],
+        dispatch: whole_workgroups([w, h, 1], [1, 1, 1]),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
@@ -702,7 +717,7 @@ fn compute_storage_image_rgba8unorm_known_result() {
     let mismatch_req = ComputeRequest {
         program: prepare_test_program(words),
         entry: "main".into(),
-        grid: [1, 1, 1],
+        dispatch: whole_workgroups([1, 1, 1], [1, 1, 1]),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
@@ -786,7 +801,7 @@ fn every_admitted_compute_storage_resident_survives_past_the_retired_slot_cap() 
     let request = |i: u32, seed_generation: u32| ComputeRequest {
         program: prepare_test_program(words.clone()),
         entry: "main".into(),
-        grid: [w, h, 1],
+        dispatch: whole_workgroups([w, h, 1], [1, 1, 1]),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
@@ -875,7 +890,7 @@ fn compute_storage_image_bgra8unorm_is_not_channel_swapped() {
     let req = ComputeRequest {
         program: prepare_test_program(words),
         entry: "main".into(),
-        grid: [w, h, 1],
+        dispatch: whole_workgroups([w, h, 1], [1, 1, 1]),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
@@ -934,7 +949,7 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
         ComputeRequest {
             program: prepare_test_program(words.clone()),
             entry: "main".into(),
-            grid,
+            dispatch: whole_workgroups(grid, [1, 1, 1]),
             storage_buffers: vec![],
             sampled_images: vec![],
             samplers: vec![],
@@ -1027,7 +1042,7 @@ fn compute_sampled_resident_direct_bind_and_lost_resident() {
     let fill_req = ComputeRequest {
         program: prepare_test_program(fill_words),
         entry: "main".into(),
-        grid: [w, h, 1],
+        dispatch: whole_workgroups([w, h, 1], [1, 1, 1]),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
@@ -1059,7 +1074,7 @@ fn compute_sampled_resident_direct_bind_and_lost_resident() {
     let make_fetch = |generation: u32| ComputeRequest {
         program: prepare_test_program(fetch_words.clone()),
         entry: "main".into(),
-        grid: [1, 1, 1],
+        dispatch: whole_workgroups([1, 1, 1], [1, 1, 1]),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             backing: ComputeBufferBacking::Bytes(vec![0; 16]),
@@ -1149,7 +1164,7 @@ fn compute_sampled_and_storage_bindings_preserve_one_resident_identity() {
     let fill = ComputeRequest {
         program: prepare_test_program(fill_words),
         entry: "main".into(),
-        grid: [1, 1, 1],
+        dispatch: whole_workgroups([1, 1, 1], [1, 1, 1]),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
@@ -1177,7 +1192,7 @@ fn compute_sampled_and_storage_bindings_preserve_one_resident_identity() {
     let alias = ComputeRequest {
         program: prepare_test_program(alias_words),
         entry: "main".into(),
-        grid: [1, 1, 1],
+        dispatch: whole_workgroups([1, 1, 1], [1, 1, 1]),
         storage_buffers: vec![],
         sampled_images: vec![ComputeSampledImageResource {
             binding: 32,
@@ -1236,7 +1251,7 @@ fn compute_sampled_image_fetch_preserves_float_bits() {
     let mut req = ComputeRequest {
         program: prepare_test_program(words),
         entry: "main".into(),
-        grid: [1, 1, 1],
+        dispatch: whole_workgroups([1, 1, 1], [1, 1, 1]),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             backing: ComputeBufferBacking::Bytes(vec![0; 16]),
@@ -1332,7 +1347,11 @@ fn compute_m2v_float_mul4_add3_known_result() {
     let req = ComputeRequest {
         program: prepare_test_program(words),
         entry: "main".into(),
-        grid: [grid, 1, 1],
+        // The local size is this kernel's own, not a placeholder: the
+        // translated entry point culls every invocation outside the thread
+        // grid, and naming `[1, 1, 1]` here leaves 63 of the 64 threads
+        // culled and the buffer untouched.
+        dispatch: whole_workgroups([grid, 1, 1], [64, 1, 1]),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             backing: ComputeBufferBacking::Bytes(input),
@@ -1366,7 +1385,7 @@ fn warm_identical_dispatch_zero_creates_and_allocs() {
     let make_req = || ComputeRequest {
         program: prepare_test_program(words.clone()),
         entry: "main".into(),
-        grid: [1, 1, 1],
+        dispatch: whole_workgroups([1, 1, 1], [1, 1, 1]),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             backing: ComputeBufferBacking::Bytes(input.clone()),
@@ -1453,7 +1472,7 @@ fn compute_storage_image_r16float_if_supported() {
     let req = ComputeRequest {
         program: prepare_test_program(words),
         entry: "main".into(),
-        grid: [2, 2, 1],
+        dispatch: whole_workgroups([2, 2, 1], [1, 1, 1]),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
@@ -1554,7 +1573,7 @@ fn a_short_bind_cannot_read_the_tail_of_the_slot_it_was_given() {
     let dispatch = |bytes: Vec<u8>| ComputeRequest {
         program: prepare_test_program(words.clone()),
         entry: "main".into(),
-        grid: [1, 1, 1],
+        dispatch: whole_workgroups([1, 1, 1], [1, 1, 1]),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             backing: ComputeBufferBacking::Bytes(bytes),

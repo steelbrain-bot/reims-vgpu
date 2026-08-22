@@ -336,6 +336,51 @@ pub struct RuntimeStorageImageRequest {
 /// The translator selects descriptor bindings before emission. Keeping the
 /// executable and projected interface together prevents a caller from pairing
 /// words from one reflected layout with resources from another.
+/// The push-constant bytes a translated kernel reads its exact Metal thread
+/// grid from, in this device's own hashable spelling.
+///
+/// metal2vulkan reflects this as `KernelGridPushConstantRange`, which is not a
+/// hash key; the pipeline layout it forces *is* cached by one. The `size` is
+/// taken from the translator's constant rather than restated, so the two
+/// spellings cannot drift apart — only the presence and the offset are this
+/// device's to carry.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct KernelGridRange {
+    pub offset: u32,
+    pub size: u32,
+}
+
+impl From<metal2vulkan::reflect::KernelGridPushConstantRange> for KernelGridRange {
+    fn from(range: metal2vulkan::reflect::KernelGridPushConstantRange) -> Self {
+        Self {
+            offset: range.offset,
+            size: range.size,
+        }
+    }
+}
+
+impl KernelGridRange {
+    /// Three tightly packed `u32` dimensions.
+    pub const GRID_BYTES: usize = 3 * size_of::<u32>();
+
+    /// The three `u32` dimensions, in the order the translated guard reads them
+    /// at `offset`, `offset + 4` and `offset + 8`.
+    #[must_use]
+    pub fn bytes(threads_per_grid: [u32; 3]) -> [u8; Self::GRID_BYTES] {
+        let mut out = [0u8; Self::GRID_BYTES];
+        for (axis, value) in threads_per_grid.iter().enumerate() {
+            out[axis * 4..axis * 4 + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        out
+    }
+}
+
+/// The byte count `bytes` produces is the translator's, not a number chosen
+/// here: a widened grid ABI fails this rather than pushing a short range.
+const _: () = assert!(
+    KernelGridRange::GRID_BYTES as u32 == metal2vulkan::reflect::KERNEL_GRID_PUSH_CONSTANT_SIZE
+);
+
 pub struct ShaderVariant {
     /// Process-local identity used by semantic execution requests.
     ///
@@ -344,6 +389,14 @@ pub struct ShaderVariant {
     /// the shader content that produced them rather than with an invented
     /// executor cache bound.
     pub id: reims_vgpu_protocol::PreparedShaderId,
+    /// Where this kernel reads its exact Metal thread grid, when the translated
+    /// entry point culls its surplus invocations against one.
+    ///
+    /// `None` for every render stage, and for a kernel the translator proved
+    /// needs no cull. Derived from reflection here, beside the other
+    /// reflection-derived facts, because the answer depends only on the
+    /// translated shader and must not be rediscovered per dispatch.
+    pub kernel_grid: Option<KernelGridRange>,
     /// The module, in this variant's numbering.
     pub words: Arc<Vec<u32>>,
     /// The typed sampler descriptors reflection declares, transformed into
@@ -412,6 +465,7 @@ impl ShaderVariant {
         samplers: Arc<[crate::spirv_bind::ReflectedSamplerDescriptor]>,
         vertex_inputs: crate::spirv_vertex_input::VertexInputWidths,
         declared_bindings: Arc<[u32]>,
+        kernel_grid: Option<KernelGridRange>,
     ) -> Arc<Self> {
         let used_descriptor_bindings = declared_bindings
             .iter()
@@ -424,6 +478,7 @@ impl ShaderVariant {
         let variant = Arc::new(Self {
             id: allocate_prepared_shader_id(),
             words,
+            kernel_grid,
             samplers,
             declared_bindings,
             used_descriptor_bindings,
@@ -788,11 +843,24 @@ pub fn specialize_render_samplers(
 #[cfg(any(test, feature = "test-fixtures"))]
 pub fn prepare_shader_words(words: Vec<u32>) -> Arc<ShaderVariant> {
     let declared_bindings = crate::spirv_bind::declared_binding_numbers(&words).into();
+    // A fixture hands over raw module words with no reflection beside them, so
+    // the kernel-grid range has to come from the module itself. Every module
+    // metal2vulkan emits for a kernel places that block at the contract's
+    // default offset, which is what this reconstructs — and a module with no
+    // push-constant variable gets `None`, which is also what a render stage
+    // gets. Real shaders never come through here: they carry reflection, and
+    // reflection stays the authority for them.
+    let kernel_grid =
+        crate::spirv_bind::declares_push_constants(&words).then_some(KernelGridRange {
+            offset: metal2vulkan::reflect::DEFAULT_KERNEL_GRID_PUSH_CONSTANT_OFFSET,
+            size: metal2vulkan::reflect::KERNEL_GRID_PUSH_CONSTANT_SIZE,
+        });
     ShaderVariant::of(
         Arc::new(words),
         Arc::from([]),
         crate::spirv_vertex_input::VertexInputWidths::unknown(),
         declared_bindings,
+        kernel_grid,
     )
 }
 
@@ -836,6 +904,8 @@ pub fn empty_test_shader(stage: RenderTranslationStage) -> Arc<CachedShader> {
             reflection_version: REFLECTION_VERSION,
             descriptor_layout: Default::default(),
             stage,
+            // A render fixture, so there is no dispatch grid to cull against.
+            kernel_dispatch: None,
             entry_point: None,
             bindings: vec![],
             argument_buffer_fields: vec![],
@@ -1386,6 +1456,10 @@ impl CachedShader {
                         &self.reflection.vertex_attributes,
                     ),
                     crate::spirv_bind::reflected_descriptor_bindings(&self.reflection).into(),
+                    self.reflection
+                        .kernel_dispatch
+                        .and_then(metal2vulkan::reflect::KernelDispatch::push_constant_range)
+                        .map(KernelGridRange::from),
                 )
             })
             .clone()

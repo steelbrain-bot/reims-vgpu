@@ -388,8 +388,7 @@ impl LinearTextureDescriptor {
 
     pub fn declared_pixel_format(&self) -> Option<u16> {
         self.declaration
-            .map(|declaration| declaration.pixel_format)
-            .filter(|format| *format != 0)
+            .and_then(|declaration| declaration.declared_pixel_format())
     }
 
     pub fn declared_usage(&self) -> Option<u32> {

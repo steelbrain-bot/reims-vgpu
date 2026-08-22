@@ -4013,6 +4013,9 @@ pub(crate) unsafe fn execute_draw_inner(
         ));
     }
     let layout_key = LayoutKey {
+        // A render stage never culls a dispatch grid, so it exposes no
+        // push-constant range and cannot share a kernel's layout.
+        kernel_grid: None,
         bindings: layout_bindings,
     };
     // Resolve the serialized load source. A newly imported attachment does not

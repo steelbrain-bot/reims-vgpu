@@ -85,6 +85,16 @@ pub(crate) struct BindingSig {
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct LayoutKey {
     pub bindings: Vec<BindingSig>,
+    /// The kernel-grid push-constant range this layout must expose, when the
+    /// stage using it is a compute kernel that culls its surplus invocations.
+    ///
+    /// Part of the key and not a side input: two stages with identical bindings
+    /// and different push-constant ranges are different pipeline layouts, and
+    /// a graphics stage shares this cache. Leaving it out would let a render
+    /// layout satisfy a kernel's lookup and hand back a layout with no range,
+    /// where the push is then invalid usage and the cull reads whatever the
+    /// driver leaves behind.
+    pub kernel_grid: Option<super::super::m2v_cache::KernelGridRange>,
 }
 
 impl LayoutKey {
@@ -1617,10 +1627,22 @@ impl ObjectCaches {
         } else {
             vec![dsl]
         };
+        let push_ranges: Vec<vk::PushConstantRange> = key
+            .kernel_grid
+            .into_iter()
+            .map(|range| {
+                vk::PushConstantRange::default()
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                    .offset(range.offset)
+                    .size(range.size)
+            })
+            .collect();
         let pl = ctx
             .device
             .create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts),
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(&layouts)
+                    .push_constant_ranges(&push_ranges),
                 None,
             )
             .map_err(|e| {

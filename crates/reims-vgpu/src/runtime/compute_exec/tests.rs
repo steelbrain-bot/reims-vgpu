@@ -25,6 +25,21 @@ use reims_vgpu_paging::geometry::{
 };
 use reims_vgpu_wire::device_desc::IOSurfacePlaneViewBuilder;
 
+/// A whole-workgroup dispatch of `counts` groups of `local` threads.
+///
+/// Fixtures here name workgroup counts, because that is what they dispatch.
+/// The plan also carries the exact thread grid a translated kernel would cull
+/// against, and for whole workgroups that is every thread of every group — so
+/// the local size has to be named rather than assumed, and a fixture whose
+/// SPIR-V declares `LocalSize 64 1 1` says so here too.
+fn whole_workgroups(
+    counts: [u32; 3],
+    local: [u32; 3],
+) -> reims_vgpu_protocol::dispatch::WorkgroupPlan {
+    reims_vgpu_protocol::dispatch::workgroup_counts(counts, local, false)
+        .expect("fixture dispatch dimensions are non-zero")
+}
+
 #[test]
 fn argument_buffer_reflection_decline_carries_the_owner_coordinate() {
     use crate::observe::Decline as _;
@@ -1901,7 +1916,7 @@ fn incomplete_compute_engine_call_fires_stall_proxy() {
             ..Default::default()
         },
         entry: "main".into(),
-        grid: [1, 1, 1],
+        dispatch: whole_workgroups([1, 1, 1], [1, 1, 1]),
         ..Default::default()
     };
     let done = spawn_compute_engine_stall_watchdog(pipe, &req, Duration::from_millis(10));
@@ -2834,4 +2849,181 @@ fn a_sampled_image_the_kernel_uses_and_the_guest_left_empty_stays_null() {
         ),
         vec![33]
     );
+}
+
+/// Build one task with a buffer at ref 7 and a buffer-backed texture at ref 10
+/// over it, and return the state, host and the texture's first-row GVA.
+///
+/// `bytes_per_row` and `offset` are the two fields
+/// `newTextureWithDescriptor:offset:bytesPerRow:` adds to a texture
+/// descriptor, so they are what a case here varies.
+fn buffer_backed_texture_task(
+    width: u32,
+    height: u32,
+    offset: u64,
+    bytes_per_row: u64,
+    allocation_size: u64,
+) -> (Device, FakeHost, u64) {
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_wire::ops::backed_texture::{
+        BufferTextureBody, BUFFER_TEXTURE_TOTAL_LEN, OPCODE_BUFFER_TEXTURE,
+    };
+
+    const OP_HEADER: usize = reims_vgpu_wire::OP_HEADER_LEN;
+    const BUFFER_REF: u32 = 7;
+    const TEXTURE_REF: u32 = 10;
+    const BUFFER_HANDLE: u32 = 5;
+
+    let mut host = FakeHost::new();
+    host.stable_map_pages = true;
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
+
+    // The buffer that owns the storage.
+    let buffer_gva = u64::from(BUFFER_HANDLE) << RESOURCE_PAGE_SHIFT;
+    let mut buffer_descriptor = [0u8; 16];
+    st64(&mut buffer_descriptor[0..], allocation_size);
+    st32(&mut buffer_descriptor[8..], BUFFER_HANDLE);
+    let buffer_descriptor_gva = 0x180u64;
+    write_task_gva_arm64e(
+        &mut host,
+        &state.tasks[1],
+        buffer_descriptor_gva,
+        &buffer_descriptor,
+    );
+    let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(&mut entry[0..], (OBJECT_TYPE_BUFFER as u32) | (16u32 << 8));
+    entry[4..12].copy_from_slice(&buffer_descriptor_gva.to_le_bytes());
+    write_task_gva_arm64e(
+        &mut host,
+        &state.tasks[1],
+        list_object_entry_offset(BUFFER_REF, 32).unwrap(),
+        &entry,
+    );
+
+    // The opcode-9 record placing a texture over it.
+    let mut record = vec![0u8; BUFFER_TEXTURE_TOTAL_LEN as usize];
+    st32(&mut record[0..], OPCODE_BUFFER_TEXTURE);
+    st32(&mut record[4..], BUFFER_TEXTURE_TOTAL_LEN);
+    st32(&mut record[8..], TEXTURE_REF);
+    let buffer_ref_at = OP_HEADER + std::mem::offset_of!(BufferTextureBody, buffer_ref);
+    let offset_at = OP_HEADER + std::mem::offset_of!(BufferTextureBody, offset);
+    let bytes_per_row_at = OP_HEADER + std::mem::offset_of!(BufferTextureBody, bytes_per_row);
+    let descriptor_at = OP_HEADER + std::mem::offset_of!(BufferTextureBody, desc);
+    st32(&mut record[buffer_ref_at..], BUFFER_REF);
+    st64(&mut record[offset_at..], offset);
+    st64(&mut record[bytes_per_row_at..], bytes_per_row);
+    // 2D, usage=3, BGRA8Unorm, one mip / sample / array element, shared.
+    st32(
+        &mut record[descriptor_at..],
+        2 | (3 << 8) | ((MTL_FORMAT_BGRA8_UNORM as u32) << 16),
+    );
+    st32(&mut record[descriptor_at + 4..], width);
+    st32(&mut record[descriptor_at + 8..], height);
+    st32(&mut record[descriptor_at + 12..], 1);
+    for (field, value) in [(16usize, 1u16), (18, 1), (20, 1), (22, 0)] {
+        record[descriptor_at + field..descriptor_at + field + 2]
+            .copy_from_slice(&value.to_le_bytes());
+    }
+    let record_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], record_gva, &record);
+    let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(
+        &mut entry[0..],
+        (crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_VIEW as u32)
+            | (BUFFER_TEXTURE_TOTAL_LEN << 8),
+    );
+    entry[4..12].copy_from_slice(&record_gva.to_le_bytes());
+    write_task_gva_arm64e(
+        &mut host,
+        &state.tasks[1],
+        list_object_entry_offset(TEXTURE_REF, 32).unwrap(),
+        &entry,
+    );
+
+    (state, host, buffer_gva + offset)
+}
+
+/// A texture over an `MTLBuffer`'s storage is a linear window like any other.
+///
+/// It used to be refused outright as `compute_buffer_texture_unsupported`,
+/// which cost the guest every compute bind of one — and the construction is
+/// how a guest hands the same bytes to a kernel as texels and as a buffer, so
+/// the loss is not a corner. The window must reach the guest pages through the
+/// **buffer's** alias: a second alias over one allocation is exactly what this
+/// construction exists to avoid.
+#[test]
+fn a_buffer_backed_texture_stages_as_a_linear_window_over_its_buffer() {
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+
+    let (mut state, mut host, first_row_gva) =
+        buffer_backed_texture_task(60, 16, 0x100, 256, 0x4000);
+    crate::runtime::guest_ram_map::reset();
+    crate::runtime::guest_ram::latch_import_limits(1 << PAGE_SHIFT_ARM64E, 1 << 30, 1 << 30);
+    let staged = stage_texture_raw(&mut state, &mut host, 1, 10, 32, false)
+        .expect("a buffer-backed texture must stage");
+    crate::runtime::guest_ram::forget_import_limits();
+    crate::runtime::guest_ram_map::reset();
+
+    assert_eq!((staged.width, staged.height), (60, 16));
+    assert_eq!(staged.pixel_format, MTL_FORMAT_BGRA8_UNORM);
+    match &staged.input {
+        VulkanTextureInput::GuestPages(source) => {
+            // The last row is tight, not a full stride: Metal does not require
+            // the final row's trailing pad to be inside the allocation.
+            assert_eq!(source.total_len, 15 * 256 + 60 * 4);
+            assert_eq!(source.source_offset, 0x100);
+            // 256 bytes of stride over a 4-byte texel is 64 texels of row
+            // length against 60 texels of content, which is what tells the
+            // copy where each row starts.
+            assert_eq!(source.row_length_texels, 64);
+        }
+        _ => panic!("an importable buffer texture must retain guest pages"),
+    }
+    // Keyed by the buffer, so a kernel binding ref 7 as a buffer and ref 10 as
+    // a texture shares one alias rather than importing the allocation twice.
+    assert!(state.bound_buffers.packed(1, 7).is_some());
+    assert!(state.bound_buffers.packed(1, 10).is_none());
+    assert_eq!(first_row_gva, (5u64 << RESOURCE_PAGE_SHIFT) + 0x100);
+}
+
+/// The window must fit the buffer the guest named.
+///
+/// A placement is arithmetic over an allocation this device does not own, so
+/// an offset and pitch that reach past the end are refused by name rather than
+/// read — the CPU fallback walks by GVA and would happily read whatever the
+/// next allocation put there.
+#[test]
+fn a_buffer_backed_texture_past_the_end_of_its_buffer_is_refused_by_name() {
+    // 16 rows of 256 bytes from 0x100 reaches 0x1000, one byte past a 0xfff
+    // allocation.
+    let (mut state, mut host, _) = buffer_backed_texture_task(64, 16, 0x100, 256, 0xfff);
+    match stage_texture_raw(&mut state, &mut host, 1, 10, 32, false) {
+        Err(ComputeStatus::MissingTexture("compute_buffer_tex_span_oob")) => {}
+        Err(other) => panic!("expected span_oob, got {}", other.reason()),
+        Ok(_) => panic!("a window past the allocation must be refused, not staged"),
+    }
+}
+
+/// A `bytesPerRow` of zero is the API's own spelling of one tight row, which
+/// is what Metal accepts for a 1D or texture-buffer texture. It is a declared
+/// value of the field, so it is read rather than treated as a missing pitch.
+#[test]
+fn a_zero_bytes_per_row_buffer_texture_is_tight_rows() {
+    let (mut state, mut host, _) = buffer_backed_texture_task(64, 1, 0, 0, 0x4000);
+    crate::runtime::guest_ram_map::reset();
+    crate::runtime::guest_ram::latch_import_limits(1 << PAGE_SHIFT_ARM64E, 1 << 30, 1 << 30);
+    let staged = stage_texture_raw(&mut state, &mut host, 1, 10, 32, false)
+        .expect("a tight-row buffer-backed texture must stage");
+    crate::runtime::guest_ram::forget_import_limits();
+    crate::runtime::guest_ram_map::reset();
+    match &staged.input {
+        VulkanTextureInput::GuestPages(source) => {
+            assert_eq!(source.total_len, 64 * 4);
+            // Tight rows need no row length: the copy's own extent is the pitch.
+            assert_eq!(source.row_length_texels, 0);
+        }
+        _ => panic!("expected guest pages"),
+    }
 }

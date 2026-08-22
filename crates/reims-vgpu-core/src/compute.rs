@@ -76,7 +76,16 @@ impl SamplerResource {
 pub struct ComputeRequest {
     pub program: crate::PreparedShaderStage,
     pub entry: String,
-    pub grid: [u32; 3],
+    /// Workgroup counts **and** the exact Metal thread grid they round up to.
+    ///
+    /// Both halves are needed to record one dispatch: `vkCmdDispatch` takes the
+    /// counts, and the translated entry point culls its surplus invocations
+    /// against the thread grid. Carrying the plan rather than a bare `[u32; 3]`
+    /// is what stops a backend recording the first without the second — which
+    /// is not a missing optimization but the whole of Metal's exact-grid
+    /// contract, and was silently unmet for as long as this field was the
+    /// quotient alone.
+    pub dispatch: reims_vgpu_protocol::dispatch::WorkgroupPlan,
     pub storage_buffers: Vec<ComputeBufferResource>,
     pub sampled_images: Vec<ComputeSampledImageResource>,
     pub samplers: Vec<SamplerResource>,

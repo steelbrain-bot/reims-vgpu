@@ -116,6 +116,21 @@ pub struct TextureDeclaration {
 }
 
 impl TextureDeclaration {
+    /// The declared pixel format, or `None` when the declaration carries none.
+    ///
+    /// `MTLPixelFormatInvalid` is zero and no texture can be created with it,
+    /// so a zero here is the field being absent rather than a format to place
+    /// arithmetic on. Stated once, because every consumer that read the field
+    /// raw had to know the rule and one of them defaulted instead.
+    #[must_use]
+    pub const fn declared_pixel_format(&self) -> Option<u16> {
+        if self.pixel_format == 0 {
+            None
+        } else {
+            Some(self.pixel_format)
+        }
+    }
+
     /// [`StorageMode`] projected from this declaration's `resource_options`.
     ///
     /// Derived rather than stored, so there is no second spelling of the mode

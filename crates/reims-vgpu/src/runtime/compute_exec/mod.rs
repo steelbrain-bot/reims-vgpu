@@ -1747,6 +1747,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     let mut view_level = 0;
     let mut view_pixel_format = None;
     let mut heap_texture = None;
+    let mut buffer_texture = None;
     // A linear texture object (type-2/3) must resolve through its own
     // descriptor, never through the mapping registry: its numeric ref shares
     // the id space with surface backing surface mids, so the `mappings.contains(ref)`
@@ -1786,14 +1787,12 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                     }
                     heap_texture = Some((heap_ref, use_offset, offset, record.declaration));
                 }
-                Ok(ResourceDescriptor::BufferTexture(_)) => {
-                    crate::observe::fail(format!(
-                        "compute_stage_tex view_fail reason=buffer_texture_unsupported ref={texture_ref} desc_len={}",
-                        resource.descriptor().len()
-                    ));
-                    return Err(ComputeStatus::Unsupported(
-                        "compute_buffer_texture_unsupported",
-                    ));
+                Ok(ResourceDescriptor::BufferTexture(record)) => {
+                    // A texture over an MTLBuffer's own storage. It is not a
+                    // view over another texture and has no surface behind it,
+                    // so it skips every path below and goes straight to the
+                    // linear rail, which is what it already is.
+                    buffer_texture = Some(*record);
                 }
                 Ok(ResourceDescriptor::TextureView(_)) => {
                     let view = match crate::runtime::draw::resolve_texture_view_reasoned(
@@ -1962,6 +1961,25 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                 .unwrap_or_else(|| VulkanTextureInput::HostBytes(vec![0; need])),
             writeback: TextureWriteback::None,
         });
+    }
+    // Before the surface classification, not after it: a buffer-backed
+    // texture's ref shares its id space with surface backing mids, so the
+    // `mappings.contains(ref)` fallback below would hand it a same-numbered
+    // surface. That is the collision the type-2/3 arm already forces past with
+    // `ref_is_linear`, and this form has no reason to enter the question at
+    // all — it names its storage outright.
+    if let Some(record) = buffer_texture {
+        let placement = buffer_texture_placement(state, host, task_id, texture_ref, &record)?;
+        return stage_linear_placement(
+            state,
+            host,
+            task_id,
+            texture_ref,
+            binding,
+            is_storage,
+            view_pixel_format,
+            placement,
+        );
     }
     let stage_entry = objects::lookup_list_entry(state, host, task_id, stage_ref);
     let ref_is_linear = stage_entry
@@ -2412,35 +2430,107 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         });
     }
 
-    // Type-2/3 linear. Fail-visible: name which gate rejected (live class:
-    // silent ot=2 MissingTexture, journal 2026-07-14 compute census).
-    // The reason travels *in* the status now, so this line and the caller's
-    // both name the registered slug rather than a local shorthand only this
-    // closure understood.
-    let linear_fail = |st: ComputeStatus, detail: String| {
-        crate::observe::fail(format!(
-            "compute_stage_tex linear_fail reason={} ref={texture_ref} {detail}",
-            st.reason()
-        ));
-        Err(st)
-    };
+    // Type-2/3 linear. The buffer-backed form took the same rail above, from
+    // its own placement — see [`LinearPlacement`].
+    let placement =
+        linear_texture_placement(state, host, task_id, texture_ref, stage_ref, view_level)?;
+    stage_linear_placement(
+        state,
+        host,
+        task_id,
+        texture_ref,
+        binding,
+        is_storage,
+        view_pixel_format,
+        placement,
+    )
+}
+
+/// A texture whose texels are a strided window over one guest allocation.
+///
+/// Two guest constructions produce one of these, and the only difference
+/// between them is which descriptor was read. A type-2/3 linear texture object
+/// names its own allocation and a mip level within it. An opcode-9
+/// buffer-backed texture — `newTextureWithDescriptor:offset:bytesPerRow:` —
+/// names an `MTLBuffer`, a byte offset into it, and a row pitch. Past this
+/// point they are the same object: a first row at a GVA, a stride, an extent,
+/// and a format. Everything the rail does after that — the window cache, the
+/// residency key, the packed guest alias, the storage writeback — is arithmetic
+/// over exactly these fields, which is why it takes this rather than either
+/// descriptor.
+///
+/// The two refs are separate because for a buffer-backed texture they are two
+/// different guest objects, and each is the right key for a different question.
+struct LinearPlacement {
+    /// The texture object the shader bound. Identity for the host-bytes window
+    /// cache, the residency key, and the storage writeback — all questions
+    /// about *this texture's* content.
+    texture_ref: u32,
+    /// The object that owns the guest allocation holding the texels: the
+    /// texture itself for a linear texture object, the **buffer** for a
+    /// buffer-backed one.
+    ///
+    /// This keys the packed alias, so a buffer the guest binds both as a buffer
+    /// and as a texture over the same bytes resolves to one alias rather than
+    /// two aliases of one allocation — which is the whole point of the
+    /// construction, and the case a guest uses it for.
+    storage_ref: u32,
+    /// First byte of the allocation named by `storage_ref`, and its length.
+    allocation_gva: u64,
+    allocation_size: u64,
+    /// First byte of this texture's first row.
+    gva: u64,
+    /// The pixel format the descriptor declared, before any view override.
+    declared_format: u16,
+    width: u32,
+    height: u32,
+    row_stride: u64,
+}
+
+/// Name which gate a linear placement or stage failed at.
+///
+/// Shared by both constructors and the rail so a refusal reads the same
+/// whichever descriptor produced the placement — the reason travels in the
+/// status, so this line and the caller's name one registered slug.
+fn linear_fail<T>(bound_ref: u32, status: ComputeStatus, detail: &str) -> Result<T, ComputeStatus> {
+    crate::observe::fail(format!(
+        "compute_stage_tex linear_fail reason={} ref={bound_ref} {detail}",
+        status.reason()
+    ));
+    Err(status)
+}
+
+/// Place a type-2/3 linear texture object's `view_level`.
+///
+/// Fail-visible: name which gate rejected (live class: silent ot=2
+/// MissingTexture, journal 2026-07-14 compute census).
+fn linear_texture_placement<M: HostMemory + HostOps>(
+    state: &mut Device,
+    host: &mut M,
+    task_id: u32,
+    bound_ref: u32,
+    stage_ref: u32,
+    view_level: u32,
+) -> Result<LinearPlacement, ComputeStatus> {
     let resource = match objects::resolve_resource(state, host, task_id, stage_ref) {
         Ok(resource) if resource.entry().kind == ObjectKind::Texture => resource,
         Ok(resource) => {
             return linear_fail(
+                bound_ref,
                 ComputeStatus::MissingTexture(crate::observe::ladder_slug!(
                     "compute_linear_tex",
                     wrong_type
                 )),
-                format!("ot={}", resource.entry().kind),
+                &format!("ot={}", resource.entry().kind),
             );
         }
         Err(rung) => {
             return linear_fail(
+                bound_ref,
                 ComputeStatus::MissingTexture(crate::observe::ladder_slugs!("compute_linear_tex")(
                     rung,
                 )),
-                match rung {
+                &match rung {
                     objects::LadderRung::WrongType { got } => format!("ot={got}"),
                     objects::LadderRung::NoListEntry | objects::LadderRung::DescRead { .. } => {
                         String::new()
@@ -2451,47 +2541,39 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     };
     let Ok(ResourceDescriptor::Texture(tex)) = objects::decoded_resource(&resource) else {
         return linear_fail(
+            bound_ref,
             ComputeStatus::MissingTexture(crate::observe::ladder_slug!(
                 "compute_linear_tex",
                 desc_decode
             )),
-            format!("len={}", resource.descriptor().len()),
+            &format!("len={}", resource.descriptor().len()),
         );
     };
-    let Some(base_format) = tex.declared_pixel_format() else {
+    let Some(declared_format) = tex.declared_pixel_format() else {
         return linear_fail(
+            bound_ref,
             ComputeStatus::Unsupported("linear_tex_no_fmt"),
-            String::new(),
+            "",
         );
     };
-    let Some(stage_format) =
-        crate::runtime::draw::effective_view_sample_format(base_format, view_pixel_format)
-    else {
+    // `level_gva` derives the level's first row from this same base, so a
+    // placement can only fail here if it would have failed there — naming it
+    // separately says *which* of the two the descriptor lacked.
+    let Some(allocation_gva) = tex.allocation_base_gva(state.page_shift) else {
         return linear_fail(
-            ComputeStatus::Unsupported("linear_tex_view_format"),
-            format!(
-                "base={stage_ref} base_fmt={:#x} view_fmt={view_pixel_format:?}",
-                base_format
+            bound_ref,
+            ComputeStatus::MissingTexture("compute_linear_tex_no_allocation"),
+            &format!(
+                "base={stage_ref} handle={:#x} page_shift={}",
+                tex.handle, state.page_shift
             ),
         );
     };
-    let Some(bpp) = pixel_format::bytes_per_pixel(stage_format) else {
-        return linear_fail(
-            ComputeStatus::Unsupported("linear_tex_fmt_bytes"),
-            format!("fmt={stage_format:#x}"),
-        );
-    };
-    let storage_format = pixel_format::storage_image_format(stage_format);
-    if is_storage && storage_format.is_none() {
-        return linear_fail(
-            ComputeStatus::Unsupported("linear_tex_fmt_storage"),
-            format!("fmt={stage_format:#x}"),
-        );
-    }
     let Some((gva, layout)) = tex.level_gva(view_level, state.page_shift) else {
         return linear_fail(
+            bound_ref,
             ComputeStatus::MissingTexture("compute_linear_tex_no_level"),
-            format!(
+            &format!(
                 "base={stage_ref} level={view_level} handle={:#x} alloc={} levels={} base_off={} page_shift={}",
                 tex.handle,
                 tex.allocation_size,
@@ -2501,30 +2583,238 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             ),
         );
     };
-    let w = layout.width;
-    let h = layout.height;
-    if w == 0 || h == 0 || layout.row_stride == 0 {
+    Ok(LinearPlacement {
+        texture_ref: stage_ref,
+        storage_ref: stage_ref,
+        allocation_gva,
+        allocation_size: tex.allocation_size,
+        gva,
+        declared_format,
+        width: layout.width,
+        height: layout.height,
+        row_stride: layout.row_stride,
+    })
+}
+
+/// Place an opcode-9 buffer-backed texture over its `MTLBuffer`.
+///
+/// `newTextureWithDescriptor:offset:bytesPerRow:` admits exactly one shape —
+/// one mip level, one slice, one sample, one depth plane — so anything else
+/// here is a descriptor this device decoded wrongly rather than a texture it
+/// could place, and it refuses by name instead of placing a window whose
+/// arithmetic would be a guess.
+fn buffer_texture_placement<M: HostMemory + HostOps>(
+    state: &mut Device,
+    host: &mut M,
+    task_id: u32,
+    bound_ref: u32,
+    record: &reims_vgpu_protocol::BufferTextureDescriptor,
+) -> Result<LinearPlacement, ComputeStatus> {
+    let declaration = &record.desc;
+    if declaration.depth > 1
+        || declaration.mipmap_level_count > 1
+        || declaration.sample_count > 1
+        || declaration.array_length > 1
+    {
         return linear_fail(
+            bound_ref,
+            ComputeStatus::Unsupported("compute_buffer_tex_shape"),
+            &format!(
+                "buf={} type={} dims={}x{}x{} mips={} samples={} array={}",
+                record.buffer_ref,
+                declaration.texture_type,
+                declaration.width,
+                declaration.height,
+                declaration.depth,
+                declaration.mipmap_level_count,
+                declaration.sample_count,
+                declaration.array_length
+            ),
+        );
+    }
+    let Some(declared_format) = declaration.declared_pixel_format() else {
+        return linear_fail(
+            bound_ref,
+            ComputeStatus::Unsupported("compute_buffer_tex_no_fmt"),
+            &format!("buf={}", record.buffer_ref),
+        );
+    };
+    let Some(bpp) = pixel_format::bytes_per_pixel(declared_format) else {
+        return linear_fail(
+            bound_ref,
+            ComputeStatus::Unsupported("compute_buffer_tex_fmt_bytes"),
+            &format!("buf={} fmt={declared_format:#x}", record.buffer_ref),
+        );
+    };
+    let (allocation_gva, allocation_size) =
+        match objects::resolve_buffer_span(state, host, task_id, record.buffer_ref) {
+            Ok(span) => span,
+            Err(refusal) => {
+                let slug = match refusal {
+                    objects::BufferSpanRefusal::Rung(rung) => {
+                        crate::observe::ladder_slugs!("compute_buffer_tex")(rung)
+                    }
+                    objects::BufferSpanRefusal::Decode => {
+                        crate::observe::ladder_slug!("compute_buffer_tex", desc_decode)
+                    }
+                    objects::BufferSpanRefusal::NoBacking => "compute_buffer_tex_no_backing",
+                };
+                return linear_fail(
+                    bound_ref,
+                    ComputeStatus::MissingTexture(slug),
+                    &format!("buf={}", record.buffer_ref),
+                );
+            }
+        };
+    // A `bytesPerRow` of 0 is the API's own spelling of one tight row, which is
+    // what Metal accepts for a 1D or texture-buffer texture. It is a declared
+    // value of the field, not an absent one, so it is read here rather than
+    // treated as a missing pitch.
+    let tight = u64::from(declaration.width).checked_mul(u64::from(bpp));
+    let row_stride = if record.bytes_per_row == 0 {
+        tight
+    } else {
+        Some(record.bytes_per_row)
+    };
+    // The window must fit the buffer the guest named. The last row is `tight`
+    // bytes, not a full stride, because Metal does not require the trailing pad
+    // of the final row to be inside the allocation.
+    let reach = row_stride.zip(tight).and_then(|(stride, tight)| {
+        u64::from(declaration.height.saturating_sub(1))
+            .checked_mul(stride)?
+            .checked_add(tight)?
+            .checked_add(record.offset)
+    });
+    let (Some(row_stride), Some(reach)) = (row_stride, reach) else {
+        return linear_fail(
+            bound_ref,
+            ComputeStatus::Unsupported("compute_buffer_tex_reach_overflow"),
+            &format!(
+                "buf={} off={} bpr={} {}x{} bpp={bpp}",
+                record.buffer_ref,
+                record.offset,
+                record.bytes_per_row,
+                declaration.width,
+                declaration.height
+            ),
+        );
+    };
+    if reach > allocation_size {
+        return linear_fail(
+            bound_ref,
+            ComputeStatus::MissingTexture("compute_buffer_tex_span_oob"),
+            &format!(
+                "buf={} off={} bpr={row_stride} reach={reach} alloc={allocation_size} {}x{}",
+                record.buffer_ref, record.offset, declaration.width, declaration.height
+            ),
+        );
+    }
+    let Some(gva) = allocation_gva.checked_add(record.offset) else {
+        return linear_fail(
+            bound_ref,
+            ComputeStatus::MissingTexture("compute_buffer_tex_offset_overflow"),
+            &format!(
+                "buf={} base={allocation_gva:#x} off={}",
+                record.buffer_ref, record.offset
+            ),
+        );
+    };
+    Ok(LinearPlacement {
+        // The bound texture object is this content's identity even though the
+        // bytes belong to the buffer: two textures over one buffer at different
+        // offsets are two textures, and the window cache and residency mirror
+        // must not confuse them.
+        texture_ref: bound_ref,
+        storage_ref: record.buffer_ref,
+        allocation_gva,
+        allocation_size,
+        gva,
+        declared_format,
+        width: declaration.width,
+        height: declaration.height,
+        row_stride,
+    })
+}
+
+/// Stage a linear placement: resident if the engine already holds this window,
+/// a zero-copy guest alias if the pages can be packed, host bytes otherwise.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the bind's access mode and view format decide the staged format, and neither belongs in the placement"
+)]
+fn stage_linear_placement<M: HostMemory + HostOps>(
+    state: &mut Device,
+    host: &mut M,
+    task_id: u32,
+    bound_ref: u32,
+    binding: u32,
+    is_storage: bool,
+    view_pixel_format: Option<u16>,
+    placement: LinearPlacement,
+) -> Result<StagedTexture, ComputeStatus> {
+    let LinearPlacement {
+        texture_ref,
+        storage_ref,
+        allocation_gva,
+        allocation_size,
+        gva,
+        declared_format,
+        width: w,
+        height: h,
+        row_stride,
+    } = placement;
+    let Some(stage_format) =
+        crate::runtime::draw::effective_view_sample_format(declared_format, view_pixel_format)
+    else {
+        return linear_fail(
+            bound_ref,
+            ComputeStatus::Unsupported("linear_tex_view_format"),
+            &format!(
+                "base={texture_ref} base_fmt={declared_format:#x} view_fmt={view_pixel_format:?}"
+            ),
+        );
+    };
+    let Some(bpp) = pixel_format::bytes_per_pixel(stage_format) else {
+        return linear_fail(
+            bound_ref,
+            ComputeStatus::Unsupported("linear_tex_fmt_bytes"),
+            &format!("fmt={stage_format:#x}"),
+        );
+    };
+    let storage_format = pixel_format::storage_image_format(stage_format);
+    if is_storage && storage_format.is_none() {
+        return linear_fail(
+            bound_ref,
+            ComputeStatus::Unsupported("linear_tex_fmt_storage"),
+            &format!("fmt={stage_format:#x}"),
+        );
+    }
+    if w == 0 || h == 0 || row_stride == 0 {
+        return linear_fail(
+            bound_ref,
             ComputeStatus::MissingTexture("compute_linear_tex_zero_geom"),
-            format!("{w}x{h} stride={}", layout.row_stride),
+            &format!("{w}x{h} stride={row_stride}"),
         );
     }
     let Some(tight) = (w as u64).checked_mul(bpp as u64).map(|v| v as usize) else {
         return linear_fail(
+            bound_ref,
             ComputeStatus::Unsupported("linear_tex_tight_overflow"),
-            format!("{w}x{h} bpp={bpp}"),
+            &format!("{w}x{h} bpp={bpp}"),
         );
     };
-    if layout.row_stride < tight as u64 {
+    if row_stride < tight as u64 {
         return linear_fail(
+            bound_ref,
             ComputeStatus::MissingTexture("compute_linear_tex_stride_lt_tight"),
-            format!("stride={} tight={tight} {w}x{h}", layout.row_stride),
+            &format!("stride={row_stride} tight={tight} {w}x{h}"),
         );
     }
     let Some(need) = tight.checked_mul(h as usize) else {
         return linear_fail(
+            bound_ref,
             ComputeStatus::Unsupported("linear_tex_need_overflow"),
-            format!("{w}x{h} bpp={bpp}"),
+            &format!("{w}x{h} bpp={bpp}"),
         );
     };
     // The identity every cache question below asks about. Built once so the
@@ -2532,25 +2822,25 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     // from each other.
     let window = crate::runtime::surface_cache::LinearWindow {
         task_id,
-        texture_ref: stage_ref,
+        texture_ref,
         gva,
         pixel_format: stage_format,
         width: w,
         height: h,
-        row_stride: layout.row_stride,
+        row_stride,
     };
     // Linear-window residency identity — mirrors the host_linear_textures
     // entry exactly. Absent when the stride overflows the key field (no live
     // class; such a window simply stays on the bytes path).
-    let span = layout.row_stride.saturating_mul(h as u64);
-    let linear_key = (layout.row_stride <= u32::MAX as u64)
-        .then(|| state.task_objects.resources.identity(task_id, stage_ref))
+    let span = row_stride.saturating_mul(h as u64);
+    let linear_key = (row_stride <= u32::MAX as u64)
+        .then(|| state.task_objects.resources.identity(task_id, texture_ref))
         .flatten()
         .map(|resource| {
             crate::model::ComputeStorageResidencyKey::linear(
                 resource,
                 gva,
-                layout.row_stride as u32,
+                row_stride as u32,
                 span,
                 w,
                 h,
@@ -2576,31 +2866,38 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     } else {
         // A pending Store is queue work, not host bytes. Submit it before this
         // source read so both operations are ordered on the engine queue.
-        crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
+        crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, bound_ref);
+        // A buffer-backed texture is two contract references over one
+        // allocation — the texture the shader binds and the buffer that owns
+        // the storage — and a synchronize may name either, so a debt may be
+        // armed under either. Both are paid. No-op when they are the same
+        // reference, which is every other placement.
+        if storage_ref != bound_ref {
+            crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, storage_ref);
+        }
         let exact_span = (h.saturating_sub(1) as u64)
-            .checked_mul(layout.row_stride)
+            .checked_mul(row_stride)
             .and_then(|prefix| prefix.checked_add(tight as u64));
         let guest = exact_span.and_then(|span| {
-            let allocation_gva = tex.allocation_base_gva(state.page_shift)?;
             let level_offset = gva.checked_sub(allocation_gva)?;
-            let row_length_texels = if layout.row_stride == tight as u64 {
+            let row_length_texels = if row_stride == tight as u64 {
                 0
             } else {
-                u32::try_from(layout.row_stride.checked_div(u64::from(bpp))?).ok()?
+                u32::try_from(row_stride.checked_div(u64::from(bpp))?).ok()?
             };
             if !crate::runtime::bound_buffers::ensure_packed_resource(
                 state,
                 host,
                 task_id,
-                stage_ref,
+                storage_ref,
                 allocation_gva,
-                tex.allocation_size,
+                allocation_size,
                 crate::runtime::bound_buffers::PackedResourceUse::ComputeTexture,
             ) {
                 return None;
             }
             let crate::runtime::bound_buffers::PackedBufferResolution::Available(packed) =
-                state.bound_buffers.packed(task_id, stage_ref)?
+                state.bound_buffers.packed(task_id, storage_ref)?
             else {
                 return None;
             };
@@ -2617,22 +2914,14 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                 state.executor.as_ref(),
                 crate::runtime::render_writeback::SettleSite::ComputeStageTexture,
             );
-            if read_linear_texture_bulk(
-                state,
-                host,
-                task_id,
-                gva,
-                layout.row_stride,
-                tight,
-                h,
-                &mut bytes,
-            ) {
+            if read_linear_texture_bulk(state, host, task_id, gva, row_stride, tight, h, &mut bytes)
+            {
                 // One cached-view walk for the whole span.
             } else {
                 let mut row = vec![0u8; tight];
                 for y in 0..h {
                     let row_gva = gva
-                        .checked_add((y as u64).checked_mul(layout.row_stride).ok_or(
+                        .checked_add((y as u64).checked_mul(row_stride).ok_or(
                             ComputeStatus::GuestIo("compute_stage_tex_linear_row_offset"),
                         )?)
                         .ok_or(ComputeStatus::GuestIo("compute_stage_tex_linear_row_gva"))?;
@@ -2654,14 +2943,14 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     };
     let writeback = if is_storage {
         TextureWriteback::Linear {
-            texture_ref: stage_ref,
+            texture_ref,
             gva,
             pixel_format: stage_format,
-            row_stride: layout.row_stride,
+            row_stride,
             width: w,
             height: h,
             bpp,
-            pages: staged_window_pages(state, host, task_id, gva, layout.row_stride, h),
+            pages: staged_window_pages(state, host, task_id, gva, row_stride, h),
         }
     } else {
         TextureWriteback::None
@@ -2682,7 +2971,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                     .unwrap_or_else(|| {
                         state
                             .host_replicas
-                            .linear_host_generation(task_id, stage_ref)
+                            .linear_host_generation(task_id, texture_ref)
                             .unwrap_or(0)
                     });
                 residency = Some(ComputeStorageResidencyCandidate {
@@ -2693,7 +2982,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         }
     }
     Ok(StagedTexture {
-        resource_ref: stage_ref,
+        resource_ref: texture_ref,
         binding,
         array_element: 0,
         descriptor_count: 1,
@@ -3475,13 +3764,14 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     // — but computed by the same function that refuses the zero, because the two
     // are one rule. See [`reims_vgpu_protocol::dispatch::workgroup_counts`] for why
     // splitting them put an unreachable `.max(1)` on the quotients.
-    let Some([wg_x, wg_y, wg_z]) = reims_vgpu_protocol::dispatch::workgroup_counts(
+    let Some(plan) = reims_vgpu_protocol::dispatch::workgroup_counts(
         [grid_x, grid_y, grid_z],
         [tg_x, tg_y, tg_z],
         dispatch_threads,
     ) else {
         return ComputeStatus::BadGrid("compute_vk_zero_dims");
     };
+    let [wg_x, wg_y, wg_z] = plan.counts;
 
     // Translate before staging buffers. The final adopted SPIR-V carries the
     // conservative byte footprint that decides how much of each allocation the
@@ -4030,7 +4320,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     let req = ComputeRequest {
         program: prepared_program.stage.clone(),
         entry: "main".into(),
-        grid: [wg_x, wg_y, wg_z],
+        dispatch: plan,
         storage_buffers,
         sampled_images,
         samplers,
@@ -4290,7 +4580,7 @@ fn spawn_compute_engine_stall_watchdog(
 
     let done = Arc::new(AtomicBool::new(false));
     let thread_done = Arc::clone(&done);
-    let grid = req.grid;
+    let grid = req.dispatch.counts;
     let buffers = req.storage_buffers.len();
     let images = req.storage_images.len();
     let image_geometry: Vec<_> = req
