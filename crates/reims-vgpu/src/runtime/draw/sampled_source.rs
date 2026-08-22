@@ -2439,6 +2439,199 @@ pub(super) fn declared_guest_image_selection(
         _ if slice_base == 0 && slice_count == 1 => 0,
         _ => return None,
     };
+    // Dispatch on the type the guest's own descriptor declares, and let the
+    // shader's reflected shape veto. Metal's texture object carries its type;
+    // a shader that declares a different one is a mismatch the guest is
+    // responsible for, never a choice this device gets to make. Written the
+    // other way round — a `match` on `shape` that then checks the declaration
+    // agrees — the two are the same function, which
+    // `the_declaration_and_the_shader_shape_select_the_same_layout` proves over
+    // the whole input space. This way round is the one whose answer does not
+    // depend on which pipeline happens to be bound, so it can be taken once
+    // when the guest sets the texture instead of once per draw.
+    match declared_type {
+        TEXTURE_VIEW_MTL_TYPE_CUBE => {
+            // Only a cube storage, never a cube array: `sampled_image_shape`
+            // refuses `CubeArray` outright, so a `shape.cube` over cube-array
+            // storage could only be the first six faces of a longer array,
+            // chosen silently. And only the whole cube -- a face subrange is a
+            // shape the reflected declaration cannot be, so it is a refusal
+            // rather than a clamp.
+            (shape.cube && storage_type == TEXTURE_VIEW_MTL_TYPE_CUBE && slice_count == CUBE_FACES)
+                .then(|| {
+                    Some((
+                        reims_vgpu_memory::GuestImageLayout::D2Array {
+                            width: level.width,
+                            height: level.height,
+                            layers: u32::try_from(CUBE_FACES).ok()?,
+                            array_pitch: texture.bytes_per_slice,
+                        },
+                        layer_offset,
+                    ))
+                })
+                .flatten()
+        }
+        TEXTURE_VIEW_MTL_TYPE_1D_ARRAY => {
+            if !shape.one_dim || !shape.arrayed || level.height != 1 {
+                return None;
+            }
+            if storage_type != TEXTURE_VIEW_MTL_TYPE_1D_ARRAY {
+                return None;
+            }
+            let layers = u32::try_from(slice_count).ok()?;
+            (layers != 0).then_some((
+                reims_vgpu_memory::GuestImageLayout::D1Array {
+                    width: level.width,
+                    layers,
+                    array_pitch: texture.bytes_per_slice,
+                },
+                layer_offset,
+            ))
+        }
+        TEXTURE_VIEW_MTL_TYPE_1D => {
+            if !shape.one_dim || shape.arrayed || level.height != 1 {
+                return None;
+            }
+            (matches!(
+                storage_type,
+                TEXTURE_VIEW_MTL_TYPE_1D | TEXTURE_VIEW_MTL_TYPE_1D_ARRAY
+            ) && slice_count == 1)
+                .then_some((
+                    reims_vgpu_memory::GuestImageLayout::D1 { width: level.width },
+                    layer_offset,
+                ))
+        }
+        TEXTURE_VIEW_MTL_TYPE_3D => {
+            if !shape.volume || shape.cube || shape.one_dim {
+                return None;
+            }
+            if storage_type != TEXTURE_VIEW_MTL_TYPE_3D || slice_base != 0 || slice_count != 1 {
+                return None;
+            }
+            let depth = level.planes();
+            let depth_pitch = level.row_stride.checked_mul(u64::from(level.height))?;
+            Some((
+                reims_vgpu_memory::GuestImageLayout::D3 {
+                    width: level.width,
+                    height: level.height,
+                    depth,
+                    depth_pitch,
+                },
+                0,
+            ))
+        }
+        TEXTURE_VIEW_MTL_TYPE_2D_ARRAY => {
+            if shape.cube || shape.one_dim || shape.volume || !shape.arrayed {
+                return None;
+            }
+            if storage_type != TEXTURE_VIEW_MTL_TYPE_2D_ARRAY {
+                return None;
+            }
+            let layers = u32::try_from(slice_count).ok()?;
+            (layers != 0).then_some((
+                reims_vgpu_memory::GuestImageLayout::D2Array {
+                    width: level.width,
+                    height: level.height,
+                    layers,
+                    array_pitch: texture.bytes_per_slice,
+                },
+                layer_offset,
+            ))
+        }
+        TEXTURE_VIEW_MTL_TYPE_2D => {
+            if shape.cube || shape.one_dim || shape.volume || shape.arrayed {
+                return None;
+            }
+            (matches!(
+                storage_type,
+                TEXTURE_VIEW_MTL_TYPE_2D | TEXTURE_VIEW_MTL_TYPE_2D_ARRAY
+            ) && slice_count == 1)
+                .then_some((
+                    reims_vgpu_memory::GuestImageLayout::D2 {
+                        width: level.width,
+                        height: level.height,
+                    },
+                    layer_offset,
+                ))
+        }
+        _ => None,
+    }
+}
+
+/// The pre-inversion implementation of [`declared_guest_image_selection`],
+/// kept as the differential oracle for
+/// `the_declaration_and_the_shader_shape_select_the_same_layout`.
+///
+/// It dispatches on the *shader's* declared shape and then checks the guest's
+/// texture declaration agrees. That is the wrong way round — the texture
+/// object declares its own type and a shader must match it, so the shape can
+/// only ever veto — but the two must select identically, and the only way to
+/// prove that over the whole input space is to keep both and compare.
+#[cfg(test)]
+pub(super) fn selection_dispatched_on_the_shader_shape(
+    shape: reims_vgpu_core::SampledImageShape,
+    texture: &TextureDescriptor,
+    level: &crate::runtime::decode::resource::TextureLevelLayout,
+    view_texture_type: Option<u16>,
+    view_range: Option<TextureViewRange>,
+) -> Option<(reims_vgpu_memory::GuestImageLayout, u64)> {
+    use crate::runtime::decode::resource::{
+        TEXTURE_VIEW_MTL_TYPE_1D, TEXTURE_VIEW_MTL_TYPE_1D_ARRAY, TEXTURE_VIEW_MTL_TYPE_2D,
+        TEXTURE_VIEW_MTL_TYPE_2D_ARRAY, TEXTURE_VIEW_MTL_TYPE_3D, TEXTURE_VIEW_MTL_TYPE_CUBE,
+    };
+    // Face counts are compared against `slice_base`/`slice_count`, which the
+    // decoded view range carries as `u64`.
+    const CUBE_FACES: u64 = reims_vgpu_protocol::CUBE_FACES as u64;
+    if shape.multisampled {
+        return None;
+    }
+    let declaration = texture.declaration?;
+    let storage_type = u16::from(declaration.texture_type);
+    let storage_is_cube = matches!(
+        storage_type,
+        crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_CUBE
+            | crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_CUBE_ARRAY
+    );
+    if texture.slice_count != u32::from(declaration.array_length)
+        || texture.cube_faces != storage_is_cube
+        || !texture.declared_packing_fits_allocation()
+        || !texture.level_fits_slice(level)
+    {
+        return None;
+    }
+    let declared_type = view_texture_type.unwrap_or(storage_type);
+    let (slice_base, slice_count) = view_range
+        .map(|range| (range.slice_base, range.slice_count))
+        .unwrap_or_else(|| match storage_type {
+            TEXTURE_VIEW_MTL_TYPE_1D_ARRAY | TEXTURE_VIEW_MTL_TYPE_2D_ARRAY => {
+                (0, u64::from(declaration.array_length))
+            }
+            // Six, by the definition of the type the guest declared: a cube
+            // texture always has six slices, one per face. That is the same
+            // count [`physical_slice_count`] expands `slice_count` by, and it
+            // is why nothing here needs a cube layout of its own.
+            //
+            // [`physical_slice_count`]: reims_vgpu_protocol::LinearTextureDescriptor::physical_slice_count
+            TEXTURE_VIEW_MTL_TYPE_CUBE => (0, CUBE_FACES),
+            _ => (0, 1),
+        });
+    let storage_layers = match storage_type {
+        TEXTURE_VIEW_MTL_TYPE_1D_ARRAY | TEXTURE_VIEW_MTL_TYPE_2D_ARRAY => {
+            u64::from(declaration.array_length)
+        }
+        TEXTURE_VIEW_MTL_TYPE_CUBE => CUBE_FACES,
+        _ => 1,
+    };
+    if slice_count == 0 || slice_base.checked_add(slice_count)? > storage_layers {
+        return None;
+    }
+    let layer_offset = match storage_type {
+        TEXTURE_VIEW_MTL_TYPE_1D_ARRAY
+        | TEXTURE_VIEW_MTL_TYPE_2D_ARRAY
+        | TEXTURE_VIEW_MTL_TYPE_CUBE => texture.bytes_per_slice.checked_mul(slice_base)?,
+        _ if slice_base == 0 && slice_count == 1 => 0,
+        _ => return None,
+    };
     if shape.cube {
         // Only a cube storage, never a cube array: `sampled_image_shape`
         // refuses `CubeArray` outright, so a `shape.cube` over cube-array

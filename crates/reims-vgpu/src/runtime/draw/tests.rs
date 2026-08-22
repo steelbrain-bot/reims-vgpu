@@ -7722,3 +7722,182 @@ fn a_later_slice_is_read_at_its_own_inter_slice_advance() {
         "slice 1 must read one bytes_per_slice on, not repeat slice 0"
     );
 }
+
+/// Dispatching on the guest's texture declaration selects exactly what
+/// dispatching on the shader's reflected shape selected.
+///
+/// `declared_guest_image_selection` used to `match` on the shape the *shader*
+/// declared and then check the guest's texture descriptor agreed. That is the
+/// wrong way round for the contract — a Metal texture object carries its own
+/// type and a shader must match it, so the shape can only veto — and it is also
+/// the reason the whole resolution had to be redone on every draw, because a
+/// shape belongs to whichever pipeline is bound while a declaration belongs to
+/// the texture.
+///
+/// The two must be the same function, and the only way to know that over the
+/// whole input space is to keep both and compare. This walks every shape kind
+/// against every storage type, every view type including none, a level that is
+/// and is not one texel tall, and slice ranges that are in and out of bounds —
+/// and asserts the two agree on **every** cell, `None` included, because a cell
+/// where one refuses and the other selects is exactly the silent wrong-view bug
+/// this inversion could have introduced.
+#[test]
+fn the_declaration_and_the_shader_shape_select_the_same_layout() {
+    use crate::runtime::decode::resource::{
+        TEXTURE_VIEW_MTL_TYPE_1D, TEXTURE_VIEW_MTL_TYPE_1D_ARRAY, TEXTURE_VIEW_MTL_TYPE_2D,
+        TEXTURE_VIEW_MTL_TYPE_2D_ARRAY, TEXTURE_VIEW_MTL_TYPE_3D, TEXTURE_VIEW_MTL_TYPE_CUBE,
+        TEXTURE_VIEW_MTL_TYPE_CUBE_ARRAY,
+    };
+    use crate::runtime::draw::sampled_source::selection_dispatched_on_the_shader_shape as oracle;
+
+    const TYPES: [u16; 7] = [
+        TEXTURE_VIEW_MTL_TYPE_1D,
+        TEXTURE_VIEW_MTL_TYPE_1D_ARRAY,
+        TEXTURE_VIEW_MTL_TYPE_2D,
+        TEXTURE_VIEW_MTL_TYPE_2D_ARRAY,
+        TEXTURE_VIEW_MTL_TYPE_3D,
+        TEXTURE_VIEW_MTL_TYPE_CUBE,
+        TEXTURE_VIEW_MTL_TYPE_CUBE_ARRAY,
+    ];
+    let kinds = [
+        reims_vgpu_core::SampledImageKind::D1,
+        reims_vgpu_core::SampledImageKind::D1Array,
+        reims_vgpu_core::SampledImageKind::D2,
+        reims_vgpu_core::SampledImageKind::D2Array,
+        reims_vgpu_core::SampledImageKind::D3,
+        reims_vgpu_core::SampledImageKind::Cube,
+    ];
+
+    let mut compared = 0usize;
+    let mut reached: std::collections::BTreeMap<u16, usize> = std::collections::BTreeMap::new();
+    for storage in TYPES {
+        for array_length in [1u16, 2, 6] {
+            for height in [1u32, 64] {
+                let level = crate::runtime::decode::resource::TextureLevelLayout {
+                    offset: 0,
+                    size: 0x4000,
+                    row_stride: 0x100,
+                    width: 64,
+                    height,
+                    depth: 1,
+                };
+                let cube_faces = matches!(
+                    storage,
+                    TEXTURE_VIEW_MTL_TYPE_CUBE | TEXTURE_VIEW_MTL_TYPE_CUBE_ARRAY
+                );
+                let physical_slices = u64::from(array_length) * if cube_faces { 6 } else { 1 };
+                let texture = TextureDescriptor {
+                    allocation_size: 0x4000 * physical_slices,
+                    declaration: Some(reims_vgpu_protocol::TextureDeclaration {
+                        texture_type: storage as u8,
+                        framebuffer_only: false,
+                        is_drawable: false,
+                        write_swizzle_enabled: None,
+                        allow_gpu_optimized_contents: false,
+                        usage: 0,
+                        pixel_format: reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+                        width: level.width,
+                        height: level.height,
+                        depth: 1,
+                        mipmap_level_count: 1,
+                        sample_count: 1,
+                        array_length,
+                        resource_options: 0,
+                        protection_options: 0,
+                        swizzle: None,
+                    }),
+                    bytes_per_slice: 0x4000,
+                    slice_count: u32::from(array_length),
+                    cube_faces,
+                    levels: vec![level],
+                    ..Default::default()
+                };
+                for kind in kinds {
+                    let Some(shape) = reims_vgpu_core::sampled_image_shape(kind) else {
+                        continue;
+                    };
+                    for view_type in [None].into_iter().chain(TYPES.map(Some)) {
+                        for range in [
+                            None,
+                            Some(TextureViewRange {
+                                level_base: 0,
+                                level_count: 1,
+                                slice_base: 0,
+                                slice_count: 1,
+                            }),
+                            Some(TextureViewRange {
+                                level_base: 0,
+                                level_count: 1,
+                                slice_base: 1,
+                                slice_count: 1,
+                            }),
+                            Some(TextureViewRange {
+                                level_base: 0,
+                                level_count: 1,
+                                slice_base: 0,
+                                slice_count: 6,
+                            }),
+                            // Out of bounds on every array_length above.
+                            Some(TextureViewRange {
+                                level_base: 0,
+                                level_count: 1,
+                                slice_base: 5,
+                                slice_count: 4,
+                            }),
+                            // A zero count, which must refuse rather than
+                            // producing a layerless image.
+                            Some(TextureViewRange {
+                                level_base: 0,
+                                level_count: 1,
+                                slice_base: 0,
+                                slice_count: 0,
+                            }),
+                        ] {
+                            let declared_now = view_type.unwrap_or(storage);
+                            let want = oracle(shape, &texture, &level, view_type, range);
+                            let got = declared_guest_image_selection(
+                                shape, &texture, &level, view_type, range,
+                            );
+                            assert_eq!(
+                                got, want,
+                                "storage={storage} array_length={array_length} height={height} \
+                                 kind={kind:?} view_type={view_type:?} range={range:?}"
+                            );
+                            compared += 1;
+                            if got.is_some() {
+                                // Coverage is per *dispatch arm*, keyed by the
+                                // type the declaration named, because a bulk
+                                // count of selections cannot see an arm that
+                                // stopped being reachable — which is exactly
+                                // how the cube arm sat unexercised here while
+                                // the total read healthy.
+                                *reached.entry(declared_now).or_insert(0usize) += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // A run where an arm never selected compares `None` against `None` for
+    // every one of its cells and proves nothing about it, which is how this
+    // test fails silently when a grid field stops being representable. The
+    // cube arm did exactly that on the first draft — the allocation was one
+    // sixth of what a cube's six faces need, so every cube cell was refused
+    // before the dispatch and a deliberate break to the six-face rule went
+    // undetected. Name every arm and require each to have selected.
+    assert!(compared >= 2000, "the grid shrank: compared={compared}");
+    for arm in [
+        TEXTURE_VIEW_MTL_TYPE_1D,
+        TEXTURE_VIEW_MTL_TYPE_1D_ARRAY,
+        TEXTURE_VIEW_MTL_TYPE_2D,
+        TEXTURE_VIEW_MTL_TYPE_2D_ARRAY,
+        TEXTURE_VIEW_MTL_TYPE_3D,
+        TEXTURE_VIEW_MTL_TYPE_CUBE,
+    ] {
+        assert!(
+            reached.get(&arm).copied().unwrap_or(0) > 0,
+            "no cell selected through the {arm} arm, so nothing here tests it: {reached:?}"
+        );
+    }
+}
