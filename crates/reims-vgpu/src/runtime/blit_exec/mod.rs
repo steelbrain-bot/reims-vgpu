@@ -4481,7 +4481,50 @@ fn execute_resolved_texture_copy_batch<M: HostMemory + HostOps>(
         // were never the cost — re-entering the mapping rail per row was. It
         // stages the slice whole now; see [`read_texture_rect`].
         let sl_mixed_started = std::time::Instant::now();
+        // This loop is a whole-surface **CPU** copy, and it should not exist:
+        // `copyFromTexture:...toTexture:` is a blit-encoder command, so the
+        // contract puts this copy on the GPU queue, where ordering against
+        // earlier GPU writes is free and no host byte moves.
+        //
+        // What it costs, from one driven fullscreen Maps boot: `sl_mixed_bytes`
+        // 7.57 GB staged in 45 s over 968 levels, 7.8 MB a level -- a
+        // full-screen surface each time. The four clocks below sum to 99.9 % of
+        // `sl_mixed_us` and say the bytes were never the problem:
+        //
+        // | part | share | note |
+        // |---|---|---|
+        // | `settle` inside the read | **51.0 %** | the CPU blocking on the GPU |
+        // | read copy | 21.1 % | 9.9 GB/s |
+        // | write copy | 18.4 % | 11.3 GB/s |
+        // | zeroing `staged` | 9.4 % | overwritten in full immediately after |
+        //
+        // The read costs 3.9x the write on identical byte counts for one reason:
+        // `gva_view::read_rect` calls `settle_before_read` and
+        // `write_rect_within` does not. `settle_gva_rect_read` equals
+        // `sl_levels_n` exactly, and its `_overlap` count equals it too against
+        // two `_disjoint`, so **every** read here waits on this device's own
+        // submitted GPU writes -- 1.9 ms a call, 1.85 s of a 45 s boot with the
+        // drain thread stalled. The staging copy is what creates the stall it
+        // then pays for.
+        //
+        // Encoding the copy on the queue removes all four rows at once, and
+        // stops ~500 MB/s of DRAM traffic that a unified-memory part's GPU is
+        // contending for and that `proc_us` charges nowhere. Widening
+        // `try_copy_whole_plane_on_gpu` is not the route: its `source_is_resident`
+        // predicate asks whether the GPU holds newer content than the guest
+        // pages, which under a host-pointer import is never true, and its
+        // plane-to-plane shape is not this arm's buffer-to-image one.
+        //
+        // Banked per level rather than per slice so a sub-microsecond part is
+        // not truncated to nothing by `as_micros`.
+        let mut alloc_ns = 0u64;
+        let mut window_ns = 0u64;
+        let mut read_ns = 0u64;
+        let mut write_ns = 0u64;
+        let alloc_started = std::time::Instant::now();
         let mut staged = vec![0u8; (row_bytes.saturating_mul(h as u64)) as usize];
+        alloc_ns += alloc_started.elapsed().as_nanos() as u64;
+        crate::runtime::drain::note_store_route_n("sl_mixed_bytes", staged.len() as u64);
         for (source, destination) in
             std::iter::once(&level.first_slice).chain(level.remaining_slices.iter())
         {
@@ -4490,6 +4533,7 @@ fn execute_resolved_texture_copy_batch<M: HostMemory + HostOps>(
             if src.width() != w || src.height() != h || dst.width() != w || dst.height() != h {
                 return br(BlitStatus::Bounds, "sl_inner_dim_mismatch");
             }
+            let window_started = std::time::Instant::now();
             let allowed = match texture_region_window(
                 state,
                 host,
@@ -4504,6 +4548,8 @@ fn execute_resolved_texture_copy_batch<M: HostMemory + HostOps>(
                 Ok(v) => v,
                 Err(st) => return st,
             };
+            window_ns += window_started.elapsed().as_nanos() as u64;
+            let read_started = std::time::Instant::now();
             if let Err(st) = read_texture_rect(
                 state,
                 host,
@@ -4516,6 +4562,8 @@ fn execute_resolved_texture_copy_batch<M: HostMemory + HostOps>(
             ) {
                 return st;
             }
+            read_ns += read_started.elapsed().as_nanos() as u64;
+            let write_started = std::time::Instant::now();
             if let Err(st) = write_texture_rect(
                 state,
                 host,
@@ -4529,7 +4577,12 @@ fn execute_resolved_texture_copy_batch<M: HostMemory + HostOps>(
             ) {
                 return st;
             }
+            write_ns += write_started.elapsed().as_nanos() as u64;
         }
+        crate::runtime::drain::note_store_route_us("sl_mixed_alloc_us", alloc_ns / 1000);
+        crate::runtime::drain::note_store_route_us("sl_mixed_window_us", window_ns / 1000);
+        crate::runtime::drain::note_store_route_us("sl_mixed_read_us", read_ns / 1000);
+        crate::runtime::drain::note_store_route_us("sl_mixed_write_us", write_ns / 1000);
         crate::runtime::drain::note_store_route_us(
             "sl_mixed_us",
             sl_mixed_started.elapsed().as_micros() as u64,

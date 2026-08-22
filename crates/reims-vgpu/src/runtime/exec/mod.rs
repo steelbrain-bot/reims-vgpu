@@ -2035,13 +2035,16 @@ fn handle_blit_record<M: HostMemory + HostOps>(
     opcode: u32,
     cmd_bytes: &[u8],
 ) {
-    // `walk_blit_us` charges this rail 33.3 s of a 45 s driven Maps window and
-    // every clock inside `execute_blit` accounts for 0.14 s of it. The gap has
-    // to be in this function, and only two things here are outside that call:
-    // the decode above, and the `Fence` arm, which reaches
-    // `execute_blit_fence` directly rather than through `execute_blit`. A
-    // blocking fence wait costs exactly what is missing and does no work while
-    // it costs it, which is why no copy clock can see it.
+    // `walk_blit_us` charges this rail more than the whole render family does on
+    // a driven fullscreen Maps window, against three orders of magnitude fewer
+    // records, so the per-record cost here is what matters and not the count.
+    //
+    // This comment used to name the `Fence` arm as the gap, on the reasoning
+    // that a blocking wait costs wall clock while no copy clock can see it. The
+    // per-kind counters below refute that: `blitrec_copy_n` equals
+    // `walk_records_blit` exactly on every boot measured, so this workload sends
+    // no fences and no fills at all and every record is a `Copy`. The cost is
+    // inside `execute_blit`, and `blit_kind_*_us` splits it further.
     //
     // Timed at the closure `walk_segment_records` calls, so decode is inside the
     // span and no arm can leave without being charged.
@@ -3933,6 +3936,13 @@ fn apply_binds<T: Copy, B: Clone>(
             break;
         }
         let bind = make(index, entry);
+        // `Arc::make_mut` copies here whenever the table is shared, which it is
+        // for the first bind record after every draw -- `bind_snapshot` clones all
+        // six tables. That reads like copy-on-write thrash and was measured on a
+        // driven fullscreen Maps boot: 2.74 calls a draw, 1.10 of them copying,
+        // and **2.9 elements per copy**. The tables hold about three entries, so
+        // the whole cost is ~3 element copies a draw. Not a lever; do not spend a
+        // boot on it again.
         let list = match stage {
             Stage::Vertex => Arc::make_mut(vertex),
             Stage::Fragment => Arc::make_mut(fragment),
