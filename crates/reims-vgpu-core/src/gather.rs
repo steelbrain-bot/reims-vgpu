@@ -204,7 +204,12 @@ impl GatherWitness {
 
         let audit = if density == AuditDensity::Disabled {
             ContentAudit::Skipped
-        } else if !matches!(pending, GuestWriteReach::Disjoint) {
+        // Both of the reach answers that license the gather, spelled out. A
+        // `matches!` is not exhaustiveness-checked, so a new variant does not
+        // fail the build here the way a `match` arm would -- naming
+        // `Quiet` and `Disjoint` together is what keeps "the audit may run"
+        // meaning the same thing on both routes.
+        } else if !matches!(pending, GuestWriteReach::Quiet | GuestWriteReach::Disjoint) {
             entry.audit_armed = false;
             entry.fold_valid = false;
             entry.rebaselines = 0;

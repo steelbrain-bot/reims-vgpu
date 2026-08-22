@@ -1867,7 +1867,14 @@ mod tests {
 
     impl GuestWriteService for ScriptedExecutor {
         fn guest_writes_outstanding(&self) -> bool {
-            self.guest_writes != GuestWriteReach::Disjoint
+            // Both answers that mean "nothing of mine reaches you". Scripting
+            // `Quiet` here must behave as the real executor does when its debt
+            // flag is clear, or a test would exercise a state the device cannot
+            // be in.
+            !matches!(
+                self.guest_writes,
+                GuestWriteReach::Quiet | GuestWriteReach::Disjoint
+            )
         }
 
         fn guest_writes_reaching(&self, _pages: &[u64]) -> GuestWriteReach {

@@ -68,13 +68,24 @@ fn pending_writes_over(
     gpas: &[u64],
 ) -> PendingWrites {
     if !executor.guest_writes_outstanding() {
-        return PendingWrites::Disjoint;
+        return PendingWrites::Quiet;
     }
     executor.guest_writes_reaching(gpas)
 }
 
+/// Census name for one reach answer.
+///
+/// `gw_pending_quiet` and `gw_pending_disjoint` are counted apart because they
+/// are reached by different routes and send an investigation to opposite halves
+/// of the device. `quiet` means this device held **no** outstanding guest write
+/// when the gather ran, so the pages were never examined; `disjoint` means it
+/// held one, the pages were examined, and the write lands in none of them. Both
+/// license the gather, and a single counter covering both cannot say whether a
+/// gather that read stale bytes did so because the debt was never armed or
+/// because the footprint comparison was wrong.
 fn pending_writes_route(pending: PendingWrites) -> &'static str {
     match pending {
+        PendingWrites::Quiet => "gw_pending_quiet",
         PendingWrites::Disjoint => "gw_pending_disjoint",
         PendingWrites::Overlap => "gw_pending_overlap",
         PendingWrites::Unnamed => "gw_pending_unnamed",
@@ -396,6 +407,68 @@ mod tests {
         pending: PendingWrites::Disjoint,
         stated_gen: Some(StatedGeneration::Mapping(0)),
     };
+
+    /// The two reach answers that license a gather must stay tellable apart on
+    /// the census, and must license it identically.
+    ///
+    /// They are reached by different routes -- `Quiet` without the pages being
+    /// examined at all, `Disjoint` only after examining them -- and one counter
+    /// covering both cannot say whether a gather that returned stale bytes did
+    /// so because the write debt was never armed or because the footprint
+    /// comparison was wrong. Those two have opposite repairs, which is why the
+    /// split is worth a variant rather than a comment.
+    ///
+    /// The audit half is the half that could regress silently: the admission is
+    /// spelled with `matches!`, which `rustc` does not exhaustiveness-check, so
+    /// nothing but this test fails if a later variant stops licensing the audit.
+    #[test]
+    fn a_quiet_ledger_and_a_tested_disjoint_window_are_counted_apart_and_license_alike() {
+        assert_ne!(
+            pending_writes_route(PendingWrites::Quiet),
+            pending_writes_route(PendingWrites::Disjoint),
+            "one counter for both routes is the zero-sampled-at-the-wrong-place trap"
+        );
+
+        let buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+        let bind = |w: &mut GatherWitness, pending| {
+            observe(
+                w,
+                KEY,
+                one_page(&GPAS, &runs),
+                WitnessReadings { pending, ..QUIET },
+                next_gen(),
+            )
+        };
+
+        for licensing in [PendingWrites::Quiet, PendingWrites::Disjoint] {
+            // Fresh witness per arm: the audit is stateful, and a shared one
+            // would let the first arm's fold decide the second's outcome.
+            let mut w = witness_auditing(AuditDensity::EveryBind);
+            let settled = bind_quietly(&mut w, &GPAS, &runs, 4);
+            assert_eq!(
+                settled.audit,
+                ContentAudit::Agreed,
+                "control: the audit must actually be running"
+            );
+            let seen = bind(&mut w, licensing);
+            assert_ne!(
+                seen.audit,
+                ContentAudit::Indebted,
+                "{licensing:?} licenses the gather, so the audit may compare across it"
+            );
+        }
+
+        for withholding in [PendingWrites::Overlap, PendingWrites::Unnamed] {
+            let mut w = witness_auditing(AuditDensity::EveryBind);
+            let _ = bind_quietly(&mut w, &GPAS, &runs, 4);
+            assert_eq!(
+                bind(&mut w, withholding).audit,
+                ContentAudit::Indebted,
+                "{withholding:?} does not license a fold across an unlanded copy"
+            );
+        }
+    }
 
     /// One bind, discarding the audit — for the tests that are about the verdict.
     fn verdict(

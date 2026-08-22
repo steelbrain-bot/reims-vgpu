@@ -781,11 +781,16 @@ pub fn settle_guest_writes_unless_disjoint(
             None => Reach::Unnamed,
         };
         crate::runtime::drain::note_store_route(match reach {
-            Reach::Disjoint => site.route_disjoint(),
+            // `Quiet` cannot arrive from `guest_writes_reaching` -- the early
+            // return above already took the no-outstanding-writes case, and it
+            // emits no counter there because there was no wait to save. It is
+            // spelled beside `Disjoint` because it is the same answer to this
+            // decision, not left to a wildcard.
+            Reach::Quiet | Reach::Disjoint => site.route_disjoint(),
             Reach::Overlap => site.route_overlap(),
             Reach::Unnamed => site.route_unnamed(),
         });
-        if reach == Reach::Disjoint {
+        if matches!(reach, Reach::Quiet | Reach::Disjoint) {
             return;
         }
         settle_guest_writes(executor, site);

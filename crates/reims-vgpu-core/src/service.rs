@@ -70,7 +70,19 @@ pub enum PresentationRoute {
 /// What an executor can prove about outstanding writes into a page window.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GuestWriteReach {
-    /// Nothing outstanding lands in any page asked about.
+    /// The executor holds no outstanding guest writes at all, so the question
+    /// was answered without looking at the pages.
+    ///
+    /// Semantically this implies [`GuestWriteReach::Disjoint`] and every
+    /// consumer treats the two the same way. It is a separate variant because
+    /// the *census* cannot otherwise tell "this device had nothing in flight"
+    /// from "it had writes in flight and they missed this window", and those
+    /// two readings send an investigation to opposite halves of the device. A
+    /// single counter covering both is a zero sampled at the wrong place, which
+    /// is the trap `AGENTS.md` names under `## Before A Broad Sweep`.
+    Quiet,
+    /// An outstanding write was tested against the pages and lands in none of
+    /// them.
     Disjoint,
     /// An outstanding write lands in at least one page asked about.
     Overlap,

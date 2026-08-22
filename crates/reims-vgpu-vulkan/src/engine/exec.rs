@@ -1293,7 +1293,13 @@ pub(super) fn imported_guest_visibility(
     let reach = super::guest_writes_reaching_sets(pages.iter().filter_map(Option::as_ref));
     match reach {
         reims_vgpu_core::GuestWriteReach::Overlap => ImportedGuestVisibility::GpuOverlap,
-        reims_vgpu_core::GuestWriteReach::Disjoint => ImportedGuestVisibility::HostOnly,
+        // `Quiet` cannot reach here -- the early return above already answered
+        // the no-outstanding-writes case -- but it means the same thing as
+        // `Disjoint` to this decision, so it is spelled out rather than left to
+        // a wildcard that would swallow a future variant.
+        reims_vgpu_core::GuestWriteReach::Quiet | reims_vgpu_core::GuestWriteReach::Disjoint => {
+            ImportedGuestVisibility::HostOnly
+        }
         reims_vgpu_core::GuestWriteReach::Unnamed => ImportedGuestVisibility::GpuUnknown,
     }
 }
