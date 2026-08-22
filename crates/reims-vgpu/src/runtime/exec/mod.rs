@@ -2249,6 +2249,23 @@ fn handle_blit_record<M: HostMemory + HostOps>(
 /// redundancy to remove and the resolution has to stay where it is.
 ///
 /// It is a count and not a timing, so it survives host contention.
+///
+/// # Measured, and it says the redundancy is real
+///
+/// Driven fullscreen Maps, macos-13, x86/Vulkan, banded to the driven windows:
+/// 8 665 482 records against 2 522 653 draws, **3.44 records a draw**. So the
+/// guest changes about **2.4 slots between one draw and the next**, and this
+/// device re-resolves the whole accumulated state for every one of them.
+/// That is the second of the two shapes above, not the first: there is
+/// redundancy to remove, and it is most of the work.
+///
+/// The companion reading, from the same boot, closes a question that would
+/// otherwise keep being asked: the decode-side draw count and the executed
+/// draw count are **identical** -- 2 522 653 and 2 522 653. This device fans
+/// one guest draw record out to exactly one executed draw. The workload's
+/// ~3 132 draws a frame is the guest's own scene complexity and there is no
+/// amplification here to find, so a session looking for the missing factor of
+/// four should not spend a boot on this one.
 pub mod stream_shape_census {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
