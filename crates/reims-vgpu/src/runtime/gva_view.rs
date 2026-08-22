@@ -518,6 +518,14 @@ pub(crate) fn read_rect<H: HostMemory + HostOps>(
     dst: &mut [u8],
 ) -> Result<(), MemError> {
     let copy = RunCopy::read_rect(dst, rect).ok_or(MemError::BadArgs)?;
+    settle_before_read(
+        state,
+        host,
+        task_id,
+        gva,
+        copy.len() as u64,
+        crate::runtime::render_writeback::SettleSite::GvaRectRead,
+    );
     span_multi(state, host, task_id, gva, copy, None)
 }
 
@@ -618,6 +626,50 @@ pub fn unmap_fresh_span<H: HostOps>(host: &mut H, span: FreshSpan) {
     host.unmap_pages(span.map_base, span.map_len);
 }
 
+/// Order a host read of `[gva, gva+span)` against this device's own submitted
+/// GPU writes to the same guest pages.
+///
+/// The GVA rail hands out a raw `memcpy` over guest RAM. Nothing the GPU knows
+/// about orders that copy against a render Store this device has already
+/// recorded into the command stream and deliberately not waited on, so a reader
+/// that does not settle first reads the pre-Store bytes — silently, and only
+/// when the race happens to be lost.
+///
+/// It sits on the two read entry points rather than in their callers because
+/// this is where the span being read is named. A caller cannot reach guest bytes
+/// through this module without passing one of them, so a new reader inherits the
+/// ordering instead of having to remember it, and there is nothing for a sweep
+/// to go looking for.
+///
+/// Free in the common case: [`settle_guest_writes_unless_disjoint`] returns on a
+/// flag read when nothing is outstanding, so the page walk below runs only when
+/// this device actually owes writes, and the wait only when they land in pages
+/// this read touches.
+fn settle_before_read<H: HostMemory + HostOps>(
+    state: &mut Device,
+    host: &mut H,
+    task_id: u32,
+    gva: u64,
+    span: u64,
+    site: crate::runtime::render_writeback::SettleSite,
+) {
+    if span == 0 {
+        return;
+    }
+    let (tasks, page_shift, page_size) = (&state.tasks, state.page_shift, state.page_size());
+    crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(
+        state.executor.as_ref(),
+        site,
+        || {
+            let want = reims_vgpu_paging::span::pages_spanned(gva, span, page_size);
+            let gpas = crate::runtime::gva_mem::task_gva_page_gpas(
+                host, tasks, task_id, gva, span, page_shift,
+            );
+            (gpas.len() as u64 == want).then_some(gpas)
+        },
+    );
+}
+
 /// Read `buf.len()` bytes from guest `gva` via HostOps map_pages (multi-import).
 pub fn read_span<H: HostMemory + HostOps>(
     state: &mut Device,
@@ -629,6 +681,14 @@ pub fn read_span<H: HostMemory + HostOps>(
     if buf.is_empty() {
         return true;
     }
+    settle_before_read(
+        state,
+        host,
+        task_id,
+        gva,
+        buf.len() as u64,
+        crate::runtime::render_writeback::SettleSite::GvaSpanRead,
+    );
     if let Some((ptr, avail)) = host_ptr_for_span(state, host, task_id, gva, buf.len() as u64) {
         if avail >= buf.len() {
             // SAFETY: host_ptr_for_span guarantees `avail` readable bytes.
@@ -1296,6 +1356,118 @@ mod tests {
             line.contains("reason=gva_zero_pfn"),
             "the walk's own check must be the reason: {line}"
         );
+    }
+
+    /// A host read of guest pages is ordered against this device's own
+    /// submitted-but-unexecuted GPU writes to those same pages.
+    ///
+    /// The GVA rail is a raw `memcpy` over guest RAM, and nothing the GPU knows
+    /// about orders it against a render Store already recorded into the command
+    /// stream. Without the settle this reads the pre-Store bytes — silently, and
+    /// only on the boots where the race is lost.
+    ///
+    /// Both arms are here on purpose. Asserting only that a wait happens would
+    /// pass on a rail that waits unconditionally, which is a different bug: the
+    /// disjoint arm is what says the ordering is taken because the writes reach
+    /// these pages and not because every read blocks.
+    #[test]
+    fn a_host_read_of_guest_pages_settles_the_writes_that_reach_them() {
+        use crate::runtime::executor::*;
+        use reims_vgpu_core::{
+            CapabilityService, ComputeResidencyService, ExecutionPort, GuestWriteReach,
+            PresentationService, ReadbackService, ResidentService,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct SettleProbe {
+            reach: GuestWriteReach,
+            quiesced: AtomicUsize,
+        }
+
+        impl ExecutionPort for SettleProbe {
+            type Submission = ResolvedSubmission;
+            type Completion = ExecutionCompletion;
+            type Error = DrawError;
+
+            fn execute(
+                &self,
+                _submission: Self::Submission,
+            ) -> Result<Self::Completion, Self::Error> {
+                unreachable!("this test executes no command buffer")
+            }
+        }
+        impl reims_vgpu_core::GuestWriteService for SettleProbe {
+            fn guest_writes_outstanding(&self) -> bool {
+                true
+            }
+            fn guest_writes_reaching(&self, _pages: &[u64]) -> GuestWriteReach {
+                self.reach
+            }
+            fn quiesce_guest_writes(&self) {
+                self.quiesced.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        impl ResidentService for SettleProbe {}
+        impl ComputeResidencyService for SettleProbe {}
+        impl CapabilityService for SettleProbe {}
+        impl PresentationService for SettleProbe {}
+        impl ReadbackService for SettleProbe {
+            type Error = DrawError;
+
+            fn read_target(
+                &self,
+                _identity: &crate::model::TargetIdentity,
+            ) -> Result<reims_vgpu_core::TargetReadback, Self::Error> {
+                unreachable!("this test reads no target")
+            }
+        }
+        impl GuestPageTransferService for SettleProbe {}
+        impl CompletionService for SettleProbe {}
+        impl SubmissionBatchService for SettleProbe {}
+        impl GuestImportService for SettleProbe {}
+        impl MaintenanceService for SettleProbe {}
+        impl SessionService for SettleProbe {}
+        impl ObservationService for SettleProbe {}
+        impl ShaderTranslationService for SettleProbe {}
+        impl RenderBufferPlanningService for SettleProbe {}
+        impl GuestImagePlanningService for SettleProbe {}
+        impl WindowPresentationService for SettleProbe {}
+        impl Executor for SettleProbe {}
+
+        // One page of the fixture's data0, read both ways. The rect is strided
+        // so its guest reach is the span the walk resolves and not the packed
+        // length the caller receives.
+        for (reach, expected) in [
+            (GuestWriteReach::Overlap, 2),
+            (GuestWriteReach::Disjoint, 0),
+        ] {
+            let (mut host, _root, _data0, _data1, page) = pt_fixture(PAGE_SHIFT_X86);
+            let mut state = state_x86();
+            state.define_task(1, page, 2);
+            let probe = Arc::new(SettleProbe {
+                reach,
+                quiesced: AtomicUsize::new(0),
+            });
+            state.executor = probe.clone();
+
+            let mut buf = [0u8; 32];
+            assert!(
+                read_span(&mut state, &mut host, 1, 0x100, &mut buf),
+                "the fixture's first page resolves"
+            );
+            let rect = crate::runtime::mapper::RectStride::new(16, 8, 4).expect("a valid rect");
+            read_rect(&mut state, &mut host, 1, 0x100, rect, &mut buf[..32])
+                .expect("the fixture's first page resolves");
+
+            assert_eq!(
+                probe.quiesced.load(Ordering::Acquire),
+                expected,
+                "{reach:?}: a host read of guest pages must settle exactly when \
+                 this device's outstanding writes reach them"
+            );
+        }
     }
 
     /// The read direction must name the check that refused, exactly as the

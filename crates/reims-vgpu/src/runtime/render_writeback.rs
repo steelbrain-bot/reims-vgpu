@@ -688,6 +688,23 @@ settle_sites! {
     MappingBytesWrite => "settle_mapping_bytes_write",
     /// `mapper::read_mapping_bytes`.
     MappingBytesRead => "settle_mapping_bytes_read",
+    /// `gva_view::read_span` — the contiguous host read of a task-GVA span,
+    /// reached by the compute rail staging a linear texture whose rows are
+    /// tightly packed.
+    GvaSpanRead => "settle_gva_span_read",
+    /// `gva_view::read_rect` — the strided host read of a task-GVA rectangle,
+    /// reached by `blit_exec::read_texture_rect`'s linear arm.
+    ///
+    /// This site is why the two above it exist as a pair. The GVA rail is the
+    /// one host reader of guest pages that had no settle at all, and the arm
+    /// that reaches it is selected by the *target-import* rail: a source the
+    /// device rendered into directly owes no writeback debt, so the whole-plane
+    /// GPU copy refuses with `sl_gpu_src_not_resident` and the copy falls here
+    /// — to a bare `memcpy` racing the render that produced the very pixels it
+    /// is copying. With target import off the same copy finds a resident, runs
+    /// GPU-side, and is ordered by the render pass; that is why the defect was
+    /// visible on exactly one arm and why it came and went between boots.
+    GvaRectRead => "settle_gva_rect_read",
 }
 
 /// Block until every guest-page write this device has submitted has executed.

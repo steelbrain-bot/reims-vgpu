@@ -3808,6 +3808,16 @@ enum GpuPlaneRefusal {
     SelfCopy,
     /// The source's bytes are its guest pages' bytes already — nothing to copy
     /// from a resident, and the host path is the cheap one.
+    ///
+    /// **Says which bytes the host path names, and nothing about when it reads
+    /// them.** This arm is selected by the target-import rail: a source the
+    /// device rendered into directly owes no writeback debt, so there is no
+    /// resident to copy from and the fall-through is a `memcpy` over pages a
+    /// submitted render Store may still be writing. Reading that as "not a
+    /// loss" is what hid a whole missing layer — `gva_view`'s reads settle
+    /// against outstanding guest writes now, and 716 of 716 on one driven boot
+    /// genuinely overlapped. The variant is still a fall-through and still not
+    /// a loss; the ordering that makes that true lives in the read.
     SrcNotResident,
     /// The destination is a linear guest allocation, which has no mapping for a
     /// GPU-side copy to name.
