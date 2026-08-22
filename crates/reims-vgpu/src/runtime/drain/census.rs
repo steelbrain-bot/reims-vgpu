@@ -2992,20 +2992,33 @@ pub fn note_drain_tranche(
         // that says how much reach the seek needs, and a merge that went back
         // to stepping would pay all of it.
         {
-            let (asks, sets, given, walked, runs, span_misses, runs_skipped) =
-                reims_vgpu_vulkan::engine::vis_walk_census::take();
+            let (
+                asks,
+                sets,
+                given,
+                walked,
+                runs,
+                span_misses,
+                runs_skipped,
+                rebuilds,
+                rebuild_pages,
+                rebuild_ns,
+            ) = reims_vgpu_vulkan::engine::vis_walk_census::take();
             if asks != 0 && sets != 0 {
                 crate::observe::off(format!(
                     "vis_walk asks={asks} sets={sets} given={given} walked={walked} \
                      runs_skipped={runs_skipped} runs_per_ask={:.1} sets_per_ask={:.2} \
                      given_per_set={:.1} walked_per_ask={:.1} skipped_per_ask={:.1} \
-                     span_miss_frac={:.3}",
+                     span_miss_frac={:.3} rebuilds={rebuilds} rebuild_pages={rebuild_pages} \
+                     rebuild_us={} rebuild_us_per_ask={:.3}",
                     runs as f64 / asks as f64,
                     sets as f64 / asks as f64,
                     given as f64 / sets as f64,
                     walked as f64 / asks as f64,
                     runs_skipped as f64 / asks as f64,
                     span_misses as f64 / sets as f64,
+                    rebuild_ns / 1000,
+                    rebuild_ns as f64 / 1000.0 / asks as f64,
                 ));
             }
         }

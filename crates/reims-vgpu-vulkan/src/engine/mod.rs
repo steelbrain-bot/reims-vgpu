@@ -1629,6 +1629,28 @@ struct GuestWriteFootprint {
     ///
     /// The authority on membership, and the arming side's only structure. The
     /// asking side reads [`Self::runs`] instead — see there for why.
+    ///
+    /// **Hashed, and an ordered map was measured and reverted.** Getting runs
+    /// out of a hash map costs a collect and a sort — 20.62 us over ~2 465
+    /// pages, 1 379 times a second, which is 0.59 us a draw and 78 % of the
+    /// whole visibility span. A `BTreeMap` makes that rebuild a walk and it
+    /// works: 20.62 -> 3.67 us, 0.593 -> 0.108 us a draw, `rb_visibility_us`
+    /// 0.807 -> 0.551, all disjoint across boots.
+    ///
+    /// It is still a loss. Arming and retiring touch ~150 000 pages a second
+    /// and a logarithmic insert costs more than the sort it removes:
+    /// `post_store_us` went 1.102 -> 1.623 us a draw and the whole drain worker
+    /// went **20.65 -> 21.98 us a draw**, both disjoint at n=3 against n=2. The
+    /// drain rose by more than those two phases account for, so the retire path
+    /// is paying as well.
+    ///
+    /// The asking side is 44 000 reads a second against 1 379 rebuilds, so the
+    /// rebuild is already the right trade; what is wrong is the *sort*, not the
+    /// container. An arm merges a `GuestPageSet` that is already sorted and
+    /// deduped, so runs could be maintained by merging it into the existing
+    /// vector — no sort and no hashed-insert penalty. Retiring would still need
+    /// a rebuild. That is the shape worth trying next; swapping the container
+    /// is not, and has been measured.
     page_counts: std::collections::HashMap<u64, usize>,
     /// `page_counts`' keys as sorted, coalesced, inclusive page runs.
     ///
@@ -1642,11 +1664,17 @@ struct GuestWriteFootprint {
     /// the largest single cost in the device, for an answer that was
     /// `Disjoint` on all but 265 of 1 374 851 draws.
     ///
-    /// Runs answer it without scattering. A written region is physically
-    /// contiguous far more often than not, so the ledger collapses to a handful
-    /// of entries: a page outside their overall span is retired by two
-    /// comparisons, and one inside it costs a binary search over a vector small
-    /// enough to stay in cache.
+    /// Runs answer it without scattering: a page outside their overall span is
+    /// retired by two comparisons, and one inside it is found by bisection.
+    ///
+    /// **They do not collapse to a handful of entries, and this doc used to say
+    /// they did.** A driven fullscreen Maps boot holds ~2 465 armed pages in
+    /// ~2 600 runs — so the coalescing recovers almost nothing and the armed
+    /// pages are very nearly all non-adjacent. Two consequences, both measured:
+    /// the vector is ~41 KB rather than cache-resident, and every consumer of
+    /// this field is linear in a count that tracks the guest's outstanding
+    /// writes rather than the draw's own read set. Why a writeback ledger's
+    /// pages do not merge is not understood and is worth knowing.
     ///
     /// Coalescing is exact: two page numbers merge only when they are adjacent,
     /// so every page in a run is a page in `page_counts` and the merge answers
@@ -1664,6 +1692,7 @@ impl GuestWriteFootprint {
     /// The armed pages as sorted, coalesced, inclusive runs.
     fn runs(&mut self) -> &[(u64, u64)] {
         if self.runs_stale {
+            let started = std::time::Instant::now();
             self.runs.clear();
             let mut pages: Vec<u64> = self.page_counts.keys().copied().collect();
             pages.sort_unstable();
@@ -1674,6 +1703,10 @@ impl GuestWriteFootprint {
                 }
             }
             self.runs_stale = false;
+            vis_walk_census::note_rebuild(
+                self.page_counts.len() as u64,
+                started.elapsed().as_nanos() as u64,
+            );
         }
         &self.runs
     }
@@ -1742,6 +1775,9 @@ pub mod vis_walk_census {
     static RUNS: AtomicU64 = AtomicU64::new(0);
     static SPAN_MISSES: AtomicU64 = AtomicU64::new(0);
     static RUNS_SKIPPED: AtomicU64 = AtomicU64::new(0);
+    static REBUILDS: AtomicU64 = AtomicU64::new(0);
+    static REBUILD_PAGES: AtomicU64 = AtomicU64::new(0);
+    static REBUILD_NS: AtomicU64 = AtomicU64::new(0);
 
     /// One ask's totals, banked once rather than per set.
     ///
@@ -1758,6 +1794,12 @@ pub mod vis_walk_census {
         pub(super) span_misses: u64,
     }
 
+    pub(super) fn note_rebuild(pages: u64, ns: u64) {
+        REBUILDS.fetch_add(1, Relaxed);
+        REBUILD_PAGES.fetch_add(pages, Relaxed);
+        REBUILD_NS.fetch_add(ns, Relaxed);
+    }
+
     pub(super) fn bank(ask: &Ask, runs: u64) {
         ASKS.fetch_add(1, Relaxed);
         RUNS.fetch_add(runs, Relaxed);
@@ -1768,7 +1810,8 @@ pub mod vis_walk_census {
         SPAN_MISSES.fetch_add(ask.span_misses, Relaxed);
     }
 
-    /// Read and reset: `(asks, sets, given, walked, runs, span_misses, runs_skipped)`.
+    /// Read and reset: `(asks, sets, given, walked, runs, span_misses, runs_skipped,
+    /// rebuilds, rebuild_pages, rebuild_ns)`.
     ///
     /// `runs_skipped` is a **distance, not a cost**: the number of ledger runs
     /// the cursor moved past, which the merge covers in a bisection and so pays
@@ -1776,7 +1819,7 @@ pub mod vis_walk_census {
     /// how far the seek has to reach, and the day it is being stepped again the
     /// same distance becomes the same number of comparisons.
     #[allow(clippy::type_complexity)]
-    pub fn take() -> (u64, u64, u64, u64, u64, u64, u64) {
+    pub fn take() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
         (
             ASKS.swap(0, Relaxed),
             SETS.swap(0, Relaxed),
@@ -1785,6 +1828,9 @@ pub mod vis_walk_census {
             RUNS.swap(0, Relaxed),
             SPAN_MISSES.swap(0, Relaxed),
             RUNS_SKIPPED.swap(0, Relaxed),
+            REBUILDS.swap(0, Relaxed),
+            REBUILD_PAGES.swap(0, Relaxed),
+            REBUILD_NS.swap(0, Relaxed),
         )
     }
 }
