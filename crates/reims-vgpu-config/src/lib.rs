@@ -379,6 +379,53 @@ pub const GATHER_AUDIT_ALL: &str = "REIMS_VGPU_GATHER_AUDIT_ALL";
 /// the whole per-draw copy the cache exists to remove.
 pub const GATHER_VOUCH: &str = "REIMS_VGPU_GATHER_VOUCH";
 
+/// `off` refuses every sampled guest-memory **alias** while leaving the
+/// host-pointer import itself in place.
+///
+/// Narrowing only, and it is the ablation `REIMS_VGPU_GUEST_IMPORT=off` cannot
+/// perform. That switch closes the import, which moves the sampled rail onto a
+/// different window construction *and* onto a different content rail at the
+/// same time, so an arm difference measured against it names two variables at
+/// once. This one moves exactly one: the import still resolves, the gather
+/// still reads the guest's own pages, and only the aliasing image — the arm
+/// where Vulkan binds an image directly over those pages — is withheld, as a
+/// named refusal rather than a silent fallback.
+///
+/// Use it when a defect is visible on a capable host and absent on the copying
+/// arm, to say whether the alias or the addressing is the variable.
+pub const SAMPLED_ALIAS: &str = "REIMS_VGPU_SAMPLED_ALIAS";
+
+/// `off` keeps every draw-time **buffer** bind on the CPU staging read even
+/// where the host-pointer import would have let the GPU gather the guest's own
+/// pages.
+///
+/// The narrowing counterpart of [`SAMPLED_ALIAS`], and the second half of
+/// taking `REIMS_VGPU_GUEST_IMPORT=off` apart. That switch closes the import for
+/// *every* rail at once — sampled textures, buffers, render targets and
+/// writeback — so a defect that only reproduces without it names no subsystem.
+/// This one moves the buffer rail alone: vertex, index, uniform and storage
+/// binds go back to `BufferContent::Bytes`, read by the CPU at bind time,
+/// while sampled textures keep the import.
+///
+/// The distinction it isolates is not only who copies. A CPU staging read takes
+/// the guest's bytes when the draw is **recorded**; a GPU gather over imported
+/// pages reads them when the command buffer **executes**. Those differ for any
+/// buffer the guest recycles between the two, and nothing else in this device
+/// separates them.
+pub const BUFFER_IMPORT: &str = "REIMS_VGPU_BUFFER_IMPORT";
+
+/// `off` keeps every render target in a device-local image even where the
+/// host-pointer import would have bound one directly over the guest's pages.
+///
+/// The third narrowing switch in the set that takes `REIMS_VGPU_GUEST_IMPORT=off`
+/// apart, after [`SAMPLED_ALIAS`] and [`BUFFER_IMPORT`]. A target bound over
+/// guest memory is written in place; a device-local one is written into its own
+/// allocation and reaches the guest's pages only through
+/// `runtime::render_writeback`. Those are different orderings between a Store
+/// and any later read of the same pages, and this is the only switch that moves
+/// that one variable.
+pub const TARGET_IMPORT: &str = "REIMS_VGPU_TARGET_IMPORT";
+
 /// `off` narrows the CLEAR-seed Store at the head of a draw chain out of
 /// existence: the solid colour is not written into the guest's pages before the
 /// encode, and only what the draw's own Store lands reaches them.

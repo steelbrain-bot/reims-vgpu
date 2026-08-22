@@ -192,6 +192,13 @@ impl SampledCopyCause {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WindowRefusal {
     HostImportUnavailable,
+    /// The operator withheld the aliasing rail with `REIMS_VGPU_SAMPLED_ALIAS=off`.
+    ///
+    /// A narrowing switch, so this is a refusal and not a capability: the bind
+    /// falls to the imported-buffer copy rail the same way every shape refusal
+    /// does. It is named so an ablation boot can be told apart from a host that
+    /// genuinely cannot alias.
+    SampledAliasDisabledByEnv,
     UnsupportedImageShape {
         layers: u32,
         volume: bool,
@@ -308,6 +315,7 @@ impl Decline for WindowRefusal {
     fn slug(&self) -> &'static str {
         match self {
             Self::HostImportUnavailable => "no_host_import",
+            Self::SampledAliasDisabledByEnv => "sampled_alias_disabled_by_env",
             Self::UnsupportedImageShape { .. } => "unsupported_image_shape",
             Self::SampledContentRequiresCopy(cause) => cause.slug(),
             Self::SampledAliasHostWritesNotCoherent { .. } => {

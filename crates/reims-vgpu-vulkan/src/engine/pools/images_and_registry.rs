@@ -574,6 +574,17 @@ impl ResourcePools {
         if sample_count != 1 {
             return None;
         }
+        // Narrowing switch, asked before the host is. A target withheld here
+        // takes the device-local allocation every host without the import
+        // takes, and reaches guest pages through `render_writeback` instead of
+        // being written in place.
+        if matches!(
+            reims_vgpu_config::switch(reims_vgpu_config::TARGET_IMPORT),
+            reims_vgpu_config::Switch::Off
+        ) {
+            crate::telemetry::note_route("target_guest_import_disabled_by_env");
+            return None;
+        }
         let target = target?;
         let bytes_per_texel = crate::translate::pixel::texel_layout_of(format)
             .map(|layout| u64::from(layout.bytes_per_texel()))?;

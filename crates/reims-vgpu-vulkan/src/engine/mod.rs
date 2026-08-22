@@ -2601,6 +2601,20 @@ pub fn sampled_guest_image_binding_requirement(
     request: reims_vgpu_memory::GuestImageBindingRequest,
 ) -> Option<reims_vgpu_memory::GuestImageBindingDisposition> {
     use reims_vgpu_memory::{GuestImageBindingDisposition, GuestImageBindingRequirement};
+    // Narrowing switch, asked before the host is: an operator withholding the
+    // aliasing rail must reach the same copy rail a host without the extension
+    // reaches, and must say so by name rather than by silence.
+    if matches!(
+        reims_vgpu_config::switch(reims_vgpu_config::SAMPLED_ALIAS),
+        reims_vgpu_config::Switch::Off
+    ) {
+        reims_vgpu_observe::Emit::decline(
+            "sampled_guest_alias_ineligible",
+            &linear_image_import::WindowRefusal::SampledAliasDisabledByEnv,
+        )
+        .off();
+        return Some(GuestImageBindingDisposition::Refused);
+    }
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
