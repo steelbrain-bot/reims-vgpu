@@ -667,26 +667,15 @@ impl TaskResources {
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let task = TaskId::new(task_id);
         objects
             .into_iter()
-            .map(|object| {
-                let Some(id) = registry.graph.resolve(TaskId::new(task_id), object) else {
-                    return (object, None, None);
-                };
-                let expected = registry
-                    .graph
-                    .resource(id)
-                    .map(|node| node.content.current());
-                registry
-                    .graph
-                    .prepare(id, submission)
-                    .expect("a resolved resource exists");
-                registry
-                    .graph
-                    .submit(id, submission)
-                    .expect("the resource was prepared in this transition");
-                (object, Some(id), expected)
-            })
+            .map(
+                |object| match registry.graph.enter_submission(task, object, submission) {
+                    Some((id, expected)) => (object, Some(id), Some(expected)),
+                    None => (object, None, None),
+                },
+            )
             .collect()
     }
 

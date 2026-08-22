@@ -79,10 +79,18 @@ pub struct ContentStamp {
     pub version: ContentVersion,
 }
 
+/// Where a resource sits with respect to submissions that reference it.
+///
+/// There is no `Prepared` between [`Self::Created`] and [`Self::InFlight`].
+/// There was one, and nothing ever read it: the only writer assigned it and the
+/// next line of the same function overwrote it with `InFlight`, both under the
+/// one lock that guards this graph, so no observer anywhere could sample a
+/// resource in it. It is gone with the `prepare`/`submit` split that produced
+/// it — see [`ResourceGraph::enter_submission`], which performs that pair as
+/// the single transition its caller always wanted.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LifecycleState {
     Created,
-    Prepared,
     InFlight,
     Released,
 }
@@ -845,38 +853,50 @@ impl ResourceGraph {
         Ok(node.backing_generation)
     }
 
-    pub fn prepare(
+    /// Resolve one object-table reference and enter the resource it names into
+    /// a submission, reporting the content version that submission must expect.
+    ///
+    /// # One transition, because it was never two
+    ///
+    /// This replaced a `resolve`/`resource`/`prepare`/`submit` quartet whose
+    /// last three took the **same key**, so opening a submission cost four
+    /// `BTreeMap` descents per resource descriptor where the work asks for two.
+    /// `prepare` and `submit` had exactly one caller each, on adjacent lines,
+    /// and `submit`'s `SubmissionNotPrepared` guard re-checked a set membership
+    /// `prepare` had inserted one line earlier — a condition no caller could
+    /// make false. Splitting them bought a state nobody could observe: both ran
+    /// under one lock, so the intermediate was never visible outside this
+    /// function, and the `Prepared` lifecycle it assigned was overwritten before
+    /// the borrow ended and was read nowhere in the tree.
+    ///
+    /// The measurement that prompted it: `ExecPhase::Open` was 147 ms/s of a
+    /// drain worker running at 0.95 duty on driven fullscreen Maps — 259 us of
+    /// CPU to open one submission, and the second largest cost in this device
+    /// after the draw encode itself.
+    ///
+    /// A resolved slot always names a live resource — the slot table and the
+    /// resource table are written together under this same lock — which is what
+    /// the old `expect` on `prepare` asserted and what this one asserts.
+    pub fn enter_submission(
         &mut self,
-        id: AnyResourceId,
+        task: TaskId,
+        object: ObjectTableRef<ResourceObject>,
         submission: SubmissionId,
-    ) -> Result<(), GraphError> {
+    ) -> Option<(AnyResourceId, ContentVersion)> {
+        let id = self
+            .slots
+            .get(&(task, object))
+            .and_then(|slot| slot.current)?;
         let node = self
             .resources
             .get_mut(&id)
-            .ok_or(GraphError::ResourceAbsent)?;
+            .expect("a resolved slot names a live resource");
+        let expected = node.content.current();
         node.in_flight.insert(submission);
-        if node.lifecycle != LifecycleState::Released {
-            node.lifecycle = LifecycleState::Prepared;
-        }
-        Ok(())
-    }
-
-    pub fn submit(
-        &mut self,
-        id: AnyResourceId,
-        submission: SubmissionId,
-    ) -> Result<(), GraphError> {
-        let node = self
-            .resources
-            .get_mut(&id)
-            .ok_or(GraphError::ResourceAbsent)?;
-        if !node.in_flight.contains(&submission) {
-            return Err(GraphError::SubmissionNotPrepared);
-        }
         if node.lifecycle != LifecycleState::Released {
             node.lifecycle = LifecycleState::InFlight;
         }
-        Ok(())
+        Some((id, expected))
     }
 
     pub fn complete(
@@ -1119,8 +1139,15 @@ mod tests {
             .create_resource(task(), object(1), ObjectKind::Texture, None, [])
             .unwrap();
         let submission = SubmissionId::new(9);
-        graph.prepare(id, submission).unwrap();
-        graph.submit(id, submission).unwrap();
+        let (entered, _) = graph
+            .enter_submission(task(), object(1), submission)
+            .expect("the resource this test just created resolves");
+        assert_eq!(entered, id);
+        assert_eq!(
+            graph.resource(id).unwrap().lifecycle,
+            LifecycleState::InFlight,
+            "entering a submission is one transition and lands in InFlight"
+        );
         graph.release_reference(task(), object(1)).unwrap();
 
         assert_eq!(
