@@ -831,6 +831,13 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 if let Some((w, h, src)) =
                     try_gva_resident_sample(state, host, task_id, texture_ref, resource, tex)
                 {
+                    note_linear_sample_geometry(
+                        state,
+                        task_id,
+                        texture_ref,
+                        tex,
+                        LinearSampleRung::Resident,
+                    );
                     return Some((w, h, 0, src));
                 }
             }
@@ -843,6 +850,13 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 sampled_shape,
                 selection,
             ) {
+                note_linear_sample_geometry(
+                    state,
+                    task_id,
+                    texture_ref,
+                    tex,
+                    LinearSampleRung::ZeroCopy,
+                );
                 return Some((w, h, 0, src));
             }
             if refuse_unmaterialized_mip_range(texture_ref, tex, selection) {
@@ -851,6 +865,13 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
             if let Some((w, h, rgba, identity, byte_format)) =
                 load_linear_from_host_caches(state, host, task_id, texture_ref, tex)
             {
+                note_linear_sample_geometry(
+                    state,
+                    task_id,
+                    texture_ref,
+                    tex,
+                    LinearSampleRung::HostRead,
+                );
                 return Some((
                     w,
                     h,
@@ -863,6 +884,19 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     ),
                 ));
             }
+            // Every rung of the linear fork declined. The bind is not lost --
+            // the last-resort rung below still reads the guest's bytes -- but
+            // it reads them on the CPU, per bind, and none of the three rails
+            // this fork exists to choose between served it. Recorded with the
+            // same geometry line as the three that do, so a boot can say which
+            // textures land here rather than only how many.
+            note_linear_sample_geometry(
+                state,
+                task_id,
+                texture_ref,
+                tex,
+                LinearSampleRung::Unserved,
+            );
         }
     }
 
@@ -2903,6 +2937,19 @@ fn held_buffer_content(
     None
 }
 
+/// Whether this bind may take the zero-copy buffer rail at all.
+///
+/// The caller's own answer, narrowed by the operator's. `REIMS_VGPU_BUFFER_IMPORT=off`
+/// may only take a bind *off* the rail; it can never put one on that the caller
+/// refused, which is the direction `AGENTS.md` requires of every override.
+fn buffer_zero_copy_allowed(requested: bool) -> bool {
+    requested
+        && !matches!(
+            crate::env::switch(crate::env::BUFFER_IMPORT),
+            crate::env::Switch::Off
+        )
+}
+
 /// Resolve a previously validated backing through the zero-copy ladder, with
 /// the CPU read as the capability fallback.
 // Hot buffer-load path: the arguments are the decoded bind plus the host and
@@ -2919,6 +2966,7 @@ pub(super) fn load_buffer_content_resolved<M: HostMemory + HostOps>(
     extent_cap: Option<u64>,
     backing: &BufferBacking,
 ) -> Option<reims_vgpu_core::BufferContent> {
+    let allow_zero_copy = buffer_zero_copy_allowed(allow_zero_copy);
     // Resolve the backing (object-list entry + descriptor) once and share it
     // between the zero-copy attempt and the CPU fallback.
     if allow_zero_copy {
@@ -2968,6 +3016,7 @@ pub(super) fn load_buffer_content<M: HostMemory + HostOps>(
     allow_zero_copy: bool,
     extent_cap: Option<u64>,
 ) -> Option<reims_vgpu_core::BufferContent> {
+    let allow_zero_copy = buffer_zero_copy_allowed(allow_zero_copy);
     if allow_zero_copy {
         if let Some(content) = held_buffer_content(state, task_id, buffer_ref, offset, extent_cap) {
             return Some(content);
@@ -3560,6 +3609,276 @@ fn stated_task_resource_generation(
     }
 }
 
+/// Which rung of the linear sampled fork served one guest texture.
+///
+/// The three arms below are the three rungs in `resolve_sampled_source`'s
+/// linear branch, in the order it tries them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum LinearSampleRung {
+    /// A render Store already published these pages as an engine image.
+    Resident,
+    /// The zero-copy rail: the engine reads the guest's own pages.
+    ZeroCopy,
+    /// The CPU rung: this device reads the guest bytes and converts them.
+    HostRead,
+    /// None of the three rungs served this bind, so it falls past the linear
+    /// branch to the descriptor-driven last-resort rung below.
+    ///
+    /// The other three are outcomes of the fork; this is the absence of one,
+    /// and it was invisible until a boot needed it. A linear bind that reaches
+    /// the last-resort rung has read guest bytes on the CPU and rebuilt them
+    /// per bind, so a rail sitting here is both the slow answer and the one
+    /// whose content nothing above compared.
+    Unserved,
+}
+
+impl LinearSampleRung {
+    fn route(self) -> &'static str {
+        match self {
+            Self::Resident => "lingeom_resident",
+            Self::ZeroCopy => "lingeom_zero_copy",
+            Self::HostRead => "lingeom_host_read",
+            Self::Unserved => "lingeom_unserved",
+        }
+    }
+
+    fn slug(self) -> &'static str {
+        match self {
+            Self::Resident => "resident",
+            Self::ZeroCopy => "zero_copy",
+            Self::HostRead => "host_read",
+            Self::Unserved => "unserved",
+        }
+    }
+}
+
+/// Record the geometry one linear sampled bind resolved, and which rung took it.
+///
+/// This is an instrument and decides nothing. It exists because the two
+/// guest-memory arms — the zero-copy rail and the CPU rung the copying host
+/// runs — are known to render Maps' type layer differently while every counter
+/// in the tree reads clean on both, and no reading in the tree says whether the
+/// two arms compute the *same geometry* for the same guest texture. Both arms
+/// pass through this one fork, so a record emitted here is directly comparable
+/// between two boots: run each arm to the same scene and diff the two multisets.
+///
+/// Deduped per `(gva, declared format)`, which is a handful of lines a boot,
+/// while the route counters beside it carry the volume. The pair is deliberate:
+/// a count says how much traffic a rung took and the line says what shape it
+/// took, and `AGENTS.md` records that quoting one as the other is a mistake this
+/// repository has already made.
+fn note_linear_sample_geometry(
+    state: &Device,
+    task_id: u32,
+    texture_ref: u32,
+    tex: &TextureDescriptor,
+    rung: LinearSampleRung,
+) {
+    crate::runtime::drain::note_store_route(rung.route());
+    let Some((gva, layout)) = tex.level_gva(0, state.page_shift) else {
+        return;
+    };
+    let Some(format) = tex.declared_pixel_format() else {
+        return;
+    };
+    if !crate::observe::first_sight("lin_geom", gva ^ (u64::from(format) << 48)) {
+        return;
+    }
+    crate::observe::off(format!(
+        "lin_geom rung={} task={task_id} ref={texture_ref} gva={gva:#x} \
+         {}x{} pitch={} fmt={format:#x} mips={} usage={:#x} announce={:?}",
+        rung.slug(),
+        layout.width,
+        layout.height,
+        layout.row_stride,
+        tex.mipmap_level_count.max(1),
+        tex.declared_usage().unwrap_or(0),
+        tex.guest_write_announcement(),
+    ));
+}
+
+/// Record the byte window one linear sampled bind resolved for its gather.
+///
+/// Three sites build that window — a packed import plus an image contract, a
+/// packed import without one, and a task-GVA walk when no import exists — and
+/// they are reached by different hosts, so no boot exercises more than two of
+/// them. `AGENTS.md` names that shape as the one to diff arm against arm rather
+/// than read alone, and the levels of an image contract are *allocation*
+/// relative, so a window based anywhere but the allocation's own start applies
+/// those offsets to the wrong bytes.
+///
+/// Deduped per `(gva, site)` so the arms can be compared source by source.
+/// Purely an observation: nothing here reaches a decision.
+/// Judge a **reused** packed view's recorded page GPAs against a live walk of
+/// the task page table.
+///
+/// `bound_buffers::audit_view_gpas_against_page_table` asks the same question at
+/// *construction*, and says in its own doc that it therefore "cannot see a page
+/// table edited after an alias was built". That blind spot is not a detail: the
+/// construction audit's large `agree` beside a zero `differs` was read as closing
+/// the question of *where* the sampled bytes come from, and it cannot see the one
+/// way the answer goes wrong after the fact. A guest that frees a small texture
+/// and places different physical pages at the same address — which is what a
+/// window server does continuously with rasterized type — moves the page table
+/// under a view this device already built and caches.
+///
+/// So this is the reuse-time half. It decides nothing and it is not a gate: a
+/// disagreement is reported and the bind proceeds exactly as before, because the
+/// point is to measure whether the class occurs at all before anything is built
+/// on the answer.
+///
+/// It walks the guest page table on every bind it runs for, so it runs only when
+/// the operator has already asked for content-level scrutiny with
+/// `REIMS_VGPU_GATHER_AUDIT_ALL=on`. There is deliberately **no stride**: a
+/// sampling rate here would report a rate nobody could interpret, and
+/// `AGENTS.md` bans one for exactly that reason.
+fn audit_packed_view_on_reuse<M: HostMemory>(
+    state: &Device,
+    host: &M,
+    task_id: u32,
+    gva: u64,
+    view_gpas: &[u64],
+) {
+    use crate::runtime::gather_witness::AuditDensity;
+    if matches!(
+        crate::runtime::gather_witness::audit_density(),
+        AuditDensity::Disabled
+    ) {
+        return;
+    }
+    let page = state.page_size();
+    if page == 0 || view_gpas.is_empty() {
+        return;
+    }
+    let page_base = gva - (gva % page);
+    let map_len = (view_gpas.len() as u64) * page;
+    let table = crate::runtime::gva_mem::task_gva_page_gpas(
+        host,
+        &state.tasks,
+        task_id,
+        page_base,
+        map_len,
+        state.page_shift,
+    );
+    if table.len() < view_gpas.len() {
+        crate::runtime::drain::note_store_route("linview_reuse_short");
+        return;
+    }
+    match view_gpas
+        .iter()
+        .zip(table.iter())
+        .enumerate()
+        .find(|(_, (view, live))| view != live)
+    {
+        None => crate::runtime::drain::note_store_route("linview_reuse_agree"),
+        Some((index, (view_gpa, live_gpa))) => {
+            crate::runtime::drain::note_store_route("linview_reuse_differs");
+            if crate::observe::first_sight("linview_reuse", gva) {
+                crate::observe::fail(format!(
+                    "linview_reuse_differs task={task_id} gva={gva:#x} page={index} \
+                     view_gpa={view_gpa:#x} live_gpa={live_gpa:#x} pages={} \
+                     (the packed view this bind samples names a physical page the \
+                     guest no longer places at this address)",
+                    view_gpas.len()
+                ));
+            }
+        }
+    }
+}
+
+/// Compare the **bytes** the import path would hand the gather against a live
+/// page-table read of the same guest window.
+///
+/// [`audit_packed_view_on_reuse`] compares page *numbers* and reads 1 364 726
+/// agree against zero. That is a real closure of one question and it does not
+/// close this one: a packed view's host pointer is
+/// `import.host_base() + head + offset`, and every one of those terms can be
+/// wrong while the page list is right. The remapped alias the PCI shim builds
+/// places each shared page at its *resource* offset inside a reserved range, so
+/// an error in `head`, in the within-page offset, or in which reserved range the
+/// resource was given, moves the read without moving a single GPA.
+///
+/// So this reads the window both ways and compares the bytes themselves. The
+/// CPU walk is the same one the copying arm uses for every bind, which makes
+/// this an arm-against-arm comparison inside one boot rather than across two.
+///
+/// An instrument: it decides nothing, it is not a gate, and the bind proceeds
+/// unchanged either way. It reads the whole window on the CPU, so it runs only
+/// under `REIMS_VGPU_GATHER_AUDIT_ALL=on`, and never with a stride.
+fn audit_import_bytes_against_page_table<M: HostMemory>(
+    state: &Device,
+    host: &M,
+    task_id: u32,
+    gva: u64,
+    host_ptr: usize,
+    span: u64,
+) {
+    use crate::runtime::gather_witness::AuditDensity;
+    if matches!(
+        crate::runtime::gather_witness::audit_density(),
+        AuditDensity::Disabled
+    ) {
+        return;
+    }
+    // Bound the compare so one enormous window cannot dominate the boot. This
+    // is a prefix, not a sample: every window is judged, over its first pages.
+    const COMPARE_LIMIT: u64 = 16 * 1024;
+    let len = span.min(COMPARE_LIMIT);
+    let Ok(len) = usize::try_from(len) else {
+        return;
+    };
+    if len == 0 {
+        return;
+    }
+    let mut walked = vec![0u8; len];
+    if crate::runtime::gva_mem::try_read_task_gva_by_id(
+        host,
+        &state.tasks,
+        task_id,
+        gva,
+        &mut walked,
+        state.page_shift,
+    )
+    .is_err()
+    {
+        crate::runtime::drain::note_store_route("linbytes_walk_unavailable");
+        return;
+    }
+    // SAFETY: `host_ptr` is the import's own mapping of this window, obtained
+    // from the packed view that produced `span`, and the guest RAM import is
+    // held for the lifetime of the VM.
+    let imported = unsafe { std::slice::from_raw_parts(host_ptr as *const u8, len) };
+    match imported.iter().zip(walked.iter()).position(|(a, b)| a != b) {
+        None => crate::runtime::drain::note_store_route("linbytes_agree"),
+        Some(offset) => {
+            crate::runtime::drain::note_store_route("linbytes_differ");
+            if crate::observe::first_sight("linbytes_differ", gva) {
+                crate::observe::fail(format!(
+                    "linbytes_differ task={task_id} gva={gva:#x} span={span} \
+                     first_diff={offset} imported={:#04x} walked={:#04x} \
+                     (the import mapping and the task page table disagree about \
+                     the bytes at this address)",
+                    imported[offset], walked[offset]
+                ));
+            }
+        }
+    }
+}
+
+fn note_linear_sample_window(site: &'static str, gva: u64, base: u64, span: u64, row_len: u32) {
+    crate::runtime::drain::note_store_route(match site {
+        "packed_contract" => "linwin_packed_contract",
+        "packed_plane" => "linwin_packed_plane",
+        _ => "linwin_gva_walk",
+    });
+    if !crate::observe::first_sight("lin_window", gva ^ (span << 24)) {
+        return;
+    }
+    crate::observe::off(format!(
+        "lin_window site={site} gva={gva:#x} base={base} span={span} rowlen={row_len}"
+    ));
+}
+
 fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     state: &mut Device,
     host: &mut M,
@@ -3902,6 +4221,15 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
             }];
             let stated = stated_task_resource_generation(state, tex, resource);
             let allocation_gva = allocation.as_ref()?.gva;
+            audit_packed_view_on_reuse(state, host, task_id, allocation_gva, witness.gpas);
+            audit_import_bytes_against_page_table(
+                state,
+                host,
+                task_id,
+                allocation_gva,
+                witness.host_ptr,
+                packed.size,
+            );
             let seen = crate::runtime::gather_witness::note_gather(
                 state,
                 crate::runtime::gather_witness::GatherRail::Linear,
@@ -3921,6 +4249,7 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
             let memory =
                 linear_guest_image_allocation_memory(&packed, image_allocation, u64::from(bpp))?;
             let transfer = packed.texel_source(0, packed.size, 0)?;
+            note_linear_sample_window("packed_contract", allocation_gva, 0, packed.size, 0);
             let request = SampledSourceRequest::GuestImage(
                 reims_vgpu_memory::GuestImageSource {
                     direct: direct_admitted.then_some(memory),
@@ -3938,6 +4267,8 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
 
         let page = state.page_size();
         let witness = packed.witness_window(plane_offset, span)?;
+        audit_packed_view_on_reuse(state, host, task_id, gva, witness.gpas);
+        audit_import_bytes_against_page_table(state, host, task_id, gva, witness.host_ptr, span);
         let witness_runs = [reims_vgpu_memory::GuestRun {
             host_ptr: witness.host_ptr,
             len: span,
@@ -3959,6 +4290,7 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                 page_size: page as usize,
             },
         );
+        note_linear_sample_window("packed_plane", gva, plane_offset, span, row_length_texels);
         let source = reims_vgpu_memory::GuestRunSource {
             runs: std::sync::Arc::clone(&packed.runs),
             source_offset: plane_offset,
@@ -4020,6 +4352,7 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
             },
         );
         let physical_pages = reims_vgpu_memory::GuestPageSet::new(&gpas);
+        note_linear_sample_window("gva_walk", backing.gva, 0, backing.size, 0);
         let transfer = reims_vgpu_memory::GuestRunSource {
             runs: std::sync::Arc::new(runs),
             source_offset: 0,
