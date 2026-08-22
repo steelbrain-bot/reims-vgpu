@@ -51,7 +51,7 @@
 //!
 //! | part | us/s | % | what it brackets | what would fix it |
 //! |---|---|---|---|---|
-//! | `Resolve` | 15498 | 72.1 | the attachment-alias branch and `resolve_sampled_source`, per texture bind | the sampled content cache and the gather witness |
+//! | `Resolve` | 15498 | 72.1 | the attachment-alias branch and `resolve_sampled_source`, per texture bind | resolving at the `Set` record instead of at the draw — see below |
 //! | [`Part::Reflect`] | 2556 | 11.9 | the AIR constexpr static-sampler walk and, in this measurement, the residual SPIR-V sampler-interface scan | carrying the reflected interface with each `m2v_cache` variant |
 //! | [`Part::Lookup`] | 1526 | 7.1 | `lookup_list_entry` + `resolve_texture_view`, per texture bind | caching the guest object-list walk and the type-8 view descriptor read |
 //! | [`Part::Samplers`] | 1263 | 5.9 | `load_vulkan_sampler` over the record's own sampler binds | the task-scoped retained sampler registry |
@@ -88,6 +88,40 @@
 //! is drawing into materialises a fresh `w * h` buffer per bind, or in
 //! [`Part::ResolveSource`], where the rung ladder reads guest pages — and those
 //! have nothing in common but a line number.
+//!
+//! # The fix for `Resolve` is to stop asking, not to remember the answer
+//!
+//! That column used to read "the sampled content cache and the gather witness",
+//! and the first half of it is the wrong instruction. A memo over this phase
+//! would be keyed by something this crate invented, and its hit rate would be a
+//! property of the workload rather than of this device — which is the reading
+//! `## A Bounded Cache Is Fake Performance` exists to refuse.
+//!
+//! The contract already says where the answer belongs. A Metal render encoder
+//! *has state*: the guest issues `setFragmentTexture:atIndex:` once and then
+//! draws against it, and a driver resolves that texture at the record that set
+//! it. This device instead re-resolves every entry of the encoder's bind tables
+//! on every draw, including the entries the guest has not touched since the
+//! last one — `sampled` is 0.936 a draw, so the common case is re-resolving the
+//! same single texture that was resolved for the previous draw.
+//!
+//! Resolution splits cleanly along that line, and only the cheap half is
+//! genuinely per-draw. The resource half — the rung ladder, the linear
+//! admission, the gather witness — depends on the resource and its content
+//! version, and on a banded driven Maps boot costs 1.540 µs a draw. The
+//! interface half — which descriptor slot the ref lands in, which does vary
+//! when the pipeline changes between two draws over the same texture — is
+//! `Part::Reflect` plus `Part::Lookup`, **0.03 µs a draw**.
+//!
+//! So the resolved entry belongs in the encoder's bind slot beside the raw ref
+//! that produced it, computed when the guest sets it, replaced when the guest
+//! sets that slot again, and dropped when the encoder ends. Nothing outlives
+//! the thing that owns it, so there is no capacity, no eviction and no
+//! staleness question the slot's own lifetime does not answer. The one term
+//! that must not be forgotten is the second input: an entry is also superseded
+//! when the *resource's* content authority moves, not only when the guest
+//! re-binds, and omitting that is exactly what would turn this from owning a
+//! value into holding a stale one.
 //!
 //! The last two are one part on purpose. They are different data structures —
 //! a small reflection `Vec` and a full SPIR-V word array — but they answer the
