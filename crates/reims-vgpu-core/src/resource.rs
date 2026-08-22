@@ -95,6 +95,46 @@ pub enum LifecycleState {
     Released,
 }
 
+/// What the alias walk costs, as three running totals this crate owns and the
+/// composition crate reports once a second on the `OFF` channel.
+///
+/// [`ResourceGraph::guest_wrote_aliases`] runs once per resource descriptor that
+/// declares a guest write — around a million times a minute on a driven
+/// fullscreen Maps boot — so a term in it that is not proportional to the
+/// resource being written is paid a million times. The address-overlap search
+/// was such a term: it scanned every storage node in the device, and counting
+/// it is what turned "this looks quadratic" into 3 947.6 nodes examined per
+/// walk against 1.00 resource actually visited. Arithmetic would not have
+/// settled it — two arithmetic guesses in this same neighbourhood measured at
+/// nothing.
+///
+/// `scan_iters / walks` is now the standing guard rather than a diagnosis:
+/// `ResourceGraph::storage_overlapping` holds it near 1, and anything that
+/// reintroduces a scan moves it by three orders of magnitude in a counter that
+/// is already being printed. Three relaxed adds per walk is what that costs.
+pub mod alias_walk_census {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    static WALKS: AtomicU64 = AtomicU64::new(0);
+    static VISITED: AtomicU64 = AtomicU64::new(0);
+    static SCAN_ITERS: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn note(walks: u64, visited: u64, scan_iters: u64) {
+        WALKS.fetch_add(walks, Relaxed);
+        VISITED.fetch_add(visited, Relaxed);
+        SCAN_ITERS.fetch_add(scan_iters, Relaxed);
+    }
+
+    /// Read and reset the three totals: `(walks, visited, scan_iters)`.
+    pub fn take() -> (u64, u64, u64) {
+        (
+            WALKS.swap(0, Relaxed),
+            VISITED.swap(0, Relaxed),
+            SCAN_ITERS.swap(0, Relaxed),
+        )
+    }
+}
+
 /// Versions held by the three places resource bytes can reside.
 ///
 /// `None` means that replica does not contain bytes from this resource's
@@ -428,6 +468,34 @@ struct NamespaceSlot {
 pub struct ResourceGraph {
     slots: BTreeMap<(TaskId, ObjectTableRef<ResourceObject>), NamespaceSlot>,
     resources: BTreeMap<AnyResourceId, ResourceNode>,
+    /// Every [`StorageBacking::TaskAddress`] node, ordered by the guest range it
+    /// backs: `(task, start, storage id) -> end`.
+    ///
+    /// Asking which storage nodes overlap a guest range used to be a walk of
+    /// **every** node in the device, inside a walk run once per resource
+    /// descriptor that declares a guest write. One driven fullscreen Maps boot
+    /// counted 3 876 645 110 such examinations in 45 seconds — 3 947.6 nodes per
+    /// walk over 982 038 walks — against 1.00 resource actually visited.
+    ///
+    /// Removing it is worth, over three interleaved boots an arm with the arms
+    /// disjoint on every axis: the walk's own scan 3 801 -> 1.2 nodes examined,
+    /// the `open` phase 4.19 -> 1.00 us per draw (-76 %), and the whole drain
+    /// worker 27.22 -> 23.51 us per draw (-13.6 %).
+    ///
+    /// This is an **index, not a memo**: it is derived from the same nodes on
+    /// every mutation and holds no computed answer, so it has no hit rate, no
+    /// eviction and no invalidation. It is maintained at `create_storage`, which
+    /// is the only place a node or its backing is ever written — nothing
+    /// reassigns `StorageNode::backing` and nothing removes a node — so it
+    /// cannot drift from the map it indexes.
+    ///
+    /// The storage id is in the key so two nodes may back the same range.
+    task_address_index: BTreeMap<(TaskId, u64, u64), u64>,
+    /// The longest `TaskAddress` extent recorded for a task, which is what
+    /// bounds a query: any range overlapping `[start, end)` must begin at or
+    /// after `start - longest`. It only grows, so it can widen the scanned
+    /// window but can never narrow it past a real overlap.
+    longest_task_extent: BTreeMap<TaskId, u64>,
     storage: BTreeMap<StorageId, StorageNode>,
     mappings: BTreeMap<MappingId, MappingNode>,
     next_resource_index: u32,
@@ -439,6 +507,8 @@ impl Default for ResourceGraph {
         Self {
             slots: BTreeMap::new(),
             resources: BTreeMap::new(),
+            task_address_index: BTreeMap::new(),
+            longest_task_extent: BTreeMap::new(),
             storage: BTreeMap::new(),
             mappings: BTreeMap::new(),
             next_resource_index: 1,
@@ -458,6 +528,7 @@ impl ResourceGraph {
     /// the alias set whose content authorities must advance.
     pub fn guest_wrote_aliases(&self, id: AnyResourceId) -> Option<ContentVersion> {
         let source = self.resources.get(&id)?.content.clone();
+        let mut scan_iters = 0u64;
         let mut pending = vec![id];
         let mut visited = BTreeSet::new();
         let mut ranges = Vec::<(TaskId, u64, u64)>::new();
@@ -495,25 +566,20 @@ impl ResourceGraph {
                 let end = start.saturating_add(length.get());
                 if start < end && !ranges.contains(&(task, start, end)) {
                     ranges.push((task, start, end));
-                    for candidate in self.storage.values() {
-                        let StorageBacking::TaskAddress {
-                            task: other_task,
-                            address: other_address,
-                            length: other_length,
-                        } = candidate.backing
-                        else {
-                            continue;
-                        };
-                        let other_start = other_address.get();
-                        let other_end = other_start.saturating_add(other_length.get());
-                        if task == other_task && start < other_end && other_start < end {
-                            pending.extend(candidate.owners.iter().copied());
-                        }
-                    }
+                    let overlapping = self.storage_overlapping(task, start, end);
+                    let mut examined = 0u64;
+                    let owners = overlapping
+                        .inspect(|_| examined = examined.saturating_add(1))
+                        .filter_map(|id| self.storage.get(&id))
+                        .flat_map(|candidate| candidate.owners.iter().copied())
+                        .collect::<Vec<_>>();
+                    scan_iters = scan_iters.saturating_add(examined);
+                    pending.extend(owners);
                 }
             }
         }
 
+        alias_walk_census::note(1, visited.len() as u64, scan_iters);
         let version = source.guest_wrote().ok()?;
         for authority in authorities {
             if !authority.same_authority(&source) {
@@ -651,7 +717,46 @@ impl ResourceGraph {
                 content: ContentAuthority::default(),
             },
         );
+        if let StorageBacking::TaskAddress {
+            task,
+            address,
+            length,
+        } = self.storage[&id].backing
+        {
+            let start = address.get();
+            let end = start.saturating_add(length.get());
+            if start < end {
+                self.task_address_index.insert((task, start, id.get()), end);
+                let longest = self.longest_task_extent.entry(task).or_insert(0);
+                *longest = (*longest).max(end - start);
+            }
+        }
         Ok(id)
+    }
+
+    /// Every storage node whose guest range intersects `[start, end)` on `task`.
+    ///
+    /// The bound is [`Self::longest_task_extent`]: a range starting before
+    /// `start - longest` cannot reach `start`, so the scan begins there, and a
+    /// range starting at or after `end` cannot overlap, so it stops there. What
+    /// remains inside that window still has to be tested, because a shorter
+    /// range inside it may stop before `start`.
+    fn storage_overlapping(
+        &self,
+        task: TaskId,
+        start: u64,
+        end: u64,
+    ) -> impl Iterator<Item = StorageId> + '_ {
+        use std::ops::Bound;
+        let longest = self.longest_task_extent.get(&task).copied().unwrap_or(0);
+        let low = start.saturating_sub(longest);
+        self.task_address_index
+            .range((
+                Bound::Included((task, low, 0)),
+                Bound::Excluded((task, end, 0)),
+            ))
+            .filter(move |(_, &other_end)| start < other_end)
+            .map(|(&(_, _, id), _)| StorageId::new(id))
     }
 
     pub fn storage(&self, id: StorageId) -> Option<&StorageNode> {
@@ -1012,6 +1117,136 @@ mod tests {
 
     fn object(value: u32) -> ObjectTableRef<ResourceObject> {
         ObjectTableRef::new(value)
+    }
+
+    /// The index must return exactly what walking every storage node returned.
+    ///
+    /// This replaced a scan of the whole storage map with a bounded range scan,
+    /// and a bound that is too tight loses an alias silently: the resource that
+    /// shares those guest bytes keeps a content version the guest has already
+    /// invalidated, which is stale pixels and not a crash. So the property is
+    /// checked against the predicate it replaced rather than against a handful
+    /// of cases someone thought of — the shapes that break a range bound are
+    /// exactly the ones that are easy not to think of. Ranges are drawn from a
+    /// 4 KiB address space with lengths up to a quarter of it, so nodes overlap
+    /// each other densely and the long-range-reaching-forward shape the bound
+    /// exists for is generated rather than hoped for.
+    #[test]
+    fn the_address_index_agrees_with_walking_every_storage_node() {
+        let mut graph = ResourceGraph::default();
+        // A fixed sequence, so a failure is reproducible: xorshift, seeded.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        let tasks = [TaskId::new(1), TaskId::new(2)];
+        for _ in 0..400 {
+            let task = tasks[(next() % 2) as usize];
+            let address = next() % 4096;
+            // Zero lengths are legal to construct and are deliberately included:
+            // they must be indexed by neither arm.
+            let length = next() % 1024;
+            graph
+                .create_storage(StorageBacking::TaskAddress {
+                    task,
+                    address: GuestVirtualAddress::new(address),
+                    length: ByteLength::new(length),
+                })
+                .unwrap();
+        }
+        // Backings the index does not hold at all, to prove it excludes them.
+        for plane in 0..8 {
+            graph
+                .mapper_storage(MapperSurfaceRef::new(plane), PlaneIndex::new(0))
+                .unwrap();
+        }
+
+        let brute = |task: TaskId, start: u64, end: u64| -> BTreeSet<StorageId> {
+            graph
+                .storage
+                .values()
+                .filter_map(|candidate| {
+                    let StorageBacking::TaskAddress {
+                        task: other_task,
+                        address: other_address,
+                        length: other_length,
+                    } = candidate.backing
+                    else {
+                        return None;
+                    };
+                    let other_start = other_address.get();
+                    let other_end = other_start.saturating_add(other_length.get());
+                    (task == other_task && start < other_end && other_start < end)
+                        .then_some(candidate.id)
+                })
+                .collect()
+        };
+
+        let mut queries = 0;
+        let mut nonempty = 0;
+        for _ in 0..2000 {
+            let task = tasks[(next() % 2) as usize];
+            let start = next() % 4096;
+            let end = start.saturating_add(next() % 1024);
+            if start >= end {
+                continue;
+            }
+            queries += 1;
+            let indexed: BTreeSet<StorageId> =
+                graph.storage_overlapping(task, start, end).collect();
+            let expected = brute(task, start, end);
+            assert_eq!(
+                indexed, expected,
+                "task={task:?} range=[{start}, {end}) disagreed"
+            );
+            nonempty += usize::from(!expected.is_empty());
+        }
+        // A test that only ever compared two empty sets would pass while the
+        // index returned nothing at all, so the coverage is asserted too.
+        assert!(queries > 1000, "too few usable queries: {queries}");
+        assert!(nonempty > 500, "too few overlapping queries: {nonempty}");
+    }
+
+    /// A range that begins before the query and reaches into it must be found.
+    ///
+    /// The bound is `start - longest_task_extent`, so this is the shape that a
+    /// too-tight bound drops, and it is worth a case of its own that names it.
+    #[test]
+    fn an_overlap_beginning_far_before_the_query_is_still_found() {
+        let mut graph = ResourceGraph::default();
+        let long = graph
+            .create_storage(StorageBacking::TaskAddress {
+                task: task(),
+                address: GuestVirtualAddress::new(0),
+                length: ByteLength::new(10_000),
+            })
+            .unwrap();
+        let short = graph
+            .create_storage(StorageBacking::TaskAddress {
+                task: task(),
+                address: GuestVirtualAddress::new(9_990),
+                length: ByteLength::new(10),
+            })
+            .unwrap();
+        // Starts 9 990 bytes before the query and is the only reason the bound
+        // has to reach back at all.
+        let found: BTreeSet<StorageId> = graph.storage_overlapping(task(), 9_995, 9_999).collect();
+        assert_eq!(found, BTreeSet::from([long, short]));
+
+        // Another task's identical range is not this task's alias.
+        let found: BTreeSet<StorageId> = graph
+            .storage_overlapping(TaskId::new(99), 9_995, 9_999)
+            .collect();
+        assert!(found.is_empty());
+
+        // Touching end-to-start is not an overlap: [0, 10 000) and [10 000, ..).
+        let found: BTreeSet<StorageId> =
+            graph.storage_overlapping(task(), 10_000, 10_001).collect();
+        assert!(found.is_empty(), "half-open ranges must not touch-overlap");
     }
 
     #[test]

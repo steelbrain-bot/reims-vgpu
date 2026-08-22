@@ -2953,6 +2953,22 @@ pub fn note_drain_tranche(
         if let Some(open) = DRAIN_DUTY.take_open_parts() {
             crate::observe::off(open);
         }
+        // The alias walk's own totals, owned by the semantic core because the
+        // walk is core's. `iters_per_walk` is the reading that matters: how many
+        // storage nodes one guest write examines to find the ranges overlapping
+        // it. A number near the device's whole storage population says the
+        // overlap search is a linear scan being paid per write.
+        {
+            let (walks, visited, scan_iters) = reims_vgpu_core::resource::alias_walk_census::take();
+            if walks != 0 {
+                crate::observe::off(format!(
+                    "alias_walk walks={walks} visited={visited} scan_iters={scan_iters} \
+                     visited_per_walk={:.2} iters_per_walk={:.1}",
+                    visited as f64 / walks as f64,
+                    scan_iters as f64 / walks as f64,
+                ));
+            }
+        }
         if let Some(pre) = DRAIN_DUTY.take_preflight_parts() {
             crate::observe::off(pre);
         }
