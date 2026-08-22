@@ -827,6 +827,39 @@ pub const PASS_CHURN: &str = "REIMS_VGPU_PASS_CHURN";
 ///
 /// Nothing the guest observes depends on it either way: it writes queries and
 /// reads them back, and no decision is taken on the result.
+///
+/// # What it read: the GPU second is 69 % draw execution
+///
+/// One driven fullscreen Maps boot, macos-13, x86/Vulkan Intel iGPU, banded to
+/// its 43 driven windows and joined by `t=`, 2 143 275 draws:
+///
+/// ```text
+/// pass instances   67 902     2.21 per submission, 31.6 draws each
+/// inside passes     6.151 us/draw   68.9 %    194.2 us per instance
+/// outside them      2.778 us/draw   31.1 %     87.7 us per instance
+/// ```
+///
+/// The stamps are inside the begin and inside the end, so a pass's load and
+/// store operations fall on the *outside* side: inside is draw execution, and
+/// outside is the boundary plus the attachment load and store.
+///
+/// **The boundary price cross-checks.** 87.7 µs per instance sits inside the
+/// 63-100 µs [`PASS_CHURN`] measured causally by *adding* boundaries rather than
+/// by timing them — two methods with nothing in common agreeing on the largest
+/// suspected cost in this device.
+///
+/// Perturbation is small: `gpu us/draw` read 8.929 with this on against 8.577 on
+/// the comparable boot without it, +4.1 %, inside the ±12 % spread that column
+/// carries. The split is internal to one boot and does not rest on that pair.
+///
+/// **What it rules out.** `fps = 1 / (gpu_us_per_draw × draws_per_frame)`. At
+/// that boot's 3 391 draws a frame, 60 fps needs ≤ 4.91 µs/draw and in-pass draw
+/// execution *alone* is 6.151 — so a device with zero boundary, zero load and
+/// zero store still misses 60 fps. Nor is the boundary mostly ours: the
+/// device-caused instances (`passmerge_outside_*`) are ~12.6 % of them, so
+/// perfect merging of what this device causes is worth ~3.9 % of GPU. The
+/// remaining term is `draws_per_frame`, which is 2 631-3 391 and has never been
+/// checked for fidelity.
 pub const PASS_SPANS: &str = "REIMS_VGPU_PASS_SPANS";
 
 /// **Probe, default off.** On, every render pass's outgoing `VK_SUBPASS_EXTERNAL`
