@@ -630,3 +630,32 @@ mod tests {
         assert_eq!(explicit.minimum_attachment_extent(), (0, 6));
     }
 }
+
+/// A resolved draw must be able to cross a thread boundary.
+///
+/// [`DrawRequest`] is documented as immutable, backend-neutral and fully
+/// resolved, and the x86 device is drain-CPU bound with the whole encode on one
+/// thread. Those two facts together make this type the seam a pipelined or
+/// parallel encoder would cut on: the resolving side builds one of these and
+/// hands it to whoever records it, and nothing in it may borrow the resolver's
+/// state or bind it to the resolver's thread.
+///
+/// `Send` is that promise made checkable. A field added later that is not
+/// `Send` -- a raw pointer into guest memory, an `Rc`, a handle keyed to the
+/// calling thread -- would close the seam silently, because nothing else in
+/// this tree would notice until someone tried to build the encoder and found
+/// the type no longer crosses.
+///
+/// This is not a claim that the encoder exists. It is the one property the
+/// encoder cannot be built without, asserted where the type is defined so it
+/// cannot regress unnoticed.
+#[cfg(test)]
+mod thread_seam {
+    /// See the module doc: the resolved-draw seam is only a seam if a resolved
+    /// draw can leave the thread that resolved it.
+    #[test]
+    fn a_resolved_draw_can_leave_the_thread_that_resolved_it() {
+        fn assert_send<T: Send>() {}
+        assert_send::<super::DrawRequest>();
+    }
+}
