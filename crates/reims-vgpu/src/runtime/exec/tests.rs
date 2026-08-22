@@ -5704,3 +5704,56 @@ fn a_clear_seeds_the_pass_for_any_store_action_and_publishes_only_for_store() {
          guest pages would be inventing content the guest declined"
     );
 }
+
+/// The dirty-flag predicate is pointer identity, so an equal-but-separate table
+/// is a *changed* state and not an unchanged one.
+///
+/// This is the property the whole reading rests on. `encoder_state_unchanged`
+/// is allowed to be conservative — calling a genuinely unchanged pair "changed"
+/// only forgoes a saving — but it must never call a changed pair unchanged, and
+/// the way that would happen is by comparing contents instead of allocations.
+/// Two tables holding equal bytes are two `Set` records; the guest re-stated
+/// its binds and the encoder state was rebuilt, whatever the bytes say.
+#[test]
+fn encoder_state_is_unchanged_only_when_the_tables_are_the_same_allocation() {
+    let base = PendingDraw {
+        pipeline_ref: 7,
+        ..Default::default()
+    };
+
+    let shared = PendingDraw {
+        vertex_buffers: base.vertex_buffers.clone(),
+        fragment_buffers: base.fragment_buffers.clone(),
+        vertex_textures: base.vertex_textures.clone(),
+        fragment_textures: base.fragment_textures.clone(),
+        vertex_samplers: base.vertex_samplers.clone(),
+        fragment_samplers: base.fragment_samplers.clone(),
+        ..base.clone()
+    };
+    assert!(
+        encoder_state_unchanged(&base, &shared),
+        "cloned handles are the same allocation, so no Set record separated them"
+    );
+
+    // A different pipeline with every table shared is still a changed state:
+    // the reflected interface the binds project onto has moved.
+    let repipelined = PendingDraw {
+        pipeline_ref: 8,
+        ..shared.clone()
+    };
+    assert!(
+        !encoder_state_unchanged(&base, &repipelined),
+        "a SetPipeline between the two draws changes which binding each bind lands on"
+    );
+
+    // Equal contents in a fresh allocation: the guest re-stated the class, so
+    // this must read as changed even though a byte comparison would not.
+    let restated = PendingDraw {
+        vertex_textures: std::sync::Arc::new((*base.vertex_textures).clone()),
+        ..shared.clone()
+    };
+    assert!(
+        !encoder_state_unchanged(&base, &restated),
+        "an equal-but-separate table is a Set record and must never read as unchanged"
+    );
+}

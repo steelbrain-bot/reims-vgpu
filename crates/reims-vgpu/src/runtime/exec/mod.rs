@@ -4363,7 +4363,36 @@ fn finish_stream<M: HostMemory + HostOps>(
             out.draws_fail = out.draws_fail.saturating_add(1);
             dirty_color_targets(state, host, task_id, &acc.color_targets);
         }
+        // How many consecutive draws arrive with byte-identical encoder state.
+        //
+        // `BindTable` is `Arc<Vec<_>>` and the decode accumulator clones the
+        // handle rather than the vector, so two draws whose tables are the same
+        // allocation were separated by no `Set` record for that class at all.
+        // `Arc::ptr_eq` is therefore an exact identity test, O(1), with no hash
+        // and nothing remembered past the previous record — the dirty-flag
+        // question a Metal encoder answers natively, asked here for the first
+        // time so the size of the answer is known before anything is built on
+        // it. Instrument only: nothing below reads `unchanged`.
+        let mut previous: Option<&PendingDraw> = None;
         for (di, pd) in draw_list.iter().enumerate() {
+            let unchanged = previous.is_some_and(|prev| encoder_state_unchanged(prev, pd));
+            crate::runtime::drain::note_store_route(if unchanged {
+                "dirty_state_unchanged"
+            } else {
+                "dirty_state_changed"
+            });
+            if unchanged {
+                // Which classes would still have to be re-resolved if the whole
+                // record were skipped, so the ceiling is not read as larger
+                // than it is.
+                if previous.is_some_and(|prev| prev.viewports != pd.viewports) {
+                    crate::runtime::drain::note_store_route("dirty_state_viewport_moved");
+                }
+                if previous.is_some_and(|prev| prev.scissors != pd.scissors) {
+                    crate::runtime::drain::note_store_route("dirty_state_scissor_moved");
+                }
+            }
+            previous = Some(pd);
             flush_render_barriers_at(
                 state,
                 &expanded.barriers_after_draw,
@@ -4989,6 +5018,38 @@ fn multi_draw_chain_source(resident_chain: bool, cpu_chain_ready: bool) -> Multi
     } else {
         MultiDrawChainSource::Missing
     }
+}
+
+/// Whether `next` was issued with the encoder in exactly the state `previous`
+/// left it in — no `Set` record of any bind class between the two, and the same
+/// pipeline.
+///
+/// This is the dirty-flag question a `MTLRenderCommandEncoder` answers
+/// natively. A Metal encoder holds bind state; a draw that follows another with
+/// no intervening `set*` reads identical state, and a driver re-emits nothing
+/// for it.
+///
+/// It is answered here by **pointer identity and nothing else**.
+/// [`draw::BindTable`] is `Arc<Vec<_>>` and the decode accumulator clones the
+/// handle rather than the vector, so two records whose tables are the same
+/// allocation were provably separated by no `Set` for that class. That makes
+/// this exact rather than approximate, O(1) rather than a walk, and free of any
+/// hash, key or stored answer — nothing is remembered past the immediately
+/// preceding record, so there is nothing to bound and nothing to invalidate.
+///
+/// Deliberately **not** a content question. Whether the guest wrote to a
+/// resource between the two draws is a different matter, and the answer that
+/// makes it safe to ignore here is already recorded against
+/// `BATCH_MAX_DRAWS`: a command buffer executes as one unit, so two draws in
+/// one have always read guest RAM at the same instant.
+fn encoder_state_unchanged(previous: &PendingDraw, next: &PendingDraw) -> bool {
+    previous.pipeline_ref == next.pipeline_ref
+        && std::sync::Arc::ptr_eq(&previous.vertex_buffers, &next.vertex_buffers)
+        && std::sync::Arc::ptr_eq(&previous.fragment_buffers, &next.fragment_buffers)
+        && std::sync::Arc::ptr_eq(&previous.vertex_textures, &next.vertex_textures)
+        && std::sync::Arc::ptr_eq(&previous.fragment_textures, &next.fragment_textures)
+        && std::sync::Arc::ptr_eq(&previous.vertex_samplers, &next.vertex_samplers)
+        && std::sync::Arc::ptr_eq(&previous.fragment_samplers, &next.fragment_samplers)
 }
 
 fn fill_draw_binds_from_pending(req: &mut draw::DrawEncodeRequest, pd: &PendingDraw) {
