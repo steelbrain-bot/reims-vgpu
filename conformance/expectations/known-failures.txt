@@ -80,3 +80,34 @@ mip_sample_level_6_size1
 # diagnosed; `rt_resolve` is where to start.
 # ---------------------------------------------------------------------------
 srt_blit_buffer_backed_512x512
+
+# ---------------------------------------------------------------------------
+# A 1920x1080 render deep enough to outrun the fence deadline hands the copy
+# behind it an unfinished surface.
+#
+# `stale_frames=3/4 frame=0 wrong=2073596/2073600 got=another frame's colour`.
+# The device names it, on the fail channel, fifteen times in the run:
+#
+#   stamp_wait_timeout reason=stamp_wait_timeout index=1 value=727
+#     (the submission carrying this stamp's word has not executed within the
+#      fence deadline; its completion remains pending)
+#   ... heaviest=[pipe=578 ... 1920x1080 ...] draws=127
+#
+# So the ordering the copy asks for is *requested* and then abandoned: the wait
+# expires and the copy proceeds against a surface the render has not finished
+# writing. `reims-vgpu-vulkan::engine::stamp_completion` is where the deadline
+# is, and it is the thing to fix -- a deadline that gives up is a bound nobody
+# derived from the contract, and what it costs is guest content.
+#
+# Both rails lose it, which is what says the copy is not the defect. Before the
+# surface-identity source account existed this case took the host staging arm
+# and failed the same way at 2/4 frames; it now takes the GPU arm and fails at
+# 3/4, with the whole surface wrong rather than 640 texels of it, because a
+# GPU-side whole-plane copy moves all of an unfinished surface where a staged
+# row walk was slow enough to catch most rows after the fact. Neither number is
+# a passing one and the difference between them is not the bug.
+#
+# Its 1024x768 x8 sibling passes on the GPU arm, which is what gates the source
+# account itself: the deadline is reached only by the heavier geometry.
+# ---------------------------------------------------------------------------
+srt_blit_iosurface_source_1920x1080_x4

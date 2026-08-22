@@ -3400,3 +3400,173 @@ fn a_whole_surface_iosurface_texture_source_reaches_the_destinations_own_guest_p
         "a pitch that is not a whole number of texels is the plane's own refusal"
     );
 }
+
+/// The GPU whole-plane arm asks whether *a* GPU resident names the source, and
+/// an IOSurface-backed one is named by its surface identity with no writeback
+/// debt involved.
+///
+/// This is the gate on the fix for the target-import rail. Under a host-pointer
+/// import a render Store writes into the guest pages themselves and leaves no
+/// debt behind, so a source-resolution that asks only "is there a debt?" refuses
+/// the GPU arm on every record — measured on a driven fullscreen Maps boot as
+/// `sl_gpu_src_not_resident` equal to `sl_levels_n`, 1036 of 1036. Revert the
+/// surface-identity account in `try_copy_whole_plane_on_gpu` and this test fails
+/// on both counters.
+///
+/// Both arms of the probe are asserted for the reason the settle test states:
+/// a probe that answered `true` unconditionally would pass a rail that never
+/// asks, so the disjoint arm is what says the question reached the executor.
+#[test]
+fn a_whole_plane_copy_names_an_iosurface_source_by_its_surface_identity() {
+    use crate::runtime::drain::census::store_route_count;
+    use crate::runtime::executor::*;
+    use reims_vgpu_core::{
+        CapabilityService, ComputeResidencyService, ExecutionPort, PresentationService,
+        ReadbackService, ResidentService,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct ResidentProbe {
+        /// Whether a GPU resident exists for whatever identity is asked about.
+        present: bool,
+        asked: AtomicUsize,
+    }
+
+    impl ExecutionPort for ResidentProbe {
+        type Submission = ResolvedSubmission;
+        type Completion = ExecutionCompletion;
+        type Error = DrawError;
+
+        fn execute(&self, _submission: Self::Submission) -> Result<Self::Completion, Self::Error> {
+            unreachable!("this test executes no command buffer")
+        }
+    }
+    impl PresentationService for ResidentProbe {
+        fn resident_presentable(
+            &self,
+            _identity: &crate::model::TargetIdentity,
+            _width: u32,
+            _height: u32,
+        ) -> bool {
+            self.asked.fetch_add(1, Ordering::AcqRel);
+            self.present
+        }
+    }
+    impl ReadbackService for ResidentProbe {
+        type Error = DrawError;
+
+        fn read_target(
+            &self,
+            _identity: &crate::model::TargetIdentity,
+        ) -> Result<reims_vgpu_core::TargetReadback, Self::Error> {
+            unreachable!("this test reads no target")
+        }
+    }
+    impl reims_vgpu_core::GuestWriteService for ResidentProbe {}
+    impl ResidentService for ResidentProbe {}
+    impl ComputeResidencyService for ResidentProbe {}
+    impl CapabilityService for ResidentProbe {}
+    impl GuestPageTransferService for ResidentProbe {}
+    impl CompletionService for ResidentProbe {}
+    impl SubmissionBatchService for ResidentProbe {}
+    impl GuestImportService for ResidentProbe {}
+    impl MaintenanceService for ResidentProbe {}
+    impl SessionService for ResidentProbe {}
+    impl ObservationService for ResidentProbe {}
+    impl ShaderTranslationService for ResidentProbe {}
+    impl RenderBufferPlanningService for ResidentProbe {}
+    impl GuestImagePlanningService for ResidentProbe {}
+    impl WindowPresentationService for ResidentProbe {}
+    impl Executor for ResidentProbe {}
+
+    // `present: false` is the control. The source owes no writeback debt on
+    // either arm, so the only thing that differs is the executor's answer, and
+    // therefore the only thing the counters can be reading.
+    for (present, expected_route) in [
+        (true, "sl_gpu_src_via_surface"),
+        (false, "sl_gpu_src_not_resident"),
+    ] {
+        let (mut host, mut state) = blit_device();
+        install_iosurface_texture(&mut host, &mut state, 2, 20, 0x40);
+        install_iosurface_texture(&mut host, &mut state, 3, 21, 0x50);
+        let probe = Arc::new(ResidentProbe {
+            present,
+            asked: AtomicUsize::new(0),
+        });
+        state.executor = probe.clone();
+
+        let src_pixels: [u8; 16] = [
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, // row 0
+            0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, // row 1
+        ];
+        assert!(mapping_write::write_rect_raw(
+            &mut state,
+            &mut host,
+            20,
+            mapping_write::Rect {
+                origin_x: 0,
+                origin_y: 0,
+                width: 2,
+                height: 2
+            },
+            &src_pixels,
+            8
+        ));
+
+        let before = store_route_count(expected_route);
+        let other = store_route_count(if present {
+            "sl_gpu_src_not_resident"
+        } else {
+            "sl_gpu_src_via_surface"
+        });
+
+        let mut cmd = copy_cmd(CopyKind::TextureToTextureSliceLevel, 2, 3);
+        cmd.slice_count = 1;
+        cmd.level_count = 1;
+        assert_eq!(
+            execute_blit(&mut state, &mut host, 1, &cmd),
+            BlitStatus::Ok,
+            "every GPU-arm refusal is a fall-through, so the copy must still land"
+        );
+
+        assert_eq!(
+            probe.asked.load(Ordering::Acquire),
+            1,
+            "the rail must ask the executor about the source's surface identity"
+        );
+        assert_eq!(
+            store_route_count(expected_route),
+            before + 1,
+            "present={present} must route through {expected_route}"
+        );
+        assert_eq!(
+            store_route_count(if present {
+                "sl_gpu_src_not_resident"
+            } else {
+                "sl_gpu_src_via_surface"
+            }),
+            other,
+            "present={present} must not also route through the other account"
+        );
+
+        // The fall-through is the safety property the whole rail rests on: a
+        // refused GPU arm loses no pixels.
+        let mut back = [0u8; 16];
+        assert!(mapping_write::read_rect_raw(
+            &mut state,
+            &mut host,
+            21,
+            mapping_write::Rect {
+                origin_x: 0,
+                origin_y: 0,
+                width: 2,
+                height: 2
+            },
+            &mut back,
+            8
+        ));
+        assert_eq!(&back[..], &src_pixels[..], "the copy did not land");
+    }
+}

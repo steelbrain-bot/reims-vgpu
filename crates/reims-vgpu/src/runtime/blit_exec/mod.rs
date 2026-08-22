@@ -3806,18 +3806,28 @@ enum GpuPlaneRefusal {
     /// Source and destination are the same reference, so resolving the
     /// destination would pay away the very debt holding the source's content.
     SelfCopy,
-    /// The source's bytes are its guest pages' bytes already — nothing to copy
-    /// from a resident, and the host path is the cheap one.
+    /// Neither account of the source names a GPU resident: it owes no writeback
+    /// debt *and* it is not an IOSurface-backed texture with a live resident
+    /// under its surface identity. There is nothing for a GPU-side copy to read
+    /// from, and the host staging loop is the only arm.
+    ///
+    /// **Both accounts are needed, and asking only the first is what this
+    /// variant used to mean.** A writeback debt says the GPU holds newer
+    /// content than the guest pages do, which is the copying rail's answer and
+    /// is *never* true under a host-pointer import — there the render Store
+    /// wrote into the guest pages themselves. So the debt question alone
+    /// refused the GPU arm on every record of a driven fullscreen Maps boot
+    /// (`sl_gpu_src_not_resident` equal to `sl_levels_n`, 1036 of 1036) on
+    /// exactly the rail the arm exists for, and the whole-surface copy that
+    /// Metal puts on a `MTLBlitCommandEncoder` ran on the host CPU instead.
     ///
     /// **Says which bytes the host path names, and nothing about when it reads
-    /// them.** This arm is selected by the target-import rail: a source the
-    /// device rendered into directly owes no writeback debt, so there is no
-    /// resident to copy from and the fall-through is a `memcpy` over pages a
-    /// submitted render Store may still be writing. Reading that as "not a
-    /// loss" is what hid a whole missing layer — `gva_view`'s reads settle
-    /// against outstanding guest writes now, and 716 of 716 on one driven boot
-    /// genuinely overlapped. The variant is still a fall-through and still not
-    /// a loss; the ordering that makes that true lives in the read.
+    /// them.** The fall-through is a `memcpy` over pages a submitted render
+    /// Store may still be writing. Reading that as "not a loss" is what hid a
+    /// whole missing layer — `gva_view`'s reads settle against outstanding
+    /// guest writes now, and 716 of 716 on one driven boot genuinely
+    /// overlapped. The variant is still a fall-through and still not a loss;
+    /// the ordering that makes that true lives in the read.
     SrcNotResident,
     /// The destination is a linear guest allocation, which has no mapping for a
     /// GPU-side copy to name.
@@ -3971,6 +3981,7 @@ struct WholePlaneGpuCopy<'a> {
     destination_object: u32,
     level_count: u16,
     slice_count: u16,
+    source: &'a TextureBacking,
     destination: &'a TextureBacking,
 }
 
@@ -3986,21 +3997,84 @@ fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
         destination_object,
         level_count,
         slice_count,
+        source,
         destination,
     } = copy;
     let key = crate::runtime::writeback_debt::resource_key(state, task_id, source_object)?;
     let debt = state.content.pending_writebacks.get_gva(key);
+    // Two ways to learn that the GPU can name this source, and the device needs
+    // both because they belong to different rails.
+    //
+    // A writeback debt says "the GPU holds newer content than the guest pages
+    // do", which is the copying rail's answer. Under a host-pointer import
+    // there is never such a debt -- the render Store wrote *into* the guest
+    // pages -- so asking only that question refused the GPU arm on **every**
+    // record of a driven fullscreen Maps boot (`sl_gpu_src_not_resident` equal
+    // to `sl_levels_n`, 1036 of 1036), on the rail it helps most.
+    //
+    // The question the contract actually asks is whether a GPU resident names
+    // this source at all, and for an IOSurface-backed texture that is answered
+    // by the same identity the draw path stores through -- so a surface a draw
+    // rendered into has one whether or not it left any debt behind.
+    let source_surface = match source {
+        TextureBacking::Surface(t) => Some(t),
+        _ => None,
+    };
+    let surface_source = source_surface.and_then(|t| {
+        let identity = crate::runtime::present_identity::surface_identity(
+            state,
+            t.mapping_id.get(),
+            t.width,
+            t.height,
+        );
+        if !state
+            .executor
+            .resident_presentable(&identity, t.width, t.height)
+        {
+            return None;
+        }
+        Some((
+            identity,
+            GpuResidentSource {
+                width: t.width,
+                height: t.height,
+                pixel_format: t.pixel_format,
+            },
+        ))
+    });
     if let Err(refusal) = gpu_whole_plane_admissible(
         level_count,
         slice_count,
         source_object,
         destination_object,
-        debt.is_some(),
+        debt.is_some() || surface_source.is_some(),
     ) {
         note_store_route(refusal.route());
         return None;
     }
-    let debt = debt?;
+    // The debt rail first where both answer: it names the resident that owes
+    // the guest pages their bytes, and taking the other one would leave that
+    // debt outstanding behind a copy that already landed.
+    let (source_identity, src) = match (debt, surface_source) {
+        (Some(debt), _) => (
+            crate::runtime::writeback_debt::gva_identity(debt),
+            GpuResidentSource {
+                width: debt.width,
+                height: debt.height,
+                pixel_format: debt.format,
+            },
+        ),
+        (None, Some(resident)) => {
+            // A tally of which account named the source, not an outcome — this
+            // record still lands on exactly one of the routes below, so
+            // `sl_gpu_src_via_surface` deliberately does **not** participate in
+            // the partition the refusal counters and `sl_gpu_landed` form.
+            note_store_route("sl_gpu_src_via_surface");
+            resident
+        }
+        // `gpu_whole_plane_admissible` refused this above.
+        (None, None) => return None,
+    };
     let TextureBacking::Surface(t) = destination else {
         note_store_route(GpuPlaneRefusal::DstNotIOSurface.route());
         return None;
@@ -4025,11 +4099,6 @@ fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
                 pixel_format,
             },
         );
-    let src = GpuResidentSource {
-        width: debt.width,
-        height: debt.height,
-        pixel_format: debt.format,
-    };
     if let Err(refusal) = gpu_whole_plane_destination(Some(plane), window, src) {
         note_store_route(refusal.route());
         // "The formats differ" does not say which of the three does, and the
@@ -4056,12 +4125,11 @@ fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
         }
         return None;
     }
-    let identity = crate::runtime::writeback_debt::gva_identity(debt);
     match mapping_write::write_bgra8_from_resident_gpu(
         state,
         host,
         mapping_id,
-        &identity,
+        &source_identity,
         plane.width,
         plane.height,
     ) {
@@ -4337,6 +4405,7 @@ fn execute_resolved_texture_copy_batch<M: HostMemory + HostOps>(
             destination_object,
             level_count,
             slice_count,
+            source: &first_level.first_slice.0.backing,
             destination: &first_level.first_slice.1.backing,
         },
     ) {

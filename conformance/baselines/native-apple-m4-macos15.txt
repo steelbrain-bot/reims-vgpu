@@ -221,6 +221,12 @@ CASE srt_blit_after_render_1920x1080 PASS the copy moved what the render ahead o
 ROUTE srt_blit_pipelined_1024x768_x8 settle_gva_rect_read
 ROUTE srt_blit_pipelined_1024x768_x8 settle_gva_rect_read_overlap
 CASE srt_blit_pipelined_1024x768_x8 PASS every frame's copy moved that frame's own pixels
+ROUTE srt_blit_iosurface_source_1024x768_x8 sl_gpu_src_via_surface
+ROUTE srt_blit_iosurface_source_1024x768_x8 sl_gpu_landed
+CASE srt_blit_iosurface_source_1024x768_x8 PASS every surface-to-surface copy moved its own frame's pixels
+ROUTE srt_blit_iosurface_source_1920x1080_x4 sl_gpu_src_via_surface
+ROUTE srt_blit_iosurface_source_1920x1080_x4 sl_gpu_landed
+CASE srt_blit_iosurface_source_1920x1080_x4 PASS every surface-to-surface copy moved its own frame's pixels
 CASE srt_blit_buffer_backed_512x512 PASS the copy out of a buffer-backed source moved what the render had written
-SUMMARY cases=220 failures=0 skipped=0
+SUMMARY cases=222 failures=0 skipped=0
 DEVICE name=Apple M4 unified=true

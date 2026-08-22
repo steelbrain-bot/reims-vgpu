@@ -167,6 +167,10 @@ blitAfterRenderCase(1920, 1080)
 
 blitPipelinedCase(1024, 768, frames: 8)
 
+blitIOSurfaceSourceCase(1024, 768, frames: 8)
+
+blitIOSurfaceSourceCase(1920, 1080, frames: 4)
+
 blitBufferBackedCase(512, 512)
 
 print("SUMMARY cases=\(ran) failures=\(failures) skipped=\(skipped)")
