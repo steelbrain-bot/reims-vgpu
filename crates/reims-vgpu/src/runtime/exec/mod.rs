@@ -4525,13 +4525,37 @@ fn finish_stream<M: HostMemory + HostOps>(
                 }
             }
         });
-        if let (Some(req), Some(depth)) = (first_req.as_mut(), acc.depth_attach.as_ref()) {
+        if let (Some(req), Some(depth)) = (
+            first_req.as_mut(),
+            acc.depth_attach
+                .as_ref()
+                .filter(|attachment| attachment.texture_ref != 0),
+        ) {
             req.depth_attachment_resource =
                 match objects::resolve_resource(state, host, task_id, depth.texture_ref) {
                     Ok(resource) => Some(resource),
                     Err(rung) => {
                         crate::observe::RungReport::new("depth_attachment_resolve", "depth_ref")
                             .rung(task_id, depth.texture_ref, rung);
+                        None
+                    }
+                };
+        }
+        if let (Some(req), Some(stencil)) = (
+            first_req.as_mut(),
+            acc.stencil_attach
+                .as_ref()
+                .filter(|attachment| attachment.texture_ref != 0),
+        ) {
+            req.stencil_attachment_resource =
+                match objects::resolve_resource(state, host, task_id, stencil.texture_ref) {
+                    Ok(resource) => Some(resource),
+                    Err(rung) => {
+                        crate::observe::RungReport::new(
+                            "stencil_attachment_resolve",
+                            "stencil_ref",
+                        )
+                        .rung(task_id, stencil.texture_ref, rung);
                         None
                     }
                 };
@@ -5037,6 +5061,7 @@ fn render_pass_attachment_template(first: &draw::DrawEncodeRequest) -> draw::Dra
         task_id: first.task_id,
         colors,
         depth_attachment_resource: first.depth_attachment_resource.clone(),
+        stencil_attachment_resource: first.stencil_attachment_resource.clone(),
         ..Default::default()
     }
 }

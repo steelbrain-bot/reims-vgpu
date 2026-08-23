@@ -99,14 +99,14 @@ pub use registers::{DeviceRegisters, GfxRegisters, IosfcRegisters, GFX_MMIO_SIZE
 pub use released_pages::{ReleasedPages, ReleasedVerdict, RELEASED_PAGE_WATCH_CAP};
 pub use render::{
     viewport_slot_count, AttachmentInitial, AttachmentSlot, BlendFactor, BlendOp,
-    BlendStateResource, BufferContent, ColorLoadAction, CullMode, DepthAttachment, DepthClipMode,
-    DepthState, DrawOutput, DrawRequest, FillMode, IndexType, IndexedDrawResource, LineWidth,
-    PreparedRenderProgram, PreparedShaderStage, PrimitiveTopology, RenderBarrier,
-    RenderBarrierStages, RenderTargetExtent, SampledByteOrigin, SampledContentIdentity,
-    SampledImageResource, SampledSource, ScissorResource, SecondaryColorTarget, SeedOrder,
-    StencilAttachment, StencilFaceOps, StencilOp, StencilState, StorageBufferResource,
-    VertexAttributeFormat, VertexAttributeResource, VertexStepFunction, ViewportResource,
-    VisibilityResultMode,
+    BlendStateResource, BufferContent, ColorLoadAction, CullMode, DepthAspectAttachment,
+    DepthAttachment, DepthClipMode, DepthState, DrawOutput, DrawRequest, FillMode, IndexType,
+    IndexedDrawResource, LineWidth, PreparedRenderProgram, PreparedShaderStage, PrimitiveTopology,
+    RenderBarrier, RenderBarrierStages, RenderTargetExtent, SampledByteOrigin,
+    SampledContentIdentity, SampledImageResource, SampledSource, ScissorResource,
+    SecondaryColorTarget, SeedOrder, StencilAttachment, StencilFaceOps, StencilOp, StencilState,
+    StorageBufferResource, VertexAttributeFormat, VertexAttributeResource, VertexStepFunction,
+    ViewportResource, VisibilityResultMode,
 };
 pub use residency::{
     ComputeResidencyLedger, ComputeResidencyService, ComputeStorageOrigin,

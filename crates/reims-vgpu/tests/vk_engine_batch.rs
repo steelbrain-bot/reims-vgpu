@@ -338,9 +338,11 @@ fn stored_multisample_target_survives_for_a_later_encoder() {
     first.depth_attachment = Some(DepthAttachment {
         resource_lifetime: reims_vgpu_core::ResourceLifetime::new().reference(),
         identity: depth_identity.clone(),
-        load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
-        store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
-        clear_value: 1.0,
+        depth: Some(reims_vgpu_core::DepthAspectAttachment {
+            load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
+            store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
+            clear_value: 1.0,
+        }),
         stencil: None,
     });
     first.depth = Some(DepthState {
@@ -371,9 +373,11 @@ fn stored_multisample_target_survives_for_a_later_encoder() {
     second.depth_attachment = Some(DepthAttachment {
         resource_lifetime: reims_vgpu_core::ResourceLifetime::new().reference(),
         identity: depth_identity,
-        load_action: reims_vgpu_protocol::pass_action::LoadAction::Load,
-        store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
-        clear_value: 1.0,
+        depth: Some(reims_vgpu_core::DepthAspectAttachment {
+            load_action: reims_vgpu_protocol::pass_action::LoadAction::Load,
+            store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
+            clear_value: 1.0,
+        }),
         stencil: None,
     });
     second.depth = Some(DepthState {

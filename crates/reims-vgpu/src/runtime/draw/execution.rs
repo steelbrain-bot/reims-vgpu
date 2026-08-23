@@ -2265,25 +2265,25 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
 /// type-2/3 targets use the GVA identity below. Unlike deferred writeback, this
 /// lifetime is safe on portability-subset devices because the final record
 /// materializes guest bytes before the packet completes.
-/// The registry resident this draw's **depth** attachment renders into, if the
-/// guest's pass descriptor named a depth texture.
+/// The registry resident this draw's depth/stencil attachment renders into, if
+/// the guest's pass descriptor named either texture.
 ///
-/// The depth buffer is a guest resource with a guest lifetime. The decoded ref
-/// is task-local construction input, so it is replaced by the resource graph's
+/// The attachment is a guest resource with a guest lifetime. The decoded ref is
+/// task-local construction input, so it is replaced by the resource graph's
 /// canonical index and generation before it becomes an executor identity. Two
 /// tasks may legally use the same ref concurrently, and deleting then recreating
 /// one ref starts a distinct lifetime; neither may inherit the other's resident
-/// depth contents.
+/// depth/stencil contents.
 ///
 /// Geometry and aspect changes still recreate the image, through
 /// `ResidentTargetSlot::reusable_for` and the `stencil` field of the key.
-pub(super) fn depth_chain_identity(
+pub(super) fn depth_stencil_chain_identity(
     req: &DrawEncodeRequest,
+    attachment_ref: u32,
     with_stencil: bool,
     resource: reims_vgpu_protocol::ResourceId<reims_vgpu_protocol::ResourceObject>,
 ) -> Option<crate::model::TargetIdentity> {
-    let depth = req.depth_attach.as_ref()?;
-    if depth.texture_ref == 0 {
+    if attachment_ref == 0 {
         return None;
     }
     let c0 = req.colors.first()?;

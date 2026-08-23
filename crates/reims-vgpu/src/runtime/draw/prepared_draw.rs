@@ -137,16 +137,18 @@ pub(super) fn plan_target_completion(
         executor_request.target_rgba8 = None;
     }
 
-    let depth_stencil_store = executor_request
-        .depth_attachment
-        .as_ref()
-        .is_some_and(|depth| {
-            depth.store_action.publishes_single_sample()
-                || depth
-                    .stencil
-                    .as_ref()
-                    .is_some_and(|stencil| stencil.store_action.publishes_single_sample())
-        });
+    let depth_stencil_store =
+        executor_request
+            .depth_attachment
+            .as_ref()
+            .is_some_and(|attachment| {
+                attachment
+                    .depth
+                    .is_some_and(|depth| depth.store_action.publishes_single_sample())
+                    || attachment
+                        .stencil
+                        .is_some_and(|stencil| stencil.store_action.publishes_single_sample())
+            });
     if matches!(route, DrawCompletionRoute::Pixels) && !store_publishes && depth_stencil_store {
         executor_request.skip_readback = true;
         route = DrawCompletionRoute::EffectsOnly;
@@ -259,9 +261,11 @@ mod tests {
             depth_attachment: Some(reims_vgpu_core::DepthAttachment {
                 identity: gva(0x4000),
                 resource_lifetime: owner.lifetime_ref(),
-                load_action: LoadAction::Clear,
-                store_action: StoreAction::Store,
-                clear_value: 0.0,
+                depth: Some(reims_vgpu_core::DepthAspectAttachment {
+                    load_action: LoadAction::Clear,
+                    store_action: StoreAction::Store,
+                    clear_value: 0.0,
+                }),
                 stencil: None,
             }),
             ..reims_vgpu_core::DrawRequest::default()

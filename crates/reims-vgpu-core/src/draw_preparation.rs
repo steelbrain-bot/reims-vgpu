@@ -322,10 +322,8 @@ pub enum DrawPreparationDecline<TranslationDecline> {
         detail: &'static str,
     },
     DepthAttachmentIdentityMissing {
-        depth_ref: u32,
-    },
-    StencilAttachmentWithoutDepth {
-        stencil_ref: u32,
+        aspect: &'static str,
+        attachment_ref: u32,
     },
     DepthStencilAttachmentMismatch {
         depth_ref: u32,
@@ -548,10 +546,7 @@ impl<TranslationDecline: Decline> Decline for DrawPreparationDecline<Translation
             }
             Self::DepthStencilStateMissing { .. } => "draw_prepare_depth_stencil_state_missing",
             Self::DepthAttachmentIdentityMissing { .. } => {
-                "draw_prepare_depth_attachment_identity_missing"
-            }
-            Self::StencilAttachmentWithoutDepth { .. } => {
-                "draw_prepare_stencil_attachment_without_depth"
+                "draw_prepare_depth_stencil_attachment_identity_missing"
             }
             Self::DepthStencilAttachmentMismatch { .. } => {
                 "draw_prepare_depth_stencil_attachment_mismatch"
@@ -829,12 +824,13 @@ impl<TranslationDecline: Decline> Decline for DrawPreparationDecline<Translation
                 ("state_ref", state_ref.to_string()),
                 ("detail", (*detail).to_string()),
             ],
-            Self::DepthAttachmentIdentityMissing { depth_ref } => {
-                vec![("depth_ref", depth_ref.to_string())]
-            }
-            Self::StencilAttachmentWithoutDepth { stencil_ref } => {
-                vec![("stencil_ref", stencil_ref.to_string())]
-            }
+            Self::DepthAttachmentIdentityMissing {
+                aspect,
+                attachment_ref,
+            } => vec![
+                ("aspect", (*aspect).to_string()),
+                ("attachment_ref", attachment_ref.to_string()),
+            ],
             Self::DepthStencilAttachmentMismatch {
                 depth_ref,
                 stencil_ref,

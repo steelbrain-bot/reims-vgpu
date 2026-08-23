@@ -7438,13 +7438,19 @@ fn a_gva_span_no_store_has_stamped_refuses_the_resident_sample_rung() {
 /// Not a GPU test: nothing in this crate can drive `registry_ensure_depth`
 /// without a device, so the gate sits at the key that rail is keyed on.
 #[test]
-fn a_depth_attachment_is_keyed_on_the_guest_texture_the_pass_bound() {
+fn depth_and_stencil_attachments_are_keyed_on_the_guest_texture_the_pass_bound() {
     use crate::model::TargetIdentity;
-    use crate::runtime::draw::execution::depth_chain_identity;
+    use crate::runtime::draw::execution::depth_stencil_chain_identity;
     use reims_vgpu_protocol::{ResourceId, ResourceObject};
 
     let id = |r: &DrawEncodeRequest, st: bool, resource: ResourceId<ResourceObject>| {
-        depth_chain_identity(r, st, resource)
+        let attachment_ref = r
+            .depth_attach
+            .as_ref()
+            .map(|depth| depth.texture_ref)
+            .or_else(|| r.stencil_attach.as_ref().map(|stencil| stencil.texture_ref))
+            .unwrap_or(0);
+        depth_stencil_chain_identity(r, attachment_ref, st, resource)
     };
     let req = |depth_ref: u32, w: u32, h: u32| DrawEncodeRequest {
         colors: vec![ColorRtRequest {
@@ -7499,8 +7505,31 @@ fn a_depth_attachment_is_keyed_on_the_guest_texture_the_pass_bound() {
     // alternation between a stencil draw and a depth-only one.
     assert_ne!(
         id(&req(42, 1024, 768), true, first_resource),
-        Some(first),
+        Some(first.clone()),
         "a stencil-carrying depth attachment is its own resident"
+    );
+    let stencil_only = DrawEncodeRequest {
+        colors: vec![ColorRtRequest {
+            width: 1024,
+            height: 768,
+            ..Default::default()
+        }],
+        stencil_attach: Some(StencilAttachmentState {
+            texture_ref: 42,
+            ..Default::default()
+        }),
+        ..DrawEncodeRequest::default()
+    };
+    assert_eq!(
+        id(&stencil_only, true, first_resource),
+        Some(TargetIdentity::Texture {
+            ref_: 17,
+            width: 1024,
+            height: 768,
+            generation: 3,
+            stencil: true,
+        }),
+        "a stencil-only attachment uses its own generational texture identity"
     );
 
     // No depth texture in the pass descriptor names no resident. A backend may
@@ -7512,7 +7541,7 @@ fn a_depth_attachment_is_keyed_on_the_guest_texture_the_pass_bound() {
         "an unbound depth attachment names no resident"
     );
     assert_eq!(
-        depth_chain_identity(
+        depth_stencil_chain_identity(
             &DrawEncodeRequest {
                 colors: vec![ColorRtRequest {
                     width: 1024,
@@ -7521,6 +7550,7 @@ fn a_depth_attachment_is_keyed_on_the_guest_texture_the_pass_bound() {
                 }],
                 ..DrawEncodeRequest::default()
             },
+            0,
             false,
             first_resource,
         ),
@@ -7555,7 +7585,7 @@ fn depth_identity_separates_equal_refs_across_tasks_and_object_reuse() {
 }
 
 #[test]
-fn pass_depth_attachment_is_built_without_depth_test_state_and_invalid_pairs_refuse() {
+fn pass_depth_and_stencil_attachments_are_independent_and_invalid_pairs_refuse() {
     use reims_vgpu_protocol::pass_action::{LoadAction, StoreAction};
 
     let state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
@@ -7569,6 +7599,15 @@ fn pass_depth_attachment_is_built_without_depth_test_state_and_invalid_pairs_ref
         )),
     );
     let depth_owner = resource.lifetime_ref().id();
+    let stencil_resource = resources.register(
+        1,
+        43,
+        std::sync::Arc::new(crate::model::TaskResource::new(
+            reims_vgpu_protocol::ObjectListEntry::new(ObjectKind::Texture, 0, 0),
+            std::sync::Arc::from([]),
+        )),
+    );
+    let stencil_owner = stencil_resource.lifetime_ref().id();
 
     let base = DrawEncodeRequest {
         task_id: 1,
@@ -7591,24 +7630,46 @@ fn pass_depth_attachment_is_built_without_depth_test_state_and_invalid_pairs_ref
     let attachment = semantic_depth_attachment(&base)
         .expect("the declared attachment is supported")
         .expect("a bound depth texture is a pass attachment");
-    assert_eq!(attachment.load_action, LoadAction::Clear);
-    assert_eq!(attachment.store_action, StoreAction::Store);
-    assert_eq!(attachment.clear_value, 0.25);
+    assert_eq!(
+        attachment.depth,
+        Some(reims_vgpu_core::DepthAspectAttachment {
+            load_action: LoadAction::Clear,
+            store_action: StoreAction::Store,
+            clear_value: 0.25,
+        })
+    );
     assert_eq!(attachment.stencil, None);
     assert_eq!(attachment.resource_lifetime.id(), depth_owner);
     assert!(attachment.resource_lifetime.is_live());
 
     let stencil_only = DrawEncodeRequest {
+        colors: vec![ColorRtRequest {
+            width: 8,
+            height: 6,
+            ..Default::default()
+        }],
         stencil_attach: Some(StencilAttachmentState {
             texture_ref: 43,
-            ..Default::default()
+            load_action: LoadAction::Clear,
+            store_action: StoreAction::Store,
+            clear_stencil: 7,
         }),
+        stencil_attachment_resource: Some(stencil_resource),
         ..DrawEncodeRequest::default()
     };
-    assert!(matches!(
-        semantic_depth_attachment(&stencil_only),
-        Err(DrawPreparationDecline::StencilAttachmentWithoutDepth { stencil_ref: 43 })
-    ));
+    let attachment = semantic_depth_attachment(&stencil_only)
+        .expect("a stencil-only attachment is supported")
+        .expect("a bound stencil texture is a pass attachment");
+    assert_eq!(attachment.depth, None);
+    assert_eq!(
+        attachment.stencil,
+        Some(reims_vgpu_core::StencilAttachment {
+            load_action: LoadAction::Clear,
+            store_action: StoreAction::Store,
+            clear_value: 7,
+        })
+    );
+    assert_eq!(attachment.resource_lifetime.id(), stencil_owner);
 
     let mismatch = DrawEncodeRequest {
         stencil_attach: Some(StencilAttachmentState {

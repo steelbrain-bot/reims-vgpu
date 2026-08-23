@@ -3,7 +3,7 @@
 //! Raw guest ordinals terminate here. Execution receives complete blend,
 //! depth, and stencil state or a typed preparation refusal.
 
-use super::{depth_chain_identity, DrawEncodeRequest, DrawPreparationDecline};
+use super::{depth_stencil_chain_identity, DrawEncodeRequest, DrawPreparationDecline};
 
 /// Whether one present face makes the native state read or write stencil.
 ///
@@ -148,37 +148,32 @@ pub(super) fn semantic_depth_state(
 pub(super) fn semantic_depth_attachment(
     request: &DrawEncodeRequest,
 ) -> Result<Option<reims_vgpu_core::DepthAttachment>, DrawPreparationDecline> {
-    use reims_vgpu_core::{DepthAttachment, StencilAttachment};
+    use reims_vgpu_core::{DepthAspectAttachment, DepthAttachment, StencilAttachment};
     use reims_vgpu_protocol::pass_action::StoreAction;
 
-    let Some(depth) = request
+    let depth = request
         .depth_attach
         .as_ref()
-        .filter(|attachment| attachment.texture_ref != 0)
-    else {
-        if let Some(stencil) = request
-            .stencil_attach
-            .as_ref()
-            .filter(|attachment| attachment.texture_ref != 0)
-        {
-            return Err(DrawPreparationDecline::StencilAttachmentWithoutDepth {
-                stencil_ref: stencil.texture_ref,
-            });
-        }
-        return Ok(None);
-    };
-
+        .filter(|attachment| attachment.texture_ref != 0);
     let stencil = request
         .stencil_attach
         .as_ref()
-        .filter(|attachment| attachment.texture_ref != 0)
+        .filter(|attachment| attachment.texture_ref != 0);
+    if depth.is_none() && stencil.is_none() {
+        return Ok(None);
+    }
+
+    if let (Some(depth), Some(stencil)) = (depth, stencil) {
+        if stencil.texture_ref != depth.texture_ref {
+            return Err(DrawPreparationDecline::DepthStencilAttachmentMismatch {
+                depth_ref: depth.texture_ref,
+                stencil_ref: stencil.texture_ref,
+            });
+        }
+    }
+
+    let stencil = stencil
         .map(|stencil| {
-            if stencil.texture_ref != depth.texture_ref {
-                return Err(DrawPreparationDecline::DepthStencilAttachmentMismatch {
-                    depth_ref: depth.texture_ref,
-                    stencil_ref: stencil.texture_ref,
-                });
-            }
             if matches!(
                 stencil.store_action,
                 StoreAction::MultisampleResolve | StoreAction::StoreAndMultisampleResolve
@@ -196,38 +191,65 @@ pub(super) fn semantic_depth_attachment(
         })
         .transpose()?;
 
-    if matches!(
-        depth.store_action,
-        StoreAction::MultisampleResolve | StoreAction::StoreAndMultisampleResolve
-    ) {
-        return Err(DrawPreparationDecline::DepthStencilStoreActionUnsupported {
-            aspect: "depth",
-            store_action: depth.store_action.guest_ordinal(),
-        });
-    }
+    let depth = depth
+        .map(|depth| {
+            if matches!(
+                depth.store_action,
+                StoreAction::MultisampleResolve | StoreAction::StoreAndMultisampleResolve
+            ) {
+                return Err(DrawPreparationDecline::DepthStencilStoreActionUnsupported {
+                    aspect: "depth",
+                    store_action: depth.store_action.guest_ordinal(),
+                });
+            }
+            Ok(DepthAspectAttachment {
+                load_action: depth.load_action,
+                store_action: depth.store_action,
+                clear_value: depth.clear_depth as f32,
+            })
+        })
+        .transpose()?;
 
-    let resource = request.depth_attachment_resource.as_ref().ok_or(
-        DrawPreparationDecline::DepthAttachmentIdentityMissing {
-            depth_ref: depth.texture_ref,
-        },
-    )?;
+    let attachment_ref = request
+        .depth_attach
+        .as_ref()
+        .filter(|attachment| attachment.texture_ref != 0)
+        .map(|attachment| attachment.texture_ref)
+        .or_else(|| {
+            request
+                .stencil_attach
+                .as_ref()
+                .filter(|attachment| attachment.texture_ref != 0)
+                .map(|attachment| attachment.texture_ref)
+        })
+        .expect("a depth or stencil attachment was established above");
+    let attachment_aspect = if depth.is_some() { "depth" } else { "stencil" };
+    let resource = if depth.is_some() {
+        request.depth_attachment_resource.as_ref()
+    } else {
+        request.stencil_attachment_resource.as_ref()
+    }
+    .ok_or(DrawPreparationDecline::DepthAttachmentIdentityMissing {
+        aspect: attachment_aspect,
+        attachment_ref,
+    })?;
     let semantic_id =
         resource
             .semantic_id()
             .ok_or(DrawPreparationDecline::DepthAttachmentIdentityMissing {
-                depth_ref: depth.texture_ref,
+                aspect: attachment_aspect,
+                attachment_ref,
             })?;
-    let identity = depth_chain_identity(request, stencil.is_some(), semantic_id).ok_or(
-        DrawPreparationDecline::DepthAttachmentIdentityMissing {
-            depth_ref: depth.texture_ref,
-        },
-    )?;
+    let identity =
+        depth_stencil_chain_identity(request, attachment_ref, stencil.is_some(), semantic_id)
+            .ok_or(DrawPreparationDecline::DepthAttachmentIdentityMissing {
+                aspect: attachment_aspect,
+                attachment_ref,
+            })?;
     Ok(Some(DepthAttachment {
         identity,
         resource_lifetime: resource.lifetime_ref(),
-        load_action: depth.load_action,
-        store_action: depth.store_action,
-        clear_value: depth.clear_depth as f32,
+        depth,
         stencil,
     }))
 }

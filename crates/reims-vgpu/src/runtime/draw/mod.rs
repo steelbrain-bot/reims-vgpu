@@ -854,6 +854,8 @@ pub struct DrawEncodeRequest {
     /// identity cannot collide across tasks or object-slot reuse.
     pub depth_attachment_resource: Option<std::sync::Arc<crate::model::TaskResource>>,
     pub stencil_attach: Option<StencilAttachmentState>,
+    /// Canonical resource named by [`Self::stencil_attach`].
+    pub stencil_attachment_resource: Option<std::sync::Arc<crate::model::TaskResource>>,
     /// Records 2+ of a resident render-pass chain: load the prior record's
     /// content from the engine target instead of a CPU seed. Set by the exec
     /// chain loop (Vulkan rail only); default false.

@@ -185,13 +185,17 @@ pub(crate) struct SecondaryAttachKey {
     pub load: ColorLoadKey,
 }
 
-/// A depth attachment's contribution to the render-pass key. `None` on `PassKey`
-/// ⇒ no depth attachment (the 2D UI path). Depth-only uses D32_SFLOAT; when
-/// `stencil` is set the attachment is the device-queried combined
-/// depth-stencil format (`DeviceContext::depth_stencil_format`) with a live
-/// STENCIL aspect (load/store), so it must partition the pass cache.
+/// The depth/stencil slot's contribution to the render-pass key. `None` on
+/// `PassKey` means neither aspect exists. Depth-only uses D32_SFLOAT; when
+/// `stencil` is set the slot uses the device-queried combined depth-stencil
+/// format (`DeviceContext::depth_stencil_format`) with a live STENCIL aspect
+/// (load/store), so it must partition the pass cache. `depth` independently
+/// distinguishes a stencil-only Metal attachment from a combined one.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub(crate) struct DepthAttachKey {
+    /// Whether the Metal pass bound a depth aspect. A stencil-only attachment
+    /// uses the same Vulkan depth/stencil slot with depth load/store disabled.
+    pub depth: bool,
     pub load: ColorLoadKey,
     pub store: bool,
     /// true = combined depth-stencil native attachment. This includes both a
@@ -1774,7 +1778,11 @@ impl ObjectCaches {
         // index is the current attachment count and color slot 0 is untouched.
         let depth_ref = key.depth.map(|d| {
             let final_layout = vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-            let (dload, depth_initial) = d.load.vulkan(final_layout);
+            let (dload, depth_initial) = if d.depth {
+                d.load.vulkan(final_layout)
+            } else {
+                (vk::AttachmentLoadOp::DONT_CARE, vk::ImageLayout::UNDEFINED)
+            };
             // A pass-bound stencil aspect or Metal's implicit stencil value
             // selects the combined format. Depth-only stays D32_SFLOAT with
             // DONT_CARE stencil operations.
@@ -1808,7 +1816,7 @@ impl ObjectCaches {
                     .format(dformat)
                     .samples(vk_sample_count(key.sample_count))
                     .load_op(dload)
-                    .store_op(if d.store {
+                    .store_op(if d.depth && d.store {
                         vk::AttachmentStoreOp::STORE
                     } else {
                         vk::AttachmentStoreOp::DONT_CARE
@@ -2685,6 +2693,7 @@ mod object_cache_tests {
             load: ColorLoadKey::Clear,
         };
         clear.depth = Some(DepthAttachKey {
+            depth: true,
             load: ColorLoadKey::Clear,
             stencil: true,
             ..Default::default()
@@ -2733,6 +2742,7 @@ mod object_cache_tests {
         compound.multisample_resolve = true;
         compound.color_input = true;
         compound.depth = Some(DepthAttachKey {
+            depth: true,
             load: ColorLoadKey::Load,
             stencil: true,
             ..Default::default()
@@ -2768,6 +2778,7 @@ mod object_cache_tests {
             load: ColorLoadKey::Clear,
         };
         base.depth = Some(DepthAttachKey {
+            depth: true,
             load: ColorLoadKey::Clear,
             stencil: true,
             ..Default::default()
@@ -2810,6 +2821,11 @@ mod object_cache_tests {
                 Some(PassCompatField::SecondaryFormat),
             ),
             ("depth", |k| k.depth = None, Some(PassCompatField::Depth)),
+            (
+                "depth aspect",
+                |k| k.depth.as_mut().unwrap().depth = false,
+                Some(PassCompatField::Depth),
+            ),
             (
                 "color input",
                 |k| k.color_input = true,

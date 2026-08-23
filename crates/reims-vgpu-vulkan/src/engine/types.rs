@@ -388,9 +388,11 @@ mod tests {
         req.depth_attachment = Some(DepthAttachment {
             identity: surface(3),
             resource_lifetime: reims_vgpu_core::ResourceLifetime::new().reference(),
-            load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
-            store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
-            clear_value: 1.0,
+            depth: Some(reims_vgpu_core::DepthAspectAttachment {
+                load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
+                store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
+                clear_value: 1.0,
+            }),
             stencil: None,
         });
         assert!(req.writes_attachment(&surface(3)), "depth");

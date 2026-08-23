@@ -4197,8 +4197,8 @@ pub(crate) unsafe fn execute_draw_inner(
     // "the guest asked to load" and "there is something to load" are two
     // questions and only the second one is about this device.
     phase.enter(super::draw_phase::Phase::PipelineDepth);
-    let implementation_depth = req.depth_attachment.is_some() || req.depth.is_some();
-    let depth_attachment = implementation_depth
+    let implementation_depth_stencil = req.depth_attachment.is_some() || req.depth.is_some();
+    let depth_attachment = implementation_depth_stencil
         .then(|| acquire_depth_view(ctx, pools, req, counters))
         .transpose()?;
     phase.enter(super::draw_phase::Phase::Pipeline);
@@ -4208,9 +4208,13 @@ pub(crate) unsafe fn execute_draw_inner(
         let content_ready = depth_attachment
             .as_ref()
             .is_some_and(|a: &AcquiredDepth| a.content_ready);
-        let mut load =
-            depth_load_for_segment(d.load_action, req.continues_render_pass, content_ready);
-        if d.load_action == reims_vgpu_protocol::pass_action::LoadAction::Load && !content_ready {
+        let mut load = d.depth.map_or(ColorLoadKey::DontCare, |depth| {
+            depth_load_for_segment(depth.load_action, req.continues_render_pass, content_ready)
+        });
+        if d.depth.is_some_and(|depth| {
+            depth.load_action == reims_vgpu_protocol::pass_action::LoadAction::Load
+        }) && !content_ready
+        {
             note_depth_load_without_content(req.width, req.height, d.stencil.is_some());
         }
         let mut stencil_load = d.stencil.map_or_else(
@@ -4238,7 +4242,10 @@ pub(crate) unsafe fn execute_draw_inner(
             .expect("depth state has an attachment extent");
         let attachment_is_wider =
             depth_width > framebuffer_width || depth_height > framebuffer_height;
-        let depth_clear = (load == ColorLoadKey::Clear).then_some(d.clear_value);
+        let depth_clear = d
+            .depth
+            .filter(|_| load == ColorLoadKey::Clear)
+            .map(|depth| depth.clear_value);
         let stencil_clear = d
             .stencil
             .filter(|_| stencil_load == ColorLoadKey::Clear)
@@ -4265,10 +4272,14 @@ pub(crate) unsafe fn execute_draw_inner(
             preclear_depth = Some((depth_clear, stencil_clear));
         }
         pass_key.depth = Some(super::caches::DepthAttachKey {
+            depth: d.depth.is_some(),
             load,
             // An internal Vulkan pass split cannot execute Metal's final
             // DontCare early: a continuation consumes the preceding segment.
-            store: d.store_action.publishes_single_sample() || req.render_pass_continues,
+            store: d
+                .depth
+                .is_some_and(|depth| depth.store_action.publishes_single_sample())
+                || (d.depth.is_some() && req.render_pass_continues),
             stencil: implementation_stencil,
             stencil_load,
             stencil_store: d
@@ -4276,8 +4287,9 @@ pub(crate) unsafe fn execute_draw_inner(
                 .is_some_and(|stencil| stencil.store_action.publishes_single_sample())
                 || (implementation_stencil && req.render_pass_continues),
         });
-    } else if implementation_depth {
+    } else if implementation_depth_stencil {
         pass_key.depth = Some(super::caches::DepthAttachKey {
+            depth: true,
             // Native Metal compares against an implicit depth value of one
             // when test state is bound without a pass attachment. Vulkan has
             // no attachmentless depth test, so a draw-owned image cleared to
@@ -4327,7 +4339,7 @@ pub(crate) unsafe fn execute_draw_inner(
             return Err(DrawError::Unsupported(
                 super::reason::DrawReason::MultisampleResolveShapeUnsupported {
                     color_targets: 1u32.saturating_add(req.secondary_targets.len() as u32),
-                    depth: implementation_depth,
+                    depth: implementation_depth_stencil,
                     color_input: req.color_input,
                 },
             ));
@@ -4755,7 +4767,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // slot's cached framebuffer was built against. One predicate, because the
     // two answers it feeds have to agree: which pass the slot is ensured under,
     // and whether the draw builds (and later disposes) a framebuffer of its own.
-    let ordinary_ad_hoc_framebuffer = is_mrt || implementation_depth || req.color_input;
+    let ordinary_ad_hoc_framebuffer = is_mrt || implementation_depth_stencil || req.color_input;
     let ad_hoc_framebuffer = ordinary_ad_hoc_framebuffer || req.multisample_resolve;
     let (primary_pass, primary_pass_compatibility) = if ad_hoc_framebuffer {
         let color_only = pass_key.primary_attachment_only();
@@ -6799,7 +6811,7 @@ pub(crate) unsafe fn execute_draw_inner(
         );
     }
 
-    let clear = clear_values(req, implementation_depth);
+    let clear = clear_values(req, implementation_depth_stencil);
     phase.enter(super::draw_phase::Phase::RecordPass);
     let rp_begin = vk::RenderPassBeginInfo::default()
         .render_pass(render_pass)
@@ -7837,7 +7849,7 @@ unsafe fn ad_hoc_attachment_views(
 /// pass to LOAD. The clear now travels as
 /// [`super::types::DrawRequest::target_clear`], the same shape the secondaries
 /// have always used.
-fn clear_values(req: &DrawRequest, implementation_depth: bool) -> Vec<vk::ClearValue> {
+fn clear_values(req: &DrawRequest, implementation_depth_stencil: bool) -> Vec<vk::ClearValue> {
     let mut clear = vec![vk::ClearValue {
         color: vk::ClearColorValue {
             float32: req.target_clear,
@@ -7851,11 +7863,14 @@ fn clear_values(req: &DrawRequest, implementation_depth: bool) -> Vec<vk::ClearV
     if let Some(d) = &req.depth_attachment {
         clear.push(vk::ClearValue {
             depth_stencil: vk::ClearDepthStencilValue {
-                depth: d.clear_value,
+                // Vulkan carries both words in one union even when only one
+                // aspect has CLEAR loadOp. The unused depth word has no guest
+                // semantics for a stencil-only Metal attachment.
+                depth: d.depth.map(|depth| depth.clear_value).unwrap_or(1.0),
                 stencil: d.stencil.map(|s| s.clear_value).unwrap_or(0),
             },
         });
-    } else if implementation_depth {
+    } else if implementation_depth_stencil {
         clear.push(vk::ClearValue {
             depth_stencil: vk::ClearDepthStencilValue {
                 depth: 1.0,
@@ -10096,9 +10111,11 @@ mod tests {
             depth_attachment: Some(super::super::types::DepthAttachment {
                 identity: super::super::types::TargetIdentity::Anonymous { slot: 1 },
                 resource_lifetime: reims_vgpu_core::ResourceLifetime::new().reference(),
-                load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
-                store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
-                clear_value: 0.5,
+                depth: Some(reims_vgpu_core::DepthAspectAttachment {
+                    load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
+                    store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
+                    clear_value: 0.5,
+                }),
                 stencil: None,
             }),
             ..DrawRequest::default()
@@ -10139,6 +10156,30 @@ mod tests {
             assert_eq!(clear[1].depth_stencil.depth, 1.0);
             assert_eq!(clear[1].depth_stencil.stencil, 0);
         }
+    }
+
+    #[test]
+    fn a_stencil_only_attachment_carries_no_depth_clear_contract() {
+        let req = DrawRequest {
+            depth_attachment: Some(reims_vgpu_core::DepthAttachment {
+                identity: reims_vgpu_core::TargetIdentity::Anonymous { slot: 7 },
+                resource_lifetime: reims_vgpu_core::ResourceLifetime::new().reference(),
+                depth: None,
+                stencil: Some(reims_vgpu_core::StencilAttachment {
+                    load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
+                    store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
+                    clear_value: 7,
+                }),
+            }),
+            ..DrawRequest::default()
+        };
+
+        let clear = clear_values(&req, true);
+        assert_eq!(clear.len(), 2, "colour plus stencil-only attachment");
+        unsafe {
+            assert_eq!(clear[1].depth_stencil.stencil, 7);
+        }
+        assert!(implementation_stencil(&req));
     }
 
     /// This draw's own snapshot copy is recorded after the registry's access is
@@ -10705,9 +10746,11 @@ mod depth_load_tests {
             depth_attachment: Some(reims_vgpu_core::DepthAttachment {
                 identity: reims_vgpu_core::TargetIdentity::Anonymous { slot: 1 },
                 resource_lifetime: reims_vgpu_core::ResourceLifetime::new().reference(),
-                load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
-                store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
-                clear_value: 1.0,
+                depth: Some(reims_vgpu_core::DepthAspectAttachment {
+                    load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
+                    store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
+                    clear_value: 1.0,
+                }),
                 stencil: None,
             }),
             ..DrawRequest::default()

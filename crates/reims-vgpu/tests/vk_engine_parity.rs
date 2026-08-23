@@ -275,9 +275,11 @@ fn multisample_resolve_preserves_subpixel_coverage() {
     req.depth_attachment = Some(DepthAttachment {
         resource_lifetime: reims_vgpu_core::ResourceLifetime::new().reference(),
         identity: TargetIdentity::Anonymous { slot: 0x4d50 },
-        load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
-        store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
-        clear_value: 1.0,
+        depth: Some(reims_vgpu_core::DepthAspectAttachment {
+            load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
+            store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
+            clear_value: 1.0,
+        }),
         stencil: None,
     });
     req.depth = Some(DepthState {
@@ -693,9 +695,11 @@ fn depth_test_honored_compare_and_clear_wired() {
         req.depth_attachment = Some(DepthAttachment {
             resource_lifetime: reims_vgpu_core::ResourceLifetime::new().reference(),
             identity: TargetIdentity::Anonymous { slot: 0xd370 },
-            load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
-            store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
-            clear_value: clear,
+            depth: Some(reims_vgpu_core::DepthAspectAttachment {
+                load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
+                store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
+                clear_value: clear,
+            }),
             stencil: None,
         });
         req.depth = Some(DepthState {
@@ -774,13 +778,15 @@ fn mismatched_depth_attachment_clear_covers_its_full_image() {
     let depth_attachment = |clear_value: f32, load: bool| DepthAttachment {
         resource_lifetime: reims_vgpu_core::ResourceLifetime::new().reference(),
         identity: depth_identity.clone(),
-        load_action: if load {
-            reims_vgpu_protocol::pass_action::LoadAction::Load
-        } else {
-            reims_vgpu_protocol::pass_action::LoadAction::Clear
-        },
-        store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
-        clear_value,
+        depth: Some(reims_vgpu_core::DepthAspectAttachment {
+            load_action: if load {
+                reims_vgpu_protocol::pass_action::LoadAction::Load
+            } else {
+                reims_vgpu_protocol::pass_action::LoadAction::Clear
+            },
+            store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
+            clear_value,
+        }),
         stencil: None,
     };
 
@@ -977,9 +983,11 @@ fn depth_test_honored_on_resident_target_path() {
                 generation: 1,
                 stencil: false,
             },
-            load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
-            store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
-            clear_value: clear,
+            depth: Some(reims_vgpu_core::DepthAspectAttachment {
+                load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
+                store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
+                clear_value: clear,
+            }),
             stencil: None,
         });
         req.depth = Some(DepthState {
@@ -1124,9 +1132,11 @@ fn stencil_test_honored_compare_ref_and_clear_wired() {
         req.depth_attachment = Some(DepthAttachment {
             resource_lifetime: reims_vgpu_core::ResourceLifetime::new().reference(),
             identity: TargetIdentity::Anonymous { slot: 0x57e0 },
-            load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
-            store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
-            clear_value: 1.0,
+            depth: Some(reims_vgpu_core::DepthAspectAttachment {
+                load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
+                store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
+                clear_value: 1.0,
+            }),
             stencil: Some(StencilAttachment {
                 load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
                 store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
@@ -4210,9 +4220,11 @@ fn depth_and_mrt_secondary_render_in_one_pass() {
                 generation: 1,
                 stencil: false,
             },
-            load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
-            store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
-            clear_value: 1.0,
+            depth: Some(reims_vgpu_core::DepthAspectAttachment {
+                load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
+                store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
+                clear_value: 1.0,
+            }),
             stencil: None,
         });
         req.depth = Some(DepthState {
