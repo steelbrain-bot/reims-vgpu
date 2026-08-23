@@ -1527,17 +1527,36 @@ impl DeviceContext {
         command_buffers: &[vk::CommandBuffer],
         fence: vk::Fence,
     ) -> Result<Option<u64>, vk::Result> {
+        unsafe { self.submit_guest_work_after(command_buffers, fence, None) }
+    }
+
+    pub(crate) unsafe fn submit_guest_work_after(
+        &self,
+        command_buffers: &[vk::CommandBuffer],
+        fence: vk::Fence,
+        wait_value: Option<u64>,
+    ) -> Result<Option<u64>, vk::Result> {
         let timeline = self
             .stamp_completion
             .as_ref()
             .map(|completion| completion.reserve_submission());
         let timeline_value = timeline.as_ref().map(|(_, value, _)| *value);
+        let timeline_wait = wait_value.and_then(|value| {
+            timeline.as_ref().map(|(semaphore, signal, _)| {
+                assert!(value < *signal);
+                super::queue_owner::TimelineWait::new(
+                    *semaphore,
+                    value,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                )
+            })
+        });
         if let Some(owner) = self.queue_owner.as_ref() {
             return owner
-                .submit_sync(command_buffers, fence, timeline)
+                .submit_sync(command_buffers, fence, timeline_wait, timeline)
                 .map(|()| timeline_value);
         }
-        unsafe { self.submit_guest_work_reserved(command_buffers, fence, timeline) }
+        unsafe { self.submit_guest_work_reserved(command_buffers, fence, timeline_wait, timeline) }
     }
 
     /// Hand an ended draw batch to the ordered queue owner without waiting for
@@ -1554,14 +1573,16 @@ impl DeviceContext {
             .map(|completion| completion.reserve_submission());
         let timeline_value = timeline.as_ref().map(|(_, value, _)| *value);
         let Some(owner) = self.queue_owner.as_ref() else {
-            return unsafe { self.submit_guest_work_reserved(command_buffers, fence, timeline) }
-                .map(|timeline| AsyncGuestSubmission {
-                    timeline,
-                    driver_return: None,
-                });
+            return unsafe {
+                self.submit_guest_work_reserved(command_buffers, fence, None, timeline)
+            }
+            .map(|timeline| AsyncGuestSubmission {
+                timeline,
+                driver_return: None,
+            });
         };
         owner
-            .submit_async(command_buffers, fence, timeline)
+            .submit_async(command_buffers, fence, None, timeline)
             .map(|driver_return| AsyncGuestSubmission {
                 timeline: timeline_value,
                 driver_return: Some(driver_return),
@@ -1572,24 +1593,37 @@ impl DeviceContext {
         &self,
         command_buffers: &[vk::CommandBuffer],
         fence: vk::Fence,
+        timeline_wait: Option<super::queue_owner::TimelineWait>,
         timeline: Option<(vk::Semaphore, u64, super::stamp_completion::SubmissionNote)>,
     ) -> Result<Option<u64>, vk::Result> {
-        let plain = vk::SubmitInfo::default().command_buffers(command_buffers);
-        let Some((semaphore, value, note)) = timeline else {
-            unsafe { self.device.queue_submit(self.queue(), &[plain], fence) }?;
-            return Ok(None);
-        };
-        let semaphores = [semaphore];
-        let values = [value];
-        let mut timeline_info =
-            vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&values);
-        let info = vk::SubmitInfo::default()
+        let signal_point = timeline
+            .as_ref()
+            .map(|(semaphore, value, _)| (*semaphore, *value));
+        let operands = super::queue_owner::semaphore_submit_operands(
+            &[],
+            &[],
+            &[],
+            timeline_wait,
+            signal_point,
+        );
+        let mut timeline_info = vk::TimelineSemaphoreSubmitInfo::default()
+            .wait_semaphore_values(&operands.wait_values)
+            .signal_semaphore_values(&operands.signal_values);
+        let mut info = vk::SubmitInfo::default()
+            .wait_semaphores(&operands.wait_semaphores)
+            .wait_dst_stage_mask(&operands.wait_stages)
             .command_buffers(command_buffers)
-            .signal_semaphores(&semaphores)
-            .push_next(&mut timeline_info);
+            .signal_semaphores(&operands.signal_semaphores);
+        if operands.has_timeline {
+            info = info.push_next(&mut timeline_info);
+        }
         unsafe { self.device.queue_submit(self.queue(), &[info], fence) }?;
-        note.submitted(value);
-        Ok(Some(value))
+        if let Some((_, value, note)) = timeline {
+            note.submitted(value);
+            Ok(Some(value))
+        } else {
+            Ok(None)
+        }
     }
 
     pub(crate) fn queue_failure(&self) -> Option<vk::Result> {

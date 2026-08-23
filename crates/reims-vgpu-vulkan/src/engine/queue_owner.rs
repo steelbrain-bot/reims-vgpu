@@ -13,6 +13,93 @@ use std::sync::{mpsc, Arc, Mutex};
 
 use super::stamp_completion::SubmissionNote;
 
+/// One GPU-side wait on an already accepted timeline point.
+///
+/// The semaphore, value and destination stage travel together because they
+/// occupy the same index in three Vulkan submission arrays. Keeping them in
+/// separate call arguments would permit a wait value to be paired with a stage
+/// belonging to another semaphore.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TimelineWait {
+    semaphore: vk::Semaphore,
+    value: u64,
+    stage: vk::PipelineStageFlags,
+}
+
+impl TimelineWait {
+    pub(crate) const fn new(
+        semaphore: vk::Semaphore,
+        value: u64,
+        stage: vk::PipelineStageFlags,
+    ) -> Self {
+        Self {
+            semaphore,
+            value,
+            stage,
+        }
+    }
+}
+
+/// Owned arrays for one `VkSubmitInfo` and its optional timeline extension.
+///
+/// Vulkan indexes timeline values by the corresponding semaphore array. The
+/// zero entries for binary semaphores are ignored by Vulkan, but are required
+/// to keep both value counts equal to their semaphore counts whenever a
+/// timeline semaphore is present.
+pub(crate) struct SemaphoreSubmitOperands {
+    pub(crate) wait_semaphores: Vec<vk::Semaphore>,
+    pub(crate) wait_stages: Vec<vk::PipelineStageFlags>,
+    pub(crate) wait_values: Vec<u64>,
+    pub(crate) signal_semaphores: Vec<vk::Semaphore>,
+    pub(crate) signal_values: Vec<u64>,
+    pub(crate) has_timeline: bool,
+}
+
+pub(crate) fn semaphore_submit_operands(
+    binary_waits: &[vk::Semaphore],
+    binary_wait_stages: &[vk::PipelineStageFlags],
+    binary_signals: &[vk::Semaphore],
+    timeline_wait: Option<TimelineWait>,
+    timeline_signal: Option<(vk::Semaphore, u64)>,
+) -> SemaphoreSubmitOperands {
+    assert_eq!(
+        binary_waits.len(),
+        binary_wait_stages.len(),
+        "every wait semaphore requires its own destination stage"
+    );
+    if let (Some(wait), Some((signal_semaphore, signal_value))) = (timeline_wait, timeline_signal) {
+        assert!(
+            wait.semaphore != signal_semaphore || wait.value < signal_value,
+            "a submission cannot wait for its own or a later timeline signal"
+        );
+    }
+
+    let mut wait_semaphores = binary_waits.to_vec();
+    let mut wait_stages = binary_wait_stages.to_vec();
+    let mut wait_values = vec![0; binary_waits.len()];
+    if let Some(wait) = timeline_wait {
+        wait_semaphores.push(wait.semaphore);
+        wait_stages.push(wait.stage);
+        wait_values.push(wait.value);
+    }
+
+    let mut signal_semaphores = binary_signals.to_vec();
+    let mut signal_values = vec![0; binary_signals.len()];
+    if let Some((semaphore, value)) = timeline_signal {
+        signal_semaphores.push(semaphore);
+        signal_values.push(value);
+    }
+
+    SemaphoreSubmitOperands {
+        wait_semaphores,
+        wait_stages,
+        wait_values,
+        signal_semaphores,
+        signal_values,
+        has_timeline: timeline_wait.is_some() || timeline_signal.is_some(),
+    }
+}
+
 type Reply = mpsc::SyncSender<Result<QueueOutcome, vk::Result>>;
 type AsyncSubmitReply = mpsc::SyncSender<Result<(), vk::Result>>;
 #[cfg(feature = "host-window")]
@@ -29,6 +116,7 @@ struct OwnedSubmit {
     wait_stages: Vec<vk::PipelineStageFlags>,
     signal_semaphores: Vec<vk::Semaphore>,
     fence: vk::Fence,
+    timeline_wait: Option<TimelineWait>,
     timeline: Option<(vk::Semaphore, u64, SubmissionNote)>,
     async_queued_at: Option<std::time::Instant>,
 }
@@ -208,6 +296,7 @@ impl QueueOwner {
         &self,
         command_buffers: &[vk::CommandBuffer],
         fence: vk::Fence,
+        timeline_wait: Option<TimelineWait>,
         timeline: Option<(vk::Semaphore, u64, SubmissionNote)>,
     ) -> Result<(), vk::Result> {
         let submit = OwnedSubmit {
@@ -216,6 +305,7 @@ impl QueueOwner {
             wait_stages: Vec::new(),
             signal_semaphores: Vec::new(),
             fence,
+            timeline_wait,
             timeline,
             async_queued_at: None,
         };
@@ -231,6 +321,7 @@ impl QueueOwner {
         &self,
         command_buffers: &[vk::CommandBuffer],
         fence: vk::Fence,
+        timeline_wait: Option<TimelineWait>,
         timeline: Option<(vk::Semaphore, u64, SubmissionNote)>,
     ) -> Result<PendingQueueSubmit, vk::Result> {
         if let Some(result) = self.failure.get() {
@@ -248,6 +339,7 @@ impl QueueOwner {
                     wait_stages: Vec::new(),
                     signal_semaphores: Vec::new(),
                     fence,
+                    timeline_wait,
                     timeline,
                     async_queued_at: Some(std::time::Instant::now()),
                 },
@@ -275,6 +367,7 @@ impl QueueOwner {
             wait_stages: wait_stages.to_vec(),
             signal_semaphores: signal_semaphores.to_vec(),
             fence,
+            timeline_wait: None,
             timeline: None,
             async_queued_at: None,
         };
@@ -307,6 +400,7 @@ impl QueueOwner {
             wait_stages: transaction.wait_stages.to_vec(),
             signal_semaphores: transaction.signal_semaphores.to_vec(),
             fence: transaction.fence,
+            timeline_wait: None,
             timeline: None,
             async_queued_at: None,
         };
@@ -500,21 +594,28 @@ fn complete_present_transaction(
 unsafe fn execute_submit(
     device: &ash::Device,
     queue: vk::Queue,
-    mut submit: OwnedSubmit,
+    submit: OwnedSubmit,
 ) -> Result<(), vk::Result> {
-    let mut timeline_value = [0u64; 1];
-    let mut timeline_info = vk::TimelineSemaphoreSubmitInfo::default();
-    if let Some((semaphore, value, _)) = submit.timeline.as_ref() {
-        submit.signal_semaphores.push(*semaphore);
-        timeline_value[0] = *value;
-        timeline_info = timeline_info.signal_semaphore_values(&timeline_value);
-    }
+    let signal_point = submit
+        .timeline
+        .as_ref()
+        .map(|(semaphore, value, _)| (*semaphore, *value));
+    let operands = semaphore_submit_operands(
+        &submit.wait_semaphores,
+        &submit.wait_stages,
+        &submit.signal_semaphores,
+        submit.timeline_wait,
+        signal_point,
+    );
+    let mut timeline_info = vk::TimelineSemaphoreSubmitInfo::default()
+        .wait_semaphore_values(&operands.wait_values)
+        .signal_semaphore_values(&operands.signal_values);
     let mut info = vk::SubmitInfo::default()
-        .wait_semaphores(&submit.wait_semaphores)
-        .wait_dst_stage_mask(&submit.wait_stages)
+        .wait_semaphores(&operands.wait_semaphores)
+        .wait_dst_stage_mask(&operands.wait_stages)
         .command_buffers(&submit.command_buffers)
-        .signal_semaphores(&submit.signal_semaphores);
-    if submit.timeline.is_some() {
+        .signal_semaphores(&operands.signal_semaphores);
+    if operands.has_timeline {
         info = info.push_next(&mut timeline_info);
     }
     unsafe { device.queue_submit(queue, &[info], submit.fence) }?;
@@ -539,6 +640,84 @@ mod tests {
     }
 
     #[test]
+    fn mixed_binary_and_timeline_operands_keep_every_index_aligned() {
+        let binary_waits = [vk::Semaphore::from_raw(1), vk::Semaphore::from_raw(2)];
+        let binary_stages = [
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+        ];
+        let binary_signals = [vk::Semaphore::from_raw(3)];
+        let timeline = vk::Semaphore::from_raw(4);
+        let operands = semaphore_submit_operands(
+            &binary_waits,
+            &binary_stages,
+            &binary_signals,
+            Some(TimelineWait::new(
+                timeline,
+                7,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+            )),
+            Some((timeline, 8)),
+        );
+
+        assert_eq!(
+            operands.wait_semaphores,
+            vec![binary_waits[0], binary_waits[1], timeline]
+        );
+        assert_eq!(
+            operands.wait_stages,
+            vec![
+                binary_stages[0],
+                binary_stages[1],
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+            ]
+        );
+        assert_eq!(operands.wait_values, vec![0, 0, 7]);
+        assert_eq!(
+            operands.signal_semaphores,
+            vec![binary_signals[0], timeline]
+        );
+        assert_eq!(operands.signal_values, vec![0, 8]);
+        assert!(operands.has_timeline);
+    }
+
+    #[test]
+    fn signal_only_and_plain_submissions_preserve_the_existing_shapes() {
+        let timeline = vk::Semaphore::from_raw(9);
+        let signal = semaphore_submit_operands(&[], &[], &[], None, Some((timeline, 11)));
+        assert!(signal.wait_semaphores.is_empty());
+        assert!(signal.wait_stages.is_empty());
+        assert!(signal.wait_values.is_empty());
+        assert_eq!(signal.signal_semaphores, vec![timeline]);
+        assert_eq!(signal.signal_values, vec![11]);
+        assert!(signal.has_timeline);
+
+        let plain = semaphore_submit_operands(&[], &[], &[], None, None);
+        assert!(plain.wait_semaphores.is_empty());
+        assert!(plain.wait_values.is_empty());
+        assert!(plain.signal_semaphores.is_empty());
+        assert!(plain.signal_values.is_empty());
+        assert!(!plain.has_timeline);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot wait for its own or a later timeline signal")]
+    fn one_submit_cannot_wait_for_the_timeline_value_it_signals() {
+        let timeline = vk::Semaphore::from_raw(12);
+        let _ = semaphore_submit_operands(
+            &[],
+            &[],
+            &[],
+            Some(TimelineWait::new(
+                timeline,
+                13,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+            )),
+            Some((timeline, 13)),
+        );
+    }
+
+    #[test]
     fn first_async_failure_is_sticky() {
         let _ = super::super::device_lost::take_device_lost_seen();
         let latch = FailureLatch::default();
@@ -558,6 +737,7 @@ mod tests {
             .submit_async(
                 &[vk::CommandBuffer::from_raw(1)],
                 vk::Fence::from_raw(2),
+                None,
                 Some((vk::Semaphore::from_raw(3), 7, probe.note())),
             )
             .expect("owner accepted submission");
@@ -596,6 +776,7 @@ mod tests {
             owner.submit_async(
                 &[vk::CommandBuffer::from_raw(1)],
                 vk::Fence::from_raw(2),
+                None,
                 Some((vk::Semaphore::from_raw(3), 7, probe.note())),
             ),
             Err(vk::Result::ERROR_DEVICE_LOST)
