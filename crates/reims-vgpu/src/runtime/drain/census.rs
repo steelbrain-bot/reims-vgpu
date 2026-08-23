@@ -3519,7 +3519,7 @@ fn emit_draw_phase(executor: &dyn crate::runtime::executor::Executor) {
 /// **A per-second `busy_us` is not comparable across boots that delivered
 /// different amounts of work.** The guest sets the draw rate on this rail, so a
 /// change that slows the guest lowers `busy_us` by lowering the workload. Divide
-/// by `draw_phase draws` or by the kind's own `*_n` before comparing two arms —
+/// by `retired_draws` or by the kind's own `*_n` before comparing two arms —
 /// the writeback's own positive control halved the frame rate and lowered
 /// `busy_us` by 48 % while per-submission GPU cost moved 1.5 %.
 /// # `pass_us` splits the GPU second where the kinds cannot
@@ -3548,7 +3548,7 @@ fn emit_gpu_span(executor: &dyn crate::runtime::executor::Executor) {
     };
     crate::observe::off(format!(
         "gpu_span busy_us={} busy_max_us={} read={} armed={} sealed={} unread={} \
-         unattributed={} draw_us={} draw_n={} store_us={} store_n={} \
+         unattributed={} draw_us={} draw_n={} retired_draws={} store_us={} store_n={} \
          readback_us={} readback_n={} compute_us={} compute_n={} stamp_us={} stamp_n={} \
          pass_us={} pass_n={}",
         w.busy_us,
@@ -3560,6 +3560,7 @@ fn emit_gpu_span(executor: &dyn crate::runtime::executor::Executor) {
         w.unattributed(),
         w.kind_us[0],
         w.kind_n[0],
+        w.retired_draws,
         w.kind_us[1],
         w.kind_n[1],
         w.kind_us[2],

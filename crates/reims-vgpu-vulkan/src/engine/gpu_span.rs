@@ -274,6 +274,11 @@ static UNREAD: AtomicU64 = AtomicU64::new(0);
 /// [`READ`], and `the_kinds_tile_the_total` is what keeps that true.
 static KIND_NS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
 static KIND_N: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+/// Guest draws carried by the draw submissions whose timestamps were read.
+///
+/// This travels with the timestamped ring slot rather than the CPU census so
+/// it names exactly the same retired submission population as [`BUSY_NS`].
+static RETIRED_DRAWS: AtomicU64 = AtomicU64::new(0);
 /// GPU nanoseconds spent *inside* render pass instances, and the number of
 /// instances that contributed. See [`GpuSpanWindow::pass_us`].
 static PASS_NS: AtomicU64 = AtomicU64::new(0);
@@ -300,6 +305,9 @@ pub struct GpuSpanWindow {
     /// Submissions per [`Kind`], in [`Kind::ALL`] order. Sums to [`Self::read`]
     /// exactly.
     pub kind_n: [u64; KINDS],
+    /// Guest draws carried by the retired draw submissions in this window.
+    /// This is the matching denominator for GPU microseconds per draw.
+    pub retired_draws: u64,
     /// GPU microseconds measured between the inside of a render pass instance's
     /// begin and the inside of its end, summed over every instance read back
     /// this window.
@@ -349,6 +357,7 @@ pub fn take_window() -> Option<GpuSpanWindow> {
         unread: UNREAD.swap(0, Ordering::Relaxed),
         kind_us,
         kind_n,
+        retired_draws: RETIRED_DRAWS.swap(0, Ordering::Relaxed),
         pass_us: reims_vgpu_observe::phase_clock::to_us(PASS_NS.swap(0, Ordering::Relaxed)),
         pass_n: PASS_N.swap(0, Ordering::Relaxed),
     };
@@ -372,12 +381,13 @@ pub(crate) fn note_unread() {
 
 /// One submission's GPU execution time, from the delta between its two stamps,
 /// charged both to the total and to the kind the command buffer was recorded for.
-pub(crate) fn note_busy_ns(kind: Kind, ns: u64) {
+pub(crate) fn note_busy_ns(kind: Kind, ns: u64, draws: u64) {
     BUSY_NS.fetch_add(ns, Ordering::Relaxed);
     READ.fetch_add(1, Ordering::Relaxed);
     MAX_NS.fetch_max(ns, Ordering::Relaxed);
     KIND_NS[kind as usize].fetch_add(ns, Ordering::Relaxed);
     KIND_N[kind as usize].fetch_add(1, Ordering::Relaxed);
+    RETIRED_DRAWS.fetch_add(draws, Ordering::Relaxed);
 }
 
 /// One render pass instance's GPU execution time, from the delta between the
@@ -409,7 +419,7 @@ pub(crate) enum SlotSpan {
     /// Top stamp written; the command buffer is still recording.
     Armed(Kind),
     /// Both stamps written; the delta is readable once the fence signals.
-    Sealed(Kind),
+    Sealed { kind: Kind, draws: u64 },
 }
 
 #[cfg(test)]
@@ -424,12 +434,13 @@ mod tests {
         note_armed();
         note_armed();
         note_sealed();
-        note_busy_ns(Kind::Draw, 3_000);
-        note_busy_ns(Kind::Store, 5_000);
+        note_busy_ns(Kind::Draw, 3_000, 7);
+        note_busy_ns(Kind::Store, 5_000, 0);
         let w = take_window().expect("two command buffers armed");
         assert_eq!(w.armed, 2);
         assert_eq!(w.sealed, 1);
         assert_eq!(w.read, 2);
+        assert_eq!(w.retired_draws, 7);
         assert_eq!(w.busy_max_us, reims_vgpu_observe::phase_clock::to_us(5_000));
         assert_eq!(w.unread, 0);
         assert_eq!(take_window(), None, "the window cleared itself");
@@ -450,12 +461,12 @@ mod tests {
     fn the_sum_and_the_high_water_are_different_readings() {
         let _ = take_window();
         note_armed();
-        note_busy_ns(Kind::Draw, 1_000_000);
-        note_busy_ns(Kind::Draw, 1_000_000);
+        note_busy_ns(Kind::Draw, 1_000_000, 1);
+        note_busy_ns(Kind::Draw, 1_000_000, 1);
         let even = take_window().expect("armed");
         note_armed();
-        note_busy_ns(Kind::Draw, 1_900_000);
-        note_busy_ns(Kind::Draw, 100_000);
+        note_busy_ns(Kind::Draw, 1_900_000, 1);
+        note_busy_ns(Kind::Draw, 100_000, 1);
         let skewed = take_window().expect("armed");
         assert_eq!(even.busy_us, skewed.busy_us, "the same total");
         assert!(
@@ -476,7 +487,7 @@ mod tests {
         let _ = take_window();
         note_armed();
         for (i, k) in Kind::ALL.iter().enumerate() {
-            note_busy_ns(*k, 1_000_000 * (i as u64 + 1));
+            note_busy_ns(*k, 1_000_000 * (i as u64 + 1), u64::from(*k == Kind::Draw));
         }
         let w = take_window().expect("armed");
         assert_eq!(w.unattributed(), 0, "{w:?}");
@@ -504,7 +515,7 @@ mod tests {
     fn pass_time_is_part_of_busy_and_not_another_kind() {
         let _ = take_window();
         note_armed();
-        note_busy_ns(Kind::Draw, 10_000_000);
+        note_busy_ns(Kind::Draw, 10_000_000, 4);
         note_pass_ns(3_000_000);
         note_pass_ns(1_000_000);
         let w = take_window().expect("armed");
@@ -530,7 +541,7 @@ mod tests {
     fn a_window_without_pass_pairs_reports_zero_pass_time() {
         let _ = take_window();
         note_armed();
-        note_busy_ns(Kind::Draw, 5_000_000);
+        note_busy_ns(Kind::Draw, 5_000_000, 3);
         let w = take_window().expect("armed");
         assert_eq!((w.pass_us, w.pass_n), (0, 0), "{w:?}");
         assert!(w.busy_us > 0, "{w:?}");

@@ -1145,7 +1145,13 @@ impl ResourcePools {
     ///
     /// `cb` must be `slot`'s command buffer, still recording, and outside any
     /// render pass.
-    unsafe fn gpu_span_seal(&mut self, ctx: &DeviceContext, cb: vk::CommandBuffer, slot: usize) {
+    unsafe fn gpu_span_seal(
+        &mut self,
+        ctx: &DeviceContext,
+        cb: vk::CommandBuffer,
+        slot: usize,
+        draws: u64,
+    ) {
         let Some(probe) = ctx.draw_spans.as_ref() else {
             return;
         };
@@ -1158,7 +1164,8 @@ impl ResourcePools {
             probe.pool,
             DrawSpanProbe::base(slot) + 1,
         );
-        self.encoder.slots[slot].span = gpu_span::SlotSpan::Sealed(kind);
+        debug_assert!(kind == gpu_span::Kind::Draw || draws == 0);
+        self.encoder.slots[slot].span = gpu_span::SlotSpan::Sealed { kind, draws };
         gpu_span::note_sealed();
     }
 
@@ -1223,7 +1230,11 @@ impl ResourcePools {
         ctx: &DeviceContext,
         cb: vk::CommandBuffer,
     ) {
-        unsafe { self.gpu_span_seal(ctx, cb, self.encoder.cur) };
+        let draws = u64::from(matches!(
+            self.encoder.slots[self.encoder.cur].span,
+            gpu_span::SlotSpan::Armed(gpu_span::Kind::Draw)
+        ));
+        unsafe { self.gpu_span_seal(ctx, cb, self.encoder.cur, draws) };
     }
 
     /// Reset this slot's readback timestamp region and write its start stamp.
@@ -1331,7 +1342,7 @@ impl ResourcePools {
         let Some(probe) = ctx.draw_spans.as_ref() else {
             return;
         };
-        let gpu_span::SlotSpan::Sealed(kind) =
+        let gpu_span::SlotSpan::Sealed { kind, draws } =
             std::mem::replace(&mut self.encoder.slots[slot].span, gpu_span::SlotSpan::Idle)
         else {
             return;
@@ -1352,7 +1363,7 @@ impl ResourcePools {
             )
             .is_ok()
         {
-            gpu_span::note_busy_ns(kind, probe.scale.elapsed_ns(ticks[0], ticks[1]));
+            gpu_span::note_busy_ns(kind, probe.scale.elapsed_ns(ticks[0], ticks[1]), draws);
             for pair in ticks[2..].chunks_exact(2) {
                 gpu_span::note_pass_ns(probe.scale.elapsed_ns(pair[0], pair[1]));
             }
@@ -2161,7 +2172,7 @@ impl ResourcePools {
         // any other index would charge this submission's GPU span to a slot whose
         // queries a different command buffer wrote.
         let slot = self.encoder.cur;
-        unsafe { self.gpu_span_seal(ctx, batch.cb, slot) };
+        unsafe { self.gpu_span_seal(ctx, batch.cb, slot, batch.draws) };
         counters.batch_flush_close_us.fetch_add(
             close_started.elapsed().as_micros() as u64,
             Ordering::Relaxed,
