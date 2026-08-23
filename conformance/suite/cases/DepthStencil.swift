@@ -70,6 +70,7 @@ private func makeDepthTaskFixture() -> DepthTaskFixture? {
 }
 
 private func clearTaskDepth(_ fixture: DepthTaskFixture, _ value: Double) -> Bool {
+    var discardedColour: [Float] = [0, 0, 0, 0]
     let pass = MTLRenderPassDescriptor()
     pass.colorAttachments[0].texture = fixture.colour
     pass.colorAttachments[0].loadAction = .dontCare
@@ -84,6 +85,7 @@ private func clearTaskDepth(_ fixture: DepthTaskFixture, _ value: Double) -> Boo
     }
     encoder.setRenderPipelineState(fixture.pipeline)
     encoder.setVertexBuffer(fixture.vertices, offset: 0, index: 0)
+    encoder.setFragmentBytes(&discardedColour, length: 16, index: 0)
     encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
     encoder.endEncoding()
     commandBuffer.commit()
