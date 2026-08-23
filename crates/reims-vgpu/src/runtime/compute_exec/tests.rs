@@ -1805,7 +1805,7 @@ fn stage_texture_linear_ref_does_not_collide_with_surface_mid() {
 }
 
 #[test]
-fn stage_heap_texture_uses_host_only_residency_identity() {
+fn equal_heap_placements_stage_one_shared_residency_identity() {
     use crate::runtime::decode::resource::{
         list_object_entry_offset, HEAP_TEXTURE_DESCRIPTOR, HEAP_TEXTURE_HEAP_REF, HEAP_TEXTURE_LEN,
         HEAP_TEXTURE_OFFSET, HEAP_TEXTURE_OPCODE, HEAP_TEXTURE_USE_OFFSET, OBJECT_LIST_ENTRY_LEN,
@@ -1819,6 +1819,7 @@ fn stage_heap_texture_uses_host_only_residency_identity() {
     assert!(state.set_object_list(1, 0, 32));
 
     let texture_ref = 20u32;
+    let alias_ref = 21u32;
     let heap_ref = 19u32;
     let desc_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E;
     let mut desc = vec![0u8; HEAP_TEXTURE_LEN];
@@ -1847,12 +1848,20 @@ fn stage_heap_texture_uses_host_only_residency_identity() {
     st64(&mut desc[HEAP_TEXTURE_OFFSET..], 0);
     write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
 
+    let alias_desc_gva = (4u64 + 3) << PAGE_SHIFT_ARM64E;
+    let mut alias_desc = desc.clone();
+    st32(&mut alias_desc[8..], alias_ref);
+    write_task_gva_arm64e(&mut host, &state.tasks[1], alias_desc_gva, &alias_desc);
+
     let entry_offset = list_object_entry_offset(texture_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (OBJECT_TYPE_TEXTURE_VIEW as u32) | ((HEAP_TEXTURE_LEN as u32) << 8);
     st32(&mut list_entry[0..], packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], entry_offset, &list_entry);
+    let alias_entry_offset = list_object_entry_offset(alias_ref, 32).unwrap();
+    list_entry[4..12].copy_from_slice(&alias_desc_gva.to_le_bytes());
+    write_task_gva_arm64e(&mut host, &state.tasks[1], alias_entry_offset, &list_entry);
 
     let staged = stage_texture_raw(&mut state, &mut host, 1, texture_ref, 33, true)
         .expect("live opcode-0x15 heap texture must stage");
@@ -1872,15 +1881,21 @@ fn stage_heap_texture_uses_host_only_residency_identity() {
     assert!(!residency.key.is_linear());
     assert_eq!(
         residency.key.origin,
-        crate::model::ComputeStorageOrigin::Heap {
-            resource: state
-                .task_objects
-                .resources
-                .identity(1, texture_ref)
-                .unwrap(),
-        }
+        state
+            .task_objects
+            .resources
+            .heap_storage_origin(1, texture_ref)
+            .unwrap()
     );
     assert_eq!(residency.seed_generation, 0);
+
+    let alias = stage_texture_raw(&mut state, &mut host, 1, alias_ref, 34, true)
+        .expect("an equal explicit placement must stage");
+    let alias_residency = alias.residency.expect("heap alias needs GPU residency");
+    assert_eq!(
+        residency.key, alias_residency.key,
+        "equal heap generation/range and image view must acquire one resident"
+    );
 }
 
 /// UnmapMemory removes the guest page-table alias, not the discrete
@@ -2872,15 +2887,17 @@ fn live_compute_mirrors_are_not_evicted_by_an_invented_capacity() {
     };
 
     for tex in 0..LIVE_WINDOWS {
-        let key = ComputeStorageResidencyKey::heap(
+        let key = ComputeStorageResidencyKey::heap_placement(
             reims_vgpu_protocol::ResourceId::new(tex, 1),
+            0,
+            0x100,
             16,
             16,
             0x50,
         );
         assert!(matches!(
             key.origin,
-            crate::model::ComputeStorageOrigin::Heap { .. }
+            crate::model::ComputeStorageOrigin::HeapPlacement { .. }
         ));
         note_storage_residency_writeback(&mut state, &staged(key));
     }
@@ -2896,8 +2913,10 @@ fn live_compute_mirrors_are_not_evicted_by_an_invented_capacity() {
         "every independently live mirror remains owned"
     );
     for tex in 0..LIVE_WINDOWS {
-        let key = ComputeStorageResidencyKey::heap(
+        let key = ComputeStorageResidencyKey::heap_placement(
             reims_vgpu_protocol::ResourceId::new(tex, 1),
+            0,
+            0x100,
             16,
             16,
             0x50,

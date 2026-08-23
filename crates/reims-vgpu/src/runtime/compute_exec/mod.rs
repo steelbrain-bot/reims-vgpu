@@ -2037,13 +2037,21 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             ));
             return Err(ComputeStatus::Unsupported("compute_heap_host_len"));
         };
-        let Some(resource_id) = state.task_objects.resources.identity(task_id, texture_ref) else {
+        let Some(origin) = state
+            .task_objects
+            .resources
+            .heap_storage_origin(task_id, texture_ref)
+        else {
             return Err(ComputeStatus::MissingTexture(
-                "compute_heap_resource_identity",
+                "compute_heap_storage_identity",
             ));
         };
-        let key =
-            crate::model::ComputeStorageResidencyKey::heap(resource_id, width, height, format);
+        let key = crate::model::ComputeStorageResidencyKey {
+            origin,
+            width,
+            height,
+            pixel_format: format,
+        };
         let serve = match state.content.compute_residency.generation(&key) {
             None => None,
             Some(generation) => {

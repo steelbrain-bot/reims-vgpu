@@ -326,14 +326,28 @@ pub(super) fn residency_fields(
             ("residency_row_stride", row_stride.to_string()),
             ("residency_span_end", span_end.to_string()),
         ]),
-        reims_vgpu_core::ComputeStorageOrigin::Heap { resource } => fields.extend([
-            ("residency_kind", "heap".to_string()),
-            ("residency_resource", resource.index().to_string()),
-            (
-                "residency_resource_generation",
-                resource.generation().to_string(),
-            ),
+        reims_vgpu_core::ComputeStorageOrigin::HeapPlacement {
+            heap,
+            offset,
+            span_end,
+        } => fields.extend([
+            ("residency_kind", "heap_placement".to_string()),
+            ("residency_heap", heap.index().to_string()),
+            ("residency_heap_generation", heap.generation().to_string()),
+            ("residency_heap_offset", format!("{offset:#x}")),
+            ("residency_span_end", span_end.to_string()),
         ]),
+        reims_vgpu_core::ComputeStorageOrigin::HeapAllocation { heap, allocation } => fields
+            .extend([
+                ("residency_kind", "heap_allocation".to_string()),
+                ("residency_heap", heap.index().to_string()),
+                ("residency_heap_generation", heap.generation().to_string()),
+                ("residency_resource", allocation.index().to_string()),
+                (
+                    "residency_resource_generation",
+                    allocation.generation().to_string(),
+                ),
+            ]),
     }
     fields
 }
@@ -489,8 +503,10 @@ mod tests {
             ]
         );
         assert_eq!(
-            residency_fields(&ComputeStorageResidencyKey::heap(
+            residency_fields(&ComputeStorageResidencyKey::heap_placement(
                 reims_vgpu_protocol::ResourceId::new(12, 4),
+                0x100,
+                0x900,
                 8,
                 4,
                 60,
@@ -499,9 +515,11 @@ mod tests {
                 ("residency_width", "8".into()),
                 ("residency_height", "4".into()),
                 ("residency_pixel_format", "60".into()),
-                ("residency_kind", "heap".into()),
-                ("residency_resource", "12".into()),
-                ("residency_resource_generation", "4".into()),
+                ("residency_kind", "heap_placement".into()),
+                ("residency_heap", "12".into()),
+                ("residency_heap_generation", "4".into()),
+                ("residency_heap_offset", "0x100".into()),
+                ("residency_span_end", "2304".into()),
             ]
         );
     }

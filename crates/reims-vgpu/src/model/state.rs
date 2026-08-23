@@ -864,6 +864,38 @@ impl TaskResources {
         )
     }
 
+    pub fn heap_storage_origin(
+        &self,
+        task_id: u32,
+        texture_ref: u32,
+    ) -> Option<ComputeStorageOrigin> {
+        let registry = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let texture = registry
+            .objects
+            .get(&(task_id, texture_ref))?
+            .semantic_id()?;
+        let node = registry.graph.resource(texture)?;
+        let storage = registry.graph.storage(node.storage?)?;
+        match storage.backing {
+            reims_vgpu_core::StorageBacking::HeapPlacement {
+                heap,
+                offset,
+                length,
+            } => Some(ComputeStorageOrigin::HeapPlacement {
+                heap,
+                offset: offset.get(),
+                span_end: offset.get().checked_add(length.get())?,
+            }),
+            reims_vgpu_core::StorageBacking::HeapAllocation { heap, allocation } => {
+                Some(ComputeStorageOrigin::HeapAllocation { heap, allocation })
+            }
+            _ => None,
+        }
+    }
+
     /// Resolve the retained buffer allocation behind one buffer-backed texture.
     ///
     /// The child-to-parent graph edge is generational. A deleted and reused raw
