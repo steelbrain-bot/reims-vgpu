@@ -408,6 +408,71 @@ func stencilIndependenceCases() {
                "combined pipeline, state, or colour target creation failed")
     }
 
+    if let pipeline = depthPipeline(.invalid, stencil: .stencil8),
+       let equal = stencilTestState(.equal),
+       let colour = dev.makeTexture(descriptor: colourDescriptor) {
+        let stencilDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .stencil8, width: width, height: height, mipmapped: false)
+        stencilDescriptor.usage = .renderTarget
+        stencilDescriptor.storageMode = .private
+        if let stencil = dev.makeTexture(descriptor: stencilDescriptor) {
+            var red: [Float] = [1, 0, 0, 1]
+            let first = MTLRenderPassDescriptor()
+            first.colorAttachments[0].texture = colour
+            first.colorAttachments[0].loadAction = .clear
+            first.colorAttachments[0].storeAction = .dontCare
+            first.stencilAttachment.texture = stencil
+            first.stencilAttachment.loadAction = .clear
+            first.stencilAttachment.storeAction = .store
+            first.stencilAttachment.clearStencil = 7
+
+            let commandBuffer = queue.makeCommandBuffer()!
+            let firstEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: first)!
+            firstEncoder.setRenderPipelineState(pipeline)
+            firstEncoder.setVertexBuffer(vertices, offset: 0, index: 0)
+            firstEncoder.setFragmentBytes(&red, length: 16, index: 0)
+            firstEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+            firstEncoder.endEncoding()
+
+            var green: [Float] = [0, 1, 0, 1]
+            let second = MTLRenderPassDescriptor()
+            second.colorAttachments[0].texture = colour
+            second.colorAttachments[0].loadAction = .clear
+            second.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 1, alpha: 1)
+            second.colorAttachments[0].storeAction = .store
+            second.stencilAttachment.texture = stencil
+            second.stencilAttachment.loadAction = .load
+            second.stencilAttachment.storeAction = .dontCare
+
+            let secondEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: second)!
+            secondEncoder.setRenderPipelineState(pipeline)
+            secondEncoder.setDepthStencilState(equal)
+            secondEncoder.setStencilReferenceValue(7)
+            secondEncoder.setVertexBuffer(vertices, offset: 0, index: 0)
+            secondEncoder.setFragmentBytes(&green, length: 16, index: 0)
+            secondEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+            secondEncoder.endEncoding()
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+
+            if let pixels = readBack(readPipe, colour, width, height) {
+                let expected = pack(0, 255, 0, 255)
+                let ok = pixels.allSatisfy { $0 == expected }
+                report("stencil_only_attachment_clear_without_test_state", ok,
+                       ok ? "stored stencil-only clear passed the later equal test"
+                          : "want=\(hex(expected)) got=\(hex(pixels[0]))")
+            } else {
+                refused("stencil_only_attachment_clear_without_test_state")
+            }
+        } else {
+            report("stencil_only_attachment_clear_without_test_state", false,
+                   "stencil8 render-target allocation failed")
+        }
+    } else {
+        report("stencil_only_attachment_clear_without_test_state", false,
+               "stencil-only pipeline, state, or colour target creation failed")
+    }
+
     let variants: [(String, MTLCompareFunction, Bool)] = [
         ("equal", .equal, true),
         ("not_equal", .notEqual, false),

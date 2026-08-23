@@ -56,6 +56,7 @@ CASE depth_test_greater_without_attachment PASS z=0 compared against the absent 
 CASE depth_test_never_without_attachment PASS z=0 compared against the absent attachment value
 CASE depth_test_always_without_attachment PASS z=0 compared against the absent attachment value
 CASE stencil_attachment_clear_without_test_state PASS stored stencil clear passed the later equal test
+CASE stencil_only_attachment_clear_without_test_state PASS stored stencil-only clear passed the later equal test
 CASE stencil_test_equal_without_attachment_depth_false PASS reference zero compared against implicit stencil zero
 CASE stencil_test_not_equal_without_attachment_depth_false PASS reference zero compared against implicit stencil zero
 CASE stencil_test_equal_without_attachment_depth_true PASS reference zero compared against implicit stencil zero
