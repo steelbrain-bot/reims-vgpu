@@ -1,17 +1,18 @@
 import Metal
 import Foundation
 
-private func clearHeapTexture(_ texture: MTLTexture, _ color: MTLClearColor) -> Bool {
-    let pass = MTLRenderPassDescriptor()
-    pass.colorAttachments[0].texture = texture
-    pass.colorAttachments[0].loadAction = .clear
-    pass.colorAttachments[0].clearColor = color
-    pass.colorAttachments[0].storeAction = .store
-
+private func fillHeapTexture(_ texture: MTLTexture, _ value: SIMD4<Float>) -> Bool {
     guard let commandBuffer = queue.makeCommandBuffer(),
-          let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else {
+          let encoder = commandBuffer.makeComputeCommandEncoder() else {
         return false
     }
+    var color = value
+    encoder.setComputePipelineState(pipeline("heap_alias_fill"))
+    encoder.setTexture(texture, index: 0)
+    encoder.setBytes(&color, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+    encoder.dispatchThreads(
+        MTLSize(width: texture.width, height: texture.height, depth: 1),
+        threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
     encoder.endEncoding()
     commandBuffer.commit()
     commandBuffer.waitUntilCompleted()
@@ -33,7 +34,7 @@ func heapTextureAliasCase() {
         height: height,
         mipmapped: false)
     descriptor.storageMode = .private
-    descriptor.usage = [.renderTarget, .shaderRead]
+    descriptor.usage = [.shaderRead, .shaderWrite]
 
     let requirement = dev.heapTextureSizeAndAlign(descriptor: descriptor)
     guard requirement.size > 0, requirement.align > 0 else {
@@ -64,7 +65,7 @@ func heapTextureAliasCase() {
         report(label, false, "a one-slot heap admitted two simultaneously live textures")
         return
     }
-    guard clearHeapTexture(first, MTLClearColor(red: 1, green: 0, blue: 0, alpha: 1)) else {
+    guard fillHeapTexture(first, SIMD4<Float>(1, 0, 0, 1)) else {
         report(label, false, "commands using the first heap texture did not complete")
         return
     }
@@ -83,7 +84,7 @@ func heapTextureAliasCase() {
                "the replacement moved from offset=\(firstOffset) to offset=\(second.heapOffset)")
         return
     }
-    guard clearHeapTexture(second, MTLClearColor(red: 0, green: 1, blue: 0, alpha: 1)) else {
+    guard fillHeapTexture(second, SIMD4<Float>(0, 1, 0, 1)) else {
         report(label, false, "commands using the replacement heap texture did not complete")
         return
     }

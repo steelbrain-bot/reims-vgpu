@@ -229,4 +229,12 @@ fragment float4 glyph_fs(VOut in [[stage_in]],
     float cov = atlas.sample(s, in.uv).r;
     return float4(colour.rgb * cov, cov);
 }
+
+kernel void heap_alias_fill(texture2d<float, access::write> output [[texture(0)]],
+                            constant float4 &value [[buffer(0)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x < output.get_width() && gid.y < output.get_height()) {
+        output.write(value, gid);
+    }
+}
 """
