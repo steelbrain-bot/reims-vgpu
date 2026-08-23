@@ -1,16 +1,5 @@
 CASE shader_compile PASS runtime library built
 CASE depth_attachment_isolated_across_tasks PASS each task loaded its own stored depth
-CASE depth_attachment_clear_without_test_state PASS stored depth clear rejected the later draw
-CASE depth_test_less_without_attachment PASS z=0 compared against the absent attachment value
-CASE depth_test_equal_without_attachment PASS z=0 compared against the absent attachment value
-CASE depth_test_greater_without_attachment PASS z=0 compared against the absent attachment value
-CASE depth_test_never_without_attachment PASS z=0 compared against the absent attachment value
-CASE depth_test_always_without_attachment PASS z=0 compared against the absent attachment value
-CASE stencil_attachment_clear_without_test_state PASS stored stencil clear passed the later equal test
-CASE stencil_test_equal_without_attachment_depth_false PASS reference zero compared against implicit stencil zero
-CASE stencil_test_not_equal_without_attachment_depth_false PASS reference zero compared against implicit stencil zero
-CASE stencil_test_equal_without_attachment_depth_true PASS reference zero compared against implicit stencil zero
-CASE stencil_test_not_equal_without_attachment_depth_true PASS reference zero compared against implicit stencil zero
 CASE linear_r8Unorm_64x16_pitch_tight PASS 1024 texels exact
 CASE linear_r8Unorm_64x16_pitch_tight_sampled PASS 1024 texels exact
 CASE linear_a8Unorm_64x16_pitch_tight PASS 1024 texels exact
@@ -60,6 +49,17 @@ CASE incremental_bgra8Unorm_compute_rewrite_visible PASS rewrite visible
 CASE rt_pipeline PASS solid_fs pipeline built
 CASE rt_render_then_sample PASS 4096 texels are the drawn colour
 CASE rt_blit_to_buffer PASS 4096 texels exact through blit
+CASE depth_attachment_clear_without_test_state PASS stored depth clear rejected the later draw
+CASE depth_test_less_without_attachment PASS z=0 compared against the absent attachment value
+CASE depth_test_equal_without_attachment PASS z=0 compared against the absent attachment value
+CASE depth_test_greater_without_attachment PASS z=0 compared against the absent attachment value
+CASE depth_test_never_without_attachment PASS z=0 compared against the absent attachment value
+CASE depth_test_always_without_attachment PASS z=0 compared against the absent attachment value
+CASE stencil_attachment_clear_without_test_state PASS stored stencil clear passed the later equal test
+CASE stencil_test_equal_without_attachment_depth_false PASS reference zero compared against implicit stencil zero
+CASE stencil_test_not_equal_without_attachment_depth_false PASS reference zero compared against implicit stencil zero
+CASE stencil_test_equal_without_attachment_depth_true PASS reference zero compared against implicit stencil zero
+CASE stencil_test_not_equal_without_attachment_depth_true PASS reference zero compared against implicit stencil zero
 CASE mip_chain_create PASS levels=7
 CASE mip_fetch_level_0_size64 PASS 4096 texels are level 0's marker
 CASE mip_sample_level_0_size64 PASS 4096 texels are level 0's marker
@@ -240,10 +240,10 @@ ROUTE srt_blit_pipelined_1024x768_x8 settle_gva_rect_read
 ROUTE srt_blit_pipelined_1024x768_x8 settle_gva_rect_read_overlap
 CASE srt_blit_pipelined_1024x768_x8 PASS every frame's copy moved that frame's own pixels
 ROUTE srt_blit_iosurface_source_1024x768_x8 sl_gpu_src_via_surface
-ROUTE srt_blit_iosurface_source_1024x768_x8 sl_gpu_landed
+ROUTE srt_blit_iosurface_source_1024x768_x8 sl_gpu_resident_landed
 CASE srt_blit_iosurface_source_1024x768_x8 PASS every surface-to-surface copy moved its own frame's pixels
 ROUTE srt_blit_iosurface_source_1920x1080_x4 sl_gpu_src_via_surface
-ROUTE srt_blit_iosurface_source_1920x1080_x4 sl_gpu_landed
+ROUTE srt_blit_iosurface_source_1920x1080_x4 sl_gpu_resident_landed
 CASE srt_blit_iosurface_source_1920x1080_x4 PASS every surface-to-surface copy moved its own frame's pixels
 CASE srt_blit_buffer_backed_512x512 PASS the copy out of a buffer-backed source moved what the render had written
 SUMMARY cases=240 failures=0 skipped=0
