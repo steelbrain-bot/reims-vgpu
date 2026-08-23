@@ -495,6 +495,22 @@ fn frag_unbound_static_use(
     }
 }
 
+/// Whether an unprovided fragment resource still represents guest work loss.
+///
+/// A statically-used texture is repaired with an explicit null descriptor by
+/// the caller. Declared-but-unused and absent executable variables require no
+/// descriptor under Vulkan. Everything else remains visible: an unprovided
+/// used buffer or sampler loses work, while an ambiguous binding cannot
+/// authorize either omission or substitution.
+fn frag_unbound_requires_report(gap: FragUnbound, use_: reims_vgpu_core::DescriptorUse) -> bool {
+    match use_ {
+        reims_vgpu_core::DescriptorUse::Used => gap.class != FragUnboundClass::Texture,
+        reims_vgpu_core::DescriptorUse::Ambiguous => true,
+        reims_vgpu_core::DescriptorUse::NotDeclared
+        | reims_vgpu_core::DescriptorUse::DeclaredUnused => false,
+    }
+}
+
 /// Decode the depth-stencil descriptor a draw bound, on the Linux path
 /// `load_render_pipeline`: object-list lookup → descriptor read → decode (which
 /// validates the depth-stencil construction opcode). Returns the specific reason slug on

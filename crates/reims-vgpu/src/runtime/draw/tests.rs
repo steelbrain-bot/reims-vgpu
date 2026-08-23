@@ -7763,6 +7763,36 @@ fn every_fragment_gap_uses_the_executable_descriptor_verdict() {
     );
 }
 
+#[test]
+fn only_unrepaired_fragment_gaps_reach_the_failure_path() {
+    use reims_vgpu_core::DescriptorUse;
+
+    let gap = |class| FragUnbound {
+        class,
+        metal_index: 1,
+    };
+    assert!(!frag_unbound_requires_report(
+        gap(FragUnboundClass::Buffer),
+        DescriptorUse::DeclaredUnused
+    ));
+    assert!(!frag_unbound_requires_report(
+        gap(FragUnboundClass::Sampler),
+        DescriptorUse::NotDeclared
+    ));
+    assert!(!frag_unbound_requires_report(
+        gap(FragUnboundClass::Texture),
+        DescriptorUse::Used
+    ));
+    assert!(frag_unbound_requires_report(
+        gap(FragUnboundClass::Buffer),
+        DescriptorUse::Used
+    ));
+    assert!(frag_unbound_requires_report(
+        gap(FragUnboundClass::Sampler),
+        DescriptorUse::Ambiguous
+    ));
+}
+
 /// A retained depth-stencil state is served without consulting guest memory,
 /// and the delete opcode is what takes it away.
 ///

@@ -13,6 +13,22 @@ pub(super) struct BoundBufferPlan {
     pub(super) stage_in_buffers: std::collections::BTreeSet<u32>,
 }
 
+/// Whether this draw has an executable consumer for a bound buffer.
+///
+/// Static use comes from the translated module, independently of source
+/// reflection. A vertex stage-in fetch is the other consumer and is declared
+/// by the pipeline descriptor rather than by a direct shader argument.
+fn buffer_bind_needs_content(
+    executable_use: reims_vgpu_core::DescriptorUse,
+    feeds_stage_in: bool,
+) -> bool {
+    feeds_stage_in
+        || matches!(
+            executable_use,
+            reims_vgpu_core::DescriptorUse::Used | reims_vgpu_core::DescriptorUse::Ambiguous
+        )
+}
+
 pub(super) fn plan_bound_buffers<M: HostMemory + HostOps>(
     state: &mut Device,
     host: &mut M,
@@ -57,6 +73,13 @@ pub(super) fn plan_bound_buffers<M: HostMemory + HostOps>(
         // attribute list names keeps its guest bytes whatever reflection
         // says about the argument.
         let feeds_stage_in = bind_plan.feeds_stage_in(b.index);
+        let executable_use = v_shader.variant().buffer_use(b.index);
+        let access = v_shader.interface.buffer_access(b.index);
+        crate::runtime::bind_phase::note_access(access);
+        if !buffer_bind_needs_content(executable_use, feeds_stage_in) {
+            crate::runtime::drain::note_store_route("render_buffer_executable_unused");
+            continue;
+        }
         // The vertex shader's own reflection bounds its own `[[buffer(n)]]`
         // binds, and a stage-in index is excluded — see that function's doc
         // for why the exclusion is not implied by the translator's output.
@@ -70,8 +93,6 @@ pub(super) fn plan_bound_buffers<M: HostMemory + HostOps>(
             req.instance_count,
             req.indexed.is_some(),
         );
-        let access = v_shader.interface.buffer_access(b.index);
-        crate::runtime::bind_phase::note_access(access);
         crate::runtime::bind_phase::note_unused_staged(access);
         let Some(content) = load_buffer_content(
             state,
@@ -99,6 +120,13 @@ pub(super) fn plan_bound_buffers<M: HostMemory + HostOps>(
         if b.buffer_ref == 0 {
             continue;
         }
+        let executable_use = f_shader.variant().buffer_use(b.index);
+        let access = f_shader.interface.buffer_access(b.index);
+        crate::runtime::bind_phase::note_access(access);
+        if !buffer_bind_needs_content(executable_use, false) {
+            crate::runtime::drain::note_store_route("render_buffer_executable_unused");
+            continue;
+        }
         // The fragment shader's reflection, for the same reason. The two
         // stages are looked up separately because one Metal buffer index
         // names a different argument in each, and a cap taken from the
@@ -113,8 +141,6 @@ pub(super) fn plan_bound_buffers<M: HostMemory + HostOps>(
             req.instance_count,
             req.indexed.is_some(),
         );
-        let access = f_shader.interface.buffer_access(b.index);
-        crate::runtime::bind_phase::note_access(access);
         // No stage-in exclusion here: `[[stage_in]]` is a vertex-stage
         // concept and `pd.vertex_attributes` names vertex buffer indices,
         // which are a different index space from the fragment stage's.
@@ -214,4 +240,28 @@ pub(super) fn plan_bound_buffers<M: HostMemory + HostOps>(
         attributes: attrs,
         stage_in_buffers: stage_in_bufs,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::buffer_bind_needs_content;
+    use reims_vgpu_core::DescriptorUse;
+
+    #[test]
+    fn only_an_executable_or_stage_in_consumer_needs_buffer_content() {
+        assert!(!buffer_bind_needs_content(
+            DescriptorUse::NotDeclared,
+            false
+        ));
+        assert!(!buffer_bind_needs_content(
+            DescriptorUse::DeclaredUnused,
+            false
+        ));
+        assert!(buffer_bind_needs_content(DescriptorUse::Used, false));
+        assert!(buffer_bind_needs_content(DescriptorUse::Ambiguous, false));
+        assert!(buffer_bind_needs_content(
+            DescriptorUse::DeclaredUnused,
+            true
+        ));
+    }
 }

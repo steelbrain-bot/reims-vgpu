@@ -83,7 +83,7 @@ pub(super) fn plan_shader_resources<M: HostMemory + HostOps>(
     let reportable = uses
         .iter()
         .copied()
-        .filter(|(gap, use_)| !(gap.class == FragUnboundClass::Texture && use_.is_violation()))
+        .filter(|(gap, use_)| frag_unbound_requires_report(*gap, *use_))
         .collect::<Vec<_>>();
     if !reportable.is_empty() {
         report_fragment_gaps(request, &fragment, &reportable, width, height);
