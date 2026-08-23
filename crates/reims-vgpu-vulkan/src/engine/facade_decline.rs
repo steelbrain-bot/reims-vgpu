@@ -42,6 +42,25 @@ pub enum EngineFacadeDecline {
     WindowSourceDisappearedBeforePin {
         identity: TargetIdentity,
     },
+    ResidentCopySameIdentity {
+        identity: TargetIdentity,
+    },
+    ResidentCopyGeometryMismatch {
+        source_width: u32,
+        source_height: u32,
+        destination_width: u32,
+        destination_height: u32,
+    },
+    ResidentCopyFormatMismatch {
+        source: ash::vk::Format,
+        destination: ash::vk::Format,
+    },
+    ResidentCopyDestinationUnavailable {
+        identity: TargetIdentity,
+    },
+    ResidentCopyPinRefused {
+        identity: TargetIdentity,
+    },
 }
 
 impl Decline for EngineFacadeDecline {
@@ -65,6 +84,15 @@ impl Decline for EngineFacadeDecline {
             Self::WindowSourceDisappearedBeforePin { .. } => {
                 "vk_engine_window_source_disappeared_before_pin"
             }
+            Self::ResidentCopySameIdentity { .. } => "vk_engine_resident_copy_same_identity",
+            Self::ResidentCopyGeometryMismatch { .. } => {
+                "vk_engine_resident_copy_geometry_mismatch"
+            }
+            Self::ResidentCopyFormatMismatch { .. } => "vk_engine_resident_copy_format_mismatch",
+            Self::ResidentCopyDestinationUnavailable { .. } => {
+                "vk_engine_resident_copy_destination_unavailable"
+            }
+            Self::ResidentCopyPinRefused { .. } => "vk_engine_resident_copy_pin_refused",
         }
     }
 
@@ -102,6 +130,27 @@ impl Decline for EngineFacadeDecline {
                 fields
             }
             Self::WindowSourceDisappearedBeforePin { identity } => identity_fields(identity),
+            Self::ResidentCopySameIdentity { identity }
+            | Self::ResidentCopyDestinationUnavailable { identity }
+            | Self::ResidentCopyPinRefused { identity } => identity_fields(identity),
+            Self::ResidentCopyGeometryMismatch {
+                source_width,
+                source_height,
+                destination_width,
+                destination_height,
+            } => vec![
+                ("source_width", source_width.to_string()),
+                ("source_height", source_height.to_string()),
+                ("destination_width", destination_width.to_string()),
+                ("destination_height", destination_height.to_string()),
+            ],
+            Self::ResidentCopyFormatMismatch {
+                source,
+                destination,
+            } => vec![
+                ("source_format", format!("{source:?}")),
+                ("destination_format", format!("{destination:?}")),
+            ],
         }
     }
 }
@@ -161,6 +210,25 @@ mod tests {
             EngineFacadeDecline::WindowSourceDisappearedBeforePin {
                 identity: identity(),
             },
+            EngineFacadeDecline::ResidentCopySameIdentity {
+                identity: identity(),
+            },
+            EngineFacadeDecline::ResidentCopyGeometryMismatch {
+                source_width: 64,
+                source_height: 32,
+                destination_width: 32,
+                destination_height: 16,
+            },
+            EngineFacadeDecline::ResidentCopyFormatMismatch {
+                source: ash::vk::Format::R8G8B8A8_UNORM,
+                destination: ash::vk::Format::B8G8R8A8_UNORM,
+            },
+            EngineFacadeDecline::ResidentCopyDestinationUnavailable {
+                identity: identity(),
+            },
+            EngineFacadeDecline::ResidentCopyPinRefused {
+                identity: identity(),
+            },
         ]
     }
 
@@ -178,7 +246,7 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 8, "the engine façade reason census moved");
+        assert_eq!(before, 13, "the engine façade reason census moved");
         assert_eq!(before, slugs.len(), "duplicate engine façade slug");
     }
 

@@ -298,6 +298,27 @@ pub trait GuestPageTransferService: std::fmt::Debug + Send + Sync {
     }
 }
 
+/// Executor service for a whole-subresource copy between semantic residents.
+///
+/// The destination's canonical guest pages travel with the resident copy so
+/// both placements are published by one backend transaction.
+pub trait ResidentCopyService: std::fmt::Debug + Send + Sync {
+    fn copy_resident_level0(
+        &self,
+        _owner: ResourceLifetimeRef,
+        _source: &TargetIdentity,
+        _destination: &TargetIdentity,
+        _target: &reims_vgpu_memory::GuestPageTarget,
+        _pages: &[u64],
+    ) -> Result<(), DrawError> {
+        Err(DrawError::Facade(
+            EngineFacadeDecline::ExecutorServiceUnavailable {
+                service: "resident_level0_copy",
+            },
+        ))
+    }
+}
+
 /// Completion-word ordering against outstanding executor access to guest RAM.
 pub trait CompletionService: std::fmt::Debug + Send + Sync {
     fn install_stamp_announce(&self, _hook: StampAnnounce) {}
@@ -658,6 +679,7 @@ pub trait Executor:
     + PresentationService
     + ReadbackService<Error = DrawError>
     + GuestPageTransferService
+    + ResidentCopyService
     + CompletionService
     + SubmissionBatchService
     + GuestImportService
@@ -774,6 +796,26 @@ impl GuestPageTransferService for VulkanExecutor {
         pages: &[u64],
     ) -> Result<(), DrawError> {
         reims_vgpu_vulkan::engine::copy_target_to_guest_pages(identity, target, pages)
+    }
+}
+
+impl ResidentCopyService for VulkanExecutor {
+    fn copy_resident_level0(
+        &self,
+        owner: ResourceLifetimeRef,
+        source: &TargetIdentity,
+        destination: &TargetIdentity,
+        target: &reims_vgpu_memory::GuestPageTarget,
+        pages: &[u64],
+    ) -> Result<(), DrawError> {
+        reims_vgpu_vulkan::engine::copy_resident_level0(source, destination, target, pages)?;
+        let backing = self.retain_resident_resource(owner, destination);
+        if backing != ResidentContentBacking::DeviceAllocation {
+            crate::observe::fail(format!(
+                "resident_copy_lease_fail destination={destination:?} backing={backing:?}"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1843,6 +1885,7 @@ mod tests {
     impl PresentationService for ScriptedExecutor {}
     impl WindowPresentationService for ScriptedExecutor {}
     impl GuestPageTransferService for ScriptedExecutor {}
+    impl ResidentCopyService for ScriptedExecutor {}
     impl CompletionService for ScriptedExecutor {}
     impl SubmissionBatchService for ScriptedExecutor {}
     impl GuestImportService for ScriptedExecutor {}
@@ -2089,6 +2132,7 @@ mod tests {
     impl PresentationService for WrongIdentityExecutor {}
     impl WindowPresentationService for WrongIdentityExecutor {}
     impl GuestPageTransferService for WrongIdentityExecutor {}
+    impl ResidentCopyService for WrongIdentityExecutor {}
     impl CompletionService for WrongIdentityExecutor {}
     impl SubmissionBatchService for WrongIdentityExecutor {}
     impl GuestImportService for WrongIdentityExecutor {}

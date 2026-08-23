@@ -794,6 +794,7 @@ mod tests {
     impl crate::runtime::executor::PresentationService for NoopExecutor {}
     impl crate::runtime::executor::WindowPresentationService for NoopExecutor {}
     impl crate::runtime::executor::GuestPageTransferService for NoopExecutor {}
+    impl crate::runtime::executor::ResidentCopyService for NoopExecutor {}
     impl crate::runtime::executor::CompletionService for NoopExecutor {}
     impl crate::runtime::executor::SubmissionBatchService for NoopExecutor {}
     impl crate::runtime::executor::GuestImportService for NoopExecutor {}
@@ -863,6 +864,7 @@ mod tests {
     impl crate::runtime::executor::ComputeResidencyService for RecordingWarmExecutor {}
 
     impl crate::runtime::executor::GuestPageTransferService for RecordingWarmExecutor {}
+    impl crate::runtime::executor::ResidentCopyService for RecordingWarmExecutor {}
     impl crate::runtime::executor::CompletionService for RecordingWarmExecutor {}
 
     impl crate::runtime::executor::GuestImportService for RecordingWarmExecutor {

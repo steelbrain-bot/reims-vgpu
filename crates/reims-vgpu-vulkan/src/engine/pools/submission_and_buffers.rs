@@ -2031,6 +2031,20 @@ impl ResourcePools {
         true
     }
 
+    /// Retain a resident that the current command buffer will completely
+    /// overwrite. Unlike a read pin, the destination need not hold initialized
+    /// contents yet; it becomes readable only after queue acceptance.
+    pub(in crate::engine) fn pin_resident_write_for_entry(
+        &mut self,
+        identity: &TargetIdentity,
+    ) -> bool {
+        if !self.pin_resident_target_for_write(identity) {
+            return false;
+        }
+        self.encoder.resident_pins_live.push(identity.clone());
+        true
+    }
+
     fn install_open_batch(&mut self, batch: OpenBatch) {
         debug_assert!(self.encoder.open_batch.is_none(), "replacing an open batch");
         self.encoder.open_batch = Some(batch);

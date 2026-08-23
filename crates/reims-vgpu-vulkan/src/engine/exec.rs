@@ -3562,16 +3562,16 @@ fn note_depth_load_without_content(width: u32, height: u32, stencil: bool) {
 /// query this mutable registry first: such a result can change before the draw
 /// acquires the engine, while this decision cannot race a reclaim or target
 /// replacement.
-struct SampledResidentExpectation<'a> {
-    binding: u32,
-    identity: &'a TargetIdentity,
-    resource_width: u32,
-    resource_height: u32,
-    shader_multisampled: bool,
-    initialized_by_this_pass: bool,
+pub(super) struct SampledResidentExpectation<'a> {
+    pub(super) binding: u32,
+    pub(super) identity: &'a TargetIdentity,
+    pub(super) resource_width: u32,
+    pub(super) resource_height: u32,
+    pub(super) shader_multisampled: bool,
+    pub(super) initialized_by_this_pass: bool,
 }
 
-fn validate_sampled_resident(
+pub(super) fn validate_sampled_resident(
     expected: SampledResidentExpectation<'_>,
     held: Option<(bool, u32, u32, u32)>,
     prior: Option<ResidentReclaim>,

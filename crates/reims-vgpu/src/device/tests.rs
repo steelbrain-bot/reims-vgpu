@@ -145,6 +145,7 @@ fn drain_tail_remains_in_the_device_executor_session() {
         }
     }
     impl GuestPageTransferService for ScopeProbe {}
+    impl ResidentCopyService for ScopeProbe {}
     impl CompletionService for ScopeProbe {}
     impl SubmissionBatchService for ScopeProbe {
         fn flush_submission_tail(&self) {

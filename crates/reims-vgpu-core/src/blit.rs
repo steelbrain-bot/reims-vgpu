@@ -53,6 +53,9 @@ impl ResolvedLinearTextureLevel {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedSurfaceTextureBacking {
     pub mapping_id: MappingId,
+    /// Explicit plane selected by a plane-view object. Base IOSurface textures
+    /// select through their declaration and carry no plane ordinal.
+    pub plane: Option<u32>,
     pub width: u32,
     pub height: u32,
     pub surface_offset: u64,
@@ -322,6 +325,7 @@ mod tests {
 
         let surface = ResolvedTextureBacking::Surface(ResolvedSurfaceTextureBacking {
             mapping_id: MappingId::new(9),
+            plane: None,
             width: 1920,
             height: 1080,
             surface_offset: 0,
@@ -352,6 +356,7 @@ mod tests {
                 content: destination,
                 backing: ResolvedTextureBacking::Surface(ResolvedSurfaceTextureBacking {
                     mapping_id: MappingId::new(9),
+                    plane: None,
                     width: 8,
                     height: 4,
                     surface_offset: 0,

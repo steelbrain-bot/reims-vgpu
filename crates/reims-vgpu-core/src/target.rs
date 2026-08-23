@@ -12,6 +12,15 @@ pub enum TargetIdentity {
         generation: u64,
         format: TexelLayout,
     },
+    /// One contract-selected plane view of a registered surface.
+    SurfacePlane {
+        id: u32,
+        plane: u32,
+        width: u32,
+        height: u32,
+        generation: u64,
+        format: TexelLayout,
+    },
     Texture {
         ref_: u32,
         width: u32,
@@ -66,6 +75,7 @@ impl TargetIdentity {
     pub fn geometry(&self) -> Option<(u32, u32)> {
         match self {
             Self::Surface { width, height, .. }
+            | Self::SurfacePlane { width, height, .. }
             | Self::Texture { width, height, .. }
             | Self::Gva { width, height, .. } => Some((*width, *height)),
             Self::Anonymous { .. } => None,
@@ -81,6 +91,7 @@ impl TargetIdentity {
     pub fn generation(&self) -> u64 {
         match self {
             Self::Surface { generation, .. }
+            | Self::SurfacePlane { generation, .. }
             | Self::Texture { generation, .. }
             | Self::Gva { generation, .. } => *generation,
             Self::Anonymous { .. } => 0,
@@ -89,6 +100,7 @@ impl TargetIdentity {
     pub fn namespaced_id(&self) -> (u8, u64) {
         match self {
             Self::Surface { id, .. } => (0, u64::from(*id)),
+            Self::SurfacePlane { id, plane, .. } => (4, u64::from(*id) << 32 | u64::from(*plane)),
             Self::Texture { ref_, .. } => (1, u64::from(*ref_)),
             Self::Gva { gva, .. } => (2, *gva),
             Self::Anonymous { slot } => (3, *slot),
@@ -113,6 +125,9 @@ impl TargetIdentity {
             Self::Surface {
                 generation: value, ..
             }
+            | Self::SurfacePlane {
+                generation: value, ..
+            }
             | Self::Texture {
                 generation: value, ..
             }
@@ -126,6 +141,16 @@ impl TargetIdentity {
     pub fn aliases(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Surface { id: a, .. }, Self::Surface { id: b, .. }) => a == b,
+            (
+                Self::SurfacePlane {
+                    id: a, plane: ap, ..
+                },
+                Self::SurfacePlane {
+                    id: b, plane: bp, ..
+                },
+            ) => a == b && ap == bp,
+            (Self::Surface { id: a, .. }, Self::SurfacePlane { id: b, .. })
+            | (Self::SurfacePlane { id: a, .. }, Self::Surface { id: b, .. }) => a == b,
             (Self::Gva { gva: a, .. }, Self::Gva { gva: b, .. }) => a == b,
             (Self::Texture { ref_: a, .. }, Self::Texture { ref_: b, .. }) => a == b,
             (Self::Anonymous { slot: a }, Self::Anonymous { slot: b }) => a == b,
@@ -134,7 +159,9 @@ impl TargetIdentity {
     }
     pub fn resident_layout(&self) -> TexelLayout {
         match self {
-            Self::Surface { format, .. } | Self::Gva { format, .. } => *format,
+            Self::Surface { format, .. }
+            | Self::SurfacePlane { format, .. }
+            | Self::Gva { format, .. } => *format,
             Self::Texture { .. } | Self::Anonymous { .. } => TexelLayout::Rgba8,
         }
     }
@@ -180,6 +207,24 @@ mod tests {
             .diverges_from(&held),
             TargetKeyDivergence::Namespace
         );
+    }
+
+    #[test]
+    fn explicit_surface_planes_are_distinct_contract_identities() {
+        let plane = |plane| TargetIdentity::SurfacePlane {
+            id: 7,
+            plane,
+            width: 64,
+            height: 32,
+            generation: 2,
+            format: TexelLayout::Bgra8,
+        };
+        assert_ne!(plane(0), plane(1));
+        assert!(!plane(0).aliases(&plane(1)));
+        assert!(surface(2, 64).aliases(&plane(0)));
+        assert_eq!(plane(0).geometry(), Some((64, 32)));
+        assert_eq!(plane(0).generation(), 2);
+        assert_eq!(plane(0).resident_layout(), TexelLayout::Bgra8);
     }
 
     #[test]

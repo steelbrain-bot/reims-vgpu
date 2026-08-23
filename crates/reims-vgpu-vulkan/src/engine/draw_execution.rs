@@ -350,6 +350,22 @@ pub(super) fn identity_fields(identity: &TargetIdentity) -> Vec<(&'static str, S
             // which of them refused.
             ("identity_format", format!("{format:?}")),
         ],
+        TargetIdentity::SurfacePlane {
+            id,
+            plane,
+            width,
+            height,
+            generation,
+            format,
+        } => vec![
+            ("identity_kind", "surface_plane".into()),
+            ("identity_id", id.to_string()),
+            ("identity_plane", plane.to_string()),
+            ("identity_width", width.to_string()),
+            ("identity_height", height.to_string()),
+            ("identity_generation", generation.to_string()),
+            ("identity_format", format!("{format:?}")),
+        ],
         TargetIdentity::Texture {
             ref_,
             width,

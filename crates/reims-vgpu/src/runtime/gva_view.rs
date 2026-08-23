@@ -1424,6 +1424,7 @@ mod tests {
             }
         }
         impl GuestPageTransferService for SettleProbe {}
+        impl ResidentCopyService for SettleProbe {}
         impl CompletionService for SettleProbe {}
         impl SubmissionBatchService for SettleProbe {}
         impl GuestImportService for SettleProbe {}

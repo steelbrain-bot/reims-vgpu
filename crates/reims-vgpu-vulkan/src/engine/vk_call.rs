@@ -65,6 +65,12 @@ pub enum VkOp {
     /// `vkQueueSubmit` of the guest-page copy.
     GuestWriteSubmit,
 
+    // ---- mod.rs `copy_resident_level0` — whole-image resident blit ----
+    ResidentCopyResetCb,
+    ResidentCopyBeginCb,
+    ResidentCopyEndCb,
+    ResidentCopySubmit,
+
     // ---- mod.rs `read_resident_storage` — the pinned deferred-writeback
     //      storage-image flush rail (GPU→host tight copy, then unpin) ----
     /// `vkResetCommandBuffer` before recording the storage flush copy.
@@ -377,6 +383,11 @@ impl Decline for VkCall {
             VkOp::GuestWriteEndCb => "vk_guest_write_end_cb",
             VkOp::GuestWriteSubmit => "vk_guest_write_submit",
 
+            VkOp::ResidentCopyResetCb => "vk_resident_copy_reset_cb",
+            VkOp::ResidentCopyBeginCb => "vk_resident_copy_begin_cb",
+            VkOp::ResidentCopyEndCb => "vk_resident_copy_end_cb",
+            VkOp::ResidentCopySubmit => "vk_resident_copy_submit",
+
             VkOp::StorageReadResetCb => "vk_storage_read_reset_cb",
             VkOp::StorageReadBeginCb => "vk_storage_read_begin_cb",
             VkOp::StorageReadEndCb => "vk_storage_read_end_cb",
@@ -557,6 +568,10 @@ mod tests {
         VkOp::GuestWriteBeginCb,
         VkOp::GuestWriteEndCb,
         VkOp::GuestWriteSubmit,
+        VkOp::ResidentCopyResetCb,
+        VkOp::ResidentCopyBeginCb,
+        VkOp::ResidentCopyEndCb,
+        VkOp::ResidentCopySubmit,
         VkOp::StorageReadResetCb,
         VkOp::StorageReadBeginCb,
         VkOp::StorageReadEndCb,

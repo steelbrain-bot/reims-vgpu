@@ -911,6 +911,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         note_blit_iosurface_resident(state, mapping_id);
         return Ok(TextureBacking::Surface(IOSurfaceTextureBacking {
             mapping_id: MappingId::new(mapping_id),
+            plane: None,
             width: tex_w,
             height: tex_h,
             surface_offset,
@@ -996,6 +997,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         note_blit_iosurface_resident(state, sid);
         return Ok(TextureBacking::Surface(IOSurfaceTextureBacking {
             mapping_id: MappingId::new(sid),
+            plane: Some(view.plane_index),
             width: view.width,
             height: view.height,
             surface_offset,
@@ -3978,9 +3980,10 @@ fn gpu_whole_plane_destination(
     Ok(())
 }
 
-/// Land the source's engine resident straight into the destination's guest pages
-/// with the GPU, for the one shape where that is exactly the copy the guest asked
-/// for.
+/// Land the source's engine resident into the destination's canonical guest
+/// pages and, when its resource lifetime is available, a device-local resident.
+/// If the guest-page transfer declines after the resident submission, the
+/// resident is withdrawn from semantic use before this arm falls through.
 ///
 /// # Why a blit is not a guest-byte reader here
 ///
@@ -4055,6 +4058,12 @@ fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
     };
     let source_is_surface = source_surface.is_some();
     let surface_source = source_surface.and_then(|t| {
+        // Colour attachment resolution deliberately names an IOSurface plane
+        // view by the base surface resident: render_target resolves that view
+        // through the mapping's allocation geometry. This source lookup must
+        // use the identity its producer published. The destination below is
+        // different: this blit is itself the producer and publishes the exact
+        // decoded plane that its subsequent compute consumer will request.
         let identity = crate::runtime::present_identity::surface_identity(
             state,
             t.mapping_id.get(),
@@ -4164,6 +4173,89 @@ fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
             }
         }
         return None;
+    }
+    let destination_resource = state
+        .task_objects
+        .resources
+        .get(task_id, destination_object);
+    if destination_resource.is_some() {
+        let target_format = reims_vgpu_core::pixel_format::store_texel_order(plane.pixel_format)?;
+        let destination_identity = match t.plane {
+            Some(plane_index) => crate::runtime::present_identity::surface_plane_identity(
+                state,
+                mapping_id,
+                plane_index,
+                plane.width,
+                plane.height,
+                target_format,
+            ),
+            None => crate::runtime::present_identity::surface_identity(
+                state,
+                mapping_id,
+                plane.width,
+                plane.height,
+            ),
+        };
+        let held = pixel_format::verbatim_storage_format(src.pixel_format);
+        if let (Some(resource), Some(held)) = (destination_resource, held) {
+            let destination = mapping_write::IOSurfaceDestination {
+                mapping_id,
+                base_off: plane.surface_offset,
+                bpr: plane.row_stride,
+                span_end: t.span_end,
+                width: plane.width,
+                height: plane.height,
+                format: plane.pixel_format,
+            };
+            if let Ok(licence) =
+                mapping_write::licence_iosurface_texture_surface(state, host, held, &destination)
+            {
+                match state.executor.copy_resident_level0(
+                    resource.lifetime_ref(),
+                    &source_identity,
+                    &destination_identity,
+                    &licence.target,
+                    &licence.gpas,
+                ) {
+                    Ok(()) => {
+                        let epoch = mapping_write::note_iosurface_texture_landed(
+                            state,
+                            mapping_id,
+                            licence.base_off,
+                            licence.span_end,
+                        );
+                        if let Some(epoch) = epoch {
+                            if !state
+                                .executor
+                                .stamp_resident_content_epoch(&destination_identity, epoch)
+                            {
+                                crate::observe::fail(format!(
+                                        "blit_resident_copy_epoch_refused mapping={mapping_id} epoch={epoch}"
+                                    ));
+                            }
+                        }
+                        if !state
+                            .executor
+                            .note_resident_content_copied_out(&destination_identity)
+                        {
+                            crate::observe::fail(format!(
+                                "blit_resident_copy_out_refused mapping={mapping_id}"
+                            ));
+                        }
+                        state.invalidate_object_host_copies(task_id, destination_object);
+                        note_store_route("sl_gpu_resident_landed");
+                        return Some(BlitStatus::Ok);
+                    }
+                    Err(decline) => {
+                        note_store_route("sl_gpu_resident_declined");
+                        crate::observe::off(format!(
+                            "blit_resident_copy mid={mapping_id} {}x{} decline={decline:?}",
+                            plane.width, plane.height
+                        ));
+                    }
+                }
+            }
+        }
     }
     match mapping_write::write_bgra8_from_resident_gpu(
         state,

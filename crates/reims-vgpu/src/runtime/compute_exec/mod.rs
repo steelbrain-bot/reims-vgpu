@@ -1583,6 +1583,7 @@ pub(crate) struct StagedTexture {
 enum VulkanTextureInput {
     HostBytes(Vec<u8>),
     GuestPages(reims_vgpu_memory::GuestRunSource),
+    TargetResident(crate::model::TargetIdentity),
     Resident(ResidentServe),
 }
 
@@ -2201,6 +2202,19 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             ));
             return Err(ComputeStatus::Unsupported("stage_tex_fmt_storage"));
         }
+        let target_resident = (!is_storage)
+            .then(|| {
+                crate::runtime::draw::compute_iosurface_resident_sample(
+                    state,
+                    host,
+                    task_id,
+                    texture_ref,
+                    mapping_id,
+                    width,
+                    height,
+                )
+            })
+            .flatten();
         let m = state
             .surfaces
             .mappings
@@ -2341,7 +2355,9 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             ));
         }
         let mut bytes = vec![0u8; need];
-        let input = if let Some(resident) = serve {
+        let input = if let Some(identity) = target_resident {
+            VulkanTextureInput::TargetResident(identity)
+        } else if let Some(resident) = serve {
             VulkanTextureInput::Resident(resident)
         } else if let Some(source) = span_end.checked_sub(surface_offset).and_then(|span| {
             let row_length_texels = if surface_bpr == tight {
@@ -4138,6 +4154,13 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                     VulkanTextureInput::GuestPages(source) => {
                         reims_vgpu_core::ComputeStorageImageSeed::GuestPages(source)
                     }
+                    VulkanTextureInput::TargetResident(_) => {
+                        crate::observe::fail(format!(
+                        "compute_linux internal reason=target_resident_on_storage pipe={} bind={}",
+                        acc.pipeline_ref, t.binding
+                    ));
+                        return ComputeStatus::Unsupported("compute_storage_source_role");
+                    }
                     VulkanTextureInput::Resident(ResidentServe::Seed(_)) => {
                         reims_vgpu_core::ComputeStorageImageSeed::Resident
                     }
@@ -4189,6 +4212,9 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                     }
                     VulkanTextureInput::GuestPages(source) => {
                         reims_vgpu_core::ComputeSampledImageSource::GuestPages(source)
+                    }
+                    VulkanTextureInput::TargetResident(identity) => {
+                        reims_vgpu_core::ComputeSampledImageSource::TargetResident(identity)
                     }
                     VulkanTextureInput::Resident(ResidentServe::Sample(identity, generation)) => {
                         reims_vgpu_core::ComputeSampledImageSource::Resident(

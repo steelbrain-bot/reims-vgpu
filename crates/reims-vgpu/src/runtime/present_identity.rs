@@ -62,6 +62,30 @@ pub fn surface_identity(
     }
 }
 
+pub fn surface_plane_identity(
+    state: &Device,
+    mapping_id: u32,
+    plane: u32,
+    width: u32,
+    height: u32,
+    format: reims_vgpu_core::pixel_format::TexelLayout,
+) -> TargetIdentity {
+    let generation = state
+        .surfaces
+        .mappings
+        .get(&mapping_id)
+        .map(|mapping| mapping.lifecycle.generation as u64)
+        .unwrap_or(0);
+    TargetIdentity::SurfacePlane {
+        id: mapping_id,
+        plane,
+        width,
+        height,
+        generation,
+        format,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,6 +112,30 @@ mod tests {
             surface_identity(&state, 7, 65, 32),
             "geometry is part of the resident's shape"
         );
+    }
+
+    #[test]
+    fn plane_identity_carries_the_decoded_plane_without_colliding_with_the_surface() {
+        let state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
+        let surface = surface_identity(&state, 7, 64, 32);
+        let plane0 = surface_plane_identity(
+            &state,
+            7,
+            0,
+            64,
+            32,
+            reims_vgpu_core::pixel_format::TexelLayout::Bgra8,
+        );
+        let plane1 = surface_plane_identity(
+            &state,
+            7,
+            1,
+            64,
+            32,
+            reims_vgpu_core::pixel_format::TexelLayout::Bgra8,
+        );
+        assert_ne!(surface, plane0);
+        assert_ne!(plane0, plane1);
     }
 
     /// A mapping's resident is created at the format the mapping declares, and

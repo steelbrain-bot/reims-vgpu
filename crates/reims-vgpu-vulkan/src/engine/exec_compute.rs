@@ -52,13 +52,39 @@ struct PreparedSampledImage {
     null: bool,
 }
 
-#[derive(Clone, Copy)]
-struct PreparedResidentSample {
-    identity: reims_vgpu_core::ComputeStorageResidencyKey,
-    initial_access: super::pools::ResidentAccess,
-    /// The same semantic image is also a writable storage binding in this
-    /// dispatch. Its storage preparation owns the one transition to GENERAL.
-    also_storage: bool,
+#[derive(Clone)]
+enum PreparedResidentSample {
+    Compute {
+        identity: reims_vgpu_core::ComputeStorageResidencyKey,
+        initial_access: super::pools::ResidentAccess,
+        /// The same semantic image is also a writable storage binding in this
+        /// dispatch. Its storage preparation owns the one transition to GENERAL.
+        also_storage: bool,
+    },
+    Target {
+        identity: reims_vgpu_core::TargetIdentity,
+        initial_access: super::pools::ResidentAccess,
+    },
+}
+
+impl PreparedResidentSample {
+    fn initial_access(&self) -> super::pools::ResidentAccess {
+        match self {
+            Self::Compute { initial_access, .. } | Self::Target { initial_access, .. } => {
+                *initial_access
+            }
+        }
+    }
+
+    fn also_storage(&self) -> bool {
+        matches!(
+            self,
+            Self::Compute {
+                also_storage: true,
+                ..
+            }
+        )
+    }
 }
 
 struct PreparedTexelSource {
@@ -169,6 +195,7 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
             super::types::ComputeSampledImageSource::Null => true,
             super::types::ComputeSampledImageSource::Bytes(bytes) => bytes.len() == tight,
             super::types::ComputeSampledImageSource::Resident(_) => true,
+            super::types::ComputeSampledImageSource::TargetResident(_) => true,
             super::types::ComputeSampledImageSource::GuestPages(source) => {
                 guest_image_source_is_exact(
                     source,
@@ -189,6 +216,7 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
                             source.total_len as usize
                         }
                         super::types::ComputeSampledImageSource::Resident(_) => 0,
+                        super::types::ComputeSampledImageSource::TargetResident(_) => 0,
                     },
                     expected: tight,
                 },
@@ -740,10 +768,66 @@ pub(crate) unsafe fn execute_compute_inner(
                     src_image,
                     src_view,
                     None,
-                    Some(PreparedResidentSample {
+                    Some(PreparedResidentSample::Compute {
                         identity: bind.identity,
                         initial_access: src_access,
                         also_storage,
+                    }),
+                )
+            } else if let super::types::ComputeSampledImageSource::TargetResident(identity) =
+                &resource.source
+            {
+                let held = pools.registry_get(identity).map(|slot| {
+                    (
+                        slot.content_ready,
+                        slot.width,
+                        slot.height,
+                        slot.sample_count,
+                        slot.image,
+                        slot.access,
+                    )
+                });
+                super::exec::validate_sampled_resident(
+                    super::exec::SampledResidentExpectation {
+                        binding: resource.binding,
+                        identity,
+                        resource_width: resource.width,
+                        resource_height: resource.height,
+                        shader_multisampled: false,
+                        initialized_by_this_pass: false,
+                    },
+                    held.map(|held| (held.0, held.1, held.2, held.3)),
+                    pools.prior_reclaim(identity),
+                )
+                .map_err(DrawError::DrawExecution)?;
+                let (_, _, _, _, image, access) =
+                    held.expect("validated target resident remains present");
+                let view = unsafe {
+                    pools.registry_sample_view(
+                        ctx,
+                        identity,
+                        crate::format::vk_storage_image(resource.format),
+                        reims_vgpu_protocol::SwizzlePlan::default(),
+                        counters,
+                    )?
+                }
+                .expect("validated target resident remains present");
+                if !pools.pin_resident_for_entry(identity) {
+                    return Err(DrawError::DrawExecution(
+                        super::draw_execution::DrawExecutionDecline::SampledResidentNotReady {
+                            binding: resource.binding,
+                            identity: identity.clone(),
+                        },
+                    ));
+                }
+                pools.registry_note_sampled_use(identity);
+                (
+                    image,
+                    view,
+                    None,
+                    Some(PreparedResidentSample::Target {
+                        identity: identity.clone(),
+                        initial_access: access,
                     }),
                 )
             } else {
@@ -773,6 +857,7 @@ pub(crate) unsafe fn execute_compute_inner(
                             &mut guest_gathers,
                         )?
                     },
+                    super::types::ComputeSampledImageSource::TargetResident(_) => unreachable!(),
                     super::types::ComputeSampledImageSource::Resident(_) => unreachable!(),
                     super::types::ComputeSampledImageSource::Null => unreachable!(),
                 };
@@ -1130,15 +1215,16 @@ pub(crate) unsafe fn execute_compute_inner(
             continue;
         }
         let range = super::color_subresource_range();
-        if let Some(resident) = prepared.resident {
-            if resident.also_storage {
+        if let Some(resident) = &prepared.resident {
+            if resident.also_storage() {
                 continue;
             }
-            let (src_stage, src_access) = resident.initial_access.source_scope();
+            let initial_access = resident.initial_access();
+            let (src_stage, src_access) = initial_access.source_scope();
             let barrier = [vk::ImageMemoryBarrier::default()
                 .src_access_mask(src_access)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                .old_layout(resident.initial_access.layout())
+                .old_layout(initial_access.layout())
                 .new_layout(vk::ImageLayout::GENERAL)
                 .image(prepared.image)
                 .subresource_range(range)];
@@ -1570,8 +1656,16 @@ pub(crate) unsafe fn execute_compute_inner(
         }
     }
     for prepared in &sampled_slots {
-        if let Some(resident) = prepared.resident.filter(|resident| !resident.also_storage) {
-            pools.mark_compute_resident_sampled(&resident.identity);
+        if let Some(PreparedResidentSample::Compute {
+            identity,
+            also_storage: false,
+            ..
+        }) = &prepared.resident
+        {
+            pools.mark_compute_resident_sampled(identity);
+        }
+        if let Some(PreparedResidentSample::Target { identity, .. }) = &prepared.resident {
+            pools.registry_note_access(identity, super::pools::ResidentAccess::compute_read());
         }
     }
 

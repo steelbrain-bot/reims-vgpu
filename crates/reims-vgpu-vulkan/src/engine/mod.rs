@@ -3919,10 +3919,11 @@ unsafe fn copy_image_level0_to_host_delivered(
             .end_command_buffer(cb)
             .map_err(|e| DrawError::VkCall(VkCall::new(ops.end_cb, e)))?;
         let cbs = [cb];
-        ctx.submit_queue_work(&cbs, &[], &[], &[], fence)
+        let timeline = ctx
+            .submit_guest_work(&cbs, fence)
             .map_err(|e| DrawError::VkCall(VkCall::new(ops.submit, e)))?;
         let sealed = pools.seal_entry(Vec::new(), Vec::new());
-        pools.finish_entry_async(sealed, None, None);
+        pools.finish_entry_async(sealed, timeline, None);
     }
     // Split three ways rather than timed as a whole: the submit and the copy
     // scale with the surface, the fence does not scale with anything we control,
@@ -4269,7 +4270,7 @@ pub fn copy_target_to_guest_pages(
     }
     unsafe {
         let plan = plan_guest_copy(ctx, pools, counters, dst)?;
-        copy_image_level0_to_buffer(ctx, pools, counters, &snap, &plan)?;
+        copy_image_level0_to_buffer(ctx, pools, counters, identity, &snap, &plan, pages)?;
         pools.registry_note_access(identity, pools::ResidentAccess::transfer_read());
         // The copy above is `vkCmdCopyImageToBuffer` into the guest's own
         // imported pages, so these bytes are the host readback this rail elides
@@ -4287,9 +4288,236 @@ pub fn copy_target_to_guest_pages(
     // than guarding every early return above, because the whole body runs under
     // the engine lock and a reclaim needs the same lock: nothing can take the
     // image while this function is running, only after it returns.
-    if let Some(pages) = reims_vgpu_memory::GuestWritePages::new(pages) {
-        record_guest_write_debt(pools, GuestWriteSource::ResidentTarget(identity), &pages);
+    Ok(())
+}
+
+/// Copy one complete single-sample resident image into another device-local
+/// resident.
+///
+pub fn copy_resident_level0(
+    source: &TargetIdentity,
+    destination: &TargetIdentity,
+    target: &GuestPageTarget,
+    pages: &[u64],
+) -> Result<(), DrawError> {
+    if source.aliases(destination) {
+        return Err(DrawError::Facade(
+            EngineFacadeDecline::ResidentCopySameIdentity {
+                identity: source.clone(),
+            },
+        ));
     }
+    let Some((destination_width, destination_height)) = destination.geometry() else {
+        return Err(DrawError::Facade(
+            EngineFacadeDecline::ResidentCopyGeometryMismatch {
+                source_width: source.width(),
+                source_height: source.height(),
+                destination_width: 0,
+                destination_height: 0,
+            },
+        ));
+    };
+    let destination_format =
+        crate::translate::pixel::vk_texel_layout(destination.resident_layout());
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref mut pools,
+        ref counters,
+        ..
+    } = &mut *guard;
+    let ctx = owner.ensure(counters)?;
+    unsafe { pools.ensure_init(ctx, counters)? };
+    let source_snapshot = resident_read_snapshot(pools, source)?;
+    if (source_snapshot.width, source_snapshot.height) != (destination_width, destination_height) {
+        return Err(DrawError::Facade(
+            EngineFacadeDecline::ResidentCopyGeometryMismatch {
+                source_width: source_snapshot.width,
+                source_height: source_snapshot.height,
+                destination_width,
+                destination_height,
+            },
+        ));
+    }
+    if !crate::translate::pixel::stored_bytes_agree(source_snapshot.format, destination_format) {
+        return Err(DrawError::Facade(
+            EngineFacadeDecline::ResidentCopyFormatMismatch {
+                source: source_snapshot.format,
+                destination: destination_format,
+            },
+        ));
+    }
+    let target_format = crate::format::vk_storage_image(target.format);
+    if (target.width, target.height) != (destination_width, destination_height)
+        || !crate::translate::pixel::stored_bytes_agree(destination_format, target_format)
+    {
+        return Err(DrawError::Facade(
+            EngineFacadeDecline::ResidentCopyGeometryMismatch {
+                source_width: destination_width,
+                source_height: destination_height,
+                destination_width: target.width,
+                destination_height: target.height,
+            },
+        ));
+    }
+    unsafe { pools.batch_flush(ctx, counters)? };
+    let plan = unsafe { plan_guest_copy(ctx, pools, counters, target)? };
+    let (destination_image, _) = unsafe {
+        pools.registry_ensure_attachment(
+            ctx,
+            destination.clone(),
+            destination_width,
+            destination_height,
+            1,
+            destination.generation(),
+            destination_format,
+            None,
+            false,
+            counters,
+        )?
+    };
+    let Some(destination_slot) = pools.registry_get(destination) else {
+        return Err(DrawError::Facade(
+            EngineFacadeDecline::ResidentCopyDestinationUnavailable {
+                identity: destination.clone(),
+            },
+        ));
+    };
+    let destination_access = destination_slot.access;
+
+    unsafe {
+        // Keep the two-destination publication transaction out of a render
+        // batch. A refusal can then unwind only this copy's pins and recording;
+        // it cannot invalidate unrelated work already accumulated in a batch.
+        let (cb, fence) = pools.begin_entry(ctx, counters)?;
+        pools.begin_slot_recording(
+            ctx,
+            cb,
+            gpu_span::Kind::Store,
+            VkOp::ResidentCopyResetCb,
+            VkOp::ResidentCopyBeginCb,
+        )?;
+        pools.close_open_pass(&ctx.device, cb);
+        let destination_next = pools::ResidentAccess::transfer_read();
+        if !pools.pin_resident_for_entry(source) {
+            pools.abort_recorded_guest_work();
+            return Err(DrawError::Facade(
+                EngineFacadeDecline::ResidentCopyPinRefused {
+                    identity: source.clone(),
+                },
+            ));
+        }
+        if !pools.pin_resident_write_for_entry(destination) {
+            pools.abort_recorded_guest_work();
+            return Err(DrawError::Facade(
+                EngineFacadeDecline::ResidentCopyPinRefused {
+                    identity: destination.clone(),
+                },
+            ));
+        }
+
+        let source_next = pools::ResidentAccess::transfer_read();
+        exec::barrier_resident_for_transfer_read(
+            &ctx.device,
+            cb,
+            source_snapshot.image,
+            pools
+                .registry_get(source)
+                .map_or(source_next, |slot| slot.access),
+            source_next,
+        );
+        let (destination_stage, destination_src_access) = destination_access.source_scope();
+        let destination_barrier = [ash::vk::ImageMemoryBarrier::default()
+            .src_access_mask(destination_src_access)
+            .dst_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
+            .old_layout(destination_access.layout())
+            .new_layout(ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .image(destination_image)
+            .subresource_range(color_subresource_range())];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            destination_stage,
+            ash::vk::PipelineStageFlags::TRANSFER,
+            ash::vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &destination_barrier,
+        );
+        let region = [ash::vk::ImageCopy::default()
+            .src_subresource(color_subresource_layers())
+            .dst_subresource(color_subresource_layers())
+            .extent(ash::vk::Extent3D {
+                width: destination_width,
+                height: destination_height,
+                depth: 1,
+            })];
+        ctx.device.cmd_copy_image(
+            cb,
+            source_snapshot.image,
+            source_next.layout(),
+            destination_image,
+            ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &region,
+        );
+        let destination_release = [ash::vk::ImageMemoryBarrier::default()
+            .src_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(ash::vk::AccessFlags::TRANSFER_READ)
+            .old_layout(ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(destination_next.layout())
+            .image(destination_image)
+            .subresource_range(color_subresource_range())];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            ash::vk::PipelineStageFlags::TRANSFER,
+            ash::vk::PipelineStageFlags::TRANSFER,
+            ash::vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &destination_release,
+        );
+        record_guest_copy_plan(
+            ctx,
+            pools,
+            cb,
+            destination_image,
+            destination_next.layout(),
+            &plan,
+        );
+        release_guest_copy_to_host(ctx, cb, &plan);
+        if let Some(pages) = reims_vgpu_memory::GuestWritePages::new(pages) {
+            record_guest_write_debt(pools, GuestWriteSource::RingEntry, &pages);
+        }
+
+        pools.gpu_span_seal_current(ctx, cb);
+        if let Err(error) = ctx
+            .device
+            .end_command_buffer(cb)
+            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ResidentCopyEndCb, e)))
+        {
+            pools.abort_recorded_guest_work();
+            return Err(error);
+        }
+        let cbs = [cb];
+        let timeline = match ctx
+            .submit_guest_work(&cbs, fence)
+            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ResidentCopySubmit, e)))
+        {
+            Ok(timeline) => timeline,
+            Err(error) => {
+                pools.abort_recorded_guest_work();
+                return Err(error);
+            }
+        };
+        let sealed = pools.seal_entry(Vec::new(), Vec::new());
+        pools.finish_entry_async(sealed, timeline, None);
+        pools.wait_entry_fence(ctx, counters, fence)?;
+        pools.registry_mark_ready_with_access(destination, destination_next);
+        pools.registry_note_access(source, source_next);
+    }
+    counters.note_target_read(
+        u64::from(target.width) * u64::from(target.height) * 4,
+        TargetReadDelivery::GuestPagesOnGpu,
+    );
     Ok(())
 }
 
@@ -4956,8 +5184,10 @@ unsafe fn copy_image_level0_to_buffer(
     ctx: &context::DeviceContext,
     pools: &mut pools::ResourcePools,
     counters: &counters::EngineCounters,
+    source: &TargetIdentity,
     snap: &ResidentReadSnapshot,
     plan: &GuestCopyPlan,
+    pages: &[u64],
 ) -> Result<(), DrawError> {
     use crate::telemetry::{note_readback_phase, ReadbackPhase};
     let submit_started = std::time::Instant::now();
@@ -5026,6 +5256,9 @@ unsafe fn copy_image_level0_to_buffer(
     unsafe { record_guest_copy_plan(ctx, pools, cb, snap.image, read_access.layout(), plan) };
     unsafe { pools.readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::BOTTOM_OF_PIPE, 2) };
     unsafe { release_guest_copy_to_host(ctx, cb, plan) };
+    if let Some(pages) = reims_vgpu_memory::GuestWritePages::new(pages) {
+        record_guest_write_debt(pools, GuestWriteSource::ResidentTarget(source), &pages);
+    }
     // The wait this rail no longer takes here.
     //
     // What the stamp needs is that every copy has landed before the guest is

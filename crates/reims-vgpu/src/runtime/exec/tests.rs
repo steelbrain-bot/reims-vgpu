@@ -4084,6 +4084,7 @@ fn render_barriers_preserve_position_and_scope_while_residency_stays_a_noop() {
         }
     }
     impl GuestPageTransferService for BarrierProbe {}
+    impl ResidentCopyService for BarrierProbe {}
     impl CompletionService for BarrierProbe {}
     impl SubmissionBatchService for BarrierProbe {
         fn flush_submission_tail(&self) {

@@ -2633,10 +2633,25 @@ impl ResourcePools {
     /// one holder's pin on another's behalf. Silent saturation is what would let
     /// that land as a rare wrong frame instead of a log line.
     pub(crate) fn pin_resident_target(&mut self, identity: &TargetIdentity, pinned: bool) -> bool {
+        self.pin_resident_target_with_readiness(identity, pinned, true)
+    }
+
+    /// Pin a complete-overwrite destination without claiming that its old
+    /// contents are readable. Queue acceptance publishes the new contents.
+    pub(crate) fn pin_resident_target_for_write(&mut self, identity: &TargetIdentity) -> bool {
+        self.pin_resident_target_with_readiness(identity, true, false)
+    }
+
+    fn pin_resident_target_with_readiness(
+        &mut self,
+        identity: &TargetIdentity,
+        pinned: bool,
+        require_ready: bool,
+    ) -> bool {
         let Some(slot) = self.shared.registry.get_mut(identity) else {
             return false;
         };
-        if pinned && (!slot.content_ready || slot.resource_released) {
+        if pinned && ((require_ready && !slot.content_ready) || slot.resource_released) {
             return false;
         }
         if !pinned && slot.pin_count == 0 {
@@ -3833,6 +3848,21 @@ pub(super) mod pin_count_tests {
         pools.shared.registry.insert(id.clone(), dummy_slot(false));
         assert!(!pools.pin_resident_target(&id, true), "not-ready slot");
         assert_eq!(pools.shared.registry.get(&id).unwrap().pin_count, 0);
+    }
+
+    #[test]
+    fn complete_overwrite_pin_does_not_publish_unwritten_contents() {
+        let mut pools = ResourcePools::new();
+        let id = pinned_identity();
+        pools.shared.registry.insert(id.clone(), dummy_slot(false));
+
+        assert!(pools.pin_resident_write_for_entry(&id));
+        let slot = pools.shared.registry.get(&id).unwrap();
+        assert!(!slot.content_ready);
+        assert_eq!(slot.pin_count, 1);
+
+        let sealed = pools.seal_entry(Vec::new(), Vec::new());
+        assert_eq!(sealed.cleanup.unpin_residents, vec![id]);
     }
 
     #[test]

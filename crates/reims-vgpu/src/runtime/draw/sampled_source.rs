@@ -268,6 +268,122 @@ pub(super) fn sampled_texture_descriptor<M: HostMemory>(
 /// The currency ladder distinguishes an engine allocation from a resident over
 /// the guest allocation. A guest write stales the former; it updates the same
 /// bytes in the latter and changes the next Vulkan dependency to `HOST_WRITE`.
+struct IOSurfaceResidentCurrency {
+    identity: crate::model::TargetIdentity,
+    read: reims_vgpu_core::ResidentReadPlan,
+    ready: bool,
+    current: bool,
+}
+
+fn iosurface_resident_currency(
+    state: &mut Device,
+    resource: Option<&std::sync::Arc<crate::model::TaskResource>>,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+    resident_identity: Option<crate::model::TargetIdentity>,
+) -> IOSurfaceResidentCurrency {
+    let resident_id = resident_identity.unwrap_or_else(|| {
+        crate::runtime::present_identity::surface_identity(state, mapping_id, width, height)
+    });
+    let resident_read = state.executor.resident_read_plan(&resident_id);
+    let resident_backing = resource
+        .filter(|resource| resource_type_owns_surface_resident(resource.entry().kind))
+        .map(|resource| {
+            state
+                .executor
+                .retain_resident_resource(resource.lifetime_ref(), &resident_id)
+        })
+        .unwrap_or(resident_read.backing);
+    let resident_ready = resident_backing != reims_vgpu_core::ResidentContentBacking::NotReady;
+    if resident_ready {
+        crate::runtime::drain::note_store_route(match resident_backing {
+            reims_vgpu_core::ResidentContentBacking::GuestAllocation => {
+                "iosurfacesample_ready_guest_allocation"
+            }
+            reims_vgpu_core::ResidentContentBacking::DeviceAllocation => {
+                "iosurfacesample_ready_device_allocation"
+            }
+            reims_vgpu_core::ResidentContentBacking::NotReady => {
+                unreachable!("resident_ready excludes this arm")
+            }
+        });
+    }
+    let mapping_epoch = state
+        .surfaces
+        .mappings
+        .get(&mapping_id)
+        .map(|mapping| mapping.content.surface_epoch);
+    let mut resident_epoch = resident_ready
+        .then_some(resident_read.content_epoch)
+        .flatten();
+    if let Some(epoch) = mapping_epoch.filter(|epoch| {
+        resident_backing == reims_vgpu_core::ResidentContentBacking::GuestAllocation
+            && Some(*epoch) != resident_epoch
+    }) {
+        if state
+            .executor
+            .note_resident_guest_write(&resident_id, epoch)
+        {
+            resident_epoch = Some(epoch);
+            note_iosurface_texture_sample_rung("iosurfacerung_guest_allocation_resynced");
+        } else {
+            crate::observe::fail(format!(
+                "iosurface_sample_fail reason=guest_allocation_resync_refused mapping={mapping_id} epoch={epoch}"
+            ));
+        }
+    }
+    IOSurfaceResidentCurrency {
+        identity: resident_id,
+        read: resident_read,
+        ready: resident_ready,
+        current: resident_ready
+            && iosurface_texture_resident_is_current(mapping_epoch, resident_epoch),
+    }
+}
+
+pub(crate) fn compute_iosurface_resident_sample<M: HostMemory + HostOps>(
+    state: &mut Device,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+) -> Option<crate::model::TargetIdentity> {
+    let resource = objects::resolve_resource(state, host, task_id, texture_ref).ok();
+    let plane_identity = resource
+        .as_ref()
+        .filter(|resource| resource.entry().kind == ObjectKind::IOSurfacePlaneView)
+        .and_then(|resource| match objects::decoded_resource(resource) {
+            Ok(crate::runtime::decode::resource::Descriptor::IOSurfacePlaneView(descriptor)) => {
+                descriptor.view
+            }
+            _ => None,
+        })
+        .and_then(|view| {
+            reims_vgpu_core::pixel_format::store_texel_order(view.pixel_format).map(|format| {
+                crate::runtime::present_identity::surface_plane_identity(
+                    state,
+                    mapping_id,
+                    view.plane_index,
+                    width,
+                    height,
+                    format,
+                )
+            })
+        });
+    let currency = iosurface_resident_currency(
+        state,
+        resource.as_ref(),
+        mapping_id,
+        width,
+        height,
+        plane_identity,
+    );
+    currency.current.then_some(currency.identity)
+}
+
 pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     state: &mut Device,
     host: &mut M,
@@ -497,11 +613,13 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         if let Some(m) = state.surfaces.mappings.get(&mid) {
             if m.has_geometry() && m.width_or_zero() > 0 && m.height_or_zero() > 0 {
                 let (w, h) = (m.width_or_zero(), m.height_or_zero());
+                let declared_format = m.format_or_zero();
                 // Compute the resident-surface identity once and reuse it for
                 // both the readiness check and the direct bind.
-                let resident_id =
-                    crate::runtime::present_identity::surface_identity(state, mid, w, h);
-                let resident_read = state.executor.resident_read_plan(&resident_id);
+                let currency =
+                    iosurface_resident_currency(state, resolved_resource.as_ref(), mid, w, h, None);
+                let resident_id = currency.identity;
+                let resident_read = currency.read;
                 // `content_ready` only. The obvious strengthening — also require
                 // the resident's `content_epoch` to match the mapping's, as the
                 // attachment LOAD elision does — was tried and reverted, because
@@ -517,70 +635,11 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // change. What guards this rung today is the guest-write witness
                 // below, which is the witness the LOAD elision's epoch pair
                 // cannot supply anyway.
-                let resident_backing = resolved_resource
-                    .as_ref()
-                    .filter(|resource| resource_type_owns_surface_resident(resource.entry().kind))
-                    .map(|resource| {
-                        state
-                            .executor
-                            .retain_resident_resource(resource.lifetime_ref(), &resident_id)
-                    })
-                    // An unclassified ref has no resource object to own a
-                    // lease. Keep its existing query path so compatibility
-                    // traffic still reaches the copying rails.
-                    .unwrap_or(resident_read.backing);
-                let resident_ready =
-                    resident_backing != reims_vgpu_core::ResidentContentBacking::NotReady;
-                if resident_ready {
-                    crate::runtime::drain::note_store_route(match resident_backing {
-                        reims_vgpu_core::ResidentContentBacking::GuestAllocation => {
-                            "iosurfacesample_ready_guest_allocation"
-                        }
-                        reims_vgpu_core::ResidentContentBacking::DeviceAllocation => {
-                            "iosurfacesample_ready_device_allocation"
-                        }
-                        reims_vgpu_core::ResidentContentBacking::NotReady => {
-                            unreachable!("resident_ready excludes this arm")
-                        }
-                    });
-                }
+                let resident_ready = currency.ready;
                 // The serialized validity quad advances the mapping epoch when
                 // the guest declares a CPU write. A resident is current only
                 // when its Store stamp still equals that contract-owned epoch.
-                let mapping_epoch = state
-                    .surfaces
-                    .mappings
-                    .get(&mid)
-                    .map(|mapping| mapping.content.surface_epoch);
-                let mut resident_epoch = resident_ready
-                    .then_some(resident_read.content_epoch)
-                    .flatten();
-                // A guest write does not stale an image that *is* the guest
-                // allocation. It changes those same bytes. Publish the new
-                // epoch to that representation and change its synchronization
-                // source to HOST_WRITE so the next sampled bind emits the
-                // required availability dependency instead of importing a
-                // second alias over the same memory.
-                if let Some(epoch) = mapping_epoch.filter(|epoch| {
-                    resident_backing == reims_vgpu_core::ResidentContentBacking::GuestAllocation
-                        && Some(*epoch) != resident_epoch
-                }) {
-                    if state
-                        .executor
-                        .note_resident_guest_write(&resident_id, epoch)
-                    {
-                        resident_epoch = Some(epoch);
-                        note_iosurface_texture_sample_rung(
-                            "iosurfacerung_guest_allocation_resynced",
-                        );
-                    } else {
-                        crate::observe::fail(format!(
-                            "iosurface_sample_fail reason=guest_allocation_resync_refused mapping={mid} epoch={epoch}"
-                        ));
-                    }
-                }
-                let resident_current = resident_ready
-                    && iosurface_texture_resident_is_current(mapping_epoch, resident_epoch);
+                let resident_current = currency.current;
 
                 // A bind whose view remaps channels cannot take a resident
                 // directly — the engine hands the swizzle to the image view and
@@ -590,10 +649,10 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     note_iosurface_texture_sample_rung("iosurfacerung_resident_swizzled");
                 } else if resident_current {
                     note_iosurface_texture_sample_rung("iosurfacerung_resident");
-                    let declared = if m.format_or_zero() == 0 {
+                    let declared = if declared_format == 0 {
                         pixel_format::MTL_FORMAT_BGRA8_UNORM
                     } else {
-                        m.format_or_zero()
+                        declared_format
                     };
                     let format = pixel_format::sampled_image_format(declared)?;
                     return Some((w, h, mid, SampledSourceRequest::Target(resident_id, format)));

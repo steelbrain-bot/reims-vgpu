@@ -273,6 +273,8 @@ pub enum ComputeSampledImageSource {
     Bytes(Vec<u8>),
     /// Exact bounded guest allocation/window.
     GuestPages(GuestRunSource),
+    /// A render/blit target whose authoritative image is already resident.
+    TargetResident(crate::TargetIdentity),
     /// Prior storage output copied device-locally for this sampled bind.
     Resident(ComputeResidentSampleBind),
 }

@@ -1883,8 +1883,9 @@ pub(crate) struct NonPinnedTotals {
 /// alone has to state what it is waiting for.
 ///
 /// The enum is closed because the rails that touch a resident are: a draw's
-/// render pass, an MRT secondary's render pass, a resident sample, and the
-/// three transfer reads (present blit, guest-page readback, GPU seed source).
+/// render pass, an MRT secondary's render pass, graphics and compute resident
+/// samples, and the three transfer reads (present blit, guest-page readback,
+/// GPU seed source).
 /// Every one of them ends in one of these variants, which is what lets
 /// [`Self::source_scope`] be exact rather than a blunt `ALL_COMMANDS` union
 /// over every write a resident could conceivably carry.
@@ -1904,6 +1905,8 @@ pub(crate) enum ResidentAccess {
     ColorFeedback(vk::ImageLayout),
     /// A draw sampled it.
     ShaderRead(vk::ImageLayout),
+    /// A compute dispatch sampled it.
+    ComputeRead(vk::ImageLayout),
     /// A transfer read it: a present blit, a guest-page readback, a GPU seed
     /// copy, or this draw's own copy-on-sample snapshot.
     TransferRead(vk::ImageLayout),
@@ -1965,6 +1968,7 @@ impl ResidentAccess {
             | Self::ColorFeedback(_)
             | Self::ShaderRead(_)
             | Self::TransferRead(_) => true,
+            Self::ComputeRead(_) => false,
         }
     }
 
@@ -1973,15 +1977,20 @@ impl ResidentAccess {
         Self::TransferRead(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
     }
 
+    pub(crate) const fn compute_read() -> Self {
+        Self::ComputeRead(vk::ImageLayout::GENERAL)
+    }
+
     /// Where the image is — the `old_layout` a barrier over it must name.
     pub(crate) fn layout(self) -> vk::ImageLayout {
         match self {
             Self::Untouched => vk::ImageLayout::UNDEFINED,
             Self::HostWrite(layout) => layout,
             Self::ColorWrite(layout) => layout,
-            Self::ColorFeedback(layout) | Self::ShaderRead(layout) | Self::TransferRead(layout) => {
-                layout
-            }
+            Self::ColorFeedback(layout)
+            | Self::ShaderRead(layout)
+            | Self::ComputeRead(layout)
+            | Self::TransferRead(layout) => layout,
         }
     }
 
@@ -2025,11 +2034,34 @@ impl ResidentAccess {
                 vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
                 vk::AccessFlags::SHADER_READ,
             ),
+            Self::ComputeRead(_) => (
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::AccessFlags::SHADER_READ,
+            ),
             Self::TransferRead(_) => (
                 vk::PipelineStageFlags::TRANSFER,
                 vk::AccessFlags::TRANSFER_READ,
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod resident_access_tests {
+    use super::*;
+
+    #[test]
+    fn compute_read_carries_compute_scope_and_needs_an_explicit_graphics_dependency() {
+        let access = ResidentAccess::compute_read();
+        assert_eq!(access.layout(), vk::ImageLayout::GENERAL);
+        assert_eq!(
+            access.source_scope(),
+            (
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::AccessFlags::SHADER_READ,
+            )
+        );
+        assert!(!access.covered_by_pass_entry());
     }
 }
 

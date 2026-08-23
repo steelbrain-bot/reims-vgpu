@@ -69,6 +69,7 @@ pub(crate) use resident::*;
 // Guest resource lookup, content-authority resolution, and construction of
 // semantic sampled inputs. Native draw assembly consumes this boundary.
 mod sampled_source;
+pub(crate) use sampled_source::compute_iosurface_resident_sample;
 use sampled_source::*;
 
 // Type-8 texture-view resolution and linear texture loads. Backend-independent,

@@ -1262,7 +1262,7 @@ fn stage_texture_iosurface_plane_view_ref_resolves_surface_mapping() {
     assert!(match &staged.input {
         VulkanTextureInput::GuestPages(source) => source.total_len == 4 * 4 * 4,
         VulkanTextureInput::HostBytes(bytes) => bytes.len() == 4 * 4 * 4,
-        VulkanTextureInput::Resident(_) => false,
+        VulkanTextureInput::Resident(_) | VulkanTextureInput::TargetResident(_) => false,
     });
     assert!(staged.bytes.is_empty(), "the input has one typed owner");
     assert!(matches!(
@@ -1337,7 +1337,7 @@ fn stage_texture_iosurface_plane_view_record_reshapes_stageable_single_plane_sur
     assert!(match &staged.input {
         VulkanTextureInput::GuestPages(source) => source.total_len == 4 * 16,
         VulkanTextureInput::HostBytes(bytes) => bytes.len() == 4 * 16,
-        VulkanTextureInput::Resident(_) => false,
+        VulkanTextureInput::Resident(_) | VulkanTextureInput::TargetResident(_) => false,
     });
     assert!(
         staged.bytes.is_empty(),
@@ -1392,7 +1392,7 @@ fn stage_texture_iosurface_plane_view_record_reshapes_stageable_single_plane_sur
     assert!(match &sampled.input {
         VulkanTextureInput::GuestPages(source) => source.total_len == 4 * 4 * 4,
         VulkanTextureInput::HostBytes(bytes) => bytes.len() == 4 * 4 * 4,
-        VulkanTextureInput::Resident(_) => false,
+        VulkanTextureInput::Resident(_) | VulkanTextureInput::TargetResident(_) => false,
     });
     assert!(sampled.bytes.is_empty(), "the input has one typed owner");
     assert!(matches!(sampled.writeback, TextureWriteback::None));
@@ -1488,7 +1488,7 @@ fn stage_texture_iosurface_plane_view_record_stages_biplanar_y_plane() {
     assert!(match &staged.input {
         VulkanTextureInput::GuestPages(source) => source.total_len == 16 * 8,
         VulkanTextureInput::HostBytes(bytes) => bytes.len() == 16 * 8,
-        VulkanTextureInput::Resident(_) => false,
+        VulkanTextureInput::Resident(_) | VulkanTextureInput::TargetResident(_) => false,
     });
     assert!(
         staged.bytes.is_empty(),

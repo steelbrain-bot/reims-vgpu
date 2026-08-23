@@ -340,7 +340,7 @@ func blitBufferBackedCase(_ w: Int, _ h: Int) {
 // which is what the report says when it fails.
 func blitIOSurfaceSourceCase(_ w: Int, _ h: Int, frames: Int) {
     let label = "srt_blit_iosurface_source_\(w)x\(h)_x\(frames)"
-    claims(label, "sl_gpu_src_via_surface", "sl_gpu_landed")
+    claims(label, "sl_gpu_src_via_surface", "sl_gpu_resident_landed")
     guard let pipe = makeRenderPipeline("heavy_fs", .bgra8Unorm) else {
         report(label, false, "heavy pipeline unavailable for bgra8Unorm"); return
     }

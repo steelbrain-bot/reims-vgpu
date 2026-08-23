@@ -353,32 +353,6 @@ impl QueueOwner {
         Ok(PendingQueueSubmit { receiver })
     }
 
-    pub(crate) fn submit_sync_ordered(
-        &self,
-        command_buffers: &[vk::CommandBuffer],
-        wait_semaphores: &[vk::Semaphore],
-        wait_stages: &[vk::PipelineStageFlags],
-        signal_semaphores: &[vk::Semaphore],
-        fence: vk::Fence,
-    ) -> Result<(), vk::Result> {
-        let submit = OwnedSubmit {
-            command_buffers: command_buffers.to_vec(),
-            wait_semaphores: wait_semaphores.to_vec(),
-            wait_stages: wait_stages.to_vec(),
-            signal_semaphores: signal_semaphores.to_vec(),
-            fence,
-            timeline_wait: None,
-            timeline: None,
-            async_queued_at: None,
-        };
-        self.send_sync(|reply| Request::Submit {
-            submit,
-            reply: Some(reply),
-            async_reply: None,
-        })
-        .map(|_| ())
-    }
-
     /// Enqueue the blit submission and its presentation as one ordered display
     /// transaction, returning before either host call runs.
     ///

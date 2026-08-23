@@ -3313,6 +3313,7 @@ fn a_whole_surface_iosurface_texture_source_reaches_the_destinations_own_guest_p
     const H: u32 = 32;
     const BPR: u64 = 256;
     let src = IOSurfaceTextureBacking {
+        plane: None,
         mapping_id: MappingId::new(7),
         width: W,
         height: H,
@@ -3437,16 +3438,22 @@ fn a_whole_plane_copy_names_an_iosurface_source_by_its_surface_identity() {
     use crate::runtime::executor::*;
     use reims_vgpu_core::{
         CapabilityService, ComputeResidencyService, ExecutionPort, PresentationService,
-        ReadbackService, ResidentService,
+        ReadbackService, ResidentService, TargetIdentity,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     #[derive(Debug)]
     struct ResidentProbe {
         /// Whether a GPU resident exists for whatever identity is asked about.
         present: bool,
+        guest_copy_succeeds: bool,
         asked: AtomicUsize,
+        resident_copies: Mutex<Vec<(u64, TargetIdentity, TargetIdentity)>>,
+        guest_page_copies: AtomicUsize,
+        guest_materializations: Mutex<Vec<TargetIdentity>>,
+        copied_out: AtomicUsize,
+        copy_order: Mutex<Vec<&'static str>>,
     }
 
     impl ExecutionPort for ResidentProbe {
@@ -3480,10 +3487,82 @@ fn a_whole_plane_copy_names_an_iosurface_source_by_its_surface_identity() {
         }
     }
     impl reims_vgpu_core::GuestWriteService for ResidentProbe {}
-    impl ResidentService for ResidentProbe {}
+    impl ResidentService for ResidentProbe {
+        fn stamp_resident_content_epoch(&self, _identity: &TargetIdentity, _epoch: u32) -> bool {
+            true
+        }
+
+        fn note_resident_content_copied_out(&self, _identity: &TargetIdentity) -> bool {
+            self.copied_out.fetch_add(1, Ordering::AcqRel);
+            true
+        }
+    }
     impl ComputeResidencyService for ResidentProbe {}
     impl CapabilityService for ResidentProbe {}
-    impl GuestPageTransferService for ResidentProbe {}
+    impl GuestPageTransferService for ResidentProbe {
+        fn copy_target_to_guest_pages(
+            &self,
+            identity: &TargetIdentity,
+            _target: &reims_vgpu_memory::GuestPageTarget,
+            _pages: &[u64],
+        ) -> Result<(), DrawError> {
+            self.guest_page_copies.fetch_add(1, Ordering::AcqRel);
+            self.guest_materializations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(identity.clone());
+            self.copy_order
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push("guest");
+            if self.guest_copy_succeeds {
+                Ok(())
+            } else {
+                Err(DrawError::Facade(
+                    EngineFacadeDecline::ExecutorServiceUnavailable {
+                        service: "target_to_guest_pages",
+                    },
+                ))
+            }
+        }
+    }
+    impl ResidentCopyService for ResidentProbe {
+        fn copy_resident_level0(
+            &self,
+            owner: reims_vgpu_core::ResourceLifetimeRef,
+            source: &TargetIdentity,
+            destination: &TargetIdentity,
+            _target: &reims_vgpu_memory::GuestPageTarget,
+            _pages: &[u64],
+        ) -> Result<(), DrawError> {
+            self.copy_order
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push("resident");
+            self.resident_copies
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((owner.id(), source.clone(), destination.clone()));
+            self.guest_page_copies.fetch_add(1, Ordering::AcqRel);
+            self.guest_materializations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(destination.clone());
+            self.copy_order
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push("guest");
+            if self.guest_copy_succeeds {
+                Ok(())
+            } else {
+                Err(DrawError::Facade(
+                    EngineFacadeDecline::ExecutorServiceUnavailable {
+                        service: "resident_level0_copy",
+                    },
+                ))
+            }
+        }
+    }
     impl CompletionService for ResidentProbe {}
     impl SubmissionBatchService for ResidentProbe {}
     impl GuestImportService for ResidentProbe {}
@@ -3496,6 +3575,9 @@ fn a_whole_plane_copy_names_an_iosurface_source_by_its_surface_identity() {
     impl WindowPresentationService for ResidentProbe {}
     impl Executor for ResidentProbe {}
 
+    crate::runtime::guest_ram_map::reset();
+    crate::runtime::guest_ram::latch_import_limits(1 << PAGE_SHIFT_ARM64E, 1 << 30, 1 << 30);
+
     // `present: false` is the control. The source owes no writeback debt on
     // either arm, so the only thing that differs is the executor's answer, and
     // therefore the only thing the counters can be reading.
@@ -3503,18 +3585,31 @@ fn a_whole_plane_copy_names_an_iosurface_source_by_its_surface_identity() {
     // IOSurface-backed, so "no resident stands under its identity" is a
     // different answer from "it was never a surface", and the two must not
     // share a counter.
-    for (present, expected_route) in [
-        (true, "sl_gpu_src_via_surface"),
-        (false, "sl_gpu_src_surface_no_resident"),
+    for (present, guest_copy_succeeds, expected_route) in [
+        (true, true, "sl_gpu_src_via_surface"),
+        (true, false, "sl_gpu_src_via_surface"),
+        (false, true, "sl_gpu_src_surface_no_resident"),
     ] {
         let (mut host, mut state) = blit_device();
+        host.stable_map_pages = true;
+        host.strict_linux_map = true;
         install_iosurface_texture(&mut host, &mut state, 2, 20, 0x40);
         install_iosurface_texture(&mut host, &mut state, 3, 21, 0x50);
         let probe = Arc::new(ResidentProbe {
             present,
+            guest_copy_succeeds,
             asked: AtomicUsize::new(0),
+            resident_copies: Mutex::new(Vec::new()),
+            guest_page_copies: AtomicUsize::new(0),
+            guest_materializations: Mutex::new(Vec::new()),
+            copied_out: AtomicUsize::new(0),
+            copy_order: Mutex::new(Vec::new()),
         });
         state.executor = probe.clone();
+
+        let expected_source = crate::runtime::present_identity::surface_identity(&state, 20, 2, 2);
+        let expected_destination =
+            crate::runtime::present_identity::surface_identity(&state, 21, 2, 2);
 
         let src_pixels: [u8; 16] = [
             0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, // row 0
@@ -3535,6 +3630,8 @@ fn a_whole_plane_copy_names_an_iosurface_source_by_its_surface_identity() {
         ));
 
         let before = store_route_count(expected_route);
+        let resident_before = store_route_count("sl_gpu_resident_landed");
+        let page_before = store_route_count("sl_gpu_landed");
         let other = store_route_count(if present {
             "sl_gpu_src_surface_no_resident"
         } else {
@@ -3570,6 +3667,88 @@ fn a_whole_plane_copy_names_an_iosurface_source_by_its_surface_identity() {
             "present={present} must not also route through the other account"
         );
 
+        let expected_owner = state
+            .task_objects
+            .resources
+            .get(1, 3)
+            .expect("the destination resource must own the in-flight copy")
+            .lifetime_ref()
+            .id();
+
+        let resident_copies = probe
+            .resident_copies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if present && guest_copy_succeeds {
+            assert_eq!(
+                resident_copies.as_slice(),
+                &[(
+                    expected_owner,
+                    expected_source.clone(),
+                    expected_destination.clone(),
+                )],
+                "the accepted copy must name both exact semantic residents and the destination lifetime"
+            );
+            assert_eq!(probe.guest_page_copies.load(Ordering::Acquire), 1);
+            assert_eq!(
+                probe
+                    .guest_materializations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_slice(),
+                &[expected_destination.clone()],
+                "canonical guest pages must be materialized from the destination resident"
+            );
+            assert_eq!(probe.copied_out.load(Ordering::Acquire), 1);
+            assert_eq!(
+                probe
+                    .copy_order
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_slice(),
+                &["resident", "guest"],
+                "the successful resident and guest placements must retain queue order"
+            );
+            assert_eq!(
+                store_route_count("sl_gpu_resident_landed"),
+                resident_before + 1
+            );
+            assert_eq!(store_route_count("sl_gpu_landed"), page_before);
+            continue;
+        }
+        if present {
+            assert_eq!(resident_copies.len(), 1);
+            assert_eq!(resident_copies[0].0, expected_owner);
+            assert_eq!(resident_copies[0].1, expected_source);
+            assert_eq!(resident_copies[0].2, expected_destination);
+        } else {
+            assert!(resident_copies.is_empty());
+        }
+        drop(resident_copies);
+
+        if present {
+            assert_eq!(probe.guest_page_copies.load(Ordering::Acquire), 2);
+            assert_eq!(
+                probe
+                    .guest_materializations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_slice(),
+                &[expected_destination.clone(), expected_source.clone()],
+                "a declined destination materialization must abandon it before the source fallback"
+            );
+            assert_eq!(probe.copied_out.load(Ordering::Acquire), 0);
+            assert_eq!(
+                probe
+                    .copy_order
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_slice(),
+                &["resident", "guest", "guest"],
+                "the declined transaction must not attempt another resident publication"
+            );
+        }
+
         // The fall-through is the safety property the whole rail rests on: a
         // refused GPU arm loses no pixels.
         let mut back = [0u8; 16];
@@ -3588,4 +3767,6 @@ fn a_whole_plane_copy_names_an_iosurface_source_by_its_surface_identity() {
         ));
         assert_eq!(&back[..], &src_pixels[..], "the copy did not land");
     }
+    crate::runtime::guest_ram::forget_import_limits();
+    crate::runtime::guest_ram_map::reset();
 }

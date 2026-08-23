@@ -1643,31 +1643,6 @@ impl DeviceContext {
         }
     }
 
-    pub(crate) unsafe fn submit_queue_work(
-        &self,
-        command_buffers: &[vk::CommandBuffer],
-        wait_semaphores: &[vk::Semaphore],
-        wait_stages: &[vk::PipelineStageFlags],
-        signal_semaphores: &[vk::Semaphore],
-        fence: vk::Fence,
-    ) -> Result<(), vk::Result> {
-        if let Some(owner) = self.queue_owner.as_ref() {
-            return owner.submit_sync_ordered(
-                command_buffers,
-                wait_semaphores,
-                wait_stages,
-                signal_semaphores,
-                fence,
-            );
-        }
-        let info = vk::SubmitInfo::default()
-            .wait_semaphores(wait_semaphores)
-            .wait_dst_stage_mask(wait_stages)
-            .command_buffers(command_buffers)
-            .signal_semaphores(signal_semaphores);
-        unsafe { self.device.queue_submit(self.queue(), &[info], fence) }
-    }
-
     /// Submit one window blit and present the image it signals as a single
     /// ordered display transaction.
     ///
