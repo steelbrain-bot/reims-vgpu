@@ -190,6 +190,21 @@ impl<T, M> TaskReferenceStates<T, M> {
             .map(|state| state.id)
     }
 
+    /// Every live generational identity owned by one task.
+    ///
+    /// Task teardown consumers need the identities, not only a count: backend
+    /// residents are keyed by these generations and must not survive into a
+    /// later task that reuses the same serializer references.
+    pub fn identities_for_task(&self, task_id: u32) -> Vec<ResourceId<M>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values
+            .iter()
+            .filter_map(|(&(task, _), state)| (task == TaskId::new(task_id)).then_some(state.id))
+            .collect()
+    }
+
     pub fn delete(&self, task_id: u32, reference: SerializerRef<M>) -> bool {
         let mut registry = self
             .0
@@ -249,6 +264,9 @@ mod tests {
         let reference = SerializerRef::new(4);
         let first = states.register(1, reference, Arc::new("first".to_owned()));
         let first_id = states.identity(1, reference).unwrap();
+        let other_task_ref = SerializerRef::new(8);
+        states.register(2, other_task_ref, Arc::new("other".to_owned()));
+        assert_eq!(states.identities_for_task(1), vec![first_id]);
         let ignored = states.register(1, reference, Arc::new("ignored".to_owned()));
         assert!(Arc::ptr_eq(&first, &ignored));
 
@@ -258,5 +276,10 @@ mod tests {
         assert_ne!(states.identity(1, reference), Some(first_id));
         assert_eq!(states.delete_task(1), 1);
         assert!(!states.contains(1, reference));
+        assert!(states.identities_for_task(1).is_empty());
+        assert_eq!(
+            states.identities_for_task(2),
+            vec![states.identity(2, other_task_ref).unwrap()]
+        );
     }
 }

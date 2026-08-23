@@ -232,6 +232,43 @@ impl ComputeResidencyLedger {
         });
     }
 
+    fn retire_where(
+        &mut self,
+        mut predicate: impl FnMut(&ComputeStorageResidencyKey) -> bool,
+    ) -> Vec<ComputeStorageResidencyKey> {
+        let retired: Vec<_> = self
+            .generations
+            .keys()
+            .filter(|key| predicate(key))
+            .copied()
+            .collect();
+        for key in &retired {
+            self.generations.remove(key);
+        }
+        retired
+    }
+
+    /// Withdraw residents owned by one resource generation.
+    pub fn retire_resource(
+        &mut self,
+        resource: ResourceId<ResourceObject>,
+    ) -> Vec<ComputeStorageResidencyKey> {
+        self.retire_where(|key| key.resource() == Some(resource))
+    }
+
+    /// Withdraw residents representing one exact storage origin.
+    pub fn retire_origin(
+        &mut self,
+        origin: ComputeStorageOrigin,
+    ) -> Vec<ComputeStorageResidencyKey> {
+        self.retire_where(|key| key.origin == origin)
+    }
+
+    /// Withdraw every resident owned by one heap generation.
+    pub fn retire_heap(&mut self, heap: ResourceId<HeapObject>) -> Vec<ComputeStorageResidencyKey> {
+        self.retire_where(|key| key.heap() == Some(heap))
+    }
+
     pub fn len(&self) -> usize {
         self.generations.len()
     }
@@ -348,5 +385,33 @@ mod tests {
 
         assert_eq!(ledger.generation(&old), Some(7));
         assert_eq!(ledger.generation(&replacement), None);
+    }
+
+    #[test]
+    fn typed_lifetime_retirement_withdraws_only_its_residents() {
+        let heap = reims_vgpu_protocol::ResourceId::new(9, 1);
+        let other_heap = reims_vgpu_protocol::ResourceId::new(9, 2);
+        let allocation = reims_vgpu_protocol::ResourceId::new(4, 1);
+        let sibling_allocation = reims_vgpu_protocol::ResourceId::new(5, 1);
+        let allocation_key =
+            ComputeStorageResidencyKey::heap_allocation(heap, allocation, 4, 4, 0x50);
+        let sibling_key =
+            ComputeStorageResidencyKey::heap_allocation(heap, sibling_allocation, 4, 4, 0x50);
+        let placement_key = ComputeStorageResidencyKey::heap_placement(heap, 0, 64, 4, 4, 0x50);
+        let other_heap_key =
+            ComputeStorageResidencyKey::heap_placement(other_heap, 0, 64, 4, 4, 0x50);
+        let mut ledger = ComputeResidencyLedger::default();
+        for key in [allocation_key, sibling_key, placement_key, other_heap_key] {
+            ledger.publish(key, 3);
+        }
+
+        assert_eq!(ledger.retire_resource(allocation), vec![allocation_key]);
+        assert_eq!(
+            ledger.retire_origin(placement_key.origin),
+            vec![placement_key]
+        );
+        assert_eq!(ledger.retire_heap(heap), vec![sibling_key]);
+        assert_eq!(ledger.len(), 1);
+        assert!(ledger.contains(&other_heap_key));
     }
 }
