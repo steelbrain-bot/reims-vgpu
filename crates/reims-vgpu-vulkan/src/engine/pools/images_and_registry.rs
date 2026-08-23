@@ -3830,6 +3830,25 @@ mod heap_image_definition_tests {
         );
         assert_eq!(counters.snapshot().allocs, 1);
 
+        pools.mark_compute_resident_sampled(&bgra_identity);
+        let rgba_state = pools.heap_placement_resident_state(&rgba_identity).unwrap();
+        assert_eq!(
+            rgba_state,
+            (
+                4,
+                ResidentAccess::ShaderRead(vk::ImageLayout::GENERAL),
+                true
+            ),
+            "sampling through one view moves the shared image state"
+        );
+        pools.mark_resident_storage_image(&bgra_identity, 5);
+        assert_eq!(
+            pools.heap_placement_resident_state(&rgba_identity),
+            Some((5, ResidentAccess::transfer_read(), true)),
+            "writing through one view advances every alias"
+        );
+        assert_eq!(pools.shared.compute_storage_sole_copy.count, 1);
+
         let reshaped_identity =
             ComputeStorageResidencyKey::heap_placement(heap, 0, 1 << 20, 32, 64, 0x46);
         let reshaped_key = StorageImageKey {
@@ -3868,6 +3887,11 @@ mod heap_image_definition_tests {
             .unwrap();
         unsafe { pools.dispose(&ctx.device, rgba.slot.deferred()) };
         assert_eq!(pools.shared.heap_placement_memory.len(), 1);
+        assert_eq!(
+            pools.compute_resident_generation(&rgba_identity),
+            Some(5),
+            "a retired view resolves the surviving range authority"
+        );
         let bgra = pools
             .remove_compute_storage_resident(&bgra_identity)
             .unwrap();
