@@ -2722,13 +2722,13 @@ fn buffer_texture_placement<M: HostMemory + HostOps>(
         // must not confuse them.
         texture_ref: bound_ref,
         storage_ref: record.buffer_ref,
-        allocation_gva,
-        allocation_size,
-        gva,
-        declared_format,
-        width: declaration.width,
-        height: declaration.height,
-        row_stride,
+        allocation_gva: level.base_gva,
+        allocation_size: level.alloc_size,
+        gva: level.base_gva + level.level_offset,
+        declared_format: level.pixel_format,
+        width: level.width,
+        height: level.height,
+        row_stride: level.row_stride,
         sampled_allocation: None,
     })
 }
