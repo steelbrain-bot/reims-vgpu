@@ -452,17 +452,17 @@ fn linear_resident_retires_on_task_and_object_delete() {
     // A pending guest-flush obligation dies with the entry (boot-16 rule:
     // never write guest pages at a lifetime boundary).
     assert!(st.delete_task(6).is_some());
-    assert_eq!(st.host_materializations.queued_linear_residents().len(), 1);
-    let key = st.host_materializations.queued_linear_residents()[0];
+    assert_eq!(st.host_materializations.queued_compute_residents().len(), 1);
+    let key = st.host_materializations.queued_compute_residents()[0];
     assert!(key.is_linear());
     assert_eq!(
         key.linear_window(),
         Some((first_resource, 0x30_2000, 32, 64))
     );
-    crate::runtime::render_writeback::retire_linear_residents(&mut st);
+    crate::runtime::render_writeback::retire_compute_residents(&mut st);
     assert!(st
         .host_materializations
-        .queued_linear_residents()
+        .queued_compute_residents()
         .is_empty());
 
     st.define_task(6, 0x1000, 1);
@@ -470,13 +470,13 @@ fn linear_resident_retires_on_task_and_object_delete() {
     let second_resource = st.register_test_resource(6, 21);
     assert!(note_linear_texture_resident(&mut st, &win, 5));
     assert!(st.delete_object(6, 21));
-    assert_eq!(st.host_materializations.queued_linear_residents().len(), 1);
+    assert_eq!(st.host_materializations.queued_compute_residents().len(), 1);
     assert_eq!(
-        st.host_materializations.queued_linear_residents()[0].resource(),
+        st.host_materializations.queued_compute_residents()[0].resource(),
         Some(second_resource)
     );
     // Non-resident entries retire nothing.
-    let _ = st.host_materializations.take_linear_residents();
+    let _ = st.host_materializations.take_compute_residents();
     let px = vec![0u8; 4 * 2 * 8];
     st.insert_object(6, 22);
     assert!(store_linear_texture(
@@ -491,7 +491,7 @@ fn linear_resident_retires_on_task_and_object_delete() {
     assert!(st.delete_object(6, 22));
     assert!(st
         .host_materializations
-        .queued_linear_residents()
+        .queued_compute_residents()
         .is_empty());
 }
 

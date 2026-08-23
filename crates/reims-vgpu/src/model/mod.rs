@@ -106,7 +106,7 @@ mod tests {
                 HostReleaseEffect::ReleaseView { ptr, len }
                 | HostReleaseEffect::RetireImportedView { ptr, len, .. } => Some((*ptr, *len)),
                 HostReleaseEffect::RetireGuestImport(_)
-                | HostReleaseEffect::RetireLinearResident(_) => None,
+                | HostReleaseEffect::RetireComputeResident(_) => None,
             })
             .collect();
         views.sort_unstable();

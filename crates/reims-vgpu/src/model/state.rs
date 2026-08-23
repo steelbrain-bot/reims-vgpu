@@ -411,6 +411,13 @@ pub type SubmissionResourceSnapshot = (
 #[derive(Debug, Default)]
 pub struct TaskResources(Mutex<TaskResourceRegistry>);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HeapResourceRetirement {
+    pub resource: ResourceId<ResourceObject>,
+    /// Present only when this resource is the final owner of the heap range.
+    pub storage_origin: Option<ComputeStorageOrigin>,
+}
+
 impl TaskResources {
     pub fn get(&self, task_id: u32, ref_: u32) -> Option<Arc<TaskResource>> {
         self.0
@@ -896,6 +903,48 @@ impl TaskResources {
         }
     }
 
+    /// The residency identities a heap-texture deletion is entitled to end.
+    ///
+    /// Allocator-owned residents carry the resource generation directly. An
+    /// explicit placement carries only its heap range, so it may be withdrawn
+    /// only when the deleted resource is that storage node's final owner.
+    pub(crate) fn heap_resource_retirement(
+        &self,
+        task_id: u32,
+        texture_ref: u32,
+    ) -> Option<HeapResourceRetirement> {
+        let registry = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let resource = registry
+            .objects
+            .get(&(task_id, texture_ref))?
+            .semantic_id()?;
+        let node = registry.graph.resource(resource)?;
+        let storage = registry.graph.storage(node.storage?)?;
+        let origin = match storage.backing {
+            reims_vgpu_core::StorageBacking::HeapPlacement {
+                heap,
+                offset,
+                length,
+            } => ComputeStorageOrigin::HeapPlacement {
+                heap,
+                offset: offset.get(),
+                span_end: offset.get().checked_add(length.get())?,
+            },
+            reims_vgpu_core::StorageBacking::HeapAllocation { heap, allocation } => {
+                ComputeStorageOrigin::HeapAllocation { heap, allocation }
+            }
+            _ => return None,
+        };
+        Some(HeapResourceRetirement {
+            resource,
+            storage_origin: (storage.owners.len() == 1 && storage.owners.contains(&resource))
+                .then_some(origin),
+        })
+    }
+
     /// Resolve the retained buffer allocation behind one buffer-backed texture.
     ///
     /// The child-to-parent graph edge is generational. A deleted and reused raw
@@ -980,6 +1029,40 @@ mod task_resource_graph_tests {
         assert_ne!(first_id.generation(), second_id.generation());
         assert!(resources.resource_node(first_id).is_none());
         assert!(resources.resource_node(second_id).is_some());
+    }
+
+    #[test]
+    fn only_the_last_heap_alias_may_retire_the_shared_storage_origin() {
+        let resources = TaskResources::default();
+        let first = resources.register(4, 9, resource(ObjectKind::TextureView));
+        let alias = resources.register(4, 10, resource(ObjectKind::TextureView));
+        let heap = ResourceId::<HeapObject>::new(7, 3);
+        resources
+            .link_heap_texture(4, 9, heap, Some((0x200, 0x800)))
+            .unwrap();
+        resources
+            .link_heap_texture(4, 10, heap, Some((0x200, 0x800)))
+            .unwrap();
+
+        assert_eq!(
+            resources.heap_resource_retirement(4, 9),
+            Some(HeapResourceRetirement {
+                resource: first.semantic_id().unwrap(),
+                storage_origin: None,
+            })
+        );
+        assert!(resources.delete(4, 9));
+        assert_eq!(
+            resources.heap_resource_retirement(4, 10),
+            Some(HeapResourceRetirement {
+                resource: alias.semantic_id().unwrap(),
+                storage_origin: Some(ComputeStorageOrigin::HeapPlacement {
+                    heap,
+                    offset: 0x200,
+                    span_end: 0xa00,
+                }),
+            })
+        );
     }
 
     #[test]
@@ -3807,7 +3890,7 @@ pub enum HostReleaseEffect {
         ptr: usize,
         len: usize,
     },
-    RetireLinearResident(ComputeStorageResidencyKey),
+    RetireComputeResident(ComputeStorageResidencyKey),
 }
 
 /// Semantic state observed at a reset boundary before namespaces are rebuilt.
@@ -3921,14 +4004,14 @@ impl PendingHostReleases {
         }
     }
 
-    fn retire_linear_resident(&mut self, identity: ComputeStorageResidencyKey) {
+    fn retire_compute_resident(&mut self, identity: ComputeStorageResidencyKey) {
         self.effects
-            .push(HostReleaseEffect::RetireLinearResident(identity));
+            .push(HostReleaseEffect::RetireComputeResident(identity));
     }
 
-    fn take_linear_residents(&mut self) -> Vec<ComputeStorageResidencyKey> {
+    fn take_compute_residents(&mut self) -> Vec<ComputeStorageResidencyKey> {
         self.take_matching(|effect| match effect {
-            HostReleaseEffect::RetireLinearResident(identity) => Some(identity),
+            HostReleaseEffect::RetireComputeResident(identity) => Some(identity),
             HostReleaseEffect::RetireGuestImport(_)
             | HostReleaseEffect::RetireImportedView { .. }
             | HostReleaseEffect::ReleaseView { .. } => None,
@@ -3942,7 +4025,7 @@ impl PendingHostReleases {
             HostReleaseEffect::RetireGuestImport(_)
             | HostReleaseEffect::RetireImportedView { .. }
             | HostReleaseEffect::ReleaseView { .. } => Some(effect),
-            HostReleaseEffect::RetireLinearResident(_) => None,
+            HostReleaseEffect::RetireComputeResident(_) => None,
         });
         let mut imports = Vec::new();
         let mut views = Vec::new();
@@ -3951,17 +4034,17 @@ impl PendingHostReleases {
                 HostReleaseEffect::RetireGuestImport(_)
                 | HostReleaseEffect::RetireImportedView { .. } => imports.push(effect),
                 HostReleaseEffect::ReleaseView { .. } => views.push(effect),
-                HostReleaseEffect::RetireLinearResident(_) => unreachable!(),
+                HostReleaseEffect::RetireComputeResident(_) => unreachable!(),
             }
         }
         imports.extend(views);
         imports
     }
 
-    fn has_linear_residents(&self) -> bool {
+    fn has_compute_residents(&self) -> bool {
         self.effects
             .iter()
-            .any(|effect| matches!(effect, HostReleaseEffect::RetireLinearResident(_)))
+            .any(|effect| matches!(effect, HostReleaseEffect::RetireComputeResident(_)))
     }
 
     #[cfg(test)]
@@ -3972,7 +4055,7 @@ impl PendingHostReleases {
                 HostReleaseEffect::ReleaseView { ptr, len }
                 | HostReleaseEffect::RetireImportedView { ptr, len, .. } => Some((ptr, len)),
                 HostReleaseEffect::RetireGuestImport(_)
-                | HostReleaseEffect::RetireLinearResident(_) => None,
+                | HostReleaseEffect::RetireComputeResident(_) => None,
             })
             .collect()
     }
@@ -3985,17 +4068,17 @@ impl PendingHostReleases {
                 HostReleaseEffect::RetireGuestImport(import) => Some(import),
                 HostReleaseEffect::RetireImportedView { import, .. } => Some(import),
                 HostReleaseEffect::ReleaseView { .. }
-                | HostReleaseEffect::RetireLinearResident(_) => None,
+                | HostReleaseEffect::RetireComputeResident(_) => None,
             })
             .collect()
     }
 
     #[cfg(test)]
-    fn linear_residents(&self) -> Vec<ComputeStorageResidencyKey> {
+    fn compute_residents(&self) -> Vec<ComputeStorageResidencyKey> {
         self.effects
             .iter()
             .filter_map(|effect| match *effect {
-                HostReleaseEffect::RetireLinearResident(identity) => Some(identity),
+                HostReleaseEffect::RetireComputeResident(identity) => Some(identity),
                 HostReleaseEffect::RetireGuestImport(_) | HostReleaseEffect::ReleaseView { .. } => {
                     None
                 }
@@ -4052,16 +4135,16 @@ impl HostMaterializationState {
         self.releases.retire_materialization(view, import);
     }
 
-    pub(crate) fn retire_linear_resident(&mut self, identity: ComputeStorageResidencyKey) {
-        self.releases.retire_linear_resident(identity);
+    pub(crate) fn retire_compute_resident(&mut self, identity: ComputeStorageResidencyKey) {
+        self.releases.retire_compute_resident(identity);
     }
 
-    pub(crate) fn take_linear_residents(&mut self) -> Vec<ComputeStorageResidencyKey> {
-        self.releases.take_linear_residents()
+    pub(crate) fn take_compute_residents(&mut self) -> Vec<ComputeStorageResidencyKey> {
+        self.releases.take_compute_residents()
     }
 
-    pub(crate) fn has_linear_residents(&self) -> bool {
-        self.releases.has_linear_residents()
+    pub(crate) fn has_compute_residents(&self) -> bool {
+        self.releases.has_compute_residents()
     }
 
     pub(crate) fn take_host_view_effects(&mut self) -> Vec<HostReleaseEffect> {
@@ -4130,8 +4213,8 @@ impl HostMaterializationState {
     }
 
     #[cfg(test)]
-    pub(crate) fn queued_linear_residents(&self) -> Vec<ComputeStorageResidencyKey> {
-        self.releases.linear_residents()
+    pub(crate) fn queued_compute_residents(&self) -> Vec<ComputeStorageResidencyKey> {
+        self.releases.compute_residents()
     }
 }
 
@@ -4659,7 +4742,7 @@ impl DeviceState {
             return;
         };
         self.host_materializations
-            .retire_linear_resident(ComputeStorageResidencyKey::linear(
+            .retire_compute_resident(ComputeStorageResidencyKey::linear(
                 resource,
                 e.gva,
                 e.row_stride as u32,
@@ -4677,7 +4760,55 @@ impl DeviceState {
         }
     }
 
+    fn retire_compute_residency_keys(
+        &mut self,
+        keys: impl IntoIterator<Item = ComputeStorageResidencyKey>,
+    ) {
+        for key in keys {
+            self.host_materializations.retire_compute_resident(key);
+        }
+    }
+
+    fn retire_heap_identity(&mut self, heap: ResourceId<HeapObject>) {
+        let keys = self.content.compute_residency.retire_heap(heap);
+        self.retire_compute_residency_keys(keys);
+    }
+
+    fn retire_heap_resource(&mut self, task_id: u32, texture_ref: u32) {
+        let Some(retirement) = self
+            .task_objects
+            .resources
+            .heap_resource_retirement(task_id, texture_ref)
+        else {
+            return;
+        };
+        let mut keys = self
+            .content
+            .compute_residency
+            .retire_resource(retirement.resource);
+        if let Some(origin) = retirement.storage_origin {
+            keys.extend(self.content.compute_residency.retire_origin(origin));
+        }
+        self.retire_compute_residency_keys(keys);
+    }
+
+    pub(crate) fn delete_heap(
+        &mut self,
+        task_id: u32,
+        reference: reims_vgpu_protocol::SerializerRef<HeapObject>,
+    ) -> bool {
+        let Some(heap) = self.task_objects.heaps.identity(task_id, reference) else {
+            return false;
+        };
+        self.retire_heap_identity(heap);
+        self.task_objects.heaps.delete(task_id, reference)
+    }
+
     fn retire_task_namespaces(&mut self, task_id: u32) -> TaskNamespaceRetirement {
+        let heaps = self.task_objects.heaps.identities_for_task(task_id);
+        for heap in heaps {
+            self.retire_heap_identity(heap);
+        }
         self.task_objects.retire_task(task_id)
     }
 
@@ -4908,6 +5039,7 @@ impl DeviceState {
         #[cfg(not(test))]
         let removed = false;
         let (texture_removed, linear_removed) = self.invalidate_object_host_copies(task_id, ref_);
+        self.retire_heap_resource(task_id, ref_);
         let resource_removed = self.task_objects.resources.delete(task_id, ref_);
         self.content
             .preconstruction_writes
@@ -6497,5 +6629,65 @@ mod task_lifecycle_effect_tests {
             })
         );
         assert_eq!(state.delete_task(7), None);
+    }
+
+    #[test]
+    fn heap_resource_heap_and_task_deletes_retire_exact_residency_generations() {
+        use reims_vgpu_protocol::ObjectKind;
+
+        let mut state = state();
+        state.define_task(7, 0x4000, 3);
+        let heap_ref = SerializerRef::<HeapObject>::new(41);
+        state.task_objects.heaps.register(7, heap_ref, Arc::new(()));
+        let heap = state.task_objects.heaps.identity(7, heap_ref).unwrap();
+        let texture = state.task_objects.resources.register(
+            7,
+            9,
+            Arc::new(TaskResource::new(
+                ListObjectEntry::new(ObjectKind::TextureView, 0, 0),
+                Arc::from([]),
+            )),
+        );
+        state
+            .task_objects
+            .resources
+            .link_heap_texture(7, 9, heap, None)
+            .unwrap();
+        let resource_key = ComputeStorageResidencyKey::heap_allocation(
+            heap,
+            texture.semantic_id().unwrap(),
+            4,
+            4,
+            0x50,
+        );
+        state.content.compute_residency.publish(resource_key, 3);
+
+        assert!(state.delete_object(7, 9));
+        assert!(!state.content.compute_residency.contains(&resource_key));
+        assert_eq!(
+            state.host_materializations.take_compute_residents(),
+            vec![resource_key]
+        );
+
+        let heap_key = ComputeStorageResidencyKey::heap_placement(heap, 0, 64, 4, 4, 0x50);
+        state.content.compute_residency.publish(heap_key, 4);
+        assert!(state.delete_heap(7, heap_ref));
+        assert!(!state.content.compute_residency.contains(&heap_key));
+        assert_eq!(
+            state.host_materializations.take_compute_residents(),
+            vec![heap_key]
+        );
+
+        state.task_objects.heaps.register(7, heap_ref, Arc::new(()));
+        let replacement = state.task_objects.heaps.identity(7, heap_ref).unwrap();
+        assert_ne!(replacement, heap);
+        let task_key = ComputeStorageResidencyKey::heap_placement(replacement, 0, 64, 4, 4, 0x50);
+        state.content.compute_residency.publish(task_key, 5);
+        assert!(state.delete_task(7).is_some());
+        assert!(!state.content.compute_residency.contains(&task_key));
+        assert_eq!(
+            state.host_materializations.take_compute_residents(),
+            vec![task_key]
+        );
     }
 }

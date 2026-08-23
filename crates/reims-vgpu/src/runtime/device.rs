@@ -147,7 +147,7 @@ impl Device {
                     host.unmap_pages(ptr, len);
                     released += 1;
                 }
-                HostReleaseEffect::RetireLinearResident(_) => unreachable!(),
+                HostReleaseEffect::RetireComputeResident(_) => unreachable!(),
             }
         }
         released + self.release_completed_imported_views(host)

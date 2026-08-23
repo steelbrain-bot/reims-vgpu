@@ -797,8 +797,8 @@ pub fn settle_guest_writes_unless_disjoint(
     }
 }
 
-/// Release the engine residents of linear cache entries whose task or object
-/// the guest deleted this drain.
+/// Release engine compute residents whose resource, heap, or task lifetime the
+/// guest deleted this drain.
 ///
 /// Two releases, and dropping either one is a leak in the opposite direction: an
 /// unpin alone leaves the image holding the only copy of content nothing may
@@ -807,31 +807,15 @@ pub fn settle_guest_writes_unless_disjoint(
 ///
 /// Task teardown means the GPU VA maps are gone, so nothing here writes guest
 /// pages — the deleted object's bytes are not guest work any more.
-pub fn retire_linear_residents(state: &mut Device) {
-    if !state.host_materializations.has_linear_residents() {
+pub fn retire_compute_residents(state: &mut Device) {
+    if !state.host_materializations.has_compute_residents() {
         return;
     }
-    let retired = state.host_materializations.take_linear_residents();
-    // build arms nothing that could have pinned them, so taking the list is the
-    // whole of the work there.
+    let retired = state.host_materializations.take_compute_residents();
     for key in &retired {
         state.executor.unpin_resident_storage(key);
         state.executor.retire_resident_storage_content(key);
-        let crate::model::ComputeStorageOrigin::Linear { resource, gva, .. } = key.origin else {
-            crate::observe::fail(format!(
-                "linear_resident_retired reason=non_linear_identity identity={key:?}"
-            ));
-            continue;
-        };
-        crate::observe::off(format!(
-            "linear_resident_retired resource={} resource_generation={} gva={:#x} {}x{} fmt={:#x}",
-            resource.index(),
-            resource.generation(),
-            gva,
-            key.width,
-            key.height,
-            key.pixel_format
-        ));
+        crate::observe::off(format!("compute_resident_retired identity={key:?}"));
     }
 }
 

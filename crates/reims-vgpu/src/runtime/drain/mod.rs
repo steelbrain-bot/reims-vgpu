@@ -46,6 +46,7 @@ fn note_bb_retired(cause: &'static str, entries: usize) {
 
 fn note_task_namespace_retirement(retired: TaskNamespaceRetirement) {
     for (route, count) in [
+        ("heap_task_deleted", retired.heaps),
         (
             "compute_pipeline_state_task_deleted",
             retired.compute_pipelines,
@@ -356,10 +357,8 @@ fn apply_delete_object(state: &mut Device, channel_id: u32, payload: &[u8], pack
         return;
     }
     if op.opcode() == reims_vgpu_wire::ops::destroy::OPCODE_DELETE_HEAP {
-        let retired = state
-            .task_objects
-            .heaps
-            .delete(task_id, reims_vgpu_protocol::SerializerRef::new(object_ref));
+        let retired =
+            state.delete_heap(task_id, reims_vgpu_protocol::SerializerRef::new(object_ref));
         note_store_route(if retired {
             "heap_deleted"
         } else {
@@ -6115,7 +6114,7 @@ pub fn drain_pending<H: HostMemory + HostOps>(state: &mut Device, host: &mut H) 
     crate::runtime::mapper::flush_retired_views(state, host);
     // Unpin engine residents of linear cache entries dropped by task/object
     // deletes this drain, so they become LRU-evictable instead of leaking.
-    crate::runtime::render_writeback::retire_linear_residents(state);
+    crate::runtime::render_writeback::retire_compute_residents(state);
 }
 
 #[cfg(test)]
