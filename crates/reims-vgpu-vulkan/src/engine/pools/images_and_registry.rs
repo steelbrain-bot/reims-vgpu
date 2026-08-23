@@ -15,6 +15,43 @@ enum StorageImageAllocation {
     Heap,
 }
 
+/// Owns a newly-created image until every fallible admission step succeeds.
+///
+/// Memory-type selection happens after image creation because Vulkan reports
+/// the compatible types through the image's memory requirements. Keeping that
+/// handle under a drop guard makes every refusal and Vulkan error on the path
+/// destroy it, including new `?` exits added between creation and publication.
+struct PendingImage<F: FnOnce(vk::Image)> {
+    image: vk::Image,
+    destroy: Option<F>,
+}
+
+impl<F: FnOnce(vk::Image)> PendingImage<F> {
+    fn new(image: vk::Image, destroy: F) -> Self {
+        Self {
+            image,
+            destroy: Some(destroy),
+        }
+    }
+
+    fn handle(&self) -> vk::Image {
+        self.image
+    }
+
+    fn publish(mut self) -> vk::Image {
+        self.destroy = None;
+        self.image
+    }
+}
+
+impl<F: FnOnce(vk::Image)> Drop for PendingImage<F> {
+    fn drop(&mut self) {
+        if let Some(destroy) = self.destroy.take() {
+            destroy(self.image);
+        }
+    }
+}
+
 fn heap_resident_image_plan(key: StorageImageKey) -> reims_vgpu_core::HeapTextureImagePlan {
     reims_vgpu_core::HeapTextureImagePlan {
         format: reims_vgpu_protocol::SampledImageFormat::linear(
@@ -722,8 +759,13 @@ impl ResourcePools {
             .device
             .create_image(&create_info, None)
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateStorageImage, e)))?;
+        let pending_image = PendingImage::new(image, |image| unsafe {
+            ctx.device.destroy_image(image, None);
+        });
         counters.note_create(CreateSite::StorageImage);
-        let req = ctx.device.get_image_memory_requirements(image);
+        let req = ctx
+            .device
+            .get_image_memory_requirements(pending_image.handle());
         let mt = ctx
             .memory_type_for(req.memory_type_bits, req.size, MemoryClass::DeviceLocal)
             .ok_or({
@@ -754,12 +796,10 @@ impl ResourcePools {
                     && self.reclaim_pools_for_allocation_retry(ctx) > 0 =>
             {
                 alloc(ctx).map_err(|_| {
-                    ctx.device.destroy_image(image, None);
                     DrawError::VkCall(VkCall::new(VkOp::PoolsAllocStorageImage, first))
                 })?
             }
             Err(e) => {
-                ctx.device.destroy_image(image, None);
                 return Err(DrawError::VkCall(VkCall::new(
                     VkOp::PoolsAllocStorageImage,
                     e,
@@ -768,17 +808,16 @@ impl ResourcePools {
         };
         counters.note_alloc();
         ctx.device
-            .bind_image_memory(image, memory, 0)
+            .bind_image_memory(pending_image.handle(), memory, 0)
             .map_err(|e| {
                 ctx.device.free_memory(memory, None);
-                ctx.device.destroy_image(image, None);
                 DrawError::VkCall(VkCall::new(VkOp::PoolsBindStorageImage, e))
             })?;
         let view = ctx
             .device
             .create_image_view(
                 &vk::ImageViewCreateInfo::default()
-                    .image(image)
+                    .image(pending_image.handle())
                     .view_type(vk::ImageViewType::TYPE_2D)
                     .format(format)
                     .subresource_range(color_subresource_range()),
@@ -786,10 +825,10 @@ impl ResourcePools {
             )
             .map_err(|e| {
                 ctx.device.free_memory(memory, None);
-                ctx.device.destroy_image(image, None);
                 DrawError::VkCall(VkCall::new(VkOp::PoolsCreateStorageImageView, e))
             })?;
         counters.note_create(CreateSite::StorageImageView);
+        let image = pending_image.publish();
         let slot = StorageImageSlot {
             image,
             memory,
@@ -3459,6 +3498,25 @@ impl ResourcePools {
 #[cfg(test)]
 mod heap_image_definition_tests {
     use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn an_unpublished_image_is_destroyed_exactly_once() {
+        let destroyed = Cell::new(Vec::new());
+        {
+            let _image = PendingImage::new(vk::Image::from_raw(17), |image| {
+                destroyed.set(vec![image]);
+            });
+        }
+        assert_eq!(destroyed.take(), vec![vk::Image::from_raw(17)]);
+
+        let image = PendingImage::new(vk::Image::from_raw(23), |image| {
+            destroyed.set(vec![image]);
+        })
+        .publish();
+        assert_eq!(image, vk::Image::from_raw(23));
+        assert!(destroyed.take().is_empty());
+    }
 
     #[test]
     fn a_heap_resident_uses_the_same_alias_image_definition_as_its_query() {
