@@ -290,6 +290,25 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     req.colors.first().map(|c| c.target_gva()).unwrap_or(0)
                 ));
             }
+            Ok(M2vDrawSpan::ResidentGvaReadback {
+                submission,
+                identity,
+                visibility_samples: samples,
+            }) => {
+                completed_submission = Some(submission);
+                visibility_samples = samples;
+                let _store_span = StoreCostSpan::new("gva_store_us");
+                note_iosurface_texture_store_route("gva_store_sync");
+                draw_rgba = read_resident_chain(state.executor.as_ref(), req, &identity);
+                crate::observe::line(format!(
+                    "linux_m2v_draw ok resident_gva_readback pipe={} {}x{} gva={:#x} rgba={}",
+                    req.pipeline_ref,
+                    pass_w,
+                    pass_h,
+                    req.colors.first().map(|c| c.target_gva()).unwrap_or(0),
+                    draw_rgba.is_some() as u8
+                ));
+            }
             Ok(M2vDrawSpan::ResidentGvaStore {
                 submission,
                 identity,
@@ -362,35 +381,20 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     note_iosurface_texture_store_route("gva_guest_backed");
                     gva_store_armed = true;
                 } else {
-                    let landed = req.colors.first().is_some_and(|c0| {
-                        crate::runtime::writeback_debt::arm_gva(
-                            state,
-                            host,
-                            req.task_id,
-                            c0,
-                            &identity,
-                            submission,
-                        )
-                    });
-                    if landed {
-                        note_iosurface_texture_store_route("gva_resident_authoritative");
-                        gva_store_armed = true;
-                    } else {
-                        // The copying rail: read the resident the draw just
-                        // rendered into and let the synchronous Store block below
-                        // run exactly as it does for a Store that never skipped its
-                        // readback. `read_resident_chain` fail-logs a lost resident.
-                        note_iosurface_texture_store_route("gva_store_sync");
-                        draw_rgba = read_resident_chain(state.executor.as_ref(), req, &identity);
-                        crate::observe::line(format!(
-                            "linux_m2v_draw ok resident_gva_store pipe={} {}x{} gva={:#x} rgba={}",
-                            req.pipeline_ref,
-                            pass_w,
-                            pass_h,
-                            req.colors.first().map(|c| c.target_gva()).unwrap_or(0),
-                            draw_rgba.is_some() as u8
-                        ));
-                    }
+                    // Planning selected a guest-backed target, but execution
+                    // did not report guest pages. Completion cannot turn that
+                    // missing materialization into deferred authority: publish
+                    // synchronously from the exact resident instead.
+                    note_iosurface_texture_store_route("gva_store_sync");
+                    draw_rgba = read_resident_chain(state.executor.as_ref(), req, &identity);
+                    crate::observe::line(format!(
+                        "linux_m2v_draw ok resident_gva_store pipe={} {}x{} gva={:#x} rgba={}",
+                        req.pipeline_ref,
+                        pass_w,
+                        pass_h,
+                        req.colors.first().map(|c| c.target_gva()).unwrap_or(0),
+                        draw_rgba.is_some() as u8
+                    ));
                 }
             }
             Ok(M2vDrawSpan::ResidentSurfaceStore {
@@ -1549,11 +1553,18 @@ enum M2vDrawSpan {
         identity: crate::model::TargetIdentity,
         visibility_samples: Option<u64>,
     },
-    /// Final/single record of a GVA render Store executed into the registry
-    /// resident with `skip_readback`. A copied resident becomes authoritative
-    /// under a resource-scoped debt; a guest-backed resident has already
-    /// performed the guest Store and publishes its retained footprint. This
-    /// record produced no host pixels in either case.
+    /// Final GVA Store rendered into a copied registry resident. The draw may
+    /// remain in its command-buffer chain, but completion synchronously reads
+    /// this exact identity before the caller publishes pixels to guest pages.
+    ResidentGvaReadback {
+        submission: reims_vgpu_protocol::SubmissionId,
+        identity: crate::model::TargetIdentity,
+        visibility_samples: Option<u64>,
+    },
+    /// Final/single record of a GVA render Store planned against guest-backed
+    /// target memory. A successful direct Store publishes its retained page
+    /// footprint. If execution cannot report those pages, the caller reads this
+    /// exact resident synchronously rather than deferring missing content.
     ///
     /// `identity` is the key the draw registered, carried rather than re-derived
     /// — see [`Self::ResidentSurfaceStore`] for what a second derivation costs.
@@ -2245,6 +2256,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 identity,
                 visibility_samples,
             }),
+            DrawCompletionRoute::ResidentGvaReadback(identity) => {
+                Ok(M2vDrawSpan::ResidentGvaReadback {
+                    submission,
+                    identity,
+                    visibility_samples,
+                })
+            }
             DrawCompletionRoute::ResidentGvaStore(identity) => Ok(M2vDrawSpan::ResidentGvaStore {
                 submission,
                 identity,

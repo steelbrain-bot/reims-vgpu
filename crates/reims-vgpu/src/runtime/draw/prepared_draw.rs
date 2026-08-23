@@ -13,6 +13,7 @@ pub(super) enum DrawCompletionRoute {
     Pixels,
     EffectsOnly,
     ResidentChain(TargetIdentity),
+    ResidentGvaReadback(TargetIdentity),
     ResidentGvaStore(TargetIdentity),
     ResidentSurfaceStore(TargetIdentity),
 }
@@ -23,6 +24,7 @@ impl DrawCompletionRoute {
             Self::Pixels => "pixels",
             Self::EffectsOnly => "effects_only",
             Self::ResidentChain(_) => "resident_chain",
+            Self::ResidentGvaReadback(_) => "resident_gva_readback",
             Self::ResidentGvaStore(_) => "resident_gva_store",
             Self::ResidentSurfaceStore(_) => "resident_surface_store",
         }
@@ -104,9 +106,11 @@ pub(super) fn plan_target_completion(
             super::gva_chain_identity(state.executor.as_ref(), request, gva_allocation_generation)
         {
             executor_request.target_identity = Some(identity.clone());
+            executor_request.skip_readback = true;
             if guest_backing_available {
-                executor_request.skip_readback = true;
                 claim(DrawCompletionRoute::ResidentGvaStore(identity))?;
+            } else {
+                claim(DrawCompletionRoute::ResidentGvaReadback(identity))?;
             }
         }
     }
@@ -428,7 +432,7 @@ mod tests {
     /// pixels. With no guest-backed executor target, the Store therefore owns
     /// a synchronous pixel completion.
     #[test]
-    fn a_gva_store_without_guest_backing_publishes_at_completion() {
+    fn a_gva_store_without_guest_backing_reads_its_exact_resident_at_completion() {
         use reims_vgpu_protocol::pass_action::StoreAction;
 
         let state = Device::new(crate::model::DeviceId(1), crate::model::PAGE_SHIFT_X86);
@@ -468,8 +472,8 @@ mod tests {
         )
         .expect("a GVA Store has one completion route");
 
-        assert!(matches!(route, DrawCompletionRoute::Pixels));
-        assert!(!executor_request.skip_readback);
+        assert!(matches!(route, DrawCompletionRoute::ResidentGvaReadback(_)));
+        assert!(executor_request.skip_readback);
         assert_eq!(executor_request.target_identity, Some(gva(0x1000)));
     }
 }
