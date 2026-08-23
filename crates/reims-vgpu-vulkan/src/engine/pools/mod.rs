@@ -763,23 +763,72 @@ pub(crate) struct PassEcho {
     pub(crate) area: (u32, u32),
 }
 
-/// Exactly what a `VkFramebuffer` is a function of, and therefore what two
+/// Exactly what a `VkFramebuffer` is compatible with, and therefore what two
 /// draws must share to be handed the same one.
 ///
-/// `vkCreateFramebuffer` takes a render pass, an attachment view list and an
-/// extent, and nothing else. So a framebuffer is a pure function of those, and
-/// building a second one for the same triple produces an object indistinguishable
-/// from the first — except that it is a *different handle*, which is precisely
-/// what [`PassEcho`] compares.
-///
-/// Handles are keyed by their raw `u64` rather than by the ash newtype, matching
-/// how `targets` already keys a render pass.
-#[derive(Clone, PartialEq, Eq, Hash)]
+/// Vulkan permits a framebuffer created against one render pass to be used
+/// with any framebuffer-compatible render pass. The normalized compatibility
+/// key therefore belongs here rather than the concrete handle passed at cache
+/// miss creation: load/store actions may select another render-pass object,
+/// but they do not describe another framebuffer.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct AdHocFramebufferKey {
-    pub(crate) render_pass: u64,
+    pub(crate) compatibility: FramebufferCompatibilityKey,
     pub(crate) views: Vec<u64>,
     pub(crate) width: u32,
     pub(crate) height: u32,
+}
+
+pub(crate) struct AdHocFramebufferRequest<'a> {
+    pub(crate) render_pass: vk::RenderPass,
+    pub(crate) compatibility: FramebufferCompatibilityKey,
+    pub(crate) views: &'a [vk::ImageView],
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
+impl AdHocFramebufferKey {
+    fn new(request: &AdHocFramebufferRequest<'_>) -> Self {
+        Self {
+            compatibility: request.compatibility,
+            views: request.views.iter().map(|view| view.as_raw()).collect(),
+            width: request.width,
+            height: request.height,
+        }
+    }
+}
+
+#[cfg(test)]
+mod ad_hoc_framebuffer_key_tests {
+    use super::*;
+    use crate::engine::caches::{ColorLoadKey, DepthAttachKey, PassKey};
+
+    #[test]
+    fn compatible_depth_passes_share_one_framebuffer_identity() {
+        let mut clear = PassKey::single(ColorLoadKey::Clear, vk::Format::B8G8R8A8_UNORM);
+        clear.depth = Some(DepthAttachKey {
+            depth: true,
+            load: ColorLoadKey::Clear,
+            store: true,
+            ..Default::default()
+        });
+        let mut load = clear;
+        load.depth.as_mut().unwrap().load = ColorLoadKey::Load;
+
+        let views = [vk::ImageView::from_raw(41), vk::ImageView::from_raw(42)];
+        let request = |render_pass, key: PassKey| AdHocFramebufferRequest {
+            render_pass,
+            compatibility: key.framebuffer_compatibility(),
+            views: &views,
+            width: 1920,
+            height: 1080,
+        };
+        assert_eq!(
+            AdHocFramebufferKey::new(&request(vk::RenderPass::from_raw(91), clear)),
+            AdHocFramebufferKey::new(&request(vk::RenderPass::from_raw(92), load)),
+            "a Clear-to-Load continuation over the same attachments must keep its framebuffer"
+        );
+    }
 }
 
 /// Which field of a [`PassEcho`] stopped a draw continuing its predecessor's

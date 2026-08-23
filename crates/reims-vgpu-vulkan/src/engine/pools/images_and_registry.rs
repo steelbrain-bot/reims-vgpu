@@ -2711,15 +2711,15 @@ impl ResourcePools {
 
     /// The framebuffer for an attachment shape the target slot does not cache,
     /// created once and handed back to every later draw naming the same render
-    /// pass, views and extent.
+    /// framebuffer-compatible pass, views and extent.
     ///
     /// This is the whole repair for `passdiff_fb`. The previous spelling built one
     /// per draw, and because a framebuffer handle is part of [`super::PassEcho`],
-    /// two consecutive draws of one serialized render encoder — same target, same
-    /// depth resident, same extent — were read as wanting different render pass
-    /// instances. Reuse is not an optimisation Vulkan merely tolerates: the two
-    /// framebuffers agreed on every input `vkCreateFramebuffer` reads, so the
-    /// second was a distinct handle for an identical object.
+    /// two consecutive draws of one serialized render encoder — same target,
+    /// same depth resident, same extent — were read as wanting different render
+    /// pass instances. Load-action changes selected compatible render-pass
+    /// objects and used to split this cache too, even though Vulkan permits the
+    /// first framebuffer with either pass.
     ///
     /// Not bounded by a count, because the population is bounded by what it is
     /// keyed on — the views belong to registry residents and an entry dies with
@@ -2728,25 +2728,23 @@ impl ResourcePools {
     pub(crate) unsafe fn ensure_ad_hoc_framebuffer(
         &mut self,
         ctx: &DeviceContext,
-        render_pass: vk::RenderPass,
-        views: &[vk::ImageView],
-        width: u32,
-        height: u32,
+        request: super::AdHocFramebufferRequest<'_>,
         counters: &EngineCounters,
     ) -> Result<vk::Framebuffer, DrawError> {
-        use ash::vk::Handle;
-        let key = super::AdHocFramebufferKey {
-            render_pass: render_pass.as_raw(),
-            views: views.iter().map(|v| v.as_raw()).collect(),
-            width,
-            height,
-        };
+        let key = super::AdHocFramebufferKey::new(&request);
         if let Some(fb) = self.shared.ad_hoc_framebuffers.get(&key) {
             crate::telemetry::note_route("adhoc_fb_hit");
             return Ok(*fb);
         }
         let fb = unsafe {
-            self.create_mrt_framebuffer(ctx, render_pass, views, width, height, counters)
+            self.create_mrt_framebuffer(
+                ctx,
+                request.render_pass,
+                request.views,
+                request.width,
+                request.height,
+                counters,
+            )
         }?;
         crate::telemetry::note_route("adhoc_fb_miss");
         self.shared.ad_hoc_framebuffers.insert(key, fb);

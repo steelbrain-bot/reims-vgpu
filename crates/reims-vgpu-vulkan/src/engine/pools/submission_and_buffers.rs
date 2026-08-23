@@ -76,9 +76,9 @@ mod pass_echo_delta_order {
     use ash::vk::Handle as _;
 
     /// One echo. `fb` is derived from the pair the way the real framebuffer
-    /// cache derives it — `AdHocFramebufferKey` is `(render pass, views,
-    /// extent)` — so a shape change brings a new handle with it exactly as it
-    /// does on the draw path, which is the whole condition under test.
+    /// cache derives it — `AdHocFramebufferKey` is `(framebuffer compatibility,
+    /// views, extent)` — so a shape change brings a new handle with it exactly
+    /// as it does on the draw path, which is the whole condition under test.
     fn echo(image: u64, variation: bool) -> PassEcho {
         let mut key = PassKey::single(ColorLoadKey::Load, vk::Format::B8G8R8A8_UNORM);
         key.color_input = variation;
@@ -1887,10 +1887,11 @@ impl ResourcePools {
     /// not share a bucket.
     ///
     /// A framebuffer handle cannot separate them. [`super::AdHocFramebufferKey`]
-    /// is `(render pass, views, extent)`, so a shape change *implies* a new
-    /// framebuffer over the very same attachments — asking `fb` first would put
-    /// every shape flip in `passdiff_fb` and leave `passdiff_compat` reading
-    /// zero, which is the informative bucket emptied into the uninformative one.
+    /// is `(framebuffer compatibility, views, extent)`, so a shape change
+    /// *implies* a new framebuffer over the very same attachments — asking `fb`
+    /// first would put every shape flip in `passdiff_fb` and leave
+    /// `passdiff_compat` reading zero, which is the informative bucket emptied
+    /// into the uninformative one.
     /// [`PassEcho::target_image`] has no such coupling: it is what the guest
     /// named, not what this device built from it. So the target is asked
     /// **first**, and it subsumes — a break where the image also moved is a

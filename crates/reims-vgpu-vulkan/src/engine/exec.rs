@@ -4868,10 +4868,13 @@ pub(crate) unsafe fn execute_draw_inner(
             )?;
             let fb = pools.ensure_ad_hoc_framebuffer(
                 ctx,
-                render_pass,
-                &views,
-                framebuffer_width,
-                framebuffer_height,
+                super::pools::AdHocFramebufferRequest {
+                    render_pass,
+                    compatibility: pass_key.framebuffer_compatibility(),
+                    views: &views,
+                    width: framebuffer_width,
+                    height: framebuffer_height,
+                },
                 counters,
             )?;
             if let Some(d) = depth_attachment.as_ref() {
@@ -4920,10 +4923,13 @@ pub(crate) unsafe fn execute_draw_inner(
             )?;
             let fb = pools.ensure_ad_hoc_framebuffer(
                 ctx,
-                render_pass,
-                &views,
-                framebuffer_width,
-                framebuffer_height,
+                super::pools::AdHocFramebufferRequest {
+                    render_pass,
+                    compatibility: pass_key.framebuffer_compatibility(),
+                    views: &views,
+                    width: framebuffer_width,
+                    height: framebuffer_height,
+                },
                 counters,
             )?;
             if let Some(d) = depth_attachment.as_ref() {
