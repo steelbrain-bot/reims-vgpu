@@ -7119,10 +7119,8 @@ pub(crate) unsafe fn execute_draw_inner(
     unsafe { pools.bind_vertex_buffers(&ctx.device, cb, counters, &vertex_bufs) };
     match (&req.indexed, &index_slot) {
         (Some(indexed), Some(ibuf)) => {
-            pools.bind_index_buffer(
-                &ctx.device,
+            ctx.device.cmd_bind_index_buffer(
                 cb,
-                counters,
                 ibuf.buffer,
                 ibuf.offset,
                 crate::translate::raster::vk_index_type(indexed.index_type),

@@ -2013,8 +2013,6 @@ impl ResourcePools {
         self.encoder.cb_graphics.stencil = None;
         self.encoder.cb_graphics.push_layout = None;
         self.encoder.cb_graphics.push_bindings.clear();
-        self.encoder.cb_graphics.vertex_bindings.clear();
-        self.encoder.cb_graphics.index_binding = None;
         self.encoder.cb_guest_visibility = super::CbGuestVisibility::default();
     }
 
@@ -2600,8 +2598,6 @@ impl ResourcePools {
             g.stencil = None;
             g.push_layout = None;
             g.push_bindings.clear();
-            g.vertex_bindings.clear();
-            g.index_binding = None;
         }
         if g.pipeline == Some(pipeline) {
             counters
@@ -2682,7 +2678,7 @@ impl ResourcePools {
     }
 
     /// Record the draw's vertex buffers as maximal consecutive binding runs,
-    /// unless this command buffer already carries the exact requested state.
+    /// preserving every exact `(buffer, offset)` value in the request.
     ///
     /// The guest bulk operation is a pair of parallel buffer/offset arrays.
     /// Vulkan has the same operation but requires consecutive binding numbers,
@@ -2719,31 +2715,24 @@ impl ResourcePools {
                     }),
             );
         super::normalize_vertex_bindings(&mut g.vertex_scratch);
-        let requested_len = g.vertex_scratch.len();
-        if !super::install_vertex_bindings(&mut g.vertex_bindings, &mut g.vertex_scratch) {
-            counters
-                .vertex_buffer_bind_held
-                .fetch_add(requested_len as u64, Ordering::Relaxed);
-            return;
-        }
         counters
             .vertex_buffer_bind_emitted
-            .fetch_add(g.vertex_bindings.len() as u64, Ordering::Relaxed);
+            .fetch_add(g.vertex_scratch.len() as u64, Ordering::Relaxed);
 
         g.vertex_buffers.clear();
         g.vertex_offsets.clear();
         g.vertex_buffers
-            .extend(g.vertex_bindings.iter().map(|entry| entry.buffer));
+            .extend(g.vertex_scratch.iter().map(|entry| entry.buffer));
         g.vertex_offsets
-            .extend(g.vertex_bindings.iter().map(|entry| entry.offset));
+            .extend(g.vertex_scratch.iter().map(|entry| entry.offset));
 
         let mut start = 0;
-        while start < g.vertex_bindings.len() {
-            let end = super::vertex_binding_run_end(&g.vertex_bindings, start);
+        while start < g.vertex_scratch.len() {
+            let end = super::vertex_binding_run_end(&g.vertex_scratch, start);
             unsafe {
                 device.cmd_bind_vertex_buffers(
                     cb,
-                    g.vertex_bindings[start].binding,
+                    g.vertex_scratch[start].binding,
                     &g.vertex_buffers[start..end],
                     &g.vertex_offsets[start..end],
                 )
@@ -2753,46 +2742,6 @@ impl ResourcePools {
                 .fetch_add(1, Ordering::Relaxed);
             start = end;
         }
-    }
-
-    /// Bind the draw's index buffer unless this recording command buffer
-    /// already carries the exact buffer, byte offset and index type.
-    ///
-    /// A non-indexed draw does not call this method and does not disturb the
-    /// binding. Pipeline and render-pass changes do not disturb it either;
-    /// [`Self::bind_graphics_pipeline`] clears it only when a newly recording
-    /// command buffer is observed.
-    ///
-    /// # Safety
-    ///
-    /// `cb` must be the recording command buffer most recently passed to
-    /// [`Self::bind_graphics_pipeline`], and `buffer` must remain alive through
-    /// submission as required by `vkCmdBindIndexBuffer`.
-    pub(in crate::engine) unsafe fn bind_index_buffer(
-        &mut self,
-        device: &ash::Device,
-        cb: vk::CommandBuffer,
-        counters: &EngineCounters,
-        buffer: vk::Buffer,
-        offset: vk::DeviceSize,
-        index_type: vk::IndexType,
-    ) {
-        let g = &mut self.encoder.cb_graphics;
-        let wanted = super::IndexBufferBinding {
-            buffer,
-            offset,
-            index_type,
-        };
-        if !super::install_index_binding(&mut g.index_binding, wanted) {
-            counters
-                .index_buffer_bind_held
-                .fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        unsafe { device.cmd_bind_index_buffer(cb, buffer, offset, index_type) };
-        counters
-            .index_buffer_bind_calls
-            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Scratch in which the next draw normalizes its push-descriptor state.

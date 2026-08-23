@@ -947,10 +947,8 @@ pub(crate) struct CbGraphicsState {
     sc_scratch: Vec<vk::Rect2D>,
     push_scratch: Vec<PushDescriptorBinding>,
     vertex_scratch: Vec<VertexBufferBinding>,
-    vertex_bindings: Vec<VertexBufferBinding>,
     vertex_buffers: Vec<vk::Buffer>,
     vertex_offsets: Vec<vk::DeviceSize>,
-    index_binding: Option<IndexBufferBinding>,
 }
 
 /// One normalized fixed-function vertex-buffer binding.
@@ -959,14 +957,6 @@ struct VertexBufferBinding {
     binding: u32,
     buffer: vk::Buffer,
     offset: vk::DeviceSize,
-}
-
-/// The exact index-buffer state carried by a recording command buffer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct IndexBufferBinding {
-    buffer: vk::Buffer,
-    offset: vk::DeviceSize,
-    index_type: vk::IndexType,
 }
 
 /// Order a bulk bind by binding number. Vertex attributes arrive ordered by
@@ -988,33 +978,6 @@ fn vertex_binding_run_end(bindings: &[VertexBufferBinding], start: usize) -> usi
         end += 1;
     }
     end
-}
-
-/// Install one draw's complete requested vertex-binding list into the command
-/// buffer echo. Returns whether Vulkan must receive the list.
-fn install_vertex_bindings(
-    bound: &mut Vec<VertexBufferBinding>,
-    requested: &mut Vec<VertexBufferBinding>,
-) -> bool {
-    // A draw that consumes no vertex buffers does not unbind the state Vulkan
-    // already carries, so retaining it is both exact and useful to a later draw.
-    if requested.is_empty() || requested == bound {
-        return false;
-    }
-    std::mem::swap(bound, requested);
-    true
-}
-
-/// Install an exact index-buffer binding into the command-buffer echo.
-fn install_index_binding(
-    bound: &mut Option<IndexBufferBinding>,
-    requested: IndexBufferBinding,
-) -> bool {
-    if *bound == Some(requested) {
-        return false;
-    }
-    *bound = Some(requested);
-    true
 }
 
 /// One descriptor value in the normalized order used by a push layout.
@@ -4986,10 +4949,7 @@ mod vertex_binding_bulk_tests {
 
 #[cfg(test)]
 mod dynamic_state_match_tests {
-    use super::{
-        install_index_binding, install_vertex_bindings, push_descriptors_match, scissors_match,
-        viewports_match, IndexBufferBinding, PushDescriptorBinding, VertexBufferBinding,
-    };
+    use super::{push_descriptors_match, scissors_match, viewports_match, PushDescriptorBinding};
     use ash::vk;
     use ash::vk::Handle;
 
@@ -5123,64 +5083,5 @@ mod dynamic_state_match_tests {
             layout,
             &[changed]
         ));
-    }
-
-    fn vertex(binding: u32, buffer: u64, offset: u64) -> VertexBufferBinding {
-        VertexBufferBinding {
-            binding,
-            buffer: vk::Buffer::from_raw(buffer),
-            offset,
-        }
-    }
-
-    #[test]
-    fn vertex_binding_echo_retains_only_the_exact_normalized_request() {
-        let mut bound = vec![vertex(0, 11, 64), vertex(2, 13, 96)];
-        let mut same = bound.clone();
-        assert!(!install_vertex_bindings(&mut bound, &mut same));
-
-        for mut changed in [
-            vec![vertex(1, 11, 64), vertex(2, 13, 96)],
-            vec![vertex(0, 12, 64), vertex(2, 13, 96)],
-            vec![vertex(0, 11, 65), vertex(2, 13, 96)],
-            vec![vertex(0, 11, 64)],
-        ] {
-            let before = changed.clone();
-            assert!(install_vertex_bindings(&mut bound, &mut changed));
-            assert_eq!(bound, before);
-        }
-    }
-
-    #[test]
-    fn a_draw_with_no_vertex_inputs_does_not_disturb_carried_bindings() {
-        let original = vec![vertex(0, 11, 64)];
-        let mut bound = original.clone();
-        let mut empty = Vec::new();
-        assert!(!install_vertex_bindings(&mut bound, &mut empty));
-        assert_eq!(bound, original);
-    }
-
-    fn index(buffer: u64, offset: u64, index_type: vk::IndexType) -> IndexBufferBinding {
-        IndexBufferBinding {
-            buffer: vk::Buffer::from_raw(buffer),
-            offset,
-            index_type,
-        }
-    }
-
-    #[test]
-    fn index_binding_echo_compares_buffer_offset_and_type() {
-        let base = index(21, 128, vk::IndexType::UINT16);
-        let mut bound = None;
-        assert!(install_index_binding(&mut bound, base));
-        assert!(!install_index_binding(&mut bound, base));
-        for changed in [
-            index(22, 128, vk::IndexType::UINT16),
-            index(21, 132, vk::IndexType::UINT16),
-            index(21, 128, vk::IndexType::UINT32),
-        ] {
-            assert!(install_index_binding(&mut bound, changed));
-            assert_eq!(bound, Some(changed));
-        }
     }
 }
