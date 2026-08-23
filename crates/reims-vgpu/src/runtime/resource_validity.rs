@@ -164,6 +164,13 @@ fn apply_resolved(state: &mut Device, update: ResolvedResourceState) -> Validity
         // Mapping generations below remain cache invalidation witnesses during
         // the migration; they no longer stand in for the resource's version.
         if let Some(resource) = update.resource {
+            if let Some((task, object)) = state.task_objects.resources.owner(resource) {
+                crate::runtime::surface_cache::evict_texture_allocation(
+                    state,
+                    task.get(),
+                    object.get(),
+                );
+            }
             state
                 .task_objects
                 .resources
@@ -450,6 +457,50 @@ mod tests {
             crate::runtime::surface_cache::get(&state, 77, 2, 2).is_none(),
             "a host byte copy must not survive the guest's ownership claim"
         );
+    }
+
+    /// The task/object and GVA lookup doors are two indexes over one host
+    /// replica. A guest write advances that resource's content authority, so
+    /// neither index may keep serving the pre-write frame as a later LOAD
+    /// seed.
+    #[test]
+    fn a_guest_write_retires_both_host_replica_indexes() {
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
+        let (task_id, texture_ref, gva) = (4, 12, 0x4000);
+        state.register_test_resource(task_id, texture_ref);
+        crate::runtime::surface_cache::store_texture(
+            &mut state,
+            task_id,
+            texture_ref,
+            2,
+            2,
+            vec![0x55; 16],
+            gva,
+        );
+        crate::runtime::surface_cache::store_gva_owned(
+            &mut state,
+            gva,
+            2,
+            2,
+            vec![0x55; 16],
+            0,
+            None,
+            true,
+        );
+
+        apply(
+            &mut state,
+            task_id,
+            texture_ref,
+            quad(1, 0, 0, 0),
+            ValiditySite::ExecTable,
+        );
+
+        assert!(
+            crate::runtime::surface_cache::get_texture(&state, task_id, texture_ref, 2, 2)
+                .is_none()
+        );
+        assert!(crate::runtime::surface_cache::get_gva(&state, gva, 2, 2).is_none());
     }
 
     /// Byte +6 arriving while a frame is still owed is the one thing that could

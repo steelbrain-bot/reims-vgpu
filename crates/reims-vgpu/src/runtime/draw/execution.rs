@@ -739,6 +739,10 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     false
                 }
             } else if c0.target_gva() != 0 {
+                // Executor readback uses the render target's declared texel
+                // order. Guest publication and the host replica helpers below
+                // take semantic RGBA, so normalize once at this boundary.
+                normalize_gva_store_pixels(&mut rgba, draw_bgra);
                 // What this Store would cost if it were served the way the
                 // IOSurface texture surface Store is served.
                 //
@@ -1507,6 +1511,12 @@ pub(crate) fn host_cache_store_gva_layer<M: HostMemory + HostOps>(
     }
 }
 
+/// Convert executor readback into the semantic RGBA order used by GVA
+/// publication and host replicas.
+fn normalize_gva_store_pixels(pixels: &mut [u8], executor_reported_bgra: bool) {
+    reorder_rb_in_place(pixels, executor_reported_bgra, false);
+}
+
 /// Result of a Linux metal2vulkan draw.
 enum M2vDrawSpan {
     /// No drawable color0 geom.
@@ -2107,7 +2117,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             target_clear,
             color_load_action,
             target_seed_order: seed_order,
-            gpu_only_content_allowed,
             surface_target: iosurface_texture_resident_target,
             load_from_target: chain_load_from_target,
             gva_load_identity,
@@ -2144,7 +2153,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 target_seed_order: seed_order,
                 color_input: frag_color_input,
                 gva_alloc_generation,
-                gpu_only_content_allowed,
                 writeback_guest,
                 iosurface_texture_resident_target,
                 chain_load_from_target,
@@ -2343,6 +2351,17 @@ mod execution_split_tests {
         assert!(load_action_has_clear_seed(LoadAction::Clear));
         assert!(!load_action_has_clear_seed(LoadAction::Load));
         assert!(!load_action_has_clear_seed(LoadAction::DontCare));
+    }
+
+    #[test]
+    fn a_gva_store_normalizes_the_executor_reported_texel_order() {
+        let mut bgra = [0x33, 0x22, 0x11, 0xff];
+        normalize_gva_store_pixels(&mut bgra, true);
+        assert_eq!(bgra, [0x11, 0x22, 0x33, 0xff]);
+
+        let mut rgba = [0x11, 0x22, 0x33, 0xff];
+        normalize_gva_store_pixels(&mut rgba, false);
+        assert_eq!(rgba, [0x11, 0x22, 0x33, 0xff]);
     }
 
     /// The blank-with-host-entry loss must be reported as a subset of a

@@ -15,7 +15,6 @@ pub(super) struct LoadPlan {
     pub target_clear: [f32; 4],
     pub color_load_action: reims_vgpu_core::ColorLoadAction,
     pub target_seed_order: reims_vgpu_core::SeedOrder,
-    pub gpu_only_content_allowed: bool,
     pub surface_target: Option<crate::model::TargetIdentity>,
     pub load_from_target: bool,
     pub gva_load_identity: Option<crate::model::TargetIdentity>,
@@ -35,8 +34,6 @@ pub(super) fn plan_load<M: HostMemory + HostOps>(
     let mut target_clear = [0.0; 4];
     let mut color_load_action = reims_vgpu_core::ColorLoadAction::Clear;
     let mut target_seed_order = reims_vgpu_core::SeedOrder::Rgba8;
-    let gpu_only_content_allowed = state.executor.deferred_gpu_only_content();
-
     let surface_render_target = iosurface_texture_render_identity(state, request);
     let surface_target = writeback_guest
         .then(|| surface_render_target.clone())
@@ -169,7 +166,6 @@ pub(super) fn plan_load<M: HostMemory + HostOps>(
         target_clear,
         color_load_action,
         target_seed_order,
-        gpu_only_content_allowed,
         surface_target,
         load_from_target,
         gva_load_identity,

@@ -290,6 +290,24 @@ pub fn evict_texture(state: &mut Device, task_id: u32, texture_ref: u32) {
     state.host_replicas.forget_texture(task_id, texture_ref);
 }
 
+/// Drop both host replicas produced by one task texture's last materialized
+/// Store.
+///
+/// The object-keyed entry carries the GVA its pixels came from, so a decoded
+/// guest write can invalidate the two lookup doors as one authority change.
+/// Leaving the GVA door alive after removing only the object door lets a later
+/// attachment LOAD seed from pixels captured before the guest's write.
+pub fn evict_texture_allocation(state: &mut Device, task_id: u32, texture_ref: u32) {
+    let source_gva = state
+        .host_replicas
+        .texture(task_id, texture_ref)
+        .map_or(0, |entry| entry.source_gva);
+    state.host_replicas.forget_texture(task_id, texture_ref);
+    if source_gva != 0 {
+        evict_gva(state, source_gva);
+    }
+}
+
 /// The identity of one linear compute window: which object it is, where its
 /// guest backing sits, and the shape the guest declared over it.
 ///

@@ -52,7 +52,6 @@ pub(super) fn plan_target_completion(
     request: &super::DrawEncodeRequest,
     executor_request: &mut reims_vgpu_core::DrawRequest,
     gva_allocation_generation: u64,
-    gpu_only_content_allowed: bool,
     store_publishes: bool,
     writeback_guest: bool,
     surface_target: Option<TargetIdentity>,
@@ -90,12 +89,22 @@ pub(super) fn plan_target_completion(
         .target_guest
         .as_ref()
         .is_some_and(|target| target.memory().is_some());
-    if (guest_backing_available || gpu_only_content_allowed) && store_publishes && writeback_guest {
+    // Execution identity and completion authority are separate. A copied GVA
+    // target still renders into its exact generational resident so concurrent
+    // targets and a following LOAD cannot alias a pooled native image. That
+    // resident may complete the Store only when it is the guest allocation.
+    // Otherwise the guest may CPU-write a subregion as soon as completion is
+    // observed, and a later validity notification cannot merge that region
+    // with GPU-only pixels without overwriting one writer.
+    if store_publishes
+        && writeback_guest
+        && super::gva_store_defer_eligible(request, gva_allocation_generation)
+    {
         if let Some(identity) =
             super::gva_chain_identity(state.executor.as_ref(), request, gva_allocation_generation)
         {
-            if super::gva_store_defer_eligible(request, gva_allocation_generation) {
-                executor_request.target_identity = Some(identity.clone());
+            executor_request.target_identity = Some(identity.clone());
+            if guest_backing_available {
                 executor_request.skip_readback = true;
                 claim(DrawCompletionRoute::ResidentGvaStore(identity))?;
             }
@@ -276,7 +285,6 @@ mod tests {
             &mut executor_request,
             0,
             false,
-            false,
             true,
             None,
             false,
@@ -345,7 +353,6 @@ mod tests {
             &request,
             &mut executor_request,
             0,
-            false,
             true,
             true,
             Some(surface.clone()),
@@ -373,7 +380,6 @@ mod tests {
             &mut executor_request,
             0,
             false,
-            false,
             true,
             None,
             true,
@@ -395,7 +401,6 @@ mod tests {
                 &mut executor_request,
                 0,
                 false,
-                false,
                 true,
                 None,
                 true,
@@ -412,5 +417,59 @@ mod tests {
             )
         ));
         assert!(!executor_request.load_from_target);
+    }
+
+    /// A device-local image cannot be the completion of a Store into a
+    /// guest-addressable texture.
+    ///
+    /// The guest may CPU-write only part of the allocation immediately after
+    /// completion. Once that write has happened, invalidating the resident
+    /// cannot preserve both its untouched GPU pixels and the guest's new
+    /// pixels. With no guest-backed executor target, the Store therefore owns
+    /// a synchronous pixel completion.
+    #[test]
+    fn a_gva_store_without_guest_backing_publishes_at_completion() {
+        use reims_vgpu_protocol::pass_action::StoreAction;
+
+        let state = Device::new(crate::model::DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        let request = super::super::DrawEncodeRequest {
+            colors: vec![super::super::ColorRtRequest {
+                texture_ref: 9,
+                storage: super::super::ColorTargetStorage::Linear(
+                    reims_vgpu_core::LinearColorTarget {
+                        allocation_gva: 0x1000,
+                        allocation_size: 8 * 8 * 4,
+                        plane_offset: 0,
+                        row_stride: 8 * 4,
+                    },
+                ),
+                width: 8,
+                height: 8,
+                format: reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA8_UNORM,
+                sample_count: 1,
+                store_action: StoreAction::Store,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut executor_request = reims_vgpu_core::DrawRequest::default();
+        let route = plan_target_completion(
+            &state,
+            &request,
+            &mut executor_request,
+            1,
+            true,
+            true,
+            None,
+            false,
+            None,
+            8,
+            8,
+        )
+        .expect("a GVA Store has one completion route");
+
+        assert!(matches!(route, DrawCompletionRoute::Pixels));
+        assert!(!executor_request.skip_readback);
+        assert_eq!(executor_request.target_identity, Some(gva(0x1000)));
     }
 }
