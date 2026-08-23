@@ -443,8 +443,8 @@ pub struct ShaderVariant {
     /// words. Reflection owns descriptor identity; SPIR-V is consulted only to
     /// distinguish executable static use within this population.
     pub declared_bindings: Arc<[u32]>,
-    /// Uniform-constant descriptor bindings the executable module statically
-    /// uses, in this variant's binding numbering.
+    /// Descriptor bindings the executable module statically uses, in this
+    /// variant's binding numbering.
     ///
     /// Vulkan requires each of these to appear in the pipeline layout. The
     /// engine checks that relation for every draw because a missing binding can
@@ -2449,6 +2449,37 @@ mod tests {
             reims_vgpu_core::DescriptorUse::Used
         );
         assert!(resolve_prepared_shader(variant.program.id).is_some());
+    }
+
+    #[test]
+    fn retained_buffer_projection_uses_the_executable_storage_buffer_variable() {
+        let unused = crate::spirv_bind::test_support::module_with_buffer_descriptor(1, false);
+        let used = crate::spirv_bind::test_support::module_with_buffer_descriptor(1, true);
+        let shader = |words: &[u32]| {
+            synth_shader_with_resources(
+                Stage::Fragment,
+                words.iter().flat_map(|word| word.to_le_bytes()).collect(),
+                &[1],
+                metal2vulkan::reflect::ResourceKind::Buffer,
+                0,
+            )
+        };
+
+        let unused = prepare_render_shader(&shader(&unused), RenderTranslationStage::Fragment);
+        let used = prepare_render_shader(&shader(&used), RenderTranslationStage::Fragment);
+
+        assert_eq!(
+            unused.variant().buffer_use(1),
+            reims_vgpu_core::DescriptorUse::DeclaredUnused
+        );
+        assert_eq!(
+            used.variant().buffer_use(1),
+            reims_vgpu_core::DescriptorUse::Used
+        );
+        assert_eq!(
+            used.variant().program.used_descriptor_bindings.as_ref(),
+            &[1]
+        );
     }
 
     /// A minimal `CachedShader` wrapping raw bytes with an empty reflection —

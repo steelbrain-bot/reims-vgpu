@@ -484,21 +484,15 @@ fn frag_unbound_scan(
 /// harmless reflection artefact, and until it is asked the fail line is naming a
 /// population it cannot tell apart.
 ///
-/// Textures only, and the reason is the same one the declaration check gives:
-/// the caller can compute the reflected SPIR-V binding for a texture, while the
-/// other two classes require their own resource-kind handling. A buffer or a
-/// sampler gap answers [`spirv_bind::DescriptorUse::Used`] unexamined, which
-/// keeps them reported exactly as loudly as before rather than quietly
-/// downgrading a class nobody has measured.
 fn frag_unbound_static_use(
     gap: &FragUnbound,
     variant: &reims_vgpu_core::PreparedShaderVariant,
 ) -> reims_vgpu_core::DescriptorUse {
-    use reims_vgpu_core::DescriptorUse;
-    if gap.class != FragUnboundClass::Texture {
-        return DescriptorUse::Used;
+    match gap.class {
+        FragUnboundClass::Buffer => variant.buffer_use(gap.metal_index),
+        FragUnboundClass::Texture => variant.texture_use(gap.metal_index),
+        FragUnboundClass::Sampler => variant.sampler_use(gap.metal_index),
     }
-    variant.texture_use(gap.metal_index)
 }
 
 /// Decode the depth-stencil descriptor a draw bound, on the Linux path

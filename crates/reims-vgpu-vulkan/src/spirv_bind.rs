@@ -327,7 +327,15 @@ pub fn declares_descriptor(words: &[u32], binding: u32) -> bool {
 /// `OpImageTexelPointer` that never gets loaded, because those reference the
 /// variable and the spec asks about references rather than about loads.
 pub fn descriptor_static_use(words: &[u32], binding: u32) -> DescriptorUse {
-    descriptor_static_use_in_storage_classes(words, binding, &[STORAGE_CLASS_UNIFORM_CONSTANT])
+    descriptor_static_use_in_storage_classes(
+        words,
+        binding,
+        &[
+            STORAGE_CLASS_UNIFORM_CONSTANT,
+            STORAGE_CLASS_UNIFORM,
+            STORAGE_CLASS_STORAGE_BUFFER,
+        ],
+    )
 }
 
 /// Static executable use of one translated buffer descriptor.
@@ -2428,6 +2436,11 @@ mod more_tests {
             DescriptorUse::DeclaredUnused
         );
         assert_eq!(buffer_descriptor_static_use(&used, 7), DescriptorUse::Used);
+        assert_eq!(
+            descriptor_static_use(&unused, 7),
+            DescriptorUse::DeclaredUnused
+        );
+        assert_eq!(descriptor_static_use(&used, 7), DescriptorUse::Used);
         assert_eq!(
             buffer_descriptor_static_use(&used, 8),
             DescriptorUse::NotDeclared

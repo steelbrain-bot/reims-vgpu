@@ -398,6 +398,10 @@ impl PreparedShaderVariant {
         self.buffer_binding_base + metal_index
     }
 
+    pub fn buffer_use(&self, metal_index: u32) -> DescriptorUse {
+        self.descriptor_use(self.buffer_binding(metal_index))
+    }
+
     pub fn texture_binding(&self, metal_index: u32, declared_binding: Option<u32>) -> u32 {
         self.texture_declared_binding(metal_index, declared_binding)
     }
@@ -408,6 +412,10 @@ impl PreparedShaderVariant {
 
     pub fn sampler_binding(&self, metal_index: u32) -> u32 {
         self.sampler_binding_base + metal_index
+    }
+
+    pub fn sampler_use(&self, metal_index: u32) -> DescriptorUse {
+        self.descriptor_use(self.sampler_binding(metal_index))
     }
 
     pub fn texture_use(&self, metal_index: u32) -> DescriptorUse {

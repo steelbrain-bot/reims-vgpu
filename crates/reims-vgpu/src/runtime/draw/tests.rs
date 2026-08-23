@@ -7700,7 +7700,7 @@ fn pass_depth_and_stencil_attachments_are_independent_and_invalid_pairs_refuse()
 /// zero-fill gave the binding the layout never declared.
 #[test]
 fn only_a_statically_used_texture_gap_is_bound_as_null() {
-    use reims_vgpu_vulkan::spirv_bind::DescriptorUse;
+    use reims_vgpu_core::DescriptorUse;
 
     let gap = |class, metal_index| FragUnbound { class, metal_index };
     let uses = vec![
@@ -7714,9 +7714,6 @@ fn only_a_statically_used_texture_gap_is_bound_as_null() {
             gap(FragUnboundClass::Texture, 6),
             DescriptorUse::NotDeclared,
         ),
-        // Both other classes answer `Used` unconditionally from
-        // `frag_unbound_static_use`, so they are exactly the case that would slip
-        // through a filter written on the verdict alone.
         (gap(FragUnboundClass::Buffer, 7), DescriptorUse::Used),
         (gap(FragUnboundClass::Sampler, 8), DescriptorUse::Used),
     ];
@@ -7724,6 +7721,46 @@ fn only_a_statically_used_texture_gap_is_bound_as_null() {
     assert_eq!(frag_unbound_textures_to_bind_null(&uses), vec![3]);
     // Nothing flagged, nothing substituted — the hot path.
     assert!(frag_unbound_textures_to_bind_null(&[]).is_empty());
+}
+
+#[test]
+fn every_fragment_gap_uses_the_executable_descriptor_verdict() {
+    use reims_vgpu_core::{DescriptorUse, PreparedShaderStage, PreparedShaderVariant};
+    use reims_vgpu_protocol::PreparedShaderId;
+    use std::sync::Arc;
+
+    let variant = PreparedShaderVariant {
+        program: PreparedShaderStage {
+            id: PreparedShaderId::new(1),
+            used_descriptor_bindings: Arc::from([]),
+        },
+        samplers: Arc::from([]),
+        declared_bindings: Arc::from([41, 52, 63]),
+        descriptor_uses: Arc::from([
+            (41, DescriptorUse::DeclaredUnused),
+            (52, DescriptorUse::Used),
+            (63, DescriptorUse::Ambiguous),
+        ]),
+        texture_uses: Arc::from([(2, DescriptorUse::NotDeclared)]),
+        buffer_binding_base: 40,
+        texture_binding_base: 50,
+        sampler_binding_base: 60,
+        word_count: 0,
+    };
+    let gap = |class, metal_index| FragUnbound { class, metal_index };
+
+    assert_eq!(
+        frag_unbound_static_use(&gap(FragUnboundClass::Buffer, 1), &variant),
+        DescriptorUse::DeclaredUnused
+    );
+    assert_eq!(
+        frag_unbound_static_use(&gap(FragUnboundClass::Texture, 2), &variant),
+        DescriptorUse::NotDeclared
+    );
+    assert_eq!(
+        frag_unbound_static_use(&gap(FragUnboundClass::Sampler, 3), &variant),
+        DescriptorUse::Ambiguous
+    );
 }
 
 /// A retained depth-stencil state is served without consulting guest memory,
