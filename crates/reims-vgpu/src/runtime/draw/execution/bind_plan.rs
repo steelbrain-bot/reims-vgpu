@@ -13,6 +13,20 @@ pub(super) struct BoundBufferPlan {
     pub(super) stage_in_buffers: std::collections::BTreeSet<u32>,
 }
 
+/// Whether a bound buffer has any executable consumer in this draw.
+///
+/// `Unused` is the translator's explicit static-use answer. It can remove a
+/// direct shader argument, but not a fixed-function vertex stream: stage-in
+/// fetches are declared by the pipeline descriptor and do not appear as direct
+/// buffer dereferences in shader reflection. Every less precise reflection
+/// class stays on the general path.
+fn buffer_bind_needs_content(
+    access: reims_vgpu_core::ReflectedBufferAccess,
+    feeds_stage_in: bool,
+) -> bool {
+    feeds_stage_in || access != reims_vgpu_core::ReflectedBufferAccess::Unused
+}
+
 pub(super) fn plan_bound_buffers<M: HostMemory + HostOps>(
     state: &mut Device,
     host: &mut M,
@@ -72,6 +86,9 @@ pub(super) fn plan_bound_buffers<M: HostMemory + HostOps>(
         );
         let access = v_shader.interface.buffer_access(b.index);
         crate::runtime::bind_phase::note_access(access);
+        if !buffer_bind_needs_content(access, feeds_stage_in) {
+            continue;
+        }
         crate::runtime::bind_phase::note_unused_staged(access);
         let Some(content) = load_buffer_content(
             state,
@@ -115,6 +132,9 @@ pub(super) fn plan_bound_buffers<M: HostMemory + HostOps>(
         );
         let access = f_shader.interface.buffer_access(b.index);
         crate::runtime::bind_phase::note_access(access);
+        if !buffer_bind_needs_content(access, false) {
+            continue;
+        }
         // No stage-in exclusion here: `[[stage_in]]` is a vertex-stage
         // concept and `pd.vertex_attributes` names vertex buffer indices,
         // which are a different index space from the fragment stage's.
@@ -214,4 +234,30 @@ pub(super) fn plan_bound_buffers<M: HostMemory + HostOps>(
         attributes: attrs,
         stage_in_buffers: stage_in_bufs,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::buffer_bind_needs_content;
+    use reims_vgpu_core::ReflectedBufferAccess;
+
+    #[test]
+    fn only_an_explicitly_unused_direct_bind_has_no_consumer() {
+        assert!(!buffer_bind_needs_content(
+            ReflectedBufferAccess::Unused,
+            false
+        ));
+        assert!(buffer_bind_needs_content(
+            ReflectedBufferAccess::Unused,
+            true
+        ));
+        for access in [
+            ReflectedBufferAccess::ReadOnly,
+            ReflectedBufferAccess::Writable,
+            ReflectedBufferAccess::Absent,
+            ReflectedBufferAccess::Unknown,
+        ] {
+            assert!(buffer_bind_needs_content(access, false), "{access:?}");
+        }
+    }
 }
