@@ -1478,6 +1478,10 @@ impl ExecutionPort for VulkanExecutor {
         reims_vgpu_core::execute_resolved_submission(
             submission,
             |context, request| {
+                let depth_owner = request
+                    .depth_attachment
+                    .as_ref()
+                    .map(|depth| (depth.resource_lifetime.clone(), depth.identity.clone()));
                 let materialized = request
                     .sampled_images
                     .iter()
@@ -1493,6 +1497,20 @@ impl ExecutionPort for VulkanExecutor {
                 let output = reims_vgpu_vulkan::engine::execute_draw_request_in_submission(
                     context, &request,
                 )?;
+                if let Some((owner, identity)) = depth_owner {
+                    let (backing, _) = self
+                        .resident_leases
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .retain_with(owner, &identity, |identity| {
+                            reims_vgpu_vulkan::engine::retain_resident_resource(identity)
+                        });
+                    if backing == ResidentContentBacking::NotReady {
+                        crate::observe::fail(format!(
+                            "depth_resident_lease_fail identity={identity:?} backing={backing:?}"
+                        ));
+                    }
+                }
                 Ok(reims_vgpu_core::CommandExecution::new(output, materialized))
             },
             |_, request| {

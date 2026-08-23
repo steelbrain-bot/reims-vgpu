@@ -1,4 +1,5 @@
 CASE shader_compile PASS runtime library built
+CASE depth_attachment_isolated_across_tasks PASS each task loaded its own stored depth
 CASE depth_attachment_clear_without_test_state PASS stored depth clear rejected the later draw
 CASE depth_test_less_without_attachment PASS z=0 compared against the absent attachment value
 CASE depth_test_equal_without_attachment PASS z=0 compared against the absent attachment value
@@ -242,5 +243,5 @@ ROUTE srt_blit_iosurface_source_1920x1080_x4 sl_gpu_src_via_surface
 ROUTE srt_blit_iosurface_source_1920x1080_x4 sl_gpu_landed
 CASE srt_blit_iosurface_source_1920x1080_x4 PASS every surface-to-surface copy moved its own frame's pixels
 CASE srt_blit_buffer_backed_512x512 PASS the copy out of a buffer-backed source moved what the render had written
-SUMMARY cases=236 failures=0 skipped=0
+SUMMARY cases=237 failures=0 skipped=0
 DEVICE name=Apple M4 unified=true

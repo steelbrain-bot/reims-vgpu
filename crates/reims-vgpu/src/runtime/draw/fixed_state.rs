@@ -206,13 +206,25 @@ pub(super) fn semantic_depth_attachment(
         });
     }
 
-    let identity = depth_chain_identity(request, stencil.is_some()).ok_or(
+    let resource = request.depth_attachment_resource.as_ref().ok_or(
+        DrawPreparationDecline::DepthAttachmentIdentityMissing {
+            depth_ref: depth.texture_ref,
+        },
+    )?;
+    let semantic_id =
+        resource
+            .semantic_id()
+            .ok_or(DrawPreparationDecline::DepthAttachmentIdentityMissing {
+                depth_ref: depth.texture_ref,
+            })?;
+    let identity = depth_chain_identity(request, stencil.is_some(), semantic_id).ok_or(
         DrawPreparationDecline::DepthAttachmentIdentityMissing {
             depth_ref: depth.texture_ref,
         },
     )?;
     Ok(Some(DepthAttachment {
         identity,
+        resource_lifetime: resource.lifetime_ref(),
         load_action: depth.load_action,
         store_action: depth.store_action,
         clear_value: depth.clear_depth as f32,

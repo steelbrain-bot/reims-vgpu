@@ -4406,6 +4406,17 @@ fn finish_stream<M: HostMemory + HostOps>(
                 }
             }
         });
+        if let (Some(req), Some(depth)) = (first_req.as_mut(), acc.depth_attach.as_ref()) {
+            req.depth_attachment_resource =
+                match objects::resolve_resource(state, host, task_id, depth.texture_ref) {
+                    Ok(resource) => Some(resource),
+                    Err(rung) => {
+                        crate::observe::RungReport::new("depth_attachment_resolve", "depth_ref")
+                            .rung(task_id, depth.texture_ref, rung);
+                        None
+                    }
+                };
+        }
         // A serialized Metal render stream is one render pass: its attachment
         // descriptors are fixed while pipeline, binds, and draw arguments may
         // change per record. Keep a seedless template so records 2+ do not
@@ -4935,6 +4946,7 @@ fn render_pass_attachment_template(first: &draw::DrawEncodeRequest) -> draw::Dra
     draw::DrawEncodeRequest {
         task_id: first.task_id,
         colors,
+        depth_attachment_resource: first.depth_attachment_resource.clone(),
         ..Default::default()
     }
 }

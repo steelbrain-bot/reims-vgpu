@@ -818,6 +818,12 @@ pub struct DrawEncodeRequest {
     pub depth_stencil_ref: u32,
     pub stencil_ref: Option<(u32, u32)>,
     pub depth_attach: Option<DepthAttachmentState>,
+    /// Canonical resource named by [`Self::depth_attach`].
+    ///
+    /// The pass descriptor carries a task-local serializer ref. Resolution
+    /// replaces it before semantic request construction so backend resident
+    /// identity cannot collide across tasks or object-slot reuse.
+    pub depth_attachment_resource: Option<std::sync::Arc<crate::model::TaskResource>>,
     pub stencil_attach: Option<StencilAttachmentState>,
     /// Records 2+ of a resident render-pass chain: load the prior record's
     /// content from the engine target instead of a CPU seed. Set by the exec

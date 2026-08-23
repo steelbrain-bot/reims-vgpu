@@ -9988,6 +9988,7 @@ mod tests {
             ],
             depth_attachment: Some(super::super::types::DepthAttachment {
                 identity: super::super::types::TargetIdentity::Anonymous { slot: 1 },
+                resource_lifetime: reims_vgpu_core::ResourceLifetime::new().reference(),
                 load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
                 store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
                 clear_value: 0.5,
@@ -10596,6 +10597,7 @@ mod depth_load_tests {
             depth: Some(stencil_tests()),
             depth_attachment: Some(reims_vgpu_core::DepthAttachment {
                 identity: reims_vgpu_core::TargetIdentity::Anonymous { slot: 1 },
+                resource_lifetime: reims_vgpu_core::ResourceLifetime::new().reference(),
                 load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
                 store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
                 clear_value: 1.0,

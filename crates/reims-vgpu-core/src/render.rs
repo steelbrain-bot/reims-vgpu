@@ -23,13 +23,26 @@ pub struct DepthState {
 /// Metal binds this on the render-pass descriptor, independently of the
 /// encoder's per-draw [`DepthState`]. A nil or trivial depth-stencil state does
 /// not remove the attachment or its load/store operations.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct DepthAttachment {
     pub identity: crate::TargetIdentity,
+    /// Guest resource lifetime that owns the backend resident.
+    pub resource_lifetime: ResourceLifetimeRef,
     pub load_action: LoadAction,
     pub store_action: StoreAction,
     pub clear_value: f32,
     pub stencil: Option<StencilAttachment>,
+}
+
+impl PartialEq for DepthAttachment {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+            && self.resource_lifetime.id() == other.resource_lifetime.id()
+            && self.load_action == other.load_action
+            && self.store_action == other.store_action
+            && self.clear_value == other.clear_value
+            && self.stencil == other.stencil
+    }
 }
 
 /// Stencil aspect of a combined depth/stencil attachment.
@@ -576,6 +589,7 @@ mod tests {
     fn depth(identity: crate::TargetIdentity) -> DepthAttachment {
         DepthAttachment {
             identity,
+            resource_lifetime: ResourceLifetime::new().reference(),
             load_action: LoadAction::Clear,
             store_action: StoreAction::Store,
             clear_value: 1.0,

@@ -2247,47 +2247,19 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
 /// The registry resident this draw's **depth** attachment renders into, if the
 /// guest's pass descriptor named a depth texture.
 ///
-/// The depth buffer is a guest resource with a guest lifetime. A pass descriptor
-/// binds `MTLRenderPassDepthAttachment.texture`, this device decodes its ref, and
-/// that ref is the identity — so one resident exists per guest depth texture and
-/// survives for as long as the guest keeps the texture, instead of being
-/// allocated and destroyed inside one draw.
-///
-/// # Why the generation is zero
-///
-/// Every other identity carries a generation because its resident holds content
-/// that must not survive the guest reusing the key — a surface's
-/// `map_generation` is the worked example. This one carries none, and the
-/// argument is no longer the one an earlier version of this doc gave.
-///
-/// That version said the contents did not matter because the pass always
-/// CLEARed, and that enabling depth LOAD would need a real per-texture
-/// generation first. The first half was true and is now false: LOAD is honoured
-/// (`DepthState::load` carries the guest's `loadAction`), so the contents are
-/// load-bearing. The second half does not follow, and the reason is Metal's own
-/// contract rather than anything this device arranges.
-///
-/// A texture ref names one live texture. The only way a resident can outlive
-/// what it was created for is the guest destroying that texture and creating
-/// another at the same ref, the same geometry and the same aspect — and a
-/// **newly created `MTLTexture`'s contents are undefined until something writes
-/// them**. So a pass that loads from one is reading undefined data by the
-/// guest's own choice, and handing it a previous texture's depth is a
-/// conformant answer to it. There is no case where a generation would turn a
-/// wrong frame into a right one; it would only replace one undefined value with
-/// a different undefined value.
-///
-/// **What this does not license is extending the same reasoning to colour.** A
-/// colour target's contents are read back to guest pages and presented, so a
-/// stale one is a wrong frame the guest can see rather than a value it declared
-/// it did not care about. That is why the surface rail has a generation and this
-/// one does not, and the difference is the readback, not the depth.
+/// The depth buffer is a guest resource with a guest lifetime. The decoded ref
+/// is task-local construction input, so it is replaced by the resource graph's
+/// canonical index and generation before it becomes an executor identity. Two
+/// tasks may legally use the same ref concurrently, and deleting then recreating
+/// one ref starts a distinct lifetime; neither may inherit the other's resident
+/// depth contents.
 ///
 /// Geometry and aspect changes still recreate the image, through
 /// `ResidentTargetSlot::reusable_for` and the `stencil` field of the key.
 pub(super) fn depth_chain_identity(
     req: &DrawEncodeRequest,
     with_stencil: bool,
+    resource: reims_vgpu_protocol::ResourceId<reims_vgpu_protocol::ResourceObject>,
 ) -> Option<crate::model::TargetIdentity> {
     let depth = req.depth_attach.as_ref()?;
     if depth.texture_ref == 0 {
@@ -2299,10 +2271,10 @@ pub(super) fn depth_chain_identity(
         return None;
     }
     Some(crate::model::TargetIdentity::Texture {
-        ref_: depth.texture_ref,
+        ref_: resource.index(),
         width,
         height,
-        generation: 0,
+        generation: u64::from(resource.generation()),
         stencil: with_stencil,
     })
 }

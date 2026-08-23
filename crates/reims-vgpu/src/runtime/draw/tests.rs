@@ -7440,8 +7440,11 @@ fn a_gva_span_no_store_has_stamped_refuses_the_resident_sample_rung() {
 fn a_depth_attachment_is_keyed_on_the_guest_texture_the_pass_bound() {
     use crate::model::TargetIdentity;
     use crate::runtime::draw::execution::depth_chain_identity;
+    use reims_vgpu_protocol::{ResourceId, ResourceObject};
 
-    let id = |r: &DrawEncodeRequest, st: bool| depth_chain_identity(r, st);
+    let id = |r: &DrawEncodeRequest, st: bool, resource: ResourceId<ResourceObject>| {
+        depth_chain_identity(r, st, resource)
+    };
     let req = |depth_ref: u32, w: u32, h: u32| DrawEncodeRequest {
         colors: vec![ColorRtRequest {
             width: w,
@@ -7455,30 +7458,37 @@ fn a_depth_attachment_is_keyed_on_the_guest_texture_the_pass_bound() {
         ..DrawEncodeRequest::default()
     };
 
-    let first = id(&req(42, 1024, 768), false).expect("a bound depth texture has one");
+    let first_resource = ResourceId::new(17, 3);
+    let first =
+        id(&req(42, 1024, 768), false, first_resource).expect("a bound depth texture has one");
     assert_eq!(
         first,
         TargetIdentity::Texture {
-            ref_: 42,
+            ref_: 17,
             width: 1024,
             height: 768,
-            generation: 0,
+            generation: 3,
             stencil: false,
         },
-        "the guest's own texture ref is the key"
+        "the canonical resource lifetime, not its task-local ref, is the key"
     );
     assert_eq!(
-        id(&req(42, 1024, 768), false).as_ref(),
+        id(&req(42, 1024, 768), false, first_resource).as_ref(),
         Some(&first),
         "a second draw into the same depth texture resolves the same resident"
     );
     assert_ne!(
-        id(&req(43, 1024, 768), false),
+        id(&req(42, 1024, 768), false, ResourceId::new(18, 1),),
         Some(first.clone()),
-        "two guest depth textures must not fuse into one resident"
+        "the same task-local ref under another canonical resource must not fuse"
     );
     assert_ne!(
-        id(&req(42, 800, 600), false),
+        id(&req(42, 1024, 768), false, ResourceId::new(17, 4),),
+        Some(first.clone()),
+        "reusing one resource slot at a new generation must not inherit depth"
+    );
+    assert_ne!(
+        id(&req(42, 800, 600), false, first_resource),
         Some(first.clone()),
         "geometry is part of the key, so a resized attachment recreates"
     );
@@ -7487,7 +7497,7 @@ fn a_depth_attachment_is_keyed_on_the_guest_texture_the_pass_bound() {
     // residents, each stable, rather than one retired and recreated on every
     // alternation between a stencil draw and a depth-only one.
     assert_ne!(
-        id(&req(42, 1024, 768), true),
+        id(&req(42, 1024, 768), true, first_resource),
         Some(first),
         "a stencil-carrying depth attachment is its own resident"
     );
@@ -7496,7 +7506,7 @@ fn a_depth_attachment_is_keyed_on_the_guest_texture_the_pass_bound() {
     // still need a draw-owned native image to model Metal's implicit depth value
     // for a bound test state, but that image is not a guest pass attachment.
     assert_eq!(
-        id(&req(0, 1024, 768), false),
+        id(&req(0, 1024, 768), false, first_resource),
         None,
         "an unbound depth attachment names no resident"
     );
@@ -7510,7 +7520,8 @@ fn a_depth_attachment_is_keyed_on_the_guest_texture_the_pass_bound() {
                 }],
                 ..DrawEncodeRequest::default()
             },
-            false
+            false,
+            first_resource,
         ),
         None,
         "and neither does a pass with no depth attachment at all"
@@ -7518,10 +7529,48 @@ fn a_depth_attachment_is_keyed_on_the_guest_texture_the_pass_bound() {
 }
 
 #[test]
+fn depth_identity_separates_equal_refs_across_tasks_and_object_reuse() {
+    let state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
+    let resources = &state.task_objects.resources;
+    let make = || {
+        std::sync::Arc::new(crate::model::TaskResource::new(
+            reims_vgpu_protocol::ObjectListEntry::new(ObjectKind::Texture, 0, 0),
+            std::sync::Arc::from([]),
+        ))
+    };
+    let first = resources.register(1, 42, make()).semantic_id().unwrap();
+    let other_task = resources.register(2, 42, make()).semantic_id().unwrap();
+    assert_ne!(
+        first, other_task,
+        "task-local ref 42 is not a global identity"
+    );
+
+    assert!(resources.delete(1, 42));
+    let replacement = resources.register(1, 42, make()).semantic_id().unwrap();
+    assert_ne!(
+        first, replacement,
+        "object deletion ends the old generation"
+    );
+}
+
+#[test]
 fn pass_depth_attachment_is_built_without_depth_test_state_and_invalid_pairs_refuse() {
     use reims_vgpu_protocol::pass_action::{LoadAction, StoreAction};
 
+    let state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
+    let resources = &state.task_objects.resources;
+    let resource = resources.register(
+        1,
+        42,
+        std::sync::Arc::new(crate::model::TaskResource::new(
+            reims_vgpu_protocol::ObjectListEntry::new(ObjectKind::Texture, 0, 0),
+            std::sync::Arc::from([]),
+        )),
+    );
+    let depth_owner = resource.lifetime_ref().id();
+
     let base = DrawEncodeRequest {
+        task_id: 1,
         colors: vec![ColorRtRequest {
             width: 8,
             height: 6,
@@ -7533,6 +7582,7 @@ fn pass_depth_attachment_is_built_without_depth_test_state_and_invalid_pairs_ref
             store_action: StoreAction::Store,
             clear_depth: 0.25,
         }),
+        depth_attachment_resource: Some(resource),
         // Nil state is deliberate: pass load/store does not depend on this.
         depth_stencil_ref: 0,
         ..DrawEncodeRequest::default()
@@ -7544,6 +7594,8 @@ fn pass_depth_attachment_is_built_without_depth_test_state_and_invalid_pairs_ref
     assert_eq!(attachment.store_action, StoreAction::Store);
     assert_eq!(attachment.clear_value, 0.25);
     assert_eq!(attachment.stencil, None);
+    assert_eq!(attachment.resource_lifetime.id(), depth_owner);
+    assert!(attachment.resource_lifetime.is_live());
 
     let stencil_only = DrawEncodeRequest {
         stencil_attach: Some(StencilAttachmentState {

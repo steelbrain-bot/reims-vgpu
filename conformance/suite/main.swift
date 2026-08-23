@@ -8,11 +8,16 @@ import Metal
 import Foundation
 import IOSurface
 
+if CommandLine.arguments.contains("--depth-task-child") {
+    exit(depthTaskIsolationChild())
+}
 
 // `library` is lazily initialised now that it lives in a declaration
 // file, so force the build before the line that reports it.
 _ = library
 report("shader_compile", true, "runtime library built")
+
+depthTaskIsolationCase()
 
 for f in formats {
     linearAliasCase(f, 64, 16, pitch: .tight, sampler: false)

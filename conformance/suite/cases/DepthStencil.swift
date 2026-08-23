@@ -35,6 +35,155 @@ private func depthTestState(_ compare: MTLCompareFunction) -> MTLDepthStencilSta
     return dev.makeDepthStencilState(descriptor: descriptor)
 }
 
+private struct DepthTaskFixture {
+    let pipeline: MTLRenderPipelineState
+    let vertices: MTLBuffer
+    let colour: MTLTexture
+    let depth: MTLTexture
+}
+
+/// Build the same resource sequence in each process. Metal resource namespaces
+/// are task-local, so equal construction order must still produce independent
+/// depth contents.
+private func makeDepthTaskFixture() -> DepthTaskFixture? {
+    let width = 8, height = 8
+    guard let pipeline = depthPipeline(.depth32Float),
+          let vertices = dev.makeBuffer(bytes: quadVerts,
+                                        length: quadVerts.count * MemoryLayout<Float>.size,
+                                        options: .storageModeShared) else {
+        return nil
+    }
+    let colourDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
+    colourDescriptor.usage = [.renderTarget, .shaderRead]
+    colourDescriptor.storageMode = .private
+    let depthDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: .depth32Float, width: width, height: height, mipmapped: false)
+    depthDescriptor.usage = .renderTarget
+    depthDescriptor.storageMode = .private
+    guard let colour = dev.makeTexture(descriptor: colourDescriptor),
+          let depth = dev.makeTexture(descriptor: depthDescriptor) else {
+        return nil
+    }
+    return DepthTaskFixture(pipeline: pipeline, vertices: vertices,
+                            colour: colour, depth: depth)
+}
+
+private func clearTaskDepth(_ fixture: DepthTaskFixture, _ value: Double) -> Bool {
+    let pass = MTLRenderPassDescriptor()
+    pass.colorAttachments[0].texture = fixture.colour
+    pass.colorAttachments[0].loadAction = .dontCare
+    pass.colorAttachments[0].storeAction = .dontCare
+    pass.depthAttachment.texture = fixture.depth
+    pass.depthAttachment.loadAction = .clear
+    pass.depthAttachment.storeAction = .store
+    pass.depthAttachment.clearDepth = value
+    guard let commandBuffer = queue.makeCommandBuffer(),
+          let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else {
+        return false
+    }
+    encoder.setRenderPipelineState(fixture.pipeline)
+    encoder.setVertexBuffer(fixture.vertices, offset: 0, index: 0)
+    encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+    encoder.endEncoding()
+    commandBuffer.commit()
+    commandBuffer.waitUntilCompleted()
+    return commandBuffer.status == .completed
+}
+
+/// Child half of `depthTaskIsolationCase`, dispatched by `main.swift` before
+/// the ordinary battery. Standard input/output form a two-message barrier, so
+/// neither process relies on scheduler timing.
+func depthTaskIsolationChild() -> Int32 {
+    guard let fixture = makeDepthTaskFixture() else {
+        FileHandle.standardOutput.write(Data([0]))
+        return 2
+    }
+    guard FileHandle.standardInput.readData(ofLength: 1).count == 1 else { return 2 }
+    guard clearTaskDepth(fixture, 1.0) else {
+        FileHandle.standardOutput.write(Data([0]))
+        return 2
+    }
+    FileHandle.standardOutput.write(Data([1]))
+    guard FileHandle.standardInput.readData(ofLength: 1).count == 1 else { return 2 }
+    withExtendedLifetime(fixture) {}
+    return 0
+}
+
+/// Two live Metal tasks may use equal task-local object refs concurrently.
+/// Each establishes different defined depth contents; the child overwrites its
+/// own texture between the parent's Store and Load, so a backend that keys the
+/// resident on the raw ref makes the parent's Equal test reject incorrectly.
+func depthTaskIsolationCase() {
+    let label = "depth_attachment_isolated_across_tasks"
+    guard let fixture = makeDepthTaskFixture(), clearTaskDepth(fixture, 0.0) else {
+        report(label, false, "parent depth fixture or clear failed")
+        return
+    }
+
+    let childInput = Pipe()
+    let childOutput = Pipe()
+    let child = Process()
+    child.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
+    child.arguments = ["--depth-task-child"]
+    child.standardInput = childInput
+    child.standardOutput = childOutput
+    do {
+        try child.run()
+    } catch {
+        report(label, false, "child process launch failed: \(error)")
+        return
+    }
+    childInput.fileHandleForReading.closeFile()
+    childOutput.fileHandleForWriting.closeFile()
+    childInput.fileHandleForWriting.write(Data([1]))
+    let ready = childOutput.fileHandleForReading.readData(ofLength: 1)
+    guard ready == Data([1]) else {
+        child.waitUntilExit()
+        report(label, false, "child depth fixture or clear failed")
+        return
+    }
+
+    var green: [Float] = [0, 1, 0, 1]
+    let pass = MTLRenderPassDescriptor()
+    pass.colorAttachments[0].texture = fixture.colour
+    pass.colorAttachments[0].loadAction = .clear
+    pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 1, alpha: 1)
+    pass.colorAttachments[0].storeAction = .store
+    pass.depthAttachment.texture = fixture.depth
+    pass.depthAttachment.loadAction = .load
+    pass.depthAttachment.storeAction = .dontCare
+
+    var encoded = false
+    if let equal = depthTestState(.equal),
+       let commandBuffer = queue.makeCommandBuffer(),
+       let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) {
+        encoder.setRenderPipelineState(fixture.pipeline)
+        encoder.setDepthStencilState(equal)
+        encoder.setVertexBuffer(fixture.vertices, offset: 0, index: 0)
+        encoder.setFragmentBytes(&green, length: 16, index: 0)
+        encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        encoded = commandBuffer.status == .completed
+    }
+
+    childInput.fileHandleForWriting.write(Data([1]))
+    childInput.fileHandleForWriting.closeFile()
+    child.waitUntilExit()
+
+    guard encoded, let pixels = readBack(readPipe, fixture.colour, 8, 8) else {
+        report(label, false, "parent load/test or readback failed")
+        return
+    }
+    let expected = pack(0, 255, 0, 255)
+    let ok = pixels.allSatisfy { $0 == expected }
+    report(label, ok,
+           ok ? "each task loaded its own stored depth"
+              : "want=\(hex(expected)) got=\(hex(pixels[0]))")
+}
+
 /// Pass attachment operations and per-draw tests are independent Metal state.
 ///
 /// The first case clears/stores depth while no depth-stencil state is bound,

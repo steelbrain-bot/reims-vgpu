@@ -336,6 +336,7 @@ fn stored_multisample_target_survives_for_a_later_encoder() {
     first.raster_sample_count = 2;
     first.color_sample_count = 2;
     first.depth_attachment = Some(DepthAttachment {
+        resource_lifetime: reims_vgpu_core::ResourceLifetime::new().reference(),
         identity: depth_identity.clone(),
         load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
         store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
@@ -368,6 +369,7 @@ fn stored_multisample_target_survives_for_a_later_encoder() {
     second.raster_sample_count = 2;
     second.color_sample_count = 2;
     second.depth_attachment = Some(DepthAttachment {
+        resource_lifetime: reims_vgpu_core::ResourceLifetime::new().reference(),
         identity: depth_identity,
         load_action: reims_vgpu_protocol::pass_action::LoadAction::Load,
         store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
