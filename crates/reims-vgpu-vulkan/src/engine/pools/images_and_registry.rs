@@ -9,6 +9,60 @@ use super::*;
 use crate::engine::types::TargetKeyDivergence;
 use reims_vgpu_core::pixel_format::SwizzlePlan;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StorageImageAllocation {
+    Transient,
+    Heap,
+}
+
+fn heap_resident_image_plan(key: StorageImageKey) -> reims_vgpu_core::HeapTextureImagePlan {
+    reims_vgpu_core::HeapTextureImagePlan {
+        format: reims_vgpu_protocol::SampledImageFormat::linear(
+            key.format,
+            reims_vgpu_protocol::SwizzlePlan::default(),
+        ),
+        extent: [key.width, key.height, 1],
+        mip_levels: 1,
+        array_layers: 1,
+        sample_count: 1,
+        sampled: true,
+        storage: true,
+    }
+}
+
+fn storage_image_create_info(
+    key: StorageImageKey,
+    allocation: StorageImageAllocation,
+) -> Option<vk::ImageCreateInfo<'static>> {
+    if allocation == StorageImageAllocation::Heap {
+        return super::super::heap_texture_image_create_info(heap_resident_image_plan(key));
+    }
+    let format = crate::format::vk_storage_image(key.format);
+    Some(
+        vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width: key.width.max(1),
+                height: key.height.max(1),
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(if key.sampled_only {
+                vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST
+            } else {
+                vk::ImageUsageFlags::STORAGE
+                    | vk::ImageUsageFlags::SAMPLED
+                    | vk::ImageUsageFlags::TRANSFER_DST
+                    | vk::ImageUsageFlags::TRANSFER_SRC
+            })
+            .initial_layout(vk::ImageLayout::UNDEFINED),
+    )
+}
+
 /// Band observed intervals between sampled uses. This is a reuse-distance
 /// diagnostic only; no residency decision reads it.
 fn resident_resample_band(idle_ms: u64) -> &'static str {
@@ -640,42 +694,33 @@ impl ResourcePools {
         key: StorageImageKey,
         counters: &EngineCounters,
     ) -> Result<StorageImageSlot, DrawError> {
-        if let Some(slot) = self.shared.storage_image_free.take(&key) {
-            self.shared.storage_image_live.push(StorageImageSlot {
-                image: slot.image,
-                memory: slot.memory,
-                view: slot.view,
-                key: slot.key,
-            });
-            return Ok(slot);
+        self.acquire_storage_image_allocation(ctx, key, counters, StorageImageAllocation::Transient)
+    }
+
+    unsafe fn acquire_storage_image_allocation(
+        &mut self,
+        ctx: &DeviceContext,
+        key: StorageImageKey,
+        counters: &EngineCounters,
+        allocation: StorageImageAllocation,
+    ) -> Result<StorageImageSlot, DrawError> {
+        if allocation == StorageImageAllocation::Transient {
+            if let Some(slot) = self.shared.storage_image_free.take(&key) {
+                self.shared.storage_image_live.push(StorageImageSlot {
+                    image: slot.image,
+                    memory: slot.memory,
+                    view: slot.view,
+                    key: slot.key,
+                });
+                return Ok(slot);
+            }
         }
         let format = crate::format::vk_storage_image(key.format);
+        let create_info = storage_image_create_info(key, allocation)
+            .expect("heap resident image plans are validated before allocation");
         let image = ctx
             .device
-            .create_image(
-                &vk::ImageCreateInfo::default()
-                    .image_type(vk::ImageType::TYPE_2D)
-                    .format(format)
-                    .extent(vk::Extent3D {
-                        width: key.width.max(1),
-                        height: key.height.max(1),
-                        depth: 1,
-                    })
-                    .mip_levels(1)
-                    .array_layers(1)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .tiling(vk::ImageTiling::OPTIMAL)
-                    .usage(if key.sampled_only {
-                        vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST
-                    } else {
-                        vk::ImageUsageFlags::STORAGE
-                            | vk::ImageUsageFlags::SAMPLED
-                            | vk::ImageUsageFlags::TRANSFER_DST
-                            | vk::ImageUsageFlags::TRANSFER_SRC
-                    })
-                    .initial_layout(vk::ImageLayout::UNDEFINED),
-                None,
-            )
+            .create_image(&create_info, None)
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateStorageImage, e)))?;
         counters.note_create(CreateSite::StorageImage);
         let req = ctx.device.get_image_memory_requirements(image);
@@ -751,7 +796,9 @@ impl ResourcePools {
             view,
             key,
         };
-        self.shared.storage_image_live.push(slot);
+        if allocation == StorageImageAllocation::Transient {
+            self.shared.storage_image_live.push(slot);
+        }
         Ok(slot)
     }
 
@@ -812,8 +859,23 @@ impl ResourcePools {
         // losses were terminal — see `recoverable_compute_storage_residents`.
         self.note_compute_storage_reach();
 
-        // Reuse the common allocator, then detach its bookkeeping copy from
-        // the transient live list: the registry now owns this allocation.
+        if identity.is_heap()
+            && storage_image_create_info(key, StorageImageAllocation::Heap).is_none()
+        {
+            return Err(DrawError::ComputeExecution(
+                ComputeExecutionDecline::HeapImagePlanInvalid {
+                    identity,
+                    width: key.width,
+                    height: key.height,
+                    format: key.format,
+                },
+            ));
+        }
+
+        // The registry owns this allocation. Ordinary residents detach the
+        // common allocator's transient bookkeeping copy; heap residents enter
+        // through the same allocation owner with the exact queried image
+        // definition and were never transient.
         //
         // Out of memory is the one refusal worth a second attempt, exactly as at
         // the sibling target registry's admission: this device is usually still
@@ -821,26 +883,41 @@ impl ResourcePools {
         // the retired cap sweep destroyed residents at, which is what makes
         // retiring live ones safe here — the caller holds no handle from this
         // acquire yet, and no sampled source has been resolved.
-        let slot = match self.acquire_storage_image(ctx, key, counters) {
+        let acquire = |pools: &mut Self| {
+            if identity.is_heap() {
+                pools.acquire_storage_image_allocation(
+                    ctx,
+                    key,
+                    counters,
+                    StorageImageAllocation::Heap,
+                )
+            } else {
+                pools.acquire_storage_image(ctx, key, counters)
+            }
+        };
+        let slot = match acquire(self) {
             Ok(slot) => slot,
             Err(error) if error.out_of_memory() => {
                 if self.reclaim_compute_storage_for_allocation_retry(ctx) == 0 {
                     return Err(error);
                 }
-                self.acquire_storage_image(ctx, key, counters)
-                    .map_err(|_| error)?
+                acquire(self).map_err(|_| error)?
             }
             Err(error) => return Err(error),
         };
-        let live = self.shared.storage_image_live.pop().ok_or({
-            DrawError::ComputeExecution(ComputeExecutionDecline::ResidentAllocatorLiveSlotMissing {
-                identity,
-                width: key.width,
-                height: key.height,
-                format: key.format,
-            })
-        })?;
-        debug_assert_eq!(live.image, slot.image);
+        if !identity.is_heap() {
+            let live = self.shared.storage_image_live.pop().ok_or({
+                DrawError::ComputeExecution(
+                    ComputeExecutionDecline::ResidentAllocatorLiveSlotMissing {
+                        identity,
+                        width: key.width,
+                        height: key.height,
+                        format: key.format,
+                    },
+                )
+            })?;
+            debug_assert_eq!(live.image, slot.image);
+        }
         self.shared.compute_storage_registry.insert(
             identity,
             ResidentStorageImageSlot {
@@ -3376,6 +3453,36 @@ impl ResourcePools {
             self.shared.resident_resample_peak_ms =
                 self.shared.resident_resample_peak_ms.max(idle_ms);
         }
+    }
+}
+
+#[cfg(test)]
+mod heap_image_definition_tests {
+    use super::*;
+
+    #[test]
+    fn a_heap_resident_uses_the_same_alias_image_definition_as_its_query() {
+        let key = StorageImageKey {
+            width: 257,
+            height: 193,
+            format: StorageImageFormat::Rgba8Unorm,
+            sampled_only: false,
+        };
+        let query =
+            super::super::super::heap_texture_image_create_info(heap_resident_image_plan(key))
+                .unwrap();
+        let resident = storage_image_create_info(key, StorageImageAllocation::Heap).unwrap();
+
+        assert_eq!(resident.flags, vk::ImageCreateFlags::ALIAS);
+        assert_eq!(resident.flags, query.flags);
+        assert_eq!(resident.format, query.format);
+        assert_eq!(resident.extent, query.extent);
+        assert_eq!(resident.mip_levels, query.mip_levels);
+        assert_eq!(resident.array_layers, query.array_layers);
+        assert_eq!(resident.samples, query.samples);
+        assert_eq!(resident.tiling, query.tiling);
+        assert_eq!(resident.usage, query.usage);
+        assert_eq!(resident.initial_layout, query.initial_layout);
     }
 }
 

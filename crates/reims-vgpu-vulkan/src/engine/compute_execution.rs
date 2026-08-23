@@ -64,6 +64,12 @@ pub enum ComputeExecutionDecline {
         height: u32,
         format: StorageImageFormat,
     },
+    HeapImagePlanInvalid {
+        identity: ComputeStorageResidencyKey,
+        width: u32,
+        height: u32,
+        format: StorageImageFormat,
+    },
     /// A dispatch asked for this identity at a different image shape while the
     /// resident holding it still owes a deferred writeback.
     ///
@@ -142,6 +148,7 @@ impl Decline for ComputeExecutionDecline {
             Self::ResidentAllocatorLiveSlotMissing { .. } => {
                 "vk_compute_exec_resident_allocator_live_slot_missing"
             }
+            Self::HeapImagePlanInvalid { .. } => "vk_compute_exec_heap_image_plan_invalid",
             Self::ResidentRekeyWouldDropPinned { .. } => {
                 "vk_compute_exec_resident_rekey_would_drop_pinned"
             }
@@ -237,6 +244,12 @@ impl Decline for ComputeExecutionDecline {
                 fields
             }
             Self::ResidentAllocatorLiveSlotMissing {
+                identity,
+                width,
+                height,
+                format,
+            }
+            | Self::HeapImagePlanInvalid {
                 identity,
                 width,
                 height,
@@ -419,6 +432,12 @@ mod tests {
                 height: 32,
                 format: StorageImageFormat::Rgba8Unorm,
             },
+            ComputeExecutionDecline::HeapImagePlanInvalid {
+                identity: identity(),
+                width: 0,
+                height: 32,
+                format: StorageImageFormat::Rgba8Unorm,
+            },
         ]
     }
 
@@ -444,7 +463,7 @@ mod tests {
         // a pooled readback the runtime owns. Five more went with the
         // non-2D image shape: the compute rail stages one flat plane window
         // per binding and has no slice or depth axis to refuse.
-        assert_eq!(before, 7, "the compute executor's reason census moved");
+        assert_eq!(before, 8, "the compute executor's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate compute-execution slug");
     }
 
