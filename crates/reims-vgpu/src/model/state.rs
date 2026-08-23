@@ -323,6 +323,10 @@ impl TaskResource {
         self.semantic_id.get().copied()
     }
 
+    pub(crate) fn lifetime(&self) -> reims_vgpu_core::ResourceLifetime {
+        self.lifetime.clone()
+    }
+
     pub(crate) fn begin_relation_publication(&self) -> bool {
         self.relations
             .relation_publication

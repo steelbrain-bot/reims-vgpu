@@ -202,7 +202,7 @@ pub(super) fn plan_executor_request<M: HostMemory + HostOps>(
     resources.storage_buffers = storage;
     resources.sampled_images = images;
     resources.color_input = frag_color_input;
-    resources.render_target_fragment_barrier = req.render_target_fragment_barrier;
+    resources.render_barriers = req.render_barriers.clone();
     resources.continues_render_pass = req.continues_render_pass;
     resources.render_pass_continues = req.render_pass_continues;
     resources.samplers = samplers;

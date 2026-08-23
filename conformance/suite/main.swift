@@ -68,6 +68,7 @@ mipBlitCase()
 vertexBufferCase()
 
 fragmentBufferCase()
+renderBarrierCase()
 encoderBindingLifetimeCase()
 
 if texPipeline == nil {

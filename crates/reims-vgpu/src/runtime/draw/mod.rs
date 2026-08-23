@@ -858,9 +858,8 @@ pub struct DrawEncodeRequest {
     /// content from the engine target instead of a CPU seed. Set by the exec
     /// chain loop (Vulkan rail only); default false.
     pub chain_from_resident: bool,
-    /// A `memoryBarrierWithScope:RenderTargets` from fragment work to fragment
-    /// work immediately precedes this draw in the same render encoder.
-    pub render_target_fragment_barrier: bool,
+    /// Resolved render memory barriers immediately preceding this draw.
+    pub render_barriers: Vec<reims_vgpu_core::RenderBarrier>,
     /// This draw continues the Metal render encoder of the preceding draw in
     /// the same decoded stream. Vulkan may keep an identical render pass open
     /// when no command that is illegal inside it intervenes.

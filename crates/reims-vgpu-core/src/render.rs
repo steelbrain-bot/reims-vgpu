@@ -10,6 +10,92 @@ pub use reims_vgpu_protocol::{
 use reims_vgpu_protocol::{ColorWriteMask, ImageFormat, SwizzlePlan};
 use std::sync::Arc;
 
+/// Render stages named on either side of a Metal render memory barrier.
+///
+/// The guest encoding is a bit set. Keeping it typed after decode makes an
+/// unsupported stage fail at the composition boundary instead of becoming an
+/// arbitrary Vulkan mask.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RenderBarrierStages(u16);
+
+impl RenderBarrierStages {
+    pub const VERTEX: Self = Self(1);
+    pub const FRAGMENT: Self = Self(2);
+    pub const TILE: Self = Self(4);
+    pub const OBJECT: Self = Self(8);
+    pub const MESH: Self = Self(16);
+    pub const VERTEX_FRAGMENT: Self = Self(Self::VERTEX.0 | Self::FRAGMENT.0);
+    pub const ALL: Self =
+        Self(Self::VERTEX.0 | Self::FRAGMENT.0 | Self::TILE.0 | Self::OBJECT.0 | Self::MESH.0);
+
+    pub fn from_bits(bits: u16) -> Option<Self> {
+        (bits & !Self::ALL.0 == 0).then_some(Self(bits))
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub fn is_subset_of(self, other: Self) -> bool {
+        self.0 & !other.0 == 0
+    }
+}
+
+/// Resource classes covered by a render memory barrier.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RenderBarrierScope(u8);
+
+impl RenderBarrierScope {
+    pub const BUFFERS: Self = Self(1);
+    pub const TEXTURES: Self = Self(2);
+    pub const RENDER_TARGETS: Self = Self(4);
+    pub const ALL: Self = Self(Self::BUFFERS.0 | Self::TEXTURES.0 | Self::RENDER_TARGETS.0);
+
+    pub fn from_bits(bits: u8) -> Option<Self> {
+        (bits & !Self::ALL.0 == 0).then_some(Self(bits))
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// One memory dependency declared between draws in a render encoder.
+///
+/// Resource-list barriers carry canonical generational identities rather than
+/// the task-local object-table names from the wire. A backend may implement a
+/// conservative global dependency, but it cannot lose which resources the
+/// guest named at this semantic boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RenderBarrier {
+    Resources {
+        resources: Arc<[RenderBarrierResource]>,
+        after: RenderBarrierStages,
+        before: RenderBarrierStages,
+    },
+    Scope {
+        scope: RenderBarrierScope,
+        after: RenderBarrierStages,
+        before: RenderBarrierStages,
+    },
+    Texture,
+}
+
+/// Canonical identity and lifetime retained by a resource-list barrier.
+#[derive(Clone, Debug)]
+pub struct RenderBarrierResource {
+    pub id: reims_vgpu_protocol::ResourceId<reims_vgpu_protocol::ResourceObject>,
+    pub lifetime: ResourceLifetime,
+}
+
+impl PartialEq for RenderBarrierResource {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.lifetime.id() == other.lifetime.id()
+    }
+}
+
+impl Eq for RenderBarrierResource {}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct DepthState {
     pub test_enable: bool,
@@ -201,13 +287,11 @@ pub struct DrawRequest {
     /// Depth/stencil attachment fixed by the enclosing render pass.
     pub depth_attachment: Option<DepthAttachment>,
     pub color_input: bool,
-    /// A render-target-scoped fragment-to-fragment memory barrier immediately
-    /// before this draw, as declared inside the same Metal render encoder.
-    /// Backends must keep this ordering inside the encoder rather than turning
-    /// it into command-buffer completion. A backend render-pass instance is not
-    /// part of this contract and may be split to express the resource-wide
-    /// dependency faithfully.
-    pub render_target_fragment_barrier: bool,
+    /// Memory barriers immediately before this draw in the same Metal render
+    /// encoder. Consecutive barriers remain distinct resolved commands; the
+    /// backend may realize them with one stronger dependency when no work lies
+    /// between them.
+    pub render_barriers: Vec<RenderBarrier>,
     pub continues_render_pass: bool,
     pub render_pass_continues: bool,
 }
@@ -786,5 +870,56 @@ mod thread_seam {
     fn a_resolved_draw_can_leave_the_thread_that_resolved_it() {
         fn assert_send<T: Send>() {}
         assert_send::<super::DrawRequest>();
+    }
+
+    #[test]
+    fn render_barrier_masks_accept_only_declared_bits() {
+        assert_eq!(
+            super::RenderBarrierStages::from_bits(3),
+            Some(super::RenderBarrierStages::VERTEX_FRAGMENT)
+        );
+        assert_eq!(
+            super::RenderBarrierStages::from_bits(4),
+            Some(super::RenderBarrierStages::TILE)
+        );
+        assert_eq!(super::RenderBarrierStages::from_bits(32), None);
+        assert_eq!(
+            super::RenderBarrierScope::from_bits(7),
+            Some(super::RenderBarrierScope::ALL)
+        );
+        assert_eq!(super::RenderBarrierScope::from_bits(8), None);
+    }
+
+    #[test]
+    fn render_barrier_resources_distinguish_generational_identity_and_lifetime() {
+        use reims_vgpu_protocol::ResourceId;
+
+        let first_lifetime = crate::ResourceLifetime::new();
+        let second_lifetime = crate::ResourceLifetime::new();
+        let first = super::RenderBarrierResource {
+            id: ResourceId::new(5, 1),
+            lifetime: first_lifetime.clone(),
+        };
+        assert_eq!(
+            first,
+            super::RenderBarrierResource {
+                id: ResourceId::new(5, 1),
+                lifetime: first_lifetime,
+            }
+        );
+        assert_ne!(
+            first,
+            super::RenderBarrierResource {
+                id: ResourceId::new(5, 2),
+                lifetime: second_lifetime.clone(),
+            }
+        );
+        assert_ne!(
+            first,
+            super::RenderBarrierResource {
+                id: ResourceId::new(5, 1),
+                lifetime: second_lifetime,
+            }
+        );
     }
 }

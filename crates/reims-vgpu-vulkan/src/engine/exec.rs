@@ -449,6 +449,9 @@ enum PassObstacle {
     /// A resource-wide render-target dependency from prior fragment work to
     /// this draw's fragment reads.
     RenderTargetBarrier,
+    /// Any other decoded render memory barrier, conservatively realized as a
+    /// global Vulkan dependency.
+    RenderBarrier,
     /// A target sampled by its own draw, captured before the attachment changes.
     Snapshot,
     /// The seed copy that gives a `LOAD` pass its prior content.
@@ -497,6 +500,7 @@ impl PassObstacle {
     fn route(self) -> &'static str {
         match self {
             Self::RenderTargetBarrier => "passmerge_outside_render_target_barrier",
+            Self::RenderBarrier => "passmerge_outside_render_barrier",
             Self::Snapshot => "passmerge_outside_snapshot",
             Self::Seed => "passmerge_outside_seed",
             Self::AttachmentLoad => "passmerge_outside_attachment_load",
@@ -516,6 +520,7 @@ impl PassObstacle {
     fn held_route(self) -> &'static str {
         match self {
             Self::RenderTargetBarrier => "passheld_outside_render_target_barrier",
+            Self::RenderBarrier => "passheld_outside_render_barrier",
             Self::Snapshot => "passheld_outside_snapshot",
             Self::Seed => "passheld_outside_seed",
             Self::AttachmentLoad => "passheld_outside_attachment_load",
@@ -528,6 +533,26 @@ impl PassObstacle {
             Self::GuestMemoryVisibility => "passheld_outside_guest_memory_visibility",
             Self::Gather => "passheld_outside_gather",
             Self::QueryReset => "passheld_outside_query_reset",
+        }
+    }
+
+    /// The `passreopen_*` route for an encoder continuation whose preceding
+    /// native pass was closed by this obstacle.
+    fn reopen_route(self) -> &'static str {
+        match self {
+            Self::RenderTargetBarrier => "passreopen_outside_render_target_barrier",
+            Self::RenderBarrier => "passreopen_outside_render_barrier",
+            Self::Snapshot => "passreopen_outside_snapshot",
+            Self::Seed => "passreopen_outside_seed",
+            Self::AttachmentLoad => "passreopen_outside_attachment_load",
+            Self::TargetLayout => "passreopen_outside_target_layout",
+            Self::ClearWait => "passreopen_outside_clear_wait",
+            Self::ResidentLayout => "passreopen_outside_resident_layout",
+            Self::SampledUpload => "passreopen_outside_sampled_upload",
+            Self::GuestMemoryVisibility => "passreopen_outside_guest_memory_visibility",
+            Self::Gather => "passreopen_outside_gather",
+            Self::MrtLayout => "passreopen_outside_mrt_layout",
+            Self::QueryReset => "passreopen_outside_query_reset",
         }
     }
 }
@@ -605,6 +630,34 @@ fn render_target_fragment_dependency() -> (
         vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
         vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::TRANSFER,
         vk::AccessFlags::SHADER_READ | vk::AccessFlags::TRANSFER_READ,
+        vk::DependencyFlags::empty(),
+    )
+}
+
+fn is_render_target_fragment_barrier(barrier: &reims_vgpu_core::RenderBarrier) -> bool {
+    matches!(
+        barrier,
+        reims_vgpu_core::RenderBarrier::Scope { scope, after, before }
+            if *scope == reims_vgpu_core::RenderBarrierScope::RENDER_TARGETS
+                && *after == reims_vgpu_core::RenderBarrierStages::FRAGMENT
+                && *before == reims_vgpu_core::RenderBarrierStages::FRAGMENT
+    )
+}
+
+/// Conservative native realization for every admitted render barrier whose
+/// exact Vulkan resource/stage projection is not yet narrower.
+fn generic_render_barrier_dependency() -> (
+    vk::PipelineStageFlags,
+    vk::AccessFlags,
+    vk::PipelineStageFlags,
+    vk::AccessFlags,
+    vk::DependencyFlags,
+) {
+    (
+        vk::PipelineStageFlags::ALL_COMMANDS,
+        vk::AccessFlags::MEMORY_WRITE,
+        vk::PipelineStageFlags::ALL_COMMANDS,
+        vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
         vk::DependencyFlags::empty(),
     )
 }
@@ -5577,24 +5630,38 @@ pub(crate) unsafe fn execute_draw_inner(
         vk::DependencyFlags::empty()
     };
 
-    if req.render_target_fragment_barrier {
-        // Metal's render-target scope is resource-wide. Vulkan requires an
-        // in-render-pass dependency whose source is a framebuffer-space stage
-        // to carry BY_REGION, which would order only matching framebuffer
-        // coordinates. End the Vulkan pass instance and express the full
-        // dependency here instead; the command buffer and decoded Metal
-        // encoder remain open, so this introduces neither CPU completion nor a
-        // queue submission boundary.
+    if !req.render_barriers.is_empty() {
+        // A Metal render barrier sits between draws, while Vulkan cannot record
+        // a resource-wide pipeline barrier inside this render pass. End only
+        // the native pass instance and record the dependency in the same
+        // command buffer; the decoded Metal encoder and deferred batch remain
+        // open, so this adds neither CPU completion nor a queue submission.
         //
-        // TRANSFER_READ is included because the snapshot fallback below is an
-        // implementation of a later fragment read. When that rail is selected,
-        // the copy must consume the same visibility the guest granted to the
-        // fragment shader.
+        // The common exact target/fragment form keeps its narrower proven
+        // projection, including TRANSFER_READ for a snapshot implementing the
+        // later fragment read. Other admitted forms use the conservative
+        // global dependency while their typed scope and identities remain in
+        // the core command for future narrowing.
+        let exact_target_fragment = req.render_barriers.len() == 1
+            && is_render_target_fragment_barrier(&req.render_barriers[0]);
         unsafe {
-            outside_pass.before_record(PassObstacle::RenderTargetBarrier, pools, &ctx.device, cb)
+            outside_pass.before_record(
+                if exact_target_fragment {
+                    PassObstacle::RenderTargetBarrier
+                } else {
+                    PassObstacle::RenderBarrier
+                },
+                pools,
+                &ctx.device,
+                cb,
+            )
         };
         let (src_stage, src_access, dst_stage, dst_access, dependency_flags) =
-            render_target_fragment_dependency();
+            if exact_target_fragment {
+                render_target_fragment_dependency()
+            } else {
+                generic_render_barrier_dependency()
+            };
         let barrier = [vk::MemoryBarrier::default()
             .src_access_mask(src_access)
             .dst_access_mask(dst_access)];
@@ -5607,7 +5674,14 @@ pub(crate) unsafe fn execute_draw_inner(
             &[],
             &[],
         );
-        crate::telemetry::note_route("render_target_fragment_barrier_recorded");
+        if exact_target_fragment {
+            crate::telemetry::note_route("render_target_fragment_barrier_recorded");
+        } else {
+            crate::telemetry::note_route_n(
+                "render_barrier_recorded",
+                req.render_barriers.len() as u64,
+            );
+        }
     }
 
     phase.enter(super::draw_phase::Phase::RecBarrierImportedTest);
@@ -6844,28 +6918,16 @@ pub(crate) unsafe fn execute_draw_inner(
             "passbegin_encoder_first"
         });
         if req.continues_render_pass {
-            crate::telemetry::note_route(match pass_merge_route {
-                "passmerge_no_join" => "passreopen_no_join",
-                "passmerge_pass_differs" => "passreopen_pass_differs",
-                "passmerge_outside_render_target_barrier" => {
-                    "passreopen_outside_render_target_barrier"
-                }
-                "passmerge_outside_snapshot" => "passreopen_outside_snapshot",
-                "passmerge_outside_seed" => "passreopen_outside_seed",
-                "passmerge_outside_attachment_load" => "passreopen_outside_attachment_load",
-                "passmerge_outside_target_layout" => "passreopen_outside_target_layout",
-                "passmerge_outside_clear_wait" => "passreopen_outside_clear_wait",
-                "passmerge_outside_resident_layout" => "passreopen_outside_resident_layout",
-                "passmerge_outside_sampled_upload" => "passreopen_outside_sampled_upload",
-                "passmerge_outside_guest_memory_visibility" => {
-                    "passreopen_outside_guest_memory_visibility"
-                }
-                "passmerge_outside_gather" => "passreopen_outside_gather",
-                "passmerge_outside_mrt_layout" => "passreopen_outside_mrt_layout",
-                "passmerge_outside_query_reset" => "passreopen_outside_query_reset",
-                "passmerge_reachable" => "passreopen_reachable",
-                _ => unreachable!("pass merge route is exhaustive"),
-            });
+            let reopen_route = if !joins {
+                "passreopen_no_join"
+            } else if !continues {
+                "passreopen_pass_differs"
+            } else {
+                outside_pass
+                    .first
+                    .map_or("passreopen_reachable", PassObstacle::reopen_route)
+            };
+            crate::telemetry::note_route(reopen_route);
         }
         // An encoder boundary, a different pass instance, or an intervening
         // outside-pass command closes whatever the predecessor left open. A
@@ -8133,6 +8195,51 @@ mod tests {
         assert!(dst_access.contains(vk::AccessFlags::SHADER_READ));
         assert!(dst_access.contains(vk::AccessFlags::TRANSFER_READ));
         assert!(dependency_flags.is_empty());
+    }
+
+    #[test]
+    fn generic_render_barriers_use_a_global_read_write_dependency() {
+        let (src_stage, src_access, dst_stage, dst_access, dependency_flags) =
+            generic_render_barrier_dependency();
+        assert_eq!(src_stage, vk::PipelineStageFlags::ALL_COMMANDS);
+        assert_eq!(src_access, vk::AccessFlags::MEMORY_WRITE);
+        assert_eq!(dst_stage, vk::PipelineStageFlags::ALL_COMMANDS);
+        assert_eq!(
+            dst_access,
+            vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE
+        );
+        assert!(dependency_flags.is_empty());
+    }
+
+    #[test]
+    fn every_render_barrier_obstacle_has_an_exhaustive_reopen_route() {
+        assert_eq!(
+            PassObstacle::RenderTargetBarrier.reopen_route(),
+            "passreopen_outside_render_target_barrier"
+        );
+        assert_eq!(
+            PassObstacle::RenderBarrier.reopen_route(),
+            "passreopen_outside_render_barrier"
+        );
+    }
+
+    #[test]
+    fn only_the_exact_target_fragment_form_uses_the_narrow_dependency() {
+        let exact = reims_vgpu_core::RenderBarrier::Scope {
+            scope: reims_vgpu_core::RenderBarrierScope::RENDER_TARGETS,
+            after: reims_vgpu_core::RenderBarrierStages::FRAGMENT,
+            before: reims_vgpu_core::RenderBarrierStages::FRAGMENT,
+        };
+        let wider = reims_vgpu_core::RenderBarrier::Scope {
+            scope: reims_vgpu_core::RenderBarrierScope::ALL,
+            after: reims_vgpu_core::RenderBarrierStages::FRAGMENT,
+            before: reims_vgpu_core::RenderBarrierStages::FRAGMENT,
+        };
+        assert!(is_render_target_fragment_barrier(&exact));
+        assert!(!is_render_target_fragment_barrier(&wider));
+        assert!(!is_render_target_fragment_barrier(
+            &reims_vgpu_core::RenderBarrier::Texture
+        ));
     }
 
     #[test]

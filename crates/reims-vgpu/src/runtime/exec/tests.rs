@@ -3956,7 +3956,7 @@ fn direct_icb_barrier_and_direct_expand_in_encoder_order() {
         args_buffer_offset: 0,
         inherited: direct(0x51),
     });
-    acc.push_barrier(false);
+    acc.push_barrier(reims_vgpu_core::RenderBarrier::Texture);
     acc.push_draw(direct(0x61));
 
     let mut out = ExecResult::default();
@@ -3971,7 +3971,10 @@ fn direct_icb_barrier_and_direct_expand_in_encoder_order() {
     );
     assert_eq!(expanded.draws[1].icb_ref, Some(0x91));
     assert_eq!(expanded.draws[1].draw.base_instance, 5);
-    assert_eq!(expanded.barriers_after_draw, [2]);
+    assert_eq!(
+        expanded.barriers_before_draw,
+        [(2, reims_vgpu_core::RenderBarrier::Texture)]
+    );
     assert_eq!(out.render_icb_fail, 0);
 }
 
@@ -4040,10 +4043,9 @@ fn a_buffer_offset_that_lands_on_nothing_reports_which_way_it_missed() {
 /// Residency hints remain measurable no-ops, while barriers retain their exact
 /// position and decoded dependency domain in the stream.
 ///
-/// The barrier used to share the residency answer on the claim that every draw
-/// already had a pass boundary. Deferred same-target batches invalidate that
-/// claim: without this transition a later draw can run in the same open batch
-/// as the writes the guest explicitly ordered before it.
+/// The barrier used to share the residency answer on the claim that a submit
+/// boundary was a memory dependency. It is not: the resolved command must
+/// reach the backend at its exact position while residency hints remain no-ops.
 #[test]
 fn render_barriers_preserve_position_and_scope_while_residency_stays_a_noop() {
     use crate::runtime::drain::store_route_count;
@@ -4116,22 +4118,22 @@ fn render_barriers_preserve_position_and_scope_while_residency_stays_a_noop() {
         ),
         (
             wire_render::OPCODE_MEMORY_BARRIER_RESOURCES,
-            "render_barrier_submission_boundary",
+            "render_barrier_resources",
             core::mem::size_of::<wire_render::MemoryBarrierResources>()
                 + core::mem::size_of::<wire_render::RefBind>(),
-            1,
+            0,
         ),
         (
             wire_render::OPCODE_MEMORY_BARRIER_SCOPE,
-            "render_barrier_submission_boundary",
+            "render_barrier_scope",
             core::mem::size_of::<wire_render::MemoryBarrierScope>(),
-            1,
+            0,
         ),
         (
             wire_render::OPCODE_TEXTURE_BARRIER,
-            "render_barrier_submission_boundary",
+            "render_barrier_texture",
             0,
-            1,
+            0,
         ),
     ] {
         let probe = Arc::new(BarrierProbe::default());
@@ -4161,12 +4163,10 @@ fn render_barriers_preserve_position_and_scope_while_residency_stays_a_noop() {
             0,
             "record walking cannot submit draws that finish_stream has not executed"
         );
-        if expected_flushes != 0 {
+        if op == wire_render::OPCODE_TEXTURE_BARRIER {
             assert_eq!(
                 acc.render_work,
-                [RenderWork::Barrier {
-                    render_target_fragment: false,
-                }],
+                [RenderWork::Barrier(reims_vgpu_core::RenderBarrier::Texture)],
                 "the barrier must retain its exact position before execution"
             );
         }
@@ -4178,10 +4178,9 @@ fn render_barriers_preserve_position_and_scope_while_residency_stays_a_noop() {
         );
     }
 
-    // The exact render-target/fragment-to-fragment form is carried to the next
-    // draw instead of forcing command-buffer completion. Its four payload bytes
-    // are the decoded API fields, so nearby scope/stage forms remain on the
-    // conservative submission boundary exercised above.
+    // The exact render-target/fragment-to-fragment form retains all four
+    // decoded API fields. Vulkan may project this common shape more narrowly;
+    // other admitted forms remain typed and use its conservative dependency.
     let probe = Arc::new(BarrierProbe::default());
     let mut state = Device::new_with_executor(DeviceId(1), PAGE_SHIFT_ARM64E, probe.clone());
     let host = FakeHost::new();
@@ -4205,33 +4204,153 @@ fn render_barriers_preserve_position_and_scope_while_residency_stays_a_noop() {
     );
     assert_eq!(
         acc.render_work,
-        [RenderWork::Barrier {
-            render_target_fragment: true,
-        }]
+        [RenderWork::Barrier(reims_vgpu_core::RenderBarrier::Scope {
+            scope: reims_vgpu_core::RenderBarrierScope::RENDER_TARGETS,
+            after: reims_vgpu_core::RenderBarrierStages::FRAGMENT,
+            before: reims_vgpu_core::RenderBarrierStages::FRAGMENT,
+        })]
     );
     assert_eq!(probe.flushes.load(Ordering::Relaxed), 0);
 
+    let barrier = reims_vgpu_core::RenderBarrier::Texture;
     let mut cursor = 0;
-    assert!(!take_target_fragment_barrier_at(&[1, 1, 3], &mut cursor, 0));
-    assert!(take_target_fragment_barrier_at(&[1, 1, 3], &mut cursor, 1));
-    assert_eq!(cursor, 2);
-    assert!(!take_target_fragment_barrier_at(&[1, 1, 3], &mut cursor, 2));
-    assert!(take_target_fragment_barrier_at(&[1, 1, 3], &mut cursor, 3));
-    assert_eq!(cursor, 3);
-
-    let probe = Arc::new(BarrierProbe::default());
-    let state = Device::new_with_executor(DeviceId(1), PAGE_SHIFT_ARM64E, probe.clone());
-    let mut cursor = 0;
-    let positions = [1, 1, 3];
-    flush_render_barriers_at(&state, &positions, &mut cursor, 0);
-    assert_eq!(probe.flushes.load(Ordering::Relaxed), 0);
-    flush_render_barriers_at(&state, &positions, &mut cursor, 1);
-    assert_eq!(probe.flushes.load(Ordering::Relaxed), 2);
-    flush_render_barriers_at(&state, &positions, &mut cursor, 2);
-    assert_eq!(probe.flushes.load(Ordering::Relaxed), 2);
-    flush_render_barriers_at(&state, &positions, &mut cursor, 3);
-    assert_eq!(probe.flushes.load(Ordering::Relaxed), 3);
+    let positions = [(1, barrier.clone()), (1, barrier.clone()), (3, barrier)];
+    let mut pending = Vec::new();
+    append_render_barriers_at(&positions, &mut cursor, 0, &mut pending);
+    assert!(pending.is_empty());
+    append_render_barriers_at(&positions, &mut cursor, 1, &mut pending);
+    assert_eq!(pending.len(), 2);
+    append_render_barriers_at(&positions, &mut cursor, 2, &mut pending);
+    assert_eq!(pending.len(), 2);
+    append_render_barriers_at(&positions, &mut cursor, 3, &mut pending);
+    assert_eq!(pending.len(), 3);
     assert_eq!(cursor, positions.len());
+}
+
+#[test]
+fn render_barrier_resources_are_resolved_generationally_and_invalid_terms_refuse() {
+    use crate::model::TaskResource;
+    use crate::runtime::decode::resource::ListObjectEntry;
+    use reims_vgpu_protocol::{ObjectKind, ObjectTableRef};
+
+    fn resource() -> Arc<TaskResource> {
+        Arc::new(TaskResource::new(
+            ListObjectEntry::new(ObjectKind::Buffer, 0, 0),
+            Arc::from([]),
+        ))
+    }
+
+    let state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let first = state.task_objects.resources.register(1, 77, resource());
+    let command = render::Command {
+        kind: RenderKind::BarrierResources,
+        barrier_after_stages: 1,
+        barrier_before_stages: 2,
+        barrier_resources: vec![ObjectTableRef::new(77)],
+        ..Default::default()
+    };
+    let first_barrier = resolved_render_barrier(&state, &host, 1, &command)
+        .expect("valid barrier")
+        .expect("nonempty barrier");
+    let reims_vgpu_core::RenderBarrier::Resources { resources, .. } = &first_barrier else {
+        panic!("resource-list barrier changed domain");
+    };
+    assert_eq!(resources[0].id, first.semantic_id().unwrap());
+    assert_eq!(resources[0].lifetime.id(), first.lifetime_ref().id());
+
+    assert!(state.task_objects.resources.delete(1, 77));
+    let replacement = state.task_objects.resources.register(1, 77, resource());
+    let replacement_barrier = resolved_render_barrier(&state, &host, 1, &command)
+        .expect("valid replacement barrier")
+        .expect("nonempty replacement barrier");
+    let reims_vgpu_core::RenderBarrier::Resources { resources, .. } = replacement_barrier else {
+        panic!("replacement changed domain");
+    };
+    assert_eq!(resources[0].id, replacement.semantic_id().unwrap());
+    assert_ne!(
+        first_barrier,
+        reims_vgpu_core::RenderBarrier::Resources {
+            resources,
+            after: reims_vgpu_core::RenderBarrierStages::VERTEX,
+            before: reims_vgpu_core::RenderBarrierStages::FRAGMENT,
+        }
+    );
+
+    let unsupported = render::Command {
+        kind: RenderKind::BarrierScope,
+        barrier_scope: 1,
+        barrier_after_stages: 4,
+        barrier_before_stages: 2,
+        ..Default::default()
+    };
+    assert_eq!(
+        resolved_render_barrier(&state, &host, 1, &unsupported),
+        Err(RenderBarrierRefusal::UnsupportedStages {
+            side: "after",
+            raw: 4,
+        })
+    );
+    let unidentified = render::Command {
+        kind: RenderKind::BarrierScope,
+        barrier_scope: 1,
+        barrier_unidentified_u8: 1,
+        barrier_after_stages: 1,
+        barrier_before_stages: 2,
+        ..Default::default()
+    };
+    assert_eq!(
+        resolved_render_barrier(&state, &host, 1, &unidentified),
+        Err(RenderBarrierRefusal::UnidentifiedField { raw: 1 })
+    );
+}
+
+#[test]
+fn a_render_barrier_survives_a_refused_draw_until_one_is_recorded() {
+    let barrier = reims_vgpu_core::RenderBarrier::Texture;
+    let mut pending = vec![barrier.clone()];
+    retire_render_barriers_after(EncodeStatus::MissingPipeline("test_refusal"), &mut pending);
+    assert_eq!(pending, [barrier], "a pre-backend refusal consumes nothing");
+    retire_render_barriers_after(EncodeStatus::Ok, &mut pending);
+    assert!(
+        pending.is_empty(),
+        "the recorded draw consumes the dependency"
+    );
+}
+
+#[test]
+fn a_malformed_render_barrier_refuses_only_later_state_snapshots() {
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    assert!(
+        acc.bind_snapshot().is_ok(),
+        "state before the barrier is valid"
+    );
+
+    let mut command = vec![0u8; wire_render::MEMORY_BARRIER_SCOPE_TOTAL_LEN as usize];
+    st32(&mut command, wire_render::OPCODE_MEMORY_BARRIER_SCOPE);
+    st32(
+        &mut command[4..],
+        wire_render::MEMORY_BARRIER_SCOPE_TOTAL_LEN,
+    );
+    command[reims_vgpu_wire::OP_HEADER_LEN..][..4].copy_from_slice(&[1, 1, 1, 2]);
+    handle_render_record(
+        &mut state,
+        &host,
+        1,
+        wire_render::OPCODE_MEMORY_BARRIER_SCOPE,
+        &command,
+        &mut out,
+        &mut acc,
+    );
+    assert!(matches!(
+        acc.bind_snapshot(),
+        Err(StreamRefusal::Barrier(
+            RenderBarrierRefusal::UnidentifiedField { raw: 1 }
+        ))
+    ));
 }
 
 /// The three ICB blit records are told apart rather than refused as one.

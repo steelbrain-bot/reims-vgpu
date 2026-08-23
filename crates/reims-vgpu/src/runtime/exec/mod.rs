@@ -71,11 +71,11 @@ struct RenderIcbExecute {
     inherited: PendingDraw,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum RenderWork {
     Draw(usize),
     ExecuteIcb(usize),
-    Barrier { render_target_fragment: bool },
+    Barrier(reims_vgpu_core::RenderBarrier),
 }
 
 /// One draw recorded with the bind state at that point (archive DrawRec / multi-draw job).
@@ -472,10 +472,8 @@ impl StreamAccum {
         self.render_work.push(RenderWork::ExecuteIcb(index));
     }
 
-    fn push_barrier(&mut self, render_target_fragment: bool) {
-        self.render_work.push(RenderWork::Barrier {
-            render_target_fragment,
-        });
+    fn push_barrier(&mut self, barrier: reims_vgpu_core::RenderBarrier) {
+        self.render_work.push(RenderWork::Barrier(barrier));
     }
 
     /// The subset of [`Self::clears`] whose colour the guest may read back, so
@@ -3089,16 +3087,9 @@ fn handle_render_record<M: HostMemory + HostOps>(
             crate::runtime::drain::note_store_route("render_noop_residency_hint");
         }
         RenderKind::BarrierResources | RenderKind::BarrierScope | RenderKind::TextureBarrier => {
-            // A render barrier orders following fragment reads after preceding
-            // draw writes, including reads of a render target. Draws can remain
-            // in one deferred backend batch, so the tranche tail is not a
-            // boundary here. Retain the exact draw position so finish_stream
-            // submits the batch there; the backend queue orders the next draw
-            // after it and reopening the continued pass LOADs the content it
-            // produced.
-            // This is deliberately stronger than a resource/scope-qualified
-            // barrier, but it preserves the guest-visible ordering without
-            // reconstructing a narrower answer from unrelated state.
+            // Retain the resolved dependency at its exact encoder position.
+            // The next successfully recorded draw carries it into the backend;
+            // a refused draw cannot consume ordering that no command recorded.
             crate::runtime::drain::note_store_route(match cmd.kind {
                 RenderKind::BarrierResources => "render_barrier_resources",
                 RenderKind::BarrierScope => "render_barrier_scope",
@@ -3126,17 +3117,17 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     _ => "render_barrier_stages_other",
                 },
             );
-            let render_target_fragment = cmd.kind == RenderKind::BarrierScope
-                && cmd.barrier_scope == 4
-                && cmd.barrier_unidentified_u8 == 0
-                && cmd.barrier_after_stages == 2
-                && cmd.barrier_before_stages == 2;
-            acc.push_barrier(render_target_fragment);
-            crate::runtime::drain::note_store_route(if render_target_fragment {
-                "render_barrier_target_fragment_deferred"
-            } else {
-                "render_barrier_submission_boundary"
-            });
+            match resolved_render_barrier(state, host, task_id, &cmd) {
+                Ok(Some(barrier)) => acc.push_barrier(barrier),
+                Ok(None) => crate::runtime::drain::note_store_route("render_barrier_empty"),
+                Err(refusal) => {
+                    crate::observe::Emit::decline("render_barrier", &refusal)
+                        .field("task", task_id)
+                        .fail_once(refusal.latch());
+                    acc.unrepresentable
+                        .get_or_insert(StreamRefusal::Barrier(refusal));
+                }
+            }
         }
         // The tile-shader family. Nine opcodes that used to reach
         // `OtherAccepted` together, split here into the three different things
@@ -3539,6 +3530,7 @@ fn note_draw_refused(refusal: StreamRefusal, pipeline_ref: u32, site: &'static s
         StreamRefusal::Visibility(state) => crate::observe::Emit::decline("render_draw", &state),
         StreamRefusal::PassAction(action) => crate::observe::Emit::decline("render_draw", &action),
         StreamRefusal::PassExtent(extent) => crate::observe::Emit::decline("render_draw", &extent),
+        StreamRefusal::Barrier(barrier) => crate::observe::Emit::decline("render_draw", &barrier),
     };
     emit.field("site", site)
         .field("pipeline_ref", pipeline_ref)
@@ -3625,6 +3617,7 @@ impl StreamRefusal {
                     | (u64::from(extent.axis == "height") << 54)
                     | (extent.raw & ((1 << 54) - 1))
             }
+            Self::Barrier(barrier) => (1 << 53) | barrier.latch(),
         }
     }
 }
@@ -3714,6 +3707,156 @@ enum StreamRefusal {
     /// A non-zero pass raster dimension that cannot be represented by the
     /// backend-independent image geometry.
     PassExtent(PassExtentRefusal),
+    /// A barrier carried a stage, scope, reserved byte, or resource reference
+    /// that cannot be represented as a resolved command.
+    Barrier(RenderBarrierRefusal),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenderBarrierRefusal {
+    UnsupportedStages { side: &'static str, raw: u16 },
+    UnsupportedScope { raw: u8 },
+    UnidentifiedField { raw: u8 },
+    ResourceUnavailable { index: u32, object_ref: u32 },
+}
+
+impl RenderBarrierRefusal {
+    fn latch(self) -> u64 {
+        match self {
+            Self::UnsupportedStages { side, raw } => {
+                u64::from(raw) | (u64::from(side == "before") << 16)
+            }
+            Self::UnsupportedScope { raw } => (1 << 20) | u64::from(raw),
+            Self::UnidentifiedField { raw } => (1 << 21) | u64::from(raw),
+            Self::ResourceUnavailable { index, object_ref } => {
+                (1 << 22) | (u64::from(index) << 32) | u64::from(object_ref)
+            }
+        }
+    }
+}
+
+impl crate::observe::Decline for RenderBarrierRefusal {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::UnsupportedStages { .. } => "render_barrier_stages_unsupported",
+            Self::UnsupportedScope { .. } => "render_barrier_scope_unsupported",
+            Self::UnidentifiedField { .. } => "render_barrier_unidentified_field",
+            Self::ResourceUnavailable { .. } => "render_barrier_resource_unavailable",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::UnsupportedStages { side, raw } => {
+                vec![("side", (*side).into()), ("raw", raw.to_string())]
+            }
+            Self::UnsupportedScope { raw } | Self::UnidentifiedField { raw } => {
+                vec![("raw", raw.to_string())]
+            }
+            Self::ResourceUnavailable { index, object_ref } => vec![
+                ("index", index.to_string()),
+                ("object_ref", format!("{object_ref:#x}")),
+            ],
+        }
+    }
+}
+
+fn resolved_render_barrier<M: HostMemory + HostOps>(
+    state: &Device,
+    host: &M,
+    task_id: u32,
+    cmd: &render::Command,
+) -> Result<Option<reims_vgpu_core::RenderBarrier>, RenderBarrierRefusal> {
+    use reims_vgpu_core::{RenderBarrier, RenderBarrierScope, RenderBarrierStages};
+
+    if cmd.kind == RenderKind::TextureBarrier {
+        return Ok(Some(RenderBarrier::Texture));
+    }
+    let after = RenderBarrierStages::from_bits(cmd.barrier_after_stages).ok_or(
+        RenderBarrierRefusal::UnsupportedStages {
+            side: "after",
+            raw: cmd.barrier_after_stages,
+        },
+    )?;
+    let before = RenderBarrierStages::from_bits(cmd.barrier_before_stages).ok_or(
+        RenderBarrierRefusal::UnsupportedStages {
+            side: "before",
+            raw: cmd.barrier_before_stages,
+        },
+    )?;
+    let implemented = RenderBarrierStages::VERTEX_FRAGMENT;
+    if !after.is_subset_of(implemented) {
+        return Err(RenderBarrierRefusal::UnsupportedStages {
+            side: "after",
+            raw: cmd.barrier_after_stages,
+        });
+    }
+    if !before.is_subset_of(implemented) {
+        return Err(RenderBarrierRefusal::UnsupportedStages {
+            side: "before",
+            raw: cmd.barrier_before_stages,
+        });
+    }
+    if after.is_empty() || before.is_empty() {
+        return Ok(None);
+    }
+    match cmd.kind {
+        RenderKind::BarrierResources => {
+            let mut resources = Vec::with_capacity(cmd.barrier_resources.len());
+            for (index, object_ref) in cmd.barrier_resources.iter().enumerate() {
+                let raw = object_ref.get();
+                let resource =
+                    objects::resolve_resource(state, host, task_id, raw).map_err(|_| {
+                        RenderBarrierRefusal::ResourceUnavailable {
+                            index: index as u32,
+                            object_ref: raw,
+                        }
+                    })?;
+                let semantic =
+                    resource
+                        .semantic_id()
+                        .ok_or(RenderBarrierRefusal::ResourceUnavailable {
+                            index: index as u32,
+                            object_ref: raw,
+                        })?;
+                resources.push(reims_vgpu_core::RenderBarrierResource {
+                    id: semantic,
+                    lifetime: resource.lifetime(),
+                });
+            }
+            if resources.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(RenderBarrier::Resources {
+                    resources: resources.into(),
+                    after,
+                    before,
+                }))
+            }
+        }
+        RenderKind::BarrierScope => {
+            if cmd.barrier_unidentified_u8 != 0 {
+                return Err(RenderBarrierRefusal::UnidentifiedField {
+                    raw: cmd.barrier_unidentified_u8,
+                });
+            }
+            let scope = RenderBarrierScope::from_bits(cmd.barrier_scope).ok_or(
+                RenderBarrierRefusal::UnsupportedScope {
+                    raw: cmd.barrier_scope,
+                },
+            )?;
+            if scope.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(RenderBarrier::Scope {
+                    scope,
+                    after,
+                    before,
+                }))
+            }
+        }
+        _ => unreachable!("render barrier kind checked by caller"),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4024,8 +4167,7 @@ fn apply_binds<T: Copy, B: Clone>(
 #[derive(Debug, Default)]
 struct ExpandedRenderWork {
     draws: Vec<PendingDraw>,
-    barriers_after_draw: Vec<usize>,
-    target_fragment_barriers_after_draw: Vec<usize>,
+    barriers_before_draw: Vec<(usize, reims_vgpu_core::RenderBarrier)>,
 }
 
 fn render_icb_refusal(
@@ -4187,15 +4329,11 @@ fn expand_render_work<M: HostMemory + HostOps>(
                     expanded.draws.push(draw.clone());
                 }
             }
-            RenderWork::Barrier {
-                render_target_fragment,
-            } => {
+            RenderWork::Barrier(ref barrier) => {
                 let position = expanded.draws.len();
-                if render_target_fragment {
-                    expanded.target_fragment_barriers_after_draw.push(position);
-                } else {
-                    expanded.barriers_after_draw.push(position);
-                }
+                expanded
+                    .barriers_before_draw
+                    .push((position, barrier.clone()));
             }
             RenderWork::ExecuteIcb(index) => {
                 let Some(execute) = acc.execute_icb.get(index) else {
@@ -4287,44 +4425,30 @@ fn expand_render_work<M: HostMemory + HostOps>(
     expanded
 }
 
-/// Submit every recorded render barrier at or before one draw position.
-///
-/// Positions are appended while the wire is walked, so they are sorted. The
-/// cursor makes each command effective exactly once, including consecutive and
-/// trailing barriers. `<=` also preserves ordering after an earlier draw
-/// refusal skips directly to the chain tail.
-fn flush_render_barriers_at(
-    state: &Device,
-    positions: &[usize],
+/// Append every barrier at or before one draw position to the unresolved
+/// dependency carried into the next successfully recorded draw.
+fn append_render_barriers_at(
+    barriers: &[(usize, reims_vgpu_core::RenderBarrier)],
     cursor: &mut usize,
     draw_position: usize,
+    pending: &mut Vec<reims_vgpu_core::RenderBarrier>,
 ) {
-    while positions
+    while barriers
         .get(*cursor)
-        .is_some_and(|position| *position <= draw_position)
+        .is_some_and(|(position, _)| *position <= draw_position)
     {
-        state.executor.flush_submission_tail();
+        pending.push(barriers[*cursor].1.clone());
         *cursor += 1;
     }
 }
 
-/// Consume render-target fragment barriers immediately preceding this draw.
-/// Several consecutive barriers have the same memory-ordering effect, so the
-/// draw request carries one semantic dependency while this cursor still proves
-/// that every decoded record reached its exact encoder position.
-fn take_target_fragment_barrier_at(
-    positions: &[usize],
-    cursor: &mut usize,
-    draw_position: usize,
-) -> bool {
-    let before = *cursor;
-    while positions
-        .get(*cursor)
-        .is_some_and(|position| *position <= draw_position)
-    {
-        *cursor += 1;
+fn retire_render_barriers_after(
+    status: EncodeStatus,
+    pending: &mut Vec<reims_vgpu_core::RenderBarrier>,
+) {
+    if status == EncodeStatus::Ok {
+        pending.clear();
     }
-    *cursor != before
 }
 
 fn finish_stream<M: HostMemory + HostOps>(
@@ -4366,13 +4490,7 @@ fn finish_stream<M: HostMemory + HostOps>(
         // barrier positions measured against this exact list.
         let draw_list: Vec<&PendingDraw> = expanded.draws.iter().collect();
         let mut render_barrier_cursor = 0;
-        let mut target_fragment_barrier_cursor = 0;
-        flush_render_barriers_at(
-            state,
-            &expanded.barriers_after_draw,
-            &mut render_barrier_cursor,
-            0,
-        );
+        let mut pending_render_barriers = Vec::new();
         let mut chain_rgba: Option<Vec<u8>> = None;
         // Occlusion counts, keyed by the guest byte offset each lands at.
         //
@@ -4484,23 +4602,12 @@ fn finish_stream<M: HostMemory + HostOps>(
                 }
             }
             previous = Some(pd);
-            let barrier_cursor_before = render_barrier_cursor;
-            flush_render_barriers_at(
-                state,
-                &expanded.barriers_after_draw,
+            append_render_barriers_at(
+                &expanded.barriers_before_draw,
                 &mut render_barrier_cursor,
                 di,
+                &mut pending_render_barriers,
             );
-            // A barrier seals the command buffer, so it is a reset point for
-            // any dirty-flag skip: the per-command-buffer staging memo goes
-            // with the seal, and "one command buffer reads guest RAM at one
-            // instant" stops covering the pair. Counted so the fractions above
-            // are not read as reachable in full — they are measured across
-            // seals and this says how often one intervenes.
-            if render_barrier_cursor != barrier_cursor_before {
-                crate::runtime::drain::note_store_route("dirty_state_barrier_seal");
-                previous = None;
-            }
             fin.enter(crate::runtime::drain::FinishPhase::Retarget);
             let mut req = if di == 0 {
                 let Some(req) = first_req.take() else {
@@ -4513,11 +4620,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                 };
                 retarget_render_pass_draw(template, pd)
             };
-            req.render_target_fragment_barrier = take_target_fragment_barrier_at(
-                &expanded.target_fragment_barriers_after_draw,
-                &mut target_fragment_barrier_cursor,
-                di,
-            );
+            req.render_barriers.clone_from(&pending_render_barriers);
             {
                 fin.enter(crate::runtime::drain::FinishPhase::Binds);
                 fill_draw_binds_from_pending(&mut req, pd);
@@ -4580,6 +4683,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                 fin.enter(crate::runtime::drain::FinishPhase::Encode);
                 let encode =
                     draw::encode_draw_chain(state, host, &req, do_writeback, force_full_store);
+                retire_render_barriers_after(encode.status, &mut pending_render_barriers);
                 fin.enter(crate::runtime::drain::FinishPhase::Result);
                 // Read before the status is matched: a draw whose Store failed
                 // still ran its query, and the count is the guest's answer
@@ -4736,12 +4840,6 @@ fn finish_stream<M: HostMemory + HostOps>(
                 }
             }
         }
-        flush_render_barriers_at(
-            state,
-            &expanded.barriers_after_draw,
-            &mut render_barrier_cursor,
-            draw_list.len(),
-        );
         fin.enter(crate::runtime::drain::FinishPhase::Tail);
         write_visibility_results(state, host, task_id, acc, &visibility_counts);
         // Encode never landed Stores (unavailable operations, missing MTLB/pipeline, or
@@ -4762,15 +4860,6 @@ fn finish_stream<M: HostMemory + HostOps>(
                     out.clears_applied, out.draws_fail, saw_backend_unavailable as u8
                 ));
             }
-        }
-    }
-
-    // A barrier-only stream, or a render stream whose draws were all refused
-    // before entering the backend, can still order an open batch left by a
-    // preceding stream. No draw loop exists to consume its positions.
-    if !will_draw && !expanded.barriers_after_draw.is_empty() {
-        for _ in &expanded.barriers_after_draw {
-            state.executor.flush_submission_tail();
         }
     }
 }

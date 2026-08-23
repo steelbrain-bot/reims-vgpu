@@ -162,6 +162,31 @@ fragment float4 heavy_fs(VOut in [[stage_in]],
     return float4(colour.rgb + poison, colour.a);
 }
 
+// A render-stage resource barrier must make every producer write visible to
+// the following fragment draw in the same encoder. Each fragment owns one
+// word, avoiding atomics and data races while making the oracle cover the
+// entire raster rather than one scheduling-sensitive fragment.
+fragment float4 render_barrier_write_fs(VOut in [[stage_in]],
+                                        device uint *words [[buffer(0)]],
+                                        constant uint2 &params [[buffer(1)]]) {
+    float acc = 0.0;
+    for (int i = 0; i < 512; ++i) {
+        acc += fract(sin(float(i) * 12.9898 + in.pos.x * 0.017 + in.pos.y * 0.031) * 43758.5453);
+    }
+    uint2 p = uint2(in.pos.xy);
+    words[p.y * params.x + p.x] = params.y + uint(acc > 1.0e30);
+    return float4(0.0, 0.0, 0.0, 1.0);
+}
+
+fragment float4 render_barrier_read_fs(VOut in [[stage_in]],
+                                       device const uint *words [[buffer(0)]],
+                                       constant uint2 &params [[buffer(1)]]) {
+    uint2 p = uint2(in.pos.xy);
+    bool current = words[p.y * params.x + p.x] == params.y;
+    return current ? float4(0.0, 1.0, 0.0, 1.0)
+                   : float4(1.0, 0.0, 0.0, 1.0);
+}
+
 fragment float4 tex_fs(VOut in [[stage_in]],
                        texture2d<float, access::sample> tex [[texture(0)]]) {
     constexpr sampler s(filter::nearest, address::clamp_to_edge);
