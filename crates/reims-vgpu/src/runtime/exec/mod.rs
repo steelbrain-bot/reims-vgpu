@@ -75,7 +75,7 @@ struct RenderIcbExecute {
 enum RenderWork {
     Draw(usize),
     ExecuteIcb(usize),
-    Barrier,
+    Barrier { render_target_fragment: bool },
 }
 
 /// One draw recorded with the bind state at that point (archive DrawRec / multi-draw job).
@@ -472,8 +472,10 @@ impl StreamAccum {
         self.render_work.push(RenderWork::ExecuteIcb(index));
     }
 
-    fn push_barrier(&mut self) {
-        self.render_work.push(RenderWork::Barrier);
+    fn push_barrier(&mut self, render_target_fragment: bool) {
+        self.render_work.push(RenderWork::Barrier {
+            render_target_fragment,
+        });
     }
 
     /// The subset of [`Self::clears`] whose colour the guest may read back, so
@@ -3097,8 +3099,44 @@ fn handle_render_record<M: HostMemory + HostOps>(
             // This is deliberately stronger than a resource/scope-qualified
             // barrier, but it preserves the guest-visible ordering without
             // reconstructing a narrower answer from unrelated state.
-            acc.push_barrier();
-            crate::runtime::drain::note_store_route("render_barrier_submission_boundary");
+            crate::runtime::drain::note_store_route(match cmd.kind {
+                RenderKind::BarrierResources => "render_barrier_resources",
+                RenderKind::BarrierScope => "render_barrier_scope",
+                RenderKind::TextureBarrier => "render_barrier_texture",
+                _ => unreachable!("render barrier arm is exhaustive"),
+            });
+            if cmd.kind == RenderKind::BarrierScope {
+                crate::runtime::drain::note_store_route(match cmd.barrier_scope {
+                    1 => "render_barrier_scope_buffers",
+                    2 => "render_barrier_scope_textures",
+                    3 => "render_barrier_scope_buffers_textures",
+                    4 => "render_barrier_scope_targets",
+                    5 => "render_barrier_scope_buffers_targets",
+                    6 => "render_barrier_scope_textures_targets",
+                    7 => "render_barrier_scope_all",
+                    _ => "render_barrier_scope_unknown",
+                });
+            }
+            crate::runtime::drain::note_store_route(
+                match (cmd.barrier_after_stages, cmd.barrier_before_stages) {
+                    (1, 1) => "render_barrier_stages_vertex_vertex",
+                    (1, 2) => "render_barrier_stages_vertex_fragment",
+                    (2, 1) => "render_barrier_stages_fragment_vertex",
+                    (2, 2) => "render_barrier_stages_fragment_fragment",
+                    _ => "render_barrier_stages_other",
+                },
+            );
+            let render_target_fragment = cmd.kind == RenderKind::BarrierScope
+                && cmd.barrier_scope == 4
+                && cmd.barrier_unidentified_u8 == 0
+                && cmd.barrier_after_stages == 2
+                && cmd.barrier_before_stages == 2;
+            acc.push_barrier(render_target_fragment);
+            crate::runtime::drain::note_store_route(if render_target_fragment {
+                "render_barrier_target_fragment_deferred"
+            } else {
+                "render_barrier_submission_boundary"
+            });
         }
         // The tile-shader family. Nine opcodes that used to reach
         // `OtherAccepted` together, split here into the three different things
@@ -3987,6 +4025,7 @@ fn apply_binds<T: Copy, B: Clone>(
 struct ExpandedRenderWork {
     draws: Vec<PendingDraw>,
     barriers_after_draw: Vec<usize>,
+    target_fragment_barriers_after_draw: Vec<usize>,
 }
 
 fn render_icb_refusal(
@@ -4148,7 +4187,16 @@ fn expand_render_work<M: HostMemory + HostOps>(
                     expanded.draws.push(draw.clone());
                 }
             }
-            RenderWork::Barrier => expanded.barriers_after_draw.push(expanded.draws.len()),
+            RenderWork::Barrier {
+                render_target_fragment,
+            } => {
+                let position = expanded.draws.len();
+                if render_target_fragment {
+                    expanded.target_fragment_barriers_after_draw.push(position);
+                } else {
+                    expanded.barriers_after_draw.push(position);
+                }
+            }
             RenderWork::ExecuteIcb(index) => {
                 let Some(execute) = acc.execute_icb.get(index) else {
                     continue;
@@ -4260,6 +4308,25 @@ fn flush_render_barriers_at(
     }
 }
 
+/// Consume render-target fragment barriers immediately preceding this draw.
+/// Several consecutive barriers have the same memory-ordering effect, so the
+/// draw request carries one semantic dependency while this cursor still proves
+/// that every decoded record reached its exact encoder position.
+fn take_target_fragment_barrier_at(
+    positions: &[usize],
+    cursor: &mut usize,
+    draw_position: usize,
+) -> bool {
+    let before = *cursor;
+    while positions
+        .get(*cursor)
+        .is_some_and(|position| *position <= draw_position)
+    {
+        *cursor += 1;
+    }
+    *cursor != before
+}
+
 fn finish_stream<M: HostMemory + HostOps>(
     state: &mut Device,
     host: &mut M,
@@ -4299,6 +4366,7 @@ fn finish_stream<M: HostMemory + HostOps>(
         // barrier positions measured against this exact list.
         let draw_list: Vec<&PendingDraw> = expanded.draws.iter().collect();
         let mut render_barrier_cursor = 0;
+        let mut target_fragment_barrier_cursor = 0;
         flush_render_barriers_at(
             state,
             &expanded.barriers_after_draw,
@@ -4434,6 +4502,11 @@ fn finish_stream<M: HostMemory + HostOps>(
                 };
                 retarget_render_pass_draw(template, pd)
             };
+            req.render_target_fragment_barrier = take_target_fragment_barrier_at(
+                &expanded.target_fragment_barriers_after_draw,
+                &mut target_fragment_barrier_cursor,
+                di,
+            );
             {
                 fin.enter(crate::runtime::drain::FinishPhase::Binds);
                 fill_draw_binds_from_pending(&mut req, pd);

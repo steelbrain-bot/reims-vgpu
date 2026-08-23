@@ -446,6 +446,9 @@ fn compute_gather_enabled() -> bool {
 /// name would simply be missing from one of them.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PassObstacle {
+    /// A resource-wide render-target dependency from prior fragment work to
+    /// this draw's fragment reads.
+    RenderTargetBarrier,
     /// A target sampled by its own draw, captured before the attachment changes.
     Snapshot,
     /// The seed copy that gives a `LOAD` pass its prior content.
@@ -493,6 +496,7 @@ impl PassObstacle {
     /// as this device records today.
     fn route(self) -> &'static str {
         match self {
+            Self::RenderTargetBarrier => "passmerge_outside_render_target_barrier",
             Self::Snapshot => "passmerge_outside_snapshot",
             Self::Seed => "passmerge_outside_seed",
             Self::AttachmentLoad => "passmerge_outside_attachment_load",
@@ -511,6 +515,7 @@ impl PassObstacle {
     /// held-open pass would still meet.
     fn held_route(self) -> &'static str {
         match self {
+            Self::RenderTargetBarrier => "passheld_outside_render_target_barrier",
             Self::Snapshot => "passheld_outside_snapshot",
             Self::Seed => "passheld_outside_seed",
             Self::AttachmentLoad => "passheld_outside_attachment_load",
@@ -579,6 +584,29 @@ impl PassObstacles {
         unsafe { pools.close_open_pass(device, cb) };
         self.note(obstacle);
     }
+}
+
+/// Vulkan scope for Metal's render-target fragment-to-fragment barrier.
+///
+/// The destination includes transfer reads because an attachment snapshot is
+/// an implementation of the fragment read, not guest work inserted before the
+/// barrier. This dependency is recorded outside a render pass so it stays
+/// framebuffer-global; adding `BY_REGION` would change the decoded contract to
+/// same-coordinate ordering.
+fn render_target_fragment_dependency() -> (
+    vk::PipelineStageFlags,
+    vk::AccessFlags,
+    vk::PipelineStageFlags,
+    vk::AccessFlags,
+    vk::DependencyFlags,
+) {
+    (
+        vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+        vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::TRANSFER,
+        vk::AccessFlags::SHADER_READ | vk::AccessFlags::TRANSFER_READ,
+        vk::DependencyFlags::empty(),
+    )
 }
 
 /// Turn every pending gather into dispatches, or `None` to leave the whole
@@ -5478,6 +5506,39 @@ pub(crate) unsafe fn execute_draw_inner(
         vk::DependencyFlags::empty()
     };
 
+    if req.render_target_fragment_barrier {
+        // Metal's render-target scope is resource-wide. Vulkan requires an
+        // in-render-pass dependency whose source is a framebuffer-space stage
+        // to carry BY_REGION, which would order only matching framebuffer
+        // coordinates. End the Vulkan pass instance and express the full
+        // dependency here instead; the command buffer and decoded Metal
+        // encoder remain open, so this introduces neither CPU completion nor a
+        // queue submission boundary.
+        //
+        // TRANSFER_READ is included because the snapshot fallback below is an
+        // implementation of a later fragment read. When that rail is selected,
+        // the copy must consume the same visibility the guest granted to the
+        // fragment shader.
+        unsafe {
+            outside_pass.before_record(PassObstacle::RenderTargetBarrier, pools, &ctx.device, cb)
+        };
+        let (src_stage, src_access, dst_stage, dst_access, dependency_flags) =
+            render_target_fragment_dependency();
+        let barrier = [vk::MemoryBarrier::default()
+            .src_access_mask(src_access)
+            .dst_access_mask(dst_access)];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            src_stage,
+            dst_stage,
+            dependency_flags,
+            &barrier,
+            &[],
+            &[],
+        );
+        crate::telemetry::note_route("render_target_fragment_barrier_recorded");
+    }
+
     phase.enter(super::draw_phase::Phase::RecBarrierImportedTest);
     // Publish writes made through any other Vulkan alias of guest memory before
     // this draw consumes an imported buffer or image. This is deliberately one
@@ -6677,7 +6738,7 @@ pub(crate) unsafe fn execute_draw_inner(
             }
         }
     }
-    crate::telemetry::note_route(if !joins {
+    let pass_merge_route = if !joins {
         "passmerge_no_join"
     } else if !continues {
         "passmerge_pass_differs"
@@ -6685,7 +6746,8 @@ pub(crate) unsafe fn execute_draw_inner(
         outside_pass
             .first
             .map_or("passmerge_reachable", PassObstacle::route)
-    });
+    };
+    crate::telemetry::note_route(pass_merge_route);
     crate::telemetry::note_route(if !joins {
         "passheld_no_join"
     } else if !continues {
@@ -6701,6 +6763,40 @@ pub(crate) unsafe fn execute_draw_inner(
             .render_pass_continuations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     } else {
+        // A serialized Metal render encoder owes one native render-pass
+        // instance. Split those required begins from reopens created while the
+        // same encoder is still live, then name the nearest reason for every
+        // reopen. This is observation only: `continues_open` already decides
+        // the branch and the route never reaches command recording.
+        crate::telemetry::note_route(if req.continues_render_pass {
+            "passbegin_encoder_reopen"
+        } else {
+            "passbegin_encoder_first"
+        });
+        if req.continues_render_pass {
+            crate::telemetry::note_route(match pass_merge_route {
+                "passmerge_no_join" => "passreopen_no_join",
+                "passmerge_pass_differs" => "passreopen_pass_differs",
+                "passmerge_outside_render_target_barrier" => {
+                    "passreopen_outside_render_target_barrier"
+                }
+                "passmerge_outside_snapshot" => "passreopen_outside_snapshot",
+                "passmerge_outside_seed" => "passreopen_outside_seed",
+                "passmerge_outside_attachment_load" => "passreopen_outside_attachment_load",
+                "passmerge_outside_target_layout" => "passreopen_outside_target_layout",
+                "passmerge_outside_clear_wait" => "passreopen_outside_clear_wait",
+                "passmerge_outside_resident_layout" => "passreopen_outside_resident_layout",
+                "passmerge_outside_sampled_upload" => "passreopen_outside_sampled_upload",
+                "passmerge_outside_guest_memory_visibility" => {
+                    "passreopen_outside_guest_memory_visibility"
+                }
+                "passmerge_outside_gather" => "passreopen_outside_gather",
+                "passmerge_outside_mrt_layout" => "passreopen_outside_mrt_layout",
+                "passmerge_outside_query_reset" => "passreopen_outside_query_reset",
+                "passmerge_reachable" => "passreopen_reachable",
+                _ => unreachable!("pass merge route is exhaustive"),
+            });
+        }
         // An encoder boundary, a different pass instance, or an intervening
         // outside-pass command closes whatever the predecessor left open. A
         // continuation reopened here must LOAD regardless of the encoder's
@@ -7944,6 +8040,19 @@ pub(super) unsafe fn barrier_resident_for_transfer_read(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_target_fragment_barrier_is_resource_wide_and_covers_snapshot_reads() {
+        let (src_stage, src_access, dst_stage, dst_access, dependency_flags) =
+            render_target_fragment_dependency();
+        assert_eq!(src_stage, vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT);
+        assert_eq!(src_access, vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
+        assert!(dst_stage.contains(vk::PipelineStageFlags::FRAGMENT_SHADER));
+        assert!(dst_stage.contains(vk::PipelineStageFlags::TRANSFER));
+        assert!(dst_access.contains(vk::AccessFlags::SHADER_READ));
+        assert!(dst_access.contains(vk::AccessFlags::TRANSFER_READ));
+        assert!(dependency_flags.is_empty());
+    }
 
     #[test]
     fn line_width_only_changes_line_rasterized_geometry() {

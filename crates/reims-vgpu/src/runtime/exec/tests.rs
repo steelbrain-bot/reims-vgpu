@@ -3956,7 +3956,7 @@ fn direct_icb_barrier_and_direct_expand_in_encoder_order() {
         args_buffer_offset: 0,
         inherited: direct(0x51),
     });
-    acc.push_barrier();
+    acc.push_barrier(false);
     acc.push_draw(direct(0x61));
 
     let mut out = ExecResult::default();
@@ -4037,15 +4037,15 @@ fn a_buffer_offset_that_lands_on_nothing_reports_which_way_it_missed() {
     );
 }
 
-/// Residency hints remain measurable no-ops, while barriers submit preceding
-/// draws at their exact position in the stream.
+/// Residency hints remain measurable no-ops, while barriers retain their exact
+/// position and decoded dependency domain in the stream.
 ///
 /// The barrier used to share the residency answer on the claim that every draw
 /// already had a pass boundary. Deferred same-target batches invalidate that
 /// claim: without this transition a later draw can run in the same open batch
 /// as the writes the guest explicitly ordered before it.
 #[test]
-fn a_render_barrier_submits_preceding_draws_while_residency_stays_a_noop() {
+fn render_barriers_preserve_position_and_scope_while_residency_stays_a_noop() {
     use crate::runtime::drain::store_route_count;
     use crate::runtime::executor::*;
     use reims_vgpu_core::{
@@ -4163,7 +4163,9 @@ fn a_render_barrier_submits_preceding_draws_while_residency_stays_a_noop() {
         if expected_flushes != 0 {
             assert_eq!(
                 acc.render_work,
-                [RenderWork::Barrier],
+                [RenderWork::Barrier {
+                    render_target_fragment: false,
+                }],
                 "the barrier must retain its exact position before execution"
             );
         }
@@ -4174,6 +4176,47 @@ fn a_render_barrier_submits_preceding_draws_while_residency_stays_a_noop() {
             "op {op:#x} applied the wrong submission boundary"
         );
     }
+
+    // The exact render-target/fragment-to-fragment form is carried to the next
+    // draw instead of forcing command-buffer completion. Its four payload bytes
+    // are the decoded API fields, so nearby scope/stage forms remain on the
+    // conservative submission boundary exercised above.
+    let probe = Arc::new(BarrierProbe::default());
+    let mut state = Device::new_with_executor(DeviceId(1), PAGE_SHIFT_ARM64E, probe.clone());
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    let mut command = vec![0u8; wire_render::MEMORY_BARRIER_SCOPE_TOTAL_LEN as usize];
+    st32(&mut command[0..], wire_render::OPCODE_MEMORY_BARRIER_SCOPE);
+    st32(
+        &mut command[4..],
+        wire_render::MEMORY_BARRIER_SCOPE_TOTAL_LEN,
+    );
+    command[reims_vgpu_wire::OP_HEADER_LEN..][..4].copy_from_slice(&[4, 0, 2, 2]);
+    handle_render_record(
+        &mut state,
+        &host,
+        1,
+        wire_render::OPCODE_MEMORY_BARRIER_SCOPE,
+        &command,
+        &mut out,
+        &mut acc,
+    );
+    assert_eq!(
+        acc.render_work,
+        [RenderWork::Barrier {
+            render_target_fragment: true,
+        }]
+    );
+    assert_eq!(probe.flushes.load(Ordering::Relaxed), 0);
+
+    let mut cursor = 0;
+    assert!(!take_target_fragment_barrier_at(&[1, 1, 3], &mut cursor, 0));
+    assert!(take_target_fragment_barrier_at(&[1, 1, 3], &mut cursor, 1));
+    assert_eq!(cursor, 2);
+    assert!(!take_target_fragment_barrier_at(&[1, 1, 3], &mut cursor, 2));
+    assert!(take_target_fragment_barrier_at(&[1, 1, 3], &mut cursor, 3));
+    assert_eq!(cursor, 3);
 
     let probe = Arc::new(BarrierProbe::default());
     let state = Device::new_with_executor(DeviceId(1), PAGE_SHIFT_ARM64E, probe.clone());

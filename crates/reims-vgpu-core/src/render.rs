@@ -165,6 +165,13 @@ pub struct DrawRequest {
     pub depth_clip: DepthClipMode,
     pub depth: Option<DepthState>,
     pub color_input: bool,
+    /// A render-target-scoped fragment-to-fragment memory barrier immediately
+    /// before this draw, as declared inside the same Metal render encoder.
+    /// Backends must keep this ordering inside the encoder rather than turning
+    /// it into command-buffer completion. A backend render-pass instance is not
+    /// part of this contract and may be split to express the resource-wide
+    /// dependency faithfully.
+    pub render_target_fragment_barrier: bool,
     pub continues_render_pass: bool,
     pub render_pass_continues: bool,
 }
