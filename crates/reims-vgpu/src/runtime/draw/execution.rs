@@ -247,6 +247,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // already performed. The twin of `surface_store_armed`, and it returns
     // through the same door.
     let mut gva_store_armed = false;
+    let mut effects_only_completed = false;
     if req.pipeline_ref != 0 && (req.vertex_count > 0 || req.indexed.is_some()) {
         match try_metal2vulkan_draw(state, host, req, writeback_guest) {
             Ok(M2vDrawSpan::Pixels {
@@ -263,6 +264,14 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     "linux_m2v_draw ok pipe={} {}x{} vtx={}",
                     req.pipeline_ref, pass_w, pass_h, req.vertex_count
                 ));
+            }
+            Ok(M2vDrawSpan::EffectsOnly {
+                submission,
+                visibility_samples: samples,
+            }) => {
+                completed_submission = Some(submission);
+                visibility_samples = samples;
+                effects_only_completed = true;
             }
             Ok(M2vDrawSpan::ResidentChain {
                 submission,
@@ -949,6 +958,8 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             visibility_samples,
             None,
         )
+    } else if effects_only_completed {
+        DrawChainResult::new(EncodeStatus::Ok, None, visibility_samples, None)
     } else {
         DrawChainResult::new(
             EncodeStatus::BackendUnavailable("draw_vk_nothing_stored"),
@@ -1511,6 +1522,12 @@ enum M2vDrawSpan {
         submission: reims_vgpu_protocol::SubmissionId,
         bytes: Vec<u8>,
         bgra: bool,
+        visibility_samples: Option<u64>,
+    },
+    /// The accepted draw published depth or stencil but no colour attachment.
+    /// No CPU readback or guest colour Store belongs to this completion.
+    EffectsOnly {
+        submission: reims_vgpu_protocol::SubmissionId,
         visibility_samples: Option<u64>,
     },
     /// Intermediate record of a resident render-pass chain: content stays on
@@ -2209,6 +2226,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 submission,
                 bytes: completed.output.pixels,
                 bgra: completed.output.pixels_bgra,
+                visibility_samples,
+            }),
+            DrawCompletionRoute::EffectsOnly => Ok(M2vDrawSpan::EffectsOnly {
+                submission,
                 visibility_samples,
             }),
             DrawCompletionRoute::ResidentChain(identity) => Ok(M2vDrawSpan::ResidentChain {

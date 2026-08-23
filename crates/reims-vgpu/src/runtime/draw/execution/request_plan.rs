@@ -221,6 +221,22 @@ pub(super) fn plan_executor_request<M: HostMemory + HostOps>(
     resources.target_clear = target_clear;
     resources.color_load_action = color_load_action;
     resources.target_seed_order = seed_order;
+    // The pass attachment and the encoder's test state are independent Metal
+    // objects. Build the attachment even when the state is nil or trivial, and
+    // build neither from the other. These pass-owned actions are also part of
+    // target completion, so they must exist before that route is chosen: a
+    // depth-only Store is an effects-only completion, not a colour readback.
+    crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::AssembleDepth);
+    resources.depth_attachment = semantic_depth_attachment(req)?;
+    if req.depth_stencil_ref != 0 {
+        let ds = load_depth_stencil_descriptor(state, host, req.task_id, req.depth_stencil_ref)
+            .map_err(|detail| DrawPreparationDecline::DepthStencilStateMissing {
+                task_id: req.task_id,
+                state_ref: req.depth_stencil_ref,
+                detail,
+            })?;
+        resources.depth = semantic_depth_state(&ds, req)?;
+    }
     // Start from the portable Store answer. Target planning may turn readback
     // off only while assigning the matching resident completion route; the
     // executor then reports whether that resident was guest-backed or copied.
@@ -262,22 +278,6 @@ pub(super) fn plan_executor_request<M: HostMemory + HostOps>(
     // invocation count; indexed draws are governed by `index_count`.
     let vertex_count = req.vertex_count;
 
-    // The pass attachment and the encoder's test state are independent Metal
-    // objects. Build the attachment even when the state is nil or trivial, so
-    // its clear/load/store still occurs. Conversely, a state bound to a pass
-    // with no attachment cannot invent storage; Metal disables those tests.
-    crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::AssembleDepth);
-    resources.depth_attachment = semantic_depth_attachment(req)?;
-    if req.depth_stencil_ref != 0 {
-        let ds = load_depth_stencil_descriptor(state, host, req.task_id, req.depth_stencil_ref)
-            .map_err(|detail| DrawPreparationDecline::DepthStencilStateMissing {
-                task_id: req.task_id,
-                state_ref: req.depth_stencil_ref,
-                detail,
-            })?;
-        let depth = semantic_depth_state(&ds, req)?;
-        resources.depth = depth;
-    }
     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
     resources.program = program;
     resources.width = w;

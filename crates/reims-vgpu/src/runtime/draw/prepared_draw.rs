@@ -11,6 +11,7 @@ use crate::runtime::Device;
 #[derive(Clone, Debug)]
 pub(super) enum DrawCompletionRoute {
     Pixels,
+    EffectsOnly,
     ResidentChain(TargetIdentity),
     ResidentGvaStore(TargetIdentity),
     ResidentSurfaceStore(TargetIdentity),
@@ -20,6 +21,7 @@ impl DrawCompletionRoute {
     pub(super) const fn kind(&self) -> &'static str {
         match self {
             Self::Pixels => "pixels",
+            Self::EffectsOnly => "effects_only",
             Self::ResidentChain(_) => "resident_chain",
             Self::ResidentGvaStore(_) => "resident_gva_store",
             Self::ResidentSurfaceStore(_) => "resident_surface_store",
@@ -107,7 +109,7 @@ pub(super) fn plan_target_completion(
     }
     let renders_into_surface =
         surface_target.is_some() && executor_request.target_identity == surface_target;
-    if renders_into_surface && !executor_request.skip_readback {
+    if store_publishes && renders_into_surface && !executor_request.skip_readback {
         executor_request.skip_readback = true;
         claim(DrawCompletionRoute::ResidentSurfaceStore(
             surface_target.expect("the equality above established a surface identity"),
@@ -133,6 +135,21 @@ pub(super) fn plan_target_completion(
         }
         executor_request.load_from_target = true;
         executor_request.target_rgba8 = None;
+    }
+
+    let depth_stencil_store = executor_request
+        .depth_attachment
+        .as_ref()
+        .is_some_and(|depth| {
+            depth.store_action.publishes_single_sample()
+                || depth
+                    .stencil
+                    .as_ref()
+                    .is_some_and(|stencil| stencil.store_action.publishes_single_sample())
+        });
+    if matches!(route, DrawCompletionRoute::Pixels) && !store_publishes && depth_stencil_store {
+        executor_request.skip_readback = true;
+        route = DrawCompletionRoute::EffectsOnly;
     }
 
     Ok(route)
@@ -223,6 +240,53 @@ mod tests {
             .expect_err("a second route cannot silently win by branch order");
         assert_eq!(conflict.current, "resident_gva_store");
         assert_eq!(conflict.requested, "resident_surface_store");
+    }
+
+    #[test]
+    fn a_depth_store_without_a_color_store_has_an_effects_only_completion() {
+        use reims_vgpu_protocol::pass_action::{LoadAction, StoreAction};
+
+        let state = Device::new(crate::model::DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        let owner = std::sync::Arc::new(crate::model::TaskResource::new(
+            reims_vgpu_protocol::ObjectListEntry::new(
+                crate::runtime::decode::resource::ObjectKind::Texture,
+                0,
+                0,
+            ),
+            std::sync::Arc::from([]),
+        ));
+        let mut executor_request = reims_vgpu_core::DrawRequest {
+            depth_attachment: Some(reims_vgpu_core::DepthAttachment {
+                identity: gva(0x4000),
+                resource_lifetime: owner.lifetime_ref(),
+                load_action: LoadAction::Clear,
+                store_action: StoreAction::Store,
+                clear_value: 0.0,
+                stencil: None,
+            }),
+            ..reims_vgpu_core::DrawRequest::default()
+        };
+        let route = plan_target_completion(
+            &state,
+            &super::super::DrawEncodeRequest::default(),
+            &mut executor_request,
+            0,
+            false,
+            false,
+            true,
+            None,
+            false,
+            None,
+            8,
+            8,
+        )
+        .expect("a completed depth Store has one typed outcome");
+
+        assert!(matches!(route, DrawCompletionRoute::EffectsOnly));
+        assert!(
+            executor_request.skip_readback,
+            "no colour Store means there are no colour pixels to read back"
+        );
     }
 
     #[test]
