@@ -2653,6 +2653,35 @@ struct LinearPlacement {
     )>,
 }
 
+/// Complete sampled-mip transfer independent of host-pointer import.
+///
+/// A retained packed resource is the direct answer when available. The copying
+/// rail still owns the same allocation contract when it is not: walking the
+/// task's current page plan produces a full-allocation run source rather than
+/// narrowing the bind to level zero.
+fn complete_mip_transfer_source<M: HostMemory + HostOps>(
+    state: &Device,
+    host: &mut M,
+    task_id: u32,
+    allocation_gva: u64,
+    allocation_size: u64,
+    packed: Option<reims_vgpu_memory::GuestRunSource>,
+) -> Result<reims_vgpu_memory::GuestRunSource, crate::runtime::draw::WindowRefusal> {
+    packed.map_or_else(
+        || {
+            crate::runtime::draw::task_gva_guest_run_source(
+                state,
+                host,
+                task_id,
+                allocation_gva,
+                allocation_size,
+            )
+            .map(|(_, source)| source)
+        },
+        Ok,
+    )
+}
+
 /// A render-target resident currently represents one linear level. It can
 /// replace a sampled guest allocation only when that bind names no complete
 /// mip chain; otherwise explicit LODs above zero would silently lose the
@@ -3055,39 +3084,61 @@ fn stage_linear_placement<M: HostMemory + HostOps>(
             .and_then(|prefix| prefix.checked_add(tight as u64));
         let guest_image = if is_storage {
             None
-        } else {
-            sampled_allocation.as_ref().and_then(|(allocation, view)| {
-                if !crate::runtime::bound_buffers::ensure_packed_resource(
-                    state,
-                    host,
-                    task_id,
-                    storage_ref,
-                    allocation_gva,
-                    allocation_size,
-                    crate::runtime::bound_buffers::PackedResourceUse::ComputeTexture,
-                ) {
-                    return None;
+        } else if let Some((allocation, view)) = sampled_allocation.as_ref() {
+            let packed = crate::runtime::bound_buffers::ensure_packed_resource(
+                state,
+                host,
+                task_id,
+                storage_ref,
+                allocation_gva,
+                allocation_size,
+                crate::runtime::bound_buffers::PackedResourceUse::ComputeTexture,
+            )
+            .then(|| state.bound_buffers.packed(task_id, storage_ref))
+            .flatten()
+            .and_then(|packed| match packed {
+                crate::runtime::bound_buffers::PackedBufferResolution::Available(packed) => {
+                    packed.texel_source(0, allocation_size, 0)
                 }
-                let crate::runtime::bound_buffers::PackedBufferResolution::Available(packed) =
-                    state.bound_buffers.packed(task_id, storage_ref)?
-                else {
-                    return None;
-                };
-                Some(reims_vgpu_memory::GuestImageSource {
-                    direct: None,
-                    allocation: allocation.clone(),
-                    view: *view,
-                    transfer: packed.texel_source(0, allocation_size, 0)?,
-                })
+                crate::runtime::bound_buffers::PackedBufferResolution::Unavailable { .. } => None,
+            });
+            let transfer = match complete_mip_transfer_source(
+                state,
+                host,
+                task_id,
+                allocation_gva,
+                allocation_size,
+                packed,
+            ) {
+                Ok(source) => source,
+                Err(refusal) => {
+                    let reason = match refusal {
+                        crate::runtime::draw::WindowRefusal::NoAlias => {
+                            "compute_linear_mip_no_alias"
+                        }
+                        crate::runtime::draw::WindowRefusal::SpanUnmapped => {
+                            "compute_linear_mip_span_unmapped"
+                        }
+                        crate::runtime::draw::WindowRefusal::Untileable => {
+                            "compute_linear_mip_untileable"
+                        }
+                    };
+                    return linear_fail(
+                        bound_ref,
+                        ComputeStatus::GuestIo(reason),
+                        &format!("base={allocation_gva:#x} alloc={allocation_size}"),
+                    );
+                }
+            };
+            Some(reims_vgpu_memory::GuestImageSource {
+                direct: None,
+                allocation: allocation.clone(),
+                view: *view,
+                transfer,
             })
+        } else {
+            None
         };
-        if sampled_allocation.is_some() && !is_storage && guest_image.is_none() {
-            return linear_fail(
-                bound_ref,
-                ComputeStatus::GuestIo("compute_linear_mip_pages"),
-                &format!("base={allocation_gva:#x} alloc={allocation_size}"),
-            );
-        }
         let guest = exact_span.and_then(|span| {
             let level_offset = gva.checked_sub(allocation_gva)?;
             let row_length_texels = if row_stride == tight as u64 {

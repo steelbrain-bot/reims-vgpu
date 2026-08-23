@@ -72,6 +72,7 @@ mod sampled_source;
 pub(crate) use sampled_source::compute_iosurface_resident_sample;
 pub(crate) use sampled_source::declared_guest_image_allocation;
 use sampled_source::*;
+pub(crate) use sampled_source::{task_gva_guest_run_source, WindowRefusal};
 
 pub(crate) fn compute_gva_resident_sample<M: HostMemory + HostOps>(
     state: &mut Device,

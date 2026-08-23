@@ -1975,6 +1975,37 @@ pub(super) fn task_gva_guest_run_window<M: HostMemory + HostOps>(
     Ok((gpas, runs))
 }
 
+/// Resolve one complete GVA allocation into the transfer source shared by
+/// render and compute sampled-image staging.
+///
+/// This is the copy-backed counterpart of a packed resource: it preserves the
+/// allocation's complete byte range and physical-page identity without
+/// requiring Vulkan host-pointer import. Callers retain the separately decoded
+/// image allocation/view contract beside it.
+pub(crate) fn task_gva_guest_run_source<M: HostMemory + HostOps>(
+    state: &Device,
+    host: &mut M,
+    task_id: u32,
+    gva: u64,
+    span: u64,
+) -> Result<(Vec<u64>, reims_vgpu_memory::GuestRunSource), WindowRefusal> {
+    let (gpas, runs) = task_gva_guest_run_window(state, host, task_id, gva, span)?;
+    let page = state.page_size();
+    let physical_pages = reims_vgpu_memory::GuestPageSet::new(&gpas);
+    let pages = guest_page_window(host, gpas.clone(), page, gva % page, span);
+    Ok((
+        gpas,
+        reims_vgpu_memory::GuestRunSource {
+            runs: std::sync::Arc::new(runs),
+            source_offset: 0,
+            total_len: span,
+            row_length_texels: 0,
+            pages,
+            physical_pages,
+        },
+    ))
+}
+
 /// Why a guest-page window could not be built.
 ///
 /// Typed rather than a bare `None` because these are **degradations that
@@ -1992,7 +2023,7 @@ pub(super) fn task_gva_guest_run_window<M: HostMemory + HostOps>(
 /// it were either — the same conflation [`band_runs`] already carries and says
 /// so about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum WindowRefusal {
+pub(crate) enum WindowRefusal {
     /// The host will not promise a stable page alias, so no rail here can run.
     ///
     /// Latched once per process by [`guest_run_alias_available`], which names
@@ -4594,8 +4625,8 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     if let (Some(backing), Some((image_allocation, view))) =
         (allocation.as_ref(), image_contract.as_ref())
     {
-        let (gpas, runs) =
-            match task_gva_guest_run_window(state, host, task_id, backing.gva, backing.size) {
+        let (gpas, transfer) =
+            match task_gva_guest_run_source(state, host, task_id, backing.gva, backing.size) {
                 Ok(window) => window,
                 Err(refusal) => {
                     crate::runtime::drain::note_store_route(match refusal {
@@ -4619,27 +4650,12 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
             stated,
             crate::runtime::gather_witness::GatherWindow {
                 gpas: &gpas,
-                runs: &runs,
+                runs: &transfer.runs,
                 span: backing.size,
                 page_size: page,
             },
         );
-        let physical_pages = reims_vgpu_memory::GuestPageSet::new(&gpas);
         note_linear_sample_window("gva_walk", backing.gva, 0, backing.size, 0);
-        let transfer = reims_vgpu_memory::GuestRunSource {
-            runs: std::sync::Arc::new(runs),
-            source_offset: 0,
-            total_len: backing.size,
-            row_length_texels: 0,
-            pages: guest_page_window(
-                host,
-                gpas,
-                page as u64,
-                backing.gva % page as u64,
-                backing.size,
-            ),
-            physical_pages,
-        };
         return Some((
             w,
             h,

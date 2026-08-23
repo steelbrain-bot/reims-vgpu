@@ -2156,6 +2156,47 @@ fn setup_linear_task_x86(host: &mut FakeHost, state: &mut Device, pfns: &[u32]) 
     state.define_task(1, page, 2);
 }
 
+/// A complete sampled mip allocation remains stageable when Vulkan cannot
+/// retain a host-pointer import for it.
+///
+/// Compute used to ask only for the retained packed resource and refuse the
+/// whole bind when that optional rail was unavailable. The task page plan is
+/// the allocation contract on the copying rail too, so the fallback must carry
+/// every byte and every physical page rather than narrowing the source to the
+/// selected mip level.
+#[test]
+fn a_complete_mip_allocation_falls_back_to_the_task_page_plan() {
+    let mut host = FakeHost::new();
+    host.strict_linux_map = true;
+    host.stable_map_pages = true;
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
+    setup_linear_task_x86(&mut host, &mut state, &[4]);
+
+    let page = 1u64 << PAGE_SHIFT_X86;
+    let allocation_gva = 0x800;
+    let allocation_size = page - allocation_gva;
+    let source =
+        complete_mip_transfer_source(&state, &mut host, 1, allocation_gva, allocation_size, None)
+            .expect("the copying rail resolves the complete mip allocation");
+
+    assert_eq!(source.source_offset, 0);
+    assert_eq!(source.total_len, allocation_size);
+    assert_eq!(source.row_length_texels, 0);
+    assert_eq!(
+        source
+            .physical_pages
+            .as_ref()
+            .expect("physical identity accompanies the transfer")
+            .pages()
+            .len(),
+        1
+    );
+    assert_eq!(
+        source.runs.iter().map(|run| run.len).sum::<u64>(),
+        allocation_size
+    );
+}
+
 #[test]
 fn bulk_linear_read_destrides_span_with_one_view() {
     let mut host = FakeHost::new();
