@@ -1,7 +1,7 @@
 //! Canonical task-owned resource, storage, and mapping graph.
 
 use reims_vgpu_protocol::{
-    BackingGeneration, ByteLength, ByteOffset, ContentVersion, GuestVirtualAddress,
+    BackingGeneration, ByteLength, ByteOffset, ContentVersion, GuestVirtualAddress, HeapObject,
     MapperSurfaceRef, MappingId, ObjectKind, ObjectTableRef, PlaneIndex, ResourceId,
     ResourceObject, StorageId, SubmissionId, SurfaceBackingId, TaskId,
 };
@@ -402,9 +402,17 @@ pub enum StorageBacking {
         plane: PlaneIndex,
     },
     HeapPlacement {
-        heap: AnyResourceId,
+        heap: ResourceId<HeapObject>,
         offset: ByteOffset,
         length: ByteLength,
+    },
+    /// A texture whose offset is selected by the heap allocator rather than by
+    /// the guest. The allocation's resource lifetime is its identity; the wire
+    /// offset is deliberately absent because `use_offset == false` says it has
+    /// no meaning.
+    HeapAllocation {
+        heap: ResourceId<HeapObject>,
+        allocation: AnyResourceId,
     },
 }
 
@@ -450,6 +458,7 @@ pub enum GraphError {
     ParentCycle,
     StorageAbsent,
     StorageConflict,
+    HeapPlacementOverlap,
     MappingAlreadyExists,
     MappingAbsent,
     SubmissionNotPrepared,
@@ -902,6 +911,72 @@ impl ResourceGraph {
             .parents
             .insert(buffer);
         Ok(())
+    }
+
+    /// Attach one texture to storage owned by a generational heap lifetime.
+    ///
+    /// Equal explicit ranges are aliases and therefore intern one storage and
+    /// one content authority. A partial overlap is not representable by the
+    /// current whole-image authority and refuses instead of pretending the
+    /// images are disjoint. Allocator-owned placements use the texture's own
+    /// lifetime and never consult the meaningless serialized offset.
+    pub fn link_heap_texture(
+        &mut self,
+        texture: AnyResourceId,
+        heap: ResourceId<HeapObject>,
+        explicit: Option<(ByteOffset, ByteLength)>,
+    ) -> Result<(), GraphError> {
+        if !self.resources.contains_key(&texture) {
+            return Err(GraphError::ResourceAbsent);
+        }
+        let backing = match explicit {
+            Some((offset, length)) => {
+                let start = offset.get();
+                let Some(end) = start.checked_add(length.get()) else {
+                    return Err(GraphError::HeapPlacementOverlap);
+                };
+                if length.get() == 0 {
+                    return Err(GraphError::HeapPlacementOverlap);
+                }
+                for storage in self.storage.values() {
+                    let StorageBacking::HeapPlacement {
+                        heap: other_heap,
+                        offset: other_offset,
+                        length: other_length,
+                    } = storage.backing
+                    else {
+                        continue;
+                    };
+                    if other_heap != heap {
+                        continue;
+                    }
+                    let other_start = other_offset.get();
+                    let other_end = other_start.saturating_add(other_length.get());
+                    let exact = start == other_start && end == other_end;
+                    if !exact && start < other_end && other_start < end {
+                        return Err(GraphError::HeapPlacementOverlap);
+                    }
+                }
+                StorageBacking::HeapPlacement {
+                    heap,
+                    offset,
+                    length,
+                }
+            }
+            None => StorageBacking::HeapAllocation {
+                heap,
+                allocation: texture,
+            },
+        };
+        let existing = self
+            .storage
+            .values()
+            .find_map(|storage| (storage.backing == backing).then_some(storage.id));
+        let storage = match existing {
+            Some(storage) => storage,
+            None => self.create_storage(backing)?,
+        };
+        self.attach_initial_storage(texture, storage)
     }
 
     pub fn attach_initial_storage(
@@ -1605,6 +1680,105 @@ mod tests {
         assert!(graph.resource(buffer).is_some());
         graph.release_reference(task(), object(2)).unwrap();
         assert!(graph.resource(buffer).is_none());
+    }
+
+    #[test]
+    fn equal_explicit_heap_placements_share_storage_and_content_authority() {
+        let mut graph = ResourceGraph::default();
+        let first = graph
+            .create_resource(task(), object(1), ObjectKind::TextureView, None, [])
+            .unwrap();
+        let second = graph
+            .create_resource(task(), object(2), ObjectKind::TextureView, None, [])
+            .unwrap();
+        let heap = ResourceId::<HeapObject>::new(7, 3);
+
+        graph
+            .link_heap_texture(
+                first,
+                heap,
+                Some((ByteOffset::new(0x200), ByteLength::new(0x800))),
+            )
+            .unwrap();
+        graph
+            .link_heap_texture(
+                second,
+                heap,
+                Some((ByteOffset::new(0x200), ByteLength::new(0x800))),
+            )
+            .unwrap();
+
+        let first_node = graph.resource(first).unwrap();
+        let second_node = graph.resource(second).unwrap();
+        assert_eq!(first_node.storage, second_node.storage);
+        assert!(first_node.content.same_authority(&second_node.content));
+    }
+
+    #[test]
+    fn partial_heap_overlap_refuses_and_different_heap_generations_are_disjoint() {
+        let mut graph = ResourceGraph::default();
+        let first = graph
+            .create_resource(task(), object(1), ObjectKind::TextureView, None, [])
+            .unwrap();
+        let overlap = graph
+            .create_resource(task(), object(2), ObjectKind::TextureView, None, [])
+            .unwrap();
+        let reused_heap = graph
+            .create_resource(task(), object(3), ObjectKind::TextureView, None, [])
+            .unwrap();
+        let heap = ResourceId::<HeapObject>::new(7, 3);
+
+        graph
+            .link_heap_texture(
+                first,
+                heap,
+                Some((ByteOffset::new(0x200), ByteLength::new(0x800))),
+            )
+            .unwrap();
+        assert_eq!(
+            graph.link_heap_texture(
+                overlap,
+                heap,
+                Some((ByteOffset::new(0x600), ByteLength::new(0x800))),
+            ),
+            Err(GraphError::HeapPlacementOverlap)
+        );
+        graph
+            .link_heap_texture(
+                reused_heap,
+                ResourceId::<HeapObject>::new(7, 4),
+                Some((ByteOffset::new(0x600), ByteLength::new(0x800))),
+            )
+            .unwrap();
+        assert_ne!(
+            graph.resource(first).unwrap().storage,
+            graph.resource(reused_heap).unwrap().storage
+        );
+    }
+
+    #[test]
+    fn allocator_owned_heap_textures_ignore_wire_offset_by_having_distinct_allocations() {
+        let mut graph = ResourceGraph::default();
+        let first = graph
+            .create_resource(task(), object(1), ObjectKind::TextureView, None, [])
+            .unwrap();
+        let second = graph
+            .create_resource(task(), object(2), ObjectKind::TextureView, None, [])
+            .unwrap();
+        let heap = ResourceId::<HeapObject>::new(7, 3);
+
+        graph.link_heap_texture(first, heap, None).unwrap();
+        graph.link_heap_texture(second, heap, None).unwrap();
+
+        assert_ne!(
+            graph.resource(first).unwrap().storage,
+            graph.resource(second).unwrap().storage
+        );
+        assert!(!graph
+            .resource(first)
+            .unwrap()
+            .content
+            .same_authority(&graph.resource(second).unwrap().content));
     }
 
     #[test]
