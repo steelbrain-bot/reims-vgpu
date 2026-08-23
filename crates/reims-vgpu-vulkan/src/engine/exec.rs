@@ -1453,6 +1453,33 @@ fn color_load_for_segment(
     }
 }
 
+fn depth_load_for_segment(
+    action: reims_vgpu_protocol::pass_action::LoadAction,
+    continues_render_pass: bool,
+    content_ready: bool,
+) -> ColorLoadKey {
+    if continues_render_pass {
+        return ColorLoadKey::Load;
+    }
+    match action {
+        reims_vgpu_protocol::pass_action::LoadAction::Load if content_ready => ColorLoadKey::Load,
+        // Loading an attachment with no defined prior contents is undefined by
+        // the guest contract. CLEAR is the deterministic value this backend has
+        // historically selected for that case.
+        reims_vgpu_protocol::pass_action::LoadAction::Load
+        | reims_vgpu_protocol::pass_action::LoadAction::Clear => ColorLoadKey::Clear,
+        reims_vgpu_protocol::pass_action::LoadAction::DontCare => ColorLoadKey::DontCare,
+    }
+}
+
+fn implementation_stencil(req: &DrawRequest) -> bool {
+    req.depth_attachment
+        .as_ref()
+        .and_then(|depth| depth.stencil)
+        .is_some()
+        || req.depth.as_ref().and_then(|depth| depth.stencil).is_some()
+}
+
 enum PreparedSampled {
     Null {
         binding: u32,
@@ -3437,81 +3464,70 @@ struct AcquiredDepth {
     content_ready: bool,
 }
 
-impl AcquiredDepth {
-    /// Whether the render pass may declare `VK_ATTACHMENT_LOAD_OP_LOAD` for this
-    /// draw's depth attachment.
-    ///
-    /// **The only thing `DepthAttachKey::load` may be built from.** The guest
-    /// asking is one of two terms and it is the term that does not decide: a
-    /// LOAD pass also declares `initial_layout` DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-    /// and naming a layout an image is not in is undefined behaviour rather than
-    /// a stale read — so an image nothing has rendered into cannot be loaded from
-    /// whatever the guest asked for. The two terms live behind one call because
-    /// they were briefly two expressions at one site, which is the shape where a
-    /// later edit reaches for the guest's flag alone and gets a validation error
-    /// on hosts that check and undefined contents on hosts that do not.
-    fn honours_load(&self, guest_wants_load: bool) -> bool {
-        guest_wants_load && self.content_ready
-    }
-}
-
 unsafe fn acquire_depth_view(
     ctx: &super::context::DeviceContext,
     pools: &mut super::pools::ResourcePools,
     req: &DrawRequest,
     counters: &EngineCounters,
 ) -> Result<AcquiredDepth, DrawError> {
-    let with_stencil = req.depth.as_ref().and_then(|d| d.stencil).is_some();
+    let with_stencil = req
+        .depth_attachment
+        .as_ref()
+        .and_then(|d| d.stencil)
+        .is_some()
+        || req.depth.as_ref().and_then(|d| d.stencil).is_some();
     let sample_count = req.raster_sample_count.max(1);
     let (depth_width, depth_height) = req
         .depth_attachment_extent()
-        .expect("depth acquisition requires depth state");
-    if let Some(identity) = req.depth.as_ref().and_then(|d| d.identity.clone()) {
-        // Asked before `registry_ensure_depth`, because that call creates the
-        // slot when it is absent and a fresh slot is `content_ready == false`.
-        // Asking after would answer about the image this draw just made rather
-        // than about the one the guest expects to load.
-        let content_ready = pools.registry_content_ready(&identity);
-        let (image, view) = pools.registry_ensure_depth(
+        .unwrap_or((req.width, req.height));
+    let Some(identity) = req
+        .depth_attachment
+        .as_ref()
+        .map(|attachment| attachment.identity.clone())
+    else {
+        let (image, memory, view) = pools.create_transient_depth(
             ctx,
-            identity.clone(),
             depth_width,
             depth_height,
             sample_count,
             with_stencil,
             counters,
         )?;
-        // A geometry or aspect change recreates the image inside that call, and
-        // the recreated one holds nothing. Re-asking is what keeps this honest.
-        let content_ready = content_ready && pools.registry_content_ready(&identity);
-        let access = pools
-            .registry_get(&identity)
-            .expect("the depth resident was just ensured")
-            .access;
         return Ok(AcquiredDepth {
             image,
-            access,
+            access: super::pools::ResidentAccess::Untouched,
             view,
-            owned: None,
-            identity: Some(identity),
-            content_ready,
+            owned: Some((image, memory, view)),
+            identity: None,
+            content_ready: false,
         });
-    }
-    let (dimg, dmem, dview) = pools.create_transient_depth(
+    };
+    // Asked before `registry_ensure_depth`, because that call creates the slot
+    // when it is absent and a fresh slot is `content_ready == false`.
+    let content_ready = pools.registry_content_ready(&identity);
+    let (image, view) = pools.registry_ensure_depth(
         ctx,
+        identity.clone(),
         depth_width,
         depth_height,
         sample_count,
         with_stencil,
         counters,
     )?;
+    // A geometry or aspect change recreates the image inside that call, and the
+    // recreated one holds nothing. Re-asking is what keeps this honest.
+    let content_ready = content_ready && pools.registry_content_ready(&identity);
+    let access = pools
+        .registry_get(&identity)
+        .expect("the depth resident was just ensured")
+        .access;
     Ok(AcquiredDepth {
-        image: dimg,
-        access: super::pools::ResidentAccess::Untouched,
-        view: dview,
-        owned: Some((dimg, dmem, dview)),
-        identity: None,
-        content_ready: false,
+        image,
+        access,
+        view,
+        owned: None,
+        identity: Some(identity),
+        content_ready,
     })
 }
 
@@ -3881,7 +3897,7 @@ pub(crate) unsafe fn execute_draw_inner(
         force_loss,
         quirk: ctx.caps.quirks.no_deferred_draw_batching,
         is_mrt,
-        depth_barred: depth_bars_batching(req.depth.is_some()),
+        depth_barred: depth_bars_batching(req.depth_attachment.is_some() || req.depth.is_some()),
         reads_back: !req.skip_readback,
         has_query: req.occlusion_query.is_some(),
         no_identity: req.target_identity.is_none(),
@@ -4128,26 +4144,53 @@ pub(crate) unsafe fn execute_draw_inner(
     // "the guest asked to load" and "there is something to load" are two
     // questions and only the second one is about this device.
     phase.enter(super::draw_phase::Phase::PipelineDepth);
-    let depth_attachment = req
-        .depth
-        .as_ref()
-        .map(|_| acquire_depth_view(ctx, pools, req, counters))
+    let implementation_depth = req.depth_attachment.is_some() || req.depth.is_some();
+    let depth_attachment = implementation_depth
+        .then(|| acquire_depth_view(ctx, pools, req, counters))
         .transpose()?;
     phase.enter(super::draw_phase::Phase::Pipeline);
-    let mut preclear_depth = false;
-    if let Some(d) = &req.depth {
-        let mut load = depth_attachment
+    let mut preclear_depth = None;
+    let implementation_stencil = implementation_stencil(req);
+    if let Some(d) = &req.depth_attachment {
+        let content_ready = depth_attachment
             .as_ref()
-            .is_some_and(|a: &AcquiredDepth| a.honours_load(d.load));
-        if d.load && !load {
+            .is_some_and(|a: &AcquiredDepth| a.content_ready);
+        let mut load =
+            depth_load_for_segment(d.load_action, req.continues_render_pass, content_ready);
+        if d.load_action == reims_vgpu_protocol::pass_action::LoadAction::Load && !content_ready {
             note_depth_load_without_content(req.width, req.height, d.stencil.is_some());
         }
+        let mut stencil_load = d.stencil.map_or_else(
+            || {
+                if implementation_stencil {
+                    if req.continues_render_pass {
+                        ColorLoadKey::Load
+                    } else {
+                        ColorLoadKey::Clear
+                    }
+                } else {
+                    ColorLoadKey::DontCare
+                }
+            },
+            |stencil| {
+                depth_load_for_segment(
+                    stencil.load_action,
+                    req.continues_render_pass,
+                    content_ready,
+                )
+            },
+        );
         let (depth_width, depth_height) = req
             .depth_attachment_extent()
             .expect("depth state has an attachment extent");
-        preclear_depth =
-            !load && (depth_width > framebuffer_width || depth_height > framebuffer_height);
-        if preclear_depth {
+        let attachment_is_wider =
+            depth_width > framebuffer_width || depth_height > framebuffer_height;
+        let depth_clear = (load == ColorLoadKey::Clear).then_some(d.clear_value);
+        let stencil_clear = d
+            .stencil
+            .filter(|_| stencil_load == ColorLoadKey::Clear)
+            .map(|stencil| stencil.clear_value);
+        if attachment_is_wider && (depth_clear.is_some() || stencil_clear.is_some()) {
             let format = if d.stencil.is_some() {
                 ctx.depth_stencil_format
             } else {
@@ -4160,13 +4203,44 @@ pub(crate) unsafe fn execute_draw_inner(
                     },
                 ));
             }
-            load = true;
+            if depth_clear.is_some() {
+                load = ColorLoadKey::Load;
+            }
+            if stencil_clear.is_some() {
+                stencil_load = ColorLoadKey::Load;
+            }
+            preclear_depth = Some((depth_clear, stencil_clear));
         }
         pass_key.depth = Some(super::caches::DepthAttachKey {
             load,
-            stencil: d.stencil.is_some(),
+            // An internal Vulkan pass split cannot execute Metal's final
+            // DontCare early: a continuation consumes the preceding segment.
+            store: d.store_action.publishes_single_sample() || req.render_pass_continues,
+            stencil: implementation_stencil,
+            stencil_load,
+            stencil_store: d
+                .stencil
+                .is_some_and(|stencil| stencil.store_action.publishes_single_sample())
+                || (implementation_stencil && req.render_pass_continues),
+        });
+    } else if implementation_depth {
+        pass_key.depth = Some(super::caches::DepthAttachKey {
+            // Native Metal compares against an implicit depth value of one
+            // when test state is bound without a pass attachment. Vulkan has
+            // no attachmentless depth test, so a draw-owned image cleared to
+            // that value carries the same semantics.
+            load: ColorLoadKey::Clear,
+            store: req.render_pass_continues,
+            stencil: implementation_stencil,
+            stencil_load: if implementation_stencil {
+                ColorLoadKey::Clear
+            } else {
+                ColorLoadKey::DontCare
+            },
+            stencil_store: implementation_stencil && req.render_pass_continues,
         });
     }
+    let effective_depth = req.effective_depth_state();
     let raster_sample_count = req.raster_sample_count.max(1);
     let color_sample_count = req.color_sample_count.max(1);
     if color_sample_count != raster_sample_count {
@@ -4200,7 +4274,7 @@ pub(crate) unsafe fn execute_draw_inner(
             return Err(DrawError::Unsupported(
                 super::reason::DrawReason::MultisampleResolveShapeUnsupported {
                     color_targets: 1u32.saturating_add(req.secondary_targets.len() as u32),
-                    depth: req.depth.is_some(),
+                    depth: implementation_depth,
                     color_input: req.color_input,
                 },
             ));
@@ -4298,65 +4372,62 @@ pub(crate) unsafe fn execute_draw_inner(
         effective_line_raster_state(req.primitive_topology, req.fill_mode, req.line_width);
     let depth_bias = effective_depth_bias(req.depth_bias, ctx.features.depth_bias_clamp)
         .map_err(DrawError::Unsupported)?;
-    let pipeline_key =
-        PipelineKey {
-            vert: vert_digest,
-            frag: frag_digest,
-            attrs: attr_keys,
-            topology: req.primitive_topology,
-            blend: req.blend.as_ref().map(super::types::blend_key),
-            secondary_blend: {
-                let mut per_slot = [None; MAX_SECONDARY_ATTACH];
-                for (slot, target) in req
-                    .secondary_targets
-                    .iter()
-                    .take(MAX_SECONDARY_ATTACH)
-                    .enumerate()
-                {
-                    per_slot[slot] = target.blend.as_ref().map(super::types::blend_key);
-                }
-                per_slot
-            },
-            color_write_mask: {
-                let mut per_slot = [ColorWriteMask::default(); 1 + MAX_SECONDARY_ATTACH];
-                per_slot[0] = req.color_write_mask;
-                for (slot, target) in req
-                    .secondary_targets
-                    .iter()
-                    .take(MAX_SECONDARY_ATTACH)
-                    .enumerate()
-                {
-                    per_slot[slot + 1] = target.color_write_mask;
-                }
-                per_slot
-            },
-            pass: pass_key.compatibility(),
-            // Taken from the pass key this draw built, not from `pass`, which
-            // erases it once feedback stops changing the render pass.
-            feedback_colors: pass_key.feedback_colors,
-            cull_mode: req.cull_mode,
-            front_face_ccw: req.front_face_ccw,
-            fill_mode: req.fill_mode,
-            line_width_bits,
-            rasterizer_discard,
-            depth_bias_enable: depth_bias.is_some(),
-            depth_clip: req.depth_clip,
-            depth_test: req.depth.as_ref().map(|d| d.test_enable).unwrap_or(false),
-            depth_write: req.depth.as_ref().map(|d| d.write_enable).unwrap_or(false),
-            depth_compare: req
-                .depth
-                .as_ref()
-                .map(|d| d.compare)
-                .unwrap_or(super::types::SamplerCompareFunction::Always),
-            stencil: req.depth.as_ref().and_then(|d| d.stencil).map(|s| {
-                super::caches::StencilKey {
-                    front: s.front,
-                    back: s.back,
-                }
+    let pipeline_key = PipelineKey {
+        vert: vert_digest,
+        frag: frag_digest,
+        attrs: attr_keys,
+        topology: req.primitive_topology,
+        blend: req.blend.as_ref().map(super::types::blend_key),
+        secondary_blend: {
+            let mut per_slot = [None; MAX_SECONDARY_ATTACH];
+            for (slot, target) in req
+                .secondary_targets
+                .iter()
+                .take(MAX_SECONDARY_ATTACH)
+                .enumerate()
+            {
+                per_slot[slot] = target.blend.as_ref().map(super::types::blend_key);
+            }
+            per_slot
+        },
+        color_write_mask: {
+            let mut per_slot = [ColorWriteMask::default(); 1 + MAX_SECONDARY_ATTACH];
+            per_slot[0] = req.color_write_mask;
+            for (slot, target) in req
+                .secondary_targets
+                .iter()
+                .take(MAX_SECONDARY_ATTACH)
+                .enumerate()
+            {
+                per_slot[slot + 1] = target.color_write_mask;
+            }
+            per_slot
+        },
+        pass: pass_key.compatibility(),
+        // Taken from the pass key this draw built, not from `pass`, which
+        // erases it once feedback stops changing the render pass.
+        feedback_colors: pass_key.feedback_colors,
+        cull_mode: req.cull_mode,
+        front_face_ccw: req.front_face_ccw,
+        fill_mode: req.fill_mode,
+        line_width_bits,
+        rasterizer_discard,
+        depth_bias_enable: depth_bias.is_some(),
+        depth_clip: req.depth_clip,
+        depth_test: effective_depth.map(|d| d.test_enable).unwrap_or(false),
+        depth_write: effective_depth.map(|d| d.write_enable).unwrap_or(false),
+        depth_compare: effective_depth
+            .map(|d| d.compare)
+            .unwrap_or(super::types::SamplerCompareFunction::Always),
+        stencil: effective_depth
+            .and_then(|d| d.stencil)
+            .map(|s| super::caches::StencilKey {
+                front: s.front,
+                back: s.back,
             }),
-            viewport_slots: slot_count_u32,
-            layout: layout_key.clone(),
-        };
+        viewport_slots: slot_count_u32,
+        layout: layout_key.clone(),
+    };
     // One cache, consulted once. `get_or_create_pipeline` already counts the hit
     // and already checks the negative entry for a key that failed to compile.
     phase.enter(super::draw_phase::Phase::PipelineCompile);
@@ -4631,7 +4702,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // slot's cached framebuffer was built against. One predicate, because the
     // two answers it feeds have to agree: which pass the slot is ensured under,
     // and whether the draw builds (and later disposes) a framebuffer of its own.
-    let ordinary_ad_hoc_framebuffer = is_mrt || req.depth.is_some() || req.color_input;
+    let ordinary_ad_hoc_framebuffer = is_mrt || implementation_depth || req.color_input;
     let ad_hoc_framebuffer = ordinary_ad_hoc_framebuffer || req.multisample_resolve;
     let (primary_pass, primary_pass_compatibility) = if ad_hoc_framebuffer {
         let color_only = pass_key.primary_attachment_only();
@@ -6585,8 +6656,7 @@ pub(crate) unsafe fn execute_draw_inner(
             );
         }
     }
-    if preclear_depth {
-        let depth = req.depth.as_ref().expect("preclear implies depth state");
+    if let Some((clear_depth, clear_stencil)) = preclear_depth {
         let attachment = depth_attachment
             .as_ref()
             .expect("preclear implies an acquired depth attachment");
@@ -6596,8 +6666,8 @@ pub(crate) unsafe fn execute_draw_inner(
                 &ctx.device,
                 cb,
                 attachment,
-                depth.clear_value,
-                depth.stencil.map(|stencil| stencil.clear_value),
+                clear_depth,
+                clear_stencil,
             );
         }
     }
@@ -6655,7 +6725,7 @@ pub(crate) unsafe fn execute_draw_inner(
         );
     }
 
-    let clear = clear_values(req);
+    let clear = clear_values(req, implementation_depth);
     phase.enter(super::draw_phase::Phase::RecordPass);
     let rp_begin = vk::RenderPassBeginInfo::default()
         .render_pass(render_pass)
@@ -6885,7 +6955,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // — only bound for stencil pipelines, which list STENCIL_REFERENCE as a
     // dynamic state; front/back set together because Metal's split refs are one
     // guest state and a cache that held half of it would be two.
-    if let Some(s) = req.depth.as_ref().and_then(|d| d.stencil) {
+    if let Some(s) = req.effective_depth_state().and_then(|d| d.stencil) {
         unsafe {
             pools.set_dynamic_stencil_reference(
                 &ctx.device,
@@ -7705,7 +7775,7 @@ unsafe fn ad_hoc_attachment_views(
 /// pass to LOAD. The clear now travels as
 /// [`super::types::DrawRequest::target_clear`], the same shape the secondaries
 /// have always used.
-fn clear_values(req: &DrawRequest) -> Vec<vk::ClearValue> {
+fn clear_values(req: &DrawRequest, implementation_depth: bool) -> Vec<vk::ClearValue> {
     let mut clear = vec![vk::ClearValue {
         color: vk::ClearColorValue {
             float32: req.target_clear,
@@ -7716,11 +7786,18 @@ fn clear_values(req: &DrawRequest) -> Vec<vk::ClearValue> {
             color: vk::ClearColorValue { float32: sec.clear },
         });
     }
-    if let Some(d) = &req.depth {
+    if let Some(d) = &req.depth_attachment {
         clear.push(vk::ClearValue {
             depth_stencil: vk::ClearDepthStencilValue {
                 depth: d.clear_value,
                 stencil: d.stencil.map(|s| s.clear_value).unwrap_or(0),
+            },
+        });
+    } else if implementation_depth {
+        clear.push(vk::ClearValue {
+            depth_stencil: vk::ClearDepthStencilValue {
+                depth: 1.0,
+                stencil: 0,
             },
         });
     }
@@ -7803,15 +7880,19 @@ unsafe fn record_attachment_wide_depth_clear(
     device: &ash::Device,
     cb: vk::CommandBuffer,
     attachment: &AcquiredDepth,
-    clear_depth: f32,
+    clear_depth: Option<f32>,
     clear_stencil: Option<u32>,
 ) {
-    let aspect = vk::ImageAspectFlags::DEPTH
-        | if clear_stencil.is_some() {
-            vk::ImageAspectFlags::STENCIL
-        } else {
-            vk::ImageAspectFlags::empty()
-        };
+    debug_assert!(clear_depth.is_some() || clear_stencil.is_some());
+    let aspect = if clear_depth.is_some() {
+        vk::ImageAspectFlags::DEPTH
+    } else {
+        vk::ImageAspectFlags::empty()
+    } | if clear_stencil.is_some() {
+        vk::ImageAspectFlags::STENCIL
+    } else {
+        vk::ImageAspectFlags::empty()
+    };
     let range = vk::ImageSubresourceRange::default()
         .aspect_mask(aspect)
         .base_mip_level(0)
@@ -7840,7 +7921,7 @@ unsafe fn record_attachment_wide_depth_clear(
         attachment.image,
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         &vk::ClearDepthStencilValue {
-            depth: clear_depth,
+            depth: clear_depth.unwrap_or(0.0),
             stencil: clear_stencil.unwrap_or(0),
         },
         &[range],
@@ -9905,21 +9986,17 @@ mod tests {
                 secondary_with_clear([1.0, 0.0, 0.0, 1.0]),
                 secondary_with_clear([0.0, 1.0, 0.0, 0.5]),
             ],
-            depth: Some(super::super::types::DepthState {
-                // No guest depth texture: this synthetic request exercises the
-                // transient rail, which is the one that still owns its image.
-                identity: None,
-                test_enable: true,
-                write_enable: true,
-                compare: super::super::types::SamplerCompareFunction::Less,
+            depth_attachment: Some(super::super::types::DepthAttachment {
+                identity: super::super::types::TargetIdentity::Anonymous { slot: 1 },
+                load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
+                store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
                 clear_value: 0.5,
-                load: false,
                 stencil: None,
             }),
             ..DrawRequest::default()
         };
 
-        let clear = clear_values(&req);
+        let clear = clear_values(&req, true);
         assert_eq!(
             clear.len(),
             4,
@@ -9941,9 +10018,19 @@ mod tests {
     /// draw that names no colour has always got.
     #[test]
     fn an_unstated_clear_is_transparent_black() {
-        let clear = clear_values(&DrawRequest::default());
+        let clear = clear_values(&DrawRequest::default(), false);
         assert_eq!(clear.len(), 1, "no secondaries and no depth is one entry");
         unsafe { assert_eq!(clear[0].color.float32, [0.0; 4]) };
+    }
+
+    #[test]
+    fn attachmentless_depth_test_gets_metals_implicit_clear_value() {
+        let clear = clear_values(&DrawRequest::default(), true);
+        assert_eq!(clear.len(), 2, "colour plus implementation depth");
+        unsafe {
+            assert_eq!(clear[1].depth_stencil.depth, 1.0);
+            assert_eq!(clear[1].depth_stencil.stencil, 0);
+        }
     }
 
     /// This draw's own snapshot copy is recorded after the registry's access is
@@ -10430,14 +10517,25 @@ mod tests {
 mod depth_load_tests {
     use super::*;
 
-    fn acquired(content_ready: bool) -> AcquiredDepth {
-        AcquiredDepth {
-            view: vk::ImageView::null(),
-            image: vk::Image::null(),
-            owned: None,
-            identity: None,
-            access: crate::engine::pools::ResidentAccess::Untouched,
-            content_ready,
+    fn stencil_tests() -> reims_vgpu_core::DepthState {
+        let face = reims_vgpu_core::StencilFaceOps {
+            compare: reims_vgpu_core::SamplerCompareFunction::Equal,
+            fail_op: reims_vgpu_core::StencilOp::Keep,
+            depth_fail_op: reims_vgpu_core::StencilOp::Keep,
+            pass_op: reims_vgpu_core::StencilOp::Keep,
+            read_mask: u32::MAX,
+            write_mask: 0,
+        };
+        reims_vgpu_core::DepthState {
+            test_enable: true,
+            write_enable: false,
+            compare: reims_vgpu_core::SamplerCompareFunction::Always,
+            stencil: Some(reims_vgpu_core::StencilState {
+                front: face,
+                back: face,
+                reference_front: 0,
+                reference_back: 0,
+            }),
         }
     }
 
@@ -10453,42 +10551,64 @@ mod depth_load_tests {
     /// guest asked for into a load of last frame's depth.
     #[test]
     fn a_depth_load_needs_both_the_guest_asking_and_a_resident_holding_something() {
-        assert!(
-            acquired(true).honours_load(true),
+        use reims_vgpu_protocol::pass_action::LoadAction;
+        assert_eq!(
+            depth_load_for_segment(LoadAction::Load, false, true),
+            ColorLoadKey::Load,
             "guest asked and the resident holds depth: the one case that loads"
         );
-        assert!(
-            !acquired(false).honours_load(true),
+        assert_eq!(
+            depth_load_for_segment(LoadAction::Load, false, false),
+            ColorLoadKey::Clear,
             "an empty resident cannot be loaded from whatever the guest asked"
         );
-        assert!(
-            !acquired(true).honours_load(false),
-            "a guest that asked to clear must clear, resident contents or not"
+        assert_eq!(
+            depth_load_for_segment(LoadAction::Clear, false, true),
+            ColorLoadKey::Clear,
+            "a guest clear must clear, resident contents or not"
         );
-        assert!(!acquired(false).honours_load(false));
+        assert_eq!(
+            depth_load_for_segment(LoadAction::DontCare, false, true),
+            ColorLoadKey::DontCare,
+        );
     }
 
-    /// The transient rail can never honour a LOAD, whatever the guest asked.
-    ///
-    /// Its buffer is created for this draw and destroyed after it, so there has
-    /// never been anything in it to load. That is the same conclusion the old
-    /// `depth_load_unsupported_transient` decline reached unconditionally, and it
-    /// still holds for the rail that decline was named for — what changed is that
-    /// the *identified* case is no longer routed through it.
     #[test]
-    fn the_transient_depth_rail_never_honours_a_load() {
-        let transient = AcquiredDepth {
-            view: vk::ImageView::null(),
-            image: vk::Image::null(),
-            owned: Some((
-                vk::Image::null(),
-                vk::DeviceMemory::null(),
-                vk::ImageView::null(),
-            )),
-            identity: None,
-            access: crate::engine::pools::ResidentAccess::Untouched,
-            content_ready: false,
+    fn a_vulkan_reopen_loads_the_attachment_instead_of_reapplying_metal_clear() {
+        use reims_vgpu_protocol::pass_action::LoadAction;
+        for action in [LoadAction::Load, LoadAction::Clear, LoadAction::DontCare] {
+            assert_eq!(
+                depth_load_for_segment(action, true, true),
+                ColorLoadKey::Load,
+            );
+        }
+    }
+
+    #[test]
+    fn native_stencil_exists_for_a_pass_aspect_or_for_attachmentless_test_state() {
+        let state_only = DrawRequest {
+            depth: Some(stencil_tests()),
+            ..DrawRequest::default()
         };
-        assert!(!transient.honours_load(true));
+        assert!(implementation_stencil(&state_only));
+
+        let depth_only_with_stencil_state = DrawRequest {
+            depth: Some(stencil_tests()),
+            depth_attachment: Some(reims_vgpu_core::DepthAttachment {
+                identity: reims_vgpu_core::TargetIdentity::Anonymous { slot: 1 },
+                load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
+                store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
+                clear_value: 1.0,
+                stencil: None,
+            }),
+            ..DrawRequest::default()
+        };
+        assert!(implementation_stencil(&depth_only_with_stencil_state));
+
+        let depth_only = DrawRequest {
+            depth_attachment: depth_only_with_stencil_state.depth_attachment,
+            ..DrawRequest::default()
+        };
+        assert!(!implementation_stencil(&depth_only));
     }
 }

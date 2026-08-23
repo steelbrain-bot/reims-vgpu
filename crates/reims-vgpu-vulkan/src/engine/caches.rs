@@ -190,12 +190,16 @@ pub(crate) struct SecondaryAttachKey {
 /// `stencil` is set the attachment is the device-queried combined
 /// depth-stencil format (`DeviceContext::depth_stencil_format`) with a live
 /// STENCIL aspect (load/store), so it must partition the pass cache.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub(crate) struct DepthAttachKey {
-    /// true = LOAD existing depth, false = CLEAR at pass start.
-    pub load: bool,
-    /// true = combined depth-stencil attachment (stencil test active).
+    pub load: ColorLoadKey,
+    pub store: bool,
+    /// true = combined depth-stencil native attachment. This includes both a
+    /// pass-owned stencil aspect and Metal's implicit stencil value when state
+    /// enables testing without such an aspect.
     pub stencil: bool,
+    pub stencil_load: ColorLoadKey,
+    pub stencil_store: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -306,7 +310,10 @@ impl PassKey {
             secondary.load = ColorLoadKey::Clear;
         }
         if let Some(depth) = &mut key.depth {
-            depth.load = false;
+            depth.load = ColorLoadKey::Clear;
+            depth.store = false;
+            depth.stencil_load = ColorLoadKey::Clear;
+            depth.stencil_store = false;
         }
         if color_feedback_layout() == color0_pass_exit_layout() {
             key.feedback_colors = 0;
@@ -1766,22 +1773,20 @@ impl ObjectCaches {
         // Depth attachment is appended LAST (after color + secondaries), so its
         // index is the current attachment count and color slot 0 is untouched.
         let depth_ref = key.depth.map(|d| {
-            let (dload, dinitial) = if d.load {
-                (
-                    vk::AttachmentLoadOp::LOAD,
-                    vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                )
-            } else {
-                (vk::AttachmentLoadOp::CLEAR, vk::ImageLayout::UNDEFINED)
-            };
-            // Stencil test active ⇒ combined format with a live STENCIL aspect
-            // (CLEAR/STORE mirroring depth). Depth-only stays D32_SFLOAT with
-            // DONT_CARE stencil, byte-identical to the pre-stencil pass.
+            let final_layout = vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            let (dload, depth_initial) = d.load.vulkan(final_layout);
+            // A pass-bound stencil aspect or Metal's implicit stencil value
+            // selects the combined format. Depth-only stays D32_SFLOAT with
+            // DONT_CARE stencil operations.
             let (dformat, sload, sstore) = if d.stencil {
                 (
                     ctx.depth_stencil_format,
-                    dload,
-                    vk::AttachmentStoreOp::STORE,
+                    d.stencil_load.vulkan(final_layout).0,
+                    if d.stencil_store {
+                        vk::AttachmentStoreOp::STORE
+                    } else {
+                        vk::AttachmentStoreOp::DONT_CARE
+                    },
                 )
             } else {
                 (
@@ -1790,13 +1795,24 @@ impl ObjectCaches {
                     vk::AttachmentStoreOp::DONT_CARE,
                 )
             };
+            let dinitial = if depth_initial == final_layout
+                || (d.stencil && d.stencil_load == ColorLoadKey::Load)
+            {
+                final_layout
+            } else {
+                vk::ImageLayout::UNDEFINED
+            };
             let index = attachments.len() as u32;
             attachments.push(
                 vk::AttachmentDescription::default()
                     .format(dformat)
                     .samples(vk_sample_count(key.sample_count))
                     .load_op(dload)
-                    .store_op(vk::AttachmentStoreOp::STORE)
+                    .store_op(if d.store {
+                        vk::AttachmentStoreOp::STORE
+                    } else {
+                        vk::AttachmentStoreOp::DONT_CARE
+                    })
                     .stencil_load_op(sload)
                     .stencil_store_op(sstore)
                     .initial_layout(dinitial)
@@ -2669,14 +2685,15 @@ mod object_cache_tests {
             load: ColorLoadKey::Clear,
         };
         clear.depth = Some(DepthAttachKey {
-            load: false,
+            load: ColorLoadKey::Clear,
             stencil: true,
+            ..Default::default()
         });
 
         let mut load = clear;
         load.color0_load = ColorLoadKey::Load;
         load.secondary[0].load = ColorLoadKey::Load;
-        load.depth.as_mut().unwrap().load = true;
+        load.depth.as_mut().unwrap().load = ColorLoadKey::Load;
         assert_eq!(clear.compatibility(), load.compatibility());
 
         let mut different_format = load;
@@ -2716,8 +2733,9 @@ mod object_cache_tests {
         compound.multisample_resolve = true;
         compound.color_input = true;
         compound.depth = Some(DepthAttachKey {
-            load: true,
+            load: ColorLoadKey::Load,
             stencil: true,
+            ..Default::default()
         });
         compound.secondary_count = 1;
 
@@ -2750,8 +2768,9 @@ mod object_cache_tests {
             load: ColorLoadKey::Clear,
         };
         base.depth = Some(DepthAttachKey {
-            load: false,
+            load: ColorLoadKey::Clear,
             stencil: true,
+            ..Default::default()
         });
         base.sample_count = 1;
 
@@ -2771,7 +2790,7 @@ mod object_cache_tests {
                 |k| {
                     k.color0_load = ColorLoadKey::Load;
                     k.secondary[0].load = ColorLoadKey::Load;
-                    k.depth.as_mut().unwrap().load = true;
+                    k.depth.as_mut().unwrap().load = ColorLoadKey::Load;
                 },
                 None,
             ),

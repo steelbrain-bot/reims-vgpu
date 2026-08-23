@@ -262,15 +262,12 @@ pub(super) fn plan_executor_request<M: HostMemory + HostOps>(
     // invocation count; indexed draws are governed by `index_count`.
     let vertex_count = req.vertex_count;
 
-    // Honor a bound NON-TRIVIAL depth-stencil state: attach a transient depth
-    // buffer + enable the depth test. Decoded once per depth draw; the whole
-    // 2D UI binds no depth-stencil (`depth_stencil_ref == 0`, 0 decodes), so
-    // this is inert there. A trivial state (compare Always, no write, no
-    // stencil) stays `None` — no depth attachment, byte-identical 2D path.
-    // Descriptor resolution and enum normalization are fail-closed: a
-    // bound state either becomes one semantic engine state or refuses the
-    // draw by name. A trivial state remains the exact no-depth operation.
+    // The pass attachment and the encoder's test state are independent Metal
+    // objects. Build the attachment even when the state is nil or trivial, so
+    // its clear/load/store still occurs. Conversely, a state bound to a pass
+    // with no attachment cannot invent storage; Metal disables those tests.
     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::AssembleDepth);
+    resources.depth_attachment = semantic_depth_attachment(req)?;
     if req.depth_stencil_ref != 0 {
         let ds = load_depth_stencil_descriptor(state, host, req.task_id, req.depth_stencil_ref)
             .map_err(|detail| DrawPreparationDecline::DepthStencilStateMissing {
@@ -278,7 +275,8 @@ pub(super) fn plan_executor_request<M: HostMemory + HostOps>(
                 state_ref: req.depth_stencil_ref,
                 detail,
             })?;
-        resources.depth = semantic_depth_state(&ds, req)?;
+        let depth = semantic_depth_state(&ds, req)?;
+        resources.depth = depth;
     }
     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
     resources.program = program;

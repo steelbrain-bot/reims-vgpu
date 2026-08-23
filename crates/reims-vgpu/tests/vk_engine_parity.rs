@@ -9,10 +9,10 @@
 use metal2vulkan::passes::Stage;
 use reims_vgpu_vulkan::engine::{
     self, AttachmentInitial, BlendFactor, BlendOp, BlendStateResource, BufferContent, CullMode,
-    DepthState, DrawRequest, IndexType, IndexedDrawResource, PrimitiveTopology,
+    DepthAttachment, DepthState, DrawRequest, IndexType, IndexedDrawResource, PrimitiveTopology,
     SampledContentIdentity, SampledImageResource, SampledSource, SamplerCompareFunction,
-    SamplerResource, ScissorResource, SecondaryColorTarget, StencilFaceOps, StencilOp,
-    StencilState, StorageBufferResource, TargetIdentity, VertexAttributeFormat,
+    SamplerResource, ScissorResource, SecondaryColorTarget, StencilAttachment, StencilFaceOps,
+    StencilOp, StencilState, StorageBufferResource, TargetIdentity, VertexAttributeFormat,
     VertexAttributeResource, VertexStepFunction, ViewportResource, VisibilityResultMode,
     MAX_DEVICE_RECREATES,
 };
@@ -272,13 +272,17 @@ fn multisample_resolve_preserves_subpixel_coverage() {
     req.raster_sample_count = 4;
     req.color_sample_count = 4;
     req.multisample_resolve = true;
+    req.depth_attachment = Some(DepthAttachment {
+        identity: TargetIdentity::Anonymous { slot: 0x4d50 },
+        load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
+        store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
+        clear_value: 1.0,
+        stencil: None,
+    });
     req.depth = Some(DepthState {
-        identity: None,
         test_enable: true,
         write_enable: true,
         compare: SamplerCompareFunction::Always,
-        clear_value: 1.0,
-        load: false,
         stencil: None,
     });
     req.viewports = vec![ViewportResource {
@@ -685,15 +689,17 @@ fn depth_test_honored_compare_and_clear_wired() {
         });
         req.samplers
             .push(SamplerResource::normalized_default(sampler_binding(0)));
+        req.depth_attachment = Some(DepthAttachment {
+            identity: TargetIdentity::Anonymous { slot: 0xd370 },
+            load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
+            store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
+            clear_value: clear,
+            stencil: None,
+        });
         req.depth = Some(DepthState {
-            // Parity fixtures bind no guest depth texture, so they exercise the
-            // transient rail rather than the registry-resident one.
-            identity: None,
             test_enable: true,
             write_enable: true,
             compare,
-            clear_value: clear,
-            load: false,
             stencil: None,
         });
         req.depth_bias = depth_bias;
@@ -757,13 +763,21 @@ fn mismatched_depth_attachment_clear_covers_its_full_image() {
         generation: 1,
         stencil: false,
     };
-    let depth = |clear_value: f32, load: bool, compare| DepthState {
-        identity: Some(depth_identity.clone()),
+    let depth_state = |compare| DepthState {
         test_enable: true,
         write_enable: true,
         compare,
+        stencil: None,
+    };
+    let depth_attachment = |clear_value: f32, load: bool| DepthAttachment {
+        identity: depth_identity.clone(),
+        load_action: if load {
+            reims_vgpu_protocol::pass_action::LoadAction::Load
+        } else {
+            reims_vgpu_protocol::pass_action::LoadAction::Clear
+        },
+        store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
         clear_value,
-        load,
         stencil: None,
     };
 
@@ -772,7 +786,8 @@ fn mismatched_depth_attachment_clear_covers_its_full_image() {
     establish.vertex_count = 0;
     establish.skip_readback = true;
     establish.target_identity = Some(TargetIdentity::Anonymous { slot: 0xd80 });
-    establish.depth = Some(depth(1.0, false, SamplerCompareFunction::Always));
+    establish.depth_attachment = Some(depth_attachment(1.0, false));
+    establish.depth = Some(depth_state(SamplerCompareFunction::Always));
     match engine::execute_draw_request(&establish) {
         Ok(_) => {}
         Err(error) if skip_if_no_gpu(&error.to_string()) => {
@@ -788,7 +803,8 @@ fn mismatched_depth_attachment_clear_covers_its_full_image() {
     narrow.vertex_count = 0;
     narrow.skip_readback = true;
     narrow.target_identity = Some(TargetIdentity::Anonymous { slot: 0xd81 });
-    narrow.depth = Some(depth(0.25, false, SamplerCompareFunction::Always));
+    narrow.depth_attachment = Some(depth_attachment(0.25, false));
+    narrow.depth = Some(depth_state(SamplerCompareFunction::Always));
     engine::execute_draw_request(&narrow).expect("narrow depth clear");
 
     // Load the complete depth resident and draw z=0.5 with Less. A complete
@@ -820,7 +836,8 @@ fn mismatched_depth_attachment_clear_covers_its_full_image() {
     ];
     let mut verify = engine_req(&vert, &frag, 8, 8);
     verify.vertex_count = 6;
-    verify.depth = Some(depth(0.0, true, SamplerCompareFunction::Less));
+    verify.depth_attachment = Some(depth_attachment(0.0, true));
+    verify.depth = Some(depth_state(SamplerCompareFunction::Less));
     verify.storage_buffers.push(StorageBufferResource {
         binding: 0,
         content: encode_f32(&positions.into_iter().flatten().collect::<Vec<_>>()).into(),
@@ -948,15 +965,23 @@ fn depth_test_honored_on_resident_target_path() {
         });
         req.samplers
             .push(SamplerResource::normalized_default(sampler_binding(0)));
+        req.depth_attachment = Some(DepthAttachment {
+            identity: TargetIdentity::Texture {
+                ref_: surface_id + 10_000,
+                width: w,
+                height: h,
+                generation: 1,
+                stencil: false,
+            },
+            load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
+            store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
+            clear_value: clear,
+            stencil: None,
+        });
         req.depth = Some(DepthState {
-            // Parity fixtures bind no guest depth texture, so they exercise the
-            // transient rail rather than the registry-resident one.
-            identity: None,
             test_enable: true,
             write_enable: true,
             compare,
-            clear_value: clear,
-            load: false,
             stencil: None,
         });
         match engine::execute_draw_request(&req) {
@@ -1092,21 +1117,26 @@ fn stencil_test_honored_compare_ref_and_clear_wired() {
         });
         req.samplers
             .push(SamplerResource::normalized_default(sampler_binding(0)));
+        req.depth_attachment = Some(DepthAttachment {
+            identity: TargetIdentity::Anonymous { slot: 0x57e0 },
+            load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
+            store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
+            clear_value: 1.0,
+            stencil: Some(StencilAttachment {
+                load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
+                store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
+                clear_value: clear,
+            }),
+        });
         req.depth = Some(DepthState {
-            // Parity fixtures bind no guest depth texture, so they exercise the
-            // transient rail rather than the registry-resident one.
-            identity: None,
             test_enable: true,
             write_enable: false,
             compare: SamplerCompareFunction::Always,
-            clear_value: 1.0,
-            load: false,
             stencil: Some(StencilState {
                 front: face,
                 back: face,
                 reference_front: reference,
                 reference_back: reference,
-                clear_value: clear,
             }),
         });
         draw_or_skip("stencil", &req).map(|px| triangle_covered(&px, w, h))
@@ -4166,16 +4196,23 @@ fn depth_and_mrt_secondary_render_in_one_pass() {
             blend: None,
             color_write_mask: Default::default(),
         });
+        req.depth_attachment = Some(DepthAttachment {
+            identity: TargetIdentity::Texture {
+                ref_: surface_id + 20_000,
+                width: w,
+                height: h,
+                generation: 1,
+                stencil: false,
+            },
+            load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
+            store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
+            clear_value: 1.0,
+            stencil: None,
+        });
         req.depth = Some(DepthState {
-            // Parity fixtures bind no guest depth texture, so this is the
-            // transient rail — the one that owns its image and so the one whose
-            // dispose order a shared framebuffer would get wrong.
-            identity: None,
             test_enable: true,
             write_enable: true,
             compare,
-            clear_value: 1.0,
-            load: false,
             stencil: None,
         });
         match engine::execute_draw_request(&req) {

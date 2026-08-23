@@ -11,13 +11,13 @@ pub use reims_vgpu_core::{
     ComputeBufferResource, ComputeBufferResult, ComputeImageDestination, ComputeImageResult,
     ComputeOutput, ComputeRequest, ComputeResidentSampleBind, ComputeSampledImageResource,
     ComputeSampledImageSource, ComputeStorageImageResource, ComputeStorageImageSeed,
-    ComputeStorageResidency, CullMode, DepthClipMode, DepthState, DrawOutput, DrawRequest,
-    FillMode, IndexType, IndexedDrawResource, PrimitiveTopology, SampledByteOrigin,
+    ComputeStorageResidency, CullMode, DepthAttachment, DepthClipMode, DepthState, DrawOutput,
+    DrawRequest, FillMode, IndexType, IndexedDrawResource, PrimitiveTopology, SampledByteOrigin,
     SampledContentIdentity, SampledImageResource, SampledSource, SamplerAddressMode,
     SamplerBorderColor, SamplerCompareFunction, SamplerFilter, SamplerMipFilter, SamplerResource,
-    ScissorResource, SecondaryColorTarget, SeedOrder, StencilFaceOps, StencilOp, StencilState,
-    StorageBufferResource, VertexAttributeFormat, VertexAttributeResource, VertexStepFunction,
-    ViewportResource, VisibilityResultMode,
+    ScissorResource, SecondaryColorTarget, SeedOrder, StencilAttachment, StencilFaceOps, StencilOp,
+    StencilState, StorageBufferResource, VertexAttributeFormat, VertexAttributeResource,
+    VertexStepFunction, ViewportResource, VisibilityResultMode,
 };
 pub use reims_vgpu_memory::{
     GuestImageSource, GuestRun, GuestRunSource, GuestTargetBacking, GuestTargetMemory,
@@ -385,13 +385,11 @@ mod tests {
             Some(AttachmentSlot::Primary)
         );
 
-        req.depth = Some(DepthState {
-            identity: Some(surface(3)),
-            test_enable: true,
-            write_enable: true,
-            compare: SamplerCompareFunction::Less,
+        req.depth_attachment = Some(DepthAttachment {
+            identity: surface(3),
+            load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
+            store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
             clear_value: 1.0,
-            load: false,
             stencil: None,
         });
         assert!(req.writes_attachment(&surface(3)), "depth");

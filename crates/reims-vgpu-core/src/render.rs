@@ -2,6 +2,7 @@
 
 use crate::{ContentStamp, GatherVouch, ResourceLifetime, ResourceLifetimeRef, SamplerResource};
 use reims_vgpu_memory::{GuestRunSource, GuestTargetPlan};
+pub use reims_vgpu_protocol::pass_action::{LoadAction, StoreAction};
 pub use reims_vgpu_protocol::{
     BlendFactor, BlendOp, BlendStateResource, CullMode, DepthClipMode, FillMode, IndexType,
     PrimitiveTopology, StencilOp, VertexAttributeFormat, VertexStepFunction, VisibilityResultMode,
@@ -11,13 +12,32 @@ use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DepthState {
-    pub identity: Option<crate::TargetIdentity>,
     pub test_enable: bool,
     pub write_enable: bool,
     pub compare: crate::SamplerCompareFunction,
-    pub clear_value: f32,
-    pub load: bool,
     pub stencil: Option<StencilState>,
+}
+
+/// Pass-owned depth/stencil attachment state.
+///
+/// Metal binds this on the render-pass descriptor, independently of the
+/// encoder's per-draw [`DepthState`]. A nil or trivial depth-stencil state does
+/// not remove the attachment or its load/store operations.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DepthAttachment {
+    pub identity: crate::TargetIdentity,
+    pub load_action: LoadAction,
+    pub store_action: StoreAction,
+    pub clear_value: f32,
+    pub stencil: Option<StencilAttachment>,
+}
+
+/// Stencil aspect of a combined depth/stencil attachment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StencilAttachment {
+    pub load_action: LoadAction,
+    pub store_action: StoreAction,
+    pub clear_value: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -36,7 +56,6 @@ pub struct StencilState {
     pub back: StencilFaceOps,
     pub reference_front: u32,
     pub reference_back: u32,
-    pub clear_value: u32,
 }
 
 /// One executor-prepared shader stage and the semantic descriptor interface
@@ -163,7 +182,11 @@ pub struct DrawRequest {
     /// `setDepthBias:slopeScale:clamp:` in that source order.
     pub depth_bias: Option<[f32; 3]>,
     pub depth_clip: DepthClipMode,
+    /// Per-draw depth/stencil tests. `None` disables tests without changing the
+    /// pass-owned attachment below.
     pub depth: Option<DepthState>,
+    /// Depth/stencil attachment fixed by the enclosing render pass.
+    pub depth_attachment: Option<DepthAttachment>,
     pub color_input: bool,
     /// A render-target-scoped fragment-to-fragment memory barrier immediately
     /// before this draw, as declared inside the same Metal render encoder.
@@ -177,12 +200,21 @@ pub struct DrawRequest {
 }
 
 impl DrawRequest {
+    /// Per-draw tests, independent from pass-owned attachment operations.
+    ///
+    /// Native Metal still applies depth comparison when the pass descriptor has
+    /// no depth attachment, against an implicit value of one. Backends that
+    /// require a native attachment must provide that implementation detail
+    /// without turning it into a pass-owned core attachment.
+    pub fn effective_depth_state(&self) -> Option<&DepthState> {
+        self.depth.as_ref()
+    }
+
     pub fn depth_attachment_extent(&self) -> Option<(u32, u32)> {
-        self.depth.as_ref().map(|depth| {
+        self.depth_attachment.as_ref().map(|depth| {
             depth
                 .identity
-                .as_ref()
-                .and_then(crate::TargetIdentity::geometry)
+                .geometry()
                 .unwrap_or((self.width, self.height))
         })
     }
@@ -233,7 +265,7 @@ impl DrawRequest {
             } else {
                 AttachmentSlot::Secondary
             })
-        } else if self.depth.as_ref().and_then(|d| d.identity.as_ref()) == Some(identity) {
+        } else if self.depth_attachment.as_ref().map(|d| &d.identity) == Some(identity) {
             Some(AttachmentSlot::Depth)
         } else {
             None
@@ -541,14 +573,12 @@ mod tests {
         assert!(shaped(false, false, true).planes_are_array_slices());
     }
 
-    fn depth(identity: crate::TargetIdentity) -> DepthState {
-        DepthState {
-            identity: Some(identity),
-            test_enable: false,
-            write_enable: false,
-            compare: crate::SamplerCompareFunction::Always,
+    fn depth(identity: crate::TargetIdentity) -> DepthAttachment {
+        DepthAttachment {
+            identity,
+            load_action: LoadAction::Clear,
+            store_action: StoreAction::Store,
             clear_value: 1.0,
-            load: false,
             stencil: None,
         }
     }
@@ -581,7 +611,7 @@ mod tests {
                 width: std::num::NonZeroU32::new(2),
                 height: None,
             },
-            depth: Some(depth(crate::TargetIdentity::Texture {
+            depth_attachment: Some(depth(crate::TargetIdentity::Texture {
                 ref_: 3,
                 width: 5,
                 height: 3,
@@ -616,7 +646,7 @@ mod tests {
         let anonymous = DrawRequest {
             width: 8,
             height: 6,
-            depth: Some(depth(crate::TargetIdentity::Anonymous { slot: 1 })),
+            depth_attachment: Some(depth(crate::TargetIdentity::Anonymous { slot: 1 })),
             ..Default::default()
         };
         assert_eq!(anonymous.depth_attachment_extent(), Some((8, 6)));
@@ -624,7 +654,7 @@ mod tests {
         let explicit = DrawRequest {
             width: 8,
             height: 6,
-            depth: Some(depth(crate::TargetIdentity::Texture {
+            depth_attachment: Some(depth(crate::TargetIdentity::Texture {
                 ref_: 1,
                 width: 0,
                 height: 6,
@@ -635,6 +665,43 @@ mod tests {
         };
         assert_eq!(explicit.depth_attachment_extent(), Some((0, 6)));
         assert_eq!(explicit.minimum_attachment_extent(), (0, 6));
+    }
+
+    #[test]
+    fn depth_tests_and_pass_attachment_operations_are_independent() {
+        let tests = DepthState {
+            test_enable: true,
+            write_enable: true,
+            compare: crate::SamplerCompareFunction::Less,
+            stencil: None,
+        };
+        let attachment = depth(crate::TargetIdentity::Texture {
+            ref_: 9,
+            width: 4,
+            height: 4,
+            generation: 1,
+            stencil: false,
+        });
+
+        let tests_only = DrawRequest {
+            depth: Some(tests.clone()),
+            ..Default::default()
+        };
+        assert_eq!(tests_only.effective_depth_state(), Some(&tests));
+
+        let attachment_only = DrawRequest {
+            depth_attachment: Some(attachment.clone()),
+            ..Default::default()
+        };
+        assert_eq!(attachment_only.effective_depth_state(), None);
+        assert_eq!(attachment_only.depth_attachment, Some(attachment.clone()));
+
+        let both = DrawRequest {
+            depth: Some(tests.clone()),
+            depth_attachment: Some(attachment),
+            ..Default::default()
+        };
+        assert_eq!(both.effective_depth_state(), Some(&tests));
     }
 }
 

@@ -52,6 +52,10 @@ for f in formats {
 
 renderTargetCases()
 
+depthStencilIndependenceCases()
+
+stencilIndependenceCases()
+
 mipCase()
 
 mipBlitCase()

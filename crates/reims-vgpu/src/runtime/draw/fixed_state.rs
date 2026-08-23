@@ -113,11 +113,6 @@ pub(super) fn semantic_depth_state(
     if depth_stencil_descriptor_is_trivial(descriptor) {
         return Ok(None);
     }
-    let (clear_value, load_action) = request
-        .depth_attach
-        .as_ref()
-        .map(|depth| (depth.clear_depth as f32, depth.load_action))
-        .unwrap_or((1.0, reims_vgpu_protocol::pass_action::LoadAction::Clear));
     let stencil = if front.is_some_and(stencil_face_ops_has_effect)
         || back.is_some_and(stencil_face_ops_has_effect)
     {
@@ -132,29 +127,95 @@ pub(super) fn semantic_depth_state(
         let front = front.unwrap_or(PASS_THROUGH);
         let back = back.unwrap_or(PASS_THROUGH);
         let (reference_front, reference_back) = request.stencil_ref.unwrap_or((0, 0));
-        let clear_value = request
-            .stencil_attach
-            .as_ref()
-            .map(|stencil| stencil.clear_stencil)
-            .unwrap_or(0);
         Some(StencilState {
             front,
             back,
             reference_front,
             reference_back,
-            clear_value,
         })
     } else {
         None
     };
 
     Ok(Some(reims_vgpu_core::DepthState {
-        identity: depth_chain_identity(request, stencil.is_some()),
         test_enable: true,
         write_enable: descriptor.depth_write_enabled,
         compare,
-        clear_value,
-        load: load_action == reims_vgpu_protocol::pass_action::LoadAction::Load,
+        stencil,
+    }))
+}
+
+pub(super) fn semantic_depth_attachment(
+    request: &DrawEncodeRequest,
+) -> Result<Option<reims_vgpu_core::DepthAttachment>, DrawPreparationDecline> {
+    use reims_vgpu_core::{DepthAttachment, StencilAttachment};
+    use reims_vgpu_protocol::pass_action::StoreAction;
+
+    let Some(depth) = request
+        .depth_attach
+        .as_ref()
+        .filter(|attachment| attachment.texture_ref != 0)
+    else {
+        if let Some(stencil) = request
+            .stencil_attach
+            .as_ref()
+            .filter(|attachment| attachment.texture_ref != 0)
+        {
+            return Err(DrawPreparationDecline::StencilAttachmentWithoutDepth {
+                stencil_ref: stencil.texture_ref,
+            });
+        }
+        return Ok(None);
+    };
+
+    let stencil = request
+        .stencil_attach
+        .as_ref()
+        .filter(|attachment| attachment.texture_ref != 0)
+        .map(|stencil| {
+            if stencil.texture_ref != depth.texture_ref {
+                return Err(DrawPreparationDecline::DepthStencilAttachmentMismatch {
+                    depth_ref: depth.texture_ref,
+                    stencil_ref: stencil.texture_ref,
+                });
+            }
+            if matches!(
+                stencil.store_action,
+                StoreAction::MultisampleResolve | StoreAction::StoreAndMultisampleResolve
+            ) {
+                return Err(DrawPreparationDecline::DepthStencilStoreActionUnsupported {
+                    aspect: "stencil",
+                    store_action: stencil.store_action.guest_ordinal(),
+                });
+            }
+            Ok(StencilAttachment {
+                load_action: stencil.load_action,
+                store_action: stencil.store_action,
+                clear_value: stencil.clear_stencil,
+            })
+        })
+        .transpose()?;
+
+    if matches!(
+        depth.store_action,
+        StoreAction::MultisampleResolve | StoreAction::StoreAndMultisampleResolve
+    ) {
+        return Err(DrawPreparationDecline::DepthStencilStoreActionUnsupported {
+            aspect: "depth",
+            store_action: depth.store_action.guest_ordinal(),
+        });
+    }
+
+    let identity = depth_chain_identity(request, stencil.is_some()).ok_or(
+        DrawPreparationDecline::DepthAttachmentIdentityMissing {
+            depth_ref: depth.texture_ref,
+        },
+    )?;
+    Ok(Some(DepthAttachment {
+        identity,
+        load_action: depth.load_action,
+        store_action: depth.store_action,
+        clear_value: depth.clear_depth as f32,
         stencil,
     }))
 }

@@ -321,6 +321,20 @@ pub enum DrawPreparationDecline<TranslationDecline> {
         state_ref: u32,
         detail: &'static str,
     },
+    DepthAttachmentIdentityMissing {
+        depth_ref: u32,
+    },
+    StencilAttachmentWithoutDepth {
+        stencil_ref: u32,
+    },
+    DepthStencilAttachmentMismatch {
+        depth_ref: u32,
+        stencil_ref: u32,
+    },
+    DepthStencilStoreActionUnsupported {
+        aspect: &'static str,
+        store_action: u16,
+    },
     BlendState {
         reason: PipelineStateDecodeError,
     },
@@ -533,6 +547,18 @@ impl<TranslationDecline: Decline> Decline for DrawPreparationDecline<Translation
                 "draw_prepare_chain_resident_identity_missing"
             }
             Self::DepthStencilStateMissing { .. } => "draw_prepare_depth_stencil_state_missing",
+            Self::DepthAttachmentIdentityMissing { .. } => {
+                "draw_prepare_depth_attachment_identity_missing"
+            }
+            Self::StencilAttachmentWithoutDepth { .. } => {
+                "draw_prepare_stencil_attachment_without_depth"
+            }
+            Self::DepthStencilAttachmentMismatch { .. } => {
+                "draw_prepare_depth_stencil_attachment_mismatch"
+            }
+            Self::DepthStencilStoreActionUnsupported { .. } => {
+                "draw_prepare_depth_stencil_store_action_unsupported"
+            }
             Self::BlendState { .. } => "draw_prepare_blend_state",
             Self::DepthCompare { .. } => "draw_prepare_depth_compare",
             Self::StencilState { .. } => "draw_prepare_stencil_state",
@@ -802,6 +828,26 @@ impl<TranslationDecline: Decline> Decline for DrawPreparationDecline<Translation
                 ("task_id", task_id.to_string()),
                 ("state_ref", state_ref.to_string()),
                 ("detail", (*detail).to_string()),
+            ],
+            Self::DepthAttachmentIdentityMissing { depth_ref } => {
+                vec![("depth_ref", depth_ref.to_string())]
+            }
+            Self::StencilAttachmentWithoutDepth { stencil_ref } => {
+                vec![("stencil_ref", stencil_ref.to_string())]
+            }
+            Self::DepthStencilAttachmentMismatch {
+                depth_ref,
+                stencil_ref,
+            } => vec![
+                ("depth_ref", depth_ref.to_string()),
+                ("stencil_ref", stencil_ref.to_string()),
+            ],
+            Self::DepthStencilStoreActionUnsupported {
+                aspect,
+                store_action,
+            } => vec![
+                ("aspect", (*aspect).to_string()),
+                ("store_action", store_action.to_string()),
             ],
             Self::BlendState { reason } | Self::DepthCompare { reason } => {
                 vec![("value", reason.raw().to_string())]

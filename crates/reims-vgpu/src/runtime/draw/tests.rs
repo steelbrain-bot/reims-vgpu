@@ -7492,8 +7492,9 @@ fn a_depth_attachment_is_keyed_on_the_guest_texture_the_pass_bound() {
         "a stencil-carrying depth attachment is its own resident"
     );
 
-    // No depth texture in the pass descriptor: nothing to key a resident on, and
-    // the engine's transient fallback is what runs.
+    // No depth texture in the pass descriptor names no resident. A backend may
+    // still need a draw-owned native image to model Metal's implicit depth value
+    // for a bound test state, but that image is not a guest pass attachment.
     assert_eq!(
         id(&req(0, 1024, 768), false),
         None,
@@ -7514,6 +7515,62 @@ fn a_depth_attachment_is_keyed_on_the_guest_texture_the_pass_bound() {
         None,
         "and neither does a pass with no depth attachment at all"
     );
+}
+
+#[test]
+fn pass_depth_attachment_is_built_without_depth_test_state_and_invalid_pairs_refuse() {
+    use reims_vgpu_protocol::pass_action::{LoadAction, StoreAction};
+
+    let base = DrawEncodeRequest {
+        colors: vec![ColorRtRequest {
+            width: 8,
+            height: 6,
+            ..Default::default()
+        }],
+        depth_attach: Some(DepthAttachmentState {
+            texture_ref: 42,
+            load_action: LoadAction::Clear,
+            store_action: StoreAction::Store,
+            clear_depth: 0.25,
+        }),
+        // Nil state is deliberate: pass load/store does not depend on this.
+        depth_stencil_ref: 0,
+        ..DrawEncodeRequest::default()
+    };
+    let attachment = semantic_depth_attachment(&base)
+        .expect("the declared attachment is supported")
+        .expect("a bound depth texture is a pass attachment");
+    assert_eq!(attachment.load_action, LoadAction::Clear);
+    assert_eq!(attachment.store_action, StoreAction::Store);
+    assert_eq!(attachment.clear_value, 0.25);
+    assert_eq!(attachment.stencil, None);
+
+    let stencil_only = DrawEncodeRequest {
+        stencil_attach: Some(StencilAttachmentState {
+            texture_ref: 43,
+            ..Default::default()
+        }),
+        ..DrawEncodeRequest::default()
+    };
+    assert!(matches!(
+        semantic_depth_attachment(&stencil_only),
+        Err(DrawPreparationDecline::StencilAttachmentWithoutDepth { stencil_ref: 43 })
+    ));
+
+    let mismatch = DrawEncodeRequest {
+        stencil_attach: Some(StencilAttachmentState {
+            texture_ref: 43,
+            ..Default::default()
+        }),
+        ..base
+    };
+    assert!(matches!(
+        semantic_depth_attachment(&mismatch),
+        Err(DrawPreparationDecline::DepthStencilAttachmentMismatch {
+            depth_ref: 42,
+            stencil_ref: 43,
+        })
+    ));
 }
 
 /// Only a texture gap the fragment module statically uses is substituted for.

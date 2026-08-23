@@ -10,8 +10,8 @@
 
 use metal2vulkan::passes::Stage;
 use reims_vgpu_vulkan::engine::{
-    self, BufferContent, DepthState, DrawRequest, GuestRun, GuestRunSource, IndexType,
-    IndexedDrawResource, PrimitiveTopology, SampledImageResource, SampledSource,
+    self, BufferContent, DepthAttachment, DepthState, DrawRequest, GuestRun, GuestRunSource,
+    IndexType, IndexedDrawResource, PrimitiveTopology, SampledImageResource, SampledSource,
     SamplerCompareFunction, SamplerResource, ScissorResource, StorageBufferResource,
     TargetIdentity,
 };
@@ -335,13 +335,17 @@ fn stored_multisample_target_survives_for_a_later_encoder() {
     let mut first = batch_req(&vert, &frag, &identity, false, half_scissor(true));
     first.raster_sample_count = 2;
     first.color_sample_count = 2;
+    first.depth_attachment = Some(DepthAttachment {
+        identity: depth_identity.clone(),
+        load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
+        store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
+        clear_value: 1.0,
+        stencil: None,
+    });
     first.depth = Some(DepthState {
-        identity: Some(depth_identity.clone()),
         test_enable: true,
         write_enable: true,
         compare: SamplerCompareFunction::Always,
-        clear_value: 1.0,
-        load: false,
         stencil: None,
     });
     match engine::execute_draw_request(&first) {
@@ -363,13 +367,17 @@ fn stored_multisample_target_survives_for_a_later_encoder() {
     let mut second = batch_req(&vert, &frag, &identity, true, half_scissor(false));
     second.raster_sample_count = 2;
     second.color_sample_count = 2;
+    second.depth_attachment = Some(DepthAttachment {
+        identity: depth_identity,
+        load_action: reims_vgpu_protocol::pass_action::LoadAction::Load,
+        store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
+        clear_value: 1.0,
+        stencil: None,
+    });
     second.depth = Some(DepthState {
-        identity: Some(depth_identity),
         test_enable: true,
         write_enable: true,
         compare: SamplerCompareFunction::Always,
-        clear_value: 1.0,
-        load: true,
         stencil: None,
     });
     engine::execute_draw_request(&second).expect("later encoder loads multisample resident");
