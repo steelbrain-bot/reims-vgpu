@@ -178,18 +178,37 @@ impl ResourcePools {
         self.shared.sampled_cache_bytes = 0;
         for s in self.shared.storage_image_free.drain() {
             device.destroy_image_view(s.view, None);
-            device.destroy_image(s.image, None);
-            device.free_memory(s.memory, None);
+            match s.backing {
+                StorageImageBacking::Dedicated(memory) => {
+                    device.destroy_image(s.image, None);
+                    device.free_memory(memory, None);
+                }
+                StorageImageBacking::HeapPlacement { .. } => {}
+            }
         }
         for s in self.shared.storage_image_live.drain(..) {
             device.destroy_image_view(s.view, None);
-            device.destroy_image(s.image, None);
-            device.free_memory(s.memory, None);
+            match s.backing {
+                StorageImageBacking::Dedicated(memory) => {
+                    device.destroy_image(s.image, None);
+                    device.free_memory(memory, None);
+                }
+                StorageImageBacking::HeapPlacement { .. } => {}
+            }
         }
         for (_, resident) in self.shared.compute_storage_registry.drain() {
             device.destroy_image_view(resident.slot.view, None);
-            device.destroy_image(resident.slot.image, None);
-            device.free_memory(resident.slot.memory, None);
+            match resident.slot.backing {
+                StorageImageBacking::Dedicated(memory) => {
+                    device.destroy_image(resident.slot.image, None);
+                    device.free_memory(memory, None);
+                }
+                StorageImageBacking::HeapPlacement { .. } => {}
+            }
+        }
+        for (_, placement) in self.shared.heap_placement_memory.drain() {
+            device.destroy_image(placement.image, None);
+            device.free_memory(placement.memory, None);
         }
         self.shared.compute_storage_order.clear();
         for (_, t) in self.shared.targets.drain() {

@@ -12,7 +12,8 @@ use reims_vgpu_core::pixel_format::SwizzlePlan;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StorageImageAllocation {
     Transient,
-    Heap,
+    HeapAllocation,
+    HeapPlacement(ComputeStorageResidencyKey),
 }
 
 /// Owns a newly-created image until every fallible admission step succeeds.
@@ -41,6 +42,13 @@ impl<F: FnOnce(vk::Image)> PendingImage<F> {
     fn publish(mut self) -> vk::Image {
         self.destroy = None;
         self.image
+    }
+
+    /// Destroy the image before releasing storage that may already be bound to
+    /// it. Vulkan requires a bound image to die before its memory is freed.
+    fn destroy_then(self, release: impl FnOnce()) {
+        drop(self);
+        release();
     }
 }
 
@@ -71,7 +79,7 @@ fn storage_image_create_info(
     key: StorageImageKey,
     allocation: StorageImageAllocation,
 ) -> Option<vk::ImageCreateInfo<'static>> {
-    if allocation == StorageImageAllocation::Heap {
+    if allocation != StorageImageAllocation::Transient {
         return super::super::heap_texture_image_create_info(heap_resident_image_plan(key));
     }
     let format = crate::format::vk_storage_image(key.format);
@@ -745,7 +753,7 @@ impl ResourcePools {
             if let Some(slot) = self.shared.storage_image_free.take(&key) {
                 self.shared.storage_image_live.push(StorageImageSlot {
                     image: slot.image,
-                    memory: slot.memory,
+                    backing: slot.backing,
                     view: slot.view,
                     key: slot.key,
                 });
@@ -753,6 +761,52 @@ impl ResourcePools {
             }
         }
         let format = crate::format::vk_storage_image(key.format);
+        if let StorageImageAllocation::HeapPlacement(identity) = allocation {
+            let placement = HeapPlacementMemoryKey::from_residency(&identity)
+                .expect("heap-placement allocation carries a heap-placement identity");
+            if let Some(existing) = self.shared.heap_placement_memory.get(&placement).copied() {
+                if existing.key.width != key.width || existing.key.height != key.height {
+                    return Err(DrawError::ComputeExecution(
+                        ComputeExecutionDecline::HeapPlacementImageShapeMismatch {
+                            identity,
+                            held_width: existing.key.width,
+                            held_height: existing.key.height,
+                            wanted_width: key.width,
+                            wanted_height: key.height,
+                        },
+                    ));
+                }
+                let view = ctx
+                    .device
+                    .create_image_view(
+                        &vk::ImageViewCreateInfo::default()
+                            .image(existing.image)
+                            .view_type(vk::ImageViewType::TYPE_2D)
+                            .format(format)
+                            .subresource_range(color_subresource_range()),
+                        None,
+                    )
+                    .map_err(|e| {
+                        DrawError::VkCall(VkCall::new(VkOp::PoolsCreateStorageImageView, e))
+                    })?;
+                counters.note_create(CreateSite::StorageImageView);
+                let placement_memory = self
+                    .shared
+                    .heap_placement_memory
+                    .get_mut(&placement)
+                    .expect("the copied placement remains owned");
+                placement_memory.children = placement_memory
+                    .children
+                    .checked_add(1)
+                    .expect("one heap-placement child per resident image");
+                return Ok(StorageImageSlot {
+                    image: existing.image,
+                    backing: StorageImageBacking::HeapPlacement { placement },
+                    view,
+                    key,
+                });
+            }
+        }
         let create_info = storage_image_create_info(key, allocation)
             .expect("heap resident image plans are validated before allocation");
         let image = ctx
@@ -766,8 +820,42 @@ impl ResourcePools {
         let req = ctx
             .device
             .get_image_memory_requirements(pending_image.handle());
+        let placement = match allocation {
+            StorageImageAllocation::HeapPlacement(identity) => {
+                let placement = HeapPlacementMemoryKey::from_residency(&identity)
+                    .expect("heap-placement allocation carries a heap-placement identity");
+                let placement_size =
+                    placement
+                        .allocation_size()
+                        .ok_or(DrawError::ComputeExecution(
+                            ComputeExecutionDecline::HeapPlacementRequirementMismatch {
+                                identity,
+                                required_size: req.size,
+                                placement_size: 0,
+                            },
+                        ))?;
+                if req.size > placement_size {
+                    return Err(DrawError::ComputeExecution(
+                        ComputeExecutionDecline::HeapPlacementRequirementMismatch {
+                            identity,
+                            required_size: req.size,
+                            placement_size,
+                        },
+                    ));
+                }
+                Some((identity, placement, placement_size))
+            }
+            StorageImageAllocation::Transient | StorageImageAllocation::HeapAllocation => None,
+        };
+        let allocation_size = placement
+            .map(|(_, _, placement_size)| placement_size)
+            .unwrap_or(req.size);
         let mt = ctx
-            .memory_type_for(req.memory_type_bits, req.size, MemoryClass::DeviceLocal)
+            .memory_type_for(
+                req.memory_type_bits,
+                allocation_size,
+                MemoryClass::DeviceLocal,
+            )
             .ok_or({
                 DrawError::Unsupported(reason::DrawReason::NoDeviceLocalMemoryForStorageImage {
                     memory_type_bits: req.memory_type_bits,
@@ -783,13 +871,13 @@ impl ResourcePools {
             allocate_memory_timed(
                 ctx,
                 &vk::MemoryAllocateInfo::default()
-                    .allocation_size(req.size)
+                    .allocation_size(allocation_size)
                     .memory_type_index(mt),
                 AllocSite::StorageImage,
             )
         };
         let memory = match alloc(ctx) {
-            Ok(m) => m,
+            Ok(memory) => memory,
             Err(first)
                 if (first == vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
                     || first == vk::Result::ERROR_OUT_OF_HOST_MEMORY)
@@ -803,35 +891,58 @@ impl ResourcePools {
                 return Err(DrawError::VkCall(VkCall::new(
                     VkOp::PoolsAllocStorageImage,
                     e,
-                )));
+                )))
             }
         };
         counters.note_alloc();
-        ctx.device
-            .bind_image_memory(pending_image.handle(), memory, 0)
-            .map_err(|e| {
-                ctx.device.free_memory(memory, None);
-                DrawError::VkCall(VkCall::new(VkOp::PoolsBindStorageImage, e))
-            })?;
-        let view = ctx
+        if let Err(error) = ctx
             .device
-            .create_image_view(
-                &vk::ImageViewCreateInfo::default()
-                    .image(pending_image.handle())
-                    .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(format)
-                    .subresource_range(color_subresource_range()),
-                None,
-            )
-            .map_err(|e| {
-                ctx.device.free_memory(memory, None);
-                DrawError::VkCall(VkCall::new(VkOp::PoolsCreateStorageImageView, e))
-            })?;
+            .bind_image_memory(pending_image.handle(), memory, 0)
+        {
+            pending_image.destroy_then(|| ctx.device.free_memory(memory, None));
+            return Err(DrawError::VkCall(VkCall::new(
+                VkOp::PoolsBindStorageImage,
+                error,
+            )));
+        }
+        let view = match ctx.device.create_image_view(
+            &vk::ImageViewCreateInfo::default()
+                .image(pending_image.handle())
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(format)
+                .subresource_range(color_subresource_range()),
+            None,
+        ) {
+            Ok(view) => view,
+            Err(error) => {
+                pending_image.destroy_then(|| ctx.device.free_memory(memory, None));
+                return Err(DrawError::VkCall(VkCall::new(
+                    VkOp::PoolsCreateStorageImageView,
+                    error,
+                )));
+            }
+        };
         counters.note_create(CreateSite::StorageImageView);
         let image = pending_image.publish();
+        let backing = match placement {
+            Some((_, placement, _)) => {
+                let prior = self.shared.heap_placement_memory.insert(
+                    placement,
+                    HeapPlacementMemory {
+                        image,
+                        memory,
+                        children: 1,
+                        key,
+                    },
+                );
+                debug_assert!(prior.is_none(), "placement admission is serialized");
+                StorageImageBacking::HeapPlacement { placement }
+            }
+            None => StorageImageBacking::Dedicated(memory),
+        };
         let slot = StorageImageSlot {
             image,
-            memory,
+            backing,
             view,
             key,
         };
@@ -855,9 +966,6 @@ impl ResourcePools {
         seed_generation: u32,
         counters: &EngineCounters,
     ) -> Result<ResidentStorageImageUse, DrawError> {
-        if let Some(decline) = self.heap_placement_definition_refusal(&identity) {
-            return Err(DrawError::ComputeExecution(decline));
-        }
         // A shape change re-keys the identity, and one identity holds one slot,
         // so the old image is destroyed. Every other removal in this registry
         // skips a pinned resident, as allocation-pressure recovery does,
@@ -877,14 +985,7 @@ impl ResourcePools {
             .is_some_and(|resident| resident.slot.key != key)
         {
             if let Some(old) = self.remove_compute_storage_resident(&identity) {
-                self.dispose(
-                    &ctx.device,
-                    DeferredHandle::Image {
-                        image: old.slot.image,
-                        view: old.slot.view,
-                        memory: old.slot.memory,
-                    },
-                );
+                self.dispose(&ctx.device, old.slot.deferred());
             }
         }
         let now = self.shared.idle_clock_ms;
@@ -896,13 +997,14 @@ impl ResourcePools {
                 generation_match: resident.generation == seed_generation,
             });
         }
+        let inherited_alias_state = self.heap_placement_resident_state(&identity);
 
         // Census only. A slot count used to trim this population here and its
         // losses were terminal — see `recoverable_compute_storage_residents`.
         self.note_compute_storage_reach();
 
         if identity.is_heap()
-            && storage_image_create_info(key, StorageImageAllocation::Heap).is_none()
+            && storage_image_create_info(key, StorageImageAllocation::HeapAllocation).is_none()
         {
             return Err(DrawError::ComputeExecution(
                 ComputeExecutionDecline::HeapImagePlanInvalid {
@@ -925,17 +1027,22 @@ impl ResourcePools {
         // the retired cap sweep destroyed residents at, which is what makes
         // retiring live ones safe here — the caller holds no handle from this
         // acquire yet, and no sampled source has been resolved.
-        let acquire = |pools: &mut Self| {
-            if identity.is_heap() {
-                pools.acquire_storage_image_allocation(
+        let acquire = |pools: &mut Self| match identity.origin {
+            reims_vgpu_core::ComputeStorageOrigin::HeapPlacement { .. } => pools
+                .acquire_storage_image_allocation(
                     ctx,
                     key,
                     counters,
-                    StorageImageAllocation::Heap,
-                )
-            } else {
-                pools.acquire_storage_image(ctx, key, counters)
-            }
+                    StorageImageAllocation::HeapPlacement(identity),
+                ),
+            reims_vgpu_core::ComputeStorageOrigin::HeapAllocation { .. } => pools
+                .acquire_storage_image_allocation(
+                    ctx,
+                    key,
+                    counters,
+                    StorageImageAllocation::HeapAllocation,
+                ),
+            _ => pools.acquire_storage_image(ctx, key, counters),
         };
         let slot = match acquire(self) {
             Ok(slot) => slot,
@@ -964,47 +1071,51 @@ impl ResourcePools {
             identity,
             ResidentStorageImageSlot {
                 slot,
-                generation: 0,
-                access: ResidentAccess::Untouched,
+                generation: inherited_alias_state.map(|state| state.0).unwrap_or(0),
+                access: inherited_alias_state
+                    .map(|state| state.1)
+                    .unwrap_or(ResidentAccess::Untouched),
                 pinned: false,
-                // No dispatch has written it, so it holds no guest work to lose.
-                gpu_only_content: false,
+                // A view of an existing placement inherits that range's
+                // content authority; a first definition has no output yet.
+                gpu_only_content: inherited_alias_state.is_some_and(|state| state.2),
                 last_touch_ms: now,
             },
         );
         self.shared.compute_storage_order.push_back(identity);
         Ok(ResidentStorageImageUse {
             slot,
-            access: ResidentAccess::Untouched,
-            generation_match: false,
+            access: inherited_alias_state
+                .map(|state| state.1)
+                .unwrap_or(ResidentAccess::Untouched),
+            generation_match: inherited_alias_state.is_some_and(|state| state.0 == seed_generation),
         })
     }
 
-    /// Refuse a second live image definition over one explicit heap range.
-    ///
-    /// The semantic graph intentionally interns exact ranges even when their
-    /// texture definitions differ. Vulkan must therefore bind those images to
-    /// one memory range to preserve aliasing. The current resident owner can
-    /// represent only the equal-definition case as one image; this check keeps
-    /// the unsupported case visible instead of allocating unrelated memory.
-    pub(crate) fn heap_placement_definition_refusal(
+    /// Shared content/layout state of an already materialized definition over
+    /// the same explicit heap range. Every alias is a view of one native image,
+    /// so disagreement is an internal loss of authority and fails closed.
+    fn heap_placement_resident_state(
         &self,
-        wanted: &ComputeStorageResidencyKey,
-    ) -> Option<ComputeExecutionDecline> {
-        let reims_vgpu_core::ComputeStorageOrigin::HeapPlacement { .. } = wanted.origin else {
+        identity: &ComputeStorageResidencyKey,
+    ) -> Option<(u32, ResidentAccess, bool)> {
+        let reims_vgpu_core::ComputeStorageOrigin::HeapPlacement { .. } = identity.origin else {
             return None;
         };
-        let held = self
+        let mut aliases = self
             .shared
             .compute_storage_registry
-            .keys()
-            .filter(|held| held.origin == wanted.origin && *held != wanted)
-            .min()
-            .copied()?;
-        Some(ComputeExecutionDecline::HeapPlacementDefinitionConflict {
-            held,
-            wanted: *wanted,
-        })
+            .iter()
+            .filter(|(candidate, _)| candidate.origin == identity.origin)
+            .map(|(_, resident)| {
+                (
+                    resident.generation,
+                    resident.access,
+                    resident.gpu_only_content,
+                )
+            });
+        let state = aliases.next()?;
+        aliases.all(|candidate| candidate == state).then_some(state)
     }
 
     /// The refusal owed when `identity` is already held at a different image
@@ -1129,14 +1240,7 @@ impl ResourcePools {
         let mut freed = 0;
         for victim in &victims {
             if let Some(old) = self.remove_compute_storage_resident(victim) {
-                self.dispose(
-                    &ctx.device,
-                    DeferredHandle::Image {
-                        image: old.slot.image,
-                        view: old.slot.view,
-                        memory: old.slot.memory,
-                    },
-                );
+                self.dispose(&ctx.device, old.slot.deferred());
                 freed += 1;
             }
         }
@@ -1174,8 +1278,27 @@ impl ResourcePools {
             .retain(|entry| entry != identity);
         let old = old?;
         if old.gpu_only_content {
-            let bytes = Self::storage_slot_bytes(&old);
-            Self::fold_totals(&mut self.shared.compute_storage_sole_copy, bytes, false);
+            let heap_alias_remains = matches!(
+                identity.origin,
+                reims_vgpu_core::ComputeStorageOrigin::HeapPlacement { .. }
+            ) && self
+                .shared
+                .compute_storage_registry
+                .keys()
+                .any(|candidate| candidate.origin == identity.origin);
+            if !heap_alias_remains {
+                let bytes = match identity.origin {
+                    reims_vgpu_core::ComputeStorageOrigin::HeapPlacement {
+                        offset,
+                        span_end,
+                        ..
+                    } => span_end
+                        .checked_sub(offset)
+                        .expect("heap-placement origins carry a non-wrapping range"),
+                    _ => Self::storage_slot_bytes(&old),
+                };
+                Self::fold_totals(&mut self.shared.compute_storage_sole_copy, bytes, false);
+            }
         }
         Some(old)
     }
@@ -1202,6 +1325,15 @@ impl ResourcePools {
         let touch = self.shared.idle_clock_ms;
         if let Some(resident) = self.shared.compute_storage_registry.get_mut(identity) {
             resident.last_touch_ms = touch;
+        } else if matches!(
+            identity.origin,
+            reims_vgpu_core::ComputeStorageOrigin::HeapPlacement { .. }
+        ) {
+            for (candidate, resident) in &mut self.shared.compute_storage_registry {
+                if candidate.origin == identity.origin {
+                    resident.last_touch_ms = touch;
+                }
+            }
         }
     }
 
@@ -1218,9 +1350,16 @@ impl ResourcePools {
         identity: &ComputeStorageResidencyKey,
         generation: u32,
     ) {
-        if let Some(resident) = self.shared.compute_storage_registry.get_mut(identity) {
-            resident.generation = generation;
-            resident.access = ResidentAccess::transfer_read();
+        for (candidate, resident) in &mut self.shared.compute_storage_registry {
+            if candidate == identity
+                || matches!(
+                    identity.origin,
+                    reims_vgpu_core::ComputeStorageOrigin::HeapPlacement { .. }
+                ) && candidate.origin == identity.origin
+            {
+                resident.generation = generation;
+                resident.access = ResidentAccess::transfer_read();
+            }
         }
         // The dispatch just wrote this image, so nothing outside it holds the
         // result yet.
@@ -1232,6 +1371,34 @@ impl ResourcePools {
     /// totals in step. The single writer of that field on a live slot, for the
     /// reason [`Self::set_sole_copy`] is on the sibling registry.
     fn set_compute_sole_copy(&mut self, identity: &ComputeStorageResidencyKey, sole: bool) -> bool {
+        if let reims_vgpu_core::ComputeStorageOrigin::HeapPlacement {
+            offset, span_end, ..
+        } = identity.origin
+        {
+            let mut found = false;
+            let mut was_sole = false;
+            for (candidate, resident) in &mut self.shared.compute_storage_registry {
+                if candidate.origin == identity.origin {
+                    found = true;
+                    was_sole |= resident.gpu_only_content;
+                    resident.gpu_only_content = sole;
+                }
+            }
+            if !found || was_sole == sole {
+                return found;
+            }
+            let bytes = span_end
+                .checked_sub(offset)
+                .expect("heap-placement origins carry a non-wrapping range");
+            Self::fold_totals(&mut self.shared.compute_storage_sole_copy, bytes, sole);
+            if sole {
+                self.shared.compute_storage_sole_copy_peak = Self::high_water(
+                    self.shared.compute_storage_sole_copy_peak,
+                    self.shared.compute_storage_sole_copy,
+                );
+            }
+            return true;
+        }
         let Some(resident) = self.shared.compute_storage_registry.get_mut(identity) else {
             return false;
         };
@@ -1339,6 +1506,10 @@ impl ResourcePools {
             .compute_storage_registry
             .get(identity)
             .map(|resident| resident.generation)
+            .or_else(|| {
+                self.heap_placement_resident_state(identity)
+                    .map(|state| state.0)
+            })
     }
 
     /// Generation + engine format of a resident compute storage image, if one
@@ -1386,8 +1557,15 @@ impl ResourcePools {
 
     /// Record the resting state of a resident that this dispatch only sampled.
     pub(crate) fn mark_compute_resident_sampled(&mut self, identity: &ComputeStorageResidencyKey) {
-        if let Some(resident) = self.shared.compute_storage_registry.get_mut(identity) {
-            resident.access = ResidentAccess::ShaderRead(vk::ImageLayout::GENERAL);
+        for (candidate, resident) in &mut self.shared.compute_storage_registry {
+            if candidate == identity
+                || matches!(
+                    identity.origin,
+                    reims_vgpu_core::ComputeStorageOrigin::HeapPlacement { .. }
+                ) && candidate.origin == identity.origin
+            {
+                resident.access = ResidentAccess::ShaderRead(vk::ImageLayout::GENERAL);
+            }
         }
     }
 
@@ -3549,6 +3727,19 @@ mod heap_image_definition_tests {
     }
 
     #[test]
+    fn bound_storage_is_released_after_its_pending_image() {
+        use std::cell::RefCell;
+
+        let events = RefCell::new(Vec::new());
+        let image = PendingImage::new(vk::Image::from_raw(29), |_| {
+            events.borrow_mut().push("destroy image");
+        });
+        image.destroy_then(|| events.borrow_mut().push("free memory"));
+
+        assert_eq!(*events.borrow(), ["destroy image", "free memory"]);
+    }
+
+    #[test]
     fn a_heap_resident_uses_the_same_alias_image_definition_as_its_query() {
         let key = StorageImageKey {
             width: 257,
@@ -3559,9 +3750,13 @@ mod heap_image_definition_tests {
         let query =
             super::super::super::heap_texture_image_create_info(heap_resident_image_plan(key))
                 .unwrap();
-        let resident = storage_image_create_info(key, StorageImageAllocation::Heap).unwrap();
+        let resident =
+            storage_image_create_info(key, StorageImageAllocation::HeapAllocation).unwrap();
 
-        assert_eq!(resident.flags, vk::ImageCreateFlags::ALIAS);
+        assert_eq!(
+            resident.flags,
+            vk::ImageCreateFlags::ALIAS | vk::ImageCreateFlags::MUTABLE_FORMAT
+        );
         assert_eq!(resident.flags, query.flags);
         assert_eq!(resident.format, query.format);
         assert_eq!(resident.extent, query.extent);
@@ -3571,6 +3766,120 @@ mod heap_image_definition_tests {
         assert_eq!(resident.tiling, query.tiling);
         assert_eq!(resident.usage, query.usage);
         assert_eq!(resident.initial_layout, query.initial_layout);
+    }
+
+    #[test]
+    fn exact_heap_alias_definitions_share_one_native_image_and_allocation() {
+        reims_vgpu_observe::redirect_logs_for_tests();
+        let mut ctx = match unsafe { DeviceContext::create() } {
+            Ok(ctx) => ctx,
+            Err(error) => {
+                eprintln!("SKIP heap placement aliases: no device ({error})");
+                return;
+            }
+        };
+        let counters = EngineCounters::default();
+        let mut pools = ResourcePools::new();
+        let heap = reims_vgpu_protocol::ResourceId::new(7, 3);
+        let rgba_identity =
+            ComputeStorageResidencyKey::heap_placement(heap, 0, 1 << 20, 64, 64, 0x46);
+        let bgra_identity =
+            ComputeStorageResidencyKey::heap_placement(heap, 0, 1 << 20, 64, 64, 0x50);
+        let rgba_key = StorageImageKey {
+            width: 64,
+            height: 64,
+            format: StorageImageFormat::Rgba8Unorm,
+            sampled_only: false,
+        };
+        let bgra_key = StorageImageKey {
+            format: StorageImageFormat::Bgra8Unorm,
+            ..rgba_key
+        };
+
+        let rgba = unsafe {
+            pools.acquire_resident_storage_image(&ctx, rgba_identity, rgba_key, 0, &counters)
+        }
+        .expect("first heap placement image");
+        pools.mark_resident_storage_image(&rgba_identity, 4);
+        let bgra = unsafe {
+            pools.acquire_resident_storage_image(&ctx, bgra_identity, bgra_key, 4, &counters)
+        }
+        .expect("compatible alias view");
+
+        assert_eq!(rgba.slot.image, bgra.slot.image);
+        assert_ne!(rgba.slot.view, bgra.slot.view);
+        assert!(bgra.generation_match, "the alias inherits range currency");
+        assert!(
+            pools.shared.compute_storage_registry[&bgra_identity].gpu_only_content,
+            "the alias inherits the range's sole-copy authority"
+        );
+        assert_eq!(
+            pools.shared.compute_storage_sole_copy.count, 1,
+            "one shared range is one sole-copy resident"
+        );
+        assert_eq!(pools.shared.heap_placement_memory.len(), 1);
+        assert_eq!(
+            pools
+                .shared
+                .heap_placement_memory
+                .values()
+                .next()
+                .unwrap()
+                .children,
+            2
+        );
+        assert_eq!(counters.snapshot().allocs, 1);
+
+        let reshaped_identity =
+            ComputeStorageResidencyKey::heap_placement(heap, 0, 1 << 20, 32, 64, 0x46);
+        let reshaped_key = StorageImageKey {
+            width: 32,
+            ..rgba_key
+        };
+        let error = match unsafe {
+            pools.acquire_resident_storage_image(
+                &ctx,
+                reshaped_identity,
+                reshaped_key,
+                4,
+                &counters,
+            )
+        } {
+            Err(error) => error,
+            Ok(_) => panic!("one native image cannot represent a different geometry"),
+        };
+        assert!(matches!(
+            error,
+            DrawError::ComputeExecution(
+                ComputeExecutionDecline::HeapPlacementImageShapeMismatch {
+                    identity,
+                    held_width: 64,
+                    held_height: 64,
+                    wanted_width: 32,
+                    wanted_height: 64,
+                }
+            ) if identity == reshaped_identity
+        ));
+        assert_eq!(pools.shared.heap_placement_memory.len(), 1);
+        assert_eq!(counters.snapshot().allocs, 1);
+
+        let rgba = pools
+            .remove_compute_storage_resident(&rgba_identity)
+            .unwrap();
+        unsafe { pools.dispose(&ctx.device, rgba.slot.deferred()) };
+        assert_eq!(pools.shared.heap_placement_memory.len(), 1);
+        let bgra = pools
+            .remove_compute_storage_resident(&bgra_identity)
+            .unwrap();
+        unsafe { pools.dispose(&ctx.device, bgra.slot.deferred()) };
+        assert!(pools.shared.heap_placement_memory.is_empty());
+        assert_eq!(
+            pools.shared.compute_storage_sole_copy,
+            NonPinnedTotals::default()
+        );
+
+        unsafe { pools.destroy_all(&ctx.device) };
+        unsafe { ctx.destroy() };
     }
 }
 

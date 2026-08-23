@@ -22,7 +22,7 @@ use super::vk_call::{VkCall, VkOp};
 use super::{buffer_slab, color_subresource_range, gpu_span, host_ram, reason, slab, types};
 use crate::memory::{MappedMemoryKind, MemoryClass};
 use crate::translate;
-use reims_vgpu_core::ComputeStorageResidencyKey;
+use reims_vgpu_core::{ComputeStorageOrigin, ComputeStorageResidencyKey};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct TargetKey {
@@ -529,6 +529,10 @@ pub(crate) struct SharedPools {
     storage_image_live: Vec<StorageImageSlot>,
     /// Protocol-identity keyed compute storage images retained across calls.
     compute_storage_registry: HashMap<ComputeStorageResidencyKey, ResidentStorageImageSlot>,
+    /// Native allocations keyed by the guest's exact generational placement
+    /// range. No entry is evicted; its child count follows resident-image
+    /// destruction through the submission graveyard.
+    heap_placement_memory: HashMap<HeapPlacementMemoryKey, HeapPlacementMemory>,
     /// Insertion order for [`Self::compute_storage_registry`], oldest *created*
     /// at the front. A `VecDeque` for the same reason as [`Self::registry_order`].
     ///
@@ -1156,6 +1160,14 @@ pub(crate) enum DeferredHandle {
         view: vk::ImageView,
         memory: vk::DeviceMemory,
     },
+    /// One image bound to a contract-owned explicit heap range. The range's
+    /// allocation is shared by every alias definition and lives in
+    /// `heap_placement_memory`; retiring this child releases one fence-safe
+    /// edge and frees the allocation only when the last edge is gone.
+    HeapPlacementImage {
+        view: vk::ImageView,
+        placement: HeapPlacementMemoryKey,
+    },
     /// An image alias-bound into a guest allocation. The parent memory belongs
     /// to `HostRamImports`; destroying this child releases only its view/image
     /// and one parent-child lifetime edge.
@@ -1202,7 +1214,9 @@ impl DeferredHandle {
     /// one, which is the only thing that makes this total.
     fn destroyed_view(&self) -> Option<vk::ImageView> {
         match self {
-            Self::Image { view, .. } | Self::GuestImage { view, .. } => Some(*view),
+            Self::Image { view, .. }
+            | Self::HeapPlacementImage { view, .. }
+            | Self::GuestImage { view, .. } => Some(*view),
             Self::RecycleSampled(slot) => Some(slot.view),
             Self::RecycleTarget(img) => Some(img.view),
             Self::ImageView(view) => Some(*view),
@@ -1220,6 +1234,37 @@ impl DeferredHandle {
 }
 
 impl ResourcePools {
+    fn release_heap_placement_child(
+        &mut self,
+        placement: HeapPlacementMemoryKey,
+    ) -> Option<HeapPlacementMemory> {
+        let Some(entry) = self.shared.heap_placement_memory.get_mut(&placement) else {
+            reims_vgpu_observe::fail(format!(
+                "heap_placement_memory_release fail reason=absent heap={} heap_gen={} offset={:#x} span_end={:#x}",
+                placement.heap.index(),
+                placement.heap.generation(),
+                placement.offset,
+                placement.span_end,
+            ));
+            return None;
+        };
+        let Some(children) = entry.children.checked_sub(1) else {
+            reims_vgpu_observe::fail(format!(
+                "heap_placement_memory_release fail reason=child_underflow heap={} heap_gen={} offset={:#x} span_end={:#x}",
+                placement.heap.index(),
+                placement.heap.generation(),
+                placement.offset,
+                placement.span_end,
+            ));
+            return None;
+        };
+        entry.children = children;
+        if children != 0 {
+            return None;
+        }
+        self.shared.heap_placement_memory.remove(&placement)
+    }
+
     /// Terminal destroy of a deferred handle. Image variants free their backing
     /// memory through the slab suballocator (`free_image` releases the
     /// sub-range; a non-slab image falls back to a raw `vkFreeMemory` so mixed
@@ -1246,6 +1291,13 @@ impl ResourcePools {
                 device.destroy_image(image, None);
                 if !self.shared.slab.free_image(device, image) {
                     device.free_memory(memory, None);
+                }
+            }
+            DeferredHandle::HeapPlacementImage { view, placement } => {
+                device.destroy_image_view(view, None);
+                if let Some(allocation) = self.release_heap_placement_child(placement) {
+                    device.destroy_image(allocation.image, None);
+                    device.free_memory(allocation.memory, None);
                 }
             }
             DeferredHandle::GuestImage {
@@ -1730,12 +1782,75 @@ pub(crate) struct StorageImageKey {
     pub sampled_only: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct HeapPlacementMemoryKey {
+    heap: reims_vgpu_protocol::ResourceId<reims_vgpu_protocol::HeapObject>,
+    offset: u64,
+    span_end: u64,
+}
+
+impl HeapPlacementMemoryKey {
+    fn from_residency(identity: &ComputeStorageResidencyKey) -> Option<Self> {
+        let ComputeStorageOrigin::HeapPlacement {
+            heap,
+            offset,
+            span_end,
+        } = identity.origin
+        else {
+            return None;
+        };
+        Some(Self {
+            heap,
+            offset,
+            span_end,
+        })
+    }
+
+    fn allocation_size(self) -> Option<u64> {
+        self.span_end
+            .checked_sub(self.offset)
+            .filter(|size| *size != 0)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HeapPlacementMemory {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    children: usize,
+    key: StorageImageKey,
+}
+
+#[derive(Clone, Copy)]
+enum StorageImageBacking {
+    Dedicated(vk::DeviceMemory),
+    HeapPlacement { placement: HeapPlacementMemoryKey },
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct StorageImageSlot {
     pub image: vk::Image,
-    pub memory: vk::DeviceMemory,
+    backing: StorageImageBacking,
     pub view: vk::ImageView,
     pub key: StorageImageKey,
+}
+
+impl StorageImageSlot {
+    fn deferred(self) -> DeferredHandle {
+        match self.backing {
+            StorageImageBacking::Dedicated(memory) => DeferredHandle::Image {
+                image: self.image,
+                view: self.view,
+                memory,
+            },
+            StorageImageBacking::HeapPlacement { placement } => {
+                DeferredHandle::HeapPlacementImage {
+                    view: self.view,
+                    placement,
+                }
+            }
+        }
+    }
 }
 
 pub(crate) struct ResidentStorageImageUse {

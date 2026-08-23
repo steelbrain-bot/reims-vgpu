@@ -70,16 +70,17 @@ pub enum ComputeExecutionDecline {
         height: u32,
         format: StorageImageFormat,
     },
-    /// Two live texture definitions name the same explicit heap byte range.
-    ///
-    /// Equal definitions converge on one resident image today. Different
-    /// definitions require distinct alias-capable images bound to the same
-    /// native memory range; allocating independent memory would make the
-    /// guest's aliases observe unrelated contents. Until that native relation
-    /// exists, refuse the second definition by name.
-    HeapPlacementDefinitionConflict {
-        held: ComputeStorageResidencyKey,
-        wanted: ComputeStorageResidencyKey,
+    HeapPlacementRequirementMismatch {
+        identity: ComputeStorageResidencyKey,
+        required_size: u64,
+        placement_size: u64,
+    },
+    HeapPlacementImageShapeMismatch {
+        identity: ComputeStorageResidencyKey,
+        held_width: u32,
+        held_height: u32,
+        wanted_width: u32,
+        wanted_height: u32,
     },
     /// A dispatch asked for this identity at a different image shape while the
     /// resident holding it still owes a deferred writeback.
@@ -160,8 +161,11 @@ impl Decline for ComputeExecutionDecline {
                 "vk_compute_exec_resident_allocator_live_slot_missing"
             }
             Self::HeapImagePlanInvalid { .. } => "vk_compute_exec_heap_image_plan_invalid",
-            Self::HeapPlacementDefinitionConflict { .. } => {
-                "vk_compute_exec_heap_placement_definition_conflict"
+            Self::HeapPlacementRequirementMismatch { .. } => {
+                "vk_compute_exec_heap_placement_requirement_mismatch"
+            }
+            Self::HeapPlacementImageShapeMismatch { .. } => {
+                "vk_compute_exec_heap_placement_image_shape_mismatch"
             }
             Self::ResidentRekeyWouldDropPinned { .. } => {
                 "vk_compute_exec_resident_rekey_would_drop_pinned"
@@ -297,15 +301,31 @@ impl Decline for ComputeExecutionDecline {
                 ]);
                 fields
             }
-            Self::HeapPlacementDefinitionConflict { held, wanted } => {
-                let mut fields = residency_fields(wanted);
+            Self::HeapPlacementRequirementMismatch {
+                identity,
+                required_size,
+                placement_size,
+            } => {
+                let mut fields = residency_fields(identity);
                 fields.extend([
-                    ("held_width", held.width.to_string()),
-                    ("held_height", held.height.to_string()),
-                    ("held_pixel_format", held.pixel_format.to_string()),
-                    ("wanted_width", wanted.width.to_string()),
-                    ("wanted_height", wanted.height.to_string()),
-                    ("wanted_pixel_format", wanted.pixel_format.to_string()),
+                    ("required_size", required_size.to_string()),
+                    ("placement_size", placement_size.to_string()),
+                ]);
+                fields
+            }
+            Self::HeapPlacementImageShapeMismatch {
+                identity,
+                held_width,
+                held_height,
+                wanted_width,
+                wanted_height,
+            } => {
+                let mut fields = residency_fields(identity);
+                fields.extend([
+                    ("held_width", held_width.to_string()),
+                    ("held_height", held_height.to_string()),
+                    ("wanted_width", wanted_width.to_string()),
+                    ("wanted_height", wanted_height.to_string()),
                 ]);
                 fields
             }
@@ -464,23 +484,17 @@ mod tests {
                 height: 32,
                 format: StorageImageFormat::Rgba8Unorm,
             },
-            ComputeExecutionDecline::HeapPlacementDefinitionConflict {
-                held: ComputeStorageResidencyKey::heap_placement(
-                    reims_vgpu_protocol::ResourceId::new(12, 4),
-                    0x100,
-                    0x900,
-                    8,
-                    4,
-                    60,
-                ),
-                wanted: ComputeStorageResidencyKey::heap_placement(
-                    reims_vgpu_protocol::ResourceId::new(12, 4),
-                    0x100,
-                    0x900,
-                    16,
-                    4,
-                    60,
-                ),
+            ComputeExecutionDecline::HeapPlacementRequirementMismatch {
+                identity: identity(),
+                required_size: 8192,
+                placement_size: 4096,
+            },
+            ComputeExecutionDecline::HeapPlacementImageShapeMismatch {
+                identity: identity(),
+                held_width: 64,
+                held_height: 64,
+                wanted_width: 128,
+                wanted_height: 32,
             },
         ]
     }
@@ -507,7 +521,7 @@ mod tests {
         // a pooled readback the runtime owns. Five more went with the
         // non-2D image shape: the compute rail stages one flat plane window
         // per binding and has no slice or depth axis to refuse.
-        assert_eq!(before, 9, "the compute executor's reason census moved");
+        assert_eq!(before, 10, "the compute executor's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate compute-execution slug");
     }
 

@@ -3277,7 +3277,7 @@ fn heap_texture_image_create_info(
     }
     Some(
         vk::ImageCreateInfo::default()
-            .flags(vk::ImageCreateFlags::ALIAS)
+            .flags(vk::ImageCreateFlags::ALIAS | vk::ImageCreateFlags::MUTABLE_FORMAT)
             .image_type(vk::ImageType::TYPE_2D)
             .format(crate::format::vk_sampled_image(plan.format))
             .extent(vk::Extent3D {
@@ -3319,7 +3319,10 @@ mod heap_texture_requirement_tests {
     #[test]
     fn image_plan_carries_aliasing_and_every_execution_usage() {
         let info = heap_texture_image_create_info(plan()).unwrap();
-        assert_eq!(info.flags, vk::ImageCreateFlags::ALIAS);
+        assert_eq!(
+            info.flags,
+            vk::ImageCreateFlags::ALIAS | vk::ImageCreateFlags::MUTABLE_FORMAT
+        );
         assert_eq!(info.image_type, vk::ImageType::TYPE_2D);
         assert_eq!(
             info.extent,
