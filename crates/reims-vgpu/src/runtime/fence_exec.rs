@@ -111,7 +111,7 @@ pub fn execute_fence(
     if plan.updates_state {
         state.set_fence_generation(task_id, fence_ref, plan.update_value);
     }
-    match plan.decision {
+    let status = match plan.decision {
         Decision::SignalUpdate | Decision::SignalNoop | Decision::WaitSatisfied => FenceStatus::Ok,
         Decision::WaitPending => FenceStatus::Pending,
         Decision::WaitTimeoutUnsupported => refused(
@@ -131,7 +131,36 @@ pub fn execute_fence(
                     .field("action", format!("{action:?}"))
             },
         ),
-    }
+    };
+    note_fence_route(domain, action, status);
+    status
+}
+
+/// Count the encoder, operation, and outcome at the one shared fence seam.
+///
+/// Successful render and compute fences otherwise leave no observable trace:
+/// their stream handlers intercept the records before the encoder-specific
+/// counters see them. Keeping this census beside the state transition makes a
+/// boot able to say which domains actually rely on the fence contract, while
+/// the always-on failure path remains reserved for work that was lost.
+fn note_fence_route(domain: Domain, action: FenceAction, status: FenceStatus) {
+    let route = match (domain, action, status) {
+        (Domain::BlitFence, FenceAction::Update, FenceStatus::Ok) => "fence_blit_update_ok",
+        (Domain::BlitFence, FenceAction::Wait, FenceStatus::Ok) => "fence_blit_wait_ok",
+        (Domain::BlitFence, FenceAction::Wait, FenceStatus::Pending) => "fence_blit_wait_pending",
+        (Domain::ComputeFence, FenceAction::Update, FenceStatus::Ok) => "fence_compute_update_ok",
+        (Domain::ComputeFence, FenceAction::Wait, FenceStatus::Ok) => "fence_compute_wait_ok",
+        (Domain::ComputeFence, FenceAction::Wait, FenceStatus::Pending) => {
+            "fence_compute_wait_pending"
+        }
+        (Domain::RenderFence, FenceAction::Update, FenceStatus::Ok) => "fence_render_update_ok",
+        (Domain::RenderFence, FenceAction::Wait, FenceStatus::Ok) => "fence_render_wait_ok",
+        (Domain::RenderFence, FenceAction::Wait, FenceStatus::Pending) => {
+            "fence_render_wait_pending"
+        }
+        _ => return,
+    };
+    crate::runtime::drain::note_store_route(route);
 }
 
 /// Execute a decoded ch-event segment command (signal / wait / wait-timeout).
@@ -239,6 +268,66 @@ mod tests {
             execute_fence(&mut state, 1, Domain::ComputeFence, 9, FenceAction::Wait),
             FenceStatus::Pending
         );
+    }
+
+    #[test]
+    fn encoder_fence_routes_name_domain_action_and_outcome() {
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let cases = [
+            (
+                Domain::BlitFence,
+                101,
+                "fence_blit_update_ok",
+                "fence_blit_wait_ok",
+                "fence_blit_wait_pending",
+            ),
+            (
+                Domain::ComputeFence,
+                102,
+                "fence_compute_update_ok",
+                "fence_compute_wait_ok",
+                "fence_compute_wait_pending",
+            ),
+            (
+                Domain::RenderFence,
+                103,
+                "fence_render_update_ok",
+                "fence_render_wait_ok",
+                "fence_render_wait_pending",
+            ),
+        ];
+
+        for (domain, reference, update_route, wait_route, pending_route) in cases {
+            let update_before = crate::runtime::drain::store_route_count(update_route);
+            let wait_before = crate::runtime::drain::store_route_count(wait_route);
+            let pending_before = crate::runtime::drain::store_route_count(pending_route);
+
+            assert_eq!(
+                execute_fence(&mut state, 1, domain, reference, FenceAction::Update),
+                FenceStatus::Ok
+            );
+            assert_eq!(
+                execute_fence(&mut state, 1, domain, reference, FenceAction::Wait),
+                FenceStatus::Ok
+            );
+            assert_eq!(
+                execute_fence(&mut state, 1, domain, reference + 1000, FenceAction::Wait,),
+                FenceStatus::Pending
+            );
+
+            assert_eq!(
+                crate::runtime::drain::store_route_count(update_route),
+                update_before + 1
+            );
+            assert_eq!(
+                crate::runtime::drain::store_route_count(wait_route),
+                wait_before + 1
+            );
+            assert_eq!(
+                crate::runtime::drain::store_route_count(pending_route),
+                pending_before + 1
+            );
+        }
     }
 
     #[test]
