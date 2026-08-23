@@ -72,6 +72,7 @@ renderBarrierCase()
 computeBarrierCase(resourceBarrier: true)
 computeBarrierCase(resourceBarrier: false)
 heapTextureAliasCase()
+heapTexturePlacementOverlapCase()
 encoderBindingLifetimeCase()
 
 if texPipeline == nil {

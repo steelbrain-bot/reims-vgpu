@@ -100,3 +100,57 @@ func heapTextureAliasCase() {
              ? "one live range was released, reused at offset=\(second.heapOffset), and addressed as the replacement"
              : "wrong=\(bad.count)/\(got.count) first=\(hex(got[bad[0]])) want=\(hex(want))")
 }
+
+// Placement heaps let the caller name overlapping ranges directly. Merely
+// creating both resources is defined; only concurrent GPU access needs an
+// explicit synchronization discipline. Keep both objects live so an
+// implementation that treats overlap as an allocator collision cannot pass by
+// retiring the first one implicitly.
+func heapTexturePlacementOverlapCase() {
+    let label = "heap_texture_placement_overlap"
+    let width = 64
+    let height = 64
+    let unorm = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: .rgba8Unorm,
+        width: width,
+        height: height,
+        mipmapped: false)
+    let uint = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: .rgba8Uint,
+        width: width,
+        height: height,
+        mipmapped: false)
+    for descriptor in [unorm, uint] {
+        descriptor.storageMode = .private
+        descriptor.usage = [.shaderRead, .shaderWrite]
+    }
+
+    let unormRequirement = dev.heapTextureSizeAndAlign(descriptor: unorm)
+    let uintRequirement = dev.heapTextureSizeAndAlign(descriptor: uint)
+    guard unormRequirement.size > 0, unormRequirement.align > 0,
+          uintRequirement.size > 0, uintRequirement.align > 0 else {
+        skip(label, "the device reported no heap storage requirement for one texture")
+        return
+    }
+
+    let heapDescriptor = MTLHeapDescriptor()
+    heapDescriptor.type = .placement
+    heapDescriptor.storageMode = .private
+    heapDescriptor.hazardTrackingMode = .untracked
+    heapDescriptor.size = max(unormRequirement.size, uintRequirement.size)
+    guard let heap = dev.makeHeap(descriptor: heapDescriptor) else {
+        report(label, false, "the placement heap could not be created")
+        return
+    }
+    guard let first = heap.makeTexture(descriptor: unorm, offset: 0) else {
+        report(label, false, "the placement heap refused its first texture")
+        return
+    }
+    guard let alias = heap.makeTexture(descriptor: uint, offset: 0) else {
+        report(label, false, "the placement heap refused a live overlapping texture")
+        return
+    }
+
+    report(label, first.heapOffset == 0 && alias.heapOffset == 0,
+           "two live texture definitions were placed at offsets=\(first.heapOffset),\(alias.heapOffset)")
+}
