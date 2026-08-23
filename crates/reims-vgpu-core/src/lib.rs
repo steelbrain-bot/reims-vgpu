@@ -123,9 +123,10 @@ pub use scheduler::{
     TranslationOrderHold, TranslationScheduling, UnreleasedTranslationHold, WorkSchedulingState,
 };
 pub use service::{
-    GuestWriteReach, GuestWriteService, PreparedPresentation, PresentDecline, PresentationRoute,
-    PresentationService, PresentationSource, ReadbackLease, ReadbackService, ResidentContent,
-    ResidentReadPlan, ResidentReclaim, ResidentService, TargetReadback,
+    GuestWriteReach, GuestWriteService, HeapTextureImagePlan, HeapTextureRequirements,
+    PreparedPresentation, PresentDecline, PresentationRoute, PresentationService,
+    PresentationSource, ReadbackLease, ReadbackService, ResidentContent, ResidentReadPlan,
+    ResidentReclaim, ResidentService, TargetReadback,
 };
 pub use shader_interface::*;
 pub use stamp::{CompletionPublications, PendingStamp, StampLedger, StampWait, UnmetSource};

@@ -3220,6 +3220,137 @@ pub fn sampled_guest_image_binding_requirement(
     }
 }
 
+/// Native allocation requirements for the exact image definition a heap
+/// texture will later use.
+///
+/// The temporary image is intentionally unbound. Vulkan exposes allocation
+/// size and alignment from the image object itself, so no byte-size formula can
+/// substitute for this query without risking a different placement contract.
+pub fn heap_texture_requirements(
+    plan: reims_vgpu_core::HeapTextureImagePlan,
+) -> Option<reims_vgpu_core::HeapTextureRequirements> {
+    let create_info = heap_texture_image_create_info(plan)?;
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref counters,
+        ..
+    } = &mut *guard;
+    let ctx = owner.ensure(counters).ok()?;
+    let image = match unsafe { ctx.device.create_image(&create_info, None) } {
+        Ok(image) => image,
+        Err(error) => {
+            reims_vgpu_observe::fail(format!(
+                "heap_texture_requirements fail reason=vk_create_image err={error:?}"
+            ));
+            return None;
+        }
+    };
+    let requirements = unsafe { ctx.device.get_image_memory_requirements(image) };
+    unsafe { ctx.device.destroy_image(image, None) };
+    Some(reims_vgpu_core::HeapTextureRequirements {
+        size: requirements.size,
+        alignment: requirements.alignment,
+    })
+}
+
+/// One native image definition shared by the requirements query and the
+/// eventual placed-image constructor.
+fn heap_texture_image_create_info(
+    plan: reims_vgpu_core::HeapTextureImagePlan,
+) -> Option<ash::vk::ImageCreateInfo<'static>> {
+    use ash::vk;
+    if plan.extent.into_iter().any(|dimension| dimension == 0)
+        || plan.mip_levels == 0
+        || plan.array_layers == 0
+        || plan.sample_count != 1
+        || (!plan.sampled && !plan.storage)
+    {
+        return None;
+    }
+    let mut usage = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+    if plan.sampled {
+        usage |= vk::ImageUsageFlags::SAMPLED;
+    }
+    if plan.storage {
+        usage |= vk::ImageUsageFlags::STORAGE;
+    }
+    Some(
+        vk::ImageCreateInfo::default()
+            .flags(vk::ImageCreateFlags::ALIAS)
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(crate::format::vk_sampled_image(plan.format))
+            .extent(vk::Extent3D {
+                width: plan.extent[0],
+                height: plan.extent[1],
+                depth: plan.extent[2],
+            })
+            .mip_levels(plan.mip_levels)
+            .array_layers(plan.array_layers)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED),
+    )
+}
+
+#[cfg(test)]
+mod heap_texture_requirement_tests {
+    use super::*;
+    use ash::vk;
+    use reims_vgpu_protocol::{SampledImageFormat, StorageImageFormat, SwizzlePlan};
+
+    fn plan() -> reims_vgpu_core::HeapTextureImagePlan {
+        reims_vgpu_core::HeapTextureImagePlan {
+            format: SampledImageFormat::linear(
+                StorageImageFormat::Rgba8Unorm,
+                SwizzlePlan::default(),
+            ),
+            extent: [180, 135, 1],
+            mip_levels: 1,
+            array_layers: 1,
+            sample_count: 1,
+            sampled: true,
+            storage: true,
+        }
+    }
+
+    #[test]
+    fn image_plan_carries_aliasing_and_every_execution_usage() {
+        let info = heap_texture_image_create_info(plan()).unwrap();
+        assert_eq!(info.flags, vk::ImageCreateFlags::ALIAS);
+        assert_eq!(info.image_type, vk::ImageType::TYPE_2D);
+        assert_eq!(
+            info.extent,
+            vk::Extent3D {
+                width: 180,
+                height: 135,
+                depth: 1
+            }
+        );
+        assert!(info.usage.contains(vk::ImageUsageFlags::SAMPLED));
+        assert!(info.usage.contains(vk::ImageUsageFlags::STORAGE));
+        assert!(info.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC));
+        assert!(info.usage.contains(vk::ImageUsageFlags::TRANSFER_DST));
+    }
+
+    #[test]
+    fn unsupported_sample_count_has_no_native_plan() {
+        let mut unsupported = plan();
+        unsupported.sample_count = 4;
+        assert!(heap_texture_image_create_info(unsupported).is_none());
+    }
+
+    #[test]
+    fn native_query_returns_nonzero_power_of_two_requirements() {
+        let requirements = heap_texture_requirements(plan())
+            .expect("the supported Vulkan pathway provides image requirements");
+        assert_ne!(requirements.size, 0);
+        assert!(requirements.alignment.is_power_of_two());
+    }
+}
+
 pub fn deferred_gpu_only_content_allowed() -> bool {
     device_capabilities().deferred_gpu_only_content_allowed()
 }

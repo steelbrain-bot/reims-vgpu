@@ -28,6 +28,13 @@ pub const TEXTURE_BODY_LEN: usize = wire::TEXTURE_DESCRIPTOR_LEN;
 /// [`crate::runtime::decode::resource::decode_heap_texture`].
 pub const WIDE_TEXTURE_BODY_LEN: usize = wire::WIDE_TEXTURE_DESCRIPTOR_LEN;
 
+const TEXTURE_USAGE_SHADER_READ: u32 = 1 << 0;
+const TEXTURE_USAGE_SHADER_WRITE: u32 = 1 << 1;
+const SUPPORTED_TEXTURE_USAGE: u32 = TEXTURE_USAGE_SHADER_READ | TEXTURE_USAGE_SHADER_WRITE;
+// `MTLResourceStorageModePrivate`: the storage-mode ordinal occupies
+// `resource_options[7:4]`; the wire crate owns and tests that field projection.
+const PRIVATE_DEFAULT_CACHE_RESOURCE_OPTIONS: u16 = 2 << 4;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Request {
     pub task_id: u32,
@@ -62,6 +69,10 @@ pub enum QueryError {
     UnknownPixelFormat,
     UnknownUsage,
     UnknownResourceOptions,
+    UnsupportedTextureShape,
+    UnsupportedUsage,
+    UnsupportedResourceOptions,
+    UnsupportedSwizzle,
     HostRequirementsUnavailable,
     ZeroRequirement,
     /// The request names a task id that resolves to no active task, so there is
@@ -93,6 +104,10 @@ impl crate::observe::Decline for QueryError {
             Self::UnknownPixelFormat => "heap_query_unknown_pixel_format",
             Self::UnknownUsage => "heap_query_unknown_usage",
             Self::UnknownResourceOptions => "heap_query_unknown_resource_options",
+            Self::UnsupportedTextureShape => "heap_query_unsupported_texture_shape",
+            Self::UnsupportedUsage => "heap_query_unsupported_usage",
+            Self::UnsupportedResourceOptions => "heap_query_unsupported_resource_options",
+            Self::UnsupportedSwizzle => "heap_query_unsupported_swizzle",
             Self::HostRequirementsUnavailable => "heap_query_host_requirements_unavailable",
             Self::ZeroRequirement => "heap_query_zero_requirement",
             Self::BadTask => "heap_query_bad_task",
@@ -174,10 +189,81 @@ pub fn decode_wide_serialized_texture_descriptor(
     Ok(reims_vgpu_protocol::texture_declaration_from_wide(d))
 }
 
-pub fn query_size_and_align(_desc: &TextureDescriptor) -> Result<SizeAndAlign, QueryError> {
-    // Vulkan image requirements are not yet proven equivalent to the guest heap
-    // placement contract, so refuse rather than return a guessed layout.
-    Err(QueryError::HostRequirementsUnavailable)
+/// Resolve the descriptor into the one backend-neutral image definition used
+/// both for this query and for later heap placement.
+///
+/// This first admitted cell is deliberately narrow: the execution path can
+/// currently represent private, shader-readable and shader-writable 2D images
+/// with one level, layer, and sample. Other declarations refuse by a typed
+/// reason until their native creation contract is implemented.
+pub fn image_plan(
+    desc: &TextureDescriptor,
+) -> Result<reims_vgpu_core::HeapTextureImagePlan, QueryError> {
+    if desc.texture_type != 2
+        || desc.width == 0
+        || desc.height == 0
+        || desc.depth != 1
+        || desc.mipmap_level_count != 1
+        || desc.sample_count != 1
+        || desc.array_length != 1
+        || desc.framebuffer_only
+        || desc.is_drawable
+    {
+        return Err(QueryError::UnsupportedTextureShape);
+    }
+    // MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite. Render-target,
+    // pixel-format-view, and atomic usage require additional native image
+    // features and are not silently widened into this plan.
+    if desc.usage != SUPPORTED_TEXTURE_USAGE {
+        return Err(QueryError::UnsupportedUsage);
+    }
+    // MTLStorageModePrivate. Heap storage has no guest-addressable bytes, and
+    // the current execution rail implements only private GPU content.
+    if desc.resource_options != PRIVATE_DEFAULT_CACHE_RESOURCE_OPTIONS
+        || desc.storage_mode() != reims_vgpu_protocol::StorageMode::Private
+        || desc.protection_options != 0
+    {
+        return Err(QueryError::UnsupportedResourceOptions);
+    }
+    if desc.write_swizzle_enabled == Some(true)
+        || desc.swizzle.is_some_and(|raw| {
+            reims_vgpu_protocol::swizzle_plan(&raw)
+                .is_none_or(|plan| !reims_vgpu_protocol::swizzle_is_identity(&plan))
+        })
+    {
+        return Err(QueryError::UnsupportedSwizzle);
+    }
+    let format = reims_vgpu_core::pixel_format::compute_sampled_image_format(desc.pixel_format)
+        .ok_or(QueryError::UnknownPixelFormat)?;
+    if reims_vgpu_core::pixel_format::storage_image_format(desc.pixel_format).is_none() {
+        return Err(QueryError::UnsupportedUsage);
+    }
+    Ok(reims_vgpu_core::HeapTextureImagePlan {
+        format,
+        extent: [desc.width, desc.height, desc.depth],
+        mip_levels: u32::from(desc.mipmap_level_count),
+        array_layers: u32::from(desc.array_length),
+        sample_count: u32::from(desc.sample_count),
+        sampled: true,
+        storage: true,
+    })
+}
+
+pub fn query_size_and_align(
+    desc: &TextureDescriptor,
+    query: impl FnOnce(
+        reims_vgpu_core::HeapTextureImagePlan,
+    ) -> Option<reims_vgpu_core::HeapTextureRequirements>,
+) -> Result<SizeAndAlign, QueryError> {
+    let plan = image_plan(desc)?;
+    let requirement = query(plan).ok_or(QueryError::HostRequirementsUnavailable)?;
+    if requirement.size == 0 || requirement.alignment == 0 {
+        return Err(QueryError::ZeroRequirement);
+    }
+    Ok(SizeAndAlign {
+        size: requirement.size,
+        align: requirement.alignment,
+    })
 }
 
 #[cfg(test)]
@@ -244,12 +330,54 @@ mod tests {
         assert_eq!(ld64(&reply[8..]), 0x80);
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn native_query_returns_nonzero_requirement() {
+    fn delegates_the_resolved_image_plan_and_returns_backend_requirements() {
         let request = decode_request(&live_request_fixture()).unwrap();
-        let result = query_size_and_align(&request.descriptor).unwrap();
-        assert!(result.size >= 180 * 135 * 16);
-        assert!(result.align.is_power_of_two());
+        let result = query_size_and_align(&request.descriptor, |plan| {
+            assert_eq!(plan.extent, [180, 135, 1]);
+            assert!(plan.sampled);
+            assert!(plan.storage);
+            Some(reims_vgpu_core::HeapTextureRequirements {
+                size: 0x78000,
+                alignment: 0x80,
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            result,
+            SizeAndAlign {
+                size: 0x78000,
+                align: 0x80
+            }
+        );
+    }
+
+    #[test]
+    fn refuses_zero_backend_requirements() {
+        let request = decode_request(&live_request_fixture()).unwrap();
+        assert_eq!(
+            query_size_and_align(&request.descriptor, |_| {
+                Some(reims_vgpu_core::HeapTextureRequirements {
+                    size: 0,
+                    alignment: 0x80,
+                })
+            }),
+            Err(QueryError::ZeroRequirement)
+        );
+    }
+
+    #[test]
+    fn refuses_before_calling_the_backend_for_an_unimplemented_shape() {
+        let mut request = decode_request(&live_request_fixture()).unwrap();
+        request.descriptor.mipmap_level_count = 2;
+        let mut called = false;
+        assert_eq!(
+            query_size_and_align(&request.descriptor, |_| {
+                called = true;
+                None
+            }),
+            Err(QueryError::UnsupportedTextureShape)
+        );
+        assert!(!called);
     }
 }

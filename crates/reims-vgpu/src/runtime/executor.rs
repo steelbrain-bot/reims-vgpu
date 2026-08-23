@@ -400,6 +400,13 @@ pub trait GuestImagePlanningService: std::fmt::Debug + Send + Sync {
     ) -> Option<reims_vgpu_memory::GuestImageBindingDisposition> {
         None
     }
+
+    fn heap_texture_requirements(
+        &self,
+        _plan: reims_vgpu_core::HeapTextureImagePlan,
+    ) -> Option<reims_vgpu_core::HeapTextureRequirements> {
+        None
+    }
 }
 
 /// Backend housekeeping which does not itself execute a guest command.
@@ -1012,6 +1019,14 @@ impl GuestImagePlanningService for VulkanExecutor {
     ) -> Option<reims_vgpu_memory::GuestImageBindingDisposition> {
         let _scope = self.enter();
         reims_vgpu_vulkan::engine::sampled_guest_image_binding_requirement(request)
+    }
+
+    fn heap_texture_requirements(
+        &self,
+        plan: reims_vgpu_core::HeapTextureImagePlan,
+    ) -> Option<reims_vgpu_core::HeapTextureRequirements> {
+        let _scope = self.enter();
+        reims_vgpu_vulkan::engine::heap_texture_requirements(plan)
     }
 }
 

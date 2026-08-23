@@ -2103,27 +2103,30 @@ fn reply_heap_texture_size_and_align<H: HostMemory + HostOps>(
             .fail();
         return false;
     };
-    let requirement = match crate::runtime::heap_query::query_size_and_align(&request.descriptor) {
-        Ok(requirement) => requirement,
-        Err(error) => {
-            let desc = request.descriptor;
-            Emit::decline("heap_texture_query", &error)
-                .field("task", task_id)
-                .field("type", desc.texture_type)
-                .field("fmt", format!("{:#x}", desc.pixel_format))
-                .field(
-                    "dims",
-                    format!("{}x{}x{}", desc.width, desc.height, desc.depth),
-                )
-                .field("mips", desc.mipmap_level_count)
-                .field("samples", desc.sample_count)
-                .field("array", desc.array_length)
-                .field("usage", format!("{:#x}", desc.usage))
-                .field("options", format!("{:#x}", desc.resource_options))
-                .fail();
-            return false;
-        }
-    };
+    let requirement =
+        match crate::runtime::heap_query::query_size_and_align(&request.descriptor, |plan| {
+            state.executor.heap_texture_requirements(plan)
+        }) {
+            Ok(requirement) => requirement,
+            Err(error) => {
+                let desc = request.descriptor;
+                Emit::decline("heap_texture_query", &error)
+                    .field("task", task_id)
+                    .field("type", desc.texture_type)
+                    .field("fmt", format!("{:#x}", desc.pixel_format))
+                    .field(
+                        "dims",
+                        format!("{}x{}x{}", desc.width, desc.height, desc.depth),
+                    )
+                    .field("mips", desc.mipmap_level_count)
+                    .field("samples", desc.sample_count)
+                    .field("array", desc.array_length)
+                    .field("usage", format!("{:#x}", desc.usage))
+                    .field("options", format!("{:#x}", desc.resource_options))
+                    .fail();
+                return false;
+            }
+        };
     let reply = requirement.encode();
     if crate::runtime::gva_mem::write_task_gva_product_within(
         state,

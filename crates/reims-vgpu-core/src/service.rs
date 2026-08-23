@@ -1,6 +1,31 @@
 //! Backend-neutral service results used beside the submission port.
 
 use crate::{ResidentContentBacking, ResourceLifetimeRef, TargetIdentity};
+use reims_vgpu_protocol::SampledImageFormat;
+
+/// Backend-neutral image definition used for a heap texture's allocation
+/// requirements and, later, for the image placed into that allocation.
+///
+/// Keeping this as one value is part of the contract: a backend must not answer
+/// the guest from one native image shape and create a different one when the
+/// texture is constructed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HeapTextureImagePlan {
+    pub format: SampledImageFormat,
+    pub extent: [u32; 3],
+    pub mip_levels: u32,
+    pub array_layers: u32,
+    pub sample_count: u32,
+    pub sampled: bool,
+    pub storage: bool,
+}
+
+/// Native allocation requirements for one [`HeapTextureImagePlan`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HeapTextureRequirements {
+    pub size: u64,
+    pub alignment: u64,
+}
 
 /// One semantic resident selected for host presentation.
 ///
