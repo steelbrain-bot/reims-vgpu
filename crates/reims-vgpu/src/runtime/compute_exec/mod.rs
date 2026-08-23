@@ -1015,6 +1015,7 @@ enum VulkanBufferInput {
 struct BufferStagePlan {
     base_gva: u64,
     size: u64,
+    is_private: bool,
     full: u64,
     avail: u64,
     want: usize,
@@ -1104,6 +1105,7 @@ fn resolve_buffer_stage_plan<M: HostMemory + HostOps>(
     Ok(BufferStagePlan {
         base_gva,
         size,
+        is_private: desc.is_private,
         full,
         avail,
         want,
@@ -1123,20 +1125,23 @@ pub(crate) fn stage_buffer_with_extent<M: HostMemory + HostOps>(
         let BufferStagePlan {
             base_gva,
             size,
+            is_private,
             full,
             avail,
             want,
             gva,
         } = plan;
-        if crate::runtime::bound_buffers::ensure_packed_resource(
-            state,
-            host,
-            task_id,
-            bind.buffer_ref,
-            base_gva,
-            size,
-            crate::runtime::bound_buffers::PackedResourceUse::Buffer,
-        ) {
+        if !is_private
+            && crate::runtime::bound_buffers::ensure_packed_resource(
+                state,
+                host,
+                task_id,
+                bind.buffer_ref,
+                base_gva,
+                size,
+                crate::runtime::bound_buffers::PackedResourceUse::Buffer,
+            )
+        {
             let guest = state
                 .bound_buffers
                 .packed_available(task_id, bind.buffer_ref, base_gva, size)
@@ -1179,6 +1184,7 @@ fn materialize_buffer_host<M: HostMemory + HostOps>(
     let BufferStagePlan {
         base_gva,
         size,
+        is_private: _,
         full,
         avail,
         want,

@@ -212,6 +212,10 @@ pub struct BufferDescriptor {
     pub allocation_size: u64,
     pub handle64: u64,
     pub handle: u32,
+    /// Private buffers have a distinct device allocation and consume guest
+    /// bytes through an explicit transfer. A clear bit describes the single
+    /// allocation backed directly by guest pages.
+    pub is_private: bool,
 }
 
 impl BufferDescriptor {
@@ -1100,6 +1104,7 @@ mod tests {
             allocation_size: 0x3000,
             handle64: 0x1_0000_0042,
             handle: 0x42,
+            is_private: true,
         };
         assert_eq!(descriptor.backing_gva_size(12), Some((0x42_000, 0x3000)));
         assert_eq!(descriptor.backing_gva_size(14), Some((0x108_000, 0x3000)));

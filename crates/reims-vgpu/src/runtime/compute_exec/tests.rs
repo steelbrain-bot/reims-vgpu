@@ -788,6 +788,30 @@ fn a_compute_extent_stages_only_the_proven_prefix_from_the_bound_offset() {
     }
     assert!(staged.bytes.is_empty(), "the input has one typed owner");
     assert_eq!(staged.pages.len(), 1);
+
+    let private_descriptor_gva = 0x1c0u64;
+    st64(&mut descriptor[8..], (1u64 << 32) | 5);
+    write_task_gva_arm64e(
+        &mut host,
+        &state.tasks[1],
+        private_descriptor_gva,
+        &descriptor,
+    );
+    let private_entry_offset = list_object_entry_offset(8, 32).unwrap();
+    entry[4..12].copy_from_slice(&private_descriptor_gva.to_le_bytes());
+    write_task_gva_arm64e(&mut host, &state.tasks[1], private_entry_offset, &entry);
+    let private_bind = ComputeBufferBind {
+        buffer_ref: 8,
+        ..bind
+    };
+    let staged = stage_buffer_with_extent(&mut state, &mut host, 1, &private_bind, Some(12))
+        .expect("private buffer stages");
+    match staged.input {
+        VulkanBufferInput::HostBytes(bytes) => assert_eq!(bytes, contents[8..20]),
+        VulkanBufferInput::GuestPages(_) => {
+            panic!("a private buffer must snapshot its transfer bytes")
+        }
+    }
 }
 
 /// Callers must pass page_shift explicitly; 12 and 14 place handle differently.
@@ -798,6 +822,7 @@ fn buffer_backing_gva_requires_explicit_page_shift() {
         allocation_size: 0x1000,
         handle64: 0x101,
         handle: 0x101,
+        is_private: false,
     };
     let (gva12, _) = d.backing_gva_size(PAGE_SHIFT_X86).expect("12");
     let (gva14, _) = d.backing_gva_size(PAGE_SHIFT_ARM64E).expect("14");

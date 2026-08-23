@@ -1445,10 +1445,16 @@ fn list_entry_and_buffer() {
     let d = decode_buffer_descriptor(&buf).unwrap();
     assert_eq!(d.allocation_size, 256);
     assert_eq!(d.handle, 0x1234);
+    assert!(!d.is_private);
     assert_eq!(
         d.backing_gva_size(PAGE_SHIFT_ARM64E),
         Some(((0x1234u64) << RESOURCE_PAGE_SHIFT, 256))
     );
+
+    st64(&mut buf[LINEAR_DESC_HANDLE..], 0x1_0000_1234);
+    let private = decode_buffer_descriptor(&buf).unwrap();
+    assert_eq!(private.handle, 0x1234);
+    assert!(private.is_private);
 }
 
 #[test]

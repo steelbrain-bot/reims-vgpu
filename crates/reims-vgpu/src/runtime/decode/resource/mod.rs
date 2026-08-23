@@ -249,6 +249,7 @@ pub use reims_vgpu_protocol::BufferDescriptor;
 pub const LINEAR_DESC_MIN_LEN: usize = 16;
 pub const LINEAR_DESC_SIZE: usize = 0;
 pub const LINEAR_DESC_HANDLE: usize = 8;
+const BUFFER_DESC_PRIVATE_BIT: u64 = 1 << 32;
 /// Arm fixture alias of [`reims_vgpu_paging::geometry::PAGE_SHIFT_ARM64E`].
 /// Prefer `PAGE_SHIFT_ARM64E` / `PAGE_SHIFT_X86` at new call sites. Product
 /// paths must pass `Device::page_shift`, not a fixed arch constant.
@@ -933,6 +934,7 @@ pub fn decode_buffer_descriptor(bytes: &[u8]) -> Result<BufferDescriptor, Decode
         allocation_size: ld64(&bytes[LINEAR_DESC_SIZE..]),
         handle64,
         handle: handle64 as u32,
+        is_private: handle64 & BUFFER_DESC_PRIVATE_BIT != 0,
     })
 }
 
