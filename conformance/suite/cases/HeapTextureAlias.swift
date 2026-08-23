@@ -115,20 +115,20 @@ func heapTexturePlacementOverlapCase() {
         width: width,
         height: height,
         mipmapped: false)
-    let rg16 = MTLTextureDescriptor.texture2DDescriptor(
-        pixelFormat: .rg16Float,
+    let bgra = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: .bgra8Unorm,
         width: width,
         height: height,
         mipmapped: false)
-    for descriptor in [unorm, rg16] {
+    for descriptor in [unorm, bgra] {
         descriptor.storageMode = .private
         descriptor.usage = [.shaderRead, .shaderWrite]
     }
 
     let unormRequirement = dev.heapTextureSizeAndAlign(descriptor: unorm)
-    let rg16Requirement = dev.heapTextureSizeAndAlign(descriptor: rg16)
+    let bgraRequirement = dev.heapTextureSizeAndAlign(descriptor: bgra)
     guard unormRequirement.size > 0, unormRequirement.align > 0,
-          rg16Requirement.size > 0, rg16Requirement.align > 0 else {
+          bgraRequirement.size > 0, bgraRequirement.align > 0 else {
         skip(label, "the device reported no heap storage requirement for one texture")
         return
     }
@@ -137,7 +137,7 @@ func heapTexturePlacementOverlapCase() {
     heapDescriptor.type = .placement
     heapDescriptor.storageMode = .private
     heapDescriptor.hazardTrackingMode = .untracked
-    heapDescriptor.size = max(unormRequirement.size, rg16Requirement.size)
+    heapDescriptor.size = max(unormRequirement.size, bgraRequirement.size)
     guard let heap = dev.makeHeap(descriptor: heapDescriptor) else {
         report(label, false, "the placement heap could not be created")
         return
@@ -146,13 +146,24 @@ func heapTexturePlacementOverlapCase() {
         report(label, false, "the placement heap refused its first texture")
         return
     }
-    guard let alias = heap.makeTexture(descriptor: rg16, offset: 0) else {
+    guard let alias = heap.makeTexture(descriptor: bgra, offset: 0) else {
         report(label, false, "the placement heap refused a live overlapping texture")
         return
     }
 
     guard fillHeapTexture(first, SIMD4<Float>(1, 0, 0, 1)) else {
         report(label, false, "commands using the first placement texture did not complete")
+        return
+    }
+    guard let aliased = readBack(readPipe, alias, width, height) else {
+        refused(label)
+        return
+    }
+    let blue = pack(0, 0, 255, 255)
+    guard aliased.allSatisfy({ $0 == blue }) else {
+        let wrong = aliased.filter { $0 != blue }
+        report(label, false,
+               "the BGRA alias did not observe RGBA bytes: wrong=\(wrong.count)/\(aliased.count)")
         return
     }
     guard fillHeapTexture(alias, SIMD4<Float>(0, 1, 0, 1)) else {
