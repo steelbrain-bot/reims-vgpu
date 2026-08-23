@@ -55,7 +55,7 @@ impl NodeWatch {
         match self.seen.get_mut(&gpa) {
             Some(previous) => {
                 let verdict = match writes.wrote_any_since(previous.epoch, &[gpa]) {
-                    HostWriteVerdict::Quiet => NodeVerdict::Quiet,
+                    HostWriteVerdict::NoWrites | HostWriteVerdict::Disjoint => NodeVerdict::Quiet,
                     HostWriteVerdict::Overlap => NodeVerdict::Wrote {
                         gap_us: now_us.saturating_sub(previous.at_us),
                     },

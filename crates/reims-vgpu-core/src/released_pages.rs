@@ -74,7 +74,7 @@ impl ReleasedPages {
         let mut decided = Vec::new();
         self.pages.retain(|&gpa, released| {
             let verdict = match writes.wrote_any_since(released.epoch, &[gpa]) {
-                HostWriteVerdict::Quiet => return true,
+                HostWriteVerdict::NoWrites | HostWriteVerdict::Disjoint => return true,
                 HostWriteVerdict::Overlap => ReleasedVerdict::Wrote {
                     since_us: now_us.saturating_sub(released.at_us),
                 },

@@ -278,7 +278,9 @@ pub fn note_gather(
     // than one that landed here, and they want different repairs — name the
     // writer's pages, widen the ring, or stop writing the window at all. Taken
     // for every bind that had a previous one to ask about, so the split covers
-    // the vouched binds too and `gw_hw_quiet` is the denominator.
+    // the vouched binds too. `gw_hw_no_writes + gw_hw_disjoint` is the
+    // denominator; keeping them separate says whether this question walked
+    // the window or the global epoch answered it first.
     if let Some(verdict) = counts.pages_wrote {
         note_store_route(verdict.route());
     }
@@ -403,7 +405,7 @@ mod tests {
     /// bind.
     const QUIET: WitnessReadings = WitnessReadings {
         pages_epoch: 1,
-        pages_wrote: Some(reims_vgpu_core::HostWriteVerdict::Quiet),
+        pages_wrote: Some(reims_vgpu_core::HostWriteVerdict::NoWrites),
         pending: PendingWrites::Disjoint,
         stated_gen: Some(StatedGeneration::Mapping(0)),
     };

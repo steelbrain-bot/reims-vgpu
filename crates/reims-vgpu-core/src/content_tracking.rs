@@ -61,22 +61,28 @@ pub enum StatedGeneration {
     TaskResource(ResourceWriteStamp),
 }
 
-/// Why a page-exact write observation cannot call a window quiet.
+/// Exact outcome of asking whether host writes reached a page set.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostWriteVerdict {
-    Quiet,
+    /// The ledger's global epoch is unchanged, so no page can have been
+    /// written and the requested set was not walked.
+    NoWrites,
+    /// The ledger advanced, but none of the requested pages were among the
+    /// writes since the supplied epoch.
+    Disjoint,
     Overlap,
     Unnamed,
 }
 
 impl HostWriteVerdict {
     pub fn wrote(self) -> bool {
-        !matches!(self, Self::Quiet)
+        !matches!(self, Self::NoWrites | Self::Disjoint)
     }
 
     pub fn route(self) -> &'static str {
         match self {
-            Self::Quiet => "gw_hw_quiet",
+            Self::NoWrites => "gw_hw_no_writes",
+            Self::Disjoint => "gw_hw_disjoint",
             Self::Overlap => "gw_hw_overlap",
             Self::Unnamed => "gw_hw_unnamed",
         }
@@ -153,7 +159,7 @@ impl PageEpochs {
                 return HostWriteVerdict::Overlap;
             }
         }
-        HostWriteVerdict::Quiet
+        HostWriteVerdict::Disjoint
     }
 }
 
@@ -321,6 +327,9 @@ impl HostWrites {
     }
 
     pub fn wrote_any_since(&self, since: u64, pages: &[u64]) -> HostWriteVerdict {
+        if since == self.epoch {
+            return HostWriteVerdict::NoWrites;
+        }
         self.pages.verdict(since, pages, self.page_shift)
     }
 }
@@ -582,7 +591,8 @@ impl GvaWriteReach {
             Self::Quiet => "gvaw_quiet",
             Self::NoEntry => "gvaw_no_entry",
             Self::GuestWrote => "gvaw_guest_wrote",
-            Self::Host(HostWriteVerdict::Quiet) => "gvaw_host_quiet",
+            Self::Host(HostWriteVerdict::NoWrites) => "gvaw_host_no_writes",
+            Self::Host(HostWriteVerdict::Disjoint) => "gvaw_host_disjoint",
             Self::Host(HostWriteVerdict::Overlap) => "gvaw_host_overlap",
             Self::Host(HostWriteVerdict::Unnamed) => "gvaw_host_unnamed",
         }
@@ -647,7 +657,7 @@ impl GvaStoreWitness {
             return GvaWriteReach::GuestWrote;
         }
         match host_writes.wrote_any_since(entry.host_epoch, &entry.pages) {
-            HostWriteVerdict::Quiet => GvaWriteReach::Quiet,
+            HostWriteVerdict::NoWrites | HostWriteVerdict::Disjoint => GvaWriteReach::Quiet,
             other => GvaWriteReach::Host(other),
         }
     }
@@ -883,11 +893,29 @@ mod tests {
         }
         assert_eq!(
             writes.wrote_any_since(before, &[7 << 12]),
-            HostWriteVerdict::Quiet
+            HostWriteVerdict::Disjoint
         );
         assert_eq!(
             writes.wrote_any_since(before, &[101 << 12]),
             HostWriteVerdict::Overlap
+        );
+    }
+
+    #[test]
+    fn an_unchanged_global_epoch_answers_without_a_page_verdict() {
+        let writes = HostWrites::default();
+        let epoch = writes.epoch();
+        assert_eq!(
+            writes.wrote_any_since(epoch, &[7 << 12, 101 << 12]),
+            HostWriteVerdict::NoWrites
+        );
+
+        let mut advanced = writes;
+        advanced.note_pages(vec![99 << 12]);
+        assert_eq!(
+            advanced.wrote_any_since(epoch, &[7 << 12, 101 << 12]),
+            HostWriteVerdict::Disjoint,
+            "once the global epoch moves, quiet requires a page-exact verdict"
         );
     }
 
