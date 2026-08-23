@@ -12,7 +12,7 @@ use reims_vgpu_protocol::FenceObject;
 use reims_vgpu_protocol::SurfaceId;
 use reims_vgpu_protocol::{
     ByteLength, ByteOffset, ComputePipelineObject, ComputeStageInputDescriptor, ContentVersion,
-    FunctionObject, GuestVirtualAddress, MapperResolvedSurfaceId, MapperSurfaceRef,
+    FunctionObject, GuestVirtualAddress, HeapObject, MapperResolvedSurfaceId, MapperSurfaceRef,
     ObjectListEntry as ListObjectEntry, ObjectTableRef, PlaneIndex,
     ResourceDecodeError as ResourceDecodeStatus, ResourceDescriptor as Descriptor, ResourceId,
     ResourceObject, SamplerDescriptor, SamplerObject, SubmissionId, SurfaceBackingId, TaskId,
@@ -514,6 +514,19 @@ impl TaskResources {
             .cloned()
     }
 
+    #[cfg(test)]
+    pub fn storage_node(
+        &self,
+        id: reims_vgpu_protocol::StorageId,
+    ) -> Option<reims_vgpu_core::StorageNode> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .graph
+            .storage(id)
+            .cloned()
+    }
+
     /// Record a CPU write against the canonical resource identity, when that
     /// object has already been constructed.
     #[cfg(test)]
@@ -826,6 +839,29 @@ impl TaskResources {
                 .is_ok(),
             _ => false,
         }
+    }
+
+    pub fn link_heap_texture(
+        &self,
+        task_id: u32,
+        texture_ref: u32,
+        heap: ResourceId<HeapObject>,
+        explicit: Option<(u64, u64)>,
+    ) -> Result<(), reims_vgpu_core::GraphError> {
+        let mut registry = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let texture = registry
+            .objects
+            .get(&(task_id, texture_ref))
+            .and_then(|resource| resource.semantic_id())
+            .ok_or(reims_vgpu_core::GraphError::ResourceAbsent)?;
+        registry.graph.link_heap_texture(
+            texture,
+            heap,
+            explicit.map(|(offset, length)| (ByteOffset::new(offset), ByteLength::new(length))),
+        )
     }
 
     /// Resolve the retained buffer allocation behind one buffer-backed texture.
@@ -1181,6 +1217,7 @@ pub type TaskFunctionStates = TaskReferenceStates<LoadedFunction, FunctionObject
 
 pub type TaskFenceStates = reims_vgpu_core::TaskFenceStates;
 pub type TaskEventStates = reims_vgpu_core::TaskEventStates;
+pub type TaskHeapStates = TaskReferenceStates<(), HeapObject>;
 
 /// Per-task render pipeline states, keyed by the pipeline API's reference
 /// space. A state owns its decoded descriptor, translated functions and derived
@@ -3758,6 +3795,7 @@ pub struct TranslationHoldAtReset {
 /// Namespace entries retired by a task lifetime transition.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TaskNamespaceRetirement {
+    pub heaps: usize,
     pub compute_pipelines: usize,
     pub depth_stencil_states: usize,
     pub render_pipelines: usize,
@@ -4143,6 +4181,7 @@ impl ContentAuthorityState {
 #[derive(Debug, Default)]
 pub(crate) struct TaskObjectNamespaces {
     pub(crate) resources: TaskResources,
+    pub(crate) heaps: TaskHeapStates,
     pub(crate) samplers: TaskSamplerStates,
     pub(crate) compute_pipelines: TaskComputePipelineStates,
     pub(crate) functions: TaskFunctionStates,
@@ -4158,6 +4197,7 @@ impl TaskObjectNamespaces {
         self.resources.delete_task(task_id);
         self.samplers.delete_task(task_id);
         TaskNamespaceRetirement {
+            heaps: self.heaps.delete_task(task_id),
             compute_pipelines: self.compute_pipelines.delete_task(task_id),
             depth_stencil_states: self.depth_stencil.delete_task(task_id),
             render_pipelines: self.render_pipelines.delete_task(task_id),
@@ -6331,7 +6371,7 @@ mod slot_table_reach_tests {
 mod task_lifecycle_effect_tests {
     use super::*;
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
-    use reims_vgpu_protocol::{DepthStencilDescriptor, SerializerRef};
+    use reims_vgpu_protocol::{DepthStencilDescriptor, HeapObject, SerializerRef};
 
     fn state() -> DeviceState {
         DeviceState::new(DeviceId(1), PAGE_SHIFT_X86)
@@ -6380,12 +6420,17 @@ mod task_lifecycle_effect_tests {
         state.set_fence_generation(7, 21, 1);
         state.set_event_generation(7, 31, 1);
         state.set_event_generation(7, 32, 1);
+        state
+            .task_objects
+            .heaps
+            .register(7, SerializerRef::<HeapObject>::new(41), Arc::new(()));
 
         assert_eq!(
             state.define_task(7, 0x8000, 3),
             TaskDefinitionEffect {
                 kind: TaskDefinitionKind::RedefinedSameRoot,
                 retired: TaskNamespaceRetirement {
+                    heaps: 1,
                     depth_stencil_states: 2,
                     fences: 1,
                     events: 2,
@@ -6407,9 +6452,14 @@ mod task_lifecycle_effect_tests {
         );
 
         state.set_event_generation(7, 33, 3);
+        state
+            .task_objects
+            .heaps
+            .register(7, SerializerRef::<HeapObject>::new(42), Arc::new(()));
         assert_eq!(
             state.delete_task(7),
             Some(TaskNamespaceRetirement {
+                heaps: 1,
                 events: 1,
                 ..TaskNamespaceRetirement::default()
             })

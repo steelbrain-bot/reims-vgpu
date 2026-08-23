@@ -355,6 +355,18 @@ fn apply_delete_object(state: &mut Device, channel_id: u32, payload: &[u8], pack
         });
         return;
     }
+    if op.opcode() == reims_vgpu_wire::ops::destroy::OPCODE_DELETE_HEAP {
+        let retired = state
+            .task_objects
+            .heaps
+            .delete(task_id, reims_vgpu_protocol::SerializerRef::new(object_ref));
+        note_store_route(if retired {
+            "heap_deleted"
+        } else {
+            "heap_delete_absent"
+        });
+        return;
+    }
     if op.opcode() == reims_vgpu_wire::ops::destroy::OPCODE_DELETE_COMPUTE_PIPELINE_STATE {
         let retired = state
             .task_objects

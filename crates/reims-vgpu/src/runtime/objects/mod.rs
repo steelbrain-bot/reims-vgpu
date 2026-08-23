@@ -1647,6 +1647,25 @@ fn ensure_resource_relations<M: HostMemory>(
     resource.finish_relation_publication(published);
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HeapRelationDecline {
+    ZeroHeap,
+    MisalignedOffset,
+    PlacementOverlap,
+    GraphRelation,
+}
+
+impl crate::observe::Decline for HeapRelationDecline {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::ZeroHeap => "heap_relation_zero_heap",
+            Self::MisalignedOffset => "heap_relation_misaligned_offset",
+            Self::PlacementOverlap => "heap_relation_placement_overlap",
+            Self::GraphRelation => "heap_relation_graph",
+        }
+    }
+}
+
 /// Publish construction relations that are explicit in decoded descriptors.
 fn publish_resource_relations<M: HostMemory>(
     state: &Device,
@@ -1724,6 +1743,82 @@ fn publish_resource_relations<M: HostMemory>(
             }
         }
         ObjectKind::TextureView => {
+            if let Ok(crate::runtime::decode::resource::Descriptor::HeapTexture(heap_texture)) =
+                decoded_resource(resource)
+            {
+                let heap_ref = heap_texture.heap;
+                if heap_ref.get() == 0 {
+                    crate::observe::Emit::decline(
+                        "heap_texture_relation",
+                        &HeapRelationDecline::ZeroHeap,
+                    )
+                    .field("task", task_id)
+                    .field("ref", object_ref)
+                    .fail();
+                    return false;
+                }
+                let requirement = match crate::runtime::heap_query::query_size_and_align(
+                    &heap_texture.declaration,
+                    |plan| state.executor.heap_texture_requirements(plan),
+                ) {
+                    Ok(requirement) => requirement,
+                    Err(error) => {
+                        crate::observe::Emit::decline("heap_texture_relation", &error)
+                            .field("task", task_id)
+                            .field("ref", object_ref)
+                            .field("heap", heap_ref.get())
+                            .fail();
+                        return false;
+                    }
+                };
+                if heap_texture.use_offset && heap_texture.offset % requirement.align != 0 {
+                    crate::observe::Emit::decline(
+                        "heap_texture_relation",
+                        &HeapRelationDecline::MisalignedOffset,
+                    )
+                    .field("task", task_id)
+                    .field("ref", object_ref)
+                    .field("heap", heap_ref.get())
+                    .field("offset", heap_texture.offset)
+                    .field("align", requirement.align)
+                    .fail();
+                    return false;
+                }
+                state
+                    .task_objects
+                    .heaps
+                    .register(task_id, heap_ref, Arc::new(()));
+                let heap = state
+                    .task_objects
+                    .heaps
+                    .identity(task_id, heap_ref)
+                    .expect("the heap reference was just published");
+                let explicit = heap_texture
+                    .use_offset
+                    .then_some((heap_texture.offset, requirement.size));
+                return match state
+                    .task_objects
+                    .resources
+                    .link_heap_texture(task_id, object_ref, heap, explicit)
+                {
+                    Ok(()) => true,
+                    Err(error) => {
+                        let decline = if error == reims_vgpu_core::GraphError::HeapPlacementOverlap
+                        {
+                            HeapRelationDecline::PlacementOverlap
+                        } else {
+                            HeapRelationDecline::GraphRelation
+                        };
+                        crate::observe::Emit::decline("heap_texture_relation", &decline)
+                            .field("task", task_id)
+                            .field("ref", object_ref)
+                            .field("heap", heap_ref.get())
+                            .field("graph", format!("{error:?}"))
+                            .fail();
+                        false
+                    }
+                };
+            }
             if let Ok(crate::runtime::decode::resource::Descriptor::BufferTexture(buffer_texture)) =
                 decoded_resource(resource)
             {

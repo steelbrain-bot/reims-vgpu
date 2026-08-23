@@ -290,6 +290,93 @@ fn a_retained_view_retries_its_parent_relation_after_the_parent_appears() {
     assert!(view_node.parents.contains(&surface_node.id));
 }
 
+fn heap_texture_descriptor(
+    object_ref: u32,
+    heap_ref: u32,
+    use_offset: bool,
+    offset: u64,
+) -> [u8; 60] {
+    use reims_vgpu_wire::ops::heap_texture as heap;
+    let mut bytes = [0u8; heap::NEW_HEAP_TEXTURE_TOTAL_LEN as usize];
+    st32(&mut bytes[0..], heap::OPCODE_NEW_HEAP_TEXTURE);
+    st32(&mut bytes[4..], heap::NEW_HEAP_TEXTURE_TOTAL_LEN);
+    st32(&mut bytes[8..], object_ref);
+    st32(&mut bytes[12..], heap_ref);
+    // 2D, GPU-optimized, shaderRead|shaderWrite, RGBA32Float (125).
+    st32(&mut bytes[16..], 0x007d_0342);
+    st32(&mut bytes[20..], 180);
+    st32(&mut bytes[24..], 135);
+    st32(&mut bytes[28..], 1);
+    st16(&mut bytes[32..], 1);
+    st16(&mut bytes[34..], 1);
+    st16(&mut bytes[36..], 1);
+    st16(&mut bytes[38..], 0x20);
+    bytes[48] = u8::from(use_offset);
+    st64(&mut bytes[52..], offset);
+    bytes
+}
+
+#[test]
+fn heap_texture_relations_publish_the_generational_heap_and_exact_alias() {
+    let host = FakeHost::new();
+    let state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
+    let first = state.task_objects.resources.register(
+        1,
+        2,
+        Arc::new(TaskResource::new(
+            ListObjectEntry::new(ObjectKind::TextureView, 0, 0),
+            Arc::from(heap_texture_descriptor(2, 7, true, 0)),
+        )),
+    );
+    let second = state.task_objects.resources.register(
+        1,
+        3,
+        Arc::new(TaskResource::new(
+            ListObjectEntry::new(ObjectKind::TextureView, 0, 0),
+            Arc::from(heap_texture_descriptor(3, 7, true, 0)),
+        )),
+    );
+
+    ensure_resource_relations(&state, &host, 1, 2, &first);
+    ensure_resource_relations(&state, &host, 1, 3, &second);
+
+    let first_node = state
+        .task_objects
+        .resources
+        .resource_node(first.semantic_id().unwrap())
+        .unwrap();
+    let second_node = state
+        .task_objects
+        .resources
+        .resource_node(second.semantic_id().unwrap())
+        .unwrap();
+    assert_eq!(first_node.storage, second_node.storage);
+    let storage = state
+        .task_objects
+        .resources
+        .storage_node(first_node.storage.expect("heap storage"))
+        .unwrap();
+    let reims_vgpu_core::StorageBacking::HeapPlacement {
+        heap,
+        offset,
+        length,
+    } = storage.backing
+    else {
+        panic!("explicit heap texture did not publish explicit heap storage");
+    };
+    assert_eq!(
+        heap,
+        state
+            .task_objects
+            .heaps
+            .identity(1, reims_vgpu_protocol::SerializerRef::new(7))
+            .unwrap()
+    );
+    assert_eq!(offset.get(), 0);
+    assert_ne!(length.get(), 0);
+    assert!(first_node.content.same_authority(&second_node.content));
+}
+
 #[test]
 fn task_lifetime_retires_all_of_its_resource_objects() {
     let mut host = FakeHost::new();
