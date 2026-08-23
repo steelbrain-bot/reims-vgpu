@@ -2527,6 +2527,18 @@ struct LinearPlacement {
     )>,
 }
 
+/// A render-target resident currently represents one linear level. It can
+/// replace a sampled guest allocation only when that bind names no complete
+/// mip chain; otherwise explicit LODs above zero would silently lose the
+/// allocation levels that exist only in guest storage.
+fn can_bind_linear_target_resident(
+    is_storage: bool,
+    has_complete_mip_allocation: bool,
+    was_render_target: bool,
+) -> bool {
+    !is_storage && !has_complete_mip_allocation && was_render_target
+}
+
 /// Name which gate a linear placement or stage failed at.
 ///
 /// Shared by both constructors and the rail so a refusal reads the same
@@ -2870,8 +2882,36 @@ fn stage_linear_placement<M: HostMemory + HostOps>(
         ),
         _ => None,
     };
+    let target_resident = if can_bind_linear_target_resident(
+        is_storage,
+        sampled_allocation.is_some(),
+        state
+            .task_objects
+            .resources
+            .get(task_id, texture_ref)
+            .is_some_and(|resource| resource.was_render_target()),
+    )
+    {
+        u32::try_from(row_stride).ok().and_then(|row_stride| {
+            crate::runtime::draw::compute_gva_resident_sample(
+                state,
+                host,
+                task_id,
+                texture_ref,
+                gva,
+                row_stride,
+                w,
+                h,
+                declared_format,
+            )
+        })
+    } else {
+        None
+    };
     let mut bytes = vec![0u8; need];
-    let input = if let Some(resident) = serve {
+    let input = if let Some(identity) = target_resident {
+        VulkanTextureInput::TargetResident(identity)
+    } else if let Some(resident) = serve {
         VulkanTextureInput::Resident(resident)
     } else {
         // A pending Store is queue work, not host bytes. Submit it before this

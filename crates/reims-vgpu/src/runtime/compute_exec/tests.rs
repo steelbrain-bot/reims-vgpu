@@ -41,6 +41,17 @@ fn whole_workgroups(
 }
 
 #[test]
+fn a_single_level_resident_never_replaces_a_complete_sampled_mip_chain() {
+    assert!(can_bind_linear_target_resident(false, false, true));
+    assert!(
+        !can_bind_linear_target_resident(false, true, true),
+        "a complete sampled allocation owns levels absent from the render resident"
+    );
+    assert!(!can_bind_linear_target_resident(true, false, true));
+    assert!(!can_bind_linear_target_resident(false, false, false));
+}
+
+#[test]
 fn argument_buffer_reflection_decline_carries_the_owner_coordinate() {
     use crate::observe::Decline as _;
     let decline = ComputeReflectionDecline::ReflectedResourceUnsupported {

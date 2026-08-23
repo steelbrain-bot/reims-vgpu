@@ -73,6 +73,33 @@ pub(crate) use sampled_source::compute_iosurface_resident_sample;
 pub(crate) use sampled_source::declared_guest_image_allocation;
 use sampled_source::*;
 
+pub(crate) fn compute_gva_resident_sample<M: HostMemory + HostOps>(
+    state: &mut Device,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    gva: u64,
+    row_stride: u32,
+    width: u32,
+    height: u32,
+    format: u16,
+) -> Option<crate::model::TargetIdentity> {
+    sampled_source::gva_resident_if_current(
+        state,
+        host,
+        task_id,
+        sampled_source::GvaSpan {
+            texture_ref,
+            gva,
+            row_stride,
+            width,
+            height,
+            format,
+        },
+    )
+    .ok()
+}
+
 // Type-8 texture-view resolution and linear texture loads. Backend-independent,
 // so the module carries no gate of its own; the two items inside it that are
 // arm- or test-specific keep theirs.
