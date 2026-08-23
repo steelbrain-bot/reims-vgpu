@@ -1,6 +1,6 @@
 //! Backend-independent resolved compute commands and their typed results.
 
-use reims_vgpu_memory::{GuestPageTarget, GuestRunSource};
+use reims_vgpu_memory::{GuestImageSource, GuestPageTarget, GuestRunSource};
 use reims_vgpu_protocol::StorageImageFormat;
 pub use reims_vgpu_protocol::{
     SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter, SamplerMipFilter,
@@ -273,6 +273,8 @@ pub enum ComputeSampledImageSource {
     Bytes(Vec<u8>),
     /// Exact bounded guest allocation/window.
     GuestPages(GuestRunSource),
+    /// Complete guest image allocation and the mip/layer view selected from it.
+    GuestImage(GuestImageSource),
     /// A render/blit target whose authoritative image is already resident.
     TargetResident(crate::TargetIdentity),
     /// Prior storage output copied device-locally for this sampled bind.

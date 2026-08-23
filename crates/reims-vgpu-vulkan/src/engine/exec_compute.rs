@@ -15,7 +15,7 @@ use super::compute_validation::ComputeValidationDecline;
 use super::context::ContextOwner;
 use super::counters::EngineCounters;
 use super::device_lost::{DeviceLostDecline, DeviceLostOp};
-use super::pools::{BufferSlot, ResourcePools, StorageImageKey, StorageImageSlot};
+use super::pools::{BufferSlot, ResourcePools, SampledKey, StorageImageKey, StorageImageSlot};
 use super::types::{
     ComputeBufferOutput, ComputeBufferResult, ComputeOutput, ComputeRequest,
     ComputeResidentSampleBind, ComputeSampledImageResource, ComputeStorageResidency, DrawError,
@@ -46,9 +46,11 @@ struct PreparedSampledImage {
     image: vk::Image,
     view: vk::ImageView,
     upload: Option<PreparedTexelSource>,
+    allocation_copy: Option<super::exec::GuestAllocationCopy>,
     resident: Option<PreparedResidentSample>,
     width: u32,
     height: u32,
+    mip_levels: u32,
     null: bool,
 }
 
@@ -90,6 +92,65 @@ impl PreparedResidentSample {
 struct PreparedTexelSource {
     texels: super::exec::GuestTexels,
     row_length_texels: u32,
+}
+
+fn compute_guest_image_is_exact(
+    resource: &ComputeSampledImageResource,
+    source: &reims_vgpu_memory::GuestImageSource,
+) -> bool {
+    let texel = resource.format.bytes_per_texel() as u64;
+    if !source.allocation.is_vulkan_mip_chain(texel) || !source.view.fits(&source.allocation) {
+        return false;
+    }
+    let Some(base) = source
+        .allocation
+        .mips
+        .get(source.view.base_mip_level as usize)
+    else {
+        return false;
+    };
+    if base.layout.width() != resource.width || base.layout.height() != resource.height {
+        return false;
+    }
+    let Some(view_end) = source
+        .view
+        .base_mip_level
+        .checked_add(source.view.mip_level_count)
+    else {
+        return false;
+    };
+    let Some(transfer_end) = source
+        .transfer
+        .source_offset
+        .checked_add(source.transfer.total_len)
+    else {
+        return false;
+    };
+    let levels_fit = (source.view.base_mip_level..view_end).all(|level| {
+        source
+            .allocation
+            .mips
+            .get(level as usize)
+            .and_then(|mip| {
+                mip.layout
+                    .visible_span(mip.row_pitch, texel)
+                    .and_then(|span| mip.resource_relative_offset.checked_add(span))
+            })
+            .is_some_and(|end| {
+                end <= transfer_end
+                    && source.allocation.mips[level as usize].resource_relative_offset
+                        >= source.transfer.source_offset
+            })
+    });
+    let covered = source
+        .transfer
+        .runs
+        .iter()
+        .try_fold(0_u64, |sum, run| sum.checked_add(run.len));
+    levels_fit
+        && covered.is_some_and(|bytes| transfer_end <= bytes)
+        && source.view.base_array_layer == 0
+        && source.view.array_layer_count == 1
 }
 
 struct PreparedStorageBuffer {
@@ -204,8 +265,19 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
                     img.format.bytes_per_texel(),
                 )
             }
+            super::types::ComputeSampledImageSource::GuestImage(source) => {
+                compute_guest_image_is_exact(img, source)
+            }
         };
         if !valid {
+            if let super::types::ComputeSampledImageSource::GuestImage(source) = &img.source {
+                return Err(DrawError::ComputeValidation(
+                    ComputeValidationDecline::SampledImageLayout {
+                        binding: img.binding,
+                        mip_levels: source.allocation.mips.len(),
+                    },
+                ));
+            }
             return Err(DrawError::ComputeValidation(
                 ComputeValidationDecline::SampledBytesLength {
                     binding: img.binding,
@@ -214,6 +286,9 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
                         super::types::ComputeSampledImageSource::Bytes(bytes) => bytes.len(),
                         super::types::ComputeSampledImageSource::GuestPages(source) => {
                             source.total_len as usize
+                        }
+                        super::types::ComputeSampledImageSource::GuestImage(source) => {
+                            source.transfer.total_len as usize
                         }
                         super::types::ComputeSampledImageSource::Resident(_) => 0,
                         super::types::ComputeSampledImageSource::TargetResident(_) => 0,
@@ -715,9 +790,11 @@ pub(crate) unsafe fn execute_compute_inner(
                 image: vk::Image::null(),
                 view: vk::ImageView::null(),
                 upload: None,
+                allocation_copy: None,
                 resident: None,
                 width: 0,
                 height: 0,
+                mip_levels: 1,
                 null: true,
             });
             continue;
@@ -728,6 +805,8 @@ pub(crate) unsafe fn execute_compute_inner(
             format: resource.format,
             sampled_only: true,
         };
+        let mut allocation_copy = None;
+        let mut mip_levels = 1;
         let (image, view, upload, resident) =
             if let super::types::ComputeSampledImageSource::Resident(bind) = &resource.source {
                 let Some((src_image, src_view, src_key, generation, src_access)) =
@@ -830,6 +909,43 @@ pub(crate) unsafe fn execute_compute_inner(
                         initial_access: access,
                     }),
                 )
+            } else if let super::types::ComputeSampledImageSource::GuestImage(source) =
+                &resource.source
+            {
+                mip_levels = source.view.mip_level_count;
+                let img = pools.acquire_sampled(
+                    ctx,
+                    SampledKey {
+                        width: resource.width,
+                        height: resource.height,
+                        mip_levels,
+                        layers: 1,
+                        volume: false,
+                        cube: false,
+                        arrayed: false,
+                        one_dim: false,
+                        format: crate::format::vk_storage_image(resource.format),
+                        swizzle: reims_vgpu_protocol::SwizzlePlan::default(),
+                    },
+                    counters,
+                )?;
+                let prepared = unsafe {
+                    prepare_compute_guest_texels(
+                        ctx,
+                        pools,
+                        counters,
+                        &source.transfer,
+                        ComputeTexelRole::Sampled,
+                        &mut guest_gathers,
+                    )?
+                };
+                allocation_copy = Some(super::exec::GuestAllocationCopy {
+                    allocation: source.allocation.clone(),
+                    view: source.view,
+                    transfer_source_offset: source.transfer.source_offset,
+                    bytes_per_texel: resource.format.bytes_per_texel() as u64,
+                });
+                (img.image, img.view, Some(prepared), None)
             } else {
                 let img = pools.acquire_storage_image(ctx, key, counters)?;
                 let prepared = match &resource.source {
@@ -857,6 +973,7 @@ pub(crate) unsafe fn execute_compute_inner(
                             &mut guest_gathers,
                         )?
                     },
+                    super::types::ComputeSampledImageSource::GuestImage(_) => unreachable!(),
                     super::types::ComputeSampledImageSource::TargetResident(_) => unreachable!(),
                     super::types::ComputeSampledImageSource::Resident(_) => unreachable!(),
                     super::types::ComputeSampledImageSource::Null => unreachable!(),
@@ -869,9 +986,11 @@ pub(crate) unsafe fn execute_compute_inner(
             image,
             view,
             upload,
+            allocation_copy,
             resident,
             width: resource.width,
             height: resource.height,
+            mip_levels,
             null: false,
         });
     }
@@ -1151,8 +1270,14 @@ pub(crate) unsafe fn execute_compute_inner(
             }
         }
         for sampled in &req.sampled_images {
-            if let super::types::ComputeSampledImageSource::GuestPages(source) = &sampled.source {
-                read_pages.push(source.physical_pages.clone());
+            match &sampled.source {
+                super::types::ComputeSampledImageSource::GuestPages(source) => {
+                    read_pages.push(source.physical_pages.clone());
+                }
+                super::types::ComputeSampledImageSource::GuestImage(source) => {
+                    read_pages.push(source.transfer.physical_pages.clone());
+                }
+                _ => {}
             }
         }
         for storage in &req.storage_images {
@@ -1214,7 +1339,10 @@ pub(crate) unsafe fn execute_compute_inner(
         if prepared.null {
             continue;
         }
-        let range = super::color_subresource_range();
+        let range = vk::ImageSubresourceRange {
+            level_count: prepared.mip_levels,
+            ..super::color_subresource_range()
+        };
         if let Some(resident) = &prepared.resident {
             if resident.also_storage() {
                 continue;
@@ -1256,15 +1384,26 @@ pub(crate) unsafe fn execute_compute_inner(
             &barrier,
         );
         if let Some(source) = &prepared.upload {
-            let copy = [vk::BufferImageCopy::default()
-                .buffer_offset(source.texels.offset())
-                .buffer_row_length(source.row_length_texels)
-                .image_subresource(super::color_subresource_layers())
-                .image_extent(vk::Extent3D {
-                    width: prepared.width,
-                    height: prepared.height,
-                    depth: 1,
-                })];
+            let copy = if let Some(allocation) = &prepared.allocation_copy {
+                super::exec::sampled_allocation_copy_regions(
+                    prepared.binding,
+                    source.texels.offset(),
+                    allocation.bytes_per_texel,
+                    false,
+                    allocation,
+                )
+                .map_err(DrawError::DrawExecution)?
+            } else {
+                vec![vk::BufferImageCopy::default()
+                    .buffer_offset(source.texels.offset())
+                    .buffer_row_length(source.row_length_texels)
+                    .image_subresource(super::color_subresource_layers())
+                    .image_extent(vk::Extent3D {
+                        width: prepared.width,
+                        height: prepared.height,
+                        depth: 1,
+                    })]
+            };
             ctx.device.cmd_copy_buffer_to_image(
                 cb,
                 source.texels.buffer(),
@@ -1819,6 +1958,86 @@ mod tests {
         };
 
         assert!(validate_compute(&req).is_ok());
+    }
+
+    fn mip_chain_source() -> reims_vgpu_memory::GuestImageSource {
+        use reims_vgpu_memory::{
+            GuestImageAllocationLayout, GuestImageLayout, GuestImageMipLayout, GuestImageSource,
+            GuestImageViewRange, GuestRun, GuestRunSource,
+        };
+        let mip = |resource_relative_offset, row_pitch, width, height| GuestImageMipLayout {
+            resource_relative_offset,
+            row_pitch,
+            layout: GuestImageLayout::D2 { width, height },
+        };
+        GuestImageSource {
+            direct: None,
+            allocation: GuestImageAllocationLayout {
+                mips: Arc::from([
+                    mip(0, 256, 64, 64),
+                    mip(0x4000, 128, 32, 32),
+                    mip(0x5000, 64, 16, 16),
+                ]),
+            },
+            view: GuestImageViewRange {
+                base_mip_level: 0,
+                mip_level_count: 3,
+                base_array_layer: 0,
+                array_layer_count: 1,
+            },
+            transfer: GuestRunSource {
+                runs: Arc::new(vec![GuestRun {
+                    host_ptr: 0x1000,
+                    len: 0x6000,
+                }]),
+                source_offset: 0,
+                total_len: 0x6000,
+                row_length_texels: 0,
+                pages: None,
+                physical_pages: Default::default(),
+            },
+        }
+    }
+
+    #[test]
+    fn compute_sampled_bind_preserves_a_complete_mip_allocation() {
+        let request = ComputeRequest {
+            program: test_program(),
+            entry: "main".into(),
+            dispatch: reims_vgpu_protocol::dispatch::workgroup_counts([1, 1, 1], [1, 1, 1], false)
+                .expect("a one-by-one dispatch is a valid grid"),
+            sampled_images: vec![ComputeSampledImageResource {
+                binding: 32,
+                array_element: 0,
+                descriptor_count: 1,
+                format: StorageImageFormat::Rgba8Unorm,
+                width: 64,
+                height: 64,
+                source: super::super::types::ComputeSampledImageSource::GuestImage(
+                    mip_chain_source(),
+                ),
+                content: None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(validate_compute(&request), Ok(()));
+
+        let mut short = request;
+        let super::super::types::ComputeSampledImageSource::GuestImage(source) =
+            &mut short.sampled_images[0].source
+        else {
+            unreachable!()
+        };
+        source.transfer.total_len = 0x5000;
+        assert!(matches!(
+            validate_compute(&short),
+            Err(DrawError::ComputeValidation(
+                ComputeValidationDecline::SampledImageLayout {
+                    binding: 32,
+                    mip_levels: 3,
+                }
+            ))
+        ));
     }
 
     fn residency_identity() -> ComputeStorageResidencyKey {

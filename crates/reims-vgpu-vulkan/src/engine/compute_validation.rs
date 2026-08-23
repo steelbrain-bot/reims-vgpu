@@ -42,6 +42,10 @@ pub enum ComputeValidationDecline {
         actual: usize,
         expected: usize,
     },
+    SampledImageLayout {
+        binding: u32,
+        mip_levels: usize,
+    },
     InvalidSamplerLod {
         binding: u32,
         lod_min_bits: u32,
@@ -90,6 +94,7 @@ impl Decline for ComputeValidationDecline {
             }
             Self::SampledZeroGeometry { .. } => "vk_compute_validate_sampled_zero_geometry",
             Self::SampledBytesLength { .. } => "vk_compute_validate_sampled_bytes_length",
+            Self::SampledImageLayout { .. } => "vk_compute_validate_sampled_image_layout",
             Self::InvalidSamplerLod { .. } => "vk_compute_validate_invalid_sampler_lod",
             Self::DuplicateSamplerBinding { .. } => "vk_compute_validate_duplicate_sampler_binding",
             Self::DuplicateStorageImageBinding { .. } => {
@@ -159,6 +164,13 @@ impl Decline for ComputeValidationDecline {
                 ("actual", actual.to_string()),
                 ("expected", expected.to_string()),
             ],
+            Self::SampledImageLayout {
+                binding,
+                mip_levels,
+            } => vec![
+                ("binding", binding.to_string()),
+                ("mip_levels", mip_levels.to_string()),
+            ],
             Self::InvalidSamplerLod {
                 binding,
                 lod_min_bits,
@@ -205,6 +217,10 @@ mod tests {
                 actual: 3,
                 expected: 4,
             },
+            ComputeValidationDecline::SampledImageLayout {
+                binding: 32,
+                mip_levels: 2,
+            },
             ComputeValidationDecline::InvalidSamplerLod {
                 binding: 64,
                 lod_min_bits: 2.0f32.to_bits(),
@@ -244,11 +260,7 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        // Down from 18: the four 1D/array-layer checks went out with the
-        // non-2D image shape. A compute texture binding is one flat plane
-        // window or one linear GVA level, so there is no slice or depth axis
-        // for a request to get wrong.
-        assert_eq!(before, 17, "the compute validator's reason census moved");
+        assert_eq!(before, 18, "the compute validator's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate compute-validation slug");
     }
 

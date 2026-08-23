@@ -48,24 +48,6 @@ offset_oracle_54x16_pitch_tight_plus1_compute
 # these, which makes it the more serious of the two: guest work is lost with
 # nothing saying so.
 # ---------------------------------------------------------------------------
-mip_blit_level_1_size32
-mip_blit_level_2_size16
-mip_blit_level_3_size8
-mip_blit_level_4_size4
-mip_blit_level_5_size2
-mip_blit_level_6_size1
-mip_fetch_level_1_size32
-mip_fetch_level_2_size16
-mip_fetch_level_3_size8
-mip_fetch_level_4_size4
-mip_fetch_level_5_size2
-mip_fetch_level_6_size1
-mip_sample_level_1_size32
-mip_sample_level_2_size16
-mip_sample_level_3_size8
-mip_sample_level_4_size4
-mip_sample_level_5_size2
-mip_sample_level_6_size1
 
 # ---------------------------------------------------------------------------
 # A render target made from an `MTLBuffer` is refused as a colour attachment.

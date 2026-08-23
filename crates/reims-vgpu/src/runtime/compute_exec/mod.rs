@@ -1583,6 +1583,7 @@ pub(crate) struct StagedTexture {
 enum VulkanTextureInput {
     HostBytes(Vec<u8>),
     GuestPages(reims_vgpu_memory::GuestRunSource),
+    GuestImage(reims_vgpu_memory::GuestImageSource),
     TargetResident(crate::model::TargetIdentity),
     Resident(ResidentServe),
 }
@@ -2501,6 +2502,12 @@ struct LinearPlacement {
     width: u32,
     height: u32,
     row_stride: u64,
+    /// Complete base-texture allocation when the sampled bind names a mip
+    /// chain. A single-level view deliberately leaves this absent.
+    sampled_allocation: Option<(
+        reims_vgpu_memory::GuestImageAllocationLayout,
+        reims_vgpu_memory::GuestImageViewRange,
+    )>,
 }
 
 /// Name which gate a linear placement or stage failed at.
@@ -2599,6 +2606,31 @@ fn linear_texture_placement<M: HostMemory + HostOps>(
             ),
         );
     };
+    let sampled_allocation = if view_level == 0 && tex.mipmap_level_count > 1 {
+        let Some(bytes_per_texel) = pixel_format::bytes_per_pixel(declared_format) else {
+            return linear_fail(
+                bound_ref,
+                ComputeStatus::Unsupported("compute_linear_mip_format"),
+                &format!("fmt={declared_format:#x}"),
+            );
+        };
+        let shape = reims_vgpu_core::sampled_image_shape(reims_vgpu_core::SampledImageKind::D2)
+            .expect("2-D sampled images are representable");
+        Some(
+            crate::runtime::draw::declared_guest_image_allocation(
+                shape,
+                tex,
+                None,
+                None,
+                u64::from(bytes_per_texel),
+            )
+            .ok_or(ComputeStatus::Unsupported(
+                "compute_linear_mip_allocation_invalid",
+            ))?,
+        )
+    } else {
+        None
+    };
     Ok(LinearPlacement {
         texture_ref: stage_ref,
         storage_ref: stage_ref,
@@ -2609,6 +2641,7 @@ fn linear_texture_placement<M: HostMemory + HostOps>(
         width: layout.width,
         height: layout.height,
         row_stride: layout.row_stride,
+        sampled_allocation,
     })
 }
 
@@ -2749,6 +2782,7 @@ fn buffer_texture_placement<M: HostMemory + HostOps>(
         width: declaration.width,
         height: declaration.height,
         row_stride,
+        sampled_allocation: None,
     })
 }
 
@@ -2778,6 +2812,7 @@ fn stage_linear_placement<M: HostMemory + HostOps>(
         width: w,
         height: h,
         row_stride,
+        sampled_allocation,
     } = placement;
     let Some(stage_format) =
         crate::runtime::draw::effective_view_sample_format(declared_format, view_pixel_format)
@@ -2894,6 +2929,41 @@ fn stage_linear_placement<M: HostMemory + HostOps>(
         let exact_span = (h.saturating_sub(1) as u64)
             .checked_mul(row_stride)
             .and_then(|prefix| prefix.checked_add(tight as u64));
+        let guest_image = if is_storage {
+            None
+        } else {
+            sampled_allocation.as_ref().and_then(|(allocation, view)| {
+                if !crate::runtime::bound_buffers::ensure_packed_resource(
+                    state,
+                    host,
+                    task_id,
+                    storage_ref,
+                    allocation_gva,
+                    allocation_size,
+                    crate::runtime::bound_buffers::PackedResourceUse::ComputeTexture,
+                ) {
+                    return None;
+                }
+                let crate::runtime::bound_buffers::PackedBufferResolution::Available(packed) =
+                    state.bound_buffers.packed(task_id, storage_ref)?
+                else {
+                    return None;
+                };
+                Some(reims_vgpu_memory::GuestImageSource {
+                    direct: None,
+                    allocation: allocation.clone(),
+                    view: *view,
+                    transfer: packed.texel_source(0, allocation_size, 0)?,
+                })
+            })
+        };
+        if sampled_allocation.is_some() && !is_storage && guest_image.is_none() {
+            return linear_fail(
+                bound_ref,
+                ComputeStatus::GuestIo("compute_linear_mip_pages"),
+                &format!("base={allocation_gva:#x} alloc={allocation_size}"),
+            );
+        }
         let guest = exact_span.and_then(|span| {
             let level_offset = gva.checked_sub(allocation_gva)?;
             let row_length_texels = if row_stride == tight as u64 {
@@ -2919,7 +2989,9 @@ fn stage_linear_placement<M: HostMemory + HostOps>(
             };
             packed.texel_source(level_offset, span, row_length_texels)
         });
-        if let Some(source) = guest {
+        if let Some(source) = guest_image {
+            VulkanTextureInput::GuestImage(source)
+        } else if let Some(source) = guest {
             VulkanTextureInput::GuestPages(source)
         } else if let Some(cached) =
             crate::runtime::surface_cache::get_linear_texture(state, &window)
@@ -4154,6 +4226,13 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                     VulkanTextureInput::GuestPages(source) => {
                         reims_vgpu_core::ComputeStorageImageSeed::GuestPages(source)
                     }
+                    VulkanTextureInput::GuestImage(_) => {
+                        crate::observe::fail(format!(
+                        "compute_linux internal reason=sampled_image_on_storage pipe={} bind={}",
+                        acc.pipeline_ref, t.binding
+                    ));
+                        return ComputeStatus::Unsupported("compute_storage_source_role");
+                    }
                     VulkanTextureInput::TargetResident(_) => {
                         crate::observe::fail(format!(
                         "compute_linux internal reason=target_resident_on_storage pipe={} bind={}",
@@ -4212,6 +4291,9 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                     }
                     VulkanTextureInput::GuestPages(source) => {
                         reims_vgpu_core::ComputeSampledImageSource::GuestPages(source)
+                    }
+                    VulkanTextureInput::GuestImage(source) => {
+                        reims_vgpu_core::ComputeSampledImageSource::GuestImage(source)
                     }
                     VulkanTextureInput::TargetResident(identity) => {
                         reims_vgpu_core::ComputeSampledImageSource::TargetResident(identity)

@@ -2804,7 +2804,7 @@ pub(super) fn selection_dispatched_on_the_shader_shape(
 /// adjacent slices. Vulkan expresses that same relation as `arrayPitch` on
 /// each mip. A volume is different: its shrinking depth remains inside the
 /// mip and is represented by `depthPitch`, never by array layers.
-pub(super) fn declared_guest_image_allocation(
+pub(crate) fn declared_guest_image_allocation(
     shape: reims_vgpu_core::SampledImageShape,
     texture: &TextureDescriptor,
     view_texture_type: Option<u16>,

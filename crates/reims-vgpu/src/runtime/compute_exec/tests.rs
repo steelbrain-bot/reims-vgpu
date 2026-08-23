@@ -1261,6 +1261,7 @@ fn stage_texture_iosurface_plane_view_ref_resolves_surface_mapping() {
     assert_eq!((staged.width, staged.height), (4, 4));
     assert!(match &staged.input {
         VulkanTextureInput::GuestPages(source) => source.total_len == 4 * 4 * 4,
+        VulkanTextureInput::GuestImage(_) => false,
         VulkanTextureInput::HostBytes(bytes) => bytes.len() == 4 * 4 * 4,
         VulkanTextureInput::Resident(_) | VulkanTextureInput::TargetResident(_) => false,
     });
@@ -1336,6 +1337,7 @@ fn stage_texture_iosurface_plane_view_record_reshapes_stageable_single_plane_sur
     );
     assert!(match &staged.input {
         VulkanTextureInput::GuestPages(source) => source.total_len == 4 * 16,
+        VulkanTextureInput::GuestImage(_) => false,
         VulkanTextureInput::HostBytes(bytes) => bytes.len() == 4 * 16,
         VulkanTextureInput::Resident(_) | VulkanTextureInput::TargetResident(_) => false,
     });
@@ -1391,6 +1393,7 @@ fn stage_texture_iosurface_plane_view_record_reshapes_stageable_single_plane_sur
     );
     assert!(match &sampled.input {
         VulkanTextureInput::GuestPages(source) => source.total_len == 4 * 4 * 4,
+        VulkanTextureInput::GuestImage(_) => false,
         VulkanTextureInput::HostBytes(bytes) => bytes.len() == 4 * 4 * 4,
         VulkanTextureInput::Resident(_) | VulkanTextureInput::TargetResident(_) => false,
     });
@@ -1487,6 +1490,7 @@ fn stage_texture_iosurface_plane_view_record_stages_biplanar_y_plane() {
     );
     assert!(match &staged.input {
         VulkanTextureInput::GuestPages(source) => source.total_len == 16 * 8,
+        VulkanTextureInput::GuestImage(_) => false,
         VulkanTextureInput::HostBytes(bytes) => bytes.len() == 16 * 8,
         VulkanTextureInput::Resident(_) | VulkanTextureInput::TargetResident(_) => false,
     });

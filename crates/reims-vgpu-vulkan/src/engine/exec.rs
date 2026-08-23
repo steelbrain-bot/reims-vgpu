@@ -1563,11 +1563,11 @@ enum PreparedSampled {
 }
 
 #[derive(Clone, Debug)]
-struct GuestAllocationCopy {
-    allocation: reims_vgpu_memory::GuestImageAllocationLayout,
-    view: reims_vgpu_memory::GuestImageViewRange,
-    transfer_source_offset: u64,
-    bytes_per_texel: u64,
+pub(super) struct GuestAllocationCopy {
+    pub(super) allocation: reims_vgpu_memory::GuestImageAllocationLayout,
+    pub(super) view: reims_vgpu_memory::GuestImageViewRange,
+    pub(super) transfer_source_offset: u64,
+    pub(super) bytes_per_texel: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2783,7 +2783,7 @@ fn sampled_copy_regions(
     }
 }
 
-fn sampled_allocation_copy_regions(
+pub(super) fn sampled_allocation_copy_regions(
     binding: u32,
     source_buffer_offset: u64,
     bytes_per_texel: u64,
