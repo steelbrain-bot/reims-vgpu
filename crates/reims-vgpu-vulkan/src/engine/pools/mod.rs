@@ -3363,7 +3363,7 @@ fn sampled_content_hash(bytes: &[u8]) -> u128 {
 /// A `vkAllocateMemory` per draw is the render-target-recreate bug class (Safari
 /// video playback crawls when every frame reallocates its target). The count is
 /// the proxy for it, and it needs the site: a staging bucket that misses its
-/// free list, a per-frame sampled image, and a transient depth attachment are
+/// free list, a per-frame sampled image, and a depth attachment are
 /// three different defects that a single fused count cannot separate.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AllocSite {
@@ -3382,20 +3382,15 @@ pub(crate) enum AllocSite {
     /// boot: `mrt_draw_single=24579` with no `secondary_mrt_drop` at all — the
     /// guest never asked for MRT, rather than asking and being degraded.
     MrtSecondary,
-    /// A depth buffer allocated for one draw and destroyed after it, because
-    /// the pass named no guest depth texture to key a resident on. See
-    /// [`AllocSite::DepthResident`] for the rail that owns the identified case;
-    /// this one should read near zero, and a rising count means guests are
-    /// binding depth state without a depth attachment.
+    /// Draw-owned implementation attachment used when Metal applies depth or
+    /// stencil test state without a pass-owned attachment.
     TransientDepth,
     /// A depth buffer held in the registry under the guest texture the pass
     /// bound, for as long as the guest keeps that texture.
     ///
-    /// Split from [`AllocSite::TransientDepth`] rather than replacing it because
-    /// the two answer different questions and a boot series spanning the change
-    /// has to stay readable: this counts allocations that amortise over a
-    /// texture's life, that one counts allocations that do not amortise at all.
-    /// Summing them would hide exactly the ratio the split exists to show.
+    /// Split from [`AllocSite::TransientDepth`] because one allocation
+    /// amortises over a guest texture's lifetime and the other belongs to a
+    /// single draw whose test state has no pass-owned attachment.
     DepthResident,
     /// A HOST_VISIBLE upload block, not one staging buffer.
     ///

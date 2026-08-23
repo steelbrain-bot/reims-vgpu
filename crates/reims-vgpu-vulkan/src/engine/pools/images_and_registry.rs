@@ -2215,46 +2215,6 @@ impl ResourcePools {
         Ok((image, view))
     }
 
-    /// Allocate a transient D32_SFLOAT depth attachment (image + memory + view)
-    /// sized to `width`x`height`. The caller owns it for exactly one draw and
-    /// must dispose it deferred (`DeferredHandle::Image`) after submit — the CB
-    /// still references it until its fence signals. Depth is never read back, so
-    /// no TRANSFER_SRC usage.
-    ///
-    /// # It does not recycle, and on this pathway it never runs
-    ///
-    /// Every sibling allocator here reuses before allocating; this one does not.
-    /// `exec` creates one per draw that carries depth state and disposes it at
-    /// the end of that same draw. That was once by far the largest allocator in
-    /// the engine: driven boots read `vk_alloc_sites transient_depth=5374:21225`
-    /// and later `4623:18257` — thousands of `vkAllocateMemory` calls totalling
-    /// ~18-21 GiB, against `slab_block=41:2568` for every resident colour target
-    /// in the same boot. A depth [`FreePool`] was built against exactly that,
-    /// measured at a 4 % improvement, and reverted as more code for no benefit.
-    ///
-    /// **A driven boot on the current build allocates zero.** x86/Vulkan,
-    /// measured across all 126 `vk_alloc_sites` census windows spanning the boot
-    /// (Safari page loads and page-downs, a title-bar drag, a wallpaper drag,
-    /// Chess, the WebGL aquarium, then `killall` teardown): every window read
-    /// `transient_depth=0:0`. The zero is not a broken probe — the counter is the
-    /// `allocate_memory` wrapper's, keyed [`AllocSite::TransientDepth`], and
-    /// `slab_block` and `staging` moved by thousands in the same lines.
-    ///
-    /// Nothing was refused on the way, either: zero `shader_state_degraded`, zero
-    /// `depth_compare_unmapped`, zero `depth_load_unsupported_transient` in the
-    /// whole log. So the guest is not asking for depth and being turned away — it
-    /// is not asking. `resources.depth` is set only where the guest's
-    /// depth-stencil descriptor decodes with a mapped compare, and no draw we
-    /// executed carried one. The likely reading, NOT measured, is that a 3D
-    /// application's depth work happens before its surface reaches our stream and
-    /// what we execute is the compositor's 2D layer work.
-    ///
-    /// So do not build the depth pool. The premise it was queued against — a
-    /// per-draw allocation storm — does not reproduce, and a fourth recycle pool
-    /// would be more mechanism guarding nothing. `vk_alloc_sites transient_depth`
-    /// is the number that would say a future workload changed this; until it is
-    /// nonzero there is nothing here to recycle.
-    ///
     /// The depth resident the guest's bound depth texture names, created on
     /// first use and held until the guest stops touching it.
     ///
@@ -2269,11 +2229,8 @@ impl ResourcePools {
     /// would have a hit rate, and hit rates fall off when a second window with a
     /// different size appears.
     ///
-    /// Contents are *not* preserved by this: the pass still CLEARs, and
-    /// `DepthState::load` is still false. What became persistent is the
-    /// allocation, not the pixels. See
-    /// `reims-vgpu::runtime::draw::depth_chain_identity` for why that
-    /// distinction is what lets the identity carry generation zero.
+    /// Load and store behavior belongs to the pass attachment and is applied
+    /// independently from per-draw depth/stencil tests.
     // The arguments are the depth attachment's decoded geometry; a struct here
     // would only rename the same fields at every call site.
     #[allow(clippy::too_many_arguments)]
@@ -2311,9 +2268,8 @@ impl ResourcePools {
     /// preferred case; the D24_S8 fallback is 24-bit UNORM depth, which the
     /// stencil-test path tolerates (it asserts stencil, not depth bits).
     ///
-    /// One function because the resident rail and the transient fallback must
-    /// pick the same format for the same draw — they feed the same render pass,
-    /// whose attachment format is fixed by `PassKey`.
+    /// A pass-owned stencil aspect or an attachmentless stencil test selects
+    /// the combined native format used by the implementation attachment.
     fn depth_format(ctx: &DeviceContext, with_stencil: bool) -> vk::Format {
         if with_stencil {
             ctx.depth_stencil_format
@@ -2322,6 +2278,12 @@ impl ResourcePools {
         }
     }
 
+    /// Allocate a draw-owned native depth/stencil attachment for Metal test
+    /// state whose pass descriptor names no corresponding attachment.
+    ///
+    /// Native Metal compares against implicit depth one and stencil zero in
+    /// that case. Vulkan requires an attachment to run those tests, so the
+    /// caller clears this image to those values and retires it with the draw.
     pub(crate) unsafe fn create_transient_depth(
         &mut self,
         ctx: &DeviceContext,
@@ -2331,12 +2293,6 @@ impl ResourcePools {
         with_stencil: bool,
         counters: &EngineCounters,
     ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView), DrawError> {
-        // Device-queried combined depth-stencil format when the bound state runs
-        // the stencil test (D32_S8 preferred, D24_S8 fallback — see
-        // DeviceContext::depth_stencil_format); plain D32_SFLOAT (no stencil
-        // aspect) otherwise, which is spec-mandatory. Depth is 32-bit float in
-        // the preferred case; the D24_S8 fallback is 24-bit UNORM depth, which
-        // the stencil-test path tolerates (it asserts stencil, not depth bits).
         let (format, aspect) = if with_stencil {
             (
                 ctx.depth_stencil_format,
