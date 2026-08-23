@@ -1168,9 +1168,18 @@ impl ResourceGraph {
             .resources
             .remove(&id)
             .expect("collection candidate exists");
-        if let Some(storage) = node.storage {
-            if let Some(storage) = self.storage.get_mut(&storage) {
+        if let Some(storage_id) = node.storage {
+            let retire_heap_storage = self.storage.get_mut(&storage_id).is_some_and(|storage| {
                 storage.owners.remove(&id);
+                storage.owners.is_empty()
+                    && matches!(
+                        storage.backing,
+                        StorageBacking::HeapPlacement { .. }
+                            | StorageBacking::HeapAllocation { .. }
+                    )
+            });
+            if retire_heap_storage {
+                self.storage.remove(&storage_id);
             }
         }
         for parent in node.parents {
@@ -1712,6 +1721,45 @@ mod tests {
         let second_node = graph.resource(second).unwrap();
         assert_eq!(first_node.storage, second_node.storage);
         assert!(first_node.content.same_authority(&second_node.content));
+    }
+
+    #[test]
+    fn a_heap_range_dies_with_its_last_texture_and_can_be_reused() {
+        let mut graph = ResourceGraph::default();
+        let first = graph
+            .create_resource(task(), object(1), ObjectKind::TextureView, None, [])
+            .unwrap();
+        let alias = graph
+            .create_resource(task(), object(2), ObjectKind::TextureView, None, [])
+            .unwrap();
+        let heap = ResourceId::<HeapObject>::new(7, 3);
+        let placement = Some((ByteOffset::new(0x200), ByteLength::new(0x800)));
+
+        graph.link_heap_texture(first, heap, placement).unwrap();
+        graph.link_heap_texture(alias, heap, placement).unwrap();
+        let storage = graph.resource(first).unwrap().storage.unwrap();
+
+        graph.release_reference(task(), object(1)).unwrap();
+        assert!(
+            graph.storage(storage).is_some(),
+            "the alias still owns the range"
+        );
+        graph.release_reference(task(), object(2)).unwrap();
+        assert!(
+            graph.storage(storage).is_none(),
+            "the last release frees the range"
+        );
+
+        let replacement = graph
+            .create_resource(task(), object(3), ObjectKind::TextureView, None, [])
+            .unwrap();
+        graph
+            .link_heap_texture(
+                replacement,
+                heap,
+                Some((ByteOffset::new(0x600), ByteLength::new(0x800))),
+            )
+            .expect("a placement may overlap a range whose lifetime ended");
     }
 
     #[test]
