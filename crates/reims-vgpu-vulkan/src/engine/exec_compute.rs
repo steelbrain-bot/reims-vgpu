@@ -487,8 +487,9 @@ fn resident_sample_exact(
     bind: ComputeResidentSampleBind,
     src_key: StorageImageKey,
 ) -> Result<(), DrawError> {
+    let resource_storage = resource.format.storage();
     let exact = crate::format::vk_storage_image(src_key.format)
-        == crate::format::vk_storage_image(resource.format)
+        == crate::format::vk_storage_image(resource_storage)
         && src_key.width == resource.width
         && src_key.height == resource.height;
     if !exact {
@@ -504,7 +505,7 @@ fn resident_sample_exact(
                 source_row_bytes,
                 resource_width: resource.width,
                 resource_height: resource.height,
-                resource_format: resource.format,
+                resource_format: resource_storage,
                 resource_row_bytes,
             },
         ));
@@ -799,16 +800,21 @@ pub(crate) unsafe fn execute_compute_inner(
             });
             continue;
         }
-        let key = StorageImageKey {
-            width: resource.width,
-            height: resource.height,
-            format: resource.format,
-            sampled_only: true,
-        };
         let mut allocation_copy = None;
         let mut mip_levels = 1;
         let (image, view, upload, resident) =
             if let super::types::ComputeSampledImageSource::Resident(bind) = &resource.source {
+                if resource.format.transfer() != reims_vgpu_protocol::TransferFunction::Linear
+                    || !resource.format.swizzle().is_identity()
+                {
+                    return Err(DrawError::ComputeExecution(
+                        ComputeExecutionDecline::ResidentSampleViewUnsupported {
+                            binding: resource.binding,
+                            identity: bind.identity,
+                            format: resource.format,
+                        },
+                    ));
+                }
                 let Some((src_image, src_view, src_key, generation, src_access)) =
                     pools.compute_resident_snapshot(&bind.identity)
                 else {
@@ -885,8 +891,8 @@ pub(crate) unsafe fn execute_compute_inner(
                     pools.registry_sample_view(
                         ctx,
                         identity,
-                        crate::format::vk_storage_image(resource.format),
-                        reims_vgpu_protocol::SwizzlePlan::default(),
+                        crate::format::vk_sampled_image(resource.format),
+                        resource.format.swizzle(),
                         counters,
                     )?
                 }
@@ -924,8 +930,8 @@ pub(crate) unsafe fn execute_compute_inner(
                         cube: false,
                         arrayed: false,
                         one_dim: false,
-                        format: crate::format::vk_storage_image(resource.format),
-                        swizzle: reims_vgpu_protocol::SwizzlePlan::default(),
+                        format: crate::format::vk_sampled_image(resource.format),
+                        swizzle: resource.format.swizzle(),
                     },
                     counters,
                 )?;
@@ -947,7 +953,24 @@ pub(crate) unsafe fn execute_compute_inner(
                 });
                 (img.image, img.view, Some(prepared), None)
             } else {
-                let img = pools.acquire_storage_image(ctx, key, counters)?;
+                let img = unsafe {
+                    pools.acquire_sampled(
+                        ctx,
+                        SampledKey {
+                            width: resource.width,
+                            height: resource.height,
+                            mip_levels: 1,
+                            layers: 1,
+                            volume: false,
+                            cube: false,
+                            arrayed: false,
+                            one_dim: false,
+                            format: crate::format::vk_sampled_image(resource.format),
+                            swizzle: resource.format.swizzle(),
+                        },
+                        counters,
+                    )?
+                };
                 let prepared = match &resource.source {
                     super::types::ComputeSampledImageSource::Bytes(bytes) => {
                         let st = pools.acquire_staging(
@@ -2010,7 +2033,7 @@ mod tests {
                 binding: 32,
                 array_element: 0,
                 descriptor_count: 1,
-                format: StorageImageFormat::Rgba8Unorm,
+                format: StorageImageFormat::Rgba8Unorm.into(),
                 width: 64,
                 height: 64,
                 source: super::super::types::ComputeSampledImageSource::GuestImage(
@@ -2049,7 +2072,7 @@ mod tests {
             binding: 32,
             array_element: 0,
             descriptor_count: 1,
-            format: StorageImageFormat::Rgba8Unorm,
+            format: StorageImageFormat::Rgba8Unorm.into(),
             width: 1,
             height: 1,
             source: super::super::types::ComputeSampledImageSource::Resident(
@@ -2160,7 +2183,7 @@ mod tests {
         // produce it.
         let mut row_compatible = resident_sample_resource();
         row_compatible.width = 2;
-        row_compatible.format = StorageImageFormat::Rg8Unorm;
+        row_compatible.format = StorageImageFormat::Rg8Unorm.into();
         assert_eq!(
             resident_sample_shape_slug(&row_compatible, resident_sample_key()),
             "vk_compute_exec_resident_sample_byte_shape_mismatch"
@@ -2185,7 +2208,7 @@ mod tests {
                 binding: 32,
                 array_element: 0,
                 descriptor_count: 1,
-                format: StorageImageFormat::Rgba8Unorm,
+                format: StorageImageFormat::Rgba8Unorm.into(),
                 width: 1,
                 height: 1,
                 source: super::super::types::ComputeSampledImageSource::Bytes(vec![0; 4]),

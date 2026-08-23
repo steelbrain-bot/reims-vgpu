@@ -1761,6 +1761,7 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
 
         pixel_format: MTL_FORMAT_RGBA8_UNORM,
         storage_format: Some(reims_vgpu_protocol::StorageImageFormat::Rgba8Unorm),
+        view_swizzle: reims_vgpu_protocol::SwizzlePlan::default(),
         width: 2,
         height: 2,
         bytes: rgba.clone(),
@@ -2301,6 +2302,7 @@ fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
 
         pixel_format: MTL_FORMAT_RGBA8_UNORM,
         storage_format: Some(reims_vgpu_protocol::StorageImageFormat::Rgba8Unorm),
+        view_swizzle: reims_vgpu_protocol::SwizzlePlan::default(),
         width: 2,
         height: 2,
         bytes: vec![0u8; 16],
@@ -2709,6 +2711,7 @@ fn live_compute_mirrors_are_not_evicted_by_an_invented_capacity() {
 
         pixel_format: key.pixel_format,
         storage_format: Some(reims_vgpu_protocol::StorageImageFormat::Rgba8Uint),
+        view_swizzle: reims_vgpu_protocol::SwizzlePlan::default(),
         width: key.width,
         height: key.height,
         bytes: Vec::new(),

@@ -810,9 +810,13 @@ pub fn storage_image_format(format: u16) -> Option<reims_vgpu_protocol::StorageI
 /// storage table for a sampled binding.
 pub fn compute_sampled_image_format(
     format: u16,
-) -> Option<reims_vgpu_protocol::StorageImageFormat> {
+) -> Option<reims_vgpu_protocol::SampledImageFormat> {
     use reims_vgpu_protocol::StorageImageFormat as F;
-    Some(match format {
+    use reims_vgpu_protocol::{SampledImageFormat, TransferFunction};
+    let storage = match format {
+        MTL_FORMAT_A8_UNORM => F::R8Unorm,
+        MTL_FORMAT_RGBA8_UNORM_SRGB => F::Rgba8Unorm,
+        MTL_FORMAT_BGRA8_UNORM_SRGB => F::Bgra8Unorm,
         MTL_FORMAT_R16_UNORM => F::R16Unorm,
         MTL_FORMAT_RG16_UNORM => F::Rg16Unorm,
         MTL_FORMAT_RGBA16_UNORM => F::Rgba16Unorm,
@@ -821,7 +825,16 @@ pub fn compute_sampled_image_format(
         MTL_FORMAT_RG11B10_FLOAT => F::Rg11b10Float,
         MTL_FORMAT_RGB9E5_FLOAT => F::Rgb9e5Ufloat,
         _ => storage_image_format(format)?,
-    })
+    };
+    let transfer = if is_srgb(format) {
+        TransferFunction::Srgb
+    } else {
+        TransferFunction::Linear
+    };
+    let swizzle = sampled_texel(format)
+        .map(|(_, swizzle)| swizzle)
+        .unwrap_or_else(swizzle_identity);
+    SampledImageFormat::with_transfer(storage, transfer, swizzle)
 }
 
 /// Exact stored texel for a guest declaration a byte-copy rail can serve.
@@ -2282,7 +2295,7 @@ mod tests {
 
         assert_eq!(
             compute_sampled_image_format(MTL_FORMAT_R16_UNORM),
-            Some(F::R16Unorm)
+            Some(F::R16Unorm.into())
         );
         assert_eq!(storage_image_format(MTL_FORMAT_R16_UNORM), None);
         assert_eq!(
@@ -2291,9 +2304,22 @@ mod tests {
         );
         assert_eq!(
             compute_sampled_image_format(MTL_FORMAT_RGB9E5_FLOAT),
-            Some(F::Rgb9e5Ufloat)
+            Some(F::Rgb9e5Ufloat.into())
         );
         assert_eq!(storage_image_format(MTL_FORMAT_RGB9E5_FLOAT), None);
+        let alpha = compute_sampled_image_format(MTL_FORMAT_A8_UNORM).unwrap();
+        let red = compute_sampled_image_format(MTL_FORMAT_R8_UNORM).unwrap();
+        assert_eq!(alpha.storage(), F::R8Unorm);
+        assert_eq!(red.storage(), F::R8Unorm);
+        assert_eq!(alpha.swizzle().source[3], SwizzleSource::R);
+        assert_eq!(alpha.swizzle().source[..3], [SwizzleSource::Zero; 3]);
+        assert!(red.swizzle().is_identity());
+        assert!(
+            compute_sampled_image_format(MTL_FORMAT_RGBA8_UNORM_SRGB)
+                .unwrap()
+                .transfer()
+                == reims_vgpu_protocol::TransferFunction::Srgb
+        );
         assert_eq!(compute_sampled_image_format(0xffff), None);
     }
 

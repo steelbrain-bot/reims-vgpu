@@ -8,6 +8,7 @@
 use super::types::StorageImageFormat;
 use reims_vgpu_core::ComputeStorageResidencyKey;
 use reims_vgpu_observe::Decline;
+use reims_vgpu_protocol::SampledImageFormat;
 
 /// A specific failure while preparing a validated compute dispatch.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,6 +42,11 @@ pub enum ComputeExecutionDecline {
         resource_height: u32,
         resource_format: StorageImageFormat,
         resource_row_bytes: u64,
+    },
+    ResidentSampleViewUnsupported {
+        binding: u32,
+        identity: ComputeStorageResidencyKey,
+        format: SampledImageFormat,
     },
     SeedSkippedWithoutResidency {
         binding: u32,
@@ -124,6 +130,9 @@ impl Decline for ComputeExecutionDecline {
             Self::ResidentSampleByteShapeMismatch { .. } => {
                 "vk_compute_exec_resident_sample_byte_shape_mismatch"
             }
+            Self::ResidentSampleViewUnsupported { .. } => {
+                "vk_compute_exec_resident_sample_view_unsupported"
+            }
             Self::SeedSkippedWithoutResidency { .. } => {
                 "vk_compute_exec_seed_skipped_without_residency"
             }
@@ -198,6 +207,15 @@ impl Decline for ComputeExecutionDecline {
                     ("resource_format", format!("{resource_format:?}")),
                     ("resource_row_bytes", resource_row_bytes.to_string()),
                 ]);
+                fields
+            }
+            Self::ResidentSampleViewUnsupported {
+                binding,
+                identity,
+                format,
+            } => {
+                let mut fields = binding_identity_fields(*binding, identity);
+                fields.push(("sampled_format", format!("{format:?}")));
                 fields
             }
             Self::SeedSkippedWithoutResidency {
@@ -356,6 +374,21 @@ mod tests {
                 resource_format: StorageImageFormat::Rgba8Unorm,
                 resource_row_bytes: 128,
             },
+            ComputeExecutionDecline::ResidentSampleViewUnsupported {
+                binding: 32,
+                identity: identity(),
+                format: reims_vgpu_protocol::SampledImageFormat::linear(
+                    StorageImageFormat::R8Unorm,
+                    reims_vgpu_protocol::SwizzlePlan {
+                        source: [
+                            reims_vgpu_protocol::SwizzleSource::Zero,
+                            reims_vgpu_protocol::SwizzleSource::Zero,
+                            reims_vgpu_protocol::SwizzleSource::Zero,
+                            reims_vgpu_protocol::SwizzleSource::R,
+                        ],
+                    },
+                ),
+            },
             ComputeExecutionDecline::SeedSkippedWithoutResidency {
                 binding: 34,
                 width: 64,
@@ -397,7 +430,7 @@ mod tests {
         // a pooled readback the runtime owns. Five more went with the
         // non-2D image shape: the compute rail stages one flat plane window
         // per binding and has no slice or depth axis to refuse.
-        assert_eq!(before, 6, "the compute executor's reason census moved");
+        assert_eq!(before, 7, "the compute executor's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate compute-execution slug");
     }
 

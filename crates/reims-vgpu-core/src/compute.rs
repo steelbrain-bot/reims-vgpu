@@ -1,7 +1,7 @@
 //! Backend-independent resolved compute commands and their typed results.
 
 use reims_vgpu_memory::{GuestImageSource, GuestPageTarget, GuestRunSource};
-use reims_vgpu_protocol::StorageImageFormat;
+use reims_vgpu_protocol::{SampledImageFormat, StorageImageFormat};
 pub use reims_vgpu_protocol::{
     SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter, SamplerMipFilter,
 };
@@ -258,7 +258,7 @@ pub struct ComputeSampledImageResource {
     pub binding: u32,
     pub array_element: u32,
     pub descriptor_count: u32,
-    pub format: StorageImageFormat,
+    pub format: SampledImageFormat,
     pub width: u32,
     pub height: u32,
     pub source: ComputeSampledImageSource,

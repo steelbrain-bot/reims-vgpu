@@ -601,7 +601,7 @@ pub fn storage_image(mtl: u16) -> Result<StorageImageFormat, TranslateReason> {
 /// The converse does not hold and must not: this rail carries the integer and
 /// packed formats a compute shader reads and [`sampled_pixels`] has no
 /// [`TexelLayout`] for, because that one answers a CPU-upload byte order.
-pub fn sampled_image(mtl: u16) -> Result<StorageImageFormat, TranslateReason> {
+pub fn sampled_image(mtl: u16) -> Result<reims_vgpu_protocol::SampledImageFormat, TranslateReason> {
     use reims_vgpu_core::pixel_format as pf;
     // Sampled-only members first, then everything a storage image may be. The
     // `translate` call keeps an entirely unknown value declining as
@@ -967,67 +967,34 @@ mod tests {
     /// other binding. Sweeping every `u16` is what makes the next one a failure
     /// here rather than a lost frame on a rail nobody booted.
     ///
-    /// The exceptions are listed rather than tolerated, because each is a real
-    /// decision this rail cannot yet express:
-    ///
-    /// - `A8Unorm` needs its channel plan. [`sampled_pixels`] hands back a
-    ///   [`SwizzlePlan`] that puts the single byte in alpha; a
-    ///   [`StorageImageFormat`] carries no component mapping, so admitting it
-    ///   here would sample the byte as **red**. A wrong sample is worse than a
-    ///   named refusal, so it stays refused until the compute request can carry
-    ///   a plan.
-    /// - The two `*_SRGB` orders would have to bind their linear sibling, which
-    ///   is the [`TranslateReason::SrgbDowngraded`] loss [`srgb_decline`]
-    ///   documents. This rail's `Result` has nowhere to record it, and
-    ///   [`storage_image`] refuses sRGB for the same reason with its own test
-    ///   pinning that. Admitting it silently here would break the symmetry the
-    ///   crate relies on, so it waits for the rail to gain a warning channel.
-    ///
     /// The converse is deliberately not asserted: this rail carries the integer
     /// and packed formats a compute shader reads and [`sampled_pixels`] has no
     /// [`TexelLayout`] for, because that one answers a CPU-upload byte order and
     /// not a sampling capability.
     #[test]
     fn a_texture_the_graphics_rail_samples_is_not_refused_by_the_compute_one() {
-        const EXCEPTIONS: &[(u16, &str)] = &[
-            (p::MTL_FORMAT_A8_UNORM, "needs a component mapping"),
-            (p::MTL_FORMAT_RGBA8_UNORM_SRGB, "would downgrade unrecorded"),
-            (p::MTL_FORMAT_BGRA8_UNORM_SRGB, "would downgrade unrecorded"),
-        ];
-
         let mut refused = Vec::new();
         for mtl in 0..=u16::MAX {
             if sampled_pixels(mtl).is_ok() && sampled_image(mtl).is_err() {
                 refused.push(mtl);
             }
         }
-        let expected: Vec<u16> = EXCEPTIONS.iter().map(|&(mtl, _)| mtl).collect();
         assert_eq!(
-            refused, expected,
-            "a format the graphics rail samples must be sampleable in a dispatch \
-             or be one of the exceptions this test names"
+            refused,
+            Vec::<u16>::new(),
+            "a format the graphics rail samples must be sampleable in a dispatch"
         );
-
-        // Each exception is refused for the reason claimed and not because the
-        // contract does not define it — an undefined value would satisfy the
-        // sweep above for the wrong reason.
-        for &(mtl, why) in EXCEPTIONS {
-            assert!(
-                translate(mtl).is_ok(),
-                "{mtl:#x} is a defined format ({why})"
-            );
-        }
 
         // The ten-bit biplanar video planes travel together: a shader samples
         // luma and chroma from one frame, so one admitted without the other is
         // the whole dispatch lost anyway.
         assert_eq!(
             sampled_image(p::MTL_FORMAT_R16_UNORM),
-            Ok(StorageImageFormat::R16Unorm)
+            Ok(StorageImageFormat::R16Unorm.into())
         );
         assert_eq!(
             sampled_image(p::MTL_FORMAT_RG16_UNORM),
-            Ok(StorageImageFormat::Rg16Unorm)
+            Ok(StorageImageFormat::Rg16Unorm.into())
         );
 
         // Sampled-only means sampled-only: none of the members this rail adds

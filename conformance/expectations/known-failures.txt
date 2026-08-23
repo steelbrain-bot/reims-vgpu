@@ -8,34 +8,6 @@
 # Recorded on rail macos-13, x86 pathway, with the import capable and on.
 
 # ---------------------------------------------------------------------------
-# A8Unorm is refused on the compute sampled rail.
-#
-# The device declines the bind rather than mis-executing it, so every one of
-# these reports "the readback dispatch produced nothing" -- the refusal is
-# visible and named. `/tmp/reims-vgpu-fail.log`:
-#
-#   compute_linux sampled_format fail reason=mtl_format_unsupported bind=32 fmt=0x1
-#   compute_record reason=sampled_format_unsupported class=unsupported
-#
-# `fmt=0x1` is `MTLPixelFormatA8Unorm`. Twelve cases, and twelve refusals in the
-# log, so nothing here is lost silently. The fragment arm of the same shapes
-# passes, which is why the type layer renders at all: a glyph atlas reaches the
-# rasterizer and not a kernel.
-# ---------------------------------------------------------------------------
-incremental_a8Unorm_compute_first_read
-replace_a8Unorm_compute_first_read
-linear_a8Unorm_218x16_pitch_256
-linear_a8Unorm_54x16_pitch_tight_plus1
-linear_a8Unorm_54x16_pitch_tight_plus2
-linear_a8Unorm_64x16_pitch_tight
-linear_a8Unorm_64x16_pitch_tight_sampled
-offset_alias_a8Unorm_54x16_x4
-offset_oracle_218x16_pitch_tight_compute
-offset_oracle_250x16_pitch_tight_compute
-offset_oracle_256x16_pitch_tight_compute
-offset_oracle_54x16_pitch_tight_plus1_compute
-
-# ---------------------------------------------------------------------------
 # Nothing above mip level 0 arrives.
 #
 # All three ways of asking agree, which is what makes this one defect and not

@@ -266,6 +266,75 @@ impl From<TexelLayout> for StorageImageFormat {
     }
 }
 
+/// Backend-independent sampled image view.
+///
+/// Sampling needs three facts which a storage-image selector cannot carry:
+/// the byte-compatible storage shape, the fixed-function transfer, and the
+/// component mapping. `A8Unorm` is the smallest proof: it stores one R8 byte
+/// but Metal exposes that byte as alpha, not red.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SampledImageFormat {
+    storage: StorageImageFormat,
+    transfer: TransferFunction,
+    swizzle: SwizzlePlan,
+}
+
+impl SampledImageFormat {
+    pub const fn linear(storage: StorageImageFormat, swizzle: SwizzlePlan) -> Self {
+        Self {
+            storage,
+            transfer: TransferFunction::Linear,
+            swizzle,
+        }
+    }
+
+    pub fn with_transfer(
+        storage: StorageImageFormat,
+        transfer: TransferFunction,
+        swizzle: SwizzlePlan,
+    ) -> Option<Self> {
+        if matches!(transfer, TransferFunction::Srgb)
+            && !matches!(
+                storage,
+                StorageImageFormat::Rgba8Unorm | StorageImageFormat::Bgra8Unorm
+            )
+        {
+            return None;
+        }
+        Some(Self {
+            storage,
+            transfer,
+            swizzle,
+        })
+    }
+
+    pub const fn storage(self) -> StorageImageFormat {
+        self.storage
+    }
+
+    pub const fn transfer(self) -> TransferFunction {
+        self.transfer
+    }
+
+    pub const fn swizzle(self) -> SwizzlePlan {
+        self.swizzle
+    }
+
+    pub const fn with_swizzle(self, swizzle: SwizzlePlan) -> Self {
+        Self { swizzle, ..self }
+    }
+
+    pub const fn bytes_per_texel(self) -> usize {
+        self.storage.bytes_per_texel()
+    }
+}
+
+impl From<StorageImageFormat> for SampledImageFormat {
+    fn from(storage: StorageImageFormat) -> Self {
+        Self::linear(storage, SwizzlePlan::default())
+    }
+}
+
 impl TexelLayout {
     /// Every layout in stable table-index order.
     pub const ALL: &'static [Self] = &[

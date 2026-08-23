@@ -54,7 +54,8 @@ pub use pipeline::{
 };
 pub use pixel::{
     apply_swizzle_rgba8, swizzle_identity, swizzle_is_identity, swizzle_plan, ImageFormat,
-    StorageImageFormat, SwizzlePlan, SwizzleSource, TexelLayout, TransferFunction,
+    SampledImageFormat, StorageImageFormat, SwizzlePlan, SwizzleSource, TexelLayout,
+    TransferFunction,
 };
 pub use resource::{
     decode_object_list_entry, decode_surface_backing_descriptor, BufferDescriptor,

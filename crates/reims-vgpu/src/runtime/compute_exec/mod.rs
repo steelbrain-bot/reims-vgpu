@@ -1575,6 +1575,10 @@ pub(crate) struct StagedTexture {
     /// format is sampled-only. This exact value is supplied to metal2vulkan's
     /// runtime specialization API.
     pub storage_format: Option<reims_vgpu_protocol::StorageImageFormat>,
+    /// Component mapping declared by a semantic texture view. The base Metal
+    /// format's own mapping is composed with this when the sampled request is
+    /// built; storage binds require identity and refuse earlier.
+    pub view_swizzle: reims_vgpu_protocol::SwizzlePlan,
     pub width: u32,
     pub height: u32,
     /// post-dispatch host result only; the pre-dispatch source is the typed
@@ -1726,7 +1730,7 @@ pub(crate) fn resident_serve(
     }
     let (engine_generation, engine_format) = executor.compute_resident_sample_source(&key)?;
     (engine_generation == mirror_generation
-        && mtl_to_engine_sampled(pixel_format).is_some_and(|f| f == engine_format))
+        && mtl_to_engine_sampled(pixel_format).is_some_and(|f| f.storage() == engine_format))
     .then_some(ResidentServe::Sample(key, mirror_generation))
 }
 
@@ -1754,6 +1758,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     let mut iosurface_plane_view_record: Option<objects::IOSurfacePlaneViewDescriptor> = None;
     let mut view_level = 0;
     let mut view_pixel_format = None;
+    let mut view_swizzle = reims_vgpu_protocol::SwizzlePlan::default();
     let mut heap_texture = None;
     let mut buffer_texture = None;
     // A linear texture object (type-2/3) must resolve through its own
@@ -1822,10 +1827,11 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                             ));
                         }
                     };
-                    if view
-                        .swizzle
-                        .as_ref()
-                        .is_some_and(|plan| !pixel_format::swizzle_is_identity(plan))
+                    if is_storage
+                        && view
+                            .swizzle
+                            .as_ref()
+                            .is_some_and(|plan| !pixel_format::swizzle_is_identity(plan))
                     {
                         crate::observe::fail(format!(
                         "compute_stage_tex view_fail reason=swizzle_unsupported ref={texture_ref} base={} storage={}",
@@ -1835,6 +1841,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                             "compute_view_swizzle_unsupported",
                         ));
                     }
+                    view_swizzle = view.swizzle.unwrap_or_default();
                     stage_ref = view.base_texture_ref;
                     let Some(level) = view.single_non_array_level() else {
                         crate::observe::fail(format!(
@@ -1956,6 +1963,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
 
             pixel_format: format,
             storage_format,
+            view_swizzle,
             width,
             height,
             bytes: Vec::new(),
@@ -1986,6 +1994,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             binding,
             is_storage,
             view_pixel_format,
+            view_swizzle,
             placement,
         );
     }
@@ -2440,6 +2449,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
 
             pixel_format: stage_fmt,
             storage_format,
+            view_swizzle,
             width,
             height,
             bytes,
@@ -2465,6 +2475,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         binding,
         is_storage,
         view_pixel_format,
+        view_swizzle,
         placement,
     )
 }
@@ -2747,6 +2758,7 @@ fn stage_linear_placement<M: HostMemory + HostOps>(
     binding: u32,
     is_storage: bool,
     view_pixel_format: Option<u16>,
+    view_swizzle: reims_vgpu_protocol::SwizzlePlan,
     placement: LinearPlacement,
 ) -> Result<StagedTexture, ComputeStatus> {
     let LinearPlacement {
@@ -3024,6 +3036,7 @@ fn stage_linear_placement<M: HostMemory + HostOps>(
 
         pixel_format: stage_format,
         storage_format,
+        view_swizzle,
         width: w,
         height: h,
         bytes,
@@ -4231,6 +4244,8 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 ));
                 return ComputeStatus::Unsupported("sampled_format_unsupported");
             };
+            let sampled_fmt =
+                sampled_fmt.with_swizzle(t.view_swizzle.after(&sampled_fmt.swizzle()));
             let source =
                 match std::mem::replace(&mut t.input, VulkanTextureInput::HostBytes(Vec::new())) {
                     VulkanTextureInput::HostBytes(bytes) => {
@@ -4302,7 +4317,10 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             binding,
             array_element: 0,
             descriptor_count: 1,
-            format: reims_vgpu_protocol::StorageImageFormat::Rgba8Unorm,
+            format: reims_vgpu_protocol::SampledImageFormat::linear(
+                reims_vgpu_protocol::StorageImageFormat::Rgba8Unorm,
+                reims_vgpu_protocol::SwizzlePlan::default(),
+            ),
             width: 0,
             height: 0,
             source: reims_vgpu_core::ComputeSampledImageSource::Null,
@@ -4673,7 +4691,7 @@ fn spawn_compute_engine_stall_watchdog(
 /// against the pixel table they had to agree with. The call sites below are all
 /// `if let Some(..)` / `let Some(..) else`, so the adapters keep that shape; the
 /// decision itself now happens in exactly one place.
-fn mtl_to_engine_sampled(format: u16) -> Option<reims_vgpu_protocol::StorageImageFormat> {
+fn mtl_to_engine_sampled(format: u16) -> Option<reims_vgpu_protocol::SampledImageFormat> {
     // The *sampled* admission, not the storage one. Asking `storage_image` here
     // cost macOS 14 and macOS 15 a whole `DispatchThreadgroups` a boot on
     // `MTLPixelFormatR16Unorm`, which is sampleable everywhere and is not a

@@ -1084,7 +1084,7 @@ fn compute_sampled_resident_direct_bind_and_lost_resident() {
             binding: 32,
             array_element: 0,
             descriptor_count: 1,
-            format: StorageImageFormat::Rgba8Unorm,
+            format: StorageImageFormat::Rgba8Unorm.into(),
             width: w,
             height: h,
             source: ComputeSampledImageSource::Resident(ComputeResidentSampleBind {
@@ -1198,7 +1198,7 @@ fn compute_sampled_and_storage_bindings_preserve_one_resident_identity() {
             binding: 32,
             array_element: 0,
             descriptor_count: 1,
-            format: StorageImageFormat::Rgba8Unorm,
+            format: StorageImageFormat::Rgba8Unorm.into(),
             width: w,
             height: h,
             source: ComputeSampledImageSource::Resident(ComputeResidentSampleBind {
@@ -1261,7 +1261,7 @@ fn compute_sampled_image_fetch_preserves_float_bits() {
             binding: 32,
             array_element: 0,
             descriptor_count: 1,
-            format: StorageImageFormat::Rgba32Float,
+            format: StorageImageFormat::Rgba32Float.into(),
             width: 1,
             height: 1,
             source: ComputeSampledImageSource::Bytes(bytes),
@@ -1289,7 +1289,7 @@ fn compute_sampled_image_fetch_preserves_float_bits() {
 
     // RGB9E5 has no writable-storage selector in the guest ABI, but it is a
     // valid sampled texture. Zero packed RGB decodes to (0, 0, 0, 1).
-    req.sampled_images[0].format = StorageImageFormat::Rgb9e5Ufloat;
+    req.sampled_images[0].format = StorageImageFormat::Rgb9e5Ufloat.into();
     req.sampled_images[0].source = ComputeSampledImageSource::Bytes(vec![0; 4]);
     let Some(out) = engine_or_skip("compute sampled RGB9E5 image", &req) else {
         return;
@@ -1301,6 +1301,24 @@ fn compute_sampled_image_fetch_preserves_float_bits() {
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     assert_eq!(got, vec![0.0f32.to_bits(), 0, 0, 1.0f32.to_bits()]);
+
+    // A8 stores the same one byte as R8 but exposes it through alpha. Binding
+    // the allocation's identity R8 view would return `(a, 0, 0, 1)` instead.
+    req.sampled_images[0].format = reims_vgpu_core::pixel_format::compute_sampled_image_format(
+        reims_vgpu_core::pixel_format::MTL_FORMAT_A8_UNORM,
+    )
+    .expect("A8 is a sampled format");
+    req.sampled_images[0].source = ComputeSampledImageSource::Bytes(vec![0x7f]);
+    let Some(out) = engine_or_skip("compute sampled A8 image", &req) else {
+        return;
+    };
+    let got: Vec<u32> = out.buffers[0]
+        .bytes()
+        .expect("host-backed fixture returns bytes")
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    assert_eq!(got, vec![0, 0, 0, (127.0f32 / 255.0).to_bits()]);
 
     // Integer sampled views need an integer OpTypeImage and R32_UINT backing.
     let uint_spvasm = spvasm
@@ -1317,7 +1335,7 @@ fn compute_sampled_image_fetch_preserves_float_bits() {
         return;
     };
     req.program = prepare_test_program(words);
-    req.sampled_images[0].format = StorageImageFormat::R32Uint;
+    req.sampled_images[0].format = StorageImageFormat::R32Uint.into();
     req.sampled_images[0].source =
         ComputeSampledImageSource::Bytes(0x1234_5678u32.to_le_bytes().to_vec());
     let Some(out) = engine_or_skip("compute sampled R32Uint image", &req) else {

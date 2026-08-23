@@ -1,7 +1,9 @@
 //! Vulkan representation of backend-independent texel storage layouts.
 
 use ash::vk;
-use reims_vgpu_protocol::{ImageFormat, StorageImageFormat, TexelLayout, TransferFunction};
+use reims_vgpu_protocol::{
+    ImageFormat, SampledImageFormat, StorageImageFormat, TexelLayout, TransferFunction,
+};
 
 /// Vulkan's linear format spelling for one guest texel layout.
 pub fn vk_texel_layout(layout: TexelLayout) -> vk::Format {
@@ -68,6 +70,18 @@ pub fn vk_storage_image(format: StorageImageFormat) -> vk::Format {
         StorageImageFormat::Rgb10a2Unorm => vk::Format::A2B10G10R10_UNORM_PACK32,
         StorageImageFormat::Bgr10a2Unorm => vk::Format::A2R10G10B10_UNORM_PACK32,
         StorageImageFormat::Rg11b10Float => vk::Format::B10G11R11_UFLOAT_PACK32,
+    }
+}
+
+/// Vulkan view format for a semantic sampled image.
+pub fn vk_sampled_image(format: SampledImageFormat) -> vk::Format {
+    match format.transfer() {
+        TransferFunction::Linear => vk_storage_image(format.storage()),
+        TransferFunction::Srgb => match format.storage() {
+            StorageImageFormat::Rgba8Unorm => vk::Format::R8G8B8A8_SRGB,
+            StorageImageFormat::Bgra8Unorm => vk::Format::B8G8R8A8_SRGB,
+            _ => unreachable!("SampledImageFormat validates sRGB storage shapes"),
+        },
     }
 }
 
