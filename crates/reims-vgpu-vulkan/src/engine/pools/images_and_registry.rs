@@ -855,6 +855,9 @@ impl ResourcePools {
         seed_generation: u32,
         counters: &EngineCounters,
     ) -> Result<ResidentStorageImageUse, DrawError> {
+        if let Some(decline) = self.heap_placement_definition_refusal(&identity) {
+            return Err(DrawError::ComputeExecution(decline));
+        }
         // A shape change re-keys the identity, and one identity holds one slot,
         // so the old image is destroyed. Every other removal in this registry
         // skips a pinned resident, as allocation-pressure recovery does,
@@ -974,6 +977,33 @@ impl ResourcePools {
             slot,
             access: ResidentAccess::Untouched,
             generation_match: false,
+        })
+    }
+
+    /// Refuse a second live image definition over one explicit heap range.
+    ///
+    /// The semantic graph intentionally interns exact ranges even when their
+    /// texture definitions differ. Vulkan must therefore bind those images to
+    /// one memory range to preserve aliasing. The current resident owner can
+    /// represent only the equal-definition case as one image; this check keeps
+    /// the unsupported case visible instead of allocating unrelated memory.
+    pub(crate) fn heap_placement_definition_refusal(
+        &self,
+        wanted: &ComputeStorageResidencyKey,
+    ) -> Option<ComputeExecutionDecline> {
+        let reims_vgpu_core::ComputeStorageOrigin::HeapPlacement { .. } = wanted.origin else {
+            return None;
+        };
+        let held = self
+            .shared
+            .compute_storage_registry
+            .keys()
+            .filter(|held| held.origin == wanted.origin && *held != wanted)
+            .min()
+            .copied()?;
+        Some(ComputeExecutionDecline::HeapPlacementDefinitionConflict {
+            held,
+            wanted: *wanted,
         })
     }
 

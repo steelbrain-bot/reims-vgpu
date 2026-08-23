@@ -5219,6 +5219,55 @@ mod recycle_tests {
         );
     }
 
+    /// Exact explicit heap ranges are one storage authority, including when
+    /// two live textures describe that range differently. Until the Vulkan
+    /// backend can bind distinct images to one native memory range, admitting
+    /// the second definition would silently split that authority into unrelated
+    /// allocations.
+    #[test]
+    fn a_live_heap_range_refuses_a_second_image_definition() {
+        use reims_vgpu_observe::decline::Decline;
+
+        let mut pools = ResourcePools::new();
+        let heap = reims_vgpu_protocol::ResourceId::new(7, 3);
+        let held = ComputeStorageResidencyKey::heap_placement(heap, 0x1000, 0x5000, 64, 64, 0x50);
+        pools.shared.compute_storage_registry.insert(
+            held,
+            ResidentStorageImageSlot {
+                slot: null_storage_slot(64, 64),
+                generation: 0,
+                access: ResidentAccess::Untouched,
+                pinned: false,
+                gpu_only_content: false,
+                last_touch_ms: 0,
+            },
+        );
+
+        assert!(
+            pools.heap_placement_definition_refusal(&held).is_none(),
+            "the exact definition converges on its existing resident"
+        );
+        let disjoint =
+            ComputeStorageResidencyKey::heap_placement(heap, 0x5000, 0x9000, 128, 32, 0x50);
+        assert!(
+            pools.heap_placement_definition_refusal(&disjoint).is_none(),
+            "a disjoint range owns independent storage"
+        );
+
+        let alias = ComputeStorageResidencyKey::heap_placement(heap, 0x1000, 0x5000, 128, 32, 0x50);
+        let decline = pools
+            .heap_placement_definition_refusal(&alias)
+            .expect("a different definition over the live range must refuse");
+        assert_eq!(
+            decline.slug(),
+            "vk_compute_exec_heap_placement_definition_conflict"
+        );
+        assert!(
+            pools.shared.compute_storage_registry.contains_key(&held),
+            "refusing the alias must preserve the resident authority"
+        );
+    }
+
     /// Re-keying an identity whose resident still owes a deferred writeback is
     /// refused, not performed.
     ///
