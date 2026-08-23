@@ -217,10 +217,31 @@ pub struct ComputeResidencyLedger {
 
 impl ComputeResidencyLedger {
     pub fn generation(&self, key: &ComputeStorageResidencyKey) -> Option<u32> {
-        self.generations.get(key).copied()
+        if let Some(generation) = self.generations.get(key) {
+            return Some(*generation);
+        }
+        let ComputeStorageOrigin::HeapPlacement { .. } = key.origin else {
+            return None;
+        };
+        let mut aliases = self
+            .generations
+            .iter()
+            .filter(|(candidate, _)| candidate.origin == key.origin)
+            .map(|(_, generation)| *generation);
+        let generation = aliases.next()?;
+        aliases
+            .all(|candidate| candidate == generation)
+            .then_some(generation)
     }
 
     pub fn publish(&mut self, key: ComputeStorageResidencyKey, generation: u32) {
+        if matches!(key.origin, ComputeStorageOrigin::HeapPlacement { .. }) {
+            for (candidate, held_generation) in &mut self.generations {
+                if candidate.origin == key.origin {
+                    *held_generation = generation;
+                }
+            }
+        }
         self.generations.insert(key, generation);
     }
 
@@ -278,7 +299,7 @@ impl ComputeResidencyLedger {
     }
 
     pub fn contains(&self, key: &ComputeStorageResidencyKey) -> bool {
-        self.generations.contains_key(key)
+        self.generation(key).is_some()
     }
 }
 
@@ -413,5 +434,27 @@ mod tests {
         assert_eq!(ledger.retire_heap(heap), vec![sibling_key]);
         assert_eq!(ledger.len(), 1);
         assert!(ledger.contains(&other_heap_key));
+    }
+
+    #[test]
+    fn exact_heap_aliases_share_one_content_generation() {
+        let heap = reims_vgpu_protocol::ResourceId::new(9, 1);
+        let rgba = ComputeStorageResidencyKey::heap_placement(heap, 0, 16384, 64, 64, 0x46);
+        let bgra = ComputeStorageResidencyKey::heap_placement(heap, 0, 16384, 64, 64, 0x50);
+        let disjoint = ComputeStorageResidencyKey::heap_placement(heap, 16384, 32768, 64, 64, 0x46);
+        let mut ledger = ComputeResidencyLedger::default();
+
+        ledger.publish(rgba, 3);
+        assert_eq!(
+            ledger.generation(&bgra),
+            Some(3),
+            "a new view of the exact range inherits its current content"
+        );
+        assert_eq!(ledger.generation(&disjoint), None);
+
+        ledger.publish(bgra, 4);
+        assert_eq!(ledger.generation(&rgba), Some(4));
+        assert_eq!(ledger.generation(&bgra), Some(4));
+        assert_eq!(ledger.retire_origin(rgba.origin), vec![rgba, bgra]);
     }
 }
