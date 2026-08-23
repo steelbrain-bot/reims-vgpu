@@ -17,6 +17,39 @@
 
 use super::*;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FenceWait {
+    Signaled,
+    Pending,
+    Failed(vk::Result),
+}
+
+fn classify_fence_wait(result: Result<(), vk::Result>) -> FenceWait {
+    match result {
+        Ok(()) => FenceWait::Signaled,
+        Err(vk::Result::TIMEOUT) => FenceWait::Pending,
+        Err(error) => FenceWait::Failed(error),
+    }
+}
+
+#[cfg(test)]
+mod fence_wait_contract_tests {
+    use super::*;
+
+    #[test]
+    fn a_diagnostic_fence_deadline_keeps_the_submission_pending() {
+        assert_eq!(
+            classify_fence_wait(Err(vk::Result::TIMEOUT)),
+            FenceWait::Pending
+        );
+        assert_eq!(classify_fence_wait(Ok(())), FenceWait::Signaled);
+        assert_eq!(
+            classify_fence_wait(Err(vk::Result::ERROR_DEVICE_LOST)),
+            FenceWait::Failed(vk::Result::ERROR_DEVICE_LOST)
+        );
+    }
+}
+
 /// A readback slot lent out to be read where it lies.
 ///
 /// The three values travel together because reading the mapping needs all
@@ -1039,6 +1072,41 @@ impl ResourcePools {
         }
     }
 
+    /// Wait for one submitted fence to signal.
+    ///
+    /// [`FENCE_TIMEOUT_NS`] is a diagnostic sampling interval, not a contract
+    /// deadline. Vulkan's `TIMEOUT` reports only that the fence has not signaled
+    /// yet; converting it into command loss makes guest behavior depend on host
+    /// execution time. The first interval expiry emits the caller's detailed
+    /// trail, and every expiry remains counted while the exact fence stays
+    /// authoritative.
+    unsafe fn wait_fence_until_signaled(
+        ctx: &DeviceContext,
+        counters: &EngineCounters,
+        fence: vk::Fence,
+        op: DeviceLostOp,
+        mut report_delayed: impl FnMut(),
+    ) -> Result<(), DrawError> {
+        let mut reported = false;
+        loop {
+            if let Some(error) = ctx.queue_failure() {
+                return Err(Self::wait_error(counters, error, op));
+            }
+            match classify_fence_wait(ctx.device.wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS))
+            {
+                FenceWait::Signaled => return Ok(()),
+                FenceWait::Pending => {
+                    counters.fence_timeouts.fetch_add(1, Ordering::Relaxed);
+                    if !reported {
+                        report_delayed();
+                        reported = true;
+                    }
+                }
+                FenceWait::Failed(error) => return Err(Self::wait_error(counters, error, op)),
+            }
+        }
+    }
+
     /// Reset a ring-slot command buffer and begin recording it, arming its GPU
     /// timestamp pair in the same call.
     ///
@@ -1384,27 +1452,30 @@ impl ResourcePools {
             ));
         }
         let fence = self.encoder.slots[index].fence;
-        ctx.device
-            .wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS)
-            .map_err(|e| {
-                // The wait that every macos-11 freeze lands in. Until now the
-                // failure said only that *a* wait timed out; this names the
-                // submission it timed out on, which is the question two
-                // sessions of switch-bisecting could not reach. Emitted before
-                // the error is mapped, because `wait_error` may turn it into a
-                // device loss and the teardown that follows clears the ring.
+        Self::wait_fence_until_signaled(
+            ctx,
+            counters,
+            fence,
+            DeviceLostOp::PoolsWaitFencesRetire,
+            || {
+                // The first diagnostic deadline names the submission that is
+                // still executing. The wait continues because elapsed host
+                // time is not permission to discard the guest's command.
                 let held = match crate::gpu_hang_trail::submission(index) {
                     Some(note) => format!("{note}"),
                     None => "none (this slot's work was never recorded)".to_string(),
                 };
                 reims_vgpu_observe::fail(format!(
-                    "vk_engine_fence_wedged slot={index} result={e:?} held={held}"
+                    "vk_engine_fence_delayed reason=vk_engine_fence_delayed \
+                     slot={index} deadline_ns={FENCE_TIMEOUT_NS} held={held}"
                 ));
                 if let Some(rest) = crate::gpu_hang_trail::outstanding() {
-                    reims_vgpu_observe::fail(format!("vk_engine_fence_wedged_queue {rest}"));
+                    reims_vgpu_observe::fail(format!(
+                        "vk_engine_fence_delayed_queue reason=vk_engine_fence_delayed {rest}"
+                    ));
                 }
-                Self::wait_error(counters, e, DeviceLostOp::PoolsWaitFencesRetire)
-            })?;
+            },
+        )?;
         ctx.device
             .reset_fences(&[fence])
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsResetFencesRetire, e)))?;
@@ -2243,12 +2314,12 @@ impl ResourcePools {
         counters: &EngineCounters,
         fence: vk::Fence,
     ) -> Result<(), DrawError> {
-        if let Some(index) = self
+        let index = self
             .encoder
             .slots
             .iter()
-            .position(|slot| slot.fence == fence && slot.pending.is_some())
-        {
+            .position(|slot| slot.fence == fence && slot.pending.is_some());
+        if let Some(index) = index {
             self.await_submit_return(counters, index, DeviceLostOp::PoolsWaitFencesEntry)?;
         }
         if let Some(error) = ctx.queue_failure() {
@@ -2258,9 +2329,27 @@ impl ResourcePools {
                 DeviceLostOp::PoolsWaitFencesEntry,
             ));
         }
-        ctx.device
-            .wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS)
-            .map_err(|e| Self::wait_error(counters, e, DeviceLostOp::PoolsWaitFencesEntry))
+        Self::wait_fence_until_signaled(
+            ctx,
+            counters,
+            fence,
+            DeviceLostOp::PoolsWaitFencesEntry,
+            || {
+                let held = index
+                    .and_then(crate::gpu_hang_trail::submission)
+                    .map_or_else(|| "none".to_string(), |note| format!("{note}"));
+                reims_vgpu_observe::fail(format!(
+                    "vk_engine_fence_delayed reason=vk_engine_fence_delayed \
+                     slot={} deadline_ns={FENCE_TIMEOUT_NS} held={held}",
+                    index.map_or_else(|| "unknown".to_string(), |slot| slot.to_string())
+                ));
+                if let Some(rest) = crate::gpu_hang_trail::outstanding() {
+                    reims_vgpu_observe::fail(format!(
+                        "vk_engine_fence_delayed_queue reason=vk_engine_fence_delayed {rest}"
+                    ));
+                }
+            },
+        )
     }
 
     /// Record that the command buffer being built reads guest RAM when it
