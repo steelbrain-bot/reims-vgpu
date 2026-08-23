@@ -4,7 +4,7 @@ import IOSurface
 
 func blitAfterRenderCase(_ w: Int, _ h: Int) {
     let label = "srt_blit_after_render_\(w)x\(h)"
-    claims(label, "settle_gva_rect_read")
+    claims(label, "gva_store_sync")
     guard let pipe = makeRenderPipeline("heavy_fs", .bgra8Unorm_srgb) else {
         report(label, false, "heavy pipeline unavailable for bgra8Unorm_srgb"); return
     }
@@ -95,13 +95,11 @@ func blitAfterRenderCase(_ w: Int, _ h: Int) {
 // report names. Nothing is waited on until every frame has been committed.
 func blitPipelinedCase(_ w: Int, _ h: Int, frames: Int) {
     let label = "srt_blit_pipelined_\(w)x\(h)_x\(frames)"
-    // The rail this case exists for: a whole-plane texture copy whose host-side
-    // read of guest pages has to be ordered against renders this device has
-    // submitted and not yet executed. `settle_gva_rect_read_overlap` counts the
-    // reads that found an outstanding write reaching their own pages, so a run
-    // where it never moves did not put the case on this rail whatever it
-    // reported.
-    claims(label, "settle_gva_rect_read", "settle_gva_rect_read_overlap")
+    // The rail this case exists for: a copied GVA render target must be read
+    // from its resident allocation and published to guest pages before the
+    // following texture copy observes it. A run where `gva_store_sync` never
+    // moves did not put the case on that rail, whatever it reported.
+    claims(label, "gva_store_sync")
     guard let pipe = makeRenderPipeline("heavy_fs", .bgra8Unorm_srgb) else {
         report(label, false, "heavy pipeline unavailable for bgra8Unorm_srgb"); return
     }
