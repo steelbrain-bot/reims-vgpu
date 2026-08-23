@@ -3767,7 +3767,7 @@ fn resolved_render_barrier<M: HostMemory + HostOps>(
     task_id: u32,
     cmd: &render::Command,
 ) -> Result<Option<reims_vgpu_core::RenderBarrier>, RenderBarrierRefusal> {
-    use reims_vgpu_core::{RenderBarrier, RenderBarrierScope, RenderBarrierStages};
+    use reims_vgpu_core::{MemoryBarrierScope, RenderBarrier, RenderBarrierStages};
 
     if cmd.kind == RenderKind::TextureBarrier {
         return Ok(Some(RenderBarrier::Texture));
@@ -3819,7 +3819,7 @@ fn resolved_render_barrier<M: HostMemory + HostOps>(
                             index: index as u32,
                             object_ref: raw,
                         })?;
-                resources.push(reims_vgpu_core::RenderBarrierResource {
+                resources.push(reims_vgpu_core::BarrierResource {
                     id: semantic,
                     lifetime: resource.lifetime(),
                 });
@@ -3840,7 +3840,7 @@ fn resolved_render_barrier<M: HostMemory + HostOps>(
                     raw: cmd.barrier_unidentified_u8,
                 });
             }
-            let scope = RenderBarrierScope::from_bits(cmd.barrier_scope).ok_or(
+            let scope = MemoryBarrierScope::from_bits(u16::from(cmd.barrier_scope)).ok_or(
                 RenderBarrierRefusal::UnsupportedScope {
                     raw: cmd.barrier_scope,
                 },

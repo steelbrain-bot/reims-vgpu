@@ -6,11 +6,47 @@
 //! satisfied, or leave it pending. The planner owns no storage and performs no
 //! I/O; composition applies its result to the device-owned task namespace.
 
-use crate::ReferenceNamespace;
-use reims_vgpu_protocol::{EventObject, FenceObject, ResourceId, SerializerRef, TaskId};
+use crate::{ReferenceNamespace, ResourceLifetime};
+use reims_vgpu_protocol::{
+    EventObject, FenceObject, ResourceId, ResourceObject, SerializerRef, TaskId,
+};
 use std::collections::BTreeMap;
 
 pub const FENCE_INITIAL_GENERATION: u64 = 1;
+
+/// Resource classes covered by a Metal memory barrier.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryBarrierScope(u16);
+
+impl MemoryBarrierScope {
+    pub const BUFFERS: Self = Self(1);
+    pub const TEXTURES: Self = Self(2);
+    pub const RENDER_TARGETS: Self = Self(4);
+    pub const ALL: Self = Self(Self::BUFFERS.0 | Self::TEXTURES.0 | Self::RENDER_TARGETS.0);
+
+    pub fn from_bits(bits: u16) -> Option<Self> {
+        (bits & !Self::ALL.0 == 0).then_some(Self(bits))
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// Canonical identity and lifetime retained by a resource-list barrier.
+#[derive(Clone, Debug)]
+pub struct BarrierResource {
+    pub id: ResourceId<ResourceObject>,
+    pub lifetime: ResourceLifetime,
+}
+
+impl PartialEq for BarrierResource {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.lifetime.id() == other.lifetime.id()
+    }
+}
+
+impl Eq for BarrierResource {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[repr(u32)]

@@ -4205,7 +4205,7 @@ fn render_barriers_preserve_position_and_scope_while_residency_stays_a_noop() {
     assert_eq!(
         acc.render_work,
         [RenderWork::Barrier(reims_vgpu_core::RenderBarrier::Scope {
-            scope: reims_vgpu_core::RenderBarrierScope::RENDER_TARGETS,
+            scope: reims_vgpu_core::MemoryBarrierScope::RENDER_TARGETS,
             after: reims_vgpu_core::RenderBarrierStages::FRAGMENT,
             before: reims_vgpu_core::RenderBarrierStages::FRAGMENT,
         })]

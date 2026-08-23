@@ -41,25 +41,6 @@ impl RenderBarrierStages {
     }
 }
 
-/// Resource classes covered by a render memory barrier.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct RenderBarrierScope(u8);
-
-impl RenderBarrierScope {
-    pub const BUFFERS: Self = Self(1);
-    pub const TEXTURES: Self = Self(2);
-    pub const RENDER_TARGETS: Self = Self(4);
-    pub const ALL: Self = Self(Self::BUFFERS.0 | Self::TEXTURES.0 | Self::RENDER_TARGETS.0);
-
-    pub fn from_bits(bits: u8) -> Option<Self> {
-        (bits & !Self::ALL.0 == 0).then_some(Self(bits))
-    }
-
-    pub fn is_empty(self) -> bool {
-        self.0 == 0
-    }
-}
-
 /// One memory dependency declared between draws in a render encoder.
 ///
 /// Resource-list barriers carry canonical generational identities rather than
@@ -69,32 +50,17 @@ impl RenderBarrierScope {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RenderBarrier {
     Resources {
-        resources: Arc<[RenderBarrierResource]>,
+        resources: Arc<[crate::BarrierResource]>,
         after: RenderBarrierStages,
         before: RenderBarrierStages,
     },
     Scope {
-        scope: RenderBarrierScope,
+        scope: crate::MemoryBarrierScope,
         after: RenderBarrierStages,
         before: RenderBarrierStages,
     },
     Texture,
 }
-
-/// Canonical identity and lifetime retained by a resource-list barrier.
-#[derive(Clone, Debug)]
-pub struct RenderBarrierResource {
-    pub id: reims_vgpu_protocol::ResourceId<reims_vgpu_protocol::ResourceObject>,
-    pub lifetime: ResourceLifetime,
-}
-
-impl PartialEq for RenderBarrierResource {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id && self.lifetime.id() == other.lifetime.id()
-    }
-}
-
-impl Eq for RenderBarrierResource {}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DepthState {
@@ -884,10 +850,10 @@ mod thread_seam {
         );
         assert_eq!(super::RenderBarrierStages::from_bits(32), None);
         assert_eq!(
-            super::RenderBarrierScope::from_bits(7),
-            Some(super::RenderBarrierScope::ALL)
+            crate::MemoryBarrierScope::from_bits(7),
+            Some(crate::MemoryBarrierScope::ALL)
         );
-        assert_eq!(super::RenderBarrierScope::from_bits(8), None);
+        assert_eq!(crate::MemoryBarrierScope::from_bits(8), None);
     }
 
     #[test]
@@ -896,27 +862,27 @@ mod thread_seam {
 
         let first_lifetime = crate::ResourceLifetime::new();
         let second_lifetime = crate::ResourceLifetime::new();
-        let first = super::RenderBarrierResource {
+        let first = crate::BarrierResource {
             id: ResourceId::new(5, 1),
             lifetime: first_lifetime.clone(),
         };
         assert_eq!(
             first,
-            super::RenderBarrierResource {
+            crate::BarrierResource {
                 id: ResourceId::new(5, 1),
                 lifetime: first_lifetime,
             }
         );
         assert_ne!(
             first,
-            super::RenderBarrierResource {
+            crate::BarrierResource {
                 id: ResourceId::new(5, 2),
                 lifetime: second_lifetime.clone(),
             }
         );
         assert_ne!(
             first,
-            super::RenderBarrierResource {
+            crate::BarrierResource {
                 id: ResourceId::new(5, 1),
                 lifetime: second_lifetime,
             }

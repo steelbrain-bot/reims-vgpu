@@ -102,11 +102,11 @@ pub use render::{
     BlendStateResource, BufferContent, ColorLoadAction, CullMode, DepthAttachment, DepthClipMode,
     DepthState, DrawOutput, DrawRequest, FillMode, IndexType, IndexedDrawResource, LineWidth,
     PreparedRenderProgram, PreparedShaderStage, PrimitiveTopology, RenderBarrier,
-    RenderBarrierResource, RenderBarrierScope, RenderBarrierStages, RenderTargetExtent,
-    SampledByteOrigin, SampledContentIdentity, SampledImageResource, SampledSource,
-    ScissorResource, SecondaryColorTarget, SeedOrder, StencilAttachment, StencilFaceOps, StencilOp,
-    StencilState, StorageBufferResource, VertexAttributeFormat, VertexAttributeResource,
-    VertexStepFunction, ViewportResource, VisibilityResultMode,
+    RenderBarrierStages, RenderTargetExtent, SampledByteOrigin, SampledContentIdentity,
+    SampledImageResource, SampledSource, ScissorResource, SecondaryColorTarget, SeedOrder,
+    StencilAttachment, StencilFaceOps, StencilOp, StencilState, StorageBufferResource,
+    VertexAttributeFormat, VertexAttributeResource, VertexStepFunction, ViewportResource,
+    VisibilityResultMode,
 };
 pub use residency::{
     ComputeResidencyLedger, ComputeResidencyService, ComputeStorageOrigin,
@@ -131,9 +131,10 @@ pub use shader_interface::*;
 pub use stamp::{CompletionPublications, PendingStamp, StampLedger, StampWait, UnmetSource};
 pub use submission::{SubmissionContext, SubmissionTracker};
 pub use synchronization::{
-    plan_event, plan_fence, Decision as SynchronizationDecision, Domain as SynchronizationDomain,
-    EventKind, FenceAction, Plan as SynchronizationPlan, Reason as SynchronizationReason,
-    TaskEventStates, TaskFenceStates, TaskGenerationStates, FENCE_INITIAL_GENERATION,
+    plan_event, plan_fence, BarrierResource, Decision as SynchronizationDecision,
+    Domain as SynchronizationDomain, EventKind, FenceAction, MemoryBarrierScope,
+    Plan as SynchronizationPlan, Reason as SynchronizationReason, TaskEventStates, TaskFenceStates,
+    TaskGenerationStates, FENCE_INITIAL_GENERATION,
 };
 pub use target::{TargetIdentity, TargetKeyDivergence};
 pub use task::{TaskEntry, TaskTable};

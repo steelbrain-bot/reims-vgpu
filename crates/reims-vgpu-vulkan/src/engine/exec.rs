@@ -638,7 +638,7 @@ fn is_render_target_fragment_barrier(barrier: &reims_vgpu_core::RenderBarrier) -
     matches!(
         barrier,
         reims_vgpu_core::RenderBarrier::Scope { scope, after, before }
-            if *scope == reims_vgpu_core::RenderBarrierScope::RENDER_TARGETS
+            if *scope == reims_vgpu_core::MemoryBarrierScope::RENDER_TARGETS
                 && *after == reims_vgpu_core::RenderBarrierStages::FRAGMENT
                 && *before == reims_vgpu_core::RenderBarrierStages::FRAGMENT
     )
@@ -8226,12 +8226,12 @@ mod tests {
     #[test]
     fn only_the_exact_target_fragment_form_uses_the_narrow_dependency() {
         let exact = reims_vgpu_core::RenderBarrier::Scope {
-            scope: reims_vgpu_core::RenderBarrierScope::RENDER_TARGETS,
+            scope: reims_vgpu_core::MemoryBarrierScope::RENDER_TARGETS,
             after: reims_vgpu_core::RenderBarrierStages::FRAGMENT,
             before: reims_vgpu_core::RenderBarrierStages::FRAGMENT,
         };
         let wider = reims_vgpu_core::RenderBarrier::Scope {
-            scope: reims_vgpu_core::RenderBarrierScope::ALL,
+            scope: reims_vgpu_core::MemoryBarrierScope::ALL,
             after: reims_vgpu_core::RenderBarrierStages::FRAGMENT,
             before: reims_vgpu_core::RenderBarrierStages::FRAGMENT,
         };
