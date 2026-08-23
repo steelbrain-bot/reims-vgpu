@@ -6,7 +6,7 @@
 //! remaining accepted opcodes are recognized and returned as typed kinds with
 //! raw length validation where the contract specifies fixed sizes.
 
-use reims_vgpu_protocol::{HeapObject, ObjectTableRef, ResourceObject};
+use reims_vgpu_protocol::{HeapObject, ObjectTableRef, ResourceObject, SerializerRef};
 use reims_vgpu_wire::ops::render as wire;
 use reims_vgpu_wire::ops::render_pass as wire_pass;
 use reims_vgpu_wire::ops::tile as wire_tile;
@@ -688,7 +688,7 @@ pub struct Command {
     pub residency_resources: Vec<ObjectTableRef<ResourceObject>>,
     /// Heap declarations carried by [`Kind::UseHeap`]. Heap refs inhabit the
     /// serializer's heap namespace, not the task object-list namespace.
-    pub residency_heaps: Vec<ObjectTableRef<HeapObject>>,
+    pub residency_heaps: Vec<SerializerRef<HeapObject>>,
     /// Resource declarations carried by [`Kind::BarrierResources`].
     pub barrier_resources: Vec<ObjectTableRef<ResourceObject>>,
     /// Render stages whose accesses must complete before a barrier.
@@ -1470,7 +1470,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             }
             out.residency_heaps.extend(
                 refs.iter()
-                    .map(|reference| ObjectTableRef::new(reference.object_ref.get())),
+                    .map(|reference| SerializerRef::new(reference.object_ref.get())),
             );
             Ok(out)
         }
@@ -1509,7 +1509,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             }
             out.residency_heaps.extend(
                 refs.iter()
-                    .map(|reference| ObjectTableRef::new(reference.object_ref.get())),
+                    .map(|reference| SerializerRef::new(reference.object_ref.get())),
             );
             Ok(out)
         }

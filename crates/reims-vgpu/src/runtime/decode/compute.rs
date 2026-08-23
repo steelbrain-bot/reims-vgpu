@@ -1,7 +1,7 @@
 //! Compute command decoder (port of `host/utils/reims-vgpu-compute-decode`).
 
 use reims_vgpu_core::endian::ld32;
-use reims_vgpu_protocol::{HeapObject, ObjectTableRef, ResourceObject};
+use reims_vgpu_protocol::{HeapObject, ObjectTableRef, ResourceObject, SerializerRef};
 use reims_vgpu_wire::ops::compute as wire;
 
 /// Shared serializer op-header length from `reims-vgpu-wire`.
@@ -193,7 +193,7 @@ pub struct Command {
     pub textures: Vec<RefBinding>,
     pub samplers: Vec<SamplerBinding>,
     pub resources: Vec<ObjectTableRef<ResourceObject>>,
-    pub heaps: Vec<ObjectTableRef<HeapObject>>,
+    pub heaps: Vec<SerializerRef<HeapObject>>,
     pub grid: Size3,
     pub threads_per_threadgroup: Size3,
     pub indirect_buffer_ref: u32,
@@ -359,7 +359,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.count = count;
             for i in 0..count as usize {
                 out.heaps
-                    .push(ObjectTableRef::new(ld32(&payload[4 + i * REF_SIZE..])));
+                    .push(SerializerRef::new(ld32(&payload[4 + i * REF_SIZE..])));
             }
             Ok(out)
         }

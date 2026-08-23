@@ -1,8 +1,8 @@
 //! Semantic texture declarations and mapper-backed IOSurface views.
 
 use crate::{
-    HeapObject, MapperSurfaceRef, ObjectTableRef, PlaneIndex, ResourceDecodeError, ResourceObject,
-    SerializerRef, TextureRotation,
+    HeapObject, MapperSurfaceRef, PlaneIndex, ResourceDecodeError, ResourceObject, SerializerRef,
+    TextureRotation,
 };
 use reims_vgpu_wire::device_desc::{
     MapperIOSurfaceTextureError as WireMapperError, MapperIOSurfaceTextureOperation,
@@ -168,7 +168,7 @@ pub struct MapperIOSurfaceTextureView {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HeapTextureDescriptor {
     pub object: SerializerRef<ResourceObject>,
-    pub heap: ObjectTableRef<HeapObject>,
+    pub heap: SerializerRef<HeapObject>,
     pub declaration: TextureDeclaration,
     pub use_offset: bool,
     pub offset: u64,
@@ -193,7 +193,7 @@ pub fn decode_heap_texture_descriptor(
                 .map_err(|_| ResourceDecodeError::ErrShort("res_heap_texture_len"))?;
             Ok(HeapTextureDescriptor {
                 object: SerializerRef::new(body.object_ref.get()),
-                heap: ObjectTableRef::new(body.heap_ref.get()),
+                heap: SerializerRef::new(body.heap_ref.get()),
                 declaration: texture_declaration_from_narrow(&body.desc),
                 use_offset: body.use_offset(),
                 offset: body.offset.get(),
@@ -209,7 +209,7 @@ pub fn decode_heap_texture_descriptor(
                 .map_err(|_| ResourceDecodeError::ErrShort("res_heap_texture_len"))?;
             Ok(HeapTextureDescriptor {
                 object: SerializerRef::new(body.object_ref.get()),
-                heap: ObjectTableRef::new(body.heap_ref.get()),
+                heap: SerializerRef::new(body.heap_ref.get()),
                 declaration: texture_declaration_from_wide(&body.desc),
                 use_offset: body.use_offset(),
                 offset: body.offset.get(),
