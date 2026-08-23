@@ -4618,9 +4618,15 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
     // pending value will be written to.
     let stamp_index_slot = stamp_slot_index(stamp_index);
 
-    // Packets this wake consumes before the ring runs dry — the width any
-    // packet-level fan-out could use. See `census::note_tranche_width`.
+    // Packets this call consumes before it stops. The guest may publish more
+    // while the drain is running, so this is a throughput population rather
+    // than an initial-ready-width claim. `exec_run_packets` below isolates the
+    // consecutive command class a whole-submission fan-out could consume.
     let mut tranche_packets = 0u64;
+    // Whole EXEC submissions can fan out only across adjacent EXEC packets;
+    // a control/resource packet is an ordered boundary, even when the child
+    // FIFO as a whole was wide.
+    let mut exec_run_packets = 0u64;
 
     loop {
         let regs_started = std::time::Instant::now();
@@ -4742,6 +4748,12 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                     // outer pending-drain loop.
                     break;
                 }
+                if packet.opcode == CHILD_OP_EXEC_INDIRECT2 {
+                    exec_run_packets += 1;
+                } else {
+                    census::note_exec_run_width(exec_run_packets);
+                    exec_run_packets = 0;
+                }
                 head = packet.next_head;
                 tranche_packets += 1;
                 let head_started = std::time::Instant::now();
@@ -4820,6 +4832,7 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
         }
     }
 
+    census::note_exec_run_width(exec_run_packets);
     census::note_tranche_width(census::TrancheRing::Child, tranche_packets);
 
     // Every `break` above lands here, which is what makes one site enough: a

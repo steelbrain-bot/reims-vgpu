@@ -4142,7 +4142,7 @@ mod lookup_age_tests {
     }
 }
 
-/// How many packets one drain wake finds already published.
+/// How many packets one drain call consumes before it stops.
 ///
 /// # The question this answers
 ///
@@ -4152,11 +4152,12 @@ mod lookup_age_tests {
 /// resolver and a recorder cut apart at draw granularity must synchronise 6.4
 /// times a draw at 7.6 µs a time.
 ///
-/// A packet seam only pays if packets are *available* at once. The guest
-/// publishes into a head/tail ring and this device drains it until empty, so
-/// the number of packets standing in the ring when a wake begins is exactly the
-/// width any fan-out could use. One is no width at all, whatever the refactor
-/// costs.
+/// A packet seam only pays if packets are available together. The guest may
+/// publish more packets while this device is draining, so the child population
+/// is a throughput upper bound rather than an initial-tail snapshot. The
+/// separate `exec_run` population removes non-EXEC boundaries; a scheduler
+/// still has to measure readiness and resource dependencies before treating
+/// that run length as executable width.
 ///
 /// This is a count and a distribution, not a timing: it is read to size a
 /// design, and it must survive both host contention and the perturbation of
@@ -4199,15 +4200,22 @@ static TRANCHE: [TrancheCensus; 2] = [
     },
 ];
 
-/// Record that one drain wake consumed `packets` packets before the ring ran
-/// dry. A wake that found nothing is not a wake for this purpose — it says
-/// nothing about available width — so zero is dropped.
-pub fn note_tranche_width(ring: TrancheRing, packets: u64) {
+/// Consecutive successfully-consumed `EXEC_INDIRECT2` packets. Unlike the
+/// child tranche population, this excludes resource/control packets and splits
+/// at each non-EXEC opcode. It is the width a whole-submission encoder could
+/// actually consume without crossing another guest command class.
+static EXEC_RUN: TrancheCensus = TrancheCensus {
+    wakes: std::sync::atomic::AtomicU64::new(0),
+    packets: std::sync::atomic::AtomicU64::new(0),
+    max: std::sync::atomic::AtomicU64::new(0),
+    buckets: [const { std::sync::atomic::AtomicU64::new(0) }; 7],
+};
+
+fn note_width(c: &TrancheCensus, packets: u64) {
     use std::sync::atomic::Ordering;
     if packets == 0 {
         return;
     }
-    let c = &TRANCHE[ring as usize];
     c.wakes.fetch_add(1, Ordering::Relaxed);
     c.packets.fetch_add(packets, Ordering::Relaxed);
     c.max.fetch_max(packets, Ordering::Relaxed);
@@ -4223,6 +4231,17 @@ pub fn note_tranche_width(ring: TrancheRing, packets: u64) {
     c.buckets[bucket].fetch_add(1, Ordering::Relaxed);
 }
 
+/// Record that one drain wake consumed `packets` packets before the ring ran
+/// dry. A wake that found nothing is not a wake for this purpose — it says
+/// nothing about available width — so zero is dropped.
+pub fn note_tranche_width(ring: TrancheRing, packets: u64) {
+    note_width(&TRANCHE[ring as usize], packets);
+}
+
+pub fn note_exec_run_width(packets: u64) {
+    note_width(&EXEC_RUN, packets);
+}
+
 /// [`take_drain_tranche`] for the census's own test.
 #[cfg(test)]
 pub(super) fn take_drain_tranche_for_test(t_ms: u64) -> Vec<String> {
@@ -4233,7 +4252,11 @@ pub(super) fn take_drain_tranche_for_test(t_ms: u64) -> Vec<String> {
 fn take_drain_tranche(t_ms: u64) -> Vec<String> {
     use std::sync::atomic::Ordering;
     let mut lines = Vec::new();
-    for (ring, c) in [("root", &TRANCHE[0]), ("child", &TRANCHE[1])] {
+    for (ring, c) in [
+        ("root", &TRANCHE[0]),
+        ("child", &TRANCHE[1]),
+        ("exec_run", &EXEC_RUN),
+    ] {
         let wakes = c.wakes.swap(0, Ordering::Relaxed);
         if wakes == 0 {
             continue;
@@ -4245,8 +4268,9 @@ fn take_drain_tranche(t_ms: u64) -> Vec<String> {
             .iter()
             .map(|x| x.swap(0, Ordering::Relaxed).to_string())
             .collect();
+        let populations = if ring == "exec_run" { "runs" } else { "wakes" };
         lines.push(format!(
-            "drain_tranche t={t_ms} ring={ring} wakes={wakes} packets={packets} max={max} b1={} b2={} b4={} b8={} b16={} b32={} b64={}",
+            "drain_tranche t={t_ms} ring={ring} {populations}={wakes} packets={packets} max={max} b1={} b2={} b4={} b8={} b16={} b32={} b64={}",
             b[0], b[1], b[2], b[3], b[4], b[5], b[6]
         ));
     }

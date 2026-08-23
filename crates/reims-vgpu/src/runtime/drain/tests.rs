@@ -6713,7 +6713,7 @@ fn a_pending_stamp_discharges_a_wait_on_its_own_slot_and_no_other() {
 /// wrongly in the direction that reads as "there is no width here".
 #[test]
 fn the_tranche_census_buckets_by_width_and_separates_the_rings() {
-    use super::census::{note_tranche_width, TrancheRing};
+    use super::census::{note_exec_run_width, note_tranche_width, TrancheRing};
 
     // Drain anything another test in this binary left behind.
     let _ = super::census::take_drain_tranche_for_test(0);
@@ -6729,12 +6729,14 @@ fn the_tranche_census_buckets_by_width_and_separates_the_rings() {
         note_tranche_width(TrancheRing::Child, width);
     }
     note_tranche_width(TrancheRing::Root, 5);
+    note_exec_run_width(3);
+    note_exec_run_width(17);
 
     let lines = super::census::take_drain_tranche_for_test(9);
     assert_eq!(
         lines.len(),
-        2,
-        "one line per ring that saw a wake: {lines:?}"
+        3,
+        "one line per width population that saw work: {lines:?}"
     );
 
     let root = lines
@@ -6761,6 +6763,15 @@ fn the_tranche_census_buckets_by_width_and_separates_the_rings() {
     assert!(child.contains("b16=1"), "20: {child}");
     assert!(child.contains("b32=1"), "40: {child}");
     assert!(child.contains("b64=1"), "120: {child}");
+
+    let exec = lines
+        .iter()
+        .find(|l| l.contains("ring=exec_run"))
+        .expect("consecutive EXEC packets report separately");
+    assert!(exec.contains("runs=2"), "{exec}");
+    assert!(exec.contains("packets=20"), "{exec}");
+    assert!(exec.contains("b2=1"), "3: {exec}");
+    assert!(exec.contains("b16=1"), "17: {exec}");
 
     assert!(
         super::census::take_drain_tranche_for_test(10).is_empty(),
