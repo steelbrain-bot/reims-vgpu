@@ -5,6 +5,14 @@ use reims_vgpu_protocol::{SampledImageFormat, StorageImageFormat};
 pub use reims_vgpu_protocol::{
     SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter, SamplerMipFilter,
 };
+use std::sync::Arc;
+
+/// One memory dependency declared between dispatches in a compute encoder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ComputeBarrier {
+    Resources(Arc<[crate::BarrierResource]>),
+    Scope(crate::MemoryBarrierScope),
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct SamplerResource {
@@ -86,6 +94,8 @@ pub struct ComputeRequest {
     /// contract, and was silently unmet for as long as this field was the
     /// quotient alone.
     pub dispatch: reims_vgpu_protocol::dispatch::WorkgroupPlan,
+    /// Memory barriers immediately before this dispatch in encoder order.
+    pub barriers: Vec<ComputeBarrier>,
     pub storage_buffers: Vec<ComputeBufferResource>,
     pub sampled_images: Vec<ComputeSampledImageResource>,
     pub samplers: Vec<SamplerResource>,

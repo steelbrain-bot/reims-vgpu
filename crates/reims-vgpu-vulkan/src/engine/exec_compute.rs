@@ -1270,6 +1270,28 @@ pub(crate) unsafe fn execute_compute_inner(
         )?
     };
 
+    if let Some((src_stage, src_access, dst_stage, dst_access, dependency_flags)) =
+        compute_memory_barrier_dependency(&req.barriers)
+    {
+        // Compute barriers order prior dispatch work before every operation
+        // used to realize the following dispatch, including implementation
+        // uploads and copies. Exact resource/scope identity remains in the
+        // core request; this first native projection is deliberately global.
+        let barrier = [vk::MemoryBarrier::default()
+            .src_access_mask(src_access)
+            .dst_access_mask(dst_access)];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            src_stage,
+            dst_stage,
+            dependency_flags,
+            &barrier,
+            &[],
+            &[],
+        );
+        crate::telemetry::note_route_n("compute_barrier_recorded", req.barriers.len() as u64);
+    }
+
     let reads_imported_guest = storage_slots
         .iter()
         .any(|prepared| prepared.bound.guest_import)
@@ -1905,6 +1927,18 @@ pub(crate) unsafe fn execute_compute_inner(
     Ok(ComputeOutput { buffers, images })
 }
 
+fn compute_memory_barrier_dependency(
+    barriers: &[reims_vgpu_core::ComputeBarrier],
+) -> Option<(
+    vk::PipelineStageFlags,
+    vk::AccessFlags,
+    vk::PipelineStageFlags,
+    vk::AccessFlags,
+    vk::DependencyFlags,
+)> {
+    (!barriers.is_empty()).then(super::exec::generic_memory_barrier_dependency)
+}
+
 /// Copy a completely initialized mapped Vulkan output without first touching
 /// every destination page with a redundant zero fill. The caller supplies an
 /// exact readable `len`-byte mapping and the copy initializes the entire Vec
@@ -1924,6 +1958,25 @@ pub(super) unsafe fn copy_mapped_output(ptr: *const u8, len: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compute_requests_record_the_shared_memory_dependency_only_when_declared() {
+        assert!(compute_memory_barrier_dependency(&[]).is_none());
+
+        let barriers = [reims_vgpu_core::ComputeBarrier::Scope(
+            reims_vgpu_core::MemoryBarrierScope::BUFFERS,
+        )];
+        let (src_stage, src_access, dst_stage, dst_access, flags) =
+            compute_memory_barrier_dependency(&barriers).expect("declared dependency");
+        assert_eq!(src_stage, vk::PipelineStageFlags::ALL_COMMANDS);
+        assert_eq!(src_access, vk::AccessFlags::MEMORY_WRITE);
+        assert_eq!(dst_stage, vk::PipelineStageFlags::ALL_COMMANDS);
+        assert_eq!(
+            dst_access,
+            vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE
+        );
+        assert_eq!(flags, vk::DependencyFlags::empty());
+    }
     use crate::engine::{
         ComputeResidentSampleBind, ComputeSampledImageResource, ComputeStorageImageResource,
         SamplerResource, StorageImageFormat,

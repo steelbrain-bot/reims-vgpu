@@ -15,6 +15,33 @@ use reims_vgpu_core::endian::{st16, st32, st64};
 use reims_vgpu_protocol::pass_action::{MTL_LOAD_ACTION_CLEAR, MTL_STORE_ACTION_STORE};
 
 #[test]
+fn a_malformed_compute_barrier_blocks_the_later_dispatch() {
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut seg = crate::runtime::compute_session::ComputeSegment::default();
+
+    handle_compute_record(
+        &mut state,
+        &mut host,
+        1,
+        wire_compute::OPCODE_MEMORY_BARRIER_SCOPE,
+        &[0; 4],
+        &mut out,
+        &mut seg,
+    );
+
+    let mut dispatch = crate::runtime::decode::compute::Command::default();
+    dispatch.kind = ComputeKind::DispatchThreadgroups;
+    assert_eq!(
+        compute_exec::apply_record(&mut state, &mut host, 1, &dispatch, &mut seg),
+        Some(ComputeStatus::Unsupported(
+            "compute_barrier_decode_malformed"
+        ))
+    );
+}
+
+#[test]
 fn render_pass_chain_edges_follow_the_decoded_encoder() {
     assert_eq!(render_pass_chain_position(0, 1), (false, false));
     assert_eq!(render_pass_chain_position(0, 3), (false, true));

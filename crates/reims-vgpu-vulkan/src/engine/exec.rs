@@ -646,7 +646,7 @@ fn is_render_target_fragment_barrier(barrier: &reims_vgpu_core::RenderBarrier) -
 
 /// Conservative native realization for every admitted render barrier whose
 /// exact Vulkan resource/stage projection is not yet narrower.
-fn generic_render_barrier_dependency() -> (
+pub(super) fn generic_memory_barrier_dependency() -> (
     vk::PipelineStageFlags,
     vk::AccessFlags,
     vk::PipelineStageFlags,
@@ -5660,7 +5660,7 @@ pub(crate) unsafe fn execute_draw_inner(
             if exact_target_fragment {
                 render_target_fragment_dependency()
             } else {
-                generic_render_barrier_dependency()
+                generic_memory_barrier_dependency()
             };
         let barrier = [vk::MemoryBarrier::default()
             .src_access_mask(src_access)
@@ -8200,7 +8200,7 @@ mod tests {
     #[test]
     fn generic_render_barriers_use_a_global_read_write_dependency() {
         let (src_stage, src_access, dst_stage, dst_access, dependency_flags) =
-            generic_render_barrier_dependency();
+            generic_memory_barrier_dependency();
         assert_eq!(src_stage, vk::PipelineStageFlags::ALL_COMMANDS);
         assert_eq!(src_access, vk::AccessFlags::MEMORY_WRITE);
         assert_eq!(dst_stage, vk::PipelineStageFlags::ALL_COMMANDS);

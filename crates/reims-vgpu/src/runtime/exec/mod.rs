@@ -1872,6 +1872,7 @@ fn handle_compute_record<M: HostMemory + HostOps>(
         Ok(c) => c,
         // Same silent drop as the render path above.
         Err(status) => {
+            compute_exec::latch_malformed_compute_barrier(opcode, seg);
             if let Some(e) = crate::observe::Emit::refusal("compute_decode", &status) {
                 // Latched per (reason, opcode): the guest re-encodes the same
                 // stream every frame, so an unclassified opcode would arrive

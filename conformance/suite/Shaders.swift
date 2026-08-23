@@ -122,6 +122,31 @@ kernel void grid_bounds(device uint *out [[buffer(0)]],
     out[gid.y * stride + gid.x] = 1u + gid.x;
 }
 
+// Two dispatches in a concurrent compute encoder have no implicit dependency.
+// Each thread owns one word, so the explicit barrier is the only ordering term
+// and neither kernel relies on atomics or a cross-thread race.
+static uint compute_barrier_value(uint token, uint gid) {
+    uint value = token ^ gid;
+    for (uint i = 0; i < 512; ++i) {
+        value = value * 1664525u + 1013904223u;
+        value ^= value >> ((i & 7u) + 1u);
+    }
+    return value;
+}
+
+kernel void compute_barrier_write(device uint *words [[buffer(0)]],
+                                  constant uint &token [[buffer(1)]],
+                                  uint gid [[thread_position_in_grid]]) {
+    words[gid] = compute_barrier_value(token, gid);
+}
+
+kernel void compute_barrier_read(device const uint *words [[buffer(0)]],
+                                 device uint *verdict [[buffer(1)]],
+                                 constant uint &token [[buffer(2)]],
+                                 uint gid [[thread_position_in_grid]]) {
+    verdict[gid] = words[gid] == compute_barrier_value(token, gid) ? 1u : 0u;
+}
+
 struct VOut { float4 pos [[position]]; float2 uv; };
 
 // A full-target triangle strip driven from a vertex buffer the test owns, so a

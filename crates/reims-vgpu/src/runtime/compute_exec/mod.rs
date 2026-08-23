@@ -14,7 +14,8 @@
 //!
 //! Fences use the stream walk (`fence_exec`). Control-flow (`0xdc`–`0xe2`) and
 //! ICB execution (`0xe4`/`0xe5`) are decoded but return typed unsupported
-//! refusals. Barriers and compressed-texture flush are ordered no-ops.
+//! refusals. Memory barriers are resolved into the next dispatch; compressed
+//! texture flush remains an ordered no-op.
 //!
 //! Direct dispatch uses the Vulkan engine. Buffer and storage-image writeback
 //! is staged through GVA or IOSurface texture mappings.
@@ -476,6 +477,62 @@ pub enum ComputeStatus {
     Unsupported(&'static str),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ComputeBarrierRefusal {
+    DecodeMalformed { opcode: u32 },
+    ScopeUnsupported { raw: u16 },
+    ResourceUnavailable { index: u32, object_ref: u32 },
+}
+
+impl ComputeBarrierRefusal {
+    fn latch(self) -> u64 {
+        match self {
+            Self::DecodeMalformed { opcode } => (2 << 60) | u64::from(opcode),
+            Self::ScopeUnsupported { raw } => u64::from(raw),
+            Self::ResourceUnavailable { index, object_ref } => {
+                (1 << 63) | (u64::from(index) << 32) | u64::from(object_ref)
+            }
+        }
+    }
+}
+
+impl crate::observe::Decline for ComputeBarrierRefusal {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::DecodeMalformed { .. } => "compute_barrier_decode_malformed",
+            Self::ScopeUnsupported { .. } => "compute_barrier_scope_unsupported",
+            Self::ResourceUnavailable { .. } => "compute_barrier_resource_unavailable",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::DecodeMalformed { opcode } => vec![("opcode", format!("{opcode:#x}"))],
+            Self::ScopeUnsupported { raw } => vec![("raw", raw.to_string())],
+            Self::ResourceUnavailable { index, object_ref } => vec![
+                ("index", index.to_string()),
+                ("object_ref", format!("{object_ref:#x}")),
+            ],
+        }
+    }
+}
+
+pub(crate) fn latch_malformed_compute_barrier(
+    opcode: u32,
+    seg: &mut crate::runtime::compute_session::ComputeSegment,
+) -> bool {
+    if !matches!(
+        opcode,
+        reims_vgpu_wire::ops::compute::OPCODE_MEMORY_BARRIER_RESOURCES
+            | reims_vgpu_wire::ops::compute::OPCODE_MEMORY_BARRIER_SCOPE
+    ) {
+        return false;
+    }
+    seg.barrier_block
+        .get_or_insert(ComputeBarrierRefusal::DecodeMalformed { opcode });
+    true
+}
+
 impl crate::observe::Refusal for ComputeStatus {
     fn refusal(&self) -> Option<&'static str> {
         match self {
@@ -650,6 +707,70 @@ fn accepted_dispatch_type(task_id: u32, declared: u32) -> u32 {
     MTL_DISPATCH_TYPE_SERIAL
 }
 
+fn resolved_compute_barrier<M: HostMemory + HostOps>(
+    state: &Device,
+    host: &M,
+    task_id: u32,
+    cmd: &ComputeCommand,
+) -> Result<Option<reims_vgpu_core::ComputeBarrier>, ComputeBarrierRefusal> {
+    match cmd.kind {
+        Kind::BarrierResources => {
+            let mut resources = Vec::with_capacity(cmd.resources.len());
+            for (index, object_ref) in cmd.resources.iter().enumerate() {
+                let raw = object_ref.get();
+                let resource =
+                    objects::resolve_resource(state, host, task_id, raw).map_err(|_| {
+                        ComputeBarrierRefusal::ResourceUnavailable {
+                            index: index as u32,
+                            object_ref: raw,
+                        }
+                    })?;
+                let id =
+                    resource
+                        .semantic_id()
+                        .ok_or(ComputeBarrierRefusal::ResourceUnavailable {
+                            index: index as u32,
+                            object_ref: raw,
+                        })?;
+                resources.push(reims_vgpu_core::BarrierResource {
+                    id,
+                    lifetime: resource.lifetime(),
+                });
+            }
+            if resources.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(reims_vgpu_core::ComputeBarrier::Resources(
+                    resources.into(),
+                )))
+            }
+        }
+        Kind::BarrierScope => {
+            let scope = reims_vgpu_core::MemoryBarrierScope::from_bits(cmd.barrier_scope).ok_or(
+                ComputeBarrierRefusal::ScopeUnsupported {
+                    raw: cmd.barrier_scope,
+                },
+            )?;
+            if scope.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(reims_vgpu_core::ComputeBarrier::Scope(scope)))
+            }
+        }
+        _ => unreachable!("compute barrier kind checked by caller"),
+    }
+}
+
+fn retire_pending_compute_barriers(
+    status: ComputeStatus,
+    pending: &mut Vec<reims_vgpu_core::ComputeBarrier>,
+) -> ComputeStatus {
+    if status == ComputeStatus::Ok {
+        pending.clear();
+    }
+    status
+}
+
 fn apply_record_inner<M: HostMemory + HostOps>(
     state: &mut Device,
     host: &mut M,
@@ -725,44 +846,29 @@ fn apply_record_inner<M: HostMemory + HostOps>(
             if seg.block.is_some() {
                 return Some(ComputeStatus::Unsupported("dispatch_in_sequencing_block"));
             }
+            if let Some(refusal) = seg.barrier_block {
+                return Some(ComputeStatus::Unsupported(crate::observe::Decline::slug(
+                    &refusal,
+                )));
+            }
             // Open multi-record session (control-flow SPI): encode on that encoder.
             if let Some(sess) = seg.session.as_mut() {
                 return Some(execute_dispatch_nested(
                     state, host, task_id, &seg.acc, cmd, sess,
                 ));
             }
-            Some(execute_dispatch(state, host, task_id, &seg.acc, cmd))
+            let status =
+                execute_dispatch(state, host, task_id, &seg.acc, cmd, &seg.pending_barriers);
+            Some(retire_pending_compute_barriers(
+                status,
+                &mut seg.pending_barriers,
+            ))
         }
-        // Five kinds the product answers by doing nothing, each counted
+        // Three kinds the product answers by doing nothing, each counted
         // separately. `None` here is also what every state-accumulating record
         // above returns, so a no-op and a drop are the same silence — and these
         // are the records where the difference matters, because unlike a
         // `BufferBind` they carry ordering the guest expects us to honour.
-        //
-        // The barrier group is a deliberate no-op and the reason is structural:
-        // the product submits one dispatch at a time and waits, so every
-        // resource and scope barrier the guest asks for is already implied by
-        // the boundary between two records. `UseHeaps`/`UseResources` are
-        // residency hints for a driver that pages resources; we resolve every
-        // binding per dispatch, so there is nothing for them to keep resident.
-        // These counters exist to price that argument, not to doubt it — if
-        // they are large, the per-record submit is what they are the cost of.
-        //
-        // That argument is load-bearing in a way it did not look, and the
-        // capture now says how much traffic rests on it. Under
-        // `-setSupportsComputePassDescriptorDispatchType:` Apple's serializer
-        // emits a scope barrier — `0xd7`, `Buffers|Textures` — after **every**
-        // dispatch and every ICB execution of a serial pass, measured on all six
-        // selectors (`reims_vgpu_wire::ops::compute::OPCODE_MEMORY_BARRIER_SCOPE`, and
-        // `reims_vgpu_wire::ops::compute::MemoryBarrierScope` carries the
-        // derivation). So a guest that negotiates that flag doubles this rail's
-        // record count and every second record lands here. The no-op stays
-        // right, and on the Vulkan arm it is stronger than "pass granularity":
-        // executor compute validation begins,
-        // ends and submits one command buffer per dispatch, so consecutive
-        // dispatches are separated by a queue submission rather than by a
-        // barrier inside one. `compute_noop_barrier` reading high is that
-        // capability being on, not a defect.
         //
         // The fence pair has no such argument and never had one; it sat in the
         // barrier group's arm without sharing its comment. An `MTLFence` update
@@ -780,7 +886,19 @@ fn apply_record_inner<M: HostMemory + HostOps>(
             None
         }
         Kind::BarrierResources | Kind::BarrierScope => {
-            crate::runtime::drain::note_store_route("compute_noop_barrier");
+            match resolved_compute_barrier(state, host, task_id, cmd) {
+                Ok(Some(barrier)) => {
+                    seg.pending_barriers.push(barrier);
+                    crate::runtime::drain::note_store_route("compute_barrier_pending");
+                }
+                Ok(None) => crate::runtime::drain::note_store_route("compute_barrier_empty"),
+                Err(refusal) => {
+                    crate::observe::Emit::decline("compute_barrier", &refusal)
+                        .field("task", task_id)
+                        .fail_once(refusal.latch());
+                    seg.barrier_block.get_or_insert(refusal);
+                }
+            }
             None
         }
         Kind::UseHeaps | Kind::UseResources => {
@@ -2890,8 +3008,7 @@ fn stage_linear_placement<M: HostMemory + HostOps>(
             .resources
             .get(task_id, texture_ref)
             .is_some_and(|resource| resource.was_render_target()),
-    )
-    {
+    ) {
         u32::try_from(row_stride).ok().and_then(|row_stride| {
             crate::runtime::draw::compute_gva_resident_sample(
                 state,
@@ -3601,9 +3718,10 @@ pub fn execute_dispatch<M: HostMemory + HostOps>(
     task_id: u32,
     acc: &ComputeAccum,
     cmd: &ComputeCommand,
+    barriers: &[reims_vgpu_core::ComputeBarrier],
 ) -> ComputeStatus {
     {
-        execute_dispatch_linux(state, host, task_id, acc, cmd)
+        execute_dispatch_linux(state, host, task_id, acc, cmd, barriers)
     }
 }
 
@@ -3791,6 +3909,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     task_id: u32,
     acc: &ComputeAccum,
     cmd: &ComputeCommand,
+    barriers: &[reims_vgpu_core::ComputeBarrier],
 ) -> ComputeStatus {
     use crate::runtime::executor::DrawError;
     use reims_vgpu_core::{
@@ -4434,6 +4553,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         program: prepared_program.stage.clone(),
         entry: "main".into(),
         dispatch: plan,
+        barriers: barriers.to_vec(),
         storage_buffers,
         sampled_images,
         samplers,

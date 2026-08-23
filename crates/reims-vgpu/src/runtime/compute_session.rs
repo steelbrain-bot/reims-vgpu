@@ -89,6 +89,10 @@ pub struct ComputeSegment {
     pub session: Option<ComputeSession>,
     /// Latched sequencing failure; once set it refuses later dispatches.
     pub block: Option<SequencingBlock>,
+    /// Resolved memory dependencies waiting for the next accepted dispatch.
+    pub(crate) pending_barriers: Vec<reims_vgpu_core::ComputeBarrier>,
+    /// A malformed barrier cannot be skipped to execute later work unordered.
+    pub(crate) barrier_block: Option<crate::runtime::compute_exec::ComputeBarrierRefusal>,
 }
 
 pub fn ensure_session(

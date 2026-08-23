@@ -89,6 +89,9 @@ CASE fb_offset_0 PASS slot 0 at offset 0 reached the fragment stage
 CASE fb_offset_256 PASS slot 1 at offset 256 reached the fragment stage
 CASE fb_offset_512 PASS slot 2 at offset 512 reached the fragment stage
 CASE fb_rebound_between_draws PASS each draw read the offset bound before it
+CASE render_barrier_resource_fragment PASS 8 alternating producer/consumer rounds were visible
+CASE compute_barrier_resource PASS 8 alternating concurrent producer/consumer rounds were visible
+CASE compute_barrier_scope_buffers PASS 8 alternating concurrent producer/consumer rounds were visible
 CASE ebl_same_bind_second_encoder PASS the binding re-issued on the second encoder is the one that drew
 CASE ebl_changed_bind_second_encoder PASS the binding re-issued on the second encoder is the one that drew
 CASE ebl_same_bind_second_command_buffer PASS the binding re-issued on the second encoder is the one that drew
@@ -243,5 +246,5 @@ ROUTE srt_blit_iosurface_source_1920x1080_x4 sl_gpu_src_via_surface
 ROUTE srt_blit_iosurface_source_1920x1080_x4 sl_gpu_landed
 CASE srt_blit_iosurface_source_1920x1080_x4 PASS every surface-to-surface copy moved its own frame's pixels
 CASE srt_blit_buffer_backed_512x512 PASS the copy out of a buffer-backed source moved what the render had written
-SUMMARY cases=237 failures=0 skipped=0
+SUMMARY cases=240 failures=0 skipped=0
 DEVICE name=Apple M4 unified=true

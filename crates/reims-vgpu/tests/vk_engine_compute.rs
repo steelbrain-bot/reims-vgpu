@@ -338,6 +338,7 @@ fn compute_inc_ssbo_known_result() {
         program: prepare_test_program(words),
         entry: "main".into(),
         dispatch: whole_workgroups([grid, 1, 1], [64, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             backing: ComputeBufferBacking::Bytes(input),
@@ -383,6 +384,7 @@ fn compute_writable_guest_ssbo_lands_in_place() {
         program: prepare_test_program(words.clone()),
         entry: "main".into(),
         dispatch: whole_workgroups([1, 1, 1], [1, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             backing: ComputeBufferBacking::Bytes(10.0f32.to_le_bytes().to_vec()),
@@ -448,6 +450,7 @@ fn compute_writable_guest_ssbo_lands_in_place() {
         program: prepare_test_program(words),
         entry: "main".into(),
         dispatch: whole_workgroups([(n as u32).div_ceil(64), 1, 1], [64, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             backing: ComputeBufferBacking::GuestPages {
@@ -511,6 +514,7 @@ fn compute_readonly_ssbo_has_zero_readback() {
         program: prepare_test_program(words),
         entry: "main".into(),
         dispatch: whole_workgroups([1, 1, 1], [1, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             backing: ComputeBufferBacking::Bytes(0x1234_5678u32.to_le_bytes().to_vec()),
@@ -587,6 +591,7 @@ fn compute_2d_grid_tiles_global_invocation_xy() {
         program: prepare_test_program(words.clone()),
         entry: "main".into(),
         dispatch: whole_workgroups([8, 8, 1], [1, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             backing: ComputeBufferBacking::Bytes(zeros.clone()),
@@ -632,6 +637,7 @@ fn compute_storage_image_rgba8unorm_known_result() {
         program: prepare_test_program(words.clone()),
         entry: "main".into(),
         dispatch: whole_workgroups([w, h, 1], [1, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
@@ -680,6 +686,7 @@ fn compute_storage_image_rgba8unorm_known_result() {
         program: prepare_test_program(words.clone()),
         entry: "main".into(),
         dispatch: whole_workgroups([w, h, 1], [1, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
@@ -718,6 +725,7 @@ fn compute_storage_image_rgba8unorm_known_result() {
         program: prepare_test_program(words),
         entry: "main".into(),
         dispatch: whole_workgroups([1, 1, 1], [1, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
@@ -802,6 +810,7 @@ fn every_admitted_compute_storage_resident_survives_past_the_retired_slot_cap() 
         program: prepare_test_program(words.clone()),
         entry: "main".into(),
         dispatch: whole_workgroups([w, h, 1], [1, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
@@ -891,6 +900,7 @@ fn compute_storage_image_bgra8unorm_is_not_channel_swapped() {
         program: prepare_test_program(words),
         entry: "main".into(),
         dispatch: whole_workgroups([w, h, 1], [1, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
@@ -950,6 +960,7 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
             program: prepare_test_program(words.clone()),
             entry: "main".into(),
             dispatch: whole_workgroups(grid, [1, 1, 1]),
+            barriers: Vec::new(),
             storage_buffers: vec![],
             sampled_images: vec![],
             samplers: vec![],
@@ -1043,6 +1054,7 @@ fn compute_sampled_resident_direct_bind_and_lost_resident() {
         program: prepare_test_program(fill_words),
         entry: "main".into(),
         dispatch: whole_workgroups([w, h, 1], [1, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
@@ -1075,6 +1087,7 @@ fn compute_sampled_resident_direct_bind_and_lost_resident() {
         program: prepare_test_program(fetch_words.clone()),
         entry: "main".into(),
         dispatch: whole_workgroups([1, 1, 1], [1, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             backing: ComputeBufferBacking::Bytes(vec![0; 16]),
@@ -1165,6 +1178,7 @@ fn compute_sampled_and_storage_bindings_preserve_one_resident_identity() {
         program: prepare_test_program(fill_words),
         entry: "main".into(),
         dispatch: whole_workgroups([1, 1, 1], [1, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
@@ -1193,6 +1207,7 @@ fn compute_sampled_and_storage_bindings_preserve_one_resident_identity() {
         program: prepare_test_program(alias_words),
         entry: "main".into(),
         dispatch: whole_workgroups([1, 1, 1], [1, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![],
         sampled_images: vec![ComputeSampledImageResource {
             binding: 32,
@@ -1252,6 +1267,7 @@ fn compute_sampled_image_fetch_preserves_float_bits() {
         program: prepare_test_program(words),
         entry: "main".into(),
         dispatch: whole_workgroups([1, 1, 1], [1, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             backing: ComputeBufferBacking::Bytes(vec![0; 16]),
@@ -1370,6 +1386,7 @@ fn compute_m2v_float_mul4_add3_known_result() {
         // grid, and naming `[1, 1, 1]` here leaves 63 of the 64 threads
         // culled and the buffer untouched.
         dispatch: whole_workgroups([grid, 1, 1], [64, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             backing: ComputeBufferBacking::Bytes(input),
@@ -1404,6 +1421,7 @@ fn warm_identical_dispatch_zero_creates_and_allocs() {
         program: prepare_test_program(words.clone()),
         entry: "main".into(),
         dispatch: whole_workgroups([1, 1, 1], [1, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             backing: ComputeBufferBacking::Bytes(input.clone()),
@@ -1491,6 +1509,7 @@ fn compute_storage_image_r16float_if_supported() {
         program: prepare_test_program(words),
         entry: "main".into(),
         dispatch: whole_workgroups([2, 2, 1], [1, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
@@ -1592,6 +1611,7 @@ fn a_short_bind_cannot_read_the_tail_of_the_slot_it_was_given() {
         program: prepare_test_program(words.clone()),
         entry: "main".into(),
         dispatch: whole_workgroups([1, 1, 1], [1, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             backing: ComputeBufferBacking::Bytes(bytes),

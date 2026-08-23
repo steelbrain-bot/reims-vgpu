@@ -25,6 +25,141 @@ use reims_vgpu_paging::geometry::{
 };
 use reims_vgpu_wire::device_desc::IOSurfacePlaneViewBuilder;
 
+fn barrier_test_resource(
+    kind: reims_vgpu_protocol::ObjectKind,
+) -> std::sync::Arc<crate::model::TaskResource> {
+    std::sync::Arc::new(crate::model::TaskResource::new(
+        crate::runtime::decode::resource::ListObjectEntry::new(kind, 0, 0),
+        std::sync::Arc::from(Vec::<u8>::new()),
+    ))
+}
+
+#[test]
+fn compute_barriers_preserve_scope_resource_generation_and_lifetime() {
+    let state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+
+    let mut scope = ComputeCommand::default();
+    scope.kind = Kind::BarrierScope;
+    scope.barrier_scope = 3;
+    assert_eq!(
+        resolved_compute_barrier(&state, &host, 1, &scope),
+        Ok(Some(reims_vgpu_core::ComputeBarrier::Scope(
+            reims_vgpu_core::MemoryBarrierScope::from_bits(3).unwrap(),
+        )))
+    );
+
+    let first = state.task_objects.resources.register(
+        1,
+        9,
+        barrier_test_resource(reims_vgpu_protocol::ObjectKind::Buffer),
+    );
+    let mut resources = ComputeCommand::default();
+    resources.kind = Kind::BarrierResources;
+    resources.resources = vec![reims_vgpu_protocol::ObjectTableRef::new(9)];
+    let first_barrier = resolved_compute_barrier(&state, &host, 1, &resources)
+        .expect("resource-list barrier resolves")
+        .expect("nonempty resource list");
+    let reims_vgpu_core::ComputeBarrier::Resources(first_resources) = first_barrier else {
+        panic!("resource-list barrier changed kind")
+    };
+    assert_eq!(first_resources[0].id, first.semantic_id().unwrap());
+    assert_eq!(first_resources[0].lifetime.id(), first.lifetime().id());
+
+    assert!(state.task_objects.resources.delete(1, 9));
+    let replacement = state.task_objects.resources.register(
+        1,
+        9,
+        barrier_test_resource(reims_vgpu_protocol::ObjectKind::Buffer),
+    );
+    let replacement_barrier = resolved_compute_barrier(&state, &host, 1, &resources)
+        .expect("replacement resource resolves")
+        .expect("nonempty resource list");
+    let reims_vgpu_core::ComputeBarrier::Resources(replacement_resources) = replacement_barrier
+    else {
+        panic!("resource-list barrier changed kind")
+    };
+    assert_eq!(
+        replacement_resources[0].id,
+        replacement.semantic_id().unwrap()
+    );
+    assert_ne!(first_resources[0].id, replacement_resources[0].id);
+    assert_ne!(
+        first_resources[0].lifetime.id(),
+        replacement_resources[0].lifetime.id()
+    );
+
+    resources.resources = vec![reims_vgpu_protocol::ObjectTableRef::new(99)];
+    assert_eq!(
+        resolved_compute_barrier(&state, &host, 1, &resources),
+        Err(ComputeBarrierRefusal::ResourceUnavailable {
+            index: 0,
+            object_ref: 99,
+        })
+    );
+
+    resources.resources.clear();
+    assert_eq!(
+        resolved_compute_barrier(&state, &host, 1, &resources),
+        Ok(None)
+    );
+}
+
+#[test]
+fn compute_barriers_fail_visible_and_survive_a_refused_dispatch() {
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let mut seg = crate::runtime::compute_session::ComputeSegment::default();
+
+    let mut barrier = ComputeCommand::default();
+    barrier.kind = Kind::BarrierScope;
+    barrier.barrier_scope = 1;
+    assert_eq!(
+        apply_record(&mut state, &mut host, 1, &barrier, &mut seg),
+        None
+    );
+    assert_eq!(seg.pending_barriers.len(), 1);
+    barrier.barrier_scope = 2;
+    assert_eq!(
+        apply_record(&mut state, &mut host, 1, &barrier, &mut seg),
+        None
+    );
+    assert_eq!(
+        seg.pending_barriers,
+        vec![
+            reims_vgpu_core::ComputeBarrier::Scope(reims_vgpu_core::MemoryBarrierScope::BUFFERS),
+            reims_vgpu_core::ComputeBarrier::Scope(reims_vgpu_core::MemoryBarrierScope::TEXTURES),
+        ]
+    );
+
+    let mut dispatch = ComputeCommand::default();
+    dispatch.kind = Kind::DispatchThreadgroups;
+    dispatch.grid = compute::Size3 { x: 1, y: 1, z: 1 };
+    dispatch.threads_per_threadgroup = compute::Size3 { x: 1, y: 1, z: 1 };
+    assert!(matches!(
+        apply_record(&mut state, &mut host, 1, &dispatch, &mut seg),
+        Some(ComputeStatus::MissingPipeline(_))
+    ));
+    assert_eq!(seg.pending_barriers.len(), 2);
+    assert_eq!(
+        retire_pending_compute_barriers(ComputeStatus::Ok, &mut seg.pending_barriers),
+        ComputeStatus::Ok
+    );
+    assert!(seg.pending_barriers.is_empty());
+
+    barrier.barrier_scope = 8;
+    assert_eq!(
+        apply_record(&mut state, &mut host, 1, &barrier, &mut seg),
+        None
+    );
+    assert_eq!(
+        apply_record(&mut state, &mut host, 1, &dispatch, &mut seg),
+        Some(ComputeStatus::Unsupported(
+            "compute_barrier_scope_unsupported"
+        ))
+    );
+}
+
 /// A whole-workgroup dispatch of `counts` groups of `local` threads.
 ///
 /// Fixtures here name workgroup counts, because that is what they dispatch.
@@ -452,8 +587,7 @@ fn accum_stage_in_tg_imageblock_and_control_fail_closed() {
     let mut host = FakeHost::new();
     let mut seg = crate::runtime::compute_session::ComputeSegment {
         acc,
-        session: None,
-        block: None,
+        ..Default::default()
     };
     let mut cmd = ComputeCommand::default();
     // Empty start-do-while encodes without a condition buffer.
@@ -853,7 +987,7 @@ fn dispatch_missing_pipeline() {
     cmd.kind = Kind::DispatchThreadgroups;
     cmd.grid = compute::Size3 { x: 1, y: 1, z: 1 };
     cmd.threads_per_threadgroup = compute::Size3 { x: 1, y: 1, z: 1 };
-    let st = execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
+    let st = execute_dispatch(&mut state, &mut host, 1, &acc, &cmd, &[]);
     // The slug names *which* pipeline check refused, and it differs by
     // backend: both arms open with `pipeline_ref == 0`, and before the
     // status carried a reason the two were indistinguishable in the log.
@@ -891,7 +1025,7 @@ fn dispatch_backend_unavailable_with_texture_binds() {
         z: 1,
     };
     cmd.threads_per_threadgroup = compute::Size3 { x: 32, y: 0, z: 1 };
-    let st = execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
+    let st = execute_dispatch(&mut state, &mut host, 1, &acc, &cmd, &[]);
     assert!(
         matches!(
             st,
@@ -923,7 +1057,7 @@ fn dispatch_missing_pipeline_not_backend_unavailable() {
     cmd.kind = Kind::DispatchThreadgroups;
     cmd.grid = compute::Size3 { x: 1, y: 1, z: 1 };
     cmd.threads_per_threadgroup = compute::Size3 { x: 1, y: 1, z: 1 };
-    let st = execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
+    let st = execute_dispatch(&mut state, &mut host, 1, &acc, &cmd, &[]);
     assert_eq!(
         st,
         ComputeStatus::MissingPipeline("compute_vk_pipeline_ref_zero")
@@ -1175,7 +1309,7 @@ fn dispatch_buffer_kernel_mul3add1() {
     cmd.kind = Kind::DispatchThreadgroups;
     cmd.grid = compute::Size3 { x: 1, y: 1, z: 1 };
     cmd.threads_per_threadgroup = compute::Size3 { x: 4, y: 1, z: 1 };
-    let st = execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
+    let st = execute_dispatch(&mut state, &mut host, 1, &acc, &cmd, &[]);
     assert!(
         matches!(
             st,
@@ -1229,7 +1363,7 @@ fn dispatch_missing_texture_fails() {
     cmd.grid = compute::Size3 { x: 1, y: 1, z: 1 };
     cmd.threads_per_threadgroup = compute::Size3 { x: 1, y: 1, z: 1 };
     // Missing pipeline object → MissingPipeline before texture stage.
-    let st = execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
+    let st = execute_dispatch(&mut state, &mut host, 1, &acc, &cmd, &[]);
     assert!(matches!(
         st,
         ComputeStatus::MissingPipeline(_)

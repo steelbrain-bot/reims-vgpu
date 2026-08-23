@@ -69,6 +69,8 @@ vertexBufferCase()
 
 fragmentBufferCase()
 renderBarrierCase()
+computeBarrierCase(resourceBarrier: true)
+computeBarrierCase(resourceBarrier: false)
 encoderBindingLifetimeCase()
 
 if texPipeline == nil {

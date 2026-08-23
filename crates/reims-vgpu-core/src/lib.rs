@@ -49,12 +49,12 @@ pub use blit::{
 };
 pub use capabilities::{CapabilityService, DeviceInfoLimits, ExecutorCapabilities, MAX_CHANNELS};
 pub use compute::{
-    ComputeBufferBacking, ComputeBufferOutput, ComputeBufferResource, ComputeBufferResult,
-    ComputeImageDestination, ComputeImageResult, ComputeOutput, ComputeRequest,
-    ComputeResidentSampleBind, ComputeSampledImageResource, ComputeSampledImageSource,
-    ComputeStorageImageResource, ComputeStorageImageSeed, ComputeStorageResidency,
-    SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter,
-    SamplerMipFilter, SamplerResource, SamplerSource,
+    ComputeBarrier, ComputeBufferBacking, ComputeBufferOutput, ComputeBufferResource,
+    ComputeBufferResult, ComputeImageDestination, ComputeImageResult, ComputeOutput,
+    ComputeRequest, ComputeResidentSampleBind, ComputeSampledImageResource,
+    ComputeSampledImageSource, ComputeStorageImageResource, ComputeStorageImageSeed,
+    ComputeStorageResidency, SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction,
+    SamplerFilter, SamplerMipFilter, SamplerResource, SamplerSource,
 };
 pub use content_tracking::{
     BufferWriteGens, BufferWriteStamp, GatherKey, GvaPlaneKey, GvaResourceKey, GvaStoreWitness,
