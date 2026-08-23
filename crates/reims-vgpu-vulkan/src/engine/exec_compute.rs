@@ -870,6 +870,7 @@ pub(crate) unsafe fn execute_compute_inner(
                         slot.sample_count,
                         slot.image,
                         slot.access,
+                        slot.mip_levels,
                     )
                 });
                 super::exec::validate_sampled_resident(
@@ -885,7 +886,7 @@ pub(crate) unsafe fn execute_compute_inner(
                     pools.prior_reclaim(identity),
                 )
                 .map_err(DrawError::DrawExecution)?;
-                let (_, _, _, _, image, access) =
+                let (_, _, _, _, image, access, levels) =
                     held.expect("validated target resident remains present");
                 let view = unsafe {
                     pools.registry_sample_view(
@@ -906,6 +907,7 @@ pub(crate) unsafe fn execute_compute_inner(
                     ));
                 }
                 pools.registry_note_sampled_use(identity);
+                mip_levels = levels;
                 (
                     image,
                     view,

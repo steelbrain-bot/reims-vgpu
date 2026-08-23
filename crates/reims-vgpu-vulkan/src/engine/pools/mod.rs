@@ -4448,6 +4448,18 @@ mod resident_reuse_tests {
         }
     }
 
+    #[test]
+    fn a_resident_subresource_range_names_every_owned_mip() {
+        let mut resident = slot(64, 64, 1, vk::Format::R8G8B8A8_UNORM);
+        resident.mip_levels = 3;
+        assert_eq!(
+            resident
+                .subresource_range(vk::Format::R8G8B8A8_UNORM)
+                .level_count,
+            3
+        );
+    }
+
     /// A three-level chain the guest laid out smallest-first, so level zero —
     /// the first entry, and the one Vulkan calls mip 0 — sits last in address
     /// order. Pitches differ per level, as a guest's own chain's do.
