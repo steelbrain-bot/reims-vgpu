@@ -3106,7 +3106,7 @@ fn bound_buffer_content(
 /// allocation. The registry owns address resolution; the returned source owns
 /// only the execution references needed to keep that allocation live.
 fn packed_buffer_content(
-    state: &Device,
+    state: &mut Device,
     task_id: u32,
     buffer_ref: u32,
     offset: u64,
@@ -3118,7 +3118,9 @@ fn packed_buffer_content(
     };
     let full = packed.size.checked_sub(offset).filter(|&span| span != 0)?;
     let span = extent_cap.map_or(full, |cap| full.min(cap));
-    let source = packed.buffer_source(offset, span)?;
+    let source = state
+        .bound_buffers
+        .packed_buffer_source(task_id, buffer_ref, offset, span)?;
     Some(reims_vgpu_core::BufferContent::GuestRuns(source))
 }
 
@@ -3172,29 +3174,14 @@ fn packed_buffer_content(
 /// and hashes the window's guest-physical page list and then copies it again
 /// into an `Arc<[u64]>`.
 ///
-/// Because the packed rung is tried first and succeeds, the registry rung
-/// never runs on this workload. One driven fullscreen Maps boot,
-/// rail=macos-13, x86/Vulkan, banded:
-///
-/// ```text
-/// zc_buffer_held_packed   14 456 050      6.36 a draw
-/// zc_buffer_held                   0
-/// ```
-///
-/// and the whole device built canonical page sets **6.65 times a draw over
-/// 20.4 pages a build**, peaking at 2 136 pages — a whole 1920x1080 target.
-/// Against a same-boot `proc_us` of 23.35 that measured 1.004 µs a draw with
-/// the measuring pair included, so on the order of 3 % of the drain worker's
-/// per-draw budget is spent re-deriving page identity that did not change.
-///
-/// This is recorded rather than repaired because 3 % is not the shape of this
-/// rail's gap — see `crate::runtime::exec`'s `encoder_class_state` for the
-/// larger sibling of the same observation. When it is repaired, the mechanism
-/// is already here and is not a new cache: `BoundBuffers::insert` retains a
-/// window under exactly the `(task, reference, offset, cap)` key this function
-/// looks up, in an unbounded registry whose entries are retired by the guest's
-/// own address-span lifetime events. The packed rung retaining its derived
-/// window is what would make `zc_buffer_held` non-zero.
+/// Retaining every derived window was measured and reverted. One fullscreen
+/// Maps boot did halve vertex resolution (1.555 to 0.794 µs/draw), but it held
+/// 30 705 windows over 2 549 resources, including 3 313 offsets for one live
+/// resource. Visibility/barrier work doubled from 0.82 to 1.62 µs/draw, slot
+/// work nearly doubled from 1.06 to 2.03, and the whole drain regressed from
+/// 18.73 to 29.18 µs/draw. The derived window is therefore the wrong ownership
+/// unit even though its content stays live; a repair has to avoid materialising
+/// one entry per offset rather than move that population into this registry.
 fn held_buffer_content(
     state: &mut Device,
     task_id: u32,

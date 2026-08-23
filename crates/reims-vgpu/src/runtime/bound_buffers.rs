@@ -131,6 +131,25 @@ pub struct PackedBuffer {
         reims_vgpu_memory::GuestImageBindingKey,
         reims_vgpu_memory::GuestImageBindingDisposition,
     >,
+    /// Canonical physical identity for buffer windows already used by a live
+    /// bind. The key is the decoded allocation-relative offset plus the exact
+    /// shader-proven span. Entries share this resource's lifetime and never
+    /// evict, so a repeated bind cannot go cold while its buffer remains live.
+    ///
+    /// This is deliberately not a second materialized buffer registry. Vulkan
+    /// still receives the one packed allocation plus an offset; only the pure
+    /// page-set projection is retained here. Registering every offset as a
+    /// resource made shared residency work scale with the number of offsets.
+    ///
+    /// Three interleaved fullscreen Maps boots per arm measured the distinction.
+    /// Retaining these projections held 26 283–31 551 exact windows with a
+    /// 99.88–99.92% hit rate, reduced canonical page-set builds from 6.82 to
+    /// 0.71 per draw, and reduced whole-drain CPU time from 21.95 to 20.09
+    /// microseconds per draw. The corresponding version that registered those
+    /// windows as buffer resources regressed the whole drain; resource identity
+    /// remains the allocation, while this map owns only its pure projections.
+    pub buffer_window_page_sets:
+        std::collections::HashMap<(u64, u64), reims_vgpu_memory::GuestPageSet>,
     /// Allocation owned by `map_pages` when this resource required a packed
     /// alias. RAMBlock-backed resources borrow the VM-wide import and carry no
     /// per-resource retirement.
@@ -216,6 +235,35 @@ impl PackedBuffer {
         span: u64,
     ) -> Option<reims_vgpu_memory::GuestRunSource> {
         self.texel_source(offset, span, 0)
+    }
+
+    /// One buffer bind with its canonical physical identity retained by the
+    /// packed resource that owns it.
+    pub fn buffer_source_retained(
+        &mut self,
+        offset: u64,
+        span: u64,
+    ) -> Option<reims_vgpu_memory::GuestRunSource> {
+        offset.checked_add(span).filter(|&end| end <= self.size)?;
+        let key = (offset, span);
+        let physical_pages = if let Some(pages) = self.buffer_window_page_sets.get(&key) {
+            crate::runtime::drain::note_store_route("buffer_window_set_hit");
+            pages.clone()
+        } else {
+            let pages =
+                reims_vgpu_memory::GuestPageSet::new(self.witness_window(offset, span)?.gpas)?;
+            self.buffer_window_page_sets.insert(key, pages.clone());
+            crate::runtime::drain::note_store_route("buffer_window_set_miss");
+            pages
+        };
+        Some(reims_vgpu_memory::GuestRunSource {
+            runs: Arc::clone(&self.runs),
+            source_offset: offset,
+            total_len: span,
+            row_length_texels: 0,
+            pages: Some(Arc::clone(&self.pages)),
+            physical_pages: Some(physical_pages),
+        })
     }
 
     /// Physical pages touched by one allocation-relative byte window.
@@ -604,6 +652,7 @@ fn ensure_packed_resource_with_extent<
                             guest,
                         }]),
                         sampled_image_requirements: std::collections::HashMap::new(),
+                        buffer_window_page_sets: std::collections::HashMap::new(),
                         owned_alias: None,
                     }));
                 }
@@ -666,6 +715,7 @@ fn ensure_packed_resource_with_extent<
                             guest,
                         }]),
                         sampled_image_requirements: std::collections::HashMap::new(),
+                        buffer_window_page_sets: std::collections::HashMap::new(),
                         owned_alias: None,
                     }));
                 }
@@ -727,6 +777,10 @@ fn ensure_packed_resource_with_extent<
             sampled_image_requirements: previous_available
                 .as_ref()
                 .map(|previous| previous.sampled_image_requirements.clone())
+                .unwrap_or_default(),
+            buffer_window_page_sets: previous_available
+                .as_ref()
+                .map(|previous| previous.buffer_window_page_sets.clone())
                 .unwrap_or_default(),
             owned_alias: Some(PackedAliasRetirement {
                 import: import.id(),
@@ -932,6 +986,7 @@ pub fn note_registry_levels(state: &crate::runtime::Device) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static LAST_MS: AtomicU64 = AtomicU64::new(0);
     static PEAK_ENTRIES: AtomicU64 = AtomicU64::new(0);
+    static PEAK_BUFFER_WINDOW_SETS: AtomicU64 = AtomicU64::new(0);
 
     let now = crate::observe::elapsed_ms() as u64;
     let last = LAST_MS.load(Ordering::Relaxed);
@@ -950,11 +1005,15 @@ pub fn note_registry_levels(state: &crate::runtime::Device) {
         .fetch_max(shape.entries as u64, Ordering::Relaxed)
         .max(shape.entries as u64);
     let aliases = state.bound_buffers.packed_alias_shape();
+    let buffer_window_sets = state.bound_buffers.buffer_window_page_set_count();
+    let buffer_window_sets_peak = PEAK_BUFFER_WINDOW_SETS
+        .fetch_max(buffer_window_sets as u64, Ordering::Relaxed)
+        .max(buffer_window_sets as u64);
     crate::observe::off(format!(
         "bound_buffers (levels, not per-interval) entries={} peak={} pairs={} \
          multi_offset_pairs={} max_offsets={} aliases={} alias_plans={} \
          alias_duplicates={} alias_plan_max={} alias_pages={} alias_shared_pages={} \
-         alias_page_max={}",
+         alias_page_max={} buffer_window_sets={} buffer_window_sets_peak={}",
         shape.entries,
         peak,
         shape.pairs,
@@ -967,6 +1026,8 @@ pub fn note_registry_levels(state: &crate::runtime::Device) {
         aliases.physical_pages,
         aliases.multiply_aliased_pages,
         aliases.max_aliases_per_page,
+        buffer_window_sets,
+        buffer_window_sets_peak,
     ));
 }
 
@@ -1034,6 +1095,35 @@ impl BoundBuffers {
                 None
             }
         }
+    }
+
+    /// Derive one retained buffer window from the live packed resource.
+    pub fn packed_buffer_source(
+        &mut self,
+        task_id: u32,
+        resource_ref: u32,
+        offset: u64,
+        span: u64,
+    ) -> Option<reims_vgpu_memory::GuestRunSource> {
+        match self.retained.resource_mut(owner(task_id, resource_ref))? {
+            PackedBufferResolution::Available(packed) => {
+                packed.buffer_source_retained(offset, span)
+            }
+            PackedBufferResolution::Unavailable { .. } => None,
+        }
+    }
+
+    /// Live retained page-set projections, owned by their packed resources.
+    pub fn buffer_window_page_set_count(&self) -> usize {
+        self.retained
+            .resource_values()
+            .filter_map(|resource| match resource {
+                PackedBufferResolution::Available(packed) => {
+                    Some(packed.buffer_window_page_sets.len())
+                }
+                PackedBufferResolution::Unavailable { .. } => None,
+            })
+            .sum()
     }
 
     pub fn note_sampled_image_requirement(
@@ -1257,6 +1347,7 @@ mod tests {
             runs: Arc::new(Vec::new()),
             pages: Arc::new(Vec::new()),
             sampled_image_requirements: std::collections::HashMap::new(),
+            buffer_window_page_sets: std::collections::HashMap::new(),
             owned_alias: Some(PackedAliasRetirement {
                 import: import_id,
                 ptr: 0x10_0000 + allocation * 0x10_0000,
@@ -1480,6 +1571,7 @@ mod tests {
                 runs: Arc::new(Vec::new()),
                 pages: Arc::new(Vec::new()),
                 sampled_image_requirements: std::collections::HashMap::new(),
+                buffer_window_page_sets: std::collections::HashMap::new(),
                 owned_alias: None,
             }),
         );
@@ -1515,6 +1607,54 @@ mod tests {
     }
 
     #[test]
+    fn a_packed_buffer_retains_page_identity_by_exact_live_window() {
+        let import = Arc::new(
+            crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
+                0x7f00_0000_0000,
+                0x3000,
+                0x1000,
+            )
+            .expect("aligned allocation"),
+        );
+        let mut packed = PackedBuffer {
+            gva: 0x1000,
+            size: 0x3000,
+            head: 0,
+            import,
+            gpas: Arc::new(vec![0x9000, 0x4000, 0x7000]),
+            footprint: crate::runtime::guest_ram::GuestPageFootprint::new(
+                Arc::from([0x9000, 0x4000, 0x7000]),
+                0x1000,
+            )
+            .unwrap(),
+            runs: Arc::new(Vec::new()),
+            pages: Arc::new(Vec::new()),
+            sampled_image_requirements: std::collections::HashMap::new(),
+            buffer_window_page_sets: std::collections::HashMap::new(),
+            owned_alias: None,
+        };
+
+        let first = packed
+            .buffer_source_retained(0x800, 0x1000)
+            .expect("window in allocation");
+        let repeated = packed
+            .buffer_source_retained(0x800, 0x1000)
+            .expect("same live window");
+        assert_eq!(packed.buffer_window_page_sets.len(), 1);
+        assert_eq!(first.physical_pages, repeated.physical_pages);
+        assert_eq!(
+            first.physical_pages.unwrap().pages(),
+            &[0x4000, 0x9000],
+            "the retained identity is the exact canonical window"
+        );
+
+        packed
+            .buffer_source_retained(0x1800, 0x1000)
+            .expect("different decoded offset");
+        assert_eq!(packed.buffer_window_page_sets.len(), 2);
+    }
+
+    #[test]
     fn packed_alias_retirement_carries_import_and_host_view_together() {
         let import = Arc::new(
             crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
@@ -1547,6 +1687,7 @@ mod tests {
                 runs: Arc::new(Vec::new()),
                 pages: Arc::new(Vec::new()),
                 sampled_image_requirements: std::collections::HashMap::new(),
+                buffer_window_page_sets: std::collections::HashMap::new(),
                 owned_alias: Some(expected),
             }),
         );
@@ -1583,6 +1724,7 @@ mod tests {
             runs: Arc::new(Vec::new()),
             pages: Arc::new(Vec::new()),
             sampled_image_requirements: std::collections::HashMap::new(),
+            buffer_window_page_sets: std::collections::HashMap::new(),
             owned_alias: None,
         };
 
