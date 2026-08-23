@@ -740,6 +740,12 @@ pub struct Command {
     /// order. See [`Self::viewports`].
     pub scissors: Vec<ScissorRect>,
     pub fence_ref: u32,
+    /// Render stages named by a [`Kind::Fence`] record.
+    ///
+    /// The update opcode carries `afterStages`; the wait opcode carries
+    /// `beforeStages`. Both occupy the same 32-bit wire field, and the opcode
+    /// supplies which side of the dependency it describes.
+    pub fence_stages: u32,
     /// Value of a [`Kind::SetRasterState`], [`Kind::SetStoreAction`] or
     /// [`Kind::SetVisibilityResultMode`] record.
     pub mode: u64,
@@ -1445,6 +1451,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             let f = wire::fence(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::Fence;
             out.fence_ref = f.fence_ref.get();
+            out.fence_stages = f.stages.get();
             Ok(out)
         }
         wire::OPCODE_USE_RESOURCE => {

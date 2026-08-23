@@ -2544,6 +2544,28 @@ fn the_inherited_residency_opcodes_reach_the_residency_arm() {
     }
 }
 
+/// A render fence's stage mask is part of the dependency, not padding beside
+/// the object reference. Update and wait share this record shape; their opcode
+/// decides whether the field means `afterStages` or `beforeStages` later.
+#[test]
+fn render_fence_preserves_its_stage_mask() {
+    for (opcode, stages) in [
+        (wire::OPCODE_UPDATE_FENCE, 2u32),
+        (wire::OPCODE_WAIT_FOR_FENCE, 1u32),
+    ] {
+        let mut bytes = vec![0u8; wire::FENCE_TOTAL_LEN as usize];
+        bytes[0..4].copy_from_slice(&opcode.to_le_bytes());
+        bytes[4..8].copy_from_slice(&wire::FENCE_TOTAL_LEN.to_le_bytes());
+        bytes[8..12].copy_from_slice(&6464u32.to_le_bytes());
+        bytes[12..16].copy_from_slice(&stages.to_le_bytes());
+
+        let command = decode(&bytes).expect("decode render fence");
+        assert_eq!(command.kind, Kind::Fence);
+        assert_eq!(command.fence_ref, 6464);
+        assert_eq!(command.fence_stages, stages);
+    }
+}
+
 #[test]
 fn property_fuzz() {
     for op in 0u32..0x120 {
