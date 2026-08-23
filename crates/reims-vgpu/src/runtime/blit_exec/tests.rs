@@ -1952,6 +1952,108 @@ fn install_linear_rgba(
     );
 }
 
+fn install_buffer_backed_bgra(
+    host: &mut FakeHost,
+    state: &mut Device,
+    buffer_ref: u32,
+    texture_ref: u32,
+    handle: u32,
+    width: u32,
+    height: u32,
+    offset: u64,
+    row_stride: u64,
+) {
+    use crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_VIEW;
+    use reims_vgpu_wire::ops::backed_texture::{
+        BufferTextureBody, BUFFER_TEXTURE_TOTAL_LEN, OPCODE_BUFFER_TEXTURE,
+    };
+
+    assert!(state.set_object_list(1, 0, 16));
+    let mut buffer_descriptor = [0u8; 16];
+    st64(&mut buffer_descriptor, 0x4000);
+    st32(&mut buffer_descriptor[8..], handle);
+    let buffer_descriptor_gva = 0x180;
+    write_task_gva_arm64e(
+        host,
+        &state.tasks[1],
+        buffer_descriptor_gva,
+        &buffer_descriptor,
+    );
+    let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(
+        &mut entry,
+        (OBJECT_TYPE_BUFFER as u32) | ((buffer_descriptor.len() as u32) << 8),
+    );
+    st64(&mut entry[4..], buffer_descriptor_gva);
+    write_task_gva_arm64e(
+        host,
+        &state.tasks[1],
+        list_object_entry_offset(buffer_ref, 16).unwrap(),
+        &entry,
+    );
+
+    let mut record = vec![0u8; BUFFER_TEXTURE_TOTAL_LEN as usize];
+    st32(&mut record, OPCODE_BUFFER_TEXTURE);
+    st32(&mut record[4..], BUFFER_TEXTURE_TOTAL_LEN);
+    st32(&mut record[8..], texture_ref);
+    let body = reims_vgpu_wire::OP_HEADER_LEN;
+    let buffer_ref_at = body + core::mem::offset_of!(BufferTextureBody, buffer_ref);
+    let offset_at = body + core::mem::offset_of!(BufferTextureBody, offset);
+    let row_stride_at = body + core::mem::offset_of!(BufferTextureBody, bytes_per_row);
+    let desc_at = body + core::mem::offset_of!(BufferTextureBody, desc);
+    st32(&mut record[buffer_ref_at..], buffer_ref);
+    st64(&mut record[offset_at..], offset);
+    st64(&mut record[row_stride_at..], row_stride);
+    st32(
+        &mut record[desc_at..],
+        2 | (3 << 8) | (u32::from(MTL_FORMAT_BGRA8_UNORM) << 16),
+    );
+    st32(&mut record[desc_at + 4..], width);
+    st32(&mut record[desc_at + 8..], height);
+    st32(&mut record[desc_at + 12..], 1);
+    for (field, value) in [(16usize, 1u16), (18, 1), (20, 1), (22, 0)] {
+        record[desc_at + field..desc_at + field + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    let record_gva = 6u64 << PAGE_SHIFT_ARM64E;
+    write_task_gva_arm64e(host, &state.tasks[1], record_gva, &record);
+    let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(
+        &mut entry,
+        (OBJECT_TYPE_TEXTURE_VIEW as u32) | (BUFFER_TEXTURE_TOTAL_LEN << 8),
+    );
+    st64(&mut entry[4..], record_gva);
+    write_task_gva_arm64e(
+        host,
+        &state.tasks[1],
+        list_object_entry_offset(texture_ref, 16).unwrap(),
+        &entry,
+    );
+}
+
+#[test]
+fn a_buffer_backed_texture_is_a_terminal_linear_blit_endpoint() {
+    let (mut host, mut state) = blit_device();
+    install_buffer_backed_bgra(&mut host, &mut state, 7, 10, 5, 64, 16, 0x100, 0x120);
+
+    let backing = resolve_texture_backing(&mut state, &mut host, 1, 10, 0, 0)
+        .expect("opcode 9 names a complete linear endpoint");
+    let TextureBacking::Linear(level) = backing else {
+        panic!("a buffer texture must not enter the semantic view chain");
+    };
+    assert_eq!(level.base_gva, 5u64 << PAGE_SHIFT_ARM64E);
+    assert_eq!(level.alloc_size, 0x4000);
+    assert_eq!(level.level_offset, 0x100);
+    assert_eq!(level.row_stride, 0x120);
+    assert_eq!((level.width, level.height), (64, 16));
+    assert_eq!(level.pixel_format, MTL_FORMAT_BGRA8_UNORM);
+
+    assert!(matches!(
+        resolve_texture_backing(&mut state, &mut host, 1, 10, 1, 0),
+        Err(BlitStatus::Unsupported)
+    ));
+    assert_eq!(blit_fail_reason(), "buffer_tex_level_slice");
+}
+
 #[allow(clippy::too_many_arguments)]
 fn install_linear_rgba_with_shape(
     host: &mut FakeHost,

@@ -48,17 +48,3 @@ offset_oracle_54x16_pitch_tight_plus1_compute
 # these, which makes it the more serious of the two: guest work is lost with
 # nothing saying so.
 # ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# A render target made from an `MTLBuffer` is refused as a colour attachment.
-#
-# `never_written=262144` of 262144: every draw into it was dropped, so the copy
-# out of it moved a target nothing had rendered to. The fail log names it:
-#
-#   rt_resolve reason=rt_wrong_type object_type=texture_view
-#
-# A texture created over a buffer arrives at the render-target resolver as a
-# texture view, and the resolver's ladder does not admit that type. Named, not
-# diagnosed; `rt_resolve` is where to start.
-# ---------------------------------------------------------------------------
-srt_blit_buffer_backed_512x512

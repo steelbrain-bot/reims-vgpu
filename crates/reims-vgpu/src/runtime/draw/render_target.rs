@@ -387,6 +387,23 @@ pub(super) struct RenderTargetRefusal {
 /// contract. Grouped by rung in the order [`lookup_render_target`] tries them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RenderTargetCause {
+    /// The opcode-9 buffer-backed texture declaration or its retained buffer
+    /// relation could not name one complete linear image plane.
+    BufferTexturePlacement {
+        reason: objects::BufferTexturePlacementRefusal,
+    },
+    /// Buffer-backed render targets expose only their one declared level,
+    /// slice, and depth plane.
+    BufferTextureSubresource {
+        level: u32,
+        slice: u32,
+        depth_plane: u32,
+    },
+    /// The buffer-backed texture's row stride cannot cross the core target
+    /// boundary, whose contract carries strides as `u32`.
+    BufferTextureStride {
+        row_stride: u64,
+    },
     /// A type-8 view whose swizzle is not the identity. The archive's
     /// `resolve_texture` requires `!has_swizzle` for a linear resolve, so the
     /// channel order this view asks for cannot be honoured by rendering into
@@ -606,6 +623,30 @@ impl crate::observe::Decline for RenderTargetRefusal {
     fn slug(&self) -> &'static str {
         use RenderTargetCause as C;
         match self.cause {
+            C::BufferTexturePlacement { reason } => match reason {
+                objects::BufferTexturePlacementRefusal::Decode => "rt_buffer_tex_desc_decode",
+                objects::BufferTexturePlacementRefusal::SemanticKind => {
+                    "rt_buffer_tex_semantic_kind"
+                }
+                objects::BufferTexturePlacementRefusal::InvalidShape => "rt_buffer_tex_shape",
+                objects::BufferTexturePlacementRefusal::MissingFormat => "rt_buffer_tex_no_fmt",
+                objects::BufferTexturePlacementRefusal::UnsupportedFormat => {
+                    "rt_buffer_tex_fmt_bytes"
+                }
+                objects::BufferTexturePlacementRefusal::Buffer(_) => "rt_buffer_tex_no_backing",
+                objects::BufferTexturePlacementRefusal::RowStrideTooSmall => {
+                    "rt_buffer_tex_bpr_short"
+                }
+                objects::BufferTexturePlacementRefusal::ReachOverflow => {
+                    "rt_buffer_tex_reach_overflow"
+                }
+                objects::BufferTexturePlacementRefusal::PastAllocation => "rt_buffer_tex_span_oob",
+                objects::BufferTexturePlacementRefusal::AddressOverflow => {
+                    "rt_buffer_tex_offset_overflow"
+                }
+            },
+            C::BufferTextureSubresource { .. } => "rt_buffer_tex_subresource",
+            C::BufferTextureStride { .. } => "rt_buffer_tex_stride",
             C::ViewSwizzled => "rt_view_swizzled",
             C::ViewBaseUnbound => "rt_view_base_unbound",
             C::ViewSubresourceOutOfRange { .. } => "rt_view_subresource_out_of_range",
@@ -657,6 +698,21 @@ impl crate::observe::Decline for RenderTargetRefusal {
         use RenderTargetCause as C;
         let mut v = vec![("base", self.base_ref.to_string())];
         match self.cause {
+            C::BufferTexturePlacement { reason } => {
+                v.push(("reason", format!("{reason:?}")));
+            }
+            C::BufferTextureSubresource {
+                level,
+                slice,
+                depth_plane,
+            } => {
+                v.push(("level", level.to_string()));
+                v.push(("slice", slice.to_string()));
+                v.push(("depth_plane", depth_plane.to_string()));
+            }
+            C::BufferTextureStride { row_stride } => {
+                v.push(("row_stride", row_stride.to_string()));
+            }
             C::ViewSubresourceOutOfRange { level, slice } => {
                 v.push(("level", level.to_string()));
                 v.push(("slice", slice.to_string()));
@@ -975,6 +1031,57 @@ fn resolve_render_target<M: HostMemory + HostOps>(
 ) -> Result<ResolvedRenderTarget, RenderTargetRefusal> {
     use RenderTargetCause as C;
     let texture_ref = att.texture_ref;
+    if objects::lookup_list_entry(state, host, task_id, texture_ref)
+        .is_some_and(|entry| entry.kind == ObjectKind::TextureView)
+    {
+        let resource = objects::resolve_resource(state, host, task_id, texture_ref)
+            .map_err(|_| C::LinearDescRead.at(texture_ref))?;
+        let buffer_texture =
+            objects::resolve_buffer_texture_placement_from_resource(state, &resource)
+                .map_err(|reason| C::BufferTexturePlacement { reason }.at(texture_ref))?;
+        if let Some(level) = buffer_texture {
+            if att.level != 0 || att.slice != 0 || att.depth_plane != 0 {
+                return Err(C::BufferTextureSubresource {
+                    level: att.level,
+                    slice: att.slice,
+                    depth_plane: att.depth_plane,
+                }
+                .at(texture_ref));
+            }
+            if pixel_format::render_target_bpp(level.pixel_format).is_none() {
+                return Err(C::LinearFormat {
+                    fmt: level.pixel_format,
+                }
+                .at(texture_ref));
+            }
+            let row_stride = u32::try_from(level.row_stride).map_err(|_| {
+                C::BufferTextureStride {
+                    row_stride: level.row_stride,
+                }
+                .at(texture_ref)
+            })?;
+            let storage = super::LinearColorTarget::new(
+                level.base_gva,
+                level.alloc_size,
+                level.level_offset,
+                row_stride,
+            )
+            .map(super::ColorTargetStorage::Linear)
+            .ok_or(
+                C::BufferTexturePlacement {
+                    reason: objects::BufferTexturePlacementRefusal::AddressOverflow,
+                }
+                .at(texture_ref),
+            )?;
+            return Ok(ResolvedRenderTarget {
+                storage,
+                width: level.width,
+                height: level.height,
+                format: level.pixel_format,
+                sample_count: 1,
+            });
+        }
+    }
     // Type-8 view → base (archive resource_resolve_texture view chain).
     let (resolved_ref, view_fmt_override, level, slice) =
         if let Some(view) = resolve_texture_view(state, host, task_id, texture_ref) {
@@ -1883,6 +1990,113 @@ mod tests {
             texture_ref,
             ..Default::default()
         }
+    }
+
+    /// Opcode 9 shares the texture-view wire family but semantically declares
+    /// a texture over a buffer allocation. Render-target resolution must stop
+    /// at that terminal placement instead of treating its buffer ref as a view
+    /// base and rejecting the attachment as the wrong object type.
+    #[test]
+    fn a_buffer_backed_texture_is_a_linear_render_target() {
+        use crate::model::PAGE_SHIFT_ARM64E;
+        use crate::runtime::decode::resource::{
+            list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER,
+            OBJECT_TYPE_TEXTURE_VIEW,
+        };
+        use crate::runtime::gva_mem::{self, write_task_gva_arm64e};
+        use reims_vgpu_core::endian::{st32, st64};
+        use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        use reims_vgpu_wire::ops::backed_texture::{
+            BufferTextureBody, BUFFER_TEXTURE_TOTAL_LEN, OPCODE_BUFFER_TEXTURE,
+        };
+
+        const TASK: u32 = 1;
+        const BUFFER_REF: u32 = 7;
+        const TEXTURE_REF: u32 = 10;
+        const BUFFER_HANDLE: u32 = 5;
+        const WIDTH: u32 = 64;
+        const HEIGHT: u32 = 16;
+        const OFFSET: u64 = 0x100;
+        const BPR: u64 = 0x120;
+        const ALLOC: u64 = 0x4000;
+
+        let mut host = FakeHost::new();
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        assert!(state.set_object_list(TASK, 0, 32));
+
+        let mut buffer_descriptor = [0u8; 16];
+        st64(&mut buffer_descriptor, ALLOC);
+        st32(&mut buffer_descriptor[8..], BUFFER_HANDLE);
+        let buffer_descriptor_gva = 0x180;
+        write_task_gva_arm64e(
+            &mut host,
+            &state.tasks[TASK],
+            buffer_descriptor_gva,
+            &buffer_descriptor,
+        );
+        let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+        st32(
+            &mut entry,
+            (OBJECT_TYPE_BUFFER as u32) | ((buffer_descriptor.len() as u32) << 8),
+        );
+        st64(&mut entry[4..], buffer_descriptor_gva);
+        write_task_gva_arm64e(
+            &mut host,
+            &state.tasks[TASK],
+            list_object_entry_offset(BUFFER_REF, 32).unwrap(),
+            &entry,
+        );
+
+        let mut record = vec![0u8; BUFFER_TEXTURE_TOTAL_LEN as usize];
+        st32(&mut record, OPCODE_BUFFER_TEXTURE);
+        st32(&mut record[4..], BUFFER_TEXTURE_TOTAL_LEN);
+        st32(&mut record[8..], TEXTURE_REF);
+        let body = reims_vgpu_wire::OP_HEADER_LEN;
+        let buffer_ref_at = body + core::mem::offset_of!(BufferTextureBody, buffer_ref);
+        let offset_at = body + core::mem::offset_of!(BufferTextureBody, offset);
+        let bpr_at = body + core::mem::offset_of!(BufferTextureBody, bytes_per_row);
+        let desc_at = body + core::mem::offset_of!(BufferTextureBody, desc);
+        st32(&mut record[buffer_ref_at..], BUFFER_REF);
+        st64(&mut record[offset_at..], OFFSET);
+        st64(&mut record[bpr_at..], BPR);
+        st32(
+            &mut record[desc_at..],
+            2 | (3 << 8) | (u32::from(MTL_FORMAT_BGRA8_UNORM) << 16),
+        );
+        st32(&mut record[desc_at + 4..], WIDTH);
+        st32(&mut record[desc_at + 8..], HEIGHT);
+        st32(&mut record[desc_at + 12..], 1);
+        for (field, value) in [(16usize, 1u16), (18, 1), (20, 1), (22, 0)] {
+            record[desc_at + field..desc_at + field + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        let record_gva = 6u64 << PAGE_SHIFT_ARM64E;
+        write_task_gva_arm64e(&mut host, &state.tasks[TASK], record_gva, &record);
+        let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+        st32(
+            &mut entry,
+            (OBJECT_TYPE_TEXTURE_VIEW as u32) | (BUFFER_TEXTURE_TOTAL_LEN << 8),
+        );
+        st64(&mut entry[4..], record_gva);
+        write_task_gva_arm64e(
+            &mut host,
+            &state.tasks[TASK],
+            list_object_entry_offset(TEXTURE_REF, 32).unwrap(),
+            &entry,
+        );
+
+        let target = resolve_render_target(&mut state, &host, TASK, attach(TEXTURE_REF))
+            .expect("the buffer texture has one complete linear render plane");
+        let linear = target.storage.linear().expect("linear target");
+        assert_eq!(
+            linear.allocation_gva,
+            u64::from(BUFFER_HANDLE) << PAGE_SHIFT_ARM64E
+        );
+        assert_eq!(linear.allocation_size, ALLOC);
+        assert_eq!(linear.plane_offset, OFFSET);
+        assert_eq!(linear.row_stride, BPR as u32);
+        assert_eq!((target.width, target.height), (WIDTH, HEIGHT));
+        assert_eq!(target.format, MTL_FORMAT_BGRA8_UNORM);
     }
 
     /// A refusal is reported once per attachment per check, not once per draw.

@@ -823,6 +823,49 @@ impl TaskResources {
             _ => false,
         }
     }
+
+    /// Resolve the retained buffer allocation behind one buffer-backed texture.
+    ///
+    /// The child-to-parent graph edge is generational. A deleted and reused raw
+    /// buffer reference therefore cannot retarget a texture that still owns the
+    /// original parent resource.
+    pub(crate) fn buffer_texture_backing(
+        &self,
+        texture: &TaskResource,
+    ) -> Option<(u64, u64, u64, u64)> {
+        let texture_id = texture.semantic_id()?;
+        let registry = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let texture_node = registry.graph.resource(texture_id)?;
+        let texture_storage = registry.graph.storage(texture_node.storage?)?;
+        let reims_vgpu_core::StorageBacking::BufferRange {
+            buffer,
+            offset,
+            bytes_per_row,
+        } = texture_storage.backing
+        else {
+            return None;
+        };
+        if !texture_node.parents.contains(&buffer) {
+            return None;
+        }
+        let buffer_node = registry.graph.resource(buffer)?;
+        let buffer_storage = registry.graph.storage(buffer_node.storage?)?;
+        let reims_vgpu_core::StorageBacking::TaskAddress {
+            address, length, ..
+        } = buffer_storage.backing
+        else {
+            return None;
+        };
+        Some((
+            address.get(),
+            length.get(),
+            offset.get(),
+            bytes_per_row.get(),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -928,12 +971,21 @@ mod task_resource_graph_tests {
     fn buffer_texture_relation_retains_the_source_buffer() {
         let resources = TaskResources::default();
         let buffer = resources.register(4, 9, resource(ObjectKind::Buffer));
-        let _texture = resources.register(4, 10, resource(ObjectKind::TextureView));
+        let texture = resources.register(4, 10, resource(ObjectKind::TextureView));
         let buffer_id = buffer.semantic_id().unwrap();
 
+        assert!(resources.attach_task_address(4, 9, 0x4000, 0x2000));
         assert!(resources.link_buffer_texture(4, 10, 9, 96, 512));
         assert!(resources.delete(4, 9));
         assert!(resources.resource_node(buffer_id).is_some());
+        let replacement = resources.register(4, 9, resource(ObjectKind::Buffer));
+        assert!(resources.attach_task_address(4, 9, 0x9000, 0x1000));
+        assert_ne!(replacement.semantic_id(), Some(buffer_id));
+        assert_eq!(
+            resources.buffer_texture_backing(&texture),
+            Some((0x4000, 0x2000, 96, 512)),
+            "a live texture must keep naming its retained generational buffer"
+        );
         assert!(resources.delete(4, 10));
         assert!(resources.resource_node(buffer_id).is_none());
     }

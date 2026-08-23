@@ -2665,115 +2665,56 @@ fn buffer_texture_placement<M: HostMemory + HostOps>(
     bound_ref: u32,
     record: &reims_vgpu_protocol::BufferTextureDescriptor,
 ) -> Result<LinearPlacement, ComputeStatus> {
-    let declaration = &record.desc;
-    if declaration.depth > 1
-        || declaration.mipmap_level_count > 1
-        || declaration.sample_count > 1
-        || declaration.array_length > 1
-    {
-        return linear_fail(
-            bound_ref,
-            ComputeStatus::Unsupported("compute_buffer_tex_shape"),
-            &format!(
-                "buf={} type={} dims={}x{}x{} mips={} samples={} array={}",
-                record.buffer_ref,
-                declaration.texture_type,
-                declaration.width,
-                declaration.height,
-                declaration.depth,
-                declaration.mipmap_level_count,
-                declaration.sample_count,
-                declaration.array_length
+    let resource = objects::resolve_resource(state, host, task_id, bound_ref).map_err(|rung| {
+        ComputeStatus::MissingTexture(crate::observe::ladder_slugs!("compute_buffer_tex")(rung))
+    })?;
+    let level = objects::resolve_buffer_texture_placement_from_resource(state, &resource)
+        .map_err(|reason| match reason {
+            objects::BufferTexturePlacementRefusal::Decode => ComputeStatus::MissingTexture(
+                crate::observe::ladder_slug!("compute_buffer_tex", desc_decode),
             ),
-        );
-    }
-    let Some(declared_format) = declaration.declared_pixel_format() else {
-        return linear_fail(
-            bound_ref,
-            ComputeStatus::Unsupported("compute_buffer_tex_no_fmt"),
-            &format!("buf={}", record.buffer_ref),
-        );
-    };
-    let Some(bpp) = pixel_format::bytes_per_pixel(declared_format) else {
-        return linear_fail(
-            bound_ref,
-            ComputeStatus::Unsupported("compute_buffer_tex_fmt_bytes"),
-            &format!("buf={} fmt={declared_format:#x}", record.buffer_ref),
-        );
-    };
-    let (allocation_gva, allocation_size) =
-        match objects::resolve_buffer_span(state, host, task_id, record.buffer_ref) {
-            Ok(span) => span,
-            Err(refusal) => {
-                let slug = match refusal {
-                    objects::BufferSpanRefusal::Rung(rung) => {
-                        crate::observe::ladder_slugs!("compute_buffer_tex")(rung)
-                    }
-                    objects::BufferSpanRefusal::Decode => {
-                        crate::observe::ladder_slug!("compute_buffer_tex", desc_decode)
-                    }
-                    objects::BufferSpanRefusal::NoBacking => "compute_buffer_tex_no_backing",
-                };
-                return linear_fail(
-                    bound_ref,
-                    ComputeStatus::MissingTexture(slug),
-                    &format!("buf={}", record.buffer_ref),
-                );
+            objects::BufferTexturePlacementRefusal::SemanticKind => {
+                ComputeStatus::MissingTexture("compute_buffer_tex_semantic_kind")
             }
-        };
-    // A `bytesPerRow` of 0 is the API's own spelling of one tight row, which is
-    // what Metal accepts for a 1D or texture-buffer texture. It is a declared
-    // value of the field, not an absent one, so it is read here rather than
-    // treated as a missing pitch.
-    let tight = u64::from(declaration.width).checked_mul(u64::from(bpp));
-    let row_stride = if record.bytes_per_row == 0 {
-        tight
-    } else {
-        Some(record.bytes_per_row)
-    };
-    // The window must fit the buffer the guest named. The last row is `tight`
-    // bytes, not a full stride, because Metal does not require the trailing pad
-    // of the final row to be inside the allocation.
-    let reach = row_stride.zip(tight).and_then(|(stride, tight)| {
-        u64::from(declaration.height.saturating_sub(1))
-            .checked_mul(stride)?
-            .checked_add(tight)?
-            .checked_add(record.offset)
-    });
-    let (Some(row_stride), Some(reach)) = (row_stride, reach) else {
-        return linear_fail(
-            bound_ref,
-            ComputeStatus::Unsupported("compute_buffer_tex_reach_overflow"),
-            &format!(
-                "buf={} off={} bpr={} {}x{} bpp={bpp}",
-                record.buffer_ref,
-                record.offset,
-                record.bytes_per_row,
-                declaration.width,
-                declaration.height
-            ),
-        );
-    };
-    if reach > allocation_size {
-        return linear_fail(
-            bound_ref,
-            ComputeStatus::MissingTexture("compute_buffer_tex_span_oob"),
-            &format!(
-                "buf={} off={} bpr={row_stride} reach={reach} alloc={allocation_size} {}x{}",
-                record.buffer_ref, record.offset, declaration.width, declaration.height
-            ),
-        );
-    }
-    let Some(gva) = allocation_gva.checked_add(record.offset) else {
-        return linear_fail(
-            bound_ref,
-            ComputeStatus::MissingTexture("compute_buffer_tex_offset_overflow"),
-            &format!(
-                "buf={} base={allocation_gva:#x} off={}",
-                record.buffer_ref, record.offset
-            ),
-        );
-    };
+            objects::BufferTexturePlacementRefusal::Buffer(objects::BufferSpanRefusal::Rung(
+                rung,
+            )) => ComputeStatus::MissingTexture(crate::observe::ladder_slugs!(
+                "compute_buffer_tex"
+            )(rung)),
+            objects::BufferTexturePlacementRefusal::Buffer(objects::BufferSpanRefusal::Decode) => {
+                ComputeStatus::MissingTexture(crate::observe::ladder_slug!(
+                    "compute_buffer_tex",
+                    desc_decode
+                ))
+            }
+            objects::BufferTexturePlacementRefusal::Buffer(
+                objects::BufferSpanRefusal::NoBacking,
+            ) => ComputeStatus::MissingTexture("compute_buffer_tex_no_backing"),
+            objects::BufferTexturePlacementRefusal::PastAllocation => {
+                ComputeStatus::MissingTexture("compute_buffer_tex_span_oob")
+            }
+            objects::BufferTexturePlacementRefusal::AddressOverflow => {
+                ComputeStatus::MissingTexture("compute_buffer_tex_offset_overflow")
+            }
+            objects::BufferTexturePlacementRefusal::InvalidShape => {
+                ComputeStatus::Unsupported("compute_buffer_tex_shape")
+            }
+            objects::BufferTexturePlacementRefusal::MissingFormat => {
+                ComputeStatus::Unsupported("compute_buffer_tex_no_fmt")
+            }
+            objects::BufferTexturePlacementRefusal::UnsupportedFormat => {
+                ComputeStatus::Unsupported("compute_buffer_tex_fmt_bytes")
+            }
+            objects::BufferTexturePlacementRefusal::RowStrideTooSmall => {
+                ComputeStatus::Unsupported("compute_buffer_tex_bpr_short")
+            }
+            objects::BufferTexturePlacementRefusal::ReachOverflow => {
+                ComputeStatus::Unsupported("compute_buffer_tex_reach_overflow")
+            }
+        })?
+        .ok_or(ComputeStatus::MissingTexture(
+            "compute_buffer_tex_semantic_kind",
+        ))?;
     Ok(LinearPlacement {
         // The bound texture object is this content's identity even though the
         // bytes belong to the buffer: two textures over one buffer at different

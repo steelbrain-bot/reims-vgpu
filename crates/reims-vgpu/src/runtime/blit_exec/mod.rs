@@ -757,6 +757,21 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
 
     // Type-8 view → base texture (unswizzled; multi-level / array / non-2D allowed).
     if entry.kind == ObjectKind::TextureView {
+        match objects::resolve_buffer_texture_placement_from_resource(state, &resource) {
+            Ok(Some(linear)) => {
+                if level != 0 || slice != 0 {
+                    return Err(br(BlitStatus::Unsupported, "buffer_tex_level_slice"));
+                }
+                return Ok(TextureBacking::Linear(linear));
+            }
+            Ok(None) => {}
+            Err(reason) => {
+                crate::observe::fail(format!(
+                    "blit buffer_texture_resolve task={task_id} ref={texture_ref} reason={reason:?}"
+                ));
+                return Err(br(BlitStatus::Unsupported, "buffer_tex_resolve"));
+            }
+        }
         let view = draw::resolve_texture_view_reasoned(state, host, task_id, texture_ref).map_err(
             |reason| {
                 crate::observe::Emit::decline("blit_tex_view_resolve", &reason)

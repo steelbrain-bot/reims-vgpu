@@ -1908,6 +1908,100 @@ pub fn resolve_buffer_span_from_resource(
         .ok_or(BufferSpanRefusal::NoBacking)
 }
 
+/// Why a decoded buffer-backed texture could not name one linear image plane.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BufferTexturePlacementRefusal {
+    Decode,
+    SemanticKind,
+    InvalidShape,
+    MissingFormat,
+    UnsupportedFormat,
+    Buffer(BufferSpanRefusal),
+    RowStrideTooSmall,
+    ReachOverflow,
+    PastAllocation,
+    AddressOverflow,
+}
+
+/// Resolve an opcode-9 texture-over-buffer construction into its one linear plane.
+///
+/// `ObjectKind::TextureView` is the wire family for both genuine texture views
+/// and buffer-backed textures. The decoded semantic variant decides which one
+/// this is: `Ok(None)` is a real view and remains on the view-chain path, while
+/// `Some` is a terminal allocation-backed texture and must not be reinterpreted
+/// as a view hop.
+pub fn resolve_buffer_texture_placement_from_resource(
+    state: &Device,
+    resource: &crate::model::TaskResource,
+) -> Result<Option<reims_vgpu_core::ResolvedLinearTextureLevel>, BufferTexturePlacementRefusal> {
+    if resource.entry().kind != ObjectKind::TextureView {
+        return Ok(None);
+    }
+    let record = match decoded_resource(resource) {
+        Ok(crate::runtime::decode::resource::Descriptor::BufferTexture(record)) => *record,
+        Ok(crate::runtime::decode::resource::Descriptor::TextureView(_)) => return Ok(None),
+        Ok(_) => return Err(BufferTexturePlacementRefusal::SemanticKind),
+        Err(_) => return Err(BufferTexturePlacementRefusal::Decode),
+    };
+    let declaration = record.desc;
+    if declaration.width == 0
+        || declaration.height == 0
+        || declaration.depth != 1
+        || declaration.mipmap_level_count != 1
+        || declaration.sample_count != 1
+        || declaration.array_length != 1
+    {
+        return Err(BufferTexturePlacementRefusal::InvalidShape);
+    }
+    let pixel_format = declaration
+        .declared_pixel_format()
+        .ok_or(BufferTexturePlacementRefusal::MissingFormat)?;
+    let bpp = reims_vgpu_core::pixel_format::bytes_per_pixel(pixel_format)
+        .ok_or(BufferTexturePlacementRefusal::UnsupportedFormat)?;
+    let (base_gva, alloc_size, offset, declared_row_stride) = state
+        .task_objects
+        .resources
+        .buffer_texture_backing(resource)
+        .ok_or(BufferTexturePlacementRefusal::Buffer(
+            BufferSpanRefusal::NoBacking,
+        ))?;
+    let tight = u64::from(declaration.width)
+        .checked_mul(u64::from(bpp))
+        .ok_or(BufferTexturePlacementRefusal::ReachOverflow)?;
+    let row_stride = if declared_row_stride == 0 {
+        tight
+    } else {
+        declared_row_stride
+    };
+    if row_stride < tight {
+        return Err(BufferTexturePlacementRefusal::RowStrideTooSmall);
+    }
+    let reach = u64::from(declaration.height - 1)
+        .checked_mul(row_stride)
+        .and_then(|rows| rows.checked_add(tight))
+        .and_then(|span| offset.checked_add(span))
+        .ok_or(BufferTexturePlacementRefusal::ReachOverflow)?;
+    if reach > alloc_size {
+        return Err(BufferTexturePlacementRefusal::PastAllocation);
+    }
+    base_gva
+        .checked_add(offset)
+        .ok_or(BufferTexturePlacementRefusal::AddressOverflow)?;
+    Ok(Some(reims_vgpu_core::ResolvedLinearTextureLevel {
+        base_gva,
+        alloc_size,
+        level_offset: offset,
+        row_stride,
+        slice_stride: 0,
+        slice_index: 0,
+        width: declaration.width,
+        height: declaration.height,
+        depth: 1,
+        bpp,
+        pixel_format,
+    }))
+}
+
 /// Resolve object ref and, if IOSurface texture, latch mapping geometry + cache the entry.
 ///
 /// Returns the mapping_id for IOSurface textures, or None.
