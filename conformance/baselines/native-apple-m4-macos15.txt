@@ -93,7 +93,7 @@ CASE render_barrier_resource_fragment PASS 8 alternating producer/consumer round
 CASE compute_barrier_resource PASS 8 alternating concurrent producer/consumer rounds were visible
 CASE compute_barrier_scope_buffers PASS 8 alternating concurrent producer/consumer rounds were visible
 CASE heap_texture_alias_lifecycle PASS one live range was released, reused at offset=0, and addressed as the replacement
-CASE heap_texture_placement_overlap PASS two live texture definitions were placed at offsets=0,0
+CASE heap_texture_placement_overlap PASS two live definitions at offset=0 executed sequentially and addressed the replacement
 CASE ebl_same_bind_second_encoder PASS the binding re-issued on the second encoder is the one that drew
 CASE ebl_changed_bind_second_encoder PASS the binding re-issued on the second encoder is the one that drew
 CASE ebl_same_bind_second_command_buffer PASS the binding re-issued on the second encoder is the one that drew

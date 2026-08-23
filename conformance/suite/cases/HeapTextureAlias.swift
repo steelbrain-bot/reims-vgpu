@@ -115,20 +115,20 @@ func heapTexturePlacementOverlapCase() {
         width: width,
         height: height,
         mipmapped: false)
-    let uint = MTLTextureDescriptor.texture2DDescriptor(
-        pixelFormat: .rgba8Uint,
+    let rg16 = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: .rg16Float,
         width: width,
         height: height,
         mipmapped: false)
-    for descriptor in [unorm, uint] {
+    for descriptor in [unorm, rg16] {
         descriptor.storageMode = .private
         descriptor.usage = [.shaderRead, .shaderWrite]
     }
 
     let unormRequirement = dev.heapTextureSizeAndAlign(descriptor: unorm)
-    let uintRequirement = dev.heapTextureSizeAndAlign(descriptor: uint)
+    let rg16Requirement = dev.heapTextureSizeAndAlign(descriptor: rg16)
     guard unormRequirement.size > 0, unormRequirement.align > 0,
-          uintRequirement.size > 0, uintRequirement.align > 0 else {
+          rg16Requirement.size > 0, rg16Requirement.align > 0 else {
         skip(label, "the device reported no heap storage requirement for one texture")
         return
     }
@@ -137,7 +137,7 @@ func heapTexturePlacementOverlapCase() {
     heapDescriptor.type = .placement
     heapDescriptor.storageMode = .private
     heapDescriptor.hazardTrackingMode = .untracked
-    heapDescriptor.size = max(unormRequirement.size, uintRequirement.size)
+    heapDescriptor.size = max(unormRequirement.size, rg16Requirement.size)
     guard let heap = dev.makeHeap(descriptor: heapDescriptor) else {
         report(label, false, "the placement heap could not be created")
         return
@@ -146,11 +146,28 @@ func heapTexturePlacementOverlapCase() {
         report(label, false, "the placement heap refused its first texture")
         return
     }
-    guard let alias = heap.makeTexture(descriptor: uint, offset: 0) else {
+    guard let alias = heap.makeTexture(descriptor: rg16, offset: 0) else {
         report(label, false, "the placement heap refused a live overlapping texture")
         return
     }
 
-    report(label, first.heapOffset == 0 && alias.heapOffset == 0,
-           "two live texture definitions were placed at offsets=\(first.heapOffset),\(alias.heapOffset)")
+    guard fillHeapTexture(first, SIMD4<Float>(1, 0, 0, 1)) else {
+        report(label, false, "commands using the first placement texture did not complete")
+        return
+    }
+    guard fillHeapTexture(alias, SIMD4<Float>(0, 1, 0, 1)) else {
+        report(label, false, "commands using the overlapping placement texture did not complete")
+        return
+    }
+    guard let got = readBack(readPipe, alias, width, height) else {
+        refused(label)
+        return
+    }
+
+    let want = pack(0, 255, 0, 255)
+    let bad = got.indices.filter { got[$0] != want }
+    report(label, first.heapOffset == 0 && alias.heapOffset == 0 && bad.isEmpty,
+           bad.isEmpty
+             ? "two live definitions at offset=0 executed sequentially and addressed the replacement"
+             : "wrong=\(bad.count)/\(got.count) first=\(hex(got[bad[0]])) want=\(hex(want))")
 }
