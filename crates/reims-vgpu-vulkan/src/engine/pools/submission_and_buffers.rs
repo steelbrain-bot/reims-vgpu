@@ -7008,12 +7008,18 @@ mod encoder_submission_ownership {
         let first = identity(10, 4);
         let second = identity(11, 4);
 
-        drop(pools.recording_for_submission(first).unwrap());
-        drop(pools.recording_for_submission(first).unwrap());
+        {
+            let _recording = pools.recording_for_submission(first).unwrap();
+        }
+        {
+            let _recording = pools.recording_for_submission(first).unwrap();
+        }
         assert_eq!(pools.active_encoders.len(), 1);
         assert!(pools.idle_encoders.is_empty());
 
-        drop(pools.recording_for_submission(second).unwrap());
+        {
+            let _recording = pools.recording_for_submission(second).unwrap();
+        }
         assert_eq!(pools.active_encoders.len(), 2);
         assert_ne!(
             pools.active_encoders.get(&first).unwrap().active_submission,
@@ -7035,11 +7041,15 @@ mod encoder_submission_ownership {
         let mut pools = ResourcePools::new();
         let first = identity(20, 5);
         let next = identity(21, 5);
-        drop(pools.recording_for_submission(first).unwrap());
+        {
+            let _recording = pools.recording_for_submission(first).unwrap();
+        }
         pools.close_submission_without_context(first).unwrap();
         assert_eq!(pools.idle_encoders.len(), 1);
 
-        drop(pools.recording_for_submission(next).unwrap());
+        {
+            let _recording = pools.recording_for_submission(next).unwrap();
+        }
         assert!(pools.idle_encoders.is_empty());
         assert_eq!(pools.active_encoders.len(), 1);
         assert_eq!(
