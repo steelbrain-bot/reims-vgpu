@@ -166,6 +166,35 @@ pub struct ExecutionCompletion<Output> {
 pub type ResolvedExecutionCompletion<Draw, Compute> =
     ExecutionCompletion<Box<[ExecutionOutput<Draw, Compute>]>>;
 
+/// Ordered progress through one immutable submission.
+///
+/// A backend can fail after recording a nonempty prefix. Keeping that prefix
+/// beside the first typed failure lets the semantic owner apply exactly the
+/// work that was accepted, instead of treating a partially recorded packet as
+/// either wholly successful or wholly absent. Packet workers return this shape;
+/// the legacy all-or-error adapter below deliberately discards the prefix only
+/// for callers that have not moved to transactional completion yet.
+#[derive(Debug)]
+pub struct SubmissionExecutionProgress<Output, Error> {
+    pub submission: SubmissionIdentity,
+    pub output: Box<[Output]>,
+    pub gpu_materialized: std::sync::Arc<[ContentStamp]>,
+    pub failure: Option<Error>,
+}
+
+impl<Output, Error> SubmissionExecutionProgress<Output, Error> {
+    pub fn into_result(self) -> Result<ExecutionCompletion<Box<[Output]>>, Error> {
+        match self.failure {
+            Some(error) => Err(error),
+            None => Ok(ExecutionCompletion {
+                submission: self.submission,
+                output: self.output,
+                gpu_materialized: self.gpu_materialized,
+            }),
+        }
+    }
+}
+
 /// Validated completion identity paired with its operation-specific output.
 #[derive(Debug)]
 pub struct ExecutionReceipt<Output> {
@@ -191,6 +220,25 @@ pub trait ExecutionPort: std::fmt::Debug + Send + Sync {
 /// guest-memory blits and core state transitions.
 pub fn execute_resolved_submission<Draw, Compute, DrawOutput, ComputeOutput, Error>(
     submission: ResolvedSubmission<Draw, Compute>,
+    draw: impl FnMut(&SubmissionContext, Draw) -> Result<CommandExecution<DrawOutput>, Error>,
+    compute: impl FnMut(&SubmissionContext, Compute) -> Result<CommandExecution<ComputeOutput>, Error>,
+    blit: impl FnMut(
+        &SubmissionContext,
+        ResolvedBlit,
+    ) -> Result<CommandExecution<BlitCompletion>, Error>,
+    resource_state: impl FnMut(
+        &SubmissionContext,
+        ResolvedResourceState,
+    ) -> Result<CommandExecution<ResourceStateCompletion>, Error>,
+) -> Result<ResolvedExecutionCompletion<DrawOutput, ComputeOutput>, Error> {
+    execute_resolved_submission_progress(submission, draw, compute, blit, resource_state)
+        .into_result()
+}
+
+/// Execute commands in order while retaining the exact successful prefix when
+/// the first command declines.
+pub fn execute_resolved_submission_progress<Draw, Compute, DrawOutput, ComputeOutput, Error>(
+    submission: ResolvedSubmission<Draw, Compute>,
     mut draw: impl FnMut(&SubmissionContext, Draw) -> Result<CommandExecution<DrawOutput>, Error>,
     mut compute: impl FnMut(
         &SubmissionContext,
@@ -204,49 +252,62 @@ pub fn execute_resolved_submission<Draw, Compute, DrawOutput, ComputeOutput, Err
         &SubmissionContext,
         ResolvedResourceState,
     ) -> Result<CommandExecution<ResourceStateCompletion>, Error>,
-) -> Result<ResolvedExecutionCompletion<DrawOutput, ComputeOutput>, Error> {
+) -> SubmissionExecutionProgress<ExecutionOutput<DrawOutput, ComputeOutput>, Error> {
     let identity = submission.context.identity;
     let mut outputs = Vec::with_capacity(submission.command_buffer.commands().len());
     let mut materialized = std::collections::BTreeSet::new();
     for command in submission.command_buffer.into_commands().into_vec() {
         let execution = match command {
-            ResolvedCommand::Draw(command) => {
-                let execution = draw(&submission.context, command)?;
+            ResolvedCommand::Draw(command) => draw(&submission.context, command).map(|execution| {
                 CommandExecution::new(
                     ExecutionOutput::Draw(execution.output),
                     execution.gpu_materialized,
                 )
-            }
+            }),
             ResolvedCommand::Compute(command) => {
-                let execution = compute(&submission.context, command)?;
-                CommandExecution::new(
-                    ExecutionOutput::Compute(execution.output),
-                    execution.gpu_materialized,
-                )
+                compute(&submission.context, command).map(|execution| {
+                    CommandExecution::new(
+                        ExecutionOutput::Compute(execution.output),
+                        execution.gpu_materialized,
+                    )
+                })
             }
             ResolvedCommand::Blit(command) => {
-                let execution = blit(&submission.context, *command)?;
-                CommandExecution::new(
-                    ExecutionOutput::Blit(execution.output),
-                    execution.gpu_materialized,
-                )
+                blit(&submission.context, *command).map(|execution| {
+                    CommandExecution::new(
+                        ExecutionOutput::Blit(execution.output),
+                        execution.gpu_materialized,
+                    )
+                })
             }
-            ResolvedCommand::ResourceState(command) => {
-                let execution = resource_state(&submission.context, command)?;
-                CommandExecution::new(
-                    ExecutionOutput::ResourceState(execution.output),
-                    execution.gpu_materialized,
-                )
+            ResolvedCommand::ResourceState(command) => resource_state(&submission.context, command)
+                .map(|execution| {
+                    CommandExecution::new(
+                        ExecutionOutput::ResourceState(execution.output),
+                        execution.gpu_materialized,
+                    )
+                }),
+        };
+        let execution = match execution {
+            Ok(execution) => execution,
+            Err(error) => {
+                return SubmissionExecutionProgress {
+                    submission: identity,
+                    output: outputs.into_boxed_slice(),
+                    gpu_materialized: materialized.into_iter().collect::<Vec<_>>().into(),
+                    failure: Some(error),
+                };
             }
         };
         materialized.extend(execution.gpu_materialized.iter().copied());
         outputs.push(execution.output);
     }
-    Ok(ExecutionCompletion {
+    SubmissionExecutionProgress {
         submission: identity,
         output: outputs.into_boxed_slice(),
         gpu_materialized: materialized.into_iter().collect::<Vec<_>>().into(),
-    })
+        failure: None,
+    }
 }
 
 #[cfg(test)]
@@ -364,5 +425,39 @@ mod tests {
         assert!(matches!(completion.output[0], ExecutionOutput::Draw(10)));
         assert!(matches!(completion.output[1], ExecutionOutput::Compute(20)));
         assert!(matches!(completion.output[2], ExecutionOutput::Draw(30)));
+    }
+
+    #[test]
+    fn a_failed_command_returns_the_exact_successful_prefix() {
+        let context = SubmissionContext::standalone(7);
+        let first = range(1).content;
+        let submission = ResolvedSubmission {
+            context: context.clone(),
+            command_buffer: ResolvedCommandBuffer::new(vec![
+                ResolvedCommand::Draw(1),
+                ResolvedCommand::Draw(2),
+                ResolvedCommand::Draw(3),
+            ]),
+        };
+
+        let progress = execute_resolved_submission_progress(
+            submission,
+            |_, draw| {
+                if draw == 2 {
+                    Err("second draw refused")
+                } else {
+                    Ok(CommandExecution::new(draw * 10, vec![first]))
+                }
+            },
+            |_, _: ()| -> Result<CommandExecution<()>, &'static str> { unreachable!() },
+            |_, _| unreachable!(),
+            |_, _| unreachable!(),
+        );
+
+        assert_eq!(progress.submission, context.identity);
+        assert_eq!(progress.failure, Some("second draw refused"));
+        assert_eq!(progress.gpu_materialized.as_ref(), &[first]);
+        assert_eq!(progress.output.len(), 1);
+        assert!(matches!(progress.output[0], ExecutionOutput::Draw(10)));
     }
 }

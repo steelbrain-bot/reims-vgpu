@@ -69,10 +69,10 @@ pub use draw_preparation::{
     AttachmentPlanDecline, AttachmentTargetRole, DrawPreparationDecline, SamplerBindingSource,
 };
 pub use execution::{
-    execute_resolved_submission, BlitCompletion, CommandExecution, ExecutionCompletion,
-    ExecutionKind, ExecutionOutput, ExecutionPort, ExecutionReceipt, ResolvedCommand,
-    ResolvedCommandBuffer, ResolvedExecutionCompletion, ResolvedSubmission,
-    ResourceStateCompletion,
+    execute_resolved_submission, execute_resolved_submission_progress, BlitCompletion,
+    CommandExecution, ExecutionCompletion, ExecutionKind, ExecutionOutput, ExecutionPort,
+    ExecutionReceipt, ResolvedCommand, ResolvedCommandBuffer, ResolvedExecutionCompletion,
+    ResolvedSubmission, ResourceStateCompletion, SubmissionExecutionProgress,
 };
 pub use gather::{
     fold_runs, AuditDensity, ContentAudit, GatherObservation, GatherOutcome, GatherPolicies,

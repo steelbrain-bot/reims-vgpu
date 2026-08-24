@@ -107,6 +107,8 @@ pub type ResolvedSubmission =
     reims_vgpu_core::ResolvedSubmission<Box<DrawRequest>, Box<ComputeRequest>>;
 pub type ExecutionOutput = reims_vgpu_core::ExecutionOutput<DrawOutput, ComputeOutput>;
 pub type ExecutionCompletion = reims_vgpu_core::ExecutionCompletion<Box<[ExecutionOutput]>>;
+pub type ExecutionProgress =
+    reims_vgpu_core::SubmissionExecutionProgress<ExecutionOutput, DrawError>;
 pub type ExecutionReceipt<T> = reims_vgpu_core::ExecutionReceipt<T>;
 pub type StampAnnounce = std::sync::Arc<dyn Fn(u32) + Send + Sync>;
 
@@ -711,6 +713,29 @@ pub trait Executor:
     + RenderBufferPlanningService
     + WindowPresentationService
 {
+    /// Execute a whole immutable submission while retaining the exact accepted
+    /// prefix if a later command declines.
+    ///
+    /// Backends that only implement the legacy all-or-error port return either
+    /// the whole output or an empty failed prefix. Packet-capable backends
+    /// override this and preserve progress command by command.
+    fn execute_progress(&self, submission: ResolvedSubmission) -> ExecutionProgress {
+        let identity = submission.context.identity;
+        match self.execute(submission) {
+            Ok(completion) => ExecutionProgress {
+                submission: completion.submission,
+                output: completion.output,
+                gpu_materialized: completion.gpu_materialized,
+                failure: None,
+            },
+            Err(error) => ExecutionProgress {
+                submission: identity,
+                output: Box::new([]),
+                gpu_materialized: Arc::from([]),
+                failure: Some(error),
+            },
+        }
+    }
 }
 
 /// Compatibility adapter over the current Vulkan engine facade.
@@ -1031,7 +1056,11 @@ impl ObservationService for VulkanExecutor {
     }
 }
 
-impl Executor for VulkanExecutor {}
+impl Executor for VulkanExecutor {
+    fn execute_progress(&self, submission: ResolvedSubmission) -> ExecutionProgress {
+        self.execute_progress_impl(submission)
+    }
+}
 
 impl GuestImagePlanningService for VulkanExecutor {
     fn sampled_image_binding_requirement(
@@ -1546,36 +1575,74 @@ impl ComputeResidencyService for VulkanExecutor {
     }
 }
 
-impl ExecutionPort for VulkanExecutor {
-    type Submission = ResolvedSubmission;
-    type Completion = ExecutionCompletion;
-    type Error = DrawError;
+impl VulkanExecutor {
+    fn execute_progress_impl(&self, submission: ResolvedSubmission) -> ExecutionProgress {
+        enum SideEffect {
+            Draw {
+                depth_owner: Option<(ResourceLifetimeRef, TargetIdentity)>,
+                materialized: Vec<reims_vgpu_core::ContentStamp>,
+            },
+            Compute {
+                materialized: Vec<reims_vgpu_core::ContentStamp>,
+            },
+            HostSemantic,
+        }
 
-    fn execute(&self, submission: Self::Submission) -> Result<Self::Completion, Self::Error> {
         let _scope = self.enter();
-        reims_vgpu_core::execute_resolved_submission(
-            submission,
-            |context, request| {
-                let depth_owner = request
-                    .depth_attachment
-                    .as_ref()
-                    .map(|depth| (depth.resource_lifetime.clone(), depth.identity.clone()));
-                let materialized = request
-                    .sampled_images
-                    .iter()
-                    .filter(|image| {
-                        matches!(
-                            &image.source,
-                            reims_vgpu_core::SampledSource::Bytes(_)
-                                | reims_vgpu_core::SampledSource::GuestRuns(..)
-                        )
-                    })
-                    .filter_map(|image| image.content)
-                    .collect::<Vec<_>>();
-                let output = reims_vgpu_vulkan::engine::execute_draw_request_in_submission(
-                    context, &request,
-                )?;
-                if let Some((owner, identity)) = depth_owner {
+        let side_effects = submission
+            .command_buffer
+            .commands()
+            .iter()
+            .map(|command| match command {
+                ResolvedCommand::Draw(request) => SideEffect::Draw {
+                    depth_owner: request
+                        .depth_attachment
+                        .as_ref()
+                        .map(|depth| (depth.resource_lifetime.clone(), depth.identity.clone())),
+                    materialized: request
+                        .sampled_images
+                        .iter()
+                        .filter(|image| {
+                            matches!(
+                                &image.source,
+                                reims_vgpu_core::SampledSource::Bytes(_)
+                                    | reims_vgpu_core::SampledSource::GuestRuns(..)
+                            )
+                        })
+                        .filter_map(|image| image.content)
+                        .collect(),
+                },
+                ResolvedCommand::Compute(request) => SideEffect::Compute {
+                    materialized: request
+                        .sampled_images
+                        .iter()
+                        .filter(|image| {
+                            matches!(
+                                &image.source,
+                                reims_vgpu_core::ComputeSampledImageSource::Bytes(_)
+                                    | reims_vgpu_core::ComputeSampledImageSource::GuestPages(_)
+                            )
+                        })
+                        .filter_map(|image| image.content)
+                        .collect(),
+                },
+                ResolvedCommand::Blit(_) | ResolvedCommand::ResourceState(_) => {
+                    SideEffect::HostSemantic
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut progress = reims_vgpu_vulkan::engine::execute_submission_progress(submission);
+        let mut materialized = std::collections::BTreeSet::new();
+        for effect in side_effects.into_iter().take(progress.output.len()) {
+            match effect {
+                SideEffect::Draw {
+                    depth_owner,
+                    materialized: stamps,
+                } => {
+                    materialized.extend(stamps);
+                    let Some((owner, identity)) = depth_owner else {
+                        continue;
+                    };
                     let (backing, _) = self
                         .resident_leases
                         .lock()
@@ -1589,41 +1656,24 @@ impl ExecutionPort for VulkanExecutor {
                         ));
                     }
                 }
-                Ok(reims_vgpu_core::CommandExecution::new(output, materialized))
-            },
-            |context, request| {
-                let materialized = request
-                    .sampled_images
-                    .iter()
-                    .filter(|image| {
-                        matches!(
-                            &image.source,
-                            reims_vgpu_core::ComputeSampledImageSource::Bytes(_)
-                                | reims_vgpu_core::ComputeSampledImageSource::GuestPages(_)
-                        )
-                    })
-                    .filter_map(|image| image.content)
-                    .collect::<Vec<_>>();
-                let output = reims_vgpu_vulkan::engine::execute_compute_request_in_submission(
-                    context, &request,
-                )?;
-                Ok(reims_vgpu_core::CommandExecution::new(output, materialized))
-            },
-            |_, _| {
-                Err(DrawError::Facade(
-                    EngineFacadeDecline::ExecutorServiceUnavailable {
-                        service: "host_memory_blit",
-                    },
-                ))
-            },
-            |_, _| {
-                Err(DrawError::Facade(
-                    EngineFacadeDecline::ExecutorServiceUnavailable {
-                        service: "core_resource_state",
-                    },
-                ))
-            },
-        )
+                SideEffect::Compute {
+                    materialized: stamps,
+                } => materialized.extend(stamps),
+                SideEffect::HostSemantic => {}
+            }
+        }
+        progress.gpu_materialized = materialized.into_iter().collect::<Vec<_>>().into();
+        progress
+    }
+}
+
+impl ExecutionPort for VulkanExecutor {
+    type Submission = ResolvedSubmission;
+    type Completion = ExecutionCompletion;
+    type Error = DrawError;
+
+    fn execute(&self, submission: Self::Submission) -> Result<Self::Completion, Self::Error> {
+        self.execute_progress_impl(submission).into_result()
     }
 }
 
@@ -1677,32 +1727,44 @@ pub fn execute_command_buffer(
     context: SubmissionContext,
     command_buffer: ResolvedCommandBuffer<Box<DrawRequest>, Box<ComputeRequest>>,
 ) -> Result<ExecutionCompletion, DrawError> {
+    execute_command_buffer_progress(executor, context, command_buffer)?.into_result()
+}
+
+/// Execute and validate a whole command buffer without discarding an accepted
+/// prefix when a later operation fails.
+pub fn execute_command_buffer_progress(
+    executor: &dyn Executor,
+    context: SubmissionContext,
+    command_buffer: ResolvedCommandBuffer<Box<DrawRequest>, Box<ComputeRequest>>,
+) -> Result<ExecutionProgress, DrawError> {
     let expected_identity = context.identity;
     let expected_kinds = ExpectedCommandKinds::capture(&command_buffer);
-    let completion = executor.execute(ResolvedSubmission {
+    let progress = executor.execute_progress(ResolvedSubmission {
         context,
         command_buffer,
-    })?;
-    if completion.submission != expected_identity {
+    });
+    if progress.submission != expected_identity {
         return Err(DrawError::Facade(
             EngineFacadeDecline::ExecutorCompletionIdentityMismatch {
                 expected: expected_identity,
-                actual: completion.submission,
+                actual: progress.submission,
             },
         ));
     }
-    if completion.output.len() != expected_kinds.len() {
+    let count_is_valid = progress.output.len() <= expected_kinds.len()
+        && (progress.failure.is_some() || progress.output.len() == expected_kinds.len());
+    if !count_is_valid {
         return Err(DrawError::Facade(
             EngineFacadeDecline::ExecutorCompletionCountMismatch {
                 expected: expected_kinds.len(),
-                actual: completion.output.len(),
+                actual: progress.output.len(),
             },
         ));
     }
-    for (index, actual) in completion.output.iter().enumerate() {
+    for (index, actual) in progress.output.iter().enumerate() {
         let expected = expected_kinds
             .get(index)
-            .expect("completion count was checked above");
+            .expect("progress cannot exceed the checked command count");
         if expected != actual.kind() {
             return Err(DrawError::Facade(
                 EngineFacadeDecline::ExecutorCompletionKindMismatch {
@@ -1712,7 +1774,46 @@ pub fn execute_command_buffer(
             ));
         }
     }
-    Ok(completion)
+    Ok(progress)
+}
+
+/// Execute an ordered draw-only command buffer as one submission transaction.
+///
+/// Render-chain orchestration uses this form because its completion plans are
+/// all draw plans; heterogeneous EXEC transactions use
+/// [`execute_command_buffer_progress`] directly.
+pub fn execute_draws_progress(
+    executor: &dyn Executor,
+    context: SubmissionContext,
+    requests: Vec<DrawRequest>,
+) -> Result<reims_vgpu_core::SubmissionExecutionProgress<DrawOutput, DrawError>, DrawError> {
+    let command_buffer = ResolvedCommandBuffer::new(
+        requests
+            .into_iter()
+            .map(|request| ResolvedCommand::Draw(Box::new(request)))
+            .collect::<Vec<_>>(),
+    );
+    let progress = execute_command_buffer_progress(executor, context, command_buffer)?;
+    let mut outputs = Vec::with_capacity(progress.output.len());
+    for output in progress.output.into_vec() {
+        match output {
+            ExecutionOutput::Draw(output) => outputs.push(output),
+            other => {
+                return Err(DrawError::Facade(
+                    EngineFacadeDecline::ExecutorCompletionKindMismatch {
+                        expected: reims_vgpu_core::ExecutionKind::Draw.as_str(),
+                        actual: other.kind().as_str(),
+                    },
+                ));
+            }
+        }
+    }
+    Ok(reims_vgpu_core::SubmissionExecutionProgress {
+        submission: progress.submission,
+        output: outputs.into_boxed_slice(),
+        gpu_materialized: progress.gpu_materialized,
+        failure: progress.failure,
+    })
 }
 
 /// Execute a draw and enforce that the executor returns the matching completion.
@@ -1926,6 +2027,7 @@ mod tests {
         Compute,
         Commands,
         ReversedCommands,
+        FailSecondCommand,
     }
 
     #[derive(Debug)]
@@ -2005,7 +2107,59 @@ mod tests {
         }
     }
 
-    impl Executor for ScriptedExecutor {}
+    impl Executor for ScriptedExecutor {
+        fn execute_progress(&self, submission: ResolvedSubmission) -> ExecutionProgress {
+            if matches!(self.completion, ScriptedCompletion::FailSecondCommand) {
+                let context = submission.context.clone();
+                self.seen.lock().unwrap().push(context);
+                let mut command_index = 0usize;
+                return reims_vgpu_core::execute_resolved_submission_progress(
+                    submission,
+                    |_, _| {
+                        command_index += 1;
+                        if command_index == 2 {
+                            Err(DrawError::Facade(
+                                EngineFacadeDecline::ExecutorServiceUnavailable {
+                                    service: "scripted_second_command",
+                                },
+                            ))
+                        } else {
+                            Ok(
+                                reims_vgpu_core::CommandExecution::without_gpu_materialization(
+                                    DrawOutput::default(),
+                                ),
+                            )
+                        }
+                    },
+                    |_, _| {
+                        Ok(
+                            reims_vgpu_core::CommandExecution::without_gpu_materialization(
+                                ComputeOutput::default(),
+                            ),
+                        )
+                    },
+                    |_, _| unreachable!(),
+                    |_, _| unreachable!(),
+                );
+            }
+
+            let identity = submission.context.identity;
+            match ExecutionPort::execute(self, submission) {
+                Ok(completion) => ExecutionProgress {
+                    submission: completion.submission,
+                    output: completion.output,
+                    gpu_materialized: completion.gpu_materialized,
+                    failure: None,
+                },
+                Err(error) => ExecutionProgress {
+                    submission: identity,
+                    output: Box::new([]),
+                    gpu_materialized: Arc::from([]),
+                    failure: Some(error),
+                },
+            }
+        }
+    }
 
     impl ResidentService for ScriptedExecutor {}
 
@@ -2085,6 +2239,7 @@ mod tests {
                         outputs.reverse();
                         outputs
                     }
+                    ScriptedCompletion::FailSecondCommand => command_outputs(),
                 }
                 .into_boxed_slice(),
                 gpu_materialized: Arc::from([]),
@@ -2279,6 +2434,30 @@ mod tests {
                 expected: "draw",
                 actual: "compute",
             })
+        ));
+    }
+
+    #[test]
+    fn a_whole_submission_preserves_outputs_before_the_first_failure() {
+        let scripted = ScriptedExecutor::new(ScriptedCompletion::FailSecondCommand);
+        let command_buffer = ResolvedCommandBuffer::new(vec![
+            ResolvedCommand::Draw(Box::new(DrawRequest::default())),
+            ResolvedCommand::Draw(Box::new(DrawRequest::default())),
+            ResolvedCommand::Draw(Box::new(DrawRequest::default())),
+        ]);
+
+        let progress = execute_command_buffer_progress(&scripted, context(), command_buffer)
+            .expect("the progress envelope is valid");
+
+        assert_eq!(progress.output.len(), 1);
+        assert!(matches!(progress.output[0], ExecutionOutput::Draw(_)));
+        assert!(matches!(
+            progress.failure,
+            Some(DrawError::Facade(
+                EngineFacadeDecline::ExecutorServiceUnavailable {
+                    service: "scripted_second_command",
+                }
+            ))
         ));
     }
 

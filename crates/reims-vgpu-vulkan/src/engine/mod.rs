@@ -1561,6 +1561,15 @@ pub fn execute_draw_request_in_submission(
     submission: &reims_vgpu_core::SubmissionContext,
     req: &DrawRequest,
 ) -> Result<DrawOutput, DrawError> {
+    let mut guard = lock_engine();
+    execute_draw_request_locked(&mut guard, submission, req)
+}
+
+fn execute_draw_request_locked(
+    guard: &mut EngineState,
+    submission: &reims_vgpu_core::SubmissionContext,
+    req: &DrawRequest,
+) -> Result<DrawOutput, DrawError> {
     exec::validate_v1(req)?;
     let vertex =
         crate::m2v_cache::resolve_prepared_shader(req.program.vertex.id).ok_or_else(|| {
@@ -1579,7 +1588,6 @@ pub fn execute_draw_request_in_submission(
             )
         })?;
     let program = exec::NativeRenderProgram { vertex, fragment };
-    let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
         ref mut caches,
@@ -2699,6 +2707,15 @@ pub fn execute_compute_request_in_submission(
     submission: &reims_vgpu_core::SubmissionContext,
     req: &ComputeRequest,
 ) -> Result<ComputeOutput, ComputeError> {
+    let mut guard = lock_engine();
+    execute_compute_request_locked(&mut guard, submission, req)
+}
+
+fn execute_compute_request_locked(
+    guard: &mut EngineState,
+    submission: &reims_vgpu_core::SubmissionContext,
+    req: &ComputeRequest,
+) -> Result<ComputeOutput, ComputeError> {
     exec_compute::validate_compute(req)?;
     let shader = crate::m2v_cache::resolve_prepared_shader(req.program.id).ok_or_else(|| {
         DrawError::ComputeValidation(
@@ -2708,7 +2725,6 @@ pub fn execute_compute_request_in_submission(
         )
     })?;
     let program = exec_compute::NativeComputeProgram { shader };
-    let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
         ref mut caches,
@@ -2731,6 +2747,58 @@ pub fn execute_compute_request_in_submission(
             Err(DrawError::DeviceLost(decline))
         }
         Err(e) => Err(e),
+    }
+}
+
+/// Execute one immutable render/compute submission through one engine entry.
+///
+/// This removes the per-command process-lock boundary. The lock still owns the
+/// shared engine for the duration of this transitional implementation; moving
+/// [`pools::EncoderPools`] to a recording worker removes that remaining coarse
+/// ownership without changing the packet transaction or its prefix semantics.
+pub fn execute_submission_progress(
+    submission: reims_vgpu_core::ResolvedSubmission<Box<DrawRequest>, Box<ComputeRequest>>,
+) -> reims_vgpu_core::SubmissionExecutionProgress<
+    reims_vgpu_core::ExecutionOutput<DrawOutput, ComputeOutput>,
+    DrawError,
+> {
+    let identity = submission.context.identity;
+    let mut outputs = Vec::with_capacity(submission.command_buffer.commands().len());
+    let mut guard = lock_engine();
+    for command in submission.command_buffer.into_commands().into_vec() {
+        let result = match command {
+            reims_vgpu_core::ResolvedCommand::Draw(request) => {
+                execute_draw_request_locked(&mut guard, &submission.context, &request)
+                    .map(reims_vgpu_core::ExecutionOutput::Draw)
+            }
+            reims_vgpu_core::ResolvedCommand::Compute(request) => {
+                execute_compute_request_locked(&mut guard, &submission.context, &request)
+                    .map(reims_vgpu_core::ExecutionOutput::Compute)
+            }
+            reims_vgpu_core::ResolvedCommand::Blit(_)
+            | reims_vgpu_core::ResolvedCommand::ResourceState(_) => Err(DrawError::Facade(
+                EngineFacadeDecline::ExecutorServiceUnavailable {
+                    service: "host_semantic_command",
+                },
+            )),
+        };
+        match result {
+            Ok(output) => outputs.push(output),
+            Err(error) => {
+                return reims_vgpu_core::SubmissionExecutionProgress {
+                    submission: identity,
+                    output: outputs.into_boxed_slice(),
+                    gpu_materialized: std::sync::Arc::from([]),
+                    failure: Some(error),
+                };
+            }
+        }
+    }
+    reims_vgpu_core::SubmissionExecutionProgress {
+        submission: identity,
+        output: outputs.into_boxed_slice(),
+        gpu_materialized: std::sync::Arc::from([]),
+        failure: None,
     }
 }
 

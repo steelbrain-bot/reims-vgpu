@@ -189,6 +189,88 @@ pub(super) struct DrawCompletionPlan {
     render_target_resource: Option<std::sync::Arc<crate::model::TaskResource>>,
 }
 
+/// One packet-owned render transaction: immutable executor requests paired
+/// with the semantic completion plans that consume their ordered outputs.
+pub(super) struct PreparedDrawSubmission {
+    context: reims_vgpu_core::SubmissionContext,
+    draws: PreparedDraws,
+}
+
+enum PreparedDraws {
+    Empty,
+    One(PreparedDraw),
+    Many(Vec<PreparedDraw>),
+}
+
+pub(super) struct PreparedDrawProgress {
+    pub completed: Vec<CompletedDraw>,
+    pub failure: Option<ExecutorDiagnostic>,
+}
+
+impl PreparedDrawSubmission {
+    pub fn new(context: reims_vgpu_core::SubmissionContext) -> Self {
+        Self {
+            context,
+            draws: PreparedDraws::Empty,
+        }
+    }
+
+    pub fn push(&mut self, draw: PreparedDraw) {
+        self.draws = match std::mem::replace(&mut self.draws, PreparedDraws::Empty) {
+            PreparedDraws::Empty => PreparedDraws::One(draw),
+            PreparedDraws::One(first) => PreparedDraws::Many(vec![first, draw]),
+            PreparedDraws::Many(mut draws) => {
+                draws.push(draw);
+                PreparedDraws::Many(draws)
+            }
+        };
+    }
+
+    pub fn execute(self, state: &mut Device) -> Result<PreparedDrawProgress, ExecutorDiagnostic> {
+        let draws = match self.draws {
+            PreparedDraws::Empty => {
+                return Ok(PreparedDrawProgress {
+                    completed: Vec::new(),
+                    failure: None,
+                });
+            }
+            PreparedDraws::One(draw) => {
+                let completed = draw.execute_direct(state, self.context)?;
+                return Ok(PreparedDrawProgress {
+                    completed: vec![completed],
+                    failure: None,
+                });
+            }
+            PreparedDraws::Many(draws) => draws,
+        };
+        let executor = std::sync::Arc::clone(&state.executor);
+        let mut requests = Vec::with_capacity(draws.len());
+        let mut completion_plans = Vec::with_capacity(draws.len());
+        for draw in draws {
+            let (request, completion) = draw.into_executor_parts();
+            requests.push(request);
+            completion_plans.push(completion);
+        }
+        let progress = executor::execute_draws_progress(executor.as_ref(), self.context, requests)
+            .map_err(|error| ExecutorDiagnostic::from_decline(&error))?;
+        state
+            .task_objects
+            .resources
+            .record_gpu_materializations(progress.gpu_materialized.iter().copied());
+        let completed = completion_plans
+            .into_iter()
+            .zip(progress.output)
+            .map(|(plan, output)| plan.apply_output(progress.submission, output))
+            .collect();
+        Ok(PreparedDrawProgress {
+            completed,
+            failure: progress
+                .failure
+                .map(|error| ExecutorDiagnostic::from_decline(&error)),
+        })
+    }
+}
+
 impl PreparedDraw {
     pub(super) fn new(
         request: reims_vgpu_core::DrawRequest,
@@ -212,9 +294,26 @@ impl PreparedDraw {
         state: &mut Device,
         task_id: u32,
     ) -> Result<CompletedDraw, ExecutorDiagnostic> {
+        let context = executor::context_for(state, task_id);
+        let mut submission = PreparedDrawSubmission::new(context);
+        submission.push(self);
+        let mut progress = submission.execute(state)?;
+        if let Some(failure) = progress.failure {
+            return Err(failure);
+        }
+        Ok(progress
+            .completed
+            .pop()
+            .expect("one prepared draw returns one completion"))
+    }
+
+    fn execute_direct(
+        self,
+        state: &mut Device,
+        submission: reims_vgpu_core::SubmissionContext,
+    ) -> Result<CompletedDraw, ExecutorDiagnostic> {
         let (request, completion) = self.into_executor_parts();
         let executor = std::sync::Arc::clone(&state.executor);
-        let submission = executor::context_for(state, task_id);
         let receipt = executor::execute_draw(executor.as_ref(), submission, request)
             .map_err(|error| ExecutorDiagnostic::from_decline(&error))?;
         Ok(completion.apply(state, receipt))
@@ -250,12 +349,20 @@ impl DrawCompletionPlan {
             .task_objects
             .resources
             .record_gpu_materializations(receipt.gpu_materialized.iter().copied());
+        self.apply_output(receipt.submission, receipt.output)
+    }
+
+    fn apply_output(
+        self,
+        submission: reims_vgpu_protocol::SubmissionIdentity,
+        output: reims_vgpu_core::DrawOutput,
+    ) -> CompletedDraw {
         if let Some(resource) = self.render_target_resource {
             resource.note_render_target_use();
         }
         CompletedDraw {
-            submission: receipt.submission.id,
-            output: receipt.output,
+            submission: submission.id,
+            output,
             route: self.route,
         }
     }

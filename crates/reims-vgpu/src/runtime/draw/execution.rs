@@ -2059,12 +2059,96 @@ pub(super) fn resolve_gva_load_source<M: HostMemory + HostOps>(
     }
 }
 
+struct PreparedM2vDraw {
+    draw: PreparedDraw,
+    task_id: u32,
+    pipeline_ref: u32,
+    width: u32,
+    height: u32,
+    census_verbose: bool,
+}
+
+impl PreparedM2vDraw {
+    fn execute(self, state: &mut Device) -> Result<M2vDrawSpan, ExecutorDiagnostic> {
+        let Self {
+            draw,
+            task_id,
+            pipeline_ref,
+            width,
+            height,
+            census_verbose,
+        } = self;
+        let completed = draw.execute(state, task_id)?;
+        crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Store);
+        report_completed_pixels(
+            census_verbose,
+            pipeline_ref,
+            width,
+            height,
+            &completed.output,
+        );
+        let visibility_samples = completed.output.occlusion_samples;
+        let submission = completed.submission;
+        Ok(match completed.route {
+            DrawCompletionRoute::Pixels => M2vDrawSpan::Pixels {
+                submission,
+                bytes: completed.output.pixels,
+                bgra: completed.output.pixels_bgra,
+                visibility_samples,
+            },
+            DrawCompletionRoute::EffectsOnly => M2vDrawSpan::EffectsOnly {
+                submission,
+                visibility_samples,
+            },
+            DrawCompletionRoute::ResidentChain(identity) => M2vDrawSpan::ResidentChain {
+                submission,
+                identity,
+                visibility_samples,
+            },
+            DrawCompletionRoute::ResidentGvaReadback(identity) => {
+                M2vDrawSpan::ResidentGvaReadback {
+                    submission,
+                    identity,
+                    visibility_samples,
+                }
+            }
+            DrawCompletionRoute::ResidentGvaStore(identity) => M2vDrawSpan::ResidentGvaStore {
+                submission,
+                identity,
+                guest_store_pages: completed.output.guest_store_pages,
+                visibility_samples,
+            },
+            DrawCompletionRoute::ResidentSurfaceStore(identity) => {
+                M2vDrawSpan::ResidentSurfaceStore {
+                    submission,
+                    identity,
+                    guest_store_pages: completed.output.guest_store_pages,
+                    guest_store_window: completed.output.guest_store_window,
+                    visibility_samples,
+                }
+            }
+        })
+    }
+}
+
 fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     state: &mut Device,
     host: &mut M,
     req: &DrawEncodeRequest,
     writeback_guest: bool,
 ) -> Result<M2vDrawSpan, DrawAttemptError> {
+    match prepare_metal2vulkan_draw(state, host, req, writeback_guest)? {
+        Some(prepared) => prepared.execute(state).map_err(DrawAttemptError::from),
+        None => Ok(M2vDrawSpan::None),
+    }
+}
+
+fn prepare_metal2vulkan_draw<M: HostMemory + HostOps>(
+    state: &mut Device,
+    host: &mut M,
+    req: &DrawEncodeRequest,
+    writeback_guest: bool,
+) -> Result<Option<PreparedM2vDraw>, DrawAttemptError> {
     // Only the final record of a portability render-pass chain reads back CPU
     // pixels; used by the resident-chain rail below (harmless on other paths).
     let _ = &writeback_guest;
@@ -2099,7 +2183,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         height: h,
     }) = pipeline_plan::plan_pipeline(state, host, req)?
     else {
-        return Ok(M2vDrawSpan::None);
+        return Ok(None);
     };
     {
         let resource_plan::DrawResourcePlan {
@@ -2202,83 +2286,19 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             h,
             vertex_count,
         );
-        // The executor boundary projects its native error into an exact
-        // diagnostic (slug, fields, and display detail). Orchestration keeps
-        // that diagnostic opaque, so the boundary below names the executor's
-        // specific check without importing its error vocabulary.
-        crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Engine);
         let render_target_resource = req
             .colors
             .first()
             .and_then(|color| color.resource.as_ref())
             .cloned();
-        let completed = PreparedDraw::new(resources, completion_route, render_target_resource)
-            .execute(state, req.task_id)?;
-        // The engine reports per draw because a Metal pass whose counter spans
-        // several draws is several Vulkan queries. Carry the completion value
-        // beside the span; the request remains input-only.
-        let visibility_samples = completed.output.occlusion_samples;
-        // Everything from here to the end of the chain is Store routing, and the
-        // `?` above deliberately leaves a declined draw charged to `engine`:
-        // where it declined is the engine's own typed reason to report, not this
-        // census's.
-        crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Store);
-        // RGB nonzero (ignore alpha) so black+alpha is not mistaken for content.
-        // Resident/import path uses skip_readback → empty `out.pixels` is **expected**
-        // and must not be read as "GPU drew black" (use import_content res_rgb_nz).
-        // The scan is O(pixels) on the drain worker and the line it feeds is the
-        // only consumer, so it runs only when that sink is open.
-        report_completed_pixels(census_verbose, req.pipeline_ref, w, h, &completed.output);
-        // No content-gated CPU composites: premultiplied One/OneMinusSourceAlpha
-        // is hardware Load+blend, and keep-seed / alpha0-hole compositing is not
-        // something real Metal does. The blend state below is what makes that
-        // true; a draw that lands wrong shows up as a typed decline on this
-        // boundary, not as a pixel census.
-        // Engine pixels are authoritative (empty when skip_readback; the Store
-        // path materializes bytes for surface_cache and the guest writeback).
-        //
-        // A resident completion carries its materialization outcome separately:
-        // direct guest pages need publication, copied residents retain debt.
-        let submission = completed.submission;
-        match completed.route {
-            DrawCompletionRoute::Pixels => Ok(M2vDrawSpan::Pixels {
-                submission,
-                bytes: completed.output.pixels,
-                bgra: completed.output.pixels_bgra,
-                visibility_samples,
-            }),
-            DrawCompletionRoute::EffectsOnly => Ok(M2vDrawSpan::EffectsOnly {
-                submission,
-                visibility_samples,
-            }),
-            DrawCompletionRoute::ResidentChain(identity) => Ok(M2vDrawSpan::ResidentChain {
-                submission,
-                identity,
-                visibility_samples,
-            }),
-            DrawCompletionRoute::ResidentGvaReadback(identity) => {
-                Ok(M2vDrawSpan::ResidentGvaReadback {
-                    submission,
-                    identity,
-                    visibility_samples,
-                })
-            }
-            DrawCompletionRoute::ResidentGvaStore(identity) => Ok(M2vDrawSpan::ResidentGvaStore {
-                submission,
-                identity,
-                guest_store_pages: completed.output.guest_store_pages,
-                visibility_samples,
-            }),
-            DrawCompletionRoute::ResidentSurfaceStore(identity) => {
-                Ok(M2vDrawSpan::ResidentSurfaceStore {
-                    submission,
-                    identity,
-                    guest_store_pages: completed.output.guest_store_pages,
-                    guest_store_window: completed.output.guest_store_window,
-                    visibility_samples,
-                })
-            }
-        }
+        Ok(Some(PreparedM2vDraw {
+            draw: PreparedDraw::new(resources, completion_route, render_target_resource),
+            task_id: req.task_id,
+            pipeline_ref: req.pipeline_ref,
+            width: w,
+            height: h,
+            census_verbose,
+        }))
     }
 }
 
