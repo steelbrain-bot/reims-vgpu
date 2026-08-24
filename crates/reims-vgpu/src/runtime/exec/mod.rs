@@ -4550,6 +4550,16 @@ struct PreparedResidentRecord {
 }
 
 struct SurfaceTransactionCompletion {
+    core: SurfaceCompletionCore,
+    final_icb: bool,
+    chain_rgba: Option<Vec<u8>>,
+    resident_chain_identity: Option<crate::model::TargetIdentity>,
+    visibility_counts: std::collections::BTreeMap<u64, u64>,
+    saw_backend_unavailable: bool,
+    draw_started: std::time::Instant,
+}
+
+struct SurfaceCompletionCore {
     task_id: u32,
     records: Vec<PreparedResidentRecord>,
     final_req: draw::DrawEncodeRequest,
@@ -4585,19 +4595,9 @@ impl RecordedSurfaceTransaction {
         state: &mut Device,
         host: &mut M,
         out: &mut ExecResult,
-        chain_rgba: &mut Option<Vec<u8>>,
-        visibility_counts: &mut std::collections::BTreeMap<u64, u64>,
-    ) -> Result<draw::DrawChainResult, ()> {
+    ) {
         let progress = self.recording.complete(state);
-        complete_prepared_surface_transaction(
-            state,
-            host,
-            out,
-            progress,
-            self.completion,
-            chain_rgba,
-            visibility_counts,
-        )
+        complete_terminal_surface_transaction(state, host, out, progress, self.completion);
     }
 }
 
@@ -4752,17 +4752,29 @@ fn flush_prepared_surface_transaction<M: HostMemory + HostOps>(
     final_req: &draw::DrawEncodeRequest,
     acc: &StreamAccum,
     chain_rgba: &mut Option<Vec<u8>>,
+    resident_chain_identity: &mut Option<crate::model::TargetIdentity>,
     visibility_counts: &mut std::collections::BTreeMap<u64, u64>,
+    saw_backend_unavailable: bool,
+    final_icb: bool,
+    draw_started: std::time::Instant,
     total_draws: usize,
-) -> Result<draw::DrawChainResult, ()> {
+) {
     let transaction = PreparedSurfaceTransaction {
         recording: submission.into_execution(),
         completion: SurfaceTransactionCompletion {
-            task_id,
-            records: std::mem::take(records),
-            final_req: final_req.clone(),
-            acc: acc.clone(),
-            total_draws,
+            core: SurfaceCompletionCore {
+                task_id,
+                records: std::mem::take(records),
+                final_req: final_req.clone(),
+                acc: acc.clone(),
+                total_draws,
+            },
+            final_icb,
+            chain_rgba: chain_rgba.take(),
+            resident_chain_identity: resident_chain_identity.take(),
+            visibility_counts: std::mem::take(visibility_counts),
+            saw_backend_unavailable,
+            draw_started,
         },
     };
     let identity = transaction.recording.identity();
@@ -4803,7 +4815,144 @@ fn flush_prepared_surface_transaction<M: HostMemory + HostOps>(
         crate::runtime::chain_phase::Phase::Engine,
         engine_started.elapsed(),
     );
-    recorded?.complete(state, host, out, chain_rgba, visibility_counts)
+    match recorded {
+        Ok(recorded) => recorded.complete(state, host, out),
+        Err(_) => finish_render_tail(
+            state,
+            host,
+            task_id,
+            acc,
+            out,
+            visibility_counts,
+            saw_backend_unavailable,
+        ),
+    }
+}
+
+fn complete_terminal_surface_transaction<M: HostMemory + HostOps>(
+    state: &mut Device,
+    host: &mut M,
+    out: &mut ExecResult,
+    progress: draw::PreparedM2vProgress,
+    completion: SurfaceTransactionCompletion,
+) {
+    let SurfaceTransactionCompletion {
+        core,
+        final_icb,
+        mut chain_rgba,
+        resident_chain_identity,
+        mut visibility_counts,
+        mut saw_backend_unavailable,
+        draw_started,
+    } = completion;
+    let task_id = core.task_id;
+    let acc = core.acc.clone();
+    let final_req = core.final_req.clone();
+    let total_draws = core.total_draws;
+    let encode = match complete_prepared_surface_transaction(
+        state,
+        host,
+        out,
+        progress,
+        core,
+        &mut chain_rgba,
+        &mut visibility_counts,
+    ) {
+        Ok(encode) => encode,
+        Err(()) => {
+            finish_render_tail(
+                state,
+                host,
+                task_id,
+                &acc,
+                out,
+                &visibility_counts,
+                saw_backend_unavailable,
+            );
+            return;
+        }
+    };
+
+    match (final_req.visibility, encode.visibility_samples) {
+        (Some(arming), Some(samples)) => {
+            let slot = visibility_counts.entry(arming.offset).or_default();
+            *slot = slot.saturating_add(samples);
+        }
+        (Some(arming), None) => note_unanswered_visibility(task_id, final_req.pipeline_ref, arming),
+        (None, _) => {}
+    }
+    crate::runtime::drain::note_drain_phase(crate::runtime::drain::DrainPhase::Draw, draw_started);
+    if final_icb {
+        if encode.status == EncodeStatus::Ok {
+            out.render_icb_ok = out.render_icb_ok.saturating_add(1);
+            crate::runtime::drain::note_store_route("icb_exec_ok");
+        } else {
+            out.render_icb_fail = out.render_icb_fail.saturating_add(1);
+        }
+    }
+    match encode.status {
+        EncodeStatus::Ok => out.draws_ok = out.draws_ok.saturating_add(1),
+        status @ EncodeStatus::BackendUnavailable(_) => {
+            saw_backend_unavailable = true;
+            out.draws_fail = out.draws_fail.saturating_add(1);
+            note_draw_encode_fail(
+                task_id,
+                final_req.pipeline_ref,
+                status,
+                total_draws.saturating_sub(1),
+                total_draws,
+            );
+            land_chain_before_abandon(
+                state,
+                host,
+                &mut chain_rgba,
+                ChainAbandonContext {
+                    task_id,
+                    acc: &acc,
+                    req: &final_req,
+                    resident_identity: resident_chain_identity.as_ref(),
+                    end: ChainEnd {
+                        cause: draw::ChainAbandonCause::BackendUnavailable,
+                        resident: resident_chain_identity.is_some(),
+                    },
+                },
+            );
+        }
+        status => {
+            out.draws_fail = out.draws_fail.saturating_add(1);
+            note_draw_encode_fail(
+                task_id,
+                final_req.pipeline_ref,
+                status,
+                total_draws.saturating_sub(1),
+                total_draws,
+            );
+            land_chain_before_abandon(
+                state,
+                host,
+                &mut chain_rgba,
+                ChainAbandonContext {
+                    task_id,
+                    acc: &acc,
+                    req: &final_req,
+                    resident_identity: resident_chain_identity.as_ref(),
+                    end: ChainEnd {
+                        cause: draw::ChainAbandonCause::TerminalRefusal,
+                        resident: resident_chain_identity.is_some(),
+                    },
+                },
+            );
+        }
+    }
+    finish_render_tail(
+        state,
+        host,
+        task_id,
+        &acc,
+        out,
+        &visibility_counts,
+        saw_backend_unavailable,
+    );
 }
 
 #[allow(
@@ -4815,11 +4964,11 @@ fn complete_prepared_surface_transaction<M: HostMemory + HostOps>(
     host: &mut M,
     out: &mut ExecResult,
     progress: draw::PreparedM2vProgress,
-    completion: SurfaceTransactionCompletion,
+    completion: SurfaceCompletionCore,
     chain_rgba: &mut Option<Vec<u8>>,
     visibility_counts: &mut std::collections::BTreeMap<u64, u64>,
 ) -> Result<draw::DrawChainResult, ()> {
-    let SurfaceTransactionCompletion {
+    let SurfaceCompletionCore {
         task_id,
         records,
         final_req,
@@ -5349,9 +5498,8 @@ fn finish_stream<M: HostMemory + HostOps>(
                         }
                     }
                 }
-                let mut batched_final = None;
                 let mut prepared_final_refusal = None;
-                if do_writeback && !prepared_resident_records.is_empty() {
+                if do_writeback {
                     match draw::prepare_surface_store_draw_chain(state, host, &req) {
                         Ok(Some(prepared)) => {
                             prepared_resident.push(prepared);
@@ -5359,7 +5507,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                                 &mut prepared_resident,
                                 draw::PreparedM2vSubmission::new(submission_context.clone()),
                             );
-                            match flush_prepared_surface_transaction(
+                            flush_prepared_surface_transaction(
                                 state,
                                 host,
                                 task_id,
@@ -5369,18 +5517,20 @@ fn finish_stream<M: HostMemory + HostOps>(
                                 &req,
                                 acc,
                                 &mut chain_rgba,
+                                &mut resident_chain_identity,
                                 &mut visibility_counts,
+                                saw_backend_unavailable,
+                                pd.icb_ref.is_some(),
+                                draw_started,
                                 draw_list.len(),
-                            ) {
-                                Ok(encode) => batched_final = Some(encode),
-                                Err(()) => break,
-                            }
+                            );
+                            return;
                         }
                         Ok(None) => {}
                         Err(encode) => prepared_final_refusal = Some(encode),
                     }
                 }
-                if batched_final.is_none() && !prepared_resident_records.is_empty() {
+                if !prepared_resident_records.is_empty() {
                     match flush_prepared_resident(
                         state,
                         out,
@@ -5407,7 +5557,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                         }
                     }
                 }
-                let encode = batched_final.or(prepared_final_refusal).unwrap_or_else(|| {
+                let encode = prepared_final_refusal.unwrap_or_else(|| {
                     draw::encode_draw_chain(state, host, &req, do_writeback, force_full_store)
                 });
                 retire_render_barriers_after(encode.status, &mut pending_render_barriers);
@@ -5568,25 +5718,58 @@ fn finish_stream<M: HostMemory + HostOps>(
             }
         }
         fin.enter(crate::runtime::drain::FinishPhase::Tail);
-        write_visibility_results(state, host, task_id, acc, &visibility_counts);
-        // Encode never landed Stores (unavailable operations, missing MTLB/pipeline, or
-        // mrt resolve fail). Honor CLEAR load+store into guest/host pages so
-        // dual-buffer display mids at least hold the pass clear color (archive
-        // CLEAR seed — not a content heuristic). Applies for any draw-fail
-        // class, not only BackendUnavailable: mrt_request fail used to skip this and left
-        // mid pages empty → nz_swing thrash on x86 Linux product.
-        if out.draws_ok == 0 && !acc.clears.is_empty() {
-            for att in acc.clears_reaching_guest_pages() {
-                if apply_clear(state, host, task_id, att) {
-                    out.clears_applied = out.clears_applied.saturating_add(1);
-                }
+        finish_render_tail(
+            state,
+            host,
+            task_id,
+            acc,
+            out,
+            &visibility_counts,
+            saw_backend_unavailable,
+        );
+    }
+}
+
+fn note_unanswered_visibility(task_id: u32, pipeline_ref: u32, arming: draw::VisibilityArming) {
+    crate::runtime::drain::note_store_route("visibility_query_unanswered");
+    if crate::observe::first_sight(
+        "visibility_query_unanswered",
+        u64::from(arming.mode.guest_ordinal()),
+    ) {
+        crate::observe::fail(format!(
+            "visibility_query_unanswered reason=visibility_query_unanswered task={task_id} \
+             pipe={pipeline_ref} mode={} off={:#x} (the guest armed an occlusion query and this \
+             backend ran none; it will read whatever its buffer already held)",
+            arming.mode.guest_ordinal(),
+            arming.offset
+        ));
+    }
+}
+
+fn finish_render_tail<M: HostMemory + HostOps>(
+    state: &mut Device,
+    host: &mut M,
+    task_id: u32,
+    acc: &StreamAccum,
+    out: &mut ExecResult,
+    visibility_counts: &std::collections::BTreeMap<u64, u64>,
+    saw_backend_unavailable: bool,
+) {
+    write_visibility_results(state, host, task_id, acc, visibility_counts);
+    // Encode never landed Stores. Honor a contract CLEAR that reaches guest
+    // pages so a refused pass still publishes the contents its load/store
+    // actions specify.
+    if out.draws_ok == 0 && !acc.clears.is_empty() {
+        for att in acc.clears_reaching_guest_pages() {
+            if apply_clear(state, host, task_id, att) {
+                out.clears_applied = out.clears_applied.saturating_add(1);
             }
-            if out.clears_applied > 0 || saw_backend_unavailable || out.draws_fail > 0 {
-                crate::observe::fail(format!(
-                    "draw_fail_clear_fallback task={task_id} clears={} draws_fail={} backend_unavailable={}",
-                    out.clears_applied, out.draws_fail, saw_backend_unavailable as u8
-                ));
-            }
+        }
+        if out.clears_applied > 0 || saw_backend_unavailable || out.draws_fail > 0 {
+            crate::observe::fail(format!(
+                "draw_fail_clear_fallback task={task_id} clears={} draws_fail={} backend_unavailable={}",
+                out.clears_applied, out.draws_fail, saw_backend_unavailable as u8
+            ));
         }
     }
 }
