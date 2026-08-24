@@ -169,6 +169,35 @@ impl EncoderPools {
         self.gather_live.push(slot);
     }
 
+    /// Allocate or recycle one descriptor set for this encoder's guest-gather
+    /// dispatch and retain it until the recording seals.
+    ///
+    /// Both the descriptor arena and the retired-set free list belong to this
+    /// encoder. No shared registry participates in either the hit or miss path.
+    pub(in crate::engine) unsafe fn alloc_scatter_descriptor_set(
+        &mut self,
+        device: &ash::Device,
+        dsl: vk::DescriptorSetLayout,
+        counters: &EngineCounters,
+    ) -> Result<vk::DescriptorSet, DrawError> {
+        let (set, pool) = match self.take_free_scatter_dset() {
+            Some(recycled) => recycled,
+            None => unsafe { self.alloc_descriptor_set(device, dsl, counters) }?,
+        };
+        self.scatter_dsets.push((set, pool));
+        Ok(set)
+    }
+
+    /// Take one retired guest-gather set out of this encoder's free list.
+    fn take_free_scatter_dset(&mut self) -> Option<(vk::DescriptorSet, vk::DescriptorPool)> {
+        self.scatter_dset_free.pop()
+    }
+
+    /// Return a retired entry's guest-gather sets to this encoder's free list.
+    fn recycle_scatter_dsets(&mut self, sets: &mut Vec<(vk::DescriptorSet, vk::DescriptorPool)>) {
+        self.scatter_dset_free.append(sets);
+    }
+
     pub(in crate::engine) fn cb_bound_buffer(
         &self,
         key: (usize, u64, u64),
@@ -1129,59 +1158,6 @@ impl ResourcePools {
                 None
             }
         }
-    }
-
-    /// A descriptor set for the guest-scatter kernel, recycled if one has
-    /// retired and allocated if not, parked on the list [`Self::seal_entry`]
-    /// drains so the caller owes it nothing.
-    ///
-    /// The caller must write it before dispatching: a recycled set still names
-    /// the previous dispatch's three buffers, and `ScatterPipeline::write_set`
-    /// is the only writer. Every caller does, because writing is how it names
-    /// its own buffers at all — there is no path that binds a set it did not
-    /// just write.
-    ///
-    /// # Safety
-    ///
-    /// `device` must be the device these pools belong to, and `dsl` must be the
-    /// guest-scatter layout every set on the free list was allocated against.
-    pub(crate) unsafe fn alloc_scatter_descriptor_set(
-        &mut self,
-        device: &ash::Device,
-        dsl: vk::DescriptorSetLayout,
-        counters: &EngineCounters,
-    ) -> Result<vk::DescriptorSet, DrawError> {
-        let (set, pool) = match self.take_free_scatter_dset() {
-            Some(recycled) => recycled,
-            None => unsafe { self.encoder.alloc_descriptor_set(device, dsl, counters) }?,
-        };
-        self.encoder.scatter_dsets.push((set, pool));
-        Ok(set)
-    }
-
-    /// Take a retired guest-scatter set off the free list, or `None` when there
-    /// is none.
-    ///
-    /// Split out of [`Self::alloc_scatter_descriptor_set`] for the same reason
-    /// [`Self::take_free_gather`] is split out of `acquire_guest_gather`: it is
-    /// the whole of the no-aliasing property and it is the half that needs no
-    /// device, so a test can exercise it. A set **leaves** the free list when it
-    /// is handed out and only `drain_cleanup` puts it back, which runs after the
-    /// fence of the submission that named it — so two dispatches inside one
-    /// command buffer cannot be handed one set and have the second's
-    /// `write_set` overwrite the first's bindings.
-    fn take_free_scatter_dset(&mut self) -> Option<(vk::DescriptorSet, vk::DescriptorPool)> {
-        self.encoder.scatter_dset_free.pop()
-    }
-
-    /// Return a retired entry's guest-scatter sets to the free list.
-    ///
-    /// The other half of [`Self::take_free_scatter_dset`], named for the same
-    /// reason: the fence is what makes a rewrite safe, and this is the only
-    /// caller that has one. `drain_cleanup` is the only call site and it runs
-    /// after the wait.
-    fn recycle_scatter_dsets(&mut self, sets: &mut Vec<(vk::DescriptorSet, vk::DescriptorPool)>) {
-        self.encoder.scatter_dset_free.append(sets);
     }
 
     /// Whether the current command buffer already owns the cleanup that will
@@ -3236,7 +3212,8 @@ impl ResourcePools {
         self.encoder.desc_arena.free(device, &pending.dsets);
         // The fence this entry waited on is exactly what makes a rewrite of
         // these safe, so the free list is fed from here and nowhere else.
-        self.recycle_scatter_dsets(&mut pending.scatter_dsets);
+        self.encoder
+            .recycle_scatter_dsets(&mut pending.scatter_dsets);
         // No cache admissions here: `seal_entry` lifted them out and
         // `finish_entry_async` gave them to the cache at submit. What is left in
         // `pending.sampled` is every slot nothing retained, which recycles.
@@ -6505,8 +6482,8 @@ mod gather_slots_do_not_alias {
 /// The guest-scatter descriptor pool's no-aliasing property, which is what makes
 /// recycling a set cheaper than allocating one *and* correct.
 ///
-/// These exercise [`ResourcePools::take_free_scatter_dset`] and
-/// [`ResourcePools::recycle_scatter_dsets`] rather than
+/// These exercise [`EncoderPools::take_free_scatter_dset`] and
+/// [`EncoderPools::recycle_scatter_dsets`] rather than
 /// `alloc_scatter_descriptor_set`, because the miss path allocates and needs a
 /// device while the property under test does not — the same split, for the same
 /// reason, as [`gather_slots_do_not_alias`].
@@ -6531,13 +6508,13 @@ mod scatter_descriptor_sets_do_not_alias {
     /// Two takes with no retire between them cannot resolve to one set.
     #[test]
     fn two_takes_with_no_retire_between_them_give_two_sets() {
-        let mut pools = ResourcePools::new();
-        pools.recycle_scatter_dsets(&mut vec![pair(1), pair(2)]);
-        let first = pools.take_free_scatter_dset().expect("two were recycled");
-        let second = pools.take_free_scatter_dset().expect("two were recycled");
+        let mut encoder = EncoderPools::new();
+        encoder.recycle_scatter_dsets(&mut vec![pair(1), pair(2)]);
+        let first = encoder.take_free_scatter_dset().expect("two were recycled");
+        let second = encoder.take_free_scatter_dset().expect("two were recycled");
         assert_ne!(first.0, second.0);
         assert!(
-            pools.take_free_scatter_dset().is_none(),
+            encoder.take_free_scatter_dset().is_none(),
             "the list held exactly what was recycled into it"
         );
     }
@@ -6546,14 +6523,14 @@ mod scatter_descriptor_sets_do_not_alias {
     /// stop calling `vkAllocateDescriptorSets`.
     #[test]
     fn a_retired_set_is_handed_out_again() {
-        let mut pools = ResourcePools::new();
-        pools.recycle_scatter_dsets(&mut vec![pair(7)]);
-        let taken = pools.take_free_scatter_dset().expect("one was recycled");
+        let mut encoder = EncoderPools::new();
+        encoder.recycle_scatter_dsets(&mut vec![pair(7)]);
+        let taken = encoder.take_free_scatter_dset().expect("one was recycled");
         assert_eq!(taken.0.as_raw(), 7);
-        assert!(pools.take_free_scatter_dset().is_none());
-        pools.recycle_scatter_dsets(&mut vec![taken]);
+        assert!(encoder.take_free_scatter_dset().is_none());
+        encoder.recycle_scatter_dsets(&mut vec![taken]);
         assert_eq!(
-            pools
+            encoder
                 .take_free_scatter_dset()
                 .expect("it was recycled again")
                 .0
@@ -6566,8 +6543,8 @@ mod scatter_descriptor_sets_do_not_alias {
     /// allocates rather than reading an empty `pop` as a usable handle.
     #[test]
     fn a_fresh_pool_has_nothing_to_hand_out() {
-        let mut pools = ResourcePools::new();
-        assert!(pools.take_free_scatter_dset().is_none());
+        let mut encoder = EncoderPools::new();
+        assert!(encoder.take_free_scatter_dset().is_none());
     }
 
     /// Recycling drains the caller's vector, so a `PendingGpuCleanup` cannot be
@@ -6575,14 +6552,14 @@ mod scatter_descriptor_sets_do_not_alias {
     /// dispatches.
     #[test]
     fn recycling_takes_the_sets_out_of_the_entry_that_owed_them() {
-        let mut pools = ResourcePools::new();
+        let mut encoder = EncoderPools::new();
         let mut owed = vec![pair(3), pair(4)];
-        pools.recycle_scatter_dsets(&mut owed);
+        encoder.recycle_scatter_dsets(&mut owed);
         assert!(owed.is_empty());
-        pools.recycle_scatter_dsets(&mut owed);
-        assert!(pools.take_free_scatter_dset().is_some());
-        assert!(pools.take_free_scatter_dset().is_some());
-        assert!(pools.take_free_scatter_dset().is_none());
+        encoder.recycle_scatter_dsets(&mut owed);
+        assert!(encoder.take_free_scatter_dset().is_some());
+        assert!(encoder.take_free_scatter_dset().is_some());
+        assert!(encoder.take_free_scatter_dset().is_none());
     }
 
     fn batch_target() -> super::BatchTarget {

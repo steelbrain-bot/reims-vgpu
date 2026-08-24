@@ -760,8 +760,11 @@ unsafe fn plan_buffer_gather_dispatches(
     let mut out = Vec::with_capacity(planned.len());
     for ((source, dst, dst_have, table), place) in planned.iter().zip(&places) {
         let _d = super::gather_phase::Span::open(super::gather_phase::Part::Dset);
-        let set =
-            unsafe { pools.alloc_scatter_descriptor_set(&ctx.device, pipeline.dsl, counters) }?;
+        let set = unsafe {
+            pools
+                .encoder_mut()
+                .alloc_scatter_descriptor_set(&ctx.device, pipeline.dsl, counters)
+        }?;
         unsafe {
             super::guest_scatter::ScatterPipeline::write_set(
                 &ctx.device,

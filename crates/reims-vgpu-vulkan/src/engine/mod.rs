@@ -5095,8 +5095,11 @@ unsafe fn plan_guest_scatter_dispatches(
     let (runs_slot, places) = unsafe { stage_run_tables(ctx, pools, counters, &words) }?;
     let mut groups = Vec::with_capacity(tables.len());
     for ((buffer, table), place) in tables.iter().zip(&places) {
-        let set =
-            unsafe { pools.alloc_scatter_descriptor_set(&ctx.device, pipeline.dsl, counters) }?;
+        let set = unsafe {
+            pools
+                .encoder_mut()
+                .alloc_scatter_descriptor_set(&ctx.device, pipeline.dsl, counters)
+        }?;
         unsafe {
             guest_scatter::ScatterPipeline::write_set(
                 &ctx.device,
