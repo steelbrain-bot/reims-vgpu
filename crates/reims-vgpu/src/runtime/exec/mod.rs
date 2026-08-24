@@ -2885,6 +2885,13 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     return;
                 }
             };
+            // A zero object reference is the unbound fence sentinel. Its
+            // companion stage word describes no dependency and therefore has
+            // no meaning to validate; interpreting it first can turn stale
+            // serializer bytes into a sticky refusal that drops later draws.
+            if cmd.fence_ref == 0 {
+                return;
+            }
             let stages = u16::try_from(cmd.fence_stages)
                 .ok()
                 .and_then(reims_vgpu_core::RenderBarrierStages::from_bits);

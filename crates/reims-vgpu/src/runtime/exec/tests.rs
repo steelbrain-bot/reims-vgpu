@@ -5848,6 +5848,101 @@ fn a_render_encoder_fence_reaches_the_shared_fence_object() {
     );
 }
 
+/// A nil fence is an unbound operation, so its companion stage word carries no
+/// dependency to interpret. Serializer storage outside the live reference may
+/// contain any bits; those bits must not poison the encoder and suppress later
+/// work. The same unknown mask on a live fence remains a typed refusal.
+#[test]
+fn a_nil_render_fence_does_not_validate_stale_stage_bits() {
+    use crate::runtime::decode::stream::{SEGMENT_HEADER_LEN, SEGMENT_TYPE_RENDER};
+    use reims_vgpu_wire::ops::render as wire_render;
+
+    const LIVE_FENCE_REF: u32 = 6464;
+    const STAGES_FRAGMENT: u32 = 2;
+    const STAGES_UNKNOWN: u32 = 1 << 5;
+
+    fn stream_with_fences(records: &[(u32, u32, u32)]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        for &(opcode, fence_ref, stages) in records {
+            let mut hdr = [0u8; 8];
+            st32(&mut hdr[0..4], opcode);
+            st32(&mut hdr[4..8], wire_render::FENCE_TOTAL_LEN);
+            payload.extend_from_slice(&hdr);
+            let mut fence = [0u8; 8];
+            st32(&mut fence[0..4], fence_ref);
+            st32(&mut fence[4..8], stages);
+            payload.extend_from_slice(&fence);
+        }
+
+        let mut stream = vec![0u8; SEGMENT_HEADER_LEN];
+        let stream_len = stream.len() + payload.len();
+        st32(&mut stream[0..4], stream_len as u32);
+        stream[4] = SEGMENT_TYPE_RENDER;
+        stream.extend_from_slice(&payload);
+        stream
+    }
+
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    let stream = stream_with_fences(&[
+        (wire_render::OPCODE_UPDATE_FENCE, 0, STAGES_UNKNOWN),
+        (
+            wire_render::OPCODE_UPDATE_FENCE,
+            LIVE_FENCE_REF,
+            STAGES_FRAGMENT,
+        ),
+        (
+            wire_render::OPCODE_WAIT_FOR_FENCE,
+            LIVE_FENCE_REF,
+            STAGES_FRAGMENT,
+        ),
+    ]);
+    walk_stream(&mut state, &mut host, 1, &stream, &mut out, &mut acc);
+
+    assert!(
+        acc.unrepresentable.is_none(),
+        "stage bits beside an unbound fence do not invalidate the stream"
+    );
+    assert_eq!(state.fence_generation(1, 0), None);
+    assert_eq!(state.fence_generation(1, LIVE_FENCE_REF), Some(1));
+    assert_eq!(
+        acc.render_work,
+        vec![RenderWork::Barrier(reims_vgpu_core::RenderBarrier::Fence {
+            after: reims_vgpu_core::RenderBarrierStages::FRAGMENT,
+            before: reims_vgpu_core::RenderBarrierStages::FRAGMENT,
+        })]
+    );
+
+    let mut live_state = Device::new(DeviceId(2), PAGE_SHIFT_ARM64E);
+    let mut live_host = FakeHost::new();
+    let mut live_out = ExecResult::default();
+    let mut live_acc = StreamAccum::default();
+    let live_unknown = stream_with_fences(&[(
+        wire_render::OPCODE_UPDATE_FENCE,
+        LIVE_FENCE_REF,
+        STAGES_UNKNOWN,
+    )]);
+    walk_stream(
+        &mut live_state,
+        &mut live_host,
+        1,
+        &live_unknown,
+        &mut live_out,
+        &mut live_acc,
+    );
+    assert_eq!(
+        live_acc.unrepresentable,
+        Some(StreamRefusal::Barrier(
+            RenderBarrierRefusal::FenceStagesUnsupported {
+                raw: STAGES_UNKNOWN,
+            }
+        )),
+        "the same unknown stage mask on a live fence remains fail-closed"
+    );
+}
+
 /// `MTLLoadActionClear` seeds the pass whatever the store action says, and only
 /// `MTLStoreActionStore` lets that colour reach the guest's pages.
 ///
