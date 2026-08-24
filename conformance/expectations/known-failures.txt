@@ -22,12 +22,12 @@
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# A Store-only multisample colour attachment is not preserved.
+# A compute observer sees one sample in a four-sample texture.
 #
 # Native Metal retains four distinct per-sample colours across command buffers.
-# The guest first tries to serialize the unresolved resident through the
-# single-sample target-read rail (`read_target_multisample_image`), then refuses
-# the lawful `texture2d_ms` observer as `unstageable_multisampled`. The render
-# draw is skipped and the observer dispatch produces nothing.
+# The guest render and observer both execute, and sample zero contains the
+# expected per-sample render value. The translated texture sample-count query
+# returns one, so the observer never visits samples one through three and those
+# output slots retain their sentinel values.
 # ---------------------------------------------------------------------------
 msaa4_color_store_no_resolve
