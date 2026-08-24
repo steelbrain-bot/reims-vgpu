@@ -1148,9 +1148,9 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         .expect("fresh packet identities reserve one scheduler position");
     match dispatch {
         reims_vgpu_core::SubmissionDispatch::Record(work) => {
-            let (result, newly_recordable) = execute_prepared_exec(state, host, work);
+            let result = execute_prepared_exec(state, host, work);
+            let newly_recordable = commit_ready_execs(state, host);
             debug_assert!(newly_recordable.is_empty());
-            commit_ready_execs(state, host);
             result
         }
         reims_vgpu_core::SubmissionDispatch::Queued { .. } => exposed,
@@ -1161,10 +1161,7 @@ fn execute_prepared_exec<M: HostMemory + HostOps>(
     state: &mut Device,
     host: &mut M,
     work: reims_vgpu_core::SubmissionWork<PreparedExecWork>,
-) -> (
-    ExecResult,
-    Vec<reims_vgpu_core::SubmissionWork<PreparedExecWork>>,
-) {
+) -> ExecResult {
     let reims_vgpu_core::SubmissionWork {
         context,
         work:
@@ -1244,7 +1241,7 @@ fn execute_prepared_exec<M: HostMemory + HostOps>(
                 move |transaction| transaction.record(executor.as_ref()),
             )
             .expect("one EXEC owns one terminal recording worker");
-        return (result, Vec::new());
+        return result;
     }
     let finished_context = state
         .submissions
@@ -1254,7 +1251,7 @@ fn execute_prepared_exec<M: HostMemory + HostOps>(
     let close_ns = close_started.elapsed().as_nanos() as u64;
     measured_ns += close_ns;
     crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Close, close_ns);
-    let newly_recordable = state
+    state
         .submissions_scheduled
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1268,7 +1265,7 @@ fn execute_prepared_exec<M: HostMemory + HostOps>(
             })),
         )
         .expect("the resolving packet owns its recording admission");
-    (result, newly_recordable)
+    result
 }
 
 /// Close the [`ExecPhase`] tiling of `process_exec_indirect2` at one of its
@@ -5026,7 +5023,6 @@ pub(crate) fn collect_exec_recordings<M: HostMemory + HostOps>(
     } else {
         state.surface_recording_workers.take_finished()
     };
-    let mut newly_recordable = std::collections::VecDeque::new();
     for worker in worker_results {
         let pending = state
             .pending_execs
@@ -5038,7 +5034,7 @@ pub(crate) fn collect_exec_recordings<M: HostMemory + HostOps>(
                 Err(worker_panic_diagnostic())
             }
         };
-        let work = state
+        state
             .submissions_scheduled
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -5047,21 +5043,24 @@ pub(crate) fn collect_exec_recordings<M: HostMemory + HostOps>(
                 RecordedExecCommit::Async(Box::new(AsyncExecCommit { pending, recording })),
             )
             .expect("the worker owns its live recording admission");
-        newly_recordable.extend(work);
     }
 
-    commit_ready_execs(state, host);
+    let mut newly_recordable: std::collections::VecDeque<_> =
+        commit_ready_execs(state, host).into();
     while let Some(work) = newly_recordable.pop_front() {
-        let (_, admitted) = execute_prepared_exec(state, host, work);
-        newly_recordable.extend(admitted);
+        let _ = execute_prepared_exec(state, host, work);
         // A synchronous continuation can both complete its own commit and
         // release another conflicting waiter. Commit first: that waiter's
         // resource versions are defined by this ordered predecessor.
-        commit_ready_execs(state, host);
+        newly_recordable.extend(commit_ready_execs(state, host));
     }
 }
 
-fn commit_ready_execs<M: HostMemory + HostOps>(state: &mut Device, host: &mut M) {
+fn commit_ready_execs<M: HostMemory + HostOps>(
+    state: &mut Device,
+    host: &mut M,
+) -> Vec<reims_vgpu_core::SubmissionWork<PreparedExecWork>> {
+    let mut newly_recordable = Vec::new();
     loop {
         let ready = state
             .submissions_scheduled
@@ -5127,7 +5126,15 @@ fn commit_ready_execs<M: HostMemory + HostOps>(state: &mut Device, host: &mut M)
         state
             .completed_execs
             .push_back(CompletedExec { identity, result });
+        let admitted = state
+            .submissions_scheduled
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .complete(identity)
+            .expect("the guest-order commit owns its live semantic admission");
+        newly_recordable.extend(admitted);
     }
+    newly_recordable
 }
 
 fn complete_terminal_surface_transaction<M: HostMemory + HostOps>(

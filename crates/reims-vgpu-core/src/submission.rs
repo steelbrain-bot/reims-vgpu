@@ -135,6 +135,11 @@ pub enum SubmissionRecordError {
     Commit(SubmissionCommitOrderError),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubmissionCompleteError {
+    NotRecording(SubmissionIdentity),
+}
+
 /// Queueing policy over disjoint recording and guest-ordered commit ownership.
 ///
 /// This owner never waits. Conflicting EXECs retain their immutable context in
@@ -267,23 +272,39 @@ impl<W, T> SubmissionScheduler<W, T> {
         }
     }
 
-    /// Publish a worker result and immediately release its recording footprint.
+    /// Publish a worker result without releasing its semantic footprint.
     ///
-    /// Close and semantic completion deliberately do not happen here; they are
-    /// owned by [`Self::take_ready`] and therefore remain in guest order.
+    /// Recording completion is not semantic completion. A conflicting waiter
+    /// must remain parked until the recorded result reaches guest-order commit
+    /// and the caller applies its completion facts through [`Self::complete`].
     pub fn record(
         &mut self,
         identity: SubmissionIdentity,
         result: T,
-    ) -> Result<Vec<SubmissionWork<W>>, SubmissionRecordError> {
+    ) -> Result<(), SubmissionRecordError> {
         if !self.admissions.contains(identity) {
             return Err(SubmissionRecordError::NotRecording(identity));
         }
         self.commits
             .record(identity, result)
             .map_err(SubmissionRecordError::Commit)?;
-        let retired = self.admissions.retire(identity);
-        debug_assert!(retired, "the checked recording admission remains active");
+        Ok(())
+    }
+
+    /// Retire one semantically committed footprint and admit newly independent
+    /// waiters.
+    ///
+    /// The caller invokes this only after the matching value returned by
+    /// [`Self::take_ready`] has updated content, resource lifetime, and backend
+    /// submission state. Keeping that ordering explicit prevents a waiter from
+    /// snapshotting the predecessor's pre-commit state.
+    pub fn complete(
+        &mut self,
+        identity: SubmissionIdentity,
+    ) -> Result<Vec<SubmissionWork<W>>, SubmissionCompleteError> {
+        if !self.admissions.retire(identity) {
+            return Err(SubmissionCompleteError::NotRecording(identity));
+        }
         Ok(self.dispatch_ready())
     }
 
@@ -630,8 +651,12 @@ mod tests {
         assert_eq!(scheduler.active_len(), 2);
         assert_eq!(scheduler.waiting_len(), 1);
 
+        scheduler.record(first.identity, "first").unwrap();
+        assert_eq!(scheduler.active_len(), 2);
+        assert_eq!(scheduler.waiting_len(), 1);
+        assert_eq!(scheduler.take_ready(), Some((first.identity, "first")));
         assert_eq!(
-            scheduler.record(first.identity, "first").unwrap(),
+            scheduler.complete(first.identity).unwrap(),
             vec![SubmissionWork {
                 context: blocked,
                 work: (),
@@ -662,8 +687,11 @@ mod tests {
             Ok(SubmissionDispatch::Queued { .. })
         ));
 
+        scheduler.record(first.identity, ()).unwrap();
+        assert_eq!(scheduler.waiting_len(), 2);
+        assert_eq!(scheduler.take_ready(), Some((first.identity, ())));
         assert_eq!(
-            scheduler.record(first.identity, ()).unwrap(),
+            scheduler.complete(first.identity).unwrap(),
             vec![SubmissionWork {
                 context: second,
                 work: (),
@@ -681,19 +709,52 @@ mod tests {
         scheduler.accept(first.clone(), ()).unwrap();
         scheduler.accept(second.clone(), ()).unwrap();
 
-        assert!(scheduler
-            .record(second.identity, "second")
-            .unwrap()
-            .is_empty());
-        assert_eq!(scheduler.active_len(), 1);
+        scheduler.record(second.identity, "second").unwrap();
+        assert_eq!(scheduler.active_len(), 2);
         assert_eq!(scheduler.take_ready(), None);
-        assert!(scheduler
-            .record(first.identity, "first")
-            .unwrap()
-            .is_empty());
-        assert_eq!(scheduler.active_len(), 0);
+        scheduler.record(first.identity, "first").unwrap();
+        assert_eq!(scheduler.active_len(), 2);
         assert_eq!(scheduler.take_ready(), Some((first.identity, "first")));
+        assert!(scheduler.complete(first.identity).unwrap().is_empty());
+        assert_eq!(scheduler.active_len(), 1);
         assert_eq!(scheduler.take_ready(), Some((second.identity, "second")));
+        assert!(scheduler.complete(second.identity).unwrap().is_empty());
+        assert_eq!(scheduler.active_len(), 0);
+    }
+
+    #[test]
+    fn a_finished_successor_keeps_its_conflicting_waiter_parked_until_commit() {
+        let first = context_with_resources(60, [Some(ResourceId::new(9, 1))]);
+        let successor = context_with_resources(61, [Some(ResourceId::new(10, 1))]);
+        let waiter = context_with_resources(62, [Some(ResourceId::new(10, 1))]);
+        let mut scheduler = SubmissionScheduler::<(), &'static str>::default();
+        scheduler.accept(first.clone(), ()).unwrap();
+        scheduler.accept(successor.clone(), ()).unwrap();
+        assert!(matches!(
+            scheduler.accept(waiter.clone(), ()),
+            Ok(SubmissionDispatch::Queued { .. })
+        ));
+
+        scheduler.record(successor.identity, "successor").unwrap();
+        assert_eq!(scheduler.take_ready(), None);
+        assert_eq!(scheduler.waiting_len(), 1);
+
+        scheduler.record(first.identity, "first").unwrap();
+        assert_eq!(scheduler.take_ready(), Some((first.identity, "first")));
+        assert!(scheduler.complete(first.identity).unwrap().is_empty());
+        assert_eq!(scheduler.waiting_len(), 1);
+        assert_eq!(
+            scheduler.take_ready(),
+            Some((successor.identity, "successor"))
+        );
+        assert_eq!(scheduler.waiting_len(), 1);
+        assert_eq!(
+            scheduler.complete(successor.identity).unwrap(),
+            vec![SubmissionWork {
+                context: waiter,
+                work: (),
+            }]
+        );
     }
 
     #[test]
