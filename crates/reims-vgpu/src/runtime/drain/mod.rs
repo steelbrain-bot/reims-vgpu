@@ -6108,6 +6108,12 @@ pub fn drain_pending<H: HostMemory + HostOps>(state: &mut Device, host: &mut H) 
         return;
     }
     crate::runtime::exec::resolve_ready_execs(state, host);
+    if publish_completed_execs(state, host) {
+        // A CPU-only waiter can finish while resolving this wave. Publish its
+        // exact completion word before yielding, and keep any successor that
+        // semantic commit admitted for the next ownership interval.
+        return;
+    }
     // A queued present action is part of the ordered device timeline. QEMU
     // cannot paint it while this worker owns the device lock, so later worker
     // wakeups must leave guest work queued until scanout consumes the action.

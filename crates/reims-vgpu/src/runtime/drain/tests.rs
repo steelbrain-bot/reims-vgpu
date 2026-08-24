@@ -201,6 +201,57 @@ fn an_accepted_async_exec_withholds_its_exact_stamp_until_ordered_commit() {
 }
 
 #[test]
+fn a_cpu_only_ready_exec_publishes_without_needing_another_wake() {
+    use std::sync::Arc;
+
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let stamp_pfn = 0x40u32;
+    let stamp_gpa = state.pfn_gpa(stamp_pfn);
+    host.map_range(stamp_gpa, state.page_size() as usize, 0);
+    state.registers.gfx.fifo_base_page = stamp_pfn;
+
+    let identity = reims_vgpu_protocol::SubmissionIdentity {
+        id: reims_vgpu_protocol::SubmissionId::new(9),
+        task: reims_vgpu_protocol::TaskId::new(1),
+    };
+    let context = reims_vgpu_core::SubmissionContext {
+        identity,
+        resources: Arc::from([]),
+        segments: Arc::from([]),
+        segment: None,
+    };
+    let dispatch = state
+        .submissions_scheduled
+        .lock()
+        .unwrap()
+        .accept(
+            context,
+            crate::runtime::exec::PreparedExecWork::empty_for_test(1),
+        )
+        .unwrap();
+    let reims_vgpu_core::SubmissionDispatch::Record(work) = dispatch else {
+        panic!("an empty first submission owns recording admission")
+    };
+    state.ready_execs.push_back(work);
+    state.pending_exec_publications.insert(
+        identity,
+        crate::runtime::device::PendingExecPublication {
+            channel_id: 2,
+            payload_len: 64,
+            stamp_index: 1,
+            stamp_value: 0x77,
+        },
+    );
+
+    drain_pending(&mut state, &mut host);
+
+    assert_eq!(host.get_u32(stamp_gpa + 4), 0x77);
+    assert!(state.completed_execs.is_empty());
+    assert!(!state.pending_exec_publications.contains_key(&identity));
+}
+
+#[test]
 fn sync_exec_stall_proxy_fires_at_watchdog_scale_only() {
     assert!(!sync_exec_stalled(SYNC_EXEC_STALL_US - 1));
     assert!(sync_exec_stalled(SYNC_EXEC_STALL_US));

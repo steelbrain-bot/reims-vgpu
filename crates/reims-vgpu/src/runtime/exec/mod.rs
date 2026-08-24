@@ -877,6 +877,22 @@ pub(crate) struct PreparedExecWork {
     measured_ns: u64,
 }
 
+#[cfg(test)]
+impl PreparedExecWork {
+    pub(crate) fn empty_for_test(task_id: u32) -> Self {
+        Self {
+            task_id,
+            streams: Vec::new(),
+            result: ExecResult {
+                task_id,
+                ..Default::default()
+            },
+            started: std::time::Instant::now(),
+            measured_ns: 0,
+        }
+    }
+}
+
 pub(crate) enum RecordedExecCommit {
     Async(Box<AsyncExecCommit>),
     Synchronous(Box<SynchronousExecCommit>),
