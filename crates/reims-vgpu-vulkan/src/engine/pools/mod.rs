@@ -389,7 +389,7 @@ pub(crate) struct EncoderPools {
     /// the compute gather switched off. Recycling makes the steady state zero of
     /// both.
     ///
-    /// A set returns here only from `drain_cleanup`, which runs after the fence
+    /// A set returns here only from `reclaim_retired_entry`, after the fence
     /// of the submission that named it — the same rule the staging and gather
     /// free lists keep, and the reason a rewrite cannot race a dispatch still
     /// reading the old bindings.
@@ -1451,6 +1451,16 @@ impl ResourcePools {
 /// they remain here until its fence retires and then return to their scratch
 /// pool.
 pub(crate) struct PendingGpuCleanup {
+    encoder: EncoderCleanup,
+    visibility: VisibilityCleanup,
+    shared: SharedCleanup,
+}
+
+/// Fence-delayed returns owned entirely by the recording encoder.
+///
+/// Once the fence signals these can re-enter that encoder's private free lists
+/// without acquiring or mutating any device-wide registry.
+struct EncoderCleanup {
     dsets: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
     /// The guest-scatter sets, kept apart from `dsets` because they recycle
     /// rather than free — see [`EncoderPools::scatter_dset_free`].
@@ -1458,6 +1468,14 @@ pub(crate) struct PendingGpuCleanup {
     staging: Vec<BufferSlot>,
     gather: Vec<BufferSlot>,
     readback: Vec<BufferSlot>,
+}
+
+/// Fence-delayed mutations owed to session-wide resource state.
+///
+/// This transaction crosses from a retired encoder slot to the shared owner;
+/// keeping it distinct from [`EncoderCleanup`] lets the encoder recycle its
+/// private resources before shared publication is acquired.
+struct SharedCleanup {
     sampled: Vec<SampledSlot>,
     attachment_snapshots: Vec<SampledSlot>,
     storage_images: Vec<StorageImageSlot>,
@@ -1466,7 +1484,14 @@ pub(crate) struct PendingGpuCleanup {
     unpin_residents: Vec<TargetIdentity>,
     /// The same, in the compute-storage registry.
     unpin_compute_residents: Vec<reims_vgpu_core::ComputeStorageResidencyKey>,
-    /// Visibility ledger entries owned by this submission.
+}
+
+/// Visibility-ledger obligations whose lifetime ends at this fence.
+///
+/// The ledger has its own synchronization and is neither encoder-local nor a
+/// shared native-resource registry. Keeping it separate prevents retirement
+/// from nesting that lock inside a future `SharedPools` lock.
+struct VisibilityCleanup {
     guest_write_tokens: Vec<super::GuestWriteToken>,
 }
 
@@ -1492,6 +1517,18 @@ pub(crate) struct SealedEntry {
 #[must_use = "a retired encoder entry must be applied to shared state"]
 struct RetiredEntry {
     cleanup: PendingGpuCleanup,
+    retirement: SubmittedPoint,
+}
+
+/// Shared-state half of one fence-complete encoder entry.
+///
+/// Encoder-local resources have already been recovered. The recording point
+/// travels with the remaining mutations so it cannot be acknowledged before
+/// all shared pins, ledgers, and free-pool returns have been applied.
+#[must_use = "shared retirement must be applied before acknowledging its point"]
+struct SharedRetirement {
+    visibility: VisibilityCleanup,
+    cleanup: SharedCleanup,
     retirement: SubmittedPoint,
 }
 
@@ -2084,7 +2121,7 @@ pub(crate) struct NonPinnedTotals {
 /// failure as omitting the barrier outright, only harder to see.
 ///
 /// A resident is the only image class where this matters. Pool-owned transients
-/// re-enter their free lists only through `drain_cleanup`, which `retire_slot`
+/// re-enter their free lists only through `reclaim_retired_entry`, which `retire_slot`
 /// reaches only after `wait_for_fences` on the submission that last used them,
 /// so a pooled image cannot be handed out while GPU work still reads it and
 /// there is nothing for a source scope to name. A resident is keyed by

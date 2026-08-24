@@ -5,7 +5,7 @@
 //! is what recycles the pools. A staging, readback, sampled or storage-image
 //! slot handed to a batch is not free when its caller is done with it; it rides
 //! `PendingGpuCleanup` until `retire_slot` has waited that batch's fence, and
-//! only then does `drain_cleanup` push it back onto a free list. Periodic
+//! only then does `reclaim_retired_entry` push it back onto a free list. Periodic
 //! maintenance decides when those already-free lists may shrink.
 //!
 //! The image *registry* is keyed by identity rather than by slot and lives in
@@ -144,6 +144,41 @@ fn pass_spans_probe_enabled() -> bool {
             reims_vgpu_config::Switch::On
         )
     })
+}
+
+fn buffer_bucket(size: u64) -> u64 {
+    let mut bucket = 64u64;
+    while bucket < size {
+        bucket = bucket.saturating_mul(2);
+        if bucket == 0 {
+            return u64::MAX;
+        }
+    }
+    bucket
+}
+
+impl RetiredEntry {
+    /// Separate the fence-complete resources by their next owner without
+    /// acknowledging the shared recording point.
+    fn split(self) -> (EncoderCleanup, SharedRetirement) {
+        let RetiredEntry {
+            cleanup,
+            retirement,
+        } = self;
+        let PendingGpuCleanup {
+            encoder,
+            visibility,
+            shared,
+        } = cleanup;
+        (
+            encoder,
+            SharedRetirement {
+                visibility,
+                cleanup: shared,
+                retirement,
+            },
+        )
+    }
 }
 
 impl EncoderPools {
@@ -1721,11 +1756,15 @@ impl ResourcePools {
 
     /// Return a fence-complete encoder transaction to shared ownership.
     unsafe fn apply_retired_entry(&mut self, device: &ash::Device, retired: RetiredEntry) {
-        let RetiredEntry {
+        let (encoder, shared) = retired.split();
+        unsafe { self.encoder.reclaim_retired_entry(device, encoder) };
+        let SharedRetirement {
+            visibility,
             cleanup,
             retirement,
-        } = retired;
-        unsafe { self.drain_cleanup(device, cleanup) };
+        } = shared;
+        super::super::retire_guest_write_pages(&visibility.guest_write_tokens);
+        self.drain_shared_cleanup(cleanup);
         retirement.retire();
         self.release_ready_graveyard(device);
     }
@@ -2063,22 +2102,28 @@ impl EncoderPools {
         let admissions = take_retained_slots(&mut sampled, sampled_retains);
         SealedEntry {
             cleanup: PendingGpuCleanup {
-                dsets,
-                scatter_dsets: std::mem::take(&mut self.scatter_dsets),
-                staging: std::mem::take(&mut self.staging_live),
-                gather: std::mem::take(&mut self.gather_live),
-                readback,
-                sampled,
-                attachment_snapshots: std::mem::take(&mut self.attachment_snapshot_live),
-                storage_images: std::mem::take(&mut self.storage_image_live),
-                unpin_residents: std::mem::take(&mut self.resident_pins_live),
-                unpin_compute_residents: std::mem::take(&mut self.compute_write_pins_live),
-                guest_write_tokens: {
-                    let mut tokens: Vec<_> = std::mem::take(&mut self.guest_write_tokens_live)
-                        .into_values()
-                        .collect();
-                    tokens.sort_unstable();
-                    tokens
+                encoder: EncoderCleanup {
+                    dsets,
+                    scatter_dsets: std::mem::take(&mut self.scatter_dsets),
+                    staging: std::mem::take(&mut self.staging_live),
+                    gather: std::mem::take(&mut self.gather_live),
+                    readback,
+                },
+                visibility: VisibilityCleanup {
+                    guest_write_tokens: {
+                        let mut tokens: Vec<_> = std::mem::take(&mut self.guest_write_tokens_live)
+                            .into_values()
+                            .collect();
+                        tokens.sort_unstable();
+                        tokens
+                    },
+                },
+                shared: SharedCleanup {
+                    sampled,
+                    attachment_snapshots: std::mem::take(&mut self.attachment_snapshot_live),
+                    storage_images: std::mem::take(&mut self.storage_image_live),
+                    unpin_residents: std::mem::take(&mut self.resident_pins_live),
+                    unpin_compute_residents: std::mem::take(&mut self.compute_write_pins_live),
                 },
             },
             admissions,
@@ -2102,6 +2147,28 @@ impl EncoderPools {
             cleanup,
             retirement,
         })
+    }
+
+    /// Recover the encoder-private half of a fence-complete entry.
+    ///
+    /// # Safety
+    /// The command buffer that referenced every resource in `encoder` must have
+    /// completed.
+    unsafe fn reclaim_retired_entry(&mut self, device: &ash::Device, mut encoder: EncoderCleanup) {
+        self.desc_arena.free(device, &encoder.dsets);
+        self.recycle_scatter_dsets(&mut encoder.scatter_dsets);
+        for slot in encoder.staging.drain(..) {
+            let bucket = buffer_bucket(slot.size);
+            self.staging_free.entry(bucket).or_default().push(slot);
+        }
+        for slot in encoder.gather.drain(..) {
+            let bucket = buffer_bucket(slot.size);
+            self.gather_free.entry(bucket).or_default().push(slot);
+        }
+        for slot in encoder.readback.drain(..) {
+            let bucket = buffer_bucket(slot.size);
+            self.readback_free.entry(bucket).or_default().push(slot);
+        }
     }
 
     /// Park a submitted command buffer and return the content admissions that
@@ -3323,46 +3390,16 @@ impl ResourcePools {
     ///
     /// # Safety
     /// The CB that referenced these resources must have retired.
-    unsafe fn drain_cleanup(&mut self, device: &ash::Device, mut pending: PendingGpuCleanup) {
-        super::super::retire_guest_write_pages(&pending.guest_write_tokens);
+    fn drain_shared_cleanup(&mut self, mut pending: SharedCleanup) {
         for identity in pending.unpin_residents.drain(..) {
             self.pin_resident_target(&identity, false);
         }
         for identity in pending.unpin_compute_residents.drain(..) {
             self.pin_resident_storage(&identity, false);
         }
-        self.encoder.desc_arena.free(device, &pending.dsets);
-        // The fence this entry waited on is exactly what makes a rewrite of
-        // these safe, so the free list is fed from here and nowhere else.
-        self.encoder
-            .recycle_scatter_dsets(&mut pending.scatter_dsets);
         // No cache admissions here: `seal_entry` lifted them out and
         // `finish_entry_async` gave them to the cache at submit. What is left in
         // `pending.sampled` is every slot nothing retained, which recycles.
-        for slot in pending.staging.drain(..) {
-            let bucket = Self::bucket(slot.size);
-            self.encoder
-                .staging_free
-                .entry(bucket)
-                .or_default()
-                .push(slot);
-        }
-        for slot in pending.gather.drain(..) {
-            let bucket = Self::bucket(slot.size);
-            self.encoder
-                .gather_free
-                .entry(bucket)
-                .or_default()
-                .push(slot);
-        }
-        for slot in pending.readback.drain(..) {
-            let bucket = Self::bucket(slot.size);
-            self.encoder
-                .readback_free
-                .entry(bucket)
-                .or_default()
-                .push(slot);
-        }
         for slot in pending.sampled.drain(..) {
             self.admit_sampled(slot);
         }
@@ -3372,18 +3409,6 @@ impl ResourcePools {
         for slot in pending.storage_images.drain(..) {
             self.admit_storage_image(slot);
         }
-    }
-
-    fn bucket(size: u64) -> u64 {
-        // Power-of-two bucket, min 64.
-        let mut b = 64u64;
-        while b < size {
-            b = b.saturating_mul(2);
-            if b == 0 {
-                return u64::MAX;
-            }
-        }
-        b
     }
 
     fn note_staging_hit(&mut self) {
@@ -3478,7 +3503,7 @@ impl ResourcePools {
         counters: &EngineCounters,
     ) -> Result<BufferSlot, DrawError> {
         let need = size.max(4);
-        let bucket = Self::bucket(need);
+        let bucket = buffer_bucket(need);
         // Prefer exact-usage free slots in this bucket; usage is OR'd broadly so reuse is fine.
         if let Some(list) = self.encoder.staging_free.get_mut(&bucket) {
             if let Some(slot) = list.pop() {
@@ -3519,7 +3544,7 @@ impl ResourcePools {
         usage: vk::BufferUsageFlags,
         counters: &EngineCounters,
     ) -> Result<BufferSlot, DrawError> {
-        let bucket = Self::bucket(size.max(4));
+        let bucket = buffer_bucket(size.max(4));
         if let Some(slot) = self.encoder.take_free_gather(bucket) {
             return Ok(slot);
         }
@@ -3696,7 +3721,7 @@ impl ResourcePools {
     pub(crate) fn recycle_staging(&mut self) {
         self.forget_cb_bound_buffers("bindmap_clear_recycle", "bindmap_clear_recycle_entries");
         for slot in self.encoder.staging_live.drain(..) {
-            let bucket = Self::bucket(slot.size);
+            let bucket = buffer_bucket(slot.size);
             self.encoder
                 .staging_free
                 .entry(bucket)
@@ -3833,7 +3858,7 @@ impl EncoderPools {
         // readback rather than after an arbitrary delay. This is the only
         // engine-locked point the return path can rely on running.
         self.reclaim_returned_readback_leases();
-        let bucket = ResourcePools::bucket(size.max(4));
+        let bucket = buffer_bucket(size.max(4));
         if let Some(list) = self.readback_free.get_mut(&bucket) {
             if let Some(slot) = list.pop() {
                 self.readback_live = Some(slot);
@@ -3919,18 +3944,18 @@ impl EncoderPools {
                 continue;
             };
             let slot = self.readback_leased.remove(index).slot;
-            let bucket = ResourcePools::bucket(slot.size);
+            let bucket = buffer_bucket(slot.size);
             self.readback_free.entry(bucket).or_default().push(slot);
         }
     }
 
     pub(crate) fn recycle_readback(&mut self) {
         if let Some(slot) = self.readback_live.take() {
-            let bucket = ResourcePools::bucket(slot.size);
+            let bucket = buffer_bucket(slot.size);
             self.readback_free.entry(bucket).or_default().push(slot);
         }
         for slot in self.readback_multi_live.drain(..) {
-            let bucket = ResourcePools::bucket(slot.size);
+            let bucket = buffer_bucket(slot.size);
             self.readback_free.entry(bucket).or_default().push(slot);
         }
     }
@@ -3942,7 +3967,7 @@ impl EncoderPools {
         size: u64,
         counters: &EngineCounters,
     ) -> Result<BufferSlot, DrawError> {
-        let bucket = ResourcePools::bucket(size.max(4));
+        let bucket = buffer_bucket(size.max(4));
         if let Some(list) = self.readback_free.get_mut(&bucket) {
             if let Some(slot) = list.pop() {
                 self.readback_multi_live.push(slot);
@@ -5635,17 +5660,23 @@ mod recycle_tests {
             cmd_buf: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
             pending: Some(PendingGpuCleanup {
-                dsets: Vec::new(),
-                scatter_dsets: Vec::new(),
-                staging: Vec::new(),
-                gather: Vec::new(),
-                readback: Vec::new(),
-                sampled: Vec::new(),
-                attachment_snapshots: Vec::new(),
-                storage_images: Vec::new(),
-                unpin_residents: Vec::new(),
-                unpin_compute_residents: Vec::new(),
-                guest_write_tokens: Vec::new(),
+                encoder: EncoderCleanup {
+                    dsets: Vec::new(),
+                    scatter_dsets: Vec::new(),
+                    staging: Vec::new(),
+                    gather: Vec::new(),
+                    readback: Vec::new(),
+                },
+                visibility: VisibilityCleanup {
+                    guest_write_tokens: Vec::new(),
+                },
+                shared: SharedCleanup {
+                    sampled: Vec::new(),
+                    attachment_snapshots: Vec::new(),
+                    storage_images: Vec::new(),
+                    unpin_residents: Vec::new(),
+                    unpin_compute_residents: Vec::new(),
+                },
             }),
             submission: SlotSubmission::HostOwned,
             retirement: None,
@@ -5687,12 +5718,14 @@ mod recycle_tests {
             "encoder extraction is not shared-state acknowledgement"
         );
 
-        let RetiredEntry {
-            cleanup,
-            retirement,
-        } = retired;
-        assert!(cleanup.dsets.is_empty());
-        retirement.retire();
+        let (encoder, shared) = retired.split();
+        assert!(encoder.dsets.is_empty());
+        assert!(shared.cleanup.sampled.is_empty());
+        assert!(
+            !order.retired(captured),
+            "splitting the encoder return cannot acknowledge shared state"
+        );
+        shared.retirement.retire();
         assert!(order.retired(captured));
     }
 
@@ -5920,7 +5953,7 @@ mod recycle_tests {
             .cleanup;
         assert!(pools.encoder.guest_write_tokens_live.is_empty());
         assert_eq!(
-            cleanup.guest_write_tokens,
+            cleanup.visibility.guest_write_tokens,
             vec![write_token(11), write_token(12)]
         );
     }
@@ -5946,8 +5979,8 @@ mod recycle_tests {
             .encoder_mut()
             .seal_entry(Vec::new(), Vec::new())
             .cleanup;
-        assert_eq!(cleanup.guest_write_tokens.len(), 1);
-        crate::engine::retire_guest_write_pages(&cleanup.guest_write_tokens);
+        assert_eq!(cleanup.visibility.guest_write_tokens.len(), 1);
+        crate::engine::retire_guest_write_pages(&cleanup.visibility.guest_write_tokens);
         assert!(!crate::engine::guest_writes_outstanding());
     }
 
@@ -6001,7 +6034,7 @@ mod recycle_tests {
             .seal_entry(Vec::new(), Vec::new())
             .cleanup;
         assert!(pools.encoder.resident_pins_live.is_empty());
-        for held in cleanup.unpin_residents.drain(..) {
+        for held in cleanup.shared.unpin_residents.drain(..) {
             pools.pin_resident_target(&held, false);
         }
         assert_eq!(
@@ -6009,7 +6042,7 @@ mod recycle_tests {
             "every pin the ledger took is released exactly once"
         );
         assert!(
-            cleanup.unpin_residents.is_empty(),
+            cleanup.shared.unpin_residents.is_empty(),
             "a retired pin must not be released a second time"
         );
     }
@@ -6057,12 +6090,12 @@ mod recycle_tests {
             .seal_entry(Vec::new(), Vec::new())
             .cleanup;
         assert_eq!(
-            cleanup.guest_write_tokens,
+            cleanup.visibility.guest_write_tokens,
             vec![write_token(21)],
             "the write's visibility token follows the ring-owned image to its fence"
         );
         assert!(
-            cleanup.unpin_residents.is_empty(),
+            cleanup.shared.unpin_residents.is_empty(),
             "so its submission carries no unpin either"
         );
     }
@@ -6111,10 +6144,10 @@ mod recycle_tests {
             pools.encoder.compute_write_pins_live.is_empty(),
             "sealing hands the pin to the slot rather than copying it"
         );
-        assert_eq!(cleanup.unpin_compute_residents, vec![id]);
+        assert_eq!(cleanup.shared.unpin_compute_residents, vec![id]);
 
-        // What `drain_cleanup` does with them, once the fence has signalled.
-        for identity in cleanup.unpin_compute_residents.drain(..) {
+        // What shared cleanup does with them, once the fence has signalled.
+        for identity in cleanup.shared.unpin_compute_residents.drain(..) {
             pools.pin_resident_storage(&identity, false);
         }
         assert!(
@@ -6148,6 +6181,7 @@ mod recycle_tests {
             .encoder_mut()
             .seal_entry(Vec::new(), Vec::new())
             .cleanup
+            .shared
             .unpin_compute_residents
             .is_empty());
     }
@@ -6185,7 +6219,7 @@ mod recycle_tests {
             .encoder_mut()
             .seal_entry(Vec::new(), Vec::new())
             .cleanup;
-        for held in cleanup.unpin_residents.drain(..) {
+        for held in cleanup.shared.unpin_residents.drain(..) {
             pools.pin_resident_target(&held, false);
         }
         assert_eq!(
@@ -6597,7 +6631,7 @@ mod gather_slots_do_not_alias {
     #[test]
     fn a_second_acquire_cannot_name_the_first_ones_buffer() {
         let mut pools = ResourcePools::new();
-        let bucket = ResourcePools::bucket(4096);
+        let bucket = buffer_bucket(4096);
         pools
             .encoder
             .gather_free
@@ -6629,7 +6663,7 @@ mod gather_slots_do_not_alias {
     #[test]
     fn an_acquired_slot_is_no_longer_free() {
         let mut pools = ResourcePools::new();
-        let bucket = ResourcePools::bucket(4096);
+        let bucket = buffer_bucket(4096);
         pools
             .encoder
             .gather_free

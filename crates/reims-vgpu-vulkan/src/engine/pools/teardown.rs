@@ -53,20 +53,22 @@ impl ResourcePools {
         }
         for slot in &mut self.encoder.slots {
             if let Some(pending) = slot.pending.take() {
-                super::super::retire_guest_write_pages(&pending.guest_write_tokens);
+                super::super::retire_guest_write_pages(&pending.visibility.guest_write_tokens);
                 // The descriptor pool is destroyed below (frees every set);
                 // move the owed transients into the live lists so the drains
                 // below destroy them.
-                self.encoder.staging_live.extend(pending.staging);
-                self.encoder.gather_live.extend(pending.gather);
-                self.encoder.readback_multi_live.extend(pending.readback);
-                self.encoder.sampled_live.extend(pending.sampled);
+                self.encoder.staging_live.extend(pending.encoder.staging);
+                self.encoder.gather_live.extend(pending.encoder.gather);
+                self.encoder
+                    .readback_multi_live
+                    .extend(pending.encoder.readback);
+                self.encoder.sampled_live.extend(pending.shared.sampled);
                 self.encoder
                     .attachment_snapshot_live
-                    .extend(pending.attachment_snapshots);
+                    .extend(pending.shared.attachment_snapshots);
                 self.encoder
                     .storage_image_live
-                    .extend(pending.storage_images);
+                    .extend(pending.shared.storage_images);
             }
         }
         self.encoder.in_flight = 0;

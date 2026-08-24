@@ -4127,7 +4127,7 @@ pub(super) mod pin_count_tests {
         assert_eq!(pools.shared.registry.get(&identity).unwrap().pin_count, 1);
         let sealed = pools.encoder_mut().seal_entry(Vec::new(), Vec::new());
         assert!(pools.encoder.resident_pins_live.is_empty());
-        assert_eq!(sealed.cleanup.unpin_residents, vec![identity]);
+        assert_eq!(sealed.cleanup.shared.unpin_residents, vec![identity]);
     }
 
     /// The window presenter blits a resident with no format conversion and no
@@ -4340,7 +4340,7 @@ pub(super) mod pin_count_tests {
         assert_eq!(slot.pin_count, 1);
 
         let sealed = pools.encoder_mut().seal_entry(Vec::new(), Vec::new());
-        assert_eq!(sealed.cleanup.unpin_residents, vec![id]);
+        assert_eq!(sealed.cleanup.shared.unpin_residents, vec![id]);
     }
 
     #[test]
