@@ -3941,7 +3941,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // and never reaches a name of its own.
     let fit = batch_target
         .as_ref()
-        .map(|t| pools.batch_fit(t, batch_mixed_targets_disabled()))
+        .map(|t| pools.encoder().batch_fit(t, batch_mixed_targets_disabled()))
         .unwrap_or(BatchFit::None);
     let terms = JoinTerms {
         force_loss,
@@ -3981,7 +3981,10 @@ pub(crate) unsafe fn execute_draw_inner(
     // at the draw records why individual candidates still have to close.
     if joins {
         crate::telemetry::note_route(
-            match batch_target.as_ref().and_then(|t| pools.batch_target_is(t)) {
+            match batch_target
+                .as_ref()
+                .and_then(|t| pools.encoder().batch_target_is(t))
+            {
                 Some(true) => "join_same_target",
                 Some(false) => "join_other_target",
                 // A joiner with no `BatchTarget` of its own: refused by

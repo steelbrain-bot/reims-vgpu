@@ -352,6 +352,11 @@ impl ResourcePools {
         &mut self.encoder
     }
 
+    /// The command-recording state owned by this encoder alone.
+    pub(in crate::engine) fn encoder(&self) -> &EncoderPools {
+        &self.encoder
+    }
+
     /// Advance the registry clock and report whether a bounded maintenance pass
     /// is due. The pass may release objects already outside every live resource
     /// (dead direct images and free-pool entries), but elapsed time is never an
@@ -1834,7 +1839,9 @@ impl ResourcePools {
         }
         taken
     }
+}
 
+impl EncoderPools {
     /// Whether a draw at `target` can append to the open batch, and when it
     /// cannot, which of the three reasons it is. Anything but
     /// [`BatchFit::Open`] means the caller must claim its own slot (and
@@ -1858,10 +1865,10 @@ impl ResourcePools {
     /// parameter rather than reading the environment here keeps this function
     /// pure and testable.
     pub(crate) fn batch_fit(&self, target: &BatchTarget, narrow_to_target: bool) -> BatchFit {
-        let Some(b) = self.encoder.open_batch.as_ref() else {
+        let Some(b) = self.open_batch.as_ref() else {
             return BatchFit::None;
         };
-        if b.draws >= self.encoder.batch_max_draws {
+        if b.draws >= self.batch_max_draws {
             return BatchFit::Full;
         }
         if narrow_to_target && b.target != *target {
@@ -1880,14 +1887,9 @@ impl ResourcePools {
     /// `batch_fit` because that function is deliberately pure and testable
     /// without a device, and a counter in it would not be.
     pub(crate) fn batch_target_is(&self, target: &BatchTarget) -> Option<bool> {
-        self.encoder
-            .open_batch
-            .as_ref()
-            .map(|b| b.target == *target)
+        self.open_batch.as_ref().map(|b| b.target == *target)
     }
-}
 
-impl EncoderPools {
     /// Whether the pass a draw is about to open is the one already standing in
     /// the same command buffer — see [`PassEcho`].
     ///
@@ -6129,7 +6131,7 @@ mod recycle_tests {
         pools.encoder.slots = (0..4).map(|_| idle_slot()).collect();
 
         assert!(
-            matches!(pools.batch_fit(&target(0), false), BatchFit::None),
+            matches!(pools.encoder().batch_fit(&target(0), false), BatchFit::None),
             "nothing recording"
         );
 
@@ -6141,15 +6143,24 @@ mod recycle_tests {
             dsets: Vec::new(),
         });
         assert!(
-            matches!(pools.batch_fit(&target(0), true), BatchFit::Open(..)),
+            matches!(
+                pools.encoder().batch_fit(&target(0), true),
+                BatchFit::Open(..)
+            ),
             "its own target fits on either arm"
         );
         assert!(
-            matches!(pools.batch_fit(&target(1), true), BatchFit::OtherTarget),
+            matches!(
+                pools.encoder().batch_fit(&target(1), true),
+                BatchFit::OtherTarget
+            ),
             "the narrowed arm refuses a second surface"
         );
         assert!(
-            matches!(pools.batch_fit(&target(1), false), BatchFit::Open(..)),
+            matches!(
+                pools.encoder().batch_fit(&target(1), false),
+                BatchFit::Open(..)
+            ),
             "the default arm admits it — every draw opens and ends its own pass"
         );
 
@@ -6158,7 +6169,10 @@ mod recycle_tests {
         pools.encoder.open_batch.as_mut().expect("open").draws = BATCH_MAX_DRAWS;
         for narrow in [false, true] {
             assert!(
-                matches!(pools.batch_fit(&target(0), narrow), BatchFit::Full),
+                matches!(
+                    pools.encoder().batch_fit(&target(0), narrow),
+                    BatchFit::Full
+                ),
                 "narrow={narrow}"
             );
         }
@@ -6495,14 +6509,14 @@ mod scatter_descriptor_sets_do_not_alias {
             dsets: Vec::new(),
         });
         assert!(matches!(
-            pools.batch_fit(&target, false),
+            pools.encoder().batch_fit(&target, false),
             super::BatchFit::Open(..)
         ));
         if let Some(b) = pools.encoder.open_batch.as_mut() {
             b.draws = 4;
         }
         assert!(matches!(
-            pools.batch_fit(&target, false),
+            pools.encoder().batch_fit(&target, false),
             super::BatchFit::Full
         ));
     }
