@@ -5594,7 +5594,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // its commands append after the previous draw's end_render_pass.
     if !joins {
         unsafe {
-            pools.begin_slot_recording(
+            pools.encoder_mut().begin_slot_recording(
                 ctx,
                 cb,
                 super::gpu_span::Kind::Draw,

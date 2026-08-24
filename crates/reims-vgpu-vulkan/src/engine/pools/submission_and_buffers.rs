@@ -147,6 +147,60 @@ fn pass_spans_probe_enabled() -> bool {
 }
 
 impl EncoderPools {
+    /// Reset and begin this encoder's current command buffer, arming its GPU
+    /// timestamp pair in the same transition.
+    ///
+    /// # Safety
+    /// `cb` must be the current slot's command buffer and not recording.
+    pub(crate) unsafe fn begin_slot_recording(
+        &mut self,
+        ctx: &DeviceContext,
+        cb: vk::CommandBuffer,
+        kind: gpu_span::Kind,
+        reset_op: VkOp,
+        begin_op: VkOp,
+    ) -> Result<(), DrawError> {
+        ctx.device
+            .reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())
+            .map_err(|error| DrawError::VkCall(VkCall::new(reset_op, error)))?;
+        ctx.device
+            .begin_command_buffer(
+                cb,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+            .map_err(|error| DrawError::VkCall(VkCall::new(begin_op, error)))?;
+        unsafe { self.gpu_span_arm(ctx, cb, kind) };
+        Ok(())
+    }
+
+    /// Arm the current slot's timestamp region immediately after beginning its
+    /// command buffer.
+    unsafe fn gpu_span_arm(
+        &mut self,
+        ctx: &DeviceContext,
+        cb: vk::CommandBuffer,
+        kind: gpu_span::Kind,
+    ) {
+        let Some(probe) = ctx.draw_spans.as_ref() else {
+            return;
+        };
+        let slot = self.cur;
+        if self.slots[slot].span != gpu_span::SlotSpan::Idle {
+            gpu_span::note_unread();
+        }
+        let base = DrawSpanProbe::base(slot);
+        ctx.device
+            .cmd_reset_query_pool(cb, probe.pool, base, DrawSpanProbe::PER_SLOT);
+        ctx.device
+            .cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, probe.pool, base);
+        self.slots[slot].span = gpu_span::SlotSpan::Armed(kind);
+        self.slots[slot].pass_spans = 0;
+        self.pass_open_index = None;
+        self.pass_probe = Some(probe.pool);
+        gpu_span::note_armed();
+    }
+
     /// Allocate a descriptor set from this encoder's arena, growing it on
     /// exhaustion rather than dropping guest work.
     pub(crate) unsafe fn alloc_descriptor_set(
@@ -1122,95 +1176,6 @@ impl ResourcePools {
                 FenceWait::Failed(error) => return Err(Self::wait_error(counters, error, op)),
             }
         }
-    }
-
-    /// Reset a ring-slot command buffer and begin recording it, arming its GPU
-    /// timestamp pair in the same call.
-    ///
-    /// **This is the only way a ring-slot command buffer may be begun.** All five
-    /// submission kinds used to spell the reset-then-begin pair out by hand, and
-    /// the probe was wired into exactly one of them — which reported 51 % GPU
-    /// occupancy for a device whose writeback submissions carried no stamps at
-    /// all. Folding the arm into the begin is what makes a sixth kind unable to
-    /// join without one: there is no longer a shorter path to a recording slot CB.
-    ///
-    /// The `VkOp`s are parameters because each caller reports its own failure name
-    /// and those names are load-bearing in the fail log.
-    ///
-    /// # Safety
-    ///
-    /// `cb` must be the current slot's command buffer and must not be recording.
-    pub(crate) unsafe fn begin_slot_recording(
-        &mut self,
-        ctx: &DeviceContext,
-        cb: vk::CommandBuffer,
-        kind: gpu_span::Kind,
-        reset_op: VkOp,
-        begin_op: VkOp,
-    ) -> Result<(), DrawError> {
-        ctx.device
-            .reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())
-            .map_err(|e| DrawError::VkCall(VkCall::new(reset_op, e)))?;
-        ctx.device
-            .begin_command_buffer(
-                cb,
-                &vk::CommandBufferBeginInfo::default()
-                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )
-            .map_err(|e| DrawError::VkCall(VkCall::new(begin_op, e)))?;
-        unsafe { self.gpu_span_arm(ctx, cb, kind) };
-        Ok(())
-    }
-
-    /// Reset the current slot's timestamp pair and write the top one, so the
-    /// submission about to be recorded reports its own GPU execution time.
-    ///
-    /// Private, and reached only through [`Self::begin_slot_recording`]: a caller
-    /// that could arm without beginning could also begin without arming, which is
-    /// the failure this pairing exists to prevent. A batch joiner reaches neither
-    /// — it appends to a CB already armed, and arming again would move the top
-    /// stamp forward past work the batch has already recorded, reading as a fast
-    /// submission rather than as a broken one.
-    ///
-    /// Both `vkCmdResetQueryPool` and the write must be outside a render pass
-    /// instance, which the caller satisfies by sitting immediately after
-    /// `vkBeginCommandBuffer`.
-    ///
-    /// # Safety
-    ///
-    /// `cb` must be the current slot's command buffer, recording, and outside any
-    /// render pass.
-    unsafe fn gpu_span_arm(
-        &mut self,
-        ctx: &DeviceContext,
-        cb: vk::CommandBuffer,
-        kind: gpu_span::Kind,
-    ) {
-        let Some(probe) = ctx.draw_spans.as_ref() else {
-            return;
-        };
-        let slot = self.encoder.cur;
-        // A slot armed twice without a read between means the ring reused it
-        // without retiring it, which would also mean its cleanup was never
-        // drained. Report rather than silently overwrite: the sample is lost
-        // either way and only the counter says so.
-        if self.encoder.slots[slot].span != gpu_span::SlotSpan::Idle {
-            gpu_span::note_unread();
-        }
-        let base = DrawSpanProbe::base(slot);
-        // The whole region, pass pairs included: a query's results are undefined
-        // until it is reset, and this is the one point in a slot command buffer
-        // that is guaranteed to be outside a render pass instance, which
-        // `vkCmdResetQueryPool` requires and `vkCmdWriteTimestamp` does not.
-        ctx.device
-            .cmd_reset_query_pool(cb, probe.pool, base, DrawSpanProbe::PER_SLOT);
-        ctx.device
-            .cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, probe.pool, base);
-        self.encoder.slots[slot].span = gpu_span::SlotSpan::Armed(kind);
-        self.encoder.slots[slot].pass_spans = 0;
-        self.encoder.pass_open_index = None;
-        self.encoder.pass_probe = Some(probe.pool);
-        gpu_span::note_armed();
     }
 
     /// Write the bottom timestamp of the slot's command buffer, immediately

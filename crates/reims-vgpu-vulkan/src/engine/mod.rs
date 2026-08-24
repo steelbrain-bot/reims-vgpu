@@ -3938,7 +3938,7 @@ unsafe fn copy_image_level0_to_host_delivered(
     // would discard them and beginning it again is invalid.
     if appended.is_none() {
         unsafe {
-            pools.begin_slot_recording(
+            pools.encoder_mut().begin_slot_recording(
                 ctx,
                 cb,
                 gpu_span::Kind::Readback,
@@ -4525,7 +4525,7 @@ pub fn copy_resident_level0(
         // batch. A refusal can then unwind only this copy's pins and recording;
         // it cannot invalidate unrelated work already accumulated in a batch.
         let (cb, fence) = pools.begin_entry(ctx, counters)?;
-        pools.begin_slot_recording(
+        pools.encoder_mut().begin_slot_recording(
             ctx,
             cb,
             gpu_span::Kind::Store,
@@ -5342,7 +5342,7 @@ unsafe fn copy_image_level0_to_buffer(
     };
     if appended.is_none() {
         unsafe {
-            pools.begin_slot_recording(
+            pools.encoder_mut().begin_slot_recording(
                 ctx,
                 cb,
                 gpu_span::Kind::Store,

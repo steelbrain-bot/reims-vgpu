@@ -1276,7 +1276,7 @@ pub(crate) unsafe fn execute_compute_inner(
     // The ring slot's CB retired at begin_entry and its fence is unsignaled —
     // no pre-record wait remains (pre_record_wait_us stays 0 on this path).
     unsafe {
-        pools.begin_slot_recording(
+        pools.encoder_mut().begin_slot_recording(
             ctx,
             cb,
             super::gpu_span::Kind::Compute,
