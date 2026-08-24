@@ -248,6 +248,96 @@ impl EncoderPools {
         Ok(())
     }
 
+    fn configure_batch_capacity(&mut self, draws: u64) {
+        debug_assert!(self.attachment_snapshot_live.is_empty());
+        self.batch_max_draws = draws;
+    }
+
+    /// Create the command pool, descriptor arena, and ring owned by this
+    /// recording context alone.
+    ///
+    /// # Safety
+    /// `ctx` must outlive every native object installed on this encoder.
+    unsafe fn ensure_init(
+        &mut self,
+        ctx: &DeviceContext,
+        counters: &EngineCounters,
+        batch_max_draws: u64,
+    ) -> Result<(), DrawError> {
+        if self.initialized {
+            return Ok(());
+        }
+        self.configure_batch_capacity(batch_max_draws);
+        let cmd_pool = ctx
+            .device
+            .create_command_pool(
+                &vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(ctx.gq)
+                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                None,
+            )
+            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateCommandPool, e)))?;
+        counters.note_create(CreateSite::CommandPool);
+        let cmd_bufs = ctx
+            .device
+            .allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(cmd_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(RING_DEPTH as u32),
+            )
+            .map_err(|e| {
+                ctx.device.destroy_command_pool(cmd_pool, None);
+                DrawError::VkCall(VkCall::new(VkOp::PoolsAllocCommandBuffers, e))
+            })?;
+        // Growable descriptor arena: block 0 up front, more blocks on demand.
+        // Free sets after each draw/dispatch; exhaustion grows rather than drops.
+        let mut desc_arena = DescriptorArena::empty();
+        if let Err(e) = desc_arena.create_first_block(&ctx.device) {
+            ctx.device.destroy_command_pool(cmd_pool, None);
+            return Err(e);
+        }
+        counters.note_create(CreateSite::DescriptorPool);
+        let mut slots = Vec::with_capacity(RING_DEPTH);
+        for cmd_buf in cmd_bufs {
+            // Fences start unsignaled: a slot with no pending cleanup is never
+            // waited on, and a submit requires an unsignaled fence.
+            match ctx
+                .device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+            {
+                Ok(fence) => {
+                    counters.note_create(CreateSite::Fence);
+                    slots.push(CmdSlot {
+                        cmd_buf,
+                        fence,
+                        pending: None,
+                        submission: SlotSubmission::HostOwned,
+                        retirement: None,
+                        span: super::gpu_span::SlotSpan::Idle,
+                        readback_span_armed: false,
+                        pass_spans: 0,
+                    });
+                }
+                Err(e) => {
+                    for slot in &slots {
+                        ctx.device.destroy_fence(slot.fence, None);
+                    }
+                    desc_arena.destroy(&ctx.device);
+                    ctx.device.destroy_command_pool(cmd_pool, None);
+                    return Err(DrawError::VkCall(VkCall::new(VkOp::PoolsCreateFence, e)));
+                }
+            }
+        }
+        self.cmd_pool = cmd_pool;
+        self.desc_arena = desc_arena;
+        self.slots = slots;
+        self.cur = 0;
+        self.in_flight = 0;
+        self.initialized = true;
+        Ok(())
+    }
+
     pub(crate) fn note_guest_read_recorded(&mut self) {
         self.guest_reads_in_flight = true;
         super::super::publish_guest_read_debt(true);
@@ -1140,86 +1230,14 @@ impl ResourcePools {
         if self.encoder.initialized {
             return Ok(());
         }
-        self.configure_batch_capacity(super::batch_max_draws(ctx.caps.memory.topology));
-        let cmd_pool = ctx
-            .device
-            .create_command_pool(
-                &vk::CommandPoolCreateInfo::default()
-                    .queue_family_index(ctx.gq)
-                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
-                None,
-            )
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateCommandPool, e)))?;
-        counters.note_create(CreateSite::CommandPool);
-        let cmd_bufs = ctx
-            .device
-            .allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(cmd_pool)
-                    .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(RING_DEPTH as u32),
-            )
-            .map_err(|e| {
-                ctx.device.destroy_command_pool(cmd_pool, None);
-                DrawError::VkCall(VkCall::new(VkOp::PoolsAllocCommandBuffers, e))
-            })?;
-        // Growable descriptor arena: block 0 up front, more blocks on demand.
-        // Free sets after each draw/dispatch; exhaustion grows rather than drops.
-        let mut desc_arena = DescriptorArena::empty();
-        if let Err(e) = desc_arena.create_first_block(&ctx.device) {
-            ctx.device.destroy_command_pool(cmd_pool, None);
-            return Err(e);
-        }
-        counters.note_create(CreateSite::DescriptorPool);
-        let mut slots = Vec::with_capacity(RING_DEPTH);
-        for cmd_buf in cmd_bufs.into_iter() {
-            // Fences start unsignaled: a slot with no pending cleanup is never
-            // waited on, and a submit requires an unsignaled fence.
-            match ctx
-                .device
-                .create_fence(&vk::FenceCreateInfo::default(), None)
-            {
-                Ok(fence) => {
-                    counters.note_create(CreateSite::Fence);
-                    slots.push(CmdSlot {
-                        cmd_buf,
-                        fence,
-                        pending: None,
-                        submission: SlotSubmission::HostOwned,
-                        retirement: None,
-                        span: super::gpu_span::SlotSpan::Idle,
-                        readback_span_armed: false,
-                        pass_spans: 0,
-                    });
-                }
-                Err(e) => {
-                    for slot in &slots {
-                        ctx.device.destroy_fence(slot.fence, None);
-                    }
-                    desc_arena.destroy(&ctx.device);
-                    ctx.device.destroy_command_pool(cmd_pool, None);
-                    return Err(DrawError::VkCall(VkCall::new(VkOp::PoolsCreateFence, e)));
-                }
-            }
-        }
-        self.encoder.cmd_pool = cmd_pool;
-        self.encoder.desc_arena = desc_arena;
-        self.encoder.slots = slots;
-        self.encoder.cur = 0;
-        self.encoder.in_flight = 0;
-        self.encoder.initialized = true;
-        Ok(())
-    }
-
-    /// Install one device's submission capacity before the Vulkan-owned pool
-    /// objects are created. Attachment snapshots have the same command-buffer
-    /// lifetime, so their recycle budget is derived here rather than retaining
-    /// the largest topology's population on every host.
-    fn configure_batch_capacity(&mut self, draws: u64) {
-        debug_assert!(self.encoder.attachment_snapshot_live.is_empty());
         debug_assert_eq!(self.shared.attachment_snapshot_free.len(), 0);
-        self.encoder.batch_max_draws = draws;
-        self.shared.attachment_snapshot_free = FreePool::new();
+        unsafe {
+            self.encoder.ensure_init(
+                ctx,
+                counters,
+                super::batch_max_draws(ctx.caps.memory.topology),
+            )
+        }
     }
 
     /// The capacity installed for this pool's physical device.
@@ -6859,18 +6877,16 @@ mod scatter_descriptor_sets_do_not_alias {
         );
     }
 
-    /// Installing device policy resets the snapshot pool before any Vulkan
-    /// object can enter it, without installing a second capacity policy.
+    /// Device policy belongs to each recording context and does not mutate the
+    /// peer that may record beside it.
     #[test]
-    fn configuring_batch_capacity_resets_the_snapshot_pool() {
-        let mut pools = ResourcePools::new();
-        pools.configure_batch_capacity(super::DISCRETE_BATCH_MAX_DRAWS);
+    fn configuring_one_encoder_does_not_configure_another() {
+        let mut first = EncoderPools::new();
+        let second = EncoderPools::new();
+        first.configure_batch_capacity(super::DISCRETE_BATCH_MAX_DRAWS);
 
-        assert_eq!(
-            pools.encoder.batch_max_draws,
-            super::DISCRETE_BATCH_MAX_DRAWS
-        );
-        assert_eq!(pools.shared.attachment_snapshot_free.len(), 0);
+        assert_eq!(first.batch_max_draws, super::DISCRETE_BATCH_MAX_DRAWS);
+        assert_eq!(second.batch_max_draws, super::BATCH_MAX_DRAWS);
     }
 }
 
