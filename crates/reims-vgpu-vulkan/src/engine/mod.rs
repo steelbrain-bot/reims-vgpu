@@ -1663,7 +1663,7 @@ pub fn flush_batched_draws() {
         // The lock-free publication can race an in-engine consumer that
         // flushes before this caller acquires the lock. Only a batch observed
         // here belongs in the tail population.
-        let had_batch = pools.batch_open_recording().is_some();
+        let had_batch = pools.encoder().batch_open_recording().is_some();
         let call_started = std::time::Instant::now();
         let result = unsafe { pools.batch_flush(ctx, counters) };
         counters.batch_tail_call_us.fetch_add(
@@ -2544,7 +2544,7 @@ pub fn write_completion_stamp(
             rung: ctx.caps.host_pointer.rung,
         }));
     };
-    let had_batch = pools.batch_open_recording().is_some();
+    let had_batch = pools.encoder().batch_open_recording().is_some();
     let deferred = had_batch
         && completion.queue_for_next_submission(
             session,
@@ -2619,7 +2619,7 @@ pub fn submit_batch_for_waiting_stamp(index: u32) -> bool {
         ref counters,
         ..
     } = &mut *guard;
-    if pools.batch_open_recording().is_none() {
+    if pools.encoder().batch_open_recording().is_none() {
         return false;
     }
     let Some(ctx) = owner.ctx.as_ref() else {
@@ -3908,7 +3908,7 @@ unsafe fn copy_image_level0_to_host_delivered(
     // hand and is sealed into the batch's own pending cleanup by
     // `batch_flush` — so the fence that returns it to the free list is now the
     // very fence this copy was submitted with, instead of one submitted earlier.
-    let appended = pools.batch_open_recording();
+    let appended = pools.encoder().batch_open_recording();
     let (cb, fence) = match appended {
         Some(pair) => {
             counters
@@ -5330,7 +5330,7 @@ unsafe fn copy_image_level0_to_buffer(
     // `copy_image_level0_to_host_delivered` gives: `begin_entry` would submit
     // that batch only to submit this copy behind it, and the copy has to be
     // ordered after those draws either way.
-    let appended = pools.batch_open_recording();
+    let appended = pools.encoder().batch_open_recording();
     let (cb, fence) = match appended {
         Some(pair) => {
             counters

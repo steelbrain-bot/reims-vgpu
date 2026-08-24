@@ -1185,7 +1185,9 @@ pub(crate) unsafe fn execute_compute_inner(
     // free. A push layout records its writes into the command buffer instead.
     let mut dset_pool: Option<vk::DescriptorPool> = None;
     let dset = if dsl != vk::DescriptorSetLayout::null() && !push_descriptors {
-        let (dset, pool) = pools.alloc_descriptor_set(&ctx.device, dsl, counters)?;
+        let (dset, pool) = pools
+            .encoder_mut()
+            .alloc_descriptor_set(&ctx.device, dsl, counters)?;
         dset_pool = Some(pool);
         Some(dset)
     } else {
@@ -1755,7 +1757,9 @@ pub(crate) unsafe fn execute_compute_inner(
 
     if force_loss {
         if let (Some(ds), Some(pool)) = (dset, dset_pool) {
-            pools.free_descriptor_sets(&ctx.device, &[(ds, pool)]);
+            pools
+                .encoder()
+                .free_descriptor_sets(&ctx.device, &[(ds, pool)]);
         }
         pools.recycle_staging();
         pools.recycle_readback();

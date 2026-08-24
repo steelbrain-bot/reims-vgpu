@@ -5506,7 +5506,9 @@ pub(crate) unsafe fn execute_draw_inner(
     // free routes back to the block it came from. A push layout owns neither.
     let mut dset_pool: Option<vk::DescriptorPool> = None;
     let dset = if dsl != vk::DescriptorSetLayout::null() && !push_descriptors {
-        let (dset, pool) = pools.alloc_descriptor_set(&ctx.device, dsl, counters)?;
+        let (dset, pool) = pools
+            .encoder_mut()
+            .alloc_descriptor_set(&ctx.device, dsl, counters)?;
         dset_pool = Some(pool);
         Some(dset)
     } else {
@@ -7393,7 +7395,9 @@ pub(crate) unsafe fn execute_draw_inner(
     if force_loss {
         // Recycle transient resources before reporting loss.
         if let (Some(ds), Some(pool)) = (dset, dset_pool) {
-            pools.free_descriptor_sets(&ctx.device, &[(ds, pool)]);
+            pools
+                .encoder()
+                .free_descriptor_sets(&ctx.device, &[(ds, pool)]);
         }
         pools.recycle_staging();
         pools.recycle_readback();

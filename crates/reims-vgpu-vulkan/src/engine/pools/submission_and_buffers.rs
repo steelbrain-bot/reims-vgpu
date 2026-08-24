@@ -147,6 +147,41 @@ fn pass_spans_probe_enabled() -> bool {
 }
 
 impl EncoderPools {
+    /// Allocate a descriptor set from this encoder's arena, growing it on
+    /// exhaustion rather than dropping guest work.
+    pub(crate) unsafe fn alloc_descriptor_set(
+        &mut self,
+        device: &ash::Device,
+        dsl: vk::DescriptorSetLayout,
+        counters: &EngineCounters,
+    ) -> Result<(vk::DescriptorSet, vk::DescriptorPool), DrawError> {
+        let (set, pool, grew) = self.desc_arena.allocate(device, dsl)?;
+        if grew {
+            counters.desc_pool_grow.fetch_add(1, Ordering::Relaxed);
+            reims_vgpu_observe::off(format!(
+                "desc_arena_grow blocks={} block_max_sets={DESC_BLOCK_MAX_SETS} cause=pool_exhausted",
+                self.desc_arena.block_count()
+            ));
+        }
+        Ok((set, pool))
+    }
+
+    /// Free `(set, owning_pool)` pairs to this encoder's allocating arena.
+    pub(crate) unsafe fn free_descriptor_sets(
+        &self,
+        device: &ash::Device,
+        sets: &[(vk::DescriptorSet, vk::DescriptorPool)],
+    ) {
+        unsafe { self.desc_arena.free(device, sets) };
+    }
+
+    /// The open batch command buffer and fence, if this encoder is recording.
+    pub(crate) fn batch_open_recording(&self) -> Option<(vk::CommandBuffer, vk::Fence)> {
+        self.open_batch
+            .as_ref()
+            .map(|batch| (batch.cb, batch.fence))
+    }
+
     fn new() -> Self {
         Self {
             readback_lease_returns: Arc::new(ReadbackLeaseReturns::default()),
@@ -715,28 +750,6 @@ impl ResourcePools {
         self.encoder.batch_max_draws
     }
 
-    /// Allocate one descriptor set for `dsl` from the arena, growing a new pool
-    /// block on exhaustion (rather than dropping the draw). Returns the set and
-    /// its owning pool — pair the pool with the set so a later free routes to
-    /// the allocating block. Emits the always-on `desc_arena_grow` cap-pressure
-    /// proxy on growth (a rare event; zero under normal load).
-    pub(crate) unsafe fn alloc_descriptor_set(
-        &mut self,
-        device: &ash::Device,
-        dsl: vk::DescriptorSetLayout,
-        counters: &EngineCounters,
-    ) -> Result<(vk::DescriptorSet, vk::DescriptorPool), DrawError> {
-        let (set, pool, grew) = self.encoder.desc_arena.allocate(device, dsl)?;
-        if grew {
-            counters.desc_pool_grow.fetch_add(1, Ordering::Relaxed);
-            reims_vgpu_observe::off(format!(
-                "desc_arena_grow blocks={} block_max_sets={DESC_BLOCK_MAX_SETS} cause=pool_exhausted",
-                self.encoder.desc_arena.block_count()
-            ));
-        }
-        Ok((set, pool))
-    }
-
     /// The device's guest-scatter pipeline, built on the first writeback that
     /// wants it and `None` on a device whose driver refused to build it.
     ///
@@ -794,7 +807,7 @@ impl ResourcePools {
     ) -> Result<vk::DescriptorSet, DrawError> {
         let (set, pool) = match self.take_free_scatter_dset() {
             Some(recycled) => recycled,
-            None => unsafe { self.alloc_descriptor_set(device, dsl, counters) }?,
+            None => unsafe { self.encoder.alloc_descriptor_set(device, dsl, counters) }?,
         };
         self.encoder.scatter_dsets.push((set, pool));
         Ok(set)
@@ -823,15 +836,6 @@ impl ResourcePools {
     /// after the wait.
     fn recycle_scatter_dsets(&mut self, sets: &mut Vec<(vk::DescriptorSet, vk::DescriptorPool)>) {
         self.encoder.scatter_dset_free.append(sets);
-    }
-
-    /// Free `(set, owning_pool)` pairs back to their allocating blocks.
-    pub(crate) unsafe fn free_descriptor_sets(
-        &self,
-        device: &ash::Device,
-        sets: &[(vk::DescriptorSet, vk::DescriptorPool)],
-    ) {
-        self.encoder.desc_arena.free(device, sets);
     }
 
     /// Whether the current command buffer already owns the cleanup that will
@@ -1578,20 +1582,6 @@ impl ResourcePools {
         result.map(|()| true).map_err(|error| {
             Self::wait_error(counters, error, DeviceLostOp::PoolsFenceStatusBeginEntry)
         })
-    }
-
-    /// The open batch's command buffer and the fence [`Self::batch_flush`] will
-    /// submit it with, for a caller that wants to append to the run rather than
-    /// end it.
-    ///
-    /// The command buffer is **already recording** — the caller must not begin
-    /// or reset it. It may carry the preceding draw's still-open render pass;
-    /// every command that cannot live there closes it at its recording site.
-    /// The fence is the one returned here precisely so the caller can wait it
-    /// after `batch_flush` without having to reach back into a batch that no
-    /// longer exists by then.
-    pub(crate) fn batch_open_recording(&self) -> Option<(vk::CommandBuffer, vk::Fence)> {
-        self.encoder.open_batch.as_ref().map(|b| (b.cb, b.fence))
     }
 
     /// Start a new entry (draw / dispatch / sync helper): advance to the next
