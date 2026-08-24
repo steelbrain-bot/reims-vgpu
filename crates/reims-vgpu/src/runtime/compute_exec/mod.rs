@@ -479,9 +479,23 @@ pub enum ComputeStatus {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ComputeBarrierRefusal {
-    DecodeMalformed { opcode: u32 },
-    ScopeUnsupported { raw: u16 },
-    ResourceUnavailable { index: u32, object_ref: u32 },
+    DecodeMalformed {
+        opcode: u32,
+    },
+    ScopeUnsupported {
+        raw: u16,
+    },
+    ResourceUnavailable {
+        index: u32,
+        object_ref: u32,
+    },
+    FenceWaitPending {
+        fence_ref: u32,
+    },
+    FenceUnsupported {
+        fence_ref: u32,
+        reason: &'static str,
+    },
 }
 
 impl ComputeBarrierRefusal {
@@ -492,6 +506,8 @@ impl ComputeBarrierRefusal {
             Self::ResourceUnavailable { index, object_ref } => {
                 (1 << 63) | (u64::from(index) << 32) | u64::from(object_ref)
             }
+            Self::FenceWaitPending { fence_ref } => (3 << 60) | u64::from(fence_ref),
+            Self::FenceUnsupported { fence_ref, .. } => (4 << 60) | u64::from(fence_ref),
         }
     }
 }
@@ -502,6 +518,8 @@ impl crate::observe::Decline for ComputeBarrierRefusal {
             Self::DecodeMalformed { .. } => "compute_barrier_decode_malformed",
             Self::ScopeUnsupported { .. } => "compute_barrier_scope_unsupported",
             Self::ResourceUnavailable { .. } => "compute_barrier_resource_unavailable",
+            Self::FenceWaitPending { .. } => "compute_fence_wait_pending",
+            Self::FenceUnsupported { reason, .. } => reason,
         }
     }
 
@@ -513,6 +531,12 @@ impl crate::observe::Decline for ComputeBarrierRefusal {
                 ("index", index.to_string()),
                 ("object_ref", format!("{object_ref:#x}")),
             ],
+            Self::FenceWaitPending { fence_ref } => {
+                vec![("fence", format!("{fence_ref:#x}"))]
+            }
+            Self::FenceUnsupported { fence_ref, .. } => {
+                vec![("fence", format!("{fence_ref:#x}"))]
+            }
         }
     }
 }
@@ -864,25 +888,54 @@ fn apply_record_inner<M: HostMemory + HostOps>(
                 &mut seg.pending_barriers,
             ))
         }
-        // Three kinds the product answers by doing nothing, each counted
-        // separately. `None` here is also what every state-accumulating record
-        // above returns, so a no-op and a drop are the same silence — and these
-        // are the records where the difference matters, because unlike a
-        // `BufferBind` they carry ordering the guest expects us to honour.
-        //
-        // The fence pair has no such argument and never had one; it sat in the
-        // barrier group's arm without sharing its comment. An `MTLFence` update
-        // or wait inside a compute encoder is ordering the guest stated
-        // explicitly, and nothing else in the crate handles these two kinds —
-        // `fence_exec` serves the event rail, not this one. If either counter
-        // is non-zero, that is guest-stated ordering we are discarding, and it
-        // wants a contract answer rather than another counter.
         Kind::UpdateFence => {
-            crate::runtime::drain::note_store_route("compute_noop_update_fence");
+            let status = crate::runtime::fence_exec::execute_fence(
+                state,
+                task_id,
+                reims_vgpu_core::SynchronizationDomain::ComputeFence,
+                cmd.fence_ref,
+                reims_vgpu_core::FenceAction::Update,
+            );
+            if let crate::runtime::fence_exec::FenceStatus::Unsupported(reason) = status {
+                seg.barrier_block
+                    .get_or_insert(ComputeBarrierRefusal::FenceUnsupported {
+                        fence_ref: cmd.fence_ref,
+                        reason,
+                    });
+            }
             None
         }
         Kind::WaitFence => {
-            crate::runtime::drain::note_store_route("compute_noop_wait_fence");
+            use crate::runtime::fence_exec::FenceStatus;
+            let status = crate::runtime::fence_exec::execute_fence(
+                state,
+                task_id,
+                reims_vgpu_core::SynchronizationDomain::ComputeFence,
+                cmd.fence_ref,
+                reims_vgpu_core::FenceAction::Wait,
+            );
+            match status {
+                FenceStatus::Ok => seg
+                    .pending_barriers
+                    .push(reims_vgpu_core::ComputeBarrier::Fence),
+                FenceStatus::Pending => {
+                    let refusal = ComputeBarrierRefusal::FenceWaitPending {
+                        fence_ref: cmd.fence_ref,
+                    };
+                    crate::observe::Emit::decline("compute_fence", &refusal)
+                        .field("task", task_id)
+                        .fail_once(refusal.latch());
+                    seg.barrier_block.get_or_insert(refusal);
+                }
+                FenceStatus::Unsupported(reason) => {
+                    seg.barrier_block
+                        .get_or_insert(ComputeBarrierRefusal::FenceUnsupported {
+                            fence_ref: cmd.fence_ref,
+                            reason,
+                        });
+                }
+                FenceStatus::Missing => {}
+            }
             None
         }
         Kind::BarrierResources | Kind::BarrierScope => {

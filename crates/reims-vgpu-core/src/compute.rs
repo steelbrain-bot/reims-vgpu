@@ -12,6 +12,13 @@ use std::sync::Arc;
 pub enum ComputeBarrier {
     Resources(Arc<[crate::BarrierResource]>),
     Scope(crate::MemoryBarrierScope),
+    /// A satisfied `waitForFence:` immediately before this dispatch.
+    ///
+    /// Unlike a scope barrier, an encoder fence names all writes before the
+    /// matching update. Keeping the fence as its own semantic command avoids
+    /// inventing a resource class while allowing a backend to realize the
+    /// required memory dependency conservatively.
+    Fence,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]

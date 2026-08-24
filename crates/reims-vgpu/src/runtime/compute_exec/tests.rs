@@ -160,6 +160,46 @@ fn compute_barriers_fail_visible_and_survive_a_refused_dispatch() {
     );
 }
 
+#[test]
+fn compute_fence_wait_becomes_a_dependency_and_an_unsatisfied_wait_blocks_dispatch() {
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let mut seg = crate::runtime::compute_session::ComputeSegment::default();
+
+    let mut update = ComputeCommand::default();
+    update.kind = Kind::UpdateFence;
+    update.fence_ref = 17;
+    assert_eq!(
+        apply_record(&mut state, &mut host, 1, &update, &mut seg),
+        None
+    );
+
+    let mut wait = ComputeCommand::default();
+    wait.kind = Kind::WaitFence;
+    wait.fence_ref = 17;
+    assert_eq!(
+        apply_record(&mut state, &mut host, 1, &wait, &mut seg),
+        None
+    );
+    assert_eq!(
+        seg.pending_barriers,
+        vec![reims_vgpu_core::ComputeBarrier::Fence]
+    );
+    assert_eq!(seg.barrier_block, None);
+
+    let mut pending = crate::runtime::compute_session::ComputeSegment::default();
+    wait.fence_ref = 23;
+    assert_eq!(
+        apply_record(&mut state, &mut host, 1, &wait, &mut pending),
+        None
+    );
+    assert_eq!(pending.pending_barriers, Vec::new());
+    assert_eq!(
+        pending.barrier_block,
+        Some(ComputeBarrierRefusal::FenceWaitPending { fence_ref: 23 })
+    );
+}
+
 /// A whole-workgroup dispatch of `counts` groups of `local` threads.
 ///
 /// Fixtures here name workgroup counts, because that is what they dispatch.

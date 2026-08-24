@@ -1976,6 +1976,10 @@ mod tests {
             vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE
         );
         assert_eq!(flags, vk::DependencyFlags::empty());
+
+        assert!(
+            compute_memory_barrier_dependency(&[reims_vgpu_core::ComputeBarrier::Fence]).is_some()
+        );
     }
     use crate::engine::{
         ComputeResidentSampleBind, ComputeSampledImageResource, ComputeStorageImageResource,
