@@ -1079,17 +1079,19 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     }
     let close_started = std::time::Instant::now();
     if let Some(context) = state.submissions.finish() {
-        if let Err(error) = state.executor.close_submission(context.identity) {
-            out.draws_fail = out.draws_fail.saturating_add(1);
-            crate::observe::Emit::decline("submission_close", &error)
-                .field("submission", context.identity.id.get())
-                .field("task", context.identity.task.get())
-                .fail();
+        match state.executor.close_submission(context.identity) {
+            Ok(()) => state.task_objects.resources.complete_submission(
+                context.identity.id,
+                context.resources.iter().filter_map(|use_| use_.resource),
+            ),
+            Err(error) => {
+                out.draws_fail = out.draws_fail.saturating_add(1);
+                crate::observe::Emit::decline("submission_close", &error)
+                    .field("submission", context.identity.id.get())
+                    .field("task", context.identity.task.get())
+                    .fail();
+            }
         }
-        state.task_objects.resources.complete_submission(
-            context.identity.id,
-            context.resources.iter().filter_map(|use_| use_.resource),
-        );
     }
     let close_ns = close_started.elapsed().as_nanos() as u64;
     measured_ns += close_ns;

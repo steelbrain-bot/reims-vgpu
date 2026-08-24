@@ -185,6 +185,7 @@ fn an_exec_packet_closes_its_exact_backend_submission() {
     #[derive(Debug, Default)]
     struct CloseProbe {
         closed: Mutex<Vec<reims_vgpu_protocol::SubmissionIdentity>>,
+        fail: std::sync::atomic::AtomicBool,
     }
 
     impl ExecutionPort for CloseProbe {
@@ -220,7 +221,15 @@ fn an_exec_packet_closes_its_exact_backend_submission() {
             identity: reims_vgpu_protocol::SubmissionIdentity,
         ) -> Result<(), DrawError> {
             self.closed.lock().unwrap().push(identity);
-            Ok(())
+            if self.fail.load(std::sync::atomic::Ordering::Acquire) {
+                Err(DrawError::Facade(
+                    EngineFacadeDecline::ExecutorServiceUnavailable {
+                        service: "test_submission_close",
+                    },
+                ))
+            } else {
+                Ok(())
+            }
         }
     }
     impl GuestImportService for CloseProbe {}
@@ -258,6 +267,57 @@ fn an_exec_packet_closes_its_exact_backend_submission() {
         closed[0].id.get(),
         0,
         "a packet identity is never standalone"
+    );
+    drop(closed);
+
+    // A failed close never publishes semantic completion for the resources
+    // whose native prefix was not accepted by the backend.
+    use crate::model::TaskResource;
+    use crate::runtime::decode::fifo::CHILD_EXEC_RESOURCE_OBJECT_ID;
+    use crate::runtime::decode::resource::ListObjectEntry;
+    use reims_vgpu_protocol::ObjectKind;
+    let resource = state.task_objects.resources.register(
+        3,
+        9,
+        std::sync::Arc::new(TaskResource::new(
+            ListObjectEntry::new(ObjectKind::Buffer, 0, 0),
+            std::sync::Arc::from([]),
+        )),
+    );
+    let resource_id = resource
+        .semantic_id()
+        .expect("registered resource identity");
+    probe.fail.store(true, std::sync::atomic::Ordering::Release);
+    let mut payload = vec![
+        0u8;
+        CHILD_EXEC_INDIRECT_HEADER_LEN as usize
+            + CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize
+            + CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as usize
+    ];
+    st32(&mut payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..], 3);
+    st32(
+        &mut payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..],
+        1,
+    );
+    st32(&mut payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..], 1);
+    let resource_desc = CHILD_EXEC_INDIRECT_HEADER_LEN as usize;
+    st32(
+        &mut payload[resource_desc + CHILD_EXEC_RESOURCE_OBJECT_ID as usize..],
+        9,
+    );
+
+    let result = process_exec_indirect2(&mut state, &mut host, &payload);
+    assert_eq!(result.draws_fail, 1);
+    let failed = probe.closed.lock().unwrap()[1];
+    assert!(
+        state
+            .task_objects
+            .resources
+            .resource_node(resource_id)
+            .unwrap()
+            .in_flight
+            .contains(&failed.id),
+        "a backend close failure must not claim the resource envelope completed"
     );
 }
 
