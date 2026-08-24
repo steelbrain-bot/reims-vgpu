@@ -204,6 +204,60 @@ fn batched_draws_compose_and_flush_on_read() {
 }
 
 #[test]
+fn a_refused_submission_tail_keeps_the_recorded_resident_prefix() {
+    let _guard = engine_test_lock().lock().unwrap();
+    engine::flush_batched_draws();
+    let (vert, frag) = triangle_spirv();
+    let identity = TargetIdentity::Surface {
+        id: 990_111,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let context = submission(111);
+    let left = batch_req(&vert, &frag, &identity, false, half_scissor(true));
+    let right = batch_req(&vert, &frag, &identity, true, half_scissor(false));
+    let invalid_tail = DrawRequest::default();
+    let commands = reims_vgpu_core::ResolvedCommandBuffer::new(vec![
+        reims_vgpu_core::ResolvedCommand::Draw(Box::new(left)),
+        reims_vgpu_core::ResolvedCommand::Draw(Box::new(right)),
+        reims_vgpu_core::ResolvedCommand::Draw(Box::new(invalid_tail)),
+    ]);
+    let progress = engine::execute_submission_progress(reims_vgpu_core::ResolvedSubmission {
+        context: context.clone(),
+        command_buffer: commands,
+    });
+    if let Some(error) = progress.failure.as_ref() {
+        if progress.output.is_empty() && skip_if_no_gpu(&error.to_string()) {
+            eprintln!("skipping: {error}");
+            return;
+        }
+    }
+    assert_eq!(
+        progress.output.len(),
+        2,
+        "the exact recorded prefix completed"
+    );
+    assert!(progress.failure.is_some(), "the invalid tail is refused");
+    engine::close_submission(context.identity).expect("the prefix remains submittable");
+
+    let pixels = engine::read_target(&identity)
+        .expect("the refused tail did not discard the prefix")
+        .into_rgba8();
+    for y in [0u32, H / 2, H - 1] {
+        for x in [0u32, W / 4, W / 2, 3 * W / 4, W - 1] {
+            let offset = ((y * W + x) * 4) as usize;
+            assert!(
+                is_frag_color(&pixels[offset..offset + 4]),
+                "prefix pixel at ({x},{y}) = {:?}",
+                &pixels[offset..offset + 4]
+            );
+        }
+    }
+}
+
+#[test]
 fn one_recording_retains_unchanged_vertex_buffer_state() {
     let _guard = engine_test_lock().lock().unwrap();
     engine::flush_batched_draws();

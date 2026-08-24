@@ -279,6 +279,10 @@ impl PreparedDraw {
         }
     }
 
+    pub(super) fn is_surface_store(&self) -> bool {
+        matches!(self.route, DrawCompletionRoute::ResidentSurfaceStore(_))
+    }
+
     pub(super) fn new(
         request: reims_vgpu_core::DrawRequest,
         route: DrawCompletionRoute,

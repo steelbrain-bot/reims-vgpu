@@ -238,14 +238,9 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // request that caused it.
     let mut visibility_samples = None;
     let mut chain_resident_identity = None;
-    // IOSurface texture composite Store: the frame was written into the mapping's guest
-    // pages by `store_surface_resident`, so this encode owes the caller nothing
-    // further.
-    let mut surface_store_armed = false;
     // GVA render Store: a copied resident leaves a resource-scoped transfer
     // debt, while a guest-backed resident publishes the attachment write it
-    // already performed. The twin of `surface_store_armed`, and it returns
-    // through the same door.
+    // already performed.
     let mut gva_store_armed = false;
     let mut effects_only_completed = false;
     if req.pipeline_ref != 0 && (req.vertex_count > 0 || req.indexed.is_some()) {
@@ -404,108 +399,16 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 guest_store_window,
                 visibility_samples: samples,
             }) => {
-                completed_submission = Some(submission);
-                visibility_samples = samples;
-                // Into the same `iosurface_store_us` bucket the synchronous and `Owned`
-                // routes report, because the whole claim of this rail is that the
-                // bucket shrinks. Leaving it unbracketed would move the arm's cost
-                // into the residual `draw_phase` cannot attribute — which is
-                // exactly the 28 % hole `b872e43` had to instrument, and it would
-                // read as a win of the same size as the work it hid.
-                let _store_span = StoreCostSpan::new("iosurface_store_us");
-                let c0_store = req.colors.first().map(|c0| {
-                    (
-                        c0.mapping_id(),
-                        c0.width,
-                        c0.height,
-                        c0.format,
-                        c0.texture_ref,
-                    )
-                });
-                let directly_landed = c0_store.and_then(|(mid, cw, ch, fmt, texture_ref)| {
-                    let pages = guest_store_pages.as_ref()?;
-                    let window = guest_store_window.as_ref()?;
-                    state.note_host_wrote_pages(pages.pages().to_vec());
-                    let epoch = crate::runtime::mapping_write::note_iosurface_texture_landed(
-                        state,
-                        mid,
-                        window.start,
-                        window.end,
-                    )?;
-                    // This resident is the imported guest allocation that just
-                    // received the Store. Publishing those same bytes advances
-                    // the mapping epoch; hand that exact currency back to the
-                    // exact identity carried by draw completion so the next
-                    // sample does not replace it with a second alias.
-                    if !state
-                        .executor
-                        .stamp_resident_content_epoch(&identity, epoch)
-                    {
-                        crate::observe::fail(format!(
-                            "resident_surface_store_fail reason=epoch_stamp_refused mapping={mid} epoch={epoch}"
-                        ));
-                    }
-                    publish_surface_store(state, host, mid, cw, ch, fmt);
-                    record_materialized_store(state, req.task_id, texture_ref, submission);
-                    Some(())
-                });
-                if directly_landed.is_some() {
-                    note_pass_scissor_union(pass_w, pass_h);
-                    note_iosurface_texture_store_route("surface_guest_backed");
-                    surface_store_armed = true;
-                    crate::observe::line(format!(
-                        "linux_m2v_draw ok resident_surface_guest_backed pipe={} {}x{} mid={}",
-                        req.pipeline_ref,
-                        pass_w,
-                        pass_h,
-                        req.colors.first().map(|c| c.mapping_id()).unwrap_or(0)
-                    ));
-                } else {
-                    let stored = c0_store
-                        .map(|(mid, cw, ch, _, _)| {
-                            store_surface_resident(state, host, &identity, mid, cw, ch)
-                        })
-                        .unwrap_or(false);
-                    match (stored, c0_store) {
-                        (true, Some((mid, cw, ch, fmt, texture_ref))) => {
-                            note_iosurface_texture_store_route("surface_resident");
-                            // The same two publishes the `Owned` rail performs at arm
-                            // time, for the same reason: full-frame backing evidence gates
-                            // `present_unbacked`, and a route that skipped it would
-                            // make that gate structurally dead.
-                            {
-                                let _span = StoreCostSpan::new("iosurface_publish_us");
-                                publish_surface_store(state, host, mid, cw, ch, fmt);
-                            }
-                            record_materialized_store(state, req.task_id, texture_ref, submission);
-                            surface_store_armed = true;
-                            crate::observe::line(format!(
-                                "linux_m2v_draw ok resident_surface_store pipe={} {}x{} mid={mid}",
-                                req.pipeline_ref, pass_w, pass_h
-                            ));
-                        }
-                        _ => {
-                            // The arm refused (its typed decline says which gate), so
-                            // the frame has to be materialized after all: read the
-                            // resident the draw just rendered into and let the
-                            // synchronous Store block below run exactly as it does for
-                            // a Store that never skipped its readback. This pays the
-                            // readback the rail exists to avoid, which is the point —
-                            // the fallback is a cost, never a lost frame.
-                            note_iosurface_texture_store_route("surface_resident_sync");
-                            draw_rgba =
-                                read_resident_chain(state.executor.as_ref(), req, &identity);
-                            crate::observe::line(format!(
-                            "linux_m2v_draw ok resident_surface_store_sync_fallback pipe={} {}x{} mid={} rgba={}",
-                            req.pipeline_ref,
-                            pass_w,
-                            pass_h,
-                            req.colors.first().map(|c| c.mapping_id()).unwrap_or(0),
-                            draw_rgba.is_some() as u8
-                        ));
-                        }
-                    }
-                }
+                return complete_surface_store(
+                    state,
+                    host,
+                    req,
+                    submission,
+                    identity,
+                    guest_store_pages,
+                    guest_store_window,
+                    samples,
+                )
             }
             Ok(M2vDrawSpan::None) => {
                 crate::observe::line(format!(
@@ -577,7 +480,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // the guest write lands on first access. `None`, not the frame, for the same
     // reason the `Owned` route returns `None` — `writeback_guest` is granted only
     // to the last record of a packet, so there is no record N+1 to seed.
-    if surface_store_armed || gva_store_armed {
+    if gva_store_armed {
         return DrawChainResult::new(EncodeStatus::Ok, None, visibility_samples, None);
     }
 
@@ -976,6 +879,121 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             None,
         )
     }
+}
+
+pub(crate) fn complete_surface_store<M: HostMemory + HostOps>(
+    state: &mut Device,
+    host: &mut M,
+    req: &DrawEncodeRequest,
+    submission: reims_vgpu_protocol::SubmissionId,
+    identity: crate::model::TargetIdentity,
+    guest_store_pages: Option<reims_vgpu_memory::GuestWritePages>,
+    guest_store_window: Option<std::ops::Range<u64>>,
+    visibility_samples: Option<u64>,
+) -> DrawChainResult {
+    crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Store);
+    let _store_span = StoreCostSpan::new("iosurface_store_us");
+    let Some(c0) = req.colors.first() else {
+        return DrawChainResult::new(
+            EncodeStatus::BadArgs("surface_store_without_color0"),
+            None,
+            visibility_samples,
+            None,
+        );
+    };
+    let target = (
+        c0.mapping_id(),
+        c0.width,
+        c0.height,
+        c0.format,
+        c0.texture_ref,
+    );
+    let directly_landed = guest_store_pages
+        .as_ref()
+        .zip(guest_store_window.as_ref())
+        .and_then(|(pages, window)| {
+            state.note_host_wrote_pages(pages.pages().to_vec());
+            let epoch = crate::runtime::mapping_write::note_iosurface_texture_landed(
+                state,
+                target.0,
+                window.start,
+                window.end,
+            )?;
+            if !state
+                .executor
+                .stamp_resident_content_epoch(&identity, epoch)
+            {
+                crate::observe::fail(format!(
+                    "resident_surface_store_fail reason=epoch_stamp_refused mapping={} epoch={epoch}",
+                    target.0
+                ));
+            }
+            publish_surface_store(state, host, target.0, target.1, target.2, target.3);
+            record_materialized_store(state, req.task_id, target.4, submission);
+            Some(())
+        });
+    if directly_landed.is_some() {
+        note_pass_scissor_union(target.1, target.2);
+        note_iosurface_texture_store_route("surface_guest_backed");
+        return DrawChainResult::new(EncodeStatus::Ok, None, visibility_samples, None);
+    }
+
+    if store_surface_resident(state, host, &identity, target.0, target.1, target.2) {
+        note_iosurface_texture_store_route("surface_resident");
+        {
+            let _span = StoreCostSpan::new("iosurface_publish_us");
+            publish_surface_store(state, host, target.0, target.1, target.2, target.3);
+        }
+        record_materialized_store(state, req.task_id, target.4, submission);
+        return DrawChainResult::new(EncodeStatus::Ok, None, visibility_samples, None);
+    }
+
+    note_iosurface_texture_store_route("surface_resident_sync");
+    let Some(mut bgra) = read_resident_chain(state.executor.as_ref(), req, &identity) else {
+        return DrawChainResult::new(
+            EncodeStatus::BackendUnavailable("draw_vk_nothing_stored"),
+            None,
+            visibility_samples,
+            None,
+        );
+    };
+    reorder_rb_in_place(&mut bgra, false, true);
+    note_iosurface_texture_store_route("cpu_portability");
+    let stored = mapping_write::write_bgra8(
+        state,
+        host,
+        target.0,
+        &bgra,
+        target.1.saturating_mul(RGBA8_BPP),
+        target.1,
+        target.2,
+    );
+    if !stored {
+        crate::observe::fail(format!(
+            "linux_m2v_store mid={} {}x{} pipe={} reason=cpu_portability_write_fail fmt={:#x}",
+            target.0, target.1, target.2, req.pipeline_ref, target.3
+        ));
+        return DrawChainResult::new(
+            EncodeStatus::BackendUnavailable("draw_vk_nothing_stored"),
+            None,
+            visibility_samples,
+            None,
+        );
+    }
+    let epoch = state
+        .surfaces
+        .mappings
+        .get(&target.0)
+        .map(|mapping| mapping.content.surface_epoch);
+    {
+        let _span = StoreCostSpan::new("iosurface_publish_us");
+        publish_surface_store(state, host, target.0, target.1, target.2, target.3);
+    }
+    if let Some(epoch) = epoch {
+        stamp_iosurface_texture_resident(state, req, true, epoch);
+    }
+    record_materialized_store(state, req.task_id, target.4, submission);
+    DrawChainResult::new(EncodeStatus::Ok, None, visibility_samples, None)
 }
 
 /// Publish the one semantic outcome shared by ordered Store rails.
@@ -1522,7 +1540,7 @@ fn normalize_gva_store_pixels(pixels: &mut [u8], executor_reported_bgra: bool) {
 }
 
 /// Result of a Linux metal2vulkan draw.
-enum M2vDrawSpan {
+pub(crate) enum M2vDrawSpan {
     /// No drawable color0 geom.
     None,
     /// CPU-side pixels (readback path), in the order the engine reports.
@@ -2098,6 +2116,10 @@ impl PreparedM2vDraw {
         self.draw.resident_chain_identity()
     }
 
+    pub(crate) fn is_surface_store(&self) -> bool {
+        self.draw.is_surface_store()
+    }
+
     pub(crate) fn execute_intermediate(self, state: &mut Device) -> DrawChainResult {
         let pipeline_ref = self.pipeline_ref;
         match self.execute(state) {
@@ -2189,7 +2211,7 @@ pub(crate) struct PreparedM2vSubmission {
 }
 
 pub(crate) struct PreparedM2vProgress {
-    pub(crate) completed: Vec<DrawChainResult>,
+    pub(crate) completed: Vec<M2vDrawSpan>,
     pub(crate) failure: Option<ExecutorDiagnostic>,
 }
 
@@ -2221,13 +2243,13 @@ impl PreparedM2vSubmission {
             .into_iter()
             .zip(progress.completed)
             .map(|(meta, completed)| {
-                intermediate_chain_result(finish_m2v_draw(
+                finish_m2v_draw(
                     meta.pipeline_ref,
                     meta.width,
                     meta.height,
                     meta.census_verbose,
                     completed,
-                ))
+                )
             })
             .collect();
         Ok(PreparedM2vProgress {
@@ -2237,7 +2259,7 @@ impl PreparedM2vSubmission {
     }
 }
 
-fn intermediate_chain_result(span: M2vDrawSpan) -> DrawChainResult {
+pub(crate) fn intermediate_chain_result(span: M2vDrawSpan) -> DrawChainResult {
     match span {
         M2vDrawSpan::Pixels {
             mut bytes,
@@ -2457,6 +2479,40 @@ pub(crate) fn prepare_intermediate_draw_chain<M: HostMemory + HostOps>(
 ) -> Result<Option<PreparedM2vDraw>, DrawChainResult> {
     match prepare_metal2vulkan_draw(state, host, req, false) {
         Ok(prepared) => Ok(prepared),
+        Err(error) => {
+            let slug = crate::observe::Decline::slug(&error);
+            crate::runtime::drain::note_store_route(slug);
+            linux_m2v_draw_failure(&error, req).fail_once(req.pipeline_ref as u64);
+            Err(DrawChainResult::new(
+                EncodeStatus::BackendUnavailable("draw_vk_nothing_stored"),
+                None,
+                None,
+                None,
+            ))
+        }
+    }
+}
+
+/// Prepare a final mapping Store for the EXEC-owned draw submission when no
+/// CPU-side CLEAR publication must precede it.
+pub(crate) fn prepare_surface_store_draw_chain<M: HostMemory + HostOps>(
+    state: &mut Device,
+    host: &mut M,
+    req: &DrawEncodeRequest,
+) -> Result<Option<PreparedM2vDraw>, DrawChainResult> {
+    let clear_store_precedes_draw = clear_seed_enabled()
+        && req.colors.iter().any(|color| {
+            color.publishes_single_sample()
+                && load_action_has_clear_seed(color.load_action)
+                && color.width != 0
+                && color.height != 0
+        });
+    if clear_store_precedes_draw {
+        return Ok(None);
+    }
+    match prepare_metal2vulkan_draw(state, host, req, true) {
+        Ok(Some(prepared)) if prepared.is_surface_store() => Ok(Some(prepared)),
+        Ok(_) => Ok(None),
         Err(error) => {
             let slug = crate::observe::Decline::slug(&error);
             crate::runtime::drain::note_store_route(slug);

@@ -4520,6 +4520,7 @@ fn apply_prepared_resident_prefix(
     let completed_len = progress.completed.len();
     let mut last_identity = None;
     for (index, (record, completed)) in records.iter().zip(progress.completed).enumerate() {
+        let completed = draw::intermediate_chain_result(completed);
         if let (Some(arming), Some(samples)) = (record.req.visibility, completed.visibility_samples)
         {
             let slot = visibility_counts.entry(arming.offset).or_default();
@@ -4645,6 +4646,130 @@ fn land_prepared_resident_prefix<M: HostMemory + HostOps>(
             },
         },
     );
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the transaction owns execution, ordered publication, and failure recovery"
+)]
+fn flush_prepared_surface_transaction<M: HostMemory + HostOps>(
+    state: &mut Device,
+    host: &mut M,
+    task_id: u32,
+    out: &mut ExecResult,
+    submission: draw::PreparedM2vSubmission,
+    records: &mut Vec<PreparedResidentRecord>,
+    final_req: &draw::DrawEncodeRequest,
+    acc: &StreamAccum,
+    chain_rgba: &mut Option<Vec<u8>>,
+    visibility_counts: &mut std::collections::BTreeMap<u64, u64>,
+    total_draws: usize,
+) -> Result<draw::DrawChainResult, ()> {
+    let resident_count = records.len();
+    let progress = submission.execute(state).map_err(|error| {
+        crate::observe::fail(format!(
+            "draw_submission_fail reason={} task={task_id} detail={error}",
+            crate::observe::Decline::slug(&error)
+        ));
+        out.draws_fail = out.draws_fail.saturating_add(1);
+    })?;
+    let completed_count = progress.completed.len();
+    let mut outputs = progress.completed;
+    let final_output = (outputs.len() > resident_count).then(|| outputs.remove(resident_count));
+    let resident_progress = draw::PreparedM2vProgress {
+        completed: outputs,
+        failure: (final_output.is_none() && resident_count != 0)
+            .then_some(progress.failure.clone())
+            .flatten()
+            .filter(|_| completed_count < resident_count),
+    };
+    let resident_identity = match apply_prepared_resident_prefix(
+        out,
+        records,
+        resident_progress,
+        visibility_counts,
+        total_draws,
+    ) {
+        Ok(identity) => identity,
+        Err((identity, failed_index)) => {
+            land_prepared_resident_prefix(
+                state,
+                host,
+                task_id,
+                acc,
+                chain_rgba,
+                records,
+                identity.as_ref(),
+                failed_index,
+            );
+            return Err(());
+        }
+    };
+    records.clear();
+
+    let Some(final_output) = final_output else {
+        let reason = progress
+            .failure
+            .as_ref()
+            .map(crate::observe::Decline::slug)
+            .unwrap_or("final_store_completion_missing");
+        out.draws_fail = out.draws_fail.saturating_add(1);
+        note_draw_encode_fail(
+            task_id,
+            final_req.pipeline_ref,
+            EncodeStatus::BackendUnavailable(reason),
+            total_draws.saturating_sub(1),
+            total_draws,
+        );
+        land_chain_before_abandon(
+            state,
+            host,
+            chain_rgba,
+            ChainAbandonContext {
+                task_id,
+                acc,
+                req: final_req,
+                resident_identity: resident_identity.as_ref(),
+                end: ChainEnd {
+                    cause: draw::ChainAbandonCause::TerminalRefusal,
+                    resident: resident_identity.is_some(),
+                },
+            },
+        );
+        return Err(());
+    };
+    if let Some(failure) = progress.failure {
+        crate::observe::fail(format!(
+            "draw_submission_tail_fail reason={} task={task_id} detail={failure}",
+            crate::observe::Decline::slug(&failure)
+        ));
+    }
+    match final_output {
+        draw::M2vDrawSpan::ResidentSurfaceStore {
+            submission,
+            identity,
+            guest_store_pages,
+            guest_store_window,
+            visibility_samples,
+        } => Ok(draw::complete_surface_store(
+            state,
+            host,
+            final_req,
+            submission,
+            identity,
+            guest_store_pages,
+            guest_store_window,
+            visibility_samples,
+        )),
+        _ => {
+            out.draws_fail = out.draws_fail.saturating_add(1);
+            crate::observe::fail(format!(
+                "draw_submission_fail reason=final_store_completion_kind task={task_id} pipe={}",
+                final_req.pipeline_ref
+            ));
+            Err(())
+        }
+    }
 }
 
 fn finish_stream<M: HostMemory + HostOps>(
@@ -5047,7 +5172,38 @@ fn finish_stream<M: HostMemory + HostOps>(
                         }
                     }
                 }
-                if !prepared_resident_records.is_empty() {
+                let mut batched_final = None;
+                let mut prepared_final_refusal = None;
+                if do_writeback && !prepared_resident_records.is_empty() {
+                    match draw::prepare_surface_store_draw_chain(state, host, &req) {
+                        Ok(Some(prepared)) => {
+                            prepared_resident.push(prepared);
+                            let submission = std::mem::replace(
+                                &mut prepared_resident,
+                                draw::PreparedM2vSubmission::new(submission_context.clone()),
+                            );
+                            match flush_prepared_surface_transaction(
+                                state,
+                                host,
+                                task_id,
+                                out,
+                                submission,
+                                &mut prepared_resident_records,
+                                &req,
+                                acc,
+                                &mut chain_rgba,
+                                &mut visibility_counts,
+                                draw_list.len(),
+                            ) {
+                                Ok(encode) => batched_final = Some(encode),
+                                Err(()) => break,
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(encode) => prepared_final_refusal = Some(encode),
+                    }
+                }
+                if batched_final.is_none() && !prepared_resident_records.is_empty() {
                     match flush_prepared_resident(
                         state,
                         out,
@@ -5075,8 +5231,9 @@ fn finish_stream<M: HostMemory + HostOps>(
                 }
                 let draw_started = std::time::Instant::now();
                 fin.enter(crate::runtime::drain::FinishPhase::Encode);
-                let encode =
-                    draw::encode_draw_chain(state, host, &req, do_writeback, force_full_store);
+                let encode = batched_final.or(prepared_final_refusal).unwrap_or_else(|| {
+                    draw::encode_draw_chain(state, host, &req, do_writeback, force_full_store)
+                });
                 retire_render_barriers_after(encode.status, &mut pending_render_barriers);
                 fin.enter(crate::runtime::drain::FinishPhase::Result);
                 // Read before the status is matched: a draw whose Store failed

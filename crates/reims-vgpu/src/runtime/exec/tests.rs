@@ -39,18 +39,12 @@ fn a_batched_resident_failure_preserves_the_exact_successful_prefix() {
     ];
     let progress = draw::PreparedM2vProgress {
         completed: vec![
-            draw::DrawChainResult {
-                status: EncodeStatus::Ok,
-                chain_rgba: None,
+            draw::M2vDrawSpan::ResidentChain {
+                submission: reims_vgpu_protocol::SubmissionId::new(1),
+                identity: first_identity.clone(),
                 visibility_samples: None,
-                resident_identity: Some(first_identity.clone()),
             },
-            draw::DrawChainResult {
-                status: EncodeStatus::BadArgs("second_draw_refused"),
-                chain_rgba: None,
-                visibility_samples: None,
-                resident_identity: None,
-            },
+            draw::M2vDrawSpan::None,
         ],
         failure: None,
     };
