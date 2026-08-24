@@ -14,7 +14,7 @@ use std::time::Instant;
 use super::context::DeviceContext;
 use super::counters::EngineCounters;
 use super::facade_decline::EngineFacadeDecline;
-use super::pools::ResourcePools;
+use super::pools::ResourcePoolsAccess;
 use super::types::{DrawError, PresentRect, TargetIdentity, WindowPresentSource};
 use super::vk_call::{VkCall, VkOp};
 use crate::translate;
@@ -850,7 +850,7 @@ impl WindowPresenter {
     unsafe fn retire(
         &mut self,
         ctx: &DeviceContext,
-        pools: &mut ResourcePools,
+        pools: &mut ResourcePoolsAccess<'_>,
     ) -> Result<bool, DrawError> {
         for ix in 0..self.frames.len() {
             if !self.frames[ix].submitted {
@@ -1081,7 +1081,7 @@ impl WindowPresenter {
     pub(crate) unsafe fn begin_present(
         &mut self,
         ctx: &DeviceContext,
-        pools: &mut ResourcePools,
+        pools: &mut ResourcePoolsAccess<'_>,
         counters: &EngineCounters,
         offered_seq: Option<u64>,
         source: Option<&WindowPresentSource>,
@@ -1734,7 +1734,7 @@ impl WindowPresenter {
         self.cadence_busy_acquire = 0;
     }
 
-    pub(crate) fn release_pins_after_idle(&mut self, pools: &mut ResourcePools) {
+    pub(crate) fn release_pins_after_idle(&mut self, pools: &mut ResourcePoolsAccess<'_>) {
         for frame in &mut self.frames {
             for identity in frame.pinned.drain(..) {
                 let _ = pools.pin_resident_target(&identity, false);
@@ -1746,7 +1746,7 @@ impl WindowPresenter {
     pub(crate) unsafe fn destroy(
         &mut self,
         ctx: &DeviceContext,
-        pools: Option<&mut ResourcePools>,
+        pools: Option<&mut ResourcePoolsAccess<'_>>,
     ) {
         if let Err(error) = ctx.queue_wait_idle() {
             let decline = VkCall::new(VkOp::WindowDestroyQueueWaitIdle, error);

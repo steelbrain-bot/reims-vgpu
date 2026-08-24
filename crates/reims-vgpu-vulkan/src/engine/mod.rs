@@ -216,7 +216,7 @@ pub fn release_session(session: &SessionHandle) {
         unsafe {
             #[cfg(feature = "host-window")]
             if let Some(mut presenter) = resources.window_presenter.take() {
-                presenter.destroy(ctx, Some(&mut resources.pools));
+                presenter.destroy(ctx, Some(&mut resources.pools.access()));
             }
             resources.pools.destroy_all(&ctx.device);
         }
@@ -615,14 +615,14 @@ impl EngineState {
             unsafe {
                 #[cfg(feature = "host-window")]
                 if let Some(mut presenter) = presenter {
-                    presenter.destroy(ctx, Some(&mut resources.pools));
+                    presenter.destroy(ctx, Some(&mut resources.pools.access()));
                 }
                 for session in &inactive_sessions {
                     let mut session_resources = session.resources.lock();
                     session.indexes.lock().clear();
                     #[cfg(feature = "host-window")]
                     if let Some(mut presenter) = session_resources.window_presenter.take() {
-                        presenter.destroy(ctx, Some(&mut session_resources.pools));
+                        presenter.destroy(ctx, Some(&mut session_resources.pools.access()));
                     }
                     session_resources.pools.destroy_all(&ctx.device);
                     session_resources.pools = ResourcePools::new();
@@ -1894,8 +1894,9 @@ pub fn reset_guest_state() -> GuestResetStats {
         }
         unsafe {
             #[cfg(feature = "host-window")]
-            if let Some(presenter) = guard.resources.window_presenter.as_mut() {
+            if let Some(mut presenter) = guard.resources.window_presenter.take() {
                 presenter.release_pins_after_idle(&mut guard.resources.pools.access());
+                guard.resources.window_presenter = Some(presenter);
             }
             guard.resources.pools.destroy_all(&ctx.device);
         }
@@ -3476,7 +3477,7 @@ pub fn resident_presentable(identity: &TargetIdentity, width: u32, height: u32) 
 
 #[cfg(feature = "host-window")]
 fn resident_present_decision(
-    pools: &ResourcePools,
+    pools: &mut pools::ResourcePoolsAccess<'_>,
     identity: &TargetIdentity,
     width: u32,
     height: u32,
@@ -7193,7 +7194,7 @@ mod device_loss_window_rail_tests {
             "and take the latch, so one loss is recovered once"
         );
         assert!(
-            lock_engine().window_presenter.is_none(),
+            lock_engine().resources.window_presenter.is_none(),
             "recovery must leave no presenter made from the lost device"
         );
     }
