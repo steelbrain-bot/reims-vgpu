@@ -1211,6 +1211,62 @@ impl ResourcePools {
         }
     }
 
+    /// Move one exact submission encoder out of the depot for exclusive
+    /// transaction ownership.
+    pub(in crate::engine) fn checkout_submission_encoder(
+        &mut self,
+        identity: SubmissionIdentity,
+    ) -> Result<EncoderCheckout, DrawError> {
+        let mut encoder = if identity.id.get() == 0 {
+            std::mem::replace(&mut self.pair.encoder, OwnedPool(EncoderPools::new()))
+        } else if let Some(encoder) = self.active_encoders.remove(&identity) {
+            encoder
+        } else {
+            self.idle_encoders
+                .pop()
+                .unwrap_or_else(|| OwnedPool(EncoderPools::new()))
+        };
+        if let Err(error) = encoder.enter_submission(identity) {
+            if identity.id.get() == 0 {
+                self.pair.encoder = encoder;
+            } else {
+                self.active_encoders.insert(identity, encoder);
+            }
+            return Err(error);
+        }
+        Ok(EncoderCheckout { identity, encoder })
+    }
+
+    /// Borrow the checkout together with the session-shared native pools for
+    /// one command recording call.
+    pub(in crate::engine) fn recording_from_checkout<'a>(
+        &'a mut self,
+        checkout: &'a mut EncoderCheckout,
+    ) -> RecordingPools<'a> {
+        RecordingPools {
+            pair: PoolPair {
+                encoder: &mut checkout.encoder.0,
+                shared: &mut self.pair.shared.0,
+            },
+        }
+    }
+
+    /// Restore an exclusively checked-out encoder to the exact active slot it
+    /// came from.  Closing the submission, not returning this temporary owner,
+    /// is what may move it to the idle depot.
+    pub(in crate::engine) fn return_submission_encoder(&mut self, checkout: EncoderCheckout) {
+        let EncoderCheckout { identity, encoder } = checkout;
+        if identity.id.get() == 0 {
+            self.pair.encoder = encoder;
+            return;
+        }
+        let displaced = self.active_encoders.insert(identity, encoder);
+        assert!(
+            displaced.is_none(),
+            "an encoder identity cannot be returned while it is already active"
+        );
+    }
+
     /// Borrow the encoder that owns one exact guest submission.
     ///
     /// An encoder returns to the reusable depot only at that submission's close
@@ -7055,6 +7111,30 @@ mod encoder_submission_ownership {
         assert_eq!(
             pools.active_encoders.get(&next).unwrap().active_submission,
             Some(next)
+        );
+    }
+
+    #[test]
+    fn a_checked_out_encoder_is_absent_until_the_exact_transaction_returns_it() {
+        let mut pools = ResourcePools::new();
+        let submission = identity(22, 5);
+        let mut checkout = pools.checkout_submission_encoder(submission).unwrap();
+
+        assert!(!pools.active_encoders.contains_key(&submission));
+        assert_eq!(checkout.identity, submission);
+        assert_eq!(checkout.encoder.active_submission, Some(submission));
+        {
+            let recording = pools.recording_from_checkout(&mut checkout);
+            assert_eq!(recording.encoder.active_submission, Some(submission));
+        }
+
+        pools.return_submission_encoder(checkout);
+        assert_eq!(
+            pools
+                .active_encoders
+                .get(&submission)
+                .and_then(|encoder| encoder.active_submission),
+            Some(submission)
         );
     }
 

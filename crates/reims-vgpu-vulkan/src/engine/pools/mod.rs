@@ -731,6 +731,17 @@ pub(crate) struct ResourcePools {
     idle_encoders: Vec<OwnedPool<EncoderPools>>,
 }
 
+/// Exclusive ownership of one exact submission's encoder while it records.
+///
+/// The encoder is absent from the depot for this value's lifetime, so another
+/// recorder cannot recover the same command pool by identity or recycle it as
+/// idle.  Returning it requires the identity again; the depot decides whether
+/// it remains active or becomes reusable only at the submission close event.
+pub(crate) struct EncoderCheckout {
+    identity: SubmissionIdentity,
+    encoder: OwnedPool<EncoderPools>,
+}
+
 impl std::ops::Deref for ResourcePools {
     type Target = PoolPair<OwnedPool<EncoderPools>, OwnedPool<SharedPools>>;
 

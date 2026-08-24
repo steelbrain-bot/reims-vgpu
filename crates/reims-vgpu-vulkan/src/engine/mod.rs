@@ -1448,11 +1448,15 @@ impl EngineGuard {
             .flush_device_derived(&mut self.caches, session_id, &mut self.resources);
     }
 
-    fn into_submission_recording(mut self) -> Result<SubmissionRecording, DrawError> {
+    fn into_submission_recording(
+        mut self,
+        identity: reims_vgpu_protocol::SubmissionIdentity,
+    ) -> Result<SubmissionRecording, DrawError> {
         let (context, force_loss) = self
             .guard
             .owner
             .lease_recording_context(&self.resources.counters)?;
+        let checkout = self.resources.pools.checkout_submission_encoder(identity)?;
         let caches = self.caches.take();
         let resources = self.resources.take();
         let session = self.session.clone();
@@ -1465,6 +1469,7 @@ impl EngineGuard {
             caches,
             resources,
             session,
+            checkout: Some(checkout),
         })
     }
 }
@@ -1475,6 +1480,15 @@ struct SubmissionRecording {
     caches: parking_lot::lock_api::ArcMutexGuard<parking_lot::RawMutex, ObjectCaches>,
     resources: parking_lot::lock_api::ArcMutexGuard<parking_lot::RawMutex, SessionResources>,
     session: SessionHandle,
+    checkout: Option<pools::EncoderCheckout>,
+}
+
+impl Drop for SubmissionRecording {
+    fn drop(&mut self) {
+        if let Some(checkout) = self.checkout.take() {
+            self.resources.pools.return_submission_encoder(checkout);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1484,7 +1498,7 @@ mod submission_recording_ownership_tests {
     #[test]
     fn an_exec_recording_lease_does_not_own_the_process_global_engine_lock() {
         let recording = lock_engine()
-            .into_submission_recording()
+            .into_submission_recording(reims_vgpu_core::SubmissionContext::standalone(0).identity)
             .expect("a Vulkan context is available to the recording lease");
         let owner = ENGINE
             .try_lock()
@@ -1755,8 +1769,15 @@ fn execute_draw_request_locked(
         ..
     } = guard.parts();
     let (ctx, force_loss) = owner.lease_recording_context(counters)?;
+    let mut recording = pools.recording_for_submission(submission.identity)?;
     let result = record_draw_request(
-        &ctx, force_loss, caches, indexes, pools, counters, submission, req,
+        &ctx,
+        force_loss,
+        caches,
+        indexes,
+        &mut recording,
+        counters,
+        req,
     );
     match result {
         Ok(out) => {
@@ -1780,9 +1801,8 @@ fn record_draw_request(
     force_loss: bool,
     caches: &mut ObjectCaches,
     indexes: &mut SessionCacheIndexes,
-    pools: &mut ResourcePools,
+    recording: &mut pools::RecordingPools<'_>,
     counters: &EngineCounters,
-    submission: &reims_vgpu_core::SubmissionContext,
     req: &DrawRequest,
 ) -> Result<DrawOutput, DrawError> {
     exec::validate_v1(req)?;
@@ -1804,16 +1824,8 @@ fn record_draw_request(
         })?;
     let program = exec::NativeRenderProgram { vertex, fragment };
     let (result, dropped_unfilled_gathers) = unsafe {
-        let mut recording = pools.recording_for_submission(submission.identity)?;
         let result = exec::execute_draw_inner(
-            ctx,
-            force_loss,
-            caches,
-            indexes,
-            &mut recording,
-            counters,
-            req,
-            &program,
+            ctx, force_loss, caches, indexes, recording, counters, req, &program,
         );
         let dropped = if result.is_err() {
             recording.discard_cb_binds_owed_a_gather()
@@ -2936,7 +2948,8 @@ fn execute_compute_request_locked(
         ..
     } = guard.parts();
     let (ctx, force_loss) = owner.lease_recording_context(counters)?;
-    let result = record_compute_request(&ctx, force_loss, caches, pools, counters, submission, req);
+    let mut recording = pools.recording_for_submission(submission.identity)?;
+    let result = record_compute_request(&ctx, force_loss, caches, &mut recording, counters, req);
     match result {
         Ok(out) => {
             // Same as the draw arm: a dispatch that ran proves the device.
@@ -2955,9 +2968,8 @@ fn record_compute_request(
     ctx: &context::DeviceContext,
     force_loss: bool,
     caches: &mut ObjectCaches,
-    pools: &mut ResourcePools,
+    recording: &mut pools::RecordingPools<'_>,
     counters: &EngineCounters,
-    submission: &reims_vgpu_core::SubmissionContext,
     req: &ComputeRequest,
 ) -> Result<ComputeOutput, ComputeError> {
     exec_compute::validate_compute(req)?;
@@ -2970,15 +2982,8 @@ fn record_compute_request(
     })?;
     let program = exec_compute::NativeComputeProgram { shader };
     unsafe {
-        let mut recording = pools.recording_for_submission(submission.identity)?;
         exec_compute::execute_compute_inner(
-            ctx,
-            force_loss,
-            caches,
-            &mut recording,
-            counters,
-            req,
-            &program,
+            ctx, force_loss, caches, recording, counters, req, &program,
         )
     }
 }
@@ -2997,7 +3002,7 @@ pub fn execute_submission_progress(
 > {
     let identity = submission.context.identity;
     let mut outputs = Vec::with_capacity(submission.command_buffer.commands().len());
-    let mut recording = match lock_engine().into_submission_recording() {
+    let mut recording = match lock_engine().into_submission_recording(identity) {
         Ok(recording) => recording,
         Err(error) => {
             return reims_vgpu_core::SubmissionExecutionProgress {
@@ -3021,28 +3026,27 @@ pub fn execute_submission_progress(
                 window_presenter: _,
             resident_epoch: _,
         } = &mut *recording.resources;
+        let mut native = pools.recording_from_checkout(
+            recording
+                .checkout
+                .as_mut()
+                .expect("the whole-EXEC encoder remains checked out while recording"),
+        );
         let result = match command {
             reims_vgpu_core::ResolvedCommand::Draw(request) => record_draw_request(
                 context,
                 force_loss,
                 caches,
                 indexes,
-                pools,
+                &mut native,
                 counters,
-                &submission.context,
                 &request,
             )
             .map(reims_vgpu_core::ExecutionOutput::Draw),
-            reims_vgpu_core::ResolvedCommand::Compute(request) => record_compute_request(
-                context,
-                force_loss,
-                caches,
-                pools,
-                counters,
-                &submission.context,
-                &request,
-            )
-            .map(reims_vgpu_core::ExecutionOutput::Compute),
+            reims_vgpu_core::ResolvedCommand::Compute(request) => {
+                record_compute_request(context, force_loss, caches, &mut native, counters, &request)
+                    .map(reims_vgpu_core::ExecutionOutput::Compute)
+            }
             reims_vgpu_core::ResolvedCommand::Blit(_)
             | reims_vgpu_core::ResolvedCommand::ResourceState(_) => Err(DrawError::Facade(
                 EngineFacadeDecline::ExecutorServiceUnavailable {
