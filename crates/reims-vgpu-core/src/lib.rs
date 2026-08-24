@@ -134,6 +134,7 @@ pub use submission::{
     SubmissionAcceptError, SubmissionAdmissionRefusal, SubmissionAdmissions, SubmissionCommitOrder,
     SubmissionCommitOrderError, SubmissionConflict, SubmissionContext, SubmissionDispatch,
     SubmissionFootprint, SubmissionRecordError, SubmissionScheduler, SubmissionTracker,
+    SubmissionWork,
 };
 pub use synchronization::{
     plan_event, plan_fence, BarrierResource, Decision as SynchronizationDecision,

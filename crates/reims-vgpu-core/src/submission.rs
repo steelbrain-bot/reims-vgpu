@@ -105,9 +105,15 @@ pub enum SubmissionCommitOrderError {
 
 /// One nonblocking admission decision made at the packet boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SubmissionDispatch {
+pub struct SubmissionWork<W> {
+    pub context: SubmissionContext,
+    pub work: W,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SubmissionDispatch<W> {
     /// The complete EXEC footprint is disjoint from every active recorder.
-    Record(SubmissionContext),
+    Record(SubmissionWork<W>),
     /// The commit position is reserved, but recording ownership is parked.
     Queued {
         identity: SubmissionIdentity,
@@ -135,13 +141,13 @@ pub enum SubmissionRecordError {
 /// arrival order, while every waiter is reconsidered after a recorder retires
 /// so an unrelated transaction cannot be trapped behind a conflicting head.
 #[derive(Debug)]
-pub struct SubmissionScheduler<T> {
-    waiting: VecDeque<SubmissionContext>,
+pub struct SubmissionScheduler<W, T> {
+    waiting: VecDeque<SubmissionWork<W>>,
     admissions: SubmissionAdmissions,
     commits: SubmissionCommitOrder<T>,
 }
 
-impl<T> Default for SubmissionScheduler<T> {
+impl<W, T> Default for SubmissionScheduler<W, T> {
     fn default() -> Self {
         Self {
             waiting: VecDeque::new(),
@@ -230,13 +236,14 @@ impl<T> SubmissionCommitOrder<T> {
     }
 }
 
-impl<T> SubmissionScheduler<T> {
+impl<W, T> SubmissionScheduler<W, T> {
     /// Reserve one guest-order position and acquire recording ownership when
     /// the candidate is independent. A conflict is queued, never waited on.
     pub fn accept(
         &mut self,
         context: SubmissionContext,
-    ) -> Result<SubmissionDispatch, SubmissionAcceptError> {
+        work: W,
+    ) -> Result<SubmissionDispatch<W>, SubmissionAcceptError> {
         let identity = context.identity;
         if self.commits.contains(identity) {
             return Err(SubmissionAcceptError::AlreadyAccepted(identity));
@@ -245,9 +252,9 @@ impl<T> SubmissionScheduler<T> {
             .register(identity)
             .map_err(SubmissionAcceptError::Commit)?;
         match self.admissions.admit(&context) {
-            Ok(()) => Ok(SubmissionDispatch::Record(context)),
+            Ok(()) => Ok(SubmissionDispatch::Record(SubmissionWork { context, work })),
             Err(SubmissionAdmissionRefusal::Conflict { active, reason }) => {
-                self.waiting.push_back(context);
+                self.waiting.push_back(SubmissionWork { context, work });
                 Ok(SubmissionDispatch::Queued {
                     identity,
                     blocked_by: active,
@@ -268,7 +275,7 @@ impl<T> SubmissionScheduler<T> {
         &mut self,
         identity: SubmissionIdentity,
         result: T,
-    ) -> Result<Vec<SubmissionContext>, SubmissionRecordError> {
+    ) -> Result<Vec<SubmissionWork<W>>, SubmissionRecordError> {
         if !self.admissions.contains(identity) {
             return Err(SubmissionRecordError::NotRecording(identity));
         }
@@ -282,13 +289,13 @@ impl<T> SubmissionScheduler<T> {
 
     /// Admit every waiter now independent of active recordings and of waiters
     /// admitted earlier in this same pass.
-    pub fn dispatch_ready(&mut self) -> Vec<SubmissionContext> {
+    pub fn dispatch_ready(&mut self) -> Vec<SubmissionWork<W>> {
         let mut ready = Vec::new();
         let mut blocked = VecDeque::new();
-        while let Some(context) = self.waiting.pop_front() {
-            match self.admissions.admit(&context) {
-                Ok(()) => ready.push(context),
-                Err(SubmissionAdmissionRefusal::Conflict { .. }) => blocked.push_back(context),
+        while let Some(submission) = self.waiting.pop_front() {
+            match self.admissions.admit(&submission.context) {
+                Ok(()) => ready.push(submission),
+                Err(SubmissionAdmissionRefusal::Conflict { .. }) => blocked.push_back(submission),
                 Err(SubmissionAdmissionRefusal::AlreadyActive(identity)) => {
                     unreachable!("a queued identity cannot already own recording: {identity:?}")
                 }
@@ -494,7 +501,7 @@ mod tests {
         SubmissionAcceptError, SubmissionAdmissionRefusal, SubmissionAdmissions,
         SubmissionCommitOrder, SubmissionCommitOrderError, SubmissionConflict, SubmissionContext,
         SubmissionDispatch, SubmissionFootprint, SubmissionRecordError, SubmissionScheduler,
-        SubmissionTracker,
+        SubmissionTracker, SubmissionWork,
     };
     use reims_vgpu_protocol::{
         ObjectTableRef, ResourceId, ResourceObject, ResourceValidity, SegmentBoundary, SegmentKind,
@@ -582,14 +589,17 @@ mod tests {
         let first = context_with_resources(50, [Some(shared)]);
         let blocked = context_with_resources(51, [Some(shared)]);
         let independent = context_with_resources(52, [Some(ResourceId::new(4, 1))]);
-        let mut scheduler = SubmissionScheduler::<&'static str>::default();
+        let mut scheduler = SubmissionScheduler::<(), &'static str>::default();
 
         assert_eq!(
-            scheduler.accept(first.clone()),
-            Ok(SubmissionDispatch::Record(first.clone()))
+            scheduler.accept(first.clone(), ()),
+            Ok(SubmissionDispatch::Record(SubmissionWork {
+                context: first.clone(),
+                work: (),
+            }))
         );
         assert_eq!(
-            scheduler.accept(blocked.clone()),
+            scheduler.accept(blocked.clone(), ()),
             Ok(SubmissionDispatch::Queued {
                 identity: blocked.identity,
                 blocked_by: first.identity,
@@ -597,15 +607,21 @@ mod tests {
             })
         );
         assert_eq!(
-            scheduler.accept(independent.clone()),
-            Ok(SubmissionDispatch::Record(independent))
+            scheduler.accept(independent.clone(), ()),
+            Ok(SubmissionDispatch::Record(SubmissionWork {
+                context: independent,
+                work: (),
+            }))
         );
         assert_eq!(scheduler.active_len(), 2);
         assert_eq!(scheduler.waiting_len(), 1);
 
         assert_eq!(
             scheduler.record(first.identity, "first").unwrap(),
-            vec![blocked]
+            vec![SubmissionWork {
+                context: blocked,
+                work: (),
+            }]
         );
         assert_eq!(scheduler.active_len(), 2);
         assert_eq!(scheduler.waiting_len(), 0);
@@ -617,22 +633,28 @@ mod tests {
         let first = context_with_resources(53, [Some(shared)]);
         let second = context_with_resources(54, [Some(shared)]);
         let third = context_with_resources(55, [Some(shared)]);
-        let mut scheduler = SubmissionScheduler::<()>::default();
+        let mut scheduler = SubmissionScheduler::<(), ()>::default();
 
         assert!(matches!(
-            scheduler.accept(first.clone()),
+            scheduler.accept(first.clone(), ()),
             Ok(SubmissionDispatch::Record(_))
         ));
         assert!(matches!(
-            scheduler.accept(second.clone()),
+            scheduler.accept(second.clone(), ()),
             Ok(SubmissionDispatch::Queued { .. })
         ));
         assert!(matches!(
-            scheduler.accept(third),
+            scheduler.accept(third, ()),
             Ok(SubmissionDispatch::Queued { .. })
         ));
 
-        assert_eq!(scheduler.record(first.identity, ()).unwrap(), vec![second]);
+        assert_eq!(
+            scheduler.record(first.identity, ()).unwrap(),
+            vec![SubmissionWork {
+                context: second,
+                work: (),
+            }]
+        );
         assert_eq!(scheduler.active_len(), 1);
         assert_eq!(scheduler.waiting_len(), 1);
     }
@@ -642,8 +664,8 @@ mod tests {
         let first = context_with_resources(56, [Some(ResourceId::new(6, 1))]);
         let second = context_with_resources(57, [Some(ResourceId::new(7, 1))]);
         let mut scheduler = SubmissionScheduler::default();
-        scheduler.accept(first.clone()).unwrap();
-        scheduler.accept(second.clone()).unwrap();
+        scheduler.accept(first.clone(), ()).unwrap();
+        scheduler.accept(second.clone(), ()).unwrap();
 
         assert!(scheduler
             .record(second.identity, "second")
@@ -664,13 +686,13 @@ mod tests {
     fn duplicate_accept_is_typed_and_reset_aborts_in_guest_order() {
         let first = context_with_resources(58, [Some(ResourceId::new(8, 1))]);
         let second = context_with_resources(59, [Some(ResourceId::new(8, 1))]);
-        let mut scheduler = SubmissionScheduler::<()>::default();
-        scheduler.accept(first.clone()).unwrap();
+        let mut scheduler = SubmissionScheduler::<(), ()>::default();
+        scheduler.accept(first.clone(), ()).unwrap();
         assert_eq!(
-            scheduler.accept(first.clone()),
+            scheduler.accept(first.clone(), ()),
             Err(SubmissionAcceptError::AlreadyAccepted(first.identity))
         );
-        scheduler.accept(second.clone()).unwrap();
+        scheduler.accept(second.clone(), ()).unwrap();
         assert_eq!(
             scheduler.record(second.identity, ()),
             Err(SubmissionRecordError::NotRecording(second.identity))
