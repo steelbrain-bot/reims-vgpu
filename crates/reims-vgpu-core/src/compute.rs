@@ -278,6 +278,8 @@ pub struct ComputeSampledImageResource {
     pub format: SampledImageFormat,
     pub width: u32,
     pub height: u32,
+    /// Whether the shader binding requires a multisampled 2D image.
+    pub multisampled: bool,
     pub source: ComputeSampledImageSource,
     pub content: Option<crate::ContentStamp>,
 }

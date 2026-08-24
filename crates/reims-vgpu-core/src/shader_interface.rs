@@ -219,6 +219,7 @@ pub enum ReflectedSampledKind {
 pub enum ReflectedComputeTexture {
     Absent,
     Plain2d(ImageAccess),
+    Multisampled2d,
     UnstageableShape { axis: &'static str },
 }
 
@@ -592,7 +593,12 @@ impl ShaderInterface {
             ShaderTextureDimension::Cube => Some("dim_cube"),
             ShaderTextureDimension::Buffer => Some("dim_buffer"),
             ShaderTextureDimension::D2 if shape.arrayed => Some("arrayed"),
-            ShaderTextureDimension::D2 if shape.multisampled => Some("multisampled"),
+            ShaderTextureDimension::D2 if shape.multisampled && shape.writable => {
+                Some("multisampled_storage")
+            }
+            ShaderTextureDimension::D2 if shape.multisampled => {
+                return ReflectedComputeTexture::Multisampled2d;
+            }
             ShaderTextureDimension::D2 => None,
         };
         match axis {
@@ -735,6 +741,48 @@ mod tests {
                 .first_non_sampled_texture_descriptor()
                 .map(|(index, descriptor)| (index, descriptor.access)),
             Some((5, ReflectedTextureAccess::Storage))
+        );
+    }
+
+    #[test]
+    fn compute_multisample_reads_keep_their_sample_axis() {
+        let mut sampled_ms = shape(ShaderTextureDimension::D2);
+        sampled_ms.multisampled = true;
+        let mut storage_ms = sampled_ms;
+        storage_ms.writable = true;
+        let interface = ShaderInterface {
+            stage: ReflectedShaderStage::Kernel,
+            bindings: vec![
+                texture(
+                    ShaderResourceKind::Texture,
+                    0,
+                    32,
+                    1,
+                    sampled_ms,
+                    ShaderResourceAccess::Sampled,
+                ),
+                texture(
+                    ShaderResourceKind::StorageImage,
+                    1,
+                    33,
+                    1,
+                    storage_ms,
+                    ShaderResourceAccess::Storage,
+                ),
+            ],
+            local_size: Some([1, 1, 1]),
+            unsupported: None,
+        };
+
+        assert_eq!(
+            interface.compute_texture(32),
+            ReflectedComputeTexture::Multisampled2d
+        );
+        assert_eq!(
+            interface.compute_texture(33),
+            ReflectedComputeTexture::UnstageableShape {
+                axis: "multisampled_storage"
+            }
         );
     }
 }

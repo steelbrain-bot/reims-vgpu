@@ -3615,6 +3615,7 @@ fn note_depth_load_without_content(width: u32, height: u32, stencil: bool) {
 /// query this mutable registry first: such a result can change before the draw
 /// acquires the engine, while this decision cannot race a reclaim or target
 /// replacement.
+#[derive(Clone, Copy)]
 pub(super) struct SampledResidentExpectation<'a> {
     pub(super) binding: u32,
     pub(super) identity: &'a TargetIdentity,
@@ -8452,6 +8453,27 @@ mod tests {
             Ok(()),
             "the attachment load establishes content before the fragment reads it"
         );
+
+        let expected_ms = SampledResidentExpectation {
+            binding: 34,
+            identity: &identity,
+            resource_width: 64,
+            resource_height: 32,
+            shader_multisampled: true,
+            initialized_by_this_pass: false,
+        };
+        assert_eq!(
+            validate_sampled_resident(expected_ms, Some((true, 64, 32, 4)), None),
+            Ok(())
+        );
+        assert!(matches!(
+            validate_sampled_resident(expected_ms, Some((true, 64, 32, 1)), None),
+            Err(DrawExecutionDecline::SampledResidentSampleCountMismatch {
+                resident_samples: 1,
+                shader_multisampled: true,
+                ..
+            })
+        ));
     }
 
     #[test]

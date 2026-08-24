@@ -352,8 +352,15 @@ fn stage_texture_iosurface_plane_view_plane_index_beats_the_ambiguous_geometry_s
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    let staged = stage_texture_raw(&mut state, &mut host, 1, iosurface_plane_view_ref, 33, true)
-        .expect("a IOSurface plane view plane view over a mapped surface must stage");
+    let staged = stage_texture_raw(
+        &mut state,
+        &mut host,
+        1,
+        iosurface_plane_view_ref,
+        33,
+        ComputeTextureStage::Storage2d,
+    )
+    .expect("a IOSurface plane view plane view over a mapped surface must stage");
     match staged.writeback {
         TextureWriteback::IOSurface {
             surface_offset,
@@ -1465,8 +1472,15 @@ fn stage_texture_iosurface_plane_view_ref_resolves_surface_mapping() {
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
     crate::runtime::guest_ram::latch_import_limits(1 << PAGE_SHIFT_ARM64E, 1 << 30, 1 << 30);
-    let staged = stage_texture_raw(&mut state, &mut host, 1, iosurface_plane_view_ref, 32, true)
-        .expect("IOSurface plane view→surface stage must succeed after ensure");
+    let staged = stage_texture_raw(
+        &mut state,
+        &mut host,
+        1,
+        iosurface_plane_view_ref,
+        32,
+        ComputeTextureStage::Storage2d,
+    )
+    .expect("IOSurface plane view→surface stage must succeed after ensure");
     crate::runtime::guest_ram::forget_import_limits();
     assert_eq!((staged.width, staged.height), (4, 4));
     assert!(match &staged.input {
@@ -1538,8 +1552,15 @@ fn stage_texture_iosurface_plane_view_record_reshapes_stageable_single_plane_sur
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    let staged = stage_texture_raw(&mut state, &mut host, 1, iosurface_plane_view_ref, 33, true)
-        .expect("serialized IOSurface plane view view must override base surface geometry");
+    let staged = stage_texture_raw(
+        &mut state,
+        &mut host,
+        1,
+        iosurface_plane_view_ref,
+        33,
+        ComputeTextureStage::Storage2d,
+    )
+    .expect("serialized IOSurface plane view view must override base surface geometry");
     assert_eq!((staged.width, staged.height), (1, 4));
     assert_eq!(
         staged.storage_format,
@@ -1592,7 +1613,7 @@ fn stage_texture_iosurface_plane_view_record_reshapes_stageable_single_plane_sur
         1,
         iosurface_plane_view_ref,
         32,
-        false,
+        ComputeTextureStage::Sampled2d,
     )
     .expect("sample-only R32Uint view must stage from the same IOSurface bytes");
     assert_eq!((sampled.width, sampled.height), (4, 4));
@@ -1691,8 +1712,15 @@ fn stage_texture_iosurface_plane_view_record_stages_biplanar_y_plane() {
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    let staged = stage_texture_raw(&mut state, &mut host, 1, iosurface_plane_view_ref, 32, true)
-        .expect("plane record must stage the Y plane of a biplanar surface");
+    let staged = stage_texture_raw(
+        &mut state,
+        &mut host,
+        1,
+        iosurface_plane_view_ref,
+        32,
+        ComputeTextureStage::Storage2d,
+    )
+    .expect("plane record must stage the Y plane of a biplanar surface");
     assert_eq!((staged.width, staged.height), (16, 8));
     assert_eq!(
         staged.storage_format,
@@ -1727,7 +1755,7 @@ fn stage_texture_iosurface_plane_view_record_stages_biplanar_y_plane() {
         1,
         iosurface_plane_view_ref,
         32,
-        false,
+        ComputeTextureStage::Sampled2d,
     )
     .expect("sampled IOSurface plane view plane must stage without writeback");
     assert!(!sampled.is_storage);
@@ -1783,7 +1811,14 @@ fn stage_texture_iosurface_plane_view_multiplanar_without_record_fails_closed() 
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    match stage_texture_raw(&mut state, &mut host, 1, iosurface_plane_view_ref, 32, true) {
+    match stage_texture_raw(
+        &mut state,
+        &mut host,
+        1,
+        iosurface_plane_view_ref,
+        32,
+        ComputeTextureStage::Storage2d,
+    ) {
         Err(ComputeStatus::Unsupported(_)) => {}
         Err(other) => panic!("expected Unsupported, got {other:?}"),
         Ok(_) => panic!("multiplanar without plane record must fail closed"),
@@ -1836,7 +1871,14 @@ fn stage_texture_linear_ref_does_not_collide_with_surface_mid() {
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
     // Must fail linear (bogus desc), NOT succeed against surface mid 7.
-    if let Ok(s) = stage_texture_raw(&mut state, &mut host, 1, colliding_mid, 32, true) {
+    if let Ok(s) = stage_texture_raw(
+        &mut state,
+        &mut host,
+        1,
+        colliding_mid,
+        32,
+        ComputeTextureStage::Storage2d,
+    ) {
         panic!(
             "linear ref must not stage collided surface mid ({}x{})",
             s.width, s.height
@@ -1903,8 +1945,15 @@ fn equal_heap_placements_stage_one_shared_residency_identity() {
     list_entry[4..12].copy_from_slice(&alias_desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], alias_entry_offset, &list_entry);
 
-    let staged = stage_texture_raw(&mut state, &mut host, 1, texture_ref, 33, true)
-        .expect("live opcode-0x15 heap texture must stage");
+    let staged = stage_texture_raw(
+        &mut state,
+        &mut host,
+        1,
+        texture_ref,
+        33,
+        ComputeTextureStage::Storage2d,
+    )
+    .expect("live opcode-0x15 heap texture must stage");
     assert_eq!((staged.width, staged.height), (180, 135));
     assert_eq!(staged.pixel_format, MTL_FORMAT_RGBA32_FLOAT);
     assert_eq!(
@@ -1929,8 +1978,15 @@ fn equal_heap_placements_stage_one_shared_residency_identity() {
     );
     assert_eq!(residency.seed_generation, 0);
 
-    let alias = stage_texture_raw(&mut state, &mut host, 1, alias_ref, 34, true)
-        .expect("an equal explicit placement must stage");
+    let alias = stage_texture_raw(
+        &mut state,
+        &mut host,
+        1,
+        alias_ref,
+        34,
+        ComputeTextureStage::Storage2d,
+    )
+    .expect("an equal explicit placement must stage");
     let alias_residency = alias.residency.expect("heap alias needs GPU residency");
     assert_eq!(
         residency.key, alias_residency.key,
@@ -1964,6 +2020,7 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
         view_swizzle: reims_vgpu_protocol::SwizzlePlan::default(),
         width: 2,
         height: 2,
+        multisampled: false,
         bytes: rgba.clone(),
         is_storage: true,
         residency: None,
@@ -2085,8 +2142,15 @@ fn stage_texture_iosurface_plane_view_ignores_task_object_list_slot_collision() 
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    let staged = stage_texture_raw(&mut state, &mut host, 1, iosurface_plane_view_ref, 32, true)
-        .expect("IOSurface plane view must stage mapping sid, not poisoned IOSurface texture slot");
+    let staged = stage_texture_raw(
+        &mut state,
+        &mut host,
+        1,
+        iosurface_plane_view_ref,
+        32,
+        ComputeTextureStage::Storage2d,
+    )
+    .expect("IOSurface plane view must stage mapping sid, not poisoned IOSurface texture slot");
     assert_eq!((staged.width, staged.height), (4, 4));
     assert!(matches!(
         staged.writeback,
@@ -2129,7 +2193,7 @@ fn stage_texture_iosurface_plane_view_without_surface_is_missing() {
         1,
         iosurface_plane_view_ref,
         32,
-        false,
+        ComputeTextureStage::Sampled2d,
     );
     assert!(matches!(st, Err(ComputeStatus::MissingTexture(_))));
 }
@@ -2546,6 +2610,7 @@ fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
         view_swizzle: reims_vgpu_protocol::SwizzlePlan::default(),
         width: 2,
         height: 2,
+        multisampled: false,
         bytes: vec![0u8; 16],
         is_storage: true,
         residency,
@@ -2955,6 +3020,7 @@ fn live_compute_mirrors_are_not_evicted_by_an_invented_capacity() {
         view_swizzle: reims_vgpu_protocol::SwizzlePlan::default(),
         width: key.width,
         height: key.height,
+        multisampled: false,
         bytes: Vec::new(),
         // The mirror is only armed for a storage output, which is what makes a
         // heap texture's engine copy the sole content.
@@ -3238,8 +3304,15 @@ fn a_buffer_backed_texture_stages_as_a_linear_window_over_its_buffer() {
         buffer_backed_texture_task(60, 16, 0x100, 256, 0x4000);
     crate::runtime::guest_ram_map::reset();
     crate::runtime::guest_ram::latch_import_limits(1 << PAGE_SHIFT_ARM64E, 1 << 30, 1 << 30);
-    let staged = stage_texture_raw(&mut state, &mut host, 1, 10, 32, false)
-        .expect("a buffer-backed texture must stage");
+    let staged = stage_texture_raw(
+        &mut state,
+        &mut host,
+        1,
+        10,
+        32,
+        ComputeTextureStage::Sampled2d,
+    )
+    .expect("a buffer-backed texture must stage");
     crate::runtime::guest_ram::forget_import_limits();
     crate::runtime::guest_ram_map::reset();
 
@@ -3276,7 +3349,14 @@ fn a_buffer_backed_texture_past_the_end_of_its_buffer_is_refused_by_name() {
     // 16 rows of 256 bytes from 0x100 reaches 0x1000, one byte past a 0xfff
     // allocation.
     let (mut state, mut host, _) = buffer_backed_texture_task(64, 16, 0x100, 256, 0xfff);
-    match stage_texture_raw(&mut state, &mut host, 1, 10, 32, false) {
+    match stage_texture_raw(
+        &mut state,
+        &mut host,
+        1,
+        10,
+        32,
+        ComputeTextureStage::Sampled2d,
+    ) {
         Err(ComputeStatus::MissingTexture("compute_buffer_tex_span_oob")) => {}
         Err(other) => panic!("expected span_oob, got {}", other.reason()),
         Ok(_) => panic!("a window past the allocation must be refused, not staged"),
@@ -3291,8 +3371,15 @@ fn a_zero_bytes_per_row_buffer_texture_is_tight_rows() {
     let (mut state, mut host, _) = buffer_backed_texture_task(64, 1, 0, 0, 0x4000);
     crate::runtime::guest_ram_map::reset();
     crate::runtime::guest_ram::latch_import_limits(1 << PAGE_SHIFT_ARM64E, 1 << 30, 1 << 30);
-    let staged = stage_texture_raw(&mut state, &mut host, 1, 10, 32, false)
-        .expect("a tight-row buffer-backed texture must stage");
+    let staged = stage_texture_raw(
+        &mut state,
+        &mut host,
+        1,
+        10,
+        32,
+        ComputeTextureStage::Sampled2d,
+    )
+    .expect("a tight-row buffer-backed texture must stage");
     crate::runtime::guest_ram::forget_import_limits();
     crate::runtime::guest_ram_map::reset();
     match &staged.input {

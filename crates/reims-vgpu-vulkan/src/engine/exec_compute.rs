@@ -249,6 +249,19 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
                 },
             ));
         }
+        if img.multisampled
+            && !matches!(
+                img.source,
+                super::types::ComputeSampledImageSource::TargetResident(_)
+                    | super::types::ComputeSampledImageSource::Null
+            )
+        {
+            return Err(DrawError::ComputeValidation(
+                ComputeValidationDecline::MultisampledSourceNotTargetResident {
+                    binding: img.binding,
+                },
+            ));
+        }
         let tight = (img.width as usize)
             .saturating_mul(img.height as usize)
             .saturating_mul(img.format.bytes_per_texel());
@@ -879,7 +892,7 @@ pub(crate) unsafe fn execute_compute_inner(
                         identity,
                         resource_width: resource.width,
                         resource_height: resource.height,
-                        shader_multisampled: false,
+                        shader_multisampled: resource.multisampled,
                         initialized_by_this_pass: false,
                     },
                     held.map(|held| (held.0, held.1, held.2, held.3)),
@@ -2095,6 +2108,7 @@ mod tests {
                 format: StorageImageFormat::Rgba8Unorm.into(),
                 width: 64,
                 height: 64,
+                multisampled: false,
                 source: super::super::types::ComputeSampledImageSource::GuestImage(
                     mip_chain_source(),
                 ),
@@ -2134,6 +2148,7 @@ mod tests {
             format: StorageImageFormat::Rgba8Unorm.into(),
             width: 1,
             height: 1,
+            multisampled: false,
             source: super::super::types::ComputeSampledImageSource::Resident(
                 ComputeResidentSampleBind {
                     identity: residency_identity(),
@@ -2150,6 +2165,38 @@ mod tests {
             format: StorageImageFormat::Rgba8Unorm,
             sampled_only: false,
         }
+    }
+
+    #[test]
+    fn multisampled_compute_inputs_require_a_render_target_resident() {
+        let mut resource = resident_sample_resource();
+        resource.multisampled = true;
+        let mut request = ComputeRequest {
+            program: test_program(),
+            entry: "main".into(),
+            dispatch: reims_vgpu_protocol::dispatch::workgroup_counts([1, 1, 1], [1, 1, 1], false)
+                .expect("a one-by-one dispatch is a valid grid"),
+            sampled_images: vec![resource],
+            ..Default::default()
+        };
+        assert!(matches!(
+            validate_compute(&request),
+            Err(DrawError::ComputeValidation(
+                ComputeValidationDecline::MultisampledSourceNotTargetResident { binding: 32 }
+            ))
+        ));
+
+        request.sampled_images[0].source =
+            super::super::types::ComputeSampledImageSource::TargetResident(
+                super::super::types::TargetIdentity::Surface {
+                    id: 7,
+                    width: 1,
+                    height: 1,
+                    generation: 1,
+                    format: reims_vgpu_protocol::TexelLayout::Rgba8,
+                },
+            );
+        assert_eq!(validate_compute(&request), Ok(()));
     }
 
     fn resident_sample_shape_slug(
@@ -2270,6 +2317,7 @@ mod tests {
                 format: StorageImageFormat::Rgba8Unorm.into(),
                 width: 1,
                 height: 1,
+                multisampled: false,
                 source: super::super::types::ComputeSampledImageSource::Bytes(vec![0; 4]),
                 content: None,
             }],

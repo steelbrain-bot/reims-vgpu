@@ -1100,6 +1100,7 @@ fn compute_sampled_resident_direct_bind_and_lost_resident() {
             format: StorageImageFormat::Rgba8Unorm.into(),
             width: w,
             height: h,
+            multisampled: false,
             source: ComputeSampledImageSource::Resident(ComputeResidentSampleBind {
                 identity,
                 generation,
@@ -1216,6 +1217,7 @@ fn compute_sampled_and_storage_bindings_preserve_one_resident_identity() {
             format: StorageImageFormat::Rgba8Unorm.into(),
             width: w,
             height: h,
+            multisampled: false,
             source: ComputeSampledImageSource::Resident(ComputeResidentSampleBind {
                 identity,
                 generation: 2,
@@ -1280,6 +1282,7 @@ fn compute_sampled_image_fetch_preserves_float_bits() {
             format: StorageImageFormat::Rgba32Float.into(),
             width: 1,
             height: 1,
+            multisampled: false,
             source: ComputeSampledImageSource::Bytes(bytes),
             content: None,
         }],

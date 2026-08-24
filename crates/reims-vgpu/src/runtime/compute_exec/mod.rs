@@ -1752,6 +1752,9 @@ pub(crate) struct StagedTexture {
     pub view_swizzle: reims_vgpu_protocol::SwizzlePlan,
     pub width: u32,
     pub height: u32,
+    /// Shader-required sample axis. Multisampled binds are admitted only from
+    /// the exact render-target resident; flat guest bytes cannot represent it.
+    pub multisampled: bool,
     /// post-dispatch host result only; the pre-dispatch source is the typed
     /// `input` below and never consults this field.
     pub bytes: Vec<u8>,
@@ -1769,7 +1772,22 @@ enum VulkanTextureInput {
     Resident(ResidentServe),
 }
 
-impl StagedTexture {}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ComputeTextureStage {
+    Sampled2d,
+    Sampled2dMultisample,
+    Storage2d,
+}
+
+impl ComputeTextureStage {
+    const fn is_storage(self) -> bool {
+        matches!(self, Self::Storage2d)
+    }
+
+    const fn is_multisampled(self) -> bool {
+        matches!(self, Self::Sampled2dMultisample)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ComputeStorageResidencyCandidate {
@@ -1920,8 +1938,9 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     task_id: u32,
     texture_ref: u32,
     binding: u32,
-    is_storage: bool,
+    stage: ComputeTextureStage,
 ) -> Result<StagedTexture, ComputeStatus> {
+    let is_storage = stage.is_storage();
     // IOSurface plane view RefTextureHandle → surface_id (live CI binds ot5).
     let mut stage_ref = texture_ref;
     let mut from_iosurface_plane_view = false;
@@ -2145,6 +2164,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             view_swizzle,
             width,
             height,
+            multisampled: false,
             bytes: Vec::new(),
             is_storage,
             residency: is_storage.then_some(ComputeStorageResidencyCandidate {
@@ -2171,7 +2191,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             task_id,
             texture_ref,
             binding,
-            is_storage,
+            stage,
             view_pixel_format,
             view_swizzle,
             placement,
@@ -2397,19 +2417,30 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             ));
             return Err(ComputeStatus::Unsupported("stage_tex_fmt_storage"));
         }
-        let target_resident = (!is_storage)
-            .then(|| {
-                crate::runtime::draw::compute_iosurface_resident_sample(
-                    state,
-                    host,
-                    task_id,
-                    texture_ref,
-                    mapping_id,
-                    width,
-                    height,
-                )
-            })
-            .flatten();
+        let was_render_target = state
+            .task_objects
+            .resources
+            .get(task_id, texture_ref)
+            .is_some_and(|resource| resource.was_render_target());
+        let target_resident = if stage.is_multisampled() && was_render_target {
+            Some(crate::runtime::present_identity::surface_identity(
+                state, mapping_id, width, height,
+            ))
+        } else {
+            (!is_storage)
+                .then(|| {
+                    crate::runtime::draw::compute_iosurface_resident_sample(
+                        state,
+                        host,
+                        task_id,
+                        texture_ref,
+                        mapping_id,
+                        width,
+                        height,
+                    )
+                })
+                .flatten()
+        };
         let m = state
             .surfaces
             .mappings
@@ -2631,6 +2662,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             view_swizzle,
             width,
             height,
+            multisampled: false,
             bytes,
             is_storage,
             residency: is_storage.then_some(ComputeStorageResidencyCandidate {
@@ -2652,7 +2684,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         task_id,
         texture_ref,
         binding,
-        is_storage,
+        stage,
         view_pixel_format,
         view_swizzle,
         placement,
@@ -2976,11 +3008,12 @@ fn stage_linear_placement<M: HostMemory + HostOps>(
     task_id: u32,
     bound_ref: u32,
     binding: u32,
-    is_storage: bool,
+    stage: ComputeTextureStage,
     view_pixel_format: Option<u16>,
     view_swizzle: reims_vgpu_protocol::SwizzlePlan,
     placement: LinearPlacement,
 ) -> Result<StagedTexture, ComputeStatus> {
+    let is_storage = stage.is_storage();
     let LinearPlacement {
         texture_ref,
         storage_ref,
@@ -3090,7 +3123,7 @@ fn stage_linear_placement<M: HostMemory + HostOps>(
         ),
         _ => None,
     };
-    let target_resident = if can_bind_linear_target_resident(
+    let may_bind_target = can_bind_linear_target_resident(
         is_storage,
         sampled_allocation.is_some(),
         state
@@ -3098,7 +3131,28 @@ fn stage_linear_placement<M: HostMemory + HostOps>(
             .resources
             .get(task_id, texture_ref)
             .is_some_and(|resource| resource.was_render_target()),
-    ) {
+    );
+    let target_resident = if stage.is_multisampled() && may_bind_target {
+        crate::runtime::writeback_debt::resource_key(state, task_id, texture_ref).and_then(|key| {
+            let generation = crate::runtime::writeback_debt::gva_resource_generation(
+                state,
+                host,
+                key,
+                gva,
+                row_stride.saturating_mul(u64::from(h)),
+            );
+            (generation != 0).then(|| crate::model::TargetIdentity::Gva {
+                gva,
+                width: w,
+                height: h,
+                generation,
+                format: crate::runtime::draw::gva_resident_format(
+                    state.executor.as_ref(),
+                    stage_format,
+                ),
+            })
+        })
+    } else if may_bind_target {
         u32::try_from(row_stride).ok().and_then(|row_stride| {
             crate::runtime::draw::compute_gva_resident_sample(
                 state,
@@ -3308,6 +3362,7 @@ fn stage_linear_placement<M: HostMemory + HostOps>(
         view_swizzle,
         width: w,
         height: h,
+        multisampled: false,
         bytes,
         is_storage,
         residency,
@@ -4242,9 +4297,14 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         // translator's reflection — the declared Metal texture type, exact at
         // translate time. The always-on `census_reflection_wellformed` guard
         // proves the reflection is internally consistent per translate.
-        let is_storage = match kernel_shader.interface().compute_texture(binding) {
-            ReflectedComputeTexture::Plain2d(ImageAccess::Sampled) => false,
-            ReflectedComputeTexture::Plain2d(ImageAccess::Storage) => true,
+        let stage = match kernel_shader.interface().compute_texture(binding) {
+            ReflectedComputeTexture::Plain2d(ImageAccess::Sampled) => {
+                ComputeTextureStage::Sampled2d
+            }
+            ReflectedComputeTexture::Plain2d(ImageAccess::Storage) => {
+                ComputeTextureStage::Storage2d
+            }
+            ReflectedComputeTexture::Multisampled2d => ComputeTextureStage::Sampled2dMultisample,
             ReflectedComputeTexture::Absent => {
                 // Metal permits unused bound resources. If reflection lists no
                 // texture shape at this binding, the shader does not sample/write
@@ -4268,6 +4328,8 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 return ComputeStatus::Unsupported("texture_shape_unstageable");
             }
         };
+        let is_storage = stage.is_storage();
+        let multisampled = stage.is_multisampled();
         let storage_access = if is_storage {
             match kernel_shader.storage_image_access(binding) {
                 Some(StorageImageAccess::WriteOnly) => Some("write_only"),
@@ -4292,10 +4354,18 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         } else {
             None
         };
-        match stage_texture_raw(state, host, task_id, t.texture_ref, binding, is_storage) {
+        match stage_texture_raw(state, host, task_id, t.texture_ref, binding, stage) {
             Ok(mut s) => {
+                if multisampled && !matches!(s.input, VulkanTextureInput::TargetResident(_)) {
+                    crate::observe::fail(format!(
+                        "compute_linux texture_shape fail reason=multisample_resident_missing pipe={} i={} ref={} bind={binding}",
+                        acc.pipeline_ref, t.index, t.texture_ref
+                    ));
+                    return ComputeStatus::Unsupported("texture_multisample_resident_missing");
+                }
                 s.array_element = descriptor.array_element;
                 s.descriptor_count = descriptor.descriptor_count;
+                s.multisampled = multisampled;
                 if let Some(storage_access) = storage_access {
                     if storage_access == "write_only" {
                         storage_writeonly_count += 1;
@@ -4554,6 +4624,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 format: sampled_fmt,
                 width: t.width,
                 height: t.height,
+                multisampled: t.multisampled,
                 source,
                 content: state
                     .task_objects
@@ -4594,6 +4665,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             ),
             width: 0,
             height: 0,
+            multisampled: false,
             source: reims_vgpu_core::ComputeSampledImageSource::Null,
             content: None,
         });

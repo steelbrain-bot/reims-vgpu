@@ -1919,7 +1919,12 @@ pub fn reflected_compute_texture(
         TextureDimension::Cube => Some("dim_cube"),
         TextureDimension::Buffer => Some("dim_buffer"),
         TextureDimension::D2 if shape.arrayed => Some("arrayed"),
-        TextureDimension::D2 if shape.multisampled => Some("multisampled"),
+        TextureDimension::D2 if shape.multisampled && shape.writable => {
+            Some("multisampled_storage")
+        }
+        TextureDimension::D2 if shape.multisampled => {
+            return ReflectedComputeTexture::Multisampled2d;
+        }
         TextureDimension::D2 => None,
     };
     match axis {
@@ -3264,7 +3269,6 @@ mod more_tests {
             (TextureDimension::Cube, true, false, "dim_cube"),
             (TextureDimension::Buffer, false, false, "dim_buffer"),
             (TextureDimension::D2, true, false, "arrayed"),
-            (TextureDimension::D2, false, true, "multisampled"),
         ];
         for (dimension, arrayed, multisampled, axis) in unstageable {
             for writable in [false, true] {
@@ -3279,6 +3283,26 @@ mod more_tests {
                 );
             }
         }
+
+        let mut sampled_ms = shape(TextureDimension::D2, false, false);
+        sampled_ms.multisampled = true;
+        let mut r = empty_reflection(ShaderStage::Kernel);
+        r.bindings.push(texture_binding(bind, sampled_ms));
+        assert_eq!(
+            reflected_compute_texture(&r, bind),
+            ReflectedComputeTexture::Multisampled2d
+        );
+
+        let mut storage_ms = shape(TextureDimension::D2, false, true);
+        storage_ms.multisampled = true;
+        let mut r = empty_reflection(ShaderStage::Kernel);
+        r.bindings.push(texture_binding(bind, storage_ms));
+        assert_eq!(
+            reflected_compute_texture(&r, bind),
+            ReflectedComputeTexture::UnstageableShape {
+                axis: "multisampled_storage"
+            }
+        );
 
         // The one stageable shape, both access classes, is not swept up by it.
         for (writable, want) in [(false, ImageAccess::Sampled), (true, ImageAccess::Storage)] {

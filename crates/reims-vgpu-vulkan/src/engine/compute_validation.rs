@@ -37,6 +37,9 @@ pub enum ComputeValidationDecline {
         width: u32,
         height: u32,
     },
+    MultisampledSourceNotTargetResident {
+        binding: u32,
+    },
     SampledBytesLength {
         binding: u32,
         actual: usize,
@@ -93,6 +96,9 @@ impl Decline for ComputeValidationDecline {
                 "vk_compute_validate_sampled_array_element_out_of_range"
             }
             Self::SampledZeroGeometry { .. } => "vk_compute_validate_sampled_zero_geometry",
+            Self::MultisampledSourceNotTargetResident { .. } => {
+                "vk_compute_validate_multisampled_source_not_target_resident"
+            }
             Self::SampledBytesLength { .. } => "vk_compute_validate_sampled_bytes_length",
             Self::SampledImageLayout { .. } => "vk_compute_validate_sampled_image_layout",
             Self::InvalidSamplerLod { .. } => "vk_compute_validate_invalid_sampler_lod",
@@ -118,6 +124,7 @@ impl Decline for ComputeValidationDecline {
             Self::DuplicateStorageBufferBinding { binding }
             | Self::EmptyStorageBuffer { binding }
             | Self::DuplicateSampledImageBinding { binding }
+            | Self::MultisampledSourceNotTargetResident { binding }
             | Self::DuplicateSamplerBinding { binding }
             | Self::DuplicateStorageImageBinding { binding } => {
                 vec![("binding", binding.to_string())]
@@ -212,6 +219,7 @@ mod tests {
                 width: 0,
                 height: 1,
             },
+            ComputeValidationDecline::MultisampledSourceNotTargetResident { binding: 32 },
             ComputeValidationDecline::SampledBytesLength {
                 binding: 32,
                 actual: 3,
@@ -260,7 +268,7 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 18, "the compute validator's reason census moved");
+        assert_eq!(before, 19, "the compute validator's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate compute-validation slug");
     }
 
