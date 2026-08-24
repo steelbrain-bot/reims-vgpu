@@ -126,6 +126,8 @@ impl std::fmt::Debug for SessionHandle {
 struct SessionInner {
     id: SessionId,
     resources: Arc<Mutex<SessionResources>>,
+    indexes: Arc<Mutex<SessionCacheIndexes>>,
+    counters: Arc<EngineCounters>,
     signals: Arc<SessionSignals>,
 }
 
@@ -138,6 +140,8 @@ impl SessionHandle {
         let handle = Self(Arc::new(SessionInner {
             id,
             resources: Arc::new(Mutex::new(SessionResources::new())),
+            indexes: Arc::new(Mutex::new(SessionCacheIndexes::new())),
+            counters: Arc::new(EngineCounters::default()),
             signals: Arc::new(SessionSignals::default()),
         }));
         LIVE_SESSIONS.lock().insert(id, Arc::downgrade(&handle.0));
@@ -225,6 +229,8 @@ static DEFAULT_SESSION: Lazy<SessionHandle> = Lazy::new(|| {
     SessionHandle(Arc::new(SessionInner {
         id: SessionId(0),
         resources: Arc::new(Mutex::new(SessionResources::new())),
+        indexes: Arc::new(Mutex::new(SessionCacheIndexes::new())),
+        counters: Arc::new(EngineCounters::default()),
         signals: Arc::new(SessionSignals::default()),
     }))
 });
@@ -375,8 +381,6 @@ struct EngineState {
 
 struct SessionResources {
     pools: ResourcePools,
-    indexes: SessionCacheIndexes,
-    counters: EngineCounters,
     #[cfg(feature = "host-window")]
     window_presenter: Option<window_present::WindowPresenter>,
     resident_epoch: Arc<AtomicU64>,
@@ -402,8 +406,6 @@ impl SessionResources {
     fn new() -> Self {
         Self {
             pools: ResourcePools::new(),
-            indexes: SessionCacheIndexes::new(),
-            counters: EngineCounters::default(),
             #[cfg(feature = "host-window")]
             window_presenter: None,
             resident_epoch: Arc::new(AtomicU64::new(1)),
@@ -445,16 +447,15 @@ impl EngineState {
     fn on_device_lost(
         &mut self,
         caches: &mut ObjectCaches,
+        indexes: &mut SessionCacheIndexes,
+        counters: &EngineCounters,
         session_id: SessionId,
         resources: &mut SessionResources,
     ) -> bool {
-        resources
-            .counters
-            .device_lost
-            .fetch_add(1, Ordering::Relaxed);
+        counters.device_lost.fetch_add(1, Ordering::Relaxed);
         self.owner.mark_device_lost();
-        self.flush_device_derived(caches, session_id, resources);
-        match self.owner.ensure(&resources.counters) {
+        self.flush_device_derived(caches, indexes, session_id, resources);
+        match self.owner.ensure(counters) {
             Ok(_) => true,
             Err(error) => {
                 reims_vgpu_observe::Emit::decline("vk_device_recreate", &error).fail_once(1);
@@ -476,6 +477,7 @@ impl EngineState {
     fn flush_device_derived(
         &mut self,
         caches: &mut ObjectCaches,
+        indexes: &mut SessionCacheIndexes,
         session_id: SessionId,
         resources: &mut SessionResources,
     ) {
@@ -496,7 +498,7 @@ impl EngineState {
                 .resident_epoch
                 .fetch_add(1, Ordering::Release);
         }
-        resources.indexes.clear();
+        indexes.clear();
         // Taken unconditionally, before anything fallible. The
         // presenter's swapchain, surface and semaphores were made against the
         // device that is going away; whether or not there is still a `ctx` to
@@ -517,15 +519,15 @@ impl EngineState {
                     presenter.destroy(ctx, Some(&mut resources.pools));
                 }
                 for session in &inactive_sessions {
-                    let mut session = session.resources.lock();
-                    session.indexes.clear();
+                    let mut session_resources = session.resources.lock();
+                    session.indexes.lock().clear();
                     #[cfg(feature = "host-window")]
-                    if let Some(mut presenter) = session.window_presenter.take() {
-                        presenter.destroy(ctx, Some(&mut session.pools));
+                    if let Some(mut presenter) = session_resources.window_presenter.take() {
+                        presenter.destroy(ctx, Some(&mut session_resources.pools));
                     }
-                    session.pools.destroy_all(&ctx.device);
-                    session.pools = ResourcePools::new();
-                    session.indexes = SessionCacheIndexes::new();
+                    session_resources.pools.destroy_all(&ctx.device);
+                    session_resources.pools = ResourcePools::new();
+                    *session.indexes.lock() = SessionCacheIndexes::new();
                 }
                 caches.destroy_all(&ctx.device);
                 resources.pools.destroy_all(&ctx.device);
@@ -533,12 +535,12 @@ impl EngineState {
         } else {
             caches.clear_logical();
             for session in &inactive_sessions {
-                let mut session = session.resources.lock();
-                session.pools = ResourcePools::new();
-                session.indexes = SessionCacheIndexes::new();
+                let mut session_resources = session.resources.lock();
+                session_resources.pools = ResourcePools::new();
+                *session.indexes.lock() = SessionCacheIndexes::new();
                 #[cfg(feature = "host-window")]
                 {
-                    session.window_presenter = None;
+                    session_resources.window_presenter = None;
                 }
             }
             for session in &inactive_sessions {
@@ -546,7 +548,7 @@ impl EngineState {
             }
         }
         resources.pools = ResourcePools::new();
-        resources.indexes = SessionCacheIndexes::new();
+        *indexes = SessionCacheIndexes::new();
         *caches = ObjectCaches::new();
     }
 }
@@ -691,8 +693,6 @@ mod session_slot_tests {
         let cache_address = Arc::as_ptr(&engine.caches);
         first
             .0
-            .resources
-            .lock()
             .counters
             .device_lost
             .store(3, std::sync::atomic::Ordering::Relaxed);
@@ -701,8 +701,6 @@ mod session_slot_tests {
         assert_eq!(
             second
                 .0
-                .resources
-                .lock()
                 .counters
                 .device_lost
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -711,8 +709,6 @@ mod session_slot_tests {
         assert_eq!(
             first
                 .0
-                .resources
-                .lock()
                 .counters
                 .device_lost
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -1361,8 +1357,11 @@ pub fn take_engine_lock_census(win_ms: u64) -> Option<String> {
 struct EngineGuard {
     guard: parking_lot::MutexGuard<'static, EngineState>,
     caches: GuardSlot<parking_lot::lock_api::ArcMutexGuard<parking_lot::RawMutex, ObjectCaches>>,
+    indexes:
+        GuardSlot<parking_lot::lock_api::ArcMutexGuard<parking_lot::RawMutex, SessionCacheIndexes>>,
     resources:
         GuardSlot<parking_lot::lock_api::ArcMutexGuard<parking_lot::RawMutex, SessionResources>>,
+    counters: Arc<EngineCounters>,
     session: SessionHandle,
     session_id: SessionId,
     site: EngineLockSite,
@@ -1413,14 +1412,14 @@ impl EngineGuard {
         let EngineGuard {
             guard,
             caches,
+            indexes,
             resources,
+            counters,
             ..
         } = self;
         let EngineState { owner, caches: _ } = &mut **guard;
         let SessionResources {
             pools,
-            indexes,
-            counters,
             #[cfg(feature = "host-window")]
             window_presenter,
             resident_epoch: _,
@@ -1438,27 +1437,35 @@ impl EngineGuard {
 
     fn on_device_lost(&mut self) -> bool {
         let session_id = self.session_id;
-        self.guard
-            .on_device_lost(&mut self.caches, session_id, &mut self.resources)
+        self.guard.on_device_lost(
+            &mut self.caches,
+            &mut self.indexes,
+            &self.counters,
+            session_id,
+            &mut self.resources,
+        )
     }
 
     fn flush_device_derived(&mut self) {
         let session_id = self.session_id;
-        self.guard
-            .flush_device_derived(&mut self.caches, session_id, &mut self.resources);
+        self.guard.flush_device_derived(
+            &mut self.caches,
+            &mut self.indexes,
+            session_id,
+            &mut self.resources,
+        );
     }
 
     fn into_submission_recording(
         mut self,
         identity: reims_vgpu_protocol::SubmissionIdentity,
     ) -> Result<SubmissionRecording, DrawError> {
-        let (context, force_loss) = self
-            .guard
-            .owner
-            .lease_recording_context(&self.resources.counters)?;
+        let (context, force_loss) = self.guard.owner.lease_recording_context(&self.counters)?;
         let checkout = self.resources.pools.checkout_submission_encoder(identity)?;
         let caches = self.caches.take();
+        let indexes = self.indexes.take();
         let resources = self.resources.take();
+        let counters = Arc::clone(&self.counters);
         let session = self.session.clone();
         // `caches` and `resources` remain locked for this exact transaction;
         // dropping the outer guard releases only the process-global owner lock.
@@ -1467,7 +1474,9 @@ impl EngineGuard {
             context,
             force_loss,
             caches,
+            indexes,
             resources,
+            counters,
             session,
             checkout: Some(checkout),
         })
@@ -1478,7 +1487,9 @@ struct SubmissionRecording {
     context: Arc<context::SharedDeviceContext>,
     force_loss: bool,
     caches: parking_lot::lock_api::ArcMutexGuard<parking_lot::RawMutex, ObjectCaches>,
+    indexes: parking_lot::lock_api::ArcMutexGuard<parking_lot::RawMutex, SessionCacheIndexes>,
     resources: parking_lot::lock_api::ArcMutexGuard<parking_lot::RawMutex, SessionResources>,
+    counters: Arc<EngineCounters>,
     session: SessionHandle,
     checkout: Option<pools::EncoderCheckout>,
 }
@@ -1539,10 +1550,13 @@ fn lock_engine_at(site: EngineLockSite) -> EngineGuard {
     let caches = guard.caches.lock_arc();
     let session = current_session_handle();
     let resources = session.0.resources.lock_arc();
+    let indexes = session.0.indexes.lock_arc();
     EngineGuard {
         guard,
         caches: GuardSlot::new(caches),
+        indexes: GuardSlot::new(indexes),
         resources: GuardSlot::new(resources),
+        counters: Arc::clone(&session.0.counters),
         session: session.clone(),
         session_id: session.id(),
         site,
@@ -1584,7 +1598,7 @@ pub fn reset_guest_state() -> GuestResetStats {
         .resources
         .resident_epoch
         .fetch_add(1, Ordering::Release);
-    guard.resources.indexes.clear();
+    guard.indexes.clear();
     let (resident_targets, pooled_targets, sampled_images, storage_images) =
         guard.resources.pools.guest_reset_counts();
     let stats = GuestResetStats {
@@ -1871,7 +1885,7 @@ pub fn flush_batched_draws() {
     }
     let lock_started = std::time::Instant::now();
     let mut guard = lock_engine();
-    guard.resources.counters.batch_tail_lock_us.fetch_add(
+    guard.counters.batch_tail_lock_us.fetch_add(
         lock_started.elapsed().as_micros() as u64,
         std::sync::atomic::Ordering::Relaxed,
     );
@@ -3020,12 +3034,12 @@ pub fn execute_submission_progress(
         let caches = &mut *recording.caches;
         let SessionResources {
             pools,
-            indexes,
-            counters,
             #[cfg(feature = "host-window")]
                 window_presenter: _,
             resident_epoch: _,
         } = &mut *recording.resources;
+        let indexes = &mut *recording.indexes;
+        let counters = &*recording.counters;
         let mut native = pools.recording_from_checkout(
             recording
                 .checkout
@@ -6682,7 +6696,7 @@ pub fn batch_max_draws() -> u64 {
 
 pub fn counter_snapshot() -> CounterSnapshot {
     let eng = lock_engine();
-    let mut snap = eng.resources.counters.snapshot();
+    let mut snap = eng.counters.snapshot();
     if let Some(owner) = eng
         .owner
         .ctx
@@ -6735,7 +6749,7 @@ pub fn counter_snapshot() -> CounterSnapshot {
 
 /// Reset create/alloc/hit-miss counters (not device_lost/recreates). For reuse-gate tests.
 pub fn reset_draw_counters() {
-    lock_engine().resources.counters.reset();
+    lock_engine().counters.reset();
 }
 
 /// Test-only: destroy device, clear recreate budget, rebuild on next draw.
@@ -6783,9 +6797,9 @@ pub fn test_reset_engine() {
         g.owner = ContextOwner::new();
     }
     **g.caches = ObjectCaches::new();
-    g.resources.indexes = SessionCacheIndexes::new();
+    **g.indexes = SessionCacheIndexes::new();
     g.resources.pools = ResourcePools::new();
-    g.resources.counters.reset_all();
+    g.counters.reset_all();
 }
 
 /// Test hook: next execute reports device lost (named path).
@@ -6818,10 +6832,7 @@ pub fn device_recreate_count() -> u32 {
 /// Mark context poisoned and flush as if device lost (tests that assert recreate cap).
 pub fn test_poison_and_flush() {
     let mut g = lock_engine();
-    g.resources
-        .counters
-        .device_lost
-        .fetch_add(1, Ordering::Relaxed);
+    g.counters.device_lost.fetch_add(1, Ordering::Relaxed);
     g.owner.mark_device_lost();
     g.flush_device_derived();
 }
