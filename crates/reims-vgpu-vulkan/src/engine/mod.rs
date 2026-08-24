@@ -6528,7 +6528,7 @@ pub fn test_reset_engine() {
     // later test a dead one — so it is torn down and the next `ensure` builds a
     // replacement.
     let poisoned = g.owner.poisoned;
-    if let Some(mut ctx) = g.owner.ctx.take() {
+    if let Some(ctx) = g.owner.ctx.take() {
         // A healthy test reset reuses the device after destroying every pool.
         // Settle both the owner's FIFO and the GPU before those handles go.
         if !poisoned {
@@ -6541,7 +6541,6 @@ pub fn test_reset_engine() {
             g.resources.pools.destroy_all(&ctx.device);
         }
         if poisoned {
-            unsafe { ctx.destroy() };
             g.owner = ContextOwner::new();
         } else {
             g.owner = ContextOwner::new();

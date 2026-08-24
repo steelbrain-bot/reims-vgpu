@@ -5,6 +5,7 @@
 use ash::vk;
 use std::ffi::{CStr, CString};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use super::counters::EngineCounters;
 use super::device_lost::DeviceLostDecline;
@@ -594,6 +595,34 @@ pub(crate) struct DeviceContext {
     /// `VK_KHR_swapchain` was enabled for the engine-owned host window.
     #[cfg(feature = "host-window")]
     pub swapchain: bool,
+}
+
+/// Shared lifetime of one exact Vulkan device incarnation.
+///
+/// Removing a context from [`ContextOwner`] prevents new recordings from
+/// acquiring it immediately. Existing whole-EXEC recorders may still own an
+/// `Arc`; native destruction therefore belongs to the last such owner rather
+/// than to the thread that first observes device loss.
+pub(crate) struct SharedDeviceContext(DeviceContext);
+
+impl SharedDeviceContext {
+    fn new(context: DeviceContext) -> Self {
+        Self(context)
+    }
+}
+
+impl std::ops::Deref for SharedDeviceContext {
+    type Target = DeviceContext;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for SharedDeviceContext {
+    fn drop(&mut self) {
+        unsafe { self.0.destroy() };
+    }
 }
 
 /// Result of handing one guest submission to the queue owner.
@@ -1784,7 +1813,7 @@ fn dedicated_transfer_family(families: &[vk::QueueFamilyProperties]) -> Option<u
 
 /// Process-global engine state ownership (device + recreate policy + init fail cache).
 pub(crate) struct ContextOwner {
-    pub ctx: Option<DeviceContext>,
+    pub ctx: Option<Arc<SharedDeviceContext>>,
     pub init_error: Option<DrawError>,
     pub recreate_count: u32,
     pub poisoned: bool,
@@ -1826,7 +1855,7 @@ impl ContextOwner {
             match unsafe { DeviceContext::create() } {
                 Ok(c) => {
                     super::publish_device_capabilities(&c);
-                    self.ctx = Some(c);
+                    self.ctx = Some(Arc::new(SharedDeviceContext::new(c)));
                 }
                 Err(e) => {
                     self.note_init_failure(&e);
@@ -1834,7 +1863,7 @@ impl ContextOwner {
                 }
             }
         }
-        Ok(self.ctx.as_ref().unwrap())
+        Ok(self.ctx.as_deref().map(std::ops::Deref::deref).unwrap())
     }
 
     /// Decide whether a failed bring-up becomes the permanent answer.
@@ -1872,15 +1901,13 @@ impl ContextOwner {
                 },
             ));
         }
-        if let Some(mut old) = self.ctx.take() {
-            unsafe { old.destroy() };
-        }
+        self.ctx.take();
         self.recreate_count += 1;
         counters.recreates.fetch_add(1, Ordering::Relaxed);
         match unsafe { DeviceContext::create() } {
             Ok(c) => {
                 super::publish_device_capabilities(&c);
-                self.ctx = Some(c);
+                self.ctx = Some(Arc::new(SharedDeviceContext::new(c)));
                 self.poisoned = false;
                 Ok(())
             }
@@ -2265,6 +2292,17 @@ mod pipeline_cache_blob_tests {
             }
         }
         std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+#[cfg(test)]
+mod shared_device_lifetime_tests {
+    use super::SharedDeviceContext;
+
+    #[test]
+    fn a_device_incarnation_lease_can_cross_a_recording_worker_boundary() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<std::sync::Arc<SharedDeviceContext>>();
     }
 }
 
