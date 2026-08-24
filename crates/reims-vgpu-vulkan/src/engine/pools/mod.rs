@@ -1453,6 +1453,17 @@ pub(crate) struct SealedEntry {
     admissions: Vec<(SampledSlot, SampledRetain)>,
 }
 
+/// What one encoder returns after a slot's fence signals.
+///
+/// Cleanup and global recording retirement travel together so shared state
+/// cannot acknowledge the recording point without first recovering every
+/// native resource the command buffer owned.
+#[must_use = "a retired encoder entry must be applied to shared state"]
+struct RetiredEntry {
+    cleanup: PendingGpuCleanup,
+    retirement: SubmittedPoint,
+}
+
 pub(crate) struct SampledSlot {
     pub image: vk::Image,
     pub memory: vk::DeviceMemory,

@@ -1445,8 +1445,23 @@ impl ResourcePools {
         counters: &EngineCounters,
         index: usize,
     ) -> Result<(), DrawError> {
-        if self.encoder.slots[index].pending.is_none() {
+        let Some(retired) = (unsafe { self.take_retired_slot(ctx, counters, index)? }) else {
             return Ok(());
+        };
+        unsafe { self.apply_retired_entry(&ctx.device, retired) };
+        Ok(())
+    }
+
+    /// Recover one completed slot from encoder ownership. Shared pools are not
+    /// mutated here; the returned transaction carries everything they are owed.
+    unsafe fn take_retired_slot(
+        &mut self,
+        ctx: &DeviceContext,
+        counters: &EngineCounters,
+        index: usize,
+    ) -> Result<Option<RetiredEntry>, DrawError> {
+        if self.encoder.slots[index].pending.is_none() {
+            return Ok(None);
         }
         self.await_submit_return(counters, index, DeviceLostOp::PoolsWaitFencesRetire)?;
         if let Some(error) = ctx.queue_failure() {
@@ -1500,14 +1515,25 @@ impl ResourcePools {
         // Its fence has signalled, so this submission is no longer a candidate
         // for a wedge. Paired with the `note_submit` in `finish_entry_async`.
         crate::gpu_hang_trail::note_retired(index);
-        self.drain_cleanup(&ctx.device, pending);
-        self.encoder.slots[index]
+        let retirement = self.encoder.slots[index]
             .retirement
             .take()
-            .expect("submitted slot has no recording point")
-            .retire();
-        self.release_ready_graveyard(&ctx.device);
-        Ok(())
+            .expect("submitted slot has no recording point");
+        Ok(Some(RetiredEntry {
+            cleanup: pending,
+            retirement,
+        }))
+    }
+
+    /// Return a fence-complete encoder transaction to shared ownership.
+    unsafe fn apply_retired_entry(&mut self, device: &ash::Device, retired: RetiredEntry) {
+        let RetiredEntry {
+            cleanup,
+            retirement,
+        } = retired;
+        unsafe { self.drain_cleanup(device, cleanup) };
+        retirement.retire();
+        self.release_ready_graveyard(device);
     }
 
     /// Recover host ownership of a slot's fence after an asynchronous queue
