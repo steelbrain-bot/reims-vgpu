@@ -84,6 +84,7 @@ pub use window_present::{WindowCpuFrame, WindowPresentOutcome};
 
 use caches::{ObjectCaches, SessionCacheIndexes};
 use context::ContextOwner;
+use device_lost::{DeviceLostDecline, DeviceLostOp};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use pools::ResourcePools;
@@ -3765,11 +3766,19 @@ struct ReadbackOps {
     reset_cb: VkOp,
     begin_cb: VkOp,
     end_cb: VkOp,
-    submit: VkOp,
+    submit: DeviceLostOp,
     map: VkOp,
     /// `vkInvalidateMappedMemoryRanges`, which the readback owes whenever
     /// `MemoryClass::Readback` landed on a host-cached non-coherent type.
     invalidate: VkOp,
+}
+
+fn guest_submit_error(op: DeviceLostOp, result: ash::vk::Result) -> DrawError {
+    if result == ash::vk::Result::ERROR_DEVICE_LOST {
+        DrawError::DeviceLost(DeviceLostDecline::Driver { op, result })
+    } else {
+        DrawError::VkCall(VkCall::new(op.vk_op(), result))
+    }
 }
 
 /// Copy level 0 of a resident color image to host bytes, tightly packed.
@@ -4104,7 +4113,7 @@ unsafe fn copy_image_level0_to_host_delivered(
         let cbs = [cb];
         let timeline = ctx
             .submit_guest_work(&cbs, fence)
-            .map_err(|e| DrawError::VkCall(VkCall::new(ops.submit, e)))?;
+            .map_err(|e| guest_submit_error(ops.submit, e))?;
         let sealed = pools.encoder_mut().seal_entry(Vec::new(), Vec::new());
         pools.finish_entry_async(sealed, timeline, None);
     }
@@ -4683,7 +4692,7 @@ pub fn copy_resident_level0(
         let cbs = [cb];
         let timeline = match ctx
             .submit_guest_work(&cbs, fence)
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ResidentCopySubmit, e)))
+            .map_err(|e| guest_submit_error(DeviceLostOp::ResidentCopySubmit, e))
         {
             Ok(timeline) => timeline,
             Err(error) => {
@@ -5479,7 +5488,7 @@ unsafe fn copy_image_level0_to_buffer(
         let cbs = [cb];
         let timeline = ctx
             .submit_guest_work(&cbs, fence)
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteSubmit, e)))?;
+            .map_err(|e| guest_submit_error(DeviceLostOp::GuestWriteSubmit, e))?;
         let sealed = pools.encoder_mut().seal_entry(Vec::new(), Vec::new());
         pools.finish_entry_async(sealed, timeline, None);
     }
@@ -5896,7 +5905,7 @@ fn target_readback_ops() -> ReadbackOps {
         reset_cb: VkOp::ReadbackResetCb,
         begin_cb: VkOp::ReadbackBeginCb,
         end_cb: VkOp::ReadbackEndCb,
-        submit: VkOp::ReadbackSubmit,
+        submit: DeviceLostOp::ReadbackSubmit,
         map: VkOp::ReadbackMap,
         invalidate: VkOp::ReadbackInvalidate,
     }

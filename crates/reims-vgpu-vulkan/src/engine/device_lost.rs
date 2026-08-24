@@ -19,6 +19,9 @@ use super::vk_call::VkOp;
 pub enum DeviceLostOp {
     DrawSubmit,
     ComputeSubmit,
+    ReadbackSubmit,
+    GuestWriteSubmit,
+    ResidentCopySubmit,
     PoolsWaitFencesRetire,
     PoolsFenceStatusBeginEntry,
     PoolsWaitFencesEntry,
@@ -33,6 +36,9 @@ impl DeviceLostOp {
         match self {
             Self::DrawSubmit => VkOp::ExecSubmit,
             Self::ComputeSubmit => VkOp::ComputeExecSubmit,
+            Self::ReadbackSubmit => VkOp::ReadbackSubmit,
+            Self::GuestWriteSubmit => VkOp::GuestWriteSubmit,
+            Self::ResidentCopySubmit => VkOp::ResidentCopySubmit,
             Self::PoolsWaitFencesRetire => VkOp::PoolsWaitFencesRetire,
             Self::PoolsFenceStatusBeginEntry => VkOp::PoolsFenceStatusBeginEntry,
             Self::PoolsWaitFencesEntry => VkOp::PoolsWaitFencesEntry,
@@ -124,6 +130,18 @@ impl Decline for DeviceLostDecline {
                 ..
             } => "vk_device_lost_compute_exec_submit",
             Self::Driver {
+                op: DeviceLostOp::ReadbackSubmit,
+                ..
+            } => "vk_device_lost_readback_submit",
+            Self::Driver {
+                op: DeviceLostOp::GuestWriteSubmit,
+                ..
+            } => "vk_device_lost_guest_write_submit",
+            Self::Driver {
+                op: DeviceLostOp::ResidentCopySubmit,
+                ..
+            } => "vk_device_lost_resident_copy_submit",
+            Self::Driver {
                 op: DeviceLostOp::PoolsWaitFencesRetire,
                 ..
             } => "vk_device_lost_pools_wait_fences_retire",
@@ -181,6 +199,18 @@ mod tests {
             },
             DeviceLostDecline::Driver {
                 op: DeviceLostOp::ComputeSubmit,
+                result: vk::Result::ERROR_DEVICE_LOST,
+            },
+            DeviceLostDecline::Driver {
+                op: DeviceLostOp::ReadbackSubmit,
+                result: vk::Result::ERROR_DEVICE_LOST,
+            },
+            DeviceLostDecline::Driver {
+                op: DeviceLostOp::GuestWriteSubmit,
+                result: vk::Result::ERROR_DEVICE_LOST,
+            },
+            DeviceLostDecline::Driver {
+                op: DeviceLostOp::ResidentCopySubmit,
                 result: vk::Result::ERROR_DEVICE_LOST,
             },
             DeviceLostDecline::Driver {
