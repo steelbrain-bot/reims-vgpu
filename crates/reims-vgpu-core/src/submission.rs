@@ -473,6 +473,20 @@ impl SubmissionTracker {
         });
     }
 
+    /// Reinstall an already-owned immutable envelope while its parked EXEC is
+    /// being resolved.
+    ///
+    /// Admission owns the context between these short active intervals. This
+    /// keeps the decoder cursor single-owner without requiring a conflicting
+    /// submission to occupy it while waiting for an older recorder.
+    pub fn resume(&mut self, context: SubmissionContext) {
+        assert!(
+            self.active.is_none(),
+            "a submission cannot resume while another remains active"
+        );
+        self.active = Some(context);
+    }
+
     /// Select the active submission segment, when this operation belongs to an
     /// EXEC envelope. Direct tools and focused walkers intentionally have no
     /// active submission and continue to use standalone executor context.
@@ -841,5 +855,10 @@ mod tests {
         assert_eq!(finished.identity, first);
         assert!(tracker.finish().is_none());
         assert_eq!(tracker.context_or_standalone(99).identity.id.get(), 0);
+
+        tracker.resume(finished.clone());
+        assert_eq!(tracker.context_or_standalone(99), finished);
+        assert_eq!(tracker.finish(), Some(finished));
+        assert!(tracker.finish().is_none());
     }
 }

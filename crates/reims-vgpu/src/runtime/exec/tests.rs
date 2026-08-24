@@ -43,7 +43,11 @@ fn an_async_exec_commits_only_after_its_worker_result_reaches_the_drain_owner() 
             .accept(
                 context.clone(),
                 PreparedExecWork {
+                    task_id: 1,
                     streams: Vec::new(),
+                    result: ExecResult::default(),
+                    started: std::time::Instant::now(),
+                    measured_ns: 0,
                 },
             )
             .unwrap(),
@@ -92,6 +96,130 @@ fn an_async_exec_commits_only_after_its_worker_result_reaches_the_drain_owner() 
     assert!(completed.result.draws_fail > 0);
     assert!(state.pending_execs.is_empty());
     assert_eq!(state.submissions_scheduled.lock().unwrap().commit_len(), 0);
+}
+
+#[test]
+fn a_conflicting_exec_parks_its_owned_streams_without_quiescing_the_recorder() {
+    use crate::model::TaskResource;
+    use crate::runtime::decode::fifo::CHILD_EXEC_RESOURCE_OBJECT_ID;
+    use crate::runtime::decode::resource::ListObjectEntry;
+    use reims_vgpu_protocol::{ObjectKind, ResourceValidity, SubmissionResourceUse};
+
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    state.define_task(3, 0x1_0000, 2);
+    let resource = state.task_objects.resources.register(
+        3,
+        9,
+        Arc::new(TaskResource::new(
+            ListObjectEntry::new(ObjectKind::Buffer, 0, 0),
+            Arc::from([]),
+        )),
+    );
+    let resource_id = resource.semantic_id().unwrap();
+    let first_identity = state.submissions.next_identity(TaskId::new(3));
+    let first_resolved = state.task_objects.resources.begin_submission(
+        3,
+        first_identity.id,
+        [ObjectTableRef::new(9)],
+    );
+    let (first_object, first_resource, first_content) = first_resolved[0];
+    assert_eq!(first_resource, Some(resource_id));
+    let first_context = reims_vgpu_core::SubmissionContext {
+        identity: first_identity,
+        resources: vec![SubmissionResourceUse {
+            object: first_object,
+            resource: first_resource,
+            expected_content: first_content,
+            validity: ResourceValidity::default(),
+        }]
+        .into(),
+        segments: Arc::from([]),
+        segment: None,
+    };
+    assert!(matches!(
+        state
+            .submissions_scheduled
+            .lock()
+            .unwrap()
+            .accept(
+                first_context.clone(),
+                PreparedExecWork {
+                    task_id: 3,
+                    streams: Vec::new(),
+                    result: ExecResult::default(),
+                    started: std::time::Instant::now(),
+                    measured_ns: 0,
+                },
+            )
+            .unwrap(),
+        reims_vgpu_core::SubmissionDispatch::Record(_)
+    ));
+    state.pending_execs.insert(
+        first_identity,
+        PendingExecState {
+            context: first_context,
+            result: ExecResult {
+                task_id: 3,
+                pending_submission: Some(first_identity),
+                ..Default::default()
+            },
+            started: std::time::Instant::now(),
+            measured_ns: 0,
+            fallback: SurfaceRecordingFallback {
+                task_id: 3,
+                acc: StreamAccum::default(),
+                visibility_counts: Default::default(),
+                saw_backend_unavailable: false,
+            },
+        },
+    );
+    let rendezvous = Arc::new(std::sync::Barrier::new(2));
+    let worker_rendezvous = Arc::clone(&rendezvous);
+    state
+        .surface_recording_workers
+        .dispatch(
+            first_identity,
+            (),
+            host.worker_wake(),
+            move |_| -> Result<
+                RecordedSurfaceTransaction,
+                crate::runtime::executor::ExecutorDiagnostic,
+            > {
+                worker_rendezvous.wait();
+                panic!("synthetic terminal recorder")
+            },
+        )
+        .unwrap();
+
+    let mut payload = vec![
+        0u8;
+        CHILD_EXEC_INDIRECT_HEADER_LEN as usize
+            + CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize
+            + CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as usize
+    ];
+    st32(&mut payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..], 3);
+    st32(
+        &mut payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..],
+        1,
+    );
+    st32(&mut payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..], 1);
+    st32(
+        &mut payload
+            [CHILD_EXEC_INDIRECT_HEADER_LEN as usize + CHILD_EXEC_RESOURCE_OBJECT_ID as usize..],
+        9,
+    );
+
+    let accepted = process_exec_indirect2(&mut state, &mut host, &payload);
+    assert!(accepted.pending_submission.is_some());
+    assert_eq!(state.submissions_scheduled.lock().unwrap().waiting_len(), 1);
+    assert_eq!(state.submissions_scheduled.lock().unwrap().active_len(), 1);
+
+    rendezvous.wait();
+    collect_exec_recordings(&mut state, &mut host, true);
+    assert_eq!(state.submissions_scheduled.lock().unwrap().waiting_len(), 0);
+    assert_eq!(state.submissions_scheduled.lock().unwrap().active_len(), 0);
+    assert_eq!(state.completed_execs.len(), 2);
 }
 
 #[test]
@@ -340,6 +468,12 @@ fn an_exec_packet_closes_its_exact_backend_submission() {
 
     let result = process_exec_indirect2(&mut state, &mut host, &payload);
     assert_eq!(result.task_id, 3);
+    assert!(result.pending_submission.is_some());
+    let completed = state
+        .completed_execs
+        .pop_front()
+        .expect("CPU-only EXEC completion uses the ordered result inbox");
+    assert_eq!(completed.result.draws_fail, 0);
     let closed = probe.closed.lock().unwrap();
     assert_eq!(closed.len(), 1, "one packet has one close boundary");
     assert_eq!(closed[0].task.get(), 3);
@@ -386,7 +520,13 @@ fn an_exec_packet_closes_its_exact_backend_submission() {
         9,
     );
 
-    let result = process_exec_indirect2(&mut state, &mut host, &payload);
+    let accepted = process_exec_indirect2(&mut state, &mut host, &payload);
+    assert!(accepted.pending_submission.is_some());
+    let result = state
+        .completed_execs
+        .pop_front()
+        .expect("close failure is returned through ordered completion")
+        .result;
     assert_eq!(result.draws_fail, 1);
     let failed = probe.closed.lock().unwrap()[1];
     assert!(

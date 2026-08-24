@@ -4841,6 +4841,13 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                         },
                     );
                     debug_assert!(displaced.is_none());
+                    // A CPU-only EXEC can finish after admission but before its
+                    // FIFO publication owner is installed. Its semantic result
+                    // is already ordered in `completed_execs`; discharge it now
+                    // rather than depending on an unrelated future doorbell.
+                    if !state.completed_execs.is_empty() {
+                        publish_completed_execs(state, host);
+                    }
                 } else if coalesce {
                     // Deliberately untimed: the cost this span was measuring is
                     // the submit, and folding a value into a latch is not one.

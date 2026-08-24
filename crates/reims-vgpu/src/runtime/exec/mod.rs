@@ -853,6 +853,13 @@ pub(crate) struct PendingExecState {
     fallback: SurfaceRecordingFallback,
 }
 
+pub(crate) struct SynchronousExecCommit {
+    context: reims_vgpu_core::SubmissionContext,
+    result: ExecResult,
+    started: std::time::Instant,
+    measured_ns: u64,
+}
+
 /// Loaded command payload owned by one scheduler admission.
 ///
 /// These stream bytes no longer depend on their mutable guest command-buffer
@@ -863,12 +870,16 @@ pub(crate) struct PendingExecState {
 /// predecessor finishes.
 #[derive(Debug)]
 pub(crate) struct PreparedExecWork {
+    task_id: u32,
     streams: Vec<Vec<u8>>,
+    result: ExecResult,
+    started: std::time::Instant,
+    measured_ns: u64,
 }
 
 pub(crate) enum RecordedExecCommit {
     Async(Box<AsyncExecCommit>),
-    Synchronous(reims_vgpu_core::SubmissionContext),
+    Synchronous(Box<SynchronousExecCommit>),
 }
 
 pub(crate) struct AsyncExecCommit {
@@ -883,7 +894,10 @@ impl std::fmt::Debug for RecordedExecCommit {
                 .debug_tuple("Async")
                 .field(&commit.pending.context.identity)
                 .finish(),
-            Self::Synchronous(context) => f.debug_tuple("Synchronous").field(context).finish(),
+            Self::Synchronous(commit) => f
+                .debug_tuple("Synchronous")
+                .field(&commit.context.identity)
+                .finish(),
         }
     }
 }
@@ -1100,38 +1114,11 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         )
         .collect::<Vec<_>>()
         .into();
-    state.submissions.begin(
-        submission_identity,
-        Arc::clone(&submission_resources),
-        Arc::clone(&submission_segments),
-    );
     let submission_context = reims_vgpu_core::SubmissionContext {
         identity: submission_identity,
         resources: submission_resources,
         segments: submission_segments,
         segment: None,
-    };
-    let dispatch = state
-        .submissions_scheduled
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .accept(submission_context.clone(), PreparedExecWork { streams })
-        .expect("fresh packet identities reserve one scheduler position");
-    let prepared = match dispatch {
-        reims_vgpu_core::SubmissionDispatch::Record(work) => work.work,
-        reims_vgpu_core::SubmissionDispatch::Queued { identity, .. } => {
-            let mut admitted = collect_exec_recordings(state, host, true);
-            let position = admitted
-                .iter()
-                .position(|work| work.context.identity == identity)
-                .expect("a declared conflict becomes recordable when active recorders quiesce");
-            let prepared = admitted.swap_remove(position).work;
-            assert!(
-                admitted.is_empty(),
-                "the serial packet walker cannot leave another prepared EXEC without an owner"
-            );
-            prepared
-        }
     };
     crate::runtime::drain::note_open_part(
         crate::runtime::drain::OpenPart::Use,
@@ -1142,11 +1129,60 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     measured_ns += open_ns;
     crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Open, open_ns);
 
+    out.pending_submission = Some(submission_identity);
+    let exposed = out.clone();
+    let dispatch = state
+        .submissions_scheduled
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .accept(
+            submission_context,
+            PreparedExecWork {
+                task_id,
+                streams,
+                result: out,
+                started: exec_started,
+                measured_ns,
+            },
+        )
+        .expect("fresh packet identities reserve one scheduler position");
+    match dispatch {
+        reims_vgpu_core::SubmissionDispatch::Record(work) => {
+            let (result, newly_recordable) = execute_prepared_exec(state, host, work);
+            debug_assert!(newly_recordable.is_empty());
+            commit_ready_execs(state, host);
+            result
+        }
+        reims_vgpu_core::SubmissionDispatch::Queued { .. } => exposed,
+    }
+}
+
+fn execute_prepared_exec<M: HostMemory + HostOps>(
+    state: &mut Device,
+    host: &mut M,
+    work: reims_vgpu_core::SubmissionWork<PreparedExecWork>,
+) -> (
+    ExecResult,
+    Vec<reims_vgpu_core::SubmissionWork<PreparedExecWork>>,
+) {
+    let reims_vgpu_core::SubmissionWork {
+        context,
+        work:
+            PreparedExecWork {
+                task_id,
+                streams,
+                mut result,
+                started,
+                mut measured_ns,
+            },
+    } = work;
+    state.submissions.resume(context.clone());
+
     let mut encoders = EncoderWalkState {
-        terminal_boundary: submission_context.segments.last().copied(),
+        terminal_boundary: context.segments.last().copied(),
         ..Default::default()
     };
-    for (stream_index, stream) in (0u32..).zip(prepared.streams) {
+    for (stream_index, stream) in (0u32..).zip(streams) {
         let walk_started = std::time::Instant::now();
         let finish_ns = walk_submitted_stream(
             state,
@@ -1154,7 +1190,7 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
             task_id,
             stream_index,
             &stream,
-            &mut out,
+            &mut result,
             &mut encoders,
         );
         let walk_ns = (walk_started.elapsed().as_nanos() as u64).saturating_sub(finish_ns);
@@ -1175,10 +1211,11 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     }
     let close_started = std::time::Instant::now();
     if let Some(transaction) = encoders.pending_surface {
-        let context = state
+        let finished_context = state
             .submissions
             .finish()
             .expect("the terminal transaction closes its EXEC envelope");
+        debug_assert_eq!(finished_context.identity, context.identity);
         let identity = context.identity;
         let fallback = SurfaceRecordingFallback {
             task_id: transaction.completion.core.task_id,
@@ -1186,13 +1223,12 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
             visibility_counts: transaction.completion.visibility_counts.clone(),
             saw_backend_unavailable: transaction.completion.saw_backend_unavailable,
         };
-        out.pending_submission = Some(identity);
         let displaced = state.pending_execs.insert(
             identity,
             PendingExecState {
                 context,
-                result: out.clone(),
-                started: exec_started,
+                result: result.clone(),
+                started,
                 measured_ns,
                 fallback,
             },
@@ -1208,56 +1244,31 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
                 move |transaction| transaction.record(executor.as_ref()),
             )
             .expect("one EXEC owns one terminal recording worker");
-        return out;
+        return (result, Vec::new());
     }
-    // A non-recording terminal path is an ordered EXEC barrier. Retire older
-    // detached recorders before publishing this packet's synchronous result;
-    // adjacent render EXECs remain free to overlap above.
-    let _ = collect_exec_recordings(state, host, true);
-    if let Some(context) = state.submissions.finish() {
-        let newly_recordable = state
-            .submissions_scheduled
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .record(context.identity, RecordedExecCommit::Synchronous(context))
-            .expect("the active packet owns its reserved commit position");
-        assert!(
-            newly_recordable.is_empty(),
-            "the serial packet walker cannot have a queued conflicting EXEC"
-        );
-        loop {
-            let ready = state
-                .submissions_scheduled
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take_ready();
-            let Some((identity, commit)) = ready else {
-                break;
-            };
-            let RecordedExecCommit::Synchronous(context) = commit else {
-                unreachable!("an asynchronous predecessor is committed by its worker wake")
-            };
-            match state.executor.close_submission(identity) {
-                Ok(()) => state.task_objects.resources.complete_submission(
-                    identity.id,
-                    context.resources.iter().filter_map(|use_| use_.resource),
-                ),
-                Err(error) => {
-                    out.draws_fail = out.draws_fail.saturating_add(1);
-                    crate::observe::Emit::decline("submission_close", &error)
-                        .field("submission", identity.id.get())
-                        .field("task", identity.task.get())
-                        .fail();
-                }
-            }
-        }
-    }
+    let finished_context = state
+        .submissions
+        .finish()
+        .expect("the synchronous path closes its EXEC envelope");
+    debug_assert_eq!(finished_context.identity, context.identity);
     let close_ns = close_started.elapsed().as_nanos() as u64;
     measured_ns += close_ns;
     crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Close, close_ns);
-    note_exec_header(exec_started, measured_ns);
-    out.total_us = elapsed_us(exec_started);
-    out
+    let newly_recordable = state
+        .submissions_scheduled
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .record(
+            context.identity,
+            RecordedExecCommit::Synchronous(Box::new(SynchronousExecCommit {
+                context,
+                result: result.clone(),
+                started,
+                measured_ns,
+            })),
+        )
+        .expect("the resolving packet owns its recording admission");
+    (result, newly_recordable)
 }
 
 /// Close the [`ExecPhase`] tiling of `process_exec_indirect2` at one of its
@@ -5002,20 +5013,20 @@ fn finish_recording_refusal<M: HostMemory + HostOps>(
     );
 }
 
-/// Retire published worker results and apply every guest-order commit now at
-/// the head. `wait` is used only by a declared resource conflict and teardown;
-/// ordinary drain polling never waits for an unrelated recorder.
+/// Retire published worker results, resume newly unblocked EXEC resolution,
+/// and apply every guest-order commit now at the head. `wait` is reserved for
+/// teardown; packet admission never quiesces an unrelated recorder.
 pub(crate) fn collect_exec_recordings<M: HostMemory + HostOps>(
     state: &mut Device,
     host: &mut M,
     wait: bool,
-) -> Vec<reims_vgpu_core::SubmissionWork<PreparedExecWork>> {
+) {
     let worker_results = if wait {
         state.surface_recording_workers.quiesce()
     } else {
         state.surface_recording_workers.take_finished()
     };
-    let mut newly_recordable = Vec::new();
+    let mut newly_recordable = std::collections::VecDeque::new();
     for worker in worker_results {
         let pending = state
             .pending_execs
@@ -5039,6 +5050,18 @@ pub(crate) fn collect_exec_recordings<M: HostMemory + HostOps>(
         newly_recordable.extend(work);
     }
 
+    commit_ready_execs(state, host);
+    while let Some(work) = newly_recordable.pop_front() {
+        let (_, admitted) = execute_prepared_exec(state, host, work);
+        newly_recordable.extend(admitted);
+        // A synchronous continuation can both complete its own commit and
+        // release another conflicting waiter. Commit first: that waiter's
+        // resource versions are defined by this ordered predecessor.
+        commit_ready_execs(state, host);
+    }
+}
+
+fn commit_ready_execs<M: HostMemory + HostOps>(state: &mut Device, host: &mut M) {
     loop {
         let ready = state
             .submissions_scheduled
@@ -5048,31 +5071,47 @@ pub(crate) fn collect_exec_recordings<M: HostMemory + HostOps>(
         let Some((identity, commit)) = ready else {
             break;
         };
-        let RecordedExecCommit::Async(commit) = commit else {
-            unreachable!("synchronous commits are consumed by their packet owner")
-        };
-        let AsyncExecCommit {
-            mut pending,
-            recording,
-        } = *commit;
-        match recording {
-            Ok(recorded) => recorded.complete(state, host, &mut pending.result),
-            Err(ref error) => {
-                finish_recording_refusal(state, host, &mut pending.result, &pending.fallback, error)
+        let (context, mut result, started, mut measured_ns) = match commit {
+            RecordedExecCommit::Async(commit) => {
+                let AsyncExecCommit {
+                    mut pending,
+                    recording,
+                } = *commit;
+                match recording {
+                    Ok(recorded) => recorded.complete(state, host, &mut pending.result),
+                    Err(ref error) => finish_recording_refusal(
+                        state,
+                        host,
+                        &mut pending.result,
+                        &pending.fallback,
+                        error,
+                    ),
+                }
+                (
+                    pending.context,
+                    pending.result,
+                    pending.started,
+                    pending.measured_ns,
+                )
             }
-        }
+            RecordedExecCommit::Synchronous(commit) => {
+                let SynchronousExecCommit {
+                    context,
+                    result,
+                    started,
+                    measured_ns,
+                } = *commit;
+                (context, result, started, measured_ns)
+            }
+        };
         let close_started = std::time::Instant::now();
         match state.executor.close_submission(identity) {
             Ok(()) => state.task_objects.resources.complete_submission(
                 identity.id,
-                pending
-                    .context
-                    .resources
-                    .iter()
-                    .filter_map(|use_| use_.resource),
+                context.resources.iter().filter_map(|use_| use_.resource),
             ),
             Err(error) => {
-                pending.result.draws_fail = pending.result.draws_fail.saturating_add(1);
+                result.draws_fail = result.draws_fail.saturating_add(1);
                 crate::observe::Emit::decline("submission_close", &error)
                     .field("submission", identity.id.get())
                     .field("task", identity.task.get())
@@ -5080,17 +5119,15 @@ pub(crate) fn collect_exec_recordings<M: HostMemory + HostOps>(
             }
         }
         let close_ns = close_started.elapsed().as_nanos() as u64;
-        pending.measured_ns = pending.measured_ns.saturating_add(close_ns);
+        measured_ns = measured_ns.saturating_add(close_ns);
         crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Close, close_ns);
-        note_exec_header(pending.started, pending.measured_ns);
-        pending.result.total_us = elapsed_us(pending.started);
-        pending.result.pending_submission = None;
-        state.completed_execs.push_back(CompletedExec {
-            identity,
-            result: pending.result,
-        });
+        note_exec_header(started, measured_ns);
+        result.total_us = elapsed_us(started);
+        result.pending_submission = None;
+        state
+            .completed_execs
+            .push_back(CompletedExec { identity, result });
     }
-    newly_recordable
 }
 
 fn complete_terminal_surface_transaction<M: HostMemory + HostOps>(
