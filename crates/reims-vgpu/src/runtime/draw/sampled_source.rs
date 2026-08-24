@@ -3383,7 +3383,7 @@ pub(super) fn load_index_content_reason<M: HostMemory + HostOps>(
 /// order the registry keys a resident on — and because two callers assembling
 /// the same five by hand is how they come to disagree about one of them.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct GvaSpan {
+pub(crate) struct GvaSpan {
     pub texture_ref: u32,
     pub gva: u64,
     pub row_stride: u32,

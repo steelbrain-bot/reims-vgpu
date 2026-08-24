@@ -4624,11 +4624,10 @@ fn land_prepared_resident_prefix<M: HostMemory + HostOps>(
     task_id: u32,
     acc: &StreamAccum,
     chain_rgba: &mut Option<Vec<u8>>,
-    records: &[PreparedResidentRecord],
+    record: Option<&PreparedResidentRecord>,
     resident_identity: Option<&crate::model::TargetIdentity>,
-    failed_index: usize,
 ) {
-    let Some(record) = records.get(failed_index).or_else(|| records.last()) else {
+    let Some(record) = record else {
         return;
     };
     land_chain_before_abandon(
@@ -4698,9 +4697,8 @@ fn flush_prepared_surface_transaction<M: HostMemory + HostOps>(
                 task_id,
                 acc,
                 chain_rgba,
-                records,
+                records.get(failed_index).or_else(|| records.last()),
                 identity.as_ref(),
-                failed_index,
             );
             return Err(());
         }
@@ -4759,9 +4757,11 @@ fn flush_prepared_surface_transaction<M: HostMemory + HostOps>(
                 final_req,
                 submission,
                 identity,
-                guest_store_pages,
-                guest_store_window,
-                visibility_samples,
+                draw::SurfaceStorePublication {
+                    guest_store_pages,
+                    guest_store_window,
+                    visibility_samples,
+                },
             );
             crate::runtime::chain_phase::note_detached(
                 crate::runtime::chain_phase::Phase::Store,
@@ -5077,9 +5077,10 @@ fn finish_stream<M: HostMemory + HostOps>(
                                         task_id,
                                         acc,
                                         &mut chain_rgba,
-                                        &prepared_resident_records,
+                                        prepared_resident_records
+                                            .get(failed_index)
+                                            .or_else(|| prepared_resident_records.last()),
                                         identity.as_ref(),
-                                        failed_index,
                                     );
                                     break;
                                 }
@@ -5156,9 +5157,10 @@ fn finish_stream<M: HostMemory + HostOps>(
                                         task_id,
                                         acc,
                                         &mut chain_rgba,
-                                        &prepared_resident_records,
+                                        prepared_resident_records
+                                            .get(failed_index)
+                                            .or_else(|| prepared_resident_records.last()),
                                         identity.as_ref(),
-                                        failed_index,
                                     );
                                     break;
                                 }
@@ -5243,9 +5245,10 @@ fn finish_stream<M: HostMemory + HostOps>(
                                 task_id,
                                 acc,
                                 &mut chain_rgba,
-                                &prepared_resident_records,
+                                prepared_resident_records
+                                    .get(failed_index)
+                                    .or_else(|| prepared_resident_records.last()),
                                 identity.as_ref(),
-                                failed_index,
                             );
                             break;
                         }

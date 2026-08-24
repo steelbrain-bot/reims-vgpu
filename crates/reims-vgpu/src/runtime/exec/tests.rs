@@ -76,8 +76,10 @@ fn a_malformed_compute_barrier_blocks_the_later_dispatch() {
         &mut seg,
     );
 
-    let mut dispatch = crate::runtime::decode::compute::Command::default();
-    dispatch.kind = ComputeKind::DispatchThreadgroups;
+    let dispatch = crate::runtime::decode::compute::Command {
+        kind: ComputeKind::DispatchThreadgroups,
+        ..Default::default()
+    };
     assert_eq!(
         compute_exec::apply_record(&mut state, &mut host, 1, &dispatch, &mut seg),
         Some(ComputeStatus::Unsupported(

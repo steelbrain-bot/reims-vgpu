@@ -3798,7 +3798,7 @@ fn a_whole_plane_copy_names_an_iosurface_source_by_its_surface_identity() {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .as_slice(),
-                &[expected_destination.clone()],
+                std::slice::from_ref(&expected_destination),
                 "canonical guest pages must be materialized from the destination resident"
             );
             assert_eq!(probe.copied_out.load(Ordering::Acquire), 1);

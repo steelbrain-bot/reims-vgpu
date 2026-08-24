@@ -196,10 +196,9 @@ pub(super) struct PreparedDrawSubmission {
     draws: PreparedDraws,
 }
 
-enum PreparedDraws {
-    Empty,
-    One(PreparedDraw),
-    Many(Vec<PreparedDraw>),
+struct PreparedDraws {
+    first: Option<PreparedDraw>,
+    rest: Vec<PreparedDraw>,
 }
 
 pub(super) struct PreparedDrawProgress {
@@ -211,41 +210,40 @@ impl PreparedDrawSubmission {
     pub fn new(context: reims_vgpu_core::SubmissionContext) -> Self {
         Self {
             context,
-            draws: PreparedDraws::Empty,
+            draws: PreparedDraws {
+                first: None,
+                rest: Vec::new(),
+            },
         }
     }
 
     pub fn push(&mut self, draw: PreparedDraw) {
-        self.draws = match std::mem::replace(&mut self.draws, PreparedDraws::Empty) {
-            PreparedDraws::Empty => PreparedDraws::One(draw),
-            PreparedDraws::One(first) => PreparedDraws::Many(vec![first, draw]),
-            PreparedDraws::Many(mut draws) => {
-                draws.push(draw);
-                PreparedDraws::Many(draws)
-            }
-        };
+        if self.draws.first.is_none() {
+            self.draws.first = Some(draw);
+        } else {
+            self.draws.rest.push(draw);
+        }
     }
 
     pub fn execute(self, state: &mut Device) -> Result<PreparedDrawProgress, ExecutorDiagnostic> {
-        let draws = match self.draws {
-            PreparedDraws::Empty => {
-                return Ok(PreparedDrawProgress {
-                    completed: Vec::new(),
-                    failure: None,
-                });
-            }
-            PreparedDraws::One(draw) => {
-                let completed = draw.execute_direct(state, self.context)?;
-                return Ok(PreparedDrawProgress {
-                    completed: vec![completed],
-                    failure: None,
-                });
-            }
-            PreparedDraws::Many(draws) => draws,
+        let Some(first) = self.draws.first else {
+            return Ok(PreparedDrawProgress {
+                completed: Vec::new(),
+                failure: None,
+            });
         };
+        if self.draws.rest.is_empty() {
+            let completed = first.execute_direct(state, self.context)?;
+            return Ok(PreparedDrawProgress {
+                completed: vec![completed],
+                failure: None,
+            });
+        }
+        let draws = std::iter::once(first).chain(self.draws.rest);
         let executor = std::sync::Arc::clone(&state.executor);
-        let mut requests = Vec::with_capacity(draws.len());
-        let mut completion_plans = Vec::with_capacity(draws.len());
+        let (minimum, _) = draws.size_hint();
+        let mut requests = Vec::with_capacity(minimum);
+        let mut completion_plans = Vec::with_capacity(minimum);
         for draw in draws {
             let (request, completion) = draw.into_executor_parts();
             requests.push(request);

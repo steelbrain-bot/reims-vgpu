@@ -3158,12 +3158,14 @@ fn stage_linear_placement<M: HostMemory + HostOps>(
                 state,
                 host,
                 task_id,
-                texture_ref,
-                gva,
-                row_stride,
-                w,
-                h,
-                declared_format,
+                crate::runtime::draw::GvaSpan {
+                    texture_ref,
+                    gva,
+                    row_stride,
+                    width: w,
+                    height: h,
+                    format: declared_format,
+                },
             )
         })
     } else {

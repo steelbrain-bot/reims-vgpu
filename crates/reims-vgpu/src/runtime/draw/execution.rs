@@ -405,9 +405,11 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     req,
                     submission,
                     identity,
-                    guest_store_pages,
-                    guest_store_window,
-                    samples,
+                    SurfaceStorePublication {
+                        guest_store_pages,
+                        guest_store_window,
+                        visibility_samples: samples,
+                    },
                 )
             }
             Ok(M2vDrawSpan::None) => {
@@ -881,16 +883,25 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     }
 }
 
+pub(crate) struct SurfaceStorePublication {
+    pub guest_store_pages: Option<reims_vgpu_memory::GuestWritePages>,
+    pub guest_store_window: Option<std::ops::Range<u64>>,
+    pub visibility_samples: Option<u64>,
+}
+
 pub(crate) fn complete_surface_store<M: HostMemory + HostOps>(
     state: &mut Device,
     host: &mut M,
     req: &DrawEncodeRequest,
     submission: reims_vgpu_protocol::SubmissionId,
     identity: crate::model::TargetIdentity,
-    guest_store_pages: Option<reims_vgpu_memory::GuestWritePages>,
-    guest_store_window: Option<std::ops::Range<u64>>,
-    visibility_samples: Option<u64>,
+    publication: SurfaceStorePublication,
 ) -> DrawChainResult {
+    let SurfaceStorePublication {
+        guest_store_pages,
+        guest_store_window,
+        visibility_samples,
+    } = publication;
     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Store);
     let _store_span = StoreCostSpan::new("iosurface_store_us");
     let Some(c0) = req.colors.first() else {
