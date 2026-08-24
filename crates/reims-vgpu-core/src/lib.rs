@@ -130,7 +130,10 @@ pub use service::{
 };
 pub use shader_interface::*;
 pub use stamp::{CompletionPublications, PendingStamp, StampLedger, StampWait, UnmetSource};
-pub use submission::{SubmissionContext, SubmissionTracker};
+pub use submission::{
+    SubmissionAdmissionRefusal, SubmissionAdmissions, SubmissionConflict, SubmissionContext,
+    SubmissionFootprint, SubmissionTracker,
+};
 pub use synchronization::{
     plan_event, plan_fence, BarrierResource, Decision as SynchronizationDecision,
     Domain as SynchronizationDomain, EventKind, FenceAction, FenceSignal, MemoryBarrierScope,
