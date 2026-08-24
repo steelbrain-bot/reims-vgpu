@@ -1627,16 +1627,62 @@ impl ExecutionPort for VulkanExecutor {
     }
 }
 
-/// Execute a draw and enforce that the executor returns the matching completion.
-pub fn execute_draw(
+/// Expected operation kinds retained while the owned command buffer is inside
+/// the executor.
+///
+/// The current draw and compute adapters submit one command at a time. Keeping
+/// that case inline avoids adding a heap allocation to every draw merely to
+/// establish the whole-buffer transaction seam. A real multi-command EXEC
+/// allocates exactly its declared command count once at the packet boundary.
+enum ExpectedCommandKinds {
+    One(reims_vgpu_core::ExecutionKind),
+    Many(Vec<reims_vgpu_core::ExecutionKind>),
+}
+
+impl ExpectedCommandKinds {
+    fn capture(
+        command_buffer: &ResolvedCommandBuffer<Box<DrawRequest>, Box<ComputeRequest>>,
+    ) -> Self {
+        match command_buffer.commands() {
+            [command] => Self::One(command.kind()),
+            commands => Self::Many(commands.iter().map(ResolvedCommand::kind).collect()),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::One(_) => 1,
+            Self::Many(kinds) => kinds.len(),
+        }
+    }
+
+    fn get(&self, index: usize) -> Option<reims_vgpu_core::ExecutionKind> {
+        match self {
+            Self::One(kind) => (index == 0).then_some(*kind),
+            Self::Many(kinds) => kinds.get(index).copied(),
+        }
+    }
+}
+
+/// Execute one complete immutable command buffer and validate its ordered
+/// completion transaction before any semantic completion plan can consume it.
+///
+/// The command kinds are captured before ownership crosses the executor port.
+/// A backend therefore cannot silently omit, insert, or reorder heterogeneous
+/// operations while still returning the submission's outer identity. This is
+/// the composition boundary for a whole decoded EXEC; the single-operation
+/// adapters below deliberately use the same path.
+pub fn execute_command_buffer(
     executor: &dyn Executor,
     context: SubmissionContext,
-    request: DrawRequest,
-) -> Result<ExecutionReceipt<DrawOutput>, DrawError> {
+    command_buffer: ResolvedCommandBuffer<Box<DrawRequest>, Box<ComputeRequest>>,
+) -> Result<ExecutionCompletion, DrawError> {
     let expected_identity = context.identity;
-    let expected_kind = reims_vgpu_core::ExecutionKind::Draw.as_str();
-    let expected = ResolvedSubmission::single(context, ResolvedCommand::Draw(Box::new(request)));
-    let completion = executor.execute(expected)?;
+    let expected_kinds = ExpectedCommandKinds::capture(&command_buffer);
+    let completion = executor.execute(ResolvedSubmission {
+        context,
+        command_buffer,
+    })?;
     if completion.submission != expected_identity {
         return Err(DrawError::Facade(
             EngineFacadeDecline::ExecutorCompletionIdentityMismatch {
@@ -1645,15 +1691,39 @@ pub fn execute_draw(
             },
         ));
     }
-    let mut outputs = completion.output.into_vec();
-    if outputs.len() != 1 {
+    if completion.output.len() != expected_kinds.len() {
         return Err(DrawError::Facade(
             EngineFacadeDecline::ExecutorCompletionCountMismatch {
-                expected: 1,
-                actual: outputs.len(),
+                expected: expected_kinds.len(),
+                actual: completion.output.len(),
             },
         ));
     }
+    for (index, actual) in completion.output.iter().enumerate() {
+        let expected = expected_kinds
+            .get(index)
+            .expect("completion count was checked above");
+        if expected != actual.kind() {
+            return Err(DrawError::Facade(
+                EngineFacadeDecline::ExecutorCompletionKindMismatch {
+                    expected: expected.as_str(),
+                    actual: actual.kind().as_str(),
+                },
+            ));
+        }
+    }
+    Ok(completion)
+}
+
+/// Execute a draw and enforce that the executor returns the matching completion.
+pub fn execute_draw(
+    executor: &dyn Executor,
+    context: SubmissionContext,
+    request: DrawRequest,
+) -> Result<ExecutionReceipt<DrawOutput>, DrawError> {
+    let command_buffer = ResolvedCommandBuffer::single(ResolvedCommand::Draw(Box::new(request)));
+    let completion = execute_command_buffer(executor, context, command_buffer)?;
+    let mut outputs = completion.output.into_vec();
     match outputs.pop().expect("one checked completion") {
         ExecutionOutput::Draw(output) => Ok(ExecutionReceipt {
             submission: completion.submission,
@@ -1662,7 +1732,7 @@ pub fn execute_draw(
         }),
         other => Err(DrawError::Facade(
             EngineFacadeDecline::ExecutorCompletionKindMismatch {
-                expected: expected_kind,
+                expected: reims_vgpu_core::ExecutionKind::Draw.as_str(),
                 actual: other.kind().as_str(),
             },
         )),
@@ -1675,27 +1745,9 @@ pub fn execute_compute(
     context: SubmissionContext,
     request: ComputeRequest,
 ) -> Result<ExecutionReceipt<ComputeOutput>, DrawError> {
-    let expected_identity = context.identity;
-    let expected_kind = reims_vgpu_core::ExecutionKind::Compute.as_str();
-    let expected = ResolvedSubmission::single(context, ResolvedCommand::Compute(Box::new(request)));
-    let completion = executor.execute(expected)?;
-    if completion.submission != expected_identity {
-        return Err(DrawError::Facade(
-            EngineFacadeDecline::ExecutorCompletionIdentityMismatch {
-                expected: expected_identity,
-                actual: completion.submission,
-            },
-        ));
-    }
+    let command_buffer = ResolvedCommandBuffer::single(ResolvedCommand::Compute(Box::new(request)));
+    let completion = execute_command_buffer(executor, context, command_buffer)?;
     let mut outputs = completion.output.into_vec();
-    if outputs.len() != 1 {
-        return Err(DrawError::Facade(
-            EngineFacadeDecline::ExecutorCompletionCountMismatch {
-                expected: 1,
-                actual: outputs.len(),
-            },
-        ));
-    }
     match outputs.pop().expect("one checked completion") {
         ExecutionOutput::Compute(output) => Ok(ExecutionReceipt {
             submission: completion.submission,
@@ -1704,7 +1756,7 @@ pub fn execute_compute(
         }),
         other => Err(DrawError::Facade(
             EngineFacadeDecline::ExecutorCompletionKindMismatch {
-                expected: expected_kind,
+                expected: reims_vgpu_core::ExecutionKind::Compute.as_str(),
                 actual: other.kind().as_str(),
             },
         )),
@@ -1872,6 +1924,8 @@ mod tests {
     enum ScriptedCompletion {
         Draw,
         Compute,
+        Commands,
+        ReversedCommands,
     }
 
     #[derive(Debug)]
@@ -1991,17 +2045,47 @@ mod tests {
         type Error = DrawError;
 
         fn execute(&self, submission: Self::Submission) -> Result<Self::Completion, Self::Error> {
-            let context = submission.context;
+            let ResolvedSubmission {
+                context,
+                command_buffer,
+            } = submission;
             let identity = context.identity;
             self.seen.lock().unwrap().push(context.clone());
+            let command_outputs = || {
+                command_buffer
+                    .into_commands()
+                    .into_vec()
+                    .into_iter()
+                    .map(|command| match command {
+                        ResolvedCommand::Draw(_) => ExecutionOutput::Draw(DrawOutput::default()),
+                        ResolvedCommand::Compute(_) => {
+                            ExecutionOutput::Compute(ComputeOutput::default())
+                        }
+                        ResolvedCommand::Blit(_) => {
+                            ExecutionOutput::Blit(reims_vgpu_core::BlitCompletion { written: None })
+                        }
+                        ResolvedCommand::ResourceState(update) => ExecutionOutput::ResourceState(
+                            reims_vgpu_core::ResourceStateCompletion { update },
+                        ),
+                    })
+                    .collect::<Vec<_>>()
+            };
             Ok(ExecutionCompletion {
                 submission: identity,
-                output: vec![match self.completion {
-                    ScriptedCompletion::Draw => ExecutionOutput::Draw(DrawOutput::default()),
-                    ScriptedCompletion::Compute => {
-                        ExecutionOutput::Compute(ComputeOutput::default())
+                output: match self.completion {
+                    ScriptedCompletion::Draw => {
+                        vec![ExecutionOutput::Draw(DrawOutput::default())]
                     }
-                }]
+                    ScriptedCompletion::Compute => {
+                        vec![ExecutionOutput::Compute(ComputeOutput::default())]
+                    }
+                    ScriptedCompletion::Commands => command_outputs(),
+                    ScriptedCompletion::ReversedCommands => {
+                        let mut outputs = command_outputs();
+                        outputs.reverse();
+                        outputs
+                    }
+                }
                 .into_boxed_slice(),
                 gpu_materialized: Arc::from([]),
             })
@@ -2153,6 +2237,41 @@ mod tests {
     fn executor_cannot_return_a_completion_for_another_operation_kind() {
         let scripted = ScriptedExecutor::new(ScriptedCompletion::Compute);
         let error = execute_draw(&scripted, context(), DrawRequest::default()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            DrawError::Facade(EngineFacadeDecline::ExecutorCompletionKindMismatch {
+                expected: "draw",
+                actual: "compute",
+            })
+        ));
+    }
+
+    #[test]
+    fn one_command_buffer_crosses_the_executor_and_returns_in_order() {
+        let scripted = ScriptedExecutor::new(ScriptedCompletion::Commands);
+        let command_buffer = ResolvedCommandBuffer::new(vec![
+            ResolvedCommand::Draw(Box::new(DrawRequest::default())),
+            ResolvedCommand::Compute(Box::new(ComputeRequest::default())),
+        ]);
+
+        let completion =
+            execute_command_buffer(&scripted, context(), command_buffer).expect("ordered result");
+
+        assert_eq!(scripted.seen.lock().unwrap().len(), 1);
+        assert!(matches!(completion.output[0], ExecutionOutput::Draw(_)));
+        assert!(matches!(completion.output[1], ExecutionOutput::Compute(_)));
+    }
+
+    #[test]
+    fn a_whole_submission_cannot_reorder_completion_kinds() {
+        let scripted = ScriptedExecutor::new(ScriptedCompletion::ReversedCommands);
+        let command_buffer = ResolvedCommandBuffer::new(vec![
+            ResolvedCommand::Draw(Box::new(DrawRequest::default())),
+            ResolvedCommand::Compute(Box::new(ComputeRequest::default())),
+        ]);
+
+        let error = execute_command_buffer(&scripted, context(), command_buffer).unwrap_err();
 
         assert!(matches!(
             error,
