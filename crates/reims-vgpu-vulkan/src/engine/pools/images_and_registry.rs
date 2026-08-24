@@ -3514,7 +3514,7 @@ impl ResourcePools {
     /// `vk_result=A_device_memory_allocation_has_failed`, at geometries up to
     /// 1920x1080.
     ///
-    /// # It cannot be hoisted into `bind_image_slab`, and that is measured too
+    /// # Why the retry remains at this ownership boundary
     ///
     /// Those seven look like an argument for one wrapper around
     /// `bind_image_slab`, covering every allocation site at once. **That was
@@ -3523,17 +3523,13 @@ impl ResourcePools {
     /// failure, against seven — and then the process dies, so the fix is worse
     /// than the bug.
     ///
-    /// The reasoning that said it was safe is wrong in one specific way, and it
-    /// is worth stating because it is convincing: [`ResourcePools::dispose`]
-    /// parks a retired resident in the graveyard whenever `open_slot_mask` is
-    /// non-zero, and that mask counts the *recording* batch's slot, so a resident
-    /// released mid-draw cannot be handed back to a later allocation in the same
-    /// draw. True — but it only holds once a batch is open. The sampled binds run
-    /// early in `execute_draw_inner`, before the batch exists, so the mask can be
-    /// **0** there and `dispose` destroys immediately. The caller is by then
-    /// holding raw `vk::Image`/`vk::ImageView` handles for the target it resolved
-    /// and the residents it is about to sample, and the reclaim frees them under
-    /// it.
+    /// That experiment predated the session-wide recording order. Disposal can
+    /// no longer free a handle under early sampled binding: `begin_entry`
+    /// reserves before any pool acquire, and every displaced handle waits for
+    /// that point. This closes the specific raw-handle lifetime hole; it does not
+    /// establish that every allocation caller can recover halfway through its
+    /// own construction. Moving the retry still needs a behavioral case for each
+    /// caller rather than treating the old crash's cause as proof of a new path.
     ///
     /// This site is safe for a reason that does not generalise: it runs inside
     /// `registry_ensure_attachment`, at the one point in a draw where retiring a

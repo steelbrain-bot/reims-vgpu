@@ -67,6 +67,9 @@ pub enum DrawError {
     Slab(super::slab::SlabDecline),
     /// Fence wait timed out.
     FenceTimeout,
+    /// The session-wide native-object retirement sequence exhausted its exact
+    /// identity space before a command buffer began recording.
+    RecordingSequenceExhausted,
     /// Device lost and recreate budget exhausted (or mid-draw loss).
     DeviceLost(super::device_lost::DeviceLostDecline),
 }
@@ -126,6 +129,9 @@ impl std::fmt::Display for DrawError {
             Self::VkCall(c) => write!(f, "vk_engine_vk: {c}"),
             Self::Slab(d) => write!(f, "vk_engine_slab: {d}"),
             Self::FenceTimeout => write!(f, "vk_engine_fence_timeout"),
+            Self::RecordingSequenceExhausted => {
+                write!(f, "vk_engine_recording_sequence_exhausted")
+            }
             Self::DeviceLost(d) => write!(f, "vk_engine_device_lost: {d}"),
         }
     }
@@ -146,6 +152,7 @@ impl reims_vgpu_observe::Decline for DrawError {
             Self::VkCall(c) => c.slug(),
             Self::Slab(d) => d.slug(),
             Self::FenceTimeout => "vk_engine_fence_timeout",
+            Self::RecordingSequenceExhausted => "vk_engine_recording_sequence_exhausted",
             Self::Init(d) => d.slug(),
             Self::Facade(d) => d.slug(),
             Self::DrawPreparation(d) => d.slug(),
@@ -171,6 +178,7 @@ impl reims_vgpu_observe::Decline for DrawError {
             Self::ComputeExecution(d) => d.fields(),
             Self::DeviceLost(d) => d.fields(),
             Self::FenceTimeout => Vec::new(),
+            Self::RecordingSequenceExhausted => Vec::new(),
             Self::Facade(d) => d.fields(),
             Self::DrawPreparation(d) => d.fields(),
         }

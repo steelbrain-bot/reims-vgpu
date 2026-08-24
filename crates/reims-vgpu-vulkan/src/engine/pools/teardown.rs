@@ -73,7 +73,7 @@ impl ResourcePools {
         // Every fence above was waited (or failed on a lost device, where the
         // handles die with the device anyway), so no slot can still be reading:
         // release the whole graveyard regardless of what each handle waits on.
-        self.release_graveyard(device, SlotMask::MAX);
+        self.release_all_graveyard(device);
         for list in self.encoder.staging_free.values_mut() {
             for s in list.drain(..) {
                 release_buffer_slot(device, &mut self.shared.slabs, s);

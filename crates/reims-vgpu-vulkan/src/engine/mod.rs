@@ -30,6 +30,7 @@ pub mod init_decline;
 mod linear_image_import;
 mod pools;
 mod queue_owner;
+mod retirement;
 mod scatter_shader;
 pub mod stamp_completion;
 /// The requested draw-time buffer-gather working set. Re-exported for the same
@@ -1134,10 +1135,10 @@ mod device_capability_snapshot_tests {
 ///
 /// What remains before building it is engineering rather than measurement:
 /// per-encoder instances of [`pools::EncoderPools`], `SharedPools` behind its
-/// own lock, submission kept in the guest's order at commit, and cross-ring
-/// object lifetime — `graveyard`'s `SlotMask` is per-ring today, and a shared
-/// image can be referenced by any ring, so disposal has to wait on all of them
-/// rather than on one.
+/// own lock, and submission kept in the guest's order at commit. Cross-ring
+/// object lifetime is already represented by the session-wide recording order:
+/// registry removal captures the latest point, including recording work, and
+/// destruction waits for that exact ordered prefix.
 ///
 /// One thing already ruled out, and cheaply: the window thread is **not**
 /// losing frames to this mutex. Over 47 driven seconds, `window_wait_us` is

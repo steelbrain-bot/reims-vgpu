@@ -179,7 +179,7 @@ impl EncoderPools {
             slots: Vec::new(),
             cur: 0,
             in_flight: 0,
-            graveyard: Vec::new(),
+            recording: None,
             open_batch: None,
             batch_max_draws: BATCH_MAX_DRAWS,
             last_pass: None,
@@ -197,6 +197,8 @@ impl EncoderPools {
 impl SharedPools {
     fn new() -> Self {
         Self {
+            retirement: Arc::new(RetirementOrder::default()),
+            graveyard: Vec::new(),
             targets: HashMap::new(),
             target_order: Vec::new(),
             multisample_target: None,
@@ -659,6 +661,7 @@ impl ResourcePools {
                         fence,
                         pending: None,
                         submission: SlotSubmission::HostOwned,
+                        retirement: None,
                         span: super::gpu_span::SlotSpan::Idle,
                         readback_span_armed: false,
                         pass_spans: 0,
@@ -818,57 +821,28 @@ impl ResourcePools {
         self.encoder.desc_arena.free(device, sets);
     }
 
-    /// The ring slots whose recorded GPU work may still reference pool objects:
-    /// every submitted-but-unretired CB, plus the open draw batch's slot (its
-    /// CB is still recording, so unsubmitted, but it already references
-    /// images/buffers — destroying them before its flush would be a
-    /// use-after-free at submit). A zero mask means nothing can be reading
-    /// anything.
-    ///
-    /// # The one recording state this does *not* cover
-    ///
-    /// A slot claimed by `begin_entry` and being recorded into, which is neither
-    /// `pending` yet nor an `open_batch`, is in neither set — so a
-    /// [`Self::dispose`] while it records destroys immediately, on an object the
-    /// open command buffer already names.
-    ///
-    /// That is sound today only because **nothing runs in that gap**: every
-    /// non-batch caller claims the slot, records, submits and seals inside one
-    /// call, so no host code can reach a dispose in between. It is a property of
-    /// those callers and not of this function, and the compiler cannot see it.
-    ///
-    /// A caller that wants to record several independent units of work into one
-    /// submission — the shape the guest-page writeback would take to stop paying
-    /// a fence per window — reopens exactly this gap, because its per-unit
-    /// bookkeeping (`unpin_resident_target`, which is what permits eviction)
-    /// would run while later units are still recording. Such a caller must
-    /// either do all of its bookkeeping after the submit, or make its recording
-    /// slot visible here the way `open_batch` is. Do not assume the graveyard
-    /// covers it: it covers the two states above, and this is a third.
-    fn open_slot_mask(&self) -> SlotMask {
-        let mut mask: SlotMask = 0;
-        for (index, slot) in self.encoder.slots.iter().enumerate() {
-            if slot.pending.is_some() {
-                mask |= 1 << index;
-            }
-        }
-        if self.encoder.open_batch.is_some() {
-            // The batch records into `cur` and seals onto that same slot at
-            // flush, and every path that retires a slot flushes the batch
-            // first, so this bit cannot clear before the batch's work retires.
-            mask |= 1 << self.encoder.cur;
-        }
-        mask
+    /// Whether the current command buffer already owns the cleanup that will
+    /// receive resources rejected by a sampled-cache admission. A submitted
+    /// entry owns it through `pending`; a deferred batch owns it through
+    /// `open_batch`. Native-object destruction is governed independently by
+    /// the recording order.
+    fn current_entry_owns_cleanup(&self) -> bool {
+        self.encoder
+            .slots
+            .get(self.encoder.cur)
+            .is_some_and(|slot| slot.pending.is_some())
+            || self.encoder.open_batch.is_some()
     }
 
-    /// Destroy `handle` now if nothing can be reading it, else park it in the
-    /// graveyard until each slot open at this instant has retired.
+    /// Destroy `handle` now if every recording that could have named it is
+    /// terminal, else park it until that exact ordered prefix retires.
     pub(crate) unsafe fn dispose(&mut self, device: &ash::Device, handle: DeferredHandle) {
-        let waiting = self.open_slot_mask();
-        if waiting == 0 {
-            self.destroy_or_recycle(device, handle);
-        } else {
-            self.encoder.graveyard.push((waiting, handle));
+        self.release_ready_graveyard(device);
+        match self.shared.retirement.latest() {
+            Some(point) if !self.shared.retirement.retired(point) => {
+                self.shared.graveyard.push((point, handle));
+            }
+            _ => self.destroy_or_recycle(device, handle),
         }
     }
 
@@ -1060,26 +1034,29 @@ impl ResourcePools {
         self.shared.resident_resample_peak_ms
     }
 
-    /// Clear `retired` from every parked handle's wait mask and take out the
-    /// ones that now wait on nothing. `retired` is the bit of the slot that
-    /// just retired; teardown passes every bit.
-    ///
-    /// Taking rather than destroying in place is what lets `destroy_or_recycle`
-    /// borrow `self.shared.sampled_free`/`self.shared.target_free` while the graveyard is
-    /// being walked, and it is the whole decision the mask exists to make, so
-    /// it is also the seam the tests drive without a device.
-    fn take_released_graveyard(&mut self, retired: SlotMask) -> Vec<DeferredHandle> {
-        let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.encoder.graveyard)
+    /// Take handles whose complete pre-removal recording prefix is terminal.
+    /// Taking before destruction permits terminal handling to borrow the free
+    /// pools that live beside the graveyard.
+    fn take_released_graveyard(&mut self) -> Vec<DeferredHandle> {
+        let retirement = Arc::clone(&self.shared.retirement);
+        let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.shared.graveyard)
             .into_iter()
-            .map(|(mask, handle)| (mask & !retired, handle))
-            .partition(|(mask, _)| *mask == 0);
-        self.encoder.graveyard = waiting;
+            .partition(|(point, _)| retirement.retired(*point));
+        self.shared.graveyard = waiting;
         ready.into_iter().map(|(_, handle)| handle).collect()
     }
 
-    /// Terminally handle every graveyard entry released by `retired` retiring.
-    pub(super) unsafe fn release_graveyard(&mut self, device: &ash::Device, retired: SlotMask) {
-        for handle in self.take_released_graveyard(retired) {
+    /// Terminally handle every graveyard entry whose prefix has retired.
+    unsafe fn release_ready_graveyard(&mut self, device: &ash::Device) {
+        for handle in self.take_released_graveyard() {
+            self.destroy_or_recycle(device, handle);
+        }
+    }
+
+    /// Teardown-only release after every command buffer has been waited or the
+    /// device has been lost and is itself being destroyed.
+    pub(super) unsafe fn release_all_graveyard(&mut self, device: &ash::Device) {
+        for (_, handle) in std::mem::take(&mut self.shared.graveyard) {
             self.destroy_or_recycle(device, handle);
         }
     }
@@ -1519,7 +1496,12 @@ impl ResourcePools {
         // for a wedge. Paired with the `note_submit` in `finish_entry_async`.
         crate::gpu_hang_trail::note_retired(index);
         self.drain_cleanup(&ctx.device, pending);
-        self.release_graveyard(&ctx.device, 1 << index);
+        self.encoder.slots[index]
+            .retirement
+            .take()
+            .expect("submitted slot has no recording point")
+            .retire();
+        self.release_ready_graveyard(&ctx.device);
         Ok(())
     }
 
@@ -1602,6 +1584,11 @@ impl ResourcePools {
         // reader/compute/prefetch path (and prevents ring wrap from resetting
         // the still-recording batch CB).
         self.batch_flush(ctx, counters)?;
+        // A caller that returned early left an unsubmitted command buffer in
+        // this encoder. Dropping its lease cancels the exact order point; the
+        // next reset discards the recording itself.
+        self.encoder.recording.take();
+        self.release_ready_graveyard(&ctx.device);
         // Whatever pass was standing, the caller is about to record into a
         // different command buffer than the one that opened it. Unconditional
         // and above the early exits below, because every claim of a slot ends
@@ -1662,6 +1649,12 @@ impl ResourcePools {
             }
         }
         self.encoder.cur = next;
+        self.encoder.recording = Some(
+            self.shared
+                .retirement
+                .reserve()
+                .map_err(|_| DrawError::RecordingSequenceExhausted)?,
+        );
         Ok((
             self.encoder.slots[next].cmd_buf,
             self.encoder.slots[next].fence,
@@ -1758,6 +1751,17 @@ impl ResourcePools {
             self.encoder.slots[self.encoder.cur].pending.is_none(),
             "current slot already owes cleanup"
         );
+        debug_assert!(
+            self.encoder.slots[self.encoder.cur].retirement.is_none(),
+            "current slot already owns a recording point"
+        );
+        self.encoder.slots[self.encoder.cur].retirement = Some(
+            self.encoder
+                .recording
+                .take()
+                .expect("submission has no recording lease")
+                .submitted(),
+        );
         self.encoder.slots[self.encoder.cur].pending = Some(cleanup);
         self.encoder.slots[self.encoder.cur].submission = submit_return
             .map(SlotSubmission::QueueOwned)
@@ -1783,14 +1787,14 @@ impl ResourcePools {
     ///
     /// An admission that cannot be retained returns its image to
     /// `sampled_live`. The command buffer that fills or samples that image must
-    /// already be represented by [`Self::open_slot_mask`] so the next seal
+    /// already satisfy [`Self::current_entry_owns_cleanup`] so the next seal
     /// parks the image behind the right fence. A batch enters the mask when
     /// `open_batch` is set; a non-batch slot enters it when its cleanup is
     /// parked. The assertion keeps a third caller from admitting too early.
     unsafe fn admit_recorded_sampled(&mut self, admissions: Vec<(SampledSlot, SampledRetain)>) {
         debug_assert!(
-            admissions.is_empty() || self.open_slot_mask() & (1 << self.encoder.cur) != 0,
-            "admitting while the filling command buffer's slot is invisible to dispose()"
+            admissions.is_empty() || self.current_entry_owns_cleanup(),
+            "admitting before the filling command buffer owns its cleanup"
         );
         for (slot, retain) in admissions {
             self.admit_sampled_slot(slot, &retain.content, retain.resource_lifetime.as_ref());
@@ -2178,11 +2182,10 @@ impl ResourcePools {
     /// command buffer until a recorded guest write overlaps its pages.
     ///
     /// Publishing now is sound because the fill is *recorded* now, into the same
-    /// command buffer and ahead of any consumer, and because setting
-    /// `open_batch` is exactly what puts this slot in [`Self::open_slot_mask`] —
-    /// see [`Self::admit_recorded_sampled`] for why that is the precondition.
-    /// The opener sets it first, below, so the mask is right for its own
-    /// admissions too.
+    /// command buffer and ahead of any consumer. Setting `open_batch` also makes
+    /// this entry own the cleanup that receives any rejected admission; see
+    /// [`Self::admit_recorded_sampled`]. The opener sets it before admitting its
+    /// own images below.
     ///
     /// What it costs is a promise: these entries claim content a command buffer
     /// has not yet delivered. [`Self::batch_flush`] keeps it or, if the submit
@@ -2947,6 +2950,7 @@ impl ResourcePools {
     /// carrying them into the next entry would invent a lifetime the GPU never
     /// began.
     pub(crate) fn abort_recorded_guest_work(&mut self) {
+        self.encoder.recording.take();
         let tokens: Vec<_> = self
             .encoder
             .guest_write_tokens_live
@@ -3038,8 +3042,7 @@ impl ResourcePools {
         // batch whose submit failed leaves its opener's bit set with no fence
         // behind it. Sweep every bit that is no longer open so a quiesce always
         // leaves the graveyard holding only genuinely-blocked handles.
-        let still_open = self.open_slot_mask();
-        self.release_graveyard(&ctx.device, !still_open);
+        self.release_ready_graveyard(&ctx.device);
         Ok(())
     }
 
@@ -5501,8 +5504,7 @@ mod recycle_tests {
         assert_eq!(allocs, 1, "only the cold first frame allocated");
     }
 
-    /// A ring slot that owes cleanup, with null handles — enough for the
-    /// graveyard's mask bookkeeping, which reads only `pending.is_some()`.
+    /// A ring slot that owes cleanup, with null handles.
     fn pending_slot() -> CmdSlot {
         CmdSlot {
             cmd_buf: vk::CommandBuffer::null(),
@@ -5521,6 +5523,7 @@ mod recycle_tests {
                 guest_write_tokens: Vec::new(),
             }),
             submission: SlotSubmission::HostOwned,
+            retirement: None,
             span: super::gpu_span::SlotSpan::Idle,
             readback_span_armed: false,
             pass_spans: 0,
@@ -5533,6 +5536,7 @@ mod recycle_tests {
             fence: vk::Fence::null(),
             pending: None,
             submission: SlotSubmission::HostOwned,
+            retirement: None,
             span: super::gpu_span::SlotSpan::Idle,
             readback_span_armed: false,
             pass_spans: 0,
@@ -6020,42 +6024,38 @@ mod recycle_tests {
         assert_eq!(pools.encoder.guest_write_tokens_live.len(), 1);
     }
 
-    /// A dispose site has already unlinked the handle, so only the entries
-    /// recording or in flight *at that instant* can still reference it. The
-    /// handle is therefore released when those slots retire — not when the
-    /// whole ring goes idle. Device-free: drives the mask decision only.
+    /// A dispose site has already unlinked the handle, so only recordings
+    /// reserved at that instant can reference it. A later recording cannot
+    /// extend the captured prefix.
     #[test]
-    fn a_disposed_handle_waits_on_the_slots_open_when_it_was_disposed_and_no_others() {
+    fn a_disposed_handle_waits_on_the_recordings_open_when_it_was_disposed_and_no_others() {
         let mut pools = ResourcePools::new();
-        pools.encoder.slots = (0..4).map(|_| idle_slot()).collect();
-        pools.encoder.slots[0] = pending_slot();
-        pools.encoder.slots[1] = pending_slot();
-
-        let waiting = pools.open_slot_mask();
-        assert_eq!(waiting, 0b0011, "slots 0 and 1 are in flight");
-        pools.encoder.graveyard.push((
+        let first = pools.shared.retirement.reserve().unwrap().submitted();
+        let second = pools.shared.retirement.reserve().unwrap().submitted();
+        let waiting = pools.shared.retirement.latest().unwrap();
+        pools.shared.graveyard.push((
             waiting,
             DeferredHandle::Framebuffer(vk::Framebuffer::null()),
         ));
 
-        // A later entry claims slot 2. It began after the dispose, so it cannot
-        // have recorded a reference to the handle, and the handle must not
-        // start waiting on it.
-        pools.encoder.slots[2] = pending_slot();
+        let later = pools.shared.retirement.reserve().unwrap().submitted();
+        later.retire();
         assert!(
-            pools.take_released_graveyard(1 << 2).is_empty(),
-            "slot 2 retiring says nothing about a handle disposed before it began"
+            pools.take_released_graveyard().is_empty(),
+            "later completion says nothing about a handle removed before it began"
         );
+        first.retire();
         assert!(
-            pools.take_released_graveyard(1 << 0).is_empty(),
-            "slot 1 could still be reading it"
+            pools.take_released_graveyard().is_empty(),
+            "the second recording could still be reading it"
         );
+        second.retire();
         assert_eq!(
-            pools.take_released_graveyard(1 << 1).len(),
+            pools.take_released_graveyard().len(),
             1,
-            "both witnesses retired: the handle is free"
+            "the captured prefix retired: the handle is free"
         );
-        assert!(pools.encoder.graveyard.is_empty());
+        assert!(pools.shared.graveyard.is_empty());
     }
 
     /// Installing and taking the owned batch publish the exact state the drain
@@ -6089,7 +6089,7 @@ mod recycle_tests {
         let mut pools = ResourcePools::new();
         pools.encoder.slots = (0..4).map(|_| idle_slot()).collect();
         pools.encoder.cur = 3;
-        assert_eq!(pools.open_slot_mask(), 0, "idle ring, no batch");
+        assert!(!pools.current_entry_owns_cleanup(), "idle ring, no batch");
 
         pools.encoder.open_batch = Some(OpenBatch {
             cb: vk::CommandBuffer::null(),
@@ -6103,7 +6103,10 @@ mod recycle_tests {
             draws: 1,
             dsets: Vec::new(),
         });
-        assert_eq!(pools.open_slot_mask(), 1 << 3, "the batch's own slot");
+        assert!(
+            pools.current_entry_owns_cleanup(),
+            "the batch owns its cleanup"
+        );
     }
 
     /// The target decides a join only on the narrowed arm, and each of the three
@@ -6161,43 +6164,38 @@ mod recycle_tests {
         }
     }
 
-    /// What `GRAVEYARD_FORCE_DRAIN` used to backstop: a pure-async streak never
-    /// lets the ring reach idle, so under a global drain the graveyard grew
-    /// until a forced full quiesce cut it down. Per-slot masks make that
-    /// structural — every slot a handle waits on retires within one ring wrap,
-    /// so the population is bounded by the disposes of one wrap with no valve.
+    /// A pure-async streak never needs a forced idle drain. Each handle waits
+    /// for an exact ordered prefix, and advancing fence completions releases it
+    /// even while later recordings remain live.
     #[test]
     fn a_ring_that_never_goes_idle_still_drains_the_graveyard() {
         let mut pools = ResourcePools::new();
         let depth = 4;
-        pools.encoder.slots = (0..depth).map(|_| pending_slot()).collect();
+        let mut submitted = VecDeque::new();
 
         let mut released = 0;
         let mut peak = 0;
         for step in 0..64 {
-            // Every slot but the one about to retire stays in flight, so the
-            // ring is never idle and `open_slot_mask()` is never zero.
-            let waiting = pools.open_slot_mask();
-            assert_ne!(waiting, 0, "step {step}: ring must stay busy");
-            pools.encoder.graveyard.push((
+            let point = pools.shared.retirement.reserve().unwrap().submitted();
+            let waiting = pools.shared.retirement.latest().unwrap();
+            submitted.push_back(point);
+            pools.shared.graveyard.push((
                 waiting,
                 DeferredHandle::Framebuffer(vk::Framebuffer::null()),
             ));
-            peak = peak.max(pools.encoder.graveyard.len());
+            peak = peak.max(pools.shared.graveyard.len());
 
-            let index = step % depth;
-            pools.encoder.slots[index].pending = None;
-            released += pools.take_released_graveyard(1 << index).len();
-            pools.encoder.slots[index] = pending_slot();
+            if submitted.len() == depth {
+                submitted.pop_front().unwrap().retire();
+                released += pools.take_released_graveyard().len();
+            }
+            assert!(!submitted.is_empty(), "step {step}: work remains in flight");
         }
 
-        // A handle disposed at step `s` waits on all `depth` slots and the
-        // retire at step `s` clears the first of them, so it frees at step
-        // `s + depth - 1`. Only the final `depth - 1` disposes are still parked.
         assert_eq!(
             released,
             64 - (depth - 1),
-            "everything older than one ring wrap freed without a forced quiesce"
+            "everything outside the live submission window was released"
         );
         assert!(
             peak <= depth,

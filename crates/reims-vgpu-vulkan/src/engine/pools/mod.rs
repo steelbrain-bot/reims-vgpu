@@ -17,6 +17,7 @@ use super::context::{DeviceContext, DrawSpanProbe, TimestampProbe, FENCE_TIMEOUT
 use super::counters::{CreateSite, EngineCounters};
 use super::desc_arena::{DescriptorArena, DESC_BLOCK_MAX_SETS};
 use super::device_lost::{DeviceLostDecline, DeviceLostOp};
+use super::retirement::{RecordingLease, RecordingPoint, RetirementOrder, SubmittedPoint};
 use super::types::{DrawError, ResidentReclaim, StorageImageFormat, TargetIdentity};
 use super::vk_call::{VkCall, VkOp};
 use super::{buffer_slab, color_subresource_range, gpu_span, host_ram, reason, slab, types};
@@ -408,15 +409,10 @@ pub(crate) struct EncoderPools {
     /// object a prior CB may reference is unsafe — dispose() defers those
     /// handles to `graveyard` until the slots that could reference them retire.
     in_flight: usize,
-    /// Handles displaced (cache eviction, registry replace) while GPU work was
-    /// open, each paired with the [`SlotMask`] of the ring slots that were open
-    /// at dispose time. A dispose site has already made the handle unreachable
-    /// (it was taken out of the cache/registry that named it), so no *later*
-    /// entry can bind it; only the entries recording or in flight at that
-    /// instant can still reference it. Clearing a slot's bit as it retires
-    /// therefore frees the handle on the last fence that could be reading it,
-    /// not on the whole ring going idle.
-    graveyard: Vec<(SlotMask, DeferredHandle)>,
+    /// Point reserved before the current command buffer read any shared native
+    /// registry. Submission transfers it to the slot; abandoning the recording
+    /// cancels it through `RecordingLease::drop`.
+    recording: Option<RecordingLease>,
     /// Open draw batch: a ring slot whose CB is still recording deferred
     /// same-target draws (submit pending). While `Some`, that CB references
     /// live GPU objects exactly like an in-flight CB, so dispose/graveyard
@@ -501,6 +497,11 @@ pub(crate) struct EncoderPools {
 /// A field belongs here when two encoders asking the same question must get
 /// the same answer.
 pub(crate) struct SharedPools {
+    /// One order across every encoder that reads these registries. A removed
+    /// native handle waits only for the prefix that could already have named
+    /// it; recordings reserved later cannot extend its lifetime.
+    retirement: Arc<RetirementOrder>,
+    graveyard: Vec<(RecordingPoint, DeferredHandle)>,
     /// Target images + framebuffers keyed by geometry + render_pass identity.
     targets: HashMap<(TargetKey, u64), TargetSlot>, // u64 = render_pass as u64
     target_order: Vec<(TargetKey, u64)>,
@@ -1093,6 +1094,8 @@ struct CmdSlot {
     fence: vk::Fence,
     pending: Option<PendingGpuCleanup>,
     submission: SlotSubmission,
+    /// The global recording point this slot's fence retires.
+    retirement: Option<SubmittedPoint>,
     /// Whether this slot's GPU timestamp pair has been written, and how far.
     /// Read and cleared when the slot retires, which is the first moment the
     /// fence makes the queries readable. See [`super::gpu_span`].
@@ -1152,16 +1155,16 @@ struct CmdSlot {
 /// and not the work. Frames are *not* claimed: `present_hz` interleaved and
 /// draws-per-frame differed between boots by more than the effect.
 ///
-/// **16 is the ceiling the types already allow**, not a round number: the two
-/// assertions below pin the ring to [`SlotMask`]'s width and to
-/// [`crate::gpu_hang_trail::SUBMIT_SLOTS`], and the latter is 16. Going deeper
-/// is a change to the hang trail first, and would want its own measurement —
-/// this arm says the bubble is real, not that it is exhausted.
+/// **16 is the ceiling the types already allow**, not a round number: the
+/// assertion below pins the ring to [`crate::gpu_hang_trail::SUBMIT_SLOTS`],
+/// which is 16. Going deeper is a change to the hang trail first, and would
+/// want its own measurement — this arm says the bubble is real, not that it is
+/// exhausted.
 /// # Depth 32 was measured and does not convert. Do not try it again.
 ///
 /// The measurement the paragraph above asked for, run 2026-08-22:
-/// `SUBMIT_SLOTS` raised to 32 alongside, both `const _` assertions still
-/// holding because [`SlotMask`] is a `u32` and 32 bits is exactly its width.
+/// `SUBMIT_SLOTS` raised to 32 alongside, with the relation below still
+/// holding.
 /// Twelve interleaved boots, driven fullscreen Maps on macos-13, banded to the
 /// driven windows; one depth-32 boot excluded on its own measurement rather
 /// than on its result -- 799 531 draws against 2.16-2.32 M everywhere else and
@@ -1191,16 +1194,6 @@ struct CmdSlot {
 /// deepening it further is not a lever on this rail: the remaining `slot_us`
 /// is overlapped, not blocking.
 pub(crate) const RING_DEPTH: usize = 16;
-
-/// One bit per ring slot: the set of slots a deferred handle is still waiting
-/// on. Sized so the whole ring fits, which is what bounds the graveyard — a
-/// handle's mask can only name slots that existed when it was disposed, and
-/// every one of those retires within a ring wrap.
-pub(crate) type SlotMask = u32;
-const _: () = assert!(
-    RING_DEPTH <= SlotMask::BITS as usize,
-    "SlotMask must have one bit per ring slot"
-);
 
 /// The hang trail keeps one outstanding-submission record per ring slot, and it
 /// arm too, where no executor is available. This is the only place both

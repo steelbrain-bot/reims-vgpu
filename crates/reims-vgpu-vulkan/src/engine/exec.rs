@@ -3356,14 +3356,10 @@ fn depth_bars_batching(has_depth: bool) -> bool {
 
 /// Hand this draw's ad-hoc attachment handles to the graveyard.
 ///
-/// **Both submit paths call this and neither may inline it.** They differ only in
-/// *when* their slot enters [`super::pools::ResourcePools::open_slot_mask`] —
-/// `finish_entry_async` marks it pending on the submitting path, `batch_append`
-/// installs the open batch on the deferred one — and the rule that this call must
-/// follow that moment is the entire safety argument. Called before it, the mask
-/// is empty and `dispose` destroys immediately, under a command buffer that still
-/// names these handles. A second copy of the sequence is where one of the two
-/// would drift off that rule.
+/// **Both submit paths call this and neither may inline it.** The command buffer
+/// reserved its recording point before resolving these attachments, so disposal
+/// waits for it whether the draw submits now or remains in an open batch. One
+/// terminal path keeps the framebuffer/depth pairing identical on both arms.
 ///
 /// `transient_depth` carries the draw's framebuffer whenever it has depth, so the
 /// two arms are exclusive by that test rather than by re-deriving which features
@@ -7592,11 +7588,9 @@ pub(crate) unsafe fn execute_draw_inner(
             sampled_retains,
             counters,
         );
-        // After the append, never before: installing the open batch is what puts
-        // this slot into `open_slot_mask`, so these handles wait for the batch's
-        // own work instead of being freed under a command buffer still recording
-        // them. This is the same ordering rule the submitting path meets through
-        // `finish_entry_async`, which is why both go through one function.
+        // The recording point was reserved before attachment resolution and
+        // remains owned by this open batch. Both submit arms use the same
+        // terminal disposal so their paired handles cannot drift.
         dispose_ad_hoc_attachments(
             ctx,
             pools,
@@ -8607,7 +8601,7 @@ mod tests {
     /// This pins the decision and not the disposal, which is the honest scope: no
     /// test here can reach `dispose_ad_hoc_attachments`, so what it guards is the
     /// rung, and the safety argument for the rung being relaxed lives in that
-    /// function's doc and in `open_slot_mask`'s.
+    /// function's doc and in the recording-order tests.
     ///
     /// Worth a test rather than a reading of the ladder because the rung was
     /// unconditional for as long as no measured workload presented depth. A
