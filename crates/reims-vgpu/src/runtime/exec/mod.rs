@@ -5129,19 +5129,23 @@ fn commit_ready_execs<M: HostMemory + HostOps>(state: &mut Device, host: &mut M)
             }
         };
         let close_started = std::time::Instant::now();
-        match state.executor.close_submission(identity) {
-            Ok(()) => state.task_objects.resources.complete_submission(
-                identity.id,
-                context.resources.iter().filter_map(|use_| use_.resource),
-            ),
-            Err(error) => {
-                result.draws_fail = result.draws_fail.saturating_add(1);
-                crate::observe::Emit::decline("submission_close", &error)
-                    .field("submission", identity.id.get())
-                    .field("task", identity.task.get())
-                    .fail();
-            }
+        if let Err(error) = state.executor.close_submission(identity) {
+            result.draws_fail = result.draws_fail.saturating_add(1);
+            crate::observe::Emit::decline("submission_close", &error)
+                .field("submission", identity.id.get())
+                .field("task", identity.task.get())
+                .fail();
         }
+        // Backend acceptance and resource-envelope lifetime are independent
+        // completion facts. A close refusal loses this packet's native work,
+        // but the packet is terminal, gets a failure stamp, and no longer owns
+        // an in-flight resource reservation. Retaining that reservation while
+        // retiring the scheduler footprint would let a conflicting successor
+        // run against state which still claimed the failed predecessor live.
+        state.task_objects.resources.complete_submission(
+            identity.id,
+            context.resources.iter().filter_map(|use_| use_.resource),
+        );
         let close_ns = close_started.elapsed().as_nanos() as u64;
         measured_ns = measured_ns.saturating_add(close_ns);
         crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Close, close_ns);

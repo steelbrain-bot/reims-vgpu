@@ -516,8 +516,8 @@ fn an_exec_packet_closes_its_exact_backend_submission() {
     );
     drop(closed);
 
-    // A failed close never publishes semantic completion for the resources
-    // whose native prefix was not accepted by the backend.
+    // A failed close loses native work and remains fail-visible, but it still
+    // ends the packet's resource envelope before scheduler conflict retirement.
     use crate::model::TaskResource;
     use crate::runtime::decode::fifo::CHILD_EXEC_RESOURCE_OBJECT_ID;
     use crate::runtime::decode::resource::ListObjectEntry;
@@ -562,14 +562,14 @@ fn an_exec_packet_closes_its_exact_backend_submission() {
     assert_eq!(result.draws_fail, 1);
     let failed = probe.closed.lock().unwrap()[1];
     assert!(
-        state
+        !state
             .task_objects
             .resources
             .resource_node(resource_id)
             .unwrap()
             .in_flight
             .contains(&failed.id),
-        "a backend close failure must not claim the resource envelope completed"
+        "scheduler retirement must not leave a failed predecessor in flight"
     );
 }
 
