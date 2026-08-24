@@ -370,7 +370,7 @@ pub(crate) fn color_subresource_layers() -> ash::vk::ImageSubresourceLayers {
 
 struct EngineState {
     owner: ContextOwner,
-    caches: ObjectCaches,
+    caches: Arc<Mutex<ObjectCaches>>,
 }
 
 struct SessionResources {
@@ -415,7 +415,7 @@ impl EngineState {
     fn new() -> Self {
         Self {
             owner: ContextOwner::new(),
-            caches: ObjectCaches::new(),
+            caches: Arc::new(Mutex::new(ObjectCaches::new())),
         }
     }
 
@@ -442,13 +442,18 @@ impl EngineState {
     ///
     /// Returns whether a fresh context came up, so a caller that can retry knows
     /// whether retrying is worth anything.
-    fn on_device_lost(&mut self, session_id: SessionId, resources: &mut SessionResources) -> bool {
+    fn on_device_lost(
+        &mut self,
+        caches: &mut ObjectCaches,
+        session_id: SessionId,
+        resources: &mut SessionResources,
+    ) -> bool {
         resources
             .counters
             .device_lost
             .fetch_add(1, Ordering::Relaxed);
         self.owner.mark_device_lost();
-        self.flush_device_derived(session_id, resources);
+        self.flush_device_derived(caches, session_id, resources);
         match self.owner.ensure(&resources.counters) {
             Ok(_) => true,
             Err(error) => {
@@ -468,7 +473,12 @@ impl EngineState {
     /// the exception — its only constructor is on the window thread — so this
     /// takes it and publishes that it is gone, and
     /// `host_window::present::App::reattach_engine` is what builds it again.
-    fn flush_device_derived(&mut self, session_id: SessionId, resources: &mut SessionResources) {
+    fn flush_device_derived(
+        &mut self,
+        caches: &mut ObjectCaches,
+        session_id: SessionId,
+        resources: &mut SessionResources,
+    ) {
         clear_device_capabilities();
         clear_open_batches();
         resources.resident_epoch.fetch_add(1, Ordering::Release);
@@ -517,11 +527,11 @@ impl EngineState {
                     session.pools = ResourcePools::new();
                     session.indexes = SessionCacheIndexes::new();
                 }
-                self.caches.destroy_all(&ctx.device);
+                caches.destroy_all(&ctx.device);
                 resources.pools.destroy_all(&ctx.device);
             }
         } else {
-            self.caches.clear_logical();
+            caches.clear_logical();
             for session in &inactive_sessions {
                 let mut session = session.resources.lock();
                 session.pools = ResourcePools::new();
@@ -537,7 +547,7 @@ impl EngineState {
         }
         resources.pools = ResourcePools::new();
         resources.indexes = SessionCacheIndexes::new();
-        self.caches = ObjectCaches::new();
+        *caches = ObjectCaches::new();
     }
 }
 
@@ -570,7 +580,7 @@ mod session_slot_tests {
             .resident_epoch
             .store(42, Ordering::Release);
 
-        assert_eq!(engine.caches.levels(), [0; 6]);
+        assert_eq!(engine.caches.lock().levels(), [0; 6]);
         assert_eq!(
             first
                 .0
@@ -678,7 +688,7 @@ mod session_slot_tests {
         let engine = EngineState::new();
         let first = session(81);
         let second = session(82);
-        let cache_address = std::ptr::addr_of!(engine.caches);
+        let cache_address = Arc::as_ptr(&engine.caches);
         first
             .0
             .resources
@@ -687,7 +697,7 @@ mod session_slot_tests {
             .device_lost
             .store(3, std::sync::atomic::Ordering::Relaxed);
 
-        assert_eq!(std::ptr::addr_of!(engine.caches), cache_address);
+        assert_eq!(Arc::as_ptr(&engine.caches), cache_address);
         assert_eq!(
             second
                 .0
@@ -1350,6 +1360,7 @@ pub fn take_engine_lock_census(win_ms: u64) -> Option<String> {
 /// inside the lock — and a sampler would miss precisely those.
 struct EngineGuard {
     guard: parking_lot::MutexGuard<'static, EngineState>,
+    caches: parking_lot::lock_api::ArcMutexGuard<parking_lot::RawMutex, ObjectCaches>,
     resources: parking_lot::lock_api::ArcMutexGuard<parking_lot::RawMutex, SessionResources>,
     session_id: SessionId,
     site: EngineLockSite,
@@ -1372,9 +1383,12 @@ impl std::ops::DerefMut for EngineGuard {
 impl EngineGuard {
     fn parts(&mut self) -> EngineParts<'_> {
         let EngineGuard {
-            guard, resources, ..
+            guard,
+            caches,
+            resources,
+            ..
         } = self;
-        let EngineState { owner, caches } = &mut **guard;
+        let EngineState { owner, caches: _ } = &mut **guard;
         let SessionResources {
             pools,
             indexes,
@@ -1396,13 +1410,14 @@ impl EngineGuard {
 
     fn on_device_lost(&mut self) -> bool {
         let session_id = self.session_id;
-        self.guard.on_device_lost(session_id, &mut self.resources)
+        self.guard
+            .on_device_lost(&mut self.caches, session_id, &mut self.resources)
     }
 
     fn flush_device_derived(&mut self) {
         let session_id = self.session_id;
         self.guard
-            .flush_device_derived(session_id, &mut self.resources);
+            .flush_device_derived(&mut self.caches, session_id, &mut self.resources);
     }
 }
 
@@ -1433,10 +1448,12 @@ fn lock_engine_at(site: EngineLockSite) -> EngineGuard {
             guard
         }
     };
+    let caches = guard.caches.lock_arc();
     let session = current_session_handle();
     let resources = session.0.resources.lock_arc();
     EngineGuard {
         guard,
+        caches,
         resources,
         session_id: session.id(),
         site,
@@ -6600,7 +6617,7 @@ pub fn test_reset_engine() {
     } else {
         g.owner = ContextOwner::new();
     }
-    g.caches = ObjectCaches::new();
+    *g.caches = ObjectCaches::new();
     g.resources.indexes = SessionCacheIndexes::new();
     g.resources.pools = ResourcePools::new();
     g.resources.counters.reset_all();
