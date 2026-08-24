@@ -2886,6 +2886,7 @@ pub fn execute_submission_progress(
         match result {
             Ok(output) => outputs.push(output),
             Err(error) => {
+                apply_failure_scope(&mut outputs, &error);
                 return reims_vgpu_core::SubmissionExecutionProgress {
                     submission: identity,
                     output: outputs.into_boxed_slice(),
@@ -2900,6 +2901,42 @@ pub fn execute_submission_progress(
         output: outputs.into_boxed_slice(),
         gpu_materialized: std::sync::Arc::from([]),
         failure: None,
+    }
+}
+
+/// Whether an executor failure leaves the already-recorded command prefix
+/// alive for [`close_submission`] to commit.
+///
+/// Ordinary command refusals stop at that command and keep the prefix. Device
+/// loss is different: recovery destroys every encoder made from the lost
+/// device, so no prefix remains to submit and no semantic completion may be
+/// inferred from outputs recorded before the loss was observed.
+fn failure_retains_recorded_prefix(error: &DrawError) -> bool {
+    !matches!(error, DrawError::DeviceLost(_))
+}
+
+fn apply_failure_scope<T>(outputs: &mut Vec<T>, error: &DrawError) {
+    if !failure_retains_recorded_prefix(error) {
+        outputs.clear();
+    }
+}
+
+#[cfg(test)]
+mod submission_failure_scope_tests {
+    use super::*;
+
+    #[test]
+    fn device_loss_aborts_the_submission_while_a_command_refusal_keeps_its_prefix() {
+        let lost = DrawError::DeviceLost(device_lost::DeviceLostDecline::ForcedDraw);
+        let mut outputs = vec![1, 2];
+        apply_failure_scope(&mut outputs, &lost);
+        assert!(outputs.is_empty());
+
+        let refused =
+            DrawError::Facade(EngineFacadeDecline::ExecutorServiceUnavailable { service: "test" });
+        let mut outputs = vec![1, 2];
+        apply_failure_scope(&mut outputs, &refused);
+        assert_eq!(outputs, [1, 2]);
     }
 }
 
