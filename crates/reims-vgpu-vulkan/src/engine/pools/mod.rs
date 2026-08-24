@@ -697,9 +697,43 @@ pub(crate) struct SharedPools {
     host_ram_imports: host_ram::HostRamImports,
 }
 
+pub(crate) struct OwnedPool<T>(T);
+
+impl<T> std::ops::Deref for OwnedPool<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for OwnedPool<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
+pub(crate) struct PoolPair<Encoder, Shared> {
+    encoder: Encoder,
+    shared: Shared,
+}
+
 pub(crate) struct ResourcePools {
-    encoder: EncoderPools,
-    shared: SharedPools,
+    pair: PoolPair<OwnedPool<EncoderPools>, OwnedPool<SharedPools>>,
+}
+
+impl std::ops::Deref for ResourcePools {
+    type Target = PoolPair<OwnedPool<EncoderPools>, OwnedPool<SharedPools>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.pair
+    }
+}
+
+impl std::ops::DerefMut for ResourcePools {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.pair
+    }
 }
 
 /// Exclusive recording view borrowed for one encoder transaction.
@@ -708,20 +742,20 @@ pub(crate) struct ResourcePools {
 /// recording-local state can move to a worker without granting that worker
 /// ownership of session teardown or replacement.
 pub(crate) struct RecordingPools<'a> {
-    pools: &'a mut ResourcePools,
+    pair: PoolPair<&'a mut EncoderPools, &'a mut SharedPools>,
 }
 
-impl std::ops::Deref for RecordingPools<'_> {
-    type Target = ResourcePools;
+impl<'a> std::ops::Deref for RecordingPools<'a> {
+    type Target = PoolPair<&'a mut EncoderPools, &'a mut SharedPools>;
 
     fn deref(&self) -> &Self::Target {
-        self.pools
+        &self.pair
     }
 }
 
 impl std::ops::DerefMut for RecordingPools<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.pools
+        &mut self.pair
     }
 }
 
@@ -1350,7 +1384,11 @@ impl DeferredHandle {
     }
 }
 
-impl ResourcePools {
+impl<Encoder, Shared> PoolPair<Encoder, Shared>
+where
+    Encoder: std::ops::DerefMut<Target = EncoderPools>,
+    Shared: std::ops::DerefMut<Target = SharedPools>,
+{
     fn release_heap_placement_child(
         &mut self,
         placement: HeapPlacementMemoryKey,

@@ -243,7 +243,11 @@ struct NewResident {
     attachment_view: Option<vk::ImageView>,
 }
 
-impl ResourcePools {
+impl<Encoder, Shared> PoolPair<Encoder, Shared>
+where
+    Encoder: std::ops::DerefMut<Target = EncoderPools>,
+    Shared: std::ops::DerefMut<Target = SharedPools>,
+{
     /// Resolve a sampled declaration to a resident whose image *is* the guest's
     /// allocation, so the GPU samples the pages the guest CPU writes.
     ///
@@ -4831,7 +4835,12 @@ pub(super) mod pin_count_tests {
                 };
                 NonPinnedTotals {
                     count: sole().count(),
-                    bytes: sole().map(ResourcePools::slot_attachment_bytes).sum(),
+                    bytes: sole()
+                        .map(PoolPair::<
+                            OwnedPool<EncoderPools>,
+                            OwnedPool<SharedPools>,
+                        >::slot_attachment_bytes)
+                        .sum(),
                 }
             };
             assert_eq!(

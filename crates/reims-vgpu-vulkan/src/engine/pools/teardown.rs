@@ -70,97 +70,100 @@ impl ResourcePools {
                 }
             }
         }
-        for slot in &mut self.encoder.slots {
-            if let Some(pending) = slot.pending.take() {
-                super::super::retire_guest_write_pages(&pending.visibility.guest_write_tokens);
-                // The descriptor pool is destroyed below (frees every set);
-                // move the owed transients into the live lists so the drains
-                // below destroy them.
-                self.encoder.staging_live.extend(pending.encoder.staging);
-                self.encoder.gather_live.extend(pending.encoder.gather);
-                self.encoder
-                    .readback_multi_live
-                    .extend(pending.encoder.readback);
-                self.encoder.sampled_live.extend(pending.shared.sampled);
-                self.encoder
-                    .attachment_snapshot_live
-                    .extend(pending.shared.attachment_snapshots);
-                self.encoder
-                    .storage_image_live
-                    .extend(pending.shared.storage_images);
+        {
+            let encoder = &mut self.pair.encoder.0;
+            for slot in &mut encoder.slots {
+                if let Some(pending) = slot.pending.take() {
+                    super::super::retire_guest_write_pages(&pending.visibility.guest_write_tokens);
+                    // The descriptor pool is destroyed below (frees every set);
+                    // move the owed transients into the live lists so the drains
+                    // below destroy them.
+                    encoder.staging_live.extend(pending.encoder.staging);
+                    encoder.gather_live.extend(pending.encoder.gather);
+                    encoder.readback_multi_live.extend(pending.encoder.readback);
+                    encoder.sampled_live.extend(pending.shared.sampled);
+                    encoder
+                        .attachment_snapshot_live
+                        .extend(pending.shared.attachment_snapshots);
+                    encoder
+                        .storage_image_live
+                        .extend(pending.shared.storage_images);
+                }
             }
+            encoder.in_flight = 0;
         }
-        self.encoder.in_flight = 0;
         // Every fence above was waited (or failed on a lost device, where the
         // handles die with the device anyway), so no slot can still be reading:
         // release the whole graveyard regardless of what each handle waits on.
         self.release_all_graveyard(device);
-        for list in self.encoder.staging_free.values_mut() {
-            for s in list.drain(..) {
-                release_buffer_slot(device, &mut self.shared.slabs, s);
-            }
-        }
-        for s in self.encoder.staging_live.drain(..) {
-            release_buffer_slot(device, &mut self.shared.slabs, s);
-        }
-        for list in self.encoder.gather_free.values_mut() {
-            for s in list.drain(..) {
-                release_buffer_slot(device, &mut self.shared.slabs, s);
-            }
-        }
-        for s in self.encoder.gather_live.drain(..) {
-            release_buffer_slot(device, &mut self.shared.slabs, s);
-        }
-        for list in self.encoder.readback_free.values_mut() {
-            for s in list.drain(..) {
-                release_buffer_slot(device, &mut self.shared.slabs, s);
-            }
-        }
-        if let Some(s) = self.encoder.readback_live.take() {
-            release_buffer_slot(device, &mut self.shared.slabs, s);
-        }
-        for s in self.encoder.readback_multi_live.drain(..) {
-            release_buffer_slot(device, &mut self.shared.slabs, s);
-        }
-        // Leased slots are the one class here whose memory a live borrow may
-        // still be reading, and freeing it unmaps that borrow's pointer — a
-        // read after this line is a fault, not a stale pixel. So wait for the
-        // holders rather than for a fence: the pool-owned outstanding count moves
-        // with the holder, and a holder never blocks on the engine lock while
-        // it holds a lease, so it always makes progress and this always
-        // terminates.
-        //
-        // The bound exists because a teardown that hangs is worse than one that
-        // races: it is generous against a scatter that takes ~1 ms, and expiry
-        // is reported rather than assumed away.
-        let lease_deadline = std::time::Instant::now() + LEASE_QUIESCE;
-        while self
-            .encoder
-            .readback_lease_returns
-            .outstanding
-            .load(std::sync::atomic::Ordering::Acquire)
-            != 0
         {
-            if std::time::Instant::now() >= lease_deadline {
-                reims_vgpu_observe::Emit::decline(
-                    "vk_pools_destroy",
-                    &ReadbackLeaseQuiesceExpired {
-                        outstanding: self
-                            .encoder
-                            .readback_lease_returns
-                            .outstanding
-                            .load(std::sync::atomic::Ordering::Acquire),
-                        waited_ms: LEASE_QUIESCE.as_millis() as u64,
-                    },
-                )
-                .fail_once(0);
-                break;
+            let encoder = &mut self.pair.encoder.0;
+            let shared = &mut self.pair.shared.0;
+            for list in encoder.staging_free.values_mut() {
+                for s in list.drain(..) {
+                    release_buffer_slot(device, &mut shared.slabs, s);
+                }
             }
-            std::thread::yield_now();
-        }
-        self.encoder.reclaim_returned_readback_leases();
-        for l in self.encoder.readback_leased.drain(..) {
-            release_buffer_slot(device, &mut self.shared.slabs, l.slot);
+            for s in encoder.staging_live.drain(..) {
+                release_buffer_slot(device, &mut shared.slabs, s);
+            }
+            for list in encoder.gather_free.values_mut() {
+                for s in list.drain(..) {
+                    release_buffer_slot(device, &mut shared.slabs, s);
+                }
+            }
+            for s in encoder.gather_live.drain(..) {
+                release_buffer_slot(device, &mut shared.slabs, s);
+            }
+            for list in encoder.readback_free.values_mut() {
+                for s in list.drain(..) {
+                    release_buffer_slot(device, &mut shared.slabs, s);
+                }
+            }
+            if let Some(s) = encoder.readback_live.take() {
+                release_buffer_slot(device, &mut shared.slabs, s);
+            }
+            for s in encoder.readback_multi_live.drain(..) {
+                release_buffer_slot(device, &mut shared.slabs, s);
+            }
+            // Leased slots are the one class here whose memory a live borrow may
+            // still be reading, and freeing it unmaps that borrow's pointer — a
+            // read after this line is a fault, not a stale pixel. So wait for the
+            // holders rather than for a fence: the pool-owned outstanding count moves
+            // with the holder, and a holder never blocks on the engine lock while
+            // it holds a lease, so it always makes progress and this always
+            // terminates.
+            //
+            // The bound exists because a teardown that hangs is worse than one that
+            // races: it is generous against a scatter that takes ~1 ms, and expiry
+            // is reported rather than assumed away.
+            let lease_deadline = std::time::Instant::now() + LEASE_QUIESCE;
+            while encoder
+                .readback_lease_returns
+                .outstanding
+                .load(std::sync::atomic::Ordering::Acquire)
+                != 0
+            {
+                if std::time::Instant::now() >= lease_deadline {
+                    reims_vgpu_observe::Emit::decline(
+                        "vk_pools_destroy",
+                        &ReadbackLeaseQuiesceExpired {
+                            outstanding: encoder
+                                .readback_lease_returns
+                                .outstanding
+                                .load(std::sync::atomic::Ordering::Acquire),
+                            waited_ms: LEASE_QUIESCE.as_millis() as u64,
+                        },
+                    )
+                    .fail_once(0);
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            encoder.reclaim_returned_readback_leases();
+            for l in encoder.readback_leased.drain(..) {
+                release_buffer_slot(device, &mut shared.slabs, l.slot);
+            }
         }
         // Ad-hoc framebuffers name views owned by the targets and residents
         // destroyed below, and a framebuffer may not outlive its attachments —

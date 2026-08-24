@@ -973,7 +973,11 @@ impl SharedPools {
     }
 }
 
-impl ResourcePools {
+impl<Encoder, Shared> PoolPair<Encoder, Shared>
+where
+    Encoder: std::ops::DerefMut<Target = EncoderPools>,
+    Shared: std::ops::DerefMut<Target = SharedPools>,
+{
     /// Close one guest exec as one native recording transaction.
     ///
     /// Segment continuation may retain the render pass and dynamic state for
@@ -1092,18 +1096,34 @@ impl ResourcePools {
             recycled_images,
         )
     }
+}
 
+impl ResourcePools {
     pub(crate) fn new() -> Self {
         Self {
-            encoder: EncoderPools::new(),
-            shared: SharedPools::new(),
+            pair: PoolPair {
+                encoder: OwnedPool(EncoderPools::new()),
+                shared: OwnedPool(SharedPools::new()),
+            },
         }
     }
 
     pub(in crate::engine) fn recording(&mut self) -> RecordingPools<'_> {
-        RecordingPools { pools: self }
+        let pair = &mut self.pair;
+        RecordingPools {
+            pair: PoolPair {
+                encoder: &mut pair.encoder.0,
+                shared: &mut pair.shared.0,
+            },
+        }
     }
+}
 
+impl<Encoder, Shared> PoolPair<Encoder, Shared>
+where
+    Encoder: std::ops::DerefMut<Target = EncoderPools>,
+    Shared: std::ops::DerefMut<Target = SharedPools>,
+{
     /// The command-recording state owned by this encoder alone.
     ///
     /// Returning the narrow owner makes command-buffer state operations unable
@@ -2564,7 +2584,11 @@ impl EncoderPools {
     }
 }
 
-impl ResourcePools {
+impl<Encoder, Shared> PoolPair<Encoder, Shared>
+where
+    Encoder: std::ops::DerefMut<Target = EncoderPools>,
+    Shared: std::ops::DerefMut<Target = SharedPools>,
+{
     /// Begin one decoded guest operation recorded into `cb`.
     ///
     /// Guest CPU writes are external to this backend, so no command-buffer
@@ -3342,7 +3366,11 @@ impl EncoderPools {
     }
 }
 
-impl ResourcePools {
+impl<Encoder, Shared> PoolPair<Encoder, Shared>
+where
+    Encoder: std::ops::DerefMut<Target = EncoderPools>,
+    Shared: std::ops::DerefMut<Target = SharedPools>,
+{
     /// Whether a recorded command buffer still owes an ordering point for its
     /// guest-memory reads.
     pub(crate) fn has_guest_read_debt(&self) -> bool {
@@ -3894,13 +3922,10 @@ impl ResourcePools {
 
     pub(crate) fn recycle_staging(&mut self) {
         self.forget_cb_bound_buffers("bindmap_clear_recycle", "bindmap_clear_recycle_entries");
-        for slot in self.encoder.staging_live.drain(..) {
+        let encoder: &mut EncoderPools = &mut self.encoder;
+        for slot in encoder.staging_live.drain(..) {
             let bucket = buffer_bucket(slot.size);
-            self.encoder
-                .staging_free
-                .entry(bucket)
-                .or_default()
-                .push(slot);
+            encoder.staging_free.entry(bucket).or_default().push(slot);
         }
     }
 }
@@ -4163,7 +4188,11 @@ impl EncoderPools {
     }
 }
 
-impl ResourcePools {
+impl<Encoder, Shared> PoolPair<Encoder, Shared>
+where
+    Encoder: std::ops::DerefMut<Target = EncoderPools>,
+    Shared: std::ops::DerefMut<Target = SharedPools>,
+{
     pub(crate) unsafe fn acquire_target(
         &mut self,
         ctx: &DeviceContext,
@@ -4617,9 +4646,10 @@ impl ResourcePools {
                 .fetch_add(1, Ordering::Relaxed);
             return None;
         };
+        let last_touch_ms = self.shared.idle_clock_ms;
         let entry = &mut self.shared.sampled_cache[index];
         entry.retain_owner(owner);
-        entry.last_touch_ms = self.shared.idle_clock_ms;
+        entry.last_touch_ms = last_touch_ms;
         let handles = entry.slot.handles();
         counters.sampled_cache_hits.fetch_add(1, Ordering::Relaxed);
         counters
@@ -5496,7 +5526,12 @@ mod recycle_tests {
                 };
                 NonPinnedTotals {
                     count: sole().count(),
-                    bytes: sole().map(ResourcePools::storage_slot_bytes).sum(),
+                    bytes: sole()
+                        .map(PoolPair::<
+                            OwnedPool<EncoderPools>,
+                            OwnedPool<SharedPools>,
+                        >::storage_slot_bytes)
+                        .sum(),
                 }
             };
             assert_eq!(
@@ -5936,15 +5971,13 @@ mod recycle_tests {
         let mut pools = ResourcePools::new();
         let order = std::sync::Arc::clone(&pools.shared.retirement);
 
-        pools
-            .encoder
-            .begin_recording(pools.shared.checkout_recording().unwrap());
+        let first_recording = pools.shared.checkout_recording().unwrap();
+        pools.encoder.begin_recording(first_recording);
         let sealed = pools.encoder.seal_entry(Vec::new(), Vec::new());
         let first = order.latest().unwrap();
 
-        pools
-            .encoder
-            .begin_recording(pools.shared.checkout_recording().unwrap());
+        let later_recording = pools.shared.checkout_recording().unwrap();
+        pools.encoder.begin_recording(later_recording);
         let later = order.latest().unwrap();
         drop(sealed);
 
