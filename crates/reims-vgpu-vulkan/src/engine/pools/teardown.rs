@@ -285,6 +285,12 @@ impl ResourcePools {
         }
         self.shared.scatter_refused = false;
         self.encoder.desc_arena.destroy(device);
+        if let Some(probe) = self.encoder.timestamps.take() {
+            device.destroy_query_pool(probe.pool, None);
+        }
+        if let Some(probe) = self.encoder.draw_spans.take() {
+            device.destroy_query_pool(probe.pool, None);
+        }
         if self.encoder.cmd_pool != vk::CommandPool::null() {
             device.destroy_command_pool(self.encoder.cmd_pool, None);
             self.encoder.cmd_pool = vk::CommandPool::null();

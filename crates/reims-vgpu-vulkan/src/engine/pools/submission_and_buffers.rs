@@ -87,6 +87,43 @@ mod fence_wait_contract_tests {
     use super::*;
 
     #[test]
+    fn query_pools_follow_the_encoder_owner_not_ring_slot_ordinals() {
+        let scale = super::super::super::context::TickScale {
+            ns_per_tick: 1.0,
+            valid_mask: u64::MAX,
+        };
+        let mut first = ResourcePools::new();
+        let mut second = ResourcePools::new();
+        first.encoder.timestamps = Some(TimestampProbe {
+            pool: vk::QueryPool::from_raw(11),
+            scale,
+        });
+        second.encoder.timestamps = Some(TimestampProbe {
+            pool: vk::QueryPool::from_raw(22),
+            scale,
+        });
+        first.encoder.draw_spans = Some(DrawSpanProbe {
+            pool: vk::QueryPool::from_raw(33),
+            scale,
+        });
+        second.encoder.draw_spans = Some(DrawSpanProbe {
+            pool: vk::QueryPool::from_raw(44),
+            scale,
+        });
+
+        assert_ne!(
+            first.encoder.timestamps.as_ref().unwrap().pool,
+            second.encoder.timestamps.as_ref().unwrap().pool,
+            "two encoders with slot zero live must not reset one query region"
+        );
+        assert_ne!(
+            first.encoder.draw_spans.as_ref().unwrap().pool,
+            second.encoder.draw_spans.as_ref().unwrap().pool,
+            "draw-span regions follow encoder ownership too"
+        );
+    }
+
+    #[test]
     fn a_diagnostic_fence_deadline_keeps_the_submission_pending() {
         assert_eq!(
             classify_fence_wait(Err(vk::Result::TIMEOUT)),
@@ -408,10 +445,54 @@ impl EncoderPools {
                 ctx.device.destroy_command_pool(cmd_pool, None);
                 DrawError::VkCall(VkCall::new(VkOp::PoolsAllocCommandBuffers, e))
             })?;
+        let timestamps = ctx.timestamp_scale.and_then(|scale| {
+            let ci = vk::QueryPoolCreateInfo::default()
+                .query_type(vk::QueryType::TIMESTAMP)
+                .query_count(TimestampProbe::PER_SLOT * RING_DEPTH as u32);
+            ctx.device
+                .create_query_pool(&ci, None)
+                .map(|pool| {
+                    counters.note_create(CreateSite::QueryPool);
+                    TimestampProbe { pool, scale }
+                })
+                .map_err(|error| {
+                    reims_vgpu_observe::Emit::decline(
+                        "vk_timestamp_pool",
+                        &VkCall::new(VkOp::ContextCreateQueryPool, error),
+                    )
+                    .fail_once(0);
+                })
+                .ok()
+        });
+        let draw_spans = ctx.draw_span_scale.and_then(|scale| {
+            let ci = vk::QueryPoolCreateInfo::default()
+                .query_type(vk::QueryType::TIMESTAMP)
+                .query_count(DrawSpanProbe::PER_SLOT * RING_DEPTH as u32);
+            ctx.device
+                .create_query_pool(&ci, None)
+                .map(|pool| {
+                    counters.note_create(CreateSite::QueryPool);
+                    DrawSpanProbe { pool, scale }
+                })
+                .map_err(|error| {
+                    reims_vgpu_observe::Emit::decline(
+                        "vk_draw_span_pool",
+                        &VkCall::new(VkOp::ContextCreateQueryPool, error),
+                    )
+                    .fail_once(0);
+                })
+                .ok()
+        });
         // Growable descriptor arena: block 0 up front, more blocks on demand.
         // Free sets after each draw/dispatch; exhaustion grows rather than drops.
         let mut desc_arena = DescriptorArena::empty();
         if let Err(e) = desc_arena.create_first_block(&ctx.device) {
+            if let Some(probe) = timestamps {
+                ctx.device.destroy_query_pool(probe.pool, None);
+            }
+            if let Some(probe) = draw_spans {
+                ctx.device.destroy_query_pool(probe.pool, None);
+            }
             ctx.device.destroy_command_pool(cmd_pool, None);
             return Err(e);
         }
@@ -442,12 +523,20 @@ impl EncoderPools {
                         ctx.device.destroy_fence(slot.fence, None);
                     }
                     desc_arena.destroy(&ctx.device);
+                    if let Some(probe) = timestamps {
+                        ctx.device.destroy_query_pool(probe.pool, None);
+                    }
+                    if let Some(probe) = draw_spans {
+                        ctx.device.destroy_query_pool(probe.pool, None);
+                    }
                     ctx.device.destroy_command_pool(cmd_pool, None);
                     return Err(DrawError::VkCall(VkCall::new(VkOp::PoolsCreateFence, e)));
                 }
             }
         }
         self.cmd_pool = cmd_pool;
+        self.timestamps = timestamps;
+        self.draw_spans = draw_spans;
         self.desc_arena = desc_arena;
         self.slots = slots;
         self.cur = 0;
@@ -616,7 +705,7 @@ impl EncoderPools {
         cb: vk::CommandBuffer,
         kind: gpu_span::Kind,
     ) {
-        let Some(probe) = ctx.draw_spans.as_ref() else {
+        let Some(probe) = self.draw_spans.as_ref() else {
             return;
         };
         let slot = self.cur;
@@ -644,7 +733,7 @@ impl EncoderPools {
         slot: usize,
         draws: u64,
     ) {
-        let Some(probe) = ctx.draw_spans.as_ref() else {
+        let Some(probe) = self.draw_spans.as_ref() else {
             return;
         };
         let gpu_span::SlotSpan::Armed(kind) = self.slots[slot].span else {
@@ -684,7 +773,7 @@ impl EncoderPools {
         if !pass_spans_probe_enabled() {
             return;
         }
-        let Some(probe) = ctx.draw_spans.as_ref() else {
+        let Some(probe) = self.draw_spans.as_ref() else {
             return;
         };
         let slot = self.cur;
@@ -787,6 +876,8 @@ impl EncoderPools {
             last_pass: None,
             open_pass: None,
             pass_probe: None,
+            timestamps: None,
+            draw_spans: None,
             pass_open_index: None,
             guest_reads_in_flight: false,
             guest_write_tokens_live: std::collections::HashMap::new(),
@@ -1962,7 +2053,7 @@ impl EncoderPools {
     /// `cb` must be this encoder's current command buffer, recording, and
     /// outside any render pass.
     pub(crate) unsafe fn readback_span_arm(&mut self, ctx: &DeviceContext, cb: vk::CommandBuffer) {
-        let Some(probe) = ctx.timestamps.as_ref() else {
+        let Some(probe) = self.timestamps.as_ref() else {
             return;
         };
         let slot = self.cur;
@@ -1990,7 +2081,7 @@ impl EncoderPools {
         mark: u32,
     ) {
         debug_assert!(mark < TimestampProbe::PER_SLOT);
-        let Some(probe) = ctx.timestamps.as_ref() else {
+        let Some(probe) = self.timestamps.as_ref() else {
             return;
         };
         if !self.slots[self.cur].readback_span_armed {
@@ -2011,7 +2102,7 @@ impl EncoderPools {
     /// Keeping the armed bit beside the slot prevents a reset in another
     /// encoder from being mistaken for this recording's result.
     unsafe fn readback_span_read(&mut self, ctx: &DeviceContext, slot: usize) {
-        let Some(probe) = ctx.timestamps.as_ref() else {
+        let Some(probe) = self.timestamps.as_ref() else {
             return;
         };
         if !std::mem::replace(&mut self.slots[slot].readback_span_armed, false) {
@@ -2040,7 +2131,7 @@ impl EncoderPools {
     /// defect, not a reason to wait in the retirement path. Reading only the
     /// written prefix avoids asking Vulkan for reset-but-unwritten query pairs.
     unsafe fn gpu_span_read(&mut self, ctx: &DeviceContext, slot: usize) {
-        let Some(probe) = ctx.draw_spans.as_ref() else {
+        let Some(probe) = self.draw_spans.as_ref() else {
             return;
         };
         let gpu_span::SlotSpan::Sealed { kind, draws } =

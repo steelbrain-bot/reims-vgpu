@@ -6846,7 +6846,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // has been waited on, a few lines below — at which point the command buffer
     // that names it has completed, which is the whole of Vulkan's valid-usage
     // requirement for destroying it. That is deliberately simpler than the
-    // `TimestampProbe` shape (one pool for the device's life): this pool cannot
+    // `TimestampProbe` shape (one pool for the encoder's life): this pool cannot
     // be shared with a concurrent submission because there is no concurrent
     // submission to share it with, a queried draw having just been excluded
     // from batching. If `note_create` ever shows these in volume, pooling them

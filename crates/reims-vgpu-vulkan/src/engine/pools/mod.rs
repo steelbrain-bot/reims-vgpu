@@ -451,6 +451,13 @@ pub(crate) struct EncoderPools {
     /// buffer can open. `None` on a host that writes no timestamps, which is
     /// what makes every pass stamp a no-op there.
     pass_probe: Option<vk::QueryPool>,
+    /// Timestamp queries owned by this encoder's readback ring. Slot ordinals
+    /// are local to an encoder, so the pool must be local too: sharing a pool
+    /// would let slot zero in one recorder reset slot zero still executing in
+    /// another.
+    timestamps: Option<TimestampProbe>,
+    /// Draw and render-pass timestamp regions owned by this encoder's ring.
+    draw_spans: Option<DrawSpanProbe>,
     /// Index of the pass region pair whose begin stamp is written and whose end
     /// stamp is not, i.e. the open pass instance's own pair.
     ///

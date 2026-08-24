@@ -552,8 +552,8 @@ pub(crate) struct DeviceContext {
     /// Metal's attachment-wide load clear before the minimum-sized framebuffer.
     pub depth_transfer_dst: bool,
     pub depth_stencil_transfer_dst: bool,
-    /// A two-slot timestamp query pool for the composite readback, and the tick
-    /// length that turns its delta into wall clock. `None` when this queue
+    /// Tick geometry for each encoder's composite-readback timestamp pool.
+    /// `None` when this queue
     /// family reports `timestampValidBits == 0` or the device reports a
     /// `timestampPeriod` of zero, both of which Vulkan permits.
     ///
@@ -561,19 +561,17 @@ pub(crate) struct DeviceContext {
     /// `readback_split fence_us` is wall clock spent blocked, and a blocked
     /// caller cannot tell GPU work from the latency of asking. See
     /// [`TimestampProbe`].
-    pub timestamps: Option<TimestampProbe>,
-    /// Two timestamps per ring slot, for the GPU execution time of a draw
-    /// submission. `None` on the same two capability answers as
-    /// [`Self::timestamps`], and additionally when [`reims_vgpu_config::GPU_SPANS`] is
+    pub timestamp_scale: Option<TickScale>,
+    /// Tick geometry for each encoder's draw-span timestamp pool. `None` on the
+    /// same two capability answers as [`Self::timestamp_scale`], and additionally
+    /// when [`reims_vgpu_config::GPU_SPANS`] is
     /// off — which is the whole of how that switch narrows, because a `None` here
     /// means no query is ever reset, written or read.
     ///
-    /// Separate from [`Self::timestamps`] rather than a wider pool because the two
-    /// are indexed by different things: the readback's three queries are safe to
-    /// share for the device's life precisely because that path is serialized,
-    /// while a draw's pair belongs to the ring slot whose fence will make it
-    /// readable. See [`super::gpu_span`].
-    pub draw_spans: Option<DrawSpanProbe>,
+    /// Separate from [`Self::timestamp_scale`] because the two encoder-owned
+    /// pools have different per-slot shapes and independent enablement. See
+    /// [`super::gpu_span`].
+    pub draw_span_scale: Option<TickScale>,
     /// The thread that publishes and announces FIFO completion stamps, and the
     /// timeline semaphore FIFO-owned submissions signal.
     ///
@@ -1085,46 +1083,14 @@ impl DeviceContext {
             qfs[gq as usize].timestamp_valid_bits,
             props.limits.timestamp_period,
         );
-        // One region per ring slot, for the reason `TimestampProbe`'s doc gives:
-        // the guest-page writeback submits without waiting, so two of its copies
-        // can be in flight at once and a shared region is reset under the first.
-        let timestamps = scale.and_then(|scale| {
-            let ci = vk::QueryPoolCreateInfo::default()
-                .query_type(vk::QueryType::TIMESTAMP)
-                .query_count(TimestampProbe::PER_SLOT * super::pools::RING_DEPTH as u32);
-            device
-                .create_query_pool(&ci, None)
-                .map(|pool| TimestampProbe { pool, scale })
-                .map_err(|e| {
-                    reims_vgpu_observe::Emit::decline(
-                        "vk_timestamp_pool",
-                        &VkCall::new(VkOp::ContextCreateQueryPool, e),
-                    )
-                    .fail_once(0);
-                })
-                .ok()
+        // Query pools themselves belong to each encoder. Keeping only the
+        // device-reported scale here prevents two independent encoders with the
+        // same ring-slot ordinal from resetting one another's live queries.
+        let timestamp_scale = scale;
+        let draw_span_scale = scale.filter(|_| {
+            reims_vgpu_config::read(reims_vgpu_config::GPU_SPANS).0
+                != reims_vgpu_config::Switch::Off
         });
-        let draw_spans = scale
-            .filter(|_| {
-                reims_vgpu_config::read(reims_vgpu_config::GPU_SPANS).0
-                    != reims_vgpu_config::Switch::Off
-            })
-            .and_then(|scale| {
-                let ci = vk::QueryPoolCreateInfo::default()
-                    .query_type(vk::QueryType::TIMESTAMP)
-                    .query_count(DrawSpanProbe::PER_SLOT * super::pools::RING_DEPTH as u32);
-                device
-                    .create_query_pool(&ci, None)
-                    .map(|pool| DrawSpanProbe { pool, scale })
-                    .map_err(|e| {
-                        reims_vgpu_observe::Emit::decline(
-                            "vk_draw_span_pool",
-                            &VkCall::new(VkOp::ContextCreateQueryPool, e),
-                        )
-                        .fail_once(0);
-                    })
-                    .ok()
-            });
         // Gated on the feature actually being enabled, not on the API version.
         // `timelineSemaphore` is core in 1.2 and this backend's baseline is 1.2,
         // so a device that declines it is out of spec — which is exactly why the
@@ -1286,8 +1252,8 @@ impl DeviceContext {
             depth_stencil_format,
             depth_transfer_dst,
             depth_stencil_transfer_dst,
-            timestamps,
-            draw_spans,
+            timestamp_scale,
+            draw_span_scale,
             stamp_completion,
             queue_owner,
             pipeline_cache_path: Some(pipeline_cache_path),
@@ -1392,12 +1358,6 @@ impl DeviceContext {
         // running.
         if let Some(mut completion) = self.stamp_completion.take() {
             unsafe { completion.stop(&self.device) };
-        }
-        if let Some(probe) = self.timestamps.take() {
-            self.device.destroy_query_pool(probe.pool, None);
-        }
-        if let Some(probe) = self.draw_spans.take() {
-            self.device.destroy_query_pool(probe.pool, None);
         }
         self.device
             .destroy_pipeline_cache(self.pipeline_cache, None);
