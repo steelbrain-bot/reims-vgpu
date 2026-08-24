@@ -700,6 +700,14 @@ impl EncoderPools {
             .map(|batch| (batch.cb, batch.fence))
     }
 
+    pub(crate) fn batch_stamp_recording(
+        &self,
+    ) -> Option<super::super::stamp_completion::RecordingStampId> {
+        self.open_batch
+            .as_ref()
+            .and_then(|batch| batch.stamp_recording)
+    }
+
     fn new() -> Self {
         Self {
             readback_lease_returns: Arc::new(ReadbackLeaseReturns::default()),
@@ -2582,6 +2590,7 @@ impl ResourcePools {
         target: BatchTarget,
         dset: Option<(vk::DescriptorSet, vk::DescriptorPool)>,
         sampled_retains: Vec<SampledRetain>,
+        stamp_completion: Option<&super::super::stamp_completion::StampCompletion>,
         counters: &EngineCounters,
     ) {
         let (cb, fence) = slot;
@@ -2601,6 +2610,7 @@ impl ResourcePools {
                 self.install_open_batch(OpenBatch {
                     cb,
                     fence,
+                    stamp_recording: stamp_completion.and_then(|owner| owner.begin_recording()),
                     target,
                     draws: 1,
                     dsets: dset.into_iter().collect(),
@@ -2675,9 +2685,10 @@ impl ResourcePools {
         }
         let submit_started = std::time::Instant::now();
         let submit = attempt_sealed_commit(sealed, || {
-            unsafe { ctx.submit_guest_work_async(&[batch.cb], batch.fence) }.map_err(|result| {
-                super::super::guest_submit_error(DeviceLostOp::PoolsSubmitBatch, result)
-            })
+            unsafe { ctx.submit_guest_work_async(&[batch.cb], batch.fence, batch.stamp_recording) }
+                .map_err(|result| {
+                    super::super::guest_submit_error(DeviceLostOp::PoolsSubmitBatch, result)
+                })
         });
         counters.batch_flush_submit_us.fetch_add(
             submit_started.elapsed().as_micros() as u64,
@@ -6370,6 +6381,7 @@ mod recycle_tests {
         pools.install_open_batch(OpenBatch {
             cb: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
+            stamp_recording: None,
             target: BatchTarget {
                 identity: TargetIdentity::Anonymous { slot: 0 },
                 width: 16,
@@ -6397,6 +6409,7 @@ mod recycle_tests {
         pools.encoder.open_batch = Some(OpenBatch {
             cb: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
+            stamp_recording: None,
             target: BatchTarget {
                 identity: TargetIdentity::Anonymous { slot: 0 },
                 width: 16,
@@ -6439,6 +6452,7 @@ mod recycle_tests {
         pools.encoder.open_batch = Some(OpenBatch {
             cb: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
+            stamp_recording: None,
             target: target(0),
             draws: 1,
             dsets: Vec::new(),
@@ -6869,6 +6883,7 @@ mod scatter_descriptor_sets_do_not_alias {
         pools.encoder.open_batch = Some(super::OpenBatch {
             cb: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
+            stamp_recording: None,
             target: target.clone(),
             draws: 3,
             dsets: Vec::new(),

@@ -2546,15 +2546,18 @@ pub fn write_completion_stamp(
             rung: ctx.caps.host_pointer.rung,
         }));
     };
+    let recording = pools.encoder().batch_stamp_recording();
     let had_batch = pools.encoder().batch_open_recording().is_some();
-    let deferred = had_batch
-        && completion.queue_for_next_submission(
+    let deferred = recording.is_some_and(|recording| {
+        completion.queue_for_recording(
+            recording,
             session,
             Arc::clone(&stamp_signals),
             index,
             guest_ref.clone(),
             value,
-        );
+        )
+    });
     if !deferred {
         // A full pending ring cannot wait while this thread owns the open
         // command buffer: submitting it is what lets completions retire. This
@@ -2588,8 +2591,8 @@ pub fn write_completion_stamp(
 /// Submit the open batch when FIFO `index` is owed a stamp parked in it.
 ///
 /// Called when a guest packet is held on a stamp wait this device has already
-/// promised but not put in flight. `queue_for_next_submission` registers a stamp
-/// against the open batch's *future* submission point, and the batch has no time
+/// promised but not put in flight. `queue_for_recording` registers a stamp
+/// against the exact open recording, and the batch has no time
 /// bound — it stays open until a draw claims a slot, a readback arrives, a
 /// present runs, or the pending ring fills. On a channel that has gone quiet
 /// none of those need happen soon, so a timeline can block for tens of

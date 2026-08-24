@@ -7611,6 +7611,7 @@ pub(crate) unsafe fn execute_draw_inner(
             target,
             dset.zip(dset_pool),
             sampled_retains,
+            ctx.stamp_completion.as_ref(),
             counters,
         );
         // The recording point was reserved before attachment resolution and

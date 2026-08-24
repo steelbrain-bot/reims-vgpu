@@ -1086,6 +1086,9 @@ fn scissors_match(a: &[vk::Rect2D], b: &[vk::Rect2D]) -> bool {
 pub(crate) struct OpenBatch {
     cb: vk::CommandBuffer,
     fence: vk::Fence,
+    /// Exact recording identity for completion stamps parked while this
+    /// command buffer remains open. `None` when the timeline rail is absent.
+    stamp_recording: Option<super::stamp_completion::RecordingStampId>,
     /// Only the narrowed arm reads this; see [`BatchFit::OtherTarget`].
     target: BatchTarget,
     draws: u64,

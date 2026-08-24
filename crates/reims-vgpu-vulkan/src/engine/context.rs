@@ -1539,7 +1539,7 @@ impl DeviceContext {
         let timeline = self
             .stamp_completion
             .as_ref()
-            .map(|completion| completion.reserve_submission());
+            .map(|completion| completion.reserve_submission(None));
         let timeline_value = timeline.as_ref().map(|(_, value, _)| *value);
         let timeline_wait = wait_value.and_then(|value| {
             timeline.as_ref().map(|(semaphore, signal, _)| {
@@ -1566,11 +1566,12 @@ impl DeviceContext {
         &self,
         command_buffers: &[vk::CommandBuffer],
         fence: vk::Fence,
+        recording: Option<super::stamp_completion::RecordingStampId>,
     ) -> Result<AsyncGuestSubmission, vk::Result> {
         let timeline = self
             .stamp_completion
             .as_ref()
-            .map(|completion| completion.reserve_submission());
+            .map(|completion| completion.reserve_submission(recording));
         let timeline_value = timeline.as_ref().map(|(_, value, _)| *value);
         let Some(owner) = self.queue_owner.as_ref() else {
             return unsafe {

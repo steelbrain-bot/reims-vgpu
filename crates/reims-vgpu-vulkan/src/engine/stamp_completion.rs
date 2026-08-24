@@ -106,13 +106,13 @@ pub(super) fn fifo_has_pending_stamp(state: &SessionState, index: u32) -> bool {
 }
 
 /// The subset of the session's pending mask whose completion point is a submission
-/// **this device has not made yet** — a stamp registered against the open
-/// batch's future point by `StampCompletion::queue_for_next_submission`.
+/// **this device has not made yet** — a stamp registered against the exact open
+/// recording by `StampCompletion::queue_for_recording`.
 ///
 /// The distinction is the whole difference between a guest waiting on the GPU
 /// and a guest waiting on *us*. A `Submitted` stamp is in flight and nothing can
-/// make it land sooner. A `NextSubmission` stamp is a word we have promised and
-/// then parked in a command buffer that is still recording, and the batch has no
+/// make it land sooner. A parked stamp is a word we have promised and attached
+/// to a command buffer that is still recording, and the batch has no
 /// time bound — it stays open until a draw claims a slot, a readback arrives, a
 /// present runs, or the pending ring fills. So a timeline blocked on one is
 /// blocked until unrelated work happens to arrive, which on a quiet channel can
@@ -189,20 +189,27 @@ struct Waiting {
     queued_at: std::time::Instant,
 }
 
-/// Association between one guest stamp and one FIFO-owned submission.
+/// Identity of the command-buffer recording a deferred guest stamp belongs to.
 ///
-/// A stamp recorded in an open batch already knows which monotonic point the
-/// next reservation will receive. Carrying that point here prevents an older,
-/// delayed `vkQueueSubmit` from claiming stamps recorded for a newer batch.
+/// This is deliberately not a predicted timeline value. Recording contexts may
+/// finish out of order; only ordered queue acceptance assigns a timeline point.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct RecordingStampId(std::num::NonZeroU64);
+
+/// Association between one submitted guest stamp and its FIFO-owned timeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CompletionPoint {
-    NextSubmission(u64),
     Submitted(u64),
 }
 
 #[derive(Default)]
 struct PendingQueue {
     waiting: std::collections::VecDeque<Waiting>,
+    /// Stamps grouped by the exact command-buffer recording that owns them.
+    /// Groups move to `waiting` only when ordered queue acceptance assigns
+    /// their timeline, so record completion order cannot become publication
+    /// order.
+    parked: std::collections::HashMap<RecordingStampId, Vec<Waiting>>,
     per_fifo: std::collections::HashMap<(super::SessionId, u32), usize>,
 }
 
@@ -211,12 +218,21 @@ impl PendingQueue {
         self.per_fifo.get(&(session, index)).copied().unwrap_or(0) == FIFO_PENDING_STAMP_CAPACITY
     }
 
-    fn push(&mut self, waiting: Waiting) {
+    fn note_pending(&mut self, waiting: &Waiting) {
         *self
             .per_fifo
             .entry((waiting.session, waiting.index))
             .or_default() += 1;
+    }
+
+    fn push(&mut self, waiting: Waiting) {
+        self.note_pending(&waiting);
         self.waiting.push_back(waiting);
+    }
+
+    fn park(&mut self, recording: RecordingStampId, waiting: Waiting) {
+        self.note_pending(&waiting);
+        self.parked.entry(recording).or_default().push(waiting);
     }
 
     fn pop_front(&mut self) -> Option<Waiting> {
@@ -235,39 +251,44 @@ impl PendingQueue {
         self.per_fifo.contains_key(&(session, index))
     }
 
-    fn bind_submission(&mut self, timeline: u64) -> usize {
-        let mut bound = 0;
-        for waiting in &mut self.waiting {
-            if waiting.point == CompletionPoint::NextSubmission(timeline) {
-                waiting.point = CompletionPoint::Submitted(timeline);
-                bound += 1;
-            }
+    fn bind_recording(&mut self, recording: RecordingStampId, timeline: u64) -> usize {
+        let Some(mut bound) = self.parked.remove(&recording) else {
+            return 0;
+        };
+        let count = bound.len();
+        for waiting in &mut bound {
+            waiting.point = CompletionPoint::Submitted(timeline);
         }
+        self.waiting.extend(bound);
         self.republish_unsubmitted();
-        bound
+        count
     }
 
     /// Recompute the lock-free projection of which FIFOs still have a stamp
     /// parked on an unsubmitted batch.
     ///
     /// Recomputed from the queue rather than decremented, because one
-    /// `bind_submission` can promote several of a FIFO's stamps at once while
+    /// `bind_recording` can promote several of a FIFO's stamps at once while
     /// leaving others — belonging to a *later* still-open batch — behind, and a
     /// counter stepped per promotion would clear the bit while one of those is
     /// still parked.
     fn republish_unsubmitted(&self) {
         let mut masks: std::collections::HashMap<usize, (Arc<SessionState>, u32)> =
             std::collections::HashMap::new();
-        for waiting in &self.waiting {
+        for waiting in self.parked.values().flatten() {
             let key = Arc::as_ptr(&waiting.signals) as usize;
             let (_, mask) = masks
                 .entry(key)
                 .or_insert_with(|| (Arc::clone(&waiting.signals), 0));
-            if matches!(waiting.point, CompletionPoint::NextSubmission(_))
-                && waiting.index < u32::BITS
-            {
+            if waiting.index < u32::BITS {
                 *mask |= 1u32 << waiting.index;
             }
+        }
+        for waiting in &self.waiting {
+            let key = Arc::as_ptr(&waiting.signals) as usize;
+            masks
+                .entry(key)
+                .or_insert_with(|| (Arc::clone(&waiting.signals), 0));
         }
         for (_, (signals, mask)) in masks {
             signals.unsubmitted_fifo_mask.store(mask, Ordering::Release);
@@ -283,9 +304,11 @@ struct Shared {
     /// where it should be.
     wake: Condvar,
     stop: AtomicBool,
-    /// Highest value handed out. The drain worker reserves with `fetch_add`
-    /// under the engine lock, so reservation order is submission order.
+    /// Highest value handed out. The ordered commit caller reserves immediately
+    /// before queue handoff, so reservation order is submission order.
     next_value: AtomicU64,
+    /// Unique ownership identities for command buffers still recording.
+    next_recording: AtomicU64,
     /// Highest timeline point successfully handed to the ordered queue owner.
     ///
     /// A completion stamp may be recorded after the handoff but before the
@@ -296,12 +319,17 @@ struct Shared {
 }
 
 impl Shared {
-    /// Point an open batch will receive when it is handed to the queue.
-    fn next_submission(&self) -> u64 {
-        self.next_value.load(Ordering::Acquire) + 1
+    fn begin_recording(&self) -> Option<RecordingStampId> {
+        self.next_recording
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_add(1)
+            })
+            .ok()
+            .and_then(|previous| std::num::NonZeroU64::new(previous + 1))
+            .map(RecordingStampId)
     }
 
-    /// Reserve the point previously advertised by [`Self::next_submission`].
+    /// Reserve the next queue-completion point in ordered handoff order.
     fn reserve_submission(&self) -> u64 {
         self.next_value.fetch_add(1, Ordering::AcqRel) + 1
     }
@@ -313,11 +341,13 @@ impl Shared {
 }
 
 /// Cloneable publication half handed to the queue owner with one submission.
-/// It cannot stop the completion thread or destroy its semaphore; it can only
-/// bind pending guest stamps after `vkQueueSubmit` has actually succeeded.
+/// It cannot stop the completion thread or destroy its semaphore; it binds the
+/// recording's pending stamps when the ordered owner accepts the handoff, then
+/// records the driver's later return without changing that association.
 #[derive(Clone)]
 pub(crate) struct SubmissionNote {
     shared: Arc<Shared>,
+    recording: Option<RecordingStampId>,
 }
 
 #[cfg(test)]
@@ -334,6 +364,7 @@ impl SubmissionProbe {
                 wake: Condvar::new(),
                 stop: AtomicBool::new(false),
                 next_value: AtomicU64::new(0),
+                next_recording: AtomicU64::new(0),
                 latest_queued: AtomicU64::new(0),
             }),
         }
@@ -342,6 +373,7 @@ impl SubmissionProbe {
     pub(super) fn note(&self) -> SubmissionNote {
         SubmissionNote {
             shared: Arc::clone(&self.shared),
+            recording: None,
         }
     }
 
@@ -355,19 +387,22 @@ impl SubmissionNote {
         self.shared
             .latest_queued
             .fetch_max(value, Ordering::Release);
-    }
-
-    pub(crate) fn submitted(&self, value: u64) {
-        self.queued(value);
+        let Some(recording) = self.recording else {
+            return;
+        };
         let bound = self
             .shared
             .queue
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .bind_submission(value);
+            .bind_recording(recording, value);
         if bound != 0 {
             self.shared.wake.notify_all();
         }
+    }
+
+    pub(crate) fn submitted(&self, value: u64) {
+        self.queued(value);
     }
 }
 
@@ -403,6 +438,7 @@ impl StampCompletion {
             wake: Condvar::new(),
             stop: AtomicBool::new(false),
             next_value: AtomicU64::new(0),
+            next_recording: AtomicU64::new(0),
             latest_queued: AtomicU64::new(0),
         });
         let thread_shared = Arc::clone(&shared);
@@ -420,19 +456,29 @@ impl StampCompletion {
 
     /// Reserve the timeline point for one FIFO-owned queue submission.
     ///
-    /// Reserved under the engine lock, so the values are handed out in
-    /// submission order — which is what makes a single-threaded drain of the
-    /// queue announce stamps in that same order without any further ordering
-    /// machinery.
-    pub(crate) fn reserve_submission(&self) -> (vk::Semaphore, u64, SubmissionNote) {
+    /// The caller must already own ordered commit. Values are handed out in
+    /// that order, which lets the single completion thread announce stamps in
+    /// the same order without reconstructing it from recording completion.
+    pub(crate) fn reserve_submission(
+        &self,
+        recording: Option<RecordingStampId>,
+    ) -> (vk::Semaphore, u64, SubmissionNote) {
         let value = self.shared.reserve_submission();
         (
             self.semaphore,
             value,
             SubmissionNote {
                 shared: Arc::clone(&self.shared),
+                recording,
             },
         )
+    }
+
+    /// Mint the identity an open command buffer uses to own deferred stamps.
+    /// Exhaustion disables deferral for that recording; the caller then takes
+    /// the existing flush-and-bind path instead of reusing an identity.
+    pub(crate) fn begin_recording(&self) -> Option<RecordingStampId> {
+        self.shared.begin_recording()
     }
 
     /// The newest queue point this device has accepted, including work waiting
@@ -495,8 +541,9 @@ impl StampCompletion {
     /// pending ring is full. The caller owns the open command buffer, so
     /// sleeping there would prevent the very submission that can make room;
     /// it must submit the batch and retry against that concrete point.
-    pub(super) fn queue_for_next_submission(
+    pub(super) fn queue_for_recording(
         &self,
+        recording: RecordingStampId,
         session: super::SessionId,
         signals: Arc<SessionState>,
         index: u32,
@@ -515,20 +562,21 @@ impl StampCompletion {
         if queue.is_full(session, index) || self.shared.stop.load(Ordering::Acquire) {
             return false;
         }
-        // The engine lock serializes this read with reservation. No other
-        // FIFO-owned submission can reserve between recording this stamp and
-        // flushing its open batch, so this is the batch's exact future point.
-        let target = self.shared.next_submission();
-        queue.push(Waiting {
-            session,
-            signals: Arc::clone(&signals),
-            point: CompletionPoint::NextSubmission(target),
-            index,
-            word,
-            stamp,
+        queue.park(
+            recording,
+            Waiting {
+                session,
+                signals: Arc::clone(&signals),
+                // Parked entries have no executable timeline yet. This value is
+                // overwritten when their exact recording reaches ordered commit.
+                point: CompletionPoint::Submitted(0),
+                index,
+                word,
+                stamp,
 
-            queued_at: std::time::Instant::now(),
-        });
+                queued_at: std::time::Instant::now(),
+            },
+        );
         signals
             .pending_fifo_mask
             .fetch_or(1u32 << index, Ordering::Release);
@@ -585,7 +633,7 @@ impl StampCompletion {
             let _ = join.join();
         }
         let queue = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
-        for waiting in &queue.waiting {
+        for waiting in queue.waiting.iter().chain(queue.parked.values().flatten()) {
             waiting
                 .signals
                 .pending_fifo_mask
@@ -629,9 +677,7 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
             return;
         };
         let semaphores = [semaphore];
-        let CompletionPoint::Submitted(timeline) = waiting.point else {
-            unreachable!("front was checked as submitted")
-        };
+        let CompletionPoint::Submitted(timeline) = waiting.point;
         let values = [timeline];
         let info = vk::SemaphoreWaitInfo::default()
             .semaphores(&semaphores)
@@ -818,10 +864,8 @@ mod tests {
         }
     }
 
-    fn deferred(index: u32, stamp: u32, submission: u64) -> Waiting {
-        let mut waiting = waiting(index, stamp);
-        waiting.point = CompletionPoint::NextSubmission(submission);
-        waiting
+    fn recording(value: u64) -> RecordingStampId {
+        RecordingStampId(std::num::NonZeroU64::new(value).expect("nonzero recording"))
     }
 
     fn test_shared(next_value: u64) -> Arc<Shared> {
@@ -830,6 +874,7 @@ mod tests {
             wake: Condvar::new(),
             stop: AtomicBool::new(false),
             next_value: AtomicU64::new(next_value),
+            next_recording: AtomicU64::new(0),
             latest_queued: AtomicU64::new(0),
         })
     }
@@ -875,15 +920,15 @@ mod tests {
         let second_signals = Arc::new(SessionState::default());
         let mut queue = PendingQueue::default();
         for stamp in 0..FIFO_PENDING_STAMP_CAPACITY as u32 {
-            let mut entry = deferred(0, stamp, 7);
+            let mut entry = waiting(0, stamp);
             entry.session = first;
             entry.signals = Arc::clone(&first_signals);
-            queue.push(entry);
+            queue.park(recording(7), entry);
         }
-        let mut other = deferred(0, 0xfeed, 9);
+        let mut other = waiting(0, 0xfeed);
         other.session = second;
         other.signals = Arc::clone(&second_signals);
-        queue.push(other);
+        queue.park(recording(9), other);
         queue.republish_unsubmitted();
 
         assert!(queue.is_full(first, 0));
@@ -891,7 +936,10 @@ mod tests {
         assert!(fifo_has_unsubmitted_stamp(&first_signals, 0));
         assert!(fifo_has_unsubmitted_stamp(&second_signals, 0));
 
-        assert_eq!(queue.bind_submission(7), FIFO_PENDING_STAMP_CAPACITY);
+        assert_eq!(
+            queue.bind_recording(recording(7), 7),
+            FIFO_PENDING_STAMP_CAPACITY
+        );
         assert!(!fifo_has_unsubmitted_stamp(&first_signals, 0));
         assert!(fifo_has_unsubmitted_stamp(&second_signals, 0));
     }
@@ -927,7 +975,7 @@ mod tests {
     /// an unmade submission — not merely when one of them is bound.
     ///
     /// A FIFO can hold stamps against two different open batches, and
-    /// `bind_submission` promotes only the one whose point matches. Stepping a
+    /// `bind_recording` promotes only the exact recording. Stepping a
     /// counter per promotion would clear the bit while the later batch's stamp
     /// is still parked, and a timeline blocked on *that* one would then never
     /// get its batch submitted. Hence the recompute.
@@ -936,24 +984,21 @@ mod tests {
         let mut queue = PendingQueue::default();
 
         // Two batches' worth of stamps on one FIFO, plus a sibling's.
-        let mut early = waiting(1, 0x10);
+        let early = waiting(1, 0x10);
         let signals = Arc::clone(&early.signals);
-        early.point = CompletionPoint::NextSubmission(7);
         let mut late = waiting(1, 0x11);
         late.signals = Arc::clone(&signals);
-        late.point = CompletionPoint::NextSubmission(9);
         let mut other = waiting(2, 0x20);
         other.signals = Arc::clone(&signals);
-        other.point = CompletionPoint::NextSubmission(9);
-        queue.push(early);
-        queue.push(late);
-        queue.push(other);
+        queue.park(recording(7), early);
+        queue.park(recording(9), late);
+        queue.park(recording(9), other);
         queue.republish_unsubmitted();
         assert!(fifo_has_unsubmitted_stamp(&signals, 1));
         assert!(fifo_has_unsubmitted_stamp(&signals, 2));
 
         // Submitting batch 7 binds only the early one.
-        assert_eq!(queue.bind_submission(7), 1);
+        assert_eq!(queue.bind_recording(recording(7), 7), 1);
         assert!(
             fifo_has_unsubmitted_stamp(&signals, 1),
             "FIFO 1 still has a stamp on batch 9, so its batch must still be \
@@ -962,7 +1007,7 @@ mod tests {
         assert!(fifo_has_unsubmitted_stamp(&signals, 2));
 
         // Submitting batch 9 binds the rest, and both bits clear.
-        assert_eq!(queue.bind_submission(9), 2);
+        assert_eq!(queue.bind_recording(recording(9), 9), 2);
         assert!(
             !fifo_has_unsubmitted_stamp(&signals, 1),
             "with everything in flight there is nothing left to submit early"
@@ -970,8 +1015,8 @@ mod tests {
         assert!(!fifo_has_unsubmitted_stamp(&signals, 2));
     }
 
-    /// Reservation order is submission order; reserving alone does not publish
-    /// a point that a completion stamp could observe.
+    /// Recording identity and timeline reservation are separate monotonic
+    /// namespaces; neither publishes a queue point by itself.
     #[test]
     fn reservations_are_monotonic_and_handoff_is_published_separately() {
         let shared = Shared {
@@ -979,15 +1024,12 @@ mod tests {
             wake: Condvar::new(),
             stop: AtomicBool::new(false),
             next_value: AtomicU64::new(0),
+            next_recording: AtomicU64::new(0),
             latest_queued: AtomicU64::new(0),
         };
         for n in 1u64..=100 {
-            assert_eq!(shared.next_submission(), n);
-            assert_eq!(
-                shared.reserve_submission(),
-                n,
-                "the point recorded into an open-batch stamp is exactly the point subsequently reserved"
-            );
+            assert_eq!(shared.begin_recording(), Some(recording(n)));
+            assert_eq!(shared.reserve_submission(), n);
         }
         assert_eq!(shared.latest_queued.load(Ordering::Acquire), 0);
     }
@@ -999,10 +1041,12 @@ mod tests {
             wake: Condvar::new(),
             stop: AtomicBool::new(false),
             next_value: AtomicU64::new(1),
+            next_recording: AtomicU64::new(0),
             latest_queued: AtomicU64::new(0),
         });
         let note = SubmissionNote {
             shared: Arc::clone(&shared),
+            recording: None,
         };
 
         note.queued(1);
@@ -1067,49 +1111,30 @@ mod tests {
     }
 
     #[test]
-    fn an_open_batch_stamp_binds_only_when_submission_succeeds() {
+    fn an_open_batch_stamp_binds_at_ordered_queue_acceptance() {
         let shared = Arc::new(Shared {
             queue: Mutex::new(PendingQueue::default()),
             wake: Condvar::new(),
             stop: AtomicBool::new(false),
             next_value: AtomicU64::new(0),
+            next_recording: AtomicU64::new(0),
             latest_queued: AtomicU64::new(0),
         });
-        let mut submitted = waiting(0, 1);
-        submitted.point = CompletionPoint::Submitted(7);
-        let mut deferred_a = waiting(0, 2);
-        deferred_a.point = CompletionPoint::NextSubmission(11);
-        let mut deferred_b = waiting(1, 3);
-        deferred_b.point = CompletionPoint::NextSubmission(11);
+        let submitted = waiting(0, 1);
+        let deferred_a = waiting(0, 2);
+        let deferred_b = waiting(1, 3);
         {
             let mut queue = shared.queue.lock().expect("pending queue");
             queue.push(submitted);
-            queue.push(deferred_a);
-            queue.push(deferred_b);
+            queue.park(recording(4), deferred_a);
+            queue.park(recording(4), deferred_b);
         }
         let note = SubmissionNote {
             shared: Arc::clone(&shared),
+            recording: Some(recording(4)),
         };
 
         note.queued(11);
-        let before_submit: Vec<CompletionPoint> = shared
-            .queue
-            .lock()
-            .expect("pending queue")
-            .waiting
-            .iter()
-            .map(|w| w.point)
-            .collect();
-        assert_eq!(
-            before_submit,
-            vec![
-                CompletionPoint::Submitted(7),
-                CompletionPoint::NextSubmission(11),
-                CompletionPoint::NextSubmission(11),
-            ]
-        );
-
-        note.submitted(11);
 
         let points: Vec<CompletionPoint> = shared
             .queue
@@ -1122,10 +1147,16 @@ mod tests {
         assert_eq!(
             points,
             vec![
-                CompletionPoint::Submitted(7),
+                CompletionPoint::Submitted(2),
                 CompletionPoint::Submitted(11),
                 CompletionPoint::Submitted(11),
             ]
+        );
+        note.submitted(11);
+        assert_eq!(
+            shared.queue.lock().expect("pending queue").waiting.len(),
+            3,
+            "the driver-return notification cannot bind the group twice"
         );
     }
 
@@ -1138,22 +1169,22 @@ mod tests {
             wake: Condvar::new(),
             stop: AtomicBool::new(false),
             next_value: AtomicU64::new(0),
+            next_recording: AtomicU64::new(0),
             latest_queued: AtomicU64::new(0),
         });
-        let mut older = waiting(0, 1);
-        older.point = CompletionPoint::NextSubmission(1);
-        let mut newer = waiting(0, 2);
-        newer.point = CompletionPoint::NextSubmission(2);
+        let older = waiting(0, 1);
+        let newer = waiting(0, 2);
         {
             let mut queue = shared.queue.lock().expect("pending queue");
-            queue.push(older);
-            queue.push(newer);
+            queue.park(recording(1), older);
+            queue.park(recording(2), newer);
         }
         let note = SubmissionNote {
             shared: Arc::clone(&shared),
+            recording: Some(recording(1)),
         };
 
-        note.submitted(1);
+        note.queued(1);
 
         let points: Vec<CompletionPoint> = shared
             .queue
@@ -1163,12 +1194,16 @@ mod tests {
             .iter()
             .map(|w| w.point)
             .collect();
+        assert_eq!(points, vec![CompletionPoint::Submitted(1)]);
         assert_eq!(
-            points,
-            vec![
-                CompletionPoint::Submitted(1),
-                CompletionPoint::NextSubmission(2),
-            ]
+            shared
+                .queue
+                .lock()
+                .expect("pending queue")
+                .parked
+                .get(&recording(2))
+                .map(Vec::len),
+            Some(1)
         );
     }
 
@@ -1180,36 +1215,31 @@ mod tests {
         const BATCHES: u64 = 8;
         const FIFOS: u32 = 4;
         let mut queue = PendingQueue::default();
-        let mut owners = Vec::new();
 
         // A concrete pressure-path point is mixed into the same queue. No
         // open-batch submission notification may rewrite it.
         queue.push(waiting(FIFOS, 0xf000));
-        owners.push(None);
         for batch in 1..=BATCHES {
             for fifo in 0..FIFOS {
-                queue.push(deferred(fifo, (batch as u32) * 16 + fifo, batch));
-                owners.push(Some(batch));
+                queue.park(recording(batch), waiting(fifo, (batch as u32) * 16 + fifo));
             }
         }
         let fifo_levels = queue.per_fifo.clone();
 
         for submitted in 1..=BATCHES {
             assert_eq!(
-                queue.bind_submission(submitted),
+                queue.bind_recording(recording(submitted), submitted),
                 FIFOS as usize,
                 "one notification binds every FIFO stamp in its batch and no other"
             );
-            for (waiting, owner) in queue.waiting.iter().zip(&owners) {
-                let expected = match owner {
-                    None => CompletionPoint::Submitted(0xf001),
-                    Some(batch) if *batch <= submitted => CompletionPoint::Submitted(*batch),
-                    Some(batch) => CompletionPoint::NextSubmission(*batch),
-                };
-                assert_eq!(waiting.point, expected, "owner={owner:?} after={submitted}");
-            }
+            assert_eq!(queue.waiting.len(), 1 + submitted as usize * FIFOS as usize);
+            assert!(queue
+                .waiting
+                .iter()
+                .skip(1)
+                .all(|waiting| matches!(waiting.point, CompletionPoint::Submitted(_))));
             assert_eq!(
-                queue.bind_submission(submitted),
+                queue.bind_recording(recording(submitted), submitted),
                 0,
                 "a duplicate driver-success notification is idempotent"
             );
@@ -1226,25 +1256,45 @@ mod tests {
     #[test]
     fn out_of_order_notifications_still_cannot_cross_batch_ownership() {
         let mut queue = PendingQueue::default();
-        queue.push(deferred(0, 1, 1));
-        queue.push(deferred(0, 2, 2));
-        queue.push(deferred(0, 3, 3));
+        queue.park(recording(1), waiting(0, 1));
+        queue.park(recording(2), waiting(0, 2));
+        queue.park(recording(3), waiting(0, 3));
 
-        assert_eq!(queue.bind_submission(2), 1);
+        assert_eq!(queue.bind_recording(recording(2), 2), 1);
         assert_eq!(
             queue.waiting.iter().map(|w| w.point).collect::<Vec<_>>(),
-            vec![
-                CompletionPoint::NextSubmission(1),
-                CompletionPoint::Submitted(2),
-                CompletionPoint::NextSubmission(3),
-            ]
+            vec![CompletionPoint::Submitted(2)]
         );
-        assert_eq!(queue.bind_submission(1), 1);
-        assert_eq!(queue.bind_submission(3), 1);
+        assert_eq!(queue.bind_recording(recording(1), 1), 1);
+        assert_eq!(queue.bind_recording(recording(3), 3), 1);
         assert!(queue
             .waiting
             .iter()
             .all(|waiting| matches!(waiting.point, CompletionPoint::Submitted(_))));
+    }
+
+    #[test]
+    fn recording_finish_order_cannot_replace_ordered_commit_order() {
+        let mut queue = PendingQueue::default();
+        // The later recording finishes first and parks its stamp first.
+        queue.park(recording(2), waiting(0, 0x22));
+        queue.park(recording(1), waiting(0, 0x11));
+
+        // Ordered queue acceptance remains the only publication order.
+        queue.bind_recording(recording(1), 7);
+        queue.bind_recording(recording(2), 8);
+
+        assert_eq!(
+            queue
+                .waiting
+                .iter()
+                .map(|waiting| (waiting.stamp, waiting.point))
+                .collect::<Vec<_>>(),
+            vec![
+                (0x11, CompletionPoint::Submitted(7)),
+                (0x22, CompletionPoint::Submitted(8)),
+            ]
+        );
     }
 
     /// Reproduce the actual two-thread shape deterministically: the queue
@@ -1257,11 +1307,12 @@ mod tests {
             .queue
             .lock()
             .expect("pending queue")
-            .push(deferred(0, 1, 1));
+            .park(recording(1), waiting(0, 1));
         let gate = Arc::new(std::sync::Barrier::new(2));
         let worker_gate = Arc::clone(&gate);
         let note = SubmissionNote {
             shared: Arc::clone(&shared),
+            recording: Some(recording(1)),
         };
         let worker = std::thread::spawn(move || {
             worker_gate.wait();
@@ -1272,16 +1323,10 @@ mod tests {
             .queue
             .lock()
             .expect("pending queue")
-            .push(deferred(1, 2, 2));
+            .park(recording(2), waiting(1, 2));
         gate.wait();
         worker.join().expect("queue worker");
 
-        assert_eq!(
-            points(&shared),
-            vec![
-                CompletionPoint::Submitted(1),
-                CompletionPoint::NextSubmission(2),
-            ]
-        );
+        assert_eq!(points(&shared), vec![CompletionPoint::Submitted(1)]);
     }
 }
