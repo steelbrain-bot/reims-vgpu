@@ -2306,6 +2306,8 @@ impl EncoderPools {
         self.cb_graphics.viewports.clear();
         self.cb_graphics.scissors.clear();
         self.cb_graphics.stencil = None;
+        self.cb_graphics.depth_bias = None;
+        self.cb_graphics.blend_constants = None;
         self.cb_graphics.push_layout = None;
         self.cb_graphics.push_bindings.clear();
         self.cb_graphics.vertex_bindings.clear();
@@ -2864,6 +2866,8 @@ impl EncoderPools {
             g.viewports.clear();
             g.scissors.clear();
             g.stencil = None;
+            g.depth_bias = None;
+            g.blend_constants = None;
             g.push_layout = None;
             g.push_bindings.clear();
             g.vertex_bindings.clear();
@@ -2885,6 +2889,8 @@ impl EncoderPools {
         g.viewports.clear();
         g.scissors.clear();
         g.stencil = None;
+        g.depth_bias = None;
+        g.blend_constants = None;
         unsafe { device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline) };
     }
 
@@ -3070,6 +3076,48 @@ impl EncoderPools {
             device.cmd_set_stencil_reference(cb, vk::StencilFaceFlags::FRONT, front);
             device.cmd_set_stencil_reference(cb, vk::StencilFaceFlags::BACK, back);
         }
+    }
+
+    /// Record `vkCmdSetDepthBias` only when the recording encoder does not
+    /// already carry the exact floating-point state.
+    pub(crate) unsafe fn set_dynamic_depth_bias(
+        &mut self,
+        device: &ash::Device,
+        cb: vk::CommandBuffer,
+        counters: &EngineCounters,
+        constant_factor: f32,
+        slope_factor: f32,
+        clamp: f32,
+    ) {
+        let bits = super::float_bits([constant_factor, slope_factor, clamp]);
+        if self.cb_graphics.depth_bias == Some(bits) {
+            counters
+                .dynstate_depth_bias_held
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.cb_graphics.depth_bias = Some(bits);
+        unsafe { device.cmd_set_depth_bias(cb, constant_factor, clamp, slope_factor) };
+    }
+
+    /// Record `vkCmdSetBlendConstants` only when the recording encoder does
+    /// not already carry the exact values.
+    pub(crate) unsafe fn set_dynamic_blend_constants(
+        &mut self,
+        device: &ash::Device,
+        cb: vk::CommandBuffer,
+        counters: &EngineCounters,
+        constants: [f32; 4],
+    ) {
+        let bits = super::float_bits(constants);
+        if self.cb_graphics.blend_constants == Some(bits) {
+            counters
+                .dynstate_blend_constants_held
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.cb_graphics.blend_constants = Some(bits);
+        unsafe { device.cmd_set_blend_constants(cb, &constants) };
     }
 }
 

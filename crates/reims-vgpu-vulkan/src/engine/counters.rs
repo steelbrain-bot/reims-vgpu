@@ -508,9 +508,9 @@ engine_counters! {
         /// it joined was already carrying exactly it — see
         /// `ResourcePools::CbGraphicsState`.
         ///
-        /// Every draw asks all four questions, so each of these is out of
+        /// Every applicable draw asks these questions, so each is out of
         /// `chain_phase chains` and none can exceed it. `dynstate_pipeline_held`
-        /// is the one to read first: a pipeline change clears the other three by
+        /// is the one to read first: a pipeline change clears the other state by
         /// construction, so it is the ceiling on them and a boot where it is
         /// near zero is a boot where consecutive draws never share a pipeline
         /// and this whole cache is inert.
@@ -523,6 +523,8 @@ engine_counters! {
         dynstate_viewport_held,
         dynstate_scissor_held,
         dynstate_stencil_held,
+        dynstate_depth_bias_held,
+        dynstate_blend_constants_held,
         /// Vertex-buffer binding slots requested by draws. This equals
         /// `vertex_buffer_bind_held + vertex_buffer_bind_emitted`.
         vertex_buffer_bind_slots,

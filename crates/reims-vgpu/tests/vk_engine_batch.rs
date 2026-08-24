@@ -10,10 +10,11 @@
 
 use metal2vulkan::passes::Stage;
 use reims_vgpu_vulkan::engine::{
-    self, BufferContent, DepthAttachment, DepthState, DrawRequest, GuestRun, GuestRunSource,
-    IndexType, IndexedDrawResource, PrimitiveTopology, SampledImageResource, SampledSource,
-    SamplerCompareFunction, SamplerResource, ScissorResource, StorageBufferResource,
-    TargetIdentity, VertexAttributeFormat, VertexAttributeResource, VertexStepFunction,
+    self, BlendFactor, BlendOp, BlendStateResource, BufferContent, DepthAttachment, DepthState,
+    DrawRequest, GuestRun, GuestRunSource, IndexType, IndexedDrawResource, PrimitiveTopology,
+    SampledImageResource, SampledSource, SamplerCompareFunction, SamplerResource, ScissorResource,
+    StorageBufferResource, TargetIdentity, VertexAttributeFormat, VertexAttributeResource,
+    VertexStepFunction,
 };
 /// The resident format every `TargetIdentity::Surface` in this file is built at.
 ///
@@ -256,6 +257,58 @@ fn one_recording_retains_unchanged_vertex_buffer_state() {
     assert_eq!(delta.vertex_buffer_bind_held, 3, "retained: {delta:?}");
     assert_eq!(delta.vertex_buffer_bind_calls, 1, "setter calls: {delta:?}");
     assert!(pixels.chunks_exact(4).any(is_frag_color));
+}
+
+#[test]
+fn one_recording_retains_unchanged_blend_constants() {
+    let _guard = engine_test_lock().lock().unwrap();
+    engine::flush_batched_draws();
+    let (vert, frag) = triangle_spirv();
+    let identity = TargetIdentity::Surface {
+        id: 990_107,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let make = |load_from_target, left| {
+        let mut request = batch_req(
+            &vert,
+            &frag,
+            &identity,
+            load_from_target,
+            half_scissor(left),
+        );
+        request.blend_constants = [0.2, 0.4, 0.6, 0.8];
+        request.blend = Some(BlendStateResource {
+            src_color: BlendFactor::ConstantColor,
+            dst_color: BlendFactor::Zero,
+            color_op: BlendOp::Add,
+            src_alpha: BlendFactor::ConstantAlpha,
+            dst_alpha: BlendFactor::Zero,
+            alpha_op: BlendOp::Add,
+        });
+        request
+    };
+    let before = engine::counter_snapshot();
+    if let Err(error) = engine::execute_draw_request(&make(false, true)) {
+        let message = error.to_string();
+        if skip_if_no_gpu(&message) {
+            eprintln!("skipping: {message}");
+            return;
+        }
+        panic!("first retained blend-state draw: {message}");
+    }
+    engine::execute_draw_request(&make(true, false)).expect("second retained blend-state draw");
+    let pixels = engine::read_target(&identity)
+        .expect("read target")
+        .into_rgba8();
+    let delta = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(
+        delta.dynstate_blend_constants_held, 1,
+        "the second draw retained the setter value: {delta:?}"
+    );
+    assert!(pixels.iter().any(|byte| *byte != 0));
 }
 
 /// A decoded EXEC packet is the contract-owned Vulkan recording lifetime.

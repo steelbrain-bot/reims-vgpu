@@ -957,6 +957,9 @@ pub(crate) struct CbGraphicsState {
     scissors: Vec<vk::Rect2D>,
     /// The front/back references last handed to `vkCmdSetStencilReference`.
     stencil: Option<(u32, u32)>,
+    /// Bit-exact values last handed to the two floating-point dynamic setters.
+    depth_bias: Option<[u32; 3]>,
+    blend_constants: Option<[u32; 4]>,
     /// The push-descriptor layout and exact descriptor values last recorded.
     push_layout: Option<vk::PipelineLayout>,
     push_bindings: Vec<PushDescriptorBinding>,
@@ -970,6 +973,10 @@ pub(crate) struct CbGraphicsState {
     vertex_bindings: Vec<VertexBufferBinding>,
     vertex_buffers: Vec<vk::Buffer>,
     vertex_offsets: Vec<vk::DeviceSize>,
+}
+
+fn float_bits<const N: usize>(values: [f32; N]) -> [u32; N] {
+    values.map(f32::to_bits)
 }
 
 /// One normalized fixed-function vertex-buffer binding.
@@ -5012,9 +5019,19 @@ mod vertex_binding_bulk_tests {
 
 #[cfg(test)]
 mod dynamic_state_match_tests {
-    use super::{push_descriptors_match, scissors_match, viewports_match, PushDescriptorBinding};
+    use super::{
+        float_bits, push_descriptors_match, scissors_match, viewports_match, PushDescriptorBinding,
+    };
     use ash::vk;
     use ash::vk::Handle;
+
+    #[test]
+    fn floating_dynamic_state_is_compared_by_exact_bits() {
+        assert_ne!(float_bits([0.0]), float_bits([-0.0]));
+        let nan = f32::from_bits(0x7fc0_0123);
+        assert_eq!(float_bits([nan]), float_bits([nan]));
+        assert_ne!(float_bits([nan]), float_bits([f32::from_bits(0x7fc0_0124)]));
+    }
 
     fn vp(x: f32, y: f32, w: f32, h: f32, near: f32, far: f32) -> vk::Viewport {
         vk::Viewport {

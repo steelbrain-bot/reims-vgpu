@@ -7048,13 +7048,24 @@ pub(crate) unsafe fn execute_draw_inner(
     };
     if let Some([constant_factor, slope_factor, clamp]) = depth_bias {
         unsafe {
-            ctx.device
-                .cmd_set_depth_bias(cb, constant_factor, clamp, slope_factor)
+            pools.encoder_mut().set_dynamic_depth_bias(
+                &ctx.device,
+                cb,
+                counters,
+                constant_factor,
+                slope_factor,
+                clamp,
+            )
         };
     }
     if draw_uses_blend_constants(req) {
         unsafe {
-            ctx.device.cmd_set_blend_constants(cb, &req.blend_constants);
+            pools.encoder_mut().set_dynamic_blend_constants(
+                &ctx.device,
+                cb,
+                counters,
+                req.blend_constants,
+            );
         }
     }
     // Dynamic stencil reference (Metal `setStencilFrontReferenceValue:back…`)
