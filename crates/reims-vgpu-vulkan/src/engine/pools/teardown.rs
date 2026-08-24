@@ -22,6 +22,22 @@ impl ResourcePools {
         // there is neither a legal nor a useful cmd_end_render_pass to emit.
         self.encoder.open_pass = None;
         self.encoder.forget_pass_echo();
+        // A queue handoff transaction is installed on its exact slot before
+        // the driver can accept it. Current callers hold the pool exclusively
+        // across that call; keeping teardown total over this state also makes
+        // the ownership contract valid when recorders become independent.
+        for index in 0..self.encoder.slots.len() {
+            let state = std::mem::replace(
+                &mut self.encoder.slots[index].submission,
+                SlotSubmission::HostOwned,
+            );
+            match state {
+                SlotSubmission::SealedWaitingCommit(sealed) => {
+                    self.abort_sealed_entry(device, index, sealed);
+                }
+                state => self.encoder.slots[index].submission = state,
+            }
+        }
         // A batched submit transfers host ownership of its fence to the queue
         // thread until the driver's submit call returns. Teardown can be
         // reached through session release without a queue-wide barrier, so
@@ -30,6 +46,9 @@ impl ResourcePools {
             let state = std::mem::replace(&mut slot.submission, SlotSubmission::HostOwned);
             let result = match state {
                 SlotSubmission::HostOwned => Ok(()),
+                SlotSubmission::SealedWaitingCommit(_) => {
+                    unreachable!("sealed entries were recovered before queue returns")
+                }
                 SlotSubmission::QueueOwned(receipt) => receipt.wait(),
                 SlotSubmission::Failed(result) => Err(result),
             };

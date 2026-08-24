@@ -48,16 +48,6 @@ enum SealedCommit<T, E> {
     Rejected { sealed: SealedEntry, error: E },
 }
 
-fn attempt_sealed_commit<T, E>(
-    sealed: SealedEntry,
-    commit: impl FnOnce() -> Result<T, E>,
-) -> SealedCommit<T, E> {
-    match commit() {
-        Ok(committed) => SealedCommit::Accepted { sealed, committed },
-        Err(error) => SealedCommit::Rejected { sealed, error },
-    }
-}
-
 /// Wait for one submitted fence to signal.
 ///
 /// [`FENCE_TIMEOUT_NS`] is a diagnostic sampling interval, not a contract
@@ -112,11 +102,25 @@ mod fence_wait_contract_tests {
     #[test]
     fn a_rejected_commit_returns_the_exact_sealed_cleanup() {
         let mut pools = ResourcePools::new();
+        pools.encoder.slots.push(CmdSlot {
+            cmd_buf: vk::CommandBuffer::null(),
+            fence: vk::Fence::null(),
+            pending: None,
+            submission: SlotSubmission::HostOwned,
+            retirement: None,
+            span: gpu_span::SlotSpan::Idle,
+            readback_span_armed: false,
+            pass_spans: 0,
+        });
         let set = vk::DescriptorSet::from_raw(11);
         let pool = vk::DescriptorPool::from_raw(12);
         let sealed = pools.encoder.seal_test_entry(vec![(set, pool)], Vec::new());
-
-        let (sealed, error) = match attempt_sealed_commit(sealed, || Err::<(), _>(17)) {
+        pools.encoder.stage_sealed_entry(sealed);
+        assert!(matches!(
+            pools.encoder.slots[0].submission,
+            SlotSubmission::SealedWaitingCommit(_)
+        ));
+        let (sealed, error) = match pools.encoder.resolve_staged_commit(Err::<(), _>(17)) {
             SealedCommit::Accepted { .. } => panic!("the rejected commit was accepted"),
             SealedCommit::Rejected { sealed, error } => (sealed, error),
         };
@@ -260,6 +264,47 @@ impl RetiredEntry {
 }
 
 impl EncoderPools {
+    /// Make an ended recording teardown-visible before a queue call can accept
+    /// its command buffer.
+    fn stage_sealed_entry(&mut self, sealed: SealedEntry) {
+        let slot = &mut self.slots[self.cur];
+        assert!(slot.pending.is_none(), "sealed slot already owes cleanup");
+        assert!(
+            slot.retirement.is_none(),
+            "sealed slot already owns a submitted recording"
+        );
+        assert!(
+            matches!(slot.submission, SlotSubmission::HostOwned),
+            "only a host-owned slot can be sealed"
+        );
+        slot.submission = SlotSubmission::SealedWaitingCommit(sealed);
+    }
+
+    /// Consume the exact transaction staged on the current ring slot.
+    fn take_staged_entry(&mut self) -> SealedEntry {
+        match std::mem::replace(
+            &mut self.slots[self.cur].submission,
+            SlotSubmission::HostOwned,
+        ) {
+            SlotSubmission::SealedWaitingCommit(sealed) => sealed,
+            state => {
+                self.slots[self.cur].submission = state;
+                panic!("current slot has no sealed transaction")
+            }
+        }
+    }
+
+    /// Pair the queue verdict with the exact transaction already visible on
+    /// this slot, so neither success nor rejection can recover cleanup from a
+    /// later mutable recording.
+    fn resolve_staged_commit<T, E>(&mut self, result: Result<T, E>) -> SealedCommit<T, E> {
+        let sealed = self.take_staged_entry();
+        match result {
+            Ok(committed) => SealedCommit::Accepted { sealed, committed },
+            Err(error) => SealedCommit::Rejected { sealed, error },
+        }
+    }
+
     /// Claim this encoder for one exact product submission.
     ///
     /// Re-entering the same submission is the ordinary multi-draw/dispatch
@@ -1791,7 +1836,12 @@ impl ResourcePools {
     /// return immediately to the same owners `seal_entry` took it from. The
     /// recording lease is cancelled rather than submitted, and guest-write
     /// debt is retired without inventing a fence lifetime.
-    unsafe fn abort_sealed_entry(&mut self, device: &ash::Device, sealed: SealedEntry) {
+    pub(super) unsafe fn abort_sealed_entry(
+        &mut self,
+        device: &ash::Device,
+        slot: usize,
+        sealed: SealedEntry,
+    ) {
         let SealedEntry {
             recording,
             cleanup,
@@ -1809,9 +1859,9 @@ impl ResourcePools {
             .sampled
             .extend(admissions.into_iter().map(|(slot, _)| slot));
         self.drain_shared_cleanup(shared);
-        self.encoder.slots[self.encoder.cur].span = gpu_span::SlotSpan::Idle;
-        self.encoder.slots[self.encoder.cur].readback_span_armed = false;
-        self.encoder.slots[self.encoder.cur].pass_spans = 0;
+        self.encoder.slots[slot].span = gpu_span::SlotSpan::Idle;
+        self.encoder.slots[slot].readback_span_armed = false;
+        self.encoder.slots[slot].pass_spans = 0;
         self.release_ready_graveyard(device);
     }
 
@@ -2006,6 +2056,10 @@ impl EncoderPools {
         let state = std::mem::replace(&mut self.slots[index].submission, SlotSubmission::HostOwned);
         let result = match state {
             SlotSubmission::HostOwned => Ok(()),
+            SlotSubmission::SealedWaitingCommit(sealed) => {
+                self.slots[index].submission = SlotSubmission::SealedWaitingCommit(sealed);
+                panic!("cannot await a sealed command buffer before queue acceptance")
+            }
             SlotSubmission::QueueOwned(receipt) => receipt.wait(),
             SlotSubmission::Failed(error) => Err(error),
         };
@@ -2026,6 +2080,7 @@ impl EncoderPools {
     ) -> Result<bool, DrawError> {
         let result = match &self.slots[index].submission {
             SlotSubmission::HostOwned => return Ok(true),
+            SlotSubmission::SealedWaitingCommit(_) => return Ok(false),
             SlotSubmission::QueueOwned(receipt) => {
                 let Some(result) = receipt.try_complete() else {
                     return Ok(false);
@@ -2710,25 +2765,25 @@ impl ResourcePools {
             .encoder
             .seal_entry(std::mem::take(&mut batch.dsets), Vec::new());
         if let Err(result) = end_result {
-            unsafe { self.abort_sealed_entry(&ctx.device, sealed) };
+            unsafe { self.abort_sealed_entry(&ctx.device, slot, sealed) };
             self.discard_sampled_cache(&ctx.device);
             return Err(DrawError::VkCall(VkCall::new(
                 VkOp::PoolsEndCbBatch,
                 result,
             )));
         }
+        self.encoder.stage_sealed_entry(sealed);
         let submit_started = std::time::Instant::now();
-        let submit = attempt_sealed_commit(sealed, || {
+        let submit =
             unsafe { ctx.submit_guest_work_async(&[batch.cb], batch.fence, batch.stamp_recording) }
                 .map_err(|result| {
                     super::super::guest_submit_error(DeviceLostOp::PoolsSubmitBatch, result)
-                })
-        });
+                });
         counters.batch_flush_submit_us.fetch_add(
             submit_started.elapsed().as_micros() as u64,
             Ordering::Relaxed,
         );
-        match submit {
+        match self.encoder.resolve_staged_commit(submit) {
             SealedCommit::Accepted {
                 sealed,
                 committed: submission,
@@ -2742,7 +2797,7 @@ impl ResourcePools {
                 Ok(())
             }
             SealedCommit::Rejected { sealed, error: e } => {
-                unsafe { self.abort_sealed_entry(&ctx.device, sealed) };
+                unsafe { self.abort_sealed_entry(&ctx.device, slot, sealed) };
                 // This batch's draws published sampled images to the content
                 // cache on the promise that this command buffer would fill
                 // them. It never reached the queue, so their contents are

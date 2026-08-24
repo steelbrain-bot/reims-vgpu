@@ -1111,10 +1111,17 @@ struct CbGuestVisibility {
 /// One in-flight ring slot: a primary CB, its fence (created unsignaled;
 /// reset immediately after every successful wait), and — while the CB is in
 /// flight — the cleanup its entry owes.
+// The fixed-depth ring deliberately owns the sealed transaction inline. Boxing
+// it would add an allocation to every native commit in order to save idle slot
+// bytes, while the enum is what makes teardown exhaustive over this lifetime.
+#[allow(clippy::large_enum_variant)]
 enum SlotSubmission {
     /// No host driver call currently owns the fence. `pending` separately says
     /// whether submitted GPU work still owns the command buffer.
     HostOwned,
+    /// Recording has ended and the exact cleanup transaction is parked on its
+    /// ring slot before any queue call can accept the command buffer.
+    SealedWaitingCommit(SealedEntry),
     /// The queue thread has accepted the submit and owns the fence until this
     /// receipt returns.
     QueueOwned(super::queue_owner::PendingQueueSubmit),
