@@ -60,11 +60,11 @@ impl ResourcePools {
                 self.encoder.staging_live.extend(pending.staging);
                 self.encoder.gather_live.extend(pending.gather);
                 self.encoder.readback_multi_live.extend(pending.readback);
-                self.shared.sampled_live.extend(pending.sampled);
-                self.shared
+                self.encoder.sampled_live.extend(pending.sampled);
+                self.encoder
                     .attachment_snapshot_live
                     .extend(pending.attachment_snapshots);
-                self.shared
+                self.encoder
                     .storage_image_live
                     .extend(pending.storage_images);
             }
@@ -163,11 +163,11 @@ impl ResourcePools {
             device.destroy_image_view(img.view, None);
             device.destroy_image(img.image, None);
         }
-        for s in self.shared.sampled_live.drain(..) {
+        for s in self.encoder.sampled_live.drain(..) {
             device.destroy_image_view(s.view, None);
             device.destroy_image(s.image, None);
         }
-        for s in self.shared.attachment_snapshot_live.drain(..) {
+        for s in self.encoder.attachment_snapshot_live.drain(..) {
             device.destroy_image_view(s.view, None);
             device.destroy_image(s.image, None);
         }
@@ -186,7 +186,7 @@ impl ResourcePools {
                 StorageImageBacking::HeapPlacement { .. } => {}
             }
         }
-        for s in self.shared.storage_image_live.drain(..) {
+        for s in self.encoder.storage_image_live.drain(..) {
             device.destroy_image_view(s.view, None);
             match s.backing {
                 StorageImageBacking::Dedicated(memory) => {

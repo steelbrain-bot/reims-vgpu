@@ -751,7 +751,7 @@ impl ResourcePools {
     ) -> Result<StorageImageSlot, DrawError> {
         if allocation == StorageImageAllocation::Transient {
             if let Some(slot) = self.shared.storage_image_free.take(&key) {
-                self.shared.storage_image_live.push(StorageImageSlot {
+                self.encoder.storage_image_live.push(StorageImageSlot {
                     image: slot.image,
                     backing: slot.backing,
                     view: slot.view,
@@ -947,13 +947,13 @@ impl ResourcePools {
             key,
         };
         if allocation == StorageImageAllocation::Transient {
-            self.shared.storage_image_live.push(slot);
+            self.encoder.storage_image_live.push(slot);
         }
         Ok(slot)
     }
 
     pub(crate) fn recycle_storage_images(&mut self) {
-        for slot in self.shared.storage_image_live.drain(..) {
+        for slot in self.encoder.storage_image_live.drain(..) {
             self.shared.storage_image_free.push_uncapped(slot.key, slot);
         }
     }
@@ -1055,7 +1055,7 @@ impl ResourcePools {
             Err(error) => return Err(error),
         };
         if !identity.is_heap() {
-            let live = self.shared.storage_image_live.pop().ok_or({
+            let live = self.encoder.storage_image_live.pop().ok_or({
                 DrawError::ComputeExecution(
                     ComputeExecutionDecline::ResidentAllocatorLiveSlotMissing {
                         identity,

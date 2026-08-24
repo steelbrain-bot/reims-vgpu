@@ -154,6 +154,9 @@ impl EncoderPools {
             staging_live: Vec::new(),
             gather_free: HashMap::new(),
             gather_live: Vec::new(),
+            sampled_live: Vec::new(),
+            attachment_snapshot_live: Vec::new(),
+            storage_image_live: Vec::new(),
             cb_bound_buffers: super::CbBufferMemo::default(),
             cb_gather_owed: Vec::new(),
             cb_sampled_guest: std::collections::HashMap::new(),
@@ -199,13 +202,10 @@ impl SharedPools {
             multisample_target: None,
             ad_hoc_framebuffers: HashMap::new(),
             sampled_free: FreePool::new(),
-            sampled_live: Vec::new(),
             attachment_snapshot_free: FreePool::new(),
-            attachment_snapshot_live: Vec::new(),
             sampled_cache: Vec::new(),
             sampled_cache_bytes: 0,
             storage_image_free: FreePool::new(),
-            storage_image_live: Vec::new(),
             compute_storage_registry: HashMap::new(),
             heap_placement_memory: HashMap::new(),
             compute_storage_order: VecDeque::new(),
@@ -264,12 +264,12 @@ impl ResourcePools {
     }
 
     pub(crate) fn guest_reset_counts(&self) -> (usize, usize, usize, usize) {
-        let sampled = self.shared.sampled_live.len()
+        let sampled = self.encoder.sampled_live.len()
             + self.shared.sampled_free.len()
             + self.shared.sampled_cache.len()
-            + self.shared.attachment_snapshot_live.len()
+            + self.encoder.attachment_snapshot_live.len()
             + self.shared.attachment_snapshot_free.len();
-        let storage = self.shared.storage_image_live.len()
+        let storage = self.encoder.storage_image_live.len()
             + self.shared.storage_image_free.len()
             + self.shared.compute_storage_registry.len();
         (
@@ -688,7 +688,7 @@ impl ResourcePools {
     /// lifetime, so their recycle budget is derived here rather than retaining
     /// the largest topology's population on every host.
     fn configure_batch_capacity(&mut self, draws: u64) {
-        debug_assert!(self.shared.attachment_snapshot_live.is_empty());
+        debug_assert!(self.encoder.attachment_snapshot_live.is_empty());
         debug_assert_eq!(self.shared.attachment_snapshot_free.len(), 0);
         self.encoder.batch_max_draws = draws;
         self.shared.attachment_snapshot_free = FreePool::new();
@@ -1687,7 +1687,7 @@ impl ResourcePools {
         self.forget_cb_sampled_guest();
         let mut readback: Vec<BufferSlot> = self.encoder.readback_live.take().into_iter().collect();
         readback.append(&mut self.encoder.readback_multi_live);
-        let mut sampled = std::mem::take(&mut self.shared.sampled_live);
+        let mut sampled = std::mem::take(&mut self.encoder.sampled_live);
         let admissions = take_retained_slots(&mut sampled, sampled_retains);
         // Both seal points reach here, which is the whole reason the scatter's
         // sets are parked on `self` instead of travelling with its plan. They
@@ -1701,8 +1701,8 @@ impl ResourcePools {
                 gather: std::mem::take(&mut self.encoder.gather_live),
                 readback,
                 sampled,
-                attachment_snapshots: std::mem::take(&mut self.shared.attachment_snapshot_live),
-                storage_images: std::mem::take(&mut self.shared.storage_image_live),
+                attachment_snapshots: std::mem::take(&mut self.encoder.attachment_snapshot_live),
+                storage_images: std::mem::take(&mut self.encoder.storage_image_live),
                 unpin_residents: std::mem::take(&mut self.encoder.resident_pins_live),
                 unpin_compute_residents: std::mem::take(&mut self.encoder.compute_write_pins_live),
                 guest_write_tokens: {
@@ -2222,7 +2222,7 @@ impl ResourcePools {
                 counters.batch_opens.fetch_add(1, Ordering::Relaxed);
             }
         }
-        let admissions = take_retained_slots(&mut self.shared.sampled_live, sampled_retains);
+        let admissions = take_retained_slots(&mut self.encoder.sampled_live, sampled_retains);
         self.admit_recorded_sampled(admissions);
     }
 
@@ -4131,9 +4131,9 @@ impl ResourcePools {
         if let Some(slot) = recycled {
             let handles = slot.handles();
             match use_ {
-                SampledTransientUse::Upload => self.shared.sampled_live.push(slot),
+                SampledTransientUse::Upload => self.encoder.sampled_live.push(slot),
                 SampledTransientUse::AttachmentSnapshot => {
-                    self.shared.attachment_snapshot_live.push(slot)
+                    self.encoder.attachment_snapshot_live.push(slot)
                 }
             }
             return Ok(handles);
@@ -4246,9 +4246,9 @@ impl ResourcePools {
         };
         let handles = slot.handles();
         match use_ {
-            SampledTransientUse::Upload => self.shared.sampled_live.push(slot),
+            SampledTransientUse::Upload => self.encoder.sampled_live.push(slot),
             SampledTransientUse::AttachmentSnapshot => {
-                self.shared.attachment_snapshot_live.push(slot)
+                self.encoder.attachment_snapshot_live.push(slot)
             }
         }
         Ok(handles)
@@ -4334,7 +4334,7 @@ impl ResourcePools {
     ) {
         let Some(owner) = resource_lifetime.filter(|owner| owner.is_live()) else {
             crate::telemetry::note_route("sampled_admit_no_lifetime");
-            self.shared.sampled_live.push(slot);
+            self.encoder.sampled_live.push(slot);
             return;
         };
         let (fingerprint, retained, content_len) = match content {
@@ -4362,7 +4362,7 @@ impl ResourcePools {
             crate::telemetry::note_route("sampled_admit_duplicate");
             let existing = &mut self.shared.sampled_cache[index];
             existing.retain_owner(owner);
-            self.shared.sampled_live.push(slot);
+            self.encoder.sampled_live.push(slot);
             return;
         }
         crate::telemetry::note_route("sampled_admit_kept");
@@ -4384,11 +4384,11 @@ impl ResourcePools {
         // does not also recycle staging. No memo may survive the slots it
         // names entering the free pool.
         self.forget_cb_sampled_guest();
-        for slot in self.shared.sampled_live.drain(..) {
+        for slot in self.encoder.sampled_live.drain(..) {
             let sk = slot.key();
             self.shared.sampled_free.push_uncapped(sk, slot);
         }
-        for slot in self.shared.attachment_snapshot_live.drain(..) {
+        for slot in self.encoder.attachment_snapshot_live.drain(..) {
             let sk = slot.key();
             self.shared.attachment_snapshot_free.push_uncapped(sk, slot);
         }

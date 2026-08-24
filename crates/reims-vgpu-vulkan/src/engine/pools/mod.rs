@@ -199,9 +199,10 @@ pub(crate) fn return_readback_lease(lease: ReadbackLease) {
 ///
 /// Splitting the fields does not by itself make anything concurrent. What it
 /// does is make the boundary checkable: a method that reaches into both halves
-/// now says so in its body, and the ones that do are the seam a parallel
-/// encoder has to answer for. There are ten of them out of 456, and six are
-/// construction, teardown or counters.
+/// now says so in its body. Initialization, teardown and recycling legitimately
+/// straddle it because an encoder-local live object returns to a device-wide
+/// free pool only after that encoder's fence retires; ordinary command-state
+/// operations do not.
 ///
 /// The rule that keeps this true: **nothing in here may be reachable from
 /// another encoder.** A ring slot, its command pool, its descriptor arena, the
@@ -226,6 +227,15 @@ pub(crate) struct EncoderPools {
     /// `gather_guest_buffer_window` exists to avoid.
     gather_free: HashMap<u64, Vec<BufferSlot>>,
     gather_live: Vec<BufferSlot>,
+    /// Transient sampled images referenced by the command buffer now being
+    /// recorded. Sealing this encoder transfers them to its own fence.
+    sampled_live: Vec<SampledSlot>,
+    /// Attachment-feedback snapshots referenced by this encoder's current
+    /// command buffer.
+    attachment_snapshot_live: Vec<SampledSlot>,
+    /// Transient compute storage images referenced by this encoder's current
+    /// command buffer.
+    storage_image_live: Vec<StorageImageSlot>,
     /// Buffer binds the command buffer now recording has already staged or
     /// gathered, keyed by the content that produced them.
     ///
@@ -518,20 +528,17 @@ pub(crate) struct SharedPools {
     ad_hoc_framebuffers: HashMap<AdHocFramebufferKey, vk::Framebuffer>,
     /// Transient sampled-image pool, keyed by exact image and view geometry.
     sampled_free: FreePool<SampledKey, SampledSlot>,
-    sampled_live: Vec<SampledSlot>,
     /// Attachment-feedback snapshots have a command-buffer working set rather
     /// than a serialized-resource lifetime. Their recyclable images therefore
     /// remain separate from uploaded sampled images; dropping either free-pool
     /// entry loses only recomputable storage, never cached guest content.
     attachment_snapshot_free: FreePool<SampledKey, SampledSlot>,
-    attachment_snapshot_live: Vec<SampledSlot>,
     /// Exact-content sampled images retained across draw calls. Hash narrows
     /// candidates only; a hit always requires full byte equality.
     sampled_cache: Vec<ResidentSampledSlot>,
     sampled_cache_bytes: usize,
     /// Storage-image pool for compute.
     storage_image_free: FreePool<StorageImageKey, StorageImageSlot>,
-    storage_image_live: Vec<StorageImageSlot>,
     /// Protocol-identity keyed compute storage images retained across calls.
     compute_storage_registry: HashMap<ComputeStorageResidencyKey, ResidentStorageImageSlot>,
     /// Native allocations keyed by the guest's exact generational placement
