@@ -1691,10 +1691,11 @@ fn execute_draw_request_locked(
             req,
             &program,
         );
-        let dropped = result
-            .is_err()
-            .then(|| recording.discard_cb_binds_owed_a_gather())
-            .unwrap_or(0);
+        let dropped = if result.is_err() {
+            recording.discard_cb_binds_owed_a_gather()
+        } else {
+            0
+        };
         (result, dropped)
     };
     if dropped_unfilled_gathers > 0 {
