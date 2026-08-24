@@ -161,8 +161,42 @@ fn an_accepted_async_exec_withholds_its_exact_stamp_until_ordered_commit() {
             identity,
             result: crate::runtime::exec::ExecResult::default(),
         });
+    let channel = 2u32;
+    let root_pfn = 0x10u32;
+    let list_pfn = 0x20u32;
+    let ring_pfn = 0x30u32;
+    let root_gpa = state.pfn_gpa(root_pfn);
+    let list_gpa = state.pfn_gpa(list_pfn);
+    let ring_gpa = state.pfn_gpa(ring_pfn);
+    for gpa in [root_gpa, list_gpa, ring_gpa] {
+        host.map_range(gpa, state.page_size() as usize, 0);
+    }
+    // A malformed EXEC still completes synchronously. Unlike a NOP it may
+    // cross the pending-EXEC boundary, matching the ordering that exposed the
+    // regression: processing the current EXEC made its older predecessor
+    // ready for publication before this packet's own word was written.
+    let packet = packet_bytes(CHILD_OP_EXEC_INDIRECT2, 0x56, &[]);
+    host.write_gpa(ring_gpa, &packet).unwrap();
+    host.put_u32(list_gpa, ring_pfn);
+    let regs_gpa = root_gpa + child_reg_block_offset(channel).unwrap();
+    host.put_u32(regs_gpa + CHILD_REG_TAIL, packet.len() as u32);
+    host.put_u32(regs_gpa + CHILD_REG_HEAD, 0);
+    host.put_u32(regs_gpa + CHILD_REG_STAMP_INDEX, 1);
+    host.put_u32(regs_gpa + CHILD_REG_BASE_PFN, list_pfn);
+    state.registers.gfx.root_page = root_pfn;
+
+    drain_child_fifo(&mut state, &mut host, channel);
+    assert_eq!(
+        host.get_u32(regs_gpa + CHILD_REG_HEAD),
+        packet.len() as u32,
+        "the synchronous packet must be consumed"
+    );
     publish_completed_execs(&mut state, &mut host);
-    assert_eq!(host.get_u32(stamp_gpa + 4), 0x55);
+    assert_eq!(
+        host.get_u32(stamp_gpa + 4),
+        0x56,
+        "the current synchronous word must follow the older async completion"
+    );
     assert!(!state.pending_exec_publications.contains_key(&identity));
 }
 

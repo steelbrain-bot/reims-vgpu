@@ -4820,6 +4820,16 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                 // an async execution path, that ordering has to come back with
                 // it — and be written against the async model that then exists,
                 // not inherited from an empty queue.
+                if matches!(disposition, ChildPacketDisposition::Complete)
+                    && !state.completed_execs.is_empty()
+                {
+                    // A synchronous EXEC can be the declared barrier that
+                    // quiesces an older detached recorder. That predecessor is
+                    // now semantically complete but still owns the older FIFO
+                    // word; publish it before this packet's newer word or the
+                    // next drain would move the slot backwards.
+                    publish_completed_execs(state, host);
+                }
                 if let ChildPacketDisposition::AcceptedAsync(identity) = disposition {
                     let displaced = state.pending_exec_publications.insert(
                         identity,
