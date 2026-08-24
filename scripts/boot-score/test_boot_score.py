@@ -25,11 +25,11 @@ class BootScoreTests(unittest.TestCase):
                 "OFF drain_duty win_ms=500 duty=0.8 draws=100 draw_us=400 proc_us=1000 t=1000\n",
                 "OFF gpu_span busy_us=900 retired_draws=90 t=1002\n",
                 "OFF window_publish win_ms=500 fresh=10 t=999\n",
-                "OFF host_window_cadence window_ms=500 presents=9 offered=10 t=800\n",
+                "OFF host_window_cadence window_ms=500 presents=9 offered=10 present_hz=18 offered_hz=20 t=800\n",
                 "OFF drain_duty win_ms=1500 duty=0.9 draws=300 draw_us=600 proc_us=6000 t=2000\n",
                 "OFF gpu_span busy_us=3300 retired_draws=110 t=1999\n",
                 "OFF window_publish win_ms=1500 fresh=30 t=2001\n",
-                "OFF host_window_cadence window_ms=1500 presents=27 offered=30 t=1800\n",
+                "OFF host_window_cadence window_ms=1500 presents=27 offered=30 present_hz=18 offered_hz=20 t=1800\n",
             ]
         )
 
@@ -64,6 +64,20 @@ class BootScoreTests(unittest.TestCase):
 
         self.assertIn("n=1", result)
         self.assertIn("cpu=20.00", result)
+
+    def test_cadence_median_rejects_a_partial_boundary_window(self):
+        result = self.score(
+            [
+                "OFF host_window_cadence window_ms=4000 presents=2 offered=2 present_hz=0.5 offered_hz=0.5 t=900\n",
+                "OFF drain_duty win_ms=1000 duty=0.8 draws=100 proc_us=2000 t=1000\n",
+                "OFF gpu_span busy_us=1000 retired_draws=100 t=1000\n",
+                "OFF host_window_cadence window_ms=1000 presents=40 offered=40 present_hz=40 offered_hz=40 t=1800\n",
+                "OFF host_window_cadence window_ms=1000 presents=40 offered=40 present_hz=40 offered_hz=40 t=2800\n",
+            ]
+        )
+
+        self.assertIn("fps= 40.0", result)
+        self.assertIn("offered= 40.0", result)
 
 
 if __name__ == "__main__":

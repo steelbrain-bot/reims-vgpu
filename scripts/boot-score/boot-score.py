@@ -48,6 +48,7 @@ Usage:  scripts/boot-score/boot-score.py FAIL_LOG [FAIL_LOG ...]
 """
 
 import re
+import statistics
 import sys
 
 FIELD = re.compile(r"(\w+)=(-?[\d.]+)")
@@ -81,14 +82,8 @@ def score(path):
                     pub[int(float(f["t"]))] = (float(f["fresh"]), float(f["win_ms"]))
             elif line.startswith("OFF host_window_cadence "):
                 f = _fields(line)
-                if "window_ms" in f and "presents" in f and "offered" in f:
-                    cadence.append(
-                        (
-                            float(f["presents"]),
-                            float(f["offered"]),
-                            float(f["window_ms"]),
-                        )
-                    )
+                if "present_hz" in f and "offered_hz" in f:
+                    cadence.append((float(f["present_hz"]), float(f["offered_hz"])))
             elif line.startswith("OFF drain_duty "):
                 duty.append(_fields(line))
 
@@ -130,11 +125,8 @@ def score(path):
     cpu_per_draw = cpu_us / draws
     gpu_per_draw = gpu_us / retired_draws
     total = cpu_per_draw + gpu_per_draw
-    cadence_presents = sum(sample[0] for sample in cadence)
-    cadence_offered = sum(sample[1] for sample in cadence)
-    cadence_ms = sum(sample[2] for sample in cadence)
-    fps = cadence_presents / (cadence_ms / 1000) if cadence_ms else 0.0
-    offered_fps = cadence_offered / (cadence_ms / 1000) if cadence_ms else 0.0
+    fps = statistics.median(sample[0] for sample in cadence) if cadence else 0.0
+    offered_fps = statistics.median(sample[1] for sample in cadence) if cadence else 0.0
     occupancy = (cpu_us + gpu_us) / (busy_win_ms * 1000)
     return (
         f"{path:<40} n={n:<3} cpu={cpu_per_draw:5.2f} gpu={gpu_per_draw:5.2f} "
