@@ -1507,6 +1507,10 @@ struct VisibilityCleanup {
 /// a fence-length late.
 #[must_use = "a sealed entry must be submitted or explicitly aborted"]
 pub(crate) struct SealedEntry {
+    /// Exact global recording lifetime for the command buffer whose resources
+    /// are in `cleanup`. Rejection drops this lease as cancellation; queue
+    /// acceptance converts it into the slot's submitted retirement point.
+    recording: RecordingLease,
     pub(crate) cleanup: PendingGpuCleanup,
     /// Each entry pairs the image the CB fills with what names it. Empty for
     /// every non-render entry (compute, present, sync helpers).

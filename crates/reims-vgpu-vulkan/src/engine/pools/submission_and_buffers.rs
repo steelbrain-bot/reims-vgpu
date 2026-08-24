@@ -114,7 +114,7 @@ mod fence_wait_contract_tests {
         let mut pools = ResourcePools::new();
         let set = vk::DescriptorSet::from_raw(11);
         let pool = vk::DescriptorPool::from_raw(12);
-        let sealed = pools.encoder.seal_entry(vec![(set, pool)], Vec::new());
+        let sealed = pools.encoder.seal_test_entry(vec![(set, pool)], Vec::new());
 
         let (sealed, error) = match attempt_sealed_commit(sealed, || Err::<(), _>(17)) {
             SealedCommit::Accepted { .. } => panic!("the rejected commit was accepted"),
@@ -1775,11 +1775,12 @@ impl ResourcePools {
     /// recording lease is cancelled rather than submitted, and guest-write
     /// debt is retired without inventing a fence lifetime.
     unsafe fn abort_sealed_entry(&mut self, device: &ash::Device, sealed: SealedEntry) {
-        self.encoder.recording.take();
         let SealedEntry {
+            recording,
             cleanup,
             admissions,
         } = sealed;
+        drop(recording);
         let PendingGpuCleanup {
             encoder,
             visibility,
@@ -2171,6 +2172,10 @@ impl EncoderPools {
         let mut sampled = std::mem::take(&mut self.sampled_live);
         let admissions = take_retained_slots(&mut sampled, sampled_retains);
         SealedEntry {
+            recording: self
+                .recording
+                .take()
+                .expect("sealing entry without recording lease"),
             cleanup: PendingGpuCleanup {
                 encoder: EncoderCleanup {
                     dsets,
@@ -2198,6 +2203,22 @@ impl EncoderPools {
             },
             admissions,
         }
+    }
+
+    /// Give device-free cleanup tests the same mandatory recording lifetime as
+    /// product submissions. Each helper call owns a fresh isolated order, so
+    /// dropping the returned package exercises cancellation without borrowing
+    /// session state the test did not construct.
+    #[cfg(test)]
+    pub(super) fn seal_test_entry(
+        &mut self,
+        dsets: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
+        sampled_retains: Vec<SampledRetain>,
+    ) -> SealedEntry {
+        assert!(self.recording.is_none(), "test recording already installed");
+        let order = std::sync::Arc::new(super::super::retirement::RetirementOrder::default());
+        self.begin_recording(order.reserve().expect("test recording point"));
+        self.seal_entry(dsets, sampled_retains)
     }
 
     /// Extract a fence-complete slot as one transaction for shared ownership.
@@ -2250,6 +2271,7 @@ impl EncoderPools {
         submit_return: Option<super::super::queue_owner::PendingQueueSubmit>,
     ) -> Vec<(SampledSlot, SampledRetain)> {
         let SealedEntry {
+            recording,
             cleanup,
             admissions,
         } = sealed;
@@ -2261,12 +2283,7 @@ impl EncoderPools {
             self.slots[self.cur].retirement.is_none(),
             "current slot already owns a recording point"
         );
-        self.slots[self.cur].retirement = Some(
-            self.recording
-                .take()
-                .expect("submission has no recording lease")
-                .submitted(),
-        );
+        self.slots[self.cur].retirement = Some(recording.submitted());
         self.slots[self.cur].pending = Some(cleanup);
         self.slots[self.cur].submission = submit_return
             .map(SlotSubmission::QueueOwned)
@@ -5820,6 +5837,10 @@ mod recycle_tests {
 
         pools.encoder.begin_recording(lease);
         let sealed = pools.encoder.seal_entry(Vec::new(), Vec::new());
+        assert!(
+            pools.encoder.recording.is_none(),
+            "sealing must move the exact lifetime out of mutable encoder state"
+        );
         let admissions = pools.encoder.park_submitted_entry(sealed, None, None);
         assert!(admissions.is_empty());
         assert!(pools.encoder.recording.is_none());
@@ -5832,6 +5853,35 @@ mod recycle_tests {
         let RetiredEntry { retirement, .. } = retired;
         retirement.retire();
         assert!(order.retired(captured));
+    }
+
+    #[test]
+    fn sealed_recording_cancellation_cannot_cancel_a_later_recording() {
+        let mut pools = ResourcePools::new();
+        let order = std::sync::Arc::clone(&pools.shared.retirement);
+
+        pools
+            .encoder
+            .begin_recording(pools.shared.checkout_recording().unwrap());
+        let sealed = pools.encoder.seal_entry(Vec::new(), Vec::new());
+        let first = order.latest().unwrap();
+
+        pools
+            .encoder
+            .begin_recording(pools.shared.checkout_recording().unwrap());
+        let later = order.latest().unwrap();
+        drop(sealed);
+
+        assert!(
+            order.retired(first),
+            "the sealed package owns its cancellation"
+        );
+        assert!(
+            !order.retired(later),
+            "dropping an earlier sealed package must not cancel a later encoder recording"
+        );
+        pools.encoder.recording.take();
+        assert!(order.retired(later));
     }
 
     #[test]
@@ -5941,7 +5991,7 @@ mod recycle_tests {
                 // This device-free test installs no native cleanup; explicitly
                 // consume the empty package after observing seal's local
                 // lifetime transition.
-                drop(p.encoder_mut().seal_entry(Vec::new(), Vec::new()));
+                drop(p.encoder_mut().seal_test_entry(Vec::new(), Vec::new()));
             }),
             ("a staging recycle", &|p| p.recycle_staging()),
         ];
@@ -6033,7 +6083,7 @@ mod recycle_tests {
         );
         let cleanup = pools
             .encoder_mut()
-            .seal_entry(Vec::new(), Vec::new())
+            .seal_test_entry(Vec::new(), Vec::new())
             .cleanup;
         assert!(pools.encoder.guest_write_tokens_live.is_empty());
         assert_eq!(
@@ -6061,7 +6111,7 @@ mod recycle_tests {
         );
         let cleanup = pools
             .encoder_mut()
-            .seal_entry(Vec::new(), Vec::new())
+            .seal_test_entry(Vec::new(), Vec::new())
             .cleanup;
         assert_eq!(cleanup.visibility.guest_write_tokens.len(), 1);
         crate::engine::retire_guest_write_pages(&cleanup.visibility.guest_write_tokens);
@@ -6115,7 +6165,7 @@ mod recycle_tests {
         // them. Model that slot's fence retirement without a Vulkan device.
         let mut cleanup = pools
             .encoder_mut()
-            .seal_entry(Vec::new(), Vec::new())
+            .seal_test_entry(Vec::new(), Vec::new())
             .cleanup;
         assert!(pools.encoder.resident_pins_live.is_empty());
         for held in cleanup.shared.unpin_residents.drain(..) {
@@ -6171,7 +6221,7 @@ mod recycle_tests {
         );
         let cleanup = pools
             .encoder_mut()
-            .seal_entry(Vec::new(), Vec::new())
+            .seal_test_entry(Vec::new(), Vec::new())
             .cleanup;
         assert_eq!(
             cleanup.visibility.guest_write_tokens,
@@ -6222,7 +6272,7 @@ mod recycle_tests {
 
         let mut cleanup = pools
             .encoder_mut()
-            .seal_entry(Vec::new(), Vec::new())
+            .seal_test_entry(Vec::new(), Vec::new())
             .cleanup;
         assert!(
             pools.encoder.compute_write_pins_live.is_empty(),
@@ -6263,7 +6313,7 @@ mod recycle_tests {
         assert!(pools.encoder.compute_write_pins_live.is_empty());
         assert!(pools
             .encoder_mut()
-            .seal_entry(Vec::new(), Vec::new())
+            .seal_test_entry(Vec::new(), Vec::new())
             .cleanup
             .shared
             .unpin_compute_residents
@@ -6301,7 +6351,7 @@ mod recycle_tests {
 
         let mut cleanup = pools
             .encoder_mut()
-            .seal_entry(Vec::new(), Vec::new())
+            .seal_test_entry(Vec::new(), Vec::new())
             .cleanup;
         for held in cleanup.shared.unpin_residents.drain(..) {
             pools.pin_resident_target(&held, false);
