@@ -2308,6 +2308,7 @@ impl EncoderPools {
         self.cb_graphics.stencil = None;
         self.cb_graphics.push_layout = None;
         self.cb_graphics.push_bindings.clear();
+        self.cb_graphics.vertex_bindings.clear();
         self.cb_guest_visibility = super::CbGuestVisibility::default();
     }
 }
@@ -2865,6 +2866,7 @@ impl EncoderPools {
             g.stencil = None;
             g.push_layout = None;
             g.push_bindings.clear();
+            g.vertex_bindings.clear();
         }
         if g.pipeline == Some(pipeline) {
             counters
@@ -2981,25 +2983,30 @@ impl EncoderPools {
                         offset: bound.offset,
                     }),
             );
-        super::normalize_vertex_bindings(&mut g.vertex_scratch);
+        if !super::retain_vertex_bindings(&mut g.vertex_bindings, &mut g.vertex_scratch) {
+            counters
+                .vertex_buffer_bind_held
+                .fetch_add(requested.len() as u64, Ordering::Relaxed);
+            return;
+        }
         counters
             .vertex_buffer_bind_emitted
-            .fetch_add(g.vertex_scratch.len() as u64, Ordering::Relaxed);
+            .fetch_add(g.vertex_bindings.len() as u64, Ordering::Relaxed);
 
         g.vertex_buffers.clear();
         g.vertex_offsets.clear();
         g.vertex_buffers
-            .extend(g.vertex_scratch.iter().map(|entry| entry.buffer));
+            .extend(g.vertex_bindings.iter().map(|entry| entry.buffer));
         g.vertex_offsets
-            .extend(g.vertex_scratch.iter().map(|entry| entry.offset));
+            .extend(g.vertex_bindings.iter().map(|entry| entry.offset));
 
         let mut start = 0;
-        while start < g.vertex_scratch.len() {
-            let end = super::vertex_binding_run_end(&g.vertex_scratch, start);
+        while start < g.vertex_bindings.len() {
+            let end = super::vertex_binding_run_end(&g.vertex_bindings, start);
             unsafe {
                 device.cmd_bind_vertex_buffers(
                     cb,
-                    g.vertex_scratch[start].binding,
+                    g.vertex_bindings[start].binding,
                     &g.vertex_buffers[start..end],
                     &g.vertex_offsets[start..end],
                 )

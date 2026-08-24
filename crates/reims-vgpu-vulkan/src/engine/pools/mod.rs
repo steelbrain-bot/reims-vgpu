@@ -966,6 +966,8 @@ pub(crate) struct CbGraphicsState {
     sc_scratch: Vec<vk::Rect2D>,
     push_scratch: Vec<PushDescriptorBinding>,
     vertex_scratch: Vec<VertexBufferBinding>,
+    /// Exact normalized vertex-buffer state currently carried by `cb`.
+    vertex_bindings: Vec<VertexBufferBinding>,
     vertex_buffers: Vec<vk::Buffer>,
     vertex_offsets: Vec<vk::DeviceSize>,
 }
@@ -986,6 +988,21 @@ fn normalize_vertex_bindings(wanted: &mut [VertexBufferBinding]) {
     debug_assert!(wanted
         .windows(2)
         .all(|pair| pair[0].binding != pair[1].binding));
+}
+
+/// Replace the encoder's retained vertex-buffer state only when a setter
+/// changed it. `requested` is normalized here so order differences that name
+/// the same binding table do not manufacture a state transition.
+fn retain_vertex_bindings(
+    retained: &mut Vec<VertexBufferBinding>,
+    requested: &mut Vec<VertexBufferBinding>,
+) -> bool {
+    normalize_vertex_bindings(requested);
+    if *retained == *requested {
+        return false;
+    }
+    std::mem::swap(retained, requested);
+    true
 }
 
 /// End index of the maximal consecutive binding run beginning at `start`.
@@ -4927,7 +4944,10 @@ mod idle_slab_trim_tests {
 
 #[cfg(test)]
 mod vertex_binding_bulk_tests {
-    use super::{normalize_vertex_bindings, vertex_binding_run_end, VertexBufferBinding};
+    use super::{
+        normalize_vertex_bindings, retain_vertex_bindings, vertex_binding_run_end,
+        VertexBufferBinding,
+    };
     use ash::vk;
     use ash::vk::Handle;
 
@@ -4969,6 +4989,24 @@ mod vertex_binding_bulk_tests {
             start = end;
         }
         assert_eq!(starts_and_ends, vec![(0, 2), (2, 4), (4, 5)]);
+    }
+
+    #[test]
+    fn retained_bindings_emit_only_exact_state_changes() {
+        let mut retained = Vec::new();
+        let mut first = vec![binding(3, 30, 3), binding(1, 10, 1)];
+        assert!(retain_vertex_bindings(&mut retained, &mut first));
+        assert_eq!(retained, vec![binding(1, 10, 1), binding(3, 30, 3)]);
+
+        let mut same_in_wire_order = vec![binding(3, 30, 3), binding(1, 10, 1)];
+        assert!(!retain_vertex_bindings(
+            &mut retained,
+            &mut same_in_wire_order
+        ));
+
+        let mut changed_offset = vec![binding(1, 10, 2), binding(3, 30, 3)];
+        assert!(retain_vertex_bindings(&mut retained, &mut changed_offset));
+        assert_eq!(retained, vec![binding(1, 10, 2), binding(3, 30, 3)]);
     }
 }
 

@@ -13,7 +13,7 @@ use reims_vgpu_vulkan::engine::{
     self, BufferContent, DepthAttachment, DepthState, DrawRequest, GuestRun, GuestRunSource,
     IndexType, IndexedDrawResource, PrimitiveTopology, SampledImageResource, SampledSource,
     SamplerCompareFunction, SamplerResource, ScissorResource, StorageBufferResource,
-    TargetIdentity,
+    TargetIdentity, VertexAttributeFormat, VertexAttributeResource, VertexStepFunction,
 };
 /// The resident format every `TargetIdentity::Surface` in this file is built at.
 ///
@@ -200,6 +200,62 @@ fn batched_draws_compose_and_flush_on_read() {
             );
         }
     }
+}
+
+#[test]
+fn one_recording_retains_unchanged_vertex_buffer_state() {
+    let _guard = engine_test_lock().lock().unwrap();
+    engine::flush_batched_draws();
+    let (vert, frag) = triangle_spirv();
+    let identity = TargetIdentity::Surface {
+        id: 990_106,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let content = std::sync::Arc::new(vec![0u8; 24]);
+    let make = |load_from_target, left| {
+        let mut request = batch_req(
+            &vert,
+            &frag,
+            &identity,
+            load_from_target,
+            half_scissor(left),
+        );
+        for (location, binding) in [(0, 2), (1, 0), (2, 1)] {
+            request.vertex_attributes.push(VertexAttributeResource {
+                location,
+                binding,
+                format: VertexAttributeFormat::Float2,
+                offset: 0,
+                stride: 8,
+                step_function: VertexStepFunction::PerVertex,
+                step_rate: 1,
+                content: BufferContent::Bytes(std::sync::Arc::clone(&content)),
+            });
+        }
+        request
+    };
+    let before = engine::counter_snapshot();
+    if let Err(error) = engine::execute_draw_request(&make(false, true)) {
+        let message = error.to_string();
+        if skip_if_no_gpu(&message) {
+            eprintln!("skipping: {message}");
+            return;
+        }
+        panic!("first retained-state draw: {message}");
+    }
+    engine::execute_draw_request(&make(true, false)).expect("second retained-state draw");
+    let pixels = engine::read_target(&identity)
+        .expect("read target")
+        .into_rgba8();
+    let delta = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(delta.vertex_buffer_bind_slots, 6, "requested: {delta:?}");
+    assert_eq!(delta.vertex_buffer_bind_emitted, 3, "emitted: {delta:?}");
+    assert_eq!(delta.vertex_buffer_bind_held, 3, "retained: {delta:?}");
+    assert_eq!(delta.vertex_buffer_bind_calls, 1, "setter calls: {delta:?}");
+    assert!(pixels.chunks_exact(4).any(is_frag_color));
 }
 
 /// A decoded EXEC packet is the contract-owned Vulkan recording lifetime.
