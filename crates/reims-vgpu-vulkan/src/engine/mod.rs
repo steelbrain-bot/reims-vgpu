@@ -4049,7 +4049,7 @@ unsafe fn copy_image_level0_to_host_delivered(
         // draws and the copy together.
         pools.batch_flush(ctx, counters)?;
     } else {
-        unsafe { pools.gpu_span_seal_current(ctx, cb) };
+        unsafe { pools.encoder_mut().gpu_span_seal_current(ctx, cb) };
         ctx.device
             .end_command_buffer(cb)
             .map_err(|e| DrawError::VkCall(VkCall::new(ops.end_cb, e)))?;
@@ -4623,7 +4623,7 @@ pub fn copy_resident_level0(
             record_guest_write_debt(pools, GuestWriteSource::RingEntry, &pages);
         }
 
-        pools.gpu_span_seal_current(ctx, cb);
+        pools.encoder_mut().gpu_span_seal_current(ctx, cb);
         if let Err(error) = ctx
             .device
             .end_command_buffer(cb)
@@ -5410,7 +5410,7 @@ unsafe fn copy_image_level0_to_buffer(
         // draws and this copy together.
         pools.batch_flush(ctx, counters)?;
     } else {
-        unsafe { pools.gpu_span_seal_current(ctx, cb) };
+        unsafe { pools.encoder_mut().gpu_span_seal_current(ctx, cb) };
         ctx.device
             .end_command_buffer(cb)
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteEndCb, e)))?;

@@ -6976,7 +6976,7 @@ pub(crate) unsafe fn execute_draw_inner(
         ctx.device
             .cmd_begin_render_pass(cb, &rp_begin, vk::SubpassContents::INLINE);
         pools.encoder_mut().note_pass_opened(echo);
-        unsafe { pools.gpu_span_pass_begin(ctx, cb) };
+        unsafe { pools.encoder_mut().gpu_span_pass_begin(ctx, cb) };
     }
     if pass_key.feedback_colors != 0 {
         // Order each feedback draw's reads after the preceding colour writes.
@@ -7386,7 +7386,7 @@ pub(crate) unsafe fn execute_draw_inner(
         // Last command before the CB ends, so the stamp bounds every draw and
         // copy this submission recorded. A deferred draw is sealed by
         // `batch_flush` instead, on the same slot.
-        unsafe { pools.gpu_span_seal_current(ctx, cb) };
+        unsafe { pools.encoder_mut().gpu_span_seal_current(ctx, cb) };
         if let Err(e) = ctx.device.end_command_buffer(cb) {
             return Err(DrawError::VkCall(VkCall::new(VkOp::ExecEndCb, e)));
         }

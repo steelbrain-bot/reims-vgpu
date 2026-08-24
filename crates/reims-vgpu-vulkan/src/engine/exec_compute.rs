@@ -1750,7 +1750,7 @@ pub(crate) unsafe fn execute_compute_inner(
         );
     }
 
-    unsafe { pools.gpu_span_seal_current(ctx, cb) };
+    unsafe { pools.encoder_mut().gpu_span_seal_current(ctx, cb) };
     ctx.device
         .end_command_buffer(cb)
         .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ComputeExecEndCb, e)))?;

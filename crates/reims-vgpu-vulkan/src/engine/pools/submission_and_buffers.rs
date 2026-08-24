@@ -201,6 +201,76 @@ impl EncoderPools {
         gpu_span::note_armed();
     }
 
+    /// Seal one recording slot's GPU timestamp span immediately before its
+    /// command buffer ends.
+    unsafe fn gpu_span_seal(
+        &mut self,
+        ctx: &DeviceContext,
+        cb: vk::CommandBuffer,
+        slot: usize,
+        draws: u64,
+    ) {
+        let Some(probe) = ctx.draw_spans.as_ref() else {
+            return;
+        };
+        let gpu_span::SlotSpan::Armed(kind) = self.slots[slot].span else {
+            return;
+        };
+        ctx.device.cmd_write_timestamp(
+            cb,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            probe.pool,
+            DrawSpanProbe::base(slot) + 1,
+        );
+        debug_assert!(kind == gpu_span::Kind::Draw || draws == 0);
+        self.slots[slot].span = gpu_span::SlotSpan::Sealed { kind, draws };
+        gpu_span::note_sealed();
+    }
+
+    /// Seal the current slot's timestamp span for an immediate submission.
+    pub(crate) unsafe fn gpu_span_seal_current(
+        &mut self,
+        ctx: &DeviceContext,
+        cb: vk::CommandBuffer,
+    ) {
+        let draws = u64::from(matches!(
+            self.slots[self.cur].span,
+            gpu_span::SlotSpan::Armed(gpu_span::Kind::Draw)
+        ));
+        unsafe { self.gpu_span_seal(ctx, cb, self.cur, draws) };
+    }
+
+    /// Stamp the inside of the render pass instance just opened by this
+    /// encoder. A host without timestamp support leaves this a no-op.
+    pub(in crate::engine) unsafe fn gpu_span_pass_begin(
+        &mut self,
+        ctx: &DeviceContext,
+        cb: vk::CommandBuffer,
+    ) {
+        if !pass_spans_probe_enabled() {
+            return;
+        }
+        let Some(probe) = ctx.draw_spans.as_ref() else {
+            return;
+        };
+        let slot = self.cur;
+        if !matches!(self.slots[slot].span, gpu_span::SlotSpan::Armed(_)) {
+            return;
+        }
+        let index = self.slots[slot].pass_spans;
+        if index >= DrawSpanProbe::PASS_SPANS {
+            crate::telemetry::note_route("gpu_span_pass_region_full");
+            return;
+        }
+        ctx.device.cmd_write_timestamp(
+            cb,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            probe.pool,
+            DrawSpanProbe::pass_base(slot, index),
+        );
+        self.pass_open_index = Some(index);
+    }
+
     /// Allocate a descriptor set from this encoder's arena, growing it on
     /// exhaustion rather than dropping guest work.
     pub(crate) unsafe fn alloc_descriptor_set(
@@ -1176,109 +1246,6 @@ impl ResourcePools {
                 FenceWait::Failed(error) => return Err(Self::wait_error(counters, error, op)),
             }
         }
-    }
-
-    /// Write the bottom timestamp of the slot's command buffer, immediately
-    /// before it ends.
-    ///
-    /// `slot` is passed rather than read from `self.encoder.cur` because the batch flush
-    /// path seals the slot the batch was opened on, and a caller that guessed
-    /// would attribute one submission's span to another slot's queries.
-    ///
-    /// # Safety
-    ///
-    /// `cb` must be `slot`'s command buffer, still recording, and outside any
-    /// render pass.
-    unsafe fn gpu_span_seal(
-        &mut self,
-        ctx: &DeviceContext,
-        cb: vk::CommandBuffer,
-        slot: usize,
-        draws: u64,
-    ) {
-        let Some(probe) = ctx.draw_spans.as_ref() else {
-            return;
-        };
-        let gpu_span::SlotSpan::Armed(kind) = self.encoder.slots[slot].span else {
-            return;
-        };
-        ctx.device.cmd_write_timestamp(
-            cb,
-            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-            probe.pool,
-            DrawSpanProbe::base(slot) + 1,
-        );
-        debug_assert!(kind == gpu_span::Kind::Draw || draws == 0);
-        self.encoder.slots[slot].span = gpu_span::SlotSpan::Sealed { kind, draws };
-        gpu_span::note_sealed();
-    }
-
-    /// Stamp the inside of a render pass instance that has just begun, so the
-    /// GPU time it spends drawing can be told apart from the time the device
-    /// spends beginning and ending passes.
-    ///
-    /// Called immediately after `vkCmdBeginRenderPass`, so the stamp sits inside
-    /// the instance and the pass's own load operations fall before it. The
-    /// matching end stamp is written just inside `vkCmdEndRenderPass` by
-    /// [`Self::close_open_pass`]; `busy_us` less the sum of these pairs is what
-    /// the submission spent outside any pass.
-    ///
-    /// A no-op on a host that writes no timestamps, and on a command buffer that
-    /// was never armed -- in both cases there is no pair to complete, and
-    /// `pass_open_index` stays `None` so the close writes nothing either.
-    ///
-    /// # Safety
-    ///
-    /// `cb` must be the current slot's command buffer and recording.
-    pub(in crate::engine) unsafe fn gpu_span_pass_begin(
-        &mut self,
-        ctx: &DeviceContext,
-        cb: vk::CommandBuffer,
-    ) {
-        if !pass_spans_probe_enabled() {
-            return;
-        }
-        let Some(probe) = ctx.draw_spans.as_ref() else {
-            return;
-        };
-        let slot = self.encoder.cur;
-        if !matches!(self.encoder.slots[slot].span, gpu_span::SlotSpan::Armed(_)) {
-            return;
-        }
-        let index = self.encoder.slots[slot].pass_spans;
-        // Sized so this cannot be exceeded -- see `DrawSpanProbe::PASS_SPANS`.
-        // The guard is what keeps that true if the batch ceiling ever rises
-        // without the region following it, and it drops a record rather than
-        // writing outside the slot's own region into another slot's queries.
-        if index >= DrawSpanProbe::PASS_SPANS {
-            crate::telemetry::note_route("gpu_span_pass_region_full");
-            return;
-        }
-        ctx.device.cmd_write_timestamp(
-            cb,
-            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-            probe.pool,
-            DrawSpanProbe::pass_base(slot, index),
-        );
-        self.encoder.pass_open_index = Some(index);
-    }
-
-    /// [`Self::gpu_span_seal`] for the slot the caller is about to submit on its
-    /// own, which is always the current one.
-    ///
-    /// # Safety
-    ///
-    /// As [`Self::gpu_span_seal`].
-    pub(crate) unsafe fn gpu_span_seal_current(
-        &mut self,
-        ctx: &DeviceContext,
-        cb: vk::CommandBuffer,
-    ) {
-        let draws = u64::from(matches!(
-            self.encoder.slots[self.encoder.cur].span,
-            gpu_span::SlotSpan::Armed(gpu_span::Kind::Draw)
-        ));
-        unsafe { self.gpu_span_seal(ctx, cb, self.encoder.cur, draws) };
     }
 
     /// Reset this slot's readback timestamp region and write its start stamp.
@@ -2284,7 +2251,7 @@ impl ResourcePools {
         // any other index would charge this submission's GPU span to a slot whose
         // queries a different command buffer wrote.
         let slot = self.encoder.cur;
-        unsafe { self.gpu_span_seal(ctx, batch.cb, slot, batch.draws) };
+        unsafe { self.encoder.gpu_span_seal(ctx, batch.cb, slot, batch.draws) };
         counters.batch_flush_close_us.fetch_add(
             close_started.elapsed().as_micros() as u64,
             Ordering::Relaxed,
