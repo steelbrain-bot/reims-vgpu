@@ -1838,7 +1838,9 @@ pub(crate) unsafe fn execute_compute_inner(
     // failed wait below leaves the slot pending, so no path ever reuses an
     // unretired fence. The readback maps below stay valid: the BufferSlot
     // handles are held by value and nothing else runs under the engine lock.
-    let sealed = pools.seal_entry(dset.zip(dset_pool).into_iter().collect(), Vec::new());
+    let sealed = pools
+        .encoder_mut()
+        .seal_entry(dset.zip(dset_pool).into_iter().collect(), Vec::new());
     pools.finish_entry_async(sealed, submitted_timeline, None);
 
     if all_writeback_deferred {

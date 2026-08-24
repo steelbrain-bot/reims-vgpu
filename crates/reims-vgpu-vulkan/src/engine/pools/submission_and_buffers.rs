@@ -1666,56 +1666,6 @@ impl ResourcePools {
         ))
     }
 
-    /// Seal the current entry's transient resources: move every live pool slot
-    /// (which the just-recorded CB references) out of the shared live lists so
-    /// a concurrent entry cannot recycle them, bundled with the descriptor set.
-    ///
-    /// The images named by `sampled_retains` are lifted straight back out of the
-    /// cleanup into [`SealedEntry::admissions`]: they are not transient, they
-    /// are about to become cache entries, and leaving them in the bag is what
-    /// made them wait for a fence.
-    pub(crate) fn seal_entry(
-        &mut self,
-        dsets: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
-        sampled_retains: Vec<SampledRetain>,
-    ) -> SealedEntry {
-        // The slots the map names are about to be handed to the cleanup, so
-        // nothing recorded after this may bind one.
-        self.forget_cb_bound_buffers("bindmap_clear_seal", "bindmap_clear_seal_entries");
-        self.forget_cb_sampled_guest();
-        let mut readback: Vec<BufferSlot> = self.encoder.readback_live.take().into_iter().collect();
-        readback.append(&mut self.encoder.readback_multi_live);
-        let mut sampled = std::mem::take(&mut self.encoder.sampled_live);
-        let admissions = take_retained_slots(&mut sampled, sampled_retains);
-        // Both seal points reach here, which is the whole reason the scatter's
-        // sets are parked on `self` instead of travelling with its plan. They
-        // travel in their own field rather than joining `dsets`, because they
-        // recycle at retire and a draw's do not.
-        SealedEntry {
-            cleanup: PendingGpuCleanup {
-                dsets,
-                scatter_dsets: std::mem::take(&mut self.encoder.scatter_dsets),
-                staging: std::mem::take(&mut self.encoder.staging_live),
-                gather: std::mem::take(&mut self.encoder.gather_live),
-                readback,
-                sampled,
-                attachment_snapshots: std::mem::take(&mut self.encoder.attachment_snapshot_live),
-                storage_images: std::mem::take(&mut self.encoder.storage_image_live),
-                unpin_residents: std::mem::take(&mut self.encoder.resident_pins_live),
-                unpin_compute_residents: std::mem::take(&mut self.encoder.compute_write_pins_live),
-                guest_write_tokens: {
-                    let mut tokens: Vec<_> =
-                        std::mem::take(&mut self.encoder.guest_write_tokens_live)
-                            .into_values()
-                            .collect();
-                    tokens.sort_unstable();
-                    tokens
-                },
-            },
-            admissions,
-        }
-    }
-
     /// Park the sealed cleanup on the current slot and give the content cache
     /// the images this entry's CB fills. The CB was submitted with the slot
     /// fence and the entry returns without waiting.
@@ -1888,6 +1838,59 @@ impl EncoderPools {
     /// without a device, and a counter in it would not be.
     pub(crate) fn batch_target_is(&self, target: &BatchTarget) -> Option<bool> {
         self.open_batch.as_ref().map(|b| b.target == *target)
+    }
+
+    /// Seal the current entry's transient resources: transfer everything the
+    /// command buffer references into one immutable cleanup package. Shared
+    /// registries consume that package only after encoder ownership has ended.
+    ///
+    /// The images named by `sampled_retains` are lifted into
+    /// [`SealedEntry::admissions`]: they are about to become content entries,
+    /// and leaving them in the cleanup would make them wait for a fence.
+    pub(crate) fn seal_entry(
+        &mut self,
+        dsets: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
+        sampled_retains: Vec<SampledRetain>,
+    ) -> SealedEntry {
+        let bound = (self.cb_bound_buffers.aliases.len()
+            + self.cb_bound_buffers.immutable.len()
+            + self.cb_bound_buffers.guest_snapshots.len()) as u64;
+        crate::telemetry::note_route("bindmap_clear_seal");
+        crate::telemetry::note_route_n("bindmap_clear_seal_entries", bound);
+        self.cb_bound_buffers = super::CbBufferMemo::default();
+        self.cb_gather_owed.clear();
+        crate::telemetry::note_route_n(
+            "sampled_bindmap_clear_entries",
+            self.cb_sampled_guest.len() as u64,
+        );
+        self.cb_sampled_guest.clear();
+
+        let mut readback: Vec<BufferSlot> = self.readback_live.take().into_iter().collect();
+        readback.append(&mut self.readback_multi_live);
+        let mut sampled = std::mem::take(&mut self.sampled_live);
+        let admissions = take_retained_slots(&mut sampled, sampled_retains);
+        SealedEntry {
+            cleanup: PendingGpuCleanup {
+                dsets,
+                scatter_dsets: std::mem::take(&mut self.scatter_dsets),
+                staging: std::mem::take(&mut self.staging_live),
+                gather: std::mem::take(&mut self.gather_live),
+                readback,
+                sampled,
+                attachment_snapshots: std::mem::take(&mut self.attachment_snapshot_live),
+                storage_images: std::mem::take(&mut self.storage_image_live),
+                unpin_residents: std::mem::take(&mut self.resident_pins_live),
+                unpin_compute_residents: std::mem::take(&mut self.compute_write_pins_live),
+                guest_write_tokens: {
+                    let mut tokens: Vec<_> = std::mem::take(&mut self.guest_write_tokens_live)
+                        .into_values()
+                        .collect();
+                    tokens.sort_unstable();
+                    tokens
+                },
+            },
+            admissions,
+        }
     }
 
     /// Whether the pass a draw is about to open is the one already standing in
@@ -2300,7 +2303,9 @@ impl ResourcePools {
         match submit {
             Ok(submission) => {
                 let finish_started = std::time::Instant::now();
-                let sealed = self.seal_entry(std::mem::take(&mut batch.dsets), Vec::new());
+                let sealed = self
+                    .encoder
+                    .seal_entry(std::mem::take(&mut batch.dsets), Vec::new());
                 self.finish_entry_async(sealed, submission.timeline, submission.driver_return);
                 counters.batch_flush_finish_us.fetch_add(
                     finish_started.elapsed().as_micros() as u64,
@@ -5649,7 +5654,7 @@ mod recycle_tests {
         type EndOfLife<'a> = (&'a str, &'a dyn Fn(&mut ResourcePools));
         let ends: [EndOfLife<'_>; 2] = [
             ("a seal", &|p| {
-                p.seal_entry(Vec::new(), Vec::new());
+                p.encoder_mut().seal_entry(Vec::new(), Vec::new());
             }),
             ("a staging recycle", &|p| p.recycle_staging()),
         ];
@@ -5739,7 +5744,10 @@ mod recycle_tests {
             GuestWriteSource::ResidentTarget(&identity),
             Some(write_token(12)),
         );
-        let cleanup = pools.seal_entry(Vec::new(), Vec::new()).cleanup;
+        let cleanup = pools
+            .encoder_mut()
+            .seal_entry(Vec::new(), Vec::new())
+            .cleanup;
         assert!(pools.encoder.guest_write_tokens_live.is_empty());
         assert_eq!(
             cleanup.guest_write_tokens,
@@ -5764,7 +5772,10 @@ mod recycle_tests {
             1,
             "one command buffer has one fence and therefore one lifetime for this page set"
         );
-        let cleanup = pools.seal_entry(Vec::new(), Vec::new()).cleanup;
+        let cleanup = pools
+            .encoder_mut()
+            .seal_entry(Vec::new(), Vec::new())
+            .cleanup;
         assert_eq!(cleanup.guest_write_tokens.len(), 1);
         crate::engine::retire_guest_write_pages(&cleanup.guest_write_tokens);
         assert!(!crate::engine::guest_writes_outstanding());
@@ -5815,7 +5826,10 @@ mod recycle_tests {
 
         // Sealing transfers the pins to the exact submission that references
         // them. Model that slot's fence retirement without a Vulkan device.
-        let mut cleanup = pools.seal_entry(Vec::new(), Vec::new()).cleanup;
+        let mut cleanup = pools
+            .encoder_mut()
+            .seal_entry(Vec::new(), Vec::new())
+            .cleanup;
         assert!(pools.encoder.resident_pins_live.is_empty());
         for held in cleanup.unpin_residents.drain(..) {
             pools.pin_resident_target(&held, false);
@@ -5868,7 +5882,10 @@ mod recycle_tests {
             pools.encoder.resident_pins_live.is_empty(),
             "and leaves the ledger nothing to release"
         );
-        let cleanup = pools.seal_entry(Vec::new(), Vec::new()).cleanup;
+        let cleanup = pools
+            .encoder_mut()
+            .seal_entry(Vec::new(), Vec::new())
+            .cleanup;
         assert_eq!(
             cleanup.guest_write_tokens,
             vec![write_token(21)],
@@ -5916,7 +5933,10 @@ mod recycle_tests {
             "and the ledger records the pin it actually took"
         );
 
-        let mut cleanup = pools.seal_entry(Vec::new(), Vec::new()).cleanup;
+        let mut cleanup = pools
+            .encoder_mut()
+            .seal_entry(Vec::new(), Vec::new())
+            .cleanup;
         assert!(
             pools.encoder.compute_write_pins_live.is_empty(),
             "sealing hands the pin to the slot rather than copying it"
@@ -5955,6 +5975,7 @@ mod recycle_tests {
         pools.note_guest_write_recorded(GuestWriteSource::ResidentStorage(&absent), None);
         assert!(pools.encoder.compute_write_pins_live.is_empty());
         assert!(pools
+            .encoder_mut()
             .seal_entry(Vec::new(), Vec::new())
             .cleanup
             .unpin_compute_residents
@@ -5990,7 +6011,10 @@ mod recycle_tests {
         pools.note_guest_write_recorded(GuestWriteSource::ResidentTarget(&identity), None);
         assert_eq!(pools.shared.registry[&identity].pin_count, 2);
 
-        let mut cleanup = pools.seal_entry(Vec::new(), Vec::new()).cleanup;
+        let mut cleanup = pools
+            .encoder_mut()
+            .seal_entry(Vec::new(), Vec::new())
+            .cleanup;
         for held in cleanup.unpin_residents.drain(..) {
             pools.pin_resident_target(&held, false);
         }

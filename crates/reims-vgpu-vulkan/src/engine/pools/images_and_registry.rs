@@ -4125,7 +4125,7 @@ pub(super) mod pin_count_tests {
 
         assert!(pools.pin_resident_for_entry(&identity));
         assert_eq!(pools.shared.registry.get(&identity).unwrap().pin_count, 1);
-        let sealed = pools.seal_entry(Vec::new(), Vec::new());
+        let sealed = pools.encoder_mut().seal_entry(Vec::new(), Vec::new());
         assert!(pools.encoder.resident_pins_live.is_empty());
         assert_eq!(sealed.cleanup.unpin_residents, vec![identity]);
     }
@@ -4339,7 +4339,7 @@ pub(super) mod pin_count_tests {
         assert!(!slot.content_ready);
         assert_eq!(slot.pin_count, 1);
 
-        let sealed = pools.seal_entry(Vec::new(), Vec::new());
+        let sealed = pools.encoder_mut().seal_entry(Vec::new(), Vec::new());
         assert_eq!(sealed.cleanup.unpin_residents, vec![id]);
     }
 

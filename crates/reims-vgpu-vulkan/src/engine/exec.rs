@@ -7622,7 +7622,9 @@ pub(crate) unsafe fn execute_draw_inner(
     // admissions) on this ring slot in every mode; whichever entry retires
     // the slot drains it. A failed wait below leaves the slot pending, so no
     // path ever reuses an unretired fence.
-    let sealed = pools.seal_entry(dset.zip(dset_pool).into_iter().collect(), sampled_retains);
+    let sealed = pools
+        .encoder_mut()
+        .seal_entry(dset.zip(dset_pool).into_iter().collect(), sampled_retains);
     pools.finish_entry_async(sealed, submitted_timeline, None);
 
     // Dispose the ad-hoc per-draw framebuffers (MRT and/or depth) now that

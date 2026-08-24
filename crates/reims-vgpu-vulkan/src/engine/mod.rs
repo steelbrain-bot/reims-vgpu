@@ -4057,7 +4057,7 @@ unsafe fn copy_image_level0_to_host_delivered(
         let timeline = ctx
             .submit_guest_work(&cbs, fence)
             .map_err(|e| DrawError::VkCall(VkCall::new(ops.submit, e)))?;
-        let sealed = pools.seal_entry(Vec::new(), Vec::new());
+        let sealed = pools.encoder_mut().seal_entry(Vec::new(), Vec::new());
         pools.finish_entry_async(sealed, timeline, None);
     }
     // Split three ways rather than timed as a whole: the submit and the copy
@@ -4643,7 +4643,7 @@ pub fn copy_resident_level0(
                 return Err(error);
             }
         };
-        let sealed = pools.seal_entry(Vec::new(), Vec::new());
+        let sealed = pools.encoder_mut().seal_entry(Vec::new(), Vec::new());
         pools.finish_entry_async(sealed, timeline, None);
         pools.wait_entry_fence(ctx, counters, fence)?;
         pools.registry_mark_ready_with_access(destination, destination_next);
@@ -5418,7 +5418,7 @@ unsafe fn copy_image_level0_to_buffer(
         let timeline = ctx
             .submit_guest_work(&cbs, fence)
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteSubmit, e)))?;
-        let sealed = pools.seal_entry(Vec::new(), Vec::new());
+        let sealed = pools.encoder_mut().seal_entry(Vec::new(), Vec::new());
         pools.finish_entry_async(sealed, timeline, None);
     }
     note_readback_phase(
