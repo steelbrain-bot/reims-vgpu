@@ -1100,6 +1100,10 @@ impl ResourcePools {
         }
     }
 
+    pub(in crate::engine) fn recording(&mut self) -> RecordingPools<'_> {
+        RecordingPools { pools: self }
+    }
+
     /// The command-recording state owned by this encoder alone.
     ///
     /// Returning the narrow owner makes command-buffer state operations unable

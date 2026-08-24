@@ -702,6 +702,29 @@ pub(crate) struct ResourcePools {
     shared: SharedPools,
 }
 
+/// Exclusive recording view borrowed for one encoder transaction.
+///
+/// Native execution takes this type instead of the session's owning pool so
+/// recording-local state can move to a worker without granting that worker
+/// ownership of session teardown or replacement.
+pub(crate) struct RecordingPools<'a> {
+    pools: &'a mut ResourcePools,
+}
+
+impl std::ops::Deref for RecordingPools<'_> {
+    type Target = ResourcePools;
+
+    fn deref(&self) -> &Self::Target {
+        self.pools
+    }
+}
+
+impl std::ops::DerefMut for RecordingPools<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.pools
+    }
+}
+
 /// State of the deferred-submit draw batch (draw-batching increment 1): the
 /// opener's ring slot CB stays in recording state across joinable same-target
 /// draws; per-draw descriptor sets and sampled-cache admissions accumulate

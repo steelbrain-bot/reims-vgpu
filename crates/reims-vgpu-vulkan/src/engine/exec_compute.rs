@@ -15,7 +15,7 @@ use super::compute_validation::ComputeValidationDecline;
 use super::context::ContextOwner;
 use super::counters::EngineCounters;
 use super::device_lost::{DeviceLostDecline, DeviceLostOp};
-use super::pools::{BufferSlot, ResourcePools, SampledKey, StorageImageKey, StorageImageSlot};
+use super::pools::{BufferSlot, RecordingPools, SampledKey, StorageImageKey, StorageImageSlot};
 use super::types::{
     ComputeBufferOutput, ComputeBufferResult, ComputeOutput, ComputeRequest,
     ComputeResidentSampleBind, ComputeSampledImageResource, ComputeStorageResidency, DrawError,
@@ -442,7 +442,7 @@ enum ComputeTexelRole {
 
 unsafe fn prepare_compute_guest_texels(
     ctx: &super::context::DeviceContext,
-    pools: &mut ResourcePools,
+    pools: &mut RecordingPools<'_>,
     counters: &EngineCounters,
     source: &super::types::GuestRunSource,
     role: ComputeTexelRole,
@@ -564,7 +564,7 @@ pub(crate) struct NativeComputeProgram {
 pub(crate) unsafe fn execute_compute_inner(
     owner: &mut ContextOwner,
     caches: &mut ObjectCaches,
-    pools: &mut ResourcePools,
+    pools: &mut RecordingPools<'_>,
     counters: &EngineCounters,
     req: &ComputeRequest,
     program: &NativeComputeProgram,

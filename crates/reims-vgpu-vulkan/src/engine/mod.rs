@@ -1597,8 +1597,18 @@ fn execute_draw_request_locked(
         ..
     } = &mut *guard;
     pools.encoder_mut().enter_submission(submission.identity)?;
-    let result =
-        unsafe { exec::execute_draw_inner(owner, caches, indexes, pools, counters, req, &program) };
+    let result = unsafe {
+        let mut recording = pools.recording();
+        exec::execute_draw_inner(
+            owner,
+            caches,
+            indexes,
+            &mut recording,
+            counters,
+            req,
+            &program,
+        )
+    };
     if result.is_err() {
         // A draw can abandon after staging a gathered window and before the copy
         // that fills it is recorded — `SampledResidentNotReady` and its two
@@ -2734,7 +2744,8 @@ fn execute_compute_request_locked(
     } = &mut *guard;
     pools.encoder_mut().enter_submission(submission.identity)?;
     let result = unsafe {
-        exec_compute::execute_compute_inner(owner, caches, pools, counters, req, &program)
+        let mut recording = pools.recording();
+        exec_compute::execute_compute_inner(owner, caches, &mut recording, counters, req, &program)
     };
     match result {
         Ok(out) => {

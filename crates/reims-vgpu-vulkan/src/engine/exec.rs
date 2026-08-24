@@ -17,7 +17,7 @@ use super::device_lost::{DeviceLostDecline, DeviceLostOp};
 use super::draw_execution::DrawExecutionDecline;
 use super::draw_validation::DrawValidationDecline;
 use super::pools::{
-    BatchFit, BatchTarget, BufferSlot, CbBind, ResourcePools, SampledKey, SampledSlot, TargetKey,
+    BatchFit, BatchTarget, BufferSlot, CbBind, RecordingPools, SampledKey, SampledSlot, TargetKey,
 };
 use super::stage_phase;
 use super::types::{
@@ -602,7 +602,7 @@ impl PassObstacles {
     unsafe fn before_record(
         &mut self,
         obstacle: PassObstacle,
-        pools: &mut ResourcePools,
+        pools: &mut RecordingPools<'_>,
         device: &ash::Device,
         cb: vk::CommandBuffer,
     ) {
@@ -686,7 +686,7 @@ pub(super) fn generic_memory_barrier_dependency() -> (
 /// `gathers` must name buffers live for the whole submission being recorded.
 unsafe fn plan_buffer_gather_dispatches(
     ctx: &super::context::DeviceContext,
-    pools: &mut ResourcePools,
+    pools: &mut RecordingPools<'_>,
     counters: &EngineCounters,
     gathers: &[PendingGuestGather],
 ) -> Result<Option<Vec<GatherDispatch>>, DrawError> {
@@ -896,7 +896,7 @@ struct StageBufferUse {
 
 unsafe fn stage_buffer_content(
     ctx: &super::context::DeviceContext,
-    pools: &mut ResourcePools,
+    pools: &mut RecordingPools<'_>,
     counters: &EngineCounters,
     content: &BufferContent,
     use_: StageBufferUse,
@@ -1016,7 +1016,7 @@ unsafe fn stage_buffer_content(
 /// `ctx` must own the device `pools` holds every live import against.
 unsafe fn import_guest_buffer_window(
     ctx: &super::context::DeviceContext,
-    pools: &mut ResourcePools,
+    pools: &mut RecordingPools<'_>,
     transfer: &reims_vgpu_memory::GuestReadTransferPlan<'_>,
     role: BufferGatherRole,
 ) -> Option<BoundBuffer> {
@@ -1059,7 +1059,7 @@ unsafe fn import_guest_buffer_window(
 /// `ctx` must own the device `pools` holds every live import against.
 pub(super) unsafe fn import_guest_compute_buffer_window(
     ctx: &super::context::DeviceContext,
-    pools: &mut ResourcePools,
+    pools: &mut RecordingPools<'_>,
     src: &super::types::GuestRunSource,
 ) -> Option<BoundBuffer> {
     if !ctx.caps.host_pointer.is_available() {
@@ -1148,7 +1148,7 @@ pub(super) unsafe fn import_guest_compute_buffer_window(
 /// `ctx` must own the device `pools` holds every live import against.
 unsafe fn gather_guest_buffer_window(
     ctx: &super::context::DeviceContext,
-    pools: &mut ResourcePools,
+    pools: &mut RecordingPools<'_>,
     counters: &EngineCounters,
     src: &super::types::GuestRunSource,
     transfer: &reims_vgpu_memory::GuestReadTransferPlan<'_>,
@@ -1728,7 +1728,7 @@ const GUEST_IMPORT_COPY_OFFSET_ALIGN: u64 = 16;
 /// `ctx` must own the device `pools` holds every live import against.
 pub(super) unsafe fn prepare_guest_texel_window(
     ctx: &super::context::DeviceContext,
-    pools: &mut ResourcePools,
+    pools: &mut RecordingPools<'_>,
     counters: &EngineCounters,
     src: &super::types::GuestRunSource,
     gathers: &mut Vec<PendingGuestGather>,
@@ -3674,7 +3674,7 @@ pub(super) fn validate_sampled_resident(
 #[allow(clippy::too_many_arguments)]
 unsafe fn prepare_guest_sampled_transfer(
     ctx: &super::context::DeviceContext,
-    pools: &mut ResourcePools,
+    pools: &mut RecordingPools<'_>,
     counters: &EngineCounters,
     resource: &super::types::SampledImageResource,
     image_source: &reims_vgpu_memory::GuestImageSource,
@@ -3750,7 +3750,7 @@ pub(crate) unsafe fn execute_draw_inner(
     owner: &mut ContextOwner,
     caches: &mut ObjectCaches,
     indexes: &mut SessionCacheIndexes,
-    pools: &mut ResourcePools,
+    pools: &mut RecordingPools<'_>,
     counters: &EngineCounters,
     req: &DrawRequest,
     program: &NativeRenderProgram,
@@ -7830,7 +7830,7 @@ fn read_occlusion_samples(
 /// secondary out from under the framebuffer being built.
 unsafe fn ad_hoc_attachment_views(
     ctx: &super::context::DeviceContext,
-    pools: &mut ResourcePools,
+    pools: &mut RecordingPools<'_>,
     counters: &EngineCounters,
     req: &DrawRequest,
     primary_view: vk::ImageView,
