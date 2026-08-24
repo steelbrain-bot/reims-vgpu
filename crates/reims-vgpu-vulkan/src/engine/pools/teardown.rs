@@ -265,7 +265,7 @@ impl ResourcePools {
             device.destroy_command_pool(self.encoder.cmd_pool, None);
             self.encoder.cmd_pool = vk::CommandPool::null();
         }
-        self.shared.initialized = false;
+        self.encoder.initialized = false;
     }
 }
 

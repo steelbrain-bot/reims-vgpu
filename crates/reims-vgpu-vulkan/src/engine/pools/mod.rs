@@ -344,6 +344,11 @@ pub(crate) struct EncoderPools {
     readback_leased: Vec<LeasedReadback>,
     /// Persistent command pool; each ring slot owns one primary CB.
     cmd_pool: vk::CommandPool,
+    /// Whether this encoder owns its command pool, descriptor arena and ring.
+    ///
+    /// Device-wide registries are shared, but these objects are not: every
+    /// independently recording encoder must initialize its own set.
+    initialized: bool,
     /// Growable descriptor-pool arena (FREE_DESCRIPTOR_SET blocks). Grows a new
     /// block on exhaustion instead of hard-failing the draw; sets are freed
     /// per entry, paired with their owning block. See [`DescriptorArena`].
@@ -675,7 +680,6 @@ pub(crate) struct SharedPools {
     /// Lives here rather than beside its one consumer so it is destroyed by the
     /// same teardown that destroys every other device object.
     host_ram_imports: host_ram::HostRamImports,
-    initialized: bool,
 }
 
 pub(crate) struct ResourcePools {

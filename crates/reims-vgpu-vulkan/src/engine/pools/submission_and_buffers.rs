@@ -146,6 +146,95 @@ fn pass_spans_probe_enabled() -> bool {
     })
 }
 
+impl EncoderPools {
+    fn new() -> Self {
+        Self {
+            readback_lease_returns: Arc::new(ReadbackLeaseReturns::default()),
+            staging_free: HashMap::new(),
+            staging_live: Vec::new(),
+            gather_free: HashMap::new(),
+            gather_live: Vec::new(),
+            cb_bound_buffers: super::CbBufferMemo::default(),
+            cb_gather_owed: Vec::new(),
+            cb_sampled_guest: std::collections::HashMap::new(),
+            cb_graphics: super::CbGraphicsState::default(),
+            cb_guest_visibility: super::CbGuestVisibility::default(),
+            staging_hits: 0,
+            staging_misses: 0,
+            staging_miss_bins: [0; STAGING_BUCKET_BINS],
+            staging_miss_us_bins: [0; STAGING_BUCKET_BINS],
+            settled_staging_mark: 0,
+            readback_free: HashMap::new(),
+            readback_live: None,
+            readback_multi_live: Vec::new(),
+            readback_leased: Vec::new(),
+            cmd_pool: vk::CommandPool::null(),
+            initialized: false,
+            desc_arena: DescriptorArena::empty(),
+            scatter_dsets: Vec::new(),
+            scatter_dset_free: Vec::new(),
+            slots: Vec::new(),
+            cur: 0,
+            in_flight: 0,
+            graveyard: Vec::new(),
+            open_batch: None,
+            batch_max_draws: BATCH_MAX_DRAWS,
+            last_pass: None,
+            open_pass: None,
+            pass_probe: None,
+            pass_open_index: None,
+            guest_reads_in_flight: false,
+            guest_write_tokens_live: std::collections::HashMap::new(),
+            resident_pins_live: Vec::new(),
+            compute_write_pins_live: Vec::new(),
+        }
+    }
+}
+
+impl SharedPools {
+    fn new() -> Self {
+        Self {
+            targets: HashMap::new(),
+            target_order: Vec::new(),
+            multisample_target: None,
+            ad_hoc_framebuffers: HashMap::new(),
+            sampled_free: FreePool::new(),
+            sampled_live: Vec::new(),
+            attachment_snapshot_free: FreePool::new(),
+            attachment_snapshot_live: Vec::new(),
+            sampled_cache: Vec::new(),
+            sampled_cache_bytes: 0,
+            storage_image_free: FreePool::new(),
+            storage_image_live: Vec::new(),
+            compute_storage_registry: HashMap::new(),
+            heap_placement_memory: HashMap::new(),
+            compute_storage_order: VecDeque::new(),
+            registry: HashMap::new(),
+            guest_resident_authority: HashMap::new(),
+            registry_order: VecDeque::new(),
+            reclaimed_recent: VecDeque::new(),
+            registry_non_pinned_peak: 0,
+            registry_non_pinned: NonPinnedTotals::default(),
+            registry_non_pinned_peak_bytes: 0,
+            registry_sole_copy: NonPinnedTotals::default(),
+            registry_sole_copy_peak: NonPinnedTotals::default(),
+            resident_resample_peak_ms: 0,
+            compute_storage_sole_copy: NonPinnedTotals::default(),
+            compute_storage_sole_copy_peak: NonPinnedTotals::default(),
+            idle_clock_ms: 0,
+            last_maintenance_ms: 0,
+            settled_maintenance_passes: 0,
+            scatter: None,
+            scatter_refused: false,
+            completed_guest_imports: Vec::new(),
+            target_free: FreePool::new(),
+            slab: slab::SlabPool::new(),
+            slabs: buffer_slab::BufferSlabs::new(),
+            host_ram_imports: host_ram::HostRamImports::default(),
+        }
+    }
+}
+
 impl ResourcePools {
     /// End one guest allocation's backend lifetime after open submissions.
     pub(crate) unsafe fn retire_guest_import(
@@ -246,85 +335,8 @@ impl ResourcePools {
 
     pub(crate) fn new() -> Self {
         Self {
-            encoder: super::EncoderPools {
-                readback_lease_returns: Arc::new(ReadbackLeaseReturns::default()),
-                staging_free: HashMap::new(),
-                staging_live: Vec::new(),
-                gather_free: HashMap::new(),
-                gather_live: Vec::new(),
-                cb_bound_buffers: super::CbBufferMemo::default(),
-                cb_gather_owed: Vec::new(),
-                cb_sampled_guest: std::collections::HashMap::new(),
-                cb_graphics: super::CbGraphicsState::default(),
-                cb_guest_visibility: super::CbGuestVisibility::default(),
-                staging_hits: 0,
-                staging_misses: 0,
-                staging_miss_bins: [0; STAGING_BUCKET_BINS],
-                staging_miss_us_bins: [0; STAGING_BUCKET_BINS],
-                settled_staging_mark: 0,
-                readback_free: HashMap::new(),
-                readback_live: None,
-                readback_multi_live: Vec::new(),
-                readback_leased: Vec::new(),
-                cmd_pool: vk::CommandPool::null(),
-                desc_arena: DescriptorArena::empty(),
-                scatter_dsets: Vec::new(),
-                scatter_dset_free: Vec::new(),
-                slots: Vec::new(),
-                cur: 0,
-                in_flight: 0,
-                graveyard: Vec::new(),
-                open_batch: None,
-                batch_max_draws: BATCH_MAX_DRAWS,
-                last_pass: None,
-                open_pass: None,
-                pass_probe: None,
-                pass_open_index: None,
-                guest_reads_in_flight: false,
-                guest_write_tokens_live: std::collections::HashMap::new(),
-                resident_pins_live: Vec::new(),
-                compute_write_pins_live: Vec::new(),
-            },
-            shared: super::SharedPools {
-                targets: HashMap::new(),
-                target_order: Vec::new(),
-                multisample_target: None,
-                ad_hoc_framebuffers: HashMap::new(),
-                sampled_free: FreePool::new(),
-                sampled_live: Vec::new(),
-                attachment_snapshot_free: FreePool::new(),
-                attachment_snapshot_live: Vec::new(),
-                sampled_cache: Vec::new(),
-                sampled_cache_bytes: 0,
-                storage_image_free: FreePool::new(),
-                storage_image_live: Vec::new(),
-                compute_storage_registry: HashMap::new(),
-                heap_placement_memory: HashMap::new(),
-                compute_storage_order: VecDeque::new(),
-                registry: HashMap::new(),
-                guest_resident_authority: HashMap::new(),
-                registry_order: VecDeque::new(),
-                reclaimed_recent: VecDeque::new(),
-                registry_non_pinned_peak: 0,
-                registry_non_pinned: NonPinnedTotals::default(),
-                registry_non_pinned_peak_bytes: 0,
-                registry_sole_copy: NonPinnedTotals::default(),
-                registry_sole_copy_peak: NonPinnedTotals::default(),
-                resident_resample_peak_ms: 0,
-                compute_storage_sole_copy: NonPinnedTotals::default(),
-                compute_storage_sole_copy_peak: NonPinnedTotals::default(),
-                idle_clock_ms: 0,
-                last_maintenance_ms: 0,
-                settled_maintenance_passes: 0,
-                scatter: None,
-                scatter_refused: false,
-                completed_guest_imports: Vec::new(),
-                target_free: FreePool::new(),
-                slab: slab::SlabPool::new(),
-                slabs: buffer_slab::BufferSlabs::new(),
-                host_ram_imports: host_ram::HostRamImports::default(),
-                initialized: false,
-            },
+            encoder: EncoderPools::new(),
+            shared: SharedPools::new(),
         }
     }
 
@@ -598,7 +610,7 @@ impl ResourcePools {
         ctx: &DeviceContext,
         counters: &EngineCounters,
     ) -> Result<(), DrawError> {
-        if self.shared.initialized {
+        if self.encoder.initialized {
             return Ok(());
         }
         self.configure_batch_capacity(super::batch_max_draws(ctx.caps.memory.topology));
@@ -667,7 +679,7 @@ impl ResourcePools {
         self.encoder.slots = slots;
         self.encoder.cur = 0;
         self.encoder.in_flight = 0;
-        self.shared.initialized = true;
+        self.encoder.initialized = true;
         Ok(())
     }
 
@@ -6506,6 +6518,20 @@ mod scatter_descriptor_sets_do_not_alias {
             super::BATCH_MAX_DRAWS,
             "a device-free pool carries enough capacity for either topology"
         );
+    }
+
+    /// Device-wide registries may be shared by several recording contexts, but
+    /// initialization creates one command pool, descriptor arena and ring for
+    /// each context. The latch therefore travels with the encoder and cannot
+    /// make a newly constructed peer look initialized.
+    #[test]
+    fn encoder_initialization_is_not_shared_state() {
+        let mut first = EncoderPools::new();
+        let second = EncoderPools::new();
+
+        first.initialized = true;
+        assert!(first.initialized);
+        assert!(!second.initialized);
     }
 
     /// Topology changes only submission granularity: both arms execute the
